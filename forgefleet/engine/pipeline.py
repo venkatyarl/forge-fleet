@@ -312,35 +312,20 @@ Be specific — file names, line references, exact problems."""},
     # ─── Step 4: Build ──────────────────────────────
     
     def _build(self, description: str, context: dict, plan: str) -> dict:
-        """Build the code using agents with proper tech stack context."""
-        tech = context.get("tech_stack", {})
-        tech_instruction = ""
-        if tech.get("backend") == "Rust + Axum":
-            tech_instruction = "This is a RUST project using Axum + sqlx + PostgreSQL. Write RUST code, NOT Python or Flask."
-        if tech.get("frontend"):
-            tech_instruction += f" Frontend is {tech['frontend']}. Write React/TypeScript, NOT plain HTML."
+        """Build using Intern→Junior→Senior→Architect seniority chain."""
+        from .seniority import SeniorityPipeline
         
-        llm_code = self.router.get_llm(2) or LLM(base_url="http://192.168.5.100:51802/v1")
+        tech_stack = context.get("tech_stack", {})
         
-        template = get_template(description)
-        
-        agent = Agent(
-            role="Senior Developer",
-            goal="Write production code using the correct tech stack",
-            backstory=f"{tech_instruction}\n\n{template.system_prompt}\n\nPlan:\n{plan[:1500]}",
-            tools=self.tools,
-            llm=llm_code,
-            verbose=True,
-            max_iterations=12,
+        full_description = (
+            f"{description}\n\n"
+            f"Plan:\n{plan[:1500]}\n\n"
+            f"Relevant files:\n{context.get('relevant_files', '')[:1000]}"
         )
         
-        task = Task(
-            description=f"Implement: {description}\n\nRelevant files:\n{context.get('relevant_files', '')[:1000]}",
-            agent=agent,
-        )
+        seniority = SeniorityPipeline(tools=self.tools, router=self.router)
+        result = seniority.execute(full_description, tech_stack=tech_stack)
         
-        crew = Crew(agents=[agent], tasks=[task], verbose=True)
-        result = crew.kickoff()
         return result
     
     # ─── Step 6: Dependency Management ──────────────
