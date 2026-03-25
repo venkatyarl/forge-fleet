@@ -47,6 +47,8 @@ class DiscoveredEndpoint:
     hostname: str = ""
     url: str = ""
     timeout: int = 120
+    healthy: bool = True
+    busy: bool = False
     
     def __post_init__(self):
         self.url = f"http://{self.ip}:{self.port}"
