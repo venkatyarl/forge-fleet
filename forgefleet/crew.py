@@ -41,10 +41,10 @@ def get_llm(tier: str = "fast") -> LLM:
     
     # Default endpoints based on our fleet layout
     endpoints = {
-        "fast": "http://192.168.5.100:8082",    # Taylor 9B
-        "code": "http://192.168.5.102:8081",     # Marcus 32B
-        "review": "http://192.168.5.108:8082",   # James 72B
-        "expert": "http://192.168.5.100:8080",   # Taylor 235B cluster
+        "fast": "http://192.168.5.100:51803",    # Taylor 9B
+        "code": "http://192.168.5.102:51802",     # Marcus 32B
+        "review": "http://192.168.5.108:51801",   # James 72B
+        "expert": "http://192.168.5.100:51800",   # Taylor 235B cluster
     }
     
     model_names = {

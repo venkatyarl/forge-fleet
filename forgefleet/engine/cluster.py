@@ -42,7 +42,7 @@ class ClusterNode:
     ram_gb: int = 0
     role: str = ""  # "master" or "worker"
     rpc_port: int = 50052
-    model_port: int = 8080
+    model_port: int = 51800
     healthy: bool = False
     pid: int = 0
     
@@ -61,7 +61,7 @@ class Cluster:
     model_size_gb: float
     master: ClusterNode = None
     workers: list = field(default_factory=list)
-    master_port: int = 8080
+    master_port: int = 51800
     ctx_size: int = 8192
     ngl: int = 99  # GPU layers
     status: str = "stopped"  # stopped, starting, running, degraded, failed
@@ -208,7 +208,7 @@ class ClusterManager:
         }
     
     def create_cluster(self, plan: dict, model_path: str,
-                       master_port: int = 8080, ctx_size: int = 8192,
+                       master_port: int = 51800, ctx_size: int = 8192,
                        ngl: int = 99) -> Cluster:
         """Create a cluster from a plan.
         

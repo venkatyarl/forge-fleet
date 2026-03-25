@@ -225,7 +225,7 @@ class FleetDaemon:
         """Listen for UDP announcements from new nodes.
         
         Protocol: new node sends UDP packet to broadcast:50099
-        Payload: "FORGEFLEET_ANNOUNCE:{port}" (e.g., "FORGEFLEET_ANNOUNCE:8081")
+        Payload: "FORGEFLEET_ANNOUNCE:{port}" (e.g., "FORGEFLEET_ANNOUNCE:51803")
         
         Daemon immediately scans the sender IP on that port.
         """
@@ -342,7 +342,7 @@ def announce_to_fleet(port: int, broadcast_ip: str = "255.255.255.255"):
         python3 -c "from forgefleet.engine.daemon import announce_to_fleet; announce_to_fleet(8081)"
     
     Or simpler:
-        echo "FORGEFLEET_ANNOUNCE:8081" | nc -u -w1 255.255.255.255 50099
+        echo "FORGEFLEET_ANNOUNCE:51803" | nc -u -w1 255.255.255.255 50099
     """
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)

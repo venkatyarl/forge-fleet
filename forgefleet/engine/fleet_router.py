@@ -93,7 +93,7 @@ class FleetRouter:
                     ep = ModelEndpoint(
                         name=model.get("name", "unknown"),
                         node=node_name, ip=ip,
-                        port=model.get("port", 8080),
+                        port=model.get("port", 51800),
                         tier=model.get("tier", 1),
                     )
                     self.endpoints.append(ep)
@@ -258,7 +258,7 @@ class FleetRouter:
         llm = self.get_llm(tier)
         if llm is None:
             # Nothing available at any tier — use a hardcoded fallback
-            llm = LLM(base_url="http://192.168.5.100:8082/v1", model="fallback")
+            llm = LLM(base_url="http://192.168.5.100:51803/v1", model="fallback")
         
         return llm
     

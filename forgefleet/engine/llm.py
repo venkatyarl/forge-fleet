@@ -12,7 +12,7 @@ class LLM:
     Works with llama.cpp server, Ollama, vLLM, or any OpenAI-compatible API.
     No dependencies — uses urllib directly.
     """
-    base_url: str = "http://localhost:8082/v1"
+    base_url: str = "http://localhost:51803/v1"
     model: str = "local"
     temperature: float = 0.2
     max_tokens: int = 4096
