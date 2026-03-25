@@ -69,7 +69,7 @@ class NetworkDiscovery:
     - Stores in discovered_endpoints
     """
     subnet: str = ""
-    known_ports: list = field(default_factory=lambda: [8080, 8081, 8082, 8083])
+    known_ports: list = field(default_factory=lambda: [51800, 51801, 51802, 51803, 8080, 8081, 8082, 8083])
     discovered: list = field(default_factory=list)
     scan_timeout: float = 1.0  # TCP connect timeout per IP
     
