@@ -109,10 +109,24 @@ class NetworkDiscovery:
         # Try /health endpoint (llama.cpp)
         try:
             req = urllib.request.Request(f"{endpoint.url}/health")
-            with urllib.request.urlopen(req, timeout=3) as resp:
+            with urllib.request.urlopen(req, timeout=5) as resp:
                 data = json.loads(resp.read())
-                if data.get("status") != "ok":
+                if data.get("status") == "ok":
+                    pass  # Healthy
+                else:
                     return None
+        except urllib.error.HTTPError as e:
+            # 503 = model loading — still a valid endpoint, just not ready yet
+            if e.code == 503:
+                try:
+                    body = json.loads(e.read().decode())
+                    if "loading" in body.get("error", {}).get("message", "").lower():
+                        endpoint.model_name = "loading..."
+                        endpoint.tier = 0  # Unknown until loaded
+                        return endpoint
+                except Exception:
+                    pass
+            return None
         except Exception:
             return None
         
