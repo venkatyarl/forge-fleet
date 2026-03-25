@@ -6,11 +6,11 @@ import sys
 import time
 from pathlib import Path
 
-from .orchestrator.fleet_discovery import FleetDiscovery
-from .orchestrator.pipeline import TieredPipeline
-from .routing.task_router import TaskRouter
-from .memory.store import MemoryStore
-from .context.repo_context import RepoContext
+from forgefleet.orchestrator.fleet_discovery import FleetDiscovery
+from forgefleet.orchestrator.pipeline import TieredPipeline
+from forgefleet.routing.task_router import TaskRouter
+from forgefleet.memory.store import MemoryStore
+from forgefleet.context.repo_context import RepoContext
 
 
 def main():

@@ -20,8 +20,29 @@ class RepoContext:
     def __init__(self, repo_dir: str, max_tokens: int = 8000):
         self.repo_dir = repo_dir
         self.max_tokens = max_tokens
+        self._context_mode_available = self._check_context_mode()
         self._aider_available = self._check_aider()
         self._cocoindex_available = self._check_cocoindex()
+    
+    def _check_context_mode(self) -> bool:
+        try:
+            from .context_mode import ContextModeIntegration
+            cm = ContextModeIntegration(self.repo_dir)
+            return cm._available
+        except:
+            return False
+    
+    def _context_mode_search(self, query: str) -> str:
+        """Use Context Mode FTS5 search — 98% token reduction."""
+        try:
+            from .context_mode import ContextModeIntegration
+            cm = ContextModeIntegration(self.repo_dir)
+            result = cm.search(query)
+            if result:
+                return f"## Relevant code (Context Mode FTS5 search — 98% compressed):\n{result}"
+        except:
+            pass
+        return ""
     
     def _check_aider(self) -> bool:
         try:
@@ -41,12 +62,19 @@ class RepoContext:
         """Get relevant code context for a task.
         
         Tries in order:
-        1. CocoIndex AST search (most token-efficient)
-        2. Aider repo-map (understands full structure)
-        3. Simple file reading (fallback)
+        1. Context Mode FTS5 search (98% token reduction)
+        2. CocoIndex AST search (70% token savings)
+        3. Aider repo-map (understands full structure)
+        4. Simple file reading (fallback)
         """
         if specific_files:
             return self._read_specific_files(specific_files)
+        
+        # Try Context Mode first (best token efficiency)
+        if self._context_mode_available:
+            ctx = self._context_mode_search(task_description)
+            if ctx:
+                return ctx
         
         if self._cocoindex_available:
             ctx = self._cocoindex_search(task_description)

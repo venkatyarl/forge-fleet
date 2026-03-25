@@ -65,7 +65,7 @@ Commit your changes with descriptive messages."""
     
     def _run_manual(self, task: str, max_iterations: int) -> Optional[str]:
         """Manual agent loop — read files, prompt, parse, write."""
-        from .file_ops import read_repo_files, write_code_blocks, parse_llm_response
+        from forgefleet.agent_loop.file_ops import read_repo_files, write_code_blocks, parse_llm_response
         
         context = read_repo_files(self.repo_dir, max_files=5)
         result = None

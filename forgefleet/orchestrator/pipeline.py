@@ -3,9 +3,9 @@ import subprocess
 import os
 import json
 from typing import Optional
-from ..agent_loop.strands_agent import StrandsAgent
-from ..agent_loop.file_ops import read_repo_files
-from .fleet_discovery import FleetDiscovery, ModelEndpoint
+from forgefleet.agent_loop.strands_agent import StrandsAgent
+from forgefleet.agent_loop.file_ops import read_repo_files
+from forgefleet.orchestrator.fleet_discovery import FleetDiscovery, ModelEndpoint
 
 
 class TieredPipeline:

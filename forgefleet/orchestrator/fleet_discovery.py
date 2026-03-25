@@ -138,9 +138,14 @@ class FleetDiscovery:
                 ["curl", "-s", "--max-time", "2", f"{endpoint.url}/slots"],
                 capture_output=True, text=True, timeout=4
             )
-            if r.returncode == 0 and '"idle"' not in r.stdout:
-                endpoint.busy = True
-                return True
+            if r.returncode == 0 and r.stdout.strip():
+                import json as _json
+                slots = _json.loads(r.stdout)
+                # llama.cpp uses "is_processing": true/false
+                if isinstance(slots, list):
+                    all_busy = all(s.get("is_processing", False) for s in slots)
+                    endpoint.busy = all_busy
+                    return all_busy
         except:
             pass
         endpoint.busy = False
