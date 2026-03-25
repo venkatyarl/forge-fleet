@@ -344,7 +344,7 @@ class MCPServer:
                 ip=ip,
                 model_url=args["model_url"],
                 model_path=args["model_path"],
-                port=args.get("port", 8081),
+                port=args.get("port", 51802),
                 ctx_size=args.get("ctx_size", 8192),
             )
             
@@ -416,7 +416,7 @@ class MCPServer:
             
             # Get fleet-aware LLMs
             self.router = FleetRouter()
-            llm_fast = self.router.get_llm(1) or LLM(base_url="http://192.168.5.100:8082/v1")
+            llm_fast = self.router.get_llm(1) or LLM(base_url="http://192.168.5.100:51803/v1")
             llm_code = self.router.get_llm(2) or llm_fast
             llm_review = self.router.get_llm(3) or llm_code
             
