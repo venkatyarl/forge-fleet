@@ -117,16 +117,31 @@ class SeniorityPipeline:
         if intern_result.status == "failed":
             return self._build_result(results, time.time() - start)
         
-        # Step 2: JUNIOR implements based on intern's research
-        print(f"\n👨‍💻 Junior implementing...", flush=True)
-        junior_instructions = (
-            f"The research team found this about the codebase:\n{intern_result.output[:3000]}\n\n"
-            f"Now implement the feature. Use write_file for EVERY file you create.\n"
-            f"Task: {task_description}"
-        )
-        junior_result = self._run_level(
-            Seniority.JUNIOR, junior_instructions, intern_result.output, tech_context
-        )
+        # Step 2: JUNIOR implements — ONE FILE AT A TIME
+        print(f"\n👨‍💻 Junior implementing (file-by-file)...", flush=True)
+        
+        # Use intern's output to determine specific files to create
+        # Break into individual file tasks for faster LLM calls
+        file_tasks = self._extract_file_tasks(task_description, intern_result.output, tech_context)
+        
+        junior_result = HandoffResult(seniority=Seniority.JUNIOR, output="", status="complete", owner="Junior Developer")
+        junior_start = time.time()
+        
+        for i, file_task in enumerate(file_tasks):
+            print(f"  📄 File {i+1}/{len(file_tasks)}: {file_task[:60]}", flush=True)
+            
+            single_result = self._run_level(
+                Seniority.JUNIOR,
+                file_task,
+                "",  # Minimal context — keep prompt small
+                tech_context,
+            )
+            junior_result.output += f"\n{single_result.output}"
+            
+            if single_result.status == "failed":
+                print(f"    ⚠️ Failed, continuing...", flush=True)
+        
+        junior_result.time_spent = time.time() - junior_start
         results.append(junior_result)
         
         if junior_result.status == "failed" and not junior_result.files_changed:
@@ -210,7 +225,11 @@ class SeniorityPipeline:
         )
         
         start = time.time()
-        output = agent.execute(task, context)
+        try:
+            output = agent.execute(task, context)
+        except Exception as e:
+            output = f"ERROR: {e}"
+            print(f"  ❌ {config['title']} error: {str(e)[:100]}", flush=True)
         
         result = HandoffResult(
             seniority=level,
@@ -226,6 +245,67 @@ class SeniorityPipeline:
             result.escalation_reason = output
         
         return result
+    
+    def _extract_file_tasks(self, task_description: str, intern_output: str, tech_context: str) -> list[str]:
+        """Break a task into individual file-level instructions.
+        
+        Instead of "implement the whole feature," create:
+        - "Create models.rs with Leave struct"
+        - "Create handlers.rs with GET /leave endpoint"
+        - "Create routes.rs with router setup"
+        
+        Each becomes a focused 32B call that finishes in <60s.
+        """
+        # Use 9B to decompose (fast)
+        llm_fast = self.router.get_llm(1)
+        if not llm_fast:
+            llm_fast = LLM(base_url="http://192.168.5.100:51803/v1")
+        
+        prompt = f"""Break this task into individual FILE operations. 
+Each item should be ONE write_file call.
+
+Task: {task_description[:500]}
+{f"Tech: {tech_context}" if tech_context else ""}
+Research: {intern_output[:1000]}
+
+List each file to create. Format — one per line:
+FILE: path/to/file.rs — description of what goes in it
+
+Only list files that need to be CREATED or MODIFIED. Max 5 files."""
+        
+        try:
+            messages = [
+                {"role": "system", "content": "List files to create. One per line. Format: FILE: path — description"},
+                {"role": "user", "content": prompt},
+            ]
+            response = llm_fast.call(messages)
+            content = response.get("content", "")
+            
+            # Parse FILE: lines
+            import re
+            file_lines = re.findall(r'FILE:\s*(.+)', content)
+            
+            if file_lines:
+                tasks = []
+                for fl in file_lines[:5]:
+                    parts = fl.split("—", 1) if "—" in fl else fl.split("-", 1)
+                    filepath = parts[0].strip()
+                    desc = parts[1].strip() if len(parts) > 1 else "implement this file"
+                    
+                    tasks.append(
+                        f"Create file: {filepath}\n"
+                        f"Content: {desc}\n"
+                        f"{tech_context}\n"
+                        f"Use write_file to save it. Write the COMPLETE file content."
+                    )
+                return tasks
+        except Exception:
+            pass
+        
+        # Fallback: single task
+        return [
+            f"Implement this feature using write_file:\n{task_description[:500]}\n{tech_context}"
+        ]
     
     def _build_result(self, results: list[HandoffResult], total_time: float) -> dict:
         """Build the final result, determining who owns the commit."""
