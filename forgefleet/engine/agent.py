@@ -82,22 +82,39 @@ class Agent:
             tool_calls = response.get("tool_calls", [])
             content = response.get("content", "")
             
-            # Parse Qwen-style tool calls from <tools> tags in content
-            if not tool_calls and content and "<tools>" in content:
+            # Parse tool calls from content (Qwen uses multiple formats)
+            if not tool_calls and content:
                 import re
+                tool_json = None
+                
+                # Format 1: <tools>{JSON}</tools>
                 tools_match = re.findall(r'<tools>\s*(\{.*?\})\s*</tools>', content, re.DOTALL)
                 if tools_match:
+                    tool_json = tools_match
+                
+                # Format 2: ```json\n{JSON}\n```
+                if not tool_json:
+                    code_match = re.findall(r'```(?:json)?\s*\n?(\{[^`]*?"name"\s*:\s*"[^`]*?\})\s*```', content, re.DOTALL)
+                    if code_match:
+                        tool_json = code_match
+                
+                # Format 3: bare JSON with "name" and "arguments" keys
+                if not tool_json and content.strip().startswith("{") and '"name"' in content and '"arguments"' in content:
+                    tool_json = [content.strip()]
+                
+                if tool_json:
                     tool_calls = []
-                    for tm in tools_match:
+                    for tm in tool_json:
                         try:
-                            tc_data = json.loads(tm)
-                            tool_calls.append({
-                                "function": {
-                                    "name": tc_data.get("name", ""),
-                                    "arguments": json.dumps(tc_data.get("arguments", {})),
-                                },
-                                "id": f"call_{tc_data.get('name', 'unknown')}",
-                            })
+                            tc_data = json.loads(tm.strip())
+                            if "name" in tc_data:
+                                tool_calls.append({
+                                    "function": {
+                                        "name": tc_data["name"],
+                                        "arguments": json.dumps(tc_data.get("arguments", {})),
+                                    },
+                                    "id": f"call_{tc_data['name']}",
+                                })
                         except json.JSONDecodeError:
                             pass
             
