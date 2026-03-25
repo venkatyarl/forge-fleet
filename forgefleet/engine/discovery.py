@@ -378,7 +378,7 @@ class NetworkDiscovery:
         return info
     
     def install_model(self, ip: str, model_url: str, model_path: str,
-                      port: int = 8081, ctx_size: int = 8192) -> dict:
+                      port: int = 51802, ctx_size: int = 8192) -> dict:
         """Install and start a model on a remote node.
         
         Steps:

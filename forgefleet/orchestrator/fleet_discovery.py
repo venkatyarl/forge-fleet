@@ -67,7 +67,7 @@ class FleetDiscovery:
                 # Extract port from description
                 import re
                 port_match = re.search(r'port (\d+)', model_desc)
-                port = int(port_match.group(1)) if port_match else 8081
+                port = int(port_match.group(1)) if port_match else 51802
                 
                 # Determine tier based on model name
                 tier = self._model_to_tier(model_desc)
@@ -96,7 +96,7 @@ class FleetDiscovery:
                 endpoint = ModelEndpoint(
                     name=tier_cfg.get("model", "unknown"),
                     url=url,
-                    port=int(url.split(":")[-1]) if ":" in url else 8081,
+                    port=int(url.split(":")[-1]) if ":" in url else 51802,
                     tier=tier_num,
                 )
                 if tier_num not in self.tiers:

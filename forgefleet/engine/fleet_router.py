@@ -112,7 +112,7 @@ class FleetRouter:
                 
                 # Extract port: "port 8082"
                 port_match = re.search(r"port (\d+)", m)
-                port = int(port_match.group(1)) if port_match else 8080
+                port = int(port_match.group(1)) if port_match else 51800
                 
                 # Extract model name: everything before first "("
                 model_name = m.split("(")[0].strip()

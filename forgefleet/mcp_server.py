@@ -64,7 +64,7 @@ class MCPServer:
                 },
             },
             "fleet_scan": {
-                "description": "Scan the local network for new LLM endpoints. Discovers llama.cpp, Ollama, and vLLM servers automatically on ports 8080-8083.",
+                "description": "Scan the local network for new LLM endpoints. Discovers llama.cpp, Ollama, and vLLM servers automatically on ports 51800-51803.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -142,7 +142,7 @@ class MCPServer:
                         "port": {
                             "type": "integer",
                             "description": "Port to start llama-server on",
-                            "default": 8081,
+                            "default": 51802,
                         },
                         "ctx_size": {
                             "type": "integer",
@@ -169,7 +169,7 @@ class MCPServer:
                         },
                         "endpoint": {
                             "type": "string",
-                            "description": "For model_loaded: IP:port to wait for (e.g., 192.168.5.100:8080)",
+                            "description": "For model_loaded: IP:port to wait for (e.g., 192.168.5.100:51800)",
                         },
                         "timeout": {
                             "type": "integer",
@@ -317,7 +317,7 @@ class MCPServer:
                         return f"✅ Tier {tier} available: {ep.name} @ http://{ep.ip}:{ep.port}"
                 
                 elif condition == "model_loaded":
-                    endpoint_str = args.get("endpoint", "192.168.5.100:8080")
+                    endpoint_str = args.get("endpoint", "192.168.5.100:51800")
                     ip, port = endpoint_str.split(":")
                     try:
                         import urllib.request as ur

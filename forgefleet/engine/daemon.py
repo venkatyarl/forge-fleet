@@ -339,7 +339,7 @@ def announce_to_fleet(port: int, broadcast_ip: str = "255.255.255.255"):
     Call this when starting a new llama-server to notify ForgeFleet immediately.
     
     Usage on a new node:
-        python3 -c "from forgefleet.engine.daemon import announce_to_fleet; announce_to_fleet(8081)"
+        python3 -c "from forgefleet.engine.daemon import announce_to_fleet; announce_to_fleet(51803)"
     
     Or simpler:
         echo "FORGEFLEET_ANNOUNCE:51803" | nc -u -w1 255.255.255.255 50099

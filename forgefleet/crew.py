@@ -59,7 +59,7 @@ def get_llm(tier: str = "fast") -> LLM:
         for name, node in fleet["nodes"].items():
             for model in node.get("models", []):
                 t = model.get("tier", 0)
-                url = f"http://{node.get('ip', '127.0.0.1')}:{model.get('port', 8080)}"
+                url = f"http://{node.get('ip', '127.0.0.1')}:{model.get('port', 51800)}"
                 if t == 1 and tier == "fast":
                     endpoints["fast"] = url
                 elif t == 2 and tier == "code":
