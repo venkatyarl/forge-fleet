@@ -26,8 +26,14 @@ class TaskDecomposer:
     a reasoning task, not a coding task.
     """
     
-    def __init__(self, llm: LLM = None):
-        self.llm = llm or LLM(base_url="http://192.168.5.100:51803/v1")
+    def __init__(self, llm: LLM = None, use_smart_model: bool = False):
+        if llm:
+            self.llm = llm
+        elif use_smart_model:
+            # Use 72B for better decomposition
+            self.llm = LLM(base_url="http://192.168.5.100:51801/v1", model="qwen2.5-72b", timeout=300)
+        else:
+            self.llm = LLM(base_url="http://192.168.5.100:51803/v1")
     
     def decompose(self, task: str, max_subtasks: int = 7) -> list[Subtask]:
         """Break a task into subtasks."""

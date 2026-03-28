@@ -189,21 +189,19 @@ class LifecycleManager:
             from .task_decomposer import TaskDecomposer
             from .llm import LLM
             
-            decomposer = TaskDecomposer()
+            # Use 72B for EPIC/FEATURE decomposition (9B is too weak for this)
+            decomposer = TaskDecomposer(use_smart_model=True)
             
             # Determine level: EPIC → Features, FEATURE → Tickets, else → Subtasks
             if "[EPIC]" in title.upper():
-                # EPIC → create FEATURES
                 level = "features"
                 child_prefix = "[FEATURE]"
-                prompt = f"Break this EPIC into major FEATURES (not code tasks). Each feature is a significant capability.\n\n{desc}"
+                prompt = f"Recruitment system: {desc}"  # Keep it simple — let decomposer handle the breakdown
             elif "[FEATURE]" in title.upper() or is_complex:
-                # FEATURE → create TICKETS (buildable tasks)
                 level = "tickets"
                 child_prefix = ""
-                prompt = f"Break this feature into specific coding TICKETS. Each ticket should be one concrete implementation task (one crate, one handler, one model file).\n\n{desc}"
+                prompt = desc
             else:
-                # Regular complex ticket → create subtasks
                 level = "subtasks"
                 child_prefix = ""
                 prompt = desc
