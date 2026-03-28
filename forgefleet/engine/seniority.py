@@ -274,10 +274,17 @@ class SeniorityPipeline:
         if not read_tool:
             return {}
         
-        stack = {"backend": "", "frontend": "", "database": "", "instructions": ""}
+        stack = {
+            "components": [],  # List of all detected components
+            "backend": "",
+            "frontend": "",
+            "database": "",
+            "instructions": "",
+            "file_map": {},  # component → directory mapping
+        }
         
-        # Check ALL common project config files
-        config_files = {
+        # Scan for config files at root AND in subdirectories
+        config_signatures = {
             "Cargo.toml": "rust",
             "package.json": "node",
             "requirements.txt": "python",
@@ -290,26 +297,64 @@ class SeniorityPipeline:
             "Gemfile": "ruby",
             "mix.exs": "elixir",
             "composer.json": "php",
-            "Program.cs": "csharp",
-            "*.csproj": "csharp",
         }
         
         detected_langs = []
         project_info = ""
         
-        for config_file, lang in config_files.items():
+        # Check root level
+        for config_file, lang in config_signatures.items():
             content = read_tool.run(filepath=config_file)
             if "Not found" not in content:
-                detected_langs.append(lang)
+                detected_langs.append(("root", lang, config_file))
                 project_info += f"\n{config_file}:\n{content[:300]}\n"
+        
+        # Check common subdirectories for their own stacks
+        if list_tool:
+            root_listing = list_tool.run(directory=".", pattern="")
+            project_info = f"Root:\n{root_listing}\n" + project_info
+            
+            # Scan subdirs for their own config files
+            subdirs = [line.split("/")[0] for line in root_listing.split("\n") if "/" in line]
+            subdirs = list(set(subdirs))[:15]  # Unique top-level dirs
+            
+            for subdir in subdirs:
+                for config_file, lang in config_signatures.items():
+                    content = read_tool.run(filepath=f"{subdir}/{config_file}")
+                    if "Not found" not in content:
+                        detected_langs.append((subdir, lang, config_file))
+                        stack["file_map"][subdir] = lang
+                        stack["components"].append({
+                            "directory": subdir,
+                            "language": lang,
+                            "config": f"{subdir}/{config_file}",
+                        })
+                        project_info += f"\n{subdir}/{config_file}:\n{content[:200]}\n"
         
         # Also check directory structure
         if list_tool:
             root_files = list_tool.run(directory=".", pattern="")
             project_info = f"Root files:\n{root_files}\n" + project_info
         
-        # Determine stack from detected files
-        if "rust" in detected_langs:
+        # Build instructions based on ALL detected components
+        root_langs = [lang for dir, lang, _ in detected_langs if dir == "root"]
+        all_langs = [lang for _, lang, _ in detected_langs]
+        
+        if stack["components"]:
+            # Multi-component project — build directory-specific instructions
+            component_map = "\n".join(
+                f"  {c['directory']}/ → {c['language'].upper()} (config: {c['config']})"
+                for c in stack["components"]
+            )
+            stack["instructions"] = (
+                f"MULTI-COMPONENT PROJECT. Each directory has its own language:\n"
+                f"{component_map}\n"
+                f"WRITE FILES IN THE CORRECT DIRECTORY for the component you're working on. "
+                f"Do NOT mix languages across directories."
+            )
+        
+        # Determine primary stack from root-level files
+        if "rust" in root_langs or "rust" in all_langs:
             stack["backend"] = "Rust"
             # Read Cargo.toml for framework
             cargo = read_tool.run(filepath="Cargo.toml")
