@@ -1,110 +1,175 @@
-"""ForgeFleet Configuration — single source of truth. No hardcoding anywhere else.
+"""ForgeFleet Configuration — SINGLE SOURCE OF TRUTH.
 
-All settings loaded from:
-1. Environment variables (highest priority)
-2. ~/.forgefleet/config.json (user config)
-3. fleet.json (node discovery)
-4. Defaults (lowest priority)
+One config file: ~/.forgefleet/config.json
+Contains EVERYTHING: nodes, services, notifications, ports.
+Exposed via MCP server — OpenClaw, MC, Claude all read from here.
 
-NOTHING should be hardcoded in any module. Import from here.
+No more fleet.json, no more scattered configs.
 """
 import json
 import os
+import socket
 from dataclasses import dataclass, field
 
 
-def _load_config_file() -> dict:
-    """Load ~/.forgefleet/config.json if it exists."""
-    path = os.path.expanduser("~/.forgefleet/config.json")
-    if os.path.exists(path):
+CONFIG_PATH = os.path.expanduser("~/.forgefleet/config.json")
+
+
+def _load() -> dict:
+    """Load the master config."""
+    if os.path.exists(CONFIG_PATH):
         try:
-            with open(path) as f:
+            with open(CONFIG_PATH) as f:
                 return json.load(f)
         except:
             pass
     return {}
 
 
-def _load_fleet_json() -> dict:
-    """Load fleet.json for node info."""
-    for path in [
+def _save(config: dict):
+    """Save the master config."""
+    os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(config, f, indent=2)
+
+
+def get(key: str, default=None):
+    """Get a config value. env var → config file → default."""
+    env_key = f"FORGEFLEET_{key.upper()}"
+    env_val = os.environ.get(env_key)
+    if env_val is not None:
+        return env_val
+    config = _load()
+    return config.get(key, default)
+
+
+def set_value(key: str, value):
+    """Set a config value."""
+    config = _load()
+    config[key] = value
+    _save(config)
+
+
+def get_all() -> dict:
+    """Get the entire config."""
+    return _load()
+
+
+# ─── Convenience accessors ──────────────────────────────
+
+def get_nodes() -> dict:
+    """Get all fleet nodes."""
+    return get("nodes", {})
+
+
+def get_node(name: str) -> dict:
+    """Get a specific node's config."""
+    return get_nodes().get(name, {})
+
+
+def get_node_ip(name: str) -> str:
+    """Get a node's primary IP."""
+    return get_node(name).get("ip", "")
+
+
+def get_gateway_node() -> str:
+    """Find which node is the gateway."""
+    for name, node in get_nodes().items():
+        if node.get("role") == "gateway":
+            return name
+    return ""
+
+
+def get_mc_url() -> str:
+    """Get Mission Control URL — derived from gateway node."""
+    mc_port = get("services", {}).get("mc", {}).get("port", 60002)
+    gateway = get_gateway_node()
+    if gateway:
+        ip = get_node_ip(gateway)
+        return f"http://{ip}:{mc_port}"
+    return get("mc_url", "http://localhost:60002")
+
+
+def get_telegram_config() -> dict:
+    """Get Telegram notification config."""
+    return get("notifications", {}).get("telegram", {})
+
+
+def get_llm_ports() -> list:
+    """Get LLM scan ports."""
+    return get("llm_ports", [51800, 51801, 51802, 51803])
+
+
+def get_local_ip() -> str:
+    """Get this machine's LAN IP."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except:
+        return "127.0.0.1"
+
+
+def get_node_name() -> str:
+    """Get this machine's node name from config."""
+    local_ip = get_local_ip()
+    for name, node in get_nodes().items():
+        if node.get("ip") == local_ip:
+            return name
+        if local_ip in node.get("alt_ips", []):
+            return name
+    return os.uname().nodename.split(".")[0].lower()
+
+
+# ─── Initialize default config if missing ───────────────
+
+def init_default():
+    """Create default config if none exists. Merges fleet.json if available."""
+    if os.path.exists(CONFIG_PATH):
+        config = _load()
+        if config.get("nodes"):
+            return  # Already has nodes — don't overwrite
+    
+    config = _load() or {}
+    
+    # Try to import from fleet.json
+    for fleet_path in [
         os.path.expanduser("~/fleet.json"),
         os.path.expanduser("~/.openclaw/workspace/fleet.json"),
     ]:
-        if os.path.exists(path):
+        if os.path.exists(fleet_path):
             try:
-                with open(path) as f:
-                    return json.load(f)
+                with open(fleet_path) as f:
+                    fleet = json.load(f)
+                config["nodes"] = fleet.get("nodes", {})
+                break
             except:
                 pass
-    return {}
-
-
-_user_config = _load_config_file()
-_fleet = _load_fleet_json()
-
-
-# ─── Getters (env var → config file → default) ─────────
-
-def get(key: str, default=None):
-    """Get a config value. Priority: env var → config file → default."""
-    env_key = f"FORGEFLEET_{key.upper()}"
-    return os.environ.get(env_key, _user_config.get(key, default))
-
-
-# ─── Core Settings ──────────────────────────────────────
-
-# Mission Control
-MC_URL = get("mc_url", "http://192.168.5.100:60002")
-
-# Telegram notifications
-TELEGRAM_CHAT_ID = get("telegram_chat_id", "8496613333")
-TELEGRAM_CHANNEL = get("telegram_channel", "telegram")
-
-# Default repo (can be overridden per-task)
-DEFAULT_REPO = get("default_repo", os.getcwd())
-
-# Node identity
-NODE_NAME = get("node_name", os.uname().nodename.split(".")[0].lower())
-
-# ForgeFleet ports
-FORGEFLEET_PORT = int(get("port", "51820"))
-ANNOUNCE_PORT = int(get("announce_port", "50099"))
-
-# LLM scan ports
-LLM_PORTS = [int(p) for p in get("llm_ports", "51800,51801,51802,51803").split(",")]
-
-# Fleet data directory
-DATA_DIR = get("data_dir", os.path.expanduser("~/.forgefleet"))
-
-# Timeouts per tier
-TIER_TIMEOUTS = {
-    1: int(get("tier1_timeout", "120")),
-    2: int(get("tier2_timeout", "300")),
-    3: int(get("tier3_timeout", "600")),
-    4: int(get("tier4_timeout", "900")),
-}
-
-
-def get_fleet_nodes() -> dict:
-    """Get node info from fleet.json."""
-    return _fleet.get("nodes", {})
-
-
-def get_node_ip(node_name: str) -> str:
-    """Get IP for a node name."""
-    nodes = get_fleet_nodes()
-    node = nodes.get(node_name, {})
-    return node.get("ip", "")
-
-
-def save_config(updates: dict):
-    """Save updates to ~/.forgefleet/config.json."""
-    config_path = os.path.expanduser("~/.forgefleet/config.json")
-    os.makedirs(os.path.dirname(config_path), exist_ok=True)
     
-    existing = _load_config_file()
-    existing.update(updates)
+    # Set defaults for anything missing
+    config.setdefault("nodes", {})
+    config.setdefault("services", {
+        "mc": {"port": 60002},
+        "forgefleet": {"port": 51820},
+        "hireflow_backend": {"port": 8180},
+        "hireflow_frontend": {"port": 3100},
+    })
+    config.setdefault("notifications", {
+        "telegram": {
+            "chat_id": "8496613333",
+            "channel": "telegram",
+        }
+    })
+    config.setdefault("llm_ports", [51800, 51801, 51802, 51803])
+    config.setdefault("announce_port", 50099)
+    config.setdefault("tier_timeouts", {
+        "1": 120, "2": 300, "3": 600, "4": 900,
+    })
     
-    with open(config_path, "w") as f:
-        json.dump(existing, f, indent=2)
+    _save(config)
+
+
+# Auto-initialize on import
+init_default()

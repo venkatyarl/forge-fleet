@@ -180,6 +180,28 @@ class MCPServer:
                     "required": ["condition"],
                 },
             },
+            "fleet_config": {
+                "description": "Get or set ForgeFleet configuration. Single source of truth for all fleet data — nodes, services, notifications, ports. Other services (OpenClaw, MC, Claude) should query this instead of reading fleet.json directly.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": ["get_all", "get_nodes", "get_node", "get_services", "set"],
+                            "description": "What to do",
+                            "default": "get_all",
+                        },
+                        "key": {
+                            "type": "string",
+                            "description": "Config key (for get/set)",
+                        },
+                        "value": {
+                            "type": "string",
+                            "description": "Value to set (for set action)",
+                        },
+                    },
+                },
+            },
             "fleet_crew": {
                 "description": "Run a multi-agent coding crew on a task. Three agents work sequentially: Context Engineer (9B) researches the codebase, Code Writer (32B) implements, Code Reviewer (72B) verifies.",
                 "inputSchema": {
@@ -338,6 +360,28 @@ class MCPServer:
             
             elapsed = int(time.time() - start_time)
             return f"⏰ Timeout after {elapsed}s waiting for {condition}"
+        
+        elif name == "fleet_config":
+            from forgefleet import config as ff_config
+            action = args.get("action", "get_all")
+            
+            if action == "get_all":
+                return json.dumps(ff_config.get_all(), indent=2)
+            elif action == "get_nodes":
+                return json.dumps(ff_config.get_nodes(), indent=2)
+            elif action == "get_node":
+                node_name = args.get("key", "")
+                return json.dumps(ff_config.get_node(node_name), indent=2)
+            elif action == "get_services":
+                return json.dumps(ff_config.get("services", {}), indent=2)
+            elif action == "set":
+                key = args.get("key", "")
+                value = args.get("value", "")
+                if key:
+                    ff_config.set_value(key, value)
+                    return f"Set {key} = {value}"
+                return "No key provided"
+            return "Unknown action"
         
         elif name == "fleet_install_model":
             ip = self._resolve_node(args["node"])
