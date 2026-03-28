@@ -125,11 +125,22 @@ class LifecycleManager:
                     time.sleep(30)
                     continue
                 
-                # Check LLM health first
+                # Check LLM health
                 restarted = self.updater.check_and_restart_llms()
                 if restarted:
                     print(f"  🔧 Restarted LLMs: {restarted}", flush=True)
-                    time.sleep(10)  # Let them load
+                    time.sleep(10)
+                
+                # Check Docker services (MC, HireFlow backend)
+                from .docker_monitor import DockerMonitor
+                docker = DockerMonitor()
+                docker_restarted = docker.check_and_restart_all()
+                if docker_restarted:
+                    print(f"  🐳 Docker: {docker_restarted}", flush=True)
+                    self.notify.send_message(
+                        f"🐳 ForgeFleet restarted Docker: {', '.join(docker_restarted)}",
+                        silent=True,
+                    )
                 
                 # Run the current phase
                 if self.state.phase == "work":
