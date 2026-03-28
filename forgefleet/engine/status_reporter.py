@@ -31,15 +31,21 @@ class StatusReporter:
             busy = [ep for ep in router.endpoints if ep.busy]
             lines.append(f"\n⚡ LLMs: {len(healthy)}/{len(router.endpoints)} healthy, {len(busy)} busy")
             
+            # Map IPs to node names
+            from forgefleet import config as ff_config
+            ip_to_name = {node.get("ip", ""): name for name, node in ff_config.get_nodes().items()}
+            
             by_tier = {}
             for ep in router.endpoints:
                 by_tier.setdefault(ep.tier, []).append(ep)
+            
+            tier_names = {1: "9B fast", 2: "32B code", 3: "72B review", 4: "235B expert"}
             for tier in sorted(by_tier.keys()):
                 eps = by_tier[tier]
-                names = ", ".join(ep.node for ep in eps)
+                names = ", ".join(ip_to_name.get(ep.ip, ep.ip) for ep in eps)
                 busy_count = sum(1 for ep in eps if ep.busy)
                 status = f"({busy_count} busy)" if busy_count else "(idle)"
-                lines.append(f"  T{tier}: {len(eps)} endpoints {status} — {names}")
+                lines.append(f"  T{tier} {tier_names.get(tier, '')}: {len(eps)} {status} — {names}")
         except Exception as e:
             lines.append(f"\n⚡ LLMs: error — {e}")
         
