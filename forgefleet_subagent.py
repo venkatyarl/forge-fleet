@@ -1,5 +1,5 @@
-"""ForgeFleet Sub-Agent — runs on remote nodes."""
-import sys, os, time, signal, subprocess
+"""ForgeFleet Sub-Agent v2 — auto-detects tech stack, never builds wrong."""
+import sys, os, time, signal, subprocess, json
 
 sys.path.insert(0, os.path.expanduser("~/taylorProjects/forge-fleet"))
 
@@ -22,8 +22,48 @@ def stop(s, f):
     running = False
 signal.signal(signal.SIGTERM, stop)
 
-print(f"Sub-agent {NODE}: {len(router.endpoints)} endpoints", flush=True)
+# AUTO-DETECT tech stack from actual repo files
+def detect_tech_stack(repo_dir):
+    """Read the repo to determine tech stack — never guess."""
+    stack = {"backend": "", "frontend": "", "database": "", "instructions": ""}
+    
+    if os.path.exists(os.path.join(repo_dir, "Cargo.toml")):
+        stack["backend"] = "Rust + Axum"
+        stack["instructions"] = (
+            "MANDATORY: This is a RUST project. "
+            "ALL backend code MUST be Rust. NEVER write Python, Flask, Django, or any other language. "
+            "Rust files go in rust-backend/crates/CRATE_NAME/src/. "
+            "Use sqlx::query_as(), NOT sqlx::query! macros. "
+            "Use Uuid for IDs, DateTime<Utc> for timestamps."
+        )
+    elif os.path.exists(os.path.join(repo_dir, "requirements.txt")):
+        stack["backend"] = "Python"
+        stack["instructions"] = "This is a Python project. Write Python code."
+    
+    if os.path.exists(os.path.join(repo_dir, "package.json")):
+        try:
+            pkg = json.loads(open(os.path.join(repo_dir, "package.json")).read())
+            deps = pkg.get("dependencies", {})
+            if "next" in deps:
+                stack["frontend"] = "Next.js + React + TypeScript"
+            elif "react" in deps:
+                stack["frontend"] = "React + TypeScript"
+        except: pass
+    
+    for f in ["docker-compose.yml", "docker-compose.yaml"]:
+        path = os.path.join(repo_dir, f)
+        if os.path.exists(path):
+            content = open(path).read().lower()
+            if "postgres" in content: stack["database"] = "PostgreSQL"
+            elif "mysql" in content: stack["database"] = "MySQL"
+    
+    return stack
 
+tech = detect_tech_stack(repo)
+print(f"Sub-agent {NODE}: {len(router.endpoints)} endpoints", flush=True)
+print(f"Tech stack: {tech['backend']} / {tech['frontend']} / {tech['database']}", flush=True)
+
+# TOOLS with tech-stack aware write_file
 def rf(filepath=""):
     f = os.path.join(repo, filepath)
     if not os.path.exists(f): return f"Not found: {filepath}"
@@ -43,8 +83,13 @@ def lf(directory=".", pattern=""):
     return "\n".join(files[:30])
 
 def wf(filepath="", content=""):
-    if filepath.startswith("src/") and not filepath.startswith("src/app"):
-        return "REJECTED: write to rust-backend/crates/ not src/"
+    # GUARD: reject wrong-stack files based on detected tech
+    if tech["backend"] == "Rust + Axum":
+        if filepath.endswith(".py") and not filepath.startswith("scripts/"):
+            return f"REJECTED: This is a Rust project. Cannot write Python file: {filepath}"
+        if filepath.startswith("src/") and not filepath.startswith(("src/app", "src/components", "src/pages", "src/lib")):
+            return f"REJECTED: Rust files go in rust-backend/crates/CRATE_NAME/src/, not {filepath}"
+    
     f = os.path.join(repo, filepath)
     os.makedirs(os.path.dirname(f), exist_ok=True)
     open(f, "w").write(content)
@@ -60,11 +105,9 @@ def rc(command=""):
 tools = [
     Tool(name="read_file", description="Read a file", parameters={"type": "object", "properties": {"filepath": {"type": "string"}}, "required": ["filepath"]}, func=rf),
     Tool(name="list_files", description="List files", parameters={"type": "object", "properties": {"directory": {"type": "string"}, "pattern": {"type": "string"}}}, func=lf),
-    Tool(name="write_file", description="Write file. Rust goes in rust-backend/crates/", parameters={"type": "object", "properties": {"filepath": {"type": "string"}, "content": {"type": "string"}}, "required": ["filepath", "content"]}, func=wf),
+    Tool(name="write_file", description="Write file", parameters={"type": "object", "properties": {"filepath": {"type": "string"}, "content": {"type": "string"}}, "required": ["filepath", "content"]}, func=wf),
     Tool(name="run_command", description="Run command", parameters={"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}, func=rc),
 ]
-
-tech = {"backend": "Rust+Axum", "frontend": "Next.js+React+TypeScript", "database": "PostgreSQL"}
 
 end_time = time.time() + 36000  # 10 hours
 done = 0
@@ -98,7 +141,7 @@ while running and time.time() < end_time:
                 mc.update_ticket(tid, "ready_for_review", result=f"Built by {NODE}")
                 done += 1
                 print(f"[{NODE}] ✅ Done → {branch}", flush=True)
-                # Notify via Telegram
+                # Notify
                 try:
                     subprocess.run(["ssh", "192.168.5.100", f"openclaw message send --target 8496613333 --channel telegram --message '✅ [{NODE}] Built: {title[:40]} → {branch}' --silent"], capture_output=True, timeout=15)
                 except: pass
@@ -109,7 +152,6 @@ while running and time.time() < end_time:
             mc.update_ticket(tid, "todo")
             fail += 1
             print(f"[{NODE}] ⚠️ No changes", flush=True)
-            # Notify failure
             try:
                 subprocess.run(["ssh", "192.168.5.100", f"openclaw message send --target 8496613333 --channel telegram --message '❌ [{NODE}] No changes: {title[:40]}' --silent"], capture_output=True, timeout=15)
             except: pass
