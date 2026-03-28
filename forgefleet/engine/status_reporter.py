@@ -116,6 +116,66 @@ class StatusReporter:
         except:
             pass
         
+        # Code sync — are all nodes on latest?
+        try:
+            local_hash = subprocess.run(
+                ["git", "rev-parse", "HEAD"], capture_output=True, text=True,
+                timeout=5, cwd=os.path.expanduser("~/taylorProjects/forge-fleet")
+            ).stdout.strip()[:8]
+            
+            from forgefleet import config
+            sync_status = []
+            for name in config.get_nodes():
+                ip = config.get_node_ip(name)
+                try:
+                    r = subprocess.run(
+                        ["ssh", "-o", "ConnectTimeout=3", ip,
+                         "ls ~/taylorProjects/forge-fleet/forgefleet/engine/docker_monitor.py 2>/dev/null && echo 'latest' || echo 'outdated'"],
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    sync_status.append(f"{name}:{'✅' if 'latest' in r.stdout else '❌'}")
+                except:
+                    sync_status.append(f"{name}:?")
+            
+            lines.append(f"\n📦 Code sync: {' '.join(sync_status)}")
+        except:
+            pass
+        
+        # Active tasks — what's being built on each node
+        try:
+            active = []
+            from forgefleet import config
+            for name in config.get_nodes():
+                ip = config.get_node_ip(name)
+                try:
+                    r = subprocess.run(
+                        ["ssh", "-o", "ConnectTimeout=3", ip,
+                         "tail -1 ~/forgefleet-agent.log 2>/dev/null | strings | head -c 50"],
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    last_line = r.stdout.strip()
+                    if last_line and "Iteration" in last_line:
+                        active.append(f"{name}: building")
+                    elif last_line:
+                        active.append(f"{name}: {last_line[:30]}")
+                except:
+                    pass
+            
+            if active:
+                lines.append(f"\n🏗️ Active: {', '.join(active)}")
+        except:
+            pass
+        
+        # Evolution stats
+        try:
+            from .evolution import EvolutionEngine
+            evo = EvolutionEngine()
+            rate = evo._overall_success_rate()
+            lines.append(f"\n📈 Success rate: {rate}")
+            evo.close()
+        except:
+            pass
+        
         return "\n".join(lines)
     
     def send_report(self):
