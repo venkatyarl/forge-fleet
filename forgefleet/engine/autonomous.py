@@ -49,7 +49,7 @@ class AutonomousWorker:
     node_name: str = "taylor-forgefleet"
     poll_interval: int = 30  # seconds between ticket checks
     max_tasks_per_session: int = 20
-    only_when_idle: bool = True
+    only_when_idle: bool = False  # Build always — idle detection broken on headless servers
     
     # Components
     router: FleetRouter = field(default_factory=FleetRouter)
