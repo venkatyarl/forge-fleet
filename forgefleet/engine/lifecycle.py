@@ -333,7 +333,7 @@ class LifecycleManager:
         self.state.phase = "analyze"
     
     def _phase_analyze(self):
-        """Find issues and plan improvements."""
+        """Find issues and plan improvements. ALWAYS try to self-update if there are unapplied insights."""
         print(f"\n🔍 Phase: ANALYZE", flush=True)
         
         insights = self.evolution.analyze()
@@ -344,9 +344,17 @@ class LifecycleManager:
         
         self.state.tasks_since_last_analyze = 0
         
-        # If there are actionable insights, self-update
-        actionable = [i for i in insights if i.confidence > 0.7]
-        if actionable and self._should_self_update():
+        # Check for unapplied insights — ALWAYS try to fix them
+        unapplied = self.evolution.db.execute(
+            "SELECT COUNT(*) FROM insights WHERE applied=0"
+        ).fetchone()[0]
+        
+        if unapplied > 0 and self._should_self_update():
+            print(f"  🔧 {unapplied} unapplied insights — triggering self-update", flush=True)
+            self.notify.send_message(
+                f"🔧 ForgeFleet analyzing {unapplied} unapplied insights...",
+                silent=True,
+            )
             self.state.phase = "self_update"
         elif self.state.failed_task_ids:
             self.state.phase = "verify"
@@ -357,6 +365,10 @@ class LifecycleManager:
         """Stop gracefully, fix itself, restart."""
         print(f"\n🔧 Phase: SELF-UPDATE", flush=True)
         
+        # First: apply learnings from errors to prompt templates (quick, no code changes)
+        self.updater.apply_error_learnings()
+        
+        # Then: try deeper code-level fixes
         results = self.updater.run_improvement_cycle()
         
         for r in results:

@@ -69,6 +69,43 @@ class SelfUpdater:
         self.resilience = ResilienceManager()
         self.last_update = 0
     
+    def apply_error_learnings(self):
+        """Read top errors and update prompt templates to prevent them."""
+        from .prompt_templates import TEMPLATES
+        
+        # Get top errors
+        rows = self.evolution.db.execute(
+            "SELECT error, COUNT(*) as cnt FROM task_records WHERE success=0 AND error != '' GROUP BY error ORDER BY cnt DESC LIMIT 5"
+        ).fetchall()
+        
+        if not rows:
+            return
+        
+        # Build "things to avoid" list from real errors
+        avoid_list = []
+        for error, count in rows:
+            if "Python" in error or "Flask" in error:
+                avoid_list.append("NEVER write Python/Flask code in a Rust project")
+            if "HTML" in error or "CSS" in error:
+                avoid_list.append("NEVER write plain HTML — use React components")
+            if "described instead of writing" in error:
+                avoid_list.append("ALWAYS use write_file tool — never just describe code")
+            if "junk" in error.lower() or "wrong path" in error.lower():
+                avoid_list.append("Write files to rust-backend/crates/ not src/")
+        
+        if avoid_list:
+            # Update all prompt templates with learned rules
+            for name, template in TEMPLATES.items():
+                for rule in avoid_list:
+                    if rule not in template.system_prompt:
+                        template.system_prompt += f"\n⚠️ LEARNED RULE: {rule}"
+            
+            print(f"  📝 Applied {len(avoid_list)} learned rules to prompt templates", flush=True)
+            
+            # Mark insights as applied
+            self.evolution.db.execute("UPDATE insights SET applied=1 WHERE applied=0")
+            self.evolution.db.commit()
+    
     def run_improvement_cycle(self) -> list[SelfUpdateResult]:
         """Run one self-improvement cycle.
         
