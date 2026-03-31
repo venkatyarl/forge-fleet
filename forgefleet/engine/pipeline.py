@@ -26,6 +26,8 @@ from .prompt_templates import get_template
 from .evolution import EvolutionEngine, TaskRecord
 from .task_decomposer import TaskDecomposer
 from .context_store import ContextStore
+from .ownership import OwnershipManager
+from .execution_tracking import ExecutionTracker
 
 
 @dataclass
@@ -51,7 +53,8 @@ class EngineeringPipeline:
     Each step uses the right LLM tier and runs perspectives in parallel.
     """
     
-    def __init__(self, repo_dir: str, mc_url: str = "http://192.168.5.100:60002"):
+    def __init__(self, repo_dir: str, mc_url: str = "http://192.168.5.100:60002",
+                 ownership: OwnershipManager | None = None):
         self.repo_dir = repo_dir
         self.router = FleetRouter()
         self.mc = MCClient(base_url=mc_url)
@@ -60,6 +63,7 @@ class EngineeringPipeline:
         self.context_store = ContextStore()
         self.repo_map = RepoMap(repo_dir)
         self.tools = self._build_tools()
+        self.ownership = ownership
     
     def execute(self, ticket: dict) -> PipelineResult:
         """Execute the full pipeline for a ticket."""
@@ -78,17 +82,25 @@ class EngineeringPipeline:
             print(f"\n📚 Step 1: Context Gathering", flush=True)
             context = self._gather_context(ticket)
             result.phase_results["context"] = context
+            self._record_stage_model(tid, "context_gathering")
             
             # Step 2: PLANNING
             print(f"\n📋 Step 2: Planning", flush=True)
             plan = self._create_plan(ticket, context)
             result.phase_results["plan"] = plan
+            self._record_stage_model(tid, "planning")
             
             # Step 3: PRE-BUILD MULTI-PERSPECTIVE REVIEW
             print(f"\n🔍 Step 3: Pre-Build Review ({len(PRE_BUILD_ROLES)} perspectives)", flush=True)
             pre_issues = self._multi_perspective_review(plan, PRE_BUILD_ROLES, "pre")
             result.pre_review_issues = pre_issues
             result.phase_results["pre_review"] = pre_issues
+            self._record_stage_model(tid, "pre_review")
+
+            # Add pre-build reviewers as contributors
+            if self.ownership:
+                for role in PRE_BUILD_ROLES:
+                    self.ownership.add_contributor(tid, role.name if hasattr(role, 'name') else str(role))
             
             # Check for prerequisites
             prereqs = [i for i in pre_issues if "prerequisite" in i.lower() or "dependency" in i.lower() or "blocked" in i.lower()]
@@ -103,6 +115,7 @@ class EngineeringPipeline:
             build_result = self._build(desc, context, plan)
             result.phase_results["build"] = build_result
             result.branch = branch
+            self._record_stage_model(tid, "build")
             
             # Step 5: POST-BUILD MULTI-PERSPECTIVE REVIEW
             if self.git.has_changes():
@@ -116,6 +129,12 @@ class EngineeringPipeline:
                 )
                 result.post_review_issues = post_issues
                 result.phase_results["post_review"] = post_issues
+                self._record_stage_model(tid, "post_review")
+
+                # Add reviewers to ownership tracking
+                if self.ownership:
+                    for role in POST_BUILD_ROLES:
+                        self.ownership.add_reviewer(tid, role.name if hasattr(role, 'name') else str(role))
                 
                 # Step 6: COMPLETION
                 print(f"\n✅ Step 6: Completion", flush=True)
@@ -145,6 +164,13 @@ class EngineeringPipeline:
             result.phase_results["error"] = str(e)
             self.mc.fail_ticket(tid, str(e)[:500])
             print(f"  ❌ Pipeline error: {e}", flush=True)
+            # Escalation trigger: if pipeline fails, escalate ownership
+            if self.ownership:
+                task = self.ownership.get_task(tid)
+                if task and task.owner_level != "human":
+                    ok, reason = self.ownership.escalate(tid)
+                    if ok:
+                        print(f"  ⬆️ Escalated to {reason}", flush=True)
         finally:
             self.git._run("checkout", "main")
         
@@ -161,6 +187,27 @@ class EngineeringPipeline:
         
         return result
     
+    def _record_stage_model(self, ticket_id: str, stage: str):
+        """Record which model/node was used for a pipeline stage."""
+        if not self.ownership:
+            return
+        # Use the last LLM the router handed out
+        for ep in self.router.endpoints:
+            if ep.busy:
+                self.ownership.record_model(
+                    ticket_id=ticket_id, stage=stage,
+                    model_name=ep.name, node_name=ep.node, role="executor",
+                )
+                return
+        # Fallback: record the first healthy endpoint
+        for ep in self.router.endpoints:
+            if ep.healthy:
+                self.ownership.record_model(
+                    ticket_id=ticket_id, stage=stage,
+                    model_name=ep.name, node_name=ep.node, role="executor",
+                )
+                return
+
     # ─── Step 1: Context Gathering ──────────────────
     
     def _gather_context(self, ticket: dict) -> dict:

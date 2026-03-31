@@ -27,6 +27,7 @@ from forgefleet.engine.agent import Agent
 from forgefleet.engine.task import Task
 from forgefleet.engine.crew import Crew
 from forgefleet.engine.tool import Tool
+from forgefleet.engine.model_governance import ModelGovernance
 import subprocess
 import time
 
@@ -45,6 +46,7 @@ class MCPServer:
     def __init__(self):
         self.discovery = NetworkDiscovery()
         self.router = FleetRouter()
+        self.governance = ModelGovernance()
         self.tools = self._register_tools()
     
     def _register_tools(self) -> dict:
@@ -219,6 +221,32 @@ class MCPServer:
                     },
                     "required": ["task"],
                 },
+            },
+            "model_recommend": {
+                "description": "Recommend a model/mode for a task type using ForgeFleet governance history.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "task_type": {
+                            "type": "string",
+                            "description": "Task type to recommend a model for"
+                        }
+                    },
+                    "required": ["task_type"]
+                }
+            },
+            "model_stats": {
+                "description": "Show historical model performance for a task type from the ForgeFleet governance database.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "task_type": {
+                            "type": "string",
+                            "description": "Task type to inspect"
+                        }
+                    },
+                    "required": ["task_type"]
+                }
             },
         }
     

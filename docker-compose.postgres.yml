@@ -1,0 +1,16 @@
+services:
+  forgefleet-postgres:
+    image: postgres:16
+    container_name: forgefleet-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: forgefleet
+      POSTGRES_USER: forgefleet
+      POSTGRES_PASSWORD: forgefleet
+    ports:
+      - "55432:5432"
+    volumes:
+      - forgefleet_postgres_data:/var/lib/postgresql/data
+
+volumes:
+  forgefleet_postgres_data:

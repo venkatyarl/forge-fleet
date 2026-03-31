@@ -90,6 +90,66 @@ def get_telegram_config() -> dict:
 def get_llm_ports() -> list:
     return get("llm.ports", [51800, 51801, 51802, 51803])
 
+def get_ports() -> dict:
+    return get("ports", {})
+
+def get_scheduling() -> dict:
+    return get("scheduling", {})
+
+def get_canonical_writer() -> str:
+    return get("scheduling.canonical_writer", get_gateway_node() or "taylor")
+
+def get_node_capabilities(name: str) -> dict:
+    return get_node(name).get("capabilities", {})
+
+def get_node_preferences(name: str) -> dict:
+    return get_node(name).get("preferences", {})
+
+def get_node_resources(name: str) -> dict:
+    return get_node(name).get("resources", {})
+
+def get_mcp_topology() -> dict:
+    return get("mcp", {})
+
+def get_enrollment() -> dict:
+    return get("enrollment", {})
+
+def get_bootstrap_targets() -> list:
+    return get("bootstrap_targets", [])
+
+def get_database() -> dict:
+    return get("database", {})
+
+def get_database_url() -> str:
+    db = get_database()
+    env_url = os.environ.get("FORGEFLEET_DATABASE_URL")
+    if env_url:
+        return env_url
+    url = db.get("url")
+    if url:
+        return url
+    host = db.get("host", "127.0.0.1")
+    port = db.get("port", 5432)
+    name = db.get("name", "forgefleet")
+    user = db.get("user", "forgefleet")
+    password = db.get("password", "forgefleet")
+    return f"postgresql://{user}:{password}@{host}:{port}/{name}"
+
+def get_node_models(name: str) -> dict:
+    return get_node(name).get("models", {})
+
+def get_all_models() -> list[dict]:
+    models = []
+    for node_name, node in get_nodes().items():
+        for model_key, model in node.get("models", {}).items():
+            models.append({
+                "key": model_key,
+                "node": node_name,
+                "ip": node.get("ip", "127.0.0.1"),
+                **model,
+            })
+    return models
+
 def get_tier_timeout(tier: int) -> int:
     return get(f"llm.timeouts.tier{tier}", 300)
 

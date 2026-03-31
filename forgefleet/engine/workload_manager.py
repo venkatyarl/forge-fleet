@@ -13,6 +13,8 @@ from .fleet_router import FleetRouter
 from .mc_client import MCClient
 from .pipeline import EngineeringPipeline, PipelineResult
 from .task_decomposer import TaskDecomposer
+from .ownership import OwnershipManager
+from .execution_tracking import ExecutionTracker
 from .llm import LLM
 
 
@@ -37,12 +39,23 @@ class WorkloadManager:
         self.router = FleetRouter()
         self.mc = MCClient()
         self.decomposer = TaskDecomposer()
+        self._init_tracker()
         self.active_tasks: dict = {}  # ticket_id -> future
         self.completed: list[PipelineResult] = []
         
         # Performance tracking
         self.avg_simple_time = 30  # seconds
         self.avg_complex_time = 300
+
+    def _init_tracker(self):
+        try:
+            self.tracker = ExecutionTracker()
+        except Exception:
+            self.tracker = None
+        self.ownership = OwnershipManager(
+            node_name=self.mc.node_name,
+            tracker=self.tracker,
+        )
     
     def decide_concurrency(self, tickets: list[dict]) -> WorkloadDecision:
         """Decide how many tickets to run concurrently."""
@@ -128,24 +141,48 @@ class WorkloadManager:
         print(f"   Running {decision.max_concurrent} tickets concurrently", flush=True)
         
         results = []
-        pipeline = EngineeringPipeline(self.repo_dir)
+        pipeline = EngineeringPipeline(self.repo_dir, ownership=self.ownership)
         
         with ThreadPoolExecutor(max_workers=decision.max_concurrent) as executor:
             futures = {}
             
             for ticket in tickets[:decision.max_concurrent]:
-                self.mc.claim_ticket(ticket["id"])
+                ticket_id = ticket["id"]
+                claimed, reason = self.ownership.claim(ticket_id)
+                if not claimed:
+                    print(f"  ⏭️ Skipping {ticket['title'][:50]} ({reason})", flush=True)
+                    continue
+
+                mc_claim = self.mc.claim_ticket(ticket_id)
+                if isinstance(mc_claim, dict) and mc_claim.get("error"):
+                    self.ownership.release(ticket_id, final_state="mc_claim_failed")
+                    print(f"  ⏭️ Skipping {ticket['title'][:50]} (mc_claim_failed)", flush=True)
+                    continue
+
+                can_execute, exec_reason = self.ownership.can_execute(ticket_id)
+                if not can_execute:
+                    self.ownership.release(ticket_id, final_state=exec_reason)
+                    print(f"  ⏭️ Skipping {ticket['title'][:50]} ({exec_reason})", flush=True)
+                    continue
+
                 future = executor.submit(pipeline.execute, ticket)
                 futures[future] = ticket
+                self.active_tasks[ticket_id] = future
             
             for future in as_completed(futures):
                 ticket = futures[future]
+                ticket_id = ticket["id"]
                 try:
                     result = future.result()
                     results.append(result)
                     icon = "✅" if result.success else "❌"
+                    final_state = "completed" if result.success else "failed"
+                    self.ownership.release(ticket_id, final_state=final_state)
+                    self.active_tasks.pop(ticket_id, None)
                     print(f"  {icon} {result.title[:50]} ({result.total_time:.0f}s)", flush=True)
                 except Exception as e:
+                    self.ownership.release(ticket_id, final_state="exception")
+                    self.active_tasks.pop(ticket_id, None)
                     print(f"  ❌ {ticket['title'][:50]}: {e}", flush=True)
         
         self.completed.extend(results)

@@ -1,5 +1,11 @@
 """Task — a unit of work assigned to an agent."""
+from __future__ import annotations
+
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .lifecycle_policy import LifecyclePolicy
 
 
 @dataclass
@@ -14,6 +20,9 @@ class Task:
     agent: object = None  # Agent instance
     context_tasks: list = field(default_factory=list)  # Tasks whose output feeds into this
     output: str = ""  # Filled after execution
+    retries: int = 0
+    review_loops: int = 0
+    lifecycle_state: str = "todo"
     
     def execute(self, extra_context: str = "") -> str:
         """Execute the task using its assigned agent."""

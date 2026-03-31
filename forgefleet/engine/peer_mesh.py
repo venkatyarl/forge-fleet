@@ -1,9 +1,12 @@
-"""Peer Mesh — nodes discover each other, elect coordinators, share state.
+"""Peer Mesh — nodes discover each other, elect degraded-mode coordinators, share state.
 
 Three capabilities:
 1. Peer Discovery: each node pings all others on port 51820
-2. Coordinator Election: if Taylor dies, another node takes over
+2. Degraded-Mode Operational Coordination: if Taylor is unavailable, another node can temporarily coordinate operations
 3. Build Queue Sync: nodes announce what they're working on to avoid duplicates
+
+Important: operational coordinator != canonical global governance writer.
+Taylor remains the canonical writer for global governance state when available.
 """
 import json
 import os
@@ -30,11 +33,12 @@ class PeerInfo:
 class PeerMesh:
     """Distributed peer mesh — every node knows about every other node.
     
-    No central coordinator required (but one is elected for efficiency).
+    Canonical governance writing and degraded-mode operational coordination are separate concepts.
     Each node:
     - Pings all peers every 30s
     - Knows who's alive, who's building what
-    - If coordinator dies, highest-RAM surviving node takes over
+    - May elect a degraded-mode operational coordinator when canonical primary is unavailable
+    - Does not assume operational coordination implies canonical governance authority
     """
     
     def __init__(self):
@@ -44,7 +48,8 @@ class PeerMesh:
         self.local_ip = config.get_local_ip()
         self.peers: dict[str, PeerInfo] = {}
         self.current_task: str = ""  # What THIS node is building
-        self.coordinator: str = ""  # Who's the current coordinator
+        self.operational_coordinator: str = ""  # Temporary degraded-mode coordinator
+        self.canonical_writer: str = config.get_canonical_writer()
         self._lock = threading.Lock()
         
         # Initialize peer list from config
@@ -81,10 +86,11 @@ class PeerMesh:
         return results
     
     def elect_coordinator(self) -> str:
-        """Elect a coordinator — highest RAM node that's alive.
+        """Elect a degraded-mode operational coordinator — highest RAM node that's alive.
         
-        If Taylor (gateway) is alive, it's always coordinator.
-        If Taylor dies, the highest-RAM surviving node takes over.
+        If Taylor (gateway) is alive, it's always the operational coordinator.
+        If Taylor is unavailable, the highest-RAM surviving node temporarily coordinates operations.
+        This does NOT change canonical global governance writer semantics.
         """
         candidates = []
         
@@ -103,20 +109,24 @@ class PeerMesh:
         # Gateway always wins if alive
         for name, ram, role in candidates:
             if role == "gateway":
-                self.coordinator = name
+                self.operational_coordinator = name
                 return name
         
         # Otherwise highest RAM
         candidates.sort(key=lambda c: c[1], reverse=True)
         if candidates:
-            self.coordinator = candidates[0][0]
-            return self.coordinator
+            self.operational_coordinator = candidates[0][0]
+            return self.operational_coordinator
         
         return self.node_name  # Fallback to self
     
     def is_coordinator(self) -> bool:
-        """Am I the current coordinator?"""
-        return self.coordinator == self.node_name
+        """Am I the current degraded-mode operational coordinator?"""
+        return self.operational_coordinator == self.node_name
+
+    def is_canonical_writer(self) -> bool:
+        """Am I the canonical global governance writer?"""
+        return self.canonical_writer == self.node_name
     
     def announce_task(self, ticket_id: str, title: str):
         """Announce what this node is working on — prevents duplicate claims."""
@@ -171,11 +181,13 @@ class PeerMesh:
                 "last_seen": peer.last_seen,
                 "agent_running": peer.agent_running,
                 "current_task": peer.current_task,
-                "is_coordinator": self.coordinator == name,
+                "is_coordinator": self.operational_coordinator == name,
             }
         
         return {
-            "coordinator": self.coordinator,
+            "canonical_writer": self.canonical_writer,
+            "coordinator": self.operational_coordinator,
+            "is_canonical_writer": self.is_canonical_writer(),
             "nodes": nodes,
             "total_alive": sum(1 for n in nodes.values() if n["healthy"]),
             "total_building": sum(1 for n in nodes.values() if n.get("current_task")),
