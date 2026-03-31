@@ -28,6 +28,8 @@ from .task_decomposer import TaskDecomposer
 from .context_store import ContextStore
 from .ownership import OwnershipManager
 from .execution_tracking import ExecutionTracker
+from .lifecycle_policy import LifecyclePolicy, MergeContext
+from .mcp_topology import MCPTopology
 
 
 @dataclass
@@ -44,6 +46,12 @@ class PipelineResult:
     post_review_issues: list = field(default_factory=list)
     prerequisite_tickets: list = field(default_factory=list)
     unblocked_tickets: list = field(default_factory=list)
+    done_state: str = ""
+    final_state: str = ""
+    auto_merge_reason: str = ""
+    execution_retries: int = 0
+    review_loops: int = 0
+    topology: dict = field(default_factory=dict)
 
 
 class EngineeringPipeline:
@@ -64,12 +72,15 @@ class EngineeringPipeline:
         self.repo_map = RepoMap(repo_dir)
         self.tools = self._build_tools()
         self.ownership = ownership
+        self.lifecycle = LifecyclePolicy()
+        self.topology = MCPTopology.from_config()
     
     def execute(self, ticket: dict) -> PipelineResult:
         """Execute the full pipeline for a ticket."""
         tid = ticket["id"]
         title = ticket.get("title", "")
         desc = ticket.get("description", title)
+        task_type = self._detect_task_type(desc)
         
         result = PipelineResult(ticket_id=tid, title=title)
         start = time.time()
@@ -78,6 +89,17 @@ class EngineeringPipeline:
         print(f"🎯 Pipeline: {title[:60]}", flush=True)
         
         try:
+            topology_validation = self._validate_runtime_topology()
+            result.topology = topology_validation
+            result.phase_results["topology"] = topology_validation
+            if not topology_validation.get("can_proceed", True):
+                result.final_state = self.lifecycle.failure_state(blocked=True)
+                result.phase_results["error"] = topology_validation.get("summary", "MCP topology blocked execution")
+                print(f"  ⛔ {topology_validation.get('summary', 'MCP topology blocked execution')}", flush=True)
+                return self._finalize_result(result, task_type=task_type, start_time=start)
+            if topology_validation.get("degraded"):
+                print(f"  ⚠️ {topology_validation.get('summary', 'MCP topology degraded')}", flush=True)
+
             # Step 1: CONTEXT GATHERING
             print(f"\n📚 Step 1: Context Gathering", flush=True)
             context = self._gather_context(ticket)
@@ -103,7 +125,10 @@ class EngineeringPipeline:
                     self.ownership.add_contributor(tid, role.name if hasattr(role, 'name') else str(role))
             
             # Check for prerequisites
-            prereqs = [i for i in pre_issues if "prerequisite" in i.lower() or "dependency" in i.lower() or "blocked" in i.lower()]
+            prereqs = [
+                i for i in pre_issues
+                if "prerequisite" in i.lower() or "dependency" in i.lower() or "blocked" in i.lower()
+            ]
             if prereqs:
                 result.prerequisite_tickets = self._create_prerequisite_tickets(tid, prereqs)
                 print(f"  ⚠️ Created {len(result.prerequisite_tickets)} prerequisite tickets", flush=True)
@@ -112,56 +137,71 @@ class EngineeringPipeline:
             print(f"\n🔨 Step 4: Build", flush=True)
             branch = f"feat/forgefleet-{tid[:8]}"
             self.git.create_branch(branch)
-            build_result = self._build(desc, context, plan)
+            build_result = self._build_with_retry(tid, desc, context, plan, result)
             result.phase_results["build"] = build_result
             result.branch = branch
             self._record_stage_model(tid, "build")
+
+            tests_passed = self._tests_passed(build_result)
+            if not tests_passed:
+                result.final_state = self.lifecycle.failure_state(failed_test=True)
+                self.mc.fail_ticket(tid, "Build/test stage did not produce a passing result")
+                print(f"  ❌ Build/test stage did not pass lifecycle policy", flush=True)
+                return self._finalize_result(result, task_type=task_type, start_time=start)
             
             # Step 5: POST-BUILD MULTI-PERSPECTIVE REVIEW
             if self.git.has_changes():
                 print(f"\n🔬 Step 5: Post-Build Review ({len(POST_BUILD_ROLES)} perspectives)", flush=True)
-                
-                # Get the diff for review
-                diff = self.git._run("diff", "--cached").output if self.git.has_changes() else ""
-                post_issues = self._multi_perspective_review(
-                    f"Code changes:\n{diff[:3000]}\n\nOriginal task: {desc}",
-                    POST_BUILD_ROLES, "post"
-                )
+                post_issues = self._run_post_build_review(tid, desc, context, plan, result)
                 result.post_review_issues = post_issues
                 result.phase_results["post_review"] = post_issues
-                self._record_stage_model(tid, "post_review")
 
                 # Add reviewers to ownership tracking
                 if self.ownership:
                     for role in POST_BUILD_ROLES:
                         self.ownership.add_reviewer(tid, role.name if hasattr(role, 'name') else str(role))
+
+                if post_issues:
+                    result.final_state = self.lifecycle.failure_state(failed_review=True)
+                    self.mc.fail_ticket(
+                        tid,
+                        f"Post-review still found issues after {result.review_loops} retry loops",
+                    )
+                    print(
+                        f"  ❌ Post-review found blocking issues after {result.review_loops} retry loops",
+                        flush=True,
+                    )
+                    return self._finalize_result(result, task_type=task_type, start_time=start)
                 
                 # Step 6: COMPLETION
                 print(f"\n✅ Step 6: Completion", flush=True)
-                self.git.stage_all()
-                self.git.commit(f"feat: {title[:50]} [ForgeFleet Pipeline]")
-                push = self.git.push(branch)
-                
-                if push.success:
-                    result.success = True
-                    result.branch = branch
-                    self.mc.complete_ticket(tid, f"Built by ForgeFleet Pipeline in {time.time()-start:.0f}s", branch)
-                    
-                    # Unblock dependent tickets
-                    result.unblocked_tickets = self._unblock_dependents(tid)
-                    if result.unblocked_tickets:
-                        print(f"  🔓 Unblocked {len(result.unblocked_tickets)} dependent tickets", flush=True)
-                    
-                    print(f"  ✅ Pushed to {branch}", flush=True)
-                else:
-                    self.mc.fail_ticket(tid, f"Push failed: {push.error}")
-                    print(f"  ❌ Push failed", flush=True)
+                completion = self._complete_execution(
+                    tid=tid,
+                    title=title,
+                    desc=desc,
+                    branch=branch,
+                    task_type=task_type,
+                    tests_passed=tests_passed,
+                    review_passed=not post_issues,
+                    result=result,
+                    start_time=start,
+                )
+                result.phase_results["completion"] = completion
+                result.success = completion.get("success", False)
+                result.done_state = completion.get("done_state", "")
+                result.final_state = completion.get("final_state", result.final_state)
+                result.auto_merge_reason = completion.get("auto_merge_reason", "")
+                if result.success and result.unblocked_tickets:
+                    print(f"  🔓 Unblocked {len(result.unblocked_tickets)} dependent tickets", flush=True)
             else:
+                result.final_state = self.lifecycle.failure_state(execution_failed=True)
                 self.mc.fail_ticket(tid, "No code changes produced")
                 print(f"  ⚠️ No changes produced", flush=True)
             
         except Exception as e:
             result.phase_results["error"] = str(e)
+            if not result.final_state:
+                result.final_state = self.lifecycle.failure_state(execution_failed=True)
             self.mc.fail_ticket(tid, str(e)[:500])
             print(f"  ❌ Pipeline error: {e}", flush=True)
             # Escalation trigger: if pipeline fails, escalate ownership
@@ -174,18 +214,237 @@ class EngineeringPipeline:
         finally:
             self.git._run("checkout", "main")
         
-        result.total_time = time.time() - start
-        
-        # Record in evolution engine
+        return self._finalize_result(result, task_type=task_type, start_time=start)
+
+    def _finalize_result(self, result: PipelineResult, task_type: str,
+                         start_time: float) -> PipelineResult:
+        """Finalize timing/evolution bookkeeping exactly once."""
+        if result.phase_results.get("_finalized"):
+            return result
+
+        result.total_time = time.time() - start_time
         self.evolution.record_task(TaskRecord(
-            task_id=tid, title=title,
-            task_type=self._detect_task_type(desc),
+            task_id=result.ticket_id,
+            title=result.title,
+            task_type=task_type,
             total_time=result.total_time,
-            success=result.success, pushed=result.success,
+            success=result.success,
+            pushed=result.success,
             error=result.phase_results.get("error", ""),
         ))
-        
+        result.phase_results["_finalized"] = True
         return result
+
+    def _validate_runtime_topology(self) -> dict:
+        """Validate MCP runtime links for the active ForgeFleet flow."""
+        validation = self.topology.validate(current_service="forgefleet")
+        return validation.to_dict()
+
+    def _build_with_retry(self, ticket_id: str, description: str,
+                          context: dict, plan: str,
+                          result: PipelineResult) -> dict:
+        """Run build stage with lifecycle retry limits."""
+        attempt = 0
+        last_result = {"success": False, "error": "build_not_started"}
+
+        while True:
+            try:
+                last_result = self._build(description, context, plan)
+            except Exception as e:
+                last_result = {"success": False, "error": str(e)}
+
+            build_succeeded = self._build_succeeded(last_result)
+            if build_succeeded and self.git.has_changes():
+                return last_result
+
+            if not self.lifecycle.should_retry_execution(attempt):
+                break
+
+            attempt += 1
+            result.execution_retries = attempt
+            print(
+                f"  🔁 Build retry {attempt}/{self.lifecycle.max_execution_retries} "
+                f"after unsuccessful execution",
+                flush=True,
+            )
+            self._record_stage_model(ticket_id, f"build_retry_{attempt}")
+
+        if not last_result.get("error") and not self.git.has_changes():
+            last_result["error"] = "Build produced no file changes"
+        return last_result
+
+    def _run_post_build_review(self, ticket_id: str, description: str, context: dict,
+                               plan: str, result: PipelineResult) -> list[str]:
+        """Run post-build review and bounded repair loops."""
+        review_loops = 0
+        issues = self._review_current_changes(description)
+        result.phase_results["post_review_attempt_0"] = issues
+        self._record_stage_model(ticket_id, "post_review")
+
+        while issues and self.lifecycle.should_retry_review(review_loops):
+            review_loops += 1
+            result.review_loops = review_loops
+            print(
+                f"  🔁 Review loop {review_loops}/{self.lifecycle.max_review_loops} "
+                f"to address {len(issues)} issue(s)",
+                flush=True,
+            )
+            feedback = "\n".join(issues)
+            retry_description = (
+                f"{description}\n\nAddress these blocking review findings before completion:\n"
+                f"{feedback[:3000]}"
+            )
+            retry_plan = f"{plan}\n\nBlocking review findings to resolve:\n{feedback[:3000]}"
+            retry_build = self._build(retry_description, context, retry_plan)
+            result.phase_results[f"build_review_loop_{review_loops}"] = retry_build
+            self._record_stage_model(ticket_id, f"build_review_loop_{review_loops}")
+
+            if not self._build_succeeded(retry_build):
+                break
+
+            issues = self._review_current_changes(description)
+            result.phase_results[f"post_review_attempt_{review_loops}"] = issues
+
+        return issues
+
+    def _review_current_changes(self, description: str) -> list[str]:
+        """Review the current working tree diff."""
+        diff_result = self.git._run("diff")
+        diff = diff_result.output if diff_result.success else diff_result.error
+        return self._multi_perspective_review(
+            f"Code changes:\n{diff[:3000]}\n\nOriginal task: {description}",
+            POST_BUILD_ROLES,
+            "post",
+        )
+
+    def _complete_execution(self, tid: str, title: str, desc: str, branch: str,
+                            task_type: str, tests_passed: bool,
+                            review_passed: bool, result: PipelineResult,
+                            start_time: float) -> dict:
+        """Apply lifecycle merge policy and complete the ticket."""
+        stage_result = self.git.stage_all()
+        if not stage_result.success:
+            return {
+                "success": False,
+                "final_state": self.lifecycle.failure_state(execution_failed=True),
+                "error": stage_result.error or stage_result.output,
+            }
+
+        commit_result = self.git.commit(f"feat: {title[:50]} [ForgeFleet Pipeline]")
+        if not commit_result.success:
+            return {
+                "success": False,
+                "final_state": self.lifecycle.failure_state(execution_failed=True),
+                "error": commit_result.error or commit_result.output,
+            }
+
+        branch_push = self.git.push(branch)
+        if not branch_push.success:
+            return {
+                "success": False,
+                "final_state": self.lifecycle.failure_state(execution_failed=True),
+                "error": branch_push.error or branch_push.output,
+            }
+
+        merge_ctx = MergeContext(
+            task_type=task_type,
+            tests_passed=tests_passed,
+            review_passed=review_passed,
+            has_blocking_feedback=not review_passed,
+            branch_mergeable=True,
+            human_review_required=False,
+            blocked_by_policy=False,
+        )
+        auto_merge_allowed, auto_merge_reason = self.lifecycle.can_auto_merge(merge_ctx)
+
+        merged = False
+        completion_message = f"Built by ForgeFleet Pipeline in {time.time() - start_time:.0f}s"
+        mc_updated = False
+
+        if auto_merge_allowed:
+            merged = self._merge_branch_to_main(branch, title)
+            if merged:
+                response = self.mc.complete_ticket(tid, completion_message, branch)
+                mc_updated = "error" not in response
+                if mc_updated:
+                    result.unblocked_tickets = self._unblock_dependents(tid)
+                    print(f"  ✅ Auto-merged via lifecycle policy and pushed {branch}", flush=True)
+            else:
+                auto_merge_reason = "merge_failed"
+
+        if not merged:
+            response = self.mc.update_ticket(
+                tid,
+                "ready_for_review",
+                result=(
+                    f"{completion_message}. Awaiting review/merge decision "
+                    f"({auto_merge_reason})."
+                ),
+                branch=branch,
+            )
+            mc_updated = "error" not in response
+            if mc_updated:
+                print(f"  ✅ Pushed to {branch} (awaiting review: {auto_merge_reason})", flush=True)
+
+        done_state = self.lifecycle.done_state(
+            merged=merged,
+            mc_updated=mc_updated,
+            review_passed=review_passed,
+            tests_passed=tests_passed,
+        )
+        final_state = done_state if mc_updated else self.lifecycle.failure_state(execution_failed=True)
+
+        return {
+            "success": mc_updated and (merged or review_passed),
+            "done_state": done_state,
+            "final_state": final_state,
+            "auto_merge_reason": auto_merge_reason,
+            "merged": merged,
+            "branch_pushed": branch_push.success,
+        }
+
+    def _merge_branch_to_main(self, branch: str, title: str) -> bool:
+        """Merge a successful branch back to main and push it."""
+        checkout_main = self.git._run("checkout", "main")
+        if not checkout_main.success:
+            return False
+
+        self.git._run("pull", "--ff-only", "origin", "main", timeout=60)
+        merge_result = self.git._run(
+            "merge",
+            "--no-ff",
+            branch,
+            "-m",
+            f"merge: {title[:50]} [ForgeFleet Pipeline]",
+            timeout=60,
+        )
+        if not merge_result.success:
+            return False
+
+        return self.git.push("main").success
+
+    def _build_succeeded(self, build_result: dict) -> bool:
+        """Infer whether the build stage succeeded enough to continue."""
+        if not isinstance(build_result, dict):
+            return bool(build_result)
+        if "success" in build_result:
+            return bool(build_result.get("success"))
+        if "tests_passed" in build_result:
+            return bool(build_result.get("tests_passed"))
+        if build_result.get("error"):
+            return False
+        return True
+
+    def _tests_passed(self, build_result: dict) -> bool:
+        """Infer test/build pass status from the build stage output."""
+        if not isinstance(build_result, dict):
+            return bool(build_result)
+
+        for key in ("tests_passed", "tests_ok", "passed", "success"):
+            if key in build_result:
+                return bool(build_result.get(key))
+
+        return self.git.has_changes() and not build_result.get("error")
     
     def _record_stage_model(self, ticket_id: str, stage: str):
         """Record which model/node was used for a pipeline stage."""
@@ -322,7 +581,7 @@ Output:
 Questions to answer:
 {chr(10).join(f'- {q}' for q in role.review_questions)}
 
-List any issues found. If everything looks good, say "No issues."
+List any issues found. If everything looks good, say \"No issues.\"
 Be specific — file names, line references, exact problems."""},
             ]
             try:

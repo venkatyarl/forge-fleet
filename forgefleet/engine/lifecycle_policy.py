@@ -72,7 +72,8 @@ class LifecyclePolicy:
         return loops < self.max_review_loops
 
     def failure_state(self, failed_test: bool = False, failed_review: bool = False,
-                      blocked: bool = False, needs_human: bool = False) -> str:
+                      blocked: bool = False, needs_human: bool = False,
+                      execution_failed: bool = False) -> str:
         if needs_human:
             return "needs_human"
         if blocked:
@@ -81,4 +82,6 @@ class LifecyclePolicy:
             return "failed_review"
         if failed_test:
             return "failed_test"
+        if execution_failed:
+            return "failed_execution"
         return "retrying"

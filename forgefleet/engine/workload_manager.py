@@ -16,6 +16,8 @@ from .task_decomposer import TaskDecomposer
 from .ownership import OwnershipManager
 from .execution_tracking import ExecutionTracker
 from .llm import LLM
+from .lifecycle_policy import LifecyclePolicy
+from .mcp_topology import MCPTopology
 
 
 @dataclass
@@ -42,6 +44,8 @@ class WorkloadManager:
         self._init_tracker()
         self.active_tasks: dict = {}  # ticket_id -> future
         self.completed: list[PipelineResult] = []
+        self.lifecycle = LifecyclePolicy()
+        self.topology = MCPTopology.from_config()
         
         # Performance tracking
         self.avg_simple_time = 30  # seconds
@@ -129,6 +133,13 @@ class WorkloadManager:
     
     def run_batch(self, max_tickets: int = 20) -> list[PipelineResult]:
         """Run a batch of tickets with dynamic concurrency."""
+        topology_validation = self.topology.validate(current_service="forgefleet")
+        if not topology_validation.can_proceed:
+            print(f"MCP topology blocked batch execution: {topology_validation.summary()}", flush=True)
+            return []
+        if topology_validation.degraded:
+            print(f"⚠️ MCP topology degraded: {topology_validation.summary()}", flush=True)
+
         tickets = self.mc.get_claimable()
         if not tickets:
             print("No claimable tickets", flush=True)
@@ -176,12 +187,19 @@ class WorkloadManager:
                     result = future.result()
                     results.append(result)
                     icon = "✅" if result.success else "❌"
-                    final_state = "completed" if result.success else "failed"
+                    final_state = result.done_state or (
+                        result.final_state or (
+                            "completed" if result.success else self.lifecycle.failure_state(execution_failed=True)
+                        )
+                    )
                     self.ownership.release(ticket_id, final_state=final_state)
                     self.active_tasks.pop(ticket_id, None)
                     print(f"  {icon} {result.title[:50]} ({result.total_time:.0f}s)", flush=True)
                 except Exception as e:
-                    self.ownership.release(ticket_id, final_state="exception")
+                    self.ownership.release(
+                        ticket_id,
+                        final_state=self.lifecycle.failure_state(execution_failed=True),
+                    )
                     self.active_tasks.pop(ticket_id, None)
                     print(f"  ❌ {ticket['title'][:50]}: {e}", flush=True)
         
