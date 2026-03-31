@@ -24,6 +24,8 @@ DEFAULT_HUMAN_REVIEW_CLASSES = {
 
 @dataclass
 class MergeContext:
+    """Inputs used to decide whether a finished branch can auto-merge."""
+
     task_type: str = "general"
     tests_passed: bool = False
     review_passed: bool = False
@@ -35,6 +37,8 @@ class MergeContext:
 
 @dataclass
 class LifecyclePolicy:
+    """Retry and merge policy for the ForgeFleet execution lifecycle."""
+
     max_execution_retries: int = 2
     max_review_loops: int = 2
     human_review_classes: set[str] = field(default_factory=lambda: set(DEFAULT_HUMAN_REVIEW_CLASSES))

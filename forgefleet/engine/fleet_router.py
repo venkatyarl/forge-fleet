@@ -9,7 +9,6 @@ import time
 import urllib.request
 import urllib.error
 from dataclasses import dataclass, field
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 from .llm import LLM
 from .scheduling_policy import SchedulingPolicy, TaskRequirements
@@ -36,7 +35,6 @@ class ModelEndpoint:
 
 @dataclass
 class FleetRouter:
-    policy: SchedulingPolicy = field(default_factory=SchedulingPolicy)
     """Routes tasks to the best available model across the fleet.
     
     Current behavior:
@@ -51,6 +49,8 @@ class FleetRouter:
     - speed-to-completion selection
     - ownership/handoff awareness
     """
+
+    policy: SchedulingPolicy = field(default_factory=SchedulingPolicy)
     fleet_path: str = ""
     endpoints: list = field(default_factory=list)
     tiers: dict = field(default_factory=dict)  # tier_num -> [endpoints]
@@ -65,7 +65,6 @@ class FleetRouter:
                 for path in [
                     os.path.expanduser("~/fleet.json"),
                     os.path.expanduser("~/.openclaw/workspace/fleet.json"),
-                    "/Users/venkat/.openclaw/workspace/fleet.json",
                 ]:
                     if os.path.exists(path):
                         self.fleet_path = path

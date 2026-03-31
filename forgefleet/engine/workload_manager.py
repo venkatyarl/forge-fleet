@@ -6,7 +6,6 @@ Decides how many tickets to work on simultaneously based on:
 - Current load on each endpoint
 - Model sizes and tiers
 """
-import time
 from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from .fleet_router import FleetRouter
@@ -15,7 +14,6 @@ from .pipeline import EngineeringPipeline, PipelineResult
 from .task_decomposer import TaskDecomposer
 from .ownership import OwnershipManager
 from .execution_tracking import ExecutionTracker
-from .llm import LLM
 from .lifecycle_policy import LifecyclePolicy
 from .mcp_topology import MCPTopology
 

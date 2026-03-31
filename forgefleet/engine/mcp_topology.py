@@ -13,6 +13,8 @@ from .. import config
 
 @dataclass
 class MCPService:
+    """Configured MCP service role and metadata."""
+
     name: str
     server: bool = False
     client: bool = False
@@ -22,6 +24,8 @@ class MCPService:
 
 @dataclass
 class MCPLink:
+    """Directed relationship between an MCP client and server service."""
+
     source: str
     target: str
     required: bool = True
@@ -34,6 +38,8 @@ class MCPLink:
 
 @dataclass
 class TopologyValidation:
+    """Validation result describing MCP runtime readiness."""
+
     services: dict[str, dict[str, Any]] = field(default_factory=dict)
     available_required: list[str] = field(default_factory=list)
     available_optional: list[str] = field(default_factory=list)
@@ -70,6 +76,8 @@ class TopologyValidation:
 
 @dataclass
 class MCPTopology:
+    """In-memory representation of MCP services and required links."""
+
     services: dict[str, MCPService] = field(default_factory=dict)
     required_links: list[MCPLink] = field(default_factory=list)
     optional_links: list[MCPLink] = field(default_factory=list)

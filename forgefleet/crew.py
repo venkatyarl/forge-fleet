@@ -3,29 +3,53 @@
 Uses local LLMs via llama.cpp (OpenAI-compatible API).
 Each agent role uses a different model tier from the fleet.
 """
+from __future__ import annotations
+
 import os
-import json
 import subprocess
 from pathlib import Path
-from crewai import Agent, Crew, Task, Process, LLM
-from crewai.tools import BaseTool
-from typing import Type
-from pydantic import BaseModel, Field
+from typing import Any, Type
+
+from . import config
+
+try:
+    from pydantic import BaseModel, Field
+except ImportError:
+    class BaseModel:
+        """Fallback base model for environments without pydantic."""
+
+        pass
+
+    def Field(*args, default=None, description=""):
+        return default
+
+try:
+    from crewai import Agent, Crew, Task, Process, LLM
+    from crewai.tools import BaseTool
+    CREWAI_IMPORT_ERROR = None
+except ImportError as e:
+    Agent = Crew = Task = Process = LLM = Any
+    CREWAI_IMPORT_ERROR = e
+
+    class BaseTool:  # type: ignore[no-redef]
+        """Fallback base class so this module still imports without CrewAI."""
+
+        pass
 
 
 # ─── Fleet-aware LLM configuration ─────────────────────
 
 def load_fleet_config() -> dict:
-    """Load fleet.json to discover available models."""
-    for path in [
-        os.path.expanduser("~/fleet.json"),
-        os.path.expanduser("~/.openclaw/workspace/fleet.json"),
-        "/Users/venkat/.openclaw/workspace/fleet.json",
-    ]:
-        if os.path.exists(path):
-            with open(path) as f:
-                return json.load(f)
-    return {}
+    """Load the canonical ForgeFleet configuration."""
+    return config.get_all()
+
+
+def _require_crewai():
+    """Raise a clear runtime error when CrewAI is unavailable."""
+    if CREWAI_IMPORT_ERROR is not None:
+        raise RuntimeError(
+            "crewai is required to use forgefleet.crew; install the optional CrewAI dependency"
+        ) from CREWAI_IMPORT_ERROR
 
 
 def get_llm(tier: str = "fast") -> LLM:
@@ -37,56 +61,52 @@ def get_llm(tier: str = "fast") -> LLM:
         review — 72B models (code review, complex reasoning)
         expert — 235B cluster (hardest problems)
     """
+    _require_crewai()
+
     fleet = load_fleet_config()
-    
-    # Default endpoints based on our fleet layout
-    endpoints = {
-        "fast": "http://192.168.5.100:51803",    # Taylor 9B
-        "code": "http://192.168.5.102:51802",     # Marcus 32B
-        "review": "http://192.168.5.108:51801",   # James 72B
-        "expert": "http://192.168.5.100:51800",   # Taylor 235B cluster
-    }
-    
+    tier_num = {
+        "fast": 1,
+        "code": 2,
+        "review": 3,
+        "expert": 4,
+    }.get(tier, 1)
+
     model_names = {
         "fast": "qwen3.5-9b",
         "code": "qwen2.5-coder-32b",
         "review": "qwen2.5-72b",
         "expert": "qwen3-235b",
     }
-    
-    # Try to read from fleet.json
-    if fleet and "nodes" in fleet:
-        for name, node in fleet["nodes"].items():
-            for model in node.get("models", []):
-                t = model.get("tier", 0)
-                url = f"http://{node.get('ip', '127.0.0.1')}:{model.get('port', 51800)}"
-                if t == 1 and tier == "fast":
-                    endpoints["fast"] = url
-                elif t == 2 and tier == "code":
-                    endpoints["code"] = url
-                elif t == 3 and tier == "review":
-                    endpoints["review"] = url
-                elif t == 4 and tier == "expert":
-                    endpoints["expert"] = url
-    
-    base_url = endpoints.get(tier, endpoints["fast"])
-    model_name = model_names.get(tier, "qwen3.5-9b")
-    
+
+    available_models = config.get_all_models() if fleet else []
+    selected = next((m for m in available_models if int(m.get("tier", 0) or 0) == tier_num), None)
+    if not selected and available_models:
+        selected = available_models[0]
+    if not selected:
+        raise RuntimeError("No configured ForgeFleet models found in ~/.forgefleet/fleet.toml")
+
+    base_url = f"http://{selected.get('ip', '127.0.0.1')}:{selected.get('port', 51800)}/v1"
+    model_name = selected.get("name") or selected.get("key") or model_names.get(tier, "qwen3.5-9b")
+
     return LLM(
         model=f"openai/{model_name}",
-        base_url=f"{base_url}/v1",
+        base_url=base_url,
         api_key="not-needed",
         temperature=0.2,
-        timeout=900,  # 15 min for large models
+        timeout=max(config.get_tier_timeout(int(selected.get("tier", tier_num) or tier_num)), 300),
     )
 
 
 # ─── Custom Tools ───────────────────────────────────────
 
 class FileReadInput(BaseModel):
+    """Arguments for reading a repo file."""
+
     filepath: str = Field(description="Path to the file to read")
 
+
 class FileReadTool(BaseTool):
+    """Tool that reads a file relative to the working repository."""
     name: str = "read_file"
     description: str = "Read the contents of a file in the repository"
     args_schema: Type[BaseModel] = FileReadInput
@@ -106,10 +126,14 @@ class FileReadTool(BaseTool):
 
 
 class FileWriteInput(BaseModel):
+    """Arguments for writing a repo file."""
+
     filepath: str = Field(description="Path to create/overwrite")
     content: str = Field(description="File content to write")
 
+
 class FileWriteTool(BaseTool):
+    """Tool that writes a file relative to the working repository."""
     name: str = "write_file"
     description: str = "Write content to a file, creating directories if needed"
     args_schema: Type[BaseModel] = FileWriteInput
@@ -126,9 +150,13 @@ class FileWriteTool(BaseTool):
 
 
 class ShellInput(BaseModel):
+    """Arguments for running a shell command in the repo."""
+
     command: str = Field(description="Shell command to execute")
 
+
 class ShellTool(BaseTool):
+    """Tool that runs a shell command inside the working repository."""
     name: str = "run_command"
     description: str = "Run a shell command in the repository directory (for cargo check, tests, etc.)"
     args_schema: Type[BaseModel] = ShellInput
@@ -151,10 +179,14 @@ class ShellTool(BaseTool):
 
 
 class ListFilesInput(BaseModel):
+    """Arguments for listing files in the repo."""
+
     directory: str = Field(description="Directory to list", default=".")
     pattern: str = Field(description="File extension to filter", default="")
 
+
 class ListFilesTool(BaseTool):
+    """Tool that lists files in the working repository."""
     name: str = "list_files"
     description: str = "List files in a directory, optionally filtered by extension"
     args_schema: Type[BaseModel] = ListFilesInput
@@ -184,6 +216,7 @@ def build_coding_crew(repo_dir: str, task_title: str, task_description: str) -> 
     2. Code Writer (32B) — quality code generation
     3. Code Reviewer (72B) — catches bugs, verifies quality
     """
+    _require_crewai()
     
     # Tools scoped to the repo
     read_file = FileReadTool(repo_dir=repo_dir)

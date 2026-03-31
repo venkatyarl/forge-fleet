@@ -21,6 +21,8 @@ ESCALATION_LADDER = ["intern", "junior", "senior", "executive", "human"]
 
 @dataclass
 class TaskOwnership:
+    """Ownership and collaboration state for a single ticket."""
+
     ticket_id: str
     owner: str
     owner_level: str = "junior"

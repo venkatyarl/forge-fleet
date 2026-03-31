@@ -10,6 +10,8 @@ from .db import connect
 
 @dataclass
 class ExecutionTracker:
+    """Persist execution, event, and model-usage records to Postgres."""
+
     def __post_init__(self):
         self._init_db()
 

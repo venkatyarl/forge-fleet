@@ -12,24 +12,20 @@ import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from .agent import Agent
-from .task import Task
-from .crew import Crew
+
 from .llm import LLM
 from .tool import Tool
 from .fleet_router import FleetRouter
 from .mc_client import MCClient
 from .git_ops import GitOps
-from .roles import Role, PRE_BUILD_ROLES, POST_BUILD_ROLES, ALL_ROLES
+from .roles import Role, PRE_BUILD_ROLES, POST_BUILD_ROLES
 from .repo_map import RepoMap
-from .prompt_templates import get_template
 from .evolution import EvolutionEngine, TaskRecord
-from .task_decomposer import TaskDecomposer
 from .context_store import ContextStore
 from .ownership import OwnershipManager
-from .execution_tracking import ExecutionTracker
 from .lifecycle_policy import LifecyclePolicy, MergeContext
 from .mcp_topology import MCPTopology
+from .. import config
 
 
 @dataclass
@@ -61,11 +57,11 @@ class EngineeringPipeline:
     Each step uses the right LLM tier and runs perspectives in parallel.
     """
     
-    def __init__(self, repo_dir: str, mc_url: str = "http://192.168.5.100:60002",
+    def __init__(self, repo_dir: str, mc_url: str = "",
                  ownership: OwnershipManager | None = None):
         self.repo_dir = repo_dir
         self.router = FleetRouter()
-        self.mc = MCClient(base_url=mc_url)
+        self.mc = MCClient(base_url=mc_url or config.get_mc_url())
         self.git = GitOps(repo_dir)
         self.evolution = EvolutionEngine()
         self.context_store = ContextStore()
@@ -527,7 +523,9 @@ class EngineeringPipeline:
     
     def _create_plan(self, ticket: dict, context: dict) -> str:
         """Create a game plan using an LLM."""
-        llm = self.router.get_llm(1) or LLM(base_url="http://192.168.5.100:51803/v1")
+        llm = self.router.get_llm(1)
+        if not llm:
+            return "Plan generation unavailable — no configured LLM endpoints were available"
         
         messages = [
             {"role": "system", "content": "You are a tech lead creating a build plan. Be specific and actionable."},
@@ -564,12 +562,16 @@ Output:
             eps = self.router.get_available(tier)
             for ep in eps:
                 available_llms.append(LLM(
-                    base_url=f"http://{ep.ip}:{ep.port}/v1",
+                    base_url=f"{ep.url}/v1",
                     model=ep.name,
+                    timeout=config.get_tier_timeout(tier),
                 ))
         
         if not available_llms:
-            available_llms = [LLM(base_url="http://192.168.5.100:51801/v1")]
+            fallback_llm = self.router.get_llm(3) or self.router.get_llm(2) or self.router.get_llm(1)
+            if not fallback_llm:
+                return ["[System] No configured LLM endpoints available for review"]
+            available_llms = [fallback_llm]
         
         def review_with_role(role: Role, llm: LLM) -> list[str]:
             messages = [
