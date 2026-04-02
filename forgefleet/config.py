@@ -4,34 +4,155 @@ Single file: ~/.forgefleet/fleet.toml
 Human-friendly TOML format with comments.
 Auto-reloads when file changes — no restart needed.
 """
+from __future__ import annotations
+
+import copy
+import json
+import logging
 import os
 import socket
+import stat
+import threading
 import time
 import tomllib  # Built into Python 3.11+
 
 
-CONFIG_PATH = os.path.expanduser("~/.forgefleet/fleet.toml")
+logger = logging.getLogger(__name__)
+
+
+CONFIG_PATH = os.path.expanduser(
+    os.environ.get("FORGEFLEET_CONFIG_PATH", "~/.forgefleet/fleet.toml")
+)
 _cache = {}
 _cache_mtime = 0
+_cache_lock = threading.Lock()
+
+
+def _is_path_secure(path: str) -> bool:
+    """Basic hardening for config file path and permissions."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False
+
+    if not stat.S_ISREG(st.st_mode):
+        logger.warning("Config path is not a regular file: %s", path)
+        return False
+
+    if os.name != "nt" and (st.st_mode & (stat.S_IWGRP | stat.S_IWOTH)):
+        logger.warning("Refusing insecure config file permissions (group/world writable): %s", path)
+        return False
+
+    return True
+
+
+def _coerce_env_value(value: str):
+    """Parse env overrides as TOML scalars/arrays when possible."""
+    text = value.strip()
+    if not text:
+        return ""
+    try:
+        parsed = tomllib.loads(f"v = {text}")
+        return parsed["v"]
+    except Exception:
+        return value
+
+
+def _ensure_key_path(key: str):
+    if not key or not isinstance(key, str):
+        raise ValueError("Config key must be a non-empty string")
+    allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
+    if any(ch not in allowed for ch in key):
+        raise ValueError(f"Invalid config key: {key}")
+
+
+def _toml_key(key: str) -> str:
+    if key and all(ch.isalnum() or ch in "_-" for ch in key):
+        return key
+    return json.dumps(key)
+
+
+def _toml_value(value) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return repr(value)
+    if isinstance(value, str):
+        return json.dumps(value)
+    if isinstance(value, list):
+        return "[" + ", ".join(_toml_value(v) for v in value) + "]"
+    raise TypeError(f"Unsupported config value type: {type(value).__name__}")
+
+
+def _dump_toml(data: dict) -> str:
+    """Minimal TOML serializer for nested dict + scalar/list values."""
+    lines: list[str] = []
+
+    def emit_table(table: dict, prefix: str = ""):
+        scalar_items = []
+        nested_items = []
+
+        for key in sorted(table.keys()):
+            value = table[key]
+            if isinstance(value, dict):
+                nested_items.append((key, value))
+            else:
+                scalar_items.append((key, value))
+
+        for key, value in scalar_items:
+            lines.append(f"{_toml_key(key)} = {_toml_value(value)}")
+
+        for key, value in nested_items:
+            section = f"{prefix}.{key}" if prefix else key
+            if lines and lines[-1] != "":
+                lines.append("")
+            lines.append(f"[{section}]")
+            emit_table(value, section)
+
+    emit_table(data)
+    return "\n".join(lines).strip() + "\n"
+
+
+def _parse_set_value(value):
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    if not text:
+        return ""
+    try:
+        return tomllib.loads(f"v = {text}")["v"]
+    except Exception:
+        return value
 
 
 def _load() -> dict:
     """Load fleet.toml with caching. Reloads if file changed."""
     global _cache, _cache_mtime
-    
-    if not os.path.exists(CONFIG_PATH):
-        return _cache or {}
-    
-    mtime = os.path.getmtime(CONFIG_PATH)
-    if mtime != _cache_mtime:
-        try:
-            with open(CONFIG_PATH, "rb") as f:
-                _cache = tomllib.load(f)
-            _cache_mtime = mtime
-        except Exception as e:
-            print(f"Config load error: {e}")
-    
-    return _cache
+
+    config_path = CONFIG_PATH
+    if not os.path.exists(config_path):
+        return copy.deepcopy(_cache) if _cache else {}
+
+    if not _is_path_secure(config_path):
+        return copy.deepcopy(_cache) if _cache else {}
+
+    mtime = os.path.getmtime(config_path)
+    with _cache_lock:
+        if mtime != _cache_mtime:
+            try:
+                with open(config_path, "rb") as handle:
+                    loaded = tomllib.load(handle)
+                if isinstance(loaded, dict):
+                    _cache = loaded
+                    _cache_mtime = mtime
+                else:
+                    logger.warning("Config root must be a TOML table: %s", config_path)
+            except Exception as exc:
+                logger.warning("Config load error (%s): %s", config_path, exc)
+
+        return copy.deepcopy(_cache)
 
 
 def get(key: str, default=None):
@@ -40,8 +161,8 @@ def get(key: str, default=None):
     env_key = f"FORGEFLEET_{key.upper().replace('.', '_')}"
     env_val = os.environ.get(env_key)
     if env_val is not None:
-        return env_val
-    
+        return _coerce_env_value(env_val)
+
     # Walk the config tree
     config = _load()
     parts = key.split(".")
@@ -184,7 +305,7 @@ def get_local_ip() -> str:
         ip = s.getsockname()[0]
         s.close()
         return ip
-    except:
+    except Exception:
         return "127.0.0.1"
 
 def get_node_name() -> str:
@@ -197,8 +318,49 @@ def get_node_name() -> str:
     return os.uname().nodename.split(".")[0].lower()
 
 def set_value(key: str, value):
-    """Set a value — appends to TOML file (simple key=value at end)."""
-    # For complex updates, edit the file directly
-    # This is a simple append for runtime overrides
-    with open(CONFIG_PATH, "a") as f:
-        f.write(f"\n# Runtime override\n# {key} = {value}\n")
+    """Set a value in fleet.toml using an atomic write.
+
+    Accepts TOML literals via string values (e.g. "true", "42", "['a']").
+    """
+    global _cache, _cache_mtime
+
+    _ensure_key_path(key)
+    parsed_value = _parse_set_value(value)
+    config_path = CONFIG_PATH
+
+    parent_dir = os.path.dirname(config_path) or "."
+    os.makedirs(parent_dir, mode=0o700, exist_ok=True)
+
+    config_data = _load()
+    if not isinstance(config_data, dict):
+        config_data = {}
+
+    current = config_data
+    parts = key.split(".")
+    for part in parts[:-1]:
+        existing = current.get(part)
+        if not isinstance(existing, dict):
+            existing = {}
+            current[part] = existing
+        current = existing
+    current[parts[-1]] = parsed_value
+
+    rendered = _dump_toml(config_data)
+    tmp_path = f"{config_path}.tmp.{os.getpid()}.{int(time.time() * 1000)}"
+    with open(tmp_path, "w", encoding="utf-8") as handle:
+        handle.write(rendered)
+
+    if os.name != "nt":
+        os.chmod(tmp_path, 0o600)
+
+    os.replace(tmp_path, config_path)
+
+    if os.name != "nt":
+        os.chmod(config_path, 0o600)
+
+    with _cache_lock:
+        _cache = copy.deepcopy(config_data)
+        try:
+            _cache_mtime = os.path.getmtime(config_path)
+        except OSError:
+            _cache_mtime = 0

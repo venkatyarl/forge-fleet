@@ -5,11 +5,14 @@ No static JSON inventory needed — finds everything automatically.
 Also handles model installation and updates on new nodes.
 """
 import json
+import os
+import shlex
 import socket
 import subprocess
 import time
 import urllib.request
 import urllib.error
+import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Optional
@@ -320,7 +323,32 @@ class NetworkDiscovery:
             "192.168.5.100", "192.168.5.102", "192.168.5.103",
             "192.168.5.104", "192.168.5.106", "192.168.5.108",
         ]
-    
+
+    def _ssh_args(self, timeout_seconds: int = 5) -> list[str]:
+        return [
+            "ssh",
+            "-o", f"ConnectTimeout={max(1, int(timeout_seconds))}",
+            "-o", "StrictHostKeyChecking=accept-new",
+        ]
+
+    def _remote_file_expr(self, path: str) -> str:
+        if path.startswith("~/"):
+            rel = path[2:]
+            return f"$HOME/{shlex.quote(rel)}"
+        if path == "~":
+            return "$HOME"
+        return shlex.quote(path)
+
+    def _remote_dir_expr(self, path: str) -> str:
+        if path.startswith("~/"):
+            rel = path[2:]
+            rel_dir = os.path.dirname(rel)
+            if not rel_dir or rel_dir == ".":
+                return "$HOME"
+            return f"$HOME/{shlex.quote(rel_dir)}"
+        directory = os.path.dirname(path)
+        return shlex.quote(directory if directory else ".")
+
     def check_model_status(self, ip: str) -> dict:
         """Check what models are available/running on a specific node.
         
@@ -343,8 +371,7 @@ class NetworkDiscovery:
         # Check available RAM via SSH (if accessible)
         try:
             r = subprocess.run(
-                ["ssh", "-o", "ConnectTimeout=3", "-o", "StrictHostKeyChecking=no",
-                 ip, "free -g 2>/dev/null || sysctl -n hw.memsize 2>/dev/null"],
+                [*self._ssh_args(3), ip, "free -g 2>/dev/null || sysctl -n hw.memsize 2>/dev/null"],
                 capture_output=True, text=True, timeout=5
             )
             if r.returncode == 0:
@@ -358,21 +385,45 @@ class NetworkDiscovery:
     def install_model(self, ip: str, model_url: str, model_path: str,
                       port: int = 51802, ctx_size: int = 8192) -> dict:
         """Install and start a model on a remote node.
-        
+
         Steps:
         1. SSH to node
         2. Download model (wget/curl)
         3. Start llama-server
         4. Verify health
-        
+
         Returns status dict.
         """
         result = {"ip": ip, "success": False, "steps": []}
-        
+
+        # Basic input validation/hardening
+        parsed = urllib.parse.urlparse(str(model_url))
+        if parsed.scheme not in {"http", "https"}:
+            result["steps"].append("Invalid model_url (must be http/https)")
+            return result
+
+        try:
+            port = int(port)
+            ctx_size = int(ctx_size)
+        except (TypeError, ValueError):
+            result["steps"].append("Invalid numeric parameters: port/ctx_size")
+            return result
+
+        if port < 1 or port > 65535:
+            result["steps"].append("Invalid port (must be 1-65535)")
+            return result
+        if ctx_size < 256:
+            result["steps"].append("Invalid ctx_size (must be >=256)")
+            return result
+
+        remote_model = self._remote_file_expr(model_path)
+        remote_dir = self._remote_dir_expr(model_path)
+        safe_url = shlex.quote(model_url)
+
         # Step 1: Check if model already exists
         try:
             r = subprocess.run(
-                ["ssh", "-o", "ConnectTimeout=5", ip, f"ls -la {model_path}"],
+                [*self._ssh_args(5), ip, f"ls -la {remote_model}"],
                 capture_output=True, text=True, timeout=10
             )
             if r.returncode == 0:
@@ -380,9 +431,9 @@ class NetworkDiscovery:
             else:
                 # Download model
                 result["steps"].append(f"Downloading model to {model_path}...")
+                download_cmd = f"mkdir -p {remote_dir} && curl -fsSL {safe_url} -o {remote_model}"
                 r = subprocess.run(
-                    ["ssh", ip, f"mkdir -p $(dirname {model_path}) && "
-                     f"wget -q -O {model_path} '{model_url}'"],
+                    [*self._ssh_args(5), ip, download_cmd],
                     capture_output=True, text=True, timeout=3600  # 1hr for large models
                 )
                 if r.returncode != 0:
@@ -392,12 +443,12 @@ class NetworkDiscovery:
         except Exception as e:
             result["steps"].append(f"SSH failed: {e}")
             return result
-        
+
         # Step 2: Start llama-server
         try:
             cmd = (
                 f"nohup llama-server "
-                f"--model {model_path} "
+                f"--model {remote_model} "
                 f"--port {port} "
                 f"--host 0.0.0.0 "
                 f"--ctx-size {ctx_size} "
@@ -406,14 +457,14 @@ class NetworkDiscovery:
                 f"> /tmp/llama-{port}.log 2>&1 &"
             )
             subprocess.run(
-                ["ssh", ip, cmd],
+                [*self._ssh_args(5), ip, cmd],
                 capture_output=True, text=True, timeout=10
             )
             result["steps"].append(f"Started llama-server on port {port}")
         except Exception as e:
             result["steps"].append(f"Failed to start: {e}")
             return result
-        
+
         # Step 3: Wait and verify
         time.sleep(5)
         ep = self.scan_port(ip, port)
@@ -426,7 +477,7 @@ class NetworkDiscovery:
             }
         else:
             result["steps"].append("Server started but health check failed")
-        
+
         return result
     
     def update_config_discovery_cache(self) -> dict:

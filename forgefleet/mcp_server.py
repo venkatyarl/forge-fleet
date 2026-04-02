@@ -251,7 +251,27 @@ class MCPServer:
         }
     
     def _resolve_node(self, node: str) -> str:
-        """Resolve node name to IP address."""
+        """Resolve node name to IP address via canonical config first."""
+        candidate = str(node or "").strip()
+        if not candidate:
+            return candidate
+
+        parts = candidate.split(".")
+        if len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts):
+            return candidate
+
+        from forgefleet import config as ff_config
+
+        by_name = ff_config.get_node(candidate)
+        if by_name and by_name.get("ip"):
+            return by_name.get("ip")
+
+        lowered = candidate.lower()
+        for name, info in ff_config.get_nodes().items():
+            if str(name).lower() == lowered and info.get("ip"):
+                return info.get("ip")
+
+        # Legacy fallback map (kept for compatibility if config is incomplete)
         node_map = {
             "taylor": "192.168.5.100",
             "james": "192.168.5.108",
@@ -260,7 +280,7 @@ class MCPServer:
             "priya": "192.168.5.106",
             "ace": "192.168.5.104",
         }
-        return node_map.get(node.lower(), node)
+        return node_map.get(lowered, candidate)
     
     def handle_tool(self, name: str, args: dict) -> str:
         """Execute a tool and return the result."""
@@ -326,12 +346,18 @@ class MCPServer:
         elif name == "fleet_ssh":
             ip = self._resolve_node(args["node"])
             command = args["command"]
-            timeout = args.get("timeout", 30)
-            
+            timeout = int(args.get("timeout", 30) or 30)
+            timeout = max(1, min(timeout, 600))
+
             try:
                 r = subprocess.run(
-                    ["ssh", "-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=no",
-                     ip, command],
+                    [
+                        "ssh",
+                        "-o", "ConnectTimeout=5",
+                        "-o", "StrictHostKeyChecking=accept-new",
+                        ip,
+                        command,
+                    ],
                     capture_output=True, text=True, timeout=timeout
                 )
                 output = r.stdout + r.stderr
