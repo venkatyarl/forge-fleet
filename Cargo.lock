@@ -826,7 +826,7 @@ checksum = "37909eebbb50d72f9059c3b6d82c0463f2ff062c9e95845c43a6c9c0355411be"
 
 [[package]]
 name = "ff-agent"
-version = "0.1.0"
+version = "2026.4.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -856,7 +856,7 @@ dependencies = [
 
 [[package]]
 name = "ff-api"
-version = "0.1.0"
+version = "2026.4.7"
 dependencies = [
  "anyhow",
  "axum",
@@ -876,7 +876,7 @@ dependencies = [
 
 [[package]]
 name = "ff-benchmark"
-version = "0.1.0"
+version = "2026.4.7"
 dependencies = [
  "anyhow",
  "chrono",
@@ -893,7 +893,7 @@ dependencies = [
 
 [[package]]
 name = "ff-code-intel"
-version = "0.1.0"
+version = "2026.4.7"
 dependencies = [
  "anyhow",
  "chrono",
@@ -907,7 +907,7 @@ dependencies = [
 
 [[package]]
 name = "ff-control"
-version = "0.1.0"
+version = "2026.4.7"
 dependencies = [
  "chrono",
  "ff-core",
@@ -924,7 +924,7 @@ dependencies = [
 
 [[package]]
 name = "ff-core"
-version = "0.1.0"
+version = "2026.4.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -944,7 +944,7 @@ dependencies = [
 
 [[package]]
 name = "ff-cron"
-version = "0.1.0"
+version = "2026.4.7"
 dependencies = [
  "anyhow",
  "chrono",
@@ -963,7 +963,7 @@ dependencies = [
 
 [[package]]
 name = "ff-db"
-version = "0.1.0"
+version = "2026.4.7"
 dependencies = [
  "anyhow",
  "chrono",
@@ -982,7 +982,7 @@ dependencies = [
 
 [[package]]
 name = "ff-deploy"
-version = "0.1.0"
+version = "2026.4.7"
 dependencies = [
  "anyhow",
  "chrono",
@@ -995,7 +995,7 @@ dependencies = [
 
 [[package]]
 name = "ff-discovery"
-version = "0.1.0"
+version = "2026.4.7"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1011,7 +1011,7 @@ dependencies = [
 
 [[package]]
 name = "ff-evolution"
-version = "0.1.0"
+version = "2026.4.7"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1029,7 +1029,7 @@ dependencies = [
 
 [[package]]
 name = "ff-gateway"
-version = "0.1.0"
+version = "2026.4.7"
 dependencies = [
  "anyhow",
  "axum",
@@ -1061,7 +1061,7 @@ dependencies = [
 
 [[package]]
 name = "ff-mc"
-version = "0.1.0"
+version = "2026.4.7"
 dependencies = [
  "anyhow",
  "axum",
@@ -1080,7 +1080,7 @@ dependencies = [
 
 [[package]]
 name = "ff-mcp"
-version = "0.1.0"
+version = "2026.4.7"
 dependencies = [
  "anyhow",
  "axum",
@@ -1105,7 +1105,7 @@ dependencies = [
 
 [[package]]
 name = "ff-memory"
-version = "0.1.0"
+version = "2026.4.7"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1122,7 +1122,7 @@ dependencies = [
 
 [[package]]
 name = "ff-mesh"
-version = "0.1.0"
+version = "2026.4.7"
 dependencies = [
  "anyhow",
  "axum",
@@ -1140,7 +1140,7 @@ dependencies = [
 
 [[package]]
 name = "ff-observability"
-version = "0.1.0"
+version = "2026.4.7"
 dependencies = [
  "anyhow",
  "axum",
@@ -1166,7 +1166,7 @@ dependencies = [
 
 [[package]]
 name = "ff-orchestrator"
-version = "0.1.0"
+version = "2026.4.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1185,7 +1185,7 @@ dependencies = [
 
 [[package]]
 name = "ff-pipeline"
-version = "0.1.0"
+version = "2026.4.7"
 dependencies = [
  "chrono",
  "reqwest",
@@ -1198,7 +1198,7 @@ dependencies = [
 
 [[package]]
 name = "ff-runtime"
-version = "0.1.0"
+version = "2026.4.7"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1214,7 +1214,7 @@ dependencies = [
 
 [[package]]
 name = "ff-security"
-version = "0.1.0"
+version = "2026.4.7"
 dependencies = [
  "anyhow",
  "axum",
@@ -1236,7 +1236,7 @@ dependencies = [
 
 [[package]]
 name = "ff-sessions"
-version = "0.1.0"
+version = "2026.4.7"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1252,7 +1252,7 @@ dependencies = [
 
 [[package]]
 name = "ff-skills"
-version = "0.1.0"
+version = "2026.4.7"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1268,7 +1268,7 @@ dependencies = [
 
 [[package]]
 name = "ff-ssh"
-version = "0.1.0"
+version = "2026.4.7"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1284,7 +1284,7 @@ dependencies = [
 
 [[package]]
 name = "ff-terminal"
-version = "0.1.0"
+version = "2026.4.7"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1304,7 +1304,7 @@ dependencies = [
 
 [[package]]
 name = "ff-updater"
-version = "0.1.0"
+version = "2026.4.7"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1320,7 +1320,7 @@ dependencies = [
 
 [[package]]
 name = "ff-voice"
-version = "0.1.0"
+version = "2026.4.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1385,7 +1385,7 @@ checksum = "00b0228411908ca8685dba7fc2cdd70ec9990a6e753e89b6ac91a84c40fbaf4b"
 
 [[package]]
 name = "forge-fleet"
-version = "0.1.0"
+version = "2026.4.7"
 dependencies = [
  "anyhow",
  "chrono",

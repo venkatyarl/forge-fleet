@@ -155,7 +155,29 @@ pub fn clear_session_shell_state(session_id: &str) {
 // Tool registry helpers
 // ---------------------------------------------------------------------------
 
-/// Returns all built-in agent tools (boxed).
+/// Returns only core tools (sent to LLM by default — keeps prompt small).
+/// Other tools are loaded on demand via ToolSearch.
+pub fn core_tools() -> Vec<Box<dyn AgentTool>> {
+    vec![
+        Box::new(bash::BashTool),
+        Box::new(file_read::FileReadTool),
+        Box::new(file_write::FileWriteTool),
+        Box::new(file_edit::FileEditTool),
+        Box::new(glob_tool::GlobTool),
+        Box::new(grep_tool::GrepTool),
+        Box::new(agent_tool::SubAgentTool),
+        Box::new(web_fetch::WebFetchTool),
+        Box::new(web_search::WebSearchTool),
+        Box::new(plan_tools::AskUserQuestionTool),
+    ]
+}
+
+/// Returns core tools as Arc (for parallel execution).
+pub fn core_tools_arc() -> Vec<Arc<dyn AgentTool>> {
+    core_tools().into_iter().map(|t| Arc::from(t)).collect()
+}
+
+/// Returns all built-in agent tools (boxed) — used for ToolSearch discovery.
 pub fn all_tools() -> Vec<Box<dyn AgentTool>> {
     vec![
         // Core file & shell tools

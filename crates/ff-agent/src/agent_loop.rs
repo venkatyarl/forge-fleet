@@ -122,7 +122,7 @@ impl AgentSession {
             id: session_id,
             config,
             messages,
-            tools: tools::all_tools_arc(),
+            tools: tools::core_tools_arc(),
             cancel_token: CancellationToken::new(),
             usage: TokenUsage::default(),
             tracker: ConversationTracker::new(),
@@ -154,7 +154,7 @@ impl AgentSession {
             id: session_id,
             config,
             messages,
-            tools: tools::all_tools_arc(),
+            tools: tools::core_tools_arc(),
             cancel_token: CancellationToken::new(),
             usage: TokenUsage::default(),
             tracker: ConversationTracker::new(),
@@ -833,34 +833,11 @@ fn emit(tx: &Option<mpsc::UnboundedSender<AgentEvent>>, event: AgentEvent) {
 
 fn default_system_prompt(working_dir: &std::path::Path) -> String {
     format!(
-        r#"You are a coding agent with access to tools for reading, writing, and editing files, running shell commands, and searching codebases. You are working in the directory: {working_dir}
+        r#"You are ForgeFleet, a helpful AI assistant. You have access to tools when you need them. Working directory: {working_dir}
 
-## Available Tools
+When the user asks you to do something that requires reading files, running commands, or making changes, use the available tools. For simple conversations, just respond naturally.
 
-- **Bash**: Execute shell commands. Use for builds, tests, git, system operations.
-- **Read**: Read file contents with line numbers. Always read before editing.
-- **Write**: Create or overwrite files. Use for new files.
-- **Edit**: Make exact string replacements in files. Preferred for modifying existing files.
-- **Glob**: Find files by name pattern (e.g., "**/*.rs").
-- **Grep**: Search file contents with regex patterns.
-- **Agent**: Spawn a sub-agent to handle a complex task autonomously.
-- **WebFetch**: Fetch web page content.
-- **WebSearch**: Search the web for information.
-- **TaskCreate/TaskUpdate/TaskList**: Track work with tasks.
-- **AskUserQuestion**: Ask the user for clarification.
-- **EnterPlanMode/ExitPlanMode**: Switch to planning mode for design work.
-- **EnterWorktree/ExitWorktree**: Create isolated git worktree for safe changes.
-
-## Guidelines
-
-- Always read a file before editing it.
-- Use Edit for modifying existing files (not Write, which overwrites entirely).
-- Use Bash for running builds, tests, and git commands.
-- Be precise with Edit — old_string must match exactly including whitespace.
-- When investigating issues, read the relevant code first before making changes.
-- After making changes, verify them by reading the modified file or running tests.
-- Keep responses concise. Focus on actions, not explanations.
-- Use Agent tool to delegate complex subtasks to sub-agents."#,
+Be concise. Focus on actions, not explanations."#,
         working_dir = working_dir.display()
     )
 }

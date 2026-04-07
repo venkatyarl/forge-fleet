@@ -138,7 +138,7 @@ async fn main() -> Result<()> {
     let config_path = resolve_config_path(cli.config)?;
 
     let llm = cli.llm.or_else(|| env::var("FORGEFLEET_LLM_URL").ok())
-        .unwrap_or_else(|| "http://192.168.5.102:51000".into());
+        .unwrap_or_else(|| detect_local_llm().unwrap_or_else(|| "http://localhost:51000".into()));
     let model = cli.model.or_else(|| env::var("FORGEFLEET_MODEL").ok())
         .unwrap_or_else(|| "auto".into());
     let working_dir = cli.cwd.unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from("/")));
@@ -364,6 +364,33 @@ async fn run_headless(prompt: &str, config: AgentSessionConfig, output_format: &
 }
 
 // ─── Fleet Management Commands ─────────────────────────────────────────────
+
+/// Auto-detect the local LLM endpoint by checking common ports.
+fn detect_local_llm() -> Option<String> {
+    // Check local ports synchronously (fast TCP connect)
+    let ports = [51000, 51001, 11434, 8080];
+    for port in ports {
+        if std::net::TcpStream::connect_timeout(
+            &format!("127.0.0.1:{port}").parse().ok()?,
+            std::time::Duration::from_millis(100),
+        ).is_ok() {
+            return Some(format!("http://127.0.0.1:{port}"));
+        }
+    }
+
+    // Check known fleet IPs
+    let fleet_ips = ["192.168.5.100", "192.168.5.102", "192.168.5.103", "192.168.5.104", "192.168.5.108"];
+    for ip in fleet_ips {
+        if std::net::TcpStream::connect_timeout(
+            &format!("{ip}:51000").parse().ok()?,
+            std::time::Duration::from_millis(200),
+        ).is_ok() {
+            return Some(format!("http://{ip}:51000"));
+        }
+    }
+
+    None
+}
 
 fn resolve_config_path(override_path: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(path) = override_path { return Ok(path); }
