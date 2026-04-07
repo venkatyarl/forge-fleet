@@ -1,0 +1,130 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ff-core",
+    "crates/ff-api",
+    "crates/ff-discovery",
+    "crates/ff-agent",
+    # "crates/ff-cli", # superseded by ff-terminal unified binary
+    "crates/ff-mesh",
+    "crates/ff-runtime",
+    "crates/ff-ssh",
+    "crates/ff-orchestrator",
+    "crates/ff-pipeline",
+    "crates/ff-memory",
+    "crates/ff-gateway",
+    "crates/ff-sessions",
+    "crates/ff-skills",
+    "crates/ff-cron",
+    "crates/ff-observability",
+    "crates/ff-voice",
+    "crates/ff-security",
+    "crates/ff-evolution",
+    "crates/ff-deploy",
+    "crates/ff-benchmark",
+    "crates/ff-control",
+    "crates/ff-db",
+    "crates/ff-updater",
+    "crates/ff-mc",
+    "crates/ff-mcp",
+    "crates/ff-code-intel",
+    "crates/ff-terminal",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["ForgeFleet Contributors"]
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+futures = "0.3"
+
+# Web / HTTP
+axum = { version = "0.8", features = ["ws", "macros"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+hyper = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Database
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono", "uuid"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Logging / tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
+
+# Utils
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "6"
+uuid = { version = "1", features = ["v4", "serde"] }
+clap = { version = "4", features = ["derive"] }
+dashmap = "6"
+bytes = "1"
+
+# ─── Root binary (ForgeFleet daemon) ─────────────────────────────────────────
+
+[package]
+name = "forge-fleet"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "ForgeFleet daemon — unified AI operating system"
+
+[[bin]]
+name = "forgefleetd"
+path = "src/main.rs"
+
+[[bin]]
+name = "migrate_from_postgres"
+path = "tools/migrate_from_postgres.rs"
+
+[dependencies]
+ff-core = { path = "crates/ff-core" }
+ff-db = { path = "crates/ff-db" }
+ff-api = { path = "crates/ff-api" }
+ff-discovery = { path = "crates/ff-discovery" }
+ff-agent = { path = "crates/ff-agent" }
+ff-gateway = { path = "crates/ff-gateway" }
+ff-cron = { path = "crates/ff-cron" }
+ff-control = { path = "crates/ff-control" }
+ff-observability = { path = "crates/ff-observability" }
+ff-evolution = { path = "crates/ff-evolution" }
+ff-runtime = { path = "crates/ff-runtime" }
+ff-updater = { path = "crates/ff-updater" }
+ff-mcp = { path = "crates/ff-mcp" }
+ff-mc = { path = "crates/ff-mc" }
+
+tokio.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+toml.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+reqwest.workspace = true
+rusqlite = { version = "0.32", features = ["bundled"] }
+tokio-postgres = "0.7"
+serde_json.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
+tempfile = "3"
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+ff-gateway = { path = "crates/ff-gateway" }

@@ -1,3 +1,33 @@
+# Rust
+target/
+*.rs.bk
+
+# Python (legacy)
 .venv/
 __pycache__/
 *.pyc
+*.pyo
+
+# OS
+.DS_Store
+*.swp
+*.swo
+*~
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Environment
+.env
+.env.*
+
+# Node
+node_modules/
+dist/
+
+# ForgeFleet runtime
+*.db
+*.sqlite
+*.log

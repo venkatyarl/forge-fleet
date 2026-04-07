@@ -1,0 +1,83 @@
+# ForgeFleet systemd service — Linux process supervision
+# ===========================================================
+#
+# Install (system-wide):
+#   sudo cp forgefleet.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable forgefleet
+#   sudo systemctl start forgefleet
+#
+# Install (user-level, no root):
+#   mkdir -p ~/.config/systemd/user
+#   cp forgefleet.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable forgefleet
+#   systemctl --user start forgefleet
+#   loginctl enable-linger $USER   # keeps service running after logout
+#
+# Uninstall:
+#   sudo systemctl stop forgefleet
+#   sudo systemctl disable forgefleet
+#   sudo rm /etc/systemd/system/forgefleet.service
+#   sudo systemctl daemon-reload
+#
+# Check status:
+#   systemctl status forgefleet
+#
+# View logs:
+#   journalctl -u forgefleet -f
+#   journalctl -u forgefleet --since "1 hour ago"
+#
+# Notes:
+#   - Restart=always with 5s delay ensures crash recovery
+#   - WatchdogSec can be enabled if forgefleetd supports sd_notify
+#   - Adjust User= if running as a dedicated 'forgefleet' user
+#   - For user-level install, remove User= and Group= lines
+
+[Unit]
+Description=ForgeFleet Daemon — Unified AI Operating System
+Documentation=https://github.com/taylor-oclaw/forge-fleet
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/forgefleetd start
+WorkingDirectory=%h/.forgefleet
+
+# Run as dedicated service user by default.
+# install.sh will rewrite this to the current user if 'forgefleet' doesn't exist.
+User=forgefleet
+
+# Auto-restart on crash
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# Environment
+Environment=RUST_LOG=info
+Environment=FORGEFLEET_HOME=%h/.forgefleet
+
+# Logging — use journald (structured)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=forgefleetd
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.forgefleet
+PrivateTmp=true
+
+# Resource limits
+LimitNOFILE=4096
+
+# Graceful shutdown (SIGTERM, then 30s grace before SIGKILL)
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

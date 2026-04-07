@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-labelledby="forgefleet-mark-title forgefleet-mark-desc">
+  <title id="forgefleet-mark-title">ForgeFleet Mark</title>
+  <desc id="forgefleet-mark-desc">A fleet command mesh symbol with connected nodes and a navigation arrow.</desc>
+  <defs>
+    <linearGradient id="ff-ring" x1="18" y1="18" x2="110" y2="110" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#67E8F9" />
+      <stop offset="0.5" stop-color="#38BDF8" />
+      <stop offset="1" stop-color="#A78BFA" />
+    </linearGradient>
+    <linearGradient id="ff-arrow" x1="49" y1="46" x2="84" y2="92" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#E0F2FE" />
+      <stop offset="1" stop-color="#38BDF8" />
+    </linearGradient>
+    <radialGradient id="ff-glow" cx="0" cy="0" r="1" gradientTransform="translate(64 64) rotate(90) scale(56)" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#38BDF8" stop-opacity="0.22" />
+      <stop offset="1" stop-color="#38BDF8" stop-opacity="0" />
+    </radialGradient>
+  </defs>
+
+  <circle cx="64" cy="64" r="56" fill="url(#ff-glow)" />
+  <circle cx="64" cy="64" r="50" fill="none" stroke="url(#ff-ring)" stroke-width="8" />
+
+  <path d="M34 84L64 32L94 84" fill="none" stroke="#7DD3FC" stroke-opacity="0.92" stroke-width="5" stroke-linecap="round" stroke-linejoin="round" />
+  <path d="M34 84H94" fill="none" stroke="#7DD3FC" stroke-opacity="0.8" stroke-width="5" stroke-linecap="round" />
+  <path d="M64 32V100" fill="none" stroke="#38BDF8" stroke-opacity="0.65" stroke-width="3.5" stroke-linecap="round" />
+
+  <circle cx="34" cy="84" r="5" fill="#E0F2FE" />
+  <circle cx="64" cy="32" r="5" fill="#E0F2FE" />
+  <circle cx="94" cy="84" r="5" fill="#E0F2FE" />
+  <circle cx="64" cy="100" r="4" fill="#93C5FD" />
+
+  <path d="M64 44L80 72L64 66L48 72L64 44Z" fill="url(#ff-arrow)" />
+  <path d="M64 66V92" stroke="#BAE6FD" stroke-width="4" stroke-linecap="round" />
+  <circle cx="64" cy="64" r="3" fill="#F8FAFC" />
+</svg>

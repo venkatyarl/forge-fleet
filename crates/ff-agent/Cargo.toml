@@ -1,0 +1,33 @@
+[package]
+name = "ff-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ff-core = { path = "../ff-core" }
+ff-api = { path = "../ff-api" }
+ff-discovery = { path = "../ff-discovery" }
+ff-db = { path = "../ff-db" }
+ff-pipeline = { path = "../ff-pipeline" }
+ff-orchestrator = { path = "../ff-orchestrator" }
+ff-security = { path = "../ff-security" }
+
+anyhow.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+chrono.workspace = true
+dashmap.workspace = true
+dirs = "5"
+futures.workspace = true
+glob = "0.3"
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tokio-util = { version = "0.7", features = ["rt"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true

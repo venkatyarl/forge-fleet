@@ -1,0 +1,22 @@
+[package]
+name = "ff-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "forgefleet"
+path = "src/main.rs"
+
+[dependencies]
+ff-agent = { path = "../ff-agent" }
+
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+chrono.workspace = true
+tokio.workspace = true
+reqwest.workspace = true

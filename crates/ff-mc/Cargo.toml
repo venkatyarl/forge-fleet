@@ -1,0 +1,26 @@
+[package]
+name = "ff-mc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "ForgeFleet Mission Control — work items, epics, sprints, kanban board, dashboard"
+
+[dependencies]
+ff-core = { path = "../ff-core" }
+ff-db = { path = "../ff-db" }
+
+# Workspace deps
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+dashmap.workspace = true
+axum.workspace = true
+
+# Direct deps
+rusqlite = { version = "0.32", features = ["bundled"] }

@@ -1,2 +1,0 @@
-# Backwards-compatible requirements export from pyproject.toml
-psycopg

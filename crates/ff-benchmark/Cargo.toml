@@ -1,0 +1,23 @@
+[package]
+name = "ff-benchmark"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "ForgeFleet benchmarking and capacity planning"
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+dashmap.workspace = true
+reqwest.workspace = true
+ff-core = { path = "../ff-core" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "test-util"] }

@@ -1,0 +1,25 @@
+[package]
+name = "ff-mesh"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "ForgeFleet mesh — leader/worker coordination, resource pooling, distributed compute"
+
+[dependencies]
+ff-core = { path = "../ff-core" }
+
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+axum.workspace = true
+reqwest.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+dashmap.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }

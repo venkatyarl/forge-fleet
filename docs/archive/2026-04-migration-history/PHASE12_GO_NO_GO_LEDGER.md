@@ -1,0 +1,25 @@
+# Phase 12 — GO/NO-GO Decision Ledger
+
+Date: 2026-04-04  
+Repo: `/Users/venkat/taylorProjects/forge-fleet`  
+Release target: `v0.1.0-internal`
+
+This ledger tracks the concrete decision criteria required to move from **HOLD / NO-GO** to **GO**.
+
+## Decision Ledger
+
+| criterion | current state | evidence | owner | next action | target date |
+|---|---|---|---|---|---|
+| UG-01 — Release-content integrity (Gate G4) | **OPEN (P0 blocker)**. Release-content drift/untracked in-scope surface still flagged; G4 not recorded PASS. | `docs/PHASE12_BLOCKERS_TRACKER.md` (UG-01), `docs/PHASE12_UNRESOLVED_GAPS.md` (UG-01), `docs/PHASE12_DECISION_MEMO.md` §2/§3, `docs/PHASE11_GO_GATES.md` (G4). | Release Engineering + Workspace maintainers | Reconcile include/defer scope, clear critical untracked release assets, and record **G4 = PASS** with evidence in gate sheet. | 2026-04-05 |
+| UG-02 — Formal GO gate execution + cross-functional sign-off (G1–G10) | **OPEN (P0 blocker)**. Gate checklist remains incomplete and sign-off records are not fully filled. | `docs/PHASE12_BLOCKERS_TRACKER.md` (UG-02), `docs/PHASE12_UNRESOLVED_GAPS.md` (UG-02), `docs/PHASE11_GO_GATES.md`, `docs/PHASE12_SIGNOFF_PACKAGE.md`. | Release Coordination + Engineering/Product/Ops/QA leadership | Execute all G1–G10, attach evidence links for each gate, and complete Eng/Product/Ops/QA sign-off blocks. | 2026-04-06 |
+| UG-03 — CI governance enforcement (Gate G5) | **IN PROGRESS (P1)**. Workflow exists, but required-check enforcement proof on protected branch is still pending. | `docs/PHASE12_BLOCKERS_TRACKER.md` (UG-03), `.github/workflows/rust-quality-gates.yml`, `docs/PHASE12_CI_BOOTSTRAP.md`, `docs/PHASE11_GO_GATES.md` (G5). | Infra / Ops Engineering | Produce green candidate-SHA runs (fmt/clippy/check/test), capture branch protection evidence, and mark **G5 = PASS**. | 2026-04-06 |
+| UG-04 — Integration maturity decision (Gate G6) | **OPEN (P1)**. `src/main.rs` bootstrap and `ff-pipeline` placeholder/defer path still unresolved in gate record. | `docs/PHASE12_BLOCKERS_TRACKER.md` (UG-04), `docs/PHASE12_UNRESOLVED_GAPS.md` (UG-04), `docs/PHASE12_DECISION_MEMO.md` §2/§4, `src/main.rs`, `crates/ff-pipeline/src/lib.rs`, `docs/PHASE11_GO_GATES.md` (G6). | Core Platform (CLI/Control/Pipeline) | Either implement accepted MVP behavior or formally defer with owner/date/risk acceptance; then record **G6 = PASS**. | 2026-04-06 (defer/closure) / 2026-04-11 (if full MVP completion needed) |
+| UG-05 — Fresh release evidence packet for candidate SHA (G1/G2/G3/G7) | **OPEN (P1)**. Release-day artifacts for candidate SHA are still incomplete/stale. | `docs/PHASE12_BLOCKERS_TRACKER.md` (UG-05), `docs/PHASE12_UNRESOLVED_GAPS.md` (UG-05), `docs/PHASE12_EVIDENCE_MATRIX.md` §2, `docs/PHASE11_GO_GATES.md` (G1/G2/G3/G7). | Quality Engineering + Release Engineering | Regenerate `.phase12-release/` artifacts (fmt/clippy/check/test/build/help + smoke), link evidence, and mark relevant gates PASS. | 2026-04-06 |
+| UG-06 — Ops startup/health + rollback readiness (G8/G9) | **OPEN (P1)**. Ops gates are defined but not evidenced as PASS for release candidate. | `docs/PHASE12_BLOCKERS_TRACKER.md` (UG-06), `docs/PHASE12_UNRESOLVED_GAPS.md` (UG-06), `docs/PHASE11_GO_GATES.md` (G8/G9), `docs/PHASE10_OPERATOR_RUNBOOK.md`, `docs/PHASE10_SHIP_PLAN.md`. | Operations / On-call | Execute startup/health checks and rollback (or dry-run), capture logs/artifacts, and mark **G8/G9 = PASS**. | 2026-04-06 |
+| UG-07 — FF10 backlog truth-state reconciliation | **OPEN (P1)**. FF10-001..FF10-013 release relevance is not fully reconciled to decisioning. | `docs/PHASE12_BLOCKERS_TRACKER.md` (UG-07), `docs/PHASE12_UNRESOLVED_GAPS.md` (UG-07), `docs/PHASE11_FINAL_AUDIT.md` (R4), `docs/PHASE11_REMEDIATION_PLAN.md`, `docs/PHASE11_RISK_BURNDOWN.md`. | Program + Core Engineering | Mark FF10 items as Done / GO-critical / Deferred with owner + evidence so no blocker remains ambiguous before GO call. | 2026-04-05 (rebaseline) / 2026-04-11 (if GO-critical implementation remains) |
+| **OVERALL — Computed GO/NO-GO decision** | **NO-GO / HOLD**. Computation: **0/7 criteria done**, **1/7 in progress**, **6/7 open**; readiness score **3.20/5** (< **4.0 GO threshold**) and governance score **2.0** (< **3.0 floor**). | `docs/PHASE12_BLOCKERS_TRACKER.md`, `docs/PHASE12_READINESS_SCORECARD.md` (Total 3.20/5; threshold), `docs/PHASE12_DECISION_MEMO.md` §4 (flip conditions). | Release decision authority (Engineering + Product + Ops + QA) | **To flip to GO:** close UG-01..UG-07, mark **G1–G10 PASS** with evidence links, complete multi-role sign-offs, and publish explicit GO statement for candidate `<TAG>@<SHA>` in `docs/PHASE12_SIGNOFF_PACKAGE.md`. | 2026-04-06 final GO checkpoint (or 2026-04-11 if integration/backlog carryover remains) |
+
+## Computation Rule
+
+- Decision is **GO** only when all required criteria above are closed with evidence and governance sign-offs are complete.
+- If any P0 criterion remains open, or if gate/sign-off evidence is incomplete, decision remains **NO-GO / HOLD**.

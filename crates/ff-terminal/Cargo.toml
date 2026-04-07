@@ -1,0 +1,29 @@
+[package]
+name = "ff-terminal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "ForgeFleet Terminal — rich interactive TUI for the ForgeFleet agent platform"
+
+[[bin]]
+name = "ff"
+path = "src/main.rs"
+
+[dependencies]
+ff-agent = { path = "../ff-agent" }
+ff-api = { path = "../ff-api" }
+
+ratatui = { version = "0.29", features = ["crossterm"] }
+crossterm = "0.29"
+
+reqwest.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+unicode-width = "0.2"

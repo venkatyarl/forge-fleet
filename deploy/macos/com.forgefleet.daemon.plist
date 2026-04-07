@@ -1,0 +1,90 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ForgeFleet LaunchAgent — macOS process supervision
+  ==================================================
+
+  Install:
+    mkdir -p ~/.forgefleet/logs
+    cp com.forgefleet.daemon.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.forgefleet.daemon.plist
+
+  Uninstall:
+    launchctl unload ~/Library/LaunchAgents/com.forgefleet.daemon.plist
+    rm ~/Library/LaunchAgents/com.forgefleet.daemon.plist
+
+  Check status:
+    launchctl list | grep forgefleet
+
+  View logs:
+    tail -f ~/.forgefleet/logs/forgefleetd.log
+
+  Notes:
+    - KeepAlive ensures automatic restart on crash
+    - ThrottleInterval prevents restart loops (10s cooldown)
+    - Binary expected at /usr/local/bin/forgefleetd
+      (or change ProgramArguments to ~/bin/forgefleetd)
+    - RUST_LOG controls log verbosity (trace/debug/info/warn/error)
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Service identity -->
+    <key>Label</key>
+    <string>com.forgefleet.daemon</string>
+
+    <!-- Binary and arguments -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/forgefleetd</string>
+        <string>start</string>
+    </array>
+
+    <!-- Working directory -->
+    <key>WorkingDirectory</key>
+    <string>~/.forgefleet</string>
+
+    <!-- Auto-restart on crash -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Cooldown between restarts (seconds) -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <!-- Logging -->
+    <key>StandardOutPath</key>
+    <string>~/.forgefleet/logs/forgefleetd.log</string>
+    <key>StandardErrorPath</key>
+    <string>~/.forgefleet/logs/forgefleetd.log</string>
+
+    <!-- Environment -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>RUST_LOG</key>
+        <string>info</string>
+        <key>FORGEFLEET_HOME</key>
+        <string>~/.forgefleet</string>
+    </dict>
+
+    <!-- Start at login -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Resource limits -->
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>4096</integer>
+    </dict>
+    <key>HardResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>8192</integer>
+    </dict>
+
+    <!-- Process priority (0 = normal, negative = higher priority) -->
+    <key>Nice</key>
+    <integer>0</integer>
+</dict>
+</plist>

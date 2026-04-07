@@ -1,0 +1,29 @@
+[package]
+name = "ff-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "ForgeFleet MCP (Model Context Protocol) server — JSON-RPC 2.0 over stdio/HTTP"
+
+[dependencies]
+ff-core = { path = "../ff-core" }
+ff-db = { path = "../ff-db" }
+ff-api = { path = "../ff-api" }
+ff-discovery = { path = "../ff-discovery" }
+ff-ssh = { path = "../ff-ssh" }
+ff-runtime = { path = "../ff-runtime" }
+ff-orchestrator = { path = "../ff-orchestrator" }
+ff-pipeline = { path = "../ff-pipeline" }
+
+tokio = { workspace = true, features = ["io-std"] }
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+axum.workspace = true
+reqwest.workspace = true
+toml = "0.8"

@@ -1,0 +1,37 @@
+[package]
+name = "ff-gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "ForgeFleet multi-channel messaging gateway (Telegram, Discord, Web, webhooks, embed widget)"
+
+[dependencies]
+ff-core = { path = "../ff-core" }
+ff-agent = { path = "../ff-agent" }
+ff-api = { path = "../ff-api" }
+ff-discovery = { path = "../ff-discovery" }
+ff-mc = { path = "../ff-mc" }
+ff-mcp = { path = "../ff-mcp" }
+ff-db = { path = "../ff-db" }
+ff-observability = { path = "../ff-observability" }
+
+# Workspace dependencies requested by architecture spec
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+axum.workspace = true
+reqwest.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+dashmap.workspace = true
+tower-http.workspace = true
+hyper.workspace = true
+bytes.workspace = true
+tokio-util = { version = "0.7", features = ["rt"] }
+rust-embed = "8"
+mime_guess = "2"

@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="forgefleet-favicon-title">
+  <title id="forgefleet-favicon-title">ForgeFleet</title>
+  <defs>
+    <linearGradient id="ff-fav-ring" x1="10" y1="10" x2="54" y2="54" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#67E8F9" />
+      <stop offset="0.55" stop-color="#38BDF8" />
+      <stop offset="1" stop-color="#A78BFA" />
+    </linearGradient>
+    <linearGradient id="ff-fav-arrow" x1="24" y1="18" x2="40" y2="42" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#E0F2FE" />
+      <stop offset="1" stop-color="#38BDF8" />
+    </linearGradient>
+  </defs>
+
+  <circle cx="32" cy="32" r="25" fill="none" stroke="url(#ff-fav-ring)" stroke-width="4" />
+  <path d="M17 42L32 16L47 42" fill="none" stroke="#7DD3FC" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round" />
+  <path d="M17 42H47" fill="none" stroke="#7DD3FC" stroke-width="2.8" stroke-linecap="round" />
+  <circle cx="17" cy="42" r="2.4" fill="#E0F2FE" />
+  <circle cx="32" cy="16" r="2.4" fill="#E0F2FE" />
+  <circle cx="47" cy="42" r="2.4" fill="#E0F2FE" />
+  <path d="M32 22L40 36L32 33L24 36L32 22Z" fill="url(#ff-fav-arrow)" />
+  <path d="M32 33V46" stroke="#BAE6FD" stroke-width="2.8" stroke-linecap="round" />
+</svg>

@@ -1,0 +1,20 @@
+[package]
+name = "ff-memory"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "ForgeFleet universal memory layer: long-term memory store, session capture, and RAG pipeline"
+
+[dependencies]
+ff-core = { path = "../ff-core" }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+dashmap.workspace = true
+sqlx.workspace = true

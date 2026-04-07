@@ -1,0 +1,50 @@
+[package]
+name = "ff-observability"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "ForgeFleet observability — telemetry, metrics, events, log ingestion, alerting, dashboard"
+
+[dependencies]
+ff-core = { path = "../ff-core" }
+
+# Async runtime
+tokio.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Web / HTTP (dashboard APIs)
+axum.workspace = true
+
+# Error handling
+anyhow.workspace = true
+thiserror.workspace = true
+
+# Logging / tracing
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+
+# OpenTelemetry (distributed tracing export)
+opentelemetry = "0.27"
+opentelemetry_sdk = { version = "0.27", features = ["trace"] }
+opentelemetry-stdout = { version = "0.27", features = ["trace"] }
+tracing-opentelemetry = "0.28"
+
+# Filesystem
+dirs.workspace = true
+
+# Prometheus metrics export
+prometheus = "0.13"
+lazy_static = "1"
+
+# Utils
+chrono.workspace = true
+uuid.workspace = true
+dashmap.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }

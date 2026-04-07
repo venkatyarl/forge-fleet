@@ -1,0 +1,207 @@
+//! Embedded migration runner.
+//!
+//! Migrations are SQL strings embedded in Rust, applied forward-only
+//! with version tracking via a `_migrations` meta-table.
+
+use rusqlite::Connection;
+use tracing::{debug, info, warn};
+
+use crate::error::{DbError, Result};
+use crate::schema;
+
+/// A single migration step.
+struct Migration {
+    version: u32,
+    name: &'static str,
+    sql: &'static str,
+}
+
+/// All migrations in order. Add new ones at the end — never modify existing entries.
+static MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "initial_schema",
+        sql: schema::SCHEMA_V1,
+    },
+    Migration {
+        version: 2,
+        name: "task_ownership_schema",
+        sql: schema::SCHEMA_V2_TASK_OWNERSHIP,
+    },
+    Migration {
+        version: 3,
+        name: "autonomy_events_schema",
+        sql: schema::SCHEMA_V3_AUTONOMY_EVENTS,
+    },
+    Migration {
+        version: 4,
+        name: "telegram_media_ingest_schema",
+        sql: schema::SCHEMA_V4_TELEGRAM_MEDIA_INGEST,
+    },
+    Migration {
+        version: 5,
+        name: "fleet_node_runtime_schema",
+        sql: schema::SCHEMA_V5_FLEET_NODE_RUNTIME,
+    },
+    Migration {
+        version: 6,
+        name: "fleet_enrollment_events_schema",
+        sql: schema::SCHEMA_V6_FLEET_ENROLLMENT_EVENTS,
+    },
+];
+
+/// Ensure the migrations meta-table exists.
+fn ensure_migrations_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS _migrations (
+            version     INTEGER PRIMARY KEY,
+            name        TEXT NOT NULL,
+            applied_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        );",
+    )?;
+    Ok(())
+}
+
+/// Get the current schema version (0 if no migrations have been applied).
+fn current_version(conn: &Connection) -> Result<u32> {
+    let version: u32 = conn.query_row(
+        "SELECT COALESCE(MAX(version), 0) FROM _migrations",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(version)
+}
+
+/// Run all pending migrations on the given connection.
+///
+/// This function is idempotent — re-running it on an up-to-date database is a no-op.
+/// Migrations run in a transaction so partial failures roll back cleanly.
+pub fn run_migrations(conn: &Connection) -> Result<u32> {
+    ensure_migrations_table(conn)?;
+    let current = current_version(conn)?;
+
+    let pending: Vec<&Migration> = MIGRATIONS.iter().filter(|m| m.version > current).collect();
+
+    if pending.is_empty() {
+        debug!(current_version = current, "database is up to date");
+        return Ok(current);
+    }
+
+    info!(
+        current_version = current,
+        pending = pending.len(),
+        "running {} pending migration(s)",
+        pending.len()
+    );
+
+    for migration in &pending {
+        info!(
+            version = migration.version,
+            name = migration.name,
+            "applying migration"
+        );
+
+        // Wrap each migration in a transaction.
+        conn.execute_batch("BEGIN IMMEDIATE;")?;
+
+        match conn.execute_batch(migration.sql) {
+            Ok(()) => {
+                conn.execute(
+                    "INSERT INTO _migrations (version, name) VALUES (?1, ?2)",
+                    rusqlite::params![migration.version, migration.name],
+                )?;
+                conn.execute_batch("COMMIT;")?;
+                info!(
+                    version = migration.version,
+                    "migration applied successfully"
+                );
+            }
+            Err(e) => {
+                warn!(version = migration.version, error = %e, "migration failed, rolling back");
+                let _ = conn.execute_batch("ROLLBACK;");
+                return Err(DbError::Migration(format!(
+                    "migration v{} '{}' failed: {e}",
+                    migration.version, migration.name
+                )));
+            }
+        }
+    }
+
+    let final_version = current_version(conn)?;
+    info!(version = final_version, "all migrations applied");
+    Ok(final_version)
+}
+
+/// Get information about applied migrations.
+pub fn applied_migrations(conn: &Connection) -> Result<Vec<(u32, String, String)>> {
+    ensure_migrations_table(conn)?;
+
+    let mut stmt =
+        conn.prepare("SELECT version, name, applied_at FROM _migrations ORDER BY version")?;
+
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, u32>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+
+    let mut result = Vec::new();
+    for row in rows {
+        result.push(row?);
+    }
+    Ok(result)
+}
+
+/// Get the latest migration version available (not yet applied necessarily).
+pub fn latest_available_version() -> u32 {
+    MIGRATIONS.last().map(|m| m.version).unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    #[test]
+    fn test_migrations_run_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        // First run applies all.
+        let v1 = run_migrations(&conn).unwrap();
+        assert_eq!(v1, latest_available_version());
+
+        // Second run is a no-op.
+        let v2 = run_migrations(&conn).unwrap();
+        assert_eq!(v1, v2);
+    }
+
+    #[test]
+    fn test_applied_migrations_list() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+
+        let applied = applied_migrations(&conn).unwrap();
+        assert!(!applied.is_empty());
+        assert_eq!(applied[0].0, 1);
+        assert_eq!(applied[0].1, "initial_schema");
+    }
+
+    #[test]
+    fn test_tables_created() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+
+        // Verify every expected table exists.
+        for table in crate::schema::TABLES {
+            let count: u32 = conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "table '{}' should exist", table);
+        }
+    }
+}

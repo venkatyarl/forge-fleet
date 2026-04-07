@@ -1,0 +1,23 @@
+[package]
+name = "ff-control"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "ForgeFleet control-plane facade wiring discovery/runtime/orchestration/scheduling/deploy"
+
+[dependencies]
+ff-core = { path = "../ff-core" }
+ff-discovery = { path = "../ff-discovery" }
+ff-runtime = { path = "../ff-runtime" }
+ff-orchestrator = { path = "../ff-orchestrator" }
+ff-cron = { path = "../ff-cron" }
+ff-deploy = { path = "../ff-deploy" }
+
+chrono.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
