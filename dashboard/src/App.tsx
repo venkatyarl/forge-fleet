@@ -24,8 +24,10 @@ import { Settings } from './pages/Settings'
 import { Chats } from './pages/Chats'
 import { ToolInventory } from './pages/ToolInventory'
 import { ModelHub } from './pages/ModelHub'
+import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts'
 
 function Shell() {
+  useKeyboardShortcuts()
   const [darkMode, setDarkMode] = useState(() => {
     const cached = localStorage.getItem('ff_dark_mode')
     return cached ? cached === 'true' : true

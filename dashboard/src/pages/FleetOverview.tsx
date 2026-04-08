@@ -1,143 +1,160 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useOutletContext } from 'react-router-dom'
 import { NodeCard } from '../components/NodeCard'
+import { SkeletonStatCard, SkeletonCard } from '../components/Skeleton'
+import { EmptyState } from '../components/EmptyState'
 import { getJson } from '../lib/api'
 import { extractNodes, extractSummary } from '../lib/normalizers'
 import type { FleetNode, FleetStatusResponse, WsEvent } from '../types'
 
-type HealthResponse = {
-  status?: string
-  [key: string]: unknown
-}
+type HealthResponse = { status?: string; [key: string]: unknown }
 
 export function FleetOverview() {
+  
   const { wsEvent } = useOutletContext<{ wsEvent: WsEvent | null }>()
   const [nodes, setNodes] = useState<FleetNode[]>([])
   const [gatewayHealth, setGatewayHealth] = useState('unknown')
   const [summary, setSummary] = useState({
-    total_nodes: 0,
-    connected_nodes: 0,
-    unhealthy_nodes: 0,
-    enrolled_nodes: 0,
-    seed_nodes: 0,
-    model_count: 0,
-    leader: 'unknown',
+    total_nodes: 0, connected_nodes: 0, unhealthy_nodes: 0,
+    enrolled_nodes: 0, seed_nodes: 0, model_count: 0, leader: 'unknown',
   })
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const [lastUpdated, setLastUpdated] = useState<Date | null>(null)
 
   const load = useCallback(async () => {
     try {
       setError(null)
       const [fleet, healthData] = await Promise.all([
-        getJson<FleetStatusResponse>('/api/fleet/status').catch(() =>
-          getJson<FleetStatusResponse>('/api/status'),
-        ),
+        getJson<FleetStatusResponse>('/api/fleet/status').catch(() => getJson<FleetStatusResponse>('/api/status')),
         getJson<HealthResponse>('/health').catch(() => ({ status: 'unknown' })),
       ])
-
-      const normalizedNodes = extractNodes(fleet)
-      const normalizedSummary = extractSummary(fleet)
-
-      setNodes(normalizedNodes)
+      setNodes(extractNodes(fleet))
+      const s = extractSummary(fleet)
       setSummary({
-        total_nodes: normalizedSummary.total_nodes ?? normalizedNodes.length,
-        connected_nodes: normalizedSummary.connected_nodes ?? 0,
-        unhealthy_nodes: normalizedSummary.unhealthy_nodes ?? 0,
-        enrolled_nodes: normalizedSummary.enrolled_nodes ?? 0,
-        seed_nodes: normalizedSummary.seed_nodes ?? 0,
-        model_count: normalizedSummary.model_count ?? 0,
-        leader: normalizedSummary.leader ?? 'unknown',
+        total_nodes: s.total_nodes ?? 0, connected_nodes: s.connected_nodes ?? 0,
+        unhealthy_nodes: s.unhealthy_nodes ?? 0, enrolled_nodes: s.enrolled_nodes ?? 0,
+        seed_nodes: s.seed_nodes ?? 0, model_count: s.model_count ?? 0,
+        leader: s.leader ?? 'unknown',
       })
       setGatewayHealth(healthData.status ?? 'unknown')
+      setLastUpdated(new Date())
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load fleet overview')
+      setError(err instanceof Error ? err.message : 'Failed to load')
     } finally {
       setLoading(false)
     }
   }, [])
 
-  useEffect(() => {
-    void load()
-    const interval = window.setInterval(() => void load(), 15000)
-    return () => window.clearInterval(interval)
-  }, [load])
+  useEffect(() => { void load(); const i = setInterval(() => void load(), 15000); return () => clearInterval(i) }, [load])
+  useEffect(() => { if (wsEvent) void load() }, [wsEvent, load])
 
-  useEffect(() => {
-    if (wsEvent) {
-      void load()
-    }
-  }, [wsEvent, load])
-
-  const leaderNodeName = useMemo(() => {
-    const explicitLeader = nodes.find((node) => node.is_leader || node.leader_state === 'leader')
-    return explicitLeader?.name ?? summary.leader
+  const leaderName = useMemo(() => {
+    return nodes.find(n => n.is_leader || n.leader_state === 'leader')?.name ?? summary.leader
   }, [nodes, summary.leader])
 
+  const healthPct = summary.total_nodes > 0
+    ? Math.round(((summary.total_nodes - summary.unhealthy_nodes) / summary.total_nodes) * 100) : 0
+
   return (
-    <section className="space-y-4">
-      <article className="rounded-2xl border border-slate-800 bg-gradient-to-r from-slate-900 via-slate-900 to-slate-950 p-4 md:p-5">
-        <div className="flex flex-wrap items-center gap-4">
-          <img
-            src="/brand/forgefleet-mark.svg"
-            alt="ForgeFleet"
-            className="h-14 w-14 rounded-xl border border-slate-700/80 bg-slate-950/80 p-1.5"
-          />
-          <div>
-            <h2 className="text-base font-semibold text-slate-100 md:text-lg">ForgeFleet Command Mesh</h2>
-            <p className="mt-1 text-sm text-slate-300">
-              Unified fleet telemetry, mission control, and routing visibility in one dark-first command center.
-            </p>
-          </div>
+    <section className="space-y-6">
+      {/* Status Banner */}
+      <div className="flex items-center justify-between">
+        <div>
+          <h2 className="text-xl font-semibold text-zinc-100">Fleet Overview</h2>
+          <p className="text-sm text-zinc-500">
+            {lastUpdated ? `Updated ${lastUpdated.toLocaleTimeString()}` : 'Loading...'}
+          </p>
         </div>
-      </article>
-
-      <div className="grid gap-3 md:grid-cols-3 xl:grid-cols-8">
-        <Stat label="Total Nodes" value={String(summary.total_nodes)} />
-        <Stat label="Connected" value={String(summary.connected_nodes)} accent="text-emerald-300" />
-        <Stat label="Unhealthy" value={String(summary.unhealthy_nodes)} accent="text-amber-300" />
-        <Stat label="Live Enrolled" value={String(summary.enrolled_nodes)} accent="text-sky-300" />
-        <Stat label="Seed Static" value={String(summary.seed_nodes)} accent="text-slate-300" />
-        <Stat label="Models Loaded" value={String(summary.model_count)} accent="text-sky-300" />
-        <Stat label="Leader" value={leaderNodeName} />
-        <Stat label="Gateway Health" value={gatewayHealth} />
+        <div className="flex items-center gap-3">
+          <div className={`flex items-center gap-2 rounded-full px-3 py-1.5 text-sm font-medium ${
+            healthPct >= 80 ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20' :
+            healthPct >= 50 ? 'bg-amber-500/10 text-amber-400 border border-amber-500/20' :
+            'bg-rose-500/10 text-rose-400 border border-rose-500/20'
+          }`}>
+            <span className={`h-2 w-2 rounded-full ${healthPct >= 80 ? 'bg-emerald-400' : healthPct >= 50 ? 'bg-amber-400' : 'bg-rose-400'}`} />
+            {healthPct}% Healthy
+          </div>
+          <button onClick={() => void load()} className="rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-sm text-zinc-400 hover:text-zinc-200 transition">
+            Refresh
+          </button>
+        </div>
       </div>
 
-      {loading ? <PanelText text="Loading fleet overview..." /> : null}
-      {error ? <PanelText text={`Error: ${error}`} danger /> : null}
+      {/* Golden Signals — 4 key metrics */}
+      {loading ? (
+        <div className="grid gap-3 md:grid-cols-4">
+          {[1,2,3,4].map(i => <SkeletonStatCard key={i} />)}
+        </div>
+      ) : (
+        <div className="grid gap-3 md:grid-cols-4">
+          <SignalCard label="Nodes Online" value={`${summary.connected_nodes}/${summary.total_nodes}`} color="emerald" icon="🖥️" />
+          <SignalCard label="Models Loaded" value={String(summary.model_count)} color="sky" icon="🤖" />
+          <SignalCard label="Unhealthy" value={String(summary.unhealthy_nodes)} color={summary.unhealthy_nodes > 0 ? 'rose' : 'zinc'} icon="⚠️" />
+          <SignalCard label="Leader" value={leaderName} color="violet" icon="👑" />
+        </div>
+      )}
 
-      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-        {nodes.map((node) => (
-          <NodeCard key={node.id ?? node.name} node={node} />
-        ))}
+      {/* Secondary stats */}
+      <div className="grid gap-3 md:grid-cols-4">
+        <MiniStat label="Enrolled" value={summary.enrolled_nodes} />
+        <MiniStat label="Seed" value={summary.seed_nodes} />
+        <MiniStat label="Gateway" value={gatewayHealth} />
+        <MiniStat label="Version" value="v2026.4.7" />
       </div>
 
-      {!loading && nodes.length === 0 ? (
-        <PanelText text="No nodes reported by API yet." />
-      ) : null}
+      {error && (
+        <div className="rounded-xl border border-rose-500/20 bg-rose-500/5 px-4 py-3 text-sm text-rose-300">
+          {error}
+        </div>
+      )}
+
+      {/* Node Grid */}
+      {loading ? (
+        <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+          {[1,2,3,4,5,6].map(i => <SkeletonCard key={i} lines={4} />)}
+        </div>
+      ) : nodes.length === 0 ? (
+        <EmptyState
+          icon="🖥️"
+          title="No nodes connected"
+          description="Connect your first fleet node to start monitoring. Each node runs ForgeFleet daemon with LLM inference."
+          primaryAction={{ label: 'Add Node', to: '/onboarding' }}
+          secondaryAction={{ label: 'View Setup Guide', to: '/onboarding' }}
+        />
+      ) : (
+        <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+          {nodes.map(node => <NodeCard key={node.id ?? node.name} node={node} />)}
+        </div>
+      )}
     </section>
   )
 }
 
-function Stat({ label, value, accent }: { label: string; value: string; accent?: string }) {
+function SignalCard({ label, value, color, icon }: { label: string; value: string; color: string; icon: string }) {
+  const colors: Record<string, string> = {
+    emerald: 'border-emerald-500/20 text-emerald-400',
+    sky: 'border-sky-500/20 text-sky-400',
+    rose: 'border-rose-500/20 text-rose-400',
+    violet: 'border-violet-500/20 text-violet-400',
+    zinc: 'border-zinc-700 text-zinc-400',
+  }
   return (
-    <article className="rounded-xl border border-slate-800 bg-slate-900/70 p-4">
-      <p className="text-xs uppercase tracking-wide text-slate-500">{label}</p>
-      <p className={`mt-2 text-2xl font-semibold ${accent ?? 'text-slate-100'}`}>{value}</p>
+    <article className={`rounded-xl border bg-zinc-900/80 p-4 ${colors[color] || colors.zinc}`}>
+      <div className="flex items-center justify-between">
+        <p className="text-xs uppercase tracking-wide text-zinc-500">{label}</p>
+        <span className="text-lg">{icon}</span>
+      </div>
+      <p className={`mt-2 text-2xl font-semibold ${colors[color]?.split(' ')[1] || 'text-zinc-100'}`}>{value}</p>
     </article>
   )
 }
 
-function PanelText({ text, danger = false }: { text: string; danger?: boolean }) {
+function MiniStat({ label, value }: { label: string; value: string | number }) {
   return (
-    <div
-      className={`rounded-xl border px-4 py-3 text-sm ${
-        danger
-          ? 'border-rose-500/30 bg-rose-500/10 text-rose-200'
-          : 'border-slate-800 bg-slate-900/50 text-slate-300'
-      }`}
-    >
-      {text}
+    <div className="flex items-center justify-between rounded-lg border border-zinc-800 bg-zinc-900/50 px-3 py-2">
+      <span className="text-xs text-zinc-500">{label}</span>
+      <span className="text-sm font-medium text-zinc-300">{String(value)}</span>
     </div>
   )
 }
