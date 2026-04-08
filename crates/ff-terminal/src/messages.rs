@@ -78,7 +78,9 @@ pub fn render_assistant_message(text: &str) -> DisplayMessage {
 /// Render a tool start event.
 pub fn render_tool_start(tool_name: &str, input_json: &str) -> DisplayMessage {
     let preview = if input_json.len() > 60 {
-        format!("{}...", &input_json[..60])
+        let mut end = 60;
+        while end > 0 && !input_json.is_char_boundary(end) { end -= 1; }
+        format!("{}...", &input_json[..end])
     } else {
         input_json.to_string()
     };
@@ -101,10 +103,14 @@ pub fn render_tool_end(tool_name: &str, result: &str, is_error: bool, duration_m
         ("✓", Color::Rgb(74, 222, 128))
     };
 
-    let preview = if result.len() > 100 {
-        format!("{}...", &result.lines().next().unwrap_or("")[..result.len().min(100)])
+    let first_line = result.lines().next().unwrap_or("");
+    let preview = if first_line.len() > 100 {
+        // Safe UTF-8 truncation
+        let mut end = 100;
+        while end > 0 && !first_line.is_char_boundary(end) { end -= 1; }
+        format!("{}...", &first_line[..end])
     } else {
-        result.lines().next().unwrap_or("").to_string()
+        first_line.to_string()
     };
 
     DisplayMessage {
