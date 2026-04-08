@@ -209,8 +209,14 @@ async fn run_event_loop(
                         app.should_quit = true;
                     }
 
-                    // Enter: submit message (works even while running — queues it)
+                    // Enter: accept suggestion if active, otherwise submit
                     (KeyCode::Enter, KeyModifiers::NONE) => {
+                        // If a suggestion is selected, accept it first
+                        if app.input.suggestion_index.is_some() {
+                            app.input.accept_suggestion();
+                            continue;
+                        }
+
                         if app.input.text.trim().is_empty() { continue; }
 
                         let trimmed = app.input.text.trim().to_string();
