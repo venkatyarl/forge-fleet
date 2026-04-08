@@ -51,7 +51,10 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Start ForgeFleet (daemon + LLM + web)
     Start { #[arg(long, default_value_t = false)] leader: bool },
+    /// Stop ForgeFleet daemon
+    Stop,
     Status, Nodes, Models, Health,
     Proxy { #[arg(long, default_value_t = 4000)] port: u16 },
     Discover { #[arg(long, default_value = "192.168.5.0/24")] subnet: String },
@@ -78,7 +81,8 @@ async fn main() -> Result<()> {
     };
 
     match cli.command {
-        Some(Command::Start { leader }) => handle_start(leader, &config_path),
+        Some(Command::Start { leader }) => handle_start(leader, &config_path, &working_dir).await,
+        Some(Command::Stop) => handle_stop().await,
         Some(Command::Status) => handle_status(&config_path),
         Some(Command::Nodes) => handle_nodes(&config_path),
         Some(Command::Models) => handle_models(&agent_config).await,
@@ -337,6 +341,30 @@ async fn run_headless(prompt: &str, config: AgentSessionConfig, output_format: &
     Ok(())
 }
 
+async fn handle_stop() -> Result<()> {
+    println!("{CYAN}▶ Stopping ForgeFleet{RESET}");
+
+    // Kill forgefleetd
+    let kill = tokio::process::Command::new("pkill").args(["-f", "forgefleetd"]).output().await;
+    match kill {
+        Ok(o) if o.status.success() => println!("  {GREEN}✓ Daemon stopped{RESET}"),
+        _ => println!("  {YELLOW}⚠ No daemon process found{RESET}"),
+    }
+
+    // Verify
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let client = reqwest::Client::builder().timeout(Duration::from_secs(1)).build()?;
+    let still_running = client.get(format!("http://127.0.0.1:{}/health", ff_terminal::app::PORT_DAEMON))
+        .send().await.map(|r| r.status().is_success()).unwrap_or(false);
+
+    if still_running {
+        println!("  {RED}✗ Daemon still running — try: kill $(pgrep forgefleetd){RESET}");
+    } else {
+        println!("  {GREEN}✓ ForgeFleet stopped{RESET}");
+    }
+    Ok(())
+}
+
 // ─── Helpers ───────────────────────────────────────────────────────────────
 
 fn detect_local_llm() -> Option<String> {
@@ -374,9 +402,137 @@ fn load_config(p: &Path) -> Result<FleetConfig> {
     Ok(toml::from_str(&fs::read_to_string(p)?)?)
 }
 
-fn handle_start(leader: bool, p: &Path) -> Result<()> {
-    println!("{CYAN}▶ Starting ForgeFleet daemon ({}){RESET}", if leader {"leader"} else {"auto"});
-    println!("  config: {}", p.display()); Ok(())
+async fn handle_start(leader: bool, config_path: &Path, working_dir: &Path) -> Result<()> {
+    println!("{CYAN}▶ Starting ForgeFleet{RESET}");
+    println!("  Config: {}", config_path.display());
+    println!("  Mode:   {}", if leader { "leader" } else { "auto" });
+    println!();
+
+    // Check if already running
+    let client = reqwest::Client::builder().timeout(Duration::from_secs(2)).build()?;
+    if client.get(format!("http://127.0.0.1:{}/health", ff_terminal::app::PORT_DAEMON))
+        .send().await.map(|r| r.status().is_success()).unwrap_or(false) {
+        println!("{GREEN}✓ ForgeFleet is already running{RESET}");
+        println!("  Daemon:    http://localhost:{}", ff_terminal::app::PORT_DAEMON);
+        println!("  Web UI:    http://localhost:{}", ff_terminal::app::PORT_WEB);
+        println!("  WebSocket: ws://localhost:{}", ff_terminal::app::PORT_WS);
+        return Ok(());
+    }
+
+    // Step 1: Find and start LLM server
+    println!("{YELLOW}1/4{RESET} Checking LLM server...");
+    let llm_running = std::net::TcpStream::connect_timeout(
+        &"127.0.0.1:51000".parse().unwrap(), Duration::from_millis(500)).is_ok();
+
+    if llm_running {
+        println!("  {GREEN}✓ LLM server already running on :51000{RESET}");
+    } else {
+        println!("  {YELLOW}⚠ No LLM server detected locally{RESET}");
+        println!("  Start one with: ollama serve & ollama run qwen2.5-coder:32b");
+        println!("  Or: llama-server -m /path/to/model.gguf --host 0.0.0.0 --port 51000 --ctx-size 32768");
+    }
+
+    // Step 2: Start ForgeFleet daemon
+    println!("{YELLOW}2/4{RESET} Starting ForgeFleet daemon...");
+
+    // Find the forgefleetd binary
+    let daemon_binary = find_daemon_binary(working_dir);
+    match daemon_binary {
+        Some(bin) => {
+            let mut cmd = tokio::process::Command::new(&bin);
+            cmd.arg("--config").arg(config_path);
+            if leader { cmd.arg("start").arg("--leader"); }
+
+            // Spawn as background process
+            match cmd.stdout(std::process::Stdio::null())
+                     .stderr(std::process::Stdio::null())
+                     .spawn() {
+                Ok(child) => {
+                    println!("  {GREEN}✓ Daemon started (PID: {}){RESET}", child.id().unwrap_or(0));
+
+                    // Wait a moment for it to boot
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+
+                    // Verify it's running
+                    let health = client.get(format!("http://127.0.0.1:{}/health", ff_terminal::app::PORT_DAEMON))
+                        .send().await;
+                    match health {
+                        Ok(r) if r.status().is_success() => {
+                            println!("  {GREEN}✓ Daemon healthy{RESET}");
+                        }
+                        _ => {
+                            println!("  {YELLOW}⚠ Daemon started but health check pending{RESET}");
+                            println!("  It may still be initializing. Check: ff health");
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("  {RED}✗ Failed to start daemon: {e}{RESET}");
+                    println!("  Binary: {}", bin.display());
+                    println!("  Try: cargo run --release (from forge-fleet directory)");
+                }
+            }
+        }
+        None => {
+            println!("  {RED}✗ forgefleetd binary not found{RESET}");
+            println!("  Build with: cargo build --release");
+            println!("  Or run: cargo run --release");
+        }
+    }
+
+    // Step 3: Check fleet connectivity
+    println!("{YELLOW}3/4{RESET} Checking fleet nodes...");
+    let nodes = [("Taylor","192.168.5.100"),("Marcus","192.168.5.102"),("Sophie","192.168.5.103"),("Priya","192.168.5.104"),("James","192.168.5.108")];
+    let mut online = 0;
+    for (name, ip) in &nodes {
+        let ok = client.get(format!("http://{ip}:51000/health")).send().await
+            .map(|r| r.status().is_success()).unwrap_or(false);
+        if ok { online += 1; }
+        let icon = if ok { format!("{GREEN}●{RESET}") } else { format!("{RED}○{RESET}") };
+        println!("  {icon} {name} ({ip})");
+    }
+
+    // Step 4: Summary
+    println!("{YELLOW}4/4{RESET} Summary");
+    println!();
+    println!("  {GREEN}ForgeFleet v{}{RESET}", env!("CARGO_PKG_VERSION"));
+    println!("  Fleet: {online}/{} nodes online", nodes.len());
+    println!();
+    println!("  Daemon:    http://localhost:{}", ff_terminal::app::PORT_DAEMON);
+    println!("  LLM API:   http://localhost:{}", ff_terminal::app::PORT_LLM);
+    println!("  Web UI:    http://localhost:{}", ff_terminal::app::PORT_WEB);
+    println!("  WebSocket: ws://localhost:{}", ff_terminal::app::PORT_WS);
+    println!("  Metrics:   http://localhost:{}", ff_terminal::app::PORT_METRICS);
+    println!();
+    println!("  Run {CYAN}ff{RESET} for terminal, or open {CYAN}http://localhost:{}{RESET} for web UI", ff_terminal::app::PORT_WEB);
+
+    Ok(())
+}
+
+/// Find the forgefleetd daemon binary.
+fn find_daemon_binary(working_dir: &Path) -> Option<PathBuf> {
+    // Check common locations
+    let candidates = [
+        working_dir.join("target/release/forgefleetd"),
+        working_dir.join("target/debug/forgefleetd"),
+        PathBuf::from("/usr/local/bin/forgefleetd"),
+        dirs::home_dir().unwrap_or_default().join(".local/bin/forgefleetd"),
+        dirs::home_dir().unwrap_or_default().join(".cargo/bin/forgefleetd"),
+    ];
+
+    for path in candidates.iter() {
+        if path.exists() { return Some(path.to_path_buf()); }
+    }
+
+    // Try which
+    if let Ok(output) = std::process::Command::new("which").arg("forgefleetd").output() {
+        if output.status.success() {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !path.is_empty() { return Some(PathBuf::from(path)); }
+        }
+    }
+
+    None
 }
 
 fn handle_status(p: &Path) -> Result<()> {

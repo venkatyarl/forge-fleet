@@ -1290,6 +1290,7 @@ dependencies = [
  "chrono",
  "clap",
  "crossterm 0.29.0",
+ "dirs 5.0.1",
  "ff-agent",
  "ff-api",
  "ratatui",

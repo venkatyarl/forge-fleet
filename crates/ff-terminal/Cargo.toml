@@ -18,6 +18,7 @@ ratatui = { version = "0.29", features = ["crossterm"] }
 crossterm = "0.29"
 
 reqwest.workspace = true
+dirs = "5"
 anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
