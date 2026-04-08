@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { Navigate, Outlet, Route, Routes } from 'react-router-dom'
 import { Header } from './components/Header'
 import { Sidebar } from './components/Sidebar'
+import { CommandPalette } from './components/CommandPalette'
 import { useWsFeed } from './hooks/useWsFeed'
 import { AuditLog } from './pages/AuditLog'
 import { ConfigEditor } from './pages/ConfigEditor'
@@ -38,6 +39,7 @@ function Shell() {
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100">
+      <CommandPalette />
       <Header
         wsConnected={connected}
         eventCount={eventCount}
