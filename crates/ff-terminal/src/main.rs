@@ -169,13 +169,13 @@ async fn run_event_loop(
             if handle.is_finished() {
                 if let Some(handle) = agent_handle.take() {
                     if let Ok((session, _)) = handle.await {
-                        app.session_id = session.id.to_string();
-                        app.session = Some(session);
+                        app.tab_mut().session_id = session.id.to_string();
+                        app.tab_mut().session = Some(session);
                     }
                 }
                 event_rx = None;
-                app.is_running = false;
-                app.status = "Ready".into();
+                app.tab_mut().is_running = false;
+                app.tab_mut().status = "Ready".into();
             }
         }
 
@@ -188,23 +188,23 @@ async fn run_event_loop(
             if let Event::Key(key) = event::read()? {
                 match (key.code, key.modifiers) {
                     // Esc: cancel running agent (don't quit)
-                    (KeyCode::Esc, _) if app.is_running => {
+                    (KeyCode::Esc, _) if app.tab().is_running => {
                         if let Some(handle) = agent_handle.take() {
                             handle.abort();
                         }
                         event_rx = None;
-                        app.is_running = false;
-                        app.status = "Cancelled".into();
-                        app.messages.push(ff_terminal::messages::render_status("Agent cancelled by user"));
+                        app.tab_mut().is_running = false;
+                        app.tab_mut().status = "Cancelled".into();
+                        app.tab_mut().messages.push(ff_terminal::messages::render_status("Agent cancelled by user"));
                     }
 
                     // Ctrl+C: quit (only when not running, otherwise cancel)
                     (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                        if app.is_running {
+                        if app.tab().is_running {
                             if let Some(handle) = agent_handle.take() { handle.abort(); }
                             event_rx = None;
-                            app.is_running = false;
-                            app.status = "Cancelled".into();
+                            app.tab_mut().is_running = false;
+                            app.tab_mut().status = "Cancelled".into();
                         } else {
                             app.should_quit = true;
                         }
@@ -216,41 +216,41 @@ async fn run_event_loop(
                     // Enter: accept suggestion if active, otherwise submit
                     (KeyCode::Enter, KeyModifiers::NONE) => {
                         // If a suggestion is selected, accept it first
-                        if app.input.suggestion_index.is_some() {
-                            app.input.accept_suggestion();
+                        if app.tab_mut().input.suggestion_index.is_some() {
+                            app.tab_mut().input.accept_suggestion();
                             continue;
                         }
 
-                        if app.input.text.trim().is_empty() { continue; }
+                        if app.tab_mut().input.text.trim().is_empty() { continue; }
 
-                        let trimmed = app.input.text.trim().to_string();
+                        let trimmed = app.tab_mut().input.text.trim().to_string();
                         if trimmed == "/exit" || trimmed == "/quit" {
                             app.should_quit = true;
                             continue;
                         }
 
                         // If running, cancel current and start new
-                        if app.is_running {
+                        if app.tab().is_running {
                             if let Some(handle) = agent_handle.take() { handle.abort(); }
                             event_rx = None;
-                            app.is_running = false;
+                            app.tab_mut().is_running = false;
                         }
 
                         // Slash commands
                         if trimmed.starts_with('/') {
-                            let mut session = app.session.take().unwrap_or_else(|| AgentSession::new(config.clone()));
+                            let mut session = app.tab_mut().session.take().unwrap_or_else(|| AgentSession::new(config.clone()));
                             if let Some(output) = commands.try_execute(&trimmed, &mut session).await {
-                                app.messages.push(ff_terminal::messages::render_user_message(&trimmed));
-                                app.messages.push(ff_terminal::messages::render_assistant_message(&output));
-                                app.input.submit();
+                                app.tab_mut().messages.push(ff_terminal::messages::render_user_message(&trimmed));
+                                app.tab_mut().messages.push(ff_terminal::messages::render_assistant_message(&output));
+                                app.tab_mut().input.submit();
                             }
-                            app.session = Some(session);
+                            app.tab_mut().session = Some(session);
                             continue;
                         }
 
                         // Agent run
                         app.submit_input();
-                        let mut session = app.session.take().unwrap_or_else(|| AgentSession::new(config.clone()));
+                        let mut session = app.tab_mut().session.take().unwrap_or_else(|| AgentSession::new(config.clone()));
                         let prompt = trimmed;
                         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
 
@@ -265,29 +265,36 @@ async fn run_event_loop(
 
                     // Text editing — ALWAYS works (even while running)
                     (KeyCode::Tab, _) => {
-                        app.input.compute_suggestions(command_list);
-                        app.input.next_suggestion();
+                        app.tab_mut().input.compute_suggestions(command_list);
+                        app.tab_mut().input.next_suggestion();
                     }
                     (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
-                        app.input.insert_char(c);
-                        if app.input.text.starts_with('/') {
-                            app.input.compute_suggestions(command_list);
+                        app.tab_mut().input.insert_char(c);
+                        if app.tab_mut().input.text.starts_with('/') {
+                            app.tab_mut().input.compute_suggestions(command_list);
                         }
                     }
-                    (KeyCode::Backspace, _) => app.input.backspace(),
-                    (KeyCode::Delete, _) => app.input.delete(),
-                    (KeyCode::Left, _) => app.input.move_left(),
-                    (KeyCode::Right, _) => app.input.move_right(),
-                    (KeyCode::Home, _) => app.input.home(),
-                    (KeyCode::End, _) => app.input.end(),
-                    (KeyCode::Up, _) => app.input.history_up(),
-                    (KeyCode::Down, _) => app.input.history_down(),
+                    (KeyCode::Backspace, _) => app.tab_mut().input.backspace(),
+                    (KeyCode::Delete, _) => app.tab_mut().input.delete(),
+                    (KeyCode::Left, _) => app.tab_mut().input.move_left(),
+                    (KeyCode::Right, _) => app.tab_mut().input.move_right(),
+                    (KeyCode::Home, _) => app.tab_mut().input.home(),
+                    (KeyCode::End, _) => app.tab_mut().input.end(),
+                    (KeyCode::Up, _) => app.tab_mut().input.history_up(),
+                    (KeyCode::Down, _) => app.tab_mut().input.history_down(),
 
                     // Scroll
-                    (KeyCode::PageUp, _) => { app.auto_scroll = false; app.scroll_offset = app.scroll_offset.saturating_add(10); }
+                    (KeyCode::PageUp, _) => { app.tab_mut().auto_scroll = false; app.tab_mut().scroll_offset = app.tab_mut().scroll_offset.saturating_add(10); }
                     (KeyCode::PageDown, _) => {
-                        if app.scroll_offset > 10 { app.scroll_offset -= 10; } else { app.scroll_offset = 0; app.auto_scroll = true; }
+                        let so = app.tab_mut().scroll_offset;
+                        if so > 10 { app.tab_mut().scroll_offset -= 10; } else { app.tab_mut().scroll_offset = 0; app.tab_mut().auto_scroll = true; }
                     }
+
+                    // Tab management
+                    (KeyCode::Char('t'), KeyModifiers::CONTROL) => { app.new_tab(); }
+                    (KeyCode::Char('w'), KeyModifiers::CONTROL) => { app.close_tab(); }
+                    (KeyCode::Right, KeyModifiers::CONTROL) => { app.next_tab(); }
+                    (KeyCode::Left, KeyModifiers::CONTROL) => { app.prev_tab(); }
 
                     _ => {}
                 }

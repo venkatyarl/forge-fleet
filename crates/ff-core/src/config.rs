@@ -220,7 +220,7 @@ fn default_heartbeat_timeout() -> u64 {
     45
 }
 fn default_api_port() -> u16 {
-    51800
+    51000
 }
 
 // ── NodeConfig (maps to [nodes.<name>]) ──────────────────────────────────────

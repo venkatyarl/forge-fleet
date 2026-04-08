@@ -905,7 +905,7 @@ fn start_gateway_subsystem(
     mc_db_path: Option<String>,
 ) -> JoinHandle<()> {
     let gateway_config = GatewayConfig {
-        bind_addr: format!("0.0.0.0:{}", config.fleet.api_port.saturating_add(1)),
+        bind_addr: format!("0.0.0.0:{}", config.fleet.api_port.saturating_add(2)), // Web UI on api_port + 2 (51002)
         fleet_config: Some(config.clone()),
         config_path: Some(config_path),
         backend_registry: Some(backend_registry),

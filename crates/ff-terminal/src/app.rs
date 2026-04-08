@@ -24,38 +24,57 @@ pub const PORT_METRICS: u16 = 51004;
 // ─── Main app state ────────────────────────────────────────────────────────
 
 pub struct App {
-    // Session
+    // Config
     pub config: AgentSessionConfig,
-    pub session: Option<AgentSession>,
     pub commands: CommandRegistry,
-    pub session_id: String,
 
-    // Display
+    // Tabs — multiple sessions in the same TUI
+    pub tabs: Vec<SessionTab>,
+    pub active_tab: usize,
+
+    // Global state
+    pub frame: u64,
+    pub should_quit: bool,
+    pub fleet_nodes: Vec<FleetNode>,
+    pub current_project: Option<ProjectInfo>,
+    pub working_dir: PathBuf,
+}
+
+/// A single session tab — each has its own conversation, input, and agent.
+pub struct SessionTab {
+    pub name: String,
+    pub session: Option<AgentSession>,
+    pub session_id: String,
     pub messages: Vec<DisplayMessage>,
     pub input: InputState,
     pub is_running: bool,
     pub scroll_offset: u16,
     pub auto_scroll: bool,
     pub status: String,
-    pub frame: u64,
-    pub should_quit: bool,
-
-    // Fleet
-    pub fleet_nodes: Vec<FleetNode>,
-
-    // Current model/token tracking
     pub current_model: String,
     pub tokens_used: usize,
     pub tokens_total: usize,
     pub turn: u32,
+}
 
-    // Project
-    pub current_project: Option<ProjectInfo>,
-    pub working_dir: PathBuf,
-
-    // Sessions
-    pub saved_sessions: Vec<SessionInfo>,
-    pub active_session_index: usize,
+impl SessionTab {
+    pub fn new(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            session: None,
+            session_id: String::new(),
+            messages: Vec::new(),
+            input: InputState::new(),
+            is_running: false,
+            scroll_offset: 0,
+            auto_scroll: true,
+            status: "Ready".into(),
+            current_model: "auto".into(),
+            tokens_used: 0,
+            tokens_total: 32_768,
+            turn: 0,
+        }
+    }
 }
 
 /// A fleet node with its ForgeFleet daemon and model status.
@@ -100,93 +119,111 @@ pub struct SessionInfo {
 impl App {
     pub fn new(config: AgentSessionConfig) -> Self {
         let working_dir = config.working_dir.clone();
-
-        // Detect project from working directory
         let current_project = detect_project(&working_dir);
+
+        let first_tab = SessionTab::new("Session 1");
 
         Self {
             config,
-            session: None,
             commands: CommandRegistry::new(),
-            session_id: String::new(),
-
-            messages: Vec::new(),
-            input: InputState::new(),
-            is_running: false,
-            scroll_offset: 0,
-            auto_scroll: true,
-            status: "Ready".into(),
+            tabs: vec![first_tab],
+            active_tab: 0,
             frame: 0,
             should_quit: false,
-
             fleet_nodes: default_fleet_nodes(),
-
-            current_model: "auto".into(),
-            tokens_used: 0,
-            tokens_total: 32_768,
-            turn: 0,
-
             current_project,
             working_dir,
-
-            saved_sessions: Vec::new(),
-            active_session_index: 0,
         }
     }
 
-    /// Process an agent event and update display.
+    /// Get the active tab.
+    pub fn tab(&self) -> &SessionTab {
+        &self.tabs[self.active_tab]
+    }
+
+    /// Get the active tab mutably.
+    pub fn tab_mut(&mut self) -> &mut SessionTab {
+        &mut self.tabs[self.active_tab]
+    }
+
+    /// Create a new tab and switch to it.
+    pub fn new_tab(&mut self) {
+        let name = format!("Session {}", self.tabs.len() + 1);
+        self.tabs.push(SessionTab::new(&name));
+        self.active_tab = self.tabs.len() - 1;
+    }
+
+    /// Switch to next tab.
+    pub fn next_tab(&mut self) {
+        if self.tabs.len() > 1 {
+            self.active_tab = (self.active_tab + 1) % self.tabs.len();
+        }
+    }
+
+    /// Switch to previous tab.
+    pub fn prev_tab(&mut self) {
+        if self.tabs.len() > 1 {
+            self.active_tab = if self.active_tab == 0 { self.tabs.len() - 1 } else { self.active_tab - 1 };
+        }
+    }
+
+    /// Close current tab (unless it's the last one).
+    pub fn close_tab(&mut self) {
+        if self.tabs.len() > 1 {
+            self.tabs.remove(self.active_tab);
+            if self.active_tab >= self.tabs.len() {
+                self.active_tab = self.tabs.len() - 1;
+            }
+        }
+    }
+
+    /// Process an agent event and update active tab.
     pub fn handle_event(&mut self, event: AgentEvent) {
+        let tab = &mut self.tabs[self.active_tab];
+
         if let Some(display) = crate::messages::event_to_display(&event) {
-            self.messages.push(display);
+            tab.messages.push(display);
         }
 
         match &event {
-            AgentEvent::TurnComplete { turn, .. } => {
-                self.turn = *turn;
-            }
+            AgentEvent::TurnComplete { turn, .. } => { tab.turn = *turn; }
             AgentEvent::TokenWarning { usage_pct, estimated_tokens, .. } => {
-                self.tokens_used = *estimated_tokens;
-                self.status = format!("Context: {usage_pct:.0}%");
+                tab.tokens_used = *estimated_tokens;
+                tab.status = format!("Context: {usage_pct:.0}%");
             }
-            AgentEvent::Done { .. } => {
-                self.is_running = false;
-                self.status = "Ready".into();
-            }
+            AgentEvent::Done { .. } => { tab.is_running = false; tab.status = "Ready".into(); }
             AgentEvent::Error { message, .. } => {
-                self.is_running = false;
-                self.status = format!("Error: {}", &message[..message.len().min(50)]);
+                tab.is_running = false;
+                tab.status = format!("Error: {}", &message[..message.len().min(50)]);
             }
-            AgentEvent::Status { message, .. } => {
-                self.status = message.clone();
-            }
+            AgentEvent::Status { message, .. } => { tab.status = message.clone(); }
             _ => {}
         }
     }
 
-    /// Submit user input.
+    /// Submit user input from active tab.
     pub fn submit_input(&mut self) {
-        let text = self.input.submit();
+        let tab = &mut self.tabs[self.active_tab];
+        let text = tab.input.submit();
         if text.is_empty() { return; }
-        self.messages.push(render_user_message(&text));
-        self.is_running = true;
-        self.status = "Thinking...".into();
+        tab.messages.push(render_user_message(&text));
+        tab.is_running = true;
+        tab.status = "Thinking...".into();
     }
 
-    /// Get the spinner character for the current frame.
+    /// Get spinner for animation.
     pub fn spinner(&self) -> &'static str {
         const FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
         FRAMES[(self.frame as usize / 2) % FRAMES.len()]
     }
 
-    /// Total lines in the message pane.
-    pub fn total_message_lines(&self) -> usize {
-        self.messages.iter().map(|m| m.lines.len()).sum()
-    }
-
-    /// Get web UI URL for this machine.
+    /// Get web UI URL.
     pub fn web_url(&self) -> String {
         format!("http://localhost:{}", PORT_WEB)
     }
+
+    /// Tab count.
+    pub fn tab_count(&self) -> usize { self.tabs.len() }
 }
 
 /// Detect project from working directory (check for FORGEFLEET.md, Cargo.toml, package.json).
