@@ -37,6 +37,7 @@ pub mod multimodal;
 pub mod model_discovery;
 pub mod network_check;
 pub mod notebook_edit;
+pub mod orchestrate;
 pub mod plan_tools;
 pub mod project_mgmt;
 pub mod research;
@@ -44,6 +45,8 @@ pub mod research_ext;
 pub mod uiux;
 pub mod skill_builder;
 pub mod tool_builder;
+pub mod tool_search;
+pub mod training_tool;
 pub mod send_message;
 pub mod sleep_tool;
 pub mod task_tools;
@@ -171,6 +174,9 @@ pub fn core_tools() -> Vec<Box<dyn AgentTool>> {
         Box::new(web_fetch::WebFetchTool),
         Box::new(web_search::WebSearchTool),
         Box::new(plan_tools::AskUserQuestionTool),
+        Box::new(orchestrate::OrchestrateTool),
+        Box::new(tool_search::ToolSearchTool),
+        Box::new(training_tool::TrainingTool),
     ]
 }
 
@@ -204,6 +210,7 @@ pub fn all_tools() -> Vec<Box<dyn AgentTool>> {
         Box::new(web_search::WebSearchTool),
         // Planning tools
         Box::new(plan_tools::AskUserQuestionTool),
+        Box::new(orchestrate::OrchestrateTool),
         Box::new(plan_tools::EnterPlanModeTool),
         Box::new(plan_tools::ExitPlanModeTool),
         // Git & utility tools

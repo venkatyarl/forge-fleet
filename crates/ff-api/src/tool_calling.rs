@@ -108,6 +108,18 @@ impl ToolChatMessage {
         }
     }
 
+    /// Create a user message with text + image (OpenAI vision format).
+    pub fn user_with_image(text: impl Into<String>, image_base64: &str, mime_type: &str) -> Self {
+        Self {
+            role: "user".into(),
+            content: Some(serde_json::json!([
+                { "type": "text", "text": text.into() },
+                { "type": "image_url", "image_url": { "url": format!("data:{};base64,{}", mime_type, image_base64) } }
+            ])),
+            ..Default::default()
+        }
+    }
+
     /// Create a tool-result message.
     pub fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
@@ -150,6 +162,13 @@ pub struct ToolChatCompletionRequest {
     pub max_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
+    /// Enable prompt caching on llama-server (llama.cpp).
+    ///
+    /// When set to `true`, the server reuses KV-cache entries for the static
+    /// prefix of the conversation (system prompt + tool definitions) across
+    /// requests, dramatically reducing time-to-first-token on subsequent turns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_prompt: Option<bool>,
 }
 
 /// A response choice that may include tool calls.
@@ -252,6 +271,7 @@ mod tests {
             temperature: Some(0.3),
             max_tokens: Some(4096),
             stream: Some(false),
+            cache_prompt: Some(true),
         };
 
         let json = serde_json::to_value(&req).unwrap();

@@ -45,7 +45,7 @@ fn render_tab_bar(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         spans.push(Span::styled(format!(" {}{} ", tab.name, indicator), style));
         spans.push(Span::styled(" ", Style::default()));
     }
-    spans.push(Span::styled(" Ctrl+T: new │ Ctrl+←/→: switch │ Ctrl+W: close ", Style::default().fg(Color::Rgb(71, 85, 105))));
+    spans.push(Span::styled(" Ctrl+T: new │ Ctrl+N/P: switch │ Ctrl+W: close ", Style::default().fg(Color::Rgb(71, 85, 105))));
 
     frame.render_widget(
         Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::Rgb(30, 41, 59))),
@@ -58,19 +58,20 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let spinner = if tab.is_running { app.spinner() } else { "●" };
     let spinner_color = if tab.is_running { Color::Rgb(251, 191, 36) } else { Color::Rgb(74, 222, 128) };
 
-    let project_name = app.current_project.as_ref()
-        .map(|p| format!(" │ {} ", p.name))
-        .unwrap_or_default();
+    // Show project name + working directory path
+    let working_dir = app.config.working_dir.to_string_lossy();
+    let project_display = app.current_project.as_ref()
+        .map(|p| format!(" │ {} ({}) ", p.name, working_dir))
+        .unwrap_or_else(|| format!(" │ {} ", working_dir));
 
     let header = Line::from(vec![
         Span::styled(format!(" {spinner} "), Style::default().fg(spinner_color)),
         Span::styled("ForgeFleet", theme.header),
-        Span::styled(&project_name, Style::default().fg(Color::Rgb(139, 92, 246))),
+        Span::styled(&project_display, Style::default().fg(Color::Rgb(139, 92, 246))),
         Span::styled(
-            format!("│ Model: {} │ Turn: {}/{} │ {} │ ",
-                &tab.current_model[..tab.current_model.len().min(25)],
+            format!("│ {} │ Turn: {}/{} │ ",
+                &tab.current_model[..tab.current_model.len().min(30)],
                 tab.turn, app.config.max_turns,
-                &app.config.llm_base_url,
             ),
             theme.status_text,
         ),
@@ -113,6 +114,25 @@ fn render_left_sidebar(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) 
         lines.push(Line::from(vec![
             Span::styled(" 📁 ", Style::default()),
             Span::styled(&project.name, Style::default().fg(Color::Rgb(139, 92, 246)).add_modifier(Modifier::BOLD)),
+        ]));
+        lines.push(Line::from(""));
+    }
+
+    // Brain status — Hive Mind / Fleet Brain / Project Memory
+    if let Some(status) = &app.brain_status {
+        lines.push(Line::from(vec![
+            Span::styled(" Memory ", Style::default().fg(Color::Rgb(167, 243, 208)).add_modifier(Modifier::BOLD)),
+        ]));
+        let p_color = if status.project_entries > 0 { Color::Rgb(74, 222, 128) } else { Color::Rgb(71, 85, 105) };
+        let b_color = if status.brain_entries > 0 { Color::Rgb(74, 222, 128) } else { Color::Rgb(71, 85, 105) };
+        let h_color = if status.hive_entries > 0 { Color::Rgb(74, 222, 128) } else { Color::Rgb(71, 85, 105) };
+        lines.push(Line::from(vec![
+            Span::styled("  P:", Style::default().fg(Color::Rgb(100, 116, 139))),
+            Span::styled(format!("{}", status.project_entries), Style::default().fg(p_color)),
+            Span::styled(" B:", Style::default().fg(Color::Rgb(100, 116, 139))),
+            Span::styled(format!("{}", status.brain_entries), Style::default().fg(b_color)),
+            Span::styled(" H:", Style::default().fg(Color::Rgb(100, 116, 139))),
+            Span::styled(format!("{}", status.hive_entries), Style::default().fg(h_color)),
         ]));
         lines.push(Line::from(""));
     }
@@ -224,19 +244,28 @@ fn render_messages(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         .flat_map(|m| m.lines.clone())
         .collect();
 
-    let visible_height = inner.height as usize;
     let total_lines = all_lines.len();
+    let visible_height = inner.height as usize;
 
-    // Auto-scroll: show last N lines
+    if visible_height == 0 {
+        return;
+    }
+
+    // Manual slicing with strict bounds — never exceed visible_height
     let start = if app.tab().auto_scroll {
         total_lines.saturating_sub(visible_height)
     } else {
-        total_lines.saturating_sub(visible_height + app.tab().scroll_offset as usize)
+        total_lines
+            .saturating_sub(visible_height)
+            .saturating_sub(app.tab().scroll_offset as usize)
     };
 
-    let visible: Vec<Line> = all_lines.into_iter().skip(start).take(visible_height).collect();
+    let visible: Vec<Line> = all_lines.into_iter()
+        .skip(start)
+        .take(visible_height) // strict cap — never pass more lines than the area can hold
+        .collect();
 
-    let paragraph = Paragraph::new(visible).wrap(Wrap { trim: false });
+    let paragraph = Paragraph::new(visible);
     frame.render_widget(paragraph, inner);
 }
 

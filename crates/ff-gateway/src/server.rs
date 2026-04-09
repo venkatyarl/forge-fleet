@@ -337,6 +337,8 @@ pub fn build_router(state: Arc<GatewayState>, mc_db_path: Option<&str>) -> Route
         .route("/api/config", get(get_config).post(update_config))
         .route("/api/config/reload-status", get(config_reload_status))
         .route("/api/settings/runtime", get(settings_runtime))
+        .route("/api/brain/status", get(brain_status))
+        .route("/api/brain/search", get(brain_search))
         .route("/api/audit/recent", get(audit_recent))
         .route("/api/audit/events", get(audit_recent))
         .route("/api/proxy/stats", get(proxy_stats))
@@ -4720,4 +4722,40 @@ async fn delete_chat(Path(id): Path<String>) -> impl IntoResponse {
     let mut manager = ff_agent::chat_manager::ChatManager::load().await;
     manager.delete(&id).await;
     Json(json!({ "deleted": true }))
+}
+
+/// GET /api/brain/search?q=query — search across all three brains.
+async fn brain_search(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+    let query = params.get("q").cloned().unwrap_or_default();
+    if query.is_empty() {
+        return Json(json!({ "results": [], "error": "missing ?q= parameter" }));
+    }
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let results = ff_agent::brain::search_all(&query, &cwd).await;
+    Json(json!({ "results": results, "query": query }))
+}
+
+/// GET /api/brain/status — three-brain memory status.
+async fn brain_status() -> impl IntoResponse {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let ctx = ff_agent::brain::BrainLoader::load_for_dir(&cwd).await;
+    let status = ff_agent::brain::BrainLoadedStatus::from(&ctx);
+
+    Json(json!({
+        "project": {
+            "name": ctx.project_name,
+            "root": ctx.project_root.map(|p| p.to_string_lossy().to_string()),
+            "entries": status.project_entries,
+            "has_forgefleet_md": ctx.project_forgefleet_md.is_some(),
+            "has_context_md": ctx.project_context_md.is_some(),
+        },
+        "brain": {
+            "entries": status.brain_entries,
+            "has_brain_md": ctx.brain_md.is_some(),
+        },
+        "hive": {
+            "entries": status.hive_entries,
+            "has_hive_md": ctx.hive_md.is_some(),
+        },
+    }))
 }

@@ -14,7 +14,7 @@ use std::{env, fs};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyModifiers, MouseEventKind, EnableMouseCapture, DisableMouseCapture};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::execute;
 use ratatui::backend::CrosstermBackend;
@@ -43,6 +43,9 @@ struct Cli {
     model: Option<String>,
     #[arg(long, global = true)]
     cwd: Option<PathBuf>,
+    /// Attach an image to the prompt (for multimodal models)
+    #[arg(long, short = 'i', global = true)]
+    image: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<Command>,
     #[arg(trailing_var_arg = true)]
@@ -61,6 +64,8 @@ enum Command {
     Config { #[command(subcommand)] command: ConfigCommand },
     Version,
     Run { prompt: String, #[arg(long, default_value = "text")] output: String, #[arg(long, default_value_t = 30)] max_turns: u32 },
+    /// Run with supervisor — auto-detect failures, fix, and retry
+    Supervise { prompt: String, #[arg(long, default_value_t = 3)] max_attempts: u32 },
 }
 
 #[derive(Debug, Subcommand)]
@@ -72,12 +77,45 @@ async fn main() -> Result<()> {
     let config_path = resolve_config_path(cli.config)?;
     let llm = cli.llm.or_else(|| env::var("FORGEFLEET_LLM_URL").ok())
         .unwrap_or_else(|| detect_local_llm().unwrap_or_else(|| "http://localhost:51000".into()));
-    let model = cli.model.or_else(|| env::var("FORGEFLEET_MODEL").ok()).unwrap_or_else(|| "auto".into());
+    let mut model = cli.model.or_else(|| env::var("FORGEFLEET_MODEL").ok()).unwrap_or_else(|| "auto".into());
+
+    // If model is "auto", query the LLM server for its actual model name
+    if model == "auto" {
+        let detect_url = format!("{}/v1/models", llm.trim_end_matches('/'));
+        match reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap_or_default()
+            .get(&detect_url)
+            .send().await
+        {
+            Ok(resp) => {
+                if let Ok(body) = resp.json::<serde_json::Value>().await {
+                    if let Some(id) = body.get("data")
+                        .and_then(|d| d.as_array())
+                        .and_then(|arr| arr.first())
+                        .and_then(|m| m.get("id"))
+                        .and_then(|id| id.as_str())
+                    {
+                        model = id.to_string();
+                    }
+                }
+            }
+            Err(_) => {
+                // Fallback: infer from port
+                if llm.contains("51005") {
+                    model = "ForgeFleet-LoRA".into();
+                }
+            }
+        }
+    }
     let working_dir = cli.cwd.unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from("/")));
 
     let agent_config = AgentSessionConfig {
         model, llm_base_url: llm, working_dir: working_dir.clone(),
-        system_prompt: None, max_turns: 30, ..Default::default()
+        system_prompt: None, max_turns: 30,
+        image_path: cli.image,
+        ..Default::default()
     };
 
     match cli.command {
@@ -95,6 +133,31 @@ async fn main() -> Result<()> {
             let mut cfg = agent_config; cfg.max_turns = max_turns;
             run_headless(&prompt, cfg, &output).await
         }
+        Some(Command::Supervise { prompt, max_attempts }) => {
+            let sup_config = ff_agent::supervisor::SupervisorConfig {
+                max_attempts,
+                ..Default::default()
+            };
+            println!("{CYAN}▶ Supervisor mode: up to {max_attempts} attempts{RESET}");
+            println!("{CYAN}  Task: {}{RESET}", &prompt[..prompt.len().min(80)]);
+            println!();
+
+            let result = ff_agent::supervisor::supervise(&prompt, agent_config, sup_config).await;
+
+            if result.success {
+                println!("{GREEN}✓ Task completed on attempt {}/{}{RESET}", result.attempts, max_attempts);
+            } else {
+                println!("{RED}✗ Task failed after {} attempts{RESET}", result.attempts);
+            }
+
+            for d in &result.diagnoses {
+                println!("  Attempt {}: {} → {}", d.attempt, d.failure_type, d.fix_applied);
+            }
+
+            println!();
+            println!("{}", &result.final_output[..result.final_output.len().min(500)]);
+            Ok(())
+        }
         None => {
             let prompt_text = cli.prompt.join(" ");
             if !prompt_text.is_empty() { run_headless(&prompt_text, agent_config, "text").await }
@@ -106,23 +169,53 @@ async fn main() -> Result<()> {
 // ─── TUI Mode ──────────────────────────────────────────────────────────────
 
 async fn run_tui(config: AgentSessionConfig) -> Result<()> {
+    // Set up panic hook to restore terminal on crash
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = crossterm::terminal::disable_raw_mode();
+        let _ = crossterm::execute!(
+            io::stdout(),
+            LeaveAlternateScreen,
+            DisableMouseCapture
+        );
+        original_hook(info);
+    }));
+
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = App::new(config.clone());
     let commands = CommandRegistry::new();
-    let command_list: Vec<(&str, &str)> = commands.list();
+    let mut command_list: Vec<(&str, &str)> = commands.list();
+    // Add built-in TUI commands
+    command_list.push(("/new", "Start a new session tab"));
+    command_list.push(("/memory", "Search across all memory layers: /memory <query>"));
+    command_list.push(("/search", "Search memory: /search <query>"));
+    command_list.push(("/help", "Show available commands"));
+    command_list.sort();
 
     // Async fleet health check on startup
     check_fleet_health(&mut app).await;
 
+    // Pre-load three-brain memory context
+    let brain_ctx = ff_agent::brain::BrainLoader::load_for_dir(&config.working_dir).await;
+    app.brain_status = Some(ff_agent::brain::BrainLoadedStatus::from(&brain_ctx));
+
+    // Initialize Hive Mind
+    let hive = ff_agent::hive_sync::HiveSync::new();
+    hive.ensure_initialized().await;
+    let sync_result = hive.pull().await;
+    if let Some(status) = &mut app.brain_status {
+        status.hive_synced_at = sync_result.last_sync_at;
+    }
+
     let result = run_event_loop(&mut terminal, &mut app, config, &commands, &command_list).await;
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
     terminal.show_cursor()?;
     result
 }
@@ -176,6 +269,23 @@ async fn run_event_loop(
                 event_rx = None;
                 app.tab_mut().is_running = false;
                 app.tab_mut().status = "Ready".into();
+
+                // Auto-send queued message if one was waiting
+                if let Some(queued) = app.tab_mut().queued_message.take() {
+                    let prompt = detect_dropped_content(&queued);
+                    // Show user message
+                    app.tab_mut().input.text = queued;
+                    app.submit_input();
+                    // Start agent with queued message
+                    let mut session = app.tab_mut().session.take().unwrap_or_else(|| AgentSession::new(config.clone()));
+                    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+                    let handle = tokio::spawn(async move {
+                        let outcome = session.run(&prompt, Some(tx)).await;
+                        (session, outcome)
+                    });
+                    agent_handle = Some(handle);
+                    event_rx = Some(rx);
+                }
             }
         }
 
@@ -185,7 +295,30 @@ async fn run_event_loop(
 
         // Poll events
         if event::poll(Duration::from_millis(50))? {
-            if let Event::Key(key) = event::read()? {
+            let ev = event::read()?;
+
+            // Handle mouse scroll for chat scrolling
+            if let Event::Mouse(mouse) = &ev {
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => {
+                        let tab = app.tab_mut();
+                        tab.auto_scroll = false;
+                        tab.scroll_offset = tab.scroll_offset.saturating_add(3);
+                    }
+                    MouseEventKind::ScrollDown => {
+                        let tab = app.tab_mut();
+                        if tab.scroll_offset > 0 {
+                            tab.scroll_offset = tab.scroll_offset.saturating_sub(3);
+                        }
+                        if tab.scroll_offset == 0 {
+                            tab.auto_scroll = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            if let Event::Key(key) = ev {
                 match (key.code, key.modifiers) {
                     // Esc: cancel running agent (don't quit)
                     (KeyCode::Esc, _) if app.tab().is_running => {
@@ -229,14 +362,49 @@ async fn run_event_loop(
                             continue;
                         }
 
-                        // If running, show message that agent is busy — don't cancel
+                        // If running, queue the message for after the agent finishes
                         if app.tab().is_running {
+                            app.tab_mut().queued_message = Some(trimmed.clone());
                             app.tab_mut().messages.push(ff_terminal::messages::render_status(
-                                "Agent is still processing. Wait for it to finish, or press Esc to cancel."
+                                &format!("Queued: \"{}\" — will send when agent finishes.", if trimmed.len() > 60 { format!("{}...", &trimmed[..60]) } else { trimmed })
                             ));
-                            // Put the text back in input so user doesn't lose it
-                            app.tab_mut().input.text = trimmed;
-                            app.tab_mut().input.cursor = app.tab_mut().input.text.len();
+                            app.tab_mut().input.text.clear();
+                            app.tab_mut().input.cursor = 0;
+                            continue;
+                        }
+
+                        // Built-in navigation commands
+                        // Memory search command
+                        if trimmed.starts_with("/memory ") || trimmed.starts_with("/search ") {
+                            let query = trimmed.split_once(' ').map(|(_, q)| q).unwrap_or("");
+                            if !query.is_empty() {
+                                let results = ff_agent::brain::search_all(query, &config.working_dir).await;
+                                if results.is_empty() {
+                                    app.tab_mut().messages.push(ff_terminal::messages::render_status(
+                                        &format!("No memory entries match \"{query}\"")
+                                    ));
+                                } else {
+                                    let mut output = format!("Found {} results for \"{}\":\n", results.len(), query);
+                                    for r in results.iter().take(10) {
+                                        output.push_str(&format!("\n[{}] ({}) {}", r.layer, r.category, r.content));
+                                    }
+                                    app.tab_mut().messages.push(ff_terminal::messages::render_assistant_message(&output));
+                                }
+                            }
+                            app.tab_mut().input.text.clear();
+                            app.tab_mut().input.cursor = 0;
+                            continue;
+                        }
+
+                        if trimmed == "/new" || trimmed == "/new-session" {
+                            let n = app.tabs.len() + 1;
+                            app.tabs.push(ff_terminal::app::SessionTab::new(&format!("Session {n}")));
+                            app.active_tab = app.tabs.len() - 1;
+                            app.tab_mut().messages.push(ff_terminal::messages::render_status(
+                                "New session created. Use Ctrl+N/P to switch tabs, Ctrl+W to close."
+                            ));
+                            app.tab_mut().input.text.clear();
+                            app.tab_mut().input.cursor = 0;
                             continue;
                         }
 
@@ -305,11 +473,12 @@ async fn run_event_loop(
                             app.tab_mut().input.compute_suggestions(command_list);
                         }
                     }
-                    // Tab management (MUST be before arrow key handlers)
+                    // Tab management
                     (KeyCode::Char('t'), KeyModifiers::CONTROL) => { app.new_tab(); }
                     (KeyCode::Char('w'), KeyModifiers::CONTROL) => { app.close_tab(); }
-                    (KeyCode::Right, KeyModifiers::CONTROL) => { app.next_tab(); }
-                    (KeyCode::Left, KeyModifiers::CONTROL) => { app.prev_tab(); }
+                    // Ctrl+N/P for tab switching (works on macOS, emacs-style)
+                    (KeyCode::Char('n'), KeyModifiers::CONTROL) => { app.next_tab(); }
+                    (KeyCode::Char('p'), KeyModifiers::CONTROL) => { app.prev_tab(); }
 
                     // Text editing
                     (KeyCode::Backspace, _) => app.tab_mut().input.backspace(),
@@ -450,7 +619,8 @@ fn detect_dropped_content(input: &str) -> String {
 }
 
 fn detect_local_llm() -> Option<String> {
-    let ports = [51000, 51001, 11434, 8080];
+    // Check llama-server first (stable), LoRA model second, then Ollama
+    let ports = [51000, 51001, 51005, 11434, 8080];
     for port in ports {
         if std::net::TcpStream::connect_timeout(
             &format!("127.0.0.1:{port}").parse().ok()?,

@@ -1,6 +1,10 @@
 pub mod agent_loop;
 pub mod agent_roles;
 pub mod bash_security;
+pub mod brain;
+pub mod hive_sync;
+pub mod learning;
+pub mod supervisor;
 pub mod chat_manager;
 pub mod commands;
 pub mod commands_extended;
@@ -12,10 +16,12 @@ pub mod file_history;
 pub mod fleet_inference;
 pub mod hooks;
 pub mod mcp_client;
+pub mod mcp_tools;
 pub mod memory;
 pub mod multi_agent;
 pub mod notifications;
 pub mod openai_bridge;
+pub mod orchestrator_agent;
 pub mod permissions;
 pub mod plugins;
 pub mod rpc_inference;
@@ -26,6 +32,7 @@ pub mod system_prompt;
 pub mod template_registry;
 pub mod thinking;
 pub mod tools;
+pub mod training;
 
 use std::time::{Duration, Instant};
 

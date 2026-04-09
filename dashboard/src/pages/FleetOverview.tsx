@@ -29,7 +29,12 @@ export function FleetOverview() {
         getJson<FleetStatusResponse>('/api/fleet/status').catch(() => getJson<FleetStatusResponse>('/api/status')),
         getJson<HealthResponse>('/health').catch(() => ({ status: 'unknown' })),
       ])
-      setNodes(extractNodes(fleet))
+      // Filter out phantom/test nodes
+      const allNodes = extractNodes(fleet)
+      setNodes(allNodes.filter(n => {
+        const name = (n.name ?? '').toLowerCase()
+        return !name.includes('postgres-verify') && !name.includes('verify.local')
+      }))
       const s = extractSummary(fleet)
       setSummary({
         total_nodes: s.total_nodes ?? 0, connected_nodes: s.connected_nodes ?? 0,
@@ -88,7 +93,7 @@ export function FleetOverview() {
         </div>
       ) : (
         <div className="grid gap-3 md:grid-cols-4">
-          <SignalCard label="Nodes Online" value={`${summary.connected_nodes}/${summary.total_nodes}`} color="emerald" icon="🖥️" />
+          <SignalCard label="Members Online" value={`${summary.connected_nodes}/${summary.total_nodes}`} color="emerald" icon="🖥️" />
           <SignalCard label="Models Loaded" value={String(summary.model_count)} color="sky" icon="🤖" />
           <SignalCard label="Unhealthy" value={String(summary.unhealthy_nodes)} color={summary.unhealthy_nodes > 0 ? 'rose' : 'zinc'} icon="⚠️" />
           <SignalCard label="Leader" value={leaderName} color="violet" icon="👑" />
@@ -117,10 +122,10 @@ export function FleetOverview() {
       ) : nodes.length === 0 ? (
         <EmptyState
           icon="🖥️"
-          title="No nodes connected"
-          description="Connect your first fleet node to start monitoring. Each node runs ForgeFleet daemon with LLM inference."
-          primaryAction={{ label: 'Add Node', to: '/onboarding' }}
-          secondaryAction={{ label: 'View Setup Guide', to: '/onboarding' }}
+          title="No fleet members connected"
+          description="Add your first fleet member to start monitoring. Each member runs ForgeFleet daemon with LLM inference."
+          primaryAction={{ label: 'Add Fleet Member', to: '/onboarding' }}
+          secondaryAction={{ label: 'Setup Guide', to: '/onboarding' }}
         />
       ) : (
         <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">

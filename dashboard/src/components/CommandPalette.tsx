@@ -11,30 +11,32 @@ type CommandItem = {
 }
 
 const COMMANDS: CommandItem[] = [
-  // Navigation
-  { id: 'home', label: 'Home', category: 'Navigate', path: '/' },
-  { id: 'fleet', label: 'Fleet Overview', category: 'Navigate', path: '/' },
-  { id: 'topology', label: 'Topology', category: 'Navigate', path: '/topology' },
-  { id: 'models', label: 'Model Inventory', category: 'Navigate', path: '/models' },
-  { id: 'model-hub', label: 'Model Hub', category: 'Navigate', path: '/model-hub' },
-  { id: 'tools', label: 'Tool Inventory', category: 'Navigate', path: '/tools' },
-  { id: 'metrics', label: 'Metrics', category: 'Navigate', path: '/metrics' },
-  { id: 'mission', label: 'Mission Control', category: 'Navigate', path: '/mission-control' },
-  { id: 'tasks', label: 'My Tasks', category: 'Navigate', path: '/my-tasks' },
-  { id: 'projects', label: 'Projects', category: 'Navigate', path: '/projects' },
-  { id: 'planning', label: 'Planning Hub', category: 'Navigate', path: '/planning' },
-  { id: 'chat', label: 'Chat Studio', category: 'Navigate', path: '/chat' },
-  { id: 'chats', label: 'Chats', category: 'Navigate', path: '/chats' },
-  { id: 'workflow', label: 'Workflow Workbench', category: 'Navigate', path: '/workflow' },
-  { id: 'settings', label: 'Settings', category: 'Navigate', path: '/settings' },
-  { id: 'config', label: 'Config Editor', category: 'Navigate', path: '/config' },
-  { id: 'proxy', label: 'LLM Proxy', category: 'Navigate', path: '/llm-proxy' },
-  { id: 'audit', label: 'Audit Log', category: 'Navigate', path: '/audit' },
-  { id: 'updates', label: 'Updates', category: 'Navigate', path: '/updates' },
-  { id: 'onboarding', label: 'Operator Onboarding', category: 'Navigate', path: '/onboarding' },
+  // Mission Control
+  { id: 'home', label: 'Mission Control', category: 'Navigate', path: '/', shortcut: 'G H' },
+  // Chats
+  { id: 'chat', label: 'New Chat', category: 'Chats', path: '/chat', shortcut: 'G C' },
+  { id: 'chats', label: 'Chat History', category: 'Chats', path: '/chats' },
+  // Project Management
+  { id: 'tasks', label: 'My Tasks', category: 'Projects', path: '/my-tasks' },
+  { id: 'projects', label: 'Projects', category: 'Projects', path: '/projects', shortcut: 'G P' },
+  { id: 'planning', label: 'Planning Hub', category: 'Projects', path: '/planning' },
+  { id: 'workflow', label: 'Workflows', category: 'Projects', path: '/workflow' },
+  // Fleet (via Settings)
+  { id: 'fleet', label: 'Fleet Overview', category: 'Fleet', path: '/fleet', shortcut: 'G F' },
+  { id: 'fleet-members', label: 'Fleet Members', category: 'Settings', path: '/settings#fleet' },
+  { id: 'topology', label: 'Topology', category: 'Fleet', path: '/topology', shortcut: 'G T' },
+  { id: 'model-hub', label: 'Available Models', category: 'Fleet', path: '/model-hub' },
+  { id: 'tools', label: 'Tools', category: 'Fleet', path: '/tools', shortcut: 'G K' },
+  { id: 'metrics', label: 'Metrics', category: 'Fleet', path: '/metrics' },
+  { id: 'onboarding', label: 'Add New Fleet Member', category: 'Fleet', path: '/onboarding' },
+  // Settings
+  { id: 'settings', label: 'Settings', category: 'Admin', path: '/settings', shortcut: 'G S' },
+  { id: 'proxy', label: 'LLM Proxy', category: 'Admin', path: '/llm-proxy' },
+  { id: 'audit', label: 'Audit Log', category: 'Admin', path: '/audit' },
+  { id: 'updates', label: 'Updates', category: 'Admin', path: '/updates' },
   // Actions
-  { id: 'new-chat', label: 'New Chat', category: 'Action', path: '/chat' },
-  { id: 'fleet-health', label: 'Check Fleet Health', category: 'Action', path: '/' },
+  { id: 'new-chat', label: 'Start New Chat', category: 'Action', path: '/chat' },
+  { id: 'fleet-health', label: 'Check Fleet Health', category: 'Action', path: '/fleet' },
   { id: 'refresh', label: 'Refresh Page', category: 'Action', action: () => window.location.reload() },
 ]
 
@@ -44,7 +46,6 @@ export function CommandPalette() {
   const [selected, setSelected] = useState(0)
   const navigate = useNavigate()
 
-  // Cmd+K to open
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
@@ -87,10 +88,10 @@ export function CommandPalette() {
   return (
     <div className="fixed inset-0 z-50 flex items-start justify-center pt-[20vh]" onClick={() => setOpen(false)}>
       <div className="fixed inset-0 bg-black/60" />
-      <div className="relative w-full max-w-lg rounded-xl border border-slate-700 bg-slate-900 shadow-2xl shadow-black/50"
+      <div className="relative w-full max-w-lg rounded-xl border border-zinc-700 bg-zinc-900 shadow-2xl shadow-black/50"
            onClick={e => e.stopPropagation()}>
-        <div className="flex items-center border-b border-slate-800 px-4">
-          <svg className="h-5 w-5 text-slate-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <div className="flex items-center border-b border-zinc-800 px-4">
+          <svg className="h-5 w-5 text-zinc-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
           </svg>
           <input
@@ -99,15 +100,15 @@ export function CommandPalette() {
             onChange={e => { setQuery(e.target.value); setSelected(0) }}
             onKeyDown={handleKeyDown}
             placeholder="Search commands, pages..."
-            className="flex-1 bg-transparent px-3 py-3 text-sm text-slate-100 outline-none placeholder:text-slate-500"
+            className="flex-1 bg-transparent px-3 py-3 text-sm text-zinc-100 outline-none placeholder:text-zinc-500"
             autoFocus
           />
-          <kbd className="rounded border border-slate-700 bg-slate-800 px-1.5 py-0.5 text-xs text-slate-500">esc</kbd>
+          <kbd className="rounded border border-zinc-700 bg-zinc-800 px-1.5 py-0.5 text-xs text-zinc-500">esc</kbd>
         </div>
 
         <div className="max-h-72 overflow-y-auto p-2">
           {filtered.length === 0 ? (
-            <div className="px-3 py-6 text-center text-sm text-slate-500">No results for "{query}"</div>
+            <div className="px-3 py-6 text-center text-sm text-zinc-500">No results for "{query}"</div>
           ) : (
             filtered.map((item, i) => (
               <button
@@ -115,21 +116,21 @@ export function CommandPalette() {
                 onClick={() => execute(item)}
                 onMouseEnter={() => setSelected(i)}
                 className={`flex w-full items-center justify-between rounded-lg px-3 py-2 text-sm transition ${
-                  i === selected ? 'bg-violet-500/20 text-violet-200' : 'text-slate-300 hover:bg-slate-800'
+                  i === selected ? 'bg-violet-500/20 text-violet-200' : 'text-zinc-300 hover:bg-zinc-800'
                 }`}
               >
                 <div className="flex items-center gap-3">
-                  <span className="text-xs text-slate-500 w-16">{item.category}</span>
+                  <span className="text-xs text-zinc-500 w-16">{item.category}</span>
                   <span>{item.label}</span>
                 </div>
-                {item.shortcut && <kbd className="text-xs text-slate-600">{item.shortcut}</kbd>}
+                {item.shortcut && <kbd className="text-xs text-zinc-600">{item.shortcut}</kbd>}
               </button>
             ))
           )}
         </div>
 
-        <div className="border-t border-slate-800 px-4 py-2 text-xs text-slate-500">
-          ↑↓ navigate • ↵ select • esc close
+        <div className="border-t border-zinc-800 px-4 py-2 text-xs text-zinc-500">
+          ↑↓ navigate &middot; ↵ select &middot; esc close
         </div>
       </div>
     </div>

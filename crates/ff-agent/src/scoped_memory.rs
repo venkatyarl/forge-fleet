@@ -47,6 +47,10 @@ pub enum MemoryScope {
     Folder { path: PathBuf },
     /// Temporary — cleaned up after scrub.
     Temp,
+    /// Fleet Brain — personal node preferences, cross-project knowledge.
+    FleetBrain,
+    /// Hive Mind — shared fleet standards and topology (synced across fleet).
+    HiveMind,
 }
 
 impl MemoryScope {
@@ -57,6 +61,8 @@ impl MemoryScope {
             Self::MultiProject { project_names, .. } => format!("Multi: {}", project_names.join(", ")),
             Self::Folder { path } => format!("Folder: {}", path.display()),
             Self::Temp => "Temp".into(),
+            Self::FleetBrain => "Fleet Brain".into(),
+            Self::HiveMind => "Hive Mind".into(),
         }
     }
 }
@@ -117,6 +123,12 @@ pub enum MemoryCategory {
     Constraint,
     Learning,
     Context,
+    /// Reusable tool-calling patterns (Fleet Brain).
+    ToolPattern,
+    /// Shared coding standards (Hive Mind).
+    CodingStandard,
+    /// Fleet topology knowledge (Hive Mind).
+    FleetTopology,
 }
 
 // ---------------------------------------------------------------------------
@@ -264,6 +276,9 @@ fn category_label(cat: MemoryCategory) -> &'static str {
         MemoryCategory::Constraint => "CONSTRAINT",
         MemoryCategory::Learning => "LEARNING",
         MemoryCategory::Context => "CONTEXT",
+        MemoryCategory::ToolPattern => "TOOL_PATTERN",
+        MemoryCategory::CodingStandard => "CODING_STANDARD",
+        MemoryCategory::FleetTopology => "FLEET_TOPOLOGY",
     }
 }
 
@@ -392,6 +407,12 @@ fn scope_base_path(scope: &MemoryScope) -> PathBuf {
             base.join("folders").join(hash)
         }
         MemoryScope::Temp => base.join("temp"),
+        MemoryScope::FleetBrain => {
+            dirs::home_dir().unwrap_or_default().join(".forgefleet").join("brain")
+        }
+        MemoryScope::HiveMind => {
+            dirs::home_dir().unwrap_or_default().join(".forgefleet").join("hive")
+        }
     }
 }
 

@@ -95,6 +95,27 @@ impl MemoryScope {
     }
 }
 
+/// Detect the git root for a working directory.
+/// Returns None if not in a git repo or git is not available.
+pub async fn detect_git_root(cwd: &Path) -> Option<PathBuf> {
+    let output = tokio::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(cwd)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .await
+        .ok()?;
+
+    if output.status.success() {
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !path.is_empty() {
+            return Some(PathBuf::from(path));
+        }
+    }
+    None
+}
+
 /// Build a context section from discovered memory files for injection into
 /// the system prompt.
 pub fn build_memory_context(files: &[MemoryFile]) -> String {

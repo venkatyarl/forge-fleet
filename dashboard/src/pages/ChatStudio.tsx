@@ -27,6 +27,8 @@ type ChatHistoryEntry = {
   toolOutput?: string
   isError?: boolean
   durationMs?: number
+  imageBase64?: string
+  imageMimeType?: string
 }
 
 type ModelListPayload = {
@@ -44,9 +46,11 @@ type ModelListPayload = {
   }>
 }
 
+type ContentBlock = { type: 'text'; text: string } | { type: 'image_url'; image_url: { url: string } }
+
 type ChatCompletionRequestMessage = {
   role: 'system' | 'user' | 'assistant'
-  content: string
+  content: string | ContentBlock[]
 }
 
 type AgentEvent = {
@@ -173,7 +177,17 @@ function buildRequestMessages(history: ChatHistoryEntry[], systemPrompt: string)
 
   for (const entry of history) {
     if (entry.role === 'user' || entry.role === 'assistant') {
-      messages.push({ role: entry.role, content: entry.content })
+      if (entry.imageBase64 && entry.role === 'user') {
+        messages.push({
+          role: 'user',
+          content: [
+            { type: 'text', text: entry.content },
+            { type: 'image_url', image_url: { url: `data:${entry.imageMimeType ?? 'image/png'};base64,${entry.imageBase64}` } },
+          ],
+        })
+      } else {
+        messages.push({ role: entry.role, content: entry.content })
+      }
     }
   }
 
@@ -227,6 +241,9 @@ export function ChatStudio() {
   const [selectedModel, setSelectedModel] = useState('')
   const [systemPrompt, setSystemPrompt] = useState('')
   const [draft, setDraft] = useState('')
+  const [attachedImage, setAttachedImage] = useState<{
+    name: string; size: number; dataUrl: string; base64: string; mimeType: string
+  } | null>(null)
   const [history, setHistory] = useState<ChatHistoryEntry[]>([])
   const [loadingModels, setLoadingModels] = useState(true)
   const [sending, setSending] = useState(false)
@@ -433,9 +450,12 @@ export function ChatStudio() {
         at: new Date().toISOString(),
         model: selectedModel,
         backend: activeBackend.label,
+        imageBase64: attachedImage?.base64,
+        imageMimeType: attachedImage?.mimeType,
       }
 
       setHistory((prev) => [...prev, userEntry])
+      setAttachedImage(null) // clear after sending
 
       if (agentMode) {
         // Agent mode: POST to /api/agent/session
@@ -761,6 +781,20 @@ export function ChatStudio() {
       </div>
 
       <form onSubmit={sendMessage} className="space-y-3 rounded-xl border border-slate-800 bg-slate-900/70 p-4">
+        {/* Image attachment preview */}
+        {attachedImage && (
+          <div className="flex items-center gap-2 rounded-md border border-violet-500/30 bg-violet-500/10 px-3 py-2">
+            <img src={attachedImage.dataUrl} alt="attached" className="h-12 w-12 rounded object-cover" />
+            <div className="flex-1 min-w-0">
+              <p className="text-xs text-violet-300 truncate">{attachedImage.name}</p>
+              <p className="text-[10px] text-zinc-500">{(attachedImage.size / 1024).toFixed(0)} KB</p>
+            </div>
+            <button type="button" onClick={() => setAttachedImage(null)} className="text-zinc-500 hover:text-zinc-300">
+              <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+            </button>
+          </div>
+        )}
+
         <label className="grid gap-1 text-sm text-slate-300">
           Message
           <textarea
@@ -778,9 +812,36 @@ export function ChatStudio() {
         </label>
 
         <div className="flex flex-wrap items-center justify-between gap-2">
-          <p className="text-xs text-slate-400">
-            {agentMode ? 'Cmd+Enter to send. Agent events stream via WebSocket.' : 'History is kept in this page state for the current browser tab.'}
-          </p>
+          <div className="flex items-center gap-2">
+            {/* Image upload button */}
+            <label className="cursor-pointer rounded-md border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-xs text-zinc-400 hover:border-zinc-600 hover:text-zinc-200 transition">
+              <input
+                type="file"
+                accept="image/*"
+                className="hidden"
+                onChange={(e) => {
+                  const file = e.target.files?.[0]
+                  if (!file) return
+                  const reader = new FileReader()
+                  reader.onload = () => {
+                    setAttachedImage({
+                      name: file.name,
+                      size: file.size,
+                      dataUrl: reader.result as string,
+                      base64: (reader.result as string).split(',')[1],
+                      mimeType: file.type,
+                    })
+                  }
+                  reader.readAsDataURL(file)
+                  e.target.value = ''
+                }}
+              />
+              Attach Image
+            </label>
+            <p className="text-xs text-slate-500">
+              {agentMode ? 'Cmd+Enter to send' : 'History kept in browser tab'}
+            </p>
+          </div>
           <button
             type="submit"
             disabled={sending || agentRunning || !draft.trim() || (!agentMode && !selectedModel) || (!agentMode && backendId === 'custom' && !activeBackend.baseUrl)}

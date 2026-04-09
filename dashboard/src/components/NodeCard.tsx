@@ -1,4 +1,3 @@
-import { Link } from 'react-router-dom'
 import type { FleetNode } from '../types'
 
 type NodeCardProps = {
@@ -48,14 +47,10 @@ function formatHeartbeat(node: FleetNode): string {
 export function NodeCard({ node }: NodeCardProps) {
   const status = (node.status ?? node.health ?? 'unknown').toLowerCase()
   const sourceKind = node.source_kind ?? (node.runtime_enrolled ? 'enrolled/live' : 'seed/static')
-  const name = node.name ?? node.id ?? 'Unnamed node'
+  const name = node.name ?? node.id ?? 'Unnamed member'
   const isLeader = node.is_leader || node.leader_state === 'leader'
 
-  const modelsLoaded = node.models_loaded ?? []
-  const modelsText =
-    node.models_loaded_state === 'unreported'
-      ? 'unreported'
-      : `${modelsLoaded.length} (${modelsLoaded.join(', ') || 'none'})`
+  const modelsLoaded = node.models_loaded ?? (node.models ?? []).map(m => m.name)
 
   return (
     <article className="rounded-xl border border-slate-800 bg-slate-900/60 p-4 shadow-sm">
@@ -89,17 +84,18 @@ export function NodeCard({ node }: NodeCardProps) {
         <Field label="Heartbeat Source" value={node.heartbeat_source ?? 'unreported'} />
       </dl>
 
-      <p className="mt-3 text-xs text-slate-400">Models loaded: {modelsText}</p>
-      <p className="mt-1 text-xs text-slate-500">
-        Runtime provenance: {(node.runtime_provenance ?? []).join(', ') || 'unreported'}
-      </p>
-
-      <Link
-        to={`/nodes/${encodeURIComponent(node.id ?? node.name)}`}
-        className="mt-4 inline-block text-sm text-sky-300 hover:text-sky-200"
-      >
-        View details →
-      </Link>
+      {/* Models running on this member */}
+      {modelsLoaded.length > 0 ? (
+        <div className="mt-3 flex flex-wrap gap-1.5">
+          {modelsLoaded.map(name => (
+            <span key={name} className="rounded-md border border-slate-700 bg-slate-800/80 px-2 py-0.5 text-xs text-slate-300">
+              🤖 {name}
+            </span>
+          ))}
+        </div>
+      ) : (
+        <p className="mt-3 text-xs text-slate-500">No models reported</p>
+      )}
     </article>
   )
 }

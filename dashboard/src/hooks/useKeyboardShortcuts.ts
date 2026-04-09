@@ -21,7 +21,7 @@ export function useKeyboardShortcuts() {
       // ? shows help
       if (key === '?' && !e.metaKey && !e.ctrlKey) {
         e.preventDefault()
-        alert('Keyboard Shortcuts:\n\nG then H — Home\nG then T — Topology\nG then M — Mission Control\nG then C — Chat Studio\nG then P — Projects\nG then S — Settings\nG then K — Tools\n\n⌘K — Command Palette\n? — This help')
+        alert('Keyboard Shortcuts:\n\nG then H — Mission Control (Home)\nG then T — Topology\nG then F — Fleet Overview\nG then C — Chat Studio\nG then P — Projects\nG then S — Settings\nG then K — Tools\n\n⌘K — Command Palette\n? — This help')
         return
       }
 
@@ -34,7 +34,7 @@ export function useKeyboardShortcuts() {
         switch (key) {
           case 'h': navigate('/'); break
           case 't': navigate('/topology'); break
-          case 'm': navigate('/mission-control'); break
+          case 'f': navigate('/fleet'); break
           case 'c': navigate('/chat'); break
           case 'p': navigate('/projects'); break
           case 's': navigate('/settings'); break

@@ -1,167 +1,249 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useEffect, useState } from 'react'
 
-type FleetModel = {
-  node: string
-  ip: string
-  port: number
-  model: string
-  online: boolean
-  contextWindow: number
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+type UnifiedModel = {
+  name: string
+  params?: string
+  context?: string
+  bestFor?: string
+  sources: ModelSource[]
+  /** Fleet-specific */
+  fleetMember?: string
+  fleetIp?: string
+  fleetPort?: number
+  online?: boolean
 }
 
-type HFModel = {
-  id: string
-  downloads: number
-  likes: number
-  pipeline_tag?: string
+type ModelSource = {
+  name: 'Fleet' | 'HuggingFace' | 'Ollama'
+  url?: string
+  downloads?: number
+  likes?: number
 }
+
+// ---------------------------------------------------------------------------
+// Static fleet model data
+// ---------------------------------------------------------------------------
+
+const FLEET_MODELS: UnifiedModel[] = [
+  { name: 'Gemma-4-31B', params: '31B', context: '262K', bestFor: 'Multimodal, Reasoning', fleetMember: 'Taylor', fleetIp: '192.168.5.100', fleetPort: 51000, sources: [{ name: 'Fleet' }] },
+  { name: 'Qwen3-Coder', params: '32B', context: '32K', bestFor: 'Coding', fleetMember: 'Taylor', fleetIp: '192.168.5.100', fleetPort: 51001, sources: [{ name: 'Fleet' }] },
+  { name: 'Qwen2.5-Coder-32B', params: '32B', context: '32K', bestFor: 'Coding, Review', fleetMember: 'Marcus', fleetIp: '192.168.5.102', fleetPort: 51000, sources: [{ name: 'Fleet' }] },
+  { name: 'Qwen2.5-Coder-32B', params: '32B', context: '32K', bestFor: 'Coding, Review', fleetMember: 'Sophie', fleetIp: '192.168.5.103', fleetPort: 51000, sources: [{ name: 'Fleet' }] },
+  { name: 'Qwen2.5-Coder-32B', params: '32B', context: '32K', bestFor: 'Coding, Review', fleetMember: 'Priya', fleetIp: '192.168.5.104', fleetPort: 51000, sources: [{ name: 'Fleet' }] },
+  { name: 'Qwen2.5-72B', params: '72B', context: '32K', bestFor: 'Reasoning, General', fleetMember: 'James', fleetIp: '192.168.5.108', fleetPort: 51000, sources: [{ name: 'Fleet' }] },
+  { name: 'Qwen3.5-9B', params: '9B', context: '32K', bestFor: 'Fast responses', fleetMember: 'James', fleetIp: '192.168.5.108', fleetPort: 51001, sources: [{ name: 'Fleet' }] },
+]
+
+// Well-known models for reference
+const REFERENCE_MODELS: UnifiedModel[] = [
+  { name: 'Llama-3.1-405B', params: '405B', context: '128K', bestFor: 'Maximum quality', sources: [
+    { name: 'HuggingFace', url: 'https://huggingface.co/meta-llama/Llama-3.1-405B' },
+    { name: 'Ollama', url: 'https://ollama.com/library/llama3.1:405b' },
+  ]},
+  { name: 'Llama-3.1-70B', params: '70B', context: '128K', bestFor: 'High quality, balanced', sources: [
+    { name: 'HuggingFace', url: 'https://huggingface.co/meta-llama/Llama-3.1-70B' },
+    { name: 'Ollama', url: 'https://ollama.com/library/llama3.1:70b' },
+  ]},
+  { name: 'DeepSeek-Coder-V2', params: '236B', context: '128K', bestFor: 'Coding', sources: [
+    { name: 'HuggingFace', url: 'https://huggingface.co/deepseek-ai/DeepSeek-Coder-V2-Instruct' },
+  ]},
+  { name: 'Mistral-Large-2', params: '123B', context: '128K', bestFor: 'Reasoning, Multilingual', sources: [
+    { name: 'HuggingFace', url: 'https://huggingface.co/mistralai/Mistral-Large-Instruct-2407' },
+    { name: 'Ollama', url: 'https://ollama.com/library/mistral-large' },
+  ]},
+  { name: 'Phi-4', params: '14B', context: '16K', bestFor: 'Efficient, edge deployment', sources: [
+    { name: 'HuggingFace', url: 'https://huggingface.co/microsoft/phi-4' },
+    { name: 'Ollama', url: 'https://ollama.com/library/phi4' },
+  ]},
+  { name: 'Gemma-2-27B', params: '27B', context: '8K', bestFor: 'Efficient reasoning', sources: [
+    { name: 'HuggingFace', url: 'https://huggingface.co/google/gemma-2-27b-it' },
+    { name: 'Ollama', url: 'https://ollama.com/library/gemma2:27b' },
+  ]},
+  { name: 'CodeLlama-34B', params: '34B', context: '16K', bestFor: 'Code generation', sources: [
+    { name: 'HuggingFace', url: 'https://huggingface.co/codellama/CodeLlama-34b-Instruct-hf' },
+    { name: 'Ollama', url: 'https://ollama.com/library/codellama:34b' },
+  ]},
+  { name: 'Qwen2.5-Coder-32B', params: '32B', context: '32K', bestFor: 'Coding, tool calling', sources: [
+    { name: 'HuggingFace', url: 'https://huggingface.co/Qwen/Qwen2.5-Coder-32B-Instruct' },
+    { name: 'Ollama', url: 'https://ollama.com/library/qwen2.5-coder:32b' },
+  ]},
+]
+
+// ---------------------------------------------------------------------------
+// Main component
+// ---------------------------------------------------------------------------
 
 export function ModelHub() {
-  const [fleetModels, setFleetModels] = useState<FleetModel[]>([])
-  const [hfModels, setHfModels] = useState<HFModel[]>([])
-  const [hfQuery, setHfQuery] = useState('coding')
-  const [loading, setLoading] = useState(false)
-  const [activeTab, setActiveTab] = useState<'fleet' | 'huggingface' | 'compare'>('fleet')
+  const [query, setQuery] = useState('')
+  const [models, setModels] = useState<UnifiedModel[]>([])
+  const [showFleetOnly, setShowFleetOnly] = useState(false)
 
-  // Load fleet models
+  // Merge fleet + reference, check fleet health
   useEffect(() => {
-    const nodes = [
-      { name: 'Taylor', ip: '192.168.5.100', models: [{ port: 51000, name: 'Gemma-4-31B' }, { port: 51001, name: 'Qwen3-Coder' }] },
-      { name: 'Marcus', ip: '192.168.5.102', models: [{ port: 51000, name: 'Qwen2.5-Coder-32B' }] },
-      { name: 'Sophie', ip: '192.168.5.103', models: [{ port: 51000, name: 'Qwen2.5-Coder-32B' }] },
-      { name: 'Priya', ip: '192.168.5.104', models: [{ port: 51000, name: 'Qwen2.5-Coder-32B' }] },
-      { name: 'James', ip: '192.168.5.108', models: [{ port: 51000, name: 'Qwen2.5-72B' }, { port: 51001, name: 'Qwen3.5-9B' }] },
-    ]
+    const merged = [...FLEET_MODELS, ...REFERENCE_MODELS]
+    setModels(merged)
 
-    const models: FleetModel[] = []
-    nodes.forEach(node => {
-      node.models.forEach(m => {
-        models.push({
-          node: node.name, ip: node.ip, port: m.port, model: m.name,
-          online: false, contextWindow: 32768,
+    // Check fleet model health
+    FLEET_MODELS.forEach((m) => {
+      if (!m.fleetIp || !m.fleetPort) return
+      fetch(`http://${m.fleetIp}:${m.fleetPort}/health`, { signal: AbortSignal.timeout(3000) })
+        .then(r => {
+          if (r.ok) {
+            setModels(prev => prev.map(p =>
+              p.fleetMember === m.fleetMember && p.fleetPort === m.fleetPort
+                ? { ...p, online: true }
+                : p
+            ))
+          }
         })
-      })
-    })
-    setFleetModels(models)
-
-    // Check health
-    models.forEach((m, i) => {
-      fetch(`http://${m.ip}:${m.port}/health`, { signal: AbortSignal.timeout(3000) })
-        .then(r => { if (r.ok) setFleetModels(prev => prev.map((p, j) => j === i ? { ...p, online: true } : p)) })
         .catch(() => {})
     })
   }, [])
 
-  // Search HuggingFace
-  const searchHF = useCallback(async () => {
-    setLoading(true)
-    try {
-      const resp = await fetch(`https://huggingface.co/api/models?search=${encodeURIComponent(hfQuery)}&sort=trending&direction=-1&limit=20&filter=text-generation`)
-      if (resp.ok) {
-        const data = await resp.json() as HFModel[]
-        setHfModels(data)
-      }
-    } catch { /* ignore */ }
-    setLoading(false)
-  }, [hfQuery])
+  // Filter
+  const filtered = models.filter(m => {
+    if (showFleetOnly && !m.fleetMember) return false
+    if (!query) return true
+    const lower = query.toLowerCase()
+    return (
+      m.name.toLowerCase().includes(lower) ||
+      (m.bestFor ?? '').toLowerCase().includes(lower) ||
+      (m.fleetMember ?? '').toLowerCase().includes(lower) ||
+      (m.params ?? '').toLowerCase().includes(lower) ||
+      m.sources.some(s => s.name.toLowerCase().includes(lower))
+    )
+  })
 
   return (
     <section className="space-y-4">
-      <div className="flex items-center justify-between">
-        <div>
-          <h2 className="text-xl font-semibold text-slate-100">Model Hub</h2>
-          <p className="text-sm text-slate-400">Browse, compare, and manage LLM models</p>
-        </div>
+      <div>
+        <h1 className="text-2xl font-bold text-zinc-100">Available Models</h1>
+        <p className="text-sm text-zinc-500">Models running on your fleet and available from external sources</p>
       </div>
 
-      {/* Tabs */}
-      <div className="flex gap-2">
-        {(['fleet', 'huggingface', 'compare'] as const).map(tab => (
-          <button key={tab} onClick={() => setActiveTab(tab)}
-            className={`rounded-lg px-4 py-2 text-sm ${activeTab === tab ? 'bg-violet-500/30 text-violet-200 border border-violet-500/50' : 'bg-slate-800 text-slate-400 border border-slate-700'}`}>
-            {tab === 'fleet' ? 'Fleet Models' : tab === 'huggingface' ? 'HuggingFace' : 'Compare'}
-          </button>
-        ))}
+      {/* Search + filter */}
+      <div className="flex items-center gap-3">
+        <div className="relative flex-1">
+          <svg className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-zinc-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+          </svg>
+          <input
+            type="text"
+            value={query}
+            onChange={e => setQuery(e.target.value)}
+            placeholder="Search models by name, params, use case..."
+            className="w-full rounded-lg border border-zinc-700 bg-zinc-950 pl-10 pr-3 py-2 text-sm text-zinc-100 placeholder:text-zinc-500 focus:border-violet-500/50 focus:outline-none"
+          />
+        </div>
+        <button
+          onClick={() => setShowFleetOnly(!showFleetOnly)}
+          className={`rounded-lg border px-3 py-2 text-sm transition ${
+            showFleetOnly
+              ? 'border-violet-500/50 bg-violet-500/20 text-violet-300'
+              : 'border-zinc-700 bg-zinc-900 text-zinc-400 hover:text-zinc-200'
+          }`}
+        >
+          Fleet only
+        </button>
       </div>
 
-      {activeTab === 'fleet' && (
-        <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-3">
-          {fleetModels.map((m, i) => (
-            <article key={i} className="rounded-xl border border-slate-800 bg-slate-900/70 p-4">
-              <div className="flex items-center gap-2">
-                <span className={`h-2.5 w-2.5 rounded-full ${m.online ? 'bg-emerald-400' : 'bg-rose-400'}`} />
-                <h3 className="font-semibold text-slate-200">{m.model}</h3>
-              </div>
-              <div className="mt-2 space-y-1 text-sm text-slate-400">
-                <div>Node: {m.node} ({m.ip}:{m.port})</div>
-                <div>Context: {(m.contextWindow / 1024).toFixed(0)}K tokens</div>
-                <div>Status: {m.online ? <span className="text-emerald-400">Online</span> : <span className="text-rose-400">Offline</span>}</div>
-              </div>
-              <div className="mt-3 h-2 rounded-full bg-slate-800">
-                <div className="h-2 rounded-full bg-emerald-500" style={{ width: '3%' }} />
-              </div>
-              <div className="mt-1 text-xs text-slate-500">0 / {(m.contextWindow / 1024).toFixed(0)}K tokens (0%)</div>
-            </article>
-          ))}
-        </div>
-      )}
+      {/* Results count */}
+      <p className="text-xs text-zinc-500">{filtered.length} model{filtered.length !== 1 ? 's' : ''} found</p>
 
-      {activeTab === 'huggingface' && (
-        <div className="space-y-4">
-          <div className="flex gap-2">
-            <input
-              type="text" value={hfQuery} onChange={e => setHfQuery(e.target.value)}
-              placeholder="Search models..."
-              className="flex-1 rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100"
-              onKeyDown={e => { if (e.key === 'Enter') void searchHF() }}
-            />
-            <button onClick={() => void searchHF()}
-              className="rounded-md border border-violet-500/40 bg-violet-500/20 px-4 py-2 text-sm text-violet-200 hover:bg-violet-500/30">
-              {loading ? 'Searching...' : 'Search'}
-            </button>
-          </div>
-          <div className="grid gap-3 md:grid-cols-2">
-            {hfModels.map(m => (
-              <article key={m.id} className="rounded-xl border border-slate-800 bg-slate-900/70 p-4 hover:border-slate-600 transition">
-                <h3 className="font-semibold text-slate-200 truncate">{m.id}</h3>
-                <div className="mt-2 flex items-center gap-4 text-sm text-slate-400">
-                  <span>⬇ {m.downloads >= 1000000 ? `${(m.downloads/1000000).toFixed(1)}M` : m.downloads >= 1000 ? `${(m.downloads/1000).toFixed(1)}K` : m.downloads}</span>
-                  <span>❤ {m.likes}</span>
-                  {m.pipeline_tag && <span className="rounded bg-slate-800 px-2 py-0.5 text-xs">{m.pipeline_tag}</span>}
-                </div>
-                <a href={`https://huggingface.co/${m.id}`} target="_blank" rel="noopener noreferrer"
-                  className="mt-2 block text-xs text-violet-400 hover:text-violet-300">
-                  View on HuggingFace →
-                </a>
-              </article>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {activeTab === 'compare' && (
-        <div className="rounded-xl border border-slate-800 bg-slate-900/70 p-6">
-          <h3 className="text-lg font-semibold text-slate-200 mb-4">Model Comparison</h3>
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="border-b border-slate-700 text-slate-400">
-                <th className="py-2 text-left">Model</th>
-                <th className="py-2 text-left">Params</th>
-                <th className="py-2 text-left">Context</th>
-                <th className="py-2 text-left">RAM (Q4)</th>
-                <th className="py-2 text-left">Best For</th>
+      {/* Table */}
+      <div className="overflow-x-auto rounded-xl border border-zinc-800 bg-zinc-900/60">
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="border-b border-zinc-800 text-left">
+              <th className="px-4 py-3 text-xs font-semibold uppercase tracking-wider text-zinc-500">Model</th>
+              <th className="px-4 py-3 text-xs font-semibold uppercase tracking-wider text-zinc-500">Params</th>
+              <th className="px-4 py-3 text-xs font-semibold uppercase tracking-wider text-zinc-500">Context</th>
+              <th className="px-4 py-3 text-xs font-semibold uppercase tracking-wider text-zinc-500">Best For</th>
+              <th className="px-4 py-3 text-xs font-semibold uppercase tracking-wider text-zinc-500">Fleet Member</th>
+              <th className="px-4 py-3 text-xs font-semibold uppercase tracking-wider text-zinc-500">Sources</th>
+              <th className="px-4 py-3 text-xs font-semibold uppercase tracking-wider text-zinc-500">Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            {filtered.map((m, i) => (
+              <tr key={`${m.name}-${m.fleetMember ?? i}`} className="border-b border-zinc-800/50 transition hover:bg-zinc-800/30">
+                <td className="px-4 py-3">
+                  <span className="font-medium text-zinc-200">{m.name}</span>
+                </td>
+                <td className="px-4 py-3 text-zinc-400">{m.params ?? '—'}</td>
+                <td className="px-4 py-3 text-zinc-400">{m.context ?? '—'}</td>
+                <td className="px-4 py-3 text-zinc-400">{m.bestFor ?? '—'}</td>
+                <td className="px-4 py-3">
+                  {m.fleetMember ? (
+                    <span className="text-zinc-200">{m.fleetMember}</span>
+                  ) : (
+                    <span className="text-zinc-600">—</span>
+                  )}
+                </td>
+                <td className="px-4 py-3">
+                  <div className="flex flex-wrap gap-1">
+                    {m.sources.map(s => (
+                      <SourceBadge key={s.name} source={s} />
+                    ))}
+                  </div>
+                </td>
+                <td className="px-4 py-3">
+                  {m.fleetMember ? (
+                    <span className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs ${
+                      m.online
+                        ? 'bg-emerald-500/20 text-emerald-300'
+                        : 'bg-zinc-700/50 text-zinc-400'
+                    }`}>
+                      <span className={`h-1.5 w-1.5 rounded-full ${m.online ? 'bg-emerald-400' : 'bg-zinc-500'}`} />
+                      {m.online ? 'Online' : 'Offline'}
+                    </span>
+                  ) : (
+                    <span className="text-xs text-zinc-600">Available</span>
+                  )}
+                </td>
               </tr>
-            </thead>
-            <tbody className="text-slate-300">
-              <tr className="border-b border-slate-800"><td className="py-2">Qwen2.5-Coder-32B</td><td>32B</td><td>32K</td><td>~20GB</td><td>Coding</td></tr>
-              <tr className="border-b border-slate-800"><td className="py-2">Qwen2.5-72B</td><td>72B</td><td>32K</td><td>~45GB</td><td>Reasoning</td></tr>
-              <tr className="border-b border-slate-800"><td className="py-2">Gemma-4-31B</td><td>31B</td><td>262K</td><td>~20GB</td><td>Multimodal</td></tr>
-              <tr className="border-b border-slate-800"><td className="py-2">Llama-3.1-405B</td><td>405B</td><td>128K</td><td>~250GB</td><td>Maximum quality</td></tr>
-              <tr className="border-b border-slate-800"><td className="py-2">Qwen3.5-9B</td><td>9B</td><td>32K</td><td>~6GB</td><td>Fast/lightweight</td></tr>
-            </tbody>
-          </table>
-        </div>
-      )}
+            ))}
+          </tbody>
+        </table>
+
+        {filtered.length === 0 && (
+          <div className="px-4 py-8 text-center text-sm text-zinc-500">
+            No models match "{query}"
+          </div>
+        )}
+      </div>
     </section>
   )
+}
+
+// ---------------------------------------------------------------------------
+// Source badge with link
+// ---------------------------------------------------------------------------
+
+function SourceBadge({ source }: { source: ModelSource }) {
+  const colors: Record<string, string> = {
+    Fleet: 'bg-violet-500/20 text-violet-300 border-violet-500/30',
+    HuggingFace: 'bg-amber-500/20 text-amber-300 border-amber-500/30',
+    Ollama: 'bg-sky-500/20 text-sky-300 border-sky-500/30',
+  }
+
+  const badge = (
+    <span className={`inline-flex items-center rounded-md border px-1.5 py-0.5 text-[10px] font-medium ${colors[source.name] ?? 'bg-zinc-700 text-zinc-300 border-zinc-600'}`}>
+      {source.name}
+    </span>
+  )
+
+  if (source.url) {
+    return (
+      <a href={source.url} target="_blank" rel="noopener noreferrer" className="hover:opacity-80 transition">
+        {badge}
+      </a>
+    )
+  }
+
+  return badge
 }

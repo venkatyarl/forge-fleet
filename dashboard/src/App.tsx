@@ -13,7 +13,6 @@ import { Metrics } from './pages/Metrics'
 import { MissionControl } from './pages/MissionControl'
 import { ModelInventory } from './pages/ModelInventory'
 import { MyTasks } from './pages/MyTasks'
-import { NodeDetail } from './pages/NodeDetail'
 import { OperatorOnboarding } from './pages/OperatorOnboarding'
 import { PlanningHub } from './pages/PlanningHub'
 import { Projects } from './pages/Projects'
@@ -50,9 +49,9 @@ function Shell() {
         onToggleDarkMode={() => setDarkMode((prev) => !prev)}
       />
 
-      <div className="flex min-h-[calc(100vh-85px)] flex-col md:flex-row">
+      <div className="flex h-[calc(100vh-49px)] flex-col md:flex-row">
         <Sidebar />
-        <main className="flex-1 p-4 md:p-6">
+        <main className="flex-1 overflow-y-auto p-4 md:p-6">
           <Outlet context={{ wsEvent: lastEvent }} />
         </main>
       </div>
@@ -64,27 +63,34 @@ export default function App() {
   return (
     <Routes>
       <Route path="/" element={<Shell />}>
-        <Route index element={<FleetOverview />} />
-        <Route path="nodes/:nodeId" element={<NodeDetail />} />
-        <Route path="models" element={<ModelInventory />} />
-        <Route path="model-hub" element={<ModelHub />} />
-        <Route path="tools" element={<ToolInventory />} />
-        <Route path="settings" element={<Settings />} />
-        <Route path="config" element={<ConfigEditor />} />
-        <Route path="mission-control" element={<MissionControl />} />
-        <Route path="onboarding" element={<OperatorOnboarding />} />
-        <Route path="my-tasks" element={<MyTasks />} />
-        <Route path="workflow" element={<WorkflowWorkbench />} />
-        <Route path="planning" element={<PlanningHub />} />
-        <Route path="projects" element={<Projects />} />
-        <Route path="chats" element={<Chats />} />
+        {/* Mission Control = home */}
+        <Route index element={<MissionControl />} />
+        {/* Chats */}
         <Route path="chat" element={<ChatStudio />} />
         <Route path="chat/:chatId" element={<ChatStudio />} />
-        <Route path="llm-proxy" element={<LLMProxy />} />
+        <Route path="chats" element={<Chats />} />
+        {/* Project Management */}
+        <Route path="my-tasks" element={<MyTasks />} />
+        <Route path="projects" element={<Projects />} />
+        <Route path="planning" element={<PlanningHub />} />
+        <Route path="workflow" element={<WorkflowWorkbench />} />
+        {/* Fleet (accessible via Settings or direct link) */}
+        <Route path="fleet" element={<FleetOverview />} />
         <Route path="topology" element={<Topology />} />
+        <Route path="model-hub" element={<ModelHub />} />
+        <Route path="models" element={<ModelInventory />} />
+        <Route path="tools" element={<ToolInventory />} />
+        <Route path="metrics" element={<Metrics />} />
+        {/* Settings (unified page) */}
+        <Route path="settings" element={<Settings />} />
+        <Route path="config" element={<ConfigEditor />} />
+        <Route path="llm-proxy" element={<LLMProxy />} />
         <Route path="audit" element={<AuditLog />} />
         <Route path="updates" element={<Updates />} />
-        <Route path="metrics" element={<Metrics />} />
+        <Route path="onboarding" element={<OperatorOnboarding />} />
+        {/* Legacy redirects */}
+        <Route path="mission-control" element={<Navigate to="/" replace />} />
+        <Route path="nodes/:nodeId" element={<Navigate to="/settings#fleet" replace />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Route>
     </Routes>

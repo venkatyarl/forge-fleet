@@ -59,6 +59,8 @@ pub struct AgentSessionConfig {
     pub auto_save: bool,
     /// Memory scope for this session (default: Global).
     pub memory_scope: Option<MemoryScope>,
+    /// Optional image path to attach to the first user message (multimodal).
+    pub image_path: Option<PathBuf>,
 }
 
 impl Default for AgentSessionConfig {
@@ -75,6 +77,7 @@ impl Default for AgentSessionConfig {
             tool_result_budget_chars: 50_000,
             auto_save: true,
             memory_scope: None,
+            image_path: None,
         }
     }
 }
@@ -91,6 +94,10 @@ pub struct AgentSession {
     tool_ctx: AgentToolContext,
     compaction_config: CompactionConfig,
     pub turn_count: u32,
+    /// Track recent tool signatures for loop detection.
+    recent_tool_sigs: Vec<String>,
+    /// Count of consecutive tool errors (resets on success).
+    consecutive_errors: u32,
 }
 
 impl AgentSession {
@@ -129,6 +136,8 @@ impl AgentSession {
             tool_ctx,
             compaction_config,
             turn_count: 0,
+            recent_tool_sigs: Vec::new(),
+            consecutive_errors: 0,
         }
     }
 
@@ -161,6 +170,8 @@ impl AgentSession {
             tool_ctx,
             compaction_config,
             turn_count,
+            recent_tool_sigs: Vec::new(),
+            consecutive_errors: 0,
         }
     }
 
@@ -170,20 +181,14 @@ impl AgentSession {
         prompt: &str,
         event_tx: Option<mpsc::UnboundedSender<AgentEvent>>,
     ) -> AgentOutcome {
-        // Load scoped memory and inject into system prompt (first turn only)
+        // Load three-brain memory and inject into system prompt (first turn only)
         if self.turn_count == 0 {
-            if let Some(scope) = &self.config.memory_scope {
-                let store = ScopedMemoryStore::open(scope.clone()).await;
-                if !store.is_empty() {
-                    let memory_context = store.build_context(4000);
-                    // Append memory context to system message
-                    if let Some(sys_msg) = self.messages.first_mut() {
-                        if let Some(current) = sys_msg.text_content().map(String::from) {
-                            *sys_msg = ToolChatMessage::system(format!(
-                                "{current}\n\n## Project Memory ({} entries)\n\n{memory_context}",
-                                store.len()
-                            ));
-                        }
+            let brain_ctx = crate::brain::BrainLoader::load_for_dir(&self.config.working_dir).await;
+            let injection = crate::brain::BrainLoader::build_injection(&brain_ctx, 3000);
+            if !injection.is_empty() {
+                if let Some(sys_msg) = self.messages.first_mut() {
+                    if let Some(current) = sys_msg.text_content().map(String::from) {
+                        *sys_msg = ToolChatMessage::system(format!("{current}{injection}"));
                     }
                 }
             }
@@ -191,14 +196,34 @@ impl AgentSession {
 
         // Inject Focus Stack + Backlog context as a system reminder
         let tracker_ctx = self.tracker.context_injection();
-        if !tracker_ctx.is_empty() {
-            // Add as a user message that provides context (not a system message, since
-            // some models only support one system message)
-            self.messages.push(ToolChatMessage::user(format!(
-                "[System Context]\n{tracker_ctx}\nNow, please address: {prompt}"
-            )));
+        let full_prompt = if !tracker_ctx.is_empty() {
+            format!("[System Context]\n{tracker_ctx}\nNow, please address: {prompt}")
         } else {
-            self.messages.push(ToolChatMessage::user(prompt));
+            prompt.to_string()
+        };
+
+        // If image is attached, create multimodal message
+        if let Some(image_path) = &self.config.image_path {
+            if let Ok(image_data) = tokio::fs::read(image_path).await {
+                use base64::Engine;
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&image_data);
+                let ext = image_path.extension().and_then(|e| e.to_str()).unwrap_or("png");
+                let mime = match ext {
+                    "jpg" | "jpeg" => "image/jpeg",
+                    "gif" => "image/gif",
+                    "webp" => "image/webp",
+                    "svg" => "image/svg+xml",
+                    _ => "image/png",
+                };
+                self.messages.push(ToolChatMessage::user_with_image(&full_prompt, &b64, mime));
+                // Clear image_path so it's only sent once
+                self.config.image_path = None;
+            } else {
+                warn!(path = %image_path.display(), "failed to read image file");
+                self.messages.push(ToolChatMessage::user(full_prompt));
+            }
+        } else {
+            self.messages.push(ToolChatMessage::user(full_prompt));
         }
 
         let http_client = reqwest::Client::builder()
@@ -221,6 +246,55 @@ impl AgentSession {
             .await
             {
                 warn!(error = %e, "failed to auto-save session");
+            }
+        }
+
+        // Auto-collect training data for future LoRA fine-tuning
+        if self.config.auto_save {
+            let success = matches!(outcome, AgentOutcome::EndTurn { .. });
+            let task_type = crate::orchestrator_agent::analyze_task(prompt);
+            let conv = crate::training::TrainingConversation {
+                id: self.id.to_string(),
+                system_prompt: self.messages.first()
+                    .and_then(|m| m.text_content())
+                    .unwrap_or_default()
+                    .to_string(),
+                turns: self.messages.iter().skip(1).map(|m| {
+                    crate::training::TrainingTurn {
+                        role: m.role.clone(),
+                        content: m.text_content().unwrap_or_default().to_string(),
+                        tool_calls: m.tool_calls.as_ref().map(|calls| {
+                            calls.iter().map(|c| crate::training::TrainingToolCall {
+                                name: c.function.name.clone(),
+                                arguments: c.function.arguments.clone(),
+                            }).collect()
+                        }),
+                        tool_call_id: m.tool_call_id.clone(),
+                    }
+                }).collect(),
+                task_type: format!("{:?}", task_type),
+                success,
+                collected_at: chrono::Utc::now().to_rfc3339(),
+            };
+            if let Err(e) = crate::training::save_conversation(&conv).await {
+                debug!(error = %e, "failed to save training data");
+            }
+
+            // Auto-learn from this session — extract and route to brains
+            let brain_ctx = crate::brain::BrainLoader::load_for_dir(&self.config.working_dir).await;
+            let learn_report = crate::learning::extract_and_route(
+                &self.messages, &brain_ctx, &self.id.to_string()
+            ).await;
+
+            // Auto-sync hive if we added hive entries
+            if learn_report.hive_count > 0 {
+                let hive = crate::hive_sync::HiveSync::new();
+                hive.auto_sync().await;
+            }
+
+            // Apply relevance decay periodically (roughly every 10 sessions)
+            if self.turn_count % 10 == 0 {
+                crate::learning::decay_all_brains(&brain_ctx).await;
             }
         }
 
@@ -315,8 +389,11 @@ async fn run_agent_loop(
     let session_id = session.id.to_string();
     let openai_tools = openai_bridge::tools_to_openai_arc(&session.tools);
 
+    let mut llm_retry_count = 0u32;
+
     for turn in 1..=session.config.max_turns {
         session.turn_count = turn;
+        llm_retry_count = 0; // reset per turn
 
         // Check cancellation
         if session.cancel_token.is_cancelled() {
@@ -378,9 +455,21 @@ async fn run_agent_loop(
             temperature: Some(session.config.temperature),
             max_tokens: Some(session.config.max_tokens),
             stream: Some(false),
+            // Enable llama.cpp prompt caching — the server reuses KV-cache
+            // entries for the static system-prompt + tool-definition prefix,
+            // cutting time-to-first-token on turns 2+ by ~40-60%.
+            cache_prompt: Some(true),
         };
 
         // --- Send to LLM ---
+        emit(
+            &event_tx,
+            AgentEvent::Status {
+                session_id: session_id.clone(),
+                message: format!("Thinking... (sending {} messages to LLM)", session.messages.len()),
+            },
+        );
+
         let url = format!(
             "{}/v1/chat/completions",
             session.config.llm_base_url.trim_end_matches('/')
@@ -427,7 +516,19 @@ async fn run_agent_loop(
                     continue;
                 }
 
-                let msg = format!("LLM request failed: {err}");
+                // Retry with exponential backoff (up to 3 attempts)
+                llm_retry_count += 1;
+                if llm_retry_count <= 3 {
+                    let delay_ms = 1000 * (1u64 << llm_retry_count); // 2s, 4s, 8s
+                    emit(&event_tx, AgentEvent::Status {
+                        session_id: session_id.clone(),
+                        message: format!("LLM error (attempt {}/3), retrying in {}s: {}", llm_retry_count, delay_ms / 1000, &err_str[..err_str.len().min(100)]),
+                    });
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    continue; // retry the same turn
+                }
+
+                let msg = format!("LLM request failed after 3 retries: {err}");
                 emit(
                     &event_tx,
                     AgentEvent::Error {
@@ -602,10 +703,12 @@ async fn run_agent_loop(
             let results = futures::future::join_all(futures).await;
             for result in results {
                 match result {
-                    Ok((tool_id, content, _is_error)) => {
+                    Ok((tool_id, content, is_error)) => {
+                        if is_error { session.consecutive_errors += 1; } else { session.consecutive_errors = 0; }
                         tool_results.push((tool_id, content));
                     }
                     Err(e) => {
+                        session.consecutive_errors += 1;
                         tool_results.push(("error".into(), format!("Tool execution failed: {e}")));
                     }
                 }
@@ -668,6 +771,8 @@ async fn run_agent_loop(
                 let result_content =
                     tools::truncate_output(&result.content, tools::MAX_TOOL_RESULT_CHARS);
 
+                if result.is_error { session.consecutive_errors += 1; } else { session.consecutive_errors = 0; }
+
                 emit(
                     &event_tx,
                     AgentEvent::ToolEnd {
@@ -712,6 +817,50 @@ async fn run_agent_loop(
             }
         }
         } // close else (single tool)
+
+        // --- Loop detection ---
+        for tc in &tool_calls {
+            let sig = format!("{}:{}", tc.function.name, &tc.function.arguments[..tc.function.arguments.len().min(80)]);
+            session.recent_tool_sigs.push(sig);
+        }
+        // Keep sliding window of last 20 signatures
+        if session.recent_tool_sigs.len() > 20 {
+            session.recent_tool_sigs.drain(0..session.recent_tool_sigs.len() - 20);
+        }
+        // Check for repetition
+        if let Some(last) = session.recent_tool_sigs.last() {
+            let repeat_count = session.recent_tool_sigs.iter().filter(|s| *s == last).count();
+            if repeat_count >= 3 {
+                warn!(session = %session_id, tool = %last, count = repeat_count, "loop detected");
+                emit(&event_tx, AgentEvent::Status {
+                    session_id: session_id.clone(),
+                    message: format!("Loop detected: same action repeated {} times. Injecting recovery...", repeat_count),
+                });
+                session.messages.push(ToolChatMessage::user(
+                    "STOP. You are repeating the same action in a loop. \
+                     This approach is not working. Step back and try a completely different strategy. \
+                     What is the root cause of the problem? Try a different tool or different arguments."
+                        .to_string()
+                ));
+                session.recent_tool_sigs.clear();
+            }
+        }
+
+        // --- Consecutive error ceiling ---
+        if session.consecutive_errors >= 5 {
+            warn!(session = %session_id, errors = session.consecutive_errors, "consecutive error ceiling hit");
+            emit(&event_tx, AgentEvent::Status {
+                session_id: session_id.clone(),
+                message: format!("{} consecutive tool errors. Injecting recovery...", session.consecutive_errors),
+            });
+            session.messages.push(ToolChatMessage::user(
+                "5 consecutive tool calls have failed. STOP and reassess. \
+                 What is fundamentally wrong? Check if the file exists, if you have the right path, \
+                 or if you need a completely different approach. Read the error messages carefully."
+                    .to_string()
+            ));
+            session.consecutive_errors = 0;
+        }
 
         emit(
             &event_tx,
@@ -888,7 +1037,27 @@ SSH user for all nodes: the default user (use ssh without specifying user, or us
 - Always use tools when the task requires interacting with the system
 - For fleet operations, SSH into nodes using: ssh user@ip 'command'
 - For parallel work across nodes, spawn sub-agents with the Agent tool
-- Be concise. Show results, not explanations."#,
+- Be concise. Show results, not explanations.
+- Always READ a file before trying to EDIT it.
+- Only stop calling tools when the task is ACTUALLY DONE, not when you have a plan.
+
+## Reasoning Protocol (ReAct)
+Follow the Reason-Act-Observe pattern on every turn:
+1. REASON: Before each tool call, briefly state your reasoning (1 sentence) — what you intend to do and why.
+2. ACT: Call the tool.
+3. OBSERVE: After each tool result, briefly state what you learned (1 sentence) — what the result tells you and what to do next.
+This makes your thought process visible and improves tool selection accuracy.
+
+## Error Recovery
+- If a tool call fails, READ the error message carefully and try a different approach.
+- NEVER retry the exact same command that just failed — change something.
+- If 3 attempts at the same approach fail, try a completely different strategy.
+- If you cannot complete a task, explain specifically what is blocking you and what you tried.
+
+## Progress
+- Every turn must make concrete forward progress — read a file, run a command, edit code.
+- If you don't have enough information, use a tool to get it. Don't speculate.
+- If you're unsure, ask the user with AskUserQuestion instead of guessing."#,
         working_dir = working_dir.display()
     )
 }

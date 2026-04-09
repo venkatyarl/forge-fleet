@@ -39,6 +39,7 @@ pub struct App {
     pub fleet_nodes: Vec<FleetNode>,
     pub current_project: Option<ProjectInfo>,
     pub working_dir: PathBuf,
+    pub brain_status: Option<ff_agent::brain::BrainLoadedStatus>,
 }
 
 /// A single session tab — each has its own conversation, input, and agent.
@@ -57,6 +58,8 @@ pub struct SessionTab {
     pub tokens_total: usize,
     pub turn: u32,
     pub tracker: ConversationTracker,
+    /// Message queued while agent is running — sent automatically when agent finishes.
+    pub queued_message: Option<String>,
 }
 
 impl SessionTab {
@@ -76,6 +79,7 @@ impl SessionTab {
             tokens_total: 32_768,
             turn: 0,
             tracker: ConversationTracker::new(),
+            queued_message: None,
         }
     }
 
@@ -151,6 +155,7 @@ impl App {
             fleet_nodes: default_fleet_nodes(),
             current_project,
             working_dir,
+            brain_status: None,
         }
     }
 
