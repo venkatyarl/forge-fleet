@@ -844,7 +844,7 @@ pub async fn fleet_install_model(params: Option<Value>) -> HandlerResult {
         .as_ref()
         .and_then(|p| p.get("port"))
         .and_then(|v| v.as_u64())
-        .unwrap_or(51802) as u16;
+        .unwrap_or(55000) as u16;
 
     let ctx_size = params
         .as_ref()

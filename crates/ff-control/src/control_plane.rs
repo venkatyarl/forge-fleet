@@ -229,7 +229,7 @@ fn node_from_config(name: &str, node: &NodeConfig) -> Node {
         id: Uuid::new_v4(),
         name: name.to_string(),
         host: node.ip.clone(),
-        port: node.port.unwrap_or(51800),
+        port: node.port.unwrap_or(55000),
         role: node.role,
         election_priority: node.priority(),
         status: NodeStatus::Online,

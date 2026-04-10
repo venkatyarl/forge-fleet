@@ -876,7 +876,7 @@ impl OperationalStore {
                 id                TEXT PRIMARY KEY,
                 name              TEXT NOT NULL UNIQUE,
                 host              TEXT NOT NULL,
-                port              BIGINT NOT NULL DEFAULT 51800,
+                port              BIGINT NOT NULL DEFAULT 55000,
                 role              TEXT NOT NULL DEFAULT 'worker',
                 election_priority BIGINT NOT NULL DEFAULT 99,
                 status            TEXT NOT NULL DEFAULT 'online',

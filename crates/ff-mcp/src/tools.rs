@@ -228,7 +228,7 @@ impl ToolRegistry {
                     "port": {
                         "type": "integer",
                         "description": "Port to start llama-server on",
-                        "default": 51802
+                        "default": 55000
                     },
                     "ctx_size": {
                         "type": "integer",

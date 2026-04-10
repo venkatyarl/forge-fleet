@@ -12,7 +12,7 @@ CREATE TABLE IF NOT EXISTS nodes (
     id              TEXT PRIMARY KEY,               -- UUID
     name            TEXT NOT NULL UNIQUE,            -- human name ("taylor")
     host            TEXT NOT NULL,                   -- IP or hostname
-    port            INTEGER NOT NULL DEFAULT 51800,
+    port            INTEGER NOT NULL DEFAULT 55000,
     role            TEXT NOT NULL DEFAULT 'worker',  -- leader | worker
     election_priority INTEGER NOT NULL DEFAULT 99,
     status          TEXT NOT NULL DEFAULT 'online',  -- online | degraded | offline | starting | maintenance
