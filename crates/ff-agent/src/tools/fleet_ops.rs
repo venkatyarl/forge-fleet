@@ -283,14 +283,15 @@ impl AgentTool for FleetInventoryTool {
             .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u16)).collect())
             .unwrap_or_else(|| vec![51000, 51001, 11434]);
 
-        let known_nodes = [
-            ("Taylor", "192.168.5.100"),
-            ("Marcus", "192.168.5.102"),
-            ("Sophie", "192.168.5.103"),
-            ("Priya", "192.168.5.104"),
-            ("Ace", "192.168.5.105"),
-            ("James", "192.168.5.108"),
-        ];
+        // Load known fleet nodes from Postgres (no hardcoded node list).
+        let known_nodes: Vec<(String, String)> = match crate::fleet_info::fetch_nodes().await {
+            Ok(rows) => rows.into_iter().map(|r| (r.name, r.ip)).collect(),
+            Err(e) => return AgentToolResult::err(format!("Failed to load fleet from database: {e}")),
+        };
+
+        if known_nodes.is_empty() {
+            return AgentToolResult::ok("No fleet nodes registered in the database.".to_string());
+        }
 
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(3))

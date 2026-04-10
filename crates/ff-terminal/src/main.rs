@@ -187,7 +187,12 @@ async fn run_tui(config: AgentSessionConfig) -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(config.clone());
+    let mut app = App::new(config.clone()).await;
+
+    // Warm the ff-agent fleet-info cache so system prompts include the live
+    // fleet description on first session creation.
+    let _ = ff_agent::fleet_info::ensure_fleet_description_cached().await;
+    let _ = ff_agent::fleet_info::ensure_snapshot_cached().await;
     let commands = CommandRegistry::new();
     let mut command_list: Vec<(&str, &str)> = commands.list();
     // Add built-in TUI commands

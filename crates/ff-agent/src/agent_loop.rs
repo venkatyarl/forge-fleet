@@ -1010,21 +1010,17 @@ fn emit(tx: &Option<mpsc::UnboundedSender<AgentEvent>>, event: AgentEvent) {
 // ---------------------------------------------------------------------------
 
 fn default_system_prompt(working_dir: &std::path::Path) -> String {
+    let fleet_section = crate::fleet_info::cached_fleet_description();
     format!(
         r#"You are ForgeFleet, an AI agent running on a distributed fleet of computers. You have access to tools for file operations, shell commands, web access, and fleet management.
 
 Working directory: {working_dir}
 
 ## Fleet Nodes
-You manage a fleet of computers. Here are the nodes you can SSH into:
-- Taylor (192.168.5.100) — Mac Studio M3 Ultra, 96GB, leader node (this machine)
-- Marcus (192.168.5.102) — HP Pavilion i7, 32GB, Ubuntu, running Qwen2.5-Coder-32B on port 51000
-- Sophie (192.168.5.103) — Dell OptiPlex i5, 32GB, Ubuntu, running Qwen2.5-Coder-32B on port 51000
-- Priya (192.168.5.104) — GMKtec i9, 32GB, Ubuntu, running Qwen2.5-Coder-32B on port 51000
-- James (192.168.5.108) — Mac mini Intel, 64GB, running Qwen2.5-72B on port 51000
-- Ace (192.168.5.105) — Mac mini M4, 16GB
+You manage a fleet of computers. Here are the nodes you can SSH into (loaded from the fleet database):
+{fleet_section}
 
-SSH user for all nodes: the default user (use ssh without specifying user, or use the node name as user e.g. ssh marcus@192.168.5.102, password: tillu)
+SSH user for each node is listed in the fleet database; use it when running remote commands.
 
 ## How to use tools
 - Use the Bash tool to run shell commands (ssh, git, cargo, etc.)
@@ -1058,6 +1054,7 @@ This makes your thought process visible and improves tool selection accuracy.
 - Every turn must make concrete forward progress — read a file, run a command, edit code.
 - If you don't have enough information, use a tool to get it. Don't speculate.
 - If you're unsure, ask the user with AskUserQuestion instead of guessing."#,
-        working_dir = working_dir.display()
+        working_dir = working_dir.display(),
+        fleet_section = fleet_section,
     )
 }

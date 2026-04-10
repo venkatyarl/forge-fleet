@@ -186,11 +186,19 @@ impl AgentTool for SelfHealTool {
         let action = input.get("action").and_then(Value::as_str).unwrap_or("status");
         let node = input.get("node").and_then(Value::as_str);
 
-        let nodes: Vec<(&str, &str)> = if let Some(n) = node {
-            vec![(n, n)]
+        // Build node list from DB (no hardcoded fleet).
+        let nodes: Vec<(String, String)> = if let Some(n) = node {
+            vec![(n.to_string(), n.to_string())]
         } else {
-            vec![("Taylor", "192.168.5.100"), ("Marcus", "192.168.5.102"), ("Sophie", "192.168.5.103"), ("Priya", "192.168.5.104"), ("James", "192.168.5.108")]
+            match crate::fleet_info::fetch_nodes().await {
+                Ok(rows) => rows.into_iter().map(|r| (r.name, r.ip)).collect(),
+                Err(e) => return AgentToolResult::err(format!("Failed to load fleet from database: {e}")),
+            }
         };
+
+        if nodes.is_empty() {
+            return AgentToolResult::ok("No fleet nodes registered in the database.".to_string());
+        }
 
         let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(3)).build().unwrap_or_default();
         let mut issues = Vec::new();
@@ -263,40 +271,92 @@ impl AgentTool for AutoFleetTool {
                 }
             }
             "report" => {
+                // Build the report dynamically from the Postgres fleet snapshot.
+                let snapshot = match crate::fleet_info::fetch_snapshot().await {
+                    Ok(s) => s,
+                    Err(e) => return AgentToolResult::err(format!("Failed to load fleet from database: {e}")),
+                };
+                if snapshot.nodes.is_empty() {
+                    return AgentToolResult::ok(
+                        "No fleet nodes registered in the database.".to_string(),
+                    );
+                }
+
                 let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(3)).build().unwrap_or_default();
                 let mut report = String::from("AutoFleet Report:\n\n");
-                let nodes = [("Taylor","192.168.5.100",96), ("Marcus","192.168.5.102",32), ("Sophie","192.168.5.103",32), ("Priya","192.168.5.104",32), ("James","192.168.5.108",64)];
-                let mut total_ram = 0;
-                let mut online = 0;
-                for (name, ip, ram) in &nodes {
-                    let status = client.get(format!("http://{ip}:55000/health")).send().await.map(|r| r.status().is_success()).unwrap_or(false);
+                let mut total_ram: i64 = 0;
+                let mut online = 0usize;
+                let node_count = snapshot.nodes.len();
+
+                for node in &snapshot.nodes {
+                    // Pick the first model port for this node if known; otherwise 55000.
+                    let port = snapshot
+                        .models
+                        .iter()
+                        .find(|m| m.node_name == node.name)
+                        .map(|m| m.port as u16)
+                        .unwrap_or(55000);
+                    let status = client
+                        .get(format!("http://{}:{}/health", node.ip, port))
+                        .send()
+                        .await
+                        .map(|r| r.status().is_success())
+                        .unwrap_or(false);
                     let icon = if status { online += 1; "●" } else { "○" };
-                    total_ram += ram;
-                    report.push_str(&format!("  {icon} {name}: {ip} ({ram}GB) — {}\n", if status { "ONLINE" } else { "OFFLINE" }));
+                    total_ram += node.ram_gb as i64;
+                    report.push_str(&format!(
+                        "  {icon} {name}: {ip} ({ram}GB) — {state}\n",
+                        name = node.name,
+                        ip = node.ip,
+                        ram = node.ram_gb,
+                        state = if status { "ONLINE" } else { "OFFLINE" },
+                    ));
                 }
-                report.push_str(&format!("\n  Nodes: {online}/{} online\n  Total RAM: {total_ram}GB\n  Pending: 4× DGX Spark (128GB), 4× EVO-X2 (128GB)\n  Future total: {} nodes, {}GB\n", nodes.len(), nodes.len() + 8, total_ram + 4*128 + 4*128));
+                report.push_str(&format!(
+                    "\n  Nodes: {online}/{node_count} online\n  Total RAM: {total_ram}GB\n",
+                ));
 
                 report.push_str("\n  Recommendations:\n");
-                if online < nodes.len() { report.push_str("    - Some nodes offline — run SelfHeal to diagnose\n"); }
+                if online < node_count {
+                    report.push_str("    - Some nodes offline — run SelfHeal to diagnose\n");
+                }
                 report.push_str("    - Run 'AutoFleet scan' to detect new hardware\n");
                 report.push_str("    - Run 'AutoFleet optimize' to rebalance model placement\n");
 
                 AgentToolResult::ok(report)
             }
             "optimize" => {
-                AgentToolResult::ok("Model Placement Optimization:\n\n\
-  Current:\n\
-    Taylor (96GB): Gemma-4-31B, Qwen3-Coder\n\
-    Marcus (32GB): Qwen2.5-Coder-32B\n\
-    Sophie (32GB): Qwen2.5-Coder-32B\n\
-    Priya (32GB): Qwen2.5-Coder-32B\n\
-    James (64GB): Qwen2.5-72B, Qwen3.5-9B\n\n\
-  Suggestion:\n\
-    - James underutilized (64GB, running 72B uses 45GB)\n\
-    - Could add a 14B model for fast tasks\n\
-    - Marcus/Sophie/Priya are identical — good for parallel agent work\n\
-    - When DGX Sparks arrive: run 405B model across 2 linked Sparks\n\
-    - When EVO-X2s arrive: each gets 70B model (128GB each)\n".to_string())
+                // Build an optimization summary from DB-reported models per node.
+                let snapshot = match crate::fleet_info::fetch_snapshot().await {
+                    Ok(s) => s,
+                    Err(e) => return AgentToolResult::err(format!("Failed to load fleet from database: {e}")),
+                };
+                if snapshot.nodes.is_empty() {
+                    return AgentToolResult::ok(
+                        "No fleet nodes registered in the database.".to_string(),
+                    );
+                }
+                let mut lines = Vec::new();
+                lines.push("Model Placement Optimization:".to_string());
+                lines.push(String::new());
+                lines.push("  Current:".to_string());
+                for node in &snapshot.nodes {
+                    let models: Vec<String> = snapshot
+                        .models
+                        .iter()
+                        .filter(|m| m.node_name == node.name)
+                        .map(|m| m.name.clone())
+                        .collect();
+                    lines.push(format!(
+                        "    {} ({}GB): {}",
+                        node.name,
+                        node.ram_gb,
+                        if models.is_empty() { "no models registered".into() } else { models.join(", ") }
+                    ));
+                }
+                lines.push(String::new());
+                lines.push("  Suggestion: rebalance models so that each node is used up to ~70% of its RAM; colocate fast small models with latency-sensitive workloads.".to_string());
+                AgentToolResult::ok(lines.join("\n"))
             }
             "rebalance" => {
                 AgentToolResult::ok("Rebalance: would move work from busy nodes to idle nodes. Currently all nodes have similar load. No rebalancing needed.".to_string())

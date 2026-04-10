@@ -11,6 +11,7 @@ pub mod commands_extended;
 pub mod compaction;
 pub mod consensus;
 pub mod features;
+pub mod fleet_info;
 pub mod focus_stack;
 pub mod file_history;
 pub mod fleet_inference;

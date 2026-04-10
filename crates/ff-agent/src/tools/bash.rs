@@ -60,7 +60,7 @@ impl AgentTool for BashTool {
         }
 
         // Intercept bare SSH commands to fleet nodes and make them non-interactive
-        let command = rewrite_fleet_ssh(command);
+        let command = rewrite_fleet_ssh(command).await;
         let command = command.as_str();
 
         // Block interactive commands that would hang forever
@@ -154,22 +154,15 @@ async fn run_shell(script: &str) -> anyhow::Result<(i32, String, String)> {
     Ok((exit_code, stdout, stderr))
 }
 
-/// Fleet node name → IP mapping.
-fn fleet_node_ip(name: &str) -> Option<(&'static str, &'static str)> {
-    match name.to_ascii_lowercase().as_str() {
-        "taylor" => Some(("192.168.5.100", "venkat")),
-        "marcus" => Some(("192.168.5.102", "marcus")),
-        "sophie" => Some(("192.168.5.103", "sophie")),
-        "priya" => Some(("192.168.5.104", "priya")),
-        "james" => Some(("192.168.5.108", "james")),
-        "ace" => Some(("192.168.5.105", "ace")),
-        _ => None,
-    }
+/// Fleet node name → (ip, ssh_user) lookup via Postgres.
+async fn fleet_node_ip(name: &str) -> Option<(String, String)> {
+    crate::fleet_info::fetch_node_ip_user(name).await
 }
 
 /// Rewrite bare SSH commands to fleet nodes into non-interactive commands.
-/// "ssh sophie" → "ssh -o ConnectTimeout=10 sophie@192.168.5.103 'hostname && uptime && free -h && df -h / && ps aux --sort=-%cpu | head -5'"
-fn rewrite_fleet_ssh(command: &str) -> String {
+/// e.g. "ssh <node>" → "ssh -o ConnectTimeout=10 <user>@<ip> 'hostname && uptime && ...'"
+/// where `<ip>` and `<user>` are resolved from Postgres via `fleet_node_ip`.
+async fn rewrite_fleet_ssh(command: &str) -> String {
     let trimmed = command.trim();
 
     // Match "ssh <nodename>" with no additional command
@@ -179,7 +172,7 @@ fn rewrite_fleet_ssh(command: &str) -> String {
             let target = parts[1];
             // Check if target is a fleet node name (no @ sign, no IP)
             if !target.contains('@') && !target.contains('.') {
-                if let Some((ip, user)) = fleet_node_ip(target) {
+                if let Some((ip, user)) = fleet_node_ip(target).await {
                     return format!(
                         "ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no {user}@{ip} 'echo \"=== {target} ({ip}) ===\"  && hostname && echo \"---\" && uptime && echo \"---\" && uname -sr && echo \"---\" && free -h 2>/dev/null || sysctl -n hw.memsize 2>/dev/null && echo \"---\" && df -h / && echo \"---\" && echo \"Running processes:\" && ps aux --sort=-%cpu 2>/dev/null | head -6 || ps aux | head -6'"
                     );
@@ -191,7 +184,7 @@ fn rewrite_fleet_ssh(command: &str) -> String {
     // Match "ssh into <nodename>" pattern
     if trimmed.starts_with("ssh into ") || trimmed.starts_with("ssh to ") {
         let node_name = trimmed.split_whitespace().last().unwrap_or("");
-        if let Some((ip, user)) = fleet_node_ip(node_name) {
+        if let Some((ip, user)) = fleet_node_ip(node_name).await {
             return format!(
                 "ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no {user}@{ip} 'echo \"=== {node_name} ({ip}) ===\" && hostname && uptime && uname -sr'"
             );

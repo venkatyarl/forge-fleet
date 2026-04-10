@@ -38,7 +38,7 @@ impl AgentTool for OrchestrateTool {
 
         // If specific node requested, route there
         if let Some(target) = input.get("target_node").and_then(Value::as_str) {
-            let fleet = orchestrator_agent::fleet_capabilities();
+            let fleet = orchestrator_agent::fleet_capabilities().await;
             if let Some(node) = fleet.iter().find(|n| n.name == target || n.ip == target) {
                 let config = crate::agent_loop::AgentSessionConfig {
                     model: node.model_name.clone(),

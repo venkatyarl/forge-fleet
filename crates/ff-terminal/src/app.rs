@@ -139,7 +139,7 @@ pub struct SessionInfo {
 }
 
 impl App {
-    pub fn new(config: AgentSessionConfig) -> Self {
+    pub async fn new(config: AgentSessionConfig) -> Self {
         let working_dir = config.working_dir.clone();
         let current_project = detect_project(&working_dir);
 
@@ -152,7 +152,7 @@ impl App {
             active_tab: 0,
             frame: 0,
             should_quit: false,
-            fleet_nodes: default_fleet_nodes(),
+            fleet_nodes: fleet_nodes_from_db().await,
             current_project,
             working_dir,
             brain_status: None,
@@ -287,43 +287,53 @@ fn detect_project(dir: &std::path::Path) -> Option<ProjectInfo> {
     None
 }
 
-fn default_fleet_nodes() -> Vec<FleetNode> {
-    vec![
-        FleetNode {
-            name: "Taylor".into(), ip: "192.168.5.100".into(), daemon_online: false,
-            models: vec![
-                NodeModel { name: "Gemma-4-31B".into(), port: 51000, online: false, context_window: 262_144, tokens_used: 0 },
-                NodeModel { name: "Qwen3-Coder".into(), port: 51001, online: false, context_window: 32_768, tokens_used: 0 },
-            ],
-        },
-        FleetNode {
-            name: "Marcus".into(), ip: "192.168.5.102".into(), daemon_online: false,
-            models: vec![
-                NodeModel { name: "Qwen2.5-Coder-32B".into(), port: 51000, online: false, context_window: 32_768, tokens_used: 0 },
-            ],
-        },
-        FleetNode {
-            name: "Sophie".into(), ip: "192.168.5.103".into(), daemon_online: false,
-            models: vec![
-                NodeModel { name: "Qwen2.5-Coder-32B".into(), port: 51000, online: false, context_window: 32_768, tokens_used: 0 },
-            ],
-        },
-        FleetNode {
-            name: "Priya".into(), ip: "192.168.5.104".into(), daemon_online: false,
-            models: vec![
-                NodeModel { name: "Qwen2.5-Coder-32B".into(), port: 51000, online: false, context_window: 32_768, tokens_used: 0 },
-            ],
-        },
-        FleetNode {
-            name: "James".into(), ip: "192.168.5.108".into(), daemon_online: false,
-            models: vec![
-                NodeModel { name: "Qwen2.5-72B".into(), port: 51000, online: false, context_window: 32_768, tokens_used: 0 },
-                NodeModel { name: "Qwen3.5-9B".into(), port: 51001, online: false, context_window: 32_768, tokens_used: 0 },
-            ],
-        },
-        FleetNode {
-            name: "Ace".into(), ip: "192.168.5.105".into(), daemon_online: false,
-            models: vec![],
-        },
-    ]
+/// Load the fleet topology from Postgres. Returns an empty vec if the
+/// database is unreachable — the TUI health-check loop will populate it later.
+async fn fleet_nodes_from_db() -> Vec<FleetNode> {
+    // Read fleet.toml to get the database URL.
+    let Some(home) = dirs::home_dir() else { return Vec::new(); };
+    let config_path = home.join(".forgefleet/fleet.toml");
+    let Ok(toml_str) = std::fs::read_to_string(&config_path) else { return Vec::new(); };
+    let Ok(config) = toml::from_str::<ff_core::config::FleetConfig>(&toml_str) else { return Vec::new(); };
+    let db_url = config.database.url.trim().to_string();
+    if db_url.is_empty() { return Vec::new(); }
+
+    let pool = match sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(std::time::Duration::from_secs(3))
+        .connect(&db_url)
+        .await
+    {
+        Ok(p) => p,
+        Err(_) => return Vec::new(),
+    };
+
+    let nodes = match ff_db::pg_list_nodes(&pool).await {
+        Ok(n) => n,
+        Err(_) => return Vec::new(),
+    };
+    let models = ff_db::pg_list_models(&pool).await.unwrap_or_default();
+
+    nodes
+        .into_iter()
+        .map(|n| {
+            let node_models: Vec<NodeModel> = models
+                .iter()
+                .filter(|m| m.node_name == n.name)
+                .map(|m| NodeModel {
+                    name: m.name.clone(),
+                    port: m.port as u16,
+                    online: false,
+                    context_window: 32_768,
+                    tokens_used: 0,
+                })
+                .collect();
+            FleetNode {
+                name: n.name,
+                ip: n.ip,
+                daemon_online: false,
+                models: node_models,
+            }
+        })
+        .collect()
 }

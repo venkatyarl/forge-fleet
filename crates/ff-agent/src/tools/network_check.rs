@@ -58,22 +58,43 @@ impl AgentTool for NetworkCheckTool {
                 }
             }
             "fleet" => {
-                let nodes = [
-                    ("Taylor", "192.168.5.100", 51000),
-                    ("Marcus", "192.168.5.102", 51000),
-                    ("Sophie", "192.168.5.103", 51000),
-                    ("Priya", "192.168.5.104", 51000),
-                    ("James", "192.168.5.108", 51000),
-                ];
+                // Load fleet topology from Postgres (no hardcoded node list).
+                let snapshot = match crate::fleet_info::fetch_snapshot().await {
+                    Ok(s) => s,
+                    Err(e) => return AgentToolResult::err(format!("Failed to load fleet from database: {e}")),
+                };
+                if snapshot.nodes.is_empty() {
+                    return AgentToolResult::ok(
+                        "No fleet nodes registered in the database.".to_string(),
+                    );
+                }
+
                 let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(3)).build().unwrap_or_default();
                 let mut results = Vec::new();
-                for (name, ip, port) in &nodes {
-                    let url = format!("http://{ip}:{port}/health");
-                    let status = match client.get(&url).send().await {
-                        Ok(r) if r.status().is_success() => "ONLINE",
-                        _ => "OFFLINE",
+                for node in &snapshot.nodes {
+                    // Prefer a model-specific port if one exists; otherwise default to 51000.
+                    let node_models: Vec<&ff_db::FleetModelRow> = snapshot
+                        .models
+                        .iter()
+                        .filter(|m| m.node_name == node.name)
+                        .collect();
+                    let ports: Vec<u16> = if node_models.is_empty() {
+                        vec![51000]
+                    } else {
+                        node_models.iter().map(|m| m.port as u16).collect()
                     };
-                    results.push(format!("{name:<10} {ip}:{port:<5} {status}"));
+                    for port in ports {
+                        let url = format!("http://{}:{}/health", node.ip, port);
+                        let status = match client.get(&url).send().await {
+                            Ok(r) if r.status().is_success() => "ONLINE",
+                            _ => "OFFLINE",
+                        };
+                        results.push(format!(
+                            "{name:<10} {ip}:{port:<5} {status}",
+                            name = node.name,
+                            ip = node.ip,
+                        ));
+                    }
                 }
                 AgentToolResult::ok(results.join("\n"))
             }

@@ -2,7 +2,7 @@
 //! and routes them to the best fleet node for execution.
 //!
 //! Architecture:
-//! - Orchestrator runs on Taylor (leader, best model)
+//! - Orchestrator runs on the fleet leader (the node with the lowest election_priority)
 //! - Analyzes user intent → decides what needs to happen
 //! - Routes work to specialist worker nodes
 //! - Collects results → synthesizes response
@@ -45,52 +45,146 @@ pub enum Strength {
     General,
 }
 
-/// Get the fleet's capabilities.
-pub fn fleet_capabilities() -> Vec<NodeCapability> {
-    vec![
-        NodeCapability {
-            name: "taylor-gemma".into(), ip: "192.168.5.100".into(), user: "venkat".into(),
-            llm_port: 51000, model_name: "Gemma-4-31B".into(), model_params: 31_000_000_000,
-            strengths: vec![Strength::General, Strength::Reasoning, Strength::LargeContext],
-            available: true,
-        },
-        NodeCapability {
-            name: "taylor-qwen3".into(), ip: "192.168.5.100".into(), user: "venkat".into(),
-            llm_port: 51001, model_name: "Qwen3-Coder-Next".into(), model_params: 32_000_000_000,
-            strengths: vec![Strength::Coding, Strength::FastResponse],
-            available: true,
-        },
-        NodeCapability {
-            name: "marcus".into(), ip: "192.168.5.102".into(), user: "marcus".into(),
-            llm_port: 51000, model_name: "Qwen2.5-Coder-32B".into(), model_params: 32_000_000_000,
-            strengths: vec![Strength::Coding, Strength::Review],
-            available: true,
-        },
-        NodeCapability {
-            name: "sophie".into(), ip: "192.168.5.103".into(), user: "sophie".into(),
-            llm_port: 51000, model_name: "Qwen2.5-Coder-32B".into(), model_params: 32_000_000_000,
-            strengths: vec![Strength::Coding, Strength::Review],
-            available: true,
-        },
-        NodeCapability {
-            name: "priya".into(), ip: "192.168.5.104".into(), user: "priya".into(),
-            llm_port: 51000, model_name: "Qwen2.5-Coder-32B".into(), model_params: 32_000_000_000,
-            strengths: vec![Strength::Coding, Strength::Review],
-            available: true,
-        },
-        NodeCapability {
-            name: "james-72b".into(), ip: "192.168.5.108".into(), user: "james".into(),
-            llm_port: 51000, model_name: "Qwen2.5-72B".into(), model_params: 72_000_000_000,
-            strengths: vec![Strength::Reasoning, Strength::General, Strength::Review],
-            available: true,
-        },
-        NodeCapability {
-            name: "james-9b".into(), ip: "192.168.5.108".into(), user: "james".into(),
-            llm_port: 51001, model_name: "Qwen3.5-9B".into(), model_params: 9_000_000_000,
-            strengths: vec![Strength::FastResponse],
-            available: true,
-        },
-    ]
+/// Get the fleet's capabilities from the Postgres `fleet_nodes` + `fleet_models` tables.
+///
+/// Each (node, model) pair becomes one `NodeCapability`. Strengths are inferred
+/// from the model's family, size, and preferred workloads so that `select_nodes`
+/// can still route tasks without any hardcoded fleet identities.
+pub async fn fleet_capabilities() -> Vec<NodeCapability> {
+    let snapshot = match crate::fleet_info::fetch_snapshot().await {
+        Ok(s) => s,
+        Err(err) => {
+            warn!(error = %err, "fleet_capabilities: failed to query Postgres");
+            return Vec::new();
+        }
+    };
+
+    let mut out = Vec::new();
+    for node in &snapshot.nodes {
+        let node_models: Vec<&ff_db::FleetModelRow> = snapshot
+            .models
+            .iter()
+            .filter(|m| m.node_name == node.name)
+            .collect();
+
+        if node_models.is_empty() {
+            // Node with no registered model — still expose a generic capability
+            // at the conventional port 51000 so ops tooling can target it.
+            out.push(NodeCapability {
+                name: node.name.clone(),
+                ip: node.ip.clone(),
+                user: node.ssh_user.clone(),
+                llm_port: 51000,
+                model_name: "unknown".into(),
+                model_params: 0,
+                strengths: vec![Strength::General],
+                available: node.status.eq_ignore_ascii_case("online"),
+            });
+            continue;
+        }
+
+        let model_count = node_models.len();
+        for m in &node_models {
+            let cap_name = if model_count > 1 {
+                format!("{}-{}", node.name, m.slug)
+            } else {
+                node.name.clone()
+            };
+            let strengths = infer_strengths(m);
+            let params = infer_params_from_name(&m.name);
+            out.push(NodeCapability {
+                name: cap_name,
+                ip: node.ip.clone(),
+                user: node.ssh_user.clone(),
+                llm_port: m.port as u16,
+                model_name: m.name.clone(),
+                model_params: params,
+                strengths,
+                available: node.status.eq_ignore_ascii_case("online"),
+            });
+        }
+    }
+    out
+}
+
+/// Infer a model's strengths from its family, size, and preferred workloads.
+fn infer_strengths(model: &ff_db::FleetModelRow) -> Vec<Strength> {
+    let mut set: Vec<Strength> = Vec::new();
+    let family = model.family.to_ascii_lowercase();
+    let name = model.name.to_ascii_lowercase();
+    let params = infer_params_from_name(&model.name);
+
+    // Preferred workloads from the DB take precedence.
+    if let Some(arr) = model.preferred_workloads.as_array() {
+        for v in arr {
+            if let Some(s) = v.as_str() {
+                match s.to_ascii_lowercase().as_str() {
+                    "code" | "coding" => set.push(Strength::Coding),
+                    "reasoning" | "reason" => set.push(Strength::Reasoning),
+                    "review" => set.push(Strength::Review),
+                    "fast" | "fast_response" => set.push(Strength::FastResponse),
+                    "large_context" | "long_context" => set.push(Strength::LargeContext),
+                    "research" => set.push(Strength::Research),
+                    "general" => set.push(Strength::General),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // Family-based defaults.
+    if set.is_empty() {
+        if family.contains("coder") || name.contains("coder") {
+            set.push(Strength::Coding);
+            set.push(Strength::Review);
+        } else if family.contains("gemma") || family.contains("llama") {
+            set.push(Strength::General);
+            set.push(Strength::Reasoning);
+        } else if family.contains("qwen") {
+            set.push(Strength::General);
+            set.push(Strength::Reasoning);
+        } else {
+            set.push(Strength::General);
+        }
+    }
+
+    // Size-based defaults.
+    if params >= 65_000_000_000 {
+        if !set.contains(&Strength::Reasoning) {
+            set.push(Strength::Reasoning);
+        }
+        if !set.contains(&Strength::LargeContext) {
+            set.push(Strength::LargeContext);
+        }
+    } else if params > 0 && params <= 10_000_000_000 && !set.contains(&Strength::FastResponse) {
+        set.push(Strength::FastResponse);
+    }
+
+    set
+}
+
+/// Parse a model's parameter count from its name (e.g. "Qwen2.5-72B" → 72e9).
+fn infer_params_from_name(name: &str) -> u64 {
+    let lower = name.to_ascii_lowercase();
+    // Look for patterns like "7b", "32b", "405b".
+    let bytes = lower.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_digit() {
+            let start = i;
+            while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
+                i += 1;
+            }
+            if i < bytes.len() && bytes[i] == b'b' {
+                if let Ok(n) = lower[start..i].parse::<f64>() {
+                    return (n * 1_000_000_000.0) as u64;
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+    0
 }
 
 // ---------------------------------------------------------------------------
@@ -258,12 +352,12 @@ fn has_any(words: &[&str], needles: &[&str]) -> bool {
 }
 
 /// Select the best node(s) for a task type.
-pub fn select_nodes(task_type: TaskType) -> Vec<NodeCapability> {
-    let fleet = fleet_capabilities();
+pub async fn select_nodes(task_type: TaskType) -> Vec<NodeCapability> {
+    let fleet = fleet_capabilities().await;
 
     match task_type {
         TaskType::SimpleQuestion | TaskType::Documentation => {
-            // Fastest model — James 9B or Taylor Qwen3
+            // Fastest model available
             fleet.into_iter()
                 .filter(|n| n.strengths.contains(&Strength::FastResponse))
                 .take(1)
@@ -285,8 +379,24 @@ pub fn select_nodes(task_type: TaskType) -> Vec<NodeCapability> {
             nodes.into_iter().take(1).collect()
         }
         TaskType::FleetOp => {
-            // Taylor (leader) handles fleet ops
-            fleet.into_iter().filter(|n| n.name.starts_with("taylor")).take(1).collect()
+            // Leader node (highest election priority) handles fleet ops.
+            // Pull the DB snapshot to find which node name is the leader, then
+            // return the matching capability.
+            let leader_name = crate::fleet_info::fetch_nodes()
+                .await
+                .ok()
+                .and_then(|mut rows| {
+                    rows.sort_by_key(|r| r.election_priority);
+                    rows.into_iter().next().map(|r| r.name)
+                });
+            if let Some(lname) = leader_name {
+                fleet.into_iter()
+                    .filter(|n| n.name == lname || n.name.starts_with(&format!("{lname}-")))
+                    .take(1)
+                    .collect()
+            } else {
+                fleet.into_iter().take(1).collect()
+            }
         }
         TaskType::Research | TaskType::Architecture => {
             // Best reasoning model
@@ -350,7 +460,7 @@ pub async fn orchestrate(
 ) -> OrchestratedResult {
     let start = std::time::Instant::now();
     let task_type = analyze_task(prompt);
-    let nodes = select_nodes(task_type);
+    let nodes = select_nodes(task_type).await;
 
     info!(
         task_type = ?task_type,
