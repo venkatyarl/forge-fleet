@@ -15,8 +15,10 @@ ff-ssh = { path = "../ff-ssh" }
 ff-runtime = { path = "../ff-runtime" }
 ff-orchestrator = { path = "../ff-orchestrator" }
 ff-pipeline = { path = "../ff-pipeline" }
+ff-pulse = { path = "../ff-pulse" }
 
 tokio = { workspace = true, features = ["io-std"] }
+sqlx = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true

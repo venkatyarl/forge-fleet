@@ -281,6 +281,62 @@ CREATE INDEX IF NOT EXISTS idx_fleet_enrollment_events_node
     ON fleet_enrollment_events(node_id, created_at DESC);
 "#;
 
+/// Postgres-only schema: fleet config tables (nodes, models, settings).
+///
+/// Applied as Postgres migration version 7.
+/// These tables replace fleet.toml as single source of truth for fleet config.
+pub const SCHEMA_V7_FLEET_POSTGRES: &str = r#"
+-- ─── Fleet Nodes ──────────────────────────────────────────────────────────
+-- Replaces [nodes.*] sections in fleet.toml.
+CREATE TABLE IF NOT EXISTS fleet_nodes (
+    name            TEXT PRIMARY KEY,
+    ip              TEXT NOT NULL,
+    ssh_user        TEXT NOT NULL DEFAULT 'root',
+    ram_gb          INTEGER NOT NULL DEFAULT 0,
+    cpu_cores       INTEGER NOT NULL DEFAULT 0,
+    os              TEXT NOT NULL DEFAULT '',
+    role            TEXT NOT NULL DEFAULT 'worker',
+    election_priority INTEGER NOT NULL DEFAULT 50,
+    hardware        TEXT NOT NULL DEFAULT '',
+    alt_ips         JSONB NOT NULL DEFAULT '[]',
+    capabilities    JSONB NOT NULL DEFAULT '{}',
+    preferences     JSONB NOT NULL DEFAULT '{}',
+    resources       JSONB NOT NULL DEFAULT '{}',
+    status          TEXT NOT NULL DEFAULT 'online',
+    registered_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- ─── Fleet Models ─────────────────────────────────────────────────────────
+-- Replaces [nodes.*.models.*] sections in fleet.toml.
+CREATE TABLE IF NOT EXISTS fleet_models (
+    id              TEXT PRIMARY KEY,
+    node_name       TEXT NOT NULL REFERENCES fleet_nodes(name),
+    slug            TEXT NOT NULL,
+    name            TEXT NOT NULL,
+    family          TEXT NOT NULL DEFAULT '',
+    port            INTEGER NOT NULL,
+    tier            INTEGER NOT NULL DEFAULT 2,
+    local_model     BOOLEAN NOT NULL DEFAULT true,
+    lifecycle       TEXT NOT NULL DEFAULT 'production',
+    mode            TEXT NOT NULL DEFAULT 'always_on',
+    preferred_workloads JSONB NOT NULL DEFAULT '[]',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(node_name, slug)
+);
+
+CREATE INDEX IF NOT EXISTS idx_fleet_models_node ON fleet_models(node_name);
+
+-- ─── Fleet Settings ───────────────────────────────────────────────────────
+-- Replaces [general], [scheduling], [ports], [llm], [enrollment], etc.
+CREATE TABLE IF NOT EXISTS fleet_settings (
+    key             TEXT PRIMARY KEY,
+    value           JSONB NOT NULL,
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+"#;
+
 pub const TABLES: &[&str] = &[
     "nodes",
     "models",

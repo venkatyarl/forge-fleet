@@ -117,6 +117,18 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         &runtime_registry,
     );
 
+    // ─── Postgres fleet config seed (fleet.toml → Postgres) ───────────────
+    if config.database.mode != DatabaseMode::EmbeddedSqlite {
+        if let Some(pg_pool) = operational_store.pg_pool() {
+            ff_db::run_postgres_migrations(pg_pool)
+                .await
+                .context("postgres fleet-config migrations failed")?;
+            ff_db::seed_from_fleet_toml(pg_pool, &config)
+                .await
+                .context("failed to seed postgres from fleet.toml")?;
+        }
+    }
+
     // ─── Config hot-reload handle ────────────────────────────────────────────
     let (config_handle, config_tx) = ConfigHandle::new(config.clone(), config_path.clone());
     let config_watcher = spawn_watcher(config_handle, config_tx);
@@ -272,6 +284,37 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         ));
     } else {
         info!("subsystem disabled: mcp federation loop");
+    }
+
+    // 12) MCP HTTP server
+    info!("starting subsystem: mcp http server");
+    subsystem_tasks.push(start_mcp_http_subsystem(config.clone()));
+
+    // 13) Fleet Pulse heartbeat (Redis real-time metrics)
+    {
+        let redis_url = config.redis.url.clone();
+        let pulse_node = node_name.clone();
+        let pulse_shutdown = shutdown_rx.clone();
+        if !redis_url.is_empty() {
+            info!("starting subsystem: fleet pulse heartbeat");
+            subsystem_tasks.push(tokio::spawn(async move {
+                match ff_pulse::PulseClient::connect(&redis_url).await {
+                    Ok(client) => {
+                        let publisher = ff_pulse::HeartbeatPublisher::new(
+                            client,
+                            pulse_node,
+                            Duration::from_secs(15),
+                        );
+                        let _ = publisher.start(pulse_shutdown).await;
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "fleet pulse: Redis connection failed, heartbeat disabled");
+                    }
+                }
+            }));
+        } else {
+            info!("subsystem disabled: fleet pulse (no redis.url configured)");
+        }
     }
 
     info!("all subsystems started; waiting for shutdown signal");
@@ -1270,13 +1313,18 @@ fn start_self_heal_subsystem(
                         info!(healthy, managed, "self-heal health sweep complete");
                     }
 
-                    // Fleet-wide health check — check remote nodes via HTTP
-                    let fleet_nodes = vec![
-                        ("taylor", "192.168.5.100"),
-                        ("marcus", "192.168.5.102"),
-                        ("sophie", "192.168.5.103"),
-                        ("priya", "192.168.5.104"),
-                        ("james", "192.168.5.108"),
+                    // Fleet-wide health check — check remote nodes via HTTP on port 55000
+                    // Each node runs its LLM server on port 55000 with node-specific flags.
+                    let fleet_nodes: Vec<(&str, &str, &str)> = vec![
+                        // (name, ip, restart_command)
+                        ("marcus",   "192.168.5.102", "nohup ~/llama.cpp/build-new/bin/llama-server -m ~/models/qwen3-coder-30b-a3b/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf --host 0.0.0.0 --port 55000 --ctx-size 32768 --threads 12 --jinja --no-warmup --parallel 4 > /tmp/llama-server.log 2>&1 &"),
+                        ("sophie",   "192.168.5.103", "nohup ~/llama.cpp/build-new/bin/llama-server -m ~/models/qwen3-coder-30b-a3b/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf --host 0.0.0.0 --port 55000 --ctx-size 32768 --threads 4 --jinja --no-warmup --parallel 1 > /tmp/llama-server.log 2>&1 &"),
+                        ("priya",    "192.168.5.104", "nohup ~/llama.cpp/build-new/bin/llama-server -m ~/models/qwen3-coder-30b-a3b/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf --host 0.0.0.0 --port 55000 --ctx-size 32768 --threads 8 --jinja --no-warmup --parallel 2 > /tmp/llama-server.log 2>&1 &"),
+                        ("james",    "192.168.5.108", "nohup ~/llama.cpp/build/bin/llama-server -m ~/models/qwen3.5-35b-a3b/Qwen3.5-35B-A3B-Q4_K_M.gguf --host 0.0.0.0 --port 55000 --ctx-size 32768 --threads 8 --jinja --no-warmup --parallel 2 > /tmp/llama-server.log 2>&1 &"),
+                        ("logan",    "192.168.5.111", "nohup ~/llama.cpp/build/bin/llama-server -m ~/models/qwen3.5-35b-a3b/Qwen3.5-35B-A3B-Q4_K_M.gguf --host 0.0.0.0 --port 55000 --ctx-size 32768 --threads 28 --jinja --no-warmup --parallel 4 > /tmp/llama-server.log 2>&1 &"),
+                        ("veronica", "192.168.5.112", "nohup env LD_LIBRARY_PATH=~/llama.cpp/build/bin ~/llama.cpp/build/bin/llama-server -m ~/models/qwen3.5-35b-a3b/Qwen3.5-35B-A3B-Q4_K_M.gguf --host 0.0.0.0 --port 55000 --ctx-size 32768 --threads 28 --jinja --no-warmup --parallel 4 > /tmp/llama-server.log 2>&1 &"),
+                        ("lily",     "192.168.5.113", "nohup env LD_LIBRARY_PATH=~/llama.cpp/build/bin ~/llama.cpp/build/bin/llama-server -m ~/models/qwen3.5-35b-a3b/Qwen3.5-35B-A3B-Q4_K_M.gguf --host 0.0.0.0 --port 55000 --ctx-size 32768 --threads 28 --jinja --no-warmup --parallel 4 > /tmp/llama-server.log 2>&1 &"),
+                        ("duncan",   "192.168.5.114", "nohup env LD_LIBRARY_PATH=~/llama.cpp/build/bin ~/llama.cpp/build/bin/llama-server -m ~/models/qwen3.5-35b-a3b/Qwen3.5-35B-A3B-Q4_K_M.gguf --host 0.0.0.0 --port 55000 --ctx-size 32768 --threads 28 --jinja --no-warmup --parallel 4 > /tmp/llama-server.log 2>&1 &"),
                     ];
 
                     let http = reqwest::Client::builder()
@@ -1287,26 +1335,26 @@ fn start_self_heal_subsystem(
                     let mut fleet_healthy = 0u32;
                     let mut fleet_issues = Vec::new();
 
-                    for (name, ip) in &fleet_nodes {
-                        let url = format!("http://{}:51000/health", ip);
+                    for (name, ip, restart_cmd) in &fleet_nodes {
+                        let url = format!("http://{}:55000/health", ip);
                         match http.get(&url).send().await {
                             Ok(r) if r.status().is_success() => { fleet_healthy += 1; }
                             _ => {
                                 fleet_issues.push(format!("{name} ({ip})"));
 
-                                // Attempt remote restart via SSH (non-blocking)
+                                // Attempt remote restart via SSH with node-specific command
                                 if loop_cfg.auto_adopt {
                                     let ssh_cmd = format!(
                                         "ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no {}@{} \
-                                         'pgrep -f llama-server || (nohup llama-server -m ~/models/*/*.gguf --host 0.0.0.0 --port 51000 --ctx-size 32768 --jinja -ngl 0 --no-warmup </dev/null &>/tmp/llama.log &)' 2>/dev/null",
-                                        name, ip
+                                         'pgrep -f llama-server || ({})' 2>/dev/null",
+                                        name, ip, restart_cmd
                                     );
                                     let _ = tokio::process::Command::new("bash")
                                         .arg("-c")
                                         .arg(&ssh_cmd)
                                         .output()
                                         .await;
-                                    info!(node = %name, ip = %ip, "self-heal attempted remote LLM restart");
+                                    info!(node = %name, ip = %ip, "self-heal attempted remote LLM restart on port 55000");
                                 }
                             }
                         }
@@ -1370,6 +1418,25 @@ fn start_mcp_federation_subsystem(
                     }
                 }
             }
+        }
+    })
+}
+
+fn start_mcp_http_subsystem(config: FleetConfig) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let server = ff_mcp::McpServer::new();
+        let transport = ff_mcp::transport::HttpTransport::new(server);
+        let addr = format!(
+            "0.0.0.0:{}",
+            config
+                .mcp
+                .get("forgefleet")
+                .and_then(|m| m.port)
+                .unwrap_or(50001)
+        );
+        info!(addr = %addr, "MCP HTTP server starting");
+        if let Err(e) = transport.run(&addr).await {
+            error!(error = %e, "MCP HTTP server failed");
         }
     })
 }

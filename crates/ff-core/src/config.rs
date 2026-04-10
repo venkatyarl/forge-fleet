@@ -98,6 +98,10 @@ pub struct FleetConfig {
     #[serde(default)]
     pub database: DatabaseConfig,
 
+    /// Redis connection for Fleet Pulse real-time metrics — `[redis]`.
+    #[serde(default)]
+    pub redis: RedisConfig,
+
     /// Pending nodes awaiting bootstrap — `[[bootstrap_targets]]`.
     #[serde(default)]
     pub bootstrap_targets: Vec<BootstrapTarget>,
@@ -130,6 +134,7 @@ impl Default for FleetConfig {
             mcp: HashMap::new(),
             enrollment: EnrollmentConfig::default(),
             database: DatabaseConfig::default(),
+            redis: RedisConfig::default(),
             bootstrap_targets: vec![],
             leader: LeaderConfig::default(),
             models: vec![],
@@ -1106,6 +1111,38 @@ fn default_database_url() -> String {
 }
 fn default_max_connections() -> u32 {
     10
+}
+
+// ── Redis Config (Fleet Pulse) ───────────────────────────────────────────────
+
+/// Redis connection configuration for Fleet Pulse real-time metrics.
+///
+/// Config section: `[redis]` in fleet.toml.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RedisConfig {
+    /// Redis connection URL.
+    #[serde(default = "default_redis_url")]
+    pub url: String,
+
+    /// Key prefix for all Fleet Pulse keys.
+    #[serde(default = "default_redis_prefix")]
+    pub prefix: String,
+}
+
+impl Default for RedisConfig {
+    fn default() -> Self {
+        Self {
+            url: default_redis_url(),
+            prefix: default_redis_prefix(),
+        }
+    }
+}
+
+fn default_redis_url() -> String {
+    "redis://127.0.0.1:6379".into()
+}
+fn default_redis_prefix() -> String {
+    "pulse".into()
 }
 
 // ── Bootstrap Targets ────────────────────────────────────────────────────────

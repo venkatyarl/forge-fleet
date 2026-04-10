@@ -55,6 +55,14 @@ impl OperationalStore {
         }
     }
 
+    /// Get a reference to the Postgres pool, if this store is Postgres-backed.
+    pub fn pg_pool(&self) -> Option<&PgPool> {
+        match self {
+            Self::Sqlite(_) => None,
+            Self::Postgres(pool) => Some(pool.as_ref()),
+        }
+    }
+
     pub async fn health_probe(&self) -> Result<(bool, u64), DbError> {
         match self {
             Self::Sqlite(pool) => {

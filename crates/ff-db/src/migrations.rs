@@ -4,6 +4,7 @@
 //! with version tracking via a `_migrations` meta-table.
 
 use rusqlite::Connection;
+use sqlx::PgPool;
 use tracing::{debug, info, warn};
 
 use crate::error::{DbError, Result};
@@ -157,6 +158,109 @@ pub fn applied_migrations(conn: &Connection) -> Result<Vec<(u32, String, String)
 /// Get the latest migration version available (not yet applied necessarily).
 pub fn latest_available_version() -> u32 {
     MIGRATIONS.last().map(|m| m.version).unwrap_or(0)
+}
+
+// ─── Postgres Migrations ─────────────────────────────────────────────────────
+
+/// A single Postgres migration step.
+struct PgMigration {
+    version: u32,
+    name: &'static str,
+    sql: &'static str,
+}
+
+/// Postgres-only migrations. These run independently from the SQLite migrations
+/// above and use their own version sequence.
+static PG_MIGRATIONS: &[PgMigration] = &[PgMigration {
+    version: 7,
+    name: "fleet_config_tables",
+    sql: schema::SCHEMA_V7_FLEET_POSTGRES,
+}];
+
+/// Ensure the Postgres `_migrations` tracking table exists.
+async fn ensure_pg_migrations_table(pool: &PgPool) -> Result<()> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS _migrations (
+            version     INTEGER PRIMARY KEY,
+            name        TEXT NOT NULL,
+            applied_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Get the current Postgres schema version (0 if no migrations applied).
+async fn pg_current_version(pool: &PgPool) -> Result<u32> {
+    let row: (i64,) = sqlx::query_as("SELECT COALESCE(MAX(version), 0) FROM _migrations")
+        .fetch_one(pool)
+        .await?;
+    Ok(row.0 as u32)
+}
+
+/// Run all pending Postgres migrations.
+///
+/// Idempotent — re-running on an up-to-date database is a no-op.
+pub async fn run_postgres_migrations(pool: &PgPool) -> Result<u32> {
+    ensure_pg_migrations_table(pool).await?;
+    let current = pg_current_version(pool).await?;
+
+    let pending: Vec<&PgMigration> = PG_MIGRATIONS
+        .iter()
+        .filter(|m| m.version > current)
+        .collect();
+
+    if pending.is_empty() {
+        debug!(current_version = current, "postgres database is up to date");
+        return Ok(current);
+    }
+
+    info!(
+        current_version = current,
+        pending = pending.len(),
+        "running {} pending postgres migration(s)",
+        pending.len()
+    );
+
+    for migration in &pending {
+        info!(
+            version = migration.version,
+            name = migration.name,
+            "applying postgres migration"
+        );
+
+        // Run DDL then record the version in a single transaction.
+        let mut tx = pool.begin().await?;
+
+        match sqlx::query(migration.sql).execute(&mut *tx).await {
+            Ok(_) => {
+                sqlx::query("INSERT INTO _migrations (version, name) VALUES ($1, $2)")
+                    .bind(migration.version as i32)
+                    .bind(migration.name)
+                    .execute(&mut *tx)
+                    .await?;
+
+                tx.commit().await?;
+                info!(
+                    version = migration.version,
+                    "postgres migration applied successfully"
+                );
+            }
+            Err(e) => {
+                // Transaction is dropped (rolled back) on error.
+                warn!(version = migration.version, error = %e, "postgres migration failed");
+                return Err(DbError::Migration(format!(
+                    "postgres migration v{} '{}' failed: {e}",
+                    migration.version, migration.name
+                )));
+            }
+        }
+    }
+
+    let final_version = pg_current_version(pool).await?;
+    info!(version = final_version, "all postgres migrations applied");
+    Ok(final_version)
 }
 
 #[cfg(test)]

@@ -23,8 +23,13 @@ pub mod schema;
 pub mod sync;
 
 pub use connection::{DbPool, DbPoolConfig};
-pub use migrations::run_migrations;
+pub use migrations::{run_migrations, run_postgres_migrations};
 pub use operational_store::OperationalStore;
+pub use queries::{
+    FleetModelRow, FleetNodeRow, pg_get_node, pg_get_setting, pg_list_models,
+    pg_list_models_for_node, pg_list_nodes, pg_set_setting, pg_upsert_model, pg_upsert_node,
+    seed_from_fleet_toml,
+};
 pub use runtime_registry::RuntimeRegistryStore;
 pub use sync::{
     BackupScheduler, FollowerSync, LeaderSync, ReplicationBackupHelperAvailability, SyncConfig,

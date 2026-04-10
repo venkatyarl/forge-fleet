@@ -1,0 +1,27 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: forgefleet-postgres
+    ports:
+      - "55432:5432"
+    environment:
+      POSTGRES_USER: forgefleet
+      POSTGRES_PASSWORD: forgefleet
+      POSTGRES_DB: forgefleet
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: forgefleet-redis
+    ports:
+      - "6380:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --save 60 1 --loglevel warning
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:

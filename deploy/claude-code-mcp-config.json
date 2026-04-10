@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "forgefleet": {
+      "command": "curl",
+      "args": ["-sN", "http://192.168.5.100:50001/mcp"],
+      "type": "http",
+      "url": "http://192.168.5.100:50001/mcp"
+    }
+  }
+}

@@ -81,6 +81,10 @@ impl ToolRegistry {
         self.register(Self::project_profile_list());
         self.register(Self::project_profile_delete());
         self.register(Self::project_policy_resolve());
+        self.register(Self::fleet_pulse());
+        self.register(Self::fleet_nodes_db());
+        self.register(Self::fleet_node_detail());
+        self.register(Self::fleet_models_db());
     }
 
     // ── Tool definitions ─────────────────────────────────────────────────
@@ -443,6 +447,69 @@ impl ToolRegistry {
             }),
         }
     }
+
+    fn fleet_pulse() -> ToolDefinition {
+        ToolDefinition {
+            name: "fleet_pulse".to_string(),
+            description: "Get real-time fleet metrics from Redis. Returns FleetSnapshot with per-node CPU/RAM/disk/tokens_per_sec/active_tasks. Optionally filter by node name.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Optional node name to get metrics for a single node"
+                    }
+                },
+                "required": []
+            }),
+        }
+    }
+
+    fn fleet_nodes_db() -> ToolDefinition {
+        ToolDefinition {
+            name: "fleet_nodes_db".to_string(),
+            description: "List all fleet nodes from the Postgres registry (persistent, not just fleet.toml). Returns node details including capabilities, resources, hardware, and status.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            }),
+        }
+    }
+
+    fn fleet_node_detail() -> ToolDefinition {
+        ToolDefinition {
+            name: "fleet_node_detail".to_string(),
+            description: "Get detailed info for a single node: Postgres record (persistent registry) combined with live Redis metrics (CPU/RAM/disk/tokens_per_sec).".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Node name to look up"
+                    }
+                },
+                "required": ["node"]
+            }),
+        }
+    }
+
+    fn fleet_models_db() -> ToolDefinition {
+        ToolDefinition {
+            name: "fleet_models_db".to_string(),
+            description: "List all models from the Postgres registry with their node assignments, tiers, families, ports, and preferred workloads.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Optional node name to filter models for a specific node"
+                    }
+                },
+                "required": []
+            }),
+        }
+    }
 }
 
 impl Default for ToolRegistry {
@@ -475,6 +542,10 @@ mod tests {
             "project_profile_list",
             "project_profile_delete",
             "project_policy_resolve",
+            "fleet_pulse",
+            "fleet_nodes_db",
+            "fleet_node_detail",
+            "fleet_models_db",
         ];
         for name in &expected {
             assert!(registry.contains(name), "missing tool: {name}");

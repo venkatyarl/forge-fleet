@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use ff_api::adaptive_router::AdaptiveRouter;
+use ff_pulse::PulseClient;
 use ff_api::classifier::TaskType;
 use ff_api::quality_tracker::{Outcome, QualityTracker, QualityTrackerConfig};
 use ff_api::registry::{BackendEndpoint, BackendRegistry};
@@ -39,6 +40,7 @@ use ff_runtime::process_manager::ProcessManager;
 use ff_ssh::{RemoteExecutor, SshNodeConfig};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use sqlx::postgres::PgPoolOptions;
 use tracing::{info, warn};
 
 use crate::federation;
@@ -96,6 +98,27 @@ pub async fn fleet_status(params: Option<Value>) -> HandlerResult {
         .map(|r| (r.name.clone(), r.clone()))
         .collect();
 
+    // Best-effort: fetch live metrics from Redis (Fleet Pulse).
+    // If Redis is unavailable, we fall back to scan-only data.
+    let pulse_metrics: HashMap<String, ff_pulse::NodeMetrics> =
+        match PulseClient::connect(&config.redis.url).await {
+            Ok(mut pulse) => match pulse.get_all_metrics().await {
+                Ok(snapshot) => snapshot
+                    .nodes
+                    .into_iter()
+                    .map(|m| (m.node_name.clone(), m))
+                    .collect(),
+                Err(e) => {
+                    warn!("fleet_status: Redis pulse fetch failed (non-fatal): {e}");
+                    HashMap::new()
+                }
+            },
+            Err(e) => {
+                warn!("fleet_status: Redis connection failed (non-fatal): {e}");
+                HashMap::new()
+            }
+        };
+
     let mut nodes_json = Vec::new();
     let mut healthy_nodes = 0usize;
     let mut degraded_nodes = 0usize;
@@ -139,6 +162,8 @@ pub async fn fleet_status(params: Option<Value>) -> HandlerResult {
             }));
         }
 
+        let pulse = pulse_metrics.get(name.as_str());
+
         nodes_json.push(json!({
             "name": name,
             "ip": node_cfg.ip,
@@ -147,7 +172,18 @@ pub async fn fleet_status(params: Option<Value>) -> HandlerResult {
             "latency_ms": maybe_scan.map(|r| r.latency_ms),
             "http_status": maybe_scan.and_then(|r| r.http_status),
             "error": maybe_scan.and_then(|r| r.error.clone()),
-            "models": models
+            "models": models,
+            "pulse": pulse.map(|m| json!({
+                "cpu_percent": m.cpu_percent,
+                "ram_used_gb": m.ram_used_gb,
+                "ram_total_gb": m.ram_total_gb,
+                "disk_used_gb": m.disk_used_gb,
+                "disk_total_gb": m.disk_total_gb,
+                "tokens_per_sec": m.tokens_per_sec,
+                "active_tasks": m.active_tasks,
+                "uptime_secs": m.uptime_secs,
+                "temperature_c": m.temperature_c
+            }))
         }));
     }
 
@@ -160,7 +196,8 @@ pub async fn fleet_status(params: Option<Value>) -> HandlerResult {
             "healthy": healthy_nodes,
             "degraded": degraded_nodes,
             "offline": offline_nodes,
-            "models_loaded": models_loaded
+            "models_loaded": models_loaded,
+            "pulse_online": pulse_metrics.len()
         },
         "scanned_at": Utc::now().to_rfc3339(),
         "scan_results": scan_results
@@ -1465,6 +1502,132 @@ pub async fn project_policy_resolve(params: Option<Value>) -> HandlerResult {
     }))
 }
 
+// ─── Fleet Pulse (Redis real-time metrics) ──────────────────────────────────
+
+pub async fn fleet_pulse(params: Option<Value>) -> HandlerResult {
+    let (config, _) = load_config_auto()?;
+
+    let mut pulse = PulseClient::connect(&config.redis.url)
+        .await
+        .map_err(|e| format!("Redis connection failed: {e}"))?;
+
+    let node_filter = params
+        .as_ref()
+        .and_then(|p| p.get("node"))
+        .and_then(|v| v.as_str());
+
+    if let Some(node) = node_filter {
+        let metrics = pulse
+            .get_metrics(node)
+            .await
+            .map_err(|e| format!("Redis error: {e}"))?;
+        Ok(json!({ "node": node, "metrics": metrics }))
+    } else {
+        let snapshot = pulse
+            .get_all_metrics()
+            .await
+            .map_err(|e| format!("Redis error: {e}"))?;
+        Ok(serde_json::to_value(snapshot).map_err(|e| e.to_string())?)
+    }
+}
+
+// ─── Fleet Nodes DB (Postgres persistent registry) ──────────────────────────
+
+pub async fn fleet_nodes_db(_params: Option<Value>) -> HandlerResult {
+    let (config, _) = load_config_auto()?;
+    let pool = get_pg_pool(&config).await?;
+
+    let nodes = ff_db::pg_list_nodes(&pool)
+        .await
+        .map_err(|e| format!("Postgres query failed: {e}"))?;
+
+    Ok(json!({
+        "count": nodes.len(),
+        "nodes": nodes
+    }))
+}
+
+// ─── Fleet Node Detail (Postgres + Redis combined) ──────────────────────────
+
+pub async fn fleet_node_detail(params: Option<Value>) -> HandlerResult {
+    let node = params
+        .as_ref()
+        .and_then(|p| p.get("node"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "fleet_node_detail requires 'node' parameter".to_string())?;
+
+    let (config, _) = load_config_auto()?;
+    let pool = get_pg_pool(&config).await?;
+
+    let db_node = ff_db::pg_get_node(&pool, node)
+        .await
+        .map_err(|e| format!("Postgres query failed: {e}"))?;
+
+    let db_models = ff_db::pg_list_models_for_node(&pool, node)
+        .await
+        .map_err(|e| format!("Postgres models query failed: {e}"))?;
+
+    // Best-effort Redis metrics
+    let live_metrics = match PulseClient::connect(&config.redis.url).await {
+        Ok(mut pulse) => match pulse.get_metrics(node).await {
+            Ok(metrics) => metrics,
+            Err(e) => {
+                warn!("fleet_node_detail: Redis fetch failed (non-fatal): {e}");
+                None
+            }
+        },
+        Err(e) => {
+            warn!("fleet_node_detail: Redis connection failed (non-fatal): {e}");
+            None
+        }
+    };
+
+    Ok(json!({
+        "node": node,
+        "registry": db_node,
+        "models": db_models,
+        "live_metrics": live_metrics
+    }))
+}
+
+// ─── Fleet Models DB (Postgres model registry) ─────────────────────────────
+
+pub async fn fleet_models_db(params: Option<Value>) -> HandlerResult {
+    let (config, _) = load_config_auto()?;
+    let pool = get_pg_pool(&config).await?;
+
+    let node_filter = params
+        .as_ref()
+        .and_then(|p| p.get("node"))
+        .and_then(|v| v.as_str());
+
+    let models = if let Some(node) = node_filter {
+        ff_db::pg_list_models_for_node(&pool, node)
+            .await
+            .map_err(|e| format!("Postgres query failed: {e}"))?
+    } else {
+        ff_db::pg_list_models(&pool)
+            .await
+            .map_err(|e| format!("Postgres query failed: {e}"))?
+    };
+
+    Ok(json!({
+        "count": models.len(),
+        "node_filter": node_filter,
+        "models": models
+    }))
+}
+
+// ─── Postgres pool helper ───────────────────────────────────────────────────
+
+async fn get_pg_pool(config: &FleetConfig) -> Result<sqlx::PgPool, String> {
+    PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&config.database.url)
+        .await
+        .map_err(|e| format!("Postgres connection failed: {e}"))
+}
+
 // ─── Handler dispatch ────────────────────────────────────────────────────────
 
 /// Dispatch a method call to the appropriate handler.
@@ -1488,6 +1651,10 @@ pub async fn dispatch(method: &str, params: Option<Value>) -> HandlerResult {
         "project_profile_list" => project_profile_list(params).await,
         "project_profile_delete" => project_profile_delete(params).await,
         "project_policy_resolve" => project_policy_resolve(params).await,
+        "fleet_pulse" => fleet_pulse(params).await,
+        "fleet_nodes_db" => fleet_nodes_db(params).await,
+        "fleet_node_detail" => fleet_node_detail(params).await,
+        "fleet_models_db" => fleet_models_db(params).await,
         _ => Err(format!("unknown method: {method}")),
     }
 }

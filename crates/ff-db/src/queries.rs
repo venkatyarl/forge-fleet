@@ -6,6 +6,8 @@
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
+use sqlx::{PgPool, Row};
 
 use crate::error::Result;
 
@@ -1330,6 +1332,375 @@ pub fn config_list(conn: &Connection) -> Result<Vec<(String, String)>> {
     })?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(Into::into)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Postgres fleet config — row types, query helpers, seed function
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// A fleet node row from the Postgres `fleet_nodes` table.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FleetNodeRow {
+    pub name: String,
+    pub ip: String,
+    pub ssh_user: String,
+    pub ram_gb: i32,
+    pub cpu_cores: i32,
+    pub os: String,
+    pub role: String,
+    pub election_priority: i32,
+    pub hardware: String,
+    pub alt_ips: JsonValue,
+    pub capabilities: JsonValue,
+    pub preferences: JsonValue,
+    pub resources: JsonValue,
+    pub status: String,
+}
+
+/// A fleet model row from the Postgres `fleet_models` table.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FleetModelRow {
+    pub id: String,
+    pub node_name: String,
+    pub slug: String,
+    pub name: String,
+    pub family: String,
+    pub port: i32,
+    pub tier: i32,
+    pub local_model: bool,
+    pub lifecycle: String,
+    pub mode: String,
+    pub preferred_workloads: JsonValue,
+}
+
+// ─── Postgres Node Queries ───────────────────────────────────────────────────
+
+/// List all fleet nodes from Postgres.
+pub async fn pg_list_nodes(pool: &PgPool) -> Result<Vec<FleetNodeRow>> {
+    let rows = sqlx::query(
+        "SELECT name, ip, ssh_user, ram_gb, cpu_cores, os, role,
+                election_priority, hardware, alt_ips, capabilities,
+                preferences, resources, status
+         FROM fleet_nodes ORDER BY election_priority, name",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .iter()
+        .map(|r| FleetNodeRow {
+            name: r.get("name"),
+            ip: r.get("ip"),
+            ssh_user: r.get("ssh_user"),
+            ram_gb: r.get("ram_gb"),
+            cpu_cores: r.get("cpu_cores"),
+            os: r.get("os"),
+            role: r.get("role"),
+            election_priority: r.get("election_priority"),
+            hardware: r.get("hardware"),
+            alt_ips: r.get("alt_ips"),
+            capabilities: r.get("capabilities"),
+            preferences: r.get("preferences"),
+            resources: r.get("resources"),
+            status: r.get("status"),
+        })
+        .collect())
+}
+
+/// Get a single fleet node by name from Postgres.
+pub async fn pg_get_node(pool: &PgPool, name: &str) -> Result<Option<FleetNodeRow>> {
+    let row = sqlx::query(
+        "SELECT name, ip, ssh_user, ram_gb, cpu_cores, os, role,
+                election_priority, hardware, alt_ips, capabilities,
+                preferences, resources, status
+         FROM fleet_nodes WHERE name = $1",
+    )
+    .bind(name)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(|r| FleetNodeRow {
+        name: r.get("name"),
+        ip: r.get("ip"),
+        ssh_user: r.get("ssh_user"),
+        ram_gb: r.get("ram_gb"),
+        cpu_cores: r.get("cpu_cores"),
+        os: r.get("os"),
+        role: r.get("role"),
+        election_priority: r.get("election_priority"),
+        hardware: r.get("hardware"),
+        alt_ips: r.get("alt_ips"),
+        capabilities: r.get("capabilities"),
+        preferences: r.get("preferences"),
+        resources: r.get("resources"),
+        status: r.get("status"),
+    }))
+}
+
+/// Upsert a fleet node in Postgres.
+pub async fn pg_upsert_node(pool: &PgPool, node: &FleetNodeRow) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO fleet_nodes (name, ip, ssh_user, ram_gb, cpu_cores, os, role,
+                election_priority, hardware, alt_ips, capabilities, preferences, resources, status, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW())
+         ON CONFLICT (name) DO UPDATE SET
+            ip = EXCLUDED.ip,
+            ssh_user = EXCLUDED.ssh_user,
+            ram_gb = EXCLUDED.ram_gb,
+            cpu_cores = EXCLUDED.cpu_cores,
+            os = EXCLUDED.os,
+            role = EXCLUDED.role,
+            election_priority = EXCLUDED.election_priority,
+            hardware = EXCLUDED.hardware,
+            alt_ips = EXCLUDED.alt_ips,
+            capabilities = EXCLUDED.capabilities,
+            preferences = EXCLUDED.preferences,
+            resources = EXCLUDED.resources,
+            status = EXCLUDED.status,
+            updated_at = NOW()",
+    )
+    .bind(&node.name)
+    .bind(&node.ip)
+    .bind(&node.ssh_user)
+    .bind(node.ram_gb)
+    .bind(node.cpu_cores)
+    .bind(&node.os)
+    .bind(&node.role)
+    .bind(node.election_priority)
+    .bind(&node.hardware)
+    .bind(&node.alt_ips)
+    .bind(&node.capabilities)
+    .bind(&node.preferences)
+    .bind(&node.resources)
+    .bind(&node.status)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+// ─── Postgres Model Queries ──────────────────────────────────────────────────
+
+/// List all fleet models from Postgres.
+pub async fn pg_list_models(pool: &PgPool) -> Result<Vec<FleetModelRow>> {
+    let rows = sqlx::query(
+        "SELECT id, node_name, slug, name, family, port, tier,
+                local_model, lifecycle, mode, preferred_workloads
+         FROM fleet_models ORDER BY node_name, slug",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .iter()
+        .map(|r| FleetModelRow {
+            id: r.get("id"),
+            node_name: r.get("node_name"),
+            slug: r.get("slug"),
+            name: r.get("name"),
+            family: r.get("family"),
+            port: r.get("port"),
+            tier: r.get("tier"),
+            local_model: r.get("local_model"),
+            lifecycle: r.get("lifecycle"),
+            mode: r.get("mode"),
+            preferred_workloads: r.get("preferred_workloads"),
+        })
+        .collect())
+}
+
+/// List fleet models for a specific node from Postgres.
+pub async fn pg_list_models_for_node(pool: &PgPool, node: &str) -> Result<Vec<FleetModelRow>> {
+    let rows = sqlx::query(
+        "SELECT id, node_name, slug, name, family, port, tier,
+                local_model, lifecycle, mode, preferred_workloads
+         FROM fleet_models WHERE node_name = $1 ORDER BY slug",
+    )
+    .bind(node)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .iter()
+        .map(|r| FleetModelRow {
+            id: r.get("id"),
+            node_name: r.get("node_name"),
+            slug: r.get("slug"),
+            name: r.get("name"),
+            family: r.get("family"),
+            port: r.get("port"),
+            tier: r.get("tier"),
+            local_model: r.get("local_model"),
+            lifecycle: r.get("lifecycle"),
+            mode: r.get("mode"),
+            preferred_workloads: r.get("preferred_workloads"),
+        })
+        .collect())
+}
+
+/// Upsert a fleet model in Postgres.
+pub async fn pg_upsert_model(pool: &PgPool, model: &FleetModelRow) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO fleet_models (id, node_name, slug, name, family, port, tier,
+                local_model, lifecycle, mode, preferred_workloads, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
+         ON CONFLICT (id) DO UPDATE SET
+            node_name = EXCLUDED.node_name,
+            slug = EXCLUDED.slug,
+            name = EXCLUDED.name,
+            family = EXCLUDED.family,
+            port = EXCLUDED.port,
+            tier = EXCLUDED.tier,
+            local_model = EXCLUDED.local_model,
+            lifecycle = EXCLUDED.lifecycle,
+            mode = EXCLUDED.mode,
+            preferred_workloads = EXCLUDED.preferred_workloads,
+            updated_at = NOW()",
+    )
+    .bind(&model.id)
+    .bind(&model.node_name)
+    .bind(&model.slug)
+    .bind(&model.name)
+    .bind(&model.family)
+    .bind(model.port)
+    .bind(model.tier)
+    .bind(model.local_model)
+    .bind(&model.lifecycle)
+    .bind(&model.mode)
+    .bind(&model.preferred_workloads)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+// ─── Postgres Settings Queries ───────────────────────────────────────────────
+
+/// Get a fleet setting from Postgres.
+pub async fn pg_get_setting(pool: &PgPool, key: &str) -> Result<Option<JsonValue>> {
+    let row = sqlx::query("SELECT value FROM fleet_settings WHERE key = $1")
+        .bind(key)
+        .fetch_optional(pool)
+        .await?;
+
+    Ok(row.map(|r| r.get("value")))
+}
+
+/// Set a fleet setting in Postgres (upsert).
+pub async fn pg_set_setting(pool: &PgPool, key: &str, value: &JsonValue) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO fleet_settings (key, value, updated_at)
+         VALUES ($1, $2, NOW())
+         ON CONFLICT (key) DO UPDATE SET
+            value = EXCLUDED.value,
+            updated_at = NOW()",
+    )
+    .bind(key)
+    .bind(value)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+// ─── Seed from FleetConfig ───────────────────────────────────────────────────
+
+/// Seed Postgres fleet tables from a parsed `FleetConfig`.
+///
+/// Idempotent — uses ON CONFLICT DO UPDATE so first run populates and
+/// subsequent runs refresh to match fleet.toml.
+pub async fn seed_from_fleet_toml(
+    pool: &PgPool,
+    config: &ff_core::config::FleetConfig,
+) -> Result<()> {
+    use tracing::info;
+
+    let mut node_count = 0u32;
+    let mut model_count = 0u32;
+
+    for (name, node_cfg) in &config.nodes {
+        // Resolve ram/cpu from top-level fields or resources sub-struct.
+        let ram_gb = node_cfg
+            .ram_gb
+            .or_else(|| node_cfg.resources.as_ref().and_then(|r| r.ram_gb))
+            .unwrap_or(0) as i32;
+        let cpu_cores = node_cfg
+            .cpu_cores
+            .or_else(|| node_cfg.resources.as_ref().and_then(|r| r.cpu_cores))
+            .unwrap_or(0) as i32;
+
+        let capabilities_json = node_cfg
+            .capabilities
+            .as_ref()
+            .map(|c| serde_json::to_value(c).unwrap_or_default())
+            .unwrap_or(JsonValue::Object(serde_json::Map::new()));
+
+        let preferences_json = node_cfg
+            .preferences
+            .as_ref()
+            .map(|p| serde_json::to_value(p).unwrap_or_default())
+            .unwrap_or(JsonValue::Object(serde_json::Map::new()));
+
+        let resources_json = node_cfg
+            .resources
+            .as_ref()
+            .map(|r| serde_json::to_value(r).unwrap_or_default())
+            .unwrap_or(JsonValue::Object(serde_json::Map::new()));
+
+        let node_row = FleetNodeRow {
+            name: name.clone(),
+            ip: node_cfg.ip.clone(),
+            ssh_user: node_cfg.ssh_user.clone().unwrap_or_else(|| "root".into()),
+            ram_gb,
+            cpu_cores,
+            os: node_cfg.os.clone().unwrap_or_default(),
+            role: format!("{}", node_cfg.role).to_lowercase(),
+            election_priority: node_cfg.election_priority.unwrap_or(100) as i32,
+            hardware: String::new(),
+            alt_ips: serde_json::to_value(&node_cfg.alt_ips).unwrap_or_default(),
+            capabilities: capabilities_json,
+            preferences: preferences_json,
+            resources: resources_json,
+            status: "online".into(),
+        };
+
+        pg_upsert_node(pool, &node_row).await?;
+        node_count += 1;
+
+        // Insert models for this node.
+        for (slug, model_cfg) in &node_cfg.models {
+            let model_id = format!("{name}:{slug}");
+            let model_row = FleetModelRow {
+                id: model_id,
+                node_name: name.clone(),
+                slug: slug.clone(),
+                name: model_cfg.name.clone(),
+                family: model_cfg.family.clone().unwrap_or_default(),
+                port: model_cfg.port.unwrap_or(0) as i32,
+                tier: model_cfg.tier as i32,
+                local_model: model_cfg.local.unwrap_or(true),
+                lifecycle: model_cfg.lifecycle.clone().unwrap_or_else(|| "production".into()),
+                mode: model_cfg.mode.clone().unwrap_or_else(|| "always_on".into()),
+                preferred_workloads: serde_json::to_value(&model_cfg.preferred_workloads)
+                    .unwrap_or_default(),
+            };
+
+            pg_upsert_model(pool, &model_row).await?;
+            model_count += 1;
+        }
+    }
+
+    // Seed settings from various config sections.
+    pg_set_setting(pool, "scheduling", &serde_json::to_value(&config.scheduling)?).await?;
+    pg_set_setting(pool, "ports", &serde_json::to_value(&config.ports)?).await?;
+    pg_set_setting(pool, "llm", &serde_json::to_value(&config.llm)?).await?;
+    pg_set_setting(pool, "enrollment", &serde_json::to_value(&config.enrollment)?).await?;
+    pg_set_setting(pool, "fleet", &serde_json::to_value(&config.fleet)?).await?;
+
+    info!(
+        nodes = node_count,
+        models = model_count,
+        "seeded postgres fleet tables from fleet.toml"
+    );
+
+    Ok(())
 }
 
 #[cfg(test)]
