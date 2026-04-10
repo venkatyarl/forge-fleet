@@ -16,5 +16,6 @@ tracing.workspace = true
 chrono.workspace = true
 thiserror.workspace = true
 sysinfo = "0.33"
+reqwest = { workspace = true, features = ["json"] }
 futures = { workspace = true }
 tokio-stream = "0.1"

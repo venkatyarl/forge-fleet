@@ -16,7 +16,7 @@ pub struct NodeMetrics {
     pub ram_total_gb: f64,
     pub disk_used_gb: f64,
     pub disk_total_gb: f64,
-    pub loaded_models: Vec<String>,
+    pub loaded_models: Vec<LoadedModel>,
     pub active_tasks: u32,
     pub queue_depth: u32,
     pub tokens_per_sec: f64,
@@ -41,6 +41,14 @@ pub struct PulseEvent {
     pub node_name: String,
     pub timestamp: DateTime<Utc>,
     pub details: serde_json::Value,
+}
+
+/// A model detected as running on a local port.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoadedModel {
+    pub port: u16,
+    pub model_id: String,
+    pub status: String, // "healthy", "loading", "error"
 }
 
 /// Types of events that flow through the pulse:events channel.

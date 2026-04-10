@@ -18,5 +18,5 @@ pub mod subscriber;
 pub use client::PulseClient;
 pub use error::{PulseError, Result};
 pub use heartbeat::HeartbeatPublisher;
-pub use metrics::{FleetSnapshot, NodeMetrics, PulseEvent, PulseEventType};
+pub use metrics::{FleetSnapshot, LoadedModel, NodeMetrics, PulseEvent, PulseEventType};
 pub use subscriber::PulseSubscriber;
