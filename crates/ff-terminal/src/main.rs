@@ -76,7 +76,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let config_path = resolve_config_path(cli.config)?;
     let llm = cli.llm.or_else(|| env::var("FORGEFLEET_LLM_URL").ok())
-        .unwrap_or_else(|| detect_local_llm().unwrap_or_else(|| "http://localhost:55000".into()));
+        .unwrap_or(detect_llm_from_db_or_local(&config_path).await);
     let mut model = cli.model.or_else(|| env::var("FORGEFLEET_MODEL").ok()).unwrap_or_else(|| "auto".into());
 
     // If model is "auto", query the LLM server for its actual model name
@@ -618,33 +618,67 @@ fn detect_dropped_content(input: &str) -> String {
     }
 }
 
-fn detect_local_llm() -> Option<String> {
-    // Check local LLM ports (55000-55001 for models, then legacy/Ollama)
-    let local_ports = [55000, 55001, 11434, 8080];
-    for port in local_ports {
-        if std::net::TcpStream::connect_timeout(
-            &format!("127.0.0.1:{port}").parse().ok()?,
-            Duration::from_millis(100),
-        ).is_ok() { return Some(format!("http://127.0.0.1:{port}")); }
+/// Detect the best LLM endpoint by querying Postgres for fleet nodes + models,
+/// then probing each for a healthy connection. Falls back to localhost:55000.
+async fn detect_llm_from_db_or_local(config_path: &std::path::Path) -> String {
+    // Try to load fleet.toml to get the database URL
+    if let Ok(toml_str) = std::fs::read_to_string(config_path) {
+        if let Ok(config) = toml::from_str::<ff_core::config::FleetConfig>(&toml_str) {
+            let db_url = config.database.url.trim();
+            if !db_url.is_empty() {
+                // Query Postgres for fleet nodes and their model ports
+                if let Ok(pool) = sqlx::postgres::PgPoolOptions::new()
+                    .max_connections(1)
+                    .acquire_timeout(Duration::from_secs(3))
+                    .connect(db_url)
+                    .await
+                {
+                    if let Ok(nodes) = ff_db::pg_list_nodes(&pool).await {
+                        // Also get models to find ports
+                        let models = ff_db::pg_list_models(&pool).await.unwrap_or_default();
+
+                        // Build (ip, port, cores, supports_tools) pairs
+                        // Prefer models that support tool calling (Qwen) over those that don't (Gemma)
+                        let mut endpoints: Vec<(String, u16, i32, bool)> = Vec::new();
+                        for node in &nodes {
+                            let node_models: Vec<_> = models.iter().filter(|m| m.node_name == node.name).collect();
+                            if node_models.is_empty() {
+                                endpoints.push((node.ip.clone(), 55000, node.cpu_cores, true));
+                            } else {
+                                for m in node_models {
+                                    // Qwen models support tool calling, Gemma does not
+                                    let supports_tools = m.family.to_lowercase().contains("qwen");
+                                    endpoints.push((node.ip.clone(), m.port as u16, node.cpu_cores, supports_tools));
+                                }
+                            }
+                        }
+                        // Sort: tool-calling models first, then by cores descending
+                        endpoints.sort_by(|a, b| b.3.cmp(&a.3).then(b.2.cmp(&a.2)));
+
+                        for (ip, port, _, _) in &endpoints {
+                            if let Ok(addr) = format!("{ip}:{port}").parse() {
+                                if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
+                                    tracing::info!(ip = %ip, port, "auto-detected LLM endpoint from database");
+                                    return format!("http://{ip}:{port}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
-    // Try fleet nodes on port 55000 (prefer EVO-X2 nodes for speed, then others)
-    let fleet = [
-        "192.168.5.111", // logan (EVO-X2, 32 threads)
-        "192.168.5.112", // veronica
-        "192.168.5.113", // lily
-        "192.168.5.114", // duncan
-        "192.168.5.108", // james
-        "192.168.5.102", // marcus
-        "192.168.5.103", // sophie
-        "192.168.5.104", // priya
-        "192.168.5.100", // taylor
-    ];
-    for ip in fleet {
-        if std::net::TcpStream::connect_timeout(
-            &format!("{ip}:55000").parse().ok()?, Duration::from_millis(200),
-        ).is_ok() { return Some(format!("http://{ip}:55000")); }
+
+    // Fallback: probe localhost
+    for port in [55000, 55001, 11434] {
+        if let Ok(addr) = format!("127.0.0.1:{port}").parse() {
+            if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_ok() {
+                return format!("http://127.0.0.1:{port}");
+            }
+        }
     }
-    None
+
+    "http://localhost:55000".into()
 }
 
 fn resolve_config_path(p: Option<PathBuf>) -> Result<PathBuf> {
