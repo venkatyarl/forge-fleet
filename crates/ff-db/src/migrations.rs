@@ -193,7 +193,7 @@ async fn ensure_pg_migrations_table(pool: &PgPool) -> Result<()> {
 
 /// Get the current Postgres schema version (0 if no migrations applied).
 async fn pg_current_version(pool: &PgPool) -> Result<u32> {
-    let row: (i64,) = sqlx::query_as("SELECT COALESCE(MAX(version), 0) FROM _migrations")
+    let row: (i32,) = sqlx::query_as("SELECT COALESCE(MAX(version), 0) FROM _migrations")
         .fetch_one(pool)
         .await?;
     Ok(row.0 as u32)
@@ -230,10 +230,10 @@ pub async fn run_postgres_migrations(pool: &PgPool) -> Result<u32> {
             "applying postgres migration"
         );
 
-        // Run DDL then record the version in a single transaction.
+        // Run DDL via raw_sql (supports multi-statement), then record version.
         let mut tx = pool.begin().await?;
 
-        match sqlx::query(migration.sql).execute(&mut *tx).await {
+        match sqlx::raw_sql(migration.sql).execute(&mut *tx).await {
             Ok(_) => {
                 sqlx::query("INSERT INTO _migrations (version, name) VALUES ($1, $2)")
                     .bind(migration.version as i32)
