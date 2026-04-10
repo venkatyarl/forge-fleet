@@ -76,7 +76,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let config_path = resolve_config_path(cli.config)?;
     let llm = cli.llm.or_else(|| env::var("FORGEFLEET_LLM_URL").ok())
-        .unwrap_or_else(|| detect_local_llm().unwrap_or_else(|| "http://localhost:51000".into()));
+        .unwrap_or_else(|| detect_local_llm().unwrap_or_else(|| "http://localhost:55000".into()));
     let mut model = cli.model.or_else(|| env::var("FORGEFLEET_MODEL").ok()).unwrap_or_else(|| "auto".into());
 
     // If model is "auto", query the LLM server for its actual model name
@@ -93,7 +93,7 @@ async fn main() -> Result<()> {
                 if let Ok(body) = resp.json::<serde_json::Value>().await {
                     if let Some(id) = body.get("data")
                         .and_then(|d| d.as_array())
-                        .and_then(|arr| arr.first())
+                        .and_then(|arr| arr.last())
                         .and_then(|m| m.get("id"))
                         .and_then(|id| id.as_str())
                     {
@@ -619,19 +619,30 @@ fn detect_dropped_content(input: &str) -> String {
 }
 
 fn detect_local_llm() -> Option<String> {
-    // Check llama-server first (stable), LoRA model second, then Ollama
-    let ports = [51000, 51001, 51005, 11434, 8080];
-    for port in ports {
+    // Check local LLM ports (55000-55001 for models, then legacy/Ollama)
+    let local_ports = [55000, 55001, 11434, 8080];
+    for port in local_ports {
         if std::net::TcpStream::connect_timeout(
             &format!("127.0.0.1:{port}").parse().ok()?,
             Duration::from_millis(100),
         ).is_ok() { return Some(format!("http://127.0.0.1:{port}")); }
     }
-    let fleet = ["192.168.5.100", "192.168.5.102", "192.168.5.103", "192.168.5.104", "192.168.5.108"];
+    // Try fleet nodes on port 55000 (prefer EVO-X2 nodes for speed, then others)
+    let fleet = [
+        "192.168.5.111", // logan (EVO-X2, 32 threads)
+        "192.168.5.112", // veronica
+        "192.168.5.113", // lily
+        "192.168.5.114", // duncan
+        "192.168.5.108", // james
+        "192.168.5.102", // marcus
+        "192.168.5.103", // sophie
+        "192.168.5.104", // priya
+        "192.168.5.100", // taylor
+    ];
     for ip in fleet {
         if std::net::TcpStream::connect_timeout(
-            &format!("{ip}:51000").parse().ok()?, Duration::from_millis(200),
-        ).is_ok() { return Some(format!("http://{ip}:51000")); }
+            &format!("{ip}:55000").parse().ok()?, Duration::from_millis(200),
+        ).is_ok() { return Some(format!("http://{ip}:55000")); }
     }
     None
 }
