@@ -117,15 +117,26 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         &runtime_registry,
     );
 
-    // ─── Postgres fleet config seed (fleet.toml → Postgres) ───────────────
+    // ─── Postgres fleet config seed (fleet.toml → Postgres, first boot only) ──
     if config.database.mode != DatabaseMode::EmbeddedSqlite {
         if let Some(pg_pool) = operational_store.pg_pool() {
             ff_db::run_postgres_migrations(pg_pool)
                 .await
                 .context("postgres fleet-config migrations failed")?;
-            ff_db::seed_from_fleet_toml(pg_pool, &config)
-                .await
-                .context("failed to seed postgres from fleet.toml")?;
+
+            // Only seed if Postgres fleet_nodes table is empty (first boot)
+            let existing = ff_db::pg_list_nodes(pg_pool).await.unwrap_or_default();
+            if existing.is_empty() {
+                info!("first boot: seeding Postgres from fleet.toml");
+                ff_db::seed_from_fleet_toml(pg_pool, &config)
+                    .await
+                    .context("failed to seed postgres from fleet.toml")?;
+            } else {
+                info!(
+                    nodes = existing.len(),
+                    "Postgres fleet tables already populated, skipping seed"
+                );
+            }
         }
     }
 
@@ -159,9 +170,30 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let mut subsystem_tasks: Vec<JoinHandle<()>> = Vec::new();
 
-    // ─── Pre-seed registry from fleet.toml ───────────────────────────────────
+    // ─── Pre-seed registry from fleet.toml + Postgres ─────────────────────────
     let registry = control_plane.handles.discovery.registry.clone();
     seed_registry_from_config(&config, &registry);
+
+    // If Postgres is available, also seed from DB (more authoritative)
+    if let Some(pg_pool) = operational_store.pg_pool() {
+        if let Ok(db_nodes) = ff_db::pg_list_nodes(pg_pool).await {
+            let default_port = config.fleet.api_port;
+            for node in &db_nodes {
+                if let Ok(ip) = node.ip.parse::<std::net::IpAddr>() {
+                    let port = default_port;
+                    let priority = node.election_priority as u32;
+                    registry.upsert_config_node(&node.name, ip, port, priority);
+                    info!(
+                        node = %node.name,
+                        ip = %node.ip,
+                        port,
+                        priority,
+                        "seeded node from Postgres"
+                    );
+                }
+            }
+        }
+    }
 
     // 1) discovery — fleet node scanning + subnet scanning
     info!("starting subsystem: discovery");
@@ -269,6 +301,7 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         subsystem_tasks.push(start_self_heal_subsystem(
             config.clone(),
             node_name.clone(),
+            operational_store.clone(),
             shutdown_rx.clone(),
         ));
     } else {
@@ -1263,6 +1296,7 @@ fn expected_model_ports_for_node(config: &FleetConfig, node_name: &str) -> Vec<u
 fn start_self_heal_subsystem(
     config: FleetConfig,
     node_name: String,
+    operational_store: OperationalStore,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -1278,6 +1312,18 @@ fn start_self_heal_subsystem(
         if expected_ports.is_empty() {
             info!(node = %node_name, "self-heal loop started with no expected local model ports");
         }
+
+        // Hardcoded restart commands as fallback — matches the old behaviour
+        let fallback_restart_commands: HashMap<String, (String, String)> = [
+            ("marcus",   "192.168.5.102", "nohup ~/llama.cpp/build-new/bin/llama-server -m ~/models/qwen3-coder-30b-a3b/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf --host 0.0.0.0 --port 55000 --ctx-size 32768 --threads 12 --jinja --no-warmup --parallel 4 > /tmp/llama-server.log 2>&1 &"),
+            ("sophie",   "192.168.5.103", "nohup ~/llama.cpp/build-new/bin/llama-server -m ~/models/qwen3-coder-30b-a3b/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf --host 0.0.0.0 --port 55000 --ctx-size 32768 --threads 4 --jinja --no-warmup --parallel 1 > /tmp/llama-server.log 2>&1 &"),
+            ("priya",    "192.168.5.104", "nohup ~/llama.cpp/build-new/bin/llama-server -m ~/models/qwen3-coder-30b-a3b/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf --host 0.0.0.0 --port 55000 --ctx-size 32768 --threads 8 --jinja --no-warmup --parallel 2 > /tmp/llama-server.log 2>&1 &"),
+            ("james",    "192.168.5.108", "nohup ~/llama.cpp/build/bin/llama-server -m ~/models/qwen3.5-35b-a3b/Qwen3.5-35B-A3B-Q4_K_M.gguf --host 0.0.0.0 --port 55000 --ctx-size 32768 --threads 8 --jinja --no-warmup --parallel 2 > /tmp/llama-server.log 2>&1 &"),
+            ("logan",    "192.168.5.111", "nohup ~/llama.cpp/build/bin/llama-server -m ~/models/qwen3.5-35b-a3b/Qwen3.5-35B-A3B-Q4_K_M.gguf --host 0.0.0.0 --port 55000 --ctx-size 32768 --threads 28 --jinja --no-warmup --parallel 4 > /tmp/llama-server.log 2>&1 &"),
+            ("veronica", "192.168.5.112", "nohup env LD_LIBRARY_PATH=~/llama.cpp/build/bin ~/llama.cpp/build/bin/llama-server -m ~/models/qwen3.5-35b-a3b/Qwen3.5-35B-A3B-Q4_K_M.gguf --host 0.0.0.0 --port 55000 --ctx-size 32768 --threads 28 --jinja --no-warmup --parallel 4 > /tmp/llama-server.log 2>&1 &"),
+            ("lily",     "192.168.5.113", "nohup env LD_LIBRARY_PATH=~/llama.cpp/build/bin ~/llama.cpp/build/bin/llama-server -m ~/models/qwen3.5-35b-a3b/Qwen3.5-35B-A3B-Q4_K_M.gguf --host 0.0.0.0 --port 55000 --ctx-size 32768 --threads 28 --jinja --no-warmup --parallel 4 > /tmp/llama-server.log 2>&1 &"),
+            ("duncan",   "192.168.5.114", "nohup env LD_LIBRARY_PATH=~/llama.cpp/build/bin ~/llama.cpp/build/bin/llama-server -m ~/models/qwen3.5-35b-a3b/Qwen3.5-35B-A3B-Q4_K_M.gguf --host 0.0.0.0 --port 55000 --ctx-size 32768 --threads 28 --jinja --no-warmup --parallel 4 > /tmp/llama-server.log 2>&1 &"),
+        ].iter().map(|(name, ip, cmd)| (name.to_string(), (ip.to_string(), cmd.to_string()))).collect();
 
         let mut ticker = tokio::time::interval(Duration::from_secs(loop_cfg.interval_secs.max(5)));
 
@@ -1313,19 +1359,60 @@ fn start_self_heal_subsystem(
                         info!(healthy, managed, "self-heal health sweep complete");
                     }
 
-                    // Fleet-wide health check — check remote nodes via HTTP on port 55000
-                    // Each node runs its LLM server on port 55000 with node-specific flags.
-                    let fleet_nodes: Vec<(&str, &str, &str)> = vec![
-                        // (name, ip, restart_command)
-                        ("marcus",   "192.168.5.102", "nohup ~/llama.cpp/build-new/bin/llama-server -m ~/models/qwen3-coder-30b-a3b/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf --host 0.0.0.0 --port 55000 --ctx-size 32768 --threads 12 --jinja --no-warmup --parallel 4 > /tmp/llama-server.log 2>&1 &"),
-                        ("sophie",   "192.168.5.103", "nohup ~/llama.cpp/build-new/bin/llama-server -m ~/models/qwen3-coder-30b-a3b/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf --host 0.0.0.0 --port 55000 --ctx-size 32768 --threads 4 --jinja --no-warmup --parallel 1 > /tmp/llama-server.log 2>&1 &"),
-                        ("priya",    "192.168.5.104", "nohup ~/llama.cpp/build-new/bin/llama-server -m ~/models/qwen3-coder-30b-a3b/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf --host 0.0.0.0 --port 55000 --ctx-size 32768 --threads 8 --jinja --no-warmup --parallel 2 > /tmp/llama-server.log 2>&1 &"),
-                        ("james",    "192.168.5.108", "nohup ~/llama.cpp/build/bin/llama-server -m ~/models/qwen3.5-35b-a3b/Qwen3.5-35B-A3B-Q4_K_M.gguf --host 0.0.0.0 --port 55000 --ctx-size 32768 --threads 8 --jinja --no-warmup --parallel 2 > /tmp/llama-server.log 2>&1 &"),
-                        ("logan",    "192.168.5.111", "nohup ~/llama.cpp/build/bin/llama-server -m ~/models/qwen3.5-35b-a3b/Qwen3.5-35B-A3B-Q4_K_M.gguf --host 0.0.0.0 --port 55000 --ctx-size 32768 --threads 28 --jinja --no-warmup --parallel 4 > /tmp/llama-server.log 2>&1 &"),
-                        ("veronica", "192.168.5.112", "nohup env LD_LIBRARY_PATH=~/llama.cpp/build/bin ~/llama.cpp/build/bin/llama-server -m ~/models/qwen3.5-35b-a3b/Qwen3.5-35B-A3B-Q4_K_M.gguf --host 0.0.0.0 --port 55000 --ctx-size 32768 --threads 28 --jinja --no-warmup --parallel 4 > /tmp/llama-server.log 2>&1 &"),
-                        ("lily",     "192.168.5.113", "nohup env LD_LIBRARY_PATH=~/llama.cpp/build/bin ~/llama.cpp/build/bin/llama-server -m ~/models/qwen3.5-35b-a3b/Qwen3.5-35B-A3B-Q4_K_M.gguf --host 0.0.0.0 --port 55000 --ctx-size 32768 --threads 28 --jinja --no-warmup --parallel 4 > /tmp/llama-server.log 2>&1 &"),
-                        ("duncan",   "192.168.5.114", "nohup env LD_LIBRARY_PATH=~/llama.cpp/build/bin ~/llama.cpp/build/bin/llama-server -m ~/models/qwen3.5-35b-a3b/Qwen3.5-35B-A3B-Q4_K_M.gguf --host 0.0.0.0 --port 55000 --ctx-size 32768 --threads 28 --jinja --no-warmup --parallel 4 > /tmp/llama-server.log 2>&1 &"),
-                    ];
+                    // Fleet-wide health check — read node list from Postgres if available,
+                    // restart commands from fleet_settings or hardcoded fallback.
+                    let fleet_nodes: Vec<(String, String, String)> = {
+                        let mut nodes = Vec::new();
+
+                        // Try to read restart_commands from Postgres fleet_settings
+                        let pg_restart_commands: HashMap<String, String> =
+                            if let Some(pool) = operational_store.pg_pool() {
+                                ff_db::pg_get_setting(pool, "restart_commands")
+                                    .await
+                                    .ok()
+                                    .flatten()
+                                    .and_then(|v| serde_json::from_value::<HashMap<String, String>>(v).ok())
+                                    .unwrap_or_default()
+                            } else {
+                                HashMap::new()
+                            };
+
+                        // Try to get node list from Postgres
+                        let pg_nodes = if let Some(pool) = operational_store.pg_pool() {
+                            ff_db::pg_list_nodes(pool).await.unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        };
+
+                        if !pg_nodes.is_empty() {
+                            for db_node in &pg_nodes {
+                                // Skip the leader node itself
+                                if db_node.name == node_name {
+                                    continue;
+                                }
+                                // Use Postgres restart_commands setting if available,
+                                // else fall back to hardcoded map
+                                let restart_cmd = pg_restart_commands
+                                    .get(&db_node.name)
+                                    .cloned()
+                                    .or_else(|| fallback_restart_commands.get(&db_node.name).map(|(_, cmd)| cmd.clone()))
+                                    .unwrap_or_default();
+
+                                nodes.push((
+                                    db_node.name.clone(),
+                                    db_node.ip.clone(),
+                                    restart_cmd,
+                                ));
+                            }
+                        } else {
+                            // Fallback: use hardcoded list
+                            for (name, (ip, cmd)) in &fallback_restart_commands {
+                                nodes.push((name.clone(), ip.clone(), cmd.clone()));
+                            }
+                        }
+
+                        nodes
+                    };
 
                     let http = reqwest::Client::builder()
                         .timeout(Duration::from_secs(5))
@@ -1343,7 +1430,7 @@ fn start_self_heal_subsystem(
                                 fleet_issues.push(format!("{name} ({ip})"));
 
                                 // Attempt remote restart via SSH with node-specific command
-                                if loop_cfg.auto_adopt {
+                                if loop_cfg.auto_adopt && !restart_cmd.is_empty() {
                                     let ssh_cmd = format!(
                                         "ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no {}@{} \
                                          'pgrep -f llama-server || ({})' 2>/dev/null",

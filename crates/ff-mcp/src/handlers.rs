@@ -17,7 +17,9 @@ use ff_api::registry::{BackendEndpoint, BackendRegistry};
 use ff_api::router::{TierRouter, TierRouterConfig, TierTimeouts};
 use ff_api::types::{ChatCompletionRequest, ChatMessage};
 use ff_core::config::{self, DatabaseMode, FleetConfig};
-use ff_db::{DbPool, DbPoolConfig, OperationalStore, run_migrations};
+use ff_db::{
+    DbPool, DbPoolConfig, FleetModelRow, OperationalStore, run_migrations,
+};
 use ff_discovery::health::{HealthMonitor, HealthStatus, HealthTarget};
 use ff_discovery::ports::known_llm_ports;
 use ff_discovery::scanner::{
@@ -79,11 +81,55 @@ pub async fn fleet_status(params: Option<Value>) -> HandlerResult {
         .unwrap_or(false);
 
     let (config, config_path) = load_config_auto()?;
-    let scan_targets = build_known_scan_targets(&config);
+
+    // ─── Primary source: Postgres. Fallback: fleet.toml ─────────────────────
+    let (pg_nodes, pg_models) = match get_pg_pool(&config).await {
+        Ok(pool) => {
+            let nodes = ff_db::pg_list_nodes(&pool).await.unwrap_or_default();
+            let models = ff_db::pg_list_models(&pool).await.unwrap_or_default();
+            if nodes.is_empty() {
+                info!("fleet_status: Postgres fleet_nodes empty, falling back to fleet.toml");
+                (None, None)
+            } else {
+                info!(
+                    nodes = nodes.len(),
+                    models = models.len(),
+                    "fleet_status: using Postgres as primary source"
+                );
+                (Some(nodes), Some(models))
+            }
+        }
+        Err(e) => {
+            warn!("fleet_status: Postgres unavailable ({e}), falling back to fleet.toml");
+            (None, None)
+        }
+    };
+
+    let using_postgres = pg_nodes.is_some();
+
+    // Build scan targets from whichever source we're using
+    let scan_targets = if let Some(ref db_nodes) = pg_nodes {
+        let default_port = config.fleet.api_port;
+        let node_tuples: Vec<(String, String, Option<u16>, u32)> = db_nodes
+            .iter()
+            .map(|n| {
+                (
+                    n.name.clone(),
+                    n.ip.clone(),
+                    Some(default_port),
+                    n.election_priority as u32,
+                )
+            })
+            .collect();
+        build_scan_targets(node_tuples, default_port)
+    } else {
+        build_known_scan_targets(&config)
+    };
 
     info!(
         refresh,
         targets = scan_targets.len(),
+        source = if using_postgres { "postgres" } else { "fleet.toml" },
         "fleet_status handler called"
     );
 
@@ -125,74 +171,155 @@ pub async fn fleet_status(params: Option<Value>) -> HandlerResult {
     let mut offline_nodes = 0usize;
     let mut models_loaded = 0usize;
 
-    for (name, node_cfg) in &config.nodes {
-        let maybe_scan = scan_by_name.get(name);
-        let status = maybe_scan
-            .map(|r| scan_status_to_str(r.status))
-            .unwrap_or("unknown");
-
-        match status {
-            "healthy" => healthy_nodes += 1,
-            "degraded" => degraded_nodes += 1,
-            "offline" => offline_nodes += 1,
-            _ => {}
+    // Group Postgres models by node_name for easy lookup
+    let models_by_node: HashMap<String, Vec<&FleetModelRow>> = if let Some(ref db_models) = pg_models {
+        let mut map: HashMap<String, Vec<&FleetModelRow>> = HashMap::new();
+        for m in db_models {
+            map.entry(m.node_name.clone()).or_default().push(m);
         }
+        map
+    } else {
+        HashMap::new()
+    };
 
-        let mut models = Vec::new();
-        for (slug, model) in &node_cfg.models {
-            let model_name = if model.name.trim().is_empty() {
-                slug.clone()
-            } else {
-                model.name.clone()
-            };
-            let port = model
-                .port
-                .or(node_cfg.port)
-                .unwrap_or(config.fleet.api_port);
-            let loaded = status == "healthy" || status == "degraded";
-            if loaded {
-                models_loaded += 1;
+    if let Some(ref db_nodes) = pg_nodes {
+        // ── Postgres path ──────────────────────────────────────────────────
+        for node in db_nodes {
+            let maybe_scan = scan_by_name.get(&node.name);
+            let status = maybe_scan
+                .map(|r| scan_status_to_str(r.status))
+                .unwrap_or("unknown");
+
+            match status {
+                "healthy" => healthy_nodes += 1,
+                "degraded" => degraded_nodes += 1,
+                "offline" => offline_nodes += 1,
+                _ => {}
             }
-            models.push(json!({
-                "id": slug,
-                "name": model_name,
-                "tier": model.tier,
-                "port": port,
-                "status": if loaded { "loaded" } else { "unreachable" }
+
+            let mut models = Vec::new();
+            if let Some(node_models) = models_by_node.get(&node.name) {
+                for m in node_models {
+                    let loaded = status == "healthy" || status == "degraded";
+                    if loaded {
+                        models_loaded += 1;
+                    }
+                    models.push(json!({
+                        "id": m.slug,
+                        "name": m.name,
+                        "tier": m.tier,
+                        "port": m.port,
+                        "status": if loaded { "loaded" } else { "unreachable" }
+                    }));
+                }
+            }
+
+            let pulse = pulse_metrics.get(node.name.as_str());
+
+            nodes_json.push(json!({
+                "name": node.name,
+                "ip": node.ip,
+                "role": node.role,
+                "status": status,
+                "hardware": node.hardware,
+                "ram_gb": node.ram_gb,
+                "cpu_cores": node.cpu_cores,
+                "os": node.os,
+                "latency_ms": maybe_scan.map(|r| r.latency_ms),
+                "http_status": maybe_scan.and_then(|r| r.http_status),
+                "error": maybe_scan.and_then(|r| r.error.clone()),
+                "models": models,
+                "pulse": pulse.map(|m| json!({
+                    "cpu_percent": m.cpu_percent,
+                    "ram_used_gb": m.ram_used_gb,
+                    "ram_total_gb": m.ram_total_gb,
+                    "disk_used_gb": m.disk_used_gb,
+                    "disk_total_gb": m.disk_total_gb,
+                    "tokens_per_sec": m.tokens_per_sec,
+                    "active_tasks": m.active_tasks,
+                    "uptime_secs": m.uptime_secs,
+                    "temperature_c": m.temperature_c
+                }))
             }));
         }
+    } else {
+        // ── fleet.toml fallback path ───────────────────────────────────────
+        for (name, node_cfg) in &config.nodes {
+            let maybe_scan = scan_by_name.get(name);
+            let status = maybe_scan
+                .map(|r| scan_status_to_str(r.status))
+                .unwrap_or("unknown");
 
-        let pulse = pulse_metrics.get(name.as_str());
+            match status {
+                "healthy" => healthy_nodes += 1,
+                "degraded" => degraded_nodes += 1,
+                "offline" => offline_nodes += 1,
+                _ => {}
+            }
 
-        nodes_json.push(json!({
-            "name": name,
-            "ip": node_cfg.ip,
-            "role": format!("{}", node_cfg.role),
-            "status": status,
-            "latency_ms": maybe_scan.map(|r| r.latency_ms),
-            "http_status": maybe_scan.and_then(|r| r.http_status),
-            "error": maybe_scan.and_then(|r| r.error.clone()),
-            "models": models,
-            "pulse": pulse.map(|m| json!({
-                "cpu_percent": m.cpu_percent,
-                "ram_used_gb": m.ram_used_gb,
-                "ram_total_gb": m.ram_total_gb,
-                "disk_used_gb": m.disk_used_gb,
-                "disk_total_gb": m.disk_total_gb,
-                "tokens_per_sec": m.tokens_per_sec,
-                "active_tasks": m.active_tasks,
-                "uptime_secs": m.uptime_secs,
-                "temperature_c": m.temperature_c
-            }))
-        }));
+            let mut models = Vec::new();
+            for (slug, model) in &node_cfg.models {
+                let model_name = if model.name.trim().is_empty() {
+                    slug.clone()
+                } else {
+                    model.name.clone()
+                };
+                let port = model
+                    .port
+                    .or(node_cfg.port)
+                    .unwrap_or(config.fleet.api_port);
+                let loaded = status == "healthy" || status == "degraded";
+                if loaded {
+                    models_loaded += 1;
+                }
+                models.push(json!({
+                    "id": slug,
+                    "name": model_name,
+                    "tier": model.tier,
+                    "port": port,
+                    "status": if loaded { "loaded" } else { "unreachable" }
+                }));
+            }
+
+            let pulse = pulse_metrics.get(name.as_str());
+
+            nodes_json.push(json!({
+                "name": name,
+                "ip": node_cfg.ip,
+                "role": format!("{}", node_cfg.role),
+                "status": status,
+                "latency_ms": maybe_scan.map(|r| r.latency_ms),
+                "http_status": maybe_scan.and_then(|r| r.http_status),
+                "error": maybe_scan.and_then(|r| r.error.clone()),
+                "models": models,
+                "pulse": pulse.map(|m| json!({
+                    "cpu_percent": m.cpu_percent,
+                    "ram_used_gb": m.ram_used_gb,
+                    "ram_total_gb": m.ram_total_gb,
+                    "disk_used_gb": m.disk_used_gb,
+                    "disk_total_gb": m.disk_total_gb,
+                    "tokens_per_sec": m.tokens_per_sec,
+                    "active_tasks": m.active_tasks,
+                    "uptime_secs": m.uptime_secs,
+                    "temperature_c": m.temperature_c
+                }))
+            }));
+        }
     }
+
+    let total_nodes = if using_postgres {
+        pg_nodes.as_ref().map_or(0, |n| n.len())
+    } else {
+        config.nodes.len()
+    };
 
     Ok(json!({
         "refresh": refresh,
         "config_path": config_path,
+        "source": if using_postgres { "postgres" } else { "fleet.toml" },
         "nodes": nodes_json,
         "summary": {
-            "total_nodes": config.nodes.len(),
+            "total_nodes": total_nodes,
             "healthy": healthy_nodes,
             "degraded": degraded_nodes,
             "offline": offline_nodes,
