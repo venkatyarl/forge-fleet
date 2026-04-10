@@ -303,10 +303,10 @@ impl Command for FleetCommand {
     async fn execute(&self, _args: &str, _session: &mut AgentSession) -> String {
         let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(3)).build().unwrap_or_default();
         let nodes = [
-            ("Taylor", "192.168.5.100:51000"), ("Taylor-2", "192.168.5.100:51001"),
-            ("Marcus", "192.168.5.102:51000"), ("Sophie", "192.168.5.103:51000"),
-            ("Priya", "192.168.5.104:51000"), ("James", "192.168.5.108:51000"),
-            ("James-2", "192.168.5.108:51001"),
+            ("Taylor", "192.168.5.100:55000"), ("Taylor-2", "192.168.5.100:55001"),
+            ("Marcus", "192.168.5.102:55000"), ("Sophie", "192.168.5.103:55000"),
+            ("Priya", "192.168.5.104:55000"), ("James", "192.168.5.108:55000"),
+            ("James-2", "192.168.5.108:55001"),
         ];
         let mut output = String::from("Fleet LLM Status:\n\n");
         for (name, addr) in &nodes {

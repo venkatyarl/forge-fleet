@@ -53,7 +53,7 @@ enum Command {
 #[derive(Debug, Args)]
 struct ChatArgs {
     /// LLM endpoint URL
-    #[arg(long, default_value = "http://192.168.5.102:51000")]
+    #[arg(long, default_value = "http://192.168.5.102:55000")]
     llm: String,
     /// Model name
     #[arg(long, short = 'm', default_value = "auto")]
@@ -74,7 +74,7 @@ struct RunArgs {
     /// The prompt to send to the agent
     prompt: String,
     /// LLM endpoint URL
-    #[arg(long, default_value = "http://192.168.5.102:51000")]
+    #[arg(long, default_value = "http://192.168.5.102:55000")]
     llm: String,
     /// Model name
     #[arg(long, short = 'm', default_value = "auto")]

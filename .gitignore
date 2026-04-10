@@ -31,3 +31,4 @@ dist/
 *.db
 *.sqlite
 *.log
+.forgefleet/

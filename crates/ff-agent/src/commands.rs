@@ -395,7 +395,7 @@ impl Command for FastCommand {
     fn description(&self) -> &str { "Switch to fastest available fleet LLM" }
     async fn execute(&self, _args: &str, session: &mut AgentSession) -> String {
         // Switch to smallest/fastest model — Qwen3.5-9B on James
-        session.config.llm_base_url = "http://192.168.5.108:51001".into();
+        session.config.llm_base_url = "http://192.168.5.108:55001".into();
         session.config.model = "auto".into();
         "Switched to fast mode (James — Qwen3.5-9B)".into()
     }

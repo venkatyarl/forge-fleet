@@ -40,7 +40,7 @@ impl AgentTool for SubAgentTool {
                 },
                 "llm_base_url": {
                     "type": "string",
-                    "description": "Optional fleet LLM endpoint URL (e.g. http://192.168.5.102:51000). Defaults to same as parent."
+                    "description": "Optional fleet LLM endpoint URL (e.g. http://192.168.5.102:55000). Defaults to same as parent."
                 },
                 "working_dir": {
                     "type": "string",
@@ -75,7 +75,7 @@ impl AgentTool for SubAgentTool {
         let llm_base_url = input
             .get("llm_base_url")
             .and_then(Value::as_str)
-            .unwrap_or("http://192.168.5.102:51000")
+            .unwrap_or("http://192.168.5.102:55000")
             .to_string();
 
         let model = input

@@ -73,56 +73,77 @@ impl FleetInferenceManager {
         self.endpoints.insert(endpoint.name.clone(), endpoint);
     }
 
-    /// Register all known fleet endpoints (from fleet.toml or hardcoded).
+    /// Register all known fleet endpoints (from fleet.toml or hardcoded fallback).
     pub fn register_default_fleet(&self) {
         let defaults = vec![
             FleetEndpoint {
-                name: "taylor-gemma".into(), url: "http://192.168.5.100:51000".into(),
+                name: "taylor-gemma".into(), url: "http://192.168.5.100:55000".into(),
                 model_name: "gemma-4-31b-it".into(), model_params: 31_000_000_000,
                 memory_gb: 96, gpu_type: GpuType::AppleSilicon,
                 tps: None, ttft_ms: None, context_window: 262_144,
                 healthy: true, last_check: None,
             },
             FleetEndpoint {
-                name: "taylor-qwen3".into(), url: "http://192.168.5.100:51001".into(),
-                model_name: "qwen3-coder-next".into(), model_params: 32_000_000_000,
+                name: "taylor-qwen35".into(), url: "http://192.168.5.100:55001".into(),
+                model_name: "qwen3.5-35b-a3b".into(), model_params: 35_000_000_000,
                 memory_gb: 96, gpu_type: GpuType::AppleSilicon,
                 tps: None, ttft_ms: None, context_window: 32_768,
                 healthy: true, last_check: None,
             },
             FleetEndpoint {
-                name: "marcus".into(), url: "http://192.168.5.102:51000".into(),
-                model_name: "qwen2.5-coder-32b".into(), model_params: 32_000_000_000,
+                name: "marcus".into(), url: "http://192.168.5.102:55000".into(),
+                model_name: "qwen3-coder-30b-a3b".into(), model_params: 30_000_000_000,
                 memory_gb: 32, gpu_type: GpuType::Cpu,
-                tps: Some(1.5), ttft_ms: Some(30_000.0), context_window: 32_768,
+                tps: Some(3.0), ttft_ms: Some(15_000.0), context_window: 32_768,
                 healthy: true, last_check: None,
             },
             FleetEndpoint {
-                name: "sophie".into(), url: "http://192.168.5.103:51000".into(),
-                model_name: "qwen2.5-coder-32b".into(), model_params: 32_000_000_000,
+                name: "sophie".into(), url: "http://192.168.5.103:55000".into(),
+                model_name: "qwen3-coder-30b-a3b".into(), model_params: 30_000_000_000,
                 memory_gb: 32, gpu_type: GpuType::Cpu,
-                tps: Some(1.5), ttft_ms: Some(30_000.0), context_window: 32_768,
+                tps: Some(2.0), ttft_ms: Some(20_000.0), context_window: 32_768,
                 healthy: true, last_check: None,
             },
             FleetEndpoint {
-                name: "priya".into(), url: "http://192.168.5.104:51000".into(),
-                model_name: "qwen2.5-coder-32b".into(), model_params: 32_000_000_000,
+                name: "priya".into(), url: "http://192.168.5.104:55000".into(),
+                model_name: "qwen3-coder-30b-a3b".into(), model_params: 30_000_000_000,
                 memory_gb: 32, gpu_type: GpuType::Cpu,
-                tps: Some(1.5), ttft_ms: Some(30_000.0), context_window: 32_768,
+                tps: Some(2.5), ttft_ms: Some(18_000.0), context_window: 32_768,
                 healthy: true, last_check: None,
             },
             FleetEndpoint {
-                name: "james-72b".into(), url: "http://192.168.5.108:51000".into(),
-                model_name: "qwen2.5-72b".into(), model_params: 72_000_000_000,
+                name: "james".into(), url: "http://192.168.5.108:55000".into(),
+                model_name: "qwen3.5-35b-a3b".into(), model_params: 35_000_000_000,
                 memory_gb: 64, gpu_type: GpuType::Cpu,
-                tps: Some(0.66), ttft_ms: Some(80_000.0), context_window: 32_768,
+                tps: Some(2.0), ttft_ms: Some(20_000.0), context_window: 32_768,
                 healthy: true, last_check: None,
             },
             FleetEndpoint {
-                name: "james-9b".into(), url: "http://192.168.5.108:51001".into(),
-                model_name: "qwen3.5-9b".into(), model_params: 9_000_000_000,
-                memory_gb: 64, gpu_type: GpuType::Cpu,
-                tps: None, ttft_ms: None, context_window: 32_768,
+                name: "logan".into(), url: "http://192.168.5.111:55000".into(),
+                model_name: "qwen3.5-35b-a3b".into(), model_params: 35_000_000_000,
+                memory_gb: 128, gpu_type: GpuType::Cpu,
+                tps: Some(4.0), ttft_ms: Some(10_000.0), context_window: 32_768,
+                healthy: true, last_check: None,
+            },
+            FleetEndpoint {
+                name: "veronica".into(), url: "http://192.168.5.112:55000".into(),
+                model_name: "qwen3.5-35b-a3b".into(), model_params: 35_000_000_000,
+                memory_gb: 128, gpu_type: GpuType::Cpu,
+                tps: Some(4.0), ttft_ms: Some(10_000.0), context_window: 32_768,
+                healthy: true, last_check: None,
+            },
+            FleetEndpoint {
+                name: "lily".into(), url: "http://192.168.5.113:55000".into(),
+                model_name: "qwen3.5-35b-a3b".into(), model_params: 35_000_000_000,
+                memory_gb: 128, gpu_type: GpuType::Cpu,
+                tps: Some(4.0), ttft_ms: Some(10_000.0), context_window: 32_768,
+                healthy: true, last_check: None,
+            },
+            FleetEndpoint {
+                name: "duncan".into(), url: "http://192.168.5.114:55000".into(),
+                model_name: "qwen3.5-35b-a3b".into(), model_params: 35_000_000_000,
+                memory_gb: 128, gpu_type: GpuType::Cpu,
+                tps: Some(4.0), ttft_ms: Some(10_000.0), context_window: 32_768,
                 healthy: true, last_check: None,
             },
         ];

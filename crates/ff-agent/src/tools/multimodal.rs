@@ -198,7 +198,7 @@ impl AgentTool for SelfHealTool {
 
         for (name, ip) in &nodes {
             // Check LLM server
-            let llm_ok = client.get(format!("http://{ip}:51000/health")).send().await.map(|r| r.status().is_success()).unwrap_or(false);
+            let llm_ok = client.get(format!("http://{ip}:55000/health")).send().await.map(|r| r.status().is_success()).unwrap_or(false);
             // Check SSH
             let ssh_ok = Command::new("ssh").args(["-o", "ConnectTimeout=3", "-o", "StrictHostKeyChecking=no", &format!("root@{ip}"), "echo ok"]).output().await.map(|o| o.status.success()).unwrap_or(false);
 
@@ -222,7 +222,7 @@ impl AgentTool for SelfHealTool {
                 if issues.is_empty() { return AgentToolResult::ok("No issues to heal. All nodes healthy.".to_string()); }
                 let mut healed = Vec::new();
                 for (name, ip) in &nodes {
-                    let llm_ok = client.get(format!("http://{ip}:51000/health")).send().await.map(|r| r.status().is_success()).unwrap_or(false);
+                    let llm_ok = client.get(format!("http://{ip}:55000/health")).send().await.map(|r| r.status().is_success()).unwrap_or(false);
                     if !llm_ok {
                         // Try to restart LLM server
                         let _restart = Command::new("ssh").args(["-o", "ConnectTimeout=5", &format!("root@{ip}"), "pkill -f llama-server; sleep 2; nohup llama-server -m /models/*.gguf --host 0.0.0.0 --port 51000 &>/tmp/llama.log &"]).output().await;
@@ -269,7 +269,7 @@ impl AgentTool for AutoFleetTool {
                 let mut total_ram = 0;
                 let mut online = 0;
                 for (name, ip, ram) in &nodes {
-                    let status = client.get(format!("http://{ip}:51000/health")).send().await.map(|r| r.status().is_success()).unwrap_or(false);
+                    let status = client.get(format!("http://{ip}:55000/health")).send().await.map(|r| r.status().is_success()).unwrap_or(false);
                     let icon = if status { online += 1; "●" } else { "○" };
                     total_ram += ram;
                     report.push_str(&format!("  {icon} {name}: {ip} ({ram}GB) — {}\n", if status { "ONLINE" } else { "OFFLINE" }));

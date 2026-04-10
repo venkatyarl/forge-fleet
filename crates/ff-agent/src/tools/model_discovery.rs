@@ -413,7 +413,7 @@ impl AgentTool for ClusterInferenceTool {
                         for (i, node) in nodes.iter().enumerate() {
                             plan.push_str(&format!("  Node {}: ssh root@{node} 'exo --node-id node{i} --peers {}'\n", i, nodes.iter().filter(|n| *n != node).map(|n| format!("{n}:50051")).collect::<Vec<_>>().join(",")));
                         }
-                        plan.push_str(&format!("\nAPI endpoint: http://{}:51000\n", nodes[0]));
+                        plan.push_str(&format!("\nAPI endpoint: http://{}:55000\n", nodes[0]));
                     }
                     "vllm_tp" => {
                         plan.push_str("## vLLM Tensor Parallel Setup\n\n");
@@ -436,7 +436,7 @@ impl AgentTool for ClusterInferenceTool {
                     let rpc_ok = tokio::net::TcpStream::connect(format!("{node}:50052")).await.is_ok();
 
                     // Check LLM server
-                    let llm_url = format!("http://{node}:51000/health");
+                    let llm_url = format!("http://{node}:55000/health");
                     let llm_ok = client.get(&llm_url).send().await.map(|r| r.status().is_success()).unwrap_or(false);
 
                     status.push(format!("  {node}: RPC={} LLM={}", if rpc_ok {"ON"} else {"OFF"}, if llm_ok {"ON"} else {"OFF"}));
@@ -445,7 +445,7 @@ impl AgentTool for ClusterInferenceTool {
             }
 
             "benchmark" => {
-                AgentToolResult::ok("Cluster Benchmark:\n  Use the Bash tool to run:\n  curl http://<controller>:51000/v1/chat/completions -d '{\"model\":\"...\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}]}'\n  Measure: time to first token, tokens per second, total latency".to_string())
+                AgentToolResult::ok("Cluster Benchmark:\n  Use the Bash tool to run:\n  curl http://<controller>:55000/v1/chat/completions -d '{\"model\":\"...\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}]}'\n  Measure: time to first token, tokens per second, total latency".to_string())
             }
 
             "teardown" => {

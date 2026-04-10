@@ -66,8 +66,8 @@ pub struct AgentSessionConfig {
 impl Default for AgentSessionConfig {
     fn default() -> Self {
         Self {
-            model: "qwen2.5-coder-32b".into(),
-            llm_base_url: "http://localhost:51000".into(),
+            model: "auto".into(),
+            llm_base_url: "http://localhost:55000".into(),
             working_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
             system_prompt: None,
             max_turns: 30,
