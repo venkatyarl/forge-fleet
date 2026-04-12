@@ -291,6 +291,298 @@ impl AgentTool for ImageConvertTool {
     }
 }
 
+/// VideoAnalyze — download a video, extract key frames + audio, analyze with multimodal LLM.
+pub struct VideoAnalyzeTool;
+
+#[async_trait]
+impl AgentTool for VideoAnalyzeTool {
+    fn name(&self) -> &str { "VideoAnalyze" }
+    fn description(&self) -> &str {
+        "Download and analyze a video from YouTube, TikTok, Twitter, etc. \
+         Extracts key frames and audio, sends to a multimodal LLM for analysis. \
+         Returns a text summary of the video content."
+    }
+    fn parameters_schema(&self) -> Value {
+        json!({"type":"object","properties":{
+            "url":{"type":"string","description":"Video URL (YouTube, TikTok, Twitter, etc.)"},
+            "prompt":{"type":"string","description":"What to analyze (default: 'Describe this video')"},
+            "max_frames":{"type":"number","description":"Max key frames to extract (default: 8)"},
+            "extract_audio":{"type":"boolean","description":"Also transcribe audio (default: true)"}
+        },"required":["url"]})
+    }
+    async fn execute(&self, input: Value, ctx: &AgentToolContext) -> AgentToolResult {
+        let url = input.get("url").and_then(Value::as_str).unwrap_or("");
+        let prompt = input.get("prompt").and_then(Value::as_str).unwrap_or("Describe what is happening in this video. Include key visual elements, text on screen, actions, and any spoken content.");
+        let max_frames = input.get("max_frames").and_then(Value::as_u64).unwrap_or(8) as usize;
+        let extract_audio = input.get("extract_audio").and_then(Value::as_bool).unwrap_or(true);
+
+        if url.is_empty() { return AgentToolResult::err("Missing 'url'"); }
+
+        let tmp_dir = ctx.working_dir.join(".ff-video-analysis");
+        let _ = tokio::fs::create_dir_all(&tmp_dir).await;
+        let video_path = tmp_dir.join("video.mp4");
+
+        // Step 1: Download video with yt-dlp
+        let dl_result = Command::new("yt-dlp")
+            .args(["--no-playlist", "-f", "mp4/best", "--max-filesize", "100M",
+                   "-o", &video_path.to_string_lossy(), url])
+            .current_dir(&ctx.working_dir)
+            .output().await;
+
+        match &dl_result {
+            Ok(out) if !out.status.success() => {
+                let err = String::from_utf8_lossy(&out.stderr);
+                return AgentToolResult::err(format!("yt-dlp download failed: {}", truncate_output(&err, 500)));
+            }
+            Err(e) => return AgentToolResult::err(format!("yt-dlp not found: {e}. Install: pip install yt-dlp")),
+            _ => {}
+        }
+
+        if !video_path.exists() {
+            // yt-dlp may have added an extension — find the actual file
+            let mut found = false;
+            if let Ok(mut entries) = tokio::fs::read_dir(&tmp_dir).await {
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if name.starts_with("video.") && !name.ends_with(".part") {
+                        let _ = tokio::fs::rename(entry.path(), &video_path).await;
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            if !found {
+                return AgentToolResult::err("Download succeeded but video file not found");
+            }
+        }
+
+        // Step 2: Extract key frames with ffmpeg
+        let frames_dir = tmp_dir.join("frames");
+        let _ = tokio::fs::create_dir_all(&frames_dir).await;
+
+        // Get video duration
+        let probe = Command::new("ffprobe")
+            .args(["-v", "error", "-show_entries", "format=duration",
+                   "-of", "default=noprint_wrappers=1:nokey=1"])
+            .arg(&video_path)
+            .output().await;
+
+        let duration: f64 = probe.ok()
+            .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())
+            .unwrap_or(30.0);
+
+        // Extract frames at even intervals
+        let interval = (duration / max_frames as f64).max(1.0);
+        let ffmpeg_result = Command::new("ffmpeg")
+            .args(["-i", &video_path.to_string_lossy(),
+                   "-vf", &format!("fps=1/{interval:.1}"),
+                   "-frames:v", &max_frames.to_string(),
+                   "-q:v", "2",
+                   &frames_dir.join("frame_%03d.jpg").to_string_lossy()])
+            .output().await;
+
+        if ffmpeg_result.is_err() {
+            return AgentToolResult::err("ffmpeg not found. Install: apt install ffmpeg / brew install ffmpeg");
+        }
+
+        // Count extracted frames
+        let mut frame_paths: Vec<String> = Vec::new();
+        if let Ok(mut entries) = tokio::fs::read_dir(&frames_dir).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.ends_with(".jpg") {
+                    frame_paths.push(entry.path().to_string_lossy().to_string());
+                }
+            }
+        }
+        frame_paths.sort();
+
+        // Step 3: Extract audio transcript (if requested)
+        let mut audio_text = String::new();
+        if extract_audio {
+            let audio_path = tmp_dir.join("audio.wav");
+            let _ = Command::new("ffmpeg")
+                .args(["-i", &video_path.to_string_lossy(),
+                       "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
+                       "-y", &audio_path.to_string_lossy()])
+                .output().await;
+
+            // Try whisper for transcription
+            let whisper = Command::new("whisper")
+                .args([&audio_path.to_string_lossy().to_string(),
+                       "--model", "base", "--output_format", "txt",
+                       "--output_dir", &tmp_dir.to_string_lossy().to_string()])
+                .output().await;
+
+            if let Ok(out) = whisper {
+                if out.status.success() {
+                    if let Ok(txt) = tokio::fs::read_to_string(tmp_dir.join("audio.txt")).await {
+                        audio_text = txt;
+                    }
+                }
+            }
+        }
+
+        // Step 4: Send frames to multimodal LLM for analysis
+        // Build a description from frame count and audio
+        let mut analysis = Vec::new();
+        analysis.push(format!("Video: {url}"));
+        analysis.push(format!("Duration: {duration:.1}s"));
+        analysis.push(format!("Frames extracted: {}", frame_paths.len()));
+
+        // Try to send to the omni model on the fleet
+        // Look for an omni/multimodal endpoint from fleet config
+        let omni_endpoints = [
+            "http://192.168.5.111:55001",  // Logan omni (fallback — should come from DB)
+            "http://127.0.0.1:55000",      // local
+        ];
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .build().unwrap_or_default();
+
+        let mut llm_analysis = String::new();
+        for endpoint in &omni_endpoints {
+            // Build multimodal request with image URLs (base64 encoded)
+            let mut image_contents: Vec<Value> = Vec::new();
+            image_contents.push(json!({"type": "text", "text": prompt}));
+
+            for (i, frame) in frame_paths.iter().take(6).enumerate() {
+                if let Ok(data) = tokio::fs::read(frame).await {
+                    use base64::Engine;
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+                    image_contents.push(json!({
+                        "type": "image_url",
+                        "image_url": {"url": format!("data:image/jpeg;base64,{b64}")}
+                    }));
+                }
+            }
+
+            if !audio_text.is_empty() {
+                image_contents.push(json!({
+                    "type": "text",
+                    "text": format!("\n\nAudio transcript:\n{}", truncate_output(&audio_text, 2000))
+                }));
+            }
+
+            let body = json!({
+                "messages": [{"role": "user", "content": image_contents}],
+                "max_tokens": 1000,
+                "temperature": 0.3
+            });
+
+            let url = format!("{endpoint}/v1/chat/completions");
+            match client.post(&url).json(&body).send().await {
+                Ok(resp) => {
+                    if let Ok(data) = resp.json::<Value>().await {
+                        if let Some(content) = data.pointer("/choices/0/message/content").and_then(Value::as_str) {
+                            llm_analysis = content.to_string();
+                            break;
+                        }
+                    }
+                }
+                Err(_) => continue,
+            }
+        }
+
+        if !llm_analysis.is_empty() {
+            analysis.push(format!("\nAI Analysis:\n{llm_analysis}"));
+        } else {
+            analysis.push("\nAI Analysis: No multimodal LLM available. Frames saved locally.".into());
+            analysis.push(format!("Frames at: {}", frames_dir.display()));
+        }
+
+        if !audio_text.is_empty() {
+            analysis.push(format!("\nAudio Transcript:\n{}", truncate_output(&audio_text, 2000)));
+        }
+
+        // Cleanup video file (keep frames for reference)
+        let _ = tokio::fs::remove_file(&video_path).await;
+
+        AgentToolResult::ok(truncate_output(&analysis.join("\n"), MAX_TOOL_RESULT_CHARS))
+    }
+}
+
+/// AudioAnalyze — extract and transcribe audio from files or URLs.
+pub struct AudioAnalyzeTool;
+
+#[async_trait]
+impl AgentTool for AudioAnalyzeTool {
+    fn name(&self) -> &str { "AudioAnalyze" }
+    fn description(&self) -> &str { "Analyze audio files: transcribe speech, detect language, get duration/format info." }
+    fn parameters_schema(&self) -> Value {
+        json!({"type":"object","properties":{
+            "file_path":{"type":"string","description":"Path to audio file"},
+            "url":{"type":"string","description":"URL to download audio from"},
+            "transcribe":{"type":"boolean","description":"Transcribe speech to text (default: true)"}
+        }})
+    }
+    async fn execute(&self, input: Value, ctx: &AgentToolContext) -> AgentToolResult {
+        let file_path = input.get("file_path").and_then(Value::as_str);
+        let url = input.get("url").and_then(Value::as_str);
+        let transcribe = input.get("transcribe").and_then(Value::as_bool).unwrap_or(true);
+
+        let audio_path = if let Some(fp) = file_path {
+            let p = if std::path::Path::new(fp).is_absolute() { std::path::PathBuf::from(fp) } else { ctx.working_dir.join(fp) };
+            if !p.exists() { return AgentToolResult::err(format!("File not found: {}", p.display())); }
+            p
+        } else if let Some(u) = url {
+            let tmp = ctx.working_dir.join(".ff-audio-tmp.mp3");
+            let dl = Command::new("yt-dlp")
+                .args(["--extract-audio", "--audio-format", "mp3", "-o", &tmp.to_string_lossy(), u])
+                .output().await;
+            if dl.is_err() || !tmp.exists() {
+                return AgentToolResult::err("Failed to download audio");
+            }
+            tmp
+        } else {
+            return AgentToolResult::err("Provide 'file_path' or 'url'");
+        };
+
+        let mut info = Vec::new();
+
+        // Get audio info with ffprobe
+        let probe = Command::new("ffprobe")
+            .args(["-v", "quiet", "-print_format", "json", "-show_format", "-show_streams"])
+            .arg(&audio_path)
+            .output().await;
+
+        if let Ok(out) = probe {
+            if out.status.success() {
+                let json_str = String::from_utf8_lossy(&out.stdout);
+                if let Ok(data) = serde_json::from_str::<Value>(&json_str) {
+                    if let Some(fmt) = data.get("format") {
+                        info.push(format!("Duration: {}s", fmt.get("duration").and_then(Value::as_str).unwrap_or("?")));
+                        info.push(format!("Format: {}", fmt.get("format_long_name").and_then(Value::as_str).unwrap_or("?")));
+                        info.push(format!("Bitrate: {}kbps", fmt.get("bit_rate").and_then(Value::as_str).unwrap_or("0").parse::<u64>().unwrap_or(0) / 1000));
+                    }
+                }
+            }
+        }
+
+        // Transcribe with whisper
+        if transcribe {
+            let whisper = Command::new("whisper")
+                .args([&audio_path.to_string_lossy().to_string(), "--model", "base", "--output_format", "txt",
+                       "--output_dir", &ctx.working_dir.to_string_lossy().to_string()])
+                .output().await;
+
+            match whisper {
+                Ok(out) if out.status.success() => {
+                    let stem = audio_path.file_stem().unwrap_or_default().to_string_lossy();
+                    let txt_path = ctx.working_dir.join(format!("{stem}.txt"));
+                    if let Ok(txt) = tokio::fs::read_to_string(&txt_path).await {
+                        info.push(format!("\nTranscript:\n{}", truncate_output(&txt, 3000)));
+                    }
+                }
+                _ => info.push("\nTranscription: whisper not installed (pip install openai-whisper)".into()),
+            }
+        }
+
+        AgentToolResult::ok(info.join("\n"))
+    }
+}
+
 // HTML parsing helpers
 fn extract_meta(html: &str, start_tag: &str, end_tag: &str) -> Option<String> {
     let start = html.find(start_tag)? + start_tag.len();

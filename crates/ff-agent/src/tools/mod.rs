@@ -286,6 +286,8 @@ pub fn all_tools() -> Vec<Box<dyn AgentTool>> {
         Box::new(media::ScreenshotCaptureTool),
         Box::new(media::ImageAnalyzeTool),
         Box::new(media::VideoDownloadTool),
+        Box::new(media::VideoAnalyzeTool),
+        Box::new(media::AudioAnalyzeTool),
         Box::new(media::LinkPreviewTool),
         Box::new(media::ImageConvertTool),
         // Skill builder
