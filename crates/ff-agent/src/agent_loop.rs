@@ -24,10 +24,11 @@ use crate::compaction::{
 };
 use crate::focus_stack::ConversationTracker;
 use crate::openai_bridge;
-use crate::scoped_memory::{MemoryScope, ScopedMemoryStore};
+use crate::scoped_memory::MemoryScope;
 use crate::session_store;
 use std::sync::Arc;
 
+use crate::inference_router::InferenceRouter;
 use crate::tools::{self, AgentTool, AgentToolContext};
 
 // ---------------------------------------------------------------------------
@@ -61,6 +62,10 @@ pub struct AgentSessionConfig {
     pub memory_scope: Option<MemoryScope>,
     /// Optional image path to attach to the first user message (multimodal).
     pub image_path: Option<PathBuf>,
+    /// Local-first inference router. When set, the agent uses this to pick the
+    /// active LLM endpoint per turn, with automatic fleet failover.
+    /// Falls back to `llm_base_url` if not set (backwards compat).
+    pub inference_router: Option<Arc<InferenceRouter>>,
 }
 
 impl Default for AgentSessionConfig {
@@ -77,6 +82,7 @@ impl Default for AgentSessionConfig {
             tool_result_budget_chars: 50_000,
             auto_save: true,
             memory_scope: None,
+            inference_router: None,
             image_path: None,
         }
     }
@@ -389,11 +395,9 @@ async fn run_agent_loop(
     let session_id = session.id.to_string();
     let openai_tools = openai_bridge::tools_to_openai_arc(&session.tools);
 
-    let mut llm_retry_count = 0u32;
-
     for turn in 1..=session.config.max_turns {
         session.turn_count = turn;
-        llm_retry_count = 0; // reset per turn
+        let mut llm_retry_count = 0u32;
 
         // Check cancellation
         if session.cancel_token.is_cancelled() {
@@ -470,10 +474,15 @@ async fn run_agent_loop(
             },
         );
 
-        let url = format!(
-            "{}/v1/chat/completions",
-            session.config.llm_base_url.trim_end_matches('/')
-        );
+        // Resolve the active LLM endpoint: use InferenceRouter (local-first +
+        // fleet failover) when available, otherwise fall back to llm_base_url.
+        let active_base = if let Some(router) = &session.config.inference_router {
+            router.active_url().unwrap_or_else(|| session.config.llm_base_url.clone())
+        } else {
+            session.config.llm_base_url.clone()
+        };
+
+        let url = format!("{}/v1/chat/completions", active_base.trim_end_matches('/'));
 
         debug!(turn, url = %url, model = %session.config.model, "sending agent request");
 
@@ -485,7 +494,13 @@ async fn run_agent_loop(
         };
 
         let response = match response {
-            Ok(resp) => resp,
+            Ok(resp) => {
+                // Mark the endpoint healthy on success
+                if let Some(router) = &session.config.inference_router {
+                    router.report_success(&active_base);
+                }
+                resp
+            }
             Err(err) => {
                 let err_str = format!("{err}");
 
@@ -512,11 +527,29 @@ async fn run_agent_loop(
                         message: format!("Context overflow — auto-compacted {before} → {after} messages. Retrying..."),
                     });
 
-                    // Retry this turn after compaction
                     continue;
                 }
 
-                // Retry with exponential backoff (up to 3 attempts)
+                // On LLM failure: mark endpoint as down and immediately try the
+                // next available fleet node (rather than waiting with backoff).
+                if let Some(router) = &session.config.inference_router {
+                    router.report_failure(&active_base);
+                    let next = router.active_url();
+                    if next.as_deref() != Some(active_base.as_str()) {
+                        emit(&event_tx, AgentEvent::Status {
+                            session_id: session_id.clone(),
+                            message: format!(
+                                "LLM at {} unreachable — failing over to {}",
+                                active_base,
+                                next.as_deref().unwrap_or("(none)")
+                            ),
+                        });
+                        // Retry this turn immediately on the new endpoint
+                        continue;
+                    }
+                }
+
+                // No router or all endpoints exhausted — exponential backoff
                 llm_retry_count += 1;
                 if llm_retry_count <= 3 {
                     let delay_ms = 1000 * (1u64 << llm_retry_count); // 2s, 4s, 8s
@@ -525,7 +558,7 @@ async fn run_agent_loop(
                         message: format!("LLM error (attempt {}/3), retrying in {}s: {}", llm_retry_count, delay_ms / 1000, &err_str[..err_str.len().min(100)]),
                     });
                     tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                    continue; // retry the same turn
+                    continue;
                 }
 
                 let msg = format!("LLM request failed after 3 retries: {err}");

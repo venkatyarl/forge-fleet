@@ -32,3 +32,5 @@ dist/
 *.sqlite
 *.log
 .forgefleet/
+# Added by code-review-graph
+.code-review-graph/

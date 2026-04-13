@@ -32,7 +32,7 @@ pub fn render(frame: &mut Frame, app: &App) {
     render_footer(frame, main_chunks[4], app, &theme);
 }
 
-fn render_tab_bar(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+fn render_tab_bar(frame: &mut Frame, area: Rect, app: &App, _theme: &Theme) {
     let mut spans = vec![Span::styled(" ", Style::default())];
     for (i, tab) in app.tabs.iter().enumerate() {
         let is_active = i == app.active_tab;
@@ -181,7 +181,7 @@ fn render_left_sidebar(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) 
         lines.push(Line::from(Span::styled("  (empty)", Style::default().fg(Color::Rgb(71, 85, 105)))));
         lines.push(Line::from(Span::styled("  /backlog <item>", Style::default().fg(Color::Rgb(71, 85, 105)))));
     } else {
-        for (i, item) in tab.tracker.backlog.items().iter().enumerate().take(5) {
+        for (_i, item) in tab.tracker.backlog.items().iter().enumerate().take(5) {
             let priority_icon = match item.priority {
                 ff_agent::focus_stack::BacklogPriority::Urgent => "🔴",
                 ff_agent::focus_stack::BacklogPriority::High => "🟠",

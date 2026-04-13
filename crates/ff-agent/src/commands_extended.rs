@@ -519,7 +519,7 @@ impl Command for PasteImageCommand {
     fn name(&self) -> &str { "paste-image" }
     fn aliases(&self) -> Vec<&str> { vec!["pi", "image"] }
     fn description(&self) -> &str { "Paste an image from clipboard or file path for analysis" }
-    async fn execute(&self, args: &str, session: &mut AgentSession) -> String {
+    async fn execute(&self, args: &str, _session: &mut AgentSession) -> String {
         if !args.is_empty() {
             // Treat args as file path
             let path = std::path::Path::new(args.trim());

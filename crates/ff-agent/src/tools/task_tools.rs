@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use dashmap::DashMap;
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -24,6 +25,12 @@ pub struct AgentTask {
     pub created_at: String,
     pub updated_at: String,
     pub metadata: HashMap<String, Value>,
+    /// Which node/session created this task.
+    pub origin_node: Option<String>,
+    /// ID of parent task that spawned this (for sub-tasks).
+    pub parent_task_id: Option<String>,
+    /// Node URL to POST a result callback to when task completes.
+    pub reply_to_node: Option<String>,
 }
 
 static TASK_STORE: std::sync::LazyLock<Arc<DashMap<String, AgentTask>>> =
@@ -62,7 +69,10 @@ impl AgentTool for TaskCreateTool {
             "type": "object",
             "properties": {
                 "subject": { "type": "string", "description": "Brief title for the task" },
-                "description": { "type": "string", "description": "What needs to be done" }
+                "description": { "type": "string", "description": "What needs to be done" },
+                "origin_node": { "type": "string", "description": "Node that originated this task" },
+                "parent_task_id": { "type": "string", "description": "Parent task ID if this is a sub-task" },
+                "reply_to_node": { "type": "string", "description": "Node URL to POST result callback to when done" }
             },
             "required": ["subject", "description"]
         })
@@ -76,6 +86,10 @@ impl AgentTool for TaskCreateTool {
             return AgentToolResult::err("Missing 'subject'");
         }
 
+        let origin_node = input.get("origin_node").and_then(Value::as_str).map(str::to_string);
+        let parent_task_id = input.get("parent_task_id").and_then(Value::as_str).map(str::to_string);
+        let reply_to_node = input.get("reply_to_node").and_then(Value::as_str).map(str::to_string);
+
         let id = next_task_id();
         let now = now_iso();
         let task = AgentTask {
@@ -87,6 +101,9 @@ impl AgentTool for TaskCreateTool {
             created_at: now.clone(),
             updated_at: now,
             metadata: HashMap::new(),
+            origin_node,
+            parent_task_id,
+            reply_to_node,
         };
 
         TASK_STORE.insert(id.clone(), task);
@@ -152,7 +169,7 @@ impl AgentTool for TaskUpdateTool {
         })
     }
 
-    async fn execute(&self, input: Value, _ctx: &AgentToolContext) -> AgentToolResult {
+    async fn execute(&self, input: Value, ctx: &AgentToolContext) -> AgentToolResult {
         let id = input.get("task_id").and_then(Value::as_str).unwrap_or("");
         let mut task = match TASK_STORE.get_mut(id) {
             Some(t) => t,
@@ -170,7 +187,30 @@ impl AgentTool for TaskUpdateTool {
         }
         task.updated_at = now_iso();
 
-        AgentToolResult::ok(format!("Task #{id} updated (status: {})", task.status))
+        let status_clone = task.status.clone();
+        let task_id_clone = task.id.clone();
+        let output_clone = task.output.clone();
+        let reply_to = task.reply_to_node.clone();
+        let session_id = ctx.session_id.clone();
+
+        // Fire best-effort callback if task just completed and has a reply_to_node.
+        if status_clone == "completed" {
+            if let Some(reply_url) = reply_to {
+                let callback_url = format!("{}/agent/message", reply_url.trim_end_matches('/'));
+                let payload = json!({
+                    "task_id": task_id_clone,
+                    "from_node": session_id,
+                    "status": "completed",
+                    "output": output_clone.unwrap_or_default(),
+                });
+                tokio::spawn(async move {
+                    let client = Client::new();
+                    let _ = client.post(&callback_url).json(&payload).send().await;
+                });
+            }
+        }
+
+        AgentToolResult::ok(format!("Task #{id} updated (status: {})", status_clone))
     }
 }
 

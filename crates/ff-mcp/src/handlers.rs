@@ -1745,6 +1745,23 @@ pub async fn fleet_models_db(params: Option<Value>) -> HandlerResult {
     }))
 }
 
+// ─── Task Lineage ────────────────────────────────────────────────────────────
+
+pub async fn task_lineage(params: Option<Value>) -> HandlerResult {
+    let task_id = params
+        .as_ref()
+        .and_then(|p| p.get("task_id"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "task_lineage requires 'task_id' parameter".to_string())?;
+
+    let (config, _) = load_config_auto()?;
+    let pool = get_pg_pool(&config).await?;
+
+    ff_db::pg_get_task_lineage(&pool, task_id)
+        .await
+        .map_err(|e| format!("Postgres query failed: {e}"))
+}
+
 // ─── Postgres pool helper ───────────────────────────────────────────────────
 
 async fn get_pg_pool(config: &FleetConfig) -> Result<sqlx::PgPool, String> {
@@ -1782,6 +1799,7 @@ pub async fn dispatch(method: &str, params: Option<Value>) -> HandlerResult {
         "fleet_nodes_db" => fleet_nodes_db(params).await,
         "fleet_node_detail" => fleet_node_detail(params).await,
         "fleet_models_db" => fleet_models_db(params).await,
+        "task_lineage" => task_lineage(params).await,
         _ => Err(format!("unknown method: {method}")),
     }
 }

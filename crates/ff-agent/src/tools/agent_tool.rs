@@ -49,6 +49,14 @@ impl AgentTool for SubAgentTool {
                 "max_turns": {
                     "type": "number",
                     "description": "Maximum turns for the sub-agent (default 10)"
+                },
+                "parent_task_id": {
+                    "type": "string",
+                    "description": "Task ID of the spawning task"
+                },
+                "origin_node": {
+                    "type": "string",
+                    "description": "Node that originated this work"
                 }
             },
             "required": ["prompt"]
@@ -61,6 +69,20 @@ impl AgentTool for SubAgentTool {
             _ => return AgentToolResult::err("Missing or empty 'prompt' parameter"),
         };
 
+        // Inject provenance context into the prompt if provided.
+        let parent_task_id = input.get("parent_task_id").and_then(Value::as_str).unwrap_or("").to_string();
+        let origin_node = input.get("origin_node").and_then(Value::as_str).unwrap_or("").to_string();
+        let prompt = if !parent_task_id.is_empty() || !origin_node.is_empty() {
+            format!(
+                "[PROVENANCE: origin={}, parent_task={}]\n{}",
+                if origin_node.is_empty() { "unknown" } else { &origin_node },
+                if parent_task_id.is_empty() { "none" } else { &parent_task_id },
+                prompt
+            )
+        } else {
+            prompt
+        };
+
         let description = input
             .get("description")
             .and_then(Value::as_str)
@@ -71,11 +93,12 @@ impl AgentTool for SubAgentTool {
             .and_then(Value::as_u64)
             .unwrap_or(10) as u32;
 
-        // Inherit parent's LLM config or use overrides
+        // Inherit parent's LLM config or use overrides.
+        // Fall back to localhost so the InferenceRouter handles actual routing.
         let llm_base_url = input
             .get("llm_base_url")
             .and_then(Value::as_str)
-            .unwrap_or("http://192.168.5.102:55000")
+            .unwrap_or("http://localhost:55000")
             .to_string();
 
         let model = input

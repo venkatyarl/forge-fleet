@@ -171,11 +171,18 @@ struct PgMigration {
 
 /// Postgres-only migrations. These run independently from the SQLite migrations
 /// above and use their own version sequence.
-static PG_MIGRATIONS: &[PgMigration] = &[PgMigration {
-    version: 7,
-    name: "fleet_config_tables",
-    sql: schema::SCHEMA_V7_FLEET_POSTGRES,
-}];
+static PG_MIGRATIONS: &[PgMigration] = &[
+    PgMigration {
+        version: 7,
+        name: "fleet_config_tables",
+        sql: schema::SCHEMA_V7_FLEET_POSTGRES,
+    },
+    PgMigration {
+        version: 8,
+        name: "task_provenance_schema",
+        sql: schema::SCHEMA_V8_TASK_PROVENANCE,
+    },
+];
 
 /// Ensure the Postgres `_migrations` tracking table exists.
 async fn ensure_pg_migrations_table(pool: &PgPool) -> Result<()> {

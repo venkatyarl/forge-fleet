@@ -3,9 +3,8 @@
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use super::{AgentTool, AgentToolContext, AgentToolResult, MAX_TOOL_RESULT_CHARS, truncate_output};
+use super::{AgentTool, AgentToolContext, AgentToolResult};
 use super::web_search::WebSearchTool;
-use super::web_fetch::WebFetchTool;
 
 pub struct CompetitorAnalysisTool;
 #[async_trait]

@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 
 use ff_agent::agent_loop::{AgentEvent, AgentSession, AgentSessionConfig};
 use ff_agent::commands::CommandRegistry;
-use ff_terminal::app::{App, PORT_WEB};
+use ff_terminal::app::App;
 use ff_terminal::render;
 
 const GREEN: &str = "\x1b[32m";
@@ -66,17 +66,52 @@ enum Command {
     Run { prompt: String, #[arg(long, default_value = "text")] output: String, #[arg(long, default_value_t = 30)] max_turns: u32 },
     /// Run with supervisor — auto-detect failures, fix, and retry
     Supervise { prompt: String, #[arg(long, default_value_t = 3)] max_attempts: u32 },
+    /// Manage ForgeFleet tasks
+    Task { #[command(subcommand)] command: TaskCommand },
 }
 
 #[derive(Debug, Subcommand)]
 enum ConfigCommand { Show, Set { key: String, value: String } }
 
+#[derive(Debug, Subcommand)]
+enum TaskCommand {
+    /// List recent tasks
+    List {
+        /// Filter by status (pending/in_progress/completed/failed)
+        #[arg(long)]
+        status: Option<String>,
+        /// Maximum number of tasks to show
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+    },
+    /// Get details for a specific task
+    Get { id: String },
+    /// Update a task's status
+    Update {
+        id: String,
+        #[arg(long)]
+        status: String,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let config_path = resolve_config_path(cli.config)?;
-    let llm = cli.llm.or_else(|| env::var("FORGEFLEET_LLM_URL").ok())
-        .unwrap_or(detect_llm_from_db_or_local(&config_path).await);
+    // Build the local-first inference router (probes localhost + fleet from DB).
+    // If the user explicitly passed --llm, skip auto-routing and use that URL directly.
+    let (llm, router) = if let Some(explicit_url) = cli.llm.or_else(|| env::var("FORGEFLEET_LLM_URL").ok()) {
+        (explicit_url, None)
+    } else {
+        let r = ff_agent::inference_router::InferenceRouter::from_config(&config_path).await;
+        let primary = if let Some(url) = r.active_url() {
+            url
+        } else {
+            detect_llm_from_db_or_local(&config_path).await
+        };
+        (primary, Some(std::sync::Arc::new(r)))
+    };
+
     let mut model = cli.model.or_else(|| env::var("FORGEFLEET_MODEL").ok()).unwrap_or_else(|| "auto".into());
 
     // If model is "auto", query the LLM server for its actual model name
@@ -102,7 +137,6 @@ async fn main() -> Result<()> {
                 }
             }
             Err(_) => {
-                // Fallback: infer from port
                 if llm.contains("51005") {
                     model = "ForgeFleet-LoRA".into();
                 }
@@ -115,6 +149,7 @@ async fn main() -> Result<()> {
         model, llm_base_url: llm, working_dir: working_dir.clone(),
         system_prompt: None, max_turns: 30,
         image_path: cli.image,
+        inference_router: router,
         ..Default::default()
     };
 
@@ -133,28 +168,36 @@ async fn main() -> Result<()> {
             let mut cfg = agent_config; cfg.max_turns = max_turns;
             run_headless(&prompt, cfg, &output).await
         }
+        Some(Command::Task { command }) => handle_task(command, &config_path).await,
         Some(Command::Supervise { prompt, max_attempts }) => {
             let sup_config = ff_agent::supervisor::SupervisorConfig {
                 max_attempts,
                 ..Default::default()
             };
-            println!("{CYAN}▶ Supervisor mode: up to {max_attempts} attempts{RESET}");
-            println!("{CYAN}  Task: {}{RESET}", &prompt[..prompt.len().min(80)]);
-            println!();
+            let llm_display = agent_config.llm_base_url.trim_end_matches('/').to_string();
+            eprintln!("{CYAN}▶ ForgeFleet Supervisor{RESET}  \x1b[2m{llm_display} · model={}{RESET}", agent_config.model);
+            eprintln!("\x1b[2m  Task: {}{RESET}", &prompt[..prompt.len().min(80)]);
+            eprintln!("\x1b[2m  Max attempts: {max_attempts}{RESET}");
+            eprintln!();
 
             let result = ff_agent::supervisor::supervise(&prompt, agent_config, sup_config).await;
 
+            eprintln!();
             if result.success {
-                println!("{GREEN}✓ Task completed on attempt {}/{}{RESET}", result.attempts, max_attempts);
+                eprintln!("{GREEN}✓ Task completed on attempt {}/{max_attempts}{RESET}", result.attempts);
             } else {
-                println!("{RED}✗ Task failed after {} attempts{RESET}", result.attempts);
+                eprintln!("{RED}✗ Task failed after {} attempt(s){RESET}", result.attempts);
             }
 
-            for d in &result.diagnoses {
-                println!("  Attempt {}: {} → {}", d.attempt, d.failure_type, d.fix_applied);
+            if !result.diagnoses.is_empty() {
+                eprintln!();
+                for d in &result.diagnoses {
+                    let status = if d.attempt < result.attempts || result.success { "✓" } else { "✗" };
+                    eprintln!("  \x1b[2mAttempt {}: [{status}] {} → {}\x1b[0m", d.attempt, d.failure_type, d.fix_applied);
+                }
             }
 
-            println!();
+            eprintln!();
             println!("{}", &result.final_output[..result.final_output.len().min(500)]);
             Ok(())
         }
@@ -514,11 +557,70 @@ async fn run_event_loop(
 
 // ─── Headless Mode ─────────────────────────────────────────────────────────
 
+/// Summarize tool input for display — extract the most relevant parameter.
+fn summarize_tool_input(tool_name: &str, input_json: &str) -> String {
+    let v: serde_json::Value = match serde_json::from_str(input_json) {
+        Ok(v) => v,
+        Err(_) => return String::new(),
+    };
+
+    // Pick the most meaningful field per tool
+    let key = match tool_name {
+        "Bash" => "command",
+        "Read" => "file_path",
+        "Write" => "file_path",
+        "Edit" => "file_path",
+        "Glob" => "pattern",
+        "Grep" => "pattern",
+        "WebFetch" | "WebSearch" => "url",
+        "Agent" => "description",
+        "Orchestrate" => "task",
+        "TaskCreate" => "subject",
+        "TaskUpdate" => "task_id",
+        "SendMessage" => "to",
+        _ => "",
+    };
+
+    if !key.is_empty() {
+        if let Some(val) = v.get(key).and_then(|v| v.as_str()) {
+            let truncated = &val[..val.len().min(60)];
+            return truncated.replace('\n', " ").to_string();
+        }
+    }
+
+    // Fallback: first string value in the object
+    if let Some(obj) = v.as_object() {
+        for (_, val) in obj.iter().take(1) {
+            if let Some(s) = val.as_str() {
+                return s[..s.len().min(60)].replace('\n', " ").to_string();
+            }
+        }
+    }
+
+    String::new()
+}
+
+/// Whether to show a result preview for this tool.
+fn should_show_result_preview(tool_name: &str) -> bool {
+    matches!(tool_name,
+        "Bash" | "WebSearch" | "WebFetch" | "Orchestrate" |
+        "TaskCreate" | "TaskList" | "TaskGet" | "SendMessage"
+    )
+}
+
 async fn run_headless(prompt: &str, config: AgentSessionConfig, output_format: &str) -> Result<()> {
+    let is_json = output_format == "json";
+
+    // Print session header
+    if !is_json {
+        let llm_display = config.llm_base_url.trim_end_matches('/').to_string();
+        eprintln!("{CYAN}▶ ForgeFleet Agent{RESET}  \x1b[2m{llm_display} · model={}{RESET}", config.model);
+        eprintln!();
+    }
+
     let mut session = AgentSession::new(config);
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
     let prompt = prompt.to_string();
-    let is_json = output_format == "json";
 
     let handle = tokio::spawn(async move { session.run(&prompt, Some(event_tx)).await });
 
@@ -527,13 +629,56 @@ async fn run_headless(prompt: &str, config: AgentSessionConfig, output_format: &
         if is_json { events.push(event); }
         else {
             match &event {
-                AgentEvent::AssistantText { text, .. } => print!("{text}"),
-                AgentEvent::ToolStart { tool_name, .. } => eprint!("{YELLOW}⚡ {tool_name}...{RESET} "),
-                AgentEvent::ToolEnd { duration_ms, is_error, .. } => {
-                    if *is_error { eprintln!("{RED}✗ ({duration_ms}ms){RESET}"); }
-                    else { eprintln!("{GREEN}✓ ({duration_ms}ms){RESET}"); }
+                AgentEvent::Status { message, .. } => {
+                    eprintln!("\x1b[2m  → {message}\x1b[0m");
                 }
-                AgentEvent::Error { message, .. } => eprintln!("{RED}Error: {message}{RESET}"),
+                AgentEvent::TurnComplete { turn, .. } => {
+                    eprintln!("\x1b[2m── turn {turn} ──────────────────────────────\x1b[0m");
+                }
+                AgentEvent::ToolStart { tool_name, input_json, .. } => {
+                    let input_summary = summarize_tool_input(tool_name, input_json);
+                    eprint!("{YELLOW}⚡ {tool_name}{RESET}");
+                    if !input_summary.is_empty() {
+                        eprint!("\x1b[2m({input_summary})\x1b[0m");
+                    }
+                    eprint!(" ");
+                }
+                AgentEvent::ToolEnd { tool_name, result, is_error, duration_ms, .. } => {
+                    if *is_error {
+                        eprintln!("{RED}✗ ({duration_ms}ms){RESET}");
+                        let first_line = result.lines().next().unwrap_or("").trim();
+                        if !first_line.is_empty() {
+                            eprintln!("  {RED}{}{RESET}", &first_line[..first_line.len().min(120)]);
+                        }
+                    } else {
+                        eprintln!("{GREEN}✓ ({duration_ms}ms){RESET}");
+                        if should_show_result_preview(tool_name) {
+                            let preview = result.trim();
+                            if !preview.is_empty() {
+                                let lines: Vec<&str> = preview.lines().take(3).collect();
+                                for line in lines {
+                                    let trimmed = line.trim();
+                                    if !trimmed.is_empty() {
+                                        eprintln!("  \x1b[2m{}\x1b[0m", &trimmed[..trimmed.len().min(120)]);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                AgentEvent::AssistantText { text, .. } => {
+                    print!("{text}");
+                }
+                AgentEvent::Compaction { messages_before, messages_after, .. } => {
+                    eprintln!("\x1b[2m  ⟳ context compacted: {messages_before} → {messages_after} messages\x1b[0m");
+                }
+                AgentEvent::TokenWarning { usage_pct, .. } => {
+                    let pct = (*usage_pct * 100.0) as u32;
+                    eprintln!("{YELLOW}  ⚠ context {pct}% full\x1b[0m");
+                }
+                AgentEvent::Error { message, .. } => {
+                    eprintln!("{RED}  ✗ {message}{RESET}");
+                }
                 _ => {}
             }
         }
@@ -651,8 +796,15 @@ async fn detect_llm_from_db_or_local(config_path: &std::path::Path) -> String {
                                 endpoints.push((node.ip.clone(), 55000, node.cpu_cores, true));
                             } else {
                                 for m in node_models {
-                                    // Qwen models support tool calling, Gemma does not
-                                    let supports_tools = m.family.to_lowercase().contains("qwen");
+                                    // Qwen and Gemma-4 (via MLX) both support OpenAI tool calling.
+                                    // Check id/slug/name for "gemma-4" or "gemma4" to distinguish from older Gemma variants.
+                                    let fam = m.family.to_lowercase();
+                                    let id_lower = m.id.to_lowercase();
+                                    let name_lower = m.name.to_lowercase();
+                                    let is_gemma4 = (id_lower.contains("gemma-4") || id_lower.contains("gemma4")
+                                        || name_lower.contains("gemma-4") || name_lower.contains("gemma4"))
+                                        && fam.contains("gemma");
+                                    let supports_tools = fam.contains("qwen") || is_gemma4;
                                     endpoints.push((node.ip.clone(), m.port as u16, node.cpu_cores, supports_tools));
                                 }
                             }
@@ -865,6 +1017,124 @@ async fn handle_health(_c: &AgentSessionConfig) -> Result<()> {
         let s = client.get(format!("http://{ip}:51000/health")).send().await.map(|r| r.status().is_success()).unwrap_or(false);
         println!("  {name:<12} {ip}:51000  {}", if s {format!("{GREEN}ONLINE{RESET}")} else {format!("{RED}OFFLINE{RESET}")});
     } Ok(())
+}
+
+async fn handle_task(cmd: TaskCommand, _config_path: &Path) -> Result<()> {
+    // Tasks live in the agent in-memory store, exposed via the agent HTTP server on :50002.
+    let client = reqwest::Client::builder().timeout(Duration::from_secs(5)).build()?;
+    let base = "http://127.0.0.1:50002";
+
+    match cmd {
+        TaskCommand::List { status, limit } => {
+            let resp = client.get(format!("{base}/tasks")).send().await;
+            let body = match resp {
+                Ok(r) => r.json::<serde_json::Value>().await.unwrap_or_default(),
+                Err(e) => {
+                    println!("{RED}✗ Cannot reach agent HTTP server (is forgefleetd running?): {e}{RESET}");
+                    return Ok(());
+                }
+            };
+
+            let empty = vec![];
+            let all_tasks = body.get("tasks").and_then(|v| v.as_array()).unwrap_or(&empty);
+            let tasks: Vec<&serde_json::Value> = all_tasks.iter()
+                .filter(|t| {
+                    if let Some(ref s) = status {
+                        t.get("status").and_then(|v| v.as_str()) == Some(s.as_str())
+                    } else { true }
+                })
+                .take(limit as usize)
+                .collect();
+
+            if tasks.is_empty() {
+                println!("{YELLOW}No tasks found{RESET}");
+                return Ok(());
+            }
+
+            println!("{GREEN}✓ Tasks ({} shown){RESET}", tasks.len());
+            println!("  {:<6} {:<40} {:<12} {:<16} {}", "ID", "SUBJECT", "STATUS", "NODE", "CREATED");
+            println!("  {}", "-".repeat(95));
+            for t in &tasks {
+                let id = t.get("id").and_then(|v| v.as_str()).unwrap_or("-");
+                let subject = t.get("subject").and_then(|v| v.as_str()).unwrap_or("-");
+                let status_str = t.get("status").and_then(|v| v.as_str()).unwrap_or("-");
+                let node = t.get("origin_node").and_then(|v| v.as_str()).unwrap_or("-");
+                let created = t.get("created_at").and_then(|v| v.as_str()).unwrap_or("-");
+                let status_color = match status_str {
+                    "completed" => GREEN,
+                    "failed" => RED,
+                    "in_progress" => CYAN,
+                    _ => YELLOW,
+                };
+                let short_subject = &subject[..subject.len().min(39)];
+                let short_created = &created[..created.len().min(19)];
+                println!("  {id:<6} {short_subject:<40} {status_color}{status_str:<12}{RESET} {node:<16} {short_created}");
+            }
+        }
+        TaskCommand::Get { id } => {
+            let resp = client.get(format!("{base}/tasks")).send().await;
+            let body = match resp {
+                Ok(r) => r.json::<serde_json::Value>().await.unwrap_or_default(),
+                Err(e) => {
+                    println!("{RED}✗ Cannot reach agent HTTP server: {e}{RESET}");
+                    return Ok(());
+                }
+            };
+
+            let empty = vec![];
+            let task = body.get("tasks").and_then(|v| v.as_array()).unwrap_or(&empty)
+                .iter()
+                .find(|t| {
+                    t.get("id").and_then(|v| v.as_str())
+                        .map(|tid| tid == id || tid.starts_with(&id))
+                        .unwrap_or(false)
+                });
+
+            match task {
+                None => println!("{RED}✗ Task not found: {id}{RESET}"),
+                Some(t) => {
+                    let tid = t.get("id").and_then(|v| v.as_str()).unwrap_or(&id);
+                    let subject = t.get("subject").and_then(|v| v.as_str()).unwrap_or("-");
+                    let status = t.get("status").and_then(|v| v.as_str()).unwrap_or("-");
+                    let node = t.get("origin_node").and_then(|v| v.as_str()).unwrap_or("-");
+                    let created = t.get("created_at").and_then(|v| v.as_str()).unwrap_or("-");
+                    println!("{GREEN}✓ Task #{tid}{RESET}");
+                    println!("  subject:     {subject}");
+                    println!("  status:      {status}");
+                    println!("  origin_node: {node}");
+                    println!("  created:     {created}");
+                    if let Some(output) = t.get("output").and_then(|v| v.as_str()) {
+                        if !output.is_empty() {
+                            println!("\n  Output:\n    {}", &output[..output.len().min(500)]);
+                        }
+                    }
+                }
+            }
+        }
+        TaskCommand::Update { id, status } => {
+            // POST a status update via the agent message endpoint
+            let valid = ["pending", "in_progress", "completed", "failed", "cancelled"];
+            if !valid.contains(&status.as_str()) {
+                println!("{RED}✗ Invalid status '{status}'. Valid: {}{RESET}", valid.join(", "));
+                return Ok(());
+            }
+            let payload = serde_json::json!({
+                "task_id": id,
+                "status": status,
+                "output": "",
+                "from": "ff-cli",
+            });
+            let r = client.post(format!("{base}/agent/message"))
+                .json(&payload)
+                .send()
+                .await;
+            match r {
+                Ok(_) => println!("{GREEN}✓ Task #{id} → {status}{RESET}"),
+                Err(e) => println!("{RED}✗ Failed: {e}{RESET}"),
+            }
+        }
+    }
+    Ok(())
 }
 
 fn handle_config(cmd: ConfigCommand, p: &Path) -> Result<()> {

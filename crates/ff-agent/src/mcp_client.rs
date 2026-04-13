@@ -40,7 +40,7 @@ pub struct McpConnection {
 }
 
 enum McpTransport {
-    Stdio { child: Child, stdin_buf: Vec<u8> },
+    Stdio { child: Child, #[allow(dead_code)] stdin_buf: Vec<u8> },
     Http { url: String, client: reqwest::Client },
 }
 

@@ -85,6 +85,7 @@ impl ToolRegistry {
         self.register(Self::fleet_nodes_db());
         self.register(Self::fleet_node_detail());
         self.register(Self::fleet_models_db());
+        self.register(Self::task_lineage());
     }
 
     // ── Tool definitions ─────────────────────────────────────────────────
@@ -510,6 +511,23 @@ impl ToolRegistry {
             }),
         }
     }
+
+    fn task_lineage() -> ToolDefinition {
+        ToolDefinition {
+            name: "task_lineage".to_string(),
+            description: "Get the full routing and ownership lineage for a task — shows which nodes it originated from, was routed through, and ownership handoffs.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "string",
+                        "description": "Task ID to retrieve lineage for"
+                    }
+                },
+                "required": ["task_id"]
+            }),
+        }
+    }
 }
 
 impl Default for ToolRegistry {
@@ -546,6 +564,7 @@ mod tests {
             "fleet_nodes_db",
             "fleet_node_detail",
             "fleet_models_db",
+            "task_lineage",
         ];
         for name in &expected {
             assert!(registry.contains(name), "missing tool: {name}");

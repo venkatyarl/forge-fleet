@@ -5,7 +5,6 @@
 //! When the agent gets stuck, the supervisor diagnoses why and applies
 //! targeted fixes without human intervention.
 
-use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -152,7 +151,7 @@ pub async fn supervise(
     warn!(attempts = sup_config.max_attempts, "supervisor: all attempts failed");
 
     // Write failure diagnosis to Fleet Brain for learning
-    let brain_ctx = crate::brain::BrainLoader::load_for_dir(&agent_config.working_dir).await;
+    let _brain_ctx = crate::brain::BrainLoader::load_for_dir(&agent_config.working_dir).await;
     let entry = crate::scoped_memory::MemoryEntry {
         id: uuid::Uuid::new_v4().to_string(),
         category: crate::scoped_memory::MemoryCategory::Learning,

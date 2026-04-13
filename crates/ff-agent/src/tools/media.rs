@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
+use sqlx::Row;
 use tokio::process::Command;
 
 use super::{AgentTool, AgentToolContext, AgentToolResult, MAX_TOOL_RESULT_CHARS, truncate_output};
@@ -430,12 +431,9 @@ impl AgentTool for VideoAnalyzeTool {
         analysis.push(format!("Duration: {duration:.1}s"));
         analysis.push(format!("Frames extracted: {}", frame_paths.len()));
 
-        // Try to send to the omni model on the fleet
-        // Look for an omni/multimodal endpoint from fleet config
-        let omni_endpoints = [
-            "http://192.168.5.111:55001",  // Logan omni (fallback — should come from DB)
-            "http://127.0.0.1:55000",      // local
-        ];
+        // Try to send to the omni model on the fleet — endpoint resolved from DB.
+        let omni_base = find_omni_endpoint().await;
+        let omni_endpoints = [omni_base.as_str(), "http://127.0.0.1:55000"];
 
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(120))
@@ -447,7 +445,7 @@ impl AgentTool for VideoAnalyzeTool {
             let mut image_contents: Vec<Value> = Vec::new();
             image_contents.push(json!({"type": "text", "text": prompt}));
 
-            for (i, frame) in frame_paths.iter().take(6).enumerate() {
+            for (_i, frame) in frame_paths.iter().take(6).enumerate() {
                 if let Ok(data) = tokio::fs::read(frame).await {
                     use base64::Engine;
                     let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
@@ -471,8 +469,8 @@ impl AgentTool for VideoAnalyzeTool {
                 "temperature": 0.3
             });
 
-            let url = format!("{endpoint}/v1/chat/completions");
-            match client.post(&url).json(&body).send().await {
+            let req_url = format!("{endpoint}/v1/chat/completions");
+            match client.post(&req_url).json(&body).send().await {
                 Ok(resp) => {
                     if let Ok(data) = resp.json::<Value>().await {
                         if let Some(content) = data.pointer("/choices/0/message/content").and_then(Value::as_str) {
@@ -581,6 +579,45 @@ impl AgentTool for AudioAnalyzeTool {
 
         AgentToolResult::ok(info.join("\n"))
     }
+}
+
+/// Resolve the omni/multimodal endpoint from DB; fall back to Logan's known address.
+async fn find_omni_endpoint() -> String {
+    if let Ok(ep) = query_omni_endpoint().await {
+        return ep;
+    }
+    "http://192.168.5.111:55001".to_string() // fallback: Logan
+}
+
+async fn query_omni_endpoint() -> anyhow::Result<String> {
+    let toml_str = std::fs::read_to_string(
+        std::env::var("HOME").unwrap_or_default() + "/.forgefleet/fleet.toml"
+    )?;
+    let config: toml::Value = toml::from_str(&toml_str)?;
+    let db_url = config
+        .get("database").and_then(|d| d.get("url"))
+        .and_then(|u| u.as_str())
+        .ok_or_else(|| anyhow::anyhow!("no db url"))?
+        .to_string();
+
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(std::time::Duration::from_secs(2))
+        .connect(&db_url)
+        .await?;
+
+    let row = sqlx::query(
+        "SELECT fn.ip, fm.port FROM fleet_models fm
+         JOIN fleet_nodes fn ON fn.name = fm.node_name
+         WHERE fm.name ILIKE '%omni%' OR fm.name ILIKE '%multimodal%' OR fm.name ILIKE '%vision%'
+         ORDER BY fn.cpu_cores DESC LIMIT 1"
+    )
+    .fetch_one(&pool)
+    .await?;
+
+    let ip: String = row.try_get("ip")?;
+    let port: i32 = row.try_get("port")?;
+    Ok(format!("http://{}:{}", ip, port))
 }
 
 // HTML parsing helpers

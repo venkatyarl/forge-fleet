@@ -337,6 +337,30 @@ CREATE TABLE IF NOT EXISTS fleet_settings (
 );
 "#;
 
+/// Postgres-only schema: task provenance columns + routing log table.
+///
+/// Applied as Postgres migration version 8.
+/// IF NOT EXISTS / IF NOT EXISTS guards make this idempotent.
+pub const SCHEMA_V8_TASK_PROVENANCE: &str = r#"
+-- ALTER TABLE tasks: add provenance columns (IF NOT EXISTS guards for idempotency)
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS origin_node TEXT;      -- which node created this task
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS parent_task_id TEXT;   -- spawning task ID (for sub-tasks)
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS reply_to_node TEXT;    -- where to POST result callback
+
+-- task_routing_log: full breadcrumb of every node hop
+CREATE TABLE IF NOT EXISTS task_routing_log (
+    id          BIGSERIAL PRIMARY KEY,
+    task_id     TEXT NOT NULL,
+    from_node   TEXT NOT NULL,
+    to_node     TEXT NOT NULL,
+    reason      TEXT NOT NULL DEFAULT '',
+    routed_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_routing_log_task ON task_routing_log(task_id, id);
+CREATE INDEX IF NOT EXISTS idx_routing_log_from ON task_routing_log(from_node);
+CREATE INDEX IF NOT EXISTS idx_routing_log_to ON task_routing_log(to_node);
+"#;
+
 pub const TABLES: &[&str] = &[
     "nodes",
     "models",

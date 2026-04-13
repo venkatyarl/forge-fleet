@@ -7,9 +7,8 @@
 use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
 use tokio::fs;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// Result of a hive sync operation.
 #[derive(Debug, Clone, Default)]

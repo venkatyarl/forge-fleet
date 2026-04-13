@@ -9,7 +9,6 @@
 //!
 //! This is what makes ForgeFleet work like Claude Code but distributed.
 
-use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};

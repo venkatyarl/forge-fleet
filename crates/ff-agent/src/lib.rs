@@ -13,6 +13,7 @@ pub mod consensus;
 pub mod features;
 pub mod fleet_info;
 pub mod focus_stack;
+pub mod inference_router;
 pub mod file_history;
 pub mod fleet_inference;
 pub mod hooks;
@@ -35,6 +36,7 @@ pub mod thinking;
 pub mod tools;
 pub mod training;
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -61,6 +63,9 @@ pub struct EmbeddedAgentConfig {
     pub llm_base_url: Option<String>,
     /// Optional default model for LLM steps.
     pub llm_model: Option<String>,
+    /// Local-first inference router with fleet fallback. When set, LLM steps
+    /// use this to pick the best available endpoint automatically.
+    pub inference_router: Option<Arc<crate::inference_router::InferenceRouter>>,
 }
 
 impl EmbeddedAgentConfig {
@@ -73,6 +78,7 @@ impl EmbeddedAgentConfig {
             ownership_api_base_url: None,
             llm_base_url: None,
             llm_model: None,
+            inference_router: None,
         }
     }
 }
@@ -199,6 +205,29 @@ pub async fn run(
         autonomous = config.autonomous_mode,
         "ff-agent subsystem started"
     );
+
+    // Start the agent HTTP server for inter-node messaging callbacks on port 50002.
+    // Uses a minimal standalone router so it compiles without the binary-only state module.
+    {
+        let message_router = axum::Router::new()
+            .route("/health", axum::routing::get(agent_http_health))
+            .route("/agent/message", axum::routing::post(handle_agent_message))
+            .route("/tasks", axum::routing::get(list_agent_tasks));
+        let agent_http_addr = "0.0.0.0:50002";
+        tokio::spawn(async move {
+            match tokio::net::TcpListener::bind(agent_http_addr).await {
+                Ok(listener) => {
+                    tracing::info!(addr = agent_http_addr, "agent message server listening");
+                    if let Err(err) = axum::serve(listener, message_router).await {
+                        tracing::error!(error = %err, "agent HTTP server failed");
+                    }
+                }
+                Err(err) => {
+                    tracing::error!(error = %err, addr = agent_http_addr, "failed to bind agent HTTP server");
+                }
+            }
+        });
+    }
 
     if config.autonomous_mode {
         run_autonomous_loop(config, operational_store, &mut shutdown_rx).await?;
@@ -729,8 +758,16 @@ async fn execute_claimed_task(
     let graph = build_pipeline_graph(task, &decomposed)?;
 
     let mut exec_config = ExecutorConfig::default();
-    if let Some(base) = &config.llm_base_url {
-        exec_config = exec_config.with_llm_base_url(base.clone());
+
+    // Prefer the inference router's active endpoint; fall back to static llm_base_url.
+    let effective_llm_base_url = config
+        .inference_router
+        .as_ref()
+        .and_then(|r| r.active_url())
+        .or_else(|| config.llm_base_url.clone());
+
+    if let Some(base) = effective_llm_base_url {
+        exec_config = exec_config.with_llm_base_url(base);
     }
     if let Some(model) = task.model.clone().or_else(|| config.llm_model.clone()) {
         exec_config = exec_config.with_llm_model(model);
@@ -849,6 +886,62 @@ fn shell_quote(input: &str) -> String {
     format!("'{}'", input.replace('\'', "'\"'\"'"))
 }
 
+// ---------------------------------------------------------------------------
+// Standalone inter-agent message HTTP handlers (used by the embedded run() loop)
+// ---------------------------------------------------------------------------
+
+async fn agent_http_health() -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!({"ok": true, "service": "ff-agent-message-server"}))
+}
+
+async fn list_agent_tasks() -> axum::Json<serde_json::Value> {
+    use crate::tools::task_tools::TASK_STORE_PUB;
+    let mut tasks: Vec<serde_json::Value> = TASK_STORE_PUB
+        .iter()
+        .map(|e| {
+            let t = e.value();
+            serde_json::json!({
+                "id": t.id,
+                "subject": t.subject,
+                "status": t.status,
+                "origin_node": t.origin_node,
+                "created_at": t.created_at,
+                "output": t.output,
+            })
+        })
+        .collect();
+    // Sort by created_at descending
+    tasks.sort_by(|a, b| {
+        let ca = a.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
+        let cb = b.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
+        cb.cmp(ca)
+    });
+    let count = tasks.len();
+    axum::Json(serde_json::json!({"tasks": tasks, "count": count}))
+}
+
+async fn handle_agent_message(
+    axum::Json(payload): axum::Json<serde_json::Value>,
+) -> axum::Json<serde_json::Value> {
+    let task_id = payload.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+    let status = payload.get("status").and_then(|v| v.as_str()).unwrap_or("");
+    let output = payload.get("output").and_then(|v| v.as_str()).unwrap_or("");
+    let from = payload.get("from").and_then(|v| v.as_str()).unwrap_or("?");
+
+    tracing::info!(task_id, status, from, "agent message received");
+
+    // Update in-memory task store if a task completion callback arrives.
+    if !task_id.is_empty() && status == "completed" {
+        use crate::tools::task_tools::TASK_STORE_PUB;
+        if let Some(mut task) = TASK_STORE_PUB.get_mut(task_id) {
+            task.status = "completed".to_string();
+            task.output = Some(output.to_string());
+        }
+    }
+
+    axum::Json(serde_json::json!({"ok": true}))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -943,6 +1036,7 @@ mod tests {
             ownership_api_base_url: None,
             llm_base_url: None,
             llm_model: None,
+            inference_router: None,
         };
 
         let handle = tokio::spawn(run(
@@ -1031,6 +1125,7 @@ mod tests {
             ownership_api_base_url: None,
             llm_base_url: None,
             llm_model: None,
+            inference_router: None,
         };
 
         let handle = tokio::spawn(run(

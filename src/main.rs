@@ -99,6 +99,11 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
     let node_name = resolve_node_name(cli, &config);
     let role = resolve_role(cli, start, &config, &node_name);
 
+    // Publish node identity for in-process consumers (agent, MCP tools, callbacks).
+    // SAFETY: single-threaded at this point — daemon subsystems haven't spawned yet.
+    #[allow(unused_unsafe)]
+    unsafe { std::env::set_var("FORGEFLEET_NODE_NAME", &node_name); }
+
     init_logging(cli, &node_name)?;
     print_startup_banner(&node_name, &role, &config_path);
 
@@ -223,7 +228,12 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
 
     // 4) agent
     info!("starting subsystem: agent");
-    let embedded_agent_config = build_embedded_agent_config(&config, node_name.clone());
+    let mut embedded_agent_config = build_embedded_agent_config(&config, node_name.clone());
+    // Wire in the inference router so autonomous LLM tasks use local-first fleet routing.
+    let inference_router = Arc::new(
+        ff_agent::inference_router::InferenceRouter::from_config(&config_path).await,
+    );
+    embedded_agent_config.inference_router = Some(inference_router);
     subsystem_tasks.push(start_agent_subsystem(
         embedded_agent_config,
         operational_store.clone(),
@@ -1539,6 +1549,8 @@ fn build_embedded_agent_config(
         ownership_api_base_url: config.agent.ownership_api_base_url.clone(),
         llm_base_url: std::env::var("FF_PIPELINE_LLM_BASE_URL").ok(),
         llm_model: std::env::var("FF_PIPELINE_LLM_MODEL").ok(),
+        // InferenceRouter is wired in at the call site (async context).
+        inference_router: None,
     }
 }
 

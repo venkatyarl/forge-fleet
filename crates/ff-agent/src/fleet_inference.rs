@@ -78,7 +78,8 @@ impl FleetInferenceManager {
         let defaults = vec![
             FleetEndpoint {
                 name: "taylor-gemma".into(), url: "http://192.168.5.100:55000".into(),
-                model_name: "gemma-4-31b-it".into(), model_params: 31_000_000_000,
+                // MLX server uses the full local path as model ID
+                model_name: "/Users/venkat/models/gemma-4-31b-it-4bit".into(), model_params: 31_000_000_000,
                 memory_gb: 96, gpu_type: GpuType::AppleSilicon,
                 tps: None, ttft_ms: None, context_window: 262_144,
                 healthy: true, last_check: None,

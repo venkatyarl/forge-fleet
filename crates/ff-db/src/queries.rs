@@ -2279,3 +2279,84 @@ mod tests {
         assert_eq!(rows[0].hostname.as_deref(), Some("gamma.local"));
     }
 }
+
+// ─── Task Provenance ─────────────────────────────────────────────────────────
+
+/// Append a routing hop to task_routing_log.
+pub async fn pg_append_routing_log(
+    pool: &PgPool,
+    task_id: &str,
+    from_node: &str,
+    to_node: &str,
+    reason: &str,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO task_routing_log (task_id, from_node, to_node, reason)
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind(task_id)
+    .bind(from_node)
+    .bind(to_node)
+    .bind(reason)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// A single routing hop.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RoutingHop {
+    pub task_id: String,
+    pub from_node: String,
+    pub to_node: String,
+    pub reason: String,
+    pub routed_at: String,
+}
+
+/// Get full routing lineage for a task (task row + routing hops + ownership events).
+pub async fn pg_get_task_lineage(pool: &PgPool, task_id: &str) -> Result<serde_json::Value> {
+    // Routing hops
+    let hops = sqlx::query(
+        "SELECT task_id, from_node, to_node, reason, routed_at::text FROM task_routing_log
+         WHERE task_id = $1 ORDER BY id",
+    )
+    .bind(task_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    let hops_json: Vec<serde_json::Value> = hops.iter().map(|r| {
+        serde_json::json!({
+            "from": r.try_get::<String, _>("from_node").unwrap_or_default(),
+            "to": r.try_get::<String, _>("to_node").unwrap_or_default(),
+            "reason": r.try_get::<String, _>("reason").unwrap_or_default(),
+            "at": r.try_get::<String, _>("routed_at").unwrap_or_default(),
+        })
+    }).collect();
+
+    // Ownership events
+    let events = sqlx::query(
+        "SELECT event_type, from_owner, to_owner, reason, created_at FROM ownership_events
+         WHERE task_id = $1 ORDER BY id",
+    )
+    .bind(task_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    let events_json: Vec<serde_json::Value> = events.iter().map(|r| {
+        serde_json::json!({
+            "event": r.try_get::<String, _>("event_type").unwrap_or_default(),
+            "from": r.try_get::<Option<String>, _>("from_owner").unwrap_or_default(),
+            "to": r.try_get::<Option<String>, _>("to_owner").unwrap_or_default(),
+            "reason": r.try_get::<Option<String>, _>("reason").unwrap_or_default(),
+            "at": r.try_get::<String, _>("created_at").unwrap_or_default(),
+        })
+    }).collect();
+
+    Ok(serde_json::json!({
+        "task_id": task_id,
+        "routing": hops_json,
+        "ownership_events": events_json,
+    }))
+}

@@ -94,6 +94,12 @@ impl AgentTool for OrchestrateTool {
             ));
         }
 
+        output.push_str(&format!(
+            "\nTask routing: {} → {}\n",
+            std::env::var("FORGEFLEET_NODE_NAME").unwrap_or_else(|_| "local".into()),
+            result.nodes_used.join(", ")
+        ));
+
         if result.results.iter().any(|r| r.success) {
             AgentToolResult::ok(truncate_output(&output, MAX_TOOL_RESULT_CHARS))
         } else {

@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio::process::Command;
 
-use super::{AgentTool, AgentToolContext, AgentToolResult, MAX_TOOL_RESULT_CHARS, truncate_output};
+use super::{AgentTool, AgentToolContext, AgentToolResult};
 
 /// ColorPalette — generate color palettes, convert formats, check contrast.
 pub struct ColorPaletteTool;
@@ -178,7 +178,7 @@ impl AgentTool for ComponentScaffoldTool {
     async fn execute(&self, input: Value, _ctx: &AgentToolContext) -> AgentToolResult {
         let name = input.get("name").and_then(Value::as_str).unwrap_or("MyComponent");
         let framework = input.get("framework").and_then(Value::as_str).unwrap_or("react");
-        let style = input.get("style").and_then(Value::as_str).unwrap_or("tailwind");
+        let _style = input.get("style").and_then(Value::as_str).unwrap_or("tailwind");
         let props: Vec<Value> = input.get("props").and_then(Value::as_array).cloned().unwrap_or_default();
 
         let props_type = if props.is_empty() { String::new() } else {

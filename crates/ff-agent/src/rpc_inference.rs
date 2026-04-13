@@ -65,6 +65,7 @@ pub struct RpcWorkerConfig {
 /// Manage a distributed inference cluster using llama.cpp RPC.
 pub struct RpcClusterManager {
     config: Option<RpcClusterConfig>,
+    #[allow(dead_code)]
     workers: HashMap<String, RpcWorker>,
 }
 
