@@ -170,6 +170,30 @@ enum ModelCommand {
         id: String,
         #[arg(long, default_value_t = false)] yes: bool,
     },
+    /// Load a model: start a local inference server for it on the given port.
+    Load {
+        /// Library id (UUID from `ff model library`).
+        id: String,
+        /// Port to bind the inference server on (default: 51001).
+        #[arg(long, default_value_t = 51001)] port: u16,
+        /// Context window tokens (default 32768).
+        #[arg(long)] ctx: Option<u32>,
+        /// Parallel request slots (default 4).
+        #[arg(long)] parallel: Option<u32>,
+    },
+    /// Unload: stop a running inference server by deployment id.
+    Unload {
+        /// Deployment id (UUID from `ff model deployments`).
+        id: String,
+    },
+    /// List inference-server processes running on this host.
+    Ps,
+    /// Sample this node's disk usage and write to fleet_disk_usage.
+    DiskSample,
+    /// Health-check a running deployment by id.
+    Ping {
+        id: String,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -1944,6 +1968,64 @@ async fn handle_model(cmd: ModelCommand) -> Result<()> {
                     println!("Deleted {} ({}) from {}", row.file_path, human_bytes(row.size_bytes as u64), row.node_name);
                 }
                 Err(e) => anyhow::bail!("filesystem remove failed: {e}"),
+            }
+        }
+        ModelCommand::Load { id, port, ctx, parallel } => {
+            let opts = ff_agent::model_runtime::LoadOptions {
+                library_id: id.clone(),
+                port,
+                context_size: ctx,
+                parallel,
+            };
+            println!("{CYAN}▶ Loading library {} on port {port}...{RESET}", id);
+            match ff_agent::model_runtime::load_model(&pool, opts).await {
+                Ok(res) => {
+                    println!("{CYAN}✓ Loaded{RESET} — deployment {} pid {} @ http://127.0.0.1:{}",
+                        res.deployment_id, res.pid, res.port);
+                }
+                Err(e) => anyhow::bail!("load failed: {e}"),
+            }
+        }
+        ModelCommand::Unload { id } => {
+            match ff_agent::model_runtime::unload_model(&pool, &id).await {
+                Ok(()) => println!("Unloaded deployment {id}"),
+                Err(e) => anyhow::bail!("unload failed: {e}"),
+            }
+        }
+        ModelCommand::Ps => {
+            let procs = ff_agent::model_runtime::list_local_processes().await;
+            if procs.is_empty() {
+                println!("(no inference servers running)");
+                return Ok(());
+            }
+            println!("{:<8} {:<10} {:<8} {}", "PID", "RUNTIME", "PORT", "MODEL");
+            for p in procs {
+                println!("{:<8} {:<10} {:<8} {}",
+                    p.pid, p.runtime,
+                    p.port.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
+                    p.model_path.clone().unwrap_or_else(|| "-".into()));
+            }
+        }
+        ModelCommand::DiskSample => {
+            match ff_agent::disk_sampler::sample_local_disk(&pool).await {
+                Ok(s) => {
+                    println!("Node:        {}", s.node_name);
+                    println!("Models dir:  {}", s.models_dir.display());
+                    println!("Total:       {}", human_bytes(s.total_bytes));
+                    println!("Used:        {}", human_bytes(s.used_bytes));
+                    println!("Free:        {}", human_bytes(s.free_bytes));
+                    println!("Models size: {}", human_bytes(s.models_bytes));
+                    println!("Quota:       {}%", s.quota_pct);
+                    println!("Over quota:  {}", s.over_quota);
+                }
+                Err(e) => anyhow::bail!("disk sample failed: {e}"),
+            }
+        }
+        ModelCommand::Ping { id } => {
+            match ff_agent::model_runtime::health_check_deployment(&pool, &id).await {
+                Ok(true) => println!("{CYAN}✓ healthy{RESET}"),
+                Ok(false) => println!("{YELLOW}⚠ unhealthy (reachable but failing){RESET}"),
+                Err(e) => anyhow::bail!("health check failed: {e}"),
             }
         }
         ModelCommand::Jobs { status, limit } => {

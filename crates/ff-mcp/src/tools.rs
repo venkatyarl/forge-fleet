@@ -86,6 +86,11 @@ impl ToolRegistry {
         self.register(Self::fleet_node_detail());
         self.register(Self::fleet_models_db());
         self.register(Self::task_lineage());
+        self.register(Self::fleet_models_catalog());
+        self.register(Self::fleet_models_search());
+        self.register(Self::fleet_models_library());
+        self.register(Self::fleet_models_deployments());
+        self.register(Self::fleet_models_disk_usage());
     }
 
     // ── Tool definitions ─────────────────────────────────────────────────
@@ -512,6 +517,81 @@ impl ToolRegistry {
         }
     }
 
+    fn fleet_models_catalog() -> ToolDefinition {
+        ToolDefinition {
+            name: "fleet_models_catalog".to_string(),
+            description: "List the curated model catalog — what models ForgeFleet can download and deploy. Returns id, name, family, parameters, tier, gated flag, and description.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            }),
+        }
+    }
+
+    fn fleet_models_search() -> ToolDefinition {
+        ToolDefinition {
+            name: "fleet_models_search".to_string(),
+            description: "Search the curated model catalog by a query string (matches id, name, family, description). Returns the same shape as fleet_models_catalog.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query — matches id, name, family, or description"
+                    }
+                },
+                "required": ["query"]
+            }),
+        }
+    }
+
+    fn fleet_models_library() -> ToolDefinition {
+        ToolDefinition {
+            name: "fleet_models_library".to_string(),
+            description: "List models actually on disk across fleet nodes. Returns node_name, catalog_id, runtime, quant, file_path, size_bytes. Optionally filter to a single node.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Optional node name to filter to a single node"
+                    }
+                },
+                "required": []
+            }),
+        }
+    }
+
+    fn fleet_models_deployments() -> ToolDefinition {
+        ToolDefinition {
+            name: "fleet_models_deployments".to_string(),
+            description: "List currently running model deployments across the fleet. Returns node_name, catalog_id, runtime, port, health_status, started_at. Optionally filter to a single node.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "node": {
+                        "type": "string",
+                        "description": "Optional node name to filter to a single node"
+                    }
+                },
+                "required": []
+            }),
+        }
+    }
+
+    fn fleet_models_disk_usage() -> ToolDefinition {
+        ToolDefinition {
+            name: "fleet_models_disk_usage".to_string(),
+            description: "Latest disk usage sample per fleet node. Returns node_name, total_gb, used_gb, free_gb, models_gb, sampled_at.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            }),
+        }
+    }
+
     fn task_lineage() -> ToolDefinition {
         ToolDefinition {
             name: "task_lineage".to_string(),
@@ -565,6 +645,11 @@ mod tests {
             "fleet_node_detail",
             "fleet_models_db",
             "task_lineage",
+            "fleet_models_catalog",
+            "fleet_models_search",
+            "fleet_models_library",
+            "fleet_models_deployments",
+            "fleet_models_disk_usage",
         ];
         for name in &expected {
             assert!(registry.contains(name), "missing tool: {name}");

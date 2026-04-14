@@ -1762,6 +1762,174 @@ pub async fn task_lineage(params: Option<Value>) -> HandlerResult {
         .map_err(|e| format!("Postgres query failed: {e}"))
 }
 
+// ─── Fleet Models Catalog / Library / Deployments / Disk Usage ─────────────
+
+fn catalog_row_to_json(row: &ff_db::ModelCatalogRow) -> Value {
+    json!({
+        "id": row.id,
+        "name": row.name,
+        "family": row.family,
+        "parameters": row.parameters,
+        "tier": row.tier,
+        "gated": row.gated,
+        "description": row.description,
+        "preferred_workloads": row.preferred_workloads,
+        "variants": row.variants,
+    })
+}
+
+pub async fn fleet_models_catalog(_params: Option<Value>) -> HandlerResult {
+    let (config, _) = load_config_auto()?;
+    let pool = get_pg_pool(&config).await?;
+
+    let rows = ff_db::pg_list_catalog(&pool)
+        .await
+        .map_err(|e| format!("Postgres query failed: {e}"))?;
+
+    let items: Vec<Value> = rows.iter().map(catalog_row_to_json).collect();
+    Ok(json!({
+        "count": items.len(),
+        "catalog": items,
+    }))
+}
+
+pub async fn fleet_models_search(params: Option<Value>) -> HandlerResult {
+    let query = params
+        .as_ref()
+        .and_then(|p| p.get("query"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "fleet_models_search requires 'query' parameter".to_string())?;
+
+    let (config, _) = load_config_auto()?;
+    let pool = get_pg_pool(&config).await?;
+
+    let rows = ff_db::pg_search_catalog(&pool, query)
+        .await
+        .map_err(|e| format!("Postgres query failed: {e}"))?;
+
+    let items: Vec<Value> = rows.iter().map(catalog_row_to_json).collect();
+    Ok(json!({
+        "query": query,
+        "count": items.len(),
+        "catalog": items,
+    }))
+}
+
+pub async fn fleet_models_library(params: Option<Value>) -> HandlerResult {
+    let node = params
+        .as_ref()
+        .and_then(|p| p.get("node"))
+        .and_then(|v| v.as_str());
+
+    let (config, _) = load_config_auto()?;
+    let pool = get_pg_pool(&config).await?;
+
+    let rows = ff_db::pg_list_library(&pool, node)
+        .await
+        .map_err(|e| format!("Postgres query failed: {e}"))?;
+
+    let items: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "id": r.id,
+                "node_name": r.node_name,
+                "catalog_id": r.catalog_id,
+                "runtime": r.runtime,
+                "quant": r.quant,
+                "file_path": r.file_path,
+                "size_bytes": r.size_bytes,
+                "sha256": r.sha256,
+                "downloaded_at": r.downloaded_at,
+                "last_used_at": r.last_used_at,
+                "source_url": r.source_url,
+            })
+        })
+        .collect();
+
+    Ok(json!({
+        "node_filter": node,
+        "count": items.len(),
+        "library": items,
+    }))
+}
+
+pub async fn fleet_models_deployments(params: Option<Value>) -> HandlerResult {
+    let node = params
+        .as_ref()
+        .and_then(|p| p.get("node"))
+        .and_then(|v| v.as_str());
+
+    let (config, _) = load_config_auto()?;
+    let pool = get_pg_pool(&config).await?;
+
+    let rows = ff_db::pg_list_deployments(&pool, node)
+        .await
+        .map_err(|e| format!("Postgres query failed: {e}"))?;
+
+    let items: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "id": r.id,
+                "node_name": r.node_name,
+                "library_id": r.library_id,
+                "catalog_id": r.catalog_id,
+                "runtime": r.runtime,
+                "port": r.port,
+                "pid": r.pid,
+                "started_at": r.started_at,
+                "last_health_at": r.last_health_at,
+                "health_status": r.health_status,
+                "context_window": r.context_window,
+                "tokens_used": r.tokens_used,
+                "request_count": r.request_count,
+            })
+        })
+        .collect();
+
+    Ok(json!({
+        "node_filter": node,
+        "count": items.len(),
+        "deployments": items,
+    }))
+}
+
+pub async fn fleet_models_disk_usage(_params: Option<Value>) -> HandlerResult {
+    let (config, _) = load_config_auto()?;
+    let pool = get_pg_pool(&config).await?;
+
+    let rows = ff_db::pg_latest_disk_usage(&pool)
+        .await
+        .map_err(|e| format!("Postgres query failed: {e}"))?;
+
+    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
+
+    let items: Vec<Value> = rows
+        .iter()
+        .map(|(node_name, models_dir, total, used, free, models, sampled_at)| {
+            json!({
+                "node_name": node_name,
+                "models_dir": models_dir,
+                "total_bytes": total,
+                "used_bytes": used,
+                "free_bytes": free,
+                "models_bytes": models,
+                "total_gb": (*total as f64) / GB,
+                "used_gb": (*used as f64) / GB,
+                "free_gb": (*free as f64) / GB,
+                "models_gb": (*models as f64) / GB,
+                "sampled_at": sampled_at,
+            })
+        })
+        .collect();
+
+    Ok(json!({
+        "count": items.len(),
+        "disk_usage": items,
+    }))
+}
+
 // ─── Postgres pool helper ───────────────────────────────────────────────────
 
 async fn get_pg_pool(config: &FleetConfig) -> Result<sqlx::PgPool, String> {
@@ -1800,6 +1968,11 @@ pub async fn dispatch(method: &str, params: Option<Value>) -> HandlerResult {
         "fleet_node_detail" => fleet_node_detail(params).await,
         "fleet_models_db" => fleet_models_db(params).await,
         "task_lineage" => task_lineage(params).await,
+        "fleet_models_catalog" => fleet_models_catalog(params).await,
+        "fleet_models_search" => fleet_models_search(params).await,
+        "fleet_models_library" => fleet_models_library(params).await,
+        "fleet_models_deployments" => fleet_models_deployments(params).await,
+        "fleet_models_disk_usage" => fleet_models_disk_usage(params).await,
         _ => Err(format!("unknown method: {method}")),
     }
 }
