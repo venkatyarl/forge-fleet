@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  ForgeFleet daemon launchd agent.
+
+  Installs:   cp this file to ~/Library/LaunchAgents/com.forgefleet.daemon.plist
+  Loads:      launchctl load  ~/Library/LaunchAgents/com.forgefleet.daemon.plist
+  Unloads:    launchctl unload ~/Library/LaunchAgents/com.forgefleet.daemon.plist
+  Start now:  launchctl start com.forgefleet.daemon
+
+  The daemon runs: deferred-task scheduler + worker, disk sampler, deployment
+  reconciler. Add --scheduler on exactly ONE node in the fleet (the leader).
+
+  Replace USER/HOME paths below with yours before installing.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.forgefleet.daemon</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/venkat/.local/bin/ff</string>
+        <string>daemon</string>
+        <string>--scheduler</string>
+        <string>--defer-interval</string>
+        <string>15</string>
+        <string>--disk-interval</string>
+        <string>300</string>
+        <string>--reconcile-interval</string>
+        <string>60</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/Users/venkat</string>
+        <key>PATH</key>
+        <string>/Users/venkat/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/venkat</string>
+
+    <key>StandardOutPath</key>
+    <string>/Users/venkat/.forgefleet/logs/daemon.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/venkat/.forgefleet/logs/daemon.err.log</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>Crashed</key>
+        <true/>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+</dict>
+</plist>

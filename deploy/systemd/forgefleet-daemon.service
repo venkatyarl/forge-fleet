@@ -1,0 +1,46 @@
+# ForgeFleet daemon systemd unit.
+#
+# Installs:   sudo cp this file to /etc/systemd/system/forgefleet-daemon.service
+# Reload:     sudo systemctl daemon-reload
+# Enable:     sudo systemctl enable forgefleet-daemon.service
+# Start:      sudo systemctl start forgefleet-daemon.service
+# Status:     sudo systemctl status forgefleet-daemon.service
+# Logs:       journalctl -u forgefleet-daemon.service -f
+#
+# The daemon runs: deferred-task scheduler + worker, disk sampler, deployment
+# reconciler. Only ONE node in the fleet (the leader) should run with --scheduler.
+#
+# Replace USER/HOME paths below before installing.
+
+[Unit]
+Description=ForgeFleet daemon (defer-worker + disk-sampler + reconciler)
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%i
+Group=%i
+WorkingDirectory=/home/%i
+Environment=HOME=/home/%i
+Environment=PATH=/home/%i/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+# ONE node should pass --scheduler; workers omit it.
+ExecStart=/home/%i/.local/bin/ff daemon \
+    --defer-interval 15 \
+    --disk-interval 300 \
+    --reconcile-interval 60
+
+Restart=on-failure
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+
+# Optional hardening (uncomment once confirmed working)
+# PrivateTmp=yes
+# NoNewPrivileges=yes
+# ProtectSystem=strict
+# ReadWritePaths=/home/%i/.forgefleet /home/%i/models
+
+[Install]
+WantedBy=multi-user.target
