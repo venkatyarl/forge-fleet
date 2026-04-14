@@ -40,6 +40,50 @@ pub struct App {
     pub current_project: Option<ProjectInfo>,
     pub working_dir: PathBuf,
     pub brain_status: Option<ff_agent::brain::BrainLoadedStatus>,
+
+    /// Active modal overlay (e.g. model picker). When Some, key input is captured by the overlay.
+    pub picker: Option<ModelPicker>,
+}
+
+/// Interactive model picker overlay shown when user runs `/model` with no args.
+#[derive(Debug, Clone, Default)]
+pub struct ModelPicker {
+    /// All models loaded from the fleet DB (deduplicated by name, with node list).
+    pub items: Vec<ModelPickerItem>,
+    /// True until the async load completes.
+    pub loading: bool,
+    /// Optional load error to display.
+    pub error: Option<String>,
+    /// Currently highlighted index in the *filtered* view.
+    pub selected: usize,
+    /// Filter typed by the user.
+    pub filter: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelPickerItem {
+    pub name: String,
+    pub tier: i32,
+    /// Nodes that host this model (sorted, deduplicated).
+    pub nodes: Vec<String>,
+    /// Resolved endpoint URL for the first available node (used on select).
+    pub endpoint: String,
+    /// Is at least one host node online?
+    pub online: bool,
+}
+
+impl ModelPicker {
+    /// Returns indices into `items` that match the current filter (case-insensitive substring on name).
+    pub fn visible_indices(&self) -> Vec<usize> {
+        if self.filter.is_empty() {
+            return (0..self.items.len()).collect();
+        }
+        let needle = self.filter.to_lowercase();
+        self.items.iter().enumerate()
+            .filter(|(_, m)| m.name.to_lowercase().contains(&needle))
+            .map(|(i, _)| i)
+            .collect()
+    }
 }
 
 /// A single session tab — each has its own conversation, input, and agent.
@@ -156,6 +200,7 @@ impl App {
             current_project,
             working_dir,
             brain_status: None,
+            picker: None,
         }
     }
 

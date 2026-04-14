@@ -35,6 +35,7 @@ impl CommandRegistry {
         let mut registry = Self { commands: Vec::new() };
         // Register all built-in commands
         registry.register(Box::new(HelpCommand));
+        registry.register(Box::new(ExitCommand));
         registry.register(Box::new(ClearCommand));
         registry.register(Box::new(CompactCommand));
         registry.register(Box::new(ModelCommand));
@@ -112,6 +113,19 @@ impl Command for HelpCommand {
     }
 }
 
+/// `/exit` — special sentinel so it appears in the command list; the TUI handles quitting directly.
+struct ExitCommand;
+#[async_trait]
+impl Command for ExitCommand {
+    fn name(&self) -> &str { "exit" }
+    fn aliases(&self) -> Vec<&str> { vec!["quit"] }
+    fn description(&self) -> &str { "Exit the TUI" }
+    async fn execute(&self, _args: &str, _session: &mut AgentSession) -> String {
+        // TUI intercepts /exit before dispatch; this is a fallback message.
+        "Exiting...".into()
+    }
+}
+
 struct ClearCommand;
 #[async_trait]
 impl Command for ClearCommand {
@@ -149,21 +163,50 @@ struct ModelCommand;
 #[async_trait]
 impl Command for ModelCommand {
     fn name(&self) -> &str { "model" }
-    fn description(&self) -> &str { "Show or switch the current LLM model/endpoint" }
+    fn description(&self) -> &str { "Show or switch the current LLM model (picks the right node automatically)" }
     async fn execute(&self, args: &str, session: &mut AgentSession) -> String {
         if args.is_empty() {
             return format!(
-                "Current model: {}\nEndpoint: {}",
+                "Current model: {}\nEndpoint: {}\n\nUse /models to see available models, or /model <name> to switch.",
                 session.config.model, session.config.llm_base_url
             );
         }
-        // If args contains a URL, switch endpoint
+        // If args contains a URL, switch endpoint directly (raw override)
         if args.starts_with("http") {
             session.config.llm_base_url = args.to_string();
-            format!("Switched LLM endpoint to: {args}")
-        } else {
-            session.config.model = args.to_string();
-            format!("Switched model to: {args}")
+            return format!("Switched LLM endpoint to: {args}");
+        }
+        // Look up the model in the fleet DB and resolve the endpoint automatically.
+        match crate::fleet_info::fetch_snapshot().await {
+            Ok(snapshot) => {
+                let target = args.trim();
+                // Match on model.name (display) or model.slug (e.g. "qwen2.5-coder-32b")
+                let matches: Vec<_> = snapshot.models.iter()
+                    .filter(|m| m.name.eq_ignore_ascii_case(target) || m.slug.eq_ignore_ascii_case(target))
+                    .collect();
+                if matches.is_empty() {
+                    return format!("No model named '{target}' found in the fleet. Run /models to see options.");
+                }
+                // Prefer the first match; find the node to get its IP
+                let chosen = matches[0];
+                let node = snapshot.nodes.iter().find(|n| n.name == chosen.node_name);
+                match node {
+                    Some(node) => {
+                        let url = format!("http://{}:{}", node.ip, chosen.port);
+                        session.config.llm_base_url = url.clone();
+                        session.config.model = chosen.name.clone();
+                        let others: Vec<_> = matches.iter().skip(1).map(|m| m.node_name.as_str()).collect();
+                        let also = if others.is_empty() { String::new() } else { format!(" (also on: {})", others.join(", ")) };
+                        format!("Switched to {} on {} @ {}{}", chosen.name, chosen.node_name, url, also)
+                    }
+                    None => format!("Found model '{target}' but node '{}' is not registered.", chosen.node_name),
+                }
+            }
+            Err(e) => {
+                // Fallback: just set the model name, keep endpoint
+                session.config.model = args.to_string();
+                format!("Switched model to: {args} (fleet lookup failed: {e})")
+            }
         }
     }
 }

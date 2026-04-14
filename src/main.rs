@@ -220,9 +220,9 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         shutdown_rx.clone(),
     ));
 
-    // 3) api proxy — build shared backend registry from config
+    // 3) api proxy — build shared backend registry from config + Postgres
     info!("starting subsystem: api proxy");
-    let api_config = build_api_config(&config);
+    let api_config = build_api_config(&config, operational_store.pg_pool()).await;
     let backend_registry = std::sync::Arc::new(BackendRegistry::new(api_config.backends.clone()));
     subsystem_tasks.push(start_api_proxy_subsystem(api_config));
 
@@ -1554,10 +1554,10 @@ fn build_embedded_agent_config(
     }
 }
 
-fn build_api_config(config: &FleetConfig) -> ApiConfig {
+async fn build_api_config(config: &FleetConfig, pg_pool: Option<&ff_db::PgPool>) -> ApiConfig {
     let mut backends = Vec::new();
 
-    // 1) Node-level model mapping (primary source)
+    // 1) Node-level model mapping from fleet.toml (may be empty when all config is in Postgres)
     for (node_name, node_cfg) in &config.nodes {
         for (model_slug, model_cfg) in &node_cfg.models {
             let port = model_cfg.port.unwrap_or(config.fleet.api_port);
@@ -1610,6 +1610,48 @@ fn build_api_config(config: &FleetConfig) -> ApiConfig {
                 busy: false,
                 scheme: "http".to_string(),
             });
+        }
+    }
+
+    // 3) Primary source: Postgres fleet_models + fleet_nodes (authoritative when daemon runs in
+    //    postgres_full mode — fleet.toml [nodes] sections will be empty).
+    if let Some(pool) = pg_pool {
+        // Build a node-name → IP map from fleet_nodes.
+        let node_ips: HashMap<String, String> = ff_db::pg_list_nodes(pool)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|n| (n.name, n.ip))
+            .collect();
+
+        if let Ok(db_models) = ff_db::pg_list_models(pool).await {
+            for m in db_models {
+                if let Some(host) = node_ips.get(&m.node_name) {
+                    let port = m.port as u16;
+                    let id = format!("{}:{}:{}", m.node_name, m.slug, port);
+                    if backends.iter().any(|b| b.id == id) {
+                        continue;
+                    }
+                    backends.push(BackendEndpoint {
+                        id,
+                        node: m.node_name.clone(),
+                        host: host.clone(),
+                        port,
+                        model: m.slug.clone(),
+                        tier: m.tier as u8,
+                        healthy: true,
+                        busy: false,
+                        scheme: "http".to_string(),
+                    });
+                    info!(
+                        node = %m.node_name,
+                        model = %m.slug,
+                        host,
+                        port,
+                        "registered backend from Postgres fleet_models"
+                    );
+                }
+            }
         }
     }
 

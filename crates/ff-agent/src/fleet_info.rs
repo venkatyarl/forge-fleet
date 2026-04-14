@@ -7,7 +7,7 @@
 
 use std::time::Duration;
 
-use ff_db::{FleetModelRow, FleetNodeRow, pg_get_node, pg_list_models, pg_list_nodes};
+use ff_db::{FleetModelRow, FleetNodeRow, pg_get_node, pg_get_secret, pg_list_models, pg_list_nodes};
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use tokio::sync::OnceCell;
@@ -73,6 +73,47 @@ pub async fn fetch_snapshot() -> Result<FleetSnapshot, String> {
         .await
         .map_err(|e| format!("pg_list_models: {e}"))?;
     Ok(FleetSnapshot { nodes, models })
+}
+
+// ─── Secrets ───────────────────────────────────────────────────────────────
+
+/// Fetch a secret by key. Priority: Postgres `fleet_secrets` table, then the
+/// corresponding environment variable (e.g. `HF_TOKEN` for `huggingface.token`).
+/// Returns `None` if neither source has a value.
+pub async fn fetch_secret(key: &str) -> Option<String> {
+    if let Ok(pool) = get_fleet_pool().await {
+        if let Ok(Some(value)) = pg_get_secret(&pool, key).await {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    // Fallback: environment variable.
+    let env_key = env_key_for_secret(key);
+    if let Ok(val) = std::env::var(&env_key) {
+        let trimmed = val.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    None
+}
+
+/// Convenience wrapper for the Hugging Face token.
+pub async fn get_hf_token() -> Option<String> {
+    fetch_secret("huggingface.token").await
+}
+
+/// Map a secret key to its fallback environment variable name.
+/// e.g. `huggingface.token` → `HF_TOKEN`, `openai.api_key` → `OPENAI_API_KEY`.
+fn env_key_for_secret(key: &str) -> String {
+    match key {
+        "huggingface.token" => "HF_TOKEN".to_string(),
+        "openai.api_key" => "OPENAI_API_KEY".to_string(),
+        "anthropic.api_key" => "ANTHROPIC_API_KEY".to_string(),
+        other => other.replace('.', "_").to_uppercase(),
+    }
 }
 
 /// Look up a single node by name (case-insensitive).

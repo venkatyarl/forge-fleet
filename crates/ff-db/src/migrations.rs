@@ -182,6 +182,16 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "task_provenance_schema",
         sql: schema::SCHEMA_V8_TASK_PROVENANCE,
     },
+    PgMigration {
+        version: 9,
+        name: "fleet_secrets",
+        sql: schema::SCHEMA_V9_FLEET_SECRETS,
+    },
+    PgMigration {
+        version: 10,
+        name: "deferred_tasks",
+        sql: schema::SCHEMA_V10_DEFERRED_TASKS,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.

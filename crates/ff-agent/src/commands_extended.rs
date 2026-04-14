@@ -326,16 +326,35 @@ struct ModelsCommand;
 #[async_trait]
 impl Command for ModelsCommand {
     fn name(&self) -> &str { "models" }
-    fn description(&self) -> &str { "List available models on current LLM endpoint" }
+    fn description(&self) -> &str { "List available models across the fleet (deduplicated)" }
     async fn execute(&self, _args: &str, session: &mut AgentSession) -> String {
-        let url = format!("{}/v1/models", session.config.llm_base_url.trim_end_matches('/'));
-        let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(5)).build().unwrap_or_default();
-        match client.get(&url).send().await {
-            Ok(resp) => match resp.text().await {
-                Ok(body) => body,
-                Err(e) => format!("Failed to read: {e}"),
-            },
-            Err(e) => format!("Failed to fetch models: {e}"),
+        match crate::fleet_info::fetch_snapshot().await {
+            Ok(snapshot) => {
+                use std::collections::BTreeMap;
+                // Map: model_name -> (tier, Vec<node_name>)
+                let mut by_name: BTreeMap<String, (i32, Vec<String>)> = BTreeMap::new();
+                for m in &snapshot.models {
+                    let entry = by_name.entry(m.name.clone()).or_insert((m.tier, Vec::new()));
+                    if !entry.1.contains(&m.node_name) {
+                        entry.1.push(m.node_name.clone());
+                    }
+                }
+                if by_name.is_empty() {
+                    return "No models registered in fleet database.".to_string();
+                }
+                let mut out = String::new();
+                out.push_str(&format!("Available models ({} unique, {} total across fleet):\n\n", by_name.len(), snapshot.models.len()));
+                // Sort by tier desc, then name
+                let mut entries: Vec<_> = by_name.into_iter().collect();
+                entries.sort_by(|a, b| b.1.0.cmp(&a.1.0).then(a.0.cmp(&b.0)));
+                for (name, (tier, mut nodes)) in entries {
+                    nodes.sort();
+                    out.push_str(&format!("  [T{tier}] {name}\n       on: {}\n", nodes.join(", ")));
+                }
+                out.push_str(&format!("\nCurrent: {} @ {}\nUse /model <name> to switch.", session.config.model, session.config.llm_base_url));
+                out
+            }
+            Err(e) => format!("Failed to load fleet snapshot: {e}\n\nFalling back to endpoint query...\nEndpoint: {}", session.config.llm_base_url),
         }
     }
 }

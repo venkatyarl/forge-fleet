@@ -1600,6 +1600,386 @@ pub async fn pg_set_setting(pool: &PgPool, key: &str, value: &JsonValue) -> Resu
     Ok(())
 }
 
+// ─── Fleet Secrets ─────────────────────────────────────────────────────────
+// Plaintext at rest — acceptable for trusted internal fleet.
+// Callers MUST NOT log secret values; prefer lengths or hashes when debugging.
+
+/// A row from `fleet_secrets`. Contains the plaintext value — handle with care.
+#[derive(Debug, Clone)]
+pub struct FleetSecretRow {
+    pub key: String,
+    pub value: String,
+    pub description: Option<String>,
+    pub updated_by: Option<String>,
+}
+
+/// Fetch a single secret value by key. Returns `None` if missing.
+pub async fn pg_get_secret(pool: &PgPool, key: &str) -> Result<Option<String>> {
+    let row = sqlx::query("SELECT value FROM fleet_secrets WHERE key = $1")
+        .bind(key)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(|r| r.get("value")))
+}
+
+/// Upsert a secret. `updated_by` is a free-form tag (node name, user, or tool).
+pub async fn pg_set_secret(
+    pool: &PgPool,
+    key: &str,
+    value: &str,
+    description: Option<&str>,
+    updated_by: Option<&str>,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO fleet_secrets (key, value, description, updated_at, updated_by)
+         VALUES ($1, $2, $3, NOW(), $4)
+         ON CONFLICT (key) DO UPDATE SET
+            value = EXCLUDED.value,
+            description = COALESCE(EXCLUDED.description, fleet_secrets.description),
+            updated_at = NOW(),
+            updated_by = EXCLUDED.updated_by",
+    )
+    .bind(key)
+    .bind(value)
+    .bind(description)
+    .bind(updated_by)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Delete a secret by key. Returns true if a row was deleted.
+pub async fn pg_delete_secret(pool: &PgPool, key: &str) -> Result<bool> {
+    let result = sqlx::query("DELETE FROM fleet_secrets WHERE key = $1")
+        .bind(key)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+// ─── Deferred Task Queue ───────────────────────────────────────────────────
+
+/// One row of the deferred_tasks table. Payload/trigger_spec/result/required_caps are free-form JSON.
+#[derive(Debug, Clone)]
+pub struct DeferredTaskRow {
+    pub id: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub created_by: Option<String>,
+    pub title: String,
+    pub kind: String,
+    pub payload: JsonValue,
+    pub trigger_type: String,
+    pub trigger_spec: JsonValue,
+    pub preferred_node: Option<String>,
+    pub required_caps: JsonValue,
+    pub status: String,
+    pub attempts: i32,
+    pub max_attempts: i32,
+    pub next_attempt_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub claimed_by: Option<String>,
+    pub claimed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_error: Option<String>,
+    pub result: Option<JsonValue>,
+    pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Insert a new deferred task. Returns the generated UUID.
+pub async fn pg_enqueue_deferred(
+    pool: &PgPool,
+    title: &str,
+    kind: &str,
+    payload: &JsonValue,
+    trigger_type: &str,
+    trigger_spec: &JsonValue,
+    preferred_node: Option<&str>,
+    required_caps: &JsonValue,
+    created_by: Option<&str>,
+    max_attempts: Option<i32>,
+) -> Result<String> {
+    let row = sqlx::query(
+        "INSERT INTO deferred_tasks
+            (title, kind, payload, trigger_type, trigger_spec, preferred_node,
+             required_caps, created_by, max_attempts)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, COALESCE($9, 5))
+         RETURNING id",
+    )
+    .bind(title)
+    .bind(kind)
+    .bind(payload)
+    .bind(trigger_type)
+    .bind(trigger_spec)
+    .bind(preferred_node)
+    .bind(required_caps)
+    .bind(created_by)
+    .bind(max_attempts)
+    .fetch_one(pool)
+    .await?;
+    let id: sqlx::types::Uuid = row.get("id");
+    Ok(id.to_string())
+}
+
+/// List deferred tasks filtered by status (None = all). Newest first.
+pub async fn pg_list_deferred(
+    pool: &PgPool,
+    status: Option<&str>,
+    limit: i64,
+) -> Result<Vec<DeferredTaskRow>> {
+    let rows = if let Some(s) = status {
+        sqlx::query(
+            "SELECT * FROM deferred_tasks WHERE status = $1 ORDER BY created_at DESC LIMIT $2",
+        )
+        .bind(s)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?
+    } else {
+        sqlx::query("SELECT * FROM deferred_tasks ORDER BY created_at DESC LIMIT $1")
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+    };
+    Ok(rows.iter().map(row_to_deferred).collect())
+}
+
+/// Fetch a single deferred task by id. Returns None if missing.
+pub async fn pg_get_deferred(pool: &PgPool, id: &str) -> Result<Option<DeferredTaskRow>> {
+    let uuid = sqlx::types::Uuid::parse_str(id)
+        .map_err(|e| crate::error::DbError::NotFound(format!("bad uuid {id}: {e}")))?;
+    let row = sqlx::query("SELECT * FROM deferred_tasks WHERE id = $1")
+        .bind(uuid)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.as_ref().map(row_to_deferred))
+}
+
+/// Cancel a deferred task by id. Only allowed from pending/dispatchable/failed states.
+/// Returns true if a row was updated.
+pub async fn pg_cancel_deferred(pool: &PgPool, id: &str) -> Result<bool> {
+    let uuid = sqlx::types::Uuid::parse_str(id)
+        .map_err(|e| crate::error::DbError::NotFound(format!("bad uuid {id}: {e}")))?;
+    let r = sqlx::query(
+        "UPDATE deferred_tasks
+            SET status = 'cancelled', completed_at = NOW()
+          WHERE id = $1
+            AND status IN ('pending', 'dispatchable', 'failed')",
+    )
+    .bind(uuid)
+    .execute(pool)
+    .await?;
+    Ok(r.rows_affected() > 0)
+}
+
+/// Mark a failed task for retry: reset to 'pending' and clear the claim.
+/// Returns true if a row was updated.
+pub async fn pg_retry_deferred(pool: &PgPool, id: &str) -> Result<bool> {
+    let uuid = sqlx::types::Uuid::parse_str(id)
+        .map_err(|e| crate::error::DbError::NotFound(format!("bad uuid {id}: {e}")))?;
+    let r = sqlx::query(
+        "UPDATE deferred_tasks
+            SET status = 'pending',
+                claimed_by = NULL,
+                claimed_at = NULL,
+                next_attempt_at = NOW(),
+                last_error = NULL
+          WHERE id = $1 AND status IN ('failed', 'cancelled')",
+    )
+    .bind(uuid)
+    .execute(pool)
+    .await?;
+    Ok(r.rows_affected() > 0)
+}
+
+/// Promote pending tasks to 'dispatchable' when their trigger conditions are met.
+/// `online_nodes` is the set of node names currently reachable.
+/// `now` is the current UTC time (for at_time triggers).
+/// Returns the number of tasks promoted.
+pub async fn pg_scheduler_pass(
+    pool: &PgPool,
+    online_nodes: &[String],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<u64> {
+    // node_online: promote if any node in trigger_spec.node matches online_nodes.
+    // Using JSONB -> for key access; ANY() for set membership.
+    let node_online_promoted = if online_nodes.is_empty() {
+        0
+    } else {
+        sqlx::query(
+            "UPDATE deferred_tasks
+                SET status = 'dispatchable',
+                    next_attempt_at = NOW()
+              WHERE status = 'pending'
+                AND trigger_type = 'node_online'
+                AND (trigger_spec->>'node') = ANY($1)",
+        )
+        .bind(online_nodes)
+        .execute(pool)
+        .await?
+        .rows_affected()
+    };
+
+    // at_time: promote if trigger_spec.at <= now.
+    let at_time_promoted = sqlx::query(
+        "UPDATE deferred_tasks
+            SET status = 'dispatchable',
+                next_attempt_at = NOW()
+          WHERE status = 'pending'
+            AND trigger_type = 'at_time'
+            AND (trigger_spec->>'at')::timestamptz <= $1",
+    )
+    .bind(now)
+    .execute(pool)
+    .await?
+    .rows_affected();
+
+    // manual / now: promote immediately (manual is for retry loops; 'now' is fire-and-forget).
+    let immediate_promoted = sqlx::query(
+        "UPDATE deferred_tasks
+            SET status = 'dispatchable',
+                next_attempt_at = NOW()
+          WHERE status = 'pending'
+            AND trigger_type IN ('manual', 'now')
+            AND (next_attempt_at IS NULL OR next_attempt_at <= NOW())",
+    )
+    .execute(pool)
+    .await?
+    .rows_affected();
+
+    Ok(node_online_promoted + at_time_promoted + immediate_promoted)
+}
+
+/// Atomic worker claim: grab one dispatchable task that matches the worker's capabilities.
+/// Uses FOR UPDATE SKIP LOCKED for race-free multi-worker claim semantics.
+pub async fn pg_claim_deferred(
+    pool: &PgPool,
+    worker_node: &str,
+) -> Result<Option<DeferredTaskRow>> {
+    let mut tx = pool.begin().await?;
+    // Prefer tasks with preferred_node = worker_node first, then any node.
+    let row = sqlx::query(
+        "SELECT * FROM deferred_tasks
+          WHERE status = 'dispatchable'
+            AND (preferred_node IS NULL OR preferred_node = $1)
+            AND (next_attempt_at IS NULL OR next_attempt_at <= NOW())
+          ORDER BY (preferred_node = $1) DESC NULLS LAST, created_at ASC
+          FOR UPDATE SKIP LOCKED
+          LIMIT 1",
+    )
+    .bind(worker_node)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let claimed = if let Some(r) = row {
+        let id: sqlx::types::Uuid = r.get("id");
+        sqlx::query(
+            "UPDATE deferred_tasks
+                SET status = 'running',
+                    claimed_by = $1,
+                    claimed_at = NOW(),
+                    attempts = attempts + 1
+              WHERE id = $2",
+        )
+        .bind(worker_node)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        Some(row_to_deferred(&r))
+    } else {
+        None
+    };
+
+    tx.commit().await?;
+    Ok(claimed)
+}
+
+/// Finalize a deferred task after execution. `success = true` → completed; false → failed.
+/// On failure, attempts are compared to max_attempts to decide retry vs terminal.
+pub async fn pg_finish_deferred(
+    pool: &PgPool,
+    id: &str,
+    success: bool,
+    result: Option<&JsonValue>,
+    error: Option<&str>,
+) -> Result<()> {
+    let uuid = sqlx::types::Uuid::parse_str(id)
+        .map_err(|e| crate::error::DbError::NotFound(format!("bad uuid {id}: {e}")))?;
+    if success {
+        sqlx::query(
+            "UPDATE deferred_tasks
+                SET status = 'completed',
+                    result = $1,
+                    completed_at = NOW()
+              WHERE id = $2",
+        )
+        .bind(result)
+        .bind(uuid)
+        .execute(pool)
+        .await?;
+    } else {
+        // Retry if attempts < max_attempts; else terminal fail.
+        sqlx::query(
+            "UPDATE deferred_tasks
+                SET status = CASE
+                        WHEN attempts >= max_attempts THEN 'failed'
+                        ELSE 'pending'
+                    END,
+                    last_error = $1,
+                    claimed_by = NULL,
+                    claimed_at = NULL,
+                    -- Exponential backoff capped at 4h: 1m, 5m, 30m, 1h, 4h
+                    next_attempt_at = NOW() + (LEAST(240, GREATEST(1, POWER(5, attempts)::int)) * INTERVAL '1 minute')
+              WHERE id = $2",
+        )
+        .bind(error)
+        .bind(uuid)
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
+/// Map a sqlx Row into a DeferredTaskRow.
+fn row_to_deferred(r: &sqlx::postgres::PgRow) -> DeferredTaskRow {
+    let id: sqlx::types::Uuid = r.get("id");
+    DeferredTaskRow {
+        id: id.to_string(),
+        created_at: r.get("created_at"),
+        created_by: r.get("created_by"),
+        title: r.get("title"),
+        kind: r.get("kind"),
+        payload: r.get("payload"),
+        trigger_type: r.get("trigger_type"),
+        trigger_spec: r.get("trigger_spec"),
+        preferred_node: r.get("preferred_node"),
+        required_caps: r.get("required_caps"),
+        status: r.get("status"),
+        attempts: r.get("attempts"),
+        max_attempts: r.get("max_attempts"),
+        next_attempt_at: r.get("next_attempt_at"),
+        claimed_by: r.get("claimed_by"),
+        claimed_at: r.get("claimed_at"),
+        last_error: r.get("last_error"),
+        result: r.get("result"),
+        completed_at: r.get("completed_at"),
+    }
+}
+
+/// List secrets metadata (key, description, updated_by, updated_at) — does NOT return values.
+/// Use `pg_get_secret` when a specific value is needed.
+pub async fn pg_list_secrets(pool: &PgPool) -> Result<Vec<(String, Option<String>, Option<String>, chrono::DateTime<chrono::Utc>)>> {
+    let rows = sqlx::query(
+        "SELECT key, description, updated_by, updated_at
+         FROM fleet_secrets ORDER BY key",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.iter().map(|r| (
+        r.get::<String, _>("key"),
+        r.get::<Option<String>, _>("description"),
+        r.get::<Option<String>, _>("updated_by"),
+        r.get::<chrono::DateTime<chrono::Utc>, _>("updated_at"),
+    )).collect())
+}
+
 // ─── Seed from FleetConfig ───────────────────────────────────────────────────
 
 /// Seed Postgres fleet tables from a parsed `FleetConfig`.

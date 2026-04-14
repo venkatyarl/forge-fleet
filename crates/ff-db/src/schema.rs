@@ -341,6 +341,58 @@ CREATE TABLE IF NOT EXISTS fleet_settings (
 ///
 /// Applied as Postgres migration version 8.
 /// IF NOT EXISTS / IF NOT EXISTS guards make this idempotent.
+pub const SCHEMA_V10_DEFERRED_TASKS: &str = r#"
+-- ─── Deferred Task Queue ──────────────────────────────────────────────────
+-- Persistent queue for work that can't run right now (offline node, future time,
+-- event trigger). Leader schedules, any daemon can worker-claim via SKIP LOCKED.
+CREATE TABLE IF NOT EXISTS deferred_tasks (
+    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by       TEXT,                          -- user@host or service tag
+    title            TEXT NOT NULL,                 -- one-line human summary
+    -- What to run
+    kind             TEXT NOT NULL,                 -- 'shell' | 'http' | 'agent_run'
+    payload          JSONB NOT NULL,                -- shape depends on kind
+    -- When to run
+    trigger_type     TEXT NOT NULL,                 -- 'node_online' | 'at_time' | 'manual' | 'now'
+    trigger_spec     JSONB NOT NULL DEFAULT '{}',   -- e.g. {"node": "ace"} or {"at": "..."}
+    -- Execution routing
+    preferred_node   TEXT,                          -- null = any node may claim
+    required_caps    JSONB NOT NULL DEFAULT '[]',   -- e.g. ["llm", "qwen-coder"]
+    -- Status machine
+    status           TEXT NOT NULL DEFAULT 'pending',  -- pending | dispatchable | running | completed | failed | cancelled
+    attempts         INT NOT NULL DEFAULT 0,
+    max_attempts     INT NOT NULL DEFAULT 5,
+    next_attempt_at  TIMESTAMPTZ,                   -- null until scheduler decides
+    claimed_by       TEXT,                          -- node name that is running it
+    claimed_at       TIMESTAMPTZ,
+    last_error       TEXT,
+    result           JSONB,
+    completed_at     TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_deferred_tasks_status_next
+    ON deferred_tasks (status, next_attempt_at);
+CREATE INDEX IF NOT EXISTS idx_deferred_tasks_preferred_node
+    ON deferred_tasks (preferred_node) WHERE status IN ('pending', 'dispatchable');
+CREATE INDEX IF NOT EXISTS idx_deferred_tasks_trigger
+    ON deferred_tasks (trigger_type) WHERE status = 'pending';
+"#;
+
+pub const SCHEMA_V9_FLEET_SECRETS: &str = r#"
+-- ─── Fleet Secrets ────────────────────────────────────────────────────────
+-- Shared secrets (API tokens, etc.) readable by every fleet node.
+-- Plaintext at rest — acceptable for a trusted internal fleet.
+-- Future: encrypt with a fleet master key from macOS Keychain / Linux keyring.
+CREATE TABLE IF NOT EXISTS fleet_secrets (
+    key         TEXT PRIMARY KEY,           -- e.g. "huggingface.token"
+    value       TEXT NOT NULL,              -- raw secret value
+    description TEXT,                       -- human-readable purpose
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_by  TEXT                        -- node or user that set it
+);
+"#;
+
 pub const SCHEMA_V8_TASK_PROVENANCE: &str = r#"
 -- ALTER TABLE tasks: add provenance columns (IF NOT EXISTS guards for idempotency)
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS origin_node TEXT;      -- which node created this task

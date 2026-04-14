@@ -68,10 +68,76 @@ enum Command {
     Supervise { prompt: String, #[arg(long, default_value_t = 3)] max_attempts: u32 },
     /// Manage ForgeFleet tasks
     Task { #[command(subcommand)] command: TaskCommand },
+    /// Manage fleet-wide secrets (HF token, API keys, etc.) stored in Postgres.
+    Secrets { #[command(subcommand)] command: SecretsCommand },
+    /// Deferred task queue — schedule work that runs when conditions are met
+    /// (node comes online, a time is reached, manual retry).
+    Defer { #[command(subcommand)] command: DeferCommand },
+    /// Run the deferred task worker loop (scheduler + executor).
+    /// Typically run as a background service on the fleet leader.
+    DeferWorker {
+        /// Optional node name to use when claiming tasks; defaults to `hostname`.
+        #[arg(long)] as_node: Option<String>,
+        /// Poll interval in seconds (scheduler + fallback for Redis).
+        #[arg(long, default_value_t = 15)] interval: u64,
+        /// Also act as scheduler (evaluate triggers → dispatchable). Only one node should do this.
+        #[arg(long, default_value_t = false)] scheduler: bool,
+        /// Exit after one scheduler+worker pass (useful for tests / cron).
+        #[arg(long, default_value_t = false)] once: bool,
+    },
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Clone, Subcommand)]
 enum ConfigCommand { Show, Set { key: String, value: String } }
+
+#[derive(Debug, Clone, Subcommand)]
+enum DeferCommand {
+    /// List deferred tasks. Filter by status or limit count.
+    #[command(alias = "ls")]
+    List {
+        #[arg(long)] status: Option<String>,
+        #[arg(long, default_value_t = 50)] limit: i64,
+    },
+    /// Enqueue a shell command to run when a target node comes online.
+    /// Example: ff defer add-shell --when-node-online ace --run "rm -rf ~/.ollama" --title "Ollama cleanup on ace"
+    AddShell {
+        /// Human-readable title shown in listings.
+        #[arg(long)] title: String,
+        /// Shell command to execute on the target node (via SSH).
+        #[arg(long)] run: String,
+        /// Trigger: task runs when this node becomes reachable.
+        #[arg(long = "when-node-online")] when_node_online: Option<String>,
+        /// Optional: run at a specific RFC3339 time instead (UTC).
+        #[arg(long = "when-at")] when_at: Option<String>,
+        /// Node that should execute the command (defaults to the target in when-node-online).
+        #[arg(long = "on-node")] on_node: Option<String>,
+        #[arg(long, default_value_t = 5)] max_attempts: i32,
+    },
+    /// Show details for a single deferred task by id.
+    Get { id: String },
+    /// Cancel a pending/dispatchable/failed task.
+    Cancel { id: String },
+    /// Retry a failed or cancelled task (resets attempts-aware status, runs ASAP).
+    Retry { id: String },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum SecretsCommand {
+    /// List secret keys (values are not printed).
+    #[command(alias = "ls")]
+    List,
+    /// Print a secret value by key (careful — goes to stdout).
+    Get { key: String },
+    /// Set (or update) a secret.
+    Set {
+        key: String,
+        value: String,
+        #[arg(long)] description: Option<String>,
+    },
+    /// Delete a secret by key.
+    #[command(alias = "rm")]
+    Delete { key: String },
+}
 
 #[derive(Debug, Subcommand)]
 enum TaskCommand {
@@ -98,6 +164,22 @@ enum TaskCommand {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let config_path = resolve_config_path(cli.config)?;
+
+    // Fast-path subcommands that don't need the inference router or any LLM probing.
+    // Skips a network round-trip to the fleet + `/v1/models` HTTP fetch.
+    match &cli.command {
+        Some(Command::Version) => { println!("ff {}", env!("CARGO_PKG_VERSION")); return Ok(()); }
+        Some(Command::Secrets { command }) => return handle_secrets(command.clone()).await,
+        Some(Command::Defer   { command }) => return handle_defer(command.clone()).await,
+        Some(Command::DeferWorker { as_node, interval, scheduler, once }) => {
+            return handle_defer_worker(as_node.clone(), *interval, *scheduler, *once).await;
+        }
+        Some(Command::Config  { command }) => return handle_config(command.clone(), &config_path),
+        Some(Command::Status)              => return handle_status(&config_path),
+        Some(Command::Nodes)               => return handle_nodes(&config_path),
+        _ => {}
+    }
+
     // Build the local-first inference router (probes localhost + fleet from DB).
     // If the user explicitly passed --llm, skip auto-routing and use that URL directly.
     let (llm, router) = if let Some(explicit_url) = cli.llm.or_else(|| env::var("FORGEFLEET_LLM_URL").ok()) {
@@ -169,6 +251,11 @@ async fn main() -> Result<()> {
             run_headless(&prompt, cfg, &output).await
         }
         Some(Command::Task { command }) => handle_task(command, &config_path).await,
+        Some(Command::Secrets { command }) => handle_secrets(command).await,
+        Some(Command::Defer { command }) => handle_defer(command).await,
+        Some(Command::DeferWorker { as_node, interval, scheduler, once }) => {
+            handle_defer_worker(as_node, interval, scheduler, once).await
+        }
         Some(Command::Supervise { prompt, max_attempts }) => {
             let sup_config = ff_agent::supervisor::SupervisorConfig {
                 max_attempts,
@@ -337,6 +424,9 @@ async fn run_event_loop(
             }
         }
 
+        // Poll any in-flight async picker load
+        poll_picker_load(app);
+
         // Render
         app.frame += 1;
         terminal.draw(|frame| render::render(frame, app))?;
@@ -367,6 +457,12 @@ async fn run_event_loop(
             }
 
             if let Event::Key(key) = ev {
+                // Modal: Model Picker overlay captures all key input.
+                if app.picker.is_some() {
+                    handle_picker_key(app, key);
+                    continue;
+                }
+
                 match (key.code, key.modifiers) {
                     // Esc: cancel running agent (don't quit)
                     (KeyCode::Esc, _) if app.tab().is_running => {
@@ -392,6 +488,11 @@ async fn run_event_loop(
                     }
                     (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
                         app.should_quit = true;
+                    }
+
+                    // Shift+Enter or Alt+Enter: insert newline for multi-line input
+                    (KeyCode::Enter, m) if m.contains(KeyModifiers::SHIFT) || m.contains(KeyModifiers::ALT) => {
+                        app.tab_mut().input.insert_newline();
                     }
 
                     // Enter: accept suggestion if active, otherwise submit
@@ -453,6 +554,17 @@ async fn run_event_loop(
                             ));
                             app.tab_mut().input.text.clear();
                             app.tab_mut().input.cursor = 0;
+                            continue;
+                        }
+
+                        // /model with no args → open interactive picker overlay
+                        if trimmed == "/model" {
+                            open_model_picker(app);
+                            let tab = app.tab_mut();
+                            tab.input.text.clear();
+                            tab.input.cursor = 0;
+                            tab.input.suggestions.clear();
+                            tab.input.suggestion_index = None;
                             continue;
                         }
 
@@ -529,14 +641,42 @@ async fn run_event_loop(
                     (KeyCode::Char('p'), KeyModifiers::CONTROL) => { app.prev_tab(); }
 
                     // Text editing
-                    (KeyCode::Backspace, _) => app.tab_mut().input.backspace(),
-                    (KeyCode::Delete, _) => app.tab_mut().input.delete(),
+                    (KeyCode::Backspace, _) => {
+                        app.tab_mut().input.backspace();
+                        if app.tab().input.text.starts_with('/') {
+                            app.tab_mut().input.compute_suggestions(command_list);
+                        } else {
+                            app.tab_mut().input.suggestions.clear();
+                            app.tab_mut().input.suggestion_index = None;
+                        }
+                    }
+                    (KeyCode::Delete, _) => {
+                        app.tab_mut().input.delete();
+                        if app.tab().input.text.starts_with('/') {
+                            app.tab_mut().input.compute_suggestions(command_list);
+                        } else {
+                            app.tab_mut().input.suggestions.clear();
+                            app.tab_mut().input.suggestion_index = None;
+                        }
+                    }
+                    // Mac Option+Left/Right (and common Alt+Left/Right) — jump by word
+                    (KeyCode::Left, m) if m.contains(KeyModifiers::ALT) => app.tab_mut().input.move_word_left(),
+                    (KeyCode::Right, m) if m.contains(KeyModifiers::ALT) => app.tab_mut().input.move_word_right(),
                     (KeyCode::Left, _) => app.tab_mut().input.move_left(),
                     (KeyCode::Right, _) => app.tab_mut().input.move_right(),
                     (KeyCode::Home, _) => app.tab_mut().input.home(),
                     (KeyCode::End, _) => app.tab_mut().input.end(),
-                    (KeyCode::Up, _) => app.tab_mut().input.history_up(),
-                    (KeyCode::Down, _) => app.tab_mut().input.history_down(),
+                    // Up/Down: navigate within multi-line input first, else history.
+                    (KeyCode::Up, _) => {
+                        if !app.tab_mut().input.move_line_up() {
+                            app.tab_mut().input.history_up();
+                        }
+                    }
+                    (KeyCode::Down, _) => {
+                        if !app.tab_mut().input.move_line_down() {
+                            app.tab_mut().input.history_down();
+                        }
+                    }
 
                     // Scroll
                     (KeyCode::PageUp, _) => { app.tab_mut().auto_scroll = false; app.tab_mut().scroll_offset = app.tab_mut().scroll_offset.saturating_add(10); }
@@ -598,6 +738,127 @@ fn summarize_tool_input(tool_name: &str, input_json: &str) -> String {
     }
 
     String::new()
+}
+
+// ─── Model Picker overlay ──────────────────────────────────────────────────
+
+/// Open the model picker overlay and kick off async loading of fleet models.
+fn open_model_picker(app: &mut ff_terminal::app::App) {
+    use ff_terminal::app::ModelPicker;
+    app.picker = Some(ModelPicker { loading: true, ..Default::default() });
+    // Spawn background load. We poll `app.picker` synchronously, so write results into a shared slot.
+    let slot = std::sync::Arc::new(std::sync::Mutex::new(None::<Result<Vec<ff_terminal::app::ModelPickerItem>, String>>));
+    let slot_clone = slot.clone();
+    tokio::spawn(async move {
+        let result = load_picker_items().await;
+        if let Ok(mut g) = slot_clone.lock() {
+            *g = Some(result);
+        }
+    });
+    // Stash the slot on the picker via a polling field — store in a thread-local-ish way.
+    // Simplest: poll once per frame in the main loop. We'll use a global static for the in-flight load.
+    PICKER_LOAD_SLOT.lock().unwrap().replace(slot);
+}
+
+/// Global slot for in-flight picker load. Polled each frame by the main loop.
+static PICKER_LOAD_SLOT: std::sync::Mutex<Option<std::sync::Arc<std::sync::Mutex<Option<Result<Vec<ff_terminal::app::ModelPickerItem>, String>>>>>> = std::sync::Mutex::new(None);
+
+/// Drain the picker load slot if a result is available; install it onto the picker.
+pub fn poll_picker_load(app: &mut ff_terminal::app::App) {
+    let slot_opt = PICKER_LOAD_SLOT.lock().unwrap().clone();
+    let Some(slot) = slot_opt else { return };
+    let result = {
+        let mut g = slot.lock().unwrap();
+        g.take()
+    };
+    let Some(result) = result else { return };
+    PICKER_LOAD_SLOT.lock().unwrap().take(); // clear
+    if let Some(picker) = app.picker.as_mut() {
+        picker.loading = false;
+        match result {
+            Ok(items) => { picker.items = items; picker.selected = 0; }
+            Err(e) => { picker.error = Some(e); }
+        }
+    }
+}
+
+async fn load_picker_items() -> Result<Vec<ff_terminal::app::ModelPickerItem>, String> {
+    use ff_terminal::app::ModelPickerItem;
+    use std::collections::BTreeMap;
+    let snapshot = ff_agent::fleet_info::fetch_snapshot().await?;
+    // Always offer "auto" — uses the fleet router to pick the best model per task.
+    let mut auto_items = vec![ModelPickerItem {
+        name: "auto".into(),
+        tier: 9, // sort to top
+        nodes: vec!["router".into()],
+        endpoint: format!("http://{}:{}",
+            snapshot.nodes.iter().find(|n| n.role == "leader").map(|n| n.ip.as_str()).unwrap_or("127.0.0.1"),
+            ff_terminal::app::PORT_LLM),
+        online: true,
+    }];
+    // Group by model.name
+    let mut by_name: BTreeMap<String, (i32, Vec<(String, String, i32, bool)>)> = BTreeMap::new();
+    for m in &snapshot.models {
+        let node = snapshot.nodes.iter().find(|n| n.name == m.node_name);
+        let ip = node.map(|n| n.ip.clone()).unwrap_or_default();
+        let online = node.map(|n| n.role != "offline").unwrap_or(false);
+        let entry = by_name.entry(m.name.clone()).or_insert((m.tier, Vec::new()));
+        entry.1.push((m.node_name.clone(), ip, m.port, online));
+    }
+    let mut items: Vec<ModelPickerItem> = by_name.into_iter().map(|(name, (tier, mut hosts))| {
+        hosts.sort_by(|a, b| a.0.cmp(&b.0));
+        let online = hosts.iter().any(|h| h.3);
+        // Pick first online host as the endpoint, fall back to first host
+        let chosen = hosts.iter().find(|h| h.3).cloned().unwrap_or_else(|| hosts[0].clone());
+        let endpoint = format!("http://{}:{}", chosen.1, chosen.2);
+        let nodes: Vec<String> = hosts.iter().map(|h| h.0.clone()).collect();
+        ModelPickerItem { name, tier, nodes, endpoint, online }
+    }).collect();
+    // Sort by tier desc, name asc
+    items.sort_by(|a, b| b.tier.cmp(&a.tier).then(a.name.cmp(&b.name)));
+    // Prepend "auto" entry so user can always pick router-based selection.
+    auto_items.append(&mut items);
+    Ok(auto_items)
+}
+
+/// Handle a key press while the model picker overlay is active.
+fn handle_picker_key(app: &mut ff_terminal::app::App, key: crossterm::event::KeyEvent) {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    let Some(picker) = app.picker.as_mut() else { return };
+    let visible = picker.visible_indices();
+    match (key.code, key.modifiers) {
+        (KeyCode::Esc, _) => { app.picker = None; }
+        (KeyCode::Up, _) => {
+            if !visible.is_empty() {
+                picker.selected = picker.selected.saturating_sub(1);
+            }
+        }
+        (KeyCode::Down, _) => {
+            if !visible.is_empty() && picker.selected + 1 < visible.len() {
+                picker.selected += 1;
+            }
+        }
+        (KeyCode::Backspace, _) => {
+            picker.filter.pop();
+            picker.selected = 0;
+        }
+        (KeyCode::Enter, _) => {
+            if let Some(&idx) = visible.get(picker.selected) {
+                let chosen = picker.items[idx].clone();
+                app.config.llm_base_url = chosen.endpoint.clone();
+                app.config.model = chosen.name.clone();
+                app.tab_mut().current_model = chosen.name.clone();
+                let msg = format!("Switched to {} @ {}", chosen.name, chosen.endpoint);
+                app.tab_mut().messages.push(ff_terminal::messages::render_status(&msg));
+            }
+            app.picker = None;
+        }
+        (KeyCode::Char(c), mods) if !mods.contains(KeyModifiers::CONTROL) && !mods.contains(KeyModifiers::ALT) => {
+            picker.filter.push(c);
+            picker.selected = 0;
+        }
+        _ => {}
+    }
 }
 
 /// Whether to show a result preview for this tool.
@@ -1089,6 +1350,440 @@ async fn load_fleet_nodes_for_health(c: &AgentSessionConfig) -> Vec<(String, Str
         ("Duncan".into(), "192.168.5.114".into(), 51000),
         ("Aura".into(),   "192.168.5.110".into(), 51000),
     ]
+}
+
+async fn handle_secrets(cmd: SecretsCommand) -> Result<()> {
+    let pool = ff_agent::fleet_info::get_fleet_pool()
+        .await
+        .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
+    // Ensure secrets table + other Postgres migrations are applied. Idempotent.
+    ff_db::run_postgres_migrations(&pool).await
+        .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
+    match cmd {
+        SecretsCommand::List => {
+            let rows = ff_db::pg_list_secrets(&pool).await?;
+            if rows.is_empty() {
+                println!("(no secrets stored)");
+                return Ok(());
+            }
+            println!("{:<28} {:<14} {:<20} {}", "KEY", "UPDATED BY", "UPDATED AT", "DESCRIPTION");
+            for (key, desc, updated_by, updated_at) in rows {
+                let ts = updated_at.format("%Y-%m-%d %H:%M UTC").to_string();
+                println!(
+                    "{:<28} {:<14} {:<20} {}",
+                    key,
+                    updated_by.unwrap_or_else(|| "-".into()),
+                    ts,
+                    desc.unwrap_or_default()
+                );
+            }
+        }
+        SecretsCommand::Get { key } => {
+            match ff_db::pg_get_secret(&pool, &key).await? {
+                Some(value) => println!("{value}"),
+                None => {
+                    eprintln!("No secret set for key: {key}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        SecretsCommand::Set { key, value, description } => {
+            let who = whoami_tag();
+            ff_db::pg_set_secret(&pool, &key, &value, description.as_deref(), Some(&who)).await?;
+            println!("Secret '{key}' stored ({} bytes) by {who}", value.len());
+        }
+        SecretsCommand::Delete { key } => {
+            let deleted = ff_db::pg_delete_secret(&pool, &key).await?;
+            if deleted {
+                println!("Deleted secret '{key}'");
+            } else {
+                println!("No secret with key '{key}' to delete");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Best-effort tag for `updated_by`: `user@host`.
+fn whoami_tag() -> String {
+    let user = std::env::var("USER").unwrap_or_else(|_| "unknown".into());
+    let host = std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".into());
+    format!("{user}@{host}")
+}
+
+async fn handle_defer(cmd: DeferCommand) -> Result<()> {
+    let pool = ff_agent::fleet_info::get_fleet_pool()
+        .await
+        .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
+    ff_db::run_postgres_migrations(&pool).await
+        .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
+    match cmd {
+        DeferCommand::List { status, limit } => {
+            let rows = ff_db::pg_list_deferred(&pool, status.as_deref(), limit).await?;
+            if rows.is_empty() {
+                println!("(no deferred tasks)");
+                return Ok(());
+            }
+            println!(
+                "{:<38} {:<10} {:<12} {:<16} {:<6} {}",
+                "ID", "STATUS", "TRIGGER", "TARGET", "TRY", "TITLE"
+            );
+            for r in rows {
+                let trigger = format!(
+                    "{}",
+                    match r.trigger_type.as_str() {
+                        "node_online" => r.trigger_spec.get("node").and_then(|v| v.as_str()).map(|n| format!("node={n}")).unwrap_or_else(|| "node_online".into()),
+                        "at_time" => r.trigger_spec.get("at").and_then(|v| v.as_str()).unwrap_or("at_time").to_string(),
+                        other => other.to_string(),
+                    }
+                );
+                let target = r.preferred_node.clone().unwrap_or_else(|| "-".into());
+                println!(
+                    "{:<38} {:<10} {:<12} {:<16} {:<6} {}",
+                    r.id,
+                    r.status,
+                    trigger,
+                    target,
+                    format!("{}/{}", r.attempts, r.max_attempts),
+                    r.title
+                );
+            }
+        }
+        DeferCommand::AddShell { title, run, when_node_online, when_at, on_node, max_attempts } => {
+            let (trigger_type, trigger_spec, preferred_node) =
+                if let Some(node) = when_node_online.clone() {
+                    (
+                        "node_online".to_string(),
+                        serde_json::json!({"node": node}),
+                        on_node.clone().or(Some(node)),
+                    )
+                } else if let Some(at) = when_at {
+                    ("at_time".to_string(), serde_json::json!({"at": at}), on_node.clone())
+                } else {
+                    anyhow::bail!("must specify --when-node-online <node> or --when-at <rfc3339>");
+                };
+
+            let payload = serde_json::json!({
+                "command": run,
+            });
+            let id = ff_db::pg_enqueue_deferred(
+                &pool,
+                &title,
+                "shell",
+                &payload,
+                &trigger_type,
+                &trigger_spec,
+                preferred_node.as_deref(),
+                &serde_json::json!([]),
+                Some(&whoami_tag()),
+                Some(max_attempts),
+            )
+            .await?;
+            println!("Enqueued deferred task: {id}");
+            println!("  title:         {title}");
+            println!("  kind:          shell");
+            println!("  trigger:       {trigger_type} ({trigger_spec})");
+            if let Some(n) = &preferred_node {
+                println!("  runs on node:  {n}");
+            }
+            println!("  max attempts:  {max_attempts}");
+            println!();
+            println!("NOTE: executor loop is not yet running. Task is captured durably in Postgres");
+            println!("      and will begin processing once `forgefleetd defer-worker` is live.");
+        }
+        DeferCommand::Get { id } => {
+            match ff_db::pg_get_deferred(&pool, &id).await? {
+                Some(r) => {
+                    println!("ID:            {}", r.id);
+                    println!("Title:         {}", r.title);
+                    println!("Status:        {}", r.status);
+                    println!("Kind:          {}", r.kind);
+                    println!("Trigger:       {} ({})", r.trigger_type, r.trigger_spec);
+                    println!("Preferred node:{}", r.preferred_node.clone().unwrap_or_else(|| "-".into()));
+                    println!("Attempts:      {}/{}", r.attempts, r.max_attempts);
+                    println!("Created:       {}  by {}", r.created_at.format("%Y-%m-%d %H:%M UTC"), r.created_by.clone().unwrap_or_else(|| "-".into()));
+                    if let Some(ts) = r.next_attempt_at { println!("Next attempt:  {}", ts.format("%Y-%m-%d %H:%M UTC")); }
+                    if let Some(n) = &r.claimed_by { println!("Claimed by:    {n}"); }
+                    if let Some(err) = &r.last_error { println!("Last error:    {err}"); }
+                    if let Some(res) = &r.result { println!("Result:        {res}"); }
+                    println!("\nPayload:\n{}", serde_json::to_string_pretty(&r.payload).unwrap_or_default());
+                }
+                None => {
+                    eprintln!("No deferred task with id '{id}'");
+                    std::process::exit(1);
+                }
+            }
+        }
+        DeferCommand::Cancel { id } => {
+            if ff_db::pg_cancel_deferred(&pool, &id).await? {
+                println!("Cancelled task {id}");
+            } else {
+                println!("Task {id} is not in a cancellable state (or does not exist)");
+            }
+        }
+        DeferCommand::Retry { id } => {
+            if ff_db::pg_retry_deferred(&pool, &id).await? {
+                println!("Task {id} requeued for retry (status=pending)");
+            } else {
+                println!("Task {id} is not in a retryable state (must be failed or cancelled)");
+            }
+        }
+    }
+    Ok(())
+}
+
+// ─── Deferred task worker ──────────────────────────────────────────────────
+
+/// Probe each fleet node's SSH port (22) to determine reachability. Returns the list of reachable node names.
+async fn probe_online_nodes(nodes: &[ff_db::FleetNodeRow]) -> Vec<String> {
+    use tokio::net::TcpStream;
+    use tokio::time::{timeout, Duration as TokDuration};
+    let mut handles = Vec::new();
+    for n in nodes {
+        let name = n.name.clone();
+        let ip = n.ip.clone();
+        let handle: tokio::task::JoinHandle<Option<String>> = tokio::spawn(async move {
+            let addr = format!("{ip}:22");
+            match timeout(TokDuration::from_secs(3), TcpStream::connect(&addr)).await {
+                Ok(Ok(_)) => Some(name),
+                _ => None,
+            }
+        });
+        handles.push(handle);
+    }
+    let mut online = Vec::new();
+    for h in handles {
+        if let Ok(Some(name)) = h.await {
+            online.push(name);
+        }
+    }
+    online
+}
+
+/// Execute a single deferred task. Returns (success, result_json, error).
+async fn execute_deferred(
+    task: &ff_db::DeferredTaskRow,
+    nodes: &[ff_db::FleetNodeRow],
+) -> (bool, Option<serde_json::Value>, Option<String>) {
+    match task.kind.as_str() {
+        "shell" => {
+            let command = match task.payload.get("command").and_then(|v| v.as_str()) {
+                Some(c) => c,
+                None => return (false, None, Some("shell payload missing 'command' field".into())),
+            };
+            // preferred_node tells us where to run. If None, run locally.
+            let target = task.preferred_node.as_deref();
+            execute_shell(target, command, nodes).await
+        }
+        "http" => {
+            let url = match task.payload.get("url").and_then(|v| v.as_str()) {
+                Some(u) => u,
+                None => return (false, None, Some("http payload missing 'url' field".into())),
+            };
+            let method = task.payload.get("method").and_then(|v| v.as_str()).unwrap_or("GET");
+            let body = task.payload.get("body").cloned();
+            execute_http(method, url, body).await
+        }
+        other => (false, None, Some(format!("unknown task kind: {other}"))),
+    }
+}
+
+/// Run a shell command either locally (when target is this host or None) or via SSH.
+async fn execute_shell(
+    target_node: Option<&str>,
+    command: &str,
+    nodes: &[ff_db::FleetNodeRow],
+) -> (bool, Option<serde_json::Value>, Option<String>) {
+    use tokio::process::Command as TokCmd;
+    let this_hostname = std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_lowercase())
+        .unwrap_or_default();
+
+    let (program, args): (&str, Vec<String>) = match target_node {
+        None => ("sh", vec!["-c".into(), command.to_string()]),
+        Some(n) if this_hostname.starts_with(&n.to_lowercase()) => {
+            ("sh", vec!["-c".into(), command.to_string()])
+        }
+        Some(n) => {
+            // SSH to target: look up user@ip from DB.
+            let node = match nodes.iter().find(|x| x.name.eq_ignore_ascii_case(n)) {
+                Some(n) => n,
+                None => return (false, None, Some(format!("node '{n}' not in fleet_nodes"))),
+            };
+            let dest = format!("{}@{}", node.ssh_user, node.ip);
+            (
+                "ssh",
+                vec![
+                    "-o".into(), "ConnectTimeout=8".into(),
+                    "-o".into(), "StrictHostKeyChecking=accept-new".into(),
+                    "-o".into(), "BatchMode=yes".into(),
+                    dest,
+                    command.to_string(),
+                ],
+            )
+        }
+    };
+
+    let output = TokCmd::new(program).args(&args).output().await;
+    match output {
+        Ok(o) => {
+            let stdout = String::from_utf8_lossy(&o.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&o.stderr).to_string();
+            let result = serde_json::json!({
+                "exit_code": o.status.code(),
+                "stdout": stdout,
+                "stderr": stderr,
+            });
+            if o.status.success() {
+                (true, Some(result), None)
+            } else {
+                let err = format!("exit {}: {}", o.status.code().unwrap_or(-1), stderr.trim().lines().last().unwrap_or(""));
+                (false, Some(result), Some(err))
+            }
+        }
+        Err(e) => (false, None, Some(format!("spawn {program} failed: {e}"))),
+    }
+}
+
+/// Execute an HTTP request task.
+async fn execute_http(
+    method: &str,
+    url: &str,
+    body: Option<serde_json::Value>,
+) -> (bool, Option<serde_json::Value>, Option<String>) {
+    let client = match reqwest::Client::builder().timeout(Duration::from_secs(30)).build() {
+        Ok(c) => c,
+        Err(e) => return (false, None, Some(format!("http client: {e}"))),
+    };
+    let method_obj = match method.to_uppercase().as_str() {
+        "GET" => reqwest::Method::GET,
+        "POST" => reqwest::Method::POST,
+        "PUT" => reqwest::Method::PUT,
+        "DELETE" => reqwest::Method::DELETE,
+        "PATCH" => reqwest::Method::PATCH,
+        other => return (false, None, Some(format!("bad http method: {other}"))),
+    };
+    let mut req = client.request(method_obj, url);
+    if let Some(b) = body {
+        req = req.json(&b);
+    }
+    match req.send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            let result = serde_json::json!({"status": status.as_u16(), "body": text});
+            if status.is_success() {
+                (true, Some(result), None)
+            } else {
+                (false, Some(result), Some(format!("HTTP {status}")))
+            }
+        }
+        Err(e) => (false, None, Some(format!("http send: {e}"))),
+    }
+}
+
+async fn handle_defer_worker(
+    as_node: Option<String>,
+    interval: u64,
+    scheduler: bool,
+    once: bool,
+) -> Result<()> {
+    let worker_name = as_node
+        .or_else(|| std::env::var("FORGEFLEET_NODE_NAME").ok())
+        .unwrap_or_else(|| {
+            std::process::Command::new("hostname")
+                .output()
+                .ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| s.trim().split('.').next().unwrap_or("unknown").to_string())
+                .unwrap_or_else(|| "unknown".into())
+        });
+
+    let pool = ff_agent::fleet_info::get_fleet_pool()
+        .await
+        .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
+    ff_db::run_postgres_migrations(&pool).await
+        .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
+
+    println!("{CYAN}▶ defer-worker starting{RESET}");
+    println!("  node:      {worker_name}");
+    println!("  scheduler: {scheduler}");
+    println!("  interval:  {interval}s");
+    println!("  mode:      {}", if once { "single-pass" } else { "continuous" });
+
+    loop {
+        let pass_start = std::time::Instant::now();
+
+        // Scheduler pass: promote pending tasks whose trigger fired.
+        if scheduler {
+            match ff_db::pg_list_nodes(&pool).await {
+                Ok(nodes) => {
+                    let online = probe_online_nodes(&nodes).await;
+                    let now = chrono::Utc::now();
+                    match ff_db::pg_scheduler_pass(&pool, &online, now).await {
+                        Ok(n) if n > 0 => {
+                            println!("{CYAN}[sched]{RESET} promoted {n} task(s) to dispatchable (online: {})", online.join(","));
+                        }
+                        Ok(_) => {}
+                        Err(e) => eprintln!("{RED}[sched] pg_scheduler_pass: {e}{RESET}"),
+                    }
+                }
+                Err(e) => eprintln!("{RED}[sched] list nodes: {e}{RESET}"),
+            }
+        }
+
+        // Worker pass: claim and execute one task (loop until queue empty).
+        let mut ran_any = false;
+        loop {
+            let claimed = match ff_db::pg_claim_deferred(&pool, &worker_name).await {
+                Ok(Some(t)) => t,
+                Ok(None) => break,
+                Err(e) => {
+                    eprintln!("{RED}[worker] claim error: {e}{RESET}");
+                    break;
+                }
+            };
+            ran_any = true;
+            println!("{YELLOW}[worker]{RESET} claimed {} — {}", claimed.id, claimed.title);
+
+            // Fetch nodes for SSH routing.
+            let nodes = ff_db::pg_list_nodes(&pool).await.unwrap_or_default();
+            let (ok, result, err) = execute_deferred(&claimed, &nodes).await;
+
+            match ff_db::pg_finish_deferred(&pool, &claimed.id, ok, result.as_ref(), err.as_deref()).await {
+                Ok(()) => {
+                    if ok {
+                        println!("  {CYAN}✓ completed{RESET}");
+                    } else {
+                        println!("  {RED}✗ failed{RESET}: {}", err.clone().unwrap_or_default());
+                    }
+                }
+                Err(e) => eprintln!("{RED}  finalize error: {e}{RESET}"),
+            }
+        }
+
+        if once {
+            println!("{CYAN}▶ defer-worker: --once set, exiting{RESET}");
+            return Ok(());
+        }
+
+        let elapsed = pass_start.elapsed();
+        let sleep_for = Duration::from_secs(interval).saturating_sub(elapsed);
+        if !ran_any && sleep_for.as_millis() > 0 {
+            tokio::time::sleep(sleep_for).await;
+        } else if sleep_for.as_millis() > 0 {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
 }
 
 async fn handle_task(cmd: TaskCommand, _config_path: &Path) -> Result<()> {
