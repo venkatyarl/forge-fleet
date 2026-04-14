@@ -341,6 +341,112 @@ CREATE TABLE IF NOT EXISTS fleet_settings (
 ///
 /// Applied as Postgres migration version 8.
 /// IF NOT EXISTS / IF NOT EXISTS guards make this idempotent.
+pub const SCHEMA_V11_MODEL_LIFECYCLE: &str = r#"
+-- ─── Model Lifecycle (catalog / library / deployments / jobs) ─────────────
+-- Splits the old `fleet_models` concept into:
+--   catalog      = what we *can* download (curated + dynamic)
+--   library      = what's on disk per node (inventory)
+--   deployments  = what's running per node right now (processes)
+--   jobs         = in-flight downloads/deletions/swaps (progress tracking)
+
+-- Add a runtime column to fleet_nodes if it doesn't already exist.
+-- Values: "llama.cpp" | "mlx" | "vllm" | "unknown"
+ALTER TABLE fleet_nodes ADD COLUMN IF NOT EXISTS runtime TEXT NOT NULL DEFAULT 'unknown';
+ALTER TABLE fleet_nodes ADD COLUMN IF NOT EXISTS models_dir TEXT NOT NULL DEFAULT '~/models';
+ALTER TABLE fleet_nodes ADD COLUMN IF NOT EXISTS disk_quota_pct INT NOT NULL DEFAULT 80;
+
+-- Catalog: global list of models available for download.
+-- Populated from config/model_catalog.toml on migration and refreshable via `ff model sync-catalog`.
+CREATE TABLE IF NOT EXISTS fleet_model_catalog (
+    id                  TEXT PRIMARY KEY,            -- slug, e.g. "qwen3-coder-30b"
+    name                TEXT NOT NULL,               -- display name
+    family              TEXT NOT NULL,               -- qwen / gemma / llama / etc
+    parameters          TEXT NOT NULL,               -- "30B"
+    tier                INT NOT NULL,                -- 1..4
+    description         TEXT,
+    gated               BOOLEAN NOT NULL DEFAULT FALSE,
+    preferred_workloads JSONB NOT NULL DEFAULT '[]', -- ["code", "chat", "reasoning"]
+    variants            JSONB NOT NULL DEFAULT '[]', -- [{runtime, quant, hf_repo, size_gb}, ...]
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Library: what's on disk per node (one row per {node, catalog_id, variant}).
+CREATE TABLE IF NOT EXISTS fleet_model_library (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    node_name       TEXT NOT NULL REFERENCES fleet_nodes(name) ON DELETE CASCADE,
+    catalog_id      TEXT NOT NULL,                           -- may reference fleet_model_catalog.id
+    runtime         TEXT NOT NULL,                           -- 'llama.cpp' | 'mlx' | 'vllm'
+    quant           TEXT,                                    -- e.g. 'Q4_K_M' or '4bit'
+    file_path       TEXT NOT NULL,                           -- absolute path on node
+    size_bytes      BIGINT NOT NULL DEFAULT 0,
+    sha256          TEXT,                                    -- nullable; verified on demand
+    downloaded_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_used_at    TIMESTAMPTZ,
+    source_url      TEXT,                                    -- e.g. hf://repo or local path
+    UNIQUE (node_name, file_path)
+);
+
+CREATE INDEX IF NOT EXISTS idx_model_library_node ON fleet_model_library (node_name);
+CREATE INDEX IF NOT EXISTS idx_model_library_catalog ON fleet_model_library (catalog_id);
+
+-- Deployments: currently running llama-server / mlx_lm.server / vllm processes.
+CREATE TABLE IF NOT EXISTS fleet_model_deployments (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    node_name       TEXT NOT NULL REFERENCES fleet_nodes(name) ON DELETE CASCADE,
+    library_id      UUID REFERENCES fleet_model_library(id) ON DELETE SET NULL,
+    catalog_id      TEXT,                                    -- redundant but useful for offline queries
+    runtime         TEXT NOT NULL,
+    port            INT NOT NULL,
+    pid             INT,
+    started_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_health_at  TIMESTAMPTZ,
+    health_status   TEXT NOT NULL DEFAULT 'starting',        -- starting | healthy | unhealthy | stopped
+    context_window  INT,
+    tokens_used     BIGINT NOT NULL DEFAULT 0,
+    request_count   BIGINT NOT NULL DEFAULT 0,
+    UNIQUE (node_name, port)
+);
+
+CREATE INDEX IF NOT EXISTS idx_model_deployments_node ON fleet_model_deployments (node_name);
+CREATE INDEX IF NOT EXISTS idx_model_deployments_health ON fleet_model_deployments (health_status);
+
+-- Jobs: in-flight operations with progress tracking.
+-- Kinds: 'download' | 'delete' | 'load' | 'unload' | 'swap' | 'convert' | 'transfer' | 'verify'
+CREATE TABLE IF NOT EXISTS fleet_model_jobs (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    node_name       TEXT NOT NULL,
+    kind            TEXT NOT NULL,
+    target_catalog_id TEXT,                                  -- for download/load/swap
+    target_library_id UUID,                                  -- for delete/load/unload/convert
+    params          JSONB NOT NULL DEFAULT '{}',             -- kind-specific options
+    status          TEXT NOT NULL DEFAULT 'queued',          -- queued | running | completed | failed | cancelled
+    progress_pct    REAL NOT NULL DEFAULT 0,                 -- 0..100
+    bytes_done      BIGINT,
+    bytes_total     BIGINT,
+    eta_seconds     INT,
+    started_at      TIMESTAMPTZ,
+    completed_at    TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    error_message   TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_model_jobs_node_status ON fleet_model_jobs (node_name, status);
+CREATE INDEX IF NOT EXISTS idx_model_jobs_created ON fleet_model_jobs (created_at DESC);
+
+-- Disk usage snapshots: periodic sampling of disk free/used for quota monitoring.
+CREATE TABLE IF NOT EXISTS fleet_disk_usage (
+    node_name       TEXT NOT NULL REFERENCES fleet_nodes(name) ON DELETE CASCADE,
+    sampled_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    models_dir      TEXT NOT NULL,
+    total_bytes     BIGINT NOT NULL,
+    used_bytes      BIGINT NOT NULL,
+    free_bytes      BIGINT NOT NULL,
+    models_bytes    BIGINT NOT NULL DEFAULT 0,               -- just the models dir
+    PRIMARY KEY (node_name, sampled_at)
+);
+CREATE INDEX IF NOT EXISTS idx_disk_usage_latest ON fleet_disk_usage (node_name, sampled_at DESC);
+"#;
+
 pub const SCHEMA_V10_DEFERRED_TASKS: &str = r#"
 -- ─── Deferred Task Queue ──────────────────────────────────────────────────
 -- Persistent queue for work that can't run right now (offline node, future time,

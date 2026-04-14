@@ -1657,6 +1657,498 @@ pub async fn pg_delete_secret(pool: &PgPool, key: &str) -> Result<bool> {
     Ok(result.rows_affected() > 0)
 }
 
+// ─── Model Lifecycle ───────────────────────────────────────────────────────
+
+/// Catalog entry — what we can download.
+#[derive(Debug, Clone)]
+pub struct ModelCatalogRow {
+    pub id: String,
+    pub name: String,
+    pub family: String,
+    pub parameters: String,
+    pub tier: i32,
+    pub description: Option<String>,
+    pub gated: bool,
+    pub preferred_workloads: JsonValue,
+    pub variants: JsonValue,
+}
+
+/// Upsert a catalog entry. Returns the id.
+pub async fn pg_upsert_catalog(
+    pool: &PgPool,
+    row: &ModelCatalogRow,
+) -> Result<String> {
+    sqlx::query(
+        "INSERT INTO fleet_model_catalog
+            (id, name, family, parameters, tier, description, gated, preferred_workloads, variants, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+         ON CONFLICT (id) DO UPDATE SET
+            name = EXCLUDED.name,
+            family = EXCLUDED.family,
+            parameters = EXCLUDED.parameters,
+            tier = EXCLUDED.tier,
+            description = EXCLUDED.description,
+            gated = EXCLUDED.gated,
+            preferred_workloads = EXCLUDED.preferred_workloads,
+            variants = EXCLUDED.variants,
+            updated_at = NOW()",
+    )
+    .bind(&row.id)
+    .bind(&row.name)
+    .bind(&row.family)
+    .bind(&row.parameters)
+    .bind(row.tier)
+    .bind(&row.description)
+    .bind(row.gated)
+    .bind(&row.preferred_workloads)
+    .bind(&row.variants)
+    .execute(pool)
+    .await?;
+    Ok(row.id.clone())
+}
+
+/// List catalog entries sorted by tier (desc) then name (asc).
+pub async fn pg_list_catalog(pool: &PgPool) -> Result<Vec<ModelCatalogRow>> {
+    let rows = sqlx::query(
+        "SELECT id, name, family, parameters, tier, description, gated, preferred_workloads, variants
+           FROM fleet_model_catalog
+          ORDER BY tier DESC, name ASC",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.iter().map(|r| ModelCatalogRow {
+        id: r.get("id"),
+        name: r.get("name"),
+        family: r.get("family"),
+        parameters: r.get("parameters"),
+        tier: r.get("tier"),
+        description: r.get("description"),
+        gated: r.get("gated"),
+        preferred_workloads: r.get("preferred_workloads"),
+        variants: r.get("variants"),
+    }).collect())
+}
+
+/// Search catalog by substring on name/family/id (case-insensitive).
+pub async fn pg_search_catalog(pool: &PgPool, query: &str) -> Result<Vec<ModelCatalogRow>> {
+    let pattern = format!("%{}%", query.to_lowercase());
+    let rows = sqlx::query(
+        "SELECT id, name, family, parameters, tier, description, gated, preferred_workloads, variants
+           FROM fleet_model_catalog
+          WHERE LOWER(id) LIKE $1 OR LOWER(name) LIKE $1 OR LOWER(family) LIKE $1
+          ORDER BY tier DESC, name ASC",
+    )
+    .bind(&pattern)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.iter().map(|r| ModelCatalogRow {
+        id: r.get("id"),
+        name: r.get("name"),
+        family: r.get("family"),
+        parameters: r.get("parameters"),
+        tier: r.get("tier"),
+        description: r.get("description"),
+        gated: r.get("gated"),
+        preferred_workloads: r.get("preferred_workloads"),
+        variants: r.get("variants"),
+    }).collect())
+}
+
+/// Fetch one catalog entry by id.
+pub async fn pg_get_catalog(pool: &PgPool, id: &str) -> Result<Option<ModelCatalogRow>> {
+    let row = sqlx::query(
+        "SELECT id, name, family, parameters, tier, description, gated, preferred_workloads, variants
+           FROM fleet_model_catalog WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.as_ref().map(|r| ModelCatalogRow {
+        id: r.get("id"),
+        name: r.get("name"),
+        family: r.get("family"),
+        parameters: r.get("parameters"),
+        tier: r.get("tier"),
+        description: r.get("description"),
+        gated: r.get("gated"),
+        preferred_workloads: r.get("preferred_workloads"),
+        variants: r.get("variants"),
+    }))
+}
+
+/// Library entry — a model file on disk on a specific node.
+#[derive(Debug, Clone)]
+pub struct ModelLibraryRow {
+    pub id: String,
+    pub node_name: String,
+    pub catalog_id: String,
+    pub runtime: String,
+    pub quant: Option<String>,
+    pub file_path: String,
+    pub size_bytes: i64,
+    pub sha256: Option<String>,
+    pub downloaded_at: chrono::DateTime<chrono::Utc>,
+    pub last_used_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub source_url: Option<String>,
+}
+
+/// Upsert a library entry keyed by (node_name, file_path). Returns library id.
+pub async fn pg_upsert_library(
+    pool: &PgPool,
+    node_name: &str,
+    catalog_id: &str,
+    runtime: &str,
+    quant: Option<&str>,
+    file_path: &str,
+    size_bytes: i64,
+    sha256: Option<&str>,
+    source_url: Option<&str>,
+) -> Result<String> {
+    let row = sqlx::query(
+        "INSERT INTO fleet_model_library
+            (node_name, catalog_id, runtime, quant, file_path, size_bytes, sha256, source_url)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         ON CONFLICT (node_name, file_path) DO UPDATE SET
+            catalog_id = EXCLUDED.catalog_id,
+            runtime = EXCLUDED.runtime,
+            quant = COALESCE(EXCLUDED.quant, fleet_model_library.quant),
+            size_bytes = EXCLUDED.size_bytes,
+            sha256 = COALESCE(EXCLUDED.sha256, fleet_model_library.sha256),
+            source_url = COALESCE(EXCLUDED.source_url, fleet_model_library.source_url)
+         RETURNING id",
+    )
+    .bind(node_name)
+    .bind(catalog_id)
+    .bind(runtime)
+    .bind(quant)
+    .bind(file_path)
+    .bind(size_bytes)
+    .bind(sha256)
+    .bind(source_url)
+    .fetch_one(pool)
+    .await?;
+    let id: sqlx::types::Uuid = row.get("id");
+    Ok(id.to_string())
+}
+
+/// List all library entries, optionally filtered by node.
+pub async fn pg_list_library(pool: &PgPool, node_name: Option<&str>) -> Result<Vec<ModelLibraryRow>> {
+    let rows = if let Some(n) = node_name {
+        sqlx::query(
+            "SELECT * FROM fleet_model_library WHERE node_name = $1 ORDER BY node_name, catalog_id",
+        )
+        .bind(n)
+        .fetch_all(pool)
+        .await?
+    } else {
+        sqlx::query("SELECT * FROM fleet_model_library ORDER BY node_name, catalog_id")
+            .fetch_all(pool)
+            .await?
+    };
+    Ok(rows.iter().map(|r| {
+        let id: sqlx::types::Uuid = r.get("id");
+        ModelLibraryRow {
+            id: id.to_string(),
+            node_name: r.get("node_name"),
+            catalog_id: r.get("catalog_id"),
+            runtime: r.get("runtime"),
+            quant: r.get("quant"),
+            file_path: r.get("file_path"),
+            size_bytes: r.get("size_bytes"),
+            sha256: r.get("sha256"),
+            downloaded_at: r.get("downloaded_at"),
+            last_used_at: r.get("last_used_at"),
+            source_url: r.get("source_url"),
+        }
+    }).collect())
+}
+
+/// Delete a library entry. Returns true if a row was removed.
+pub async fn pg_delete_library(pool: &PgPool, id: &str) -> Result<bool> {
+    let uuid = sqlx::types::Uuid::parse_str(id)
+        .map_err(|e| crate::error::DbError::NotFound(format!("bad uuid {id}: {e}")))?;
+    let r = sqlx::query("DELETE FROM fleet_model_library WHERE id = $1")
+        .bind(uuid)
+        .execute(pool)
+        .await?;
+    Ok(r.rows_affected() > 0)
+}
+
+/// Deployment row — a currently-running inference process.
+#[derive(Debug, Clone)]
+pub struct ModelDeploymentRow {
+    pub id: String,
+    pub node_name: String,
+    pub library_id: Option<String>,
+    pub catalog_id: Option<String>,
+    pub runtime: String,
+    pub port: i32,
+    pub pid: Option<i32>,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    pub last_health_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub health_status: String,
+    pub context_window: Option<i32>,
+    pub tokens_used: i64,
+    pub request_count: i64,
+}
+
+/// List deployments optionally filtered by node.
+pub async fn pg_list_deployments(pool: &PgPool, node_name: Option<&str>) -> Result<Vec<ModelDeploymentRow>> {
+    let rows = if let Some(n) = node_name {
+        sqlx::query("SELECT * FROM fleet_model_deployments WHERE node_name = $1 ORDER BY node_name, port")
+            .bind(n)
+            .fetch_all(pool)
+            .await?
+    } else {
+        sqlx::query("SELECT * FROM fleet_model_deployments ORDER BY node_name, port")
+            .fetch_all(pool)
+            .await?
+    };
+    Ok(rows.iter().map(|r| {
+        let id: sqlx::types::Uuid = r.get("id");
+        let lib_id: Option<sqlx::types::Uuid> = r.get("library_id");
+        ModelDeploymentRow {
+            id: id.to_string(),
+            node_name: r.get("node_name"),
+            library_id: lib_id.map(|u| u.to_string()),
+            catalog_id: r.get("catalog_id"),
+            runtime: r.get("runtime"),
+            port: r.get("port"),
+            pid: r.get("pid"),
+            started_at: r.get("started_at"),
+            last_health_at: r.get("last_health_at"),
+            health_status: r.get("health_status"),
+            context_window: r.get("context_window"),
+            tokens_used: r.get("tokens_used"),
+            request_count: r.get("request_count"),
+        }
+    }).collect())
+}
+
+/// Upsert a deployment (node + port is unique).
+pub async fn pg_upsert_deployment(
+    pool: &PgPool,
+    node_name: &str,
+    library_id: Option<&str>,
+    catalog_id: Option<&str>,
+    runtime: &str,
+    port: i32,
+    pid: Option<i32>,
+    health_status: &str,
+    context_window: Option<i32>,
+) -> Result<String> {
+    let lib_uuid = library_id
+        .map(|s| sqlx::types::Uuid::parse_str(s)
+            .map_err(|e| crate::error::DbError::NotFound(format!("bad library uuid {s}: {e}"))))
+        .transpose()?;
+    let row = sqlx::query(
+        "INSERT INTO fleet_model_deployments
+            (node_name, library_id, catalog_id, runtime, port, pid, health_status, context_window, last_health_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+         ON CONFLICT (node_name, port) DO UPDATE SET
+            library_id = EXCLUDED.library_id,
+            catalog_id = EXCLUDED.catalog_id,
+            runtime = EXCLUDED.runtime,
+            pid = EXCLUDED.pid,
+            health_status = EXCLUDED.health_status,
+            context_window = COALESCE(EXCLUDED.context_window, fleet_model_deployments.context_window),
+            last_health_at = NOW()
+         RETURNING id",
+    )
+    .bind(node_name)
+    .bind(lib_uuid)
+    .bind(catalog_id)
+    .bind(runtime)
+    .bind(port)
+    .bind(pid)
+    .bind(health_status)
+    .bind(context_window)
+    .fetch_one(pool)
+    .await?;
+    let id: sqlx::types::Uuid = row.get("id");
+    Ok(id.to_string())
+}
+
+/// Remove a deployment (when a model is unloaded).
+pub async fn pg_delete_deployment(pool: &PgPool, id: &str) -> Result<bool> {
+    let uuid = sqlx::types::Uuid::parse_str(id)
+        .map_err(|e| crate::error::DbError::NotFound(format!("bad uuid {id}: {e}")))?;
+    let r = sqlx::query("DELETE FROM fleet_model_deployments WHERE id = $1")
+        .bind(uuid)
+        .execute(pool)
+        .await?;
+    Ok(r.rows_affected() > 0)
+}
+
+/// Record a disk usage sample.
+pub async fn pg_insert_disk_usage(
+    pool: &PgPool,
+    node_name: &str,
+    models_dir: &str,
+    total_bytes: i64,
+    used_bytes: i64,
+    free_bytes: i64,
+    models_bytes: i64,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO fleet_disk_usage (node_name, models_dir, total_bytes, used_bytes, free_bytes, models_bytes)
+         VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(node_name)
+    .bind(models_dir)
+    .bind(total_bytes)
+    .bind(used_bytes)
+    .bind(free_bytes)
+    .bind(models_bytes)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Get the latest disk usage sample per node.
+pub async fn pg_latest_disk_usage(pool: &PgPool) -> Result<Vec<(String, String, i64, i64, i64, i64, chrono::DateTime<chrono::Utc>)>> {
+    let rows = sqlx::query(
+        "SELECT DISTINCT ON (node_name)
+                node_name, models_dir, total_bytes, used_bytes, free_bytes, models_bytes, sampled_at
+           FROM fleet_disk_usage
+          ORDER BY node_name, sampled_at DESC",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.iter().map(|r| (
+        r.get::<String, _>("node_name"),
+        r.get::<String, _>("models_dir"),
+        r.get::<i64, _>("total_bytes"),
+        r.get::<i64, _>("used_bytes"),
+        r.get::<i64, _>("free_bytes"),
+        r.get::<i64, _>("models_bytes"),
+        r.get::<chrono::DateTime<chrono::Utc>, _>("sampled_at"),
+    )).collect())
+}
+
+/// A model lifecycle job (download, delete, load, etc.) — tracks progress.
+#[derive(Debug, Clone)]
+pub struct ModelJobRow {
+    pub id: String,
+    pub node_name: String,
+    pub kind: String,
+    pub target_catalog_id: Option<String>,
+    pub target_library_id: Option<String>,
+    pub params: JsonValue,
+    pub status: String,
+    pub progress_pct: f32,
+    pub bytes_done: Option<i64>,
+    pub bytes_total: Option<i64>,
+    pub eta_seconds: Option<i32>,
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub error_message: Option<String>,
+}
+
+/// Insert a new model lifecycle job. Returns job id.
+pub async fn pg_create_job(
+    pool: &PgPool,
+    node_name: &str,
+    kind: &str,
+    target_catalog_id: Option<&str>,
+    target_library_id: Option<&str>,
+    params: &JsonValue,
+) -> Result<String> {
+    let lib_uuid = target_library_id
+        .map(|s| sqlx::types::Uuid::parse_str(s)
+            .map_err(|e| crate::error::DbError::NotFound(format!("bad library uuid {s}: {e}"))))
+        .transpose()?;
+    let row = sqlx::query(
+        "INSERT INTO fleet_model_jobs (node_name, kind, target_catalog_id, target_library_id, params)
+         VALUES ($1, $2, $3, $4, $5)
+         RETURNING id",
+    )
+    .bind(node_name)
+    .bind(kind)
+    .bind(target_catalog_id)
+    .bind(lib_uuid)
+    .bind(params)
+    .fetch_one(pool)
+    .await?;
+    let id: sqlx::types::Uuid = row.get("id");
+    Ok(id.to_string())
+}
+
+/// Update job progress. Any field can be left None to keep its current value.
+pub async fn pg_update_job_progress(
+    pool: &PgPool,
+    id: &str,
+    status: Option<&str>,
+    progress_pct: Option<f32>,
+    bytes_done: Option<i64>,
+    bytes_total: Option<i64>,
+    eta_seconds: Option<i32>,
+    error_message: Option<&str>,
+) -> Result<()> {
+    let uuid = sqlx::types::Uuid::parse_str(id)
+        .map_err(|e| crate::error::DbError::NotFound(format!("bad uuid {id}: {e}")))?;
+    sqlx::query(
+        "UPDATE fleet_model_jobs SET
+            status = COALESCE($2, status),
+            progress_pct = COALESCE($3, progress_pct),
+            bytes_done = COALESCE($4, bytes_done),
+            bytes_total = COALESCE($5, bytes_total),
+            eta_seconds = COALESCE($6, eta_seconds),
+            error_message = COALESCE($7, error_message),
+            started_at = COALESCE(started_at, CASE WHEN $2 = 'running' THEN NOW() ELSE started_at END),
+            completed_at = CASE WHEN $2 IN ('completed', 'failed', 'cancelled') THEN NOW() ELSE completed_at END
+          WHERE id = $1",
+    )
+    .bind(uuid)
+    .bind(status)
+    .bind(progress_pct)
+    .bind(bytes_done)
+    .bind(bytes_total)
+    .bind(eta_seconds)
+    .bind(error_message)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// List jobs (optionally filtered by status).
+pub async fn pg_list_jobs(pool: &PgPool, status: Option<&str>, limit: i64) -> Result<Vec<ModelJobRow>> {
+    let rows = if let Some(s) = status {
+        sqlx::query("SELECT * FROM fleet_model_jobs WHERE status = $1 ORDER BY created_at DESC LIMIT $2")
+            .bind(s)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+    } else {
+        sqlx::query("SELECT * FROM fleet_model_jobs ORDER BY created_at DESC LIMIT $1")
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+    };
+    Ok(rows.iter().map(|r| {
+        let id: sqlx::types::Uuid = r.get("id");
+        let lib_id: Option<sqlx::types::Uuid> = r.get("target_library_id");
+        ModelJobRow {
+            id: id.to_string(),
+            node_name: r.get("node_name"),
+            kind: r.get("kind"),
+            target_catalog_id: r.get("target_catalog_id"),
+            target_library_id: lib_id.map(|u| u.to_string()),
+            params: r.get("params"),
+            status: r.get("status"),
+            progress_pct: r.get("progress_pct"),
+            bytes_done: r.get("bytes_done"),
+            bytes_total: r.get("bytes_total"),
+            eta_seconds: r.get("eta_seconds"),
+            started_at: r.get("started_at"),
+            completed_at: r.get("completed_at"),
+            created_at: r.get("created_at"),
+            error_message: r.get("error_message"),
+        }
+    }).collect())
+}
+
 // ─── Deferred Task Queue ───────────────────────────────────────────────────
 
 /// One row of the deferred_tasks table. Payload/trigger_spec/result/required_caps are free-form JSON.

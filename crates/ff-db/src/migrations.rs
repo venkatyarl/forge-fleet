@@ -192,6 +192,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "deferred_tasks",
         sql: schema::SCHEMA_V10_DEFERRED_TASKS,
     },
+    PgMigration {
+        version: 11,
+        name: "model_lifecycle",
+        sql: schema::SCHEMA_V11_MODEL_LIFECYCLE,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.

@@ -105,6 +105,70 @@ pub async fn get_hf_token() -> Option<String> {
     fetch_secret("huggingface.token").await
 }
 
+/// Resolve the ForgeFleet node name for the CURRENT host, in priority order:
+///   1. `$FORGEFLEET_NODE_NAME` env var (explicit override)
+///   2. Postgres `fleet_nodes` row whose `ip` or `alt_ips` matches any local IPv4 address
+///   3. `hostname` short-name fallback (lowercased, first label)
+pub async fn resolve_this_node_name() -> String {
+    if let Ok(v) = std::env::var("FORGEFLEET_NODE_NAME") {
+        let t = v.trim();
+        if !t.is_empty() { return t.to_string(); }
+    }
+
+    // Collect local IPv4 addresses.
+    let local_ips = local_ipv4_addrs();
+
+    if let Ok(pool) = get_fleet_pool().await {
+        if let Ok(nodes) = pg_list_nodes(&pool).await {
+            for n in &nodes {
+                if local_ips.contains(&n.ip) {
+                    return n.name.clone();
+                }
+                // alt_ips is JSONB array of strings
+                if let Some(alt) = n.alt_ips.as_array() {
+                    for v in alt {
+                        if let Some(s) = v.as_str() {
+                            if local_ips.contains(&s.to_string()) {
+                                return n.name.clone();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: hostname short name.
+    std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().split('.').next().unwrap_or("unknown").to_lowercase())
+        .unwrap_or_else(|| "unknown".into())
+}
+
+/// Enumerate local IPv4 addresses (non-loopback) via `ifconfig -l`.
+/// Returns an empty vec on any error; callers then fall through to hostname.
+fn local_ipv4_addrs() -> Vec<String> {
+    // Use `ifconfig` with `-a` (BSD/mac: lists all interfaces with addresses).
+    let out = std::process::Command::new("ifconfig").arg("-a").output();
+    let Ok(out) = out else { return Vec::new() };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut ips = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("inet ") {
+            // rest looks like "192.168.5.100 netmask ..."
+            if let Some(addr) = rest.split_whitespace().next() {
+                if !addr.starts_with("127.") && !addr.starts_with("169.254") {
+                    ips.push(addr.to_string());
+                }
+            }
+        }
+    }
+    ips
+}
+
 /// Map a secret key to its fallback environment variable name.
 /// e.g. `huggingface.token` → `HF_TOKEN`, `openai.api_key` → `OPENAI_API_KEY`.
 fn env_key_for_secret(key: &str) -> String {

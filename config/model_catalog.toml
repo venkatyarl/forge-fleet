@@ -1,0 +1,794 @@
+# ForgeFleet Model Catalog
+#
+# Curated list of LLMs that ForgeFleet knows how to provision across the fleet.
+# The `ff` CLI and the web dashboard read this file to show downloadable
+# models along with their verified HuggingFace repos and size estimates.
+#
+# Size estimation rules of thumb:
+#   Q4_K_M (gguf)  ~ 0.55 bytes / parameter
+#   4bit   (mlx)   ~ 0.55 bytes / parameter
+#   Q8_0   (gguf)  ~ 1.10 bytes / parameter
+#   fp16           ~ 2.00 bytes / parameter
+#
+# Tiers:
+#   1 = small     (7-9B)     runs anywhere, including 16GB nodes
+#   2 = mid       (13-35B)   needs 32GB+
+#   3 = large     (70-200B)  needs 64GB+ or MoE sparsity
+#   4 = frontier  (200B+)    leader-node only / distributed
+
+schema_version = "1"
+updated = "2026-04-13"
+
+# ---------------------------------------------------------------------------
+# Gemma 4 — gated (Gemma terms)
+# ---------------------------------------------------------------------------
+
+[[models]]
+id = "gemma4-31b-it"
+name = "Gemma 4 31B Instruct"
+family = "gemma"
+parameters = "31B"
+tier = 2
+description = "Gemma 4 31B instruction-tuned. Strong general reasoning."
+gated = true
+preferred_workloads = ["chat", "reasoning"]
+
+  [[models.variants]]
+  runtime = "llama.cpp"
+  quant = "Q4_K_M"
+  hf_repo = "bartowski/gemma-4-31b-it-GGUF"
+  size_gb = 19
+
+  [[models.variants]]
+  runtime = "mlx"
+  quant = "4bit"
+  hf_repo = "mlx-community/gemma-4-31b-it-4bit"
+  size_gb = 18
+
+# ---------------------------------------------------------------------------
+# Qwen 3.5 family (newer releases — distinct from Qwen 3)
+# ---------------------------------------------------------------------------
+
+[[models]]
+id = "qwen35-35b-a3b"
+name = "Qwen3.5-35B-A3B-Instruct"
+family = "qwen"
+parameters = "35B"
+tier = 2
+description = "Qwen 3.5 35B A3B (MoE, ~3B active). Venkat's daily-driver on multiple fleet nodes."
+gated = false
+preferred_workloads = ["chat", "code", "reasoning", "tool_calling"]
+
+  [[models.variants]]
+  runtime = "llama.cpp"
+  quant = "Q4_K_M"
+  hf_repo = "Qwen/Qwen3.5-35B-A3B-Instruct-GGUF"
+  size_gb = 20
+
+  [[models.variants]]
+  runtime = "mlx"
+  quant = "4bit"
+  hf_repo = "mlx-community/Qwen3.5-35B-A3B-Instruct-4bit"
+  size_gb = 19
+
+[[models]]
+id = "qwen35-9b"
+name = "Qwen3.5-9B-Instruct"
+family = "qwen"
+parameters = "9B"
+tier = 1
+description = "Qwen 3.5 9B — small fast workhorse."
+gated = false
+preferred_workloads = ["chat", "tool_calling"]
+
+  [[models.variants]]
+  runtime = "llama.cpp"
+  quant = "Q4_K_M"
+  hf_repo = "Qwen/Qwen3.5-9B-Instruct-GGUF"
+  size_gb = 5
+
+  [[models.variants]]
+  runtime = "mlx"
+  quant = "4bit"
+  hf_repo = "mlx-community/Qwen3.5-9B-Instruct-4bit"
+  size_gb = 5
+
+[[models]]
+id = "qwen35-397b"
+name = "Qwen3.5-397B"
+family = "qwen"
+parameters = "397B"
+tier = 4
+description = "Qwen 3.5 397B — frontier-class. Leader-only due to size."
+gated = false
+preferred_workloads = ["reasoning", "long_context"]
+
+  [[models.variants]]
+  runtime = "llama.cpp"
+  quant = "Q4_K_M"
+  hf_repo = "Qwen/Qwen3.5-397B-GGUF"
+  size_gb = 227
+
+# ---------------------------------------------------------------------------
+# Qwen3 family
+# ---------------------------------------------------------------------------
+
+[[models]]
+id = "qwen3-coder-30b"
+name = "Qwen3-Coder-30B-A3B-Instruct"
+family = "qwen"
+parameters = "30B"
+tier = 2
+description = "Qwen3 MoE coding model (3B active params) — fleet default for code tasks."
+gated = false
+preferred_workloads = ["code", "tool_calling", "reasoning"]
+
+  [[models.variants]]
+  runtime = "llama.cpp"
+  quant = "Q4_K_M"
+  hf_repo = "Qwen/Qwen3-Coder-30B-A3B-Instruct-GGUF"
+  size_gb = 17.0
+
+  [[models.variants]]
+  runtime = "mlx"
+  quant = "4bit"
+  hf_repo = "mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit"
+  size_gb = 17.0
+
+  [[models.variants]]
+  runtime = "vllm"
+  quant = "fp16"
+  hf_repo = "Qwen/Qwen3-Coder-30B-A3B-Instruct"
+  size_gb = 60.0
+
+[[models]]
+id = "qwen3-35b-a3b"
+name = "Qwen3-35B-A3B-Instruct"
+family = "qwen"
+parameters = "35B"
+tier = 2
+description = "Qwen3 general-purpose MoE instruct model with 3B active parameters."
+gated = false
+preferred_workloads = ["chat", "reasoning", "tool_calling"]
+
+  [[models.variants]]
+  runtime = "llama.cpp"
+  quant = "Q4_K_M"
+  hf_repo = "Qwen/Qwen3-35B-A3B-Instruct-GGUF"
+  size_gb = 20.0
+
+  [[models.variants]]
+  runtime = "mlx"
+  quant = "4bit"
+  hf_repo = "mlx-community/Qwen3-35B-A3B-Instruct-4bit"
+  size_gb = 20.0
+
+[[models]]
+id = "qwen3-235b"
+name = "Qwen3-235B-A22B"
+family = "qwen"
+parameters = "235B"
+tier = 4
+description = "Qwen3 235B MoE (~22B active)."
+gated = false
+preferred_workloads = ["reasoning", "code", "long_context"]
+
+  [[models.variants]]
+  runtime = "llama.cpp"
+  quant = "Q4_K_M"
+  hf_repo = "Qwen/Qwen3-235B-A22B-Instruct-GGUF"
+  size_gb = 135
+
+[[models]]
+id = "qwen3-70b"
+name = "Qwen3-70B-Instruct"
+family = "qwen"
+parameters = "70B"
+tier = 3
+description = "Qwen3 70B dense."
+gated = false
+preferred_workloads = ["chat", "reasoning", "tool_calling"]
+
+  [[models.variants]]
+  runtime = "llama.cpp"
+  quant = "Q4_K_M"
+  hf_repo = "bartowski/Qwen3-70B-Instruct-GGUF"
+  size_gb = 40
+
+[[models]]
+id = "qwen3-72b"
+name = "Qwen3-72B-Instruct"
+family = "qwen"
+parameters = "72B"
+tier = 3
+description = "Flagship dense Qwen3 instruct model for top-tier reasoning and chat."
+gated = false
+preferred_workloads = ["chat", "reasoning", "tool_calling"]
+
+  [[models.variants]]
+  runtime = "llama.cpp"
+  quant = "Q4_K_M"
+  hf_repo = "bartowski/Qwen3-72B-Instruct-GGUF"
+  size_gb = 41.0
+
+  [[models.variants]]
+  runtime = "mlx"
+  quant = "4bit"
+  hf_repo = "mlx-community/Qwen3-72B-Instruct-4bit"
+  size_gb = 41.0
+
+  [[models.variants]]
+  runtime = "vllm"
+  quant = "fp16"
+  hf_repo = "Qwen/Qwen3-72B-Instruct"
+  size_gb = 145.0
+
+[[models]]
+id = "qwen3-14b"
+name = "Qwen3-14B-Instruct"
+family = "qwen"
+parameters = "14B"
+tier = 2
+description = "Mid-size dense Qwen3 model — good balance of quality and speed."
+gated = false
+preferred_workloads = ["chat", "reasoning", "tool_calling"]
+
+  [[models.variants]]
+  runtime = "llama.cpp"
+  quant = "Q4_K_M"
+  hf_repo = "bartowski/Qwen3-14B-Instruct-GGUF"
+  size_gb = 8.5
+
+  [[models.variants]]
+  runtime = "mlx"
+  quant = "4bit"
+  hf_repo = "mlx-community/Qwen3-14B-Instruct-4bit"
+  size_gb = 8.5
+
+[[models]]
+id = "qwen3-7b"
+name = "Qwen3-7B-Instruct"
+family = "qwen"
+parameters = "7B"
+tier = 1
+description = "Fast small Qwen3 for lightweight nodes and quick drafting."
+gated = false
+preferred_workloads = ["chat", "tool_calling"]
+
+  [[models.variants]]
+  runtime = "llama.cpp"
+  quant = "Q4_K_M"
+  hf_repo = "Qwen/Qwen3-7B-Instruct-GGUF"
+  size_gb = 4.5
+
+  [[models.variants]]
+  runtime = "mlx"
+  quant = "4bit"
+  hf_repo = "mlx-community/Qwen3-7B-Instruct-4bit"
+  size_gb = 4.5
+
+[[models]]
+id = "qwen3-omni-7b"
+name = "Qwen3-Omni-7B"
+family = "qwen"
+parameters = "7B"
+tier = 1
+description = "Multimodal Qwen3 handling text, audio, vision, and video inputs."
+gated = false
+preferred_workloads = ["omni", "vision", "chat"]
+
+  [[models.variants]]
+  runtime = "llama.cpp"
+  quant = "Q4_K_M"
+  hf_repo = "Qwen/Qwen3-Omni-7B-GGUF"
+  size_gb = 5.0
+
+  [[models.variants]]
+  runtime = "mlx"
+  quant = "4bit"
+  hf_repo = "mlx-community/Qwen3-Omni-7B-4bit"
+  size_gb = 5.0
+
+# ---------------------------------------------------------------------------
+# Qwen2.5 family
+# ---------------------------------------------------------------------------
+
+[[models]]
+id = "qwen25-coder-32b"
+name = "Qwen2.5-Coder-32B-Instruct"
+family = "qwen"
+parameters = "32B"
+tier = 2
+description = "Battle-tested coder model — current workhorse on Marcus/Sophie/Priya."
+gated = false
+preferred_workloads = ["code", "tool_calling"]
+
+  [[models.variants]]
+  runtime = "llama.cpp"
+  quant = "Q4_K_M"
+  hf_repo = "Qwen/Qwen2.5-Coder-32B-Instruct-GGUF"
+  size_gb = 19.0
+
+  [[models.variants]]
+  runtime = "mlx"
+  quant = "4bit"
+  hf_repo = "mlx-community/Qwen2.5-Coder-32B-Instruct-4bit"
+  size_gb = 19.0
+
+  [[models.variants]]
+  runtime = "vllm"
+  quant = "fp16"
+  hf_repo = "Qwen/Qwen2.5-Coder-32B-Instruct"
+  size_gb = 65.0
+
+[[models]]
+id = "qwen25-72b"
+name = "Qwen2.5-72B-Instruct"
+family = "qwen"
+parameters = "72B"
+tier = 3
+description = "Qwen2.5 flagship — currently running on James for deep reasoning."
+gated = false
+preferred_workloads = ["chat", "reasoning", "tool_calling"]
+
+  [[models.variants]]
+  runtime = "llama.cpp"
+  quant = "Q4_K_M"
+  hf_repo = "Qwen/Qwen2.5-72B-Instruct-GGUF"
+  size_gb = 41.0
+
+  [[models.variants]]
+  runtime = "mlx"
+  quant = "4bit"
+  hf_repo = "mlx-community/Qwen2.5-72B-Instruct-4bit"
+  size_gb = 41.0
+
+  [[models.variants]]
+  runtime = "vllm"
+  quant = "fp16"
+  hf_repo = "Qwen/Qwen2.5-72B-Instruct"
+  size_gb = 145.0
+
+[[models]]
+id = "qwen25-coder-7b"
+name = "Qwen2.5-Coder-7B-Instruct"
+family = "qwen"
+parameters = "7B"
+tier = 1
+description = "Small coder model for lightweight autocomplete and fast iterations."
+gated = false
+preferred_workloads = ["code", "tool_calling"]
+
+  [[models.variants]]
+  runtime = "llama.cpp"
+  quant = "Q4_K_M"
+  hf_repo = "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF"
+  size_gb = 4.5
+
+  [[models.variants]]
+  runtime = "mlx"
+  quant = "4bit"
+  hf_repo = "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit"
+  size_gb = 4.5
+
+[[models]]
+id = "qwen25-vl-7b"
+name = "Qwen2.5-VL-7B-Instruct"
+family = "qwen"
+parameters = "7B"
+tier = 1
+description = "Qwen2.5 vision-language model with strong OCR and chart understanding."
+gated = false
+preferred_workloads = ["vision", "chat"]
+
+  [[models.variants]]
+  runtime = "llama.cpp"
+  quant = "Q4_K_M"
+  hf_repo = "bartowski/Qwen2.5-VL-7B-Instruct-GGUF"
+  size_gb = 5.0
+
+  [[models.variants]]
+  runtime = "mlx"
+  quant = "4bit"
+  hf_repo = "mlx-community/Qwen2.5-VL-7B-Instruct-4bit"
+  size_gb = 5.0
+
+[[models]]
+id = "qwen25-vl-72b"
+name = "Qwen2.5-VL-72B-Instruct"
+family = "qwen"
+parameters = "72B"
+tier = 3
+description = "Large vision-language model for complex multi-image and video reasoning."
+gated = false
+preferred_workloads = ["vision", "reasoning"]
+
+  [[models.variants]]
+  runtime = "llama.cpp"
+  quant = "Q4_K_M"
+  hf_repo = "bartowski/Qwen2.5-VL-72B-Instruct-GGUF"
+  size_gb = 41.0
+
+  [[models.variants]]
+  runtime = "mlx"
+  quant = "4bit"
+  hf_repo = "mlx-community/Qwen2.5-VL-72B-Instruct-4bit"
+  size_gb = 41.0
+
+# ---------------------------------------------------------------------------
+# Gemma 3 (gated)
+# ---------------------------------------------------------------------------
+
+[[models]]
+id = "gemma3-27b"
+name = "Gemma 3 27B Instruct"
+family = "gemma"
+parameters = "27B"
+tier = 2
+description = "Google's flagship open Gemma 3 model with long-context and multimodal support."
+gated = true
+preferred_workloads = ["chat", "reasoning", "vision"]
+
+  [[models.variants]]
+  runtime = "llama.cpp"
+  quant = "Q4_K_M"
+  hf_repo = "bartowski/gemma-3-27b-it-GGUF"
+  size_gb = 16.0
+
+  [[models.variants]]
+  runtime = "mlx"
+  quant = "4bit"
+  hf_repo = "mlx-community/gemma-3-27b-it-4bit"
+  size_gb = 16.0
+
+  [[models.variants]]
+  runtime = "vllm"
+  quant = "fp16"
+  hf_repo = "google/gemma-3-27b-it"
+  size_gb = 54.0
+
+[[models]]
+id = "gemma3-9b"
+name = "Gemma 3 9B Instruct"
+family = "gemma"
+parameters = "9B"
+tier = 1
+description = "Mid-small Gemma 3 — efficient chat model with vision input."
+gated = true
+preferred_workloads = ["chat", "vision"]
+
+  [[models.variants]]
+  runtime = "llama.cpp"
+  quant = "Q4_K_M"
+  hf_repo = "bartowski/gemma-3-9b-it-GGUF"
+  size_gb = 5.5
+
+  [[models.variants]]
+  runtime = "mlx"
+  quant = "4bit"
+  hf_repo = "mlx-community/gemma-3-9b-it-4bit"
+  size_gb = 5.5
+
+# ---------------------------------------------------------------------------
+# Llama 3.x (gated)
+# ---------------------------------------------------------------------------
+
+[[models]]
+id = "llama31-70b"
+name = "Llama 3.1 70B Instruct"
+family = "llama"
+parameters = "70B"
+tier = 3
+description = "Meta's flagship open Llama 3.1 instruct with strong general reasoning."
+gated = true
+preferred_workloads = ["chat", "reasoning", "tool_calling"]
+
+  [[models.variants]]
+  runtime = "llama.cpp"
+  quant = "Q4_K_M"
+  hf_repo = "bartowski/Meta-Llama-3.1-70B-Instruct-GGUF"
+  size_gb = 40.0
+
+  [[models.variants]]
+  runtime = "mlx"
+  quant = "4bit"
+  hf_repo = "mlx-community/Meta-Llama-3.1-70B-Instruct-4bit"
+  size_gb = 40.0
+
+  [[models.variants]]
+  runtime = "vllm"
+  quant = "fp16"
+  hf_repo = "meta-llama/Meta-Llama-3.1-70B-Instruct"
+  size_gb = 141.0
+
+[[models]]
+id = "llama31-8b"
+name = "Llama 3.1 8B Instruct"
+family = "llama"
+parameters = "8B"
+tier = 1
+description = "Lightweight Llama 3.1 — good baseline for small-node chat workloads."
+gated = true
+preferred_workloads = ["chat", "tool_calling"]
+
+  [[models.variants]]
+  runtime = "llama.cpp"
+  quant = "Q4_K_M"
+  hf_repo = "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF"
+  size_gb = 4.9
+
+  [[models.variants]]
+  runtime = "mlx"
+  quant = "4bit"
+  hf_repo = "mlx-community/Meta-Llama-3.1-8B-Instruct-4bit"
+  size_gb = 4.9
+
+  [[models.variants]]
+  runtime = "vllm"
+  quant = "fp16"
+  hf_repo = "meta-llama/Meta-Llama-3.1-8B-Instruct"
+  size_gb = 16.0
+
+[[models]]
+id = "llama32-vision-11b"
+name = "Llama 3.2 11B Vision Instruct"
+family = "llama"
+parameters = "11B"
+tier = 2
+description = "Llama 3.2 vision-enabled model for image+text reasoning."
+gated = true
+preferred_workloads = ["vision", "chat"]
+
+  [[models.variants]]
+  runtime = "llama.cpp"
+  quant = "Q4_K_M"
+  hf_repo = "bartowski/Llama-3.2-11B-Vision-Instruct-GGUF"
+  size_gb = 7.0
+
+  [[models.variants]]
+  runtime = "mlx"
+  quant = "4bit"
+  hf_repo = "mlx-community/Llama-3.2-11B-Vision-Instruct-4bit"
+  size_gb = 7.0
+
+# ---------------------------------------------------------------------------
+# DeepSeek
+# ---------------------------------------------------------------------------
+
+[[models]]
+id = "deepseek-v3"
+name = "DeepSeek-V3"
+family = "deepseek"
+parameters = "671B"
+tier = 4
+description = "DeepSeek V3 MoE (37B active) — frontier-class reasoning, needs the leader node."
+gated = false
+preferred_workloads = ["reasoning", "chat", "code"]
+
+  [[models.variants]]
+  runtime = "llama.cpp"
+  quant = "Q4_K_M"
+  hf_repo = "bartowski/DeepSeek-V3-GGUF"
+  size_gb = 380.0
+
+  [[models.variants]]
+  runtime = "mlx"
+  quant = "4bit"
+  hf_repo = "mlx-community/DeepSeek-V3-4bit"
+  size_gb = 380.0
+
+[[models]]
+id = "deepseek-coder-v2"
+name = "DeepSeek-Coder-V2-Instruct"
+family = "deepseek"
+parameters = "236B"
+tier = 4
+description = "DeepSeek Coder V2 MoE (21B active) — top-tier open coder for hard refactors."
+gated = false
+preferred_workloads = ["code", "reasoning"]
+
+  [[models.variants]]
+  runtime = "llama.cpp"
+  quant = "Q4_K_M"
+  hf_repo = "bartowski/DeepSeek-Coder-V2-Instruct-GGUF"
+  size_gb = 140.0
+
+  [[models.variants]]
+  runtime = "mlx"
+  quant = "4bit"
+  hf_repo = "mlx-community/DeepSeek-Coder-V2-Instruct-4bit"
+  size_gb = 140.0
+
+[[models]]
+id = "deepseek-coder-v2-lite"
+name = "DeepSeek-Coder-V2-Lite-Instruct"
+family = "deepseek"
+parameters = "16B"
+tier = 2
+description = "Lite variant of DeepSeek Coder V2 (2.4B active) — fits on smaller nodes."
+gated = false
+preferred_workloads = ["code", "tool_calling"]
+
+  [[models.variants]]
+  runtime = "llama.cpp"
+  quant = "Q4_K_M"
+  hf_repo = "bartowski/DeepSeek-Coder-V2-Lite-Instruct-GGUF"
+  size_gb = 10.0
+
+  [[models.variants]]
+  runtime = "mlx"
+  quant = "4bit"
+  hf_repo = "mlx-community/DeepSeek-Coder-V2-Lite-Instruct-4bit"
+  size_gb = 10.0
+
+# ---------------------------------------------------------------------------
+# Mistral
+# ---------------------------------------------------------------------------
+
+[[models]]
+id = "mistral-large-2411"
+name = "Mistral-Large-Instruct-2411"
+family = "mistral"
+parameters = "123B"
+tier = 3
+description = "Mistral Large 2 — strong multilingual reasoning and tool use."
+gated = false
+preferred_workloads = ["chat", "reasoning", "tool_calling"]
+
+  [[models.variants]]
+  runtime = "llama.cpp"
+  quant = "Q4_K_M"
+  hf_repo = "bartowski/Mistral-Large-Instruct-2411-GGUF"
+  size_gb = 70.0
+
+  [[models.variants]]
+  runtime = "mlx"
+  quant = "4bit"
+  hf_repo = "mlx-community/Mistral-Large-Instruct-2411-4bit"
+  size_gb = 70.0
+
+[[models]]
+id = "mistral-small-3"
+name = "Mistral-Small-3-Instruct-2501"
+family = "mistral"
+parameters = "24B"
+tier = 2
+description = "Mistral Small 3 — fast 24B dense model with latency-optimized tool calling."
+gated = false
+preferred_workloads = ["chat", "tool_calling", "code"]
+
+  [[models.variants]]
+  runtime = "llama.cpp"
+  quant = "Q4_K_M"
+  hf_repo = "bartowski/Mistral-Small-3-Instruct-2501-GGUF"
+  size_gb = 14.0
+
+  [[models.variants]]
+  runtime = "mlx"
+  quant = "4bit"
+  hf_repo = "mlx-community/Mistral-Small-3-Instruct-2501-4bit"
+  size_gb = 14.0
+
+[[models]]
+id = "mistral-nemo-12b"
+name = "Mistral-Nemo-Instruct-2407"
+family = "mistral"
+parameters = "12B"
+tier = 1
+description = "Mistral Nemo — 12B dense with 128k context, built with NVIDIA."
+gated = false
+preferred_workloads = ["chat", "tool_calling"]
+
+  [[models.variants]]
+  runtime = "llama.cpp"
+  quant = "Q4_K_M"
+  hf_repo = "bartowski/Mistral-Nemo-Instruct-2407-GGUF"
+  size_gb = 7.5
+
+  [[models.variants]]
+  runtime = "mlx"
+  quant = "4bit"
+  hf_repo = "mlx-community/Mistral-Nemo-Instruct-2407-4bit"
+  size_gb = 7.5
+
+# ---------------------------------------------------------------------------
+# Phi
+# ---------------------------------------------------------------------------
+
+[[models]]
+id = "phi-4"
+name = "Phi-4"
+family = "phi"
+parameters = "14B"
+tier = 2
+description = "Microsoft Phi-4 — strong reasoning for its size, great on mid-tier nodes."
+gated = false
+preferred_workloads = ["reasoning", "chat", "code"]
+
+  [[models.variants]]
+  runtime = "llama.cpp"
+  quant = "Q4_K_M"
+  hf_repo = "bartowski/phi-4-GGUF"
+  size_gb = 8.5
+
+  [[models.variants]]
+  runtime = "mlx"
+  quant = "4bit"
+  hf_repo = "mlx-community/phi-4-4bit"
+  size_gb = 8.5
+
+  [[models.variants]]
+  runtime = "vllm"
+  quant = "fp16"
+  hf_repo = "microsoft/phi-4"
+  size_gb = 29.0
+
+[[models]]
+id = "phi-4-mini"
+name = "Phi-4-mini-instruct"
+family = "phi"
+parameters = "3.8B"
+tier = 1
+description = "Tiny Phi-4 — fits anywhere, good for edge nodes and fast drafts."
+gated = false
+preferred_workloads = ["chat", "tool_calling"]
+
+  [[models.variants]]
+  runtime = "llama.cpp"
+  quant = "Q4_K_M"
+  hf_repo = "bartowski/Phi-4-mini-instruct-GGUF"
+  size_gb = 2.3
+
+  [[models.variants]]
+  runtime = "mlx"
+  quant = "4bit"
+  hf_repo = "mlx-community/Phi-4-mini-instruct-4bit"
+  size_gb = 2.3
+
+# ---------------------------------------------------------------------------
+# Vision-focused
+# ---------------------------------------------------------------------------
+
+[[models]]
+id = "llava-1.6-34b"
+name = "LLaVA v1.6 34B"
+family = "llama"
+parameters = "34B"
+tier = 2
+description = "LLaVA 1.6 on Yi-34B base — popular open vision-language model."
+gated = false
+preferred_workloads = ["vision", "chat"]
+
+  [[models.variants]]
+  runtime = "llama.cpp"
+  quant = "Q4_K_M"
+  hf_repo = "cjpais/llava-v1.6-34B-gguf"
+  size_gb = 20.0
+
+  [[models.variants]]
+  runtime = "mlx"
+  quant = "4bit"
+  hf_repo = "mlx-community/llava-v1.6-34b-4bit"
+  size_gb = 20.0
+
+[[models]]
+id = "llava-1.6-mistral-7b"
+name = "LLaVA v1.6 Mistral 7B"
+family = "mistral"
+parameters = "7B"
+tier = 1
+description = "Compact LLaVA on Mistral 7B — lightweight multimodal for small nodes."
+gated = false
+preferred_workloads = ["vision", "chat"]
+
+  [[models.variants]]
+  runtime = "llama.cpp"
+  quant = "Q4_K_M"
+  hf_repo = "cjpais/llava-1.6-mistral-7b-gguf"
+  size_gb = 4.4
+
+  [[models.variants]]
+  runtime = "mlx"
+  quant = "4bit"
+  hf_repo = "mlx-community/llava-v1.6-mistral-7b-4bit"
+  size_gb = 4.4

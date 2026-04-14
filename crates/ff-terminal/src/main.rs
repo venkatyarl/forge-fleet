@@ -73,6 +73,8 @@ enum Command {
     /// Deferred task queue — schedule work that runs when conditions are met
     /// (node comes online, a time is reached, manual retry).
     Defer { #[command(subcommand)] command: DeferCommand },
+    /// Model lifecycle management (catalog, library, deployments, jobs).
+    Model { #[command(subcommand)] command: ModelCommand },
     /// Run the deferred task worker loop (scheduler + executor).
     /// Typically run as a background service on the fleet leader.
     DeferWorker {
@@ -119,6 +121,37 @@ enum DeferCommand {
     Cancel { id: String },
     /// Retry a failed or cancelled task (resets attempts-aware status, runs ASAP).
     Retry { id: String },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum ModelCommand {
+    /// Sync the curated model catalog TOML into Postgres.
+    SyncCatalog,
+    /// Search the catalog (fuzzy on id/name/family).
+    Search { query: String },
+    /// List catalog entries (what can be downloaded).
+    Catalog,
+    /// List library entries (what's on disk, per node).
+    Library {
+        #[arg(long)] node: Option<String>,
+    },
+    /// List current deployments (what's running, per node).
+    Deployments {
+        #[arg(long)] node: Option<String>,
+    },
+    /// Scan a node's local models directory and reconcile with fleet_model_library.
+    /// Defaults to the current host (taylor) scanning ~/models.
+    Scan {
+        #[arg(long)] node: Option<String>,
+        #[arg(long)] models_dir: Option<PathBuf>,
+    },
+    /// Show latest disk usage per node (from fleet_disk_usage snapshots).
+    Disk,
+    /// List lifecycle jobs (downloads, deletes, loads, swaps).
+    Jobs {
+        #[arg(long)] status: Option<String>,
+        #[arg(long, default_value_t = 30)] limit: i64,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -171,6 +204,7 @@ async fn main() -> Result<()> {
         Some(Command::Version) => { println!("ff {}", env!("CARGO_PKG_VERSION")); return Ok(()); }
         Some(Command::Secrets { command }) => return handle_secrets(command.clone()).await,
         Some(Command::Defer   { command }) => return handle_defer(command.clone()).await,
+        Some(Command::Model   { command }) => return handle_model(command.clone()).await,
         Some(Command::DeferWorker { as_node, interval, scheduler, once }) => {
             return handle_defer_worker(as_node.clone(), *interval, *scheduler, *once).await;
         }
@@ -253,6 +287,7 @@ async fn main() -> Result<()> {
         Some(Command::Task { command }) => handle_task(command, &config_path).await,
         Some(Command::Secrets { command }) => handle_secrets(command).await,
         Some(Command::Defer { command }) => handle_defer(command).await,
+        Some(Command::Model { command }) => handle_model(command).await,
         Some(Command::DeferWorker { as_node, interval, scheduler, once }) => {
             handle_defer_worker(as_node, interval, scheduler, once).await
         }
@@ -426,6 +461,14 @@ async fn run_event_loop(
 
         // Poll any in-flight async picker load
         poll_picker_load(app);
+
+        // Poll async fleet health refresh result (non-blocking).
+        poll_fleet_health_refresh(app);
+
+        // Kick off a fleet health refresh every ~30s (20 fps × 30s = 600 frames).
+        if app.frame % 600 == 0 && app.frame > 0 {
+            kick_fleet_health_refresh(&app.fleet_nodes);
+        }
 
         // Render
         app.frame += 1;
@@ -780,6 +823,58 @@ pub fn poll_picker_load(app: &mut ff_terminal::app::App) {
             Err(e) => { picker.error = Some(e); }
         }
     }
+}
+
+// ─── Periodic Fleet Health Refresh ─────────────────────────────────────────
+
+/// Result slot for an in-flight health refresh. Keyed only by presence.
+static FLEET_HEALTH_SLOT: std::sync::Mutex<Option<std::sync::Arc<std::sync::Mutex<Option<Vec<ff_terminal::app::FleetNode>>>>>> = std::sync::Mutex::new(None);
+
+/// Kick off a background task that pings every node + its model endpoints.
+/// Idempotent — if one is already in flight, this does nothing.
+pub fn kick_fleet_health_refresh(current_nodes: &[ff_terminal::app::FleetNode]) {
+    // Already a refresh in flight? Skip.
+    {
+        let guard = FLEET_HEALTH_SLOT.lock().unwrap();
+        if guard.is_some() { return; }
+    }
+    let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+    *FLEET_HEALTH_SLOT.lock().unwrap() = Some(slot.clone());
+
+    // Snapshot the current node list so the background task can work without sharing &mut.
+    let nodes_snapshot = current_nodes.to_vec();
+
+    tokio::spawn(async move {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap_or_default();
+        let mut refreshed = nodes_snapshot;
+        for node in refreshed.iter_mut() {
+            let daemon_url = format!("http://{}:{}/health", node.ip, ff_terminal::app::PORT_DAEMON);
+            node.daemon_online = client.get(&daemon_url).send().await
+                .map(|r| r.status().is_success()).unwrap_or(false);
+            for model in node.models.iter_mut() {
+                let model_url = format!("http://{}:{}/health", node.ip, model.port);
+                model.online = client.get(&model_url).send().await
+                    .map(|r| r.status().is_success()).unwrap_or(false);
+            }
+        }
+        *slot.lock().unwrap() = Some(refreshed);
+    });
+}
+
+/// Install the refreshed fleet node list if the background task is done.
+pub fn poll_fleet_health_refresh(app: &mut ff_terminal::app::App) {
+    let slot_opt = FLEET_HEALTH_SLOT.lock().unwrap().clone();
+    let Some(slot) = slot_opt else { return };
+    let result = {
+        let mut g = slot.lock().unwrap();
+        g.take()
+    };
+    let Some(fresh) = result else { return };
+    *FLEET_HEALTH_SLOT.lock().unwrap() = None;
+    app.fleet_nodes = fresh;
 }
 
 async fn load_picker_items() -> Result<Vec<ff_terminal::app::ModelPickerItem>, String> {
@@ -1538,6 +1633,154 @@ async fn handle_defer(cmd: DeferCommand) -> Result<()> {
     Ok(())
 }
 
+// ─── Model lifecycle CLI ───────────────────────────────────────────────────
+
+async fn handle_model(cmd: ModelCommand) -> Result<()> {
+    let pool = ff_agent::fleet_info::get_fleet_pool()
+        .await
+        .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
+    ff_db::run_postgres_migrations(&pool).await
+        .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
+
+    match cmd {
+        ModelCommand::SyncCatalog => {
+            let n = ff_agent::model_catalog::sync_catalog(&pool).await
+                .map_err(|e| anyhow::anyhow!(e))?;
+            println!("Synced {n} catalog entries from TOML to Postgres");
+        }
+        ModelCommand::Search { query } => {
+            let rows = ff_db::pg_search_catalog(&pool, &query).await?;
+            if rows.is_empty() {
+                println!("(no catalog matches for \"{query}\")");
+                return Ok(());
+            }
+            println!("{:<28} {:<10} {:<6} {:<7} {}", "ID", "FAMILY", "TIER", "GATED", "NAME");
+            for r in rows {
+                let gated = if r.gated { "yes" } else { "-" };
+                println!("{:<28} {:<10} T{:<5} {:<7} {}", r.id, r.family, r.tier, gated, r.name);
+            }
+        }
+        ModelCommand::Catalog => {
+            let rows = ff_db::pg_list_catalog(&pool).await?;
+            if rows.is_empty() {
+                println!("(catalog empty — run `ff model sync-catalog` first)");
+                return Ok(());
+            }
+            println!("{:<28} {:<10} {:<6} {:<7} {:<7} {}", "ID", "FAMILY", "TIER", "PARAMS", "GATED", "NAME");
+            for r in rows {
+                let gated = if r.gated { "yes" } else { "-" };
+                println!("{:<28} {:<10} T{:<5} {:<7} {:<7} {}",
+                    r.id, r.family, r.tier, r.parameters, gated, r.name);
+            }
+        }
+        ModelCommand::Library { node } => {
+            let rows = ff_db::pg_list_library(&pool, node.as_deref()).await?;
+            if rows.is_empty() {
+                println!("(library empty — run `ff model scan` to index your local models dir)");
+                return Ok(());
+            }
+            println!("{:<10} {:<28} {:<10} {:<10} {:<10} {}", "NODE", "CATALOG_ID", "RUNTIME", "QUANT", "SIZE", "PATH");
+            for r in rows {
+                let sz = human_bytes(r.size_bytes as u64);
+                let quant = r.quant.clone().unwrap_or_else(|| "-".into());
+                println!("{:<10} {:<28} {:<10} {:<10} {:<10} {}",
+                    r.node_name, r.catalog_id, r.runtime, quant, sz, r.file_path);
+            }
+        }
+        ModelCommand::Deployments { node } => {
+            let rows = ff_db::pg_list_deployments(&pool, node.as_deref()).await?;
+            if rows.is_empty() {
+                println!("(no deployments recorded)");
+                return Ok(());
+            }
+            println!("{:<10} {:<28} {:<10} {:<6} {:<10} {}", "NODE", "CATALOG_ID", "RUNTIME", "PORT", "HEALTH", "STARTED");
+            for r in rows {
+                let catalog = r.catalog_id.clone().unwrap_or_else(|| "-".into());
+                println!("{:<10} {:<28} {:<10} {:<6} {:<10} {}",
+                    r.node_name, catalog, r.runtime, r.port, r.health_status,
+                    r.started_at.format("%Y-%m-%d %H:%M UTC"));
+            }
+        }
+        ModelCommand::Scan { node, models_dir } => {
+            // Default: resolve this host's node name from Postgres by IP.
+            let node_name = match node {
+                Some(n) => n,
+                None => ff_agent::fleet_info::resolve_this_node_name().await,
+            };
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
+            let default_dir = PathBuf::from(home).join("models");
+            let dir = models_dir.unwrap_or(default_dir);
+
+            if !dir.exists() {
+                anyhow::bail!("models dir does not exist: {}", dir.display());
+            }
+            println!("Scanning {} on node {} ...", dir.display(), node_name);
+            let summary = ff_agent::model_library_scanner::scan_local_library(&pool, &node_name, &dir)
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+            println!("  added:   {}", summary.added);
+            println!("  updated: {}", summary.updated);
+            println!("  removed: {}", summary.removed);
+            println!("  total:   {} across models dir", human_bytes(summary.total_bytes));
+        }
+        ModelCommand::Disk => {
+            let rows = ff_db::pg_latest_disk_usage(&pool).await?;
+            if rows.is_empty() {
+                println!("(no disk usage samples yet — the daemon records these periodically)");
+                return Ok(());
+            }
+            println!("{:<10} {:<24} {:<10} {:<10} {:<10} {}", "NODE", "MODELS_DIR", "FREE", "USED", "MODELS", "SAMPLED");
+            for (node, dir, total, used, free, models_sz, ts) in rows {
+                let _ = total;
+                println!("{:<10} {:<24} {:<10} {:<10} {:<10} {}",
+                    node,
+                    dir,
+                    human_bytes(free as u64),
+                    human_bytes(used as u64),
+                    human_bytes(models_sz as u64),
+                    ts.format("%Y-%m-%d %H:%M UTC")
+                );
+            }
+        }
+        ModelCommand::Jobs { status, limit } => {
+            let rows = ff_db::pg_list_jobs(&pool, status.as_deref(), limit).await?;
+            if rows.is_empty() {
+                println!("(no jobs)");
+                return Ok(());
+            }
+            println!("{:<38} {:<10} {:<12} {:<10} {:<7} {}", "ID", "NODE", "KIND", "STATUS", "PCT", "TARGET");
+            for r in rows {
+                let target = r.target_catalog_id.clone()
+                    .or(r.target_library_id.clone())
+                    .unwrap_or_else(|| "-".into());
+                println!("{:<38} {:<10} {:<12} {:<10} {:<6.1}% {}",
+                    r.id, r.node_name, r.kind, r.status, r.progress_pct, target);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Pretty-print a byte size (KiB/MiB/GiB/TiB).
+fn human_bytes(n: u64) -> String {
+    let (unit, v) = if n >= 1 << 40 { ("TiB", n as f64 / (1u64 << 40) as f64) }
+        else if n >= 1 << 30 { ("GiB", n as f64 / (1u64 << 30) as f64) }
+        else if n >= 1 << 20 { ("MiB", n as f64 / (1u64 << 20) as f64) }
+        else if n >= 1 << 10 { ("KiB", n as f64 / (1u64 << 10) as f64) }
+        else { return format!("{n}B"); };
+    format!("{v:.1}{unit}")
+}
+
+/// Best-effort hostname → node name (short, lowercased, without domain).
+fn default_node_name() -> String {
+    std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().split('.').next().unwrap_or("unknown").to_lowercase())
+        .unwrap_or_else(|| "unknown".into())
+}
+
 // ─── Deferred task worker ──────────────────────────────────────────────────
 
 /// Probe each fleet node's SSH port (22) to determine reachability. Returns the list of reachable node names.
@@ -1697,16 +1940,10 @@ async fn handle_defer_worker(
     scheduler: bool,
     once: bool,
 ) -> Result<()> {
-    let worker_name = as_node
-        .or_else(|| std::env::var("FORGEFLEET_NODE_NAME").ok())
-        .unwrap_or_else(|| {
-            std::process::Command::new("hostname")
-                .output()
-                .ok()
-                .and_then(|o| String::from_utf8(o.stdout).ok())
-                .map(|s| s.trim().split('.').next().unwrap_or("unknown").to_string())
-                .unwrap_or_else(|| "unknown".into())
-        });
+    let worker_name = match as_node {
+        Some(n) => n,
+        None => ff_agent::fleet_info::resolve_this_node_name().await,
+    };
 
     let pool = ff_agent::fleet_info::get_fleet_pool()
         .await
