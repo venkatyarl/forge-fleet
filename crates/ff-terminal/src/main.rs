@@ -152,6 +152,24 @@ enum ModelCommand {
         #[arg(long)] status: Option<String>,
         #[arg(long, default_value_t = 30)] limit: i64,
     },
+    /// Download a model from HuggingFace to this node's models dir.
+    /// Picks the variant matching this node's runtime (llama.cpp / mlx / vllm).
+    Download {
+        /// Catalog id (use `ff model search` to find one).
+        id: String,
+        /// Override runtime (default: this node's runtime from DB).
+        #[arg(long)] runtime: Option<String>,
+        /// Override target node (default: this host).
+        #[arg(long)] node: Option<String>,
+        /// Force re-download even if files already exist.
+        #[arg(long, default_value_t = false)] force: bool,
+    },
+    /// Delete a model from a node's library (removes files from disk).
+    Delete {
+        /// Library id (UUID from `ff model library`).
+        id: String,
+        #[arg(long, default_value_t = false)] yes: bool,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -1742,6 +1760,192 @@ async fn handle_model(cmd: ModelCommand) -> Result<()> {
                 );
             }
         }
+        ModelCommand::Download { id, runtime, node, force } => {
+            // Resolve target node + node runtime + models_dir.
+            let node_name = match node {
+                Some(n) => n,
+                None => ff_agent::fleet_info::resolve_this_node_name().await,
+            };
+            let node_row = ff_db::pg_get_node(&pool, &node_name)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("node '{node_name}' not in fleet_nodes"))?;
+            let target_runtime = runtime.unwrap_or_else(|| node_row.runtime.clone());
+            if target_runtime == "unknown" {
+                anyhow::bail!("node '{node_name}' has unknown runtime; set with: ff config set fleet.{node_name}.runtime mlx|llama.cpp|vllm");
+            }
+
+            // Lookup catalog entry; pick variant for runtime.
+            let catalog = ff_db::pg_get_catalog(&pool, &id).await?
+                .ok_or_else(|| anyhow::anyhow!("no catalog entry with id '{id}' (try `ff model search`)"))?;
+            let variants = catalog.variants.as_array()
+                .ok_or_else(|| anyhow::anyhow!("catalog variants for '{id}' is not an array"))?;
+            let variant = variants.iter().find(|v| {
+                v.get("runtime").and_then(|x| x.as_str()) == Some(target_runtime.as_str())
+            }).ok_or_else(|| {
+                let available: Vec<String> = variants.iter()
+                    .filter_map(|v| v.get("runtime").and_then(|x| x.as_str()).map(String::from))
+                    .collect();
+                anyhow::anyhow!("no variant for runtime '{target_runtime}' on '{id}'. available: {}", available.join(", "))
+            })?;
+
+            let hf_repo = variant.get("hf_repo").and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("variant missing hf_repo"))?;
+            let quant = variant.get("quant").and_then(|v| v.as_str()).map(String::from);
+            let size_gb = variant.get("size_gb").and_then(|v| v.as_f64()).unwrap_or(0.0);
+
+            // For now: only download when targeting the current host (we can run locally).
+            // Cross-node downloads require daemon endpoints — flag clearly.
+            let this_node = ff_agent::fleet_info::resolve_this_node_name().await;
+            if node_name != this_node {
+                anyhow::bail!("cross-node download not yet implemented. for now run `ff model download {id}` directly on '{node_name}'");
+            }
+
+            // Compute destination dir under models_dir.
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
+            let models_dir = expand_tilde(&node_row.models_dir, &home);
+            let dest = models_dir.join(&id);
+
+            // HF token (optional — gated models need it).
+            let token = ff_agent::fleet_info::get_hf_token().await;
+            if catalog.gated && token.is_none() {
+                anyhow::bail!("model '{id}' is gated on HF; set token first with: ff secrets set huggingface.token <hf_xxx>");
+            }
+
+            // Allow patterns: prefer runtime-specific glob to avoid pulling everything.
+            let allow_patterns: Vec<String> = match target_runtime.as_str() {
+                "llama.cpp" => vec!["*.gguf".into(), "tokenizer*".into(), "*config*".into()],
+                "mlx" | "vllm" => vec![
+                    "*.safetensors".into(),
+                    "*.json".into(),
+                    "tokenizer*".into(),
+                    "*config*".into(),
+                    "README*".into(),
+                ],
+                other => vec![format!("*.{other}")],
+            };
+            let deny_patterns: Vec<String> = vec!["*.f16*".into(), "*.bf16*".into()];
+
+            let _ = force; // not yet used; resume-by-size is automatic
+
+            // Create job row for tracking.
+            let params = serde_json::json!({
+                "hf_repo": hf_repo,
+                "runtime": target_runtime,
+                "quant": quant,
+                "dest": dest.to_string_lossy(),
+            });
+            let job_id = ff_db::pg_create_job(
+                &pool, &node_name, "download",
+                Some(&id), None, &params,
+            ).await?;
+            ff_db::pg_update_job_progress(
+                &pool, &job_id, Some("running"), Some(0.0), None, None, None, None,
+            ).await?;
+
+            println!("{CYAN}▶ Downloading {} ({})\n  source: {}\n  dest:   {}\n  job:    {}{RESET}",
+                catalog.name, target_runtime, hf_repo, dest.display(), job_id);
+            if size_gb > 0.0 { println!("  estimated size: {size_gb:.1} GB"); }
+
+            // Run download with progress callback.
+            let pool_for_progress = pool.clone();
+            let job_id_for_progress = job_id.clone();
+            let mut last_pct = -1i32;
+            let opts = ff_agent::hf_download::DownloadOptions {
+                repo: hf_repo.to_string(),
+                revision: None,
+                dest_dir: dest.clone(),
+                token: token.clone(),
+                allow_patterns,
+                deny_patterns,
+            };
+
+            let result = ff_agent::hf_download::download_repo(opts, move |p| {
+                let pct = p.percent as i32;
+                if pct != last_pct {
+                    last_pct = pct;
+                    let bar_w = 30;
+                    let filled = (bar_w as f32 * p.percent / 100.0) as usize;
+                    let bar = format!("{}{}", "█".repeat(filled), "░".repeat(bar_w - filled));
+                    let done_mb = p.bytes_done / (1u64 << 20);
+                    let total_mb = p.bytes_total / (1u64 << 20);
+                    eprint!("\r  [{bar}] {pct:>3}%  {done_mb}/{total_mb} MiB  {}", trunc_for_status(&p.file, 40));
+                    use std::io::Write as _;
+                    let _ = std::io::stderr().flush();
+                    // Update DB job (fire and forget — best effort)
+                    let pool2 = pool_for_progress.clone();
+                    let jid = job_id_for_progress.clone();
+                    let bd = p.bytes_done as i64;
+                    let bt = p.bytes_total as i64;
+                    let pp = p.percent;
+                    tokio::spawn(async move {
+                        let _ = ff_db::pg_update_job_progress(
+                            &pool2, &jid, None, Some(pp), Some(bd), Some(bt), None, None,
+                        ).await;
+                    });
+                }
+            }).await;
+            eprintln!(); // newline after progress bar
+
+            match result {
+                Ok(files) => {
+                    println!("{CYAN}✓ Downloaded {} file(s){RESET}", files.len());
+                    let _ = ff_db::pg_update_job_progress(
+                        &pool, &job_id, Some("completed"), Some(100.0), None, None, None, None,
+                    ).await;
+                    // Re-scan node so library reflects the new model.
+                    println!("Re-scanning library...");
+                    let summary = ff_agent::model_library_scanner::scan_local_library(
+                        &pool, &node_name, &models_dir
+                    ).await.map_err(|e| anyhow::anyhow!(e))?;
+                    println!("  added: {}, updated: {}", summary.added, summary.updated);
+                }
+                Err(e) => {
+                    let _ = ff_db::pg_update_job_progress(
+                        &pool, &job_id, Some("failed"), None, None, None, None, Some(&e),
+                    ).await;
+                    anyhow::bail!("download failed: {e}");
+                }
+            }
+        }
+        ModelCommand::Delete { id, yes } => {
+            // Look up library row.
+            let all = ff_db::pg_list_library(&pool, None).await?;
+            let row = all.iter().find(|r| r.id == id)
+                .ok_or_else(|| anyhow::anyhow!("no library entry with id '{id}' (try `ff model library`)"))?;
+
+            // Safety: refuse if a deployment references this library row.
+            let deployments = ff_db::pg_list_deployments(&pool, Some(&row.node_name)).await?;
+            let in_use = deployments.iter().any(|d| d.library_id.as_deref() == Some(&id));
+            if in_use {
+                anyhow::bail!("model is currently deployed on {} — unload it first (`ff model unload <deployment_id>`)", row.node_name);
+            }
+
+            // Cross-node delete not yet wired — only this host.
+            let this_node = ff_agent::fleet_info::resolve_this_node_name().await;
+            if row.node_name != this_node {
+                anyhow::bail!("cross-node delete not yet implemented. run on '{}' instead.", row.node_name);
+            }
+
+            if !yes {
+                println!("This will delete {} ({}) from disk. Re-run with --yes to confirm.",
+                    row.file_path, human_bytes(row.size_bytes as u64));
+                return Ok(());
+            }
+
+            let path = std::path::Path::new(&row.file_path);
+            let result = if path.is_dir() {
+                std::fs::remove_dir_all(path)
+            } else {
+                std::fs::remove_file(path)
+            };
+            match result {
+                Ok(()) => {
+                    let _ = ff_db::pg_delete_library(&pool, &id).await?;
+                    println!("Deleted {} ({}) from {}", row.file_path, human_bytes(row.size_bytes as u64), row.node_name);
+                }
+                Err(e) => anyhow::bail!("filesystem remove failed: {e}"),
+            }
+        }
         ModelCommand::Jobs { status, limit } => {
             let rows = ff_db::pg_list_jobs(&pool, status.as_deref(), limit).await?;
             if rows.is_empty() {
@@ -1771,15 +1975,25 @@ fn human_bytes(n: u64) -> String {
     format!("{v:.1}{unit}")
 }
 
-/// Best-effort hostname → node name (short, lowercased, without domain).
-fn default_node_name() -> String {
-    std::process::Command::new("hostname")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().split('.').next().unwrap_or("unknown").to_lowercase())
-        .unwrap_or_else(|| "unknown".into())
+/// Expand a leading `~` to `$HOME` so config strings like "~/models" resolve to absolute paths.
+fn expand_tilde(p: &str, home: &str) -> PathBuf {
+    if let Some(rest) = p.strip_prefix("~/") {
+        PathBuf::from(home).join(rest)
+    } else if p == "~" {
+        PathBuf::from(home)
+    } else {
+        PathBuf::from(p)
+    }
 }
+
+/// Truncate a string for inline status display, with a leading ellipsis.
+fn trunc_for_status(s: &str, max: usize) -> String {
+    if s.chars().count() <= max { return s.to_string(); }
+    let take = max.saturating_sub(1);
+    let suffix: String = s.chars().rev().take(take).collect::<Vec<_>>().into_iter().rev().collect();
+    format!("…{suffix}")
+}
+
 
 // ─── Deferred task worker ──────────────────────────────────────────────────
 

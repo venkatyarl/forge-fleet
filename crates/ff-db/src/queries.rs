@@ -1355,7 +1355,21 @@ pub struct FleetNodeRow {
     pub preferences: JsonValue,
     pub resources: JsonValue,
     pub status: String,
+    /// Inference runtime: 'llama.cpp' | 'mlx' | 'vllm' | 'unknown'.
+    /// Added in schema V11; defaults to 'unknown' for pre-existing rows.
+    #[serde(default = "default_runtime")]
+    pub runtime: String,
+    /// Models directory on the node (default '~/models').
+    #[serde(default = "default_models_dir")]
+    pub models_dir: String,
+    /// Disk quota for the models dir as a percentage of total disk (default 80).
+    #[serde(default = "default_disk_quota_pct")]
+    pub disk_quota_pct: i32,
 }
+
+fn default_runtime() -> String { "unknown".to_string() }
+fn default_models_dir() -> String { "~/models".to_string() }
+fn default_disk_quota_pct() -> i32 { 80 }
 
 /// A fleet model row from the Postgres `fleet_models` table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1380,7 +1394,10 @@ pub async fn pg_list_nodes(pool: &PgPool) -> Result<Vec<FleetNodeRow>> {
     let rows = sqlx::query(
         "SELECT name, ip, ssh_user, ram_gb, cpu_cores, os, role,
                 election_priority, hardware, alt_ips, capabilities,
-                preferences, resources, status
+                preferences, resources, status,
+                COALESCE(runtime, 'unknown') AS runtime,
+                COALESCE(models_dir, '~/models') AS models_dir,
+                COALESCE(disk_quota_pct, 80) AS disk_quota_pct
          FROM fleet_nodes ORDER BY election_priority, name",
     )
     .fetch_all(pool)
@@ -1403,6 +1420,9 @@ pub async fn pg_list_nodes(pool: &PgPool) -> Result<Vec<FleetNodeRow>> {
             preferences: r.get("preferences"),
             resources: r.get("resources"),
             status: r.get("status"),
+            runtime: r.get("runtime"),
+            models_dir: r.get("models_dir"),
+            disk_quota_pct: r.get("disk_quota_pct"),
         })
         .collect())
 }
@@ -1412,7 +1432,10 @@ pub async fn pg_get_node(pool: &PgPool, name: &str) -> Result<Option<FleetNodeRo
     let row = sqlx::query(
         "SELECT name, ip, ssh_user, ram_gb, cpu_cores, os, role,
                 election_priority, hardware, alt_ips, capabilities,
-                preferences, resources, status
+                preferences, resources, status,
+                COALESCE(runtime, 'unknown') AS runtime,
+                COALESCE(models_dir, '~/models') AS models_dir,
+                COALESCE(disk_quota_pct, 80) AS disk_quota_pct
          FROM fleet_nodes WHERE name = $1",
     )
     .bind(name)
@@ -1434,6 +1457,9 @@ pub async fn pg_get_node(pool: &PgPool, name: &str) -> Result<Option<FleetNodeRo
         preferences: r.get("preferences"),
         resources: r.get("resources"),
         status: r.get("status"),
+        runtime: r.get("runtime"),
+        models_dir: r.get("models_dir"),
+        disk_quota_pct: r.get("disk_quota_pct"),
     }))
 }
 
@@ -1441,8 +1467,9 @@ pub async fn pg_get_node(pool: &PgPool, name: &str) -> Result<Option<FleetNodeRo
 pub async fn pg_upsert_node(pool: &PgPool, node: &FleetNodeRow) -> Result<()> {
     sqlx::query(
         "INSERT INTO fleet_nodes (name, ip, ssh_user, ram_gb, cpu_cores, os, role,
-                election_priority, hardware, alt_ips, capabilities, preferences, resources, status, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW())
+                election_priority, hardware, alt_ips, capabilities, preferences, resources, status,
+                runtime, models_dir, disk_quota_pct, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, NOW())
          ON CONFLICT (name) DO UPDATE SET
             ip = EXCLUDED.ip,
             ssh_user = EXCLUDED.ssh_user,
@@ -1457,6 +1484,9 @@ pub async fn pg_upsert_node(pool: &PgPool, node: &FleetNodeRow) -> Result<()> {
             preferences = EXCLUDED.preferences,
             resources = EXCLUDED.resources,
             status = EXCLUDED.status,
+            runtime = COALESCE(NULLIF(EXCLUDED.runtime, ''), fleet_nodes.runtime),
+            models_dir = COALESCE(NULLIF(EXCLUDED.models_dir, ''), fleet_nodes.models_dir),
+            disk_quota_pct = COALESCE(NULLIF(EXCLUDED.disk_quota_pct, 0), fleet_nodes.disk_quota_pct),
             updated_at = NOW()",
     )
     .bind(&node.name)
@@ -1473,6 +1503,9 @@ pub async fn pg_upsert_node(pool: &PgPool, node: &FleetNodeRow) -> Result<()> {
     .bind(&node.preferences)
     .bind(&node.resources)
     .bind(&node.status)
+    .bind(&node.runtime)
+    .bind(&node.models_dir)
+    .bind(node.disk_quota_pct)
     .execute(pool)
     .await?;
     Ok(())
@@ -2531,6 +2564,9 @@ pub async fn seed_from_fleet_toml(
             preferences: preferences_json,
             resources: resources_json,
             status: "online".into(),
+            runtime: "unknown".into(),
+            models_dir: "~/models".into(),
+            disk_quota_pct: 80,
         };
 
         pg_upsert_node(pool, &node_row).await?;
