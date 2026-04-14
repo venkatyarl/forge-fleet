@@ -87,6 +87,23 @@ enum Command {
         /// Exit after one scheduler+worker pass (useful for tests / cron).
         #[arg(long, default_value_t = false)] once: bool,
     },
+    /// Run ForgeFleet's unified daemon: deferred-task scheduler+worker, disk
+    /// sampler, and deployment reconciler all in one long-lived process.
+    /// Typically run on boot via launchd/systemd.
+    Daemon {
+        /// Worker node name (defaults to this host via DB lookup).
+        #[arg(long)] as_node: Option<String>,
+        /// Act as the deferred-task scheduler too (only one node should).
+        #[arg(long, default_value_t = false)] scheduler: bool,
+        /// Deferred-worker poll interval in seconds.
+        #[arg(long, default_value_t = 15)] defer_interval: u64,
+        /// Disk-sampler interval in seconds (default 300 = 5 min).
+        #[arg(long, default_value_t = 300)] disk_interval: u64,
+        /// Reconciler interval in seconds (default 60).
+        #[arg(long, default_value_t = 60)] reconcile_interval: u64,
+        /// Exit after one pass of each (useful for cron/testing).
+        #[arg(long, default_value_t = false)] once: bool,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -199,6 +216,23 @@ enum ModelCommand {
     Ping {
         id: String,
     },
+    /// Transfer a model from one node to another (same-runtime, LAN rsync).
+    Transfer {
+        /// Library UUID on the source node.
+        #[arg(long)] library_id: String,
+        /// Source node name.
+        #[arg(long)] from: String,
+        /// Target node name.
+        #[arg(long)] to: String,
+    },
+    /// Convert a safetensors library entry to MLX on this Apple Silicon host.
+    Convert {
+        /// Library UUID (must be runtime=vllm i.e. safetensors).
+        library_id: String,
+        /// Quantization bits (4 or 8).
+        #[arg(long, default_value_t = 4)]
+        q_bits: u8,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -254,6 +288,9 @@ async fn main() -> Result<()> {
         Some(Command::Model   { command }) => return handle_model(command.clone()).await,
         Some(Command::DeferWorker { as_node, interval, scheduler, once }) => {
             return handle_defer_worker(as_node.clone(), *interval, *scheduler, *once).await;
+        }
+        Some(Command::Daemon { as_node, scheduler, defer_interval, disk_interval, reconcile_interval, once }) => {
+            return handle_daemon(as_node.clone(), *scheduler, *defer_interval, *disk_interval, *reconcile_interval, *once).await;
         }
         Some(Command::Config  { command }) => return handle_config(command.clone(), &config_path),
         Some(Command::Status)              => return handle_status(&config_path),
@@ -337,6 +374,9 @@ async fn main() -> Result<()> {
         Some(Command::Model { command }) => handle_model(command).await,
         Some(Command::DeferWorker { as_node, interval, scheduler, once }) => {
             handle_defer_worker(as_node, interval, scheduler, once).await
+        }
+        Some(Command::Daemon { as_node, scheduler, defer_interval, disk_interval, reconcile_interval, once }) => {
+            handle_daemon(as_node, scheduler, defer_interval, disk_interval, reconcile_interval, once).await
         }
         Some(Command::Supervise { prompt, max_attempts }) => {
             let sup_config = ff_agent::supervisor::SupervisorConfig {
@@ -2286,6 +2326,43 @@ async fn handle_model(cmd: ModelCommand) -> Result<()> {
                 Err(e) => anyhow::bail!("health check failed: {e}"),
             }
         }
+        ModelCommand::Transfer { library_id, from, to } => {
+            let opts = ff_agent::model_transfer::TransferOptions {
+                source_node: from.clone(),
+                target_node: to.clone(),
+                library_id: library_id.clone(),
+            };
+            match ff_agent::model_transfer::transfer_model(&pool, opts).await {
+                Ok(res) => {
+                    println!(
+                        "{CYAN}✓ transferred{RESET} {} bytes  new library id: {}",
+                        res.bytes_transferred, res.target_library_id
+                    );
+                }
+                Err(e) => anyhow::bail!("transfer failed: {e}"),
+            }
+        }
+        ModelCommand::Convert { library_id, q_bits } => {
+            let opts = ff_agent::model_convert::ConvertOptions {
+                library_id: library_id.clone(),
+                quant_bits: q_bits,
+                output_dir: None,
+            };
+            println!(
+                "{CYAN}▶ Converting library {library_id} to MLX ({q_bits}-bit)...{RESET}"
+            );
+            match ff_agent::model_convert::convert_safetensors_to_mlx(&pool, opts).await {
+                Ok(res) => {
+                    println!(
+                        "{CYAN}✓ converted{RESET} in {}s → {}  (new library id: {})",
+                        res.duration_seconds,
+                        res.output_path.display(),
+                        res.new_library_id,
+                    );
+                }
+                Err(e) => anyhow::bail!("convert failed: {e}"),
+            }
+        }
         ModelCommand::Jobs { status, limit } => {
             let rows = ff_db::pg_list_jobs(&pool, status.as_deref(), limit).await?;
             if rows.is_empty() {
@@ -2513,54 +2590,7 @@ async fn handle_defer_worker(
 
     loop {
         let pass_start = std::time::Instant::now();
-
-        // Scheduler pass: promote pending tasks whose trigger fired.
-        if scheduler {
-            match ff_db::pg_list_nodes(&pool).await {
-                Ok(nodes) => {
-                    let online = probe_online_nodes(&nodes).await;
-                    let now = chrono::Utc::now();
-                    match ff_db::pg_scheduler_pass(&pool, &online, now).await {
-                        Ok(n) if n > 0 => {
-                            println!("{CYAN}[sched]{RESET} promoted {n} task(s) to dispatchable (online: {})", online.join(","));
-                        }
-                        Ok(_) => {}
-                        Err(e) => eprintln!("{RED}[sched] pg_scheduler_pass: {e}{RESET}"),
-                    }
-                }
-                Err(e) => eprintln!("{RED}[sched] list nodes: {e}{RESET}"),
-            }
-        }
-
-        // Worker pass: claim and execute one task (loop until queue empty).
-        let mut ran_any = false;
-        loop {
-            let claimed = match ff_db::pg_claim_deferred(&pool, &worker_name).await {
-                Ok(Some(t)) => t,
-                Ok(None) => break,
-                Err(e) => {
-                    eprintln!("{RED}[worker] claim error: {e}{RESET}");
-                    break;
-                }
-            };
-            ran_any = true;
-            println!("{YELLOW}[worker]{RESET} claimed {} — {}", claimed.id, claimed.title);
-
-            // Fetch nodes for SSH routing.
-            let nodes = ff_db::pg_list_nodes(&pool).await.unwrap_or_default();
-            let (ok, result, err) = execute_deferred(&claimed, &nodes).await;
-
-            match ff_db::pg_finish_deferred(&pool, &claimed.id, ok, result.as_ref(), err.as_deref()).await {
-                Ok(()) => {
-                    if ok {
-                        println!("  {CYAN}✓ completed{RESET}");
-                    } else {
-                        println!("  {RED}✗ failed{RESET}: {}", err.clone().unwrap_or_default());
-                    }
-                }
-                Err(e) => eprintln!("{RED}  finalize error: {e}{RESET}"),
-            }
-        }
+        let ran_any = defer_pass(&pool, &worker_name, scheduler).await? > 0;
 
         if once {
             println!("{CYAN}▶ defer-worker: --once set, exiting{RESET}");
@@ -2573,6 +2603,185 @@ async fn handle_defer_worker(
             tokio::time::sleep(sleep_for).await;
         } else if sleep_for.as_millis() > 0 {
             tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+}
+
+/// One scheduler+worker pass. Returns number of tasks executed.
+async fn defer_pass(
+    pool: &sqlx::PgPool,
+    worker_name: &str,
+    scheduler: bool,
+) -> Result<usize> {
+    // Scheduler pass: promote pending tasks whose trigger fired.
+    if scheduler {
+        match ff_db::pg_list_nodes(pool).await {
+            Ok(nodes) => {
+                let online = probe_online_nodes(&nodes).await;
+                let now = chrono::Utc::now();
+                match ff_db::pg_scheduler_pass(pool, &online, now).await {
+                    Ok(n) if n > 0 => {
+                        println!("{CYAN}[sched]{RESET} promoted {n} task(s) to dispatchable (online: {})", online.join(","));
+                    }
+                    Ok(_) => {}
+                    Err(e) => eprintln!("{RED}[sched] pg_scheduler_pass: {e}{RESET}"),
+                }
+            }
+            Err(e) => eprintln!("{RED}[sched] list nodes: {e}{RESET}"),
+        }
+    }
+
+    // Worker pass: claim and execute until queue empty.
+    let mut count = 0usize;
+    loop {
+        let claimed = match ff_db::pg_claim_deferred(pool, worker_name).await {
+            Ok(Some(t)) => t,
+            Ok(None) => break,
+            Err(e) => {
+                eprintln!("{RED}[worker] claim error: {e}{RESET}");
+                break;
+            }
+        };
+        count += 1;
+        println!("{YELLOW}[worker]{RESET} claimed {} — {}", claimed.id, claimed.title);
+
+        let nodes = ff_db::pg_list_nodes(pool).await.unwrap_or_default();
+        let (ok, result, err) = execute_deferred(&claimed, &nodes).await;
+
+        match ff_db::pg_finish_deferred(pool, &claimed.id, ok, result.as_ref(), err.as_deref()).await {
+            Ok(()) => {
+                if ok {
+                    println!("  {CYAN}✓ completed{RESET}");
+                } else {
+                    println!("  {RED}✗ failed{RESET}: {}", err.clone().unwrap_or_default());
+                }
+            }
+            Err(e) => eprintln!("{RED}  finalize error: {e}{RESET}"),
+        }
+    }
+    Ok(count)
+}
+
+async fn handle_daemon(
+    as_node: Option<String>,
+    scheduler: bool,
+    defer_interval: u64,
+    disk_interval: u64,
+    reconcile_interval: u64,
+    once: bool,
+) -> Result<()> {
+    let worker_name = match as_node {
+        Some(n) => n,
+        None => ff_agent::fleet_info::resolve_this_node_name().await,
+    };
+
+    let pool = ff_agent::fleet_info::get_fleet_pool()
+        .await
+        .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
+    ff_db::run_postgres_migrations(&pool).await
+        .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
+
+    println!("{CYAN}▶ ForgeFleet daemon starting{RESET}");
+    println!("  node:       {worker_name}");
+    println!("  scheduler:  {scheduler}");
+    println!("  defer:      every {defer_interval}s");
+    println!("  disk:       every {disk_interval}s");
+    println!("  reconcile:  every {reconcile_interval}s");
+
+    if once {
+        // Run one pass of each sequentially, then exit.
+        match defer_pass(&pool, &worker_name, scheduler).await {
+            Ok(n) => println!("{CYAN}[defer]{RESET} one-pass complete ({n} task(s))"),
+            Err(e) => eprintln!("{RED}[defer] pass error: {e}{RESET}"),
+        }
+        match ff_agent::disk_sampler::sample_local_disk(&pool).await {
+            Ok(s) => println!(
+                "{CYAN}[disk]{RESET} {} total={}MB used={}MB free={}MB models={}MB quota={}%{}",
+                s.node_name,
+                s.total_bytes / 1_048_576,
+                s.used_bytes / 1_048_576,
+                s.free_bytes / 1_048_576,
+                s.models_bytes / 1_048_576,
+                s.quota_pct,
+                if s.over_quota { " OVER" } else { "" },
+            ),
+            Err(e) => eprintln!("{RED}[disk] sample error: {e}{RESET}"),
+        }
+        match ff_agent::deployment_reconciler::reconcile_local(&pool).await {
+            Ok(r) => println!(
+                "{CYAN}[reconcile]{RESET} adopted={} removed={} refreshed={}",
+                r.adopted, r.removed, r.refreshed,
+            ),
+            Err(e) => eprintln!("{RED}[reconcile] error: {e}{RESET}"),
+        }
+        println!("{CYAN}▶ daemon: --once set, exiting{RESET}");
+        return Ok(());
+    }
+
+    let mut defer_tick = tokio::time::interval(Duration::from_secs(defer_interval));
+    let mut disk_tick = tokio::time::interval(Duration::from_secs(disk_interval));
+    let mut recon_tick = tokio::time::interval(Duration::from_secs(reconcile_interval));
+    // First tick fires immediately for each — prime all three.
+    defer_tick.tick().await;
+    disk_tick.tick().await;
+    recon_tick.tick().await;
+
+    // Do an initial pass immediately on startup.
+    let _ = defer_pass(&pool, &worker_name, scheduler).await;
+    match ff_agent::disk_sampler::sample_local_disk(&pool).await {
+        Ok(s) => println!(
+            "{CYAN}[disk]{RESET} {} total={}MB used={}MB free={}MB models={}MB quota={}%{}",
+            s.node_name,
+            s.total_bytes / 1_048_576,
+            s.used_bytes / 1_048_576,
+            s.free_bytes / 1_048_576,
+            s.models_bytes / 1_048_576,
+            s.quota_pct,
+            if s.over_quota { " OVER" } else { "" },
+        ),
+        Err(e) => eprintln!("{RED}[disk] sample error: {e}{RESET}"),
+    }
+    match ff_agent::deployment_reconciler::reconcile_local(&pool).await {
+        Ok(r) if r.adopted + r.removed + r.refreshed > 0 => println!(
+            "{CYAN}[reconcile]{RESET} adopted={} removed={} refreshed={}",
+            r.adopted, r.removed, r.refreshed,
+        ),
+        Ok(_) => {}
+        Err(e) => eprintln!("{RED}[reconcile] error: {e}{RESET}"),
+    }
+
+    loop {
+        tokio::select! {
+            _ = defer_tick.tick() => {
+                if let Err(e) = defer_pass(&pool, &worker_name, scheduler).await {
+                    eprintln!("{RED}[defer] pass error: {e}{RESET}");
+                }
+            }
+            _ = disk_tick.tick() => {
+                match ff_agent::disk_sampler::sample_local_disk(&pool).await {
+                    Ok(s) => println!(
+                        "{CYAN}[disk]{RESET} {} total={}MB used={}MB free={}MB models={}MB quota={}%{}",
+                        s.node_name,
+                        s.total_bytes / 1_048_576,
+                        s.used_bytes / 1_048_576,
+                        s.free_bytes / 1_048_576,
+                        s.models_bytes / 1_048_576,
+                        s.quota_pct,
+                        if s.over_quota { " OVER" } else { "" },
+                    ),
+                    Err(e) => eprintln!("{RED}[disk] sample error: {e}{RESET}"),
+                }
+            }
+            _ = recon_tick.tick() => {
+                match ff_agent::deployment_reconciler::reconcile_local(&pool).await {
+                    Ok(r) if r.adopted + r.removed + r.refreshed > 0 => println!(
+                        "{CYAN}[reconcile]{RESET} adopted={} removed={} refreshed={}",
+                        r.adopted, r.removed, r.refreshed,
+                    ),
+                    Ok(_) => {}
+                    Err(e) => eprintln!("{RED}[reconcile] error: {e}{RESET}"),
+                }
+            }
         }
     }
 }
