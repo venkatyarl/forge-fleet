@@ -75,6 +75,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 clap = { version = "4", features = ["derive"] }
 dashmap = "6"
 bytes = "1"
+sha2 = { version = "0.10", features = [] }
 
 # ─── Root binary (ForgeFleet daemon) ─────────────────────────────────────────
 

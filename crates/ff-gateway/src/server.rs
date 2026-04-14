@@ -3621,9 +3621,46 @@ async fn proxy_chat_completions(
 
     // ── TierRouter path (preferred) ──────────────────────────────────
     if let Some(tier_router) = tier_router {
-        let escalation_chain = tier_router
+        let mut escalation_chain = tier_router
             .route_with_escalation(&payload.model, None, None)
             .await;
+
+        // If no backend matched, try to auto-load the model on this node from
+        // the fleet_model_library table. This makes `ff model download <x>`
+        // followed by a chat request with `model: "<x>"` Just Work — the
+        // router will spawn the inference server on demand.
+        if escalation_chain.is_empty() {
+            if let (Some(store), Some(registry)) =
+                (state.operational_store.as_ref(), state.api_registry.as_ref())
+                && let Some(pool) = store.pg_pool()
+            {
+                match ff_api::autoload::ensure_deployed(pool, &payload.model).await {
+                    Ok(url) => {
+                        if let Some((host, port)) = parse_autoload_url(&url) {
+                            let endpoint = ff_api::registry::BackendEndpoint {
+                                id: format!("autoload-{}-{}", payload.model, port),
+                                node: "local".to_string(),
+                                host,
+                                port,
+                                model: payload.model.clone(),
+                                tier: 2,
+                                healthy: true,
+                                busy: false,
+                                scheme: "http".to_string(),
+                            };
+                            registry.add_endpoint(endpoint).await;
+                            info!(model = %payload.model, %url, "autoloaded model for chat request");
+                            escalation_chain = tier_router
+                                .route_with_escalation(&payload.model, None, None)
+                                .await;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(model = %payload.model, error = %e, "autoload failed");
+                    }
+                }
+            }
+        }
 
         if escalation_chain.is_empty() {
             return Err((
@@ -4758,4 +4795,16 @@ async fn brain_status() -> impl IntoResponse {
             "has_hive_md": ctx.hive_md.is_some(),
         },
     }))
+}
+
+/// Parse a `http://host:port` URL returned by `ff_api::autoload::ensure_deployed`
+/// into `(host, port)`. Returns `None` for malformed URLs.
+fn parse_autoload_url(url: &str) -> Option<(String, u16)> {
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))?;
+    let rest = rest.split('/').next().unwrap_or(rest);
+    let (host, port_str) = rest.rsplit_once(':')?;
+    let port: u16 = port_str.parse().ok()?;
+    Some((host.to_string(), port))
 }

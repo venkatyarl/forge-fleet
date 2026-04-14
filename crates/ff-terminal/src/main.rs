@@ -212,6 +212,8 @@ enum ModelCommand {
     Ps,
     /// Sample this node's disk usage and write to fleet_disk_usage.
     DiskSample,
+    /// Show full details for a catalog id, library row UUID, or deployment UUID.
+    Info { id: String },
     /// Show a smart-LRU eviction plan for a node (dry-run).
     Prune {
         #[arg(long)] node: Option<String>,
@@ -2418,6 +2420,7 @@ async fn handle_model(cmd: ModelCommand) -> Result<()> {
                 token: token.clone(),
                 allow_patterns,
                 deny_patterns,
+                skip_verify: false,
             };
 
             let result = ff_agent::hf_download::download_repo(opts, move |p| {
@@ -2628,6 +2631,92 @@ async fn handle_model(cmd: ModelCommand) -> Result<()> {
                     p.port.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
                     p.model_path.clone().unwrap_or_else(|| "-".into()));
             }
+        }
+        ModelCommand::Info { id } => {
+            // Try as catalog id first.
+            if let Some(c) = ff_db::pg_get_catalog(&pool, &id).await? {
+                println!("{CYAN}━ Catalog entry ━{RESET}");
+                println!("ID:           {}", c.id);
+                println!("Name:         {}", c.name);
+                println!("Family:       {}", c.family);
+                println!("Parameters:   {}", c.parameters);
+                println!("Tier:         T{}", c.tier);
+                println!("Gated:        {}", if c.gated { "yes (HF license required)" } else { "no" });
+                if let Some(d) = &c.description { println!("Description:  {d}"); }
+                if let Some(arr) = c.preferred_workloads.as_array() {
+                    let wl: Vec<String> = arr.iter().filter_map(|v| v.as_str().map(String::from)).collect();
+                    if !wl.is_empty() { println!("Workloads:    {}", wl.join(", ")); }
+                }
+                if let Some(variants) = c.variants.as_array() {
+                    println!("\nVariants:");
+                    for v in variants {
+                        let runtime = v.get("runtime").and_then(|x| x.as_str()).unwrap_or("?");
+                        let quant = v.get("quant").and_then(|x| x.as_str()).unwrap_or("-");
+                        let repo = v.get("hf_repo").and_then(|x| x.as_str()).unwrap_or("?");
+                        let size = v.get("size_gb").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                        println!("  - {runtime:<10} quant={quant:<8} {size:>6.1} GB  {repo}");
+                    }
+                }
+                // Where is it on the fleet?
+                let lib = ff_db::pg_list_library(&pool, None).await?;
+                let copies: Vec<&ff_db::ModelLibraryRow> = lib.iter().filter(|r| r.catalog_id == c.id).collect();
+                if !copies.is_empty() {
+                    println!("\nOn disk:");
+                    for r in &copies {
+                        let q = r.quant.clone().unwrap_or_else(|| "-".into());
+                        println!("  - {:<10} ({:<10} {:<6}) {}  [{}]",
+                            r.node_name, r.runtime, q, human_bytes(r.size_bytes as u64), &r.id[..8]);
+                    }
+                }
+                let deps = ff_db::pg_list_deployments(&pool, None).await?;
+                let live: Vec<&ff_db::ModelDeploymentRow> = deps.iter()
+                    .filter(|d| d.catalog_id.as_deref() == Some(&c.id))
+                    .collect();
+                if !live.is_empty() {
+                    println!("\nDeployments:");
+                    for d in &live {
+                        println!("  - {:<10} port {:<5} {:<10} health={}  [{}]",
+                            d.node_name, d.port, d.runtime, d.health_status, &d.id[..8]);
+                    }
+                }
+                return Ok(());
+            }
+            // Try as library row UUID.
+            let all_lib = ff_db::pg_list_library(&pool, None).await?;
+            if let Some(r) = all_lib.iter().find(|r| r.id == id) {
+                println!("{CYAN}━ Library row ━{RESET}");
+                println!("ID:           {}", r.id);
+                println!("Node:         {}", r.node_name);
+                println!("Catalog ID:   {}", r.catalog_id);
+                println!("Runtime:      {}", r.runtime);
+                println!("Quant:        {}", r.quant.clone().unwrap_or_else(|| "-".into()));
+                println!("File path:    {}", r.file_path);
+                println!("Size:         {}", human_bytes(r.size_bytes as u64));
+                if let Some(s) = &r.sha256 { println!("SHA256:       {s}"); }
+                println!("Downloaded:   {}", r.downloaded_at.format("%Y-%m-%d %H:%M UTC"));
+                if let Some(t) = r.last_used_at { println!("Last used:    {}", t.format("%Y-%m-%d %H:%M UTC")); }
+                if let Some(s) = &r.source_url { println!("Source:       {s}"); }
+                return Ok(());
+            }
+            // Try as deployment UUID.
+            let all_dep = ff_db::pg_list_deployments(&pool, None).await?;
+            if let Some(d) = all_dep.iter().find(|d| d.id == id) {
+                println!("{CYAN}━ Deployment ━{RESET}");
+                println!("ID:           {}", d.id);
+                println!("Node:         {}", d.node_name);
+                println!("Catalog ID:   {}", d.catalog_id.clone().unwrap_or_else(|| "-".into()));
+                println!("Runtime:      {}", d.runtime);
+                println!("Port:         {}", d.port);
+                println!("PID:          {}", d.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into()));
+                println!("Health:       {}", d.health_status);
+                println!("Started:      {}", d.started_at.format("%Y-%m-%d %H:%M UTC"));
+                if let Some(t) = d.last_health_at { println!("Last health:  {}", t.format("%Y-%m-%d %H:%M UTC")); }
+                if let Some(c) = d.context_window { println!("Ctx window:   {c}"); }
+                println!("Tokens used:  {}", d.tokens_used);
+                println!("Requests:     {}", d.request_count);
+                return Ok(());
+            }
+            anyhow::bail!("'{id}' is not a known catalog id, library UUID, or deployment UUID");
         }
         ModelCommand::Prune { node, min_cold_days } => {
             let node_name = match node {
@@ -3064,6 +3153,20 @@ async fn handle_daemon(
             ),
             Err(e) => eprintln!("{RED}[reconcile] error: {e}{RESET}"),
         }
+        // Sweeper — only the scheduler needs to do this fleet-wide.
+        if scheduler {
+            match ff_agent::job_sweeper::sweep_stale(
+                &pool,
+                &ff_agent::job_sweeper::SweepPolicy::default(),
+            ).await {
+                Ok(s) if s.jobs_failed + s.deferred_failed > 0 => println!(
+                    "{CYAN}[sweeper]{RESET} jobs_failed={} deferred_failed={}",
+                    s.jobs_failed, s.deferred_failed,
+                ),
+                Ok(_) => println!("{CYAN}[sweeper]{RESET} no stale work"),
+                Err(e) => eprintln!("{RED}[sweeper] error: {e}{RESET}"),
+            }
+        }
         println!("{CYAN}▶ daemon: --once set, exiting{RESET}");
         return Ok(());
     }
@@ -3071,10 +3174,13 @@ async fn handle_daemon(
     let mut defer_tick = tokio::time::interval(Duration::from_secs(defer_interval));
     let mut disk_tick = tokio::time::interval(Duration::from_secs(disk_interval));
     let mut recon_tick = tokio::time::interval(Duration::from_secs(reconcile_interval));
-    // First tick fires immediately for each — prime all three.
+    // Sweeper: every 5 minutes, only on the scheduler node.
+    let mut sweep_tick = tokio::time::interval(Duration::from_secs(300));
+    // First tick fires immediately for each — prime all four.
     defer_tick.tick().await;
     disk_tick.tick().await;
     recon_tick.tick().await;
+    sweep_tick.tick().await;
 
     // Do an initial pass immediately on startup.
     let _ = defer_pass(&pool, &worker_name, scheduler).await;
@@ -3130,6 +3236,19 @@ async fn handle_daemon(
                     ),
                     Ok(_) => {}
                     Err(e) => eprintln!("{RED}[reconcile] error: {e}{RESET}"),
+                }
+            }
+            _ = sweep_tick.tick(), if scheduler => {
+                match ff_agent::job_sweeper::sweep_stale(
+                    &pool,
+                    &ff_agent::job_sweeper::SweepPolicy::default(),
+                ).await {
+                    Ok(s) if s.jobs_failed + s.deferred_failed > 0 => println!(
+                        "{CYAN}[sweeper]{RESET} jobs_failed={} deferred_failed={}",
+                        s.jobs_failed, s.deferred_failed,
+                    ),
+                    Ok(_) => {}
+                    Err(e) => eprintln!("{RED}[sweeper] error: {e}{RESET}"),
                 }
             }
         }

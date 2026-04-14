@@ -23,6 +23,7 @@ pub mod mcp_tools;
 pub mod memory;
 pub mod deployment_reconciler;
 pub mod disk_sampler;
+pub mod job_sweeper;
 pub mod model_catalog;
 pub mod model_convert;
 pub mod model_library_scanner;

@@ -87,6 +87,12 @@ pub async fn sample_local_disk(pool: &sqlx::PgPool) -> Result<DiskSample, String
     .await
     .map_err(|e| format!("pg_insert_disk_usage: {e}"))?;
 
+    // If we crossed the quota line, enqueue a deferred task so operators notice.
+    // Idempotent: only enqueue if no identical alert is already pending/dispatchable.
+    if over_quota {
+        let _ = maybe_alert_over_quota(pool, &node_name, used_bytes, total_bytes, quota_pct).await;
+    }
+
     Ok(DiskSample {
         node_name,
         models_dir,
@@ -97,6 +103,54 @@ pub async fn sample_local_disk(pool: &sqlx::PgPool) -> Result<DiskSample, String
         quota_pct,
         over_quota,
     })
+}
+
+/// Enqueue a `manual` deferred task flagging disk-quota breach for operator
+/// review. No-op if one is already pending for this node.
+async fn maybe_alert_over_quota(
+    pool: &sqlx::PgPool,
+    node_name: &str,
+    used_bytes: u64,
+    total_bytes: u64,
+    quota_pct: u32,
+) -> Result<(), String> {
+    // De-dupe: see if an alert for this node is already open.
+    let rows = ff_db::pg_list_deferred(pool, Some("pending"), 50)
+        .await
+        .map_err(|e| format!("pg_list_deferred: {e}"))?;
+    let already_alerted = rows.iter().any(|r| {
+        r.title.starts_with("⚠ disk quota exceeded on ") &&
+        r.title.contains(node_name)
+    });
+    if already_alerted {
+        return Ok(());
+    }
+
+    let used_pct = if total_bytes == 0 { 0 } else { used_bytes * 100 / total_bytes };
+    let title = format!("⚠ disk quota exceeded on {node_name} ({}%)", used_pct);
+    let payload = serde_json::json!({
+        "note": format!(
+            "Disk usage {}% exceeds quota {}% on {}. \
+             Review with: ff model prune --node {} \
+             Delete candidates with: ff model delete <library-id> --yes",
+            used_pct, quota_pct, node_name, node_name
+        ),
+    });
+    let _ = ff_db::pg_enqueue_deferred(
+        pool,
+        &title,
+        "manual",
+        &payload,
+        "manual",                       // trigger_type: user must act
+        &serde_json::json!({}),
+        Some(node_name),
+        &serde_json::json!([]),
+        Some("disk-sampler"),
+        Some(1),                         // max_attempts — this is informational
+    )
+    .await
+    .map_err(|e| format!("pg_enqueue_deferred: {e}"))?;
+    Ok(())
 }
 
 /// Recursively sum the size of every regular file under `root`. Best-effort — silently

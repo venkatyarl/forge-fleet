@@ -4,10 +4,11 @@
 //! allow/deny glob filters, resumable skip-if-complete behaviour, and
 //! progress callbacks.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use futures::StreamExt;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
 /// Options for [`download_repo`].
@@ -25,6 +26,22 @@ pub struct DownloadOptions {
     pub allow_patterns: Vec<String>,
     /// Glob-ish exclude filters applied after allow filters.
     pub deny_patterns: Vec<String>,
+    /// If true, skip sha256 verification of LFS files.
+    pub skip_verify: bool,
+}
+
+impl Default for DownloadOptions {
+    fn default() -> Self {
+        Self {
+            repo: String::new(),
+            revision: None,
+            dest_dir: PathBuf::new(),
+            token: None,
+            allow_patterns: Vec::new(),
+            deny_patterns: Vec::new(),
+            skip_verify: false,
+        }
+    }
 }
 
 /// Progress tick emitted while streaming a file.
@@ -37,12 +54,66 @@ pub struct DownloadProgress {
 }
 
 #[derive(Debug, Deserialize)]
+struct LfsInfo {
+    #[serde(default)]
+    sha256: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct TreeEntry {
     #[serde(rename = "type")]
     entry_type: String,
     path: String,
     #[serde(default)]
     size: u64,
+    #[serde(default)]
+    lfs: Option<LfsInfo>,
+}
+
+impl TreeEntry {
+    fn expected_sha256(&self) -> Option<&str> {
+        self.lfs.as_ref().and_then(|l| l.sha256.as_deref())
+    }
+}
+
+/// Compute sha256 of a file via streaming reads (64 KiB chunks).
+///
+/// Returns the lowercase hex digest.
+pub fn compute_file_sha256(path: &Path) -> Result<String, String> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)
+        .map_err(|e| format!("failed to open {:?} for hashing: {e}", path))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = f
+            .read(&mut buf)
+            .map_err(|e| format!("read error while hashing {:?}: {e}", path))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let digest = hasher.finalize();
+    Ok(hex_encode(&digest))
+}
+
+/// Verify a file's sha256 against `expected` (case-insensitive hex).
+///
+/// Returns `Ok(true)` if they match, `Ok(false)` if they don't, `Err` on I/O.
+pub fn verify_file_sha256(path: &Path, expected: &str) -> Result<bool, String> {
+    let actual = compute_file_sha256(path)?;
+    Ok(actual.eq_ignore_ascii_case(expected))
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0xf) as usize] as char);
+    }
+    s
 }
 
 /// Download a repository from Hugging Face.
@@ -129,18 +200,37 @@ pub async fn download_repo(
                 .map_err(|e| format!("failed to create parent {:?}: {e}", parent))?;
         }
 
-        // Resume: skip if already complete.
+        // Resume: skip if already complete (and verified when possible).
         if file.size > 0 {
             if let Ok(meta) = tokio::fs::metadata(&dest_path).await {
                 if meta.is_file() && meta.len() == file.size {
-                    progress(DownloadProgress {
-                        file: file.path.clone(),
-                        bytes_done: file.size,
-                        bytes_total: file.size,
-                        percent: 100.0,
-                    });
-                    downloaded.push(dest_path);
-                    continue;
+                    let mut accept = true;
+                    if !opts.skip_verify {
+                        if let Some(expected) = file.expected_sha256() {
+                            let path_for_hash = dest_path.clone();
+                            let expected_owned = expected.to_string();
+                            let ok = tokio::task::spawn_blocking(move || {
+                                verify_file_sha256(&path_for_hash, &expected_owned)
+                            })
+                            .await
+                            .map_err(|e| format!("hash task join error: {e}"))??;
+                            if !ok {
+                                // Existing file is corrupt — remove and re-download.
+                                let _ = tokio::fs::remove_file(&dest_path).await;
+                                accept = false;
+                            }
+                        }
+                    }
+                    if accept {
+                        progress(DownloadProgress {
+                            file: file.path.clone(),
+                            bytes_done: file.size,
+                            bytes_total: file.size,
+                            percent: 100.0,
+                        });
+                        downloaded.push(dest_path);
+                        continue;
+                    }
                 }
             }
         }
@@ -226,10 +316,31 @@ pub async fn download_repo(
 
         // 4. Verify size if known.
         if file.size > 0 && bytes_done != file.size {
+            let _ = tokio::fs::remove_file(&dest_path).await;
             return Err(format!(
                 "size mismatch for {}: expected {}, got {}",
                 file.path, file.size, bytes_done
             ));
+        }
+
+        // 5. Verify sha256 for LFS files (absent sha256 => skip silently).
+        if !opts.skip_verify {
+            if let Some(expected) = file.expected_sha256() {
+                let path_for_hash = dest_path.clone();
+                let expected_owned = expected.to_string();
+                let ok = tokio::task::spawn_blocking(move || {
+                    verify_file_sha256(&path_for_hash, &expected_owned)
+                })
+                .await
+                .map_err(|e| format!("hash task join error: {e}"))??;
+                if !ok {
+                    let _ = tokio::fs::remove_file(&dest_path).await;
+                    return Err(format!(
+                        "sha256 mismatch for {}: expected {}",
+                        file.path, expected
+                    ));
+                }
+            }
         }
 
         downloaded.push(dest_path);
@@ -309,6 +420,28 @@ mod tests {
         assert!(glob_match("tokenizer*", "tokenizer.json"));
         assert!(glob_match("*config*", "generation_config.json"));
         assert!(glob_match("*.safetensors", "model-00001-of-00010.safetensors"));
+    }
+
+    #[test]
+    fn sha256_known_vector() {
+        // sha256("abc") = ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+        use std::io::Write;
+        let mut tmp = tempfile::NamedTempFile::new().expect("tmp");
+        tmp.write_all(b"abc").expect("write");
+        tmp.flush().expect("flush");
+        let path = tmp.path();
+        let hash = compute_file_sha256(path).expect("hash");
+        assert_eq!(
+            hash,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert!(verify_file_sha256(path, &hash).expect("verify"));
+        assert!(verify_file_sha256(
+            path,
+            "BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD"
+        )
+        .expect("verify upper"));
+        assert!(!verify_file_sha256(path, &"0".repeat(64)).expect("verify bad"));
     }
 
     #[test]

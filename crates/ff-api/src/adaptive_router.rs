@@ -35,6 +35,12 @@ pub struct AdaptiveRouterConfig {
 
     /// Whether to allow adaptive routing at all (feature flag).
     pub enabled: bool,
+
+    /// Whether to auto-load models on demand when the router selects a model
+    /// that isn't currently in the registry. When true, callers can invoke
+    /// [`AdaptiveRouter::autoload_if_missing`] to spawn the inference server
+    /// for a catalog model before routing falls over.
+    pub autoload_enabled: bool,
 }
 
 impl Default for AdaptiveRouterConfig {
@@ -44,6 +50,7 @@ impl Default for AdaptiveRouterConfig {
             quality_epsilon: 0.05,
             max_latency_ratio: 3.0,
             enabled: true,
+            autoload_enabled: true,
         }
     }
 }
@@ -128,6 +135,42 @@ impl AdaptiveRouter {
     /// Get a reference to the tier router.
     pub fn tier_router(&self) -> &Arc<TierRouter> {
         &self.tier_router
+    }
+
+    /// If no healthy backend exists for `catalog_id`, attempt to auto-load it
+    /// on the local node via [`crate::autoload::ensure_deployed`] and register
+    /// the resulting endpoint in the shared registry.
+    ///
+    /// Returns `Ok(Some(url))` if a model was newly loaded, `Ok(None)` if the
+    /// model was already present (or autoload is disabled), or `Err(_)` if the
+    /// autoload attempt failed.
+    pub async fn autoload_if_missing(
+        &self,
+        pool: &sqlx::PgPool,
+        catalog_id: &str,
+    ) -> Result<Option<String>, String> {
+        if !self.config.autoload_enabled {
+            return Ok(None);
+        }
+        if !self.registry.healthy_by_model(catalog_id).await.is_empty() {
+            return Ok(None);
+        }
+        let url = crate::autoload::ensure_deployed(pool, catalog_id).await?;
+        // Register as an ad-hoc tier-2 backend so future requests route to it.
+        let (host, port) = parse_host_port(&url).ok_or_else(|| format!("bad url: {url}"))?;
+        let endpoint = BackendEndpoint {
+            id: format!("autoload-{}-{}", catalog_id, port),
+            node: "local".to_string(),
+            host,
+            port,
+            model: catalog_id.to_string(),
+            tier: 2,
+            healthy: true,
+            busy: false,
+            scheme: "http".to_string(),
+        };
+        self.registry.add_endpoint(endpoint).await;
+        Ok(Some(url))
     }
 
     // ── Main Routing Entry Point ─────────────────────────────────────────
@@ -342,6 +385,16 @@ impl AdaptiveRouter {
     async fn get_model_tiers(&self) -> HashMap<String, u8> {
         self.registry.available_models().await.into_iter().collect()
     }
+}
+
+/// Parse a `http://host:port` URL into `(host, port)`. Returns `None` if the
+/// URL doesn't have the expected shape.
+fn parse_host_port(url: &str) -> Option<(String, u16)> {
+    let rest = url.strip_prefix("http://").or_else(|| url.strip_prefix("https://"))?;
+    let rest = rest.split('/').next().unwrap_or(rest);
+    let (host, port_str) = rest.rsplit_once(':')?;
+    let port: u16 = port_str.parse().ok()?;
+    Some((host.to_string(), port))
 }
 
 /// Check if a model string is an explicit model/tier request (not "auto" or empty).

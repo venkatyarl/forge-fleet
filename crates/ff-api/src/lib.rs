@@ -1,4 +1,5 @@
 pub mod adaptive_router;
+pub mod autoload;
 pub mod classifier;
 pub mod config;
 pub mod error;
