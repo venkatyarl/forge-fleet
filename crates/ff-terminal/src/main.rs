@@ -212,6 +212,12 @@ enum ModelCommand {
     Ps,
     /// Sample this node's disk usage and write to fleet_disk_usage.
     DiskSample,
+    /// Show a smart-LRU eviction plan for a node (dry-run).
+    Prune {
+        #[arg(long)] node: Option<String>,
+        /// Min days since last use before a row can be considered cold.
+        #[arg(long, default_value_t = 7)] min_cold_days: i64,
+    },
     /// Health-check a running deployment by id.
     Ping {
         id: String,
@@ -2303,6 +2309,31 @@ async fn handle_model(cmd: ModelCommand) -> Result<()> {
                     p.port.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
                     p.model_path.clone().unwrap_or_else(|| "-".into()));
             }
+        }
+        ModelCommand::Prune { node, min_cold_days } => {
+            let node_name = match node {
+                Some(n) => n,
+                None => ff_agent::fleet_info::resolve_this_node_name().await,
+            };
+            let policy = ff_agent::smart_lru::LruPolicy {
+                min_cold_days,
+                ..Default::default()
+            };
+            let plan = ff_agent::smart_lru::plan_eviction(&pool, &node_name, &policy).await
+                .map_err(|e| anyhow::anyhow!(e))?;
+            if plan.candidates.is_empty() {
+                println!("Node '{node_name}' is within quota — no eviction needed.");
+                return Ok(());
+            }
+            println!("Eviction plan for {node_name} (would free {}):\n", human_bytes(plan.total_bytes_freed));
+            println!("{:<38} {:<24} {:<10} {:<10} {}", "LIBRARY_ID", "CATALOG", "RUNTIME", "SIZE", "REASONS");
+            for c in &plan.candidates {
+                println!("{:<38} {:<24} {:<10} {:<10} {}",
+                    c.library_id, c.catalog_id, c.runtime,
+                    human_bytes(c.size_bytes),
+                    c.reasons.join(", "));
+            }
+            println!("\n(dry-run; use `ff model delete <library-id> --yes` to actually remove)");
         }
         ModelCommand::DiskSample => {
             match ff_agent::disk_sampler::sample_local_disk(&pool).await {

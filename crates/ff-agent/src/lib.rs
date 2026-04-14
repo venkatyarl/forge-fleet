@@ -28,6 +28,7 @@ pub mod model_convert;
 pub mod model_library_scanner;
 pub mod model_runtime;
 pub mod model_transfer;
+pub mod smart_lru;
 pub mod multi_agent;
 pub mod notifications;
 pub mod openai_bridge;

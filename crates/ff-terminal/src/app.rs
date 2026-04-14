@@ -383,22 +383,41 @@ async fn fleet_nodes_from_db() -> Vec<FleetNode> {
         Ok(n) => n,
         Err(_) => return Vec::new(),
     };
-    let models = ff_db::pg_list_models(&pool).await.unwrap_or_default();
+    // Prefer new lifecycle `fleet_model_deployments` (what's actually running); fall back
+    // to legacy `fleet_models` (configured/desired models) when no deployments exist yet.
+    let deployments = ff_db::pg_list_deployments(&pool, None).await.unwrap_or_default();
+    let legacy_models = ff_db::pg_list_models(&pool).await.unwrap_or_default();
 
     nodes
         .into_iter()
         .map(|n| {
-            let node_models: Vec<NodeModel> = models
+            // Deployments on this node.
+            let mut node_models: Vec<NodeModel> = deployments
                 .iter()
-                .filter(|m| m.node_name == n.name)
-                .map(|m| NodeModel {
-                    name: m.name.clone(),
-                    port: m.port as u16,
-                    online: false,
-                    context_window: 32_768,
-                    tokens_used: 0,
+                .filter(|d| d.node_name == n.name)
+                .map(|d| NodeModel {
+                    name: d.catalog_id.clone().unwrap_or_else(|| format!("deploy:{}", d.port)),
+                    port: d.port as u16,
+                    // TUI health loop will overwrite this; use DB status as initial guess.
+                    online: d.health_status == "healthy",
+                    context_window: d.context_window.unwrap_or(32_768) as usize,
+                    tokens_used: d.tokens_used as usize,
                 })
                 .collect();
+            // If nothing deployed, show legacy fleet_models entries (existing pattern pre-V11).
+            if node_models.is_empty() {
+                node_models = legacy_models
+                    .iter()
+                    .filter(|m| m.node_name == n.name)
+                    .map(|m| NodeModel {
+                        name: m.name.clone(),
+                        port: m.port as u16,
+                        online: false,
+                        context_window: 32_768,
+                        tokens_used: 0,
+                    })
+                    .collect();
+            }
             FleetNode {
                 name: n.name,
                 ip: n.ip,
