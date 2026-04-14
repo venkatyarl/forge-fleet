@@ -21,6 +21,7 @@ pub mod hooks;
 pub mod mcp_client;
 pub mod mcp_tools;
 pub mod memory;
+pub mod deployment_reconciler;
 pub mod disk_sampler;
 pub mod model_catalog;
 pub mod model_library_scanner;

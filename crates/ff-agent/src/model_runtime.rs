@@ -320,6 +320,11 @@ async fn wait_for_health(runtime: &str, port: u16, timeout: std::time::Duration)
     false
 }
 
+/// Public re-export of [`probe_health`] for other modules (e.g. reconciler).
+pub async fn probe_health_public(runtime: &str, port: u16, timeout: std::time::Duration) -> bool {
+    probe_health(runtime, port, timeout).await
+}
+
 async fn probe_health(runtime: &str, port: u16, timeout: std::time::Duration) -> bool {
     // llama.cpp and vllm expose /health; MLX uses /v1/models.
     let endpoint = match runtime {
