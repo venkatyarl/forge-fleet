@@ -181,6 +181,11 @@ enum ModelCommand {
         /// Parallel request slots (default 4).
         #[arg(long)] parallel: Option<u32>,
     },
+    /// Enqueue downloads of multiple catalog ids onto a node via the deferred queue.
+    DownloadBatch {
+        #[arg(long)] node: String,
+        ids: Vec<String>,
+    },
     /// Unload: stop a running inference server by deployment id.
     Unload {
         /// Deployment id (UUID from `ff model deployments`).
@@ -920,42 +925,173 @@ pub fn poll_fleet_health_refresh(app: &mut ff_terminal::app::App) {
 }
 
 async fn load_picker_items() -> Result<Vec<ff_terminal::app::ModelPickerItem>, String> {
-    use ff_terminal::app::ModelPickerItem;
+    use ff_terminal::app::{ModelPickerItem, PickerItemState};
     use std::collections::BTreeMap;
-    let snapshot = ff_agent::fleet_info::fetch_snapshot().await?;
-    // Always offer "auto" — uses the fleet router to pick the best model per task.
-    let mut auto_items = vec![ModelPickerItem {
-        name: "auto".into(),
-        tier: 9, // sort to top
-        nodes: vec!["router".into()],
-        endpoint: format!("http://{}:{}",
-            snapshot.nodes.iter().find(|n| n.role == "leader").map(|n| n.ip.as_str()).unwrap_or("127.0.0.1"),
-            ff_terminal::app::PORT_LLM),
-        online: true,
-    }];
-    // Group by model.name
-    let mut by_name: BTreeMap<String, (i32, Vec<(String, String, i32, bool)>)> = BTreeMap::new();
-    for m in &snapshot.models {
-        let node = snapshot.nodes.iter().find(|n| n.name == m.node_name);
-        let ip = node.map(|n| n.ip.clone()).unwrap_or_default();
-        let online = node.map(|n| n.role != "offline").unwrap_or(false);
-        let entry = by_name.entry(m.name.clone()).or_insert((m.tier, Vec::new()));
-        entry.1.push((m.node_name.clone(), ip, m.port, online));
+
+    // Connect to Postgres using ~/.forgefleet/fleet.toml (same pattern as fleet_nodes_from_db).
+    let home = dirs::home_dir().ok_or_else(|| "no home dir".to_string())?;
+    let config_path = home.join(".forgefleet/fleet.toml");
+    let toml_str = std::fs::read_to_string(&config_path)
+        .map_err(|e| format!("read fleet.toml: {e}"))?;
+    let config: ff_core::config::FleetConfig = toml::from_str(&toml_str)
+        .map_err(|e| format!("parse fleet.toml: {e}"))?;
+    let db_url = config.database.url.trim().to_string();
+    if db_url.is_empty() { return Err("database.url is empty in fleet.toml".into()); }
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(std::time::Duration::from_secs(3))
+        .connect(&db_url)
+        .await
+        .map_err(|e| format!("connect postgres: {e}"))?;
+
+    // Fetch everything in parallel.
+    let (catalog_r, library_r, deployments_r, nodes_r, jobs_running_r, jobs_queued_r) = tokio::join!(
+        ff_db::pg_list_catalog(&pool),
+        ff_db::pg_list_library(&pool, None),
+        ff_db::pg_list_deployments(&pool, None),
+        ff_db::pg_list_nodes(&pool),
+        ff_db::pg_list_jobs(&pool, Some("running"), 50),
+        ff_db::pg_list_jobs(&pool, Some("queued"), 50),
+    );
+    let catalog = catalog_r.map_err(|e| format!("list catalog: {e}"))?;
+    let library = library_r.map_err(|e| format!("list library: {e}"))?;
+    let deployments = deployments_r.map_err(|e| format!("list deployments: {e}"))?;
+    let nodes = nodes_r.map_err(|e| format!("list nodes: {e}"))?;
+    let mut jobs = jobs_running_r.map_err(|e| format!("list running jobs: {e}"))?;
+    jobs.extend(jobs_queued_r.map_err(|e| format!("list queued jobs: {e}"))?);
+
+    // Node name -> ip.
+    let node_ip: std::collections::HashMap<String, String> = nodes
+        .iter().map(|n| (n.name.clone(), n.ip.clone())).collect();
+
+    // catalog_id -> CatMeta.
+    #[derive(Clone)]
+    struct CatMeta { name: String, tier: i32 }
+    let cat_meta: std::collections::HashMap<String, CatMeta> = catalog
+        .iter()
+        .map(|c| (c.id.clone(), CatMeta { name: c.name.clone(), tier: c.tier }))
+        .collect();
+
+    #[derive(Default)]
+    struct Agg {
+        lib_nodes: Vec<String>,
+        lib_runtime: Option<String>,
+        lib_size_bytes: i64,
+        deploy: Option<(String, String, i32, String)>, // (node, ip, port, runtime)
+        deploy_healthy: bool,
+        job: Option<(f32, String)>, // (pct, status)
     }
-    let mut items: Vec<ModelPickerItem> = by_name.into_iter().map(|(name, (tier, mut hosts))| {
-        hosts.sort_by(|a, b| a.0.cmp(&b.0));
-        let online = hosts.iter().any(|h| h.3);
-        // Pick first online host as the endpoint, fall back to first host
-        let chosen = hosts.iter().find(|h| h.3).cloned().unwrap_or_else(|| hosts[0].clone());
-        let endpoint = format!("http://{}:{}", chosen.1, chosen.2);
-        let nodes: Vec<String> = hosts.iter().map(|h| h.0.clone()).collect();
-        ModelPickerItem { name, tier, nodes, endpoint, online }
-    }).collect();
-    // Sort by tier desc, name asc
-    items.sort_by(|a, b| b.tier.cmp(&a.tier).then(a.name.cmp(&b.name)));
-    // Prepend "auto" entry so user can always pick router-based selection.
-    auto_items.append(&mut items);
-    Ok(auto_items)
+    let mut aggs: BTreeMap<String, Agg> = BTreeMap::new();
+    for c in &catalog { aggs.entry(c.id.clone()).or_default(); }
+    for l in &library {
+        let a = aggs.entry(l.catalog_id.clone()).or_default();
+        if !a.lib_nodes.contains(&l.node_name) { a.lib_nodes.push(l.node_name.clone()); }
+        a.lib_runtime.get_or_insert_with(|| l.runtime.clone());
+        a.lib_size_bytes = a.lib_size_bytes.max(l.size_bytes);
+    }
+    for d in &deployments {
+        let Some(cid) = d.catalog_id.as_ref() else { continue };
+        let a = aggs.entry(cid.clone()).or_default();
+        let healthy = d.health_status == "healthy";
+        if a.deploy.is_none() || (healthy && !a.deploy_healthy) {
+            let ip = node_ip.get(&d.node_name).cloned().unwrap_or_default();
+            a.deploy = Some((d.node_name.clone(), ip, d.port, d.runtime.clone()));
+            a.deploy_healthy = healthy;
+        }
+    }
+    for j in &jobs {
+        if j.kind != "download" { continue; }
+        let Some(cid) = j.target_catalog_id.as_ref() else { continue };
+        let a = aggs.entry(cid.clone()).or_default();
+        if a.job.as_ref().map(|(p, _)| j.progress_pct > *p).unwrap_or(true) {
+            a.job = Some((j.progress_pct, j.status.clone()));
+        }
+    }
+
+    let mut items: Vec<ModelPickerItem> = Vec::new();
+    for (cid, a) in aggs.into_iter() {
+        let meta = cat_meta.get(&cid).cloned()
+            .unwrap_or(CatMeta { name: cid.clone(), tier: 0 });
+
+        // State precedence: Loaded > Downloading > OnDisk > Catalog.
+        let (state, endpoint, endpoint_display, progress_pct, detail, runtime, online) =
+            if a.deploy_healthy {
+                let (node, ip, port, runtime) = a.deploy.clone().unwrap();
+                let endpoint = format!("http://{ip}:{port}");
+                let disp = format!("{node} @ {ip}:{port}");
+                (PickerItemState::Loaded, endpoint, Some(disp), None,
+                 format!("on {node}"), Some(runtime), true)
+            } else if a.job.is_some() {
+                let (pct, status) = a.job.clone().unwrap();
+                let tag = if status == "queued" { "queued" } else { "downloading" };
+                (PickerItemState::Downloading, String::new(), None, Some(pct),
+                 format!("{tag} {pct:.0}%"), a.lib_runtime.clone(), false)
+            } else if !a.lib_nodes.is_empty() {
+                let mut nodes_sorted = a.lib_nodes.clone();
+                nodes_sorted.sort();
+                let detail = if a.lib_size_bytes > 0 {
+                    format!("on {} ({})", nodes_sorted.join(", "), human_bytes_i64(a.lib_size_bytes))
+                } else {
+                    format!("on {}", nodes_sorted.join(", "))
+                };
+                (PickerItemState::OnDisk, String::new(), None, None, detail, a.lib_runtime.clone(), false)
+            } else if a.deploy.is_some() {
+                let (node, _ip, _port, runtime) = a.deploy.clone().unwrap();
+                (PickerItemState::OnDisk, String::new(), None, None,
+                 format!("deploy unhealthy on {node}"), Some(runtime), false)
+            } else {
+                (PickerItemState::Catalog, String::new(), None, None,
+                 "not yet on fleet".into(), None, false)
+            };
+
+        let mut nodes_v = a.lib_nodes.clone();
+        nodes_v.sort();
+        if let Some((n, _, _, _)) = a.deploy.as_ref() {
+            if !nodes_v.contains(n) { nodes_v.push(n.clone()); }
+        }
+
+        items.push(ModelPickerItem {
+            name: meta.name, tier: meta.tier, nodes: nodes_v,
+            endpoint, online, state, endpoint_display, progress_pct, detail, runtime,
+        });
+    }
+
+    fn state_rank(s: ff_terminal::app::PickerItemState) -> u8 {
+        use ff_terminal::app::PickerItemState::*;
+        match s { Auto => 0, Loaded => 1, Downloading => 2, OnDisk => 3, Catalog => 4 }
+    }
+    items.sort_by(|a, b| {
+        state_rank(a.state).cmp(&state_rank(b.state))
+            .then(b.tier.cmp(&a.tier))
+            .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+
+    // Build "auto" sentinel at the top.
+    let leader_ip = nodes.iter().find(|n| n.role == "leader").map(|n| n.ip.clone())
+        .unwrap_or_else(|| "127.0.0.1".into());
+    let auto = ModelPickerItem {
+        name: "auto".into(),
+        tier: 99,
+        nodes: vec!["router".into()],
+        endpoint: format!("http://{leader_ip}:{}", ff_terminal::app::PORT_LLM),
+        online: true,
+        state: PickerItemState::Auto,
+        endpoint_display: Some(format!("{leader_ip}:{}", ff_terminal::app::PORT_LLM)),
+        progress_pct: None,
+        detail: "fleet router".into(),
+        runtime: None,
+    };
+
+    let mut out = Vec::with_capacity(items.len() + 1);
+    out.push(auto);
+    out.extend(items);
+    Ok(out)
+}
+
+/// Human-readable bytes (i64) — tiny helper for the picker detail column.
+fn human_bytes_i64(n: i64) -> String {
+    if n < 0 { return "0 B".into(); }
+    human_bytes(n as u64)
 }
 
 /// Handle a key press while the model picker overlay is active.
@@ -980,15 +1116,36 @@ fn handle_picker_key(app: &mut ff_terminal::app::App, key: crossterm::event::Key
             picker.selected = 0;
         }
         (KeyCode::Enter, _) => {
+            use ff_terminal::app::PickerItemState;
             if let Some(&idx) = visible.get(picker.selected) {
                 let chosen = picker.items[idx].clone();
-                app.config.llm_base_url = chosen.endpoint.clone();
-                app.config.model = chosen.name.clone();
-                app.tab_mut().current_model = chosen.name.clone();
-                let msg = format!("Switched to {} @ {}", chosen.name, chosen.endpoint);
-                app.tab_mut().messages.push(ff_terminal::messages::render_status(&msg));
+                match chosen.state {
+                    PickerItemState::Auto | PickerItemState::Loaded => {
+                        app.config.llm_base_url = chosen.endpoint.clone();
+                        app.config.model = chosen.name.clone();
+                        app.tab_mut().current_model = chosen.name.clone();
+                        let msg = format!("Switched to {} @ {}", chosen.name, chosen.endpoint);
+                        app.tab_mut().messages.push(ff_terminal::messages::render_status(&msg));
+                        app.picker = None;
+                    }
+                    PickerItemState::Downloading => {
+                        let msg = format!("{} is still downloading; wait for it to finish.", chosen.name);
+                        app.tab_mut().messages.push(ff_terminal::messages::render_status(&msg));
+                        app.picker = None;
+                    }
+                    PickerItemState::OnDisk | PickerItemState::Catalog => {
+                        let hint = if matches!(chosen.state, PickerItemState::OnDisk) {
+                            format!("Model not loaded; use `ff model load {}` first.", chosen.name)
+                        } else {
+                            format!("Model not loaded; use `ff model download {}` and `ff model load {}` first.", chosen.name, chosen.name)
+                        };
+                        app.tab_mut().messages.push(ff_terminal::messages::render_status(&hint));
+                        app.picker = None;
+                    }
+                }
+            } else {
+                app.picker = None;
             }
-            app.picker = None;
         }
         (KeyCode::Char(c), mods) if !mods.contains(KeyModifiers::CONTROL) && !mods.contains(KeyModifiers::ALT) => {
             picker.filter.push(c);
@@ -1541,6 +1698,22 @@ async fn handle_secrets(cmd: SecretsCommand) -> Result<()> {
     Ok(())
 }
 
+/// POSIX shell single-quote escape: wraps the argument in single quotes and
+/// escapes any embedded single quotes. Safe for pasting into `sh -c`.
+fn shell_escape_single(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
+}
+
 /// Best-effort tag for `updated_by`: `user@host`.
 fn whoami_tag() -> String {
     let user = std::env::var("USER").unwrap_or_else(|_| "unknown".into());
@@ -1817,11 +1990,40 @@ async fn handle_model(cmd: ModelCommand) -> Result<()> {
             let quant = variant.get("quant").and_then(|v| v.as_str()).map(String::from);
             let size_gb = variant.get("size_gb").and_then(|v| v.as_f64()).unwrap_or(0.0);
 
-            // For now: only download when targeting the current host (we can run locally).
-            // Cross-node downloads require daemon endpoints — flag clearly.
+            // Cross-node downloads are dispatched via the deferred task queue: a
+            // defer-worker running on the target node will claim it and run
+            // `ff model download <id> --runtime <rt>` locally there.
             let this_node = ff_agent::fleet_info::resolve_this_node_name().await;
             if node_name != this_node {
-                anyhow::bail!("cross-node download not yet implemented. for now run `ff model download {id}` directly on '{node_name}'");
+                let escaped_id = shell_escape_single(&id);
+                let command = format!(
+                    "ff model download {} --runtime {}",
+                    escaped_id, target_runtime
+                );
+                let title = format!(
+                    "Download {} ({} variant) on {}",
+                    id, target_runtime, node_name
+                );
+                let payload = serde_json::json!({ "command": command });
+                let trigger_spec = serde_json::json!({});
+                let defer_id = ff_db::pg_enqueue_deferred(
+                    &pool,
+                    &title,
+                    "shell",
+                    &payload,
+                    "now",
+                    &trigger_spec,
+                    Some(&node_name),
+                    &serde_json::json!([]),
+                    Some(&whoami_tag()),
+                    Some(3),
+                )
+                .await?;
+                println!(
+                    "Enqueued cross-node download as deferred task {defer_id}. It will run on {node_name} when a defer-worker there claims it."
+                );
+                println!("Check status with: ff defer list");
+                return Ok(());
             }
 
             // Compute destination dir under models_dir.
@@ -1930,6 +2132,62 @@ async fn handle_model(cmd: ModelCommand) -> Result<()> {
                     anyhow::bail!("download failed: {e}");
                 }
             }
+        }
+        ModelCommand::DownloadBatch { node, ids } => {
+            if ids.is_empty() {
+                anyhow::bail!("no catalog ids provided; usage: ff model download-batch --node <name> <id>...");
+            }
+            // Resolve target node + its runtime.
+            let node_row = ff_db::pg_get_node(&pool, &node)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("node '{node}' not in fleet_nodes"))?;
+            let target_runtime = node_row.runtime.clone();
+            if target_runtime == "unknown" {
+                anyhow::bail!("node '{node}' has unknown runtime; set with: ff config set fleet.{node}.runtime mlx|llama.cpp|vllm");
+            }
+
+            // Validate every id exists in the catalog BEFORE enqueuing anything.
+            for id in &ids {
+                if ff_db::pg_get_catalog(&pool, id).await?.is_none() {
+                    anyhow::bail!("no catalog entry with id '{id}' (try `ff model search`)");
+                }
+            }
+
+            let who = whoami_tag();
+            let mut enqueued: Vec<(String, String)> = Vec::with_capacity(ids.len());
+            for id in &ids {
+                let escaped_id = shell_escape_single(id);
+                let command = format!(
+                    "ff model download {} --runtime {}",
+                    escaped_id, target_runtime
+                );
+                let title = format!(
+                    "Download {} ({} variant) on {}",
+                    id, target_runtime, node
+                );
+                let payload = serde_json::json!({ "command": command });
+                let trigger_spec = serde_json::json!({});
+                let defer_id = ff_db::pg_enqueue_deferred(
+                    &pool,
+                    &title,
+                    "shell",
+                    &payload,
+                    "now",
+                    &trigger_spec,
+                    Some(&node),
+                    &serde_json::json!([]),
+                    Some(&who),
+                    Some(3),
+                )
+                .await?;
+                enqueued.push((id.clone(), defer_id));
+            }
+
+            println!("Enqueued {} cross-node downloads on '{}':", enqueued.len(), node);
+            for (id, defer_id) in &enqueued {
+                println!("  {defer_id}  {id}");
+            }
+            println!("Check status with: ff defer list");
         }
         ModelCommand::Delete { id, yes } => {
             // Look up library row.

@@ -60,6 +60,21 @@ pub struct ModelPicker {
     pub filter: String,
 }
 
+/// Library-browser state for a model in the picker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickerItemState {
+    /// "auto" router sentinel at the top of the list.
+    Auto,
+    /// Deployment exists and is healthy — can be selected as the session endpoint.
+    Loaded,
+    /// Present in fleet_model_library on one or more nodes, but not deployed.
+    OnDisk,
+    /// Only in fleet_model_catalog — not on any node yet.
+    Catalog,
+    /// In-flight download job (queued or running).
+    Downloading,
+}
+
 #[derive(Debug, Clone)]
 pub struct ModelPickerItem {
     pub name: String,
@@ -67,9 +82,20 @@ pub struct ModelPickerItem {
     /// Nodes that host this model (sorted, deduplicated).
     pub nodes: Vec<String>,
     /// Resolved endpoint URL for the first available node (used on select).
+    /// Only meaningful when `state == Loaded`.
     pub endpoint: String,
     /// Is at least one host node online?
     pub online: bool,
+    /// Library-browser state — drives icon, colour, and whether Enter can select it.
+    pub state: PickerItemState,
+    /// Only `Some` for `Loaded`: "host:port" for display.
+    pub endpoint_display: Option<String>,
+    /// Only `Some` for `Downloading`: 0.0–100.0 percent complete.
+    pub progress_pct: Option<f32>,
+    /// Pre-rendered right-hand detail string ("on marcus, sophie" / "not yet on fleet" / size / "42%").
+    pub detail: String,
+    /// Optional runtime tag ("llama.cpp", "mlx", …) displayed after the detail.
+    pub runtime: Option<String>,
 }
 
 impl ModelPicker {

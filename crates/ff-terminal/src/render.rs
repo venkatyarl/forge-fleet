@@ -99,31 +99,60 @@ fn render_model_picker(frame: &mut Frame, app: &App, _theme: &Theme) {
         let msg = if picker.items.is_empty() { " No models found in fleet" } else { " No matches" };
         lines.push(Line::from(Span::styled(msg, Style::default().fg(Color::Rgb(100, 116, 139)))));
     } else {
+        use crate::app::PickerItemState;
         let max_rows = list_area.height as usize;
         // Simple windowing: keep `selected` visible
         let selected = picker.selected.min(visible_idxs.len().saturating_sub(1));
         let start = if selected >= max_rows { selected + 1 - max_rows } else { 0 };
+        let sel_bg = Color::Rgb(99, 102, 241);
         for (row, &idx) in visible_idxs.iter().enumerate().skip(start).take(max_rows) {
             let m = &picker.items[idx];
             let is_selected = row == selected;
-            let status_dot = if m.online { ("●", Color::Rgb(74, 222, 128)) } else { ("○", Color::Rgb(248, 113, 113)) };
-            let row_style = if is_selected {
-                Style::default().fg(Color::White).bg(Color::Rgb(99, 102, 241))
-            } else {
-                Style::default().fg(Color::Rgb(226, 232, 240))
+            let bg = if is_selected { sel_bg } else { Color::Reset };
+
+            // State icon + color.
+            let (icon, icon_color) = match m.state {
+                PickerItemState::Auto        => ("◆", Color::Rgb(139, 92, 246)),    // purple
+                PickerItemState::Loaded      => ("●", Color::Rgb(74, 222, 128)),    // green
+                PickerItemState::OnDisk      => ("◐", Color::Rgb(251, 191, 36)),    // yellow
+                PickerItemState::Catalog     => ("○", Color::Rgb(148, 163, 184)),   // gray
+                PickerItemState::Downloading => ("↓", Color::Rgb(125, 211, 252)),   // cyan
             };
-            let nodes_str = m.nodes.join(", ");
-            let nodes_color = if is_selected { Color::Rgb(199, 210, 254) } else { Color::Rgb(100, 116, 139) };
-            let tier_label = if m.name == "auto" { "[AUTO]".to_string() } else { format!("[T{}]", m.tier) };
-            let on_label = if m.name == "auto" { "  fleet router" } else { "  on " };
-            let nodes_text = if m.name == "auto" { String::new() } else { nodes_str };
-            lines.push(Line::from(vec![
-                Span::styled(format!(" {} ", status_dot.0), Style::default().fg(status_dot.1).bg(if is_selected { Color::Rgb(99, 102, 241) } else { Color::Reset })),
-                Span::styled(format!("{tier_label} "), if is_selected { row_style } else { Style::default().fg(Color::Rgb(251, 191, 36)) }),
-                Span::styled(m.name.clone(), if is_selected { row_style.add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::Rgb(226, 232, 240)).add_modifier(Modifier::BOLD) }),
-                Span::styled(on_label, Style::default().fg(nodes_color).bg(if is_selected { Color::Rgb(99, 102, 241) } else { Color::Reset })),
-                Span::styled(nodes_text, Style::default().fg(nodes_color).bg(if is_selected { Color::Rgb(99, 102, 241) } else { Color::Reset })),
-            ]));
+
+            let name_style = if is_selected {
+                Style::default().fg(Color::White).bg(bg).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Rgb(226, 232, 240)).add_modifier(Modifier::BOLD)
+            };
+            let tier_style = if is_selected {
+                Style::default().fg(Color::White).bg(bg)
+            } else {
+                Style::default().fg(Color::Rgb(251, 191, 36))
+            };
+            let detail_color = if is_selected { Color::Rgb(199, 210, 254) } else { Color::Rgb(148, 163, 184) };
+            let dim_color    = if is_selected { Color::Rgb(199, 210, 254) } else { Color::Rgb(100, 116, 139) };
+
+            let tier_label = match m.state {
+                PickerItemState::Auto => "[AUTO]".to_string(),
+                _ => format!("[T{}]", m.tier),
+            };
+
+            let mut spans: Vec<Span> = Vec::new();
+            spans.push(Span::styled(format!(" {icon} "), Style::default().fg(icon_color).bg(bg)));
+            spans.push(Span::styled(format!("{tier_label} "), tier_style));
+            spans.push(Span::styled(m.name.clone(), name_style));
+            spans.push(Span::styled("  ", Style::default().bg(bg)));
+            spans.push(Span::styled(m.detail.clone(), Style::default().fg(detail_color).bg(bg)));
+            if let Some(ep) = &m.endpoint_display {
+                if matches!(m.state, PickerItemState::Loaded) {
+                    spans.push(Span::styled(format!("  {ep}"), Style::default().fg(dim_color).bg(bg)));
+                }
+            }
+            if let Some(rt) = &m.runtime {
+                spans.push(Span::styled(format!("  [{rt}]"), Style::default().fg(dim_color).bg(bg)));
+            }
+
+            lines.push(Line::from(spans));
         }
     }
 
