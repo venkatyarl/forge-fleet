@@ -231,6 +231,14 @@ enum ModelCommand {
         /// Target node name.
         #[arg(long)] to: String,
     },
+    /// Auto-load a catalog model on this node: resolves library row, picks a free
+    /// port, calls load_model. No-op if already deployed.
+    Autoload {
+        /// Catalog id (e.g. "qwen3-coder-30b").
+        catalog_id: String,
+        /// Override context size (default 32768).
+        #[arg(long)] ctx: Option<u32>,
+    },
     /// Convert a safetensors library entry to MLX on this Apple Silicon host.
     Convert {
         /// Library UUID (must be runtime=vllm i.e. safetensors).
@@ -299,7 +307,7 @@ async fn main() -> Result<()> {
             return handle_daemon(as_node.clone(), *scheduler, *defer_interval, *disk_interval, *reconcile_interval, *once).await;
         }
         Some(Command::Config  { command }) => return handle_config(command.clone(), &config_path),
-        Some(Command::Status)              => return handle_status(&config_path),
+        Some(Command::Status)              => return handle_status(&config_path).await,
         Some(Command::Nodes)               => return handle_nodes(&config_path),
         _ => {}
     }
@@ -362,7 +370,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Some(Command::Start { leader }) => handle_start(leader, &config_path, &working_dir).await,
         Some(Command::Stop) => handle_stop().await,
-        Some(Command::Status) => handle_status(&config_path),
+        Some(Command::Status) => handle_status(&config_path).await,
         Some(Command::Nodes) => handle_nodes(&config_path),
         Some(Command::Models) => handle_models(&agent_config).await,
         Some(Command::Health) => handle_health(&agent_config).await,
@@ -1591,9 +1599,290 @@ fn find_daemon_binary(working_dir: &Path) -> Option<PathBuf> {
     None
 }
 
-fn handle_status(p: &Path) -> Result<()> {
-    let cfg = load_config(p)?;
-    println!("{GREEN}✓ ForgeFleet Status{RESET}\n  nodes: {}\n  models: {}", cfg.nodes.len(), cfg.models.len()); Ok(())
+async fn handle_status(p: &Path) -> Result<()> {
+    // Cap total runtime at 15s.
+    let fut = handle_status_inner(p.to_path_buf());
+    match tokio::time::timeout(Duration::from_secs(15), fut).await {
+        Ok(r) => r,
+        Err(_) => {
+            println!("{RED}✗ ff status timed out after 15s{RESET}");
+            Ok(())
+        }
+    }
+}
+
+async fn handle_status_inner(p: PathBuf) -> Result<()> {
+    println!("{CYAN}━━━ ForgeFleet Status ━━━{RESET}");
+
+    // Load fleet.toml (needed for redis URL and as a fallback for DB URL).
+    let fleet_cfg: Option<ff_core::config::FleetConfig> = fs::read_to_string(&p)
+        .ok()
+        .and_then(|s| toml::from_str(&s).ok());
+
+    // ── 1. Database ────────────────────────────────────────────────────────
+    print!("{CYAN}Database{RESET}  : ");
+    let pool_res = tokio::time::timeout(
+        Duration::from_secs(3),
+        ff_agent::fleet_info::get_fleet_pool(),
+    ).await;
+    let pool_opt: Option<sqlx::PgPool> = match pool_res {
+        Ok(Ok(pool)) => {
+            // Count applied migrations.
+            let migs: Option<i64> = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*)::bigint FROM _migrations"
+            )
+            .fetch_one(&pool)
+            .await
+            .ok();
+            match migs {
+                Some(n) => println!("{GREEN}✓ connected{RESET} ({n} migrations applied)"),
+                None    => println!("{GREEN}✓ connected{RESET} (migrations table missing)"),
+            }
+            Some(pool)
+        }
+        Ok(Err(e)) => {
+            println!("{RED}✗ unreachable{RESET} ({})", truncate(&e, 60));
+            None
+        }
+        Err(_) => {
+            println!("{RED}✗ unreachable{RESET} (timeout)");
+            None
+        }
+    };
+
+    // ── 2. Redis ───────────────────────────────────────────────────────────
+    print!("{CYAN}Redis{RESET}     : ");
+    let redis_url = fleet_cfg.as_ref()
+        .map(|c| c.redis.url.clone())
+        .unwrap_or_else(|| "redis://127.0.0.1:6379".to_string());
+    match ping_redis(&redis_url).await {
+        Ok(ms)   => println!("{GREEN}✓ PONG{RESET} ({redis_url}, {ms}ms)"),
+        Err(e)   => println!("{RED}✗ unreachable{RESET} ({redis_url}) — {}", truncate(&e, 50)),
+    }
+
+    // ── 3. Fleet nodes ─────────────────────────────────────────────────────
+    println!("{CYAN}Nodes{RESET}     :");
+    let nodes: Vec<ff_db::FleetNodeRow> = match &pool_opt {
+        Some(pool) => ff_db::pg_list_nodes(pool).await.unwrap_or_default(),
+        None => Vec::new(),
+    };
+    if nodes.is_empty() {
+        println!("  {YELLOW}(no nodes — DB unavailable or empty){RESET}");
+    } else {
+        // Probe SSH port 22 on each node in parallel.
+        let probes: Vec<_> = nodes.iter().map(|n| {
+            let ip = n.ip.clone();
+            async move { tcp_probe(&ip, 22, Duration::from_secs(2)).await }
+        }).collect();
+        let online: Vec<bool> = futures::future::join_all(probes).await;
+        for (n, up) in nodes.iter().zip(online.iter()) {
+            let status = if *up {
+                format!("{GREEN}online{RESET}")
+            } else {
+                format!("{RED}offline{RESET}")
+            };
+            println!(
+                "  {:<10} {:<16} {:<10} {}",
+                n.name, n.ip, n.runtime, status
+            );
+        }
+    }
+
+    // ── 4. Deployments ─────────────────────────────────────────────────────
+    print!("{CYAN}Deployments{RESET}: ");
+    if let Some(pool) = &pool_opt {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT health_status, COUNT(*)::bigint FROM fleet_model_deployments \
+             GROUP BY health_status ORDER BY health_status"
+        ).fetch_all(pool).await.unwrap_or_default();
+        if rows.is_empty() {
+            println!("{YELLOW}(none){RESET}");
+        } else {
+            let parts: Vec<String> = rows.iter().map(|(s, c)| {
+                let color = match s.as_str() {
+                    "healthy"   => GREEN,
+                    "unhealthy" => RED,
+                    "starting"  => YELLOW,
+                    _           => RESET,
+                };
+                format!("{color}{s}={c}{RESET}")
+            }).collect();
+            println!("{}", parts.join("  "));
+        }
+    } else {
+        println!("{RED}✗ unreachable{RESET}");
+    }
+
+    // ── 5. Model library ───────────────────────────────────────────────────
+    print!("{CYAN}Library{RESET}   : ");
+    if let Some(pool) = &pool_opt {
+        let row: Option<(i64, i64)> = sqlx::query_as(
+            "SELECT COUNT(*)::bigint, COALESCE(SUM(size_bytes), 0)::bigint FROM fleet_model_library"
+        ).fetch_one(pool).await.ok();
+        match row {
+            Some((n, bytes)) => {
+                let gib = (bytes as f64) / 1024.0 / 1024.0 / 1024.0;
+                println!("{n} models, {gib:.1} GiB across fleet");
+            }
+            None => println!("{RED}✗ query failed{RESET}"),
+        }
+    } else {
+        println!("{RED}✗ unreachable{RESET}");
+    }
+
+    // ── 6. Catalog ─────────────────────────────────────────────────────────
+    print!("{CYAN}Catalog{RESET}   : ");
+    if let Some(pool) = &pool_opt {
+        let n: Option<i64> = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM fleet_model_catalog"
+        ).fetch_one(pool).await.ok();
+        match n {
+            Some(n) => println!("{n} entries"),
+            None    => println!("{RED}✗ query failed{RESET}"),
+        }
+    } else {
+        println!("{RED}✗ unreachable{RESET}");
+    }
+
+    // ── 7. Disk usage ──────────────────────────────────────────────────────
+    println!("{CYAN}Disk{RESET}      :");
+    if let Some(pool) = &pool_opt {
+        // Latest sample per node.
+        let rows: Vec<(String, i64, i64, i64, i32)> = sqlx::query_as(
+            "SELECT DISTINCT ON (d.node_name) \
+                    d.node_name, d.total_bytes, d.used_bytes, d.models_bytes, \
+                    COALESCE(n.disk_quota_pct, 80) \
+             FROM fleet_disk_usage d \
+             LEFT JOIN fleet_nodes n ON n.name = d.node_name \
+             ORDER BY d.node_name, d.sampled_at DESC"
+        ).fetch_all(pool).await.unwrap_or_default();
+        if rows.is_empty() {
+            println!("  {YELLOW}(no samples yet){RESET}");
+        } else {
+            for (name, total, used, models, quota) in rows {
+                let total_gib = (total as f64) / 1024.0 / 1024.0 / 1024.0;
+                let used_gib  = (used  as f64) / 1024.0 / 1024.0 / 1024.0;
+                let models_gib= (models as f64) / 1024.0 / 1024.0 / 1024.0;
+                let used_pct = if total > 0 { (used as f64 / total as f64) * 100.0 } else { 0.0 };
+                let over = used_pct >= quota as f64;
+                let line = format!(
+                    "  {:<10} {:5.1}/{:5.1} GiB ({:4.1}%)  models {:5.1} GiB  quota {}%",
+                    name, used_gib, total_gib, used_pct, models_gib, quota
+                );
+                if over { println!("{RED}{line}{RESET}"); } else { println!("{line}"); }
+            }
+        }
+    } else {
+        println!("  {RED}✗ unreachable{RESET}");
+    }
+
+    // ── 8. Deferred tasks ──────────────────────────────────────────────────
+    print!("{CYAN}Deferred{RESET}  : ");
+    if let Some(pool) = &pool_opt {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT status, COUNT(*)::bigint FROM deferred_tasks \
+             GROUP BY status ORDER BY status"
+        ).fetch_all(pool).await.unwrap_or_default();
+        if rows.is_empty() {
+            println!("{YELLOW}(none){RESET}");
+        } else {
+            let parts: Vec<String> = rows.iter().map(|(s, c)| {
+                if s == "failed" && *c > 0 {
+                    format!("{RED}{s}={c}{RESET}")
+                } else {
+                    format!("{s}={c}")
+                }
+            }).collect();
+            println!("{}", parts.join("  "));
+        }
+    } else {
+        println!("{RED}✗ unreachable{RESET}");
+    }
+
+    // ── 9. In-flight jobs ──────────────────────────────────────────────────
+    print!("{CYAN}Jobs{RESET}      : ");
+    if let Some(pool) = &pool_opt {
+        let n: Option<i64> = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM fleet_model_jobs WHERE status IN ('running','queued')"
+        ).fetch_one(pool).await.ok();
+        match n {
+            Some(0) => println!("0 in-flight"),
+            Some(n) => println!("{YELLOW}{n} in-flight{RESET} (running or queued)"),
+            None    => println!("{RED}✗ query failed{RESET}"),
+        }
+    } else {
+        println!("{RED}✗ unreachable{RESET}");
+    }
+
+    // ── 10. Secrets ───────────────────────────────────────────────────────
+    print!("{CYAN}Secrets{RESET}   : ");
+    if let Some(pool) = &pool_opt {
+        let keys: Vec<(String,)> = sqlx::query_as(
+            "SELECT key FROM fleet_secrets ORDER BY key"
+        ).fetch_all(pool).await.unwrap_or_default();
+        if keys.is_empty() {
+            println!("{YELLOW}(none){RESET}");
+        } else {
+            let list: Vec<String> = keys.into_iter().map(|(k,)| k).collect();
+            println!("{}", list.join(", "));
+        }
+    } else {
+        println!("{RED}✗ unreachable{RESET}");
+    }
+
+    Ok(())
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max { s.to_string() } else { format!("{}…", &s[..max]) }
+}
+
+async fn tcp_probe(host: &str, port: u16, timeout: Duration) -> bool {
+    let addr = format!("{host}:{port}");
+    match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(&addr)).await {
+        Ok(Ok(_)) => true,
+        _ => false,
+    }
+}
+
+/// Lightweight Redis PING — speaks RESP directly without a redis client dep.
+async fn ping_redis(url: &str) -> std::result::Result<u128, String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Parse redis://host:port (ignore auth/db for this health ping).
+    let rest = url.strip_prefix("redis://").unwrap_or(url);
+    let host_port = rest.split('/').next().unwrap_or(rest);
+    // Strip userinfo if present.
+    let host_port = host_port.rsplit('@').next().unwrap_or(host_port);
+    let (host, port) = match host_port.rsplit_once(':') {
+        Some((h, p)) => (h.to_string(), p.parse::<u16>().unwrap_or(6379)),
+        None => (host_port.to_string(), 6379),
+    };
+
+    let start = std::time::Instant::now();
+    let connect = tokio::net::TcpStream::connect((host.as_str(), port));
+    let mut stream = tokio::time::timeout(Duration::from_secs(3), connect)
+        .await
+        .map_err(|_| "connect timeout".to_string())?
+        .map_err(|e| format!("connect: {e}"))?;
+
+    tokio::time::timeout(Duration::from_secs(3), stream.write_all(b"PING\r\n"))
+        .await
+        .map_err(|_| "write timeout".to_string())?
+        .map_err(|e| format!("write: {e}"))?;
+
+    let mut buf = [0u8; 64];
+    let n = tokio::time::timeout(Duration::from_secs(3), stream.read(&mut buf))
+        .await
+        .map_err(|_| "read timeout".to_string())?
+        .map_err(|e| format!("read: {e}"))?;
+
+    let reply = String::from_utf8_lossy(&buf[..n]);
+    if reply.starts_with("+PONG") {
+        Ok(start.elapsed().as_millis())
+    } else {
+        Err(format!("unexpected reply: {}", reply.trim()))
+    }
 }
 
 fn handle_nodes(p: &Path) -> Result<()> {
@@ -2289,6 +2578,36 @@ async fn handle_model(cmd: ModelCommand) -> Result<()> {
                 }
                 Err(e) => anyhow::bail!("load failed: {e}"),
             }
+        }
+        ModelCommand::Autoload { catalog_id, ctx } => {
+            let node_name = ff_agent::fleet_info::resolve_this_node_name().await;
+
+            // 1. Already deployed?
+            let deps = ff_db::pg_list_deployments(&pool, Some(&node_name)).await?;
+            if let Some(d) = deps.iter().find(|d| d.catalog_id.as_deref() == Some(&catalog_id) && d.health_status == "healthy") {
+                println!("Already deployed on port {} (deployment {})", d.port, d.id);
+                return Ok(());
+            }
+
+            // 2. Find library row on this node for this catalog_id.
+            let libs = ff_db::pg_list_library(&pool, Some(&node_name)).await?;
+            let lib = libs.iter().find(|r| r.catalog_id == catalog_id)
+                .ok_or_else(|| anyhow::anyhow!("model '{catalog_id}' not in library on '{node_name}'. Download it first: ff model download {catalog_id}"))?;
+
+            // 3. Pick a free port (51001..=51020, skipping ones in deployments).
+            let used_ports: std::collections::HashSet<i32> = deps.iter().map(|d| d.port).collect();
+            let port = (51001u16..=51020).find(|p| !used_ports.contains(&(*p as i32)))
+                .ok_or_else(|| anyhow::anyhow!("no free port in 51001-51020"))?;
+
+            // 4. Load.
+            let res = ff_agent::model_runtime::load_model(&pool, ff_agent::model_runtime::LoadOptions {
+                library_id: lib.id.clone(),
+                port,
+                context_size: ctx,
+                parallel: None,
+            }).await.map_err(|e| anyhow::anyhow!(e))?;
+
+            println!("Autoloaded {} on port {} (deployment {})", catalog_id, res.port, res.deployment_id);
         }
         ModelCommand::Unload { id } => {
             match ff_agent::model_runtime::unload_model(&pool, &id).await {
