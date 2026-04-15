@@ -197,6 +197,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "model_lifecycle",
         sql: schema::SCHEMA_V11_MODEL_LIFECYCLE,
     },
+    PgMigration {
+        version: 12,
+        name: "onboarding_foundation",
+        sql: schema::SCHEMA_V12_ONBOARDING,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.

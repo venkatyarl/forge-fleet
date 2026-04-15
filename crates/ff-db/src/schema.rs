@@ -341,6 +341,53 @@ CREATE TABLE IF NOT EXISTS fleet_settings (
 ///
 /// Applied as Postgres migration version 8.
 /// IF NOT EXISTS / IF NOT EXISTS guards make this idempotent.
+pub const SCHEMA_V12_ONBOARDING: &str = r#"
+-- ─── V12: Self-service onboarding foundation ──────────────────────────────
+-- New tables for SSH key tracking + mesh verification, plus ALTER TABLE on
+-- fleet_nodes for sub-agent fan-out, GitHub identity, and installed-tool
+-- version tracking. See plan: gentle-questing-valley.md §3–§3h for design.
+
+-- SSH public keys per node. Separate from fleet_nodes so we can stash both
+-- the daemon user's pubkey AND the machine's host keys (multiple per node).
+CREATE TABLE IF NOT EXISTS fleet_node_ssh_keys (
+    node_name    TEXT NOT NULL REFERENCES fleet_nodes(name) ON DELETE CASCADE,
+    key_purpose  TEXT NOT NULL,             -- 'user' | 'host'
+    public_key   TEXT NOT NULL,             -- full OpenSSH format line
+    key_type     TEXT NOT NULL,             -- 'ed25519' | 'rsa' | 'ecdsa'
+    fingerprint  TEXT NOT NULL,             -- sha256:... from ssh-keygen -lf
+    added_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (node_name, fingerprint)
+);
+CREATE INDEX IF NOT EXISTS idx_ssh_keys_node_purpose
+    ON fleet_node_ssh_keys (node_name, key_purpose);
+
+-- Bidirectional SSH reachability matrix. One row per ordered (src, dst) pair.
+-- Written by the mesh-propagation deferred task and the periodic re-verify
+-- tick; read by the dashboard and `ff fleet ssh-mesh-check`.
+CREATE TABLE IF NOT EXISTS fleet_mesh_status (
+    src_node     TEXT NOT NULL,
+    dst_node     TEXT NOT NULL,
+    status       TEXT NOT NULL,             -- 'ok' | 'failed' | 'pending'
+    last_checked TIMESTAMPTZ,
+    last_error   TEXT,
+    attempts     INT NOT NULL DEFAULT 0,
+    PRIMARY KEY (src_node, dst_node)
+);
+CREATE INDEX IF NOT EXISTS idx_mesh_status_dst ON fleet_mesh_status (dst_node);
+CREATE INDEX IF NOT EXISTS idx_mesh_status_status ON fleet_mesh_status (status);
+
+-- Extend fleet_nodes for onboarding features:
+--   sub_agent_count — how many concurrent worker slots this node serves
+--   gh_account       — which GitHub identity this node is authenticated against
+--   tooling          — JSONB map of {tool: {current, latest, checked_at}}
+ALTER TABLE fleet_nodes
+    ADD COLUMN IF NOT EXISTS sub_agent_count INT  NOT NULL DEFAULT 1;
+ALTER TABLE fleet_nodes
+    ADD COLUMN IF NOT EXISTS gh_account      TEXT;
+ALTER TABLE fleet_nodes
+    ADD COLUMN IF NOT EXISTS tooling         JSONB NOT NULL DEFAULT '{}';
+"#;
+
 pub const SCHEMA_V11_MODEL_LIFECYCLE: &str = r#"
 -- ─── Model Lifecycle (catalog / library / deployments / jobs) ─────────────
 -- Splits the old `fleet_models` concept into:

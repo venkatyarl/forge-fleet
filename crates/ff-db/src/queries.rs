@@ -1365,11 +1365,26 @@ pub struct FleetNodeRow {
     /// Disk quota for the models dir as a percentage of total disk (default 80).
     #[serde(default = "default_disk_quota_pct")]
     pub disk_quota_pct: i32,
+    /// Concurrent defer-worker slots on this node (default 1). Scales agent-
+    /// heavy workloads. Added in schema V12.
+    #[serde(default = "default_sub_agent_count")]
+    pub sub_agent_count: i32,
+    /// GitHub owner/account this node is authenticated against (e.g.
+    /// "venkat-oclaw"). NULL for existing nodes still on Taylor's PAT. V12.
+    #[serde(default)]
+    pub gh_account: Option<String>,
+    /// Map of installed-tool versions:
+    ///   {"os":{"current":"Ubuntu 24.04.4","latest":"Ubuntu 24.04.5","checked_at":"..."}}
+    /// Populated every 6h by the daemon's version_check tick. V12.
+    #[serde(default = "default_tooling")]
+    pub tooling: JsonValue,
 }
 
 fn default_runtime() -> String { "unknown".to_string() }
 fn default_models_dir() -> String { "~/models".to_string() }
 fn default_disk_quota_pct() -> i32 { 80 }
+fn default_sub_agent_count() -> i32 { 1 }
+fn default_tooling() -> JsonValue { serde_json::json!({}) }
 
 /// A fleet model row from the Postgres `fleet_models` table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1397,7 +1412,10 @@ pub async fn pg_list_nodes(pool: &PgPool) -> Result<Vec<FleetNodeRow>> {
                 preferences, resources, status,
                 COALESCE(runtime, 'unknown') AS runtime,
                 COALESCE(models_dir, '~/models') AS models_dir,
-                COALESCE(disk_quota_pct, 80) AS disk_quota_pct
+                COALESCE(disk_quota_pct, 80) AS disk_quota_pct,
+                COALESCE(sub_agent_count, 1) AS sub_agent_count,
+                gh_account,
+                COALESCE(tooling, '{}'::jsonb) AS tooling
          FROM fleet_nodes ORDER BY election_priority, name",
     )
     .fetch_all(pool)
@@ -1423,6 +1441,9 @@ pub async fn pg_list_nodes(pool: &PgPool) -> Result<Vec<FleetNodeRow>> {
             runtime: r.get("runtime"),
             models_dir: r.get("models_dir"),
             disk_quota_pct: r.get("disk_quota_pct"),
+            sub_agent_count: r.get("sub_agent_count"),
+            gh_account: r.get("gh_account"),
+            tooling: r.get("tooling"),
         })
         .collect())
 }
@@ -1435,7 +1456,10 @@ pub async fn pg_get_node(pool: &PgPool, name: &str) -> Result<Option<FleetNodeRo
                 preferences, resources, status,
                 COALESCE(runtime, 'unknown') AS runtime,
                 COALESCE(models_dir, '~/models') AS models_dir,
-                COALESCE(disk_quota_pct, 80) AS disk_quota_pct
+                COALESCE(disk_quota_pct, 80) AS disk_quota_pct,
+                COALESCE(sub_agent_count, 1) AS sub_agent_count,
+                gh_account,
+                COALESCE(tooling, '{}'::jsonb) AS tooling
          FROM fleet_nodes WHERE name = $1",
     )
     .bind(name)
@@ -1460,6 +1484,9 @@ pub async fn pg_get_node(pool: &PgPool, name: &str) -> Result<Option<FleetNodeRo
         runtime: r.get("runtime"),
         models_dir: r.get("models_dir"),
         disk_quota_pct: r.get("disk_quota_pct"),
+        sub_agent_count: r.get("sub_agent_count"),
+        gh_account: r.get("gh_account"),
+        tooling: r.get("tooling"),
     }))
 }
 
@@ -1468,8 +1495,10 @@ pub async fn pg_upsert_node(pool: &PgPool, node: &FleetNodeRow) -> Result<()> {
     sqlx::query(
         "INSERT INTO fleet_nodes (name, ip, ssh_user, ram_gb, cpu_cores, os, role,
                 election_priority, hardware, alt_ips, capabilities, preferences, resources, status,
-                runtime, models_dir, disk_quota_pct, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, NOW())
+                runtime, models_dir, disk_quota_pct,
+                sub_agent_count, gh_account, tooling, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
+                 $18, $19, $20, NOW())
          ON CONFLICT (name) DO UPDATE SET
             ip = EXCLUDED.ip,
             ssh_user = EXCLUDED.ssh_user,
@@ -1487,6 +1516,12 @@ pub async fn pg_upsert_node(pool: &PgPool, node: &FleetNodeRow) -> Result<()> {
             runtime = COALESCE(NULLIF(EXCLUDED.runtime, ''), fleet_nodes.runtime),
             models_dir = COALESCE(NULLIF(EXCLUDED.models_dir, ''), fleet_nodes.models_dir),
             disk_quota_pct = COALESCE(NULLIF(EXCLUDED.disk_quota_pct, 0), fleet_nodes.disk_quota_pct),
+            sub_agent_count = COALESCE(NULLIF(EXCLUDED.sub_agent_count, 0), fleet_nodes.sub_agent_count),
+            gh_account = COALESCE(EXCLUDED.gh_account, fleet_nodes.gh_account),
+            tooling = CASE
+                WHEN EXCLUDED.tooling = '{}'::jsonb THEN fleet_nodes.tooling
+                ELSE EXCLUDED.tooling
+            END,
             updated_at = NOW()",
     )
     .bind(&node.name)
@@ -1506,6 +1541,9 @@ pub async fn pg_upsert_node(pool: &PgPool, node: &FleetNodeRow) -> Result<()> {
     .bind(&node.runtime)
     .bind(&node.models_dir)
     .bind(node.disk_quota_pct)
+    .bind(node.sub_agent_count)
+    .bind(&node.gh_account)
+    .bind(&node.tooling)
     .execute(pool)
     .await?;
     Ok(())
@@ -2182,6 +2220,167 @@ pub async fn pg_list_jobs(pool: &PgPool, status: Option<&str>, limit: i64) -> Re
     }).collect())
 }
 
+// ─── Onboarding: SSH keys + mesh status (schema V12) ──────────────────────
+
+/// One SSH key row for a fleet node.
+#[derive(Debug, Clone)]
+pub struct NodeSshKeyRow {
+    pub node_name: String,
+    pub key_purpose: String,   // 'user' | 'host'
+    pub public_key: String,
+    pub key_type: String,      // 'ed25519' | 'rsa' | 'ecdsa'
+    pub fingerprint: String,
+    pub added_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Upsert a public key for a node. Idempotent on (node_name, fingerprint).
+pub async fn pg_insert_node_ssh_key(
+    pool: &PgPool,
+    node_name: &str,
+    key_purpose: &str,
+    public_key: &str,
+    key_type: &str,
+    fingerprint: &str,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO fleet_node_ssh_keys (node_name, key_purpose, public_key, key_type, fingerprint)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (node_name, fingerprint) DO UPDATE SET
+            public_key = EXCLUDED.public_key,
+            key_type = EXCLUDED.key_type,
+            key_purpose = EXCLUDED.key_purpose",
+    )
+    .bind(node_name)
+    .bind(key_purpose)
+    .bind(public_key)
+    .bind(key_type)
+    .bind(fingerprint)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// List SSH keys for a node (optionally filtered by purpose: 'user' or 'host').
+pub async fn pg_list_node_ssh_keys(
+    pool: &PgPool,
+    node_name: &str,
+    purpose: Option<&str>,
+) -> Result<Vec<NodeSshKeyRow>> {
+    let rows = if let Some(p) = purpose {
+        sqlx::query(
+            "SELECT * FROM fleet_node_ssh_keys
+              WHERE node_name = $1 AND key_purpose = $2
+              ORDER BY added_at",
+        )
+        .bind(node_name)
+        .bind(p)
+        .fetch_all(pool)
+        .await?
+    } else {
+        sqlx::query(
+            "SELECT * FROM fleet_node_ssh_keys WHERE node_name = $1 ORDER BY added_at",
+        )
+        .bind(node_name)
+        .fetch_all(pool)
+        .await?
+    };
+    Ok(rows.iter().map(|r| NodeSshKeyRow {
+        node_name: r.get("node_name"),
+        key_purpose: r.get("key_purpose"),
+        public_key: r.get("public_key"),
+        key_type: r.get("key_type"),
+        fingerprint: r.get("fingerprint"),
+        added_at: r.get("added_at"),
+    }).collect())
+}
+
+/// Delete all SSH keys for a node (used during `ff onboard revoke`).
+pub async fn pg_delete_node_ssh_keys(pool: &PgPool, node_name: &str) -> Result<u64> {
+    let r = sqlx::query("DELETE FROM fleet_node_ssh_keys WHERE node_name = $1")
+        .bind(node_name)
+        .execute(pool)
+        .await?;
+    Ok(r.rows_affected())
+}
+
+/// One row in the mesh-reachability matrix.
+#[derive(Debug, Clone)]
+pub struct MeshStatusRow {
+    pub src_node: String,
+    pub dst_node: String,
+    pub status: String,             // 'ok' | 'failed' | 'pending'
+    pub last_checked: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_error: Option<String>,
+    pub attempts: i32,
+}
+
+/// Upsert one (src, dst) mesh check result.
+pub async fn pg_upsert_mesh_status(
+    pool: &PgPool,
+    src_node: &str,
+    dst_node: &str,
+    status: &str,
+    last_error: Option<&str>,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO fleet_mesh_status (src_node, dst_node, status, last_checked, last_error, attempts)
+         VALUES ($1, $2, $3, NOW(), $4, 1)
+         ON CONFLICT (src_node, dst_node) DO UPDATE SET
+            status = EXCLUDED.status,
+            last_checked = NOW(),
+            last_error = EXCLUDED.last_error,
+            attempts = fleet_mesh_status.attempts + 1",
+    )
+    .bind(src_node)
+    .bind(dst_node)
+    .bind(status)
+    .bind(last_error)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Fetch the full mesh matrix; optionally filter by node (returns rows where
+/// src_node = node OR dst_node = node).
+pub async fn pg_list_mesh_status(
+    pool: &PgPool,
+    node: Option<&str>,
+) -> Result<Vec<MeshStatusRow>> {
+    let rows = if let Some(n) = node {
+        sqlx::query(
+            "SELECT * FROM fleet_mesh_status
+              WHERE src_node = $1 OR dst_node = $1
+              ORDER BY src_node, dst_node",
+        )
+        .bind(n)
+        .fetch_all(pool)
+        .await?
+    } else {
+        sqlx::query("SELECT * FROM fleet_mesh_status ORDER BY src_node, dst_node")
+            .fetch_all(pool)
+            .await?
+    };
+    Ok(rows.iter().map(|r| MeshStatusRow {
+        src_node: r.get("src_node"),
+        dst_node: r.get("dst_node"),
+        status: r.get("status"),
+        last_checked: r.get("last_checked"),
+        last_error: r.get("last_error"),
+        attempts: r.get("attempts"),
+    }).collect())
+}
+
+/// Remove all mesh-status rows involving a given node (used during revoke).
+pub async fn pg_delete_mesh_status_for_node(pool: &PgPool, node: &str) -> Result<u64> {
+    let r = sqlx::query(
+        "DELETE FROM fleet_mesh_status WHERE src_node = $1 OR dst_node = $1",
+    )
+    .bind(node)
+    .execute(pool)
+    .await?;
+    Ok(r.rows_affected())
+}
+
 // ─── Deferred Task Queue ───────────────────────────────────────────────────
 
 /// One row of the deferred_tasks table. Payload/trigger_spec/result/required_caps are free-form JSON.
@@ -2580,6 +2779,9 @@ pub async fn seed_from_fleet_toml(
             runtime: "unknown".into(),
             models_dir: "~/models".into(),
             disk_quota_pct: 80,
+            sub_agent_count: 1,
+            gh_account: None,
+            tooling: serde_json::json!({}),
         };
 
         pg_upsert_node(pool, &node_row).await?;
