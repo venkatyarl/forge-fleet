@@ -242,8 +242,10 @@ pub async fn list_local_processes() -> Vec<RunningProcess> {
         let port = parse_flag_value(rest, "--port")
             .and_then(|v| v.parse::<u16>().ok());
 
-        // Parse --model <path> (llama.cpp / mlx) or positional after `serve` (vllm).
+        // Parse --model <path>, -m <path> (llama-server short form), or positional
+        // after `serve` (vllm).
         let model_path = parse_flag_value(rest, "--model")
+            .or_else(|| parse_flag_value(rest, "-m"))
             .or_else(|| {
                 if runtime == "vllm" {
                     rest.split_once("serve ")
