@@ -329,6 +329,12 @@ pub fn build_router(state: Arc<GatewayState>, mc_db_path: Option<&str>) -> Route
         .route("/api/status", get(fleet_status))
         .route("/api/fleet/enroll", post(fleet_enroll))
         .route("/api/fleet/heartbeat", post(fleet_heartbeat))
+        // Onboarding (see crates/ff-gateway/src/onboard.rs + plan §§3–3h)
+        .route("/onboard/bootstrap.sh", get(crate::onboard::bootstrap_script))
+        .route("/api/fleet/self-enroll", post(crate::onboard::self_enroll))
+        .route("/api/fleet/enrollment-progress", post(crate::onboard::enrollment_progress))
+        .route("/api/fleet/check-ip", get(crate::onboard::check_ip))
+        .route("/api/fleet/check-tcp", get(crate::onboard::check_tcp))
         .route(
             "/api/transports/telegram/status",
             get(telegram_transport_status),

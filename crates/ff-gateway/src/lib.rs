@@ -13,6 +13,7 @@ pub mod discord;
 pub mod embed;
 pub mod message;
 pub mod middleware;
+pub mod onboard;
 pub mod router;
 pub mod server;
 pub mod static_files;

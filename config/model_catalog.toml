@@ -792,3 +792,25 @@ preferred_workloads = ["vision", "chat"]
   quant = "4bit"
   hf_repo = "mlx-community/llava-v1.6-mistral-7b-4bit"
   size_gb = 4.4
+
+# ---------------------------------------------------------------------------
+# MOSS-Audio — OpenMOSS-Team's 8B audio-thinking model (speech + reasoning)
+# ---------------------------------------------------------------------------
+
+[[models]]
+id = "moss-audio-8b-thinking"
+name = "MOSS-Audio-8B-Thinking"
+family = "moss"
+parameters = "8B"
+tier = 1
+description = "OpenMOSS audio-input multimodal LLM with chain-of-thought. Speech+text reasoning."
+gated = false
+preferred_workloads = ["audio", "reasoning", "multimodal"]
+
+  # Only vllm/safetensors variant known today. MLX conversion must be
+  # produced locally via `ff model convert` if Taylor wants to run it with mlx.
+  [[models.variants]]
+  runtime = "vllm"
+  quant = "fp16"
+  hf_repo = "OpenMOSS-Team/MOSS-Audio-8B-Thinking"
+  size_gb = 16
