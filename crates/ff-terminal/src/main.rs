@@ -482,10 +482,10 @@ async fn run_tui(config: AgentSessionConfig) -> Result<()> {
     let commands = CommandRegistry::new();
     let mut command_list: Vec<(&str, &str)> = commands.list();
     // Add built-in TUI commands
-    command_list.push(("/new", "Start a new session tab"));
-    command_list.push(("/memory", "Search across all memory layers: /memory <query>"));
-    command_list.push(("/search", "Search memory: /search <query>"));
-    command_list.push(("/help", "Show available commands"));
+    command_list.push(("new", "Start a new session tab"));
+    command_list.push(("memory", "Search across all memory layers: /memory <query>"));
+    command_list.push(("search", "Search memory: /search <query>"));
+    command_list.push(("help", "Show available commands"));
     command_list.sort();
 
     // Async fleet health check on startup
@@ -830,14 +830,21 @@ async fn run_event_loop(
                     (KeyCode::Right, _) => app.tab_mut().input.move_right(),
                     (KeyCode::Home, _) => app.tab_mut().input.home(),
                     (KeyCode::End, _) => app.tab_mut().input.end(),
-                    // Up/Down: navigate within multi-line input first, else history.
+                    // Up/Down: priority order:
+                    //   1. If suggestions popup is open → cycle through suggestions
+                    //   2. Else if multi-line input → navigate within input
+                    //   3. Else → history nav
                     (KeyCode::Up, _) => {
-                        if !app.tab_mut().input.move_line_up() {
+                        if !app.tab().input.suggestions.is_empty() {
+                            app.tab_mut().input.prev_suggestion();
+                        } else if !app.tab_mut().input.move_line_up() {
                             app.tab_mut().input.history_up();
                         }
                     }
                     (KeyCode::Down, _) => {
-                        if !app.tab_mut().input.move_line_down() {
+                        if !app.tab().input.suggestions.is_empty() {
+                            app.tab_mut().input.next_suggestion();
+                        } else if !app.tab_mut().input.move_line_down() {
                             app.tab_mut().input.history_down();
                         }
                     }
@@ -2875,6 +2882,13 @@ fn trunc_for_status(s: &str, max: usize) -> String {
 async fn probe_online_nodes(nodes: &[ff_db::FleetNodeRow]) -> Vec<String> {
     use tokio::net::TcpStream;
     use tokio::time::{timeout, Duration as TokDuration};
+    // KNOWN LIMITATION: this probes SSH port 22, which means a node with its
+    // OS up but its `ff daemon` dead will still appear online. As a result, the
+    // Redis `fleet:node_online` publish only fires on OS-level transitions, not
+    // daemon-level transitions. Proper fix would be a Redis heartbeat key per
+    // daemon (TTL 30s) that workers refresh; the scheduler would read those
+    // keys instead of SSH-probing. Out of scope for now — the 15s defer poll
+    // catches daemon-only restarts within one cycle.
     let mut handles = Vec::new();
     for n in nodes {
         let name = n.name.clone();

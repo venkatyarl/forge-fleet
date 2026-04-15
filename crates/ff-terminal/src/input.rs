@@ -214,16 +214,26 @@ impl InputState {
     }
 
     /// Compute slash command suggestions.
+    ///
+    /// Collapses any number of leading slashes (treating `//`, `///`, etc. as `/`),
+    /// so `//help` produces the same suggestions as `/help`. Command names in the
+    /// list may defensively start with a leading `/` — it is stripped before
+    /// prefix-matching and re-added exactly once in the formatted output.
     pub fn compute_suggestions(&mut self, commands: &[(&str, &str)]) {
         self.suggestions.clear();
         self.suggestion_index = None;
 
         if !self.text.starts_with('/') { return; }
 
-        let prefix = self.text[1..].to_ascii_lowercase();
+        // Strip ALL leading slashes from the typed input before computing the
+        // prefix, so `//he` and `///he` behave like `/he`.
+        let prefix = self.text.trim_start_matches('/').to_ascii_lowercase();
         for (name, desc) in commands {
-            if name.starts_with(&prefix) || prefix.is_empty() {
-                self.suggestions.push(format!("/{name} — {desc}"));
+            // Defensively strip a leading slash from the command name too, in
+            // case a caller registered `/foo` — we want to match against `foo`.
+            let name_clean = name.trim_start_matches('/');
+            if name_clean.starts_with(&prefix) || prefix.is_empty() {
+                self.suggestions.push(format!("/{name_clean} — {desc}"));
             }
         }
     }
@@ -234,11 +244,17 @@ impl InputState {
     }
 
     /// Accept the current suggestion.
+    ///
+    /// Replaces the input with the chosen command followed by a single space.
+    /// Normalizes the leading slashes so the result always begins with exactly
+    /// one `/`, regardless of how many slashes the user typed or whether the
+    /// stored command name itself contained a leading slash.
     pub fn accept_suggestion(&mut self) {
         if let Some(idx) = self.suggestion_index {
             if let Some(suggestion) = self.suggestions.get(idx) {
                 if let Some(cmd) = suggestion.split(' ').next() {
-                    self.text = format!("{cmd} ");
+                    let cmd_clean = cmd.trim_start_matches('/');
+                    self.text = format!("/{cmd_clean} ");
                     self.cursor = self.text.len();
                 }
             }
@@ -246,12 +262,98 @@ impl InputState {
         self.clear_suggestions();
     }
 
-    /// Cycle through suggestions.
+    /// Cycle forward through suggestions.
     pub fn next_suggestion(&mut self) {
         if self.suggestions.is_empty() { return; }
         self.suggestion_index = Some(match self.suggestion_index {
             None => 0,
             Some(i) => (i + 1) % self.suggestions.len(),
         });
+    }
+
+    /// Cycle backward through suggestions.
+    pub fn prev_suggestion(&mut self) {
+        if self.suggestions.is_empty() { return; }
+        let len = self.suggestions.len();
+        self.suggestion_index = Some(match self.suggestion_index {
+            None => len - 1,
+            Some(0) => len - 1,
+            Some(i) => i - 1,
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cmds() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("help", "Show available commands"),
+            ("hooks", "Manage hooks"),
+            ("memory", "Search memory"),
+            ("new", "New session"),
+            ("search", "Search"),
+        ]
+    }
+
+    fn make(text: &str) -> InputState {
+        let mut s = InputState::new();
+        s.text = text.to_string();
+        s.cursor = s.text.len();
+        s
+    }
+
+    #[test]
+    fn single_slash_matches() {
+        let mut s = make("/h");
+        s.compute_suggestions(&cmds());
+        assert!(s.suggestions.iter().any(|x| x.starts_with("/help ")));
+        assert!(s.suggestions.iter().any(|x| x.starts_with("/hooks ")));
+        // No double-slash entries.
+        assert!(s.suggestions.iter().all(|x| !x.starts_with("//")));
+    }
+
+    #[test]
+    fn double_slash_behaves_like_single() {
+        let mut single = make("/h");
+        single.compute_suggestions(&cmds());
+        let mut double = make("//h");
+        double.compute_suggestions(&cmds());
+        assert_eq!(single.suggestions, double.suggestions);
+        assert!(double.suggestions.iter().all(|x| !x.starts_with("//")));
+    }
+
+    #[test]
+    fn triple_slash_behaves_like_single() {
+        let mut single = make("/");
+        single.compute_suggestions(&cmds());
+        let mut triple = make("///");
+        triple.compute_suggestions(&cmds());
+        assert_eq!(single.suggestions, triple.suggestions);
+    }
+
+    #[test]
+    fn accept_suggestion_produces_one_slash() {
+        let mut s = make("//he");
+        s.compute_suggestions(&cmds());
+        s.suggestion_index = Some(0);
+        s.accept_suggestion();
+        assert!(s.text.starts_with('/'));
+        assert!(!s.text.starts_with("//"));
+        assert!(s.text.ends_with(' '));
+        assert_eq!(s.text, "/help ");
+    }
+
+    #[test]
+    fn accept_suggestion_normalizes_slashy_command_names() {
+        // Defensive: even if a registered name begins with `/`, accept should
+        // still yield exactly one leading slash.
+        let cmds: Vec<(&str, &str)> = vec![("/help", "Show")];
+        let mut s = make("//he");
+        s.compute_suggestions(&cmds);
+        s.suggestion_index = Some(0);
+        s.accept_suggestion();
+        assert_eq!(s.text, "/help ");
     }
 }
