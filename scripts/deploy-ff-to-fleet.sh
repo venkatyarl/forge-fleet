@@ -27,7 +27,9 @@ conn = psycopg2.connect(os.environ['PGURL'])
 cur = conn.cursor()
 cur.execute(\"\"\"
     SELECT name, ip, ssh_user, runtime FROM fleet_nodes
-     WHERE runtime = 'llama.cpp'
+     -- Skip macOS hosts (Taylor, Ace) — those need local cargo+launchd setup.
+     -- All Linux hosts get SSH+rebuild regardless of their llama.cpp/vllm tag.
+     WHERE LOWER(os) NOT LIKE 'macos%'
      ORDER BY election_priority, name
 \"\"\")
 for r in cur.fetchall():
