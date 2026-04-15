@@ -16,7 +16,7 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.forgefleet.daemon</string>
+    <string>com.forgefleet.ffdaemon</string>
 
     <key>ProgramArguments</key>
     <array>
@@ -36,7 +36,7 @@
         <key>HOME</key>
         <string>/Users/venkat</string>
         <key>PATH</key>
-        <string>/Users/venkat/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <string>/Users/venkat/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/usr/sbin:/bin:/sbin</string>
     </dict>
 
     <key>WorkingDirectory</key>

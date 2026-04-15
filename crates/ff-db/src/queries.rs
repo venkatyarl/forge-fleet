@@ -2374,18 +2374,31 @@ pub async fn pg_scheduler_pass(
 
 /// Atomic worker claim: grab one dispatchable task that matches the worker's capabilities.
 /// Uses FOR UPDATE SKIP LOCKED for race-free multi-worker claim semantics.
+///
+/// Claim precedence:
+///   1. Tasks whose `preferred_node` matches this worker (the "home" worker claims)
+///   2. Tasks with `preferred_node IS NULL` (any worker can handle)
+///   3. Tasks whose `preferred_node` is set to a DIFFERENT node, but the task has
+///      been `dispatchable` for >2 minutes — assume the preferred node has no
+///      live worker and let any other worker pick it up and route via SSH.
 pub async fn pg_claim_deferred(
     pool: &PgPool,
     worker_node: &str,
 ) -> Result<Option<DeferredTaskRow>> {
     let mut tx = pool.begin().await?;
-    // Prefer tasks with preferred_node = worker_node first, then any node.
     let row = sqlx::query(
         "SELECT * FROM deferred_tasks
           WHERE status = 'dispatchable'
-            AND (preferred_node IS NULL OR preferred_node = $1)
+            AND (
+                 preferred_node IS NULL
+              OR preferred_node = $1
+              OR next_attempt_at <= NOW() - INTERVAL '2 minutes'
+            )
             AND (next_attempt_at IS NULL OR next_attempt_at <= NOW())
-          ORDER BY (preferred_node = $1) DESC NULLS LAST, created_at ASC
+          ORDER BY
+            (preferred_node = $1) DESC NULLS LAST,
+            (preferred_node IS NULL) DESC,
+            created_at ASC
           FOR UPDATE SKIP LOCKED
           LIMIT 1",
     )
