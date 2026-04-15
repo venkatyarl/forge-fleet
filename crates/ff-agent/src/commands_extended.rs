@@ -170,12 +170,31 @@ struct PermissionsCommand;
 #[async_trait]
 impl Command for PermissionsCommand {
     fn name(&self) -> &str { "permissions" }
-    fn description(&self) -> &str { "Show or change permission mode" }
-    async fn execute(&self, args: &str, _session: &mut AgentSession) -> String {
-        if args.is_empty() {
-            return "Permission modes: default, accept_edits, bypass, plan\nUsage: /permissions <mode>".into();
+    fn description(&self) -> &str { "Show or change permission mode (default|accept_edits|bypass|plan)" }
+    async fn execute(&self, args: &str, session: &mut AgentSession) -> String {
+        let arg = args.trim();
+        if arg.is_empty() {
+            return format!(
+                "Current permission mode: {}\n\
+                 Modes:\n  \
+                   default      — allow reads, ask on writes/exec (no UI prompts yet — behaves like bypass in headless loop)\n  \
+                   accept_edits — auto-accept edits (headless: same as default)\n  \
+                   bypass       — allow everything (headless: same as default)\n  \
+                   plan         — only read-only tools run; mutating tools are blocked\n\
+                 Usage: /permissions <mode>",
+                session.config.permission_mode
+            );
         }
-        format!("Permission mode set to: {args}")
+        let mode = arg.to_lowercase();
+        match mode.as_str() {
+            "default" | "accept_edits" | "bypass" | "plan" => {
+                session.config.permission_mode = mode.clone();
+                format!("Permission mode set to: {mode}")
+            }
+            _ => format!(
+                "Invalid mode: '{arg}'. Valid modes: default, accept_edits, bypass, plan"
+            ),
+        }
     }
 }
 
@@ -469,11 +488,27 @@ struct OutputStyleCommand;
 #[async_trait]
 impl Command for OutputStyleCommand {
     fn name(&self) -> &str { "output-style" }
-    fn description(&self) -> &str { "Set output style (concise/normal/verbose)" }
-    async fn execute(&self, args: &str, _session: &mut AgentSession) -> String {
-        match args {
-            "concise" | "normal" | "verbose" => format!("Output style set to: {args}"),
-            _ => "Usage: /output-style concise|normal|verbose".into(),
+    fn description(&self) -> &str { "Set output verbosity (concise|normal|verbose)" }
+    async fn execute(&self, args: &str, session: &mut AgentSession) -> String {
+        let arg = args.trim();
+        if arg.is_empty() {
+            return format!(
+                "Current output style: {}\n\
+                 Styles:\n  \
+                   concise — terse replies, no preamble, ≤ 3 sentences\n  \
+                   normal  — default behavior\n  \
+                   verbose — walk through reasoning step by step\n\
+                 Usage: /output-style <style>",
+                session.config.output_style
+            );
+        }
+        let style = arg.to_lowercase();
+        match style.as_str() {
+            "concise" | "normal" | "verbose" => {
+                session.config.output_style = style.clone();
+                format!("Output style set to: {style} (takes effect on next request)")
+            }
+            _ => format!("Invalid style: '{arg}'. Valid styles: concise, normal, verbose"),
         }
     }
 }

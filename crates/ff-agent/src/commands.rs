@@ -344,9 +344,20 @@ struct PlanCommand;
 #[async_trait]
 impl Command for PlanCommand {
     fn name(&self) -> &str { "plan" }
-    fn description(&self) -> &str { "Enter plan mode (read-only exploration)" }
-    async fn execute(&self, _args: &str, _session: &mut AgentSession) -> String {
-        "Plan mode entered. Focus on reading and exploring. Use /plan again to exit.".into()
+    fn description(&self) -> &str { "Toggle plan mode (read-only exploration). `/plan exit` forces off." }
+    async fn execute(&self, args: &str, session: &mut AgentSession) -> String {
+        let arg = args.trim().to_lowercase();
+        if arg == "exit" || arg == "off" {
+            session.config.permission_mode = "default".into();
+            return "Plan mode OFF. Permission mode: default (mutating tools allowed again).".into();
+        }
+        if session.config.permission_mode == "plan" {
+            session.config.permission_mode = "default".into();
+            "Plan mode OFF. Permission mode: default.".into()
+        } else {
+            session.config.permission_mode = "plan".into();
+            "Plan mode ON. Only read-only tools (Read, Glob, Grep, WebFetch, WebSearch, ToolSearch, TaskList/Get, fleet_* read-only) will run. Mutating tools are blocked. Use /plan again to exit.".into()
+        }
     }
 }
 

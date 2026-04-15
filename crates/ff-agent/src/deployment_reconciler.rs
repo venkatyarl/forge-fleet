@@ -61,14 +61,38 @@ pub async fn reconcile_local(pool: &sqlx::PgPool) -> Result<ReconcileSummary, St
         let status = if healthy { "healthy" } else { "unhealthy" };
 
         if let Some(&existing) = db_by_port.get(&port_i32) {
-            // Refresh existing row.
+            // Refresh existing row. ALSO backfill library_id / catalog_id when
+            // missing — covers the common case where the deployment was adopted
+            // before the library was scanned.
+            let needs_backfill = existing.library_id.is_none() || existing.catalog_id.is_none();
+            let (lib_id_str, cat_id_str): (Option<String>, Option<String>) = if needs_backfill {
+                if let Some(mp) = &proc_info.model_path {
+                    match_library_to_path(&libs, mp)
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            };
+
+            // COALESCE in SQL: keep existing value when our match returned None.
+            let lib_uuid: Option<sqlx::types::Uuid> = lib_id_str
+                .as_deref()
+                .and_then(|s| sqlx::types::Uuid::parse_str(s).ok());
+
             if let Err(e) = sqlx::query(
                 "UPDATE fleet_model_deployments
-                    SET health_status = $1, last_health_at = NOW(), pid = $2
-                  WHERE id = $3::uuid",
+                    SET health_status = $1,
+                        last_health_at = NOW(),
+                        pid = $2,
+                        library_id = COALESCE(library_id, $3),
+                        catalog_id = COALESCE(catalog_id, $4)
+                  WHERE id = $5::uuid",
             )
             .bind(status)
             .bind(proc_info.pid as i32)
+            .bind(lib_uuid)
+            .bind(cat_id_str)
             .bind(&existing.id)
             .execute(pool)
             .await

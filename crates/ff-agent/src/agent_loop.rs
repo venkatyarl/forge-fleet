@@ -66,6 +66,16 @@ pub struct AgentSessionConfig {
     /// active LLM endpoint per turn, with automatic fleet failover.
     /// Falls back to `llm_base_url` if not set (backwards compat).
     pub inference_router: Option<Arc<InferenceRouter>>,
+    /// Permission mode: "default" | "accept_edits" | "bypass" | "plan".
+    ///
+    /// In "plan" mode, mutating tools (Bash, Edit, Write, NotebookEdit, etc.)
+    /// are blocked at dispatch; only read-only tools run. "accept_edits" and
+    /// "bypass" are recognized for forward compatibility and behave the same as
+    /// "default" in the headless agent loop (there is no confirmation UI yet).
+    pub permission_mode: String,
+    /// Output verbosity hint appended to the system prompt at the start of each
+    /// run. Values: "concise" | "normal" | "verbose".
+    pub output_style: String,
 }
 
 impl Default for AgentSessionConfig {
@@ -84,7 +94,45 @@ impl Default for AgentSessionConfig {
             memory_scope: None,
             inference_router: None,
             image_path: None,
+            permission_mode: "default".into(),
+            output_style: "normal".into(),
         }
+    }
+}
+
+/// Read-only tools permitted while `permission_mode == "plan"`.
+///
+/// Anything not in this set is blocked at tool dispatch and returns a
+/// synthetic tool result telling the LLM to exit plan mode.
+pub(crate) const PLAN_MODE_READ_ONLY_TOOLS: &[&str] = &[
+    "Read", "Glob", "Grep", "WebFetch", "WebSearch", "ToolSearch",
+    "TaskList", "TaskGet",
+    "fleet_status", "fleet_nodes_db", "fleet_models_db",
+    "fleet_models_catalog", "fleet_models_search",
+    "fleet_models_library", "fleet_models_deployments",
+    "fleet_models_disk_usage",
+];
+
+/// Returns the blocked-tool synthetic result string, or None if the tool is
+/// allowed under the current permission mode.
+pub(crate) fn plan_mode_block(permission_mode: &str, tool_name: &str) -> Option<String> {
+    if permission_mode == "plan" && !PLAN_MODE_READ_ONLY_TOOLS.contains(&tool_name) {
+        Some(format!(
+            "blocked: plan mode forbids mutating tools (attempted: {tool_name}). \
+             Use /plan to exit plan mode, then retry."
+        ))
+    } else {
+        None
+    }
+}
+
+/// Translate the configured output_style into a one-line directive appended to
+/// the system prompt. Returns an empty string for "normal" (no addition).
+pub(crate) fn output_style_directive(output_style: &str) -> &'static str {
+    match output_style {
+        "concise" => "\n\n## Output Style\nReply tersely. No preamble, no recap, no more than 3 sentences unless the user asks for detail.",
+        "verbose" => "\n\n## Output Style\nWalk the user through your reasoning step by step. Show your work.",
+        _ => "",
     }
 }
 
@@ -187,6 +235,35 @@ impl AgentSession {
         prompt: &str,
         event_tx: Option<mpsc::UnboundedSender<AgentEvent>>,
     ) -> AgentOutcome {
+        // Re-apply output-style directive to the system prompt on every run,
+        // so `/output-style` changes take effect on the NEXT request.
+        if let Some(sys_msg) = self.messages.first_mut() {
+            if let Some(current) = sys_msg.text_content().map(String::from) {
+                // Strip any previously-applied directive (marker-bounded).
+                const START: &str = "\n\n<!--ff:output_style-->";
+                const END: &str = "<!--/ff:output_style-->";
+                let base = if let (Some(s), Some(e)) = (current.find(START), current.find(END)) {
+                    if e > s {
+                        let mut b = String::new();
+                        b.push_str(&current[..s]);
+                        b.push_str(&current[e + END.len()..]);
+                        b
+                    } else {
+                        current.clone()
+                    }
+                } else {
+                    current.clone()
+                };
+                let directive = output_style_directive(&self.config.output_style);
+                let new_prompt = if directive.is_empty() {
+                    base
+                } else {
+                    format!("{base}{START}{directive}{END}")
+                };
+                *sys_msg = ToolChatMessage::system(new_prompt);
+            }
+        }
+
         // Load three-brain memory and inject into system prompt (first turn only)
         if self.turn_count == 0 {
             let brain_ctx = crate::brain::BrainLoader::load_for_dir(&self.config.working_dir).await;
@@ -715,11 +792,28 @@ async fn run_agent_loop(
         if tool_calls.len() > 1 {
             // Parallel execution using futures::join_all
             let mut futures = Vec::new();
+            // Pre-computed plan-mode blocks (no spawn needed).
+            let mut pre_blocked: Vec<(String, String, bool)> = Vec::new();
 
             for tc in &tool_calls {
                 let tool_name = tc.function.name.clone();
                 let tool_id = tc.id.clone();
                 let args_str = tc.function.arguments.clone();
+
+                // Plan-mode gate: short-circuit without spawning.
+                if let Some(blocked_msg) = plan_mode_block(&session.config.permission_mode, &tool_name) {
+                    emit(&event_tx, AgentEvent::ToolEnd {
+                        session_id: session_id.clone(),
+                        tool_name: tool_name.clone(),
+                        tool_id: tool_id.clone(),
+                        result: blocked_msg.clone(),
+                        is_error: true,
+                        duration_ms: 0,
+                    });
+                    pre_blocked.push((tool_id, blocked_msg, true));
+                    continue;
+                }
+
                 let ctx = tool_ctx_arc.clone();
                 let tools_clone = session.tools.clone();
                 let event_tx_clone = event_tx.clone();
@@ -731,6 +825,12 @@ async fn run_agent_loop(
                         &tools_clone, &ctx, &event_tx_clone, &sid,
                     ).await
                 }));
+            }
+
+            // Record pre-blocked results first
+            for (tool_id, content, is_error) in pre_blocked {
+                if is_error { session.consecutive_errors += 1; }
+                tool_results.push((tool_id, content));
             }
 
             let results = futures::future::join_all(futures).await;
@@ -794,6 +894,25 @@ async fn run_agent_loop(
                     }
                 },
             };
+
+            // --- Plan-mode gate: block mutating tools before dispatch ---
+            if let Some(blocked_msg) = plan_mode_block(&session.config.permission_mode, &tool_name) {
+                emit(
+                    &event_tx,
+                    AgentEvent::ToolEnd {
+                        session_id: session_id.clone(),
+                        tool_name: tool_name.clone(),
+                        tool_id: tool_id.clone(),
+                        result: blocked_msg.clone(),
+                        is_error: true,
+                        duration_ms: 0,
+                    },
+                );
+                session
+                    .messages
+                    .push(ToolChatMessage::tool_result(&tool_id, &blocked_msg));
+                continue;
+            }
 
             // Find and execute tool
             if let Some(idx) = tools::find_tool_arc(&tool_name, &session.tools) {
