@@ -895,6 +895,7 @@ dependencies = [
  "ff-security",
  "futures",
  "glob",
+ "redis",
  "reqwest",
  "serde",
  "serde_json",

@@ -59,17 +59,24 @@ fi
 command -v cargo >/dev/null || { echo "ERROR: no cargo on PATH (install rustup first)"; exit 1; }
 
 # 2. Ensure repo is present and up-to-date.
+mkdir -p ~/taylorProjects
 if [ ! -d ~/taylorProjects/forge-fleet/.git ]; then
-    echo "ERROR: ~/taylorProjects/forge-fleet not a git repo"
-    exit 1
+    echo "no .git — cloning fresh"
+    rm -rf ~/taylorProjects/forge-fleet
+    git clone --depth 50 https://github.com/taylor-oclaw/forge-fleet.git ~/taylorProjects/forge-fleet 2>&1 | tail -3
 fi
 cd ~/taylorProjects/forge-fleet
-git pull --ff-only 2>&1 | tail -3
+git fetch origin main 2>&1 | tail -2
+git reset --hard origin/main 2>&1 | tail -1
 
 # 3. Build.
 cargo build -p ff-terminal --release 2>&1 | tail -2
 
-# 4. Install.
+# 4. Install — fail loudly if build didn't produce a binary.
+if [ ! -x target/release/ff ]; then
+    echo "ERROR: target/release/ff missing after build — see compile errors above"
+    exit 1
+fi
 mkdir -p ~/.local/bin
 install -m 755 target/release/ff ~/.local/bin/ff
 ~/.local/bin/ff --version

@@ -107,7 +107,25 @@ enum Command {
 }
 
 #[derive(Debug, Clone, Subcommand)]
-enum ConfigCommand { Show, Set { key: String, value: String } }
+enum ConfigCommand {
+    /// Show the local project config (TOML).
+    Show,
+    /// Set a dotted key in the local project config (TOML).
+    Set { key: String, value: String },
+    /// Configure properties of a fleet node in Postgres.
+    /// Supported keys: runtime (mlx|llama.cpp|vllm|unknown), models_dir, disk_quota_pct.
+    Node {
+        /// Node name (e.g. "marcus").
+        name: String,
+        /// Property to set.
+        #[arg(value_parser = ["runtime", "models_dir", "disk_quota_pct"])]
+        key: String,
+        /// New value for the property.
+        value: String,
+    },
+    /// Show per-node configuration (runtime, models_dir, disk_quota_pct).
+    Nodes,
+}
 
 #[derive(Debug, Clone, Subcommand)]
 enum DeferCommand {
@@ -308,7 +326,7 @@ async fn main() -> Result<()> {
         Some(Command::Daemon { as_node, scheduler, defer_interval, disk_interval, reconcile_interval, once }) => {
             return handle_daemon(as_node.clone(), *scheduler, *defer_interval, *disk_interval, *reconcile_interval, *once).await;
         }
-        Some(Command::Config  { command }) => return handle_config(command.clone(), &config_path),
+        Some(Command::Config  { command }) => return handle_config(command.clone(), &config_path).await,
         Some(Command::Status)              => return handle_status(&config_path).await,
         Some(Command::Nodes)               => return handle_nodes(&config_path),
         _ => {}
@@ -378,7 +396,7 @@ async fn main() -> Result<()> {
         Some(Command::Health) => handle_health(&agent_config).await,
         Some(Command::Proxy { port }) => { println!("{CYAN}▶ Starting LLM proxy on 0.0.0.0:{port}{RESET}"); Ok(()) }
         Some(Command::Discover { subnet }) => { println!("{CYAN}▶ Discovering nodes on {subnet}{RESET}"); Ok(()) }
-        Some(Command::Config { command }) => handle_config(command, &config_path),
+        Some(Command::Config { command }) => handle_config(command, &config_path).await,
         Some(Command::Version) => { println!("ff {}", env!("CARGO_PKG_VERSION")); Ok(()) }
         Some(Command::Run { prompt, output, max_turns }) => {
             let mut cfg = agent_config; cfg.max_turns = max_turns;
@@ -3027,6 +3045,22 @@ async fn handle_defer_worker(
     println!("  interval:  {interval}s");
     println!("  mode:      {}", if once { "single-pass" } else { "continuous" });
 
+    // Subscribe to fleet:node_online so this worker wakes instantly when
+    // the scheduler reports that this node is back online.
+    let (wake_tx, mut wake_rx) = tokio::sync::mpsc::channel::<()>(8);
+    if !once {
+        let my_node = worker_name.clone();
+        tokio::spawn(async move {
+            use futures::StreamExt;
+            let mut stream = ff_agent::fleet_events::subscribe_node_online();
+            while let Some(node) = stream.next().await {
+                if node.eq_ignore_ascii_case(&my_node) {
+                    let _ = wake_tx.try_send(());
+                }
+            }
+        });
+    }
+
     loop {
         let pass_start = std::time::Instant::now();
         let ran_any = defer_pass(&pool, &worker_name, scheduler).await? > 0;
@@ -3039,7 +3073,12 @@ async fn handle_defer_worker(
         let elapsed = pass_start.elapsed();
         let sleep_for = Duration::from_secs(interval).saturating_sub(elapsed);
         if !ran_any && sleep_for.as_millis() > 0 {
-            tokio::time::sleep(sleep_for).await;
+            tokio::select! {
+                _ = tokio::time::sleep(sleep_for) => {}
+                Some(_) = wake_rx.recv() => {
+                    println!("{CYAN}[worker]{RESET} woken by fleet:node_online");
+                }
+            }
         } else if sleep_for.as_millis() > 0 {
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
@@ -3057,6 +3096,41 @@ async fn defer_pass(
         match ff_db::pg_list_nodes(pool).await {
             Ok(nodes) => {
                 let online = probe_online_nodes(&nodes).await;
+
+                // Detect online/offline transitions and publish to Redis so
+                // workers on newly-online nodes can wake up immediately
+                // instead of waiting for the next poll tick.
+                static LAST_ONLINE: std::sync::OnceLock<
+                    std::sync::Mutex<std::collections::HashSet<String>>,
+                > = std::sync::OnceLock::new();
+                let last_online = LAST_ONLINE
+                    .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+                let current: std::collections::HashSet<String> =
+                    online.iter().cloned().collect();
+                let (newly_online, newly_offline) = {
+                    let mut prev = last_online.lock().unwrap();
+                    let newly_online: Vec<String> =
+                        current.difference(&*prev).cloned().collect();
+                    let newly_offline: Vec<String> =
+                        prev.difference(&current).cloned().collect();
+                    *prev = current.clone();
+                    (newly_online, newly_offline)
+                };
+                for n in &newly_online {
+                    if let Err(e) = ff_agent::fleet_events::publish_node_online(n).await {
+                        eprintln!("{YELLOW}[sched] publish_node_online({n}): {e}{RESET}");
+                    } else {
+                        println!("{CYAN}[sched]{RESET} node online → {n} (published)");
+                    }
+                }
+                for n in &newly_offline {
+                    if let Err(e) = ff_agent::fleet_events::publish_node_offline(n).await {
+                        eprintln!("{YELLOW}[sched] publish_node_offline({n}): {e}{RESET}");
+                    } else {
+                        println!("{CYAN}[sched]{RESET} node offline → {n} (published)");
+                    }
+                }
+
                 let now = chrono::Utc::now();
                 match ff_db::pg_scheduler_pass(pool, &online, now).await {
                     Ok(n) if n > 0 => {
@@ -3206,9 +3280,32 @@ async fn handle_daemon(
         Err(e) => eprintln!("{RED}[reconcile] error: {e}{RESET}"),
     }
 
+    // Subscribe to fleet:node_online so the daemon runs an immediate
+    // defer_pass when this node comes back online (instant wake-up
+    // instead of waiting for the next defer_tick).
+    let (wake_tx, mut wake_rx) = tokio::sync::mpsc::channel::<()>(8);
+    {
+        let my_node = worker_name.clone();
+        tokio::spawn(async move {
+            use futures::StreamExt;
+            let mut stream = ff_agent::fleet_events::subscribe_node_online();
+            while let Some(node) = stream.next().await {
+                if node.eq_ignore_ascii_case(&my_node) {
+                    let _ = wake_tx.try_send(());
+                }
+            }
+        });
+    }
+
     loop {
         tokio::select! {
             _ = defer_tick.tick() => {
+                if let Err(e) = defer_pass(&pool, &worker_name, scheduler).await {
+                    eprintln!("{RED}[defer] pass error: {e}{RESET}");
+                }
+            }
+            Some(_) = wake_rx.recv() => {
+                println!("{CYAN}[defer]{RESET} woken by fleet:node_online");
                 if let Err(e) = defer_pass(&pool, &worker_name, scheduler).await {
                     eprintln!("{RED}[defer] pass error: {e}{RESET}");
                 }
@@ -3373,7 +3470,7 @@ async fn handle_task(cmd: TaskCommand, _config_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn handle_config(cmd: ConfigCommand, p: &Path) -> Result<()> {
+async fn handle_config(cmd: ConfigCommand, p: &Path) -> Result<()> {
     match cmd {
         ConfigCommand::Show => { let c = load_config(p)?; println!("{}", toml::to_string_pretty(&c)?.trim_end()); Ok(()) }
         ConfigCommand::Set { key, value } => {
@@ -3385,6 +3482,54 @@ fn handle_config(cmd: ConfigCommand, p: &Path) -> Result<()> {
             if let Some(parent) = p.parent() { fs::create_dir_all(parent)?; }
             fs::write(p, toml::to_string_pretty(&c)?)?;
             println!("{GREEN}✓{RESET} {key}={value}"); Ok(())
+        }
+        ConfigCommand::Nodes => {
+            let pool = ff_agent::fleet_info::get_fleet_pool()
+                .await
+                .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
+            ff_db::run_postgres_migrations(&pool).await
+                .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
+            let nodes = ff_db::pg_list_nodes(&pool).await?;
+            if nodes.is_empty() { println!("(no fleet nodes registered)"); return Ok(()); }
+            println!("{:<12} {:<12} {:<24} {:>14}", "NODE", "RUNTIME", "MODELS_DIR", "DISK_QUOTA_PCT");
+            for n in &nodes {
+                println!("{:<12} {:<12} {:<24} {:>14}", n.name, n.runtime, n.models_dir, n.disk_quota_pct);
+            }
+            Ok(())
+        }
+        ConfigCommand::Node { name, key, value } => {
+            let pool = ff_agent::fleet_info::get_fleet_pool()
+                .await
+                .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
+            ff_db::run_postgres_migrations(&pool).await
+                .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
+            let mut row = ff_db::pg_get_node(&pool, &name).await?
+                .ok_or_else(|| anyhow::anyhow!("node '{name}' not found in fleet_nodes"))?;
+            match key.as_str() {
+                "runtime" => {
+                    let allowed = ["mlx", "llama.cpp", "vllm", "unknown"];
+                    if !allowed.contains(&value.as_str()) {
+                        anyhow::bail!("runtime must be one of: mlx, llama.cpp, vllm, unknown");
+                    }
+                    row.runtime = value.clone();
+                }
+                "models_dir" => {
+                    if value.trim().is_empty() { anyhow::bail!("models_dir must be non-empty"); }
+                    row.models_dir = value.clone();
+                }
+                "disk_quota_pct" => {
+                    let n: i32 = value.parse()
+                        .map_err(|_| anyhow::anyhow!("disk_quota_pct must be an integer 1-100"))?;
+                    if !(1..=100).contains(&n) {
+                        anyhow::bail!("disk_quota_pct must be between 1 and 100");
+                    }
+                    row.disk_quota_pct = n;
+                }
+                _ => anyhow::bail!("unsupported key '{key}' (use runtime, models_dir, or disk_quota_pct)"),
+            }
+            ff_db::pg_upsert_node(&pool, &row).await?;
+            println!("{GREEN}✓{RESET} Updated {name}.{key} = {value}");
+            Ok(())
         }
     }
 }

@@ -23,6 +23,7 @@ dashmap.workspace = true
 dirs = "5"
 futures.workspace = true
 glob = "0.3"
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
