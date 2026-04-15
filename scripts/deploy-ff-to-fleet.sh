@@ -18,7 +18,10 @@ if ! command -v python3 >/dev/null; then
     exit 1
 fi
 
-mapfile -t NODES < <(python3 -c "
+NODES=()
+while IFS= read -r line; do
+    [ -n "$line" ] && NODES+=("$line")
+done < <(python3 -c "
 import psycopg2, os
 conn = psycopg2.connect(os.environ['PGURL'])
 cur = conn.cursor()
