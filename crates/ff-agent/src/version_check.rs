@@ -22,8 +22,16 @@ pub async fn collect_current() -> BTreeMap<String, String> {
     if let Some(v) = read_os_pretty_name().await {
         out.insert("os".into(), v);
     }
-    // Kernel
+    // Kernel / OS build — uname on Unix, Win32 OS version on Windows.
+    #[cfg(not(windows))]
     if let Some(v) = cmd_capture("uname", &["-r"]).await {
+        out.insert("kernel".into(), v);
+    }
+    #[cfg(windows)]
+    if let Some(v) = cmd_capture(
+        "cmd",
+        &["/C", "ver"],
+    ).await {
         out.insert("kernel".into(), v);
     }
     // ff binary: embedded version plus git sha of the checked-out repo.
@@ -285,6 +293,11 @@ async fn read_os_pretty_name() -> Option<String> {
             }
         }
     }
+    // Windows: `ver` prints e.g. "Microsoft Windows [Version 10.0.19045.5011]".
+    #[cfg(windows)]
+    if let Some(v) = cmd_capture("cmd", &["/C", "ver"]).await {
+        return Some(v);
+    }
     None
 }
 
@@ -300,8 +313,10 @@ async fn git_ls_remote_main() -> Option<String> {
 }
 
 fn home_repo_dir() -> std::path::PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
-    std::path::PathBuf::from(home).join("taylorProjects/forge-fleet")
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| if cfg!(windows) { "C:\\".into() } else { "/".into() });
+    std::path::PathBuf::from(home).join("taylorProjects").join("forge-fleet")
 }
 
 async fn cmd_in_dir(dir: &std::path::Path, bin: &str, args: &[&str]) -> Option<String> {
@@ -323,7 +338,9 @@ async fn cmd_in_dir(dir: &std::path::Path, bin: &str, args: &[&str]) -> Option<S
 }
 
 async fn probe_llama_server() -> Option<String> {
-    let home = std::env::var("HOME").ok()?;
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok()?;
     for path in &[
         format!("{home}/llama.cpp/build/bin/llama-server"),
         format!("{home}/llama.cpp/build-new/bin/llama-server"),

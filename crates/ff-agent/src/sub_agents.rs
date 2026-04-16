@@ -23,14 +23,22 @@ pub fn compute_default_count(cores: u32, ram_gb: u32, has_nvidia_gpu: bool) -> u
     candidate.max(1)
 }
 
-/// Return the root directory for sub-agent workspaces
-/// (`~/.forgefleet`).
+/// Return the root directory for sub-agent workspaces (`~/.forgefleet` on
+/// Unix, `%USERPROFILE%\.forgefleet` on Windows).
 fn workspaces_root() -> PathBuf {
-    if let Ok(home) = std::env::var("HOME") {
-        PathBuf::from(home).join(".forgefleet")
+    if let Some(h) = home_dir_xplat() {
+        h.join(".forgefleet")
+    } else if cfg!(windows) {
+        PathBuf::from(r"C:\ProgramData\forgefleet")
     } else {
         PathBuf::from("/tmp/.forgefleet")
     }
+}
+
+fn home_dir_xplat() -> Option<PathBuf> {
+    if let Ok(h) = std::env::var("HOME") { return Some(PathBuf::from(h)); }
+    if let Ok(h) = std::env::var("USERPROFILE") { return Some(PathBuf::from(h)); }
+    None
 }
 
 /// Ensure `~/.forgefleet/sub-agent-0 .. sub-agent-{count-1}/` exist with

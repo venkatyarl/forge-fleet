@@ -164,6 +164,32 @@ case "$OS_ID" in
 esac
 report "gh" ok
 
+# ─── 5b. gh auth login via PAT stored in fleet_secrets ───────────────────
+# Prereq: operator ran `ff secrets set github.venkat_pat ghp_xxx` on taylor.
+# If the secret isn't set we skip — `git clone` will still work for PUBLIC
+# repos, and `gh auth status` will fail at verify-time so the operator knows.
+report "gh_auth" running
+# We don't have ff installed yet on this new box, so fetch the secret via HTTP.
+# The enrollment token doubles as auth for this one-time lookup.
+PAT_VALUE="$(curl -fsS -m 10 \
+  "$LEADER/api/fleet/secret-peek?token=$TOKEN&key=$GITHUB_PAT_SECRET_KEY" \
+  2>/dev/null | python3 -c 'import sys,json; print(json.load(sys.stdin).get("value",""))' 2>/dev/null || true)"
+
+if [ -n "$PAT_VALUE" ]; then
+  if run_as_user bash -lc "echo \"$PAT_VALUE\" | gh auth login --with-token >/dev/null 2>&1"; then
+    if run_as_user bash -lc 'gh auth status --hostname github.com >/dev/null 2>&1'; then
+      GH_USER="$(run_as_user bash -lc 'gh api user -q .login 2>/dev/null' || echo unknown)"
+      report "gh_auth" ok "logged in as $GH_USER"
+    else
+      report "gh_auth" failed "login accepted but auth status verification failed"
+    fi
+  else
+    report "gh_auth" failed "gh auth login --with-token rejected PAT"
+  fi
+else
+  report "gh_auth" ok "no PAT on fleet (public repo clone will still work)"
+fi
+
 # ─── 6. Clone forge-fleet + build ff ─────────────────────────────────────
 
 report "clone" running

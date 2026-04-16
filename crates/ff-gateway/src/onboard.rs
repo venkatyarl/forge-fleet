@@ -33,6 +33,9 @@ use crate::server::GatewayState;
 const BOOTSTRAP_TEMPLATE: &str =
     include_str!("../../../scripts/bootstrap-node-template.sh");
 
+const BOOTSTRAP_TEMPLATE_PS1: &str =
+    include_str!("../../../scripts/bootstrap-node-template.ps1");
+
 /// Query params accepted by GET /onboard/bootstrap.sh
 #[derive(Debug, Deserialize)]
 pub struct BootstrapQuery {
@@ -113,13 +116,20 @@ pub async fn bootstrap_script(
         "false"
     };
 
-    // Read GitHub owner from fleet_settings; fallback to env; fallback to "venkat-oclaw".
+    // Read GitHub owner from fleet_settings → fleet_secrets → env → fallback.
+    // (fleet_secrets is the CLI-managed store; fleet_settings is reserved for
+    // structured config and has no `ff` CLI setter yet.)
     let github_owner: String = {
         let mut found: Option<String> = None;
         if let Some(pool) = state.operational_store.as_ref().and_then(|os| os.pg_pool()) {
             if let Ok(Some(v)) = ff_db::pg_get_setting(pool, "github.default_owner").await {
                 if let Some(s) = v.as_str() {
                     found = Some(s.to_string());
+                }
+            }
+            if found.is_none() {
+                if let Ok(Some(s)) = ff_db::pg_get_secret(pool, "github.default_owner").await {
+                    if !s.is_empty() { found = Some(s); }
                 }
             }
         }
@@ -144,6 +154,91 @@ pub async fn bootstrap_script(
     (
         StatusCode::OK,
         [(axum::http::header::CONTENT_TYPE, "text/x-shellscript; charset=utf-8")],
+        script,
+    )
+        .into_response()
+}
+
+/// GET /onboard/bootstrap.ps1 — Windows PowerShell equivalent of bootstrap.sh.
+/// Same query params, same placeholder substitutions, different template.
+pub async fn bootstrap_script_ps1(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+    Query(q): Query<BootstrapQuery>,
+) -> axum::response::Response {
+    let expected_token: String = match state.fleet_config.as_ref() {
+        Some(cfg_lock) => cfg_lock
+            .read()
+            .await
+            .enrollment
+            .resolve_shared_secret()
+            .unwrap_or_default(),
+        None => String::new(),
+    };
+    let token = q.token.unwrap_or_else(|| expected_token.clone());
+    if token.is_empty() || token != expected_token {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "# enrollment token missing or invalid\n",
+        )
+            .into_response();
+    }
+
+    let leader_host = std::env::var("FORGEFLEET_LEADER_HOST")
+        .unwrap_or_else(|_| "192.168.5.100".to_string());
+    let leader_port = std::env::var("FORGEFLEET_LEADER_PORT")
+        .unwrap_or_else(|_| "51002".to_string());
+    let ip = q.ip
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            headers.get("x-forwarded-for")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.split(',').next())
+                .map(|s| s.trim().to_string())
+        })
+        .unwrap_or_else(|| "auto".to_string());
+    let name = q.name.unwrap_or_else(|| "newnode".into());
+    let ssh_user = q.ssh_user.unwrap_or_else(|| name.clone());
+    let role = q.role.unwrap_or_else(|| "builder".into());
+    let runtime = q.runtime.unwrap_or_else(|| "auto".into());
+    let is_taylor = if name.eq_ignore_ascii_case("taylor") || ip == "192.168.5.100" {
+        "true"
+    } else {
+        "false"
+    };
+    let github_owner: String = {
+        let mut found: Option<String> = None;
+        if let Some(pool) = state.operational_store.as_ref().and_then(|os| os.pg_pool()) {
+            if let Ok(Some(v)) = ff_db::pg_get_setting(pool, "github.default_owner").await {
+                if let Some(s) = v.as_str() { found = Some(s.to_string()); }
+            }
+            if found.is_none() {
+                if let Ok(Some(s)) = ff_db::pg_get_secret(pool, "github.default_owner").await {
+                    if !s.is_empty() { found = Some(s); }
+                }
+            }
+        }
+        found
+            .or_else(|| std::env::var("FORGEFLEET_GITHUB_OWNER").ok())
+            .unwrap_or_else(|| "venkat-oclaw".to_string())
+    };
+
+    let script = BOOTSTRAP_TEMPLATE_PS1
+        .replace("{{LEADER_HOST}}", &leader_host)
+        .replace("{{LEADER_PORT}}", &leader_port)
+        .replace("{{TOKEN}}", &token)
+        .replace("{{NODE_NAME}}", &name)
+        .replace("{{NODE_IP}}", &ip)
+        .replace("{{SSH_USER}}", &ssh_user)
+        .replace("{{ROLE}}", &role)
+        .replace("{{RUNTIME}}", &runtime)
+        .replace("{{GITHUB_OWNER}}", &github_owner)
+        .replace("{{GITHUB_PAT_SECRET_KEY}}", "github.venkat_pat")
+        .replace("{{IS_TAYLOR}}", is_taylor);
+
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
         script,
     )
         .into_response()
@@ -507,6 +602,60 @@ pub async fn check_tcp(Query(q): Query<CheckTcpQuery>) -> Json<Value> {
     .map(|r| r.is_ok())
     .unwrap_or(false);
     Json(json!({"ip": q.ip, "port": q.port, "reachable": reachable}))
+}
+
+// ─── Secret peek (one-shot bootstrap lookup gated by enrollment token) ──
+//
+// Used by scripts/bootstrap-node-template.sh §5b to fetch the GitHub PAT
+// before `ff` is installed. The enrollment token doubles as auth — it's
+// the same gate as self-enroll, so no weaker surface is exposed.
+
+#[derive(Debug, Deserialize)]
+pub struct SecretPeekQuery {
+    pub token: String,
+    pub key: String,
+}
+
+pub async fn secret_peek(
+    State(state): State<Arc<GatewayState>>,
+    Query(q): Query<SecretPeekQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // Validate enrollment token (same check as self-enroll).
+    let expected = match state.fleet_config.as_ref() {
+        Some(cfg_lock) => cfg_lock
+            .read()
+            .await
+            .enrollment
+            .resolve_shared_secret()
+            .unwrap_or_default(),
+        None => String::new(),
+    };
+    if expected.is_empty() || q.token != expected {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "invalid enrollment token"})),
+        ));
+    }
+    // Whitelist which keys are allowed — never expose arbitrary secrets.
+    let allowed = ["github.venkat_pat", "github.default_owner"];
+    if !allowed.contains(&q.key.as_str()) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "key not allowed for bootstrap peek"})),
+        ));
+    }
+    let pool = state
+        .operational_store
+        .as_ref()
+        .and_then(|os| os.pg_pool())
+        .ok_or_else(|| {
+            (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":"postgres pool not available"})))
+        })?;
+    let value = ff_db::pg_get_secret(pool, &q.key)
+        .await
+        .map_err(|e| db_err("pg_get_secret", e))?
+        .unwrap_or_default();
+    Ok(Json(json!({"key": q.key, "value": value})))
 }
 
 // ─── Fleet tooling matrix (for /versions dashboard page) ────────────────

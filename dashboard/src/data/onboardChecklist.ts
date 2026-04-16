@@ -11,6 +11,8 @@ export type Applies =
   | 'intel-mac'
   | 'linux-gpu'
   | 'dgx-os'
+  | 'windows'
+  | 'windows-gpu'
 
 export interface VerifyAction {
   kind: 'tcp' | 'ip_ping' | 'manual'
@@ -293,6 +295,57 @@ export const CHECKLIST: ChecklistItem[] = [
       'Bootstrap script writes `/etc/sudoers.d/forgefleet-<user>` with NOPASSWD:ALL.\n\nTaylor is explicitly excluded from this — the leader keeps human-confirmed sudo.',
   },
 
+  // ─── Windows-specific prerequisites ────────────────────────────
+  {
+    id: 'win_developer_mode',
+    group: 'Windows setup',
+    title: 'Enable Developer Mode',
+    applies_to: ['windows', 'windows-gpu'],
+    detail_md:
+      'Settings → Privacy & security → For developers → toggle **Developer Mode** ON.\n\nThis enables symlinks, git long paths, and allows unsigned-script execution without prompting.',
+  },
+  {
+    id: 'win_openssh_server',
+    group: 'Windows setup',
+    title: 'Install OpenSSH Server (Windows Capability)',
+    applies_to: ['windows', 'windows-gpu'],
+    detail_md:
+      'In an elevated PowerShell:\n\n```powershell\nAdd-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0\nSet-Service -Name sshd -StartupType Automatic\nStart-Service sshd\n```\n\nThe bootstrap script auto-installs this, but if it fails (restricted OU policy etc.) fall back to the manual steps above.',
+    verify: { kind: 'tcp', port: 22 },
+  },
+  {
+    id: 'win_firewall_rules',
+    group: 'Windows setup',
+    title: 'Allow inbound firewall rules (22, 51000-51004, 55000-55010)',
+    applies_to: ['windows', 'windows-gpu'],
+    detail_md:
+      'In an elevated PowerShell:\n\n```powershell\nNew-NetFirewallRule -Name forgefleet-sshd -DisplayName "ForgeFleet sshd" -Direction Inbound -Protocol TCP -LocalPort 22 -Action Allow\nNew-NetFirewallRule -Name forgefleet-daemon -DisplayName "ForgeFleet daemon" -Direction Inbound -Protocol TCP -LocalPort 51000-51004 -Action Allow\nNew-NetFirewallRule -Name forgefleet-llm -DisplayName "ForgeFleet LLM" -Direction Inbound -Protocol TCP -LocalPort 55000-55010 -Action Allow\n```',
+  },
+  {
+    id: 'win_disable_sleep',
+    group: 'Windows setup',
+    title: 'Disable sleep + auto-suspend',
+    applies_to: ['windows', 'windows-gpu'],
+    detail_md:
+      'In an elevated PowerShell:\n\n```powershell\npowercfg /change standby-timeout-ac 0\npowercfg /change hibernate-timeout-ac 0\npowercfg /change monitor-timeout-ac 0\n```\n\nOR via GUI: Settings → System → Power → Screen and sleep → "Never" for all AC options.',
+  },
+  {
+    id: 'win_nvidia_driver',
+    group: 'Windows setup',
+    title: 'NVIDIA driver installed (GPU nodes only)',
+    applies_to: ['windows-gpu'],
+    detail_md:
+      'Run `nvidia-smi` in a terminal. If it fails, install the latest CUDA 12+ driver from the NVIDIA Studio/Game Ready installer for your GPU. vLLM requires driver ≥ 535.',
+  },
+  {
+    id: 'win_nssm',
+    group: 'Windows setup',
+    title: 'Install nssm for reliable service mode (recommended)',
+    applies_to: ['windows', 'windows-gpu'],
+    detail_md:
+      '`winget install nssm` or `choco install nssm -y`. Without nssm, the bootstrap falls back to a Task Scheduler at-logon task — which works but loses the daemon if the user logs out.',
+  },
+
   // ─── Run bootstrap ─────────────────────────────────────────────
   {
     id: 'run_copy_command',
@@ -304,9 +357,10 @@ export const CHECKLIST: ChecklistItem[] = [
   {
     id: 'run_paste_and_sudo',
     group: 'Run bootstrap',
-    title: 'Paste into terminal with sudo',
+    title: 'Paste into terminal (sudo on Unix, elevated PowerShell on Windows)',
     applies_to: ['all'],
-    detail_md: 'Open Terminal on the new machine, paste the command, hit Enter. It\'ll prompt for the user\'s sudo password once.',
+    detail_md:
+      '**Linux / macOS:** open Terminal → paste the `curl | sudo bash` command → enter your sudo password once.\n\n**Windows:** right-click PowerShell → Run as Administrator → paste the `iwr | iex` command. The script uses Win32 APIs to add firewall rules / install services so it needs elevation from the start.',
   },
   {
     id: 'run_wait_daemon_active',

@@ -12,6 +12,8 @@ export type MachineKind =
   | 'linux'
   | 'linux-gpu'
   | 'dgx-os'
+  | 'windows'
+  | 'windows-gpu'
   | 'unknown'
 
 export interface DetectedClient {
@@ -120,11 +122,10 @@ function detectLanIp(timeoutMs = 800): Promise<string | null> {
 }
 
 function suggestKind(os: OsFamily, appleSilicon: boolean, webgl: string | null): MachineKind {
+  const hasNvidia = webgl ? /nvidia|geforce|quadro|tesla|rtx|dgx/i.test(webgl) : false
   if (os === 'mac') return appleSilicon ? 'apple-silicon' : 'intel-mac'
-  if (os === 'linux') {
-    if (webgl && /nvidia|geforce|quadro|tesla|rtx|dgx/i.test(webgl)) return 'linux-gpu'
-    return 'linux'
-  }
+  if (os === 'linux') return hasNvidia ? 'linux-gpu' : 'linux'
+  if (os === 'windows') return hasNvidia ? 'windows-gpu' : 'windows'
   return 'unknown'
 }
 

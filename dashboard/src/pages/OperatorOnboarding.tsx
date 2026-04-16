@@ -13,6 +13,8 @@ const MACHINE_KINDS: { value: MachineKind; label: string }[] = [
   { value: 'linux', label: 'Linux x86 CPU (llama.cpp)' },
   { value: 'linux-gpu', label: 'Linux + NVIDIA GPU (vllm)' },
   { value: 'dgx-os', label: 'DGX OS (vllm)' },
+  { value: 'windows', label: 'Windows (llama.cpp)' },
+  { value: 'windows-gpu', label: 'Windows + NVIDIA GPU (vllm)' },
 ]
 
 function runtimeFor(kind: MachineKind): string {
@@ -21,6 +23,7 @@ function runtimeFor(kind: MachineKind): string {
       return 'mlx'
     case 'dgx-os':
     case 'linux-gpu':
+    case 'windows-gpu':
       return 'vllm'
     default:
       return 'llama.cpp'
@@ -29,6 +32,7 @@ function runtimeFor(kind: MachineKind): string {
 
 function osFamilyFor(kind: MachineKind): string {
   if (kind === 'apple-silicon' || kind === 'intel-mac') return 'mac'
+  if (kind === 'windows' || kind === 'windows-gpu') return 'windows'
   return 'linux'
 }
 
@@ -124,8 +128,13 @@ export function OperatorOnboarding() {
       role,
       runtime,
     })
-    return `curl -fsSL 'http://${LEADER_HOST}:${LEADER_PORT}/onboard/bootstrap.sh?${params.toString()}' | sudo bash`
-  }, [token, name, ip, sshUser, role, runtime])
+    const base = `http://${LEADER_HOST}:${LEADER_PORT}/onboard`
+    if (osFamily === 'windows') {
+      // PowerShell: run in an elevated pwsh/powershell.exe.
+      return `iwr -useb "${base}/bootstrap.ps1?${params.toString()}" | iex`
+    }
+    return `curl -fsSL '${base}/bootstrap.sh?${params.toString()}' | sudo bash`
+  }, [token, name, ip, sshUser, role, runtime, osFamily])
 
   const copy = useCallback(() => {
     navigator.clipboard.writeText(curlCommand).catch(() => {

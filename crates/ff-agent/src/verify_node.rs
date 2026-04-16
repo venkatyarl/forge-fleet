@@ -28,19 +28,32 @@ pub async fn verify_node(pool: &PgPool, node_name: &str) -> Result<VerifyReport,
         .map_err(|e| format!("pg_get_node: {e}"))?
         .ok_or_else(|| format!("node '{node_name}' not in fleet_nodes"))?;
     let ssh_dest = format!("{}@{}", node.ssh_user, node.ip);
+    let is_windows = node.os.to_lowercase().contains("windows");
     let mut details = Vec::new();
 
     // 1. daemon_healthy
     details.push(check_daemon_healthy(&node).await);
     // 2. db_reachable_from_node
-    details.push(check_ssh_cmd(&ssh_dest, "db_reachable_from_node",
-        "~/.local/bin/ff status --no-color 2>&1 | head -5 | grep -q 'connected\\|Database'").await);
+    let db_cmd = if is_windows {
+        r#"powershell -NoProfile -Command "& { $out = & \"$env:USERPROFILE\.local\bin\ff.exe\" status --no-color 2>&1 | Out-String; if ($out -match 'connected|Database') { exit 0 } else { exit 1 } }""#
+    } else {
+        "~/.local/bin/ff status --no-color 2>&1 | head -5 | grep -q 'connected\\|Database'"
+    };
+    details.push(check_ssh_cmd(&ssh_dest, "db_reachable_from_node", db_cmd).await);
     // 3. redis_reachable_from_node
-    details.push(check_ssh_cmd(&ssh_dest, "redis_reachable_from_node",
-        "nc -z -w 3 192.168.5.100 6380").await);
+    let redis_cmd = if is_windows {
+        r#"powershell -NoProfile -Command "Test-NetConnection -ComputerName 192.168.5.100 -Port 6380 -InformationLevel Quiet | Out-String | Select-String True | ForEach-Object { exit 0 }; exit 1""#
+    } else {
+        "nc -z -w 3 192.168.5.100 6380"
+    };
+    details.push(check_ssh_cmd(&ssh_dest, "redis_reachable_from_node", redis_cmd).await);
     // 4. sub_agent_dirs_exist
     let want = node.sub_agent_count;
-    let subcmd = format!("ls -d ~/.forgefleet/sub-agent-* 2>/dev/null | wc -l | tr -d ' '");
+    let subcmd = if is_windows {
+        r#"powershell -NoProfile -Command "(Get-ChildItem -Directory \"$env:USERPROFILE\.forgefleet\sub-agent-*\" -ErrorAction SilentlyContinue).Count""#.to_string()
+    } else {
+        "ls -d ~/.forgefleet/sub-agent-* 2>/dev/null | wc -l | tr -d ' '".to_string()
+    };
     let sub_res = ssh_capture(&ssh_dest, &subcmd).await;
     details.push(match sub_res {
         Ok(out) if out.trim().parse::<i32>().map(|v| v >= want).unwrap_or(false) => CheckResult {
@@ -57,8 +70,12 @@ pub async fn verify_node(pool: &PgPool, node_name: &str) -> Result<VerifyReport,
         },
     });
     // 5. tooling_installed
-    details.push(check_ssh_cmd(&ssh_dest, "tooling_installed",
-        "[ $(which gh op codex claude openclaw 2>/dev/null | wc -l) -ge 3 ]").await);
+    let tool_cmd = if is_windows {
+        r#"powershell -NoProfile -Command "$c = 0; foreach ($t in 'gh','git','codex','claude','openclaw') { if (Get-Command $t -ErrorAction SilentlyContinue) { $c++ } }; if ($c -ge 3) { exit 0 } else { exit 1 }""#
+    } else {
+        "[ $(which gh op codex claude openclaw 2>/dev/null | wc -l) -ge 3 ]"
+    };
+    details.push(check_ssh_cmd(&ssh_dest, "tooling_installed", tool_cmd).await);
     // 6. tool_versions_reported
     details.push(if node.tooling.as_object().map(|m| !m.is_empty()).unwrap_or(false) {
         CheckResult { check: "tool_versions_reported".into(), status: "pass".into(), message: None, retry_task_id: None }
@@ -81,10 +98,14 @@ pub async fn verify_node(pool: &PgPool, node_name: &str) -> Result<VerifyReport,
         check: "openclaw_registered".into(), status: "skip".into(),
         message: Some("openclaw api not yet wired".into()), retry_task_id: None,
     });
-    // 9. sudo_passwordless
+    // 9. sudo_passwordless (N/A on Windows — UAC is the equivalent and is
+    //    always interactive; Windows daemons run as services, so skip.)
     details.push(if node_name == "taylor" {
         CheckResult { check: "sudo_passwordless".into(), status: "skip".into(),
             message: Some("taylor is excluded from passwordless sudo policy".into()), retry_task_id: None }
+    } else if is_windows {
+        CheckResult { check: "sudo_passwordless".into(), status: "skip".into(),
+            message: Some("N/A on Windows (service runs elevated via nssm/Task Scheduler)".into()), retry_task_id: None }
     } else {
         check_ssh_cmd(&ssh_dest, "sudo_passwordless", "sudo -n true").await
     });
