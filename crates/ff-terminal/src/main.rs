@@ -173,6 +173,13 @@ enum FleetCommand {
     SshMeshCheck {
         #[arg(long)] node: Option<String>,
         #[arg(long)] json: bool,
+        /// Only re-probe pairs whose last_checked in fleet_mesh_status is
+        /// older than the given ISO-8601 duration prefix (e.g. "1h", "30m", "2d").
+        #[arg(long)] since: Option<String>,
+        /// Before probing, re-distribute user + host keys to any pair that
+        /// is currently status='failed'. Requires --yes to actually run.
+        #[arg(long, default_value_t = false)] repair: bool,
+        #[arg(long, default_value_t = false)] yes: bool,
     },
     /// Full 12-check verify battery for one node.
     VerifyNode {
@@ -2968,6 +2975,26 @@ async fn probe_online_nodes(nodes: &[ff_db::FleetNodeRow]) -> Vec<String> {
 /// as `cwd` when running locally; SSH-dispatched shell tasks ignore it
 /// (the remote node sets its own cwd). Future `agent_run` kind will use
 /// this for checkpoint/scratch isolation across concurrent sub-agents.
+fn detect_os_family() -> String {
+    if cfg!(target_os = "macos") { "macos".into() }
+    else if cfg!(target_os = "linux") { "linux".into() }
+    else { "unknown".into() }
+}
+
+/// Parse shorthand duration specs like "1h", "30m", "2d", "45s".
+fn parse_duration(spec: &str) -> Option<chrono::Duration> {
+    let spec = spec.trim();
+    let (num, unit) = spec.split_at(spec.find(|c: char| !c.is_ascii_digit())?);
+    let n: i64 = num.parse().ok()?;
+    match unit {
+        "s" | "sec" => Some(chrono::Duration::seconds(n)),
+        "m" | "min" => Some(chrono::Duration::minutes(n)),
+        "h" | "hr"  => Some(chrono::Duration::hours(n)),
+        "d" | "day" => Some(chrono::Duration::days(n)),
+        _ => None,
+    }
+}
+
 async fn execute_deferred(
     task: &ff_db::DeferredTaskRow,
     nodes: &[ff_db::FleetNodeRow],
@@ -3010,6 +3037,39 @@ async fn execute_deferred(
                 }
             } else {
                 (false, None, Some(format!("unknown internal task title: {}", task.title)))
+            }
+        }
+        "upgrade" => {
+            // Run the tool-specific upgrade playbook.
+            let tool = match task.payload.get("tool").and_then(|v| v.as_str()) {
+                Some(t) => t,
+                None => return (false, None, Some("upgrade payload missing 'tool'".into())),
+            };
+            let os_family = detect_os_family();
+            let script = match ff_agent::upgrade_playbooks::playbook_for(tool, &os_family) {
+                Some(s) => s,
+                None => return (false, None, Some(format!("no playbook for tool={tool} os={os_family}"))),
+            };
+            let target = task.preferred_node.as_deref();
+            execute_shell(target, &script, nodes, workspace).await
+        }
+        "mesh_retry" => {
+            // Re-probe a specific (src, dst) pair and refresh fleet_mesh_status.
+            let src = task.payload.get("src").and_then(|v| v.as_str()).unwrap_or("");
+            let dst = task.payload.get("dst").and_then(|v| v.as_str()).unwrap_or("");
+            if src.is_empty() || dst.is_empty() {
+                return (false, None, Some("mesh_retry payload needs src+dst".into()));
+            }
+            match ff_agent::fleet_info::get_fleet_pool().await {
+                Ok(pool) => match ff_agent::mesh_check::probe_single_pair(&pool, src, dst).await {
+                    Ok(cell) => {
+                        let ok = cell.status == "ok";
+                        let result = serde_json::json!({"status": cell.status, "error": cell.last_error});
+                        (ok, Some(result), if ok { None } else { cell.last_error })
+                    }
+                    Err(e) => (false, None, Some(format!("probe: {e}"))),
+                },
+                Err(e) => (false, None, Some(format!("pool: {e}"))),
             }
         }
         other => (false, None, Some(format!("unknown task kind: {other}"))),
@@ -3194,7 +3254,31 @@ async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
 
     match cmd {
-        FleetCommand::SshMeshCheck { node, json } => {
+        FleetCommand::SshMeshCheck { node, json, since, repair, yes } => {
+            if repair && !yes {
+                anyhow::bail!("--repair rewrites authorized_keys / known_hosts on every failed peer — pass --yes to proceed");
+            }
+            if repair {
+                println!("{CYAN}▶ Repairing mesh before probing...{RESET}");
+                let failed = ff_db::pg_list_mesh_status(&pool, None).await
+                    .map_err(|e| anyhow::anyhow!("pg_list_mesh_status: {e}"))?
+                    .into_iter()
+                    .filter(|r| r.status == "failed")
+                    .collect::<Vec<_>>();
+                println!("  found {} failed pair(s) — re-enqueuing as mesh_retry tasks", failed.len());
+                let created = ff_agent::mesh_check::enqueue_retries(&pool).await
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                println!("  enqueued {} mesh_retry task(s)", created);
+            }
+            if let Some(spec) = &since {
+                let age = parse_duration(spec)
+                    .ok_or_else(|| anyhow::anyhow!("unrecognized --since value '{spec}' (try 1h, 30m, 2d)"))?;
+                println!("{CYAN}▶ Refreshing pairs older than {spec}...{RESET}");
+                let n = ff_agent::mesh_check::refresh_stale(&pool, age).await
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                println!("  refreshed {n} stale pair(s)");
+                return Ok(());
+            }
             println!("{CYAN}▶ Running pairwise SSH mesh check...{RESET}");
             let matrix = match &node {
                 Some(n) => ff_agent::mesh_check::pairwise_ssh_check_node(&pool, n).await,
@@ -3704,6 +3788,24 @@ async fn handle_daemon(
                         s.drifted_keys.join(", ")),
                     Ok(_) => {}
                     Err(e) => eprintln!("{RED}[versions] {e}{RESET}"),
+                }
+                // Leader-only: refresh the mesh matrix at the same cadence so
+                // stale rows don't accumulate and operators see fresh status.
+                if worker_name == "taylor" {
+                    match ff_agent::mesh_check::pairwise_ssh_check(&pool).await {
+                        Ok(m) => {
+                            let (ok, fail) = m.cells.iter()
+                                .fold((0usize, 0usize), |(o, f), c| {
+                                    if c.status == "ok" { (o + 1, f) } else { (o, f + 1) }
+                                });
+                            println!("{CYAN}[mesh]{RESET} refreshed: {ok} ok, {fail} fail");
+                            // Auto-retry any failed pair whose last check was
+                            // more than 10 minutes ago — capped at 5 retries
+                            // per 24h by pg_enqueue_deferred's max_attempts.
+                            let _ = ff_agent::mesh_check::enqueue_retries(&pool).await;
+                        }
+                        Err(e) => eprintln!("{RED}[mesh] refresh error: {e}{RESET}"),
+                    }
                 }
             }
         }

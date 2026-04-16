@@ -2628,6 +2628,24 @@ pub async fn pg_claim_deferred(
     Ok(claimed)
 }
 
+/// Operator-initiated promotion: flip a pending task (any trigger_type) to
+/// dispatchable so the next worker claims it. Used by the `/versions` dashboard
+/// "Apply on <node>" button and by the mesh-status "Retry" click.
+pub async fn pg_promote_deferred(pool: &PgPool, id: &str) -> Result<bool> {
+    let uuid = sqlx::types::Uuid::parse_str(id)
+        .map_err(|e| crate::error::DbError::NotFound(format!("bad uuid {id}: {e}")))?;
+    let affected = sqlx::query(
+        "UPDATE deferred_tasks
+            SET status = 'dispatchable', next_attempt_at = NOW()
+          WHERE id = $1 AND status = 'pending'",
+    )
+    .bind(uuid)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(affected > 0)
+}
+
 /// Finalize a deferred task after execution. `success = true` → completed; false → failed.
 /// On failure, attempts are compared to max_attempts to decide retry vs terminal.
 pub async fn pg_finish_deferred(

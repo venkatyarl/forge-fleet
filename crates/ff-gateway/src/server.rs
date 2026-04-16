@@ -335,8 +335,11 @@ pub fn build_router(state: Arc<GatewayState>, mc_db_path: Option<&str>) -> Route
         .route("/api/fleet/enrollment-progress", post(crate::onboard::enrollment_progress))
         .route("/api/fleet/check-ip", get(crate::onboard::check_ip))
         .route("/api/fleet/check-tcp", get(crate::onboard::check_tcp))
+        .route("/api/fleet/tooling", get(crate::onboard::get_fleet_tooling))
         .route("/api/fleet/mesh-check", get(crate::onboard::get_mesh_check))
         .route("/api/fleet/verify-node", post(crate::onboard::post_verify_node))
+        .route("/api/fleet/deferred", get(crate::onboard::list_deferred))
+        .route("/api/fleet/deferred/{id}/promote", post(crate::onboard::promote_deferred))
         .route(
             "/api/transports/telegram/status",
             get(telegram_transport_status),

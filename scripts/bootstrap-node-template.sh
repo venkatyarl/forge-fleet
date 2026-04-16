@@ -186,6 +186,41 @@ run_as_user bash -lc "cd '$REPO_DIR' && cargo build -p ff-terminal --release 2>&
 run_as_user install -m 755 "$REPO_DIR/target/release/ff" "$(eval echo ~${SUDO_INVOKER})/.local/bin/ff"
 report "build" ok
 
+# ─── 6b. OpenClaw ────────────────────────────────────────────────────────
+# Installs OpenClaw via npm (matches deploy/provision-node.sh). Failure here
+# does NOT abort enrollment — the node can still work as a ForgeFleet member
+# and a deferred task is available to retry later.
+report "openclaw" running
+if command -v npm >/dev/null 2>&1; then
+  run_as_user bash -lc 'command -v openclaw >/dev/null || npm install -g openclaw' >/dev/null 2>&1 \
+    || npm install -g openclaw >/dev/null 2>&1 || true
+  if run_as_user bash -lc 'command -v openclaw >/dev/null'; then
+    report "openclaw" ok "$(run_as_user bash -lc 'openclaw --version 2>&1 | head -1')"
+  else
+    report "openclaw" failed "install failed — retry later"
+  fi
+else
+  report "openclaw" failed "npm not present — install node/npm and rerun"
+fi
+
+# ─── 6c. vLLM venv (GPU nodes only) ──────────────────────────────────────
+if [ "$RUNTIME" = "vllm" ]; then
+  report "vllm_venv" running
+  VENV="$USER_HOME/.forgefleet/vllm-venv"
+  if [ ! -d "$VENV" ]; then
+    run_as_user mkdir -p "$USER_HOME/.forgefleet"
+    if ! run_as_user python3 -m venv "$VENV" >/dev/null 2>&1; then
+      # DGX / Ubuntu often need python3-venv installed separately.
+      apt-get install -y python3-venv >/dev/null 2>&1 || true
+      run_as_user python3 -m venv "$VENV" || die "python3 -m venv failed (install python3-venv)"
+    fi
+  fi
+  # pip install vllm (takes a while on first run — safe to re-run, pip is idempotent).
+  run_as_user bash -lc "source '$VENV/bin/activate' && pip install --quiet --upgrade pip && pip install --quiet vllm" \
+    && report "vllm_venv" ok "$VENV" \
+    || report "vllm_venv" failed "pip install vllm failed — retry after resolving CUDA issues"
+fi
+
 # ─── 7. SSH keypair + host keys ──────────────────────────────────────────
 
 report "sshkey" running

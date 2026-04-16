@@ -12,8 +12,20 @@ interface NodeRow {
   tooling?: Record<string, ToolEntry>
 }
 
-interface FleetStatus {
+interface FleetTooling {
   nodes?: NodeRow[]
+}
+
+interface DeferredTask {
+  id: string
+  title: string
+  kind: string
+  status: string
+  preferred_node: string | null
+  payload: { tool?: string; current?: string; latest?: string }
+  attempts: number
+  max_attempts: number
+  last_error?: string | null
 }
 
 function statusSymbol(entry: ToolEntry | undefined): { icon: string; color: string } {
@@ -33,7 +45,7 @@ export function Versions() {
     let cancelled = false
     async function load() {
       try {
-        const data = await getJson<FleetStatus>('/api/fleet/status')
+        const data = await getJson<FleetTooling>('/api/fleet/tooling')
         if (cancelled) return
         setNodes(data.nodes || [])
         setLoading(false)
@@ -80,6 +92,47 @@ export function Versions() {
 
   const selEntry =
     selected && nodes.find((n) => n.name === selected.node)?.tooling?.[selected.tool]
+  const [upgradeTask, setUpgradeTask] = useState<DeferredTask | null>(null)
+  const [applying, setApplying] = useState(false)
+  const [applyMsg, setApplyMsg] = useState<string | null>(null)
+
+  useEffect(() => {
+    if (!selected) {
+      setUpgradeTask(null)
+      setApplyMsg(null)
+      return
+    }
+    const drift = selEntry && selEntry.latest && selEntry.current !== selEntry.latest
+    if (!drift) {
+      setUpgradeTask(null)
+      return
+    }
+    const qs = new URLSearchParams({
+      status: 'pending',
+      kind: 'upgrade',
+      node: selected.node,
+      tool: selected.tool,
+    })
+    getJson<{ tasks: DeferredTask[] }>(`/api/fleet/deferred?${qs.toString()}`)
+      .then((r) => setUpgradeTask(r.tasks[0] || null))
+      .catch(() => setUpgradeTask(null))
+  }, [selected, selEntry])
+
+  const applyUpgrade = async () => {
+    if (!upgradeTask) return
+    setApplying(true)
+    setApplyMsg(null)
+    try {
+      const r = await fetch(`/api/fleet/deferred/${upgradeTask.id}/promote`, { method: 'POST' })
+      const d = await r.json()
+      setApplyMsg(d.promoted ? 'Promoted — worker will pick up in next cycle.' : 'Task already dispatched or terminal.')
+      setUpgradeTask(null)
+    } catch (e) {
+      setApplyMsg(e instanceof Error ? e.message : String(e))
+    } finally {
+      setApplying(false)
+    }
+  }
 
   return (
     <div className="p-6 text-slate-100">
@@ -141,6 +194,37 @@ export function Versions() {
             <div className="text-slate-400">checked_at</div>
             <div className="text-slate-300">{selEntry.checked_at || '—'}</div>
           </div>
+          {upgradeTask ? (
+            <div className="mt-4 pt-3 border-t border-slate-700">
+              <div className="text-[11px] uppercase tracking-wider text-amber-300 mb-1">
+                Upgrade available
+              </div>
+              <div className="text-xs text-slate-300 mb-2">
+                {upgradeTask.title}
+                {upgradeTask.attempts > 0 && (
+                  <span className="ml-2 text-slate-500">
+                    (attempts: {upgradeTask.attempts}/{upgradeTask.max_attempts})
+                  </span>
+                )}
+              </div>
+              <button
+                onClick={applyUpgrade}
+                disabled={applying}
+                className="text-xs px-3 py-1.5 rounded border border-emerald-400 text-emerald-200 hover:bg-emerald-500/20 disabled:opacity-50"
+              >
+                {applying ? 'Promoting…' : `Apply on ${selected?.node}`}
+              </button>
+              {applyMsg && <div className="mt-2 text-xs text-slate-400">{applyMsg}</div>}
+            </div>
+          ) : (
+            selEntry &&
+            selEntry.latest &&
+            selEntry.current !== selEntry.latest && (
+              <div className="mt-4 pt-3 border-t border-slate-700 text-xs text-slate-500">
+                No pending upgrade task — will be enqueued on next version_check pass (every 6h).
+              </div>
+            )
+          )}
           <button
             onClick={() => setSelected(null)}
             className="mt-3 text-xs px-2 py-1 border border-slate-700 rounded text-slate-300 hover:bg-slate-800"

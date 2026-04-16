@@ -294,6 +294,75 @@ fn shell_escape_single(s: &str) -> String {
     out
 }
 
+/// Re-probe a single (src, dst) pair and upsert the result. Used by the
+/// `mesh_retry` deferred task when an auto-retry fires.
+pub async fn probe_single_pair(
+    pool: &PgPool,
+    src: &str,
+    dst: &str,
+) -> Result<MeshCell, String> {
+    let nodes = ff_db::pg_list_nodes(pool)
+        .await
+        .map_err(|e| format!("pg_list_nodes: {e}"))?;
+    let s = nodes.iter().find(|n| n.name == src)
+        .ok_or_else(|| format!("src node '{src}' not in fleet_nodes"))?;
+    let d = nodes.iter().find(|n| n.name == dst)
+        .ok_or_else(|| format!("dst node '{dst}' not in fleet_nodes"))?;
+    let cell = probe_pair(
+        s.name.clone(), s.ssh_user.clone(), s.ip.clone(),
+        d.name.clone(), d.ssh_user.clone(), d.ip.clone(),
+    ).await;
+    let _ = ff_db::pg_upsert_mesh_status(
+        pool, &cell.src, &cell.dst, &cell.status, cell.last_error.as_deref(),
+    ).await;
+    Ok(cell)
+}
+
+/// For every `fleet_mesh_status` row in status='failed' whose last_checked is
+/// older than 10 minutes, enqueue a `mesh_retry` deferred task — de-duplicated
+/// against any already-pending retry for the same (src,dst) pair. Capped at
+/// 5 attempts per 24h via the deferred_tasks `max_attempts` column.
+pub async fn enqueue_retries(pool: &PgPool) -> Result<usize, String> {
+    let cutoff = chrono::Utc::now() - chrono::Duration::minutes(10);
+    let rows = ff_db::pg_list_mesh_status(pool, None)
+        .await
+        .map_err(|e| format!("pg_list_mesh_status: {e}"))?;
+    let stale: Vec<(String, String)> = rows.iter()
+        .filter(|r| r.status == "failed"
+            && r.last_checked.map(|t| t < cutoff).unwrap_or(true))
+        .map(|r| (r.src_node.clone(), r.dst_node.clone()))
+        .collect();
+    if stale.is_empty() {
+        return Ok(0);
+    }
+    let existing = ff_db::pg_list_deferred(pool, Some("pending"), 500)
+        .await
+        .map_err(|e| format!("pg_list_deferred: {e}"))?;
+    let mut created = 0;
+    for (src, dst) in stale {
+        let already = existing.iter().any(|t| {
+            t.kind == "mesh_retry"
+                && t.payload.get("src").and_then(|v| v.as_str()) == Some(&src)
+                && t.payload.get("dst").and_then(|v| v.as_str()) == Some(&dst)
+        });
+        if already {
+            continue;
+        }
+        let title = format!("Mesh retry {src} → {dst}");
+        let payload = serde_json::json!({ "src": src, "dst": dst });
+        let trig = serde_json::json!({});
+        let caps = serde_json::json!([]);
+        if ff_db::pg_enqueue_deferred(
+            pool, &title, "mesh_retry", &payload,
+            "operator", &trig, Some("taylor"), &caps,
+            Some("mesh_auto_retry"), Some(5),
+        ).await.is_ok() {
+            created += 1;
+        }
+    }
+    Ok(created)
+}
+
 pub async fn refresh_stale(
     pool: &PgPool,
     max_age: chrono::Duration,

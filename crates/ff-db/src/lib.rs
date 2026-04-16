@@ -37,7 +37,7 @@ pub use queries::{
     pg_latest_disk_usage, pg_list_catalog, pg_list_deferred, pg_list_deployments,
     pg_list_jobs, pg_list_library, pg_list_mesh_status, pg_list_models,
     pg_list_models_for_node, pg_list_node_ssh_keys, pg_list_nodes, pg_list_secrets,
-    pg_retry_deferred, pg_scheduler_pass, pg_search_catalog, pg_set_secret,
+    pg_promote_deferred, pg_retry_deferred, pg_scheduler_pass, pg_search_catalog, pg_set_secret,
     pg_set_setting, pg_update_job_progress, pg_upsert_catalog, pg_upsert_deployment,
     pg_upsert_library, pg_upsert_mesh_status, pg_upsert_model, pg_upsert_node,
     seed_from_fleet_toml, RoutingHop,

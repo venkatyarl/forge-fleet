@@ -18,6 +18,7 @@ import { Versions } from './pages/Versions'
 import { PlanningHub } from './pages/PlanningHub'
 import { Projects } from './pages/Projects'
 import { Topology } from './pages/Topology'
+import { MeshStatus } from './pages/MeshStatus'
 import { Updates } from './pages/Updates'
 import { WorkflowWorkbench } from './pages/WorkflowWorkbench'
 import { Settings } from './pages/Settings'
@@ -91,6 +92,7 @@ export default function App() {
         <Route path="onboarding" element={<OperatorOnboarding />} />
         <Route path="onboard" element={<Navigate to="/onboarding" replace />} />
         <Route path="versions" element={<Versions />} />
+        <Route path="mesh" element={<MeshStatus />} />
         {/* Legacy redirects */}
         <Route path="mission-control" element={<Navigate to="/" replace />} />
         <Route path="nodes/:nodeId" element={<Navigate to="/settings#fleet" replace />} />

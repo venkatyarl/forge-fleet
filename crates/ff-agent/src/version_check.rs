@@ -123,7 +123,7 @@ pub async fn version_check_pass(pool: &PgPool) -> Result<DriftSummary, String> {
         total += 1;
         let lat = latest.get(k).cloned();
         if let Some(ref l) = lat {
-            if l != cur {
+            if !versions_equivalent(cur, l) {
                 drifted.push(k.clone());
             }
         }
@@ -149,6 +149,9 @@ pub async fn version_check_pass(pool: &PgPool) -> Result<DriftSummary, String> {
     // Best-effort Redis publish when drift is real.
     if !drifted.is_empty() {
         let _ = crate::fleet_events::publish_node_online(&format!("drift:{node_name}")).await;
+        // Enqueue one operator-triggered upgrade task per (node, tool) pair,
+        // de-duplicated against any already-pending task for the same pair.
+        let _ = enqueue_upgrade_tasks(pool, &node_name, &drifted, &current, &latest).await;
     }
 
     Ok(DriftSummary {
@@ -156,6 +159,97 @@ pub async fn version_check_pass(pool: &PgPool) -> Result<DriftSummary, String> {
         drifted_keys: drifted,
         checked_at: chrono::Utc::now(),
     })
+}
+
+/// For each drifted tool, enqueue a manual-trigger `upgrade` task targeting
+/// this node — unless one is already pending. Returns count of new tasks.
+async fn enqueue_upgrade_tasks(
+    pool: &PgPool,
+    node: &str,
+    drifted: &[String],
+    current: &BTreeMap<String, String>,
+    latest: &BTreeMap<String, String>,
+) -> Result<usize, String> {
+    let existing = ff_db::pg_list_deferred(pool, Some("pending"), 500)
+        .await
+        .map_err(|e| format!("pg_list_deferred: {e}"))?;
+    let already = |tool: &str| -> bool {
+        existing.iter().any(|t| {
+            t.kind == "upgrade"
+                && t.preferred_node.as_deref() == Some(node)
+                && t.payload.get("tool").and_then(|v| v.as_str()) == Some(tool)
+        })
+    };
+    let mut created = 0;
+    for tool in drifted {
+        if already(tool) {
+            continue;
+        }
+        let cur = current.get(tool).cloned().unwrap_or_default();
+        let lat = latest.get(tool).cloned().unwrap_or_default();
+        let title = format!("Upgrade {tool} on {node} ({cur} → {lat})");
+        let payload = serde_json::json!({
+            "tool":    tool,
+            "node":    node,
+            "current": cur,
+            "latest":  lat,
+        });
+        let trigger_spec = serde_json::json!({});
+        let required_caps = serde_json::json!([]);
+        if ff_db::pg_enqueue_deferred(
+            pool,
+            &title,
+            "upgrade",
+            &payload,
+            "operator",
+            &trigger_spec,
+            Some(node),
+            &required_caps,
+            Some("version_check"),
+            Some(3),
+        )
+        .await
+        .is_ok()
+        {
+            created += 1;
+        }
+    }
+    Ok(created)
+}
+
+/// Best-effort version equivalence. Tool `--version` output and upstream
+/// release tags are almost never byte-identical: "gh version 2.89.0 (date)"
+/// vs "v2.89.0", "2.32.1" vs "v2.32.1", "OpenClaw 2.4.0" vs "2.4.0", etc.
+/// We extract the first dotted numeric sequence from each side and compare
+/// those; if either side has no numeric version, fall back to literal compare
+/// (which will usually be unequal — safer to over-report drift than miss it).
+fn versions_equivalent(a: &str, b: &str) -> bool {
+    match (extract_semver(a), extract_semver(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => a == b,
+    }
+}
+
+fn extract_semver(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_digit() {
+            let start = i;
+            while i < bytes.len()
+                && (bytes[i].is_ascii_digit() || bytes[i] == b'.')
+            {
+                i += 1;
+            }
+            let slice = &s[start..i];
+            if slice.contains('.') {
+                return Some(slice.trim_end_matches('.').to_string());
+            }
+        } else {
+            i += 1;
+        }
+    }
+    None
 }
 
 // ── helpers ──────────────────────────────────────────────────────

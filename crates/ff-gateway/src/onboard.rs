@@ -509,6 +509,100 @@ pub async fn check_tcp(Query(q): Query<CheckTcpQuery>) -> Json<Value> {
     Json(json!({"ip": q.ip, "port": q.port, "reachable": reachable}))
 }
 
+// ─── Fleet tooling matrix (for /versions dashboard page) ────────────────
+
+pub async fn get_fleet_tooling(
+    State(state): State<Arc<GatewayState>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let pool = state
+        .operational_store
+        .as_ref()
+        .and_then(|os| os.pg_pool())
+        .ok_or_else(|| {
+            (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":"postgres pool not available"})))
+        })?;
+    let nodes = ff_db::pg_list_nodes(pool)
+        .await
+        .map_err(|e| db_err("pg_list_nodes", e))?;
+    let out: Vec<Value> = nodes
+        .iter()
+        .map(|n| json!({ "name": n.name, "tooling": n.tooling }))
+        .collect();
+    Ok(Json(json!({ "nodes": out })))
+}
+
+// ─── Deferred-task endpoints (drift/mesh-retry operator approval) ────────
+
+#[derive(Debug, Deserialize)]
+pub struct DeferredQuery {
+    pub status: Option<String>,
+    pub kind: Option<String>,
+    pub node: Option<String>,
+    pub tool: Option<String>,
+    pub limit: Option<i64>,
+}
+
+pub async fn list_deferred(
+    State(state): State<Arc<GatewayState>>,
+    Query(q): Query<DeferredQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let pool = state
+        .operational_store
+        .as_ref()
+        .and_then(|os| os.pg_pool())
+        .ok_or_else(|| {
+            (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":"postgres pool not available"})))
+        })?;
+    let rows = ff_db::pg_list_deferred(pool, q.status.as_deref(), q.limit.unwrap_or(100))
+        .await
+        .map_err(|e| db_err("pg_list_deferred", e))?;
+    let out: Vec<Value> = rows.iter()
+        .filter(|t| q.kind.as_deref().map(|k| k == t.kind).unwrap_or(true))
+        .filter(|t| q.node.as_deref().map(|n| t.preferred_node.as_deref() == Some(n)).unwrap_or(true))
+        .filter(|t| {
+            q.tool.as_deref().map(|tool| {
+                t.payload.get("tool").and_then(|v| v.as_str()) == Some(tool)
+            }).unwrap_or(true)
+        })
+        .map(|t| json!({
+            "id":             t.id,
+            "title":          t.title,
+            "kind":           t.kind,
+            "status":         t.status,
+            "trigger_type":   t.trigger_type,
+            "preferred_node": t.preferred_node,
+            "payload":        t.payload,
+            "attempts":       t.attempts,
+            "max_attempts":   t.max_attempts,
+            "created_at":     t.created_at,
+            "last_error":     t.last_error,
+        }))
+        .collect();
+    Ok(Json(json!({ "tasks": out })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PromotePath {
+    pub id: String,
+}
+
+pub async fn promote_deferred(
+    State(state): State<Arc<GatewayState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let pool = state
+        .operational_store
+        .as_ref()
+        .and_then(|os| os.pg_pool())
+        .ok_or_else(|| {
+            (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":"postgres pool not available"})))
+        })?;
+    let promoted = ff_db::pg_promote_deferred(pool, &id)
+        .await
+        .map_err(|e| db_err("pg_promote_deferred", e))?;
+    Ok(Json(json!({ "id": id, "promoted": promoted })))
+}
+
 // ─── Internal helpers ────────────────────────────────────────────────────
 
 fn db_err(op: &str, e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
