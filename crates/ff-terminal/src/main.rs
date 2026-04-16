@@ -2992,6 +2992,26 @@ async fn execute_deferred(
             let body = task.payload.get("body").cloned();
             execute_http(method, url, body).await
         }
+        "internal" => {
+            // Internal ForgeFleet tasks dispatched by title. Requires DB pool —
+            // we open a short-lived one here so execute_deferred stays pure.
+            if task.title.starts_with("Mesh propagate SSH for ") {
+                match ff_agent::fleet_info::get_fleet_pool().await {
+                    Ok(pool) => match ff_agent::mesh_check::mesh_propagate(&pool, &task.payload).await {
+                        Ok((ok, fail)) => {
+                            let result = serde_json::json!({"ok_peers": ok, "failed_peers": fail});
+                            let success = fail == 0;
+                            let err = if success { None } else { Some(format!("{fail} peer(s) failed")) };
+                            (success, Some(result), err)
+                        }
+                        Err(e) => (false, None, Some(format!("mesh_propagate: {e}"))),
+                    },
+                    Err(e) => (false, None, Some(format!("pool: {e}"))),
+                }
+            } else {
+                (false, None, Some(format!("unknown internal task title: {}", task.title)))
+            }
+        }
         other => (false, None, Some(format!("unknown task kind: {other}"))),
     }
 }
@@ -3568,14 +3588,25 @@ async fn handle_daemon(
     let mut recon_tick = tokio::time::interval(Duration::from_secs(reconcile_interval));
     // Sweeper: every 5 minutes, only on the scheduler node.
     let mut sweep_tick = tokio::time::interval(Duration::from_secs(300));
-    // First tick fires immediately for each — prime all four.
+    // Version check: every 6 hours (fleet-wide drift detection).
+    let mut version_tick = tokio::time::interval(Duration::from_secs(6 * 3600));
+    // First tick fires immediately for each — prime all five.
     defer_tick.tick().await;
     disk_tick.tick().await;
     recon_tick.tick().await;
     sweep_tick.tick().await;
+    version_tick.tick().await;
 
     // Do an initial pass immediately on startup.
     let _ = defer_pass(&pool, &worker_name, scheduler, &slots).await;
+    // Initial version check on daemon startup so operators see data within
+    // seconds instead of waiting 6 hours for the first tick.
+    match ff_agent::version_check::version_check_pass(&pool).await {
+        Ok(s) if !s.drifted_keys.is_empty() => println!(
+            "{CYAN}[versions]{RESET} drift: {}", s.drifted_keys.join(", ")),
+        Ok(s) => println!("{CYAN}[versions]{RESET} initial pass: {} tools ✓", s.total_keys),
+        Err(e) => eprintln!("{RED}[versions] startup: {e}{RESET}"),
+    }
     match ff_agent::disk_sampler::sample_local_disk(&pool).await {
         Ok(s) => println!(
             "{CYAN}[disk]{RESET} {} total={}MB used={}MB free={}MB models={}MB quota={}%{}",
@@ -3664,6 +3695,15 @@ async fn handle_daemon(
                     ),
                     Ok(_) => {}
                     Err(e) => eprintln!("{RED}[sweeper] error: {e}{RESET}"),
+                }
+            }
+            _ = version_tick.tick() => {
+                match ff_agent::version_check::version_check_pass(&pool).await {
+                    Ok(s) if !s.drifted_keys.is_empty() => println!(
+                        "{CYAN}[versions]{RESET} drift detected: {}",
+                        s.drifted_keys.join(", ")),
+                    Ok(_) => {}
+                    Err(e) => eprintln!("{RED}[versions] {e}{RESET}"),
                 }
             }
         }

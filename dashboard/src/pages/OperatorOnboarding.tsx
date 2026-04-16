@@ -1,447 +1,314 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { Link } from 'react-router-dom'
-import { getJson } from '../lib/api'
-import { extractNodes, extractSummary } from '../lib/normalizers'
-import type { FleetNode, FleetStatusResponse } from '../types'
+import { detectClient } from '../lib/browserDetect'
+import type { DetectedClient, MachineKind } from '../lib/browserDetect'
+import { Checklist } from './onboard/Checklist'
+import { DetailPanel } from './onboard/DetailPanel'
+import { OnboardChat } from './onboard/OnboardChat'
 
-type RuntimeConfig = {
-  nodes_configured?: number
-  bootstrap_targets_configured?: number
-}
+const LEADER_HOST = window.location.hostname || '192.168.5.100'
+const LEADER_PORT = window.location.port || '51002'
+const MACHINE_KINDS: { value: MachineKind; label: string }[] = [
+  { value: 'apple-silicon', label: 'Apple Silicon Mac (mlx)' },
+  { value: 'intel-mac', label: 'Intel Mac (llama.cpp)' },
+  { value: 'linux', label: 'Linux x86 CPU (llama.cpp)' },
+  { value: 'linux-gpu', label: 'Linux + NVIDIA GPU (vllm)' },
+  { value: 'dgx-os', label: 'DGX OS (vllm)' },
+]
 
-type TokenState = {
-  resolved?: boolean
-  source?: string
-}
-
-type EnrollmentSettings = {
-  default_role?: string | null
-  allowed_roles?: string[]
-  token?: TokenState
-}
-
-type BootstrapTarget = {
-  name: string
-  status?: string | null
-  os?: string | null
-  hardware?: string | null
-  reachable_by_ssh?: boolean | null
-  enrolled?: boolean | null
-  required_manual_floor?: string[]
-  notes?: string | null
-}
-
-type BootstrapSummary = {
-  total_targets?: number
-  enrolled_targets?: number
-  ssh_reachable_targets?: number
-  manual_steps_pending?: number
-}
-
-type SettingsRuntimeResponse = {
-  runtime_config?: RuntimeConfig
-  enrollment?: EnrollmentSettings
-  bootstrap?: {
-    summary?: BootstrapSummary
-    targets?: BootstrapTarget[]
+function runtimeFor(kind: MachineKind): string {
+  switch (kind) {
+    case 'apple-silicon':
+      return 'mlx'
+    case 'dgx-os':
+    case 'linux-gpu':
+      return 'vllm'
+    default:
+      return 'llama.cpp'
   }
 }
 
-type FleetSummaryState = {
-  total_nodes: number
-  connected_nodes: number
-  enrolled_nodes: number
-  seed_nodes: number
-}
-
-type ChecklistStep = {
-  title: string
-  detail: string
-  routeLabel?: string
-  routeTo?: string
-}
-
-const CHECKLIST_STEPS: ChecklistStep[] = [
-  {
-    title: 'Confirm enrollment trust gate is healthy',
-    detail: 'Verify enrollment token source is resolved before adding any new node.',
-    routeLabel: 'Open Settings',
-    routeTo: '/settings',
-  },
-  {
-    title: 'Validate static bootstrap inventory',
-    detail: 'Make sure each planned machine appears as a seed/static node or in bootstrap targets.',
-    routeLabel: 'Open Fleet Overview',
-    routeTo: '/',
-  },
-  {
-    title: 'Bring node online and enroll',
-    detail: 'Use POST /api/fleet/enroll, then start heartbeats to promote the node from seed/static to enrolled/live.',
-  },
-  {
-    title: 'Verify topology + replication visibility',
-    detail: 'After enrollment, verify leader/follower role and replication health.',
-    routeLabel: 'Open Topology',
-    routeTo: '/topology',
-  },
-  {
-    title: 'Inspect node-level runtime provenance',
-    detail: 'Open node detail and confirm source kind, heartbeat freshness, workload, and service version.',
-  },
-]
-
-function sourceLabel(node: FleetNode): string {
-  return node.source_kind ?? (node.runtime_enrolled ? 'enrolled/live' : 'seed/static')
-}
-
-function sourcePillClass(source: string): string {
-  if (source === 'enrolled/live') return 'bg-sky-500/20 text-sky-200 border border-sky-500/30'
-  if (source === 'seed/static') return 'bg-slate-700 text-slate-200 border border-slate-600'
-  return 'bg-violet-500/20 text-violet-200 border border-violet-500/30'
-}
-
-function boolLabel(value: boolean | null | undefined): string {
-  if (value === true) return 'yes'
-  if (value === false) return 'no'
-  return 'unknown'
-}
-
-function boolPillClass(value: boolean | null | undefined): string {
-  if (value === true) return 'bg-emerald-500/20 text-emerald-200 border border-emerald-500/30'
-  if (value === false) return 'bg-rose-500/20 text-rose-200 border border-rose-500/30'
-  return 'bg-slate-700 text-slate-200 border border-slate-600'
+function osFamilyFor(kind: MachineKind): string {
+  if (kind === 'apple-silicon' || kind === 'intel-mac') return 'mac'
+  return 'linux'
 }
 
 export function OperatorOnboarding() {
-  const [nodes, setNodes] = useState<FleetNode[]>([])
-  const [summary, setSummary] = useState<FleetSummaryState>({
-    total_nodes: 0,
-    connected_nodes: 0,
-    enrolled_nodes: 0,
-    seed_nodes: 0,
-  })
-  const [settings, setSettings] = useState<SettingsRuntimeResponse | null>(null)
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
+  const [detected, setDetected] = useState<DetectedClient | null>(null)
+  const [name, setName] = useState('newbox')
+  const [ip, setIp] = useState('')
+  const [sshUser, setSshUser] = useState('newbox')
+  const [role, setRole] = useState<'builder' | 'gateway' | 'testbed'>('builder')
+  const [machineKind, setMachineKind] = useState<MachineKind>('linux')
+  const [activeId, setActiveId] = useState<string | null>(null)
+  const [progress, setProgress] = useState<
+    Array<{ step: string; status: string; detail?: string; at: string }>
+  >([])
+  const [token, setToken] = useState<string>('')
 
-  const load = useCallback(async () => {
-    try {
-      setError(null)
-      setLoading(true)
-
-      const [fleetPayload, settingsPayload] = await Promise.all([
-        getJson<FleetStatusResponse>('/api/fleet/status').catch(() =>
-          getJson<FleetStatusResponse>('/api/status'),
-        ),
-        getJson<SettingsRuntimeResponse>('/api/settings/runtime'),
-      ])
-
-      const normalizedNodes = extractNodes(fleetPayload)
-      const normalizedSummary = extractSummary(fleetPayload)
-
-      setNodes(normalizedNodes)
-      setSummary({
-        total_nodes: normalizedSummary.total_nodes ?? normalizedNodes.length,
-        connected_nodes: normalizedSummary.connected_nodes ?? 0,
-        enrolled_nodes: normalizedSummary.enrolled_nodes ?? 0,
-        seed_nodes: normalizedSummary.seed_nodes ?? 0,
-      })
-      setSettings(settingsPayload)
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load operator onboarding state')
-    } finally {
-      setLoading(false)
-    }
+  // Kick detection once.
+  useEffect(() => {
+    detectClient().then((d) => {
+      setDetected(d)
+      setMachineKind(d.suggested_kind === 'unknown' ? 'linux' : d.suggested_kind)
+      if (d.lan_ip) setIp(d.lan_ip)
+    })
   }, [])
 
+  // Keep ssh_user synced with name by default.
   useEffect(() => {
-    void load()
-  }, [load])
+    if (sshUser === '' || sshUser === 'newbox') {
+      setSshUser(name || 'newbox')
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [name])
 
-  const enrolledNodes = useMemo(
-    () => nodes.filter((node) => sourceLabel(node) === 'enrolled/live'),
-    [nodes],
-  )
+  // Try to read the enrollment token from the runtime settings endpoint
+  // so the copy-paste command works without the operator typing a token.
+  useEffect(() => {
+    fetch('/api/settings/runtime')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => {
+        const s = d?.enrollment?.token?.value || d?.enrollment?.shared_secret
+        if (typeof s === 'string' && s.length > 0) setToken(s)
+      })
+      .catch(() => {
+        /* noop */
+      })
+  }, [])
 
-  const seedNodes = useMemo(
-    () => nodes.filter((node) => sourceLabel(node) === 'seed/static'),
-    [nodes],
-  )
+  // Subscribe to /ws for enrollment-progress events (best-effort).
+  useEffect(() => {
+    if (!name) return
+    let ws: WebSocket | null = null
+    try {
+      ws = new WebSocket(`ws://${LEADER_HOST}:${LEADER_PORT}/ws`)
+      ws.onmessage = (evt) => {
+        try {
+          const m = JSON.parse(evt.data)
+          if (m?.channel === `fleet:enrollment:${name}` || m?.name === name) {
+            setProgress((prev) => [
+              ...prev,
+              {
+                step: m.step || m.payload?.step || '?',
+                status: m.status || m.payload?.status || '?',
+                detail: m.detail || m.payload?.detail,
+                at: m.at || m.payload?.at || new Date().toISOString(),
+              },
+            ])
+          }
+        } catch {
+          /* noop */
+        }
+      }
+    } catch {
+      /* noop */
+    }
+    return () => {
+      try {
+        ws?.close()
+      } catch {
+        /* noop */
+      }
+    }
+  }, [name])
 
-  const bootstrapTargets = settings?.bootstrap?.targets ?? []
-  const bootstrapSummary = settings?.bootstrap?.summary
-  const enrollmentTokenReady = settings?.enrollment?.token?.resolved === true
+  const runtime = runtimeFor(machineKind)
+  const osFamily = osFamilyFor(machineKind)
 
-  const configuredNodes = settings?.runtime_config?.nodes_configured ?? summary.total_nodes
-  const configuredBootstrapTargets =
-    settings?.runtime_config?.bootstrap_targets_configured ?? bootstrapTargets.length
+  const curlCommand = useMemo(() => {
+    const params = new URLSearchParams({
+      token: token || '<SET-TOKEN-FIRST>',
+      name,
+      ip: ip || 'auto',
+      ssh_user: sshUser,
+      role,
+      runtime,
+    })
+    return `curl -fsSL 'http://${LEADER_HOST}:${LEADER_PORT}/onboard/bootstrap.sh?${params.toString()}' | sudo bash`
+  }, [token, name, ip, sshUser, role, runtime])
+
+  const copy = useCallback(() => {
+    navigator.clipboard.writeText(curlCommand).catch(() => {
+      /* noop */
+    })
+  }, [curlCommand])
+
+  const runFullVerify = useCallback(async () => {
+    setProgress((p) => [...p, { step: 'verify', status: 'running', at: new Date().toISOString() }])
+    try {
+      const r = await fetch(`/api/fleet/verify-node?name=${encodeURIComponent(name)}`, {
+        method: 'POST',
+      })
+      const d = await r.json()
+      setProgress((p) => [
+        ...p,
+        {
+          step: 'verify',
+          status: d.failed === 0 ? 'ok' : 'failed',
+          detail: `${d.passed} pass / ${d.failed} fail / ${d.skipped} skip`,
+          at: new Date().toISOString(),
+        },
+      ])
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      setProgress((p) => [
+        ...p,
+        { step: 'verify', status: 'failed', detail: msg, at: new Date().toISOString() },
+      ])
+    }
+  }, [name])
 
   return (
-    <section className="space-y-6">
-      <div className="flex flex-wrap items-start justify-between gap-3">
-        <div>
-          <h1 className="text-2xl font-bold tracking-tight text-slate-100">Operator Onboarding & Bring-Up</h1>
-          <p className="mt-1 text-sm text-slate-400">
-            Real bring-up path for adding computers: checklist, bootstrap target visibility, and live seed/static → enrolled/live progress.
-          </p>
+    <div className="h-full flex flex-col bg-slate-950 text-slate-100">
+      {/* Detection card + form + copy-paste command */}
+      <div className="p-4 border-b border-slate-800 space-y-3">
+        <div className="flex items-start gap-6 flex-wrap">
+          <div className="flex-1 min-w-[320px]">
+            <div className="text-[11px] uppercase tracking-wider text-slate-500 mb-1">
+              Detected this computer
+            </div>
+            {detected ? (
+              <div className="text-sm text-slate-200 font-mono space-y-0.5">
+                <div>OS family: {detected.os_family}</div>
+                <div>Cores: {detected.cores}</div>
+                <div>RAM hint: {detected.ram_gb_hint || '?'} GB</div>
+                <div>LAN IP: {detected.lan_ip || '(WebRTC blocked)'}</div>
+                <div>
+                  GPU hint: <span className="text-slate-400">{detected.webgl_renderer || '—'}</span>
+                </div>
+                <div>Timezone: {detected.timezone}</div>
+              </div>
+            ) : (
+              <div className="text-sm text-slate-500">Detecting…</div>
+            )}
+          </div>
+          <div className="flex-1 min-w-[320px] grid grid-cols-2 gap-2 text-sm">
+            <label className="text-slate-400 self-center">Name</label>
+            <input
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              className="bg-slate-900 border border-slate-700 rounded px-2 py-1"
+            />
+            <label className="text-slate-400 self-center">IP</label>
+            <input
+              value={ip}
+              onChange={(e) => setIp(e.target.value)}
+              placeholder="auto"
+              className="bg-slate-900 border border-slate-700 rounded px-2 py-1"
+            />
+            <label className="text-slate-400 self-center">SSH user</label>
+            <input
+              value={sshUser}
+              onChange={(e) => setSshUser(e.target.value)}
+              className="bg-slate-900 border border-slate-700 rounded px-2 py-1"
+            />
+            <label className="text-slate-400 self-center">Role</label>
+            <select
+              value={role}
+              onChange={(e) => setRole(e.target.value as typeof role)}
+              className="bg-slate-900 border border-slate-700 rounded px-2 py-1"
+            >
+              <option value="builder">builder</option>
+              <option value="gateway">gateway</option>
+              <option value="testbed">testbed</option>
+            </select>
+            <label className="text-slate-400 self-center">Machine kind</label>
+            <select
+              value={machineKind}
+              onChange={(e) => setMachineKind(e.target.value as MachineKind)}
+              className="bg-slate-900 border border-slate-700 rounded px-2 py-1"
+            >
+              {MACHINE_KINDS.map((k) => (
+                <option key={k.value} value={k.value}>
+                  {k.label}
+                </option>
+              ))}
+            </select>
+          </div>
         </div>
-        <button
-          type="button"
-          onClick={() => void load()}
-          disabled={loading}
-          className="rounded-lg bg-sky-600 px-4 py-2 text-sm font-medium text-white transition hover:bg-sky-500 disabled:opacity-50"
-        >
-          {loading ? 'Refreshing…' : '↻ Refresh'}
-        </button>
-      </div>
-
-      {error ? <Info text={`Error: ${error}`} danger /> : null}
-
-      <Info
-        text={
-          enrollmentTokenReady
-            ? `Enrollment token source is healthy (${settings?.enrollment?.token?.source ?? 'resolved'}). New nodes can enroll when ready.`
-            : 'Enrollment token is not resolved. Bring-up will fail until enrollment secret is configured.'
-        }
-        accent={
-          enrollmentTokenReady
-            ? 'rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-200'
-            : 'rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-200'
-        }
-      />
-
-      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-6">
-        <Stat label="Configured Nodes" value={configuredNodes} />
-        <Stat label="Connected" value={summary.connected_nodes} accent="text-emerald-300" />
-        <Stat label="Live Enrolled" value={summary.enrolled_nodes} accent="text-sky-300" />
-        <Stat label="Seed Static" value={summary.seed_nodes} />
-        <Stat label="Bootstrap Targets" value={configuredBootstrapTargets} />
-        <Stat label="SSH Reachable Targets" value={bootstrapSummary?.ssh_reachable_targets ?? 0} accent="text-emerald-300" />
-      </div>
-
-      <article className="rounded-xl border border-slate-800 bg-slate-900/60 p-4">
-        <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-slate-300">Onboarding Checklist</h2>
-        <ol className="space-y-3">
-          {CHECKLIST_STEPS.map((step, index) => (
-            <li key={step.title} className="rounded-lg border border-slate-800 bg-slate-950/70 p-3">
-              <p className="text-sm font-medium text-slate-100">
-                {index + 1}. {step.title}
-              </p>
-              <p className="mt-1 text-sm text-slate-400">{step.detail}</p>
-              {step.routeLabel && step.routeTo ? (
-                <Link to={step.routeTo} className="mt-2 inline-block text-xs text-sky-300 hover:text-sky-200">
-                  {step.routeLabel} →
-                </Link>
-              ) : null}
-            </li>
-          ))}
-        </ol>
-      </article>
-
-      <div className="grid gap-4 xl:grid-cols-2">
-        <article className="rounded-xl border border-slate-800 bg-slate-900/60 p-4">
-          <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-slate-300">
-            Seed/Static Nodes Awaiting Bring-Up ({seedNodes.length})
-          </h2>
-          {seedNodes.length === 0 ? (
-            <p className="text-sm text-slate-400">No seed/static nodes currently visible.</p>
-          ) : (
-            <ul className="space-y-2">
-              {seedNodes.map((node) => (
-                <NodeListItem key={node.id ?? node.name} node={node} />
-              ))}
-            </ul>
+        <div className="bg-slate-900 border border-indigo-500/30 rounded p-3">
+          <div className="flex items-center justify-between mb-1">
+            <div className="text-[11px] uppercase tracking-wider text-indigo-300">
+              Copy-paste on the new computer
+            </div>
+            <button
+              onClick={copy}
+              className="text-xs px-2 py-1 rounded border border-indigo-400 text-indigo-200 hover:bg-indigo-500/20"
+            >
+              Copy
+            </button>
+          </div>
+          <pre className="text-[12px] font-mono text-emerald-200 whitespace-pre-wrap break-all">
+            {curlCommand}
+          </pre>
+          {token === '' && (
+            <div className="mt-2 text-[11px] text-amber-400">
+              Warning: enrollment token not yet set. Run{' '}
+              <code className="bg-slate-800 px-1 rounded">
+                ff secrets set enrollment.shared_secret &lt;token&gt;
+              </code>{' '}
+              on Taylor before running the command above.
+            </div>
           )}
-        </article>
-
-        <article className="rounded-xl border border-slate-800 bg-slate-900/60 p-4">
-          <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-slate-300">
-            Enrolled/Live Nodes ({enrolledNodes.length})
-          </h2>
-          {enrolledNodes.length === 0 ? (
-            <p className="text-sm text-slate-400">No runtime-enrolled nodes reported yet.</p>
-          ) : (
-            <ul className="space-y-2">
-              {enrolledNodes.map((node) => (
-                <NodeListItem key={node.id ?? node.name} node={node} />
-              ))}
-            </ul>
-          )}
-        </article>
+        </div>
       </div>
 
-      <article className="rounded-xl border border-slate-800 bg-slate-900/60 p-4">
-        <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-slate-300">
-          Bootstrap Targets from Config ({bootstrapTargets.length})
-        </h2>
+      {/* 3-column body */}
+      <div className="flex-1 grid grid-cols-12 min-h-0">
+        <div className="col-span-4 border-r border-slate-800 overflow-hidden">
+          <Checklist
+            machineKind={machineKind}
+            osFamily={osFamily}
+            targetIp={ip}
+            targetName={name}
+            activeId={activeId}
+            onSelect={setActiveId}
+          />
+        </div>
+        <div className="col-span-5 border-r border-slate-800 overflow-hidden">
+          <DetailPanel activeId={activeId} />
+        </div>
+        <div className="col-span-3 overflow-hidden">
+          <OnboardChat nodeName={name} osFamily={osFamily} machineKind={machineKind} />
+        </div>
+      </div>
 
-        {bootstrapTargets.length === 0 ? (
-          <p className="text-sm text-slate-400">
-            No <code>[[bootstrap_targets]]</code> entries found in fleet config.
-          </p>
+      {/* Progress + verify */}
+      <div className="border-t border-slate-800 p-3 space-y-2">
+        <div className="flex items-center justify-between">
+          <div className="text-[11px] uppercase tracking-wider text-slate-500">
+            Enrollment progress
+          </div>
+          <button
+            onClick={runFullVerify}
+            className="text-xs px-2 py-1 rounded border border-emerald-400 text-emerald-200 hover:bg-emerald-500/20"
+          >
+            Run full verify
+          </button>
+        </div>
+        {progress.length === 0 ? (
+          <div className="text-sm text-slate-500">
+            Waiting for enrollment-progress events… run the copy-paste command on the new machine.
+          </div>
         ) : (
-          <div className="space-y-3">
-            {bootstrapTargets.map((target) => {
-              const manual = target.required_manual_floor ?? []
-              const matchingNode = nodes.find((node) => {
-                const id = String(node.id ?? node.name)
-                return id === target.name || node.name === target.name || node.hostname === target.name
-              })
-
+          <div className="space-y-0.5 font-mono text-xs max-h-40 overflow-auto">
+            {progress.slice(-20).map((ev, i) => {
+              const color =
+                ev.status === 'ok'
+                  ? 'text-emerald-300'
+                  : ev.status === 'failed'
+                    ? 'text-rose-300'
+                    : 'text-amber-300'
               return (
-                <div key={target.name} className="rounded-lg border border-slate-800 bg-slate-950/70 p-3">
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <p className="text-sm font-medium text-slate-100">{target.name}</p>
-                    <div className="flex flex-wrap items-center gap-2 text-xs">
-                      <span className={`rounded-full px-2 py-0.5 ${boolPillClass(target.reachable_by_ssh)}`}>
-                        ssh: {boolLabel(target.reachable_by_ssh)}
-                      </span>
-                      <span className={`rounded-full px-2 py-0.5 ${boolPillClass(target.enrolled)}`}>
-                        enrolled: {boolLabel(target.enrolled)}
-                      </span>
-                      <span className="rounded-full border border-slate-700 bg-slate-800 px-2 py-0.5 text-slate-200">
-                        status: {target.status ?? 'unreported'}
-                      </span>
-                    </div>
-                  </div>
-
-                  <p className="mt-1 text-xs text-slate-400">
-                    OS: {target.os ?? 'unknown'} • Hardware: {target.hardware ?? 'unknown'}
-                  </p>
-
-                  {manual.length > 0 ? (
-                    <ul className="mt-2 list-disc space-y-1 pl-5 text-xs text-amber-200">
-                      {manual.map((step) => (
-                        <li key={step}>{step}</li>
-                      ))}
-                    </ul>
-                  ) : null}
-
-                  {target.notes ? <p className="mt-2 text-xs text-slate-400">Notes: {target.notes}</p> : null}
-
-                  {matchingNode ? (
-                    <Link
-                      to={`/nodes/${encodeURIComponent(matchingNode.id ?? matchingNode.name)}`}
-                      className="mt-2 inline-block text-xs text-sky-300 hover:text-sky-200"
-                    >
-                      Open node detail →
-                    </Link>
-                  ) : null}
+                <div key={i} className={color}>
+                  [{ev.at.split('T')[1]?.slice(0, 8) || '--'}] {ev.status.padEnd(8)} {ev.step}
+                  {ev.detail ? ` — ${ev.detail}` : ''}
                 </div>
               )
             })}
           </div>
         )}
-
-        <div className="mt-4 grid gap-3 sm:grid-cols-3">
-          <Stat label="Enrolled Targets" value={bootstrapSummary?.enrolled_targets ?? 0} accent="text-sky-300" compact />
-          <Stat label="SSH Reachable" value={bootstrapSummary?.ssh_reachable_targets ?? 0} accent="text-emerald-300" compact />
-          <Stat label="Manual Steps Pending" value={bootstrapSummary?.manual_steps_pending ?? 0} compact />
-        </div>
-      </article>
-
-      <article className="rounded-xl border border-slate-800 bg-slate-900/60 p-4">
-        <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-slate-300">Bring-Up API Surface (No Placeholder Actions)</h2>
-        <ul className="space-y-2 text-sm text-slate-300">
-          <li>
-            <code className="rounded bg-slate-950 px-1 py-0.5 text-xs">POST /api/fleet/enroll</code> — trust-gated runtime enrollment for a node
-          </li>
-          <li>
-            <code className="rounded bg-slate-950 px-1 py-0.5 text-xs">POST /api/fleet/heartbeat</code> — runtime heartbeat updates after enrollment
-          </li>
-          <li>
-            <code className="rounded bg-slate-950 px-1 py-0.5 text-xs">GET /api/fleet/status</code> — full fleet status with source_kind and runtime provenance
-          </li>
-          <li>
-            <code className="rounded bg-slate-950 px-1 py-0.5 text-xs">GET /api/fleet/nodes/{'{id}'}</code> — direct node detail view
-          </li>
-          <li>
-            <code className="rounded bg-slate-950 px-1 py-0.5 text-xs">GET /api/settings/runtime</code> — safe config visibility including bootstrap target summary
-          </li>
-        </ul>
-      </article>
-    </section>
-  )
-}
-
-function NodeListItem({ node }: { node: FleetNode }) {
-  const source = sourceLabel(node)
-  const status = (node.status ?? node.health ?? 'unknown').toLowerCase()
-
-  return (
-    <li className="rounded-lg border border-slate-800 bg-slate-950/70 p-3">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <div>
-          <p className="text-sm font-medium text-slate-100">{node.name}</p>
-          <p className="text-xs text-slate-400">{node.ip ?? 'unknown ip'} • {node.role ?? 'unknown role'}</p>
-        </div>
-        <div className="flex items-center gap-2 text-xs">
-          <span className="rounded-full border border-slate-700 bg-slate-800 px-2 py-0.5 text-slate-200">
-            {status}
-          </span>
-          <span className={`rounded-full px-2 py-0.5 ${sourcePillClass(source)}`}>{source}</span>
-        </div>
       </div>
-
-      <p className="mt-1 text-xs text-slate-400">
-        heartbeat: {node.last_heartbeat ?? 'unknown'} • freshness: {node.heartbeat_freshness ?? 'unknown'}
-      </p>
-      <p className="mt-1 text-xs text-slate-500">
-        runtime provenance: {(node.runtime_provenance ?? []).join(', ') || 'unreported'}
-      </p>
-
-      <Link
-        to={`/nodes/${encodeURIComponent(node.id ?? node.name)}`}
-        className="mt-2 inline-block text-xs text-sky-300 hover:text-sky-200"
-      >
-        View details →
-      </Link>
-    </li>
-  )
-}
-
-function Stat({
-  label,
-  value,
-  accent,
-  compact = false,
-}: {
-  label: string
-  value: string | number
-  accent?: string
-  compact?: boolean
-}) {
-  return (
-    <article className={`rounded-lg border border-slate-800 bg-slate-900/70 ${compact ? 'p-3' : 'p-4'}`}>
-      <p className="text-xs uppercase tracking-wide text-slate-500">{label}</p>
-      <p className={`${compact ? 'mt-1 text-xl' : 'mt-2 text-2xl'} font-semibold ${accent ?? 'text-slate-100'}`}>
-        {value}
-      </p>
-    </article>
-  )
-}
-
-function Info({
-  text,
-  danger = false,
-  accent,
-}: {
-  text: string
-  danger?: boolean
-  accent?: string
-}) {
-  return (
-    <div
-      className={
-        accent ??
-        `rounded-xl border px-4 py-3 text-sm ${
-          danger
-            ? 'border-rose-500/30 bg-rose-500/10 text-rose-200'
-            : 'border-slate-800 bg-slate-900/50 text-slate-300'
-        }`
-      }
-    >
-      {text}
     </div>
   )
 }

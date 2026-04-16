@@ -14,6 +14,7 @@ import { MissionControl } from './pages/MissionControl'
 import { ModelInventory } from './pages/ModelInventory'
 import { MyTasks } from './pages/MyTasks'
 import { OperatorOnboarding } from './pages/OperatorOnboarding'
+import { Versions } from './pages/Versions'
 import { PlanningHub } from './pages/PlanningHub'
 import { Projects } from './pages/Projects'
 import { Topology } from './pages/Topology'
@@ -88,6 +89,8 @@ export default function App() {
         <Route path="audit" element={<AuditLog />} />
         <Route path="updates" element={<Updates />} />
         <Route path="onboarding" element={<OperatorOnboarding />} />
+        <Route path="onboard" element={<Navigate to="/onboarding" replace />} />
+        <Route path="versions" element={<Versions />} />
         {/* Legacy redirects */}
         <Route path="mission-control" element={<Navigate to="/" replace />} />
         <Route path="nodes/:nodeId" element={<Navigate to="/settings#fleet" replace />} />
