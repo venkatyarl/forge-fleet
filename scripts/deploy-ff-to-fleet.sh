@@ -91,8 +91,12 @@ if command -v systemctl >/dev/null; then
         sudo cp deploy/systemd/forgefleet-daemon.service "$UNIT" || echo "SUDO_FAILED"
         sudo systemctl daemon-reload || true
     fi
-    # Don't auto-start — operator enables: sudo systemctl enable forgefleet-daemon@$USER.service
-    echo "systemd: enable with: sudo systemctl enable --now forgefleet-daemon@$USER.service"
+    # Auto-enable at boot so the daemon comes back after a restart. Idempotent.
+    if sudo systemctl enable "forgefleet-daemon@$USER.service" >/dev/null 2>&1; then
+        echo "systemd: enabled forgefleet-daemon@$USER.service for boot"
+    else
+        echo "systemd: enable step failed (may need manual: sudo systemctl enable forgefleet-daemon@$USER.service)"
+    fi
 fi
 echo "OK"
 REMOTE
