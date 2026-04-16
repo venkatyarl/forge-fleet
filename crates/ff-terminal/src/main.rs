@@ -87,6 +87,14 @@ enum Command {
         /// Exit after one scheduler+worker pass (useful for tests / cron).
         #[arg(long, default_value_t = false)] once: bool,
     },
+    /// Show installed-vs-latest tool versions across the fleet (drift matrix).
+    Versions {
+        #[arg(long)] node: Option<String>,
+    },
+    /// Fleet-wide operations (mesh check, verify node, etc.)
+    Fleet { #[command(subcommand)] command: FleetCommand },
+    /// Self-service onboarding helpers (show curl command, list recent, revoke).
+    Onboard { #[command(subcommand)] command: OnboardCommand },
     /// Run ForgeFleet's unified daemon: deferred-task scheduler+worker, disk
     /// sampler, and deployment reconciler all in one long-lived process.
     /// Typically run on boot via launchd/systemd.
@@ -113,12 +121,13 @@ enum ConfigCommand {
     /// Set a dotted key in the local project config (TOML).
     Set { key: String, value: String },
     /// Configure properties of a fleet node in Postgres.
-    /// Supported keys: runtime (mlx|llama.cpp|vllm|unknown), models_dir, disk_quota_pct.
+    /// Supported keys: runtime (mlx|llama.cpp|vllm|unknown), models_dir,
+    /// disk_quota_pct, sub_agent_count, gh_account, role.
     Node {
         /// Node name (e.g. "marcus").
         name: String,
         /// Property to set.
-        #[arg(value_parser = ["runtime", "models_dir", "disk_quota_pct"])]
+        #[arg(value_parser = ["runtime", "models_dir", "disk_quota_pct", "sub_agent_count", "gh_account", "role"])]
         key: String,
         /// New value for the property.
         value: String,
@@ -156,6 +165,42 @@ enum DeferCommand {
     Cancel { id: String },
     /// Retry a failed or cancelled task (resets attempts-aware status, runs ASAP).
     Retry { id: String },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum FleetCommand {
+    /// Pairwise SSH reachability check across the fleet (N×(N-1) probes).
+    SshMeshCheck {
+        #[arg(long)] node: Option<String>,
+        #[arg(long)] json: bool,
+    },
+    /// Full 12-check verify battery for one node.
+    VerifyNode {
+        name: String,
+        #[arg(long)] json: bool,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum OnboardCommand {
+    /// Print the copy-paste curl command for onboarding a new computer.
+    Show {
+        #[arg(long)] name: String,
+        #[arg(long)] ip: Option<String>,
+        #[arg(long)] ssh_user: Option<String>,
+        #[arg(long, default_value = "builder")] role: String,
+        #[arg(long, default_value = "auto")] runtime: String,
+    },
+    /// List fleet nodes by election_priority (recent onboards appear first).
+    #[command(alias = "ls")]
+    List {
+        #[arg(long, default_value_t = 25)] limit: i64,
+    },
+    /// Revoke a node: delete its fleet_nodes row, ssh keys, and mesh rows.
+    Revoke {
+        name: String,
+        #[arg(long, default_value_t = false)] yes: bool,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -329,6 +374,9 @@ async fn main() -> Result<()> {
         Some(Command::Config  { command }) => return handle_config(command.clone(), &config_path).await,
         Some(Command::Status)              => return handle_status(&config_path).await,
         Some(Command::Nodes)               => return handle_nodes(&config_path),
+        Some(Command::Versions { node })   => return handle_versions(node.clone()).await,
+        Some(Command::Fleet { command })   => return handle_fleet(command.clone()).await,
+        Some(Command::Onboard { command }) => return handle_onboard(command.clone()).await,
         _ => {}
     }
 
@@ -412,6 +460,9 @@ async fn main() -> Result<()> {
         Some(Command::Daemon { as_node, scheduler, defer_interval, disk_interval, reconcile_interval, once }) => {
             handle_daemon(as_node, scheduler, defer_interval, disk_interval, reconcile_interval, once).await
         }
+        Some(Command::Versions { node }) => handle_versions(node).await,
+        Some(Command::Fleet { command }) => handle_fleet(command).await,
+        Some(Command::Onboard { command }) => handle_onboard(command).await,
         Some(Command::Supervise { prompt, max_attempts }) => {
             let sup_config = ff_agent::supervisor::SupervisorConfig {
                 max_attempts,
@@ -2912,9 +2963,15 @@ async fn probe_online_nodes(nodes: &[ff_db::FleetNodeRow]) -> Vec<String> {
 }
 
 /// Execute a single deferred task. Returns (success, result_json, error).
+///
+/// `workspace` — optional sub-agent workspace dir. Shell tasks use this
+/// as `cwd` when running locally; SSH-dispatched shell tasks ignore it
+/// (the remote node sets its own cwd). Future `agent_run` kind will use
+/// this for checkpoint/scratch isolation across concurrent sub-agents.
 async fn execute_deferred(
     task: &ff_db::DeferredTaskRow,
     nodes: &[ff_db::FleetNodeRow],
+    workspace: Option<&std::path::Path>,
 ) -> (bool, Option<serde_json::Value>, Option<String>) {
     match task.kind.as_str() {
         "shell" => {
@@ -2924,7 +2981,7 @@ async fn execute_deferred(
             };
             // preferred_node tells us where to run. If None, run locally.
             let target = task.preferred_node.as_deref();
-            execute_shell(target, command, nodes).await
+            execute_shell(target, command, nodes, workspace).await
         }
         "http" => {
             let url = match task.payload.get("url").and_then(|v| v.as_str()) {
@@ -2944,6 +3001,7 @@ async fn execute_shell(
     target_node: Option<&str>,
     command: &str,
     nodes: &[ff_db::FleetNodeRow],
+    workspace: Option<&std::path::Path>,
 ) -> (bool, Option<serde_json::Value>, Option<String>) {
     use tokio::process::Command as TokCmd;
     let this_hostname = std::process::Command::new("hostname")
@@ -2953,12 +3011,14 @@ async fn execute_shell(
         .map(|s| s.trim().to_lowercase())
         .unwrap_or_default();
 
+    let mut local = true;
     let (program, args): (&str, Vec<String>) = match target_node {
         None => ("sh", vec!["-c".into(), command.to_string()]),
         Some(n) if this_hostname.starts_with(&n.to_lowercase()) => {
             ("sh", vec!["-c".into(), command.to_string()])
         }
         Some(n) => {
+            local = false;
             // SSH to target: look up user@ip from DB.
             let node = match nodes.iter().find(|x| x.name.eq_ignore_ascii_case(n)) {
                 Some(n) => n,
@@ -2978,7 +3038,14 @@ async fn execute_shell(
         }
     };
 
-    let output = TokCmd::new(program).args(&args).output().await;
+    let mut cmd = TokCmd::new(program);
+    cmd.args(&args);
+    if local {
+        if let Some(ws) = workspace {
+            cmd.current_dir(ws);
+        }
+    }
+    let output = cmd.output().await;
     match output {
         Ok(o) => {
             let stdout = String::from_utf8_lossy(&o.stdout).to_string();
@@ -3036,6 +3103,177 @@ async fn execute_http(
     }
 }
 
+// ─── Versions / Fleet / Onboard CLI handlers (Phase 3+5) ──────────────────
+
+async fn handle_versions(node_filter: Option<String>) -> Result<()> {
+    let pool = ff_agent::fleet_info::get_fleet_pool()
+        .await
+        .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
+    ff_db::run_postgres_migrations(&pool).await
+        .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
+
+    let nodes = ff_db::pg_list_nodes(&pool).await?;
+    let filtered: Vec<&ff_db::FleetNodeRow> = nodes.iter()
+        .filter(|n| node_filter.as_deref().map(|f| n.name == f).unwrap_or(true))
+        .collect();
+
+    // Collect every tool key seen across all nodes.
+    let mut all_keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for n in &filtered {
+        if let Some(obj) = n.tooling.as_object() {
+            for k in obj.keys() {
+                all_keys.insert(k.clone());
+            }
+        }
+    }
+    if all_keys.is_empty() {
+        println!("(no tool-version data yet — run `ff daemon` for 6h or manually trigger version_check)");
+        return Ok(());
+    }
+
+    // Header
+    print!("{:<14}", "TOOL");
+    for n in &filtered {
+        print!(" {:<14}", truncate_for_col(&n.name, 14));
+    }
+    println!();
+    for k in &all_keys {
+        print!("{:<14}", truncate_for_col(k, 14));
+        for n in &filtered {
+            let cell = n.tooling.get(k);
+            let (cur, lat) = match cell {
+                Some(obj) => (
+                    obj.get("current").and_then(|v| v.as_str()).unwrap_or("-"),
+                    obj.get("latest").and_then(|v| v.as_str()),
+                ),
+                None => ("—", None),
+            };
+            let marker = match lat {
+                Some(l) if l == cur => "✓",
+                Some(_) => "⚠",
+                None => " ",
+            };
+            let disp = format!("{} {}", truncate_for_col(cur, 11), marker);
+            print!(" {:<14}", disp);
+        }
+        println!();
+    }
+    Ok(())
+}
+
+fn truncate_for_col(s: &str, n: usize) -> String {
+    if s.chars().count() <= n { s.to_string() }
+    else { s.chars().take(n.saturating_sub(1)).collect::<String>() + "…" }
+}
+
+async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
+    let pool = ff_agent::fleet_info::get_fleet_pool()
+        .await
+        .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
+    ff_db::run_postgres_migrations(&pool).await
+        .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
+
+    match cmd {
+        FleetCommand::SshMeshCheck { node, json } => {
+            println!("{CYAN}▶ Running pairwise SSH mesh check...{RESET}");
+            let matrix = match &node {
+                Some(n) => ff_agent::mesh_check::pairwise_ssh_check_node(&pool, n).await,
+                None => ff_agent::mesh_check::pairwise_ssh_check(&pool).await,
+            }.map_err(|e| anyhow::anyhow!(e))?;
+            if json {
+                let arr: Vec<_> = matrix.cells.iter().map(|c| serde_json::json!({
+                    "src": c.src, "dst": c.dst, "status": c.status, "last_error": c.last_error,
+                })).collect();
+                println!("{}", serde_json::to_string_pretty(&arr).unwrap_or_default());
+            } else {
+                let mut ok = 0; let mut fail = 0;
+                for c in &matrix.cells {
+                    let marker = if c.status == "ok" { "✓" } else { "✗" };
+                    if c.status == "ok" { ok += 1; } else { fail += 1; }
+                    let err = c.last_error.as_deref().unwrap_or("");
+                    println!("  {:<10} → {:<10}  {}  {}", c.src, c.dst, marker, err);
+                }
+                println!("\n{ok} ok, {fail} failed — checked {} pairs", matrix.cells.len());
+            }
+        }
+        FleetCommand::VerifyNode { name, json } => {
+            println!("{CYAN}▶ Running verify-node battery for {name}...{RESET}");
+            let report = ff_agent::verify_node::verify_node(&pool, &name).await
+                .map_err(|e| anyhow::anyhow!(e))?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report).unwrap_or_default());
+            } else {
+                println!("\nResults for {}: {} pass, {} fail, {} skip", report.node, report.passed, report.failed, report.skipped);
+                for r in &report.details {
+                    let marker = match r.status.as_str() {
+                        "pass" => "✓", "fail" => "✗", _ => "—",
+                    };
+                    let msg = r.message.as_deref().unwrap_or("");
+                    println!("  {}  {:<28}  {}", marker, r.check, msg);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn handle_onboard(cmd: OnboardCommand) -> Result<()> {
+    let pool = ff_agent::fleet_info::get_fleet_pool()
+        .await
+        .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
+    ff_db::run_postgres_migrations(&pool).await
+        .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
+
+    match cmd {
+        OnboardCommand::Show { name, ip, ssh_user, role, runtime } => {
+            // Try to get token from fleet_secrets, fallback to env var.
+            let token = ff_agent::fleet_info::fetch_secret("enrollment.shared_secret")
+                .await
+                .or_else(|| std::env::var("FORGEFLEET_ENROLLMENT_TOKEN").ok())
+                .unwrap_or_else(|| "<SET-TOKEN-FIRST>".into());
+            let leader = std::env::var("FORGEFLEET_LEADER_HOST")
+                .unwrap_or_else(|_| "192.168.5.100".into());
+            let ssh_user = ssh_user.unwrap_or_else(|| name.clone());
+            let ip_q = ip.unwrap_or_else(|| "auto".into());
+            println!("{CYAN}▶ On the new computer, paste:{RESET}\n");
+            println!("curl -fsSL 'http://{leader}:51002/onboard/bootstrap.sh\\");
+            println!("    ?token={token}&name={name}&ip={ip_q}\\");
+            println!("    &ssh_user={ssh_user}&role={role}&runtime={runtime}' \\");
+            println!("  | sudo bash");
+            println!("\n  (Or open http://{leader}:51002/onboard in the browser.)");
+        }
+        OnboardCommand::List { limit } => {
+            // Recent enrollments via deferred_tasks + fleet_nodes updated_at.
+            let nodes = ff_db::pg_list_nodes(&pool).await?;
+            let mut sorted: Vec<&ff_db::FleetNodeRow> = nodes.iter().collect();
+            sorted.sort_by(|a, b| b.election_priority.cmp(&a.election_priority));
+            println!("{:<15} {:<16} {:<10} {:<6} {}", "NAME", "IP", "RUNTIME", "PRIO", "GH");
+            for n in sorted.into_iter().take(limit as usize) {
+                println!("{:<15} {:<16} {:<10} {:<6} {}",
+                    n.name, n.ip, n.runtime, n.election_priority,
+                    n.gh_account.clone().unwrap_or_else(|| "-".into()));
+            }
+        }
+        OnboardCommand::Revoke { name, yes } => {
+            if !yes {
+                println!("This will DELETE fleet_nodes row '{name}', all its SSH keys, and mesh-status rows.");
+                println!("Re-run with --yes to confirm.");
+                return Ok(());
+            }
+            let removed_keys = ff_db::pg_delete_node_ssh_keys(&pool, &name).await?;
+            let removed_mesh = ff_db::pg_delete_mesh_status_for_node(&pool, &name).await?;
+            // Delete fleet_nodes row (via raw SQL — no helper exists).
+            let r = sqlx::query("DELETE FROM fleet_nodes WHERE name = $1")
+                .bind(&name)
+                .execute(&pool)
+                .await?;
+            println!("Revoked '{name}': {} ssh keys, {} mesh rows, {} node row(s)",
+                removed_keys, removed_mesh, r.rows_affected());
+        }
+    }
+    Ok(())
+}
+
 async fn handle_defer_worker(
     as_node: Option<String>,
     interval: u64,
@@ -3052,6 +3290,14 @@ async fn handle_defer_worker(
         .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
     ff_db::run_postgres_migrations(&pool).await
         .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
+
+    // Sub-agent concurrency slots — read fleet_nodes.sub_agent_count for this node.
+    let slot_count = ff_db::pg_get_node(&pool, &worker_name).await.ok()
+        .flatten()
+        .map(|n| n.sub_agent_count.max(1) as u32)
+        .unwrap_or(1);
+    let _ = ff_agent::sub_agents::ensure_workspaces(slot_count);
+    let slots = ff_agent::sub_agents::Slots::new(slot_count);
 
     println!("{CYAN}▶ defer-worker starting{RESET}");
     println!("  node:      {worker_name}");
@@ -3077,7 +3323,7 @@ async fn handle_defer_worker(
 
     loop {
         let pass_start = std::time::Instant::now();
-        let ran_any = defer_pass(&pool, &worker_name, scheduler).await? > 0;
+        let ran_any = defer_pass(&pool, &worker_name, scheduler, &slots).await? > 0;
 
         if once {
             println!("{CYAN}▶ defer-worker: --once set, exiting{RESET}");
@@ -3100,10 +3346,14 @@ async fn handle_defer_worker(
 }
 
 /// One scheduler+worker pass. Returns number of tasks executed.
+///
+/// `slots` — sub-agent concurrency pool. On hosts with capacity > 1
+/// the pass claims and spawns up to `capacity` tasks in parallel.
 async fn defer_pass(
     pool: &sqlx::PgPool,
     worker_name: &str,
     scheduler: bool,
+    slots: &ff_agent::sub_agents::Slots,
 ) -> Result<usize> {
     // Scheduler pass: promote pending tasks whose trigger fired.
     if scheduler {
@@ -3158,32 +3408,77 @@ async fn defer_pass(
         }
     }
 
-    // Worker pass: claim and execute until queue empty.
+    // Worker pass: reserve a sub-agent slot, claim one task per slot,
+    // spawn each in its own tokio task. We keep looping until either
+    // the queue is empty or all slots are busy.
     let mut count = 0usize;
+    let mut spawned = Vec::new();
     loop {
+        let guard = match slots.try_reserve_owned() {
+            Some(g) => g,
+            None => break, // all slots busy — try next tick
+        };
+
         let claimed = match ff_db::pg_claim_deferred(pool, worker_name).await {
             Ok(Some(t)) => t,
-            Ok(None) => break,
+            Ok(None) => break, // queue empty
             Err(e) => {
                 eprintln!("{RED}[worker] claim error: {e}{RESET}");
                 break;
             }
         };
         count += 1;
-        println!("{YELLOW}[worker]{RESET} claimed {} — {}", claimed.id, claimed.title);
+        println!(
+            "{YELLOW}[worker]{RESET} slot#{} claimed {} — {}",
+            guard.index(),
+            claimed.id,
+            claimed.title,
+        );
 
+        let pool2 = pool.clone();
         let nodes = ff_db::pg_list_nodes(pool).await.unwrap_or_default();
-        let (ok, result, err) = execute_deferred(&claimed, &nodes).await;
-
-        match ff_db::pg_finish_deferred(pool, &claimed.id, ok, result.as_ref(), err.as_deref()).await {
-            Ok(()) => {
-                if ok {
-                    println!("  {CYAN}✓ completed{RESET}");
-                } else {
-                    println!("  {RED}✗ failed{RESET}: {}", err.clone().unwrap_or_default());
+        let h = tokio::spawn(async move {
+            let workspace = guard.workspace().to_path_buf();
+            let (ok, result, err) =
+                execute_deferred(&claimed, &nodes, Some(&workspace)).await;
+            match ff_db::pg_finish_deferred(
+                &pool2,
+                &claimed.id,
+                ok,
+                result.as_ref(),
+                err.as_deref(),
+            )
+            .await
+            {
+                Ok(()) => {
+                    if ok {
+                        println!(
+                            "  {CYAN}✓ completed{RESET} (slot#{} id={})",
+                            guard.index(),
+                            claimed.id,
+                        );
+                    } else {
+                        println!(
+                            "  {RED}✗ failed{RESET} (slot#{} id={}): {}",
+                            guard.index(),
+                            claimed.id,
+                            err.clone().unwrap_or_default(),
+                        );
+                    }
                 }
+                Err(e) => eprintln!("{RED}  finalize error: {e}{RESET}"),
             }
-            Err(e) => eprintln!("{RED}  finalize error: {e}{RESET}"),
+            // guard drops here, releasing the slot.
+            drop(guard);
+        });
+        spawned.push(h);
+    }
+
+    // If this pass only has one slot (legacy single-claim behaviour),
+    // await the task so callers see the same semantics as before.
+    if slots.capacity() == 1 {
+        for h in spawned {
+            let _ = h.await;
         }
     }
     Ok(count)
@@ -3208,16 +3503,25 @@ async fn handle_daemon(
     ff_db::run_postgres_migrations(&pool).await
         .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
 
+    // Sub-agent concurrency slots — read fleet_nodes.sub_agent_count for this node.
+    let slot_count = ff_db::pg_get_node(&pool, &worker_name).await.ok()
+        .flatten()
+        .map(|n| n.sub_agent_count.max(1) as u32)
+        .unwrap_or(1);
+    let _ = ff_agent::sub_agents::ensure_workspaces(slot_count);
+    let slots = ff_agent::sub_agents::Slots::new(slot_count);
+
     println!("{CYAN}▶ ForgeFleet daemon starting{RESET}");
     println!("  node:       {worker_name}");
     println!("  scheduler:  {scheduler}");
+    println!("  sub-agents: {slot_count}");
     println!("  defer:      every {defer_interval}s");
     println!("  disk:       every {disk_interval}s");
     println!("  reconcile:  every {reconcile_interval}s");
 
     if once {
         // Run one pass of each sequentially, then exit.
-        match defer_pass(&pool, &worker_name, scheduler).await {
+        match defer_pass(&pool, &worker_name, scheduler, &slots).await {
             Ok(n) => println!("{CYAN}[defer]{RESET} one-pass complete ({n} task(s))"),
             Err(e) => eprintln!("{RED}[defer] pass error: {e}{RESET}"),
         }
@@ -3271,7 +3575,7 @@ async fn handle_daemon(
     sweep_tick.tick().await;
 
     // Do an initial pass immediately on startup.
-    let _ = defer_pass(&pool, &worker_name, scheduler).await;
+    let _ = defer_pass(&pool, &worker_name, scheduler, &slots).await;
     match ff_agent::disk_sampler::sample_local_disk(&pool).await {
         Ok(s) => println!(
             "{CYAN}[disk]{RESET} {} total={}MB used={}MB free={}MB models={}MB quota={}%{}",
@@ -3314,13 +3618,13 @@ async fn handle_daemon(
     loop {
         tokio::select! {
             _ = defer_tick.tick() => {
-                if let Err(e) = defer_pass(&pool, &worker_name, scheduler).await {
+                if let Err(e) = defer_pass(&pool, &worker_name, scheduler, &slots).await {
                     eprintln!("{RED}[defer] pass error: {e}{RESET}");
                 }
             }
             Some(_) = wake_rx.recv() => {
                 println!("{CYAN}[defer]{RESET} woken by fleet:node_online");
-                if let Err(e) = defer_pass(&pool, &worker_name, scheduler).await {
+                if let Err(e) = defer_pass(&pool, &worker_name, scheduler, &slots).await {
                     eprintln!("{RED}[defer] pass error: {e}{RESET}");
                 }
             }

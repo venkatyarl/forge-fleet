@@ -335,6 +335,8 @@ pub fn build_router(state: Arc<GatewayState>, mc_db_path: Option<&str>) -> Route
         .route("/api/fleet/enrollment-progress", post(crate::onboard::enrollment_progress))
         .route("/api/fleet/check-ip", get(crate::onboard::check_ip))
         .route("/api/fleet/check-tcp", get(crate::onboard::check_tcp))
+        .route("/api/fleet/mesh-check", get(crate::onboard::get_mesh_check))
+        .route("/api/fleet/verify-node", post(crate::onboard::post_verify_node))
         .route(
             "/api/transports/telegram/status",
             get(telegram_transport_status),

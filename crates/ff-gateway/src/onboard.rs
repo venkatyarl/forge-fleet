@@ -432,6 +432,71 @@ pub struct CheckTcpQuery {
     pub port: u16,
 }
 
+// ─── Mesh check endpoint ──────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct MeshCheckQuery {
+    pub node: Option<String>,
+}
+
+pub async fn get_mesh_check(
+    State(state): State<Arc<GatewayState>>,
+    Query(q): Query<MeshCheckQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let pool = state
+        .operational_store
+        .as_ref()
+        .and_then(|os| os.pg_pool())
+        .ok_or_else(|| {
+            (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":"postgres pool not available"})))
+        })?;
+    let rows = ff_db::pg_list_mesh_status(pool, q.node.as_deref())
+        .await
+        .map_err(|e| db_err("pg_list_mesh_status", e))?;
+    let matrix: Vec<Value> = rows
+        .into_iter()
+        .map(|r| {
+            json!({
+                "src_node": r.src_node,
+                "dst_node": r.dst_node,
+                "status": r.status,
+                "last_checked": r.last_checked,
+                "last_error": r.last_error,
+                "attempts": r.attempts,
+            })
+        })
+        .collect();
+    Ok(Json(json!({
+        "matrix": matrix.clone(),
+        "node_filter": q.node,
+        "count": matrix.len(),
+    })))
+}
+
+// ─── Verify-node endpoint ─────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct VerifyNodeQuery {
+    pub name: String,
+}
+
+pub async fn post_verify_node(
+    State(state): State<Arc<GatewayState>>,
+    Query(q): Query<VerifyNodeQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let pool = state
+        .operational_store
+        .as_ref()
+        .and_then(|os| os.pg_pool())
+        .ok_or_else(|| {
+            (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":"postgres pool not available"})))
+        })?;
+    let report = ff_agent::verify_node::verify_node(pool, &q.name)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))?;
+    Ok(Json(serde_json::to_value(report).unwrap_or(json!({}))))
+}
+
 pub async fn check_tcp(Query(q): Query<CheckTcpQuery>) -> Json<Value> {
     use tokio::time::timeout;
     let reachable = timeout(
