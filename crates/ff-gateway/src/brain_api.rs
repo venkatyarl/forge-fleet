@@ -353,3 +353,171 @@ pub async fn whoami(
         }))),
     }
 }
+
+// ─── Stack + Backlog (Redis-backed) ──────────────────────────────────────
+
+async fn get_brain_state_client(state: &GatewayState) -> Result<ff_brain::BrainStateClient, (StatusCode, Json<Value>)> {
+    let pool = pool_from_state(state)?;
+    let redis_url = std::env::var("FORGEFLEET_REDIS_URL")
+        .unwrap_or_else(|_| "redis://192.168.5.100:6380".to_string());
+    ff_brain::BrainStateClient::new(&redis_url, pool.clone())
+        .await
+        .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": format!("redis: {e}")}))))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StackQuery {
+    pub user: Option<String>,
+}
+
+pub async fn stack_list(
+    State(state): State<Arc<GatewayState>>,
+    Path(thread_slug): Path<String>,
+    Query(q): Query<StackQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let pool = pool_from_state(&state)?;
+    let mut client = get_brain_state_client(&state).await?;
+    let user_name = q.user.as_deref().unwrap_or("venkat");
+    let user = ff_db::pg_get_brain_user(pool, user_name)
+        .await.map_err(|e| db_err("user", e))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(json!({"error":"user not found"}))))?;
+    let thread = ff_db::pg_get_brain_thread(pool, user.id, &thread_slug)
+        .await.map_err(|e| db_err("thread", e))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(json!({"error":"thread not found"}))))?;
+    let items = client.stack_list(&user.id, &thread.id, 20).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))?;
+    Ok(Json(json!({ "items": items, "thread_slug": thread_slug })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StackPushBody {
+    pub title: String,
+    pub context: Option<String>,
+    pub push_reason: Option<String>,
+    pub user: Option<String>,
+}
+
+pub async fn stack_push(
+    State(state): State<Arc<GatewayState>>,
+    Path(thread_slug): Path<String>,
+    Json(body): Json<StackPushBody>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let pool = pool_from_state(&state)?;
+    let mut client = get_brain_state_client(&state).await?;
+    let user_name = body.user.as_deref().unwrap_or("venkat");
+    let user = ff_db::pg_get_brain_user(pool, user_name)
+        .await.map_err(|e| db_err("user", e))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(json!({"error":"user not found"}))))?;
+    let thread = ff_db::pg_get_brain_thread(pool, user.id, &thread_slug)
+        .await.map_err(|e| db_err("thread", e))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(json!({"error":"thread not found"}))))?;
+    let item = ff_brain::StackItem {
+        id: uuid::Uuid::new_v4().to_string(),
+        title: body.title,
+        context: body.context,
+        push_reason: body.push_reason,
+        progress: 0.0,
+        pushed_at: chrono::Utc::now().to_rfc3339(),
+    };
+    let depth = client.stack_push(&user.id, &thread.id, &item).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))?;
+    Ok(Json(json!({ "pushed": true, "depth": depth, "item": item })))
+}
+
+pub async fn stack_pop(
+    State(state): State<Arc<GatewayState>>,
+    Path(thread_slug): Path<String>,
+    Query(q): Query<StackQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let pool = pool_from_state(&state)?;
+    let mut client = get_brain_state_client(&state).await?;
+    let user_name = q.user.as_deref().unwrap_or("venkat");
+    let user = ff_db::pg_get_brain_user(pool, user_name)
+        .await.map_err(|e| db_err("user", e))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(json!({"error":"user not found"}))))?;
+    let thread = ff_db::pg_get_brain_thread(pool, user.id, &thread_slug)
+        .await.map_err(|e| db_err("thread", e))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(json!({"error":"thread not found"}))))?;
+    let popped = client.stack_pop(&user.id, &thread.id).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))?;
+    Ok(Json(json!({ "popped": popped })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BacklogQuery {
+    pub user: Option<String>,
+    pub limit: Option<usize>,
+}
+
+pub async fn backlog_list(
+    State(state): State<Arc<GatewayState>>,
+    Path(project): Path<String>,
+    Query(q): Query<BacklogQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let pool = pool_from_state(&state)?;
+    let mut client = get_brain_state_client(&state).await?;
+    let user_name = q.user.as_deref().unwrap_or("venkat");
+    let user = ff_db::pg_get_brain_user(pool, user_name)
+        .await.map_err(|e| db_err("user", e))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(json!({"error":"user not found"}))))?;
+    let items = client.backlog_list(&user.id, &project, q.limit.unwrap_or(50)).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))?;
+    Ok(Json(json!({ "items": items, "project": project })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BacklogAddBody {
+    pub title: String,
+    pub description: Option<String>,
+    pub priority: Option<String>,
+    pub tags: Option<Vec<String>>,
+    pub project: Option<String>,
+    pub user: Option<String>,
+}
+
+pub async fn backlog_add(
+    State(state): State<Arc<GatewayState>>,
+    Path(project): Path<String>,
+    Json(body): Json<BacklogAddBody>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let pool = pool_from_state(&state)?;
+    let mut client = get_brain_state_client(&state).await?;
+    let user_name = body.user.as_deref().unwrap_or("venkat");
+    let user = ff_db::pg_get_brain_user(pool, user_name)
+        .await.map_err(|e| db_err("user", e))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(json!({"error":"user not found"}))))?;
+    let item = ff_brain::BacklogItem {
+        id: uuid::Uuid::new_v4().to_string(),
+        title: body.title,
+        description: body.description,
+        priority: body.priority.unwrap_or_else(|| "medium".to_string()),
+        tags: body.tags.unwrap_or_default(),
+        from_thread_id: None,
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+    let count = client.backlog_add(&user.id, &project, &item).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))?;
+    Ok(Json(json!({ "added": true, "count": count, "item": item })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BacklogCompleteBody {
+    pub item_id: String,
+    pub user: Option<String>,
+}
+
+pub async fn backlog_complete(
+    State(state): State<Arc<GatewayState>>,
+    Path(project): Path<String>,
+    Json(body): Json<BacklogCompleteBody>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let pool = pool_from_state(&state)?;
+    let mut client = get_brain_state_client(&state).await?;
+    let user_name = body.user.as_deref().unwrap_or("venkat");
+    let user = ff_db::pg_get_brain_user(pool, user_name)
+        .await.map_err(|e| db_err("user", e))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(json!({"error":"user not found"}))))?;
+    let done = client.backlog_complete(&user.id, &project, &body.item_id).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))?;
+    Ok(Json(json!({ "completed": done, "item_id": body.item_id })))
+}

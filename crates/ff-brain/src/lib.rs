@@ -13,6 +13,7 @@ pub mod communities;
 pub mod context;
 pub mod embeddings;
 pub mod facts;
+pub mod stack_backlog;
 pub mod vault;
 
 pub use chat::{
@@ -23,6 +24,7 @@ pub use communities::{detect_communities, CommunitySummary};
 pub use context::{select_context, BrainMessage, ContextBundle, ResolvedNode};
 pub use embeddings::EmbeddingClient;
 pub use facts::{contains_signal_phrases, extract_candidates};
+pub use stack_backlog::{BrainStateClient, StackItem, BacklogItem};
 pub use vault::{
     chunk_markdown, extract_wikilinks, index_changed_files, index_vault, parse_frontmatter,
     parse_vault_file, IndexReport, ParsedNode, VaultChunk, VaultConfig,
