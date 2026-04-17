@@ -146,6 +146,18 @@ impl TelegramClient {
         self.call("setMessageReaction", payload).await
     }
 
+    pub async fn answer_callback_query(
+        &self,
+        callback_query_id: &str,
+        text: Option<&str>,
+    ) -> Result<Value, TelegramError> {
+        let payload = json!({
+            "callback_query_id": callback_query_id,
+            "text": text,
+        });
+        self.call("answerCallbackQuery", payload).await
+    }
+
     pub fn normalize_update(&self, update: TelegramUpdate) -> Option<IncomingMessage> {
         normalize_update(update)
     }
