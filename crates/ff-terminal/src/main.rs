@@ -3750,12 +3750,15 @@ async fn handle_daemon(
     let mut sweep_tick = tokio::time::interval(Duration::from_secs(300));
     // Version check: every 6 hours (fleet-wide drift detection).
     let mut version_tick = tokio::time::interval(Duration::from_secs(6 * 3600));
-    // First tick fires immediately for each — prime all five.
+    // Brain vault re-index: every 30 minutes (pick up Obsidian edits).
+    let mut brain_tick = tokio::time::interval(Duration::from_secs(30 * 60));
+    // First tick fires immediately for each — prime all six.
     defer_tick.tick().await;
     disk_tick.tick().await;
     recon_tick.tick().await;
     sweep_tick.tick().await;
     version_tick.tick().await;
+    brain_tick.tick().await;
 
     // Do an initial pass immediately on startup.
     let _ = defer_pass(&pool, &worker_name, scheduler, &slots).await;
@@ -3881,6 +3884,23 @@ async fn handle_daemon(
                             let _ = ff_agent::mesh_check::enqueue_retries(&pool).await;
                         }
                         Err(e) => eprintln!("{RED}[mesh] refresh error: {e}{RESET}"),
+                    }
+                }
+            }
+            _ = brain_tick.tick() => {
+                let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/venkat".into());
+                let vault_path = std::path::PathBuf::from(format!("{home}/projects/Yarli_KnowledgeBase"));
+                if vault_path.exists() {
+                    let config = ff_brain::VaultConfig {
+                        vault_path,
+                        brain_subfolder: String::new(),
+                    };
+                    match ff_brain::index_vault(&pool, &config).await {
+                        Ok(r) if r.nodes_upserted > 0 => println!(
+                            "{CYAN}[brain]{RESET} vault re-indexed: {} new/changed, {} skipped",
+                            r.nodes_upserted, r.unchanged_skipped),
+                        Ok(_) => {}
+                        Err(e) => eprintln!("{RED}[brain] vault index error: {e}{RESET}"),
                     }
                 }
             }
