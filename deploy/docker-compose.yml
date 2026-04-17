@@ -1,4 +1,22 @@
+# ForgeFleet infrastructure — all services under one project.
+#
+# Usage:
+#   cd deploy/
+#   docker compose up -d          # start everything
+#   docker compose ps             # check status
+#   docker compose logs -f redis  # tail redis logs
+#   docker compose down           # stop everything (data persists in named volumes)
+#   docker compose down -v        # stop + DELETE data volumes (destructive!)
+#
+# Ports exposed on the host:
+#   Postgres:  55432  (connect: psql -h 192.168.5.100 -p 55432 -U forgefleet)
+#   Redis:     6380   (connect: redis-cli -h 192.168.5.100 -p 6380)
+#   Sentinel:  26380  (connect: redis-cli -h 192.168.5.100 -p 26380)
+
+name: forgefleet
+
 services:
+  # ─── PostgreSQL 16 ──────────────────────────────────────────────────────
   postgres:
     image: postgres:16-alpine
     container_name: forgefleet-postgres
@@ -8,10 +26,35 @@ services:
       POSTGRES_USER: forgefleet
       POSTGRES_PASSWORD: forgefleet
       POSTGRES_DB: forgefleet
+      # Performance tuning for a 96GB Mac Studio (adjust per-node if needed).
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8 --lc-collate=en_US.utf8 --lc-ctype=en_US.utf8"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    command:
+      - "postgres"
+      - "-c"
+      - "shared_buffers=1GB"
+      - "-c"
+      - "work_mem=64MB"
+      - "-c"
+      - "maintenance_work_mem=256MB"
+      - "-c"
+      - "effective_cache_size=4GB"
+      - "-c"
+      - "max_connections=100"
+      - "-c"
+      - "log_min_duration_statement=1000"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U forgefleet -d forgefleet"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     restart: unless-stopped
+    networks:
+      - forgefleet
 
+  # ─── Redis 7 (primary) ─────────────────────────────────────────────────
   redis:
     image: redis:7-alpine
     container_name: forgefleet-redis
@@ -19,9 +62,57 @@ services:
       - "6380:6379"
     volumes:
       - redis_data:/data
-    command: redis-server --save 60 1 --loglevel warning
+    command:
+      - "redis-server"
+      - "--save"
+      - "60"
+      - "1"
+      - "--loglevel"
+      - "warning"
+      - "--appendonly"
+      - "yes"
+      - "--appendfsync"
+      - "everysec"
+      - "--maxmemory"
+      - "2gb"
+      - "--maxmemory-policy"
+      - "noeviction"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
     restart: unless-stopped
+    networks:
+      - forgefleet
+
+  # ─── Redis Sentinel (monitors the primary) ─────────────────────────────
+  sentinel:
+    image: redis:7-alpine
+    container_name: forgefleet-sentinel
+    ports:
+      - "26380:26379"
+    volumes:
+      - sentinel_data:/data
+      - ./docker/sentinel.conf:/etc/sentinel-template.conf:ro
+    entrypoint: ["/bin/sh", "-c", "cp /etc/sentinel-template.conf /data/sentinel.conf && redis-sentinel /data/sentinel.conf"]
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - forgefleet
 
 volumes:
   postgres_data:
+    name: forgefleet-postgres-data
   redis_data:
+    name: forgefleet-redis-data
+  sentinel_data:
+    name: forgefleet-sentinel-data
+
+networks:
+  forgefleet:
+    name: forgefleet
+    driver: bridge
