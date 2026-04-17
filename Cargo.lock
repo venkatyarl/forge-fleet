@@ -1175,6 +1175,7 @@ dependencies = [
  "axum",
  "chrono",
  "ff-api",
+ "ff-brain",
  "ff-core",
  "ff-db",
  "ff-discovery",

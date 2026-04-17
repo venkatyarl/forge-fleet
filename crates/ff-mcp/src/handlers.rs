@@ -1973,6 +1973,17 @@ pub async fn dispatch(method: &str, params: Option<Value>) -> HandlerResult {
         "fleet_models_library" => fleet_models_library(params).await,
         "fleet_models_deployments" => fleet_models_deployments(params).await,
         "fleet_models_disk_usage" => fleet_models_disk_usage(params).await,
+        // Virtual Brain
+        "brain_search" => crate::brain_tools::brain_search(params).await,
+        "brain_vault_read" => crate::brain_tools::brain_vault_read(params).await,
+        "brain_graph_neighbors" => crate::brain_tools::brain_graph_neighbors(params).await,
+        "brain_list_threads" => crate::brain_tools::brain_list_threads(params).await,
+        "brain_stats" => crate::brain_tools::brain_stats(params).await,
+        "brain_propose_node" => crate::brain_tools::brain_propose_node(params).await,
+        "brain_propose_link" => crate::brain_tools::brain_propose_link(params).await,
+        "brain_thread_append" => crate::brain_tools::brain_thread_append(params).await,
+        "brain_stack_push" => crate::brain_tools::brain_stack_push(params).await,
+        "brain_backlog_add" => crate::brain_tools::brain_backlog_add(params).await,
         _ => Err(format!("unknown method: {method}")),
     }
 }

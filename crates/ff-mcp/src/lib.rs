@@ -17,6 +17,7 @@
 //!       → integrated ForgeFleet crates (ff-core, ff-discovery, ff-ssh, ff-api, ff-runtime)
 //! ```
 
+pub mod brain_tools;
 pub mod federation;
 pub mod handlers;
 pub mod protocol;

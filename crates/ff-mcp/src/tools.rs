@@ -91,6 +91,18 @@ impl ToolRegistry {
         self.register(Self::fleet_models_library());
         self.register(Self::fleet_models_deployments());
         self.register(Self::fleet_models_disk_usage());
+
+        // ── Virtual Brain tools ─────────────────────────────────────────
+        self.register(Self::brain_search());
+        self.register(Self::brain_vault_read());
+        self.register(Self::brain_graph_neighbors());
+        self.register(Self::brain_list_threads());
+        self.register(Self::brain_stats());
+        self.register(Self::brain_propose_node());
+        self.register(Self::brain_propose_link());
+        self.register(Self::brain_thread_append());
+        self.register(Self::brain_stack_push());
+        self.register(Self::brain_backlog_add());
     }
 
     // ── Tool definitions ─────────────────────────────────────────────────
@@ -592,6 +604,231 @@ impl ToolRegistry {
         }
     }
 
+    // ── Virtual Brain tool definitions ───────────────────────────────────
+
+    fn brain_search() -> ToolDefinition {
+        ToolDefinition {
+            name: "brain_search".to_string(),
+            description: "Search the Virtual Brain knowledge graph by text query. Matches titles, paths, and tags. Returns matching vault nodes with metadata.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Text to search for (matches title, path, tags)"
+                    },
+                    "node_type": {
+                        "type": "string",
+                        "description": "Optional filter by node type (e.g., 'fact', 'decision', 'reference', 'preference')"
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional filter — return only nodes that have at least one of these tags"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max results to return (default 20)",
+                        "default": 20
+                    }
+                },
+                "required": ["query"]
+            }),
+        }
+    }
+
+    fn brain_vault_read() -> ToolDefinition {
+        ToolDefinition {
+            name: "brain_vault_read".to_string(),
+            description: "Read a specific vault node by its path. Returns full metadata including tags, project, confidence, and hit count.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Vault node path (e.g., 'project/forge-fleet/architecture')"
+                    }
+                },
+                "required": ["path"]
+            }),
+        }
+    }
+
+    fn brain_graph_neighbors() -> ToolDefinition {
+        ToolDefinition {
+            name: "brain_graph_neighbors".to_string(),
+            description: "Get the graph neighbors (edges) of a vault node. Shows how a node connects to other knowledge.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "node_path": {
+                        "type": "string",
+                        "description": "Path of the node to get neighbors for"
+                    }
+                },
+                "required": ["node_path"]
+            }),
+        }
+    }
+
+    fn brain_list_threads() -> ToolDefinition {
+        ToolDefinition {
+            name: "brain_list_threads".to_string(),
+            description: "List the user's conversation threads in the Virtual Brain. Threads track ongoing work contexts.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "user": {
+                        "type": "string",
+                        "description": "User name (default: venkat)",
+                        "default": "venkat"
+                    }
+                },
+                "required": []
+            }),
+        }
+    }
+
+    fn brain_stats() -> ToolDefinition {
+        ToolDefinition {
+            name: "brain_stats".to_string(),
+            description: "Get vault graph stats — node count, edge count, community count, active threads, and pending candidates.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            }),
+        }
+    }
+
+    fn brain_propose_node() -> ToolDefinition {
+        ToolDefinition {
+            name: "brain_propose_node".to_string(),
+            description: "Propose a new knowledge node to the Virtual Brain. Staged as a candidate for human review in the Inbox.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "description": "Node type: fact, decision, reference, preference, procedure, architecture"
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "Title of the knowledge node"
+                    },
+                    "body": {
+                        "type": "string",
+                        "description": "Full content / body of the knowledge node"
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Tags for categorization"
+                    },
+                    "project": {
+                        "type": "string",
+                        "description": "Optional project this knowledge belongs to"
+                    }
+                },
+                "required": ["kind", "title", "body"]
+            }),
+        }
+    }
+
+    fn brain_propose_link() -> ToolDefinition {
+        ToolDefinition {
+            name: "brain_propose_link".to_string(),
+            description: "Propose a link between two existing vault nodes. Staged for human review.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "src_path": {
+                        "type": "string",
+                        "description": "Source node path"
+                    },
+                    "dst_path": {
+                        "type": "string",
+                        "description": "Destination node path"
+                    },
+                    "edge_type": {
+                        "type": "string",
+                        "description": "Edge type: related_to, depends_on, extends, contradicts, supports, part_of"
+                    }
+                },
+                "required": ["src_path", "dst_path", "edge_type"]
+            }),
+        }
+    }
+
+    fn brain_thread_append() -> ToolDefinition {
+        ToolDefinition {
+            name: "brain_thread_append".to_string(),
+            description: "Add a message to a Virtual Brain thread. Creates the thread if it doesn't exist.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "thread_slug": {
+                        "type": "string",
+                        "description": "Thread slug (URL-safe identifier)"
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Message content to append"
+                    }
+                },
+                "required": ["thread_slug", "content"]
+            }),
+        }
+    }
+
+    fn brain_stack_push() -> ToolDefinition {
+        ToolDefinition {
+            name: "brain_stack_push".to_string(),
+            description: "Push an item onto a thread's context stack. LIFO stack for tracking nested work items.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "thread_slug": {
+                        "type": "string",
+                        "description": "Thread slug to push onto"
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "Title of the stack item"
+                    }
+                },
+                "required": ["thread_slug", "title"]
+            }),
+        }
+    }
+
+    fn brain_backlog_add() -> ToolDefinition {
+        ToolDefinition {
+            name: "brain_backlog_add".to_string(),
+            description: "Add an item to a project's backlog. Priority-sorted FIFO queue for work items.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": "Title of the backlog item"
+                    },
+                    "priority": {
+                        "type": "string",
+                        "enum": ["urgent", "high", "medium", "low"],
+                        "description": "Priority level (default: medium)",
+                        "default": "medium"
+                    },
+                    "project": {
+                        "type": "string",
+                        "description": "Project name this item belongs to"
+                    }
+                },
+                "required": ["title", "project"]
+            }),
+        }
+    }
+
     fn task_lineage() -> ToolDefinition {
         ToolDefinition {
             name: "task_lineage".to_string(),
@@ -650,6 +887,17 @@ mod tests {
             "fleet_models_library",
             "fleet_models_deployments",
             "fleet_models_disk_usage",
+            // Virtual Brain
+            "brain_search",
+            "brain_vault_read",
+            "brain_graph_neighbors",
+            "brain_list_threads",
+            "brain_stats",
+            "brain_propose_node",
+            "brain_propose_link",
+            "brain_thread_append",
+            "brain_stack_push",
+            "brain_backlog_add",
         ];
         for name in &expected {
             assert!(registry.contains(name), "missing tool: {name}");
