@@ -95,6 +95,9 @@ enum Command {
     Fleet { #[command(subcommand)] command: FleetCommand },
     /// Self-service onboarding helpers (show curl command, list recent, revoke).
     Onboard { #[command(subcommand)] command: OnboardCommand },
+    /// Virtual Brain vault indexer + utilities.
+    #[command(alias = "brain")]
+    VirtualBrain { #[command(subcommand)] command: BrainCommand },
     /// Run ForgeFleet's unified daemon: deferred-task scheduler+worker, disk
     /// sampler, and deployment reconciler all in one long-lived process.
     /// Typically run on boot via launchd/systemd.
@@ -186,6 +189,23 @@ enum FleetCommand {
         name: String,
         #[arg(long)] json: bool,
     },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum BrainCommand {
+    /// Run a full vault index (parse all .md files, upsert nodes + edges).
+    Index {
+        /// Vault root path (default: ~/projects/Yarli_KnowledgeBase).
+        #[arg(long)]
+        vault_path: Option<String>,
+        /// Only index this subfolder within the vault (default: index everything).
+        #[arg(long)]
+        subfolder: Option<String>,
+    },
+    /// Run community detection on the vault graph (Leiden placeholder).
+    Communities,
+    /// Show vault index stats.
+    Stats,
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -384,6 +404,7 @@ async fn main() -> Result<()> {
         Some(Command::Versions { node })   => return handle_versions(node.clone()).await,
         Some(Command::Fleet { command })   => return handle_fleet(command.clone()).await,
         Some(Command::Onboard { command }) => return handle_onboard(command.clone()).await,
+        Some(Command::VirtualBrain { command }) => return handle_brain(command.clone()).await,
         _ => {}
     }
 
@@ -470,6 +491,7 @@ async fn main() -> Result<()> {
         Some(Command::Versions { node }) => handle_versions(node).await,
         Some(Command::Fleet { command }) => handle_fleet(command).await,
         Some(Command::Onboard { command }) => handle_onboard(command).await,
+        Some(Command::VirtualBrain { command }) => handle_brain(command).await,
         Some(Command::Supervise { prompt, max_attempts }) => {
             let sup_config = ff_agent::supervisor::SupervisorConfig {
                 max_attempts,
@@ -3316,6 +3338,60 @@ async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
                     println!("  {}  {:<28}  {}", marker, r.check, msg);
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+async fn handle_brain(cmd: BrainCommand) -> Result<()> {
+    let pool = ff_agent::fleet_info::get_fleet_pool()
+        .await
+        .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
+    ff_db::run_postgres_migrations(&pool).await
+        .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
+
+    match cmd {
+        BrainCommand::Index { vault_path, subfolder } => {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/venkat".into());
+            let vault = vault_path.unwrap_or_else(|| format!("{home}/projects/Yarli_KnowledgeBase"));
+            let sub = subfolder.unwrap_or_default();
+            let config = ff_brain::VaultConfig {
+                vault_path: std::path::PathBuf::from(&vault),
+                brain_subfolder: sub.clone(),
+            };
+            let root = if sub.is_empty() { vault.clone() } else { format!("{vault}/{sub}") };
+            println!("{CYAN}▶ Indexing vault: {root}{RESET}");
+            let report = ff_brain::index_vault(&pool, &config).await
+                .map_err(|e| anyhow::anyhow!(e))?;
+            println!("  files scanned:    {}", report.files_scanned);
+            println!("  nodes upserted:   {}", report.nodes_upserted);
+            println!("  edges created:    {}", report.edges_created);
+            println!("  chunks written:   {}", report.chunks_written);
+            println!("  unchanged skipped: {}", report.unchanged_skipped);
+            println!("{CYAN}✓ Done{RESET}");
+        }
+        BrainCommand::Communities => {
+            println!("{CYAN}▶ Running community detection...{RESET}");
+            let summary = ff_brain::detect_communities(&pool).await
+                .map_err(|e| anyhow::anyhow!(e))?;
+            println!("  communities: {}", summary.communities_found);
+            println!("  largest:     {} nodes", summary.largest_community);
+        }
+        BrainCommand::Stats => {
+            let nodes = ff_db::pg_list_brain_vault_nodes_current(&pool, None).await
+                .map_err(|e| anyhow::anyhow!("list nodes: {e}"))?;
+            let total_edges: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM brain_vault_edges")
+                .fetch_one(&pool)
+                .await
+                .unwrap_or(0);
+            let communities: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM brain_communities")
+                .fetch_one(&pool)
+                .await
+                .unwrap_or(0);
+            println!("Vault graph stats:");
+            println!("  nodes (current): {}", nodes.len());
+            println!("  edges:           {total_edges}");
+            println!("  communities:     {communities}");
         }
     }
     Ok(())

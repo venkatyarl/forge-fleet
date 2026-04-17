@@ -103,8 +103,14 @@ pub fn extract_wikilinks(body: &str) -> Vec<String> {
         .collect()
 }
 
+const MAX_FILE_SIZE: u64 = 500_000; // 500KB — skip huge generated/API-dump files
+
 /// Parse a single .md file into a ParsedNode.
 pub fn parse_vault_file(path: &Path, vault_root: &Path) -> Result<ParsedNode, String> {
+    let meta = std::fs::metadata(path).map_err(|e| format!("metadata {}: {e}", path.display()))?;
+    if meta.len() > MAX_FILE_SIZE {
+        return Err(format!("skipping oversized file ({} bytes): {}", meta.len(), path.display()));
+    }
     let content =
         std::fs::read_to_string(path).map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
 
@@ -200,40 +206,42 @@ pub fn chunk_markdown(body: &str, file_path: &str) -> Vec<VaultChunk> {
                     token_estimate: trimmed.len() / 4,
                 });
             } else {
-                // Split large sections with overlap
-                let bytes = trimmed.as_bytes();
+                // Split large sections with overlap — char-boundary safe.
+                let chars: Vec<char> = trimmed.chars().collect();
+                let total = chars.len();
+                let chunk_chars = max_chunk_chars / 4; // work in char count not byte count
+                let overlap = chunk_chars / 5;
                 let mut pos = 0;
                 let mut chunk_idx = 0;
-                while pos < bytes.len() {
-                    let end = (pos + max_chunk_chars).min(bytes.len());
-                    // Find a word boundary near `end`
-                    let actual_end = if end < bytes.len() {
-                        trimmed[pos..end]
-                            .rfind(' ')
-                            .map(|p| pos + p)
-                            .unwrap_or(end)
+                while pos < total {
+                    let end = (pos + chunk_chars).min(total);
+                    let actual_end = if end < total {
+                        // Find space near end
+                        let window: String = chars[pos..end].iter().collect();
+                        match window.rfind(' ') {
+                            Some(sp) => pos + sp,
+                            None => end,
+                        }
                     } else {
                         end
                     };
-                    let slice = &trimmed[pos..actual_end];
+                    let slice: String = chars[pos..actual_end].iter().collect();
+                    let byte_offset = trimmed.chars().take(pos).map(|c| c.len_utf8()).sum::<usize>();
                     out.push(VaultChunk {
                         breadcrumb: if chunk_idx == 0 {
                             breadcrumb.to_string()
                         } else {
                             format!("{breadcrumb} (cont.)")
                         },
-                        text: slice.to_string(),
-                        char_offset: offset + pos,
+                        text: slice.clone(),
+                        char_offset: offset + byte_offset,
                         token_estimate: slice.len() / 4,
                     });
                     chunk_idx += 1;
 
-                    if actual_end >= bytes.len() {
-                        break;
-                    }
-                    // Advance with overlap
-                    let advance = if actual_end > pos + overlap_chars {
-                        actual_end - pos - overlap_chars
+                    if actual_end >= total { break; }
+                    let advance = if actual_end > pos + overlap {
+                        actual_end - pos - overlap
                     } else {
                         actual_end - pos
                     };
@@ -320,7 +328,18 @@ pub async fn index_vault(pool: &PgPool, config: &VaultConfig) -> Result<IndexRep
     };
 
     for file_path in &md_files {
-        let node = parse_vault_file(file_path, &brain_root)?;
+        let node = match parse_vault_file(file_path, &brain_root) {
+            Ok(n) => n,
+            Err(e) => {
+                if e.contains("skipping oversized") {
+                    debug!("{e}");
+                } else {
+                    warn!("parse error: {e}");
+                }
+                report.unchanged_skipped += 1;
+                continue;
+            }
+        };
 
         // Check if content changed
         if let Some(old_hash) = existing_hashes.get(&node.path) {
@@ -416,6 +435,10 @@ fn collect_md_recursive(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String
         let entry = entry.map_err(|e| format!("Dir entry error: {e}"))?;
         let path = entry.path();
         if path.is_dir() {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name.starts_with('.') || name == "node_modules" || name == "target" {
+                continue;
+            }
             collect_md_recursive(&path, out)?;
         } else if path.extension().and_then(|e| e.to_str()) == Some("md") {
             out.push(path);
@@ -436,117 +459,139 @@ async fn fetch_existing_hashes(pool: &PgPool) -> Result<HashMap<String, String>,
 }
 
 async fn upsert_node(pool: &PgPool, node: &ParsedNode) -> Result<(), String> {
-    sqlx::query(
-        r#"
-        INSERT INTO brain_vault_nodes (path, title, node_type, tags, extends_path,
-                                       applies_to, from_thread, confidence, body,
-                                       content_hash, indexed_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
-        ON CONFLICT (path) WHERE valid_until IS NULL
-        DO UPDATE SET
-            title = EXCLUDED.title,
-            node_type = EXCLUDED.node_type,
-            tags = EXCLUDED.tags,
-            extends_path = EXCLUDED.extends_path,
-            applies_to = EXCLUDED.applies_to,
-            from_thread = EXCLUDED.from_thread,
-            confidence = EXCLUDED.confidence,
-            body = EXCLUDED.body,
-            content_hash = EXCLUDED.content_hash,
-            indexed_at = NOW()
-        "#,
+    // Use the pg_upsert_brain_vault_node helper from ff-db (matches V13 schema).
+    ff_db::pg_upsert_brain_vault_node(
+        pool,
+        &node.path,
+        &node.title,
+        node.node_type.as_deref(),
+        None, // project — derived from folder path later
+        &node.tags,
+        node.extends_path.as_deref(),
+        &node.applies_to,
+        node.from_thread.as_deref(),
+        node.confidence,
+        &node.content_hash,
     )
-    .bind(&node.path)
-    .bind(&node.title)
-    .bind(&node.node_type)
-    .bind(&node.tags)
-    .bind(&node.extends_path)
-    .bind(&node.applies_to)
-    .bind(&node.from_thread)
-    .bind(node.confidence)
-    .bind(&node.body)
-    .bind(&node.content_hash)
-    .execute(pool)
     .await
     .map_err(|e| format!("DB error upserting node '{}': {e}", node.path))?;
-
     Ok(())
 }
 
 async fn upsert_edges(pool: &PgPool, node: &ParsedNode) -> Result<usize, String> {
-    // Delete old edges for this source
-    sqlx::query("DELETE FROM brain_vault_edges WHERE source_path = $1")
-        .bind(&node.path)
-        .execute(pool)
+    // Resolve source node UUID.
+    let src = ff_db::pg_get_brain_vault_node(pool, &node.path)
         .await
-        .map_err(|e| format!("DB error deleting edges: {e}"))?;
+        .map_err(|e| format!("get src node: {e}"))?;
+    let src_id = match src {
+        Some(n) => n.id,
+        None => return Ok(0),
+    };
 
     let mut count = 0;
 
-    // Wikilink edges
+    // Wikilink edges — resolve target by matching the wikilink text to an
+    // existing node path (basename match, Obsidian-style shortest path).
     for target in &node.wikilinks {
-        sqlx::query(
-            "INSERT INTO brain_vault_edges (source_path, target_path, edge_type) VALUES ($1, $2, 'link') ON CONFLICT DO NOTHING",
-        )
-        .bind(&node.path)
-        .bind(target)
-        .execute(pool)
-        .await
-        .map_err(|e| format!("DB error inserting edge: {e}"))?;
-        count += 1;
+        if let Some(dst) = resolve_wikilink_target(pool, target).await {
+            let _ = ff_db::pg_upsert_brain_vault_edge(
+                pool, src_id, dst, "link", 1.0, "extracted",
+            ).await;
+            count += 1;
+        }
     }
 
     // Extends edge
     if let Some(extends) = &node.extends_path {
-        sqlx::query(
-            "INSERT INTO brain_vault_edges (source_path, target_path, edge_type) VALUES ($1, $2, 'extends') ON CONFLICT DO NOTHING",
-        )
-        .bind(&node.path)
-        .bind(extends)
-        .execute(pool)
-        .await
-        .map_err(|e| format!("DB error inserting extends edge: {e}"))?;
-        count += 1;
+        let clean = extends.trim_start_matches("[[").trim_end_matches("]]");
+        if let Some(dst) = resolve_wikilink_target(pool, clean).await {
+            let _ = ff_db::pg_upsert_brain_vault_edge(
+                pool, src_id, dst, "extends", 1.0, "extracted",
+            ).await;
+            count += 1;
+        }
     }
 
     // Applies-to edges
     for target in &node.applies_to {
-        sqlx::query(
-            "INSERT INTO brain_vault_edges (source_path, target_path, edge_type) VALUES ($1, $2, 'applies_to') ON CONFLICT DO NOTHING",
-        )
-        .bind(&node.path)
-        .bind(target)
-        .execute(pool)
-        .await
-        .map_err(|e| format!("DB error inserting applies_to edge: {e}"))?;
-        count += 1;
+        let clean = target.trim_start_matches("[[").trim_end_matches("]]");
+        if let Some(dst) = resolve_wikilink_target(pool, clean).await {
+            let _ = ff_db::pg_upsert_brain_vault_edge(
+                pool, src_id, dst, "applies_to", 1.0, "extracted",
+            ).await;
+            count += 1;
+        }
     }
 
     Ok(count)
 }
 
+/// Resolve a wikilink target text (e.g. "UI Design" or "Projects/ForgeFleet/UI Design")
+/// to an existing brain_vault_nodes.id. Uses Obsidian's shortest-path semantics:
+/// first try exact path match, then basename match.
+async fn resolve_wikilink_target(pool: &PgPool, target: &str) -> Option<uuid::Uuid> {
+    // Try exact path match (e.g. "Projects/ForgeFleet/UI Design.md")
+    let with_md = if target.ends_with(".md") { target.to_string() } else { format!("{target}.md") };
+    if let Ok(Some(node)) = ff_db::pg_get_brain_vault_node(pool, &with_md).await {
+        return Some(node.id);
+    }
+    // Try basename match (e.g. "UI Design" matches "any/path/UI Design.md")
+    let basename = target.rsplit('/').next().unwrap_or(target);
+    let pattern = format!("%/{basename}.md");
+    let row: Option<(uuid::Uuid,)> = sqlx::query_as(
+        "SELECT id FROM brain_vault_nodes WHERE path LIKE $1 AND valid_until IS NULL LIMIT 1",
+    )
+    .bind(&pattern)
+    .fetch_optional(pool)
+    .await
+    .ok()?;
+    row.map(|r| r.0)
+}
+
 async fn write_chunks(pool: &PgPool, node_path: &str, chunks: &[VaultChunk]) -> Result<(), String> {
-    // Delete old chunks for this node
-    sqlx::query("DELETE FROM rag_chunks WHERE source_path = $1")
+    // The rag_chunks table is created by ff-memory's RAG engine, not by our
+    // V13 migration. If it doesn't exist, skip chunk writing silently — nodes
+    // + edges still index fine without chunks. Chunks enable semantic search
+    // which only kicks in once pgvector + embeddings are deployed (Phase 4b).
+    let table_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_name = 'rag_chunks')",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap_or(false);
+    if !table_exists {
+        return Ok(());
+    }
+
+    let _ = sqlx::query("DELETE FROM rag_chunks WHERE workspace_id = 'brain_vault' AND source_path = $1")
         .bind(node_path)
         .execute(pool)
-        .await
-        .map_err(|e| format!("DB error deleting chunks: {e}"))?;
+        .await;
+
+    // Deterministic document_id from path (simple hash-based).
+    let mut hasher = Sha256::new();
+    hasher.update(b"brain_vault_doc:");
+    hasher.update(node_path.as_bytes());
+    let hash = hasher.finalize();
+    let doc_id = uuid::Uuid::from_slice(&hash[..16]).unwrap_or_else(|_| uuid::Uuid::new_v4());
 
     for (i, chunk) in chunks.iter().enumerate() {
-        sqlx::query(
-            r#"
-            INSERT INTO rag_chunks (source_path, chunk_index, breadcrumb, text,
-                                    char_offset, token_estimate)
-            VALUES ($1, $2, $3, $4, $5, $6)
-            "#,
+        let chunk_id = uuid::Uuid::new_v4();
+        let metadata = serde_json::json!({
+            "breadcrumb": chunk.breadcrumb,
+            "char_offset": chunk.char_offset,
+            "token_estimate": chunk.token_estimate,
+        });
+        let _ = sqlx::query(
+            "INSERT INTO rag_chunks (id, workspace_id, document_id, source_path, chunk_index, content, metadata)
+             VALUES ($1, 'brain_vault', $2, $3, $4, $5, $6)",
         )
+        .bind(chunk_id)
+        .bind(doc_id)
         .bind(node_path)
         .bind(i as i32)
-        .bind(&chunk.breadcrumb)
         .bind(&chunk.text)
-        .bind(chunk.char_offset as i64)
-        .bind(chunk.token_estimate as i32)
+        .bind(metadata.to_string())
         .execute(pool)
         .await
         .map_err(|e| format!("DB error inserting chunk: {e}"))?;

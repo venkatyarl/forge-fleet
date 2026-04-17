@@ -1402,6 +1402,7 @@ dependencies = [
  "dirs 5.0.1",
  "ff-agent",
  "ff-api",
+ "ff-brain",
  "ff-core",
  "ff-db",
  "futures",

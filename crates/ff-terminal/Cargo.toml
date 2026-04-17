@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 ff-agent = { path = "../ff-agent" }
 ff-api = { path = "../ff-api" }
+ff-brain = { path = "../ff-brain" }
 ff-core = { path = "../ff-core" }
 ff-db = { path = "../ff-db" }
 sqlx = { workspace = true }

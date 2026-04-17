@@ -18,9 +18,9 @@ pub struct CommunitySummary {
 /// Current implementation: union-find connected components.
 /// Assigns each component a community_id and writes it back to brain_vault_nodes.
 pub async fn detect_communities(pool: &PgPool) -> Result<CommunitySummary, String> {
-    // Fetch all active node paths
-    let node_rows: Vec<(String,)> =
-        sqlx::query_as("SELECT path FROM brain_vault_nodes WHERE valid_until IS NULL")
+    // Fetch all active node (id, path) pairs.
+    let node_rows: Vec<(uuid::Uuid, String)> =
+        sqlx::query_as("SELECT id, path FROM brain_vault_nodes WHERE valid_until IS NULL")
             .fetch_all(pool)
             .await
             .map_err(|e| format!("DB error fetching nodes: {e}"))?;
@@ -32,10 +32,12 @@ pub async fn detect_communities(pool: &PgPool) -> Result<CommunitySummary, Strin
         });
     }
 
-    // Build path -> index mapping
+    // Build path→index and id→index mappings.
     let mut path_to_idx: HashMap<String, usize> = HashMap::new();
-    for (i, (path,)) in node_rows.iter().enumerate() {
+    let mut id_to_idx: HashMap<uuid::Uuid, usize> = HashMap::new();
+    for (i, (id, path)) in node_rows.iter().enumerate() {
         path_to_idx.insert(path.clone(), i);
+        id_to_idx.insert(*id, i);
     }
     let n = node_rows.len();
 
@@ -81,15 +83,15 @@ pub async fn detect_communities(pool: &PgPool) -> Result<CommunitySummary, Strin
         }
     };
 
-    // Fetch edges and union
-    let edge_rows: Vec<(String, String)> =
-        sqlx::query_as("SELECT source_path, target_path FROM brain_vault_edges")
+    // Fetch edges and union — schema uses src_id/dst_id (UUIDs).
+    let edge_rows: Vec<(uuid::Uuid, uuid::Uuid)> =
+        sqlx::query_as("SELECT src_id, dst_id FROM brain_vault_edges")
             .fetch_all(pool)
             .await
             .map_err(|e| format!("DB error fetching edges: {e}"))?;
 
-    for (src, tgt) in &edge_rows {
-        if let (Some(&si), Some(&ti)) = (path_to_idx.get(src), path_to_idx.get(tgt)) {
+    for (src_id, dst_id) in &edge_rows {
+        if let (Some(&si), Some(&ti)) = (id_to_idx.get(src_id), id_to_idx.get(dst_id)) {
             union(&mut parent, &mut rank, si, ti);
         }
     }
@@ -110,7 +112,7 @@ pub async fn detect_communities(pool: &PgPool) -> Result<CommunitySummary, Strin
     }
 
     // Write community_id back to nodes
-    for (i, (path,)) in node_rows.iter().enumerate() {
+    for (i, (_id, path)) in node_rows.iter().enumerate() {
         let root = find(&mut parent, i);
         let cid = root_to_community[&root];
         sqlx::query(
