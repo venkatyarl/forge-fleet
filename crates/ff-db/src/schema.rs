@@ -341,6 +341,202 @@ CREATE TABLE IF NOT EXISTS fleet_settings (
 ///
 /// Applied as Postgres migration version 8.
 /// IF NOT EXISTS / IF NOT EXISTS guards make this idempotent.
+pub const SCHEMA_V13_VIRTUAL_BRAIN: &str = r#"
+-- ─── V13: Virtual Brain — unified knowledge graph + channel-agnostic chat ──
+-- See plan: gentle-questing-valley.md
+-- NOTE: pgvector (CREATE EXTENSION vector) is deferred to V14 since it
+-- requires server-side installation. V13 runs on any Postgres 14+.
+
+-- ─── Users + channel identity mapping ──────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS brain_users (
+    id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name         TEXT NOT NULL UNIQUE,
+    display_name TEXT,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS brain_channel_identities (
+    channel     TEXT NOT NULL,
+    external_id TEXT NOT NULL,
+    user_id     UUID NOT NULL REFERENCES brain_users(id),
+    PRIMARY KEY (channel, external_id)
+);
+
+-- ─── Threads (many per user, portable across devices) ──────────────────────
+
+CREATE TABLE IF NOT EXISTS brain_threads (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id         UUID NOT NULL REFERENCES brain_users(id),
+    slug            TEXT NOT NULL,
+    title           TEXT,
+    icon            TEXT,
+    project         TEXT,
+    status          TEXT NOT NULL DEFAULT 'active',
+    last_message_at TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (user_id, slug)
+);
+CREATE INDEX IF NOT EXISTS idx_brain_threads_user
+    ON brain_threads(user_id, last_message_at DESC) WHERE status = 'active';
+
+-- Which thread each device/channel is currently pointing at.
+CREATE TABLE IF NOT EXISTS brain_thread_attachments (
+    channel     TEXT NOT NULL,
+    external_id TEXT NOT NULL,
+    user_id     UUID NOT NULL REFERENCES brain_users(id),
+    thread_id   UUID NOT NULL REFERENCES brain_threads(id),
+    attached_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (channel, external_id)
+);
+CREATE INDEX IF NOT EXISTS idx_brain_attachments_thread
+    ON brain_thread_attachments(thread_id);
+
+-- ─── Messages ──────────────────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS brain_messages (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    thread_id   UUID NOT NULL REFERENCES brain_threads(id) ON DELETE CASCADE,
+    user_id     UUID NOT NULL REFERENCES brain_users(id),
+    channel     TEXT NOT NULL,
+    external_id TEXT NOT NULL,
+    role        TEXT NOT NULL,
+    content     TEXT NOT NULL,
+    metadata    JSONB NOT NULL DEFAULT '{}',
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_brain_messages_thread
+    ON brain_messages(thread_id, created_at);
+
+-- ─── Stack + Backlog archives (live state is in Redis) ─────────────────────
+
+CREATE TABLE IF NOT EXISTS brain_stack_archive (
+    id           UUID PRIMARY KEY,
+    user_id      UUID NOT NULL REFERENCES brain_users(id),
+    thread_id    UUID REFERENCES brain_threads(id),
+    title        TEXT NOT NULL,
+    context      TEXT,
+    push_reason  TEXT,
+    pushed_at    TIMESTAMPTZ NOT NULL,
+    popped_at    TIMESTAMPTZ,
+    archived_from_thread BOOLEAN NOT NULL DEFAULT false,
+    archived_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_stack_archive_user_thread
+    ON brain_stack_archive(user_id, thread_id, pushed_at DESC);
+
+CREATE TABLE IF NOT EXISTS brain_backlog_archive (
+    id                   UUID PRIMARY KEY,
+    user_id              UUID NOT NULL REFERENCES brain_users(id),
+    project              TEXT NOT NULL,
+    title                TEXT NOT NULL,
+    priority             TEXT NOT NULL,
+    from_thread_id       UUID REFERENCES brain_threads(id),
+    completed_at         TIMESTAMPTZ NOT NULL,
+    completed_by_channel TEXT,
+    tags                 TEXT[] NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_backlog_archive_project
+    ON brain_backlog_archive(user_id, project, completed_at DESC);
+
+-- ─── Vault knowledge graph ─────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS brain_vault_nodes (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    path            TEXT UNIQUE NOT NULL,
+    title           TEXT NOT NULL,
+    node_type       TEXT,
+    project         TEXT,
+    tags            TEXT[] NOT NULL DEFAULT '{}',
+    extends_path    TEXT,
+    applies_to      TEXT[] NOT NULL DEFAULT '{}',
+    from_thread     TEXT,
+    confidence      REAL,
+    content_hash    TEXT NOT NULL,
+    valid_from      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    valid_until     TIMESTAMPTZ,
+    superseded_by   UUID REFERENCES brain_vault_nodes(id),
+    hits            INT NOT NULL DEFAULT 0,
+    references_     INT NOT NULL DEFAULT 0,
+    last_accessed   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    community_id    INT,
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_vault_nodes_project_current
+    ON brain_vault_nodes(project) WHERE valid_until IS NULL;
+CREATE INDEX IF NOT EXISTS idx_vault_nodes_tags
+    ON brain_vault_nodes USING GIN(tags);
+CREATE INDEX IF NOT EXISTS idx_vault_nodes_superseded
+    ON brain_vault_nodes(superseded_by) WHERE superseded_by IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS brain_vault_edges (
+    src_id     UUID NOT NULL REFERENCES brain_vault_nodes(id) ON DELETE CASCADE,
+    dst_id     UUID NOT NULL REFERENCES brain_vault_nodes(id) ON DELETE CASCADE,
+    edge_type  TEXT NOT NULL,
+    confidence REAL NOT NULL DEFAULT 1.0,
+    provenance TEXT NOT NULL DEFAULT 'extracted',
+    PRIMARY KEY (src_id, dst_id, edge_type)
+);
+CREATE INDEX IF NOT EXISTS idx_vault_edges_src ON brain_vault_edges(src_id, edge_type);
+CREATE INDEX IF NOT EXISTS idx_vault_edges_dst ON brain_vault_edges(dst_id, edge_type);
+
+-- Chunk embeddings table is deferred to V14 (requires pgvector extension).
+-- For now, embeddings are stored as JSON arrays in rag_chunks.metadata if needed.
+
+-- ─── Communities (Leiden clustering) ───────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS brain_communities (
+    id            SERIAL PRIMARY KEY,
+    label         TEXT,
+    god_node_id   UUID REFERENCES brain_vault_nodes(id),
+    member_count  INT NOT NULL DEFAULT 0,
+    color         TEXT,
+    updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- ─── Knowledge candidates (extractor output, pending approval) ─────────────
+
+CREATE TABLE IF NOT EXISTS brain_knowledge_candidates (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id       UUID NOT NULL REFERENCES brain_users(id),
+    thread_id     UUID REFERENCES brain_threads(id),
+    action        TEXT NOT NULL,
+    kind          TEXT,
+    title         TEXT,
+    body          TEXT,
+    tags          TEXT[] NOT NULL DEFAULT '{}',
+    project       TEXT,
+    extends_path  TEXT,
+    applies_to    TEXT[] NOT NULL DEFAULT '{}',
+    target_path   TEXT,
+    from_thread   TEXT,
+    confidence    REAL,
+    status        TEXT NOT NULL DEFAULT 'pending',
+    reviewed_at   TIMESTAMPTZ,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_brain_candidates_pending
+    ON brain_knowledge_candidates(user_id, status, created_at)
+    WHERE status = 'pending';
+
+-- ─── Reminders ─────────────────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS brain_reminders (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id         UUID NOT NULL REFERENCES brain_users(id),
+    thread_id       UUID REFERENCES brain_threads(id),
+    content         TEXT NOT NULL,
+    remind_at       TIMESTAMPTZ NOT NULL,
+    channel_pref    TEXT,
+    status          TEXT NOT NULL DEFAULT 'pending',
+    snoozed_until   TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    fired_at        TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_reminders_pending
+    ON brain_reminders(remind_at) WHERE status = 'pending';
+"#;
+
 pub const SCHEMA_V12_ONBOARDING: &str = r#"
 -- ─── V12: Self-service onboarding foundation ──────────────────────────────
 -- New tables for SSH key tracking + mesh verification, plus ALTER TABLE on

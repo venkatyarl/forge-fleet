@@ -11,6 +11,7 @@
 
 pub mod discord;
 pub mod embed;
+pub mod brain_api;
 pub mod message;
 pub mod middleware;
 pub mod onboard;

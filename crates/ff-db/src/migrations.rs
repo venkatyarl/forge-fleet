@@ -202,6 +202,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "onboarding_foundation",
         sql: schema::SCHEMA_V12_ONBOARDING,
     },
+    PgMigration {
+        version: 13,
+        name: "virtual_brain",
+        sql: schema::SCHEMA_V13_VIRTUAL_BRAIN,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.

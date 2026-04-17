@@ -1,0 +1,26 @@
+[package]
+name = "ff-brain"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "ForgeFleet Virtual Brain — knowledge graph, context selection, chat, and fact extraction"
+
+[dependencies]
+ff-db = { path = "../ff-db" }
+ff-agent = { path = "../ff-agent" }
+
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+reqwest.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+sha2.workspace = true
+futures = "0.3"
+notify = "7"
+regex = "1"
+serde_yaml = "0.9"

@@ -270,6 +270,29 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         .as_ref()
         .is_some_and(|telegram| telegram.enabled)
     {
+        // Fallback: if the token env var / inline config is empty, pull the
+        // bot token from fleet_secrets (`telegram.bot_token`) and export it
+        // via the configured env var so resolve_bot_token() finds it. Keeps
+        // secrets out of shell rc files and launchd plists.
+        if let Some(tg) = config.transport.telegram.as_ref() {
+            if tg.resolve_bot_token().is_none() {
+                if let Some(pg_pool) = operational_store.pg_pool() {
+                    match ff_db::pg_get_secret(pg_pool, "telegram.bot_token").await {
+                        Ok(Some(token)) if !token.trim().is_empty() => {
+                            let key = if tg.bot_token_env.trim().is_empty() {
+                                "FORGEFLEET_TELEGRAM_BOT_TOKEN"
+                            } else {
+                                tg.bot_token_env.as_str()
+                            };
+                            unsafe { std::env::set_var(key, token.trim()); }
+                            info!("telegram bot token loaded from fleet_secrets");
+                        }
+                        Ok(_) => info!("telegram bot token absent in fleet_secrets"),
+                        Err(e) => error!(error = %e, "fleet_secrets lookup failed"),
+                    }
+                }
+            }
+        }
         info!("starting subsystem: telegram transport");
         subsystem_tasks.push(start_telegram_transport_subsystem(
             config.clone(),

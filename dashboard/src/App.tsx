@@ -25,6 +25,8 @@ import { Settings } from './pages/Settings'
 import { Chats } from './pages/Chats'
 import { ToolInventory } from './pages/ToolInventory'
 import { ModelHub } from './pages/ModelHub'
+import { Brain } from './pages/Brain'
+import { BrainGraph } from './pages/BrainGraph'
 import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts'
 
 function Shell() {
@@ -76,6 +78,10 @@ export default function App() {
         <Route path="projects" element={<Projects />} />
         <Route path="planning" element={<PlanningHub />} />
         <Route path="workflow" element={<WorkflowWorkbench />} />
+        {/* Brain */}
+        <Route path="brain" element={<Brain />} />
+        <Route path="brain/graph" element={<BrainGraph />} />
+        <Route path="brain/:threadSlug" element={<Brain />} />
         {/* Fleet (accessible via Settings or direct link) */}
         <Route path="fleet" element={<FleetOverview />} />
         <Route path="topology" element={<Topology />} />

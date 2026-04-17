@@ -230,15 +230,24 @@ fn build_outgoing_request(
     outgoing: &OutgoingMessage,
 ) -> Result<TelegramOutgoingRequest, TelegramError> {
     if outgoing.media.is_empty() {
+        // Build the payload as a map so optional fields (reply_to_message_id,
+        // message_thread_id, reply_markup) can be OMITTED when None. Telegram
+        // rejects `null` for these with 400 "object expected as reply markup".
+        let mut payload = serde_json::Map::new();
+        payload.insert("chat_id".into(), json!(outgoing.chat_id));
+        payload.insert("text".into(), json!(outgoing.text.clone().unwrap_or_default()));
+        if let Some(id) = outgoing.reply_to.as_deref().and_then(|id| id.parse::<i64>().ok()) {
+            payload.insert("reply_to_message_id".into(), json!(id));
+        }
+        if let Some(id) = outgoing.thread_id.as_deref().and_then(|id| id.parse::<i64>().ok()) {
+            payload.insert("message_thread_id".into(), json!(id));
+        }
+        if let Some(kb) = inline_keyboard_json(&outgoing.buttons) {
+            payload.insert("reply_markup".into(), kb);
+        }
         return Ok(TelegramOutgoingRequest {
             method: "sendMessage",
-            payload: json!({
-                "chat_id": outgoing.chat_id,
-                "text": outgoing.text.clone().unwrap_or_default(),
-                "reply_to_message_id": outgoing.reply_to.as_deref().and_then(|id| id.parse::<i64>().ok()),
-                "message_thread_id": outgoing.thread_id.as_deref().and_then(|id| id.parse::<i64>().ok()),
-                "reply_markup": inline_keyboard_json(&outgoing.buttons),
-            }),
+            payload: Value::Object(payload),
         });
     }
 
@@ -269,32 +278,25 @@ fn build_media_request(
 ) -> TelegramOutgoingRequest {
     let (method, media_key, media_value) = telegram_media_payload(media);
 
+    // Only insert optional fields when present — Telegram rejects explicit
+    // null for reply_to_message_id, message_thread_id, and reply_markup.
     let mut payload = serde_json::Map::new();
     payload.insert("chat_id".to_string(), json!(outgoing.chat_id));
     payload.insert(media_key.to_string(), json!(media_value));
-    payload.insert("caption".to_string(), json!(outgoing.text));
-    payload.insert(
-        "reply_to_message_id".to_string(),
-        json!(
-            outgoing
-                .reply_to
-                .as_deref()
-                .and_then(|id| id.parse::<i64>().ok())
-        ),
-    );
-    payload.insert(
-        "message_thread_id".to_string(),
-        json!(
-            outgoing
-                .thread_id
-                .as_deref()
-                .and_then(|id| id.parse::<i64>().ok())
-        ),
-    );
-    payload.insert(
-        "reply_markup".to_string(),
-        json!(inline_keyboard_json(&outgoing.buttons)),
-    );
+    if let Some(text) = outgoing.text.as_ref() {
+        if !text.is_empty() {
+            payload.insert("caption".to_string(), json!(text));
+        }
+    }
+    if let Some(id) = outgoing.reply_to.as_deref().and_then(|id| id.parse::<i64>().ok()) {
+        payload.insert("reply_to_message_id".to_string(), json!(id));
+    }
+    if let Some(id) = outgoing.thread_id.as_deref().and_then(|id| id.parse::<i64>().ok()) {
+        payload.insert("message_thread_id".to_string(), json!(id));
+    }
+    if let Some(kb) = inline_keyboard_json(&outgoing.buttons) {
+        payload.insert("reply_markup".to_string(), kb);
+    }
 
     TelegramOutgoingRequest {
         method,

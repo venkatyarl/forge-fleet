@@ -20,6 +20,15 @@ const mainSections: NavSection[] = [
     items: [],
   },
   {
+    id: 'brain',
+    title: 'Brain',
+    icon: '🧠',
+    items: [
+      { to: '/brain', label: 'Threads', icon: '💭' },
+      { to: '/brain/graph', label: 'Knowledge Graph', icon: '🕸️' },
+    ],
+  },
+  {
     id: 'chats',
     title: 'Chats',
     icon: '💬',

@@ -199,8 +199,10 @@ impl TelegramPollingTransport {
             };
 
             if let Err(error) = self.process_message(incoming, downloaded_media).await {
-                warn!(error = %error, "telegram update processing failed");
-                self.set_runtime_status(Self::STATUS_LAST_ERROR_KEY, error.to_string())
+                // Use Debug format so the full anyhow cause chain (including
+                // the underlying Telegram API status + body) is visible.
+                warn!(error = ?error, "telegram update processing failed");
+                self.set_runtime_status(Self::STATUS_LAST_ERROR_KEY, format!("{error:?}"))
                     .await;
             }
         }

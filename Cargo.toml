@@ -30,6 +30,7 @@ members = [
     "crates/ff-code-intel",
     "crates/ff-terminal",
     "crates/ff-pulse",
+    "crates/ff-brain",
 ]
 
 [workspace.package]

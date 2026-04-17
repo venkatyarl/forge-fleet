@@ -41,6 +41,25 @@ pub use queries::{
     pg_set_setting, pg_update_job_progress, pg_upsert_catalog, pg_upsert_deployment,
     pg_upsert_library, pg_upsert_mesh_status, pg_upsert_model, pg_upsert_node,
     seed_from_fleet_toml, RoutingHop,
+    // Virtual Brain (V13)
+    BrainUserRow, BrainThreadRow, BrainMessageRow, BrainVaultNodeRow, BrainVaultEdgeRow,
+    BrainCandidateRow, BrainReminderRow,
+    pg_create_brain_user, pg_get_brain_user, pg_get_brain_user_by_id,
+    pg_upsert_channel_identity, pg_resolve_channel_user,
+    pg_create_brain_thread, pg_get_brain_thread, pg_get_brain_thread_by_id,
+    pg_list_brain_threads, pg_archive_brain_thread, pg_touch_brain_thread,
+    pg_attach_thread, pg_get_attached_thread,
+    pg_insert_brain_message, pg_list_brain_messages,
+    pg_upsert_brain_vault_node, pg_get_brain_vault_node,
+    pg_list_brain_vault_nodes_current, pg_search_brain_vault_nodes,
+    pg_bump_vault_node_hits, pg_supersede_vault_node,
+    pg_upsert_brain_vault_edge, pg_list_brain_vault_edges_for_node,
+    pg_insert_brain_candidate, pg_list_brain_candidates_pending,
+    pg_update_brain_candidate_status,
+    pg_insert_brain_reminder, pg_list_due_reminders,
+    pg_fire_brain_reminder, pg_snooze_brain_reminder,
+    pg_upsert_brain_community, pg_set_vault_node_community,
+    BrainCommunityRow, pg_list_brain_communities,
 };
 pub use runtime_registry::RuntimeRegistryStore;
 pub use sync::{

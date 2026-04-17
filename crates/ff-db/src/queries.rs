@@ -3501,3 +3501,725 @@ pub async fn pg_get_task_lineage(pool: &PgPool, task_id: &str) -> Result<serde_j
         "ownership_events": events_json,
     }))
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ─── Virtual Brain (Schema V13) ───────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── brain_users ──────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct BrainUserRow {
+    pub id: uuid::Uuid,
+    pub name: String,
+    pub display_name: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+pub async fn pg_create_brain_user(
+    pool: &PgPool,
+    name: &str,
+    display_name: Option<&str>,
+) -> Result<uuid::Uuid> {
+    let row = sqlx::query(
+        "INSERT INTO brain_users (name, display_name) VALUES ($1, $2)
+         ON CONFLICT (name) DO UPDATE SET display_name = COALESCE(EXCLUDED.display_name, brain_users.display_name)
+         RETURNING id",
+    )
+    .bind(name)
+    .bind(display_name)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.get("id"))
+}
+
+pub async fn pg_get_brain_user(pool: &PgPool, name: &str) -> Result<Option<BrainUserRow>> {
+    let row = sqlx::query("SELECT * FROM brain_users WHERE name = $1")
+        .bind(name)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(|r| BrainUserRow {
+        id: r.get("id"),
+        name: r.get("name"),
+        display_name: r.get("display_name"),
+        created_at: r.get("created_at"),
+    }))
+}
+
+pub async fn pg_get_brain_user_by_id(pool: &PgPool, id: uuid::Uuid) -> Result<Option<BrainUserRow>> {
+    let row = sqlx::query("SELECT * FROM brain_users WHERE id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(|r| BrainUserRow {
+        id: r.get("id"),
+        name: r.get("name"),
+        display_name: r.get("display_name"),
+        created_at: r.get("created_at"),
+    }))
+}
+
+// ── brain_channel_identities ─────────────────────────────────────────────
+
+pub async fn pg_upsert_channel_identity(
+    pool: &PgPool,
+    channel: &str,
+    external_id: &str,
+    user_id: uuid::Uuid,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO brain_channel_identities (channel, external_id, user_id) VALUES ($1, $2, $3)
+         ON CONFLICT (channel, external_id) DO UPDATE SET user_id = $3",
+    )
+    .bind(channel)
+    .bind(external_id)
+    .bind(user_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn pg_resolve_channel_user(
+    pool: &PgPool,
+    channel: &str,
+    external_id: &str,
+) -> Result<Option<uuid::Uuid>> {
+    let row = sqlx::query(
+        "SELECT user_id FROM brain_channel_identities WHERE channel = $1 AND external_id = $2",
+    )
+    .bind(channel)
+    .bind(external_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| r.get("user_id")))
+}
+
+// ── brain_threads ────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BrainThreadRow {
+    pub id: uuid::Uuid,
+    pub user_id: uuid::Uuid,
+    pub slug: String,
+    pub title: Option<String>,
+    pub icon: Option<String>,
+    pub project: Option<String>,
+    pub status: String,
+    pub last_message_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+fn row_to_brain_thread(r: &sqlx::postgres::PgRow) -> BrainThreadRow {
+    BrainThreadRow {
+        id: r.get("id"),
+        user_id: r.get("user_id"),
+        slug: r.get("slug"),
+        title: r.get("title"),
+        icon: r.get("icon"),
+        project: r.get("project"),
+        status: r.get("status"),
+        last_message_at: r.get("last_message_at"),
+        created_at: r.get("created_at"),
+    }
+}
+
+pub async fn pg_create_brain_thread(
+    pool: &PgPool,
+    user_id: uuid::Uuid,
+    slug: &str,
+    title: Option<&str>,
+    project: Option<&str>,
+) -> Result<uuid::Uuid> {
+    let row = sqlx::query(
+        "INSERT INTO brain_threads (user_id, slug, title, project) VALUES ($1, $2, $3, $4)
+         ON CONFLICT (user_id, slug) DO UPDATE SET
+            title = COALESCE(EXCLUDED.title, brain_threads.title),
+            project = COALESCE(EXCLUDED.project, brain_threads.project)
+         RETURNING id",
+    )
+    .bind(user_id)
+    .bind(slug)
+    .bind(title)
+    .bind(project)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.get("id"))
+}
+
+pub async fn pg_get_brain_thread(pool: &PgPool, user_id: uuid::Uuid, slug: &str) -> Result<Option<BrainThreadRow>> {
+    let row = sqlx::query("SELECT * FROM brain_threads WHERE user_id = $1 AND slug = $2")
+        .bind(user_id)
+        .bind(slug)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.as_ref().map(row_to_brain_thread))
+}
+
+pub async fn pg_get_brain_thread_by_id(pool: &PgPool, id: uuid::Uuid) -> Result<Option<BrainThreadRow>> {
+    let row = sqlx::query("SELECT * FROM brain_threads WHERE id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.as_ref().map(row_to_brain_thread))
+}
+
+pub async fn pg_list_brain_threads(pool: &PgPool, user_id: uuid::Uuid) -> Result<Vec<BrainThreadRow>> {
+    let rows = sqlx::query(
+        "SELECT * FROM brain_threads WHERE user_id = $1 AND status = 'active'
+         ORDER BY last_message_at DESC NULLS LAST, created_at DESC",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.iter().map(row_to_brain_thread).collect())
+}
+
+pub async fn pg_archive_brain_thread(pool: &PgPool, id: uuid::Uuid) -> Result<()> {
+    sqlx::query("UPDATE brain_threads SET status = 'archived' WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn pg_touch_brain_thread(pool: &PgPool, id: uuid::Uuid) -> Result<()> {
+    sqlx::query("UPDATE brain_threads SET last_message_at = NOW() WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+// ── brain_thread_attachments ─────────────────────────────────────────────
+
+pub async fn pg_attach_thread(
+    pool: &PgPool,
+    channel: &str,
+    external_id: &str,
+    user_id: uuid::Uuid,
+    thread_id: uuid::Uuid,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO brain_thread_attachments (channel, external_id, user_id, thread_id, attached_at)
+         VALUES ($1, $2, $3, $4, NOW())
+         ON CONFLICT (channel, external_id) DO UPDATE SET thread_id = $4, attached_at = NOW()",
+    )
+    .bind(channel)
+    .bind(external_id)
+    .bind(user_id)
+    .bind(thread_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn pg_get_attached_thread(
+    pool: &PgPool,
+    channel: &str,
+    external_id: &str,
+) -> Result<Option<uuid::Uuid>> {
+    let row = sqlx::query(
+        "SELECT thread_id FROM brain_thread_attachments WHERE channel = $1 AND external_id = $2",
+    )
+    .bind(channel)
+    .bind(external_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| r.get("thread_id")))
+}
+
+// ── brain_messages ───────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BrainMessageRow {
+    pub id: uuid::Uuid,
+    pub thread_id: uuid::Uuid,
+    pub user_id: uuid::Uuid,
+    pub channel: String,
+    pub external_id: String,
+    pub role: String,
+    pub content: String,
+    pub metadata: JsonValue,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+fn row_to_brain_message(r: &sqlx::postgres::PgRow) -> BrainMessageRow {
+    BrainMessageRow {
+        id: r.get("id"),
+        thread_id: r.get("thread_id"),
+        user_id: r.get("user_id"),
+        channel: r.get("channel"),
+        external_id: r.get("external_id"),
+        role: r.get("role"),
+        content: r.get("content"),
+        metadata: r.get("metadata"),
+        created_at: r.get("created_at"),
+    }
+}
+
+pub async fn pg_insert_brain_message(
+    pool: &PgPool,
+    thread_id: uuid::Uuid,
+    user_id: uuid::Uuid,
+    channel: &str,
+    external_id: &str,
+    role: &str,
+    content: &str,
+    metadata: Option<&JsonValue>,
+) -> Result<uuid::Uuid> {
+    let row = sqlx::query(
+        "INSERT INTO brain_messages (thread_id, user_id, channel, external_id, role, content, metadata)
+         VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, '{}'))
+         RETURNING id",
+    )
+    .bind(thread_id)
+    .bind(user_id)
+    .bind(channel)
+    .bind(external_id)
+    .bind(role)
+    .bind(content)
+    .bind(metadata)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.get("id"))
+}
+
+pub async fn pg_list_brain_messages(
+    pool: &PgPool,
+    thread_id: uuid::Uuid,
+    limit: i64,
+) -> Result<Vec<BrainMessageRow>> {
+    let rows = sqlx::query(
+        "SELECT * FROM brain_messages WHERE thread_id = $1
+         ORDER BY created_at DESC LIMIT $2",
+    )
+    .bind(thread_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.iter().map(row_to_brain_message).collect())
+}
+
+// ── brain_vault_nodes ────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BrainVaultNodeRow {
+    pub id: uuid::Uuid,
+    pub path: String,
+    pub title: String,
+    pub node_type: Option<String>,
+    pub project: Option<String>,
+    pub tags: Vec<String>,
+    pub extends_path: Option<String>,
+    pub applies_to: Vec<String>,
+    pub from_thread: Option<String>,
+    pub confidence: Option<f32>,
+    pub content_hash: String,
+    pub valid_from: chrono::DateTime<chrono::Utc>,
+    pub valid_until: Option<chrono::DateTime<chrono::Utc>>,
+    pub superseded_by: Option<uuid::Uuid>,
+    pub hits: i32,
+    pub references_: i32,
+    pub last_accessed: chrono::DateTime<chrono::Utc>,
+    pub community_id: Option<i32>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+fn row_to_brain_vault_node(r: &sqlx::postgres::PgRow) -> BrainVaultNodeRow {
+    BrainVaultNodeRow {
+        id: r.get("id"),
+        path: r.get("path"),
+        title: r.get("title"),
+        node_type: r.get("node_type"),
+        project: r.get("project"),
+        tags: r.get("tags"),
+        extends_path: r.get("extends_path"),
+        applies_to: r.get("applies_to"),
+        from_thread: r.get("from_thread"),
+        confidence: r.get("confidence"),
+        content_hash: r.get("content_hash"),
+        valid_from: r.get("valid_from"),
+        valid_until: r.get("valid_until"),
+        superseded_by: r.get("superseded_by"),
+        hits: r.get("hits"),
+        references_: r.get("references_"),
+        last_accessed: r.get("last_accessed"),
+        community_id: r.get("community_id"),
+        updated_at: r.get("updated_at"),
+    }
+}
+
+pub async fn pg_upsert_brain_vault_node(
+    pool: &PgPool,
+    path: &str,
+    title: &str,
+    node_type: Option<&str>,
+    project: Option<&str>,
+    tags: &[String],
+    extends_path: Option<&str>,
+    applies_to: &[String],
+    from_thread: Option<&str>,
+    confidence: Option<f32>,
+    content_hash: &str,
+) -> Result<uuid::Uuid> {
+    let row = sqlx::query(
+        "INSERT INTO brain_vault_nodes
+            (path, title, node_type, project, tags, extends_path, applies_to,
+             from_thread, confidence, content_hash, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+         ON CONFLICT (path) DO UPDATE SET
+            title = EXCLUDED.title,
+            node_type = COALESCE(EXCLUDED.node_type, brain_vault_nodes.node_type),
+            project = COALESCE(EXCLUDED.project, brain_vault_nodes.project),
+            tags = EXCLUDED.tags,
+            extends_path = EXCLUDED.extends_path,
+            applies_to = EXCLUDED.applies_to,
+            from_thread = COALESCE(EXCLUDED.from_thread, brain_vault_nodes.from_thread),
+            confidence = COALESCE(EXCLUDED.confidence, brain_vault_nodes.confidence),
+            content_hash = EXCLUDED.content_hash,
+            updated_at = NOW()
+         RETURNING id",
+    )
+    .bind(path)
+    .bind(title)
+    .bind(node_type)
+    .bind(project)
+    .bind(tags)
+    .bind(extends_path)
+    .bind(applies_to)
+    .bind(from_thread)
+    .bind(confidence)
+    .bind(content_hash)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.get("id"))
+}
+
+pub async fn pg_get_brain_vault_node(pool: &PgPool, path: &str) -> Result<Option<BrainVaultNodeRow>> {
+    let row = sqlx::query("SELECT * FROM brain_vault_nodes WHERE path = $1")
+        .bind(path)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.as_ref().map(row_to_brain_vault_node))
+}
+
+pub async fn pg_list_brain_vault_nodes_current(pool: &PgPool, project: Option<&str>) -> Result<Vec<BrainVaultNodeRow>> {
+    let rows = if let Some(p) = project {
+        sqlx::query("SELECT * FROM brain_vault_nodes WHERE valid_until IS NULL AND project = $1 ORDER BY updated_at DESC")
+            .bind(p)
+            .fetch_all(pool)
+            .await?
+    } else {
+        sqlx::query("SELECT * FROM brain_vault_nodes WHERE valid_until IS NULL ORDER BY updated_at DESC")
+            .fetch_all(pool)
+            .await?
+    };
+    Ok(rows.iter().map(row_to_brain_vault_node).collect())
+}
+
+pub async fn pg_search_brain_vault_nodes(pool: &PgPool, query: &str, limit: i64) -> Result<Vec<BrainVaultNodeRow>> {
+    let pattern = format!("%{}%", query);
+    let rows = sqlx::query(
+        "SELECT * FROM brain_vault_nodes
+         WHERE valid_until IS NULL
+           AND (title ILIKE $1 OR path ILIKE $1 OR $1 = ANY(tags))
+         ORDER BY hits DESC, updated_at DESC
+         LIMIT $2",
+    )
+    .bind(&pattern)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.iter().map(row_to_brain_vault_node).collect())
+}
+
+pub async fn pg_bump_vault_node_hits(pool: &PgPool, id: uuid::Uuid) -> Result<()> {
+    sqlx::query("UPDATE brain_vault_nodes SET hits = hits + 1, last_accessed = NOW() WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn pg_supersede_vault_node(pool: &PgPool, old_path: &str, new_id: uuid::Uuid) -> Result<()> {
+    sqlx::query(
+        "UPDATE brain_vault_nodes SET valid_until = NOW(), superseded_by = $2 WHERE path = $1 AND valid_until IS NULL",
+    )
+    .bind(old_path)
+    .bind(new_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+// ── brain_vault_edges ────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BrainVaultEdgeRow {
+    pub src_id: uuid::Uuid,
+    pub dst_id: uuid::Uuid,
+    pub edge_type: String,
+    pub confidence: f32,
+    pub provenance: String,
+}
+
+pub async fn pg_upsert_brain_vault_edge(
+    pool: &PgPool,
+    src_id: uuid::Uuid,
+    dst_id: uuid::Uuid,
+    edge_type: &str,
+    confidence: f32,
+    provenance: &str,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO brain_vault_edges (src_id, dst_id, edge_type, confidence, provenance)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (src_id, dst_id, edge_type) DO UPDATE SET
+            confidence = EXCLUDED.confidence, provenance = EXCLUDED.provenance",
+    )
+    .bind(src_id)
+    .bind(dst_id)
+    .bind(edge_type)
+    .bind(confidence)
+    .bind(provenance)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn pg_list_brain_vault_edges_for_node(pool: &PgPool, node_id: uuid::Uuid) -> Result<Vec<BrainVaultEdgeRow>> {
+    let rows = sqlx::query(
+        "SELECT * FROM brain_vault_edges WHERE src_id = $1 OR dst_id = $1",
+    )
+    .bind(node_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.iter().map(|r| BrainVaultEdgeRow {
+        src_id: r.get("src_id"),
+        dst_id: r.get("dst_id"),
+        edge_type: r.get("edge_type"),
+        confidence: r.get("confidence"),
+        provenance: r.get("provenance"),
+    }).collect())
+}
+
+// ── brain_knowledge_candidates ───────────────────────────────────────────
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BrainCandidateRow {
+    pub id: uuid::Uuid,
+    pub user_id: uuid::Uuid,
+    pub thread_id: Option<uuid::Uuid>,
+    pub action: String,
+    pub kind: Option<String>,
+    pub title: Option<String>,
+    pub body: Option<String>,
+    pub tags: Vec<String>,
+    pub project: Option<String>,
+    pub target_path: Option<String>,
+    pub from_thread: Option<String>,
+    pub confidence: Option<f32>,
+    pub status: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+pub async fn pg_insert_brain_candidate(
+    pool: &PgPool,
+    user_id: uuid::Uuid,
+    thread_id: Option<uuid::Uuid>,
+    action: &str,
+    kind: Option<&str>,
+    title: Option<&str>,
+    body: Option<&str>,
+    tags: &[String],
+    project: Option<&str>,
+    target_path: Option<&str>,
+    from_thread: Option<&str>,
+    confidence: Option<f32>,
+) -> Result<uuid::Uuid> {
+    let row = sqlx::query(
+        "INSERT INTO brain_knowledge_candidates
+            (user_id, thread_id, action, kind, title, body, tags, project,
+             target_path, from_thread, confidence)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+         RETURNING id",
+    )
+    .bind(user_id)
+    .bind(thread_id)
+    .bind(action)
+    .bind(kind)
+    .bind(title)
+    .bind(body)
+    .bind(tags)
+    .bind(project)
+    .bind(target_path)
+    .bind(from_thread)
+    .bind(confidence)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.get("id"))
+}
+
+pub async fn pg_list_brain_candidates_pending(pool: &PgPool, user_id: uuid::Uuid) -> Result<Vec<BrainCandidateRow>> {
+    let rows = sqlx::query(
+        "SELECT * FROM brain_knowledge_candidates WHERE user_id = $1 AND status = 'pending'
+         ORDER BY created_at DESC",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.iter().map(|r| BrainCandidateRow {
+        id: r.get("id"),
+        user_id: r.get("user_id"),
+        thread_id: r.get("thread_id"),
+        action: r.get("action"),
+        kind: r.get("kind"),
+        title: r.get("title"),
+        body: r.get("body"),
+        tags: r.get("tags"),
+        project: r.get("project"),
+        target_path: r.get("target_path"),
+        from_thread: r.get("from_thread"),
+        confidence: r.get("confidence"),
+        status: r.get("status"),
+        created_at: r.get("created_at"),
+    }).collect())
+}
+
+pub async fn pg_update_brain_candidate_status(pool: &PgPool, id: uuid::Uuid, status: &str) -> Result<()> {
+    sqlx::query(
+        "UPDATE brain_knowledge_candidates SET status = $2, reviewed_at = NOW() WHERE id = $1",
+    )
+    .bind(id)
+    .bind(status)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+// ── brain_reminders ──────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BrainReminderRow {
+    pub id: uuid::Uuid,
+    pub user_id: uuid::Uuid,
+    pub thread_id: Option<uuid::Uuid>,
+    pub content: String,
+    pub remind_at: chrono::DateTime<chrono::Utc>,
+    pub channel_pref: Option<String>,
+    pub status: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+pub async fn pg_insert_brain_reminder(
+    pool: &PgPool,
+    user_id: uuid::Uuid,
+    thread_id: Option<uuid::Uuid>,
+    content: &str,
+    remind_at: chrono::DateTime<chrono::Utc>,
+    channel_pref: Option<&str>,
+) -> Result<uuid::Uuid> {
+    let row = sqlx::query(
+        "INSERT INTO brain_reminders (user_id, thread_id, content, remind_at, channel_pref)
+         VALUES ($1, $2, $3, $4, $5) RETURNING id",
+    )
+    .bind(user_id)
+    .bind(thread_id)
+    .bind(content)
+    .bind(remind_at)
+    .bind(channel_pref)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.get("id"))
+}
+
+pub async fn pg_list_due_reminders(pool: &PgPool) -> Result<Vec<BrainReminderRow>> {
+    let rows = sqlx::query(
+        "SELECT * FROM brain_reminders WHERE status = 'pending' AND remind_at <= NOW()
+         ORDER BY remind_at ASC LIMIT 50",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.iter().map(|r| BrainReminderRow {
+        id: r.get("id"),
+        user_id: r.get("user_id"),
+        thread_id: r.get("thread_id"),
+        content: r.get("content"),
+        remind_at: r.get("remind_at"),
+        channel_pref: r.get("channel_pref"),
+        status: r.get("status"),
+        created_at: r.get("created_at"),
+    }).collect())
+}
+
+pub async fn pg_fire_brain_reminder(pool: &PgPool, id: uuid::Uuid) -> Result<()> {
+    sqlx::query("UPDATE brain_reminders SET status = 'fired', fired_at = NOW() WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn pg_snooze_brain_reminder(pool: &PgPool, id: uuid::Uuid, until: chrono::DateTime<chrono::Utc>) -> Result<()> {
+    sqlx::query(
+        "UPDATE brain_reminders SET status = 'pending', remind_at = $2, snoozed_until = $2 WHERE id = $1",
+    )
+    .bind(id)
+    .bind(until)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+// ── brain_communities ────────────────────────────────────────────────────
+
+pub async fn pg_upsert_brain_community(
+    pool: &PgPool,
+    label: Option<&str>,
+    god_node_id: Option<uuid::Uuid>,
+    member_count: i32,
+    color: Option<&str>,
+) -> Result<i32> {
+    let row = sqlx::query(
+        "INSERT INTO brain_communities (label, god_node_id, member_count, color, updated_at)
+         VALUES ($1, $2, $3, $4, NOW()) RETURNING id",
+    )
+    .bind(label)
+    .bind(god_node_id)
+    .bind(member_count)
+    .bind(color)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.get("id"))
+}
+
+pub async fn pg_set_vault_node_community(pool: &PgPool, node_id: uuid::Uuid, community_id: i32) -> Result<()> {
+    sqlx::query("UPDATE brain_vault_nodes SET community_id = $2 WHERE id = $1")
+        .bind(node_id)
+        .bind(community_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BrainCommunityRow {
+    pub id: i32,
+    pub label: Option<String>,
+    pub god_node_id: Option<uuid::Uuid>,
+    pub member_count: i32,
+    pub color: Option<String>,
+}
+
+pub async fn pg_list_brain_communities(pool: &PgPool) -> Result<Vec<BrainCommunityRow>> {
+    let rows = sqlx::query("SELECT * FROM brain_communities ORDER BY id")
+        .fetch_all(pool)
+        .await?;
+    Ok(rows.iter().map(|r| BrainCommunityRow {
+        id: r.get("id"),
+        label: r.get("label"),
+        god_node_id: r.get("god_node_id"),
+        member_count: r.get("member_count"),
+        color: r.get("color"),
+    }).collect())
+}
