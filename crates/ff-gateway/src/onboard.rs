@@ -135,7 +135,7 @@ pub async fn bootstrap_script(
         }
         found
             .or_else(|| std::env::var("FORGEFLEET_GITHUB_OWNER").ok())
-            .unwrap_or_else(|| "venkat-oclaw".to_string())
+            .unwrap_or_else(|| "venkatyarl".to_string())
     };
 
     let script = BOOTSTRAP_TEMPLATE
@@ -220,7 +220,7 @@ pub async fn bootstrap_script_ps1(
         }
         found
             .or_else(|| std::env::var("FORGEFLEET_GITHUB_OWNER").ok())
-            .unwrap_or_else(|| "venkat-oclaw".to_string())
+            .unwrap_or_else(|| "venkatyarl".to_string())
     };
 
     let script = BOOTSTRAP_TEMPLATE_PS1

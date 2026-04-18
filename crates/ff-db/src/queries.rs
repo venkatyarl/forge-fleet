@@ -1370,7 +1370,7 @@ pub struct FleetNodeRow {
     #[serde(default = "default_sub_agent_count")]
     pub sub_agent_count: i32,
     /// GitHub owner/account this node is authenticated against (e.g.
-    /// "venkat-oclaw"). NULL for existing nodes still on Taylor's PAT. V12.
+    /// "venkatyarl"). NULL for existing nodes still on Taylor's PAT. V12.
     #[serde(default)]
     pub gh_account: Option<String>,
     /// Map of installed-tool versions:

@@ -10,7 +10,7 @@
 #   {{SSH_USER}}               — ssh_user for this node
 #   {{ROLE}}                   — "builder" | "gateway" | "testbed"
 #   {{RUNTIME}}                — "auto" | "llama.cpp" | "mlx" | "vllm"
-#   {{GITHUB_OWNER}}           — e.g. "venkat-oclaw"
+#   {{GITHUB_OWNER}}           — e.g. "venkatyarl"
 #   {{GITHUB_PAT_SECRET_KEY}}  — "github.venkat_pat"
 #   {{IS_TAYLOR}}              — "true" or "false" (controls passwordless sudo)
 #

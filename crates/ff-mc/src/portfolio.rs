@@ -1335,7 +1335,7 @@ mod tests {
             &db,
             &project.id,
             CreateProjectRepo {
-                repository_url: "https://github.com/taylor-oclaw/forge-fleet".into(),
+                repository_url: "https://github.com/venkatyarl/forge-fleet".into(),
                 provider: Some("github".into()),
                 default_branch: Some("main".into()),
                 status: Some("active".into()),

@@ -244,7 +244,7 @@ export const CHECKLIST: ChecklistItem[] = [
     title: 'gh auth login with Venkat\'s GitHub account',
     applies_to: ['all'],
     detail_md:
-      'Bootstrap script runs `gh auth login --with-token < ~/.forgefleet/gh_pat.txt`. Verifies with `gh auth status` showing `venkat-oclaw`.',
+      'Bootstrap script runs `gh auth login --with-token < ~/.forgefleet/gh_pat.txt`. Verifies with `gh auth status` showing `venkatyarl`.',
   },
   {
     id: 'tooling_1password',

@@ -36,7 +36,7 @@
 
 [Unit]
 Description=ForgeFleet Daemon — Unified AI Operating System
-Documentation=https://github.com/taylor-oclaw/forge-fleet
+Documentation=https://github.com/venkatyarl/forge-fleet
 After=network-online.target
 Wants=network-online.target
 

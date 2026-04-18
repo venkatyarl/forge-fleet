@@ -65,7 +65,7 @@ mkdir -p ~/taylorProjects
 if [ ! -d ~/taylorProjects/forge-fleet/.git ]; then
     echo "no .git — cloning fresh"
     rm -rf ~/taylorProjects/forge-fleet
-    git clone --depth 50 https://github.com/taylor-oclaw/forge-fleet.git ~/taylorProjects/forge-fleet 2>&1 | tail -3
+    git clone --depth 50 https://github.com/venkatyarl/forge-fleet.git ~/taylorProjects/forge-fleet 2>&1 | tail -3
 fi
 cd ~/taylorProjects/forge-fleet
 git fetch origin main 2>&1 | tail -2
