@@ -152,7 +152,7 @@ async fn execute_train(model: &str, ctx: &AgentToolContext) -> AgentToolResult {
         // Try the default location
         let alt = dirs::home_dir()
             .unwrap_or_default()
-            .join("taylorProjects")
+            .join("projects")
             .join("forge-fleet")
             .join("scripts")
             .join("train_lora_mlx.sh");
@@ -167,7 +167,7 @@ async fn execute_train(model: &str, ctx: &AgentToolContext) -> AgentToolResult {
     } else {
         dirs::home_dir()
             .unwrap_or_default()
-            .join("taylorProjects")
+            .join("projects")
             .join("forge-fleet")
             .join("scripts")
             .join("train_lora_mlx.sh")

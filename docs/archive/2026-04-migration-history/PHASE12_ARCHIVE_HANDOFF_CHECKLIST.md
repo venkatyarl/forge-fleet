@@ -2,7 +2,7 @@
 
 Date: `<YYYY-MM-DD>`  
 Archive Owner: `<name>`  
-Repo: `/Users/venkat/taylorProjects/forge-fleet`
+Repo: `/Users/venkat/projects/forge-fleet`
 
 > Purpose: final checklist to archive the Phase 12 release-prep campaign with complete docs, evidence, sign-offs, and clear handoff pointers.
 

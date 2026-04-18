@@ -1,7 +1,7 @@
 # Phase 12 — Final Consolidation (ForgeFleet Rust Rewrite)
 
 Date: 2026-04-04  
-Repo: `/Users/venkat/taylorProjects/forge-fleet`  
+Repo: `/Users/venkat/projects/forge-fleet`  
 Scope: Consolidated executive map of Phase 9–12 documentation and final path from **NO-GO** to **GO**.
 
 ---

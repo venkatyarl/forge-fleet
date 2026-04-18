@@ -1,7 +1,7 @@
 # Phase 12 — GO Activation Playbook (HOLD/NO-GO → GO)
 
 Date: 2026-04-04  
-Repo: `/Users/venkat/taylorProjects/forge-fleet`  
+Repo: `/Users/venkat/projects/forge-fleet`  
 Scope: operator run-sequence to flip release state from **HOLD/NO-GO** to **GO** once gates are satisfied.
 
 ---

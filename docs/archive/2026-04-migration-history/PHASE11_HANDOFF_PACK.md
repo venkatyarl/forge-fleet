@@ -1,7 +1,7 @@
 # Phase 11 Handoff Pack (ForgeFleet Rust Rewrite)
 
 Date: 2026-04-04  
-Repo: `/Users/venkat/taylorProjects/forge-fleet`
+Repo: `/Users/venkat/projects/forge-fleet`
 
 This is the fast onboarding pack for the next engineer picking up the Rust rewrite.
 

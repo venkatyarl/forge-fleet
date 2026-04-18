@@ -1,7 +1,7 @@
 # Phase 12 — Final Status Dashboard (ForgeFleet Rust Rewrite)
 
 Date: 2026-04-04  
-Repo: `/Users/venkat/taylorProjects/forge-fleet`  
+Repo: `/Users/venkat/projects/forge-fleet`  
 Release Target: `v0.1.0-internal`
 
 ## Executive Signal

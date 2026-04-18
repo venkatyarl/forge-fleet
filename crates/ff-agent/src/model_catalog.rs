@@ -50,7 +50,7 @@ pub struct CatalogVariant {
 
 /// Default path to the catalog TOML, relative to the repository root.
 pub const DEFAULT_CATALOG_PATH: &str =
-    "/Users/venkat/taylorProjects/forge-fleet/config/model_catalog.toml";
+    "/Users/venkat/projects/forge-fleet/config/model_catalog.toml";
 
 /// Resolve catalog path, honoring the `FORGEFLEET_CATALOG` env override.
 pub fn resolve_catalog_path() -> PathBuf {

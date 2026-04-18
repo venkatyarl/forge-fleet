@@ -3,7 +3,7 @@
 Date: `<YYYY-MM-DD>`  
 Release tag: `<vX.Y.Z-rc.N>`  
 Release branch: `<main|release-branch>`  
-Repo: `/Users/venkat/taylorProjects/forge-fleet`
+Repo: `/Users/venkat/projects/forge-fleet`
 
 > Purpose: single operator checklist to run final readiness before release execution.  
 > Format: checkbox-first for quick execution. Check every item before declaring **GO**.
@@ -25,7 +25,7 @@ Repo: `/Users/venkat/taylorProjects/forge-fleet`
 
 - [ ] Repository root confirmed:
   ```bash
-  cd /Users/venkat/taylorProjects/forge-fleet
+  cd /Users/venkat/projects/forge-fleet
   pwd
   ```
 - [ ] Working tree clean and branch synced:

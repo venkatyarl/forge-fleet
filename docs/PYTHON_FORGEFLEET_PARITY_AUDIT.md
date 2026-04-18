@@ -1,8 +1,8 @@
 # Python ForgeFleet → Rust ForgeFleet Parity Audit
 
 Date: 2026-04-05  
-Legacy repo: `/Users/venkat/taylorProjects/forge-fleet` (`27e84bc1`)  
-Rust repo: `/Users/venkat/taylorProjects/forge-fleet` (`f4a2e08`)
+Legacy repo: `/Users/venkat/projects/forge-fleet` (`27e84bc1`)  
+Rust repo: `/Users/venkat/projects/forge-fleet` (`f4a2e08`)
 
 ## Method and grading rules
 

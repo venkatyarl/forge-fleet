@@ -1,7 +1,7 @@
 # Fleet Bring-Up Playbook (Phase 26)
 
 Date: 2026-04-05  
-Repo: `/Users/venkat/taylorProjects/forge-fleet`
+Repo: `/Users/venkat/projects/forge-fleet`
 
 Goal: make real multi-node bring-up repeatable so James, Marcus, Sophie, Priya, and Ace can be brought online quickly once reachable.
 
@@ -87,7 +87,7 @@ tools/fleet_preflight.sh
 ## 3) Standard bring-up sequence (controller machine)
 
 ```bash
-export FLEET_REPO=/Users/venkat/taylorProjects/forge-fleet
+export FLEET_REPO=/Users/venkat/projects/forge-fleet
 export FLEET_CONFIG=/Users/venkat/.forgefleet/fleet.toml
 cd "$FLEET_REPO"
 
@@ -107,13 +107,13 @@ If a node cannot build locally, copy prebuilt binary + deploy artifacts from con
 For each node, execute:
 
 1. **Repo sync/build/install path**
-   - Ensure repo exists at `~/taylorProjects/forge-fleet`
+   - Ensure repo exists at `~/projects/forge-fleet`
    - Sync to `main`
    - Build `forgefleetd` release binary
 
 2. **Service install/start**
-   - `cd ~/taylorProjects/forge-fleet/deploy`
-   - `./install.sh ~/taylorProjects/forge-fleet/target/release/forgefleetd`
+   - `cd ~/projects/forge-fleet/deploy`
+   - `./install.sh ~/projects/forge-fleet/target/release/forgefleetd`
 
 3. **Config verification**
    - Confirm `~/.forgefleet/fleet.toml` exists
@@ -146,12 +146,12 @@ For each node, execute:
 ```bash
 ssh james@192.168.5.108 '
   set -euo pipefail
-  mkdir -p ~/taylorProjects
-  if [ ! -d ~/taylorProjects/forge-fleet/.git ]; then
-    echo "Repo missing at ~/taylorProjects/forge-fleet; clone or copy it first" >&2
+  mkdir -p ~/projects
+  if [ ! -d ~/projects/forge-fleet/.git ]; then
+    echo "Repo missing at ~/projects/forge-fleet; clone or copy it first" >&2
     exit 1
   fi
-  cd ~/taylorProjects/forge-fleet
+  cd ~/projects/forge-fleet
   git fetch origin
   git checkout main
   git pull --ff-only origin main
@@ -164,8 +164,8 @@ ssh james@192.168.5.108 '
 scp "$FLEET_CONFIG" james@192.168.5.108:~/.forgefleet/fleet.toml
 ssh james@192.168.5.108 '
   set -euo pipefail
-  cd ~/taylorProjects/forge-fleet/deploy
-  ./install.sh ~/taylorProjects/forge-fleet/target/release/forgefleetd
+  cd ~/projects/forge-fleet/deploy
+  ./install.sh ~/projects/forge-fleet/target/release/forgefleetd
   sudo systemctl status forgefleet --no-pager --lines=30
 '
 ```
@@ -209,12 +209,12 @@ curl -sS http://192.168.5.108:51801/api/fleet/replicate/sequence
 ```bash
 ssh marcus@192.168.5.102 '
   set -euo pipefail
-  mkdir -p ~/taylorProjects
-  if [ ! -d ~/taylorProjects/forge-fleet/.git ]; then
-    echo "Repo missing at ~/taylorProjects/forge-fleet; clone or copy it first" >&2
+  mkdir -p ~/projects
+  if [ ! -d ~/projects/forge-fleet/.git ]; then
+    echo "Repo missing at ~/projects/forge-fleet; clone or copy it first" >&2
     exit 1
   fi
-  cd ~/taylorProjects/forge-fleet
+  cd ~/projects/forge-fleet
   git fetch origin
   git checkout main
   git pull --ff-only origin main
@@ -227,8 +227,8 @@ ssh marcus@192.168.5.102 '
 scp "$FLEET_CONFIG" marcus@192.168.5.102:~/.forgefleet/fleet.toml
 ssh marcus@192.168.5.102 '
   set -euo pipefail
-  cd ~/taylorProjects/forge-fleet/deploy
-  ./install.sh ~/taylorProjects/forge-fleet/target/release/forgefleetd
+  cd ~/projects/forge-fleet/deploy
+  ./install.sh ~/projects/forge-fleet/target/release/forgefleetd
   sudo systemctl status forgefleet --no-pager --lines=30
 '
 ```
@@ -272,12 +272,12 @@ curl -sS http://192.168.5.102:51801/api/fleet/replicate/sequence
 ```bash
 ssh sophie@192.168.5.103 '
   set -euo pipefail
-  mkdir -p ~/taylorProjects
-  if [ ! -d ~/taylorProjects/forge-fleet/.git ]; then
-    echo "Repo missing at ~/taylorProjects/forge-fleet; clone or copy it first" >&2
+  mkdir -p ~/projects
+  if [ ! -d ~/projects/forge-fleet/.git ]; then
+    echo "Repo missing at ~/projects/forge-fleet; clone or copy it first" >&2
     exit 1
   fi
-  cd ~/taylorProjects/forge-fleet
+  cd ~/projects/forge-fleet
   git fetch origin
   git checkout main
   git pull --ff-only origin main
@@ -290,8 +290,8 @@ ssh sophie@192.168.5.103 '
 scp "$FLEET_CONFIG" sophie@192.168.5.103:~/.forgefleet/fleet.toml
 ssh sophie@192.168.5.103 '
   set -euo pipefail
-  cd ~/taylorProjects/forge-fleet/deploy
-  ./install.sh ~/taylorProjects/forge-fleet/target/release/forgefleetd
+  cd ~/projects/forge-fleet/deploy
+  ./install.sh ~/projects/forge-fleet/target/release/forgefleetd
   sudo systemctl status forgefleet --no-pager --lines=30
 '
 ```
@@ -335,12 +335,12 @@ curl -sS http://192.168.5.103:51801/api/fleet/replicate/sequence
 ```bash
 ssh priya@192.168.5.106 '
   set -euo pipefail
-  mkdir -p ~/taylorProjects
-  if [ ! -d ~/taylorProjects/forge-fleet/.git ]; then
-    echo "Repo missing at ~/taylorProjects/forge-fleet; clone or copy it first" >&2
+  mkdir -p ~/projects
+  if [ ! -d ~/projects/forge-fleet/.git ]; then
+    echo "Repo missing at ~/projects/forge-fleet; clone or copy it first" >&2
     exit 1
   fi
-  cd ~/taylorProjects/forge-fleet
+  cd ~/projects/forge-fleet
   git fetch origin
   git checkout main
   git pull --ff-only origin main
@@ -353,8 +353,8 @@ ssh priya@192.168.5.106 '
 scp "$FLEET_CONFIG" priya@192.168.5.106:~/.forgefleet/fleet.toml
 ssh priya@192.168.5.106 '
   set -euo pipefail
-  cd ~/taylorProjects/forge-fleet/deploy
-  ./install.sh ~/taylorProjects/forge-fleet/target/release/forgefleetd
+  cd ~/projects/forge-fleet/deploy
+  ./install.sh ~/projects/forge-fleet/target/release/forgefleetd
   sudo systemctl status forgefleet --no-pager --lines=30
 '
 ```
@@ -398,12 +398,12 @@ curl -sS http://192.168.5.106:51801/api/fleet/replicate/sequence
 ```bash
 ssh ace@192.168.5.104 '
   set -euo pipefail
-  mkdir -p ~/taylorProjects
-  if [ ! -d ~/taylorProjects/forge-fleet/.git ]; then
-    echo "Repo missing at ~/taylorProjects/forge-fleet; clone or copy it first" >&2
+  mkdir -p ~/projects
+  if [ ! -d ~/projects/forge-fleet/.git ]; then
+    echo "Repo missing at ~/projects/forge-fleet; clone or copy it first" >&2
     exit 1
   fi
-  cd ~/taylorProjects/forge-fleet
+  cd ~/projects/forge-fleet
   git fetch origin
   git checkout main
   git pull --ff-only origin main
@@ -416,8 +416,8 @@ ssh ace@192.168.5.104 '
 scp "$FLEET_CONFIG" ace@192.168.5.104:~/.forgefleet/fleet.toml
 ssh ace@192.168.5.104 '
   set -euo pipefail
-  cd ~/taylorProjects/forge-fleet/deploy
-  ./install.sh ~/taylorProjects/forge-fleet/target/release/forgefleetd
+  cd ~/projects/forge-fleet/deploy
+  ./install.sh ~/projects/forge-fleet/target/release/forgefleetd
   launchctl list | grep -i forgefleet || true
 '
 ```

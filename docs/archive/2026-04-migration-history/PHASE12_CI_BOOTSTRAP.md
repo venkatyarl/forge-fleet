@@ -1,7 +1,7 @@
 # Phase 12 — CI Bootstrap (Rust Quality Gates)
 
 Date: 2026-04-04  
-Repo: `/Users/venkat/taylorProjects/forge-fleet`
+Repo: `/Users/venkat/projects/forge-fleet`
 
 ## What was added
 

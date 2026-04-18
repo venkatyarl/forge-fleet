@@ -1,7 +1,7 @@
 # Phase 12 — Operator Quickstart Card (One Page)
 
 Date: 2026-04-04  
-Repo: `/Users/venkat/taylorProjects/forge-fleet`
+Repo: `/Users/venkat/projects/forge-fleet`
 
 > Fast operator reference for release checks, health checks, and rollback first steps.
 
@@ -10,7 +10,7 @@ Repo: `/Users/venkat/taylorProjects/forge-fleet`
 ## 0) Baseline (run first)
 
 ```bash
-cd /Users/venkat/taylorProjects/forge-fleet
+cd /Users/venkat/projects/forge-fleet
 mkdir -p .phase12-release
 export RELEASE_BRANCH="main"
 ```

@@ -1,7 +1,7 @@
 # Phase 11 — GO/NO-GO Gate Checklist (ForgeFleet Rust Rewrite)
 
 Date: 2026-04-04  
-Repo: `/Users/venkat/taylorProjects/forge-fleet`  
+Repo: `/Users/venkat/projects/forge-fleet`  
 Applies to target tag: `v0.1.0-internal`
 
 This checklist is the strict go-live gate for internal release. It is derived from:

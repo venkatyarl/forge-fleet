@@ -1,7 +1,7 @@
 # Phase 12 — Release Blockers Burn-down Tracker
 
 Date: 2026-04-04  
-Repo: `/Users/venkat/taylorProjects/forge-fleet`  
+Repo: `/Users/venkat/projects/forge-fleet`  
 Release target: `v0.1.0-internal`  
 Current decision state: **HOLD / NO-GO**
 

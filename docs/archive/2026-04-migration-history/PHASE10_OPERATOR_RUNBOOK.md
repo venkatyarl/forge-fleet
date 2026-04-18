@@ -19,7 +19,7 @@ Scope: `forge-fleet-rs` v0.1 internal operations (control plane + agents)
 Run from repo root:
 
 ```bash
-cd /Users/venkat/taylorProjects/forge-fleet
+cd /Users/venkat/projects/forge-fleet
 ```
 
 1. **Preflight checks**

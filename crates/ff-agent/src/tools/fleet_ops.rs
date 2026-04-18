@@ -87,7 +87,7 @@ impl AgentTool for NodeSetupTool {
 mkdir -p ~/.forgefleet/memory/global
 mkdir -p ~/.forgefleet/sessions
 mkdir -p ~/.forgefleet/plugins
-mkdir -p ~/taylorProjects
+mkdir -p ~/projects
 echo '{node_name}' > ~/.forgefleet/node_name
 echo 'ForgeFleet node setup complete'
 "#));
@@ -459,7 +459,7 @@ impl AgentTool for BinaryDeployTool {
         } else {
             // Build on target
             let build_cmd = format!(
-                "cd ~/taylorProjects/forge-fleet && git pull && cargo build --release -p ff-terminal && cp target/release/ff /usr/local/bin/ff"
+                "cd ~/projects/forge-fleet && git pull && cargo build --release -p ff-terminal && cp target/release/ff /usr/local/bin/ff"
             );
             let result = ssh_cmd(user, host, &build_cmd).await;
             AgentToolResult::ok(format!("Remote build on {host}:\n{}", truncate_output(&result, 2000)))

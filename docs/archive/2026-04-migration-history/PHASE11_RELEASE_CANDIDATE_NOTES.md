@@ -1,7 +1,7 @@
 # Phase 11 — Release Candidate Notes (ForgeFleet Rust Rewrite)
 
 Date: 2026-04-04  
-Repo: `/Users/venkat/taylorProjects/forge-fleet`  
+Repo: `/Users/venkat/projects/forge-fleet`  
 Version target: `v0.1.0-internal` (release candidate)
 
 ## RC status summary

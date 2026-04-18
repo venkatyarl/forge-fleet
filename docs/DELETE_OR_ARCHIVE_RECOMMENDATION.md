@@ -1,7 +1,7 @@
 # DELETE OR ARCHIVE Recommendation (Legacy ForgeFleet + Mission Control)
 
 Date: 2026-04-04  
-Prepared for: `/Users/venkat/taylorProjects` cleanup and cutover
+Prepared for: `/Users/venkat/projects` cleanup and cutover
 
 ## Executive Summary
 
@@ -63,7 +63,7 @@ Use the same lifecycle for each legacy repo:
 
 ## 2) Repo-by-Repo Current State + Preconditions
 
-## A) `/Users/venkat/taylorProjects/forge-fleet` (Legacy Python ForgeFleet)
+## A) `/Users/venkat/projects/forge-fleet` (Legacy Python ForgeFleet)
 
 **Current recommended state: KEEP ACTIVE**
 
@@ -90,7 +90,7 @@ Use the same lifecycle for each legacy repo:
 
 ---
 
-## B) `/Users/venkat/taylorProjects/mission-control` (Legacy Mission Control)
+## B) `/Users/venkat/projects/mission-control` (Legacy Mission Control)
 
 **Current recommended state: KEEP ACTIVE**
 
@@ -117,7 +117,7 @@ Use the same lifecycle for each legacy repo:
 
 ---
 
-## 3) Proposed `~/taylorProjects` Folder Cleanup Sequence
+## 3) Proposed `~/projects` Folder Cleanup Sequence
 
 Goal: eventually keep **one primary ForgeFleet folder**.
 
@@ -142,11 +142,11 @@ Practical safety tip: use temporary compatibility symlinks for 2–4 weeks after
 
 ## Phase 3 — Archive
 1. Create read-only archives of `forge-fleet-py-legacy` and `mission-control-legacy`.
-2. Move archives to a dedicated archive path (example: `~/taylorProjects/_archive/`).
+2. Move archives to a dedicated archive path (example: `~/projects/_archive/`).
 
 ## Phase 4 — Delete (final)
 1. After retention + restore validation, delete legacy working trees.
-2. End-state in `~/taylorProjects` should keep:
+2. End-state in `~/projects` should keep:
    - `forge-fleet/` (Rust primary)
    - archived artifacts only (outside primary dev path)
 
@@ -200,8 +200,8 @@ These are the recommended names, with timing constraints:
    - **Recommended: YES** once Rust has replaced required MC operational surface.
 
 4. Archive location recommendation:
-   - `~/taylorProjects/_archive/forge-fleet-py-legacy-YYYYMMDD.tar.zst`
-   - `~/taylorProjects/_archive/mission-control-legacy-YYYYMMDD.tar.zst`
+   - `~/projects/_archive/forge-fleet-py-legacy-YYYYMMDD.tar.zst`
+   - `~/projects/_archive/mission-control-legacy-YYYYMMDD.tar.zst`
 
 ---
 

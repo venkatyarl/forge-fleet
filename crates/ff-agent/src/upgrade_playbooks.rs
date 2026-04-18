@@ -10,12 +10,12 @@ pub fn playbook_for(tool: &str, os_family: &str) -> Option<String> {
         ("vllm", _) => Some("pip install -U vllm".into()),
         ("llama.cpp", _) => Some("cd ~/llama.cpp && git pull && cmake --build build --config Release -j".into()),
         ("ff_git" | "ff", "macos") => Some(
-            "cd ~/taylorProjects/forge-fleet && git pull --ff-only && \
+            "cd ~/projects/forge-fleet && git pull --ff-only && \
              cargo build -p ff-terminal --release && \
              install -m 755 target/release/ff ~/.local/bin/ff && \
              codesign --force --sign - ~/.local/bin/ff".into()),
         ("ff_git" | "ff", "linux") => Some(
-            "cd ~/taylorProjects/forge-fleet && git pull --ff-only && \
+            "cd ~/projects/forge-fleet && git pull --ff-only && \
              cargo build -p ff-terminal --release && \
              install -m 755 target/release/ff ~/.local/bin/ff".into()),
         ("os", "linux") => Some("sudo apt-get update && sudo apt-get -y upgrade".into()),

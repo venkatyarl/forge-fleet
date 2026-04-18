@@ -1,7 +1,7 @@
 # Phase 12 — Post-Release Monitoring Plan (First 24h)
 
 Date: 2026-04-04  
-Repo: `/Users/venkat/taylorProjects/forge-fleet`  
+Repo: `/Users/venkat/projects/forge-fleet`  
 Applies to release/tag: `<vX.Y.Z>`
 
 > Purpose: define the first 24 hours of post-release monitoring for the ForgeFleet Rust rewrite, including key signals, thresholds, escalation flow, and rollback decision points.

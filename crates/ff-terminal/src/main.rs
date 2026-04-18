@@ -189,6 +189,22 @@ enum FleetCommand {
         name: String,
         #[arg(long)] json: bool,
     },
+    /// Migrate every fleet node to a new GitHub owner + move the repo from
+    /// ~/taylorProjects/forge-fleet → ~/projects/forge-fleet. Enqueues one
+    /// idempotent shell task per node via the deferred queue (trigger=node_online),
+    /// so offline nodes pick it up when they come back online.
+    MigrateGithub {
+        /// New GitHub owner/org for the forge-fleet remote (default: venkatyarl).
+        #[arg(long, default_value = "venkatyarl")] new_owner: String,
+        /// Skip the local node (the one running this command). Default: true.
+        #[arg(long, default_value_t = true)] skip_local: bool,
+        /// Only enqueue for this specific node (for testing a single target).
+        #[arg(long)] only: Option<String>,
+        /// Show planned enqueues without writing to the defer queue.
+        #[arg(long, default_value_t = false)] dry_run: bool,
+        /// Required to actually enqueue (otherwise prints plan and exits).
+        #[arg(long, default_value_t = false)] yes: bool,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -3339,8 +3355,110 @@ async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
                 }
             }
         }
+        FleetCommand::MigrateGithub { new_owner, skip_local, only, dry_run, yes } => {
+            let nodes = ff_db::pg_list_nodes(&pool).await?;
+            let local = ff_agent::fleet_info::resolve_this_node_name().await;
+            let mut targets: Vec<&ff_db::FleetNodeRow> = nodes.iter().collect();
+            if let Some(name) = &only {
+                targets.retain(|n| &n.name == name);
+                if targets.is_empty() {
+                    anyhow::bail!("no fleet node named '{name}'");
+                }
+            } else if skip_local {
+                targets.retain(|n| n.name != local);
+            }
+            println!("{CYAN}▶ ff fleet migrate-github{RESET}");
+            println!("  new owner:       {new_owner}");
+            println!("  local node:      {local}{}", if skip_local { " (skipped)" } else { "" });
+            println!("  targets:         {} node(s)", targets.len());
+            for n in &targets {
+                println!("    {:<15} {:<16} {}", n.name, n.ip, n.gh_account.clone().unwrap_or_else(|| "-".into()));
+            }
+            if targets.is_empty() {
+                println!("{YELLOW}No nodes to enqueue. Nothing to do.{RESET}");
+                return Ok(());
+            }
+            if dry_run || !yes {
+                println!("\n{YELLOW}Dry run — not enqueuing. Pass --yes to actually enqueue.{RESET}");
+                return Ok(());
+            }
+
+            let who = whoami_tag();
+            let mut enqueued: Vec<(String, String)> = Vec::with_capacity(targets.len());
+            for n in &targets {
+                let script = build_migrate_github_script(&new_owner);
+                let title = format!("Migrate GitHub owner → {new_owner} on {}", n.name);
+                let payload = serde_json::json!({ "command": script });
+                let trigger_spec = serde_json::json!({ "node": n.name });
+                let defer_id = ff_db::pg_enqueue_deferred(
+                    &pool,
+                    &title,
+                    "shell",
+                    &payload,
+                    "node_online",
+                    &trigger_spec,
+                    Some(&n.name),
+                    &serde_json::json!([]),
+                    Some(&who),
+                    Some(3),
+                )
+                .await?;
+                enqueued.push((n.name.clone(), defer_id));
+            }
+            println!("\n{GREEN}✓ Enqueued {} migration task(s):{RESET}", enqueued.len());
+            for (node, id) in &enqueued {
+                println!("  {:<15} {id}", node);
+            }
+            println!("\nTrack progress with: ff defer list");
+        }
     }
     Ok(())
+}
+
+fn build_migrate_github_script(new_owner: &str) -> String {
+    format!(
+        r#"set -e
+if [ -d "/Users/$USER" ]; then
+  HOME_BASE="/Users/$USER"
+  OS_TYPE="mac"
+else
+  HOME_BASE="/home/$USER"
+  OS_TYPE="linux"
+fi
+OLD_DIR="$HOME_BASE/taylorProjects/forge-fleet"
+NEW_DIR="$HOME_BASE/projects/forge-fleet"
+mkdir -p "$HOME_BASE/projects"
+if [ ! -d "$NEW_DIR/.git" ]; then
+  if [ -d "$OLD_DIR/.git" ]; then
+    mv "$OLD_DIR" "$NEW_DIR"
+  else
+    git clone --depth 50 "https://github.com/{new_owner}/forge-fleet.git" "$NEW_DIR"
+  fi
+fi
+if [ ! -e "$OLD_DIR" ]; then
+  mkdir -p "$HOME_BASE/taylorProjects"
+  ln -sfn "$NEW_DIR" "$OLD_DIR"
+fi
+cd "$NEW_DIR"
+git remote set-url origin "https://github.com/{new_owner}/forge-fleet.git"
+git fetch origin main
+git reset --hard origin/main
+cargo build --release -p ff-terminal
+install -m 755 target/release/ff "$HOME_BASE/.local/bin/ff"
+if [ "$OS_TYPE" = "mac" ]; then
+  codesign --force --sign - "$HOME_BASE/.local/bin/ff" || true
+fi
+if [ "$OS_TYPE" = "linux" ]; then
+  UNIT="/etc/systemd/system/forgefleet-daemon.service"
+  if [ -f "$UNIT" ]; then
+    sudo sed -i "s|WorkingDirectory=.*taylorProjects.*forge-fleet|WorkingDirectory=$NEW_DIR|" "$UNIT" || true
+    sudo systemctl daemon-reload || true
+    sudo systemctl restart forgefleet-daemon.service || true
+  fi
+fi
+echo "migrate-github complete on $(hostname): remote=https://github.com/{new_owner}/forge-fleet.git path=$NEW_DIR"
+"#
+    )
 }
 
 async fn handle_brain(cmd: BrainCommand) -> Result<()> {

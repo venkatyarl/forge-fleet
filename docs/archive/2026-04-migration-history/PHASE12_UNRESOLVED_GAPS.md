@@ -1,7 +1,7 @@
 # Phase 12 — Unresolved Gaps Register (NO-GO -> GO)
 
 Date: 2026-04-04  
-Repo: `/Users/venkat/taylorProjects/forge-fleet`  
+Repo: `/Users/venkat/projects/forge-fleet`  
 Release target: `v0.1.0-internal`
 
 Current release posture in Phase 12 docs is **HOLD / NO-GO**.  

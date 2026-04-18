@@ -1,7 +1,7 @@
 # Phase 12 — Final Release Packet Index (ForgeFleet Rust Rewrite)
 
 Date: 2026-04-04  
-Repo: `/Users/venkat/taylorProjects/forge-fleet`
+Repo: `/Users/venkat/projects/forge-fleet`
 
 This is the single index of release-relevant artifacts for `v0.1.0-internal`, split into:
 1) **Required before GO** (must be complete/evidenced) and  

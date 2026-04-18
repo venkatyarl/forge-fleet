@@ -1,7 +1,7 @@
 # Phase 12 Decision Memo (ForgeFleet Rust Rewrite)
 
 Date: 2026-04-04  
-Repo: `/Users/venkat/taylorProjects/forge-fleet`  
+Repo: `/Users/venkat/projects/forge-fleet`  
 Audience: Engineering, Product, Ops leadership
 
 ---

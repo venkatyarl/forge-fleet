@@ -1,7 +1,7 @@
 # Phase 12 — Release Readiness Scorecard (ForgeFleet Rust Rewrite)
 
 Date: 2026-04-04  
-Repo: `/Users/venkat/taylorProjects/forge-fleet`  
+Repo: `/Users/venkat/projects/forge-fleet`  
 Release Target: `v0.1.0-internal`
 
 ---

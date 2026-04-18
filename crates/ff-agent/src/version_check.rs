@@ -316,7 +316,7 @@ fn home_repo_dir() -> std::path::PathBuf {
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .unwrap_or_else(|_| if cfg!(windows) { "C:\\".into() } else { "/".into() });
-    std::path::PathBuf::from(home).join("taylorProjects").join("forge-fleet")
+    std::path::PathBuf::from(home).join("projects").join("forge-fleet")
 }
 
 async fn cmd_in_dir(dir: &std::path::Path, bin: &str, args: &[&str]) -> Option<String> {

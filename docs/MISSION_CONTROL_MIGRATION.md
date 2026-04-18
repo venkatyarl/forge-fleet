@@ -1,6 +1,6 @@
 # Mission Control Legacy → ForgeFleet Migration
 
-## Source: ~/taylorProjects/mission-control-legacy
+## Source: ~/projects/mission-control-legacy
 ## Target: ForgeFleet ff-mc crate + ff-gateway + dashboard
 
 ## Features to Migrate (Priority Order)

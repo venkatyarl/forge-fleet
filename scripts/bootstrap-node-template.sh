@@ -193,8 +193,8 @@ fi
 # ─── 6. Clone forge-fleet + build ff ─────────────────────────────────────
 
 report "clone" running
-REPO_DIR="/home/${SUDO_INVOKER}/taylorProjects/forge-fleet"
-[ "$OS_ID" = "macos" ] && REPO_DIR="/Users/${SUDO_INVOKER}/taylorProjects/forge-fleet"
+REPO_DIR="/home/${SUDO_INVOKER}/projects/forge-fleet"
+[ "$OS_ID" = "macos" ] && REPO_DIR="/Users/${SUDO_INVOKER}/projects/forge-fleet"
 
 run_as_user mkdir -p "$(dirname "$REPO_DIR")"
 if [ ! -d "$REPO_DIR/.git" ]; then

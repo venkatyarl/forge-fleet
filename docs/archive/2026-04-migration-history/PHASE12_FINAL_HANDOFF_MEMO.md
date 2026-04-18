@@ -1,7 +1,7 @@
 # Phase 12 Final Handoff Memo (Operator-Ready)
 
 Date: 2026-04-04  
-Repo: `/Users/venkat/taylorProjects/forge-fleet`  
+Repo: `/Users/venkat/projects/forge-fleet`  
 Release Target: `v0.1.0-internal`
 
 ## 1) Current State (at handoff)
@@ -85,7 +85,7 @@ The following are the active GO blockers (from `docs/PHASE12_UNRESOLVED_GAPS.md`
 Use this as the first execution pass to regenerate release evidence:
 
 ```bash
-cd /Users/venkat/taylorProjects/forge-fleet
+cd /Users/venkat/projects/forge-fleet
 set -euo pipefail
 mkdir -p .phase12-release
 

@@ -1,7 +1,7 @@
 # Phase 9 Scope Reconciliation (CC_sources → forge-fleet-rs)
 
 Date: 2026-04-04  
-Workspace: `/Users/venkat/taylorProjects/forge-fleet`  
+Workspace: `/Users/venkat/projects/forge-fleet`  
 Source corpus: `/Users/venkat/Downloads/CC_sources`
 
 ## 1) CC_sources top-level structure (what exists)

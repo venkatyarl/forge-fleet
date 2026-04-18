@@ -2,7 +2,7 @@
 
 ## Legend
 - **CC** = Claude Code (TypeScript/Node.js, ~/Downloads/CC_sources/anthropic-leaked-source-code-main/)
-- **FF** = ForgeFleet (Rust, ~/taylorProjects/forge-fleet/)
+- **FF** = ForgeFleet (Rust, ~/projects/forge-fleet/)
 - ✅ = Fully implemented
 - 🟡 = Partially implemented / scaffolded
 - ❌ = Missing — needs to be built

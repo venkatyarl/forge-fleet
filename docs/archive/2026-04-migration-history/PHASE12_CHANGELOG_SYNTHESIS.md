@@ -1,7 +1,7 @@
 # Phase 12 Changelog Synthesis (ForgeFleet Rust Rewrite)
 
 Date: 2026-04-04  
-Repo: `/Users/venkat/taylorProjects/forge-fleet`
+Repo: `/Users/venkat/projects/forge-fleet`
 
 This document synthesizes major Rust rewrite changes across phases in changelog format.
 

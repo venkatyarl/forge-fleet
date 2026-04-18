@@ -1,7 +1,7 @@
 # Phase 10 — Release Readiness (Rust Rewrite)
 
 Snapshot: 2026-04-04 07:12 EDT
-Repo: `/Users/venkat/taylorProjects/forge-fleet`
+Repo: `/Users/venkat/projects/forge-fleet`
 
 ## 1) Workspace crate inventory
 

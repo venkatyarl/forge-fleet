@@ -1,7 +1,7 @@
 # Phase 11 — Final Audit (ForgeFleet Rust Rewrite)
 
 Date: 2026-04-04  
-Repo: `/Users/venkat/taylorProjects/forge-fleet`
+Repo: `/Users/venkat/projects/forge-fleet`
 
 ## 1) Audit scope executed
 

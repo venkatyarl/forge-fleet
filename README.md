@@ -11,11 +11,11 @@ It combines:
 - self-update, rollout, audit, and observability systems
 
 The active canonical repo is:
-- `~/taylorProjects/forge-fleet`
+- `~/projects/forge-fleet`
 
 Legacy repos are frozen:
-- `~/taylorProjects/forge-fleet-py-legacy`
-- `~/taylorProjects/mission-control-legacy`
+- `~/projects/forge-fleet-py-legacy`
+- `~/projects/mission-control-legacy`
 
 ---
 
@@ -127,13 +127,13 @@ If you want to build the dashboard locally, install:
 
 ### Build the daemon
 ```bash
-cd ~/taylorProjects/forge-fleet
+cd ~/projects/forge-fleet
 cargo build --release --bin forgefleetd
 ```
 
 ### Run workspace verification
 ```bash
-cd ~/taylorProjects/forge-fleet
+cd ~/projects/forge-fleet
 cargo check --workspace
 cargo test --workspace --lib
 cargo test -p forge-fleet --test integration_boot
@@ -141,7 +141,7 @@ cargo test -p forge-fleet --test integration_boot
 
 ### Build the dashboard
 ```bash
-cd ~/taylorProjects/forge-fleet/dashboard
+cd ~/projects/forge-fleet/dashboard
 npm install
 npm run build
 ```
@@ -201,7 +201,7 @@ See:
 
 ### Start in foreground
 ```bash
-cd ~/taylorProjects/forge-fleet
+cd ~/projects/forge-fleet
 ./target/release/forgefleetd start
 ```
 
@@ -223,13 +223,13 @@ ForgeFleet includes install artifacts for both macOS and Linux.
 
 ### Install from local build
 ```bash
-cd ~/taylorProjects/forge-fleet/deploy
-./install.sh ~/taylorProjects/forge-fleet/target/release/forgefleetd
+cd ~/projects/forge-fleet/deploy
+./install.sh ~/projects/forge-fleet/target/release/forgefleetd
 ```
 
 ### Uninstall service
 ```bash
-cd ~/taylorProjects/forge-fleet/deploy
+cd ~/projects/forge-fleet/deploy
 ./install.sh --uninstall
 ```
 
@@ -376,7 +376,7 @@ They remain useful as migration evidence and audit trail, but they are **not** t
 
 ### 1. Build
 ```bash
-cd ~/taylorProjects/forge-fleet
+cd ~/projects/forge-fleet
 cargo build --release --bin forgefleetd
 ```
 

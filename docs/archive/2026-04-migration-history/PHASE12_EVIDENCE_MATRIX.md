@@ -1,7 +1,7 @@
 # Phase 12 — Evidence Matrix (ForgeFleet Rust Rewrite)
 
 Date: 2026-04-04  
-Repo: `/Users/venkat/taylorProjects/forge-fleet`
+Repo: `/Users/venkat/projects/forge-fleet`
 
 > Purpose: map major release claims to concrete, auditable evidence artifacts and verification commands.
 

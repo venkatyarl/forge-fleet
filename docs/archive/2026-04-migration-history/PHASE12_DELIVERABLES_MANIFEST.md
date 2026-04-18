@@ -1,7 +1,7 @@
 # Phase 12 Deliverables Manifest (Phases 1–12)
 
 Date: 2026-04-04  
-Repo: `/Users/venkat/taylorProjects/forge-fleet`
+Repo: `/Users/venkat/projects/forge-fleet`
 
 This manifest is the campaign-close inventory of major deliverables produced across Phases 1–12.
 

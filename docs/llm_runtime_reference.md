@@ -16,13 +16,13 @@ routes so the `ff` CLI can talk to them uniformly.
 Built from source on Taylor:
 
 ```
-~/taylorProjects/llama.cpp/build/bin/llama-server
+~/projects/llama.cpp/build/bin/llama-server
 ```
 
 Build (one-time):
 
 ```bash
-cd ~/taylorProjects/llama.cpp
+cd ~/projects/llama.cpp
 cmake -B build -DGGML_METAL=ON
 cmake --build build --config Release -j
 ```
@@ -32,7 +32,7 @@ On NVIDIA boxes substitute `-DGGML_CUDA=ON`.
 ### Launch command
 
 ```bash
-~/taylorProjects/llama.cpp/build/bin/llama-server \
+~/projects/llama.cpp/build/bin/llama-server \
   --model /models/qwen2.5-coder-32b-instruct-q4_k_m.gguf \
   --host 0.0.0.0 \
   --port 8080 \

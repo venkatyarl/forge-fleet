@@ -61,13 +61,13 @@ fi
 command -v cargo >/dev/null || { echo "ERROR: no cargo on PATH (install rustup first)"; exit 1; }
 
 # 2. Ensure repo is present and up-to-date.
-mkdir -p ~/taylorProjects
-if [ ! -d ~/taylorProjects/forge-fleet/.git ]; then
+mkdir -p ~/projects
+if [ ! -d ~/projects/forge-fleet/.git ]; then
     echo "no .git — cloning fresh"
-    rm -rf ~/taylorProjects/forge-fleet
-    git clone --depth 50 https://github.com/venkatyarl/forge-fleet.git ~/taylorProjects/forge-fleet 2>&1 | tail -3
+    rm -rf ~/projects/forge-fleet
+    git clone --depth 50 https://github.com/venkatyarl/forge-fleet.git ~/projects/forge-fleet 2>&1 | tail -3
 fi
-cd ~/taylorProjects/forge-fleet
+cd ~/projects/forge-fleet
 git fetch origin main 2>&1 | tail -2
 git reset --hard origin/main 2>&1 | tail -1
 

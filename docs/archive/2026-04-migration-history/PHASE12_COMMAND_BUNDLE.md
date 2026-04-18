@@ -1,7 +1,7 @@
 # Phase 12 — Final Command Bundle (Minimal)
 
 Date: 2026-04-04  
-Repo: `/Users/venkat/taylorProjects/forge-fleet`
+Repo: `/Users/venkat/projects/forge-fleet`
 
 > Purpose: one minimal, copy-paste command flow for Phase 12 release control.
 > 
@@ -15,7 +15,7 @@ Repo: `/Users/venkat/taylorProjects/forge-fleet`
 ### Copy/paste
 
 ```bash
-cd /Users/venkat/taylorProjects/forge-fleet
+cd /Users/venkat/projects/forge-fleet
 mkdir -p .phase12-release
 export RELEASE_BRANCH="${RELEASE_BRANCH:-main}"
 
@@ -46,7 +46,7 @@ cargo metadata --no-deps >/dev/null
 ### Copy/paste
 
 ```bash
-cd /Users/venkat/taylorProjects/forge-fleet
+cd /Users/venkat/projects/forge-fleet
 set -euo pipefail
 
 cargo fmt --all -- --check 2>&1 | tee .phase12-release/cargo_fmt_check.log
@@ -73,7 +73,7 @@ cargo build --workspace --release 2>&1 | tee .phase12-release/cargo_build_releas
 ### Copy/paste
 
 ```bash
-cd /Users/venkat/taylorProjects/forge-fleet
+cd /Users/venkat/projects/forge-fleet
 set -euo pipefail
 
 find target/release -maxdepth 1 -type f -perm -111 -exec shasum -a 256 {} \; \
@@ -101,7 +101,7 @@ ls -1 .phase12-release | sort | tee .phase12-release/evidence_manifest.txt
 ### Copy/paste
 
 ```bash
-cd /Users/venkat/taylorProjects/forge-fleet
+cd /Users/venkat/projects/forge-fleet
 set -euo pipefail
 
 missing=0
@@ -158,7 +158,7 @@ fi
 ### If `GO_CANDIDATE`, run tag readiness dry-run
 
 ```bash
-cd /Users/venkat/taylorProjects/forge-fleet
+cd /Users/venkat/projects/forge-fleet
 export RC_SHA="$(cat .phase12-release/release_sha.txt)"
 export RC_TAG="<vX.Y.Z-rc.N>"
 

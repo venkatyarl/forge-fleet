@@ -1,7 +1,7 @@
 # Phase 12 — Toolchain Baseline (ForgeFleet Rust Rewrite)
 
 Date: 2026-04-04  
-Repo: `/Users/venkat/taylorProjects/forge-fleet`  
+Repo: `/Users/venkat/projects/forge-fleet`  
 Scope: Local developer setup baseline for Phase 12 quality gates
 
 ## 1) Goal

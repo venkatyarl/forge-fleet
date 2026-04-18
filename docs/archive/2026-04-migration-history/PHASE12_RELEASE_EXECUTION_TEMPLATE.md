@@ -2,7 +2,7 @@
 
 Date: `<YYYY-MM-DD>`  
 Release Coordinator: `<name>`  
-Repo: `/Users/venkat/taylorProjects/forge-fleet`  
+Repo: `/Users/venkat/projects/forge-fleet`  
 Target Version/Tag: `<vX.Y.Z>`  
 Release Window: `<start time> → <end time> (<timezone>)`
 

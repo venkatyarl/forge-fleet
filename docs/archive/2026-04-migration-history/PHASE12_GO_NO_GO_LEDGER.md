@@ -1,7 +1,7 @@
 # Phase 12 — GO/NO-GO Decision Ledger
 
 Date: 2026-04-04  
-Repo: `/Users/venkat/taylorProjects/forge-fleet`  
+Repo: `/Users/venkat/projects/forge-fleet`  
 Release target: `v0.1.0-internal`
 
 This ledger tracks the concrete decision criteria required to move from **HOLD / NO-GO** to **GO**.

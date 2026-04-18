@@ -1,7 +1,7 @@
 # Final Completion Checklist + Archive Readiness
 
 Date: 2026-04-05  
-Repo: `/Users/venkat/taylorProjects/forge-fleet`  
+Repo: `/Users/venkat/projects/forge-fleet`  
 Purpose: Final operational go/no-go checklist for legacy deletion, doc archival, and declaring ForgeFleet complete.
 
 ## Inputs used

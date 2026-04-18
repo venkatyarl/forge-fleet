@@ -1,7 +1,7 @@
 # Phase 12 — Release Proof Bundle (ForgeFleet Rust Rewrite)
 
 Date: 2026-04-04  
-Repo: `/Users/venkat/taylorProjects/forge-fleet`
+Repo: `/Users/venkat/projects/forge-fleet`
 
 > Purpose: single release-proof index that consolidates all evidence pointers needed for Phase 12 GO/NO-GO decisioning.
 

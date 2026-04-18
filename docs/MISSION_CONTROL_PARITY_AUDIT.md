@@ -3,8 +3,8 @@
 Date: 2026-04-04  
 Author: OpenClaw subagent parity audit  
 Repos audited:
-- Mission Control: `/Users/venkat/taylorProjects/mission-control-legacy`
-- ForgeFleet Rust: `/Users/venkat/taylorProjects/forge-fleet`
+- Mission Control: `/Users/venkat/projects/mission-control-legacy`
+- ForgeFleet Rust: `/Users/venkat/projects/forge-fleet`
 
 ---
 

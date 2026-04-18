@@ -138,7 +138,7 @@ docker exec -it forgefleet-postgres \
 ## 3) Start ForgeFleet with `mode = "postgres_runtime"`
 
 ```bash
-cd ~/taylorProjects/forge-fleet
+cd ~/projects/forge-fleet
 cargo run --bin forgefleetd -- --config ~/.forgefleet/fleet.toml start
 ```
 

@@ -1,7 +1,7 @@
 # Phase 12 Closeout Summary (ForgeFleet Rust Rewrite)
 
 Date: 2026-04-04  
-Repo: `/Users/venkat/taylorProjects/forge-fleet`
+Repo: `/Users/venkat/projects/forge-fleet`
 
 ## Executive status
 
@@ -106,7 +106,7 @@ Workspace implementation footprint: **22 crates** (`Cargo.toml` workspace member
 ## 5) Recommended next operator command sequence (single run)
 
 ```bash
-cd /Users/venkat/taylorProjects/forge-fleet
+cd /Users/venkat/projects/forge-fleet
 set -euo pipefail
 mkdir -p .phase12-release
 

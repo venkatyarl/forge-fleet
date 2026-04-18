@@ -1,7 +1,7 @@
 # Phase 12 — Final Release Readiness Recap
 
 Date: 2026-04-04  
-Repo: `/Users/venkat/taylorProjects/forge-fleet`  
+Repo: `/Users/venkat/projects/forge-fleet`  
 Release target: `v0.1.0-internal`
 
 Sources synthesized:

@@ -148,7 +148,7 @@ if ($PAT) {
 # ─── 6. Clone forge-fleet + build ff ─────────────────────────────────────
 
 Report "clone" "running"
-$REPO_DIR = Join-Path $env:USERPROFILE "taylorProjects\forge-fleet"
+$REPO_DIR = Join-Path $env:USERPROFILE "projects\forge-fleet"
 New-Item -ItemType Directory -Force -Path (Split-Path $REPO_DIR) | Out-Null
 if (-not (Test-Path (Join-Path $REPO_DIR ".git"))) {
     git clone --depth 50 "https://github.com/$GITHUB_OWNER/forge-fleet.git" $REPO_DIR

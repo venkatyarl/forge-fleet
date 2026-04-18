@@ -3,7 +3,7 @@
 Date: `<YYYY-MM-DD>`  
 Release candidate tag: `<vX.Y.Z-rc.N>`  
 Release SHA: `<git_sha>`  
-Repo: `/Users/venkat/taylorProjects/forge-fleet`
+Repo: `/Users/venkat/projects/forge-fleet`
 
 > Purpose: single sign-off package for final release decisioning.  
 > Rule: **GO requires all mandatory checklist items complete, evidence attached, and all four sign-offs (Engineering, Product, Ops, QA).**

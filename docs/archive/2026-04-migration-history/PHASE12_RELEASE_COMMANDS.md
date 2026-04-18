@@ -1,7 +1,7 @@
 # Phase 12 — Release Command Cookbook (ForgeFleet Rust Rewrite)
 
 Date: 2026-04-04  
-Repo: `/Users/venkat/taylorProjects/forge-fleet`
+Repo: `/Users/venkat/projects/forge-fleet`
 
 > Purpose: copy/paste command sets for Phase 12 release execution.  
 > Scope: preflight validation, build/test gates, RC tagging workflow, and rollback verification.
@@ -13,7 +13,7 @@ Repo: `/Users/venkat/taylorProjects/forge-fleet`
 Run all blocks from repo root unless noted otherwise.
 
 ```bash
-cd /Users/venkat/taylorProjects/forge-fleet
+cd /Users/venkat/projects/forge-fleet
 mkdir -p .phase12-release
 ```
 
@@ -33,7 +33,7 @@ mkdir -p .phase12-release
 ### 1.1 Repo + branch integrity
 
 ```bash
-cd /Users/venkat/taylorProjects/forge-fleet
+cd /Users/venkat/projects/forge-fleet
 export RELEASE_BRANCH="<release-branch>"    # ex: main
 
 git fetch origin --tags
@@ -80,7 +80,7 @@ cargo run -p ff-cli -- --help > .phase12-release/ff_cli_help.txt
 ### 2.1 Required quality gates
 
 ```bash
-cd /Users/venkat/taylorProjects/forge-fleet
+cd /Users/venkat/projects/forge-fleet
 
 cargo fmt --all -- --check 2>&1 | tee .phase12-release/cargo_fmt_check.log
 cargo clippy --workspace -- -D warnings 2>&1 | tee .phase12-release/cargo_clippy.log
@@ -102,7 +102,7 @@ cargo test --workspace --lib 2>&1 | tee .phase12-release/cargo_test_workspace_li
 ### 2.2 Release build + artifact fingerprint
 
 ```bash
-cd /Users/venkat/taylorProjects/forge-fleet
+cd /Users/venkat/projects/forge-fleet
 
 cargo build --workspace --release 2>&1 | tee .phase12-release/cargo_build_release.log
 
@@ -128,7 +128,7 @@ cargo run -p ff-cli -- version 2>&1 | tee .phase12-release/ff_cli_version.log
 ### 3.1 Set release variables (fill placeholders)
 
 ```bash
-cd /Users/venkat/taylorProjects/forge-fleet
+cd /Users/venkat/projects/forge-fleet
 
 export RELEASE_BRANCH="<release-branch>"      # ex: main
 export RC_TAG="<vX.Y.Z-rc.N>"                 # ex: v0.1.0-rc.1
@@ -198,7 +198,7 @@ git ls-remote --tags origin "$RC_TAG"
 ### 4.1 Verify rollback target identity
 
 ```bash
-cd /Users/venkat/taylorProjects/forge-fleet
+cd /Users/venkat/projects/forge-fleet
 
 export ROLLBACK_TAG="<previous_known_good_tag>"   # ex: v0.1.0-rc.0
 

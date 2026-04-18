@@ -2,7 +2,7 @@
 
 Date: `<YYYY-MM-DD>`  
 Release tag: `<vX.Y.Z-rc.N>`  
-Repo: `/Users/venkat/taylorProjects/forge-fleet`
+Repo: `/Users/venkat/projects/forge-fleet`
 
 > Purpose: minute-marked execution checklist for release day.  
 > Scope: pre-release prep (T-60 to T-10), release window (T-10 to T+15), immediate post-release validation (T+15 to T+120).  
