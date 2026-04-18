@@ -56,21 +56,33 @@ pub async fn bootstrap_script(
     headers: HeaderMap,
     Query(q): Query<BootstrapQuery>,
 ) -> axum::response::Response {
-    // Resolve enrollment token — the one embedded in the script must match
-    // what self-enroll validates. If the token QS is absent we reuse the
-    // server's shared secret (operator probably hit the URL directly).
-    let expected_token: String = match state.fleet_config.as_ref() {
-        Some(cfg_lock) => cfg_lock
-            .read()
-            .await
-            .enrollment
-            .resolve_shared_secret()
-            .unwrap_or_default(),
-        None => String::new(),
+    // Resolve enrollment policy — if require_shared_secret=false, open mode.
+    let policy = match state.fleet_config.as_ref() {
+        Some(cfg_lock) => cfg_lock.read().await.enrollment.enforcement_policy(),
+        None => ff_core::config::EnrollmentEnforcement::MisconfiguredRequired,
+    };
+    let expected_token = match &policy {
+        ff_core::config::EnrollmentEnforcement::Disabled => {
+            tracing::warn!(
+                endpoint = "/onboard/bootstrap.sh",
+                "enrollment token check DISABLED (require_shared_secret=false) — serving script without auth"
+            );
+            String::new()
+        }
+        ff_core::config::EnrollmentEnforcement::Required(tok) => tok.clone(),
+        ff_core::config::EnrollmentEnforcement::MisconfiguredRequired => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "# enrollment shared secret not configured\n",
+            )
+                .into_response();
+        }
     };
 
-    let token = q.token.unwrap_or_else(|| expected_token.clone());
-    if token.is_empty() || token != expected_token {
+    let token = q.token.clone().unwrap_or_else(|| expected_token.clone());
+    if matches!(policy, ff_core::config::EnrollmentEnforcement::Required(_))
+        && (token.is_empty() || token != expected_token)
+    {
         return (
             StatusCode::UNAUTHORIZED,
             "enrollment token missing or invalid\n",
@@ -166,17 +178,31 @@ pub async fn bootstrap_script_ps1(
     headers: HeaderMap,
     Query(q): Query<BootstrapQuery>,
 ) -> axum::response::Response {
-    let expected_token: String = match state.fleet_config.as_ref() {
-        Some(cfg_lock) => cfg_lock
-            .read()
-            .await
-            .enrollment
-            .resolve_shared_secret()
-            .unwrap_or_default(),
-        None => String::new(),
+    let policy = match state.fleet_config.as_ref() {
+        Some(cfg_lock) => cfg_lock.read().await.enrollment.enforcement_policy(),
+        None => ff_core::config::EnrollmentEnforcement::MisconfiguredRequired,
     };
-    let token = q.token.unwrap_or_else(|| expected_token.clone());
-    if token.is_empty() || token != expected_token {
+    let expected_token = match &policy {
+        ff_core::config::EnrollmentEnforcement::Disabled => {
+            tracing::warn!(
+                endpoint = "/onboard/bootstrap.ps1",
+                "enrollment token check DISABLED (require_shared_secret=false) — serving script without auth"
+            );
+            String::new()
+        }
+        ff_core::config::EnrollmentEnforcement::Required(tok) => tok.clone(),
+        ff_core::config::EnrollmentEnforcement::MisconfiguredRequired => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "# enrollment shared secret not configured\n",
+            )
+                .into_response();
+        }
+    };
+    let token = q.token.clone().unwrap_or_else(|| expected_token.clone());
+    if matches!(policy, ff_core::config::EnrollmentEnforcement::Required(_))
+        && (token.is_empty() || token != expected_token)
+    {
         return (
             StatusCode::UNAUTHORIZED,
             "# enrollment token missing or invalid\n",
@@ -304,8 +330,8 @@ pub async fn self_enroll(
             )
         })?;
 
-    // Validate token against fleet config.
-    let expected_token = state
+    // Consult enrollment policy (require_shared_secret flag + resolved secret).
+    let policy = state
         .fleet_config
         .as_ref()
         .ok_or_else(|| {
@@ -317,19 +343,30 @@ pub async fn self_enroll(
         .read()
         .await
         .enrollment
-        .resolve_shared_secret()
-        .ok_or_else(|| {
-            (
+        .enforcement_policy();
+
+    match &policy {
+        ff_core::config::EnrollmentEnforcement::Disabled => {
+            tracing::warn!(
+                endpoint = "/api/fleet/self-enroll",
+                node = %payload.name,
+                "enrollment token check DISABLED (require_shared_secret=false) — accepting request without auth"
+            );
+        }
+        ff_core::config::EnrollmentEnforcement::MisconfiguredRequired => {
+            return Err((
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({"error":"enrollment secret not configured"})),
-            )
-        })?;
-
-    if payload.token != expected_token {
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error":"invalid enrollment token"})),
-        ));
+            ));
+        }
+        ff_core::config::EnrollmentEnforcement::Required(expected) => {
+            if &payload.token != expected {
+                return Err((
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({"error":"invalid enrollment token"})),
+                ));
+            }
+        }
     }
 
     let name = payload.name.trim().to_lowercase();
@@ -620,7 +657,9 @@ pub async fn secret_peek(
     State(state): State<Arc<GatewayState>>,
     Query(q): Query<SecretPeekQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    // Validate enrollment token (same check as self-enroll).
+    // Secret peek always requires a valid token — even when
+    // require_shared_secret=false. Exposing secrets without auth would be a
+    // fleet-wide leak, so this endpoint stays locked regardless of the flag.
     let expected = match state.fleet_config.as_ref() {
         Some(cfg_lock) => cfg_lock
             .read()

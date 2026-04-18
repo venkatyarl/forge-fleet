@@ -923,7 +923,7 @@ pub struct McpConfig {
 // ── Enrollment ───────────────────────────────────────────────────────────────
 
 /// Enrollment/bootstrap configuration — `[enrollment]`.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnrollmentConfig {
     /// Engine used for bootstrapping (e.g. "forgefleet").
     #[serde(default)]
@@ -937,9 +937,16 @@ pub struct EnrollmentConfig {
     /// Whether to auto-enroll after healthcheck passes.
     #[serde(default)]
     pub auto_enroll_after_healthcheck: Option<bool>,
-    /// Shared secret/token required by `/api/fleet/enroll`.
+    /// Whether enrollment endpoints must validate a shared-secret token.
     ///
-    /// If omitted, the runtime resolves from `shared_secret_env`.
+    /// `true`  (default) — fail-closed; enrollment requires a matching token.
+    /// `false` — open mode; any request can enroll. Intended for trusted LANs
+    ///           only. The gateway logs a WARN on every request when disabled.
+    #[serde(default = "default_require_shared_secret")]
+    pub require_shared_secret: bool,
+    /// Shared secret/token required by `/api/fleet/enroll` when
+    /// `require_shared_secret = true`. If omitted, the runtime resolves from
+    /// `shared_secret_env`.
     #[serde(default)]
     pub shared_secret: Option<String>,
     /// Environment variable name used to resolve the enrollment secret.
@@ -957,6 +964,35 @@ pub struct EnrollmentConfig {
     /// Falls back to `fleet.heartbeat_interval_secs` when omitted.
     #[serde(default)]
     pub heartbeat_interval_secs: Option<u64>,
+}
+
+impl Default for EnrollmentConfig {
+    fn default() -> Self {
+        Self {
+            bootstrap_engine: None,
+            bootstrap_interface: None,
+            require_ssh_before_bootstrap: None,
+            auto_enroll_after_healthcheck: None,
+            require_shared_secret: default_require_shared_secret(),
+            shared_secret: None,
+            shared_secret_env: default_enrollment_secret_env(),
+            default_role: None,
+            allowed_roles: Vec::new(),
+            heartbeat_interval_secs: None,
+        }
+    }
+}
+
+/// Outcome of consulting enrollment policy at a request site.
+#[derive(Debug, Clone)]
+pub enum EnrollmentEnforcement {
+    /// `require_shared_secret=false`. Accept request without a token check.
+    /// Callers MUST log a warning so open mode is never silent.
+    Disabled,
+    /// Token check enabled; compare presented token against this value.
+    Required(String),
+    /// Token check enabled but no secret is configured anywhere. Reject 503.
+    MisconfiguredRequired,
 }
 
 impl EnrollmentConfig {
@@ -978,10 +1014,25 @@ impl EnrollmentConfig {
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
     }
+
+    /// Decide what enforcement every enrollment endpoint should apply.
+    pub fn enforcement_policy(&self) -> EnrollmentEnforcement {
+        if !self.require_shared_secret {
+            return EnrollmentEnforcement::Disabled;
+        }
+        match self.resolve_shared_secret() {
+            Some(tok) => EnrollmentEnforcement::Required(tok),
+            None => EnrollmentEnforcement::MisconfiguredRequired,
+        }
+    }
 }
 
 fn default_enrollment_secret_env() -> String {
     "FORGEFLEET_ENROLLMENT_TOKEN".to_string()
+}
+
+fn default_require_shared_secret() -> bool {
+    true
 }
 
 // ── Database ─────────────────────────────────────────────────────────────────

@@ -1048,14 +1048,15 @@ async fn fleet_enroll(
     let config = config_lock.read().await.clone();
     let enrollment = config.enrollment.clone();
 
-    let Some(expected_token) = enrollment.resolve_shared_secret() else {
+    let policy = enrollment.enforcement_policy();
+    if matches!(&policy, ff_core::config::EnrollmentEnforcement::MisconfiguredRequired) {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             Json(
                 json!({"error": {"message": "enrollment shared secret is not configured", "type": "enrollment_not_configured"}}),
             ),
         ));
-    };
+    }
 
     let node_id = payload.node_id.trim().to_string();
     if node_id.is_empty() {
@@ -1133,27 +1134,39 @@ async fn fleet_enroll(
         .clone()
         .or_else(|| extract_enrollment_token_from_headers(&headers));
 
-    if presented_token.as_deref() != Some(expected_token.as_str()) {
-        let capabilities = normalize_object(payload.capabilities.clone());
-        let event = queries::FleetEnrollmentEventInsert {
-            node_id: Some(node_id.clone()),
-            hostname: Some(hostname.clone()),
-            outcome: "rejected".to_string(),
-            reason: Some("invalid enrollment token".to_string()),
-            role: Some(requested_role.clone()),
-            service_version: payload.service_version.clone(),
-            addresses_json: serde_json::to_string(&ips).unwrap_or_else(|_| "[]".to_string()),
-            capabilities_json: serde_json::to_string(&capabilities)
-                .unwrap_or_else(|_| "{}".to_string()),
-            metadata_json: serde_json::to_string(&normalize_object(payload.metadata.clone()))
-                .unwrap_or_else(|_| "{}".to_string()),
-        };
-        let _ = runtime_registry.insert_enrollment_event(&event).await;
+    match &policy {
+        ff_core::config::EnrollmentEnforcement::Disabled => {
+            tracing::warn!(
+                endpoint = "/api/fleet/enroll",
+                node = %node_id,
+                "enrollment token check DISABLED (require_shared_secret=false) — accepting request without auth"
+            );
+        }
+        ff_core::config::EnrollmentEnforcement::Required(expected) => {
+            if presented_token.as_deref() != Some(expected.as_str()) {
+                let capabilities = normalize_object(payload.capabilities.clone());
+                let event = queries::FleetEnrollmentEventInsert {
+                    node_id: Some(node_id.clone()),
+                    hostname: Some(hostname.clone()),
+                    outcome: "rejected".to_string(),
+                    reason: Some("invalid enrollment token".to_string()),
+                    role: Some(requested_role.clone()),
+                    service_version: payload.service_version.clone(),
+                    addresses_json: serde_json::to_string(&ips).unwrap_or_else(|_| "[]".to_string()),
+                    capabilities_json: serde_json::to_string(&capabilities)
+                        .unwrap_or_else(|_| "{}".to_string()),
+                    metadata_json: serde_json::to_string(&normalize_object(payload.metadata.clone()))
+                        .unwrap_or_else(|_| "{}".to_string()),
+                };
+                let _ = runtime_registry.insert_enrollment_event(&event).await;
 
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error": {"message": "invalid enrollment token", "type": "unauthorized"}})),
-        ));
+                return Err((
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({"error": {"message": "invalid enrollment token", "type": "unauthorized"}})),
+                ));
+            }
+        }
+        ff_core::config::EnrollmentEnforcement::MisconfiguredRequired => unreachable!("handled above"),
     }
 
     let reported_status = "online".to_string();
