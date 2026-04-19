@@ -20,6 +20,7 @@ pub mod features;
 pub mod fleet_events;
 pub mod fleet_info;
 pub mod focus_stack;
+pub mod ha;
 pub mod inference_router;
 pub mod file_history;
 pub mod fleet_inference;
@@ -46,9 +47,12 @@ pub mod orchestrator_agent;
 pub mod permissions;
 pub mod plugins;
 pub mod rpc_inference;
+pub mod project_github_sync;
+pub mod project_registry;
 pub mod scoped_memory;
 pub mod session_store;
 pub mod software_registry;
+pub mod software_upstream;
 pub mod streaming;
 pub mod sub_agents;
 pub mod system_prompt;
@@ -59,6 +63,7 @@ pub mod training;
 
 pub use software_registry::{seed_from_toml, SeedReport};
 pub use model_catalog_seed::{seed_from_toml as seed_model_catalog_from_toml, ModelSeedReport};
+pub use project_registry::{seed_from_toml as seed_projects_from_toml, ProjectSeedReport};
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

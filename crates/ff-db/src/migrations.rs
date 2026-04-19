@@ -212,6 +212,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "computers_and_portfolio",
         sql: schema::SCHEMA_V14_COMPUTERS_AND_PORTFOLIO,
     },
+    PgMigration {
+        version: 15,
+        name: "project_management",
+        sql: schema::SCHEMA_V15_PROJECT_MANAGEMENT,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.

@@ -1,0 +1,45 @@
+# ForgeFleet Postgres follower template.
+# Run on Marcus (and any other computer designated as follower).
+# Requires env var POSTGRES_PRIMARY_HOST to point at current primary (e.g. 192.168.5.100).
+#
+# Usage on a follower node:
+#   cd deploy/
+#   POSTGRES_PRIMARY_HOST=192.168.5.100 \
+#     POSTGRES_REPLICATION_PASSWORD=<same as primary> \
+#     docker compose -f docker-compose.follower.yml up -d
+#
+# On first start, the volume is empty so replica-bootstrap.sh runs
+# pg_basebackup -R, which writes standby.signal + primary_conninfo.
+# Subsequent starts just resume WAL streaming.
+
+name: forgefleet-follower
+
+services:
+  postgres-replica:
+    image: postgres:16-alpine
+    container_name: forgefleet-postgres-replica
+    ports:
+      - "55432:5432"
+    environment:
+      POSTGRES_USER: forgefleet
+      POSTGRES_PASSWORD: forgefleet
+      POSTGRES_DB: forgefleet
+      POSTGRES_PRIMARY_HOST: ${POSTGRES_PRIMARY_HOST:-192.168.5.100}
+      POSTGRES_PRIMARY_PORT: ${POSTGRES_PRIMARY_PORT:-55432}
+      POSTGRES_REPLICATION_USER: replicator
+      POSTGRES_REPLICATION_PASSWORD: ${POSTGRES_REPLICATION_PASSWORD:-replicator-default}
+    volumes:
+      - postgres_replica_data:/var/lib/postgresql/data
+      - ./docker/replica-bootstrap.sh:/docker-entrypoint-initdb.d/00-replica-bootstrap.sh:ro
+    restart: unless-stopped
+    networks:
+      - forgefleet-follower
+
+volumes:
+  postgres_replica_data:
+    name: forgefleet-postgres-replica-data
+
+networks:
+  forgefleet-follower:
+    name: forgefleet-follower
+    driver: bridge

@@ -45,6 +45,24 @@ services:
       - "max_connections=100"
       - "-c"
       - "log_min_duration_statement=1000"
+      # ─── Streaming-replication knobs (Phase 6 HA) ─────────────────────
+      # wal_level=replica is the minimum required by pg_basebackup + a
+      # streaming standby. max_wal_senders/max_replication_slots cap the
+      # number of concurrent replicas + physical slots. hot_standby=on
+      # allows the standby to serve read-only queries while catching up.
+      # synchronous_commit=off trades a small durability window for
+      # throughput — replicas still catch up via WAL streaming and
+      # periodic pg_basebackup snapshots cover the worst-case loss.
+      - "-c"
+      - "wal_level=replica"
+      - "-c"
+      - "max_wal_senders=4"
+      - "-c"
+      - "max_replication_slots=4"
+      - "-c"
+      - "hot_standby=on"
+      - "-c"
+      - "synchronous_commit=off"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U forgefleet -d forgefleet"]
       interval: 10s

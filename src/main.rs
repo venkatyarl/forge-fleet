@@ -1636,6 +1636,11 @@ async fn start_pulse_v2_subsystems(
     let enrolled_in_fleet = priority_row.is_some();
     let election_priority = priority_row.map(|(p,)| p).unwrap_or(1000);
 
+    // Clone pg_pool + shutdown_rx for the backup orchestrator *before*
+    // the LeaderTick branch below consumes its copy (Phase 6 HA).
+    let pg_pool_for_backup = pg_pool.clone();
+    let shutdown_rx_for_backup = shutdown_rx.clone();
+
     // Build the redis::Client once — both publisher and materializer need one.
     let redis_client = redis::Client::open(redis_url.as_str())
         .context("pulse v2: failed to open redis client")?;
@@ -1743,6 +1748,26 @@ async fn start_pulse_v2_subsystems(
             "pulse v2: no fleet_members row — leader_tick NOT started (materializer + heartbeat_v2 still running)"
         );
     }
+
+    // (5) Backup orchestrator (Phase 6 HA).
+    //
+    // Runs on EVERY daemon that has a computers row — the orchestrator
+    // internally short-circuits when we're not the current leader, so
+    // startup is cheap on followers. This avoids having to re-wire the
+    // backup task into leader_tick's on_became_leader / on_lost_leader
+    // callbacks.
+    info!(
+        node = %node_name,
+        computer_id = %computer_id,
+        "starting subsystem: backup orchestrator (pg=4h, redis=2h)"
+    );
+    let backup = ff_agent::ha::backup::BackupOrchestrator::new(
+        pg_pool_for_backup,
+        computer_id,
+        node_name.clone(),
+        None,
+    );
+    handles.push(backup.spawn(shutdown_rx_for_backup));
 
     Ok(handles)
 }

@@ -1061,3 +1061,163 @@ CREATE TABLE IF NOT EXISTS backups (
 );
 CREATE INDEX IF NOT EXISTS idx_backups_by_kind_created ON backups(database_kind, created_at DESC);
 "#;
+
+/// Phase 9: Project Management — projects, milestones, work items, outputs,
+/// branches, environments, CI runs, and work-item relations.
+///
+/// Adds a first-class project registry that replaces the old "Mission Control"
+/// term. `projects.id` is a stable TEXT slug (matches
+/// `config/projects.toml`). Work items and their outputs reference the
+/// project slug. Every row is idempotent via the usual `IF NOT EXISTS` guards.
+pub const SCHEMA_V15_PROJECT_MANAGEMENT: &str = r#"
+-- ─── V15: Project Management (projects, work items, outputs, branches) ────
+-- See plan: we-are-mixing-two-streamed-sky.md §Phase 9.
+
+CREATE TABLE IF NOT EXISTS projects (
+    id                  TEXT PRIMARY KEY,
+    display_name        TEXT NOT NULL,
+    compose_file        TEXT,
+    repo_url            TEXT,
+    default_branch      TEXT NOT NULL DEFAULT 'main',
+    main_commit_sha     TEXT,
+    main_commit_message TEXT,
+    main_committed_at   TIMESTAMPTZ,
+    main_committed_by   TEXT,
+    main_last_synced_at TIMESTAMPTZ,
+    target_computers    JSONB NOT NULL DEFAULT '[]',
+    health_endpoint     TEXT,
+    status              TEXT NOT NULL DEFAULT 'active',
+    metadata            JSONB NOT NULL DEFAULT '{}'
+);
+
+CREATE TABLE IF NOT EXISTS milestones (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id  TEXT NOT NULL REFERENCES projects(id),
+    name        TEXT NOT NULL,
+    description TEXT,
+    due_date    DATE,
+    status      TEXT NOT NULL DEFAULT 'active'
+);
+
+CREATE TABLE IF NOT EXISTS work_items (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id          TEXT NOT NULL REFERENCES projects(id),
+    milestone_id        UUID REFERENCES milestones(id),
+    parent_id           UUID REFERENCES work_items(id),
+    kind                TEXT NOT NULL,
+    title               TEXT NOT NULL,
+    description         TEXT,
+    labels              JSONB NOT NULL DEFAULT '[]',
+    status              TEXT NOT NULL DEFAULT 'idea',
+    priority            TEXT NOT NULL DEFAULT 'normal',
+    assigned_to         TEXT,
+    assigned_computer   TEXT,
+    branch_name         TEXT,
+    pr_url              TEXT,
+    brain_node_ids      JSONB NOT NULL DEFAULT '[]',
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by          TEXT NOT NULL,
+    started_at          TIMESTAMPTZ,
+    completed_at        TIMESTAMPTZ,
+    due_date            DATE,
+    estimated_hours     FLOAT,
+    metadata            JSONB NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_work_items_project_status
+    ON work_items(project_id, status);
+CREATE INDEX IF NOT EXISTS idx_work_items_assigned
+    ON work_items(assigned_to, status);
+
+CREATE TABLE IF NOT EXISTS work_outputs (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    work_item_id        UUID NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+    kind                TEXT NOT NULL,
+    title               TEXT,
+    file_path           TEXT,
+    file_size_bytes     BIGINT,
+    mime_type           TEXT,
+    commit_sha          TEXT,
+    repo_url            TEXT,
+    produced_by_human   TEXT,
+    produced_by_agent   TEXT,
+    produced_on_computer TEXT,
+    llm_model_id        TEXT REFERENCES model_catalog(id),
+    llm_model_version   TEXT,
+    llm_tokens_input    INT,
+    llm_tokens_output   INT,
+    llm_cost_estimate   FLOAT,
+    produced_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    review_required     BOOLEAN NOT NULL DEFAULT false,
+    review_status       TEXT,
+    reviewed_by         TEXT,
+    reviewed_at         TIMESTAMPTZ,
+    review_notes        TEXT,
+    metadata            JSONB NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_work_outputs_by_model
+    ON work_outputs(llm_model_id);
+CREATE INDEX IF NOT EXISTS idx_work_outputs_by_computer
+    ON work_outputs(produced_on_computer);
+
+CREATE TABLE IF NOT EXISTS project_branches (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id          TEXT NOT NULL REFERENCES projects(id),
+    branch_name         TEXT NOT NULL,
+    created_by          TEXT NOT NULL,
+    assigned_computer   TEXT,
+    assigned_agent      TEXT,
+    purpose             TEXT,
+    last_commit_sha     TEXT,
+    last_commit_message TEXT,
+    last_commit_at      TIMESTAMPTZ,
+    pr_number           INT,
+    pr_url              TEXT,
+    pr_state            TEXT,
+    status              TEXT NOT NULL DEFAULT 'active',
+    merged_at           TIMESTAMPTZ,
+    merged_sha          TEXT,
+    UNIQUE (project_id, branch_name)
+);
+
+CREATE TABLE IF NOT EXISTS project_environments (
+    id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id           TEXT NOT NULL REFERENCES projects(id),
+    name                 TEXT NOT NULL,
+    target_computers     JSONB NOT NULL DEFAULT '[]',
+    deployed_commit_sha  TEXT,
+    deployed_tag         TEXT,
+    deployed_at          TIMESTAMPTZ,
+    deployed_by          TEXT,
+    deploy_trigger       TEXT,
+    deploy_status        TEXT,
+    health_endpoint      TEXT,
+    last_health_check_at TIMESTAMPTZ,
+    health_status        TEXT,
+    url                  TEXT,
+    metadata             JSONB NOT NULL DEFAULT '{}',
+    UNIQUE (project_id, name)
+);
+
+CREATE TABLE IF NOT EXISTS project_ci_runs (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id      TEXT NOT NULL REFERENCES projects(id),
+    branch_name     TEXT NOT NULL,
+    commit_sha      TEXT NOT NULL,
+    workflow_name   TEXT,
+    run_id          TEXT,
+    run_url         TEXT,
+    status          TEXT NOT NULL,
+    started_at      TIMESTAMPTZ,
+    completed_at    TIMESTAMPTZ,
+    triggered_by    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_ci_runs_by_branch
+    ON project_ci_runs(project_id, branch_name, started_at DESC);
+
+CREATE TABLE IF NOT EXISTS work_item_relations (
+    from_id         UUID NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+    to_id           UUID NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+    relation_type   TEXT NOT NULL,
+    PRIMARY KEY (from_id, to_id, relation_type)
+);
+"#;

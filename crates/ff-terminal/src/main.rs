@@ -104,6 +104,10 @@ enum Command {
     VirtualBrain { #[command(subcommand)] command: BrainCommand },
     /// OpenClaw gateway/node visibility across the fleet.
     Openclaw { #[command(subcommand)] command: OpenclawCommand },
+    /// Project management — projects, work items, branches.
+    Pm { #[command(subcommand)] command: PmCommand },
+    /// Project metadata — repos, environments, CI.
+    Project { #[command(subcommand)] command: ProjectCommand },
     /// Run ForgeFleet's unified daemon: deferred-task scheduler+worker, disk
     /// sampler, and deployment reconciler all in one long-lived process.
     /// Typically run on boot via launchd/systemd.
@@ -294,6 +298,45 @@ enum OnboardCommand {
 }
 
 #[derive(Debug, Clone, Subcommand)]
+enum PmCommand {
+    /// List work items.
+    #[command(alias = "ls")]
+    List {
+        #[arg(long)] project: Option<String>,
+        #[arg(long)] status: Option<String>,
+        #[arg(long)] assignee: Option<String>,
+    },
+    /// Create a new work item.
+    Create {
+        #[arg(long)] project: String,
+        #[arg(long)] kind: String,
+        #[arg(long)] title: String,
+        #[arg(long)] description: Option<String>,
+        #[arg(long)] priority: Option<String>,
+    },
+    /// Show details of a work item (by UUID).
+    Show { id: String },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum ProjectCommand {
+    /// List known projects.
+    #[command(alias = "ls")]
+    List,
+    /// Show project status (main + environments + branches).
+    Status { id: String },
+    /// Force a GitHub sync right now.
+    Sync {
+        #[arg(long, default_value_t = false)] all: bool,
+    },
+    /// Seed projects from config/projects.toml into Postgres.
+    Seed {
+        /// Path to projects.toml (defaults to ./config/projects.toml).
+        #[arg(long)] from_toml: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
 enum ModelCommand {
     /// Sync the curated model catalog TOML into Postgres.
     SyncCatalog,
@@ -471,6 +514,8 @@ async fn main() -> Result<()> {
         Some(Command::Onboard { command }) => return handle_onboard(command.clone()).await,
         Some(Command::VirtualBrain { command }) => return handle_brain(command.clone()).await,
         Some(Command::Openclaw { command }) => return handle_openclaw(command.clone()).await,
+        Some(Command::Pm { command }) => return handle_pm(command.clone()).await,
+        Some(Command::Project { command }) => return handle_project(command.clone(), &config_path).await,
         _ => {}
     }
 
@@ -561,6 +606,8 @@ async fn main() -> Result<()> {
         Some(Command::Onboard { command }) => handle_onboard(command).await,
         Some(Command::VirtualBrain { command }) => handle_brain(command).await,
         Some(Command::Openclaw { command }) => handle_openclaw(command).await,
+        Some(Command::Pm { command }) => handle_pm(command).await,
+        Some(Command::Project { command }) => handle_project(command, &config_path).await,
         Some(Command::Supervise { prompt, max_attempts }) => {
             let sup_config = ff_agent::supervisor::SupervisorConfig {
                 max_attempts,
@@ -4200,6 +4247,446 @@ async fn handle_openclaw(cmd: OpenclawCommand) -> Result<()> {
     Ok(())
 }
 
+async fn handle_pm(cmd: PmCommand) -> Result<()> {
+    let pool = ff_agent::fleet_info::get_fleet_pool()
+        .await
+        .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
+    ff_db::run_postgres_migrations(&pool).await
+        .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
+
+    match cmd {
+        PmCommand::List { project, status, assignee } => {
+            let rows: Vec<(
+                uuid::Uuid,
+                String,
+                String,
+                String,
+                String,
+                String,
+                Option<String>,
+                chrono::DateTime<chrono::Utc>,
+            )> = sqlx::query_as(
+                "SELECT wi.id, wi.project_id, wi.kind, wi.title, wi.status, wi.priority, \
+                        wi.assigned_to, wi.created_at \
+                 FROM work_items wi \
+                 WHERE ($1::text IS NULL OR wi.project_id = $1) \
+                   AND ($2::text IS NULL OR wi.status = $2) \
+                   AND ($3::text IS NULL OR wi.assigned_to = $3) \
+                 ORDER BY wi.created_at DESC \
+                 LIMIT 200",
+            )
+            .bind(project.as_deref())
+            .bind(status.as_deref())
+            .bind(assignee.as_deref())
+            .fetch_all(&pool)
+            .await
+            .map_err(|e| anyhow::anyhow!("list work items: {e}"))?;
+
+            if rows.is_empty() {
+                println!("(no work items)");
+                return Ok(());
+            }
+
+            println!(
+                "{:<38} {:<14} {:<6} {:<10} {:<8} {:<14} {}",
+                "ID", "PROJECT", "KIND", "STATUS", "PRIORITY", "ASSIGNEE", "TITLE"
+            );
+            for (id, pid, kind, title, st, prio, asgn, _created) in rows {
+                let title_clip = if title.len() > 60 { format!("{}…", &title[..59]) } else { title };
+                println!(
+                    "{:<38} {:<14} {:<6} {:<10} {:<8} {:<14} {}",
+                    id.to_string(),
+                    pid,
+                    kind,
+                    st,
+                    prio,
+                    asgn.as_deref().unwrap_or("-"),
+                    title_clip,
+                );
+            }
+        }
+        PmCommand::Create { project, kind, title, description, priority } => {
+            // Validate project exists first so we give a clear error instead of an FK violation.
+            let exists: Option<(String,)> = sqlx::query_as("SELECT id FROM projects WHERE id = $1")
+                .bind(&project)
+                .fetch_optional(&pool)
+                .await
+                .map_err(|e| anyhow::anyhow!("query project: {e}"))?;
+            if exists.is_none() {
+                return Err(anyhow::anyhow!(
+                    "unknown project '{project}' — run `ff project seed` or check `ff project list`"
+                ));
+            }
+
+            let created_by = ff_agent::fleet_info::resolve_this_node_name().await;
+            let prio = priority.unwrap_or_else(|| "normal".to_string());
+            let row: (uuid::Uuid,) = sqlx::query_as(
+                "INSERT INTO work_items (project_id, kind, title, description, priority, created_by) \
+                 VALUES ($1, $2, $3, $4, $5, $6) \
+                 RETURNING id",
+            )
+            .bind(&project)
+            .bind(&kind)
+            .bind(&title)
+            .bind(description.as_deref())
+            .bind(&prio)
+            .bind(&created_by)
+            .fetch_one(&pool)
+            .await
+            .map_err(|e| anyhow::anyhow!("insert work item: {e}"))?;
+
+            println!("{GREEN}✓ Created work item{RESET}");
+            println!("  id:       {}", row.0);
+            println!("  project:  {project}");
+            println!("  kind:     {kind}");
+            println!("  title:    {title}");
+            println!("  priority: {prio}");
+            println!("  created_by: {created_by}");
+        }
+        PmCommand::Show { id } => {
+            let uid = uuid::Uuid::parse_str(&id)
+                .map_err(|e| anyhow::anyhow!("invalid UUID '{id}': {e}"))?;
+            let row: Option<(
+                uuid::Uuid,
+                String,
+                String,
+                String,
+                Option<String>,
+                String,
+                String,
+                Option<String>,
+                Option<String>,
+                String,
+                chrono::DateTime<chrono::Utc>,
+            )> = sqlx::query_as(
+                "SELECT id, project_id, kind, title, description, status, priority, \
+                        assigned_to, assigned_computer, created_by, created_at \
+                 FROM work_items WHERE id = $1",
+            )
+            .bind(uid)
+            .fetch_optional(&pool)
+            .await
+            .map_err(|e| anyhow::anyhow!("query work item: {e}"))?;
+
+            let Some((id, pid, kind, title, desc, status, prio, asgn, computer, created_by, created_at)) = row
+            else {
+                return Err(anyhow::anyhow!("work item {uid} not found"));
+            };
+
+            println!("{CYAN}Work item{RESET} {id}");
+            println!("  project:      {pid}");
+            println!("  kind:         {kind}");
+            println!("  title:        {title}");
+            if let Some(d) = desc.as_deref() {
+                println!("  description:  {d}");
+            }
+            println!("  status:       {status}");
+            println!("  priority:     {prio}");
+            println!("  assigned_to:  {}", asgn.as_deref().unwrap_or("-"));
+            println!("  computer:     {}", computer.as_deref().unwrap_or("-"));
+            println!("  created_by:   {created_by}");
+            println!("  created_at:   {}", created_at.format("%Y-%m-%d %H:%M UTC"));
+
+            let outputs: Vec<(uuid::Uuid, String, Option<String>, Option<String>, chrono::DateTime<chrono::Utc>)> =
+                sqlx::query_as(
+                    "SELECT id, kind, title, file_path, produced_at \
+                     FROM work_outputs WHERE work_item_id = $1 \
+                     ORDER BY produced_at DESC",
+                )
+                .bind(uid)
+                .fetch_all(&pool)
+                .await
+                .map_err(|e| anyhow::anyhow!("query work outputs: {e}"))?;
+
+            if !outputs.is_empty() {
+                println!();
+                println!("{CYAN}Outputs ({}){RESET}", outputs.len());
+                for (oid, okind, otitle, opath, oat) in outputs {
+                    println!(
+                        "  {} [{okind}] {} {} — {}",
+                        oid,
+                        otitle.as_deref().unwrap_or("-"),
+                        opath.as_deref().unwrap_or("-"),
+                        oat.format("%Y-%m-%d %H:%M UTC"),
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn handle_project(cmd: ProjectCommand, config_path: &Path) -> Result<()> {
+    let pool = ff_agent::fleet_info::get_fleet_pool()
+        .await
+        .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
+    ff_db::run_postgres_migrations(&pool).await
+        .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
+
+    match cmd {
+        ProjectCommand::List => {
+            let rows: Vec<(
+                String,
+                String,
+                Option<String>,
+                String,
+                Option<String>,
+                Option<chrono::DateTime<chrono::Utc>>,
+                String,
+            )> = sqlx::query_as(
+                "SELECT id, display_name, repo_url, default_branch, main_commit_sha, \
+                        main_last_synced_at, status \
+                 FROM projects ORDER BY id",
+            )
+            .fetch_all(&pool)
+            .await
+            .map_err(|e| anyhow::anyhow!("list projects: {e}"))?;
+
+            if rows.is_empty() {
+                println!(
+                    "(no projects — run `ff project seed` to load config/projects.toml)"
+                );
+                return Ok(());
+            }
+
+            println!(
+                "{:<14} {:<14} {:<8} {:<10} {:<18} {}",
+                "ID", "NAME", "BRANCH", "SHA", "SYNCED", "REPO"
+            );
+            let now = chrono::Utc::now();
+            for (id, name, repo, branch, sha, synced, _status) in rows {
+                let sha_s = sha.as_deref().map(|s| &s[..s.len().min(8)]).unwrap_or("-");
+                let synced_s = match synced {
+                    Some(t) => {
+                        let age = now.signed_duration_since(t);
+                        if age.num_days() > 0 {
+                            format!("{}d ago", age.num_days())
+                        } else if age.num_hours() > 0 {
+                            format!("{}h ago", age.num_hours())
+                        } else if age.num_minutes() > 0 {
+                            format!("{}m ago", age.num_minutes())
+                        } else {
+                            "just now".to_string()
+                        }
+                    }
+                    None => "never".to_string(),
+                };
+                println!(
+                    "{:<14} {:<14} {:<8} {:<10} {:<18} {}",
+                    id,
+                    name,
+                    branch,
+                    sha_s,
+                    synced_s,
+                    repo.as_deref().unwrap_or("-"),
+                );
+            }
+        }
+        ProjectCommand::Status { id } => {
+            let project: Option<(
+                String,
+                String,
+                Option<String>,
+                String,
+                Option<String>,
+                Option<String>,
+                Option<chrono::DateTime<chrono::Utc>>,
+                Option<String>,
+            )> = sqlx::query_as(
+                "SELECT id, display_name, repo_url, default_branch, \
+                        main_commit_sha, main_commit_message, main_committed_at, main_committed_by \
+                 FROM projects WHERE id = $1",
+            )
+            .bind(&id)
+            .fetch_optional(&pool)
+            .await
+            .map_err(|e| anyhow::anyhow!("query project: {e}"))?;
+
+            let Some((id, name, repo, branch, sha, msg, committed_at, committed_by)) = project else {
+                return Err(anyhow::anyhow!("project '{id}' not found"));
+            };
+
+            println!("{CYAN}Project{RESET} {id} — {name}");
+            println!("  repo:          {}", repo.as_deref().unwrap_or("-"));
+            println!("  default branch: {branch}");
+            println!(
+                "  main:          {} — {}",
+                sha.as_deref().unwrap_or("-"),
+                msg.as_deref().unwrap_or("-")
+            );
+            if let Some(at) = committed_at {
+                println!(
+                    "  committed:     {} by {}",
+                    at.format("%Y-%m-%d %H:%M UTC"),
+                    committed_by.as_deref().unwrap_or("-")
+                );
+            }
+
+            let branches: Vec<(
+                String,
+                Option<String>,
+                Option<i32>,
+                Option<String>,
+                Option<String>,
+                String,
+            )> = sqlx::query_as(
+                "SELECT branch_name, last_commit_sha, pr_number, pr_state, pr_url, status \
+                 FROM project_branches WHERE project_id = $1 \
+                 ORDER BY branch_name",
+            )
+            .bind(&id)
+            .fetch_all(&pool)
+            .await
+            .map_err(|e| anyhow::anyhow!("query branches: {e}"))?;
+
+            if !branches.is_empty() {
+                println!();
+                println!("{CYAN}Branches ({}){RESET}", branches.len());
+                println!(
+                    "  {:<30} {:<10} {:<6} {:<8} {}",
+                    "BRANCH", "SHA", "PR#", "PR STATE", "PR URL"
+                );
+                for (br, sha, num, st, url, _status) in branches {
+                    let sha_s = sha.as_deref().map(|s| &s[..s.len().min(8)]).unwrap_or("-");
+                    let num_s = num.map(|n| n.to_string()).unwrap_or_else(|| "-".into());
+                    println!(
+                        "  {:<30} {:<10} {:<6} {:<8} {}",
+                        br,
+                        sha_s,
+                        num_s,
+                        st.as_deref().unwrap_or("-"),
+                        url.as_deref().unwrap_or("-"),
+                    );
+                }
+            }
+
+            let envs: Vec<(String, Option<String>, Option<String>, Option<chrono::DateTime<chrono::Utc>>)> =
+                sqlx::query_as(
+                    "SELECT name, deployed_commit_sha, health_status, deployed_at \
+                     FROM project_environments WHERE project_id = $1 \
+                     ORDER BY name",
+                )
+                .bind(&id)
+                .fetch_all(&pool)
+                .await
+                .map_err(|e| anyhow::anyhow!("query environments: {e}"))?;
+
+            if !envs.is_empty() {
+                println!();
+                println!("{CYAN}Environments ({}){RESET}", envs.len());
+                for (name, sha, health, deployed_at) in envs {
+                    let sha_s = sha.as_deref().map(|s| &s[..s.len().min(8)]).unwrap_or("-");
+                    let deployed_s = deployed_at
+                        .map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string())
+                        .unwrap_or_else(|| "-".into());
+                    println!(
+                        "  {:<14} sha={sha_s:<10} health={} deployed={deployed_s}",
+                        name,
+                        health.as_deref().unwrap_or("-"),
+                    );
+                }
+            }
+
+            let ci: Vec<(String, String, String, Option<chrono::DateTime<chrono::Utc>>, Option<String>)> =
+                sqlx::query_as(
+                    "SELECT branch_name, commit_sha, status, started_at, run_url \
+                     FROM project_ci_runs WHERE project_id = $1 \
+                     ORDER BY started_at DESC NULLS LAST LIMIT 5",
+                )
+                .bind(&id)
+                .fetch_all(&pool)
+                .await
+                .map_err(|e| anyhow::anyhow!("query ci runs: {e}"))?;
+
+            if !ci.is_empty() {
+                println!();
+                println!("{CYAN}Recent CI runs{RESET}");
+                for (br, sha, st, at, url) in ci {
+                    let sha_s = &sha[..sha.len().min(8)];
+                    let at_s = at
+                        .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
+                        .unwrap_or_else(|| "-".into());
+                    println!(
+                        "  {:<30} {sha_s:<10} {st:<10} {at_s:<18} {}",
+                        br,
+                        url.as_deref().unwrap_or("-"),
+                    );
+                }
+            }
+        }
+        ProjectCommand::Sync { all: _ } => {
+            // Today `--all` is the only behavior; we leave the flag in the schema so a
+            // future single-project sync can coexist without breaking callers.
+            println!("{CYAN}▶ Syncing projects from GitHub...{RESET}");
+            let sync = ff_agent::project_github_sync::GitHubSync::new(pool.clone());
+            let report = sync.sync_all_projects().await
+                .map_err(|e| anyhow::anyhow!("github sync: {e}"))?;
+            println!("  total:              {}", report.total);
+            println!("  main updated:       {}", report.updated_main);
+            println!("  branches upserted:  {}", report.branches_upserted);
+            println!("  PRs attached:       {}", report.prs_attached);
+            println!("  skipped (no repo):  {}", report.skipped_no_repo);
+            println!("  skipped (bad url):  {}", report.skipped_bad_url);
+            if !report.missing_repos.is_empty() {
+                println!(
+                    "  {}missing on GitHub:{} {}",
+                    YELLOW,
+                    RESET,
+                    report.missing_repos.join(", ")
+                );
+            }
+            if !report.errors.is_empty() {
+                println!("{RED}  errors:{RESET}");
+                for (pid, msg) in &report.errors {
+                    println!("    [{pid}] {msg}");
+                }
+            } else {
+                println!("{GREEN}✓ Done{RESET}");
+            }
+        }
+        ProjectCommand::Seed { from_toml } => {
+            let toml_path = match from_toml {
+                Some(p) => p,
+                None => resolve_projects_toml_path(config_path),
+            };
+            println!("{CYAN}▶ Seeding projects from {}{RESET}", toml_path.display());
+            let report = ff_agent::seed_projects_from_toml(&pool, &toml_path)
+                .await
+                .map_err(|e| anyhow::anyhow!("seed projects: {e}"))?;
+            println!("  inserted:  {}", report.inserted);
+            println!("  updated:   {}", report.updated);
+            println!("  unchanged: {}", report.unchanged);
+            println!("  total:     {}", report.total);
+            println!("{GREEN}✓ Done{RESET}");
+        }
+    }
+    Ok(())
+}
+
+/// Resolve the projects.toml path: prefer a `projects.toml` sibling to the
+/// fleet config, fall back to `./config/projects.toml` relative to cwd.
+fn resolve_projects_toml_path(config_path: &Path) -> PathBuf {
+    if let Some(parent) = config_path.parent() {
+        let candidate = parent.join("projects.toml");
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+    // Walk up from cwd looking for config/projects.toml (supports running from
+    // subdirectories inside the repo).
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let mut probe = Some(cwd.as_path());
+    while let Some(dir) = probe {
+        let candidate = dir.join("config").join("projects.toml");
+        if candidate.exists() {
+            return candidate;
+        }
+        probe = dir.parent();
+    }
+    // Default: ./config/projects.toml (even if it doesn't exist — error comes from seeder).
+    PathBuf::from("config/projects.toml")
+}
+
 async fn handle_onboard(cmd: OnboardCommand) -> Result<()> {
     let pool = ff_agent::fleet_info::get_fleet_pool()
         .await
@@ -4555,13 +5042,16 @@ async fn handle_daemon(
     let mut version_tick = tokio::time::interval(Duration::from_secs(6 * 3600));
     // Brain vault re-index: every 30 minutes (pick up Obsidian edits).
     let mut brain_tick = tokio::time::interval(Duration::from_secs(30 * 60));
-    // First tick fires immediately for each — prime all six.
+    // Project GitHub sync: every 5 minutes (leader-only to avoid rate-limit waste).
+    let mut gh_sync_tick = tokio::time::interval(Duration::from_secs(5 * 60));
+    // First tick fires immediately for each — prime all seven.
     defer_tick.tick().await;
     disk_tick.tick().await;
     recon_tick.tick().await;
     sweep_tick.tick().await;
     version_tick.tick().await;
     brain_tick.tick().await;
+    gh_sync_tick.tick().await;
 
     // Do an initial pass immediately on startup.
     let _ = defer_pass(&pool, &worker_name, scheduler, &slots).await;
@@ -4705,6 +5195,16 @@ async fn handle_daemon(
                         Ok(_) => {}
                         Err(e) => eprintln!("{RED}[brain] vault index error: {e}{RESET}"),
                     }
+                }
+            }
+            _ = gh_sync_tick.tick(), if scheduler => {
+                let sync = ff_agent::project_github_sync::GitHubSync::new(pool.clone());
+                match sync.sync_all_projects().await {
+                    Ok(r) if r.updated_main > 0 || !r.errors.is_empty() => println!(
+                        "{CYAN}[projects]{RESET} gh sync: {} main updated, {} branches, {} PRs, {} errors",
+                        r.updated_main, r.branches_upserted, r.prs_attached, r.errors.len()),
+                    Ok(_) => {}
+                    Err(e) => eprintln!("{RED}[projects] gh sync error: {e}{RESET}"),
                 }
             }
         }
