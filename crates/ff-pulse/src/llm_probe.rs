@@ -21,9 +21,18 @@ use crate::beat_v2::{
 /// Ports on which ForgeFleet conventionally runs LLM inference servers,
 /// plus the well-known Ollama port.
 const LLM_SCAN_PORTS: &[u16] = &[
-    51001, 51002, 51003, 51004, 51005, 51006, 51007, 51008, 51009, 51010,
+    51001, 51003, 51004, 51005, 51006, 51007, 51008, 51009, 51010,
     55000, 55001, 55002, 55003, 55004, 55005, 55006, 55007, 55008, 55009, 55010,
     11434, // ollama
+];
+
+/// Ports that belong to ForgeFleet infrastructure, NOT LLM servers.
+/// Never classify these as inference endpoints even if they respond to probes.
+const EXCLUDED_PORTS: &[u16] = &[
+    50000, // openclaw gateway
+    50001, // MCP HTTP
+    51002, // forgefleetd gateway (responds to /health + empty /v1/models)
+    51100, // pulse P2P TCP (future)
 ];
 
 pub struct LlmProbe;
@@ -46,49 +55,71 @@ impl LlmProbe {
         let mut servers = Vec::new();
 
         for &port in LLM_SCAN_PORTS {
-            // Health probe — fast skip if nothing is listening.
-            let health_url = format!("http://127.0.0.1:{port}/health");
+            // Hard skip for ForgeFleet infrastructure ports.
+            if EXCLUDED_PORTS.contains(&port) {
+                continue;
+            }
+
             let is_ollama = port == 11434;
 
-            let health_ok = match client.get(&health_url).send().await {
-                Ok(r) => r.status().is_success(),
-                Err(_) => {
-                    // ollama doesn't expose /health; it has /api/tags instead.
-                    if is_ollama {
-                        match client
-                            .get(format!("http://127.0.0.1:{port}/api/tags"))
-                            .send()
-                            .await
-                        {
-                            Ok(r) => r.status().is_success(),
-                            Err(_) => continue,
-                        }
-                    } else {
-                        continue;
-                    }
+            // Fetch /v1/models. The definitive signal that a port is an LLM
+            // server is a non-empty "data" array. ForgeFleet's own gateway
+            // returns {"data":[]} which we must NOT classify as an LLM.
+            let models_url = format!("http://127.0.0.1:{port}/v1/models");
+            let v1_response = client.get(&models_url).send().await.ok();
+
+            let (model_id, raw_body, has_data) = match v1_response {
+                Some(r) if r.status().is_success() => {
+                    let body_txt = r.text().await.unwrap_or_default();
+                    let parsed: Option<serde_json::Value> = serde_json::from_str(&body_txt).ok();
+                    let data_arr = parsed
+                        .as_ref()
+                        .and_then(|v| v.get("data"))
+                        .and_then(|d| d.as_array());
+                    let has_data = data_arr.map(|a| !a.is_empty()).unwrap_or(false);
+                    let id = data_arr
+                        .and_then(|arr| arr.last())
+                        .and_then(|m| m.get("id"))
+                        .and_then(|id| id.as_str())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| "unknown".to_string());
+                    (id, body_txt, has_data)
                 }
+                _ => ("unknown".to_string(), String::new(), false),
             };
 
-            // /v1/models — extract id + raw body text for runtime heuristics.
-            let models_url = format!("http://127.0.0.1:{port}/v1/models");
-            let (model_id, raw_body) = match client.get(&models_url).send().await {
-                Ok(r) => {
-                    let body_txt = r.text().await.unwrap_or_default();
-                    let id = serde_json::from_str::<serde_json::Value>(&body_txt)
-                        .ok()
-                        .and_then(|v| {
-                            v.get("data")
-                                .and_then(|d| d.as_array())
-                                .and_then(|arr| arr.last())
-                                .and_then(|m| m.get("id"))
-                                .and_then(|id| id.as_str())
-                                .map(|s| s.to_string())
-                        })
-                        .unwrap_or_else(|| "unknown".to_string());
-                    (id, body_txt)
+            // Ollama fallback: query /api/tags which lists pulled models.
+            // Ollama's /v1/models is OpenAI-compatible but only shows models that have been
+            // recently used — /api/tags is the authoritative list.
+            let (model_id, raw_body, has_data) = if is_ollama && !has_data {
+                let tags_url = format!("http://127.0.0.1:{port}/api/tags");
+                match client.get(&tags_url).send().await {
+                    Ok(r) if r.status().is_success() => {
+                        let body_txt = r.text().await.unwrap_or_default();
+                        let parsed: Option<serde_json::Value> = serde_json::from_str(&body_txt).ok();
+                        let models_arr = parsed
+                            .as_ref()
+                            .and_then(|v| v.get("models"))
+                            .and_then(|m| m.as_array());
+                        let has_models = models_arr.map(|a| !a.is_empty()).unwrap_or(false);
+                        let id = models_arr
+                            .and_then(|arr| arr.first())
+                            .and_then(|m| m.get("name"))
+                            .and_then(|n| n.as_str())
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| "unknown".to_string());
+                        (id, body_txt, has_models)
+                    }
+                    _ => (model_id, raw_body, has_data),
                 }
-                Err(_) => ("unknown".to_string(), String::new()),
+            } else {
+                (model_id, raw_body, has_data)
             };
+
+            // Strict: no models advertised ⇒ not an LLM server, skip.
+            if !has_data {
+                continue;
+            }
 
             let runtime = identify_runtime(port, &raw_body);
             let (tokens_per_sec, queue_depth) = fetch_metrics(&client, port).await;
@@ -99,7 +130,9 @@ impl LlmProbe {
                 .unwrap_or(&model_id)
                 .to_string();
 
-            let status = if health_ok { "active" } else { "loading" };
+            // If we got this far, the server advertised at least one model → active.
+            let status = "active";
+            let health_ok = true;
 
             servers.push(LlmServer {
                 deployment_id: Uuid::new_v4(),
@@ -230,7 +263,11 @@ fn identify_runtime(port: u16, body: &str) -> &'static str {
     if body.contains(".safetensors") && std::env::consts::OS == "macos" {
         return "mlx_lm";
     }
-    "vllm"
+    // Port 51001 on Linux conventionally runs vllm; on macOS it's mlx_lm.
+    if port == 51001 {
+        return if std::env::consts::OS == "macos" { "mlx_lm" } else { "vllm" };
+    }
+    "unknown"
 }
 
 fn extract_loaded_path(body: &str) -> Option<String> {
