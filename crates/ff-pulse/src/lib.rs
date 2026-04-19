@@ -18,6 +18,7 @@ pub mod materializer;
 pub mod metrics;
 pub mod peer_map;
 pub mod reader;
+pub mod software_collector;
 pub mod subscriber;
 
 pub use client::PulseClient;
@@ -25,4 +26,5 @@ pub use error::{PulseError, Result};
 pub use heartbeat::HeartbeatPublisher;
 pub use heartbeat_v2::HeartbeatV2Publisher;
 pub use metrics::{FleetSnapshot, LoadedModel, NodeMetrics, PulseEvent, PulseEventType};
+pub use software_collector::SoftwareCollector;
 pub use subscriber::PulseSubscriber;

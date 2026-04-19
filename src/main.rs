@@ -72,6 +72,11 @@ struct StartArgs {
     /// Force leader mode in banner metadata
     #[arg(long, default_value_t = false)]
     leader: bool,
+
+    /// Disable Pulse v2 subsystems (heartbeat v2, materializer, leader_tick).
+    /// v1 heartbeat is unaffected.
+    #[arg(long, default_value_t = false)]
+    disable_pulse_v2: bool,
 }
 
 #[tokio::main]
@@ -80,7 +85,10 @@ async fn main() -> Result<()> {
     let command = cli
         .command
         .as_ref()
-        .unwrap_or(&Command::Start(StartArgs { leader: false }));
+        .unwrap_or(&Command::Start(StartArgs {
+            leader: false,
+            disable_pulse_v2: false,
+        }));
 
     match command {
         Command::Start(args) => run_daemon(&cli, args).await,
@@ -381,6 +389,47 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         } else {
             info!("subsystem disabled: fleet pulse (no redis.url configured)");
         }
+    }
+
+    // 14) Pulse v2 — heartbeat_v2 + materializer + leader_tick
+    //
+    // Preconditions: Postgres pool (for computer_id / fleet_members lookup)
+    // and a non-empty redis URL. If the computer isn't yet enrolled in the
+    // `computers` table we log and skip v2 entirely — new hosts come up
+    // clean without errors, enrollment backfills them later.
+    //
+    // NOTE (leader-gating): the materializer writes ALL computers' rows, so
+    // it is correct only on the leader. For this phase we still spawn it on
+    // every daemon; it reads all beats but the DB writes from non-leaders
+    // are acceptable as idempotent no-ops against the delta-check snapshot.
+    // A future pass will tie spawn/stop to leader_tick's on_became_leader /
+    // on_lost_leader callbacks — until then, keeping it always-on is the
+    // simpler of the two alternatives the design notes considered.
+    if !start.disable_pulse_v2 {
+        let redis_url = config.redis.url.clone();
+        if redis_url.is_empty() {
+            info!("subsystem disabled: pulse v2 (no redis.url configured)");
+        } else if let Some(pg_pool) = operational_store.pg_pool().cloned() {
+            match start_pulse_v2_subsystems(
+                pg_pool,
+                redis_url,
+                node_name.clone(),
+                shutdown_rx.clone(),
+            )
+            .await
+            {
+                Ok(handles) => {
+                    subsystem_tasks.extend(handles);
+                }
+                Err(err) => {
+                    warn!(error = %err, "pulse v2 startup failed; v1 heartbeat continues");
+                }
+            }
+        } else {
+            info!("subsystem disabled: pulse v2 (requires postgres_runtime or postgres_full mode)");
+        }
+    } else {
+        info!("subsystem disabled: pulse v2 (--disable-pulse-v2)");
     }
 
     info!("all subsystems started; waiting for shutdown signal");
@@ -1540,6 +1589,106 @@ fn start_mcp_federation_subsystem(
             }
         }
     })
+}
+
+// ─── Pulse v2 subsystems (heartbeat_v2 + materializer + leader_tick) ────────
+//
+// Does three things, in order:
+//   1) Look up this computer's `id` and `fleet_members.election_priority`.
+//      If the host isn't enrolled, log warn and return Ok(empty) — v2 stays
+//      disabled for that host until enrollment.
+//   2) Start HeartbeatV2Publisher unconditionally when the computer row
+//      exists (it writes only its own `pulse:computer:{name}` key).
+//   3) Start the Materializer on every daemon (see NOTE at call-site), and
+//      start LeaderTick only if the computer is enrolled in `fleet_members`.
+async fn start_pulse_v2_subsystems(
+    pg_pool: ff_db::PgPool,
+    redis_url: String,
+    node_name: String,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> Result<Vec<JoinHandle<()>>> {
+    let mut handles: Vec<JoinHandle<()>> = Vec::new();
+
+    // (1a) computer_id — required for everything else.
+    let computer_id_row: Option<(uuid::Uuid,)> =
+        sqlx::query_as::<_, (uuid::Uuid,)>("SELECT id FROM computers WHERE name = $1")
+            .bind(&node_name)
+            .fetch_optional(&pg_pool)
+            .await
+            .context("pulse v2: failed to query computers by name")?;
+
+    let Some((computer_id,)) = computer_id_row else {
+        warn!(
+            node = %node_name,
+            "pulse v2: no `computers` row for this host; Pulse v2 disabled until enrollment"
+        );
+        return Ok(handles);
+    };
+
+    // (1b) election_priority — optional; fleet_members may not exist yet.
+    let priority_row: Option<(i32,)> = sqlx::query_as::<_, (i32,)>(
+        "SELECT election_priority FROM fleet_members WHERE computer_id = $1",
+    )
+    .bind(computer_id)
+    .fetch_optional(&pg_pool)
+    .await
+    .context("pulse v2: failed to query fleet_members")?;
+    let enrolled_in_fleet = priority_row.is_some();
+    let election_priority = priority_row.map(|(p,)| p).unwrap_or(1000);
+
+    // Build the redis::Client once — both publisher and materializer need one.
+    let redis_client = redis::Client::open(redis_url.as_str())
+        .context("pulse v2: failed to open redis client")?;
+
+    // (2) HeartbeatV2Publisher — always runs when computer row exists.
+    info!(
+        node = %node_name,
+        computer_id = %computer_id,
+        election_priority,
+        "starting subsystem: pulse v2 heartbeat"
+    );
+    let v2_pub = ff_pulse::HeartbeatV2Publisher::with_defaults(
+        redis_client.clone(),
+        node_name.clone(),
+        election_priority,
+    );
+    // epoch_handle + role_handle are shared with leader_tick below when
+    // available; for now we just spawn the publisher.
+    let _epoch_handle = v2_pub.epoch_handle();
+    let _role_handle = v2_pub.role_handle();
+    handles.push(v2_pub.spawn(shutdown_rx.clone()));
+
+    // (3) Materializer — runs on every daemon for this phase. See NOTE
+    // at call-site in run_daemon.
+    info!("starting subsystem: pulse v2 materializer");
+    let materializer = ff_pulse::materializer::Materializer::new(pg_pool.clone(), redis_client.clone());
+    handles.push(materializer.spawn(shutdown_rx.clone()));
+
+    // (4) LeaderTick — only when enrolled in fleet_members.
+    if enrolled_in_fleet {
+        info!(
+            node = %node_name,
+            election_priority,
+            "starting subsystem: pulse v2 leader_tick"
+        );
+        let pulse_reader = ff_pulse::reader::PulseReader::new(&redis_url)
+            .context("pulse v2: failed to build PulseReader for leader_tick")?;
+        let leader_tick = ff_agent::leader_tick::LeaderTick::new(
+            pg_pool,
+            pulse_reader,
+            computer_id,
+            node_name.clone(),
+            election_priority,
+        );
+        handles.push(leader_tick.spawn(15, shutdown_rx));
+    } else {
+        info!(
+            node = %node_name,
+            "pulse v2: no fleet_members row — leader_tick NOT started (materializer + heartbeat_v2 still running)"
+        );
+    }
+
+    Ok(handles)
 }
 
 fn start_mcp_http_subsystem(config: FleetConfig) -> JoinHandle<()> {

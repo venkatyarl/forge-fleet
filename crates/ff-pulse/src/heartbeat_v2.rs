@@ -24,6 +24,7 @@ use crate::beat_v2::{
     Capabilities, DbTopology, DockerStatus, HardwareInfo, Ip, LoadInfo, MemoryInfo,
     NetworkInfo, PulseBeatV2,
 };
+use crate::software_collector::SoftwareCollector;
 
 /// Publisher for PulseBeatV2 — richer payload used by Pulse v2 subsystems.
 pub struct HeartbeatV2Publisher {
@@ -182,8 +183,11 @@ impl HeartbeatV2Publisher {
             max_runnable_model_gb: None,
         };
 
+        // ── Installed software inventory ─────────────────────────────────
+        beat.installed_software = SoftwareCollector::new().detect();
+
         // ── Placeholders awaiting later phases ───────────────────────────
-        // llm_servers, available_models, installed_software — empty vecs
+        // llm_servers, available_models — empty vecs
         // docker — default empty status
         // peers_seen — populated by a separate loop (reader_tick)
         beat.docker = DockerStatus {
