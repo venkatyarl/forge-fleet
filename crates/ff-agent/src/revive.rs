@@ -270,35 +270,68 @@ impl ReviveManager {
     }
 
     /// Platform-specific daemon restart issued over SSH.
+    ///
+    /// On macOS, different nodes register the daemon under different launchd
+    /// labels (historical drift across onboarding scripts):
+    ///   - `com.forgefleet.forgefleetd` — newer ff-daemon installs
+    ///   - `com.forgefleet.node`        — older installs (e.g. Ace)
+    ///   - `com.forgefleet.ffdaemon`    — variant used on Taylor
+    /// We try each in order and return on the first success.
     async fn ssh_restart_daemon(&self, target: &ReviveTarget) -> Result<(), ReviveError> {
-        let restart_cmd = match target.os_family.as_str() {
+        match target.os_family.as_str() {
             "macos" => {
-                // `gui/$(id -u)/com.forgefleet.node` — we rely on the user's
-                // GUI session being the one that owns the LaunchAgent.
-                "launchctl kickstart -k gui/$(id -u)/com.forgefleet.node".to_string()
+                const MAC_LABELS: &[&str] = &[
+                    "com.forgefleet.forgefleetd",
+                    "com.forgefleet.node",
+                    "com.forgefleet.ffdaemon",
+                ];
+                for label in MAC_LABELS {
+                    let restart_cmd = format!(
+                        "launchctl kickstart -k gui/$(id -u)/{label}"
+                    );
+                    let mut cmd = Command::new("ssh");
+                    cmd.args(ssh_base_args(target.ssh_port))
+                        .arg(format!("{}@{}", target.ssh_user, target.primary_ip))
+                        .arg(&restart_cmd);
+
+                    if run_ssh(cmd).await.unwrap_or(false) {
+                        debug!(
+                            node = %target.name,
+                            label = %label,
+                            "launchctl kickstart succeeded"
+                        );
+                        return Ok(());
+                    }
+                    debug!(
+                        node = %target.name,
+                        label = %label,
+                        "launchctl kickstart failed; trying next label"
+                    );
+                }
+                Err(ReviveError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "daemon restart: no macOS launchd label matched",
+                )))
             }
             _ => {
                 // Linux / DGX: systemd user unit.
-                "systemctl --user restart forgefleet-node.service forgefleet-daemon.service \
-                   || systemctl --user restart forgefleet-node.service \
-                   || true"
-                    .to_string()
+                let restart_cmd = "systemctl --user restart forgefleet-node.service forgefleet-daemon.service \
+                       || systemctl --user restart forgefleet-node.service \
+                       || true";
+                let mut cmd = Command::new("ssh");
+                cmd.args(ssh_base_args(target.ssh_port))
+                    .arg(format!("{}@{}", target.ssh_user, target.primary_ip))
+                    .arg(restart_cmd);
+
+                if run_ssh(cmd).await.unwrap_or(false) {
+                    Ok(())
+                } else {
+                    Err(ReviveError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "daemon restart ssh call returned non-zero",
+                    )))
+                }
             }
-        };
-
-        let mut cmd = Command::new("ssh");
-        cmd.args(ssh_base_args(target.ssh_port))
-            .arg(format!("{}@{}", target.ssh_user, target.primary_ip))
-            .arg(restart_cmd);
-
-        let ok = run_ssh(cmd).await.unwrap_or(false);
-        if ok {
-            Ok(())
-        } else {
-            Err(ReviveError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "daemon restart ssh call returned non-zero",
-            )))
         }
     }
 

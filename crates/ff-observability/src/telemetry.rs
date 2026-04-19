@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 use tracing::Level;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::Layer;
+use tracing_subscriber::Registry;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
@@ -254,6 +256,164 @@ pub fn init_telemetry(config: &TelemetryConfig) -> anyhow::Result<()> {
         file_logging = file_logging_enabled,
         otel = config.enable_opentelemetry,
         "telemetry initialized"
+    );
+
+    Ok(())
+}
+
+/// Initialize the global tracing subscriber WITH an additional layer — typically
+/// a NATS log-forwarding layer so every daemon event is mirrored onto the
+/// fleet-wide event bus.
+///
+/// The `extra_layer` is composed on top of the file + stdout layers; if NATS
+/// (or whatever it represents) becomes unavailable at runtime the layer
+/// itself is expected to best-effort drop the event, never block the
+/// logging hot-path.
+///
+/// Callers should construct the extra layer first (e.g.
+/// `NatsLogLayer::with_client(client, node, "forgefleetd")`), box it, and
+/// pass it in. On any failure to attach the layer (global subscriber
+/// already installed, etc.) this returns an error — callers should fall
+/// back to plain [`init_telemetry`].
+pub fn init_telemetry_with_extra_layer<L>(
+    config: &TelemetryConfig,
+    extra_layer: L,
+) -> anyhow::Result<()>
+where
+    L: Layer<Registry> + Send + Sync + 'static,
+{
+    let file_cfg = config.file_log.as_ref().filter(|f| f.enabled);
+    let mut file_logging_enabled = false;
+
+    if config.json {
+        let stdout_layer = tracing_subscriber::fmt::layer()
+            .json()
+            .with_target(true)
+            .with_span_list(config.include_spans)
+            .with_file(config.include_location)
+            .with_line_number(config.include_location);
+
+        match file_cfg {
+            Some(file_cfg) => {
+                let filter = build_env_filter(config)?;
+                let (file_writer, guard) = file_logger::create_non_blocking_writer(file_cfg)?;
+                stash_guard(guard);
+                file_logging_enabled = true;
+
+                if file_cfg.json {
+                    let file_layer = tracing_subscriber::fmt::layer()
+                        .json()
+                        .with_target(true)
+                        .with_span_list(file_cfg.include_spans)
+                        .with_file(file_cfg.include_location)
+                        .with_line_number(file_cfg.include_location)
+                        .with_ansi(false)
+                        .with_writer(file_writer);
+
+                    tracing_subscriber::registry()
+                        .with(extra_layer)
+                        .with(filter)
+                        .with(stdout_layer)
+                        .with(file_layer)
+                        .try_init()
+                        .map_err(|e| anyhow::anyhow!("failed to init tracing subscriber: {e}"))?;
+                } else {
+                    let file_layer = tracing_subscriber::fmt::layer()
+                        .with_target(true)
+                        .with_level(true)
+                        .with_file(file_cfg.include_location)
+                        .with_line_number(file_cfg.include_location)
+                        .with_ansi(false)
+                        .with_writer(file_writer);
+
+                    tracing_subscriber::registry()
+                        .with(extra_layer)
+                        .with(filter)
+                        .with(stdout_layer)
+                        .with(file_layer)
+                        .try_init()
+                        .map_err(|e| anyhow::anyhow!("failed to init tracing subscriber: {e}"))?;
+                }
+            }
+            None => {
+                let filter = build_env_filter(config)?;
+                tracing_subscriber::registry()
+                    .with(extra_layer)
+                    .with(filter)
+                    .with(stdout_layer)
+                    .try_init()
+                    .map_err(|e| anyhow::anyhow!("failed to init tracing subscriber: {e}"))?;
+            }
+        }
+    } else {
+        let stdout_layer = tracing_subscriber::fmt::layer()
+            .with_target(true)
+            .with_level(true)
+            .with_file(config.include_location)
+            .with_line_number(config.include_location);
+
+        match file_cfg {
+            Some(file_cfg) => {
+                let filter = build_env_filter(config)?;
+                let (file_writer, guard) = file_logger::create_non_blocking_writer(file_cfg)?;
+                stash_guard(guard);
+                file_logging_enabled = true;
+
+                if file_cfg.json {
+                    let file_layer = tracing_subscriber::fmt::layer()
+                        .json()
+                        .with_target(true)
+                        .with_span_list(file_cfg.include_spans)
+                        .with_file(file_cfg.include_location)
+                        .with_line_number(file_cfg.include_location)
+                        .with_ansi(false)
+                        .with_writer(file_writer);
+
+                    tracing_subscriber::registry()
+                        .with(extra_layer)
+                        .with(filter)
+                        .with(stdout_layer)
+                        .with(file_layer)
+                        .try_init()
+                        .map_err(|e| anyhow::anyhow!("failed to init tracing subscriber: {e}"))?;
+                } else {
+                    let file_layer = tracing_subscriber::fmt::layer()
+                        .with_target(true)
+                        .with_level(true)
+                        .with_file(file_cfg.include_location)
+                        .with_line_number(file_cfg.include_location)
+                        .with_ansi(false)
+                        .with_writer(file_writer);
+
+                    tracing_subscriber::registry()
+                        .with(extra_layer)
+                        .with(filter)
+                        .with(stdout_layer)
+                        .with(file_layer)
+                        .try_init()
+                        .map_err(|e| anyhow::anyhow!("failed to init tracing subscriber: {e}"))?;
+                }
+            }
+            None => {
+                let filter = build_env_filter(config)?;
+                tracing_subscriber::registry()
+                    .with(extra_layer)
+                    .with(filter)
+                    .with(stdout_layer)
+                    .try_init()
+                    .map_err(|e| anyhow::anyhow!("failed to init tracing subscriber: {e}"))?;
+            }
+        }
+    }
+
+    tracing::info!(
+        service = %config.service_name,
+        node = ?config.node_name,
+        json = config.json,
+        file_logging = file_logging_enabled,
+        otel = config.enable_opentelemetry,
+        extra_layer = true,
+        "telemetry initialized (with extra layer)"
     );
 
     Ok(())

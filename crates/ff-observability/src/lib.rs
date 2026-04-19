@@ -49,7 +49,7 @@ pub use metrics::{
     normalize_path,
     prometheus_metrics_middleware,
 };
-pub use telemetry::{TelemetryConfig, init_telemetry};
+pub use telemetry::{TelemetryConfig, init_telemetry, init_telemetry_with_extra_layer};
 pub use tracing_ext::{
     SpanExt, TraceStore, TraceSummary, extract_or_generate_trace_id, extract_trace_header,
     global_trace_store, inject_trace_header, new_trace_id, trace_discovery, trace_llm_call,

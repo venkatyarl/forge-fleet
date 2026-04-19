@@ -112,24 +112,28 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
     #[allow(unused_unsafe)]
     unsafe { std::env::set_var("FORGEFLEET_NODE_NAME", &node_name); }
 
-    init_logging(cli, &node_name)?;
-    print_startup_banner(&node_name, &role, &config_path);
-
     // ─── NATS client (optional) ─────────────────────────────────────────────
-    // Initialize the process-global NATS client so subsystems can publish
-    // pulse beats, fleet events, and logs to subjects. NATS is optional —
-    // if the connection fails we warn and continue on Redis + Postgres alone.
-    {
-        let nats_url = ff_agent::nats_client::resolve_nats_url();
-        // Export the URL for ff-pulse's heartbeat_v2 NATS mirror (which has
-        // its own OnceCell-backed client scoped to the crate).
-        #[allow(unused_unsafe)]
-        unsafe { std::env::set_var("FORGEFLEET_NATS_URL", &nats_url); }
-        match ff_agent::nats_client::init_nats(&nats_url).await {
-            Ok(_) => info!(url = %nats_url, "NATS connected"),
-            Err(e) => warn!(url = %nats_url, error = %e, "NATS unavailable — continuing without event bus"),
-        }
+    // Initialize the process-global NATS client BEFORE tracing so the
+    // NATS log-forwarding layer can be attached to the subscriber. NATS is
+    // optional — if the connection fails we warn and continue on Redis +
+    // Postgres alone (telemetry falls back to file + stdout only).
+    //
+    // We can't emit tracing events here because the global subscriber is
+    // not yet installed; stash the outcome and log it right after
+    // `init_logging` succeeds.
+    let nats_url = ff_agent::nats_client::resolve_nats_url();
+    #[allow(unused_unsafe)]
+    unsafe { std::env::set_var("FORGEFLEET_NATS_URL", &nats_url); }
+    let nats_init_outcome: Result<(), String> = ff_agent::nats_client::init_nats(&nats_url)
+        .await
+        .map_err(|e| e.to_string());
+
+    init_logging(cli, &node_name).await?;
+    match &nats_init_outcome {
+        Ok(_) => info!(url = %nats_url, "NATS connected"),
+        Err(e) => warn!(url = %nats_url, error = %e, "NATS unavailable — continuing without event bus"),
     }
+    print_startup_banner(&node_name, &role, &config_path);
 
     enforce_database_mode_preflight(&config)?;
 
@@ -774,7 +778,7 @@ fn redact_database_url(raw: &str) -> String {
     "***".to_string()
 }
 
-fn init_logging(cli: &Cli, node_name: &str) -> Result<()> {
+async fn init_logging(cli: &Cli, node_name: &str) -> Result<()> {
     let telemetry = TelemetryConfig {
         level: cli.log_level.clone(),
         json: cli.json_logs,
@@ -782,7 +786,20 @@ fn init_logging(cli: &Cli, node_name: &str) -> Result<()> {
         ..Default::default()
     };
 
-    init_telemetry(&telemetry)
+    // If the process-global NATS client is available, attach a
+    // NatsLogLayer so every tracing event is mirrored onto
+    // `logs.<node>.forgefleetd.<level>`. Otherwise fall back to the
+    // plain file + stdout subscriber.
+    if let Some(nats_client) = ff_agent::nats_client::get_nats().await {
+        let nats_layer = ff_agent::nats_log_layer::NatsLogLayer::with_client(
+            nats_client.clone(),
+            node_name.to_string(),
+            "forgefleetd".to_string(),
+        );
+        ff_observability::init_telemetry_with_extra_layer(&telemetry, nats_layer)
+    } else {
+        init_telemetry(&telemetry)
+    }
 }
 
 fn resolve_node_name(cli: &Cli, config: &FleetConfig) -> String {
