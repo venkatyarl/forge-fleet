@@ -31,6 +31,7 @@ pub mod deployment_reconciler;
 pub mod disk_sampler;
 pub mod job_sweeper;
 pub mod model_catalog;
+pub mod model_catalog_seed;
 pub mod model_convert;
 pub mod model_library_scanner;
 pub mod model_runtime;
@@ -45,6 +46,7 @@ pub mod plugins;
 pub mod rpc_inference;
 pub mod scoped_memory;
 pub mod session_store;
+pub mod software_registry;
 pub mod streaming;
 pub mod sub_agents;
 pub mod system_prompt;
@@ -52,6 +54,9 @@ pub mod template_registry;
 pub mod thinking;
 pub mod tools;
 pub mod training;
+
+pub use software_registry::{seed_from_toml, SeedReport};
+pub use model_catalog_seed::{seed_from_toml as seed_model_catalog_from_toml, ModelSeedReport};
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

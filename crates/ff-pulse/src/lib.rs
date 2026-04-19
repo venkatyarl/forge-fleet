@@ -9,6 +9,7 @@
 //! with a 30-second TTL. If a key expires, the node is considered offline.
 //! The dashboard subscribes to pub/sub channels for real-time updates.
 
+pub mod beat_v2;
 pub mod client;
 pub mod error;
 pub mod heartbeat;

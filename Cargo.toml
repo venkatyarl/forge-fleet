@@ -132,3 +132,9 @@ tempfile = "3"
 reqwest = { workspace = true }
 serde_json = { workspace = true }
 ff-gateway = { path = "crates/ff-gateway" }
+ff-agent = { path = "crates/ff-agent" }
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono", "uuid"] }
+
+[[example]]
+name = "seed_v14_registries"
+path = "examples/seed_v14_registries.rs"

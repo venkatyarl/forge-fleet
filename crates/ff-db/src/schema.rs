@@ -780,3 +780,284 @@ pub const TABLES: &[&str] = &[
     "audit_log",
     "config_kv",
 ];
+
+pub const SCHEMA_V14_COMPUTERS_AND_PORTFOLIO: &str = r#"
+-- ─── V14: Computers as first-class + software registry + model portfolio ──
+-- Adds the new data model layer described in
+-- /Users/venkat/.claude/plans/we-are-mixing-two-streamed-sky.md
+--
+-- These tables coexist with the existing fleet_nodes / fleet_models tables.
+-- Later phases migrate callers over, then drop the old tables.
+
+-- ─── Physical computer identity ─────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS computers (
+    id                      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name                    TEXT NOT NULL UNIQUE,
+    primary_ip              TEXT NOT NULL,
+    all_ips                 JSONB NOT NULL DEFAULT '[]',
+    hostname                TEXT,
+    mac_addresses           JSONB NOT NULL DEFAULT '[]',
+    os_family               TEXT NOT NULL,                  -- macos|linux-ubuntu|linux-dgx|windows
+    os_distribution         TEXT,                            -- ubuntu-24.04, macos-26.4, etc.
+    os_version              TEXT,                            -- installed version
+    os_version_latest       TEXT,                            -- denormalized from software_registry
+    os_upgrade_available    BOOLEAN NOT NULL DEFAULT false,
+    os_version_checked_at   TIMESTAMPTZ,
+    cpu_cores               INT,
+    total_ram_gb            INT,
+    total_disk_gb           INT,
+    has_gpu                 BOOLEAN NOT NULL DEFAULT false,
+    gpu_kind                TEXT,                            -- none|integrated|apple_silicon|nvidia_cuda|amd_rocm
+    gpu_count               INT NOT NULL DEFAULT 0,
+    gpu_model               TEXT,
+    gpu_vram_gb             FLOAT,                            -- per-GPU VRAM, NULL for unified
+    gpu_total_vram_gb       FLOAT,
+    cuda_version            TEXT,
+    metal_version           TEXT,
+    rocm_version            TEXT,
+    gpu_driver_version      TEXT,
+    ssh_user                TEXT NOT NULL,
+    ssh_port                INT NOT NULL DEFAULT 22,
+    ssh_public_key          TEXT,                            -- this computer's ed25519 pub key
+    enrolled_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_seen_at            TIMESTAMPTZ,
+    offline_since           TIMESTAMPTZ,                     -- set when status → sdown/odown
+    status_changed_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    status                  TEXT NOT NULL DEFAULT 'pending', -- pending|online|sdown|odown|offline|maintenance
+    metadata                JSONB NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_computers_last_seen ON computers(last_seen_at);
+CREATE INDEX IF NOT EXISTS idx_computers_status ON computers(status);
+
+-- Downtime history (append-only log)
+CREATE TABLE IF NOT EXISTS computer_downtime_events (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    computer_id     UUID NOT NULL REFERENCES computers(id) ON DELETE CASCADE,
+    offline_at      TIMESTAMPTZ NOT NULL,
+    online_at       TIMESTAMPTZ,
+    duration_sec    INT,
+    cause           TEXT,       -- odown | graceful_shutdown | revive_initiated
+    resolved_by     TEXT        -- pulse_return | revive_success | manual
+);
+CREATE INDEX IF NOT EXISTS idx_downtime_by_computer
+    ON computer_downtime_events(computer_id, offline_at DESC);
+
+-- SSH mesh trust (replaces fleet_mesh_status logically; both coexist for now)
+CREATE TABLE IF NOT EXISTS computer_trust (
+    source_computer_id   UUID NOT NULL REFERENCES computers(id) ON DELETE CASCADE,
+    target_computer_id   UUID NOT NULL REFERENCES computers(id) ON DELETE CASCADE,
+    target_host_key      TEXT NOT NULL,
+    verified_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_probe_at        TIMESTAMPTZ,
+    last_probe_status    TEXT,
+    PRIMARY KEY (source_computer_id, target_computer_id)
+);
+
+-- ─── ForgeFleet install record ──────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS fleet_members (
+    computer_id         UUID PRIMARY KEY REFERENCES computers(id) ON DELETE CASCADE,
+    role                TEXT NOT NULL DEFAULT 'member',   -- leader|member (elected)
+    election_priority   INT NOT NULL DEFAULT 50,
+    gh_account          TEXT,
+    runtime             TEXT NOT NULL,                    -- mlx|llamacpp|vllm
+    models_dir          TEXT,
+    disk_quota_pct      INT NOT NULL DEFAULT 80,
+    enrolled_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    metadata            JSONB NOT NULL DEFAULT '{}'
+);
+
+-- Elected leader singleton (one row ever)
+CREATE TABLE IF NOT EXISTS fleet_leader_state (
+    singleton_key     TEXT PRIMARY KEY DEFAULT 'current',
+    computer_id       UUID NOT NULL REFERENCES computers(id),
+    member_name       TEXT NOT NULL,
+    epoch             BIGINT NOT NULL,
+    elected_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    reason            TEXT,
+    heartbeat_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CHECK (singleton_key = 'current')
+);
+
+-- ─── OpenClaw install record ────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS openclaw_installations (
+    computer_id          UUID PRIMARY KEY REFERENCES computers(id) ON DELETE CASCADE,
+    mode                 TEXT NOT NULL DEFAULT 'node',   -- gateway|node
+    gateway_url          TEXT,
+    last_reconfigured_at TIMESTAMPTZ,
+    config_path          TEXT NOT NULL DEFAULT '~/.openclaw/openclaw.json',
+    metadata             JSONB NOT NULL DEFAULT '{}'
+);
+
+-- ─── Software registry + per-computer install record ────────────────────
+CREATE TABLE IF NOT EXISTS software_registry (
+    id                     TEXT PRIMARY KEY,         -- "ff", "openclaw", "os-macos", ...
+    display_name           TEXT NOT NULL,
+    kind                   TEXT NOT NULL,            -- binary|runtime|service|os
+    applies_to_os_family   TEXT,                      -- NULL = applies everywhere
+    version_source         JSONB NOT NULL,
+    upgrade_playbook       JSONB NOT NULL,
+    rollback_playbook      JSONB NOT NULL DEFAULT '{}',
+    latest_version         TEXT,
+    latest_version_at      TIMESTAMPTZ,
+    release_notes_url      TEXT,
+    requires_restart       BOOLEAN NOT NULL DEFAULT false,
+    requires_reboot        BOOLEAN NOT NULL DEFAULT false,
+    metadata               JSONB NOT NULL DEFAULT '{}'
+);
+
+CREATE TABLE IF NOT EXISTS computer_software (
+    computer_id               UUID NOT NULL REFERENCES computers(id) ON DELETE CASCADE,
+    software_id               TEXT NOT NULL REFERENCES software_registry(id) ON DELETE CASCADE,
+    installed_version         TEXT,
+    install_source            TEXT,                     -- brew|apt|dpkg|pip|pipx|npm|cargo|direct|...
+    install_source_identifier TEXT,
+    install_path              TEXT,
+    first_seen_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_checked_at           TIMESTAMPTZ,
+    last_upgraded_at          TIMESTAMPTZ,
+    status                    TEXT NOT NULL DEFAULT 'ok',
+    last_upgrade_error        TEXT,
+    PRIMARY KEY (computer_id, software_id)
+);
+CREATE INDEX IF NOT EXISTS idx_computer_software_status ON computer_software(status);
+CREATE INDEX IF NOT EXISTS idx_computer_software_by_software ON computer_software(software_id);
+CREATE INDEX IF NOT EXISTS idx_computer_software_by_source ON computer_software(install_source);
+
+-- ─── Model portfolio + per-computer presence + deployments ──────────────
+CREATE TABLE IF NOT EXISTS model_catalog (
+    id                    TEXT PRIMARY KEY,
+    display_name          TEXT NOT NULL,
+    family                TEXT NOT NULL,
+    parameter_count       TEXT,
+    architecture          TEXT,
+    license               TEXT,
+    tasks                 JSONB NOT NULL DEFAULT '[]',
+    input_modalities      JSONB NOT NULL DEFAULT '[]',
+    output_modalities     JSONB NOT NULL DEFAULT '[]',
+    languages             JSONB NOT NULL DEFAULT '[]',
+    upstream_source       TEXT NOT NULL DEFAULT 'huggingface',
+    upstream_id           TEXT,
+    upstream_latest_rev   TEXT,
+    upstream_checked_at   TIMESTAMPTZ,
+    release_date          DATE,
+    quantization          TEXT,
+    file_size_gb          FLOAT,
+    context_window        INT,
+    recommended_runtime   JSONB NOT NULL DEFAULT '[]',
+    required_gpu_kind     TEXT,                        -- apple_silicon|nvidia_cuda|amd_rocm|NULL
+    min_vram_gb           FLOAT,
+    cpu_runnable          BOOLEAN NOT NULL DEFAULT true,
+    quality_tier          TEXT NOT NULL DEFAULT 'standard',
+    lifecycle_status      TEXT NOT NULL DEFAULT 'active',
+    replaced_by           TEXT REFERENCES model_catalog(id),
+    retirement_reason     TEXT,
+    retirement_date       DATE,
+    added_by              TEXT,
+    notes                 TEXT,
+    benchmark_results     JSONB NOT NULL DEFAULT '{}',
+    metadata              JSONB NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_model_catalog_by_task ON model_catalog USING GIN (tasks);
+CREATE INDEX IF NOT EXISTS idx_model_catalog_by_family ON model_catalog(family);
+CREATE INDEX IF NOT EXISTS idx_model_catalog_by_lifecycle ON model_catalog(lifecycle_status);
+CREATE INDEX IF NOT EXISTS idx_model_catalog_by_tier ON model_catalog(quality_tier);
+
+CREATE TABLE IF NOT EXISTS computer_models (
+    computer_id     UUID NOT NULL REFERENCES computers(id) ON DELETE CASCADE,
+    model_id        TEXT NOT NULL REFERENCES model_catalog(id),
+    file_path       TEXT NOT NULL,
+    size_gb         FLOAT,
+    present         BOOLEAN NOT NULL DEFAULT true,
+    downloaded_at   TIMESTAMPTZ,
+    last_seen_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    status          TEXT NOT NULL DEFAULT 'ok',     -- ok|revision_available|missing|corrupt
+    metadata        JSONB NOT NULL DEFAULT '{}',
+    PRIMARY KEY (computer_id, model_id)
+);
+
+CREATE TABLE IF NOT EXISTS computer_model_deployments (
+    id                      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    computer_id             UUID NOT NULL REFERENCES computers(id) ON DELETE CASCADE,
+    model_id                TEXT NOT NULL REFERENCES model_catalog(id),
+    runtime                 TEXT NOT NULL,
+    endpoint                TEXT NOT NULL,
+    openai_compatible       BOOLEAN NOT NULL DEFAULT true,
+    context_window          INT,
+    parallel_slots          INT,
+    pid                     INT,
+    status                  TEXT NOT NULL DEFAULT 'loading', -- loading|active|idle|error|stopping|stopped
+    cluster_id              TEXT,
+    cluster_role            TEXT,
+    cluster_peers           JSONB NOT NULL DEFAULT '[]',
+    tensor_parallel_size    INT NOT NULL DEFAULT 1,
+    pipeline_parallel_size  INT NOT NULL DEFAULT 1,
+    ram_allocated_gb        FLOAT,
+    vram_allocated_gb       FLOAT,
+    started_at              TIMESTAMPTZ,
+    stopped_at              TIMESTAMPTZ,
+    last_status_change      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    metadata                JSONB NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_deployments_by_computer ON computer_model_deployments(computer_id);
+CREATE INDEX IF NOT EXISTS idx_deployments_by_model ON computer_model_deployments(model_id);
+CREATE INDEX IF NOT EXISTS idx_deployments_by_cluster ON computer_model_deployments(cluster_id);
+
+-- Required task portfolio (operator declares "fleet must always cover X")
+CREATE TABLE IF NOT EXISTS fleet_task_coverage (
+    task                  TEXT PRIMARY KEY,
+    min_models_loaded     INT NOT NULL DEFAULT 1,
+    preferred_model_ids   JSONB NOT NULL DEFAULT '[]',
+    priority              TEXT NOT NULL DEFAULT 'normal', -- critical|normal|nice-to-have
+    notes                 TEXT,
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- ─── Docker container tracking (reported by Pulse) ──────────────────────
+CREATE TABLE IF NOT EXISTS computer_docker_containers (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    computer_id         UUID NOT NULL REFERENCES computers(id) ON DELETE CASCADE,
+    project_name        TEXT,                    -- compose project (forgefleet, hireflow360, ...)
+    compose_file        TEXT,
+    container_name      TEXT NOT NULL,
+    container_id        TEXT,
+    image               TEXT,
+    ports               JSONB NOT NULL DEFAULT '[]',
+    status              TEXT NOT NULL DEFAULT 'unknown',  -- running|stopped|exited|paused|restarting
+    health              TEXT,                    -- healthy|unhealthy|starting|none
+    last_status_change  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    first_seen_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_seen_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    metadata            JSONB NOT NULL DEFAULT '{}',
+    UNIQUE (computer_id, container_name)
+);
+CREATE INDEX IF NOT EXISTS idx_docker_by_project ON computer_docker_containers(project_name);
+CREATE INDEX IF NOT EXISTS idx_docker_by_status ON computer_docker_containers(status);
+
+-- ─── HA: database replicas + backups (Phase 6 preparation) ──────────────
+CREATE TABLE IF NOT EXISTS database_replicas (
+    computer_id                 UUID NOT NULL REFERENCES computers(id) ON DELETE CASCADE,
+    database_kind               TEXT NOT NULL,    -- postgres|redis|nats
+    role                        TEXT NOT NULL,    -- primary|replica|sentinel_voter
+    status                      TEXT NOT NULL,    -- running|syncing|promoting|stopped|failed
+    lag_bytes                   BIGINT,
+    last_sync_at                TIMESTAMPTZ,
+    promoted_at                 TIMESTAMPTZ,
+    bootstrapped_from_backup_id UUID,
+    notes                       TEXT,
+    PRIMARY KEY (computer_id, database_kind)
+);
+
+CREATE TABLE IF NOT EXISTS backups (
+    id                     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    database_kind          TEXT NOT NULL,
+    created_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    size_bytes             BIGINT NOT NULL,
+    source_computer_id     UUID NOT NULL REFERENCES computers(id),
+    checksum_sha256        TEXT NOT NULL,
+    file_name              TEXT NOT NULL,
+    distribution_status    JSONB NOT NULL DEFAULT '{}',
+    verified_restorable_at TIMESTAMPTZ,
+    retention_tier         TEXT NOT NULL DEFAULT 'recent' -- recent|daily|weekly
+);
+CREATE INDEX IF NOT EXISTS idx_backups_by_kind_created ON backups(database_kind, created_at DESC);
+"#;

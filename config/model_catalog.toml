@@ -15,9 +15,27 @@
 #   2 = mid       (13-35B)   needs 32GB+
 #   3 = large     (70-200B)  needs 64GB+ or MoE sparsity
 #   4 = frontier  (200B+)    leader-node only / distributed
+#
+# HuggingFace Task Taxonomy (added 2026-04-18):
+#   Every entry carries HF-style metadata so ForgeFleet can pick the right
+#   model for the right modality/task. Fields:
+#     tasks               — HF pipeline-tag values (e.g. "text-generation",
+#                           "automatic-speech-recognition", "image-text-to-text")
+#     input_modalities    — subset of ["text","image","audio","video"]
+#     output_modalities   — subset of ["text","image","audio","video"]
+#     languages           — ISO codes (optional)
+#     upstream_source     — "huggingface" (default)
+#     upstream_id         — canonical HF repo path
+#     quality_tier        — "flagship" | "standard" | "experimental" | "legacy"
+#     lifecycle_status    — "active" | "candidate" | "deprecated" | "retired"
+#     required_gpu_kind   — "apple_silicon" | "nvidia_cuda" | "amd_rocm"
+#                           (omit for any GPU)
+#     min_vram_gb         — minimum VRAM to load
+#     cpu_runnable        — whether this can run on CPU alone (slow)
+#     license             — SPDX-ish short form
 
-schema_version = "1"
-updated = "2026-04-13"
+schema_version = "2"
+updated = "2026-04-18"
 
 # ---------------------------------------------------------------------------
 # Gemma 4 — gated (Gemma terms)
@@ -32,6 +50,17 @@ tier = 2
 description = "Gemma 4 31B instruction-tuned. Strong general reasoning."
 gated = true
 preferred_workloads = ["chat", "reasoning"]
+tasks = ["text-generation"]
+input_modalities = ["text"]
+output_modalities = ["text"]
+languages = ["en"]
+upstream_source = "huggingface"
+upstream_id = "google/gemma-4-31b-it"
+quality_tier = "flagship"
+lifecycle_status = "active"
+min_vram_gb = 20
+cpu_runnable = false
+license = "gemma"
 
   [[models.variants]]
   runtime = "llama.cpp"
@@ -58,6 +87,17 @@ tier = 2
 description = "Qwen 3.5 35B A3B (MoE, ~3B active). Venkat's daily-driver on multiple fleet nodes."
 gated = false
 preferred_workloads = ["chat", "code", "reasoning", "tool_calling"]
+tasks = ["text-generation", "code"]
+input_modalities = ["text"]
+output_modalities = ["text"]
+languages = ["en", "zh"]
+upstream_source = "huggingface"
+upstream_id = "Qwen/Qwen3.5-35B-A3B-Instruct"
+quality_tier = "flagship"
+lifecycle_status = "active"
+min_vram_gb = 22
+cpu_runnable = false
+license = "apache-2.0"
 
   [[models.variants]]
   runtime = "llama.cpp"
@@ -80,6 +120,17 @@ tier = 1
 description = "Qwen 3.5 9B — small fast workhorse."
 gated = false
 preferred_workloads = ["chat", "tool_calling"]
+tasks = ["text-generation"]
+input_modalities = ["text"]
+output_modalities = ["text"]
+languages = ["en", "zh"]
+upstream_source = "huggingface"
+upstream_id = "Qwen/Qwen3.5-9B-Instruct"
+quality_tier = "flagship"
+lifecycle_status = "active"
+min_vram_gb = 6
+cpu_runnable = true
+license = "apache-2.0"
 
   [[models.variants]]
   runtime = "llama.cpp"
@@ -102,6 +153,17 @@ tier = 4
 description = "Qwen 3.5 397B — frontier-class. Leader-only due to size."
 gated = false
 preferred_workloads = ["reasoning", "long_context"]
+tasks = ["text-generation"]
+input_modalities = ["text"]
+output_modalities = ["text"]
+languages = ["en", "zh"]
+upstream_source = "huggingface"
+upstream_id = "Qwen/Qwen3.5-397B"
+quality_tier = "flagship"
+lifecycle_status = "active"
+min_vram_gb = 240
+cpu_runnable = false
+license = "apache-2.0"
 
   [[models.variants]]
   runtime = "llama.cpp"
@@ -122,6 +184,17 @@ tier = 2
 description = "Qwen3 MoE coding model (3B active params) — fleet default for code tasks."
 gated = false
 preferred_workloads = ["code", "tool_calling", "reasoning"]
+tasks = ["text-generation", "code"]
+input_modalities = ["text"]
+output_modalities = ["text"]
+languages = ["en", "zh"]
+upstream_source = "huggingface"
+upstream_id = "Qwen/Qwen3-Coder-30B-A3B-Instruct"
+quality_tier = "flagship"
+lifecycle_status = "active"
+min_vram_gb = 20
+cpu_runnable = false
+license = "apache-2.0"
 
   [[models.variants]]
   runtime = "llama.cpp"
@@ -150,6 +223,17 @@ tier = 2
 description = "Qwen3 general-purpose MoE instruct model with 3B active parameters."
 gated = false
 preferred_workloads = ["chat", "reasoning", "tool_calling"]
+tasks = ["text-generation"]
+input_modalities = ["text"]
+output_modalities = ["text"]
+languages = ["en", "zh"]
+upstream_source = "huggingface"
+upstream_id = "Qwen/Qwen3-35B-A3B-Instruct"
+quality_tier = "flagship"
+lifecycle_status = "active"
+min_vram_gb = 22
+cpu_runnable = false
+license = "apache-2.0"
 
   [[models.variants]]
   runtime = "llama.cpp"
@@ -172,6 +256,17 @@ tier = 4
 description = "Qwen3 235B MoE (~22B active)."
 gated = false
 preferred_workloads = ["reasoning", "code", "long_context"]
+tasks = ["text-generation", "code"]
+input_modalities = ["text"]
+output_modalities = ["text"]
+languages = ["en", "zh"]
+upstream_source = "huggingface"
+upstream_id = "Qwen/Qwen3-235B-A22B-Instruct"
+quality_tier = "flagship"
+lifecycle_status = "active"
+min_vram_gb = 145
+cpu_runnable = false
+license = "apache-2.0"
 
   [[models.variants]]
   runtime = "llama.cpp"
@@ -188,6 +283,17 @@ tier = 3
 description = "Qwen3 70B dense."
 gated = false
 preferred_workloads = ["chat", "reasoning", "tool_calling"]
+tasks = ["text-generation"]
+input_modalities = ["text"]
+output_modalities = ["text"]
+languages = ["en", "zh"]
+upstream_source = "huggingface"
+upstream_id = "Qwen/Qwen3-70B-Instruct"
+quality_tier = "flagship"
+lifecycle_status = "active"
+min_vram_gb = 45
+cpu_runnable = false
+license = "apache-2.0"
 
   [[models.variants]]
   runtime = "llama.cpp"
@@ -204,6 +310,17 @@ tier = 3
 description = "Flagship dense Qwen3 instruct model for top-tier reasoning and chat."
 gated = false
 preferred_workloads = ["chat", "reasoning", "tool_calling"]
+tasks = ["text-generation"]
+input_modalities = ["text"]
+output_modalities = ["text"]
+languages = ["en", "zh"]
+upstream_source = "huggingface"
+upstream_id = "Qwen/Qwen3-72B-Instruct"
+quality_tier = "flagship"
+lifecycle_status = "active"
+min_vram_gb = 45
+cpu_runnable = false
+license = "apache-2.0"
 
   [[models.variants]]
   runtime = "llama.cpp"
@@ -232,6 +349,17 @@ tier = 2
 description = "Mid-size dense Qwen3 model — good balance of quality and speed."
 gated = false
 preferred_workloads = ["chat", "reasoning", "tool_calling"]
+tasks = ["text-generation"]
+input_modalities = ["text"]
+output_modalities = ["text"]
+languages = ["en", "zh"]
+upstream_source = "huggingface"
+upstream_id = "Qwen/Qwen3-14B-Instruct"
+quality_tier = "flagship"
+lifecycle_status = "active"
+min_vram_gb = 10
+cpu_runnable = true
+license = "apache-2.0"
 
   [[models.variants]]
   runtime = "llama.cpp"
@@ -254,6 +382,17 @@ tier = 1
 description = "Fast small Qwen3 for lightweight nodes and quick drafting."
 gated = false
 preferred_workloads = ["chat", "tool_calling"]
+tasks = ["text-generation"]
+input_modalities = ["text"]
+output_modalities = ["text"]
+languages = ["en", "zh"]
+upstream_source = "huggingface"
+upstream_id = "Qwen/Qwen3-7B-Instruct"
+quality_tier = "flagship"
+lifecycle_status = "active"
+min_vram_gb = 6
+cpu_runnable = true
+license = "apache-2.0"
 
   [[models.variants]]
   runtime = "llama.cpp"
@@ -276,6 +415,17 @@ tier = 1
 description = "Multimodal Qwen3 handling text, audio, vision, and video inputs."
 gated = false
 preferred_workloads = ["omni", "vision", "chat"]
+tasks = ["any-to-any", "image-text-to-text", "audio-text-to-text", "video-text-to-text"]
+input_modalities = ["text", "image", "audio", "video"]
+output_modalities = ["text"]
+languages = ["en", "zh"]
+upstream_source = "huggingface"
+upstream_id = "Qwen/Qwen3-Omni-7B"
+quality_tier = "flagship"
+lifecycle_status = "active"
+min_vram_gb = 8
+cpu_runnable = false
+license = "apache-2.0"
 
   [[models.variants]]
   runtime = "llama.cpp"
@@ -302,6 +452,17 @@ tier = 2
 description = "Battle-tested coder model — current workhorse on Marcus/Sophie/Priya."
 gated = false
 preferred_workloads = ["code", "tool_calling"]
+tasks = ["text-generation", "code"]
+input_modalities = ["text"]
+output_modalities = ["text"]
+languages = ["en", "zh"]
+upstream_source = "huggingface"
+upstream_id = "Qwen/Qwen2.5-Coder-32B-Instruct"
+quality_tier = "standard"
+lifecycle_status = "active"
+min_vram_gb = 22
+cpu_runnable = false
+license = "apache-2.0"
 
   [[models.variants]]
   runtime = "llama.cpp"
@@ -330,6 +491,17 @@ tier = 3
 description = "Qwen2.5 flagship — currently running on James for deep reasoning."
 gated = false
 preferred_workloads = ["chat", "reasoning", "tool_calling"]
+tasks = ["text-generation"]
+input_modalities = ["text"]
+output_modalities = ["text"]
+languages = ["en", "zh"]
+upstream_source = "huggingface"
+upstream_id = "Qwen/Qwen2.5-72B-Instruct"
+quality_tier = "standard"
+lifecycle_status = "active"
+min_vram_gb = 45
+cpu_runnable = false
+license = "qwen"
 
   [[models.variants]]
   runtime = "llama.cpp"
@@ -358,6 +530,17 @@ tier = 1
 description = "Small coder model for lightweight autocomplete and fast iterations."
 gated = false
 preferred_workloads = ["code", "tool_calling"]
+tasks = ["text-generation", "code"]
+input_modalities = ["text"]
+output_modalities = ["text"]
+languages = ["en", "zh"]
+upstream_source = "huggingface"
+upstream_id = "Qwen/Qwen2.5-Coder-7B-Instruct"
+quality_tier = "standard"
+lifecycle_status = "active"
+min_vram_gb = 6
+cpu_runnable = true
+license = "apache-2.0"
 
   [[models.variants]]
   runtime = "llama.cpp"
@@ -380,6 +563,17 @@ tier = 1
 description = "Qwen2.5 vision-language model with strong OCR and chart understanding."
 gated = false
 preferred_workloads = ["vision", "chat"]
+tasks = ["image-text-to-text", "visual-question-answering"]
+input_modalities = ["text", "image"]
+output_modalities = ["text"]
+languages = ["en", "zh"]
+upstream_source = "huggingface"
+upstream_id = "Qwen/Qwen2.5-VL-7B-Instruct"
+quality_tier = "standard"
+lifecycle_status = "active"
+min_vram_gb = 8
+cpu_runnable = false
+license = "apache-2.0"
 
   [[models.variants]]
   runtime = "llama.cpp"
@@ -402,6 +596,17 @@ tier = 3
 description = "Large vision-language model for complex multi-image and video reasoning."
 gated = false
 preferred_workloads = ["vision", "reasoning"]
+tasks = ["image-text-to-text", "visual-question-answering", "video-text-to-text"]
+input_modalities = ["text", "image", "video"]
+output_modalities = ["text"]
+languages = ["en", "zh"]
+upstream_source = "huggingface"
+upstream_id = "Qwen/Qwen2.5-VL-72B-Instruct"
+quality_tier = "flagship"
+lifecycle_status = "active"
+min_vram_gb = 45
+cpu_runnable = false
+license = "qwen"
 
   [[models.variants]]
   runtime = "llama.cpp"
@@ -428,6 +633,17 @@ tier = 2
 description = "Google's flagship open Gemma 3 model with long-context and multimodal support."
 gated = true
 preferred_workloads = ["chat", "reasoning", "vision"]
+tasks = ["text-generation", "image-text-to-text"]
+input_modalities = ["text", "image"]
+output_modalities = ["text"]
+languages = ["en"]
+upstream_source = "huggingface"
+upstream_id = "google/gemma-3-27b-it"
+quality_tier = "standard"
+lifecycle_status = "active"
+min_vram_gb = 18
+cpu_runnable = false
+license = "gemma"
 
   [[models.variants]]
   runtime = "llama.cpp"
@@ -456,6 +672,17 @@ tier = 1
 description = "Mid-small Gemma 3 — efficient chat model with vision input."
 gated = true
 preferred_workloads = ["chat", "vision"]
+tasks = ["text-generation", "image-text-to-text"]
+input_modalities = ["text", "image"]
+output_modalities = ["text"]
+languages = ["en"]
+upstream_source = "huggingface"
+upstream_id = "google/gemma-3-9b-it"
+quality_tier = "standard"
+lifecycle_status = "active"
+min_vram_gb = 7
+cpu_runnable = true
+license = "gemma"
 
   [[models.variants]]
   runtime = "llama.cpp"
@@ -482,6 +709,17 @@ tier = 3
 description = "Meta's flagship open Llama 3.1 instruct with strong general reasoning."
 gated = true
 preferred_workloads = ["chat", "reasoning", "tool_calling"]
+tasks = ["text-generation"]
+input_modalities = ["text"]
+output_modalities = ["text"]
+languages = ["en", "es", "fr", "de", "it", "pt", "hi", "th"]
+upstream_source = "huggingface"
+upstream_id = "meta-llama/Meta-Llama-3.1-70B-Instruct"
+quality_tier = "standard"
+lifecycle_status = "active"
+min_vram_gb = 45
+cpu_runnable = false
+license = "llama-3.1-community"
 
   [[models.variants]]
   runtime = "llama.cpp"
@@ -510,6 +748,17 @@ tier = 1
 description = "Lightweight Llama 3.1 — good baseline for small-node chat workloads."
 gated = true
 preferred_workloads = ["chat", "tool_calling"]
+tasks = ["text-generation"]
+input_modalities = ["text"]
+output_modalities = ["text"]
+languages = ["en", "es", "fr", "de", "it", "pt", "hi", "th"]
+upstream_source = "huggingface"
+upstream_id = "meta-llama/Meta-Llama-3.1-8B-Instruct"
+quality_tier = "standard"
+lifecycle_status = "active"
+min_vram_gb = 6
+cpu_runnable = true
+license = "llama-3.1-community"
 
   [[models.variants]]
   runtime = "llama.cpp"
@@ -538,6 +787,17 @@ tier = 2
 description = "Llama 3.2 vision-enabled model for image+text reasoning."
 gated = true
 preferred_workloads = ["vision", "chat"]
+tasks = ["image-text-to-text", "visual-question-answering"]
+input_modalities = ["text", "image"]
+output_modalities = ["text"]
+languages = ["en"]
+upstream_source = "huggingface"
+upstream_id = "meta-llama/Llama-3.2-11B-Vision-Instruct"
+quality_tier = "standard"
+lifecycle_status = "active"
+min_vram_gb = 10
+cpu_runnable = false
+license = "llama-3.2-community"
 
   [[models.variants]]
   runtime = "llama.cpp"
@@ -564,6 +824,17 @@ tier = 4
 description = "DeepSeek V3 MoE (37B active) — frontier-class reasoning, needs the leader node."
 gated = false
 preferred_workloads = ["reasoning", "chat", "code"]
+tasks = ["text-generation", "code"]
+input_modalities = ["text"]
+output_modalities = ["text"]
+languages = ["en", "zh"]
+upstream_source = "huggingface"
+upstream_id = "deepseek-ai/DeepSeek-V3"
+quality_tier = "flagship"
+lifecycle_status = "active"
+min_vram_gb = 400
+cpu_runnable = false
+license = "deepseek"
 
   [[models.variants]]
   runtime = "llama.cpp"
@@ -586,6 +857,17 @@ tier = 4
 description = "DeepSeek Coder V2 MoE (21B active) — top-tier open coder for hard refactors."
 gated = false
 preferred_workloads = ["code", "reasoning"]
+tasks = ["text-generation", "code"]
+input_modalities = ["text"]
+output_modalities = ["text"]
+languages = ["en", "zh"]
+upstream_source = "huggingface"
+upstream_id = "deepseek-ai/DeepSeek-Coder-V2-Instruct"
+quality_tier = "standard"
+lifecycle_status = "active"
+min_vram_gb = 150
+cpu_runnable = false
+license = "deepseek"
 
   [[models.variants]]
   runtime = "llama.cpp"
@@ -608,6 +890,17 @@ tier = 2
 description = "Lite variant of DeepSeek Coder V2 (2.4B active) — fits on smaller nodes."
 gated = false
 preferred_workloads = ["code", "tool_calling"]
+tasks = ["text-generation", "code"]
+input_modalities = ["text"]
+output_modalities = ["text"]
+languages = ["en", "zh"]
+upstream_source = "huggingface"
+upstream_id = "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"
+quality_tier = "standard"
+lifecycle_status = "active"
+min_vram_gb = 12
+cpu_runnable = true
+license = "deepseek"
 
   [[models.variants]]
   runtime = "llama.cpp"
@@ -634,6 +927,17 @@ tier = 3
 description = "Mistral Large 2 — strong multilingual reasoning and tool use."
 gated = false
 preferred_workloads = ["chat", "reasoning", "tool_calling"]
+tasks = ["text-generation"]
+input_modalities = ["text"]
+output_modalities = ["text"]
+languages = ["en", "fr", "de", "es", "it", "pt", "ja", "ko", "zh"]
+upstream_source = "huggingface"
+upstream_id = "mistralai/Mistral-Large-Instruct-2411"
+quality_tier = "standard"
+lifecycle_status = "active"
+min_vram_gb = 75
+cpu_runnable = false
+license = "mrl"
 
   [[models.variants]]
   runtime = "llama.cpp"
@@ -656,6 +960,17 @@ tier = 2
 description = "Mistral Small 3 — fast 24B dense model with latency-optimized tool calling."
 gated = false
 preferred_workloads = ["chat", "tool_calling", "code"]
+tasks = ["text-generation", "code"]
+input_modalities = ["text"]
+output_modalities = ["text"]
+languages = ["en", "fr", "de", "es", "it", "pt"]
+upstream_source = "huggingface"
+upstream_id = "mistralai/Mistral-Small-3-Instruct-2501"
+quality_tier = "standard"
+lifecycle_status = "active"
+min_vram_gb = 16
+cpu_runnable = false
+license = "apache-2.0"
 
   [[models.variants]]
   runtime = "llama.cpp"
@@ -678,6 +993,17 @@ tier = 1
 description = "Mistral Nemo — 12B dense with 128k context, built with NVIDIA."
 gated = false
 preferred_workloads = ["chat", "tool_calling"]
+tasks = ["text-generation"]
+input_modalities = ["text"]
+output_modalities = ["text"]
+languages = ["en", "fr", "de", "es", "it", "pt"]
+upstream_source = "huggingface"
+upstream_id = "mistralai/Mistral-Nemo-Instruct-2407"
+quality_tier = "standard"
+lifecycle_status = "active"
+min_vram_gb = 9
+cpu_runnable = true
+license = "apache-2.0"
 
   [[models.variants]]
   runtime = "llama.cpp"
@@ -704,6 +1030,17 @@ tier = 2
 description = "Microsoft Phi-4 — strong reasoning for its size, great on mid-tier nodes."
 gated = false
 preferred_workloads = ["reasoning", "chat", "code"]
+tasks = ["text-generation", "code"]
+input_modalities = ["text"]
+output_modalities = ["text"]
+languages = ["en"]
+upstream_source = "huggingface"
+upstream_id = "microsoft/phi-4"
+quality_tier = "standard"
+lifecycle_status = "active"
+min_vram_gb = 10
+cpu_runnable = true
+license = "mit"
 
   [[models.variants]]
   runtime = "llama.cpp"
@@ -732,6 +1069,17 @@ tier = 1
 description = "Tiny Phi-4 — fits anywhere, good for edge nodes and fast drafts."
 gated = false
 preferred_workloads = ["chat", "tool_calling"]
+tasks = ["text-generation"]
+input_modalities = ["text"]
+output_modalities = ["text"]
+languages = ["en"]
+upstream_source = "huggingface"
+upstream_id = "microsoft/Phi-4-mini-instruct"
+quality_tier = "standard"
+lifecycle_status = "active"
+min_vram_gb = 3
+cpu_runnable = true
+license = "mit"
 
   [[models.variants]]
   runtime = "llama.cpp"
@@ -758,6 +1106,17 @@ tier = 2
 description = "LLaVA 1.6 on Yi-34B base — popular open vision-language model."
 gated = false
 preferred_workloads = ["vision", "chat"]
+tasks = ["image-text-to-text", "visual-question-answering"]
+input_modalities = ["text", "image"]
+output_modalities = ["text"]
+languages = ["en"]
+upstream_source = "huggingface"
+upstream_id = "liuhaotian/llava-v1.6-34b"
+quality_tier = "legacy"
+lifecycle_status = "deprecated"
+min_vram_gb = 22
+cpu_runnable = false
+license = "apache-2.0"
 
   [[models.variants]]
   runtime = "llama.cpp"
@@ -780,6 +1139,17 @@ tier = 1
 description = "Compact LLaVA on Mistral 7B — lightweight multimodal for small nodes."
 gated = false
 preferred_workloads = ["vision", "chat"]
+tasks = ["image-text-to-text", "visual-question-answering"]
+input_modalities = ["text", "image"]
+output_modalities = ["text"]
+languages = ["en"]
+upstream_source = "huggingface"
+upstream_id = "liuhaotian/llava-v1.6-mistral-7b"
+quality_tier = "legacy"
+lifecycle_status = "deprecated"
+min_vram_gb = 6
+cpu_runnable = true
+license = "apache-2.0"
 
   [[models.variants]]
   runtime = "llama.cpp"
@@ -806,6 +1176,17 @@ tier = 1
 description = "OpenMOSS audio-input multimodal LLM with chain-of-thought. Speech+text reasoning."
 gated = false
 preferred_workloads = ["audio", "reasoning", "multimodal"]
+tasks = ["audio-text-to-text", "automatic-speech-recognition"]
+input_modalities = ["audio", "text"]
+output_modalities = ["text"]
+languages = ["en", "zh"]
+upstream_source = "huggingface"
+upstream_id = "OpenMOSS-Team/MOSS-Audio-8B-Thinking"
+quality_tier = "experimental"
+lifecycle_status = "candidate"
+min_vram_gb = 18
+cpu_runnable = false
+license = "apache-2.0"
 
   # Only vllm/safetensors variant known today. MLX conversion must be
   # produced locally via `ff model convert` if Taylor wants to run it with mlx.
@@ -814,3 +1195,442 @@ preferred_workloads = ["audio", "reasoning", "multimodal"]
   quant = "fp16"
   hf_repo = "OpenMOSS-Team/MOSS-Audio-8B-Thinking"
   size_gb = 16
+
+# ===========================================================================
+# NEW ENTRIES (2026-04-18) — Swiss-knife coverage of HF task taxonomy
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Qwen 2.5 72B (explicit flagship text-generation entry per taxonomy sync)
+# ---------------------------------------------------------------------------
+
+[[models]]
+id = "qwen25-72b-taxonomy"
+name = "Qwen2.5-72B (taxonomy alias)"
+family = "qwen"
+parameters = "72B"
+tier = 3
+description = "Alias registration of Qwen2.5-72B under taxonomy id per 2026-04-18 spec."
+gated = false
+preferred_workloads = ["chat", "reasoning", "tool_calling"]
+tasks = ["text-generation"]
+input_modalities = ["text"]
+output_modalities = ["text"]
+languages = ["en", "zh"]
+upstream_source = "huggingface"
+upstream_id = "Qwen/Qwen2.5-72B-Instruct"
+quality_tier = "standard"
+lifecycle_status = "active"
+min_vram_gb = 45
+cpu_runnable = false
+license = "qwen"
+
+  [[models.variants]]
+  runtime = "llama.cpp"
+  quant = "Q4_K_M"
+  hf_repo = "Qwen/Qwen2.5-72B-Instruct-GGUF"
+  size_gb = 41.0
+  context_window = 131072
+
+# ---------------------------------------------------------------------------
+# Llama 3.3 70B Instruct — Meta's refreshed 70B flagship
+# ---------------------------------------------------------------------------
+
+[[models]]
+id = "llama-3.3-70b-instruct"
+name = "Llama 3.3 70B Instruct"
+family = "llama"
+parameters = "70B"
+tier = 3
+description = "Meta's Llama 3.3 70B — refreshed instruct flagship with improved tool use and multilingual coverage."
+gated = true
+preferred_workloads = ["chat", "reasoning", "tool_calling"]
+tasks = ["text-generation"]
+input_modalities = ["text"]
+output_modalities = ["text"]
+languages = ["en", "es", "fr", "de", "it", "pt", "hi", "th"]
+upstream_source = "huggingface"
+upstream_id = "meta-llama/Llama-3.3-70B-Instruct"
+quality_tier = "flagship"
+lifecycle_status = "active"
+min_vram_gb = 45
+cpu_runnable = false
+license = "llama-3.3-community"
+
+  [[models.variants]]
+  runtime = "llama.cpp"
+  quant = "Q4_K_M"
+  hf_repo = "bartowski/Llama-3.3-70B-Instruct-GGUF"
+  size_gb = 40.0
+  context_window = 131072
+
+  [[models.variants]]
+  runtime = "mlx"
+  quant = "4bit"
+  hf_repo = "mlx-community/Llama-3.3-70B-Instruct-4bit"
+  size_gb = 40.0
+  context_window = 131072
+
+  [[models.variants]]
+  runtime = "vllm"
+  quant = "fp16"
+  hf_repo = "meta-llama/Llama-3.3-70B-Instruct"
+  size_gb = 141.0
+  context_window = 131072
+
+# ---------------------------------------------------------------------------
+# Automatic Speech Recognition — Whisper Large v3
+# ---------------------------------------------------------------------------
+
+[[models]]
+id = "whisper-large-v3"
+name = "Whisper Large v3"
+family = "whisper"
+parameters = "1.55B"
+tier = 1
+description = "OpenAI Whisper Large v3 — best-in-class open ASR for 99 languages."
+gated = false
+preferred_workloads = ["asr", "transcription"]
+tasks = ["automatic-speech-recognition"]
+input_modalities = ["audio"]
+output_modalities = ["text"]
+languages = ["multilingual"]
+upstream_source = "huggingface"
+upstream_id = "openai/whisper-large-v3"
+quality_tier = "flagship"
+lifecycle_status = "active"
+min_vram_gb = 4
+cpu_runnable = true
+license = "apache-2.0"
+
+  [[models.variants]]
+  runtime = "whisper.cpp"
+  quant = "Q5_0"
+  hf_repo = "ggerganov/whisper.cpp"
+  size_gb = 1.1
+  context_window = 30
+
+  [[models.variants]]
+  runtime = "mlx"
+  quant = "4bit"
+  hf_repo = "mlx-community/whisper-large-v3-mlx"
+  size_gb = 1.5
+  context_window = 30
+
+  [[models.variants]]
+  runtime = "vllm"
+  quant = "fp16"
+  hf_repo = "openai/whisper-large-v3"
+  size_gb = 3.1
+  context_window = 30
+
+# ---------------------------------------------------------------------------
+# Text-to-Speech — Kokoro 82M
+# ---------------------------------------------------------------------------
+
+[[models]]
+id = "kokoro-82m"
+name = "Kokoro 82M"
+family = "kokoro"
+parameters = "82M"
+tier = 1
+description = "Hexgrad Kokoro-82M — tiny high-quality English TTS model, runs on CPU."
+gated = false
+preferred_workloads = ["tts", "speech_synthesis"]
+tasks = ["text-to-speech"]
+input_modalities = ["text"]
+output_modalities = ["audio"]
+languages = ["en"]
+upstream_source = "huggingface"
+upstream_id = "hexgrad/Kokoro-82M"
+quality_tier = "flagship"
+lifecycle_status = "active"
+min_vram_gb = 1
+cpu_runnable = true
+license = "apache-2.0"
+
+  [[models.variants]]
+  runtime = "pytorch"
+  quant = "fp16"
+  hf_repo = "hexgrad/Kokoro-82M"
+  size_gb = 0.35
+  context_window = 2048
+
+# ---------------------------------------------------------------------------
+# Embeddings
+# ---------------------------------------------------------------------------
+
+[[models]]
+id = "bge-large-en-v1.5"
+name = "BGE Large EN v1.5"
+family = "bge"
+parameters = "335M"
+tier = 1
+description = "BAAI bge-large-en-v1.5 — solid English sentence embedding model (1024-dim)."
+gated = false
+preferred_workloads = ["embeddings", "retrieval"]
+tasks = ["feature-extraction", "sentence-similarity"]
+input_modalities = ["text"]
+output_modalities = ["text"]
+languages = ["en"]
+upstream_source = "huggingface"
+upstream_id = "BAAI/bge-large-en-v1.5"
+quality_tier = "standard"
+lifecycle_status = "active"
+min_vram_gb = 1
+cpu_runnable = true
+license = "mit"
+
+  [[models.variants]]
+  runtime = "pytorch"
+  quant = "fp16"
+  hf_repo = "BAAI/bge-large-en-v1.5"
+  size_gb = 1.3
+  context_window = 512
+
+  [[models.variants]]
+  runtime = "llama.cpp"
+  quant = "Q8_0"
+  hf_repo = "CompendiumLabs/bge-large-en-v1.5-gguf"
+  size_gb = 0.4
+  context_window = 512
+
+[[models]]
+id = "qwen3-embedding-8b"
+name = "Qwen3-Embedding-8B"
+family = "qwen"
+parameters = "8B"
+tier = 1
+description = "Qwen3 8B embedding model — strong multilingual retrieval (4096-dim)."
+gated = false
+preferred_workloads = ["embeddings", "retrieval", "multilingual"]
+tasks = ["feature-extraction", "sentence-similarity"]
+input_modalities = ["text"]
+output_modalities = ["text"]
+languages = ["en", "zh", "es", "fr", "de", "ja", "ko"]
+upstream_source = "huggingface"
+upstream_id = "Qwen/Qwen3-Embedding-8B"
+quality_tier = "flagship"
+lifecycle_status = "active"
+min_vram_gb = 8
+cpu_runnable = true
+license = "apache-2.0"
+
+  [[models.variants]]
+  runtime = "pytorch"
+  quant = "fp16"
+  hf_repo = "Qwen/Qwen3-Embedding-8B"
+  size_gb = 16.0
+  context_window = 32768
+
+  [[models.variants]]
+  runtime = "llama.cpp"
+  quant = "Q4_K_M"
+  hf_repo = "Qwen/Qwen3-Embedding-8B-GGUF"
+  size_gb = 5.0
+  context_window = 32768
+
+# ---------------------------------------------------------------------------
+# Reranking
+# ---------------------------------------------------------------------------
+
+[[models]]
+id = "bge-reranker-large"
+name = "BGE Reranker Large"
+family = "bge"
+parameters = "560M"
+tier = 1
+description = "BAAI bge-reranker-large — cross-encoder reranker for high-precision retrieval."
+gated = false
+preferred_workloads = ["reranking", "retrieval"]
+tasks = ["text-ranking", "text-classification"]
+input_modalities = ["text"]
+output_modalities = ["text"]
+languages = ["en", "zh"]
+upstream_source = "huggingface"
+upstream_id = "BAAI/bge-reranker-large"
+quality_tier = "standard"
+lifecycle_status = "active"
+min_vram_gb = 2
+cpu_runnable = true
+license = "mit"
+
+  [[models.variants]]
+  runtime = "pytorch"
+  quant = "fp16"
+  hf_repo = "BAAI/bge-reranker-large"
+  size_gb = 2.2
+  context_window = 512
+
+# ---------------------------------------------------------------------------
+# Vision-Language (large)
+# ---------------------------------------------------------------------------
+
+[[models]]
+id = "qwen2.5-vl-72b"
+name = "Qwen2.5-VL-72B-Instruct (taxonomy)"
+family = "qwen"
+parameters = "72B"
+tier = 3
+description = "Qwen2.5-VL 72B — flagship open VL for multi-image/video reasoning and document understanding."
+gated = false
+preferred_workloads = ["vision", "reasoning", "documents"]
+tasks = ["image-text-to-text", "visual-question-answering", "video-text-to-text", "document-question-answering"]
+input_modalities = ["text", "image", "video"]
+output_modalities = ["text"]
+languages = ["en", "zh"]
+upstream_source = "huggingface"
+upstream_id = "Qwen/Qwen2.5-VL-72B-Instruct"
+quality_tier = "flagship"
+lifecycle_status = "active"
+min_vram_gb = 45
+cpu_runnable = false
+license = "qwen"
+
+  [[models.variants]]
+  runtime = "llama.cpp"
+  quant = "Q4_K_M"
+  hf_repo = "bartowski/Qwen2.5-VL-72B-Instruct-GGUF"
+  size_gb = 41.0
+  context_window = 131072
+
+  [[models.variants]]
+  runtime = "mlx"
+  quant = "4bit"
+  hf_repo = "mlx-community/Qwen2.5-VL-72B-Instruct-4bit"
+  size_gb = 41.0
+  context_window = 131072
+
+  [[models.variants]]
+  runtime = "vllm"
+  quant = "fp16"
+  hf_repo = "Qwen/Qwen2.5-VL-72B-Instruct"
+  size_gb = 145.0
+  context_window = 131072
+
+[[models]]
+id = "llama-3.2-vision-90b"
+name = "Llama 3.2 90B Vision Instruct"
+family = "llama"
+parameters = "90B"
+tier = 3
+description = "Meta's Llama 3.2 90B Vision — large-scale VL for document/chart/image reasoning."
+gated = true
+preferred_workloads = ["vision", "reasoning"]
+tasks = ["image-text-to-text", "visual-question-answering"]
+input_modalities = ["text", "image"]
+output_modalities = ["text"]
+languages = ["en"]
+upstream_source = "huggingface"
+upstream_id = "meta-llama/Llama-3.2-90B-Vision-Instruct"
+quality_tier = "flagship"
+lifecycle_status = "active"
+min_vram_gb = 55
+cpu_runnable = false
+license = "llama-3.2-community"
+
+  [[models.variants]]
+  runtime = "llama.cpp"
+  quant = "Q4_K_M"
+  hf_repo = "bartowski/Llama-3.2-90B-Vision-Instruct-GGUF"
+  size_gb = 52.0
+  context_window = 131072
+
+  [[models.variants]]
+  runtime = "mlx"
+  quant = "4bit"
+  hf_repo = "mlx-community/Llama-3.2-90B-Vision-Instruct-4bit"
+  size_gb = 52.0
+  context_window = 131072
+
+  [[models.variants]]
+  runtime = "vllm"
+  quant = "fp16"
+  hf_repo = "meta-llama/Llama-3.2-90B-Vision-Instruct"
+  size_gb = 180.0
+  context_window = 131072
+
+# ---------------------------------------------------------------------------
+# Image Generation — Stable Diffusion 3.5 Large
+# ---------------------------------------------------------------------------
+
+[[models]]
+id = "stable-diffusion-3.5-large"
+name = "Stable Diffusion 3.5 Large"
+family = "stable-diffusion"
+parameters = "8.1B"
+tier = 2
+description = "Stability AI SD 3.5 Large — high-quality text-to-image diffusion model."
+gated = true
+preferred_workloads = ["image_generation", "creative"]
+tasks = ["text-to-image"]
+input_modalities = ["text"]
+output_modalities = ["image"]
+languages = ["en"]
+upstream_source = "huggingface"
+upstream_id = "stabilityai/stable-diffusion-3.5-large"
+quality_tier = "flagship"
+lifecycle_status = "active"
+min_vram_gb = 12
+cpu_runnable = false
+license = "stability-community"
+
+  [[models.variants]]
+  runtime = "diffusers"
+  quant = "fp16"
+  hf_repo = "stabilityai/stable-diffusion-3.5-large"
+  size_gb = 17.0
+  context_window = 256
+
+  [[models.variants]]
+  runtime = "mlx"
+  quant = "4bit"
+  hf_repo = "mlx-community/stable-diffusion-3.5-large-4bit"
+  size_gb = 5.0
+  context_window = 256
+
+# ---------------------------------------------------------------------------
+# Document QA — Qwen2-VL-7B (fit-anywhere VL)
+# ---------------------------------------------------------------------------
+
+[[models]]
+id = "qwen2-vl-7b"
+name = "Qwen2-VL-7B-Instruct"
+family = "qwen"
+parameters = "7B"
+tier = 1
+description = "Qwen2-VL 7B — compact VL that fits anywhere; solid document QA and OCR."
+gated = false
+preferred_workloads = ["vision", "documents", "chat"]
+tasks = ["document-question-answering", "image-text-to-text", "visual-question-answering"]
+input_modalities = ["text", "image"]
+output_modalities = ["text"]
+languages = ["en", "zh"]
+upstream_source = "huggingface"
+upstream_id = "Qwen/Qwen2-VL-7B-Instruct"
+quality_tier = "standard"
+lifecycle_status = "active"
+min_vram_gb = 8
+cpu_runnable = false
+license = "apache-2.0"
+
+  [[models.variants]]
+  runtime = "llama.cpp"
+  quant = "Q4_K_M"
+  hf_repo = "bartowski/Qwen2-VL-7B-Instruct-GGUF"
+  size_gb = 5.0
+  context_window = 32768
+
+  [[models.variants]]
+  runtime = "mlx"
+  quant = "4bit"
+  hf_repo = "mlx-community/Qwen2-VL-7B-Instruct-4bit"
+  size_gb = 5.0
+  context_window = 32768
+
+  [[models.variants]]
+  runtime = "vllm"
+  quant = "fp16"
+  hf_repo = "Qwen/Qwen2-VL-7B-Instruct"
+  size_gb = 16.0
+  context_window = 32768

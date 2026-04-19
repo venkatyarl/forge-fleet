@@ -908,6 +908,7 @@ dependencies = [
  "sha2 0.10.9",
  "sqlx",
  "tempfile",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-util",
  "toml",
@@ -1304,6 +1305,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -1535,6 +1537,7 @@ dependencies = [
  "reqwest",
  "rusqlite",
  "serde_json",
+ "sqlx",
  "tempfile",
  "tokio",
  "tokio-postgres",

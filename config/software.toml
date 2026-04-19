@@ -1,0 +1,240 @@
+# ForgeFleet Software Registry Seed
+#
+# This file drives the `software_registry` table. Each [[software]] entry
+# tells ForgeFleet how to check the installed version locally, how to
+# check the upstream latest version, and how to upgrade it per OS +
+# package manager.
+#
+# Schema:
+#   id                    — stable identifier (string, required)
+#   display_name          — human-readable name (string, required)
+#   kind                  — "binary" | "runtime" | "service" | "os"
+#   applies_to_os_family  — "macos" | "linux-ubuntu" | "linux-dgx" | "windows"
+#                           (omit for cross-OS software)
+#   version_source        — inline table describing how to detect installed version
+#   upgrade_playbook      — inline table of shell commands keyed by
+#                           "<os>-<install_source>" | "<os>" | "all"
+#   requires_restart      — bool, default false (service restart after upgrade)
+#   requires_reboot       — bool, default false (OS reboot — only for kind=os)
+
+# ---------------------------------------------------------------------------
+# ForgeFleet's own
+# ---------------------------------------------------------------------------
+
+[[software]]
+id = "ff"
+display_name = "ForgeFleet CLI (ff)"
+kind = "binary"
+version_source = { method = "cmd", args = ["ff", "--version"], regex = "ff (\\S+)" }
+requires_restart = false
+
+[software.upgrade_playbook]
+macos = "cd ~/taylorProjects/forge-fleet && git pull && cargo build --release -p ff && install -m 755 target/release/ff ~/.local/bin/ff && codesign --force --sign - ~/.local/bin/ff"
+linux-ubuntu = "cd ~/taylorProjects/forge-fleet && git pull && cargo build --release -p ff && install -m 755 target/release/ff ~/.local/bin/ff"
+linux-dgx = "cd ~/taylorProjects/forge-fleet && git pull && cargo build --release -p ff && install -m 755 target/release/ff ~/.local/bin/ff"
+
+[[software]]
+id = "forgefleetd"
+display_name = "ForgeFleet Daemon (forgefleetd)"
+kind = "binary"
+version_source = { method = "cmd", args = ["forgefleetd", "--version"], regex = "forgefleetd (\\S+)" }
+requires_restart = true
+
+[software.upgrade_playbook]
+macos = "cd ~/taylorProjects/forge-fleet && git pull && cargo build --release -p forgefleetd && install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && codesign --force --sign - ~/.local/bin/forgefleetd"
+linux-ubuntu = "cd ~/taylorProjects/forge-fleet && git pull && cargo build --release -p forgefleetd && install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd"
+linux-dgx = "cd ~/taylorProjects/forge-fleet && git pull && cargo build --release -p forgefleetd && install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd"
+
+# ---------------------------------------------------------------------------
+# Agent platforms
+# ---------------------------------------------------------------------------
+
+[[software]]
+id = "openclaw"
+display_name = "OpenClaw Agent"
+kind = "binary"
+version_source = { method = "cmd", args = ["openclaw", "--version"], regex = "OpenClaw (\\S+)" }
+requires_restart = true
+
+[software.upgrade_playbook]
+all = "curl -fsSL https://openclaw.ai/install.sh | bash"
+
+# ---------------------------------------------------------------------------
+# Developer tools
+# ---------------------------------------------------------------------------
+
+[[software]]
+id = "gh"
+display_name = "GitHub CLI"
+kind = "binary"
+version_source = { method = "github_release", repo = "cli/cli" }
+requires_restart = false
+
+[software.upgrade_playbook]
+macos = "brew upgrade gh"
+linux-ubuntu = "sudo apt-get update && sudo apt-get -y install --only-upgrade gh"
+linux-dgx = "sudo apt-get update && sudo apt-get -y install --only-upgrade gh"
+
+[[software]]
+id = "op"
+display_name = "1Password CLI"
+kind = "binary"
+version_source = { method = "cmd", args = ["op", "--version"], regex = "(\\S+)" }
+requires_restart = false
+
+[software.upgrade_playbook]
+macos-brew-cask = "brew upgrade --cask 1password-cli"
+linux-ubuntu = "curl -sS https://downloads.1password.com/linux/keys/1password.asc | sudo gpg --dearmor --output /usr/share/keyrings/1password-archive-keyring.gpg && echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/1password-archive-keyring.gpg] https://downloads.1password.com/linux/debian/amd64 stable main' | sudo tee /etc/apt/sources.list.d/1password.list && sudo apt-get update && sudo apt-get -y install --only-upgrade 1password-cli"
+linux-dgx = "sudo apt-get update && sudo apt-get -y install --only-upgrade 1password-cli"
+
+[[software]]
+id = "rustup"
+display_name = "Rustup (Rust toolchain manager)"
+kind = "binary"
+version_source = { method = "cmd", args = ["rustup", "--version"], regex = "rustup (\\S+)" }
+requires_restart = false
+
+[software.upgrade_playbook]
+all = "rustup self update && rustup update stable"
+
+# ---------------------------------------------------------------------------
+# Inference runtimes
+# ---------------------------------------------------------------------------
+
+[[software]]
+id = "llama.cpp"
+display_name = "llama.cpp (llama-server)"
+kind = "runtime"
+version_source = { method = "cmd", args = ["llama-server", "--version"], regex = "version: (\\S+)" }
+requires_restart = true
+
+[software.upgrade_playbook]
+macos = "cd ~/llama.cpp && git pull && cmake --build build --config Release -j"
+linux-ubuntu = "cd ~/llama.cpp && git pull && cmake --build build --config Release -j"
+linux-dgx = "cd ~/llama.cpp && git pull && cmake --build build --config Release -j"
+
+[[software]]
+id = "mlx_lm"
+display_name = "MLX-LM (Apple Silicon inference)"
+kind = "runtime"
+applies_to_os_family = "macos"
+version_source = { method = "pip", package = "mlx-lm" }
+requires_restart = true
+
+[software.upgrade_playbook]
+macos = "pip install -U mlx-lm"
+
+[[software]]
+id = "vllm"
+display_name = "vLLM"
+kind = "runtime"
+version_source = { method = "pip", package = "vllm" }
+requires_restart = true
+
+[software.upgrade_playbook]
+linux-ubuntu = "pip install -U vllm"
+linux-dgx = "pip install -U vllm"
+
+[[software]]
+id = "ollama"
+display_name = "Ollama"
+kind = "runtime"
+version_source = { method = "cmd", args = ["ollama", "--version"], regex = "ollama version is (\\S+)" }
+requires_restart = true
+
+[software.upgrade_playbook]
+macos = "brew upgrade ollama"
+linux-ubuntu = "curl -fsSL https://ollama.com/install.sh | sh"
+linux-dgx = "curl -fsSL https://ollama.com/install.sh | sh"
+
+# ---------------------------------------------------------------------------
+# System runtimes
+# ---------------------------------------------------------------------------
+
+[[software]]
+id = "node"
+display_name = "Node.js 22"
+kind = "runtime"
+version_source = { method = "cmd", args = ["node", "--version"], regex = "v(\\S+)" }
+requires_restart = false
+
+[software.upgrade_playbook]
+macos-brew = "brew upgrade node@22"
+linux-ubuntu = "curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash - && sudo apt-get install -y nodejs"
+linux-dgx = "curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash - && sudo apt-get install -y nodejs"
+
+[[software]]
+id = "python"
+display_name = "Python 3"
+kind = "runtime"
+version_source = { method = "cmd", args = ["python3", "--version"], regex = "Python (\\S+)" }
+requires_restart = false
+
+[software.upgrade_playbook]
+macos-brew = "brew upgrade python@3.12"
+linux-ubuntu = "sudo apt-get update && sudo apt-get -y install --only-upgrade python3"
+linux-dgx = "sudo apt-get update && sudo apt-get -y install --only-upgrade python3"
+
+[[software]]
+id = "docker"
+display_name = "Docker"
+kind = "runtime"
+version_source = { method = "cmd", args = ["docker", "--version"], regex = "Docker version (\\S+?)," }
+requires_restart = true
+
+[software.upgrade_playbook]
+macos-brew-cask = "brew upgrade --cask docker"
+linux-ubuntu = "sudo apt-get update && sudo apt-get -y install --only-upgrade docker.io"
+linux-dgx = "sudo apt-get update && sudo apt-get -y install --only-upgrade docker.io"
+
+# ---------------------------------------------------------------------------
+# Operating systems (one entry per variant)
+# ---------------------------------------------------------------------------
+
+[[software]]
+id = "os-macos"
+display_name = "macOS"
+kind = "os"
+applies_to_os_family = "macos"
+version_source = { method = "sw_vers" }
+requires_restart = true
+requires_reboot = true
+
+[software.upgrade_playbook]
+macos = "sudo softwareupdate -i -a --restart"
+
+[[software]]
+id = "os-ubuntu-22.04"
+display_name = "Ubuntu 22.04 LTS (Jammy)"
+kind = "os"
+applies_to_os_family = "linux-ubuntu"
+version_source = { method = "apt_dist", codename = "jammy" }
+requires_restart = true
+requires_reboot = true
+
+[software.upgrade_playbook]
+linux-ubuntu = "sudo apt-get update && sudo apt-get -y dist-upgrade"
+
+[[software]]
+id = "os-ubuntu-24.04"
+display_name = "Ubuntu 24.04 LTS (Noble)"
+kind = "os"
+applies_to_os_family = "linux-ubuntu"
+version_source = { method = "apt_dist", codename = "noble" }
+requires_restart = true
+requires_reboot = true
+
+[software.upgrade_playbook]
+linux-ubuntu = "sudo apt-get update && sudo apt-get -y dist-upgrade"
+
+[[software]]
+id = "os-dgx"
+display_name = "NVIDIA DGX OS"
+kind = "os"
+applies_to_os_family = "linux-dgx"
+version_source = { method = "cmd", args = ["cat", "/etc/dgx-release"], regex = "DGX_SWBUILD_VERSION=(\\S+)" }
+requires_restart = true
+requires_reboot = true
+
+[software.upgrade_playbook]
+linux-dgx = "sudo apt-get update && sudo apt-get -y install --only-upgrade dgx-release"

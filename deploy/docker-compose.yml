@@ -12,6 +12,7 @@
 #   Postgres:  55432  (connect: psql -h 192.168.5.100 -p 55432 -U forgefleet)
 #   Redis:     6380   (connect: redis-cli -h 192.168.5.100 -p 6380)
 #   Sentinel:  26380  (connect: redis-cli -h 192.168.5.100 -p 26380)
+#   NATS:      4222   (client); 6222 (cluster); 8222 (monitoring, LAN only)
 
 name: forgefleet
 
@@ -104,6 +105,30 @@ services:
     networks:
       - forgefleet
 
+  # ─── NATS JetStream (coordination + event bus + KV store) ─────────────
+  nats:
+    image: nats:2.10-alpine
+    container_name: forgefleet-nats
+    ports:
+      - "4222:4222"       # client connections
+      - "6222:6222"       # cluster (for future 3-node cluster on Marcus+Sophie)
+      - "8222:8222"       # HTTP monitoring (LAN only)
+    volumes:
+      - nats_data:/data
+      - ./docker/nats.conf:/etc/nats/nats.conf:ro
+    command:
+      - "--config"
+      - "/etc/nats/nats.conf"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8222/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+    networks:
+      - forgefleet
+
 volumes:
   postgres_data:
     name: forgefleet-postgres-data
@@ -111,6 +136,8 @@ volumes:
     name: forgefleet-redis-data
   sentinel_data:
     name: forgefleet-sentinel-data
+  nats_data:
+    name: forgefleet-nats-data
 
 networks:
   forgefleet:
