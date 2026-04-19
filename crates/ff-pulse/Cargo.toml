@@ -20,3 +20,4 @@ reqwest = { workspace = true, features = ["json"] }
 futures = { workspace = true }
 tokio-stream = "0.1"
 uuid.workspace = true
+sqlx = { workspace = true }

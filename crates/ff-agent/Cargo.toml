@@ -12,6 +12,7 @@ ff-discovery = { path = "../ff-discovery" }
 ff-db = { path = "../ff-db" }
 ff-pipeline = { path = "../ff-pipeline" }
 ff-orchestrator = { path = "../ff-orchestrator" }
+ff-pulse = { path = "../ff-pulse" }
 ff-security = { path = "../ff-security" }
 
 anyhow.workspace = true

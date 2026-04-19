@@ -14,6 +14,7 @@
 
 pub mod backup;
 pub mod connection;
+pub mod leader_state;
 pub mod migrations;
 pub mod operational_store;
 pub mod queries;
@@ -21,6 +22,8 @@ pub mod replication;
 pub mod runtime_registry;
 pub mod schema;
 pub mod sync;
+
+pub use leader_state::*;
 
 pub use connection::{DbPool, DbPoolConfig};
 pub use sqlx::PgPool;

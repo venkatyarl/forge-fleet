@@ -24,6 +24,7 @@ pub mod inference_router;
 pub mod file_history;
 pub mod fleet_inference;
 pub mod hooks;
+pub mod leader_tick;
 pub mod mcp_client;
 pub mod mcp_tools;
 pub mod memory;
