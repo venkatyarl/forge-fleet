@@ -1673,13 +1673,69 @@ async fn start_pulse_v2_subsystems(
         );
         let pulse_reader = ff_pulse::reader::PulseReader::new(&redis_url)
             .context("pulse v2: failed to build PulseReader for leader_tick")?;
+
+        // Resolve my primary IP from the computers table — OpenClawManager
+        // needs it to publish the gateway URL on promotion.
+        let my_primary_ip: String =
+            sqlx::query_scalar("SELECT primary_ip FROM computers WHERE id = $1")
+                .bind(computer_id)
+                .fetch_one(&pg_pool)
+                .await
+                .unwrap_or_else(|_| "127.0.0.1".to_string());
+
+        // Build the OpenClaw manager that will be driven by leader-election
+        // callbacks (promote_to_gateway on became-leader, demote_to_node on
+        // lost-leader).
+        let openclaw = std::sync::Arc::new(ff_agent::openclaw::OpenClawManager::new(
+            pg_pool.clone(),
+            computer_id,
+            my_primary_ip,
+        ));
+
+        let oc_promote = openclaw.clone();
+        let oc_demote = openclaw.clone();
+        let pool_for_url = pg_pool.clone();
+
+        let on_became: ff_agent::leader_tick::OnBecameLeader = std::sync::Arc::new(move || {
+            let oc = oc_promote.clone();
+            tokio::spawn(async move {
+                if let Err(e) = oc.promote_to_gateway().await {
+                    tracing::error!(error = %e, "openclaw: promote_to_gateway failed");
+                }
+            });
+        });
+
+        let on_lost: ff_agent::leader_tick::OnLostLeader =
+            std::sync::Arc::new(move |_new_leader_name: String| {
+                let oc = oc_demote.clone();
+                let pool = pool_for_url.clone();
+                tokio::spawn(async move {
+                    let url = ff_agent::openclaw::lookup_gateway_url(&pool)
+                        .await
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default();
+                    if url.is_empty() {
+                        tracing::warn!(
+                            "openclaw: lost leader but no gateway URL published yet"
+                        );
+                        return;
+                    }
+                    if let Err(e) = oc.demote_to_node(&url).await {
+                        tracing::error!(error = %e, "openclaw: demote_to_node failed");
+                    }
+                });
+            });
+
         let leader_tick = ff_agent::leader_tick::LeaderTick::new(
             pg_pool,
             pulse_reader,
             computer_id,
             node_name.clone(),
             election_priority,
-        );
+        )
+        .with_on_became_leader(on_became)
+        .with_on_lost_leader(on_lost);
         handles.push(leader_tick.spawn(15, shutdown_rx));
     } else {
         info!(
