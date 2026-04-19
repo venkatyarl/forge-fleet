@@ -44,11 +44,12 @@ impl SoftwareCollector {
                 "python",
                 "docker",
                 // OS is derived at runtime: one of
-                // os-macos / os-ubuntu-22.04 / os-ubuntu-24.04 / os-dgx.
+                // os-macos / os-ubuntu-22.04 / os-ubuntu-24.04 / os-dgx / os-windows.
                 "os-macos",
                 "os-ubuntu-22.04",
                 "os-ubuntu-24.04",
                 "os-dgx",
+                "os-windows",
             ],
         }
     }
@@ -358,14 +359,34 @@ fn classify_ff_source(path: &str) -> String {
 
 /// Classify install_source for a package-manager-installed binary based on
 /// its install path + current OS.
+///
+/// Windows: distinguishes `winget` (paths under `%LOCALAPPDATA%\Microsoft\WinGet\`
+/// or `%ProgramFiles%\WindowsApps\`) from `choco` (paths under
+/// `%ProgramData%\chocolatey\`). Falls through to `None` when unclear.
+/// UNTESTED — gated on a real Windows node joining the fleet.
 fn classify_pkg_source(path: &str) -> Option<String> {
+    // Normalize — on Windows paths come back with backslashes; treat
+    // lowercase substrings to avoid case-sensitivity headaches.
+    let p = path.to_lowercase().replace('\\', "/");
+
     if path.starts_with("/opt/homebrew/bin/") || path.starts_with("/usr/local/bin/") {
-        Some("brew".to_string())
-    } else if std::env::consts::OS == "linux" && path.starts_with("/usr/bin/") {
-        Some("apt".to_string())
-    } else {
-        None
+        return Some("brew".to_string());
     }
+    if std::env::consts::OS == "linux" && path.starts_with("/usr/bin/") {
+        return Some("apt".to_string());
+    }
+    if std::env::consts::OS == "windows" {
+        if p.contains("/chocolatey/") {
+            return Some("choco".to_string());
+        }
+        if p.contains("/winget/") || p.contains("/windowsapps/") {
+            return Some("winget".to_string());
+        }
+        if p.contains("/scoop/") {
+            return Some("scoop".to_string());
+        }
+    }
+    None
 }
 
 /// Derive an `InstalledSoftware` entry for the host OS.
@@ -416,6 +437,36 @@ fn detect_os() -> Option<InstalledSoftware> {
 
             Some(InstalledSoftware {
                 id,
+                version: ver,
+                install_source: Some("system".to_string()),
+                install_path: None,
+            })
+        }
+        "windows" => {
+            // Best-effort probe via PowerShell. UNTESTED — Windows is
+            // future fleet hardware. Two attempts:
+            //   1. `Get-CimInstance Win32_OperatingSystem` — modern + fast.
+            //   2. Registry fallback for stripped-down SKUs.
+            let ver = run(
+                "powershell",
+                &[
+                    "-NoProfile",
+                    "-Command",
+                    "(Get-CimInstance Win32_OperatingSystem).Version",
+                ],
+            )
+            .or_else(|| {
+                run(
+                    "powershell",
+                    &[
+                        "-NoProfile",
+                        "-Command",
+                        "(Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion').DisplayVersion",
+                    ],
+                )
+            })?;
+            Some(InstalledSoftware {
+                id: "os-windows".into(),
                 version: ver,
                 install_source: Some("system".to_string()),
                 install_path: None,

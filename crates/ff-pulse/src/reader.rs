@@ -50,7 +50,8 @@ impl PulseReader {
     }
 
     /// Fetch the latest beat for a single computer. Returns `None` if the
-    /// key is missing (i.e. TTL expired or never published).
+    /// key is missing (i.e. TTL expired or never published) OR if the
+    /// beat fails HMAC verification.
     pub async fn latest_beat(
         &self,
         computer_name: &str,
@@ -59,13 +60,19 @@ impl PulseReader {
         let key = Self::key_for(computer_name);
         let raw: Option<String> = conn.get(&key).await?;
         match raw {
-            Some(s) => Ok(Some(serde_json::from_str(&s)?)),
+            Some(s) => {
+                if !Self::beat_signature_ok(computer_name, &s).await {
+                    return Ok(None);
+                }
+                Ok(Some(serde_json::from_str(&s)?))
+            }
             None => Ok(None),
         }
     }
 
     /// SCAN all `pulse:computer:*` keys and return every parseable beat.
-    /// Keys that vanish between SCAN and GET are silently skipped.
+    /// Keys that vanish between SCAN and GET, fail HMAC verification, or
+    /// do not parse are silently skipped.
     pub async fn all_beats(&self) -> Result<Vec<PulseBeatV2>, PulseError> {
         let keys = self.scan_keys().await?;
         if keys.is_empty() {
@@ -77,6 +84,10 @@ impl PulseReader {
         for key in &keys {
             let raw: Option<String> = conn.get(key).await?;
             if let Some(s) = raw {
+                let name = Self::strip_prefix(key).unwrap_or("unknown");
+                if !Self::beat_signature_ok(name, &s).await {
+                    continue;
+                }
                 match serde_json::from_str::<PulseBeatV2>(&s) {
                     Ok(b) => beats.push(b),
                     Err(_) => continue, // skip malformed entries
@@ -84,6 +95,13 @@ impl PulseReader {
             }
         }
         Ok(beats)
+    }
+
+    /// Verify the HMAC on a beat. Returns true iff we should accept it.
+    async fn beat_signature_ok(computer_name: &str, raw: &str) -> bool {
+        let key = crate::pulse_hmac::KeyCache::global().get().await;
+        let outcome = crate::pulse_hmac::verify_json(key.as_deref(), raw);
+        crate::pulse_hmac::log_verify(computer_name, outcome)
     }
 
     /// Returns true if the computer's beat key is missing/expired.

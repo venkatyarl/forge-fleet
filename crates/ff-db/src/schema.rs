@@ -1274,3 +1274,175 @@ CREATE TABLE IF NOT EXISTS alert_events (
 CREATE INDEX IF NOT EXISTS idx_alert_events_policy ON alert_events(policy_id, fired_at DESC);
 CREATE INDEX IF NOT EXISTS idx_alert_events_unresolved ON alert_events(resolved_at) WHERE resolved_at IS NULL;
 "#;
+
+pub const SCHEMA_V17_SECURITY_HARDENING: &str = r#"
+-- V17: Security hardening — secrets rotation, SSH key revocation, pulse HMAC.
+--
+-- 1) Extend fleet_secrets with rotation tracking. expires_at=NULL means
+--    "never expires". rotate_before_days is the warning window before
+--    expires_at. rotation_count records how many times rotate() has run.
+ALTER TABLE fleet_secrets
+    ADD COLUMN IF NOT EXISTS expires_at           TIMESTAMPTZ;
+ALTER TABLE fleet_secrets
+    ADD COLUMN IF NOT EXISTS rotate_before_days   INT NOT NULL DEFAULT 90;
+ALTER TABLE fleet_secrets
+    ADD COLUMN IF NOT EXISTS rotation_count       INT NOT NULL DEFAULT 0;
+ALTER TABLE fleet_secrets
+    ADD COLUMN IF NOT EXISTS last_rotated_at      TIMESTAMPTZ;
+
+-- 2) SSH key revocation edges. Records that a particular public key
+--    (identified by fingerprint) was removed from `target_node`'s
+--    authorized_keys. Written by ssh_key_manager::revoke_computer_trust.
+CREATE TABLE IF NOT EXISTS fleet_ssh_revocations (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    revoked_node    TEXT NOT NULL,         -- whose key was revoked
+    key_fingerprint TEXT NOT NULL,         -- fingerprint of the revoked pubkey
+    target_node     TEXT NOT NULL,         -- host we removed it from
+    revoked_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    revoked_by      TEXT,                  -- user/system tag
+    success         BOOLEAN NOT NULL DEFAULT true,
+    last_error      TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_ssh_revocations_revoked
+    ON fleet_ssh_revocations(revoked_node);
+CREATE INDEX IF NOT EXISTS idx_ssh_revocations_target
+    ON fleet_ssh_revocations(target_node);
+
+-- 3) `computer_trust` — mark edges as revoked without deleting history.
+-- The table is created in V14; this adds the revoked columns if missing.
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.tables
+               WHERE table_name = 'computer_trust') THEN
+        BEGIN
+            ALTER TABLE computer_trust
+                ADD COLUMN IF NOT EXISTS revoked_at  TIMESTAMPTZ;
+            ALTER TABLE computer_trust
+                ADD COLUMN IF NOT EXISTS revoked_by  TEXT;
+        EXCEPTION WHEN others THEN
+            -- column_add may race across concurrent migrations; ignore.
+            NULL;
+        END;
+    END IF;
+END $$;
+"#;
+
+/// V18: Tailscale-only / WAN computer support.
+///
+/// Adds `network_scope` to the `computers` table. Values:
+///   - `lan`            (default) — has a LAN IP; WoL / direct probing works
+///   - `tailscale_only`           — only reachable over Tailscale; no WoL
+///   - `wan`                      — publicly routable; no WoL, off-site
+///
+/// This hint lets `revive::ReviveManager` skip WoL for computers whose
+/// only reachable address is over an overlay network (magic packets are
+/// link-local and won't traverse Tailscale / the internet).
+pub const SCHEMA_V18_NETWORK_SCOPE: &str = r#"
+ALTER TABLE computers
+    ADD COLUMN IF NOT EXISTS network_scope TEXT NOT NULL DEFAULT 'lan';
+"#;
+
+/// V19: Phase 12 — shared NFS volumes, power scheduling, and training jobs.
+///
+/// 1) `shared_volumes` / `shared_volume_mounts` — NFS exports (one row per
+///    exported directory on the host node) plus a join table tracking which
+///    computers have mounted it and in what state.
+/// 2) `computer_schedules` — cron-driven sleep/wake/restart rules per computer.
+///    Evaluated once a minute by the leader's power scheduler. An optional
+///    `condition` expression (e.g. `idle_minutes > 120`) is parsed against
+///    pulse beats at evaluation time.
+/// 3) `training_jobs` — LoRA / full fine-tune orchestration. `loss_curve` is
+///    an append-only JSON array of {step, loss, ts} samples; when a run
+///    completes the resulting adapter is registered in `model_catalog` and
+///    `result_model_id` is populated.
+pub const SCHEMA_V19_STORAGE_POWER_TRAINING: &str = r#"
+CREATE TABLE IF NOT EXISTS shared_volumes (
+    id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name              TEXT NOT NULL UNIQUE,
+    host_computer_id  UUID NOT NULL REFERENCES computers(id) ON DELETE CASCADE,
+    export_path       TEXT NOT NULL,                         -- e.g. /Users/venkat/models on host
+    mount_path        TEXT NOT NULL,                         -- where it appears on clients, e.g. ~/models
+    nfs_version       TEXT NOT NULL DEFAULT '4',
+    read_only         BOOLEAN NOT NULL DEFAULT false,
+    size_gb           FLOAT,
+    used_gb           FLOAT,
+    purpose           TEXT,                                   -- models | training_data | outputs
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    metadata          JSONB NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_shared_volumes_host ON shared_volumes(host_computer_id);
+
+CREATE TABLE IF NOT EXISTS shared_volume_mounts (
+    volume_id       UUID NOT NULL REFERENCES shared_volumes(id) ON DELETE CASCADE,
+    computer_id     UUID NOT NULL REFERENCES computers(id) ON DELETE CASCADE,
+    mount_path      TEXT,                                    -- override; falls back to shared_volumes.mount_path
+    mounted_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    status          TEXT NOT NULL DEFAULT 'mounting',        -- mounting|mounted|stale|unmounted
+    last_check_at   TIMESTAMPTZ,
+    last_error      TEXT,
+    PRIMARY KEY (volume_id, computer_id)
+);
+
+CREATE TABLE IF NOT EXISTS computer_schedules (
+    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    computer_id      UUID NOT NULL REFERENCES computers(id) ON DELETE CASCADE,
+    kind             TEXT NOT NULL,                           -- sleep | wake | restart
+    cron_expr        TEXT NOT NULL,                           -- e.g. '0 0 * * *'
+    condition        TEXT,                                    -- e.g. 'idle_minutes > 120'
+    enabled          BOOLEAN NOT NULL DEFAULT true,
+    last_fired_at    TIMESTAMPTZ,
+    last_result      TEXT,                                    -- ok | skipped: ... | error: ...
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by       TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_computer_schedules_enabled
+    ON computer_schedules(enabled);
+CREATE INDEX IF NOT EXISTS idx_computer_schedules_by_computer
+    ON computer_schedules(computer_id);
+
+CREATE TABLE IF NOT EXISTS training_jobs (
+    id                     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name                   TEXT NOT NULL,
+    base_model_id          TEXT REFERENCES model_catalog(id),
+    training_data_path     TEXT NOT NULL,
+    adapter_output_path    TEXT,
+    training_type          TEXT NOT NULL DEFAULT 'lora',     -- lora | full_finetune | dpo
+    computer_id            UUID REFERENCES computers(id),
+    status                 TEXT NOT NULL DEFAULT 'queued',   -- queued|running|completed|failed|cancelled
+    started_at             TIMESTAMPTZ,
+    completed_at           TIMESTAMPTZ,
+    loss_curve             JSONB NOT NULL DEFAULT '[]',
+    params                 JSONB NOT NULL DEFAULT '{}',      -- epochs, lr, batch_size, lora_rank
+    result_model_id        TEXT REFERENCES model_catalog(id),
+    deferred_task_id       UUID,                              -- deferred_tasks row that drives execution
+    error_message          TEXT,
+    created_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by             TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_training_jobs_status
+    ON training_jobs(status);
+CREATE INDEX IF NOT EXISTS idx_training_jobs_by_computer
+    ON training_jobs(computer_id);
+"#;
+
+/// V20: `port_registry` — canonical inventory of every port ForgeFleet uses.
+///
+/// Seeded from `config/ports.toml` on daemon startup and via `ff ports seed`.
+/// The registry is the source of truth that firewall rules, docker-compose
+/// mappings, and `ff ports scan <computer>` cross-reference at runtime.
+pub const SCHEMA_V20_PORT_REGISTRY: &str = r#"
+CREATE TABLE IF NOT EXISTS port_registry (
+    port            INT PRIMARY KEY,
+    service         TEXT NOT NULL,
+    kind            TEXT NOT NULL,       -- control_plane|database|coordination|llm_inference|system
+    description     TEXT NOT NULL,
+    exposed_on      TEXT NOT NULL,       -- "all_members" | "leader_only" | "taylor" | ...
+    scope           TEXT NOT NULL DEFAULT 'lan',  -- lan | public_via_proxy
+    managed_by      TEXT,
+    status          TEXT NOT NULL DEFAULT 'active', -- active | planned | deprecated
+    metadata        JSONB NOT NULL DEFAULT '{}',
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_port_registry_kind ON port_registry(kind);
+CREATE INDEX IF NOT EXISTS idx_port_registry_scope ON port_registry(scope);
+"#;

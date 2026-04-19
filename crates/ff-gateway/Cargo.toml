@@ -16,6 +16,7 @@ ff-mc = { path = "../ff-mc" }
 ff-mcp = { path = "../ff-mcp" }
 ff-db = { path = "../ff-db" }
 ff-observability = { path = "../ff-observability" }
+ff-pulse = { path = "../ff-pulse" }
 
 # Workspace dependencies requested by architecture spec
 tokio.workspace = true
@@ -37,3 +38,4 @@ bytes.workspace = true
 tokio-util = { version = "0.7", features = ["rt"] }
 rust-embed = "8"
 mime_guess = "2"
+sqlx.workspace = true

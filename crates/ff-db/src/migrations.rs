@@ -222,6 +222,26 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "observability",
         sql: schema::SCHEMA_V16_OBSERVABILITY,
     },
+    PgMigration {
+        version: 17,
+        name: "security_hardening",
+        sql: schema::SCHEMA_V17_SECURITY_HARDENING,
+    },
+    PgMigration {
+        version: 18,
+        name: "network_scope",
+        sql: schema::SCHEMA_V18_NETWORK_SCOPE,
+    },
+    PgMigration {
+        version: 19,
+        name: "storage_power_training",
+        sql: schema::SCHEMA_V19_STORAGE_POWER_TRAINING,
+    },
+    PgMigration {
+        version: 20,
+        name: "port_registry",
+        sql: schema::SCHEMA_V20_PORT_REGISTRY,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.

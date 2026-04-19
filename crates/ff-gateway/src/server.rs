@@ -40,6 +40,7 @@ use ff_observability::metrics::{
 
 use crate::{
     embed,
+    llm_routing::{self, PulseLlmRouter},
     message::{Channel, IncomingMessage, OutgoingMessage},
     router::{MessageRouter, RouteTarget},
     telegram::TelegramClient,
@@ -107,6 +108,8 @@ pub struct GatewayState {
     pub model_router: Option<Arc<ModelRouter>>,
     /// Smart tier-escalation router with health tracking and metrics.
     pub tier_router: Option<Arc<TierRouter>>,
+    /// Pulse-backed LLM router (live Redis beats, preferred routing strategy).
+    pub pulse_router: Option<Arc<PulseLlmRouter>>,
     /// HTTP client for upstream LLM requests.
     pub http_client: reqwest::Client,
     /// Discovery registry for fleet node status.
@@ -160,6 +163,7 @@ impl GatewayState {
             api_registry: None,
             model_router: None,
             tier_router: None,
+            pulse_router: None,
             http_client: reqwest::Client::new(),
             discovery_registry: None,
             leader_sync: None,
@@ -276,6 +280,27 @@ impl GatewayServer {
             state.api_registry = Some(api_reg.clone());
             state.model_router = Some(model_router);
             state.tier_router = Some(tier_router);
+        }
+
+        // ─── Pulse-backed LLM router (preferred for /v1/chat/completions) ───
+        //
+        // The Pulse router reads live Redis beats, so any fleet node that is
+        // currently beating with an active+healthy LLM server becomes
+        // immediately routable without explicit backend configuration.
+        //
+        // If Redis is unreachable, construction still succeeds but every
+        // `route_completion` call will fail with a PulseError; the old
+        // tier-router path then takes over as the fallback.
+        let redis_url = std::env::var("FORGEFLEET_REDIS_URL")
+            .unwrap_or_else(|_| "redis://127.0.0.1:6380/".to_string());
+        match PulseLlmRouter::new(&redis_url) {
+            Ok(pr) => {
+                state.pulse_router = Some(Arc::new(pr));
+                info!(redis_url = %redis_url, "pulse-backed LLM router initialized");
+            }
+            Err(e) => {
+                warn!(redis_url = %redis_url, error = %e, "failed to construct PulseLlmRouter; tier-router fallback only");
+            }
         }
 
         // Build a proper HTTP client for upstream proxying
@@ -396,6 +421,22 @@ pub fn build_router(state: Arc<GatewayState>, mc_db_path: Option<&str>) -> Route
         .route("/api/agent/session/{id}/cancel", post(cancel_agent_session))
         .route("/api/agent/session/{id}/status", get(agent_session_status))
         .route("/api/agent/sessions", get(list_agent_sessions))
+        // ─── Pulse v2 dashboard routes ──────────────────────────────
+        .route("/api/fleet/computers", get(crate::pulse_api::list_computers))
+        .route("/api/fleet/members", get(crate::pulse_api::list_members))
+        .route("/api/fleet/leader", get(crate::pulse_api::get_leader))
+        .route("/api/fleet/health", get(crate::pulse_api::fleet_health))
+        .route("/api/llm/servers", get(crate::pulse_api::llm_servers))
+        .route("/api/software/computers", get(crate::pulse_api::software_computers))
+        .route("/api/software/drift", get(crate::pulse_api::software_drift))
+        .route("/api/projects", get(crate::pulse_api::list_projects))
+        .route("/api/projects/{id}/branches", get(crate::pulse_api::project_branches))
+        .route("/api/pm/work-items", get(crate::pulse_api::list_work_items))
+        .route("/api/alerts/policies", get(crate::pulse_api::alert_policies))
+        .route("/api/alerts/events", get(crate::pulse_api::alert_events))
+        .route("/api/metrics/{computer}/history", get(crate::pulse_api::metrics_history))
+        .route("/api/ha/status", get(crate::pulse_api::ha_status))
+        .route("/api/docker/projects", get(crate::pulse_api::docker_projects))
         // ─── Chat management routes ─────────────────────────────────
         .route("/api/chats", get(list_chats).post(create_chat))
         .route("/api/chats/folders", get(list_chat_folders))
@@ -3630,19 +3671,69 @@ async fn settings_runtime(State(state): State<Arc<GatewayState>>) -> Json<Value>
 
 // ─── LLM Proxy ───────────────────────────────────────────────────────────────
 
-/// POST /v1/chat/completions — proxy to ff-api LLM router with tier escalation.
+/// POST /v1/chat/completions — proxy to fleet LLM servers.
 ///
-/// Routing strategy:
-/// 1. Validate the request.
-/// 2. Build a tier-escalation chain via `TierRouter`.
-/// 3. For each tier, try each backend with the tier's timeout.
-/// 4. On 5xx/timeout, record failure and try next backend (then next tier).
-/// 5. On 4xx, return immediately (client error, don't retry).
-/// 6. On success, record metrics and return the response.
+/// Routing strategy (new, preferred):
+/// 1. Try the Pulse-backed router (`PulseLlmRouter`) — this reads live Redis
+///    beats so any active+healthy LLM server in the fleet is routable
+///    immediately, no explicit backend configuration required.
+/// 2. If Pulse finds no match (or Pulse itself is unreachable), fall back to
+///    the legacy tier-escalation router based on `BackendRegistry`.
+///
+/// Legacy tier/model-router path preserved verbatim below the Pulse attempt
+/// for backward compatibility.
 async fn proxy_chat_completions(
     State(state): State<Arc<GatewayState>>,
-    Json(payload): Json<ChatCompletionRequest>,
+    Json(raw_payload): Json<Value>,
 ) -> Result<Response<Body>, (StatusCode, Json<Value>)> {
+    // ── Pulse-first routing ──────────────────────────────────────────
+    //
+    // We try the Pulse router first. If it successfully picks a server
+    // and the upstream call returns *something* (success or a 4xx from
+    // the inference server itself), we return that. Only if Pulse cannot
+    // find a matching server OR its upstream call fails outright do we
+    // fall through to the legacy tier-router path.
+    if let Some(pulse) = state.pulse_router.clone() {
+        match pulse.route_completion(raw_payload.clone()).await {
+            Ok(value) => {
+                return Ok(Json(value).into_response());
+            }
+            Err(llm_routing::LlmRoutingError::NoMatch { .. }) => {
+                // No Pulse-visible server loaded for this model — fall back
+                // to the tier-router, which can auto-load on demand.
+                debug!("pulse found no matching server; trying tier-router fallback");
+            }
+            Err(llm_routing::LlmRoutingError::MissingModel) => {
+                let (code, body) =
+                    llm_routing::error_to_response(llm_routing::LlmRoutingError::MissingModel);
+                return Err((
+                    StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_REQUEST),
+                    Json(body),
+                ));
+            }
+            Err(e) => {
+                // Pulse upstream failure — log and fall back.
+                warn!(error = %e, "pulse routing failed; falling back to tier-router");
+            }
+        }
+    }
+
+    // ── Legacy tier-router fallback ──────────────────────────────────
+    // Re-parse the raw payload into the typed ChatCompletionRequest the
+    // legacy path expects. Any schema-level error becomes a 400 here.
+    let payload: ChatCompletionRequest = match serde_json::from_value(raw_payload) {
+        Ok(p) => p,
+        Err(e) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": {
+                    "message": format!("invalid chat completion request: {e}"),
+                    "type": "invalid_request_error"
+                }})),
+            ));
+        }
+    };
+
     // ── Validate request ─────────────────────────────────────────────
     if let Err(msg) = validate_request(&payload) {
         return Err((

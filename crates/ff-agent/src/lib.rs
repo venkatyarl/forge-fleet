@@ -34,7 +34,9 @@ pub mod alert_policy_seed;
 pub mod deployment_reconciler;
 pub mod disk_sampler;
 pub mod metrics_downsampler;
+pub mod nats_client;
 pub mod nats_log_layer;
+pub mod fleet_events_nats;
 pub mod job_sweeper;
 pub mod coverage_guard;
 pub mod model_catalog;
@@ -54,8 +56,11 @@ pub mod openclaw;
 pub mod orchestrator_agent;
 pub mod permissions;
 pub mod plugins;
+pub mod ports_registry;
 pub mod revive;
 pub mod rpc_inference;
+pub mod secrets_rotation;
+pub mod ssh_key_manager;
 pub mod project_github_sync;
 pub mod project_registry;
 pub mod scoped_memory;
@@ -69,11 +74,19 @@ pub mod template_registry;
 pub mod thinking;
 pub mod tools;
 pub mod training;
+pub mod training_orchestrator;
+pub mod shared_storage;
+pub mod power_scheduler;
+pub mod model_benchmark;
 
 pub use software_registry::{seed_from_toml, SeedReport};
 pub use model_catalog_seed::{seed_from_toml as seed_model_catalog_from_toml, ModelSeedReport};
 pub use project_registry::{seed_from_toml as seed_projects_from_toml, ProjectSeedReport};
 pub use alert_policy_seed::{seed_from_toml as seed_alert_policies_from_toml, AlertSeedReport};
+pub use ports_registry::{
+    seed_from_toml as seed_ports_from_toml,
+    SeedReport as PortsSeedReport,
+};
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

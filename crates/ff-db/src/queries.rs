@@ -4223,3 +4223,568 @@ pub async fn pg_list_brain_communities(pool: &PgPool) -> Result<Vec<BrainCommuni
         color: r.get("color"),
     }).collect())
 }
+
+// ─── V19: shared volumes / computer schedules / training jobs ──────────────
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SharedVolumeRow {
+    pub id: sqlx::types::Uuid,
+    pub name: String,
+    pub host_computer_id: sqlx::types::Uuid,
+    pub host_name: Option<String>,
+    pub export_path: String,
+    pub mount_path: String,
+    pub nfs_version: String,
+    pub read_only: bool,
+    pub size_gb: Option<f64>,
+    pub used_gb: Option<f64>,
+    pub purpose: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub metadata: JsonValue,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SharedVolumeMountRow {
+    pub volume_id: sqlx::types::Uuid,
+    pub volume_name: Option<String>,
+    pub computer_id: sqlx::types::Uuid,
+    pub computer_name: Option<String>,
+    pub mount_path: Option<String>,
+    pub mounted_at: chrono::DateTime<chrono::Utc>,
+    pub status: String,
+    pub last_check_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_error: Option<String>,
+}
+
+/// Insert a new shared volume row. Returns the generated UUID.
+pub async fn pg_create_shared_volume(
+    pool: &PgPool,
+    name: &str,
+    host_computer_id: sqlx::types::Uuid,
+    export_path: &str,
+    mount_path: &str,
+    purpose: Option<&str>,
+    read_only: bool,
+) -> Result<sqlx::types::Uuid> {
+    let row = sqlx::query(
+        "INSERT INTO shared_volumes
+            (name, host_computer_id, export_path, mount_path, purpose, read_only)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         RETURNING id",
+    )
+    .bind(name)
+    .bind(host_computer_id)
+    .bind(export_path)
+    .bind(mount_path)
+    .bind(purpose)
+    .bind(read_only)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.get("id"))
+}
+
+pub async fn pg_get_shared_volume(
+    pool: &PgPool,
+    name: &str,
+) -> Result<Option<SharedVolumeRow>> {
+    let row = sqlx::query(
+        "SELECT v.*, c.name as host_name
+         FROM shared_volumes v
+         LEFT JOIN computers c ON c.id = v.host_computer_id
+         WHERE v.name = $1",
+    )
+    .bind(name)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| SharedVolumeRow {
+        id: r.get("id"),
+        name: r.get("name"),
+        host_computer_id: r.get("host_computer_id"),
+        host_name: r.try_get("host_name").ok(),
+        export_path: r.get("export_path"),
+        mount_path: r.get("mount_path"),
+        nfs_version: r.get("nfs_version"),
+        read_only: r.get("read_only"),
+        size_gb: r.try_get("size_gb").ok(),
+        used_gb: r.try_get("used_gb").ok(),
+        purpose: r.try_get("purpose").ok(),
+        created_at: r.get("created_at"),
+        metadata: r.get("metadata"),
+    }))
+}
+
+pub async fn pg_list_shared_volumes(pool: &PgPool) -> Result<Vec<SharedVolumeRow>> {
+    let rows = sqlx::query(
+        "SELECT v.*, c.name as host_name
+         FROM shared_volumes v
+         LEFT JOIN computers c ON c.id = v.host_computer_id
+         ORDER BY v.created_at DESC",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.iter().map(|r| SharedVolumeRow {
+        id: r.get("id"),
+        name: r.get("name"),
+        host_computer_id: r.get("host_computer_id"),
+        host_name: r.try_get("host_name").ok(),
+        export_path: r.get("export_path"),
+        mount_path: r.get("mount_path"),
+        nfs_version: r.get("nfs_version"),
+        read_only: r.get("read_only"),
+        size_gb: r.try_get("size_gb").ok(),
+        used_gb: r.try_get("used_gb").ok(),
+        purpose: r.try_get("purpose").ok(),
+        created_at: r.get("created_at"),
+        metadata: r.get("metadata"),
+    }).collect())
+}
+
+pub async fn pg_upsert_shared_volume_mount(
+    pool: &PgPool,
+    volume_id: sqlx::types::Uuid,
+    computer_id: sqlx::types::Uuid,
+    mount_path: Option<&str>,
+    status: &str,
+    last_error: Option<&str>,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO shared_volume_mounts
+            (volume_id, computer_id, mount_path, status, last_check_at, last_error)
+         VALUES ($1, $2, $3, $4, NOW(), $5)
+         ON CONFLICT (volume_id, computer_id) DO UPDATE SET
+             mount_path = EXCLUDED.mount_path,
+             status = EXCLUDED.status,
+             last_check_at = NOW(),
+             last_error = EXCLUDED.last_error",
+    )
+    .bind(volume_id)
+    .bind(computer_id)
+    .bind(mount_path)
+    .bind(status)
+    .bind(last_error)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn pg_delete_shared_volume_mount(
+    pool: &PgPool,
+    volume_id: sqlx::types::Uuid,
+    computer_id: sqlx::types::Uuid,
+) -> Result<bool> {
+    let res = sqlx::query(
+        "DELETE FROM shared_volume_mounts WHERE volume_id = $1 AND computer_id = $2",
+    )
+    .bind(volume_id)
+    .bind(computer_id)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+pub async fn pg_list_shared_volume_mounts(
+    pool: &PgPool,
+    volume_id: Option<sqlx::types::Uuid>,
+) -> Result<Vec<SharedVolumeMountRow>> {
+    let rows = if let Some(vid) = volume_id {
+        sqlx::query(
+            "SELECT m.*, v.name as volume_name, c.name as computer_name
+             FROM shared_volume_mounts m
+             LEFT JOIN shared_volumes v ON v.id = m.volume_id
+             LEFT JOIN computers c       ON c.id = m.computer_id
+             WHERE m.volume_id = $1
+             ORDER BY m.mounted_at DESC",
+        )
+        .bind(vid)
+        .fetch_all(pool)
+        .await?
+    } else {
+        sqlx::query(
+            "SELECT m.*, v.name as volume_name, c.name as computer_name
+             FROM shared_volume_mounts m
+             LEFT JOIN shared_volumes v ON v.id = m.volume_id
+             LEFT JOIN computers c       ON c.id = m.computer_id
+             ORDER BY m.mounted_at DESC",
+        )
+        .fetch_all(pool)
+        .await?
+    };
+    Ok(rows.iter().map(|r| SharedVolumeMountRow {
+        volume_id: r.get("volume_id"),
+        volume_name: r.try_get("volume_name").ok(),
+        computer_id: r.get("computer_id"),
+        computer_name: r.try_get("computer_name").ok(),
+        mount_path: r.try_get("mount_path").ok(),
+        mounted_at: r.get("mounted_at"),
+        status: r.get("status"),
+        last_check_at: r.try_get("last_check_at").ok(),
+        last_error: r.try_get("last_error").ok(),
+    }).collect())
+}
+
+// ─── computer_schedules ────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ComputerScheduleRow {
+    pub id: sqlx::types::Uuid,
+    pub computer_id: sqlx::types::Uuid,
+    pub computer_name: Option<String>,
+    pub kind: String,
+    pub cron_expr: String,
+    pub condition: Option<String>,
+    pub enabled: bool,
+    pub last_fired_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_result: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub created_by: Option<String>,
+}
+
+pub async fn pg_create_schedule(
+    pool: &PgPool,
+    computer_id: sqlx::types::Uuid,
+    kind: &str,
+    cron_expr: &str,
+    condition: Option<&str>,
+    created_by: Option<&str>,
+) -> Result<sqlx::types::Uuid> {
+    let row = sqlx::query(
+        "INSERT INTO computer_schedules
+            (computer_id, kind, cron_expr, condition, created_by)
+         VALUES ($1, $2, $3, $4, $5)
+         RETURNING id",
+    )
+    .bind(computer_id)
+    .bind(kind)
+    .bind(cron_expr)
+    .bind(condition)
+    .bind(created_by)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.get("id"))
+}
+
+pub async fn pg_list_schedules(
+    pool: &PgPool,
+    computer_id: Option<sqlx::types::Uuid>,
+    only_enabled: bool,
+) -> Result<Vec<ComputerScheduleRow>> {
+    let rows = match (computer_id, only_enabled) {
+        (Some(cid), true) => sqlx::query(
+            "SELECT s.*, c.name as computer_name
+             FROM computer_schedules s
+             LEFT JOIN computers c ON c.id = s.computer_id
+             WHERE s.computer_id = $1 AND s.enabled = true
+             ORDER BY s.created_at DESC",
+        )
+        .bind(cid)
+        .fetch_all(pool)
+        .await?,
+        (Some(cid), false) => sqlx::query(
+            "SELECT s.*, c.name as computer_name
+             FROM computer_schedules s
+             LEFT JOIN computers c ON c.id = s.computer_id
+             WHERE s.computer_id = $1
+             ORDER BY s.created_at DESC",
+        )
+        .bind(cid)
+        .fetch_all(pool)
+        .await?,
+        (None, true) => sqlx::query(
+            "SELECT s.*, c.name as computer_name
+             FROM computer_schedules s
+             LEFT JOIN computers c ON c.id = s.computer_id
+             WHERE s.enabled = true
+             ORDER BY s.created_at DESC",
+        )
+        .fetch_all(pool)
+        .await?,
+        (None, false) => sqlx::query(
+            "SELECT s.*, c.name as computer_name
+             FROM computer_schedules s
+             LEFT JOIN computers c ON c.id = s.computer_id
+             ORDER BY s.created_at DESC",
+        )
+        .fetch_all(pool)
+        .await?,
+    };
+    Ok(rows.iter().map(|r| ComputerScheduleRow {
+        id: r.get("id"),
+        computer_id: r.get("computer_id"),
+        computer_name: r.try_get("computer_name").ok(),
+        kind: r.get("kind"),
+        cron_expr: r.get("cron_expr"),
+        condition: r.try_get("condition").ok(),
+        enabled: r.get("enabled"),
+        last_fired_at: r.try_get("last_fired_at").ok(),
+        last_result: r.try_get("last_result").ok(),
+        created_at: r.get("created_at"),
+        created_by: r.try_get("created_by").ok(),
+    }).collect())
+}
+
+pub async fn pg_mark_schedule_fired(
+    pool: &PgPool,
+    id: sqlx::types::Uuid,
+    result: &str,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE computer_schedules
+         SET last_fired_at = NOW(), last_result = $2
+         WHERE id = $1",
+    )
+    .bind(id)
+    .bind(result)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn pg_delete_schedule(pool: &PgPool, id: sqlx::types::Uuid) -> Result<bool> {
+    let res = sqlx::query("DELETE FROM computer_schedules WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+// ─── training_jobs ─────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TrainingJobRow {
+    pub id: sqlx::types::Uuid,
+    pub name: String,
+    pub base_model_id: Option<String>,
+    pub training_data_path: String,
+    pub adapter_output_path: Option<String>,
+    pub training_type: String,
+    pub computer_id: Option<sqlx::types::Uuid>,
+    pub computer_name: Option<String>,
+    pub status: String,
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub loss_curve: JsonValue,
+    pub params: JsonValue,
+    pub result_model_id: Option<String>,
+    pub deferred_task_id: Option<sqlx::types::Uuid>,
+    pub error_message: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub created_by: Option<String>,
+}
+
+pub async fn pg_create_training_job(
+    pool: &PgPool,
+    name: &str,
+    base_model_id: Option<&str>,
+    training_data_path: &str,
+    adapter_output_path: Option<&str>,
+    training_type: &str,
+    computer_id: Option<sqlx::types::Uuid>,
+    params: &JsonValue,
+    created_by: Option<&str>,
+) -> Result<sqlx::types::Uuid> {
+    let row = sqlx::query(
+        "INSERT INTO training_jobs
+            (name, base_model_id, training_data_path, adapter_output_path,
+             training_type, computer_id, params, created_by)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         RETURNING id",
+    )
+    .bind(name)
+    .bind(base_model_id)
+    .bind(training_data_path)
+    .bind(adapter_output_path)
+    .bind(training_type)
+    .bind(computer_id)
+    .bind(params)
+    .bind(created_by)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.get("id"))
+}
+
+pub async fn pg_get_training_job(
+    pool: &PgPool,
+    id: sqlx::types::Uuid,
+) -> Result<Option<TrainingJobRow>> {
+    let row = sqlx::query(
+        "SELECT t.*, c.name as computer_name
+         FROM training_jobs t
+         LEFT JOIN computers c ON c.id = t.computer_id
+         WHERE t.id = $1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| TrainingJobRow {
+        id: r.get("id"),
+        name: r.get("name"),
+        base_model_id: r.try_get("base_model_id").ok(),
+        training_data_path: r.get("training_data_path"),
+        adapter_output_path: r.try_get("adapter_output_path").ok(),
+        training_type: r.get("training_type"),
+        computer_id: r.try_get("computer_id").ok(),
+        computer_name: r.try_get("computer_name").ok(),
+        status: r.get("status"),
+        started_at: r.try_get("started_at").ok(),
+        completed_at: r.try_get("completed_at").ok(),
+        loss_curve: r.get("loss_curve"),
+        params: r.get("params"),
+        result_model_id: r.try_get("result_model_id").ok(),
+        deferred_task_id: r.try_get("deferred_task_id").ok(),
+        error_message: r.try_get("error_message").ok(),
+        created_at: r.get("created_at"),
+        created_by: r.try_get("created_by").ok(),
+    }))
+}
+
+pub async fn pg_list_training_jobs(
+    pool: &PgPool,
+    status: Option<&str>,
+    limit: i64,
+) -> Result<Vec<TrainingJobRow>> {
+    let rows = if let Some(s) = status {
+        sqlx::query(
+            "SELECT t.*, c.name as computer_name
+             FROM training_jobs t
+             LEFT JOIN computers c ON c.id = t.computer_id
+             WHERE t.status = $1
+             ORDER BY t.created_at DESC
+             LIMIT $2",
+        )
+        .bind(s)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?
+    } else {
+        sqlx::query(
+            "SELECT t.*, c.name as computer_name
+             FROM training_jobs t
+             LEFT JOIN computers c ON c.id = t.computer_id
+             ORDER BY t.created_at DESC
+             LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(pool)
+        .await?
+    };
+    Ok(rows.iter().map(|r| TrainingJobRow {
+        id: r.get("id"),
+        name: r.get("name"),
+        base_model_id: r.try_get("base_model_id").ok(),
+        training_data_path: r.get("training_data_path"),
+        adapter_output_path: r.try_get("adapter_output_path").ok(),
+        training_type: r.get("training_type"),
+        computer_id: r.try_get("computer_id").ok(),
+        computer_name: r.try_get("computer_name").ok(),
+        status: r.get("status"),
+        started_at: r.try_get("started_at").ok(),
+        completed_at: r.try_get("completed_at").ok(),
+        loss_curve: r.get("loss_curve"),
+        params: r.get("params"),
+        result_model_id: r.try_get("result_model_id").ok(),
+        deferred_task_id: r.try_get("deferred_task_id").ok(),
+        error_message: r.try_get("error_message").ok(),
+        created_at: r.get("created_at"),
+        created_by: r.try_get("created_by").ok(),
+    }).collect())
+}
+
+pub async fn pg_update_training_job_status(
+    pool: &PgPool,
+    id: sqlx::types::Uuid,
+    status: &str,
+    error_message: Option<&str>,
+) -> Result<()> {
+    // Transition timestamps based on status.
+    let set_started = status == "running";
+    let set_completed = matches!(status, "completed" | "failed" | "cancelled");
+    sqlx::query(
+        "UPDATE training_jobs
+         SET status = $2,
+             started_at   = CASE WHEN $3 AND started_at   IS NULL THEN NOW() ELSE started_at   END,
+             completed_at = CASE WHEN $4 AND completed_at IS NULL THEN NOW() ELSE completed_at END,
+             error_message = COALESCE($5, error_message)
+         WHERE id = $1",
+    )
+    .bind(id)
+    .bind(status)
+    .bind(set_started)
+    .bind(set_completed)
+    .bind(error_message)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn pg_attach_training_deferred_task(
+    pool: &PgPool,
+    id: sqlx::types::Uuid,
+    deferred_task_id: sqlx::types::Uuid,
+) -> Result<()> {
+    sqlx::query("UPDATE training_jobs SET deferred_task_id = $2 WHERE id = $1")
+        .bind(id)
+        .bind(deferred_task_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn pg_append_training_loss_sample(
+    pool: &PgPool,
+    id: sqlx::types::Uuid,
+    step: i64,
+    loss: f64,
+) -> Result<()> {
+    let sample = serde_json::json!({
+        "step": step,
+        "loss": loss,
+        "ts": chrono::Utc::now().to_rfc3339(),
+    });
+    sqlx::query(
+        "UPDATE training_jobs
+         SET loss_curve = loss_curve || $2::jsonb
+         WHERE id = $1",
+    )
+    .bind(id)
+    .bind(sample)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+// ─── Benchmark results (helpers around model_catalog.benchmark_results) ────
+
+/// Append one benchmark result to `model_catalog.benchmark_results`. The
+/// column is a JSON object keyed by `"<computer>:<iso-timestamp>"`; new runs
+/// merge in without overwriting history.
+pub async fn pg_append_benchmark_result(
+    pool: &PgPool,
+    catalog_id: &str,
+    computer_name: &str,
+    result: &JsonValue,
+) -> Result<()> {
+    let ts = chrono::Utc::now().to_rfc3339();
+    let key = format!("{computer_name}:{ts}");
+    let merge = serde_json::json!({ key: result });
+    sqlx::query(
+        "UPDATE model_catalog
+         SET benchmark_results = benchmark_results || $2::jsonb
+         WHERE id = $1",
+    )
+    .bind(catalog_id)
+    .bind(merge)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn pg_get_benchmark_results(
+    pool: &PgPool,
+    catalog_id: &str,
+) -> Result<Option<JsonValue>> {
+    let row = sqlx::query("SELECT benchmark_results FROM model_catalog WHERE id = $1")
+        .bind(catalog_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(|r| r.get("benchmark_results")))
+}

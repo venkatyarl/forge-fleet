@@ -115,6 +115,22 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
     init_logging(cli, &node_name)?;
     print_startup_banner(&node_name, &role, &config_path);
 
+    // ─── NATS client (optional) ─────────────────────────────────────────────
+    // Initialize the process-global NATS client so subsystems can publish
+    // pulse beats, fleet events, and logs to subjects. NATS is optional —
+    // if the connection fails we warn and continue on Redis + Postgres alone.
+    {
+        let nats_url = ff_agent::nats_client::resolve_nats_url();
+        // Export the URL for ff-pulse's heartbeat_v2 NATS mirror (which has
+        // its own OnceCell-backed client scoped to the crate).
+        #[allow(unused_unsafe)]
+        unsafe { std::env::set_var("FORGEFLEET_NATS_URL", &nats_url); }
+        match ff_agent::nats_client::init_nats(&nats_url).await {
+            Ok(_) => info!(url = %nats_url, "NATS connected"),
+            Err(e) => warn!(url = %nats_url, error = %e, "NATS unavailable — continuing without event bus"),
+        }
+    }
+
     enforce_database_mode_preflight(&config)?;
 
     // ─── Operational persistence backend (SQLite or Postgres) ──────────────
@@ -148,6 +164,37 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
                 info!(
                     nodes = existing.len(),
                     "Postgres fleet tables already populated, skipping seed"
+                );
+            }
+
+            // ─── Port registry seed (config/ports.toml → port_registry) ──
+            //
+            // Runs on every startup (the seed is idempotent — it UPSERTs).
+            // Mirrors how software_registry / model_catalog / task_coverage
+            // are seeded when their CLI entry points run; doing it here
+            // guarantees the registry is fresh without requiring an operator
+            // to remember to run `ff ports seed`.
+            let ports_path = ff_agent::ports_registry::resolve_ports_path();
+            if ports_path.exists() {
+                match ff_agent::ports_registry::seed_from_toml(pg_pool, &ports_path).await {
+                    Ok(rep) => info!(
+                        path = %ports_path.display(),
+                        total = rep.total,
+                        inserted = rep.inserted,
+                        updated = rep.updated,
+                        unchanged = rep.unchanged,
+                        "port_registry seeded from config/ports.toml"
+                    ),
+                    Err(e) => warn!(
+                        path = %ports_path.display(),
+                        error = %e,
+                        "port_registry seed failed (continuing)"
+                    ),
+                }
+            } else {
+                warn!(
+                    path = %ports_path.display(),
+                    "config/ports.toml not found — skipping port_registry seed"
                 );
             }
         }
@@ -1641,6 +1688,18 @@ async fn start_pulse_v2_subsystems(
     let pg_pool_for_backup = pg_pool.clone();
     let shutdown_rx_for_backup = shutdown_rx.clone();
 
+    // Additional clones for Phase 10 observability subsystems (metrics
+    // downsampler + alert evaluator). They start after leader_tick and also
+    // need their own PulseReaders, built from `redis_url`.
+    let pg_pool_for_metrics = pg_pool.clone();
+    let pg_pool_for_alerts = pg_pool.clone();
+    let shutdown_rx_for_metrics = shutdown_rx.clone();
+    let shutdown_rx_for_alerts = shutdown_rx.clone();
+    let redis_url_for_metrics = redis_url.clone();
+    let redis_url_for_alerts = redis_url.clone();
+    let node_name_for_metrics = node_name.clone();
+    let node_name_for_alerts = node_name.clone();
+
     // Build the redis::Client once — both publisher and materializer need one.
     let redis_client = redis::Client::open(redis_url.as_str())
         .context("pulse v2: failed to open redis client")?;
@@ -1662,6 +1721,17 @@ async fn start_pulse_v2_subsystems(
     let _epoch_handle = v2_pub.epoch_handle();
     let _role_handle = v2_pub.role_handle();
     handles.push(v2_pub.spawn(shutdown_rx.clone()));
+
+    // HMAC key refresher — publishers sign beats with this key, materializer
+    // + reader verify against the same cache. Refresh every 5 minutes.
+    // If no key is configured we publish unsigned (rollout compat).
+    {
+        let cache = ff_pulse::pulse_hmac::KeyCache::global().clone();
+        handles.push(cache.spawn_refresher(
+            pg_pool.clone(),
+            std::time::Duration::from_secs(300),
+        ));
+    }
 
     // (3) Materializer — runs on every daemon for this phase. See NOTE
     // at call-site in run_daemon.
@@ -1700,21 +1770,140 @@ async fn start_pulse_v2_subsystems(
         let oc_promote = openclaw.clone();
         let oc_demote = openclaw.clone();
         let pool_for_url = pg_pool.clone();
+        let pool_for_promote = pg_pool.clone();
+        let pool_for_demote = pg_pool.clone();
+
+        let my_name_for_promote = node_name.clone();
+        let my_name_for_demote = node_name.clone();
 
         let on_became: ff_agent::leader_tick::OnBecameLeader = std::sync::Arc::new(move || {
             let oc = oc_promote.clone();
+            let my_name = my_name_for_promote.clone();
+            let pool = pool_for_promote.clone();
             tokio::spawn(async move {
+                // Publish leader-change event to NATS (best-effort).
+                ff_agent::fleet_events_nats::FleetEventBus::publish_leader_change(
+                    None,
+                    &my_name,
+                    0,
+                )
+                .await;
+
                 if let Err(e) = oc.promote_to_gateway().await {
                     tracing::error!(error = %e, "openclaw: promote_to_gateway failed");
+                } else {
+                    // Surface promotion as a deployment.started event for the openclaw-gateway.
+                    ff_agent::fleet_events_nats::FleetEventBus::publish_deployment_change(
+                        &my_name,
+                        uuid::Uuid::nil(),
+                        "started",
+                        "openclaw-gateway",
+                    )
+                    .await;
+
+                    // Re-import paired devices stashed by the previous
+                    // leader on its way out (if any). Best-effort: if
+                    // the secret is missing or the import fails, just
+                    // log — phones/IoT will need to re-pair but the
+                    // gateway is still functional.
+                    match ff_agent::openclaw::lookup_device_pairings_export(&pool).await {
+                        Ok(Some(export)) if !export.trim().is_empty() => {
+                            match oc.import_devices(&export).await {
+                                Ok(n) => {
+                                    tracing::info!(
+                                        count = n,
+                                        "openclaw: imported paired devices from previous leader"
+                                    );
+                                    if let Err(e) =
+                                        ff_agent::openclaw::clear_device_pairings_export(&pool)
+                                            .await
+                                    {
+                                        tracing::warn!(
+                                            error = %e,
+                                            "openclaw: failed to clear device pairings secret"
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        error = %e,
+                                        "openclaw: import_devices failed — devices may need to re-pair"
+                                    );
+                                }
+                            }
+                        }
+                        Ok(_) => {
+                            tracing::debug!(
+                                "openclaw: no device pairings stashed (cold start or previous leader crashed before export)"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "openclaw: could not read device pairings secret"
+                            );
+                        }
+                    }
                 }
             });
         });
 
         let on_lost: ff_agent::leader_tick::OnLostLeader =
-            std::sync::Arc::new(move |_new_leader_name: String| {
+            std::sync::Arc::new(move |new_leader_name: String| {
                 let oc = oc_demote.clone();
                 let pool = pool_for_url.clone();
+                let pool_export = pool_for_demote.clone();
+                let my_name = my_name_for_demote.clone();
                 tokio::spawn(async move {
+                    // Publish leader-change event to NATS (best-effort).
+                    let new_name = if new_leader_name.is_empty() {
+                        "unknown"
+                    } else {
+                        new_leader_name.as_str()
+                    };
+                    ff_agent::fleet_events_nats::FleetEventBus::publish_leader_change(
+                        Some(&my_name),
+                        new_name,
+                        0,
+                    )
+                    .await;
+
+                    // Export paired devices BEFORE demoting so the new
+                    // leader can re-import them. Best-effort: a failure
+                    // here degrades to "devices must re-pair", not a
+                    // gateway outage.
+                    match oc.export_devices().await {
+                        Ok(export) => {
+                            if let Err(e) = sqlx::query(
+                                "INSERT INTO fleet_secrets (key, value, updated_by, updated_at) \
+                                 VALUES ($1, $2, 'openclaw-manager', NOW()) \
+                                 ON CONFLICT (key) DO UPDATE \
+                                 SET value = $2, updated_at = NOW()",
+                            )
+                            .bind(ff_agent::openclaw::DEVICE_PAIRINGS_SECRET_KEY)
+                            .bind(&export)
+                            .execute(&pool_export)
+                            .await
+                            {
+                                tracing::warn!(
+                                    error = %e,
+                                    "openclaw: failed to stash device pairings to fleet_secrets"
+                                );
+                            } else {
+                                tracing::info!(
+                                    bytes = export.len(),
+                                    "openclaw: stashed paired-device export for new leader"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "openclaw: export_devices failed during demotion — devices will lose pairing"
+                            );
+                        }
+                    }
+
                     let url = ff_agent::openclaw::lookup_gateway_url(&pool)
                         .await
                         .ok()
@@ -1728,6 +1917,14 @@ async fn start_pulse_v2_subsystems(
                     }
                     if let Err(e) = oc.demote_to_node(&url).await {
                         tracing::error!(error = %e, "openclaw: demote_to_node failed");
+                    } else {
+                        ff_agent::fleet_events_nats::FleetEventBus::publish_deployment_change(
+                            &my_name,
+                            uuid::Uuid::nil(),
+                            "stopped",
+                            "openclaw-gateway",
+                        )
+                        .await;
                     }
                 });
             });
@@ -1768,6 +1965,42 @@ async fn start_pulse_v2_subsystems(
         None,
     );
     handles.push(backup.spawn(shutdown_rx_for_backup));
+
+    // (6) Phase 10 — metrics downsampler. Each tick is gated internally on
+    // leadership via `fleet_leader_state`, so we start it on every daemon and
+    // it no-ops on followers.
+    match ff_pulse::reader::PulseReader::new(&redis_url_for_metrics) {
+        Ok(metrics_reader) => {
+            info!(
+                node = %node_name_for_metrics,
+                "starting subsystem: metrics downsampler (60s, leader-gated)"
+            );
+            let dsamp = ff_agent::metrics_downsampler::MetricsDownsampler::new(
+                pg_pool_for_metrics,
+                metrics_reader,
+                node_name_for_metrics.clone(),
+            );
+            handles.push(dsamp.spawn(shutdown_rx_for_metrics));
+        }
+        Err(e) => warn!(error = %e, "metrics downsampler: failed to build PulseReader"),
+    }
+
+    // (7) Phase 10 — alert evaluator. Also leader-gated internally.
+    match ff_pulse::reader::PulseReader::new(&redis_url_for_alerts) {
+        Ok(alert_reader) => {
+            info!(
+                node = %node_name_for_alerts,
+                "starting subsystem: alert evaluator (60s, leader-gated)"
+            );
+            let evaluator = ff_agent::alert_evaluator::AlertEvaluator::new(
+                pg_pool_for_alerts,
+                alert_reader,
+                node_name_for_alerts.clone(),
+            );
+            handles.push(evaluator.spawn(shutdown_rx_for_alerts));
+        }
+        Err(e) => warn!(error = %e, "alert evaluator: failed to build PulseReader"),
+    }
 
     Ok(handles)
 }

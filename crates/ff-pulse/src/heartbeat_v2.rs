@@ -20,6 +20,8 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
+use crate::nats::{get_or_init_nats, publish_pulse_beat};
+
 use crate::beat_v2::{
     Capabilities, DbTopology, HardwareInfo, Ip, LoadInfo, MemoryInfo,
     NetworkInfo, PulseBeatV2,
@@ -219,6 +221,11 @@ impl HeartbeatV2Publisher {
                 }
             };
 
+            // Best-effort: initialize the NATS client so publishes reach
+            // fleet.pulse.{name}. A failure here just means NATS is offline;
+            // pulse still flows via Redis.
+            let _ = get_or_init_nats().await;
+
             info!(
                 "heartbeat_v2 publisher started for '{}' (interval: {:?})",
                 self.computer_name, self.interval
@@ -233,6 +240,8 @@ impl HeartbeatV2Publisher {
                         } else {
                             debug!("heartbeat_v2 published for '{}'", self.computer_name);
                         }
+                        // Fire-and-forget NATS mirror. Best-effort — never errors the loop.
+                        publish_pulse_beat(&self.computer_name, &beat).await;
                     }
                     _ = shutdown.changed() => {
                         if *shutdown.borrow() {
@@ -242,6 +251,7 @@ impl HeartbeatV2Publisher {
                             if let Err(e) = publish_beat(&mut conn, &self.computer_name, &final_beat).await {
                                 warn!("heartbeat_v2: LWT publish failed: {e}");
                             }
+                            publish_pulse_beat(&self.computer_name, &final_beat).await;
                             break;
                         }
                     }
@@ -260,12 +270,22 @@ async fn publish_beat(
         redis::RedisError::from((redis::ErrorKind::TypeError, "serialize beat", e.to_string()))
     })?;
 
+    // ── HMAC sign (if a pulse_beat_hmac_key is cached) ──────────────
+    // The cache is refreshed every 5 minutes by a background task in
+    // `pulse_hmac::KeyCache::spawn_refresher`. If the cache is empty
+    // (no secret set), we publish unsigned — subscribers will accept
+    // unsigned beats while no key is configured (rollout compat).
+    let signed = match crate::pulse_hmac::KeyCache::global().get().await {
+        Some(key) => crate::pulse_hmac::sign_json(&key, &json),
+        None => json,
+    };
+
     // SET pulse:computer:{name} <json> EX 45
     let key = format!("pulse:computer:{}", name);
-    let _: () = conn.set_ex(&key, &json, 45).await?;
+    let _: () = conn.set_ex(&key, &signed, 45).await?;
 
     // PUBLISH pulse:events <json>
-    let _: () = conn.publish("pulse:events", &json).await?;
+    let _: () = conn.publish("pulse:events", &signed).await?;
 
     Ok(())
 }

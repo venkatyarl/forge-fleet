@@ -52,11 +52,18 @@
 //!     .with_on_lost_leader(on_lost);
 //! ```
 
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::io::Write;
 
 use sqlx::PgPool;
 use thiserror::Error;
 use tracing::{info, warn};
+
+/// Fleet-secret key under which the gateway publishes its device-pairing
+/// export on `on_lost_leader`. The new leader reads it on `on_became_leader`
+/// and re-imports it into its freshly-promoted gateway. Transient — cleared
+/// after a successful import.
+pub const DEVICE_PAIRINGS_SECRET_KEY: &str = "openclaw.device_pairings_export";
 
 #[derive(Debug, Error)]
 pub enum OpenClawError {
@@ -134,6 +141,90 @@ impl OpenClawManager {
         Ok(())
     }
 
+    /// Export paired devices from the local OpenClaw gateway.
+    ///
+    /// Runs `openclaw devices export --format json` and returns stdout.
+    /// Called on `on_lost_leader` — the result is written to
+    /// `fleet_secrets.openclaw.device_pairings_export` so the incoming
+    /// leader can re-import it on `on_became_leader`.
+    ///
+    /// Returns an empty string if OpenClaw reports no devices (rather
+    /// than an error) so the caller can uniformly stash-and-clear.
+    pub async fn export_devices(&self) -> Result<String, OpenClawError> {
+        info!("openclaw: exporting paired devices via openclaw CLI");
+        let output = Command::new("openclaw")
+            .args(["devices", "export", "--format", "json"])
+            .output()?;
+        if !output.status.success() {
+            let err = String::from_utf8_lossy(&output.stderr).to_string();
+            return Err(OpenClawError::Cli(format!(
+                "devices export failed: {err}"
+            )));
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        info!(
+            bytes = stdout.len(),
+            "openclaw: exported paired devices"
+        );
+        Ok(stdout)
+    }
+
+    /// Import paired devices into the local OpenClaw gateway.
+    ///
+    /// Runs `openclaw devices import --format json` and pipes `json_export`
+    /// to stdin. Returns the number of devices imported per OpenClaw's
+    /// reported output (best-effort — an opaque 0 is returned if the
+    /// output can't be parsed).
+    ///
+    /// Called on `on_became_leader` after reading the export from
+    /// `fleet_secrets`. If `json_export` is empty/whitespace, this is a
+    /// no-op returning `Ok(0)` rather than an error.
+    pub async fn import_devices(
+        &self,
+        json_export: &str,
+    ) -> Result<usize, OpenClawError> {
+        if json_export.trim().is_empty() {
+            info!("openclaw: device export is empty — nothing to import");
+            return Ok(0);
+        }
+        info!(
+            bytes = json_export.len(),
+            "openclaw: importing paired devices via openclaw CLI"
+        );
+        let mut child = Command::new("openclaw")
+            .args(["devices", "import", "--format", "json"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(json_export.as_bytes())?;
+            // Dropping stdin closes it — openclaw will proceed once EOF
+            // arrives.
+        }
+
+        let output = child.wait_with_output()?;
+        if !output.status.success() {
+            let err = String::from_utf8_lossy(&output.stderr).to_string();
+            return Err(OpenClawError::Cli(format!(
+                "devices import failed: {err}"
+            )));
+        }
+
+        // Best-effort parse: OpenClaw is expected to print a line like
+        // "imported 14 device(s)" or emit JSON {"imported":14}. Pull the
+        // first integer we find.
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let count = stdout
+            .split(|c: char| !c.is_ascii_digit())
+            .find(|s| !s.is_empty())
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0);
+        info!(count, "openclaw: imported paired devices");
+        Ok(count)
+    }
+
     /// Demote this machine's OpenClaw to node mode pointing at `leader_url`.
     ///
     /// Called on `on_lost_leader` or when first observing someone else as
@@ -171,6 +262,33 @@ pub async fn lookup_gateway_url(pool: &PgPool) -> Result<Option<String>, sqlx::E
             .fetch_optional(pool)
             .await?;
     Ok(row.map(|r| r.0))
+}
+
+/// Read the transient paired-device export from `fleet_secrets`. Returns
+/// `None` if the previous leader never stashed anything (e.g. cold fleet
+/// or the old leader crashed before exporting). The new leader reads this
+/// during `on_became_leader`; if present, it `import_devices(…)` and then
+/// clears the secret via `clear_device_pairings_export`.
+pub async fn lookup_device_pairings_export(
+    pool: &PgPool,
+) -> Result<Option<String>, sqlx::Error> {
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT value FROM fleet_secrets WHERE key = $1",
+    )
+    .bind(DEVICE_PAIRINGS_SECRET_KEY)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| r.0))
+}
+
+/// Delete the transient paired-device export secret. Called after a
+/// successful import so the next leader change starts from a clean slate.
+pub async fn clear_device_pairings_export(pool: &PgPool) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM fleet_secrets WHERE key = $1")
+        .bind(DEVICE_PAIRINGS_SECRET_KEY)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────

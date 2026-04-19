@@ -35,3 +35,4 @@ tokio.workspace = true
 tracing.workspace = true
 unicode-width = "0.2"
 uuid.workspace = true
+async-nats = "0.37"

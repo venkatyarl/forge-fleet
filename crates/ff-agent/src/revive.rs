@@ -52,6 +52,11 @@ pub struct ReviveTarget {
     pub ssh_port: i32,
     pub mac_addresses: Vec<String>,
     pub os_family: String,
+    /// One of `lan`, `tailscale_only`, `wan`. Used to decide whether WoL is
+    /// a sensible fallback when SSH is unreachable. For tailscale_only or
+    /// wan targets we skip WoL entirely — magic packets don't traverse
+    /// overlay networks or the public internet.
+    pub network_scope: String,
 }
 
 /// Terminal outcome of a single `attempt()` call.
@@ -151,12 +156,18 @@ impl ReviveManager {
     }
 
     /// Load target metadata for a computer id from the DB.
+    ///
+    /// `primary_ip` is rewritten to the "best reachable" IP — LAN preferred,
+    /// Tailscale fallback — via `fleet_info::resolve_best_ip`. This means
+    /// SSH probes for a tailscale-only computer automatically target the
+    /// 100.64.x address rather than a stale LAN IP.
     pub async fn load_target(
         &self,
         computer_id: uuid::Uuid,
     ) -> Result<ReviveTarget, ReviveError> {
         let row = sqlx::query(
-            "SELECT id, name, primary_ip, ssh_user, ssh_port, mac_addresses, os_family
+            "SELECT id, name, primary_ip, ssh_user, ssh_port, mac_addresses, os_family,
+                    COALESCE(network_scope, 'lan') AS network_scope
              FROM computers
              WHERE id = $1",
         )
@@ -165,13 +176,16 @@ impl ReviveManager {
         .await?
         .ok_or_else(|| ReviveError::TargetNotFound(computer_id.to_string()))?;
 
-        row_to_target(&row)
+        let mut target = row_to_target(&row)?;
+        rewrite_primary_ip_if_possible(&mut target).await;
+        Ok(target)
     }
 
     /// Load target metadata by unique computer name.
     pub async fn load_target_by_name(&self, name: &str) -> Result<ReviveTarget, ReviveError> {
         let row = sqlx::query(
-            "SELECT id, name, primary_ip, ssh_user, ssh_port, mac_addresses, os_family
+            "SELECT id, name, primary_ip, ssh_user, ssh_port, mac_addresses, os_family,
+                    COALESCE(network_scope, 'lan') AS network_scope
              FROM computers
              WHERE name = $1",
         )
@@ -180,7 +194,9 @@ impl ReviveManager {
         .await?
         .ok_or_else(|| ReviveError::TargetNotFound(name.to_string()))?;
 
-        row_to_target(&row)
+        let mut target = row_to_target(&row)?;
+        rewrite_primary_ip_if_possible(&mut target).await;
+        Ok(target)
     }
 
     /// Append a `revive_attempt` row to `computer_downtime_events` for
@@ -287,7 +303,22 @@ impl ReviveManager {
     }
 
     /// Send WoL to every known MAC; if we have none, return Failed.
+    ///
+    /// Skipped entirely for computers whose only reachability is via an
+    /// overlay network (Tailscale) or the public internet (WAN). Magic
+    /// packets are link-local and won't traverse those paths.
     async fn try_wol_or_fail(&self, target: &ReviveTarget) -> Result<ReviveOutcome, ReviveError> {
+        if target.network_scope == "tailscale_only" || target.network_scope == "wan" {
+            info!(
+                node = %target.name,
+                scope = %target.network_scope,
+                "skipping WoL — target reachable only via overlay/WAN, magic packets won't help"
+            );
+            return Ok(ReviveOutcome::Failed(format!(
+                "SSH unreachable, WoL not applicable for network_scope='{}'",
+                target.network_scope
+            )));
+        }
         if target.mac_addresses.is_empty() {
             return Ok(ReviveOutcome::Failed(
                 "SSH unreachable and no MAC for WoL".into(),
@@ -388,6 +419,25 @@ fn parse_mac(s: &str) -> Option<[u8; 6]> {
     Some(out)
 }
 
+/// If `fleet_info::resolve_best_ip` knows a better IP (LAN preferred over
+/// tailscale), overwrite the target's `primary_ip` so SSH/probe calls hit
+/// the right interface. Silently leaves the target unchanged on any error —
+/// the stored `primary_ip` is a safe fallback.
+async fn rewrite_primary_ip_if_possible(target: &mut ReviveTarget) {
+    if let Some((ip, kind)) = crate::fleet_info::resolve_best_ip(&target.name).await {
+        if ip != target.primary_ip {
+            debug!(
+                node = %target.name,
+                old_ip = %target.primary_ip,
+                new_ip = %ip,
+                kind = %kind,
+                "revive: resolved better IP for target"
+            );
+            target.primary_ip = ip;
+        }
+    }
+}
+
 /// Shared row-extraction helper — pulls a `ReviveTarget` from a selected row.
 fn row_to_target(row: &sqlx::postgres::PgRow) -> Result<ReviveTarget, ReviveError> {
     let mac_json: serde_json::Value = row
@@ -402,6 +452,10 @@ fn row_to_target(row: &sqlx::postgres::PgRow) -> Result<ReviveTarget, ReviveErro
         })
         .unwrap_or_default();
 
+    let network_scope: String = row
+        .try_get::<String, _>("network_scope")
+        .unwrap_or_else(|_| "lan".to_string());
+
     Ok(ReviveTarget {
         computer_id: row.get("id"),
         name: row.get("name"),
@@ -410,6 +464,7 @@ fn row_to_target(row: &sqlx::postgres::PgRow) -> Result<ReviveTarget, ReviveErro
         ssh_port: row.get("ssh_port"),
         mac_addresses,
         os_family: row.get("os_family"),
+        network_scope,
     })
 }
 

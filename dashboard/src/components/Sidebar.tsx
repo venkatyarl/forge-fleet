@@ -20,6 +20,13 @@ const mainSections: NavSection[] = [
     items: [],
   },
   {
+    id: 'pulse',
+    title: 'Pulse',
+    icon: '📡',
+    link: '/pulse',
+    items: [],
+  },
+  {
     id: 'brain',
     title: 'Brain',
     icon: '🧠',

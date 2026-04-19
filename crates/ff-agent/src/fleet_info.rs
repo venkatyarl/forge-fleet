@@ -206,6 +206,118 @@ pub async fn fetch_node_ip_user(name: &str) -> Option<(String, String)> {
     }
 }
 
+/// Resolve the best reachable IP for a computer by name, in priority order:
+///   1. Any entry in `computers.all_ips` with `kind == "lan"`.
+///   2. `computers.primary_ip` if it looks LAN-routable
+///      (i.e. 10.x, 192.168.x, or 172.16-31.x).
+///   3. Any entry in `computers.all_ips` with `kind == "tailscale"`.
+///   4. `computers.primary_ip` as a last resort (may be a Tailscale IP
+///      already on a Tailscale-only box).
+///
+/// Returns `(ip, kind)` where `kind` is one of `"lan"`, `"tailscale"`,
+/// `"wireguard"`, or `"public"`. Returns `None` if no computer row exists.
+///
+/// Call sites should use this when opening an SSH/probe connection to a peer
+/// — it prefers LAN for latency/cost but transparently falls back to an
+/// overlay network when that's all the box has.
+pub async fn resolve_best_ip(computer_name: &str) -> Option<(String, String)> {
+    let pool = get_fleet_pool().await.ok()?;
+    let row = sqlx::query_as::<_, (String, serde_json::Value, String)>(
+        "SELECT primary_ip, all_ips, network_scope
+         FROM computers
+         WHERE LOWER(name) = LOWER($1)",
+    )
+    .bind(computer_name)
+    .fetch_optional(&pool)
+    .await
+    .ok()
+    .flatten()?;
+
+    let (primary_ip, all_ips, network_scope) = row;
+
+    // Parse all_ips into (ip, kind) pairs.
+    let pairs: Vec<(String, String)> = all_ips
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| {
+                    let obj = v.as_object()?;
+                    let ip = obj.get("ip")?.as_str()?.to_string();
+                    let kind = obj
+                        .get("kind")
+                        .and_then(|k| k.as_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    Some((ip, kind))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // If explicitly tailscale_only, prefer the tailscale entry straight away.
+    if network_scope == "tailscale_only" {
+        if let Some((ip, kind)) = pairs.iter().find(|(_, k)| k == "tailscale") {
+            return Some((ip.clone(), kind.clone()));
+        }
+    }
+
+    // 1. LAN from all_ips.
+    if let Some((ip, kind)) = pairs.iter().find(|(_, k)| k == "lan") {
+        return Some((ip.clone(), kind.clone()));
+    }
+
+    // 2. primary_ip if it looks LAN-routable.
+    if is_lan_ip(&primary_ip) {
+        return Some((primary_ip, "lan".to_string()));
+    }
+
+    // 3. Tailscale from all_ips.
+    if let Some((ip, kind)) = pairs.iter().find(|(_, k)| k == "tailscale") {
+        return Some((ip.clone(), kind.clone()));
+    }
+
+    // 4. primary_ip as last resort — classify it so the caller can decide.
+    let kind = classify_ip(&primary_ip);
+    Some((primary_ip, kind))
+}
+
+fn is_lan_ip(ip: &str) -> bool {
+    ip.starts_with("10.")
+        || ip.starts_with("192.168.")
+        || ip.starts_with("172.16.")
+        || ip.starts_with("172.17.")
+        || ip.starts_with("172.18.")
+        || ip.starts_with("172.19.")
+        || ip.starts_with("172.2")
+        || ip.starts_with("172.30.")
+        || ip.starts_with("172.31.")
+}
+
+fn classify_ip(ip: &str) -> String {
+    if ip.starts_with("100.64.") || ip.starts_with("100.65.") {
+        "tailscale".to_string()
+    } else if is_lan_ip(ip) {
+        "lan".to_string()
+    } else {
+        "public".to_string()
+    }
+}
+
+/// Fetch a computer's `network_scope` setting. Returns "lan" as the safe
+/// default if the row does not exist or the column is unset.
+pub async fn fetch_network_scope(computer_name: &str) -> String {
+    let Ok(pool) = get_fleet_pool().await else { return "lan".to_string() };
+    let row = sqlx::query_as::<_, (String,)>(
+        "SELECT network_scope FROM computers WHERE LOWER(name) = LOWER($1)",
+    )
+    .bind(computer_name)
+    .fetch_optional(&pool)
+    .await
+    .ok()
+    .flatten();
+    row.map(|r| r.0).unwrap_or_else(|| "lan".to_string())
+}
+
 /// Ensure the cached fleet snapshot is populated. Safe to call multiple times.
 pub async fn ensure_snapshot_cached() -> &'static FleetSnapshot {
     FLEET_SNAPSHOT

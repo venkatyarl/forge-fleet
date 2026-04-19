@@ -14,6 +14,8 @@
 #   version_source        — inline table describing how to detect installed version
 #   upgrade_playbook      — inline table of shell commands keyed by
 #                           "<os>-<install_source>" | "<os>" | "all"
+#                           Windows-specific keys: "windows-winget", "windows-choco"
+#                           (UNTESTED — scaffolded for future Windows nodes).
 #   requires_restart      — bool, default false (service restart after upgrade)
 #   requires_reboot       — bool, default false (OS reboot — only for kind=os)
 
@@ -74,6 +76,8 @@ requires_restart = false
 macos = "brew upgrade gh"
 linux-ubuntu = "sudo apt-get update && sudo apt-get -y install --only-upgrade gh"
 linux-dgx = "sudo apt-get update && sudo apt-get -y install --only-upgrade gh"
+windows-winget = "winget upgrade --id GitHub.cli --silent --accept-source-agreements --accept-package-agreements"
+windows-choco = "choco upgrade gh -y"
 
 [[software]]
 id = "op"
@@ -86,6 +90,8 @@ requires_restart = false
 macos-brew-cask = "brew upgrade --cask 1password-cli"
 linux-ubuntu = "curl -sS https://downloads.1password.com/linux/keys/1password.asc | sudo gpg --dearmor --output /usr/share/keyrings/1password-archive-keyring.gpg && echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/1password-archive-keyring.gpg] https://downloads.1password.com/linux/debian/amd64 stable main' | sudo tee /etc/apt/sources.list.d/1password.list && sudo apt-get update && sudo apt-get -y install --only-upgrade 1password-cli"
 linux-dgx = "sudo apt-get update && sudo apt-get -y install --only-upgrade 1password-cli"
+windows-winget = "winget upgrade --id AgileBits.1Password.CLI --silent --accept-source-agreements --accept-package-agreements"
+windows-choco = "choco upgrade 1password-cli -y"
 
 [[software]]
 id = "rustup"
@@ -146,6 +152,8 @@ requires_restart = true
 macos = "brew upgrade ollama"
 linux-ubuntu = "curl -fsSL https://ollama.com/install.sh | sh"
 linux-dgx = "curl -fsSL https://ollama.com/install.sh | sh"
+windows-winget = "winget upgrade --id Ollama.Ollama --silent --accept-source-agreements --accept-package-agreements"
+windows-choco = "choco upgrade ollama -y"
 
 # ---------------------------------------------------------------------------
 # System runtimes
@@ -162,6 +170,8 @@ requires_restart = false
 macos-brew = "brew upgrade node@22"
 linux-ubuntu = "curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash - && sudo apt-get install -y nodejs"
 linux-dgx = "curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash - && sudo apt-get install -y nodejs"
+windows-winget = "winget upgrade --id OpenJS.NodeJS.LTS --silent --accept-source-agreements --accept-package-agreements"
+windows-choco = "choco upgrade nodejs-lts -y"
 
 [[software]]
 id = "python"
@@ -174,6 +184,8 @@ requires_restart = false
 macos-brew = "brew upgrade python@3.12"
 linux-ubuntu = "sudo apt-get update && sudo apt-get -y install --only-upgrade python3"
 linux-dgx = "sudo apt-get update && sudo apt-get -y install --only-upgrade python3"
+windows-winget = "winget upgrade --id Python.Python.3.12 --silent --accept-source-agreements --accept-package-agreements"
+windows-choco = "choco upgrade python -y"
 
 [[software]]
 id = "docker"
@@ -186,6 +198,8 @@ requires_restart = true
 macos-brew-cask = "brew upgrade --cask docker"
 linux-ubuntu = "sudo apt-get update && sudo apt-get -y install --only-upgrade docker.io"
 linux-dgx = "sudo apt-get update && sudo apt-get -y install --only-upgrade docker.io"
+windows-winget = "winget upgrade --id Docker.DockerDesktop --silent --accept-source-agreements --accept-package-agreements"
+windows-choco = "choco upgrade docker-desktop -y"
 
 # ---------------------------------------------------------------------------
 # Operating systems (one entry per variant)
@@ -238,3 +252,18 @@ requires_reboot = true
 
 [software.upgrade_playbook]
 linux-dgx = "sudo apt-get update && sudo apt-get -y install --only-upgrade dgx-release"
+
+# UNTESTED — future Windows node support. Upgrades intentionally use
+# winget (modern built-in) with choco as fallback for older SKUs.
+[[software]]
+id = "os-windows"
+display_name = "Microsoft Windows"
+kind = "os"
+applies_to_os_family = "windows"
+version_source = { method = "cmd", args = ["powershell", "-NoProfile", "-Command", "(Get-CimInstance Win32_OperatingSystem).Version"], regex = "(\\S+)" }
+requires_restart = true
+requires_reboot = true
+
+[software.upgrade_playbook]
+windows-winget = "winget upgrade --all --silent --accept-source-agreements --accept-package-agreements"
+windows = "powershell -NoProfile -Command \"Install-Module PSWindowsUpdate -Force -Scope CurrentUser -AcceptLicense; Get-WindowsUpdate -Install -AcceptAll -AutoReboot\""

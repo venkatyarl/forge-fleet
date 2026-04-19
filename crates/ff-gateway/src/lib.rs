@@ -12,9 +12,11 @@
 pub mod discord;
 pub mod embed;
 pub mod brain_api;
+pub mod llm_routing;
 pub mod message;
 pub mod middleware;
 pub mod onboard;
+pub mod pulse_api;
 pub mod router;
 pub mod server;
 pub mod static_files;

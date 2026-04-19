@@ -54,3 +54,14 @@ duration_secs = 30
 severity = "critical"
 cooldown_secs = 600
 channel = "telegram"
+
+[[policy]]
+name = "secret_expiring_soon"
+description = "A fleet_secret is within 14 days of expiry"
+metric = "secret_expiry_days_remaining"
+scope = "leader_only"
+condition = "< 14"
+duration_secs = 60
+severity = "warning"
+cooldown_secs = 86400
+channel = "telegram"

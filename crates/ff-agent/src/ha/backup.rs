@@ -24,6 +24,7 @@
 //! the leader actually shells out to `pg_basebackup`.
 
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::time::Duration;
 
 use chrono::Utc;
@@ -38,6 +39,14 @@ use uuid::Uuid;
 
 use ff_db::pg_enqueue_deferred;
 use ff_db::leader_state::pg_get_current_leader;
+use ff_db::{pg_get_secret, pg_set_secret};
+
+/// fleet_secrets key that stores the age X25519 recipient (public key).
+/// Readable by every fleet node — encryption only.
+pub const BACKUP_ENC_PUBKEY: &str = "backup_encryption_pubkey";
+/// fleet_secrets key that stores the age X25519 identity (private key).
+/// Only operators performing a restore should fetch this.
+pub const BACKUP_ENC_PRIVKEY: &str = "backup_encryption_privkey";
 
 const DEFAULT_POSTGRES_INTERVAL_HOURS: u64 = 4;
 const DEFAULT_REDIS_INTERVAL_HOURS: u64 = 2;
@@ -263,25 +272,32 @@ impl BackupOrchestrator {
         let out_dir = self.backup_dir.join("postgres");
         tokio::fs::create_dir_all(&out_dir).await?;
 
+        // Ensure an age keypair is provisioned in fleet_secrets before we
+        // try to encrypt. If the operator hasn't set one, we generate a
+        // fresh X25519 keypair and store it.
+        let recipient = ensure_backup_keypair(&self.pg).await?;
+
         let ts = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
-        let file_name = format!("pg-{ts}.tar.gz");
+        let file_name = format!("pg-{ts}.tar.gz.age");
         let path = out_dir.join(&file_name);
 
         // pg_basebackup -Ft -z writes a tar+gzip stream to stdout when
         // -D is "-". `-X fetch` is required with "-D -" (streaming WAL
         // to stdout is incompatible with tar-to-stdout). We stream
-        // that into our target file. Runs inside the
-        // forgefleet-postgres container as the replicator role.
+        // that through the `age` CLI (-r <recipient>) for encryption,
+        // and write the ciphertext to path (`pg-*.tar.gz.age`).
         //
-        // Using /bin/sh -c so the redirect is handled by the shell and
-        // we don't need to pipe two tokio Commands together.
+        // Using /bin/sh -c so the pipeline is handled by the shell and
+        // we don't need to wire three tokio Commands together.
         let shell_cmd = format!(
             "docker exec -e PGPASSWORD=replicator-default forgefleet-postgres \
-                 pg_basebackup -h 127.0.0.1 -U replicator -D - -Ft -z -X fetch > {}",
-            shell_quote(&path.to_string_lossy())
+                 pg_basebackup -h 127.0.0.1 -U replicator -D - -Ft -z -X fetch \
+                 | age -r {recipient} > {out}",
+            recipient = shell_quote(&recipient),
+            out = shell_quote(&path.to_string_lossy()),
         );
 
-        info!(path = %path.display(), "running pg_basebackup");
+        info!(path = %path.display(), "running pg_basebackup | age");
         let status = Command::new("sh")
             .arg("-c")
             .arg(&shell_cmd)
@@ -289,7 +305,8 @@ impl BackupOrchestrator {
             .await?;
         if !status.success() {
             return Err(BackupError::Cmd(format!(
-                "pg_basebackup exited with status {status}"
+                "pg_basebackup|age pipeline exited with status {status}; \
+                 is the `age` CLI installed on this host?"
             )));
         }
 
@@ -318,8 +335,10 @@ impl BackupOrchestrator {
         let out_dir = self.backup_dir.join("redis");
         tokio::fs::create_dir_all(&out_dir).await?;
 
+        let recipient = ensure_backup_keypair(&self.pg).await?;
+
         let ts = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
-        let file_name = format!("redis-{ts}.rdb.zst");
+        let file_name = format!("redis-{ts}.rdb.zst.age");
         let path = out_dir.join(&file_name);
 
         // 1) Ask Redis to write an RDB snapshot. BGSAVE is async but
@@ -346,12 +365,15 @@ impl BackupOrchestrator {
             }
         }
 
-        // 3) Stream the dump out of the container through zstd into the
-        //    target file. `docker cp` would copy to a temp first; a
-        //    pipe is both smaller-on-disk and faster.
+        // 3) Stream the dump out of the container through zstd + age
+        //    into the target file. `docker cp` would copy to a temp
+        //    first; a pipe is smaller-on-disk and faster.
         let shell_cmd = format!(
-            "docker exec forgefleet-redis cat /data/dump.rdb | zstd -q -o {}",
-            shell_quote(&path.to_string_lossy())
+            "docker exec forgefleet-redis cat /data/dump.rdb \
+                | zstd -q \
+                | age -r {recipient} > {out}",
+            recipient = shell_quote(&recipient),
+            out = shell_quote(&path.to_string_lossy()),
         );
         let status = Command::new("sh")
             .arg("-c")
@@ -359,13 +381,17 @@ impl BackupOrchestrator {
             .status()
             .await?;
         if !status.success() {
-            // Fallback: try plain gzip if zstd isn't on PATH.
+            // Fallback: try plain gzip if zstd isn't on PATH. Still
+            // encrypt-at-rest via age.
             warn!("zstd unavailable or failed; falling back to gzip");
-            let file_name_gz = format!("redis-{ts}.rdb.gz");
+            let file_name_gz = format!("redis-{ts}.rdb.gz.age");
             let path_gz = out_dir.join(&file_name_gz);
             let shell_cmd_gz = format!(
-                "docker exec forgefleet-redis cat /data/dump.rdb | gzip > {}",
-                shell_quote(&path_gz.to_string_lossy())
+                "docker exec forgefleet-redis cat /data/dump.rdb \
+                    | gzip \
+                    | age -r {recipient} > {out}",
+                recipient = shell_quote(&recipient),
+                out = shell_quote(&path_gz.to_string_lossy()),
             );
             let status_gz = Command::new("sh")
                 .arg("-c")
@@ -632,6 +658,103 @@ fn shell_quote(s: &str) -> String {
     } else {
         format!("'{}'", s.replace('\'', "'\"'\"'"))
     }
+}
+
+/// Ensure the fleet has an `age` keypair available for backup encryption.
+///
+/// On first call (fresh DB), generates a fresh X25519 identity, stores:
+///   - public key  → `fleet_secrets.backup_encryption_pubkey`
+///   - private key → `fleet_secrets.backup_encryption_privkey`
+///
+/// Returns the recipient (public key string, `age1...`) for use with the
+/// `age -r <recipient>` CLI.
+pub async fn ensure_backup_keypair(pool: &PgPool) -> Result<String, BackupError> {
+    if let Some(pub_k) = pg_get_secret(pool, BACKUP_ENC_PUBKEY)
+        .await
+        .map_err(|e| BackupError::Cmd(format!("fleet_secrets lookup: {e}")))?
+    {
+        // Already provisioned.
+        return Ok(pub_k);
+    }
+
+    // Generate a fresh X25519 identity.
+    let identity = age::x25519::Identity::generate();
+    let privkey = identity.to_string();
+    let pubkey = identity.to_public().to_string();
+
+    info!(
+        recipient = %pubkey,
+        "provisioning fleet backup age keypair (first-run)",
+    );
+    pg_set_secret(
+        pool,
+        BACKUP_ENC_PUBKEY,
+        &pubkey,
+        Some("age X25519 recipient for encrypted backups"),
+        Some("backup_orchestrator"),
+    )
+    .await
+    .map_err(|e| BackupError::Cmd(format!("store pubkey: {e}")))?;
+
+    // secrecy::ExposeSecret — we want to persist the privkey string.
+    use secrecy::ExposeSecret;
+    pg_set_secret(
+        pool,
+        BACKUP_ENC_PRIVKEY,
+        privkey.expose_secret(),
+        Some("age X25519 private key for decrypting backups (OPERATOR ONLY)"),
+        Some("backup_orchestrator"),
+    )
+    .await
+    .map_err(|e| BackupError::Cmd(format!("store privkey: {e}")))?;
+
+    Ok(pubkey)
+}
+
+/// Decrypt an `.age` backup file using the fleet's stored identity.
+/// Writes the plaintext to `dest` and returns `()` on success.
+///
+/// Reads `backup_encryption_privkey` from `fleet_secrets`. Callers must
+/// have operator-level access — avoid exposing this over general RPC.
+pub async fn decrypt_backup_file(
+    pool: &PgPool,
+    encrypted: &Path,
+    dest: &Path,
+) -> Result<(), BackupError> {
+    let privkey_str = pg_get_secret(pool, BACKUP_ENC_PRIVKEY)
+        .await
+        .map_err(|e| BackupError::Cmd(format!("fleet_secrets lookup: {e}")))?
+        .ok_or_else(|| {
+            BackupError::Cmd("fleet_secrets.backup_encryption_privkey not set".into())
+        })?;
+
+    let identity = age::x25519::Identity::from_str(privkey_str.trim())
+        .map_err(|e| BackupError::Cmd(format!("parse age identity: {e}")))?;
+
+    let ciphertext = tokio::fs::read(encrypted).await?;
+    // age 0.11 Decryptor::new is sync + returns a Decryptor that adapts
+    // to Recipients or Passphrase modes. Run it off the async thread.
+    let plaintext = tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let decryptor = age::Decryptor::new(&ciphertext[..])
+            .map_err(|e| BackupError::Cmd(format!("age decryptor: {e}")))?;
+        let mut reader = decryptor
+            .decrypt(std::iter::once(&identity as &dyn age::Identity))
+            .map_err(|e| BackupError::Cmd(format!("age decrypt: {e}")))?;
+        let mut out = Vec::new();
+        reader
+            .read_to_end(&mut out)
+            .map_err(|e| BackupError::Cmd(format!("age read: {e}")))?;
+        Ok::<Vec<u8>, BackupError>(out)
+    })
+    .await
+    .map_err(|e| BackupError::Cmd(format!("decrypt task: {e}")))??;
+
+    if let Some(parent) = dest.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    tokio::fs::write(dest, plaintext).await?;
+    Ok(())
 }
 
 #[cfg(test)]

@@ -22,3 +22,7 @@ tokio-stream = "0.1"
 uuid.workspace = true
 sqlx = { workspace = true }
 regex = "1"
+async-nats = "0.37"
+hmac = "0.12"
+sha2 = { workspace = true }
+subtle = "2"

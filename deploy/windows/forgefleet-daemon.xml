@@ -1,0 +1,32 @@
+<!--
+  ForgeFleet Windows service manifest.
+
+  This XML is consumed by NSSM (Non-Sucking Service Manager, see
+  scripts/install-windows-service.ps1) to wrap `ff daemon` as a
+  proper Windows service. It can also be read by future tooling
+  such as `sc.exe` configuration generators.
+
+  Status: UNTESTED. Windows is future hardware. This manifest is
+  scaffolding for when a Windows node joins the fleet.
+
+  Operational notes:
+    - `%USERPROFILE%\.local\bin\ff.exe` mirrors the Unix install
+      layout. The installer PowerShell script is responsible for
+      copying the binary here.
+    - Logs land in `%USERPROFILE%\.forgefleet\logs\` to match
+      macOS/Linux daemon log layout.
+    - `onfailure action=restart delay=30 sec` gives the crash
+      loop enough breathing room to avoid thrashing the service
+      control manager — 30s matches the SSH probe timeout budget
+      the rest of the fleet uses for revive attempts.
+-->
+<service>
+  <id>forgefleet-daemon</id>
+  <name>ForgeFleet Daemon</name>
+  <description>ForgeFleet daemon — fleet coordination + Pulse</description>
+  <executable>%USERPROFILE%\.local\bin\ff.exe</executable>
+  <arguments>daemon</arguments>
+  <logmode>append</logmode>
+  <logpath>%USERPROFILE%\.forgefleet\logs</logpath>
+  <onfailure action="restart" delay="30 sec"/>
+</service>

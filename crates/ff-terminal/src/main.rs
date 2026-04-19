@@ -112,12 +112,26 @@ enum Command {
     Alert { #[command(subcommand)] command: AlertCommand },
     /// Metrics history (downsampled Pulse beats, 90-day retention).
     Metrics { #[command(subcommand)] command: MetricsCommand },
-    /// Tail fleet logs via NATS (stub — requires FORGEFLEET_NATS_URL).
+    /// Tail fleet logs via NATS. Requires FORGEFLEET_NATS_URL (default nats://127.0.0.1:4222).
+    /// Subscribes to `logs.{computer}.{service}.>`.
     Logs {
         #[arg(long)] computer: Option<String>,
         #[arg(long)] service: Option<String>,
         #[arg(long, default_value_t = 50)] tail: usize,
     },
+    /// Subscribe to the NATS fleet-events bus and stream events to stdout.
+    /// Subject defaults to `fleet.events.>`; supply `--subject` to narrow
+    /// (e.g. `fleet.events.member.>` or `fleet.pulse.>`).
+    Events { #[command(subcommand)] command: EventsCommand },
+    /// Shared NFS storage — declare exported volumes and mount them on
+    /// fleet nodes. See `ff storage share --help`.
+    Storage { #[command(subcommand)] command: StorageCommand },
+    /// Power scheduling — cron-driven sleep/wake/restart rules per computer.
+    Power { #[command(subcommand)] command: PowerCommand },
+    /// LoRA / full-finetune training job orchestration.
+    Train { #[command(subcommand)] command: TrainCommand },
+    /// Port registry — inventory of every port ForgeFleet uses.
+    Ports { #[command(subcommand)] command: PortsCommand },
     /// Run ForgeFleet's unified daemon: deferred-task scheduler+worker, disk
     /// sampler, and deployment reconciler all in one long-lived process.
     /// Typically run on boot via launchd/systemd.
@@ -249,6 +263,69 @@ enum FleetCommand {
         #[command(subcommand)]
         command: TaskCoverageCommand,
     },
+    /// Revoke a computer's SSH trust across the fleet. Removes its
+    /// user public key from every other alive computer's authorized_keys.
+    RevokeTrust {
+        /// Computer name whose key should be revoked (e.g. "marcus").
+        #[arg(long)] computer: String,
+        /// Required — revocation is destructive.
+        #[arg(long, default_value_t = false)] yes: bool,
+    },
+    /// Rotate a computer's own SSH keypair. Currently stubbed.
+    RotateSshKey {
+        #[arg(long)] computer: String,
+    },
+    /// Rotate the fleet-wide pulse_beat_hmac_key. Every daemon picks up
+    /// the new key on next 5-minute refresh cycle.
+    RotatePulseHmac {
+        /// Optional explicit value (64 hex chars). If omitted, generate.
+        #[arg(long)] value: Option<String>,
+    },
+    /// Encrypted backup — produce one now and report path + recipient.
+    Backup {
+        /// Backup kind: postgres, redis, or all.
+        #[arg(long, default_value = "postgres")] kind: String,
+        /// Bypass the "leader only" gate (run locally regardless).
+        #[arg(long, default_value_t = false)] force: bool,
+    },
+    /// Set a computer's network_scope (lan | tailscale_only | wan).
+    ///
+    /// Controls whether revive tries WoL (LAN only) and which IP the
+    /// fleet prefers when opening SSH / Pulse connections. The default
+    /// `lan` matches every LAN-joined node; tailscale-only laptops and
+    /// off-site WAN replicas should be explicitly set.
+    SetNetworkScope {
+        /// Computer name, e.g. "taylor".
+        computer: String,
+        /// One of: lan | tailscale_only | wan.
+        scope: String,
+    },
+    /// Database / replica operations.
+    Db {
+        #[command(subcommand)]
+        command: FleetDbCommand,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum FleetDbCommand {
+    /// Register an off-site Postgres replica reachable via Tailscale (or
+    /// another overlay network). Stores a row in `database_replicas` with
+    /// role='wan_replica' and prints the compose command to run on the
+    /// remote machine. See deploy/WAN_REPLICATION.md for the full runbook.
+    AddRemoteReplica {
+        /// Name of the computer that will host the replica (must already
+        /// exist in the `computers` table — run `ff onboard` first).
+        #[arg(long)]
+        computer: String,
+        /// Overlay transport. Currently only `tailscale` is recognised;
+        /// other values print a warning but still record the row.
+        #[arg(long, default_value = "tailscale")]
+        via: String,
+        /// Skip the Tailscale reachability probe (used for docs / dry run).
+        #[arg(long, default_value_t = false)]
+        skip_probe: bool,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -286,6 +363,22 @@ enum SoftwareCommand {
 }
 
 #[derive(Debug, Clone, Subcommand)]
+enum PortsCommand {
+    /// List all registered ports. Filter by kind / scope, or emit JSON.
+    List {
+        #[arg(long)] kind: Option<String>,
+        #[arg(long)] scope: Option<String>,
+        #[arg(long)] json: bool,
+    },
+    /// Seed (upsert) the port_registry table from config/ports.toml.
+    Seed,
+    /// Scan a computer to see what's actually listening, and cross-reference
+    /// with port_registry. Reports unexpected listeners and missing
+    /// expected services.
+    Scan { computer: String },
+}
+
+#[derive(Debug, Clone, Subcommand)]
 enum BrainCommand {
     /// Run a full vault index (parse all .md files, upsert nodes + edges).
     Index {
@@ -308,6 +401,37 @@ enum OpenclawCommand {
     Status {
         #[arg(long)]
         json: bool,
+    },
+    /// Paired-device migration helpers (phone/IoT/browser pairings that
+    /// otherwise break on a leader change).
+    Devices {
+        #[command(subcommand)]
+        command: OpenclawDevicesCommand,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum OpenclawDevicesCommand {
+    /// Export paired devices from the local OpenClaw gateway to stdout.
+    /// Equivalent to `openclaw devices export --format json`, but routed
+    /// through the ForgeFleet OpenClawManager so we can also stash the
+    /// result into `fleet_secrets.openclaw.device_pairings_export` for
+    /// the next leader to pick up.
+    Export {
+        /// Also write the export into fleet_secrets (same key the
+        /// automatic demotion flow uses).
+        #[arg(long, default_value_t = false)]
+        stash: bool,
+    },
+    /// Import paired devices into the local OpenClaw gateway. Reads
+    /// JSON from stdin (or --from-secret) and pipes into
+    /// `openclaw devices import --format json`.
+    Import {
+        /// Instead of reading stdin, read the stashed secret
+        /// `openclaw.device_pairings_export` from fleet_secrets. Clears
+        /// the secret after a successful import.
+        #[arg(long, default_value_t = false)]
+        from_secret: bool,
     },
 }
 
@@ -527,6 +651,139 @@ enum ModelCommand {
         /// Human-readable retirement reason.
         #[arg(long)] reason: String,
     },
+    /// Benchmark a model against a standard prompt suite. Writes results
+    /// into `model_catalog.benchmark_results` keyed by computer + timestamp.
+    Benchmark {
+        /// Catalog id of the model to benchmark (e.g. `qwen2.5-coder`).
+        model_id: String,
+        /// Target computer (default: current host).
+        #[arg(long)] computer: Option<String>,
+        #[arg(long, default_value_t = false)] json: bool,
+    },
+    /// Show benchmark history for one model (or recent history across all).
+    Benchmarks {
+        /// Limit to a specific model catalog id.
+        #[arg(long)] model: Option<String>,
+    },
+}
+
+// ─── Phase 12: storage / power / train subcommands ─────────────────────────
+
+#[derive(Debug, Clone, Subcommand)]
+enum StorageCommand {
+    /// Shared NFS volumes.
+    Share { #[command(subcommand)] command: StorageShareCommand },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum StorageShareCommand {
+    /// Register a new NFS export (writes DB row + best-effort configures
+    /// the host's /etc/exports). The exact mount commands differ by OS —
+    /// see module docs on `shared_storage`.
+    Create {
+        /// Human-readable share name (unique).
+        #[arg(long)] name: String,
+        /// Host computer that exports this path.
+        #[arg(long)] host: String,
+        /// Absolute path on the host that gets exported.
+        #[arg(long)] path: String,
+        /// Default mount path on clients (default: same as --path).
+        #[arg(long)] mount_path: Option<String>,
+        /// Purpose tag: "models" | "training_data" | "outputs" | ...
+        #[arg(long)] purpose: Option<String>,
+        /// Read-only mount.
+        #[arg(long, default_value_t = false)] read_only: bool,
+    },
+    /// Mount a named share on a target computer.
+    Mount {
+        /// Share name.
+        name: String,
+        /// Target computer.
+        #[arg(long)] computer: String,
+        /// Optional override mount path (defaults to share's mount_path).
+        #[arg(long)] path: Option<String>,
+    },
+    /// Unmount a named share on a target computer.
+    Unmount {
+        /// Share name.
+        name: String,
+        /// Target computer.
+        #[arg(long)] computer: String,
+    },
+    /// List all registered shares and their mount status.
+    #[command(alias = "ls")]
+    List,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum PowerCommand {
+    /// Cron-driven sleep / wake / restart schedules.
+    Schedule { #[command(subcommand)] command: PowerScheduleCommand },
+    /// List all schedules.
+    #[command(alias = "ls")]
+    Schedules {
+        #[arg(long)] computer: Option<String>,
+    },
+    /// Manually run the scheduler evaluation pass once (dry-fire).
+    Tick,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum PowerScheduleCommand {
+    /// Create a sleep / wake / restart schedule for a computer.
+    Create {
+        /// Computer name (e.g. "taylor").
+        computer: String,
+        /// Schedule kind.
+        #[arg(value_parser = ["sleep", "wake", "restart"])]
+        kind: String,
+        /// 5-field cron expression (e.g. "0 0 * * *").
+        #[arg(long)] cron: String,
+        /// Optional condition — v1 supports only `idle_minutes > N`.
+        #[arg(long = "if-idle")] if_idle: Option<i64>,
+    },
+    /// Delete a schedule by id.
+    Delete {
+        id: String,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum TrainCommand {
+    /// Create a new training job in `queued` state.
+    Create {
+        /// Name for the run.
+        #[arg(long)] name: String,
+        /// Base model catalog id (e.g. "qwen3-8b").
+        #[arg(long)] base: Option<String>,
+        /// Training dataset path on the target computer.
+        #[arg(long)] dataset: String,
+        /// Optional output directory for the adapter.
+        #[arg(long)] output: Option<String>,
+        /// Training type.
+        #[arg(long, default_value = "lora")] training_type: String,
+        /// Target computer (where the script runs).
+        #[arg(long)] computer: Option<String>,
+        #[arg(long)] epochs: Option<u32>,
+        #[arg(long = "lr")] learning_rate: Option<f64>,
+        #[arg(long = "batch-size")] batch_size: Option<u32>,
+        #[arg(long = "lora-rank")] lora_rank: Option<u32>,
+        #[arg(long = "max-seq-len")] max_seq_len: Option<u32>,
+    },
+    /// Start a queued training job (enqueues a deferred_tasks row).
+    Start {
+        id: String,
+    },
+    /// List training jobs.
+    #[command(alias = "ls")]
+    List {
+        #[arg(long)] status: Option<String>,
+        #[arg(long, default_value_t = 25)] limit: i64,
+    },
+    /// Show details for one training job (by UUID).
+    Show {
+        id: String,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -582,6 +839,15 @@ enum SecretsCommand {
     /// Delete a secret by key.
     #[command(alias = "rm")]
     Delete { key: String },
+    /// Rotate a secret's value. If --value is given, uses it; otherwise
+    /// generates a fresh 32-byte hex value and stores it. Also bumps
+    /// rotation_count and extends expires_at by rotate_before_days.
+    Rotate {
+        key: String,
+        #[arg(long)] value: Option<String>,
+    },
+    /// List secrets whose `expires_at` is within `rotate_before_days`.
+    Expirations,
 }
 
 #[derive(Debug, Subcommand)]
@@ -602,6 +868,20 @@ enum TaskCommand {
         id: String,
         #[arg(long)]
         status: String,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum EventsCommand {
+    /// Subscribe to the NATS fleet event bus and print events as they arrive.
+    /// Default subject is `fleet.events.>`; use `--subject` to narrow.
+    Tail {
+        /// NATS subject filter (supports wildcards `*` and `>`).
+        #[arg(long, default_value = "fleet.events.>")]
+        subject: String,
+        /// Pretty-print JSON payloads instead of one-line compact.
+        #[arg(long, default_value_t = false)]
+        pretty: bool,
     },
 }
 
@@ -640,6 +920,11 @@ async fn main() -> Result<()> {
         Some(Command::Logs { computer, service, tail }) => {
             return handle_logs(computer.clone(), service.clone(), *tail).await;
         }
+        Some(Command::Events { command }) => return handle_events(command.clone()).await,
+        Some(Command::Storage { command }) => return handle_storage(command.clone()).await,
+        Some(Command::Power { command }) => return handle_power(command.clone()).await,
+        Some(Command::Train { command }) => return handle_train(command.clone()).await,
+        Some(Command::Ports { command }) => return handle_ports(command.clone()).await,
         _ => {}
     }
 
@@ -737,6 +1022,11 @@ async fn main() -> Result<()> {
         Some(Command::Logs { computer, service, tail }) => {
             handle_logs(computer, service, tail).await
         }
+        Some(Command::Events { command }) => handle_events(command).await,
+        Some(Command::Storage { command }) => handle_storage(command).await,
+        Some(Command::Power { command }) => handle_power(command).await,
+        Some(Command::Train { command }) => handle_train(command).await,
+        Some(Command::Ports { command }) => handle_ports(command).await,
         Some(Command::Supervise { prompt, max_attempts }) => {
             let sup_config = ff_agent::supervisor::SupervisorConfig {
                 max_attempts,
@@ -2381,6 +2671,54 @@ async fn handle_secrets(cmd: SecretsCommand) -> Result<()> {
                 println!("No secret with key '{key}' to delete");
             }
         }
+        SecretsCommand::Rotate { key, value } => {
+            let rotator = ff_agent::secrets_rotation::SecretsRotator::new(pool.clone());
+            match rotator.rotate(&key, value).await {
+                Ok(out) => {
+                    println!(
+                        "Rotated '{}' ({} bytes, sha12={}, kind={})",
+                        out.key, out.new_len, out.new_fingerprint, out.kind
+                    );
+                }
+                Err(e) => {
+                    eprintln!("Rotation failed: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        SecretsCommand::Expirations => {
+            let rotator = ff_agent::secrets_rotation::SecretsRotator::new(pool.clone());
+            let report = rotator.check_expirations().await?;
+            if report.near_expiry.is_empty() && report.already_expired.is_empty() {
+                println!("(no secrets near expiry)");
+                return Ok(());
+            }
+            println!("{:<30} {:>10} {:>5} {}", "KEY", "DAYS_LEFT", "ROT#", "EXPIRES_AT");
+            for row in report
+                .already_expired
+                .iter()
+                .chain(report.near_expiry.iter())
+            {
+                let exp = row
+                    .expires_at
+                    .map(|t| t.format("%Y-%m-%d").to_string())
+                    .unwrap_or_else(|| "-".into());
+                let days = row
+                    .days_remaining
+                    .map(|d| d.to_string())
+                    .unwrap_or_else(|| "-".into());
+                println!(
+                    "{:<30} {:>10} {:>5} {}",
+                    row.key, days, row.rotation_count, exp,
+                );
+            }
+            println!(
+                "\n{} alert(s) dispatched. near_expiry={} expired={}",
+                report.alerts_dispatched,
+                report.near_expiry.len(),
+                report.already_expired.len(),
+            );
+        }
     }
     Ok(())
 }
@@ -3393,6 +3731,79 @@ async fn handle_model(cmd: ModelCommand) -> Result<()> {
                 None => println!("{GREEN}✓{RESET} Retired '{id}'"),
             }
         }
+        ModelCommand::Benchmark { model_id, computer, json } => {
+            let computer = if let Some(c) = computer {
+                c
+            } else {
+                ff_agent::fleet_info::resolve_this_node_name().await
+            };
+            match ff_agent::model_benchmark::benchmark_with_defaults(
+                &pool, &model_id, &computer,
+            )
+            .await
+            {
+                Ok(report) => {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&report).unwrap_or_default()
+                        );
+                    } else {
+                        println!("{GREEN}✓ Benchmark complete{RESET}");
+                        println!("  model:            {}", report.model_id);
+                        println!("  computer:         {}", report.computer);
+                        println!("  runtime:          {}", report.runtime);
+                        println!("  endpoint:         {}", report.endpoint);
+                        println!("  tokens/sec:       {:.2}", report.tokens_per_sec);
+                        println!("  ttft (ms):        {}", report.ttft_ms);
+                        println!("  prompt eval/sec:  {:.2}", report.prompt_eval_rate);
+                        println!("  max ctx tokens:   {}", report.context_tokens_max);
+                        println!("  prompt count:     {}", report.prompt_count);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("{RED}✗ Benchmark failed: {e}{RESET}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        ModelCommand::Benchmarks { model } => {
+            let target = model.unwrap_or_else(|| {
+                eprintln!(
+                    "{YELLOW}No --model specified; pass --model <catalog_id> to narrow.{RESET}"
+                );
+                String::new()
+            });
+            if target.is_empty() {
+                return Ok(());
+            }
+            match ff_db::pg_get_benchmark_results(&pool, &target).await? {
+                Some(v) => {
+                    if let Some(obj) = v.as_object() {
+                        if obj.is_empty() {
+                            println!("(no benchmark runs recorded for '{target}')");
+                        } else {
+                            println!("{:<48} {:<12} {:<12}", "RUN KEY", "TOKENS/S", "TTFT(ms)");
+                            for (key, run) in obj {
+                                let tps = run.get("tokens_per_sec")
+                                    .and_then(|v| v.as_f64())
+                                    .unwrap_or(0.0);
+                                let ttft = run.get("ttft_ms")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0);
+                                println!("{:<48} {:<12.2} {:<12}", key, tps, ttft);
+                            }
+                        }
+                    } else {
+                        println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+                    }
+                }
+                None => {
+                    eprintln!("No catalog row for id '{target}'");
+                    std::process::exit(1);
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -3880,6 +4291,280 @@ async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
         }
         FleetCommand::TaskCoverage { command } => {
             handle_fleet_task_coverage(&pool, command).await?;
+        }
+        FleetCommand::RevokeTrust { computer, yes } => {
+            handle_fleet_revoke_trust(&pool, &computer, yes).await?;
+        }
+        FleetCommand::RotateSshKey { computer } => {
+            let mgr = ff_agent::ssh_key_manager::SshKeyManager::new(pool.clone());
+            match mgr.rotate_computer_keypair(&computer).await {
+                Ok(()) => println!("{GREEN}✓ rotate complete{RESET}"),
+                Err(e) => {
+                    eprintln!("{YELLOW}Not yet implemented:{RESET} {e}");
+                    std::process::exit(2);
+                }
+            }
+        }
+        FleetCommand::RotatePulseHmac { value } => {
+            handle_fleet_rotate_pulse_hmac(&pool, value).await?;
+        }
+        FleetCommand::Backup { kind, force } => {
+            handle_fleet_backup(&pool, &kind, force).await?;
+        }
+        FleetCommand::SetNetworkScope { computer, scope } => {
+            handle_fleet_set_network_scope(&pool, &computer, &scope).await?;
+        }
+        FleetCommand::Db { command } => {
+            handle_fleet_db(&pool, command).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn handle_fleet_set_network_scope(
+    pool: &sqlx::PgPool,
+    computer: &str,
+    scope: &str,
+) -> Result<()> {
+    const VALID: &[&str] = &["lan", "tailscale_only", "wan"];
+    if !VALID.contains(&scope) {
+        anyhow::bail!(
+            "unknown scope '{scope}' — must be one of: {}",
+            VALID.join(", ")
+        );
+    }
+    let res = sqlx::query(
+        "UPDATE computers SET network_scope = $1 WHERE LOWER(name) = LOWER($2)",
+    )
+    .bind(scope)
+    .bind(computer)
+    .execute(pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("update computers: {e}"))?;
+
+    if res.rows_affected() == 0 {
+        anyhow::bail!("no computer named '{computer}' found");
+    }
+    println!(
+        "{GREEN}✓{RESET} set network_scope='{scope}' on '{computer}' ({} row updated)",
+        res.rows_affected()
+    );
+    Ok(())
+}
+
+async fn handle_fleet_db(
+    pool: &sqlx::PgPool,
+    cmd: FleetDbCommand,
+) -> Result<()> {
+    match cmd {
+        FleetDbCommand::AddRemoteReplica { computer, via, skip_probe } => {
+            if via != "tailscale" {
+                eprintln!(
+                    "{YELLOW}warning:{RESET} --via '{via}' is not 'tailscale' — \
+                     recording the row anyway, but no WAN compose template will be generated."
+                );
+            }
+
+            // Resolve target computer + its Tailscale IP.
+            let row = sqlx::query_as::<_, (uuid::Uuid, String, serde_json::Value, String)>(
+                "SELECT id, primary_ip, all_ips, COALESCE(network_scope, 'lan')
+                 FROM computers
+                 WHERE LOWER(name) = LOWER($1)",
+            )
+            .bind(&computer)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| anyhow::anyhow!("query computers: {e}"))?
+            .ok_or_else(|| anyhow::anyhow!(
+                "no computer named '{computer}' registered — run `ff onboard` first"
+            ))?;
+
+            let (computer_id, primary_ip, all_ips_json, current_scope) = row;
+
+            let ts_ip = all_ips_json
+                .as_array()
+                .and_then(|arr| {
+                    arr.iter().find_map(|v| {
+                        let obj = v.as_object()?;
+                        if obj.get("kind")?.as_str() == Some("tailscale") {
+                            obj.get("ip")?.as_str().map(|s| s.to_string())
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .or_else(|| {
+                    if primary_ip.starts_with("100.64.") || primary_ip.starts_with("100.65.") {
+                        Some(primary_ip.clone())
+                    } else {
+                        None
+                    }
+                });
+
+            let ts_ip = match ts_ip {
+                Some(ip) => ip,
+                None => anyhow::bail!(
+                    "no tailscale IP in computers.all_ips for '{computer}'. \
+                     Ensure the node is joined to Tailscale and has emitted a Pulse heartbeat."
+                ),
+            };
+
+            // Optional reachability probe (skipped by --skip-probe).
+            if !skip_probe && via == "tailscale" {
+                println!("{CYAN}▶ Probing Tailscale reachability: {ts_ip}:55432{RESET}");
+                let ok = tokio::process::Command::new("nc")
+                    .args(["-vz", "-w", "3", &ts_ip, "55432"])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .await
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                if !ok {
+                    eprintln!(
+                        "{YELLOW}warning:{RESET} nc probe to {ts_ip}:55432 failed \
+                         (still recording — Postgres may not be listening yet, or nc may be missing)"
+                    );
+                } else {
+                    println!("{GREEN}✓{RESET} reachable over Tailscale");
+                }
+            }
+
+            // Upsert database_replicas row with role='wan_replica'.
+            sqlx::query(
+                "INSERT INTO database_replicas (computer_id, database_kind, role, status, notes) \
+                 VALUES ($1, 'postgres', 'wan_replica', 'stopped', $2) \
+                 ON CONFLICT (computer_id, database_kind) DO UPDATE \
+                 SET role = 'wan_replica', notes = $2",
+            )
+            .bind(computer_id)
+            .bind(format!("added via ff fleet db add-remote-replica --via {via}"))
+            .execute(pool)
+            .await
+            .map_err(|e| anyhow::anyhow!("insert database_replicas: {e}"))?;
+
+            // Auto-apply network_scope='wan' if the caller hasn't already
+            // set it (defaults to 'lan', which is wrong for a WAN replica).
+            if current_scope == "lan" {
+                sqlx::query(
+                    "UPDATE computers SET network_scope = 'wan' WHERE id = $1",
+                )
+                .bind(computer_id)
+                .execute(pool)
+                .await
+                .map_err(|e| anyhow::anyhow!("update computers.network_scope: {e}"))?;
+                println!(
+                    "{CYAN}▶{RESET} auto-applied network_scope='wan' (was 'lan')"
+                );
+            }
+
+            // Print the runbook snippet.
+            println!();
+            println!("{GREEN}✓{RESET} registered WAN replica for '{computer}' ({ts_ip})");
+            println!();
+            println!("Now run on the off-site machine:");
+            println!("  cd deploy/");
+            println!(
+                "  POSTGRES_PRIMARY_HOST=<taylor-tailscale-ip> \\\n    \
+                 POSTGRES_REPLICATION_PASSWORD=<same as primary> \\\n    \
+                 docker compose -f docker-compose.follower-remote.yml up -d"
+            );
+            println!();
+            println!("Full runbook: deploy/WAN_REPLICATION.md");
+        }
+    }
+    Ok(())
+}
+
+async fn handle_fleet_revoke_trust(
+    pool: &sqlx::PgPool,
+    computer: &str,
+    yes: bool,
+) -> Result<()> {
+    if !yes {
+        eprintln!("{YELLOW}Revocation is destructive. Pass --yes to confirm.{RESET}");
+        std::process::exit(2);
+    }
+    println!("{CYAN}▶ Revoking SSH trust for '{computer}' across fleet...{RESET}");
+    let mgr = ff_agent::ssh_key_manager::SshKeyManager::new(pool.clone());
+    let who = whoami_tag();
+    let report = mgr
+        .revoke_computer_trust(computer, Some(&who))
+        .await
+        .map_err(|e| anyhow::anyhow!("revoke: {e}"))?;
+
+    println!(
+        "\nFingerprint: {}\nRevoked on {} host(s), failed on {}.",
+        report.key_fingerprint, report.succeeded, report.failed,
+    );
+    for t in &report.targets {
+        let marker = if t.success { "✓" } else { "✗" };
+        println!(
+            "  {marker} {:<14} {}",
+            t.target,
+            if t.success { "ok" } else { t.message.as_str() }
+        );
+    }
+    Ok(())
+}
+
+async fn handle_fleet_rotate_pulse_hmac(
+    pool: &sqlx::PgPool,
+    value: Option<String>,
+) -> Result<()> {
+    println!("{CYAN}▶ Rotating pulse_beat_hmac_key...{RESET}");
+    let rotator = ff_agent::secrets_rotation::SecretsRotator::new(pool.clone());
+    let out = rotator
+        .rotate("pulse_beat_hmac_key", value)
+        .await
+        .map_err(|e| anyhow::anyhow!("rotate: {e}"))?;
+    println!(
+        "{GREEN}✓ pulse_beat_hmac_key rotated{RESET} ({} bytes, sha12={})",
+        out.new_len, out.new_fingerprint,
+    );
+    println!(
+        "{YELLOW}Daemons will pick up the new key on next 5-minute cache refresh.{RESET}"
+    );
+    Ok(())
+}
+
+async fn handle_fleet_backup(
+    pool: &sqlx::PgPool,
+    kind: &str,
+    force: bool,
+) -> Result<()> {
+    let my_name = ff_agent::fleet_info::resolve_this_node_name().await;
+    let my_id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM computers WHERE name = $1")
+        .bind(&my_name)
+        .fetch_optional(pool)
+        .await?
+        .unwrap_or_else(uuid::Uuid::nil);
+
+    let orch = ff_agent::ha::backup::BackupOrchestrator::new(
+        pool.clone(),
+        my_id,
+        my_name.clone(),
+        None,
+    );
+
+    println!("{CYAN}▶ ff fleet backup kind={kind} force={force}{RESET}");
+    let reports = orch
+        .run_once(kind, force)
+        .await
+        .map_err(|e| anyhow::anyhow!("backup: {e}"))?;
+
+    for r in &reports {
+        if r.produced {
+            println!(
+                "{GREEN}✓ {} backup produced{RESET}  file={} size={} sha256={} targets={}",
+                r.kind,
+                r.file_path.display(),
+                r.size_bytes,
+                &r.sha256[..12.min(r.sha256.len())],
+                r.distributed_to.len(),
+            );
+        } else {
+            println!("{YELLOW}(skipped){RESET}  kind={} — not leader (use --force)", r.kind);
         }
     }
     Ok(())
@@ -4557,6 +5242,285 @@ async fn handle_software_drift(pool: &sqlx::PgPool, json: bool) -> Result<()> {
     Ok(())
 }
 
+// ─── ff ports ──────────────────────────────────────────────────────────────
+
+async fn handle_ports(cmd: PortsCommand) -> Result<()> {
+    let pool = ff_agent::fleet_info::get_fleet_pool()
+        .await
+        .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
+    ff_db::run_postgres_migrations(&pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
+
+    match cmd {
+        PortsCommand::List { kind, scope, json } => handle_ports_list(&pool, kind, scope, json).await,
+        PortsCommand::Seed => handle_ports_seed(&pool).await,
+        PortsCommand::Scan { computer } => handle_ports_scan(&pool, &computer).await,
+    }
+}
+
+async fn handle_ports_seed(pool: &sqlx::PgPool) -> Result<()> {
+    let path = ff_agent::ports_registry::resolve_ports_path();
+    println!("{CYAN}▶ Seeding port_registry from {}{RESET}", path.display());
+    let report = ff_agent::ports_registry::seed_from_toml(pool, &path)
+        .await
+        .map_err(|e| anyhow::anyhow!("seed ports: {e}"))?;
+    println!(
+        "{GREEN}✓ port_registry seed:{RESET} total={} inserted={} updated={} unchanged={}",
+        report.total, report.inserted, report.updated, report.unchanged,
+    );
+    Ok(())
+}
+
+async fn handle_ports_list(
+    pool: &sqlx::PgPool,
+    kind: Option<String>,
+    scope: Option<String>,
+    json: bool,
+) -> Result<()> {
+    let mut sql = String::from(
+        "SELECT port, service, kind, description, exposed_on, scope, managed_by, status
+         FROM port_registry
+         WHERE 1=1",
+    );
+    let mut idx = 1;
+    if kind.is_some() {
+        sql.push_str(&format!(" AND kind = ${idx}"));
+        idx += 1;
+    }
+    if scope.is_some() {
+        sql.push_str(&format!(" AND scope = ${idx}"));
+    }
+    sql.push_str(" ORDER BY kind ASC, port ASC");
+
+    let mut q = sqlx::query(&sql);
+    if let Some(k) = &kind { q = q.bind(k); }
+    if let Some(s) = &scope { q = q.bind(s); }
+
+    let rows = q.fetch_all(pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("list port_registry: {e}"))?;
+
+    if json {
+        let arr: Vec<_> = rows.iter().map(|r| serde_json::json!({
+            "port":        sqlx::Row::get::<i32, _>(r, "port"),
+            "service":     sqlx::Row::get::<String, _>(r, "service"),
+            "kind":        sqlx::Row::get::<String, _>(r, "kind"),
+            "description": sqlx::Row::get::<String, _>(r, "description"),
+            "exposed_on":  sqlx::Row::get::<String, _>(r, "exposed_on"),
+            "scope":       sqlx::Row::get::<String, _>(r, "scope"),
+            "managed_by":  sqlx::Row::get::<Option<String>, _>(r, "managed_by"),
+            "status":      sqlx::Row::get::<String, _>(r, "status"),
+        })).collect();
+        println!("{}", serde_json::to_string_pretty(&arr).unwrap_or_default());
+        return Ok(());
+    }
+
+    if rows.is_empty() {
+        println!("{YELLOW}No rows in port_registry. Run `ff ports seed` first.{RESET}");
+        return Ok(());
+    }
+
+    println!(
+        "{:<6} {:<22} {:<18} {:<26} {:<10} {:<11} {}",
+        "PORT", "SERVICE", "KIND", "EXPOSED_ON", "SCOPE", "STATUS", "DESCRIPTION",
+    );
+    println!("  {}", "-".repeat(130));
+
+    let mut last_kind: Option<String> = None;
+    for r in &rows {
+        let port: i32 = sqlx::Row::get(r, "port");
+        let service: String = sqlx::Row::get(r, "service");
+        let k: String = sqlx::Row::get(r, "kind");
+        let description: String = sqlx::Row::get(r, "description");
+        let exposed_on: String = sqlx::Row::get(r, "exposed_on");
+        let scp: String = sqlx::Row::get(r, "scope");
+        let status: String = sqlx::Row::get(r, "status");
+
+        if last_kind.as_deref() != Some(k.as_str()) {
+            println!("\n{CYAN}── {k} ──{RESET}");
+            last_kind = Some(k.clone());
+        }
+
+        let status_color = match status.as_str() {
+            "active" => GREEN,
+            "deprecated" => RED,
+            "planned" => YELLOW,
+            _ => "",
+        };
+
+        println!(
+            "{:<6} {:<22} {:<18} {:<26} {:<10} {status_color}{:<11}{RESET} {}",
+            port,
+            truncate_for_col(&service, 22),
+            truncate_for_col(&k, 18),
+            truncate_for_col(&exposed_on, 26),
+            truncate_for_col(&scp, 10),
+            status,
+            description,
+        );
+    }
+    println!("\n{} port(s) registered.", rows.len());
+    Ok(())
+}
+
+async fn handle_ports_scan(pool: &sqlx::PgPool, computer: &str) -> Result<()> {
+    use tokio::process::Command as TokCmd;
+
+    println!("{CYAN}▶ Scanning {computer} for listening ports{RESET}");
+
+    let this_hostname = std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_lowercase())
+        .unwrap_or_default();
+    let is_local = this_hostname.starts_with(&computer.to_lowercase())
+        || computer.eq_ignore_ascii_case("localhost")
+        || computer.eq_ignore_ascii_case("local");
+
+    // Prefer `ss -tlnH` on Linux; `lsof -iTCP -sTCP:LISTEN -n -P` on macOS.
+    // Run both; whichever produces output wins.
+    let probe_cmd = "sh -c 'ss -tlnH 2>/dev/null || lsof -iTCP -sTCP:LISTEN -n -P 2>/dev/null'";
+
+    let output = if is_local {
+        TokCmd::new("sh").args(["-c", probe_cmd]).output().await
+    } else {
+        let row = sqlx::query(
+            "SELECT ssh_user, ip FROM fleet_nodes WHERE name = $1 LIMIT 1",
+        )
+        .bind(computer)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("lookup fleet_nodes: {e}"))?;
+
+        let (ssh_user, ip) = match row {
+            Some(r) => (
+                sqlx::Row::get::<String, _>(&r, "ssh_user"),
+                sqlx::Row::get::<String, _>(&r, "ip"),
+            ),
+            None => {
+                println!("{RED}✗ Unknown computer '{computer}' — not in fleet_nodes.{RESET}");
+                return Ok(());
+            }
+        };
+
+        let dest = format!("{ssh_user}@{ip}");
+        TokCmd::new("ssh")
+            .args([
+                "-o", "ConnectTimeout=8",
+                "-o", "StrictHostKeyChecking=accept-new",
+                "-o", "BatchMode=yes",
+                &dest,
+                probe_cmd,
+            ])
+            .output()
+            .await
+    };
+
+    let probe_stdout = match output {
+        Ok(o) if o.status.success() || !o.stdout.is_empty() => {
+            String::from_utf8_lossy(&o.stdout).to_string()
+        }
+        Ok(o) => {
+            println!(
+                "{RED}✗ probe exited {}:{RESET}\n{}",
+                o.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&o.stderr),
+            );
+            return Ok(());
+        }
+        Err(e) => {
+            println!("{RED}✗ probe failed: {e}{RESET}");
+            return Ok(());
+        }
+    };
+
+    // Parse listening ports from either `ss` or `lsof` output.
+    let mut listening: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
+    for line in probe_stdout.lines() {
+        for tok in line.split_whitespace() {
+            if let Some(colon) = tok.rfind(':') {
+                let tail = &tok[colon + 1..];
+                let num_end = tail.find(|c: char| !c.is_ascii_digit()).unwrap_or(tail.len());
+                if num_end == 0 { continue; }
+                if let Ok(p) = tail[..num_end].parse::<u16>() {
+                    listening.insert(p);
+                }
+            }
+        }
+    }
+
+    let reg_rows = sqlx::query(
+        "SELECT port, service, kind, exposed_on, status FROM port_registry ORDER BY port ASC",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("load port_registry: {e}"))?;
+
+    let mut registered: std::collections::BTreeMap<u16, (String, String, String, String)> =
+        std::collections::BTreeMap::new();
+    for r in &reg_rows {
+        let port: i32 = sqlx::Row::get(r, "port");
+        let service: String = sqlx::Row::get(r, "service");
+        let kind: String = sqlx::Row::get(r, "kind");
+        let exposed_on: String = sqlx::Row::get(r, "exposed_on");
+        let status: String = sqlx::Row::get(r, "status");
+        registered.insert(port as u16, (service, kind, exposed_on, status));
+    }
+
+    println!(
+        "\n{CYAN}Listening on {computer}:{RESET} {} port(s)",
+        listening.len()
+    );
+    let mut unexpected: Vec<u16> = Vec::new();
+    for p in &listening {
+        match registered.get(p) {
+            Some((svc, kind, _exposed, status)) => {
+                let color = if status == "deprecated" { RED } else { GREEN };
+                println!("  {color}✓ {:<6}{RESET} {svc}  ({kind}, {status})", p);
+            }
+            None => unexpected.push(*p),
+        }
+    }
+    if !unexpected.is_empty() {
+        println!("\n{YELLOW}⚠ Unexpected listeners (not in port_registry):{RESET}");
+        for p in unexpected {
+            println!("  {YELLOW}? {}{RESET}", p);
+        }
+    }
+
+    // Which registered services should be on this box but aren't?
+    // Heuristic: exposed_on contains the computer name, or is a group label.
+    let mut missing: Vec<(u16, String, String)> = Vec::new();
+    let key = computer.to_ascii_lowercase();
+    for (port, (svc, kind, exposed_on, status)) in &registered {
+        if status != "active" { continue; }
+        let eo = exposed_on.to_ascii_lowercase();
+        let relevant = eo.contains(&key)
+            || eo == "all_members"
+            || eo == "all_members_with_gguf"
+            || eo == "nats_cluster_members"
+            || eo == "gpu_members";
+        if !relevant { continue; }
+        if !listening.contains(port) {
+            missing.push((*port, svc.clone(), kind.clone()));
+        }
+    }
+    if !missing.is_empty() {
+        println!("\n{YELLOW}⚠ Expected but not listening:{RESET}");
+        for (port, svc, kind) in missing {
+            println!("  {YELLOW}∅ {:<6}{RESET} {svc}  ({kind})", port);
+        }
+    } else {
+        println!(
+            "\n{GREEN}✓ Every active port_registry entry relevant to {computer} is listening.{RESET}"
+        );
+    }
+
+    Ok(())
+}
+
 fn build_migrate_github_script(new_owner: &str) -> String {
     format!(
         r#"set -e
@@ -4742,6 +5706,102 @@ async fn handle_openclaw(cmd: OpenclawCommand) -> Result<()> {
                     "{:<14} {:<16} {} {:<34} {:<22} {}",
                     name, ip, mode_pad, url_s, ts_s, ver_s
                 );
+            }
+        }
+        OpenclawCommand::Devices { command } => {
+            handle_openclaw_devices(&pool, command).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn handle_openclaw_devices(
+    pool: &sqlx::PgPool,
+    cmd: OpenclawDevicesCommand,
+) -> Result<()> {
+    // Need a local OpenClawManager — the my_computer_id / my_primary_ip
+    // arguments aren't consulted by export_devices/import_devices (those
+    // just shell out to the local `openclaw` CLI), so we pass placeholders.
+    let local_name = ff_agent::fleet_info::resolve_this_node_name().await;
+    let (computer_id, primary_ip) = sqlx::query_as::<_, (uuid::Uuid, String)>(
+        "SELECT id, primary_ip FROM computers WHERE LOWER(name) = LOWER($1)",
+    )
+    .bind(&local_name)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("query computers: {e}"))?
+    .unwrap_or((uuid::Uuid::nil(), "127.0.0.1".to_string()));
+
+    let mgr = ff_agent::openclaw::OpenClawManager::new(pool.clone(), computer_id, primary_ip);
+
+    match cmd {
+        OpenclawDevicesCommand::Export { stash } => {
+            let export = mgr
+                .export_devices()
+                .await
+                .map_err(|e| anyhow::anyhow!("export_devices: {e}"))?;
+
+            if stash {
+                sqlx::query(
+                    "INSERT INTO fleet_secrets (key, value, updated_by, updated_at) \
+                     VALUES ($1, $2, 'ff openclaw devices export', NOW()) \
+                     ON CONFLICT (key) DO UPDATE \
+                     SET value = $2, updated_at = NOW()",
+                )
+                .bind(ff_agent::openclaw::DEVICE_PAIRINGS_SECRET_KEY)
+                .bind(&export)
+                .execute(pool)
+                .await
+                .map_err(|e| anyhow::anyhow!("stash secret: {e}"))?;
+                eprintln!(
+                    "{GREEN}✓{RESET} stashed {} bytes into fleet_secrets.{}",
+                    export.len(),
+                    ff_agent::openclaw::DEVICE_PAIRINGS_SECRET_KEY,
+                );
+            }
+            // Emit the JSON to stdout so a caller can pipe it.
+            print!("{export}");
+            if !export.ends_with('\n') {
+                println!();
+            }
+        }
+        OpenclawDevicesCommand::Import { from_secret } => {
+            let json = if from_secret {
+                match ff_agent::openclaw::lookup_device_pairings_export(pool)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("lookup stash: {e}"))?
+                {
+                    Some(v) => v,
+                    None => {
+                        eprintln!(
+                            "{YELLOW}no stashed export found in fleet_secrets.{}{RESET}",
+                            ff_agent::openclaw::DEVICE_PAIRINGS_SECRET_KEY
+                        );
+                        return Ok(());
+                    }
+                }
+            } else {
+                use std::io::Read;
+                let mut buf = String::new();
+                std::io::stdin()
+                    .read_to_string(&mut buf)
+                    .map_err(|e| anyhow::anyhow!("read stdin: {e}"))?;
+                buf
+            };
+
+            let n = mgr
+                .import_devices(&json)
+                .await
+                .map_err(|e| anyhow::anyhow!("import_devices: {e}"))?;
+
+            println!("{GREEN}✓{RESET} imported {n} device(s)");
+
+            if from_secret {
+                if let Err(e) = ff_agent::openclaw::clear_device_pairings_export(pool).await {
+                    eprintln!(
+                        "{YELLOW}warning:{RESET} failed to clear stashed secret: {e}"
+                    );
+                }
             }
         }
     }
@@ -6121,16 +7181,96 @@ async fn handle_metrics(cmd: MetricsCommand) -> Result<()> {
 }
 
 async fn handle_logs(
-    _computer: Option<String>,
-    _service: Option<String>,
+    computer: Option<String>,
+    service: Option<String>,
     _tail: usize,
 ) -> Result<()> {
-    // Part 5 stub — see nats_log_layer.rs. When FORGEFLEET_NATS_URL is
-    // honored and `async-nats` is wired up, this subscribes to
-    // `fleet.logs.{computer}.{service}.{level}` and streams events.
-    println!(
-        "{YELLOW}logs command not yet implemented{RESET} (NATS log layer is stubbed — see crates/ff-agent/src/nats_log_layer.rs)."
-    );
+    // Subscribe to `logs.{computer}.{service}.>` on NATS. Both fragments
+    // are optional — missing pieces fall back to the `*` wildcard so the
+    // user can tail everything or narrow on either axis.
+    use futures::StreamExt;
+    let url = std::env::var("FORGEFLEET_NATS_URL")
+        .unwrap_or_else(|_| "nats://127.0.0.1:4222".to_string());
+    let client = match async_nats::connect(&url).await {
+        Ok(c) => c,
+        Err(e) => {
+            println!("{YELLOW}Could not connect to NATS at {url}: {e}{RESET}");
+            println!(
+                "Set FORGEFLEET_NATS_URL or ensure nats:// is reachable (docker: `forgefleet-nats`)."
+            );
+            return Ok(());
+        }
+    };
+
+    let computer = computer.as_deref().unwrap_or("*");
+    let service = service.as_deref().unwrap_or("*");
+    let subject = format!("logs.{computer}.{service}.>");
+    println!("{CYAN}▶ Tailing NATS subject `{subject}` (Ctrl-C to exit){RESET}");
+
+    let mut sub = match client.subscribe(subject.clone()).await {
+        Ok(s) => s,
+        Err(e) => {
+            println!("{YELLOW}NATS subscribe({subject}) failed: {e}{RESET}");
+            return Ok(());
+        }
+    };
+
+    while let Some(msg) = sub.next().await {
+        let subject = msg.subject.to_string();
+        let body = String::from_utf8_lossy(&msg.payload);
+        // Pretty-render: if JSON, show level + message; else raw.
+        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&msg.payload) {
+            let ts = v.get("ts").and_then(|t| t.as_str()).unwrap_or("?");
+            let lvl = v.get("level").and_then(|l| l.as_str()).unwrap_or("info");
+            let msg_txt = v.get("message").and_then(|m| m.as_str()).unwrap_or("");
+            let target = v.get("target").and_then(|t| t.as_str()).unwrap_or("");
+            println!("[{ts}] {lvl:<5} {target} {msg_txt}  ({subject})");
+        } else {
+            println!("[{subject}] {body}");
+        }
+    }
+    Ok(())
+}
+
+async fn handle_events(cmd: EventsCommand) -> Result<()> {
+    use futures::StreamExt;
+    let EventsCommand::Tail { subject, pretty } = cmd;
+
+    let url = std::env::var("FORGEFLEET_NATS_URL")
+        .unwrap_or_else(|_| "nats://127.0.0.1:4222".to_string());
+    let client = match async_nats::connect(&url).await {
+        Ok(c) => c,
+        Err(e) => {
+            println!("{YELLOW}Could not connect to NATS at {url}: {e}{RESET}");
+            println!(
+                "Hint: start NATS via `docker compose up -d nats` or set FORGEFLEET_NATS_URL."
+            );
+            return Ok(());
+        }
+    };
+
+    println!("{CYAN}▶ Tailing NATS subject `{subject}` (Ctrl-C to exit){RESET}");
+    let mut sub = match client.subscribe(subject.clone()).await {
+        Ok(s) => s,
+        Err(e) => {
+            println!("{YELLOW}NATS subscribe({subject}) failed: {e}{RESET}");
+            return Ok(());
+        }
+    };
+
+    while let Some(msg) = sub.next().await {
+        let subj = msg.subject.to_string();
+        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&msg.payload) {
+            let rendered = if pretty {
+                serde_json::to_string_pretty(&v).unwrap_or_else(|_| v.to_string())
+            } else {
+                v.to_string()
+            };
+            println!("[{subj}] {rendered}");
+        } else {
+            println!("[{subj}] {}", String::from_utf8_lossy(&msg.payload));
+        }
+    }
     Ok(())
 }
 
@@ -6177,5 +7317,357 @@ fn truncate_str(s: &str, max: usize) -> String {
         let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
         out.push('…');
         out
+    }
+}
+
+// ─── Phase 12: storage / power / train / benchmark handlers ────────────────
+
+async fn handle_storage(cmd: StorageCommand) -> Result<()> {
+    let pool = ff_agent::fleet_info::get_fleet_pool()
+        .await
+        .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
+    ff_db::run_postgres_migrations(&pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
+
+    let mgr = ff_agent::shared_storage::SharedStorageManager::new(pool.clone());
+
+    match cmd {
+        StorageCommand::Share { command } => match command {
+            StorageShareCommand::Create {
+                name,
+                host,
+                path,
+                mount_path,
+                purpose,
+                read_only,
+            } => {
+                let mp = mount_path.unwrap_or_else(|| path.clone());
+                let id = mgr
+                    .create_share(&name, &host, &path, &mp, purpose.as_deref(), read_only)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                println!("{GREEN}✓ Registered shared volume {name}{RESET}");
+                println!("  id:            {id}");
+                println!("  host:          {host}");
+                println!("  export_path:   {path}");
+                println!("  mount_path:    {mp}");
+                if let Some(p) = purpose {
+                    println!("  purpose:       {p}");
+                }
+                if read_only {
+                    println!("  read_only:     true");
+                }
+                println!();
+                println!("NOTE: /etc/exports and NFS daemon setup are best-effort and");
+                println!("      may require manual configuration on the host. See");
+                println!("      `ff_agent::shared_storage` module docs for the exact");
+                println!("      per-OS commands.");
+                Ok(())
+            }
+            StorageShareCommand::Mount { name, computer, path } => {
+                match mgr.mount(&name, &computer, path.as_deref()).await {
+                    Ok(mp) => {
+                        println!("{GREEN}✓ Mounted {name} on {computer} at {mp}{RESET}");
+                        Ok(())
+                    }
+                    Err(e) => {
+                        eprintln!("{RED}✗ Mount failed: {e}{RESET}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            StorageShareCommand::Unmount { name, computer } => {
+                match mgr.unmount(&name, &computer).await {
+                    Ok(()) => {
+                        println!("{GREEN}✓ Unmounted {name} on {computer}{RESET}");
+                        Ok(())
+                    }
+                    Err(e) => {
+                        eprintln!("{RED}✗ Unmount failed: {e}{RESET}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            StorageShareCommand::List => {
+                let shares = mgr.list().await.map_err(|e| anyhow::anyhow!("{e}"))?;
+                if shares.is_empty() {
+                    println!("(no shared volumes registered)");
+                    return Ok(());
+                }
+                println!(
+                    "{:<18} {:<10} {:<22} {:<18} {:<7} {}",
+                    "NAME", "HOST", "EXPORT", "PURPOSE", "RO", "MOUNTS"
+                );
+                for s in shares {
+                    let mounts = if s.mounts.is_empty() {
+                        "-".to_string()
+                    } else {
+                        s.mounts
+                            .iter()
+                            .map(|(c, st)| format!("{c}({st})"))
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    };
+                    println!(
+                        "{:<18} {:<10} {:<22} {:<18} {:<7} {}",
+                        truncate_str(&s.name, 18),
+                        truncate_str(&s.host, 10),
+                        truncate_str(&s.export_path, 22),
+                        truncate_str(s.purpose.as_deref().unwrap_or("-"), 18),
+                        if s.read_only { "yes" } else { "no" },
+                        mounts
+                    );
+                }
+                Ok(())
+            }
+        },
+    }
+}
+
+async fn handle_power(cmd: PowerCommand) -> Result<()> {
+    let pool = ff_agent::fleet_info::get_fleet_pool()
+        .await
+        .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
+    ff_db::run_postgres_migrations(&pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
+
+    match cmd {
+        PowerCommand::Schedule { command } => match command {
+            PowerScheduleCommand::Create { computer, kind, cron, if_idle } => {
+                let computer_id = sqlx::query_scalar::<_, sqlx::types::Uuid>(
+                    "SELECT id FROM computers WHERE name = $1",
+                )
+                .bind(&computer)
+                .fetch_optional(&pool)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("computer '{computer}' not found"))?;
+
+                let condition = if_idle.map(|m| format!("idle_minutes > {m}"));
+                let id = ff_db::pg_create_schedule(
+                    &pool,
+                    computer_id,
+                    &kind,
+                    &cron,
+                    condition.as_deref(),
+                    Some(&whoami_tag()),
+                )
+                .await?;
+                println!("{GREEN}✓ Created schedule {id}{RESET}");
+                println!("  computer:   {computer}");
+                println!("  kind:       {kind}");
+                println!("  cron:       {cron}");
+                if let Some(c) = condition {
+                    println!("  condition:  {c}");
+                }
+                Ok(())
+            }
+            PowerScheduleCommand::Delete { id } => {
+                let uuid = sqlx::types::Uuid::parse_str(&id)
+                    .map_err(|e| anyhow::anyhow!("bad uuid: {e}"))?;
+                if ff_db::pg_delete_schedule(&pool, uuid).await? {
+                    println!("{GREEN}✓ Deleted schedule {id}{RESET}");
+                } else {
+                    println!("No schedule with id '{id}'");
+                }
+                Ok(())
+            }
+        },
+        PowerCommand::Schedules { computer } => {
+            let computer_id = if let Some(c) = computer {
+                Some(
+                    sqlx::query_scalar::<_, sqlx::types::Uuid>(
+                        "SELECT id FROM computers WHERE name = $1",
+                    )
+                    .bind(&c)
+                    .fetch_optional(&pool)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("computer '{c}' not found"))?,
+                )
+            } else {
+                None
+            };
+            let rows = ff_db::pg_list_schedules(&pool, computer_id, false).await?;
+            if rows.is_empty() {
+                println!("(no power schedules)");
+                return Ok(());
+            }
+            println!(
+                "{:<38} {:<10} {:<9} {:<18} {:<10} {}",
+                "ID", "COMPUTER", "KIND", "CRON", "ENABLED", "LAST"
+            );
+            for r in rows {
+                let last = r
+                    .last_fired_at
+                    .map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string())
+                    .unwrap_or_else(|| "-".into());
+                println!(
+                    "{:<38} {:<10} {:<9} {:<18} {:<10} {}",
+                    r.id,
+                    r.computer_name.unwrap_or_else(|| "?".into()),
+                    r.kind,
+                    r.cron_expr,
+                    if r.enabled { "yes" } else { "no" },
+                    last
+                );
+            }
+            Ok(())
+        }
+        PowerCommand::Tick => {
+            let sched = ff_agent::power_scheduler::PowerScheduler::new(pool.clone());
+            let actions = sched
+                .evaluate_once()
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            if actions.is_empty() {
+                println!("(no schedules matched this minute)");
+            } else {
+                for a in actions {
+                    println!(
+                        "{:<14} {:<9} {}",
+                        a.computer_name, a.kind, a.result
+                    );
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn handle_train(cmd: TrainCommand) -> Result<()> {
+    let pool = ff_agent::fleet_info::get_fleet_pool()
+        .await
+        .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
+    ff_db::run_postgres_migrations(&pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
+
+    let orch = ff_agent::training_orchestrator::TrainingOrchestrator::new(pool.clone());
+
+    match cmd {
+        TrainCommand::Create {
+            name,
+            base,
+            dataset,
+            output,
+            training_type,
+            computer,
+            epochs,
+            learning_rate,
+            batch_size,
+            lora_rank,
+            max_seq_len,
+        } => {
+            let spec = ff_agent::training_orchestrator::TrainingJobSpec {
+                name: name.clone(),
+                base_model_id: base,
+                training_data_path: dataset,
+                adapter_output_path: output,
+                training_type,
+                computer_name: computer,
+                epochs,
+                learning_rate,
+                batch_size,
+                lora_rank,
+                max_seq_len,
+                created_by: Some(whoami_tag()),
+            };
+            let id = orch
+                .create_job(spec)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!("{GREEN}✓ Created training job {id}{RESET}");
+            println!("  name:   {name}");
+            println!("  status: queued");
+            println!();
+            println!("Start it with: ff train start {id}");
+            Ok(())
+        }
+        TrainCommand::Start { id } => {
+            let uuid = sqlx::types::Uuid::parse_str(&id)
+                .map_err(|e| anyhow::anyhow!("bad uuid: {e}"))?;
+            let deferred = orch
+                .start_job(uuid)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!("{GREEN}✓ Training job {id} dispatched{RESET}");
+            println!("  deferred_task: {deferred}");
+            Ok(())
+        }
+        TrainCommand::List { status, limit } => {
+            let rows =
+                ff_db::pg_list_training_jobs(&pool, status.as_deref(), limit).await?;
+            if rows.is_empty() {
+                println!("(no training jobs)");
+                return Ok(());
+            }
+            println!(
+                "{:<38} {:<22} {:<12} {:<10} {:<10} {}",
+                "ID", "NAME", "STATUS", "TYPE", "COMPUTER", "CREATED"
+            );
+            for r in rows {
+                let created = r.created_at.format("%Y-%m-%d %H:%M").to_string();
+                println!(
+                    "{:<38} {:<22} {:<12} {:<10} {:<10} {}",
+                    r.id,
+                    truncate_str(&r.name, 22),
+                    r.status,
+                    r.training_type,
+                    truncate_str(r.computer_name.as_deref().unwrap_or("-"), 10),
+                    created
+                );
+            }
+            Ok(())
+        }
+        TrainCommand::Show { id } => {
+            let uuid = sqlx::types::Uuid::parse_str(&id)
+                .map_err(|e| anyhow::anyhow!("bad uuid: {e}"))?;
+            match ff_db::pg_get_training_job(&pool, uuid).await? {
+                Some(r) => {
+                    println!("ID:              {}", r.id);
+                    println!("Name:            {}", r.name);
+                    println!("Status:          {}", r.status);
+                    println!("Type:            {}", r.training_type);
+                    println!(
+                        "Base model:      {}",
+                        r.base_model_id.unwrap_or_else(|| "-".into())
+                    );
+                    println!("Dataset:         {}", r.training_data_path);
+                    if let Some(out) = r.adapter_output_path {
+                        println!("Adapter output:  {out}");
+                    }
+                    if let Some(c) = r.computer_name {
+                        println!("Computer:        {c}");
+                    }
+                    if let Some(t) = r.started_at {
+                        println!("Started:         {}", t.format("%Y-%m-%d %H:%M UTC"));
+                    }
+                    if let Some(t) = r.completed_at {
+                        println!("Completed:       {}", t.format("%Y-%m-%d %H:%M UTC"));
+                    }
+                    if let Some(deferred) = r.deferred_task_id {
+                        println!("Deferred task:   {deferred}");
+                    }
+                    if let Some(err) = r.error_message {
+                        println!("Error:           {err}");
+                    }
+                    if let Some(rm) = r.result_model_id {
+                        println!("Result model:    {rm}");
+                    }
+                    let loss_samples = r.loss_curve.as_array().map(|a| a.len()).unwrap_or(0);
+                    println!("Loss samples:    {loss_samples}");
+                    println!(
+                        "Params:\n{}",
+                        serde_json::to_string_pretty(&r.params).unwrap_or_default()
+                    );
+                }
+                None => {
+                    eprintln!("No training job with id '{id}'");
+                    std::process::exit(1);
+                }
+            }
+            Ok(())
+        }
     }
 }

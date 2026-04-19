@@ -1,0 +1,74 @@
+# ForgeFleet Postgres follower — OFF-SITE / WAN variant.
+#
+# -------------------------------------------------------------------
+# Difference from docker-compose.follower.yml:
+#
+#   * The follower reaches the PRIMARY through Tailscale (or another
+#     overlay/VPN), not the LAN. `POSTGRES_PRIMARY_HOST` is expected
+#     to be a Tailscale address such as 100.64.5.100.
+#
+#   * `network_mode: host` works on Linux Tailscale hosts, which is
+#     why it is retained below. On macOS Tailscale runs inside a
+#     user-mode stack; if you run this compose file on a mac you MUST
+#     switch to a bridge network and explicitly expose 55432, because
+#     host networking on Docker for Mac does not observe the utun
+#     Tailscale interface. In that case, replace the two lines marked
+#     "HOST-NET ONLY" with `ports: ["55432:55432"]` and DELETE the
+#     `network_mode: host` line.
+#
+#   * Primary's pg_hba.conf must allow replication from the Tailscale
+#     CIDR (100.64.0.0/10) — see deploy/WAN_REPLICATION.md §3.
+#
+#   * This replica does NOT participate in leader election. WAN
+#     latency makes quorum decisions unsafe. It's a cold-standby
+#     read replica for disaster recovery only.
+#
+# -------------------------------------------------------------------
+# Usage on an off-site machine (joined to Tailscale first):
+#
+#   cd deploy/
+#   POSTGRES_PRIMARY_HOST=100.64.5.100 \
+#     POSTGRES_REPLICATION_PASSWORD=<same as primary> \
+#     docker compose -f docker-compose.follower-remote.yml up -d
+#
+# On first start, replica-bootstrap.sh runs pg_basebackup -R with
+# standby.signal + primary_conninfo pointed at the Tailscale IP,
+# then execs the normal postgres entrypoint.
+# -------------------------------------------------------------------
+
+name: forgefleet-follower-remote
+
+services:
+  postgres-replica:
+    image: postgres:16-alpine
+    container_name: forgefleet-postgres-replica-remote
+    # HOST-NET ONLY (Linux w/ native Tailscale): sources outbound
+    # pg_basebackup traffic from the host's Tailscale IP so the
+    # primary sees 100.64.x.x and matches its pg_hba rule.
+    network_mode: host
+    environment:
+      PGPORT: 55432
+      POSTGRES_USER: forgefleet
+      POSTGRES_PASSWORD: forgefleet
+      POSTGRES_DB: forgefleet
+      # Tailscale IP of the primary. No LAN fallback: for a WAN
+      # follower the overlay network is the ONLY reachable path.
+      POSTGRES_PRIMARY_HOST: ${POSTGRES_PRIMARY_HOST:-100.64.5.100}
+      POSTGRES_PRIMARY_PORT: ${POSTGRES_PRIMARY_PORT:-55432}
+      POSTGRES_REPLICATION_USER: replicator
+      POSTGRES_REPLICATION_PASSWORD: ${POSTGRES_REPLICATION_PASSWORD:-replicator-default}
+      PGDATA: /var/lib/postgresql/data/pgdata
+      # Marker env var the bootstrap script / our tooling can read to
+      # confirm this volume is a WAN replica, not a LAN one. Helps
+      # `ff fleet db` surfaces keep LAN/WAN replicas distinct.
+      FORGEFLEET_REPLICA_SCOPE: wan
+    volumes:
+      - postgres_replica_remote_data:/var/lib/postgresql/data
+      - ./docker/replica-bootstrap.sh:/usr/local/bin/replica-bootstrap.sh:ro
+    entrypoint: ["/usr/local/bin/replica-bootstrap.sh"]
+    command: []
+    restart: unless-stopped
+
+volumes:
+  postgres_replica_remote_data:
+    name: forgefleet-postgres-replica-remote-data

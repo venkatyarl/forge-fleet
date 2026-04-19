@@ -319,6 +319,21 @@ impl Materializer {
                             continue;
                         }
                     };
+                    // ── HMAC verification ─────────────────────────────
+                    // Reject beats that fail HMAC if a pulse_beat_hmac_key
+                    // is configured; accept unsigned beats silently when
+                    // no key is configured (rollout compatibility).
+                    let name_preview = serde_json::from_str::<serde_json::Value>(&payload)
+                        .ok()
+                        .and_then(|v| v.get("computer_name")
+                            .and_then(|n| n.as_str())
+                            .map(str::to_string))
+                        .unwrap_or_else(|| "unknown".into());
+                    let hmac_key = crate::pulse_hmac::KeyCache::global().get().await;
+                    let outcome = crate::pulse_hmac::verify_json(hmac_key.as_deref(), &payload);
+                    if !crate::pulse_hmac::log_verify(&name_preview, outcome) {
+                        continue;
+                    }
                     let beat: PulseBeatV2 = match serde_json::from_str(&payload) {
                         Ok(b) => b,
                         Err(e) => {
@@ -336,6 +351,15 @@ impl Materializer {
                                 container_upserts = report.docker_container_upserts,
                                 "materializer: beat processed"
                             );
+                            // Mirror member status transitions to NATS (best-effort).
+                            if let Some((prev, new)) = &report.status_transition {
+                                crate::nats::publish_member_status_transition(
+                                    &beat.computer_name,
+                                    prev,
+                                    new,
+                                )
+                                .await;
+                            }
                         }
                         Err(e) => {
                             error!(

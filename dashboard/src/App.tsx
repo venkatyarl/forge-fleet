@@ -17,6 +17,7 @@ import { OperatorOnboarding } from './pages/OperatorOnboarding'
 import { Versions } from './pages/Versions'
 import { PlanningHub } from './pages/PlanningHub'
 import { Projects } from './pages/Projects'
+import { Pulse } from './pages/Pulse'
 import { Topology } from './pages/Topology'
 import { MeshStatus } from './pages/MeshStatus'
 import { Updates } from './pages/Updates'
@@ -82,6 +83,8 @@ export default function App() {
         <Route path="brain" element={<Brain />} />
         <Route path="brain/graph" element={<BrainGraph />} />
         <Route path="brain/:threadSlug" element={<Brain />} />
+        {/* Pulse v2 dashboard — unified fleet + LLM + software + HA + alerts + docker */}
+        <Route path="pulse" element={<Pulse />} />
         {/* Fleet (accessible via Settings or direct link) */}
         <Route path="fleet" element={<FleetOverview />} />
         <Route path="topology" element={<Topology />} />

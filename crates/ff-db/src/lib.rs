@@ -63,6 +63,18 @@ pub use queries::{
     pg_fire_brain_reminder, pg_snooze_brain_reminder,
     pg_upsert_brain_community, pg_set_vault_node_community,
     BrainCommunityRow, pg_list_brain_communities,
+    // Phase 12 (V19) — shared volumes / power schedules / training jobs
+    SharedVolumeRow, SharedVolumeMountRow,
+    pg_create_shared_volume, pg_get_shared_volume, pg_list_shared_volumes,
+    pg_upsert_shared_volume_mount, pg_delete_shared_volume_mount,
+    pg_list_shared_volume_mounts,
+    ComputerScheduleRow,
+    pg_create_schedule, pg_list_schedules, pg_mark_schedule_fired, pg_delete_schedule,
+    TrainingJobRow,
+    pg_create_training_job, pg_get_training_job, pg_list_training_jobs,
+    pg_update_training_job_status, pg_attach_training_deferred_task,
+    pg_append_training_loss_sample,
+    pg_append_benchmark_result, pg_get_benchmark_results,
 };
 pub use runtime_registry::RuntimeRegistryStore;
 pub use sync::{
