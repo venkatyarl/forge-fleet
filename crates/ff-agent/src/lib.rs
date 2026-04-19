@@ -41,6 +41,7 @@ pub mod smart_lru;
 pub mod multi_agent;
 pub mod notifications;
 pub mod openai_bridge;
+pub mod openclaw;
 pub mod orchestrator_agent;
 pub mod permissions;
 pub mod plugins;

@@ -11,9 +11,11 @@
 
 pub mod beat_v2;
 pub mod client;
+pub mod docker_probe;
 pub mod error;
 pub mod heartbeat;
 pub mod heartbeat_v2;
+pub mod llm_probe;
 pub mod materializer;
 pub mod metrics;
 pub mod peer_map;

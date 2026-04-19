@@ -1411,6 +1411,7 @@ dependencies = [
  "ff-brain",
  "ff-core",
  "ff-db",
+ "ff-pulse",
  "futures",
  "ratatui",
  "reqwest",

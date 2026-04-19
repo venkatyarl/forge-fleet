@@ -93,11 +93,17 @@ enum Command {
     },
     /// Fleet-wide operations (mesh check, verify node, etc.)
     Fleet { #[command(subcommand)] command: FleetCommand },
+    /// Manage LLM servers across the fleet.
+    Llm { #[command(subcommand)] command: LlmCommand },
+    /// Manage software inventory + upgrades.
+    Software { #[command(subcommand)] command: SoftwareCommand },
     /// Self-service onboarding helpers (show curl command, list recent, revoke).
     Onboard { #[command(subcommand)] command: OnboardCommand },
     /// Virtual Brain vault indexer + utilities.
     #[command(alias = "brain")]
     VirtualBrain { #[command(subcommand)] command: BrainCommand },
+    /// OpenClaw gateway/node visibility across the fleet.
+    Openclaw { #[command(subcommand)] command: OpenclawCommand },
     /// Run ForgeFleet's unified daemon: deferred-task scheduler+worker, disk
     /// sampler, and deployment reconciler all in one long-lived process.
     /// Typically run on boot via launchd/systemd.
@@ -189,6 +195,16 @@ enum FleetCommand {
         name: String,
         #[arg(long)] json: bool,
     },
+    /// Show the current fleet leader + election state.
+    Leader {
+        #[arg(long)] json: bool,
+    },
+    /// Show computer health table (SDOWN/ODOWN flags).
+    Health {
+        #[arg(long)] json: bool,
+    },
+    /// Debug: dump local peer_map + what each member sees.
+    Gossip,
     /// Migrate every fleet node to a new GitHub owner + move the repo from
     /// ~/taylorProjects/forge-fleet → ~/projects/forge-fleet. Enqueues one
     /// idempotent shell task per node via the deferred queue (trigger=node_online),
@@ -208,6 +224,28 @@ enum FleetCommand {
 }
 
 #[derive(Debug, Clone, Subcommand)]
+enum LlmCommand {
+    /// Show all running LLM servers fleet-wide.
+    Status {
+        #[arg(long)] json: bool,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum SoftwareCommand {
+    /// List installed software across the fleet.
+    List {
+        #[arg(long)] computer: Option<String>,
+        #[arg(long)] software: Option<String>,
+        #[arg(long)] json: bool,
+    },
+    /// Show software with upgrades available (installed_version != latest_version).
+    Drift {
+        #[arg(long)] json: bool,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
 enum BrainCommand {
     /// Run a full vault index (parse all .md files, upsert nodes + edges).
     Index {
@@ -222,6 +260,15 @@ enum BrainCommand {
     Communities,
     /// Show vault index stats.
     Stats,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum OpenclawCommand {
+    /// Show OpenClaw mode across all fleet members (gateway vs node + version).
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -419,8 +466,11 @@ async fn main() -> Result<()> {
         Some(Command::Nodes)               => return handle_nodes(&config_path),
         Some(Command::Versions { node })   => return handle_versions(node.clone()).await,
         Some(Command::Fleet { command })   => return handle_fleet(command.clone()).await,
+        Some(Command::Llm { command })     => return handle_llm(command.clone()).await,
+        Some(Command::Software { command }) => return handle_software(command.clone()).await,
         Some(Command::Onboard { command }) => return handle_onboard(command.clone()).await,
         Some(Command::VirtualBrain { command }) => return handle_brain(command.clone()).await,
+        Some(Command::Openclaw { command }) => return handle_openclaw(command.clone()).await,
         _ => {}
     }
 
@@ -506,8 +556,11 @@ async fn main() -> Result<()> {
         }
         Some(Command::Versions { node }) => handle_versions(node).await,
         Some(Command::Fleet { command }) => handle_fleet(command).await,
+        Some(Command::Llm { command }) => handle_llm(command).await,
+        Some(Command::Software { command }) => handle_software(command).await,
         Some(Command::Onboard { command }) => handle_onboard(command).await,
         Some(Command::VirtualBrain { command }) => handle_brain(command).await,
+        Some(Command::Openclaw { command }) => handle_openclaw(command).await,
         Some(Command::Supervise { prompt, max_attempts }) => {
             let sup_config = ff_agent::supervisor::SupervisorConfig {
                 max_attempts,
@@ -3355,6 +3408,15 @@ async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
                 }
             }
         }
+        FleetCommand::Leader { json } => {
+            handle_fleet_leader(&pool, json).await?;
+        }
+        FleetCommand::Health { json } => {
+            handle_fleet_health(&pool, json).await?;
+        }
+        FleetCommand::Gossip => {
+            handle_fleet_gossip().await?;
+        }
         FleetCommand::MigrateGithub { new_owner, skip_local, only, dry_run, yes } => {
             let nodes = ff_db::pg_list_nodes(&pool).await?;
             let local = ff_agent::fleet_info::resolve_this_node_name().await;
@@ -3412,6 +3474,538 @@ async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
             println!("\nTrack progress with: ff defer list");
         }
     }
+    Ok(())
+}
+
+/// Resolve the Redis URL for Pulse reads. Prefers `$FORGEFLEET_REDIS_URL`,
+/// then `~/.forgefleet/fleet.toml` `[redis] url`, then a localhost fallback.
+fn resolve_pulse_redis_url() -> String {
+    if let Ok(url) = std::env::var("FORGEFLEET_REDIS_URL") {
+        if !url.trim().is_empty() {
+            return url;
+        }
+    }
+    const FALLBACK: &str = "redis://localhost:6380";
+    let Some(home) = dirs::home_dir() else { return FALLBACK.to_string() };
+    let path = home.join(".forgefleet/fleet.toml");
+    let Ok(text) = std::fs::read_to_string(&path) else { return FALLBACK.to_string() };
+    let Ok(val) = toml::from_str::<toml::Value>(&text) else { return FALLBACK.to_string() };
+    val.get("redis")
+        .and_then(|r| r.get("url"))
+        .and_then(|u| u.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| FALLBACK.to_string())
+}
+
+fn pulse_reader() -> Result<ff_pulse::reader::PulseReader> {
+    let url = resolve_pulse_redis_url();
+    ff_pulse::reader::PulseReader::new(&url)
+        .map_err(|e| anyhow::anyhow!("pulse: connect {url}: {e}"))
+}
+
+fn secs_ago(ts: chrono::DateTime<chrono::Utc>) -> i64 {
+    (chrono::Utc::now() - ts).num_seconds().max(0)
+}
+
+async fn handle_fleet_leader(pool: &sqlx::PgPool, json: bool) -> Result<()> {
+    let leader = ff_db::pg_get_current_leader(pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("pg_get_current_leader: {e}"))?;
+
+    // Candidate pool: fleet_members × computers, sorted by election_priority.
+    let cand_rows = sqlx::query(
+        "SELECT c.name        AS name,
+                fm.election_priority AS election_priority
+         FROM fleet_members fm
+         JOIN computers c ON c.id = fm.computer_id
+         ORDER BY fm.election_priority ASC, c.name ASC",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("list candidates: {e}"))?;
+
+    let candidates: Vec<(String, i32)> = cand_rows
+        .iter()
+        .map(|r| (sqlx::Row::get::<String, _>(r, "name"), sqlx::Row::get::<i32, _>(r, "election_priority")))
+        .collect();
+
+    // Pulse info: alive + yielding from beats.
+    let mut alive_map: std::collections::HashMap<String, (bool, bool)> =
+        std::collections::HashMap::new();
+    if let Ok(reader) = pulse_reader() {
+        if let Ok(beats) = reader.all_beats().await {
+            for b in beats {
+                alive_map.insert(b.computer_name.clone(), (!b.going_offline, b.is_yielding));
+            }
+        }
+    }
+
+    if json {
+        let cur = leader.as_ref().map(|l| serde_json::json!({
+            "member_name": l.member_name,
+            "computer_id": l.computer_id,
+            "epoch":       l.epoch,
+            "elected_at":  l.elected_at,
+            "reason":      l.reason,
+            "heartbeat_at": l.heartbeat_at,
+            "heartbeat_age_secs": secs_ago(l.heartbeat_at),
+        }));
+        let cand: Vec<_> = candidates.iter().map(|(name, prio)| {
+            let (alive, yielding) = alive_map.get(name).copied().unwrap_or((false, false));
+            serde_json::json!({
+                "name": name,
+                "election_priority": prio,
+                "alive": alive,
+                "yielding": yielding,
+                "is_current": leader.as_ref().map(|l| &l.member_name == name).unwrap_or(false),
+            })
+        }).collect();
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+            "current_leader": cur,
+            "candidates":     cand,
+        })).unwrap_or_default());
+        return Ok(());
+    }
+
+    match &leader {
+        Some(l) => {
+            println!("{CYAN}▶ Current fleet leader:{RESET}");
+            println!("  name:          {}", l.member_name);
+            println!("  computer_id:   {}", l.computer_id);
+            println!("  epoch:         {}", l.epoch);
+            println!("  elected_at:    {}", l.elected_at.format("%Y-%m-%d %H:%M:%S UTC"));
+            println!("  heartbeat age: {} seconds", secs_ago(l.heartbeat_at));
+            println!("  reason:        {}", l.reason.as_deref().unwrap_or("-"));
+        }
+        None => {
+            println!("{YELLOW}(no current leader in fleet_leader_state){RESET}");
+        }
+    }
+
+    if !candidates.is_empty() {
+        println!("\n  Candidates (by election_priority):");
+        for (name, prio) in &candidates {
+            let (alive, yielding) = alive_map.get(name).copied().unwrap_or((false, false));
+            let alive_str = if alive { "yes" } else { "no" };
+            let yield_str = if yielding { "yes" } else { "no" };
+            let marker = match &leader {
+                Some(l) if &l.member_name == name => "  (← current)",
+                _ => "",
+            };
+            println!(
+                "    {:<12} priority={:<5} alive={:<4} yielding={:<4}{}",
+                name, prio, alive_str, yield_str, marker
+            );
+        }
+    } else {
+        println!("\n  (no candidates in fleet_members)");
+    }
+    Ok(())
+}
+
+async fn handle_fleet_health(pool: &sqlx::PgPool, json: bool) -> Result<()> {
+    // Pull computer rows — name, primary_ip, status, last_seen_at.
+    let rows = sqlx::query(
+        "SELECT name, primary_ip, status, last_seen_at
+         FROM computers
+         ORDER BY name ASC",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("list computers: {e}"))?;
+
+    #[derive(Debug)]
+    struct HealthRow {
+        name: String,
+        ip: String,
+        status: String,
+        last_beat_secs: Option<i64>,
+        cpu_pct: Option<f64>,
+        ram_pct: Option<f64>,
+        llm_servers: Option<usize>,
+        software_count: Option<i64>,
+        sdown: bool,
+        odown: bool,
+    }
+
+    // Pulse lookups.
+    let reader = pulse_reader().ok();
+    let beats_by_name: std::collections::HashMap<String, ff_pulse::beat_v2::PulseBeatV2> =
+        if let Some(r) = &reader {
+            r.beats_by_name().await.unwrap_or_default()
+        } else {
+            std::collections::HashMap::new()
+        };
+
+    // Software counts per computer (best-effort).
+    let sw_rows = sqlx::query(
+        "SELECT c.name AS name, COUNT(cs.software_id) AS cnt
+         FROM computers c
+         LEFT JOIN computer_software cs ON cs.computer_id = c.id
+         GROUP BY c.name",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    let mut sw_map: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    for r in &sw_rows {
+        let name: String = sqlx::Row::get(r, "name");
+        let cnt: i64 = sqlx::Row::get(r, "cnt");
+        sw_map.insert(name, cnt);
+    }
+
+    let mut out: Vec<HealthRow> = Vec::with_capacity(rows.len());
+    for r in &rows {
+        let name: String = sqlx::Row::get(r, "name");
+        let ip: String = sqlx::Row::get(r, "primary_ip");
+        let status: String = sqlx::Row::get(r, "status");
+        let last_seen: Option<chrono::DateTime<chrono::Utc>> = sqlx::Row::get(r, "last_seen_at");
+
+        let beat = beats_by_name.get(&name);
+        let last_beat_secs = beat
+            .map(|b| secs_ago(b.timestamp))
+            .or_else(|| last_seen.map(secs_ago));
+
+        let sdown = if let Some(r) = &reader {
+            r.is_sdown(&name).await.unwrap_or(true)
+        } else {
+            true
+        };
+        let odown = if let Some(r) = &reader {
+            r.is_odown(&name).await.unwrap_or(false)
+        } else {
+            false
+        };
+
+        out.push(HealthRow {
+            name: name.clone(),
+            ip,
+            status,
+            last_beat_secs,
+            cpu_pct: beat.map(|b| b.load.cpu_pct),
+            ram_pct: beat.map(|b| b.load.ram_pct),
+            llm_servers: beat.map(|b| b.llm_servers.len()),
+            software_count: sw_map.get(&name).copied(),
+            sdown,
+            odown,
+        });
+    }
+
+    if json {
+        let arr: Vec<_> = out.iter().map(|h| serde_json::json!({
+            "name": h.name,
+            "ip": h.ip,
+            "status": h.status,
+            "last_beat_secs": h.last_beat_secs,
+            "cpu_pct": h.cpu_pct,
+            "ram_pct": h.ram_pct,
+            "llm_servers": h.llm_servers,
+            "software_count": h.software_count,
+            "sdown": h.sdown,
+            "odown": h.odown,
+        })).collect();
+        println!("{}", serde_json::to_string_pretty(&arr).unwrap_or_default());
+        return Ok(());
+    }
+
+    if out.is_empty() {
+        println!("(no computers registered)");
+        return Ok(());
+    }
+
+    println!(
+        "{:<11} {:<14} {:<9} {:<10} {:<5} {:<5} {:<12} {:<8}",
+        "NAME", "IP", "STATUS", "LAST_BEAT", "CPU%", "RAM%", "LLM SERVERS", "SOFTWARE"
+    );
+    for h in &out {
+        let status = if h.odown { "odown".to_string() }
+            else if h.sdown { "sdown".to_string() }
+            else { h.status.clone() };
+        let beat = h.last_beat_secs.map(|s| format!("{s}s ago")).unwrap_or_else(|| "-".into());
+        let cpu = h.cpu_pct.map(|v| format!("{:.1}", v)).unwrap_or_else(|| "-".into());
+        let ram = h.ram_pct.map(|v| format!("{:.1}", v)).unwrap_or_else(|| "-".into());
+        let llms = h.llm_servers.map(|n| n.to_string()).unwrap_or_else(|| "-".into());
+        let sw = h.software_count.map(|n| n.to_string()).unwrap_or_else(|| "-".into());
+        println!(
+            "{:<11} {:<14} {:<9} {:<10} {:<5} {:<5} {:<12} {:<8}",
+            h.name, h.ip, status, beat, cpu, ram, llms, sw
+        );
+    }
+    Ok(())
+}
+
+async fn handle_fleet_gossip() -> Result<()> {
+    let reader = pulse_reader()?;
+    let beats = reader
+        .all_beats()
+        .await
+        .map_err(|e| anyhow::anyhow!("all_beats: {e}"))?;
+
+    if beats.is_empty() {
+        println!("(no beats present in Redis — is the daemon publishing pulses?)");
+        return Ok(());
+    }
+
+    println!("{CYAN}▶ Fleet gossip dump — peers_seen per member:{RESET}");
+    for b in &beats {
+        let age = secs_ago(b.timestamp);
+        println!(
+            "\n  {} (epoch={}, role={}, {}s old, going_offline={}, yielding={})",
+            b.computer_name, b.epoch, b.role_claimed, age, b.going_offline, b.is_yielding,
+        );
+        if b.peers_seen.is_empty() {
+            println!("    (peers_seen empty)");
+            continue;
+        }
+        for p in &b.peers_seen {
+            let pa = secs_ago(p.last_beat_at);
+            println!(
+                "    ├─ {:<12} status={:<6} epoch_witnessed={:<4} last_beat={}s ago",
+                p.name, p.status, p.epoch_witnessed, pa,
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn handle_llm(cmd: LlmCommand) -> Result<()> {
+    match cmd {
+        LlmCommand::Status { json } => handle_llm_status(json).await,
+    }
+}
+
+async fn handle_llm_status(json: bool) -> Result<()> {
+    let reader = pulse_reader()?;
+    let servers = reader
+        .list_llm_servers()
+        .await
+        .map_err(|e| anyhow::anyhow!("list_llm_servers: {e}"))?;
+
+    // Also grab all computer names so we can show "(no server)" rows.
+    let all_computers = reader.list_computers().await.unwrap_or_default();
+
+    if json {
+        let arr: Vec<_> = servers.iter().map(|(computer, s)| serde_json::json!({
+            "computer":  computer,
+            "model":     s.model.id,
+            "runtime":   s.runtime,
+            "endpoint":  s.endpoint,
+            "queue_depth": s.queue_depth,
+            "active_requests": s.active_requests,
+            "tokens_per_sec_last_min": s.tokens_per_sec_last_min,
+            "is_healthy": s.is_healthy,
+            "status":    s.status,
+        })).collect();
+        println!("{}", serde_json::to_string_pretty(&arr).unwrap_or_default());
+        return Ok(());
+    }
+
+    if servers.is_empty() {
+        println!("(no running LLM servers)");
+        if !all_computers.is_empty() {
+            println!("computers present in pulse: {}", all_computers.join(", "));
+        }
+        return Ok(());
+    }
+
+    println!(
+        "{:<10} {:<20} {:<10} {:<32} {:<5} {:<6} {:<7} {:<8}",
+        "COMPUTER", "MODEL", "RUNTIME", "ENDPOINT", "QUEUE", "ACTIVE", "TOK/S", "HEALTH"
+    );
+    for (computer, s) in &servers {
+        let health = if s.is_healthy { "healthy" } else { "unhealthy" };
+        println!(
+            "{:<10} {:<20} {:<10} {:<32} {:<5} {:<6} {:<7.1} {:<8}",
+            truncate_for_col(computer, 10),
+            truncate_for_col(&s.model.id, 20),
+            truncate_for_col(&s.runtime, 10),
+            truncate_for_col(&s.endpoint, 32),
+            s.queue_depth,
+            s.active_requests,
+            s.tokens_per_sec_last_min,
+            health
+        );
+    }
+
+    // Also show computers that have NO running server.
+    let hosts_with_server: std::collections::HashSet<&str> =
+        servers.iter().map(|(c, _)| c.as_str()).collect();
+    let mut missing: Vec<&String> = all_computers
+        .iter()
+        .filter(|c| !hosts_with_server.contains(c.as_str()))
+        .collect();
+    missing.sort();
+    for c in &missing {
+        println!("{:<10} (no server)", truncate_for_col(c, 10));
+    }
+    Ok(())
+}
+
+async fn handle_software(cmd: SoftwareCommand) -> Result<()> {
+    let pool = ff_agent::fleet_info::get_fleet_pool()
+        .await
+        .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
+    ff_db::run_postgres_migrations(&pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
+
+    match cmd {
+        SoftwareCommand::List { computer, software, json } => {
+            handle_software_list(&pool, computer, software, json).await
+        }
+        SoftwareCommand::Drift { json } => handle_software_drift(&pool, json).await,
+    }
+}
+
+async fn handle_software_list(
+    pool: &sqlx::PgPool,
+    computer: Option<String>,
+    software: Option<String>,
+    json: bool,
+) -> Result<()> {
+    let mut sql = String::from(
+        "SELECT c.name            AS computer,
+                sr.id              AS software_id,
+                sr.display_name    AS display_name,
+                sr.kind            AS kind,
+                cs.installed_version AS installed_version,
+                sr.latest_version  AS latest_version,
+                cs.install_source  AS install_source,
+                cs.status          AS status,
+                cs.last_checked_at AS last_checked_at
+         FROM computer_software cs
+         JOIN computers c          ON cs.computer_id = c.id
+         JOIN software_registry sr ON cs.software_id = sr.id
+         WHERE 1=1",
+    );
+    if computer.is_some() {
+        sql.push_str(" AND c.name = $1");
+    }
+    if software.is_some() {
+        sql.push_str(if computer.is_some() { " AND sr.id = $2" } else { " AND sr.id = $1" });
+    }
+    sql.push_str(" ORDER BY c.name ASC, sr.id ASC");
+
+    let mut query = sqlx::query(&sql);
+    if let Some(c) = &computer { query = query.bind(c); }
+    if let Some(s) = &software { query = query.bind(s); }
+
+    let rows = query
+        .fetch_all(pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("list software: {e}"))?;
+
+    if json {
+        let arr: Vec<_> = rows.iter().map(|r| serde_json::json!({
+            "computer":          sqlx::Row::get::<String, _>(r, "computer"),
+            "software_id":       sqlx::Row::get::<String, _>(r, "software_id"),
+            "display_name":      sqlx::Row::get::<String, _>(r, "display_name"),
+            "kind":              sqlx::Row::get::<String, _>(r, "kind"),
+            "installed_version": sqlx::Row::get::<Option<String>, _>(r, "installed_version"),
+            "latest_version":    sqlx::Row::get::<Option<String>, _>(r, "latest_version"),
+            "install_source":    sqlx::Row::get::<Option<String>, _>(r, "install_source"),
+            "status":            sqlx::Row::get::<String, _>(r, "status"),
+        })).collect();
+        println!("{}", serde_json::to_string_pretty(&arr).unwrap_or_default());
+        return Ok(());
+    }
+
+    if rows.is_empty() {
+        println!("(no matching computer_software rows)");
+        return Ok(());
+    }
+
+    println!(
+        "{:<11} {:<16} {:<10} {:<16} {:<16} {:<10} {:<18}",
+        "COMPUTER", "SOFTWARE", "KIND", "INSTALLED", "LATEST", "SOURCE", "STATUS"
+    );
+    for r in &rows {
+        let computer: String = sqlx::Row::get(r, "computer");
+        let sid: String = sqlx::Row::get(r, "software_id");
+        let kind: String = sqlx::Row::get(r, "kind");
+        let installed: Option<String> = sqlx::Row::get(r, "installed_version");
+        let latest: Option<String> = sqlx::Row::get(r, "latest_version");
+        let src: Option<String> = sqlx::Row::get(r, "install_source");
+        let status: String = sqlx::Row::get(r, "status");
+        println!(
+            "{:<11} {:<16} {:<10} {:<16} {:<16} {:<10} {:<18}",
+            truncate_for_col(&computer, 11),
+            truncate_for_col(&sid, 16),
+            truncate_for_col(&kind, 10),
+            truncate_for_col(installed.as_deref().unwrap_or("-"), 16),
+            truncate_for_col(latest.as_deref().unwrap_or("-"), 16),
+            truncate_for_col(src.as_deref().unwrap_or("-"), 10),
+            truncate_for_col(&status, 18),
+        );
+    }
+    Ok(())
+}
+
+async fn handle_software_drift(pool: &sqlx::PgPool, json: bool) -> Result<()> {
+    // Two drift signals: explicit status='upgrade_available' OR
+    // installed_version differs from latest_version (both non-null).
+    let rows = sqlx::query(
+        "SELECT c.name              AS computer,
+                sr.id                AS software_id,
+                sr.display_name      AS display_name,
+                cs.installed_version AS installed_version,
+                sr.latest_version    AS latest_version,
+                cs.install_source    AS install_source,
+                cs.status            AS status
+         FROM computer_software cs
+         JOIN computers c          ON cs.computer_id = c.id
+         JOIN software_registry sr ON cs.software_id = sr.id
+         WHERE cs.status = 'upgrade_available'
+            OR (cs.installed_version IS NOT NULL
+                AND sr.latest_version IS NOT NULL
+                AND cs.installed_version <> sr.latest_version)
+         ORDER BY c.name ASC, sr.id ASC",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("list drift: {e}"))?;
+
+    if json {
+        let arr: Vec<_> = rows.iter().map(|r| serde_json::json!({
+            "computer":          sqlx::Row::get::<String, _>(r, "computer"),
+            "software_id":       sqlx::Row::get::<String, _>(r, "software_id"),
+            "display_name":      sqlx::Row::get::<String, _>(r, "display_name"),
+            "installed_version": sqlx::Row::get::<Option<String>, _>(r, "installed_version"),
+            "latest_version":    sqlx::Row::get::<Option<String>, _>(r, "latest_version"),
+            "install_source":    sqlx::Row::get::<Option<String>, _>(r, "install_source"),
+            "status":            sqlx::Row::get::<String, _>(r, "status"),
+        })).collect();
+        println!("{}", serde_json::to_string_pretty(&arr).unwrap_or_default());
+        return Ok(());
+    }
+
+    if rows.is_empty() {
+        println!("{GREEN}✓ No drift detected — every computer_software row matches its software_registry.latest_version.{RESET}");
+        return Ok(());
+    }
+
+    println!(
+        "{:<11} {:<16} {:<18} {:<18} {:<10} {:<18}",
+        "COMPUTER", "SOFTWARE", "INSTALLED", "LATEST", "SOURCE", "STATUS"
+    );
+    for r in &rows {
+        let computer: String = sqlx::Row::get(r, "computer");
+        let sid: String = sqlx::Row::get(r, "software_id");
+        let installed: Option<String> = sqlx::Row::get(r, "installed_version");
+        let latest: Option<String> = sqlx::Row::get(r, "latest_version");
+        let src: Option<String> = sqlx::Row::get(r, "install_source");
+        let status: String = sqlx::Row::get(r, "status");
+        println!(
+            "{:<11} {:<16} {:<18} {:<18} {:<10} {:<18}",
+            truncate_for_col(&computer, 11),
+            truncate_for_col(&sid, 16),
+            truncate_for_col(installed.as_deref().unwrap_or("-"), 18),
+            truncate_for_col(latest.as_deref().unwrap_or("-"), 18),
+            truncate_for_col(src.as_deref().unwrap_or("-"), 10),
+            truncate_for_col(&status, 18),
+        );
+    }
+    println!("\n{} row(s) with drift.", rows.len());
     Ok(())
 }
 
@@ -3510,6 +4104,97 @@ async fn handle_brain(cmd: BrainCommand) -> Result<()> {
             println!("  nodes (current): {}", nodes.len());
             println!("  edges:           {total_edges}");
             println!("  communities:     {communities}");
+        }
+    }
+    Ok(())
+}
+
+async fn handle_openclaw(cmd: OpenclawCommand) -> Result<()> {
+    let pool = ff_agent::fleet_info::get_fleet_pool()
+        .await
+        .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
+    ff_db::run_postgres_migrations(&pool).await
+        .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
+
+    match cmd {
+        OpenclawCommand::Status { json } => {
+            // Join computers → openclaw_installations → computer_software
+            // (software_id = 'openclaw'). LEFT JOINs so every computer shows
+            // up even if OpenClaw hasn't been installed/configured yet.
+            let rows: Vec<(
+                String,                                     // name
+                String,                                     // primary_ip
+                Option<String>,                             // mode
+                Option<String>,                             // gateway_url
+                Option<chrono::DateTime<chrono::Utc>>,      // last_reconfigured_at
+                Option<String>,                             // installed_version
+            )> = sqlx::query_as(
+                "SELECT c.name, \
+                        c.primary_ip, \
+                        oi.mode, \
+                        oi.gateway_url, \
+                        oi.last_reconfigured_at, \
+                        cs.installed_version AS openclaw_version \
+                 FROM computers c \
+                 LEFT JOIN openclaw_installations oi ON oi.computer_id = c.id \
+                 LEFT JOIN computer_software cs \
+                        ON cs.computer_id = c.id AND cs.software_id = 'openclaw' \
+                 ORDER BY c.name",
+            )
+            .fetch_all(&pool)
+            .await
+            .map_err(|e| anyhow::anyhow!("query openclaw status: {e}"))?;
+
+            if json {
+                let items: Vec<serde_json::Value> = rows
+                    .into_iter()
+                    .map(|(name, ip, mode, url, reconfigured, version)| {
+                        serde_json::json!({
+                            "name": name,
+                            "primary_ip": ip,
+                            "mode": mode,
+                            "gateway_url": url,
+                            "last_reconfigured_at": reconfigured.map(|t| t.to_rfc3339()),
+                            "openclaw_version": version,
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&items)?);
+                return Ok(());
+            }
+
+            if rows.is_empty() {
+                println!("(no computers registered)");
+                return Ok(());
+            }
+
+            println!(
+                "{:<14} {:<16} {:<8} {:<34} {:<22} {}",
+                "NAME", "IP", "MODE", "GATEWAY URL", "LAST RECONFIG", "OPENCLAW"
+            );
+            for (name, ip, mode, url, reconfigured, version) in rows {
+                let mode_s = mode.as_deref().unwrap_or("-");
+                let url_s = url.as_deref().unwrap_or("-");
+                let ts_s = reconfigured
+                    .map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string())
+                    .unwrap_or_else(|| "-".into());
+                let ver_s = version.as_deref().unwrap_or("-");
+                let mode_colored = match mode_s {
+                    "gateway" => format!("{GREEN}{mode_s}{RESET}"),
+                    "node" => format!("{CYAN}{mode_s}{RESET}"),
+                    _ => mode_s.to_string(),
+                };
+                // Account for color escape width when padding.
+                let mode_pad = if matches!(mode_s, "gateway" | "node") {
+                    format!("{:<8}", mode_colored)
+                } else {
+                    format!("{:<8}", mode_s)
+                };
+                println!(
+                    "{:<14} {:<16} {} {:<34} {:<22} {}",
+                    name, ip, mode_pad, url_s, ts_s, ver_s
+                );
+            }
         }
     }
     Ok(())

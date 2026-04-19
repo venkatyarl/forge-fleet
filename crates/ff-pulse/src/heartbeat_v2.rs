@@ -21,9 +21,11 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
 use crate::beat_v2::{
-    Capabilities, DbTopology, DockerStatus, HardwareInfo, Ip, LoadInfo, MemoryInfo,
+    Capabilities, DbTopology, HardwareInfo, Ip, LoadInfo, MemoryInfo,
     NetworkInfo, PulseBeatV2,
 };
+use crate::docker_probe::DockerProbe;
+use crate::llm_probe::LlmProbe;
 use crate::software_collector::SoftwareCollector;
 
 /// Publisher for PulseBeatV2 — richer payload used by Pulse v2 subsystems.
@@ -85,7 +87,7 @@ impl HeartbeatV2Publisher {
     }
 
     /// Build a single beat from local system state.
-    pub fn build_beat(&self) -> PulseBeatV2 {
+    pub async fn build_beat(&self) -> PulseBeatV2 {
         let mut beat = PulseBeatV2::skeleton(&self.computer_name);
         beat.epoch = self.epoch.load(Ordering::Relaxed);
         beat.role_claimed = self.role.read().map(|r| r.clone()).unwrap_or_else(|_| "member".to_string());
@@ -186,17 +188,14 @@ impl HeartbeatV2Publisher {
         // ── Installed software inventory ─────────────────────────────────
         beat.installed_software = SoftwareCollector::new().detect();
 
-        // ── Placeholders awaiting later phases ───────────────────────────
-        // llm_servers, available_models — empty vecs
-        // docker — default empty status
-        // peers_seen — populated by a separate loop (reader_tick)
-        beat.docker = DockerStatus {
-            daemon_running: false, // Phase 10 probes this
-            total_cpu_pct: 0.0,
-            total_memory_mb: 0.0,
-            memory_limit_mb: 0.0,
-            projects: Vec::new(),
-        };
+        // ── LLM servers + available models (probe localhost) ─────────────
+        beat.llm_servers = LlmProbe::detect().await;
+        beat.available_models = LlmProbe::available_models();
+
+        // ── Docker daemon probe ──────────────────────────────────────────
+        beat.docker = DockerProbe::detect().await;
+
+        // ── peers_seen populated by a separate loop (reader_tick) ────────
 
         beat.db_topology = DbTopology {
             postgres_primary: None,
@@ -228,7 +227,7 @@ impl HeartbeatV2Publisher {
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(self.interval) => {
-                        let beat = self.build_beat();
+                        let beat = self.build_beat().await;
                         if let Err(e) = publish_beat(&mut conn, &self.computer_name, &beat).await {
                             error!("heartbeat_v2: publish failed: {e}");
                         } else {
@@ -238,7 +237,7 @@ impl HeartbeatV2Publisher {
                     _ = shutdown.changed() => {
                         if *shutdown.borrow() {
                             info!("heartbeat_v2 for '{}' emitting final LWT beat", self.computer_name);
-                            let mut final_beat = self.build_beat();
+                            let mut final_beat = self.build_beat().await;
                             final_beat.going_offline = true;
                             if let Err(e) = publish_beat(&mut conn, &self.computer_name, &final_beat).await {
                                 warn!("heartbeat_v2: LWT publish failed: {e}");
@@ -430,11 +429,11 @@ fn classify_iface(iface: &str, ip: &str) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn build_beat_roundtrips_through_json() {
+    #[tokio::test]
+    async fn build_beat_roundtrips_through_json() {
         let client = redis::Client::open("redis://localhost:6380").unwrap();
         let pub_ = HeartbeatV2Publisher::new(client, "test-computer".into(), Duration::from_secs(15), 100);
-        let beat = pub_.build_beat();
+        let beat = pub_.build_beat().await;
         assert_eq!(beat.pulse_protocol_version, 2);
         assert_eq!(beat.computer_name, "test-computer");
         assert!(beat.hardware.cpu_cores > 0);
