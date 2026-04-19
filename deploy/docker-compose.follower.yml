@@ -9,8 +9,9 @@
 #     docker compose -f docker-compose.follower.yml up -d
 #
 # On first start, the volume is empty so replica-bootstrap.sh runs
-# pg_basebackup -R, which writes standby.signal + primary_conninfo.
-# Subsequent starts just resume WAL streaming.
+# pg_basebackup -R, which writes standby.signal + primary_conninfo,
+# then execs the normal postgres entrypoint. Subsequent starts skip
+# basebackup and resume WAL streaming.
 
 name: forgefleet-follower
 
@@ -18,9 +19,21 @@ services:
   postgres-replica:
     image: postgres:16-alpine
     container_name: forgefleet-postgres-replica
-    ports:
-      - "55432:5432"
+    # Host networking so the replica's outbound pg_basebackup /
+    # streaming connection sources from the node's LAN IP
+    # (e.g. 192.168.5.102), which matches pg_hba.conf's
+    # `host replication replicator 192.168.5.0/24 md5` rule on primary.
+    # Using bridge networking causes Docker MASQUERADE to rewrite the
+    # source IP to the host's egress IP, which on this fleet ends up
+    # as a public VPN egress and fails the pg_hba check.
+    network_mode: host
     environment:
+      # Override default listen port so we don't collide with any
+      # future local postgres on 5432; we keep the 55432 convention.
+      PGPORT: 55432
+      # Credentials MUST match the primary (basebackup copies everything,
+      # including pg_authid). These are kept for clarity and for any
+      # future failover where this node becomes primary.
       POSTGRES_USER: forgefleet
       POSTGRES_PASSWORD: forgefleet
       POSTGRES_DB: forgefleet
@@ -28,18 +41,16 @@ services:
       POSTGRES_PRIMARY_PORT: ${POSTGRES_PRIMARY_PORT:-55432}
       POSTGRES_REPLICATION_USER: replicator
       POSTGRES_REPLICATION_PASSWORD: ${POSTGRES_REPLICATION_PASSWORD:-replicator-default}
+      PGDATA: /var/lib/postgresql/data/pgdata
     volumes:
       - postgres_replica_data:/var/lib/postgresql/data
-      - ./docker/replica-bootstrap.sh:/docker-entrypoint-initdb.d/00-replica-bootstrap.sh:ro
+      - ./docker/replica-bootstrap.sh:/usr/local/bin/replica-bootstrap.sh:ro
+    # Override the default command so we run pg_basebackup BEFORE initdb.
+    # The bootstrap script execs docker-entrypoint.sh once PGDATA is populated.
+    entrypoint: ["/usr/local/bin/replica-bootstrap.sh"]
+    command: []
     restart: unless-stopped
-    networks:
-      - forgefleet-follower
 
 volumes:
   postgres_replica_data:
     name: forgefleet-postgres-replica-data
-
-networks:
-  forgefleet-follower:
-    name: forgefleet-follower
-    driver: bridge

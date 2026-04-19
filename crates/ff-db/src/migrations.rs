@@ -217,6 +217,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "project_management",
         sql: schema::SCHEMA_V15_PROJECT_MANAGEMENT,
     },
+    PgMigration {
+        version: 16,
+        name: "observability",
+        sql: schema::SCHEMA_V16_OBSERVABILITY,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.

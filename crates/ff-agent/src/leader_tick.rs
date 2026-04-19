@@ -41,6 +41,15 @@ use ff_db::leader_state::{
 };
 use ff_pulse::reader::{PulseError, PulseReader};
 
+/// Max revive attempts per computer per [`REVIVE_BACKOFF_WINDOW_MIN`] minutes.
+/// Above this the leader skips (and should escalate via alert channels).
+const REVIVE_MAX_ATTEMPTS_PER_WINDOW: i64 = 3;
+/// Rolling window for revive-attempt backoff accounting.
+const REVIVE_BACKOFF_WINDOW_MIN: i64 = 30;
+/// Maximum age of `last_seen_at` that still qualifies a computer as a revive
+/// candidate (i.e. "was alive recently"). Matches the task spec.
+const REVIVE_RECENT_SEEN_MIN: i64 = 10;
+
 /// If the durable leader row's `heartbeat_at` is older than this, a live
 /// peer is allowed to challenge and take over.
 const STALE_THRESHOLD_SECS: i64 = 45;
@@ -153,6 +162,23 @@ impl LeaderTick {
                                     ?outcome,
                                     "leader tick"
                                 );
+                                // Only scan for revivable members when we
+                                // are currently the leader (just elected or
+                                // continuing).
+                                if matches!(
+                                    outcome,
+                                    TickOutcome::StillLeader
+                                        | TickOutcome::BecameLeader
+                                        | TickOutcome::TookOver(_)
+                                ) {
+                                    if let Err(err) = self.revive_scan().await {
+                                        tracing::warn!(
+                                            node = %self.my_name,
+                                            error = %err,
+                                            "revive_scan failed"
+                                        );
+                                    }
+                                }
                             }
                             Err(err) => {
                                 tracing::warn!(
@@ -297,6 +323,117 @@ impl LeaderTick {
             // without evidence that we are the right taker, do nothing.
             (Some(_), None) => Ok(TickOutcome::NoOp),
         }
+    }
+
+    /// Scan for computers stuck in an objectively-down state that were alive
+    /// recently, and enqueue a `revive_member` deferred task per eligible
+    /// target. Called only when we are the current leader.
+    pub async fn revive_scan(&self) -> Result<(), LeaderError> {
+        // 1. Find all currently-offline computers that were seen in the last
+        //    REVIVE_RECENT_SEEN_MIN minutes.
+        let rows = sqlx::query(
+            "SELECT id, name
+               FROM computers
+              WHERE status IN ('odown', 'offline', 'sdown')
+                AND last_seen_at IS NOT NULL
+                AND last_seen_at > NOW() - ($1 || ' minutes')::INTERVAL",
+        )
+        .bind(REVIVE_RECENT_SEEN_MIN.to_string())
+        .fetch_all(&self.pg)
+        .await?;
+
+        for row in rows {
+            let computer_id: Uuid = row.get("id");
+            let name: String = row.get("name");
+
+            // Never attempt to revive ourselves.
+            if name == self.my_name {
+                continue;
+            }
+
+            // 2. Backoff guard — skip if we've already tried too often lately.
+            let recent_attempts = match crate::revive::ReviveManager::recent_attempt_count(
+                &self.pg,
+                computer_id,
+                REVIVE_BACKOFF_WINDOW_MIN,
+            )
+            .await
+            {
+                Ok(n) => n,
+                Err(err) => {
+                    tracing::warn!(
+                        node = %name,
+                        error = %err,
+                        "revive backoff lookup failed"
+                    );
+                    continue;
+                }
+            };
+
+            if recent_attempts >= REVIVE_MAX_ATTEMPTS_PER_WINDOW {
+                tracing::warn!(
+                    node = %name,
+                    recent_attempts,
+                    window_min = REVIVE_BACKOFF_WINDOW_MIN,
+                    "revive backoff reached — skipping (escalation-worthy)"
+                );
+                continue;
+            }
+
+            // 3. De-dupe: is a revive_member task already in-flight?
+            let inflight = sqlx::query(
+                "SELECT 1 FROM deferred_tasks
+                   WHERE kind = 'shell'
+                     AND status IN ('pending', 'dispatchable', 'running')
+                     AND title = $1",
+            )
+            .bind(format!("revive_member: {name}"))
+            .fetch_optional(&self.pg)
+            .await?;
+            if inflight.is_some() {
+                tracing::debug!(node = %name, "revive task already in-flight; skipping");
+                continue;
+            }
+
+            // 4. Enqueue. Use trigger_type='now' so the scheduler promotes
+            //    immediately. The revive call runs on the leader itself
+            //    (preferred_node = self) because the target is offline.
+            let title = format!("revive_member: {name}");
+            let script = format!(
+                "ff fleet revive {name} --internal"
+            );
+            let payload = serde_json::json!({ "command": script });
+            let trigger_spec = serde_json::json!({});
+            let required_caps = serde_json::json!([]);
+
+            match ff_db::queries::pg_enqueue_deferred(
+                &self.pg,
+                &title,
+                "shell",
+                &payload,
+                "now",
+                &trigger_spec,
+                Some(&self.my_name),
+                &required_caps,
+                Some(&format!("leader:{}", self.my_name)),
+                Some(2),
+            )
+            .await
+            {
+                Ok(id) => tracing::info!(
+                    node = %name,
+                    task_id = %id,
+                    "enqueued revive_member deferred task"
+                ),
+                Err(err) => tracing::warn!(
+                    node = %name,
+                    error = %err,
+                    "failed to enqueue revive_member task"
+                ),
+            }
+        }
+
+        Ok(())
     }
 
     /// Compute the next epoch to propose: `max(seen_epoch + 1, local + 1, 1)`.

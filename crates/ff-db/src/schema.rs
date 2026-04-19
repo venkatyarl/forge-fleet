@@ -1221,3 +1221,56 @@ CREATE TABLE IF NOT EXISTS work_item_relations (
     PRIMARY KEY (from_id, to_id, relation_type)
 );
 "#;
+
+pub const SCHEMA_V16_OBSERVABILITY: &str = r#"
+-- V16: observability — metrics history, alert policies, alert events
+-- Uses plain Postgres (no TimescaleDB extension dependency; if available, add
+-- SELECT create_hypertable later — not blocking).
+
+CREATE TABLE IF NOT EXISTS computer_metrics_history (
+    computer_id          UUID NOT NULL REFERENCES computers(id) ON DELETE CASCADE,
+    recorded_at          TIMESTAMPTZ NOT NULL,
+    cpu_pct              FLOAT,
+    ram_pct              FLOAT,
+    ram_used_gb          FLOAT,
+    disk_free_gb         FLOAT,
+    gpu_pct              FLOAT,
+    llm_ram_allocated_gb FLOAT,
+    llm_queue_depth      INT,
+    llm_active_requests  INT,
+    llm_tokens_per_sec   FLOAT,
+    PRIMARY KEY (computer_id, recorded_at)
+);
+CREATE INDEX IF NOT EXISTS idx_metrics_by_time ON computer_metrics_history(recorded_at DESC);
+
+CREATE TABLE IF NOT EXISTS alert_policies (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name            TEXT NOT NULL UNIQUE,
+    description     TEXT,
+    metric          TEXT NOT NULL,          -- 'cpu_pct' | 'ram_pct' | 'disk_free_gb' | 'llm_queue_depth' | 'computer_status' | ...
+    scope           TEXT NOT NULL DEFAULT 'any_computer',  -- 'any_computer' | 'specific' (with computer_id) | 'leader_only'
+    scope_computer_id UUID REFERENCES computers(id),
+    condition       TEXT NOT NULL,          -- '> 90' | '< 10' | "== 'offline'"
+    duration_secs   INT NOT NULL DEFAULT 300,
+    severity        TEXT NOT NULL DEFAULT 'warning',  -- 'info' | 'warning' | 'critical'
+    cooldown_secs   INT NOT NULL DEFAULT 3600,
+    channel         TEXT NOT NULL DEFAULT 'telegram',  -- 'telegram' | 'log' | 'webhook' | 'openclaw'
+    enabled         BOOLEAN NOT NULL DEFAULT true,
+    metadata        JSONB NOT NULL DEFAULT '{}',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS alert_events (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    policy_id       UUID NOT NULL REFERENCES alert_policies(id),
+    computer_id     UUID REFERENCES computers(id),
+    fired_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    resolved_at     TIMESTAMPTZ,
+    value           FLOAT,
+    value_text      TEXT,
+    message         TEXT,
+    channel_result  TEXT  -- 'sent' | 'failed: <reason>' | 'muted'
+);
+CREATE INDEX IF NOT EXISTS idx_alert_events_policy ON alert_events(policy_id, fired_at DESC);
+CREATE INDEX IF NOT EXISTS idx_alert_events_unresolved ON alert_events(resolved_at) WHERE resolved_at IS NULL;
+"#;

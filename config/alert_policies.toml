@@ -1,0 +1,56 @@
+schema_version = "1"
+
+[[policy]]
+name = "computer_offline"
+description = "Computer has been ODOWN for more than 5 minutes"
+metric = "computer_status"
+scope = "any_computer"
+condition = "== 'odown'"
+duration_secs = 300
+severity = "critical"
+cooldown_secs = 3600
+channel = "telegram"
+
+[[policy]]
+name = "high_cpu"
+description = "CPU sustained above 90% for 5 minutes"
+metric = "cpu_pct"
+scope = "any_computer"
+condition = "> 90"
+duration_secs = 300
+severity = "warning"
+cooldown_secs = 1800
+channel = "log"
+
+[[policy]]
+name = "low_disk_space"
+description = "Free disk space below 20 GB"
+metric = "disk_free_gb"
+scope = "any_computer"
+condition = "< 20"
+duration_secs = 600
+severity = "warning"
+cooldown_secs = 86400
+channel = "telegram"
+
+[[policy]]
+name = "high_llm_queue"
+description = "LLM queue depth above 10 requests for 2 minutes"
+metric = "llm_queue_depth"
+scope = "any_computer"
+condition = "> 10"
+duration_secs = 120
+severity = "info"
+cooldown_secs = 900
+channel = "log"
+
+[[policy]]
+name = "leader_heartbeat_stale"
+description = "Leader's Postgres heartbeat older than 60 seconds"
+metric = "leader_heartbeat_age_secs"
+scope = "leader_only"
+condition = "> 60"
+duration_secs = 30
+severity = "critical"
+cooldown_secs = 600
+channel = "telegram"

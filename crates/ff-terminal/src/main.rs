@@ -108,6 +108,16 @@ enum Command {
     Pm { #[command(subcommand)] command: PmCommand },
     /// Project metadata — repos, environments, CI.
     Project { #[command(subcommand)] command: ProjectCommand },
+    /// Alert policies + alert events (Phase 10 observability).
+    Alert { #[command(subcommand)] command: AlertCommand },
+    /// Metrics history (downsampled Pulse beats, 90-day retention).
+    Metrics { #[command(subcommand)] command: MetricsCommand },
+    /// Tail fleet logs via NATS (stub — requires FORGEFLEET_NATS_URL).
+    Logs {
+        #[arg(long)] computer: Option<String>,
+        #[arg(long)] service: Option<String>,
+        #[arg(long, default_value_t = 50)] tail: usize,
+    },
     /// Run ForgeFleet's unified daemon: deferred-task scheduler+worker, disk
     /// sampler, and deployment reconciler all in one long-lived process.
     /// Typically run on boot via launchd/systemd.
@@ -225,6 +235,32 @@ enum FleetCommand {
         /// Required to actually enqueue (otherwise prints plan and exits).
         #[arg(long, default_value_t = false)] yes: bool,
     },
+    /// Manually trigger revive for a specific computer.
+    Revive {
+        /// Computer name (e.g. "marcus")
+        computer: String,
+        /// Skip the SSH probe — go straight to WoL + alert.
+        #[arg(long, default_value_t = false)] wol_only: bool,
+        /// Internal flag: called by the deferred task scheduler, output terse JSON.
+        #[arg(long, default_value_t = false, hide = true)] internal: bool,
+    },
+    /// Fleet task-coverage requirements (drives CoverageGuard).
+    TaskCoverage {
+        #[command(subcommand)]
+        command: TaskCoverageCommand,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum TaskCoverageCommand {
+    /// Upsert task-coverage rows from config/task_coverage.toml.
+    Seed {
+        /// Override TOML path (defaults to config/task_coverage.toml).
+        #[arg(long)] from_toml: Option<PathBuf>,
+    },
+    /// Show the current fleet_task_coverage table.
+    #[command(alias = "ls")]
+    List,
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -445,6 +481,89 @@ enum ModelCommand {
         #[arg(long, default_value_t = 4)]
         q_bits: u8,
     },
+    /// Check HuggingFace for new upstream revisions of catalog models.
+    /// Updates `upstream_latest_rev` + flips stale per-computer files
+    /// to `revision_available`. Safe to run manually.
+    CheckUpstream {
+        #[arg(long, default_value_t = false)] json: bool,
+    },
+    /// Show fleet task-coverage status: per required task, how many
+    /// active deployments serve it and any gaps.
+    Coverage {
+        #[arg(long, default_value_t = false)] json: bool,
+    },
+    /// Model scout — walk fleet_task_coverage, query HF for the top-N
+    /// downloaded models per task, filter by license/size/denylist, and
+    /// insert survivors as `lifecycle_status='candidate'`.
+    Scout {
+        /// Trigger a scout pass right now (otherwise just prints
+        /// recently-discovered candidates from the DB).
+        #[arg(long, default_value_t = false)] run_now: bool,
+        #[arg(long, default_value_t = false)] json: bool,
+    },
+    /// List catalog rows with `lifecycle_status='candidate'` awaiting
+    /// operator review.
+    ReviewCandidates {
+        #[arg(long, default_value_t = false)] json: bool,
+    },
+    /// Promote a candidate row to `lifecycle_status='active'`.
+    Approve {
+        /// Catalog id.
+        id: String,
+    },
+    /// Reject a candidate row: drops it from the catalog and appends the
+    /// upstream_id (if set) to the scout denylist.
+    Reject {
+        /// Catalog id.
+        id: String,
+    },
+    /// Retire a model: flip `lifecycle_status='retired'` and optionally
+    /// record which model supersedes it.
+    Retire {
+        /// Catalog id.
+        id: String,
+        /// Optional successor catalog id (populates `replaced_by`).
+        #[arg(long)] replace_with: Option<String>,
+        /// Human-readable retirement reason.
+        #[arg(long)] reason: String,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum AlertCommand {
+    /// List all alert policies.
+    #[command(alias = "ls")]
+    List,
+    /// List alert events (fired + resolved). Use --active to filter unresolved.
+    Events {
+        #[arg(long, default_value_t = false)] active: bool,
+        #[arg(long, default_value_t = 50)] limit: i64,
+    },
+    /// Alert policy subcommands (seeding, etc.).
+    Policy {
+        #[command(subcommand)]
+        command: AlertPolicyCommand,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum AlertPolicyCommand {
+    /// Reseed alert_policies from config/alert_policies.toml.
+    Seed {
+        /// Optional alternate path to alert_policies.toml.
+        #[arg(long)] path: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum MetricsCommand {
+    /// Print recent metrics-history rows for a computer.
+    History {
+        /// Computer name (e.g. "taylor").
+        computer: String,
+        /// Lookback window (e.g. "5m", "1h", "24h"). Default: 1h.
+        #[arg(long, default_value = "1h")] since: String,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -516,6 +635,11 @@ async fn main() -> Result<()> {
         Some(Command::Openclaw { command }) => return handle_openclaw(command.clone()).await,
         Some(Command::Pm { command }) => return handle_pm(command.clone()).await,
         Some(Command::Project { command }) => return handle_project(command.clone(), &config_path).await,
+        Some(Command::Alert { command }) => return handle_alert(command.clone()).await,
+        Some(Command::Metrics { command }) => return handle_metrics(command.clone()).await,
+        Some(Command::Logs { computer, service, tail }) => {
+            return handle_logs(computer.clone(), service.clone(), *tail).await;
+        }
         _ => {}
     }
 
@@ -608,6 +732,11 @@ async fn main() -> Result<()> {
         Some(Command::Openclaw { command }) => handle_openclaw(command).await,
         Some(Command::Pm { command }) => handle_pm(command).await,
         Some(Command::Project { command }) => handle_project(command, &config_path).await,
+        Some(Command::Alert { command }) => handle_alert(command).await,
+        Some(Command::Metrics { command }) => handle_metrics(command).await,
+        Some(Command::Logs { computer, service, tail }) => {
+            handle_logs(computer, service, tail).await
+        }
         Some(Command::Supervise { prompt, max_attempts }) => {
             let sup_config = ff_agent::supervisor::SupervisorConfig {
                 max_attempts,
@@ -3038,6 +3167,232 @@ async fn handle_model(cmd: ModelCommand) -> Result<()> {
                     r.id, r.node_name, r.kind, r.status, r.progress_pct, target);
             }
         }
+        ModelCommand::CheckUpstream { json } => {
+            println!("{CYAN}▶ Checking HuggingFace for upstream model revisions...{RESET}");
+            let checker = ff_agent::model_upstream::ModelUpstreamChecker::new(pool.clone());
+            let report = checker.check_all().await
+                .map_err(|e| anyhow::anyhow!("model upstream check: {e}"))?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report).unwrap_or_default());
+            } else {
+                println!(
+                    "checked={} updated={} unchanged={} skipped={} errors={} flagged={}",
+                    report.checked, report.updated, report.unchanged,
+                    report.skipped, report.errors.len(), report.computer_rows_flagged,
+                );
+                if !report.errors.is_empty() {
+                    println!("\n{YELLOW}Errors:{RESET}");
+                    for (id, err) in &report.errors {
+                        println!("  {id}: {err}");
+                    }
+                }
+            }
+        }
+        ModelCommand::Coverage { json } => {
+            let guard = ff_agent::coverage_guard::CoverageGuard::new_dbonly(pool.clone());
+            let report = guard.check_once().await
+                .map_err(|e| anyhow::anyhow!("coverage check: {e}"))?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report).unwrap_or_default());
+            } else {
+                println!("Tasks required:   {}", report.tasks_required);
+                println!("Tasks covered:    {}", report.tasks_covered);
+                println!("Gaps:             {}", report.gaps.len());
+                println!("Auto-loaded:      {}", report.auto_loaded.len());
+                if !report.gaps.is_empty() {
+                    println!();
+                    println!("{:<32} {:<6} {:<6}  CANDIDATES", "TASK", "MIN", "LOAD");
+                    for g in &report.gaps {
+                        let cands = if g.candidates.is_empty() {
+                            "(none)".to_string()
+                        } else {
+                            g.candidates.iter().take(3).cloned().collect::<Vec<_>>().join(", ")
+                        };
+                        println!("{:<32} {:<6} {:<6}  {}",
+                            g.task, g.min_required, g.currently_loaded, cands);
+                    }
+                }
+                if !report.auto_loaded.is_empty() {
+                    println!();
+                    println!("{GREEN}Enqueued auto-load for:{RESET} {}",
+                        report.auto_loaded.join(", "));
+                }
+            }
+        }
+        ModelCommand::Scout { run_now, json } => {
+            if run_now {
+                println!("{CYAN}▶ Running model scout pass...{RESET}");
+                let scout = ff_agent::model_scout::ModelScout::new(pool.clone());
+                let report = scout.scout_once().await
+                    .map_err(|e| anyhow::anyhow!("scout: {e}"))?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report).unwrap_or_default());
+                } else {
+                    println!(
+                        "tasks_scanned={} discovered={} added={} filtered={}",
+                        report.tasks_scanned,
+                        report.discovered,
+                        report.added_as_candidates,
+                        report.filtered_out,
+                    );
+                }
+            } else {
+                let rows = sqlx::query(
+                    "SELECT id, display_name, family, license
+                     FROM model_catalog
+                     WHERE lifecycle_status = 'candidate' AND added_by = 'scout'
+                     ORDER BY id
+                     LIMIT 100",
+                ).fetch_all(&pool).await?;
+                if json {
+                    let arr: Vec<_> = rows.iter().map(|r| serde_json::json!({
+                        "id": sqlx::Row::get::<String, _>(r, "id"),
+                        "display_name": sqlx::Row::get::<String, _>(r, "display_name"),
+                        "family": sqlx::Row::get::<String, _>(r, "family"),
+                        "license": sqlx::Row::get::<Option<String>, _>(r, "license"),
+                    })).collect();
+                    println!("{}", serde_json::to_string_pretty(&arr).unwrap_or_default());
+                } else if rows.is_empty() {
+                    println!("(no scout candidates — pass --run-now to trigger a pass)");
+                } else {
+                    println!("{:<40} {:<16} {:<20} NAME", "ID", "FAMILY", "LICENSE");
+                    for r in &rows {
+                        let id: String = sqlx::Row::get(r, "id");
+                        let name: String = sqlx::Row::get(r, "display_name");
+                        let fam: String = sqlx::Row::get(r, "family");
+                        let lic: Option<String> = sqlx::Row::get(r, "license");
+                        println!("{:<40} {:<16} {:<20} {}",
+                            id, fam, lic.unwrap_or_else(|| "-".into()), name);
+                    }
+                }
+            }
+        }
+        ModelCommand::ReviewCandidates { json } => {
+            let rows = sqlx::query(
+                "SELECT id, display_name, family, license, added_by, tasks
+                 FROM model_catalog
+                 WHERE lifecycle_status = 'candidate'
+                 ORDER BY added_by, id",
+            ).fetch_all(&pool).await?;
+            if json {
+                let arr: Vec<_> = rows.iter().map(|r| serde_json::json!({
+                    "id": sqlx::Row::get::<String, _>(r, "id"),
+                    "display_name": sqlx::Row::get::<String, _>(r, "display_name"),
+                    "family": sqlx::Row::get::<String, _>(r, "family"),
+                    "license": sqlx::Row::get::<Option<String>, _>(r, "license"),
+                    "added_by": sqlx::Row::get::<Option<String>, _>(r, "added_by"),
+                    "tasks": sqlx::Row::get::<serde_json::Value, _>(r, "tasks"),
+                })).collect();
+                println!("{}", serde_json::to_string_pretty(&arr).unwrap_or_default());
+            } else if rows.is_empty() {
+                println!("(no candidates awaiting review)");
+            } else {
+                println!("{:<40} {:<10} {:<16} {:<20} TASKS", "ID", "ADDED_BY", "FAMILY", "LICENSE");
+                for r in &rows {
+                    let id: String = sqlx::Row::get(r, "id");
+                    let fam: String = sqlx::Row::get(r, "family");
+                    let lic: Option<String> = sqlx::Row::get(r, "license");
+                    let added: Option<String> = sqlx::Row::get(r, "added_by");
+                    let tasks: serde_json::Value = sqlx::Row::get(r, "tasks");
+                    let tasks_str = tasks.as_array()
+                        .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(","))
+                        .unwrap_or_default();
+                    println!("{:<40} {:<10} {:<16} {:<20} {}",
+                        id,
+                        added.unwrap_or_else(|| "-".into()),
+                        fam,
+                        lic.unwrap_or_else(|| "-".into()),
+                        tasks_str,
+                    );
+                }
+                println!("\nApprove with: ff model approve <id>");
+                println!("Reject with:  ff model reject <id>");
+            }
+        }
+        ModelCommand::Approve { id } => {
+            let result = sqlx::query(
+                "UPDATE model_catalog
+                    SET lifecycle_status = 'active'
+                  WHERE id = $1 AND lifecycle_status = 'candidate'",
+            )
+            .bind(&id)
+            .execute(&pool)
+            .await?;
+            if result.rows_affected() == 0 {
+                anyhow::bail!("no candidate row found for id '{id}' (already approved or never existed)");
+            }
+            println!("{GREEN}✓{RESET} Promoted '{id}' to lifecycle_status='active'");
+        }
+        ModelCommand::Reject { id } => {
+            let row = sqlx::query(
+                "SELECT upstream_id FROM model_catalog
+                  WHERE id = $1 AND lifecycle_status = 'candidate'",
+            )
+            .bind(&id)
+            .fetch_optional(&pool)
+            .await?;
+            let Some(row) = row else {
+                anyhow::bail!("no candidate row found for id '{id}'");
+            };
+            let upstream_id: Option<String> = sqlx::Row::get(&row, "upstream_id");
+
+            let deleted = sqlx::query(
+                "DELETE FROM model_catalog
+                  WHERE id = $1 AND lifecycle_status = 'candidate'",
+            )
+            .bind(&id)
+            .execute(&pool)
+            .await?;
+            if deleted.rows_affected() == 0 {
+                anyhow::bail!("failed to delete candidate '{id}'");
+            }
+
+            if let Some(up) = upstream_id {
+                let path = PathBuf::from(ff_agent::model_scout::DEFAULT_DENYLIST_PATH);
+                let existing = fs::read_to_string(&path).unwrap_or_default();
+                if !existing.contains(&up) {
+                    let mut parsed: toml::Value =
+                        toml::from_str(&existing).unwrap_or_else(|_| toml::Value::Table(Default::default()));
+                    let arr = parsed
+                        .as_table_mut()
+                        .and_then(|t| t.entry("deny").or_insert_with(|| toml::Value::Array(vec![])).as_array_mut());
+                    if let Some(list) = arr {
+                        list.push(toml::Value::String(up.clone()));
+                    }
+                    if let Some(parent) = path.parent() {
+                        let _ = fs::create_dir_all(parent);
+                    }
+                    let _ = fs::write(&path, toml::to_string_pretty(&parsed).unwrap_or_default());
+                    println!("{GREEN}✓{RESET} Rejected '{id}' and added upstream_id '{up}' to denylist");
+                } else {
+                    println!("{GREEN}✓{RESET} Rejected '{id}' (upstream '{up}' already in denylist)");
+                }
+            } else {
+                println!("{GREEN}✓{RESET} Rejected '{id}' (no upstream_id to denylist)");
+            }
+        }
+        ModelCommand::Retire { id, replace_with, reason } => {
+            let result = sqlx::query(
+                "UPDATE model_catalog
+                    SET lifecycle_status   = 'retired',
+                        replaced_by        = COALESCE($2, replaced_by),
+                        retirement_reason  = $3,
+                        retirement_date    = CURRENT_DATE
+                  WHERE id = $1",
+            )
+            .bind(&id)
+            .bind(replace_with.as_deref())
+            .bind(&reason)
+            .execute(&pool)
+            .await?;
+            if result.rows_affected() == 0 {
+                anyhow::bail!("no catalog row for id '{id}'");
+            }
+            match replace_with {
+                Some(rep) => println!("{GREEN}✓{RESET} Retired '{id}' (replaced by '{rep}')"),
+                None => println!("{GREEN}✓{RESET} Retired '{id}'"),
+            }
+        }
     }
     Ok(())
 }
@@ -3519,6 +3874,152 @@ async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
                 println!("  {:<15} {id}", node);
             }
             println!("\nTrack progress with: ff defer list");
+        }
+        FleetCommand::Revive { computer, wol_only, internal } => {
+            handle_fleet_revive(&pool, &computer, wol_only, internal).await?;
+        }
+        FleetCommand::TaskCoverage { command } => {
+            handle_fleet_task_coverage(&pool, command).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn handle_fleet_task_coverage(
+    pool: &sqlx::PgPool,
+    cmd: TaskCoverageCommand,
+) -> Result<()> {
+    match cmd {
+        TaskCoverageCommand::Seed { from_toml } => {
+            let path = from_toml
+                .unwrap_or_else(ff_agent::task_coverage_seed::resolve_task_coverage_path);
+            println!("{CYAN}▶ Seeding fleet_task_coverage from {}{RESET}", path.display());
+            let report = ff_agent::task_coverage_seed::seed_from_toml(pool, &path).await
+                .map_err(|e| anyhow::anyhow!("seed: {e}"))?;
+            println!(
+                "{GREEN}✓{RESET} inserted={} updated={} unchanged={} total={}",
+                report.inserted, report.updated, report.unchanged, report.total,
+            );
+        }
+        TaskCoverageCommand::List => {
+            let rows = sqlx::query(
+                "SELECT task, min_models_loaded, priority, preferred_model_ids, notes
+                 FROM fleet_task_coverage
+                 ORDER BY
+                   CASE priority
+                     WHEN 'critical' THEN 0
+                     WHEN 'normal' THEN 1
+                     WHEN 'nice-to-have' THEN 2
+                     ELSE 3
+                   END,
+                   task",
+            )
+            .fetch_all(pool)
+            .await?;
+            if rows.is_empty() {
+                println!("(no task coverage rules — run `ff fleet task-coverage seed`)");
+                return Ok(());
+            }
+            println!("{:<32} {:<6} {:<14}  PREFERRED / NOTES", "TASK", "MIN", "PRIORITY");
+            for r in rows {
+                let task: String = sqlx::Row::get(&r, "task");
+                let min: i32 = sqlx::Row::get(&r, "min_models_loaded");
+                let pri: String = sqlx::Row::get(&r, "priority");
+                let preferred: serde_json::Value = sqlx::Row::get(&r, "preferred_model_ids");
+                let notes: Option<String> = sqlx::Row::get(&r, "notes");
+                let pref_str = preferred
+                    .as_array()
+                    .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", "))
+                    .unwrap_or_default();
+                let extra = if !pref_str.is_empty() {
+                    pref_str
+                } else {
+                    notes.unwrap_or_default()
+                };
+                println!("{:<32} {:<6} {:<14}  {}", task, min, pri, extra);
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn handle_fleet_revive(
+    pool: &sqlx::PgPool,
+    computer: &str,
+    wol_only: bool,
+    internal: bool,
+) -> Result<()> {
+    let mgr = ff_agent::revive::ReviveManager::new(pool.clone());
+    let target = mgr.load_target_by_name(computer).await
+        .map_err(|e| anyhow::anyhow!("load target: {e}"))?;
+
+    if !internal {
+        println!("{CYAN}▶ ff fleet revive {}{RESET}", target.name);
+        println!("  primary_ip:    {}", target.primary_ip);
+        println!("  ssh_user:      {}", target.ssh_user);
+        println!("  ssh_port:      {}", target.ssh_port);
+        println!("  os_family:     {}", target.os_family);
+        println!("  mac_addresses: {} entry(ies)", target.mac_addresses.len());
+    }
+
+    let outcome = if wol_only {
+        // WoL-only path short-circuits SSH. Send to every recorded MAC.
+        if target.mac_addresses.is_empty() {
+            ff_agent::revive::ReviveOutcome::Failed(
+                "no MAC addresses on record; cannot WoL-only revive".into(),
+            )
+        } else {
+            let mut sent = false;
+            for mac in &target.mac_addresses {
+                if ff_agent::revive::send_wol(mac).await.is_ok() {
+                    sent = true;
+                }
+            }
+            if sent {
+                ff_agent::revive::ReviveOutcome::WolSent
+            } else {
+                ff_agent::revive::ReviveOutcome::Failed("all WoL sends failed".into())
+            }
+        }
+    } else {
+        mgr.attempt(&target).await
+            .map_err(|e| anyhow::anyhow!("revive attempt: {e}"))?
+    };
+
+    if internal {
+        let j = serde_json::json!({
+            "computer": target.name,
+            "outcome": match &outcome {
+                ff_agent::revive::ReviveOutcome::DaemonRestarted => "daemon_restarted",
+                ff_agent::revive::ReviveOutcome::DaemonAlreadyRunning => "daemon_already_running",
+                ff_agent::revive::ReviveOutcome::WolSent => "wol_sent",
+                ff_agent::revive::ReviveOutcome::Failed(_) => "failed",
+                ff_agent::revive::ReviveOutcome::Skipped(_) => "skipped",
+            },
+            "detail": match &outcome {
+                ff_agent::revive::ReviveOutcome::Failed(r)
+                | ff_agent::revive::ReviveOutcome::Skipped(r) => Some(r.as_str()),
+                _ => None,
+            },
+        });
+        println!("{}", j);
+    } else {
+        match outcome {
+            ff_agent::revive::ReviveOutcome::DaemonRestarted => {
+                println!("{GREEN}✓ daemon restart kicked via SSH{RESET}");
+            }
+            ff_agent::revive::ReviveOutcome::DaemonAlreadyRunning => {
+                println!("{GREEN}✓ daemon already running on target{RESET}");
+            }
+            ff_agent::revive::ReviveOutcome::WolSent => {
+                println!("{CYAN}↻ Wake-on-LAN packet(s) sent — awaiting pulse{RESET}");
+            }
+            ff_agent::revive::ReviveOutcome::Skipped(reason) => {
+                println!("{YELLOW}— skipped: {reason}{RESET}");
+            }
+            ff_agent::revive::ReviveOutcome::Failed(reason) => {
+                println!("{}✗ failed: {reason}{RESET}", "\x1b[31m");
+            }
         }
     }
     Ok(())
@@ -5102,6 +5603,33 @@ async fn handle_daemon(
         });
     }
 
+    // ─── Phase 7: model portfolio intelligence ──────────────────────────
+    // These three long-lived loops only run on the elected leader so we
+    // don't burn HF API quota from every box. Non-leaders skip the spawn
+    // entirely and rely on the leader to keep the catalog + coverage fresh.
+    let (_portfolio_shutdown_tx, portfolio_shutdown_rx) = tokio::sync::watch::channel(false);
+    let is_leader = ff_db::pg_get_current_leader(&pool)
+        .await
+        .ok()
+        .flatten()
+        .map(|l| l.member_name == worker_name)
+        .unwrap_or(false);
+    if scheduler || is_leader {
+        println!(
+            "{CYAN}[portfolio]{RESET} spawning model-upstream (24h) + coverage-guard (15min) + scout (168h)"
+        );
+        let upstream = ff_agent::model_upstream::ModelUpstreamChecker::new(pool.clone());
+        let _upstream_handle = upstream.spawn(24, portfolio_shutdown_rx.clone());
+
+        let guard = ff_agent::coverage_guard::CoverageGuard::new_dbonly(pool.clone());
+        let _guard_handle = guard.spawn(15, portfolio_shutdown_rx.clone());
+
+        let scout = ff_agent::model_scout::ModelScout::new(pool.clone());
+        let _scout_handle = scout.spawn(168, portfolio_shutdown_rx.clone());
+    } else {
+        println!("{CYAN}[portfolio]{RESET} skipping — not leader / scheduler");
+    }
+
     loop {
         tokio::select! {
             _ = defer_tick.tick() => {
@@ -5390,5 +5918,264 @@ async fn handle_config(cmd: ConfigCommand, p: &Path) -> Result<()> {
             println!("{GREEN}✓{RESET} Updated {name}.{key} = {value}");
             Ok(())
         }
+    }
+}
+
+// ─── Phase 10: alerts / metrics / logs ─────────────────────────────────
+
+async fn handle_alert(cmd: AlertCommand) -> Result<()> {
+    let pool = ff_agent::fleet_info::get_fleet_pool()
+        .await
+        .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
+    ff_db::run_postgres_migrations(&pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
+
+    match cmd {
+        AlertCommand::List => {
+            let rows = sqlx::query_as::<
+                _,
+                (
+                    uuid::Uuid,
+                    String,
+                    Option<String>,
+                    String,
+                    String,
+                    String,
+                    i32,
+                    String,
+                    i32,
+                    String,
+                    bool,
+                ),
+            >(
+                "SELECT id, name, description, metric, scope, condition,
+                        duration_secs, severity, cooldown_secs, channel, enabled
+                 FROM alert_policies
+                 ORDER BY name",
+            )
+            .fetch_all(&pool)
+            .await?;
+
+            if rows.is_empty() {
+                println!("(no alert policies — run `ff alert policy seed`)");
+                return Ok(());
+            }
+            println!(
+                "{:<28} {:<10} {:<22} {:<15} {:<15} {:<10} {:<5}",
+                "NAME", "SEVERITY", "METRIC", "CONDITION", "SCOPE", "CHANNEL", "ON?"
+            );
+            for (
+                _id,
+                name,
+                _desc,
+                metric,
+                scope,
+                condition,
+                _duration,
+                severity,
+                _cooldown,
+                channel,
+                enabled,
+            ) in rows
+            {
+                println!(
+                    "{:<28} {:<10} {:<22} {:<15} {:<15} {:<10} {:<5}",
+                    name,
+                    severity,
+                    metric,
+                    condition,
+                    scope,
+                    channel,
+                    if enabled { "yes" } else { "no" }
+                );
+            }
+        }
+        AlertCommand::Events { active, limit } => {
+            let sql = if active {
+                "SELECT e.id, p.name, c.name, e.fired_at, e.resolved_at,
+                        e.value, e.value_text, e.message, e.channel_result
+                 FROM alert_events e
+                 JOIN alert_policies p ON p.id = e.policy_id
+                 LEFT JOIN computers c ON c.id = e.computer_id
+                 WHERE e.resolved_at IS NULL
+                 ORDER BY e.fired_at DESC
+                 LIMIT $1"
+            } else {
+                "SELECT e.id, p.name, c.name, e.fired_at, e.resolved_at,
+                        e.value, e.value_text, e.message, e.channel_result
+                 FROM alert_events e
+                 JOIN alert_policies p ON p.id = e.policy_id
+                 LEFT JOIN computers c ON c.id = e.computer_id
+                 ORDER BY e.fired_at DESC
+                 LIMIT $1"
+            };
+
+            let rows = sqlx::query_as::<
+                _,
+                (
+                    uuid::Uuid,
+                    String,
+                    Option<String>,
+                    chrono::DateTime<chrono::Utc>,
+                    Option<chrono::DateTime<chrono::Utc>>,
+                    Option<f64>,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                ),
+            >(sql)
+            .bind(limit)
+            .fetch_all(&pool)
+            .await?;
+
+            if rows.is_empty() {
+                if active {
+                    println!("(no active alerts)");
+                } else {
+                    println!("(no alert events recorded yet)");
+                }
+                return Ok(());
+            }
+            println!(
+                "{:<20} {:<18} {:<12} {:<10} {}",
+                "FIRED", "POLICY", "COMPUTER", "STATE", "MESSAGE"
+            );
+            for (_id, policy, computer, fired_at, resolved_at, _v, _vt, message, _cr) in rows {
+                let state = if resolved_at.is_some() { "resolved" } else { "firing" };
+                println!(
+                    "{:<20} {:<18} {:<12} {:<10} {}",
+                    fired_at.format("%Y-%m-%d %H:%M:%S"),
+                    truncate_str(&policy, 18),
+                    truncate_str(&computer.unwrap_or_else(|| "-".into()), 12),
+                    state,
+                    message.unwrap_or_default()
+                );
+            }
+        }
+        AlertCommand::Policy { command } => match command {
+            AlertPolicyCommand::Seed { path } => {
+                let toml_path = path.unwrap_or_else(resolve_alert_toml_path);
+                let report = ff_agent::seed_alert_policies_from_toml(&pool, &toml_path)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("seed alert_policies: {e}"))?;
+                println!(
+                    "Seeded alert_policies from {}: inserted={} updated={} unchanged={} total={}",
+                    toml_path.display(),
+                    report.inserted,
+                    report.updated,
+                    report.unchanged,
+                    report.total
+                );
+            }
+        },
+    }
+    Ok(())
+}
+
+async fn handle_metrics(cmd: MetricsCommand) -> Result<()> {
+    let pool = ff_agent::fleet_info::get_fleet_pool()
+        .await
+        .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
+    ff_db::run_postgres_migrations(&pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
+
+    match cmd {
+        MetricsCommand::History { computer, since } => {
+            let secs = parse_duration_secs(&since).unwrap_or(3600);
+            let rows = ff_agent::metrics_downsampler::history_for_computer(
+                &pool,
+                &computer,
+                secs as i64,
+            )
+            .await?;
+
+            if rows.is_empty() {
+                println!(
+                    "(no metrics rows for {computer} in the last {since} — downsampler writes at minute boundaries on the leader)"
+                );
+                return Ok(());
+            }
+            println!(
+                "{:<20} {:>6} {:>6} {:>7} {:>8} {:>6} {:>4} {:>4} {:>6}",
+                "TIME", "CPU%", "RAM%", "RAM-GB", "DISK-GB", "GPU%", "Q", "ACT", "TOK/S"
+            );
+            for r in rows {
+                println!(
+                    "{:<20} {:>6.1} {:>6.1} {:>7.1} {:>8.1} {:>6.1} {:>4} {:>4} {:>6.1}",
+                    r.recorded_at.format("%Y-%m-%d %H:%M:%S"),
+                    r.cpu_pct.unwrap_or(0.0),
+                    r.ram_pct.unwrap_or(0.0),
+                    r.ram_used_gb.unwrap_or(0.0),
+                    r.disk_free_gb.unwrap_or(0.0),
+                    r.gpu_pct.unwrap_or(0.0),
+                    r.llm_queue_depth.unwrap_or(0),
+                    r.llm_active_requests.unwrap_or(0),
+                    r.llm_tokens_per_sec.unwrap_or(0.0),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn handle_logs(
+    _computer: Option<String>,
+    _service: Option<String>,
+    _tail: usize,
+) -> Result<()> {
+    // Part 5 stub — see nats_log_layer.rs. When FORGEFLEET_NATS_URL is
+    // honored and `async-nats` is wired up, this subscribes to
+    // `fleet.logs.{computer}.{service}.{level}` and streams events.
+    println!(
+        "{YELLOW}logs command not yet implemented{RESET} (NATS log layer is stubbed — see crates/ff-agent/src/nats_log_layer.rs)."
+    );
+    Ok(())
+}
+
+/// Locate config/alert_policies.toml relative to the binary or the cwd.
+fn resolve_alert_toml_path() -> PathBuf {
+    if let Ok(md) = std::env::current_exe()
+        && let Some(p) = md
+            .parent()
+            .and_then(|d| d.parent())
+            .and_then(|d| d.parent())
+            .map(|d| d.join("config/alert_policies.toml"))
+        && p.exists()
+    {
+        return p;
+    }
+    PathBuf::from("config/alert_policies.toml")
+}
+
+/// Parse a duration like "5m", "1h", "24h", "30s" into seconds.
+fn parse_duration_secs(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let (num, unit) = match s.chars().position(|c| !c.is_ascii_digit() && c != '.') {
+        Some(i) => (&s[..i], &s[i..]),
+        None => (s, "s"),
+    };
+    let n: f64 = num.parse().ok()?;
+    let mult: f64 = match unit {
+        "s" | "" => 1.0,
+        "m" => 60.0,
+        "h" => 3600.0,
+        "d" => 86400.0,
+        _ => return None,
+    };
+    Some((n * mult).round() as u64)
+}
+
+fn truncate_str(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+        out.push('…');
+        out
     }
 }
