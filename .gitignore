@@ -34,3 +34,4 @@ dist/
 .forgefleet/
 # Added by code-review-graph
 .code-review-graph/
+node-compile-cache/
