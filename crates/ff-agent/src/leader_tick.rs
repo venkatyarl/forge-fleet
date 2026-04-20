@@ -48,9 +48,6 @@ use crate::ha::pg_failover::{FailoverOutcome, PostgresFailoverManager};
 const REVIVE_MAX_ATTEMPTS_PER_WINDOW: i64 = 3;
 /// Rolling window for revive-attempt backoff accounting.
 const REVIVE_BACKOFF_WINDOW_MIN: i64 = 30;
-/// Maximum age of `last_seen_at` that still qualifies a computer as a revive
-/// candidate (i.e. "was alive recently"). Matches the task spec.
-const REVIVE_RECENT_SEEN_MIN: i64 = 10;
 
 /// If the durable leader row's `heartbeat_at` is older than this, a live
 /// peer is allowed to challenge and take over.
@@ -396,16 +393,20 @@ impl LeaderTick {
     /// recently, and enqueue a `revive_member` deferred task per eligible
     /// target. Called only when we are the current leader.
     pub async fn revive_scan(&self) -> Result<(), LeaderError> {
-        // 1. Find all currently-offline computers that were seen in the last
-        //    REVIVE_RECENT_SEEN_MIN minutes.
+        // 1. Find every currently-offline computer. We intentionally do NOT
+        //    gate on a `last_seen_at` freshness window — the earlier 10-min
+        //    gate silently abandoned any member that stayed down long enough
+        //    for its own beat to expire. Instead we rely on the
+        //    [`REVIVE_MAX_ATTEMPTS_PER_WINDOW`] / [`REVIVE_BACKOFF_WINDOW_MIN`]
+        //    backoff to prevent spam on truly-dead machines. Members that
+        //    blow past the backoff get logged as "escalation-worthy" — wire
+        //    an alert policy on that condition to get operator-facing
+        //    notifications.
         let rows = sqlx::query(
             "SELECT id, name
                FROM computers
-              WHERE status IN ('odown', 'offline', 'sdown')
-                AND last_seen_at IS NOT NULL
-                AND last_seen_at > NOW() - ($1 || ' minutes')::INTERVAL",
+              WHERE status IN ('odown', 'offline', 'sdown')",
         )
-        .bind(REVIVE_RECENT_SEEN_MIN.to_string())
         .fetch_all(&self.pg)
         .await?;
 
