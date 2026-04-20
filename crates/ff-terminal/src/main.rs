@@ -386,6 +386,25 @@ enum FleetCommand {
         computer: String,
         #[arg(long, default_value_t = false)] yes: bool,
     },
+    /// Upgrade a software entry across the fleet using its upgrade_playbook.
+    ///
+    /// Looks up every (computer, software_id) row in computer_software,
+    /// resolves the correct playbook key (`{os_family}-{install_source}` →
+    /// `{os_family}` → `all`), and enqueues one shell task per target via
+    /// the deferred task queue (trigger=node_online). Offline nodes pick
+    /// the task up when they come back.
+    Upgrade {
+        /// Software ID (e.g. "gh", "openclaw", "ff").
+        software_id: String,
+        /// Target exactly one computer.
+        #[arg(long)] computer: Option<String>,
+        /// Target every computer that has this software installed.
+        #[arg(long, default_value_t = false)] all: bool,
+        /// Print the plan without enqueueing.
+        #[arg(long, default_value_t = false)] dry_run: bool,
+        /// Required to actually enqueue (otherwise prints plan and exits).
+        #[arg(long, default_value_t = false)] yes: bool,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -4268,6 +4287,99 @@ async fn execute_deferred(
     }
 }
 
+/// Post-completion hook for `meta.auto_upgrade` deferred tasks.
+///
+/// Runs whether the task succeeded or failed. Always:
+///   1. Clears `computer_software.status='upgrading'` back to either `ok`
+///      (on success) or `upgrade_available` (on failure) so the next
+///      hourly tick can retry.
+///   2. Publishes `fleet.events.software.upgrade_completed.{computer}` on NATS.
+///   3. Fires a Telegram message via fleet_secrets (no-op if not configured).
+async fn finalize_upgrade_event(
+    pool: &sqlx::PgPool,
+    task: &ff_db::DeferredTaskRow,
+    ok: bool,
+    meta: &serde_json::Value,
+    err: Option<&str>,
+) {
+    let software_id = meta
+        .get("software_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let display_name = meta
+        .get("display_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or(software_id);
+    let computer = meta
+        .get("computer")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let old_version = meta
+        .get("old_version")
+        .and_then(|v| v.as_str())
+        .unwrap_or("-");
+    let latest_version = meta
+        .get("latest_version")
+        .and_then(|v| v.as_str())
+        .unwrap_or("-");
+
+    // 1. Clear status flag.
+    let new_status = if ok { "ok" } else { "upgrade_available" };
+    let _ = sqlx::query(
+        "UPDATE computer_software cs
+            SET status = $1,
+                last_upgraded_at = CASE WHEN $1 = 'ok' THEN NOW() ELSE last_upgraded_at END
+           FROM computers c
+          WHERE cs.computer_id = c.id
+            AND cs.software_id = $2
+            AND LOWER(c.name)  = LOWER($3)",
+    )
+    .bind(new_status)
+    .bind(software_id)
+    .bind(computer)
+    .execute(pool)
+    .await;
+
+    // 2. NATS event — everyone subscribed to fleet.events.software.> sees it.
+    let status_word = if ok { "success" } else { "failed" };
+    let subject = format!(
+        "fleet.events.software.upgrade_completed.{}",
+        if computer.is_empty() { "unknown" } else { computer },
+    );
+    let payload = serde_json::json!({
+        "software_id":    software_id,
+        "display_name":   display_name,
+        "computer":       computer,
+        "old_version":    old_version,
+        "latest_version": latest_version,
+        "status":         status_word,
+        "error":          err,
+        "defer_id":       task.id,
+        "ts":             chrono::Utc::now().to_rfc3339(),
+    });
+    ff_agent::nats_client::publish_json(subject, &payload).await;
+
+    // 3. Telegram (best-effort — never crashes the worker).
+    let title = if ok {
+        format!("✅ ForgeFleet upgraded {display_name} on {computer}")
+    } else {
+        format!("❌ ForgeFleet upgrade failed: {display_name} on {computer}")
+    };
+    let body = if ok {
+        format!(
+            "{old_version} → {latest_version}\nNo operator action needed.",
+        )
+    } else {
+        format!(
+            "Tried to bump {old_version} → {latest_version}\nerror: {}\nWill retry on next hourly tick.",
+            err.unwrap_or("(unknown)"),
+        )
+    };
+    if let Err(e) = ff_agent::telegram::send_telegram_from_secrets(pool, &title, &body).await {
+        tracing::warn!(error = %e, software_id, computer, "telegram send failed");
+    }
+}
+
 /// Run a shell command either locally (when target is this host or None) or via SSH.
 async fn execute_shell(
     target_node: Option<&str>,
@@ -4617,6 +4729,9 @@ async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
         FleetCommand::Unquarantine { computer, yes } => {
             handle_fleet_unquarantine(&pool, &computer, yes).await?;
         }
+        FleetCommand::Upgrade { software_id, computer, all, dry_run, yes } => {
+            handle_fleet_upgrade(&pool, &software_id, computer, all, dry_run, yes).await?;
+        }
     }
     Ok(())
 }
@@ -4798,6 +4913,112 @@ async fn handle_fleet_unquarantine(
     }
     println!("  {GREEN}✓{RESET} status='pending' in computers table (pulse will flip to 'online')");
     println!("  {GREEN}✓{RESET} published fleet.events.quarantine (event=unquarantine) on NATS");
+    Ok(())
+}
+
+/// `ff fleet upgrade <software_id>` — dispatch the software's upgrade_playbook
+/// across the fleet via the deferred task queue.
+///
+/// Resolves the playbook key per-target in this priority order:
+///   1. `{os_family}-{install_source}`  (e.g. `"macos-brew"`)
+///   2. `{os_family}`                   (e.g. `"macos"`)
+///   3. `"all"`
+/// Targets with no matching key are warned about and skipped. Dry-run mode
+/// prints the plan and exits; `--yes` without `--dry-run` enqueues one
+/// deferred shell task per target with trigger_type=`node_online`.
+async fn handle_fleet_upgrade(
+    pool: &sqlx::PgPool,
+    software_id: &str,
+    computer: Option<String>,
+    all: bool,
+    dry_run: bool,
+    yes: bool,
+) -> Result<()> {
+    if computer.is_none() && !all {
+        anyhow::bail!("pass --all or --computer <name> to pick targets");
+    }
+    if computer.is_some() && all {
+        anyhow::bail!("--computer and --all are mutually exclusive");
+    }
+
+    // Shared resolver — same code path the hourly auto-upgrade tick uses.
+    let (plans, skipped) = ff_agent::auto_upgrade::resolve_upgrade_plans(
+        pool,
+        software_id,
+        computer.as_deref(),
+        false,
+    )
+    .await?;
+
+    let display_name = plans
+        .first()
+        .map(|p| p.display_name.clone())
+        .unwrap_or_else(|| software_id.to_string());
+    let latest_version = plans.first().and_then(|p| p.latest_version.clone());
+
+    if plans.is_empty() && skipped.is_empty() {
+        println!(
+            "{YELLOW}No computer_software rows found for software_id='{software_id}'. Nothing to do.{RESET}"
+        );
+        return Ok(());
+    }
+
+    println!("{CYAN}▶ ff fleet upgrade {software_id}{RESET}");
+    println!("  software:        {display_name} ({software_id})");
+    println!(
+        "  latest upstream: {}",
+        latest_version.as_deref().unwrap_or("(unknown)")
+    );
+    println!("  targets:         {} computer(s)", plans.len());
+    if plans.is_empty() {
+        println!("{YELLOW}No resolvable targets. Nothing to do.{RESET}");
+        for (name, why) in &skipped {
+            println!("    {YELLOW}⚠ skip{RESET} {name}: {why}");
+        }
+        return Ok(());
+    }
+
+    println!(
+        "\n  {:<10} {:<14} {:<10} {:<10} {:<22} command",
+        "computer", "os_family", "source", "installed", "playbook_key"
+    );
+    for p in &plans {
+        let short_cmd = if p.command.len() > 60 {
+            format!("{}…", &p.command[..60])
+        } else {
+            p.command.clone()
+        };
+        println!(
+            "  {:<10} {:<14} {:<10} {:<10} {:<22} {}",
+            p.computer_name,
+            p.os_family,
+            p.install_source.as_deref().unwrap_or("-"),
+            p.installed_version.as_deref().unwrap_or("-"),
+            p.playbook_key,
+            short_cmd
+        );
+    }
+    for (name, why) in &skipped {
+        println!("  {YELLOW}⚠ skip{RESET} {name}: {why}");
+    }
+
+    if dry_run {
+        println!("\n{YELLOW}Dry run — not enqueuing. Drop --dry-run and pass --yes to actually enqueue.{RESET}");
+        return Ok(());
+    }
+    if !yes {
+        println!("\n{YELLOW}Pass --yes to actually enqueue these upgrade tasks.{RESET}");
+        return Ok(());
+    }
+
+    let who = whoami_tag();
+    let enqueued = ff_agent::auto_upgrade::enqueue_plans(pool, &plans, &who).await?;
+
+    println!("\n{GREEN}✓ Enqueued {} upgrade task(s):{RESET}", enqueued.len());
+    for ep in &enqueued {
+        println!("  {:<12} {}", ep.computer_name, ep.defer_id);
+    }
+    println!("\nTrack progress with: ff defer list");
     Ok(())
 }
 
@@ -7621,6 +7842,18 @@ async fn defer_pass(
                 }
                 Err(e) => eprintln!("{RED}  finalize error: {e}{RESET}"),
             }
+
+            // Auto-upgrade finalizer: if this task was an auto-upgrade (or
+            // ff fleet upgrade), publish the completion event + ping Telegram
+            // and clear the `status='upgrading'` flag in computer_software.
+            if let Some(meta) = claimed
+                .payload
+                .get("meta")
+                .and_then(|v| v.get("auto_upgrade"))
+            {
+                finalize_upgrade_event(&pool2, &claimed, ok, meta, err.as_deref()).await;
+            }
+
             // guard drops here, releasing the slot.
             drop(guard);
         });
@@ -7818,6 +8051,15 @@ async fn handle_daemon(
 
         let scout = ff_agent::model_scout::ModelScout::new(pool.clone());
         let _scout_handle = scout.spawn(168, portfolio_shutdown_rx.clone());
+
+        // Hourly auto-upgrade loop: dispatches drift → playbook → Telegram
+        // without operator interaction. Gated by fleet_secrets.auto_upgrade_enabled.
+        println!("{CYAN}[auto-upgrade]{RESET} spawning hourly drift→upgrade→telegram loop");
+        let auto = ff_agent::auto_upgrade::AutoUpgradeTick::new(
+            pool.clone(),
+            worker_name.clone(),
+        );
+        let _auto_handle = auto.spawn(portfolio_shutdown_rx.clone());
     } else {
         println!("{CYAN}[portfolio]{RESET} skipping — not leader / scheduler");
     }

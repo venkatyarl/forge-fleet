@@ -1,8 +1,10 @@
 pub mod agent_coordinator;
 pub mod agent_loop;
 pub mod agent_roles;
+pub mod auto_upgrade;
 pub mod bash_security;
 pub mod brain;
+pub mod telegram;
 pub mod hf_download;
 pub mod hf_version_check;
 pub mod mesh_check;
