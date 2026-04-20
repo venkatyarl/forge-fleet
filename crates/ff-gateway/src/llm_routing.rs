@@ -132,40 +132,66 @@ impl PulseLlmRouter {
     }
 
     /// Pick the best candidate for `requested_model` using:
-    ///   1. Case-insensitive prefix match on `model.id`.
-    ///   2. Lowest queue_depth.
-    ///   3. Highest tokens_per_sec_last_min.
+    ///   1. Normalize both the requested name and each server's `model.id`.
+    ///      Normalization strips Ollama-style tags (`foo:14b` → `foo`),
+    ///      `.gguf` extensions, common quantization suffixes
+    ///      (`-q4_k_m`, `-q8_0`, `-bf16`, etc.), and folds underscores to
+    ///      dashes, lowercased.
+    ///   2. Prefer exact post-normalization match.
+    ///   3. Otherwise accept prefix match in either direction.
+    ///   4. Tie-break by lowest `queue_depth`, then highest
+    ///      `tokens_per_sec_last_min`.
+    ///   5. Exact matches always rank ahead of prefix matches.
     ///
     /// Returns `(computer_name, primary_ip, LlmServer)` when found.
     pub async fn pick_server(
         &self,
         requested_model: &str,
     ) -> Result<Option<(String, String, LlmServer)>, LlmRoutingError> {
-        let requested = requested_model.to_ascii_lowercase();
+        let requested_raw = requested_model.to_ascii_lowercase();
+        let requested_norm = normalize_model_id(requested_model);
         let all = self.collect_active().await?;
 
-        let mut candidates: Vec<(PulseBeatV2, LlmServer)> = all
+        // Match rank, lower = better:
+        //   0 = raw case-insensitive exact (preserves Ollama tag like `:14b`)
+        //   1 = normalized exact (tag/quant stripped both sides)
+        //   2 = normalized prefix match in either direction
+        let mut candidates: Vec<(u8, PulseBeatV2, LlmServer)> = all
             .into_iter()
-            .filter(|(_, s)| {
-                let id = s.model.id.to_ascii_lowercase();
-                // Prefer exact match, otherwise prefix match in either direction
-                // (request may be shorter OR longer than the server's id).
-                id == requested || id.starts_with(&requested) || requested.starts_with(&id)
+            .filter_map(|(b, s)| {
+                let id_raw = s.model.id.to_ascii_lowercase();
+                let id_norm = normalize_model_id(&s.model.id);
+                if id_raw == requested_raw {
+                    Some((0u8, b, s))
+                } else if id_norm == requested_norm {
+                    Some((1u8, b, s))
+                } else if id_norm.starts_with(&requested_norm)
+                    || requested_norm.starts_with(&id_norm)
+                {
+                    Some((2u8, b, s))
+                } else {
+                    None
+                }
             })
             .collect();
 
-        candidates.sort_by(|(_, a), (_, b)| {
-            a.queue_depth.cmp(&b.queue_depth).then_with(|| {
-                b.tokens_per_sec_last_min
-                    .partial_cmp(&a.tokens_per_sec_last_min)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
+        // Primary: best match rank. Secondary: lowest queue_depth.
+        // Tertiary: highest tokens/sec_last_min.
+        candidates.sort_by(|(a_rank, _, a), (b_rank, _, b)| {
+            a_rank
+                .cmp(b_rank)
+                .then_with(|| a.queue_depth.cmp(&b.queue_depth))
+                .then_with(|| {
+                    b.tokens_per_sec_last_min
+                        .partial_cmp(&a.tokens_per_sec_last_min)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
         });
 
         Ok(candidates
             .into_iter()
             .next()
-            .map(|(b, s)| (b.computer_name, b.network.primary_ip, s)))
+            .map(|(_, b, s)| (b.computer_name, b.network.primary_ip, s)))
     }
 
     /// Full end-to-end: extract `model` from the body, pick a server, and
@@ -250,6 +276,74 @@ impl PulseLlmRouter {
         }
         Ok(v)
     }
+}
+
+/// Normalize a model identifier so heterogeneous fleet-reported model IDs
+/// can be matched against user-supplied model names.
+///
+/// Handles (at least):
+/// - Ollama tags:  `qwen2.5-coder:14b`        → `qwen2.5-coder`
+/// - GGUF files:   `Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf`
+///                                             → `qwen3-coder-30b-a3b-instruct`
+/// - Mixed case + underscore separators        → lowercased, dashed
+/// - Common llama.cpp/HF quantization suffixes are stripped so a bare
+///   family name (`qwen3-coder-30b-a3b`) prefix-matches the richer id.
+pub(crate) fn normalize_model_id(raw: &str) -> String {
+    // Lowercase first.
+    let mut s = raw.to_ascii_lowercase();
+
+    // Path-component: keep only the final segment (for HF repo-style ids
+    // like `Qwen/Qwen3-Coder-30B-A3B`).
+    if let Some(idx) = s.rfind('/') {
+        s = s[idx + 1..].to_string();
+    }
+
+    // Drop anything after a colon (Ollama tag — `:14b`, `:latest`).
+    if let Some(idx) = s.find(':') {
+        s.truncate(idx);
+    }
+
+    // Strip trailing `.gguf` / `.bin` / `.safetensors` extension.
+    for ext in [".gguf", ".bin", ".safetensors"] {
+        if s.ends_with(ext) {
+            s.truncate(s.len() - ext.len());
+            break;
+        }
+    }
+
+    // Normalize separators: underscores → dashes, collapse runs of dashes.
+    s = s.replace('_', "-");
+    while s.contains("--") {
+        s = s.replace("--", "-");
+    }
+
+    // Strip common quantization / precision suffixes if trailing.
+    // Order matters: longer suffixes first so we don't leave a stray dash.
+    let quant_suffixes: &[&str] = &[
+        "-q2-k", "-q3-k-s", "-q3-k-m", "-q3-k-l",
+        "-q4-0", "-q4-1", "-q4-k-s", "-q4-k-m",
+        "-q5-0", "-q5-1", "-q5-k-s", "-q5-k-m",
+        "-q6-k", "-q8-0",
+        "-bf16", "-fp16", "-fp8", "-f16", "-f32",
+        "-int8", "-int4",
+        "-awq", "-gptq",
+    ];
+    // Strip repeatedly — a filename may carry more than one precision tag.
+    loop {
+        let mut changed = false;
+        for sfx in quant_suffixes {
+            if s.ends_with(sfx) {
+                s.truncate(s.len() - sfx.len());
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    // Trim leading/trailing dashes left over from stripping.
+    s.trim_matches('-').to_string()
 }
 
 /// Replace `127.0.0.1` / `localhost` / `0.0.0.0` in an endpoint URL with
@@ -366,6 +460,52 @@ mod tests {
         assert_eq!(
             rewrite_endpoint("http://127.0.0.1:55000", ""),
             "http://127.0.0.1:55000"
+        );
+    }
+
+    #[test]
+    fn normalize_strips_ollama_tag() {
+        assert_eq!(normalize_model_id("qwen2.5-coder:14b"), "qwen2.5-coder");
+        assert_eq!(normalize_model_id("qwen2.5-coder:latest"), "qwen2.5-coder");
+        assert_eq!(normalize_model_id("Qwen2.5-Coder:14B"), "qwen2.5-coder");
+    }
+
+    #[test]
+    fn normalize_strips_gguf_and_quant() {
+        assert_eq!(
+            normalize_model_id("Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf"),
+            "qwen3-coder-30b-a3b-instruct"
+        );
+        assert_eq!(
+            normalize_model_id("Qwen2.5-Coder-32B-Instruct-Q8_0.gguf"),
+            "qwen2.5-coder-32b-instruct"
+        );
+    }
+
+    #[test]
+    fn normalize_prefix_match_bare_vs_tagged() {
+        // Bare name vs ollama-tagged server: both normalize to the same stem.
+        let bare = normalize_model_id("qwen2.5-coder");
+        let tagged = normalize_model_id("qwen2.5-coder:14b");
+        assert_eq!(bare, tagged);
+        assert_eq!(bare, "qwen2.5-coder");
+    }
+
+    #[test]
+    fn normalize_prefix_request_matches_richer_id() {
+        // A user asks for `qwen3-coder-30b-a3b`, server has
+        // `qwen3-coder-30b-a3b-instruct`. Post-normalize, prefix match holds.
+        let requested = normalize_model_id("qwen3-coder-30b-a3b");
+        let server = normalize_model_id("Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf");
+        assert!(server.starts_with(&requested));
+    }
+
+    #[test]
+    fn normalize_handles_hf_repo_path() {
+        // HF-style `Owner/Repo` ids — keep last segment.
+        assert_eq!(
+            normalize_model_id("Qwen/Qwen3-Coder-30B-A3B-Instruct"),
+            "qwen3-coder-30b-a3b-instruct"
         );
     }
 }

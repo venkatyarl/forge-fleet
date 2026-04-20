@@ -242,6 +242,16 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "port_registry",
         sql: schema::SCHEMA_V20_PORT_REGISTRY,
     },
+    PgMigration {
+        version: 21,
+        name: "drop_deployment_model_fk",
+        sql: schema::SCHEMA_V21_DROP_DEPLOYMENT_FK,
+    },
+    PgMigration {
+        version: 22,
+        name: "drop_model_presence_fk",
+        sql: schema::SCHEMA_V22_DROP_MODEL_PRESENCE_FK,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.

@@ -1446,3 +1446,30 @@ CREATE TABLE IF NOT EXISTS port_registry (
 CREATE INDEX IF NOT EXISTS idx_port_registry_kind ON port_registry(kind);
 CREATE INDEX IF NOT EXISTS idx_port_registry_scope ON port_registry(scope);
 "#;
+
+// ─── V21: Drop computer_model_deployments.model_id FK ───────────────────
+//
+// Pulse beats can report LLM servers whose `model.id` is a Huggingface
+// repo slug, an Ollama tag (`qwen2.5-coder:14b`), or a GGUF filename —
+// none of which are guaranteed to exist in `model_catalog`. The FK was
+// blocking the materializer from persisting those deployment rows,
+// which in turn caused `/api/llm/servers` to return an empty list.
+//
+// Going forward, `model_id` is a free-form string column; `model_catalog`
+// remains the authoritative registry but is no longer a hard dependency.
+pub const SCHEMA_V21_DROP_DEPLOYMENT_FK: &str = r#"
+ALTER TABLE computer_model_deployments
+    DROP CONSTRAINT IF EXISTS computer_model_deployments_model_id_fkey;
+"#;
+
+// ─── V22: Drop computer_models.model_id FK ──────────────────────────────
+//
+// Same rationale as V21 but for the `computer_models` (model-presence)
+// table. Pulse-reported on-disk models carry ids that aren't guaranteed
+// to exist in `model_catalog`; the FK was aborting the materializer's
+// per-beat transaction before it could even reach the deployment upserts,
+// which is why V21 alone didn't fix `/api/llm/servers` returning empty.
+pub const SCHEMA_V22_DROP_MODEL_PRESENCE_FK: &str = r#"
+ALTER TABLE computer_models
+    DROP CONSTRAINT IF EXISTS computer_models_model_id_fkey;
+"#;

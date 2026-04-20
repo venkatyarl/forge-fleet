@@ -339,68 +339,45 @@ pub async fn fleet_health(
 }
 
 // ─── /api/llm/servers ───────────────────────────────────────────────────
-
+//
+// Backed by live Redis Pulse beats (via `PulseLlmRouter`), NOT Postgres —
+// Postgres's `computer_model_deployments` table only reflects deployments
+// that the materializer was able to upsert, which historically excluded
+// pulse-discovered models not present in `model_catalog`. Reality for
+// "what's running right now?" lives in Redis.
 pub async fn llm_servers(
     State(state): State<Arc<GatewayState>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let pool = pool_from_state(&state)?;
-    let rows = sqlx::query(
-        r#"
-        SELECT d.id, d.computer_id, d.model_id, d.runtime, d.endpoint,
-               d.openai_compatible, d.context_window, d.parallel_slots,
-               d.pid, d.status, d.ram_allocated_gb, d.vram_allocated_gb,
-               d.started_at, d.last_status_change,
-               c.name AS computer_name, c.primary_ip,
-               mc.display_name AS model_display_name, mc.family AS model_family,
-               (
-                   SELECT m.llm_queue_depth FROM computer_metrics_history m
-                   WHERE m.computer_id = d.computer_id
-                   ORDER BY m.recorded_at DESC LIMIT 1
-               ) AS queue_depth,
-               (
-                   SELECT m.llm_tokens_per_sec FROM computer_metrics_history m
-                   WHERE m.computer_id = d.computer_id
-                   ORDER BY m.recorded_at DESC LIMIT 1
-               ) AS tokens_per_sec
-        FROM computer_model_deployments d
-        JOIN computers c ON c.id = d.computer_id
-        LEFT JOIN model_catalog mc ON mc.id = d.model_id
-        WHERE d.status IN ('active', 'idle', 'loading')
-        ORDER BY c.name, d.model_id
-        "#,
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(|e| db_err("llm_servers", e))?;
+    let Some(router) = state.pulse_router.clone() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "pulse router not available"})),
+        ));
+    };
 
-    let servers: Vec<Value> = rows
-        .iter()
-        .map(|r| {
-            let id: uuid::Uuid = r.get("id");
-            let computer_id: uuid::Uuid = r.get("computer_id");
-            let status = r.get::<String, _>("status");
+    let raw = router.list_servers().await.map_err(|e| {
+        tracing::error!("pulse api error (llm_servers): {e}");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("llm_servers: {e}")})),
+        )
+    })?;
+
+    // Shape the raw Pulse list into the dashboard-expected format:
+    //   { computer, endpoint, runtime, model, queue_depth, tokens_per_sec,
+    //     healthy, status }
+    let servers: Vec<Value> = raw
+        .into_iter()
+        .map(|v| {
             json!({
-                "id": id.to_string(),
-                "computer_id": computer_id.to_string(),
-                "computer_name": r.get::<String, _>("computer_name"),
-                "primary_ip": r.get::<String, _>("primary_ip"),
-                "model_id": r.get::<String, _>("model_id"),
-                "model_display_name": r.try_get::<Option<String>, _>("model_display_name").ok().flatten(),
-                "model_family": r.try_get::<Option<String>, _>("model_family").ok().flatten(),
-                "runtime": r.get::<String, _>("runtime"),
-                "endpoint": r.get::<String, _>("endpoint"),
-                "openai_compatible": r.get::<bool, _>("openai_compatible"),
-                "context_window": r.try_get::<Option<i32>, _>("context_window").ok().flatten(),
-                "parallel_slots": r.try_get::<Option<i32>, _>("parallel_slots").ok().flatten(),
-                "pid": r.try_get::<Option<i32>, _>("pid").ok().flatten(),
-                "status": status.clone(),
-                "healthy": status == "active",
-                "ram_allocated_gb": r.try_get::<Option<f64>, _>("ram_allocated_gb").ok().flatten(),
-                "vram_allocated_gb": r.try_get::<Option<f64>, _>("vram_allocated_gb").ok().flatten(),
-                "started_at": iso(r.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("started_at").ok().flatten()),
-                "last_status_change": iso(Some(r.get::<chrono::DateTime<chrono::Utc>, _>("last_status_change"))),
-                "queue_depth": r.try_get::<Option<i32>, _>("queue_depth").ok().flatten(),
-                "tokens_per_sec": r.try_get::<Option<f64>, _>("tokens_per_sec").ok().flatten(),
+                "computer": v.get("computer").cloned().unwrap_or(Value::Null),
+                "endpoint": v.get("endpoint").cloned().unwrap_or(Value::Null),
+                "runtime": v.get("runtime").cloned().unwrap_or(Value::Null),
+                "model": v.get("model").cloned().unwrap_or(Value::Null),
+                "queue_depth": v.get("queue_depth").cloned().unwrap_or(Value::Null),
+                "tokens_per_sec": v.get("tokens_per_sec_last_min").cloned().unwrap_or(Value::Null),
+                "healthy": v.get("healthy").cloned().unwrap_or(Value::Null),
+                "status": v.get("status").cloned().unwrap_or(Value::Null),
             })
         })
         .collect();
