@@ -40,7 +40,7 @@ use ff_observability::metrics::{
 
 use crate::{
     embed,
-    llm_routing::{self, PulseLlmRouter},
+    llm_routing::{self, LlmRoutingCache, PulseLlmRouter},
     message::{Channel, IncomingMessage, OutgoingMessage},
     router::{MessageRouter, RouteTarget},
     telegram::TelegramClient,
@@ -110,6 +110,10 @@ pub struct GatewayState {
     pub tier_router: Option<Arc<TierRouter>>,
     /// Pulse-backed LLM router (live Redis beats, preferred routing strategy).
     pub pulse_router: Option<Arc<PulseLlmRouter>>,
+    /// Pre-computed pick cache in front of `pulse_router`, refreshed every
+    /// ~15s by a background warmer. When set, `/v1/chat/completions` routes
+    /// in sub-ms because no Redis SCAN is needed per request.
+    pub pulse_cache: Option<Arc<LlmRoutingCache>>,
     /// HTTP client for upstream LLM requests.
     pub http_client: reqwest::Client,
     /// Discovery registry for fleet node status.
@@ -164,6 +168,7 @@ impl GatewayState {
             model_router: None,
             tier_router: None,
             pulse_router: None,
+            pulse_cache: None,
             http_client: reqwest::Client::new(),
             discovery_registry: None,
             leader_sync: None,
@@ -295,8 +300,23 @@ impl GatewayServer {
             .unwrap_or_else(|_| "redis://127.0.0.1:6380/".to_string());
         match PulseLlmRouter::new(&redis_url) {
             Ok(pr) => {
-                state.pulse_router = Some(Arc::new(pr));
-                info!(redis_url = %redis_url, "pulse-backed LLM router initialized");
+                let router_arc = Arc::new(pr);
+                // Build the routing cache + warmer. The warmer JoinHandle is
+                // detached; it exits on a shutdown watch channel. We leak the
+                // sender so the watch channel stays alive for the process
+                // lifetime (gateway is a long-running daemon; abort happens
+                // on process exit).
+                let cache = Arc::new(LlmRoutingCache::new(router_arc.clone()));
+                let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+                cache.spawn_warmer(shutdown_rx);
+                // Forget the tx so the channel is never closed (cache lives
+                // for the process lifetime). If shutdown is ever wired in,
+                // replace this with a held field on GatewayState.
+                std::mem::forget(shutdown_tx);
+
+                state.pulse_router = Some(router_arc);
+                state.pulse_cache = Some(cache);
+                info!(redis_url = %redis_url, "pulse-backed LLM router + routing cache initialized");
             }
             Err(e) => {
                 warn!(redis_url = %redis_url, error = %e, "failed to construct PulseLlmRouter; tier-router fallback only");
@@ -3695,7 +3715,11 @@ async fn proxy_chat_completions(
     // find a matching server OR its upstream call fails outright do we
     // fall through to the legacy tier-router path.
     if let Some(pulse) = state.pulse_router.clone() {
-        match pulse.route_completion(raw_payload.clone()).await {
+        let cache_ref = state.pulse_cache.as_deref();
+        match pulse
+            .route_completion_cached(raw_payload.clone(), cache_ref)
+            .await
+        {
             Ok(value) => {
                 return Ok(Json(value).into_response());
             }

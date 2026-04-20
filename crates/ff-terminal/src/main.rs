@@ -63,9 +63,25 @@ enum Command {
     Discover { #[arg(long, default_value = "192.168.5.0/24")] subnet: String },
     Config { #[command(subcommand)] command: ConfigCommand },
     Version,
-    Run { prompt: String, #[arg(long, default_value = "text")] output: String, #[arg(long, default_value_t = 30)] max_turns: u32 },
+    /// Run a one-shot task against the agent.
+    ///
+    /// `--mode agent` (default) runs the full think→tool→observe loop with all
+    /// tools registered. `--mode oneshot` disables tools entirely and limits the
+    /// run to a single LLM turn — use this for pure code-gen / text-gen where
+    /// tool-use would only slow things down (and smaller models can loop).
+    Run {
+        prompt: String,
+        #[arg(long, default_value = "text")] output: String,
+        /// Execution mode: `agent` (tools + multi-turn loop) or `oneshot`
+        /// (no tools, single turn, direct text response).
+        #[arg(long, default_value = "agent")] mode: String,
+        /// Max turns (default: 30 in agent mode, 1 in oneshot mode).
+        #[arg(long)] max_turns: Option<u32>,
+    },
     /// Run with supervisor — auto-detect failures, fix, and retry
     Supervise { prompt: String, #[arg(long, default_value_t = 3)] max_attempts: u32 },
+    /// Agent coordinator — fleet-wide task dispatch via sub-agent slots.
+    Agent { #[command(subcommand)] command: AgentCommand },
     /// Manage ForgeFleet tasks
     Task { #[command(subcommand)] command: TaskCommand },
     /// Manage fleet-wide secrets (HF token, API keys, etc.) stored in Postgres.
@@ -171,6 +187,31 @@ enum ConfigCommand {
     },
     /// Show per-node configuration (runtime, models_dir, disk_quota_pct).
     Nodes,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum AgentCommand {
+    /// Dispatch a prompt to a computer's local LLM via the agent coordinator.
+    /// If `--work-item-id` is omitted, creates a transient work_item in the
+    /// `ff-agent-dispatch` project.
+    Dispatch {
+        /// The prompt to send.
+        prompt: String,
+        /// Route the task to this computer (by name). If omitted, uses any
+        /// idle sub-agent slot fleet-wide, preferring online computers.
+        #[arg(long)] to_computer: Option<String>,
+        /// Reuse an existing work_items.id instead of creating a transient one.
+        #[arg(long)] work_item_id: Option<String>,
+        /// Emit JSON instead of pretty text.
+        #[arg(long, default_value_t = false)] json: bool,
+    },
+    /// List every sub_agent slot (seeded or live).
+    SubAgents {
+        #[arg(long, default_value_t = false)] json: bool,
+    },
+    /// Seed slot 0 for every computer in the `computers` table.
+    /// Idempotent — existing rows are left alone.
+    Seed,
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -384,6 +425,44 @@ enum FleetDbCommand {
         /// Skip the interactive confirmation prompt.
         #[arg(long, default_value_t = false)]
         yes: bool,
+    },
+    /// Restore an age-encrypted backup into a *scratch* Postgres database.
+    ///
+    /// Looks up the row in `backups` by id, decrypts using
+    /// `fleet_secrets.backup_encryption_privkey`, creates the target DB
+    /// (default: `forgefleet_restored`) inside the `forgefleet-postgres`
+    /// container, and streams the plaintext archive back in via
+    /// `pg_restore` (or `psql` for plain SQL dumps). Never overwrites the
+    /// live `forgefleet` database.
+    Restore {
+        /// Backup ID (UUID) from the `backups` table.
+        backup_id: String,
+        /// Target computer name (reserved for future SSH hand-off;
+        /// currently only local restore is supported — anything else
+        /// prints a TODO and exits).
+        #[arg(long)]
+        to: Option<String>,
+        /// Target database name. A scratch DB is created and the archive
+        /// is loaded into it. Defaults to `forgefleet_restored`.
+        #[arg(long, default_value = "forgefleet_restored")]
+        target_db: String,
+        /// Required — restore actually touches Postgres (creates the DB).
+        #[arg(long, default_value_t = false)]
+        yes: bool,
+    },
+    /// Audit every recent backup: size, checksum, decryptability.
+    ///
+    /// With `--test-restore`, additionally does a full round-trip on the
+    /// single most recent Postgres backup — restore to a scratch DB,
+    /// count tables, drop the scratch DB.
+    VerifyBackups {
+        /// How many recent rows (per kind) to show. Default 10.
+        #[arg(long, default_value_t = 10)]
+        limit: i64,
+        /// Run the full restore integration test against the most recent
+        /// Postgres backup. Creates + drops a scratch DB.
+        #[arg(long, default_value_t = false)]
+        test_restore: bool,
     },
 }
 
@@ -986,6 +1065,7 @@ async fn main() -> Result<()> {
         Some(Command::VirtualBrain { command }) => return handle_brain(command.clone()).await,
         Some(Command::Openclaw { command }) => return handle_openclaw(command.clone()).await,
         Some(Command::Pm { command }) => return handle_pm(command.clone()).await,
+        Some(Command::Agent { command }) => return handle_agent(command.clone()).await,
         Some(Command::Project { command }) => return handle_project(command.clone(), &config_path).await,
         Some(Command::Alert { command }) => return handle_alert(command.clone()).await,
         Some(Command::Metrics { command }) => return handle_metrics(command.clone()).await,
@@ -1066,9 +1146,20 @@ async fn main() -> Result<()> {
         Some(Command::Discover { subnet }) => { println!("{CYAN}▶ Discovering nodes on {subnet}{RESET}"); Ok(()) }
         Some(Command::Config { command }) => handle_config(command, &config_path).await,
         Some(Command::Version) => { println!("ff {}", env!("CARGO_PKG_VERSION")); Ok(()) }
-        Some(Command::Run { prompt, output, max_turns }) => {
-            let mut cfg = agent_config; cfg.max_turns = max_turns;
-            run_headless(&prompt, cfg, &output).await
+        Some(Command::Run { prompt, output, mode, max_turns }) => {
+            let mode_norm = mode.to_lowercase();
+            if mode_norm != "agent" && mode_norm != "oneshot" {
+                eprintln!("{RED}✗ invalid --mode '{mode}' (expected 'agent' or 'oneshot'){RESET}");
+                std::process::exit(2);
+            }
+            let oneshot = mode_norm == "oneshot";
+            let mut cfg = agent_config;
+            cfg.max_turns = max_turns.unwrap_or(if oneshot { 1 } else { 30 });
+            if oneshot {
+                // Oneshot: no tool-use loop, larger response budget.
+                cfg.max_tokens = 8192;
+            }
+            run_headless(&prompt, cfg, &output, oneshot).await
         }
         Some(Command::Task { command }) => handle_task(command, &config_path).await,
         Some(Command::Secrets { command }) => handle_secrets(command).await,
@@ -1088,6 +1179,7 @@ async fn main() -> Result<()> {
         Some(Command::VirtualBrain { command }) => handle_brain(command).await,
         Some(Command::Openclaw { command }) => handle_openclaw(command).await,
         Some(Command::Pm { command }) => handle_pm(command).await,
+        Some(Command::Agent { command }) => handle_agent(command).await,
         Some(Command::Project { command }) => handle_project(command, &config_path).await,
         Some(Command::Alert { command }) => handle_alert(command).await,
         Some(Command::Metrics { command }) => handle_metrics(command).await,
@@ -1133,7 +1225,7 @@ async fn main() -> Result<()> {
         }
         None => {
             let prompt_text = cli.prompt.join(" ");
-            if !prompt_text.is_empty() { run_headless(&prompt_text, agent_config, "text").await }
+            if !prompt_text.is_empty() { run_headless(&prompt_text, agent_config, "text", false).await }
             else { run_tui(agent_config).await }
         }
     }
@@ -1931,17 +2023,24 @@ fn should_show_result_preview(tool_name: &str) -> bool {
     )
 }
 
-async fn run_headless(prompt: &str, config: AgentSessionConfig, output_format: &str) -> Result<()> {
+async fn run_headless(prompt: &str, config: AgentSessionConfig, output_format: &str, oneshot: bool) -> Result<()> {
     let is_json = output_format == "json";
 
     // Print session header
     if !is_json {
         let llm_display = config.llm_base_url.trim_end_matches('/').to_string();
-        eprintln!("{CYAN}▶ ForgeFleet Agent{RESET}  \x1b[2m{llm_display} · model={}{RESET}", config.model);
+        let mode_label = if oneshot { " · mode=oneshot" } else { "" };
+        eprintln!("{CYAN}▶ ForgeFleet Agent{RESET}  \x1b[2m{llm_display} · model={}{mode_label}{RESET}", config.model);
         eprintln!();
     }
 
     let mut session = AgentSession::new(config);
+    if oneshot {
+        // Disable tool registration — the LLM will emit a plain text response
+        // rather than calling tools. openai_tools is derived from session.tools
+        // in run_agent_loop, so clearing here suppresses tool advertisement.
+        session.tools.clear();
+    }
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
     let prompt = prompt.to_string();
 
@@ -4856,6 +4955,12 @@ async fn handle_fleet_db(
         FleetDbCommand::Failover { to, force, yes } => {
             handle_fleet_db_failover(pool, &to, force, yes).await?;
         }
+        FleetDbCommand::Restore { backup_id, to, target_db, yes } => {
+            handle_fleet_db_restore(pool, &backup_id, to.as_deref(), &target_db, yes).await?;
+        }
+        FleetDbCommand::VerifyBackups { limit, test_restore } => {
+            handle_fleet_db_verify_backups(pool, limit, test_restore).await?;
+        }
     }
     Ok(())
 }
@@ -4912,6 +5017,483 @@ async fn handle_fleet_db_failover(
         .await
         .map_err(|e| anyhow::anyhow!("promote: {e}"))?;
     println!("{GREEN}✓{RESET} '{target_name}' is now the Postgres primary.");
+    Ok(())
+}
+
+/// Resolve the local encrypted-backup root. Matches
+/// `BackupOrchestrator::new`'s default (`~/.forgefleet/backups`).
+fn local_backup_root() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join(".forgefleet/backups")
+}
+
+/// Metadata loaded from the `backups` table — shared by restore + verify.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct BackupRow {
+    id: uuid::Uuid,
+    database_kind: String,
+    file_name: String,
+    size_bytes: i64,
+    checksum_sha256: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+    retention_tier: String,
+}
+
+async fn fetch_backup_row(
+    pool: &sqlx::PgPool,
+    id: uuid::Uuid,
+) -> Result<BackupRow> {
+    let row = sqlx::query_as::<
+        _,
+        (
+            uuid::Uuid,
+            String,
+            String,
+            i64,
+            String,
+            chrono::DateTime<chrono::Utc>,
+            String,
+        ),
+    >(
+        "SELECT id, database_kind, file_name, size_bytes, checksum_sha256,
+                created_at, retention_tier
+           FROM backups WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("query backups: {e}"))?
+    .ok_or_else(|| anyhow::anyhow!("no backup row with id {id}"))?;
+    Ok(BackupRow {
+        id: row.0,
+        database_kind: row.1,
+        file_name: row.2,
+        size_bytes: row.3,
+        checksum_sha256: row.4,
+        created_at: row.5,
+        retention_tier: row.6,
+    })
+}
+
+/// Locate the on-disk artifact for a backup row.
+/// Layout: `<root>/<kind>/<file_name>`.
+fn backup_path_on_disk(row: &BackupRow) -> PathBuf {
+    local_backup_root()
+        .join(&row.database_kind)
+        .join(&row.file_name)
+}
+
+/// Run SHA256 on a file and compare against the `backups.checksum_sha256`
+/// value. Returns `Ok(true)` if they match.
+async fn verify_checksum(path: &Path, expected: &str) -> Result<bool> {
+    use sha2::{Digest, Sha256};
+    use tokio::io::AsyncReadExt;
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .map_err(|e| anyhow::anyhow!("open {}: {e}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 1024 * 1024];
+    loop {
+        let n = file.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let got = format!("{:x}", hasher.finalize());
+    Ok(got.eq_ignore_ascii_case(expected))
+}
+
+/// Cheap "is this an age ciphertext?" probe — reads the first few bytes
+/// and confirms the `age-encryption.org/v1` armor/binary header. Avoids
+/// decrypting the full archive just to answer "decryptable yes/no".
+async fn has_age_header(path: &Path) -> Result<bool> {
+    use tokio::io::AsyncReadExt;
+    let mut f = tokio::fs::File::open(path).await?;
+    let mut head = [0u8; 21];
+    let n = f.read(&mut head).await?;
+    let prefix = &head[..n];
+    // Binary and armor variants both begin with "age-encryption.org/v1".
+    Ok(prefix.starts_with(b"age-encryption.org/v1")
+        || prefix.starts_with(b"-----BEGIN AGE ENCRYPTED FILE-----"))
+}
+
+/// Restore an age-encrypted Postgres backup to a scratch database.
+///
+/// Steps:
+/// 1. Look up `backups` row.
+/// 2. Verify file exists + checksum matches.
+/// 3. Decrypt via `ff_agent::ha::backup::decrypt_backup_file` (uses the
+///    `age` Rust crate — no CLI dependency).
+/// 4. `docker exec forgefleet-postgres createdb <target_db>` (idempotent).
+/// 5. Stream the plaintext archive into the container and run
+///    `pg_restore` (tar format) or `psql` (plain SQL, fallback).
+/// 6. Print `SELECT COUNT(*) FROM fleet_members` as a sanity check.
+async fn handle_fleet_db_restore(
+    pool: &sqlx::PgPool,
+    backup_id: &str,
+    to: Option<&str>,
+    target_db: &str,
+    yes: bool,
+) -> Result<()> {
+    if let Some(target_node) = to {
+        let me = ff_agent::fleet_info::resolve_this_node_name().await;
+        if !target_node.eq_ignore_ascii_case(&me) {
+            anyhow::bail!(
+                "--to '{target_node}' != current node '{me}'. Cross-node \
+                 restore over the defer queue isn't wired yet; ssh to \
+                 '{target_node}' and re-run locally."
+            );
+        }
+    }
+    if !yes {
+        eprintln!(
+            "{YELLOW}Restore creates a new database ('{target_db}') in the \
+             local forgefleet-postgres container and loads the backup \
+             into it. Re-run with --yes to proceed.{RESET}"
+        );
+        std::process::exit(2);
+    }
+
+    let id = uuid::Uuid::parse_str(backup_id)
+        .map_err(|e| anyhow::anyhow!("invalid backup id '{backup_id}': {e}"))?;
+    let row = fetch_backup_row(pool, id).await?;
+    let enc_path = backup_path_on_disk(&row);
+
+    println!(
+        "{CYAN}▶ restore backup{RESET}  id={} kind={} file={} size={} tier={}",
+        row.id, row.database_kind, row.file_name, row.size_bytes, row.retention_tier,
+    );
+
+    if !enc_path.exists() {
+        anyhow::bail!(
+            "backup file not found on disk: {}. Rsync may not have \
+             landed yet — run `ff fleet db verify-backups` to audit.",
+            enc_path.display()
+        );
+    }
+    let disk_bytes = tokio::fs::metadata(&enc_path).await?.len() as i64;
+    if disk_bytes == 0 {
+        anyhow::bail!(
+            "backup file {} is 0 bytes — producer never wrote ciphertext. \
+             Likely cause: `age` CLI was missing when the backup ran.",
+            enc_path.display()
+        );
+    }
+
+    let checksum_ok = verify_checksum(&enc_path, &row.checksum_sha256).await?;
+    if !checksum_ok {
+        anyhow::bail!(
+            "checksum mismatch on {} — refusing to restore corrupt backup",
+            enc_path.display()
+        );
+    }
+    println!("{GREEN}✓{RESET} checksum matches (sha256={}…)", &row.checksum_sha256[..12.min(row.checksum_sha256.len())]);
+
+    // Decrypt into a tempfile. The archive sizes here (<100 MB) are fine
+    // to materialize; if that ever changes, swap this for a streaming
+    // decrypt that pipes straight into pg_restore.
+    let tmp_dir = std::env::temp_dir().join(format!("ff-restore-{}", row.id));
+    tokio::fs::create_dir_all(&tmp_dir).await?;
+    let plaintext_path = tmp_dir.join(
+        row.file_name
+            .strip_suffix(".age")
+            .unwrap_or(&row.file_name),
+    );
+    if let Err(e) = ff_agent::ha::backup::decrypt_backup_file(pool, &enc_path, &plaintext_path).await {
+        anyhow::bail!(
+            "decrypt failed: {e}. If this is '{}' key not set — no real \
+             backup encryption has happened yet, so there's nothing to \
+             restore.",
+            ff_agent::ha::backup::BACKUP_ENC_PRIVKEY
+        );
+    }
+    println!(
+        "{GREEN}✓{RESET} decrypted → {} ({} bytes)",
+        plaintext_path.display(),
+        tokio::fs::metadata(&plaintext_path).await?.len()
+    );
+
+    if row.database_kind != "postgres" {
+        println!(
+            "{YELLOW}note:{RESET} kind='{}' — only 'postgres' restore is \
+             wired end-to-end. Plaintext is available at {}.",
+            row.database_kind,
+            plaintext_path.display()
+        );
+        return Ok(());
+    }
+
+    // 1) Create the scratch DB (idempotent — swallow "already exists").
+    let createdb = tokio::process::Command::new("docker")
+        .args([
+            "exec",
+            "-u",
+            "postgres",
+            "forgefleet-postgres",
+            "createdb",
+            target_db,
+        ])
+        .output()
+        .await?;
+    if !createdb.status.success() {
+        let stderr = String::from_utf8_lossy(&createdb.stderr);
+        if !stderr.contains("already exists") {
+            anyhow::bail!("createdb {target_db} failed: {stderr}");
+        }
+        println!("{YELLOW}note:{RESET} database '{target_db}' already exists (reusing)");
+    } else {
+        println!("{GREEN}✓{RESET} created scratch database '{target_db}'");
+    }
+
+    // 2) Stream plaintext into the container and pg_restore it.
+    //    pg_basebackup tar archives come out as `base.tar.gz` nested inside
+    //    the streamed tar — that's a cluster snapshot, not a logical
+    //    dump. pg_restore won't consume it. For this helper we treat the
+    //    file as a custom/plain pg_dump archive *or* a pg_basebackup
+    //    tarball and pick the right tool based on extension.
+    println!("{CYAN}▶ loading archive into '{target_db}'...{RESET}");
+    let ext = plaintext_path.extension().and_then(|s| s.to_str()).unwrap_or("");
+    let (prog, extra_args): (&str, Vec<&str>) = if plaintext_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(|n| n.ends_with(".sql") || n.ends_with(".sql.gz"))
+        .unwrap_or(false)
+    {
+        ("psql", vec!["-v", "ON_ERROR_STOP=1", "-d", target_db])
+    } else if ext == "gz" || ext == "tgz" {
+        // pg_basebackup tar.gz — not a logical dump. We can't pg_restore
+        // it into an existing DB; the correct flow is to stop postgres,
+        // wipe PGDATA, untar, restart. That's way too destructive for a
+        // "scratch DB" helper. Report clearly instead of silently doing
+        // the wrong thing.
+        println!(
+            "{YELLOW}note:{RESET} archive looks like a pg_basebackup \
+             cluster snapshot (.tar.gz). That's a physical backup — \
+             restoring it requires replacing PGDATA, not loading into a \
+             scratch DB. Plaintext is at {}.",
+            plaintext_path.display()
+        );
+        let fm_count = count_fleet_members_live(pool).await.unwrap_or(-1);
+        println!(
+            "{GREEN}✓{RESET} sanity check — live fleet_members row count: {fm_count} \
+             (no load performed; scratch DB '{target_db}' is empty)"
+        );
+        return Ok(());
+    } else {
+        ("pg_restore", vec!["--no-owner", "--no-privileges", "-d", target_db])
+    };
+
+    // `docker exec -i` with stdin streaming from our tempfile.
+    let plaintext = tokio::fs::read(&plaintext_path).await?;
+    let mut child = tokio::process::Command::new("docker")
+        .args({
+            let mut v: Vec<&str> = vec!["exec", "-i", "-u", "postgres", "forgefleet-postgres", prog];
+            v.extend(extra_args.iter().copied());
+            v
+        })
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    {
+        use tokio::io::AsyncWriteExt;
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        stdin.write_all(&plaintext).await?;
+        stdin.shutdown().await?;
+    }
+    let out = child.wait_with_output().await?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "{prog} failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    println!("{GREEN}✓{RESET} {prog} completed");
+
+    // 3) Sanity check — count fleet_members rows in the restored DB.
+    let count_out = tokio::process::Command::new("docker")
+        .args([
+            "exec",
+            "-u",
+            "postgres",
+            "forgefleet-postgres",
+            "psql",
+            "-d",
+            target_db,
+            "-tAc",
+            "SELECT COUNT(*) FROM fleet_members",
+        ])
+        .output()
+        .await?;
+    if count_out.status.success() {
+        let c = String::from_utf8_lossy(&count_out.stdout).trim().to_string();
+        println!(
+            "{GREEN}✓{RESET} restored '{target_db}'.fleet_members row count: {c}"
+        );
+    } else {
+        println!(
+            "{YELLOW}note:{RESET} could not count fleet_members in '{target_db}': {}",
+            String::from_utf8_lossy(&count_out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// Count rows in the *live* fleet_members table via the existing pool.
+async fn count_fleet_members_live(pool: &sqlx::PgPool) -> Result<i64> {
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fleet_members")
+        .fetch_one(pool)
+        .await?;
+    Ok(n)
+}
+
+async fn handle_fleet_db_verify_backups(
+    pool: &sqlx::PgPool,
+    limit: i64,
+    test_restore: bool,
+) -> Result<()> {
+    println!("{CYAN}▶ ff fleet db verify-backups (limit={limit} test-restore={test_restore}){RESET}");
+
+    // Confirm the decryption key exists — the whole audit is meaningless
+    // without it.
+    let privkey = ff_db::pg_get_secret(pool, ff_agent::ha::backup::BACKUP_ENC_PRIVKEY)
+        .await
+        .map_err(|e| anyhow::anyhow!("fleet_secrets lookup: {e}"))?;
+    match privkey {
+        Some(_) => println!("{GREEN}✓{RESET} fleet_secrets.{} present", ff_agent::ha::backup::BACKUP_ENC_PRIVKEY),
+        None => {
+            println!(
+                "{YELLOW}warning:{RESET} fleet_secrets.{} is NOT set. No real \
+                 backup encryption has happened yet — .age files on disk \
+                 are likely 0-byte stubs from failed `age` CLI runs. \
+                 Install `age` (brew install age) and let the orchestrator \
+                 produce a real backup first.",
+                ff_agent::ha::backup::BACKUP_ENC_PRIVKEY
+            );
+        }
+    }
+
+    let rows = sqlx::query_as::<
+        _,
+        (
+            uuid::Uuid,
+            String,
+            String,
+            i64,
+            String,
+            chrono::DateTime<chrono::Utc>,
+            String,
+        ),
+    >(
+        "SELECT id, database_kind, file_name, size_bytes, checksum_sha256,
+                created_at, retention_tier
+           FROM backups
+          ORDER BY created_at DESC
+          LIMIT $1",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("query backups: {e}"))?;
+
+    if rows.is_empty() {
+        println!("(no rows in `backups` table — run `ff fleet backup` to produce one)");
+        return Ok(());
+    }
+
+    println!();
+    println!(
+        "{:<38} {:<8} {:<10} {:<20} {:<8} {:<8} {}",
+        "ID", "KIND", "SIZE", "CREATED", "CHKSUM", "DECRYPT", "FILE"
+    );
+    let mut most_recent_pg: Option<BackupRow> = None;
+    for (id, kind, file_name, size_bytes, checksum_sha256, created_at, tier) in rows {
+        let br = BackupRow {
+            id,
+            database_kind: kind.clone(),
+            file_name: file_name.clone(),
+            size_bytes,
+            checksum_sha256: checksum_sha256.clone(),
+            created_at,
+            retention_tier: tier,
+        };
+        let path = backup_path_on_disk(&br);
+        let (chk_str, dec_str) = if !path.exists() {
+            ("missing".to_string(), "n/a".to_string())
+        } else {
+            let chk = verify_checksum(&path, &checksum_sha256)
+                .await
+                .unwrap_or(false);
+            let dec = has_age_header(&path).await.unwrap_or(false);
+            let dec_str = if tokio::fs::metadata(&path).await.map(|m| m.len()).unwrap_or(0) == 0 {
+                "empty".to_string()
+            } else if dec {
+                "yes".to_string()
+            } else {
+                "no".to_string()
+            };
+            (
+                if chk { "ok".to_string() } else { "BAD".to_string() },
+                dec_str,
+            )
+        };
+        println!(
+            "{:<38} {:<8} {:<10} {:<20} {:<8} {:<8} {}",
+            id.to_string(),
+            kind,
+            size_bytes,
+            created_at.format("%Y-%m-%d %H:%M:%S").to_string(),
+            chk_str,
+            dec_str,
+            file_name,
+        );
+        if kind == "postgres" && most_recent_pg.is_none() {
+            most_recent_pg = Some(br);
+        }
+    }
+
+    if test_restore {
+        println!();
+        let Some(target) = most_recent_pg else {
+            println!("{YELLOW}--test-restore:{RESET} no postgres backups found, skipping");
+            return Ok(());
+        };
+        println!(
+            "{CYAN}▶ --test-restore:{RESET} most recent postgres backup = {} ({})",
+            target.id, target.file_name
+        );
+        let scratch = format!("forgefleet_verify_{}", &target.id.simple().to_string()[..8]);
+        println!("    scratch db: {scratch}");
+        // Invoke the same restore path, then drop the DB.
+        let restore_res = handle_fleet_db_restore(pool, &target.id.to_string(), None, &scratch, true).await;
+        // Always attempt cleanup, even on error.
+        let drop_out = tokio::process::Command::new("docker")
+            .args([
+                "exec",
+                "-u",
+                "postgres",
+                "forgefleet-postgres",
+                "dropdb",
+                "--if-exists",
+                &scratch,
+            ])
+            .output()
+            .await;
+        match drop_out {
+            Ok(o) if o.status.success() => println!("{GREEN}✓{RESET} scratch db '{scratch}' dropped"),
+            Ok(o) => println!(
+                "{YELLOW}note:{RESET} dropdb '{scratch}' non-zero: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            ),
+            Err(e) => println!("{YELLOW}note:{RESET} dropdb '{scratch}' failed to spawn: {e}"),
+        }
+        restore_res?;
+    }
+
     Ok(())
 }
 
@@ -6247,6 +6829,107 @@ async fn handle_openclaw_devices(
     Ok(())
 }
 
+async fn handle_agent(cmd: AgentCommand) -> Result<()> {
+    let pool = ff_agent::fleet_info::get_fleet_pool()
+        .await
+        .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
+    ff_db::run_postgres_migrations(&pool).await
+        .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
+
+    match cmd {
+        AgentCommand::Seed => {
+            let n = ff_agent::agent_coordinator::seed_slot_zero_for_all(&pool)
+                .await
+                .map_err(|e| anyhow::anyhow!("seed: {e}"))?;
+            println!("{GREEN}✓{RESET} seeded {n} new sub_agent row(s)");
+            Ok(())
+        }
+        AgentCommand::SubAgents { json } => {
+            let rows = ff_agent::agent_coordinator::list_sub_agents(&pool)
+                .await
+                .map_err(|e| anyhow::anyhow!("list: {e}"))?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+                return Ok(());
+            }
+            if rows.is_empty() {
+                println!("(no sub_agent rows — run `ff agent seed`)");
+                return Ok(());
+            }
+            println!(
+                "{:<14} {:<4} {:<8} {:<36} {}",
+                "COMPUTER", "SLOT", "STATUS", "ID", "WORKSPACE"
+            );
+            for r in rows {
+                println!(
+                    "{:<14} {:<4} {:<8} {:<36} {}",
+                    r.computer, r.slot, r.status, r.id.to_string(), r.workspace_dir
+                );
+            }
+            Ok(())
+        }
+        AgentCommand::Dispatch {
+            prompt,
+            to_computer,
+            work_item_id,
+            json,
+        } => {
+            // Resolve or create the work_item.
+            let wi_id = if let Some(id_str) = work_item_id.clone() {
+                uuid::Uuid::parse_str(&id_str)
+                    .map_err(|e| anyhow::anyhow!("invalid --work-item-id: {e}"))?
+            } else {
+                let created_by = ff_agent::fleet_info::resolve_this_node_name().await;
+                ff_agent::agent_coordinator::create_transient_work_item(
+                    &pool,
+                    &prompt,
+                    &created_by,
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("create transient work_item: {e}"))?
+            };
+
+            // Build the coordinator.
+            let redis_url = resolve_pulse_redis_url();
+            let reader = ff_pulse::reader::PulseReader::new(&redis_url)
+                .map_err(|e| anyhow::anyhow!("pulse reader: {e}"))?;
+            let coord = ff_agent::agent_coordinator::AgentCoordinator::new(
+                pool.clone(),
+                std::sync::Arc::new(reader),
+            );
+
+            let receipt = coord
+                .dispatch_task(wi_id, prompt.clone(), to_computer.clone())
+                .await
+                .map_err(|e| anyhow::anyhow!("dispatch: {e}"))?;
+
+            if json {
+                let out = serde_json::json!({
+                    "work_item_id": receipt.work_item_id,
+                    "sub_agent_id": receipt.sub_agent_id,
+                    "work_output_id": receipt.work_output_id,
+                    "computer": receipt.computer_name,
+                    "model": receipt.model_id,
+                    "duration_ms": receipt.duration_ms,
+                    "response": receipt.response_text,
+                });
+                println!("{}", serde_json::to_string_pretty(&out)?);
+            } else {
+                println!("{GREEN}✓ dispatched{RESET}");
+                println!("  work_item: {}", receipt.work_item_id);
+                println!("  computer:  {}", receipt.computer_name);
+                println!("  model:     {}", receipt.model_id);
+                println!("  duration:  {}ms", receipt.duration_ms);
+                if let Some(wo) = receipt.work_output_id {
+                    println!("  output:    {wo}");
+                }
+                println!("\n{CYAN}── response ──{RESET}\n{}", receipt.response_text);
+            }
+            Ok(())
+        }
+    }
+}
+
 async fn handle_pm(cmd: PmCommand) -> Result<()> {
     let pool = ff_agent::fleet_info::get_fleet_pool()
         .await
@@ -6980,6 +7663,16 @@ async fn handle_daemon(
         .unwrap_or(1);
     let _ = ff_agent::sub_agents::ensure_workspaces(slot_count);
     let slots = ff_agent::sub_agents::Slots::new(slot_count);
+
+    // Sub-agent DB rows — seed slot 0 for every computer so `ff agent dispatch`
+    // has a worker row to claim. Scheduler-only (one node writes).
+    if scheduler {
+        match ff_agent::agent_coordinator::seed_slot_zero_for_all(&pool).await {
+            Ok(n) if n > 0 => println!("{CYAN}[coord]{RESET} seeded {n} new sub_agent row(s)"),
+            Ok(_) => {}
+            Err(e) => eprintln!("{RED}[coord] seed error: {e}{RESET}"),
+        }
+    }
 
     println!("{CYAN}▶ ForgeFleet daemon starting{RESET}");
     println!("  node:       {worker_name}");

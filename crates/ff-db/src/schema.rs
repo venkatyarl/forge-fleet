@@ -1473,3 +1473,32 @@ pub const SCHEMA_V22_DROP_MODEL_PRESENCE_FK: &str = r#"
 ALTER TABLE computer_models
     DROP CONSTRAINT IF EXISTS computer_models_model_id_fkey;
 "#;
+
+// ─── V23: Sub-agent slots ───────────────────────────────────────────────
+//
+// Adds the `sub_agents` table that the agent coordinator uses to claim a
+// concurrency slot on a target computer before dispatching a work item to
+// that computer's local LLM. One row per (computer, slot) — the daemon
+// seeds slot 0..N-1 for each computer, where N comes from
+// `fleet_nodes.sub_agent_count` (falls back to cpu_cores/4 on first run).
+//
+// The unique (computer_id, slot) index enforces that a given slot is
+// always addressable at most once; the claim path uses a transactional
+// UPDATE WHERE status='idle' so two dispatchers can't grab the same slot.
+pub const SCHEMA_V23_SUB_AGENTS: &str = r#"
+CREATE TABLE IF NOT EXISTS sub_agents (
+    id                    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    computer_id           UUID NOT NULL REFERENCES computers(id) ON DELETE CASCADE,
+    slot                  INT NOT NULL,
+    status                TEXT NOT NULL DEFAULT 'idle',
+    current_work_item_id  UUID REFERENCES work_items(id),
+    started_at            TIMESTAMPTZ,
+    workspace_dir         TEXT NOT NULL,
+    model_preference      TEXT,
+    last_heartbeat_at     TIMESTAMPTZ,
+    metadata              JSONB NOT NULL DEFAULT '{}',
+    UNIQUE (computer_id, slot)
+);
+CREATE INDEX IF NOT EXISTS idx_sub_agents_status ON sub_agents(status);
+CREATE INDEX IF NOT EXISTS idx_sub_agents_computer ON sub_agents(computer_id);
+"#;

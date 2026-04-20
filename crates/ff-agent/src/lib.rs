@@ -1,3 +1,4 @@
+pub mod agent_coordinator;
 pub mod agent_loop;
 pub mod agent_roles;
 pub mod bash_security;

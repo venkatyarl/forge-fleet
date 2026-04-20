@@ -19,11 +19,15 @@
 //! - When no candidate is found we report the list of loaded models fleet-wide
 //!   so the caller sees what they *could* have asked for.
 
-use std::time::Duration;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use reqwest::Client;
 use serde_json::{Value, json};
 use thiserror::Error;
+use tokio::sync::{RwLock, watch};
+use tokio::task::JoinHandle;
 
 use ff_pulse::beat_v2::{LlmServer, PulseBeatV2};
 use ff_pulse::reader::{PulseError, PulseReader};
@@ -199,7 +203,18 @@ impl PulseLlmRouter {
     ///
     /// Streaming is NOT supported in v1 — if the request has `"stream": true`,
     /// it is downgraded to non-streaming transparently.
-    pub async fn route_completion(&self, mut body: Value) -> Result<Value, LlmRoutingError> {
+    pub async fn route_completion(&self, body: Value) -> Result<Value, LlmRoutingError> {
+        self.route_completion_cached(body, None).await
+    }
+
+    /// Like [`route_completion`] but consults `cache` first (sub-ms HashMap
+    /// lookup) and falls through to a live `pick_server` call only on miss.
+    /// Pass `None` for `cache` to use the legacy (uncached) path.
+    pub async fn route_completion_cached(
+        &self,
+        mut body: Value,
+        cache: Option<&LlmRoutingCache>,
+    ) -> Result<Value, LlmRoutingError> {
         let requested_model = body
             .get("model")
             .and_then(|v| v.as_str())
@@ -211,8 +226,15 @@ impl PulseLlmRouter {
             body["stream"] = Value::Bool(false);
         }
 
-        let Some((computer, primary_ip, server)) = self.pick_server(&requested_model).await?
-        else {
+        // Cache-first pick. The cache's own fallback will call pick_server
+        // if it misses; if even that returns None we emit the same NoMatch
+        // error the uncached path would.
+        let picked = match cache {
+            Some(c) => c.pick(&requested_model).await,
+            None => self.pick_server(&requested_model).await?,
+        };
+
+        let Some((computer, primary_ip, server)) = picked else {
             // Gather available model ids fleet-wide for a helpful error.
             let all = self.reader.list_llm_servers().await?;
             let available: Vec<String> =
@@ -253,6 +275,7 @@ impl PulseLlmRouter {
             runtime = %routed.runtime,
             model_id = %routed.model_id,
             queue_depth = routed.queue_depth,
+            cached = cache.is_some(),
             "pulse: proxying chat completion"
         );
 
@@ -272,6 +295,7 @@ impl PulseLlmRouter {
                 "endpoint": routed.endpoint,
                 "runtime": routed.runtime,
                 "upstream_status": status.as_u16(),
+                "cached": cache.is_some(),
             });
         }
         Ok(v)
@@ -404,6 +428,196 @@ pub fn error_to_response(err: LlmRoutingError) -> (u16, Value) {
             }}),
         ),
     }
+}
+
+// ─── Routing cache with background warmer ────────────────────────────────
+//
+// `LlmRoutingCache` wraps a `PulseLlmRouter` and maintains a map of
+// normalized-model-id → pre-computed pick result. A background task
+// ("warmer") refreshes the cache every ~15s by enumerating currently-loaded
+// models in the fleet and re-running `pick_server` for each. At request time
+// the gateway does an O(1) HashMap lookup instead of a SCAN + all-beats
+// decode + candidate sort, dropping routing overhead from tens of
+// milliseconds to sub-millisecond.
+//
+// Cache keys are normalized via `normalize_model_id`, so a request for
+// `qwen2.5-coder:7b` and the server-reported id `Qwen2.5-Coder-7B-Instruct`
+// both hit the same slot.
+
+/// How often the warmer re-runs `pick_server` for every known model id.
+const WARMER_INTERVAL: Duration = Duration::from_secs(15);
+/// Entries older than this are evicted from the cache (i.e. not seen for
+/// ~4 warmer ticks). A miss will transparently fall through to the live
+/// router and re-populate on next tick.
+const CACHE_TTL: Duration = Duration::from_secs(60);
+
+#[derive(Clone)]
+struct CachedEntry {
+    /// (computer_name, primary_ip, LlmServer) — the full tuple
+    /// `PulseLlmRouter::pick_server` normally returns.
+    computer: String,
+    primary_ip: String,
+    server: LlmServer,
+    refreshed_at: Instant,
+}
+
+/// Pre-computed pick cache in front of [`PulseLlmRouter`].
+///
+/// Construct with [`LlmRoutingCache::new`], spawn the background warmer with
+/// [`LlmRoutingCache::spawn_warmer`], and query with [`LlmRoutingCache::pick`].
+/// The gateway's `/v1/chat/completions` handler should prefer `pick` over
+/// calling `router.pick_server` directly for hot-path routing.
+pub struct LlmRoutingCache {
+    router: Arc<PulseLlmRouter>,
+    cache: Arc<RwLock<HashMap<String, CachedEntry>>>,
+}
+
+impl LlmRoutingCache {
+    pub fn new(router: Arc<PulseLlmRouter>) -> Self {
+        Self {
+            router,
+            cache: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Spawn the background warmer loop. It ticks every `WARMER_INTERVAL`
+    /// and exits when `shutdown` flips to `true`.
+    pub fn spawn_warmer(&self, mut shutdown: watch::Receiver<bool>) -> JoinHandle<()> {
+        let router = self.router.clone();
+        let cache = self.cache.clone();
+        tokio::spawn(async move {
+            // Run once immediately so the cache is warm by the time the
+            // first request lands.
+            if let Err(e) = warmer_tick(&router, &cache).await {
+                tracing::warn!(error = %e, "llm routing cache: initial warmer tick failed");
+            }
+            let mut ticker = tokio::time::interval(WARMER_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // First tick fires immediately; absorb it since we just ran.
+            ticker.tick().await;
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        if let Err(e) = warmer_tick(&router, &cache).await {
+                            tracing::warn!(error = %e, "llm routing cache: warmer tick failed");
+                        }
+                    }
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() {
+                            tracing::debug!("llm routing cache warmer shutting down");
+                            break;
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    /// Look up a cached pick. Falls through to a live `pick_server` call on
+    /// miss (or if the entry is stale) and populates the cache with the
+    /// result. Returns `None` only if the live router also has no match.
+    ///
+    /// Return shape matches `PulseLlmRouter::pick_server`:
+    /// `(computer_name, primary_ip, LlmServer)`.
+    pub async fn pick(&self, model_id: &str) -> Option<(String, String, LlmServer)> {
+        let key = normalize_model_id(model_id);
+
+        // Fast path: read lock, hit, fresh.
+        {
+            let guard = self.cache.read().await;
+            if let Some(entry) = guard.get(&key)
+                && entry.refreshed_at.elapsed() < CACHE_TTL
+            {
+                return Some((
+                    entry.computer.clone(),
+                    entry.primary_ip.clone(),
+                    entry.server.clone(),
+                ));
+            }
+        }
+
+        // Slow path: miss or stale — ask the live router and populate.
+        match self.router.pick_server(model_id).await {
+            Ok(Some((computer, primary_ip, server))) => {
+                let entry = CachedEntry {
+                    computer: computer.clone(),
+                    primary_ip: primary_ip.clone(),
+                    server: server.clone(),
+                    refreshed_at: Instant::now(),
+                };
+                let mut guard = self.cache.write().await;
+                guard.insert(key, entry);
+                Some((computer, primary_ip, server))
+            }
+            Ok(None) => None,
+            Err(e) => {
+                tracing::debug!(error = %e, model = %model_id, "live pick_server failed in cache fallback");
+                None
+            }
+        }
+    }
+
+    /// Test/diagnostics helper: current cache size.
+    #[allow(dead_code)]
+    pub async fn len(&self) -> usize {
+        self.cache.read().await.len()
+    }
+}
+
+/// One warmer pass:
+/// 1. List every active+healthy LLM server currently beating.
+/// 2. Collect the unique set of model ids they report.
+/// 3. For each, call `pick_server` and refresh the cache entry.
+/// 4. Evict entries older than `CACHE_TTL`.
+async fn warmer_tick(
+    router: &Arc<PulseLlmRouter>,
+    cache: &Arc<RwLock<HashMap<String, CachedEntry>>>,
+) -> Result<(), LlmRoutingError> {
+    let servers = router.list_servers().await?;
+    let mut seen_models: HashSet<String> = HashSet::new();
+    for s in &servers {
+        if let Some(m) = s.get("model").and_then(|v| v.as_str()) {
+            seen_models.insert(m.to_string());
+        }
+    }
+
+    let now = Instant::now();
+    let mut refreshed: HashMap<String, CachedEntry> = HashMap::new();
+    for model_id in &seen_models {
+        match router.pick_server(model_id).await {
+            Ok(Some((computer, primary_ip, server))) => {
+                let key = normalize_model_id(model_id);
+                refreshed.insert(
+                    key,
+                    CachedEntry {
+                        computer,
+                        primary_ip,
+                        server,
+                        refreshed_at: now,
+                    },
+                );
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::debug!(error = %e, model = %model_id, "warmer: pick_server failed");
+            }
+        }
+    }
+
+    // Merge: new entries overwrite, stale entries (not refreshed and older
+    // than TTL) are dropped.
+    let mut guard = cache.write().await;
+    for (k, v) in refreshed {
+        guard.insert(k, v);
+    }
+    guard.retain(|_, entry| entry.refreshed_at.elapsed() < CACHE_TTL);
+
+    tracing::debug!(
+        models_seen = seen_models.len(),
+        cache_size = guard.len(),
+        "llm routing cache: warmer tick complete"
+    );
+    Ok(())
 }
 
 #[cfg(test)]

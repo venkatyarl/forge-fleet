@@ -252,6 +252,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "drop_model_presence_fk",
         sql: schema::SCHEMA_V22_DROP_MODEL_PRESENCE_FK,
     },
+    PgMigration {
+        version: 23,
+        name: "sub_agents",
+        sql: schema::SCHEMA_V23_SUB_AGENTS,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.
