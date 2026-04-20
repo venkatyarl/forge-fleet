@@ -3707,6 +3707,28 @@ async fn proxy_chat_completions(
     State(state): State<Arc<GatewayState>>,
     Json(raw_payload): Json<Value>,
 ) -> Result<Response<Body>, (StatusCode, Json<Value>)> {
+    // ── Cloud-LLM routing (first pass) ───────────────────────────────
+    //
+    // If the `model` field matches a row in `cloud_llm_providers`
+    // (schema V26) we forward the request off-fleet to the provider's
+    // public API (OpenAI/Anthropic/Moonshot/Google). This only fires
+    // when we have a Postgres pool available; otherwise we quietly
+    // skip straight to Pulse.
+    if let Some(store) = state.operational_store.as_ref()
+        && let Some(pool) = store.pg_pool()
+    {
+        if let Some(model) = raw_payload.get("model").and_then(|v| v.as_str()) {
+            if let Some(result) =
+                crate::cloud_llm::try_route_to_cloud(pool, model, &raw_payload, None).await
+            {
+                match result {
+                    Ok(resp) => return Ok(resp),
+                    Err(resp) => return Ok(resp),
+                }
+            }
+        }
+    }
+
     // ── Pulse-first routing ──────────────────────────────────────────
     //
     // We try the Pulse router first. If it successfully picks a server

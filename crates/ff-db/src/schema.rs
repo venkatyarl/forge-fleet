@@ -1502,3 +1502,134 @@ CREATE TABLE IF NOT EXISTS sub_agents (
 CREATE INDEX IF NOT EXISTS idx_sub_agents_status ON sub_agents(status);
 CREATE INDEX IF NOT EXISTS idx_sub_agents_computer ON sub_agents(computer_id);
 "#;
+
+// ─── V24: External tools (GitHub-hosted CLI/MCP package manager) ────────
+//
+// Fleet-wide catalog of developer tools hosted on GitHub (e.g.
+// `code-review-graph`, `context-mode`) that expose a CLI entrypoint,
+// an MCP stdio server, or both. Mirrors the shape of `software_registry`
+// + `computer_software` (schema V14) but scoped to "things we install
+// via cargo/npm/pip/git-build from a GitHub URL" as opposed to
+// OS-level packages tracked in `software_registry`.
+//
+//   external_tools          — catalog (one row per tool)
+//   computer_external_tools — per-computer install state
+//
+// Drift detection + install dispatch reuse the same building blocks as
+// the software_registry path (github_release upstream check, deferred
+// task queue, finalizer hook).
+//
+// See `config/external_tools.toml` for the seed format.
+pub const SCHEMA_V24_EXTERNAL_TOOLS: &str = r#"
+CREATE TABLE IF NOT EXISTS external_tools (
+    id                  TEXT PRIMARY KEY,
+    display_name        TEXT NOT NULL,
+    github_url          TEXT NOT NULL,
+    kind                TEXT NOT NULL DEFAULT 'cli',  -- cli | mcp | both
+    install_method      TEXT NOT NULL,                 -- cargo_install | npm_global | pip | git_build | binary_release
+    install_spec        JSONB NOT NULL DEFAULT '{}',
+    cli_entrypoint      TEXT,                          -- command added to PATH (e.g. "crg")
+    mcp_server_command  TEXT,                          -- command run as MCP stdio server, if kind=mcp|both
+    register_as_mcp     BOOLEAN NOT NULL DEFAULT false,
+    version_source      JSONB NOT NULL DEFAULT '{}',
+    upgrade_playbook    JSONB NOT NULL DEFAULT '{}',
+    latest_version      TEXT,
+    latest_version_at   TIMESTAMPTZ,
+    intake_source       TEXT,                          -- 'direct' | 'social' (hint for where this entry came from)
+    intake_reference    TEXT,                          -- original URL (GitHub or social media)
+    added_by            TEXT,
+    added_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    metadata            JSONB NOT NULL DEFAULT '{}'
+);
+
+CREATE TABLE IF NOT EXISTS computer_external_tools (
+    computer_id         UUID NOT NULL REFERENCES computers(id) ON DELETE CASCADE,
+    tool_id             TEXT NOT NULL REFERENCES external_tools(id) ON DELETE CASCADE,
+    installed_version   TEXT,
+    install_source      TEXT,                          -- cargo | npm | pip | direct | git_build
+    install_path        TEXT,
+    mcp_registered      BOOLEAN NOT NULL DEFAULT false,
+    first_seen_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_checked_at     TIMESTAMPTZ,
+    last_upgraded_at    TIMESTAMPTZ,
+    status              TEXT NOT NULL DEFAULT 'ok',    -- ok | upgrade_available | upgrading | installing | install_failed | missing
+    last_error          TEXT,
+    PRIMARY KEY (computer_id, tool_id)
+);
+CREATE INDEX IF NOT EXISTS cet_status_idx ON computer_external_tools(status);
+CREATE INDEX IF NOT EXISTS cet_by_tool_idx ON computer_external_tools(tool_id);
+"#;
+
+// ─── V25: Social media ingest ───────────────────────────────────────────
+//
+// Ingest pipeline for short-form social posts (Twitter/X, Instagram,
+// TikTok, YouTube). The operator sends a URL; we shell out to yt-dlp to
+// pull media + metadata, sample frames via ffmpeg, then run a
+// vision-capable LLM over the frames to extract URLs, tool mentions,
+// OCR text, code snippets, and a summary. This is one of the intake
+// paths for the external_tools subsystem (V24).
+//
+// Status values: queued | fetching | analyzing | done | failed.
+pub const SCHEMA_V25_SOCIAL_MEDIA_INGEST: &str = r#"
+CREATE TABLE IF NOT EXISTS social_media_posts (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    url             TEXT NOT NULL,
+    platform        TEXT NOT NULL,              -- twitter | instagram | tiktok | youtube | other
+    author          TEXT,
+    caption         TEXT,
+    media_items     JSONB NOT NULL DEFAULT '[]', -- [{kind:image|video|audio, local_path, mime, bytes, frame_count?}]
+    extracted_text  TEXT,                        -- OCR + transcription combined
+    analysis        JSONB,                       -- vision-LLM output: {summary, detected_urls, detected_tools, entities, sentiment}
+    status          TEXT NOT NULL DEFAULT 'queued', -- queued | fetching | analyzing | done | failed
+    ingested_by     TEXT,                        -- user or agent name
+    ingested_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    analyzed_at     TIMESTAMPTZ,
+    last_error      TEXT
+);
+CREATE INDEX IF NOT EXISTS smp_status_idx ON social_media_posts(status);
+CREATE INDEX IF NOT EXISTS smp_platform_idx ON social_media_posts(platform);
+"#;
+
+// ─── V26: Cloud LLM providers (OpenAI/Anthropic/Moonshot/Google) ────────────
+//
+// Lets the gateway route `/v1/chat/completions` requests whose `model`
+// field matches a provider's `model_prefix` (e.g. `claude-*`, `openai/*`,
+// `kimi/*`, `gemini/*`) off the fleet to the provider's public API.
+// Credentials live in `fleet_secrets` (schema V9) — this table only holds
+// the provider config + a pointer (`secret_key`) to the secret row.
+//
+//   cloud_llm_providers — one row per provider (catalog)
+//   cloud_llm_usage     — per-request usage/cost/latency ledger
+//
+// OAuth (auth_kind='oauth2') is schema-ready but NOT wired in the gateway
+// this pass — see TODO(oauth) in crates/ff-gateway/src/cloud_llm.rs.
+pub const SCHEMA_V26_CLOUD_LLM_PROVIDERS: &str = r#"
+CREATE TABLE IF NOT EXISTS cloud_llm_providers (
+    id                TEXT PRIMARY KEY,
+    display_name      TEXT NOT NULL,
+    base_url          TEXT NOT NULL,
+    auth_kind         TEXT NOT NULL,
+    secret_key        TEXT NOT NULL,
+    oauth_token_secret TEXT,
+    oauth_token_url   TEXT,
+    oauth_client_id   TEXT,
+    model_prefix      TEXT NOT NULL,
+    request_format    TEXT NOT NULL DEFAULT 'openai_chat',
+    enabled           BOOLEAN NOT NULL DEFAULT true,
+    metadata          JSONB NOT NULL DEFAULT '{}',
+    added_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS cloud_llm_usage (
+    id                BIGSERIAL PRIMARY KEY,
+    provider_id       TEXT NOT NULL REFERENCES cloud_llm_providers(id),
+    model             TEXT NOT NULL,
+    tokens_input      INT,
+    tokens_output     INT,
+    cost_usd          NUMERIC(10, 6),
+    session_id        TEXT,
+    used_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    request_duration_ms INT
+);
+CREATE INDEX IF NOT EXISTS cloud_llm_usage_by_provider ON cloud_llm_usage(provider_id, used_at DESC);
+"#;

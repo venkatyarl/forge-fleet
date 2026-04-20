@@ -257,6 +257,21 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "sub_agents",
         sql: schema::SCHEMA_V23_SUB_AGENTS,
     },
+    PgMigration {
+        version: 24,
+        name: "external_tools",
+        sql: schema::SCHEMA_V24_EXTERNAL_TOOLS,
+    },
+    PgMigration {
+        version: 25,
+        name: "social_media_ingest",
+        sql: schema::SCHEMA_V25_SOCIAL_MEDIA_INGEST,
+    },
+    PgMigration {
+        version: 26,
+        name: "cloud_llm_providers",
+        sql: schema::SCHEMA_V26_CLOUD_LLM_PROVIDERS,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.

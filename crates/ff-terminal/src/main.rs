@@ -113,6 +113,12 @@ enum Command {
     Llm { #[command(subcommand)] command: LlmCommand },
     /// Manage software inventory + upgrades.
     Software { #[command(subcommand)] command: SoftwareCommand },
+    /// External tools — GitHub-hosted CLIs / MCP servers (schema V24).
+    ///
+    /// Fleet-wide package manager for dev tools like `code-review-graph`
+    /// and `context-mode`. Tracks what's installed where, checks upstream
+    /// for new releases, and dispatches installs via the deferred queue.
+    Ext { #[command(subcommand)] command: ExtCommand },
     /// Self-service onboarding helpers (show curl command, list recent, revoke).
     Onboard { #[command(subcommand)] command: OnboardCommand },
     /// Virtual Brain vault indexer + utilities.
@@ -148,6 +154,13 @@ enum Command {
     Train { #[command(subcommand)] command: TrainCommand },
     /// Port registry — inventory of every port ForgeFleet uses.
     Ports { #[command(subcommand)] command: PortsCommand },
+    /// Cloud LLM providers (OpenAI/Anthropic/Moonshot/Google). Gateway
+    /// routes `/v1/chat/completions` to these when the requested model
+    /// matches a provider's `model_prefix`.
+    CloudLlm { #[command(subcommand)] command: CloudLlmCommand },
+    /// Social media ingest — pull a TikTok / Instagram / Twitter(X) / YouTube
+    /// URL, fetch its media, and run a vision-LLM analysis over its frames.
+    Social { #[command(subcommand)] command: SocialCommand },
     /// Run ForgeFleet's unified daemon: deferred-task scheduler+worker, disk
     /// sampler, and deployment reconciler all in one long-lived process.
     /// Typically run on boot via launchd/systemd.
@@ -520,6 +533,36 @@ enum SoftwareCommand {
 }
 
 #[derive(Debug, Clone, Subcommand)]
+enum ExtCommand {
+    /// List the external-tools catalog (`external_tools` rows).
+    #[command(alias = "ls")]
+    List { #[arg(long)] json: bool },
+    /// List per-computer install state (`computer_external_tools` rows).
+    Installed {
+        #[arg(long)] computer: Option<String>,
+        #[arg(long)] tool: Option<String>,
+        #[arg(long)] json: bool,
+    },
+    /// Upsert external_tools rows from `config/external_tools.toml`.
+    Seed {
+        #[arg(long)] from_toml: Option<PathBuf>,
+    },
+    /// Dispatch an install to one or every online computer.
+    Install {
+        tool_id: String,
+        #[arg(long)] computer: Option<String>,
+        /// Target every online computer that doesn't have the tool (or whose status is upgrade_available).
+        #[arg(long, default_value_t = false)] all: bool,
+        /// Show planned enqueues without writing to the defer queue.
+        #[arg(long, default_value_t = false)] dry_run: bool,
+        /// Required to actually enqueue (otherwise prints plan and exits).
+        #[arg(long, default_value_t = false)] yes: bool,
+    },
+    /// Show computer/tool rows with `status='upgrade_available'`.
+    Drift { #[arg(long)] json: bool },
+}
+
+#[derive(Debug, Clone, Subcommand)]
 enum PortsCommand {
     /// List all registered ports. Filter by kind / scope, or emit JSON.
     List {
@@ -533,6 +576,67 @@ enum PortsCommand {
     /// with port_registry. Reports unexpected listeners and missing
     /// expected services.
     Scan { computer: String },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum CloudLlmCommand {
+    /// List cloud providers and whether their API-key secret is set.
+    List {
+        #[arg(long)] json: bool,
+    },
+    /// (Re)seed cloud_llm_providers from config/cloud_llm_providers.toml.
+    Seed,
+    /// Prompt for an API key and store it in fleet_secrets under the
+    /// provider's configured `secret_key`. The key is read from stdin
+    /// (not an argv argument) so it never lands in shell history.
+    SetKey {
+        provider_id: String,
+        /// Override: pass the key on stdin or via this flag (NOT recommended —
+        /// leaks into shell history). If omitted, prompts interactively.
+        #[arg(long)] value: Option<String>,
+    },
+    /// Show aggregate usage from cloud_llm_usage.
+    Usage {
+        /// Window like `24h`, `7d`, `1h`. Default: 24h.
+        #[arg(long, default_value = "24h")] since: String,
+    },
+    /// Send a trivial chat-completion probe to the provider to verify the
+    /// API key + reachability. Picks a reasonable default model per provider.
+    Test {
+        provider_id: String,
+        /// Override the probe model (defaults: openai=gpt-4o-mini,
+        /// anthropic=claude-3-5-haiku-latest, moonshot=kimi/moonshot-v1-8k,
+        /// google=gemini/gemini-1.5-flash).
+        #[arg(long)] model: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum SocialCommand {
+    /// Ingest a social-media URL. Inserts a `queued` row in
+    /// `social_media_posts`, kicks off the fetch→analyze pipeline in a
+    /// detached task, and prints the post UUID.
+    Ingest {
+        /// URL to a TikTok / Instagram / Twitter(X) / YouTube post.
+        url: String,
+        /// Optional "who asked" label stored on the row.
+        #[arg(long)]
+        by: Option<String>,
+    },
+    /// List recent social-media posts (most-recent first).
+    List {
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long)]
+        platform: Option<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: i64,
+    },
+    /// Show a single post's full row + pretty-printed analysis JSON.
+    Show {
+        /// Post UUID as printed by `ff social ingest`.
+        id: String,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -1080,6 +1184,7 @@ async fn main() -> Result<()> {
         Some(Command::Fleet { command })   => return handle_fleet(command.clone()).await,
         Some(Command::Llm { command })     => return handle_llm(command.clone()).await,
         Some(Command::Software { command }) => return handle_software(command.clone()).await,
+        Some(Command::Ext { command }) => return handle_ext(command.clone()).await,
         Some(Command::Onboard { command }) => return handle_onboard(command.clone()).await,
         Some(Command::VirtualBrain { command }) => return handle_brain(command.clone()).await,
         Some(Command::Openclaw { command }) => return handle_openclaw(command.clone()).await,
@@ -1096,6 +1201,8 @@ async fn main() -> Result<()> {
         Some(Command::Power { command }) => return handle_power(command.clone()).await,
         Some(Command::Train { command }) => return handle_train(command.clone()).await,
         Some(Command::Ports { command }) => return handle_ports(command.clone()).await,
+        Some(Command::CloudLlm { command }) => return handle_cloud_llm(command.clone()).await,
+        Some(Command::Social { command }) => return handle_social(command.clone()).await,
         _ => {}
     }
 
@@ -1194,6 +1301,7 @@ async fn main() -> Result<()> {
         Some(Command::Fleet { command }) => handle_fleet(command).await,
         Some(Command::Llm { command }) => handle_llm(command).await,
         Some(Command::Software { command }) => handle_software(command).await,
+        Some(Command::Ext { command }) => handle_ext(command).await,
         Some(Command::Onboard { command }) => handle_onboard(command).await,
         Some(Command::VirtualBrain { command }) => handle_brain(command).await,
         Some(Command::Openclaw { command }) => handle_openclaw(command).await,
@@ -1210,6 +1318,8 @@ async fn main() -> Result<()> {
         Some(Command::Power { command }) => handle_power(command).await,
         Some(Command::Train { command }) => handle_train(command).await,
         Some(Command::Ports { command }) => handle_ports(command).await,
+        Some(Command::CloudLlm { command }) => handle_cloud_llm(command).await,
+        Some(Command::Social { command }) => handle_social(command).await,
         Some(Command::Supervise { prompt, max_attempts }) => {
             let sup_config = ff_agent::supervisor::SupervisorConfig {
                 max_attempts,
@@ -3476,10 +3586,28 @@ async fn handle_model(cmd: ModelCommand) -> Result<()> {
             let lib = libs.iter().find(|r| r.catalog_id == catalog_id)
                 .ok_or_else(|| anyhow::anyhow!("model '{catalog_id}' not in library on '{node_name}'. Download it first: ff model download {catalog_id}"))?;
 
-            // 3. Pick a free port (51001..=51020, skipping ones in deployments).
-            let used_ports: std::collections::HashSet<i32> = deps.iter().map(|d| d.port).collect();
-            let port = (51001u16..=51020).find(|p| !used_ports.contains(&(*p as i32)))
-                .ok_or_else(|| anyhow::anyhow!("no free port in 51001-51020"))?;
+            // 3. Pick a free port via port_registry — canonical mapping
+            //    (55000-55002 llama.cpp/mlx, 51001/51003 vllm, 11434 ollama).
+            //    Fall back to legacy 51001..=51020 scan only if the registry
+            //    lookup fails (e.g. fresh install where it hasn't seeded yet).
+            let port: u16 = match ff_agent::ports_registry::pick_llm_port(
+                &pool,
+                &node_name,
+                &lib.runtime,
+            )
+            .await
+            {
+                Ok(p) => p as u16,
+                Err(_) => {
+                    let used_ports: std::collections::HashSet<i32> =
+                        deps.iter().map(|d| d.port).collect();
+                    (51001u16..=51020)
+                        .find(|p| !used_ports.contains(&(*p as i32)))
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("no free port in registry or 51001-51020")
+                        })?
+                }
+            };
 
             // 4. Load.
             let res = ff_agent::model_runtime::load_model(&pool, ff_agent::model_runtime::LoadOptions {
@@ -4378,6 +4506,125 @@ async fn finalize_upgrade_event(
     if let Err(e) = ff_agent::telegram::send_telegram_from_secrets(pool, &title, &body).await {
         tracing::warn!(error = %e, software_id, computer, "telegram send failed");
     }
+}
+
+/// Post-completion hook for `meta.external_tool` deferred tasks.
+///
+/// Runs whether the task succeeded or failed. Flips
+/// `computer_external_tools.status` from `'installing'` / `'upgrading'`
+/// to `'ok'` (success) or `'install_failed'` (failure), and makes a
+/// best-effort attempt to parse `installed_version` / `install_path`
+/// out of the task stdout.
+///
+/// TODO: when MCP auto-registration lands (see project memory
+/// `project_external_tools_subsystem.md`), also flip `mcp_registered=true`
+/// after running the registration command on the target computer.
+async fn finalize_external_tool_event(
+    pool: &sqlx::PgPool,
+    task: &ff_db::DeferredTaskRow,
+    ok: bool,
+    meta: &serde_json::Value,
+    err: Option<&str>,
+) {
+    let tool_id = meta.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    let display_name = meta
+        .get("display_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or(tool_id);
+    let computer = meta.get("computer").and_then(|v| v.as_str()).unwrap_or("");
+    let old_version = meta
+        .get("old_version")
+        .and_then(|v| v.as_str())
+        .unwrap_or("-");
+    let latest_version = meta
+        .get("latest_version")
+        .and_then(|v| v.as_str())
+        .unwrap_or("-");
+
+    // Best-effort: extract installed_version + install_path from task stdout.
+    // The result JSON written by pg_finish_deferred stores the shell result
+    // under `result` with `stdout`/`stderr`/`exit_code`.
+    let stdout = task
+        .result
+        .as_ref()
+        .and_then(|r| r.get("stdout"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    // Matches "installed X.Y.Z" / "version X.Y.Z" / "v1.2.3" patterns.
+    let version_guess: Option<String> = stdout
+        .lines()
+        .rev()
+        .find_map(|line| {
+            let l = line.to_lowercase();
+            if l.contains("installed") || l.contains("version") || l.contains("updated") {
+                line.split_whitespace()
+                    .rev()
+                    .find(|tok| {
+                        let s = tok.trim_start_matches('v');
+                        s.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)
+                    })
+                    .map(|s| s.trim_start_matches('v').to_string())
+            } else {
+                None
+            }
+        });
+
+    // Matches "Installing to /path/to/bin" or "/home/.../bin/<cli>".
+    let path_guess: Option<String> = stdout
+        .lines()
+        .rev()
+        .find_map(|line| {
+            if let Some(rest) = line.strip_prefix("Installing to ") {
+                Some(rest.trim().to_string())
+            } else {
+                None
+            }
+        });
+
+    let new_status = if ok { "ok" } else { "install_failed" };
+
+    let _ = sqlx::query(
+        "UPDATE computer_external_tools cet
+            SET status = $1,
+                last_upgraded_at = CASE WHEN $1 = 'ok' THEN NOW() ELSE last_upgraded_at END,
+                last_checked_at  = NOW(),
+                installed_version = COALESCE($4, cet.installed_version),
+                install_path      = COALESCE($5, cet.install_path),
+                last_error        = CASE WHEN $1 = 'ok' THEN NULL ELSE $6 END
+           FROM computers c
+          WHERE cet.computer_id = c.id
+            AND cet.tool_id     = $2
+            AND LOWER(c.name)   = LOWER($3)",
+    )
+    .bind(new_status)
+    .bind(tool_id)
+    .bind(computer)
+    .bind(version_guess.as_deref())
+    .bind(path_guess.as_deref())
+    .bind(err)
+    .execute(pool)
+    .await;
+
+    // NATS event on the same subject tree as software upgrades so dashboards
+    // can subscribe to `fleet.events.software.>` and pick both up.
+    let status_word = if ok { "success" } else { "failed" };
+    let subject = format!(
+        "fleet.events.external_tools.install_completed.{}",
+        if computer.is_empty() { "unknown" } else { computer },
+    );
+    let payload = serde_json::json!({
+        "tool_id":        tool_id,
+        "display_name":   display_name,
+        "computer":       computer,
+        "old_version":    old_version,
+        "latest_version": latest_version,
+        "status":         status_word,
+        "error":          err,
+        "defer_id":       task.id,
+        "ts":             chrono::Utc::now().to_rfc3339(),
+    });
+    ff_agent::nats_client::publish_json(subject, &payload).await;
 }
 
 /// Run a shell command either locally (when target is this host or None) or via SSH.
@@ -6484,6 +6731,483 @@ async fn handle_software_drift(pool: &sqlx::PgPool, json: bool) -> Result<()> {
     Ok(())
 }
 
+// ─── ff social ─────────────────────────────────────────────────────────────
+
+async fn handle_social(cmd: SocialCommand) -> Result<()> {
+    let pool = ff_agent::fleet_info::get_fleet_pool()
+        .await
+        .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
+    ff_db::run_postgres_migrations(&pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
+
+    match cmd {
+        SocialCommand::Ingest { url, by } => {
+            let id = ff_agent::social_ingest::ingest(pool.clone(), url, by).await?;
+            println!("{GREEN}✓ ingest queued{RESET}  post_id = {id}");
+            println!(
+                "  \x1b[2mUse `ff social show {id}` to check status.{RESET}"
+            );
+            Ok(())
+        }
+        SocialCommand::List { status, platform, limit } => {
+            let mut sql = String::from(
+                "SELECT id, url, platform, status, ingested_by, ingested_at \
+                 FROM social_media_posts WHERE 1=1",
+            );
+            let mut idx = 1;
+            if status.is_some() {
+                sql.push_str(&format!(" AND status = ${idx}"));
+                idx += 1;
+            }
+            if platform.is_some() {
+                sql.push_str(&format!(" AND platform = ${idx}"));
+            }
+            sql.push_str(" ORDER BY ingested_at DESC LIMIT ");
+            sql.push_str(&limit.to_string());
+
+            let mut q = sqlx::query_as::<
+                _,
+                (uuid::Uuid, String, String, String, Option<String>, chrono::DateTime<chrono::Utc>),
+            >(&sql);
+            if let Some(s) = &status { q = q.bind(s); }
+            if let Some(p) = &platform { q = q.bind(p); }
+            let rows = q.fetch_all(&pool).await?;
+
+            println!(
+                "{:<38} {:<10} {:<10} {:<16} {}",
+                "id", "platform", "status", "by", "ingested_at"
+            );
+            for (id, url, platform, status, by, at) in &rows {
+                let url_short = if url.len() > 60 { &url[..60] } else { url.as_str() };
+                println!(
+                    "{id}  {:<10} {:<10} {:<16} {}",
+                    platform,
+                    status,
+                    by.clone().unwrap_or_default(),
+                    at.format("%Y-%m-%d %H:%M")
+                );
+                println!("  \x1b[2m{url_short}{RESET}");
+            }
+            println!("\n{} row(s).", rows.len());
+            Ok(())
+        }
+        SocialCommand::Show { id } => {
+            let post_id = uuid::Uuid::parse_str(&id)
+                .map_err(|e| anyhow::anyhow!("invalid UUID '{id}': {e}"))?;
+            let row: Option<(
+                uuid::Uuid,
+                String,
+                String,
+                Option<String>,
+                Option<String>,
+                serde_json::Value,
+                Option<String>,
+                Option<serde_json::Value>,
+                String,
+                Option<String>,
+                chrono::DateTime<chrono::Utc>,
+                Option<chrono::DateTime<chrono::Utc>>,
+                Option<String>,
+            )> = sqlx::query_as(
+                "SELECT id, url, platform, author, caption, media_items, \
+                        extracted_text, analysis, status, ingested_by, \
+                        ingested_at, analyzed_at, last_error \
+                 FROM social_media_posts WHERE id = $1",
+            )
+            .bind(post_id)
+            .fetch_optional(&pool)
+            .await?;
+            let Some((
+                id, url, platform, author, caption, media_items, extracted_text,
+                analysis, status, ingested_by, ingested_at, analyzed_at, last_error,
+            )) = row
+            else {
+                println!("{RED}✗ no social_media_posts row with id = {id}{RESET}");
+                return Ok(());
+            };
+
+            println!("{CYAN}post{RESET}    {id}");
+            println!("url      {url}");
+            println!("platform {platform}");
+            println!("status   {status}");
+            println!("by       {}", ingested_by.unwrap_or_default());
+            println!("ingested {}", ingested_at.format("%Y-%m-%d %H:%M:%S"));
+            if let Some(a) = analyzed_at {
+                println!("analyzed {}", a.format("%Y-%m-%d %H:%M:%S"));
+            }
+            if let Some(a) = author { println!("author   {a}"); }
+            if let Some(c) = caption {
+                let trunc = if c.len() > 400 { format!("{}…", &c[..400]) } else { c };
+                println!("caption  {trunc}");
+            }
+            let media_arr = media_items.as_array().cloned().unwrap_or_default();
+            println!("media    {} item(s)", media_arr.len());
+            for m in &media_arr {
+                let kind = m.get("kind").and_then(|v| v.as_str()).unwrap_or("?");
+                let path = m.get("local_path").and_then(|v| v.as_str()).unwrap_or("?");
+                println!("  • [{kind}] {path}");
+            }
+            if let Some(t) = extracted_text {
+                if !t.trim().is_empty() {
+                    println!("\n{CYAN}extracted_text{RESET}\n{t}");
+                }
+            }
+            if let Some(a) = analysis {
+                let pretty = serde_json::to_string_pretty(&a).unwrap_or_default();
+                println!("\n{CYAN}analysis{RESET}\n{pretty}");
+            }
+            if let Some(e) = last_error {
+                println!("\n{RED}last_error{RESET} {e}");
+            }
+            Ok(())
+        }
+    }
+}
+
+// ─── ff ext ────────────────────────────────────────────────────────────────
+//
+// Mirrors `ff software` / `ff fleet upgrade` but scoped to the V24
+// `external_tools` + `computer_external_tools` tables.
+
+async fn handle_ext(cmd: ExtCommand) -> Result<()> {
+    let pool = ff_agent::fleet_info::get_fleet_pool()
+        .await
+        .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
+    ff_db::run_postgres_migrations(&pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
+
+    match cmd {
+        ExtCommand::List { json } => handle_ext_list(&pool, json).await,
+        ExtCommand::Installed { computer, tool, json } => {
+            handle_ext_installed(&pool, computer, tool, json).await
+        }
+        ExtCommand::Seed { from_toml } => handle_ext_seed(&pool, from_toml).await,
+        ExtCommand::Install { tool_id, computer, all, dry_run, yes } => {
+            handle_ext_install(&pool, &tool_id, computer, all, dry_run, yes).await
+        }
+        ExtCommand::Drift { json } => handle_ext_drift(&pool, json).await,
+    }
+}
+
+async fn handle_ext_seed(pool: &sqlx::PgPool, from_toml: Option<PathBuf>) -> Result<()> {
+    let path = from_toml.unwrap_or_else(|| {
+        let mut p = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        p.push("config");
+        p.push("external_tools.toml");
+        p
+    });
+    println!(
+        "{CYAN}▶ Seeding external_tools from {}{RESET}",
+        path.display()
+    );
+    let report = ff_agent::external_tools_registry::seed_from_toml(pool, &path)
+        .await
+        .map_err(|e| anyhow::anyhow!("seed external_tools: {e}"))?;
+    println!(
+        "{GREEN}✓ external_tools seed:{RESET} total={} inserted={} updated={} unchanged={}",
+        report.total, report.inserted, report.updated, report.unchanged,
+    );
+    Ok(())
+}
+
+async fn handle_ext_list(pool: &sqlx::PgPool, json: bool) -> Result<()> {
+    let tools = ff_agent::external_tools_registry::list_tools(pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("list external_tools: {e}"))?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&tools).unwrap_or_default()
+        );
+        return Ok(());
+    }
+
+    if tools.is_empty() {
+        println!(
+            "{YELLOW}(external_tools is empty — run `ff ext seed` to load config/external_tools.toml){RESET}"
+        );
+        return Ok(());
+    }
+
+    println!(
+        "{:<22} {:<8} {:<14} {:<14} {:<14} MCP",
+        "ID", "KIND", "METHOD", "CLI", "LATEST"
+    );
+    for t in &tools {
+        println!(
+            "{:<22} {:<8} {:<14} {:<14} {:<14} {}",
+            truncate_for_col(&t.id, 22),
+            truncate_for_col(&t.kind, 8),
+            truncate_for_col(&t.install_method, 14),
+            truncate_for_col(t.cli_entrypoint.as_deref().unwrap_or("-"), 14),
+            truncate_for_col(t.latest_version.as_deref().unwrap_or("-"), 14),
+            if t.register_as_mcp { "auto-register" } else { "-" },
+        );
+    }
+    println!("\n{} tool(s) in catalog.", tools.len());
+    Ok(())
+}
+
+async fn handle_ext_installed(
+    pool: &sqlx::PgPool,
+    computer: Option<String>,
+    tool: Option<String>,
+    json: bool,
+) -> Result<()> {
+    let mut sql = String::from(
+        "SELECT c.name              AS computer,
+                et.id                AS tool_id,
+                et.display_name      AS display_name,
+                et.kind              AS kind,
+                cet.installed_version AS installed_version,
+                et.latest_version    AS latest_version,
+                cet.install_source   AS install_source,
+                cet.install_path     AS install_path,
+                cet.mcp_registered   AS mcp_registered,
+                cet.status           AS status,
+                cet.last_checked_at  AS last_checked_at
+           FROM computer_external_tools cet
+           JOIN computers c      ON cet.computer_id = c.id
+           JOIN external_tools et ON cet.tool_id = et.id
+          WHERE 1=1",
+    );
+    if computer.is_some() {
+        sql.push_str(" AND c.name = $1");
+    }
+    if tool.is_some() {
+        sql.push_str(if computer.is_some() {
+            " AND et.id = $2"
+        } else {
+            " AND et.id = $1"
+        });
+    }
+    sql.push_str(" ORDER BY c.name ASC, et.id ASC");
+
+    let mut query = sqlx::query(&sql);
+    if let Some(c) = &computer { query = query.bind(c); }
+    if let Some(t) = &tool { query = query.bind(t); }
+
+    let rows = query
+        .fetch_all(pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("list computer_external_tools: {e}"))?;
+
+    if json {
+        let arr: Vec<_> = rows.iter().map(|r| serde_json::json!({
+            "computer":          sqlx::Row::get::<String, _>(r, "computer"),
+            "tool_id":           sqlx::Row::get::<String, _>(r, "tool_id"),
+            "display_name":      sqlx::Row::get::<String, _>(r, "display_name"),
+            "kind":              sqlx::Row::get::<String, _>(r, "kind"),
+            "installed_version": sqlx::Row::get::<Option<String>, _>(r, "installed_version"),
+            "latest_version":    sqlx::Row::get::<Option<String>, _>(r, "latest_version"),
+            "install_source":    sqlx::Row::get::<Option<String>, _>(r, "install_source"),
+            "install_path":      sqlx::Row::get::<Option<String>, _>(r, "install_path"),
+            "mcp_registered":    sqlx::Row::get::<bool, _>(r, "mcp_registered"),
+            "status":            sqlx::Row::get::<String, _>(r, "status"),
+        })).collect();
+        println!("{}", serde_json::to_string_pretty(&arr).unwrap_or_default());
+        return Ok(());
+    }
+
+    if rows.is_empty() {
+        println!("(no matching computer_external_tools rows)");
+        return Ok(());
+    }
+
+    println!(
+        "{:<11} {:<22} {:<10} {:<14} {:<14} {:<10} {:<18}",
+        "COMPUTER", "TOOL", "KIND", "INSTALLED", "LATEST", "SOURCE", "STATUS"
+    );
+    for r in &rows {
+        let computer: String = sqlx::Row::get(r, "computer");
+        let tid: String = sqlx::Row::get(r, "tool_id");
+        let kind: String = sqlx::Row::get(r, "kind");
+        let installed: Option<String> = sqlx::Row::get(r, "installed_version");
+        let latest: Option<String> = sqlx::Row::get(r, "latest_version");
+        let src: Option<String> = sqlx::Row::get(r, "install_source");
+        let status: String = sqlx::Row::get(r, "status");
+        println!(
+            "{:<11} {:<22} {:<10} {:<14} {:<14} {:<10} {:<18}",
+            truncate_for_col(&computer, 11),
+            truncate_for_col(&tid, 22),
+            truncate_for_col(&kind, 10),
+            truncate_for_col(installed.as_deref().unwrap_or("-"), 14),
+            truncate_for_col(latest.as_deref().unwrap_or("-"), 14),
+            truncate_for_col(src.as_deref().unwrap_or("-"), 10),
+            truncate_for_col(&status, 18),
+        );
+    }
+    Ok(())
+}
+
+async fn handle_ext_drift(pool: &sqlx::PgPool, json: bool) -> Result<()> {
+    let rows = sqlx::query(
+        "SELECT c.name              AS computer,
+                et.id                AS tool_id,
+                et.display_name      AS display_name,
+                cet.installed_version AS installed_version,
+                et.latest_version    AS latest_version,
+                cet.install_source   AS install_source,
+                cet.status           AS status
+           FROM computer_external_tools cet
+           JOIN computers c      ON cet.computer_id = c.id
+           JOIN external_tools et ON cet.tool_id = et.id
+          WHERE cet.status = 'upgrade_available'
+             OR (cet.installed_version IS NOT NULL
+                 AND et.latest_version IS NOT NULL
+                 AND cet.installed_version <> et.latest_version)
+          ORDER BY c.name ASC, et.id ASC",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("list ext drift: {e}"))?;
+
+    if json {
+        let arr: Vec<_> = rows.iter().map(|r| serde_json::json!({
+            "computer":          sqlx::Row::get::<String, _>(r, "computer"),
+            "tool_id":           sqlx::Row::get::<String, _>(r, "tool_id"),
+            "display_name":      sqlx::Row::get::<String, _>(r, "display_name"),
+            "installed_version": sqlx::Row::get::<Option<String>, _>(r, "installed_version"),
+            "latest_version":    sqlx::Row::get::<Option<String>, _>(r, "latest_version"),
+            "install_source":    sqlx::Row::get::<Option<String>, _>(r, "install_source"),
+            "status":            sqlx::Row::get::<String, _>(r, "status"),
+        })).collect();
+        println!("{}", serde_json::to_string_pretty(&arr).unwrap_or_default());
+        return Ok(());
+    }
+
+    if rows.is_empty() {
+        println!("{GREEN}✓ No external-tool drift — every computer_external_tools row matches external_tools.latest_version.{RESET}");
+        return Ok(());
+    }
+
+    println!(
+        "{:<11} {:<22} {:<18} {:<18} {:<10} {:<18}",
+        "COMPUTER", "TOOL", "INSTALLED", "LATEST", "SOURCE", "STATUS"
+    );
+    for r in &rows {
+        let computer: String = sqlx::Row::get(r, "computer");
+        let tid: String = sqlx::Row::get(r, "tool_id");
+        let installed: Option<String> = sqlx::Row::get(r, "installed_version");
+        let latest: Option<String> = sqlx::Row::get(r, "latest_version");
+        let src: Option<String> = sqlx::Row::get(r, "install_source");
+        let status: String = sqlx::Row::get(r, "status");
+        println!(
+            "{:<11} {:<22} {:<18} {:<18} {:<10} {:<18}",
+            truncate_for_col(&computer, 11),
+            truncate_for_col(&tid, 22),
+            truncate_for_col(installed.as_deref().unwrap_or("-"), 18),
+            truncate_for_col(latest.as_deref().unwrap_or("-"), 18),
+            truncate_for_col(src.as_deref().unwrap_or("-"), 10),
+            truncate_for_col(&status, 18),
+        );
+    }
+    println!("\n{} external-tool row(s) with drift.", rows.len());
+    Ok(())
+}
+
+async fn handle_ext_install(
+    pool: &sqlx::PgPool,
+    tool_id: &str,
+    computer: Option<String>,
+    all: bool,
+    dry_run: bool,
+    yes: bool,
+) -> Result<()> {
+    if computer.is_none() && !all {
+        anyhow::bail!("pass --all or --computer <name> to pick targets");
+    }
+    if computer.is_some() && all {
+        anyhow::bail!("--computer and --all are mutually exclusive");
+    }
+
+    let (plans, skipped) = ff_agent::external_tools_installer::resolve_install_plans(
+        pool,
+        tool_id,
+        computer.as_deref(),
+        all,
+    )
+    .await?;
+
+    let display_name = plans
+        .first()
+        .map(|p| p.display_name.clone())
+        .unwrap_or_else(|| tool_id.to_string());
+    let latest_version = plans.first().and_then(|p| p.latest_version.clone());
+
+    if plans.is_empty() && skipped.is_empty() {
+        println!(
+            "{YELLOW}No target computers found for tool_id='{tool_id}'. Nothing to do.{RESET}"
+        );
+        return Ok(());
+    }
+
+    println!("{CYAN}▶ ff ext install {tool_id}{RESET}");
+    println!("  tool:            {display_name} ({tool_id})");
+    println!(
+        "  latest upstream: {}",
+        latest_version.as_deref().unwrap_or("(unknown)")
+    );
+    println!("  targets:         {} computer(s)", plans.len());
+    if plans.is_empty() {
+        println!("{YELLOW}No resolvable targets. Nothing to do.{RESET}");
+        for (name, why) in &skipped {
+            println!("    {YELLOW}⚠ skip{RESET} {name}: {why}");
+        }
+        return Ok(());
+    }
+
+    println!(
+        "\n  {:<10} {:<14} {:<14} {:<10} {:<22} command",
+        "computer", "os_family", "method", "installed", "playbook_key"
+    );
+    for p in &plans {
+        let short_cmd = if p.command.len() > 60 {
+            format!("{}…", &p.command[..60])
+        } else {
+            p.command.clone()
+        };
+        println!(
+            "  {:<10} {:<14} {:<14} {:<10} {:<22} {}",
+            p.computer_name,
+            p.os_family,
+            p.install_method,
+            p.installed_version.as_deref().unwrap_or("-"),
+            p.playbook_key,
+            short_cmd,
+        );
+    }
+    for (name, why) in &skipped {
+        println!("  {YELLOW}⚠ skip{RESET} {name}: {why}");
+    }
+
+    if dry_run {
+        println!("\n{YELLOW}Dry run — not enqueuing. Drop --dry-run and pass --yes to actually enqueue.{RESET}");
+        return Ok(());
+    }
+    if !yes {
+        println!("\n{YELLOW}Pass --yes to actually enqueue these install tasks.{RESET}");
+        return Ok(());
+    }
+
+    let who = whoami_tag();
+    let enqueued =
+        ff_agent::external_tools_installer::enqueue_plans(pool, &plans, &who).await?;
+
+    println!(
+        "\n{GREEN}✓ Enqueued {} install task(s):{RESET}",
+        enqueued.len()
+    );
+    for ep in &enqueued {
+        println!("  {:<12} {}", ep.computer_name, ep.defer_id);
+    }
+    println!("\nTrack progress with: ff defer list");
+    Ok(())
+}
+
 // ─── ff ports ──────────────────────────────────────────────────────────────
 
 async fn handle_ports(cmd: PortsCommand) -> Result<()> {
@@ -6761,6 +7485,368 @@ async fn handle_ports_scan(pool: &sqlx::PgPool, computer: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+// ─── ff cloud-llm ──────────────────────────────────────────────────────────
+
+async fn handle_cloud_llm(cmd: CloudLlmCommand) -> Result<()> {
+    let pool = ff_agent::fleet_info::get_fleet_pool()
+        .await
+        .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
+    ff_db::run_postgres_migrations(&pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
+
+    match cmd {
+        CloudLlmCommand::Seed => handle_cloud_llm_seed(&pool).await,
+        CloudLlmCommand::List { json } => handle_cloud_llm_list(&pool, json).await,
+        CloudLlmCommand::SetKey { provider_id, value } => {
+            handle_cloud_llm_set_key(&pool, &provider_id, value).await
+        }
+        CloudLlmCommand::Usage { since } => handle_cloud_llm_usage(&pool, &since).await,
+        CloudLlmCommand::Test { provider_id, model } => {
+            handle_cloud_llm_test(&pool, &provider_id, model).await
+        }
+    }
+}
+
+async fn handle_cloud_llm_seed(pool: &sqlx::PgPool) -> Result<()> {
+    let path = ff_agent::cloud_llm_registry::resolve_config_path();
+    println!("{CYAN}▶ Seeding cloud_llm_providers from {}{RESET}", path.display());
+    let report = ff_agent::cloud_llm_registry::seed_from_toml(pool, &path)
+        .await
+        .map_err(|e| anyhow::anyhow!("seed cloud_llm_providers: {e}"))?;
+    println!(
+        "{GREEN}✓ cloud_llm_providers seed:{RESET} total={} inserted={} updated={} unchanged={}",
+        report.total, report.inserted, report.updated, report.unchanged,
+    );
+    Ok(())
+}
+
+async fn handle_cloud_llm_list(pool: &sqlx::PgPool, json: bool) -> Result<()> {
+    let providers = ff_agent::cloud_llm_registry::list_providers(pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("list cloud_llm_providers: {e}"))?;
+
+    if providers.is_empty() {
+        println!("{YELLOW}No cloud providers registered. Run `ff cloud-llm seed`.{RESET}");
+        return Ok(());
+    }
+
+    // Enrich with a per-provider "secret set?" flag.
+    let mut enriched: Vec<(ff_agent::cloud_llm_registry::Provider, bool)> = Vec::new();
+    for p in providers {
+        let has_key = ff_db::pg_get_secret(pool, &p.secret_key)
+            .await
+            .map(|v| v.map(|s| !s.is_empty()).unwrap_or(false))
+            .unwrap_or(false);
+        enriched.push((p, has_key));
+    }
+
+    if json {
+        let arr: Vec<_> = enriched
+            .iter()
+            .map(|(p, has_key)| {
+                serde_json::json!({
+                    "id": p.id,
+                    "display_name": p.display_name,
+                    "base_url": p.base_url,
+                    "auth_kind": p.auth_kind,
+                    "model_prefix": p.model_prefix,
+                    "request_format": p.request_format,
+                    "enabled": p.enabled,
+                    "secret_key": p.secret_key,
+                    "secret_set": has_key,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&arr).unwrap_or_default());
+        return Ok(());
+    }
+
+    println!(
+        "{:<12} {:<22} {:<14} {:<10} {:<22} {:<7} {}",
+        "ID", "NAME", "MODEL_PREFIX", "AUTH", "REQUEST_FORMAT", "ENABLED", "SECRET",
+    );
+    println!("  {}", "-".repeat(110));
+    for (p, has_key) in &enriched {
+        let secret_col = if *has_key {
+            format!("{GREEN}set{RESET}")
+        } else {
+            format!("{RED}missing{RESET}")
+        };
+        let enabled = if p.enabled {
+            format!("{GREEN}yes{RESET}")
+        } else {
+            format!("{RED}no{RESET}")
+        };
+        println!(
+            "{:<12} {:<22} {:<14} {:<10} {:<22} {:<7} {}  ({})",
+            p.id,
+            truncate_for_col(&p.display_name, 22),
+            truncate_for_col(&p.model_prefix, 14),
+            p.auth_kind,
+            truncate_for_col(&p.request_format, 22),
+            enabled,
+            secret_col,
+            p.secret_key,
+        );
+    }
+    println!("\n{} provider(s) registered.", enriched.len());
+    Ok(())
+}
+
+async fn handle_cloud_llm_set_key(
+    pool: &sqlx::PgPool,
+    provider_id: &str,
+    value_override: Option<String>,
+) -> Result<()> {
+    // Resolve the provider so we know which secret_key to write to.
+    let providers = ff_agent::cloud_llm_registry::list_providers(pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("list providers: {e}"))?;
+    let Some(provider) = providers.into_iter().find(|p| p.id == provider_id) else {
+        eprintln!(
+            "{RED}✗ Unknown provider '{provider_id}'. Try `ff cloud-llm list`.{RESET}"
+        );
+        std::process::exit(1);
+    };
+
+    let key_value = match value_override {
+        Some(v) if !v.is_empty() => v,
+        _ => {
+            eprintln!(
+                "{CYAN}▶ Enter API key for {} (input hidden via terminal; paste + Enter):{RESET}",
+                provider.id
+            );
+            let mut buf = String::new();
+            io::stdin()
+                .read_line(&mut buf)
+                .context("read API key from stdin")?;
+            buf.trim().to_string()
+        }
+    };
+
+    if key_value.is_empty() {
+        eprintln!("{RED}✗ Empty API key, aborting.{RESET}");
+        std::process::exit(2);
+    }
+
+    let who = whoami_tag();
+    ff_db::pg_set_secret(
+        pool,
+        &provider.secret_key,
+        &key_value,
+        Some(&format!("cloud LLM api key for {}", provider.id)),
+        Some(&who),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("store secret: {e}"))?;
+
+    println!(
+        "{GREEN}✓ Stored API key for '{}' at secret `{}` ({} bytes, by {who}).{RESET}",
+        provider.id,
+        provider.secret_key,
+        key_value.len(),
+    );
+    println!("Test it: ff cloud-llm test {}", provider.id);
+    Ok(())
+}
+
+async fn handle_cloud_llm_usage(pool: &sqlx::PgPool, since: &str) -> Result<()> {
+    let secs = parse_since_to_secs(since).unwrap_or(24 * 3600);
+    let rows = sqlx::query(
+        r#"SELECT provider_id,
+                  COUNT(*) AS calls,
+                  COALESCE(SUM(tokens_input), 0)::BIGINT  AS tokens_in,
+                  COALESCE(SUM(tokens_output), 0)::BIGINT AS tokens_out,
+                  COALESCE(AVG(request_duration_ms), 0)::FLOAT8 AS avg_ms
+             FROM cloud_llm_usage
+             WHERE used_at > NOW() - ($1::BIGINT * INTERVAL '1 second')
+             GROUP BY provider_id
+             ORDER BY calls DESC"#,
+    )
+    .bind(secs as i64)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("query cloud_llm_usage: {e}"))?;
+
+    if rows.is_empty() {
+        println!(
+            "{YELLOW}No cloud LLM calls recorded in the last {since} (window: {secs}s).{RESET}"
+        );
+        return Ok(());
+    }
+
+    println!(
+        "{:<12} {:>8} {:>12} {:>12} {:>10}",
+        "PROVIDER", "CALLS", "TOKENS_IN", "TOKENS_OUT", "AVG_MS",
+    );
+    println!("  {}", "-".repeat(60));
+    for r in &rows {
+        let id: String = sqlx::Row::get(r, "provider_id");
+        let calls: i64 = sqlx::Row::get(r, "calls");
+        let ti: i64 = sqlx::Row::get(r, "tokens_in");
+        let to: i64 = sqlx::Row::get(r, "tokens_out");
+        let avg_ms: f64 = sqlx::Row::get(r, "avg_ms");
+        println!(
+            "{:<12} {:>8} {:>12} {:>12} {:>10.1}",
+            id, calls, ti, to, avg_ms,
+        );
+    }
+    println!("\nWindow: last {since} ({secs}s).");
+    Ok(())
+}
+
+/// Parse a window string like `24h`, `15m`, `7d`, `3600s` into seconds.
+fn parse_since_to_secs(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let (num, suffix) = s.split_at(s.len().saturating_sub(1));
+    let n: u64 = num.parse().ok()?;
+    match suffix {
+        "s" => Some(n),
+        "m" => Some(n * 60),
+        "h" => Some(n * 3600),
+        "d" => Some(n * 86400),
+        _ => s.parse().ok(),
+    }
+}
+
+async fn handle_cloud_llm_test(
+    pool: &sqlx::PgPool,
+    provider_id: &str,
+    model_override: Option<String>,
+) -> Result<()> {
+    let providers = ff_agent::cloud_llm_registry::list_providers(pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("list providers: {e}"))?;
+    let Some(provider) = providers.into_iter().find(|p| p.id == provider_id) else {
+        eprintln!("{RED}✗ Unknown provider '{provider_id}'.{RESET}");
+        std::process::exit(1);
+    };
+
+    let key = ff_db::pg_get_secret(pool, &provider.secret_key)
+        .await
+        .map_err(|e| anyhow::anyhow!("read secret: {e}"))?;
+    let Some(api_key) = key.filter(|k| !k.is_empty()) else {
+        eprintln!(
+            "{RED}✗ No API key set for '{}'. Run `ff cloud-llm set-key {}`.{RESET}",
+            provider.id, provider.id,
+        );
+        std::process::exit(1);
+    };
+
+    let probe_model = model_override.unwrap_or_else(|| match provider.id.as_str() {
+        "openai" => "openai/gpt-4o-mini".to_string(),
+        "anthropic" => "claude-3-5-haiku-latest".to_string(),
+        "moonshot" => "kimi/moonshot-v1-8k".to_string(),
+        "google" => "gemini/gemini-1.5-flash".to_string(),
+        _ => "test".to_string(),
+    });
+
+    println!(
+        "{CYAN}▶ Probing {} ({}) with model '{}' (api_key=<redacted>){RESET}",
+        provider.id, provider.request_format, probe_model,
+    );
+
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .unwrap_or_default();
+
+    // Strip the `gemini/` prefix for Google since that's a ForgeFleet-level
+    // routing hint, not a real Google model id.
+    let wire_model = if provider.request_format == "google_generate_content" {
+        probe_model.strip_prefix("gemini/").unwrap_or(&probe_model).to_string()
+    } else {
+        probe_model.clone()
+    };
+
+    let result = probe_cloud_provider(
+        &http,
+        &provider.request_format,
+        &provider.base_url,
+        &api_key,
+        &wire_model,
+    )
+    .await;
+
+    match result {
+        Ok(reply) => {
+            println!("{GREEN}✓ {} replied:{RESET} {}", provider.id, reply);
+            Ok(())
+        }
+        Err(msg) => {
+            eprintln!("{RED}✗ {} probe failed:{RESET} {msg}", provider.id);
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Dispatch a "reply OK" probe in whatever wire format the provider expects.
+/// Mirrors the translation the gateway's cloud_llm module does.
+async fn probe_cloud_provider(
+    http: &reqwest::Client,
+    fmt: &str,
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+) -> Result<String, String> {
+    let base = base_url.trim_end_matches('/');
+    let prompt = "Reply with the word OK.";
+
+    let (url, body, headers): (String, serde_json::Value, Vec<(&str, String)>) = match fmt {
+        "openai_chat" => (
+            format!("{base}/chat/completions"),
+            serde_json::json!({"model": model,
+                "messages":[{"role":"user","content":prompt}], "max_tokens":16}),
+            vec![("authorization", format!("Bearer {api_key}"))],
+        ),
+        "anthropic_messages" => (
+            format!("{base}/messages"),
+            serde_json::json!({"model": model, "max_tokens":16,
+                "messages":[{"role":"user","content":prompt}]}),
+            vec![
+                ("x-api-key", api_key.to_string()),
+                ("anthropic-version", "2023-06-01".to_string()),
+            ],
+        ),
+        "google_generate_content" => (
+            format!("{base}/models/{model}:generateContent?key={api_key}"),
+            serde_json::json!({
+                "contents":[{"role":"user","parts":[{"text":prompt}]}],
+                "generationConfig":{"maxOutputTokens":16}}),
+            vec![],
+        ),
+        other => return Err(format!("unsupported request_format '{other}'")),
+    };
+
+    let mut req = http.post(&url).json(&body);
+    for (k, v) in &headers {
+        req = req.header(*k, v);
+    }
+    let resp = req.send().await.map_err(|e| format!("send: {e}"))?;
+    let status = resp.status();
+    let v: serde_json::Value = resp.json().await.map_err(|e| format!("json: {e}"))?;
+    if !status.is_success() {
+        let msg = v.get("error").and_then(|e| e.get("message"))
+            .and_then(|m| m.as_str()).unwrap_or("(no error message)");
+        return Err(format!("HTTP {} — {msg}", status.as_u16()));
+    }
+    let text = match fmt {
+        "google_generate_content" => {
+            v["candidates"][0]["content"]["parts"][0]["text"].as_str()
+        }
+        "anthropic_messages" => v["content"].as_array()
+            .and_then(|a| a.first())
+            .and_then(|p| p.get("text"))
+            .and_then(|t| t.as_str()),
+        _ => v["choices"][0]["message"]["content"].as_str(),
+    };
+    Ok(text.unwrap_or("(no content)").to_string())
 }
 
 fn build_migrate_github_script(new_owner: &str) -> String {
@@ -7854,6 +8940,18 @@ async fn defer_pass(
                 finalize_upgrade_event(&pool2, &claimed, ok, meta, err.as_deref()).await;
             }
 
+            // External-tool finalizer: `ff ext install` / auto drift →
+            // install path. Flips computer_external_tools.status and
+            // best-effort extracts installed_version from stdout.
+            if let Some(meta) = claimed
+                .payload
+                .get("meta")
+                .and_then(|v| v.get("external_tool"))
+            {
+                finalize_external_tool_event(&pool2, &claimed, ok, meta, err.as_deref())
+                    .await;
+            }
+
             // guard drops here, releasing the slot.
             drop(guard);
         });
@@ -8060,6 +9158,16 @@ async fn handle_daemon(
             worker_name.clone(),
         );
         let _auto_handle = auto.spawn(portfolio_shutdown_rx.clone());
+
+        // External-tools upstream drift checker (6h). Scans the V24
+        // `external_tools` catalog for new GitHub releases / brew / pip
+        // versions and flips `computer_external_tools.status` rows to
+        // `'upgrade_available'`. Pure detector — install dispatch is a
+        // separate concern (see `ff ext install`).
+        println!("{CYAN}[ext-upstream]{RESET} spawning 6h external-tools upstream checker");
+        let ext_upstream =
+            ff_agent::external_tools_upstream::ExternalToolsUpstreamChecker::new(pool.clone());
+        let _ext_upstream_handle = ext_upstream.spawn(6, portfolio_shutdown_rx.clone());
 
         // Stuck-slot reaper: resets sub_agents rows stuck in 'error' or 'busy'
         // with a stale started_at so the dispatch queue can't lock up.

@@ -84,6 +84,67 @@ fn default_status() -> String {
     "active".to_string()
 }
 
+/// Pick the lowest-numbered free LLM port for `computer_name` + `runtime` by
+/// consulting the `port_registry` table.
+///
+/// Mapping: llama.cpp / mlx → services whose id starts with `llama_cpp_slot_`
+/// (55000/55001/55002 in the seeded registry); vllm → services whose id
+/// starts with `vllm` (51001/51003); ollama → 11434 (always 11434 since
+/// Ollama's routing is internal, so we just return that).
+///
+/// Excludes ports already bound by active rows in `computer_model_deployments`
+/// for the given computer. Returns `sqlx::Error::RowNotFound` when every
+/// candidate slot is already taken.
+pub async fn pick_llm_port(
+    pool: &PgPool,
+    computer_name: &str,
+    runtime: &str,
+) -> Result<i32, sqlx::Error> {
+    if runtime == "ollama" {
+        return Ok(11434);
+    }
+
+    let service_prefix: &str = match runtime {
+        "llama.cpp" | "llama_cpp" | "mlx" | "mlx_lm" => "llama_cpp_slot_",
+        "vllm" => "vllm",
+        _ => return Err(sqlx::Error::RowNotFound),
+    };
+
+    // All LLM slots reserved for this runtime family, sorted.
+    let candidate_ports: Vec<i32> = sqlx::query_scalar(
+        "SELECT port
+           FROM port_registry
+          WHERE kind = 'llm_inference'
+            AND service LIKE $1
+          ORDER BY port",
+    )
+    .bind(format!("{service_prefix}%"))
+    .fetch_all(pool)
+    .await?;
+
+    // Ports already bound by active deployments on THIS computer.
+    // The `endpoint` column is a URL (e.g. http://127.0.0.1:55000) — parse
+    // the port out with a regex-friendly substring match at the SQL level
+    // so we don't have to pull every row back to Rust.
+    let busy_ports: Vec<i32> = sqlx::query_scalar(
+        "SELECT (substring(cmd.endpoint from ':(\\d+)(?:/|$)'))::INT AS port
+           FROM computer_model_deployments cmd
+           JOIN computers c ON c.id = cmd.computer_id
+          WHERE LOWER(c.name) = LOWER($1)
+            AND cmd.status = 'active'
+            AND cmd.endpoint ~ ':\\d+'",
+    )
+    .bind(computer_name)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    candidate_ports
+        .into_iter()
+        .find(|p| !busy_ports.contains(p))
+        .ok_or(sqlx::Error::RowNotFound)
+}
+
 /// Read the ports TOML from `path` and upsert every `[[port]]` entry into
 /// the `port_registry` table. Returns a per-row summary.
 ///

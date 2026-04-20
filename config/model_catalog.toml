@@ -1634,3 +1634,84 @@ license = "apache-2.0"
   hf_repo = "Qwen/Qwen2-VL-7B-Instruct"
   size_gb = 16.0
   context_window = 32768
+
+# ---------------------------------------------------------------------------
+# Social-ingest vision models (V25 — short-form media → OCR/URL extraction)
+# ---------------------------------------------------------------------------
+
+[[models]]
+id = "qwen2-vl-7b-instruct"
+name = "Qwen2-VL-7B-Instruct (social-ingest)"
+family = "qwen"
+parameters = "7B"
+tier = 1
+description = "Qwen2-VL 7B — primary vision model for social-media ingest (OCR, tool/URL extraction from images and video frames)."
+gated = false
+preferred_workloads = ["vision", "documents", "chat"]
+tasks = ["image-text-to-text", "visual-question-answering"]
+input_modalities = ["text", "image"]
+output_modalities = ["text"]
+languages = ["en", "zh"]
+upstream_source = "huggingface"
+upstream_id = "Qwen/Qwen2-VL-7B-Instruct"
+quality_tier = "standard"
+lifecycle_status = "active"
+min_vram_gb = 8
+cpu_runnable = false
+license = "apache-2.0"
+
+  [[models.variants]]
+  runtime = "llama.cpp"
+  quant = "Q4_K_M"
+  hf_repo = "bartowski/Qwen2-VL-7B-Instruct-GGUF"
+  size_gb = 5.0
+  context_window = 32768
+
+  [[models.variants]]
+  runtime = "mlx"
+  quant = "4bit"
+  hf_repo = "mlx-community/Qwen2-VL-7B-Instruct-4bit"
+  size_gb = 5.0
+  context_window = 32768
+
+  [[models.variants]]
+  runtime = "vllm"
+  quant = "fp16"
+  hf_repo = "Qwen/Qwen2-VL-7B-Instruct"
+  size_gb = 16.0
+  context_window = 32768
+
+[[models]]
+id = "llava-onevision-qwen2-7b-si"
+name = "LLaVA-OneVision Qwen2 7B SI"
+family = "llava"
+parameters = "7B"
+tier = 1
+description = "LLaVA-OneVision 7B (single-image) — fallback vision model for social-ingest when Qwen2-VL isn't loaded."
+gated = false
+preferred_workloads = ["vision", "chat"]
+tasks = ["image-text-to-text", "visual-question-answering"]
+input_modalities = ["text", "image"]
+output_modalities = ["text"]
+languages = ["en", "zh"]
+upstream_source = "huggingface"
+upstream_id = "lmms-lab/llava-onevision-qwen2-7b-si"
+quality_tier = "standard"
+lifecycle_status = "active"
+min_vram_gb = 8
+cpu_runnable = false
+license = "apache-2.0"
+
+  [[models.variants]]
+  runtime = "vllm"
+  quant = "fp16"
+  hf_repo = "lmms-lab/llava-onevision-qwen2-7b-si"
+  size_gb = 16.0
+  context_window = 32768
+
+  [[models.variants]]
+  runtime = "mlx"
+  quant = "4bit"
+  hf_repo = "mlx-community/llava-onevision-qwen2-7b-si-4bit"
+  size_gb = 5.0
+  context_window = 32768

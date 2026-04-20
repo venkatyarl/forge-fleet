@@ -12,6 +12,7 @@
 pub mod discord;
 pub mod embed;
 pub mod brain_api;
+pub mod cloud_llm;
 pub mod llm_routing;
 pub mod message;
 pub mod middleware;

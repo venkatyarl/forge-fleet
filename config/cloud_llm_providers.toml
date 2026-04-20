@@ -1,0 +1,143 @@
+# ForgeFleet cloud LLM provider catalog.
+#
+# The gateway inspects incoming /v1/chat/completions requests and, when the
+# `model` field matches one of these `model_prefix` values, forwards the
+# request to the provider's public API instead of a local fleet node.
+#
+# Credentials are NOT stored here — `secret_key` is the key looked up in
+# the `fleet_secrets` Postgres table. Set them with:
+#     ff cloud-llm set-key <provider_id>
+#
+# `request_format` controls body translation:
+#   openai_chat               — passthrough (OpenAI chat completions shape)
+#   anthropic_messages        — translate to POST /v1/messages
+#   google_generate_content   — translate to :generateContent
+#
+# `auth_kind = "oauth2"` is schema-ready but not wired yet; only
+# `auth_kind = "api_key"` is fully functional this pass.
+
+schema_version = "1"
+
+[[provider]]
+id = "openai"
+display_name = "OpenAI (ChatGPT)"
+base_url = "https://api.openai.com/v1"
+auth_kind = "api_key"
+secret_key = "cloud.openai.api_key"
+model_prefix = "openai/"
+request_format = "openai_chat"
+
+[[provider]]
+id = "anthropic"
+display_name = "Anthropic (Claude)"
+base_url = "https://api.anthropic.com/v1"
+auth_kind = "api_key"
+secret_key = "cloud.anthropic.api_key"
+model_prefix = "claude-"
+request_format = "anthropic_messages"
+
+[[provider]]
+id = "moonshot"
+display_name = "Moonshot (Kimi)"
+base_url = "https://api.moonshot.ai/v1"
+auth_kind = "api_key"
+secret_key = "cloud.moonshot.api_key"
+model_prefix = "kimi/"
+request_format = "openai_chat"
+
+[[provider]]
+id = "google"
+display_name = "Google (Gemini)"
+base_url = "https://generativelanguage.googleapis.com/v1beta"
+auth_kind = "api_key"
+secret_key = "cloud.google.api_key"
+model_prefix = "gemini/"
+request_format = "google_generate_content"
+
+# ─── Extended catalog drafted by Sophie (Qwen3-Coder-30B via `ff run`) ──
+# All use OpenAI-compatible chat completions API unless noted.
+
+[[provider]]
+id = "xai_grok"
+display_name = "xAI (Grok)"
+base_url = "https://api.x.ai/v1"
+auth_kind = "api_key"
+secret_key = "cloud.xai_grok.api_key"
+model_prefix = "grok/"
+request_format = "openai_chat"
+
+[[provider]]
+id = "groq"
+display_name = "Groq"
+base_url = "https://api.groq.com/openai/v1"
+auth_kind = "api_key"
+secret_key = "cloud.groq.api_key"
+model_prefix = "groq/"
+request_format = "openai_chat"
+
+[[provider]]
+id = "deepseek"
+display_name = "DeepSeek"
+base_url = "https://api.deepseek.com/v1"
+auth_kind = "api_key"
+secret_key = "cloud.deepseek.api_key"
+model_prefix = "deepseek/"
+request_format = "openai_chat"
+
+[[provider]]
+id = "mistral"
+display_name = "Mistral"
+base_url = "https://api.mistral.ai/v1"
+auth_kind = "api_key"
+secret_key = "cloud.mistral.api_key"
+model_prefix = "mistral/"
+request_format = "openai_chat"
+
+[[provider]]
+id = "fireworks"
+display_name = "Fireworks AI"
+base_url = "https://api.fireworks.ai/inference/v1"
+auth_kind = "api_key"
+secret_key = "cloud.fireworks.api_key"
+model_prefix = "fireworks/"
+request_format = "openai_chat"
+
+[[provider]]
+id = "together"
+display_name = "Together AI"
+base_url = "https://api.together.xyz/v1"
+auth_kind = "api_key"
+secret_key = "cloud.together.api_key"
+model_prefix = "together/"
+request_format = "openai_chat"
+
+[[provider]]
+id = "perplexity"
+display_name = "Perplexity"
+base_url = "https://api.perplexity.ai"
+auth_kind = "api_key"
+secret_key = "cloud.perplexity.api_key"
+model_prefix = "perplexity/"
+request_format = "openai_chat"
+
+[[provider]]
+id = "openrouter"
+display_name = "OpenRouter (aggregator)"
+base_url = "https://openrouter.ai/api/v1"
+auth_kind = "api_key"
+secret_key = "cloud.openrouter.api_key"
+model_prefix = "openrouter/"
+request_format = "openai_chat"
+
+# Cohere's v2 chat format is non-OpenAI-shaped. Kept disabled until the
+# cohere_chat_v2 translator lands in crates/ff-gateway/src/cloud_llm.rs.
+# TODO: implement cohere_chat_v2 translator + flip enabled=true in DB.
+[[provider]]
+id = "cohere"
+display_name = "Cohere"
+base_url = "https://api.cohere.com/v2"
+auth_kind = "api_key"
+secret_key = "cloud.cohere.api_key"
+model_prefix = "cohere/"
+request_format = "cohere_chat_v2"
+enabled = false

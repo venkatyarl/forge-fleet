@@ -1,0 +1,91 @@
+# ForgeFleet External Tools Registry Seed
+#
+# This file drives the `external_tools` table. Each [[tool]] entry describes
+# a GitHub-hosted developer tool that exposes a CLI, an MCP stdio server,
+# or both. Seeded via `ff ext seed`.
+#
+# Schema:
+#   id                  — stable identifier (kebab-case, string, required)
+#   display_name        — human-readable name (string, required)
+#   github_url          — canonical GitHub repo URL (string, required)
+#   kind                — "cli" | "mcp" | "both"
+#   install_method      — "cargo_install" | "npm_global" | "pip" | "git_build" | "binary_release"
+#   install_spec        — inline table, per-method args (repo, package, bin, etc.)
+#   cli_entrypoint      — command added to PATH after install (optional)
+#   mcp_server_command  — stdio command run when spawning as MCP (optional)
+#   register_as_mcp     — bool, if true the installer will register it as
+#                         an MCP server for OpenClaw/Claude Code
+#                         (MCP auto-registration is deferred — see TODO)
+#   version_source      — drift-check spec: `{ method = "github_release",
+#                         repo = "owner/name" }` etc.
+#   upgrade_playbook    — inline table of shell commands keyed by
+#                         "<os>-<source>" | "<os>" | "all"
+#   intake_source       — "direct" | "social" (hint, optional)
+#   intake_reference    — original URL (GitHub or social media, optional)
+
+# ---------------------------------------------------------------------------
+# code-review-graph — persistent incremental knowledge graph for reviews
+# ---------------------------------------------------------------------------
+
+[[tool]]
+id = "code-review-graph"
+display_name = "Code Review Graph"
+# TODO: verify url — the real repo slug may differ. Placeholder used so the
+# seed applies cleanly; operator should update before first drift check.
+github_url = "https://github.com/anthropics/code-review-graph"
+kind = "mcp"
+install_method = "cargo_install"
+install_spec = { repo = "anthropics/code-review-graph", bin = "code-review-graph-mcp" }
+cli_entrypoint = "crg"
+mcp_server_command = "code-review-graph-mcp --stdio"
+register_as_mcp = true
+version_source = { method = "github_release", repo = "anthropics/code-review-graph" }
+intake_source = "direct"
+intake_reference = "https://github.com/anthropics/code-review-graph"
+
+[tool.upgrade_playbook]
+all = "cargo install --git https://github.com/anthropics/code-review-graph --force"
+
+# ---------------------------------------------------------------------------
+# context-mode — npm-distributed MCP context server
+# ---------------------------------------------------------------------------
+
+[[tool]]
+id = "context-mode"
+display_name = "Context Mode"
+# TODO: verify url — placeholder pending operator confirmation.
+github_url = "https://github.com/context-mode/context-mode"
+kind = "mcp"
+install_method = "npm_global"
+install_spec = { package = "@context-mode/mcp" }
+cli_entrypoint = "context-mode"
+mcp_server_command = "context-mode --stdio"
+register_as_mcp = true
+version_source = { method = "github_release", repo = "context-mode/context-mode" }
+intake_source = "direct"
+intake_reference = "https://github.com/context-mode/context-mode"
+
+[tool.upgrade_playbook]
+all = "npm install -g @context-mode/mcp@latest"
+
+# ---------------------------------------------------------------------------
+# gh — GitHub CLI (representative "both CLI + repo" tool, binary release)
+# ---------------------------------------------------------------------------
+
+[[tool]]
+id = "gh-cli"
+display_name = "GitHub CLI"
+github_url = "https://github.com/cli/cli"
+kind = "cli"
+install_method = "binary_release"
+install_spec = { repo = "cli/cli", asset_pattern = "gh_*_linux_amd64.tar.gz" }
+cli_entrypoint = "gh"
+register_as_mcp = false
+version_source = { method = "github_release", repo = "cli/cli" }
+intake_source = "direct"
+intake_reference = "https://github.com/cli/cli"
+
+[tool.upgrade_playbook]
+macos = "brew upgrade gh"
+linux-ubuntu = "sudo apt-get update && sudo apt-get install -y gh"
+linux-dgx = "sudo apt-get update && sudo apt-get install -y gh"
