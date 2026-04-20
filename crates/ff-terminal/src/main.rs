@@ -8060,6 +8060,15 @@ async fn handle_daemon(
             worker_name.clone(),
         );
         let _auto_handle = auto.spawn(portfolio_shutdown_rx.clone());
+
+        // Stuck-slot reaper: resets sub_agents rows stuck in 'error' or 'busy'
+        // with a stale started_at so the dispatch queue can't lock up.
+        println!("{CYAN}[reaper]{RESET} spawning stuck-slot reaper (10min interval, 10min timeout)");
+        let reaper = ff_agent::sub_agent_reaper::SubAgentReaper::new(
+            pool.clone(),
+            worker_name.clone(),
+        );
+        let _reaper_handle = reaper.spawn(portfolio_shutdown_rx.clone());
     } else {
         println!("{CYAN}[portfolio]{RESET} skipping — not leader / scheduler");
     }

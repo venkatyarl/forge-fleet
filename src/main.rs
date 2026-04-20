@@ -1793,20 +1793,20 @@ async fn start_pulse_v2_subsystems(
         let my_name_for_promote = node_name.clone();
         let my_name_for_demote = node_name.clone();
 
-        let on_became: ff_agent::leader_tick::OnBecameLeader = std::sync::Arc::new(move || {
+        let on_became: ff_agent::leader_tick::OnBecameLeader = std::sync::Arc::new(move |prev: Option<String>| {
             let oc = oc_promote.clone();
             let my_name = my_name_for_promote.clone();
             let pool = pool_for_promote.clone();
             tokio::spawn(async move {
                 // Publish leader-change event to NATS (best-effort).
                 ff_agent::fleet_events_nats::FleetEventBus::publish_leader_change(
-                    None,
+                    prev.as_deref(),
                     &my_name,
                     0,
                 )
                 .await;
 
-                if let Err(e) = oc.promote_to_gateway().await {
+                if let Err(e) = oc.promote_to_gateway(prev.as_deref()).await {
                     tracing::error!(error = %e, "openclaw: promote_to_gateway failed");
                 } else {
                     // Surface promotion as a deployment.started event for the openclaw-gateway.
@@ -1946,6 +1946,24 @@ async fn start_pulse_v2_subsystems(
                 });
             });
 
+        // Phase 6 HA — auto Postgres failover manager. Runs inside every
+        // leader tick (only when we are the current fleet leader). The
+        // whole path is no-op'd by the env var
+        // FORGEFLEET_DISABLE_AUTO_PG_FAILOVER=true for safety drills.
+        let pg_failover_manager = std::sync::Arc::new(
+            ff_agent::ha::pg_failover::PostgresFailoverManager::new(
+                pg_pool.clone(),
+                computer_id,
+            ),
+        );
+        info!(
+            node = %node_name,
+            computer_id = %computer_id,
+            disabled = ff_agent::ha::pg_failover::DISABLE_ENV,
+            "pg_failover manager constructed (auto-failover enabled unless {} is set)",
+            ff_agent::ha::pg_failover::DISABLE_ENV
+        );
+
         let leader_tick = ff_agent::leader_tick::LeaderTick::new(
             pg_pool,
             pulse_reader,
@@ -1954,7 +1972,8 @@ async fn start_pulse_v2_subsystems(
             election_priority,
         )
         .with_on_became_leader(on_became)
-        .with_on_lost_leader(on_lost);
+        .with_on_lost_leader(on_lost)
+        .with_pg_failover(pg_failover_manager);
         handles.push(leader_tick.spawn(15, shutdown_rx));
     } else {
         info!(

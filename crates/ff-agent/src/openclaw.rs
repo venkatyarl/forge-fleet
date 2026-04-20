@@ -96,7 +96,14 @@ impl OpenClawManager {
     ///
     /// Called on `on_became_leader`. Idempotent — if we're already in
     /// gateway mode per the DB, this no-ops.
-    pub async fn promote_to_gateway(&self) -> Result<(), OpenClawError> {
+    ///
+    /// `previous_leader` — if known, this computer's name is used to rsync
+    /// the outgoing gateway's paired-device file across so phones/IoT
+    /// survive the failover without re-pairing. Best-effort.
+    pub async fn promote_to_gateway(
+        &self,
+        previous_leader: Option<&str>,
+    ) -> Result<(), OpenClawError> {
         info!("openclaw: promoting local to gateway mode");
 
         // Check current mode via DB — idempotent guard.
@@ -118,6 +125,25 @@ impl OpenClawManager {
         // Restart via launchd (macOS) or systemd (linux). Best-effort —
         // if the service isn't registered yet we log and continue.
         restart_openclaw_service()?;
+
+        // Sweeten the failover: pull the outgoing gateway's paired-device
+        // file across so phones/IoT don't have to re-pair. Runs BEFORE
+        // any token rotation so imported devices see a valid gateway
+        // state. Best-effort — all failures logged, never propagated.
+        if let Some(old) = previous_leader {
+            if !old.is_empty() {
+                let my_name: String = sqlx::query_scalar(
+                    "SELECT name FROM computers WHERE id = $1",
+                )
+                .bind(self.my_computer_id)
+                .fetch_optional(&self.pg)
+                .await?
+                .unwrap_or_default();
+                if old != my_name {
+                    let _ = migrate_devices_from(&self.pg, old, &my_name).await;
+                }
+            }
+        }
 
         let url = format!("ws://{}:50000", self.my_primary_ip);
 
@@ -350,6 +376,114 @@ fn current_uid() -> Option<String> {
         }
     }
     std::env::var("UID").ok().or_else(|| std::env::var("SUDO_UID").ok())
+}
+
+/// Best-effort: rsync the previous gateway's `~/.openclaw/data/devices.json`
+/// across so paired phones/IoT survive a failover without re-pairing.
+///
+/// Returns the number of devices imported, or `Ok(0)` on any soft failure.
+/// This is sweetener; it must never block a promotion.
+async fn migrate_devices_from(
+    pool: &PgPool,
+    old_leader: &str,
+    new_leader: &str,
+) -> anyhow::Result<usize> {
+    // 1) Look up old leader's ssh_user + ip. Prefer `computers`; fall
+    //    back to `fleet_nodes` (legacy terminology still carries data).
+    let found: Option<(String, String)> = sqlx::query_as(
+        "SELECT ssh_user, primary_ip FROM computers WHERE name = $1",
+    )
+    .bind(old_leader)
+    .fetch_optional(pool)
+    .await
+    .unwrap_or(None)
+    .or(sqlx::query_as::<_, (String, String)>(
+        "SELECT ssh_user, ip FROM fleet_nodes WHERE name = $1",
+    )
+    .bind(old_leader)
+    .fetch_optional(pool)
+    .await
+    .unwrap_or(None));
+    let (ssh_user, ip) = match found {
+        Some(x) => x,
+        None => {
+            warn!(%old_leader, "migrate_devices: no ssh_user/ip in computers or fleet_nodes");
+            return Ok(0);
+        }
+    };
+
+    // 2) Cat the file over SSH. Missing/empty → nothing to do.
+    let dest = format!("{ssh_user}@{ip}");
+    let out = Command::new("ssh")
+        .args([
+            "-o", "ConnectTimeout=8",
+            "-o", "BatchMode=yes",
+            "-o", "StrictHostKeyChecking=accept-new",
+            &dest,
+            "cat ~/.openclaw/data/devices.json 2>/dev/null",
+        ])
+        .output();
+    let body = match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+        Ok(o) => {
+            warn!(%dest, code=?o.status.code(), "migrate_devices: ssh exited non-zero");
+            return Ok(0);
+        }
+        Err(e) => {
+            warn!(%dest, error=%e, "migrate_devices: ssh spawn failed");
+            return Ok(0);
+        }
+    };
+    if body.trim().is_empty() {
+        info!(%old_leader, "migrate_devices: remote devices.json empty or missing");
+        return Ok(0);
+    }
+
+    // 3) Stage locally.
+    let ts = chrono::Utc::now().timestamp();
+    let path = format!("/tmp/ff_devices_migration_{ts}.json");
+    if let Err(e) = std::fs::write(&path, &body) {
+        warn!(%path, error=%e, "migrate_devices: write local stage failed");
+        return Ok(0);
+    }
+
+    // 4) Count for logging (best-effort parse).
+    let count = serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| v.get("devices").and_then(|d| d.as_array()).map(|a| a.len()))
+        .unwrap_or(0);
+    info!(%old_leader, %new_leader, count, %path, "migrate_devices: importing paired devices");
+
+    // 5) Import via local openclaw. Fall back to /usr/local/bin/openclaw
+    //    if the bare name isn't on $PATH.
+    let bin = which_openclaw();
+    let status = Command::new(&bin)
+        .args(["devices", "import", &path])
+        .status();
+    match status {
+        Ok(s) if s.success() => Ok(count.max(1)),
+        Ok(s) => {
+            warn!(code=?s.code(), bin=%bin, "migrate_devices: openclaw devices import failed");
+            Ok(0)
+        }
+        Err(e) => {
+            warn!(error=%e, bin=%bin, "migrate_devices: openclaw devices import spawn failed");
+            Ok(0)
+        }
+    }
+}
+
+/// Resolve the openclaw binary path — prefer `$PATH`, else `/usr/local/bin/openclaw`.
+fn which_openclaw() -> String {
+    if let Ok(o) = Command::new("which").arg("openclaw").output() {
+        if o.status.success() {
+            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if !s.is_empty() {
+                return s;
+            }
+        }
+    }
+    "/usr/local/bin/openclaw".to_string()
 }
 
 async fn upsert_secret(pool: &PgPool, key: &str, value: &str) -> Result<(), sqlx::Error> {

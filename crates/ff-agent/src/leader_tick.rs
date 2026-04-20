@@ -84,7 +84,10 @@ pub enum TickOutcome {
 }
 
 /// Callback fired once, on the tick that transitions us to leader.
-pub type OnBecameLeader = Arc<dyn Fn() + Send + Sync>;
+/// Argument: name of the previous leader we displaced (`None` on cold
+/// claim of the empty singleton). Used by OpenClaw gateway promotion
+/// to rsync paired-device state from the outgoing gateway.
+pub type OnBecameLeader = Arc<dyn Fn(Option<String>) + Send + Sync>;
 /// Callback fired once, on the tick that we stop being leader.
 /// Argument: name of the new/expected leader (may be empty if unknown).
 pub type OnLostLeader = Arc<dyn Fn(String) + Send + Sync>;
@@ -130,7 +133,7 @@ impl LeaderTick {
             my_name,
             my_priority,
             epoch: AtomicU64::new(0),
-            on_became_leader: Arc::new(|| {}),
+            on_became_leader: Arc::new(|_| {}),
             on_lost_leader: Arc::new(|_| {}),
             pg_failover_manager: None,
         }
@@ -305,7 +308,7 @@ impl LeaderTick {
                 )
                 .await?;
                 if claimed {
-                    (self.on_became_leader)();
+                    (self.on_became_leader)(None);
                     Ok(TickOutcome::BecameLeader)
                 } else {
                     // Someone else won the race — we'll see them next tick.
@@ -372,7 +375,7 @@ impl LeaderTick {
                     )
                     .await?;
                     if took {
-                        (self.on_became_leader)();
+                        (self.on_became_leader)(Some(displaced_name.clone()));
                         Ok(TickOutcome::TookOver(displaced_name))
                     } else {
                         // Another peer raced us; just wait for the next tick.
