@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { getJson } from '../lib/api'
+import { PanelHeader, RefreshButton } from './PanelHeader'
 
 type SoftwareRow = {
   computer_id: string
@@ -68,31 +69,24 @@ export function SoftwareDriftPanel() {
 
   return (
     <section className="space-y-4">
-      <div className="flex items-center justify-between">
-        <div>
-          <h2 className="text-xl font-semibold text-zinc-100">Software Inventory</h2>
-          <p className="text-sm text-zinc-500">
-            {rows.length} record{rows.length === 1 ? '' : 's'} · {driftCount} drifted
-          </p>
-        </div>
-        <div className="flex items-center gap-2">
-          <label className="flex items-center gap-2 text-xs text-zinc-400">
-            <input
-              type="checkbox"
-              checked={onlyDrift}
-              onChange={(e) => setOnlyDrift(e.target.checked)}
-              className="accent-violet-500"
-            />
-            Only drift
-          </label>
-          <button
-            onClick={() => void load()}
-            className="rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-sm text-zinc-400 hover:text-zinc-200"
-          >
-            Refresh
-          </button>
-        </div>
-      </div>
+      <PanelHeader
+        title="Software Inventory"
+        subtitle={`${rows.length} record${rows.length === 1 ? '' : 's'} · ${driftCount} drifted`}
+        rightSlot={
+          <>
+            <label className="flex items-center gap-2 text-xs text-zinc-400">
+              <input
+                type="checkbox"
+                checked={onlyDrift}
+                onChange={(e) => setOnlyDrift(e.target.checked)}
+                className="accent-violet-500"
+              />
+              Only drift
+            </label>
+            <RefreshButton onClick={() => void load()} />
+          </>
+        }
+      />
 
       {error && (
         <div className="rounded-xl border border-rose-500/20 bg-rose-500/5 px-4 py-3 text-sm text-rose-300">
@@ -110,7 +104,7 @@ export function SoftwareDriftPanel() {
       ) : (
         <div className="overflow-auto rounded-xl border border-zinc-800">
           <table className="min-w-full border-collapse text-xs">
-            <thead className="bg-zinc-900/80 text-left uppercase tracking-wide text-zinc-500">
+            <thead className="bg-zinc-900/80 text-left text-xs uppercase tracking-wider text-zinc-500">
               <tr>
                 <th className="sticky left-0 z-10 bg-zinc-900/80 px-3 py-2">Software</th>
                 {computers.map((c) => (

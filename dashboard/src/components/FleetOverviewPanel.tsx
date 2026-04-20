@@ -1,5 +1,9 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { getJson } from '../lib/api'
+import { useFleetEvents } from '../lib/useFleetEvents'
+import { LiveIndicator, PanelHeader, RefreshButton } from './PanelHeader'
+import { Sparkline } from './Sparkline'
+import { StatusBadge, StatusDot, toneFor } from './StatusBadge'
 
 // Pulse v2 fleet computer as returned by /api/fleet/computers.
 type PulseComputer = {
@@ -32,44 +36,10 @@ type PulseComputer = {
   latest_recorded_at?: string | null
 }
 
-function statusDot(status: string): string {
-  switch (status) {
-    case 'online':
-      return 'bg-emerald-400'
-    case 'sdown':
-    case 'maintenance':
-      return 'bg-amber-400'
-    case 'odown':
-    case 'offline':
-      return 'bg-rose-500'
-    case 'pending':
-      return 'bg-sky-400'
-    default:
-      return 'bg-zinc-500'
-  }
-}
-
-function statusBadge(status: string): string {
-  switch (status) {
-    case 'online':
-      return 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
-    case 'sdown':
-    case 'maintenance':
-      return 'bg-amber-500/15 text-amber-300 border-amber-500/30'
-    case 'odown':
-    case 'offline':
-      return 'bg-rose-500/15 text-rose-300 border-rose-500/30'
-    case 'pending':
-      return 'bg-sky-500/15 text-sky-300 border-sky-500/30'
-    default:
-      return 'bg-zinc-800 text-zinc-300 border-zinc-700'
-  }
-}
-
-function roleBadge(role?: string | null): string {
-  if (role === 'leader') return 'bg-violet-500/15 text-violet-300 border-violet-500/30'
-  if (role === 'member') return 'bg-zinc-800 text-zinc-300 border-zinc-700'
-  return 'bg-zinc-800 text-zinc-500 border-zinc-700'
+type MetricPoint = {
+  recorded_at: string
+  cpu_pct?: number | null
+  ram_pct?: number | null
 }
 
 function Bar({ pct, label }: { pct?: number | null; label: string }) {
@@ -99,6 +69,10 @@ export function FleetOverviewPanel() {
   const [rows, setRows] = useState<PulseComputer[]>([])
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
+  // computer.name → CPU% history series (last ~hour, ~60 points).
+  const [history, setHistory] = useState<Record<string, number[]>>({})
+  // Deduplicate in-flight history fetches per computer.
+  const historyInflight = useRef<Set<string>>(new Set())
 
   const load = useCallback(async () => {
     try {
@@ -112,28 +86,63 @@ export function FleetOverviewPanel() {
     }
   }, [])
 
+  const loadHistoryFor = useCallback(async (name: string) => {
+    if (historyInflight.current.has(name)) return
+    historyInflight.current.add(name)
+    try {
+      const data = await getJson<{ points: MetricPoint[] }>(
+        `/api/metrics/${encodeURIComponent(name)}/history?hours=1`,
+      )
+      const series = (data.points ?? [])
+        .map((p) => (typeof p.cpu_pct === 'number' ? p.cpu_pct : null))
+        .filter((v): v is number => v !== null)
+      setHistory((h) => ({ ...h, [name]: series }))
+    } catch {
+      // Leave existing series in place; the sparkline will show the
+      // "not enough data" dashed line if we have <2 points.
+    } finally {
+      historyInflight.current.delete(name)
+    }
+  }, [])
+
   useEffect(() => {
     void load()
     const i = setInterval(() => void load(), 10_000)
     return () => clearInterval(i)
   }, [load])
 
+  // When the list of computers changes, fetch history for any we don't
+  // have yet. Also refresh history every 5 minutes so the sparkline
+  // stays current.
+  useEffect(() => {
+    for (const c of rows) {
+      if (history[c.name] === undefined) void loadHistoryFor(c.name)
+    }
+    const i = setInterval(() => {
+      for (const c of rows) void loadHistoryFor(c.name)
+    }, 300_000)
+    return () => clearInterval(i)
+  }, [rows, history, loadHistoryFor])
+
+  // Real-time fleet events: refresh computer list on member transitions.
+  const { live } = useFleetEvents((evt) => {
+    if (evt.subject.startsWith('fleet.events.member.')) {
+      void load()
+    }
+  })
+
   return (
     <section className="space-y-4">
-      <div className="flex items-center justify-between">
-        <div>
-          <h2 className="text-xl font-semibold text-zinc-100">Fleet Overview</h2>
-          <p className="text-sm text-zinc-500">
-            {rows.length} computer{rows.length === 1 ? '' : 's'} enrolled
-          </p>
-        </div>
-        <button
-          onClick={() => void load()}
-          className="rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-sm text-zinc-400 hover:text-zinc-200"
-        >
-          Refresh
-        </button>
-      </div>
+      <PanelHeader
+        title="Fleet Overview"
+        subtitle={`${rows.length} computer${rows.length === 1 ? '' : 's'} enrolled`}
+        rightSlot={
+          <>
+            <LiveIndicator live={live} />
+            <RefreshButton onClick={() => void load()} />
+          </>
+        }
+      />
 
       {error && (
         <div className="rounded-xl border border-rose-500/20 bg-rose-500/5 px-4 py-3 text-sm text-rose-300">
@@ -145,73 +154,85 @@ export function FleetOverviewPanel() {
         <div className="text-sm text-zinc-500">Loading…</div>
       ) : (
         <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-          {rows.map((c) => (
-            <article
-              key={c.id}
-              className="rounded-xl border border-zinc-800 bg-zinc-900/70 p-4 shadow-sm"
-            >
-              <div className="mb-3 flex items-center justify-between">
-                <div className="flex items-center gap-2">
-                  <span className={`h-2.5 w-2.5 rounded-full ${statusDot(c.status)}`} />
-                  <div>
-                    <h3 className="text-base font-semibold text-zinc-100">{c.name}</h3>
-                    <p className="text-xs text-zinc-500">
-                      {c.primary_ip}
-                      {c.os_distribution ? ` • ${c.os_distribution}` : ''}
-                    </p>
+          {rows.map((c) => {
+            const series = history[c.name] ?? []
+            return (
+              <article
+                key={c.id}
+                className="rounded-xl border border-zinc-800 bg-zinc-900/50 p-4 shadow-sm"
+              >
+                <div className="mb-3 flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <StatusDot status={c.status} />
+                    <div>
+                      <h3 className="text-base font-semibold text-zinc-100">{c.name}</h3>
+                      <p className="text-xs text-zinc-500">
+                        {c.primary_ip}
+                        {c.os_distribution ? ` • ${c.os_distribution}` : ''}
+                      </p>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-1">
+                    <StatusBadge status={c.status} />
+                    {c.member_role && (
+                      <StatusBadge
+                        tone={toneFor(c.member_role)}
+                        status={c.member_role}
+                      />
+                    )}
                   </div>
                 </div>
-                <div className="flex items-center gap-1">
-                  <span
-                    className={`rounded-full border px-2 py-0.5 text-[11px] ${statusBadge(c.status)}`}
-                  >
-                    {c.status}
-                  </span>
-                  {c.member_role && (
-                    <span
-                      className={`rounded-full border px-2 py-0.5 text-[11px] ${roleBadge(c.member_role)}`}
-                    >
-                      {c.member_role}
-                    </span>
-                  )}
-                </div>
-              </div>
 
-              <div className="space-y-2">
-                <Bar label="CPU" pct={c.latest_cpu_pct} />
-                <Bar label="RAM" pct={c.latest_ram_pct} />
-              </div>
+                <div className="space-y-2">
+                  <Bar label="CPU" pct={c.latest_cpu_pct} />
+                  <Bar label="RAM" pct={c.latest_ram_pct} />
+                </div>
 
-              <dl className="mt-3 grid grid-cols-2 gap-2 text-xs">
-                <div>
-                  <dt className="text-zinc-500">Cores / RAM</dt>
-                  <dd className="text-zinc-300">
-                    {c.cpu_cores ?? '—'} / {c.total_ram_gb ?? '—'}G
-                  </dd>
+                <div className="mt-3 flex items-center justify-between gap-2 rounded-lg border border-zinc-800/80 bg-zinc-950/40 px-2 py-1.5">
+                  <div className="text-[10px] uppercase tracking-wider text-zinc-500">
+                    CPU · 1h
+                  </div>
+                  <Sparkline
+                    data={series}
+                    width={100}
+                    height={20}
+                    yMin={0}
+                    yMax={100}
+                    title={`CPU% over the last hour on ${c.name}`}
+                  />
                 </div>
-                <div>
-                  <dt className="text-zinc-500">GPU</dt>
-                  <dd className="text-zinc-300">
-                    {c.has_gpu
-                      ? `${c.gpu_kind ?? 'gpu'}${c.gpu_total_vram_gb ? ` ${c.gpu_total_vram_gb.toFixed(0)}G` : ''}`
-                      : 'none'}
-                  </dd>
-                </div>
-                <div>
-                  <dt className="text-zinc-500">LLM servers</dt>
-                  <dd className="text-zinc-300">{c.active_deployment_count}</dd>
-                </div>
-                <div>
-                  <dt className="text-zinc-500">Disk free</dt>
-                  <dd className="text-zinc-300">
-                    {c.latest_disk_free_gb == null
-                      ? '—'
-                      : `${c.latest_disk_free_gb.toFixed(0)}G`}
-                  </dd>
-                </div>
-              </dl>
-            </article>
-          ))}
+
+                <dl className="mt-3 grid grid-cols-2 gap-2 text-xs">
+                  <div>
+                    <dt className="text-zinc-500">Cores / RAM</dt>
+                    <dd className="text-zinc-300">
+                      {c.cpu_cores ?? '—'} / {c.total_ram_gb ?? '—'}G
+                    </dd>
+                  </div>
+                  <div>
+                    <dt className="text-zinc-500">GPU</dt>
+                    <dd className="text-zinc-300">
+                      {c.has_gpu
+                        ? `${c.gpu_kind ?? 'gpu'}${c.gpu_total_vram_gb ? ` ${c.gpu_total_vram_gb.toFixed(0)}G` : ''}`
+                        : 'none'}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt className="text-zinc-500">LLM servers</dt>
+                    <dd className="text-zinc-300">{c.active_deployment_count}</dd>
+                  </div>
+                  <div>
+                    <dt className="text-zinc-500">Disk free</dt>
+                    <dd className="text-zinc-300">
+                      {c.latest_disk_free_gb == null
+                        ? '—'
+                        : `${c.latest_disk_free_gb.toFixed(0)}G`}
+                    </dd>
+                  </div>
+                </dl>
+              </article>
+            )
+          })}
         </div>
       )}
     </section>

@@ -42,6 +42,12 @@ pub enum BenchError {
     Parse(String),
 }
 
+/// Minimum tokens-per-second a benchmark must achieve to count as "passing".
+/// Any real model — even 7B quantised on CPU — should sustain >5 tok/s.
+/// Anything slower is almost always a misconfigured/overloaded server and
+/// should block auto-promotion to `active`.
+pub const BENCH_PASS_MIN_TPS: f64 = 5.0;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BenchmarkReport {
     pub model_id: String,
@@ -57,6 +63,18 @@ pub struct BenchmarkReport {
     pub mmlu_sample_accuracy: Option<f32>,
     pub prompt_count: u32,
     pub timestamp: String,
+    /// True iff the benchmark met the "good enough for production" bar.
+    ///
+    /// Pass criteria (all must hold):
+    ///   1. `tokens_per_sec >= BENCH_PASS_MIN_TPS` (5.0 tok/s).
+    ///   2. At least one prompt produced a non-empty response
+    ///      (`context_tokens_max > 0` after the suite runs).
+    ///   3. No HTTP/parse errors bubbled out of the suite (implicit:
+    ///      if we built a `BenchmarkReport` at all, `benchmark()` made
+    ///      it through every prompt without returning `Err`).
+    pub bench_pass: bool,
+    /// Human-readable reason when `bench_pass == false`; empty on success.
+    pub bench_pass_reason: String,
 }
 
 pub struct ModelBenchmarker {
@@ -142,6 +160,24 @@ impl ModelBenchmarker {
             0.0
         };
 
+        // Compute pass/fail per the contract documented on BenchmarkReport.
+        let (bench_pass, bench_pass_reason) = if tokens_per_sec < BENCH_PASS_MIN_TPS {
+            (
+                false,
+                format!(
+                    "tokens_per_sec {:.2} < threshold {:.2}",
+                    tokens_per_sec, BENCH_PASS_MIN_TPS
+                ),
+            )
+        } else if max_ctx == 0 && total_gen_tokens == 0 {
+            (
+                false,
+                "no prompt produced a non-empty response".to_string(),
+            )
+        } else {
+            (true, String::new())
+        };
+
         let report = BenchmarkReport {
             model_id: model_id.into(),
             computer: computer.into(),
@@ -155,6 +191,8 @@ impl ModelBenchmarker {
             mmlu_sample_accuracy: None,
             prompt_count: n,
             timestamp: chrono::Utc::now().to_rfc3339(),
+            bench_pass,
+            bench_pass_reason,
         };
 
         // Persist.
@@ -261,6 +299,130 @@ fn standard_prompt_suite() -> Vec<String> {
     ]
 }
 
+/// Row shape we need to decide whether a model can run on a given node.
+struct CatalogReqs {
+    required_gpu_kind: Option<String>,
+    min_vram_gb: Option<f64>,
+    file_size_gb: Option<f64>,
+}
+
+async fn fetch_catalog_reqs(
+    pool: &PgPool,
+    model_id: &str,
+) -> Result<Option<CatalogReqs>, BenchError> {
+    let row = sqlx::query(
+        "SELECT required_gpu_kind, min_vram_gb, file_size_gb
+           FROM model_catalog
+          WHERE id = $1",
+    )
+    .bind(model_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| {
+        use sqlx::Row as _;
+        CatalogReqs {
+            required_gpu_kind: r.get("required_gpu_kind"),
+            min_vram_gb: r.get("min_vram_gb"),
+            file_size_gb: r.get("file_size_gb"),
+        }
+    }))
+}
+
+fn gpu_priority(kind: &str) -> u8 {
+    match kind {
+        // Apple silicon is preferred for MLX workloads and generally the
+        // fastest per-watt option in this fleet.
+        "apple_silicon" => 1,
+        "nvidia_cuda" => 2,
+        "amd_rocm" => 3,
+        "integrated" => 4,
+        _ => 5, // "none" or unknown
+    }
+}
+
+/// Pick the best node in the fleet to run a benchmark for `model_id`.
+///
+/// Filters (per spec):
+///   - `gpu_kind` matches `model_catalog.required_gpu_kind` if one is set;
+///     otherwise prefers GPU members over CPU-only ones.
+///   - `ram_gb` is at least `min_vram_gb` (used as a coarse "does it fit
+///     in memory" check for CPU-only runs when `required_gpu_kind IS NULL`).
+///   - `disk_free_gb` is at least `file_size_gb + 5` so the model can be
+///     staged on disk if it isn't already.
+///
+/// Ordering:
+///   1. GPU priority (apple_silicon < nvidia_cuda < amd_rocm < integrated < none).
+///   2. Lowest `cpu_pct` (least loaded).
+///
+/// Returns `Ok(None)` if the catalog row is missing or no node qualifies.
+pub async fn pick_benchmark_target(
+    pool: &PgPool,
+    pulse: &PulseReader,
+    model_id: &str,
+) -> Result<Option<String>, BenchError> {
+    let reqs = match fetch_catalog_reqs(pool, model_id).await? {
+        Some(r) => r,
+        None => return Ok(None),
+    };
+
+    let beats = pulse
+        .all_beats()
+        .await
+        .map_err(|e| BenchError::Pulse(e.to_string()))?;
+
+    // (name, gpu_priority, cpu_pct)
+    let mut candidates: Vec<(String, u8, f64)> = Vec::new();
+
+    for b in beats {
+        if b.going_offline || b.maintenance_mode {
+            continue;
+        }
+
+        let gpu_kind = b.capabilities.gpu_kind.as_str();
+
+        // GPU-kind filter.
+        match reqs.required_gpu_kind.as_deref() {
+            Some(required) if !required.is_empty() => {
+                if gpu_kind != required {
+                    continue;
+                }
+            }
+            _ => {
+                // No hard requirement — we'll still rank by gpu_priority
+                // below so GPU nodes naturally win ties against CPU nodes.
+            }
+        }
+
+        // RAM fit check (used as "does the model fit?").
+        if let Some(min_vram) = reqs.min_vram_gb {
+            if (b.hardware.ram_gb as f64) < min_vram {
+                continue;
+            }
+        }
+
+        // Disk headroom check: file_size + 5GB slack.
+        if let Some(fs_gb) = reqs.file_size_gb {
+            if b.load.disk_free_gb < fs_gb + 5.0 {
+                continue;
+            }
+        }
+
+        candidates.push((
+            b.computer_name.clone(),
+            gpu_priority(gpu_kind),
+            b.load.cpu_pct,
+        ));
+    }
+
+    // Sort: lower gpu_priority wins, then lower cpu_pct wins.
+    candidates.sort_by(|a, b| {
+        a.1.cmp(&b.1)
+            .then_with(|| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
+    });
+
+    Ok(candidates.into_iter().next().map(|(name, _, _)| name))
+}
+
 /// Light wrapper to run a benchmark without an existing PulseReader.
 /// Builds one on the fly from the `FORGEFLEET_REDIS_URL` env or
 /// `redis://127.0.0.1:6379` default.
@@ -284,4 +446,47 @@ pub async fn benchmark_with_defaults(
         }
         Err(e)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gpu_priority_ordering_prefers_apple_then_cuda_then_cpu() {
+        assert!(gpu_priority("apple_silicon") < gpu_priority("nvidia_cuda"));
+        assert!(gpu_priority("nvidia_cuda") < gpu_priority("amd_rocm"));
+        assert!(gpu_priority("amd_rocm") < gpu_priority("integrated"));
+        assert!(gpu_priority("integrated") < gpu_priority("none"));
+        assert_eq!(gpu_priority("unknown_kind"), gpu_priority("none"));
+    }
+
+    #[test]
+    fn bench_pass_threshold_is_five_tps() {
+        assert_eq!(BENCH_PASS_MIN_TPS, 5.0);
+    }
+
+    #[test]
+    fn bench_report_with_pass_fields_roundtrips_json() {
+        let r = BenchmarkReport {
+            model_id: "x".into(),
+            computer: "taylor".into(),
+            runtime: "mlx_lm".into(),
+            endpoint: "http://127.0.0.1:51001".into(),
+            tokens_per_sec: 42.5,
+            ttft_ms: 80,
+            context_tokens_max: 321,
+            prompt_eval_rate: 120.0,
+            generation_rate: 42.5,
+            mmlu_sample_accuracy: None,
+            prompt_count: 5,
+            timestamp: "2026-04-18T00:00:00Z".into(),
+            bench_pass: true,
+            bench_pass_reason: String::new(),
+        };
+        let s = serde_json::to_string(&r).unwrap();
+        let back: BenchmarkReport = serde_json::from_str(&s).unwrap();
+        assert!(back.bench_pass);
+        assert_eq!(back.tokens_per_sec, 42.5);
+    }
 }

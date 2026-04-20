@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { getJson } from '../lib/api'
+import { PanelHeader, RefreshButton } from './PanelHeader'
+import { StatusBadge, toneFor } from './StatusBadge'
 
 type Replica = {
   computer_id: string
@@ -43,32 +45,16 @@ function ageString(s?: number | null): string {
   return `${Math.floor(s / 86400)}d ago`
 }
 
-function roleBadge(role: string): string {
+function roleTone(role: string) {
   switch (role) {
     case 'primary':
-      return 'bg-violet-500/15 text-violet-300 border-violet-500/30'
+      return toneFor('leader')
     case 'replica':
-      return 'bg-sky-500/15 text-sky-300 border-sky-500/30'
+      return toneFor('info')
     case 'sentinel_voter':
-      return 'bg-amber-500/15 text-amber-300 border-amber-500/30'
+      return toneFor('warning')
     default:
-      return 'bg-zinc-800 text-zinc-400 border-zinc-700'
-  }
-}
-
-function statusBadge(status: string): string {
-  switch (status) {
-    case 'running':
-      return 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
-    case 'syncing':
-      return 'bg-sky-500/15 text-sky-300 border-sky-500/30'
-    case 'promoting':
-      return 'bg-amber-500/15 text-amber-300 border-amber-500/30'
-    case 'failed':
-    case 'stopped':
-      return 'bg-rose-500/15 text-rose-300 border-rose-500/30'
-    default:
-      return 'bg-zinc-800 text-zinc-400 border-zinc-700'
+      return toneFor('')
   }
 }
 
@@ -101,18 +87,11 @@ export function DbHaPanel() {
 
   return (
     <section className="space-y-6">
-      <div className="flex items-center justify-between">
-        <div>
-          <h2 className="text-xl font-semibold text-zinc-100">Database HA</h2>
-          <p className="text-sm text-zinc-500">Replication + backups</p>
-        </div>
-        <button
-          onClick={() => void load()}
-          className="rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-sm text-zinc-400 hover:text-zinc-200"
-        >
-          Refresh
-        </button>
-      </div>
+      <PanelHeader
+        title="Database HA"
+        subtitle="Replication + backups"
+        rightSlot={<RefreshButton onClick={() => void load()} />}
+      />
 
       {error && (
         <div className="rounded-xl border border-rose-500/20 bg-rose-500/5 px-4 py-3 text-sm text-rose-300">
@@ -122,12 +101,12 @@ export function DbHaPanel() {
 
       {/* Replicas */}
       <div>
-        <h3 className="mb-2 text-sm font-semibold uppercase tracking-wide text-zinc-400">
+        <h3 className="mb-2 text-xs uppercase tracking-wider text-zinc-500">
           Replicas
         </h3>
         <div className="overflow-hidden rounded-xl border border-zinc-800">
           <table className="w-full text-sm">
-            <thead className="bg-zinc-900/80 text-left text-xs uppercase tracking-wide text-zinc-500">
+            <thead className="bg-zinc-900/80 text-left text-xs uppercase tracking-wider text-zinc-500">
               <tr>
                 <th className="px-3 py-2">Kind</th>
                 <th className="px-3 py-2">Role</th>
@@ -146,22 +125,14 @@ export function DbHaPanel() {
                 >
                   <td className="px-3 py-2 text-zinc-300">{r.database_kind}</td>
                   <td className="px-3 py-2">
-                    <span
-                      className={`rounded-full border px-2 py-0.5 text-[11px] ${roleBadge(r.role)}`}
-                    >
-                      {r.role}
-                    </span>
+                    <StatusBadge tone={roleTone(r.role)} status={r.role} />
                   </td>
                   <td className="px-3 py-2 text-zinc-100">
                     {r.computer_name}
                     <div className="text-[11px] text-zinc-500">{r.primary_ip}</div>
                   </td>
                   <td className="px-3 py-2">
-                    <span
-                      className={`rounded-full border px-2 py-0.5 text-[11px] ${statusBadge(r.status)}`}
-                    >
-                      {r.status}
-                    </span>
+                    <StatusBadge status={r.status} />
                   </td>
                   <td className="px-3 py-2 text-zinc-400">{bytes(r.lag_bytes)}</td>
                   <td className="px-3 py-2 text-zinc-400">
@@ -184,12 +155,12 @@ export function DbHaPanel() {
 
       {/* Backups */}
       <div>
-        <h3 className="mb-2 text-sm font-semibold uppercase tracking-wide text-zinc-400">
+        <h3 className="mb-2 text-xs uppercase tracking-wider text-zinc-500">
           Recent Backups
         </h3>
         <div className="overflow-hidden rounded-xl border border-zinc-800">
           <table className="w-full text-sm">
-            <thead className="bg-zinc-900/80 text-left text-xs uppercase tracking-wide text-zinc-500">
+            <thead className="bg-zinc-900/80 text-left text-xs uppercase tracking-wider text-zinc-500">
               <tr>
                 <th className="px-3 py-2">File</th>
                 <th className="px-3 py-2">Kind</th>
@@ -215,9 +186,9 @@ export function DbHaPanel() {
                   <td className="px-3 py-2 text-zinc-400">{b.retention_tier}</td>
                   <td className="px-3 py-2 text-zinc-400">
                     {b.verified_restorable_at ? (
-                      <span className="text-emerald-300">✓</span>
+                      <span className="text-emerald-400">ok</span>
                     ) : (
-                      <span className="text-zinc-600">—</span>
+                      <span className="text-zinc-500">—</span>
                     )}
                   </td>
                 </tr>

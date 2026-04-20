@@ -326,6 +326,25 @@ enum FleetDbCommand {
         #[arg(long, default_value_t = false)]
         skip_probe: bool,
     },
+    /// Manually trigger a Postgres failover — promote the replica on
+    /// `--to <computer>` to primary. This calls the same code path as the
+    /// automatic failover that runs inside `leader_tick`.
+    ///
+    /// Intended for planned cutovers or recovering from a stuck auto
+    /// failover. Must be run on the target computer (the new primary).
+    Failover {
+        /// Name of the computer whose local replica should be promoted.
+        /// Must match `hostname` / `fleet_nodes.name`.
+        #[arg(long = "to")]
+        to: String,
+        /// Proceed even if the target isn't the current ForgeFleet leader
+        /// and/or fencing the old primary fails.
+        #[arg(long, default_value_t = false)]
+        force: bool,
+        /// Skip the interactive confirmation prompt.
+        #[arg(long, default_value_t = false)]
+        yes: bool,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -631,9 +650,22 @@ enum ModelCommand {
         #[arg(long, default_value_t = false)] json: bool,
     },
     /// Promote a candidate row to `lifecycle_status='active'`.
+    ///
+    /// Default behavior: picks a compatible node (GPU first, then CPU) and
+    /// runs the benchmark suite. The candidate is only promoted if the
+    /// benchmark passes (tokens_per_sec >= 5 AND non-empty response AND
+    /// no errors). Pass `--skip-benchmark` (or `--force`) to bypass and
+    /// promote immediately.
     Approve {
         /// Catalog id.
         id: String,
+        /// Skip the benchmark gate and promote immediately.
+        #[arg(long, default_value_t = false)] skip_benchmark: bool,
+        /// Alias for `--skip-benchmark`.
+        #[arg(long, default_value_t = false)] force: bool,
+        /// Run the benchmark on a specific computer instead of
+        /// auto-picking. Ignored when `--skip-benchmark` is set.
+        #[arg(long)] on_computer: Option<String>,
     },
     /// Reject a candidate row: drops it from the catalog and appends the
     /// upstream_id (if set) to the scout denylist.
@@ -3647,7 +3679,109 @@ async fn handle_model(cmd: ModelCommand) -> Result<()> {
                 println!("Reject with:  ff model reject <id>");
             }
         }
-        ModelCommand::Approve { id } => {
+        ModelCommand::Approve { id, skip_benchmark, force, on_computer } => {
+            // 1. Verify the candidate exists and is still in review.
+            let row = sqlx::query(
+                "SELECT lifecycle_status FROM model_catalog WHERE id = $1",
+            )
+            .bind(&id)
+            .fetch_optional(&pool)
+            .await?;
+            let Some(row) = row else {
+                anyhow::bail!("no catalog row found for id '{id}'");
+            };
+            let status: String = sqlx::Row::get(&row, "lifecycle_status");
+            if status != "candidate" {
+                anyhow::bail!(
+                    "model '{id}' is in lifecycle_status='{status}' — only 'candidate' rows can be approved"
+                );
+            }
+
+            let skip = skip_benchmark || force;
+            let mut bench_summary: Option<ff_agent::model_benchmark::BenchmarkReport> = None;
+
+            // 2. Benchmark gate (unless skipped).
+            if !skip {
+                // Open a Pulse reader so we can pick a target and find
+                // any healthy loaded endpoint.
+                let redis_url = std::env::var("FORGEFLEET_REDIS_URL")
+                    .unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+                let pulse = match ff_pulse::reader::PulseReader::new(&redis_url) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        anyhow::bail!(
+                            "can't open Pulse at {redis_url}: {e}\n\
+                             Either fix Redis connectivity, or re-run with --skip-benchmark."
+                        );
+                    }
+                };
+
+                // Pick the target computer.
+                let target = if let Some(c) = on_computer.clone() {
+                    c
+                } else {
+                    match ff_agent::model_benchmark::pick_benchmark_target(
+                        &pool, &pulse, &id,
+                    )
+                    .await
+                    {
+                        Ok(Some(n)) => n,
+                        Ok(None) => {
+                            anyhow::bail!(
+                                "no compatible node found to benchmark '{id}' \
+                                 (check required_gpu_kind / min_vram_gb / file_size_gb \
+                                 vs live Pulse beats). \
+                                 Use --on-computer <name> to force one, or \
+                                 --skip-benchmark to approve without benchmarking."
+                            );
+                        }
+                        Err(e) => anyhow::bail!("pick_benchmark_target failed: {e}"),
+                    }
+                };
+
+                println!(
+                    "{CYAN}→{RESET} Benchmarking '{id}' on '{target}' before promotion…"
+                );
+
+                let bencher = ff_agent::model_benchmark::ModelBenchmarker::new(
+                    pool.clone(),
+                    pulse,
+                );
+                match bencher.benchmark(&id, &target).await {
+                    Ok(report) => {
+                        if !report.bench_pass {
+                            eprintln!(
+                                "{RED}✗ Benchmark failed:{RESET} {}\n  \
+                                 tokens/sec: {:.2}\n  \
+                                 ttft (ms):  {}\n  \
+                                 endpoint:   {}\n\n\
+                                 Inspect results with: ff model benchmarks --model {id}\n\
+                                 Force anyway with:     ff model approve {id} --skip-benchmark",
+                                report.bench_pass_reason,
+                                report.tokens_per_sec,
+                                report.ttft_ms,
+                                report.endpoint,
+                            );
+                            std::process::exit(1);
+                        }
+                        bench_summary = Some(report);
+                    }
+                    Err(ff_agent::model_benchmark::BenchError::NotLoaded(m, c)) => {
+                        eprintln!(
+                            "{RED}✗ Cannot benchmark:{RESET} model '{m}' is not loaded \
+                             on '{c}' (no active+healthy LLM server found in Pulse).\n\n\
+                             Either:\n  \
+                               • load it first:   ff model load <library_id> --port 51001\n  \
+                               • pick a node that has it loaded: --on-computer <name>\n  \
+                               • skip the benchmark: --skip-benchmark"
+                        );
+                        std::process::exit(1);
+                    }
+                    Err(e) => anyhow::bail!("benchmark error: {e}"),
+                }
+            }
+
+            // 3. Promote to active (idempotent-safe: we re-check the gate).
             let result = sqlx::query(
                 "UPDATE model_catalog
                     SET lifecycle_status = 'active'
@@ -3657,9 +3791,23 @@ async fn handle_model(cmd: ModelCommand) -> Result<()> {
             .execute(&pool)
             .await?;
             if result.rows_affected() == 0 {
-                anyhow::bail!("no candidate row found for id '{id}' (already approved or never existed)");
+                anyhow::bail!(
+                    "race: candidate '{id}' was changed by someone else during approval"
+                );
             }
+
+            // 4. Report.
             println!("{GREEN}✓{RESET} Promoted '{id}' to lifecycle_status='active'");
+            if let Some(r) = bench_summary {
+                println!("  benchmark pass:   yes");
+                println!("  computer:         {}", r.computer);
+                println!("  endpoint:         {}", r.endpoint);
+                println!("  tokens/sec:       {:.2}", r.tokens_per_sec);
+                println!("  ttft (ms):        {}", r.ttft_ms);
+                println!("  prompts:          {}", r.prompt_count);
+            } else {
+                println!("  benchmark pass:   (skipped)");
+            }
         }
         ModelCommand::Reject { id } => {
             let row = sqlx::query(
@@ -4472,7 +4620,65 @@ async fn handle_fleet_db(
             println!();
             println!("Full runbook: deploy/WAN_REPLICATION.md");
         }
+        FleetDbCommand::Failover { to, force, yes } => {
+            handle_fleet_db_failover(pool, &to, force, yes).await?;
+        }
     }
+    Ok(())
+}
+
+async fn handle_fleet_db_failover(
+    pool: &sqlx::PgPool,
+    to: &str,
+    force: bool,
+    yes: bool,
+) -> Result<()> {
+    // 1) Resolve target computer_id.
+    let target = sqlx::query_as::<_, (uuid::Uuid, String, String)>(
+        "SELECT id, name, primary_ip FROM computers WHERE LOWER(name) = LOWER($1)",
+    )
+    .bind(to)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("query computers: {e}"))?
+    .ok_or_else(|| anyhow::anyhow!("no computer named '{to}' registered"))?;
+    let (target_id, target_name, target_ip) = target;
+
+    // 2) Must be running on the target (we shell `docker exec` locally).
+    let my_name = ff_agent::fleet_info::resolve_this_node_name().await;
+    if my_name.to_lowercase() != target_name.to_lowercase() && !force {
+        anyhow::bail!(
+            "refusing to failover: this command must be run ON '{target_name}' \
+             (we'd shell `docker exec` locally). Current node is '{my_name}'. \
+             Re-run with --force to override or ssh to '{target_name}' first."
+        );
+    }
+
+    // 3) Confirm with user.
+    if !yes {
+        eprintln!(
+            "{YELLOW}About to promote '{target_name}' ({target_ip}) to Postgres primary.{RESET}"
+        );
+        eprintln!(
+            "  - The old primary's docker container will be stopped via SSH."
+        );
+        eprintln!(
+            "  - database_replicas + fleet_secrets.postgres_primary_url will be rewritten."
+        );
+        eprintln!(
+            "  - All fleet daemons will reconnect against the new primary."
+        );
+        eprintln!("Re-run with --yes to confirm.");
+        std::process::exit(2);
+    }
+
+    println!("{CYAN}▶ Promoting '{target_name}' replica to primary...{RESET}");
+    let mgr = ff_agent::ha::pg_failover::PostgresFailoverManager::new(pool.clone(), target_id)
+        .with_strict_fencing(!force);
+    mgr.promote_local_replica()
+        .await
+        .map_err(|e| anyhow::anyhow!("promote: {e}"))?;
+    println!("{GREEN}✓{RESET} '{target_name}' is now the Postgres primary.");
     Ok(())
 }
 

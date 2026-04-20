@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { getJson } from '../lib/api'
+import { PanelHeader, RefreshButton } from './PanelHeader'
+import { StatusBadge } from './StatusBadge'
 
 type LlmServer = {
   id: string
@@ -22,21 +24,6 @@ type LlmServer = {
   started_at?: string | null
   queue_depth?: number | null
   tokens_per_sec?: number | null
-}
-
-function statusBadge(status: string): string {
-  switch (status) {
-    case 'active':
-      return 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
-    case 'idle':
-      return 'bg-sky-500/15 text-sky-300 border-sky-500/30'
-    case 'loading':
-      return 'bg-amber-500/15 text-amber-300 border-amber-500/30'
-    case 'error':
-      return 'bg-rose-500/15 text-rose-300 border-rose-500/30'
-    default:
-      return 'bg-zinc-800 text-zinc-300 border-zinc-700'
-  }
 }
 
 export function LlmTopologyPanel() {
@@ -64,20 +51,11 @@ export function LlmTopologyPanel() {
 
   return (
     <section className="space-y-4">
-      <div className="flex items-center justify-between">
-        <div>
-          <h2 className="text-xl font-semibold text-zinc-100">LLM Topology</h2>
-          <p className="text-sm text-zinc-500">
-            {rows.length} active deployment{rows.length === 1 ? '' : 's'} fleet-wide
-          </p>
-        </div>
-        <button
-          onClick={() => void load()}
-          className="rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-sm text-zinc-400 hover:text-zinc-200"
-        >
-          Refresh
-        </button>
-      </div>
+      <PanelHeader
+        title="LLM Topology"
+        subtitle={`${rows.length} active deployment${rows.length === 1 ? '' : 's'} fleet-wide`}
+        rightSlot={<RefreshButton onClick={() => void load()} />}
+      />
 
       {error && (
         <div className="rounded-xl border border-rose-500/20 bg-rose-500/5 px-4 py-3 text-sm text-rose-300">
@@ -90,7 +68,7 @@ export function LlmTopologyPanel() {
       ) : (
         <div className="overflow-hidden rounded-xl border border-zinc-800">
           <table className="w-full text-sm">
-            <thead className="bg-zinc-900/80 text-left text-xs uppercase tracking-wide text-zinc-500">
+            <thead className="bg-zinc-900/80 text-left text-xs uppercase tracking-wider text-zinc-500">
               <tr>
                 <th className="px-3 py-2">Computer</th>
                 <th className="px-3 py-2">Model</th>
@@ -133,13 +111,7 @@ export function LlmTopologyPanel() {
                     {s.tokens_per_sec == null ? '—' : s.tokens_per_sec.toFixed(1)}
                   </td>
                   <td className="px-3 py-2">
-                    <span
-                      className={`rounded-full border px-2 py-0.5 text-[11px] ${statusBadge(
-                        s.status,
-                      )}`}
-                    >
-                      {s.status}
-                    </span>
+                    <StatusBadge status={s.status} />
                   </td>
                 </tr>
               ))}

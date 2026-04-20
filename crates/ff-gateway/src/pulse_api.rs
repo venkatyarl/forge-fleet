@@ -8,16 +8,24 @@
 //! They return shapes tuned for the dashboard panels — no attempt to be a
 //! general-purpose REST API.
 
+use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     Json,
     extract::{Path, Query, State},
     http::StatusCode,
+    response::{
+        IntoResponse, Response,
+        sse::{Event, KeepAlive, Sse},
+    },
 };
+use futures::stream::Stream;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sqlx::Row;
+use tokio_stream::wrappers::ReceiverStream;
 
 use crate::server::GatewayState;
 
@@ -1075,4 +1083,80 @@ pub async fn docker_projects(
         .collect();
 
     Ok(Json(json!({ "projects": projects })))
+}
+
+// ─── /api/events/stream ────────────────────────────────────────────────
+//
+// SSE endpoint bridging NATS `fleet.events.>` into HTTP. Each inbound
+// NATS message is fanned out as a single `data: { ... }` SSE line with
+// a JSON envelope `{ subject, payload, received_at }`.
+//
+// Returns 503 with a JSON error if NATS isn't reachable. The frontend
+// (`useFleetEvents`) treats 503 as a signal to keep polling.
+
+pub async fn events_stream(
+    State(_state): State<Arc<GatewayState>>,
+) -> Result<Response, (StatusCode, Json<Value>)> {
+    // Open a NATS connection lazily via ff-pulse's shared client. Same
+    // URL resolution as the rest of the fleet (`FORGEFLEET_NATS_URL`).
+    let Some(client) = ff_pulse::nats::get_or_init_nats().await else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "nats unavailable",
+                "hint": "FORGEFLEET_NATS_URL is unreachable; frontend will fall back to polling",
+            })),
+        ));
+    };
+
+    // Subscribe to every fleet event subject. If the subscribe itself
+    // fails (e.g. server was up at connect-time but has since gone
+    // away), surface 503 too.
+    let mut sub = match client.subscribe("fleet.events.>").await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("pulse events_stream: NATS subscribe failed: {e}");
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": format!("nats subscribe failed: {e}")})),
+            ));
+        }
+    };
+
+    // Bridge NATS messages into an mpsc channel we can wrap as a stream.
+    // Bounded channel acts as back-pressure — if the client is slow we
+    // drop events rather than buffering unboundedly in server memory.
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(128);
+    tokio::spawn(async move {
+        use futures::StreamExt;
+        while let Some(msg) = sub.next().await {
+            let subject = msg.subject.to_string();
+            // Try to parse payload as JSON; fall back to raw string.
+            let payload: Value = serde_json::from_slice(&msg.payload)
+                .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&msg.payload).into()));
+            let envelope = json!({
+                "subject": subject,
+                "payload": payload,
+                "received_at": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            });
+            let event = Event::default().data(envelope.to_string());
+            if tx.send(Ok(event)).await.is_err() {
+                // Client disconnected.
+                break;
+            }
+        }
+    });
+
+    let stream: ReceiverStream<Result<Event, Infallible>> = ReceiverStream::new(rx);
+    // Cast to the `Stream` trait so axum can consume it.
+    let stream: Box<dyn Stream<Item = Result<Event, Infallible>> + Send + Unpin> =
+        Box::new(stream);
+
+    Ok(Sse::new(stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("ping"),
+        )
+        .into_response())
 }

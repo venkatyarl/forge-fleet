@@ -39,3 +39,6 @@ tokio-util = { version = "0.7", features = ["rt"] }
 rust-embed = "8"
 mime_guess = "2"
 sqlx.workspace = true
+async-nats = "0.37"
+futures = "0.3"
+tokio-stream = "0.1"

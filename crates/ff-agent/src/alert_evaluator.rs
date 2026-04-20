@@ -583,6 +583,43 @@ async fn dispatch_alert(pg: &PgPool, channel: &str, severity: &str, message: &st
             let Some(chat_id) = chat_id else {
                 return "failed: no openclaw.telegram_chat_id secret".into();
             };
+
+            // Prefer direct Telegram Bot API when a bot token is configured —
+            // no shell-out, works without openclaw installed, and gives us a
+            // clean place to extend (parse_mode, silent, etc). Fall back to
+            // `openclaw agent` otherwise (legacy path).
+            let bot_token = ff_db::pg_get_secret(pg, "openclaw.telegram_bot_token")
+                .await
+                .ok()
+                .flatten();
+
+            if let Some(token) = bot_token {
+                let url = format!("https://api.telegram.org/bot{token}/sendMessage");
+                let payload = serde_json::json!({
+                    "chat_id": chat_id,
+                    "text": format!("[{severity}] {message}"),
+                    "disable_web_page_preview": true,
+                });
+                let client = reqwest::Client::builder()
+                    .timeout(Duration::from_secs(10))
+                    .build()
+                    .unwrap_or_default();
+                return match client.post(&url).json(&payload).send().await {
+                    Ok(resp) if resp.status().is_success() => "sent".into(),
+                    Ok(resp) => {
+                        let status = resp.status();
+                        let body = resp.text().await.unwrap_or_default();
+                        format!("failed: telegram HTTP {status}: {}", body.trim())
+                    }
+                    Err(e) => format!("failed: telegram: {e}"),
+                };
+            }
+
+            // No bot token → try openclaw as a fallback. If openclaw is not
+            // installed either, we record that rather than crashing.
+            if channel == "telegram" {
+                return "failed: no bot token configured".into();
+            }
             let output = std::process::Command::new("openclaw")
                 .args([
                     "agent",
@@ -600,7 +637,7 @@ async fn dispatch_alert(pg: &PgPool, channel: &str, severity: &str, message: &st
                     out.status.code(),
                     String::from_utf8_lossy(&out.stderr).trim()
                 ),
-                Err(e) => format!("failed: spawn: {e}"),
+                Err(e) => format!("failed: spawn openclaw: {e}"),
             }
         }
         "webhook" => {

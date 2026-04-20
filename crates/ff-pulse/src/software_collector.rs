@@ -178,38 +178,30 @@ impl SoftwareCollector {
         }
 
         // ── mlx_lm (macOS only, via python3 -c) ────────────────────────
+        // Only record a version when `python3 -c "import mlx_lm; ..."` exits 0
+        // AND stdout is a clean short version string. If the module isn't
+        // installed, the command exits non-zero and we silently omit the row.
         if std::env::consts::OS == "macos" {
-            if let Some(ver) = run_allow_nonzero(
-                "python3",
-                &["-c", "import mlx_lm; print(mlx_lm.__version__)"],
-            ) {
-                let ver = ver.trim().to_string();
-                if !ver.is_empty() {
-                    out.push(InstalledSoftware {
-                        id: "mlx_lm".into(),
-                        version: ver,
-                        install_source: Some("pip".to_string()),
-                        install_path: None,
-                    });
-                }
+            if let Some(ver) = run_python_version_probe("mlx_lm") {
+                out.push(InstalledSoftware {
+                    id: "mlx_lm".into(),
+                    version: ver,
+                    install_source: Some("pip".to_string()),
+                    install_path: None,
+                });
             }
         }
 
         // ── vllm (Linux only, via python3 -c) ──────────────────────────
+        // Same guardrail as mlx_lm above — must exit 0 with a clean version.
         if std::env::consts::OS == "linux" {
-            if let Some(ver) = run_allow_nonzero(
-                "python3",
-                &["-c", "import vllm; print(vllm.__version__)"],
-            ) {
-                let ver = ver.trim().to_string();
-                if !ver.is_empty() {
-                    out.push(InstalledSoftware {
-                        id: "vllm".into(),
-                        version: ver,
-                        install_source: Some("pip".to_string()),
-                        install_path: None,
-                    });
-                }
+            if let Some(ver) = run_python_version_probe("vllm") {
+                out.push(InstalledSoftware {
+                    id: "vllm".into(),
+                    version: ver,
+                    install_source: Some("pip".to_string()),
+                    install_path: None,
+                });
             }
         }
 
@@ -321,6 +313,7 @@ fn run(cmd: &str, args: &[&str]) -> Option<String> {
 /// Like `run`, but accept non-zero exit status and use stdout+stderr. Useful
 /// for tools that report their version on stderr or exit non-zero on
 /// `--version`.
+#[allow(dead_code)]
 fn run_allow_nonzero(cmd: &str, args: &[&str]) -> Option<String> {
     let out = std::process::Command::new(cmd).args(args).output().ok()?;
     let mut s = String::from_utf8_lossy(&out.stdout).to_string();
@@ -329,6 +322,61 @@ fn run_allow_nonzero(cmd: &str, args: &[&str]) -> Option<String> {
     }
     let s = s.trim().to_string();
     if s.is_empty() { None } else { Some(s) }
+}
+
+/// Probe a Python module's `__version__` via `python3 -c`. Returns
+/// `Some(version)` ONLY when:
+/// 1. `python3` exits 0 (module imports successfully), AND
+/// 2. stdout passes [`sanitize_version`] (non-empty, single-line, no error
+///    markers, ≤ 64 chars).
+///
+/// Returns `None` in every other case — in particular, when the module isn't
+/// installed (which causes a `ModuleNotFoundError` traceback on stderr with
+/// exit code 1). This stops garbage like `"Traceback (most r..."` from leaking
+/// into the `computer_software.installed_version` column.
+fn run_python_version_probe(module: &str) -> Option<String> {
+    let script = format!("import {module}; print({module}.__version__)");
+    let output = std::process::Command::new("python3")
+        .args(["-c", &script])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    sanitize_version(&stdout)
+}
+
+/// Accept only sane-looking version strings. Rejects:
+/// - empty / whitespace-only
+/// - multi-line output (versions are one line)
+/// - anything > 64 chars (versions are always short)
+/// - substrings that indicate a failed probe: `Traceback`, `Error`, `error:`,
+///   `No module named`, `command not found`.
+fn sanitize_version(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.contains('\n') || trimmed.contains('\r') {
+        return None;
+    }
+    if trimmed.len() > 64 {
+        return None;
+    }
+    const BAD: &[&str] = &[
+        "Traceback",
+        "Error",
+        "error:",
+        "No module named",
+        "command not found",
+    ];
+    for marker in BAD {
+        if trimmed.contains(marker) {
+            return None;
+        }
+    }
+    Some(trimmed.to_string())
 }
 
 /// `which <bin>` — returns the resolved path on success.
@@ -503,6 +551,35 @@ mod tests {
             "expected at least one entry with id=ff or id=os-*; got: {:?}",
             items.iter().map(|i| &i.id).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn sanitize_version_accepts_clean_versions() {
+        assert_eq!(sanitize_version("0.6.3"), Some("0.6.3".to_string()));
+        assert_eq!(sanitize_version("  0.19.1\n"), Some("0.19.1".to_string()));
+        assert_eq!(sanitize_version("3.11.9"), Some("3.11.9".to_string()));
+    }
+
+    #[test]
+    fn sanitize_version_rejects_tracebacks_and_errors() {
+        // Python ModuleNotFoundError traceback — the exact bug we're fixing.
+        let tb = "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\nModuleNotFoundError: No module named 'vllm'";
+        assert_eq!(sanitize_version(tb), None);
+        assert_eq!(sanitize_version("Error: something broke"), None);
+        assert_eq!(sanitize_version("error: bad thing"), None);
+        assert_eq!(sanitize_version("No module named 'foo'"), None);
+        assert_eq!(sanitize_version("bash: vllm: command not found"), None);
+    }
+
+    #[test]
+    fn sanitize_version_rejects_multiline_and_long() {
+        assert_eq!(sanitize_version(""), None);
+        assert_eq!(sanitize_version("   "), None);
+        assert_eq!(sanitize_version("line1\nline2"), None);
+        let long = "x".repeat(65);
+        assert_eq!(sanitize_version(&long), None);
+        let sixty_four = "y".repeat(64);
+        assert_eq!(sanitize_version(&sixty_four), Some(sixty_four));
     }
 
     #[test]

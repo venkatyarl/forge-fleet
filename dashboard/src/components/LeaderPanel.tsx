@@ -1,5 +1,8 @@
 import { useCallback, useEffect, useState } from 'react'
 import { getJson } from '../lib/api'
+import { useFleetEvents } from '../lib/useFleetEvents'
+import { LiveIndicator, PanelHeader, RefreshButton } from './PanelHeader'
+import { StatusBadge } from './StatusBadge'
 
 type Leader = {
   computer_id: string
@@ -57,20 +60,28 @@ export function LeaderPanel() {
     return () => clearInterval(i)
   }, [load])
 
+  const { live } = useFleetEvents((evt) => {
+    if (
+      evt.subject.startsWith('fleet.events.leader_changed') ||
+      evt.subject.startsWith('fleet.events.leader.') ||
+      evt.subject.startsWith('fleet.events.member.')
+    ) {
+      void load()
+    }
+  })
+
   return (
     <section className="space-y-4">
-      <div className="flex items-center justify-between">
-        <div>
-          <h2 className="text-xl font-semibold text-zinc-100">Leader Election</h2>
-          <p className="text-sm text-zinc-500">Current leader + candidate ranking</p>
-        </div>
-        <button
-          onClick={() => void load()}
-          className="rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-sm text-zinc-400 hover:text-zinc-200"
-        >
-          Refresh
-        </button>
-      </div>
+      <PanelHeader
+        title="Leader Election"
+        subtitle="Current leader + candidate ranking"
+        rightSlot={
+          <>
+            <LiveIndicator live={live} />
+            <RefreshButton onClick={() => void load()} />
+          </>
+        }
+      />
 
       {error && (
         <div className="rounded-xl border border-rose-500/20 bg-rose-500/5 px-4 py-3 text-sm text-rose-300">
@@ -88,7 +99,7 @@ export function LeaderPanel() {
         <article className="rounded-xl border border-violet-500/30 bg-violet-500/5 p-5">
           <div className="flex items-center justify-between">
             <div>
-              <p className="text-xs uppercase tracking-wide text-violet-400">Leader</p>
+              <p className="text-xs uppercase tracking-wider text-violet-400">Leader</p>
               <h3 className="mt-1 text-2xl font-semibold text-zinc-100">
                 {leader.member_name}
               </h3>
@@ -97,7 +108,7 @@ export function LeaderPanel() {
               </p>
             </div>
             <div className="text-right">
-              <p className="text-xs uppercase tracking-wide text-zinc-500">Heartbeat</p>
+              <p className="text-xs uppercase tracking-wider text-zinc-500">Heartbeat</p>
               <p className={`mt-1 text-lg font-semibold ${heartbeatColor(leader.heartbeat_age_seconds)}`}>
                 {leader.heartbeat_age_seconds == null ? '—' : `${leader.heartbeat_age_seconds}s ago`}
               </p>
@@ -120,12 +131,12 @@ export function LeaderPanel() {
       )}
 
       <div>
-        <h3 className="mb-2 text-sm font-semibold uppercase tracking-wide text-zinc-400">
+        <h3 className="mb-2 text-xs uppercase tracking-wider text-zinc-500">
           Candidates (by priority)
         </h3>
         <div className="overflow-hidden rounded-xl border border-zinc-800">
           <table className="w-full text-sm">
-            <thead className="bg-zinc-900/80 text-left text-xs uppercase tracking-wide text-zinc-500">
+            <thead className="bg-zinc-900/80 text-left text-xs uppercase tracking-wider text-zinc-500">
               <tr>
                 <th className="px-3 py-2">#</th>
                 <th className="px-3 py-2">Name</th>
@@ -147,15 +158,15 @@ export function LeaderPanel() {
                     <td className="px-3 py-2 text-zinc-100">
                       {c.name}{' '}
                       {isLeader && (
-                        <span className="ml-1 rounded bg-violet-500/20 px-1.5 py-0.5 text-[10px] text-violet-300">
-                          leader
-                        </span>
+                        <StatusBadge tone="role-leader">leader</StatusBadge>
                       )}
                     </td>
                     <td className="px-3 py-2 text-zinc-400">{c.primary_ip}</td>
                     <td className="px-3 py-2 text-zinc-400">{c.role}</td>
                     <td className="px-3 py-2 text-zinc-300">{c.election_priority}</td>
-                    <td className="px-3 py-2 text-zinc-400">{c.status}</td>
+                    <td className="px-3 py-2">
+                      <StatusBadge status={c.status} />
+                    </td>
                   </tr>
                 )
               })}

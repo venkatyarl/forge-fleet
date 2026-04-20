@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { getJson } from '../lib/api'
+import { PanelHeader, RefreshButton } from './PanelHeader'
+import { StatusBadge } from './StatusBadge'
 
 type Container = {
   id: string
@@ -24,21 +26,6 @@ type DockerProject = {
   container_count: number
   running_count: number
   containers: Container[]
-}
-
-function statusColor(status: string): string {
-  switch (status) {
-    case 'running':
-      return 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
-    case 'paused':
-    case 'restarting':
-      return 'bg-amber-500/15 text-amber-300 border-amber-500/30'
-    case 'exited':
-    case 'stopped':
-      return 'bg-rose-500/15 text-rose-300 border-rose-500/30'
-    default:
-      return 'bg-zinc-800 text-zinc-400 border-zinc-700'
-  }
 }
 
 function healthColor(h?: string | null): string {
@@ -88,21 +75,11 @@ export function DockerPanel() {
 
   return (
     <section className="space-y-4">
-      <div className="flex items-center justify-between">
-        <div>
-          <h2 className="text-xl font-semibold text-zinc-100">Docker Containers</h2>
-          <p className="text-sm text-zinc-500">
-            {projects.length} project{projects.length === 1 ? '' : 's'} · {runningTotal}/
-            {totalContainers} running
-          </p>
-        </div>
-        <button
-          onClick={() => void load()}
-          className="rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-sm text-zinc-400 hover:text-zinc-200"
-        >
-          Refresh
-        </button>
-      </div>
+      <PanelHeader
+        title="Docker Containers"
+        subtitle={`${projects.length} project${projects.length === 1 ? '' : 's'} · ${runningTotal}/${totalContainers} running`}
+        rightSlot={<RefreshButton onClick={() => void load()} />}
+      />
 
       {error && (
         <div className="rounded-xl border border-rose-500/20 bg-rose-500/5 px-4 py-3 text-sm text-rose-300">
@@ -124,7 +101,7 @@ export function DockerPanel() {
               open
               className="rounded-xl border border-zinc-800 bg-zinc-900/50"
             >
-              <summary className="flex cursor-pointer items-center justify-between px-4 py-3 hover:bg-zinc-800/50">
+              <summary className="flex cursor-pointer items-center justify-between px-4 py-3 hover:bg-zinc-900/80">
                 <div className="flex items-center gap-2">
                   <span className="text-base font-semibold text-zinc-100">
                     {p.project_name}
@@ -136,7 +113,7 @@ export function DockerPanel() {
               </summary>
               <div className="overflow-hidden border-t border-zinc-800">
                 <table className="w-full text-sm">
-                  <thead className="bg-zinc-900/60 text-left text-xs uppercase tracking-wide text-zinc-500">
+                  <thead className="bg-zinc-900/80 text-left text-xs uppercase tracking-wider text-zinc-500">
                     <tr>
                       <th className="px-3 py-2">Container</th>
                       <th className="px-3 py-2">Computer</th>
@@ -165,11 +142,7 @@ export function DockerPanel() {
                           {(c.ports ?? []).map(formatPort).join(', ') || '—'}
                         </td>
                         <td className="px-3 py-2">
-                          <span
-                            className={`rounded-full border px-2 py-0.5 text-[11px] ${statusColor(c.status)}`}
-                          >
-                            {c.status}
-                          </span>
+                          <StatusBadge status={c.status} />
                         </td>
                         <td className={`px-3 py-2 text-xs ${healthColor(c.health)}`}>
                           {c.health ?? '—'}

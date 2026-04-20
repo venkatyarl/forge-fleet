@@ -41,6 +41,8 @@ use ff_db::leader_state::{
 };
 use ff_pulse::reader::{PulseError, PulseReader};
 
+use crate::ha::pg_failover::{FailoverOutcome, PostgresFailoverManager};
+
 /// Max revive attempts per computer per [`REVIVE_BACKOFF_WINDOW_MIN`] minutes.
 /// Above this the leader skips (and should escalate via alert channels).
 const REVIVE_MAX_ATTEMPTS_PER_WINDOW: i64 = 3;
@@ -104,6 +106,12 @@ pub struct LeaderTick {
 
     on_became_leader: OnBecameLeader,
     on_lost_leader: OnLostLeader,
+
+    /// Optional Postgres auto-failover manager. When set, each tick that
+    /// leaves us as the current leader will also call
+    /// [`PostgresFailoverManager::check_and_failover`] to detect a dead
+    /// primary and promote the local replica if we host one.
+    pg_failover_manager: Option<Arc<PostgresFailoverManager>>,
 }
 
 impl LeaderTick {
@@ -124,6 +132,7 @@ impl LeaderTick {
             epoch: AtomicU64::new(0),
             on_became_leader: Arc::new(|| {}),
             on_lost_leader: Arc::new(|_| {}),
+            pg_failover_manager: None,
         }
     }
 
@@ -136,6 +145,14 @@ impl LeaderTick {
     /// Attach a callback fired when we lose leadership.
     pub fn with_on_lost_leader(mut self, cb: OnLostLeader) -> Self {
         self.on_lost_leader = cb;
+        self
+    }
+
+    /// Attach a [`PostgresFailoverManager`]. Without this, the leader
+    /// never attempts to promote a local Postgres replica, even if the
+    /// primary goes ODOWN.
+    pub fn with_pg_failover(mut self, manager: Arc<PostgresFailoverManager>) -> Self {
+        self.pg_failover_manager = Some(manager);
         self
     }
 
@@ -177,6 +194,53 @@ impl LeaderTick {
                                             error = %err,
                                             "revive_scan failed"
                                         );
+                                    }
+
+                                    // Phase 6 HA: auto-failover check. Only
+                                    // runs on the currently-elected ForgeFleet
+                                    // leader. Disabled via env var
+                                    // FORGEFLEET_DISABLE_AUTO_PG_FAILOVER.
+                                    if let Some(manager) = &self.pg_failover_manager {
+                                        match manager.check_and_failover(&self.pulse).await {
+                                            Ok(FailoverOutcome::Promoted) => {
+                                                tracing::info!(
+                                                    node = %self.my_name,
+                                                    "pg_failover: promoted local replica to primary"
+                                                );
+                                            }
+                                            Ok(FailoverOutcome::PrimaryOdownPromotingMyReplica) => {
+                                                tracing::info!(
+                                                    node = %self.my_name,
+                                                    "pg_failover: promoting local replica"
+                                                );
+                                            }
+                                            Ok(FailoverOutcome::PrimaryOdownCantPromote) => {
+                                                tracing::warn!(
+                                                    node = %self.my_name,
+                                                    "pg_failover: primary odown but no local replica to promote"
+                                                );
+                                            }
+                                            Ok(FailoverOutcome::Blocked(why)) => {
+                                                tracing::warn!(
+                                                    node = %self.my_name,
+                                                    reason = %why,
+                                                    "pg_failover: blocked"
+                                                );
+                                            }
+                                            Ok(FailoverOutcome::NoOp) => {
+                                                tracing::debug!(
+                                                    node = %self.my_name,
+                                                    "pg_failover: no-op"
+                                                );
+                                            }
+                                            Err(e) => {
+                                                tracing::error!(
+                                                    node = %self.my_name,
+                                                    error = %e,
+                                                    "pg_failover: check_and_failover failed"
+                                                );
+                                            }
+                                        }
                                     }
                                 }
                             }

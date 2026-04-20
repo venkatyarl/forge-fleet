@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { getJson } from '../lib/api'
+import { PanelHeader, RefreshButton } from './PanelHeader'
+import { StatusBadge, toneFor } from './StatusBadge'
 
 type Environment = {
   id: string
@@ -40,15 +42,8 @@ function timeAgo(iso?: string | null): string {
   return `${Math.floor(hours / 24)}d ago`
 }
 
-function envBadge(status?: string | null): string {
-  const v = (status ?? '').toLowerCase()
-  if (v === 'healthy' || v === 'ok' || v === 'running')
-    return 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
-  if (v === 'degraded' || v === 'starting')
-    return 'bg-amber-500/15 text-amber-300 border-amber-500/30'
-  if (v === 'down' || v === 'failed' || v === 'unhealthy')
-    return 'bg-rose-500/15 text-rose-300 border-rose-500/30'
-  return 'bg-zinc-800 text-zinc-400 border-zinc-700'
+function envTone(status?: string | null) {
+  return toneFor(status ?? '')
 }
 
 export function ProjectsPanel() {
@@ -76,20 +71,11 @@ export function ProjectsPanel() {
 
   return (
     <section className="space-y-4">
-      <div className="flex items-center justify-between">
-        <div>
-          <h2 className="text-xl font-semibold text-zinc-100">Projects</h2>
-          <p className="text-sm text-zinc-500">
-            {projects.length} project{projects.length === 1 ? '' : 's'} tracked
-          </p>
-        </div>
-        <button
-          onClick={() => void load()}
-          className="rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-sm text-zinc-400 hover:text-zinc-200"
-        >
-          Refresh
-        </button>
-      </div>
+      <PanelHeader
+        title="Projects"
+        subtitle={`${projects.length} project${projects.length === 1 ? '' : 's'} tracked`}
+        rightSlot={<RefreshButton onClick={() => void load()} />}
+      />
 
       {error && (
         <div className="rounded-xl border border-rose-500/20 bg-rose-500/5 px-4 py-3 text-sm text-rose-300">
@@ -104,7 +90,7 @@ export function ProjectsPanel() {
           {projects.map((p) => (
             <article
               key={p.id}
-              className="rounded-xl border border-zinc-800 bg-zinc-900/70 p-4 shadow-sm"
+              className="rounded-xl border border-zinc-800 bg-zinc-900/50 p-4 shadow-sm"
             >
               <div className="mb-2 flex items-start justify-between gap-2">
                 <div>
@@ -113,9 +99,7 @@ export function ProjectsPanel() {
                   </h3>
                   <p className="text-[11px] text-zinc-500">{p.id}</p>
                 </div>
-                <span className="rounded-full border border-zinc-700 bg-zinc-800 px-2 py-0.5 text-[11px] text-zinc-400">
-                  {p.status}
-                </span>
+                <StatusBadge status={p.status} />
               </div>
 
               {p.repo_url && (
@@ -147,14 +131,14 @@ export function ProjectsPanel() {
 
               {p.environments.length > 0 && (
                 <div className="mb-2">
-                  <p className="mb-1 text-[10px] uppercase tracking-wide text-zinc-500">
+                  <p className="mb-1 text-[10px] uppercase tracking-wider text-zinc-500">
                     Environments
                   </p>
                   <div className="flex flex-wrap gap-1">
                     {p.environments.map((e) => (
-                      <span
+                      <StatusBadge
                         key={e.id}
-                        className={`rounded-full border px-2 py-0.5 text-[10px] ${envBadge(e.health_status ?? e.deploy_status)}`}
+                        tone={envTone(e.health_status ?? e.deploy_status)}
                         title={
                           e.deployed_commit_sha
                             ? `${e.name} @ ${e.deployed_commit_sha.slice(0, 10)}`
@@ -163,7 +147,7 @@ export function ProjectsPanel() {
                       >
                         {e.name}
                         {e.health_status ? ` · ${e.health_status}` : ''}
-                      </span>
+                      </StatusBadge>
                     ))}
                   </div>
                 </div>

@@ -1329,6 +1329,7 @@ name = "ff-gateway"
 version = "2026.4.7"
 dependencies = [
  "anyhow",
+ "async-nats",
  "axum",
  "bytes",
  "chrono",
@@ -1343,6 +1344,7 @@ dependencies = [
  "ff-mcp",
  "ff-observability",
  "ff-pulse",
+ "futures",
  "hyper",
  "mime_guess",
  "reqwest",
@@ -1353,6 +1355,7 @@ dependencies = [
  "sqlx",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-stream",
  "tokio-util",
  "toml 0.8.23",
  "tower-http",

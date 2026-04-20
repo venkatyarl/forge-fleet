@@ -1,5 +1,8 @@
 import { useCallback, useEffect, useState } from 'react'
 import { getJson } from '../lib/api'
+import { useFleetEvents } from '../lib/useFleetEvents'
+import { LiveIndicator, PanelHeader, RefreshButton } from './PanelHeader'
+import { StatusBadge, toneFor } from './StatusBadge'
 
 type AlertEvent = {
   id: string
@@ -31,16 +34,18 @@ type Policy = {
   enabled: boolean
 }
 
-function sevBadge(sev: string): string {
+// Severity → StatusBadge tone. Keeps the alerts palette aligned with
+// the rest of the dashboard (warn = amber, crit = rose, info = sky).
+function sevTone(sev: string) {
   switch (sev) {
     case 'critical':
-      return 'bg-rose-500/15 text-rose-300 border-rose-500/30'
+      return toneFor('critical')
     case 'warning':
-      return 'bg-amber-500/15 text-amber-300 border-amber-500/30'
+      return toneFor('warning')
     case 'info':
-      return 'bg-sky-500/15 text-sky-300 border-sky-500/30'
+      return toneFor('info')
     default:
-      return 'bg-zinc-800 text-zinc-400 border-zinc-700'
+      return toneFor(sev)
   }
 }
 
@@ -72,22 +77,28 @@ export function AlertsPanel() {
     return () => clearInterval(i)
   }, [load])
 
+  // Instant refresh on any fleet event that could affect alert state.
+  const { live } = useFleetEvents((evt) => {
+    if (
+      evt.subject.startsWith('fleet.events.alert.') ||
+      evt.subject.startsWith('fleet.events.member.')
+    ) {
+      void load()
+    }
+  })
+
   return (
     <section className="space-y-6">
-      <div className="flex items-center justify-between">
-        <div>
-          <h2 className="text-xl font-semibold text-zinc-100">Alerts</h2>
-          <p className="text-sm text-zinc-500">
-            {events.length} active · {policies.length} policies
-          </p>
-        </div>
-        <button
-          onClick={() => void load()}
-          className="rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-sm text-zinc-400 hover:text-zinc-200"
-        >
-          Refresh
-        </button>
-      </div>
+      <PanelHeader
+        title="Alerts"
+        subtitle={`${events.length} active · ${policies.length} policies`}
+        rightSlot={
+          <>
+            <LiveIndicator live={live} />
+            <RefreshButton onClick={() => void load()} />
+          </>
+        }
+      />
 
       {error && (
         <div className="rounded-xl border border-rose-500/20 bg-rose-500/5 px-4 py-3 text-sm text-rose-300">
@@ -97,7 +108,7 @@ export function AlertsPanel() {
 
       {/* Active events */}
       <div>
-        <h3 className="mb-2 text-sm font-semibold uppercase tracking-wide text-zinc-400">
+        <h3 className="mb-2 text-xs uppercase tracking-wider text-zinc-500">
           Active Events
         </h3>
         {events.length === 0 && !loading ? (
@@ -109,20 +120,16 @@ export function AlertsPanel() {
             {events.map((e) => (
               <article
                 key={e.id}
-                className="flex flex-wrap items-start justify-between gap-3 rounded-xl border border-zinc-800 bg-zinc-900/70 p-3"
+                className="flex flex-wrap items-start justify-between gap-3 rounded-xl border border-zinc-800 bg-zinc-900/50 p-3"
               >
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-2">
-                    <span
-                      className={`rounded-full border px-2 py-0.5 text-[11px] ${sevBadge(e.severity)}`}
-                    >
-                      {e.severity}
-                    </span>
+                    <StatusBadge tone={sevTone(e.severity)} status={e.severity} />
                     <span className="text-sm font-medium text-zinc-100">
                       {e.policy_name}
                     </span>
                     {e.computer_name && (
-                      <span className="text-xs text-zinc-500">@ {e.computer_name}</span>
+                      <span className="text-xs text-zinc-400">@ {e.computer_name}</span>
                     )}
                   </div>
                   {e.message && (
@@ -148,12 +155,12 @@ export function AlertsPanel() {
 
       {/* Policies */}
       <div>
-        <h3 className="mb-2 text-sm font-semibold uppercase tracking-wide text-zinc-400">
+        <h3 className="mb-2 text-xs uppercase tracking-wider text-zinc-500">
           Policies
         </h3>
         <div className="overflow-hidden rounded-xl border border-zinc-800">
           <table className="w-full text-sm">
-            <thead className="bg-zinc-900/80 text-left text-xs uppercase tracking-wide text-zinc-500">
+            <thead className="bg-zinc-900/80 text-left text-xs uppercase tracking-wider text-zinc-500">
               <tr>
                 <th className="px-3 py-2">Name</th>
                 <th className="px-3 py-2">Metric</th>
@@ -178,11 +185,7 @@ export function AlertsPanel() {
                     {p.condition}
                   </td>
                   <td className="px-3 py-2">
-                    <span
-                      className={`rounded-full border px-2 py-0.5 text-[11px] ${sevBadge(p.severity)}`}
-                    >
-                      {p.severity}
-                    </span>
+                    <StatusBadge tone={sevTone(p.severity)} status={p.severity} />
                   </td>
                   <td className="px-3 py-2 text-zinc-400">{p.channel}</td>
                   <td className="px-3 py-2 text-zinc-400">{p.duration_secs}s</td>
@@ -190,7 +193,7 @@ export function AlertsPanel() {
                     {p.enabled ? (
                       <span className="text-emerald-400">on</span>
                     ) : (
-                      <span className="text-zinc-600">off</span>
+                      <span className="text-zinc-500">off</span>
                     )}
                   </td>
                 </tr>

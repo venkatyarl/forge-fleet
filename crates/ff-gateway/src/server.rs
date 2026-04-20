@@ -437,6 +437,7 @@ pub fn build_router(state: Arc<GatewayState>, mc_db_path: Option<&str>) -> Route
         .route("/api/metrics/{computer}/history", get(crate::pulse_api::metrics_history))
         .route("/api/ha/status", get(crate::pulse_api::ha_status))
         .route("/api/docker/projects", get(crate::pulse_api::docker_projects))
+        .route("/api/events/stream", get(crate::pulse_api::events_stream))
         // ─── Chat management routes ─────────────────────────────────
         .route("/api/chats", get(list_chats).post(create_chat))
         .route("/api/chats/folders", get(list_chat_folders))
