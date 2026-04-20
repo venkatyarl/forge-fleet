@@ -58,6 +58,7 @@ pub mod permissions;
 pub mod plugins;
 pub mod ports_registry;
 pub mod revive;
+pub mod panic_stop;
 pub mod rpc_inference;
 pub mod secrets_rotation;
 pub mod ssh_key_manager;

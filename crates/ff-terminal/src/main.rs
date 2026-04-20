@@ -305,6 +305,46 @@ enum FleetCommand {
         #[command(subcommand)]
         command: FleetDbCommand,
     },
+    /// EMERGENCY: halt every daemon across the fleet.
+    ///
+    /// For runaway loops, resource exhaustion, or misbehaving task spam.
+    /// Runs `launchctl unload` / `systemctl --user stop` on every computer
+    /// — locally for the current node, via SSH for the rest. Remotes run
+    /// in parallel. Reports N of M stopped and lists any SSH failures.
+    ///
+    /// Use `ff fleet resume` to bring everything back up.
+    PanicStop {
+        /// Required — panic-stop is destructive.
+        #[arg(long, default_value_t = false)] yes: bool,
+        /// ALSO stop the Taylor-local Docker data-plane stack
+        /// (postgres/redis/sentinel/nats) for a true full halt. No-op if
+        /// this isn't Taylor.
+        #[arg(long, default_value_t = false)] halt_dbs: bool,
+    },
+    /// Restart every daemon across the fleet (undo a panic-stop).
+    Resume {
+        /// Required — resume touches every computer.
+        #[arg(long, default_value_t = false)] yes: bool,
+    },
+    /// Isolate a misbehaving computer without removing it from the registry.
+    ///
+    /// Stops its daemons over SSH, flips `computers.status='maintenance'`,
+    /// demotes any OpenClaw gateway row back to 'node', and publishes
+    /// `fleet.events.quarantine` on NATS. The node won't participate in
+    /// leader election or receive LLM requests while quarantined.
+    Quarantine {
+        /// Computer name (e.g. "sophie").
+        computer: String,
+        /// Required — quarantine is destructive to the node's role.
+        #[arg(long, default_value_t = false)] yes: bool,
+    },
+    /// Reverse a quarantine: restart daemons, flip status back to 'pending'.
+    /// The next pulse beat will move it to 'online'.
+    Unquarantine {
+        /// Computer name.
+        computer: String,
+        #[arg(long, default_value_t = false)] yes: bool,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -2328,7 +2368,7 @@ async fn handle_status_inner(p: PathBuf) -> Result<()> {
     print!("{CYAN}Redis{RESET}     : ");
     let redis_url = fleet_cfg.as_ref()
         .map(|c| c.redis.url.clone())
-        .unwrap_or_else(|| "redis://127.0.0.1:6379".to_string());
+        .unwrap_or_else(|| "redis://127.0.0.1:6380".to_string());
     match ping_redis(&redis_url).await {
         Ok(ms)   => println!("{GREEN}✓ PONG{RESET} ({redis_url}, {ms}ms)"),
         Err(e)   => println!("{RED}✗ unreachable{RESET} ({redis_url}) — {}", truncate(&e, 50)),
@@ -2529,8 +2569,9 @@ async fn ping_redis(url: &str) -> std::result::Result<u128, String> {
     // Strip userinfo if present.
     let host_port = host_port.rsplit('@').next().unwrap_or(host_port);
     let (host, port) = match host_port.rsplit_once(':') {
-        Some((h, p)) => (h.to_string(), p.parse::<u16>().unwrap_or(6379)),
-        None => (host_port.to_string(), 6379),
+        // Host-facing default: docker-compose publishes Redis on 6380.
+        Some((h, p)) => (h.to_string(), p.parse::<u16>().unwrap_or(6380)),
+        None => (host_port.to_string(), 6380),
     };
 
     let start = std::time::Instant::now();
@@ -3705,7 +3746,7 @@ async fn handle_model(cmd: ModelCommand) -> Result<()> {
                 // Open a Pulse reader so we can pick a target and find
                 // any healthy loaded endpoint.
                 let redis_url = std::env::var("FORGEFLEET_REDIS_URL")
-                    .unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+                    .unwrap_or_else(|_| "redis://127.0.0.1:6380".into());
                 let pulse = match ff_pulse::reader::PulseReader::new(&redis_url) {
                     Ok(p) => p,
                     Err(e) => {
@@ -4465,7 +4506,199 @@ async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
         FleetCommand::Db { command } => {
             handle_fleet_db(&pool, command).await?;
         }
+        FleetCommand::PanicStop { yes, halt_dbs } => {
+            handle_fleet_panic_stop(&pool, yes, halt_dbs).await?;
+        }
+        FleetCommand::Resume { yes } => {
+            handle_fleet_resume(&pool, yes).await?;
+        }
+        FleetCommand::Quarantine { computer, yes } => {
+            handle_fleet_quarantine(&pool, &computer, yes).await?;
+        }
+        FleetCommand::Unquarantine { computer, yes } => {
+            handle_fleet_unquarantine(&pool, &computer, yes).await?;
+        }
     }
+    Ok(())
+}
+
+/// `ff fleet panic-stop` — emergency halt of every daemon.
+///
+/// The implementation initializes NATS best-effort before delegating to
+/// `panic_stop::fleet_panic_stop` so observers on the bus see the event
+/// (the stop itself doesn't need NATS but `--halt-dbs` users expect
+/// downstream alerting to fire).
+async fn handle_fleet_panic_stop(
+    pool: &sqlx::PgPool,
+    yes: bool,
+    halt_dbs: bool,
+) -> Result<()> {
+    if !yes {
+        eprintln!(
+            "{YELLOW}⚠ panic-stop halts EVERY ForgeFleet daemon across the fleet.{RESET}"
+        );
+        eprintln!(
+            "  Use this only when the fleet is misbehaving (runaway loops, resource"
+        );
+        eprintln!(
+            "  exhaustion, task spam). Pass --yes to proceed. Recover via `ff fleet resume`."
+        );
+        std::process::exit(1);
+    }
+
+    // Fire-and-forget NATS init so the quarantine/halt events propagate.
+    let _ = ff_agent::nats_client::init_nats(&ff_agent::nats_client::resolve_nats_url()).await;
+
+    println!("{CYAN}▶ ff fleet panic-stop — halting every daemon…{RESET}");
+    let local = ff_agent::fleet_info::resolve_this_node_name().await;
+    let report = ff_agent::panic_stop::fleet_panic_stop(pool, &local)
+        .await
+        .map_err(|e| anyhow::anyhow!("panic_stop: {e}"))?;
+
+    for e in &report.entries {
+        let marker = if e.ok { format!("{GREEN}✓{RESET}") } else { format!("{RED}✗{RESET}") };
+        println!("  {marker} {:<10} {}", e.name, e.detail);
+    }
+    println!(
+        "\n{} of {} daemons stopped.{}",
+        report.succeeded,
+        report.total,
+        if report.failed > 0 {
+            format!(" {YELLOW}({} failure{}){RESET}", report.failed, if report.failed == 1 { "" } else { "s" })
+        } else {
+            String::new()
+        },
+    );
+
+    if halt_dbs {
+        println!("\n{CYAN}▶ --halt-dbs — stopping local Docker data-plane containers…{RESET}");
+        let (ok, detail) = ff_agent::panic_stop::stop_taylor_docker_stack().await;
+        let marker = if ok { format!("{GREEN}✓{RESET}") } else { format!("{YELLOW}—{RESET}") };
+        println!("  {marker} docker stack\n{detail}");
+        if !ok {
+            println!(
+                "{YELLOW}(some containers weren't running locally — expected if this isn't Taylor){RESET}"
+            );
+        }
+    }
+
+    println!("\nRecover with: {CYAN}ff fleet resume --yes{RESET}");
+    if report.failed > 0 {
+        std::process::exit(3);
+    }
+    Ok(())
+}
+
+/// `ff fleet resume` — symmetric undo of panic-stop.
+async fn handle_fleet_resume(pool: &sqlx::PgPool, yes: bool) -> Result<()> {
+    if !yes {
+        eprintln!(
+            "{YELLOW}⚠ resume will (re)start every daemon across the fleet. Pass --yes to proceed.{RESET}"
+        );
+        std::process::exit(1);
+    }
+
+    println!("{CYAN}▶ ff fleet resume — starting every daemon…{RESET}");
+    let local = ff_agent::fleet_info::resolve_this_node_name().await;
+    let report = ff_agent::panic_stop::fleet_resume(pool, &local)
+        .await
+        .map_err(|e| anyhow::anyhow!("resume: {e}"))?;
+
+    for e in &report.entries {
+        let marker = if e.ok { format!("{GREEN}✓{RESET}") } else { format!("{RED}✗{RESET}") };
+        println!("  {marker} {:<10} {}", e.name, e.detail);
+    }
+    println!(
+        "\n{} of {} daemons (re)started.{}",
+        report.succeeded,
+        report.total,
+        if report.failed > 0 {
+            format!(" {YELLOW}({} failure{}){RESET}", report.failed, if report.failed == 1 { "" } else { "s" })
+        } else {
+            String::new()
+        },
+    );
+    if report.failed > 0 {
+        std::process::exit(3);
+    }
+    Ok(())
+}
+
+/// `ff fleet quarantine <computer>` — stop daemons + flip status to
+/// 'maintenance'. See module docs on `panic_stop.rs` for full flow.
+async fn handle_fleet_quarantine(
+    pool: &sqlx::PgPool,
+    computer: &str,
+    yes: bool,
+) -> Result<()> {
+    if !yes {
+        eprintln!(
+            "{YELLOW}⚠ quarantine will stop daemons on '{computer}' and mark it 'maintenance'.{RESET}"
+        );
+        eprintln!("  The node will be excluded from leader election and LLM routing.");
+        eprintln!("  Pass --yes to proceed. Reverse with `ff fleet unquarantine {computer} --yes`.");
+        std::process::exit(1);
+    }
+
+    let _ = ff_agent::nats_client::init_nats(&ff_agent::nats_client::resolve_nats_url()).await;
+
+    println!("{CYAN}▶ ff fleet quarantine {computer}{RESET}");
+    let result = ff_agent::panic_stop::quarantine_computer(pool, computer)
+        .await
+        .map_err(|e| anyhow::anyhow!("quarantine: {e}"))?;
+
+    if result.ssh_stop_ok {
+        println!("  {GREEN}✓{RESET} ssh stop succeeded on '{}'", result.name);
+    } else {
+        println!(
+            "  {YELLOW}—{RESET} ssh stop did NOT succeed on '{}' (detail: {}) — DB flip applied anyway",
+            result.name, result.ssh_detail
+        );
+    }
+    println!("  {GREEN}✓{RESET} status='maintenance' in computers table");
+    println!("  {GREEN}✓{RESET} openclaw_installations.mode='node', gateway_url cleared (if present)");
+    println!("  {GREEN}✓{RESET} published fleet.events.quarantine on NATS");
+    println!();
+    println!("Implications while '{}' is quarantined:", result.name);
+    println!("  • will not participate in leader election");
+    println!("  • will not receive LLM inference requests");
+    println!("  • pulse beats still recorded but computer is excluded from healthy-member lists");
+    println!();
+    println!("Reverse with: {CYAN}ff fleet unquarantine {} --yes{RESET}", result.name);
+    Ok(())
+}
+
+/// `ff fleet unquarantine <computer>` — restart daemons + flip status back
+/// to 'pending'. Next pulse beat moves it to 'online'.
+async fn handle_fleet_unquarantine(
+    pool: &sqlx::PgPool,
+    computer: &str,
+    yes: bool,
+) -> Result<()> {
+    if !yes {
+        eprintln!(
+            "{YELLOW}⚠ unquarantine will restart daemons on '{computer}' and reset its status. Pass --yes to proceed.{RESET}"
+        );
+        std::process::exit(1);
+    }
+
+    let _ = ff_agent::nats_client::init_nats(&ff_agent::nats_client::resolve_nats_url()).await;
+
+    println!("{CYAN}▶ ff fleet unquarantine {computer}{RESET}");
+    let result = ff_agent::panic_stop::unquarantine_computer(pool, computer)
+        .await
+        .map_err(|e| anyhow::anyhow!("unquarantine: {e}"))?;
+
+    if result.ssh_stop_ok {
+        println!("  {GREEN}✓{RESET} ssh start succeeded on '{}'", result.name);
+    } else {
+        println!(
+            "  {YELLOW}—{RESET} ssh start did NOT succeed on '{}' (detail: {}) — DB reset applied anyway",
+            result.name, result.ssh_detail
+        );
+    }
+    println!("  {GREEN}✓{RESET} status='pending' in computers table (pulse will flip to 'online')");
+    println!("  {GREEN}✓{RESET} published fleet.events.quarantine (event=unquarantine) on NATS");
     Ok(())
 }
 

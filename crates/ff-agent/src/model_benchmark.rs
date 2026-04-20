@@ -425,14 +425,14 @@ pub async fn pick_benchmark_target(
 
 /// Light wrapper to run a benchmark without an existing PulseReader.
 /// Builds one on the fly from the `FORGEFLEET_REDIS_URL` env or
-/// `redis://127.0.0.1:6379` default.
+/// `redis://127.0.0.1:6380` default (docker-compose host mapping).
 pub async fn benchmark_with_defaults(
     pg: &PgPool,
     model_id: &str,
     computer: &str,
 ) -> Result<BenchmarkReport, BenchError> {
     let redis_url = std::env::var("FORGEFLEET_REDIS_URL")
-        .unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+        .unwrap_or_else(|_| "redis://127.0.0.1:6380".into());
     let pulse =
         PulseReader::new(&redis_url).map_err(|e| BenchError::Pulse(e.to_string()))?;
     let b = ModelBenchmarker::new(pg.clone(), pulse);

@@ -231,6 +231,12 @@ impl HeartbeatV2Publisher {
                 self.computer_name, self.interval
             );
 
+            // Counter so we can emit a periodic info-level "alive" log
+            // (every 60 beats ≈ every 15 min at the 15s default interval).
+            // Per-beat logs stay at debug! to avoid flooding the log at INFO.
+            let mut beat_count: u64 = 0;
+            const INFO_LOG_EVERY_N_BEATS: u64 = 60;
+
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(self.interval) => {
@@ -238,7 +244,17 @@ impl HeartbeatV2Publisher {
                         if let Err(e) = publish_beat(&mut conn, &self.computer_name, &beat).await {
                             error!("heartbeat_v2: publish failed: {e}");
                         } else {
+                            beat_count = beat_count.wrapping_add(1);
                             debug!("heartbeat_v2 published for '{}'", self.computer_name);
+                            // Emit a heartbeat-of-life line at INFO every N beats so
+                            // operators can confirm the publisher is alive without
+                            // raising the whole crate to debug.
+                            if beat_count == 1 || beat_count % INFO_LOG_EVERY_N_BEATS == 0 {
+                                info!(
+                                    "heartbeat_v2: published beat #{} to redis+nats for '{}'",
+                                    beat_count, self.computer_name
+                                );
+                            }
                         }
                         // Fire-and-forget NATS mirror. Best-effort — never errors the loop.
                         publish_pulse_beat(&self.computer_name, &beat).await;
