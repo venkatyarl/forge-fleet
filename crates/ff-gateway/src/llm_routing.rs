@@ -503,6 +503,11 @@ pub fn error_to_response(err: LlmRoutingError) -> (u16, Value) {
 // `qwen2.5-coder:7b` and the server-reported id `Qwen2.5-Coder-7B-Instruct`
 // both hit the same slot.
 
+/// Redis pub/sub channel that the warmer listens on for immediate
+/// cache-invalidation triggers (issue #98). The CLI publishes on this
+/// channel whenever `fleet_task_coverage` is mutated.
+pub const CHANNEL_ROUTING_INVALIDATE: &str = "routing:invalidate";
+
 /// How often the warmer re-runs `pick_server` for every known model id.
 const WARMER_INTERVAL: Duration = Duration::from_secs(15);
 /// Entries older than this are evicted from the cache (i.e. not seen for
@@ -541,9 +546,47 @@ impl LlmRoutingCache {
 
     /// Spawn the background warmer loop. It ticks every `WARMER_INTERVAL`
     /// and exits when `shutdown` flips to `true`.
-    pub fn spawn_warmer(&self, mut shutdown: watch::Receiver<bool>) -> JoinHandle<()> {
+    ///
+    /// In addition to the periodic tick, this also spawns a Redis pub/sub
+    /// subscriber on channel `routing:invalidate` (see [`CHANNEL_ROUTING_INVALIDATE`]).
+    /// Whenever an operator writes to `fleet_task_coverage` the CLI publishes
+    /// on that channel, causing the warmer to run an immediate tick instead
+    /// of waiting up to `WARMER_INTERVAL` seconds (issue #98).
+    ///
+    /// `redis_url` is used for the pub/sub listener. If `None`, or on any
+    /// pub/sub error, the warmer silently degrades to the periodic-only path.
+    pub fn spawn_warmer(&self, shutdown: watch::Receiver<bool>) -> JoinHandle<()> {
+        // Read the same env ff-gateway already uses for the pulse router so
+        // operators don't have to configure two URLs.
+        let redis_url = std::env::var("FORGEFLEET_REDIS_URL").ok();
+        self.spawn_warmer_with_redis(shutdown, redis_url)
+    }
+
+    /// Variant of [`spawn_warmer`] with an explicit Redis URL for pub/sub.
+    /// Used mainly for tests; production callers should use [`spawn_warmer`].
+    pub fn spawn_warmer_with_redis(
+        &self,
+        mut shutdown: watch::Receiver<bool>,
+        redis_url: Option<String>,
+    ) -> JoinHandle<()> {
         let router = self.router.clone();
         let cache = self.cache.clone();
+
+        // Channel that the pub/sub listener uses to wake the warmer. Bounded
+        // to 1 — extra pokes coalesce because a single tick serves them all.
+        let (poke_tx, mut poke_rx) = tokio::sync::mpsc::channel::<()>(1);
+
+        // Spawn the pub/sub listener as a sibling task. It owns its own
+        // reconnect loop so a dropped Redis connection doesn't wedge the
+        // warmer — the warmer still ticks on the 15s interval.
+        if let Some(url) = redis_url {
+            tokio::spawn(invalidate_subscriber(url, poke_tx.clone()));
+        } else {
+            tracing::debug!(
+                "llm routing cache: FORGEFLEET_REDIS_URL not set; skipping pub/sub invalidation listener"
+            );
+        }
+
         tokio::spawn(async move {
             // Run once immediately so the cache is warm by the time the
             // first request lands.
@@ -559,6 +602,14 @@ impl LlmRoutingCache {
                     _ = ticker.tick() => {
                         if let Err(e) = warmer_tick(&router, &cache).await {
                             tracing::warn!(error = %e, "llm routing cache: warmer tick failed");
+                        }
+                    }
+                    _ = poke_rx.recv() => {
+                        tracing::info!(
+                            "llm routing cache: immediate tick triggered by routing:invalidate"
+                        );
+                        if let Err(e) = warmer_tick(&router, &cache).await {
+                            tracing::warn!(error = %e, "llm routing cache: invalidation-triggered tick failed");
                         }
                     }
                     changed = shutdown.changed() => {
@@ -676,6 +727,99 @@ async fn warmer_tick(
         cache_size = guard.len(),
         "llm routing cache: warmer tick complete"
     );
+    Ok(())
+}
+
+/// Subscribe to [`CHANNEL_ROUTING_INVALIDATE`] and poke `tx` on every message.
+/// Retries forever with a 5s backoff on connection errors so a transient
+/// Redis outage doesn't permanently disable fast-path invalidation.
+async fn invalidate_subscriber(redis_url: String, tx: tokio::sync::mpsc::Sender<()>) {
+    loop {
+        match run_invalidate_subscriber_once(&redis_url, &tx).await {
+            Ok(()) => {
+                // Clean exit only happens when the subscriber stream drops.
+                tracing::debug!(
+                    "llm routing cache: routing:invalidate subscriber stream ended; reconnecting"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    redis_url = %redis_url,
+                    "llm routing cache: routing:invalidate subscriber failed; retrying in 5s"
+                );
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        // Exit the retry loop when the poke channel is dropped (warmer task
+        // itself has shut down).
+        if tx.is_closed() {
+            tracing::debug!(
+                "llm routing cache: warmer dropped poke channel; stopping invalidate subscriber"
+            );
+            return;
+        }
+    }
+}
+
+async fn run_invalidate_subscriber_once(
+    redis_url: &str,
+    tx: &tokio::sync::mpsc::Sender<()>,
+) -> Result<(), redis::RedisError> {
+    use futures::StreamExt;
+    let client = redis::Client::open(redis_url)?;
+    let mut pubsub = client.get_async_pubsub().await?;
+    pubsub.subscribe(CHANNEL_ROUTING_INVALIDATE).await?;
+    tracing::info!(
+        channel = %CHANNEL_ROUTING_INVALIDATE,
+        "llm routing cache: subscribed for cache-invalidation messages"
+    );
+    let mut msgs = pubsub.into_on_message();
+    while let Some(msg) = msgs.next().await {
+        let reason: String = msg.get_payload().unwrap_or_else(|_| "(no payload)".into());
+        tracing::debug!(%reason, "routing:invalidate received");
+        // try_send: coalesce bursts — the warmer runs one tick per wake
+        // and that tick re-reads the whole fleet, so dropping extras is safe.
+        let _ = tx.try_send(());
+    }
+    Ok(())
+}
+
+/// Publish a best-effort cache-invalidation message so every gateway's
+/// warmer runs an immediate tick. Used by CLI code paths that write to
+/// `fleet_task_coverage` (issue #98).
+///
+/// Errors are logged at `debug` and swallowed — operator workflows must
+/// never fail because Redis is unreachable.
+pub async fn publish_routing_invalidate(redis_url: &str, reason: &str) {
+    match publish_routing_invalidate_impl(redis_url, reason).await {
+        Ok(()) => {
+            tracing::debug!(
+                channel = %CHANNEL_ROUTING_INVALIDATE,
+                %reason,
+                "published routing:invalidate"
+            );
+        }
+        Err(e) => {
+            tracing::debug!(
+                redis_url,
+                error = %e,
+                %reason,
+                "routing:invalidate publish failed; gateway caches will refresh on next periodic tick"
+            );
+        }
+    }
+}
+
+async fn publish_routing_invalidate_impl(
+    redis_url: &str,
+    reason: &str,
+) -> Result<(), redis::RedisError> {
+    use redis::AsyncCommands;
+    let client = redis::Client::open(redis_url)?;
+    let mut conn = client.get_multiplexed_async_connection().await?;
+    conn.publish::<_, _, ()>(CHANNEL_ROUTING_INVALIDATE, reason)
+        .await?;
     Ok(())
 }
 

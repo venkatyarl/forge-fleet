@@ -42,3 +42,4 @@ sqlx.workspace = true
 async-nats = "0.37"
 futures = "0.3"
 tokio-stream = "0.1"
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }

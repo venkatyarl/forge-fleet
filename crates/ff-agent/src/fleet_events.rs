@@ -23,6 +23,11 @@ use tracing::{debug, error, warn};
 pub const CHANNEL_NODE_ONLINE: &str = "fleet:node_online";
 pub const CHANNEL_NODE_OFFLINE: &str = "fleet:node_offline";
 pub const CHANNEL_TASK_DISPATCHED: &str = "fleet:task_dispatched";
+/// Channel used by ff-gateway's `LlmRoutingCache` warmer (issue #98). Any
+/// code that mutates `fleet_task_coverage` should `publish_routing_invalidate`
+/// so every gateway in the fleet refreshes its pool→backend cache
+/// immediately instead of waiting for the next ~15s periodic tick.
+pub const CHANNEL_ROUTING_INVALIDATE: &str = "routing:invalidate";
 
 /// Resolve the Redis URL, reading `~/.forgefleet/fleet.toml` `[redis] url`.
 /// Falls back to `redis://192.168.5.100:6380` on any error.
@@ -63,6 +68,23 @@ pub async fn publish_node_online(node: &str) -> Result<(), String> {
 /// Publish that `node` transitioned from online to offline.
 pub async fn publish_node_offline(node: &str) -> Result<(), String> {
     publish_raw(CHANNEL_NODE_OFFLINE, node).await
+}
+
+/// Publish a best-effort `routing:invalidate` message so every gateway's
+/// LLM-routing cache warmer runs an immediate tick. Call this after any
+/// SQL write to `fleet_task_coverage` (issue #98).
+///
+/// Errors are logged at `debug` and swallowed — CLI commands must never
+/// fail because the Redis publish didn't land.
+pub async fn publish_routing_invalidate(reason: &str) {
+    if let Err(e) = publish_raw(CHANNEL_ROUTING_INVALIDATE, reason).await {
+        debug!(
+            channel = CHANNEL_ROUTING_INVALIDATE,
+            error = %e,
+            reason,
+            "publish_routing_invalidate failed; gateway caches will refresh on next periodic tick"
+        );
+    }
 }
 
 /// Publish that a task was dispatched, optionally to a specific node.
