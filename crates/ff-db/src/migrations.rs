@@ -312,6 +312,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "retire_alert_policies_toml",
         sql: schema::SCHEMA_V34_RETIRE_ALERT_POLICIES_TOML,
     },
+    PgMigration {
+        version: 35,
+        name: "retire_cloud_llm_providers_toml",
+        sql: schema::SCHEMA_V35_RETIRE_CLOUD_LLM_PROVIDERS_TOML,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.

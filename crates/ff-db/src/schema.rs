@@ -2162,3 +2162,100 @@ VALUES
 
 ON CONFLICT (name) DO NOTHING;
 "#;
+
+// ─── V35: retire config/cloud_llm_providers.toml → Postgres ─────────────────
+//
+// Per the DB-first directive: `cloud_llm_providers` is populated at DB
+// migration time rather than from a TOML. Operator edits via SQL or a
+// future `ff cloud-llm add` survive re-runs because of
+// ON CONFLICT (id) DO NOTHING.
+//
+// Credentials are NEVER stored here — `secret_key` is a pointer into
+// `fleet_secrets` (schema V9).
+pub const SCHEMA_V35_RETIRE_CLOUD_LLM_PROVIDERS_TOML: &str = r#"
+INSERT INTO cloud_llm_providers
+    (id, display_name, base_url, auth_kind, secret_key,
+     model_prefix, request_format, enabled)
+VALUES
+  ('openai',
+   'OpenAI (ChatGPT)',
+   'https://api.openai.com/v1',
+   'api_key', 'cloud.openai.api_key',
+   'openai/', 'openai_chat', true),
+
+  ('anthropic',
+   'Anthropic (Claude)',
+   'https://api.anthropic.com/v1',
+   'api_key', 'cloud.anthropic.api_key',
+   'claude-', 'anthropic_messages', true),
+
+  ('moonshot',
+   'Moonshot (Kimi)',
+   'https://api.moonshot.ai/v1',
+   'api_key', 'cloud.moonshot.api_key',
+   'kimi/', 'openai_chat', true),
+
+  ('google',
+   'Google (Gemini)',
+   'https://generativelanguage.googleapis.com/v1beta',
+   'api_key', 'cloud.google.api_key',
+   'gemini/', 'google_generate_content', true),
+
+  ('xai_grok',
+   'xAI (Grok)',
+   'https://api.x.ai/v1',
+   'api_key', 'cloud.xai_grok.api_key',
+   'grok/', 'openai_chat', true),
+
+  ('groq',
+   'Groq',
+   'https://api.groq.com/openai/v1',
+   'api_key', 'cloud.groq.api_key',
+   'groq/', 'openai_chat', true),
+
+  ('deepseek',
+   'DeepSeek',
+   'https://api.deepseek.com/v1',
+   'api_key', 'cloud.deepseek.api_key',
+   'deepseek/', 'openai_chat', true),
+
+  ('mistral',
+   'Mistral',
+   'https://api.mistral.ai/v1',
+   'api_key', 'cloud.mistral.api_key',
+   'mistral/', 'openai_chat', true),
+
+  ('fireworks',
+   'Fireworks AI',
+   'https://api.fireworks.ai/inference/v1',
+   'api_key', 'cloud.fireworks.api_key',
+   'fireworks/', 'openai_chat', true),
+
+  ('together',
+   'Together AI',
+   'https://api.together.xyz/v1',
+   'api_key', 'cloud.together.api_key',
+   'together/', 'openai_chat', true),
+
+  ('perplexity',
+   'Perplexity',
+   'https://api.perplexity.ai',
+   'api_key', 'cloud.perplexity.api_key',
+   'perplexity/', 'openai_chat', true),
+
+  ('openrouter',
+   'OpenRouter (aggregator)',
+   'https://openrouter.ai/api/v1',
+   'api_key', 'cloud.openrouter.api_key',
+   'openrouter/', 'openai_chat', true),
+
+  -- Cohere's v2 chat format is non-OpenAI-shaped. Kept disabled until the
+  -- cohere_chat_v2 translator lands in crates/ff-gateway/src/cloud_llm.rs.
+  ('cohere',
+   'Cohere',
+   'https://api.cohere.com/v2',
+   'api_key', 'cloud.cohere.api_key',
+   'cohere/', 'cohere_chat_v2', false)
+
+ON CONFLICT (id) DO NOTHING;
+"#;

@@ -1,7 +1,14 @@
 //! Cloud LLM provider registry (schema V26).
 //!
-//! Loads `config/cloud_llm_providers.toml` into the `cloud_llm_providers`
-//! Postgres table. Mirrors [`ports_registry::seed_from_toml`].
+//! Historically this module loaded `config/cloud_llm_providers.toml` into
+//! the `cloud_llm_providers` Postgres table. That file has been deleted —
+//! the DB migration `SCHEMA_V35_RETIRE_CLOUD_LLM_PROVIDERS_TOML` now owns
+//! the canonical seed set, and operator edits via SQL (or a future
+//! `ff cloud-llm add`) are preserved across upgrades.
+//!
+//! The seeder ([`seed_from_toml`]) is kept as a no-op for call-site
+//! compatibility; the read-side helpers ([`list_providers`],
+//! [`find_for_model`]) continue to work against Postgres as before.
 //!
 //! The gateway (`ff-gateway::cloud_llm`) uses [`find_for_model`] at request
 //! time to decide whether a `/v1/chat/completions` body should be forwarded
@@ -76,77 +83,21 @@ pub struct Provider {
     pub enabled: bool,
 }
 
-/// Seed the `cloud_llm_providers` table from a TOML file.
-pub async fn seed_from_toml(pool: &PgPool, toml_path: &Path) -> Result<SeedReport, CloudLlmError> {
-    let raw = std::fs::read_to_string(toml_path)
-        .map_err(|source| CloudLlmError::Io { path: toml_path.to_path_buf(), source })?;
-    let doc: ProvidersFile = toml::from_str(&raw)
-        .map_err(|source| CloudLlmError::Toml { path: toml_path.to_path_buf(), source })?;
-
-    let mut report = SeedReport { total: doc.provider.len(), ..Default::default() };
-
-    for entry in &doc.provider {
-        let row: Option<(bool, bool)> = sqlx::query_as(
-            r#"
-            WITH existing AS (
-                SELECT display_name, base_url, auth_kind, secret_key,
-                       oauth_token_secret, oauth_token_url, oauth_client_id,
-                       model_prefix, request_format, enabled
-                FROM cloud_llm_providers WHERE id = $1
-            ),
-            upsert AS (
-                INSERT INTO cloud_llm_providers
-                    (id, display_name, base_url, auth_kind, secret_key,
-                     oauth_token_secret, oauth_token_url, oauth_client_id,
-                     model_prefix, request_format, enabled)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-                ON CONFLICT (id) DO UPDATE SET
-                    display_name       = EXCLUDED.display_name,
-                    base_url           = EXCLUDED.base_url,
-                    auth_kind          = EXCLUDED.auth_kind,
-                    secret_key         = EXCLUDED.secret_key,
-                    oauth_token_secret = EXCLUDED.oauth_token_secret,
-                    oauth_token_url    = EXCLUDED.oauth_token_url,
-                    oauth_client_id    = EXCLUDED.oauth_client_id,
-                    model_prefix       = EXCLUDED.model_prefix,
-                    request_format     = EXCLUDED.request_format,
-                    enabled            = EXCLUDED.enabled
-                RETURNING (xmax = 0) AS inserted
-            )
-            SELECT u.inserted,
-                COALESCE(
-                    e.display_name       IS DISTINCT FROM $2  OR
-                    e.base_url           IS DISTINCT FROM $3  OR
-                    e.auth_kind          IS DISTINCT FROM $4  OR
-                    e.secret_key         IS DISTINCT FROM $5  OR
-                    e.oauth_token_secret IS DISTINCT FROM $6  OR
-                    e.oauth_token_url    IS DISTINCT FROM $7  OR
-                    e.oauth_client_id    IS DISTINCT FROM $8  OR
-                    e.model_prefix       IS DISTINCT FROM $9  OR
-                    e.request_format     IS DISTINCT FROM $10 OR
-                    e.enabled            IS DISTINCT FROM $11,
-                    true
-                ) AS changed
-            FROM upsert u LEFT JOIN existing e ON TRUE
-            "#,
-        )
-        .bind(&entry.id).bind(&entry.display_name).bind(&entry.base_url)
-        .bind(&entry.auth_kind).bind(&entry.secret_key)
-        .bind(entry.oauth_token_secret.as_deref())
-        .bind(entry.oauth_token_url.as_deref())
-        .bind(entry.oauth_client_id.as_deref())
-        .bind(&entry.model_prefix).bind(&entry.request_format).bind(entry.enabled)
-        .fetch_optional(pool).await?;
-
-        match row {
-            Some((true, _)) => report.inserted += 1,
-            Some((false, true)) => report.updated += 1,
-            Some((false, false)) => report.unchanged += 1,
-            None => report.updated += 1,
-        }
+/// Retired no-op seeder. The DB migration
+/// `SCHEMA_V35_RETIRE_CLOUD_LLM_PROVIDERS_TOML` now owns the canonical
+/// `cloud_llm_providers` seed set; this function is kept only so callers
+/// that predate the retirement keep compiling.
+///
+/// Logs a single info line the first time it's called in a process.
+pub async fn seed_from_toml(_pool: &PgPool, _toml_path: &Path) -> Result<SeedReport, CloudLlmError> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    if !LOGGED.swap(true, Ordering::Relaxed) {
+        tracing::info!(
+            "cloud_llm_providers: TOML seeder retired; canonical rows come from migration V35"
+        );
     }
-
-    Ok(report)
+    Ok(SeedReport::default())
 }
 
 pub async fn list_providers(pool: &PgPool) -> Result<Vec<Provider>, CloudLlmError> {
