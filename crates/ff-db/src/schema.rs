@@ -1902,3 +1902,38 @@ VALUES
 
 ON CONFLICT (id) DO NOTHING;
 "#;
+
+// ─── V29: fix V28's arch-blind Linux playbook ────────────────────────────
+//
+// V28 seeded `ff_git` and `forgefleetd_git` with a Linux playbook that
+// scp'd the leader's binary from Taylor (aarch64-apple-darwin) onto
+// Linux (x86_64) members. The binary can't exec — fleet-wide Exit 137 /
+// "Exec format error". Linux members must rebuild locally.
+//
+// Also: the V28 key was `linux`, but the resolver (`resolve_upgrade_plans`)
+// only checks `<os_family>-<install_source>`, `<os_family>`, and `all`.
+// Our `os_family` values are `linux-ubuntu` / `linux-dgx` — never bare
+// `linux` — so the V28 entry was doubly broken (wrong command AND dead
+// key). V29 writes both `linux-ubuntu` and `linux-dgx` and drops the
+// obsolete `linux` key.
+pub const SCHEMA_V29_FIX_FF_GIT_LINUX_PLAYBOOK: &str = r#"
+UPDATE software_registry
+   SET upgrade_playbook = (upgrade_playbook - 'linux')
+       || jsonb_build_object(
+           'linux-ubuntu',
+           'export PATH=$HOME/.cargo/bin:$PATH && cd ~/projects/forge-fleet && git pull --ff-only && cargo build --release -p ff-terminal && install -m 755 target/release/ff ~/.local/bin/ff && systemctl --user restart forgefleet-daemon.service',
+           'linux-dgx',
+           'export PATH=$HOME/.cargo/bin:$PATH && cd ~/projects/forge-fleet && git pull --ff-only && cargo build --release -p ff-terminal && install -m 755 target/release/ff ~/.local/bin/ff && systemctl --user restart forgefleet-daemon.service'
+       )
+ WHERE id = 'ff_git';
+
+UPDATE software_registry
+   SET upgrade_playbook = (upgrade_playbook - 'linux')
+       || jsonb_build_object(
+           'linux-ubuntu',
+           'export PATH=$HOME/.cargo/bin:$PATH && cd ~/projects/forge-fleet && git pull --ff-only && cargo build --release -p forge-fleet && install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && systemctl --user restart forgefleet-node.service',
+           'linux-dgx',
+           'export PATH=$HOME/.cargo/bin:$PATH && cd ~/projects/forge-fleet && git pull --ff-only && cargo build --release -p forge-fleet && install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && systemctl --user restart forgefleet-node.service'
+       )
+ WHERE id = 'forgefleetd_git';
+"#;

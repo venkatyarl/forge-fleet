@@ -282,6 +282,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "software_registry_seed",
         sql: schema::SCHEMA_V28_SOFTWARE_REGISTRY_SEED,
     },
+    PgMigration {
+        version: 29,
+        name: "fix_ff_git_linux_playbook",
+        sql: schema::SCHEMA_V29_FIX_FF_GIT_LINUX_PLAYBOOK,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.
