@@ -381,6 +381,18 @@ enum FleetCommand {
         /// Required — removal is destructive.
         #[arg(long, default_value_t = false)] yes: bool,
     },
+    /// EMERGENCY: wipe every non-Taylor computer from the fleet registry.
+    ///
+    /// Iterates every computer whose name is not "taylor" and runs the same
+    /// removal logic as `remove-computer` against each. Intended for rebuilds
+    /// from scratch. Requires BOTH `--yes` and `--i-know-what-im-doing`.
+    Disband {
+        /// Required — disbanding is destructive.
+        #[arg(long, default_value_t = false)] yes: bool,
+        /// Second required flag — makes the operator spell out the consequence.
+        #[arg(long = "i-know-what-im-doing", default_value_t = false)]
+        i_know_what_im_doing: bool,
+    },
     /// Rotate a computer's own SSH keypair. Currently stubbed.
     RotateSshKey {
         #[arg(long)] computer: String,
@@ -5082,6 +5094,9 @@ async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
         FleetCommand::RemoveComputer { name, yes } => {
             handle_fleet_remove_computer(&pool, &name, yes).await?;
         }
+        FleetCommand::Disband { yes, i_know_what_im_doing } => {
+            handle_fleet_disband(&pool, yes, i_know_what_im_doing).await?;
+        }
         FleetCommand::RotateSshKey { computer } => {
             let mgr = ff_agent::ssh_key_manager::SshKeyManager::new(pool.clone());
             match mgr.rotate_computer_keypair(&computer).await {
@@ -6392,6 +6407,96 @@ async fn handle_fleet_remove_computer(
     if let Some(id) = &report.revocation_task_id {
         println!("  enqueued SSH-revocation task: {id}");
         println!("  track progress with: ff defer list");
+    }
+    Ok(())
+}
+
+async fn handle_fleet_disband(
+    pool: &sqlx::PgPool,
+    yes: bool,
+    i_know_what_im_doing: bool,
+) -> Result<()> {
+    // Collect every computer that isn't Taylor. We look at both tables
+    // because a computer may exist in one but not the other if something
+    // went sideways during onboarding.
+    let fleet_names: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM fleet_nodes WHERE LOWER(name) <> 'taylor' ORDER BY name",
+    )
+    .fetch_all(pool)
+    .await?;
+    let computer_names: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM computers WHERE LOWER(name) <> 'taylor' ORDER BY name",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut targets: Vec<String> = fleet_names.clone();
+    for n in &computer_names {
+        if !targets.contains(n) {
+            targets.push(n.clone());
+        }
+    }
+    targets.sort();
+
+    println!("{CYAN}▶ ff fleet disband{RESET}");
+    println!(
+        "  This will DELETE every fleet_nodes/computers row except 'taylor'."
+    );
+    println!(
+        "  Requires BOTH --yes AND --i-know-what-im-doing to actually run."
+    );
+    println!("  targets:         {} computer(s)", targets.len());
+    for n in &targets {
+        println!("    {n}");
+    }
+
+    if targets.is_empty() {
+        println!("{YELLOW}No non-Taylor rows to remove. Nothing to do.{RESET}");
+        return Ok(());
+    }
+
+    if !(yes && i_know_what_im_doing) {
+        eprintln!(
+            "\n{YELLOW}Refusing to disband without both --yes and --i-know-what-im-doing.{RESET}"
+        );
+        std::process::exit(2);
+    }
+
+    let mut total_rows: u64 = 0;
+    let mut total_tasks: u64 = 0;
+    let mut failures: Vec<(String, String)> = Vec::new();
+    for name in &targets {
+        print!("  removing {name}... ");
+        match remove_computer_core(pool, name).await {
+            Ok(r) => {
+                let sub = r.computer_rows
+                    + r.fleet_node_rows
+                    + r.fleet_models_rows
+                    + r.leader_state_rows;
+                total_rows += sub;
+                if r.revocation_task_id.is_some() {
+                    total_tasks += 1;
+                }
+                println!("ok ({sub} rows)");
+            }
+            Err(e) => {
+                println!("{RED}FAIL{RESET} ({e})");
+                failures.push((name.clone(), e.to_string()));
+            }
+        }
+    }
+    println!(
+        "\n{GREEN}✓ disband complete{RESET} — {n} computer(s) removed, \
+         {r} DB row(s) deleted, {t} SSH-revocation task(s) enqueued",
+        n = targets.len() - failures.len(),
+        r = total_rows,
+        t = total_tasks,
+    );
+    if !failures.is_empty() {
+        eprintln!("{RED}Failures:{RESET}");
+        for (name, err) in &failures {
+            eprintln!("  {name}: {err}");
+        }
     }
     Ok(())
 }
