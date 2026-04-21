@@ -133,8 +133,14 @@ impl UpstreamChecker {
                 .unwrap_or("")
                 .to_string();
 
-            let query_result =
-                query_upstream(&http, &method, &version_source, github_token.as_deref()).await;
+            // `self_built` lives inline because it needs the pool (the leader
+            // state lookup is a DB query, not an HTTP call). Every other
+            // method goes through `query_upstream`.
+            let query_result = if method == "self_built" {
+                query_self_built(&self.pg, &id).await
+            } else {
+                query_upstream(&http, &method, &version_source, github_token.as_deref()).await
+            };
 
             match query_result {
                 UpstreamResult::Version(new_version) => {
@@ -277,6 +283,37 @@ enum UpstreamResult {
     Skipped(String),
     /// Queried but failed (HTTP, parse, missing field).
     Error(String),
+}
+
+/// Resolve the "latest" version for a self-built binary (e.g. `ff_git`,
+/// `forgefleetd_git`). The leader-of-truth's installed version IS the
+/// canonical version — by definition it's the freshest build in the fleet.
+/// Any computer whose install differs from the leader's will get flipped
+/// to `upgrade_available` by the normal drift loop.
+///
+/// Returns `Skipped` when no leader has recorded an install yet (first
+/// boot) — prevents a half-initialized fleet from flagging every node
+/// as out-of-date.
+async fn query_self_built(pool: &PgPool, id: &str) -> UpstreamResult {
+    let latest: Option<String> = sqlx::query_scalar(
+        "SELECT cs.installed_version
+           FROM computer_software cs
+           JOIN computers c ON c.id = cs.computer_id
+           JOIN fleet_leader_state ls ON ls.computer_id = c.id
+          WHERE cs.software_id = $1
+            AND cs.installed_version IS NOT NULL
+          LIMIT 1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+
+    match latest {
+        Some(v) if !v.is_empty() => UpstreamResult::Version(v),
+        _ => UpstreamResult::Skipped("no leader install recorded yet".into()),
+    }
 }
 
 /// Dispatch one row based on its `version_source.method`.

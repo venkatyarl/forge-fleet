@@ -32,8 +32,19 @@ const YELLOW: &str = "\x1b[33m";
 const RED: &str = "\x1b[31m";
 const RESET: &str = "\x1b[0m";
 
+/// clap's `--version` flag prints THIS string. Must match the `Command::Version`
+/// subcommand branches below (`ff 2026.4.7 (build <sha>)`) so both code paths
+/// expose the SHA — the drift collector greps for `(build <sha>)` regardless
+/// of which path the operator takes.
+const FF_LONG_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (build ",
+    env!("FF_GIT_SHA"),
+    ")"
+);
+
 #[derive(Debug, Parser)]
-#[command(name = "ff", version, about = "ForgeFleet — distributed AI agent platform")]
+#[command(name = "ff", version = FF_LONG_VERSION, about = "ForgeFleet — distributed AI agent platform")]
 struct Cli {
     #[arg(long, global = true)]
     config: Option<PathBuf>,
@@ -1189,7 +1200,7 @@ async fn main() -> Result<()> {
     // Fast-path subcommands that don't need the inference router or any LLM probing.
     // Skips a network round-trip to the fleet + `/v1/models` HTTP fetch.
     match &cli.command {
-        Some(Command::Version) => { println!("ff {}", env!("CARGO_PKG_VERSION")); return Ok(()); }
+        Some(Command::Version) => { println!("ff {} (build {})", env!("CARGO_PKG_VERSION"), env!("FF_GIT_SHA")); return Ok(()); }
         Some(Command::Secrets { command }) => return handle_secrets(command.clone()).await,
         Some(Command::Defer   { command }) => return handle_defer(command.clone()).await,
         Some(Command::Model   { command }) => return handle_model(command.clone()).await,
@@ -1293,7 +1304,7 @@ async fn main() -> Result<()> {
         Some(Command::Proxy { port }) => { println!("{CYAN}▶ Starting LLM proxy on 0.0.0.0:{port}{RESET}"); Ok(()) }
         Some(Command::Discover { subnet }) => { println!("{CYAN}▶ Discovering nodes on {subnet}{RESET}"); Ok(()) }
         Some(Command::Config { command }) => handle_config(command, &config_path).await,
-        Some(Command::Version) => { println!("ff {}", env!("CARGO_PKG_VERSION")); Ok(()) }
+        Some(Command::Version) => { println!("ff {} (build {})", env!("CARGO_PKG_VERSION"), env!("FF_GIT_SHA")); Ok(()) }
         Some(Command::Run { prompt, output, mode, max_turns }) => {
             let mode_norm = mode.to_lowercase();
             if mode_norm != "agent" && mode_norm != "oneshot" {

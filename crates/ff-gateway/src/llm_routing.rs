@@ -295,6 +295,15 @@ impl PulseLlmRouter {
             });
         };
 
+        // Rewrite body.model to the concrete backend's model_id. llama.cpp
+        // servers ignore the model field (they use whatever was loaded with
+        // -m), but mlx_lm.server dispatches on it — without this rewrite,
+        // MLX tries to fetch the pool alias literal ("multimodal", "coder")
+        // from HuggingFace and 404s.
+        if requested_model != server.model.id {
+            body["model"] = Value::String(server.model.id.clone());
+        }
+
         // Beats report endpoints as `http://127.0.0.1:PORT` (because the LLM
         // probe runs on the same host as the inference server). Rewrite the
         // loopback host to the node's primary IP so the gateway can reach it

@@ -47,6 +47,41 @@ macos = "cd ~/taylorProjects/forge-fleet && git pull && cargo build --release -p
 linux-ubuntu = "cd ~/taylorProjects/forge-fleet && git pull && cargo build --release -p forgefleetd && install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd"
 linux-dgx = "cd ~/taylorProjects/forge-fleet && git pull && cargo build --release -p forgefleetd && install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd"
 
+# ── Self-built drift sentinels ──────────────────────────────────────────
+#
+# The `ff`/`forgefleetd` entries above only detect drift when Cargo.toml's
+# version string bumps — which it rarely does between rebuilds. The
+# `_git` variants below track the git SHA baked into each binary at
+# build time (via crates/ff-terminal/build.rs and build.rs), giving us
+# per-commit drift detection. `method = "self_built"` tells the upstream
+# checker to treat the fleet leader's installed SHA as canonical.
+#
+# NOTE: Linux playbook uses Taylor's IP directly. Parameterizing it
+# through dynamic leader discovery is a separate gap — hardcoded is
+# acceptable for the first self-healing pass.
+
+[[software]]
+id = "ff_git"
+display_name = "ff (git SHA of built binary)"
+kind = "binary"
+version_source = { method = "self_built" }
+requires_restart = false
+
+[software.upgrade_playbook]
+macos = "cd ~/projects/forge-fleet && git pull --ff-only && cargo build --release -p ff-terminal && install -m 755 target/release/ff ~/.local/bin/ff && codesign --force --sign - ~/.local/bin/ff"
+linux = "scp -o BatchMode=yes -o StrictHostKeyChecking=accept-new venkat@192.168.5.100:~/.local/bin/ff ~/.local/bin/ff.new && install -m 755 ~/.local/bin/ff.new ~/.local/bin/ff && rm ~/.local/bin/ff.new && systemctl --user restart forgefleet-daemon.service"
+
+[[software]]
+id = "forgefleetd_git"
+display_name = "forgefleetd (git SHA of built binary)"
+kind = "binary"
+version_source = { method = "self_built" }
+requires_restart = true
+
+[software.upgrade_playbook]
+macos = "cd ~/projects/forge-fleet && git pull --ff-only && cargo build --release -p forge-fleet && install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && codesign --force --sign - ~/.local/bin/forgefleetd && launchctl kickstart -k gui/$(id -u)/com.forgefleet.forgefleetd"
+linux = "scp -o BatchMode=yes -o StrictHostKeyChecking=accept-new venkat@192.168.5.100:~/.local/bin/forgefleetd ~/.local/bin/forgefleetd.new && install -m 755 ~/.local/bin/forgefleetd.new ~/.local/bin/forgefleetd && rm ~/.local/bin/forgefleetd.new && systemctl --user restart forgefleet-node.service"
+
 # ---------------------------------------------------------------------------
 # Agent platforms
 # ---------------------------------------------------------------------------

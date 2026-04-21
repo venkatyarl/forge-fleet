@@ -31,7 +31,9 @@ impl SoftwareCollector {
         Self {
             known_ids: vec![
                 "ff",
+                "ff_git",
                 "forgefleetd",
+                "forgefleetd_git",
                 "openclaw",
                 "gh",
                 "op",
@@ -60,6 +62,14 @@ impl SoftwareCollector {
         let mut out: Vec<InstalledSoftware> = Vec::new();
 
         // ── ff ──────────────────────────────────────────────────────────
+        //
+        // `ff --version` now prints `ff 2026.4.7 (build 8355028d1)` — both
+        // parts are captured. The semver goes to `ff` (unchanged behavior);
+        // the SHA goes to `ff_git` so the upstream checker's `self_built`
+        // method has something to compare against. If the SHA parse fails
+        // (old binary, unknown SHA), the `_git` row is skipped — the
+        // semver row is still emitted so the existing pipeline keeps
+        // working.
         if let Some(path) = which("ff") {
             if let Some(raw) = run("ff", &["--version"]) {
                 if let Some(ver) = regex_capture(&raw, r"ff\s+(\S+)") {
@@ -67,22 +77,55 @@ impl SoftwareCollector {
                         id: "ff".into(),
                         version: ver,
                         install_source: Some(classify_ff_source(&path)),
+                        install_path: Some(path.clone()),
+                    });
+                }
+                if let Some(sha) = parse_build_sha(&raw) {
+                    out.push(InstalledSoftware {
+                        id: "ff_git".into(),
+                        version: sha,
+                        install_source: Some(classify_ff_source(&path)),
                         install_path: Some(path),
                     });
+                } else {
+                    tracing::debug!(
+                        raw = %raw,
+                        "ff --version has no '(build <sha>)' suffix — skipping ff_git row"
+                    );
                 }
             }
         }
 
         // ── forgefleetd ─────────────────────────────────────────────────
+        //
+        // Same split as `ff` above: semver → `forgefleetd`, SHA →
+        // `forgefleetd_git`. The binary prints `forgefleet 2026.4.7 (build
+        // 8355028d1)` (note: banner word is "forgefleet", not
+        // "forgefleetd"); the regex targets the semver, not the name.
         if let Some(path) = which("forgefleetd") {
             if let Some(raw) = run("forgefleetd", &["--version"]) {
-                let ver = regex_capture(&raw, r"(\S+)$").unwrap_or(raw.clone());
+                let ver = regex_capture(&raw, r"forgefleet\S*\s+(\S+)")
+                    .or_else(|| regex_capture(&raw, r"(\S+)$"))
+                    .unwrap_or(raw.clone());
                 out.push(InstalledSoftware {
                     id: "forgefleetd".into(),
                     version: ver.trim().to_string(),
                     install_source: Some(classify_ff_source(&path)),
-                    install_path: Some(path),
+                    install_path: Some(path.clone()),
                 });
+                if let Some(sha) = parse_build_sha(&raw) {
+                    out.push(InstalledSoftware {
+                        id: "forgefleetd_git".into(),
+                        version: sha,
+                        install_source: Some(classify_ff_source(&path)),
+                        install_path: Some(path),
+                    });
+                } else {
+                    tracing::debug!(
+                        raw = %raw,
+                        "forgefleetd --version has no '(build <sha>)' suffix — skipping forgefleetd_git row"
+                    );
+                }
             }
         }
 
@@ -392,6 +435,15 @@ fn regex_capture(s: &str, pattern: &str) -> Option<String> {
         .map(|m| m.as_str().to_string())
 }
 
+/// Parse the `(build <sha>)` suffix that `ff`/`forgefleetd` now emit. Returns
+/// `None` when the suffix is absent (pre-vergen binary) or the literal
+/// `"unknown"` (build.rs ran outside a git checkout — no drift signal
+/// possible, so we deliberately drop it rather than pollute the DB).
+fn parse_build_sha(raw: &str) -> Option<String> {
+    let sha = regex_capture(raw, r"\(build\s+([0-9a-f]{6,40})\)")?;
+    if sha == "unknown" { None } else { Some(sha) }
+}
+
 /// `ff` and `forgefleetd` are usually direct installs — either in
 /// `~/.local/bin/` or `~/.cargo/bin/`.
 fn classify_ff_source(path: &str) -> String {
@@ -580,6 +632,26 @@ mod tests {
         assert_eq!(sanitize_version(&long), None);
         let sixty_four = "y".repeat(64);
         assert_eq!(sanitize_version(&sixty_four), Some(sixty_four));
+    }
+
+    #[test]
+    fn parse_build_sha_extracts_suffix() {
+        assert_eq!(
+            parse_build_sha("ff 2026.4.7 (build 8355028d1a)"),
+            Some("8355028d1a".to_string())
+        );
+        assert_eq!(
+            parse_build_sha("forgefleet 2026.4.7 (build abcdef0123)"),
+            Some("abcdef0123".to_string())
+        );
+        // Pre-vergen binary (no suffix) — no SHA to report.
+        assert_eq!(parse_build_sha("ff 2026.4.7"), None);
+        // Build ran outside git — deliberately dropped so we don't seed
+        // `"unknown"` into computer_software rows.
+        assert_eq!(parse_build_sha("ff 2026.4.7 (build unknown)"), None);
+        // Uppercase hex — regex is case-sensitive by design; SHAs from
+        // `git rev-parse --short` are always lowercase.
+        assert_eq!(parse_build_sha("ff 2026.4.7 (build ABCDEF0123)"), None);
     }
 
     #[test]

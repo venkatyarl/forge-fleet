@@ -33,8 +33,17 @@ use ff_updater::verifier::VerifierConfig;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
+/// clap's `--version` output. Mirrors the `Command::Version` subcommand
+/// branch so the drift collector sees `(build <sha>)` on either path.
+const FORGEFLEET_LONG_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (build ",
+    env!("FF_GIT_SHA"),
+    ")"
+);
+
 #[derive(Debug, Parser)]
-#[command(name = "forgefleet", version, about = "ForgeFleet unified daemon")]
+#[command(name = "forgefleet", version = FORGEFLEET_LONG_VERSION, about = "ForgeFleet unified daemon")]
 struct Cli {
     /// Config file path (defaults to ~/.forgefleet/fleet.toml)
     #[arg(long)]
@@ -94,7 +103,11 @@ async fn main() -> Result<()> {
         Command::Start(args) => run_daemon(&cli, args).await,
         Command::Status => run_status(&cli),
         Command::Version => {
-            println!("forgefleet {}", env!("CARGO_PKG_VERSION"));
+            println!(
+                "forgefleet {} (build {})",
+                env!("CARGO_PKG_VERSION"),
+                env!("FF_GIT_SHA")
+            );
             Ok(())
         }
     }
