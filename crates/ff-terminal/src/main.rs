@@ -393,6 +393,20 @@ enum FleetCommand {
         #[arg(long = "i-know-what-im-doing", default_value_t = false)]
         i_know_what_im_doing: bool,
     },
+    /// Plan 14 source-tree migration: move `~/taylorProjects/forge-fleet`
+    /// to the canonical path (`computers.source_tree_path`, default
+    /// `~/.forgefleet/sub-agent-0/forge-fleet`) on every non-Taylor node.
+    ///
+    /// Inspects each node over SSH, prints a plan (legacy present / canonical
+    /// present / needs clone), and with --yes enqueues one deferred shell task
+    /// per candidate (trigger=node_online). Idempotent: already-migrated nodes
+    /// are skipped.
+    MigrateSourceTrees {
+        /// Print the plan and exit without enqueueing.
+        #[arg(long, default_value_t = false)] dry_run: bool,
+        /// Required to actually enqueue (otherwise prints plan and exits).
+        #[arg(long, default_value_t = false)] yes: bool,
+    },
     /// Rotate a computer's own SSH keypair. Currently stubbed.
     RotateSshKey {
         #[arg(long)] computer: String,
@@ -5097,6 +5111,9 @@ async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
         FleetCommand::Disband { yes, i_know_what_im_doing } => {
             handle_fleet_disband(&pool, yes, i_know_what_im_doing).await?;
         }
+        FleetCommand::MigrateSourceTrees { dry_run, yes } => {
+            handle_fleet_migrate_source_trees(&pool, dry_run, yes).await?;
+        }
         FleetCommand::RotateSshKey { computer } => {
             let mgr = ff_agent::ssh_key_manager::SshKeyManager::new(pool.clone());
             match mgr.rotate_computer_keypair(&computer).await {
@@ -6499,6 +6516,211 @@ async fn handle_fleet_disband(
         }
     }
     Ok(())
+}
+
+async fn handle_fleet_migrate_source_trees(
+    pool: &sqlx::PgPool,
+    dry_run: bool,
+    yes: bool,
+) -> Result<()> {
+    // Build the candidate set: every computer that isn't Taylor.
+    // We join fleet_nodes (for ssh_user/ip) with computers (for
+    // source_tree_path) on name.
+    #[derive(Debug)]
+    struct Candidate {
+        name: String,
+        ip: String,
+        ssh_user: String,
+        canonical: String,
+    }
+    let rows = sqlx::query(
+        "SELECT n.name, n.ip, n.ssh_user,
+                COALESCE(c.source_tree_path, '~/.forgefleet/sub-agent-0/forge-fleet') AS canonical
+           FROM fleet_nodes n
+           LEFT JOIN computers c ON c.name = n.name
+          WHERE LOWER(n.name) <> 'taylor'
+          ORDER BY n.name",
+    )
+    .fetch_all(pool)
+    .await?;
+    let candidates: Vec<Candidate> = rows
+        .iter()
+        .map(|r| Candidate {
+            name: sqlx::Row::get(r, "name"),
+            ip: sqlx::Row::get(r, "ip"),
+            ssh_user: sqlx::Row::get(r, "ssh_user"),
+            canonical: sqlx::Row::get(r, "canonical"),
+        })
+        .collect();
+
+    println!("{CYAN}▶ ff fleet migrate-source-trees{RESET}");
+    println!("  candidates: {} non-Taylor node(s)", candidates.len());
+    if candidates.is_empty() {
+        println!("{YELLOW}No non-Taylor nodes. Nothing to do.{RESET}");
+        return Ok(());
+    }
+
+    // Probe each candidate over SSH for the two paths. Best-effort; if the
+    // node is offline we can still enqueue — the task fires on `node_online`.
+    struct Probed {
+        c: Candidate,
+        legacy_exists: bool,
+        canonical_exists: bool,
+        ssh_reachable: bool,
+    }
+    let mut probed: Vec<Probed> = Vec::with_capacity(candidates.len());
+    for c in candidates {
+        let host = &c.ip;
+        let user = &c.ssh_user;
+        let target = format!("{user}@{host}");
+        // One SSH call returns both flags, separated by "|".
+        let script =
+            "legacy=0; canonical=0; \
+             [ -d ~/taylorProjects/forge-fleet ] && legacy=1; \
+             [ -d ~/.forgefleet/sub-agent-0/forge-fleet/.git ] && canonical=1; \
+             echo \"$legacy|$canonical\"";
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(6),
+            tokio::process::Command::new("ssh")
+                .args([
+                    "-o", "BatchMode=yes",
+                    "-o", "ConnectTimeout=4",
+                    "-o", "StrictHostKeyChecking=accept-new",
+                    &target,
+                    script,
+                ])
+                .output(),
+        )
+        .await;
+        let (legacy, canonical, reach) = match out {
+            Ok(Ok(o)) if o.status.success() => {
+                let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                let parts: Vec<&str> = s.split('|').collect();
+                (
+                    parts.first().map(|v| *v == "1").unwrap_or(false),
+                    parts.get(1).map(|v| *v == "1").unwrap_or(false),
+                    true,
+                )
+            }
+            _ => (false, false, false),
+        };
+        probed.push(Probed {
+            c,
+            legacy_exists: legacy,
+            canonical_exists: canonical,
+            ssh_reachable: reach,
+        });
+    }
+
+    println!(
+        "\n  {:<14} {:<16} {:<7} {:<10} {:<10} {}",
+        "node", "ip", "ssh", "legacy", "canonical", "action"
+    );
+    let mut to_enqueue: Vec<&Probed> = Vec::new();
+    for p in &probed {
+        let action = if !p.ssh_reachable {
+            "enqueue (offline — runs on node_online)"
+        } else if p.canonical_exists && !p.legacy_exists {
+            "skip (already migrated)"
+        } else if p.legacy_exists && p.canonical_exists {
+            "enqueue (drop legacy, canonical already present)"
+        } else if p.legacy_exists {
+            "enqueue (move legacy → canonical)"
+        } else {
+            "enqueue (fresh clone into canonical)"
+        };
+        println!(
+            "  {:<14} {:<16} {:<7} {:<10} {:<10} {}",
+            p.c.name,
+            p.c.ip,
+            if p.ssh_reachable { "ok" } else { "down" },
+            if p.legacy_exists { "yes" } else { "no" },
+            if p.canonical_exists { "yes" } else { "no" },
+            action,
+        );
+        let already_migrated = p.ssh_reachable && p.canonical_exists && !p.legacy_exists;
+        if !already_migrated {
+            to_enqueue.push(p);
+        }
+    }
+
+    if dry_run {
+        println!(
+            "\n{YELLOW}Dry run — not enqueuing. Drop --dry-run and pass --yes to enqueue.{RESET}"
+        );
+        return Ok(());
+    }
+    if !yes {
+        println!(
+            "\n{YELLOW}Pass --yes to enqueue {} migration task(s).{RESET}",
+            to_enqueue.len()
+        );
+        return Ok(());
+    }
+    if to_enqueue.is_empty() {
+        println!("\n{GREEN}✓ nothing to enqueue — every candidate is already on the canonical path.{RESET}");
+        return Ok(());
+    }
+
+    let who = whoami_tag();
+    let mut enqueued: Vec<(String, String)> = Vec::with_capacity(to_enqueue.len());
+    for p in to_enqueue {
+        let script = build_migrate_source_tree_script(&p.c.canonical);
+        let title = format!("Migrate source tree: {}", p.c.name);
+        let payload = serde_json::json!({ "command": script });
+        let trigger_spec = serde_json::json!({ "node": p.c.name });
+        let id = ff_db::pg_enqueue_deferred(
+            pool,
+            &title,
+            "shell",
+            &payload,
+            "node_online",
+            &trigger_spec,
+            Some(&p.c.name),
+            &serde_json::json!([]),
+            Some(&who),
+            Some(3),
+        )
+        .await?;
+        enqueued.push((p.c.name.clone(), id));
+    }
+    println!(
+        "\n{GREEN}✓ enqueued {} migration task(s):{RESET}",
+        enqueued.len()
+    );
+    for (name, id) in &enqueued {
+        println!("  {:<14} {id}", name);
+    }
+    println!("\nTrack progress with: ff defer list");
+    Ok(())
+}
+
+/// Emit the idempotent shell script used by `ff fleet migrate-source-trees`.
+/// Mirrors the command spec in issue #120: if canonical/.git is already
+/// present drop the legacy dir; otherwise move-or-clone into canonical.
+fn build_migrate_source_tree_script(canonical: &str) -> String {
+    // `canonical` comes from the DB; never user-shell-input. Still, keep it
+    // quoted to be safe against spaces.
+    format!(
+        r#"set -e
+CANONICAL="{canonical}"
+mkdir -p "$(dirname "$CANONICAL")"
+if [ -d "$CANONICAL/.git" ]; then
+  rm -rf ~/taylorProjects/forge-fleet
+  echo "canonical already present — dropped legacy"
+  exit 0
+fi
+if [ -d ~/taylorProjects/forge-fleet/.git ]; then
+  mv ~/taylorProjects/forge-fleet "$CANONICAL"
+  echo "moved legacy → canonical"
+else
+  git clone https://github.com/venkatyarl/forge-fleet "$CANONICAL"
+  rm -rf ~/taylorProjects/forge-fleet
+  echo "fresh clone into canonical"
+fi
+"#,
+        canonical = canonical,
+    )
 }
 
 async fn handle_fleet_rotate_pulse_hmac(
