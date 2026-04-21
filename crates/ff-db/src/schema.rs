@@ -1937,3 +1937,155 @@ UPDATE software_registry
        )
  WHERE id = 'forgefleetd_git';
 "#;
+
+// ─── V30: self-heal ~/projects/forge-fleet checkout + retire ~/taylorProjects ─
+//
+// V29 assumed every member already had a valid `~/projects/forge-fleet`
+// checkout of `github.com/venkatyarl/forge-fleet`. In practice many nodes
+// still had `~/taylorProjects/forge-fleet` from the pre-migration era or
+// had an empty `~/projects/` directory. The V29 playbook hung on first
+// `git pull` or failed with "fatal: not a git repository."
+//
+// V30 embeds a self-healing prologue in each playbook command:
+//   1. Drops any stale `~/taylorProjects/forge-fleet` (repo moved GitHub
+//      account).
+//   2. Verifies the existing `~/projects/forge-fleet` checkout's remote
+//      matches the expected URL; if not, wipes and re-clones.
+//   3. Clones fresh if the checkout is missing.
+//   4. Falls through to `git pull --ff-only` + `cargo build`.
+// Idempotent; the prologue is smart enough to keep a valid checkout and
+// only wipe when the remote is wrong or the checkout is missing.
+
+pub const SCHEMA_V30_PLAYBOOK_SELF_HEAL_REPO: &str = r#"
+-- Shared prologue (bash): ensures ~/projects/forge-fleet is a fresh checkout
+-- of github.com/venkatyarl/forge-fleet before cargo build runs.
+--
+-- Algorithm:
+--   - Drop stale ~/taylorProjects/forge-fleet (the repo moved GitHub accounts)
+--   - If ~/projects/forge-fleet/.git exists, verify remote; if wrong, wipe
+--   - Clone if missing
+--   - git pull --ff-only
+
+UPDATE software_registry
+   SET upgrade_playbook = jsonb_build_object(
+       'macos',
+       'rm -rf ~/taylorProjects/forge-fleet 2>/dev/null; mkdir -p ~/projects; if [ -d ~/projects/forge-fleet/.git ]; then ACTUAL=$(cd ~/projects/forge-fleet && git remote get-url origin 2>/dev/null); EXPECTED=https://github.com/venkatyarl/forge-fleet; case "$ACTUAL" in "$EXPECTED"|"$EXPECTED.git") : ;; *) rm -rf ~/projects/forge-fleet ;; esac; fi; [ ! -d ~/projects/forge-fleet/.git ] && git clone https://github.com/venkatyarl/forge-fleet ~/projects/forge-fleet; cd ~/projects/forge-fleet && git pull --ff-only && cargo build --release -p ff-terminal && install -m 755 target/release/ff ~/.local/bin/ff && codesign --force --sign - ~/.local/bin/ff',
+       'linux-ubuntu',
+       'export PATH=$HOME/.cargo/bin:$PATH; rm -rf ~/taylorProjects/forge-fleet 2>/dev/null; mkdir -p ~/projects; if [ -d ~/projects/forge-fleet/.git ]; then ACTUAL=$(cd ~/projects/forge-fleet && git remote get-url origin 2>/dev/null); EXPECTED=https://github.com/venkatyarl/forge-fleet; case "$ACTUAL" in "$EXPECTED"|"$EXPECTED.git") : ;; *) rm -rf ~/projects/forge-fleet ;; esac; fi; [ ! -d ~/projects/forge-fleet/.git ] && git clone https://github.com/venkatyarl/forge-fleet ~/projects/forge-fleet; cd ~/projects/forge-fleet && git pull --ff-only && cargo build --release -p ff-terminal && install -m 755 target/release/ff ~/.local/bin/ff && systemctl --user restart forgefleet-daemon.service',
+       'linux-dgx',
+       'export PATH=$HOME/.cargo/bin:$PATH; rm -rf ~/taylorProjects/forge-fleet 2>/dev/null; mkdir -p ~/projects; if [ -d ~/projects/forge-fleet/.git ]; then ACTUAL=$(cd ~/projects/forge-fleet && git remote get-url origin 2>/dev/null); EXPECTED=https://github.com/venkatyarl/forge-fleet; case "$ACTUAL" in "$EXPECTED"|"$EXPECTED.git") : ;; *) rm -rf ~/projects/forge-fleet ;; esac; fi; [ ! -d ~/projects/forge-fleet/.git ] && git clone https://github.com/venkatyarl/forge-fleet ~/projects/forge-fleet; cd ~/projects/forge-fleet && git pull --ff-only && cargo build --release -p ff-terminal && install -m 755 target/release/ff ~/.local/bin/ff && systemctl --user restart forgefleet-daemon.service'
+   )
+ WHERE id = 'ff_git';
+
+UPDATE software_registry
+   SET upgrade_playbook = jsonb_build_object(
+       'macos',
+       'rm -rf ~/taylorProjects/forge-fleet 2>/dev/null; mkdir -p ~/projects; if [ -d ~/projects/forge-fleet/.git ]; then ACTUAL=$(cd ~/projects/forge-fleet && git remote get-url origin 2>/dev/null); EXPECTED=https://github.com/venkatyarl/forge-fleet; case "$ACTUAL" in "$EXPECTED"|"$EXPECTED.git") : ;; *) rm -rf ~/projects/forge-fleet ;; esac; fi; [ ! -d ~/projects/forge-fleet/.git ] && git clone https://github.com/venkatyarl/forge-fleet ~/projects/forge-fleet; cd ~/projects/forge-fleet && git pull --ff-only && cargo build --release -p forge-fleet && install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && codesign --force --sign - ~/.local/bin/forgefleetd && launchctl kickstart -k gui/$(id -u)/com.forgefleet.forgefleetd',
+       'linux-ubuntu',
+       'export PATH=$HOME/.cargo/bin:$PATH; rm -rf ~/taylorProjects/forge-fleet 2>/dev/null; mkdir -p ~/projects; if [ -d ~/projects/forge-fleet/.git ]; then ACTUAL=$(cd ~/projects/forge-fleet && git remote get-url origin 2>/dev/null); EXPECTED=https://github.com/venkatyarl/forge-fleet; case "$ACTUAL" in "$EXPECTED"|"$EXPECTED.git") : ;; *) rm -rf ~/projects/forge-fleet ;; esac; fi; [ ! -d ~/projects/forge-fleet/.git ] && git clone https://github.com/venkatyarl/forge-fleet ~/projects/forge-fleet; cd ~/projects/forge-fleet && git pull --ff-only && cargo build --release -p forge-fleet && install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && systemctl --user restart forgefleet-node.service',
+       'linux-dgx',
+       'export PATH=$HOME/.cargo/bin:$PATH; rm -rf ~/taylorProjects/forge-fleet 2>/dev/null; mkdir -p ~/projects; if [ -d ~/projects/forge-fleet/.git ]; then ACTUAL=$(cd ~/projects/forge-fleet && git remote get-url origin 2>/dev/null); EXPECTED=https://github.com/venkatyarl/forge-fleet; case "$ACTUAL" in "$EXPECTED"|"$EXPECTED.git") : ;; *) rm -rf ~/projects/forge-fleet ;; esac; fi; [ ! -d ~/projects/forge-fleet/.git ] && git clone https://github.com/venkatyarl/forge-fleet ~/projects/forge-fleet; cd ~/projects/forge-fleet && git pull --ff-only && cargo build --release -p forge-fleet && install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && systemctl --user restart forgefleet-node.service'
+   )
+ WHERE id = 'forgefleetd_git';
+"#;
+
+// ─── V31: source_tree_path column + template playbook ─────────────────────
+//
+// Move the per-computer source-tree location into its own column so the
+// upgrade playbook becomes a clean template with no embedded one-time
+// migration logic. `resolve_upgrade_plans` substitutes `{{source_tree_path}}`
+// per-target at dispatch time. Canonical defaults:
+//   Taylor (dev workstation) → ~/projects/forge-fleet
+//   All other members        → ~/.forgefleet/sub-agent-0/forge-fleet
+// `~/taylorProjects` is retired; the runtime relocation itself is a
+// separate one-shot operator-run migration (`ff fleet migrate-source-trees`).
+pub const SCHEMA_V31_SOURCE_TREE_PATH: &str = r#"
+-- Track where each computer's forge-fleet checkout lives. Default
+-- differs by role: leader (Taylor) develops in ~/projects/forge-fleet;
+-- non-leader members clone into their sub-agent-0 workspace.
+
+ALTER TABLE computers ADD COLUMN IF NOT EXISTS source_tree_path TEXT;
+
+-- Backfill: Taylor → ~/projects; all others → ~/.forgefleet/sub-agent-0.
+UPDATE computers
+   SET source_tree_path = '~/projects/forge-fleet'
+ WHERE LOWER(name) = 'taylor' AND source_tree_path IS NULL;
+
+UPDATE computers
+   SET source_tree_path = '~/.forgefleet/sub-agent-0/forge-fleet'
+ WHERE LOWER(name) <> 'taylor' AND source_tree_path IS NULL;
+
+-- Replace V30's embedded-migration playbook with a clean template-based
+-- one. `{{source_tree_path}}` is substituted per-target at dispatch time
+-- by resolve_upgrade_plans.
+UPDATE software_registry
+   SET upgrade_playbook = jsonb_build_object(
+       'macos',
+       'mkdir -p "$(dirname {{source_tree_path}})" && [ -d "{{source_tree_path}}/.git" ] || git clone https://github.com/venkatyarl/forge-fleet "{{source_tree_path}}" && cd "{{source_tree_path}}" && git pull --ff-only && cargo build --release -p ff-terminal && install -m 755 target/release/ff ~/.local/bin/ff && codesign --force --sign - ~/.local/bin/ff',
+       'linux-ubuntu',
+       'export PATH=$HOME/.cargo/bin:$PATH && mkdir -p "$(dirname {{source_tree_path}})" && [ -d "{{source_tree_path}}/.git" ] || git clone https://github.com/venkatyarl/forge-fleet "{{source_tree_path}}" && cd "{{source_tree_path}}" && git pull --ff-only && cargo build --release -p ff-terminal && install -m 755 target/release/ff ~/.local/bin/ff && systemctl --user restart forgefleet-daemon.service',
+       'linux-dgx',
+       'export PATH=$HOME/.cargo/bin:$PATH && mkdir -p "$(dirname {{source_tree_path}})" && [ -d "{{source_tree_path}}/.git" ] || git clone https://github.com/venkatyarl/forge-fleet "{{source_tree_path}}" && cd "{{source_tree_path}}" && git pull --ff-only && cargo build --release -p ff-terminal && install -m 755 target/release/ff ~/.local/bin/ff && systemctl --user restart forgefleet-daemon.service'
+   )
+ WHERE id = 'ff_git';
+
+UPDATE software_registry
+   SET upgrade_playbook = jsonb_build_object(
+       'macos',
+       'mkdir -p "$(dirname {{source_tree_path}})" && [ -d "{{source_tree_path}}/.git" ] || git clone https://github.com/venkatyarl/forge-fleet "{{source_tree_path}}" && cd "{{source_tree_path}}" && git pull --ff-only && cargo build --release -p forge-fleet && install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && codesign --force --sign - ~/.local/bin/forgefleetd && launchctl kickstart -k gui/$(id -u)/com.forgefleet.forgefleetd',
+       'linux-ubuntu',
+       'export PATH=$HOME/.cargo/bin:$PATH && mkdir -p "$(dirname {{source_tree_path}})" && [ -d "{{source_tree_path}}/.git" ] || git clone https://github.com/venkatyarl/forge-fleet "{{source_tree_path}}" && cd "{{source_tree_path}}" && git pull --ff-only && cargo build --release -p forge-fleet && install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && systemctl --user restart forgefleet-node.service',
+       'linux-dgx',
+       'export PATH=$HOME/.cargo/bin:$PATH && mkdir -p "$(dirname {{source_tree_path}})" && [ -d "{{source_tree_path}}/.git" ] || git clone https://github.com/venkatyarl/forge-fleet "{{source_tree_path}}" && cd "{{source_tree_path}}" && git pull --ff-only && cargo build --release -p forge-fleet && install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && systemctl --user restart forgefleet-node.service'
+   )
+ WHERE id = 'forgefleetd_git';
+"#;
+
+// ─── V32: playbook production bug-fixes surfaced by the 05:58 UTC auto-run ──
+//
+// V31 shipped the template playbook but repeated V30's three production bugs
+// (plus a fourth I hadn't yet caught). The 05:58 autonomous tick surfaced
+// all four on real fleet nodes:
+//
+//   (a) `git pull --ff-only: Cannot fast-forward to multiple branches`
+//       on sophie (forgefleetd_git). Stray remote-tracking refs collide.
+//       Fix: replace with `git fetch origin main && git reset --hard
+//       origin/main` — idempotent, no ref collisions.
+//
+//   (b) `Failed to connect to bus: No medium found` on veronica (ff_git).
+//       systemctl --user needs XDG_RUNTIME_DIR to reach the session bus
+//       when invoked from a non-interactive shell. Fix: export
+//       XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}".
+//
+//   (c) `sh: cargo: command not found` on ace (forgefleetd_git — macOS).
+//       defer-worker shell on macOS doesn't inherit ~/.cargo/bin. V31 added
+//       PATH export for Linux but not macOS. Fix: add to macos entries too.
+//
+//   (d) (Discovered by V31 agent as a predicted-next-gap.) Tildes don't
+//       expand inside double-quoted strings. `cd "~/..."` fails. Fixed in
+//       auto_upgrade.rs substitution — `~/` → `$HOME/` at dispatch time. No
+//       DB change needed; included in the same logical commit.
+
+pub const SCHEMA_V32_PLAYBOOK_BUGFIXES: &str = r#"
+UPDATE software_registry
+   SET upgrade_playbook = jsonb_build_object(
+       'macos',
+       'export PATH="$HOME/.cargo/bin:$PATH" && mkdir -p "$(dirname {{source_tree_path}})" && { [ -d "{{source_tree_path}}/.git" ] || git clone https://github.com/venkatyarl/forge-fleet "{{source_tree_path}}"; } && cd "{{source_tree_path}}" && git fetch origin main && git reset --hard origin/main && cargo build --release -p ff-terminal && install -m 755 target/release/ff ~/.local/bin/ff && codesign --force --sign - ~/.local/bin/ff',
+       'linux-ubuntu',
+       'export PATH="$HOME/.cargo/bin:$PATH" && export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" && mkdir -p "$(dirname {{source_tree_path}})" && { [ -d "{{source_tree_path}}/.git" ] || git clone https://github.com/venkatyarl/forge-fleet "{{source_tree_path}}"; } && cd "{{source_tree_path}}" && git fetch origin main && git reset --hard origin/main && cargo build --release -p ff-terminal && install -m 755 target/release/ff ~/.local/bin/ff && systemctl --user restart forgefleet-daemon.service',
+       'linux-dgx',
+       'export PATH="$HOME/.cargo/bin:$PATH" && export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" && mkdir -p "$(dirname {{source_tree_path}})" && { [ -d "{{source_tree_path}}/.git" ] || git clone https://github.com/venkatyarl/forge-fleet "{{source_tree_path}}"; } && cd "{{source_tree_path}}" && git fetch origin main && git reset --hard origin/main && cargo build --release -p ff-terminal && install -m 755 target/release/ff ~/.local/bin/ff && systemctl --user restart forgefleet-daemon.service'
+   )
+ WHERE id = 'ff_git';
+
+UPDATE software_registry
+   SET upgrade_playbook = jsonb_build_object(
+       'macos',
+       'export PATH="$HOME/.cargo/bin:$PATH" && mkdir -p "$(dirname {{source_tree_path}})" && { [ -d "{{source_tree_path}}/.git" ] || git clone https://github.com/venkatyarl/forge-fleet "{{source_tree_path}}"; } && cd "{{source_tree_path}}" && git fetch origin main && git reset --hard origin/main && cargo build --release -p forge-fleet && install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && codesign --force --sign - ~/.local/bin/forgefleetd && launchctl kickstart -k gui/$(id -u)/com.forgefleet.forgefleetd',
+       'linux-ubuntu',
+       'export PATH="$HOME/.cargo/bin:$PATH" && export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" && mkdir -p "$(dirname {{source_tree_path}})" && { [ -d "{{source_tree_path}}/.git" ] || git clone https://github.com/venkatyarl/forge-fleet "{{source_tree_path}}"; } && cd "{{source_tree_path}}" && git fetch origin main && git reset --hard origin/main && cargo build --release -p forge-fleet && install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && systemctl --user restart forgefleet-node.service',
+       'linux-dgx',
+       'export PATH="$HOME/.cargo/bin:$PATH" && export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" && mkdir -p "$(dirname {{source_tree_path}})" && { [ -d "{{source_tree_path}}/.git" ] || git clone https://github.com/venkatyarl/forge-fleet "{{source_tree_path}}"; } && cd "{{source_tree_path}}" && git fetch origin main && git reset --hard origin/main && cargo build --release -p forge-fleet && install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && systemctl --user restart forgefleet-node.service'
+   )
+ WHERE id = 'forgefleetd_git';
+"#;

@@ -427,6 +427,29 @@ pub async fn self_enroll(
         .await
         .map_err(|e| db_err("pg_upsert_node", e))?;
 
+    // Seed `computers.source_tree_path` for this enrollment. Leader (Taylor)
+    // develops in `~/projects/forge-fleet`; every other member clones into
+    // its sub-agent-0 workspace. V31 backfilled existing rows; this keeps
+    // new enrollments consistent without re-running the migration.
+    // Safe no-op if the `computers` row doesn't exist yet (some enrollments
+    // create the `fleet_nodes` row first and the `computers` row is added
+    // later by Pulse/ops flows).
+    let default_source_tree_path = if node_row.role.eq_ignore_ascii_case("leader") {
+        "~/projects/forge-fleet"
+    } else {
+        "~/.forgefleet/sub-agent-0/forge-fleet"
+    };
+    let _ = sqlx::query(
+        "UPDATE computers
+            SET source_tree_path = $2
+          WHERE LOWER(name) = LOWER($1)
+            AND source_tree_path IS NULL",
+    )
+    .bind(&name)
+    .bind(default_source_tree_path)
+    .execute(pool)
+    .await;
+
     // Stash SSH identity.
     let user_pub = payload.ssh_identity.user_public_key.trim();
     if !user_pub.is_empty() {

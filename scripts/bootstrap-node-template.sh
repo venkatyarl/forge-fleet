@@ -67,6 +67,15 @@ run_as_user() {
   fi
 }
 
+# Resolve USER_HOME upfront — multiple later stages reference it (install
+# target, vllm venv path, ssh keypair, sub-agent workspaces). Leaving this
+# until later caused $USER_HOME expansion to empty and silent path breakage.
+USER_HOME="$(eval echo ~${SUDO_INVOKER})"
+
+# Pre-create directories the script writes to later. `install -m 755` does
+# NOT auto-create the parent; a fresh Ubuntu box has no ~/.local/bin.
+run_as_user mkdir -p "$USER_HOME/.local/bin" "$USER_HOME/.forgefleet/logs"
+
 say "ForgeFleet onboarding for $NAME ($IP) — runtime hint: $RUNTIME_HINT"
 report "start" running
 
@@ -75,9 +84,11 @@ report "start" running
 OS_FULL="unknown"
 OS_ID="unknown"
 if [ -f /etc/os-release ]; then
-  . /etc/os-release
-  OS_FULL="${PRETTY_NAME:-${NAME:-linux}}"
-  OS_ID="${ID:-linux}"
+  # Source in a subshell so /etc/os-release's NAME=Ubuntu can't clobber
+  # our operator-supplied $NAME (which is this node's fleet name, e.g. "sia").
+  # Previous bug: Sia enrolled as "ubuntu" because $NAME got overwritten here.
+  OS_FULL="$(. /etc/os-release; printf '%s' "${PRETTY_NAME:-${NAME:-linux}}")"
+  OS_ID="$(. /etc/os-release; printf '%s' "${ID:-linux}")"
 elif [ "$(uname)" = "Darwin" ]; then
   OS_FULL="macOS $(sw_vers -productVersion 2>/dev/null || echo unknown)"
   OS_ID="macos"
@@ -209,8 +220,54 @@ report "clone" ok
 report "build" running
 run_as_user bash -lc "cd '$REPO_DIR' && cargo build -p ff-terminal --release 2>&1 | tail -2" \
   || die "cargo build failed"
-run_as_user install -m 755 "$REPO_DIR/target/release/ff" "$(eval echo ~${SUDO_INVOKER})/.local/bin/ff"
+run_as_user install -m 755 "$REPO_DIR/target/release/ff" "$USER_HOME/.local/bin/ff"
 report "build" ok
+
+# ─── 6a. Node 22 + real dashboard build + forgefleetd ─────────────────────
+# Pulse publishing lives in forgefleetd (not ff daemon). Sia's first
+# enrollment skipped this and stayed dark in `ff fleet health`.
+# The `forge-fleet` crate's ff-gateway uses `#[derive(RustEmbed)]` pointing
+# at `dashboard/dist/` — the folder must exist at build time with the
+# compiled React assets. Operator directive: NEVER stub the dashboard —
+# every node must serve the real UI. Vite needs Node ≥ 20.19 / 22.12;
+# Ubuntu 24.04 apt ships Node 18 (too old), so we install Node 22 from
+# NodeSource on Linux and assume brew on macOS.
+case "$OS_ID" in
+  macos)
+    if ! command -v node >/dev/null 2>&1 || [ "$(node --version | cut -dv -f2 | cut -d. -f1)" -lt 20 ] 2>/dev/null; then
+      report "nodejs" running
+      run_as_user bash -lc 'command -v brew >/dev/null && brew install node@22 && brew link --overwrite --force node@22' \
+        || die "install node@22 via brew failed (install homebrew first)"
+      report "nodejs" ok "$(node --version)"
+    fi ;;
+  *)
+    NEED_NODE=0
+    if ! command -v node >/dev/null 2>&1; then NEED_NODE=1; fi
+    if command -v node >/dev/null 2>&1 && [ "$(node --version | cut -dv -f2 | cut -d. -f1)" -lt 20 ] 2>/dev/null; then NEED_NODE=1; fi
+    if [ "$NEED_NODE" = "1" ]; then
+      report "nodejs" running
+      # Ubuntu's default nodejs is 18 on 24.04; wipe it first so NodeSource's
+      # install doesn't conflict.
+      apt-get remove -y nodejs npm libnode-dev >/dev/null 2>&1 || true
+      curl -fsSL https://deb.nodesource.com/setup_22.x | bash - >/dev/null 2>&1 \
+        || die "NodeSource setup_22 failed"
+      apt-get install -y nodejs >/dev/null 2>&1 \
+        || die "apt-get install nodejs (NodeSource) failed"
+      report "nodejs" ok "$(node --version)"
+    fi ;;
+esac
+
+report "dashboard_build" running
+run_as_user bash -lc "cd '$REPO_DIR/dashboard' && npm install --no-audit --no-fund --silent 2>&1 | tail -2 && npm run build 2>&1 | tail -3" \
+  || die "dashboard build failed"
+[ -f "$REPO_DIR/dashboard/dist/index.html" ] || die "dashboard build produced no dist/index.html"
+report "dashboard_build" ok
+
+report "forgefleetd_build" running
+run_as_user bash -lc "cd '$REPO_DIR' && cargo build -p forge-fleet --release 2>&1 | tail -2" \
+  || die "forgefleetd cargo build failed"
+run_as_user install -m 755 "$REPO_DIR/target/release/forgefleetd" "$USER_HOME/.local/bin/forgefleetd"
+report "forgefleetd_build" ok
 
 # ─── 6b. OpenClaw ────────────────────────────────────────────────────────
 # Installs OpenClaw via npm (matches deploy/provision-node.sh). Failure here
@@ -250,7 +307,6 @@ fi
 # ─── 7. SSH keypair + host keys ──────────────────────────────────────────
 
 report "sshkey" running
-USER_HOME="$(eval echo ~${SUDO_INVOKER})"
 KEY_PATH="$USER_HOME/.ssh/id_ed25519"
 if [ ! -f "$KEY_PATH" ]; then
   run_as_user mkdir -p "$USER_HOME/.ssh"
@@ -392,6 +448,42 @@ os.chown(str(known), uid, gid)
 print(f"imported: +{added_user} authorized_keys, +{added_host} known_hosts")
 PY
 report "mesh_import" ok
+
+# ─── 10b. fleet.toml — Postgres + Redis URL pointing at the leader ──────
+# The daemon refuses to start without this file. Self-heal gap surfaced on
+# Sia's first enrollment (Apr 21 2026): daemon crashed-looped with
+# `connect Postgres: read fleet.toml: No such file or directory`.
+report "fleet_toml" running
+FLEET_TOML="$USER_HOME/.forgefleet/fleet.toml"
+run_as_user mkdir -p "$USER_HOME/.forgefleet"
+if [ ! -f "$FLEET_TOML" ]; then
+  run_as_user bash -c "cat > '$FLEET_TOML' <<EOF
+[database]
+mode = \"postgres_full\"
+cutover_evidence = \"phase38-cutover-validated-2026-04-05\"
+host = \"{{LEADER_HOST}}\"
+port = 55432
+name = \"forgefleet\"
+user = \"forgefleet\"
+password = \"forgefleet\"
+url = \"postgresql://forgefleet:forgefleet@{{LEADER_HOST}}:55432/forgefleet\"
+
+[redis]
+url = \"redis://{{LEADER_HOST}}:6380\"
+prefix = \"pulse\"
+
+[loops.self_heal]
+enabled = true
+interval_secs = 30
+auto_adopt = true
+max_health_failures = 3
+stop_timeout_secs = 10
+health_probe_timeout_secs = 3
+EOF"
+  report "fleet_toml" ok
+else
+  report "fleet_toml" ok "already exists"
+fi
 
 # ─── 11. systemd unit ────────────────────────────────────────────────────
 

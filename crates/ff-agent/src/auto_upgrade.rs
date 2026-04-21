@@ -87,6 +87,7 @@ pub async fn resolve_upgrade_plans(
         sqlx::query(
             "SELECT c.name                AS name,
                     c.os_family           AS os_family,
+                    c.source_tree_path    AS source_tree_path,
                     cs.install_source     AS install_source,
                     cs.installed_version  AS installed_version,
                     cs.status             AS status
@@ -104,6 +105,7 @@ pub async fn resolve_upgrade_plans(
         sqlx::query(
             "SELECT c.name                AS name,
                     c.os_family           AS os_family,
+                    c.source_tree_path    AS source_tree_path,
                     cs.install_source     AS install_source,
                     cs.installed_version  AS installed_version,
                     cs.status             AS status
@@ -120,6 +122,7 @@ pub async fn resolve_upgrade_plans(
         sqlx::query(
             "SELECT c.name                AS name,
                     c.os_family           AS os_family,
+                    c.source_tree_path    AS source_tree_path,
                     cs.install_source     AS install_source,
                     cs.installed_version  AS installed_version,
                     cs.status             AS status
@@ -140,6 +143,7 @@ pub async fn resolve_upgrade_plans(
     for row in &rows {
         let name: String = row.get("name");
         let os_family: String = row.get("os_family");
+        let source_tree_path: Option<String> = row.get("source_tree_path");
         let install_source: Option<String> = row.get("install_source");
         let installed_version: Option<String> = row.get("installed_version");
 
@@ -162,17 +166,32 @@ pub async fn resolve_upgrade_plans(
         }
 
         match matched {
-            Some((playbook_key, command)) => plans.push(UpgradePlan {
-                software_id: software_id.to_string(),
-                display_name: display_name.clone(),
-                computer_name: name,
-                os_family,
-                install_source,
-                installed_version,
-                latest_version: latest_version.clone(),
-                playbook_key,
-                command,
-            }),
+            Some((playbook_key, command)) => {
+                // Substitute {{source_tree_path}} per target. Tilde expansion
+                // does not happen inside double-quoted shell strings, so
+                // convert leading `~/` → `$HOME/` here. The playbook can then
+                // safely use `cd "{{source_tree_path}}"` on every platform.
+                let raw_path = source_tree_path
+                    .as_deref()
+                    .unwrap_or("~/projects/forge-fleet");
+                let expanded_path = if let Some(rest) = raw_path.strip_prefix("~/") {
+                    format!("$HOME/{rest}")
+                } else {
+                    raw_path.to_string()
+                };
+                let command = command.replace("{{source_tree_path}}", &expanded_path);
+                plans.push(UpgradePlan {
+                    software_id: software_id.to_string(),
+                    display_name: display_name.clone(),
+                    computer_name: name,
+                    os_family,
+                    install_source,
+                    installed_version,
+                    latest_version: latest_version.clone(),
+                    playbook_key,
+                    command,
+                })
+            },
             None => skipped.push((
                 name,
                 format!(
@@ -380,6 +399,17 @@ impl AutoUpgradeTick {
             return Ok(0);
         }
 
+        // Self-built tools (ff_git, forgefleetd_git, etc.) use method=self_built
+        // which means "leader's installed version IS canonical." The 6h
+        // software_upstream tick eventually refreshes software_registry.latest_version,
+        // but that's too slow for active dev. Do an inline refresh here on every
+        // auto-upgrade tick — one SQL UPDATE per row. If leader's row just flipped,
+        // the next line (drift check) will see upgrade_available immediately.
+        let _ = refresh_self_built_latest_versions(&self.pool).await;
+        // Then: flip computer_software.status = 'upgrade_available' for any row
+        // where installed_version != latest_version and status is currently 'ok'.
+        let _ = flip_self_built_drift_status(&self.pool).await;
+
         let ids = software_ids_with_drift(&self.pool).await?;
         if ids.is_empty() {
             return Ok(0);
@@ -519,4 +549,54 @@ impl AutoUpgradeTick {
             }
         })
     }
+}
+
+/// For every `software_registry` row with `version_source.method='self_built'`,
+/// set `latest_version` to the current fleet leader's installed_version for
+/// that software_id. Runs inline on every auto-upgrade tick so same-day drift
+/// gets caught within the tick interval, not the 6h upstream interval.
+async fn refresh_self_built_latest_versions(pool: &PgPool) -> Result<u64> {
+    let res = sqlx::query(
+        r#"
+        UPDATE software_registry sr
+           SET latest_version    = leader_cs.installed_version,
+               latest_version_at = NOW()
+          FROM computer_software leader_cs
+          JOIN computers leader_c ON leader_c.id = leader_cs.computer_id
+          JOIN fleet_leader_state ls ON ls.computer_id = leader_c.id
+         WHERE sr.id = leader_cs.software_id
+           AND sr.version_source->>'method' = 'self_built'
+           AND leader_cs.installed_version IS NOT NULL
+           AND leader_cs.installed_version <> ''
+           AND (sr.latest_version IS NULL OR sr.latest_version <> leader_cs.installed_version)
+        "#,
+    )
+    .execute(pool)
+    .await
+    .context("refresh self_built latest_versions")?;
+    Ok(res.rows_affected())
+}
+
+/// For every self_built computer_software row where installed_version differs
+/// from software_registry.latest_version AND status is currently 'ok', flip to
+/// 'upgrade_available' so the drift query picks it up. Runs after
+/// [`refresh_self_built_latest_versions`] so `latest_version` is current.
+async fn flip_self_built_drift_status(pool: &PgPool) -> Result<u64> {
+    let res = sqlx::query(
+        r#"
+        UPDATE computer_software cs
+           SET status = 'upgrade_available'
+          FROM software_registry sr
+         WHERE sr.id = cs.software_id
+           AND sr.version_source->>'method' = 'self_built'
+           AND sr.latest_version IS NOT NULL
+           AND cs.installed_version IS NOT NULL
+           AND cs.installed_version <> sr.latest_version
+           AND cs.status = 'ok'
+        "#,
+    )
+    .execute(pool)
+    .await
+    .context("flip self_built drift status")?;
+    Ok(res.rows_affected())
 }

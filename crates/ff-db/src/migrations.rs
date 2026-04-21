@@ -287,6 +287,21 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "fix_ff_git_linux_playbook",
         sql: schema::SCHEMA_V29_FIX_FF_GIT_LINUX_PLAYBOOK,
     },
+    PgMigration {
+        version: 30,
+        name: "playbook_self_heal_repo",
+        sql: schema::SCHEMA_V30_PLAYBOOK_SELF_HEAL_REPO,
+    },
+    PgMigration {
+        version: 31,
+        name: "source_tree_path",
+        sql: schema::SCHEMA_V31_SOURCE_TREE_PATH,
+    },
+    PgMigration {
+        version: 32,
+        name: "playbook_bugfixes",
+        sql: schema::SCHEMA_V32_PLAYBOOK_BUGFIXES,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.
