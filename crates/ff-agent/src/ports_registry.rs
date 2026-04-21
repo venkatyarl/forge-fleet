@@ -1,17 +1,17 @@
-//! Port registry loader.
+//! Port registry loader (retired).
 //!
-//! Parses `config/ports.toml` into rows and upserts them into the
-//! `port_registry` Postgres table (schema V20). Mirrors the shape of
-//! [`software_registry::seed_from_toml`] and
-//! [`model_catalog_seed::seed_from_toml`].
+//! Historically this module parsed `config/ports.toml` and upserted rows
+//! into the `port_registry` Postgres table. That file has been deleted —
+//! the DB migration `SCHEMA_V37_RETIRE_PORTS_TOML` now owns the canonical
+//! seed set, and operator edits via SQL are preserved across upgrades.
 //!
-//! The table row set is (port, service, kind, description, exposed_on,
-//! scope, managed_by, status, metadata). `updated_at` is owned by the DB.
+//! The public API ([`seed_from_toml`], [`SeedReport`], and the supporting
+//! `PortsFile` / `PortEntry` types) is intentionally preserved so any
+//! callers that predate the retirement keep compiling. The seeder itself
+//! is now a no-op that logs once and returns an empty [`SeedReport`].
 //!
-//! Any fields in the TOML that are NOT mapped to dedicated columns
-//! (the `[[range]]`, `[blocklist]`, and `[scope.*]` sections, plus the
-//! top-level `schema_version` / `updated` fields) are preserved by
-//! passing through — the loader only reads `[[port]]` entries.
+//! Read-side helpers such as [`pick_llm_port`] continue to work against
+//! `port_registry` as before.
 
 use std::path::{Path, PathBuf};
 
@@ -145,110 +145,23 @@ pub async fn pick_llm_port(
         .ok_or(sqlx::Error::RowNotFound)
 }
 
-/// Read the ports TOML from `path` and upsert every `[[port]]` entry into
-/// the `port_registry` table. Returns a per-row summary.
+/// Retired no-op seeder. The DB migration `SCHEMA_V37_RETIRE_PORTS_TOML`
+/// now owns the canonical `port_registry` seed set; this function is
+/// kept only so callers that predate the retirement keep compiling.
 ///
-/// Uses `INSERT ... ON CONFLICT (port) DO UPDATE SET ...` and writes every
-/// column except `updated_at` (which the DB owns).
+/// Logs a single info line the first time it's called in a process.
 pub async fn seed_from_toml(
-    pool: &PgPool,
-    toml_path: &Path,
+    _pool: &PgPool,
+    _toml_path: &Path,
 ) -> Result<SeedReport, PortsError> {
-    let raw = std::fs::read_to_string(toml_path).map_err(|source| PortsError::Io {
-        path: toml_path.to_path_buf(),
-        source,
-    })?;
-
-    let doc: PortsFile = toml::from_str(&raw).map_err(|source| PortsError::Toml {
-        path: toml_path.to_path_buf(),
-        source,
-    })?;
-
-    let mut report = SeedReport {
-        total: doc.port.len(),
-        ..SeedReport::default()
-    };
-
-    for entry in &doc.port {
-        // Pre-image vs post-image detection so we can bucket rows into
-        // inserted / updated / unchanged.
-        let row: Option<(bool, bool)> = sqlx::query_as(
-            r#"
-            WITH existing AS (
-                SELECT
-                    service,
-                    kind,
-                    description,
-                    exposed_on,
-                    scope,
-                    managed_by,
-                    status
-                FROM port_registry
-                WHERE port = $1
-            ),
-            upsert AS (
-                INSERT INTO port_registry (
-                    port,
-                    service,
-                    kind,
-                    description,
-                    exposed_on,
-                    scope,
-                    managed_by,
-                    status,
-                    updated_at
-                )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
-                ON CONFLICT (port) DO UPDATE SET
-                    service       = EXCLUDED.service,
-                    kind          = EXCLUDED.kind,
-                    description   = EXCLUDED.description,
-                    exposed_on    = EXCLUDED.exposed_on,
-                    scope         = EXCLUDED.scope,
-                    managed_by    = EXCLUDED.managed_by,
-                    status        = EXCLUDED.status,
-                    updated_at    = NOW()
-                RETURNING (xmax = 0) AS inserted
-            )
-            SELECT
-                u.inserted,
-                COALESCE(
-                    e.service     IS DISTINCT FROM $2 OR
-                    e.kind        IS DISTINCT FROM $3 OR
-                    e.description IS DISTINCT FROM $4 OR
-                    e.exposed_on  IS DISTINCT FROM $5 OR
-                    e.scope       IS DISTINCT FROM $6 OR
-                    e.managed_by  IS DISTINCT FROM $7 OR
-                    e.status      IS DISTINCT FROM $8,
-                    true
-                ) AS changed
-            FROM upsert u
-            LEFT JOIN existing e ON TRUE
-            "#,
-        )
-        .bind(entry.port)
-        .bind(&entry.service)
-        .bind(&entry.kind)
-        .bind(&entry.description)
-        .bind(&entry.exposed_on)
-        .bind(&entry.scope)
-        .bind(entry.managed_by.as_deref())
-        .bind(&entry.status)
-        .fetch_optional(pool)
-        .await?;
-
-        match row {
-            Some((true, _)) => report.inserted += 1,
-            Some((false, true)) => report.updated += 1,
-            Some((false, false)) => report.unchanged += 1,
-            None => {
-                // Upsert always returns a row; defensive branch.
-                report.updated += 1;
-            }
-        }
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    if !LOGGED.swap(true, Ordering::Relaxed) {
+        tracing::info!(
+            "port_registry: TOML seeder retired; canonical rows come from migration V37"
+        );
     }
-
-    Ok(report)
+    Ok(SeedReport::default())
 }
 
 /// Resolve the default `config/ports.toml` path relative to the workspace

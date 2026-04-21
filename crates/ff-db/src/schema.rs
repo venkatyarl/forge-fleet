@@ -2302,3 +2302,100 @@ VALUES
 
 ON CONFLICT (task) DO NOTHING;
 "#;
+
+// ─── V37: retire config/ports.toml → Postgres ───────────────────────────────
+//
+// Per the DB-first directive: runtime port-registry edits go straight to
+// Postgres. This migration idempotently UPSERTs the canonical ports
+// previously seeded from `config/ports.toml`. Operator edits survive
+// because ON CONFLICT (port) DO NOTHING.
+//
+// Readers (`pick_llm_port`, etc.) continue to consult `port_registry` as
+// before — nothing else changes.
+pub const SCHEMA_V37_RETIRE_PORTS_TOML: &str = r#"
+INSERT INTO port_registry
+    (port, service, kind, description, exposed_on, scope, managed_by, status)
+VALUES
+  -- ForgeFleet core services -------------------------------------------------
+  (51002, 'forgefleetd',      'control_plane',
+   'ForgeFleet daemon gateway API + web dashboard',
+   'all_members', 'lan', 'launchd/systemd', 'active'),
+
+  (50001, 'mcp_http',         'control_plane',
+   'Model Context Protocol HTTP server',
+   'all_members', 'lan', 'forgefleetd', 'active'),
+
+  (51100, 'pulse_p2p_tcp',    'coordination',
+   'Pulse peer-to-peer TCP fallback (when NATS unreachable)',
+   'all_members', 'lan', 'ff daemon', 'planned'),
+
+  -- OpenClaw (agent platform) ------------------------------------------------
+  (50000, 'openclaw_gateway', 'control_plane',
+   'OpenClaw gateway WebSocket — only the elected leader serves',
+   'leader_only', 'lan', 'launchd/systemd', 'active'),
+
+  -- LLM inference servers (dynamic port allocation) --------------------------
+  (51001, 'vllm',             'llm_inference',
+   'vLLM (or mlx_lm on macOS) — first model on this computer',
+   'gpu_members', 'lan', 'manual or ff model load', 'active'),
+
+  (51003, 'vllm_slot_2',      'llm_inference',
+   'vLLM / mlx_lm — second loaded model (51001 is first; 51002 is forgefleetd)',
+   'gpu_members', 'lan', 'manual or ff model load', 'active'),
+
+  (55000, 'llama_cpp_slot_1', 'llm_inference',
+   'llama-server — first model on this computer (primary convention)',
+   'all_members_with_gguf', 'lan', 'manual or ff model load', 'active'),
+
+  (55001, 'llama_cpp_slot_2', 'llm_inference',
+   'llama-server / mlx_lm.server — second loaded model',
+   'all_members_with_gguf', 'lan', 'manual or ff model load', 'active'),
+
+  (55002, 'llama_cpp_slot_3', 'llm_inference',
+   'llama-server / mlx_lm.server — third loaded model',
+   'all_members_with_gguf', 'lan', 'manual or ff model load', 'active'),
+
+  (11434, 'ollama',           'llm_inference',
+   'Ollama — multi-model runtime on a single port',
+   'all_members', 'lan', 'ollama systemd/launchd', 'active'),
+
+  -- Data plane (Docker containers, Taylor hosts primary) --------------------
+  (55432, 'postgres_primary', 'database',
+   'Postgres primary — exposed port 5432 mapped to host 55432',
+   'taylor', 'lan', 'docker compose', 'active'),
+
+  (55433, 'postgres_replica', 'database',
+   'Postgres replica — future, host 55433 on Marcus',
+   'marcus', 'lan', 'docker compose follower', 'planned'),
+
+  (6380, 'redis_primary',     'database',
+   'Redis primary — exposed 6379 mapped to 6380',
+   'taylor', 'lan', 'docker compose', 'active'),
+
+  (6381, 'redis_replica',     'database',
+   'Redis replica — future, on Marcus',
+   'marcus', 'lan', 'docker compose follower', 'planned'),
+
+  (26380, 'redis_sentinel',   'coordination',
+   'Redis Sentinel — DEPRECATED (Pulse v2 replaces this role)',
+   'taylor', 'lan', 'docker compose', 'deprecated'),
+
+  (4222, 'nats_client',       'coordination',
+   'NATS client connections — pulse events, agent tasks, KV',
+   'nats_cluster_members', 'lan', 'docker compose', 'active'),
+
+  (6222, 'nats_cluster',      'coordination',
+   'NATS inter-node cluster communication',
+   'nats_cluster_members', 'lan', 'docker compose', 'active'),
+
+  (8222, 'nats_monitoring',   'coordination',
+   'NATS HTTP monitoring/admin',
+   'nats_cluster_members', 'lan', 'docker compose', 'active'),
+
+  -- System / infrastructure --------------------------------------------------
+  (22, 'ssh',                 'system',
+   'SSH — key-only auth required',
+   'all_members', 'lan', 'OS sshd', 'active')
+
+ON CONFLICT (port) DO NOTHING;
+"#;
