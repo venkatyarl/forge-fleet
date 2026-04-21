@@ -1633,6 +1633,7 @@ dependencies = [
  "ff-pulse",
  "futures",
  "ratatui",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",
