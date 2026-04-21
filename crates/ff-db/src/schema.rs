@@ -3821,3 +3821,20 @@ VALUES
 
 ON CONFLICT (id) DO NOTHING;
 "#;
+
+// ─── V40: agent session provenance on work_outputs (issue #118) ─────────────
+//
+// Links `work_outputs` rows back to the ff-agent session that produced them,
+// and records the set of workspace-relative paths the session modified. Both
+// fields are populated by the agent loop / coordinator on completion and are
+// then read by `ff agent commit-back <session-id>` to locate the worker + the
+// files to stage into a branch + PR.
+pub const SCHEMA_V40_AGENT_SESSION_ON_WORK_OUTPUTS: &str = r#"
+ALTER TABLE work_outputs
+    ADD COLUMN IF NOT EXISTS agent_session_id TEXT,
+    ADD COLUMN IF NOT EXISTS modified_files JSONB NOT NULL DEFAULT '[]';
+
+CREATE INDEX IF NOT EXISTS idx_work_outputs_by_session
+    ON work_outputs(agent_session_id)
+    WHERE agent_session_id IS NOT NULL;
+"#;

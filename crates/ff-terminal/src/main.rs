@@ -267,6 +267,25 @@ enum AgentCommand {
     /// Seed slot 0 for every computer in the `computers` table.
     /// Idempotent — existing rows are left alone.
     Seed,
+    /// Lift fleet-LLM-produced code from a worker's sub-agent workspace back
+    /// to Taylor's canonical repo via a feature branch + (optional) PR on
+    /// origin/main.
+    ///
+    /// Looks up the agent session by ID in `work_outputs` (match on
+    /// `agent_session_id`) to find the worker name + modified files. SSHes
+    /// into the worker and runs `git checkout -b <branch>`, `git add` on the
+    /// recorded files, `git commit`, then optionally `git push` and
+    /// `gh pr create --base main`. See issue #118.
+    CommitBack {
+        /// The ff-agent session id (UUID) that produced the code. The session
+        /// must have a matching row in `work_outputs.agent_session_id`.
+        session: String,
+        /// Also run `git push -u origin <branch>` after committing locally.
+        #[arg(long, default_value_t = false)] push: bool,
+        /// After pushing, open a PR via `gh pr create --base main`.
+        /// Implies `--push`.
+        #[arg(long, default_value_t = false)] pr: bool,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -9121,7 +9140,324 @@ async fn handle_agent(cmd: AgentCommand) -> Result<()> {
             }
             Ok(())
         }
+        AgentCommand::CommitBack { session, push, pr } => {
+            handle_agent_commit_back(&pool, &session, push, pr).await
+        }
     }
+}
+
+// ─── #118: ff agent commit-back — fleet-LLM work → PR on origin/main ────────
+//
+// Lifts code produced by a fleet LLM in a sub-agent workspace back to Taylor's
+// canonical repo via a feature branch + (optional) PR against origin/main.
+//
+// Flow:
+//   1. Look up `work_outputs` WHERE agent_session_id = <session>. Pick the
+//      latest row. Extract `produced_on_computer`, `modified_files`, title.
+//   2. Resolve the worker's ssh_user + primary_ip from `fleet_nodes`.
+//      Resolve the canonical source-tree path via `software_registry.install_path`
+//      (falls back to `~/.forgefleet/sub-agent-0/forge-fleet` per convention).
+//   3. SSH into the worker and run git checkout -b / add / commit / (push / gh pr create).
+//   4. Persist the resulting branch + PR URL back into `work_items.pr_url`
+//      (via the work_item linked to the work_output).
+//   5. Best-effort publish `fleet.events.agent.commit_back_completed` on NATS.
+async fn handle_agent_commit_back(
+    pool: &sqlx::PgPool,
+    session_id: &str,
+    push: bool,
+    pr: bool,
+) -> Result<()> {
+    use tokio::process::Command;
+
+    // 1. Look up the latest work_output for this session.
+    let row: Option<(
+        uuid::Uuid,              // work_output.id
+        uuid::Uuid,              // work_item_id
+        Option<String>,          // title
+        Option<String>,          // produced_on_computer
+        serde_json::Value,       // modified_files
+        Option<String>,          // llm_model_id
+        Option<i32>,             // llm_tokens_input
+        Option<i32>,             // llm_tokens_output
+    )> = sqlx::query_as(
+        "SELECT id, work_item_id, title, produced_on_computer, modified_files, \
+                llm_model_id, llm_tokens_input, llm_tokens_output \
+         FROM work_outputs \
+         WHERE agent_session_id = $1 \
+         ORDER BY produced_at DESC \
+         LIMIT 1",
+    )
+    .bind(session_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("query work_outputs: {e}"))?;
+
+    let (wo_id, work_item_id, title, worker, modified_files_json,
+         model_id, tok_in, tok_out) = row.ok_or_else(|| {
+        anyhow::anyhow!(
+            "no work_outputs row with agent_session_id={session_id} — \
+             was the session persisted, and did it produce a work_output?"
+        )
+    })?;
+
+    let worker = worker.ok_or_else(|| {
+        anyhow::anyhow!(
+            "work_output {wo_id} has no produced_on_computer — cannot locate worker"
+        )
+    })?;
+
+    let modified_files: Vec<String> = serde_json::from_value(modified_files_json.clone())
+        .map_err(|e| anyhow::anyhow!("modified_files is not a JSON string array: {e}"))?;
+    if modified_files.is_empty() {
+        return Err(anyhow::anyhow!(
+            "work_output {wo_id} has no modified_files — nothing to commit"
+        ));
+    }
+
+    // 2. Resolve SSH target + workspace path.
+    let (ssh_user, primary_ip): (String, String) = sqlx::query_as(
+        "SELECT ssh_user, ip FROM fleet_nodes WHERE name = $1",
+    )
+    .bind(&worker)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("lookup fleet_nodes: {e}"))?
+    .ok_or_else(|| anyhow::anyhow!("no fleet_nodes row for computer={worker}"))?;
+
+    // Per reference_source_tree_locations.md: non-Taylor members use
+    // ~/.forgefleet/sub-agent-0/forge-fleet. Taylor itself uses ~/projects/forge-fleet.
+    let workspace = if worker.eq_ignore_ascii_case("taylor") {
+        "~/projects/forge-fleet"
+    } else {
+        "~/.forgefleet/sub-agent-0/forge-fleet"
+    };
+
+    // 3. Build branch name: fleet/<worker>/<yyyymmdd>-<slug>.
+    let now = chrono::Utc::now();
+    let stamp = now.format("%Y%m%d-%H%M%S").to_string();
+    let title_slug = slugify_for_branch(title.as_deref().unwrap_or("agent-session"));
+    let branch_name = format!("fleet/{}/{stamp}-{title_slug}", worker);
+
+    let commit_msg = format!(
+        "{}\n\nProduced by ff agent on {worker} in session {session_id}.\n\n\
+         Co-Authored-By: ForgeFleet Agent <agent@forgefleet.local>",
+        title.as_deref().unwrap_or("ff agent commit-back")
+    );
+
+    eprintln!("{CYAN}▶ ff agent commit-back{RESET}");
+    eprintln!("  session:   {session_id}");
+    eprintln!("  worker:    {worker} ({ssh_user}@{primary_ip})");
+    eprintln!("  workspace: {workspace}");
+    eprintln!("  branch:    {branch_name}");
+    eprintln!("  files:     {} modified", modified_files.len());
+    for f in &modified_files {
+        eprintln!("             {f}");
+    }
+
+    // Build the remote shell script. Do NOT stage via `git add .` — use the
+    // recorded list, so concurrent unrelated edits on the worker don't leak in.
+    let mut script = String::new();
+    script.push_str(&format!("cd {workspace} && "));
+    script.push_str(&format!(
+        "git fetch origin main >/dev/null 2>&1 || true && \
+         git checkout -b {shell_branch} 2>&1 && ",
+        shell_branch = shell_quote(&branch_name)
+    ));
+    for f in &modified_files {
+        script.push_str(&format!("git add -- {} && ", shell_quote(f)));
+    }
+    script.push_str(&format!(
+        "git commit -m {msg} 2>&1",
+        msg = shell_quote(&commit_msg)
+    ));
+
+    let target = format!("{ssh_user}@{primary_ip}");
+    let out = Command::new("ssh")
+        .args([
+            "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=10",
+            "-o", "StrictHostKeyChecking=accept-new",
+            &target, &script,
+        ])
+        .output()
+        .await
+        .map_err(|e| anyhow::anyhow!("ssh commit: {e}"))?;
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if !out.status.success() {
+        return Err(anyhow::anyhow!(
+            "remote git checkout/add/commit failed (rc={:?}):\n  stdout: {}\n  stderr: {}",
+            out.status.code(), stdout.trim(), stderr.trim()
+        ));
+    }
+    eprintln!("{GREEN}✓ committed{RESET}");
+
+    // 4. Optional push.
+    let should_push = push || pr;
+    if should_push {
+        let push_cmd = format!(
+            "cd {workspace} && git push -u origin {br}",
+            br = shell_quote(&branch_name)
+        );
+        let out = Command::new("ssh")
+            .args([
+                "-o", "BatchMode=yes",
+                "-o", "ConnectTimeout=10",
+                "-o", "StrictHostKeyChecking=accept-new",
+                &target, &push_cmd,
+            ])
+            .output()
+            .await
+            .map_err(|e| anyhow::anyhow!("ssh push: {e}"))?;
+        if !out.status.success() {
+            return Err(anyhow::anyhow!(
+                "remote git push failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        eprintln!("{GREEN}✓ pushed{RESET} origin/{branch_name}");
+    }
+
+    // 5. Optional PR via gh on the worker.
+    let mut pr_url: Option<String> = None;
+    if pr {
+        // Confirm gh auth before attempting.
+        let auth_check = Command::new("ssh")
+            .args([
+                "-o", "BatchMode=yes",
+                "-o", "ConnectTimeout=10",
+                "-o", "StrictHostKeyChecking=accept-new",
+                &target, "gh auth status >/dev/null 2>&1 && echo ok || echo missing",
+            ])
+            .output()
+            .await
+            .map_err(|e| anyhow::anyhow!("ssh gh auth status: {e}"))?;
+        let auth_ok = String::from_utf8_lossy(&auth_check.stdout).trim() == "ok";
+        if !auth_ok {
+            return Err(anyhow::anyhow!(
+                "gh CLI is not authenticated on {worker}. \
+                 Run `ssh {target} gh auth login` first, or skip --pr."
+            ));
+        }
+
+        let body = format!(
+            "Produced by ff agent on {worker} in session {session_id}.\n\n\
+             - Worker: {worker}\n\
+             - Model:  {}\n\
+             - Tokens: prompt={} completion={}\n\
+             - Files:  {} modified\n\n\
+             Generated by `ff agent commit-back`.",
+            model_id.as_deref().unwrap_or("(unknown)"),
+            tok_in.unwrap_or(0),
+            tok_out.unwrap_or(0),
+            modified_files.len(),
+        );
+        let pr_title = title.as_deref().unwrap_or("ff agent commit-back");
+
+        let gh_cmd = format!(
+            "cd {workspace} && gh pr create --base main --head {br} \
+             --title {title_q} --body {body_q}",
+            br = shell_quote(&branch_name),
+            title_q = shell_quote(pr_title),
+            body_q = shell_quote(&body),
+        );
+        let out = Command::new("ssh")
+            .args([
+                "-o", "BatchMode=yes",
+                "-o", "ConnectTimeout=30",
+                "-o", "StrictHostKeyChecking=accept-new",
+                &target, &gh_cmd,
+            ])
+            .output()
+            .await
+            .map_err(|e| anyhow::anyhow!("ssh gh pr create: {e}"))?;
+        if !out.status.success() {
+            return Err(anyhow::anyhow!(
+                "remote `gh pr create` failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !url.is_empty() {
+            pr_url = Some(url.clone());
+            eprintln!("{GREEN}✓ PR opened{RESET} {url}");
+        } else {
+            eprintln!("{YELLOW}! PR created but no URL returned{RESET}");
+        }
+    }
+
+    // Persist branch + PR URL onto the work_item.
+    let _ = sqlx::query(
+        "UPDATE work_items SET branch_name = COALESCE(branch_name, $2), \
+                                pr_url = COALESCE($3, pr_url) \
+         WHERE id = $1",
+    )
+    .bind(work_item_id)
+    .bind(&branch_name)
+    .bind(pr_url.as_deref())
+    .execute(pool)
+    .await;
+
+    // Best-effort NATS event.
+    let payload = serde_json::json!({
+        "session_id": session_id,
+        "work_item_id": work_item_id,
+        "worker": worker,
+        "branch": branch_name,
+        "pr_url": pr_url,
+        "files": modified_files,
+        "ts": now.to_rfc3339(),
+    });
+    ff_agent::nats_client::publish_json(
+        "fleet.events.agent.commit_back_completed".to_string(),
+        &payload,
+    ).await;
+
+    eprintln!();
+    eprintln!("{GREEN}✓ ff agent commit-back complete{RESET}");
+    if let Some(url) = pr_url {
+        println!("{url}");
+    } else {
+        println!("{branch_name}");
+    }
+    Ok(())
+}
+
+/// Slugify a title for use in a git branch name: lowercase, ASCII-only,
+/// non-alphanumerics collapsed to '-', max 40 chars.
+fn slugify_for_branch(s: &str) -> String {
+    let mut out = String::with_capacity(s.len().min(40));
+    let mut prev_dash = false;
+    for c in s.chars() {
+        let c = c.to_ascii_lowercase();
+        if c.is_ascii_alphanumeric() {
+            out.push(c);
+            prev_dash = false;
+        } else if !prev_dash && !out.is_empty() {
+            out.push('-');
+            prev_dash = true;
+        }
+        if out.len() >= 40 { break; }
+    }
+    let trimmed = out.trim_matches('-').to_string();
+    if trimmed.is_empty() { "session".to_string() } else { trimmed }
+}
+
+/// Wrap a string as a single-quoted POSIX shell argument.
+fn shell_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            // Close the quote, append an escaped apostrophe, reopen.
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
 }
 
 async fn handle_pm(cmd: PmCommand) -> Result<()> {

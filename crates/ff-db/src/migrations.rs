@@ -337,6 +337,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "retire_model_catalog_toml",
         sql: schema::SCHEMA_V39_RETIRE_MODEL_CATALOG_TOML,
     },
+    PgMigration {
+        version: 40,
+        name: "agent_session_on_work_outputs",
+        sql: schema::SCHEMA_V40_AGENT_SESSION_ON_WORK_OUTPUTS,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.
