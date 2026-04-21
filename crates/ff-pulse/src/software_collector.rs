@@ -63,34 +63,44 @@ impl SoftwareCollector {
 
         // ── ff ──────────────────────────────────────────────────────────
         //
-        // `ff --version` now prints `ff 2026.4.7 (build 8355028d1)` — both
-        // parts are captured. The semver goes to `ff` (unchanged behavior);
-        // the SHA goes to `ff_git` so the upstream checker's `self_built`
-        // method has something to compare against. If the SHA parse fails
-        // (old binary, unknown SHA), the `_git` row is skipped — the
-        // semver row is still emitted so the existing pipeline keeps
-        // working.
+        // `ff --version` prints one of two shapes, both supported here:
+        //   - legacy:  `ff 2026.4.7 (build 8355028d1)`
+        //   - current: `ff 2026.4.21_5 (pushed 8355028d12)`
+        //
+        // Semver / build-version goes to `ff`; the SHA goes to `ff_git`.
+        // When the new shape is detected, the git-state token is stashed
+        // in the `metadata` JSONB field on BOTH rows so the auto-upgrade
+        // gate can read it without re-probing the leader.
         if let Some(path) = which("ff") {
             if let Some(raw) = run("ff", &["--version"]) {
-                if let Some(ver) = regex_capture(&raw, r"ff\s+(\S+)") {
+                let parsed = parse_ff_version_line(&raw);
+                if let Some(ver) = parsed.version.clone() {
+                    let meta = parsed.git_state.clone().map(|s| {
+                        serde_json::json!({ "git_state": s })
+                    });
                     out.push(InstalledSoftware {
                         id: "ff".into(),
                         version: ver,
                         install_source: Some(classify_ff_source(&path)),
                         install_path: Some(path.clone()),
+                        metadata: meta,
                     });
                 }
-                if let Some(sha) = parse_build_sha(&raw) {
+                if let Some(sha) = parsed.sha {
+                    let meta = parsed.git_state.map(|s| {
+                        serde_json::json!({ "git_state": s })
+                    });
                     out.push(InstalledSoftware {
                         id: "ff_git".into(),
                         version: sha,
                         install_source: Some(classify_ff_source(&path)),
                         install_path: Some(path),
+                        metadata: meta,
                     });
                 } else {
                     tracing::debug!(
                         raw = %raw,
-                        "ff --version has no '(build <sha>)' suffix — skipping ff_git row"
+                        "ff --version has no SHA suffix — skipping ff_git row"
                     );
                 }
             }
@@ -98,32 +108,40 @@ impl SoftwareCollector {
 
         // ── forgefleetd ─────────────────────────────────────────────────
         //
-        // Same split as `ff` above: semver → `forgefleetd`, SHA →
-        // `forgefleetd_git`. The binary prints `forgefleet 2026.4.7 (build
-        // 8355028d1)` (note: banner word is "forgefleet", not
-        // "forgefleetd"); the regex targets the semver, not the name.
+        // Same dual-shape parse as `ff` above: semver/build-version →
+        // `forgefleetd`, SHA → `forgefleetd_git`, plus `git_state` in
+        // `metadata` when present. Banner word is "forgefleet", not
+        // "forgefleetd" — the parser normalizes either prefix.
         if let Some(path) = which("forgefleetd") {
             if let Some(raw) = run("forgefleetd", &["--version"]) {
-                let ver = regex_capture(&raw, r"forgefleet\S*\s+(\S+)")
-                    .or_else(|| regex_capture(&raw, r"(\S+)$"))
-                    .unwrap_or(raw.clone());
-                out.push(InstalledSoftware {
-                    id: "forgefleetd".into(),
-                    version: ver.trim().to_string(),
-                    install_source: Some(classify_ff_source(&path)),
-                    install_path: Some(path.clone()),
-                });
-                if let Some(sha) = parse_build_sha(&raw) {
+                let parsed = parse_ff_version_line(&raw);
+                if let Some(ver) = parsed.version.clone() {
+                    let meta = parsed.git_state.clone().map(|s| {
+                        serde_json::json!({ "git_state": s })
+                    });
+                    out.push(InstalledSoftware {
+                        id: "forgefleetd".into(),
+                        version: ver,
+                        install_source: Some(classify_ff_source(&path)),
+                        install_path: Some(path.clone()),
+                        metadata: meta,
+                    });
+                }
+                if let Some(sha) = parsed.sha {
+                    let meta = parsed.git_state.map(|s| {
+                        serde_json::json!({ "git_state": s })
+                    });
                     out.push(InstalledSoftware {
                         id: "forgefleetd_git".into(),
                         version: sha,
                         install_source: Some(classify_ff_source(&path)),
                         install_path: Some(path),
+                        metadata: meta,
                     });
                 } else {
                     tracing::debug!(
                         raw = %raw,
-                        "forgefleetd --version has no '(build <sha>)' suffix — skipping forgefleetd_git row"
+                        "forgefleetd --version has no SHA suffix — skipping forgefleetd_git row"
                     );
                 }
             }
@@ -144,6 +162,7 @@ impl SoftwareCollector {
                         version: ver,
                         install_source: src,
                         install_path: Some(path),
+                        metadata: None,
                     });
                 }
             }
@@ -159,6 +178,7 @@ impl SoftwareCollector {
                         version: ver,
                         install_source: classify_pkg_source(&path),
                         install_path: Some(path),
+                        metadata: None,
                     });
                 }
             }
@@ -174,6 +194,7 @@ impl SoftwareCollector {
                         version: ver,
                         install_source: classify_pkg_source(&path),
                         install_path: Some(path),
+                        metadata: None,
                     });
                 }
             }
@@ -189,6 +210,7 @@ impl SoftwareCollector {
                         version: ver,
                         install_source: Some("direct".to_string()),
                         install_path: Some(path),
+                        metadata: None,
                     });
                 }
             }
@@ -216,6 +238,7 @@ impl SoftwareCollector {
                     version: ver,
                     install_source: Some("direct".to_string()),
                     install_path: Some(path),
+                    metadata: None,
                 });
             }
         }
@@ -231,6 +254,7 @@ impl SoftwareCollector {
                     version: ver,
                     install_source: Some("pip".to_string()),
                     install_path: None,
+                    metadata: None,
                 });
             }
         }
@@ -244,6 +268,7 @@ impl SoftwareCollector {
                     version: ver,
                     install_source: Some("pip".to_string()),
                     install_path: None,
+                    metadata: None,
                 });
             }
         }
@@ -261,6 +286,7 @@ impl SoftwareCollector {
                         version: ver,
                         install_source: classify_pkg_source(&path),
                         install_path: Some(path),
+                        metadata: None,
                     });
                 }
             }
@@ -286,6 +312,7 @@ impl SoftwareCollector {
                         version: ver,
                         install_source: src,
                         install_path: Some(path),
+                        metadata: None,
                     });
                 }
             }
@@ -305,6 +332,7 @@ impl SoftwareCollector {
                         version: ver,
                         install_source: src,
                         install_path: Some(path),
+                        metadata: None,
                     });
                 }
             }
@@ -326,6 +354,7 @@ impl SoftwareCollector {
                         version: ver,
                         install_source: src,
                         install_path: Some(path),
+                        metadata: None,
                     });
                 }
             }
@@ -435,13 +464,46 @@ fn regex_capture(s: &str, pattern: &str) -> Option<String> {
         .map(|m| m.as_str().to_string())
 }
 
-/// Parse the `(build <sha>)` suffix that `ff`/`forgefleetd` now emit. Returns
-/// `None` when the suffix is absent (pre-vergen binary) or the literal
-/// `"unknown"` (build.rs ran outside a git checkout — no drift signal
-/// possible, so we deliberately drop it rather than pollute the DB).
-fn parse_build_sha(raw: &str) -> Option<String> {
-    let sha = regex_capture(raw, r"\(build\s+([0-9a-f]{6,40})\)")?;
-    if sha == "unknown" { None } else { Some(sha) }
+/// Parsed result of an `ff --version` / `forgefleetd --version` line.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ParsedVersionLine {
+    /// The primary version token — either the legacy semver (`2026.4.7`)
+    /// or the current build-version (`2026.4.21_5`).
+    version: Option<String>,
+    /// Short SHA when the line carries a `(build <sha>)` or
+    /// `(STATE <sha>)` suffix. `"unknown"` is dropped.
+    sha: Option<String>,
+    /// `pushed` / `unpushed` / `dirty` / `unknown` when the new shape is
+    /// detected. `None` for pre-upgrade binaries.
+    git_state: Option<String>,
+}
+
+/// Parse `ff`/`forgefleetd` version output in either shape:
+///   legacy:  `ff 2026.4.7 (build 8355028d1)`
+///   current: `ff 2026.4.21_5 (pushed 8355028d12)`
+///
+/// The current shape strips the `STATE` token into `git_state`; the
+/// legacy shape leaves `git_state = None` so callers know this is an
+/// older fleet node that can't be safety-gated.
+fn parse_ff_version_line(raw: &str) -> ParsedVersionLine {
+    let mut out = ParsedVersionLine::default();
+    // Version token follows the leading binary name ("ff"/"forgefleet"/"forgefleetd").
+    out.version = regex_capture(raw, r"(?:ff|forgefleet\S*)\s+(\S+)");
+
+    // Suffix — current shape first, then legacy.
+    if let Some(caps) = Regex::new(r"\((pushed|unpushed|dirty|unknown)\s+([0-9a-f]{6,40}\+?\S*)\)")
+        .ok()
+        .and_then(|re| re.captures(raw))
+    {
+        out.git_state = caps.get(1).map(|m| m.as_str().to_string());
+        let sha = caps.get(2).map(|m| m.as_str().to_string());
+        out.sha = sha.filter(|s| s != "unknown");
+    } else if let Some(sha) = regex_capture(raw, r"\(build\s+([0-9a-f]{6,40})\)") {
+        if sha != "unknown" {
+            out.sha = Some(sha);
+        }
+    }
+    out
 }
 
 /// `ff` and `forgefleetd` are usually direct installs — either in
@@ -499,6 +561,7 @@ fn detect_os() -> Option<InstalledSoftware> {
                 version: ver,
                 install_source: Some("system".to_string()),
                 install_path: None,
+                metadata: None,
             })
         }
         "linux" => {
@@ -515,6 +578,7 @@ fn detect_os() -> Option<InstalledSoftware> {
                     version: ver,
                     install_source: Some("system".to_string()),
                     install_path: None,
+                    metadata: None,
                 });
             }
             // Parse /etc/os-release for Ubuntu version.
@@ -540,6 +604,7 @@ fn detect_os() -> Option<InstalledSoftware> {
                 version: ver,
                 install_source: Some("system".to_string()),
                 install_path: None,
+                metadata: None,
             })
         }
         "windows" => {
@@ -570,6 +635,7 @@ fn detect_os() -> Option<InstalledSoftware> {
                 version: ver,
                 install_source: Some("system".to_string()),
                 install_path: None,
+                metadata: None,
             })
         }
         _ => None,
@@ -635,23 +701,42 @@ mod tests {
     }
 
     #[test]
-    fn parse_build_sha_extracts_suffix() {
-        assert_eq!(
-            parse_build_sha("ff 2026.4.7 (build 8355028d1a)"),
-            Some("8355028d1a".to_string())
-        );
-        assert_eq!(
-            parse_build_sha("forgefleet 2026.4.7 (build abcdef0123)"),
-            Some("abcdef0123".to_string())
-        );
-        // Pre-vergen binary (no suffix) — no SHA to report.
-        assert_eq!(parse_build_sha("ff 2026.4.7"), None);
-        // Build ran outside git — deliberately dropped so we don't seed
-        // `"unknown"` into computer_software rows.
-        assert_eq!(parse_build_sha("ff 2026.4.7 (build unknown)"), None);
-        // Uppercase hex — regex is case-sensitive by design; SHAs from
-        // `git rev-parse --short` are always lowercase.
-        assert_eq!(parse_build_sha("ff 2026.4.7 (build ABCDEF0123)"), None);
+    fn parse_ff_version_line_legacy_shape() {
+        let p = parse_ff_version_line("ff 2026.4.7 (build 8355028d1a)");
+        assert_eq!(p.version.as_deref(), Some("2026.4.7"));
+        assert_eq!(p.sha.as_deref(), Some("8355028d1a"));
+        assert_eq!(p.git_state, None);
+
+        let p = parse_ff_version_line("forgefleet 2026.4.7 (build abcdef0123)");
+        assert_eq!(p.sha.as_deref(), Some("abcdef0123"));
+
+        // Pre-vergen binary (no suffix) — no SHA, no state.
+        let p = parse_ff_version_line("ff 2026.4.7");
+        assert_eq!(p.version.as_deref(), Some("2026.4.7"));
+        assert_eq!(p.sha, None);
+        assert_eq!(p.git_state, None);
+
+        // `(build unknown)` — dropped so we don't seed "unknown" SHAs.
+        assert_eq!(parse_ff_version_line("ff 2026.4.7 (build unknown)").sha, None);
+    }
+
+    #[test]
+    fn parse_ff_version_line_current_shape() {
+        let p = parse_ff_version_line("ff 2026.4.21_5 (pushed 8355028d12)");
+        assert_eq!(p.version.as_deref(), Some("2026.4.21_5"));
+        assert_eq!(p.sha.as_deref(), Some("8355028d12"));
+        assert_eq!(p.git_state.as_deref(), Some("pushed"));
+
+        let p = parse_ff_version_line("ff 2026.4.21_6 (unpushed 8355028d12)");
+        assert_eq!(p.git_state.as_deref(), Some("unpushed"));
+
+        let p = parse_ff_version_line("ff 2026.4.21_7 (dirty 8355028d12+local)");
+        assert_eq!(p.git_state.as_deref(), Some("dirty"));
+        assert_eq!(p.sha.as_deref(), Some("8355028d12+local"));
+
+        let p = parse_ff_version_line("forgefleet 2026.4.21_5 (pushed abcdef0123)");
+        assert_eq!(p.git_state.as_deref(), Some("pushed"));
+        assert_eq!(p.sha.as_deref(), Some("abcdef0123"));
     }
 
     #[test]

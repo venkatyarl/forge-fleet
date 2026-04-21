@@ -1,21 +1,21 @@
-//! Build-time helper: capture the short git SHA of the current checkout and
-//! expose it to the `forgefleetd` binary as `FF_GIT_SHA` (read via
-//! `env!("FF_GIT_SHA")` in `src/main.rs`). Degrades to `"unknown"` outside
-//! a git checkout. Mirrors `crates/ff-terminal/build.rs`.
+//! Build-time helper: capture version metadata and expose it to the
+//! `forgefleetd` binary as env vars (`FF_GIT_SHA`, `FF_BUILD_VERSION`,
+//! `FF_GIT_STATE`) read via `env!(...)` in `src/main.rs`.
+//!
+//! Emits `ff YYYY.M.D_N (STATE sha)` version format where
+//! - `YYYY.M.D` is the local calendar date the build was produced
+//! - `_N` is a same-day build counter stored at `~/.forgefleet/builds/YYYY-M-D.count`
+//! - `STATE` is one of `pushed` | `unpushed` | `dirty` | `unknown`
+//!
+//! All git / fs failures degrade to `"unknown"` — the build NEVER fails
+//! because of a counter-file or git-state probe issue.
 
 use std::process::Command;
 
-fn main() {
-    let sha = Command::new("git")
-        .args(["rev-parse", "--short=10", "HEAD"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "unknown".to_string());
+include!("crates/ff-terminal/build_version.rs");
 
-    println!("cargo:rustc-env=FF_GIT_SHA={sha}");
+fn main() {
+    emit_version_env();
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/index");
 }

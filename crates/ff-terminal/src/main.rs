@@ -33,15 +33,46 @@ const RED: &str = "\x1b[31m";
 const RESET: &str = "\x1b[0m";
 
 /// clap's `--version` flag prints THIS string. Must match the `Command::Version`
-/// subcommand branches below (`ff 2026.4.7 (build <sha>)`) so both code paths
-/// expose the SHA — the drift collector greps for `(build <sha>)` regardless
-/// of which path the operator takes.
+/// subcommand branches below so both code paths expose the same data — the
+/// drift collector parses `ff YYYY.M.D_N (STATE sha)`.
+///
+/// Format: `YYYY.M.D_N (STATE sha)`, e.g. `2026.4.21_5 (pushed 8355028d12)`.
+/// When `build.rs` ran outside a git checkout the state is `unknown` and the
+/// sha degrades to `unknown`; the collector treats those as self-built-dev.
 const FF_LONG_VERSION: &str = concat!(
-    env!("CARGO_PKG_VERSION"),
-    " (build ",
+    env!("FF_BUILD_VERSION"),
+    " (",
+    env!("FF_GIT_STATE"),
+    " ",
     env!("FF_GIT_SHA"),
     ")"
 );
+
+/// Short version print used by `ff --version` (via clap) and `ff version`.
+/// Format: `ff 2026.4.21_5 (pushed 8355028d12)`.
+fn print_ff_version() {
+    println!("ff {FF_LONG_VERSION}");
+}
+
+/// Long version display used by the `ff version` subcommand.
+/// Prints the short form first, then a labelled block with sha / state
+/// hint / build timestamp / semver.
+fn print_ff_version_long() {
+    let state = env!("FF_GIT_STATE");
+    let hint = match state {
+        "pushed" => "commit is in origin/main — safe to propagate",
+        "unpushed" => "clean build of a local commit not yet in origin/main",
+        "dirty" => "working tree has uncommitted changes — refuse to propagate",
+        _ => "git state could not be determined (no git, no origin, etc.)",
+    };
+    print_ff_version();
+    println!();
+    println!("Primary version:  {}", env!("FF_BUILD_VERSION"));
+    println!("Git SHA:          {}", env!("FF_GIT_SHA"));
+    println!("Git state:        {state}       ({hint})");
+    println!("Built at:         {} (local)", env!("FF_BUILT_AT"));
+    println!("Cargo version:    {}", env!("CARGO_PKG_VERSION"));
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "ff", version = FF_LONG_VERSION, about = "ForgeFleet — distributed AI agent platform")]
@@ -428,6 +459,10 @@ enum FleetCommand {
         #[arg(long, default_value_t = false)] dry_run: bool,
         /// Required to actually enqueue (otherwise prints plan and exits).
         #[arg(long, default_value_t = false)] yes: bool,
+        /// Bypass the dirty-build gate for `ff_git` / `forgefleetd_git`.
+        /// Default: the gate refuses to propagate a leader whose working
+        /// tree has uncommitted changes.
+        #[arg(long, default_value_t = false)] force_dirty: bool,
     },
 }
 
@@ -1200,7 +1235,7 @@ async fn main() -> Result<()> {
     // Fast-path subcommands that don't need the inference router or any LLM probing.
     // Skips a network round-trip to the fleet + `/v1/models` HTTP fetch.
     match &cli.command {
-        Some(Command::Version) => { println!("ff {} (build {})", env!("CARGO_PKG_VERSION"), env!("FF_GIT_SHA")); return Ok(()); }
+        Some(Command::Version) => { print_ff_version_long(); return Ok(()); }
         Some(Command::Secrets { command }) => return handle_secrets(command.clone()).await,
         Some(Command::Defer   { command }) => return handle_defer(command.clone()).await,
         Some(Command::Model   { command }) => return handle_model(command.clone()).await,
@@ -1304,7 +1339,7 @@ async fn main() -> Result<()> {
         Some(Command::Proxy { port }) => { println!("{CYAN}▶ Starting LLM proxy on 0.0.0.0:{port}{RESET}"); Ok(()) }
         Some(Command::Discover { subnet }) => { println!("{CYAN}▶ Discovering nodes on {subnet}{RESET}"); Ok(()) }
         Some(Command::Config { command }) => handle_config(command, &config_path).await,
-        Some(Command::Version) => { println!("ff {} (build {})", env!("CARGO_PKG_VERSION"), env!("FF_GIT_SHA")); Ok(()) }
+        Some(Command::Version) => { print_ff_version_long(); Ok(()) }
         Some(Command::Run { prompt, output, mode, max_turns }) => {
             let mode_norm = mode.to_lowercase();
             if mode_norm != "agent" && mode_norm != "oneshot" {
@@ -5051,8 +5086,8 @@ async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
         FleetCommand::Unquarantine { computer, yes } => {
             handle_fleet_unquarantine(&pool, &computer, yes).await?;
         }
-        FleetCommand::Upgrade { software_id, computer, all, dry_run, yes } => {
-            handle_fleet_upgrade(&pool, &software_id, computer, all, dry_run, yes).await?;
+        FleetCommand::Upgrade { software_id, computer, all, dry_run, yes, force_dirty } => {
+            handle_fleet_upgrade(&pool, &software_id, computer, all, dry_run, yes, force_dirty).await?;
         }
     }
     Ok(())
@@ -5255,6 +5290,7 @@ async fn handle_fleet_upgrade(
     all: bool,
     dry_run: bool,
     yes: bool,
+    force_dirty: bool,
 ) -> Result<()> {
     if computer.is_none() && !all {
         anyhow::bail!("pass --all or --computer <name> to pick targets");
@@ -5331,6 +5367,43 @@ async fn handle_fleet_upgrade(
     if !yes {
         println!("\n{YELLOW}Pass --yes to actually enqueue these upgrade tasks.{RESET}");
         return Ok(());
+    }
+
+    // Dirty-build gate for `ff_git` / `forgefleetd_git` — refuses propagation
+    // of a leader with an uncommitted working tree unless `--force-dirty`.
+    use ff_agent::auto_upgrade::GitStateGate;
+    let gate = ff_agent::auto_upgrade::gate_git_state(pool, software_id, force_dirty).await;
+    let leader_sha = plans
+        .first()
+        .and_then(|p| p.installed_version.clone())
+        .unwrap_or_else(|| "(unknown)".into());
+    match gate {
+        GitStateGate::BlockDirty => {
+            eprintln!(
+                "{RED}✗ refusing to propagate dirty build {leader_sha} — commit or pass --force-dirty{RESET}"
+            );
+            ff_agent::auto_upgrade::mark_targets_blocked_dirty(pool, software_id).await;
+            anyhow::bail!("dirty-build gate");
+        }
+        GitStateGate::AllowWithWarning => {
+            eprintln!(
+                "{YELLOW}⚠ propagating unpushed/forced commit {leader_sha} from leader to fleet — push to origin/main when ready{RESET}"
+            );
+            let payload = serde_json::json!({
+                "software_id": software_id,
+                "sha": leader_sha,
+                "computer_count": plans.len(),
+                "source": whoami_tag(),
+                "forced": force_dirty,
+                "ts": chrono::Utc::now().to_rfc3339(),
+            });
+            ff_agent::nats_client::publish_json(
+                "fleet.events.software.unpushed_propagation".to_string(),
+                &payload,
+            )
+            .await;
+        }
+        GitStateGate::Allow => {}
     }
 
     let who = whoami_tag();

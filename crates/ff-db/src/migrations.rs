@@ -277,6 +277,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "pool_aliases",
         sql: schema::SCHEMA_V27_POOL_ALIASES,
     },
+    PgMigration {
+        version: 28,
+        name: "software_registry_seed",
+        sql: schema::SCHEMA_V28_SOFTWARE_REGISTRY_SEED,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.

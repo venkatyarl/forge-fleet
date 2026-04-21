@@ -1,23 +1,21 @@
-//! Build-time helper: capture the short git SHA of the current checkout and
-//! expose it to the `ff` binary as the `FF_GIT_SHA` env var (read via
-//! `env!("FF_GIT_SHA")` in source). Degrades to `"unknown"` outside a git
-//! checkout. Kept intentionally small — this is the ONLY drift signal the
-//! upstream checker has for self-built binaries.
+//! Build-time helper: capture version metadata and expose it to the
+//! `ff` binary as `FF_GIT_SHA`, `FF_BUILD_VERSION`, `FF_GIT_STATE` env
+//! vars, read via `env!(...)` in source.
+//!
+//! Version format: `YYYY.M.D_N (STATE sha)` where
+//! - `YYYY.M.D` is today's local date
+//! - `_N` is a same-day build counter (stored in `~/.forgefleet/builds/`)
+//! - `STATE` is `pushed` | `unpushed` | `dirty` | `unknown`
+//!
+//! All probes degrade to `"unknown"` — the build NEVER fails on a counter
+//! or git probe issue. Mirrors the root-level `build.rs` via shared helper.
 
 use std::process::Command;
 
-fn main() {
-    let sha = Command::new("git")
-        .args(["rev-parse", "--short=10", "HEAD"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "unknown".to_string());
+include!("build_version.rs");
 
-    println!("cargo:rustc-env=FF_GIT_SHA={sha}");
-    // Re-run if HEAD moves (new commit, branch switch, etc).
+fn main() {
+    emit_version_env();
     println!("cargo:rerun-if-changed=../../.git/HEAD");
     println!("cargo:rerun-if-changed=../../.git/index");
 }

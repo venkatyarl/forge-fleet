@@ -917,8 +917,15 @@ CREATE TABLE IF NOT EXISTS computer_software (
     last_upgraded_at          TIMESTAMPTZ,
     status                    TEXT NOT NULL DEFAULT 'ok',
     last_upgrade_error        TEXT,
+    -- Free-form JSON for signals that don't fit any other column
+    -- (e.g. `{"git_state":"pushed"}` for ff_git / forgefleetd_git rows).
+    metadata                  JSONB NOT NULL DEFAULT '{}'::jsonb,
     PRIMARY KEY (computer_id, software_id)
 );
+-- Idempotent add for existing deployments (the CREATE TABLE above runs
+-- only on fresh DBs; running fleets predate this column).
+ALTER TABLE computer_software
+    ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'::jsonb;
 CREATE INDEX IF NOT EXISTS idx_computer_software_status ON computer_software(status);
 CREATE INDEX IF NOT EXISTS idx_computer_software_by_software ON computer_software(software_id);
 CREATE INDEX IF NOT EXISTS idx_computer_software_by_source ON computer_software(install_source);
@@ -1648,4 +1655,250 @@ ALTER TABLE fleet_task_coverage
 
 CREATE INDEX IF NOT EXISTS fleet_task_coverage_alias_idx
     ON fleet_task_coverage(alias);
+"#;
+
+// ─── V28: Seed software_registry with canonical rows ────────────────────
+//
+// Retires `config/software.toml` — the DB (`software_registry`) is now
+// the sole source of truth. Operator edits via `ff software add/remove`
+// are preserved across upgrades because each row uses ON CONFLICT (id)
+// DO NOTHING.
+//
+// `latest_version` / `latest_version_at` are NOT seeded here — those
+// columns are owned by the upstream-check loop (see
+// `ff_agent::software_upstream`) and must stay NULL on first insert so
+// the loop reliably flips rows into `upgrade_available` the first time
+// a real check runs.
+pub const SCHEMA_V28_SOFTWARE_REGISTRY_SEED: &str = r#"
+-- ForgeFleet's own -------------------------------------------------------
+INSERT INTO software_registry
+    (id, display_name, kind, applies_to_os_family,
+     version_source, upgrade_playbook, requires_restart, requires_reboot)
+VALUES
+  ('ff',
+   'ForgeFleet CLI (ff)',
+   'binary',
+   NULL,
+   '{"method":"cmd","args":["ff","--version"],"regex":"ff (\\S+)"}'::jsonb,
+   '{
+     "macos":"cd ~/taylorProjects/forge-fleet && git pull && cargo build --release -p ff && install -m 755 target/release/ff ~/.local/bin/ff && codesign --force --sign - ~/.local/bin/ff",
+     "linux-ubuntu":"cd ~/taylorProjects/forge-fleet && git pull && cargo build --release -p ff && install -m 755 target/release/ff ~/.local/bin/ff",
+     "linux-dgx":"cd ~/taylorProjects/forge-fleet && git pull && cargo build --release -p ff && install -m 755 target/release/ff ~/.local/bin/ff"
+   }'::jsonb,
+   false, false),
+
+  ('forgefleetd',
+   'ForgeFleet Daemon (forgefleetd)',
+   'binary',
+   NULL,
+   '{"method":"cmd","args":["forgefleetd","--version"],"regex":"forgefleetd (\\S+)"}'::jsonb,
+   '{
+     "macos":"cd ~/taylorProjects/forge-fleet && git pull && cargo build --release -p forgefleetd && install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && codesign --force --sign - ~/.local/bin/forgefleetd",
+     "linux-ubuntu":"cd ~/taylorProjects/forge-fleet && git pull && cargo build --release -p forgefleetd && install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd",
+     "linux-dgx":"cd ~/taylorProjects/forge-fleet && git pull && cargo build --release -p forgefleetd && install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd"
+   }'::jsonb,
+   true, false),
+
+  ('ff_git',
+   'ff (git SHA of built binary)',
+   'binary',
+   NULL,
+   '{"method":"self_built"}'::jsonb,
+   '{
+     "macos":"cd ~/projects/forge-fleet && git pull --ff-only && cargo build --release -p ff-terminal && install -m 755 target/release/ff ~/.local/bin/ff && codesign --force --sign - ~/.local/bin/ff",
+     "linux":"scp -o BatchMode=yes -o StrictHostKeyChecking=accept-new venkat@192.168.5.100:~/.local/bin/ff ~/.local/bin/ff.new && install -m 755 ~/.local/bin/ff.new ~/.local/bin/ff && rm ~/.local/bin/ff.new && systemctl --user restart forgefleet-daemon.service"
+   }'::jsonb,
+   false, false),
+
+  ('forgefleetd_git',
+   'forgefleetd (git SHA of built binary)',
+   'binary',
+   NULL,
+   '{"method":"self_built"}'::jsonb,
+   '{
+     "macos":"cd ~/projects/forge-fleet && git pull --ff-only && cargo build --release -p forge-fleet && install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && codesign --force --sign - ~/.local/bin/forgefleetd && launchctl kickstart -k gui/$(id -u)/com.forgefleet.forgefleetd",
+     "linux":"scp -o BatchMode=yes -o StrictHostKeyChecking=accept-new venkat@192.168.5.100:~/.local/bin/forgefleetd ~/.local/bin/forgefleetd.new && install -m 755 ~/.local/bin/forgefleetd.new ~/.local/bin/forgefleetd && rm ~/.local/bin/forgefleetd.new && systemctl --user restart forgefleet-node.service"
+   }'::jsonb,
+   true, false),
+
+-- Agent platforms -------------------------------------------------------
+  ('openclaw',
+   'OpenClaw Agent',
+   'binary',
+   NULL,
+   '{"method":"cmd","args":["openclaw","--version"],"regex":"OpenClaw (\\S+)"}'::jsonb,
+   '{"all":"curl -fsSL https://openclaw.ai/install.sh | bash"}'::jsonb,
+   true, false),
+
+-- Developer tools -------------------------------------------------------
+  ('gh',
+   'GitHub CLI',
+   'binary',
+   NULL,
+   '{"method":"github_release","repo":"cli/cli"}'::jsonb,
+   '{
+     "macos":"brew upgrade gh",
+     "linux-ubuntu":"sudo apt-get update && sudo apt-get -y install --only-upgrade gh",
+     "linux-dgx":"sudo apt-get update && sudo apt-get -y install --only-upgrade gh",
+     "windows-winget":"winget upgrade --id GitHub.cli --silent --accept-source-agreements --accept-package-agreements",
+     "windows-choco":"choco upgrade gh -y"
+   }'::jsonb,
+   false, false),
+
+  ('op',
+   '1Password CLI',
+   'binary',
+   NULL,
+   '{"method":"cmd","args":["op","--version"],"regex":"(\\S+)"}'::jsonb,
+   '{
+     "macos-brew-cask":"brew upgrade --cask 1password-cli",
+     "linux-ubuntu":"curl -sS https://downloads.1password.com/linux/keys/1password.asc | sudo gpg --dearmor --output /usr/share/keyrings/1password-archive-keyring.gpg && echo ''deb [arch=amd64 signed-by=/usr/share/keyrings/1password-archive-keyring.gpg] https://downloads.1password.com/linux/debian/amd64 stable main'' | sudo tee /etc/apt/sources.list.d/1password.list && sudo apt-get update && sudo apt-get -y install --only-upgrade 1password-cli",
+     "linux-dgx":"sudo apt-get update && sudo apt-get -y install --only-upgrade 1password-cli",
+     "windows-winget":"winget upgrade --id AgileBits.1Password.CLI --silent --accept-source-agreements --accept-package-agreements",
+     "windows-choco":"choco upgrade 1password-cli -y"
+   }'::jsonb,
+   false, false),
+
+  ('rustup',
+   'Rustup (Rust toolchain manager)',
+   'binary',
+   NULL,
+   '{"method":"cmd","args":["rustup","--version"],"regex":"rustup (\\S+)"}'::jsonb,
+   '{"all":"rustup self update && rustup update stable"}'::jsonb,
+   false, false),
+
+-- Inference runtimes ----------------------------------------------------
+  ('llama.cpp',
+   'llama.cpp (llama-server)',
+   'runtime',
+   NULL,
+   '{"method":"cmd","args":["llama-server","--version"],"regex":"version: (\\S+)"}'::jsonb,
+   '{
+     "macos":"cd ~/llama.cpp && git pull && cmake --build build --config Release -j",
+     "linux-ubuntu":"cd ~/llama.cpp && git pull && cmake --build build --config Release -j",
+     "linux-dgx":"cd ~/llama.cpp && git pull && cmake --build build --config Release -j"
+   }'::jsonb,
+   true, false),
+
+  ('mlx_lm',
+   'MLX-LM (Apple Silicon inference)',
+   'runtime',
+   'macos',
+   '{"method":"pip","package":"mlx-lm"}'::jsonb,
+   '{"macos":"pip install -U mlx-lm"}'::jsonb,
+   true, false),
+
+  ('vllm',
+   'vLLM',
+   'runtime',
+   NULL,
+   '{"method":"pip","package":"vllm"}'::jsonb,
+   '{
+     "linux-ubuntu":"pip install -U vllm",
+     "linux-dgx":"pip install -U vllm"
+   }'::jsonb,
+   true, false),
+
+  ('ollama',
+   'Ollama',
+   'runtime',
+   NULL,
+   '{"method":"cmd","args":["ollama","--version"],"regex":"ollama version is (\\S+)"}'::jsonb,
+   '{
+     "macos":"brew upgrade ollama",
+     "linux-ubuntu":"curl -fsSL https://ollama.com/install.sh | sh",
+     "linux-dgx":"curl -fsSL https://ollama.com/install.sh | sh",
+     "windows-winget":"winget upgrade --id Ollama.Ollama --silent --accept-source-agreements --accept-package-agreements",
+     "windows-choco":"choco upgrade ollama -y"
+   }'::jsonb,
+   true, false),
+
+-- System runtimes -------------------------------------------------------
+  ('node',
+   'Node.js 22',
+   'runtime',
+   NULL,
+   '{"method":"cmd","args":["node","--version"],"regex":"v(\\S+)"}'::jsonb,
+   '{
+     "macos-brew":"brew upgrade node@22",
+     "linux-ubuntu":"curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash - && sudo apt-get install -y nodejs",
+     "linux-dgx":"curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash - && sudo apt-get install -y nodejs",
+     "windows-winget":"winget upgrade --id OpenJS.NodeJS.LTS --silent --accept-source-agreements --accept-package-agreements",
+     "windows-choco":"choco upgrade nodejs-lts -y"
+   }'::jsonb,
+   false, false),
+
+  ('python',
+   'Python 3',
+   'runtime',
+   NULL,
+   '{"method":"cmd","args":["python3","--version"],"regex":"Python (\\S+)"}'::jsonb,
+   '{
+     "macos-brew":"brew upgrade python@3.12",
+     "linux-ubuntu":"sudo apt-get update && sudo apt-get -y install --only-upgrade python3",
+     "linux-dgx":"sudo apt-get update && sudo apt-get -y install --only-upgrade python3",
+     "windows-winget":"winget upgrade --id Python.Python.3.12 --silent --accept-source-agreements --accept-package-agreements",
+     "windows-choco":"choco upgrade python -y"
+   }'::jsonb,
+   false, false),
+
+  ('docker',
+   'Docker',
+   'runtime',
+   NULL,
+   '{"method":"cmd","args":["docker","--version"],"regex":"Docker version (\\S+?),"}'::jsonb,
+   '{
+     "macos-brew-cask":"brew upgrade --cask docker",
+     "linux-ubuntu":"sudo apt-get update && sudo apt-get -y install --only-upgrade docker.io",
+     "linux-dgx":"sudo apt-get update && sudo apt-get -y install --only-upgrade docker.io",
+     "windows-winget":"winget upgrade --id Docker.DockerDesktop --silent --accept-source-agreements --accept-package-agreements",
+     "windows-choco":"choco upgrade docker-desktop -y"
+   }'::jsonb,
+   true, false),
+
+-- Operating systems -----------------------------------------------------
+  ('os-macos',
+   'macOS',
+   'os',
+   'macos',
+   '{"method":"sw_vers"}'::jsonb,
+   '{"macos":"sudo softwareupdate -i -a --restart"}'::jsonb,
+   true, true),
+
+  ('os-ubuntu-22.04',
+   'Ubuntu 22.04 LTS (Jammy)',
+   'os',
+   'linux-ubuntu',
+   '{"method":"apt_dist","codename":"jammy"}'::jsonb,
+   '{"linux-ubuntu":"sudo apt-get update && sudo apt-get -y dist-upgrade"}'::jsonb,
+   true, true),
+
+  ('os-ubuntu-24.04',
+   'Ubuntu 24.04 LTS (Noble)',
+   'os',
+   'linux-ubuntu',
+   '{"method":"apt_dist","codename":"noble"}'::jsonb,
+   '{"linux-ubuntu":"sudo apt-get update && sudo apt-get -y dist-upgrade"}'::jsonb,
+   true, true),
+
+  ('os-dgx',
+   'NVIDIA DGX OS',
+   'os',
+   'linux-dgx',
+   '{"method":"cmd","args":["cat","/etc/dgx-release"],"regex":"DGX_SWBUILD_VERSION=(\\S+)"}'::jsonb,
+   '{"linux-dgx":"sudo apt-get update && sudo apt-get -y install --only-upgrade dgx-release"}'::jsonb,
+   true, true),
+
+  ('os-windows',
+   'Microsoft Windows',
+   'os',
+   'windows',
+   '{"method":"cmd","args":["powershell","-NoProfile","-Command","(Get-CimInstance Win32_OperatingSystem).Version"],"regex":"(\\S+)"}'::jsonb,
+   '{
+     "windows-winget":"winget upgrade --all --silent --accept-source-agreements --accept-package-agreements",
+     "windows":"powershell -NoProfile -Command \"Install-Module PSWindowsUpdate -Force -Scope CurrentUser -AcceptLicense; Get-WindowsUpdate -Install -AcceptAll -AutoReboot\""
+   }'::jsonb,
+   true, true)
+
+ON CONFLICT (id) DO NOTHING;
 "#;

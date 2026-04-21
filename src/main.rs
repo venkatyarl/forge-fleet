@@ -34,10 +34,13 @@ use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
 /// clap's `--version` output. Mirrors the `Command::Version` subcommand
-/// branch so the drift collector sees `(build <sha>)` on either path.
+/// branch so the drift collector sees the same `YYYY.M.D_N (STATE sha)`
+/// shape on either path.
 const FORGEFLEET_LONG_VERSION: &str = concat!(
-    env!("CARGO_PKG_VERSION"),
-    " (build ",
+    env!("FF_BUILD_VERSION"),
+    " (",
+    env!("FF_GIT_STATE"),
+    " ",
     env!("FF_GIT_SHA"),
     ")"
 );
@@ -103,11 +106,7 @@ async fn main() -> Result<()> {
         Command::Start(args) => run_daemon(&cli, args).await,
         Command::Status => run_status(&cli),
         Command::Version => {
-            println!(
-                "forgefleet {} (build {})",
-                env!("CARGO_PKG_VERSION"),
-                env!("FF_GIT_SHA")
-            );
+            println!("forgefleet {FORGEFLEET_LONG_VERSION}");
             Ok(())
         }
     }

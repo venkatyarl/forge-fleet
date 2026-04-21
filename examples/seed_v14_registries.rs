@@ -7,7 +7,10 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|_| "postgres://forgefleet:forgefleet@localhost:55432/forgefleet".to_string());
     let pool = PgPoolOptions::new().max_connections(4).connect(&url).await?;
 
-    println!("▶ Seeding software_registry from config/software.toml ...");
+    // software_registry is seeded directly by migration V28 — the
+    // legacy TOML seeder is now a no-op. Call it for backwards compat
+    // only; the report will be empty.
+    println!("▶ software_registry is seeded by migration V28 (no-op seeder call) ...");
     let sw = ff_agent::software_registry::seed_from_toml(
         &pool,
         Path::new("config/software.toml"),

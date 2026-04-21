@@ -192,6 +192,13 @@ pub struct InstalledSoftware {
     pub version: String,
     pub install_source: Option<String>,
     pub install_path: Option<String>,
+    /// Optional JSON metadata carried through to `computer_software.metadata`.
+    /// Used for signals that don't fit any other column — currently only
+    /// `{ "git_state": "pushed|unpushed|dirty|unknown" }` for `ff_git` /
+    /// `forgefleetd_git` rows so the auto-upgrade gate can refuse dirty
+    /// builds without re-probing the leader.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
 }
 
 // -----------------------------------------------------------------------------

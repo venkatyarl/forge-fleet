@@ -683,16 +683,30 @@ impl Materializer {
         // Only bump `status` when installed_version itself changed: we
         // compare the pre-existing row's installed_version to the incoming
         // one in the ON CONFLICT clause using a WHERE on the excluded row.
+        //
+        // `metadata` is merged into the existing row (jsonb concat) so
+        // keys like `git_state` are preserved across beats that don't
+        // resend them. The `ADD COLUMN IF NOT EXISTS` guards against
+        // running against an older DB where the column isn't deployed
+        // yet — it's a no-op when the column is already there.
+        let _ = sqlx::query(
+            "ALTER TABLE computer_software \
+                ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'::jsonb",
+        )
+        .execute(&self.pg)
+        .await;
+        let meta = sw.metadata.clone().unwrap_or_else(|| serde_json::json!({}));
         sqlx::query(
             "INSERT INTO computer_software \
                 (computer_id, software_id, installed_version, install_source, install_path, \
-                 last_checked_at, status) \
-             VALUES ($1, $2, $3, $4, $5, NOW(), $6) \
+                 last_checked_at, status, metadata) \
+             VALUES ($1, $2, $3, $4, $5, NOW(), $6, $7) \
              ON CONFLICT (computer_id, software_id) DO UPDATE SET \
                 installed_version = EXCLUDED.installed_version, \
                 install_source    = EXCLUDED.install_source, \
                 install_path      = EXCLUDED.install_path, \
                 last_checked_at   = NOW(), \
+                metadata          = computer_software.metadata || EXCLUDED.metadata, \
                 status = CASE \
                     WHEN computer_software.installed_version IS DISTINCT FROM EXCLUDED.installed_version \
                         THEN EXCLUDED.status \
@@ -705,6 +719,7 @@ impl Materializer {
         .bind(sw.install_source.as_deref())
         .bind(sw.install_path.as_deref())
         .bind(new_status)
+        .bind(&meta)
         .execute(&self.pg)
         .await?;
 
@@ -987,12 +1002,14 @@ mod tests {
             version: "2026.4.6".to_string(),
             install_source: Some("direct".to_string()),
             install_path: Some("~/.local/bin/ff".to_string()),
+            metadata: None,
         }];
         b.installed_software = vec![InstalledSoftware {
             id: "ff".to_string(),
             version: "2026.4.7".to_string(),
             install_source: Some("direct".to_string()),
             install_path: Some("~/.local/bin/ff".to_string()),
+            metadata: None,
         }];
 
         let sa = PersistedSnapshot::from_beat(&a);

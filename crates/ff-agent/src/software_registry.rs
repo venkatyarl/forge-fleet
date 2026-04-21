@@ -1,11 +1,17 @@
-//! Software registry loader.
+//! Software registry loader (retired).
 //!
-//! Parses `config/software.toml` into rows and upserts them into the
-//! `software_registry` Postgres table (schema V14).
+//! Historically this module parsed `config/software.toml` and upserted
+//! rows into the `software_registry` Postgres table. That file has been
+//! deleted — the DB migration `SCHEMA_V28_SOFTWARE_REGISTRY_SEED` now
+//! owns the canonical seed set, and operator edits via
+//! `ff software add/remove` (or direct SQL) are preserved across
+//! upgrades.
 //!
-//! The table has `latest_version` + `latest_version_at` columns which are
-//! owned by the upstream-check loop — this loader NEVER writes those two
-//! columns, only INSERTs them as NULL on first insert.
+//! The public API ([`seed_from_toml`], [`SeedReport`], and the
+//! supporting `SoftwareFile` / `SoftwareEntry` types) is intentionally
+//! preserved so any callers that predate the retirement keep compiling.
+//! The seeder itself is now a no-op that logs once and returns an empty
+//! [`SeedReport`]. Deletion of the types happens in a later cleanup pass.
 
 use std::path::{Path, PathBuf};
 
@@ -84,127 +90,30 @@ pub struct SoftwareEntry {
     pub requires_reboot: bool,
 }
 
-/// Read the software TOML from `path` and upsert every row into
-/// `software_registry`. Returns a per-row summary.
+/// Retired no-op seeder. The DB migration `SCHEMA_V28_SOFTWARE_REGISTRY_SEED`
+/// now owns the canonical `software_registry` seed set; this function is
+/// kept only so callers that predate the retirement (e.g.
+/// `examples/seed_v14_registries.rs`) keep compiling.
 ///
-/// The SQL uses `INSERT ... ON CONFLICT (id) DO UPDATE SET ...` and updates
-/// every column EXCEPT `latest_version` and `latest_version_at`, which are
-/// owned by the upstream-check loop.
+/// Logs a single info line the first time it's called in a process.
 pub async fn seed_from_toml(
-    pool: &PgPool,
-    toml_path: &Path,
+    _pool: &PgPool,
+    _toml_path: &Path,
 ) -> Result<SeedReport, SoftwareError> {
-    let raw = std::fs::read_to_string(toml_path).map_err(|source| SoftwareError::Io {
-        path: toml_path.to_path_buf(),
-        source,
-    })?;
-
-    let doc: SoftwareFile = toml::from_str(&raw).map_err(|source| SoftwareError::Toml {
-        path: toml_path.to_path_buf(),
-        source,
-    })?;
-
-    let mut report = SeedReport {
-        total: doc.software.len(),
-        ..SeedReport::default()
-    };
-
-    for entry in &doc.software {
-        let version_source =
-            toml_table_to_json(&entry.version_source).map_err(|source| SoftwareError::Json {
-                id: entry.id.clone(),
-                field: "version_source",
-                source,
-            })?;
-
-        let upgrade_playbook =
-            toml_table_to_json(&entry.upgrade_playbook).map_err(|source| SoftwareError::Json {
-                id: entry.id.clone(),
-                field: "upgrade_playbook",
-                source,
-            })?;
-
-        // Use xmax=0 trick: a brand-new row has xmax=0; an updated row has xmax != 0.
-        // We also compare the pre-image to detect "no-op" updates and bucket them
-        // into `unchanged`.
-        let row: Option<(bool, bool)> = sqlx::query_as(
-            r#"
-            WITH existing AS (
-                SELECT
-                    display_name,
-                    kind,
-                    applies_to_os_family,
-                    version_source,
-                    upgrade_playbook,
-                    requires_restart,
-                    requires_reboot
-                FROM software_registry
-                WHERE id = $1
-            ),
-            upsert AS (
-                INSERT INTO software_registry (
-                    id,
-                    display_name,
-                    kind,
-                    applies_to_os_family,
-                    version_source,
-                    upgrade_playbook,
-                    requires_restart,
-                    requires_reboot
-                )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                ON CONFLICT (id) DO UPDATE SET
-                    display_name         = EXCLUDED.display_name,
-                    kind                 = EXCLUDED.kind,
-                    applies_to_os_family = EXCLUDED.applies_to_os_family,
-                    version_source       = EXCLUDED.version_source,
-                    upgrade_playbook     = EXCLUDED.upgrade_playbook,
-                    requires_restart     = EXCLUDED.requires_restart,
-                    requires_reboot      = EXCLUDED.requires_reboot
-                RETURNING (xmax = 0) AS inserted
-            )
-            SELECT
-                u.inserted,
-                COALESCE(
-                    e.display_name         IS DISTINCT FROM $2 OR
-                    e.kind                 IS DISTINCT FROM $3 OR
-                    e.applies_to_os_family IS DISTINCT FROM $4 OR
-                    e.version_source       IS DISTINCT FROM $5 OR
-                    e.upgrade_playbook     IS DISTINCT FROM $6 OR
-                    e.requires_restart     IS DISTINCT FROM $7 OR
-                    e.requires_reboot      IS DISTINCT FROM $8,
-                    true
-                ) AS changed
-            FROM upsert u
-            LEFT JOIN existing e ON TRUE
-            "#,
-        )
-        .bind(&entry.id)
-        .bind(&entry.display_name)
-        .bind(&entry.kind)
-        .bind(entry.applies_to_os_family.as_deref())
-        .bind(&version_source)
-        .bind(&upgrade_playbook)
-        .bind(entry.requires_restart)
-        .bind(entry.requires_reboot)
-        .fetch_optional(pool)
-        .await?;
-
-        match row {
-            Some((true, _)) => report.inserted += 1,
-            Some((false, true)) => report.updated += 1,
-            Some((false, false)) => report.unchanged += 1,
-            None => {
-                // Upsert always returns a row; this branch is defensive.
-                report.updated += 1;
-            }
-        }
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    if !LOGGED.swap(true, Ordering::Relaxed) {
+        tracing::info!(
+            "software_registry: TOML seeder retired; canonical rows come from migration V28"
+        );
     }
-
-    Ok(report)
+    Ok(SeedReport::default())
 }
 
 /// Convert a `toml::value::Table` to `serde_json::Value::Object(...)`.
+/// Retained for backwards-compat tests; the main seeder path no longer
+/// uses it (see [`seed_from_toml`] no-op stub).
+#[allow(dead_code)]
 fn toml_table_to_json(
     table: &toml::value::Table,
 ) -> Result<serde_json::Value, serde_json::Error> {

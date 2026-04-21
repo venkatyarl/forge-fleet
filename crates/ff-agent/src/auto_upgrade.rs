@@ -187,6 +187,69 @@ pub async fn resolve_upgrade_plans(
     Ok((plans, skipped))
 }
 
+/// Outcome of [`gate_git_state`] — what the dirty/unpushed/pushed check
+/// decided about a batch of plans.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GitStateGate {
+    /// Proceed as normal. Either `pushed` or `unknown` (dev environment).
+    Allow,
+    /// Proceed but warn + emit a NATS `unpushed_propagation` event.
+    AllowWithWarning,
+    /// Refuse — leader's build is dirty. Caller should mark targets
+    /// `upgrade_blocked_dirty` and abort.
+    BlockDirty,
+}
+
+/// Look up the leader's `git_state` for a `*_git` software_id and decide
+/// whether propagation is safe. Returns [`GitStateGate::Allow`] for any
+/// non-`ff_git` / `forgefleetd_git` software (the gate is a no-op for
+/// package-manager-managed upgrades). `force_dirty` converts `BlockDirty`
+/// to `AllowWithWarning` so the operator can override after inspection.
+pub async fn gate_git_state(
+    pool: &PgPool,
+    software_id: &str,
+    force_dirty: bool,
+) -> GitStateGate {
+    if !matches!(software_id, "ff_git" | "forgefleetd_git") {
+        return GitStateGate::Allow;
+    }
+    // Leader = the computer currently named in `fleet_leader_state`.
+    let state = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT cs.metadata->>'git_state'
+           FROM computer_software cs
+           JOIN computers c ON c.id = cs.computer_id
+           JOIN fleet_leader_state fls ON LOWER(fls.member_name) = LOWER(c.name)
+          WHERE cs.software_id = $1
+          LIMIT 1",
+    )
+    .bind(software_id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
+    .flatten();
+
+    match state.as_deref() {
+        Some("pushed") => GitStateGate::Allow,
+        Some("unpushed") => GitStateGate::AllowWithWarning,
+        Some("dirty") => {
+            if force_dirty { GitStateGate::AllowWithWarning } else { GitStateGate::BlockDirty }
+        }
+        _ => GitStateGate::Allow, // unknown / missing — dev fleet, proceed with weaker guarantees
+    }
+}
+
+/// Mark every target row for `software_id` as `upgrade_blocked_dirty` so
+/// operators can see why propagation refused. Best-effort; errors swallowed.
+pub async fn mark_targets_blocked_dirty(pool: &PgPool, software_id: &str) {
+    let _ = sqlx::query(
+        "UPDATE computer_software SET status = 'upgrade_blocked_dirty' WHERE software_id = $1",
+    )
+    .bind(software_id)
+    .execute(pool)
+    .await;
+}
+
 /// Enqueue the given plans as `kind='shell'` deferred tasks.
 ///
 /// Each payload carries:
@@ -348,6 +411,47 @@ impl AutoUpgradeTick {
             if plans.is_empty() {
                 continue;
             }
+            // ── Dirty-build safety gate ────────────────────────────
+            // Never force-dirty from the automatic path — the operator
+            // must explicitly opt in via `ff fleet upgrade --force-dirty`.
+            let leader_sha = plans
+                .first()
+                .and_then(|p| p.installed_version.clone())
+                .unwrap_or_else(|| "(unknown)".into());
+            let gate = gate_git_state(&self.pool, software_id, false).await;
+            match gate {
+                GitStateGate::BlockDirty => {
+                    tracing::warn!(
+                        software_id = %software_id,
+                        sha = %leader_sha,
+                        "refusing to propagate dirty build {leader_sha} — commit or pass --force-dirty"
+                    );
+                    mark_targets_blocked_dirty(&self.pool, software_id).await;
+                    continue;
+                }
+                GitStateGate::AllowWithWarning => {
+                    tracing::warn!(
+                        software_id = %software_id,
+                        sha = %leader_sha,
+                        computers = plans.len(),
+                        "propagating unpushed commit {leader_sha} from leader to fleet — push to origin/main when ready"
+                    );
+                    let payload = json!({
+                        "software_id": software_id,
+                        "sha": leader_sha,
+                        "computer_count": plans.len(),
+                        "source": who,
+                        "ts": chrono::Utc::now().to_rfc3339(),
+                    });
+                    crate::nats_client::publish_json(
+                        "fleet.events.software.unpushed_propagation".to_string(),
+                        &payload,
+                    )
+                    .await;
+                }
+                GitStateGate::Allow => {}
+            }
+
             match enqueue_plans(&self.pool, &plans, &who).await {
                 Ok(enqueued) => {
                     tracing::info!(
