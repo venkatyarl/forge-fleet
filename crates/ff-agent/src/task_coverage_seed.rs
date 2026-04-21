@@ -1,9 +1,16 @@
-//! Seed `fleet_task_coverage` from `config/task_coverage.toml`.
+//! Seed `fleet_task_coverage` (retired).
 //!
-//! The CoverageGuard (see [`crate::coverage_guard`]) reads this table on
-//! every tick. This seeder upserts every row from the TOML so operators
-//! can edit the file and re-run `ff fleet task-coverage seed` to pick up
-//! changes without hand-writing SQL.
+//! Historically this module parsed `config/task_coverage.toml` and upserted
+//! rows into the `fleet_task_coverage` Postgres table. That file has been
+//! deleted — the DB migration `SCHEMA_V36_RETIRE_TASK_COVERAGE_TOML` now
+//! owns the canonical seed set, and operator edits via SQL (or
+//! `ff fleet task-coverage set`) are preserved across upgrades.
+//!
+//! The public API ([`seed_from_toml`], [`TaskCoverageSeedReport`], and the
+//! supporting `TaskCoverageFile` / `TaskCoverageEntry` types) is
+//! intentionally preserved so any callers that predate the retirement
+//! keep compiling. The seeder itself is now a no-op that logs once and
+//! returns an empty [`TaskCoverageSeedReport`].
 
 use std::path::{Path, PathBuf};
 
@@ -85,67 +92,24 @@ pub fn resolve_task_coverage_path() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from(DEFAULT_TASK_COVERAGE_PATH))
 }
 
-/// Load `task_coverage.toml` and upsert every row into
-/// `fleet_task_coverage`. Idempotent.
+/// Retired no-op seeder. The DB migration
+/// `SCHEMA_V36_RETIRE_TASK_COVERAGE_TOML` now owns the canonical
+/// `fleet_task_coverage` seed set; this function is kept only so callers
+/// that predate the retirement keep compiling.
+///
+/// Logs a single info line the first time it's called in a process.
 pub async fn seed_from_toml(
-    pool: &PgPool,
-    toml_path: &Path,
+    _pool: &PgPool,
+    _toml_path: &Path,
 ) -> Result<TaskCoverageSeedReport, TaskCoverageError> {
-    let raw = std::fs::read_to_string(toml_path).map_err(|source| TaskCoverageError::Io {
-        path: toml_path.to_path_buf(),
-        source,
-    })?;
-
-    let doc: TaskCoverageFile =
-        toml::from_str(&raw).map_err(|source| TaskCoverageError::Toml {
-            path: toml_path.to_path_buf(),
-            source,
-        })?;
-
-    let mut report = TaskCoverageSeedReport {
-        total: doc.tasks.len(),
-        ..TaskCoverageSeedReport::default()
-    };
-
-    for entry in &doc.tasks {
-        let preferred_json =
-            serde_json::to_value(&entry.preferred_model_ids).unwrap_or_else(|_| serde_json::json!([]));
-
-        // Detect insert vs update via xmax.
-        let row: Option<(bool,)> = sqlx::query_as(
-            "INSERT INTO fleet_task_coverage
-                (task, min_models_loaded, preferred_model_ids, priority, notes, alias)
-             VALUES ($1, $2, $3, $4, $5, $6)
-             ON CONFLICT (task) DO UPDATE SET
-                min_models_loaded   = EXCLUDED.min_models_loaded,
-                preferred_model_ids = EXCLUDED.preferred_model_ids,
-                priority            = EXCLUDED.priority,
-                notes               = EXCLUDED.notes,
-                alias               = EXCLUDED.alias
-             WHERE fleet_task_coverage.min_models_loaded   IS DISTINCT FROM EXCLUDED.min_models_loaded
-                OR fleet_task_coverage.preferred_model_ids IS DISTINCT FROM EXCLUDED.preferred_model_ids
-                OR fleet_task_coverage.priority            IS DISTINCT FROM EXCLUDED.priority
-                OR fleet_task_coverage.notes               IS DISTINCT FROM EXCLUDED.notes
-                OR fleet_task_coverage.alias               IS DISTINCT FROM EXCLUDED.alias
-             RETURNING (xmax = 0) AS inserted",
-        )
-        .bind(&entry.task)
-        .bind(entry.min_models_loaded)
-        .bind(&preferred_json)
-        .bind(&entry.priority)
-        .bind(entry.notes.as_deref())
-        .bind(entry.alias.as_deref())
-        .fetch_optional(pool)
-        .await?;
-
-        match row {
-            Some((true,)) => report.inserted += 1,
-            Some((false,)) => report.updated += 1,
-            None => report.unchanged += 1,
-        }
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    if !LOGGED.swap(true, Ordering::Relaxed) {
+        tracing::info!(
+            "fleet_task_coverage: TOML seeder retired; canonical rows come from migration V36"
+        );
     }
-
-    Ok(report)
+    Ok(TaskCoverageSeedReport::default())
 }
 
 #[cfg(test)]

@@ -2259,3 +2259,46 @@ VALUES
 
 ON CONFLICT (id) DO NOTHING;
 "#;
+
+// ─── V36: retire config/task_coverage.toml → Postgres ───────────────────────
+//
+// Per the DB-first directive: runtime task-coverage edits go straight to
+// Postgres. This migration idempotently UPSERTs the seven canonical task
+// coverage requirements previously seeded from `config/task_coverage.toml`.
+// Operator edits survive because ON CONFLICT (task) DO NOTHING.
+//
+// The CoverageGuard (ff-agent::coverage_guard) reads `fleet_task_coverage`
+// on every tick; nothing else changes.
+pub const SCHEMA_V36_RETIRE_TASK_COVERAGE_TOML: &str = r#"
+INSERT INTO fleet_task_coverage
+    (task, min_models_loaded, preferred_model_ids, priority, alias)
+VALUES
+  ('text-generation',
+   1, '[]'::jsonb, 'critical', 'general'),
+
+  ('code',
+   1, '[]'::jsonb, 'critical', 'coder'),
+
+  ('feature-extraction',
+   1,
+   '["bge-large-en-v1.5","qwen3-embedding-8b"]'::jsonb,
+   'normal', NULL),
+
+  ('automatic-speech-recognition',
+   1, '[]'::jsonb, 'normal', 'audio'),
+
+  ('image-text-to-text',
+   1, '[]'::jsonb, 'nice-to-have', 'multimodal'),
+
+  ('chain-of-thought',
+   1,
+   '["qwen3.5-35b-a3b-4bit-mlx"]'::jsonb,
+   'normal', 'thinking'),
+
+  ('code-generation',
+   1,
+   '["qwen3-coder-30b-a3b","qwen3.6-35b-a3b"]'::jsonb,
+   'normal', 'code')
+
+ON CONFLICT (task) DO NOTHING;
+"#;
