@@ -201,6 +201,73 @@ impl PulseReader {
         Ok(candidates.into_iter().next())
     }
 
+    /// Pick the best `(computer_name, LlmServer)` for `requested`, expanding
+    /// pool aliases via `fleet_task_coverage.alias` (schema V27).
+    ///
+    /// Flow:
+    /// 1. If `requested` matches a row's `alias`, expand to that row's
+    ///    `preferred_model_ids` and treat every id as a candidate.
+    /// 2. Otherwise fall back to the single-model path (`requested` itself).
+    /// 3. Across every beat, collect active+healthy servers whose
+    ///    `model.id` equals any candidate, then rank by `queue_depth` ASC,
+    ///    `tokens_per_sec_last_min` DESC.
+    ///
+    /// Keeps the original single-model [`pick_llm_server_for`] intact for
+    /// callers that don't have a Postgres pool handy.
+    pub async fn pick_llm_server_for_with_pools(
+        &self,
+        pg: &sqlx::PgPool,
+        requested: &str,
+    ) -> Result<Option<(String, LlmServer)>, PulseError> {
+        // 1. Alias lookup. Swallow DB errors so an unreachable Postgres
+        //    still lets exact-id routing work.
+        let pool_members: Option<Vec<String>> = sqlx::query_scalar::<_, String>(
+            "SELECT preferred_model_ids::text
+               FROM fleet_task_coverage
+              WHERE alias = $1
+              LIMIT 1",
+        )
+        .bind(requested)
+        .fetch_optional(pg)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok());
+
+        let candidate_ids: Vec<String> = match pool_members {
+            Some(members) if !members.is_empty() => members,
+            _ => vec![requested.to_string()],
+        };
+
+        // 2. Collect matches across every beat.
+        let beats = self.all_beats().await?;
+        let mut candidates: Vec<(String, LlmServer)> = Vec::new();
+        for b in beats {
+            if b.going_offline {
+                continue;
+            }
+            for s in &b.llm_servers {
+                if s.status == "active"
+                    && s.is_healthy
+                    && candidate_ids.iter().any(|id| id == &s.model.id)
+                {
+                    candidates.push((b.computer_name.clone(), s.clone()));
+                }
+            }
+        }
+
+        // 3. Rank lowest load first, fastest tokens/sec on ties.
+        candidates.sort_by(|(_, a), (_, b)| {
+            a.queue_depth.cmp(&b.queue_depth).then_with(|| {
+                b.tokens_per_sec_last_min
+                    .partial_cmp(&a.tokens_per_sec_last_min)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+        });
+
+        Ok(candidates.into_iter().next())
+    }
+
     /// Enumerate every active+healthy LLM server across the fleet.
     pub async fn list_llm_servers(&self) -> Result<Vec<(String, LlmServer)>, PulseError> {
         let beats = self.all_beats().await?;

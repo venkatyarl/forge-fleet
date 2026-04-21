@@ -64,6 +64,10 @@ pub struct TaskCoverageEntry {
     pub priority: String,
     #[serde(default)]
     pub notes: Option<String>,
+    /// Optional short handle that gateway clients can send as the `model`
+    /// field to route to any member of this pool (schema V27).
+    #[serde(default)]
+    pub alias: Option<String>,
 }
 
 fn default_min_models_loaded() -> i32 {
@@ -110,17 +114,19 @@ pub async fn seed_from_toml(
         // Detect insert vs update via xmax.
         let row: Option<(bool,)> = sqlx::query_as(
             "INSERT INTO fleet_task_coverage
-                (task, min_models_loaded, preferred_model_ids, priority, notes)
-             VALUES ($1, $2, $3, $4, $5)
+                (task, min_models_loaded, preferred_model_ids, priority, notes, alias)
+             VALUES ($1, $2, $3, $4, $5, $6)
              ON CONFLICT (task) DO UPDATE SET
                 min_models_loaded   = EXCLUDED.min_models_loaded,
                 preferred_model_ids = EXCLUDED.preferred_model_ids,
                 priority            = EXCLUDED.priority,
-                notes               = EXCLUDED.notes
+                notes               = EXCLUDED.notes,
+                alias               = EXCLUDED.alias
              WHERE fleet_task_coverage.min_models_loaded   IS DISTINCT FROM EXCLUDED.min_models_loaded
                 OR fleet_task_coverage.preferred_model_ids IS DISTINCT FROM EXCLUDED.preferred_model_ids
                 OR fleet_task_coverage.priority            IS DISTINCT FROM EXCLUDED.priority
                 OR fleet_task_coverage.notes               IS DISTINCT FROM EXCLUDED.notes
+                OR fleet_task_coverage.alias               IS DISTINCT FROM EXCLUDED.alias
              RETURNING (xmax = 0) AS inserted",
         )
         .bind(&entry.task)
@@ -128,6 +134,7 @@ pub async fn seed_from_toml(
         .bind(&preferred_json)
         .bind(&entry.priority)
         .bind(entry.notes.as_deref())
+        .bind(entry.alias.as_deref())
         .fetch_optional(pool)
         .await?;
 

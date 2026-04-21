@@ -198,22 +198,60 @@ impl PulseLlmRouter {
             .map(|(_, b, s)| (b.computer_name, b.network.primary_ip, s)))
     }
 
+    /// Pool-alias aware variant of [`pick_server`]. When `requested_model`
+    /// matches `fleet_task_coverage.alias` (schema V27), the alias is
+    /// expanded to the pool's `preferred_model_ids` and we pick the
+    /// lowest-load live endpoint serving any member. Otherwise returns
+    /// `None` so the caller falls back to the normal matcher.
+    ///
+    /// The beat-side primary_ip is looked up via a full-beat scan after the
+    /// reader returns its pick; this keeps the reader pure (no beat→ip
+    /// join inside ff-pulse).
+    pub async fn pick_server_with_pools(
+        &self,
+        pg: &sqlx::PgPool,
+        requested_model: &str,
+    ) -> Result<Option<(String, String, LlmServer)>, LlmRoutingError> {
+        let picked = self
+            .reader
+            .pick_llm_server_for_with_pools(pg, requested_model)
+            .await?;
+        let Some((computer, server)) = picked else {
+            return Ok(None);
+        };
+        // Recover primary_ip from the beat (reader returns the computer name
+        // but not the IP; a single extra scan here is fine because alias
+        // routing is the uncommon path).
+        let beats = self.reader.all_beats().await?;
+        let primary_ip = beats
+            .iter()
+            .find(|b| b.computer_name == computer)
+            .map(|b| b.network.primary_ip.clone())
+            .unwrap_or_default();
+        Ok(Some((computer, primary_ip, server)))
+    }
+
     /// Full end-to-end: extract `model` from the body, pick a server, and
     /// proxy the JSON request to that server's `/v1/chat/completions`.
     ///
     /// Streaming is NOT supported in v1 — if the request has `"stream": true`,
     /// it is downgraded to non-streaming transparently.
     pub async fn route_completion(&self, body: Value) -> Result<Value, LlmRoutingError> {
-        self.route_completion_cached(body, None).await
+        self.route_completion_cached(body, None, None).await
     }
 
     /// Like [`route_completion`] but consults `cache` first (sub-ms HashMap
     /// lookup) and falls through to a live `pick_server` call only on miss.
     /// Pass `None` for `cache` to use the legacy (uncached) path.
+    ///
+    /// If `pg` is provided, a pool-alias lookup runs first: when the
+    /// requested `model` matches `fleet_task_coverage.alias` (schema V27),
+    /// the lowest-load live endpoint serving any pool member is used.
     pub async fn route_completion_cached(
         &self,
         mut body: Value,
         cache: Option<&LlmRoutingCache>,
+        pg: Option<&sqlx::PgPool>,
     ) -> Result<Value, LlmRoutingError> {
         let requested_model = body
             .get("model")
@@ -226,12 +264,24 @@ impl PulseLlmRouter {
             body["stream"] = Value::Bool(false);
         }
 
-        // Cache-first pick. The cache's own fallback will call pick_server
-        // if it misses; if even that returns None we emit the same NoMatch
-        // error the uncached path would.
-        let picked = match cache {
-            Some(c) => c.pick(&requested_model).await,
-            None => self.pick_server(&requested_model).await?,
+        // 1. Pool-alias expansion (optional). If we have a pool hit, use it
+        //    directly and skip the cache. Alias traffic is rare enough that
+        //    a per-request beat scan is fine.
+        let pool_pick = match pg {
+            Some(pool) => self
+                .pick_server_with_pools(pool, &requested_model)
+                .await
+                .unwrap_or(None),
+            None => None,
+        };
+
+        // 2. Cache-first pick for the normal (exact/prefix-id) path.
+        let picked = match pool_pick {
+            Some(t) => Some(t),
+            None => match cache {
+                Some(c) => c.pick(&requested_model).await,
+                None => self.pick_server(&requested_model).await?,
+            },
         };
 
         let Some((computer, primary_ip, server)) = picked else {

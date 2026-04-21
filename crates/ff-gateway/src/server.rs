@@ -3779,8 +3779,15 @@ async fn proxy_chat_completions(
     // fall through to the legacy tier-router path.
     if let Some(pulse) = state.pulse_router.clone() {
         let cache_ref = state.pulse_cache.as_deref();
+        // Hand the Pulse router the PG pool so it can expand pool aliases
+        // (`fleet_task_coverage.alias`, schema V27) before doing the
+        // normal exact/prefix model-id match.
+        let pg_ref = state
+            .operational_store
+            .as_ref()
+            .and_then(|s| s.pg_pool());
         match pulse
-            .route_completion_cached(raw_payload.clone(), cache_ref)
+            .route_completion_cached(raw_payload.clone(), cache_ref, pg_ref)
             .await
         {
             Ok(value) => {

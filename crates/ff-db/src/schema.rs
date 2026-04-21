@@ -1633,3 +1633,19 @@ CREATE TABLE IF NOT EXISTS cloud_llm_usage (
 );
 CREATE INDEX IF NOT EXISTS cloud_llm_usage_by_provider ON cloud_llm_usage(provider_id, used_at DESC);
 "#;
+
+// ─── V27: Pool aliases on fleet_task_coverage ───────────────────────────────
+//
+// Adds an optional `alias` column to `fleet_task_coverage` so gateway clients
+// can say `model="coder"` / `model="multimodal"` / `model="thinking"` instead
+// of an exact HuggingFace model id. At routing time the gateway expands the
+// alias into the row's `preferred_model_ids` and picks the lowest-load live
+// endpoint whose `model.id` matches any member. The column is UNIQUE so each
+// alias maps to exactly one pool.
+pub const SCHEMA_V27_POOL_ALIASES: &str = r#"
+ALTER TABLE fleet_task_coverage
+    ADD COLUMN IF NOT EXISTS alias TEXT UNIQUE;
+
+CREATE INDEX IF NOT EXISTS fleet_task_coverage_alias_idx
+    ON fleet_task_coverage(alias);
+"#;
