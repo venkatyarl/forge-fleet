@@ -68,8 +68,14 @@ impl LlmProbe {
             let models_url = format!("http://127.0.0.1:{port}/v1/models");
             let v1_response = client.get(&models_url).send().await.ok();
 
-            let (model_id, raw_body, has_data) = match v1_response {
+            let (model_id, raw_body, has_data, server_header) = match v1_response {
                 Some(r) if r.status().is_success() => {
+                    let server_header = r
+                        .headers()
+                        .get("server")
+                        .and_then(|h| h.to_str().ok())
+                        .map(|s| s.to_string())
+                        .unwrap_or_default();
                     let body_txt = r.text().await.unwrap_or_default();
                     let parsed: Option<serde_json::Value> = serde_json::from_str(&body_txt).ok();
                     let data_arr = parsed
@@ -83,9 +89,9 @@ impl LlmProbe {
                         .and_then(|id| id.as_str())
                         .map(|s| s.to_string())
                         .unwrap_or_else(|| "unknown".to_string());
-                    (id, body_txt, has_data)
+                    (id, body_txt, has_data, server_header)
                 }
-                _ => ("unknown".to_string(), String::new(), false),
+                _ => ("unknown".to_string(), String::new(), false, String::new()),
             };
 
             // Ollama fallback: query /api/tags which lists pulled models.
@@ -121,7 +127,7 @@ impl LlmProbe {
                 continue;
             }
 
-            let runtime = identify_runtime(port, &raw_body);
+            let runtime = identify_runtime(port, &raw_body, &server_header, &model_id);
             let (tokens_per_sec, queue_depth) = fetch_metrics(&client, port).await;
 
             let display_name = model_id
@@ -253,19 +259,44 @@ impl LlmProbe {
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
-fn identify_runtime(port: u16, body: &str) -> &'static str {
+fn identify_runtime(port: u16, body: &str, server_header: &str, model_id: &str) -> &'static str {
     if port == 11434 {
         return "ollama";
     }
-    if body.contains(".gguf") {
+    // llama.cpp advertises itself in the Server header and typically includes
+    // .gguf paths in the /v1/models response.
+    let server_lc = server_header.to_ascii_lowercase();
+    if server_lc.contains("llama.cpp") || body.contains(".gguf") {
         return "llama.cpp";
     }
-    if body.contains(".safetensors") && std::env::consts::OS == "macos" {
+    // MLX detection: `mlx_lm.server` is a Python BaseHTTPServer and typically
+    // serves model ids under `mlx-community/...` or local paths ending in
+    // `-mlx` / `-4bit`. Any one of these signatures is sufficient.
+    let is_mac = std::env::consts::OS == "macos";
+    let header_is_python_basehttp =
+        server_lc.contains("basehttp") && server_lc.contains("python");
+    let model_looks_mlx = model_id.contains("mlx-community/")
+        || model_id.contains("-mlx")
+        || model_id.contains("-4bit");
+    let body_looks_mlx = body.contains("mlx-community/")
+        || body.contains("-mlx\"")
+        || body.contains("-4bit\"");
+    if header_is_python_basehttp || model_looks_mlx || body_looks_mlx {
+        return "mlx_lm";
+    }
+    if body.contains(".safetensors") && is_mac {
         return "mlx_lm";
     }
     // Port 51001 on Linux conventionally runs vllm; on macOS it's mlx_lm.
     if port == 51001 {
-        return if std::env::consts::OS == "macos" { "mlx_lm" } else { "vllm" };
+        return if is_mac { "mlx_lm" } else { "vllm" };
+    }
+    // Last-resort fallback: if a Mac host responded with a valid /v1/models
+    // payload but didn't match any llama.cpp / ollama signature, it's almost
+    // certainly mlx_lm.server. On Linux we still return "unknown" since vllm
+    // and others cannot be disambiguated without more signals.
+    if is_mac {
+        return "mlx_lm";
     }
     "unknown"
 }
@@ -377,10 +408,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn runtime_identification_fallbacks_to_vllm() {
-        assert_eq!(identify_runtime(11434, ""), "ollama");
-        assert_eq!(identify_runtime(55000, "foo.gguf"), "llama.cpp");
-        assert_eq!(identify_runtime(55000, "{}"), "vllm");
+    fn runtime_identification_fallbacks() {
+        assert_eq!(identify_runtime(11434, "", "", ""), "ollama");
+        assert_eq!(identify_runtime(55000, "foo.gguf", "", ""), "llama.cpp");
+        // On Linux, a bare JSON body with no distinguishing signals falls
+        // through to "unknown"; on macOS the last-resort branch returns
+        // "mlx_lm". We assert the OS-appropriate expectation.
+        let expected_bare = if std::env::consts::OS == "macos" {
+            "mlx_lm"
+        } else {
+            "unknown"
+        };
+        assert_eq!(identify_runtime(55000, "{}", "", ""), expected_bare);
+        // MLX detection via server header:
+        assert_eq!(
+            identify_runtime(55000, "{}", "BaseHTTP/0.6 Python/3.14.3", ""),
+            "mlx_lm"
+        );
+        // MLX detection via model id:
+        assert_eq!(
+            identify_runtime(55000, "{}", "", "mlx-community/Qwen2.5-Coder-32B-4bit"),
+            "mlx_lm"
+        );
+        // llama.cpp server header wins over Mac fallback:
+        assert_eq!(
+            identify_runtime(55000, "{}", "llama.cpp", ""),
+            "llama.cpp"
+        );
     }
 
     #[test]

@@ -530,6 +530,28 @@ enum SoftwareCommand {
     Drift {
         #[arg(long)] json: bool,
     },
+    /// Insert or update a row in `software_registry` without editing `config/software.toml`.
+    ///
+    /// `version-source` and `upgrade-playbook` are JSON strings (stored as JSONB).
+    Add {
+        /// Software ID (primary key, e.g. "gh", "openclaw", "ff").
+        id: String,
+        /// Package kind — "apt", "brew", "cargo", "binary", "npm", "pip", …
+        #[arg(long)] kind: String,
+        /// JSON object describing how to detect the installed/latest version.
+        #[arg(long = "version-source")] version_source: String,
+        /// JSON object describing how to install/upgrade the software.
+        #[arg(long = "upgrade-playbook")] upgrade_playbook: String,
+        /// Human-readable name (defaults to `id`).
+        #[arg(long = "display-name")] display_name: Option<String>,
+    },
+    /// Delete a row from `software_registry` (cascades through `computer_software`).
+    Remove {
+        /// Software ID to remove.
+        id: String,
+        /// Required to actually delete (otherwise prints plan and exits).
+        #[arg(long, default_value_t = false)] yes: bool,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -4627,6 +4649,32 @@ async fn finalize_external_tool_event(
     ff_agent::nats_client::publish_json(subject, &payload).await;
 }
 
+/// Wrap a user shell command so any `&`-spawned children survive after the
+/// wrapper exits. Without this, `nohup llama-server ... &` inside a defer
+/// task would launch successfully and then be killed seconds later — either
+/// by SIGHUP when the SSH session tears down, or by the parent's process
+/// group cleanup on the local side.
+///
+/// Strategy: run the user command inside `setsid sh -c '...'` so it gets a
+/// fresh session + process group. Children inherit that group and survive
+/// the parent's exit. `setsid` is ubiquitous on Linux; on macOS it's not
+/// present, so we fall back to plain `sh -c` (Taylor is the only macOS
+/// defer-worker host, and it's the leader/human-in-loop — operators should
+/// prefer `nohup <cmd> </dev/null >/dev/null 2>&1 & disown` there).
+fn wrap_for_detachment(user_cmd: &str, is_linux_target: bool) -> String {
+    if is_linux_target {
+        // Single-quote-escape the user script for `setsid sh -c '...'`.
+        let escaped = user_cmd.replace('\'', "'\\''");
+        format!("setsid sh -c '{escaped}'")
+    } else {
+        // macOS or unknown — caller must detach manually.
+        // TODO: background processes in shell payloads on macOS must use
+        // `nohup <cmd> </dev/null >/dev/null 2>&1 & disown` — operator
+        // responsibility (setsid is unavailable).
+        user_cmd.to_string()
+    }
+}
+
 /// Run a shell command either locally (when target is this host or None) or via SSH.
 async fn execute_shell(
     target_node: Option<&str>,
@@ -4642,12 +4690,19 @@ async fn execute_shell(
         .map(|s| s.trim().to_lowercase())
         .unwrap_or_default();
 
+    // Local host is Linux if uname reports Linux.
+    let local_is_linux = std::env::consts::OS == "linux";
+
     let mut local = true;
     let (program, args): (&str, Vec<String>) = match target_node {
-        None => ("sh", vec!["-c".into(), command.to_string()]),
-        Some(n) if this_hostname.starts_with(&n.to_lowercase()) => {
-            ("sh", vec!["-c".into(), command.to_string()])
-        }
+        None => (
+            "sh",
+            vec!["-c".into(), wrap_for_detachment(command, local_is_linux)],
+        ),
+        Some(n) if this_hostname.starts_with(&n.to_lowercase()) => (
+            "sh",
+            vec!["-c".into(), wrap_for_detachment(command, local_is_linux)],
+        ),
         Some(n) => {
             local = false;
             // SSH to target: look up user@ip from DB.
@@ -4656,14 +4711,23 @@ async fn execute_shell(
                 None => return (false, None, Some(format!("node '{n}' not in fleet_nodes"))),
             };
             let dest = format!("{}@{}", node.ssh_user, node.ip);
+            // Assume remote targets are Linux (Marcus/Sophie/Priya are Ubuntu;
+            // James is macOS — but gets same treatment: wrap_for_detachment
+            // returns plain cmd for non-Linux, which is safe).
+            // `-n` closes stdin so backgrounded children aren't wedged on it.
+            let os_hint = node.os.to_lowercase();
+            // Default to Linux (most fleet nodes): covers ubuntu, debian,
+            // dgx-os, generic "linux". Exclude darwin/macos explicitly.
+            let remote_is_linux = !(os_hint.contains("darwin") || os_hint.contains("macos"));
             (
                 "ssh",
                 vec![
+                    "-n".into(),
                     "-o".into(), "ConnectTimeout=8".into(),
                     "-o".into(), "StrictHostKeyChecking=accept-new".into(),
                     "-o".into(), "BatchMode=yes".into(),
                     dest,
-                    command.to_string(),
+                    wrap_for_detachment(command, remote_is_linux),
                 ],
             )
         }
@@ -6576,6 +6640,24 @@ async fn handle_software(cmd: SoftwareCommand) -> Result<()> {
             handle_software_list(&pool, computer, software, json).await
         }
         SoftwareCommand::Drift { json } => handle_software_drift(&pool, json).await,
+        SoftwareCommand::Add {
+            id,
+            kind,
+            version_source,
+            upgrade_playbook,
+            display_name,
+        } => {
+            handle_software_add(
+                &pool,
+                &id,
+                &kind,
+                &version_source,
+                &upgrade_playbook,
+                display_name,
+            )
+            .await
+        }
+        SoftwareCommand::Remove { id, yes } => handle_software_remove(&pool, &id, yes).await,
     }
 }
 
@@ -6728,6 +6810,104 @@ async fn handle_software_drift(pool: &sqlx::PgPool, json: bool) -> Result<()> {
         );
     }
     println!("\n{} row(s) with drift.", rows.len());
+    Ok(())
+}
+
+/// `ff software add` — upsert a `software_registry` row directly, bypassing
+/// `config/software.toml`. The TOML seeder is still the boot-time source of
+/// truth; this handler is for ad-hoc additions (new upstream tools, fleet
+/// LLMs proposing catalog entries, etc).
+async fn handle_software_add(
+    pool: &sqlx::PgPool,
+    id: &str,
+    kind: &str,
+    version_source_json: &str,
+    upgrade_playbook_json: &str,
+    display_name: Option<String>,
+) -> Result<()> {
+    let version_source: serde_json::Value = serde_json::from_str(version_source_json)
+        .map_err(|e| anyhow::anyhow!("--version-source is not valid JSON: {e}"))?;
+    let upgrade_playbook: serde_json::Value = serde_json::from_str(upgrade_playbook_json)
+        .map_err(|e| anyhow::anyhow!("--upgrade-playbook is not valid JSON: {e}"))?;
+
+    let display = display_name.unwrap_or_else(|| id.to_string());
+    let who = whoami_tag();
+
+    let result = sqlx::query(
+        "INSERT INTO software_registry (id, display_name, kind, version_source, upgrade_playbook)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (id) DO UPDATE SET
+             display_name     = EXCLUDED.display_name,
+             kind             = EXCLUDED.kind,
+             version_source   = EXCLUDED.version_source,
+             upgrade_playbook = EXCLUDED.upgrade_playbook",
+    )
+    .bind(id)
+    .bind(&display)
+    .bind(kind)
+    .bind(&version_source)
+    .bind(&upgrade_playbook)
+    .execute(pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("upsert software_registry: {e}"))?;
+
+    println!(
+        "{GREEN}✓ software_registry upsert ok{RESET}  id={id}  display_name={display}  kind={kind}  rows_affected={}  by={who}",
+        result.rows_affected()
+    );
+    Ok(())
+}
+
+/// `ff software remove` — delete a `software_registry` row. First cleans up
+/// `computer_software` rows referencing it so the FK doesn't block, then the
+/// registry row itself. Prints before-counts and requires `--yes` to commit.
+async fn handle_software_remove(pool: &sqlx::PgPool, id: &str, confirm_yes: bool) -> Result<()> {
+    let registry_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM software_registry WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("count software_registry: {e}"))?;
+
+    if registry_count == 0 {
+        println!("{YELLOW}No software_registry row with id='{id}' — nothing to remove.{RESET}");
+        return Ok(());
+    }
+
+    let install_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM computer_software WHERE software_id = $1",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("count computer_software: {e}"))?;
+
+    println!("About to remove software id='{id}':");
+    println!("  software_registry rows:  {registry_count}");
+    println!("  computer_software rows:  {install_count}");
+
+    if !confirm_yes {
+        eprintln!("{YELLOW}⚠ destructive. Re-run with --yes to confirm.{RESET}");
+        return Ok(());
+    }
+
+    let cs = sqlx::query("DELETE FROM computer_software WHERE software_id = $1")
+        .bind(id)
+        .execute(pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("delete computer_software: {e}"))?;
+
+    let sr = sqlx::query("DELETE FROM software_registry WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("delete software_registry: {e}"))?;
+
+    println!(
+        "{GREEN}✓ removed software id='{id}'{RESET}  computer_software_deleted={}  software_registry_deleted={}  by={}",
+        cs.rows_affected(),
+        sr.rows_affected(),
+        whoami_tag()
+    );
     Ok(())
 }
 

@@ -3,12 +3,14 @@
 //! ## Role
 //!
 //! Runs on the leader every 10 minutes. Resets any `sub_agents` row whose
-//! `status` is `'error'` or `'busy'` AND whose `started_at` is older than
-//! 10 minutes. The dispatch queue depends on slots cycling back to
-//! `'idle'` — when a worker crashes mid-task or flips to `'error'` without
-//! a later cleanup, the slot is effectively dead. This tick automates the
-//! manual `UPDATE sub_agents SET status='idle' ...` the operator used to
-//! run by hand.
+//! `status` is `'error'` or `'busy'` AND whose `started_at` is either NULL
+//! or older than 10 minutes. The dispatch queue depends on slots cycling
+//! back to `'idle'` — when a worker crashes mid-task or flips to `'error'`
+//! without a later cleanup, the slot is effectively dead. A NULL
+//! `started_at` on an `'error'`/`'busy'` row means the slot was never
+//! meaningfully running, so it should be reset too. This tick automates
+//! the manual `UPDATE sub_agents SET status='idle' ...` the operator used
+//! to run by hand.
 //!
 //! Schema note: the V23 `sub_agents` table has no `claimed_at` or
 //! `last_error` columns. We use `started_at` as the staleness clock and
@@ -59,8 +61,7 @@ impl SubAgentReaper {
                FROM computers c
               WHERE s.computer_id = c.id
                 AND s.status IN ('error','busy')
-                AND s.started_at IS NOT NULL
-                AND s.started_at < NOW() - INTERVAL '10 minutes'
+                AND (s.started_at IS NULL OR s.started_at < NOW() - INTERVAL '10 minutes')
               RETURNING c.name AS computer_name, s.slot AS slot, s.status AS status",
         )
         .fetch_all(&self.pool)
