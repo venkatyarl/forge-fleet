@@ -304,6 +304,16 @@ impl PulseLlmRouter {
             body["model"] = Value::String(server.model.id.clone());
         }
 
+        // Re-apply the qwen3-family max_tokens floor against the RESOLVED
+        // backend model (issue #94). The gateway applies an initial floor
+        // before this router sees the request, but when a pool alias like
+        // `thinking` expands to `qwen3-35b-thinking` the floor check never
+        // re-ran against the concrete model — so a request with
+        // `max_tokens=512` would land on a qwen3 server and silently return
+        // empty `content`. Apply the floor here so the resolved model's
+        // limit wins regardless of what the caller sent.
+        apply_qwen3_max_tokens_floor(&mut body, &server.model.id);
+
         // Beats report endpoints as `http://127.0.0.1:PORT` (because the LLM
         // probe runs on the same host as the inference server). Rewrite the
         // loopback host to the node's primary IP so the gateway can reach it
@@ -427,6 +437,44 @@ pub(crate) fn normalize_model_id(raw: &str) -> String {
 
     // Trim leading/trailing dashes left over from stripping.
     s.trim_matches('-').to_string()
+}
+
+/// Minimum `max_tokens` for qwen3-family models running in thinking mode
+/// (issue #94). Qwen3 / Qwen3-Coder / Qwen3-Omni / Qwen3-VL / Qwen3.5 /
+/// Qwen3.6 always emit a `<think>` block that burns 300-800 tokens before
+/// any visible content. llama.cpp's `enable_thinking=false` / `/no_think`
+/// directives are currently non-functional (GH #13189, #20182, #20409),
+/// so callers that pass `max_tokens < 1024` silently get empty `content`.
+pub(crate) const QWEN3_MAX_TOKENS_FLOOR: u64 = 1024;
+
+/// Apply the qwen3 thinking-mode `max_tokens` floor against `body` when the
+/// resolved backend model name contains `qwen3`. Idempotent; safe to call
+/// before AND after pool-alias expansion (issue #94).
+///
+/// No-op when `body` isn't an object, when the resolved model isn't qwen3,
+/// or when the caller already supplied `max_tokens >= QWEN3_MAX_TOKENS_FLOOR`.
+pub(crate) fn apply_qwen3_max_tokens_floor(body: &mut Value, resolved_model_id: &str) {
+    if !resolved_model_id.to_ascii_lowercase().contains("qwen3") {
+        return;
+    }
+    let Some(obj) = body.as_object_mut() else { return };
+    let current = obj.get("max_tokens").and_then(|v| v.as_u64());
+    if current.map(|n| n >= QWEN3_MAX_TOKENS_FLOOR).unwrap_or(false) {
+        return;
+    }
+    let old = current
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "unset".to_string());
+    obj.insert(
+        "max_tokens".to_string(),
+        json!(QWEN3_MAX_TOKENS_FLOOR),
+    );
+    tracing::debug!(
+        resolved_model = %resolved_model_id,
+        old = %old,
+        new = QWEN3_MAX_TOKENS_FLOOR,
+        "qwen3 thinking-mode max_tokens floor re-applied after pool expansion"
+    );
 }
 
 /// Replace `127.0.0.1` / `localhost` / `0.0.0.0` in an endpoint URL with
@@ -924,5 +972,53 @@ mod tests {
             normalize_model_id("Qwen/Qwen3-Coder-30B-A3B-Instruct"),
             "qwen3-coder-30b-a3b-instruct"
         );
+    }
+
+    // ─── #94 — qwen3 max_tokens floor post pool-alias expansion ──────────
+
+    #[test]
+    fn qwen3_floor_raises_max_tokens_for_resolved_qwen3_model() {
+        // Caller asked for pool alias "thinking" with max_tokens=512; after
+        // expansion the concrete model is qwen3-35b-thinking. Floor should
+        // bump max_tokens to QWEN3_MAX_TOKENS_FLOOR.
+        let mut body = json!({ "model": "thinking", "max_tokens": 512 });
+        apply_qwen3_max_tokens_floor(&mut body, "qwen3-35b-thinking");
+        assert_eq!(
+            body["max_tokens"].as_u64().unwrap(),
+            QWEN3_MAX_TOKENS_FLOOR
+        );
+    }
+
+    #[test]
+    fn qwen3_floor_inserts_max_tokens_when_absent() {
+        let mut body = json!({ "model": "coder" });
+        apply_qwen3_max_tokens_floor(&mut body, "Qwen3-Coder-30B-A3B");
+        assert_eq!(
+            body["max_tokens"].as_u64().unwrap(),
+            QWEN3_MAX_TOKENS_FLOOR
+        );
+    }
+
+    #[test]
+    fn qwen3_floor_preserves_caller_value_when_already_above_floor() {
+        let mut body = json!({ "model": "thinking", "max_tokens": 8192 });
+        apply_qwen3_max_tokens_floor(&mut body, "qwen3-35b-thinking");
+        assert_eq!(body["max_tokens"].as_u64().unwrap(), 8192);
+    }
+
+    #[test]
+    fn qwen3_floor_noop_for_non_qwen3_models() {
+        // Non-qwen3 model — even with max_tokens=16, no floor applies.
+        let mut body = json!({ "model": "coder", "max_tokens": 16 });
+        apply_qwen3_max_tokens_floor(&mut body, "qwen2.5-coder-32b");
+        assert_eq!(body["max_tokens"].as_u64().unwrap(), 16);
+    }
+
+    #[test]
+    fn qwen3_floor_noop_on_non_object_body() {
+        let mut body = json!([1, 2, 3]);
+        apply_qwen3_max_tokens_floor(&mut body, "qwen3-35b-thinking");
+        // Unchanged.
+        assert_eq!(body, json!([1, 2, 3]));
     }
 }
