@@ -36,8 +36,9 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use ff_db::leader_state::{
-    LeaderState, pg_claim_leader_initial, pg_claim_leader_takeover, pg_get_current_leader,
-    pg_refresh_leader_heartbeat, pg_yield_leader,
+    LeaderState, pg_claim_leader_initial, pg_claim_leader_pulse_silent,
+    pg_claim_leader_takeover, pg_get_current_leader, pg_refresh_leader_heartbeat,
+    pg_yield_leader,
 };
 use ff_pulse::reader::{PulseError, PulseReader};
 
@@ -52,6 +53,12 @@ const REVIVE_BACKOFF_WINDOW_MIN: i64 = 30;
 /// If the durable leader row's `heartbeat_at` is older than this, a live
 /// peer is allowed to challenge and take over.
 const STALE_THRESHOLD_SECS: i64 = 45;
+
+/// Minimum duration a leader must be ODOWN on the Pulse channel before a
+/// peer is allowed to challenge via [`pg_claim_leader_pulse_silent`] —
+/// even when Postgres heartbeat is fresh. Two back-to-back tick-pass
+/// observations (15 s + 15 s) cheaply filter transient Redis partitions.
+const MIN_PULSE_SILENT_SECS: u64 = 30;
 
 /// Errors returned by [`LeaderTick::tick`].
 #[derive(Debug, thiserror::Error)]
@@ -112,6 +119,13 @@ pub struct LeaderTick {
     /// [`PostgresFailoverManager::check_and_failover`] to detect a dead
     /// primary and promote the local replica if we host one.
     pg_failover_manager: Option<Arc<PostgresFailoverManager>>,
+
+    /// First wall-clock instant at which we observed the current leader
+    /// as ODOWN on the Pulse channel despite a fresh Postgres heartbeat.
+    /// Reset to `None` whenever the leader becomes pulse-alive again OR
+    /// the leader name changes. Used to gate [`pg_claim_leader_pulse_silent`]
+    /// via [`MIN_PULSE_SILENT_SECS`] — closes #91.
+    leader_pulse_silent_since: std::sync::Mutex<Option<(String, std::time::Instant)>>,
 }
 
 impl LeaderTick {
@@ -133,6 +147,31 @@ impl LeaderTick {
             on_became_leader: Arc::new(|_| {}),
             on_lost_leader: Arc::new(|_| {}),
             pg_failover_manager: None,
+            leader_pulse_silent_since: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Track pulse-silence of the current leader across consecutive ticks.
+    /// Returns `Some(duration)` once the leader has been continuously
+    /// pulse-silent; `None` otherwise. Resets whenever the leader name
+    /// changes (different leader → different silence window).
+    fn observe_leader_pulse_silence(
+        &self,
+        leader_name: &str,
+        leader_alive_in_pulse: bool,
+    ) -> Option<std::time::Duration> {
+        let mut guard = self.leader_pulse_silent_since.lock().ok()?;
+        if leader_alive_in_pulse {
+            *guard = None;
+            return None;
+        }
+        match guard.as_ref() {
+            Some((name, since)) if name == leader_name => Some(since.elapsed()),
+            _ => {
+                let now = std::time::Instant::now();
+                *guard = Some((leader_name.to_string(), now));
+                Some(std::time::Duration::ZERO)
+            }
         }
     }
 
@@ -359,7 +398,19 @@ impl LeaderTick {
             // Someone else is leader.
             (Some(cur), Some(best)) => {
                 let stale = leader_is_stale(&cur);
-                if stale && best.member_name == self.my_name {
+                let leader_alive_in_pulse =
+                    alive.get(&cur.member_name).copied().unwrap_or(false);
+                let pulse_silence = self.observe_leader_pulse_silence(
+                    &cur.member_name,
+                    leader_alive_in_pulse,
+                );
+                let pulse_silent_long_enough = pulse_silence
+                    .map(|d| d.as_secs() >= MIN_PULSE_SILENT_SECS)
+                    .unwrap_or(false);
+                let i_am_best = best.member_name == self.my_name;
+
+                if stale && i_am_best {
+                    // Classic takeover: Postgres heartbeat is stale.
                     let new_epoch = self.next_epoch(Some(cur.epoch));
                     let displaced_name = cur.member_name.clone();
                     let took = pg_claim_leader_takeover(
@@ -375,7 +426,39 @@ impl LeaderTick {
                         (self.on_became_leader)(Some(displaced_name.clone()));
                         Ok(TickOutcome::TookOver(displaced_name))
                     } else {
-                        // Another peer raced us; just wait for the next tick.
+                        Ok(TickOutcome::NoOp)
+                    }
+                } else if pulse_silent_long_enough && i_am_best && !stale {
+                    // Pulse-silent challenge path (#91): Postgres heartbeat
+                    // is fresh (so classic takeover is blocked) BUT the
+                    // leader has been ODOWN on Pulse for ≥ MIN_PULSE_SILENT_SECS.
+                    // The leader's Pulse publisher is hung / Redis partition /
+                    // Redis daemon down — peers can't see it so it's
+                    // effectively dead for routing + dispatch purposes.
+                    let new_epoch = self.next_epoch(Some(cur.epoch));
+                    let displaced_name = cur.member_name.clone();
+                    tracing::warn!(
+                        node = %self.my_name,
+                        displaced = %displaced_name,
+                        silence_secs = pulse_silence.map(|d| d.as_secs()).unwrap_or(0),
+                        "leader pulse-silent but postgres fresh; issuing challenge"
+                    );
+                    let took = pg_claim_leader_pulse_silent(
+                        &self.pg,
+                        self.my_computer_id,
+                        &self.my_name,
+                        new_epoch,
+                        &displaced_name,
+                    )
+                    .await?;
+                    if took {
+                        // Reset silence tracker: there's a new leader now.
+                        if let Ok(mut g) = self.leader_pulse_silent_since.lock() {
+                            *g = None;
+                        }
+                        (self.on_became_leader)(Some(displaced_name.clone()));
+                        Ok(TickOutcome::TookOver(displaced_name))
+                    } else {
                         Ok(TickOutcome::NoOp)
                     }
                 } else {

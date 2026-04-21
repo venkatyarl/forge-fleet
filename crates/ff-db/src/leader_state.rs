@@ -108,6 +108,53 @@ pub async fn pg_claim_leader_takeover(
     Ok(result.rows_affected() == 1)
 }
 
+/// Pulse-silent challenge takeover. Unlike [`pg_claim_leader_takeover`],
+/// this does NOT require the leader's Postgres `heartbeat_at` to be stale
+/// — it succeeds when the leader is silent on the Pulse v2 channel even
+/// though the daemon is still refreshing Postgres. Closes the gap where
+/// the Redis publisher hangs while the main daemon loop keeps writing
+/// `heartbeat_at` to Postgres, leaving the leader invisible to peers and
+/// un-replaceable via the heartbeat-age gate.
+///
+/// Caller must independently satisfy all of:
+///   - Leader's `computers.name` is NOT in our local pulse `alive` map
+///   - Silence has persisted for ≥ `MIN_PULSE_SILENT_SECS` (tracked in
+///     [`LeaderTick::leader_pulse_silent_since`])
+///   - Caller is the best-alive candidate per the usual priority rules
+///
+/// The SQL still enforces the epoch bump AND the old-leader-name match
+/// (prevents two challengers from racing each other into split brain),
+/// so concurrent callers will collapse to one winner via the Postgres
+/// singleton lock.
+pub async fn pg_claim_leader_pulse_silent(
+    pool: &PgPool,
+    my_computer_id: Uuid,
+    my_name: &str,
+    new_epoch: i64,
+    old_leader_name: &str,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE fleet_leader_state
+         SET computer_id  = $1,
+             member_name  = $2,
+             epoch        = $3,
+             elected_at   = NOW(),
+             reason       = 'pulse_silent_challenge',
+             heartbeat_at = NOW()
+         WHERE singleton_key = 'current'
+           AND member_name = $4
+           AND epoch < $3",
+    )
+    .bind(my_computer_id)
+    .bind(my_name)
+    .bind(new_epoch)
+    .bind(old_leader_name)
+    .execute(pool)
+    .await?;
+
+    Ok(result.rows_affected() == 1)
+}
+
 /// Refresh `heartbeat_at` if we are still the leader. Returns `true` iff
 /// a row was updated — useful for detecting that we have been displaced.
 pub async fn pg_refresh_leader_heartbeat(
