@@ -3705,7 +3705,7 @@ async fn settings_runtime(State(state): State<Arc<GatewayState>>) -> Json<Value>
 /// for backward compatibility.
 async fn proxy_chat_completions(
     State(state): State<Arc<GatewayState>>,
-    Json(raw_payload): Json<Value>,
+    Json(mut raw_payload): Json<Value>,
 ) -> Result<Response<Body>, (StatusCode, Json<Value>)> {
     // ── Cloud-LLM routing (first pass) ───────────────────────────────
     //
@@ -3727,6 +3727,47 @@ async fn proxy_chat_completions(
                 }
             }
         }
+    }
+
+    // ── Qwen3 thinking-mode max_tokens floor ─────────────────────────
+    //
+    // Qwen3-family models (Qwen3, Qwen3-Coder, Qwen3-Omni, Qwen3-VL,
+    // Qwen3.5, Qwen3.6, …) always emit a `<think>` block that burns
+    // 300-800 tokens before any visible content. llama.cpp's
+    // `enable_thinking=false` / `/no_think` directives are currently
+    // non-functional (GH #13189, #20182, #20409), so callers that pass
+    // `max_tokens < 1024` silently get empty `content`. Floor it here.
+    // Cloud-routed requests have already returned above; this only
+    // affects local fleet inference.
+    if raw_payload.is_object() {
+        let model_is_qwen3 = raw_payload
+            .get("model")
+            .and_then(|v| v.as_str())
+            .map(|m| m.to_ascii_lowercase().contains("qwen3"))
+            .unwrap_or(false);
+        if model_is_qwen3 {
+            let obj = raw_payload.as_object_mut().expect("checked is_object");
+            let current = obj.get("max_tokens").and_then(|v| v.as_u64());
+            if current.map(|n| n < 1024).unwrap_or(true) {
+                let old = current
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "unset".to_string());
+                let model = obj
+                    .get("model")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                obj.insert("max_tokens".to_string(), json!(1024u64));
+                tracing::debug!(
+                    model = %model,
+                    old = %old,
+                    new = 1024,
+                    "qwen3 thinking-mode max_tokens floor applied"
+                );
+            }
+        }
+    } else {
+        warn!("chat completion payload is not a JSON object; skipping qwen3 max_tokens floor");
     }
 
     // ── Pulse-first routing ──────────────────────────────────────────

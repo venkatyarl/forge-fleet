@@ -9311,6 +9311,17 @@ async fn handle_daemon(
     // don't burn HF API quota from every box. Non-leaders skip the spawn
     // entirely and rely on the leader to keep the catalog + coverage fresh.
     let (_portfolio_shutdown_tx, portfolio_shutdown_rx) = tokio::sync::watch::channel(false);
+
+    // Local self-healer — runs on EVERY host (not leader-gated) so each
+    // box restarts its own forgefleetd if it dies. Closes the split-brain
+    // window where `ff daemon` keeps updating leader heartbeat while
+    // forgefleetd is dead and peers have no reason to fail over.
+    println!(
+        "{CYAN}[healer]{RESET} spawning local forgefleetd self-healer (30s interval, 60s kickoff)"
+    );
+    let healer = ff_agent::local_healer::LocalHealer::new(worker_name.clone());
+    let _healer_handle = healer.spawn(portfolio_shutdown_rx.clone());
+
     let is_leader = ff_db::pg_get_current_leader(&pool)
         .await
         .ok()
