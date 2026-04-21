@@ -1,7 +1,16 @@
-//! Model catalog loader.
+//! Model catalog loader (retired).
 //!
-//! Parses `config/model_catalog.toml` into `ff_db::ModelCatalogRow` rows and
-//! upserts them into the `fleet_model_catalog` Postgres table.
+//! Historically this module parsed `config/model_catalog.toml` into
+//! `ff_db::ModelCatalogRow` rows and upserted them into the legacy
+//! `fleet_model_catalog` Postgres table. That file has been deleted —
+//! the canonical V14 seed now lives in
+//! `SCHEMA_V39_RETIRE_MODEL_CATALOG_TOML`, which populates the newer
+//! `model_catalog` table.
+//!
+//! The public API ([`sync_catalog`], [`load_catalog_file`],
+//! [`CatalogFile`], [`CatalogModel`], [`CatalogVariant`]) is kept only
+//! so any callers that predate the retirement keep compiling.
+//! `sync_catalog` is now a no-op that logs once and returns 0.
 
 use std::path::{Path, PathBuf};
 
@@ -59,9 +68,13 @@ pub fn resolve_catalog_path() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from(DEFAULT_CATALOG_PATH))
 }
 
-/// Read the catalog TOML from `path` and convert each entry into a
-/// `ff_db::ModelCatalogRow`.
+/// Retired no-op loader. If `path` does not exist (which is the normal
+/// case post-V39) this returns an empty Vec; legacy callers that still
+/// hand a TOML file get the old behaviour so local testing keeps working.
 pub fn load_catalog_file(path: &Path) -> Result<Vec<ModelCatalogRow>, String> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
     let raw = std::fs::read_to_string(path)
         .map_err(|e| format!("read {}: {}", path.display(), e))?;
     let doc: CatalogFile =
@@ -88,11 +101,32 @@ pub fn load_catalog_file(path: &Path) -> Result<Vec<ModelCatalogRow>, String> {
     Ok(rows)
 }
 
-/// Load the catalog (honoring `$FORGEFLEET_CATALOG`) and upsert every row
-/// into Postgres. Returns the number of rows synced.
+/// Retired no-op catalog sync. The DB migration
+/// `SCHEMA_V39_RETIRE_MODEL_CATALOG_TOML` now owns the canonical seed for
+/// the V14 `model_catalog` table. This function is preserved for
+/// call-site compatibility and logs once + returns 0.
+///
+/// If a TOML file still exists at the resolved path (local override via
+/// `$FORGEFLEET_CATALOG` or an operator-written file), rows from it are
+/// upserted into the legacy `fleet_model_catalog` table for development
+/// convenience. Otherwise the function is a silent no-op.
 pub async fn sync_catalog(pool: &PgPool) -> Result<usize, String> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+
     let path = resolve_catalog_path();
     let rows = load_catalog_file(&path)?;
+
+    if rows.is_empty() {
+        if !LOGGED.swap(true, Ordering::Relaxed) {
+            tracing::info!(
+                "model_catalog.sync_catalog: TOML retired; canonical V14 rows come from migration V39"
+            );
+        }
+        return Ok(0);
+    }
+
+    // Dev path: a TOML override exists — replay it into the legacy table.
     let mut synced = 0usize;
     for row in &rows {
         pg_upsert_catalog(pool, row)
