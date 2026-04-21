@@ -202,10 +202,27 @@ else
 fi
 
 # ─── 6. Clone forge-fleet + build ff ─────────────────────────────────────
+#
+# Canonical source-tree location (per reference_source_tree_locations.md +
+# the V31 `computers.source_tree_path` backfill):
+#   - Taylor (leader / dev workstation):      ~/projects/forge-fleet
+#   - Every other fleet member:               ~/.forgefleet/sub-agent-0/forge-fleet
+#
+# The sub-agent-0 path is the canonical workspace for dispatched fleet-LLM
+# work (`ff supervise` / `ff run`). Keeping the bootstrap clone there
+# eliminates a wasted re-clone on the first auto-upgrade tick (V32's
+# playbook would otherwise clone to the canonical path separately).
 
 report "clone" running
-REPO_DIR="/home/${SUDO_INVOKER}/projects/forge-fleet"
-[ "$OS_ID" = "macos" ] && REPO_DIR="/Users/${SUDO_INVOKER}/projects/forge-fleet"
+if [ "$OS_ID" = "macos" ]; then
+  # macOS nodes are rare in the current fleet and usually the leader (Taylor).
+  # Keep the legacy path — the macOS Ace box isn't a dispatch target.
+  REPO_DIR="/Users/${SUDO_INVOKER}/projects/forge-fleet"
+elif [ "$ROLE" = "leader" ]; then
+  REPO_DIR="/home/${SUDO_INVOKER}/projects/forge-fleet"
+else
+  REPO_DIR="/home/${SUDO_INVOKER}/.forgefleet/sub-agent-0/forge-fleet"
+fi
 
 run_as_user mkdir -p "$(dirname "$REPO_DIR")"
 if [ ! -d "$REPO_DIR/.git" ]; then
