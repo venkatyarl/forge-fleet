@@ -373,6 +373,7 @@ lines = [l for l in sys.stdin.read().splitlines() if l.strip()]
 print(json.dumps(lines))
 ' 2>/dev/null || echo '[]')"
 
+KERNEL_REL="$(uname -r 2>/dev/null || echo unknown)"
 ENROLL_PAYLOAD="$(cat <<EOF
 {
   "token": "$TOKEN",
@@ -381,6 +382,7 @@ ENROLL_PAYLOAD="$(cat <<EOF
   "ip": "$IP",
   "os": "$OS_FULL",
   "os_id": "$OS_ID",
+  "kernel": "$KERNEL_REL",
   "runtime": "$RUNTIME",
   "ram_gb": $RAM_GB,
   "cpu_cores": $CORES,

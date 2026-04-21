@@ -328,7 +328,47 @@ async fn query_upstream(
             let Some(repo) = version_source.get("repo").and_then(|v| v.as_str()) else {
                 return UpstreamResult::Error("github_release missing 'repo'".to_string());
             };
-            match fetch_github_latest(http, repo, github_token).await {
+            // ref_kind selects which upstream GitHub artifact to check for
+            // freshness. Default is the legacy "tagged" behaviour (tag_name
+            // of the latest release). Some projects don't cut releases and
+            // the operator wants to track HEAD of a branch — `main` / `branch:<name>`
+            // / `commit` cover those cases.
+            let ref_kind = version_source
+                .get("ref_kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or("tagged");
+            let result = match ref_kind {
+                "tagged" => fetch_github_latest(http, repo, github_token).await,
+                "main" | "master" => {
+                    fetch_github_branch_head(http, repo, ref_kind, github_token).await
+                }
+                s if s.starts_with("branch:") => {
+                    let branch = s.trim_start_matches("branch:").trim();
+                    if branch.is_empty() {
+                        return UpstreamResult::Error(
+                            "github_release ref_kind 'branch:' missing name".to_string(),
+                        );
+                    }
+                    fetch_github_branch_head(http, repo, branch, github_token).await
+                }
+                "commit" => {
+                    let Some(sha) =
+                        version_source.get("commit").and_then(|v| v.as_str())
+                    else {
+                        return UpstreamResult::Error(
+                            "github_release ref_kind='commit' needs 'commit' field".to_string(),
+                        );
+                    };
+                    // Pinned commit — upstream version IS the pin. No HTTP.
+                    Ok(sha.chars().take(10).collect())
+                }
+                other => {
+                    return UpstreamResult::Error(format!(
+                        "unknown github_release ref_kind '{other}' (expected tagged|main|branch:X|commit)"
+                    ));
+                }
+            };
+            match result {
                 Ok(v) => UpstreamResult::Version(v),
                 Err(e) => UpstreamResult::Error(e),
             }
@@ -397,6 +437,36 @@ async fn fetch_github_latest(
         .ok_or_else(|| format!("missing tag_name in {url} response"))?;
 
     Ok(strip_v_prefix(tag).to_string())
+}
+
+/// Fetch the head commit SHA of a branch (shortened to 10 chars to match
+/// the format of self_built / git_sha versioning).
+async fn fetch_github_branch_head(
+    http: &reqwest::Client,
+    repo: &str,
+    branch: &str,
+    token: Option<&str>,
+) -> Result<String, String> {
+    let url = format!("https://api.github.com/repos/{repo}/branches/{branch}");
+    let mut req = http.get(&url).header("Accept", "application/vnd.github+json");
+    if let Some(t) = token {
+        if !t.is_empty() {
+            req = req.header("Authorization", format!("Bearer {t}"));
+        }
+    }
+    let resp = req.send().await.map_err(|e| format!("GET {url}: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("GET {url}: HTTP {}", resp.status()));
+    }
+    let body: JsonValue = resp
+        .json()
+        .await
+        .map_err(|e| format!("parse JSON from {url}: {e}"))?;
+    let sha = body
+        .pointer("/commit/sha")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("missing commit.sha in {url} response"))?;
+    Ok(sha.chars().take(10).collect())
 }
 
 /// Fetch the stable version of a Homebrew formula.

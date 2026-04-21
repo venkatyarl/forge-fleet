@@ -280,6 +280,11 @@ pub struct SelfEnrollPayload {
     pub ip: String,
     pub os: String,
     pub os_id: Option<String>,
+    /// `uname -r` output; e.g. `6.17.0-1014-nvidia` is the tell-tale DGX
+    /// Spark kernel (NVIDIA's custom Blackwell kernel layered on Ubuntu).
+    /// Used with os_id to derive canonical os_family.
+    #[serde(default)]
+    pub kernel: Option<String>,
     pub runtime: String,
     pub ram_gb: i32,
     pub cpu_cores: i32,
@@ -289,6 +294,40 @@ pub struct SelfEnrollPayload {
     pub gh_account: Option<String>,
     pub has_nvidia: Option<bool>,
     pub ssh_identity: SshIdentity,
+}
+
+/// Derive the canonical `computers.os_family` from the enrollment payload.
+///
+/// os_family drives upgrade_playbook routing (`{os_family}-{install_source}`
+/// → `{os_family}` → `all`) so getting this right matters.
+///
+/// Rules (ordered):
+///   1. `os_id=="macos"` → `"macos"`
+///   2. `os_id` starts with `dgx` → `"linux-dgx"` (rare — only old DGX
+///      servers that still ship `/etc/dgx-release`)
+///   3. kernel ends with `-nvidia` → `"linux-dgx"` (DGX Sparks, which show
+///      up as `os_id=ubuntu` but their custom NVIDIA kernel is the marker)
+///   4. `os_id=="ubuntu"` or `os_id` starts with `linux-ubuntu` → `"linux-ubuntu"`
+///   5. `os_id=="windows"` → `"windows"`
+///   6. fallback: whatever `os_id` was, or `"linux"`
+fn derive_os_family(os_id: Option<&str>, kernel: Option<&str>) -> String {
+    let os = os_id.unwrap_or("").to_ascii_lowercase();
+    if os == "macos" || os == "darwin" {
+        return "macos".into();
+    }
+    if os.starts_with("dgx") {
+        return "linux-dgx".into();
+    }
+    if kernel.map(|k| k.trim_end_matches('\n').ends_with("-nvidia")).unwrap_or(false) {
+        return "linux-dgx".into();
+    }
+    if os == "ubuntu" || os.starts_with("linux-ubuntu") || os.starts_with("debian") {
+        return "linux-ubuntu".into();
+    }
+    if os == "windows" {
+        return "windows".into();
+    }
+    if os.is_empty() { "linux".into() } else { os }
 }
 
 #[derive(Debug, Deserialize)]
@@ -427,26 +466,59 @@ pub async fn self_enroll(
         .await
         .map_err(|e| db_err("pg_upsert_node", e))?;
 
-    // Seed `computers.source_tree_path` for this enrollment. Leader (Taylor)
-    // develops in `~/projects/forge-fleet`; every other member clones into
-    // its sub-agent-0 workspace. V31 backfilled existing rows; this keeps
-    // new enrollments consistent without re-running the migration.
-    // Safe no-op if the `computers` row doesn't exist yet (some enrollments
-    // create the `fleet_nodes` row first and the `computers` row is added
-    // later by Pulse/ops flows).
+    // UPSERT the `computers` row so Pulse v2 has a row to check against on
+    // first beat (without this, forgefleetd logs "no computers row for this
+    // host; Pulse v2 disabled until enrollment" and never publishes). We
+    // also derive canonical os_family here rather than trusting whatever
+    // string the client sent — the bootstrap script often sends "linux" for
+    // DGX Sparks since /etc/dgx-release is absent on Blackwell; we detect
+    // via `uname -r` ending in `-nvidia` instead. (Closes #114.)
+    let os_family = derive_os_family(
+        payload.os_id.as_deref(),
+        payload.kernel.as_deref(),
+    );
     let default_source_tree_path = if node_row.role.eq_ignore_ascii_case("leader") {
         "~/projects/forge-fleet"
     } else {
         "~/.forgefleet/sub-agent-0/forge-fleet"
     };
+    let has_gpu = payload.has_nvidia.unwrap_or(false);
     let _ = sqlx::query(
-        "UPDATE computers
-            SET source_tree_path = $2
-          WHERE LOWER(name) = LOWER($1)
-            AND source_tree_path IS NULL",
+        "INSERT INTO computers (
+            name, primary_ip, os_family, os_distribution, os_version,
+            cpu_cores, total_ram_gb, has_gpu, gpu_kind,
+            ssh_user, status, source_tree_path, metadata
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+         ON CONFLICT (name) DO UPDATE SET
+            primary_ip       = EXCLUDED.primary_ip,
+            os_family        = EXCLUDED.os_family,
+            os_distribution  = COALESCE(computers.os_distribution, EXCLUDED.os_distribution),
+            os_version       = COALESCE(computers.os_version, EXCLUDED.os_version),
+            cpu_cores        = EXCLUDED.cpu_cores,
+            total_ram_gb     = EXCLUDED.total_ram_gb,
+            has_gpu          = EXCLUDED.has_gpu,
+            gpu_kind         = COALESCE(computers.gpu_kind, EXCLUDED.gpu_kind),
+            ssh_user         = EXCLUDED.ssh_user,
+            status           = EXCLUDED.status,
+            source_tree_path = COALESCE(computers.source_tree_path, EXCLUDED.source_tree_path)",
     )
     .bind(&name)
+    .bind(&payload.ip)
+    .bind(&os_family)
+    .bind(payload.os_id.as_deref())
+    .bind(&payload.os)
+    .bind(payload.cpu_cores)
+    .bind(payload.ram_gb)
+    .bind(has_gpu)
+    .bind(if has_gpu { Some("nvidia") } else { None })
+    .bind(&payload.ssh_user)
+    .bind("online")
     .bind(default_source_tree_path)
+    .bind(json!({
+        "kernel":         payload.kernel,
+        "enrolled_via":   "self_enroll",
+        "runtime":        payload.runtime,
+    }))
     .execute(pool)
     .await;
 
