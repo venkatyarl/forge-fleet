@@ -6800,6 +6800,12 @@ async fn handle_fleet_task_coverage(
                 "{GREEN}✓{RESET} inserted={} updated={} unchanged={} total={}",
                 report.inserted, report.updated, report.unchanged, report.total,
             );
+            // Wake every gateway's routing cache warmer immediately so operator
+            // edits show up without the 15s polling lag (issue #98). This is
+            // best-effort — a Redis outage here must not fail the CLI.
+            if report.inserted + report.updated > 0 {
+                ff_agent::fleet_events::publish_routing_invalidate("task_coverage_seed").await;
+            }
         }
         TaskCoverageCommand::List => {
             let rows = sqlx::query(

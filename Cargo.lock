@@ -1347,6 +1347,7 @@ dependencies = [
  "futures",
  "hyper",
  "mime_guess",
+ "redis",
  "reqwest",
  "rust-embed",
  "serde",

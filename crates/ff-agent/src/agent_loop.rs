@@ -152,7 +152,18 @@ pub struct AgentSession {
     recent_tool_sigs: Vec<String>,
     /// Count of consecutive tool errors (resets on success).
     consecutive_errors: u32,
+    /// Count of mid-session cargo-check failures the agent has been asked to
+    /// fix after Rust edits. Caps at `MAX_BUILD_VERIFY_RETRIES` before
+    /// the session is aborted with `BuildStuckAfterNRetries`. See issue #117.
+    build_verify_retries: u32,
+    /// Cached answer for "is Rust auto-verify enabled for this session?"
+    /// Populated lazily on the first `.rs` edit of the session.
+    auto_verify_rust: Option<bool>,
 }
+
+/// Max mid-session cargo-check retries before a task aborts with
+/// `BuildStuckAfterNRetries`. See issue #117.
+pub const MAX_BUILD_VERIFY_RETRIES: u32 = 5;
 
 impl AgentSession {
     /// Create a new agent session with default tools.
@@ -192,6 +203,8 @@ impl AgentSession {
             turn_count: 0,
             recent_tool_sigs: Vec::new(),
             consecutive_errors: 0,
+            build_verify_retries: 0,
+            auto_verify_rust: None,
         }
     }
 
@@ -226,6 +239,8 @@ impl AgentSession {
             turn_count,
             recent_tool_sigs: Vec::new(),
             consecutive_errors: 0,
+            build_verify_retries: 0,
+            auto_verify_rust: None,
         }
     }
 
@@ -970,6 +985,87 @@ async fn run_agent_loop(
         }
         } // close else (single tool)
 
+        // --- #117: Per-edit cargo check (auto-verify-after-edit loop) ---
+        //
+        // Did any tool call in this turn mutate a `.rs` file? If so, run
+        // `cargo check --workspace` to confirm the edit compiles. On
+        // failure, inject up to ~2000 chars of stderr as a synthetic user
+        // message so the agent fixes the breakage on the next turn.
+        //
+        // Capped at `MAX_BUILD_VERIFY_RETRIES` per session. Exceeding the
+        // cap returns `AgentOutcome::Error("BuildStuckAfterNRetries: ...")`
+        // so the outer `ff supervise` loop can decide what to do next.
+        let edited_rust_file = tool_calls.iter().any(|tc| {
+            RUST_MUTATING_TOOLS.contains(&tc.function.name.as_str())
+                && tool_call_file_path(&tc.function.arguments)
+                    .map(|p| is_rust_file(&p))
+                    .unwrap_or(false)
+        });
+
+        if edited_rust_file {
+            // Lazy-load the per-session toggle on the first .rs edit.
+            if session.auto_verify_rust.is_none() {
+                session.auto_verify_rust = Some(auto_verify_rust_enabled().await);
+            }
+
+            if session.auto_verify_rust == Some(true) {
+                emit(&event_tx, AgentEvent::Status {
+                    session_id: session_id.clone(),
+                    message: "Verifying build (cargo check --workspace)...".into(),
+                });
+
+                let verdict = cargo_check_workspace(&session.config.working_dir, 2000).await;
+                match verdict {
+                    CargoVerifyResult::Ok => {
+                        session.build_verify_retries = 0;
+                        emit(&event_tx, AgentEvent::Status {
+                            session_id: session_id.clone(),
+                            message: "cargo check: ok".into(),
+                        });
+                    }
+                    CargoVerifyResult::Skipped(why) => {
+                        debug!(session = %session_id, reason = %why, "cargo check skipped");
+                    }
+                    CargoVerifyResult::Failed(stderr) => {
+                        session.build_verify_retries += 1;
+                        warn!(
+                            session = %session_id,
+                            retry = session.build_verify_retries,
+                            "cargo check failed after Rust edit"
+                        );
+
+                        if session.build_verify_retries > MAX_BUILD_VERIFY_RETRIES {
+                            let msg = format!(
+                                "BuildStuckAfterNRetries: cargo check failed {} times in a row \
+                                 after Rust edits — aborting task so the supervisor can retry.",
+                                MAX_BUILD_VERIFY_RETRIES
+                            );
+                            emit(&event_tx, AgentEvent::Error {
+                                session_id: session_id.clone(),
+                                message: msg.clone(),
+                            });
+                            return AgentOutcome::Error(msg);
+                        }
+
+                        emit(&event_tx, AgentEvent::Status {
+                            session_id: session_id.clone(),
+                            message: format!(
+                                "cargo check failed (retry {}/{}). Injecting errors for fix...",
+                                session.build_verify_retries, MAX_BUILD_VERIFY_RETRIES
+                            ),
+                        });
+
+                        session.messages.push(ToolChatMessage::user(format!(
+                            "Your last edit broke the build. Fix these errors:\n\n\
+                             ```\n{stderr}\n```\n\n\
+                             Read the failing file(s) and correct the compile errors. \
+                             Do not move on to other tasks until `cargo check --workspace` is green."
+                        )));
+                    }
+                }
+            }
+        }
+
         // --- Loop detection ---
         for tc in &tool_calls {
             let sig = format!("{}:{}", tc.function.name, &tc.function.arguments[..tc.function.arguments.len().min(80)]);
@@ -1154,6 +1250,111 @@ fn try_fix_json(raw: &str) -> Option<serde_json::Value> {
 fn emit(tx: &Option<mpsc::UnboundedSender<AgentEvent>>, event: AgentEvent) {
     if let Some(tx) = tx {
         let _ = tx.send(event);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #117 — Per-edit cargo check (self-verify loop)
+// ---------------------------------------------------------------------------
+
+/// Tools that can mutate files and therefore may break a Rust build.
+pub(crate) const RUST_MUTATING_TOOLS: &[&str] = &["Edit", "Write", "MultiEdit", "NotebookEdit"];
+
+/// Extract a `file_path`-shaped string from a tool-call arguments JSON.
+/// Supports the standard `file_path` key used by Edit/Write and the
+/// `notebook_path` key used by NotebookEdit.
+pub(crate) fn tool_call_file_path(args_json: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(args_json).ok()?;
+    let p = v.get("file_path")
+        .or_else(|| v.get("notebook_path"))
+        .and_then(|x| x.as_str())?;
+    Some(p.to_string())
+}
+
+/// True if `path` ends with `.rs` (case-insensitive).
+pub(crate) fn is_rust_file(path: &str) -> bool {
+    std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("rs"))
+        .unwrap_or(false)
+}
+
+/// Walk up from `start` looking for a `Cargo.toml`. Returns the directory
+/// containing it — where `cargo check --workspace` should run.
+pub(crate) fn find_cargo_manifest_dir(start: &std::path::Path) -> Option<PathBuf> {
+    let mut cur: Option<&std::path::Path> = Some(start);
+    while let Some(dir) = cur {
+        if dir.join("Cargo.toml").is_file() {
+            return Some(dir.to_path_buf());
+        }
+        cur = dir.parent();
+    }
+    None
+}
+
+/// Result of an auto-verify cargo-check run after a Rust edit.
+#[derive(Debug)]
+pub(crate) enum CargoVerifyResult {
+    /// Build succeeded — clear the retry counter and continue.
+    Ok,
+    /// Build failed — first `max_chars` of stderr.
+    Failed(String),
+    /// Skipped (no Cargo.toml up-tree, cargo missing, or timed out).
+    Skipped(String),
+}
+
+/// Run `cargo check --workspace --message-format=short` in the closest
+/// Cargo workspace root above `working_dir`. 5-minute hard timeout.
+pub(crate) async fn cargo_check_workspace(
+    working_dir: &std::path::Path,
+    max_chars: usize,
+) -> CargoVerifyResult {
+    let manifest_dir = match find_cargo_manifest_dir(working_dir) {
+        Some(d) => d,
+        None => return CargoVerifyResult::Skipped(
+            "no Cargo.toml in or above working_dir".into()
+        ),
+    };
+
+    let fut = tokio::process::Command::new("cargo")
+        .arg("check")
+        .arg("--workspace")
+        .arg("--message-format=short")
+        .current_dir(&manifest_dir)
+        .output();
+
+    let out = match tokio::time::timeout(std::time::Duration::from_secs(300), fut).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => return CargoVerifyResult::Skipped(format!("failed to spawn cargo: {e}")),
+        Err(_) => return CargoVerifyResult::Skipped("cargo check timed out after 5m".into()),
+    };
+
+    if out.status.success() {
+        return CargoVerifyResult::Ok;
+    }
+
+    // Prefer stderr (cargo writes diagnostics there); fall back to stdout.
+    let mut msg = String::from_utf8_lossy(&out.stderr).into_owned();
+    if msg.trim().is_empty() {
+        msg = String::from_utf8_lossy(&out.stdout).into_owned();
+    }
+    if msg.len() > max_chars {
+        msg.truncate(max_chars);
+        msg.push_str("\n… (truncated)");
+    }
+    CargoVerifyResult::Failed(msg)
+}
+
+/// Resolve the `agent_auto_verify_rust` fleet secret. Default `true`.
+/// Any value starting with `0`, `f`/`F`, or `n`/`N` disables auto-verify.
+pub(crate) async fn auto_verify_rust_enabled() -> bool {
+    match crate::fleet_info::fetch_secret("agent_auto_verify_rust").await {
+        None => true,
+        Some(v) => {
+            let first = v.trim().chars().next();
+            !matches!(first, Some('0') | Some('f') | Some('F') | Some('n') | Some('N'))
+        }
     }
 }
 

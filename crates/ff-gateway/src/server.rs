@@ -368,6 +368,7 @@ pub fn build_router(state: Arc<GatewayState>, mc_db_path: Option<&str>) -> Route
         .route("/api/messages/raw", post(incoming_message_raw_http))
         .route("/api/send", post(outgoing_message_http))
         .route("/api/webhook", post(webhook::webhook_http_handler))
+        .route("/api/webhooks/github", post(github_webhook_handler))
         .route("/embed/widget.js", get(embed::widget_js_handler))
         .route("/dashboard", get(dashboard))
         // ─── Fleet integration routes ────────────────────────────────
@@ -631,6 +632,166 @@ async fn well_known_forgefleet(
         },
         "docs": "https://github.com/venkatyarl/forge-fleet"
     }))
+}
+
+/// GitHub webhook receiver — drops `workflow_run` + `check_run` events
+/// into `project_ci_runs` so `ff project status <id>` + the dashboard
+/// can show live CI state without polling the GitHub API.
+///
+/// Closes #105. No signature verification yet (add HMAC with
+/// `fleet_secrets.github_webhook_secret` in a follow-up); mesh is assumed
+/// trusted (webhooks arrive from GitHub hitting the public-facing URL the
+/// operator configured in their repo's webhook settings).
+async fn github_webhook_handler(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> (StatusCode, Json<Value>) {
+    let event = headers
+        .get("x-github-event")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    let Some(pool) = state.operational_store.as_ref().and_then(|os| os.pg_pool()) else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"accepted": false, "reason": "no postgres pool"})),
+        );
+    };
+
+    match event.as_str() {
+        "workflow_run" => {
+            // GH delivers workflow_run events on action=requested/in_progress/completed.
+            let wr = payload.get("workflow_run").cloned().unwrap_or(Value::Null);
+            let repo_full = payload
+                .pointer("/repository/full_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown/unknown")
+                .to_string();
+            // project_id is the short repo name (matches `projects.id` convention).
+            let project_id = repo_full
+                .split('/')
+                .nth(1)
+                .unwrap_or(&repo_full)
+                .to_string();
+            let branch = wr
+                .get("head_branch")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let commit = wr
+                .get("head_sha")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let workflow_name = wr
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let run_id = wr
+                .get("id")
+                .and_then(|v| v.as_i64())
+                .map(|i| i.to_string());
+            let run_url = wr
+                .get("html_url")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let gh_status = wr
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let conclusion = wr
+                .get("conclusion")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            // Map GH's (status, conclusion) onto project_ci_runs.status enum.
+            let status = match (gh_status.as_str(), conclusion) {
+                ("queued", _) => "queued",
+                ("in_progress", _) => "in_progress",
+                ("completed", "success") => "success",
+                ("completed", "failure") => "failure",
+                ("completed", "cancelled") => "cancelled",
+                ("completed", _) => "completed",
+                _ => "unknown",
+            };
+            let started_at = wr
+                .get("run_started_at")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let completed_at = wr
+                .get("updated_at")
+                .and_then(|v| v.as_str())
+                .filter(|_| gh_status == "completed")
+                .map(str::to_string);
+            let triggered_by = wr
+                .get("event")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+
+            // UPSERT by (project_id, run_id). Skip if the project row doesn't
+            // exist yet — project_ci_runs.project_id FKs projects(id).
+            let project_exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM projects WHERE id = $1)",
+            )
+            .bind(&project_id)
+            .fetch_one(pool)
+            .await
+            .unwrap_or(false);
+            if !project_exists {
+                tracing::warn!(target: "gh_webhook", %project_id, %repo_full, "ignoring workflow_run for unknown project");
+                return (StatusCode::ACCEPTED, Json(json!({"accepted": false, "reason": "unknown project"})));
+            }
+
+            let _ = sqlx::query(
+                "INSERT INTO project_ci_runs
+                    (project_id, branch_name, commit_sha, workflow_name, run_id, run_url,
+                     status, started_at, completed_at, triggered_by)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8::timestamptz, $9::timestamptz, $10)
+                 ON CONFLICT DO NOTHING",
+            )
+            .bind(&project_id)
+            .bind(&branch)
+            .bind(&commit)
+            .bind(&workflow_name)
+            .bind(&run_id)
+            .bind(&run_url)
+            .bind(status)
+            .bind(&started_at)
+            .bind(&completed_at)
+            .bind(&triggered_by)
+            .execute(pool)
+            .await;
+
+            // Update status if the row already existed (same run_id reappears on
+            // subsequent action=in_progress / action=completed deliveries).
+            if run_id.is_some() {
+                let _ = sqlx::query(
+                    "UPDATE project_ci_runs
+                        SET status = $1,
+                            completed_at = COALESCE($2::timestamptz, completed_at)
+                      WHERE project_id = $3 AND run_id = $4",
+                )
+                .bind(status)
+                .bind(&completed_at)
+                .bind(&project_id)
+                .bind(run_id.as_deref())
+                .execute(pool)
+                .await;
+            }
+
+            (StatusCode::ACCEPTED, Json(json!({"accepted": true, "event": "workflow_run", "project": project_id, "run_id": run_id, "status": status})))
+        }
+        "ping" => (
+            StatusCode::OK,
+            Json(json!({"accepted": true, "event": "ping", "message": "pong"})),
+        ),
+        other => (
+            StatusCode::ACCEPTED,
+            Json(json!({"accepted": false, "reason": format!("event '{other}' not handled")})),
+        ),
+    }
 }
 
 async fn telegram_transport_status(State(state): State<Arc<GatewayState>>) -> Json<Value> {
