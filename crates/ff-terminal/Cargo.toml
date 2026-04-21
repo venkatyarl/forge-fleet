@@ -37,3 +37,4 @@ unicode-width = "0.2"
 uuid.workspace = true
 async-nats = "0.37"
 sha2.workspace = true
+regex = "1"

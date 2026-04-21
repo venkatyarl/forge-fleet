@@ -877,6 +877,22 @@ enum PmCommand {
     },
     /// Show details of a work item (by UUID).
     Show { id: String },
+    /// Import Claude Code session tasks into projects.work_items.
+    ///
+    /// Claude Code's TaskCreate/TaskList/TaskUpdate tools keep their state
+    /// in the session transcript JSONL. This command parses the most
+    /// recent task list embedded in that transcript and UPSERTs each task
+    /// as a work_item, so `ff pm list` surfaces them alongside human-
+    /// authored items. Closes #104.
+    ImportClaudeTasks {
+        /// Path to the session JSONL. Defaults to the session matching
+        /// `$CLAUDE_SESSION_ID` under the current `pwd`'s project dir.
+        #[arg(long)] session: Option<PathBuf>,
+        /// Project id to attach imported items to.
+        #[arg(long, default_value = "forge-fleet")] project: String,
+        /// Print the plan without writing.
+        #[arg(long, default_value_t = false)] dry_run: bool,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -9625,7 +9641,194 @@ async fn handle_pm(cmd: PmCommand) -> Result<()> {
                 }
             }
         }
+        PmCommand::ImportClaudeTasks { session, project, dry_run } => {
+            handle_pm_import_claude_tasks(&pool, session, &project, dry_run).await?;
+        }
     }
+    Ok(())
+}
+
+/// `ff pm import-claude-tasks` — parses the Claude Code session JSONL
+/// and upserts each task as a `work_items` row.
+///
+/// Claude Code doesn't persist its task list to a separate file; the
+/// state is embedded in the session transcript as `tool_result` content
+/// on TaskCreate/TaskList/TaskUpdate calls. The format per line is
+/// `#<id> [<status>] <subject>`. We scan for the LAST occurrence of
+/// this format in the transcript and treat that as the authoritative
+/// snapshot (older lines are stale).
+///
+/// Dedupe key: the Claude task ID is stored in
+/// `work_items.metadata->>'claude_task_id'`; repeat imports UPDATE the
+/// same row rather than creating a new one.
+async fn handle_pm_import_claude_tasks(
+    pool: &sqlx::PgPool,
+    session: Option<PathBuf>,
+    project: &str,
+    dry_run: bool,
+) -> Result<()> {
+    // Resolve session path. If the operator didn't pass --session, try
+    // to find the most recently-modified .jsonl in the current project's
+    // Claude dir. Encoding mirrors Claude's slug: `/Users/venkat/...` →
+    // `-Users-venkat-...`.
+    let resolved = if let Some(p) = session {
+        p
+    } else {
+        let cwd = std::env::current_dir()
+            .map_err(|e| anyhow::anyhow!("cwd: {e}"))?;
+        let slug = cwd.to_string_lossy().replace('/', "-");
+        let home = std::env::var("HOME").unwrap_or_default();
+        let project_dir = PathBuf::from(format!("{home}/.claude/projects/{slug}"));
+        let mut newest: Option<(PathBuf, std::time::SystemTime)> = None;
+        if let Ok(entries) = std::fs::read_dir(&project_dir) {
+            for e in entries.flatten() {
+                let path = e.path();
+                if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+                    continue;
+                }
+                if let Ok(md) = e.metadata() {
+                    if let Ok(mtime) = md.modified() {
+                        if newest.as_ref().map(|(_, t)| mtime > *t).unwrap_or(true) {
+                            newest = Some((path, mtime));
+                        }
+                    }
+                }
+            }
+        }
+        newest
+            .map(|(p, _)| p)
+            .ok_or_else(|| anyhow::anyhow!("no session JSONL found under {:?}", project_dir))?
+    };
+
+    println!("{CYAN}▶ Importing Claude tasks from{RESET} {}", resolved.display());
+
+    // Stream the JSONL, tracking the LAST task-list snapshot. Each line
+    // we care about has content like `#<N> [<status>] <subject>` — we
+    // find them inside tool_result `content` strings.
+    let content = std::fs::read_to_string(&resolved)
+        .map_err(|e| anyhow::anyhow!("read {}: {e}", resolved.display()))?;
+    let task_line_re = regex::Regex::new(r"#(\d+)\s*(?:\.\s*)?\[(pending|in_progress|completed|deleted)\]\s+(.+)")
+        .map_err(|e| anyhow::anyhow!("regex: {e}"))?;
+
+    // Group by task_id — later occurrences overwrite earlier ones.
+    let mut snapshot: std::collections::BTreeMap<String, (String, String)> = Default::default();
+    for line in content.lines() {
+        // Only look inside lines that mention system-reminder OR TaskList-shaped content.
+        if !line.contains("[pending]") && !line.contains("[completed]")
+            && !line.contains("[in_progress]")
+        {
+            continue;
+        }
+        for cap in task_line_re.captures_iter(line) {
+            let id = cap[1].to_string();
+            let status = cap[2].to_string();
+            let mut subject = cap[3].trim().to_string();
+            // Subject ends at the end of the match; may have trailing JSON
+            // escape chars. Trim at the first of a few known terminators.
+            for term in ["\\n", "\"", "\n"] {
+                if let Some(pos) = subject.find(term) {
+                    subject.truncate(pos);
+                }
+            }
+            let subject = subject.trim_end().to_string();
+            if !subject.is_empty() {
+                snapshot.insert(id, (status, subject));
+            }
+        }
+    }
+
+    if snapshot.is_empty() {
+        println!("  (no task lines recognized in transcript)");
+        return Ok(());
+    }
+
+    println!("  found {} unique tasks", snapshot.len());
+    // Confirm project exists.
+    let project_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM projects WHERE id = $1)")
+            .bind(project)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| anyhow::anyhow!("project probe: {e}"))?;
+    if !project_exists {
+        eprintln!("{YELLOW}project '{project}' not found — create it first or pass --project X{RESET}");
+        std::process::exit(2);
+    }
+
+    if dry_run {
+        println!("\n{YELLOW}Dry run — not writing.{RESET}");
+        for (id, (status, subject)) in &snapshot {
+            let clip = if subject.len() > 60 {
+                format!("{}…", &subject[..59])
+            } else {
+                subject.clone()
+            };
+            println!("  would upsert #{id:<3} [{status:<11}] {clip}");
+        }
+        return Ok(());
+    }
+
+    let mut inserted = 0usize;
+    let mut updated = 0usize;
+    for (id, (status, subject)) in &snapshot {
+        // Upsert by (project_id, claude_task_id). work_items has no
+        // unique constraint on that pair so we check-then-insert/update.
+        let existing: Option<uuid::Uuid> = sqlx::query_scalar(
+            "SELECT id FROM work_items
+              WHERE project_id = $1
+                AND metadata->>'claude_task_id' = $2
+              LIMIT 1",
+        )
+        .bind(project)
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("lookup existing: {e}"))?;
+
+        let wi_status = match status.as_str() {
+            "pending" => "backlog",
+            "in_progress" => "in_progress",
+            "completed" => "done",
+            _ => "backlog",
+        };
+
+        if let Some(wi_id) = existing {
+            sqlx::query(
+                "UPDATE work_items
+                    SET status = $1,
+                        title  = $2
+                  WHERE id = $3",
+            )
+            .bind(wi_status)
+            .bind(subject)
+            .bind(wi_id)
+            .execute(pool)
+            .await
+            .map_err(|e| anyhow::anyhow!("update work_item: {e}"))?;
+            updated += 1;
+        } else {
+            sqlx::query(
+                "INSERT INTO work_items
+                    (project_id, kind, title, status, priority, created_by, metadata)
+                 VALUES ($1, 'code', $2, $3, 'normal', 'claude_code',
+                         jsonb_build_object('claude_task_id', $4::text,
+                                            'imported_at', NOW()::text))",
+            )
+            .bind(project)
+            .bind(subject)
+            .bind(wi_status)
+            .bind(id)
+            .execute(pool)
+            .await
+            .map_err(|e| anyhow::anyhow!("insert work_item: {e}"))?;
+            inserted += 1;
+        }
+    }
+
+    println!(
+        "{GREEN}✓ imported{RESET}: {inserted} new, {updated} updated ({} total from Claude)",
+        snapshot.len()
+    );
     Ok(())
 }
 
