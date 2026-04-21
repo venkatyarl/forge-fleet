@@ -2115,3 +2115,50 @@ UPDATE software_registry
    )
  WHERE id = 'ff_git';
 "#;
+
+// ─── V34: retire config/alert_policies.toml → Postgres ──────────────────────
+//
+// Per the operator's DB-first directive: TOML catalogs are bootstrap-only,
+// so runtime alert-policy edits go straight to Postgres. This migration
+// idempotently UPSERTs the six canonical policies previously seeded from
+// `config/alert_policies.toml` (operator-defined rows are preserved because
+// ON CONFLICT (name) DO NOTHING).
+//
+// UPSERT key is `name` (UNIQUE) — `id` is a generated UUID we don't pin.
+pub const SCHEMA_V34_RETIRE_ALERT_POLICIES_TOML: &str = r#"
+INSERT INTO alert_policies
+    (name, description, metric, scope, condition,
+     duration_secs, severity, cooldown_secs, channel, enabled)
+VALUES
+  ('computer_offline',
+   'Computer has been ODOWN for more than 5 minutes',
+   'computer_status', 'any_computer', '== ''odown''',
+   300, 'critical', 3600, 'telegram', true),
+
+  ('high_cpu',
+   'CPU sustained above 90% for 5 minutes',
+   'cpu_pct', 'any_computer', '> 90',
+   300, 'warning', 1800, 'log', true),
+
+  ('low_disk_space',
+   'Free disk space below 20 GB',
+   'disk_free_gb', 'any_computer', '< 20',
+   600, 'warning', 86400, 'telegram', true),
+
+  ('high_llm_queue',
+   'LLM queue depth above 10 requests for 2 minutes',
+   'llm_queue_depth', 'any_computer', '> 10',
+   120, 'info', 900, 'log', true),
+
+  ('leader_heartbeat_stale',
+   'Leader''s Postgres heartbeat older than 60 seconds',
+   'leader_heartbeat_age_secs', 'leader_only', '> 60',
+   30, 'critical', 600, 'telegram', true),
+
+  ('secret_expiring_soon',
+   'A fleet_secret is within 14 days of expiry',
+   'secret_expiry_days_remaining', 'leader_only', '< 14',
+   60, 'warning', 86400, 'telegram', true)
+
+ON CONFLICT (name) DO NOTHING;
+"#;

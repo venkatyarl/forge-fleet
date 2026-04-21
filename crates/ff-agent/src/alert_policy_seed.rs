@@ -1,8 +1,16 @@
-//! Alert policy seed loader.
+//! Alert policy seed loader (retired).
 //!
-//! Parses `config/alert_policies.toml` and upserts rows into the `alert_policies`
-//! Postgres table (schema V16). UPSERT key is `name` — operators can edit the
-//! TOML and re-seed to adjust policies.
+//! Historically this module parsed `config/alert_policies.toml` and upserted
+//! rows into the `alert_policies` Postgres table. That file has been deleted —
+//! the DB migration `SCHEMA_V34_RETIRE_ALERT_POLICIES_TOML` now owns the
+//! canonical seed set, and operator edits via `ff alerts policy add` (or
+//! direct SQL) are preserved across upgrades.
+//!
+//! The public API ([`seed_from_toml`], [`AlertSeedReport`], and the
+//! supporting `AlertPoliciesFile` / `AlertPolicyEntry` types) is
+//! intentionally preserved so any callers that predate the retirement
+//! keep compiling. The seeder itself is now a no-op that logs once and
+//! returns an empty [`AlertSeedReport`].
 
 use std::path::{Path, PathBuf};
 
@@ -88,102 +96,24 @@ fn default_enabled() -> bool {
     true
 }
 
-/// Read the TOML at `path` and upsert into `alert_policies`.
+/// Retired no-op seeder. The DB migration
+/// `SCHEMA_V34_RETIRE_ALERT_POLICIES_TOML` now owns the canonical
+/// `alert_policies` seed set; this function is kept only so callers that
+/// predate the retirement keep compiling.
+///
+/// Logs a single info line the first time it's called in a process.
 pub async fn seed_from_toml(
-    pool: &PgPool,
-    toml_path: &Path,
+    _pool: &PgPool,
+    _toml_path: &Path,
 ) -> Result<AlertSeedReport, AlertSeedError> {
-    let raw = std::fs::read_to_string(toml_path).map_err(|source| AlertSeedError::Io {
-        path: toml_path.to_path_buf(),
-        source,
-    })?;
-
-    let doc: AlertPoliciesFile =
-        toml::from_str(&raw).map_err(|source| AlertSeedError::Toml {
-            path: toml_path.to_path_buf(),
-            source,
-        })?;
-
-    let mut report = AlertSeedReport {
-        total: doc.policy.len(),
-        ..AlertSeedReport::default()
-    };
-
-    for entry in &doc.policy {
-        let scope_uuid = entry
-            .scope_computer_id
-            .as_deref()
-            .and_then(|s| uuid::Uuid::parse_str(s).ok());
-
-        let row: Option<(bool, bool)> = sqlx::query_as(
-            r#"
-            WITH existing AS (
-                SELECT description, metric, scope, scope_computer_id, condition,
-                       duration_secs, severity, cooldown_secs, channel, enabled
-                FROM alert_policies
-                WHERE name = $1
-            ),
-            upsert AS (
-                INSERT INTO alert_policies (
-                    name, description, metric, scope, scope_computer_id,
-                    condition, duration_secs, severity, cooldown_secs,
-                    channel, enabled
-                )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-                ON CONFLICT (name) DO UPDATE SET
-                    description       = EXCLUDED.description,
-                    metric            = EXCLUDED.metric,
-                    scope             = EXCLUDED.scope,
-                    scope_computer_id = EXCLUDED.scope_computer_id,
-                    condition         = EXCLUDED.condition,
-                    duration_secs     = EXCLUDED.duration_secs,
-                    severity          = EXCLUDED.severity,
-                    cooldown_secs     = EXCLUDED.cooldown_secs,
-                    channel           = EXCLUDED.channel,
-                    enabled           = EXCLUDED.enabled
-                RETURNING (xmax = 0) AS inserted
-            )
-            SELECT u.inserted,
-                COALESCE(
-                    e.description       IS DISTINCT FROM $2  OR
-                    e.metric            IS DISTINCT FROM $3  OR
-                    e.scope             IS DISTINCT FROM $4  OR
-                    e.scope_computer_id IS DISTINCT FROM $5  OR
-                    e.condition         IS DISTINCT FROM $6  OR
-                    e.duration_secs     IS DISTINCT FROM $7  OR
-                    e.severity          IS DISTINCT FROM $8  OR
-                    e.cooldown_secs     IS DISTINCT FROM $9  OR
-                    e.channel           IS DISTINCT FROM $10 OR
-                    e.enabled           IS DISTINCT FROM $11,
-                    true
-                ) AS changed
-            FROM upsert u
-            LEFT JOIN existing e ON TRUE
-            "#,
-        )
-        .bind(&entry.name)
-        .bind(entry.description.as_deref())
-        .bind(&entry.metric)
-        .bind(&entry.scope)
-        .bind(scope_uuid)
-        .bind(&entry.condition)
-        .bind(entry.duration_secs)
-        .bind(&entry.severity)
-        .bind(entry.cooldown_secs)
-        .bind(&entry.channel)
-        .bind(entry.enabled)
-        .fetch_optional(pool)
-        .await?;
-
-        match row {
-            Some((true, _)) => report.inserted += 1,
-            Some((false, true)) => report.updated += 1,
-            Some((false, false)) => report.unchanged += 1,
-            None => report.updated += 1,
-        }
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    if !LOGGED.swap(true, Ordering::Relaxed) {
+        tracing::info!(
+            "alert_policies: TOML seeder retired; canonical rows come from migration V34"
+        );
     }
-
-    Ok(report)
+    Ok(AlertSeedReport::default())
 }
 
 #[cfg(test)]
