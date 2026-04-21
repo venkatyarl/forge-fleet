@@ -2089,3 +2089,29 @@ UPDATE software_registry
    )
  WHERE id = 'forgefleetd_git';
 "#;
+
+// ─── V33: forgefleet / ForgeFleet CLI aliases (project-name discoverability) ─
+//
+// External agents (Codex, Claude Code CLI, OpenClaw tool runners, third-party
+// automation) often search for a binary by project name. Installing the ff
+// binary only as `ff` forces every caller to know the short alias upfront.
+// V33 adds the symlink creation step to every ff_git playbook so running
+// `ff fleet upgrade ff_git` (or the autonomous tick) materializes both
+// `forgefleet` and `ForgeFleet` aliases on every worker.
+//
+// Also bootstrap-node-template.sh §6 (build step) creates the same symlinks
+// on first enrollment so new boxes (Rihanna, Beyonce going forward) get the
+// aliases without waiting for an upgrade.
+
+pub const SCHEMA_V33_CLI_ALIASES: &str = r#"
+UPDATE software_registry
+   SET upgrade_playbook = jsonb_build_object(
+       'macos',
+       'export PATH="$HOME/.cargo/bin:$PATH" && mkdir -p "$(dirname {{source_tree_path}})" && { [ -d "{{source_tree_path}}/.git" ] || git clone https://github.com/venkatyarl/forge-fleet "{{source_tree_path}}"; } && cd "{{source_tree_path}}" && git fetch origin main && git reset --hard origin/main && cargo build --release -p ff-terminal && install -m 755 target/release/ff ~/.local/bin/ff && codesign --force --sign - ~/.local/bin/ff && ln -sf ~/.local/bin/ff ~/.local/bin/forgefleet && ln -sf ~/.local/bin/ff ~/.local/bin/ForgeFleet',
+       'linux-ubuntu',
+       'export PATH="$HOME/.cargo/bin:$PATH" && export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" && mkdir -p "$(dirname {{source_tree_path}})" && { [ -d "{{source_tree_path}}/.git" ] || git clone https://github.com/venkatyarl/forge-fleet "{{source_tree_path}}"; } && cd "{{source_tree_path}}" && git fetch origin main && git reset --hard origin/main && cargo build --release -p ff-terminal && install -m 755 target/release/ff ~/.local/bin/ff && ln -sf ~/.local/bin/ff ~/.local/bin/forgefleet && ln -sf ~/.local/bin/ff ~/.local/bin/ForgeFleet && systemctl --user restart forgefleet-daemon.service',
+       'linux-dgx',
+       'export PATH="$HOME/.cargo/bin:$PATH" && export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" && mkdir -p "$(dirname {{source_tree_path}})" && { [ -d "{{source_tree_path}}/.git" ] || git clone https://github.com/venkatyarl/forge-fleet "{{source_tree_path}}"; } && cd "{{source_tree_path}}" && git fetch origin main && git reset --hard origin/main && cargo build --release -p ff-terminal && install -m 755 target/release/ff ~/.local/bin/ff && ln -sf ~/.local/bin/ff ~/.local/bin/forgefleet && ln -sf ~/.local/bin/ff ~/.local/bin/ForgeFleet && systemctl --user restart forgefleet-daemon.service'
+   )
+ WHERE id = 'ff_git';
+"#;

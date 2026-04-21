@@ -302,6 +302,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "playbook_bugfixes",
         sql: schema::SCHEMA_V32_PLAYBOOK_BUGFIXES,
     },
+    PgMigration {
+        version: 33,
+        name: "cli_aliases",
+        sql: schema::SCHEMA_V33_CLI_ALIASES,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.

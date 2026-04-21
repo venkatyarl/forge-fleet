@@ -362,6 +362,7 @@ pub fn build_router(state: Arc<GatewayState>, mc_db_path: Option<&str>) -> Route
     let mut app = Router::new()
         // Core gateway routes
         .route("/health", get(health))
+        .route("/.well-known/forgefleet.json", get(well_known_forgefleet))
         .route("/ws", get(websocket_upgrade))
         .route("/api/messages", post(incoming_message_http))
         .route("/api/messages/raw", post(incoming_message_raw_http))
@@ -572,6 +573,64 @@ async fn health(State(state): State<Arc<GatewayState>>) -> Json<HealthResponse> 
         outbound_buffered: state.outbound_messages.len(),
         telegram_transport,
     })
+}
+
+/// Discovery document at the standard RFC 8615 well-known path.
+///
+/// External agents (Codex, Claude Code, OpenClaw, third-party CLIs) probe
+/// `http://<host>:51002/.well-known/forgefleet.json` to confirm a ForgeFleet
+/// leader is running and to auto-discover capabilities + endpoints without
+/// operator configuration. Designed for the "any computer on the LAN can
+/// find its ForgeFleet without hardcoding URLs" use case.
+async fn well_known_forgefleet(
+    State(state): State<Arc<GatewayState>>,
+) -> Json<Value> {
+    let leader = match state.operational_store.as_ref().and_then(|os| os.pg_pool()) {
+        Some(pool) => sqlx::query_scalar::<_, String>(
+            "SELECT member_name FROM fleet_leader_state LIMIT 1",
+        )
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten(),
+        None => None,
+    };
+    let fleet_size = match state.operational_store.as_ref().and_then(|os| os.pg_pool()) {
+        Some(pool) => sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM computers")
+            .fetch_one(pool)
+            .await
+            .ok(),
+        None => None,
+    };
+
+    Json(json!({
+        "service": "forgefleet",
+        "version": ff_core::VERSION,
+        "spec_version": "2026-04-21",
+        "leader": leader,
+        "fleet_size": fleet_size,
+        "endpoints": {
+            "health":       "/health",
+            "status":       "/api/fleet/status",
+            "onboard":      "/onboarding",
+            "bootstrap_sh": "/onboard/bootstrap.sh",
+            "bootstrap_ps1":"/onboard/bootstrap.ps1",
+            "self_enroll":  "/api/fleet/self-enroll",
+            "openai_chat":  "/v1/chat/completions",
+            "openai_models":"/v1/models",
+            "mcp":          "http://{host}:50001/mcp",
+            "websocket":    "/ws",
+            "metrics":      "/metrics"
+        },
+        "capabilities": {
+            "pulse_protocol_version": 2,
+            "openai_compat":       true,
+            "mcp":                 true,
+            "agent_dispatch":      true,
+            "supports_worktrees":  true
+        },
+        "docs": "https://github.com/venkatyarl/forge-fleet"
+    }))
 }
 
 async fn telegram_transport_status(State(state): State<Arc<GatewayState>>) -> Json<Value> {

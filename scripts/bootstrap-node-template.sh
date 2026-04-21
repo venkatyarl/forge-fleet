@@ -221,6 +221,10 @@ report "build" running
 run_as_user bash -lc "cd '$REPO_DIR' && cargo build -p ff-terminal --release 2>&1 | tail -2" \
   || die "cargo build failed"
 run_as_user install -m 755 "$REPO_DIR/target/release/ff" "$USER_HOME/.local/bin/ff"
+# CLI aliases so external agents (Codex, Claude Code, OpenClaw, third-party
+# tools) can resolve the binary by project name without hardcoding "ff".
+run_as_user ln -sf "$USER_HOME/.local/bin/ff" "$USER_HOME/.local/bin/forgefleet"
+run_as_user ln -sf "$USER_HOME/.local/bin/ff" "$USER_HOME/.local/bin/ForgeFleet"
 report "build" ok
 
 # ─── 6a. Node 22 + real dashboard build + forgefleetd ─────────────────────

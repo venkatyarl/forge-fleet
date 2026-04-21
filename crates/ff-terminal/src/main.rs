@@ -598,6 +598,19 @@ enum SoftwareCommand {
         /// Required to actually delete (otherwise prints plan and exits).
         #[arg(long, default_value_t = false)] yes: bool,
     },
+    /// Manually trigger one auto-upgrade tick (normally runs hourly in the daemon).
+    ///
+    /// Runs `refresh_self_built_latest_versions` → `flip_self_built_drift_status`
+    /// → `resolve_upgrade_plans` → `enqueue_plans` for every software_id with
+    /// drift. Useful for operators who just committed a new leader build and
+    /// want the fleet to pick it up without waiting up to 60 min.
+    ///
+    /// Respects the same `fleet_secrets.auto_upgrade_enabled` gate as the
+    /// hourly tick — if off, this command no-ops with a warning.
+    AutoUpgradeRunOnce {
+        /// Force the run even if `auto_upgrade_enabled` is false in fleet_secrets.
+        #[arg(long, default_value_t = false)] force: bool,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -6742,7 +6755,46 @@ async fn handle_software(cmd: SoftwareCommand) -> Result<()> {
             .await
         }
         SoftwareCommand::Remove { id, yes } => handle_software_remove(&pool, &id, yes).await,
+        SoftwareCommand::AutoUpgradeRunOnce { force } => {
+            handle_auto_upgrade_run_once(&pool, force).await
+        }
     }
+}
+
+/// Implementation of `ff software auto-upgrade-run-once`.
+///
+/// Bypasses the hourly scheduler by directly calling `AutoUpgradeTick::run_once()`
+/// on the local process. The resulting deferred tasks land in the defer queue
+/// same as the hourly tick — workers on each target computer pull + execute
+/// them on their next poll.
+async fn handle_auto_upgrade_run_once(pool: &sqlx::PgPool, force: bool) -> Result<()> {
+    // Mirror the gate check the hourly tick uses so --force is meaningful.
+    let enabled = ff_db::pg_get_secret(pool, "auto_upgrade_enabled")
+        .await
+        .ok()
+        .flatten()
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "on"))
+        .unwrap_or(false);
+    if !enabled && !force {
+        println!(
+            "{YELLOW}auto_upgrade_enabled is not set — pass --force to run anyway.{RESET}"
+        );
+        println!("  (To enable persistently: ff secrets set auto_upgrade_enabled true)");
+        return Ok(());
+    }
+
+    let worker = ff_agent::fleet_info::resolve_this_node_name().await;
+    println!(
+        "{CYAN}[auto-upgrade run-once]{RESET} triggering tick as worker={worker}{}",
+        if force && !enabled { " (--force: gate bypassed)" } else { "" }
+    );
+    let tick = ff_agent::auto_upgrade::AutoUpgradeTick::new(pool.clone(), worker);
+    let enqueued = tick
+        .run_once()
+        .await
+        .map_err(|e| anyhow::anyhow!("auto_upgrade run_once: {e}"))?;
+    println!("{GREEN}✓ dispatched {enqueued} upgrade task(s){RESET}");
+    Ok(())
 }
 
 async fn handle_software_list(
