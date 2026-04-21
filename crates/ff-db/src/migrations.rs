@@ -327,6 +327,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "retire_ports_toml",
         sql: schema::SCHEMA_V37_RETIRE_PORTS_TOML,
     },
+    PgMigration {
+        version: 38,
+        name: "retire_external_tools_toml",
+        sql: schema::SCHEMA_V38_RETIRE_EXTERNAL_TOOLS_TOML,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.

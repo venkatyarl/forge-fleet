@@ -2399,3 +2399,64 @@ VALUES
 
 ON CONFLICT (port) DO NOTHING;
 "#;
+
+// ─── V38: retire config/external_tools.toml → Postgres ──────────────────────
+//
+// Per the DB-first directive: runtime external-tool catalog edits go
+// straight to Postgres. This migration idempotently UPSERTs the three
+// seeded tools (code-review-graph, context-mode, gh-cli) previously
+// read from `config/external_tools.toml`. Operator edits survive because
+// ON CONFLICT (id) DO NOTHING.
+//
+// `latest_version` / `latest_version_at` are owned by the upstream-check
+// loop, not this seed — those columns start NULL.
+pub const SCHEMA_V38_RETIRE_EXTERNAL_TOOLS_TOML: &str = r#"
+INSERT INTO external_tools
+    (id, display_name, github_url, kind, install_method,
+     install_spec, cli_entrypoint, mcp_server_command, register_as_mcp,
+     version_source, upgrade_playbook, intake_source, intake_reference)
+VALUES
+  ('code-review-graph',
+   'Code Review Graph',
+   'https://github.com/anthropics/code-review-graph',
+   'mcp',
+   'cargo_install',
+   '{"repo":"anthropics/code-review-graph","bin":"code-review-graph-mcp"}'::jsonb,
+   'crg',
+   'code-review-graph-mcp --stdio',
+   true,
+   '{"method":"github_release","repo":"anthropics/code-review-graph"}'::jsonb,
+   '{"all":"cargo install --git https://github.com/anthropics/code-review-graph --force"}'::jsonb,
+   'direct',
+   'https://github.com/anthropics/code-review-graph'),
+
+  ('context-mode',
+   'Context Mode',
+   'https://github.com/context-mode/context-mode',
+   'mcp',
+   'npm_global',
+   '{"package":"@context-mode/mcp"}'::jsonb,
+   'context-mode',
+   'context-mode --stdio',
+   true,
+   '{"method":"github_release","repo":"context-mode/context-mode"}'::jsonb,
+   '{"all":"npm install -g @context-mode/mcp@latest"}'::jsonb,
+   'direct',
+   'https://github.com/context-mode/context-mode'),
+
+  ('gh-cli',
+   'GitHub CLI',
+   'https://github.com/cli/cli',
+   'cli',
+   'binary_release',
+   '{"repo":"cli/cli","asset_pattern":"gh_*_linux_amd64.tar.gz"}'::jsonb,
+   'gh',
+   NULL,
+   false,
+   '{"method":"github_release","repo":"cli/cli"}'::jsonb,
+   '{"macos":"brew upgrade gh","linux-ubuntu":"sudo apt-get update && sudo apt-get install -y gh","linux-dgx":"sudo apt-get update && sudo apt-get install -y gh"}'::jsonb,
+   'direct',
+   'https://github.com/cli/cli')
+
+ON CONFLICT (id) DO NOTHING;
+"#;

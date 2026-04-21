@@ -1,14 +1,19 @@
-//! External-tools registry loader.
+//! External-tools registry loader (retired).
 //!
-//! Parses `config/external_tools.toml` into rows and upserts them into
-//! the `external_tools` Postgres table (schema V24).
+//! Historically this module parsed `config/external_tools.toml` and
+//! upserted rows into the `external_tools` Postgres table. That file has
+//! been deleted — the DB migration `SCHEMA_V38_RETIRE_EXTERNAL_TOOLS_TOML`
+//! now owns the canonical seed set, and operator edits via SQL (or a
+//! future `ff ext add`) are preserved across upgrades.
 //!
-//! The table has `latest_version` + `latest_version_at` columns which
-//! are owned by the upstream-check loop — this loader NEVER writes those
-//! two columns, only INSERTs them as NULL on first insert.
+//! The public API ([`seed_from_toml`], [`SeedReport`], and the supporting
+//! `ExternalToolsFile` / `ExternalToolEntry` types) is intentionally
+//! preserved so any callers that predate the retirement keep compiling.
+//! The seeder itself is now a no-op that logs once and returns an empty
+//! [`SeedReport`]. Read-side helpers ([`list_tools`]) continue to work
+//! against Postgres as before.
 //!
-//! Mirrors [`crate::software_registry`]. If you change the schema here,
-//! check that module too so they don't drift apart.
+//! Mirrors [`crate::software_registry`] (V28 retirement template).
 
 use std::path::{Path, PathBuf};
 
@@ -117,168 +122,24 @@ pub struct Tool {
     pub intake_reference: Option<String>,
 }
 
-/// Read the external-tools TOML from `path` and upsert every row into
-/// `external_tools`. Returns a per-row summary.
+/// Retired no-op seeder. The DB migration
+/// `SCHEMA_V38_RETIRE_EXTERNAL_TOOLS_TOML` now owns the canonical
+/// `external_tools` seed set; this function is kept only so callers that
+/// predate the retirement keep compiling.
 ///
-/// The SQL uses `INSERT ... ON CONFLICT (id) DO UPDATE SET ...` and updates
-/// every column EXCEPT `latest_version` and `latest_version_at`, which are
-/// owned by the upstream-check loop.
+/// Logs a single info line the first time it's called in a process.
 pub async fn seed_from_toml(
-    pool: &PgPool,
-    toml_path: &Path,
+    _pool: &PgPool,
+    _toml_path: &Path,
 ) -> Result<SeedReport, ExternalToolsError> {
-    let raw = std::fs::read_to_string(toml_path).map_err(|source| ExternalToolsError::Io {
-        path: toml_path.to_path_buf(),
-        source,
-    })?;
-
-    let doc: ExternalToolsFile =
-        toml::from_str(&raw).map_err(|source| ExternalToolsError::Toml {
-            path: toml_path.to_path_buf(),
-            source,
-        })?;
-
-    let mut report = SeedReport {
-        total: doc.tool.len(),
-        ..SeedReport::default()
-    };
-
-    for entry in &doc.tool {
-        let install_spec =
-            toml_table_to_json(&entry.install_spec).map_err(|source| ExternalToolsError::Json {
-                id: entry.id.clone(),
-                field: "install_spec",
-                source,
-            })?;
-
-        let version_source =
-            toml_table_to_json(&entry.version_source).map_err(|source| {
-                ExternalToolsError::Json {
-                    id: entry.id.clone(),
-                    field: "version_source",
-                    source,
-                }
-            })?;
-
-        let upgrade_playbook = toml_table_to_json(&entry.upgrade_playbook).map_err(|source| {
-            ExternalToolsError::Json {
-                id: entry.id.clone(),
-                field: "upgrade_playbook",
-                source,
-            }
-        })?;
-
-        let metadata =
-            toml_table_to_json(&entry.metadata).map_err(|source| ExternalToolsError::Json {
-                id: entry.id.clone(),
-                field: "metadata",
-                source,
-            })?;
-
-        // xmax=0 trick identifies freshly-inserted rows; changed-detection
-        // compares each editable column against the pre-image.
-        let row: Option<(bool, bool)> = sqlx::query_as(
-            r#"
-            WITH existing AS (
-                SELECT
-                    display_name,
-                    github_url,
-                    kind,
-                    install_method,
-                    install_spec,
-                    cli_entrypoint,
-                    mcp_server_command,
-                    register_as_mcp,
-                    version_source,
-                    upgrade_playbook,
-                    intake_source,
-                    intake_reference,
-                    metadata
-                FROM external_tools
-                WHERE id = $1
-            ),
-            upsert AS (
-                INSERT INTO external_tools (
-                    id,
-                    display_name,
-                    github_url,
-                    kind,
-                    install_method,
-                    install_spec,
-                    cli_entrypoint,
-                    mcp_server_command,
-                    register_as_mcp,
-                    version_source,
-                    upgrade_playbook,
-                    intake_source,
-                    intake_reference,
-                    metadata
-                )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
-                ON CONFLICT (id) DO UPDATE SET
-                    display_name       = EXCLUDED.display_name,
-                    github_url         = EXCLUDED.github_url,
-                    kind               = EXCLUDED.kind,
-                    install_method     = EXCLUDED.install_method,
-                    install_spec       = EXCLUDED.install_spec,
-                    cli_entrypoint     = EXCLUDED.cli_entrypoint,
-                    mcp_server_command = EXCLUDED.mcp_server_command,
-                    register_as_mcp    = EXCLUDED.register_as_mcp,
-                    version_source     = EXCLUDED.version_source,
-                    upgrade_playbook   = EXCLUDED.upgrade_playbook,
-                    intake_source      = EXCLUDED.intake_source,
-                    intake_reference   = EXCLUDED.intake_reference,
-                    metadata           = EXCLUDED.metadata
-                RETURNING (xmax = 0) AS inserted
-            )
-            SELECT
-                u.inserted,
-                COALESCE(
-                    e.display_name       IS DISTINCT FROM $2  OR
-                    e.github_url         IS DISTINCT FROM $3  OR
-                    e.kind               IS DISTINCT FROM $4  OR
-                    e.install_method     IS DISTINCT FROM $5  OR
-                    e.install_spec       IS DISTINCT FROM $6  OR
-                    e.cli_entrypoint     IS DISTINCT FROM $7  OR
-                    e.mcp_server_command IS DISTINCT FROM $8  OR
-                    e.register_as_mcp    IS DISTINCT FROM $9  OR
-                    e.version_source     IS DISTINCT FROM $10 OR
-                    e.upgrade_playbook   IS DISTINCT FROM $11 OR
-                    e.intake_source      IS DISTINCT FROM $12 OR
-                    e.intake_reference   IS DISTINCT FROM $13 OR
-                    e.metadata           IS DISTINCT FROM $14,
-                    true
-                ) AS changed
-            FROM upsert u
-            LEFT JOIN existing e ON TRUE
-            "#,
-        )
-        .bind(&entry.id)
-        .bind(&entry.display_name)
-        .bind(&entry.github_url)
-        .bind(&entry.kind)
-        .bind(&entry.install_method)
-        .bind(&install_spec)
-        .bind(entry.cli_entrypoint.as_deref())
-        .bind(entry.mcp_server_command.as_deref())
-        .bind(entry.register_as_mcp)
-        .bind(&version_source)
-        .bind(&upgrade_playbook)
-        .bind(entry.intake_source.as_deref())
-        .bind(entry.intake_reference.as_deref())
-        .bind(&metadata)
-        .fetch_optional(pool)
-        .await?;
-
-        match row {
-            Some((true, _)) => report.inserted += 1,
-            Some((false, true)) => report.updated += 1,
-            Some((false, false)) => report.unchanged += 1,
-            None => report.updated += 1,
-        }
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    if !LOGGED.swap(true, Ordering::Relaxed) {
+        tracing::info!(
+            "external_tools: TOML seeder retired; canonical rows come from migration V38"
+        );
     }
-
-    Ok(report)
+    Ok(SeedReport::default())
 }
 
 /// List every row in `external_tools`, ordered by id.
@@ -328,6 +189,9 @@ pub async fn list_tools(pool: &PgPool) -> Result<Vec<Tool>, ExternalToolsError> 
 }
 
 /// Convert a `toml::value::Table` to `serde_json::Value::Object(...)`.
+/// Retained for the parser-shape tests below; the runtime seeder is
+/// retired (see module docs + V38).
+#[allow(dead_code)]
 fn toml_table_to_json(
     table: &toml::value::Table,
 ) -> Result<serde_json::Value, serde_json::Error> {
