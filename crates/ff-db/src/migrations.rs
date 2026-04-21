@@ -342,6 +342,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "agent_session_on_work_outputs",
         sql: schema::SCHEMA_V40_AGENT_SESSION_ON_WORK_OUTPUTS,
     },
+    PgMigration {
+        version: 41,
+        name: "per_arch_build_leader",
+        sql: schema::SCHEMA_V41_PER_ARCH_BUILD_LEADER,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.

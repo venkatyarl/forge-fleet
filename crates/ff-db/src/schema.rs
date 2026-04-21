@@ -3838,3 +3838,43 @@ CREATE INDEX IF NOT EXISTS idx_work_outputs_by_session
     ON work_outputs(agent_session_id)
     WHERE agent_session_id IS NOT NULL;
 "#;
+
+// ─── V41: per-arch build leader designation (closes #112) ───────────────────
+//
+// Taylor is macOS aarch64 and can't cross-compile a Linux x86_64 binary
+// for Sophie, Marcus, Priya, etc. Today V32's playbook hand-waves this by
+// running `cargo build --release` on EACH target — 1m15s × N nodes of
+// redundant compile time.
+//
+// V41 adds a `computers.build_archs` JSONB array marking which arches a
+// computer is the canonical builder for. Follow-up PR wires
+// auto_upgrade::resolve_upgrade_plans to look up the arch leader, build
+// once there, rsync the artifact to every target of that arch.
+//
+// Backfill:
+//   darwin-aarch64 → taylor
+//   linux-x86_64   → sophie
+//   linux-aarch64  → sia
+//
+// Operator overrides via `ff fleet set-build-leader --arch … --computer …`.
+// The CLI already shipped in commit 7156752f3's `ff-terminal/src/main.rs`
+// — this migration adds the column + GIN index it expects.
+//
+// (The earlier V40 slot was taken by agent_session_on_work_outputs in a
+// parallel push; this shifts build leaders to V41.)
+
+pub const SCHEMA_V41_PER_ARCH_BUILD_LEADER: &str = r#"
+ALTER TABLE computers ADD COLUMN IF NOT EXISTS build_archs JSONB NOT NULL DEFAULT '[]'::jsonb;
+
+UPDATE computers SET build_archs = '["darwin-aarch64"]'::jsonb
+ WHERE LOWER(name) = 'taylor' AND build_archs = '[]'::jsonb;
+
+UPDATE computers SET build_archs = '["linux-x86_64"]'::jsonb
+ WHERE LOWER(name) = 'sophie' AND build_archs = '[]'::jsonb;
+
+UPDATE computers SET build_archs = '["linux-aarch64"]'::jsonb
+ WHERE LOWER(name) = 'sia' AND build_archs = '[]'::jsonb;
+
+CREATE INDEX IF NOT EXISTS computers_build_archs_idx
+  ON computers USING GIN (build_archs);
+"#;
