@@ -133,6 +133,23 @@ pub struct SessionTab {
 }
 
 impl SessionTab {
+    /// Signal the currently-running agent to stop. Used by `/clear`, `/cancel`,
+    /// `/stop`, and Esc. Returns true if an agent was actually running and
+    /// got signalled. Idempotent — safe to call when nothing is running.
+    pub fn cancel_current_agent(&mut self) -> bool {
+        if !self.is_running {
+            return false;
+        }
+        if let Some(session) = &self.session {
+            session.cancel_token.cancel();
+        }
+        self.is_running = false;
+        self.status = "Cancelling…".into();
+        true
+    }
+}
+
+impl SessionTab {
     pub fn new(name: &str) -> Self {
         Self {
             name: name.to_string(),

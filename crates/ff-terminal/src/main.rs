@@ -1939,16 +1939,47 @@ async fn run_event_loop(
                         if app.tab_mut().input.text.trim().is_empty() { continue; }
 
                         let trimmed = app.tab_mut().input.text.trim().to_string();
+
+                        // ── LOCAL SLASH COMMANDS — intercepted BEFORE queue check ─
+                        // Slash commands are local TUI controls; they must NEVER be
+                        // forwarded to the LLM, even while the agent is running.
                         if trimmed == "/exit" || trimmed == "/quit" {
                             app.should_quit = true;
+                            continue;
+                        }
+                        if trimmed == "/clear" {
+                            // Clear the local chat buffer. If the agent is running,
+                            // also interrupt it (same as Esc — avoids deadlock where
+                            // the user types /clear while waiting for AskUserQuestion
+                            // but nothing ever gets delivered to the agent).
+                            if app.tab().is_running {
+                                app.tab_mut().cancel_current_agent();
+                            }
+                            app.tab_mut().messages.clear();
+                            app.tab_mut().queued_message = None;
+                            app.tab_mut().input.text.clear();
+                            app.tab_mut().input.cursor = 0;
+                            continue;
+                        }
+                        if trimmed == "/cancel" || trimmed == "/stop" {
+                            if app.tab().is_running {
+                                app.tab_mut().cancel_current_agent();
+                                app.tab_mut().messages.push(ff_terminal::messages::render_status(
+                                    "Agent cancelled by /cancel."
+                                ));
+                            }
+                            app.tab_mut().queued_message = None;
+                            app.tab_mut().input.text.clear();
+                            app.tab_mut().input.cursor = 0;
                             continue;
                         }
 
                         // If running, queue the message for after the agent finishes
                         if app.tab().is_running {
                             app.tab_mut().queued_message = Some(trimmed.clone());
+                            let preview: String = trimmed.chars().take(60).collect();
                             app.tab_mut().messages.push(ff_terminal::messages::render_status(
-                                &format!("Queued: \"{}\" — will send when agent finishes.", if trimmed.len() > 60 { format!("{}...", &trimmed[..60]) } else { trimmed })
+                                &format!("Queued: \"{}\" — will send when agent finishes.", preview)
                             ));
                             app.tab_mut().input.text.clear();
                             app.tab_mut().input.cursor = 0;

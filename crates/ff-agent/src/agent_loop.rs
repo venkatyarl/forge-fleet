@@ -835,6 +835,10 @@ async fn run_agent_loop(
         // Execute tools — parallel when multiple tool calls
         let tool_ctx_arc = Arc::new(session.tool_ctx.clone());
         let mut tool_results = Vec::new();
+        // Set by any tool that returns should_end_turn (e.g. AskUserQuestion).
+        // After processing the batch we break out of the turn loop so the
+        // model isn't re-invoked to rationalize past the pause.
+        let mut end_turn_requested = false;
 
         if tool_calls.len() > 1 {
             // Parallel execution using futures::join_all
@@ -883,8 +887,9 @@ async fn run_agent_loop(
             let results = futures::future::join_all(futures).await;
             for result in results {
                 match result {
-                    Ok((tool_id, content, is_error)) => {
+                    Ok((tool_id, content, is_error, should_end_turn)) => {
                         if is_error { session.consecutive_errors += 1; } else { session.consecutive_errors = 0; }
+                        if should_end_turn { end_turn_requested = true; }
                         tool_results.push((tool_id, content));
                     }
                     Err(e) => {
@@ -971,6 +976,7 @@ async fn run_agent_loop(
                     tools::truncate_output(&result.content, tools::MAX_TOOL_RESULT_CHARS);
 
                 if result.is_error { session.consecutive_errors += 1; } else { session.consecutive_errors = 0; }
+                if result.should_end_turn { end_turn_requested = true; }
 
                 emit(
                     &event_tx,
@@ -1016,6 +1022,20 @@ async fn run_agent_loop(
             }
         }
         } // close else (single tool)
+
+        // --- End-turn request from tool (e.g. AskUserQuestion) ---
+        //
+        // If any tool this turn set should_end_turn=true, terminate the
+        // turn NOW without re-invoking the LLM. Prevents the "agent keeps
+        // looping past a user question" failure mode where the model
+        // fabricates its own answer and keeps calling tools.
+        //
+        // The next user message will resume the agent with the answer.
+        if end_turn_requested {
+            return AgentOutcome::EndTurn {
+                final_message: "Waiting for user response…".into(),
+            };
+        }
 
         // --- #117: Per-edit cargo check (auto-verify-after-edit loop) ---
         //
@@ -1202,6 +1222,11 @@ async fn send_request(
 }
 
 /// Execute a single tool call (used by parallel executor).
+/// Returns `(tool_id, content, is_error, should_end_turn)`.
+/// `should_end_turn` is set by tools that need to pause the agent loop
+/// (e.g. AskUserQuestion, ExitPlanMode). The caller must check it and
+/// break out of the turn if true, so the model doesn't get re-invoked
+/// and rationalize past the pause.
 async fn execute_single_tool(
     tool_name: &str,
     tool_id: &str,
@@ -1210,7 +1235,7 @@ async fn execute_single_tool(
     ctx: &AgentToolContext,
     event_tx: &Option<mpsc::UnboundedSender<AgentEvent>>,
     session_id: &str,
-) -> (String, String, bool) {
+) -> (String, String, bool, bool) {
     emit(event_tx, AgentEvent::ToolStart {
         session_id: session_id.to_string(),
         tool_name: tool_name.to_string(),
@@ -1230,7 +1255,7 @@ async fn execute_single_tool(
                     tool_id: tool_id.to_string(),
                     result: err.clone(), is_error: true, duration_ms: 0,
                 });
-                return (tool_id.to_string(), err, true);
+                return (tool_id.to_string(), err, true, false);
             }
         },
     };
@@ -1248,7 +1273,7 @@ async fn execute_single_tool(
             result: content.clone(), is_error: result.is_error, duration_ms,
         });
 
-        (tool_id.to_string(), content, result.is_error)
+        (tool_id.to_string(), content, result.is_error, result.should_end_turn)
     } else {
         let err = format!("Unknown tool: {tool_name}");
         emit(event_tx, AgentEvent::ToolEnd {
@@ -1257,7 +1282,7 @@ async fn execute_single_tool(
             tool_id: tool_id.to_string(),
             result: err.clone(), is_error: true, duration_ms: 0,
         });
-        (tool_id.to_string(), err, true)
+        (tool_id.to_string(), err, true, false)
     }
 }
 

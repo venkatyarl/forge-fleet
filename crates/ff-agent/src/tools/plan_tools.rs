@@ -38,15 +38,19 @@ impl AgentTool for AskUserQuestionTool {
             return AgentToolResult::err("Missing 'question' parameter");
         }
 
-        // In headless/API mode, we can't prompt interactively.
-        // Return a message that tells the LLM to proceed with its best judgment
-        // rather than waiting forever for a response that won't come.
+        // Terminate the current turn. The agent loop will stop here; the NEXT
+        // user message will be treated as the answer. Previously this tool
+        // told the LLM "user is unavailable, proceed with best judgment"
+        // which caused endless rationalization loops — the agent would keep
+        // calling tools (Grep, Glob, Read) fabricating its own context
+        // instead of waiting for the user's actual answer.
         AgentToolResult::ok(format!(
-            "Question noted: \"{question}\"\n\
-             The user is not available for interactive input in this session. \
-             Please proceed with your best judgment based on available context. \
-             If the question is critical and you cannot proceed safely, explain what you need and stop."
+            "Question posed to user: \"{question}\"\n\n\
+             STOPPING. The agent loop will now exit this turn. The next \
+             user message will be the answer — do NOT plan any further \
+             tool calls, and do NOT rationalize an answer yourself."
         ))
+        .end_turn()
     }
 }
 

@@ -116,6 +116,11 @@ pub struct AgentToolResult {
     pub content: String,
     /// Whether the execution resulted in an error.
     pub is_error: bool,
+    /// If true, the agent loop should terminate this turn immediately after
+    /// this tool call — do NOT run the LLM again. Used by `AskUserQuestion`
+    /// so the agent doesn't rationalize past the question and keep looping.
+    /// The next user input is expected to be the answer.
+    pub should_end_turn: bool,
 }
 
 impl AgentToolResult {
@@ -123,6 +128,7 @@ impl AgentToolResult {
         Self {
             content: content.into(),
             is_error: false,
+            should_end_turn: false,
         }
     }
 
@@ -130,7 +136,16 @@ impl AgentToolResult {
         Self {
             content: content.into(),
             is_error: true,
+            should_end_turn: false,
         }
+    }
+
+    /// Mark this result as terminating the current agent turn. Next user
+    /// message will be treated as a fresh turn (or the answer to an
+    /// outstanding AskUserQuestion).
+    pub fn end_turn(mut self) -> Self {
+        self.should_end_turn = true;
+        self
     }
 }
 
