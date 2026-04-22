@@ -1,0 +1,93 @@
+# llama-server HEAD node — serves OpenAI-compatible API for one cluster.
+# ============================================================================
+#
+# Template pattern (`%i` = instance name = cluster id, e.g. `minimax`,
+# `deepseek-v32`). One env file per cluster selects the model path, port,
+# served-model-name, and the remote RPC peer(s) for tensor-parallel sharding.
+#
+# Install (head node — Sia for MiniMax, Rihanna for DeepSeek-V3.2):
+#   mkdir -p ~/.config/systemd/user ~/.forgefleet/logs
+#   cp llama-server@.service ~/.config/systemd/user/
+#   cp llama-server-<cluster>.env ~/.forgefleet/   # see template below
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now llama-server@<cluster>
+#
+# Example env file (`~/.forgefleet/llama-server-minimax.env`):
+#   LLAMACPP_PREFIX=/home/sia/llama.cpp/build
+#   MODEL_PATH=/home/sia/models/MiniMax-M2.7-GGUF/UD-Q6_K/MiniMax-M2.7-UD-Q6_K-00001-of-00005.gguf
+#   SERVED_NAME=minimax-m2.7
+#   BIND_HOST=0.0.0.0
+#   BIND_PORT=55000
+#   CTX=32768
+#   GPU_LAYERS=999
+#   PARALLEL=4
+#   # Comma-separated list of CX-7 rpc-server endpoints (head's own GPU + remote workers).
+#   # For a 2-node TP: include the worker's CX-7 IP:port.
+#   RPC_PEERS=10.42.0.2:50052
+#
+# For DeepSeek-V3.2 (head=Rihanna, worker=Beyonce):
+#   LLAMACPP_PREFIX=/home/rihanna/llama.cpp/build
+#   MODEL_PATH=/home/rihanna/models/DeepSeek-V3.2-GGUF/UD-Q2_K_XL/DeepSeek-V3.2-UD-Q2_K_XL-00001-of-00006.gguf
+#   SERVED_NAME=deepseek-v3.2
+#   BIND_HOST=0.0.0.0
+#   BIND_PORT=55000
+#   CTX=16384        # smaller due to ~9 GB KV headroom
+#   GPU_LAYERS=999
+#   PARALLEL=2
+#   RPC_PEERS=10.43.0.2:50052
+
+[Unit]
+Description=llama-server API host (cluster %i)
+Documentation=https://github.com/ggerganov/llama.cpp/tree/master/tools/server
+After=network-online.target forgefleetd.service
+Wants=network-online.target
+# Worker must be up first so the head can RPC into it. Leaving this as a
+# soft dependency (best-effort) since both workers live on different hosts
+# and this unit file only sees the local unit graph.
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.forgefleet/llama-server-%i.env
+
+# -m <gguf>            first shard (llama.cpp auto-discovers the rest)
+# --host/--port        bind address
+# -c <ctx>             context window
+# -ngl <n>             number of layers offloaded to GPU (999 = all)
+# --served-model-name  identifier returned by /v1/models
+# --rpc <peers>        comma-separated TCP endpoints for RPC workers
+# -np <n>              parallel-decode slots
+# -fa                  flash-attn (GGML_CUDA supports it on Blackwell)
+ExecStart=/bin/sh -c '${LLAMACPP_PREFIX}/bin/llama-server \
+    -m ${MODEL_PATH} \
+    --host ${BIND_HOST} \
+    --port ${BIND_PORT} \
+    -c ${CTX} \
+    -ngl ${GPU_LAYERS} \
+    --served-model-name ${SERVED_NAME} \
+    --rpc ${RPC_PEERS} \
+    -np ${PARALLEL} \
+    -fa'
+
+Restart=always
+RestartSec=10
+StartLimitIntervalSec=120
+StartLimitBurst=3
+
+# Logging — model load can emit MBs, append so we can review
+StandardOutput=append:%h/.forgefleet/logs/llama-server-%i.log
+StandardError=append:%h/.forgefleet/logs/llama-server-%i.log
+
+# CUDA + NCCL env for Blackwell GB10. NCCL_SOCKET_IFNAME pins NCCL to
+# CX-7 so it doesn't fall back to the 1-10 Gbps LAN when doing reduces.
+Environment=PATH=/usr/local/cuda-13.0/bin:/usr/local/bin:/usr/bin:/bin
+Environment=LD_LIBRARY_PATH=/usr/local/cuda-13.0/lib64
+Environment=NCCL_SOCKET_IFNAME=enp1s0f0np0
+Environment=GGML_CUDA_ENABLE_UNIFIED_MEMORY=1
+
+# Graceful shutdown — llama-server traps SIGTERM, flushes KV cache, exits.
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=60
+
+[Install]
+WantedBy=default.target

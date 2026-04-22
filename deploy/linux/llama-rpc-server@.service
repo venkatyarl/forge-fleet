@@ -1,0 +1,56 @@
+# llama.cpp RPC worker — exposes local GPU compute to a head node over TCP.
+# ===========================================================================
+#
+# Parameterized by instance name (the %i placeholder). The instance name
+# selects which env file is loaded, so one template serves multiple
+# independent clusters on the same box (rare, but possible).
+#
+# Install (user-level, per the `feedback_bootstrap_missing_systemd.md` rule):
+#   mkdir -p ~/.config/systemd/user ~/.forgefleet/logs
+#   cp llama-rpc-server@.service ~/.config/systemd/user/
+#   cp llama-rpc-server-<cluster>.env ~/.forgefleet/  # see template below
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now llama-rpc-server@<cluster>
+#   sudo loginctl enable-linger $USER
+#
+# Example env file (`~/.forgefleet/llama-rpc-server-minimax.env`):
+#   LLAMACPP_PREFIX=/home/adele/llama.cpp/build
+#   RPC_HOST=10.42.0.2       # the CX-7 IP the head node will dial
+#   RPC_PORT=50052
+#
+# Check status + log:
+#   systemctl --user status llama-rpc-server@minimax
+#   journalctl --user -u llama-rpc-server@minimax -f
+
+[Unit]
+Description=llama.cpp RPC worker (cluster %i)
+Documentation=https://github.com/ggerganov/llama.cpp/tree/master/tools/rpc
+After=network-online.target forgefleetd.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.forgefleet/llama-rpc-server-%i.env
+# -H binds to the CX-7 fabric IP (10.42.0.x / 10.43.0.x). -p is the port.
+# Head dials this from its own container via the private fabric subnet.
+ExecStart=/bin/sh -c '${LLAMACPP_PREFIX}/bin/rpc-server -H ${RPC_HOST} -p ${RPC_PORT}'
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# Logging
+StandardOutput=append:%h/.forgefleet/logs/llama-rpc-server-%i.log
+StandardError=append:%h/.forgefleet/logs/llama-rpc-server-%i.log
+
+# CUDA + library path (nvcc installs at /usr/local/cuda-13.0/bin on DGX OS).
+Environment=PATH=/usr/local/cuda-13.0/bin:/usr/local/bin:/usr/bin:/bin
+Environment=LD_LIBRARY_PATH=/usr/local/cuda-13.0/lib64
+
+# Graceful shutdown
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target
