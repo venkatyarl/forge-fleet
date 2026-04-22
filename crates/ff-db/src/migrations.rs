@@ -357,6 +357,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "multi_host_and_self_heal",
         sql: schema::SCHEMA_V43_MULTI_HOST_AND_SELF_HEAL,
     },
+    PgMigration {
+        version: 44,
+        name: "fleet_tasks",
+        sql: schema::SCHEMA_V44_FLEET_TASKS,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.

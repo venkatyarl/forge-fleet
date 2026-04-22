@@ -26,6 +26,15 @@ use ff_agent::commands::CommandRegistry;
 use ff_terminal::app::App;
 use ff_terminal::render;
 
+// V43/V44: multi-host deployment + self-heal + fleet-tasks CLI modules.
+// Wired here as mod decls; Command enum integration lives in the separate
+// V131/V132 PRs so this commit only delivers the handlers.
+mod fabric_cmd;
+mod model_serve_cmd;
+mod self_heal_cmd;
+mod storage_cmd;
+mod tasks_cmd;
+
 const GREEN: &str = "\x1b[32m";
 const CYAN: &str = "\x1b[36m";
 const YELLOW: &str = "\x1b[33m";

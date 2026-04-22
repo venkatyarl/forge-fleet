@@ -4146,3 +4146,52 @@ CREATE TABLE IF NOT EXISTS self_heal_rollouts (
 CREATE INDEX IF NOT EXISTS idx_self_heal_rollouts_by_sig
     ON self_heal_rollouts(bug_signature, started_at DESC);
 "#;
+
+// ============================================================================
+// V44 — Fleet task queue (inter-ff coordination)
+// ============================================================================
+//
+// Unified work queue so ff daemons on different computers can delegate,
+// handoff, and collaborate on tasks. Replaces scattered subsystems
+// (deferred_tasks, research_subtasks, work_items-for-agents) as the
+// coordination primitive. Claim protocol uses FOR UPDATE SKIP LOCKED for
+// atomic single-flight assignment.
+pub const SCHEMA_V44_FLEET_TASKS: &str = r#"
+CREATE TABLE IF NOT EXISTS fleet_tasks (
+    id                       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    parent_task_id           UUID REFERENCES fleet_tasks(id) ON DELETE CASCADE,
+    task_type                TEXT NOT NULL,
+    summary                  TEXT NOT NULL,
+    payload                  JSONB NOT NULL DEFAULT '{}',
+    priority                 INT NOT NULL DEFAULT 50,
+    requires_capability      JSONB NOT NULL DEFAULT '[]',
+    preferred_computer_id    UUID REFERENCES computers(id) ON DELETE SET NULL,
+    status                   TEXT NOT NULL DEFAULT 'pending',
+                             -- pending | claimed | running | completed | failed | handed_off | cancelled | paused
+    claimed_by_computer_id   UUID REFERENCES computers(id) ON DELETE SET NULL,
+    claimed_at               TIMESTAMPTZ,
+    started_at               TIMESTAMPTZ,
+    completed_at             TIMESTAMPTZ,
+    last_heartbeat_at        TIMESTAMPTZ,
+    progress_pct             REAL,
+    progress_message         TEXT,
+    result                   JSONB,
+    error                    TEXT,
+    handoff_reason           TEXT,
+    handoff_state            JSONB,
+    original_computer_id     UUID REFERENCES computers(id) ON DELETE SET NULL,
+    handoff_count            INT NOT NULL DEFAULT 0,
+    deadline_at              TIMESTAMPTZ,
+    created_at               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by_computer_id   UUID REFERENCES computers(id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_fleet_tasks_pending
+    ON fleet_tasks(priority DESC, created_at ASC)
+    WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS idx_fleet_tasks_by_claimer
+    ON fleet_tasks(claimed_by_computer_id, status);
+CREATE INDEX IF NOT EXISTS idx_fleet_tasks_by_parent
+    ON fleet_tasks(parent_task_id)
+    WHERE parent_task_id IS NOT NULL;
+"#;
