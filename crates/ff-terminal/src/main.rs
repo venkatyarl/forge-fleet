@@ -1738,11 +1738,18 @@ async fn run_tui(config: AgentSessionConfig) -> Result<()> {
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    // Mouse capture is OPT-IN to preserve native terminal text selection.
-    // When capture is on, the terminal emulator forwards mouse events to
-    // the TUI and native click-drag-to-select stops working — making it
-    // impossible to copy text. Default is OFF. Set FF_MOUSE_CAPTURE=1 to
-    // re-enable (needed only for widgets that consume mouse events).
+    // Mouse capture is OFF by default — prioritizes text selection +
+    // clipboard copy which work unconditionally in every terminal when
+    // the app isn't grabbing mouse events. Cost: scroll-wheel in TUI
+    // panels doesn't work (use arrow / PgUp / PgDn instead).
+    //
+    // Terminals DO support a "bypass mouse capture" modifier (⌥ on
+    // macOS, Shift on Alacritty/WezTerm, Ctrl+Shift on Kitty), but
+    // coverage is inconsistent and operators have reported it not
+    // working on some setups. Default-off is the safer UX.
+    //
+    // Set FF_MOUSE_CAPTURE=1 to opt back into mouse-driven scroll + tab
+    // clicks, if your terminal honors the bypass modifier cleanly.
     let want_mouse = std::env::var("FF_MOUSE_CAPTURE")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);

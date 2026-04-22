@@ -191,6 +191,10 @@ impl SessionTab {
 pub struct FleetNode {
     pub name: String,
     pub ip: String,
+    /// OS family as stored in computers.os_family / fleet_nodes.os:
+    /// "macos", "linux-ubuntu", "linux-dgx", "windows". Rendered in the
+    /// fleet panel header as a pretty name in parens.
+    pub os: String,
     /// Is the ForgeFleet daemon running on this node?
     pub daemon_online: bool,
     /// Models loaded on this node.
@@ -432,6 +436,55 @@ async fn fleet_nodes_from_db() -> Vec<FleetNode> {
         (None, raw.to_string())
     }
 
+    // Infer runtime from the model filename/id itself. The file's naming
+    // conventions are strong signals:
+    //   .gguf, -Q4_K_M, -Q5_K_M, -Q8_0, -Q6_K → llama.cpp
+    //   -mlx, -4bit-mlx, -mlx-, `-4bit` without .gguf → mlx
+    //   .safetensors with -FP8 / -BF16 → vllm
+    //   ollama-style short names (no dash) → ollama
+    // Returns None when nothing conclusive.
+    fn infer_runtime_from_name(name: &str) -> Option<String> {
+        let lower = name.to_lowercase();
+        // Explicit MLX markers first (strongest signal)
+        if lower.ends_with("-mlx")
+            || lower.contains("-mlx-")
+            || lower.contains("-4bit-mlx")
+            || lower.contains("-mlx_lm")
+        {
+            return Some("mlx".to_string());
+        }
+        // llama.cpp GGUF markers
+        if lower.ends_with(".gguf")
+            || lower.contains("-q4_k_m")
+            || lower.contains("-q4_k_s")
+            || lower.contains("-q5_k_m")
+            || lower.contains("-q5_k_s")
+            || lower.contains("-q6_k")
+            || lower.contains("-q8_0")
+            || lower.contains("-q3_k")
+            || lower.contains("-q2_k")
+            || lower.contains("-iq4")
+            || lower.contains("-ud-q")
+        {
+            return Some("llama.cpp".to_string());
+        }
+        // MLX also uses `-4bit` / `-8bit` quantization tags in its
+        // mlx-community naming convention. If no .gguf suffix appeared
+        // above, this is probably MLX.
+        if lower.contains("-4bit") || lower.contains("-8bit") || lower.contains("4bit-") {
+            return Some("mlx".to_string());
+        }
+        // vLLM / HF safetensors
+        if lower.ends_with(".safetensors")
+            || lower.contains("-fp8")
+            || lower.contains("-bf16")
+            || lower.contains("-fp16")
+        {
+            return Some("vllm".to_string());
+        }
+        None
+    }
+
     // Shorten model file names for display. Strips common quantization +
     // file-format suffixes so "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf"
     // shows as "Qwen3-Coder-30B-A3B-Instruct". Caps at 40 chars to keep
@@ -486,23 +539,51 @@ async fn fleet_nodes_from_db() -> Vec<FleetNode> {
                 .iter()
                 .filter(|d| d.node_name == n.name)
                 .map(|d| {
-                    // Prefer the deployment's explicit `runtime` column
-                    // (V14+); if the catalog_id still carries an old
-                    // "runtime:model" prefix, split that out. Never lose
-                    // runtime info — it's the prefix the operator sees.
+                    // Runtime resolution, most-specific first:
+                    //   1. Prefix encoded in catalog_id ("mlx:gemma-4")
+                    //   2. `computer_model_deployments.runtime` column
+                    //   3. The fleet node's default runtime (from
+                    //      `fleet_members.runtime` — set per-host at
+                    //      enrollment, follows reference_runtime_choice_policy.md:
+                    //      Mac→mlx, Linux→llama.cpp, DGX→vllm, Windows→
+                    //      llama.cpp/ollama).
+                    //   4. "unknown" (last resort)
                     let (parsed_rt, raw_name) = match d.catalog_id.as_deref() {
                         Some(cid) => split_runtime(cid),
-                        None => (None, format!("port-{}", d.port)),
+                        None => (None, String::new()),  // empty name triggers fallback below
                     };
-                    let runtime = parsed_rt.unwrap_or_else(|| {
-                        if d.runtime.trim().is_empty() {
-                            "unknown".to_string()
-                        } else {
-                            d.runtime.clone()
-                        }
-                    });
+                    // Runtime resolution (most-specific first):
+                    //   1. Prefix in catalog_id ("mlx:gemma-4")
+                    //   2. Inferred from model filename (-mlx, .gguf, etc.)
+                    //   3. deployments.runtime column
+                    //   4. fleet_members.runtime (host default)
+                    //   5. "unknown"
+                    let runtime = parsed_rt
+                        .filter(|r| r != "unknown")
+                        .or_else(|| infer_runtime_from_name(&raw_name))
+                        .or_else(|| {
+                            let r = d.runtime.trim();
+                            if r.is_empty() || r == "unknown" { None }
+                            else { Some(r.to_string()) }
+                        })
+                        .unwrap_or_else(|| {
+                            if n.runtime.trim().is_empty() || n.runtime == "unknown" {
+                                "unknown".to_string()
+                            } else {
+                                n.runtime.clone()
+                            }
+                        });
+                    // Model-name resolution:
+                    //   1. Non-empty raw_name from catalog_id → shorten
+                    //   2. Otherwise "(unknown model)" (better than "port-X"
+                    //      which obscured that we don't know the model)
+                    let name = if raw_name.trim().is_empty() {
+                        "(unknown model)".to_string()
+                    } else {
+                        short_model_name(&raw_name)
+                    };
                     NodeModel {
-                        name: short_model_name(&raw_name),
+                        name,
                         runtime,
                         port: d.port as u16,
                         online: d.health_status == "healthy",
@@ -518,9 +599,29 @@ async fn fleet_nodes_from_db() -> Vec<FleetNode> {
                     .filter(|m| m.node_name == n.name)
                     .map(|m| {
                         let (parsed_rt, raw_name) = split_runtime(&m.name);
+                        // Same runtime-fallback as above — prefer the
+                        // parsed prefix, then the fleet node's declared
+                        // runtime, then "unknown".
+                        // Same runtime cascade as the deployments path:
+                        // parsed prefix → filename inference → host default.
+                        let runtime = parsed_rt
+                            .filter(|r| r != "unknown")
+                            .or_else(|| infer_runtime_from_name(&raw_name))
+                            .unwrap_or_else(|| {
+                                if n.runtime.trim().is_empty() || n.runtime == "unknown" {
+                                    "unknown".to_string()
+                                } else {
+                                    n.runtime.clone()
+                                }
+                            });
+                        let name = if raw_name.trim().is_empty() {
+                            "(unknown model)".to_string()
+                        } else {
+                            short_model_name(&raw_name)
+                        };
                         NodeModel {
-                            name: short_model_name(&raw_name),
-                            runtime: parsed_rt.unwrap_or_else(|| "unknown".to_string()),
+                            name,
+                            runtime,
                             port: m.port as u16,
                             online: false,
                             context_window: 32_768,
@@ -532,6 +633,7 @@ async fn fleet_nodes_from_db() -> Vec<FleetNode> {
             FleetNode {
                 name: n.name,
                 ip: n.ip,
+                os: n.os,
                 daemon_online: false,
                 models: node_models,
             }

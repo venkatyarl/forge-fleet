@@ -9,6 +9,28 @@ use ratatui::Frame;
 use crate::app::App;
 use crate::theme::Theme;
 
+/// Pretty-print an `os_family` slug for fleet-panel display.
+/// Maps: macos→macOS, linux-ubuntu→Ubuntu, linux-dgx→DGX OS,
+/// linux-debian→Debian, windows→Windows, anything else→title-cased as-is.
+fn pretty_os_name(slug: &str) -> String {
+    match slug.to_lowercase().as_str() {
+        "macos" | "mac" | "darwin" => "macOS".to_string(),
+        "linux-ubuntu" | "ubuntu" => "Ubuntu".to_string(),
+        "linux-dgx" | "dgx-os" | "dgx" => "DGX OS".to_string(),
+        "linux-debian" | "debian" => "Debian".to_string(),
+        "linux" => "Linux".to_string(),
+        "windows" | "win32" => "Windows".to_string(),
+        "" | "unknown" => "?".to_string(),
+        other => {
+            let mut c = other.chars();
+            match c.next() {
+                Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                None => other.to_string(),
+            }
+        }
+    }
+}
+
 /// Render the full application UI.
 pub fn render(frame: &mut Frame, app: &App) {
     let theme = Theme::default();
@@ -337,9 +359,22 @@ fn render_left_sidebar(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) 
             } else {
                 ("○", Color::Rgb(248, 113, 113))
             };
+            // Header format: `Taylor (macOS) - 192.168.5.100`
+            // Title-case the hostname for readability; pretty-print the
+            // stored os_family slug so "linux-dgx" → "DGX OS".
+            let pretty_host = {
+                let mut c = node.name.chars();
+                match c.next() {
+                    Some(first) => first.to_uppercase().collect::<String>() + c.as_str(),
+                    None => String::new(),
+                }
+            };
+            let pretty_os = pretty_os_name(&node.os);
             lines.push(Line::from(vec![
                 Span::styled(format!(" {daemon_icon} "), Style::default().fg(daemon_color)),
-                Span::styled(&node.name, Style::default().fg(theme.fg).add_modifier(Modifier::BOLD)),
+                Span::styled(pretty_host, Style::default().fg(theme.fg).add_modifier(Modifier::BOLD)),
+                Span::styled(format!(" ({pretty_os})"), Style::default().fg(Color::Rgb(148, 163, 184))),
+                Span::styled(format!(" - {}", node.ip), Style::default().fg(Color::Rgb(100, 116, 139))),
             ]));
             for model in &node.models {
                 // Green dot = API responding, red = port down / not yet up.
@@ -386,6 +421,9 @@ fn render_messages(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             Line::from(Span::styled("  (Bash, Read, Edit, etc.) to accomplish your task.", theme.status_text)),
             Line::from(""),
             Line::from(Span::styled("  /help for commands  •  /fleet for node status  •  /exit to quit", theme.command_hint)),
+            Line::from(""),
+            Line::from(Span::styled("  Text selection: click-drag to select + ⌘-C / Ctrl+Shift+C to copy.", theme.command_hint)),
+            Line::from(Span::styled("  Scroll: arrow keys / PgUp / PgDn. (Mouse wheel disabled so selection works.)", theme.command_hint)),
         ]);
         frame.render_widget(welcome, inner);
         return;

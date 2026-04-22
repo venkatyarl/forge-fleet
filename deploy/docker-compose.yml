@@ -106,22 +106,16 @@ services:
     networks:
       - forgefleet
 
-  # ─── Redis Sentinel (monitors the primary) ─────────────────────────────
-  sentinel:
-    image: redis:7-alpine
-    container_name: forgefleet-sentinel
-    ports:
-      - "26380:26379"
-    volumes:
-      - sentinel_data:/data
-      - ./docker/sentinel.conf:/etc/sentinel-template.conf:ro
-    entrypoint: ["/bin/sh", "-c", "cp /etc/sentinel-template.conf /data/sentinel.conf && redis-sentinel /data/sentinel.conf"]
-    depends_on:
-      redis:
-        condition: service_healthy
-    restart: unless-stopped
-    networks:
-      - forgefleet
+  # ─── Redis Sentinel (REMOVED — replaced by Pulse P2P) ─────────────────
+  #
+  # Per Plan 14 Phase 2/6: ff's own Pulse P2P layer (TCP on :51100, inside
+  # every ff daemon) handles Redis failover via the same quorum mechanism
+  # as ForgeFleet leader election. Advantages over Sentinel:
+  #   • Peer discovery uses Postgres (independently replicated), not a
+  #     Redis pub/sub bootstrap channel that's dead when Redis is dead.
+  #   • One monitoring system for leader + Postgres + Redis + OpenClaw +
+  #     LLM servers, not N separate ones.
+  # See `project_ha_architecture.md` + `feedback_fleet_self_heals.md`.
 
   # ─── NATS JetStream (coordination + event bus + KV store) ─────────────
   nats:
@@ -152,8 +146,7 @@ volumes:
     name: forgefleet-postgres-data
   redis_data:
     name: forgefleet-redis-data
-  sentinel_data:
-    name: forgefleet-sentinel-data
+  # sentinel_data volume removed — see the Sentinel service block above.
   nats_data:
     name: forgefleet-nats-data
 

@@ -314,7 +314,9 @@ pub async fn stop_taylor_docker_stack() -> (bool, String) {
     const CONTAINERS: &[&str] = &[
         "forgefleet-postgres",
         "forgefleet-redis",
-        "forgefleet-sentinel",
+        // forgefleet-sentinel removed — Pulse P2P replaces Redis Sentinel.
+        // Left in a historical comment so readers looking for it find the
+        // rationale without chasing git blame.
         "forgefleet-nats",
     ];
 
