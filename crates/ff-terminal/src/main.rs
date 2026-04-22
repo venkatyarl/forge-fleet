@@ -141,6 +141,11 @@ enum Command {
         /// `--verify-files a.rs --verify-files b.rs`.
         #[arg(long = "verify-files")]
         verify_files: Vec<PathBuf>,
+        /// Restrict the agent's tool belt to these tools only (comma-separated).
+        /// Forbid Read on pure-create tasks to prevent Read-loops:
+        /// `--allowed-tools Write,Bash`. When unset, all core tools are exposed.
+        #[arg(long = "allowed-tools", value_delimiter = ',')]
+        allowed_tools: Vec<String>,
     },
     /// Fleet-parallel research — decomposes a query into N sub-questions,
     /// dispatches each to a different fleet LLM in parallel, and synthesizes
@@ -1526,7 +1531,8 @@ async fn main() -> Result<()> {
     }
     let working_dir = cli.cwd.unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from("/")));
 
-    let agent_config = AgentSessionConfig {
+    #[allow(unused_mut)]
+    let mut agent_config = AgentSessionConfig {
         model, llm_base_url: llm, working_dir: working_dir.clone(),
         system_prompt: None, max_turns: 30,
         image_path: cli.image,
@@ -1637,12 +1643,17 @@ async fn main() -> Result<()> {
         Some(Command::Ports { command }) => handle_ports(command).await,
         Some(Command::CloudLlm { command }) => handle_cloud_llm(command).await,
         Some(Command::Social { command }) => handle_social(command).await,
-        Some(Command::Supervise { prompt, max_attempts, verify_files }) => {
+        Some(Command::Supervise { prompt, max_attempts, verify_files, allowed_tools }) => {
             let sup_config = ff_agent::supervisor::SupervisorConfig {
                 max_attempts,
                 verify_files: verify_files.clone(),
                 ..Default::default()
             };
+            if !allowed_tools.is_empty() {
+                agent_config.allowed_tools = Some(
+                    allowed_tools.iter().cloned().collect::<std::collections::HashSet<_>>()
+                );
+            }
             let llm_display = agent_config.llm_base_url.trim_end_matches('/').to_string();
             eprintln!("{CYAN}▶ ForgeFleet Supervisor{RESET}  \x1b[2m{llm_display} · model={}{RESET}", agent_config.model);
             let prompt_preview: String = prompt.chars().take(80).collect();
@@ -1651,6 +1662,9 @@ async fn main() -> Result<()> {
             if !verify_files.is_empty() {
                 eprintln!("\x1b[2m  Verify files: {}{RESET}",
                     verify_files.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", "));
+            }
+            if !allowed_tools.is_empty() {
+                eprintln!("\x1b[2m  Allowed tools: {}{RESET}", allowed_tools.join(", "));
             }
             eprintln!();
 

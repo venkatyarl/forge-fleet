@@ -76,6 +76,15 @@ pub struct AgentSessionConfig {
     /// Output verbosity hint appended to the system prompt at the start of each
     /// run. Values: "concise" | "normal" | "verbose".
     pub output_style: String,
+    /// Optional tool allowlist. When `Some(names)`, only tools whose
+    /// `name()` appears in the set are registered with the LLM. When
+    /// `None` (default), all registered tools are exposed.
+    ///
+    /// Useful for forcing-a-shape: e.g. pure-create tasks can set
+    /// `Some(["Write", "Bash"])` to forbid Read so the model can't idle
+    /// in a Read-loop without ever calling Write. See
+    /// `feedback_ff_supervise_read_loop.md`.
+    pub allowed_tools: Option<std::collections::HashSet<String>>,
 }
 
 impl Default for AgentSessionConfig {
@@ -96,6 +105,7 @@ impl Default for AgentSessionConfig {
             image_path: None,
             permission_mode: "default".into(),
             output_style: "normal".into(),
+            allowed_tools: None,
         }
     }
 }
@@ -190,11 +200,22 @@ impl AgentSession {
             ..Default::default()
         };
 
+        // Apply --allowed-tools filter if set: only register tools whose
+        // `name()` is in the allowlist. When None, all core tools are exposed.
+        let tools = if let Some(allow) = &config.allowed_tools {
+            tools::core_tools_arc()
+                .into_iter()
+                .filter(|t| allow.contains(t.name()))
+                .collect()
+        } else {
+            tools::core_tools_arc()
+        };
+
         Self {
             id: session_id,
             config,
             messages,
-            tools: tools::core_tools_arc(),
+            tools,
             cancel_token: CancellationToken::new(),
             usage: TokenUsage::default(),
             tracker: ConversationTracker::new(),
@@ -226,11 +247,22 @@ impl AgentSession {
             ..Default::default()
         };
 
+        // Apply --allowed-tools filter if set: only register tools whose
+        // `name()` is in the allowlist. When None, all core tools are exposed.
+        let tools = if let Some(allow) = &config.allowed_tools {
+            tools::core_tools_arc()
+                .into_iter()
+                .filter(|t| allow.contains(t.name()))
+                .collect()
+        } else {
+            tools::core_tools_arc()
+        };
+
         Self {
             id: session_id,
             config,
             messages,
-            tools: tools::core_tools_arc(),
+            tools,
             cancel_token: CancellationToken::new(),
             usage: TokenUsage::default(),
             tracker: ConversationTracker::new(),
