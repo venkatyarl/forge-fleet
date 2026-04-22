@@ -130,7 +130,18 @@ enum Command {
         #[arg(long)] max_turns: Option<u32>,
     },
     /// Run with supervisor — auto-detect failures, fix, and retry
-    Supervise { prompt: String, #[arg(long, default_value_t = 3)] max_attempts: u32 },
+    Supervise {
+        prompt: String,
+        #[arg(long, default_value_t = 3)]
+        max_attempts: u32,
+        /// After agent declares done, require these files to exist + be
+        /// non-empty. If any are missing, count as a failure and retry
+        /// with a stronger write-first reminder. Closes the Read-loop gap
+        /// where agents declare DONE without writing. Repeatable:
+        /// `--verify-files a.rs --verify-files b.rs`.
+        #[arg(long = "verify-files")]
+        verify_files: Vec<PathBuf>,
+    },
     /// Fleet-parallel research — decomposes a query into N sub-questions,
     /// dispatches each to a different fleet LLM in parallel, and synthesizes
     /// the results into a cited markdown report.
@@ -1511,15 +1522,21 @@ async fn main() -> Result<()> {
         Some(Command::Ports { command }) => handle_ports(command).await,
         Some(Command::CloudLlm { command }) => handle_cloud_llm(command).await,
         Some(Command::Social { command }) => handle_social(command).await,
-        Some(Command::Supervise { prompt, max_attempts }) => {
+        Some(Command::Supervise { prompt, max_attempts, verify_files }) => {
             let sup_config = ff_agent::supervisor::SupervisorConfig {
                 max_attempts,
+                verify_files: verify_files.clone(),
                 ..Default::default()
             };
             let llm_display = agent_config.llm_base_url.trim_end_matches('/').to_string();
             eprintln!("{CYAN}▶ ForgeFleet Supervisor{RESET}  \x1b[2m{llm_display} · model={}{RESET}", agent_config.model);
-            eprintln!("\x1b[2m  Task: {}{RESET}", &prompt[..prompt.len().min(80)]);
+            let prompt_preview: String = prompt.chars().take(80).collect();
+            eprintln!("\x1b[2m  Task: {}{RESET}", prompt_preview);
             eprintln!("\x1b[2m  Max attempts: {max_attempts}{RESET}");
+            if !verify_files.is_empty() {
+                eprintln!("\x1b[2m  Verify files: {}{RESET}",
+                    verify_files.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", "));
+            }
             eprintln!();
 
             let result = ff_agent::supervisor::supervise(&prompt, agent_config, sup_config).await;

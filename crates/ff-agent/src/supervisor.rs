@@ -25,6 +25,12 @@ pub struct SupervisorConfig {
     pub loop_detection_window: usize,
     /// "Done" with fewer tool calls than this is suspicious.
     pub early_stop_min_tools: u32,
+    /// Required-deliverable paths. After the agent declares done, stat each
+    /// path; if any is missing or size=0, count the attempt as a failure and
+    /// retry. Closes the verify-deliverable gap where agents declare "Task
+    /// completed" without producing the artifact named in the prompt.
+    /// See `feedback_ff_supervise_verify_deliverable.md`.
+    pub verify_files: Vec<std::path::PathBuf>,
 }
 
 impl Default for SupervisorConfig {
@@ -34,6 +40,7 @@ impl Default for SupervisorConfig {
             retry_delay_ms: 2000,
             loop_detection_window: 3,
             early_stop_min_tools: 1,
+            verify_files: Vec::new(),
         }
     }
 }
@@ -123,6 +130,54 @@ pub async fn supervise(
 
         match failure {
             FailureType::NoFailure => {
+                // Verify declared deliverables exist before accepting success.
+                // Closes the feedback_ff_supervise_verify_deliverable.md gap
+                // where agents emitted "DONE" without writing the named files.
+                let missing: Vec<_> = sup_config
+                    .verify_files
+                    .iter()
+                    .filter(|p| {
+                        std::fs::metadata(p)
+                            .map(|m| !m.is_file() || m.len() == 0)
+                            .unwrap_or(true)
+                    })
+                    .collect();
+                if !missing.is_empty() {
+                    let evidence = format!(
+                        "agent declared done but {} deliverable(s) missing or empty: {}",
+                        missing.len(),
+                        missing
+                            .iter()
+                            .map(|p| p.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                    warn!(attempt, "{}", evidence);
+                    diagnoses.push(FailureDiagnosis {
+                        attempt,
+                        failure_type: "missing_deliverable".into(),
+                        evidence,
+                        fix_applied: "Prepending stronger write-first instruction on retry".into(),
+                    });
+                    // Prepend a stern directive so the retry writes the files.
+                    let paths_list = sup_config
+                        .verify_files
+                        .iter()
+                        .map(|p| format!("  - {}", p.display()))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let reminder = format!(
+                        "CRITICAL: the previous attempt did not create the required files. \
+                         You MUST invoke the Write tool (or Edit if the file exists) to create \
+                         each of these files with the content described below:\n{}\n\n",
+                        paths_list
+                    );
+                    let existing = agent_config.system_prompt.take().unwrap_or_default();
+                    agent_config.system_prompt = Some(format!("{}\n{}", reminder, existing));
+                    let delay = sup_config.retry_delay_ms * (1u64 << attempt);
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    continue;
+                }
                 info!(attempt, "supervisor: task completed successfully");
                 return SupervisorResult {
                     success: true,
