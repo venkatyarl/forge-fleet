@@ -644,6 +644,20 @@ impl Materializer {
         .execute(&self.pg)
         .await?;
 
+        // V43: upsert fabric pairs from reciprocal cx7-fabric IP claims.
+        // Soft-fail (log + continue) — a fabric-upsert error should not
+        // abort the whole beat materialization.
+        if let Err(e) =
+            crate::fabric_upsert::upsert_fabric_pairs(&self.pg, beat, computer_id).await
+        {
+            tracing::warn!(computer = %beat.computer_name, error = %e, "fabric_pairs upsert failed");
+        }
+        if let Err(e) =
+            crate::fabric_upsert::upsert_ray_memberships(&self.pg, beat, computer_id).await
+        {
+            tracing::warn!(computer = %beat.computer_name, error = %e, "llm_clusters upsert failed");
+        }
+
         // Q15: write new snapshot for next-beat delta compare.
         let snapshot_json = serde_json::to_string(&new_snapshot)?;
         let _: Result<(), _> = redis_conn
@@ -763,6 +777,53 @@ impl Materializer {
     ) -> Result<(), MaterializerError> {
         let cluster_peers_json =
             serde_json::to_string(&s.cluster.peers).unwrap_or_else(|_| "[]".to_string());
+
+        // Self-heal: if the incoming beat reports `runtime=""` or
+        // `"unknown"` for this (computer, model), check whether a
+        // known-runtime row already exists. If yes, refresh its
+        // `last_status_change` + `status` and return early instead of
+        // creating a duplicate row. Closes the loop identified in
+        // `project_pulse_materializer_vllm_runtime_gap.md`:
+        // docker-run vLLM on DGX Sparks reports `runtime: null` because
+        // forgefleetd didn't launch the container, and the old upsert
+        // path (keyed on runtime) would insert a new "unknown" row every
+        // 15 s alongside the authoritative "vllm" row.
+        //
+        // Logic authored by Qwen3-Coder-30B on marcus; hunk-header math
+        // fixed on the supervisor side so `git apply` accepts it.
+        if s.runtime.is_empty() || s.runtime == "unknown" {
+            let known_row = sqlx::query(
+                "SELECT id, runtime FROM computer_model_deployments \
+                 WHERE computer_id = $1 AND model_id = $2 \
+                   AND runtime IN ('vllm', 'llama.cpp', 'mlx_lm', 'ollama') \
+                 LIMIT 1",
+            )
+            .bind(computer_id)
+            .bind(&s.model.id)
+            .fetch_optional(&self.pg)
+            .await?;
+
+            if let Some(row) = known_row {
+                let existing_id: Uuid = row.try_get("id")?;
+                let known_runtime: String = row.try_get("runtime")?;
+                tracing::debug!(
+                    computer_id = %computer_id,
+                    model_id = %s.model.id,
+                    known_runtime = %known_runtime,
+                    "skipped unknown-runtime upsert; existing known-runtime row refreshed"
+                );
+                sqlx::query(
+                    "UPDATE computer_model_deployments \
+                        SET last_status_change = NOW(), status = $1 \
+                      WHERE id = $2",
+                )
+                .bind(&s.status)
+                .bind(existing_id)
+                .execute(&self.pg)
+                .await?;
+                return Ok(());
+            }
+        }
 
         // Q12: UPSERT keyed on (computer_id, model_id, runtime, endpoint).
         // There is no unique constraint on that tuple in V14, so we emulate

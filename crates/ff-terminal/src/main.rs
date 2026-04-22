@@ -266,6 +266,55 @@ enum Command {
         /// Exit after one pass of each (useful for cron/testing).
         #[arg(long, default_value_t = false)] once: bool,
     },
+    /// V43: multi-host private-fabric pair operations (CX-7, InfiniBand, RoCE).
+    Fabric { #[command(subcommand)] command: FabricCommand },
+    /// V43/V44: fleet-wide task board view.
+    Tasks { #[command(subcommand)] command: TasksCommand },
+    /// V43: self-heal coordination (operator escape-hatches).
+    SelfHeal { #[command(subcommand)] command: SelfHealCommand },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum FabricCommand {
+    /// Record that two computers are linked by a private fabric.
+    /// Does NOT assign IPs (still manual via nmcli); once both sides start
+    /// emitting fabric-kind IPs with paired_with, the materializer auto-fills.
+    Pair {
+        /// First computer name.
+        a: String,
+        /// Second computer name.
+        b: String,
+        /// Fabric kind: cx7-200g | cx7-400g | ib-100g | roce-100g.
+        #[arg(long, default_value = "cx7-200g")]
+        kind: String,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum TasksCommand {
+    /// List fleet_tasks with optional filters.
+    List {
+        #[arg(long)] computer: Option<String>,
+        #[arg(long)] status: Option<String>,
+        #[arg(long = "type")] task_type: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum SelfHealCommand {
+    /// Show the self-heal queue + per-daemon trust scores.
+    Status,
+    /// Halt all in-flight self-heal fixes.
+    Pause,
+    /// Require human approval for a tier for N hours (probation).
+    FreezeTier {
+        tier: String,
+        #[arg(long, default_value_t = 24)] hours: u32,
+    },
+    /// Rollback a specific fix by bug signature.
+    Revert { bug_signature: String },
+    /// Reset a daemon's trust score back to operator-approve probation.
+    TrustReset { computer: String },
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -961,6 +1010,28 @@ enum ProjectCommand {
 
 #[derive(Debug, Clone, Subcommand)]
 enum ModelCommand {
+    /// V43: launch a model with tensor-parallel-size 2 across a CX-7 pair
+    /// (vllm + ray). Records the launch_recipe in llm_clusters for replay.
+    ServeTp2 {
+        /// Model id (references model_catalog; used as served-model-name).
+        model_id: String,
+        /// Paired hosts, e.g. `sia+adele` or `rihanna+beyonce`.
+        #[arg(long)]
+        across: String,
+        /// Shared volume name (must exist; run `ff storage share` first).
+        #[arg(long = "shared-vault")]
+        shared_vault: String,
+        /// Port for the OpenAI-compatible API (default 55001).
+        #[arg(long, default_value_t = 55001)]
+        port: u16,
+        /// Path inside the container (default /models/<model_id>).
+        #[arg(long = "container-path")]
+        container_path: Option<String>,
+        #[arg(long = "max-model-len", default_value_t = 32768)]
+        max_model_len: u32,
+        #[arg(long = "gpu-memory-utilization", default_value_t = 0.85)]
+        gpu_memory_utilization: f32,
+    },
     /// Sync the curated model catalog TOML into Postgres.
     SyncCatalog,
     /// Search the catalog (fuzzy on id/name/family).
@@ -1510,6 +1581,50 @@ async fn main() -> Result<()> {
         Some(Command::Pm { command }) => handle_pm(command).await,
         Some(Command::Agent { command }) => handle_agent(command).await,
         Some(Command::Project { command }) => handle_project(command, &config_path).await,
+        Some(Command::Fabric { command }) => {
+            let pool = ff_agent::fleet_info::get_fleet_pool()
+                .await
+                .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
+            match command {
+                FabricCommand::Pair { a, b, kind } => {
+                    fabric_cmd::handle_fabric_pair(&pool, &a, &b, &kind).await
+                }
+            }
+        }
+        Some(Command::Tasks { command }) => {
+            let pool = ff_agent::fleet_info::get_fleet_pool()
+                .await
+                .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
+            match command {
+                TasksCommand::List { computer, status, task_type } => {
+                    tasks_cmd::handle_tasks_list(
+                        &pool,
+                        computer.as_deref(),
+                        status.as_deref(),
+                        task_type.as_deref(),
+                    )
+                    .await
+                }
+            }
+        }
+        Some(Command::SelfHeal { command }) => {
+            let pool = ff_agent::fleet_info::get_fleet_pool()
+                .await
+                .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
+            match command {
+                SelfHealCommand::Status => self_heal_cmd::handle_status(&pool).await,
+                SelfHealCommand::Pause => self_heal_cmd::handle_pause(&pool).await,
+                SelfHealCommand::FreezeTier { tier, hours } => {
+                    self_heal_cmd::handle_freeze_tier(&pool, &tier, hours).await
+                }
+                SelfHealCommand::Revert { bug_signature } => {
+                    self_heal_cmd::handle_revert(&pool, &bug_signature).await
+                }
+                SelfHealCommand::TrustReset { computer } => {
+                    self_heal_cmd::handle_trust_reset(&pool, &computer).await
+                }
+            }
+        }
         Some(Command::Alert { command }) => handle_alert(command).await,
         Some(Command::Metrics { command }) => handle_metrics(command).await,
         Some(Command::Logs { computer, service, tail }) => {
@@ -3411,6 +3526,36 @@ async fn handle_model(cmd: ModelCommand) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
 
     match cmd {
+        ModelCommand::ServeTp2 {
+            model_id,
+            across,
+            shared_vault,
+            port,
+            container_path,
+            max_model_len,
+            gpu_memory_utilization,
+        } => {
+            let (a, b) = match across.split_once('+') {
+                Some(parts) => parts,
+                None => anyhow::bail!(
+                    "--across requires `<hostA>+<hostB>` (e.g. `sia+adele`)"
+                ),
+            };
+            let path_inside = container_path
+                .unwrap_or_else(|| format!("/models/{}", model_id));
+            model_serve_cmd::handle_model_serve_tp2(
+                &pool,
+                &model_id,
+                a,
+                b,
+                &shared_vault,
+                port,
+                &path_inside,
+                max_model_len,
+                gpu_memory_utilization,
+            )
+            .await?;
+        }
         ModelCommand::SyncCatalog => {
             let n = ff_agent::model_catalog::sync_catalog(&pool).await
                 .map_err(|e| anyhow::anyhow!(e))?;

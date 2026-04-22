@@ -152,9 +152,14 @@ impl HeartbeatV2Publisher {
         };
 
         // ── Network identity ─────────────────────────────────────────────
+        let mut all_ips = detect_all_ips();
+        // V43: annotate mlx5_core NICs with cx7-fabric kind + paired_with + link_speed.
+        for ip in all_ips.iter_mut() {
+            crate::cx7_detect::enrich_ip(ip, &self.computer_name);
+        }
         beat.network = NetworkInfo {
             primary_ip: detect_primary_ip(),
-            all_ips: detect_all_ips(),
+            all_ips,
         };
 
         // ── Capabilities ─────────────────────────────────────────────────
