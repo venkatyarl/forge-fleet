@@ -1,6 +1,7 @@
 pub mod agent_coordinator;
 pub mod agent_loop;
 pub mod agent_roles;
+pub mod research;
 pub mod auto_upgrade;
 pub mod sub_agent_reaper;
 pub mod bash_security;

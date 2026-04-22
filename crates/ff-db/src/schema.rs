@@ -3878,3 +3878,108 @@ UPDATE computers SET build_archs = '["linux-aarch64"]'::jsonb
 CREATE INDEX IF NOT EXISTS computers_build_archs_idx
   ON computers USING GIN (build_archs);
 "#;
+
+// ─── V42: research subsystem — multi-agent research with citations ──────────
+//
+// Three tables to track a research session end-to-end:
+//
+//   research_sessions  — the top-level query + synthesized output
+//   research_subtasks  — per-sub-question dispatches to fleet LLMs
+//   research_findings  — individual citations / facts / sources
+//
+// A session holds the operator's question, the planner's decomposition, and
+// the final synthesized report. Subtasks are children that each run on a
+// different fleet LLM in parallel (via MultiAgentOrchestrator). Findings
+// are the atomic citations each subtask surfaced (URL, quoted snippet,
+// confidence, which subtask produced it) — used for the citation footer
+// in the final report AND for learning-from-past-sessions.
+//
+// Design notes:
+//   - session.status: 'planning' → 'dispatching' → 'synthesizing' → 'done' / 'failed'
+//   - subtask.status mirrors: 'pending' → 'running' → 'done' / 'failed'
+//   - findings carry `confidence` (0.0–1.0) so the synthesizer can weight them
+//   - every row has metadata JSONB for future extensions without migrations
+
+pub const SCHEMA_V42_RESEARCH_SUBSYSTEM: &str = r#"
+CREATE TABLE IF NOT EXISTS research_sessions (
+    id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    query              TEXT NOT NULL,
+    status             TEXT NOT NULL DEFAULT 'planning',
+    -- Operator-supplied configuration
+    depth              INT NOT NULL DEFAULT 3,
+    parallel           INT NOT NULL DEFAULT 5,
+    output_path        TEXT,
+    -- Planner's decomposition, stored raw for auditability
+    planner_model      TEXT,
+    planner_output     JSONB,
+    -- Synthesizer's output
+    synth_model        TEXT,
+    report_markdown    TEXT,
+    -- Timing + provenance
+    initiated_by       TEXT,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    started_at         TIMESTAMPTZ,
+    completed_at       TIMESTAMPTZ,
+    duration_ms        BIGINT,
+    total_tokens_in    BIGINT NOT NULL DEFAULT 0,
+    total_tokens_out   BIGINT NOT NULL DEFAULT 0,
+    error              TEXT,
+    metadata           JSONB NOT NULL DEFAULT '{}'
+);
+
+CREATE INDEX IF NOT EXISTS idx_research_sessions_by_status
+    ON research_sessions(status, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS research_subtasks (
+    id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id         UUID NOT NULL REFERENCES research_sessions(id) ON DELETE CASCADE,
+    ordinal            INT NOT NULL,
+    sub_question       TEXT NOT NULL,
+    -- Fleet dispatch info
+    assigned_computer  TEXT,
+    assigned_endpoint  TEXT,
+    assigned_model     TEXT,
+    agent_session_id   TEXT,
+    status             TEXT NOT NULL DEFAULT 'pending',
+    -- Sub-agent output
+    output_markdown    TEXT,
+    turn_count         INT,
+    -- Timing
+    started_at         TIMESTAMPTZ,
+    completed_at       TIMESTAMPTZ,
+    duration_ms        BIGINT,
+    tokens_in          BIGINT NOT NULL DEFAULT 0,
+    tokens_out         BIGINT NOT NULL DEFAULT 0,
+    error              TEXT,
+    metadata           JSONB NOT NULL DEFAULT '{}'
+);
+
+CREATE INDEX IF NOT EXISTS idx_research_subtasks_by_session
+    ON research_subtasks(session_id, ordinal);
+CREATE INDEX IF NOT EXISTS idx_research_subtasks_by_computer
+    ON research_subtasks(assigned_computer, status);
+
+CREATE TABLE IF NOT EXISTS research_findings (
+    id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id         UUID NOT NULL REFERENCES research_sessions(id) ON DELETE CASCADE,
+    subtask_id         UUID REFERENCES research_subtasks(id) ON DELETE SET NULL,
+    -- The atomic claim + where it came from
+    claim              TEXT NOT NULL,
+    source_url         TEXT,
+    source_title       TEXT,
+    source_snippet     TEXT,
+    source_kind        TEXT,   -- 'web' | 'vault' | 'code' | 'mcp' | 'model_memory'
+    confidence         FLOAT,  -- 0.0–1.0
+    -- Used by the synthesizer for ordering + filtering
+    relevance_rank     INT,
+    cross_verified     BOOLEAN NOT NULL DEFAULT false,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    metadata           JSONB NOT NULL DEFAULT '{}'
+);
+
+CREATE INDEX IF NOT EXISTS idx_research_findings_by_session
+    ON research_findings(session_id, confidence DESC);
+CREATE INDEX IF NOT EXISTS idx_research_findings_by_source_url
+    ON research_findings(source_url)
+    WHERE source_url IS NOT NULL;
+"#;

@@ -347,6 +347,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "per_arch_build_leader",
         sql: schema::SCHEMA_V41_PER_ARCH_BUILD_LEADER,
     },
+    PgMigration {
+        version: 42,
+        name: "research_subsystem",
+        sql: schema::SCHEMA_V42_RESEARCH_SUBSYSTEM,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.

@@ -122,6 +122,32 @@ enum Command {
     },
     /// Run with supervisor — auto-detect failures, fix, and retry
     Supervise { prompt: String, #[arg(long, default_value_t = 3)] max_attempts: u32 },
+    /// Fleet-parallel research — decomposes a query into N sub-questions,
+    /// dispatches each to a different fleet LLM in parallel, and synthesizes
+    /// the results into a cited markdown report.
+    ///
+    /// Uses Schema V42 tables (research_sessions / research_subtasks /
+    /// research_findings). Planner + synthesizer run on Taylor's gateway
+    /// using the "thinking" pool alias (Qwen3.5-35B-A3B thinking reserve);
+    /// sub-agents round-robin across distinct active fleet LLM deployments.
+    Research {
+        /// The research question.
+        prompt: String,
+        /// Number of parallel sub-agents (= sub-questions decomposed by planner).
+        #[arg(long, default_value_t = 5)] parallel: u32,
+        /// Max turns each sub-agent can take on its sub-question.
+        #[arg(long, default_value_t = 6)] depth: u32,
+        /// Write the final markdown report to this path.
+        #[arg(long)] output: Option<PathBuf>,
+        /// Gateway base URL for LLM calls (default: http://192.168.5.100:51002).
+        #[arg(long)] gateway: Option<String>,
+        /// Model for planner + synthesizer (default: "thinking").
+        #[arg(long = "planner-model")] planner_model: Option<String>,
+        /// Model for sub-agents (default: "coder").
+        #[arg(long = "subagent-model")] subagent_model: Option<String>,
+        /// Print intermediate progress events to stderr.
+        #[arg(long, default_value_t = false)] verbose: bool,
+    },
     /// Agent coordinator — fleet-wide task dispatch via sub-agent slots.
     Agent { #[command(subcommand)] command: AgentCommand },
     /// Manage ForgeFleet tasks
@@ -1507,6 +1533,21 @@ async fn main() -> Result<()> {
             eprintln!();
             println!("{}", &result.final_output[..result.final_output.len().min(500)]);
             Ok(())
+        }
+        Some(Command::Research {
+            prompt, parallel, depth, output, gateway, planner_model, subagent_model, verbose,
+        }) => {
+            handle_research(
+                &prompt,
+                parallel,
+                depth,
+                output,
+                gateway,
+                planner_model,
+                subagent_model,
+                verbose,
+            )
+            .await
         }
         None => {
             let prompt_text = cli.prompt.join(" ");
@@ -11598,4 +11639,107 @@ async fn handle_train(cmd: TrainCommand) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// Handler for `ff research "<query>"`.
+///
+/// Opens a Postgres pool, runs migrations (V42 lands the research tables),
+/// constructs a [`ResearchConfig`], spins a [`ResearchSession`], and
+/// streams progress to stderr while the planner → parallel sub-agents →
+/// synthesizer pipeline runs. Final markdown is printed to stdout (and
+/// optionally written to `--output path`).
+async fn handle_research(
+    prompt: &str,
+    parallel: u32,
+    depth: u32,
+    output: Option<PathBuf>,
+    gateway: Option<String>,
+    planner_model: Option<String>,
+    subagent_model: Option<String>,
+    verbose: bool,
+) -> Result<()> {
+    let pool = ff_agent::fleet_info::get_fleet_pool()
+        .await
+        .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
+    ff_db::run_postgres_migrations(&pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
+
+    let mut config = ff_agent::research::ResearchConfig::default();
+    config.query = prompt.to_string();
+    config.parallel = parallel;
+    config.depth = depth;
+    config.output_path = output;
+    if let Some(g) = gateway {
+        config.gateway_url = g;
+    }
+    if let Some(m) = planner_model {
+        config.planner_model = m;
+    }
+    if let Some(m) = subagent_model {
+        config.subagent_model = m;
+    }
+
+    eprintln!(
+        "{CYAN}▶ ff research{RESET}  \x1b[2mparallel={parallel} depth={depth} \
+         planner={} subagent={}{RESET}",
+        config.planner_model, config.subagent_model
+    );
+    eprintln!("\x1b[2m  Query: {}{RESET}\n", prompt);
+
+    let session = ff_agent::research::ResearchSession::new(pool, config)
+        .await
+        .map_err(|e| anyhow::anyhow!("create research_session: {e}"))?;
+    eprintln!("\x1b[2m  Session: {}{RESET}", session.id());
+
+    // Progress channel: dump key events to stderr so the operator sees
+    // forward motion without scrolling through raw LLM output.
+    let (prog_tx, mut prog_rx) = tokio::sync::mpsc::unbounded_channel();
+    let verbose_flag = verbose;
+    let progress_task = tokio::spawn(async move {
+        while let Some(ev) = prog_rx.recv().await {
+            use ff_agent::research::ResearchProgress;
+            match ev {
+                ResearchProgress::Planning { query } => {
+                    eprintln!(
+                        "{CYAN}[planner]{RESET} decomposing: {}",
+                        &query[..query.len().min(80)]
+                    );
+                }
+                ResearchProgress::Dispatching { sub_count } => {
+                    eprintln!(
+                        "{CYAN}[dispatch]{RESET} {sub_count} sub-agents running in parallel"
+                    );
+                }
+                ResearchProgress::Synthesizing => {
+                    eprintln!(
+                        "{CYAN}[synthesizer]{RESET} merging sub-agent outputs"
+                    );
+                }
+                ResearchProgress::Event(ev) if verbose_flag => {
+                    eprintln!("\x1b[2m  · {ev:?}\x1b[0m");
+                }
+                ResearchProgress::Event(_) => {}
+            }
+        }
+    });
+
+    let report = session
+        .run(Some(prog_tx))
+        .await
+        .map_err(|e| anyhow::anyhow!("research run: {e}"))?;
+    let _ = progress_task.await;
+
+    eprintln!();
+    eprintln!(
+        "{GREEN}✓ research complete{RESET}  \x1b[2m{}/{} sub-agents succeeded · {}ms · \
+         session {}{RESET}",
+        report.subtasks_succeeded,
+        report.subtask_count,
+        report.duration_ms,
+        report.session_id,
+    );
+    eprintln!();
+    println!("{}", report.markdown);
+    Ok(())
 }
