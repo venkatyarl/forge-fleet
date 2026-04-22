@@ -1531,7 +1531,11 @@ async fn main() -> Result<()> {
             }
 
             eprintln!();
-            println!("{}", &result.final_output[..result.final_output.len().min(500)]);
+            // Char-safe truncation: byte-slicing panics if the boundary falls
+            // inside a multi-byte UTF-8 char (e.g. box-drawing '─' in cargo
+            // output). See feedback_ff_supervise_utf8_panic.md.
+            let preview: String = result.final_output.chars().take(500).collect();
+            println!("{}", preview);
             Ok(())
         }
         Some(Command::Research {

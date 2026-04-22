@@ -78,7 +78,8 @@ pub async fn supervise(
     let mut last_output = String::new();
 
     for attempt in 1..=sup_config.max_attempts {
-        info!(attempt, task = &task[..task.len().min(100)], "supervisor: starting attempt");
+        let task_preview: String = task.chars().take(100).collect();
+        info!(attempt, task = %task_preview, "supervisor: starting attempt");
 
         // Run the agent session
         let mut session = AgentSession::new(agent_config.clone());
@@ -158,7 +159,7 @@ pub async fn supervise(
         content: format!(
             "Supervisor failed after {} attempts on task: {}. Failures: {}",
             sup_config.max_attempts,
-            &task[..task.len().min(100)],
+            task.chars().take(100).collect::<String>(),
             diagnoses.iter().map(|d| d.failure_type.clone()).collect::<Vec<_>>().join(", ")
         ),
         relevance: 0.8,

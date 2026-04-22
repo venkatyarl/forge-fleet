@@ -82,7 +82,8 @@ impl AgentTool for TrendAnalysisTool {
                         let name = item.get("full_name").and_then(Value::as_str).unwrap_or("?");
                         let stars = item.get("stargazers_count").and_then(Value::as_u64).unwrap_or(0);
                         let desc = item.get("description").and_then(Value::as_str).unwrap_or("");
-                        results.push(format!("  - {name} (⭐{stars}) — {}", &desc[..desc.len().min(60)]));
+                        let desc_preview: String = desc.chars().take(60).collect();
+                        results.push(format!("  - {name} (⭐{stars}) — {desc_preview}"));
                     }
                 }
             }

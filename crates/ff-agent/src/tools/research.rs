@@ -143,7 +143,7 @@ impl AgentTool for ScholarSearchTool {
                                     output.push_str(&format!(
                                         "{}. **{}** ({})\n   Authors: {}\n   Citations: {}\n   {}\n   {}\n\n",
                                         i + 1, title, year, authors.join(", "), citations,
-                                        if abstract_text.len() > 200 { format!("{}...", &abstract_text[..200]) } else { abstract_text.to_string() },
+                                        if abstract_text.chars().count() > 200 { format!("{}...", abstract_text.chars().take(200).collect::<String>()) } else { abstract_text.to_string() },
                                         url
                                     ));
                                 }

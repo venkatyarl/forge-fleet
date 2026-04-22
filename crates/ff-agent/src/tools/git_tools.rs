@@ -85,9 +85,10 @@ fn parse_blame_porcelain(output: &str) -> String {
             line_num += 1;
             let code = &line[1..];
             if !current_author.is_empty() {
+                let author_preview: String = current_author.chars().take(20).collect();
+                let summary_preview: String = current_summary.chars().take(40).collect();
                 result.push_str(&format!("{line_num:>4} | {:<20} | {:<40} | {code}\n",
-                    &current_author[..current_author.len().min(20)],
-                    &current_summary[..current_summary.len().min(40)]));
+                    author_preview, summary_preview));
             }
         }
     }

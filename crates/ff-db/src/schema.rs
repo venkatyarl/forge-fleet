@@ -3983,3 +3983,166 @@ CREATE INDEX IF NOT EXISTS idx_research_findings_by_source_url
     ON research_findings(source_url)
     WHERE source_url IS NOT NULL;
 "#;
+
+// ============================================================================
+// V43 — Multi-host deployment visibility + self-heal coordination foundation
+// ============================================================================
+//
+// Two related concerns in one migration:
+//
+//   (A) Multi-host deployment visibility
+//       `fabric_pairs`     — CX-7 / InfiniBand / RoCE fabric pairings between
+//                             computers (e.g. Sia↔Adele via ConnectX-7 200Gb)
+//       `llm_clusters`     — multi-host vLLM/SGLang deployments (TP=2, PP, etc)
+//                             with replayable `launch_recipe`
+//       `shared_volumes`   — NFS/SSHFS exports between paired hosts (e.g.
+//                             Sia exporting ~/models to Adele over CX-7)
+//
+//   (B) Self-heal coordination foundation (per self-heal-coordination.md plan)
+//       `fleet_bug_reports`     — workers report panics/bugs they hit
+//       `fleet_self_heal_queue` — leader's single-flight fix queue (UNIQUE on
+//                                  bug_signature prevents duplicate PRs)
+//       `daemon_trust_scores`   — per-daemon × per-tier auto-merge eligibility
+//       `self_heal_rollouts`    — canary rollout phases with health status
+//
+// These enable: (1) Pulse beats reporting fabric topology + ray cluster
+// membership so the DB reflects real multi-host state; (2) the leader's
+// self_heal_tick dedupe-and-dispatch fix pipeline.
+pub const SCHEMA_V43_MULTI_HOST_AND_SELF_HEAL: &str = r#"
+-- ─── A. Multi-host deployment visibility ───────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS fabric_pairs (
+    id                       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    pair_name                TEXT NOT NULL UNIQUE,          -- "sia-adele" (alphabetical)
+    fabric_kind              TEXT NOT NULL,                  -- cx7-200g | cx7-400g | ib-100g | roce-100g | ethernet
+    computer_a_id            UUID NOT NULL REFERENCES computers(id) ON DELETE CASCADE,
+    computer_b_id            UUID NOT NULL REFERENCES computers(id) ON DELETE CASCADE,
+    a_iface                  TEXT NOT NULL,                  -- enp1s0f0np0
+    b_iface                  TEXT NOT NULL,
+    a_ip                     TEXT NOT NULL,                  -- 10.42.0.1 (fabric-internal)
+    b_ip                     TEXT NOT NULL,                  -- 10.42.0.2
+    measured_bandwidth_gbps  DOUBLE PRECISION,               -- set by ff fabric bench
+    last_probed_at           TIMESTAMPTZ,
+    created_at               TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_fabric_pairs_by_pair_name
+    ON fabric_pairs(pair_name);
+CREATE INDEX IF NOT EXISTS idx_fabric_pairs_by_computer_a
+    ON fabric_pairs(computer_a_id);
+CREATE INDEX IF NOT EXISTS idx_fabric_pairs_by_computer_b
+    ON fabric_pairs(computer_b_id);
+
+CREATE TABLE IF NOT EXISTS llm_clusters (
+    id                     TEXT PRIMARY KEY,                 -- "minimax-tp2-sia-adele"
+    model_id               TEXT NOT NULL,                     -- references model_catalog(id); no FK because the catalog may lag
+    runtime                TEXT NOT NULL,                     -- vllm | sglang | tensorrt-llm | llama.cpp-rpc
+    topology               TEXT NOT NULL,                     -- tp | pp | tp+pp | dp
+    head_computer_id       UUID NOT NULL REFERENCES computers(id) ON DELETE CASCADE,
+    worker_computer_ids    JSONB NOT NULL DEFAULT '[]',       -- [uuid, ...]
+    fabric_pair_id         UUID REFERENCES fabric_pairs(id),
+    ray_head_endpoint      TEXT,                              -- 10.42.0.1:6379
+    api_endpoint           TEXT NOT NULL,                     -- http://10.42.0.1:55001
+    tensor_parallel_size   INT NOT NULL DEFAULT 1,
+    pipeline_parallel_size INT NOT NULL DEFAULT 1,
+    launch_recipe          JSONB NOT NULL DEFAULT '{}',       -- full env + docker cmd for replay
+    status                 TEXT NOT NULL DEFAULT 'launching', -- launching | healthy | degraded | stopped | failed
+    last_health_at         TIMESTAMPTZ,
+    launched_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    launched_by            TEXT                               -- "operator" | "ff model serve-tp2"
+);
+
+CREATE INDEX IF NOT EXISTS idx_llm_clusters_by_model_status
+    ON llm_clusters(model_id, status);
+CREATE INDEX IF NOT EXISTS idx_llm_clusters_by_head
+    ON llm_clusters(head_computer_id);
+
+CREATE TABLE IF NOT EXISTS shared_volumes (
+    id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name               TEXT NOT NULL UNIQUE,                  -- "minimax-vault"
+    host_computer_id   UUID NOT NULL REFERENCES computers(id) ON DELETE CASCADE,
+    export_path        TEXT NOT NULL,                          -- /home/sia/models
+    protocol           TEXT NOT NULL,                          -- nfs4 | sshfs | ceph
+    fabric_pair_id     UUID REFERENCES fabric_pairs(id),       -- if exported over a private fabric
+    mounted_on         JSONB NOT NULL DEFAULT '[]',           -- [{computer_id, mount_path, mounted_at}]
+    size_gb            DOUBLE PRECISION,
+    purpose            TEXT,                                   -- "models" | "training_data" | "outputs"
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_shared_volumes_by_host
+    ON shared_volumes(host_computer_id);
+
+-- ─── B. Self-heal coordination ──────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS fleet_bug_reports (
+    id                       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    bug_signature            TEXT NOT NULL,                    -- sha256(file:line:error_class) truncated
+    file_path                TEXT,
+    line_number              INT,
+    error_class              TEXT,                             -- "panic:str_index" | "cargo:type_mismatch" | "runtime:nccl"
+    stack_excerpt            TEXT,
+    reporting_computer_id    UUID REFERENCES computers(id) ON DELETE SET NULL,
+    reporting_task_id        UUID,                              -- optional link to fleet_tasks (V44)
+    reported_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    binary_version           TEXT,                              -- ff --version when it crashed
+    tier                     TEXT NOT NULL DEFAULT 'T1'        -- T0|T1|T2|T3 (see plan)
+);
+
+CREATE INDEX IF NOT EXISTS idx_fleet_bug_reports_by_sig
+    ON fleet_bug_reports(bug_signature, reported_at DESC);
+CREATE INDEX IF NOT EXISTS idx_fleet_bug_reports_recent
+    ON fleet_bug_reports(reported_at DESC);
+
+CREATE TABLE IF NOT EXISTS fleet_self_heal_queue (
+    bug_signature            TEXT PRIMARY KEY,                 -- UNIQUE enforces single-flight
+    tier                     TEXT NOT NULL,                    -- T0|T1|T2|T3
+    status                   TEXT NOT NULL,                    -- detected|fixing|reviewing|pr_open|merged|rolled_out|verified|failed|escalated
+    writer_computer_id       UUID REFERENCES computers(id) ON DELETE SET NULL,
+    writer_model             TEXT,
+    reviewer_computer_id     UUID REFERENCES computers(id) ON DELETE SET NULL,
+    reviewer_model           TEXT,
+    reviewer_confidence      DOUBLE PRECISION,
+    pr_number                INT,
+    branch_name              TEXT,
+    fix_commit_sha           TEXT,
+    fixed_tag                TEXT,                              -- "v2026.4.22_3"
+    attempts                 INT NOT NULL DEFAULT 0,
+    last_attempt_at          TIMESTAMPTZ,
+    escalated_to_operator_at TIMESTAMPTZ,
+    report_count             INT NOT NULL DEFAULT 0,            -- how many daemons hit this
+    created_at               TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_fleet_self_heal_queue_by_status
+    ON fleet_self_heal_queue(status, tier, created_at);
+
+CREATE TABLE IF NOT EXISTS daemon_trust_scores (
+    computer_id              UUID NOT NULL REFERENCES computers(id) ON DELETE CASCADE,
+    tier                     TEXT NOT NULL,                    -- T0 | T1 | T2
+    clean_fixes              INT NOT NULL DEFAULT 0,
+    reverted_fixes           INT NOT NULL DEFAULT 0,
+    last_incident_at         TIMESTAMPTZ,
+    probation_until          TIMESTAMPTZ,
+    current_level            TEXT NOT NULL DEFAULT 'operator_approve',
+                             -- operator_approve | reviewer_approve | auto_merge
+    updated_at               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (computer_id, tier)
+);
+
+CREATE TABLE IF NOT EXISTS self_heal_rollouts (
+    id                       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    bug_signature            TEXT NOT NULL REFERENCES fleet_self_heal_queue(bug_signature) ON DELETE CASCADE,
+    fixed_tag                TEXT NOT NULL,
+    phase                    TEXT NOT NULL,                    -- leader|canary|half|full|rollback
+    computer_id              UUID REFERENCES computers(id) ON DELETE SET NULL,
+    started_at               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at             TIMESTAMPTZ,
+    health_status            TEXT,                              -- ok|degraded|failed
+    rolled_back_at           TIMESTAMPTZ,
+    notes                    TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_self_heal_rollouts_by_sig
+    ON self_heal_rollouts(bug_signature, started_at DESC);
+"#;
