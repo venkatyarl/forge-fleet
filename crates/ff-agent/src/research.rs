@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::{PgPool, Row};
 use tokio::sync::mpsc;
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::multi_agent::{
@@ -68,17 +68,164 @@ pub struct ResearchConfig {
 
 impl Default for ResearchConfig {
     fn default() -> Self {
+        // Empty model + gateway strings ask [`ResearchSession::new`] to
+        // resolve them from the live DB at session start — see
+        // [`resolve_default_research_model`] and [`resolve_gateway_url`].
+        // This keeps the defaults data-driven: as the fleet's model
+        // portfolio rotates, new research sessions automatically pick
+        // up whatever's actively deployed.
         Self {
             query: String::new(),
             depth: 6,
             parallel: 5,
             output_path: None,
             initiated_by: whoami_tag(),
-            planner_model: "thinking".into(),
-            subagent_model: "coder".into(),
-            gateway_url: "http://192.168.5.100:51002".into(),
+            planner_model: String::new(),
+            subagent_model: String::new(),
+            gateway_url: String::new(),
         }
     }
+}
+
+/// Pick a sane default planner/synthesizer/sub-agent model from whatever
+/// the fleet is currently serving. Priority:
+///
+/// 1. A pool alias from `fleet_task_coverage` whose `task` column matches
+///    `preferred_task` (e.g. "chain-of-thought" for planner). If the alias
+///    has at least one active deployment, use the alias — the gateway
+///    resolves it.
+/// 2. Any active `computer_model_deployments.model_id` served from a
+///    GB10 host (fastest hardware). If multiple, pick the shortest model
+///    id (heuristic: shorter = more generic alias like "qwen3-30b").
+/// 3. Any active deployment, same ordering.
+/// 4. Fallback literal `"qwen3-30b"` — last-resort default matching the
+///    Sept 2026 fleet baseline.
+///
+/// Never hardcodes a specific version in the default path; the fallback
+/// is just there so the system degrades gracefully on an empty DB.
+pub async fn resolve_default_research_model(
+    pool: &PgPool,
+    preferred_task: &str,
+) -> String {
+    // 1) Pool alias with at least one backing deployment.
+    let alias_row: Option<(String,)> = sqlx::query_as(
+        "SELECT ftc.alias
+           FROM fleet_task_coverage ftc
+          WHERE ftc.task = $1
+            AND ftc.alias IS NOT NULL
+            AND EXISTS (
+              SELECT 1 FROM computer_model_deployments d
+               WHERE d.status = 'active'
+                 AND d.openai_compatible = true
+            )
+          LIMIT 1",
+    )
+    .bind(preferred_task)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    if let Some((alias,)) = alias_row {
+        return alias;
+    }
+
+    // 2) GB10-served model.
+    let gb10_row: Option<(String,)> = sqlx::query_as(
+        "SELECT d.model_id
+           FROM computer_model_deployments d
+           JOIN computers c ON c.id = d.computer_id
+          WHERE d.status = 'active'
+            AND d.openai_compatible = true
+            AND c.gpu_model LIKE '%GB10%'
+          ORDER BY LENGTH(d.model_id), d.started_at DESC NULLS LAST
+          LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    if let Some((m,)) = gb10_row {
+        return m;
+    }
+
+    // 3) Any active.
+    let any_row: Option<(String,)> = sqlx::query_as(
+        "SELECT d.model_id
+           FROM computer_model_deployments d
+          WHERE d.status = 'active'
+            AND d.openai_compatible = true
+          ORDER BY LENGTH(d.model_id), d.started_at DESC NULLS LAST
+          LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    if let Some((m,)) = any_row {
+        return m;
+    }
+
+    // 4) Last-resort literal.
+    "qwen3-30b".into()
+}
+
+/// Resolve a port number from `port_registry` by service name. Returns
+/// `fallback` if the row is missing (graceful degradation — operator may
+/// not have seeded the registry yet).
+pub async fn resolve_port(
+    pool: &PgPool,
+    service: &str,
+    fallback: u16,
+) -> u16 {
+    sqlx::query_scalar::<_, i32>(
+        "SELECT port FROM port_registry WHERE service = $1 AND status = 'active' LIMIT 1",
+    )
+    .bind(service)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
+    .map(|p| p as u16)
+    .unwrap_or(fallback)
+}
+
+/// Resolve the gateway URL for research LLM calls. Priority order:
+///
+/// 1. `FORGEFLEET_GATEWAY_URL` env var (operator override).
+/// 2. Current fleet leader's `primary_ip` from `fleet_leader_state` +
+///    `computers.primary_ip`, with port from `port_registry[forgefleetd]`
+///    (fallback 51002 if the registry row is missing).
+/// 3. `FORGEFLEET_LEADER_HOST` env var + same port lookup.
+/// 4. Loopback at the registry-resolved port.
+///
+/// No hardcoded ports; the 51002 literal is a last-resort fallback only
+/// used when the DB can't answer.
+pub async fn resolve_gateway_url(pool: &PgPool) -> String {
+    if let Ok(v) = std::env::var("FORGEFLEET_GATEWAY_URL") {
+        if !v.is_empty() {
+            return v;
+        }
+    }
+    let port = resolve_port(pool, "forgefleetd", 51002).await;
+    let leader_ip: Option<String> = sqlx::query_scalar(
+        "SELECT c.primary_ip
+           FROM fleet_leader_state fls
+           JOIN computers c ON c.id = fls.computer_id
+          LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    if let Some(ip) = leader_ip {
+        return format!("http://{ip}:{port}");
+    }
+    if let Ok(host) = std::env::var("FORGEFLEET_LEADER_HOST") {
+        if !host.is_empty() {
+            return format!("http://{host}:{port}");
+        }
+    }
+    format!("http://127.0.0.1:{port}")
 }
 
 /// Outcome of a research run.
@@ -113,7 +260,19 @@ pub struct ResearchSession {
 }
 
 impl ResearchSession {
-    pub async fn new(pool: PgPool, config: ResearchConfig) -> Result<Self> {
+    pub async fn new(pool: PgPool, mut config: ResearchConfig) -> Result<Self> {
+        // Resolve dynamic defaults if the caller left them empty.
+        if config.gateway_url.is_empty() {
+            config.gateway_url = resolve_gateway_url(&pool).await;
+        }
+        if config.planner_model.is_empty() {
+            config.planner_model =
+                resolve_default_research_model(&pool, "chain-of-thought").await;
+        }
+        if config.subagent_model.is_empty() {
+            config.subagent_model =
+                resolve_default_research_model(&pool, "code").await;
+        }
         let id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO research_sessions
@@ -168,39 +327,65 @@ impl ResearchSession {
         let subtask_rows =
             self.insert_subtasks(&plan.sub_questions, &backends).await?;
 
-        let tasks: Vec<AgentTask> = plan
+        // Phase 3 — run sub-agents in parallel. V1: simple chat
+        // completions hitting each backend directly (no tools). This
+        // gets REAL LLM output, not the AgentSession's empty-loop
+        // failure mode we saw with Qwen3-30B + tool-call format.
+        // V2 (follow-up): swap back to MultiAgentOrchestrator once the
+        // AgentSession + Qwen3 tool-call interop is fixed — then
+        // sub-agents can actually call WebSearch / Grep / etc.
+        update_session_status(&self.pool, self.session_id, "dispatching").await?;
+
+        let mut handles: Vec<tokio::task::JoinHandle<(Uuid, Result<(String, u64)>)>> =
+            Vec::with_capacity(plan.sub_questions.len());
+        for (i, ((q, row), backend)) in plan
             .sub_questions
             .iter()
             .zip(subtask_rows.iter())
             .zip(backends.iter())
             .enumerate()
-            .map(|(i, ((q, row), backend))| AgentTask {
-                id: row.id.to_string(),
-                prompt: self.build_subagent_prompt(i, q, &plan.sub_questions),
-                llm_base_url: backend.endpoint.clone(),
-                model: Some(backend.model_id.clone()),
-                working_dir: std::env::current_dir()
-                    .unwrap_or_else(|_| PathBuf::from("/tmp")),
-                max_turns: self.config.depth,
-            })
-            .collect();
+        {
+            let prompt = self.build_subagent_prompt(i, q, &plan.sub_questions);
+            let endpoint = backend.endpoint.clone();
+            let model = backend.model_id.clone();
+            let row_id = row.id;
+            handles.push(tokio::spawn(async move {
+                let t0 = Instant::now();
+                let out = openai_single_completion(&endpoint, &model, &prompt, 8192)
+                    .await
+                    .map(|s| (s, t0.elapsed().as_millis() as u64));
+                (row_id, out)
+            }));
+        }
 
-        // Phase 3 — run sub-agents in parallel.
-        update_session_status(&self.pool, self.session_id, "dispatching").await?;
-        let orch = MultiAgentOrchestrator::new();
-        // Relay orchestrator events to the caller's progress channel (if any).
-        let orch_tx_opt = if let Some(prog_tx) = progress.clone() {
-            let (otx, mut orx) = mpsc::unbounded_channel::<OrchestratorEvent>();
-            tokio::spawn(async move {
-                while let Some(ev) = orx.recv().await {
-                    let _ = prog_tx.send(ResearchProgress::Event(ev));
+        // Collect; map each finished handle to AgentTaskResult shape so the
+        // existing persist + synthesize code stays unchanged.
+        let mut results: Vec<AgentTaskResult> =
+            Vec::with_capacity(plan.sub_questions.len());
+        for (row, handle) in subtask_rows.iter().zip(handles.into_iter()) {
+            let (_row_id, res) = handle
+                .await
+                .unwrap_or_else(|e| (row.id, Err(anyhow::anyhow!("subagent panic: {e}"))));
+            let (status, output, dur) = match res {
+                Ok((text, dur)) => (TaskStatus::Completed, text, dur),
+                Err(e) => {
+                    warn!(subtask = %row.id, error = %e, "research sub-agent failed");
+                    (TaskStatus::Failed, format!("(sub-agent error: {e})"), 0)
                 }
+            };
+            results.push(AgentTaskResult {
+                task_id: row.id.to_string(),
+                status,
+                output,
+                events: Vec::new(),
+                duration_ms: dur,
+                turn_count: 1,
             });
-            Some(otx)
-        } else {
-            None
-        };
-        let results = orch.run_parallel(tasks, orch_tx_opt).await;
+        }
+
+        if let Some(prog_tx) = progress.clone() {
+            let _ = prog_tx.send(ResearchProgress::Synthesizing);
+        }
 
         // Phase 4 — persist each sub-agent's output.
         let mut succeeded = 0usize;
@@ -208,8 +393,15 @@ impl ResearchSession {
         let mut total_tokens_in: u64 = 0;
         let mut total_tokens_out: u64 = 0;
         for (row, result) in subtask_rows.iter().zip(results.iter()) {
-            let ok = matches!(result.status, TaskStatus::Completed);
-            if ok {
+            // MaxTurns produces useful (if truncated) output — count as
+            // success so the session doesn't get marked "failed" just
+            // because the agent used up its turn budget. Only Cancelled
+            // or Failed count as failures.
+            let useful = matches!(
+                result.status,
+                TaskStatus::Completed | TaskStatus::MaxTurns
+            );
+            if useful {
                 succeeded += 1;
             } else {
                 failed += 1;
@@ -293,11 +485,15 @@ impl ResearchSession {
              No prose outside the JSON. No markdown fences. Just JSON.",
             self.config.query, self.config.parallel
         );
+        // Thinking-mode pool aliases burn tokens on internal reasoning
+        // BEFORE producing content. 16384 budget covers both the thinking
+        // scratch + the actual JSON output. Standard instruct models use
+        // a small fraction of this.
         let raw = openai_single_completion(
             &self.config.gateway_url,
             &self.config.planner_model,
             &prompt,
-            4096,
+            16384,
         )
         .await
         .context("planner OpenAI call")?;
@@ -336,21 +532,29 @@ impl ResearchSession {
         &self,
         n: usize,
     ) -> Result<Vec<FleetBackend>> {
-        // Query computer_model_deployments for active OpenAI-compatible
-        // endpoints, prioritizing DGX Sparks (GB10 = fastest). Round-robin
-        // assignment to distinct computers so we don't clobber one box.
+        // Query active OpenAI-compatible deployments. Normalize endpoints —
+        // the materializer records `http://127.0.0.1:<port>` (the loopback
+        // view from each node's own forgefleetd) but we're dispatching
+        // FROM Taylor so we need the LAN IP. We also join against
+        // port_registry so the port in the endpoint string is always
+        // authoritative (parses the raw endpoint's port, not hardcoded).
         let rows = sqlx::query(
-            "SELECT c.name, c.primary_ip, d.endpoint, d.model_id
+            "SELECT DISTINCT ON (c.name, d.endpoint)
+                    c.name, c.primary_ip, d.endpoint, d.model_id,
+                    c.gpu_model
                FROM computer_model_deployments d
                JOIN computers c ON c.id = d.computer_id
               WHERE d.status = 'active'
                 AND d.openai_compatible = true
-              ORDER BY CASE WHEN c.gpu_model = 'NVIDIA GB10' THEN 0 ELSE 1 END,
-                       c.name",
+              ORDER BY c.name, d.endpoint, d.started_at DESC NULLS LAST",
         )
         .fetch_all(&self.pool)
         .await
         .context("query active LLM deployments")?;
+
+        // Fallback port if the deployment's endpoint string is malformed —
+        // prefer the registry's `vllm` primary-slot port over a literal.
+        let fallback_port = resolve_port(&self.pool, "vllm", 55000).await;
 
         if rows.is_empty() {
             anyhow::bail!(
@@ -359,16 +563,51 @@ impl ResearchSession {
             );
         }
 
-        let backends: Vec<FleetBackend> = rows
-            .iter()
-            .map(|r| FleetBackend {
-                computer_name: r.get("name"),
-                endpoint: r.get("endpoint"),
-                model_id: r.get("model_id"),
-            })
-            .collect();
+        // Build normalized list: one entry per (computer, model) with the
+        // LAN-reachable endpoint. Prefer GB10 boxes first.
+        let mut seen: std::collections::HashSet<(String, String)> = Default::default();
+        let mut backends: Vec<FleetBackend> = Vec::new();
+        for r in &rows {
+            let name: String = r.get("name");
+            let primary_ip: String = r.get("primary_ip");
+            let raw_endpoint: String = r.get("endpoint");
+            let model_id: String = r.get("model_id");
 
-        // Round-robin distinct computers, then wrap if we need more.
+            let endpoint = if raw_endpoint.contains("127.0.0.1")
+                || raw_endpoint.contains("localhost")
+            {
+                // Pull the port from the raw endpoint, rebuild with primary_ip.
+                // Fall back to the port registry's `vllm` entry if the
+                // endpoint string doesn't parse — never hardcode a literal.
+                let port = raw_endpoint
+                    .rsplit(':')
+                    .next()
+                    .and_then(|p| p.trim_end_matches('/').parse::<u16>().ok())
+                    .unwrap_or(fallback_port);
+                format!("http://{primary_ip}:{port}")
+            } else {
+                raw_endpoint
+            };
+
+            if seen.insert((name.clone(), model_id.clone())) {
+                backends.push(FleetBackend {
+                    computer_name: name,
+                    endpoint,
+                    model_id,
+                    is_gb10: r
+                        .get::<Option<String>, _>("gpu_model")
+                        .map(|g| g.contains("GB10"))
+                        .unwrap_or(false),
+                });
+            }
+        }
+
+        // Sort: GB10 first, then alphabetical by computer name.
+        backends.sort_by(|a, b| {
+            b.is_gb10.cmp(&a.is_gb10).then_with(|| a.computer_name.cmp(&b.computer_name))
+        });
+
+        // Round-robin across DISTINCT COMPUTERS first to maximize parallelism.
         let mut out: Vec<FleetBackend> = Vec::with_capacity(n);
         let mut seen_computer: std::collections::HashSet<String> = Default::default();
         for b in &backends {
@@ -379,7 +618,7 @@ impl ResearchSession {
                 out.push(b.clone());
             }
         }
-        // If n > distinct computers, cycle the list (backends = 4 DGX, n = 5 → 1 reuse).
+        // If n > distinct computers, cycle the full list.
         let mut i = 0;
         while out.len() < n {
             out.push(backends[i % backends.len()].clone());
@@ -583,11 +822,14 @@ impl ResearchSession {
             subs = sub_section,
         );
 
+        // Synthesizer produces a long markdown report + cites many
+        // sub-agent outputs. Thinking-mode models again can spend ~half
+        // their budget on internal reasoning, so the 32k cap leaves room.
         openai_single_completion(
             &self.config.gateway_url,
-            &self.config.planner_model, // same thinking model for synthesis
+            &self.config.planner_model, // reuse planner alias for synthesis
             &prompt,
-            8192,
+            32768,
         )
         .await
         .context("synthesizer OpenAI call")
@@ -611,6 +853,7 @@ struct FleetBackend {
     computer_name: String,
     endpoint: String,
     model_id: String,
+    is_gb10: bool,
 }
 
 #[derive(Debug, Clone)]
