@@ -3,6 +3,10 @@ pub mod agent_loop;
 pub mod agent_roles;
 pub mod research;
 pub mod auto_upgrade;
+
+/// Re-export of the panic-hook module that lives in `ff-core`. Keeps
+/// existing call sites (`ff_agent::panic_hook::install()`) working.
+pub use ff_core::panic_hook;
 pub mod sub_agent_reaper;
 pub mod bash_security;
 pub mod brain;

@@ -1439,6 +1439,11 @@ enum EventsCommand {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // V43: install the panic capture hook BEFORE anything else, so any
+    // panic in our own code gets queued for the next pulse beat to
+    // report to the leader's fleet_bug_reports.
+    ff_agent::panic_hook::install();
+
     let cli = Cli::parse();
     let config_path = resolve_config_path(cli.config)?;
 

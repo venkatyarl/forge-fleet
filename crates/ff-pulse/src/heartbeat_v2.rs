@@ -96,6 +96,24 @@ impl HeartbeatV2Publisher {
         beat.election_priority = self.election_priority;
         beat.timestamp = Utc::now();
 
+        // V43: drain any queued panics from the local panic_hook into the
+        // beat. Leader's materializer deduplicates into fleet_bug_reports.
+        let captured = ff_core::panic_hook::drain();
+        if !captured.is_empty() {
+            beat.encountered_bugs = captured
+                .into_iter()
+                .map(|b| crate::beat_v2::EncounteredBug {
+                    signature: b.signature,
+                    file_path: b.file_path,
+                    line_number: b.line_number,
+                    error_class: b.error_class,
+                    stack_excerpt: b.stack_excerpt,
+                    binary_version: b.binary_version,
+                    tier: b.tier,
+                })
+                .collect();
+        }
+
         // ── Hardware + memory snapshot ─────────────────────────────────────
         let mut sys = System::new_all();
         sys.refresh_all();

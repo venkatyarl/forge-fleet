@@ -22,6 +22,7 @@ pub mod leader;
 pub mod maintenance;
 pub mod monitor;
 pub mod node;
+pub mod panic_hook;
 pub mod notifications;
 pub mod quarantine;
 pub mod run_limits;
