@@ -342,13 +342,21 @@ fn render_left_sidebar(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) 
                 Span::styled(&node.name, Style::default().fg(theme.fg).add_modifier(Modifier::BOLD)),
             ]));
             for model in &node.models {
+                // Green dot = API responding, red = port down / not yet up.
                 let (icon, color) = if model.online {
                     ("●", Color::Rgb(74, 222, 128))
                 } else {
                     ("○", Color::Rgb(248, 113, 113))
                 };
+                // Display format: `{port}:{model}` — host is the parent
+                // header above, so we don't repeat it on every row.
+                // Example: "55000:qwen3-coder-30b"
                 lines.push(Line::from(vec![
                     Span::styled(format!("   {icon} "), Style::default().fg(color)),
+                    Span::styled(
+                        format!("{}:", model.port),
+                        Style::default().fg(Color::Rgb(100, 116, 139)),
+                    ),
                     Span::styled(&model.name, Style::default().fg(Color::Rgb(148, 163, 184))),
                 ]));
             }

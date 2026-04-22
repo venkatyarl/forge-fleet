@@ -405,6 +405,31 @@ async fn fleet_nodes_from_db() -> Vec<FleetNode> {
     let deployments = ff_db::pg_list_deployments(&pool, None).await.unwrap_or_default();
     let legacy_models = ff_db::pg_list_models(&pool).await.unwrap_or_default();
 
+    // Strip legacy `{runtime}:{model_id}` prefixes so the fleet panel shows
+    // clean model names. Keeps "gemma-4-31b-it-4bit" etc. readable rather
+    // than showing "unknown:gemma-4-31b-it-4bit". Runtime is redundant
+    // with the fleet node's declared runtime and clutters the line.
+    fn clean_model_name(raw: &str) -> String {
+        const RUNTIME_PREFIXES: &[&str] = &[
+            "unknown:", "mlx:", "mlx_lm:", "llama.cpp:", "vllm:", "ollama:",
+            "deploy:",
+        ];
+        let mut s = raw.trim().to_string();
+        for p in RUNTIME_PREFIXES {
+            if let Some(rest) = s.strip_prefix(p) {
+                s = rest.trim().to_string();
+                break;
+            }
+        }
+        // Defensive: if we stripped everything and the remainder is just
+        // digits (was "deploy:55000"), return "port-55000" instead so the
+        // user can still tell what it is.
+        if s.chars().all(|c| c.is_ascii_digit()) && !s.is_empty() {
+            return format!("port-{}", s);
+        }
+        s
+    }
+
     nodes
         .into_iter()
         .map(|n| {
@@ -413,9 +438,15 @@ async fn fleet_nodes_from_db() -> Vec<FleetNode> {
                 .iter()
                 .filter(|d| d.node_name == n.name)
                 .map(|d| NodeModel {
-                    name: d.catalog_id.clone().unwrap_or_else(|| format!("deploy:{}", d.port)),
+                    // Clean display: prefer the runtime-reported model id,
+                    // fall back to just the port. Strip any "unknown:" /
+                    // "deploy:" prefix that predates the V14 rework of
+                    // fleet_models. Final format per-line is port:model.
+                    name: d.catalog_id
+                        .as_deref()
+                        .map(clean_model_name)
+                        .unwrap_or_else(|| format!("port-{}", d.port)),
                     port: d.port as u16,
-                    // TUI health loop will overwrite this; use DB status as initial guess.
                     online: d.health_status == "healthy",
                     context_window: d.context_window.unwrap_or(32_768) as usize,
                     tokens_used: d.tokens_used as usize,
@@ -427,7 +458,7 @@ async fn fleet_nodes_from_db() -> Vec<FleetNode> {
                     .iter()
                     .filter(|m| m.node_name == n.name)
                     .map(|m| NodeModel {
-                        name: m.name.clone(),
+                        name: clean_model_name(&m.name),
                         port: m.port as u16,
                         online: false,
                         context_window: 32_768,

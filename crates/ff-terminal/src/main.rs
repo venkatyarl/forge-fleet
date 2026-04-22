@@ -1738,7 +1738,19 @@ async fn run_tui(config: AgentSessionConfig) -> Result<()> {
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    // Mouse capture is OPT-IN to preserve native terminal text selection.
+    // When capture is on, the terminal emulator forwards mouse events to
+    // the TUI and native click-drag-to-select stops working — making it
+    // impossible to copy text. Default is OFF. Set FF_MOUSE_CAPTURE=1 to
+    // re-enable (needed only for widgets that consume mouse events).
+    let want_mouse = std::env::var("FF_MOUSE_CAPTURE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if want_mouse {
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    } else {
+        execute!(stdout, EnterAlternateScreen)?;
+    }
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -1775,7 +1787,15 @@ async fn run_tui(config: AgentSessionConfig) -> Result<()> {
     let result = run_event_loop(&mut terminal, &mut app, config, &commands, &command_list).await;
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+    // Only DisableMouseCapture if we actually enabled it at startup. Issuing
+    // DisableMouseCapture when capture was never enabled is harmless on most
+    // terminals but emits stray escape codes on a few (kitty, some older
+    // xterm builds).
+    if want_mouse {
+        execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+    } else {
+        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    }
     terminal.show_cursor()?;
     result
 }
