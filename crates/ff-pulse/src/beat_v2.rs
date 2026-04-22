@@ -46,6 +46,20 @@ pub struct PulseBeatV2 {
     pub db_topology: DbTopology,
     /// Leader-only: the config version this node is serving.
     pub config_version: Option<u64>,
+    /// V43+: multi-host deployment participation (ray clusters, NFS mounts).
+    /// Absent on single-host-only daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multi_host_participation: Option<MultiHostParticipation>,
+    /// V43+: bugs/panics this daemon hit since its last beat, to be
+    /// aggregated by the leader into `fleet_bug_reports`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub encountered_bugs: Vec<EncounteredBug>,
+    /// V43+: compact snapshot of tasks this daemon is actively working on
+    /// or waiting on. Reported so the leader/CLI/TUI/web can show a
+    /// fleet-wide task view. Individual task details live in the authoritative
+    /// `fleet_tasks` table (forthcoming V44); this field is a liveness hint.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub local_tasks: Vec<LocalTaskSnapshot>,
 }
 
 // -----------------------------------------------------------------------------
@@ -62,8 +76,19 @@ pub struct NetworkInfo {
 pub struct Ip {
     pub iface: String,
     pub ip: String,
-    /// `"v4"` | `"v6"` | `"loopback"` | etc.
+    /// `"v4"` | `"v6"` | `"loopback"` | `"cx7-fabric"` | `"ib-fabric"` |
+    /// `"roce-fabric"` | `"tailscale"` | `"public"` | `"lan"`.
+    /// Fabric kinds (`*-fabric`) are private to a paired-host link — never
+    /// route API traffic to them; they're plumbing for NCCL / ray / etc.
     pub kind: String,
+    /// For fabric-kind IPs, the name of the computer on the other end of
+    /// the private link. Used by the materializer to auto-upsert a
+    /// `fabric_pairs` row when both sides claim each other.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paired_with: Option<String>,
+    /// Physical link speed in Gbps, if known (from ethtool or similar).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_speed_gbps: Option<u32>,
 }
 
 // -----------------------------------------------------------------------------
@@ -257,6 +282,95 @@ pub struct DbTopology {
 }
 
 // -----------------------------------------------------------------------------
+// V43: multi-host deployment participation + bug reporting
+// -----------------------------------------------------------------------------
+
+/// Reports cross-host resources this daemon participates in — ray clusters
+/// it's a member of, shared NFS mounts consumed, etc. Empty by default;
+/// filled in by the heartbeat collector when it detects these locally.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MultiHostParticipation {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ray_clusters: Vec<RayClusterMembership>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shared_mounts: Vec<SharedMountInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RayClusterMembership {
+    /// Matches `llm_clusters.id` in Postgres.
+    pub cluster_id: String,
+    /// `"head"` | `"worker"` | `"standalone"`.
+    pub role: String,
+    /// Head node's ray GCS endpoint, e.g. `"10.42.0.1:6379"`.
+    pub head_endpoint: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SharedMountInfo {
+    /// Matches `shared_volumes.name`.
+    pub volume_name: String,
+    /// Name of the computer exporting the share.
+    pub export_host: String,
+    /// Where this computer has the share mounted, e.g. `/home/sia/models`.
+    pub local_path: String,
+    /// `"nfs4"` | `"sshfs"` | `"ceph"` | ...
+    pub protocol: String,
+}
+
+/// A single bug / panic this daemon hit since its last beat. The leader
+/// deduplicates by `signature` into `fleet_self_heal_queue` per
+/// `self-heal-coordination.md`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EncounteredBug {
+    /// Stable hash of `(file_path, line, error_class)` — identical across
+    /// daemons that hit the same bug so the leader can count occurrences.
+    pub signature: String,
+    pub file_path: Option<String>,
+    pub line_number: Option<u32>,
+    /// Coarse taxonomy: `"panic:str_index"`, `"cargo:type_mismatch"`,
+    /// `"runtime:nccl"`, `"vllm:cutlass_scaled_mm"`, etc.
+    pub error_class: String,
+    /// Truncated stack excerpt (chars-bounded, not bytes, to avoid the same
+    /// utf8 panic we're instrumenting).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stack_excerpt: Option<String>,
+    /// `ff --version` value when this bug was hit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary_version: Option<String>,
+    /// Severity tier per plan. Defaults to `"T1"` (auto-fix-eligible crashes).
+    #[serde(default = "default_tier")]
+    pub tier: String,
+}
+
+fn default_tier() -> String {
+    "T1".to_string()
+}
+
+/// A compact task snapshot for the beat. Full detail lives in `fleet_tasks`
+/// (V44); this is a liveness hint so the operator sees what each daemon is
+/// actively doing without hitting the DB.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalTaskSnapshot {
+    /// UUID referencing `fleet_tasks.id`, or a local-only id for tasks
+    /// that haven't been promoted to the fleet queue yet.
+    pub task_id: String,
+    /// `"code_fix"` | `"research_subtask"` | `"model_benchmark"` |
+    /// `"self_heal_writer"` | `"self_heal_reviewer"` | `"user_session"` etc.
+    pub task_type: String,
+    /// Human-readable one-liner. Kept short (< 200 chars) for beat size.
+    pub summary: String,
+    /// `"pending"` | `"running"` | `"awaiting_peer"` | `"awaiting_review"` |
+    /// `"blocked"` | `"completing"`.
+    pub status: String,
+    pub progress_pct: Option<f32>,
+    /// Latest progress message this daemon recorded. Small (< 120 chars).
+    pub progress_message: Option<String>,
+    /// When it started on this daemon.
+    pub started_at: Option<DateTime<Utc>>,
+}
+
+// -----------------------------------------------------------------------------
 // Skeleton builder
 // -----------------------------------------------------------------------------
 
@@ -339,6 +453,9 @@ impl PulseBeatV2 {
                 redis_replicas: Vec::new(),
             },
             config_version: None,
+            multi_host_participation: None,
+            encountered_bugs: Vec::new(),
+            local_tasks: Vec::new(),
         }
     }
 }

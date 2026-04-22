@@ -421,6 +421,8 @@ fn detect_all_ips() -> Vec<Ip> {
                             iface: current_iface.clone(),
                             ip: ip.to_string(),
                             kind,
+                            paired_with: None,
+                            link_speed_gbps: None,
                         });
                     }
                 }
@@ -440,6 +442,8 @@ fn detect_all_ips() -> Vec<Ip> {
                             iface: iface.to_string(),
                             ip: addr.to_string(),
                             kind,
+                            paired_with: None,
+                            link_speed_gbps: None,
                         });
                     }
                 }
