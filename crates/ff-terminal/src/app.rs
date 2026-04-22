@@ -201,6 +201,10 @@ pub struct FleetNode {
 #[derive(Debug, Clone)]
 pub struct NodeModel {
     pub name: String,
+    /// Runtime engine serving this model: "mlx", "llama.cpp", "vllm",
+    /// "mlx_lm", "ollama", or "unknown". Shown as the prefix in the
+    /// fleet panel line: `{runtime}:{port}: {short_name}`.
+    pub runtime: String,
     pub port: u16,
     pub online: bool,
     pub context_window: usize,
@@ -405,26 +409,70 @@ async fn fleet_nodes_from_db() -> Vec<FleetNode> {
     let deployments = ff_db::pg_list_deployments(&pool, None).await.unwrap_or_default();
     let legacy_models = ff_db::pg_list_models(&pool).await.unwrap_or_default();
 
-    // Strip legacy `{runtime}:{model_id}` prefixes so the fleet panel shows
-    // clean model names. Keeps "gemma-4-31b-it-4bit" etc. readable rather
-    // than showing "unknown:gemma-4-31b-it-4bit". Runtime is redundant
-    // with the fleet node's declared runtime and clutters the line.
-    fn clean_model_name(raw: &str) -> String {
-        const RUNTIME_PREFIXES: &[&str] = &[
-            "unknown:", "mlx:", "mlx_lm:", "llama.cpp:", "vllm:", "ollama:",
-            "deploy:",
+    // Extract (runtime, model_id) from a raw "{runtime}:{model}" string.
+    // Legacy `fleet_models.name` was stored with this prefix; new V14
+    // `computer_model_deployments` has a separate runtime column, but we
+    // still keep this parser for the fallback path.
+    fn split_runtime(raw: &str) -> (Option<String>, String) {
+        const KNOWN_RUNTIMES: &[&str] = &[
+            "mlx", "mlx_lm", "MLX", "llama.cpp", "LLAMA.CPP", "vllm", "VLLM",
+            "ollama", "unknown",
         ];
-        let mut s = raw.trim().to_string();
-        for p in RUNTIME_PREFIXES {
-            if let Some(rest) = s.strip_prefix(p) {
-                s = rest.trim().to_string();
-                break;
+        let raw = raw.trim();
+        for rt in KNOWN_RUNTIMES {
+            let p = format!("{}:", rt);
+            if let Some(rest) = raw.strip_prefix(&p) {
+                return (Some(rt.to_string()), rest.trim().to_string());
             }
         }
-        // Defensive: if we stripped everything and the remainder is just
-        // digits (was "deploy:55000"), return "port-55000" instead so the
-        // user can still tell what it is.
-        if s.chars().all(|c| c.is_ascii_digit()) && !s.is_empty() {
+        // Old placeholder like "deploy:55000" — no runtime, treat name as-is.
+        if let Some(rest) = raw.strip_prefix("deploy:") {
+            return (None, rest.trim().to_string());
+        }
+        (None, raw.to_string())
+    }
+
+    // Shorten model file names for display. Strips common quantization +
+    // file-format suffixes so "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf"
+    // shows as "Qwen3-Coder-30B-A3B-Instruct". Caps at 40 chars to keep
+    // the fleet panel line readable.
+    fn short_model_name(raw: &str) -> String {
+        let mut s = raw.trim().to_string();
+        // Drop file extensions first.
+        for ext in [".gguf", ".safetensors", ".bin", ".ggml"] {
+            if let Some(rest) = s.strip_suffix(ext) {
+                s = rest.to_string();
+            }
+        }
+        // Drop trailing quantization / precision markers. Case-insensitive.
+        let quants = [
+            "-Q2_K", "-Q3_K_S", "-Q3_K_M", "-Q3_K_L",
+            "-Q4_0", "-Q4_K_S", "-Q4_K_M", "-Q5_0", "-Q5_K_S", "-Q5_K_M",
+            "-Q6_K", "-Q8_0",
+            "-F16", "-FP16", "-FP8", "-BF16",
+            "-UD-Q4_K_M", "-UD",
+            "-4bit", "-8bit",
+        ];
+        loop {
+            let lower = s.to_lowercase();
+            let mut changed = false;
+            for q in &quants {
+                let qlow = q.to_lowercase();
+                if lower.ends_with(&qlow) {
+                    s.truncate(s.len() - q.len());
+                    changed = true;
+                    break;
+                }
+            }
+            if !changed { break; }
+        }
+        // Cap at 40 chars.
+        if s.chars().count() > 40 {
+            s = s.chars().take(37).collect::<String>() + "…";
+        }
+        // Defensive: if we have nothing meaningful (e.g. all digits like
+        // "55000"), fall back to a marker.
+        if s.is_empty() || s.chars().all(|c| c.is_ascii_digit()) {
             return format!("port-{}", s);
         }
         s
@@ -437,19 +485,30 @@ async fn fleet_nodes_from_db() -> Vec<FleetNode> {
             let mut node_models: Vec<NodeModel> = deployments
                 .iter()
                 .filter(|d| d.node_name == n.name)
-                .map(|d| NodeModel {
-                    // Clean display: prefer the runtime-reported model id,
-                    // fall back to just the port. Strip any "unknown:" /
-                    // "deploy:" prefix that predates the V14 rework of
-                    // fleet_models. Final format per-line is port:model.
-                    name: d.catalog_id
-                        .as_deref()
-                        .map(clean_model_name)
-                        .unwrap_or_else(|| format!("port-{}", d.port)),
-                    port: d.port as u16,
-                    online: d.health_status == "healthy",
-                    context_window: d.context_window.unwrap_or(32_768) as usize,
-                    tokens_used: d.tokens_used as usize,
+                .map(|d| {
+                    // Prefer the deployment's explicit `runtime` column
+                    // (V14+); if the catalog_id still carries an old
+                    // "runtime:model" prefix, split that out. Never lose
+                    // runtime info — it's the prefix the operator sees.
+                    let (parsed_rt, raw_name) = match d.catalog_id.as_deref() {
+                        Some(cid) => split_runtime(cid),
+                        None => (None, format!("port-{}", d.port)),
+                    };
+                    let runtime = parsed_rt.unwrap_or_else(|| {
+                        if d.runtime.trim().is_empty() {
+                            "unknown".to_string()
+                        } else {
+                            d.runtime.clone()
+                        }
+                    });
+                    NodeModel {
+                        name: short_model_name(&raw_name),
+                        runtime,
+                        port: d.port as u16,
+                        online: d.health_status == "healthy",
+                        context_window: d.context_window.unwrap_or(32_768) as usize,
+                        tokens_used: d.tokens_used as usize,
+                    }
                 })
                 .collect();
             // If nothing deployed, show legacy fleet_models entries (existing pattern pre-V11).
@@ -457,12 +516,16 @@ async fn fleet_nodes_from_db() -> Vec<FleetNode> {
                 node_models = legacy_models
                     .iter()
                     .filter(|m| m.node_name == n.name)
-                    .map(|m| NodeModel {
-                        name: clean_model_name(&m.name),
-                        port: m.port as u16,
-                        online: false,
-                        context_window: 32_768,
-                        tokens_used: 0,
+                    .map(|m| {
+                        let (parsed_rt, raw_name) = split_runtime(&m.name);
+                        NodeModel {
+                            name: short_model_name(&raw_name),
+                            runtime: parsed_rt.unwrap_or_else(|| "unknown".to_string()),
+                            port: m.port as u16,
+                            online: false,
+                            context_window: 32_768,
+                            tokens_used: 0,
+                        }
                     })
                     .collect();
             }

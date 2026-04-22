@@ -359,7 +359,12 @@ impl Command for ModelsCommand {
                     }
                 }
                 if by_name.is_empty() {
-                    return "No models registered in fleet database.".to_string();
+                    return "No entries in the model catalog (V39 retired the TOML seed).\n\n\
+                            • `/deployments` — what's actually running on each fleet member\n\
+                            • `/fleet` — fleet overview (nodes + their running models)\n\
+                            • `ff model catalog add <id>` — curate a model into the catalog\n\
+                            • `ff model deployments` — same as /deployments but from CLI"
+                        .to_string();
                 }
                 let mut out = String::new();
                 out.push_str(&format!("Available models ({} unique, {} total across fleet):\n\n", by_name.len(), snapshot.models.len()));

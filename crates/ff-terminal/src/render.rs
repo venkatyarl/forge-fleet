@@ -348,13 +348,14 @@ fn render_left_sidebar(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) 
                 } else {
                     ("○", Color::Rgb(248, 113, 113))
                 };
-                // Display format: `{port}:{model}` — host is the parent
-                // header above, so we don't repeat it on every row.
-                // Example: "55000:qwen3-coder-30b"
+                // Display format: `{runtime}:{port}: {model}` — host is
+                // the parent header above; each row tells the operator
+                // what engine is serving, on which port, and which model.
+                // Example: "llama.cpp:55000: Qwen3-Coder-30B"
                 lines.push(Line::from(vec![
                     Span::styled(format!("   {icon} "), Style::default().fg(color)),
                     Span::styled(
-                        format!("{}:", model.port),
+                        format!("{}:{}: ", model.runtime, model.port),
                         Style::default().fg(Color::Rgb(100, 116, 139)),
                     ),
                     Span::styled(&model.name, Style::default().fg(Color::Rgb(148, 163, 184))),
