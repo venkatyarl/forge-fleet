@@ -172,9 +172,11 @@ fn build_stop_command(os_family: &str) -> String {
                 .to_string()
         }
         _ => {
-            // Linux / DGX — user systemd units.
-            "systemctl --user stop forgefleet-node.service forgefleet-daemon.service 2>/dev/null; \
-             systemctl --user stop forgefleet-node.service 2>/dev/null; \
+            // Linux / DGX — user systemd units. SSH sessions need XDG_RUNTIME_DIR
+            // set or `systemctl --user` silently no-ops.
+            "export XDG_RUNTIME_DIR=/run/user/$(id -u); \
+             export DBUS_SESSION_BUS_ADDRESS=unix:path=$XDG_RUNTIME_DIR/bus; \
+             systemctl --user stop forgefleetd.service forgefleet-node.service forgefleet-daemon.service 2>/dev/null; \
              echo stopped"
                 .to_string()
         }
@@ -192,8 +194,12 @@ fn build_start_command(os_family: &str) -> String {
                 .to_string()
         }
         _ => {
-            "systemctl --user start forgefleet-node.service forgefleet-daemon.service 2>/dev/null; \
-             systemctl --user start forgefleet-node.service 2>/dev/null; \
+            "export XDG_RUNTIME_DIR=/run/user/$(id -u); \
+             export DBUS_SESSION_BUS_ADDRESS=unix:path=$XDG_RUNTIME_DIR/bus; \
+             systemctl --user reset-failed forgefleetd.service forgefleet-node.service forgefleet-daemon.service 2>/dev/null; \
+             systemctl --user start forgefleetd.service 2>/dev/null \
+                 || systemctl --user start forgefleet-node.service 2>/dev/null \
+                 || systemctl --user start forgefleet-daemon.service 2>/dev/null; \
              echo started"
                 .to_string()
         }

@@ -119,14 +119,22 @@ impl LocalHealer {
                 output.status.code().unwrap_or(-1)
             ))
         } else {
-            let output = tokio::process::Command::new("systemctl")
-                .arg("--user")
-                .arg("restart")
-                .arg("forgefleet-node.service")
+            // Installed unit is `forgefleetd.service`; old `forgefleet-node.service`
+            // kept as a fallback. `reset-failed` clears any StartLimitBurst trip
+            // from a prior SIGTERM storm.
+            let script = "\
+                export XDG_RUNTIME_DIR=/run/user/$(id -u); \
+                export DBUS_SESSION_BUS_ADDRESS=unix:path=$XDG_RUNTIME_DIR/bus; \
+                systemctl --user reset-failed forgefleetd.service forgefleet-node.service 2>/dev/null; \
+                systemctl --user restart forgefleetd.service \
+                    || systemctl --user restart forgefleet-node.service";
+            let output = tokio::process::Command::new("sh")
+                .arg("-c")
+                .arg(script)
                 .output()
                 .await?;
             Ok(format!(
-                "systemctl --user restart forgefleet-node.service (exit={})",
+                "systemctl --user restart forgefleetd.service (exit={})",
                 output.status.code().unwrap_or(-1)
             ))
         }

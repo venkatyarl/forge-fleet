@@ -315,9 +315,23 @@ impl ReviveManager {
             }
             _ => {
                 // Linux / DGX: systemd user unit.
-                let restart_cmd = "systemctl --user restart forgefleet-node.service forgefleet-daemon.service \
+                //
+                // Headless SSH sessions need XDG_RUNTIME_DIR + DBUS set or
+                // `systemctl --user` silently no-ops (tripped the 2026-04-22
+                // DGX outage — 4 daemons dead 9+ hours, revive reported ✓).
+                //
+                // `reset-failed` clears StartLimitBurst trips (a SIGTERM
+                // storm during migration can trip systemd into permanent
+                // give-up). Installed unit name is `forgefleetd.service`.
+                // Old `forgefleet-node.service` kept as a fallback for
+                // nodes still on the pre-2026-04 unit layout.
+                let restart_cmd = "\
+                    export XDG_RUNTIME_DIR=/run/user/$(id -u); \
+                    export DBUS_SESSION_BUS_ADDRESS=unix:path=$XDG_RUNTIME_DIR/bus; \
+                    systemctl --user reset-failed forgefleetd.service forgefleet-node.service forgefleet-daemon.service 2>/dev/null; \
+                    systemctl --user restart forgefleetd.service \
                        || systemctl --user restart forgefleet-node.service \
-                       || true";
+                       || systemctl --user restart forgefleet-daemon.service";
                 let mut cmd = Command::new("ssh");
                 cmd.args(ssh_base_args(target.ssh_port))
                     .arg(format!("{}@{}", target.ssh_user, target.primary_ip))
