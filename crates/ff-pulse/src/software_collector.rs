@@ -371,10 +371,39 @@ impl SoftwareCollector {
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
+/// Build a PATH that always includes the user-level install dirs the
+/// daemon's inherited `$PATH` frequently omits. Systemd user units on
+/// Ubuntu get a minimal PATH (no `$HOME/.local/bin`, no `$HOME/.cargo/bin`),
+/// so `which ff` and `Command::new("ff")` silently fail to find binaries
+/// that `ff onboard` installed there. Noticed 2026-04-24 on sia/adele —
+/// both had ff+forgefleetd at ~/.local/bin/ but reported empty software
+/// inventory. Prepend the user dirs and keep the daemon's own PATH after.
+fn augmented_path() -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let mut parts: Vec<String> = vec![
+        format!("{home}/.local/bin"),
+        format!("{home}/.cargo/bin"),
+        "/opt/homebrew/bin".into(),
+        "/usr/local/bin".into(),
+        "/opt/bin".into(),
+    ];
+    let current = std::env::var("PATH").unwrap_or_default();
+    for p in current.split(':') {
+        if !p.is_empty() && !parts.iter().any(|e| e == p) {
+            parts.push(p.to_string());
+        }
+    }
+    parts.join(":")
+}
+
 /// Run a command and return trimmed stdout on success (non-empty only).
+/// The PATH is augmented with user-level bin dirs (`~/.local/bin`,
+/// `~/.cargo/bin`, etc.) so probes succeed even when the daemon inherited
+/// a minimal systemd PATH.
 fn run(cmd: &str, args: &[&str]) -> Option<String> {
     std::process::Command::new(cmd)
         .args(args)
+        .env("PATH", augmented_path())
         .output()
         .ok()
         .filter(|o| o.status.success())
@@ -387,7 +416,11 @@ fn run(cmd: &str, args: &[&str]) -> Option<String> {
 /// `--version`.
 #[allow(dead_code)]
 fn run_allow_nonzero(cmd: &str, args: &[&str]) -> Option<String> {
-    let out = std::process::Command::new(cmd).args(args).output().ok()?;
+    let out = std::process::Command::new(cmd)
+        .args(args)
+        .env("PATH", augmented_path())
+        .output()
+        .ok()?;
     let mut s = String::from_utf8_lossy(&out.stdout).to_string();
     if s.trim().is_empty() {
         s = String::from_utf8_lossy(&out.stderr).to_string();
@@ -410,6 +443,7 @@ fn run_python_version_probe(module: &str) -> Option<String> {
     let script = format!("import {module}; print({module}.__version__)");
     let output = std::process::Command::new("python3")
         .args(["-c", &script])
+        .env("PATH", augmented_path())
         .output()
         .ok()?;
     if !output.status.success() {
