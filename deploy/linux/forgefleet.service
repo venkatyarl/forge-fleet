@@ -49,11 +49,14 @@ WorkingDirectory=%h/.forgefleet
 # install.sh will rewrite this to the current user if 'forgefleet' doesn't exist.
 User=forgefleet
 
-# Auto-restart on crash
+# Auto-restart on crash. Tight StartLimitBurst (5/60s) tripped during
+# the 2026-04-22 DGX migration — a SIGTERM storm permanently gave-up
+# systemd on 4 daemons for 9+ hours. Looser cap: 100 restarts/hour,
+# which for a daemon supposed to be always-up is "effectively never".
 Restart=always
 RestartSec=5
-StartLimitIntervalSec=60
-StartLimitBurst=5
+StartLimitIntervalSec=3600
+StartLimitBurst=100
 
 # Environment
 Environment=RUST_LOG=info

@@ -36,8 +36,9 @@ EnvironmentFile=%h/.forgefleet/llama-rpc-server-%i.env
 ExecStart=/bin/sh -c '${LLAMACPP_PREFIX}/bin/rpc-server -H ${RPC_HOST} -p ${RPC_PORT}'
 Restart=always
 RestartSec=5
-StartLimitIntervalSec=60
-StartLimitBurst=5
+# See forgefleet.service — tight burst gate caused 9h DGX outage.
+StartLimitIntervalSec=3600
+StartLimitBurst=100
 
 # Logging
 StandardOutput=append:%h/.forgefleet/logs/llama-rpc-server-%i.log

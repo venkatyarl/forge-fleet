@@ -70,8 +70,9 @@ ExecStart=/bin/sh -c '${LLAMACPP_PREFIX}/bin/llama-server \
 
 Restart=always
 RestartSec=10
-StartLimitIntervalSec=120
-StartLimitBurst=3
+# See forgefleet.service — tight burst gate caused 9h DGX outage.
+StartLimitIntervalSec=3600
+StartLimitBurst=100
 
 # Logging — model load can emit MBs, append so we can review
 StandardOutput=append:%h/.forgefleet/logs/llama-server-%i.log

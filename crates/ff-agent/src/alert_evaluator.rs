@@ -507,6 +507,23 @@ async fn evaluate_current(
             let v = age.map(|(n,)| n as f64).unwrap_or(0.0);
             Ok((eval_numeric(cond, v), Some(v), None))
         }
+        "beat_age_secs" => {
+            // Per-computer pulse beat age, computed from computers.last_seen_at
+            // so the signal survives Redis TTL expiry (45s). Fires even when
+            // the beat key has vanished — exactly the scenario ODOWN quorum
+            // fails to catch when many peers die simultaneously.
+            let age: Option<(i64,)> = sqlx::query_as(
+                "SELECT EXTRACT(EPOCH FROM (NOW() - last_seen_at))::BIGINT
+                 FROM computers WHERE name = $1",
+            )
+            .bind(computer_name)
+            .fetch_optional(pg)
+            .await
+            .ok()
+            .flatten();
+            let v = age.map(|(n,)| n as f64).unwrap_or(0.0);
+            Ok((eval_numeric(cond, v), Some(v), None))
+        }
         _ => Ok((false, None, None)),
     }
 }

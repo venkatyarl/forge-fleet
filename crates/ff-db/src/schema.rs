@@ -4195,3 +4195,33 @@ CREATE INDEX IF NOT EXISTS idx_fleet_tasks_by_parent
     ON fleet_tasks(parent_task_id)
     WHERE parent_task_id IS NOT NULL;
 "#;
+
+// ─── V45: beat-age alert policies ──────────────────────────────────────────
+//
+// The existing `computer_offline` policy (V34) fires on `computer_status ==
+// 'odown'`, which requires a quorum of peers to CONCUR that the target is
+// sdown. On 2026-04-22 all 4 DGX daemons died simultaneously; the remaining
+// peers couldn't form a quorum that named any specific DGX as odown, so
+// the policy never fired during the 9-hour outage.
+//
+// `beat_age_secs` is a simpler signal: the age of `computers.last_seen_at`,
+// which survives Redis TTL expiry and fires per-computer regardless of
+// peer concurrence. The alert_evaluator handler for this metric was added
+// in the same commit.
+pub const SCHEMA_V45_BEAT_AGE_ALERTS: &str = r#"
+INSERT INTO alert_policies
+    (name, description, metric, scope, condition,
+     duration_secs, severity, cooldown_secs, channel, enabled)
+VALUES
+  ('member_stale_beat',
+   'Pulse beat older than 5 minutes — earlier signal than odown quorum',
+   'beat_age_secs', 'any_computer', '> 300',
+   300, 'warning', 1800, 'telegram', true),
+
+  ('member_beat_dead',
+   'Pulse beat older than 30 minutes — daemon presumed dead',
+   'beat_age_secs', 'any_computer', '> 1800',
+   60, 'critical', 600, 'telegram', true)
+
+ON CONFLICT (name) DO NOTHING;
+"#;
