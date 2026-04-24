@@ -819,10 +819,40 @@ fn resolve_node_name(cli: &Cli, config: &FleetConfig) -> String {
         return node_name.clone();
     }
 
+    // FORGEFLEET_NODE_NAME — the canonical identity override. Mirrors
+    // ff_agent::fleet_info::resolve_this_node_name (priority 1). The DGX
+    // outage of 2026-04-22 traced back to this check being absent here:
+    // the systemd unit set the env but main.rs ignored it, so every DGX
+    // fell through to `unknown-node` and pulse v2 refused to publish.
+    if let Ok(v) = std::env::var("FORGEFLEET_NODE_NAME") {
+        let t = v.trim();
+        if !t.is_empty() {
+            return t.to_string();
+        }
+    }
+
     if let Ok(hostname) = std::env::var("HOSTNAME")
         && !hostname.trim().is_empty()
     {
         return hostname;
+    }
+
+    // `hostname` shell command — systemd user services don't inherit
+    // $HOSTNAME, so this is the realistic Linux fallback. On a cleanly
+    // enrolled member the short hostname matches the `computers.name`
+    // row (taylor, sia, marcus, …).
+    if let Ok(out) = std::process::Command::new("hostname").output()
+        && out.status.success()
+    {
+        let name = String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .split('.')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if !name.is_empty() {
+            return name;
+        }
     }
 
     // Look for the gateway node (usually "taylor").
