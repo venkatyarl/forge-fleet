@@ -127,8 +127,15 @@ impl LlmProbe {
                 continue;
             }
 
-            let runtime = identify_runtime(port, &raw_body, &server_header, &model_id);
-            let (tokens_per_sec, queue_depth) = fetch_metrics(&client, port).await;
+            let (tokens_per_sec, queue_depth, metrics_runtime_hint) =
+                fetch_metrics(&client, port).await;
+            let runtime = identify_runtime(
+                port,
+                &raw_body,
+                &server_header,
+                &model_id,
+                metrics_runtime_hint,
+            );
 
             let display_name = model_id
                 .rsplit('/')
@@ -259,9 +266,22 @@ impl LlmProbe {
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
-fn identify_runtime(port: u16, body: &str, server_header: &str, model_id: &str) -> &'static str {
+fn identify_runtime(
+    port: u16,
+    body: &str,
+    server_header: &str,
+    model_id: &str,
+    metrics_hint: Option<&'static str>,
+) -> &'static str {
     if port == 11434 {
         return "ollama";
+    }
+    // /metrics-based detection is the most reliable signal we have:
+    // vllm exposes `vllm:*` metric names, llama.cpp exposes `llamacpp:*`.
+    // Use whatever the Prometheus scrape told us before falling back to
+    // header/body heuristics.
+    if let Some(hint) = metrics_hint {
+        return hint;
     }
     // llama.cpp advertises itself in the Server header and typically includes
     // .gguf paths in the /v1/models response.
@@ -313,16 +333,24 @@ fn extract_loaded_path(body: &str) -> Option<String> {
     }
 }
 
-async fn fetch_metrics(client: &reqwest::Client, port: u16) -> (f64, i32) {
+async fn fetch_metrics(
+    client: &reqwest::Client,
+    port: u16,
+) -> (f64, i32, Option<&'static str>) {
     let url = format!("http://127.0.0.1:{port}/metrics");
     let body = match client.get(&url).send().await {
         Ok(r) if r.status().is_success() => r.text().await.unwrap_or_default(),
-        _ => return (0.0, 0),
+        _ => return (0.0, 0, None),
     };
 
     // Prometheus-style scrape. Look for common llama.cpp / vllm metric names.
+    // The metric-name prefix is also the most reliable way to identify the
+    // runtime — it beats header sniffing (vllm's uvicorn header is generic)
+    // and body sniffing (the /v1/models payload looks the same on vllm,
+    // mlx_lm, and other OpenAI-shim servers).
     let mut tokens_per_sec = 0.0;
     let mut queue_depth = 0i32;
+    let mut runtime_hint: Option<&'static str> = None;
 
     for line in body.lines() {
         if line.starts_with('#') {
@@ -334,6 +362,16 @@ async fn fetch_metrics(client: &reqwest::Client, port: u16) -> (f64, i32) {
             None => continue,
         };
         let name = name_part.split('{').next().unwrap_or(name_part);
+
+        // Runtime fingerprint via metric-name prefix. First hit wins.
+        if runtime_hint.is_none() {
+            if name.starts_with("vllm:") || name.starts_with("vllm_") {
+                runtime_hint = Some("vllm");
+            } else if name.starts_with("llamacpp:") {
+                runtime_hint = Some("llama.cpp");
+            }
+        }
+
         let value: f64 = match value_part.parse() {
             Ok(v) => v,
             Err(_) => continue,
@@ -354,7 +392,7 @@ async fn fetch_metrics(client: &reqwest::Client, port: u16) -> (f64, i32) {
         }
     }
 
-    (tokens_per_sec, queue_depth)
+    (tokens_per_sec, queue_depth, runtime_hint)
 }
 
 fn dir_stats(path: &Path) -> (u64, bool, bool, bool) {
@@ -409,8 +447,8 @@ mod tests {
 
     #[test]
     fn runtime_identification_fallbacks() {
-        assert_eq!(identify_runtime(11434, "", "", ""), "ollama");
-        assert_eq!(identify_runtime(55000, "foo.gguf", "", ""), "llama.cpp");
+        assert_eq!(identify_runtime(11434, "", "", "", None), "ollama");
+        assert_eq!(identify_runtime(55000, "foo.gguf", "", "", None), "llama.cpp");
         // On Linux, a bare JSON body with no distinguishing signals falls
         // through to "unknown"; on macOS the last-resort branch returns
         // "mlx_lm". We assert the OS-appropriate expectation.
@@ -419,20 +457,32 @@ mod tests {
         } else {
             "unknown"
         };
-        assert_eq!(identify_runtime(55000, "{}", "", ""), expected_bare);
+        assert_eq!(identify_runtime(55000, "{}", "", "", None), expected_bare);
         // MLX detection via server header:
         assert_eq!(
-            identify_runtime(55000, "{}", "BaseHTTP/0.6 Python/3.14.3", ""),
+            identify_runtime(55000, "{}", "BaseHTTP/0.6 Python/3.14.3", "", None),
             "mlx_lm"
         );
         // MLX detection via model id:
         assert_eq!(
-            identify_runtime(55000, "{}", "", "mlx-community/Qwen2.5-Coder-32B-4bit"),
+            identify_runtime(55000, "{}", "", "mlx-community/Qwen2.5-Coder-32B-4bit", None),
             "mlx_lm"
         );
         // llama.cpp server header wins over Mac fallback:
         assert_eq!(
-            identify_runtime(55000, "{}", "llama.cpp", ""),
+            identify_runtime(55000, "{}", "llama.cpp", "", None),
+            "llama.cpp"
+        );
+        // /metrics hint wins over everything: vllm on port 55000 (Linux) was
+        // previously classified "unknown" because there's no body/header
+        // signal. Now the Prometheus scrape tells us.
+        assert_eq!(
+            identify_runtime(55000, "{}", "uvicorn", "", Some("vllm")),
+            "vllm"
+        );
+        // /metrics hint = llama.cpp beats the Mac fallback too:
+        assert_eq!(
+            identify_runtime(55000, "{}", "", "", Some("llama.cpp")),
             "llama.cpp"
         );
     }

@@ -607,11 +607,36 @@ impl Materializer {
         .execute(&self.pg)
         .await?;
 
-        // Deployment upserts (Q12).
+        // Deployment upserts (Q12). Capture the pre-upsert timestamp so we
+        // can find rows for this computer that the beat DIDN'T touch and
+        // mark them stopped (Q12b). Without this prune, deployments that
+        // vanished — a vllm container torn down, a llama-server crashed
+        // out, an endpoint retired — stay `active` in the DB forever; the
+        // fleet dashboard then reports phantom capacity.
+        let prune_before: chrono::DateTime<chrono::Utc> =
+            sqlx::query_scalar("SELECT NOW()")
+                .fetch_one(&self.pg)
+                .await?;
         for s in &beat.llm_servers {
             self.upsert_deployment(computer_id, s).await?;
             report.deployment_upserts += 1;
         }
+        // Q12b: mark any deployment row for this computer that wasn't
+        // upserted by this beat as `stopped`. Mirrors Q14's prune for
+        // containers. `last_status_change` is refreshed by every upsert
+        // above, so anything older than `prune_before` is a row the beat
+        // did not refer to.
+        sqlx::query(
+            "UPDATE computer_model_deployments \
+             SET status = 'stopped', last_status_change = NOW() \
+             WHERE computer_id = $1 \
+               AND status <> 'stopped' \
+               AND last_status_change < $2",
+        )
+        .bind(computer_id)
+        .bind(prune_before)
+        .execute(&self.pg)
+        .await?;
 
         // Docker container upserts (Q13).
         let mut seen_container_names: HashSet<String> = HashSet::new();
