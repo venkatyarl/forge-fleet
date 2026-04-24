@@ -26,19 +26,40 @@ pub enum PulseError {
 }
 
 /// Redis-backed reader for Pulse v2 beats.
+///
+/// Holds a single `ConnectionManager` (cheap to clone, auto-reconnecting)
+/// built on first use and reused for every read. Prior to 2026-04-23 the
+/// reader created a brand-new `MultiplexedConnection` per call — ~500
+/// new TCP handshakes/sec from forgefleetd under normal operation, which
+/// pushed macOS past 16K TIME_WAIT source ports and caused
+/// `EADDRNOTAVAIL` for every other outbound connect() on Taylor.
 pub struct PulseReader {
     client: redis::Client,
+    conn: tokio::sync::OnceCell<redis::aio::ConnectionManager>,
 }
 
 impl PulseReader {
     /// Build a new reader pointed at `redis_url`.
     pub fn new(redis_url: &str) -> Result<Self, PulseError> {
         let client = redis::Client::open(redis_url)?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            conn: tokio::sync::OnceCell::new(),
+        })
     }
 
-    async fn conn(&self) -> Result<redis::aio::MultiplexedConnection, PulseError> {
-        Ok(self.client.get_multiplexed_async_connection().await?)
+    async fn conn(&self) -> Result<redis::aio::ConnectionManager, PulseError> {
+        if let Some(c) = self.conn.get() {
+            return Ok(c.clone());
+        }
+        let client = self.client.clone();
+        let mgr = self
+            .conn
+            .get_or_try_init(|| async move {
+                redis::aio::ConnectionManager::new(client).await
+            })
+            .await?;
+        Ok(mgr.clone())
     }
 
     fn key_for(name: &str) -> String {

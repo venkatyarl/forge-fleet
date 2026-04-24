@@ -22,6 +22,18 @@ static FLEET_DESCRIPTION: OnceCell<String> = OnceCell::const_new();
 /// helper, which is called from legacy sync code paths).
 static FLEET_SNAPSHOT: OnceCell<FleetSnapshot> = OnceCell::const_new();
 
+/// Process-wide Postgres pool shared by every `fleet_info::*` helper.
+///
+/// Prior to 2026-04-23 this helper built a fresh `PgPool` on every call.
+/// Callers drop the pool after one query, but sqlx closes connections in
+/// a background task, so high-frequency callers (disk_sampler,
+/// deployment_reconciler, model_runtime, version_check, orchestrator,
+/// every LLM tool, every heartbeat tick) accumulated dozens of idle
+/// backends on Postgres and burned an ephemeral port per connection on
+/// the client — tripped `too many clients already` at 100-slot cap and
+/// `EADDRNOTAVAIL` on macOS once 16K source ports were TIME_WAIT.
+static FLEET_POOL: OnceCell<PgPool> = OnceCell::const_new();
+
 /// A full fleet snapshot loaded from Postgres.
 #[derive(Debug, Clone, Default)]
 pub struct FleetSnapshot {
@@ -29,8 +41,17 @@ pub struct FleetSnapshot {
     pub models: Vec<FleetModelRow>,
 }
 
-/// Open a short-lived Postgres pool using the URL from `~/.forgefleet/fleet.toml`.
+/// Return the process-wide shared Postgres pool, initializing it on first
+/// call from `~/.forgefleet/fleet.toml`.
 pub async fn get_fleet_pool() -> Result<PgPool, String> {
+    if let Some(p) = FLEET_POOL.get() {
+        return Ok(p.clone());
+    }
+    let pool = build_fleet_pool().await?;
+    Ok(FLEET_POOL.get_or_init(|| async { pool }).await.clone())
+}
+
+async fn build_fleet_pool() -> Result<PgPool, String> {
     let config_path = dirs::home_dir()
         .ok_or_else(|| "no home dir".to_string())?
         .join(".forgefleet/fleet.toml");
@@ -40,8 +61,11 @@ pub async fn get_fleet_pool() -> Result<PgPool, String> {
         toml::from_str(&toml_str).map_err(|e| format!("parse fleet.toml: {e}"))?;
 
     PgPoolOptions::new()
-        .max_connections(2)
+        .max_connections(10)
+        .min_connections(0)
         .acquire_timeout(Duration::from_secs(5))
+        .idle_timeout(Some(Duration::from_secs(60)))
+        .max_lifetime(Some(Duration::from_secs(30 * 60)))
         .connect(&config.database.url)
         .await
         .map_err(|e| format!("connect Postgres: {e}"))

@@ -42,7 +42,7 @@ services:
       - "-c"
       - "effective_cache_size=4GB"
       - "-c"
-      - "max_connections=100"
+      - "max_connections=500"
       - "-c"
       - "log_min_duration_statement=1000"
       # ─── Streaming-replication knobs (Phase 6 HA) ─────────────────────
