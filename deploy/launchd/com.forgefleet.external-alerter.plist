@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  External fleet alerter — runs OUTSIDE forgefleetd every 60s.
+
+  Queries Postgres directly for stale `computers.last_seen_at` and pages
+  Telegram if any member's beat is older than the warn/crit thresholds.
+  Survives forgefleetd death, which is the exact scenario where the
+  in-daemon alert_evaluator fails silently (the 9h DGX outage of
+  2026-04-22).
+
+  Install on Taylor:
+    cp deploy/launchd/com.forgefleet.external-alerter.plist \
+       ~/Library/LaunchAgents/
+    launchctl load -w ~/Library/LaunchAgents/com.forgefleet.external-alerter.plist
+
+  Unload:
+    launchctl unload ~/Library/LaunchAgents/com.forgefleet.external-alerter.plist
+
+  Logs:
+    tail -f ~/.forgefleet/logs/external-alerter.log
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.forgefleet.external-alerter</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/venkat/projects/forge-fleet/scripts/external-alerter.sh</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/Users/venkat</string>
+        <key>PATH</key>
+        <string>/Users/venkat/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+
+    <key>StartInterval</key>
+    <integer>60</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/venkat/.forgefleet/logs/external-alerter.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/venkat/.forgefleet/logs/external-alerter.log</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+</dict>
+</plist>
