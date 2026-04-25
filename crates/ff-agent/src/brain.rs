@@ -58,10 +58,8 @@ impl From<&BrainContext> for BrainLoadedStatus {
             project_entries: ctx.project_entries.len()
                 + ctx.project_forgefleet_md.as_ref().map(|_| 1).unwrap_or(0)
                 + ctx.project_context_md.as_ref().map(|_| 1).unwrap_or(0),
-            brain_entries: ctx.brain_entries.len()
-                + ctx.brain_md.as_ref().map(|_| 1).unwrap_or(0),
-            hive_entries: ctx.hive_entries.len()
-                + ctx.hive_md.as_ref().map(|_| 1).unwrap_or(0),
+            brain_entries: ctx.brain_entries.len() + ctx.brain_md.as_ref().map(|_| 1).unwrap_or(0),
+            hive_entries: ctx.hive_entries.len() + ctx.hive_md.as_ref().map(|_| 1).unwrap_or(0),
             project_name: ctx.project_name.clone(),
             hive_synced_at: None, // set by caller from hive_sync
         }
@@ -82,10 +80,7 @@ impl BrainLoader {
         let project_root = memory::detect_git_root(cwd).await;
 
         // Load all three layers in parallel
-        let (brain_result, hive_result) = tokio::join!(
-            load_fleet_brain(),
-            load_hive_mind(),
-        );
+        let (brain_result, hive_result) = tokio::join!(load_fleet_brain(), load_hive_mind(),);
 
         let project_result = if let Some(root) = &project_root {
             // Auto-generate context.md if missing
@@ -95,7 +90,8 @@ impl BrainLoader {
             ProjectMemoryResult::default()
         };
 
-        let project_name = project_root.as_ref()
+        let project_name = project_root
+            .as_ref()
             .and_then(|r| r.file_name())
             .map(|n| n.to_string_lossy().to_string());
 
@@ -208,17 +204,22 @@ async fn load_project_memory(project_root: &Path) -> ProjectMemoryResult {
 }
 
 async fn load_fleet_brain() -> (Option<String>, Vec<MemoryEntry>) {
-    let brain_dir = dirs::home_dir().unwrap_or_default().join(".forgefleet").join("brain");
+    let brain_dir = dirs::home_dir()
+        .unwrap_or_default()
+        .join(".forgefleet")
+        .join("brain");
 
     if !brain_dir.exists() {
         let _ = fs::create_dir_all(&brain_dir).await;
         // Create starter BRAIN.md
         let brain_md = brain_dir.join("BRAIN.md");
         if !brain_md.exists() {
-            let _ = fs::write(&brain_md,
+            let _ = fs::write(
+                &brain_md,
                 "# Fleet Brain\n\nPersonal preferences and cross-project patterns.\n\
-                 ForgeFleet learns from your sessions and stores patterns here.\n"
-            ).await;
+                 ForgeFleet learns from your sessions and stores patterns here.\n",
+            )
+            .await;
         }
     }
 
@@ -228,7 +229,10 @@ async fn load_fleet_brain() -> (Option<String>, Vec<MemoryEntry>) {
 }
 
 async fn load_hive_mind() -> (Option<String>, Vec<MemoryEntry>) {
-    let hive_dir = dirs::home_dir().unwrap_or_default().join(".forgefleet").join("hive");
+    let hive_dir = dirs::home_dir()
+        .unwrap_or_default()
+        .join(".forgefleet")
+        .join("hive");
 
     if !hive_dir.exists() {
         // Don't auto-create hive — it should be initialized by hive_sync
@@ -277,10 +281,16 @@ fn build_project_section(ctx: &BrainContext, budget: usize) -> String {
     if !ctx.project_entries.is_empty() {
         section.push_str("**Known facts:**\n");
         let mut entries: Vec<_> = ctx.project_entries.iter().collect();
-        entries.sort_by(|a, b| b.relevance.partial_cmp(&a.relevance).unwrap_or(std::cmp::Ordering::Equal));
+        entries.sort_by(|a, b| {
+            b.relevance
+                .partial_cmp(&a.relevance)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         for entry in entries.iter().take(10) {
             let line = format!("[{:?}] {}\n", entry.category, entry.content);
-            if line.len() > remaining { break; }
+            if line.len() > remaining {
+                break;
+            }
             section.push_str(&line);
             remaining = remaining.saturating_sub(line.len());
         }
@@ -309,10 +319,16 @@ fn build_brain_section(ctx: &BrainContext, budget: usize) -> String {
     }
 
     let mut entries: Vec<_> = ctx.brain_entries.iter().collect();
-    entries.sort_by(|a, b| b.relevance.partial_cmp(&a.relevance).unwrap_or(std::cmp::Ordering::Equal));
+    entries.sort_by(|a, b| {
+        b.relevance
+            .partial_cmp(&a.relevance)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     for entry in entries.iter().take(10) {
         let line = format!("[{:?}] {}\n", entry.category, entry.content);
-        if line.len() > remaining { break; }
+        if line.len() > remaining {
+            break;
+        }
         section.push_str(&line);
         remaining = remaining.saturating_sub(line.len());
     }
@@ -339,10 +355,16 @@ fn build_hive_section(ctx: &BrainContext, budget: usize) -> String {
     }
 
     let mut entries: Vec<_> = ctx.hive_entries.iter().collect();
-    entries.sort_by(|a, b| b.relevance.partial_cmp(&a.relevance).unwrap_or(std::cmp::Ordering::Equal));
+    entries.sort_by(|a, b| {
+        b.relevance
+            .partial_cmp(&a.relevance)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     for entry in entries.iter().take(10) {
         let line = format!("[{:?}] {}\n", entry.category, entry.content);
-        if line.len() > remaining { break; }
+        if line.len() > remaining {
+            break;
+        }
         section.push_str(&line);
         remaining = remaining.saturating_sub(line.len());
     }
@@ -377,7 +399,9 @@ fn truncate(s: &str, max: usize) -> String {
         s.trim().to_string()
     } else {
         let mut end = max;
-        while end > 0 && !s.is_char_boundary(end) { end -= 1; }
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
         format!("{}...", s[..end].trim())
     }
 }
@@ -396,19 +420,43 @@ pub async fn ensure_project_context(project_root: &Path) {
 
     // Scan the project for key files
     let mut summary = String::from("# Project Architecture\n\n");
-    summary.push_str(&format!("Project: {}\n", project_root.file_name().unwrap_or_default().to_string_lossy()));
+    summary.push_str(&format!(
+        "Project: {}\n",
+        project_root
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+    ));
     summary.push_str(&format!("Root: {}\n\n", project_root.display()));
 
     // Detect tech stack
     let mut stack = Vec::new();
-    if project_root.join("Cargo.toml").exists() { stack.push("Rust (Cargo)"); }
-    if project_root.join("package.json").exists() { stack.push("JavaScript/TypeScript (npm)"); }
-    if project_root.join("pyproject.toml").exists() || project_root.join("setup.py").exists() { stack.push("Python"); }
-    if project_root.join("go.mod").exists() { stack.push("Go"); }
-    if project_root.join("Dockerfile").exists() { stack.push("Docker"); }
-    if project_root.join("docker-compose.yml").exists() || project_root.join("docker-compose.yaml").exists() { stack.push("Docker Compose"); }
-    if project_root.join(".github").exists() { stack.push("GitHub Actions"); }
-    if project_root.join("Makefile").exists() { stack.push("Make"); }
+    if project_root.join("Cargo.toml").exists() {
+        stack.push("Rust (Cargo)");
+    }
+    if project_root.join("package.json").exists() {
+        stack.push("JavaScript/TypeScript (npm)");
+    }
+    if project_root.join("pyproject.toml").exists() || project_root.join("setup.py").exists() {
+        stack.push("Python");
+    }
+    if project_root.join("go.mod").exists() {
+        stack.push("Go");
+    }
+    if project_root.join("Dockerfile").exists() {
+        stack.push("Docker");
+    }
+    if project_root.join("docker-compose.yml").exists()
+        || project_root.join("docker-compose.yaml").exists()
+    {
+        stack.push("Docker Compose");
+    }
+    if project_root.join(".github").exists() {
+        stack.push("GitHub Actions");
+    }
+    if project_root.join("Makefile").exists() {
+        stack.push("Make");
+    }
 
     if !stack.is_empty() {
         summary.push_str("## Tech Stack\n");
@@ -425,8 +473,13 @@ pub async fn ensure_project_context(project_root: &Path) {
         let mut files = Vec::new();
         while let Ok(Some(entry)) = entries.next_entry().await {
             let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with('.') { continue; }
-            if name == "target" || name == "node_modules" || name == "dist" || name == "__pycache__" { continue; }
+            if name.starts_with('.') {
+                continue;
+            }
+            if name == "target" || name == "node_modules" || name == "dist" || name == "__pycache__"
+            {
+                continue;
+            }
             if entry.path().is_dir() {
                 dirs.push(name);
             } else {
@@ -512,7 +565,11 @@ pub async fn search_all(query: &str, cwd: &Path) -> Vec<SearchResult> {
     }
 
     // Sort by relevance
-    results.sort_by(|a, b| b.relevance.partial_cmp(&a.relevance).unwrap_or(std::cmp::Ordering::Equal));
+    results.sort_by(|a, b| {
+        b.relevance
+            .partial_cmp(&a.relevance)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     results
 }
 

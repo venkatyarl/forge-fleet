@@ -77,7 +77,10 @@ pub async fn ensure_deployed(pool: &PgPool, catalog_id: &str) -> Result<String, 
         tokio::time::sleep(Duration::from_millis(1500)).await;
     }
 
-    warn!(catalog_id, last_status, "autoload timed out waiting for healthy deployment");
+    warn!(
+        catalog_id,
+        last_status, "autoload timed out waiting for healthy deployment"
+    );
     Err(format!(
         "autoload of '{catalog_id}' did not become healthy within 90s (last_status: {last_status})"
     ))
@@ -97,9 +100,7 @@ async fn find_healthy_deployment(
         .map_err(|e| format!("pg_list_deployments: {e}"))?;
     Ok(deps
         .into_iter()
-        .find(|d| {
-            d.catalog_id.as_deref() == Some(catalog_id) && d.health_status == "healthy"
-        })
+        .find(|d| d.catalog_id.as_deref() == Some(catalog_id) && d.health_status == "healthy")
         .map(|d| format!("http://127.0.0.1:{}", d.port)))
 }
 
@@ -135,7 +136,13 @@ async fn resolve_this_node_name(pool: &PgPool) -> String {
         .output()
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().split('.').next().unwrap_or("unknown").to_lowercase())
+        .map(|s| {
+            s.trim()
+                .split('.')
+                .next()
+                .unwrap_or("unknown")
+                .to_lowercase()
+        })
         .unwrap_or_else(|| "unknown".into())
 }
 

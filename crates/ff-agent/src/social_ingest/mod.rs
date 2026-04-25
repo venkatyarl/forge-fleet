@@ -17,7 +17,7 @@ pub mod platform;
 
 use std::path::PathBuf;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -80,8 +80,8 @@ async fn run_pipeline(pool: PgPool, post_id: Uuid, url: String) -> Result<()> {
 
     // Persist media + caption + author before analysis so partial rows
     // are useful even if analysis later fails.
-    let media_json = serde_json::to_value(&fetched.media_items)
-        .unwrap_or(serde_json::Value::Array(vec![]));
+    let media_json =
+        serde_json::to_value(&fetched.media_items).unwrap_or(serde_json::Value::Array(vec![]));
     sqlx::query(
         "UPDATE social_media_posts \
          SET author=$2, caption=$3, media_items=$4 \

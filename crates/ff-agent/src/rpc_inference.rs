@@ -104,18 +104,27 @@ impl RpcClusterManager {
 
     /// Generate the llama-server command line for the controller.
     pub fn controller_command(&self) -> anyhow::Result<Vec<String>> {
-        let config = self.config.as_ref().ok_or_else(|| anyhow::anyhow!("Cluster not configured"))?;
+        let config = self
+            .config
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Cluster not configured"))?;
 
         let mut args = vec![
             "llama-server".to_string(),
-            "--model".to_string(), config.model.clone(),
-            "--ctx-size".to_string(), config.context_size.to_string(),
-            "--host".to_string(), "0.0.0.0".to_string(),
-            "--port".to_string(), config.controller.bind_port.to_string(),
+            "--model".to_string(),
+            config.model.clone(),
+            "--ctx-size".to_string(),
+            config.context_size.to_string(),
+            "--host".to_string(),
+            "0.0.0.0".to_string(),
+            "--port".to_string(),
+            config.controller.bind_port.to_string(),
         ];
 
         // Add RPC servers
-        let rpc_addrs: Vec<String> = config.workers.iter()
+        let rpc_addrs: Vec<String> = config
+            .workers
+            .iter()
             .map(|w| format!("{}:{}", w.address, w.port))
             .collect();
         args.push("--rpc".to_string());
@@ -124,7 +133,11 @@ impl RpcClusterManager {
         // Add tensor split if specified
         if !config.tensor_split.is_empty() {
             args.push("--tensor-split".to_string());
-            let split_str: Vec<String> = config.tensor_split.iter().map(|s| format!("{s:.2}")).collect();
+            let split_str: Vec<String> = config
+                .tensor_split
+                .iter()
+                .map(|s| format!("{s:.2}"))
+                .collect();
             args.push(split_str.join(","));
         }
 
@@ -139,16 +152,23 @@ impl RpcClusterManager {
 
     /// Generate the rpc-server command line for a worker.
     pub fn worker_command(&self, worker_name: &str) -> anyhow::Result<Vec<String>> {
-        let config = self.config.as_ref().ok_or_else(|| anyhow::anyhow!("Cluster not configured"))?;
+        let config = self
+            .config
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Cluster not configured"))?;
 
-        let worker = config.workers.iter()
+        let worker = config
+            .workers
+            .iter()
             .find(|w| w.node_name == worker_name)
             .ok_or_else(|| anyhow::anyhow!("Worker '{worker_name}' not found in cluster config"))?;
 
         Ok(vec![
             "rpc-server".to_string(),
-            "--host".to_string(), "0.0.0.0".to_string(),
-            "--port".to_string(), worker.port.to_string(),
+            "--host".to_string(),
+            "0.0.0.0".to_string(),
+            "--port".to_string(),
+            worker.port.to_string(),
         ])
     }
 
@@ -170,9 +190,24 @@ impl RpcClusterManager {
                 gpu_layers: 999, // offload everything to GPU
             },
             workers: vec![
-                RpcWorkerConfig { node_name: "adele".into(), address: "192.168.5.110".into(), port: 50052, memory_gb: 128 },
-                RpcWorkerConfig { node_name: "rihanna".into(), address: "192.168.5.112".into(), port: 50052, memory_gb: 128 },
-                RpcWorkerConfig { node_name: "beyonce".into(), address: "192.168.5.114".into(), port: 50052, memory_gb: 128 },
+                RpcWorkerConfig {
+                    node_name: "adele".into(),
+                    address: "192.168.5.110".into(),
+                    port: 50052,
+                    memory_gb: 128,
+                },
+                RpcWorkerConfig {
+                    node_name: "rihanna".into(),
+                    address: "192.168.5.112".into(),
+                    port: 50052,
+                    memory_gb: 128,
+                },
+                RpcWorkerConfig {
+                    node_name: "beyonce".into(),
+                    address: "192.168.5.114".into(),
+                    port: 50052,
+                    memory_gb: 128,
+                },
             ],
             model: "/models/Llama-3.1-405B-Instruct-Q4_K_M.gguf".into(),
             tensor_split: vec![], // auto-compute
@@ -189,9 +224,24 @@ impl RpcClusterManager {
                 gpu_layers: 999,
             },
             workers: vec![
-                RpcWorkerConfig { node_name: "evo2".into(), address: "192.168.5.120".into(), port: 50052, memory_gb: 128 },
-                RpcWorkerConfig { node_name: "evo3".into(), address: "192.168.5.122".into(), port: 50052, memory_gb: 128 },
-                RpcWorkerConfig { node_name: "evo4".into(), address: "192.168.5.124".into(), port: 50052, memory_gb: 128 },
+                RpcWorkerConfig {
+                    node_name: "evo2".into(),
+                    address: "192.168.5.120".into(),
+                    port: 50052,
+                    memory_gb: 128,
+                },
+                RpcWorkerConfig {
+                    node_name: "evo3".into(),
+                    address: "192.168.5.122".into(),
+                    port: 50052,
+                    memory_gb: 128,
+                },
+                RpcWorkerConfig {
+                    node_name: "evo4".into(),
+                    address: "192.168.5.124".into(),
+                    port: 50052,
+                    memory_gb: 128,
+                },
             ],
             model: "/models/Qwen3-235B-A22B-Q4_K_M.gguf".into(),
             tensor_split: vec![],
@@ -201,5 +251,7 @@ impl RpcClusterManager {
 }
 
 impl Default for RpcClusterManager {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }

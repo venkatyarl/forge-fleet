@@ -7,7 +7,9 @@
 
 use std::time::Duration;
 
-use ff_db::{FleetModelRow, FleetNodeRow, pg_get_node, pg_get_secret, pg_list_models, pg_list_nodes};
+use ff_db::{
+    FleetModelRow, FleetNodeRow, pg_get_node, pg_get_secret, pg_list_models, pg_list_nodes,
+};
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use tokio::sync::OnceCell;
@@ -55,8 +57,8 @@ async fn build_fleet_pool() -> Result<PgPool, String> {
     let config_path = dirs::home_dir()
         .ok_or_else(|| "no home dir".to_string())?
         .join(".forgefleet/fleet.toml");
-    let toml_str = std::fs::read_to_string(&config_path)
-        .map_err(|e| format!("read fleet.toml: {e}"))?;
+    let toml_str =
+        std::fs::read_to_string(&config_path).map_err(|e| format!("read fleet.toml: {e}"))?;
     let config: ff_core::config::FleetConfig =
         toml::from_str(&toml_str).map_err(|e| format!("parse fleet.toml: {e}"))?;
 
@@ -136,7 +138,9 @@ pub async fn get_hf_token() -> Option<String> {
 pub async fn resolve_this_node_name() -> String {
     if let Ok(v) = std::env::var("FORGEFLEET_NODE_NAME") {
         let t = v.trim();
-        if !t.is_empty() { return t.to_string(); }
+        if !t.is_empty() {
+            return t.to_string();
+        }
     }
 
     // Collect local IPv4 addresses.
@@ -167,7 +171,13 @@ pub async fn resolve_this_node_name() -> String {
         .output()
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().split('.').next().unwrap_or("unknown").to_lowercase())
+        .map(|s| {
+            s.trim()
+                .split('.')
+                .next()
+                .unwrap_or("unknown")
+                .to_lowercase()
+        })
         .unwrap_or_else(|| "unknown".into())
 }
 
@@ -219,7 +229,9 @@ pub async fn fetch_node_by_name(name: &str) -> Result<Option<FleetNodeRow>, Stri
         .await
         .map_err(|e| format!("pg_list_nodes: {e}"))?;
     let lower = name.to_ascii_lowercase();
-    Ok(rows.into_iter().find(|r| r.name.to_ascii_lowercase() == lower))
+    Ok(rows
+        .into_iter()
+        .find(|r| r.name.to_ascii_lowercase() == lower))
 }
 
 /// Look up `(ip, ssh_user)` for a fleet node by name (case-insensitive).
@@ -330,7 +342,9 @@ fn classify_ip(ip: &str) -> String {
 /// Fetch a computer's `network_scope` setting. Returns "lan" as the safe
 /// default if the row does not exist or the column is unset.
 pub async fn fetch_network_scope(computer_name: &str) -> String {
-    let Ok(pool) = get_fleet_pool().await else { return "lan".to_string() };
+    let Ok(pool) = get_fleet_pool().await else {
+        return "lan".to_string();
+    };
     let row = sqlx::query_as::<_, (String,)>(
         "SELECT network_scope FROM computers WHERE LOWER(name) = LOWER($1)",
     )
@@ -394,7 +408,11 @@ to add nodes."
             "- {name} ({ip}) — {hardware}, {ram}GB, {os}, role={role}{models}",
             name = node.name,
             ip = node.ip,
-            hardware = if node.hardware.is_empty() { "unknown hardware" } else { &node.hardware },
+            hardware = if node.hardware.is_empty() {
+                "unknown hardware"
+            } else {
+                &node.hardware
+            },
             ram = node.ram_gb,
             os = node.os,
             role = node.role,

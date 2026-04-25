@@ -9,7 +9,9 @@ pub struct CronScheduleTool;
 
 #[async_trait]
 impl AgentTool for CronScheduleTool {
-    fn name(&self) -> &str { "CronSchedule" }
+    fn name(&self) -> &str {
+        "CronSchedule"
+    }
 
     fn description(&self) -> &str {
         "Schedule, list, and manage recurring tasks on the fleet. Create cron jobs that run commands, invoke agents, or dispatch work at specified intervals."
@@ -38,12 +40,17 @@ impl AgentTool for CronScheduleTool {
 
         match action {
             "create" => {
-                let name = input.get("name").and_then(Value::as_str).unwrap_or("unnamed");
+                let name = input
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unnamed");
                 let schedule = input.get("schedule").and_then(Value::as_str).unwrap_or("");
                 let command = input.get("command").and_then(Value::as_str).unwrap_or("");
 
                 if schedule.is_empty() || command.is_empty() {
-                    return AgentToolResult::err("Both 'schedule' and 'command' are required for create");
+                    return AgentToolResult::err(
+                        "Both 'schedule' and 'command' are required for create",
+                    );
                 }
 
                 let job_id = uuid::Uuid::new_v4().to_string();
@@ -52,12 +59,14 @@ impl AgentTool for CronScheduleTool {
                     &job_id[..8]
                 ))
             }
-            "list" => {
-                AgentToolResult::ok("Cron jobs: (query ff-cron for active jobs)\nUse 'ff config show' to see configured cron jobs in fleet.toml")
-            }
+            "list" => AgentToolResult::ok(
+                "Cron jobs: (query ff-cron for active jobs)\nUse 'ff config show' to see configured cron jobs in fleet.toml",
+            ),
             "delete" => {
                 let job_id = input.get("job_id").and_then(Value::as_str).unwrap_or("");
-                if job_id.is_empty() { return AgentToolResult::err("'job_id' required for delete"); }
+                if job_id.is_empty() {
+                    return AgentToolResult::err("'job_id' required for delete");
+                }
                 AgentToolResult::ok(format!("Cron job {job_id} deleted"))
             }
             "pause" => {

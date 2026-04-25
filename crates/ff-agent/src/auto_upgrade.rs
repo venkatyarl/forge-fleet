@@ -191,7 +191,7 @@ pub async fn resolve_upgrade_plans(
                     playbook_key,
                     command,
                 })
-            },
+            }
             None => skipped.push((
                 name,
                 format!(
@@ -224,11 +224,7 @@ pub enum GitStateGate {
 /// non-`ff_git` / `forgefleetd_git` software (the gate is a no-op for
 /// package-manager-managed upgrades). `force_dirty` converts `BlockDirty`
 /// to `AllowWithWarning` so the operator can override after inspection.
-pub async fn gate_git_state(
-    pool: &PgPool,
-    software_id: &str,
-    force_dirty: bool,
-) -> GitStateGate {
+pub async fn gate_git_state(pool: &PgPool, software_id: &str, force_dirty: bool) -> GitStateGate {
     if !matches!(software_id, "ff_git" | "forgefleetd_git") {
         return GitStateGate::Allow;
     }
@@ -252,7 +248,11 @@ pub async fn gate_git_state(
         Some("pushed") => GitStateGate::Allow,
         Some("unpushed") => GitStateGate::AllowWithWarning,
         Some("dirty") => {
-            if force_dirty { GitStateGate::AllowWithWarning } else { GitStateGate::BlockDirty }
+            if force_dirty {
+                GitStateGate::AllowWithWarning
+            } else {
+                GitStateGate::BlockDirty
+            }
         }
         _ => GitStateGate::Allow, // unknown / missing — dev fleet, proceed with weaker guarantees
     }
@@ -340,11 +340,9 @@ pub async fn enqueue_plans(
 
 /// Is this pool's leader the computer whose name matches `my_name`?
 async fn is_leader(pool: &PgPool, my_name: &str) -> bool {
-    match sqlx::query_scalar::<_, String>(
-        "SELECT member_name FROM fleet_leader_state LIMIT 1",
-    )
-    .fetch_optional(pool)
-    .await
+    match sqlx::query_scalar::<_, String>("SELECT member_name FROM fleet_leader_state LIMIT 1")
+        .fetch_optional(pool)
+        .await
     {
         Ok(Some(leader)) => leader.eq_ignore_ascii_case(my_name),
         _ => false,
@@ -395,7 +393,9 @@ impl AutoUpgradeTick {
             return Ok(0);
         }
         if !is_enabled(&self.pool).await {
-            tracing::debug!("auto-upgrade disabled (fleet_secrets.auto_upgrade_enabled not truthy)");
+            tracing::debug!(
+                "auto-upgrade disabled (fleet_secrets.auto_upgrade_enabled not truthy)"
+            );
             return Ok(0);
         }
 
@@ -510,7 +510,10 @@ impl AutoUpgradeTick {
                             "ts": chrono::Utc::now().to_rfc3339(),
                         });
                         crate::nats_client::publish_json(
-                            format!("fleet.events.software.upgrade_started.{}", plan.computer_name),
+                            format!(
+                                "fleet.events.software.upgrade_started.{}",
+                                plan.computer_name
+                            ),
                             &payload,
                         )
                         .await;
@@ -659,7 +662,9 @@ async fn refresh_github_release_latest_versions(pool: &PgPool) -> Result<u64> {
         "github_release",
         |vs| {
             let repo = vs.get("repo")?.as_str()?;
-            Some(format!("https://api.github.com/repos/{repo}/releases/latest"))
+            Some(format!(
+                "https://api.github.com/repos/{repo}/releases/latest"
+            ))
         },
         |body| {
             let v: serde_json::Value = serde_json::from_str(body).ok()?;
@@ -767,7 +772,9 @@ where
                 updated += 1;
             }
             Ok(_) => { /* unchanged */ }
-            Err(e) => tracing::warn!(software_id = %id, error = %e, "software_registry update failed"),
+            Err(e) => {
+                tracing::warn!(software_id = %id, error = %e, "software_registry update failed")
+            }
         }
         // Mirror to external_tools when an entry exists. Soft-fail.
         let _ = sqlx::query(

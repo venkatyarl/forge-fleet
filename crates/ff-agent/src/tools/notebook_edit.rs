@@ -10,7 +10,9 @@ pub struct NotebookEditTool;
 
 #[async_trait]
 impl AgentTool for NotebookEditTool {
-    fn name(&self) -> &str { "NotebookEdit" }
+    fn name(&self) -> &str {
+        "NotebookEdit"
+    }
 
     fn description(&self) -> &str {
         "Edit Jupyter notebook (.ipynb) cells. Can insert, replace, or delete cells by index."
@@ -65,7 +67,9 @@ impl AgentTool for NotebookEditTool {
         // Read notebook
         let content = match fs::read_to_string(&path).await {
             Ok(c) => c,
-            Err(e) => return AgentToolResult::err(format!("Failed to read {}: {e}", path.display())),
+            Err(e) => {
+                return AgentToolResult::err(format!("Failed to read {}: {e}", path.display()));
+            }
         };
 
         let mut notebook: Value = match serde_json::from_str(&content) {
@@ -81,12 +85,18 @@ impl AgentTool for NotebookEditTool {
         match action {
             "delete" => {
                 if cell_index >= cells.len() {
-                    return AgentToolResult::err(format!("Cell index {cell_index} out of range (notebook has {} cells)", cells.len()));
+                    return AgentToolResult::err(format!(
+                        "Cell index {cell_index} out of range (notebook has {} cells)",
+                        cells.len()
+                    ));
                 }
                 cells.remove(cell_index);
             }
             "replace" | "insert" => {
-                let cell_type = input.get("cell_type").and_then(Value::as_str).unwrap_or("code");
+                let cell_type = input
+                    .get("cell_type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("code");
                 let source = input.get("source").and_then(Value::as_str).unwrap_or("");
 
                 let source_lines: Vec<Value> = source
@@ -94,7 +104,11 @@ impl AgentTool for NotebookEditTool {
                     .map(|l| Value::String(format!("{l}\n")))
                     .collect();
 
-                let outputs = if cell_type == "code" { json!([]) } else { Value::Null };
+                let outputs = if cell_type == "code" {
+                    json!([])
+                } else {
+                    Value::Null
+                };
                 let new_cell = json!({
                     "cell_type": cell_type,
                     "source": source_lines,
@@ -105,7 +119,9 @@ impl AgentTool for NotebookEditTool {
 
                 if action == "replace" {
                     if cell_index >= cells.len() {
-                        return AgentToolResult::err(format!("Cell index {cell_index} out of range"));
+                        return AgentToolResult::err(format!(
+                            "Cell index {cell_index} out of range"
+                        ));
                     }
                     cells[cell_index] = new_cell;
                 } else {

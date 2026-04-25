@@ -287,8 +287,7 @@ impl PulseLlmRouter {
         let Some((computer, primary_ip, server)) = picked else {
             // Gather available model ids fleet-wide for a helpful error.
             let all = self.reader.list_llm_servers().await?;
-            let available: Vec<String> =
-                all.into_iter().map(|(_, s)| s.model.id).collect();
+            let available: Vec<String> = all.into_iter().map(|(_, s)| s.model.id).collect();
             return Err(LlmRoutingError::NoMatch {
                 requested: requested_model,
                 available,
@@ -413,13 +412,9 @@ pub(crate) fn normalize_model_id(raw: &str) -> String {
     // Strip common quantization / precision suffixes if trailing.
     // Order matters: longer suffixes first so we don't leave a stray dash.
     let quant_suffixes: &[&str] = &[
-        "-q2-k", "-q3-k-s", "-q3-k-m", "-q3-k-l",
-        "-q4-0", "-q4-1", "-q4-k-s", "-q4-k-m",
-        "-q5-0", "-q5-1", "-q5-k-s", "-q5-k-m",
-        "-q6-k", "-q8-0",
-        "-bf16", "-fp16", "-fp8", "-f16", "-f32",
-        "-int8", "-int4",
-        "-awq", "-gptq",
+        "-q2-k", "-q3-k-s", "-q3-k-m", "-q3-k-l", "-q4-0", "-q4-1", "-q4-k-s", "-q4-k-m", "-q5-0",
+        "-q5-1", "-q5-k-s", "-q5-k-m", "-q6-k", "-q8-0", "-bf16", "-fp16", "-fp8", "-f16", "-f32",
+        "-int8", "-int4", "-awq", "-gptq",
     ];
     // Strip repeatedly — a filename may carry more than one precision tag.
     loop {
@@ -457,18 +452,20 @@ pub(crate) fn apply_qwen3_max_tokens_floor(body: &mut Value, resolved_model_id: 
     if !resolved_model_id.to_ascii_lowercase().contains("qwen3") {
         return;
     }
-    let Some(obj) = body.as_object_mut() else { return };
+    let Some(obj) = body.as_object_mut() else {
+        return;
+    };
     let current = obj.get("max_tokens").and_then(|v| v.as_u64());
-    if current.map(|n| n >= QWEN3_MAX_TOKENS_FLOOR).unwrap_or(false) {
+    if current
+        .map(|n| n >= QWEN3_MAX_TOKENS_FLOOR)
+        .unwrap_or(false)
+    {
         return;
     }
     let old = current
         .map(|n| n.to_string())
         .unwrap_or_else(|| "unset".to_string());
-    obj.insert(
-        "max_tokens".to_string(),
-        json!(QWEN3_MAX_TOKENS_FLOOR),
-    );
+    obj.insert("max_tokens".to_string(), json!(QWEN3_MAX_TOKENS_FLOOR));
     tracing::debug!(
         resolved_model = %resolved_model_id,
         old = %old,
@@ -505,7 +502,10 @@ pub fn error_to_response(err: LlmRoutingError) -> (u16, Value) {
             400,
             json!({"error": {"message": "missing `model` field", "type": "invalid_request_error"}}),
         ),
-        LlmRoutingError::NoMatch { requested, available } => (
+        LlmRoutingError::NoMatch {
+            requested,
+            available,
+        } => (
             404,
             json!({"error": {
                 "message": format!("no server has model '{}' loaded", requested),
@@ -983,20 +983,14 @@ mod tests {
         // bump max_tokens to QWEN3_MAX_TOKENS_FLOOR.
         let mut body = json!({ "model": "thinking", "max_tokens": 512 });
         apply_qwen3_max_tokens_floor(&mut body, "qwen3-35b-thinking");
-        assert_eq!(
-            body["max_tokens"].as_u64().unwrap(),
-            QWEN3_MAX_TOKENS_FLOOR
-        );
+        assert_eq!(body["max_tokens"].as_u64().unwrap(), QWEN3_MAX_TOKENS_FLOOR);
     }
 
     #[test]
     fn qwen3_floor_inserts_max_tokens_when_absent() {
         let mut body = json!({ "model": "coder" });
         apply_qwen3_max_tokens_floor(&mut body, "Qwen3-Coder-30B-A3B");
-        assert_eq!(
-            body["max_tokens"].as_u64().unwrap(),
-            QWEN3_MAX_TOKENS_FLOOR
-        );
+        assert_eq!(body["max_tokens"].as_u64().unwrap(), QWEN3_MAX_TOKENS_FLOOR);
     }
 
     #[test]

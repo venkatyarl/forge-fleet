@@ -66,7 +66,12 @@ impl HaltReport {
         let total = entries.len();
         let succeeded = entries.iter().filter(|e| e.ok).count();
         let failed = total - succeeded;
-        Self { entries, total, succeeded, failed }
+        Self {
+            entries,
+            total,
+            succeeded,
+            failed,
+        }
     }
 }
 
@@ -117,12 +122,7 @@ fn ssh_base_args(port: i32) -> Vec<String> {
 }
 
 /// Run an SSH command under a timeout; returns (success, combined_output).
-async fn run_ssh_collect(
-    user: &str,
-    host: &str,
-    port: i32,
-    remote_cmd: &str,
-) -> (bool, String) {
+async fn run_ssh_collect(user: &str, host: &str, port: i32, remote_cmd: &str) -> (bool, String) {
     let mut cmd = Command::new("ssh");
     cmd.args(ssh_base_args(port))
         .arg(format!("{user}@{host}"))
@@ -511,9 +511,21 @@ mod tests {
     #[test]
     fn halt_report_counts() {
         let r = HaltReport::from_entries(vec![
-            HaltEntry { name: "a".into(), ok: true, detail: "ok".into() },
-            HaltEntry { name: "b".into(), ok: false, detail: "boom".into() },
-            HaltEntry { name: "c".into(), ok: true, detail: "ok".into() },
+            HaltEntry {
+                name: "a".into(),
+                ok: true,
+                detail: "ok".into(),
+            },
+            HaltEntry {
+                name: "b".into(),
+                ok: false,
+                detail: "boom".into(),
+            },
+            HaltEntry {
+                name: "c".into(),
+                ok: true,
+                detail: "ok".into(),
+            },
         ]);
         assert_eq!(r.total, 3);
         assert_eq!(r.succeeded, 2);
@@ -540,7 +552,11 @@ mod tests {
         let start = build_start_command("macos");
         let stop = build_stop_command("macos");
         // both must reference identical set of launchd labels
-        for label in ["com.forgefleet.forgefleetd", "com.forgefleet.node", "com.forgefleet.ffdaemon"] {
+        for label in [
+            "com.forgefleet.forgefleetd",
+            "com.forgefleet.node",
+            "com.forgefleet.ffdaemon",
+        ] {
             assert!(start.contains(label));
             assert!(stop.contains(label));
         }

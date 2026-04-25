@@ -738,7 +738,9 @@ impl ToolRegistry {
     fn brain_propose_link() -> ToolDefinition {
         ToolDefinition {
             name: "brain_propose_link".to_string(),
-            description: "Propose a link between two existing vault nodes. Staged for human review.".to_string(),
+            description:
+                "Propose a link between two existing vault nodes. Staged for human review."
+                    .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -763,7 +765,9 @@ impl ToolRegistry {
     fn brain_thread_append() -> ToolDefinition {
         ToolDefinition {
             name: "brain_thread_append".to_string(),
-            description: "Add a message to a Virtual Brain thread. Creates the thread if it doesn't exist.".to_string(),
+            description:
+                "Add a message to a Virtual Brain thread. Creates the thread if it doesn't exist."
+                    .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -805,7 +809,9 @@ impl ToolRegistry {
     fn brain_backlog_add() -> ToolDefinition {
         ToolDefinition {
             name: "brain_backlog_add".to_string(),
-            description: "Add an item to a project's backlog. Priority-sorted FIFO queue for work items.".to_string(),
+            description:
+                "Add an item to a project's backlog. Priority-sorted FIFO queue for work items."
+                    .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {

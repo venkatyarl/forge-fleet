@@ -28,9 +28,17 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum CloudLlmError {
     #[error("failed to read {path}: {source}")]
-    Io { path: PathBuf, #[source] source: std::io::Error },
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("failed to parse {path}: {source}")]
-    Toml { path: PathBuf, #[source] source: toml::de::Error },
+    Toml {
+        path: PathBuf,
+        #[source]
+        source: toml::de::Error,
+    },
     #[error("database error: {0}")]
     Sqlx(#[from] sqlx::Error),
 }
@@ -56,16 +64,25 @@ pub struct ProviderEntry {
     pub base_url: String,
     pub auth_kind: String,
     pub secret_key: String,
-    #[serde(default)] pub oauth_token_secret: Option<String>,
-    #[serde(default)] pub oauth_token_url: Option<String>,
-    #[serde(default)] pub oauth_client_id: Option<String>,
+    #[serde(default)]
+    pub oauth_token_secret: Option<String>,
+    #[serde(default)]
+    pub oauth_token_url: Option<String>,
+    #[serde(default)]
+    pub oauth_client_id: Option<String>,
     pub model_prefix: String,
-    #[serde(default = "default_request_format")] pub request_format: String,
-    #[serde(default = "default_enabled")] pub enabled: bool,
+    #[serde(default = "default_request_format")]
+    pub request_format: String,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
 }
 
-fn default_request_format() -> String { "openai_chat".to_string() }
-fn default_enabled() -> bool { true }
+fn default_request_format() -> String {
+    "openai_chat".to_string()
+}
+fn default_enabled() -> bool {
+    true
+}
 
 /// Runtime row shape returned by [`list_providers`] / [`find_for_model`].
 #[derive(Debug, Clone, Serialize)]
@@ -89,7 +106,10 @@ pub struct Provider {
 /// that predate the retirement keep compiling.
 ///
 /// Logs a single info line the first time it's called in a process.
-pub async fn seed_from_toml(_pool: &PgPool, _toml_path: &Path) -> Result<SeedReport, CloudLlmError> {
+pub async fn seed_from_toml(
+    _pool: &PgPool,
+    _toml_path: &Path,
+) -> Result<SeedReport, CloudLlmError> {
     use std::sync::atomic::{AtomicBool, Ordering};
     static LOGGED: AtomicBool = AtomicBool::new(false);
     if !LOGGED.swap(true, Ordering::Relaxed) {
@@ -106,19 +126,26 @@ pub async fn list_providers(pool: &PgPool) -> Result<Vec<Provider>, CloudLlmErro
                 oauth_token_secret, oauth_token_url, oauth_client_id,
                 model_prefix, request_format, enabled
            FROM cloud_llm_providers ORDER BY id",
-    ).fetch_all(pool).await?;
+    )
+    .fetch_all(pool)
+    .await?;
     Ok(rows.into_iter().map(row_to_provider).collect())
 }
 
 /// Find the provider whose `model_prefix` best matches `model_id`, preferring
 /// the longest matching prefix. Disabled providers are skipped.
-pub async fn find_for_model(pool: &PgPool, model_id: &str) -> Result<Option<Provider>, CloudLlmError> {
+pub async fn find_for_model(
+    pool: &PgPool,
+    model_id: &str,
+) -> Result<Option<Provider>, CloudLlmError> {
     let rows = sqlx::query(
         "SELECT id, display_name, base_url, auth_kind, secret_key,
                 oauth_token_secret, oauth_token_url, oauth_client_id,
                 model_prefix, request_format, enabled
            FROM cloud_llm_providers WHERE enabled = true",
-    ).fetch_all(pool).await?;
+    )
+    .fetch_all(pool)
+    .await?;
 
     let mut best: Option<(usize, Provider)> = None;
     for r in rows {
@@ -156,7 +183,9 @@ pub fn resolve_config_path() -> PathBuf {
         PathBuf::from("../config/cloud_llm_providers.toml"),
         PathBuf::from("../../config/cloud_llm_providers.toml"),
     ] {
-        if candidate.exists() { return candidate; }
+        if candidate.exists() {
+            return candidate;
+        }
     }
     if let Ok(home) = std::env::var("HOME") {
         for rel in [
@@ -164,7 +193,9 @@ pub fn resolve_config_path() -> PathBuf {
             "projects/forge-fleet/config/cloud_llm_providers.toml",
         ] {
             let p = PathBuf::from(&home).join(rel);
-            if p.exists() { return p; }
+            if p.exists() {
+                return p;
+            }
         }
     }
     PathBuf::from("config/cloud_llm_providers.toml")

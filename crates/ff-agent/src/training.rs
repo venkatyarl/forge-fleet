@@ -53,7 +53,10 @@ pub struct TrainingConversation {
 // ---------------------------------------------------------------------------
 
 fn training_data_dir() -> PathBuf {
-    dirs::home_dir().unwrap_or_default().join(".forgefleet").join("training_data")
+    dirs::home_dir()
+        .unwrap_or_default()
+        .join(".forgefleet")
+        .join("training_data")
 }
 
 /// Save a training conversation.
@@ -61,7 +64,11 @@ pub async fn save_conversation(conv: &TrainingConversation) -> anyhow::Result<Pa
     let dir = training_data_dir();
     fs::create_dir_all(&dir).await?;
 
-    let filename = format!("{}_{}.json", Utc::now().format("%Y%m%d_%H%M%S"), &conv.id[..8.min(conv.id.len())]);
+    let filename = format!(
+        "{}_{}.json",
+        Utc::now().format("%Y%m%d_%H%M%S"),
+        &conv.id[..8.min(conv.id.len())]
+    );
     let path = dir.join(filename);
     let json = serde_json::to_string_pretty(conv)?;
     fs::write(&path, json).await?;
@@ -110,24 +117,32 @@ pub async fn load_all_examples() -> Vec<TrainingConversation> {
 
 /// Convert training examples to the ChatML format used by most fine-tuning tools.
 pub fn to_chatml_dataset(examples: &[TrainingConversation]) -> Vec<Value> {
-    examples.iter().map(|conv| {
-        let mut messages = vec![json!({"role": "system", "content": conv.system_prompt})];
-        for turn in &conv.turns {
-            let mut msg = json!({"role": turn.role, "content": turn.content});
-            if let Some(calls) = &turn.tool_calls {
-                let tc: Vec<Value> = calls.iter().map(|c| json!({
-                    "type": "function",
-                    "function": {"name": c.name, "arguments": c.arguments}
-                })).collect();
-                msg["tool_calls"] = json!(tc);
+    examples
+        .iter()
+        .map(|conv| {
+            let mut messages = vec![json!({"role": "system", "content": conv.system_prompt})];
+            for turn in &conv.turns {
+                let mut msg = json!({"role": turn.role, "content": turn.content});
+                if let Some(calls) = &turn.tool_calls {
+                    let tc: Vec<Value> = calls
+                        .iter()
+                        .map(|c| {
+                            json!({
+                                "type": "function",
+                                "function": {"name": c.name, "arguments": c.arguments}
+                            })
+                        })
+                        .collect();
+                    msg["tool_calls"] = json!(tc);
+                }
+                if let Some(id) = &turn.tool_call_id {
+                    msg["tool_call_id"] = json!(id);
+                }
+                messages.push(msg);
             }
-            if let Some(id) = &turn.tool_call_id {
-                msg["tool_call_id"] = json!(id);
-            }
-            messages.push(msg);
-        }
-        json!({"messages": messages})
-    }).collect()
+            json!({"messages": messages})
+        })
+        .collect()
 }
 
 /// Export dataset to JSONL file (standard fine-tuning format).
@@ -238,7 +253,10 @@ pub fn generate_training_command(config: &LoraConfig) -> String {
             )
         }
         _ => {
-            format!("# Unsupported method: {}. Use 'mlx' or 'unsloth'.", config.method)
+            format!(
+                "# Unsupported method: {}. Use 'mlx' or 'unsloth'.",
+                config.method
+            )
         }
     }
 }
@@ -254,7 +272,13 @@ pub async fn readiness_check() -> TrainingReadiness {
         min_required: min_examples,
         recommended,
         ready: count >= min_examples,
-        quality: if count >= recommended { "good" } else if count >= min_examples { "minimum" } else { "insufficient" },
+        quality: if count >= recommended {
+            "good"
+        } else if count >= min_examples {
+            "minimum"
+        } else {
+            "insufficient"
+        },
     }
 }
 
@@ -346,7 +370,10 @@ impl ClaudeCodeImporter {
         let mut total = ImportResult::default();
 
         if !cc_dir.exists() {
-            info!("no Claude Code projects directory found at {}", cc_dir.display());
+            info!(
+                "no Claude Code projects directory found at {}",
+                cc_dir.display()
+            );
             return Ok(total);
         }
 
@@ -394,31 +421,40 @@ impl ClaudeCodeImporter {
         let mut entries: Vec<Value> = Vec::new();
         for line in reader.lines() {
             let line = line?;
-            if line.trim().is_empty() { continue; }
+            if line.trim().is_empty() {
+                continue;
+            }
             if let Ok(val) = serde_json::from_str::<Value>(&line) {
                 entries.push(val);
             }
         }
 
-        let session_id = entries.iter()
+        let session_id = entries
+            .iter()
             .find_map(|e| e.get("sessionId").and_then(Value::as_str))
             .unwrap_or("unknown")
             .to_string();
 
         // Extract system prompt
-        let system_prompt = entries.iter()
+        let system_prompt = entries
+            .iter()
             .filter(|e| e.get("type").and_then(Value::as_str) == Some("system"))
             .find_map(|e| {
                 let msg = e.get("message")?;
                 let content = msg.get("content")?;
-                if let Value::String(s) = content { Some(s.clone()) }
-                else if let Value::Array(arr) = content {
+                if let Value::String(s) = content {
+                    Some(s.clone())
+                } else if let Value::Array(arr) = content {
                     arr.iter().find_map(|b| {
                         if b.get("type").and_then(Value::as_str) == Some("text") {
                             b.get("text").and_then(Value::as_str).map(String::from)
-                        } else { None }
+                        } else {
+                            None
+                        }
                     })
-                } else { None }
+                } else {
+                    None
+                }
             })
             .unwrap_or_else(|| "You are an AI coding assistant.".into());
 
@@ -448,10 +484,13 @@ impl ClaudeCodeImporter {
                         Some(Value::Array(blocks)) => {
                             // Could be text + tool_result blocks
                             for block in blocks {
-                                let block_type = block.get("type").and_then(Value::as_str).unwrap_or("");
+                                let block_type =
+                                    block.get("type").and_then(Value::as_str).unwrap_or("");
                                 match block_type {
                                     "text" => {
-                                        if let Some(text) = block.get("text").and_then(Value::as_str) {
+                                        if let Some(text) =
+                                            block.get("text").and_then(Value::as_str)
+                                        {
                                             if !text.is_empty() {
                                                 turns.push(TrainingTurn {
                                                     role: "user".into(),
@@ -463,14 +502,18 @@ impl ClaudeCodeImporter {
                                         }
                                     }
                                     "tool_result" => {
-                                        let tool_use_id = block.get("tool_use_id")
+                                        let tool_use_id = block
+                                            .get("tool_use_id")
                                             .and_then(Value::as_str)
                                             .unwrap_or("")
                                             .to_string();
-                                        let result_content = block.get("content")
+                                        let result_content = block
+                                            .get("content")
                                             .map(|c| match c {
                                                 Value::String(s) => truncate_for_training(s, 2000),
-                                                other => truncate_for_training(&other.to_string(), 2000),
+                                                other => {
+                                                    truncate_for_training(&other.to_string(), 2000)
+                                                }
                                             })
                                             .unwrap_or_default();
 
@@ -509,11 +552,13 @@ impl ClaudeCodeImporter {
                                 }
                             }
                             "tool_use" => {
-                                let name = block.get("name")
+                                let name = block
+                                    .get("name")
                                     .and_then(Value::as_str)
                                     .unwrap_or("unknown")
                                     .to_string();
-                                let input = block.get("input")
+                                let input = block
+                                    .get("input")
                                     .map(|v| serde_json::to_string(v).unwrap_or_default())
                                     .unwrap_or_default();
                                 tool_calls.push(TrainingToolCall {
@@ -531,7 +576,11 @@ impl ClaudeCodeImporter {
                     turns.push(TrainingTurn {
                         role: "assistant".into(),
                         content: combined_text,
-                        tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls) },
+                        tool_calls: if tool_calls.is_empty() {
+                            None
+                        } else {
+                            Some(tool_calls)
+                        },
                         tool_call_id: None,
                     });
                 }

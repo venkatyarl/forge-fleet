@@ -9,7 +9,9 @@ pub struct WebSearchTool;
 
 #[async_trait]
 impl AgentTool for WebSearchTool {
-    fn name(&self) -> &str { "WebSearch" }
+    fn name(&self) -> &str {
+        "WebSearch"
+    }
 
     fn description(&self) -> &str {
         "Search the web for information. Returns search results with titles, URLs, and snippets."
@@ -50,10 +52,7 @@ impl AgentTool for WebSearchTool {
             .build()
             .unwrap_or_default();
 
-        let url = format!(
-            "https://html.duckduckgo.com/html/?q={}",
-            urlencoding(query)
-        );
+        let url = format!("https://html.duckduckgo.com/html/?q={}", urlencoding(query));
 
         match client.get(&url).send().await {
             Ok(resp) => {
@@ -70,7 +69,15 @@ impl AgentTool for WebSearchTool {
                             let output = results
                                 .iter()
                                 .enumerate()
-                                .map(|(i, r)| format!("{}. {}\n   {}\n   {}", i + 1, r.title, r.url, r.snippet))
+                                .map(|(i, r)| {
+                                    format!(
+                                        "{}. {}\n   {}\n   {}",
+                                        i + 1,
+                                        r.title,
+                                        r.url,
+                                        r.snippet
+                                    )
+                                })
                                 .collect::<Vec<_>>()
                                 .join("\n\n");
                             AgentToolResult::ok(truncate_output(&output, MAX_TOOL_RESULT_CHARS))
@@ -116,7 +123,11 @@ fn parse_ddg_results(html: &str, max: usize) -> Vec<SearchResult> {
             };
 
             if !title.is_empty() && !url.is_empty() && url.starts_with("http") {
-                results.push(SearchResult { title, url: url.to_string(), snippet });
+                results.push(SearchResult {
+                    title,
+                    url: url.to_string(),
+                    snippet,
+                });
             }
         }
     }
@@ -134,9 +145,13 @@ fn strip_tags(text: &str) -> String {
     let mut result = String::new();
     let mut in_tag = false;
     for ch in text.chars() {
-        if ch == '<' { in_tag = true; }
-        else if ch == '>' { in_tag = false; }
-        else if !in_tag { result.push(ch); }
+        if ch == '<' {
+            in_tag = true;
+        } else if ch == '>' {
+            in_tag = false;
+        } else if !in_tag {
+            result.push(ch);
+        }
     }
     result.trim().to_string()
 }

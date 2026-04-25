@@ -250,7 +250,10 @@ pub async fn download_repo(
 
         let status = resp.status();
         if status == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(format!("401 Unauthorized downloading {} — token required", file.path));
+            return Err(format!(
+                "401 Unauthorized downloading {} — token required",
+                file.path
+            ));
         }
         if status == reqwest::StatusCode::FORBIDDEN {
             return Err(format!(
@@ -276,7 +279,9 @@ pub async fn download_repo(
             let chunk = chunk.map_err(|e| format!("stream error on {}: {e}", file.path))?;
             out.write_all(&chunk).await.map_err(|e| {
                 let msg = e.to_string();
-                if e.raw_os_error() == Some(28) /* ENOSPC */ {
+                if e.raw_os_error() == Some(28)
+                /* ENOSPC */
+                {
                     format!("disk full writing {:?}: {msg}", dest_path)
                 } else {
                     format!("write error on {:?}: {msg}", dest_path)
@@ -419,7 +424,10 @@ mod tests {
         assert!(!glob_match("*.gguf", "model.safetensors"));
         assert!(glob_match("tokenizer*", "tokenizer.json"));
         assert!(glob_match("*config*", "generation_config.json"));
-        assert!(glob_match("*.safetensors", "model-00001-of-00010.safetensors"));
+        assert!(glob_match(
+            "*.safetensors",
+            "model-00001-of-00010.safetensors"
+        ));
     }
 
     #[test]
@@ -436,11 +444,13 @@ mod tests {
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
         assert!(verify_file_sha256(path, &hash).expect("verify"));
-        assert!(verify_file_sha256(
-            path,
-            "BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD"
-        )
-        .expect("verify upper"));
+        assert!(
+            verify_file_sha256(
+                path,
+                "BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD"
+            )
+            .expect("verify upper")
+        );
         assert!(!verify_file_sha256(path, &"0".repeat(64)).expect("verify bad"));
     }
 

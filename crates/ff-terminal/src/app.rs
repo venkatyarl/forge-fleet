@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use ff_agent::agent_loop::{AgentEvent, AgentSession, AgentSessionConfig};
 use ff_agent::commands::CommandRegistry;
-use ff_agent::focus_stack::{ConversationTracker, BacklogPriority, PushReason};
+use ff_agent::focus_stack::{BacklogPriority, ConversationTracker, PushReason};
 
 use crate::input::InputState;
 use crate::messages::{DisplayMessage, render_user_message};
@@ -105,7 +105,9 @@ impl ModelPicker {
             return (0..self.items.len()).collect();
         }
         let needle = self.filter.to_lowercase();
-        self.items.iter().enumerate()
+        self.items
+            .iter()
+            .enumerate()
             .filter(|(_, m)| m.name.to_lowercase().contains(&needle))
             .map(|(i, _)| i)
             .collect()
@@ -172,7 +174,9 @@ impl SessionTab {
 
     /// Push current topic onto Focus Stack (conversation drifted).
     pub fn push_focus(&mut self, title: &str, context: &str, reason: PushReason) {
-        self.tracker.focus_stack.push(title.to_string(), context.to_string(), reason);
+        self.tracker
+            .focus_stack
+            .push(title.to_string(), context.to_string(), reason);
     }
 
     /// Pop from Focus Stack (resume previous topic).
@@ -182,7 +186,9 @@ impl SessionTab {
 
     /// Add to backlog.
     pub fn add_backlog(&mut self, title: &str, description: &str, priority: BacklogPriority) {
-        self.tracker.backlog.add(title.to_string(), description.to_string(), priority);
+        self.tracker
+            .backlog
+            .add(title.to_string(), description.to_string(), priority);
     }
 }
 
@@ -282,7 +288,11 @@ impl App {
     /// Switch to previous tab.
     pub fn prev_tab(&mut self) {
         if self.tabs.len() > 1 {
-            self.active_tab = if self.active_tab == 0 { self.tabs.len() - 1 } else { self.active_tab - 1 };
+            self.active_tab = if self.active_tab == 0 {
+                self.tabs.len() - 1
+            } else {
+                self.active_tab - 1
+            };
         }
     }
 
@@ -305,17 +315,28 @@ impl App {
         }
 
         match &event {
-            AgentEvent::TurnComplete { turn, .. } => { tab.turn = *turn; }
-            AgentEvent::TokenWarning { usage_pct, estimated_tokens, .. } => {
+            AgentEvent::TurnComplete { turn, .. } => {
+                tab.turn = *turn;
+            }
+            AgentEvent::TokenWarning {
+                usage_pct,
+                estimated_tokens,
+                ..
+            } => {
                 tab.tokens_used = *estimated_tokens;
                 tab.status = format!("Context: {usage_pct:.0}%");
             }
-            AgentEvent::Done { .. } => { tab.is_running = false; tab.status = "Ready".into(); }
+            AgentEvent::Done { .. } => {
+                tab.is_running = false;
+                tab.status = "Ready".into();
+            }
             AgentEvent::Error { message, .. } => {
                 tab.is_running = false;
                 tab.status = format!("Error: {}", &message[..message.len().min(50)]);
             }
-            AgentEvent::Status { message, .. } => { tab.status = message.clone(); }
+            AgentEvent::Status { message, .. } => {
+                tab.status = message.clone();
+            }
             _ => {}
         }
     }
@@ -324,7 +345,9 @@ impl App {
     pub fn submit_input(&mut self) {
         let tab = &mut self.tabs[self.active_tab];
         let text = tab.input.submit();
-        if text.is_empty() { return; }
+        if text.is_empty() {
+            return;
+        }
         tab.messages.push(render_user_message(&text));
         tab.is_running = true;
         tab.status = "Thinking...".into();
@@ -342,7 +365,9 @@ impl App {
     }
 
     /// Tab count.
-    pub fn tab_count(&self) -> usize { self.tabs.len() }
+    pub fn tab_count(&self) -> usize {
+        self.tabs.len()
+    }
 }
 
 /// Detect project from working directory (check for FORGEFLEET.md, Cargo.toml, package.json).
@@ -387,12 +412,20 @@ fn detect_project(dir: &std::path::Path) -> Option<ProjectInfo> {
 /// database is unreachable — the TUI health-check loop will populate it later.
 async fn fleet_nodes_from_db() -> Vec<FleetNode> {
     // Read fleet.toml to get the database URL.
-    let Some(home) = dirs::home_dir() else { return Vec::new(); };
+    let Some(home) = dirs::home_dir() else {
+        return Vec::new();
+    };
     let config_path = home.join(".forgefleet/fleet.toml");
-    let Ok(toml_str) = std::fs::read_to_string(&config_path) else { return Vec::new(); };
-    let Ok(config) = toml::from_str::<ff_core::config::FleetConfig>(&toml_str) else { return Vec::new(); };
+    let Ok(toml_str) = std::fs::read_to_string(&config_path) else {
+        return Vec::new();
+    };
+    let Ok(config) = toml::from_str::<ff_core::config::FleetConfig>(&toml_str) else {
+        return Vec::new();
+    };
     let db_url = config.database.url.trim().to_string();
-    if db_url.is_empty() { return Vec::new(); }
+    if db_url.is_empty() {
+        return Vec::new();
+    }
 
     let pool = match sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
@@ -410,7 +443,9 @@ async fn fleet_nodes_from_db() -> Vec<FleetNode> {
     };
     // Prefer new lifecycle `fleet_model_deployments` (what's actually running); fall back
     // to legacy `fleet_models` (configured/desired models) when no deployments exist yet.
-    let deployments = ff_db::pg_list_deployments(&pool, None).await.unwrap_or_default();
+    let deployments = ff_db::pg_list_deployments(&pool, None)
+        .await
+        .unwrap_or_default();
     let legacy_models = ff_db::pg_list_models(&pool).await.unwrap_or_default();
 
     // Extract (runtime, model_id) from a raw "{runtime}:{model}" string.
@@ -419,8 +454,15 @@ async fn fleet_nodes_from_db() -> Vec<FleetNode> {
     // still keep this parser for the fallback path.
     fn split_runtime(raw: &str) -> (Option<String>, String) {
         const KNOWN_RUNTIMES: &[&str] = &[
-            "mlx", "mlx_lm", "MLX", "llama.cpp", "LLAMA.CPP", "vllm", "VLLM",
-            "ollama", "unknown",
+            "mlx",
+            "mlx_lm",
+            "MLX",
+            "llama.cpp",
+            "LLAMA.CPP",
+            "vllm",
+            "VLLM",
+            "ollama",
+            "unknown",
         ];
         let raw = raw.trim();
         for rt in KNOWN_RUNTIMES {
@@ -499,12 +541,26 @@ async fn fleet_nodes_from_db() -> Vec<FleetNode> {
         }
         // Drop trailing quantization / precision markers. Case-insensitive.
         let quants = [
-            "-Q2_K", "-Q3_K_S", "-Q3_K_M", "-Q3_K_L",
-            "-Q4_0", "-Q4_K_S", "-Q4_K_M", "-Q5_0", "-Q5_K_S", "-Q5_K_M",
-            "-Q6_K", "-Q8_0",
-            "-F16", "-FP16", "-FP8", "-BF16",
-            "-UD-Q4_K_M", "-UD",
-            "-4bit", "-8bit",
+            "-Q2_K",
+            "-Q3_K_S",
+            "-Q3_K_M",
+            "-Q3_K_L",
+            "-Q4_0",
+            "-Q4_K_S",
+            "-Q4_K_M",
+            "-Q5_0",
+            "-Q5_K_S",
+            "-Q5_K_M",
+            "-Q6_K",
+            "-Q8_0",
+            "-F16",
+            "-FP16",
+            "-FP8",
+            "-BF16",
+            "-UD-Q4_K_M",
+            "-UD",
+            "-4bit",
+            "-8bit",
         ];
         loop {
             let lower = s.to_lowercase();
@@ -517,7 +573,9 @@ async fn fleet_nodes_from_db() -> Vec<FleetNode> {
                     break;
                 }
             }
-            if !changed { break; }
+            if !changed {
+                break;
+            }
         }
         // Cap at 40 chars.
         if s.chars().count() > 40 {
@@ -550,7 +608,7 @@ async fn fleet_nodes_from_db() -> Vec<FleetNode> {
                     //   4. "unknown" (last resort)
                     let (parsed_rt, raw_name) = match d.catalog_id.as_deref() {
                         Some(cid) => split_runtime(cid),
-                        None => (None, String::new()),  // empty name triggers fallback below
+                        None => (None, String::new()), // empty name triggers fallback below
                     };
                     // Runtime resolution (most-specific first):
                     //   1. Prefix in catalog_id ("mlx:gemma-4")
@@ -563,8 +621,11 @@ async fn fleet_nodes_from_db() -> Vec<FleetNode> {
                         .or_else(|| infer_runtime_from_name(&raw_name))
                         .or_else(|| {
                             let r = d.runtime.trim();
-                            if r.is_empty() || r == "unknown" { None }
-                            else { Some(r.to_string()) }
+                            if r.is_empty() || r == "unknown" {
+                                None
+                            } else {
+                                Some(r.to_string())
+                            }
                         })
                         .unwrap_or_else(|| {
                             if n.runtime.trim().is_empty() || n.runtime == "unknown" {

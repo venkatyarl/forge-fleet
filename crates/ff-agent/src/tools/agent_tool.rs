@@ -7,8 +7,8 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use tracing::info;
 
-use crate::agent_loop::{AgentSession, AgentSessionConfig, AgentOutcome};
 use super::{AgentTool, AgentToolContext, AgentToolResult, MAX_TOOL_RESULT_CHARS, truncate_output};
+use crate::agent_loop::{AgentOutcome, AgentSession, AgentSessionConfig};
 
 pub struct SubAgentTool;
 
@@ -70,13 +70,29 @@ impl AgentTool for SubAgentTool {
         };
 
         // Inject provenance context into the prompt if provided.
-        let parent_task_id = input.get("parent_task_id").and_then(Value::as_str).unwrap_or("").to_string();
-        let origin_node = input.get("origin_node").and_then(Value::as_str).unwrap_or("").to_string();
+        let parent_task_id = input
+            .get("parent_task_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let origin_node = input
+            .get("origin_node")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         let prompt = if !parent_task_id.is_empty() || !origin_node.is_empty() {
             format!(
                 "[PROVENANCE: origin={}, parent_task={}]\n{}",
-                if origin_node.is_empty() { "unknown" } else { &origin_node },
-                if parent_task_id.is_empty() { "none" } else { &parent_task_id },
+                if origin_node.is_empty() {
+                    "unknown"
+                } else {
+                    &origin_node
+                },
+                if parent_task_id.is_empty() {
+                    "none"
+                } else {
+                    &parent_task_id
+                },
                 prompt
             )
         } else {
@@ -88,10 +104,7 @@ impl AgentTool for SubAgentTool {
             .and_then(Value::as_str)
             .unwrap_or("sub-agent task");
 
-        let max_turns = input
-            .get("max_turns")
-            .and_then(Value::as_u64)
-            .unwrap_or(10) as u32;
+        let max_turns = input.get("max_turns").and_then(Value::as_u64).unwrap_or(10) as u32;
 
         // Inherit parent's LLM config or use overrides.
         // Fall back to localhost so the InferenceRouter handles actual routing.
@@ -120,7 +133,11 @@ impl AgentTool for SubAgentTool {
         );
 
         let config = AgentSessionConfig {
-            model: if model.is_empty() { "auto".into() } else { model },
+            model: if model.is_empty() {
+                "auto".into()
+            } else {
+                model
+            },
             llm_base_url,
             working_dir,
             system_prompt: None,
@@ -145,12 +162,8 @@ impl AgentTool for SubAgentTool {
                 );
                 AgentToolResult::ok(truncate_output(&msg, MAX_TOOL_RESULT_CHARS))
             }
-            AgentOutcome::Cancelled => {
-                AgentToolResult::err("Sub-agent was cancelled")
-            }
-            AgentOutcome::Error(e) => {
-                AgentToolResult::err(format!("Sub-agent error: {e}"))
-            }
+            AgentOutcome::Cancelled => AgentToolResult::err("Sub-agent was cancelled"),
+            AgentOutcome::Error(e) => AgentToolResult::err(format!("Sub-agent error: {e}")),
         }
     }
 }

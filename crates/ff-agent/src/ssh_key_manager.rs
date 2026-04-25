@@ -125,7 +125,13 @@ impl SshKeyManager {
             let os_family: String = row.try_get("os_family").unwrap_or_default();
 
             let outcome = self
-                .revoke_on_target(&target, ip.as_deref(), &os_family, &public_key, &fingerprint)
+                .revoke_on_target(
+                    &target,
+                    ip.as_deref(),
+                    &os_family,
+                    &public_key,
+                    &fingerprint,
+                )
                 .await;
 
             let success = outcome.is_ok();
@@ -259,16 +265,24 @@ impl SshKeyManager {
             Duration::from_secs(20),
             Command::new("ssh")
                 .args([
-                    "-o", "BatchMode=yes",
-                    "-o", "ConnectTimeout=5",
-                    "-o", "StrictHostKeyChecking=accept-new",
+                    "-o",
+                    "BatchMode=yes",
+                    "-o",
+                    "ConnectTimeout=5",
+                    "-o",
+                    "StrictHostKeyChecking=accept-new",
                     host,
                     &remote_cmd,
                 ])
                 .output(),
         )
         .await
-        .map_err(|_| SshError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "ssh timeout")))??;
+        .map_err(|_| {
+            SshError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "ssh timeout",
+            ))
+        })??;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();

@@ -61,7 +61,9 @@ pub struct FocusStack {
 }
 
 impl FocusStack {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     /// Push the current topic onto the stack (pause it).
     pub fn push(&mut self, title: String, context: String, reason: PushReason) -> String {
@@ -122,25 +124,30 @@ impl FocusStack {
 
     /// Build a summary for display in the sidebar.
     pub fn summary(&self) -> Vec<FocusStackEntry> {
-        self.items.iter().rev().enumerate().map(|(depth, item)| {
-            let age = Utc::now().signed_duration_since(item.pushed_at);
-            let age_str = if age.num_hours() > 0 {
-                format!("{}h ago", age.num_hours())
-            } else if age.num_minutes() > 0 {
-                format!("{}m ago", age.num_minutes())
-            } else {
-                "just now".into()
-            };
+        self.items
+            .iter()
+            .rev()
+            .enumerate()
+            .map(|(depth, item)| {
+                let age = Utc::now().signed_duration_since(item.pushed_at);
+                let age_str = if age.num_hours() > 0 {
+                    format!("{}h ago", age.num_hours())
+                } else if age.num_minutes() > 0 {
+                    format!("{}m ago", age.num_minutes())
+                } else {
+                    "just now".into()
+                };
 
-            FocusStackEntry {
-                depth,
-                id: item.id.clone(),
-                title: item.title.clone(),
-                progress: item.progress,
-                age: age_str,
-                reason: item.push_reason,
-            }
-        }).collect()
+                FocusStackEntry {
+                    depth,
+                    id: item.id.clone(),
+                    title: item.title.clone(),
+                    progress: item.progress,
+                    age: age_str,
+                    reason: item.push_reason,
+                }
+            })
+            .collect()
     }
 
     /// Build context injection string for the agent system prompt.
@@ -155,7 +162,8 @@ impl FocusStack {
             let progress_bar = progress_bar(item.progress, 10);
             context.push_str(&format!(
                 "{}. **{}** [{progress_bar}] — {}\n",
-                i + 1, item.title,
+                i + 1,
+                item.title,
                 match item.push_reason {
                     PushReason::Explicit => "paused by user",
                     PushReason::TopicDrift => "topic drifted",
@@ -165,7 +173,9 @@ impl FocusStack {
                 }
             ));
         }
-        context.push_str("\nAfter completing the current task, check if any stack items should be resumed.\n");
+        context.push_str(
+            "\nAfter completing the current task, check if any stack items should be resumed.\n",
+        );
         context
     }
 }
@@ -214,7 +224,9 @@ pub struct Backlog {
 }
 
 impl Backlog {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     /// Add an item to the backlog.
     pub fn add(&mut self, title: String, description: String, priority: BacklogPriority) -> String {
@@ -251,7 +263,8 @@ impl Backlog {
     pub fn next(&self) -> Option<&BacklogItem> {
         let mut sorted: Vec<&BacklogItem> = self.items.iter().collect();
         sorted.sort_by(|a, b| {
-            b.priority.cmp(&a.priority)
+            b.priority
+                .cmp(&a.priority)
                 .then(a.created_at.cmp(&b.created_at))
         });
         sorted.first().copied()
@@ -259,7 +272,9 @@ impl Backlog {
 
     /// Remove and return the next item (dequeue).
     pub fn dequeue(&mut self) -> Option<BacklogItem> {
-        if self.items.is_empty() { return None; }
+        if self.items.is_empty() {
+            return None;
+        }
 
         // Find highest priority, oldest item
         let mut best_idx = 0;
@@ -289,8 +304,12 @@ impl Backlog {
         &self.items
     }
 
-    pub fn len(&self) -> usize { self.items.len() }
-    pub fn is_empty(&self) -> bool { self.items.is_empty() }
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
 
     /// Build context injection for the agent.
     pub fn context_injection(&self) -> String {
@@ -298,7 +317,8 @@ impl Backlog {
             return String::new();
         }
 
-        let mut context = String::from("\n## Backlog (queued items — handle after current work)\n\n");
+        let mut context =
+            String::from("\n## Backlog (queued items — handle after current work)\n\n");
         for (i, item) in self.items.iter().enumerate().take(10) {
             let priority = match item.priority {
                 BacklogPriority::Urgent => "🔴",
@@ -338,7 +358,9 @@ pub struct ConversationTracker {
 }
 
 impl ConversationTracker {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     /// Build combined context injection for the system prompt.
     pub fn context_injection(&self) -> String {
@@ -361,11 +383,9 @@ impl ConversationTracker {
     /// Promote a backlog item to the focus stack (start working on it).
     pub fn promote_from_backlog(&mut self, backlog_id: &str) -> Option<String> {
         if let Some(item) = self.backlog.remove(backlog_id) {
-            let focus_id = self.focus_stack.push(
-                item.title,
-                item.description,
-                PushReason::Explicit,
-            );
+            let focus_id =
+                self.focus_stack
+                    .push(item.title, item.description, PushReason::Explicit);
             Some(focus_id)
         } else {
             None
@@ -398,10 +418,7 @@ pub struct TrackerSummary {
 fn progress_bar(progress: f64, width: usize) -> String {
     let filled = (progress * width as f64) as usize;
     let empty = width.saturating_sub(filled);
-    format!("{}{}",
-        "█".repeat(filled),
-        "░".repeat(empty),
-    )
+    format!("{}{}", "█".repeat(filled), "░".repeat(empty),)
 }
 
 #[cfg(test)]
@@ -411,9 +428,21 @@ mod tests {
     #[test]
     fn focus_stack_filo() {
         let mut stack = FocusStack::new();
-        stack.push("First topic".into(), "context 1".into(), PushReason::Explicit);
-        stack.push("Second topic".into(), "context 2".into(), PushReason::TopicDrift);
-        stack.push("Third topic".into(), "context 3".into(), PushReason::SideInvestigation);
+        stack.push(
+            "First topic".into(),
+            "context 1".into(),
+            PushReason::Explicit,
+        );
+        stack.push(
+            "Second topic".into(),
+            "context 2".into(),
+            PushReason::TopicDrift,
+        );
+        stack.push(
+            "Third topic".into(),
+            "context 3".into(),
+            PushReason::SideInvestigation,
+        );
 
         assert_eq!(stack.depth(), 3);
 
@@ -451,7 +480,10 @@ mod tests {
     #[test]
     fn defer_from_stack_to_backlog() {
         let mut tracker = ConversationTracker::new();
-        let focus_id = tracker.focus_stack.push("Paused work".into(), "context".into(), PushReason::Explicit);
+        let focus_id =
+            tracker
+                .focus_stack
+                .push("Paused work".into(), "context".into(), PushReason::Explicit);
 
         assert_eq!(tracker.focus_stack.depth(), 1);
         assert_eq!(tracker.backlog.len(), 0);
@@ -466,8 +498,12 @@ mod tests {
     #[test]
     fn context_injection_includes_both() {
         let mut tracker = ConversationTracker::new();
-        tracker.focus_stack.push("Stack item".into(), "".into(), PushReason::Explicit);
-        tracker.backlog.add("Backlog item".into(), "".into(), BacklogPriority::Medium);
+        tracker
+            .focus_stack
+            .push("Stack item".into(), "".into(), PushReason::Explicit);
+        tracker
+            .backlog
+            .add("Backlog item".into(), "".into(), BacklogPriority::Medium);
 
         let context = tracker.context_injection();
         assert!(context.contains("Focus Stack"));

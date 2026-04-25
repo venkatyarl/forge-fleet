@@ -12,7 +12,9 @@
 
 use std::path::PathBuf;
 
-use ff_api::tool_calling::{ToolChatCompletionRequest, ToolChatCompletionResponse, ToolChatMessage};
+use ff_api::tool_calling::{
+    ToolChatCompletionRequest, ToolChatCompletionResponse, ToolChatMessage,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -115,11 +117,21 @@ impl Default for AgentSessionConfig {
 /// Anything not in this set is blocked at tool dispatch and returns a
 /// synthetic tool result telling the LLM to exit plan mode.
 pub(crate) const PLAN_MODE_READ_ONLY_TOOLS: &[&str] = &[
-    "Read", "Glob", "Grep", "WebFetch", "WebSearch", "ToolSearch",
-    "TaskList", "TaskGet",
-    "fleet_status", "fleet_nodes_db", "fleet_models_db",
-    "fleet_models_catalog", "fleet_models_search",
-    "fleet_models_library", "fleet_models_deployments",
+    "Read",
+    "Glob",
+    "Grep",
+    "WebFetch",
+    "WebSearch",
+    "ToolSearch",
+    "TaskList",
+    "TaskGet",
+    "fleet_status",
+    "fleet_nodes_db",
+    "fleet_models_db",
+    "fleet_models_catalog",
+    "fleet_models_search",
+    "fleet_models_library",
+    "fleet_models_deployments",
     "fleet_models_disk_usage",
 ];
 
@@ -140,8 +152,12 @@ pub(crate) fn plan_mode_block(permission_mode: &str, tool_name: &str) -> Option<
 /// the system prompt. Returns an empty string for "normal" (no addition).
 pub(crate) fn output_style_directive(output_style: &str) -> &'static str {
     match output_style {
-        "concise" => "\n\n## Output Style\nReply tersely. No preamble, no recap, no more than 3 sentences unless the user asks for detail.",
-        "verbose" => "\n\n## Output Style\nWalk the user through your reasoning step by step. Show your work.",
+        "concise" => {
+            "\n\n## Output Style\nReply tersely. No preamble, no recap, no more than 3 sentences unless the user asks for detail."
+        }
+        "verbose" => {
+            "\n\n## Output Style\nWalk the user through your reasoning step by step. Show your work."
+        }
         _ => "",
     }
 }
@@ -337,7 +353,10 @@ impl AgentSession {
             if let Ok(image_data) = tokio::fs::read(image_path).await {
                 use base64::Engine;
                 let b64 = base64::engine::general_purpose::STANDARD.encode(&image_data);
-                let ext = image_path.extension().and_then(|e| e.to_str()).unwrap_or("png");
+                let ext = image_path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("png");
                 let mime = match ext {
                     "jpg" | "jpeg" => "image/jpeg",
                     "gif" => "image/gif",
@@ -345,7 +364,8 @@ impl AgentSession {
                     "svg" => "image/svg+xml",
                     _ => "image/png",
                 };
-                self.messages.push(ToolChatMessage::user_with_image(&full_prompt, &b64, mime));
+                self.messages
+                    .push(ToolChatMessage::user_with_image(&full_prompt, &b64, mime));
                 // Clear image_path so it's only sent once
                 self.config.image_path = None;
             } else {
@@ -385,23 +405,31 @@ impl AgentSession {
             let task_type = crate::orchestrator_agent::analyze_task(prompt);
             let conv = crate::training::TrainingConversation {
                 id: self.id.to_string(),
-                system_prompt: self.messages.first()
+                system_prompt: self
+                    .messages
+                    .first()
                     .and_then(|m| m.text_content())
                     .unwrap_or_default()
                     .to_string(),
-                turns: self.messages.iter().skip(1).map(|m| {
-                    crate::training::TrainingTurn {
+                turns: self
+                    .messages
+                    .iter()
+                    .skip(1)
+                    .map(|m| crate::training::TrainingTurn {
                         role: m.role.clone(),
                         content: m.text_content().unwrap_or_default().to_string(),
                         tool_calls: m.tool_calls.as_ref().map(|calls| {
-                            calls.iter().map(|c| crate::training::TrainingToolCall {
-                                name: c.function.name.clone(),
-                                arguments: c.function.arguments.clone(),
-                            }).collect()
+                            calls
+                                .iter()
+                                .map(|c| crate::training::TrainingToolCall {
+                                    name: c.function.name.clone(),
+                                    arguments: c.function.arguments.clone(),
+                                })
+                                .collect()
                         }),
                         tool_call_id: m.tool_call_id.clone(),
-                    }
-                }).collect(),
+                    })
+                    .collect(),
                 task_type: format!("{:?}", task_type),
                 success,
                 collected_at: chrono::Utc::now().to_rfc3339(),
@@ -413,8 +441,11 @@ impl AgentSession {
             // Auto-learn from this session — extract and route to brains
             let brain_ctx = crate::brain::BrainLoader::load_for_dir(&self.config.working_dir).await;
             let learn_report = crate::learning::extract_and_route(
-                &self.messages, &brain_ctx, &self.id.to_string()
-            ).await;
+                &self.messages,
+                &brain_ctx,
+                &self.id.to_string(),
+            )
+            .await;
 
             // Auto-sync hive if we added hive entries
             if learn_report.hive_count > 0 {
@@ -594,14 +625,19 @@ async fn run_agent_loop(
             &event_tx,
             AgentEvent::Status {
                 session_id: session_id.clone(),
-                message: format!("Thinking... (sending {} messages to LLM)", session.messages.len()),
+                message: format!(
+                    "Thinking... (sending {} messages to LLM)",
+                    session.messages.len()
+                ),
             },
         );
 
         // Resolve the active LLM endpoint: use InferenceRouter (local-first +
         // fleet failover) when available, otherwise fall back to llm_base_url.
         let active_base = if let Some(router) = &session.config.inference_router {
-            router.active_url().unwrap_or_else(|| session.config.llm_base_url.clone())
+            router
+                .active_url()
+                .unwrap_or_else(|| session.config.llm_base_url.clone())
         } else {
             session.config.llm_base_url.clone()
         };
@@ -629,7 +665,10 @@ async fn run_agent_loop(
                 let err_str = format!("{err}");
 
                 // Detect context overflow and auto-compact
-                if err_str.contains("exceed_context_size") || err_str.contains("context size") || err_str.contains("too many tokens") {
+                if err_str.contains("exceed_context_size")
+                    || err_str.contains("context size")
+                    || err_str.contains("too many tokens")
+                {
                     let before = session.messages.len();
                     let compact_config = crate::compaction::CompactionConfig {
                         context_window_tokens: 8192, // conservative — match server
@@ -637,19 +676,28 @@ async fn run_agent_loop(
                         keep_recent_messages: 4,
                         target_free_tokens: 4000,
                     };
-                    session.messages = crate::compaction::compact_messages(&session.messages, &compact_config);
+                    session.messages =
+                        crate::compaction::compact_messages(&session.messages, &compact_config);
                     let after = session.messages.len();
                     session.usage.compaction_count += 1;
 
-                    emit(&event_tx, AgentEvent::Compaction {
-                        session_id: session_id.clone(),
-                        messages_before: before,
-                        messages_after: after,
-                    });
-                    emit(&event_tx, AgentEvent::Status {
-                        session_id: session_id.clone(),
-                        message: format!("Context overflow — auto-compacted {before} → {after} messages. Retrying..."),
-                    });
+                    emit(
+                        &event_tx,
+                        AgentEvent::Compaction {
+                            session_id: session_id.clone(),
+                            messages_before: before,
+                            messages_after: after,
+                        },
+                    );
+                    emit(
+                        &event_tx,
+                        AgentEvent::Status {
+                            session_id: session_id.clone(),
+                            message: format!(
+                                "Context overflow — auto-compacted {before} → {after} messages. Retrying..."
+                            ),
+                        },
+                    );
 
                     continue;
                 }
@@ -660,14 +708,17 @@ async fn run_agent_loop(
                     router.report_failure(&active_base);
                     let next = router.active_url();
                     if next.as_deref() != Some(active_base.as_str()) {
-                        emit(&event_tx, AgentEvent::Status {
-                            session_id: session_id.clone(),
-                            message: format!(
-                                "LLM at {} unreachable — failing over to {}",
-                                active_base,
-                                next.as_deref().unwrap_or("(none)")
-                            ),
-                        });
+                        emit(
+                            &event_tx,
+                            AgentEvent::Status {
+                                session_id: session_id.clone(),
+                                message: format!(
+                                    "LLM at {} unreachable — failing over to {}",
+                                    active_base,
+                                    next.as_deref().unwrap_or("(none)")
+                                ),
+                            },
+                        );
                         // Retry this turn immediately on the new endpoint
                         continue;
                     }
@@ -677,10 +728,18 @@ async fn run_agent_loop(
                 llm_retry_count += 1;
                 if llm_retry_count <= 3 {
                     let delay_ms = 1000 * (1u64 << llm_retry_count); // 2s, 4s, 8s
-                    emit(&event_tx, AgentEvent::Status {
-                        session_id: session_id.clone(),
-                        message: format!("LLM error (attempt {}/3), retrying in {}s: {}", llm_retry_count, delay_ms / 1000, &err_str[..err_str.len().min(100)]),
-                    });
+                    emit(
+                        &event_tx,
+                        AgentEvent::Status {
+                            session_id: session_id.clone(),
+                            message: format!(
+                                "LLM error (attempt {}/3), retrying in {}s: {}",
+                                llm_retry_count,
+                                delay_ms / 1000,
+                                &err_str[..err_str.len().min(100)]
+                            ),
+                        },
+                    );
                     tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                     continue;
                 }
@@ -766,7 +825,10 @@ async fn run_agent_loop(
             if let Some(text) = assistant_msg.text_content() {
                 let text_calls = openai_bridge::parse_text_tool_calls(text);
                 if !text_calls.is_empty() {
-                    debug!(count = text_calls.len(), "parsed tool calls from text fallback");
+                    debug!(
+                        count = text_calls.len(),
+                        "parsed tool calls from text fallback"
+                    );
                     tool_calls = text_calls;
                 }
             }
@@ -852,15 +914,20 @@ async fn run_agent_loop(
                 let args_str = tc.function.arguments.clone();
 
                 // Plan-mode gate: short-circuit without spawning.
-                if let Some(blocked_msg) = plan_mode_block(&session.config.permission_mode, &tool_name) {
-                    emit(&event_tx, AgentEvent::ToolEnd {
-                        session_id: session_id.clone(),
-                        tool_name: tool_name.clone(),
-                        tool_id: tool_id.clone(),
-                        result: blocked_msg.clone(),
-                        is_error: true,
-                        duration_ms: 0,
-                    });
+                if let Some(blocked_msg) =
+                    plan_mode_block(&session.config.permission_mode, &tool_name)
+                {
+                    emit(
+                        &event_tx,
+                        AgentEvent::ToolEnd {
+                            session_id: session_id.clone(),
+                            tool_name: tool_name.clone(),
+                            tool_id: tool_id.clone(),
+                            result: blocked_msg.clone(),
+                            is_error: true,
+                            duration_ms: 0,
+                        },
+                    );
                     pre_blocked.push((tool_id, blocked_msg, true));
                     continue;
                 }
@@ -872,15 +939,23 @@ async fn run_agent_loop(
 
                 futures.push(tokio::spawn(async move {
                     execute_single_tool(
-                        &tool_name, &tool_id, &args_str,
-                        &tools_clone, &ctx, &event_tx_clone, &sid,
-                    ).await
+                        &tool_name,
+                        &tool_id,
+                        &args_str,
+                        &tools_clone,
+                        &ctx,
+                        &event_tx_clone,
+                        &sid,
+                    )
+                    .await
                 }));
             }
 
             // Record pre-blocked results first
             for (tool_id, content, is_error) in pre_blocked {
-                if is_error { session.consecutive_errors += 1; }
+                if is_error {
+                    session.consecutive_errors += 1;
+                }
                 tool_results.push((tool_id, content));
             }
 
@@ -888,8 +963,14 @@ async fn run_agent_loop(
             for result in results {
                 match result {
                     Ok((tool_id, content, is_error, should_end_turn)) => {
-                        if is_error { session.consecutive_errors += 1; } else { session.consecutive_errors = 0; }
-                        if should_end_turn { end_turn_requested = true; }
+                        if is_error {
+                            session.consecutive_errors += 1;
+                        } else {
+                            session.consecutive_errors = 0;
+                        }
+                        if should_end_turn {
+                            end_turn_requested = true;
+                        }
                         tool_results.push((tool_id, content));
                     }
                     Err(e) => {
@@ -901,126 +982,136 @@ async fn run_agent_loop(
 
             // Append all tool result messages
             for (tool_id, content) in &tool_results {
-                session.messages.push(ToolChatMessage::tool_result(tool_id, content));
+                session
+                    .messages
+                    .push(ToolChatMessage::tool_result(tool_id, content));
             }
         } else {
             // Single tool — execute directly (avoids spawn overhead)
             for tc in &tool_calls {
-            let tool_name = tc.function.name.clone();
-            let tool_id = tc.id.clone();
-            let args_str = tc.function.arguments.clone();
-
-            emit(
-                &event_tx,
-                AgentEvent::ToolStart {
-                    session_id: session_id.clone(),
-                    tool_name: tool_name.clone(),
-                    tool_id: tool_id.clone(),
-                    input_json: args_str.clone(),
-                },
-            );
-
-            // Parse arguments
-            let args: serde_json::Value = match serde_json::from_str(&args_str) {
-                Ok(v) => v,
-                Err(e) => match try_fix_json(&args_str) {
-                    Some(v) => v,
-                    None => {
-                        let err_msg =
-                            format!("Failed to parse tool arguments: {e}\nRaw: {args_str}");
-                        emit(
-                            &event_tx,
-                            AgentEvent::ToolEnd {
-                                session_id: session_id.clone(),
-                                tool_name: tool_name.clone(),
-                                tool_id: tool_id.clone(),
-                                result: err_msg.clone(),
-                                is_error: true,
-                                duration_ms: 0,
-                            },
-                        );
-                        session
-                            .messages
-                            .push(ToolChatMessage::tool_result(&tool_id, &err_msg));
-                        continue;
-                    }
-                },
-            };
-
-            // --- Plan-mode gate: block mutating tools before dispatch ---
-            if let Some(blocked_msg) = plan_mode_block(&session.config.permission_mode, &tool_name) {
-                emit(
-                    &event_tx,
-                    AgentEvent::ToolEnd {
-                        session_id: session_id.clone(),
-                        tool_name: tool_name.clone(),
-                        tool_id: tool_id.clone(),
-                        result: blocked_msg.clone(),
-                        is_error: true,
-                        duration_ms: 0,
-                    },
-                );
-                session
-                    .messages
-                    .push(ToolChatMessage::tool_result(&tool_id, &blocked_msg));
-                continue;
-            }
-
-            // Find and execute tool
-            if let Some(idx) = tools::find_tool_arc(&tool_name, &session.tools) {
-                let start = std::time::Instant::now();
-                let result = session.tools[idx].execute(args, &session.tool_ctx).await;
-                let duration_ms = start.elapsed().as_millis() as u64;
-
-                let result_content =
-                    tools::truncate_output(&result.content, tools::MAX_TOOL_RESULT_CHARS);
-
-                if result.is_error { session.consecutive_errors += 1; } else { session.consecutive_errors = 0; }
-                if result.should_end_turn { end_turn_requested = true; }
+                let tool_name = tc.function.name.clone();
+                let tool_id = tc.id.clone();
+                let args_str = tc.function.arguments.clone();
 
                 emit(
                     &event_tx,
-                    AgentEvent::ToolEnd {
+                    AgentEvent::ToolStart {
                         session_id: session_id.clone(),
                         tool_name: tool_name.clone(),
                         tool_id: tool_id.clone(),
-                        result: result_content.clone(),
-                        is_error: result.is_error,
-                        duration_ms,
+                        input_json: args_str.clone(),
                     },
                 );
 
-                session
-                    .messages
-                    .push(ToolChatMessage::tool_result(&tool_id, &result_content));
-            } else {
-                let err_msg = format!(
-                    "Unknown tool: {tool_name}. Available tools: {}",
+                // Parse arguments
+                let args: serde_json::Value = match serde_json::from_str(&args_str) {
+                    Ok(v) => v,
+                    Err(e) => match try_fix_json(&args_str) {
+                        Some(v) => v,
+                        None => {
+                            let err_msg =
+                                format!("Failed to parse tool arguments: {e}\nRaw: {args_str}");
+                            emit(
+                                &event_tx,
+                                AgentEvent::ToolEnd {
+                                    session_id: session_id.clone(),
+                                    tool_name: tool_name.clone(),
+                                    tool_id: tool_id.clone(),
+                                    result: err_msg.clone(),
+                                    is_error: true,
+                                    duration_ms: 0,
+                                },
+                            );
+                            session
+                                .messages
+                                .push(ToolChatMessage::tool_result(&tool_id, &err_msg));
+                            continue;
+                        }
+                    },
+                };
+
+                // --- Plan-mode gate: block mutating tools before dispatch ---
+                if let Some(blocked_msg) =
+                    plan_mode_block(&session.config.permission_mode, &tool_name)
+                {
+                    emit(
+                        &event_tx,
+                        AgentEvent::ToolEnd {
+                            session_id: session_id.clone(),
+                            tool_name: tool_name.clone(),
+                            tool_id: tool_id.clone(),
+                            result: blocked_msg.clone(),
+                            is_error: true,
+                            duration_ms: 0,
+                        },
+                    );
                     session
-                        .tools
-                        .iter()
-                        .map(|t| t.name())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
+                        .messages
+                        .push(ToolChatMessage::tool_result(&tool_id, &blocked_msg));
+                    continue;
+                }
 
-                emit(
-                    &event_tx,
-                    AgentEvent::ToolEnd {
-                        session_id: session_id.clone(),
-                        tool_name: tool_name.clone(),
-                        tool_id: tool_id.clone(),
-                        result: err_msg.clone(),
-                        is_error: true,
-                        duration_ms: 0,
-                    },
-                );
+                // Find and execute tool
+                if let Some(idx) = tools::find_tool_arc(&tool_name, &session.tools) {
+                    let start = std::time::Instant::now();
+                    let result = session.tools[idx].execute(args, &session.tool_ctx).await;
+                    let duration_ms = start.elapsed().as_millis() as u64;
 
-                session
-                    .messages
-                    .push(ToolChatMessage::tool_result(&tool_id, &err_msg));
+                    let result_content =
+                        tools::truncate_output(&result.content, tools::MAX_TOOL_RESULT_CHARS);
+
+                    if result.is_error {
+                        session.consecutive_errors += 1;
+                    } else {
+                        session.consecutive_errors = 0;
+                    }
+                    if result.should_end_turn {
+                        end_turn_requested = true;
+                    }
+
+                    emit(
+                        &event_tx,
+                        AgentEvent::ToolEnd {
+                            session_id: session_id.clone(),
+                            tool_name: tool_name.clone(),
+                            tool_id: tool_id.clone(),
+                            result: result_content.clone(),
+                            is_error: result.is_error,
+                            duration_ms,
+                        },
+                    );
+
+                    session
+                        .messages
+                        .push(ToolChatMessage::tool_result(&tool_id, &result_content));
+                } else {
+                    let err_msg = format!(
+                        "Unknown tool: {tool_name}. Available tools: {}",
+                        session
+                            .tools
+                            .iter()
+                            .map(|t| t.name())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+
+                    emit(
+                        &event_tx,
+                        AgentEvent::ToolEnd {
+                            session_id: session_id.clone(),
+                            tool_name: tool_name.clone(),
+                            tool_id: tool_id.clone(),
+                            result: err_msg.clone(),
+                            is_error: true,
+                            duration_ms: 0,
+                        },
+                    );
+
+                    session
+                        .messages
+                        .push(ToolChatMessage::tool_result(&tool_id, &err_msg));
+                }
             }
-        }
         } // close else (single tool)
 
         // --- End-turn request from tool (e.g. AskUserQuestion) ---
@@ -1061,19 +1152,25 @@ async fn run_agent_loop(
             }
 
             if session.auto_verify_rust == Some(true) {
-                emit(&event_tx, AgentEvent::Status {
-                    session_id: session_id.clone(),
-                    message: "Verifying build (cargo check --workspace)...".into(),
-                });
+                emit(
+                    &event_tx,
+                    AgentEvent::Status {
+                        session_id: session_id.clone(),
+                        message: "Verifying build (cargo check --workspace)...".into(),
+                    },
+                );
 
                 let verdict = cargo_check_workspace(&session.config.working_dir, 2000).await;
                 match verdict {
                     CargoVerifyResult::Ok => {
                         session.build_verify_retries = 0;
-                        emit(&event_tx, AgentEvent::Status {
-                            session_id: session_id.clone(),
-                            message: "cargo check: ok".into(),
-                        });
+                        emit(
+                            &event_tx,
+                            AgentEvent::Status {
+                                session_id: session_id.clone(),
+                                message: "cargo check: ok".into(),
+                            },
+                        );
                     }
                     CargoVerifyResult::Skipped(why) => {
                         debug!(session = %session_id, reason = %why, "cargo check skipped");
@@ -1092,20 +1189,26 @@ async fn run_agent_loop(
                                  after Rust edits — aborting task so the supervisor can retry.",
                                 MAX_BUILD_VERIFY_RETRIES
                             );
-                            emit(&event_tx, AgentEvent::Error {
-                                session_id: session_id.clone(),
-                                message: msg.clone(),
-                            });
+                            emit(
+                                &event_tx,
+                                AgentEvent::Error {
+                                    session_id: session_id.clone(),
+                                    message: msg.clone(),
+                                },
+                            );
                             return AgentOutcome::Error(msg);
                         }
 
-                        emit(&event_tx, AgentEvent::Status {
-                            session_id: session_id.clone(),
-                            message: format!(
-                                "cargo check failed (retry {}/{}). Injecting errors for fix...",
-                                session.build_verify_retries, MAX_BUILD_VERIFY_RETRIES
-                            ),
-                        });
+                        emit(
+                            &event_tx,
+                            AgentEvent::Status {
+                                session_id: session_id.clone(),
+                                message: format!(
+                                    "cargo check failed (retry {}/{}). Injecting errors for fix...",
+                                    session.build_verify_retries, MAX_BUILD_VERIFY_RETRIES
+                                ),
+                            },
+                        );
 
                         session.messages.push(ToolChatMessage::user(format!(
                             "Your last edit broke the build. Fix these errors:\n\n\
@@ -1120,22 +1223,38 @@ async fn run_agent_loop(
 
         // --- Loop detection ---
         for tc in &tool_calls {
-            let sig = format!("{}:{}", tc.function.name, &tc.function.arguments[..tc.function.arguments.len().min(80)]);
+            let sig = format!(
+                "{}:{}",
+                tc.function.name,
+                &tc.function.arguments[..tc.function.arguments.len().min(80)]
+            );
             session.recent_tool_sigs.push(sig);
         }
         // Keep sliding window of last 20 signatures
         if session.recent_tool_sigs.len() > 20 {
-            session.recent_tool_sigs.drain(0..session.recent_tool_sigs.len() - 20);
+            session
+                .recent_tool_sigs
+                .drain(0..session.recent_tool_sigs.len() - 20);
         }
         // Check for repetition
         if let Some(last) = session.recent_tool_sigs.last() {
-            let repeat_count = session.recent_tool_sigs.iter().filter(|s| *s == last).count();
+            let repeat_count = session
+                .recent_tool_sigs
+                .iter()
+                .filter(|s| *s == last)
+                .count();
             if repeat_count >= 3 {
                 warn!(session = %session_id, tool = %last, count = repeat_count, "loop detected");
-                emit(&event_tx, AgentEvent::Status {
-                    session_id: session_id.clone(),
-                    message: format!("Loop detected: same action repeated {} times. Injecting recovery...", repeat_count),
-                });
+                emit(
+                    &event_tx,
+                    AgentEvent::Status {
+                        session_id: session_id.clone(),
+                        message: format!(
+                            "Loop detected: same action repeated {} times. Injecting recovery...",
+                            repeat_count
+                        ),
+                    },
+                );
                 session.messages.push(ToolChatMessage::user(
                     "STOP. You are repeating the same action in a loop. \
                      This approach is not working. Step back and try a completely different strategy. \
@@ -1149,10 +1268,16 @@ async fn run_agent_loop(
         // --- Consecutive error ceiling ---
         if session.consecutive_errors >= 5 {
             warn!(session = %session_id, errors = session.consecutive_errors, "consecutive error ceiling hit");
-            emit(&event_tx, AgentEvent::Status {
-                session_id: session_id.clone(),
-                message: format!("{} consecutive tool errors. Injecting recovery...", session.consecutive_errors),
-            });
+            emit(
+                &event_tx,
+                AgentEvent::Status {
+                    session_id: session_id.clone(),
+                    message: format!(
+                        "{} consecutive tool errors. Injecting recovery...",
+                        session.consecutive_errors
+                    ),
+                },
+            );
             session.messages.push(ToolChatMessage::user(
                 "5 consecutive tool calls have failed. STOP and reassess. \
                  What is fundamentally wrong? Check if the file exists, if you have the right path, \
@@ -1236,12 +1361,15 @@ async fn execute_single_tool(
     event_tx: &Option<mpsc::UnboundedSender<AgentEvent>>,
     session_id: &str,
 ) -> (String, String, bool, bool) {
-    emit(event_tx, AgentEvent::ToolStart {
-        session_id: session_id.to_string(),
-        tool_name: tool_name.to_string(),
-        tool_id: tool_id.to_string(),
-        input_json: args_str.to_string(),
-    });
+    emit(
+        event_tx,
+        AgentEvent::ToolStart {
+            session_id: session_id.to_string(),
+            tool_name: tool_name.to_string(),
+            tool_id: tool_id.to_string(),
+            input_json: args_str.to_string(),
+        },
+    );
 
     let args: serde_json::Value = match serde_json::from_str(args_str) {
         Ok(v) => v,
@@ -1249,12 +1377,17 @@ async fn execute_single_tool(
             Some(v) => v,
             None => {
                 let err = format!("Failed to parse tool arguments: {e}");
-                emit(event_tx, AgentEvent::ToolEnd {
-                    session_id: session_id.to_string(),
-                    tool_name: tool_name.to_string(),
-                    tool_id: tool_id.to_string(),
-                    result: err.clone(), is_error: true, duration_ms: 0,
-                });
+                emit(
+                    event_tx,
+                    AgentEvent::ToolEnd {
+                        session_id: session_id.to_string(),
+                        tool_name: tool_name.to_string(),
+                        tool_id: tool_id.to_string(),
+                        result: err.clone(),
+                        is_error: true,
+                        duration_ms: 0,
+                    },
+                );
                 return (tool_id.to_string(), err, true, false);
             }
         },
@@ -1266,32 +1399,43 @@ async fn execute_single_tool(
         let duration_ms = start.elapsed().as_millis() as u64;
         let content = tools::truncate_output(&result.content, tools::MAX_TOOL_RESULT_CHARS);
 
-        emit(event_tx, AgentEvent::ToolEnd {
-            session_id: session_id.to_string(),
-            tool_name: tool_name.to_string(),
-            tool_id: tool_id.to_string(),
-            result: content.clone(), is_error: result.is_error, duration_ms,
-        });
+        emit(
+            event_tx,
+            AgentEvent::ToolEnd {
+                session_id: session_id.to_string(),
+                tool_name: tool_name.to_string(),
+                tool_id: tool_id.to_string(),
+                result: content.clone(),
+                is_error: result.is_error,
+                duration_ms,
+            },
+        );
 
-        (tool_id.to_string(), content, result.is_error, result.should_end_turn)
+        (
+            tool_id.to_string(),
+            content,
+            result.is_error,
+            result.should_end_turn,
+        )
     } else {
         let err = format!("Unknown tool: {tool_name}");
-        emit(event_tx, AgentEvent::ToolEnd {
-            session_id: session_id.to_string(),
-            tool_name: tool_name.to_string(),
-            tool_id: tool_id.to_string(),
-            result: err.clone(), is_error: true, duration_ms: 0,
-        });
+        emit(
+            event_tx,
+            AgentEvent::ToolEnd {
+                session_id: session_id.to_string(),
+                tool_name: tool_name.to_string(),
+                tool_id: tool_id.to_string(),
+                result: err.clone(),
+                is_error: true,
+                duration_ms: 0,
+            },
+        );
         (tool_id.to_string(), err, true, false)
     }
 }
 
 fn truncate_for_error(s: &str) -> &str {
-    if s.len() > 500 {
-        &s[..500]
-    } else {
-        s
-    }
+    if s.len() > 500 { &s[..500] } else { s }
 }
 
 /// Attempt to fix common JSON issues from LLMs.
@@ -1322,7 +1466,8 @@ pub(crate) const RUST_MUTATING_TOOLS: &[&str] = &["Edit", "Write", "MultiEdit", 
 /// `notebook_path` key used by NotebookEdit.
 pub(crate) fn tool_call_file_path(args_json: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(args_json).ok()?;
-    let p = v.get("file_path")
+    let p = v
+        .get("file_path")
         .or_else(|| v.get("notebook_path"))
         .and_then(|x| x.as_str())?;
     Some(p.to_string())
@@ -1369,9 +1514,7 @@ pub(crate) async fn cargo_check_workspace(
 ) -> CargoVerifyResult {
     let manifest_dir = match find_cargo_manifest_dir(working_dir) {
         Some(d) => d,
-        None => return CargoVerifyResult::Skipped(
-            "no Cargo.toml in or above working_dir".into()
-        ),
+        None => return CargoVerifyResult::Skipped("no Cargo.toml in or above working_dir".into()),
     };
 
     let fut = tokio::process::Command::new("cargo")
@@ -1410,7 +1553,10 @@ pub(crate) async fn auto_verify_rust_enabled() -> bool {
         None => true,
         Some(v) => {
             let first = v.trim().chars().next();
-            !matches!(first, Some('0') | Some('f') | Some('F') | Some('n') | Some('N'))
+            !matches!(
+                first,
+                Some('0') | Some('f') | Some('F') | Some('n') | Some('N')
+            )
         }
     }
 }

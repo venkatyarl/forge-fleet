@@ -13,7 +13,9 @@ pub struct TrainingTool;
 
 #[async_trait]
 impl AgentTool for TrainingTool {
-    fn name(&self) -> &str { "Training" }
+    fn name(&self) -> &str {
+        "Training"
+    }
 
     fn description(&self) -> &str {
         "Manage ForgeFleet's LoRA fine-tuning pipeline. Actions: \
@@ -43,25 +45,37 @@ impl AgentTool for TrainingTool {
     }
 
     async fn execute(&self, input: Value, ctx: &AgentToolContext) -> AgentToolResult {
-        let action = input.get("action").and_then(Value::as_str).unwrap_or("status");
+        let action = input
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or("status");
 
         match action {
             "status" => execute_status().await,
             "import" => execute_import().await,
             "export" => execute_export().await,
             "train" => {
-                let model = input.get("model").and_then(Value::as_str).unwrap_or("Qwen/Qwen3-8B");
+                let model = input
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Qwen/Qwen3-8B");
                 execute_train(model, ctx).await
             }
             "list_adapters" => execute_list_adapters().await,
-            _ => AgentToolResult::err(format!("Unknown action: {}. Use: status, import, export, train, list_adapters", action)),
+            _ => AgentToolResult::err(format!(
+                "Unknown action: {}. Use: status, import, export, train, list_adapters",
+                action
+            )),
         }
     }
 }
 
 async fn execute_status() -> AgentToolResult {
     let readiness = training::readiness_check().await;
-    let cc_dir = dirs::home_dir().unwrap_or_default().join(".claude").join("projects");
+    let cc_dir = dirs::home_dir()
+        .unwrap_or_default()
+        .join(".claude")
+        .join("projects");
     let cc_exists = cc_dir.exists();
 
     let mut status = format!(
@@ -77,11 +91,18 @@ async fn execute_status() -> AgentToolResult {
         readiness.recommended,
         if readiness.ready { "YES" } else { "NO" },
         readiness.quality,
-        if cc_exists { "yes (can import with action='import')" } else { "no" },
+        if cc_exists {
+            "yes (can import with action='import')"
+        } else {
+            "no"
+        },
     );
 
     // Check for existing adapters
-    let adapter_dir = dirs::home_dir().unwrap_or_default().join(".forgefleet").join("lora_adapters");
+    let adapter_dir = dirs::home_dir()
+        .unwrap_or_default()
+        .join(".forgefleet")
+        .join("lora_adapters");
     if adapter_dir.exists() {
         if let Ok(mut entries) = tokio::fs::read_dir(&adapter_dir).await {
             status.push_str("\nExisting adapters:\n");
@@ -101,7 +122,13 @@ async fn execute_status() -> AgentToolResult {
                 status.push_str("\n⚡ Training is currently in progress!\n");
                 // Show last few lines
                 let lines: Vec<&str> = content.lines().collect();
-                let last = lines.iter().rev().take(3).rev().cloned().collect::<Vec<_>>();
+                let last = lines
+                    .iter()
+                    .rev()
+                    .take(3)
+                    .rev()
+                    .cloned()
+                    .collect::<Vec<_>>();
                 status.push_str(&format!("Latest: {}\n", last.join(" | ")));
             }
         }
@@ -137,11 +164,9 @@ async fn execute_export() -> AgentToolResult {
         .join("dataset.jsonl");
 
     match training::export_dataset(&output.to_string_lossy()).await {
-        Ok((path, count)) => AgentToolResult::ok(format!(
-            "Exported {} examples to {}",
-            count,
-            path.display()
-        )),
+        Ok((path, count)) => {
+            AgentToolResult::ok(format!("Exported {} examples to {}", count, path.display()))
+        }
         Err(e) => AgentToolResult::err(format!("Export failed: {}", e)),
     }
 }
@@ -157,7 +182,9 @@ async fn execute_train(model: &str, ctx: &AgentToolContext) -> AgentToolResult {
             .join("scripts")
             .join("train_lora_mlx.sh");
         if !alt.exists() {
-            return AgentToolResult::err("Training script not found. Expected at scripts/train_lora_mlx.sh");
+            return AgentToolResult::err(
+                "Training script not found. Expected at scripts/train_lora_mlx.sh",
+            );
         }
     }
 
@@ -197,7 +224,10 @@ async fn execute_train(model: &str, ctx: &AgentToolContext) -> AgentToolResult {
 }
 
 async fn execute_list_adapters() -> AgentToolResult {
-    let adapter_dir = dirs::home_dir().unwrap_or_default().join(".forgefleet").join("lora_adapters");
+    let adapter_dir = dirs::home_dir()
+        .unwrap_or_default()
+        .join(".forgefleet")
+        .join("lora_adapters");
 
     if !adapter_dir.exists() {
         return AgentToolResult::ok("No adapters found. Run training first.");

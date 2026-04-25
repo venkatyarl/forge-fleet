@@ -3,7 +3,7 @@
 //! When stream:true is set, the LLM returns text/event-stream with delta chunks.
 //! This module parses SSE format and emits token-by-token events.
 
-use ff_api::tool_calling::{ToolChatMessage, ToolCall, FunctionCall};
+use ff_api::tool_calling::{FunctionCall, ToolCall, ToolChatMessage};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -102,11 +102,16 @@ impl StreamAccumulator {
     /// Finalize into a ToolChatMessage.
     pub fn into_message(self) -> ToolChatMessage {
         if !self.tool_calls.is_empty() {
-            let calls: Vec<ToolCall> = self.tool_calls
+            let calls: Vec<ToolCall> = self
+                .tool_calls
                 .into_iter()
                 .filter(|tc| !tc.name.is_empty())
                 .map(|tc| ToolCall {
-                    id: if tc.id.is_empty() { format!("call_{}", uuid::Uuid::new_v4().as_simple()) } else { tc.id },
+                    id: if tc.id.is_empty() {
+                        format!("call_{}", uuid::Uuid::new_v4().as_simple())
+                    } else {
+                        tc.id
+                    },
                     call_type: "function".into(),
                     function: FunctionCall {
                         name: tc.name,
@@ -144,14 +149,30 @@ pub fn parse_sse_line(line: &str) -> Option<StreamChunk> {
     let delta = choice.get("delta")?;
 
     Some(StreamChunk {
-        id: json.get("id").and_then(Value::as_str).unwrap_or("").to_string(),
-        model: json.get("model").and_then(Value::as_str).unwrap_or("").to_string(),
+        id: json
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        model: json
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
         delta: StreamDelta {
             role: delta.get("role").and_then(Value::as_str).map(String::from),
-            content: delta.get("content").and_then(Value::as_str).map(String::from),
-            tool_calls: delta.get("tool_calls").and_then(|tc| serde_json::from_value(tc.clone()).ok()),
+            content: delta
+                .get("content")
+                .and_then(Value::as_str)
+                .map(String::from),
+            tool_calls: delta
+                .get("tool_calls")
+                .and_then(|tc| serde_json::from_value(tc.clone()).ok()),
         },
-        finish_reason: choice.get("finish_reason").and_then(Value::as_str).map(String::from),
+        finish_reason: choice
+            .get("finish_reason")
+            .and_then(Value::as_str)
+            .map(String::from),
     })
 }
 
@@ -183,13 +204,23 @@ mod tests {
     fn accumulate_content() {
         let mut acc = StreamAccumulator::new();
         acc.feed(&StreamChunk {
-            id: "1".into(), model: "test".into(),
-            delta: StreamDelta { role: None, content: Some("Hel".into()), tool_calls: None },
+            id: "1".into(),
+            model: "test".into(),
+            delta: StreamDelta {
+                role: None,
+                content: Some("Hel".into()),
+                tool_calls: None,
+            },
             finish_reason: None,
         });
         acc.feed(&StreamChunk {
-            id: "1".into(), model: "test".into(),
-            delta: StreamDelta { role: None, content: Some("lo!".into()), tool_calls: None },
+            id: "1".into(),
+            model: "test".into(),
+            delta: StreamDelta {
+                role: None,
+                content: Some("lo!".into()),
+                tool_calls: None,
+            },
             finish_reason: Some("stop".into()),
         });
 
@@ -204,23 +235,37 @@ mod tests {
     fn accumulate_tool_calls() {
         let mut acc = StreamAccumulator::new();
         acc.feed(&StreamChunk {
-            id: "1".into(), model: "test".into(),
+            id: "1".into(),
+            model: "test".into(),
             delta: StreamDelta {
-                role: None, content: None,
+                role: None,
+                content: None,
                 tool_calls: Some(vec![StreamToolCallDelta {
-                    index: 0, id: Some("call_1".into()), call_type: Some("function".into()),
-                    function: Some(StreamFunctionDelta { name: Some("Bash".into()), arguments: Some("{\"com".into()) }),
+                    index: 0,
+                    id: Some("call_1".into()),
+                    call_type: Some("function".into()),
+                    function: Some(StreamFunctionDelta {
+                        name: Some("Bash".into()),
+                        arguments: Some("{\"com".into()),
+                    }),
                 }]),
             },
             finish_reason: None,
         });
         acc.feed(&StreamChunk {
-            id: "1".into(), model: "test".into(),
+            id: "1".into(),
+            model: "test".into(),
             delta: StreamDelta {
-                role: None, content: None,
+                role: None,
+                content: None,
                 tool_calls: Some(vec![StreamToolCallDelta {
-                    index: 0, id: None, call_type: None,
-                    function: Some(StreamFunctionDelta { name: None, arguments: Some("mand\":\"ls\"}".into()) }),
+                    index: 0,
+                    id: None,
+                    call_type: None,
+                    function: Some(StreamFunctionDelta {
+                        name: None,
+                        arguments: Some("mand\":\"ls\"}".into()),
+                    }),
                 }]),
             },
             finish_reason: Some("tool_calls".into()),

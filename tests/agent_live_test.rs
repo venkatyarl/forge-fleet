@@ -27,7 +27,9 @@ async fn agent_executes_bash_via_tool() {
         model: "Qwen2.5-Coder-32B-Instruct-Q4_K_M.gguf".into(),
         llm_base_url: "http://192.168.5.102:51000".into(),
         working_dir: PathBuf::from("/tmp"),
-        system_prompt: Some("You are a coding agent. Use the Bash tool to run commands. Be concise.".into()),
+        system_prompt: Some(
+            "You are a coding agent. Use the Bash tool to run commands. Be concise.".into(),
+        ),
         max_turns: 3,
         temperature: 0.3,
         max_tokens: 256,
@@ -42,14 +44,19 @@ async fn agent_executes_bash_via_tool() {
     let events_handle = tokio::spawn(async move {
         let mut events = Vec::new();
         while let Some(event) = event_rx.recv().await {
-            eprintln!("EVENT: {}", serde_json::to_string(&event).unwrap_or_default());
+            eprintln!(
+                "EVENT: {}",
+                serde_json::to_string(&event).unwrap_or_default()
+            );
             events.push(event);
         }
         events
     });
 
     // Simple prompt that should trigger a Bash tool call
-    let outcome = session.run("Run: echo ForgeFleet-Agent-Works", Some(event_tx)).await;
+    let outcome = session
+        .run("Run: echo ForgeFleet-Agent-Works", Some(event_tx))
+        .await;
 
     drop(session);
     let events = events_handle.await.unwrap();
@@ -74,5 +81,8 @@ async fn agent_executes_bash_via_tool() {
 
     // The test passes regardless of outcome (we're testing connectivity),
     // but log everything for debugging
-    assert!(!events.is_empty(), "should have received events from the agent loop");
+    assert!(
+        !events.is_empty(),
+        "should have received events from the agent loop"
+    );
 }

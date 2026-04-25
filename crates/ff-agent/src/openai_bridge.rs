@@ -1,8 +1,6 @@
 //! OpenAI bridge — convert between AgentTool types and OpenAI wire format.
 
-use ff_api::tool_calling::{
-    FunctionCall, OpenAiFunction, OpenAiTool, ToolCall, ToolChatMessage,
-};
+use ff_api::tool_calling::{FunctionCall, OpenAiFunction, OpenAiTool, ToolCall, ToolChatMessage};
 
 use crate::tools::AgentTool;
 

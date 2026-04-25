@@ -77,9 +77,10 @@ impl SoftwareCollector {
             if let Some(raw) = run("ff", &["--version"]) {
                 let parsed = parse_ff_version_line(&raw);
                 if let Some(ver) = parsed.version.clone() {
-                    let meta = parsed.git_state.clone().map(|s| {
-                        serde_json::json!({ "git_state": s })
-                    });
+                    let meta = parsed
+                        .git_state
+                        .clone()
+                        .map(|s| serde_json::json!({ "git_state": s }));
                     out.push(InstalledSoftware {
                         id: "ff".into(),
                         version: ver,
@@ -89,9 +90,9 @@ impl SoftwareCollector {
                     });
                 }
                 if let Some(sha) = parsed.sha {
-                    let meta = parsed.git_state.map(|s| {
-                        serde_json::json!({ "git_state": s })
-                    });
+                    let meta = parsed
+                        .git_state
+                        .map(|s| serde_json::json!({ "git_state": s }));
                     out.push(InstalledSoftware {
                         id: "ff_git".into(),
                         version: sha,
@@ -118,9 +119,10 @@ impl SoftwareCollector {
             if let Some(raw) = run("forgefleetd", &["--version"]) {
                 let parsed = parse_ff_version_line(&raw);
                 if let Some(ver) = parsed.version.clone() {
-                    let meta = parsed.git_state.clone().map(|s| {
-                        serde_json::json!({ "git_state": s })
-                    });
+                    let meta = parsed
+                        .git_state
+                        .clone()
+                        .map(|s| serde_json::json!({ "git_state": s }));
                     out.push(InstalledSoftware {
                         id: "forgefleetd".into(),
                         version: ver,
@@ -130,9 +132,9 @@ impl SoftwareCollector {
                     });
                 }
                 if let Some(sha) = parsed.sha {
-                    let meta = parsed.git_state.map(|s| {
-                        serde_json::json!({ "git_state": s })
-                    });
+                    let meta = parsed
+                        .git_state
+                        .map(|s| serde_json::json!({ "git_state": s }));
                     out.push(InstalledSoftware {
                         id: "forgefleetd_git".into(),
                         version: sha,
@@ -154,11 +156,12 @@ impl SoftwareCollector {
             if let Some(raw) = run("openclaw", &["--version"]) {
                 let first = raw.lines().next().unwrap_or("").to_string();
                 if let Some(ver) = regex_capture(&first, r"OpenClaw\s+(\S+)") {
-                    let src = if path.starts_with("/opt/homebrew/") || path.starts_with("/usr/local/") {
-                        Some("npm".to_string())
-                    } else {
-                        None
-                    };
+                    let src =
+                        if path.starts_with("/opt/homebrew/") || path.starts_with("/usr/local/") {
+                            Some("npm".to_string())
+                        } else {
+                            None
+                        };
                     out.push(InstalledSoftware {
                         id: "openclaw".into(),
                         version: ver,
@@ -262,10 +265,7 @@ impl SoftwareCollector {
                     // Fallback: try git log in ~/llama.cpp
                     let home = std::env::var("HOME").ok()?;
                     let llama_dir = format!("{home}/llama.cpp");
-                    run(
-                        "git",
-                        &["-C", &llama_dir, "log", "-1", "--format=%h"],
-                    )
+                    run("git", &["-C", &llama_dir, "log", "-1", "--format=%h"])
                 });
             if let Some(ver) = ver {
                 out.push(InstalledSoftware {
@@ -638,9 +638,7 @@ fn detect_os() -> Option<InstalledSoftware> {
             if std::path::Path::new("/etc/dgx-release").exists() {
                 let ver = std::fs::read_to_string("/etc/dgx-release")
                     .ok()
-                    .and_then(|raw| {
-                        regex_capture(&raw, r#"DGX_OS_VERSION\s*=\s*"?([^"\n]+)"?"#)
-                    })
+                    .and_then(|raw| regex_capture(&raw, r#"DGX_OS_VERSION\s*=\s*"?([^"\n]+)"?"#))
                     .unwrap_or_else(|| "unknown".to_string());
                 return Some(InstalledSoftware {
                     id: "os-dgx".into(),
@@ -652,10 +650,9 @@ fn detect_os() -> Option<InstalledSoftware> {
             }
             // Parse /etc/os-release for Ubuntu version.
             let osr = std::fs::read_to_string("/etc/os-release").ok()?;
-            let pretty = regex_capture(&osr, r#"PRETTY_NAME\s*=\s*"([^"]+)""#)
-                .unwrap_or_default();
-            let version_id = regex_capture(&osr, r#"VERSION_ID\s*=\s*"([^"]+)""#)
-                .unwrap_or_default();
+            let pretty = regex_capture(&osr, r#"PRETTY_NAME\s*=\s*"([^"]+)""#).unwrap_or_default();
+            let version_id =
+                regex_capture(&osr, r#"VERSION_ID\s*=\s*"([^"]+)""#).unwrap_or_default();
 
             let (id, ver) = if pretty.contains("Ubuntu") {
                 let id = match version_id.as_str() {
@@ -730,9 +727,9 @@ mod tests {
         //   - id == "ff"
         //   - id starts with "os-"
         let items = SoftwareCollector::new().detect();
-        let has_marker = items.iter().any(|i| {
-            i.id == "ff" || i.id.starts_with("os-")
-        });
+        let has_marker = items
+            .iter()
+            .any(|i| i.id == "ff" || i.id.starts_with("os-"));
         assert!(
             has_marker,
             "expected at least one entry with id=ff or id=os-*; got: {:?}",
@@ -786,7 +783,10 @@ mod tests {
         assert_eq!(p.git_state, None);
 
         // `(build unknown)` — dropped so we don't seed "unknown" SHAs.
-        assert_eq!(parse_ff_version_line("ff 2026.4.7 (build unknown)").sha, None);
+        assert_eq!(
+            parse_ff_version_line("ff 2026.4.7 (build unknown)").sha,
+            None
+        );
     }
 
     #[test]

@@ -150,10 +150,7 @@ pub async fn pick_llm_port(
 /// kept only so callers that predate the retirement keep compiling.
 ///
 /// Logs a single info line the first time it's called in a process.
-pub async fn seed_from_toml(
-    _pool: &PgPool,
-    _toml_path: &Path,
-) -> Result<SeedReport, PortsError> {
+pub async fn seed_from_toml(_pool: &PgPool, _toml_path: &Path) -> Result<SeedReport, PortsError> {
     use std::sync::atomic::{AtomicBool, Ordering};
     static LOGGED: AtomicBool = AtomicBool::new(false);
     if !LOGGED.swap(true, Ordering::Relaxed) {

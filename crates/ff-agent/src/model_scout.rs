@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value as JsonValue};
+use serde_json::{Value as JsonValue, json};
 use sqlx::{PgPool, Row};
 use thiserror::Error;
 use tokio::sync::watch;
@@ -484,7 +484,10 @@ mod tests {
     fn short_id_normalizes_org_slash_name() {
         assert_eq!(short_id("Qwen/Qwen3-Coder-30B"), "qwen3-coder-30b");
         assert_eq!(short_id("just-a-name"), "just-a-name");
-        assert_eq!(short_id("meta-llama/Llama-3.3-70B-Instruct"), "llama-3-3-70b-instruct");
+        assert_eq!(
+            short_id("meta-llama/Llama-3.3-70B-Instruct"),
+            "llama-3-3-70b-instruct"
+        );
     }
 
     #[test]

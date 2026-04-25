@@ -103,10 +103,7 @@ impl Default for ResearchConfig {
 ///
 /// Never hardcodes a specific version in the default path; the fallback
 /// is just there so the system degrades gracefully on an empty DB.
-pub async fn resolve_default_research_model(
-    pool: &PgPool,
-    preferred_task: &str,
-) -> String {
+pub async fn resolve_default_research_model(pool: &PgPool, preferred_task: &str) -> String {
     // 1) Pool alias with at least one backing deployment.
     let alias_row: Option<(String,)> = sqlx::query_as(
         "SELECT ftc.alias
@@ -172,11 +169,7 @@ pub async fn resolve_default_research_model(
 /// Resolve a port number from `port_registry` by service name. Returns
 /// `fallback` if the row is missing (graceful degradation — operator may
 /// not have seeded the registry yet).
-pub async fn resolve_port(
-    pool: &PgPool,
-    service: &str,
-    fallback: u16,
-) -> u16 {
+pub async fn resolve_port(pool: &PgPool, service: &str, fallback: u16) -> u16 {
     sqlx::query_scalar::<_, i32>(
         "SELECT port FROM port_registry WHERE service = $1 AND status = 'active' LIMIT 1",
     )
@@ -266,12 +259,10 @@ impl ResearchSession {
             config.gateway_url = resolve_gateway_url(&pool).await;
         }
         if config.planner_model.is_empty() {
-            config.planner_model =
-                resolve_default_research_model(&pool, "chain-of-thought").await;
+            config.planner_model = resolve_default_research_model(&pool, "chain-of-thought").await;
         }
         if config.subagent_model.is_empty() {
-            config.subagent_model =
-                resolve_default_research_model(&pool, "code").await;
+            config.subagent_model = resolve_default_research_model(&pool, "code").await;
         }
         let id = Uuid::new_v4();
         sqlx::query(
@@ -286,7 +277,12 @@ impl ResearchSession {
         .bind(&config.query)
         .bind(config.depth as i32)
         .bind(config.parallel as i32)
-        .bind(config.output_path.as_ref().map(|p| p.to_string_lossy().to_string()))
+        .bind(
+            config
+                .output_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string()),
+        )
         .bind(&config.initiated_by)
         .bind(&config.planner_model)
         .bind(&config.gateway_url)
@@ -294,7 +290,11 @@ impl ResearchSession {
         .execute(&pool)
         .await
         .context("insert research_session")?;
-        Ok(Self { pool, config, session_id: id })
+        Ok(Self {
+            pool,
+            config,
+            session_id: id,
+        })
     }
 
     pub fn id(&self) -> Uuid {
@@ -307,7 +307,9 @@ impl ResearchSession {
     ) -> Result<ResearchReport> {
         let start = Instant::now();
         let _ = progress.as_ref().map(|tx| {
-            tx.send(ResearchProgress::Planning { query: self.config.query.clone() })
+            tx.send(ResearchProgress::Planning {
+                query: self.config.query.clone(),
+            })
         });
 
         // Phase 1 — planner decomposes the query.
@@ -324,8 +326,7 @@ impl ResearchSession {
             .pick_distinct_backends(plan.sub_questions.len())
             .await
             .context("backend picker")?;
-        let subtask_rows =
-            self.insert_subtasks(&plan.sub_questions, &backends).await?;
+        let subtask_rows = self.insert_subtasks(&plan.sub_questions, &backends).await?;
 
         // Phase 3 — run sub-agents in parallel. V1: simple chat
         // completions hitting each backend directly (no tools). This
@@ -360,8 +361,7 @@ impl ResearchSession {
 
         // Collect; map each finished handle to AgentTaskResult shape so the
         // existing persist + synthesize code stays unchanged.
-        let mut results: Vec<AgentTaskResult> =
-            Vec::with_capacity(plan.sub_questions.len());
+        let mut results: Vec<AgentTaskResult> = Vec::with_capacity(plan.sub_questions.len());
         for (row, handle) in subtask_rows.iter().zip(handles.into_iter()) {
             let (_row_id, res) = handle
                 .await
@@ -397,10 +397,7 @@ impl ResearchSession {
             // success so the session doesn't get marked "failed" just
             // because the agent used up its turn budget. Only Cancelled
             // or Failed count as failures.
-            let useful = matches!(
-                result.status,
-                TaskStatus::Completed | TaskStatus::MaxTurns
-            );
+            let useful = matches!(result.status, TaskStatus::Completed | TaskStatus::MaxTurns);
             if useful {
                 succeeded += 1;
             } else {
@@ -414,7 +411,9 @@ impl ResearchSession {
 
         // Phase 5 — synthesizer merges sub-agent outputs into a report.
         update_session_status(&self.pool, self.session_id, "synthesizing").await?;
-        let _ = progress.as_ref().map(|tx| tx.send(ResearchProgress::Synthesizing));
+        let _ = progress
+            .as_ref()
+            .map(|tx| tx.send(ResearchProgress::Synthesizing));
 
         let markdown = self
             .synthesize(&plan, &subtask_rows, &results)
@@ -528,10 +527,7 @@ impl ResearchSession {
 
     // ─── Sub-agent dispatch ──────────────────────────────────────────────
 
-    async fn pick_distinct_backends(
-        &self,
-        n: usize,
-    ) -> Result<Vec<FleetBackend>> {
+    async fn pick_distinct_backends(&self, n: usize) -> Result<Vec<FleetBackend>> {
         // Query active OpenAI-compatible deployments. Normalize endpoints —
         // the materializer records `http://127.0.0.1:<port>` (the loopback
         // view from each node's own forgefleetd) but we're dispatching
@@ -573,21 +569,20 @@ impl ResearchSession {
             let raw_endpoint: String = r.get("endpoint");
             let model_id: String = r.get("model_id");
 
-            let endpoint = if raw_endpoint.contains("127.0.0.1")
-                || raw_endpoint.contains("localhost")
-            {
-                // Pull the port from the raw endpoint, rebuild with primary_ip.
-                // Fall back to the port registry's `vllm` entry if the
-                // endpoint string doesn't parse — never hardcode a literal.
-                let port = raw_endpoint
-                    .rsplit(':')
-                    .next()
-                    .and_then(|p| p.trim_end_matches('/').parse::<u16>().ok())
-                    .unwrap_or(fallback_port);
-                format!("http://{primary_ip}:{port}")
-            } else {
-                raw_endpoint
-            };
+            let endpoint =
+                if raw_endpoint.contains("127.0.0.1") || raw_endpoint.contains("localhost") {
+                    // Pull the port from the raw endpoint, rebuild with primary_ip.
+                    // Fall back to the port registry's `vllm` entry if the
+                    // endpoint string doesn't parse — never hardcode a literal.
+                    let port = raw_endpoint
+                        .rsplit(':')
+                        .next()
+                        .and_then(|p| p.trim_end_matches('/').parse::<u16>().ok())
+                        .unwrap_or(fallback_port);
+                    format!("http://{primary_ip}:{port}")
+                } else {
+                    raw_endpoint
+                };
 
             if seen.insert((name.clone(), model_id.clone())) {
                 backends.push(FleetBackend {
@@ -604,7 +599,9 @@ impl ResearchSession {
 
         // Sort: GB10 first, then alphabetical by computer name.
         backends.sort_by(|a, b| {
-            b.is_gb10.cmp(&a.is_gb10).then_with(|| a.computer_name.cmp(&b.computer_name))
+            b.is_gb10
+                .cmp(&a.is_gb10)
+                .then_with(|| a.computer_name.cmp(&b.computer_name))
         });
 
         // Round-robin across DISTINCT COMPUTERS first to maximize parallelism.
@@ -663,12 +660,7 @@ impl ResearchSession {
         Ok(out)
     }
 
-    fn build_subagent_prompt(
-        &self,
-        i: usize,
-        sub: &str,
-        all: &[String],
-    ) -> String {
+    fn build_subagent_prompt(&self, i: usize, sub: &str, all: &[String]) -> String {
         let peers: String = all
             .iter()
             .enumerate()
@@ -703,7 +695,11 @@ impl ResearchSession {
             total = all.len(),
             overall = self.config.query,
             sub = sub,
-            peers = if peers.is_empty() { "(none — you're alone)".into() } else { peers },
+            peers = if peers.is_empty() {
+                "(none — you're alone)".into()
+            } else {
+                peers
+            },
             cwd = std::env::current_dir()
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_default(),
@@ -866,11 +862,7 @@ struct SubtaskRow {
     assigned_model: String,
 }
 
-async fn update_session_status(
-    pool: &PgPool,
-    session_id: Uuid,
-    status: &str,
-) -> Result<()> {
+async fn update_session_status(pool: &PgPool, session_id: Uuid, status: &str) -> Result<()> {
     sqlx::query("UPDATE research_sessions SET status = $1 WHERE id = $2")
         .bind(status)
         .bind(session_id)
@@ -966,7 +958,10 @@ fn parse_findings(output: &str) -> Vec<(String, Option<f64>, Option<String>)> {
         let mut url: Option<String> = None;
         for tok in rest.split_whitespace().rev() {
             if tok.starts_with("http://") || tok.starts_with("https://") {
-                url = Some(tok.trim_end_matches(|c: char| !c.is_alphanumeric() && c != '/').into());
+                url = Some(
+                    tok.trim_end_matches(|c: char| !c.is_alphanumeric() && c != '/')
+                        .into(),
+                );
                 break;
             }
         }
@@ -984,9 +979,7 @@ fn parse_findings(output: &str) -> Vec<(String, Option<f64>, Option<String>)> {
 /// (planner + synthesizer call openai_single_completion, whose response
 /// includes usage). Wire this up properly in a follow-up by extending
 /// `AgentEvent::TurnComplete` with prompt/completion token fields.
-fn extract_token_counts(
-    _events: &[crate::agent_loop::AgentEvent],
-) -> (u64, u64) {
+fn extract_token_counts(_events: &[crate::agent_loop::AgentEvent]) -> (u64, u64) {
     (0, 0)
 }
 

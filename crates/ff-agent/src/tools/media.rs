@@ -12,8 +12,12 @@ pub struct ScreenshotCaptureTool;
 
 #[async_trait]
 impl AgentTool for ScreenshotCaptureTool {
-    fn name(&self) -> &str { "Screenshot" }
-    fn description(&self) -> &str { "Take a screenshot of a web page or local file. Saves as PNG. Uses headless Chrome/Chromium." }
+    fn name(&self) -> &str {
+        "Screenshot"
+    }
+    fn description(&self) -> &str {
+        "Take a screenshot of a web page or local file. Saves as PNG. Uses headless Chrome/Chromium."
+    }
     fn parameters_schema(&self) -> Value {
         json!({"type":"object","properties":{
             "url":{"type":"string","description":"URL or local file path to screenshot"},
@@ -25,11 +29,16 @@ impl AgentTool for ScreenshotCaptureTool {
     }
     async fn execute(&self, input: Value, ctx: &AgentToolContext) -> AgentToolResult {
         let url = input.get("url").and_then(Value::as_str).unwrap_or("");
-        let output = input.get("output").and_then(Value::as_str).unwrap_or("screenshot.png");
+        let output = input
+            .get("output")
+            .and_then(Value::as_str)
+            .unwrap_or("screenshot.png");
         let width = input.get("width").and_then(Value::as_u64).unwrap_or(1280);
         let height = input.get("height").and_then(Value::as_u64).unwrap_or(720);
 
-        if url.is_empty() { return AgentToolResult::err("Missing 'url'"); }
+        if url.is_empty() {
+            return AgentToolResult::err("Missing 'url'");
+        }
 
         let output_path = if std::path::Path::new(output).is_absolute() {
             std::path::PathBuf::from(output)
@@ -39,24 +48,47 @@ impl AgentTool for ScreenshotCaptureTool {
 
         // Try multiple screenshot tools
         // 1. Chrome/Chromium headless
-        for browser in ["google-chrome", "chromium-browser", "chromium", "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"] {
+        for browser in [
+            "google-chrome",
+            "chromium-browser",
+            "chromium",
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        ] {
             let result = Command::new(browser)
-                .args(["--headless", "--disable-gpu", "--no-sandbox",
+                .args([
+                    "--headless",
+                    "--disable-gpu",
+                    "--no-sandbox",
                     &format!("--window-size={width},{height}"),
                     &format!("--screenshot={}", output_path.display()),
-                    url])
-                .output().await;
+                    url,
+                ])
+                .output()
+                .await;
             if let Ok(out) = result {
                 if out.status.success() {
-                    return AgentToolResult::ok(format!("Screenshot saved: {}\nSize: {}x{}\nURL: {url}", output_path.display(), width, height));
+                    return AgentToolResult::ok(format!(
+                        "Screenshot saved: {}\nSize: {}x{}\nURL: {url}",
+                        output_path.display(),
+                        width,
+                        height
+                    ));
                 }
             }
         }
 
         // 2. Try wkhtmltoimage
         let wk_result = Command::new("wkhtmltoimage")
-            .args(["--width", &width.to_string(), "--height", &height.to_string(), url, &output_path.to_string_lossy()])
-            .output().await;
+            .args([
+                "--width",
+                &width.to_string(),
+                "--height",
+                &height.to_string(),
+                url,
+                &output_path.to_string_lossy(),
+            ])
+            .output()
+            .await;
         if let Ok(out) = wk_result {
             if out.status.success() {
                 return AgentToolResult::ok(format!("Screenshot saved: {}", output_path.display()));
@@ -75,7 +107,9 @@ impl AgentTool for ScreenshotCaptureTool {
             }
         }
 
-        AgentToolResult::err("Screenshot failed. Install Chrome, wkhtmltoimage, or Playwright.".to_string())
+        AgentToolResult::err(
+            "Screenshot failed. Install Chrome, wkhtmltoimage, or Playwright.".to_string(),
+        )
     }
 }
 
@@ -84,8 +118,12 @@ pub struct ImageAnalyzeTool;
 
 #[async_trait]
 impl AgentTool for ImageAnalyzeTool {
-    fn name(&self) -> &str { "ImageAnalyze" }
-    fn description(&self) -> &str { "Analyze an image: dimensions, format, file size, color info, and OCR text extraction." }
+    fn name(&self) -> &str {
+        "ImageAnalyze"
+    }
+    fn description(&self) -> &str {
+        "Analyze an image: dimensions, format, file size, color info, and OCR text extraction."
+    }
     fn parameters_schema(&self) -> Value {
         json!({"type":"object","properties":{
             "file_path":{"type":"string","description":"Path to the image file"},
@@ -95,27 +133,44 @@ impl AgentTool for ImageAnalyzeTool {
     async fn execute(&self, input: Value, ctx: &AgentToolContext) -> AgentToolResult {
         let file_path = input.get("file_path").and_then(Value::as_str).unwrap_or("");
         let do_ocr = input.get("ocr").and_then(Value::as_bool).unwrap_or(false);
-        let path = if std::path::Path::new(file_path).is_absolute() { std::path::PathBuf::from(file_path) } else { ctx.working_dir.join(file_path) };
+        let path = if std::path::Path::new(file_path).is_absolute() {
+            std::path::PathBuf::from(file_path)
+        } else {
+            ctx.working_dir.join(file_path)
+        };
 
-        if !path.exists() { return AgentToolResult::err(format!("File not found: {}", path.display())); }
+        if !path.exists() {
+            return AgentToolResult::err(format!("File not found: {}", path.display()));
+        }
 
         let mut info = Vec::new();
 
         // File info
         if let Ok(meta) = tokio::fs::metadata(&path).await {
             info.push(format!("File: {}", path.display()));
-            info.push(format!("Size: {} bytes ({:.1} KB)", meta.len(), meta.len() as f64 / 1024.0));
+            info.push(format!(
+                "Size: {} bytes ({:.1} KB)",
+                meta.len(),
+                meta.len() as f64 / 1024.0
+            ));
         }
 
         // Try identify (ImageMagick) or sips (macOS)
         let identify = Command::new("identify").arg(&path).output().await;
         match identify {
             Ok(out) if out.status.success() => {
-                info.push(format!("ImageMagick: {}", String::from_utf8_lossy(&out.stdout).trim()));
+                info.push(format!(
+                    "ImageMagick: {}",
+                    String::from_utf8_lossy(&out.stdout).trim()
+                ));
             }
             _ => {
                 // macOS fallback
-                let sips = Command::new("sips").args(["-g", "all"]).arg(&path).output().await;
+                let sips = Command::new("sips")
+                    .args(["-g", "all"])
+                    .arg(&path)
+                    .output()
+                    .await;
                 if let Ok(out) = sips {
                     if out.status.success() {
                         let output = String::from_utf8_lossy(&out.stdout);
@@ -129,7 +184,11 @@ impl AgentTool for ImageAnalyzeTool {
 
         // OCR
         if do_ocr {
-            let ocr = Command::new("tesseract").arg(&path).arg("stdout").output().await;
+            let ocr = Command::new("tesseract")
+                .arg(&path)
+                .arg("stdout")
+                .output()
+                .await;
             match ocr {
                 Ok(out) if out.status.success() => {
                     let text = String::from_utf8_lossy(&out.stdout);
@@ -148,8 +207,12 @@ pub struct VideoDownloadTool;
 
 #[async_trait]
 impl AgentTool for VideoDownloadTool {
-    fn name(&self) -> &str { "VideoDownload" }
-    fn description(&self) -> &str { "Download videos from URLs (YouTube, Vimeo, Twitter, etc.) using yt-dlp. Can extract audio only." }
+    fn name(&self) -> &str {
+        "VideoDownload"
+    }
+    fn description(&self) -> &str {
+        "Download videos from URLs (YouTube, Vimeo, Twitter, etc.) using yt-dlp. Can extract audio only."
+    }
     fn parameters_schema(&self) -> Value {
         json!({"type":"object","properties":{
             "url":{"type":"string","description":"Video URL"},
@@ -161,29 +224,53 @@ impl AgentTool for VideoDownloadTool {
     }
     async fn execute(&self, input: Value, ctx: &AgentToolContext) -> AgentToolResult {
         let url = input.get("url").and_then(Value::as_str).unwrap_or("");
-        let audio_only = input.get("audio_only").and_then(Value::as_bool).unwrap_or(false);
-        let info_only = input.get("info_only").and_then(Value::as_bool).unwrap_or(false);
+        let audio_only = input
+            .get("audio_only")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let info_only = input
+            .get("info_only")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
 
-        if url.is_empty() { return AgentToolResult::err("Missing 'url'"); }
+        if url.is_empty() {
+            return AgentToolResult::err("Missing 'url'");
+        }
 
         let mut args = vec!["--no-playlist"];
-        if info_only { args.push("--dump-json"); }
-        if audio_only { args.extend(["--extract-audio", "--audio-format", "mp3"]); }
-        if let Some(output) = input.get("output").and_then(Value::as_str) { args.extend(["-o", output]); }
+        if info_only {
+            args.push("--dump-json");
+        }
+        if audio_only {
+            args.extend(["--extract-audio", "--audio-format", "mp3"]);
+        }
+        if let Some(output) = input.get("output").and_then(Value::as_str) {
+            args.extend(["-o", output]);
+        }
         args.push(url);
 
         // Try yt-dlp first, then youtube-dl
         for cmd in ["yt-dlp", "youtube-dl"] {
-            let result = Command::new(cmd).args(&args).current_dir(&ctx.working_dir).output().await;
+            let result = Command::new(cmd)
+                .args(&args)
+                .current_dir(&ctx.working_dir)
+                .output()
+                .await;
             if let Ok(out) = result {
-                let output = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+                let output = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
                 if out.status.success() {
                     return AgentToolResult::ok(truncate_output(&output, MAX_TOOL_RESULT_CHARS));
                 }
             }
         }
 
-        AgentToolResult::err("Video download failed. Install yt-dlp: brew install yt-dlp".to_string())
+        AgentToolResult::err(
+            "Video download failed. Install yt-dlp: brew install yt-dlp".to_string(),
+        )
     }
 }
 
@@ -192,8 +279,12 @@ pub struct LinkPreviewTool;
 
 #[async_trait]
 impl AgentTool for LinkPreviewTool {
-    fn name(&self) -> &str { "LinkPreview" }
-    fn description(&self) -> &str { "Fetch link metadata: title, description, image, OpenGraph tags, favicon. Works with any URL." }
+    fn name(&self) -> &str {
+        "LinkPreview"
+    }
+    fn description(&self) -> &str {
+        "Fetch link metadata: title, description, image, OpenGraph tags, favicon. Works with any URL."
+    }
     fn parameters_schema(&self) -> Value {
         json!({"type":"object","properties":{
             "url":{"type":"string","description":"URL to preview"},
@@ -202,14 +293,25 @@ impl AgentTool for LinkPreviewTool {
     }
     async fn execute(&self, input: Value, _ctx: &AgentToolContext) -> AgentToolResult {
         let mut urls: Vec<String> = Vec::new();
-        if let Some(url) = input.get("url").and_then(Value::as_str) { urls.push(url.to_string()); }
-        if let Some(arr) = input.get("urls").and_then(Value::as_array) {
-            for u in arr { if let Some(s) = u.as_str() { urls.push(s.to_string()); } }
+        if let Some(url) = input.get("url").and_then(Value::as_str) {
+            urls.push(url.to_string());
         }
-        if urls.is_empty() { return AgentToolResult::err("Provide 'url' or 'urls'"); }
+        if let Some(arr) = input.get("urls").and_then(Value::as_array) {
+            for u in arr {
+                if let Some(s) = u.as_str() {
+                    urls.push(s.to_string());
+                }
+            }
+        }
+        if urls.is_empty() {
+            return AgentToolResult::err("Provide 'url' or 'urls'");
+        }
 
-        let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10))
-            .user_agent("ForgeFleet-Agent/0.1").build().unwrap_or_default();
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .user_agent("ForgeFleet-Agent/0.1")
+            .build()
+            .unwrap_or_default();
 
         let mut results = Vec::new();
         for url in &urls {
@@ -224,8 +326,16 @@ impl AgentTool for LinkPreviewTool {
 
                     results.push(format!(
                         "URL: {url}\n  Title: {}\n  Description: {}\n  Image: {}\n",
-                        if !og_title.is_empty() { &og_title } else { &title },
-                        if !og_desc.is_empty() { &og_desc } else { &description },
+                        if !og_title.is_empty() {
+                            &og_title
+                        } else {
+                            &title
+                        },
+                        if !og_desc.is_empty() {
+                            &og_desc
+                        } else {
+                            &description
+                        },
                         og_image
                     ));
                 }
@@ -243,8 +353,12 @@ pub struct ImageConvertTool;
 
 #[async_trait]
 impl AgentTool for ImageConvertTool {
-    fn name(&self) -> &str { "ImageConvert" }
-    fn description(&self) -> &str { "Convert, resize, or compress images. Supports PNG, JPG, WebP, GIF conversions." }
+    fn name(&self) -> &str {
+        "ImageConvert"
+    }
+    fn description(&self) -> &str {
+        "Convert, resize, or compress images. Supports PNG, JPG, WebP, GIF conversions."
+    }
     fn parameters_schema(&self) -> Value {
         json!({"type":"object","properties":{
             "input":{"type":"string","description":"Input image path"},
@@ -259,13 +373,33 @@ impl AgentTool for ImageConvertTool {
         let resize = input.get("resize").and_then(Value::as_str);
         let quality = input.get("quality").and_then(Value::as_u64).unwrap_or(85);
 
-        let in_path = if std::path::Path::new(input_path).is_absolute() { input_path.to_string() } else { ctx.working_dir.join(input_path).to_string_lossy().to_string() };
-        let out_path = if std::path::Path::new(output_path).is_absolute() { output_path.to_string() } else { ctx.working_dir.join(output_path).to_string_lossy().to_string() };
+        let in_path = if std::path::Path::new(input_path).is_absolute() {
+            input_path.to_string()
+        } else {
+            ctx.working_dir
+                .join(input_path)
+                .to_string_lossy()
+                .to_string()
+        };
+        let out_path = if std::path::Path::new(output_path).is_absolute() {
+            output_path.to_string()
+        } else {
+            ctx.working_dir
+                .join(output_path)
+                .to_string_lossy()
+                .to_string()
+        };
 
         // Try ImageMagick convert
         let mut args = vec![in_path.clone()];
-        if let Some(r) = resize { args.extend(["-resize".to_string(), r.to_string()]); }
-        args.extend(["-quality".to_string(), quality.to_string(), out_path.clone()]);
+        if let Some(r) = resize {
+            args.extend(["-resize".to_string(), r.to_string()]);
+        }
+        args.extend([
+            "-quality".to_string(),
+            quality.to_string(),
+            out_path.clone(),
+        ]);
 
         let result = Command::new("convert").args(&args).output().await;
         match result {
@@ -275,7 +409,10 @@ impl AgentTool for ImageConvertTool {
             _ => {
                 // macOS fallback: sips
                 let mut sips_args = vec!["-s".to_string(), "format".to_string()];
-                let ext = std::path::Path::new(&out_path).extension().and_then(|e| e.to_str()).unwrap_or("png");
+                let ext = std::path::Path::new(&out_path)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("png");
                 sips_args.push(ext.to_string());
                 if let Some(r) = resize {
                     if let Some((w, h)) = r.split_once('x') {
@@ -284,8 +421,13 @@ impl AgentTool for ImageConvertTool {
                 }
                 sips_args.extend(["--out".to_string(), out_path.clone(), in_path]);
                 match Command::new("sips").args(&sips_args).output().await {
-                    Ok(out) if out.status.success() => AgentToolResult::ok(format!("Converted: {input_path} → {output_path}")),
-                    _ => AgentToolResult::err("Image conversion failed. Install ImageMagick: brew install imagemagick".to_string()),
+                    Ok(out) if out.status.success() => {
+                        AgentToolResult::ok(format!("Converted: {input_path} → {output_path}"))
+                    }
+                    _ => AgentToolResult::err(
+                        "Image conversion failed. Install ImageMagick: brew install imagemagick"
+                            .to_string(),
+                    ),
                 }
             }
         }
@@ -297,7 +439,9 @@ pub struct VideoAnalyzeTool;
 
 #[async_trait]
 impl AgentTool for VideoAnalyzeTool {
-    fn name(&self) -> &str { "VideoAnalyze" }
+    fn name(&self) -> &str {
+        "VideoAnalyze"
+    }
     fn description(&self) -> &str {
         "Download and analyze a video from YouTube, TikTok, Twitter, etc. \
          Extracts key frames and audio, sends to a multimodal LLM for analysis. \
@@ -315,9 +459,14 @@ impl AgentTool for VideoAnalyzeTool {
         let url = input.get("url").and_then(Value::as_str).unwrap_or("");
         let prompt = input.get("prompt").and_then(Value::as_str).unwrap_or("Describe what is happening in this video. Include key visual elements, text on screen, actions, and any spoken content.");
         let max_frames = input.get("max_frames").and_then(Value::as_u64).unwrap_or(8) as usize;
-        let extract_audio = input.get("extract_audio").and_then(Value::as_bool).unwrap_or(true);
+        let extract_audio = input
+            .get("extract_audio")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
 
-        if url.is_empty() { return AgentToolResult::err("Missing 'url'"); }
+        if url.is_empty() {
+            return AgentToolResult::err("Missing 'url'");
+        }
 
         let tmp_dir = ctx.working_dir.join(".ff-video-analysis");
         let _ = tokio::fs::create_dir_all(&tmp_dir).await;
@@ -325,17 +474,33 @@ impl AgentTool for VideoAnalyzeTool {
 
         // Step 1: Download video with yt-dlp
         let dl_result = Command::new("yt-dlp")
-            .args(["--no-playlist", "-f", "mp4/best", "--max-filesize", "100M",
-                   "-o", &video_path.to_string_lossy(), url])
+            .args([
+                "--no-playlist",
+                "-f",
+                "mp4/best",
+                "--max-filesize",
+                "100M",
+                "-o",
+                &video_path.to_string_lossy(),
+                url,
+            ])
             .current_dir(&ctx.working_dir)
-            .output().await;
+            .output()
+            .await;
 
         match &dl_result {
             Ok(out) if !out.status.success() => {
                 let err = String::from_utf8_lossy(&out.stderr);
-                return AgentToolResult::err(format!("yt-dlp download failed: {}", truncate_output(&err, 500)));
+                return AgentToolResult::err(format!(
+                    "yt-dlp download failed: {}",
+                    truncate_output(&err, 500)
+                ));
             }
-            Err(e) => return AgentToolResult::err(format!("yt-dlp not found: {e}. Install: pip install yt-dlp")),
+            Err(e) => {
+                return AgentToolResult::err(format!(
+                    "yt-dlp not found: {e}. Install: pip install yt-dlp"
+                ));
+            }
             _ => {}
         }
 
@@ -363,27 +528,44 @@ impl AgentTool for VideoAnalyzeTool {
 
         // Get video duration
         let probe = Command::new("ffprobe")
-            .args(["-v", "error", "-show_entries", "format=duration",
-                   "-of", "default=noprint_wrappers=1:nokey=1"])
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+            ])
             .arg(&video_path)
-            .output().await;
+            .output()
+            .await;
 
-        let duration: f64 = probe.ok()
+        let duration: f64 = probe
+            .ok()
             .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())
             .unwrap_or(30.0);
 
         // Extract frames at even intervals
         let interval = (duration / max_frames as f64).max(1.0);
         let ffmpeg_result = Command::new("ffmpeg")
-            .args(["-i", &video_path.to_string_lossy(),
-                   "-vf", &format!("fps=1/{interval:.1}"),
-                   "-frames:v", &max_frames.to_string(),
-                   "-q:v", "2",
-                   &frames_dir.join("frame_%03d.jpg").to_string_lossy()])
-            .output().await;
+            .args([
+                "-i",
+                &video_path.to_string_lossy(),
+                "-vf",
+                &format!("fps=1/{interval:.1}"),
+                "-frames:v",
+                &max_frames.to_string(),
+                "-q:v",
+                "2",
+                &frames_dir.join("frame_%03d.jpg").to_string_lossy(),
+            ])
+            .output()
+            .await;
 
         if ffmpeg_result.is_err() {
-            return AgentToolResult::err("ffmpeg not found. Install: apt install ffmpeg / brew install ffmpeg");
+            return AgentToolResult::err(
+                "ffmpeg not found. Install: apt install ffmpeg / brew install ffmpeg",
+            );
         }
 
         // Count extracted frames
@@ -403,17 +585,35 @@ impl AgentTool for VideoAnalyzeTool {
         if extract_audio {
             let audio_path = tmp_dir.join("audio.wav");
             let _ = Command::new("ffmpeg")
-                .args(["-i", &video_path.to_string_lossy(),
-                       "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
-                       "-y", &audio_path.to_string_lossy()])
-                .output().await;
+                .args([
+                    "-i",
+                    &video_path.to_string_lossy(),
+                    "-vn",
+                    "-acodec",
+                    "pcm_s16le",
+                    "-ar",
+                    "16000",
+                    "-ac",
+                    "1",
+                    "-y",
+                    &audio_path.to_string_lossy(),
+                ])
+                .output()
+                .await;
 
             // Try whisper for transcription
             let whisper = Command::new("whisper")
-                .args([&audio_path.to_string_lossy().to_string(),
-                       "--model", "base", "--output_format", "txt",
-                       "--output_dir", &tmp_dir.to_string_lossy().to_string()])
-                .output().await;
+                .args([
+                    &audio_path.to_string_lossy().to_string(),
+                    "--model",
+                    "base",
+                    "--output_format",
+                    "txt",
+                    "--output_dir",
+                    &tmp_dir.to_string_lossy().to_string(),
+                ])
+                .output()
+                .await;
 
             if let Ok(out) = whisper {
                 if out.status.success() {
@@ -437,7 +637,8 @@ impl AgentTool for VideoAnalyzeTool {
 
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(120))
-            .build().unwrap_or_default();
+            .build()
+            .unwrap_or_default();
 
         let mut llm_analysis = String::new();
         for endpoint in &omni_endpoints {
@@ -473,7 +674,10 @@ impl AgentTool for VideoAnalyzeTool {
             match client.post(&req_url).json(&body).send().await {
                 Ok(resp) => {
                     if let Ok(data) = resp.json::<Value>().await {
-                        if let Some(content) = data.pointer("/choices/0/message/content").and_then(Value::as_str) {
+                        if let Some(content) = data
+                            .pointer("/choices/0/message/content")
+                            .and_then(Value::as_str)
+                        {
                             llm_analysis = content.to_string();
                             break;
                         }
@@ -486,12 +690,16 @@ impl AgentTool for VideoAnalyzeTool {
         if !llm_analysis.is_empty() {
             analysis.push(format!("\nAI Analysis:\n{llm_analysis}"));
         } else {
-            analysis.push("\nAI Analysis: No multimodal LLM available. Frames saved locally.".into());
+            analysis
+                .push("\nAI Analysis: No multimodal LLM available. Frames saved locally.".into());
             analysis.push(format!("Frames at: {}", frames_dir.display()));
         }
 
         if !audio_text.is_empty() {
-            analysis.push(format!("\nAudio Transcript:\n{}", truncate_output(&audio_text, 2000)));
+            analysis.push(format!(
+                "\nAudio Transcript:\n{}",
+                truncate_output(&audio_text, 2000)
+            ));
         }
 
         // Cleanup video file (keep frames for reference)
@@ -506,8 +714,12 @@ pub struct AudioAnalyzeTool;
 
 #[async_trait]
 impl AgentTool for AudioAnalyzeTool {
-    fn name(&self) -> &str { "AudioAnalyze" }
-    fn description(&self) -> &str { "Analyze audio files: transcribe speech, detect language, get duration/format info." }
+    fn name(&self) -> &str {
+        "AudioAnalyze"
+    }
+    fn description(&self) -> &str {
+        "Analyze audio files: transcribe speech, detect language, get duration/format info."
+    }
     fn parameters_schema(&self) -> Value {
         json!({"type":"object","properties":{
             "file_path":{"type":"string","description":"Path to audio file"},
@@ -518,17 +730,34 @@ impl AgentTool for AudioAnalyzeTool {
     async fn execute(&self, input: Value, ctx: &AgentToolContext) -> AgentToolResult {
         let file_path = input.get("file_path").and_then(Value::as_str);
         let url = input.get("url").and_then(Value::as_str);
-        let transcribe = input.get("transcribe").and_then(Value::as_bool).unwrap_or(true);
+        let transcribe = input
+            .get("transcribe")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
 
         let audio_path = if let Some(fp) = file_path {
-            let p = if std::path::Path::new(fp).is_absolute() { std::path::PathBuf::from(fp) } else { ctx.working_dir.join(fp) };
-            if !p.exists() { return AgentToolResult::err(format!("File not found: {}", p.display())); }
+            let p = if std::path::Path::new(fp).is_absolute() {
+                std::path::PathBuf::from(fp)
+            } else {
+                ctx.working_dir.join(fp)
+            };
+            if !p.exists() {
+                return AgentToolResult::err(format!("File not found: {}", p.display()));
+            }
             p
         } else if let Some(u) = url {
             let tmp = ctx.working_dir.join(".ff-audio-tmp.mp3");
             let dl = Command::new("yt-dlp")
-                .args(["--extract-audio", "--audio-format", "mp3", "-o", &tmp.to_string_lossy(), u])
-                .output().await;
+                .args([
+                    "--extract-audio",
+                    "--audio-format",
+                    "mp3",
+                    "-o",
+                    &tmp.to_string_lossy(),
+                    u,
+                ])
+                .output()
+                .await;
             if dl.is_err() || !tmp.exists() {
                 return AgentToolResult::err("Failed to download audio");
             }
@@ -541,18 +770,42 @@ impl AgentTool for AudioAnalyzeTool {
 
         // Get audio info with ffprobe
         let probe = Command::new("ffprobe")
-            .args(["-v", "quiet", "-print_format", "json", "-show_format", "-show_streams"])
+            .args([
+                "-v",
+                "quiet",
+                "-print_format",
+                "json",
+                "-show_format",
+                "-show_streams",
+            ])
             .arg(&audio_path)
-            .output().await;
+            .output()
+            .await;
 
         if let Ok(out) = probe {
             if out.status.success() {
                 let json_str = String::from_utf8_lossy(&out.stdout);
                 if let Ok(data) = serde_json::from_str::<Value>(&json_str) {
                     if let Some(fmt) = data.get("format") {
-                        info.push(format!("Duration: {}s", fmt.get("duration").and_then(Value::as_str).unwrap_or("?")));
-                        info.push(format!("Format: {}", fmt.get("format_long_name").and_then(Value::as_str).unwrap_or("?")));
-                        info.push(format!("Bitrate: {}kbps", fmt.get("bit_rate").and_then(Value::as_str).unwrap_or("0").parse::<u64>().unwrap_or(0) / 1000));
+                        info.push(format!(
+                            "Duration: {}s",
+                            fmt.get("duration").and_then(Value::as_str).unwrap_or("?")
+                        ));
+                        info.push(format!(
+                            "Format: {}",
+                            fmt.get("format_long_name")
+                                .and_then(Value::as_str)
+                                .unwrap_or("?")
+                        ));
+                        info.push(format!(
+                            "Bitrate: {}kbps",
+                            fmt.get("bit_rate")
+                                .and_then(Value::as_str)
+                                .unwrap_or("0")
+                                .parse::<u64>()
+                                .unwrap_or(0)
+                                / 1000
+                        ));
                     }
                 }
             }
@@ -561,9 +814,17 @@ impl AgentTool for AudioAnalyzeTool {
         // Transcribe with whisper
         if transcribe {
             let whisper = Command::new("whisper")
-                .args([&audio_path.to_string_lossy().to_string(), "--model", "base", "--output_format", "txt",
-                       "--output_dir", &ctx.working_dir.to_string_lossy().to_string()])
-                .output().await;
+                .args([
+                    &audio_path.to_string_lossy().to_string(),
+                    "--model",
+                    "base",
+                    "--output_format",
+                    "txt",
+                    "--output_dir",
+                    &ctx.working_dir.to_string_lossy().to_string(),
+                ])
+                .output()
+                .await;
 
             match whisper {
                 Ok(out) if out.status.success() => {
@@ -573,7 +834,9 @@ impl AgentTool for AudioAnalyzeTool {
                         info.push(format!("\nTranscript:\n{}", truncate_output(&txt, 3000)));
                     }
                 }
-                _ => info.push("\nTranscription: whisper not installed (pip install openai-whisper)".into()),
+                _ => info.push(
+                    "\nTranscription: whisper not installed (pip install openai-whisper)".into(),
+                ),
             }
         }
 
@@ -591,11 +854,12 @@ async fn find_omni_endpoint() -> String {
 
 async fn query_omni_endpoint() -> anyhow::Result<String> {
     let toml_str = std::fs::read_to_string(
-        std::env::var("HOME").unwrap_or_default() + "/.forgefleet/fleet.toml"
+        std::env::var("HOME").unwrap_or_default() + "/.forgefleet/fleet.toml",
     )?;
     let config: toml::Value = toml::from_str(&toml_str)?;
     let db_url = config
-        .get("database").and_then(|d| d.get("url"))
+        .get("database")
+        .and_then(|d| d.get("url"))
         .and_then(|u| u.as_str())
         .ok_or_else(|| anyhow::anyhow!("no db url"))?
         .to_string();
@@ -610,7 +874,7 @@ async fn query_omni_endpoint() -> anyhow::Result<String> {
         "SELECT fn.ip, fm.port FROM fleet_models fm
          JOIN fleet_nodes fn ON fn.name = fm.node_name
          WHERE fm.name ILIKE '%omni%' OR fm.name ILIKE '%multimodal%' OR fm.name ILIKE '%vision%'
-         ORDER BY fn.cpu_cores DESC LIMIT 1"
+         ORDER BY fn.cpu_cores DESC LIMIT 1",
     )
     .fetch_one(&pool)
     .await?;

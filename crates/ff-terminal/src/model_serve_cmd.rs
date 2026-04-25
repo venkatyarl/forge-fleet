@@ -4,7 +4,7 @@
 //! hand-running ~20 SSH commands. Records launch_recipe in llm_clusters
 //! for replay on upgrade/failover.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde_json::json;
 use sqlx::{PgPool, Row};
 use tokio::process::Command;
@@ -66,7 +66,10 @@ pub async fn handle_model_serve_tp2(
 
     let cluster_id = format!("{}-tp2-{}-{}", model_id, host_a, host_b);
 
-    println!("[1/4] Starting ray-head on {} (fabric {})...", host_a, a_fabric);
+    println!(
+        "[1/4] Starting ray-head on {} (fabric {})...",
+        host_a, a_fabric
+    );
     let head_cmd = format!(
         "docker rm -f ff-ray-head 2>/dev/null; docker run -d --name ff-ray-head \
          --network host --ipc=host --gpus all --shm-size=64g \
@@ -82,7 +85,10 @@ pub async fn handle_model_serve_tp2(
     );
     run_ssh(&a_user, &a_ip, &head_cmd).await?;
 
-    println!("[2/4] Starting ray-worker on {} (fabric {})...", host_b, b_fabric);
+    println!(
+        "[2/4] Starting ray-worker on {} (fabric {})...",
+        host_b, b_fabric
+    );
     let worker_cmd = format!(
         "sudo docker rm -f ff-ray-worker 2>/dev/null; sudo docker run -d --name ff-ray-worker \
          --network host --ipc=host --gpus all --shm-size=64g \

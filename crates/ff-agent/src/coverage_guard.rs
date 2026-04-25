@@ -28,7 +28,7 @@ use ff_pulse::reader::PulseReader;
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
 use thiserror::Error;
-use tokio::sync::{watch, Mutex};
+use tokio::sync::{Mutex, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -299,8 +299,16 @@ impl CoverageGuard {
             let a_tier = tier_rank(a.quality_tier.as_deref());
             let b_tier = tier_rank(b.quality_tier.as_deref());
 
-            let a_q4 = if is_q4(a.quantization.as_deref()) { 0 } else { 1 };
-            let b_q4 = if is_q4(b.quantization.as_deref()) { 0 } else { 1 };
+            let a_q4 = if is_q4(a.quantization.as_deref()) {
+                0
+            } else {
+                1
+            };
+            let b_q4 = if is_q4(b.quantization.as_deref()) {
+                0
+            } else {
+                1
+            };
 
             let a_size = a.file_size_gb.unwrap_or(f64::MAX);
             let b_size = b.file_size_gb.unwrap_or(f64::MAX);
@@ -309,7 +317,11 @@ impl CoverageGuard {
                 .cmp(&b_pref)
                 .then(a_tier.cmp(&b_tier))
                 .then(a_q4.cmp(&b_q4))
-                .then(a_size.partial_cmp(&b_size).unwrap_or(std::cmp::Ordering::Equal))
+                .then(
+                    a_size
+                        .partial_cmp(&b_size)
+                        .unwrap_or(std::cmp::Ordering::Equal),
+                )
         });
 
         Ok(candidates)
@@ -354,11 +366,7 @@ impl CoverageGuard {
     /// Enqueue a deferred shell task that invokes `ff model load <id>` on
     /// the chosen host. Runs on `node_online` so it re-fires if the box
     /// restarts before it executes.
-    async fn enqueue_load(
-        &self,
-        model_id: &str,
-        host_name: &str,
-    ) -> Result<String, sqlx::Error> {
+    async fn enqueue_load(&self, model_id: &str, host_name: &str) -> Result<String, sqlx::Error> {
         let title = format!("coverage-guard auto-load {model_id} on {host_name}");
         let command = format!("ff model load {model_id}");
         let payload = serde_json::json!({ "command": command });

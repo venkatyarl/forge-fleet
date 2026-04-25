@@ -10,16 +10,13 @@ use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use ff_api::adaptive_router::AdaptiveRouter;
-use ff_pulse::PulseClient;
 use ff_api::classifier::TaskType;
 use ff_api::quality_tracker::{Outcome, QualityTracker, QualityTrackerConfig};
 use ff_api::registry::{BackendEndpoint, BackendRegistry};
 use ff_api::router::{TierRouter, TierRouterConfig, TierTimeouts};
 use ff_api::types::{ChatCompletionRequest, ChatMessage};
 use ff_core::config::{self, DatabaseMode, FleetConfig};
-use ff_db::{
-    DbPool, DbPoolConfig, FleetModelRow, OperationalStore, run_migrations,
-};
+use ff_db::{DbPool, DbPoolConfig, FleetModelRow, OperationalStore, run_migrations};
 use ff_discovery::health::{HealthMonitor, HealthStatus, HealthTarget};
 use ff_discovery::ports::known_llm_ports;
 use ff_discovery::scanner::{
@@ -36,6 +33,7 @@ use ff_orchestrator::{
 use ff_pipeline::executor::ExecutorConfig;
 use ff_pipeline::graph::PipelineGraph;
 use ff_pipeline::step::{Step, StepId, StepKind, StepStatus};
+use ff_pulse::PulseClient;
 use ff_runtime::engine::EngineConfig;
 use ff_runtime::model_manager::ModelManager;
 use ff_runtime::process_manager::ProcessManager;
@@ -129,7 +127,11 @@ pub async fn fleet_status(params: Option<Value>) -> HandlerResult {
     info!(
         refresh,
         targets = scan_targets.len(),
-        source = if using_postgres { "postgres" } else { "fleet.toml" },
+        source = if using_postgres {
+            "postgres"
+        } else {
+            "fleet.toml"
+        },
         "fleet_status handler called"
     );
 
@@ -172,15 +174,16 @@ pub async fn fleet_status(params: Option<Value>) -> HandlerResult {
     let mut models_loaded = 0usize;
 
     // Group Postgres models by node_name for easy lookup
-    let models_by_node: HashMap<String, Vec<&FleetModelRow>> = if let Some(ref db_models) = pg_models {
-        let mut map: HashMap<String, Vec<&FleetModelRow>> = HashMap::new();
-        for m in db_models {
-            map.entry(m.node_name.clone()).or_default().push(m);
-        }
-        map
-    } else {
-        HashMap::new()
-    };
+    let models_by_node: HashMap<String, Vec<&FleetModelRow>> =
+        if let Some(ref db_models) = pg_models {
+            let mut map: HashMap<String, Vec<&FleetModelRow>> = HashMap::new();
+            for m in db_models {
+                map.entry(m.node_name.clone()).or_default().push(m);
+            }
+            map
+        } else {
+            HashMap::new()
+        };
 
     if let Some(ref db_nodes) = pg_nodes {
         // ── Postgres path ──────────────────────────────────────────────────
@@ -1907,21 +1910,23 @@ pub async fn fleet_models_disk_usage(_params: Option<Value>) -> HandlerResult {
 
     let items: Vec<Value> = rows
         .iter()
-        .map(|(node_name, models_dir, total, used, free, models, sampled_at)| {
-            json!({
-                "node_name": node_name,
-                "models_dir": models_dir,
-                "total_bytes": total,
-                "used_bytes": used,
-                "free_bytes": free,
-                "models_bytes": models,
-                "total_gb": (*total as f64) / GB,
-                "used_gb": (*used as f64) / GB,
-                "free_gb": (*free as f64) / GB,
-                "models_gb": (*models as f64) / GB,
-                "sampled_at": sampled_at,
-            })
-        })
+        .map(
+            |(node_name, models_dir, total, used, free, models, sampled_at)| {
+                json!({
+                    "node_name": node_name,
+                    "models_dir": models_dir,
+                    "total_bytes": total,
+                    "used_bytes": used,
+                    "free_bytes": free,
+                    "models_bytes": models,
+                    "total_gb": (*total as f64) / GB,
+                    "used_gb": (*used as f64) / GB,
+                    "free_gb": (*free as f64) / GB,
+                    "models_gb": (*models as f64) / GB,
+                    "sampled_at": sampled_at,
+                })
+            },
+        )
         .collect();
 
     Ok(json!({

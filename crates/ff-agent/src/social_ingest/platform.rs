@@ -40,15 +40,9 @@ pub fn detect_platform(url: &str) -> Platform {
         Platform::Twitter
     } else if host == "instagram.com" || host.ends_with(".instagram.com") {
         Platform::Instagram
-    } else if host == "tiktok.com"
-        || host.ends_with(".tiktok.com")
-        || host == "vm.tiktok.com"
-    {
+    } else if host == "tiktok.com" || host.ends_with(".tiktok.com") || host == "vm.tiktok.com" {
         Platform::TikTok
-    } else if host == "youtube.com"
-        || host.ends_with(".youtube.com")
-        || host == "youtu.be"
-    {
+    } else if host == "youtube.com" || host.ends_with(".youtube.com") || host == "youtu.be" {
         Platform::YouTube
     } else {
         Platform::Other

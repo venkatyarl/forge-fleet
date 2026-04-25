@@ -77,75 +77,135 @@ impl FleetInferenceManager {
     pub fn register_default_fleet(&self) {
         let defaults = vec![
             FleetEndpoint {
-                name: "taylor-gemma".into(), url: "http://192.168.5.100:55000".into(),
+                name: "taylor-gemma".into(),
+                url: "http://192.168.5.100:55000".into(),
                 // MLX server uses the full local path as model ID
-                model_name: "/Users/venkat/models/gemma-4-31b-it-4bit".into(), model_params: 31_000_000_000,
-                memory_gb: 96, gpu_type: GpuType::AppleSilicon,
-                tps: None, ttft_ms: None, context_window: 262_144,
-                healthy: true, last_check: None,
+                model_name: "/Users/venkat/models/gemma-4-31b-it-4bit".into(),
+                model_params: 31_000_000_000,
+                memory_gb: 96,
+                gpu_type: GpuType::AppleSilicon,
+                tps: None,
+                ttft_ms: None,
+                context_window: 262_144,
+                healthy: true,
+                last_check: None,
             },
             FleetEndpoint {
-                name: "taylor-qwen35".into(), url: "http://192.168.5.100:55001".into(),
-                model_name: "qwen3.5-35b-a3b".into(), model_params: 35_000_000_000,
-                memory_gb: 96, gpu_type: GpuType::AppleSilicon,
-                tps: None, ttft_ms: None, context_window: 32_768,
-                healthy: true, last_check: None,
+                name: "taylor-qwen35".into(),
+                url: "http://192.168.5.100:55001".into(),
+                model_name: "qwen3.5-35b-a3b".into(),
+                model_params: 35_000_000_000,
+                memory_gb: 96,
+                gpu_type: GpuType::AppleSilicon,
+                tps: None,
+                ttft_ms: None,
+                context_window: 32_768,
+                healthy: true,
+                last_check: None,
             },
             FleetEndpoint {
-                name: "marcus".into(), url: "http://192.168.5.102:55000".into(),
-                model_name: "qwen3-coder-30b-a3b".into(), model_params: 30_000_000_000,
-                memory_gb: 32, gpu_type: GpuType::Cpu,
-                tps: Some(3.0), ttft_ms: Some(15_000.0), context_window: 32_768,
-                healthy: true, last_check: None,
+                name: "marcus".into(),
+                url: "http://192.168.5.102:55000".into(),
+                model_name: "qwen3-coder-30b-a3b".into(),
+                model_params: 30_000_000_000,
+                memory_gb: 32,
+                gpu_type: GpuType::Cpu,
+                tps: Some(3.0),
+                ttft_ms: Some(15_000.0),
+                context_window: 32_768,
+                healthy: true,
+                last_check: None,
             },
             FleetEndpoint {
-                name: "sophie".into(), url: "http://192.168.5.103:55000".into(),
-                model_name: "qwen3-coder-30b-a3b".into(), model_params: 30_000_000_000,
-                memory_gb: 32, gpu_type: GpuType::Cpu,
-                tps: Some(2.0), ttft_ms: Some(20_000.0), context_window: 32_768,
-                healthy: true, last_check: None,
+                name: "sophie".into(),
+                url: "http://192.168.5.103:55000".into(),
+                model_name: "qwen3-coder-30b-a3b".into(),
+                model_params: 30_000_000_000,
+                memory_gb: 32,
+                gpu_type: GpuType::Cpu,
+                tps: Some(2.0),
+                ttft_ms: Some(20_000.0),
+                context_window: 32_768,
+                healthy: true,
+                last_check: None,
             },
             FleetEndpoint {
-                name: "priya".into(), url: "http://192.168.5.104:55000".into(),
-                model_name: "qwen3-coder-30b-a3b".into(), model_params: 30_000_000_000,
-                memory_gb: 32, gpu_type: GpuType::Cpu,
-                tps: Some(2.5), ttft_ms: Some(18_000.0), context_window: 32_768,
-                healthy: true, last_check: None,
+                name: "priya".into(),
+                url: "http://192.168.5.104:55000".into(),
+                model_name: "qwen3-coder-30b-a3b".into(),
+                model_params: 30_000_000_000,
+                memory_gb: 32,
+                gpu_type: GpuType::Cpu,
+                tps: Some(2.5),
+                ttft_ms: Some(18_000.0),
+                context_window: 32_768,
+                healthy: true,
+                last_check: None,
             },
             FleetEndpoint {
-                name: "james".into(), url: "http://192.168.5.108:55000".into(),
-                model_name: "qwen3.5-35b-a3b".into(), model_params: 35_000_000_000,
-                memory_gb: 64, gpu_type: GpuType::Cpu,
-                tps: Some(2.0), ttft_ms: Some(20_000.0), context_window: 32_768,
-                healthy: true, last_check: None,
+                name: "james".into(),
+                url: "http://192.168.5.108:55000".into(),
+                model_name: "qwen3.5-35b-a3b".into(),
+                model_params: 35_000_000_000,
+                memory_gb: 64,
+                gpu_type: GpuType::Cpu,
+                tps: Some(2.0),
+                ttft_ms: Some(20_000.0),
+                context_window: 32_768,
+                healthy: true,
+                last_check: None,
             },
             FleetEndpoint {
-                name: "logan".into(), url: "http://192.168.5.111:55000".into(),
-                model_name: "qwen3.5-35b-a3b".into(), model_params: 35_000_000_000,
-                memory_gb: 128, gpu_type: GpuType::Cpu,
-                tps: Some(4.0), ttft_ms: Some(10_000.0), context_window: 32_768,
-                healthy: true, last_check: None,
+                name: "logan".into(),
+                url: "http://192.168.5.111:55000".into(),
+                model_name: "qwen3.5-35b-a3b".into(),
+                model_params: 35_000_000_000,
+                memory_gb: 128,
+                gpu_type: GpuType::Cpu,
+                tps: Some(4.0),
+                ttft_ms: Some(10_000.0),
+                context_window: 32_768,
+                healthy: true,
+                last_check: None,
             },
             FleetEndpoint {
-                name: "veronica".into(), url: "http://192.168.5.112:55000".into(),
-                model_name: "qwen3.5-35b-a3b".into(), model_params: 35_000_000_000,
-                memory_gb: 128, gpu_type: GpuType::Cpu,
-                tps: Some(4.0), ttft_ms: Some(10_000.0), context_window: 32_768,
-                healthy: true, last_check: None,
+                name: "veronica".into(),
+                url: "http://192.168.5.112:55000".into(),
+                model_name: "qwen3.5-35b-a3b".into(),
+                model_params: 35_000_000_000,
+                memory_gb: 128,
+                gpu_type: GpuType::Cpu,
+                tps: Some(4.0),
+                ttft_ms: Some(10_000.0),
+                context_window: 32_768,
+                healthy: true,
+                last_check: None,
             },
             FleetEndpoint {
-                name: "lily".into(), url: "http://192.168.5.113:55000".into(),
-                model_name: "qwen3.5-35b-a3b".into(), model_params: 35_000_000_000,
-                memory_gb: 128, gpu_type: GpuType::Cpu,
-                tps: Some(4.0), ttft_ms: Some(10_000.0), context_window: 32_768,
-                healthy: true, last_check: None,
+                name: "lily".into(),
+                url: "http://192.168.5.113:55000".into(),
+                model_name: "qwen3.5-35b-a3b".into(),
+                model_params: 35_000_000_000,
+                memory_gb: 128,
+                gpu_type: GpuType::Cpu,
+                tps: Some(4.0),
+                ttft_ms: Some(10_000.0),
+                context_window: 32_768,
+                healthy: true,
+                last_check: None,
             },
             FleetEndpoint {
-                name: "duncan".into(), url: "http://192.168.5.114:55000".into(),
-                model_name: "qwen3.5-35b-a3b".into(), model_params: 35_000_000_000,
-                memory_gb: 128, gpu_type: GpuType::Cpu,
-                tps: Some(4.0), ttft_ms: Some(10_000.0), context_window: 32_768,
-                healthy: true, last_check: None,
+                name: "duncan".into(),
+                url: "http://192.168.5.114:55000".into(),
+                model_name: "qwen3.5-35b-a3b".into(),
+                model_params: 35_000_000_000,
+                memory_gb: 128,
+                gpu_type: GpuType::Cpu,
+                tps: Some(4.0),
+                ttft_ms: Some(10_000.0),
+                context_window: 32_768,
+                healthy: true,
+                last_check: None,
             },
         ];
 
@@ -156,7 +216,8 @@ impl FleetInferenceManager {
 
     /// Select the best endpoint for a given task.
     pub fn select_endpoint(&self, task_type: TaskType) -> Option<FleetEndpoint> {
-        let mut candidates: Vec<FleetEndpoint> = self.endpoints
+        let mut candidates: Vec<FleetEndpoint> = self
+            .endpoints
             .iter()
             .filter(|e| e.healthy)
             .map(|e| e.value().clone())
@@ -170,7 +231,9 @@ impl FleetInferenceManager {
         candidates.sort_by(|a, b| {
             let score_a = endpoint_score(a, task_type);
             let score_b = endpoint_score(b, task_type);
-            score_b.partial_cmp(&score_a).unwrap_or(std::cmp::Ordering::Equal)
+            score_b
+                .partial_cmp(&score_a)
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
 
         Some(candidates[0].clone())
@@ -178,7 +241,8 @@ impl FleetInferenceManager {
 
     /// Select multiple endpoints for parallel agent execution.
     pub fn select_parallel_endpoints(&self, count: usize) -> Vec<FleetEndpoint> {
-        let mut endpoints: Vec<FleetEndpoint> = self.endpoints
+        let mut endpoints: Vec<FleetEndpoint> = self
+            .endpoints
             .iter()
             .filter(|e| e.healthy)
             .map(|e| e.value().clone())
@@ -188,7 +252,9 @@ impl FleetInferenceManager {
         endpoints.sort_by(|a, b| {
             let tps_a = a.tps.unwrap_or(0.0);
             let tps_b = b.tps.unwrap_or(0.0);
-            tps_b.partial_cmp(&tps_a).unwrap_or(std::cmp::Ordering::Equal)
+            tps_b
+                .partial_cmp(&tps_a)
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
 
         endpoints.truncate(count);
@@ -227,7 +293,10 @@ impl FleetInferenceManager {
         for name in names {
             if let Some(mut ep) = self.endpoints.get_mut(&name) {
                 let url = format!("{}/health", ep.url.trim_end_matches('/'));
-                let healthy = client.get(&url).send().await
+                let healthy = client
+                    .get(&url)
+                    .send()
+                    .await
                     .map(|r| r.status().is_success())
                     .unwrap_or(false);
                 ep.healthy = healthy;
@@ -244,7 +313,9 @@ impl FleetInferenceManager {
 }
 
 impl Default for FleetInferenceManager {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Task type for endpoint selection.
@@ -270,11 +341,16 @@ fn endpoint_score(ep: &FleetEndpoint, task: TaskType) -> f64 {
             // Prefer fast inference (high TPS)
             score += ep.tps.unwrap_or(0.0) * 10.0;
             // Prefer GPU-accelerated
-            if matches!(ep.gpu_type, GpuType::AppleSilicon | GpuType::NvidiaCuda | GpuType::AmdRyzenAi) {
+            if matches!(
+                ep.gpu_type,
+                GpuType::AppleSilicon | GpuType::NvidiaCuda | GpuType::AmdRyzenAi
+            ) {
                 score += 50.0;
             }
             // Prefer smaller models (faster)
-            if ep.model_params < 15_000_000_000 { score += 30.0; }
+            if ep.model_params < 15_000_000_000 {
+                score += 30.0;
+            }
         }
         TaskType::Reasoning => {
             // Prefer larger models
@@ -303,7 +379,9 @@ fn endpoint_score(ep: &FleetEndpoint, task: TaskType) -> f64 {
     }
 
     // Health bonus
-    if ep.healthy { score += 100.0; }
+    if ep.healthy {
+        score += 100.0;
+    }
 
     score
 }
@@ -329,7 +407,9 @@ pub struct PrefixCacheManager {
 }
 
 impl PrefixCacheManager {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     /// Record that a prefix was sent to an endpoint.
     pub fn record_prefix(&self, endpoint: &str, prefix_hash: &str) {

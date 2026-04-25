@@ -3,10 +3,10 @@
 //! Commands are triggered by `/command` or `!command` prefixes in user input.
 //! The agent loop checks for commands before sending to the LLM.
 
-use async_trait::async_trait;
 use crate::agent_loop::AgentSession;
 use crate::compaction;
 use crate::session_store;
+use async_trait::async_trait;
 
 // ---------------------------------------------------------------------------
 // Command trait and registry
@@ -18,7 +18,9 @@ pub trait Command: Send + Sync {
     /// Command name (without prefix, e.g. "help").
     fn name(&self) -> &str;
     /// Aliases (e.g. "h" for "help").
-    fn aliases(&self) -> Vec<&str> { vec![] }
+    fn aliases(&self) -> Vec<&str> {
+        vec![]
+    }
     /// Short description.
     fn description(&self) -> &str;
     /// Execute the command. Returns output text to show the user.
@@ -32,7 +34,9 @@ pub struct CommandRegistry {
 
 impl CommandRegistry {
     pub fn new() -> Self {
-        let mut registry = Self { commands: Vec::new() };
+        let mut registry = Self {
+            commands: Vec::new(),
+        };
         // Register all built-in commands
         registry.register(Box::new(HelpCommand));
         registry.register(Box::new(ExitCommand));
@@ -81,16 +85,23 @@ impl CommandRegistry {
             }
         }
 
-        Some(format!("Unknown command: /{cmd_name}. Type /help for available commands."))
+        Some(format!(
+            "Unknown command: /{cmd_name}. Type /help for available commands."
+        ))
     }
 
     pub fn list(&self) -> Vec<(&str, &str)> {
-        self.commands.iter().map(|c| (c.name(), c.description())).collect()
+        self.commands
+            .iter()
+            .map(|c| (c.name(), c.description()))
+            .collect()
     }
 }
 
 impl Default for CommandRegistry {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -100,9 +111,15 @@ impl Default for CommandRegistry {
 struct HelpCommand;
 #[async_trait]
 impl Command for HelpCommand {
-    fn name(&self) -> &str { "help" }
-    fn aliases(&self) -> Vec<&str> { vec!["h", "?"] }
-    fn description(&self) -> &str { "Show available commands" }
+    fn name(&self) -> &str {
+        "help"
+    }
+    fn aliases(&self) -> Vec<&str> {
+        vec!["h", "?"]
+    }
+    fn description(&self) -> &str {
+        "Show available commands"
+    }
     async fn execute(&self, _args: &str, _session: &mut AgentSession) -> String {
         let registry = CommandRegistry::new();
         let mut output = String::from("Available commands:\n\n");
@@ -117,9 +134,15 @@ impl Command for HelpCommand {
 struct ExitCommand;
 #[async_trait]
 impl Command for ExitCommand {
-    fn name(&self) -> &str { "exit" }
-    fn aliases(&self) -> Vec<&str> { vec!["quit"] }
-    fn description(&self) -> &str { "Exit the TUI" }
+    fn name(&self) -> &str {
+        "exit"
+    }
+    fn aliases(&self) -> Vec<&str> {
+        vec!["quit"]
+    }
+    fn description(&self) -> &str {
+        "Exit the TUI"
+    }
     async fn execute(&self, _args: &str, _session: &mut AgentSession) -> String {
         // TUI intercepts /exit before dispatch; this is a fallback message.
         "Exiting...".into()
@@ -129,8 +152,12 @@ impl Command for ExitCommand {
 struct ClearCommand;
 #[async_trait]
 impl Command for ClearCommand {
-    fn name(&self) -> &str { "clear" }
-    fn description(&self) -> &str { "Clear conversation history (keep system prompt)" }
+    fn name(&self) -> &str {
+        "clear"
+    }
+    fn description(&self) -> &str {
+        "Clear conversation history (keep system prompt)"
+    }
     async fn execute(&self, _args: &str, session: &mut AgentSession) -> String {
         let system = session.messages.first().cloned();
         session.messages.clear();
@@ -144,8 +171,12 @@ impl Command for ClearCommand {
 struct CompactCommand;
 #[async_trait]
 impl Command for CompactCommand {
-    fn name(&self) -> &str { "compact" }
-    fn description(&self) -> &str { "Manually compact conversation history" }
+    fn name(&self) -> &str {
+        "compact"
+    }
+    fn description(&self) -> &str {
+        "Manually compact conversation history"
+    }
     async fn execute(&self, _args: &str, session: &mut AgentSession) -> String {
         let before = session.messages.len();
         let config = compaction::CompactionConfig {
@@ -162,8 +193,12 @@ impl Command for CompactCommand {
 struct ModelCommand;
 #[async_trait]
 impl Command for ModelCommand {
-    fn name(&self) -> &str { "model" }
-    fn description(&self) -> &str { "Show or switch the current LLM model (picks the right node automatically)" }
+    fn name(&self) -> &str {
+        "model"
+    }
+    fn description(&self) -> &str {
+        "Show or switch the current LLM model (picks the right node automatically)"
+    }
     async fn execute(&self, args: &str, session: &mut AgentSession) -> String {
         if args.is_empty() {
             return format!(
@@ -181,11 +216,17 @@ impl Command for ModelCommand {
             Ok(snapshot) => {
                 let target = args.trim();
                 // Match on model.name (display) or model.slug (e.g. "qwen2.5-coder-32b")
-                let matches: Vec<_> = snapshot.models.iter()
-                    .filter(|m| m.name.eq_ignore_ascii_case(target) || m.slug.eq_ignore_ascii_case(target))
+                let matches: Vec<_> = snapshot
+                    .models
+                    .iter()
+                    .filter(|m| {
+                        m.name.eq_ignore_ascii_case(target) || m.slug.eq_ignore_ascii_case(target)
+                    })
                     .collect();
                 if matches.is_empty() {
-                    return format!("No model named '{target}' found in the fleet. Run /models to see options.");
+                    return format!(
+                        "No model named '{target}' found in the fleet. Run /models to see options."
+                    );
                 }
                 // Prefer the first match; find the node to get its IP
                 let chosen = matches[0];
@@ -195,11 +236,25 @@ impl Command for ModelCommand {
                         let url = format!("http://{}:{}", node.ip, chosen.port);
                         session.config.llm_base_url = url.clone();
                         session.config.model = chosen.name.clone();
-                        let others: Vec<_> = matches.iter().skip(1).map(|m| m.node_name.as_str()).collect();
-                        let also = if others.is_empty() { String::new() } else { format!(" (also on: {})", others.join(", ")) };
-                        format!("Switched to {} on {} @ {}{}", chosen.name, chosen.node_name, url, also)
+                        let others: Vec<_> = matches
+                            .iter()
+                            .skip(1)
+                            .map(|m| m.node_name.as_str())
+                            .collect();
+                        let also = if others.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" (also on: {})", others.join(", "))
+                        };
+                        format!(
+                            "Switched to {} on {} @ {}{}",
+                            chosen.name, chosen.node_name, url, also
+                        )
                     }
-                    None => format!("Found model '{target}' but node '{}' is not registered.", chosen.node_name),
+                    None => format!(
+                        "Found model '{target}' but node '{}' is not registered.",
+                        chosen.node_name
+                    ),
                 }
             }
             Err(e) => {
@@ -214,8 +269,12 @@ impl Command for ModelCommand {
 struct StatusCommand;
 #[async_trait]
 impl Command for StatusCommand {
-    fn name(&self) -> &str { "status" }
-    fn description(&self) -> &str { "Show session status (tokens, turns, model)" }
+    fn name(&self) -> &str {
+        "status"
+    }
+    fn description(&self) -> &str {
+        "Show session status (tokens, turns, model)"
+    }
     async fn execute(&self, _args: &str, session: &mut AgentSession) -> String {
         let estimated_tokens = compaction::estimate_message_tokens(&session.messages);
         let pct = (estimated_tokens as f64 / session.config.context_window_tokens as f64) * 100.0;
@@ -247,8 +306,12 @@ impl Command for StatusCommand {
 struct CostCommand;
 #[async_trait]
 impl Command for CostCommand {
-    fn name(&self) -> &str { "cost" }
-    fn description(&self) -> &str { "Show token usage for this session" }
+    fn name(&self) -> &str {
+        "cost"
+    }
+    fn description(&self) -> &str {
+        "Show token usage for this session"
+    }
     async fn execute(&self, _args: &str, session: &mut AgentSession) -> String {
         format!(
             "Token usage:\n\
@@ -266,8 +329,12 @@ impl Command for CostCommand {
 struct ResumeCommand;
 #[async_trait]
 impl Command for ResumeCommand {
-    fn name(&self) -> &str { "resume" }
-    fn description(&self) -> &str { "Resume a previous session by ID" }
+    fn name(&self) -> &str {
+        "resume"
+    }
+    fn description(&self) -> &str {
+        "Resume a previous session by ID"
+    }
     async fn execute(&self, args: &str, session: &mut AgentSession) -> String {
         if args.is_empty() {
             return "Usage: /resume <session_id>".into();
@@ -292,8 +359,12 @@ impl Command for ResumeCommand {
 struct SessionsCommand;
 #[async_trait]
 impl Command for SessionsCommand {
-    fn name(&self) -> &str { "sessions" }
-    fn description(&self) -> &str { "List saved sessions" }
+    fn name(&self) -> &str {
+        "sessions"
+    }
+    fn description(&self) -> &str {
+        "List saved sessions"
+    }
     async fn execute(&self, _args: &str, _session: &mut AgentSession) -> String {
         let sessions = session_store::list_sessions().await;
         if sessions.is_empty() {
@@ -319,8 +390,12 @@ impl Command for SessionsCommand {
 struct RewindCommand;
 #[async_trait]
 impl Command for RewindCommand {
-    fn name(&self) -> &str { "rewind" }
-    fn description(&self) -> &str { "Undo the last assistant turn (removes last assistant + tool messages)" }
+    fn name(&self) -> &str {
+        "rewind"
+    }
+    fn description(&self) -> &str {
+        "Undo the last assistant turn (removes last assistant + tool messages)"
+    }
     async fn execute(&self, _args: &str, session: &mut AgentSession) -> String {
         // Remove messages from the end until we hit a user message
         let mut removed = 0;
@@ -343,13 +418,18 @@ impl Command for RewindCommand {
 struct PlanCommand;
 #[async_trait]
 impl Command for PlanCommand {
-    fn name(&self) -> &str { "plan" }
-    fn description(&self) -> &str { "Toggle plan mode (read-only exploration). `/plan exit` forces off." }
+    fn name(&self) -> &str {
+        "plan"
+    }
+    fn description(&self) -> &str {
+        "Toggle plan mode (read-only exploration). `/plan exit` forces off."
+    }
     async fn execute(&self, args: &str, session: &mut AgentSession) -> String {
         let arg = args.trim().to_lowercase();
         if arg == "exit" || arg == "off" {
             session.config.permission_mode = "default".into();
-            return "Plan mode OFF. Permission mode: default (mutating tools allowed again).".into();
+            return "Plan mode OFF. Permission mode: default (mutating tools allowed again)."
+                .into();
         }
         if session.config.permission_mode == "plan" {
             session.config.permission_mode = "default".into();
@@ -364,8 +444,12 @@ impl Command for PlanCommand {
 struct DiffCommand;
 #[async_trait]
 impl Command for DiffCommand {
-    fn name(&self) -> &str { "diff" }
-    fn description(&self) -> &str { "Show git diff in working directory" }
+    fn name(&self) -> &str {
+        "diff"
+    }
+    fn description(&self) -> &str {
+        "Show git diff in working directory"
+    }
     async fn execute(&self, _args: &str, session: &mut AgentSession) -> String {
         let output = tokio::process::Command::new("git")
             .args(["diff", "--stat"])
@@ -390,8 +474,12 @@ impl Command for DiffCommand {
 struct TasksCommand;
 #[async_trait]
 impl Command for TasksCommand {
-    fn name(&self) -> &str { "tasks" }
-    fn description(&self) -> &str { "List current tasks" }
+    fn name(&self) -> &str {
+        "tasks"
+    }
+    fn description(&self) -> &str {
+        "List current tasks"
+    }
     async fn execute(&self, _args: &str, _session: &mut AgentSession) -> String {
         // Use the in-memory task store from task_tools
         let store = &*crate::tools::task_tools::TASK_STORE_PUB;
@@ -405,22 +493,30 @@ impl Command for TasksCommand {
                 output.push_str(&format!("  #{} [{}] {}\n", t.id, t.status, t.subject));
             }
         }
-        if output.is_empty() { "No active tasks.".into() } else { output }
+        if output.is_empty() {
+            "No active tasks.".into()
+        } else {
+            output
+        }
     }
 }
 
 struct ExportCommand;
 #[async_trait]
 impl Command for ExportCommand {
-    fn name(&self) -> &str { "export" }
-    fn description(&self) -> &str { "Export conversation as JSON or Markdown" }
+    fn name(&self) -> &str {
+        "export"
+    }
+    fn description(&self) -> &str {
+        "Export conversation as JSON or Markdown"
+    }
     async fn execute(&self, args: &str, session: &mut AgentSession) -> String {
-        let format = if args.contains("md") || args.contains("markdown") { "md" } else { "json" };
-        let filename = format!(
-            "session-{}.{}",
-            &session.id.to_string()[..8],
-            format
-        );
+        let format = if args.contains("md") || args.contains("markdown") {
+            "md"
+        } else {
+            "json"
+        };
+        let filename = format!("session-{}.{}", &session.id.to_string()[..8], format);
         let path = session.config.working_dir.join(&filename);
 
         let content = if format == "json" {
@@ -445,8 +541,12 @@ impl Command for ExportCommand {
 struct FastCommand;
 #[async_trait]
 impl Command for FastCommand {
-    fn name(&self) -> &str { "fast" }
-    fn description(&self) -> &str { "Switch to fastest available fleet LLM" }
+    fn name(&self) -> &str {
+        "fast"
+    }
+    fn description(&self) -> &str {
+        "Switch to fastest available fleet LLM"
+    }
     async fn execute(&self, _args: &str, session: &mut AgentSession) -> String {
         // Switch to smallest/fastest model — Qwen3.5-9B on James
         session.config.llm_base_url = "http://192.168.5.108:55001".into();
@@ -458,8 +558,12 @@ impl Command for FastCommand {
 struct ConfigCommand;
 #[async_trait]
 impl Command for ConfigCommand {
-    fn name(&self) -> &str { "config" }
-    fn description(&self) -> &str { "Show or modify session configuration" }
+    fn name(&self) -> &str {
+        "config"
+    }
+    fn description(&self) -> &str {
+        "Show or modify session configuration"
+    }
     async fn execute(&self, args: &str, session: &mut AgentSession) -> String {
         if args.is_empty() {
             return format!(
@@ -490,13 +594,19 @@ impl Command for ConfigCommand {
             let value = value.trim();
             match key {
                 "max_turns" => {
-                    if let Ok(v) = value.parse() { session.config.max_turns = v; }
+                    if let Ok(v) = value.parse() {
+                        session.config.max_turns = v;
+                    }
                 }
                 "temperature" => {
-                    if let Ok(v) = value.parse() { session.config.temperature = v; }
+                    if let Ok(v) = value.parse() {
+                        session.config.temperature = v;
+                    }
                 }
                 "max_tokens" => {
-                    if let Ok(v) = value.parse() { session.config.max_tokens = v; }
+                    if let Ok(v) = value.parse() {
+                        session.config.max_tokens = v;
+                    }
                 }
                 _ => return format!("Unknown config key: {key}"),
             }

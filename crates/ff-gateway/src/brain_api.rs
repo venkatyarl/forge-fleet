@@ -20,13 +20,19 @@ fn pool_from_state(state: &GatewayState) -> Result<&ff_db::PgPool, (StatusCode, 
         .as_ref()
         .and_then(|os| os.pg_pool())
         .ok_or_else(|| {
-            (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":"postgres pool not available"})))
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error":"postgres pool not available"})),
+            )
         })
 }
 
 fn db_err(op: &str, e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
     tracing::error!("brain api error ({op}): {e}");
-    (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("{op}: {e}")})))
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({"error": format!("{op}: {e}")})),
+    )
 }
 
 // ─── Threads ─────────────────────────────────────────────────────────────
@@ -45,7 +51,12 @@ pub async fn list_threads(
     let user = ff_db::pg_get_brain_user(pool, user_name)
         .await
         .map_err(|e| db_err("pg_get_brain_user", e))?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(json!({"error": format!("user '{user_name}' not found")}))))?;
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": format!("user '{user_name}' not found")})),
+            )
+        })?;
     let threads = ff_db::pg_list_brain_threads(pool, user.id)
         .await
         .map_err(|e| db_err("pg_list_brain_threads", e))?;
@@ -69,10 +80,21 @@ pub async fn create_thread(
     let user = ff_db::pg_get_brain_user(pool, user_name)
         .await
         .map_err(|e| db_err("pg_get_brain_user", e))?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(json!({"error":"user not found"}))))?;
-    let id = ff_db::pg_create_brain_thread(pool, user.id, &body.slug, body.title.as_deref(), body.project.as_deref())
-        .await
-        .map_err(|e| db_err("pg_create_brain_thread", e))?;
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error":"user not found"})),
+            )
+        })?;
+    let id = ff_db::pg_create_brain_thread(
+        pool,
+        user.id,
+        &body.slug,
+        body.title.as_deref(),
+        body.project.as_deref(),
+    )
+    .await
+    .map_err(|e| db_err("pg_create_brain_thread", e))?;
     Ok(Json(json!({ "id": id, "slug": body.slug })))
 }
 
@@ -93,11 +115,21 @@ pub async fn thread_messages(
     let user = ff_db::pg_get_brain_user(pool, "venkat")
         .await
         .map_err(|e| db_err("pg_get_brain_user", e))?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(json!({"error":"default user not found; run brain seed first"}))))?;
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error":"default user not found; run brain seed first"})),
+            )
+        })?;
     let thread_row = ff_db::pg_get_brain_thread(pool, user.id, &slug)
         .await
         .map_err(|e| db_err("pg_get_brain_thread", e))?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(json!({"error": format!("thread '{slug}' not found")}))))?;
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": format!("thread '{slug}' not found")})),
+            )
+        })?;
 
     let mut msgs = ff_db::pg_list_brain_messages(pool, thread_row.id, q.limit.unwrap_or(50))
         .await
@@ -123,15 +155,32 @@ pub async fn send_thread_message(
     let user = ff_db::pg_get_brain_user(pool, user_name)
         .await
         .map_err(|e| db_err("pg_get_brain_user", e))?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(json!({"error":"user not found"}))))?;
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error":"user not found"})),
+            )
+        })?;
     let thread = ff_db::pg_get_brain_thread(pool, user.id, &slug)
         .await
         .map_err(|e| db_err("pg_get_brain_thread", e))?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(json!({"error": format!("thread '{slug}' not found")}))))?;
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": format!("thread '{slug}' not found")})),
+            )
+        })?;
 
     let channel = body.channel.as_deref().unwrap_or("web");
     let msg_id = ff_db::pg_insert_brain_message(
-        pool, thread.id, user.id, channel, "web-dashboard", "user", &body.content, None,
+        pool,
+        thread.id,
+        user.id,
+        channel,
+        "web-dashboard",
+        "user",
+        &body.content,
+        None,
     )
     .await
     .map_err(|e| db_err("pg_insert_brain_message", e))?;
@@ -140,10 +189,22 @@ pub async fn send_thread_message(
 
     // TODO: Phase 2 — call brain_chat::stream_assistant_response here
     // to generate an LLM reply. For now, echo-acknowledge.
-    let assistant_reply = format!("Received on thread '{}': {}", slug, body.content.chars().take(100).collect::<String>());
+    let assistant_reply = format!(
+        "Received on thread '{}': {}",
+        slug,
+        body.content.chars().take(100).collect::<String>()
+    );
     let _ = ff_db::pg_insert_brain_message(
-        pool, thread.id, user.id, "system", "brain", "assistant", &assistant_reply, None,
-    ).await;
+        pool,
+        thread.id,
+        user.id,
+        "system",
+        "brain",
+        "assistant",
+        &assistant_reply,
+        None,
+    )
+    .await;
 
     Ok(Json(json!({ "message_id": msg_id, "thread_slug": slug })))
 }
@@ -167,20 +228,33 @@ pub async fn attach_to_thread(
     let user = ff_db::pg_get_brain_user(pool, user_name)
         .await
         .map_err(|e| db_err("pg_get_brain_user", e))?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(json!({"error":"user not found"}))))?;
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error":"user not found"})),
+            )
+        })?;
     let thread = ff_db::pg_get_brain_thread(pool, user.id, &body.thread_slug)
         .await
         .map_err(|e| db_err("pg_get_brain_thread", e))?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(json!({"error":"thread not found"}))))?;
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error":"thread not found"})),
+            )
+        })?;
 
     // Ensure channel identity exists
-    let _ = ff_db::pg_upsert_channel_identity(pool, &body.channel, &body.external_id, user.id).await;
+    let _ =
+        ff_db::pg_upsert_channel_identity(pool, &body.channel, &body.external_id, user.id).await;
 
     ff_db::pg_attach_thread(pool, &body.channel, &body.external_id, user.id, thread.id)
         .await
         .map_err(|e| db_err("pg_attach_thread", e))?;
 
-    Ok(Json(json!({ "attached": true, "thread_slug": body.thread_slug })))
+    Ok(Json(
+        json!({ "attached": true, "thread_slug": body.thread_slug }),
+    ))
 }
 
 // ─── Knowledge candidates ────────────────────────────────────────────────
@@ -194,7 +268,12 @@ pub async fn list_candidates(
     let user = ff_db::pg_get_brain_user(pool, user_name)
         .await
         .map_err(|e| db_err("pg_get_brain_user", e))?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(json!({"error":"user not found"}))))?;
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error":"user not found"})),
+            )
+        })?;
     let candidates = ff_db::pg_list_brain_candidates_pending(pool, user.id)
         .await
         .map_err(|e| db_err("pg_list_brain_candidates_pending", e))?;
@@ -212,8 +291,12 @@ pub async fn update_candidate(
     Json(body): Json<CandidateActionBody>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let pool = pool_from_state(&state)?;
-    let uuid = uuid::Uuid::parse_str(&id)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": format!("bad uuid: {e}")}))))?;
+    let uuid = uuid::Uuid::parse_str(&id).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("bad uuid: {e}")})),
+        )
+    })?;
     ff_db::pg_update_brain_candidate_status(pool, uuid, &body.status)
         .await
         .map_err(|e| db_err("pg_update_brain_candidate_status", e))?;
@@ -238,9 +321,9 @@ pub async fn vault_graph(
             .await
             .unwrap_or_default();
         for e in edges {
-            if !all_edges.iter().any(|x: &ff_db::BrainVaultEdgeRow|
+            if !all_edges.iter().any(|x: &ff_db::BrainVaultEdgeRow| {
                 x.src_id == e.src_id && x.dst_id == e.dst_id && x.edge_type == e.edge_type
-            ) {
+            }) {
                 all_edges.push(e);
             }
         }
@@ -287,11 +370,25 @@ pub async fn create_reminder(
     let user = ff_db::pg_get_brain_user(pool, user_name)
         .await
         .map_err(|e| db_err("pg_get_brain_user", e))?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(json!({"error":"user not found"}))))?;
-    let remind_at: chrono::DateTime<chrono::Utc> = body.remind_at.parse()
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": format!("bad remind_at: {e}")}))))?;
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error":"user not found"})),
+            )
+        })?;
+    let remind_at: chrono::DateTime<chrono::Utc> = body.remind_at.parse().map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("bad remind_at: {e}")})),
+        )
+    })?;
     let id = ff_db::pg_insert_brain_reminder(
-        pool, user.id, None, &body.content, remind_at, body.channel_pref.as_deref(),
+        pool,
+        user.id,
+        None,
+        &body.content,
+        remind_at,
+        body.channel_pref.as_deref(),
     )
     .await
     .map_err(|e| db_err("pg_insert_brain_reminder", e))?;
@@ -356,13 +453,20 @@ pub async fn whoami(
 
 // ─── Stack + Backlog (Redis-backed) ──────────────────────────────────────
 
-async fn get_brain_state_client(state: &GatewayState) -> Result<ff_brain::BrainStateClient, (StatusCode, Json<Value>)> {
+async fn get_brain_state_client(
+    state: &GatewayState,
+) -> Result<ff_brain::BrainStateClient, (StatusCode, Json<Value>)> {
     let pool = pool_from_state(state)?;
     let redis_url = std::env::var("FORGEFLEET_REDIS_URL")
         .unwrap_or_else(|_| "redis://192.168.5.100:6380".to_string());
     ff_brain::BrainStateClient::new(&redis_url, pool.clone())
         .await
-        .map_err(|e| (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": format!("redis: {e}")}))))
+        .map_err(|e| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": format!("redis: {e}")})),
+            )
+        })
 }
 
 #[derive(Debug, Deserialize)]
@@ -379,12 +483,26 @@ pub async fn stack_list(
     let mut client = get_brain_state_client(&state).await?;
     let user_name = q.user.as_deref().unwrap_or("venkat");
     let user = ff_db::pg_get_brain_user(pool, user_name)
-        .await.map_err(|e| db_err("user", e))?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(json!({"error":"user not found"}))))?;
+        .await
+        .map_err(|e| db_err("user", e))?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error":"user not found"})),
+            )
+        })?;
     let thread = ff_db::pg_get_brain_thread(pool, user.id, &thread_slug)
-        .await.map_err(|e| db_err("thread", e))?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(json!({"error":"thread not found"}))))?;
-    let items = client.stack_list(&user.id, &thread.id, 20).await
+        .await
+        .map_err(|e| db_err("thread", e))?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error":"thread not found"})),
+            )
+        })?;
+    let items = client
+        .stack_list(&user.id, &thread.id, 20)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))?;
     Ok(Json(json!({ "items": items, "thread_slug": thread_slug })))
 }
@@ -406,11 +524,23 @@ pub async fn stack_push(
     let mut client = get_brain_state_client(&state).await?;
     let user_name = body.user.as_deref().unwrap_or("venkat");
     let user = ff_db::pg_get_brain_user(pool, user_name)
-        .await.map_err(|e| db_err("user", e))?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(json!({"error":"user not found"}))))?;
+        .await
+        .map_err(|e| db_err("user", e))?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error":"user not found"})),
+            )
+        })?;
     let thread = ff_db::pg_get_brain_thread(pool, user.id, &thread_slug)
-        .await.map_err(|e| db_err("thread", e))?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(json!({"error":"thread not found"}))))?;
+        .await
+        .map_err(|e| db_err("thread", e))?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error":"thread not found"})),
+            )
+        })?;
     let item = ff_brain::StackItem {
         id: uuid::Uuid::new_v4().to_string(),
         title: body.title,
@@ -419,9 +549,13 @@ pub async fn stack_push(
         progress: 0.0,
         pushed_at: chrono::Utc::now().to_rfc3339(),
     };
-    let depth = client.stack_push(&user.id, &thread.id, &item).await
+    let depth = client
+        .stack_push(&user.id, &thread.id, &item)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))?;
-    Ok(Json(json!({ "pushed": true, "depth": depth, "item": item })))
+    Ok(Json(
+        json!({ "pushed": true, "depth": depth, "item": item }),
+    ))
 }
 
 pub async fn stack_pop(
@@ -433,12 +567,26 @@ pub async fn stack_pop(
     let mut client = get_brain_state_client(&state).await?;
     let user_name = q.user.as_deref().unwrap_or("venkat");
     let user = ff_db::pg_get_brain_user(pool, user_name)
-        .await.map_err(|e| db_err("user", e))?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(json!({"error":"user not found"}))))?;
+        .await
+        .map_err(|e| db_err("user", e))?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error":"user not found"})),
+            )
+        })?;
     let thread = ff_db::pg_get_brain_thread(pool, user.id, &thread_slug)
-        .await.map_err(|e| db_err("thread", e))?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(json!({"error":"thread not found"}))))?;
-    let popped = client.stack_pop(&user.id, &thread.id).await
+        .await
+        .map_err(|e| db_err("thread", e))?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error":"thread not found"})),
+            )
+        })?;
+    let popped = client
+        .stack_pop(&user.id, &thread.id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))?;
     Ok(Json(json!({ "popped": popped })))
 }
@@ -458,9 +606,17 @@ pub async fn backlog_list(
     let mut client = get_brain_state_client(&state).await?;
     let user_name = q.user.as_deref().unwrap_or("venkat");
     let user = ff_db::pg_get_brain_user(pool, user_name)
-        .await.map_err(|e| db_err("user", e))?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(json!({"error":"user not found"}))))?;
-    let items = client.backlog_list(&user.id, &project, q.limit.unwrap_or(50)).await
+        .await
+        .map_err(|e| db_err("user", e))?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error":"user not found"})),
+            )
+        })?;
+    let items = client
+        .backlog_list(&user.id, &project, q.limit.unwrap_or(50))
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))?;
     Ok(Json(json!({ "items": items, "project": project })))
 }
@@ -484,8 +640,14 @@ pub async fn backlog_add(
     let mut client = get_brain_state_client(&state).await?;
     let user_name = body.user.as_deref().unwrap_or("venkat");
     let user = ff_db::pg_get_brain_user(pool, user_name)
-        .await.map_err(|e| db_err("user", e))?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(json!({"error":"user not found"}))))?;
+        .await
+        .map_err(|e| db_err("user", e))?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error":"user not found"})),
+            )
+        })?;
     let item = ff_brain::BacklogItem {
         id: uuid::Uuid::new_v4().to_string(),
         title: body.title,
@@ -495,7 +657,9 @@ pub async fn backlog_add(
         from_thread_id: None,
         created_at: chrono::Utc::now().to_rfc3339(),
     };
-    let count = client.backlog_add(&user.id, &project, &item).await
+    let count = client
+        .backlog_add(&user.id, &project, &item)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))?;
     Ok(Json(json!({ "added": true, "count": count, "item": item })))
 }
@@ -515,9 +679,17 @@ pub async fn backlog_complete(
     let mut client = get_brain_state_client(&state).await?;
     let user_name = body.user.as_deref().unwrap_or("venkat");
     let user = ff_db::pg_get_brain_user(pool, user_name)
-        .await.map_err(|e| db_err("user", e))?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(json!({"error":"user not found"}))))?;
-    let done = client.backlog_complete(&user.id, &project, &body.item_id).await
+        .await
+        .map_err(|e| db_err("user", e))?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error":"user not found"})),
+            )
+        })?;
+    let done = client
+        .backlog_complete(&user.id, &project, &body.item_id)
+        .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))?;
     Ok(Json(json!({ "completed": done, "item_id": body.item_id })))
 }

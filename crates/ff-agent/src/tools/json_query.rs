@@ -9,7 +9,9 @@ pub struct JsonQueryTool;
 
 #[async_trait]
 impl AgentTool for JsonQueryTool {
-    fn name(&self) -> &str { "JsonQuery" }
+    fn name(&self) -> &str {
+        "JsonQuery"
+    }
 
     fn description(&self) -> &str {
         "Query and transform JSON data using jq-style expressions. Can process JSON from files, strings, or URLs."
@@ -44,10 +46,14 @@ impl AgentTool for JsonQueryTool {
             };
             match tokio::fs::read_to_string(&path).await {
                 Ok(content) => content,
-                Err(e) => return AgentToolResult::err(format!("Failed to read {}: {e}", path.display())),
+                Err(e) => {
+                    return AgentToolResult::err(format!("Failed to read {}: {e}", path.display()));
+                }
             }
         } else {
-            return AgentToolResult::err("Provide either 'input' (JSON string) or 'file' (path to JSON file)");
+            return AgentToolResult::err(
+                "Provide either 'input' (JSON string) or 'file' (path to JSON file)",
+            );
         };
 
         // Try using jq if available, otherwise basic Rust JSON parsing
@@ -82,7 +88,10 @@ impl AgentTool for JsonQueryTool {
                     Ok(data) => {
                         // Simple dot-notation access
                         let result = simple_json_query(&data, query);
-                        AgentToolResult::ok(truncate_output(&serde_json::to_string_pretty(&result).unwrap_or_default(), MAX_TOOL_RESULT_CHARS))
+                        AgentToolResult::ok(truncate_output(
+                            &serde_json::to_string_pretty(&result).unwrap_or_default(),
+                            MAX_TOOL_RESULT_CHARS,
+                        ))
                     }
                     Err(e) => AgentToolResult::err(format!("Invalid JSON input: {e}")),
                 }
@@ -93,11 +102,15 @@ impl AgentTool for JsonQueryTool {
 
 fn simple_json_query(data: &Value, query: &str) -> Value {
     let path = query.trim_start_matches('.');
-    if path.is_empty() { return data.clone(); }
+    if path.is_empty() {
+        return data.clone();
+    }
 
     let mut current = data;
     for key in path.split('.') {
-        if key.is_empty() { continue; }
+        if key.is_empty() {
+            continue;
+        }
         if let Some(idx) = key.strip_prefix('[').and_then(|k| k.strip_suffix(']')) {
             if let Ok(i) = idx.parse::<usize>() {
                 current = current.get(i).unwrap_or(&Value::Null);

@@ -24,9 +24,7 @@ use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::beat_v2::{
-    AvailableModel, DockerContainer, InstalledSoftware, LlmServer, PulseBeatV2,
-};
+use crate::beat_v2::{AvailableModel, DockerContainer, InstalledSoftware, LlmServer, PulseBeatV2};
 
 /// Channel name this materializer subscribes to.
 const PULSE_EVENTS_CHANNEL: &str = "pulse:events";
@@ -407,7 +405,8 @@ impl Materializer {
         .fetch_optional(&self.pg)
         .await?;
 
-        let row = row.ok_or_else(|| MaterializerError::UnknownComputer(beat.computer_name.clone()))?;
+        let row =
+            row.ok_or_else(|| MaterializerError::UnknownComputer(beat.computer_name.clone()))?;
 
         let computer_id: Uuid = row.try_get("id")?;
         let prev_status: String = row.try_get("status")?;
@@ -593,8 +592,7 @@ impl Materializer {
 
         // Q11: mark models NOT in beat's list as absent (only the ones whose
         // last_seen_at is older than 5 minutes — spec).
-        let present_ids: Vec<String> =
-            beat.available_models.iter().map(|m| m.id.clone()).collect();
+        let present_ids: Vec<String> = beat.available_models.iter().map(|m| m.id.clone()).collect();
         sqlx::query(
             "UPDATE computer_models \
              SET present = false \
@@ -613,10 +611,9 @@ impl Materializer {
         // vanished — a vllm container torn down, a llama-server crashed
         // out, an endpoint retired — stay `active` in the DB forever; the
         // fleet dashboard then reports phantom capacity.
-        let prune_before: chrono::DateTime<chrono::Utc> =
-            sqlx::query_scalar("SELECT NOW()")
-                .fetch_one(&self.pg)
-                .await?;
+        let prune_before: chrono::DateTime<chrono::Utc> = sqlx::query_scalar("SELECT NOW()")
+            .fetch_one(&self.pg)
+            .await?;
         for s in &beat.llm_servers {
             self.upsert_deployment(computer_id, s).await?;
             report.deployment_upserts += 1;
@@ -672,8 +669,7 @@ impl Materializer {
         // V43: upsert fabric pairs from reciprocal cx7-fabric IP claims.
         // Soft-fail (log + continue) — a fabric-upsert error should not
         // abort the whole beat materialization.
-        if let Err(e) =
-            crate::fabric_upsert::upsert_fabric_pairs(&self.pg, beat, computer_id).await
+        if let Err(e) = crate::fabric_upsert::upsert_fabric_pairs(&self.pg, beat, computer_id).await
         {
             tracing::warn!(computer = %beat.computer_name, error = %e, "fabric_pairs upsert failed");
         }
@@ -702,15 +698,16 @@ impl Materializer {
         sw: &InstalledSoftware,
     ) -> Result<(), MaterializerError> {
         // Q9: look up latest_version from registry to compute upgrade status.
-        let latest_row = sqlx::query(
-            "SELECT latest_version FROM software_registry WHERE id = $1",
-        )
-        .bind(&sw.id)
-        .fetch_optional(&self.pg)
-        .await?;
+        let latest_row = sqlx::query("SELECT latest_version FROM software_registry WHERE id = $1")
+            .bind(&sw.id)
+            .fetch_optional(&self.pg)
+            .await?;
 
-        let latest_version: Option<String> = latest_row
-            .and_then(|r| r.try_get::<Option<String>, _>("latest_version").ok().flatten());
+        let latest_version: Option<String> = latest_row.and_then(|r| {
+            r.try_get::<Option<String>, _>("latest_version")
+                .ok()
+                .flatten()
+        });
 
         let new_status: &str = match latest_version.as_deref() {
             Some(lv) if !lv.is_empty() && lv != sw.version => "upgrade_available",
@@ -1278,9 +1275,17 @@ mod tests {
         // change entry in the report and a close-downtime-event write.
         let prev_status = "offline".to_string();
         let beat = beat_online("ace");
-        let new_status = if beat.going_offline { "offline" } else { "online" }.to_string();
+        let new_status = if beat.going_offline {
+            "offline"
+        } else {
+            "online"
+        }
+        .to_string();
         assert_ne!(prev_status, new_status);
-        assert!(matches!(prev_status.as_str(), "offline" | "sdown" | "odown"));
+        assert!(matches!(
+            prev_status.as_str(),
+            "offline" | "sdown" | "odown"
+        ));
     }
 
     #[test]

@@ -10,7 +10,9 @@ pub struct OrchestrateTool;
 
 #[async_trait]
 impl AgentTool for OrchestrateTool {
-    fn name(&self) -> &str { "Orchestrate" }
+    fn name(&self) -> &str {
+        "Orchestrate"
+    }
 
     fn description(&self) -> &str {
         "Route a complex task to the best fleet node(s) for execution. Analyzes the task type (coding, review, research, fleet ops, multi-node) and dispatches to the most capable model. For multi-node tasks, runs in parallel across the fleet."
@@ -34,7 +36,10 @@ impl AgentTool for OrchestrateTool {
             _ => return AgentToolResult::err("Missing 'task'"),
         };
 
-        let force_parallel = input.get("force_parallel").and_then(Value::as_bool).unwrap_or(false);
+        let force_parallel = input
+            .get("force_parallel")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
 
         // If specific node requested, route there
         if let Some(target) = input.get("target_node").and_then(Value::as_str) {
@@ -52,9 +57,15 @@ impl AgentTool for OrchestrateTool {
                 let outcome = session.run(task, None).await;
                 return match outcome {
                     crate::agent_loop::AgentOutcome::EndTurn { final_message } => {
-                        AgentToolResult::ok(format!("[{}] {}", node.name, truncate_output(&final_message, MAX_TOOL_RESULT_CHARS - 50)))
+                        AgentToolResult::ok(format!(
+                            "[{}] {}",
+                            node.name,
+                            truncate_output(&final_message, MAX_TOOL_RESULT_CHARS - 50)
+                        ))
                     }
-                    crate::agent_loop::AgentOutcome::Error(e) => AgentToolResult::err(format!("[{}] Error: {e}", node.name)),
+                    crate::agent_loop::AgentOutcome::Error(e) => {
+                        AgentToolResult::err(format!("[{}] Error: {e}", node.name))
+                    }
                     _ => AgentToolResult::ok(format!("[{}] Task completed", node.name)),
                 };
             } else {
@@ -64,7 +75,11 @@ impl AgentTool for OrchestrateTool {
 
         // Analyze and orchestrate
         let task_type = orchestrator_agent::analyze_task(task);
-        let task_type_override = if force_parallel { orchestrator_agent::TaskType::MultiNode } else { task_type };
+        let task_type_override = if force_parallel {
+            orchestrator_agent::TaskType::MultiNode
+        } else {
+            task_type
+        };
 
         let result = orchestrator_agent::orchestrate(task, &ctx.working_dir).await;
 
@@ -89,7 +104,9 @@ impl AgentTool for OrchestrateTool {
             let icon = if r.success { "✓" } else { "✗" };
             output.push_str(&format!(
                 "{icon} {} ({}, {:.1}s):\n{}\n\n",
-                r.node, r.model, r.duration_ms as f64 / 1000.0,
+                r.node,
+                r.model,
+                r.duration_ms as f64 / 1000.0,
                 truncate_output(&r.output, 2000)
             ));
         }

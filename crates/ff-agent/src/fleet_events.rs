@@ -33,11 +33,17 @@ pub const CHANNEL_ROUTING_INVALIDATE: &str = "routing:invalidate";
 /// Falls back to `redis://192.168.5.100:6380` on any error.
 fn resolve_redis_url() -> String {
     const FALLBACK: &str = "redis://192.168.5.100:6380";
-    let Some(home) = dirs::home_dir() else { return FALLBACK.to_string() };
+    let Some(home) = dirs::home_dir() else {
+        return FALLBACK.to_string();
+    };
     let path = home.join(".forgefleet/fleet.toml");
-    let Ok(text) = std::fs::read_to_string(&path) else { return FALLBACK.to_string() };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return FALLBACK.to_string();
+    };
     // Parse as generic toml::Value so we don't depend on FleetConfig shape.
-    let Ok(val) = toml::from_str::<toml::Value>(&text) else { return FALLBACK.to_string() };
+    let Ok(val) = toml::from_str::<toml::Value>(&text) else {
+        return FALLBACK.to_string();
+    };
     val.get("redis")
         .and_then(|r| r.get("url"))
         .and_then(|u| u.as_str())
@@ -47,8 +53,7 @@ fn resolve_redis_url() -> String {
 
 async fn publish_raw(channel: &str, payload: &str) -> Result<(), String> {
     let url = resolve_redis_url();
-    let client = redis::Client::open(url.as_str())
-        .map_err(|e| format!("redis open {url}: {e}"))?;
+    let client = redis::Client::open(url.as_str()).map_err(|e| format!("redis open {url}: {e}"))?;
     let mut conn = client
         .get_multiplexed_async_connection()
         .await

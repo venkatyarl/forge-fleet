@@ -9,7 +9,9 @@ pub struct WebFetchTool;
 
 #[async_trait]
 impl AgentTool for WebFetchTool {
-    fn name(&self) -> &str { "WebFetch" }
+    fn name(&self) -> &str {
+        "WebFetch"
+    }
 
     fn description(&self) -> &str {
         "Fetch a web page and return its content as text. Useful for reading documentation, API responses, or any web content."

@@ -15,7 +15,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
@@ -146,7 +146,9 @@ async fn ensure_binary(name: &str) -> Result<()> {
         _ => {
             let hint = match name {
                 "yt-dlp" => "install yt-dlp: pip install yt-dlp",
-                "ffmpeg" => "install ffmpeg: brew install ffmpeg (macOS) or apt install ffmpeg (Linux)",
+                "ffmpeg" => {
+                    "install ffmpeg: brew install ffmpeg (macOS) or apt install ffmpeg (Linux)"
+                }
                 other => return Err(anyhow!("{other} not found on PATH")),
             };
             Err(anyhow!("{name} not found on PATH — {hint}"))

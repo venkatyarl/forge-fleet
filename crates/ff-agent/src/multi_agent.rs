@@ -71,10 +71,13 @@ impl MultiAgentOrchestrator {
         let task_count = tasks.len();
         info!(count = task_count, "starting parallel agent execution");
 
-        emit_orch(&event_tx, OrchestratorEvent::Started {
-            task_count,
-            task_ids: tasks.iter().map(|t| t.id.clone()).collect(),
-        });
+        emit_orch(
+            &event_tx,
+            OrchestratorEvent::Started {
+                task_count,
+                task_ids: tasks.iter().map(|t| t.id.clone()).collect(),
+            },
+        );
 
         let mut handles = Vec::new();
         let cancel = self.cancel_token.clone();
@@ -83,9 +86,8 @@ impl MultiAgentOrchestrator {
             let event_tx = event_tx.clone();
             let cancel = cancel.clone();
 
-            let handle = tokio::spawn(async move {
-                run_single_agent_task(task, event_tx, cancel).await
-            });
+            let handle =
+                tokio::spawn(async move { run_single_agent_task(task, event_tx, cancel).await });
 
             handles.push(handle);
         }
@@ -107,16 +109,28 @@ impl MultiAgentOrchestrator {
             }
         }
 
-        let completed = results.iter().filter(|r| r.status == TaskStatus::Completed).count();
-        let failed = results.iter().filter(|r| r.status == TaskStatus::Failed).count();
+        let completed = results
+            .iter()
+            .filter(|r| r.status == TaskStatus::Completed)
+            .count();
+        let failed = results
+            .iter()
+            .filter(|r| r.status == TaskStatus::Failed)
+            .count();
 
-        emit_orch(&event_tx, OrchestratorEvent::AllCompleted {
-            total: results.len(),
-            completed,
-            failed,
-        });
+        emit_orch(
+            &event_tx,
+            OrchestratorEvent::AllCompleted {
+                total: results.len(),
+                completed,
+                failed,
+            },
+        );
 
-        info!(total = results.len(), completed, failed, "parallel execution complete");
+        info!(
+            total = results.len(),
+            completed, failed, "parallel execution complete"
+        );
         results
     }
 
@@ -127,7 +141,9 @@ impl MultiAgentOrchestrator {
 }
 
 impl Default for MultiAgentOrchestrator {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 async fn run_single_agent_task(
@@ -138,10 +154,13 @@ async fn run_single_agent_task(
     let start = std::time::Instant::now();
     let task_id = task.id.clone();
 
-    emit_orch(&orch_event_tx, OrchestratorEvent::TaskStarted {
-        task_id: task_id.clone(),
-        llm_endpoint: task.llm_base_url.clone(),
-    });
+    emit_orch(
+        &orch_event_tx,
+        OrchestratorEvent::TaskStarted {
+            task_id: task_id.clone(),
+            llm_endpoint: task.llm_base_url.clone(),
+        },
+    );
 
     let config = AgentSessionConfig {
         model: task.model.unwrap_or_else(|| "auto".into()),
@@ -181,11 +200,14 @@ async fn run_single_agent_task(
         AgentOutcome::Error(e) => (TaskStatus::Failed, e),
     };
 
-    emit_orch(&orch_event_tx, OrchestratorEvent::TaskCompleted {
-        task_id: task_id.clone(),
-        status,
-        duration_ms,
-    });
+    emit_orch(
+        &orch_event_tx,
+        OrchestratorEvent::TaskCompleted {
+            task_id: task_id.clone(),
+            status,
+            duration_ms,
+        },
+    );
 
     AgentTaskResult {
         task_id,
@@ -202,13 +224,27 @@ async fn run_single_agent_task(
 #[serde(tag = "orchestrator_event")]
 pub enum OrchestratorEvent {
     #[serde(rename = "started")]
-    Started { task_count: usize, task_ids: Vec<String> },
+    Started {
+        task_count: usize,
+        task_ids: Vec<String>,
+    },
     #[serde(rename = "task_started")]
-    TaskStarted { task_id: String, llm_endpoint: String },
+    TaskStarted {
+        task_id: String,
+        llm_endpoint: String,
+    },
     #[serde(rename = "task_completed")]
-    TaskCompleted { task_id: String, status: TaskStatus, duration_ms: u64 },
+    TaskCompleted {
+        task_id: String,
+        status: TaskStatus,
+        duration_ms: u64,
+    },
     #[serde(rename = "all_completed")]
-    AllCompleted { total: usize, completed: usize, failed: usize },
+    AllCompleted {
+        total: usize,
+        completed: usize,
+        failed: usize,
+    },
 }
 
 fn emit_orch(tx: &Option<mpsc::UnboundedSender<OrchestratorEvent>>, event: OrchestratorEvent) {
@@ -231,7 +267,9 @@ pub struct TimestampedEvent {
 }
 
 impl EventStream {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     pub fn append(&mut self, session_id: &str, event: AgentEvent) {
         self.events.push(TimestampedEvent {
@@ -242,7 +280,10 @@ impl EventStream {
     }
 
     pub fn events_for_session(&self, session_id: &str) -> Vec<&TimestampedEvent> {
-        self.events.iter().filter(|e| e.session_id == session_id).collect()
+        self.events
+            .iter()
+            .filter(|e| e.session_id == session_id)
+            .collect()
     }
 
     pub fn replay_from(&self, index: usize) -> &[TimestampedEvent] {
@@ -253,8 +294,12 @@ impl EventStream {
         }
     }
 
-    pub fn len(&self) -> usize { self.events.len() }
-    pub fn is_empty(&self) -> bool { self.events.is_empty() }
+    pub fn len(&self) -> usize {
+        self.events.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
 }
 
 /// Test-driven verification pipeline — code on one node, test on another, verify on a third.
@@ -267,16 +312,15 @@ pub struct VerificationPipeline {
 
 impl VerificationPipeline {
     /// Run the full pipeline: code → test → verify.
-    pub async fn run(
-        &self,
-        prompt: &str,
-        working_dir: &PathBuf,
-    ) -> VerificationResult {
+    pub async fn run(&self, prompt: &str, working_dir: &PathBuf) -> VerificationResult {
         // Step 1: Generate code on the code endpoint
         let code_config = AgentSessionConfig {
             llm_base_url: self.code_endpoint.clone(),
             working_dir: working_dir.clone(),
-            system_prompt: Some("You are a coding agent. Write code to accomplish the task. Run tests after.".into()),
+            system_prompt: Some(
+                "You are a coding agent. Write code to accomplish the task. Run tests after."
+                    .into(),
+            ),
             max_turns: 15,
             auto_save: false,
             ..Default::default()
@@ -288,8 +332,22 @@ impl VerificationPipeline {
         let code_output = match &code_outcome {
             AgentOutcome::EndTurn { final_message } => final_message.clone(),
             AgentOutcome::MaxTurns { partial_message } => partial_message.clone(),
-            AgentOutcome::Error(e) => return VerificationResult { passed: false, code_output: e.clone(), test_output: String::new(), verify_output: "Skipped — code generation failed".into() },
-            AgentOutcome::Cancelled => return VerificationResult { passed: false, code_output: "Cancelled".into(), test_output: String::new(), verify_output: "Skipped".into() },
+            AgentOutcome::Error(e) => {
+                return VerificationResult {
+                    passed: false,
+                    code_output: e.clone(),
+                    test_output: String::new(),
+                    verify_output: "Skipped — code generation failed".into(),
+                };
+            }
+            AgentOutcome::Cancelled => {
+                return VerificationResult {
+                    passed: false,
+                    code_output: "Cancelled".into(),
+                    test_output: String::new(),
+                    verify_output: "Skipped".into(),
+                };
+            }
         };
 
         // Step 2: Run tests on the test endpoint
@@ -303,7 +361,9 @@ impl VerificationPipeline {
         };
 
         let mut test_session = AgentSession::new(test_config);
-        let test_outcome = test_session.run("Run the test suite and report pass/fail", None).await;
+        let test_outcome = test_session
+            .run("Run the test suite and report pass/fail", None)
+            .await;
 
         let test_output = match &test_outcome {
             AgentOutcome::EndTurn { final_message } => final_message.clone(),

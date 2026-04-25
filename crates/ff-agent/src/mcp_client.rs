@@ -40,8 +40,15 @@ pub struct McpConnection {
 }
 
 enum McpTransport {
-    Stdio { child: Child, #[allow(dead_code)] stdin_buf: Vec<u8> },
-    Http { url: String, client: reqwest::Client },
+    Stdio {
+        child: Child,
+        #[allow(dead_code)]
+        stdin_buf: Vec<u8>,
+    },
+    Http {
+        url: String,
+        client: reqwest::Client,
+    },
 }
 
 /// Tool definition from an MCP server.
@@ -61,7 +68,9 @@ pub struct McpClientManager {
 
 impl McpClientManager {
     pub fn new() -> Self {
-        Self { connections: HashMap::new() }
+        Self {
+            connections: HashMap::new(),
+        }
     }
 
     /// Connect to an MCP server and discover its tools.
@@ -86,14 +95,19 @@ impl McpClientManager {
             for (k, v) in &config.env {
                 cmd.env(k, v);
             }
-            cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+            cmd.stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null());
 
             let child = cmd.spawn()?;
 
             McpConnection {
                 config: config.clone(),
                 tools: Vec::new(),
-                transport: McpTransport::Stdio { child, stdin_buf: Vec::new() },
+                transport: McpTransport::Stdio {
+                    child,
+                    stdin_buf: Vec::new(),
+                },
                 next_id: 1,
             }
         } else {
@@ -101,27 +115,37 @@ impl McpClientManager {
         };
 
         // Initialize handshake
-        let init_result = conn.send_request("initialize", json!({
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": {
-                "name": "forgefleet-agent",
-                "version": "0.1.0"
-            }
-        })).await?;
+        let init_result = conn
+            .send_request(
+                "initialize",
+                json!({
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": {
+                        "name": "forgefleet-agent",
+                        "version": "0.1.0"
+                    }
+                }),
+            )
+            .await?;
 
         debug!(server = %name, "MCP server initialized: {init_result}");
 
         // Send initialized notification
-        conn.send_notification("notifications/initialized", json!({})).await?;
+        conn.send_notification("notifications/initialized", json!({}))
+            .await?;
 
         // Discover tools
         let tools_result = conn.send_request("tools/list", json!({})).await?;
-        let tools: Vec<McpToolDef> = if let Some(tools_arr) = tools_result.get("tools").and_then(Value::as_array) {
-            tools_arr.iter().filter_map(|t| serde_json::from_value(t.clone()).ok()).collect()
-        } else {
-            Vec::new()
-        };
+        let tools: Vec<McpToolDef> =
+            if let Some(tools_arr) = tools_result.get("tools").and_then(Value::as_array) {
+                tools_arr
+                    .iter()
+                    .filter_map(|t| serde_json::from_value(t.clone()).ok())
+                    .collect()
+            } else {
+                Vec::new()
+            };
 
         info!(server = %name, tool_count = tools.len(), "MCP tools discovered");
 
@@ -138,17 +162,25 @@ impl McpClientManager {
         tool_name: &str,
         arguments: Value,
     ) -> anyhow::Result<String> {
-        let conn = self.connections.get_mut(server_name)
+        let conn = self
+            .connections
+            .get_mut(server_name)
             .ok_or_else(|| anyhow::anyhow!("MCP server '{server_name}' not connected"))?;
 
-        let result = conn.send_request("tools/call", json!({
-            "name": tool_name,
-            "arguments": arguments,
-        })).await?;
+        let result = conn
+            .send_request(
+                "tools/call",
+                json!({
+                    "name": tool_name,
+                    "arguments": arguments,
+                }),
+            )
+            .await?;
 
         // Extract text content from result
         if let Some(content) = result.get("content").and_then(Value::as_array) {
-            let texts: Vec<&str> = content.iter()
+            let texts: Vec<&str> = content
+                .iter()
                 .filter_map(|c| c.get("text").and_then(Value::as_str))
                 .collect();
             Ok(texts.join("\n"))
@@ -159,21 +191,32 @@ impl McpClientManager {
 
     /// List all tools from all connected servers.
     pub fn all_tools(&self) -> Vec<(String, McpToolDef)> {
-        self.connections.iter()
+        self.connections
+            .iter()
             .flat_map(|(name, conn)| {
                 let name = name.clone();
-                conn.tools.iter().map(move |t| (format!("{}_{}", name, t.name), t.clone()))
+                conn.tools
+                    .iter()
+                    .map(move |t| (format!("{}_{}", name, t.name), t.clone()))
             })
             .collect()
     }
 
     /// List connected servers.
     pub fn list_servers(&self) -> Vec<McpServerInfo> {
-        self.connections.iter().map(|(name, conn)| McpServerInfo {
-            name: name.clone(),
-            tool_count: conn.tools.len(),
-            transport: if conn.config.url.is_some() { "http" } else { "stdio" }.into(),
-        }).collect()
+        self.connections
+            .iter()
+            .map(|(name, conn)| McpServerInfo {
+                name: name.clone(),
+                tool_count: conn.tools.len(),
+                transport: if conn.config.url.is_some() {
+                    "http"
+                } else {
+                    "stdio"
+                }
+                .into(),
+            })
+            .collect()
     }
 
     /// Disconnect from a server.
@@ -196,7 +239,9 @@ impl McpClientManager {
 }
 
 impl Default for McpClientManager {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -220,10 +265,7 @@ impl McpConnection {
 
         match &mut self.transport {
             McpTransport::Http { url, client } => {
-                let resp = client.post(url.as_str())
-                    .json(&request)
-                    .send()
-                    .await?;
+                let resp = client.post(url.as_str()).json(&request).send().await?;
                 let body: Value = resp.json().await?;
                 if let Some(result) = body.get("result") {
                     Ok(result.clone())
@@ -234,13 +276,19 @@ impl McpConnection {
                 }
             }
             McpTransport::Stdio { child, .. } => {
-                let stdin = child.stdin.as_mut().ok_or_else(|| anyhow::anyhow!("no stdin"))?;
+                let stdin = child
+                    .stdin
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("no stdin"))?;
                 let mut line = serde_json::to_string(&request)?;
                 line.push('\n');
                 stdin.write_all(line.as_bytes()).await?;
                 stdin.flush().await?;
 
-                let stdout = child.stdout.as_mut().ok_or_else(|| anyhow::anyhow!("no stdout"))?;
+                let stdout = child
+                    .stdout
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("no stdout"))?;
                 let mut reader = BufReader::new(stdout);
                 let mut response_line = String::new();
                 reader.read_line(&mut response_line).await?;
@@ -269,7 +317,10 @@ impl McpConnection {
                 client.post(url.as_str()).json(&notification).send().await?;
             }
             McpTransport::Stdio { child, .. } => {
-                let stdin = child.stdin.as_mut().ok_or_else(|| anyhow::anyhow!("no stdin"))?;
+                let stdin = child
+                    .stdin
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("no stdin"))?;
                 let mut line = serde_json::to_string(&notification)?;
                 line.push('\n');
                 stdin.write_all(line.as_bytes()).await?;

@@ -52,7 +52,7 @@ pub struct ScheduleAction {
     pub schedule_id: sqlx::types::Uuid,
     pub computer_name: String,
     pub kind: String,
-    pub result: String,   // "ok" | "skipped: <reason>" | "error: <msg>"
+    pub result: String, // "ok" | "skipped: <reason>" | "error: <msg>"
 }
 
 pub struct PowerScheduler {
@@ -166,10 +166,7 @@ impl PowerScheduler {
         })
     }
 
-    async fn dispatch(
-        &self,
-        row: &ff_db::ComputerScheduleRow,
-    ) -> Result<(), PowerError> {
+    async fn dispatch(&self, row: &ff_db::ComputerScheduleRow) -> Result<(), PowerError> {
         let target = fetch_target(&self.pg, row.computer_id).await?;
         match row.kind.as_str() {
             "sleep" => dispatch_sleep(&target).await,
@@ -250,10 +247,7 @@ async fn fetch_target(
 
 /// Minutes since last pulse beat for the given computer. Returns a very
 /// large number if no beat has ever been recorded (treat as "always idle").
-async fn last_seen_idle_minutes(
-    pool: &PgPool,
-    computer_name: &str,
-) -> Result<i64, PowerError> {
+async fn last_seen_idle_minutes(pool: &PgPool, computer_name: &str) -> Result<i64, PowerError> {
     let row = sqlx::query(
         "SELECT EXTRACT(EPOCH FROM (NOW() - last_seen_at))::BIGINT as secs
          FROM computers WHERE name = $1",
@@ -311,10 +305,9 @@ async fn dispatch_wake(t: &PowerTarget) -> Result<(), PowerError> {
 }
 
 async fn run_ssh(t: &PowerTarget, cmd: &str) -> Result<(), PowerError> {
-    let (code, stdout, stderr) =
-        ssh_exec(&t.ssh_user, &t.primary_ip, cmd)
-            .await
-            .map_err(PowerError::Ssh)?;
+    let (code, stdout, stderr) = ssh_exec(&t.ssh_user, &t.primary_ip, cmd)
+        .await
+        .map_err(PowerError::Ssh)?;
     if code == 0 {
         Ok(())
     } else {
@@ -370,9 +363,9 @@ fn field_matches(field: &str, value: u32) -> Result<bool, PowerError> {
         if token.is_empty() {
             continue;
         }
-        let parsed: u32 = token.parse().map_err(|e| {
-            PowerError::CronParse(format!("bad cron token '{token}': {e}"))
-        })?;
+        let parsed: u32 = token
+            .parse()
+            .map_err(|e| PowerError::CronParse(format!("bad cron token '{token}': {e}")))?;
         if parsed == value {
             return Ok(true);
         }
@@ -387,7 +380,9 @@ mod tests {
 
     #[test]
     fn cron_wildcard_matches_any() {
-        let now = chrono::Utc.with_ymd_and_hms(2026, 4, 18, 23, 45, 0).unwrap();
+        let now = chrono::Utc
+            .with_ymd_and_hms(2026, 4, 18, 23, 45, 0)
+            .unwrap();
         assert!(cron_matches("* * * * *", now).unwrap());
     }
 

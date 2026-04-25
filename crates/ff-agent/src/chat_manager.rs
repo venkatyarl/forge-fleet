@@ -81,10 +81,7 @@ pub enum ModelSelection {
     /// ForgeFleet auto-selects based on the question/task.
     Auto,
     /// User explicitly chose a specific model/endpoint.
-    Manual {
-        model: String,
-        llm_base_url: String,
-    },
+    Manual { model: String, llm_base_url: String },
     /// Route to the best model for the task type.
     TaskBased {
         task_type: String, // "coding", "reasoning", "review", "fast"
@@ -92,7 +89,9 @@ pub enum ModelSelection {
 }
 
 impl Default for ModelSelection {
-    fn default() -> Self { Self::Auto }
+    fn default() -> Self {
+        Self::Auto
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -190,9 +189,7 @@ impl ChatManager {
         let id = uuid::Uuid::new_v4().to_string();
         let now = Utc::now();
 
-        let chat_name = name.unwrap_or_else(|| {
-            format!("Chat {}", now.format("%b %d %H:%M"))
-        });
+        let chat_name = name.unwrap_or_else(|| format!("Chat {}", now.format("%b %d %H:%M")));
 
         let chat = ChatSession {
             id: id.clone(),
@@ -244,7 +241,8 @@ impl ChatManager {
             "auto".into(),
             working_dir,
             ModelSelection::Auto,
-        ).await
+        )
+        .await
     }
 
     /// Get a chat by ID.
@@ -259,8 +257,13 @@ impl ChatManager {
 
     /// List all chats for a project (most recent first).
     pub fn list_for_project(&self, project_id: &str) -> Vec<ChatListEntry> {
-        let ids = self.project_chats.get(project_id).cloned().unwrap_or_default();
-        let mut entries: Vec<ChatListEntry> = ids.iter()
+        let ids = self
+            .project_chats
+            .get(project_id)
+            .cloned()
+            .unwrap_or_default();
+        let mut entries: Vec<ChatListEntry> = ids
+            .iter()
             .filter_map(|id| self.chats.get(id))
             .map(chat_to_list_entry)
             .collect();
@@ -270,16 +273,15 @@ impl ChatManager {
 
     /// List all chats across all scopes (most recent first).
     pub fn list_all(&self) -> Vec<ChatListEntry> {
-        let mut entries: Vec<ChatListEntry> = self.chats.values()
-            .map(chat_to_list_entry)
-            .collect();
+        let mut entries: Vec<ChatListEntry> = self.chats.values().map(chat_to_list_entry).collect();
         entries.sort_by(|a, b| b.last_active_at.cmp(&a.last_active_at));
         entries
     }
 
     /// List chats by scope type.
     pub fn list_by_scope(&self, scope_type: &str) -> Vec<ChatListEntry> {
-        self.chats.values()
+        self.chats
+            .values()
             .filter(|c| match (&c.scope, scope_type) {
                 (MemoryScope::Global, "global") => true,
                 (MemoryScope::Project { .. }, "project") => true,
@@ -380,7 +382,8 @@ impl ChatManager {
     /// List chats in a specific folder (supports nested folders like "work/frontend").
     pub fn list_in_folder(&self, folder_path: &str) -> Vec<ChatListEntry> {
         let tag = format!("folder:{folder_path}");
-        self.chats.values()
+        self.chats
+            .values()
             .filter(|c| c.tags.iter().any(|t| t == &tag))
             .map(chat_to_list_entry)
             .collect()
@@ -407,7 +410,8 @@ impl ChatManager {
 
     /// List chats that are NOT in any folder.
     pub fn list_unfiled(&self) -> Vec<ChatListEntry> {
-        self.chats.values()
+        self.chats
+            .values()
             .filter(|c| !c.tags.iter().any(|t| t.starts_with("folder:")))
             .map(chat_to_list_entry)
             .collect()
@@ -430,7 +434,9 @@ impl ChatManager {
 }
 
 impl Default for ChatManager {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

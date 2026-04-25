@@ -39,7 +39,9 @@ impl Widget for TokenGauge {
 
         // Draw background
         for x in area.x..area.x + area.width {
-            buf[(x, area.y)].set_char('░').set_fg(Color::Rgb(51, 65, 85));
+            buf[(x, area.y)]
+                .set_char('░')
+                .set_fg(Color::Rgb(51, 65, 85));
         }
 
         // Draw filled portion
@@ -122,7 +124,10 @@ impl Widget for ToolCard {
             ToolCardStatus::Error => ("✗", Color::Rgb(248, 113, 113)),
         };
 
-        let duration_str = self.duration_ms.map(|ms| format!(" ({ms}ms)")).unwrap_or_default();
+        let duration_str = self
+            .duration_ms
+            .map(|ms| format!(" ({ms}ms)"))
+            .unwrap_or_default();
         let header = format!("{icon} {}{duration_str}", self.tool_name);
 
         let block = Block::default()
@@ -132,7 +137,10 @@ impl Widget for ToolCard {
         let content = if self.expanded && !self.output_preview.is_empty() {
             format!("{header}\n{}", self.output_preview)
         } else {
-            format!("{header} {}", truncate(&self.input_preview, area.width as usize - header.len() - 2))
+            format!(
+                "{header} {}",
+                truncate(&self.input_preview, area.width as usize - header.len() - 2)
+            )
         };
 
         let paragraph = Paragraph::new(content)

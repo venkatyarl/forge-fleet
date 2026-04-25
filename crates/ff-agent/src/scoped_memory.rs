@@ -40,9 +40,15 @@ pub enum MemoryScope {
     /// Global ForgeFleet memory.
     Global,
     /// Scoped to a specific project.
-    Project { project_id: String, project_name: String },
+    Project {
+        project_id: String,
+        project_name: String,
+    },
     /// Merged context from multiple projects.
-    MultiProject { project_ids: Vec<String>, project_names: Vec<String> },
+    MultiProject {
+        project_ids: Vec<String>,
+        project_names: Vec<String>,
+    },
     /// Scoped to a specific filesystem directory.
     Folder { path: PathBuf },
     /// Temporary — cleaned up after scrub.
@@ -58,7 +64,9 @@ impl MemoryScope {
         match self {
             Self::Global => "ForgeFleet (Global)".into(),
             Self::Project { project_name, .. } => format!("Project: {project_name}"),
-            Self::MultiProject { project_names, .. } => format!("Multi: {}", project_names.join(", ")),
+            Self::MultiProject { project_names, .. } => {
+                format!("Multi: {}", project_names.join(", "))
+            }
             Self::Folder { path } => format!("Folder: {}", path.display()),
             Self::Temp => "Temp".into(),
             Self::FleetBrain => "Fleet Brain".into(),
@@ -89,7 +97,13 @@ fn chat_filename(sequence: u32, date: &DateTime<Utc>, name: &str) -> String {
 /// Sanitize a name for use in filenames.
 fn sanitize_name(name: &str) -> String {
     name.chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c.to_ascii_lowercase() } else { '-' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
         .collect::<String>()
         .trim_matches('-')
         .to_string()
@@ -157,7 +171,9 @@ impl ScopedMemoryStore {
         if let MemoryScope::Project { project_name, .. } = &scope {
             let project_md = base_path.join("project.md");
             if !project_md.exists() {
-                let content = format!("# {project_name}\n\nProject memory for {project_name}.\nAdd project-specific context, conventions, and decisions here.\n");
+                let content = format!(
+                    "# {project_name}\n\nProject memory for {project_name}.\nAdd project-specific context, conventions, and decisions here.\n"
+                );
                 let _ = fs::write(&project_md, content).await;
             }
         }
@@ -174,7 +190,12 @@ impl ScopedMemoryStore {
         let entries = load_entries(&base_path).await;
         info!(scope = %scope.display_name(), entries = entries.len(), path = %base_path.display(), "opened memory store");
 
-        Self { scope, entries, base_path, dirty: false }
+        Self {
+            scope,
+            entries,
+            base_path,
+            dirty: false,
+        }
     }
 
     /// Add a memory entry.
@@ -182,8 +203,14 @@ impl ScopedMemoryStore {
         let id = uuid::Uuid::new_v4().to_string();
         let now = Utc::now();
         self.entries.push(MemoryEntry {
-            id: id.clone(), category, content, relevance: 0.5,
-            created_at: now, updated_at: now, source_session: None, tags,
+            id: id.clone(),
+            category,
+            content,
+            relevance: 0.5,
+            created_at: now,
+            updated_at: now,
+            source_session: None,
+            tags,
         });
         self.dirty = true;
         id
@@ -192,16 +219,25 @@ impl ScopedMemoryStore {
     /// Get all memories sorted by relevance.
     pub fn all(&self) -> Vec<&MemoryEntry> {
         let mut sorted: Vec<_> = self.entries.iter().collect();
-        sorted.sort_by(|a, b| b.relevance.partial_cmp(&a.relevance).unwrap_or(std::cmp::Ordering::Equal));
+        sorted.sort_by(|a, b| {
+            b.relevance
+                .partial_cmp(&a.relevance)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         sorted
     }
 
     /// Search memories by keyword.
     pub fn search(&self, query: &str) -> Vec<&MemoryEntry> {
         let lower = query.to_ascii_lowercase();
-        self.entries.iter()
-            .filter(|e| e.content.to_ascii_lowercase().contains(&lower)
-                || e.tags.iter().any(|t| t.to_ascii_lowercase().contains(&lower)))
+        self.entries
+            .iter()
+            .filter(|e| {
+                e.content.to_ascii_lowercase().contains(&lower)
+                    || e.tags
+                        .iter()
+                        .any(|t| t.to_ascii_lowercase().contains(&lower))
+            })
             .collect()
     }
 
@@ -211,7 +247,9 @@ impl ScopedMemoryStore {
         let mut used = 0;
         for entry in self.all() {
             let line = format!("[{}] {}\n", category_label(entry.category), entry.content);
-            if used + line.len() > max_chars { break; }
+            if used + line.len() > max_chars {
+                break;
+            }
             context.push_str(&line);
             used += line.len();
         }
@@ -252,7 +290,12 @@ impl ScopedMemoryStore {
     pub fn remove(&mut self, id: &str) -> bool {
         let before = self.entries.len();
         self.entries.retain(|e| e.id != id);
-        if self.entries.len() < before { self.dirty = true; true } else { false }
+        if self.entries.len() < before {
+            self.dirty = true;
+            true
+        } else {
+            false
+        }
     }
 
     pub fn boost_relevance(&mut self, id: &str, boost: f64) {
@@ -263,9 +306,15 @@ impl ScopedMemoryStore {
         }
     }
 
-    pub fn scope(&self) -> &MemoryScope { &self.scope }
-    pub fn len(&self) -> usize { self.entries.len() }
-    pub fn is_empty(&self) -> bool { self.entries.is_empty() }
+    pub fn scope(&self) -> &MemoryScope {
+        &self.scope
+    }
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
 }
 
 fn category_label(cat: MemoryCategory) -> &'static str {
@@ -287,7 +336,10 @@ fn category_label(cat: MemoryCategory) -> &'static str {
 // ---------------------------------------------------------------------------
 
 /// Generate a daily summary file at daily/{YYYY}/{YYYY-MM}/{MMDDYYYY}.md
-pub async fn generate_daily_summary(date: &DateTime<Utc>, summary_content: &str) -> anyhow::Result<PathBuf> {
+pub async fn generate_daily_summary(
+    date: &DateTime<Utc>,
+    summary_content: &str,
+) -> anyhow::Result<PathBuf> {
     let daily_dir = memory_base_dir().join("daily").join(date_path(date));
     // The date_path gives us year/year-month/MMDDYYYY — we want the file at the day level
     let parent = daily_dir.parent().unwrap_or(&daily_dir);
@@ -313,17 +365,23 @@ pub async fn generate_daily_summary(date: &DateTime<Utc>, summary_content: &str)
 /// Scrub temp memories — extract valuable data, then clean up.
 pub async fn scrub_temp_sessions() -> anyhow::Result<u32> {
     let temp_dir = memory_base_dir().join("temp");
-    if !temp_dir.exists() { return Ok(0); }
+    if !temp_dir.exists() {
+        return Ok(0);
+    }
 
     let mut scrubbed = 0u32;
 
     // Walk year/month/day structure
     let mut year_entries = fs::read_dir(&temp_dir).await?;
     while let Some(year_entry) = year_entries.next_entry().await? {
-        if !year_entry.path().is_dir() { continue; }
+        if !year_entry.path().is_dir() {
+            continue;
+        }
         let mut month_entries = fs::read_dir(year_entry.path()).await?;
         while let Some(month_entry) = month_entries.next_entry().await? {
-            if !month_entry.path().is_dir() { continue; }
+            if !month_entry.path().is_dir() {
+                continue;
+            }
             let mut day_entries = fs::read_dir(month_entry.path()).await?;
             while let Some(day_entry) = day_entries.next_entry().await? {
                 let path = day_entry.path();
@@ -335,10 +393,19 @@ pub async fn scrub_temp_sessions() -> anyhow::Result<u32> {
                             if let Some(entries) = data.get("entries").and_then(|v| v.as_array()) {
                                 let mut global = ScopedMemoryStore::open(MemoryScope::Global).await;
                                 for entry in entries {
-                                    let relevance = entry.get("relevance").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                                    let relevance = entry
+                                        .get("relevance")
+                                        .and_then(|v| v.as_f64())
+                                        .unwrap_or(0.0);
                                     if relevance > 0.3 {
-                                        if let Some(content) = entry.get("content").and_then(|v| v.as_str()) {
-                                            global.add(MemoryCategory::Learning, format!("[scrubbed] {content}"), vec!["scrubbed".into()]);
+                                        if let Some(content) =
+                                            entry.get("content").and_then(|v| v.as_str())
+                                        {
+                                            global.add(
+                                                MemoryCategory::Learning,
+                                                format!("[scrubbed] {content}"),
+                                                vec!["scrubbed".into()],
+                                            );
                                         }
                                     }
                                 }
@@ -395,7 +462,9 @@ fn scope_base_path(scope: &MemoryScope) -> PathBuf {
     let base = memory_base_dir();
     match scope {
         MemoryScope::Global => base.join("global"),
-        MemoryScope::Project { project_name, .. } => base.join("projects").join(sanitize_name(project_name)),
+        MemoryScope::Project { project_name, .. } => {
+            base.join("projects").join(sanitize_name(project_name))
+        }
         MemoryScope::MultiProject { project_names, .. } => {
             let mut names = project_names.clone();
             names.sort();
@@ -407,12 +476,14 @@ fn scope_base_path(scope: &MemoryScope) -> PathBuf {
             base.join("folders").join(hash)
         }
         MemoryScope::Temp => base.join("temp"),
-        MemoryScope::FleetBrain => {
-            dirs::home_dir().unwrap_or_default().join(".forgefleet").join("brain")
-        }
-        MemoryScope::HiveMind => {
-            dirs::home_dir().unwrap_or_default().join(".forgefleet").join("hive")
-        }
+        MemoryScope::FleetBrain => dirs::home_dir()
+            .unwrap_or_default()
+            .join(".forgefleet")
+            .join("brain"),
+        MemoryScope::HiveMind => dirs::home_dir()
+            .unwrap_or_default()
+            .join(".forgefleet")
+            .join("hive"),
     }
 }
 
@@ -481,13 +552,19 @@ mod tests {
     fn chat_filename_sequence() {
         use chrono::TimeZone;
         let date = Utc.with_ymd_and_hms(2026, 4, 6, 12, 0, 0).unwrap();
-        assert_eq!(chat_filename(3, &date, "Review PR"), "03-04062026-review-pr.json");
+        assert_eq!(
+            chat_filename(3, &date, "Review PR"),
+            "03-04062026-review-pr.json"
+        );
     }
 
     #[test]
     fn scope_paths_are_distinct() {
         let global = scope_base_path(&MemoryScope::Global);
-        let project = scope_base_path(&MemoryScope::Project { project_id: "1".into(), project_name: "Test".into() });
+        let project = scope_base_path(&MemoryScope::Project {
+            project_id: "1".into(),
+            project_name: "Test".into(),
+        });
         let temp = scope_base_path(&MemoryScope::Temp);
         assert_ne!(global, project);
         assert_ne!(project, temp);

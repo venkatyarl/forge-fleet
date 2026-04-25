@@ -677,16 +677,16 @@ pub async fn list_work_items(
         args.push(a.clone());
         sql.push_str(&format!(" AND assigned_to = ${}", args.len()));
     }
-    sql.push_str(&format!(
-        " ORDER BY created_at DESC LIMIT {}",
-        limit
-    ));
+    sql.push_str(&format!(" ORDER BY created_at DESC LIMIT {}", limit));
 
     let mut query = sqlx::query(&sql);
     for a in &args {
         query = query.bind(a);
     }
-    let rows = query.fetch_all(pool).await.map_err(|e| db_err("list_work_items", e))?;
+    let rows = query
+        .fetch_all(pool)
+        .await
+        .map_err(|e| db_err("list_work_items", e))?;
 
     let items: Vec<Value> = rows
         .iter()
@@ -795,7 +795,11 @@ pub async fn alert_events(
         ORDER BY ae.fired_at DESC
         LIMIT {}
         "#,
-        if only_active { "WHERE ae.resolved_at IS NULL" } else { "" },
+        if only_active {
+            "WHERE ae.resolved_at IS NULL"
+        } else {
+            ""
+        },
         limit,
     );
 
@@ -1149,8 +1153,7 @@ pub async fn events_stream(
 
     let stream: ReceiverStream<Result<Event, Infallible>> = ReceiverStream::new(rx);
     // Cast to the `Stream` trait so axum can consume it.
-    let stream: Box<dyn Stream<Item = Result<Event, Infallible>> + Send + Unpin> =
-        Box::new(stream);
+    let stream: Box<dyn Stream<Item = Result<Event, Infallible>> + Send + Unpin> = Box::new(stream);
 
     Ok(Sse::new(stream)
         .keep_alive(

@@ -101,20 +101,26 @@ fn probe_sync() -> DockerStatus {
             .cloned()
             .unwrap_or_else(|| "unmanaged".to_string());
         if let Some(cf) = labels.get("com.docker.compose.project.config_files") {
-            compose_files.entry(project.clone()).or_insert_with(|| cf.clone());
+            compose_files
+                .entry(project.clone())
+                .or_insert_with(|| cf.clone());
         }
 
-        let name = c.names.split(',').next().unwrap_or(&c.names).trim().to_string();
+        let name = c
+            .names
+            .split(',')
+            .next()
+            .unwrap_or(&c.names)
+            .trim()
+            .to_string();
         let container_id = c.id.chars().take(12).collect::<String>();
         let ports = parse_ports(&c.ports);
         let status_enum = map_state(&c.state);
         let health = extract_health(&c.status);
         let uptime_sec = parse_uptime(&c.status);
 
-        let (cpu_pct, mem_mb, mem_limit_mb) = stats_by_name
-            .get(&name)
-            .copied()
-            .unwrap_or((0.0, 0.0, 0.0));
+        let (cpu_pct, mem_mb, mem_limit_mb) =
+            stats_by_name.get(&name).copied().unwrap_or((0.0, 0.0, 0.0));
 
         projects.entry(project).or_default().push(DockerContainer {
             name,
@@ -342,8 +348,14 @@ mod tests {
 
     #[test]
     fn health_extracts_correctly() {
-        assert_eq!(extract_health("Up 2 hours (healthy)"), Some("healthy".into()));
-        assert_eq!(extract_health("Up 2 hours (unhealthy)"), Some("unhealthy".into()));
+        assert_eq!(
+            extract_health("Up 2 hours (healthy)"),
+            Some("healthy".into())
+        );
+        assert_eq!(
+            extract_health("Up 2 hours (unhealthy)"),
+            Some("unhealthy".into())
+        );
         assert_eq!(extract_health("Up 2 hours"), None);
     }
 
@@ -360,7 +372,10 @@ mod tests {
     #[test]
     fn labels_parse_comma_separated() {
         let l = parse_labels("com.docker.compose.project=foo,foo.bar=baz");
-        assert_eq!(l.get("com.docker.compose.project"), Some(&"foo".to_string()));
+        assert_eq!(
+            l.get("com.docker.compose.project"),
+            Some(&"foo".to_string())
+        );
         assert_eq!(l.get("foo.bar"), Some(&"baz".to_string()));
     }
 

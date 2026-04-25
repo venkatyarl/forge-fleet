@@ -61,12 +61,11 @@ impl KeyCache {
     /// Returns `Ok(false)` (not an error) if the secret is missing —
     /// subscribers will then treat unsigned beats as acceptable.
     pub async fn refresh_from(&self, pool: &sqlx::PgPool) -> Result<bool, sqlx::Error> {
-        let row: Option<(String,)> = sqlx::query_as(
-            "SELECT value FROM fleet_secrets WHERE key = $1",
-        )
-        .bind(HMAC_SECRET_KEY)
-        .fetch_optional(pool)
-        .await?;
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT value FROM fleet_secrets WHERE key = $1")
+                .bind(HMAC_SECRET_KEY)
+                .fetch_optional(pool)
+                .await?;
         let Some((value,)) = row else {
             return Ok(false);
         };

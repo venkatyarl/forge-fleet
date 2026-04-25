@@ -1,54 +1,51 @@
 pub mod agent_coordinator;
 pub mod agent_loop;
 pub mod agent_roles;
-pub mod research;
 pub mod auto_upgrade;
+pub mod research;
 
 /// Re-export of the panic-hook module that lives in `ff-core`. Keeps
 /// existing call sites (`ff_agent::panic_hook::install()`) working.
 pub use ff_core::panic_hook;
-pub mod sub_agent_reaper;
+pub mod alert_evaluator;
+pub mod alert_policy_seed;
 pub mod bash_security;
 pub mod brain;
-pub mod telegram;
-pub mod hf_download;
-pub mod hf_version_check;
-pub mod mesh_check;
-pub mod upgrade_playbooks;
-pub mod verify_node;
-pub mod version_check;
-pub mod hive_sync;
-pub mod learning;
-pub mod supervisor;
 pub mod chat_manager;
+pub mod cloud_llm_registry;
 pub mod commands;
 pub mod commands_extended;
 pub mod compaction;
 pub mod consensus;
+pub mod coverage_guard;
+pub mod deployment_reconciler;
+pub mod disk_sampler;
+pub mod external_tools_installer;
+pub mod external_tools_registry;
+pub mod external_tools_upstream;
 pub mod features;
+pub mod file_history;
 pub mod fleet_events;
+pub mod fleet_events_nats;
+pub mod fleet_inference;
 pub mod fleet_info;
 pub mod focus_stack;
 pub mod ha;
-pub mod inference_router;
-pub mod file_history;
-pub mod fleet_inference;
+pub mod hf_download;
+pub mod hf_version_check;
+pub mod hive_sync;
 pub mod hooks;
+pub mod inference_router;
+pub mod job_sweeper;
 pub mod leader_tick;
+pub mod learning;
 pub mod local_healer;
 pub mod mcp_client;
 pub mod mcp_tools;
 pub mod memory;
-pub mod alert_evaluator;
-pub mod alert_policy_seed;
-pub mod deployment_reconciler;
-pub mod disk_sampler;
+pub mod mesh_check;
 pub mod metrics_downsampler;
-pub mod nats_client;
-pub mod nats_log_layer;
-pub mod fleet_events_nats;
-pub mod job_sweeper;
-pub mod coverage_guard;
+pub mod model_benchmark;
 pub mod model_catalog;
 pub mod model_catalog_seed;
 pub mod model_convert;
@@ -57,52 +54,52 @@ pub mod model_runtime;
 pub mod model_scout;
 pub mod model_transfer;
 pub mod model_upstream;
-pub mod task_coverage_seed;
-pub mod smart_lru;
 pub mod multi_agent;
+pub mod nats_client;
+pub mod nats_log_layer;
 pub mod notifications;
 pub mod openai_bridge;
 pub mod openclaw;
 pub mod orchestrator_agent;
+pub mod panic_stop;
 pub mod permissions;
 pub mod plugins;
 pub mod ports_registry;
-pub mod cloud_llm_registry;
-pub mod revive;
-pub mod panic_stop;
-pub mod rpc_inference;
-pub mod secrets_rotation;
-pub mod ssh_key_manager;
+pub mod power_scheduler;
 pub mod project_github_sync;
 pub mod project_registry;
+pub mod revive;
+pub mod rpc_inference;
 pub mod scoped_memory;
+pub mod secrets_rotation;
 pub mod session_store;
+pub mod shared_storage;
+pub mod smart_lru;
+pub mod social_ingest;
 pub mod software_registry;
 pub mod software_upstream;
-pub mod external_tools_registry;
-pub mod external_tools_upstream;
-pub mod external_tools_installer;
+pub mod ssh_key_manager;
 pub mod streaming;
+pub mod sub_agent_reaper;
 pub mod sub_agents;
+pub mod supervisor;
 pub mod system_prompt;
+pub mod task_coverage_seed;
+pub mod telegram;
 pub mod template_registry;
 pub mod thinking;
 pub mod tools;
 pub mod training;
 pub mod training_orchestrator;
-pub mod shared_storage;
-pub mod power_scheduler;
-pub mod model_benchmark;
-pub mod social_ingest;
+pub mod upgrade_playbooks;
+pub mod verify_node;
+pub mod version_check;
 
-pub use software_registry::{seed_from_toml, SeedReport};
-pub use model_catalog_seed::{seed_from_toml as seed_model_catalog_from_toml, ModelSeedReport};
-pub use project_registry::{seed_from_toml as seed_projects_from_toml, ProjectSeedReport};
-pub use alert_policy_seed::{seed_from_toml as seed_alert_policies_from_toml, AlertSeedReport};
-pub use ports_registry::{
-    seed_from_toml as seed_ports_from_toml,
-    SeedReport as PortsSeedReport,
-};
+pub use alert_policy_seed::{AlertSeedReport, seed_from_toml as seed_alert_policies_from_toml};
+pub use model_catalog_seed::{ModelSeedReport, seed_from_toml as seed_model_catalog_from_toml};
+pub use ports_registry::{SeedReport as PortsSeedReport, seed_from_toml as seed_ports_from_toml};
+pub use project_registry::{ProjectSeedReport, seed_from_toml as seed_projects_from_toml};
+pub use software_registry::{SeedReport, seed_from_toml};
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -991,7 +988,10 @@ async fn list_agent_tasks() -> axum::Json<serde_json::Value> {
 async fn handle_agent_message(
     axum::Json(payload): axum::Json<serde_json::Value>,
 ) -> axum::Json<serde_json::Value> {
-    let task_id = payload.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
+    let task_id = payload
+        .get("task_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let status = payload.get("status").and_then(|v| v.as_str()).unwrap_or("");
     let output = payload.get("output").and_then(|v| v.as_str()).unwrap_or("");
     let from = payload.get("from").and_then(|v| v.as_str()).unwrap_or("?");

@@ -5,7 +5,6 @@
 //! When the agent gets stuck, the supervisor diagnoses why and applies
 //! targeted fixes without human intervention.
 
-
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
@@ -204,7 +203,10 @@ pub async fn supervise(
     }
 
     // All attempts exhausted
-    warn!(attempts = sup_config.max_attempts, "supervisor: all attempts failed");
+    warn!(
+        attempts = sup_config.max_attempts,
+        "supervisor: all attempts failed"
+    );
 
     // Write failure diagnosis to Fleet Brain for learning
     let _brain_ctx = crate::brain::BrainLoader::load_for_dir(&agent_config.working_dir).await;
@@ -215,7 +217,11 @@ pub async fn supervise(
             "Supervisor failed after {} attempts on task: {}. Failures: {}",
             sup_config.max_attempts,
             task.chars().take(100).collect::<String>(),
-            diagnoses.iter().map(|d| d.failure_type.clone()).collect::<Vec<_>>().join(", ")
+            diagnoses
+                .iter()
+                .map(|d| d.failure_type.clone())
+                .collect::<Vec<_>>()
+                .join(", ")
         ),
         relevance: 0.8,
         created_at: chrono::Utc::now(),
@@ -223,8 +229,11 @@ pub async fn supervise(
         source_session: None,
         tags: vec!["supervisor_failure".into()],
     };
-    let brain_path = dirs::home_dir().unwrap_or_default()
-        .join(".forgefleet").join("brain").join("learnings.json");
+    let brain_path = dirs::home_dir()
+        .unwrap_or_default()
+        .join(".forgefleet")
+        .join("brain")
+        .join("learnings.json");
     let _ = crate::learning::apply_entry(&brain_path, &entry).await;
 
     SupervisorResult {
@@ -250,13 +259,19 @@ fn detect_failure(
     }
 
     // Count tool calls
-    let tool_ends: Vec<&AgentEvent> = events.iter().filter(|e| matches!(e, AgentEvent::ToolEnd { .. })).collect();
+    let tool_ends: Vec<&AgentEvent> = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::ToolEnd { .. }))
+        .collect();
     let tool_count = tool_ends.len();
 
     // 2. Loop detection — same tool+result hash repeated
     let mut sig_counts = std::collections::HashMap::new();
     for ev in &tool_ends {
-        if let AgentEvent::ToolEnd { tool_name, result, .. } = ev {
+        if let AgentEvent::ToolEnd {
+            tool_name, result, ..
+        } = ev
+        {
             let sig = format!("{}:{}", tool_name, &result[..result.len().min(50)]);
             *sig_counts.entry(sig).or_insert(0usize) += 1;
         }
@@ -264,16 +279,25 @@ fn detect_failure(
     for (sig, count) in &sig_counts {
         if *count >= config.loop_detection_window {
             let tool = sig.split(':').next().unwrap_or("unknown").to_string();
-            return FailureType::ToolLoop { tool, count: *count };
+            return FailureType::ToolLoop {
+                tool,
+                count: *count,
+            };
         }
     }
 
     // 3. Early stop — completed but did almost nothing
-    if matches!(outcome, AgentOutcome::EndTurn { .. }) && tool_count < config.early_stop_min_tools as usize {
+    if matches!(outcome, AgentOutcome::EndTurn { .. })
+        && tool_count < config.early_stop_min_tools as usize
+    {
         if let AgentOutcome::EndTurn { final_message } = outcome {
             let lower = final_message.to_ascii_lowercase();
-            if lower.contains("i'll") || lower.contains("i will") || lower.contains("i would")
-                || lower.contains("i can") || lower.contains("let me know") {
+            if lower.contains("i'll")
+                || lower.contains("i will")
+                || lower.contains("i would")
+                || lower.contains("i can")
+                || lower.contains("let me know")
+            {
                 return FailureType::EarlyStop { tool_count };
             }
         }
@@ -287,9 +311,10 @@ fn detect_failure(
     }
 
     // 5. High error rate
-    let error_count = events.iter().filter(|e| {
-        matches!(e, AgentEvent::ToolEnd { is_error: true, .. })
-    }).count();
+    let error_count = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::ToolEnd { is_error: true, .. }))
+        .count();
     if error_count > 5 && error_count as f64 / tool_count.max(1) as f64 > 0.7 {
         return FailureType::ConsecutiveToolErrors(error_count as u32);
     }
@@ -307,14 +332,12 @@ fn diagnose_and_fix(
     config: &mut AgentSessionConfig,
 ) -> FailureDiagnosis {
     match failure {
-        FailureType::LlmError(msg) => {
-            FailureDiagnosis {
-                attempt,
-                failure_type: "llm_error".into(),
-                evidence: msg[..msg.len().min(200)].to_string(),
-                fix_applied: "Retrying with backoff (already built into agent loop)".into(),
-            }
-        }
+        FailureType::LlmError(msg) => FailureDiagnosis {
+            attempt,
+            failure_type: "llm_error".into(),
+            evidence: msg[..msg.len().min(200)].to_string(),
+            fix_applied: "Retrying with backoff (already built into agent loop)".into(),
+        },
         FailureType::ToolLoop { tool, count } => {
             let fix = format!(
                 "You previously called {} {} times in a row. This approach is NOT working. \
@@ -350,7 +373,10 @@ fn diagnose_and_fix(
                 attempt,
                 failure_type: "max_turns_no_progress".into(),
                 evidence: "Hit max turns with minimal output".into(),
-                fix_applied: format!("Increased max_turns to {}, added progress instruction", config.max_turns),
+                fix_applied: format!(
+                    "Increased max_turns to {}, added progress instruction",
+                    config.max_turns
+                ),
             }
         }
         FailureType::ConsecutiveToolErrors(count) => {

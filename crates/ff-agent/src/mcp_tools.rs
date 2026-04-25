@@ -80,12 +80,17 @@ impl AgentTool for McpAgentTool {
 
     async fn execute(&self, input: Value, _ctx: &AgentToolContext) -> AgentToolResult {
         // Strip the server prefix from the tool name to get the original MCP tool name.
-        let original_name = self.tool_def.name
+        let original_name = self
+            .tool_def
+            .name
             .strip_prefix(&format!("{}_", self.server_name))
             .unwrap_or(&self.tool_def.name);
 
         let mut manager = self.manager.lock().await;
-        match manager.call_tool(&self.server_name, original_name, input).await {
+        match manager
+            .call_tool(&self.server_name, original_name, input)
+            .await
+        {
             Ok(output) => AgentToolResult::ok(output),
             Err(err) => AgentToolResult::err(format!("MCP tool error: {err}")),
         }

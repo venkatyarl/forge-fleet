@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sqlx::PgPool;
 use thiserror::Error;
 use uuid::Uuid;
@@ -115,12 +115,11 @@ impl AgentCoordinator {
     ) -> Result<Option<WorkerSlot>, CoordError> {
         if let Some(name) = target {
             // Validate computer exists, then look for an idle slot on it.
-            let computer: Option<(Uuid, String, String)> = sqlx::query_as(
-                "SELECT id, name, status FROM computers WHERE name = $1",
-            )
-            .bind(&name)
-            .fetch_optional(&self.pg)
-            .await?;
+            let computer: Option<(Uuid, String, String)> =
+                sqlx::query_as("SELECT id, name, status FROM computers WHERE name = $1")
+                    .bind(&name)
+                    .fetch_optional(&self.pg)
+                    .await?;
             let Some((computer_id, computer_name, _status)) = computer else {
                 return Err(CoordError::UnknownComputer(name));
             };
@@ -150,12 +149,14 @@ impl AgentCoordinator {
             )
             .fetch_optional(&self.pg)
             .await?;
-            Ok(row.map(|(sub_agent_id, computer_id, computer_name, slot)| WorkerSlot {
-                sub_agent_id,
-                computer_id,
-                computer_name,
-                slot,
-            }))
+            Ok(row.map(
+                |(sub_agent_id, computer_id, computer_name, slot)| WorkerSlot {
+                    sub_agent_id,
+                    computer_id,
+                    computer_name,
+                    slot,
+                },
+            ))
         }
     }
 
@@ -225,9 +226,7 @@ impl AgentCoordinator {
         // 3. Run the LLM call, persist output, release slot. Catch any
         //    error below so the slot always gets released.
         let started = std::time::Instant::now();
-        let result = self
-            .run_and_persist(&slot, work_item_id, &prompt)
-            .await;
+        let result = self.run_and_persist(&slot, work_item_id, &prompt).await;
 
         let (outcome_tag, receipt_or_err) = match result {
             Ok(r) => ("ok", Ok(r)),
@@ -282,10 +281,12 @@ impl AgentCoordinator {
         let fut = self.http.post(&url).json(&body).send();
         let resp = tokio::time::timeout(self.upstream_timeout, fut)
             .await
-            .map_err(|_| CoordError::Internal(format!(
-                "upstream LLM timed out after {}s",
-                self.upstream_timeout.as_secs()
-            )))??;
+            .map_err(|_| {
+                CoordError::Internal(format!(
+                    "upstream LLM timed out after {}s",
+                    self.upstream_timeout.as_secs()
+                ))
+            })??;
 
         let status = resp.status();
         let v: Value = resp.json().await?;
@@ -450,11 +451,9 @@ pub async fn ensure_sub_agent_rows(
 
 /// Seed slot-0 for every computer in `computers`. Idempotent.
 pub async fn seed_slot_zero_for_all(pool: &PgPool) -> Result<u32, CoordError> {
-    let rows: Vec<(Uuid, Option<i32>)> = sqlx::query_as(
-        "SELECT id, cpu_cores FROM computers",
-    )
-    .fetch_all(pool)
-    .await?;
+    let rows: Vec<(Uuid, Option<i32>)> = sqlx::query_as("SELECT id, cpu_cores FROM computers")
+        .fetch_all(pool)
+        .await?;
     let mut total = 0u32;
     for (computer_id, cpu_cores) in rows {
         // One slot by default; scale with cpu_cores/4 (capped at 4).
@@ -532,17 +531,19 @@ pub async fn list_sub_agents(pool: &PgPool) -> Result<Vec<SubAgentListRow>, Coor
     .await?;
     Ok(rows
         .into_iter()
-        .map(|(id, computer, slot, status, workspace_dir, work_item, started_at, heartbeat)| {
-            SubAgentListRow {
-                id,
-                computer,
-                slot,
-                status,
-                workspace_dir,
-                current_work_item_id: work_item,
-                started_at,
-                last_heartbeat_at: heartbeat,
-            }
-        })
+        .map(
+            |(id, computer, slot, status, workspace_dir, work_item, started_at, heartbeat)| {
+                SubAgentListRow {
+                    id,
+                    computer,
+                    slot,
+                    status,
+                    workspace_dir,
+                    current_work_item_id: work_item,
+                    started_at,
+                    last_heartbeat_at: heartbeat,
+                }
+            },
+        )
         .collect())
 }

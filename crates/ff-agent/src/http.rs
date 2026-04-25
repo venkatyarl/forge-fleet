@@ -79,9 +79,18 @@ async fn receive_message(
     State(_ctx): State<AppContext>,
     Json(payload): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
-    let from = payload.get("from").and_then(|v| v.as_str()).unwrap_or("unknown");
-    let to = payload.get("to").and_then(|v| v.as_str()).unwrap_or("unknown");
-    let message = payload.get("message").and_then(|v| v.as_str()).unwrap_or("");
+    let from = payload
+        .get("from")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let to = payload
+        .get("to")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let message = payload
+        .get("message")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let task_id = payload.get("task_id").and_then(|v| v.as_str());
     let status = payload.get("status").and_then(|v| v.as_str());
     let output = payload.get("output").and_then(|v| v.as_str());

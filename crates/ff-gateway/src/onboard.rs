@@ -30,11 +30,9 @@ use crate::server::GatewayState;
 
 // ─── Bootstrap script rendering ──────────────────────────────────────────
 
-const BOOTSTRAP_TEMPLATE: &str =
-    include_str!("../../../scripts/bootstrap-node-template.sh");
+const BOOTSTRAP_TEMPLATE: &str = include_str!("../../../scripts/bootstrap-node-template.sh");
 
-const BOOTSTRAP_TEMPLATE_PS1: &str =
-    include_str!("../../../scripts/bootstrap-node-template.ps1");
+const BOOTSTRAP_TEMPLATE_PS1: &str = include_str!("../../../scripts/bootstrap-node-template.ps1");
 
 /// Query params accepted by GET /onboard/bootstrap.sh
 #[derive(Debug, Deserialize)]
@@ -92,31 +90,30 @@ pub async fn bootstrap_script(
 
     // Leader host: derive from the operator's browser connection if possible;
     // else fall back to env / config.
-    let leader_host = std::env::var("FORGEFLEET_LEADER_HOST")
-        .unwrap_or_else(|_| "192.168.5.100".to_string());
-    let leader_port = std::env::var("FORGEFLEET_LEADER_PORT")
-        .unwrap_or_else(|_| "51002".to_string());
+    let leader_host =
+        std::env::var("FORGEFLEET_LEADER_HOST").unwrap_or_else(|_| "192.168.5.100".to_string());
+    let leader_port =
+        std::env::var("FORGEFLEET_LEADER_PORT").unwrap_or_else(|_| "51002".to_string());
 
     // Caller's LAN IP: prefer explicit query param, fall back to
     // X-Forwarded-For / X-Real-IP headers (if a reverse proxy added them),
     // then to a generic placeholder the script will override with `hostname -I`.
-    let ip = q
-        .ip
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            headers
-                .get("x-forwarded-for")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.split(',').next())
-                .map(|s| s.trim().to_string())
-        })
-        .or_else(|| {
-            headers
-                .get("x-real-ip")
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_string)
-        })
-        .unwrap_or_else(|| "auto".to_string());
+    let ip =
+        q.ip.filter(|s| !s.is_empty())
+            .or_else(|| {
+                headers
+                    .get("x-forwarded-for")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.split(',').next())
+                    .map(|s| s.trim().to_string())
+            })
+            .or_else(|| {
+                headers
+                    .get("x-real-ip")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| "auto".to_string());
 
     let name = q.name.unwrap_or_else(|| "newnode".into());
     let ssh_user = q.ssh_user.unwrap_or_else(|| name.clone());
@@ -141,7 +138,9 @@ pub async fn bootstrap_script(
             }
             if found.is_none() {
                 if let Ok(Some(s)) = ff_db::pg_get_secret(pool, "github.default_owner").await {
-                    if !s.is_empty() { found = Some(s); }
+                    if !s.is_empty() {
+                        found = Some(s);
+                    }
                 }
             }
         }
@@ -165,7 +164,10 @@ pub async fn bootstrap_script(
 
     (
         StatusCode::OK,
-        [(axum::http::header::CONTENT_TYPE, "text/x-shellscript; charset=utf-8")],
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/x-shellscript; charset=utf-8",
+        )],
         script,
     )
         .into_response()
@@ -210,19 +212,20 @@ pub async fn bootstrap_script_ps1(
             .into_response();
     }
 
-    let leader_host = std::env::var("FORGEFLEET_LEADER_HOST")
-        .unwrap_or_else(|_| "192.168.5.100".to_string());
-    let leader_port = std::env::var("FORGEFLEET_LEADER_PORT")
-        .unwrap_or_else(|_| "51002".to_string());
-    let ip = q.ip
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            headers.get("x-forwarded-for")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.split(',').next())
-                .map(|s| s.trim().to_string())
-        })
-        .unwrap_or_else(|| "auto".to_string());
+    let leader_host =
+        std::env::var("FORGEFLEET_LEADER_HOST").unwrap_or_else(|_| "192.168.5.100".to_string());
+    let leader_port =
+        std::env::var("FORGEFLEET_LEADER_PORT").unwrap_or_else(|_| "51002".to_string());
+    let ip =
+        q.ip.filter(|s| !s.is_empty())
+            .or_else(|| {
+                headers
+                    .get("x-forwarded-for")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.split(',').next())
+                    .map(|s| s.trim().to_string())
+            })
+            .unwrap_or_else(|| "auto".to_string());
     let name = q.name.unwrap_or_else(|| "newnode".into());
     let ssh_user = q.ssh_user.unwrap_or_else(|| name.clone());
     let role = q.role.unwrap_or_else(|| "builder".into());
@@ -236,11 +239,15 @@ pub async fn bootstrap_script_ps1(
         let mut found: Option<String> = None;
         if let Some(pool) = state.operational_store.as_ref().and_then(|os| os.pg_pool()) {
             if let Ok(Some(v)) = ff_db::pg_get_setting(pool, "github.default_owner").await {
-                if let Some(s) = v.as_str() { found = Some(s.to_string()); }
+                if let Some(s) = v.as_str() {
+                    found = Some(s.to_string());
+                }
             }
             if found.is_none() {
                 if let Ok(Some(s)) = ff_db::pg_get_secret(pool, "github.default_owner").await {
-                    if !s.is_empty() { found = Some(s); }
+                    if !s.is_empty() {
+                        found = Some(s);
+                    }
                 }
             }
         }
@@ -264,7 +271,10 @@ pub async fn bootstrap_script_ps1(
 
     (
         StatusCode::OK,
-        [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; charset=utf-8",
+        )],
         script,
     )
         .into_response()
@@ -318,7 +328,10 @@ fn derive_os_family(os_id: Option<&str>, kernel: Option<&str>) -> String {
     if os.starts_with("dgx") {
         return "linux-dgx".into();
     }
-    if kernel.map(|k| k.trim_end_matches('\n').ends_with("-nvidia")).unwrap_or(false) {
+    if kernel
+        .map(|k| k.trim_end_matches('\n').ends_with("-nvidia"))
+        .unwrap_or(false)
+    {
         return "linux-dgx".into();
     }
     if os == "ubuntu" || os.starts_with("linux-ubuntu") || os.starts_with("debian") {
@@ -473,10 +486,7 @@ pub async fn self_enroll(
     // string the client sent — the bootstrap script often sends "linux" for
     // DGX Sparks since /etc/dgx-release is absent on Blackwell; we detect
     // via `uname -r` ending in `-nvidia` instead. (Closes #114.)
-    let os_family = derive_os_family(
-        payload.os_id.as_deref(),
-        payload.kernel.as_deref(),
-    );
+    let os_family = derive_os_family(payload.os_id.as_deref(), payload.kernel.as_deref());
     let default_source_tree_path = if node_row.role.eq_ignore_ascii_case("leader") {
         "~/projects/forge-fleet"
     } else {
@@ -555,11 +565,11 @@ pub async fn self_enroll(
     let _ = ff_db::pg_enqueue_deferred(
         pool,
         &format!("Mesh propagate SSH for {name}"),
-        "internal",        // new kind; executor handles via mesh_check module
+        "internal", // new kind; executor handles via mesh_check module
         &mesh_payload,
         "now",
         &json!({}),
-        Some("taylor"),    // leader only
+        Some("taylor"), // leader only
         &json!([]),
         Some("self-enroll"),
         Some(5),
@@ -577,13 +587,12 @@ pub async fn self_enroll(
             .into_iter()
             .next()
             .map(|k| k.public_key);
-        let host_keys: Vec<String> =
-            ff_db::pg_list_node_ssh_keys(pool, &peer.name, Some("host"))
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .map(|k| k.public_key)
-                .collect();
+        let host_keys: Vec<String> = ff_db::pg_list_node_ssh_keys(pool, &peer.name, Some("host"))
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|k| k.public_key)
+            .collect();
         peers.push(PeerSshIdentity {
             name: peer.name.clone(),
             ip: peer.ip.clone(),
@@ -645,11 +654,13 @@ pub struct CheckIpQuery {
 pub async fn check_ip(Query(q): Query<CheckIpQuery>) -> Json<Value> {
     use tokio::time::timeout;
     let ip = q.ip.trim();
-    let reachable =
-        timeout(Duration::from_secs(3), tokio::net::TcpStream::connect(format!("{ip}:22")))
-            .await
-            .map(|r| r.is_ok())
-            .unwrap_or(false);
+    let reachable = timeout(
+        Duration::from_secs(3),
+        tokio::net::TcpStream::connect(format!("{ip}:22")),
+    )
+    .await
+    .map(|r| r.is_ok())
+    .unwrap_or(false);
     Json(json!({"ip": ip, "reachable": reachable}))
 }
 
@@ -675,7 +686,10 @@ pub async fn get_mesh_check(
         .as_ref()
         .and_then(|os| os.pg_pool())
         .ok_or_else(|| {
-            (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":"postgres pool not available"})))
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error":"postgres pool not available"})),
+            )
         })?;
     let rows = ff_db::pg_list_mesh_status(pool, q.node.as_deref())
         .await
@@ -716,7 +730,10 @@ pub async fn post_verify_node(
         .as_ref()
         .and_then(|os| os.pg_pool())
         .ok_or_else(|| {
-            (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":"postgres pool not available"})))
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error":"postgres pool not available"})),
+            )
         })?;
     let report = ff_agent::verify_node::verify_node(pool, &q.name)
         .await
@@ -783,7 +800,10 @@ pub async fn secret_peek(
         .as_ref()
         .and_then(|os| os.pg_pool())
         .ok_or_else(|| {
-            (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":"postgres pool not available"})))
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error":"postgres pool not available"})),
+            )
         })?;
     let value = ff_db::pg_get_secret(pool, &q.key)
         .await
@@ -802,7 +822,10 @@ pub async fn get_fleet_tooling(
         .as_ref()
         .and_then(|os| os.pg_pool())
         .ok_or_else(|| {
-            (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":"postgres pool not available"})))
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error":"postgres pool not available"})),
+            )
         })?;
     let nodes = ff_db::pg_list_nodes(pool)
         .await
@@ -834,32 +857,44 @@ pub async fn list_deferred(
         .as_ref()
         .and_then(|os| os.pg_pool())
         .ok_or_else(|| {
-            (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":"postgres pool not available"})))
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error":"postgres pool not available"})),
+            )
         })?;
     let rows = ff_db::pg_list_deferred(pool, q.status.as_deref(), q.limit.unwrap_or(100))
         .await
         .map_err(|e| db_err("pg_list_deferred", e))?;
-    let out: Vec<Value> = rows.iter()
+    let out: Vec<Value> = rows
+        .iter()
         .filter(|t| q.kind.as_deref().map(|k| k == t.kind).unwrap_or(true))
-        .filter(|t| q.node.as_deref().map(|n| t.preferred_node.as_deref() == Some(n)).unwrap_or(true))
         .filter(|t| {
-            q.tool.as_deref().map(|tool| {
-                t.payload.get("tool").and_then(|v| v.as_str()) == Some(tool)
-            }).unwrap_or(true)
+            q.node
+                .as_deref()
+                .map(|n| t.preferred_node.as_deref() == Some(n))
+                .unwrap_or(true)
         })
-        .map(|t| json!({
-            "id":             t.id,
-            "title":          t.title,
-            "kind":           t.kind,
-            "status":         t.status,
-            "trigger_type":   t.trigger_type,
-            "preferred_node": t.preferred_node,
-            "payload":        t.payload,
-            "attempts":       t.attempts,
-            "max_attempts":   t.max_attempts,
-            "created_at":     t.created_at,
-            "last_error":     t.last_error,
-        }))
+        .filter(|t| {
+            q.tool
+                .as_deref()
+                .map(|tool| t.payload.get("tool").and_then(|v| v.as_str()) == Some(tool))
+                .unwrap_or(true)
+        })
+        .map(|t| {
+            json!({
+                "id":             t.id,
+                "title":          t.title,
+                "kind":           t.kind,
+                "status":         t.status,
+                "trigger_type":   t.trigger_type,
+                "preferred_node": t.preferred_node,
+                "payload":        t.payload,
+                "attempts":       t.attempts,
+                "max_attempts":   t.max_attempts,
+                "created_at":     t.created_at,
+                "last_error":     t.last_error,
+            })
+        })
         .collect();
     Ok(Json(json!({ "tasks": out })))
 }
@@ -878,7 +913,10 @@ pub async fn promote_deferred(
         .as_ref()
         .and_then(|os| os.pg_pool())
         .ok_or_else(|| {
-            (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":"postgres pool not available"})))
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error":"postgres pool not available"})),
+            )
         })?;
     let promoted = ff_db::pg_promote_deferred(pool, &id)
         .await

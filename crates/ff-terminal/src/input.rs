@@ -13,7 +13,9 @@ pub struct InputState {
 }
 
 impl InputState {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     /// Insert a character at cursor position.
     pub fn insert_char(&mut self, ch: char) {
@@ -70,20 +72,30 @@ impl InputState {
     }
 
     /// Move cursor to start.
-    pub fn home(&mut self) { self.cursor = 0; }
+    pub fn home(&mut self) {
+        self.cursor = 0;
+    }
 
     /// Move cursor to end.
-    pub fn end(&mut self) { self.cursor = self.text.len(); }
+    pub fn end(&mut self) {
+        self.cursor = self.text.len();
+    }
 
     /// Jump cursor left by one word (Mac Option+Left semantics).
     pub fn move_word_left(&mut self) {
-        if self.cursor == 0 { return; }
+        if self.cursor == 0 {
+            return;
+        }
         let bytes = self.text.as_bytes();
         let mut i = self.cursor;
         // Skip any whitespace immediately before the cursor.
-        while i > 0 && bytes[i - 1].is_ascii_whitespace() { i -= 1; }
+        while i > 0 && bytes[i - 1].is_ascii_whitespace() {
+            i -= 1;
+        }
         // Then skip the word characters.
-        while i > 0 && !bytes[i - 1].is_ascii_whitespace() { i -= 1; }
+        while i > 0 && !bytes[i - 1].is_ascii_whitespace() {
+            i -= 1;
+        }
         self.cursor = i;
     }
 
@@ -91,12 +103,18 @@ impl InputState {
     pub fn move_word_right(&mut self) {
         let bytes = self.text.as_bytes();
         let len = bytes.len();
-        if self.cursor >= len { return; }
+        if self.cursor >= len {
+            return;
+        }
         let mut i = self.cursor;
         // Skip the current word.
-        while i < len && !bytes[i].is_ascii_whitespace() { i += 1; }
+        while i < len && !bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
         // Then skip trailing whitespace.
-        while i < len && bytes[i].is_ascii_whitespace() { i += 1; }
+        while i < len && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
         self.cursor = i;
     }
 
@@ -121,44 +139,79 @@ impl InputState {
     pub fn cursor_line_col(&self) -> (usize, usize) {
         let upto = &self.text[..self.cursor];
         let line = upto.matches('\n').count();
-        let col = upto.rfind('\n').map(|i| upto[i + 1..].chars().count()).unwrap_or_else(|| upto.chars().count());
+        let col = upto
+            .rfind('\n')
+            .map(|i| upto[i + 1..].chars().count())
+            .unwrap_or_else(|| upto.chars().count());
         (line, col)
     }
 
     /// Move cursor up one display line (preserves column when possible).
     /// Returns `true` if the cursor moved; `false` if already at the top line.
     pub fn move_line_up(&mut self) -> bool {
-        if !self.is_multiline() { return false; }
+        if !self.is_multiline() {
+            return false;
+        }
         let (line, col) = self.cursor_line_col();
-        if line == 0 { return false; }
+        if line == 0 {
+            return false;
+        }
         // Find the start of line (line-1) and line (line).
         let mut line_starts: Vec<usize> = vec![0];
         for (i, ch) in self.text.char_indices() {
-            if ch == '\n' { line_starts.push(i + 1); }
+            if ch == '\n' {
+                line_starts.push(i + 1);
+            }
         }
         let target_start = line_starts[line - 1];
         let target_end = line_starts[line].saturating_sub(1); // exclude the '\n'
         let target_len = self.text[target_start..target_end].chars().count();
         let new_col = col.min(target_len);
-        self.cursor = target_start + self.text[target_start..].char_indices().nth(new_col).map(|(i, _)| i).unwrap_or(target_end - target_start);
+        self.cursor = target_start
+            + self.text[target_start..]
+                .char_indices()
+                .nth(new_col)
+                .map(|(i, _)| i)
+                .unwrap_or(target_end - target_start);
         true
     }
 
     /// Move cursor down one display line. Returns true if moved.
     pub fn move_line_down(&mut self) -> bool {
-        if !self.is_multiline() { return false; }
+        if !self.is_multiline() {
+            return false;
+        }
         let (line, col) = self.cursor_line_col();
         let total_lines = self.line_count();
-        if line + 1 >= total_lines { return false; }
+        if line + 1 >= total_lines {
+            return false;
+        }
         let mut line_starts: Vec<usize> = vec![0];
         for (i, ch) in self.text.char_indices() {
-            if ch == '\n' { line_starts.push(i + 1); }
+            if ch == '\n' {
+                line_starts.push(i + 1);
+            }
         }
         let target_start = line_starts[line + 1];
-        let target_end = line_starts.get(line + 2).copied().unwrap_or(self.text.len() + 1).saturating_sub(1);
-        let target_len = self.text[target_start..target_end.min(self.text.len())].chars().count();
+        let target_end = line_starts
+            .get(line + 2)
+            .copied()
+            .unwrap_or(self.text.len() + 1)
+            .saturating_sub(1);
+        let target_len = self.text[target_start..target_end.min(self.text.len())]
+            .chars()
+            .count();
         let new_col = col.min(target_len);
-        self.cursor = target_start + self.text[target_start..].char_indices().nth(new_col).map(|(i, _)| i).unwrap_or_else(|| target_end.saturating_sub(target_start).min(self.text.len() - target_start));
+        self.cursor = target_start
+            + self.text[target_start..]
+                .char_indices()
+                .nth(new_col)
+                .map(|(i, _)| i)
+                .unwrap_or_else(|| {
+                    target_end
+                        .saturating_sub(target_start)
+                        .min(self.text.len() - target_start)
+                });
         true
     }
 
@@ -177,7 +230,9 @@ impl InputState {
 
     /// Navigate history up.
     pub fn history_up(&mut self) {
-        if self.history.is_empty() { return; }
+        if self.history.is_empty() {
+            return;
+        }
 
         match self.history_pos {
             None => {
@@ -223,7 +278,9 @@ impl InputState {
         self.suggestions.clear();
         self.suggestion_index = None;
 
-        if !self.text.starts_with('/') { return; }
+        if !self.text.starts_with('/') {
+            return;
+        }
 
         // Strip ALL leading slashes from the typed input before computing the
         // prefix, so `//he` and `///he` behave like `/he`.
@@ -264,7 +321,9 @@ impl InputState {
 
     /// Cycle forward through suggestions.
     pub fn next_suggestion(&mut self) {
-        if self.suggestions.is_empty() { return; }
+        if self.suggestions.is_empty() {
+            return;
+        }
         self.suggestion_index = Some(match self.suggestion_index {
             None => 0,
             Some(i) => (i + 1) % self.suggestions.len(),
@@ -273,7 +332,9 @@ impl InputState {
 
     /// Cycle backward through suggestions.
     pub fn prev_suggestion(&mut self) {
-        if self.suggestions.is_empty() { return; }
+        if self.suggestions.is_empty() {
+            return;
+        }
         let len = self.suggestions.len();
         self.suggestion_index = Some(match self.suggestion_index {
             None => len - 1,

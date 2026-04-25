@@ -112,7 +112,9 @@ fn tool_section(tools: &[Box<dyn AgentTool>]) -> String {
 
 fn guidelines_section(style: OutputStyle) -> String {
     let style_note = match style {
-        OutputStyle::Concise => "Keep responses extremely concise. Lead with actions, not explanations.",
+        OutputStyle::Concise => {
+            "Keep responses extremely concise. Lead with actions, not explanations."
+        }
         OutputStyle::Normal => "Keep responses concise but informative.",
         OutputStyle::Verbose => "Provide detailed explanations and reasoning.",
     };

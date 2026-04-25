@@ -118,15 +118,18 @@ async fn maybe_alert_over_quota(
     let rows = ff_db::pg_list_deferred(pool, Some("pending"), 50)
         .await
         .map_err(|e| format!("pg_list_deferred: {e}"))?;
-    let already_alerted = rows.iter().any(|r| {
-        r.title.starts_with("⚠ disk quota exceeded on ") &&
-        r.title.contains(node_name)
-    });
+    let already_alerted = rows
+        .iter()
+        .any(|r| r.title.starts_with("⚠ disk quota exceeded on ") && r.title.contains(node_name));
     if already_alerted {
         return Ok(());
     }
 
-    let used_pct = if total_bytes == 0 { 0 } else { used_bytes * 100 / total_bytes };
+    let used_pct = if total_bytes == 0 {
+        0
+    } else {
+        used_bytes * 100 / total_bytes
+    };
     let title = format!("⚠ disk quota exceeded on {node_name} ({}%)", used_pct);
     let payload = serde_json::json!({
         "note": format!(
@@ -141,12 +144,12 @@ async fn maybe_alert_over_quota(
         &title,
         "manual",
         &payload,
-        "manual",                       // trigger_type: user must act
+        "manual", // trigger_type: user must act
         &serde_json::json!({}),
         Some(node_name),
         &serde_json::json!([]),
         Some("disk-sampler"),
-        Some(1),                         // max_attempts — this is informational
+        Some(1), // max_attempts — this is informational
     )
     .await
     .map_err(|e| format!("pg_enqueue_deferred: {e}"))?;
@@ -159,7 +162,9 @@ fn dir_size(root: &std::path::Path) -> u64 {
     let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
     let mut total: u64 = 0;
     while let Some(dir) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for e in rd.flatten() {
             let Ok(ft) = e.file_type() else { continue };
             if ft.is_file() {

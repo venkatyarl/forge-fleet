@@ -33,10 +33,10 @@ use ff_discovery::health::HealthStatus;
 use ff_discovery::{FleetNode, NodeRegistry};
 use ff_mcp::McpServer;
 use ff_mcp::transport::HttpTransport;
-use tokio_util::sync::CancellationToken;
 use ff_observability::metrics::{
     init_prometheus_metrics, metrics_handler, prometheus_metrics_middleware,
 };
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     embed,
@@ -377,37 +377,94 @@ pub fn build_router(state: Arc<GatewayState>, mc_db_path: Option<&str>) -> Route
         .route("/api/fleet/enroll", post(fleet_enroll))
         .route("/api/fleet/heartbeat", post(fleet_heartbeat))
         // Onboarding (see crates/ff-gateway/src/onboard.rs + plan §§3–3h)
-        .route("/onboard/bootstrap.sh", get(crate::onboard::bootstrap_script))
-        .route("/onboard/bootstrap.ps1", get(crate::onboard::bootstrap_script_ps1))
+        .route(
+            "/onboard/bootstrap.sh",
+            get(crate::onboard::bootstrap_script),
+        )
+        .route(
+            "/onboard/bootstrap.ps1",
+            get(crate::onboard::bootstrap_script_ps1),
+        )
         .route("/api/fleet/self-enroll", post(crate::onboard::self_enroll))
-        .route("/api/fleet/enrollment-progress", post(crate::onboard::enrollment_progress))
+        .route(
+            "/api/fleet/enrollment-progress",
+            post(crate::onboard::enrollment_progress),
+        )
         .route("/api/fleet/check-ip", get(crate::onboard::check_ip))
         .route("/api/fleet/check-tcp", get(crate::onboard::check_tcp))
         .route("/api/fleet/tooling", get(crate::onboard::get_fleet_tooling))
         // Virtual Brain API (see crates/ff-gateway/src/brain_api.rs)
         .route("/api/brain/threads", get(crate::brain_api::list_threads))
         .route("/api/brain/threads", post(crate::brain_api::create_thread))
-        .route("/api/brain/threads/{slug}/messages", get(crate::brain_api::thread_messages))
-        .route("/api/brain/threads/{slug}/message", post(crate::brain_api::send_thread_message))
-        .route("/api/brain/attach", post(crate::brain_api::attach_to_thread))
-        .route("/api/brain/candidates", get(crate::brain_api::list_candidates))
-        .route("/api/brain/candidates/{id}", post(crate::brain_api::update_candidate))
+        .route(
+            "/api/brain/threads/{slug}/messages",
+            get(crate::brain_api::thread_messages),
+        )
+        .route(
+            "/api/brain/threads/{slug}/message",
+            post(crate::brain_api::send_thread_message),
+        )
+        .route(
+            "/api/brain/attach",
+            post(crate::brain_api::attach_to_thread),
+        )
+        .route(
+            "/api/brain/candidates",
+            get(crate::brain_api::list_candidates),
+        )
+        .route(
+            "/api/brain/candidates/{id}",
+            post(crate::brain_api::update_candidate),
+        )
         .route("/api/brain/graph", get(crate::brain_api::vault_graph))
-        .route("/api/brain/vault/search", get(crate::brain_api::vault_search))
-        .route("/api/brain/reminders", get(crate::brain_api::list_reminders))
-        .route("/api/brain/reminders", post(crate::brain_api::create_reminder))
+        .route(
+            "/api/brain/vault/search",
+            get(crate::brain_api::vault_search),
+        )
+        .route(
+            "/api/brain/reminders",
+            get(crate::brain_api::list_reminders),
+        )
+        .route(
+            "/api/brain/reminders",
+            post(crate::brain_api::create_reminder),
+        )
         .route("/api/brain/whoami", get(crate::brain_api::whoami))
-        .route("/api/brain/stack/{thread_slug}", get(crate::brain_api::stack_list))
-        .route("/api/brain/stack/{thread_slug}/push", post(crate::brain_api::stack_push))
-        .route("/api/brain/stack/{thread_slug}/pop", post(crate::brain_api::stack_pop))
-        .route("/api/brain/backlog/{project}", get(crate::brain_api::backlog_list))
-        .route("/api/brain/backlog/{project}/add", post(crate::brain_api::backlog_add))
-        .route("/api/brain/backlog/{project}/complete", post(crate::brain_api::backlog_complete))
+        .route(
+            "/api/brain/stack/{thread_slug}",
+            get(crate::brain_api::stack_list),
+        )
+        .route(
+            "/api/brain/stack/{thread_slug}/push",
+            post(crate::brain_api::stack_push),
+        )
+        .route(
+            "/api/brain/stack/{thread_slug}/pop",
+            post(crate::brain_api::stack_pop),
+        )
+        .route(
+            "/api/brain/backlog/{project}",
+            get(crate::brain_api::backlog_list),
+        )
+        .route(
+            "/api/brain/backlog/{project}/add",
+            post(crate::brain_api::backlog_add),
+        )
+        .route(
+            "/api/brain/backlog/{project}/complete",
+            post(crate::brain_api::backlog_complete),
+        )
         .route("/api/fleet/secret-peek", get(crate::onboard::secret_peek))
         .route("/api/fleet/mesh-check", get(crate::onboard::get_mesh_check))
-        .route("/api/fleet/verify-node", post(crate::onboard::post_verify_node))
+        .route(
+            "/api/fleet/verify-node",
+            post(crate::onboard::post_verify_node),
+        )
         .route("/api/fleet/deferred", get(crate::onboard::list_deferred))
-        .route("/api/fleet/deferred/{id}/promote", post(crate::onboard::promote_deferred))
+        .route(
+            "/api/fleet/deferred/{id}/promote",
+            post(crate::onboard::promote_deferred),
+        )
         .route(
             "/api/transports/telegram/status",
             get(telegram_transport_status),
@@ -439,26 +496,47 @@ pub fn build_router(state: Arc<GatewayState>, mc_db_path: Option<&str>) -> Route
         .route("/api/traces/recent", get(traces_recent))
         // ─── Agent session routes ───────────────────────────────────
         .route("/api/agent/session", post(create_agent_session))
-        .route("/api/agent/session/{id}/message", post(agent_session_message))
+        .route(
+            "/api/agent/session/{id}/message",
+            post(agent_session_message),
+        )
         .route("/api/agent/session/{id}/cancel", post(cancel_agent_session))
         .route("/api/agent/session/{id}/status", get(agent_session_status))
         .route("/api/agent/sessions", get(list_agent_sessions))
         // ─── Pulse v2 dashboard routes ──────────────────────────────
-        .route("/api/fleet/computers", get(crate::pulse_api::list_computers))
+        .route(
+            "/api/fleet/computers",
+            get(crate::pulse_api::list_computers),
+        )
         .route("/api/fleet/members", get(crate::pulse_api::list_members))
         .route("/api/fleet/leader", get(crate::pulse_api::get_leader))
         .route("/api/fleet/health", get(crate::pulse_api::fleet_health))
         .route("/api/llm/servers", get(crate::pulse_api::llm_servers))
-        .route("/api/software/computers", get(crate::pulse_api::software_computers))
+        .route(
+            "/api/software/computers",
+            get(crate::pulse_api::software_computers),
+        )
         .route("/api/software/drift", get(crate::pulse_api::software_drift))
         .route("/api/projects", get(crate::pulse_api::list_projects))
-        .route("/api/projects/{id}/branches", get(crate::pulse_api::project_branches))
+        .route(
+            "/api/projects/{id}/branches",
+            get(crate::pulse_api::project_branches),
+        )
         .route("/api/pm/work-items", get(crate::pulse_api::list_work_items))
-        .route("/api/alerts/policies", get(crate::pulse_api::alert_policies))
+        .route(
+            "/api/alerts/policies",
+            get(crate::pulse_api::alert_policies),
+        )
         .route("/api/alerts/events", get(crate::pulse_api::alert_events))
-        .route("/api/metrics/{computer}/history", get(crate::pulse_api::metrics_history))
+        .route(
+            "/api/metrics/{computer}/history",
+            get(crate::pulse_api::metrics_history),
+        )
         .route("/api/ha/status", get(crate::pulse_api::ha_status))
-        .route("/api/docker/projects", get(crate::pulse_api::docker_projects))
+        .route(
+            "/api/docker/projects",
+            get(crate::pulse_api::docker_projects),
+        )
         .route("/api/events/stream", get(crate::pulse_api::events_stream))
         // ─── Chat management routes ─────────────────────────────────
         .route("/api/chats", get(list_chats).post(create_chat))
@@ -583,17 +661,15 @@ async fn health(State(state): State<Arc<GatewayState>>) -> Json<HealthResponse> 
 /// leader is running and to auto-discover capabilities + endpoints without
 /// operator configuration. Designed for the "any computer on the LAN can
 /// find its ForgeFleet without hardcoding URLs" use case.
-async fn well_known_forgefleet(
-    State(state): State<Arc<GatewayState>>,
-) -> Json<Value> {
+async fn well_known_forgefleet(State(state): State<Arc<GatewayState>>) -> Json<Value> {
     let leader = match state.operational_store.as_ref().and_then(|os| os.pg_pool()) {
-        Some(pool) => sqlx::query_scalar::<_, String>(
-            "SELECT member_name FROM fleet_leader_state LIMIT 1",
-        )
-        .fetch_optional(pool)
-        .await
-        .ok()
-        .flatten(),
+        Some(pool) => {
+            sqlx::query_scalar::<_, String>("SELECT member_name FROM fleet_leader_state LIMIT 1")
+                .fetch_optional(pool)
+                .await
+                .ok()
+                .flatten()
+        }
         None => None,
     };
     let fleet_size = match state.operational_store.as_ref().and_then(|os| os.pg_pool()) {
@@ -685,14 +761,8 @@ async fn github_webhook_handler(
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let workflow_name = wr
-                .get("name")
-                .and_then(|v| v.as_str())
-                .map(str::to_string);
-            let run_id = wr
-                .get("id")
-                .and_then(|v| v.as_i64())
-                .map(|i| i.to_string());
+            let workflow_name = wr.get("name").and_then(|v| v.as_str()).map(str::to_string);
+            let run_id = wr.get("id").and_then(|v| v.as_i64()).map(|i| i.to_string());
             let run_url = wr
                 .get("html_url")
                 .and_then(|v| v.as_str())
@@ -702,10 +772,7 @@ async fn github_webhook_handler(
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let conclusion = wr
-                .get("conclusion")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let conclusion = wr.get("conclusion").and_then(|v| v.as_str()).unwrap_or("");
             // Map GH's (status, conclusion) onto project_ci_runs.status enum.
             let status = match (gh_status.as_str(), conclusion) {
                 ("queued", _) => "queued",
@@ -725,23 +792,22 @@ async fn github_webhook_handler(
                 .and_then(|v| v.as_str())
                 .filter(|_| gh_status == "completed")
                 .map(str::to_string);
-            let triggered_by = wr
-                .get("event")
-                .and_then(|v| v.as_str())
-                .map(str::to_string);
+            let triggered_by = wr.get("event").and_then(|v| v.as_str()).map(str::to_string);
 
             // UPSERT by (project_id, run_id). Skip if the project row doesn't
             // exist yet — project_ci_runs.project_id FKs projects(id).
-            let project_exists: bool = sqlx::query_scalar(
-                "SELECT EXISTS (SELECT 1 FROM projects WHERE id = $1)",
-            )
-            .bind(&project_id)
-            .fetch_one(pool)
-            .await
-            .unwrap_or(false);
+            let project_exists: bool =
+                sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM projects WHERE id = $1)")
+                    .bind(&project_id)
+                    .fetch_one(pool)
+                    .await
+                    .unwrap_or(false);
             if !project_exists {
                 tracing::warn!(target: "gh_webhook", %project_id, %repo_full, "ignoring workflow_run for unknown project");
-                return (StatusCode::ACCEPTED, Json(json!({"accepted": false, "reason": "unknown project"})));
+                return (
+                    StatusCode::ACCEPTED,
+                    Json(json!({"accepted": false, "reason": "unknown project"})),
+                );
             }
 
             let _ = sqlx::query(
@@ -781,7 +847,12 @@ async fn github_webhook_handler(
                 .await;
             }
 
-            (StatusCode::ACCEPTED, Json(json!({"accepted": true, "event": "workflow_run", "project": project_id, "run_id": run_id, "status": status})))
+            (
+                StatusCode::ACCEPTED,
+                Json(
+                    json!({"accepted": true, "event": "workflow_run", "project": project_id, "run_id": run_id, "status": status}),
+                ),
+            )
         }
         "ping" => (
             StatusCode::OK,
@@ -1331,7 +1402,10 @@ async fn fleet_enroll(
     let enrollment = config.enrollment.clone();
 
     let policy = enrollment.enforcement_policy();
-    if matches!(&policy, ff_core::config::EnrollmentEnforcement::MisconfiguredRequired) {
+    if matches!(
+        &policy,
+        ff_core::config::EnrollmentEnforcement::MisconfiguredRequired
+    ) {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             Json(
@@ -1434,21 +1508,28 @@ async fn fleet_enroll(
                     reason: Some("invalid enrollment token".to_string()),
                     role: Some(requested_role.clone()),
                     service_version: payload.service_version.clone(),
-                    addresses_json: serde_json::to_string(&ips).unwrap_or_else(|_| "[]".to_string()),
+                    addresses_json: serde_json::to_string(&ips)
+                        .unwrap_or_else(|_| "[]".to_string()),
                     capabilities_json: serde_json::to_string(&capabilities)
                         .unwrap_or_else(|_| "{}".to_string()),
-                    metadata_json: serde_json::to_string(&normalize_object(payload.metadata.clone()))
-                        .unwrap_or_else(|_| "{}".to_string()),
+                    metadata_json: serde_json::to_string(&normalize_object(
+                        payload.metadata.clone(),
+                    ))
+                    .unwrap_or_else(|_| "{}".to_string()),
                 };
                 let _ = runtime_registry.insert_enrollment_event(&event).await;
 
                 return Err((
                     StatusCode::UNAUTHORIZED,
-                    Json(json!({"error": {"message": "invalid enrollment token", "type": "unauthorized"}})),
+                    Json(
+                        json!({"error": {"message": "invalid enrollment token", "type": "unauthorized"}}),
+                    ),
                 ));
             }
         }
-        ff_core::config::EnrollmentEnforcement::MisconfiguredRequired => unreachable!("handled above"),
+        ff_core::config::EnrollmentEnforcement::MisconfiguredRequired => {
+            unreachable!("handled above")
+        }
     }
 
     let reported_status = "online".to_string();
@@ -4002,10 +4083,7 @@ async fn proxy_chat_completions(
         // Hand the Pulse router the PG pool so it can expand pool aliases
         // (`fleet_task_coverage.alias`, schema V27) before doing the
         // normal exact/prefix model-id match.
-        let pg_ref = state
-            .operational_store
-            .as_ref()
-            .and_then(|s| s.pg_pool());
+        let pg_ref = state.operational_store.as_ref().and_then(|s| s.pg_pool());
         match pulse
             .route_completion_cached(raw_payload.clone(), cache_ref, pg_ref)
             .await
@@ -4081,9 +4159,10 @@ async fn proxy_chat_completions(
         // followed by a chat request with `model: "<x>"` Just Work — the
         // router will spawn the inference server on demand.
         if escalation_chain.is_empty() {
-            if let (Some(store), Some(registry)) =
-                (state.operational_store.as_ref(), state.api_registry.as_ref())
-                && let Some(pool) = store.pg_pool()
+            if let (Some(store), Some(registry)) = (
+                state.operational_store.as_ref(),
+                state.api_registry.as_ref(),
+            ) && let Some(pool) = store.pg_pool()
             {
                 match ff_api::autoload::ensure_deployed(pool, &payload.model).await {
                     Ok(url) => {
@@ -4976,12 +5055,18 @@ async fn create_agent_session(
     State(state): State<Arc<GatewayState>>,
     Json(req): Json<CreateAgentSessionRequest>,
 ) -> impl IntoResponse {
-    let model = req.model.unwrap_or_else(|| "Qwen2.5-Coder-32B-Instruct-Q4_K_M.gguf".to_string());
-    let llm_base_url = req.llm_base_url.unwrap_or_else(|| "http://192.168.5.102:51000".to_string());
+    let model = req
+        .model
+        .unwrap_or_else(|| "Qwen2.5-Coder-32B-Instruct-Q4_K_M.gguf".to_string());
+    let llm_base_url = req
+        .llm_base_url
+        .unwrap_or_else(|| "http://192.168.5.102:51000".to_string());
     let working_dir = req
         .working_dir
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/")));
+        .unwrap_or_else(|| {
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"))
+        });
 
     let config = AgentSessionConfig {
         model: model.clone(),
@@ -5020,10 +5105,7 @@ async fn create_agent_session(
         let fwd_handle = tokio::spawn(async move {
             while let Some(event) = event_rx.recv().await {
                 if let Ok(payload) = serde_json::to_value(&event) {
-                    ws_hub_fwd.broadcast_event(
-                        crate::websocket::EventType::AgentEvent,
-                        payload,
-                    );
+                    ws_hub_fwd.broadcast_event(crate::websocket::EventType::AgentEvent, payload);
                 }
             }
         });
@@ -5066,11 +5148,19 @@ async fn agent_session_message(
 ) -> impl IntoResponse {
     let session_id = match Uuid::parse_str(&id) {
         Ok(id) => id,
-        Err(_) => return (StatusCode::BAD_REQUEST, Json(json!({"error": "invalid session ID"}))),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "invalid session ID"})),
+            );
+        }
     };
 
     if !state.agent_sessions.contains_key(&session_id) {
-        return (StatusCode::NOT_FOUND, Json(json!({"error": "session not found"})));
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "session not found"})),
+        );
     }
 
     let message = body
@@ -5090,7 +5180,10 @@ async fn agent_session_message(
         }),
     );
 
-    (StatusCode::OK, Json(json!({"status": "queued", "session_id": session_id.to_string()})))
+    (
+        StatusCode::OK,
+        Json(json!({"status": "queued", "session_id": session_id.to_string()})),
+    )
 }
 
 async fn cancel_agent_session(
@@ -5099,14 +5192,25 @@ async fn cancel_agent_session(
 ) -> impl IntoResponse {
     let session_id = match Uuid::parse_str(&id) {
         Ok(id) => id,
-        Err(_) => return (StatusCode::BAD_REQUEST, Json(json!({"error": "invalid session ID"}))),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "invalid session ID"})),
+            );
+        }
     };
 
     if let Some(handle) = state.agent_sessions.get(&session_id) {
         handle.cancel_token.cancel();
-        (StatusCode::OK, Json(json!({"status": "cancelled", "session_id": session_id.to_string()})))
+        (
+            StatusCode::OK,
+            Json(json!({"status": "cancelled", "session_id": session_id.to_string()})),
+        )
     } else {
-        (StatusCode::NOT_FOUND, Json(json!({"error": "session not found"})))
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "session not found"})),
+        )
     }
 }
 
@@ -5116,25 +5220,34 @@ async fn agent_session_status(
 ) -> impl IntoResponse {
     let session_id = match Uuid::parse_str(&id) {
         Ok(id) => id,
-        Err(_) => return (StatusCode::BAD_REQUEST, Json(json!({"error": "invalid session ID"}))),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "invalid session ID"})),
+            );
+        }
     };
 
     if let Some(handle) = state.agent_sessions.get(&session_id) {
-        (StatusCode::OK, Json(json!({
-            "session_id": session_id.to_string(),
-            "status": handle.status_str(),
-            "model": handle.model,
-            "llm_base_url": handle.llm_base_url,
-            "created_at": handle.created_at.to_rfc3339(),
-        })))
+        (
+            StatusCode::OK,
+            Json(json!({
+                "session_id": session_id.to_string(),
+                "status": handle.status_str(),
+                "model": handle.model,
+                "llm_base_url": handle.llm_base_url,
+                "created_at": handle.created_at.to_rfc3339(),
+            })),
+        )
     } else {
-        (StatusCode::NOT_FOUND, Json(json!({"error": "session not found"})))
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "session not found"})),
+        )
     }
 }
 
-async fn list_agent_sessions(
-    State(state): State<Arc<GatewayState>>,
-) -> impl IntoResponse {
+async fn list_agent_sessions(State(state): State<Arc<GatewayState>>) -> impl IntoResponse {
     let sessions: Vec<Value> = state
         .agent_sessions
         .iter()
@@ -5160,24 +5273,27 @@ async fn list_chats() -> impl IntoResponse {
     Json(json!({ "chats": chats }))
 }
 
-async fn create_chat(
-    Json(body): Json<Value>,
-) -> impl IntoResponse {
+async fn create_chat(Json(body): Json<Value>) -> impl IntoResponse {
     let mut manager = ff_agent::chat_manager::ChatManager::load().await;
-    let scope_str = body.get("scope").and_then(Value::as_str).unwrap_or("global");
+    let scope_str = body
+        .get("scope")
+        .and_then(Value::as_str)
+        .unwrap_or("global");
     let scope = match scope_str {
         "global" => ff_agent::scoped_memory::MemoryScope::Global,
         _ => ff_agent::scoped_memory::MemoryScope::Global,
     };
 
-    let chat = manager.create(
-        body.get("name").and_then(Value::as_str).map(String::from),
-        scope,
-        "http://192.168.5.102:51000".into(),
-        "auto".into(),
-        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/")),
-        ff_agent::chat_manager::ModelSelection::Auto,
-    ).await;
+    let chat = manager
+        .create(
+            body.get("name").and_then(Value::as_str).map(String::from),
+            scope,
+            "http://192.168.5.102:51000".into(),
+            "auto".into(),
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/")),
+            ff_agent::chat_manager::ModelSelection::Auto,
+        )
+        .await;
 
     Json(json!({ "chat": {
         "id": chat.id,
@@ -5202,7 +5318,10 @@ async fn get_chat(Path(id): Path<String>) -> impl IntoResponse {
     let manager = ff_agent::chat_manager::ChatManager::load().await;
     match manager.get(&id) {
         Some(chat) => (StatusCode::OK, Json(json!({ "chat": chat }))),
-        None => (StatusCode::NOT_FOUND, Json(json!({ "error": "chat not found" }))),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "chat not found" })),
+        ),
     }
 }
 
@@ -5213,7 +5332,9 @@ async fn delete_chat(Path(id): Path<String>) -> impl IntoResponse {
 }
 
 /// GET /api/brain/search?q=query — search across all three brains.
-async fn brain_search(axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>) -> impl IntoResponse {
+async fn brain_search(
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
     let query = params.get("q").cloned().unwrap_or_default();
     if query.is_empty() {
         return Json(json!({ "results": [], "error": "missing ?q= parameter" }));

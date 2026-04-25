@@ -9,7 +9,9 @@ pub struct HttpRequestTool;
 
 #[async_trait]
 impl AgentTool for HttpRequestTool {
-    fn name(&self) -> &str { "HttpRequest" }
+    fn name(&self) -> &str {
+        "HttpRequest"
+    }
 
     fn description(&self) -> &str {
         "Make HTTP requests (GET, POST, PUT, DELETE, PATCH). Use for API calls, webhooks, and web services."
@@ -35,8 +37,15 @@ impl AgentTool for HttpRequestTool {
             _ => return AgentToolResult::err("Missing 'url'"),
         };
 
-        let method = input.get("method").and_then(Value::as_str).unwrap_or("GET").to_uppercase();
-        let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build().unwrap_or_default();
+        let method = input
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or("GET")
+            .to_uppercase();
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap_or_default();
 
         let mut req = match method.as_str() {
             "GET" => client.get(url),
@@ -49,7 +58,9 @@ impl AgentTool for HttpRequestTool {
 
         if let Some(headers) = input.get("headers").and_then(Value::as_object) {
             for (k, v) in headers {
-                if let Some(v_str) = v.as_str() { req = req.header(k.as_str(), v_str); }
+                if let Some(v_str) = v.as_str() {
+                    req = req.header(k.as_str(), v_str);
+                }
             }
         }
 
@@ -62,7 +73,9 @@ impl AgentTool for HttpRequestTool {
         match req.send().await {
             Ok(resp) => {
                 let status = resp.status();
-                let headers: Vec<String> = resp.headers().iter()
+                let headers: Vec<String> = resp
+                    .headers()
+                    .iter()
                     .take(10)
                     .map(|(k, v)| format!("{}: {}", k, v.to_str().unwrap_or("")))
                     .collect();

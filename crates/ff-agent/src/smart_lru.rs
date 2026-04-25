@@ -107,8 +107,10 @@ pub async fn plan_eviction(
             .push(row.node_name.clone());
     }
     // Keep per-node library (the candidate pool).
-    let node_lib: Vec<&ff_db::ModelLibraryRow> =
-        all_lib.iter().filter(|r| r.node_name == node_name).collect();
+    let node_lib: Vec<&ff_db::ModelLibraryRow> = all_lib
+        .iter()
+        .filter(|r| r.node_name == node_name)
+        .collect();
 
     // Deployments on this node — rows referenced here are off-limits.
     let deployments = ff_db::pg_list_deployments(pool, Some(node_name))
@@ -138,10 +140,8 @@ pub async fn plan_eviction(
         // Base score grows with size (GiB) * age (days).
         let gb = row.size_bytes as f64 / (1u64 << 30) as f64;
         let mut score = gb * age_days as f64;
-        let mut reasons: Vec<String> = vec![
-            format!("size={:.1}GiB", gb),
-            format!("age={}d", age_days),
-        ];
+        let mut reasons: Vec<String> =
+            vec![format!("size={:.1}GiB", gb), format!("age={}d", age_days)];
 
         // Peer-copy bonus: if another node has this (catalog_id, runtime), eviction is cheap.
         let key = (row.catalog_id.clone(), row.runtime.clone());
@@ -172,7 +172,11 @@ pub async fn plan_eviction(
     }
 
     // Sort by score desc.
-    candidates.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    candidates.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     // Trim to just enough to free the target bytes.
     let mut freed: u64 = 0;

@@ -281,9 +281,7 @@ pub async fn install_on(
     let (plans, skipped) = resolve_install_plans(pool, tool_id, Some(computer_name), false).await?;
     if plans.is_empty() {
         if let Some((_, why)) = skipped.first() {
-            anyhow::bail!(
-                "no install plan for {tool_id} on {computer_name}: {why}"
-            );
+            anyhow::bail!("no install plan for {tool_id} on {computer_name}: {why}");
         }
         anyhow::bail!(
             "no install plan for {tool_id} on {computer_name} (is the computer in `computers`?)"

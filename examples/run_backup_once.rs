@@ -9,8 +9,8 @@
 //! primary entrypoint. Meanwhile, this example gives a clean way to
 //! exercise BackupOrchestrator::run_once end-to-end against a live DB.
 
-use sqlx::postgres::PgPoolOptions;
 use sqlx::Row;
+use sqlx::postgres::PgPoolOptions;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -32,12 +32,11 @@ async fn main() -> anyhow::Result<()> {
         .await?;
 
     let node_name = ff_agent::fleet_info::resolve_this_node_name().await;
-    let computer_id: sqlx::types::Uuid =
-        sqlx::query("SELECT id FROM computers WHERE name = $1")
-            .bind(&node_name)
-            .fetch_one(&pool)
-            .await?
-            .get("id");
+    let computer_id: sqlx::types::Uuid = sqlx::query("SELECT id FROM computers WHERE name = $1")
+        .bind(&node_name)
+        .fetch_one(&pool)
+        .await?
+        .get("id");
 
     println!("▶ run_backup_once");
     println!("  node:        {node_name}");
@@ -45,18 +44,17 @@ async fn main() -> anyhow::Result<()> {
     println!("  kind:        {kind}");
     println!("  force:       {force}");
 
-    let orch = ff_agent::ha::backup::BackupOrchestrator::new(
-        pool.clone(),
-        computer_id,
-        node_name,
-        None,
-    );
+    let orch =
+        ff_agent::ha::backup::BackupOrchestrator::new(pool.clone(), computer_id, node_name, None);
 
     let reports = orch.run_once(&kind, force).await?;
 
     for r in &reports {
         if !r.produced {
-            println!("\n• {} skipped — not current leader (pass --force to override)", r.kind);
+            println!(
+                "\n• {} skipped — not current leader (pass --force to override)",
+                r.kind
+            );
             continue;
         }
         println!("\n✓ {} backup produced", r.kind);

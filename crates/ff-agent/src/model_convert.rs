@@ -177,7 +177,9 @@ pub async fn convert_safetensors_to_mlx(
         .stdin(std::process::Stdio::null())
         .status()
         .await
-        .map_err(|e| format!("spawn mlx_lm.convert: {e} (is mlx-lm installed? `pip install mlx-lm`)"))?;
+        .map_err(|e| {
+            format!("spawn mlx_lm.convert: {e} (is mlx-lm installed? `pip install mlx-lm`)")
+        })?;
 
     if !status.success() {
         return Err(format!(

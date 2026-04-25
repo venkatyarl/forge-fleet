@@ -40,7 +40,7 @@ pub struct TrainingJobSpec {
     pub base_model_id: Option<String>,
     pub training_data_path: String,
     pub adapter_output_path: Option<String>,
-    pub training_type: String,   // "lora" | "full_finetune" | "dpo"
+    pub training_type: String, // "lora" | "full_finetune" | "dpo"
     pub computer_name: Option<String>,
     pub epochs: Option<u32>,
     pub learning_rate: Option<f64>,
@@ -132,12 +132,9 @@ impl TrainingOrchestrator {
             )));
         }
 
-        let computer_name = job
-            .computer_name
-            .clone()
-            .ok_or_else(|| TrainingError::InvalidState(
-                "job has no computer_name assigned".into(),
-            ))?;
+        let computer_name = job.computer_name.clone().ok_or_else(|| {
+            TrainingError::InvalidState("job has no computer_name assigned".into())
+        })?;
 
         let command = build_training_command(&job);
         let payload = serde_json::json!({ "command": command });
@@ -212,16 +209,12 @@ impl TrainingOrchestrator {
     }
 }
 
-async fn fetch_computer_id(
-    pool: &PgPool,
-    name: &str,
-) -> Result<sqlx::types::Uuid, TrainingError> {
-    let row = sqlx::query_scalar::<_, sqlx::types::Uuid>(
-        "SELECT id FROM computers WHERE name = $1",
-    )
-    .bind(name)
-    .fetch_optional(pool)
-    .await?;
+async fn fetch_computer_id(pool: &PgPool, name: &str) -> Result<sqlx::types::Uuid, TrainingError> {
+    let row =
+        sqlx::query_scalar::<_, sqlx::types::Uuid>("SELECT id FROM computers WHERE name = $1")
+            .bind(name)
+            .fetch_optional(pool)
+            .await?;
     row.ok_or_else(|| TrainingError::NotFound(name.into()))
 }
 
@@ -233,10 +226,7 @@ fn build_training_command(job: &ff_db::TrainingJobRow) -> String {
     let mut envs = Vec::new();
 
     // Training data + output paths.
-    envs.push(shell_env(
-        "DATASET_FILE",
-        &job.training_data_path,
-    ));
+    envs.push(shell_env("DATASET_FILE", &job.training_data_path));
     if let Some(out) = job.adapter_output_path.as_deref() {
         envs.push(shell_env("OUTPUT_DIR", out));
     }

@@ -22,7 +22,9 @@ pub enum PermissionMode {
 }
 
 impl Default for PermissionMode {
-    fn default() -> Self { Self::Default }
+    fn default() -> Self {
+        Self::Default
+    }
 }
 
 /// Permission level for a tool operation.
@@ -145,14 +147,12 @@ pub fn check_permission(
                 PermissionDecision::Ask
             }
         }
-        PermissionMode::Default => {
-            match level {
-                PermissionLevel::None | PermissionLevel::ReadOnly => PermissionDecision::Allow,
-                PermissionLevel::Write | PermissionLevel::Execute => PermissionDecision::Ask,
-                PermissionLevel::Dangerous => PermissionDecision::Ask,
-                PermissionLevel::Forbidden => PermissionDecision::Deny,
-            }
-        }
+        PermissionMode::Default => match level {
+            PermissionLevel::None | PermissionLevel::ReadOnly => PermissionDecision::Allow,
+            PermissionLevel::Write | PermissionLevel::Execute => PermissionDecision::Ask,
+            PermissionLevel::Dangerous => PermissionDecision::Ask,
+            PermissionLevel::Forbidden => PermissionDecision::Deny,
+        },
     }
 }
 
@@ -161,18 +161,35 @@ pub fn classify_bash_command(command: &str) -> PermissionLevel {
     let lower = command.to_ascii_lowercase();
 
     // Forbidden: catastrophically destructive
-    let forbidden = ["rm -rf /", ":(){ :|:& };:", "mkfs.", "dd if=/dev/zero of=/dev/sd"];
+    let forbidden = [
+        "rm -rf /",
+        ":(){ :|:& };:",
+        "mkfs.",
+        "dd if=/dev/zero of=/dev/sd",
+    ];
     if forbidden.iter().any(|p| lower.contains(p)) {
         return PermissionLevel::Forbidden;
     }
 
     // Dangerous: destructive or security-sensitive
     let dangerous = [
-        "rm -rf", "rm -r", "chmod 777", "chown", "shutdown", "reboot", "halt",
-        "DROP TABLE", "TRUNCATE TABLE", "DELETE FROM",
-        "curl.*|.*sh", "wget.*|.*sh", // piped downloads
-        "git push --force", "git reset --hard",
-        "passwd", "userdel", "useradd",
+        "rm -rf",
+        "rm -r",
+        "chmod 777",
+        "chown",
+        "shutdown",
+        "reboot",
+        "halt",
+        "DROP TABLE",
+        "TRUNCATE TABLE",
+        "DELETE FROM",
+        "curl.*|.*sh",
+        "wget.*|.*sh", // piped downloads
+        "git push --force",
+        "git reset --hard",
+        "passwd",
+        "userdel",
+        "useradd",
     ];
     if dangerous.iter().any(|p| lower.contains(&p.to_lowercase())) {
         return PermissionLevel::Dangerous;
@@ -180,13 +197,40 @@ pub fn classify_bash_command(command: &str) -> PermissionLevel {
 
     // Read-only: safe commands
     let readonly = [
-        "cat ", "ls", "grep ", "find ", "head ", "tail ", "pwd", "echo ", "whoami",
-        "date", "uname", "df ", "du ", "wc ", "which ", "env", "printenv",
-        "git status", "git log", "git diff", "git branch", "git show",
-        "cargo check", "cargo test", "cargo build", "cargo clippy",
-        "npm test", "npm run lint", "npx ",
+        "cat ",
+        "ls",
+        "grep ",
+        "find ",
+        "head ",
+        "tail ",
+        "pwd",
+        "echo ",
+        "whoami",
+        "date",
+        "uname",
+        "df ",
+        "du ",
+        "wc ",
+        "which ",
+        "env",
+        "printenv",
+        "git status",
+        "git log",
+        "git diff",
+        "git branch",
+        "git show",
+        "cargo check",
+        "cargo test",
+        "cargo build",
+        "cargo clippy",
+        "npm test",
+        "npm run lint",
+        "npx ",
     ];
-    if readonly.iter().any(|p| lower.starts_with(p) || lower.starts_with(&format!(" {p}"))) {
+    if readonly
+        .iter()
+        .any(|p| lower.starts_with(p) || lower.starts_with(&format!(" {p}")))
+    {
         return PermissionLevel::ReadOnly;
     }
 
@@ -236,11 +280,26 @@ mod tests {
     #[test]
     fn bash_classification() {
         assert_eq!(classify_bash_command("ls -la"), PermissionLevel::ReadOnly);
-        assert_eq!(classify_bash_command("cat file.txt"), PermissionLevel::ReadOnly);
-        assert_eq!(classify_bash_command("cargo test"), PermissionLevel::ReadOnly);
-        assert_eq!(classify_bash_command("rm -rf /"), PermissionLevel::Forbidden);
-        assert_eq!(classify_bash_command("rm -rf ./build"), PermissionLevel::Dangerous);
-        assert_eq!(classify_bash_command("mkdir -p /tmp/test"), PermissionLevel::Execute);
+        assert_eq!(
+            classify_bash_command("cat file.txt"),
+            PermissionLevel::ReadOnly
+        );
+        assert_eq!(
+            classify_bash_command("cargo test"),
+            PermissionLevel::ReadOnly
+        );
+        assert_eq!(
+            classify_bash_command("rm -rf /"),
+            PermissionLevel::Forbidden
+        );
+        assert_eq!(
+            classify_bash_command("rm -rf ./build"),
+            PermissionLevel::Dangerous
+        );
+        assert_eq!(
+            classify_bash_command("mkdir -p /tmp/test"),
+            PermissionLevel::Execute
+        );
     }
 
     #[test]
@@ -253,13 +312,31 @@ mod tests {
     #[test]
     fn permission_modes() {
         let default_cfg = PermissionConfig::default();
-        assert_eq!(check_permission("Read", PermissionLevel::ReadOnly, &default_cfg), PermissionDecision::Allow);
-        assert_eq!(check_permission("Bash", PermissionLevel::Execute, &default_cfg), PermissionDecision::Ask);
+        assert_eq!(
+            check_permission("Read", PermissionLevel::ReadOnly, &default_cfg),
+            PermissionDecision::Allow
+        );
+        assert_eq!(
+            check_permission("Bash", PermissionLevel::Execute, &default_cfg),
+            PermissionDecision::Ask
+        );
 
-        let bypass_cfg = PermissionConfig { mode: PermissionMode::Bypass, ..Default::default() };
-        assert_eq!(check_permission("Bash", PermissionLevel::Execute, &bypass_cfg), PermissionDecision::Allow);
+        let bypass_cfg = PermissionConfig {
+            mode: PermissionMode::Bypass,
+            ..Default::default()
+        };
+        assert_eq!(
+            check_permission("Bash", PermissionLevel::Execute, &bypass_cfg),
+            PermissionDecision::Allow
+        );
 
-        let plan_cfg = PermissionConfig { mode: PermissionMode::Plan, ..Default::default() };
-        assert_eq!(check_permission("Write", PermissionLevel::Write, &plan_cfg), PermissionDecision::Deny);
+        let plan_cfg = PermissionConfig {
+            mode: PermissionMode::Plan,
+            ..Default::default()
+        };
+        assert_eq!(
+            check_permission("Write", PermissionLevel::Write, &plan_cfg),
+            PermissionDecision::Deny
+        );
     }
 }

@@ -84,7 +84,11 @@ impl FileHistory {
 
     /// Get the N most accessed files (for post-compact recovery).
     pub fn top_accessed_files(&self, n: usize) -> Vec<(String, u32)> {
-        let mut entries: Vec<_> = self.access_counts.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        let mut entries: Vec<_> = self
+            .access_counts
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
         entries.sort_by(|a, b| b.1.cmp(&a.1));
         entries.truncate(n);
         entries
@@ -92,7 +96,10 @@ impl FileHistory {
 
     /// Get all changes for a specific file.
     pub fn changes_for_file(&self, path: &str) -> Vec<&FileChange> {
-        self.changes.iter().filter(|c| c.path.to_string_lossy() == path).collect()
+        self.changes
+            .iter()
+            .filter(|c| c.path.to_string_lossy() == path)
+            .collect()
     }
 
     /// Get the last change (for undo).
@@ -112,7 +119,11 @@ impl FileHistory {
         let before_lines: Vec<&str> = before.lines().collect();
         let after_lines: Vec<&str> = after.lines().collect();
 
-        let mut diff = format!("--- {}\n+++ {}\n", change.path.display(), change.path.display());
+        let mut diff = format!(
+            "--- {}\n+++ {}\n",
+            change.path.display(),
+            change.path.display()
+        );
 
         // Simple line-by-line diff
         let max_lines = before_lines.len().max(after_lines.len());
@@ -134,9 +145,15 @@ impl FileHistory {
 
     /// Get summary stats.
     pub fn stats(&self) -> FileHistoryStats {
-        let files_changed: std::collections::HashSet<_> = self.changes
+        let files_changed: std::collections::HashSet<_> = self
+            .changes
             .iter()
-            .filter(|c| matches!(c.change_type, ChangeType::Write | ChangeType::Edit | ChangeType::Create))
+            .filter(|c| {
+                matches!(
+                    c.change_type,
+                    ChangeType::Write | ChangeType::Edit | ChangeType::Create
+                )
+            })
             .map(|c| c.path.to_string_lossy().to_string())
             .collect();
 

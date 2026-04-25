@@ -61,7 +61,9 @@ pub async fn handle_tasks_list(
         } else {
             format!("{}d", age_secs / 86400)
         };
-        let pct_str = pct.map(|p| format!("{:.0}", p)).unwrap_or_else(|| "-".into());
+        let pct_str = pct
+            .map(|p| format!("{:.0}", p))
+            .unwrap_or_else(|| "-".into());
         let ty_short: String = ty.chars().take(20).collect();
         let status_short: String = status.chars().take(12).collect();
         let summary_short: String = summary.chars().take(60).collect();

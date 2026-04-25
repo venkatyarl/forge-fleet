@@ -206,11 +206,7 @@ impl ExternalToolsUpstreamChecker {
 
     /// Spawn a background tick. First tick fires ~75s after spawn so the
     /// daemon's other subsystems come up first.
-    pub fn spawn(
-        self,
-        interval_hours: u64,
-        mut shutdown: watch::Receiver<bool>,
-    ) -> JoinHandle<()> {
+    pub fn spawn(self, interval_hours: u64, mut shutdown: watch::Receiver<bool>) -> JoinHandle<()> {
         let interval = Duration::from_secs(interval_hours.max(1) * 3600);
         let kickoff = Duration::from_secs(75);
 
@@ -295,7 +291,9 @@ async fn fetch_github_latest(
     token: Option<&str>,
 ) -> Result<String, String> {
     let url = format!("https://api.github.com/repos/{repo}/releases/latest");
-    let mut req = http.get(&url).header("Accept", "application/vnd.github+json");
+    let mut req = http
+        .get(&url)
+        .header("Accept", "application/vnd.github+json");
     if let Some(t) = token {
         if !t.is_empty() {
             req = req.header("Authorization", format!("Bearer {t}"));
@@ -318,7 +316,11 @@ async fn fetch_github_latest(
 
 async fn fetch_brew_latest(http: &reqwest::Client, formula: &str) -> Result<String, String> {
     let url = format!("https://formulae.brew.sh/api/formula/{formula}.json");
-    let resp = http.get(&url).send().await.map_err(|e| format!("GET {url}: {e}"))?;
+    let resp = http
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("GET {url}: {e}"))?;
     if !resp.status().is_success() {
         return Err(format!("GET {url}: HTTP {}", resp.status()));
     }
@@ -336,7 +338,11 @@ async fn fetch_brew_latest(http: &reqwest::Client, formula: &str) -> Result<Stri
 
 async fn fetch_pip_latest(http: &reqwest::Client, package: &str) -> Result<String, String> {
     let url = format!("https://pypi.org/pypi/{package}/json");
-    let resp = http.get(&url).send().await.map_err(|e| format!("GET {url}: {e}"))?;
+    let resp = http
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("GET {url}: {e}"))?;
     if !resp.status().is_success() {
         return Err(format!("GET {url}: HTTP {}", resp.status()));
     }
@@ -354,7 +360,12 @@ async fn fetch_pip_latest(http: &reqwest::Client, package: &str) -> Result<Strin
 
 fn strip_v_prefix(tag: &str) -> &str {
     if let Some(rest) = tag.strip_prefix('v') {
-        if rest.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+        if rest
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_digit())
+            .unwrap_or(false)
+        {
             return rest;
         }
     }

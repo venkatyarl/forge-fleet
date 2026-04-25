@@ -120,9 +120,15 @@ pub fn mc_router_operational(store: OperationalStore) -> Router {
         .route("/api/mc/work-items/{id}/timer/{action}", post(timer_action))
         .route("/api/mc/work-items/{id}/pr", put(update_pr_info))
         .route("/api/mc/work-items/{id}/history", get(work_item_history))
-        .route("/api/mc/node-messages", get(list_node_messages).post(send_node_message))
+        .route(
+            "/api/mc/node-messages",
+            get(list_node_messages).post(send_node_message),
+        )
         .route("/api/mc/node-messages/{id}/read", put(mark_message_read))
-        .route("/api/mc/model-performance", get(list_model_performance).post(record_model_performance))
+        .route(
+            "/api/mc/model-performance",
+            get(list_model_performance).post(record_model_performance),
+        )
         .route("/api/mc/work-items/generate", post(generate_work_items))
         .route("/api/mc/fleet/status", get(fleet_mc_status))
         .with_state(state)
@@ -1351,8 +1357,15 @@ async fn counsel_request(
     Path(_id): Path<String>,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    let models = body.get("models").and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect::<Vec<_>>())
+    let models = body
+        .get("models")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(String::from)
+                .collect::<Vec<_>>()
+        })
         .unwrap_or_default();
 
     Json(json!({
@@ -1398,9 +1411,7 @@ async fn list_work_item_events(
 }
 
 /// POST /api/mc/work-items/{id}/timer/{action} — manual timer control.
-async fn timer_action(
-    Path((id, action)): Path<(String, String)>,
-) -> impl IntoResponse {
+async fn timer_action(Path((id, action)): Path<(String, String)>) -> impl IntoResponse {
     Json(json!({
         "work_item_id": id,
         "timer_action": action,
@@ -1410,10 +1421,7 @@ async fn timer_action(
 }
 
 /// PUT /api/mc/work-items/{id}/pr — update PR/branch info.
-async fn update_pr_info(
-    Path(id): Path<String>,
-    Json(body): Json<Value>,
-) -> impl IntoResponse {
+async fn update_pr_info(Path(id): Path<String>, Json(body): Json<Value>) -> impl IntoResponse {
     Json(json!({
         "work_item_id": id,
         "branch_name": body.get("branch_name"),
@@ -1439,9 +1447,7 @@ async fn list_node_messages() -> impl IntoResponse {
 }
 
 /// POST /api/mc/node-messages — send a message to a fleet node.
-async fn send_node_message(
-    Json(body): Json<Value>,
-) -> impl IntoResponse {
+async fn send_node_message(Json(body): Json<Value>) -> impl IntoResponse {
     Json(json!({
         "status": "sent",
         "from": body.get("from_node"),
@@ -1451,9 +1457,7 @@ async fn send_node_message(
 }
 
 /// PUT /api/mc/node-messages/{id}/read — mark a message as read.
-async fn mark_message_read(
-    Path(id): Path<String>,
-) -> impl IntoResponse {
+async fn mark_message_read(Path(id): Path<String>) -> impl IntoResponse {
     Json(json!({ "id": id, "read": true }))
 }
 
@@ -1463,9 +1467,7 @@ async fn list_model_performance() -> impl IntoResponse {
 }
 
 /// POST /api/mc/model-performance — record a model performance result.
-async fn record_model_performance(
-    Json(body): Json<Value>,
-) -> impl IntoResponse {
+async fn record_model_performance(Json(body): Json<Value>) -> impl IntoResponse {
     Json(json!({
         "status": "recorded",
         "model": body.get("model_name"),
@@ -1475,9 +1477,7 @@ async fn record_model_performance(
 }
 
 /// POST /api/mc/work-items/generate — AI-generate work items from prompt.
-async fn generate_work_items(
-    Json(body): Json<Value>,
-) -> impl IntoResponse {
+async fn generate_work_items(Json(body): Json<Value>) -> impl IntoResponse {
     let prompt = body.get("prompt").and_then(Value::as_str).unwrap_or("");
     Json(json!({
         "status": "generation_queued",

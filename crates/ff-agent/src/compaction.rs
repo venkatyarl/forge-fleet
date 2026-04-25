@@ -103,10 +103,7 @@ fn estimate_single_message_tokens(msg: &ToolChatMessage) -> usize {
 }
 
 /// Check if compaction should be triggered.
-pub fn should_compact(
-    messages: &[ToolChatMessage],
-    config: &CompactionConfig,
-) -> bool {
+pub fn should_compact(messages: &[ToolChatMessage], config: &CompactionConfig) -> bool {
     let estimated = estimate_message_tokens(messages);
     let threshold = (config.context_window_tokens as f64 * config.trigger_threshold) as usize;
     estimated > threshold
@@ -231,10 +228,7 @@ fn truncate_args(args: &str, max: usize) -> String {
 
 /// Apply tool-result budgeting: truncate oldest tool results when total size
 /// exceeds the budget. Returns the number of results truncated.
-pub fn apply_tool_result_budget(
-    messages: &mut [ToolChatMessage],
-    budget_chars: usize,
-) -> usize {
+pub fn apply_tool_result_budget(messages: &mut [ToolChatMessage], budget_chars: usize) -> usize {
     // Calculate total tool result size
     let total: usize = messages
         .iter()
@@ -261,7 +255,9 @@ pub fn apply_tool_result_budget(
         if let Some(content) = msg.text_content() {
             if content.len() > 100 {
                 let freed = content.len() - 50;
-                msg.content = Some(Value::String("[tool result truncated — context budget exceeded]".into()));
+                msg.content = Some(Value::String(
+                    "[tool result truncated — context budget exceeded]".into(),
+                ));
                 to_free = to_free.saturating_sub(freed);
                 truncated += 1;
             }
@@ -289,10 +285,7 @@ mod tests {
 
     #[test]
     fn should_compact_small_conversation() {
-        let msgs = vec![
-            ToolChatMessage::system("sys"),
-            ToolChatMessage::user("hi"),
-        ];
+        let msgs = vec![ToolChatMessage::system("sys"), ToolChatMessage::user("hi")];
         let config = CompactionConfig::default();
         assert!(!should_compact(&msgs, &config));
     }
@@ -314,7 +307,12 @@ mod tests {
         // system + summary + 4 recent
         assert_eq!(compacted.len(), 6);
         assert_eq!(compacted[0].role, "system");
-        assert!(compacted[1].text_content().unwrap().contains("Context Summary"));
+        assert!(
+            compacted[1]
+                .text_content()
+                .unwrap()
+                .contains("Context Summary")
+        );
     }
 
     #[test]

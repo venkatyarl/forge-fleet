@@ -87,11 +87,10 @@ impl GitHubSync {
             .await
             .unwrap_or(None);
 
-        let projects: Vec<(String, Option<String>, String)> = sqlx::query_as(
-            "SELECT id, repo_url, default_branch FROM projects ORDER BY id",
-        )
-        .fetch_all(&self.pg)
-        .await?;
+        let projects: Vec<(String, Option<String>, String)> =
+            sqlx::query_as("SELECT id, repo_url, default_branch FROM projects ORDER BY id")
+                .fetch_all(&self.pg)
+                .await?;
 
         let mut report = SyncReport {
             total: projects.len(),
@@ -113,8 +112,7 @@ impl GitHubSync {
             };
 
             // ─── 1. main commit ────────────────────────────────────────────
-            match fetch_branch_commit(&http, &owner, &repo, &default_branch, token.as_deref())
-                .await
+            match fetch_branch_commit(&http, &owner, &repo, &default_branch, token.as_deref()).await
             {
                 Ok(Some(info)) => {
                     if let Err(e) = write_main_commit(&self.pg, &project_id, &info).await {
@@ -172,7 +170,9 @@ impl GitHubSync {
                     }
                 }
                 Err(e) => {
-                    report.errors.push((project_id.clone(), format!("pulls: {e}")));
+                    report
+                        .errors
+                        .push((project_id.clone(), format!("pulls: {e}")));
                 }
             }
         }
@@ -192,11 +192,7 @@ impl GitHubSync {
 
     /// Spawn a background tick that runs [`Self::sync_all_projects`] every
     /// `interval_mins`. Exits cleanly when `shutdown` flips to `true`.
-    pub fn spawn(
-        self,
-        interval_mins: u64,
-        mut shutdown: watch::Receiver<bool>,
-    ) -> JoinHandle<()> {
+    pub fn spawn(self, interval_mins: u64, mut shutdown: watch::Receiver<bool>) -> JoinHandle<()> {
         let interval = Duration::from_secs(interval_mins.max(1) * 60);
         let kickoff = Duration::from_secs(30);
 
@@ -272,11 +268,7 @@ struct BranchInfo {
     last_commit_sha: Option<String>,
 }
 
-async fn upsert_branch(
-    pool: &PgPool,
-    project_id: &str,
-    branch: &BranchInfo,
-) -> Result<(), String> {
+async fn upsert_branch(pool: &PgPool, project_id: &str, branch: &BranchInfo) -> Result<(), String> {
     sqlx::query(
         "INSERT INTO project_branches (
             project_id, branch_name, created_by, last_commit_sha, status
@@ -302,11 +294,7 @@ struct PullInfo {
     url: String,
 }
 
-async fn attach_pr(
-    pool: &PgPool,
-    project_id: &str,
-    pr: &PullInfo,
-) -> Result<bool, String> {
+async fn attach_pr(pool: &PgPool, project_id: &str, pr: &PullInfo) -> Result<bool, String> {
     let rows = sqlx::query(
         "UPDATE project_branches
             SET pr_number = $3,
@@ -369,10 +357,7 @@ async fn fetch_branch_commit(
         return Err(format!("{url} returned {status}"));
     }
 
-    let json: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("parse {url}: {e}"))?;
+    let json: serde_json::Value = resp.json().await.map_err(|e| format!("parse {url}: {e}"))?;
 
     let sha = json
         .get("sha")
@@ -427,10 +412,7 @@ async fn fetch_branches(
         return Err(format!("{url} returned {status}"));
     }
 
-    let arr: Vec<serde_json::Value> = resp
-        .json()
-        .await
-        .map_err(|e| format!("parse {url}: {e}"))?;
+    let arr: Vec<serde_json::Value> = resp.json().await.map_err(|e| format!("parse {url}: {e}"))?;
 
     Ok(arr
         .into_iter()
@@ -467,10 +449,7 @@ async fn fetch_pulls(
         return Err(format!("{url} returned {status}"));
     }
 
-    let arr: Vec<serde_json::Value> = resp
-        .json()
-        .await
-        .map_err(|e| format!("parse {url}: {e}"))?;
+    let arr: Vec<serde_json::Value> = resp.json().await.map_err(|e| format!("parse {url}: {e}"))?;
 
     Ok(arr
         .into_iter()
@@ -481,10 +460,7 @@ async fn fetch_pulls(
                 .and_then(|x| x.as_str())
                 .unwrap_or("open")
                 .to_string();
-            let head_ref = v
-                .pointer("/head/ref")
-                .and_then(|x| x.as_str())?
-                .to_string();
+            let head_ref = v.pointer("/head/ref").and_then(|x| x.as_str())?.to_string();
             let url = v
                 .get("html_url")
                 .and_then(|x| x.as_str())

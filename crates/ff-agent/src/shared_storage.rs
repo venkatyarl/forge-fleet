@@ -223,8 +223,7 @@ impl SharedStorageManager {
             .ok_or_else(|| StorageError::TargetNotFound(computer_name.into()))?;
 
         // Fetch effective mount_path from row, falling back to volume default.
-        let mounts =
-            ff_db::pg_list_shared_volume_mounts(&self.pg, Some(volume.id)).await?;
+        let mounts = ff_db::pg_list_shared_volume_mounts(&self.pg, Some(volume.id)).await?;
         let mount_path = mounts
             .iter()
             .find(|m| m.computer_id == target.id)
@@ -232,10 +231,9 @@ impl SharedStorageManager {
             .unwrap_or_else(|| volume.mount_path.clone());
 
         let cmd = format!("umount {} 2>&1 || true", shell_quote(&mount_path));
-        let (code, stdout, stderr) =
-            ssh_exec(&target.ssh_user, &target.primary_ip, &cmd)
-                .await
-                .map_err(StorageError::Ssh)?;
+        let (code, stdout, stderr) = ssh_exec(&target.ssh_user, &target.primary_ip, &cmd)
+            .await
+            .map_err(StorageError::Ssh)?;
 
         if code == 0 {
             ff_db::pg_delete_shared_volume_mount(&self.pg, volume.id, target.id).await?;
@@ -246,7 +244,10 @@ impl SharedStorageManager {
             );
             Ok(())
         } else {
-            let err = format!("umount exit={code}: {}", stdout.trim_end().to_string() + &stderr);
+            let err = format!(
+                "umount exit={code}: {}",
+                stdout.trim_end().to_string() + &stderr
+            );
             ff_db::pg_upsert_shared_volume_mount(
                 &self.pg,
                 volume.id,
@@ -304,10 +305,7 @@ struct ComputerInfo {
     os_family: String,
 }
 
-async fn fetch_computer(
-    pool: &PgPool,
-    name: &str,
-) -> Result<Option<ComputerInfo>, StorageError> {
+async fn fetch_computer(pool: &PgPool, name: &str) -> Result<Option<ComputerInfo>, StorageError> {
     let row = sqlx::query(
         "SELECT id, name, primary_ip, ssh_user, os_family
          FROM computers WHERE name = $1",
@@ -354,10 +352,7 @@ async fn configure_nfs_export(host: &ComputerInfo, export_path: &str) -> Result<
 
     let line = if os.starts_with("macos") {
         // macOS /etc/exports syntax: path -network <net> -mask <mask>
-        format!(
-            "{} -network 192.168.5.0 -mask 255.255.255.0",
-            export_path
-        )
+        format!("{} -network 192.168.5.0 -mask 255.255.255.0", export_path)
     } else if os.starts_with("linux") {
         // Linux /etc/exports syntax: path client(options)
         format!(
@@ -381,10 +376,9 @@ async fn configure_nfs_export(host: &ComputerInfo, export_path: &str) -> Result<
         line_q = shell_quote(&line),
     );
 
-    let (code, stdout, stderr) =
-        ssh_exec(&host.ssh_user, &host.primary_ip, &cmd)
-            .await
-            .map_err(StorageError::Ssh)?;
+    let (code, stdout, stderr) = ssh_exec(&host.ssh_user, &host.primary_ip, &cmd)
+        .await
+        .map_err(StorageError::Ssh)?;
     if code == 0 {
         info!(
             host = %host.name,
@@ -426,10 +420,9 @@ async fn attempt_client_mount(
         opts = extra_opts,
     );
 
-    let (code, stdout, stderr) =
-        ssh_exec(&target.ssh_user, &target.primary_ip, &cmd)
-            .await
-            .map_err(StorageError::Ssh)?;
+    let (code, stdout, stderr) = ssh_exec(&target.ssh_user, &target.primary_ip, &cmd)
+        .await
+        .map_err(StorageError::Ssh)?;
     if code == 0 {
         Ok(())
     } else {

@@ -140,8 +140,12 @@ impl PostgresFailoverManager {
         }
 
         // 2) Can we reach the primary's Postgres socket directly?
-        let reachable = probe_tcp(&primary.primary_ip, POSTGRES_PORT, PRIMARY_PROBE_TIMEOUT_SECS)
-            .await;
+        let reachable = probe_tcp(
+            &primary.primary_ip,
+            POSTGRES_PORT,
+            PRIMARY_PROBE_TIMEOUT_SECS,
+        )
+        .await;
 
         if reachable {
             debug!(
@@ -263,8 +267,8 @@ impl PostgresFailoverManager {
         }
 
         // 3) Poll pg_is_in_recovery() until false (or timeout).
-        let deadline = tokio::time::Instant::now()
-            + Duration::from_secs(PROMOTION_POLL_TIMEOUT_SECS);
+        let deadline =
+            tokio::time::Instant::now() + Duration::from_secs(PROMOTION_POLL_TIMEOUT_SECS);
         loop {
             if !is_in_recovery().await.unwrap_or(true) {
                 break;
@@ -494,15 +498,25 @@ mod tests {
 
     #[test]
     fn disabled_flag_parses() {
-        unsafe { std::env::remove_var(DISABLE_ENV); }
+        unsafe {
+            std::env::remove_var(DISABLE_ENV);
+        }
         assert!(!is_disabled());
-        unsafe { std::env::set_var(DISABLE_ENV, "true"); }
+        unsafe {
+            std::env::set_var(DISABLE_ENV, "true");
+        }
         assert!(is_disabled());
-        unsafe { std::env::set_var(DISABLE_ENV, "1"); }
+        unsafe {
+            std::env::set_var(DISABLE_ENV, "1");
+        }
         assert!(is_disabled());
-        unsafe { std::env::set_var(DISABLE_ENV, "no"); }
+        unsafe {
+            std::env::set_var(DISABLE_ENV, "no");
+        }
         assert!(!is_disabled());
-        unsafe { std::env::remove_var(DISABLE_ENV); }
+        unsafe {
+            std::env::remove_var(DISABLE_ENV);
+        }
     }
 
     #[test]

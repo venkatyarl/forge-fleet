@@ -40,10 +40,7 @@ pub struct RunningProcess {
 
 /// Spawn an inference server for the given library row, wait for health, and record
 /// the deployment row in Postgres.
-pub async fn load_model(
-    pool: &sqlx::PgPool,
-    opts: LoadOptions,
-) -> Result<LoadResult, String> {
+pub async fn load_model(pool: &sqlx::PgPool, opts: LoadOptions) -> Result<LoadResult, String> {
     // Find the library row.
     let libs = ff_db::pg_list_library(pool, None)
         .await
@@ -70,11 +67,16 @@ pub async fn load_model(
         "llama.cpp" => {
             let bin = llama_server_binary();
             let mut args = vec![
-                "--model".into(), lib.file_path.clone(),
-                "--host".into(), "0.0.0.0".into(),
-                "--port".into(), port.to_string(),
-                "--ctx-size".into(), ctx.to_string(),
-                "--parallel".into(), parallel.to_string(),
+                "--model".into(),
+                lib.file_path.clone(),
+                "--host".into(),
+                "0.0.0.0".into(),
+                "--port".into(),
+                port.to_string(),
+                "--ctx-size".into(),
+                ctx.to_string(),
+                "--parallel".into(),
+                parallel.to_string(),
             ];
             // On macOS Metal builds this enables full-GPU inference.
             if cfg!(target_os = "macos") {
@@ -87,18 +89,25 @@ pub async fn load_model(
             // mlx_lm.server expects the MODEL to be either an HF repo id or a local dir
             // with config/weights. We use the local dir.
             let args = vec![
-                "--model".into(), lib.file_path.clone(),
-                "--host".into(), "0.0.0.0".into(),
-                "--port".into(), port.to_string(),
+                "--model".into(),
+                lib.file_path.clone(),
+                "--host".into(),
+                "0.0.0.0".into(),
+                "--port".into(),
+                port.to_string(),
             ];
             ("mlx_lm.server".to_string(), args, "mlx")
         }
         "vllm" => {
             let args = vec![
-                "serve".into(), lib.file_path.clone(),
-                "--host".into(), "0.0.0.0".into(),
-                "--port".into(), port.to_string(),
-                "--max-model-len".into(), ctx.to_string(),
+                "serve".into(),
+                lib.file_path.clone(),
+                "--host".into(),
+                "0.0.0.0".into(),
+                "--port".into(),
+                port.to_string(),
+                "--max-model-len".into(),
+                ctx.to_string(),
             ];
             ("vllm".to_string(), args, "vllm")
         }
@@ -108,10 +117,8 @@ pub async fn load_model(
     tracing::info!(program, ?args, "spawning inference server");
 
     // Spawn detached (parent doesn't wait). stdout/stderr to log file if present.
-    let log_dir = PathBuf::from(
-        std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()),
-    )
-    .join(".forgefleet/logs");
+    let log_dir = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()))
+        .join(".forgefleet/logs");
     let _ = std::fs::create_dir_all(&log_dir);
     let log_path = log_dir.join(format!("model-{}.log", port));
     let log_file = std::fs::OpenOptions::new()
@@ -153,7 +160,11 @@ pub async fn load_model(
     .map_err(|e| format!("pg_upsert_deployment: {e}"))?;
 
     if !health_ok {
-        tracing::warn!(pid, port, "inference server did not become healthy within 90s");
+        tracing::warn!(
+            pid,
+            port,
+            "inference server did not become healthy within 90s"
+        );
     }
 
     Ok(LoadResult {
@@ -167,10 +178,7 @@ pub async fn load_model(
 
 /// Stop a running inference server tracked under `deployment_id`.
 /// SIGTERM first (up to 10s), then SIGKILL. Deletes the deployment row on success.
-pub async fn unload_model(
-    pool: &sqlx::PgPool,
-    deployment_id: &str,
-) -> Result<(), String> {
+pub async fn unload_model(pool: &sqlx::PgPool, deployment_id: &str) -> Result<(), String> {
     let node_name = crate::fleet_info::resolve_this_node_name().await;
     let deployments = ff_db::pg_list_deployments(pool, Some(&node_name))
         .await
@@ -213,7 +221,9 @@ pub async fn list_local_processes() -> Vec<RunningProcess> {
     let output = std::process::Command::new("ps")
         .args(["-axo", "pid=,command="])
         .output();
-    let Ok(output) = output else { return Vec::new() };
+    let Ok(output) = output else {
+        return Vec::new();
+    };
     let text = String::from_utf8_lossy(&output.stdout);
 
     let mut found = Vec::new();
@@ -239,8 +249,7 @@ pub async fn list_local_processes() -> Vec<RunningProcess> {
         };
 
         // Parse --port <N>
-        let port = parse_flag_value(rest, "--port")
-            .and_then(|v| v.parse::<u16>().ok());
+        let port = parse_flag_value(rest, "--port").and_then(|v| v.parse::<u16>().ok());
 
         // Parse --model <path>, -m <path> (llama-server short form), or positional
         // after `serve` (vllm).
@@ -281,7 +290,12 @@ pub async fn health_check_deployment(
         .find(|d| d.id == deployment_id)
         .ok_or_else(|| format!("no deployment '{deployment_id}' on this node"))?;
 
-    let ok = probe_health(&dep.runtime, dep.port as u16, std::time::Duration::from_secs(3)).await;
+    let ok = probe_health(
+        &dep.runtime,
+        dep.port as u16,
+        std::time::Duration::from_secs(3),
+    )
+    .await;
     let status_new = if ok { "healthy" } else { "unhealthy" };
 
     // Write status back — use upsert with the existing library/catalog/port to update only status.
@@ -338,7 +352,10 @@ async fn probe_health(runtime: &str, port: u16, timeout: std::time::Duration) ->
         Ok(c) => c,
         Err(_) => return false,
     };
-    client.get(&url).send().await
+    client
+        .get(&url)
+        .send()
+        .await
         .map(|r| r.status().is_success())
         .unwrap_or(false)
 }

@@ -19,8 +19,8 @@ const REDIS_URL: &str = "redis://192.168.5.100:6380";
 
 /// Get a Postgres pool using the fleet config (same pattern as other handlers).
 async fn get_pool() -> Result<sqlx::PgPool, String> {
-    let (cfg, _) = config::load_config_auto()
-        .map_err(|e| format!("failed to load fleet config: {e}"))?;
+    let (cfg, _) =
+        config::load_config_auto().map_err(|e| format!("failed to load fleet config: {e}"))?;
     PgPoolOptions::new()
         .max_connections(2)
         .connect(&cfg.database.url)
@@ -45,17 +45,21 @@ async fn resolve_default_user(pool: &sqlx::PgPool) -> Result<uuid::Uuid, String>
 
 /// Search the vault knowledge graph by text query.
 pub async fn brain_search(params: Option<Value>) -> HandlerResult {
-    let query = params.as_ref()
+    let query = params
+        .as_ref()
         .and_then(|p| p.get("query"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let node_type = params.as_ref()
+    let node_type = params
+        .as_ref()
         .and_then(|p| p.get("node_type"))
         .and_then(|v| v.as_str());
-    let tags: Option<Vec<String>> = params.as_ref()
+    let tags: Option<Vec<String>> = params
+        .as_ref()
         .and_then(|p| p.get("tags"))
         .and_then(|v| serde_json::from_value(v.clone()).ok());
-    let limit = params.as_ref()
+    let limit = params
+        .as_ref()
         .and_then(|p| p.get("limit"))
         .and_then(|v| v.as_i64())
         .unwrap_or(20);
@@ -92,7 +96,8 @@ pub async fn brain_search(params: Option<Value>) -> HandlerResult {
 
 /// Read a specific vault node by path.
 pub async fn brain_vault_read(params: Option<Value>) -> HandlerResult {
-    let path = params.as_ref()
+    let path = params
+        .as_ref()
         .and_then(|p| p.get("path"))
         .and_then(|v| v.as_str())
         .ok_or_else(|| "missing required parameter: path".to_string())?;
@@ -128,7 +133,8 @@ pub async fn brain_vault_read(params: Option<Value>) -> HandlerResult {
 
 /// Get the graph neighbors (edges) of a node.
 pub async fn brain_graph_neighbors(params: Option<Value>) -> HandlerResult {
-    let node_path = params.as_ref()
+    let node_path = params
+        .as_ref()
         .and_then(|p| p.get("node_path"))
         .and_then(|v| v.as_str())
         .ok_or_else(|| "missing required parameter: node_path".to_string())?;
@@ -159,7 +165,8 @@ pub async fn brain_graph_neighbors(params: Option<Value>) -> HandlerResult {
 
 /// List the user's threads.
 pub async fn brain_list_threads(params: Option<Value>) -> HandlerResult {
-    let user_name = params.as_ref()
+    let user_name = params
+        .as_ref()
         .and_then(|p| p.get("user"))
         .and_then(|v| v.as_str())
         .unwrap_or(DEFAULT_USER);
@@ -193,33 +200,27 @@ pub async fn brain_list_threads(params: Option<Value>) -> HandlerResult {
 pub async fn brain_stats(_params: Option<Value>) -> HandlerResult {
     let pool = get_pool().await?;
 
-    let node_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM brain_vault_nodes WHERE valid_until IS NULL",
-    )
-    .fetch_one(&pool)
-    .await
-    .map_err(|e| format!("count nodes: {e}"))?;
+    let node_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM brain_vault_nodes WHERE valid_until IS NULL")
+            .fetch_one(&pool)
+            .await
+            .map_err(|e| format!("count nodes: {e}"))?;
 
-    let edge_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM brain_vault_edges",
-    )
-    .fetch_one(&pool)
-    .await
-    .map_err(|e| format!("count edges: {e}"))?;
+    let edge_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM brain_vault_edges")
+        .fetch_one(&pool)
+        .await
+        .map_err(|e| format!("count edges: {e}"))?;
 
-    let community_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM brain_communities",
-    )
-    .fetch_one(&pool)
-    .await
-    .map_err(|e| format!("count communities: {e}"))?;
+    let community_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM brain_communities")
+        .fetch_one(&pool)
+        .await
+        .map_err(|e| format!("count communities: {e}"))?;
 
-    let thread_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM brain_threads WHERE status = 'active'",
-    )
-    .fetch_one(&pool)
-    .await
-    .map_err(|e| format!("count threads: {e}"))?;
+    let thread_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM brain_threads WHERE status = 'active'")
+            .fetch_one(&pool)
+            .await
+            .map_err(|e| format!("count threads: {e}"))?;
 
     let pending_candidates: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM brain_knowledge_candidates WHERE status = 'pending'",
@@ -244,13 +245,20 @@ pub async fn brain_stats(_params: Option<Value>) -> HandlerResult {
 /// Propose a new knowledge node. Stages as a candidate for human review.
 pub async fn brain_propose_node(params: Option<Value>) -> HandlerResult {
     let p = params.ok_or_else(|| "missing parameters".to_string())?;
-    let kind = p.get("kind").and_then(|v| v.as_str())
+    let kind = p
+        .get("kind")
+        .and_then(|v| v.as_str())
         .ok_or_else(|| "missing required parameter: kind".to_string())?;
-    let title = p.get("title").and_then(|v| v.as_str())
+    let title = p
+        .get("title")
+        .and_then(|v| v.as_str())
         .ok_or_else(|| "missing required parameter: title".to_string())?;
-    let body = p.get("body").and_then(|v| v.as_str())
+    let body = p
+        .get("body")
+        .and_then(|v| v.as_str())
         .ok_or_else(|| "missing required parameter: body".to_string())?;
-    let tags: Vec<String> = p.get("tags")
+    let tags: Vec<String> = p
+        .get("tags")
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_default();
     let project = p.get("project").and_then(|v| v.as_str());
@@ -261,16 +269,16 @@ pub async fn brain_propose_node(params: Option<Value>) -> HandlerResult {
     let candidate_id = ff_db::pg_insert_brain_candidate(
         &pool,
         user_id,
-        None,          // thread_id
-        "create",      // action
+        None,     // thread_id
+        "create", // action
         Some(kind),
         Some(title),
         Some(body),
         &tags,
         project,
-        None,          // target_path
-        None,          // from_thread
-        Some(0.8),     // default confidence for MCP proposals
+        None,      // target_path
+        None,      // from_thread
+        Some(0.8), // default confidence for MCP proposals
     )
     .await
     .map_err(|e| format!("insert candidate: {e}"))?;
@@ -287,11 +295,17 @@ pub async fn brain_propose_node(params: Option<Value>) -> HandlerResult {
 /// Propose a link between two existing nodes.
 pub async fn brain_propose_link(params: Option<Value>) -> HandlerResult {
     let p = params.ok_or_else(|| "missing parameters".to_string())?;
-    let src_path = p.get("src_path").and_then(|v| v.as_str())
+    let src_path = p
+        .get("src_path")
+        .and_then(|v| v.as_str())
         .ok_or_else(|| "missing required parameter: src_path".to_string())?;
-    let dst_path = p.get("dst_path").and_then(|v| v.as_str())
+    let dst_path = p
+        .get("dst_path")
+        .and_then(|v| v.as_str())
         .ok_or_else(|| "missing required parameter: dst_path".to_string())?;
-    let edge_type = p.get("edge_type").and_then(|v| v.as_str())
+    let edge_type = p
+        .get("edge_type")
+        .and_then(|v| v.as_str())
         .ok_or_else(|| "missing required parameter: edge_type".to_string())?;
 
     let pool = get_pool().await?;
@@ -318,7 +332,7 @@ pub async fn brain_propose_link(params: Option<Value>) -> HandlerResult {
         Some(&body),
         &[],
         None,
-        Some(src_path),  // target_path = source node
+        Some(src_path), // target_path = source node
         None,
         Some(0.8),
     )
@@ -341,9 +355,13 @@ pub async fn brain_propose_link(params: Option<Value>) -> HandlerResult {
 /// Add a message to a thread.
 pub async fn brain_thread_append(params: Option<Value>) -> HandlerResult {
     let p = params.ok_or_else(|| "missing parameters".to_string())?;
-    let thread_slug = p.get("thread_slug").and_then(|v| v.as_str())
+    let thread_slug = p
+        .get("thread_slug")
+        .and_then(|v| v.as_str())
         .ok_or_else(|| "missing required parameter: thread_slug".to_string())?;
-    let content = p.get("content").and_then(|v| v.as_str())
+    let content = p
+        .get("content")
+        .and_then(|v| v.as_str())
         .ok_or_else(|| "missing required parameter: content".to_string())?;
 
     let pool = get_pool().await?;
@@ -370,11 +388,11 @@ pub async fn brain_thread_append(params: Option<Value>) -> HandlerResult {
         &pool,
         thread.id,
         user_id,
-        "mcp",       // channel
-        "mcp-tool",  // external_id
+        "mcp",      // channel
+        "mcp-tool", // external_id
         "assistant",
         content,
-        None,        // metadata
+        None, // metadata
     )
     .await
     .map_err(|e| format!("insert message: {e}"))?;
@@ -394,9 +412,13 @@ pub async fn brain_thread_append(params: Option<Value>) -> HandlerResult {
 /// Push an item onto the current thread's stack.
 pub async fn brain_stack_push(params: Option<Value>) -> HandlerResult {
     let p = params.ok_or_else(|| "missing parameters".to_string())?;
-    let thread_slug = p.get("thread_slug").and_then(|v| v.as_str())
+    let thread_slug = p
+        .get("thread_slug")
+        .and_then(|v| v.as_str())
         .ok_or_else(|| "missing required parameter: thread_slug".to_string())?;
-    let title = p.get("title").and_then(|v| v.as_str())
+    let title = p
+        .get("title")
+        .and_then(|v| v.as_str())
         .ok_or_else(|| "missing required parameter: title".to_string())?;
 
     let pool = get_pool().await?;
@@ -420,7 +442,8 @@ pub async fn brain_stack_push(params: Option<Value>) -> HandlerResult {
         pushed_at: Utc::now().to_rfc3339(),
     };
 
-    let depth = client.stack_push(&user_id, &thread.id, &item)
+    let depth = client
+        .stack_push(&user_id, &thread.id, &item)
         .await
         .map_err(|e| format!("stack push: {e}"))?;
 
@@ -434,11 +457,17 @@ pub async fn brain_stack_push(params: Option<Value>) -> HandlerResult {
 /// Add an item to a project's backlog.
 pub async fn brain_backlog_add(params: Option<Value>) -> HandlerResult {
     let p = params.ok_or_else(|| "missing parameters".to_string())?;
-    let title = p.get("title").and_then(|v| v.as_str())
+    let title = p
+        .get("title")
+        .and_then(|v| v.as_str())
         .ok_or_else(|| "missing required parameter: title".to_string())?;
-    let priority = p.get("priority").and_then(|v| v.as_str())
+    let priority = p
+        .get("priority")
+        .and_then(|v| v.as_str())
         .unwrap_or("medium");
-    let project = p.get("project").and_then(|v| v.as_str())
+    let project = p
+        .get("project")
+        .and_then(|v| v.as_str())
         .ok_or_else(|| "missing required parameter: project".to_string())?;
 
     let pool = get_pool().await?;
@@ -458,7 +487,8 @@ pub async fn brain_backlog_add(params: Option<Value>) -> HandlerResult {
         created_at: Utc::now().to_rfc3339(),
     };
 
-    let count = client.backlog_add(&user_id, project, &item)
+    let count = client
+        .backlog_add(&user_id, project, &item)
         .await
         .map_err(|e| format!("backlog add: {e}"))?;
 

@@ -26,9 +26,12 @@ pub enum MessageRole {
 /// Render a user message.
 pub fn render_user_message(text: &str) -> DisplayMessage {
     let mut lines = Vec::new();
-    lines.push(Line::from(vec![
-        Span::styled("You ", Style::default().fg(Color::Rgb(125, 211, 252)).add_modifier(Modifier::BOLD)),
-    ]));
+    lines.push(Line::from(vec![Span::styled(
+        "You ",
+        Style::default()
+            .fg(Color::Rgb(125, 211, 252))
+            .add_modifier(Modifier::BOLD),
+    )]));
     for line in text.lines() {
         lines.push(Line::from(Span::styled(
             line.to_string(),
@@ -36,15 +39,21 @@ pub fn render_user_message(text: &str) -> DisplayMessage {
         )));
     }
     lines.push(Line::from(""));
-    DisplayMessage { lines, role: MessageRole::User }
+    DisplayMessage {
+        lines,
+        role: MessageRole::User,
+    }
 }
 
 /// Render an assistant text message with basic markdown support.
 pub fn render_assistant_message(text: &str) -> DisplayMessage {
     let mut lines = Vec::new();
-    lines.push(Line::from(vec![
-        Span::styled("Agent ", Style::default().fg(Color::Rgb(134, 239, 172)).add_modifier(Modifier::BOLD)),
-    ]));
+    lines.push(Line::from(vec![Span::styled(
+        "Agent ",
+        Style::default()
+            .fg(Color::Rgb(134, 239, 172))
+            .add_modifier(Modifier::BOLD),
+    )]));
 
     let mut in_code_block = false;
     let mut in_table = false;
@@ -84,7 +93,8 @@ pub fn render_assistant_message(text: &str) -> DisplayMessage {
         // Table rows
         if line.starts_with('|') && line.ends_with('|') {
             in_table = true;
-            let cells: Vec<&str> = line.split('|')
+            let cells: Vec<&str> = line
+                .split('|')
                 .filter(|c| !c.is_empty())
                 .map(|c| c.trim())
                 .collect();
@@ -93,7 +103,10 @@ pub fn render_assistant_message(text: &str) -> DisplayMessage {
             spans.push(Span::styled("  ", Style::default()));
             for (i, cell) in cells.iter().enumerate() {
                 if i > 0 {
-                    spans.push(Span::styled(" │ ", Style::default().fg(Color::Rgb(100, 116, 139))));
+                    spans.push(Span::styled(
+                        " │ ",
+                        Style::default().fg(Color::Rgb(100, 116, 139)),
+                    ));
                 }
                 // Apply inline markdown to cell content
                 spans.extend(parse_inline_markdown(cell));
@@ -110,37 +123,43 @@ pub fn render_assistant_message(text: &str) -> DisplayMessage {
         if line.starts_with("#### ") {
             lines.push(Line::from(Span::styled(
                 format!("  {}", &line[5..]),
-                Style::default().fg(Color::Rgb(251, 191, 36)).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Rgb(251, 191, 36))
+                    .add_modifier(Modifier::BOLD),
             )));
             continue;
         }
         if line.starts_with("### ") {
             lines.push(Line::from(Span::styled(
                 format!("  {}", &line[4..]),
-                Style::default().fg(Color::Rgb(251, 191, 36)).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Rgb(251, 191, 36))
+                    .add_modifier(Modifier::BOLD),
             )));
             continue;
         }
         if line.starts_with("## ") {
             lines.push(Line::from(Span::styled(
                 line[3..].to_string(),
-                Style::default().fg(Color::Rgb(251, 191, 36)).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Rgb(251, 191, 36))
+                    .add_modifier(Modifier::BOLD),
             )));
             continue;
         }
         if line.starts_with("# ") {
             lines.push(Line::from(Span::styled(
                 line[2..].to_string(),
-                Style::default().fg(Color::Rgb(251, 191, 36)).add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                Style::default()
+                    .fg(Color::Rgb(251, 191, 36))
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
             )));
             continue;
         }
 
         // Numbered lists
         if let Some(rest) = strip_numbered_list(line) {
-            let mut spans = vec![
-                Span::styled("  ", Style::default()),
-            ];
+            let mut spans = vec![Span::styled("  ", Style::default())];
             // Find the number prefix
             let prefix_end = line.find(". ").unwrap_or(0) + 2;
             spans.push(Span::styled(
@@ -155,9 +174,10 @@ pub fn render_assistant_message(text: &str) -> DisplayMessage {
         // Bullet points
         if line.starts_with("- ") || line.starts_with("* ") {
             let content = &line[2..];
-            let mut spans = vec![
-                Span::styled("  • ", Style::default().fg(Color::Rgb(134, 239, 172))),
-            ];
+            let mut spans = vec![Span::styled(
+                "  • ",
+                Style::default().fg(Color::Rgb(134, 239, 172)),
+            )];
             spans.extend(parse_inline_markdown(content));
             lines.push(Line::from(spans));
             continue;
@@ -166,9 +186,10 @@ pub fn render_assistant_message(text: &str) -> DisplayMessage {
         // Indented bullet points
         if line.starts_with("  - ") || line.starts_with("  * ") {
             let content = &line[4..];
-            let mut spans = vec![
-                Span::styled("    ◦ ", Style::default().fg(Color::Rgb(134, 239, 172))),
-            ];
+            let mut spans = vec![Span::styled(
+                "    ◦ ",
+                Style::default().fg(Color::Rgb(134, 239, 172)),
+            )];
             spans.extend(parse_inline_markdown(content));
             lines.push(Line::from(spans));
             continue;
@@ -180,13 +201,19 @@ pub fn render_assistant_message(text: &str) -> DisplayMessage {
     }
 
     lines.push(Line::from(""));
-    DisplayMessage { lines, role: MessageRole::Assistant }
+    DisplayMessage {
+        lines,
+        role: MessageRole::Assistant,
+    }
 }
 
 /// Check if a line is a markdown table separator (e.g., |:---|:---|)
 fn is_table_separator(line: &str) -> bool {
-    if !line.starts_with('|') { return false; }
-    line.chars().all(|c| c == '|' || c == ':' || c == '-' || c == ' ')
+    if !line.starts_with('|') {
+        return false;
+    }
+    line.chars()
+        .all(|c| c == '|' || c == ':' || c == '-' || c == ' ')
 }
 
 /// Strip numbered list prefix (e.g., "1. " → rest)
@@ -209,9 +236,15 @@ fn strip_numbered_list(line: &str) -> Option<&str> {
 /// Parse inline markdown: **bold**, *italic*, `code`, [links]
 fn parse_inline_markdown(text: &str) -> Vec<Span<'static>> {
     let base_style = Style::default().fg(Color::Rgb(203, 213, 225)); // slate-300
-    let bold_style = Style::default().fg(Color::Rgb(241, 245, 249)).add_modifier(Modifier::BOLD); // slate-100 bold
-    let italic_style = Style::default().fg(Color::Rgb(203, 213, 225)).add_modifier(Modifier::ITALIC);
-    let code_style = Style::default().fg(Color::Rgb(196, 181, 253)).bg(Color::Rgb(30, 30, 40)); // violet on dark
+    let bold_style = Style::default()
+        .fg(Color::Rgb(241, 245, 249))
+        .add_modifier(Modifier::BOLD); // slate-100 bold
+    let italic_style = Style::default()
+        .fg(Color::Rgb(203, 213, 225))
+        .add_modifier(Modifier::ITALIC);
+    let code_style = Style::default()
+        .fg(Color::Rgb(196, 181, 253))
+        .bg(Color::Rgb(30, 30, 40)); // violet on dark
 
     let mut spans = Vec::new();
     let mut remaining = text;
@@ -328,7 +361,9 @@ fn find_single_asterisk_end(text: &str) -> Option<usize> {
 pub fn render_tool_start(tool_name: &str, input_json: &str) -> DisplayMessage {
     let preview = if input_json.len() > 60 {
         let mut end = 60;
-        while end > 0 && !input_json.is_char_boundary(end) { end -= 1; }
+        while end > 0 && !input_json.is_char_boundary(end) {
+            end -= 1;
+        }
         format!("{}...", &input_json[..end])
     } else {
         input_json.to_string()
@@ -337,15 +372,28 @@ pub fn render_tool_start(tool_name: &str, input_json: &str) -> DisplayMessage {
     DisplayMessage {
         lines: vec![Line::from(vec![
             Span::styled("  ⚡ ", Style::default().fg(Color::Rgb(251, 191, 36))),
-            Span::styled(tool_name.to_string(), Style::default().fg(Color::Rgb(251, 191, 36)).add_modifier(Modifier::BOLD)),
-            Span::styled(format!(" {preview}"), Style::default().fg(Color::Rgb(100, 116, 139))),
+            Span::styled(
+                tool_name.to_string(),
+                Style::default()
+                    .fg(Color::Rgb(251, 191, 36))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" {preview}"),
+                Style::default().fg(Color::Rgb(100, 116, 139)),
+            ),
         ])],
         role: MessageRole::ToolStart,
     }
 }
 
 /// Render a tool end event.
-pub fn render_tool_end(tool_name: &str, result: &str, is_error: bool, duration_ms: u64) -> DisplayMessage {
+pub fn render_tool_end(
+    tool_name: &str,
+    result: &str,
+    is_error: bool,
+    duration_ms: u64,
+) -> DisplayMessage {
     let (icon, color) = if is_error {
         ("✗", Color::Rgb(248, 113, 113))
     } else {
@@ -355,7 +403,9 @@ pub fn render_tool_end(tool_name: &str, result: &str, is_error: bool, duration_m
     let first_line = result.lines().next().unwrap_or("");
     let preview = if first_line.len() > 100 {
         let mut end = 100;
-        while end > 0 && !first_line.is_char_boundary(end) { end -= 1; }
+        while end > 0 && !first_line.is_char_boundary(end) {
+            end -= 1;
+        }
         format!("{}...", &first_line[..end])
     } else {
         first_line.to_string()
@@ -364,8 +414,14 @@ pub fn render_tool_end(tool_name: &str, result: &str, is_error: bool, duration_m
     DisplayMessage {
         lines: vec![Line::from(vec![
             Span::styled(format!("  {icon} "), Style::default().fg(color)),
-            Span::styled(tool_name.to_string(), Style::default().fg(color).add_modifier(Modifier::BOLD)),
-            Span::styled(format!(" ({duration_ms}ms) "), Style::default().fg(Color::Rgb(100, 116, 139))),
+            Span::styled(
+                tool_name.to_string(),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" ({duration_ms}ms) "),
+                Style::default().fg(Color::Rgb(100, 116, 139)),
+            ),
             Span::styled(preview, Style::default().fg(Color::Rgb(148, 163, 184))),
         ])],
         role: MessageRole::ToolEnd,
@@ -387,8 +443,16 @@ pub fn render_status(message: &str) -> DisplayMessage {
 pub fn render_error(message: &str) -> DisplayMessage {
     DisplayMessage {
         lines: vec![Line::from(vec![
-            Span::styled("  ✗ Error: ", Style::default().fg(Color::Rgb(248, 113, 113)).add_modifier(Modifier::BOLD)),
-            Span::styled(message.to_string(), Style::default().fg(Color::Rgb(248, 113, 113))),
+            Span::styled(
+                "  ✗ Error: ",
+                Style::default()
+                    .fg(Color::Rgb(248, 113, 113))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                message.to_string(),
+                Style::default().fg(Color::Rgb(248, 113, 113)),
+            ),
         ])],
         role: MessageRole::Error,
     }
@@ -398,10 +462,18 @@ pub fn render_error(message: &str) -> DisplayMessage {
 pub fn event_to_display(event: &AgentEvent) -> Option<DisplayMessage> {
     match event {
         AgentEvent::AssistantText { text, .. } => Some(render_assistant_message(text)),
-        AgentEvent::ToolStart { tool_name, input_json, .. } => Some(render_tool_start(tool_name, input_json)),
-        AgentEvent::ToolEnd { tool_name, result, is_error, duration_ms, .. } => {
-            Some(render_tool_end(tool_name, result, *is_error, *duration_ms))
-        }
+        AgentEvent::ToolStart {
+            tool_name,
+            input_json,
+            ..
+        } => Some(render_tool_start(tool_name, input_json)),
+        AgentEvent::ToolEnd {
+            tool_name,
+            result,
+            is_error,
+            duration_ms,
+            ..
+        } => Some(render_tool_end(tool_name, result, *is_error, *duration_ms)),
         AgentEvent::Status { message, .. } => Some(render_status(message)),
         AgentEvent::Error { message, .. } => Some(render_error(message)),
         _ => None,

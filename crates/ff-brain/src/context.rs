@@ -77,20 +77,26 @@ pub async fn select_context(
 
     // 2. Text search on vault nodes (ILIKE proxy for BM25)
     let search_pattern = format!("%{query}%");
-    let node_rows: Vec<(String, String, String, Option<String>, Option<i32>, Option<String>)> =
-        sqlx::query_as(
-            r#"
+    let node_rows: Vec<(
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<i32>,
+        Option<String>,
+    )> = sqlx::query_as(
+        r#"
             SELECT path, title, body, node_type, community_id, extends_path
             FROM brain_vault_nodes
             WHERE valid_until IS NULL
               AND (title ILIKE $1 OR body ILIKE $1)
             LIMIT 20
             "#,
-        )
-        .bind(&search_pattern)
-        .fetch_all(pool)
-        .await
-        .map_err(|e| format!("DB error searching nodes: {e}"))?;
+    )
+    .bind(&search_pattern)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("DB error searching nodes: {e}"))?;
 
     // Score and collect candidates
     let query_lower = query.to_lowercase();
@@ -149,7 +155,11 @@ pub async fn select_context(
     }
 
     // 3. Walk 1-hop edges for top-5 results
-    candidates.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    candidates.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     let top_paths: Vec<String> = candidates.iter().take(5).map(|n| n.path.clone()).collect();
 
     for source_path in &top_paths {
@@ -185,7 +195,11 @@ pub async fn select_context(
     }
 
     // Re-sort after adding neighbors
-    candidates.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    candidates.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     // 6. Pack within budget (estimate 4 chars per token)
     let chars_per_token = 4;

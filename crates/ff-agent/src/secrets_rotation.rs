@@ -123,7 +123,9 @@ impl SecretsRotator {
                     "Secret '{}' expires in {} days (at {})",
                     row.key,
                     row.days_remaining.unwrap_or(0),
-                    row.expires_at.map(|t| t.to_rfc3339()).unwrap_or_else(|| "-".into()),
+                    row.expires_at
+                        .map(|t| t.to_rfc3339())
+                        .unwrap_or_else(|| "-".into()),
                 );
                 let insert = sqlx::query(
                     "INSERT INTO alert_events (policy_id, value, value_text, message, channel_result)
@@ -221,11 +223,7 @@ impl SecretsRotator {
     /// Spawn the daily check loop. Runs `check_expirations` every
     /// `interval_hours`. Only runs on the leader — callers should gate
     /// with `pg_get_current_leader` before spawning.
-    pub fn spawn(
-        self,
-        interval_hours: u64,
-        mut shutdown: watch::Receiver<bool>,
-    ) -> JoinHandle<()> {
+    pub fn spawn(self, interval_hours: u64, mut shutdown: watch::Receiver<bool>) -> JoinHandle<()> {
         tokio::spawn(async move {
             // Start with a short delay to avoid racing migrations at boot.
             tokio::time::sleep(Duration::from_secs(30)).await;

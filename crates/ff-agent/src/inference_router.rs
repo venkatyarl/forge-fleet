@@ -89,7 +89,11 @@ impl InferenceRouter {
         info!(
             count = endpoints.len(),
             "InferenceRouter built: {}",
-            endpoints.iter().map(|e| e.label.as_str()).collect::<Vec<_>>().join(", ")
+            endpoints
+                .iter()
+                .map(|e| e.label.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         );
         Self::new(endpoints)
     }
@@ -129,7 +133,11 @@ impl InferenceRouter {
     pub fn report_failure(&self, url: &str) {
         let mut state = self.failures.lock().unwrap();
         state.mark_failed(url);
-        warn!(url, cooldown_secs = self.cooldown.as_secs(), "endpoint marked as failed — will retry after cooldown");
+        warn!(
+            url,
+            cooldown_secs = self.cooldown.as_secs(),
+            "endpoint marked as failed — will retry after cooldown"
+        );
     }
 
     /// Mark an endpoint as healthy (clears any failure state).
@@ -213,10 +221,13 @@ async fn build_endpoint_list(config_path: &Path) -> Vec<RouterEndpoint> {
                             continue;
                         }
 
-                        let node_models: Vec<_> = models.iter().filter(|m| m.node_name == node.name).collect();
+                        let node_models: Vec<_> =
+                            models.iter().filter(|m| m.node_name == node.name).collect();
                         if node_models.is_empty() {
                             candidates.push((
-                                node.ip.clone(), 55000, node.cpu_cores,
+                                node.ip.clone(),
+                                55000,
+                                node.cpu_cores,
                                 true, // assume capable if we don't know
                                 node.name.clone(),
                                 "auto".into(),
@@ -227,11 +238,15 @@ async fn build_endpoint_list(config_path: &Path) -> Vec<RouterEndpoint> {
                                 let id_lower = m.id.to_lowercase();
                                 let name_lower = m.name.to_lowercase();
                                 let is_gemma4 = fam.contains("gemma")
-                                    && (id_lower.contains("gemma-4") || id_lower.contains("gemma4")
-                                        || name_lower.contains("gemma-4") || name_lower.contains("gemma4"));
+                                    && (id_lower.contains("gemma-4")
+                                        || id_lower.contains("gemma4")
+                                        || name_lower.contains("gemma-4")
+                                        || name_lower.contains("gemma4"));
                                 let supports_tools = fam.contains("qwen") || is_gemma4;
                                 candidates.push((
-                                    node.ip.clone(), m.port as u16, node.cpu_cores,
+                                    node.ip.clone(),
+                                    m.port as u16,
+                                    node.cpu_cores,
                                     supports_tools,
                                     format!("{}:{}", node.name, m.port),
                                     m.id.clone(),
@@ -244,26 +259,29 @@ async fn build_endpoint_list(config_path: &Path) -> Vec<RouterEndpoint> {
                     candidates.sort_by(|a, b| b.3.cmp(&a.3).then(b.2.cmp(&a.2)));
 
                     // Probe reachability (parallel, short timeout)
-                    let probe_futs: Vec<_> = candidates.iter().map(|(ip, port, _, supports_tools, label, model_id)| {
-                        let ip = ip.clone();
-                        let label = label.clone();
-                        let model_id = model_id.clone();
-                        let st = *supports_tools;
-                        let port = *port;
-                        async move {
-                            if tcp_reachable(&ip, port).await {
-                                Some(RouterEndpoint {
-                                    url: format!("http://{ip}:{port}"),
-                                    model_id,
-                                    label,
-                                    supports_tools: st,
-                                    is_local: false,
-                                })
-                            } else {
-                                None
+                    let probe_futs: Vec<_> = candidates
+                        .iter()
+                        .map(|(ip, port, _, supports_tools, label, model_id)| {
+                            let ip = ip.clone();
+                            let label = label.clone();
+                            let model_id = model_id.clone();
+                            let st = *supports_tools;
+                            let port = *port;
+                            async move {
+                                if tcp_reachable(&ip, port).await {
+                                    Some(RouterEndpoint {
+                                        url: format!("http://{ip}:{port}"),
+                                        model_id,
+                                        label,
+                                        supports_tools: st,
+                                        is_local: false,
+                                    })
+                                } else {
+                                    None
+                                }
                             }
-                        }
-                    }).collect();
+                        })
+                        .collect();
 
                     let results = futures::future::join_all(probe_futs).await;
                     for ep in results.into_iter().flatten() {
@@ -282,16 +300,15 @@ async fn build_endpoint_list(config_path: &Path) -> Vec<RouterEndpoint> {
 
 /// True if an IP address refers to the local machine.
 fn is_local_node(ip: &str) -> bool {
-    ip == "127.0.0.1" || ip == "::1" || ip == "localhost"
-        || {
-            // Check if this is one of our own network IPs
-            use std::net::ToSocketAddrs;
-            if let Ok(addrs) = format!("{ip}:0").to_socket_addrs() {
-                addrs.into_iter().any(|a| a.ip().is_loopback())
-            } else {
-                false
-            }
+    ip == "127.0.0.1" || ip == "::1" || ip == "localhost" || {
+        // Check if this is one of our own network IPs
+        use std::net::ToSocketAddrs;
+        if let Ok(addrs) = format!("{ip}:0").to_socket_addrs() {
+            addrs.into_iter().any(|a| a.ip().is_loopback())
+        } else {
+            false
         }
+    }
 }
 
 /// TCP reachability probe with a 300ms timeout.

@@ -35,10 +35,21 @@ pub struct Notification {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum NotificationChannel {
     Desktop,
-    Webhook { url: String, headers: HashMap<String, String> },
-    Slack { webhook_url: String, channel: Option<String> },
-    Discord { webhook_url: String },
-    Telegram { bot_token: String, chat_id: String },
+    Webhook {
+        url: String,
+        headers: HashMap<String, String>,
+    },
+    Slack {
+        webhook_url: String,
+        channel: Option<String>,
+    },
+    Discord {
+        webhook_url: String,
+    },
+    Telegram {
+        bot_token: String,
+        chat_id: String,
+    },
 }
 
 /// Notification manager.
@@ -50,7 +61,9 @@ pub struct NotificationManager {
 }
 
 impl NotificationManager {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     pub fn add_channel(&mut self, channel: NotificationChannel) {
         self.channels.push(channel);
@@ -74,7 +87,10 @@ impl NotificationManager {
                 NotificationChannel::Webhook { url, headers } => {
                     send_webhook(url, headers, notification).await;
                 }
-                NotificationChannel::Slack { webhook_url, channel: _ } => {
+                NotificationChannel::Slack {
+                    webhook_url,
+                    channel: _,
+                } => {
                     send_slack(webhook_url, notification).await;
                 }
                 NotificationChannel::Discord { webhook_url } => {
@@ -97,13 +113,21 @@ async fn send_desktop_notification(title: &str, message: &str) {
             message.replace('"', "\\\""),
             title.replace('"', "\\\""),
         );
-        let _ = tokio::process::Command::new("osascript").arg("-e").arg(&script).output().await;
+        let _ = tokio::process::Command::new("osascript")
+            .arg("-e")
+            .arg(&script)
+            .output()
+            .await;
     }
 
     // Linux: notify-send
     #[cfg(target_os = "linux")]
     {
-        let _ = tokio::process::Command::new("notify-send").arg(title).arg(message).output().await;
+        let _ = tokio::process::Command::new("notify-send")
+            .arg(title)
+            .arg(message)
+            .output()
+            .await;
     }
 
     debug!(title, "desktop notification sent");

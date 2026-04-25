@@ -213,13 +213,15 @@ pub async fn list_threads(pool: &PgPool, user_id: Uuid) -> Result<Vec<ThreadSumm
 
     Ok(rows
         .into_iter()
-        .map(|(id, slug, title, project, last_message_at, status)| ThreadSummary {
-            id,
-            slug,
-            title,
-            project,
-            last_message_at,
-            status,
-        })
+        .map(
+            |(id, slug, title, project, last_message_at, status)| ThreadSummary {
+                id,
+                slug,
+                title,
+                project,
+                last_message_at,
+                status,
+            },
+        )
         .collect())
 }

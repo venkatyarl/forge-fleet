@@ -11,7 +11,9 @@ pub struct GitBlameTool;
 
 #[async_trait]
 impl AgentTool for GitBlameTool {
-    fn name(&self) -> &str { "GitBlame" }
+    fn name(&self) -> &str {
+        "GitBlame"
+    }
 
     fn description(&self) -> &str {
         "Analyze git blame for a file or line range to understand when and why code changed. Useful for investigating bugs and understanding code history."
@@ -87,8 +89,10 @@ fn parse_blame_porcelain(output: &str) -> String {
             if !current_author.is_empty() {
                 let author_preview: String = current_author.chars().take(20).collect();
                 let summary_preview: String = current_summary.chars().take(40).collect();
-                result.push_str(&format!("{line_num:>4} | {:<20} | {:<40} | {code}\n",
-                    author_preview, summary_preview));
+                result.push_str(&format!(
+                    "{line_num:>4} | {:<20} | {:<40} | {code}\n",
+                    author_preview, summary_preview
+                ));
             }
         }
     }
@@ -105,7 +109,9 @@ pub struct TestGenTool;
 
 #[async_trait]
 impl AgentTool for TestGenTool {
-    fn name(&self) -> &str { "TestGen" }
+    fn name(&self) -> &str {
+        "TestGen"
+    }
 
     fn description(&self) -> &str {
         "Generate unit tests for a specific function or module. Analyzes the code and creates appropriate test cases."
@@ -138,10 +144,15 @@ impl AgentTool for TestGenTool {
 
         let content = match tokio::fs::read_to_string(&path).await {
             Ok(c) => c,
-            Err(e) => return AgentToolResult::err(format!("Failed to read {}: {e}", path.display())),
+            Err(e) => {
+                return AgentToolResult::err(format!("Failed to read {}: {e}", path.display()));
+            }
         };
 
-        let function_name = input.get("function_name").and_then(Value::as_str).unwrap_or("");
+        let function_name = input
+            .get("function_name")
+            .and_then(Value::as_str)
+            .unwrap_or("");
 
         // Return the source code for the LLM to generate tests from
         // The agent loop will use this as context to write actual tests
@@ -154,14 +165,21 @@ impl AgentTool for TestGenTool {
             let mut end = lines.len();
 
             for (i, line) in lines.iter().enumerate() {
-                if line.contains(&format!("fn {function_name}")) || line.contains(&format!("def {function_name}")) || line.contains(&format!("function {function_name}")) {
+                if line.contains(&format!("fn {function_name}"))
+                    || line.contains(&format!("def {function_name}"))
+                    || line.contains(&format!("function {function_name}"))
+                {
                     start = i.saturating_sub(3); // include docstrings/decorators
                     found = true;
                 }
                 if found {
                     for ch in line.chars() {
-                        if ch == '{' || ch == ':' { depth += 1; }
-                        if ch == '}' { depth -= 1; }
+                        if ch == '{' || ch == ':' {
+                            depth += 1;
+                        }
+                        if ch == '}' {
+                            depth -= 1;
+                        }
                     }
                     if depth <= 0 && i > start + 1 {
                         end = i + 1;

@@ -10,7 +10,9 @@ pub struct DockerManageTool;
 
 #[async_trait]
 impl AgentTool for DockerManageTool {
-    fn name(&self) -> &str { "Docker" }
+    fn name(&self) -> &str {
+        "Docker"
+    }
 
     fn description(&self) -> &str {
         "Manage Docker containers: list, start, stop, build, run, logs, and compose operations."
@@ -41,29 +43,49 @@ impl AgentTool for DockerManageTool {
         cmd.current_dir(&ctx.working_dir);
 
         match action {
-            "ps" => { cmd.args(["ps", "-a"]); }
-            "images" => { cmd.arg("images"); }
-            "build" => { cmd.args(["build", "-t", target, "."]); }
+            "ps" => {
+                cmd.args(["ps", "-a"]);
+            }
+            "images" => {
+                cmd.arg("images");
+            }
+            "build" => {
+                cmd.args(["build", "-t", target, "."]);
+            }
             "run" => {
                 cmd.arg("run").arg("-d");
-                if !extra_args.is_empty() { for arg in extra_args.split_whitespace() { cmd.arg(arg); } }
+                if !extra_args.is_empty() {
+                    for arg in extra_args.split_whitespace() {
+                        cmd.arg(arg);
+                    }
+                }
                 cmd.arg(target);
             }
-            "stop" => { cmd.args(["stop", target]); }
-            "rm" => { cmd.args(["rm", "-f", target]); }
-            "logs" => { cmd.args(["logs", "--tail", "100", target]); }
+            "stop" => {
+                cmd.args(["stop", target]);
+            }
+            "rm" => {
+                cmd.args(["rm", "-f", target]);
+            }
+            "logs" => {
+                cmd.args(["logs", "--tail", "100", target]);
+            }
             "compose-up" => {
                 cmd = Command::new("docker");
                 cmd.current_dir(&ctx.working_dir);
                 cmd.args(["compose"]);
-                if !target.is_empty() { cmd.args(["-f", target]); }
+                if !target.is_empty() {
+                    cmd.args(["-f", target]);
+                }
                 cmd.args(["up", "-d"]);
             }
             "compose-down" => {
                 cmd = Command::new("docker");
                 cmd.current_dir(&ctx.working_dir);
                 cmd.args(["compose"]);
-                if !target.is_empty() { cmd.args(["-f", target]); }
+                if !target.is_empty() {
+                    cmd.args(["-f", target]);
+                }
                 cmd.arg("down");
             }
             "exec" => {
@@ -74,7 +96,11 @@ impl AgentTool for DockerManageTool {
 
         match cmd.output().await {
             Ok(out) => {
-                let combined = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+                let combined = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
                 if out.status.success() {
                     AgentToolResult::ok(truncate_output(&combined, MAX_TOOL_RESULT_CHARS))
                 } else {

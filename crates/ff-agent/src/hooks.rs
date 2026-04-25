@@ -57,7 +57,9 @@ pub struct HookEntry {
     pub blocking: bool,
 }
 
-fn default_timeout() -> u64 { 10 }
+fn default_timeout() -> u64 {
+    10
+}
 
 /// Hook configuration for a session.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -67,7 +69,9 @@ pub struct HookConfig {
 
 impl HookConfig {
     pub fn new() -> Self {
-        Self { hooks: HashMap::new() }
+        Self {
+            hooks: HashMap::new(),
+        }
     }
 
     pub fn add(&mut self, event: HookEvent, entry: HookEntry) {
@@ -121,7 +125,11 @@ pub async fn run_hooks(
         }
 
         let timeout = std::time::Duration::from_secs(entry.timeout_secs);
-        let cmd_result = tokio::time::timeout(timeout, run_hook_command(&entry.command, env_vars, working_dir)).await;
+        let cmd_result = tokio::time::timeout(
+            timeout,
+            run_hook_command(&entry.command, env_vars, working_dir),
+        )
+        .await;
 
         result.executed += 1;
 
@@ -145,7 +153,9 @@ pub async fn run_hooks(
                 warn!(event = event.as_str(), command = %entry.command, error = %e, "hook failed");
                 if entry.blocking {
                     result.blocked = true;
-                    result.block_reasons.push(format!("Hook '{}' failed: {e}", entry.command));
+                    result
+                        .block_reasons
+                        .push(format!("Hook '{}' failed: {e}", entry.command));
                 }
             }
             Err(_) => {

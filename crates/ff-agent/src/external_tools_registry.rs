@@ -192,9 +192,7 @@ pub async fn list_tools(pool: &PgPool) -> Result<Vec<Tool>, ExternalToolsError> 
 /// Retained for the parser-shape tests below; the runtime seeder is
 /// retired (see module docs + V38).
 #[allow(dead_code)]
-fn toml_table_to_json(
-    table: &toml::value::Table,
-) -> Result<serde_json::Value, serde_json::Error> {
+fn toml_table_to_json(table: &toml::value::Table) -> Result<serde_json::Value, serde_json::Error> {
     serde_json::to_value(table)
 }
 

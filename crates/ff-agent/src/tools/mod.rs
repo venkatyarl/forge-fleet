@@ -8,11 +8,11 @@ pub mod agentic;
 pub mod analytics;
 pub mod bash;
 pub mod code_quality;
-pub mod content;
 pub mod computer;
+pub mod content;
+pub mod cron_tool;
 pub mod crypto;
 pub mod database;
-pub mod cron_tool;
 pub mod dep_check;
 pub mod diff_tool;
 pub mod doc_gen;
@@ -23,18 +23,18 @@ pub mod file_read;
 pub mod file_write;
 pub mod finance;
 pub mod fleet_ops;
-pub mod intelligence;
 pub mod git_pr;
 pub mod git_tools;
 pub mod glob_tool;
 pub mod grep_tool;
 pub mod http_request;
+pub mod intelligence;
 pub mod json_query;
 pub mod lint_fix;
 pub mod media;
+pub mod model_discovery;
 pub mod model_mgmt;
 pub mod multimodal;
-pub mod model_discovery;
 pub mod network_check;
 pub mod notebook_edit;
 pub mod orchestrate;
@@ -42,19 +42,19 @@ pub mod plan_tools;
 pub mod project_mgmt;
 pub mod research;
 pub mod research_ext;
-pub mod uiux;
+pub mod send_message;
 pub mod skill_builder;
+pub mod sleep_tool;
+pub mod task_tools;
 pub mod tool_builder;
 pub mod tool_search;
 pub mod training_tool;
-pub mod send_message;
-pub mod sleep_tool;
-pub mod task_tools;
+pub mod uiux;
+pub mod utility_ext;
+pub mod version_mgmt;
 pub mod web_fetch;
 pub mod web_search;
 pub mod worktree;
-pub mod version_mgmt;
-pub mod utility_ext;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -397,5 +397,9 @@ pub fn truncate_output(output: &str, max_chars: usize) -> String {
     while end > 0 && !output.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}...\n[truncated — {} total chars]", &output[..end], output.len())
+    format!(
+        "{}...\n[truncated — {} total chars]",
+        &output[..end],
+        output.len()
+    )
 }

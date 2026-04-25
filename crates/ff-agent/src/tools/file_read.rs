@@ -45,15 +45,9 @@ impl AgentTool for FileReadTool {
             _ => return AgentToolResult::err("Missing or empty 'file_path' parameter"),
         };
 
-        let offset = input
-            .get("offset")
-            .and_then(Value::as_u64)
-            .unwrap_or(0) as usize;
+        let offset = input.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
 
-        let limit = input
-            .get("limit")
-            .and_then(Value::as_u64)
-            .unwrap_or(2000) as usize;
+        let limit = input.get("limit").and_then(Value::as_u64).unwrap_or(2000) as usize;
 
         let path = resolve_path(file_path, &ctx.working_dir);
 
@@ -64,7 +58,7 @@ impl AgentTool for FileReadTool {
                 return AgentToolResult::err(format!(
                     "File does not exist or cannot be accessed: {}\nError: {e}",
                     path.display()
-                ))
+                ));
             }
         };
 
@@ -92,10 +86,7 @@ impl AgentTool for FileReadTool {
         let content = match fs::read_to_string(&path).await {
             Ok(c) => c,
             Err(e) => {
-                return AgentToolResult::err(format!(
-                    "Failed to read {}: {e}",
-                    path.display()
-                ))
+                return AgentToolResult::err(format!("Failed to read {}: {e}", path.display()));
             }
         };
 
@@ -141,11 +132,39 @@ fn resolve_path(file_path: &str, working_dir: &std::path::Path) -> std::path::Pa
 fn is_binary_extension(ext: &str) -> bool {
     matches!(
         ext,
-        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "ico" | "webp" | "svg"
-            | "mp3" | "mp4" | "avi" | "mov" | "wav" | "flac"
-            | "zip" | "tar" | "gz" | "bz2" | "xz" | "7z" | "rar"
-            | "exe" | "dll" | "so" | "dylib" | "o" | "a"
-            | "wasm" | "class" | "pyc" | "pyo"
-            | "db" | "sqlite" | "sqlite3"
+        "png"
+            | "jpg"
+            | "jpeg"
+            | "gif"
+            | "bmp"
+            | "ico"
+            | "webp"
+            | "svg"
+            | "mp3"
+            | "mp4"
+            | "avi"
+            | "mov"
+            | "wav"
+            | "flac"
+            | "zip"
+            | "tar"
+            | "gz"
+            | "bz2"
+            | "xz"
+            | "7z"
+            | "rar"
+            | "exe"
+            | "dll"
+            | "so"
+            | "dylib"
+            | "o"
+            | "a"
+            | "wasm"
+            | "class"
+            | "pyc"
+            | "pyo"
+            | "db"
+            | "sqlite"
+            | "sqlite3"
     )
 }

@@ -58,7 +58,14 @@ pub async fn sweep_stale(
                 elapsed.num_minutes() % 60
             );
             if let Err(e) = ff_db::pg_update_job_progress(
-                pool, &j.id, Some("failed"), None, None, None, None, Some(&err),
+                pool,
+                &j.id,
+                Some("failed"),
+                None,
+                None,
+                None,
+                None,
+                Some(&err),
             )
             .await
             {
@@ -88,7 +95,11 @@ pub async fn sweep_stale(
         let attempts: i32 = row.get("attempts");
         let max_attempts: i32 = row.get("max_attempts");
         let error_msg = "worker died mid-run (sweeper recovery)";
-        let new_status = if attempts >= max_attempts { "failed" } else { "pending" };
+        let new_status = if attempts >= max_attempts {
+            "failed"
+        } else {
+            "pending"
+        };
         let update = sqlx::query(
             "UPDATE deferred_tasks
                 SET status = $1,

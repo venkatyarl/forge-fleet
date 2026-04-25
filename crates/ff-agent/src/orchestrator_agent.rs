@@ -9,7 +9,6 @@
 //!
 //! This is what makes ForgeFleet work like Claude Code but distributed.
 
-
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
@@ -229,113 +228,176 @@ pub fn analyze_task(prompt: &str) -> TaskType {
     let words: Vec<&str> = lower.split_whitespace().collect();
 
     // ---- Multi-node patterns (highest priority) ----
-    if lower.contains("all computers") || lower.contains("all nodes")
-        || lower.contains("every node") || lower.contains("each computer")
-        || lower.contains("entire fleet") || lower.contains("all of them")
-        || lower.contains("each of them") || lower.contains("across all")
-        || lower.contains("on every machine") || lower.contains("cluster-wide")
+    if lower.contains("all computers")
+        || lower.contains("all nodes")
+        || lower.contains("every node")
+        || lower.contains("each computer")
+        || lower.contains("entire fleet")
+        || lower.contains("all of them")
+        || lower.contains("each of them")
+        || lower.contains("across all")
+        || lower.contains("on every machine")
+        || lower.contains("cluster-wide")
     {
         return TaskType::MultiNode;
     }
 
     // ---- Fleet operations ----
-    if lower.contains("ssh") || lower.contains("deploy") || lower.contains("restart service")
-        || lower.contains("install on") || lower.contains("update all")
-        || lower.contains("fleet status") || lower.contains("node status")
-        || lower.contains("systemctl") || lower.contains("ansible")
-        || lower.contains("rolling update") || lower.contains("health check")
-        || (lower.contains("fleet") && has_any(&words, &["manage", "configure", "monitor", "check"]))
+    if lower.contains("ssh")
+        || lower.contains("deploy")
+        || lower.contains("restart service")
+        || lower.contains("install on")
+        || lower.contains("update all")
+        || lower.contains("fleet status")
+        || lower.contains("node status")
+        || lower.contains("systemctl")
+        || lower.contains("ansible")
+        || lower.contains("rolling update")
+        || lower.contains("health check")
+        || (lower.contains("fleet")
+            && has_any(&words, &["manage", "configure", "monitor", "check"]))
         || (lower.contains("node") && has_any(&words, &["restart", "stop", "start", "drain"]))
     {
         return TaskType::FleetOp;
     }
 
     // ---- Debugging / troubleshooting ----
-    if lower.contains("debug") || lower.contains("troubleshoot")
-        || lower.contains("not working") || lower.contains("doesn't work")
-        || lower.contains("broken") || lower.contains("investigate")
-        || lower.contains("why is") || lower.contains("stack trace")
-        || lower.contains("segfault") || lower.contains("panic at")
-        || lower.contains("core dump") || lower.contains("error log")
-        || (lower.contains("fix") && has_any(&words, &["bug", "error", "crash", "issue", "failure"]))
+    if lower.contains("debug")
+        || lower.contains("troubleshoot")
+        || lower.contains("not working")
+        || lower.contains("doesn't work")
+        || lower.contains("broken")
+        || lower.contains("investigate")
+        || lower.contains("why is")
+        || lower.contains("stack trace")
+        || lower.contains("segfault")
+        || lower.contains("panic at")
+        || lower.contains("core dump")
+        || lower.contains("error log")
+        || (lower.contains("fix")
+            && has_any(&words, &["bug", "error", "crash", "issue", "failure"]))
     {
         return TaskType::Debugging;
     }
 
     // ---- Testing ----
-    if lower.contains("write test") || lower.contains("add test")
-        || lower.contains("unit test") || lower.contains("integration test")
-        || lower.contains("run test") || lower.contains("test coverage")
-        || lower.contains("cargo test") || lower.contains("pytest")
-        || lower.contains("jest") || lower.contains("benchmark")
+    if lower.contains("write test")
+        || lower.contains("add test")
+        || lower.contains("unit test")
+        || lower.contains("integration test")
+        || lower.contains("run test")
+        || lower.contains("test coverage")
+        || lower.contains("cargo test")
+        || lower.contains("pytest")
+        || lower.contains("jest")
+        || lower.contains("benchmark")
         || (lower.contains("test") && has_any(&words, &["create", "write", "add", "run", "fix"]))
     {
         return TaskType::Testing;
     }
 
     // ---- Architecture / design ----
-    if lower.contains("architect") || lower.contains("design pattern")
-        || lower.contains("system design") || lower.contains("data model")
-        || lower.contains("schema design") || lower.contains("api design")
-        || lower.contains("trade-off") || lower.contains("tradeoff")
-        || lower.contains("migration strategy") || lower.contains("scaling")
-        || lower.contains("microservice") || lower.contains("monolith")
+    if lower.contains("architect")
+        || lower.contains("design pattern")
+        || lower.contains("system design")
+        || lower.contains("data model")
+        || lower.contains("schema design")
+        || lower.contains("api design")
+        || lower.contains("trade-off")
+        || lower.contains("tradeoff")
+        || lower.contains("migration strategy")
+        || lower.contains("scaling")
+        || lower.contains("microservice")
+        || lower.contains("monolith")
         || (lower.contains("design") && has_any(&words, &["system", "api", "database", "service"]))
     {
         return TaskType::Architecture;
     }
 
     // ---- Code writing ----
-    if lower.contains("write") || lower.contains("create") || lower.contains("implement")
-        || lower.contains("add a") || lower.contains("build") || lower.contains("fix the")
-        || lower.contains("refactor") || lower.contains("function")
-        || lower.contains("component") || lower.contains("endpoint")
-        || lower.contains("handler") || lower.contains("struct")
-        || lower.contains("module") || lower.contains("class")
-        || lower.contains("add support for") || lower.contains("port to")
-        || lower.contains("convert to") || lower.contains("migrate")
-        || lower.contains("scaffold") || lower.contains("boilerplate")
-        || lower.contains("impl ") || lower.contains("fn ")
+    if lower.contains("write")
+        || lower.contains("create")
+        || lower.contains("implement")
+        || lower.contains("add a")
+        || lower.contains("build")
+        || lower.contains("fix the")
+        || lower.contains("refactor")
+        || lower.contains("function")
+        || lower.contains("component")
+        || lower.contains("endpoint")
+        || lower.contains("handler")
+        || lower.contains("struct")
+        || lower.contains("module")
+        || lower.contains("class")
+        || lower.contains("add support for")
+        || lower.contains("port to")
+        || lower.contains("convert to")
+        || lower.contains("migrate")
+        || lower.contains("scaffold")
+        || lower.contains("boilerplate")
+        || lower.contains("impl ")
+        || lower.contains("fn ")
     {
         return TaskType::CodeWriting;
     }
 
     // ---- Code review ----
-    if lower.contains("review") || lower.contains("check the code")
-        || lower.contains("analyze") || lower.contains("audit")
-        || lower.contains("security") || lower.contains("code quality")
-        || lower.contains("lint") || lower.contains("smell")
-        || lower.contains("best practice") || lower.contains("pr review")
-        || lower.contains("pull request") || lower.contains("diff")
-        || lower.contains("vulnerability") || lower.contains("cve")
+    if lower.contains("review")
+        || lower.contains("check the code")
+        || lower.contains("analyze")
+        || lower.contains("audit")
+        || lower.contains("security")
+        || lower.contains("code quality")
+        || lower.contains("lint")
+        || lower.contains("smell")
+        || lower.contains("best practice")
+        || lower.contains("pr review")
+        || lower.contains("pull request")
+        || lower.contains("diff")
+        || lower.contains("vulnerability")
+        || lower.contains("cve")
     {
         return TaskType::CodeReview;
     }
 
     // ---- Documentation ----
-    if lower.contains("document") || lower.contains("readme")
-        || lower.contains("docstring") || lower.contains("rustdoc")
-        || lower.contains("jsdoc") || lower.contains("api doc")
-        || lower.contains("write docs") || lower.contains("add comments")
-        || lower.contains("changelog") || lower.contains("explain the code")
+    if lower.contains("document")
+        || lower.contains("readme")
+        || lower.contains("docstring")
+        || lower.contains("rustdoc")
+        || lower.contains("jsdoc")
+        || lower.contains("api doc")
+        || lower.contains("write docs")
+        || lower.contains("add comments")
+        || lower.contains("changelog")
+        || lower.contains("explain the code")
     {
         return TaskType::Documentation;
     }
 
     // ---- Research ----
-    if lower.contains("research") || lower.contains("find out")
-        || lower.contains("what is") || lower.contains("compare")
-        || lower.contains("how does") || lower.contains("search for")
-        || lower.contains("benchmark") || lower.contains("evaluate")
-        || lower.contains("pros and cons") || lower.contains("alternative")
-        || lower.contains("state of the art") || lower.contains("best library for")
+    if lower.contains("research")
+        || lower.contains("find out")
+        || lower.contains("what is")
+        || lower.contains("compare")
+        || lower.contains("how does")
+        || lower.contains("search for")
+        || lower.contains("benchmark")
+        || lower.contains("evaluate")
+        || lower.contains("pros and cons")
+        || lower.contains("alternative")
+        || lower.contains("state of the art")
+        || lower.contains("best library for")
     {
         return TaskType::Research;
     }
 
     // ---- Complex patterns ----
     if (lower.contains(" and ") && lower.contains(" then "))
-        || lower.split(|c: char| c == '.' || c == ';' || c == ',').count() > 3
+        || lower
+            .split(|c: char| c == '.' || c == ';' || c == ',')
+            .count()
+            > 3
         || lower.len() > 300
         || words.len() > 50
     {
@@ -357,22 +419,28 @@ pub async fn select_nodes(task_type: TaskType) -> Vec<NodeCapability> {
     match task_type {
         TaskType::SimpleQuestion | TaskType::Documentation => {
             // Fastest model available
-            fleet.into_iter()
+            fleet
+                .into_iter()
                 .filter(|n| n.strengths.contains(&Strength::FastResponse))
                 .take(1)
                 .collect()
         }
         TaskType::CodeWriting | TaskType::Testing => {
             // Best coding model
-            fleet.into_iter()
+            fleet
+                .into_iter()
                 .filter(|n| n.strengths.contains(&Strength::Coding))
                 .take(1)
                 .collect()
         }
         TaskType::CodeReview => {
             // Largest model for thorough review
-            let mut nodes: Vec<_> = fleet.into_iter()
-                .filter(|n| n.strengths.contains(&Strength::Review) || n.strengths.contains(&Strength::Reasoning))
+            let mut nodes: Vec<_> = fleet
+                .into_iter()
+                .filter(|n| {
+                    n.strengths.contains(&Strength::Review)
+                        || n.strengths.contains(&Strength::Reasoning)
+                })
                 .collect();
             nodes.sort_by(|a, b| b.model_params.cmp(&a.model_params));
             nodes.into_iter().take(1).collect()
@@ -389,7 +457,8 @@ pub async fn select_nodes(task_type: TaskType) -> Vec<NodeCapability> {
                     rows.into_iter().next().map(|r| r.name)
                 });
             if let Some(lname) = leader_name {
-                fleet.into_iter()
+                fleet
+                    .into_iter()
                     .filter(|n| n.name == lname || n.name.starts_with(&format!("{lname}-")))
                     .take(1)
                     .collect()
@@ -399,29 +468,36 @@ pub async fn select_nodes(task_type: TaskType) -> Vec<NodeCapability> {
         }
         TaskType::Research | TaskType::Architecture => {
             // Best reasoning model
-            fleet.into_iter()
+            fleet
+                .into_iter()
                 .filter(|n| n.strengths.contains(&Strength::Reasoning))
                 .take(1)
                 .collect()
         }
         TaskType::Debugging => {
             // Debugging benefits from larger models — prefer reasoning + coding
-            let mut nodes: Vec<_> = fleet.into_iter()
-                .filter(|n| n.strengths.contains(&Strength::Coding) || n.strengths.contains(&Strength::Reasoning))
+            let mut nodes: Vec<_> = fleet
+                .into_iter()
+                .filter(|n| {
+                    n.strengths.contains(&Strength::Coding)
+                        || n.strengths.contains(&Strength::Reasoning)
+                })
                 .collect();
             nodes.sort_by(|a, b| b.model_params.cmp(&a.model_params));
             nodes.into_iter().take(1).collect()
         }
         TaskType::Complex => {
             // Break into subtasks — orchestrator picks
-            fleet.into_iter()
+            fleet
+                .into_iter()
                 .filter(|n| n.strengths.contains(&Strength::Reasoning))
                 .take(1)
                 .collect()
         }
         TaskType::MultiNode => {
             // All coding nodes for parallel work
-            fleet.into_iter()
+            fleet
+                .into_iter()
                 .filter(|n| n.strengths.contains(&Strength::Coding))
                 .collect()
         }
@@ -453,10 +529,7 @@ pub struct NodeResult {
 
 /// Run a task through the orchestrator.
 /// Analyzes the task, selects nodes, dispatches, collects results.
-pub async fn orchestrate(
-    prompt: &str,
-    working_dir: &std::path::Path,
-) -> OrchestratedResult {
+pub async fn orchestrate(prompt: &str, working_dir: &std::path::Path) -> OrchestratedResult {
     let start = std::time::Instant::now();
     let task_type = analyze_task(prompt);
     let nodes = select_nodes(task_type).await;
@@ -580,8 +653,16 @@ async fn run_parallel(
     let synthesis = if successful.is_empty() {
         "All nodes failed.".into()
     } else {
-        successful.iter()
-            .map(|r| format!("**{}** ({}): {}", r.node, r.model, &r.output[..r.output.len().min(500)]))
+        successful
+            .iter()
+            .map(|r| {
+                format!(
+                    "**{}** ({}): {}",
+                    r.node,
+                    r.model,
+                    &r.output[..r.output.len().min(500)]
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n\n")
     };
@@ -619,10 +700,16 @@ pub struct ToolCallExample {
 
 /// Save a training example for future fine-tuning.
 pub async fn save_training_example(example: &TrainingExample) {
-    let dir = dirs::home_dir().unwrap_or_default().join(".forgefleet").join("training_data");
+    let dir = dirs::home_dir()
+        .unwrap_or_default()
+        .join(".forgefleet")
+        .join("training_data");
     let _ = tokio::fs::create_dir_all(&dir).await;
 
-    let file = dir.join(format!("{}.json", chrono::Utc::now().format("%Y%m%d_%H%M%S")));
+    let file = dir.join(format!(
+        "{}.json",
+        chrono::Utc::now().format("%Y%m%d_%H%M%S")
+    ));
     if let Ok(json) = serde_json::to_string_pretty(example) {
         let _ = tokio::fs::write(&file, json).await;
     }
@@ -630,7 +717,10 @@ pub async fn save_training_example(example: &TrainingExample) {
 
 /// Count available training examples.
 pub async fn training_data_count() -> usize {
-    let dir = dirs::home_dir().unwrap_or_default().join(".forgefleet").join("training_data");
+    let dir = dirs::home_dir()
+        .unwrap_or_default()
+        .join(".forgefleet")
+        .join("training_data");
     let mut count = 0;
     if let Ok(mut entries) = tokio::fs::read_dir(&dir).await {
         while let Ok(Some(_)) = entries.next_entry().await {

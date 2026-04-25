@@ -60,8 +60,7 @@ impl PeerMap {
             last_beat_at: beat.timestamp,
             epoch: beat.epoch,
             role_claimed: beat.role_claimed.clone(),
-            is_healthy: !beat.going_offline
-                && Self::is_fresh(beat.timestamp, Utc::now(), 45),
+            is_healthy: !beat.going_offline && Self::is_fresh(beat.timestamp, Utc::now(), 45),
             all_ips,
             going_offline: beat.going_offline,
         };
@@ -125,8 +124,7 @@ impl PeerMap {
             .map(|g| {
                 g.values()
                     .filter(|e| {
-                        e.going_offline
-                            || !Self::is_fresh(e.last_beat_at, now, threshold_seconds)
+                        e.going_offline || !Self::is_fresh(e.last_beat_at, now, threshold_seconds)
                     })
                     .map(|e| e.computer_name.clone())
                     .collect()

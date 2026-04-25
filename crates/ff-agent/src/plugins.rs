@@ -116,14 +116,15 @@ impl PluginRegistry {
     async fn load_plugin(&self, dir: &Path, manifest_path: &Path) -> anyhow::Result<LoadedPlugin> {
         let content = fs::read_to_string(manifest_path).await?;
 
-        let manifest: PluginManifest = if manifest_path.extension().and_then(|e| e.to_str()) == Some("toml") {
-            toml::from_str(&content)?
-        } else if manifest_path.extension().and_then(|e| e.to_str()) == Some("json") {
-            serde_json::from_str(&content)?
-        } else {
-            // Parse SKILL.md format
-            parse_skill_md(&content, dir)?
-        };
+        let manifest: PluginManifest =
+            if manifest_path.extension().and_then(|e| e.to_str()) == Some("toml") {
+                toml::from_str(&content)?
+            } else if manifest_path.extension().and_then(|e| e.to_str()) == Some("json") {
+                serde_json::from_str(&content)?
+            } else {
+                // Parse SKILL.md format
+                parse_skill_md(&content, dir)?
+            };
 
         Ok(LoadedPlugin {
             manifest,
@@ -199,7 +200,11 @@ pub struct PluginInfo {
 
 /// Parse a SKILL.md format manifest.
 fn parse_skill_md(content: &str, dir: &Path) -> anyhow::Result<PluginManifest> {
-    let mut name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
+    let mut name = dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown")
+        .to_string();
     let mut description = String::new();
     let tools = Vec::new();
 

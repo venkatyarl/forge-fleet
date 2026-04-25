@@ -136,7 +136,10 @@ impl PulseClient {
         let channel = format!("{}:events", self.prefix);
         let json = serde_json::to_string(event)?;
         self.conn.publish::<_, _, ()>(&channel, &json).await?;
-        debug!("Published event {:?} for node '{}'", event.event_type, event.node_name);
+        debug!(
+            "Published event {:?} for node '{}'",
+            event.event_type, event.node_name
+        );
         Ok(())
     }
 }

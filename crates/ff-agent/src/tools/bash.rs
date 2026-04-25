@@ -139,17 +139,18 @@ impl AgentTool for BashTool {
 }
 
 async fn run_shell(script: &str) -> anyhow::Result<(i32, String, String)> {
-    let output = Command::new("bash")
-        .arg("-c")
-        .arg(script)
-        .output()
-        .await?;
+    let output = Command::new("bash").arg("-c").arg(script).output().await?;
 
     let exit_code = output.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
-    debug!(exit_code, stdout_len = stdout.len(), stderr_len = stderr.len(), "bash execution complete");
+    debug!(
+        exit_code,
+        stdout_len = stdout.len(),
+        stderr_len = stderr.len(),
+        "bash execution complete"
+    );
 
     Ok((exit_code, stdout, stderr))
 }
@@ -199,14 +200,35 @@ fn is_interactive_command(command: &str) -> bool {
     let trimmed = command.trim();
 
     // Bare SSH without a command (already handled by rewrite, but catch edge cases)
-    if trimmed == "ssh" { return true; }
+    if trimmed == "ssh" {
+        return true;
+    }
 
     // Interactive interpreters without -c flag
     let interactive = [
-        "python3", "python", "node", "irb", "ghci", "lua",
-        "mysql", "psql", "sqlite3", "redis-cli", "mongo",
-        "vim", "vi", "nano", "emacs", "less", "more", "top", "htop",
-        "bash", "zsh", "sh", "fish",
+        "python3",
+        "python",
+        "node",
+        "irb",
+        "ghci",
+        "lua",
+        "mysql",
+        "psql",
+        "sqlite3",
+        "redis-cli",
+        "mongo",
+        "vim",
+        "vi",
+        "nano",
+        "emacs",
+        "less",
+        "more",
+        "top",
+        "htop",
+        "bash",
+        "zsh",
+        "sh",
+        "fish",
     ];
 
     // Only block if it's the bare command with no arguments

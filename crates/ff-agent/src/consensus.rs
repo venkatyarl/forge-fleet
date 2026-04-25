@@ -44,10 +44,7 @@ pub struct SolutionResult {
 }
 
 /// Run consensus coding: N agents solve the same problem, pick the best.
-pub async fn run_consensus(
-    prompt: &str,
-    config: &ConsensusConfig,
-) -> ConsensusResult {
+pub async fn run_consensus(prompt: &str, config: &ConsensusConfig) -> ConsensusResult {
     info!(agents = config.agent_count, "starting consensus coding");
 
     let mut handles = Vec::new();
@@ -119,29 +116,39 @@ pub async fn run_consensus(
                     .output()
                     .await;
 
-                solution.tests_passed = Some(
-                    test_output.map(|o| o.status.success()).unwrap_or(false)
-                );
+                solution.tests_passed =
+                    Some(test_output.map(|o| o.status.success()).unwrap_or(false));
             }
         }
     }
 
     // Pick winner: first passing solution, or first completed
-    let winner = solutions.iter()
+    let winner = solutions
+        .iter()
         .position(|s| s.tests_passed == Some(true))
         .or_else(|| solutions.iter().position(|s| s.status == "completed"));
 
     let winner_reason = match winner {
         Some(i) if solutions[i].tests_passed == Some(true) => {
-            format!("Agent {} — tests passed in {}ms", i, solutions[i].duration_ms)
+            format!(
+                "Agent {} — tests passed in {}ms",
+                i, solutions[i].duration_ms
+            )
         }
         Some(i) => {
-            format!("Agent {} — completed first in {}ms (no test validation)", i, solutions[i].duration_ms)
+            format!(
+                "Agent {} — completed first in {}ms (no test validation)",
+                i, solutions[i].duration_ms
+            )
         }
         None => "No agent completed successfully".into(),
     };
 
     info!(winner = ?winner, reason = %winner_reason, "consensus coding complete");
 
-    ConsensusResult { solutions, winner, winner_reason }
+    ConsensusResult {
+        solutions,
+        winner,
+        winner_reason,
+    }
 }

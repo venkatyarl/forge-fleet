@@ -52,8 +52,8 @@
 //!     .with_on_lost_leader(on_lost);
 //! ```
 
-use std::process::{Command, Stdio};
 use std::io::Write;
+use std::process::{Command, Stdio};
 
 use sqlx::PgPool;
 use thiserror::Error;
@@ -107,12 +107,11 @@ impl OpenClawManager {
         info!("openclaw: promoting local to gateway mode");
 
         // Check current mode via DB — idempotent guard.
-        let row: Option<(String,)> = sqlx::query_as(
-            "SELECT mode FROM openclaw_installations WHERE computer_id = $1",
-        )
-        .bind(self.my_computer_id)
-        .fetch_optional(&self.pg)
-        .await?;
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT mode FROM openclaw_installations WHERE computer_id = $1")
+                .bind(self.my_computer_id)
+                .fetch_optional(&self.pg)
+                .await?;
 
         if row.as_ref().map(|r| r.0.as_str()) == Some("gateway") {
             info!("openclaw: already gateway, no-op");
@@ -132,13 +131,12 @@ impl OpenClawManager {
         // state. Best-effort — all failures logged, never propagated.
         if let Some(old) = previous_leader {
             if !old.is_empty() {
-                let my_name: String = sqlx::query_scalar(
-                    "SELECT name FROM computers WHERE id = $1",
-                )
-                .bind(self.my_computer_id)
-                .fetch_optional(&self.pg)
-                .await?
-                .unwrap_or_default();
+                let my_name: String =
+                    sqlx::query_scalar("SELECT name FROM computers WHERE id = $1")
+                        .bind(self.my_computer_id)
+                        .fetch_optional(&self.pg)
+                        .await?
+                        .unwrap_or_default();
                 if old != my_name {
                     let _ = migrate_devices_from(&self.pg, old, &my_name).await;
                 }
@@ -183,15 +181,10 @@ impl OpenClawManager {
             .output()?;
         if !output.status.success() {
             let err = String::from_utf8_lossy(&output.stderr).to_string();
-            return Err(OpenClawError::Cli(format!(
-                "devices export failed: {err}"
-            )));
+            return Err(OpenClawError::Cli(format!("devices export failed: {err}")));
         }
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        info!(
-            bytes = stdout.len(),
-            "openclaw: exported paired devices"
-        );
+        info!(bytes = stdout.len(), "openclaw: exported paired devices");
         Ok(stdout)
     }
 
@@ -205,10 +198,7 @@ impl OpenClawManager {
     /// Called on `on_became_leader` after reading the export from
     /// `fleet_secrets`. If `json_export` is empty/whitespace, this is a
     /// no-op returning `Ok(0)` rather than an error.
-    pub async fn import_devices(
-        &self,
-        json_export: &str,
-    ) -> Result<usize, OpenClawError> {
+    pub async fn import_devices(&self, json_export: &str) -> Result<usize, OpenClawError> {
         if json_export.trim().is_empty() {
             info!("openclaw: device export is empty — nothing to import");
             return Ok(0);
@@ -233,9 +223,7 @@ impl OpenClawManager {
         let output = child.wait_with_output()?;
         if !output.status.success() {
             let err = String::from_utf8_lossy(&output.stderr).to_string();
-            return Err(OpenClawError::Cli(format!(
-                "devices import failed: {err}"
-            )));
+            return Err(OpenClawError::Cli(format!("devices import failed: {err}")));
         }
 
         // Best-effort parse: OpenClaw is expected to print a line like
@@ -295,11 +283,10 @@ impl OpenClawManager {
     /// DB row matches the desired mode, so calling this every minute is
     /// cheap.
     pub async fn reconcile_role(&self) -> Result<(), OpenClawError> {
-        let leader: Option<(uuid::Uuid, String)> = sqlx::query_as(
-            "SELECT computer_id, member_name FROM fleet_leader_state LIMIT 1",
-        )
-        .fetch_optional(&self.pg)
-        .await?;
+        let leader: Option<(uuid::Uuid, String)> =
+            sqlx::query_as("SELECT computer_id, member_name FROM fleet_leader_state LIMIT 1")
+                .fetch_optional(&self.pg)
+                .await?;
 
         match leader {
             None => {
@@ -310,12 +297,11 @@ impl OpenClawManager {
                 self.promote_to_gateway(None).await
             }
             Some((_, leader_name)) => {
-                let url: Option<(String,)> = sqlx::query_as(
-                    "SELECT primary_ip FROM computers WHERE name = $1",
-                )
-                .bind(&leader_name)
-                .fetch_optional(&self.pg)
-                .await?;
+                let url: Option<(String,)> =
+                    sqlx::query_as("SELECT primary_ip FROM computers WHERE name = $1")
+                        .bind(&leader_name)
+                        .fetch_optional(&self.pg)
+                        .await?;
                 let Some((leader_ip,)) = url else {
                     tracing::warn!(
                         leader = %leader_name,
@@ -378,15 +364,11 @@ pub async fn lookup_gateway_url(pool: &PgPool) -> Result<Option<String>, sqlx::E
 /// or the old leader crashed before exporting). The new leader reads this
 /// during `on_became_leader`; if present, it `import_devices(…)` and then
 /// clears the secret via `clear_device_pairings_export`.
-pub async fn lookup_device_pairings_export(
-    pool: &PgPool,
-) -> Result<Option<String>, sqlx::Error> {
-    let row: Option<(String,)> = sqlx::query_as(
-        "SELECT value FROM fleet_secrets WHERE key = $1",
-    )
-    .bind(DEVICE_PAIRINGS_SECRET_KEY)
-    .fetch_optional(pool)
-    .await?;
+pub async fn lookup_device_pairings_export(pool: &PgPool) -> Result<Option<String>, sqlx::Error> {
+    let row: Option<(String,)> = sqlx::query_as("SELECT value FROM fleet_secrets WHERE key = $1")
+        .bind(DEVICE_PAIRINGS_SECRET_KEY)
+        .fetch_optional(pool)
+        .await?;
     Ok(row.map(|r| r.0))
 }
 
@@ -439,7 +421,9 @@ fn restart_openclaw_service() -> Result<(), OpenClawError> {
                 .map(|s| s.success())
                 .unwrap_or(false);
             if !system_ok {
-                warn!("openclaw: systemctl restart failed in both --user and system scope; continuing");
+                warn!(
+                    "openclaw: systemctl restart failed in both --user and system scope; continuing"
+                );
             }
         }
     }
@@ -458,7 +442,9 @@ fn current_uid() -> Option<String> {
             }
         }
     }
-    std::env::var("UID").ok().or_else(|| std::env::var("SUDO_UID").ok())
+    std::env::var("UID")
+        .ok()
+        .or_else(|| std::env::var("SUDO_UID").ok())
 }
 
 /// Best-effort: rsync the previous gateway's `~/.openclaw/data/devices.json`
@@ -473,20 +459,19 @@ async fn migrate_devices_from(
 ) -> anyhow::Result<usize> {
     // 1) Look up old leader's ssh_user + ip. Prefer `computers`; fall
     //    back to `fleet_nodes` (legacy terminology still carries data).
-    let found: Option<(String, String)> = sqlx::query_as(
-        "SELECT ssh_user, primary_ip FROM computers WHERE name = $1",
-    )
-    .bind(old_leader)
-    .fetch_optional(pool)
-    .await
-    .unwrap_or(None)
-    .or(sqlx::query_as::<_, (String, String)>(
-        "SELECT ssh_user, ip FROM fleet_nodes WHERE name = $1",
-    )
-    .bind(old_leader)
-    .fetch_optional(pool)
-    .await
-    .unwrap_or(None));
+    let found: Option<(String, String)> =
+        sqlx::query_as("SELECT ssh_user, primary_ip FROM computers WHERE name = $1")
+            .bind(old_leader)
+            .fetch_optional(pool)
+            .await
+            .unwrap_or(None)
+            .or(sqlx::query_as::<_, (String, String)>(
+                "SELECT ssh_user, ip FROM fleet_nodes WHERE name = $1",
+            )
+            .bind(old_leader)
+            .fetch_optional(pool)
+            .await
+            .unwrap_or(None));
     let (ssh_user, ip) = match found {
         Some(x) => x,
         None => {
@@ -499,9 +484,12 @@ async fn migrate_devices_from(
     let dest = format!("{ssh_user}@{ip}");
     let out = Command::new("ssh")
         .args([
-            "-o", "ConnectTimeout=8",
-            "-o", "BatchMode=yes",
-            "-o", "StrictHostKeyChecking=accept-new",
+            "-o",
+            "ConnectTimeout=8",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
             &dest,
             "cat ~/.openclaw/data/devices.json 2>/dev/null",
         ])

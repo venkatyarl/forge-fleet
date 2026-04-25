@@ -14,16 +14,13 @@ use chrono::Utc;
 use tracing::debug;
 use uuid::Uuid;
 
-use crate::beat_v2::{
-    AvailableModel, ClusterInfo, LlmMemoryUsage, LlmServer, LlmServerModel,
-};
+use crate::beat_v2::{AvailableModel, ClusterInfo, LlmMemoryUsage, LlmServer, LlmServerModel};
 
 /// Ports on which ForgeFleet conventionally runs LLM inference servers,
 /// plus the well-known Ollama port.
 const LLM_SCAN_PORTS: &[u16] = &[
-    51001, 51003, 51004, 51005, 51006, 51007, 51008, 51009, 51010,
-    55000, 55001, 55002, 55003, 55004, 55005, 55006, 55007, 55008, 55009, 55010,
-    11434, // ollama
+    51001, 51003, 51004, 51005, 51006, 51007, 51008, 51009, 51010, 55000, 55001, 55002, 55003,
+    55004, 55005, 55006, 55007, 55008, 55009, 55010, 11434, // ollama
 ];
 
 /// Ports that belong to ForgeFleet infrastructure, NOT LLM servers.
@@ -102,7 +99,8 @@ impl LlmProbe {
                 match client.get(&tags_url).send().await {
                     Ok(r) if r.status().is_success() => {
                         let body_txt = r.text().await.unwrap_or_default();
-                        let parsed: Option<serde_json::Value> = serde_json::from_str(&body_txt).ok();
+                        let parsed: Option<serde_json::Value> =
+                            serde_json::from_str(&body_txt).ok();
                         let models_arr = parsed
                             .as_ref()
                             .and_then(|v| v.get("models"))
@@ -137,11 +135,7 @@ impl LlmProbe {
                 metrics_runtime_hint,
             );
 
-            let display_name = model_id
-                .rsplit('/')
-                .next()
-                .unwrap_or(&model_id)
-                .to_string();
+            let display_name = model_id.rsplit('/').next().unwrap_or(&model_id).to_string();
 
             // If we got this far, the server advertised at least one model → active.
             let status = "active";
@@ -211,7 +205,8 @@ impl LlmProbe {
                     if ext == "gguf" {
                         let size_gb = file_size_bytes(&path) as f64 / 1_073_741_824.0;
                         let id = model_id_from_name(
-                            &path.file_stem()
+                            &path
+                                .file_stem()
                                 .and_then(|s| s.to_str())
                                 .unwrap_or("unknown")
                                 .to_string(),
@@ -293,14 +288,12 @@ fn identify_runtime(
     // serves model ids under `mlx-community/...` or local paths ending in
     // `-mlx` / `-4bit`. Any one of these signatures is sufficient.
     let is_mac = std::env::consts::OS == "macos";
-    let header_is_python_basehttp =
-        server_lc.contains("basehttp") && server_lc.contains("python");
+    let header_is_python_basehttp = server_lc.contains("basehttp") && server_lc.contains("python");
     let model_looks_mlx = model_id.contains("mlx-community/")
         || model_id.contains("-mlx")
         || model_id.contains("-4bit");
-    let body_looks_mlx = body.contains("mlx-community/")
-        || body.contains("-mlx\"")
-        || body.contains("-4bit\"");
+    let body_looks_mlx =
+        body.contains("mlx-community/") || body.contains("-mlx\"") || body.contains("-4bit\"");
     if header_is_python_basehttp || model_looks_mlx || body_looks_mlx {
         return "mlx_lm";
     }
@@ -333,10 +326,7 @@ fn extract_loaded_path(body: &str) -> Option<String> {
     }
 }
 
-async fn fetch_metrics(
-    client: &reqwest::Client,
-    port: u16,
-) -> (f64, i32, Option<&'static str>) {
+async fn fetch_metrics(client: &reqwest::Client, port: u16) -> (f64, i32, Option<&'static str>) {
     let url = format!("http://127.0.0.1:{port}/metrics");
     let body = match client.get(&url).send().await {
         Ok(r) if r.status().is_success() => r.text().await.unwrap_or_default(),
@@ -383,9 +373,7 @@ async fn fetch_metrics(
             | "tokens_per_second" => {
                 tokens_per_sec = value;
             }
-            "llamacpp:requests_deferred"
-            | "vllm:num_requests_waiting"
-            | "queue_depth" => {
+            "llamacpp:requests_deferred" | "vllm:num_requests_waiting" | "queue_depth" => {
                 queue_depth = value as i32;
             }
             _ => {}
@@ -448,7 +436,10 @@ mod tests {
     #[test]
     fn runtime_identification_fallbacks() {
         assert_eq!(identify_runtime(11434, "", "", "", None), "ollama");
-        assert_eq!(identify_runtime(55000, "foo.gguf", "", "", None), "llama.cpp");
+        assert_eq!(
+            identify_runtime(55000, "foo.gguf", "", "", None),
+            "llama.cpp"
+        );
         // On Linux, a bare JSON body with no distinguishing signals falls
         // through to "unknown"; on macOS the last-resort branch returns
         // "mlx_lm". We assert the OS-appropriate expectation.
@@ -465,7 +456,13 @@ mod tests {
         );
         // MLX detection via model id:
         assert_eq!(
-            identify_runtime(55000, "{}", "", "mlx-community/Qwen2.5-Coder-32B-4bit", None),
+            identify_runtime(
+                55000,
+                "{}",
+                "",
+                "mlx-community/Qwen2.5-Coder-32B-4bit",
+                None
+            ),
             "mlx_lm"
         );
         // llama.cpp server header wins over Mac fallback:

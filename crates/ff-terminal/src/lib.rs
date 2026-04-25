@@ -10,8 +10,8 @@
 //! - Session management
 
 pub mod app;
-pub mod render;
 pub mod input;
 pub mod messages;
-pub mod widgets;
+pub mod render;
 pub mod theme;
+pub mod widgets;

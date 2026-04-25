@@ -1,10 +1,10 @@
 //! Rendering — layout and draw the ForgeFleet Terminal UI.
 
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
-use ratatui::Frame;
 
 use crate::app::App;
 use crate::theme::Theme;
@@ -44,14 +44,28 @@ pub fn render(frame: &mut Frame, app: &App) {
     let main_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints(if has_tabs {
-            vec![Constraint::Length(1), Constraint::Length(1), Constraint::Min(4), Constraint::Length(input_height), Constraint::Length(1)]
+            vec![
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Min(4),
+                Constraint::Length(input_height),
+                Constraint::Length(1),
+            ]
         } else {
-            vec![Constraint::Length(1), Constraint::Length(0), Constraint::Min(4), Constraint::Length(input_height), Constraint::Length(1)]
+            vec![
+                Constraint::Length(1),
+                Constraint::Length(0),
+                Constraint::Min(4),
+                Constraint::Length(input_height),
+                Constraint::Length(1),
+            ]
         })
         .split(area);
 
     render_header(frame, main_chunks[0], app, &theme);
-    if has_tabs { render_tab_bar(frame, main_chunks[1], app, &theme); }
+    if has_tabs {
+        render_tab_bar(frame, main_chunks[1], app, &theme);
+    }
     render_body(frame, main_chunks[2], app, &theme);
     render_input(frame, main_chunks[3], app, &theme);
     render_footer(frame, main_chunks[4], app, &theme);
@@ -63,27 +77,44 @@ pub fn render(frame: &mut Frame, app: &App) {
 }
 
 fn render_model_picker(frame: &mut Frame, app: &App, _theme: &Theme) {
-    let picker = match app.picker.as_ref() { Some(p) => p, None => return };
+    let picker = match app.picker.as_ref() {
+        Some(p) => p,
+        None => return,
+    };
     let frame_area = frame.area();
     // Centered popup: 70% width, 60% height (with sensible min/max)
     let popup_w = (frame_area.width as f32 * 0.65) as u16;
     let popup_w = popup_w.clamp(40, 100);
     let popup_h = (frame_area.height as f32 * 0.6) as u16;
-    let popup_h = popup_h.clamp(10, 28).min(frame_area.height.saturating_sub(2));
+    let popup_h = popup_h
+        .clamp(10, 28)
+        .min(frame_area.height.saturating_sub(2));
     let popup_x = (frame_area.width.saturating_sub(popup_w)) / 2;
     let popup_y = (frame_area.height.saturating_sub(popup_h)) / 2;
-    let popup_area = Rect { x: popup_x, y: popup_y, width: popup_w, height: popup_h };
+    let popup_area = Rect {
+        x: popup_x,
+        y: popup_y,
+        width: popup_w,
+        height: popup_h,
+    };
 
     frame.render_widget(Clear, popup_area);
 
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Rgb(94, 234, 212)))
-        .title(Span::styled(" Model Picker ", Style::default().fg(Color::Rgb(94, 234, 212)).add_modifier(Modifier::BOLD)));
+        .title(Span::styled(
+            " Model Picker ",
+            Style::default()
+                .fg(Color::Rgb(94, 234, 212))
+                .add_modifier(Modifier::BOLD),
+        ));
     let inner = block.inner(popup_area);
     frame.render_widget(block, popup_area);
 
-    if inner.height < 3 { return; }
+    if inner.height < 3 {
+        return;
+    }
 
     // Layout inside popup: filter line, list area, footer help.
     let chunks = Layout::default()
@@ -97,13 +128,21 @@ fn render_model_picker(frame: &mut Frame, app: &App, _theme: &Theme) {
 
     // Filter row
     let filter_text = if picker.filter.is_empty() {
-        Line::from(vec![
-            Span::styled(" Type to filter ", Style::default().fg(Color::Rgb(100, 116, 139)).add_modifier(Modifier::ITALIC)),
-        ])
+        Line::from(vec![Span::styled(
+            " Type to filter ",
+            Style::default()
+                .fg(Color::Rgb(100, 116, 139))
+                .add_modifier(Modifier::ITALIC),
+        )])
     } else {
         Line::from(vec![
             Span::styled(" filter: ", Style::default().fg(Color::Rgb(100, 116, 139))),
-            Span::styled(&picker.filter, Style::default().fg(Color::Rgb(226, 232, 240)).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                &picker.filter,
+                Style::default()
+                    .fg(Color::Rgb(226, 232, 240))
+                    .add_modifier(Modifier::BOLD),
+            ),
         ])
     };
     frame.render_widget(Paragraph::new(filter_text), chunks[0]);
@@ -114,18 +153,37 @@ fn render_model_picker(frame: &mut Frame, app: &App, _theme: &Theme) {
     let mut lines: Vec<Line> = Vec::new();
 
     if picker.loading {
-        lines.push(Line::from(Span::styled(" Loading models from fleet…", Style::default().fg(Color::Rgb(251, 191, 36)).add_modifier(Modifier::ITALIC))));
+        lines.push(Line::from(Span::styled(
+            " Loading models from fleet…",
+            Style::default()
+                .fg(Color::Rgb(251, 191, 36))
+                .add_modifier(Modifier::ITALIC),
+        )));
     } else if let Some(err) = &picker.error {
-        lines.push(Line::from(Span::styled(format!(" Error: {err}"), Style::default().fg(Color::Rgb(248, 113, 113)))));
+        lines.push(Line::from(Span::styled(
+            format!(" Error: {err}"),
+            Style::default().fg(Color::Rgb(248, 113, 113)),
+        )));
     } else if visible_idxs.is_empty() {
-        let msg = if picker.items.is_empty() { " No models found in fleet" } else { " No matches" };
-        lines.push(Line::from(Span::styled(msg, Style::default().fg(Color::Rgb(100, 116, 139)))));
+        let msg = if picker.items.is_empty() {
+            " No models found in fleet"
+        } else {
+            " No matches"
+        };
+        lines.push(Line::from(Span::styled(
+            msg,
+            Style::default().fg(Color::Rgb(100, 116, 139)),
+        )));
     } else {
         use crate::app::PickerItemState;
         let max_rows = list_area.height as usize;
         // Simple windowing: keep `selected` visible
         let selected = picker.selected.min(visible_idxs.len().saturating_sub(1));
-        let start = if selected >= max_rows { selected + 1 - max_rows } else { 0 };
+        let start = if selected >= max_rows {
+            selected + 1 - max_rows
+        } else {
+            0
+        };
         let sel_bg = Color::Rgb(99, 102, 241);
         for (row, &idx) in visible_idxs.iter().enumerate().skip(start).take(max_rows) {
             let m = &picker.items[idx];
@@ -134,25 +192,38 @@ fn render_model_picker(frame: &mut Frame, app: &App, _theme: &Theme) {
 
             // State icon + color.
             let (icon, icon_color) = match m.state {
-                PickerItemState::Auto        => ("◆", Color::Rgb(139, 92, 246)),    // purple
-                PickerItemState::Loaded      => ("●", Color::Rgb(74, 222, 128)),    // green
-                PickerItemState::OnDisk      => ("◐", Color::Rgb(251, 191, 36)),    // yellow
-                PickerItemState::Catalog     => ("○", Color::Rgb(148, 163, 184)),   // gray
-                PickerItemState::Downloading => ("↓", Color::Rgb(125, 211, 252)),   // cyan
+                PickerItemState::Auto => ("◆", Color::Rgb(139, 92, 246)), // purple
+                PickerItemState::Loaded => ("●", Color::Rgb(74, 222, 128)), // green
+                PickerItemState::OnDisk => ("◐", Color::Rgb(251, 191, 36)), // yellow
+                PickerItemState::Catalog => ("○", Color::Rgb(148, 163, 184)), // gray
+                PickerItemState::Downloading => ("↓", Color::Rgb(125, 211, 252)), // cyan
             };
 
             let name_style = if is_selected {
-                Style::default().fg(Color::White).bg(bg).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::White)
+                    .bg(bg)
+                    .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::Rgb(226, 232, 240)).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Rgb(226, 232, 240))
+                    .add_modifier(Modifier::BOLD)
             };
             let tier_style = if is_selected {
                 Style::default().fg(Color::White).bg(bg)
             } else {
                 Style::default().fg(Color::Rgb(251, 191, 36))
             };
-            let detail_color = if is_selected { Color::Rgb(199, 210, 254) } else { Color::Rgb(148, 163, 184) };
-            let dim_color    = if is_selected { Color::Rgb(199, 210, 254) } else { Color::Rgb(100, 116, 139) };
+            let detail_color = if is_selected {
+                Color::Rgb(199, 210, 254)
+            } else {
+                Color::Rgb(148, 163, 184)
+            };
+            let dim_color = if is_selected {
+                Color::Rgb(199, 210, 254)
+            } else {
+                Color::Rgb(100, 116, 139)
+            };
 
             let tier_label = match m.state {
                 PickerItemState::Auto => "[AUTO]".to_string(),
@@ -160,18 +231,30 @@ fn render_model_picker(frame: &mut Frame, app: &App, _theme: &Theme) {
             };
 
             let mut spans: Vec<Span> = Vec::new();
-            spans.push(Span::styled(format!(" {icon} "), Style::default().fg(icon_color).bg(bg)));
+            spans.push(Span::styled(
+                format!(" {icon} "),
+                Style::default().fg(icon_color).bg(bg),
+            ));
             spans.push(Span::styled(format!("{tier_label} "), tier_style));
             spans.push(Span::styled(m.name.clone(), name_style));
             spans.push(Span::styled("  ", Style::default().bg(bg)));
-            spans.push(Span::styled(m.detail.clone(), Style::default().fg(detail_color).bg(bg)));
+            spans.push(Span::styled(
+                m.detail.clone(),
+                Style::default().fg(detail_color).bg(bg),
+            ));
             if let Some(ep) = &m.endpoint_display {
                 if matches!(m.state, PickerItemState::Loaded) {
-                    spans.push(Span::styled(format!("  {ep}"), Style::default().fg(dim_color).bg(bg)));
+                    spans.push(Span::styled(
+                        format!("  {ep}"),
+                        Style::default().fg(dim_color).bg(bg),
+                    ));
                 }
             }
             if let Some(rt) = &m.runtime {
-                spans.push(Span::styled(format!("  [{rt}]"), Style::default().fg(dim_color).bg(bg)));
+                spans.push(Span::styled(
+                    format!("  [{rt}]"),
+                    Style::default().fg(dim_color).bg(bg),
+                ));
             }
 
             lines.push(Line::from(spans));
@@ -182,13 +265,33 @@ fn render_model_picker(frame: &mut Frame, app: &App, _theme: &Theme) {
 
     // Help footer
     let help = Line::from(vec![
-        Span::styled(" Enter", Style::default().fg(Color::Rgb(125, 211, 252)).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " Enter",
+            Style::default()
+                .fg(Color::Rgb(125, 211, 252))
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled("=select  ", Style::default().fg(Color::Rgb(100, 116, 139))),
-        Span::styled("↑↓", Style::default().fg(Color::Rgb(125, 211, 252)).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "↑↓",
+            Style::default()
+                .fg(Color::Rgb(125, 211, 252))
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled("=move  ", Style::default().fg(Color::Rgb(100, 116, 139))),
-        Span::styled("Esc", Style::default().fg(Color::Rgb(125, 211, 252)).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "Esc",
+            Style::default()
+                .fg(Color::Rgb(125, 211, 252))
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled("=cancel  ", Style::default().fg(Color::Rgb(100, 116, 139))),
-        Span::styled("Type", Style::default().fg(Color::Rgb(125, 211, 252)).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "Type",
+            Style::default()
+                .fg(Color::Rgb(125, 211, 252))
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" to filter", Style::default().fg(Color::Rgb(100, 116, 139))),
     ]);
     frame.render_widget(Paragraph::new(help), chunks[2]);
@@ -199,15 +302,22 @@ fn render_tab_bar(frame: &mut Frame, area: Rect, app: &App, _theme: &Theme) {
     for (i, tab) in app.tabs.iter().enumerate() {
         let is_active = i == app.active_tab;
         let style = if is_active {
-            Style::default().fg(Color::White).bg(Color::Rgb(99, 102, 241))
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::Rgb(99, 102, 241))
         } else {
-            Style::default().fg(Color::Rgb(148, 163, 184)).bg(Color::Rgb(30, 41, 59))
+            Style::default()
+                .fg(Color::Rgb(148, 163, 184))
+                .bg(Color::Rgb(30, 41, 59))
         };
         let indicator = if tab.is_running { "⚡" } else { "" };
         spans.push(Span::styled(format!(" {}{} ", tab.name, indicator), style));
         spans.push(Span::styled(" ", Style::default()));
     }
-    spans.push(Span::styled(" Ctrl+T: new │ Ctrl+N/P: switch │ Ctrl+W: close ", Style::default().fg(Color::Rgb(71, 85, 105))));
+    spans.push(Span::styled(
+        " Ctrl+T: new │ Ctrl+N/P: switch │ Ctrl+W: close ",
+        Style::default().fg(Color::Rgb(71, 85, 105)),
+    ));
 
     frame.render_widget(
         Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::Rgb(30, 41, 59))),
@@ -218,29 +328,43 @@ fn render_tab_bar(frame: &mut Frame, area: Rect, app: &App, _theme: &Theme) {
 fn render_header(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let tab = app.tab();
     let spinner = if tab.is_running { app.spinner() } else { "●" };
-    let spinner_color = if tab.is_running { Color::Rgb(251, 191, 36) } else { Color::Rgb(74, 222, 128) };
+    let spinner_color = if tab.is_running {
+        Color::Rgb(251, 191, 36)
+    } else {
+        Color::Rgb(74, 222, 128)
+    };
 
     // Show project name + working directory path
     let working_dir = app.config.working_dir.to_string_lossy();
-    let project_display = app.current_project.as_ref()
+    let project_display = app
+        .current_project
+        .as_ref()
         .map(|p| format!(" │ {} ({}) ", p.name, working_dir))
         .unwrap_or_else(|| format!(" │ {} ", working_dir));
 
     let header = Line::from(vec![
         Span::styled(format!(" {spinner} "), Style::default().fg(spinner_color)),
         Span::styled("ForgeFleet", theme.header),
-        Span::styled(&project_display, Style::default().fg(Color::Rgb(139, 92, 246))),
         Span::styled(
-            format!("│ {} │ Turn: {}/{} │ ",
+            &project_display,
+            Style::default().fg(Color::Rgb(139, 92, 246)),
+        ),
+        Span::styled(
+            format!(
+                "│ {} │ Turn: {}/{} │ ",
                 &tab.current_model[..tab.current_model.len().min(30)],
-                tab.turn, app.config.max_turns,
+                tab.turn,
+                app.config.max_turns,
             ),
             theme.status_text,
         ),
         Span::styled(app.web_url(), Style::default().fg(Color::Rgb(99, 102, 241))),
     ]);
 
-    frame.render_widget(Paragraph::new(header).style(Style::default().bg(Color::Rgb(30, 41, 59))), area);
+    frame.render_widget(
+        Paragraph::new(header).style(Style::default().bg(Color::Rgb(30, 41, 59))),
+        area,
+    );
 }
 
 fn render_body(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
@@ -249,8 +373,8 @@ fn render_body(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let body_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(22),  // left: Focus Stack + Backlog + Fleet
-            Constraint::Percentage(78),  // center: Chat
+            Constraint::Percentage(22), // left: Focus Stack + Backlog + Fleet
+            Constraint::Percentage(78), // center: Chat
         ])
         .split(area);
 
@@ -262,7 +386,10 @@ fn render_left_sidebar(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) 
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.border))
-        .title(Span::styled(" Context ", Style::default().fg(theme.fg).add_modifier(Modifier::BOLD)));
+        .title(Span::styled(
+            " Context ",
+            Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
+        ));
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -274,7 +401,12 @@ fn render_left_sidebar(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) 
     if let Some(project) = &app.current_project {
         lines.push(Line::from(vec![
             Span::styled(" 📁 ", Style::default()),
-            Span::styled(&project.name, Style::default().fg(Color::Rgb(139, 92, 246)).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                &project.name,
+                Style::default()
+                    .fg(Color::Rgb(139, 92, 246))
+                    .add_modifier(Modifier::BOLD),
+            ),
         ]));
         lines.push(Line::from(""));
     }
@@ -285,23 +417,44 @@ fn render_left_sidebar(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) 
     // Focus Stack (FILO) — real data from session tracker
     let stack_depth = tab.tracker.focus_stack.depth();
     lines.push(Line::from(vec![
-        Span::styled(" Focus Stack ", Style::default().fg(Color::Rgb(251, 191, 36)).add_modifier(Modifier::BOLD)),
-        Span::styled(format!("({})", stack_depth), Style::default().fg(Color::Rgb(100, 116, 139))),
+        Span::styled(
+            " Focus Stack ",
+            Style::default()
+                .fg(Color::Rgb(251, 191, 36))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("({})", stack_depth),
+            Style::default().fg(Color::Rgb(100, 116, 139)),
+        ),
     ]));
 
     if stack_depth == 0 {
-        lines.push(Line::from(Span::styled("  (empty)", Style::default().fg(Color::Rgb(71, 85, 105)))));
-        lines.push(Line::from(Span::styled("  /push <topic>", Style::default().fg(Color::Rgb(71, 85, 105)))));
+        lines.push(Line::from(Span::styled(
+            "  (empty)",
+            Style::default().fg(Color::Rgb(71, 85, 105)),
+        )));
+        lines.push(Line::from(Span::styled(
+            "  /push <topic>",
+            Style::default().fg(Color::Rgb(71, 85, 105)),
+        )));
     } else {
         {
             let summary = tab.tracker.focus_stack.summary();
             for entry in summary.iter().take(5) {
                 let filled = (entry.progress * 5.0) as usize;
-                let progress_bar = format!("{}{}", "█".repeat(filled), "░".repeat(5usize.saturating_sub(filled)));
+                let progress_bar = format!(
+                    "{}{}",
+                    "█".repeat(filled),
+                    "░".repeat(5usize.saturating_sub(filled))
+                );
                 let title = entry.title.clone();
                 let age = entry.age.clone();
                 lines.push(Line::from(vec![
-                    Span::styled(format!("  {} ", entry.depth + 1), Style::default().fg(Color::Rgb(251, 191, 36))),
+                    Span::styled(
+                        format!("  {} ", entry.depth + 1),
+                        Style::default().fg(Color::Rgb(251, 191, 36)),
+                    ),
                     Span::styled(title, Style::default().fg(Color::Rgb(226, 232, 240))),
                 ]));
                 lines.push(Line::from(Span::styled(
@@ -310,7 +463,10 @@ fn render_left_sidebar(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) 
                 )));
             }
         }
-        lines.push(Line::from(Span::styled("  /pop to resume", Style::default().fg(Color::Rgb(71, 85, 105)))));
+        lines.push(Line::from(Span::styled(
+            "  /pop to resume",
+            Style::default().fg(Color::Rgb(71, 85, 105)),
+        )));
     }
 
     lines.push(Line::from(""));
@@ -318,13 +474,27 @@ fn render_left_sidebar(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) 
     // Backlog (FIFO) — real data from session tracker
     let backlog_count = tab.tracker.backlog.len();
     lines.push(Line::from(vec![
-        Span::styled(" Backlog ", Style::default().fg(Color::Rgb(125, 211, 252)).add_modifier(Modifier::BOLD)),
-        Span::styled(format!("({})", backlog_count), Style::default().fg(Color::Rgb(100, 116, 139))),
+        Span::styled(
+            " Backlog ",
+            Style::default()
+                .fg(Color::Rgb(125, 211, 252))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("({})", backlog_count),
+            Style::default().fg(Color::Rgb(100, 116, 139)),
+        ),
     ]));
 
     if backlog_count == 0 {
-        lines.push(Line::from(Span::styled("  (empty)", Style::default().fg(Color::Rgb(71, 85, 105)))));
-        lines.push(Line::from(Span::styled("  /backlog <item>", Style::default().fg(Color::Rgb(71, 85, 105)))));
+        lines.push(Line::from(Span::styled(
+            "  (empty)",
+            Style::default().fg(Color::Rgb(71, 85, 105)),
+        )));
+        lines.push(Line::from(Span::styled(
+            "  /backlog <item>",
+            Style::default().fg(Color::Rgb(71, 85, 105)),
+        )));
     } else {
         for (_i, item) in tab.tracker.backlog.items().iter().enumerate().take(5) {
             let priority_icon = match item.priority {
@@ -349,9 +519,15 @@ fn render_left_sidebar(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) 
     lines.push(Line::from(""));
 
     // Fleet — node + model status (moved from former right sidebar)
-    lines.push(Line::from(Span::styled(" Fleet ", Style::default().fg(theme.fg).add_modifier(Modifier::BOLD))));
+    lines.push(Line::from(Span::styled(
+        " Fleet ",
+        Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
+    )));
     if app.fleet_nodes.is_empty() {
-        lines.push(Line::from(Span::styled("  (no nodes)", Style::default().fg(Color::Rgb(71, 85, 105)))));
+        lines.push(Line::from(Span::styled(
+            "  (no nodes)",
+            Style::default().fg(Color::Rgb(71, 85, 105)),
+        )));
     } else {
         for node in &app.fleet_nodes {
             let (daemon_icon, daemon_color) = if node.daemon_online {
@@ -371,10 +547,22 @@ fn render_left_sidebar(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) 
             };
             let pretty_os = pretty_os_name(&node.os);
             lines.push(Line::from(vec![
-                Span::styled(format!(" {daemon_icon} "), Style::default().fg(daemon_color)),
-                Span::styled(pretty_host, Style::default().fg(theme.fg).add_modifier(Modifier::BOLD)),
-                Span::styled(format!(" ({pretty_os})"), Style::default().fg(Color::Rgb(148, 163, 184))),
-                Span::styled(format!(" - {}", node.ip), Style::default().fg(Color::Rgb(100, 116, 139))),
+                Span::styled(
+                    format!(" {daemon_icon} "),
+                    Style::default().fg(daemon_color),
+                ),
+                Span::styled(
+                    pretty_host,
+                    Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(" ({pretty_os})"),
+                    Style::default().fg(Color::Rgb(148, 163, 184)),
+                ),
+                Span::styled(
+                    format!(" - {}", node.ip),
+                    Style::default().fg(Color::Rgb(100, 116, 139)),
+                ),
             ]));
             for model in &node.models {
                 // Green dot = API responding, red = port down / not yet up.
@@ -407,7 +595,10 @@ fn render_messages(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.border))
-        .title(Span::styled(" Chat ", Style::default().fg(theme.fg).add_modifier(Modifier::BOLD)));
+        .title(Span::styled(
+            " Chat ",
+            Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
+        ));
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -415,22 +606,45 @@ fn render_messages(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     if app.tab().messages.is_empty() {
         let welcome = Paragraph::new(vec![
             Line::from(""),
-            Line::from(Span::styled("  Welcome to ForgeFleet Terminal", Style::default().fg(Color::Rgb(139, 92, 246)).add_modifier(Modifier::BOLD))),
+            Line::from(Span::styled(
+                "  Welcome to ForgeFleet Terminal",
+                Style::default()
+                    .fg(Color::Rgb(139, 92, 246))
+                    .add_modifier(Modifier::BOLD),
+            )),
             Line::from(""),
-            Line::from(Span::styled("  Type a message to start. The agent will use tools", theme.status_text)),
-            Line::from(Span::styled("  (Bash, Read, Edit, etc.) to accomplish your task.", theme.status_text)),
+            Line::from(Span::styled(
+                "  Type a message to start. The agent will use tools",
+                theme.status_text,
+            )),
+            Line::from(Span::styled(
+                "  (Bash, Read, Edit, etc.) to accomplish your task.",
+                theme.status_text,
+            )),
             Line::from(""),
-            Line::from(Span::styled("  /help for commands  •  /fleet for node status  •  /exit to quit", theme.command_hint)),
+            Line::from(Span::styled(
+                "  /help for commands  •  /fleet for node status  •  /exit to quit",
+                theme.command_hint,
+            )),
             Line::from(""),
-            Line::from(Span::styled("  Text selection: click-drag to select + ⌘-C / Ctrl+Shift+C to copy.", theme.command_hint)),
-            Line::from(Span::styled("  Scroll: arrow keys / PgUp / PgDn. (Mouse wheel disabled so selection works.)", theme.command_hint)),
+            Line::from(Span::styled(
+                "  Text selection: click-drag to select + ⌘-C / Ctrl+Shift+C to copy.",
+                theme.command_hint,
+            )),
+            Line::from(Span::styled(
+                "  Scroll: arrow keys / PgUp / PgDn. (Mouse wheel disabled so selection works.)",
+                theme.command_hint,
+            )),
         ]);
         frame.render_widget(welcome, inner);
         return;
     }
 
     // Collect all lines
-    let all_lines: Vec<Line> = app.tab().messages.iter()
+    let all_lines: Vec<Line> = app
+        .tab()
+        .messages
+        .iter()
         .flat_map(|m| m.lines.clone())
         .collect();
 
@@ -450,7 +664,8 @@ fn render_messages(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             .saturating_sub(app.tab().scroll_offset as usize)
     };
 
-    let visible: Vec<Line> = all_lines.into_iter()
+    let visible: Vec<Line> = all_lines
+        .into_iter()
         .skip(start)
         .take(visible_height) // strict cap — never pass more lines than the area can hold
         .collect();
@@ -460,7 +675,11 @@ fn render_messages(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
 }
 
 fn render_input(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
-    let border_color = if app.tab().is_running { Color::Rgb(251, 191, 36) } else { theme.border_focused };
+    let border_color = if app.tab().is_running {
+        Color::Rgb(251, 191, 36)
+    } else {
+        theme.border_focused
+    };
 
     let line_count = app.tab().input.line_count();
     let title = if app.tab().is_running {
@@ -477,7 +696,11 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         .border_style(Style::default().fg(border_color))
         .title(Span::styled(
             title,
-            Style::default().fg(if app.tab().is_running { Color::Rgb(251, 191, 36) } else { theme.fg }),
+            Style::default().fg(if app.tab().is_running {
+                Color::Rgb(251, 191, 36)
+            } else {
+                theme.fg
+            }),
         ));
 
     let inner = block.inner(area);
@@ -489,7 +712,11 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     } else {
         app.tab().input.text.clone()
     };
-    let style = if is_empty { theme.input_placeholder } else { theme.input };
+    let style = if is_empty {
+        theme.input_placeholder
+    } else {
+        theme.input
+    };
 
     // Scroll offset so the cursor line stays visible when content exceeds the visible height.
     let (cursor_line, cursor_col) = app.tab().input.cursor_line_col();
@@ -528,56 +755,75 @@ fn render_input(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         if visible_count == 0 {
             // no room to show suggestions
         } else {
-        let popup_height = (visible_count as u16 + 2).min(area.y); // +2 for border, never taller than space above
-        let popup_width = area.width.min(60).min(frame_area.width.saturating_sub(area.x + 1));
-        let popup_y = area.y.saturating_sub(popup_height);
-        let popup_x = area.x + 1;
-        // Final clip: ensure the rect fits entirely inside frame buffer
-        if popup_width == 0 || popup_height == 0
-            || popup_x >= frame_area.width
-            || popup_y.saturating_add(popup_height) > frame_area.height
-            || popup_x.saturating_add(popup_width) > frame_area.width
-        {
-            return;
-        }
-        let suggestions_area = Rect {
-            x: popup_x,
-            y: popup_y,
-            width: popup_width,
-            height: popup_height,
-        };
-
-        let items: Vec<Line> = app.tab().input.suggestions.iter().take(visible_count).enumerate().map(|(i, s)| {
-            let style = if app.tab().input.suggestion_index == Some(i) {
-                Style::default().fg(Color::White).bg(Color::Rgb(99, 102, 241))
-            } else {
-                Style::default().fg(Color::Rgb(148, 163, 184))
+            let popup_height = (visible_count as u16 + 2).min(area.y); // +2 for border, never taller than space above
+            let popup_width = area
+                .width
+                .min(60)
+                .min(frame_area.width.saturating_sub(area.x + 1));
+            let popup_y = area.y.saturating_sub(popup_height);
+            let popup_x = area.x + 1;
+            // Final clip: ensure the rect fits entirely inside frame buffer
+            if popup_width == 0
+                || popup_height == 0
+                || popup_x >= frame_area.width
+                || popup_y.saturating_add(popup_height) > frame_area.height
+                || popup_x.saturating_add(popup_width) > frame_area.width
+            {
+                return;
+            }
+            let suggestions_area = Rect {
+                x: popup_x,
+                y: popup_y,
+                width: popup_width,
+                height: popup_height,
             };
-            Line::from(Span::styled(format!(" {s} "), style))
-        }).collect();
 
-        let suggestions_block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Rgb(99, 102, 241)))
-            .title(" Commands ");
+            let items: Vec<Line> = app
+                .tab()
+                .input
+                .suggestions
+                .iter()
+                .take(visible_count)
+                .enumerate()
+                .map(|(i, s)| {
+                    let style = if app.tab().input.suggestion_index == Some(i) {
+                        Style::default()
+                            .fg(Color::White)
+                            .bg(Color::Rgb(99, 102, 241))
+                    } else {
+                        Style::default().fg(Color::Rgb(148, 163, 184))
+                    };
+                    Line::from(Span::styled(format!(" {s} "), style))
+                })
+                .collect();
 
-        frame.render_widget(Clear, suggestions_area);
-        frame.render_widget(
-            Paragraph::new(items).block(suggestions_block),
-            suggestions_area,
-        );
+            let suggestions_block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Rgb(99, 102, 241)))
+                .title(" Commands ");
+
+            frame.render_widget(Clear, suggestions_area);
+            frame.render_widget(
+                Paragraph::new(items).block(suggestions_block),
+                suggestions_area,
+            );
         } // visible_count > 0
     }
 }
 
 fn render_footer(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let tab = app.tab();
-    let session_name = if tab.name.is_empty() { format!("Session {}", app.active_tab + 1) } else { tab.name.clone() };
+    let session_name = if tab.name.is_empty() {
+        format!("Session {}", app.active_tab + 1)
+    } else {
+        tab.name.clone()
+    };
     let mut spans: Vec<Span> = vec![
         Span::styled(" ", Style::default()),
         Span::styled(&tab.status, theme.status_text),
         Span::styled(
-            format!("  │  {}  │  Turn {}/{}  │  Model: {}  │  msgs {}  │  v{}",
+            format!(
+                "  │  {}  │  Turn {}/{}  │  Model: {}  │  msgs {}  │  v{}",
                 session_name,
                 tab.turn,
                 app.config.max_turns,
@@ -594,16 +840,29 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         let dim = Color::Rgb(100, 116, 139);
         let hot = Color::Rgb(74, 222, 128);
         let cold = Color::Rgb(71, 85, 105);
-        let p_col = if status.project_entries > 0 { hot } else { cold };
+        let p_col = if status.project_entries > 0 {
+            hot
+        } else {
+            cold
+        };
         let b_col = if status.brain_entries > 0 { hot } else { cold };
         let h_col = if status.hive_entries > 0 { hot } else { cold };
         spans.push(Span::styled("  │  mem ", Style::default().fg(dim)));
         spans.push(Span::styled("P:", Style::default().fg(dim)));
-        spans.push(Span::styled(format!("{}", status.project_entries), Style::default().fg(p_col)));
+        spans.push(Span::styled(
+            format!("{}", status.project_entries),
+            Style::default().fg(p_col),
+        ));
         spans.push(Span::styled(" B:", Style::default().fg(dim)));
-        spans.push(Span::styled(format!("{}", status.brain_entries), Style::default().fg(b_col)));
+        spans.push(Span::styled(
+            format!("{}", status.brain_entries),
+            Style::default().fg(b_col),
+        ));
         spans.push(Span::styled(" H:", Style::default().fg(dim)));
-        spans.push(Span::styled(format!("{}", status.hive_entries), Style::default().fg(h_col)));
+        spans.push(Span::styled(
+            format!("{}", status.hive_entries),
+            Style::default().fg(h_col),
+        ));
     }
     let footer = Line::from(spans);
 

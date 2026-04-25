@@ -115,13 +115,12 @@ pub async fn seed_from_toml(
     };
 
     for entry in &doc.project {
-        let target_computers = serde_json::to_value(&entry.target_computers).map_err(|source| {
-            ProjectError::Json {
+        let target_computers =
+            serde_json::to_value(&entry.target_computers).map_err(|source| ProjectError::Json {
                 id: entry.id.clone(),
                 field: "target_computers",
                 source,
-            }
-        })?;
+            })?;
 
         // xmax = 0 on RETURNING means the row was INSERTed; non-zero means
         // the conflict branch ran. We also compute `changed` by comparing the

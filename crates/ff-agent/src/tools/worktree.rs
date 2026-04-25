@@ -14,7 +14,9 @@ pub struct EnterWorktreeTool;
 
 #[async_trait]
 impl AgentTool for EnterWorktreeTool {
-    fn name(&self) -> &str { "EnterWorktree" }
+    fn name(&self) -> &str {
+        "EnterWorktree"
+    }
 
     fn description(&self) -> &str {
         "Create a temporary git worktree to work in an isolated copy of the repository. Useful for making changes without affecting the main working directory."
@@ -39,21 +41,26 @@ impl AgentTool for EnterWorktreeTool {
             .map(|s| s.to_string())
             .unwrap_or_else(|| format!("ff-worktree-{}", uuid::Uuid::new_v4().as_simple()));
 
-        let worktree_path = std::env::temp_dir().join(format!("ff-wt-{}", &branch[..8.min(branch.len())]));
+        let worktree_path =
+            std::env::temp_dir().join(format!("ff-wt-{}", &branch[..8.min(branch.len())]));
 
         let output = Command::new("git")
-            .args(["worktree", "add", "-b", &branch, &worktree_path.to_string_lossy()])
+            .args([
+                "worktree",
+                "add",
+                "-b",
+                &branch,
+                &worktree_path.to_string_lossy(),
+            ])
             .current_dir(&ctx.working_dir)
             .output()
             .await;
 
         match output {
-            Ok(out) if out.status.success() => {
-                AgentToolResult::ok(format!(
-                    "Created worktree at {}\nBranch: {branch}\nUse this as your working directory for isolated changes.",
-                    worktree_path.display()
-                ))
-            }
+            Ok(out) if out.status.success() => AgentToolResult::ok(format!(
+                "Created worktree at {}\nBranch: {branch}\nUse this as your working directory for isolated changes.",
+                worktree_path.display()
+            )),
             Ok(out) => {
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 AgentToolResult::err(format!("Failed to create worktree: {stderr}"))
@@ -71,7 +78,9 @@ pub struct ExitWorktreeTool;
 
 #[async_trait]
 impl AgentTool for ExitWorktreeTool {
-    fn name(&self) -> &str { "ExitWorktree" }
+    fn name(&self) -> &str {
+        "ExitWorktree"
+    }
 
     fn description(&self) -> &str {
         "Remove a temporary git worktree and clean up. Optionally merge changes back."

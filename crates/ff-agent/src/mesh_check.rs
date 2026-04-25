@@ -29,10 +29,7 @@ pub async fn pairwise_ssh_check(pool: &PgPool) -> Result<MeshMatrix, String> {
     pairwise_ssh_check_inner(pool, &nodes, None).await
 }
 
-pub async fn pairwise_ssh_check_node(
-    pool: &PgPool,
-    node: &str,
-) -> Result<MeshMatrix, String> {
+pub async fn pairwise_ssh_check_node(pool: &PgPool, node: &str) -> Result<MeshMatrix, String> {
     let nodes = ff_db::pg_list_nodes(pool)
         .await
         .map_err(|e| format!("pg_list_nodes: {e}"))?;
@@ -67,7 +64,10 @@ async fn pairwise_ssh_check_inner(
                 src.ssh_user.clone(),
                 src.ip.clone(),
                 dst.name.clone(),
-                by_name.get(&dst.name).map(|(u, _)| u.clone()).unwrap_or_default(),
+                by_name
+                    .get(&dst.name)
+                    .map(|(u, _)| u.clone())
+                    .unwrap_or_default(),
             ));
             let _ = dst;
         }
@@ -131,9 +131,12 @@ async fn probe_pair(
         Duration::from_secs(12),
         Command::new("ssh")
             .args([
-                "-o", "BatchMode=yes",
-                "-o", "ConnectTimeout=5",
-                "-o", "StrictHostKeyChecking=accept-new",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=5",
+                "-o",
+                "StrictHostKeyChecking=accept-new",
                 &format!("{src_user}@{src_ip}"),
                 &inner,
             ])
@@ -181,14 +184,30 @@ pub async fn mesh_propagate(
     pool: &PgPool,
     params: &serde_json::Value,
 ) -> Result<(usize, usize), String> {
-    let new_node = params.get("new_node").and_then(|v| v.as_str()).ok_or("missing new_node")?;
-    let new_ip = params.get("new_node_ip").and_then(|v| v.as_str()).ok_or("missing new_node_ip")?;
-    let new_user = params.get("new_node_ssh_user").and_then(|v| v.as_str()).ok_or("missing new_node_ssh_user")?;
-    let user_key = params.get("user_public_key").and_then(|v| v.as_str()).unwrap_or("");
+    let new_node = params
+        .get("new_node")
+        .and_then(|v| v.as_str())
+        .ok_or("missing new_node")?;
+    let new_ip = params
+        .get("new_node_ip")
+        .and_then(|v| v.as_str())
+        .ok_or("missing new_node_ip")?;
+    let new_user = params
+        .get("new_node_ssh_user")
+        .and_then(|v| v.as_str())
+        .ok_or("missing new_node_ssh_user")?;
+    let user_key = params
+        .get("user_public_key")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let host_keys: Vec<String> = params
         .get("host_public_keys")
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect()
+        })
         .unwrap_or_default();
 
     let known_lines: Vec<String> = host_keys
@@ -197,7 +216,9 @@ pub async fn mesh_propagate(
         .map(|k| format!("{new_ip},{new_node} {k}"))
         .collect();
 
-    let nodes = ff_db::pg_list_nodes(pool).await.map_err(|e| format!("pg_list_nodes: {e}"))?;
+    let nodes = ff_db::pg_list_nodes(pool)
+        .await
+        .map_err(|e| format!("pg_list_nodes: {e}"))?;
     let mut ok = 0usize;
     let mut fail = 0usize;
     for peer in &nodes {
@@ -212,7 +233,9 @@ pub async fn mesh_propagate(
             }
             Err(e) => {
                 fail += 1;
-                let _ = ff_db::pg_upsert_mesh_status(pool, &peer.name, new_node, "failed", Some(&e)).await;
+                let _ =
+                    ff_db::pg_upsert_mesh_status(pool, &peer.name, new_node, "failed", Some(&e))
+                        .await;
             }
         }
     }
@@ -259,9 +282,12 @@ async fn ssh_exec(dest: &str, cmd: &str) -> Result<(), String> {
         Duration::from_secs(15),
         Command::new("ssh")
             .args([
-                "-o", "BatchMode=yes",
-                "-o", "ConnectTimeout=8",
-                "-o", "StrictHostKeyChecking=accept-new",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=8",
+                "-o",
+                "StrictHostKeyChecking=accept-new",
                 dest,
                 cmd,
             ])
@@ -274,7 +300,11 @@ async fn ssh_exec(dest: &str, cmd: &str) -> Result<(), String> {
         return Err(format!(
             "exit {}: {}",
             out.status.code().unwrap_or(-1),
-            String::from_utf8_lossy(&out.stderr).trim().chars().take(160).collect::<String>()
+            String::from_utf8_lossy(&out.stderr)
+                .trim()
+                .chars()
+                .take(160)
+                .collect::<String>()
         ));
     }
     Ok(())
@@ -296,25 +326,35 @@ fn shell_escape_single(s: &str) -> String {
 
 /// Re-probe a single (src, dst) pair and upsert the result. Used by the
 /// `mesh_retry` deferred task when an auto-retry fires.
-pub async fn probe_single_pair(
-    pool: &PgPool,
-    src: &str,
-    dst: &str,
-) -> Result<MeshCell, String> {
+pub async fn probe_single_pair(pool: &PgPool, src: &str, dst: &str) -> Result<MeshCell, String> {
     let nodes = ff_db::pg_list_nodes(pool)
         .await
         .map_err(|e| format!("pg_list_nodes: {e}"))?;
-    let s = nodes.iter().find(|n| n.name == src)
+    let s = nodes
+        .iter()
+        .find(|n| n.name == src)
         .ok_or_else(|| format!("src node '{src}' not in fleet_nodes"))?;
-    let d = nodes.iter().find(|n| n.name == dst)
+    let d = nodes
+        .iter()
+        .find(|n| n.name == dst)
         .ok_or_else(|| format!("dst node '{dst}' not in fleet_nodes"))?;
     let cell = probe_pair(
-        s.name.clone(), s.ssh_user.clone(), s.ip.clone(),
-        d.name.clone(), d.ssh_user.clone(), d.ip.clone(),
-    ).await;
+        s.name.clone(),
+        s.ssh_user.clone(),
+        s.ip.clone(),
+        d.name.clone(),
+        d.ssh_user.clone(),
+        d.ip.clone(),
+    )
+    .await;
     let _ = ff_db::pg_upsert_mesh_status(
-        pool, &cell.src, &cell.dst, &cell.status, cell.last_error.as_deref(),
-    ).await;
+        pool,
+        &cell.src,
+        &cell.dst,
+        &cell.status,
+        cell.last_error.as_deref(),
+    )
+    .await;
     Ok(cell)
 }
 
@@ -327,9 +367,9 @@ pub async fn enqueue_retries(pool: &PgPool) -> Result<usize, String> {
     let rows = ff_db::pg_list_mesh_status(pool, None)
         .await
         .map_err(|e| format!("pg_list_mesh_status: {e}"))?;
-    let stale: Vec<(String, String)> = rows.iter()
-        .filter(|r| r.status == "failed"
-            && r.last_checked.map(|t| t < cutoff).unwrap_or(true))
+    let stale: Vec<(String, String)> = rows
+        .iter()
+        .filter(|r| r.status == "failed" && r.last_checked.map(|t| t < cutoff).unwrap_or(true))
         .map(|r| (r.src_node.clone(), r.dst_node.clone()))
         .collect();
     if stale.is_empty() {
@@ -353,20 +393,27 @@ pub async fn enqueue_retries(pool: &PgPool) -> Result<usize, String> {
         let trig = serde_json::json!({});
         let caps = serde_json::json!([]);
         if ff_db::pg_enqueue_deferred(
-            pool, &title, "mesh_retry", &payload,
-            "operator", &trig, Some("taylor"), &caps,
-            Some("mesh_auto_retry"), Some(5),
-        ).await.is_ok() {
+            pool,
+            &title,
+            "mesh_retry",
+            &payload,
+            "operator",
+            &trig,
+            Some("taylor"),
+            &caps,
+            Some("mesh_auto_retry"),
+            Some(5),
+        )
+        .await
+        .is_ok()
+        {
             created += 1;
         }
     }
     Ok(created)
 }
 
-pub async fn refresh_stale(
-    pool: &PgPool,
-    max_age: chrono::Duration,
-) -> Result<usize, String> {
+pub async fn refresh_stale(pool: &PgPool, max_age: chrono::Duration) -> Result<usize, String> {
     let cutoff = chrono::Utc::now() - max_age;
     let all = ff_db::pg_list_mesh_status(pool, None)
         .await

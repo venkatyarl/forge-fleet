@@ -55,9 +55,7 @@ impl PulseReader {
         let client = self.client.clone();
         let mgr = self
             .conn
-            .get_or_try_init(|| async move {
-                redis::aio::ConnectionManager::new(client).await
-            })
+            .get_or_try_init(|| async move { redis::aio::ConnectionManager::new(client).await })
             .await?;
         Ok(mgr.clone())
     }
@@ -210,13 +208,11 @@ impl PulseReader {
         }
 
         candidates.sort_by(|(_, a), (_, b)| {
-            a.queue_depth
-                .cmp(&b.queue_depth)
-                .then_with(|| {
-                    b.tokens_per_sec_last_min
-                        .partial_cmp(&a.tokens_per_sec_last_min)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
+            a.queue_depth.cmp(&b.queue_depth).then_with(|| {
+                b.tokens_per_sec_last_min
+                    .partial_cmp(&a.tokens_per_sec_last_min)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
         });
 
         Ok(candidates.into_iter().next())
@@ -310,9 +306,7 @@ impl PulseReader {
     async fn scan_keys(&self) -> Result<Vec<String>, PulseError> {
         let mut conn = self.conn().await?;
         let pattern = format!("{KEY_PREFIX}*");
-        let mut iter = conn
-            .scan_match::<_, String>(pattern)
-            .await?;
+        let mut iter = conn.scan_match::<_, String>(pattern).await?;
 
         let mut keys = Vec::new();
         while let Some(k) = iter.next().await {
@@ -334,6 +328,9 @@ impl PulseReader {
     /// Helper: shape an `all_beats()` result as a `HashMap` keyed by name.
     pub async fn beats_by_name(&self) -> Result<HashMap<String, PulseBeatV2>, PulseError> {
         let beats = self.all_beats().await?;
-        Ok(beats.into_iter().map(|b| (b.computer_name.clone(), b)).collect())
+        Ok(beats
+            .into_iter()
+            .map(|b| (b.computer_name.clone(), b))
+            .collect())
     }
 }

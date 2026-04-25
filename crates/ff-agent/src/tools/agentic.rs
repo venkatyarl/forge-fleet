@@ -11,7 +11,9 @@ pub struct VerifyAndRetryTool;
 
 #[async_trait]
 impl AgentTool for VerifyAndRetryTool {
-    fn name(&self) -> &str { "VerifyAndRetry" }
+    fn name(&self) -> &str {
+        "VerifyAndRetry"
+    }
     fn description(&self) -> &str {
         "Run a verification command (test, build, lint). If it fails, return the error output for diagnosis. Use this after making code changes to verify correctness."
     }
@@ -28,10 +30,20 @@ impl AgentTool for VerifyAndRetryTool {
     }
     async fn execute(&self, input: Value, ctx: &AgentToolContext) -> AgentToolResult {
         let command = input.get("command").and_then(Value::as_str).unwrap_or("");
-        let description = input.get("description").and_then(Value::as_str).unwrap_or("verification");
-        if command.is_empty() { return AgentToolResult::err("Missing 'command'"); }
+        let description = input
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or("verification");
+        if command.is_empty() {
+            return AgentToolResult::err("Missing 'command'");
+        }
 
-        let output = Command::new("bash").arg("-c").arg(command).current_dir(&ctx.working_dir).output().await;
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg(command)
+            .current_dir(&ctx.working_dir)
+            .output()
+            .await;
 
         match output {
             Ok(out) => {
@@ -40,7 +52,10 @@ impl AgentTool for VerifyAndRetryTool {
                 let combined = format!("{stdout}{stderr}");
 
                 if out.status.success() {
-                    AgentToolResult::ok(format!("PASS: {description}\n\n{}", truncate_output(&combined, 2000)))
+                    AgentToolResult::ok(format!(
+                        "PASS: {description}\n\n{}",
+                        truncate_output(&combined, 2000)
+                    ))
                 } else {
                     AgentToolResult::err(format!(
                         "FAIL: {description}\nExit code: {}\n\n{}\n\nDiagnose the error above and fix the issue.",
@@ -59,7 +74,9 @@ pub struct DelegateTool;
 
 #[async_trait]
 impl AgentTool for DelegateTool {
-    fn name(&self) -> &str { "Delegate" }
+    fn name(&self) -> &str {
+        "Delegate"
+    }
     fn description(&self) -> &str {
         "Delegate a subtask to a specialized agent role (e.g. security-auditor, test-writer, researcher). The task runs on a fleet node with the best model for that role. Returns the result."
     }
@@ -83,14 +100,20 @@ impl AgentTool for DelegateTool {
     }
     async fn execute(&self, input: Value, ctx: &AgentToolContext) -> AgentToolResult {
         let task = input.get("task").and_then(Value::as_str).unwrap_or("");
-        let role = input.get("role").and_then(Value::as_str).unwrap_or("researcher");
+        let role = input
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("researcher");
         let context = input.get("context").and_then(Value::as_str).unwrap_or("");
 
-        if task.is_empty() { return AgentToolResult::err("Missing 'task'"); }
+        if task.is_empty() {
+            return AgentToolResult::err("Missing 'task'");
+        }
 
         // Look up role and get system prompt extension
         let role_def = crate::agent_roles::find_role(role);
-        let role_prompt = role_def.as_ref()
+        let role_prompt = role_def
+            .as_ref()
             .map(|r| r.system_prompt_extension.as_str())
             .unwrap_or("");
 
@@ -117,8 +140,12 @@ pub struct PdfExtractTool;
 
 #[async_trait]
 impl AgentTool for PdfExtractTool {
-    fn name(&self) -> &str { "PdfExtract" }
-    fn description(&self) -> &str { "Extract text content from PDF files. Uses pdftotext if available, falls back to basic extraction." }
+    fn name(&self) -> &str {
+        "PdfExtract"
+    }
+    fn description(&self) -> &str {
+        "Extract text content from PDF files. Uses pdftotext if available, falls back to basic extraction."
+    }
     fn parameters_schema(&self) -> Value {
         json!({
             "type": "object",
@@ -131,7 +158,9 @@ impl AgentTool for PdfExtractTool {
     }
     async fn execute(&self, input: Value, ctx: &AgentToolContext) -> AgentToolResult {
         let file_path = input.get("file_path").and_then(Value::as_str).unwrap_or("");
-        if file_path.is_empty() { return AgentToolResult::err("Missing 'file_path'"); }
+        if file_path.is_empty() {
+            return AgentToolResult::err("Missing 'file_path'");
+        }
 
         let path = if std::path::Path::new(file_path).is_absolute() {
             std::path::PathBuf::from(file_path)
@@ -139,7 +168,9 @@ impl AgentTool for PdfExtractTool {
             ctx.working_dir.join(file_path)
         };
 
-        if !path.exists() { return AgentToolResult::err(format!("File not found: {}", path.display())); }
+        if !path.exists() {
+            return AgentToolResult::err(format!("File not found: {}", path.display()));
+        }
 
         // Try pdftotext first
         let mut cmd = Command::new("pdftotext");
@@ -177,8 +208,12 @@ pub struct SpreadsheetQueryTool;
 
 #[async_trait]
 impl AgentTool for SpreadsheetQueryTool {
-    fn name(&self) -> &str { "SpreadsheetQuery" }
-    fn description(&self) -> &str { "Read and query CSV or Excel files. Extract data, filter rows, get statistics." }
+    fn name(&self) -> &str {
+        "SpreadsheetQuery"
+    }
+    fn description(&self) -> &str {
+        "Read and query CSV or Excel files. Extract data, filter rows, get statistics."
+    }
     fn parameters_schema(&self) -> Value {
         json!({
             "type": "object",
@@ -193,7 +228,10 @@ impl AgentTool for SpreadsheetQueryTool {
     }
     async fn execute(&self, input: Value, ctx: &AgentToolContext) -> AgentToolResult {
         let file_path = input.get("file_path").and_then(Value::as_str).unwrap_or("");
-        let action = input.get("action").and_then(Value::as_str).unwrap_or("head");
+        let action = input
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or("head");
         let rows = input.get("rows").and_then(Value::as_u64).unwrap_or(20);
 
         let path = if std::path::Path::new(file_path).is_absolute() {
@@ -202,21 +240,49 @@ impl AgentTool for SpreadsheetQueryTool {
             ctx.working_dir.join(file_path)
         };
 
-        if !path.exists() { return AgentToolResult::err(format!("File not found: {}", path.display())); }
+        if !path.exists() {
+            return AgentToolResult::err(format!("File not found: {}", path.display()));
+        }
 
-        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
 
         match (action, ext.as_str()) {
             ("head", "csv") | ("read", "csv") => {
-                match Command::new("head").arg("-n").arg(rows.to_string()).arg(&path).output().await {
-                    Ok(out) => AgentToolResult::ok(truncate_output(&String::from_utf8_lossy(&out.stdout), MAX_TOOL_RESULT_CHARS)),
+                match Command::new("head")
+                    .arg("-n")
+                    .arg(rows.to_string())
+                    .arg(&path)
+                    .output()
+                    .await
+                {
+                    Ok(out) => AgentToolResult::ok(truncate_output(
+                        &String::from_utf8_lossy(&out.stdout),
+                        MAX_TOOL_RESULT_CHARS,
+                    )),
                     Err(e) => AgentToolResult::err(format!("Failed: {e}")),
                 }
             }
             ("stats", "csv") => {
-                let cmd = format!("wc -l '{}' && head -1 '{}' | tr ',' '\\n' | wc -l", path.display(), path.display());
-                match Command::new("bash").arg("-c").arg(&cmd).current_dir(&ctx.working_dir).output().await {
-                    Ok(out) => AgentToolResult::ok(format!("CSV stats:\n{}", String::from_utf8_lossy(&out.stdout))),
+                let cmd = format!(
+                    "wc -l '{}' && head -1 '{}' | tr ',' '\\n' | wc -l",
+                    path.display(),
+                    path.display()
+                );
+                match Command::new("bash")
+                    .arg("-c")
+                    .arg(&cmd)
+                    .current_dir(&ctx.working_dir)
+                    .output()
+                    .await
+                {
+                    Ok(out) => AgentToolResult::ok(format!(
+                        "CSV stats:\n{}",
+                        String::from_utf8_lossy(&out.stdout)
+                    )),
                     Err(e) => AgentToolResult::err(format!("Stats failed: {e}")),
                 }
             }
@@ -224,14 +290,17 @@ impl AgentTool for SpreadsheetQueryTool {
                 // Try python for Excel
                 let py_cmd = format!(
                     "python3 -c \"import openpyxl; wb=openpyxl.load_workbook('{}'); ws=wb.active; [print(','.join(str(c.value or '') for c in row)) for row in list(ws.iter_rows())[:{}]]\"",
-                    path.display(), rows
+                    path.display(),
+                    rows
                 );
                 match Command::new("bash").arg("-c").arg(&py_cmd).output().await {
                     Ok(out) if out.status.success() => AgentToolResult::ok(truncate_output(&String::from_utf8_lossy(&out.stdout), MAX_TOOL_RESULT_CHARS)),
                     _ => AgentToolResult::err("Excel reading requires python openpyxl. Install with: pip install openpyxl".to_string()),
                 }
             }
-            _ => AgentToolResult::err(format!("Unsupported file type: {ext}. Supports: csv, xlsx, xls")),
+            _ => AgentToolResult::err(format!(
+                "Unsupported file type: {ext}. Supports: csv, xlsx, xls"
+            )),
         }
     }
 }

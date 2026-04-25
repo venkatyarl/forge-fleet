@@ -28,10 +28,7 @@ pub async fn collect_current() -> BTreeMap<String, String> {
         out.insert("kernel".into(), v);
     }
     #[cfg(windows)]
-    if let Some(v) = cmd_capture(
-        "cmd",
-        &["/C", "ver"],
-    ).await {
+    if let Some(v) = cmd_capture("cmd", &["/C", "ver"]).await {
         out.insert("kernel".into(), v);
     }
     // ff binary: embedded version plus git sha of the checked-out repo.
@@ -113,7 +110,8 @@ pub async fn fetch_latest(keys: &[&str]) -> BTreeMap<String, String> {
     out
 }
 
-fn return_also(_k: &str, _v: &str) { /* helper hook for tracing; noop */ }
+fn return_also(_k: &str, _v: &str) { /* helper hook for tracing; noop */
+}
 
 /// Full roundtrip: merge current + latest, write to fleet_nodes.tooling.
 pub async fn version_check_pass(pool: &PgPool) -> Result<DriftSummary, String> {
@@ -137,7 +135,11 @@ pub async fn version_check_pass(pool: &PgPool) -> Result<DriftSummary, String> {
         }
         let mut entry = serde_json::Map::new();
         entry.insert("current".into(), serde_json::Value::String(cur.clone()));
-        entry.insert("latest".into(), lat.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null));
+        entry.insert(
+            "latest".into(),
+            lat.map(serde_json::Value::String)
+                .unwrap_or(serde_json::Value::Null),
+        );
         entry.insert("checked_at".into(), serde_json::Value::String(now.clone()));
         tooling_obj.insert(k.clone(), serde_json::Value::Object(entry));
     }
@@ -244,9 +246,7 @@ fn extract_semver(s: &str) -> Option<String> {
     while i < bytes.len() {
         if bytes[i].is_ascii_digit() {
             let start = i;
-            while i < bytes.len()
-                && (bytes[i].is_ascii_digit() || bytes[i] == b'.')
-            {
+            while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
                 i += 1;
             }
             let slice = &s[start..i];
@@ -309,14 +309,24 @@ async fn git_head_sha() -> Option<String> {
 async fn git_ls_remote_main() -> Option<String> {
     let dir = home_repo_dir();
     let out = cmd_in_dir(&dir, "git", &["ls-remote", "origin", "refs/heads/main"]).await?;
-    out.split_whitespace().next().map(|s| s.chars().take(12).collect())
+    out.split_whitespace()
+        .next()
+        .map(|s| s.chars().take(12).collect())
 }
 
 fn home_repo_dir() -> std::path::PathBuf {
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| if cfg!(windows) { "C:\\".into() } else { "/".into() });
-    std::path::PathBuf::from(home).join("projects").join("forge-fleet")
+        .unwrap_or_else(|_| {
+            if cfg!(windows) {
+                "C:\\".into()
+            } else {
+                "/".into()
+            }
+        });
+    std::path::PathBuf::from(home)
+        .join("projects")
+        .join("forge-fleet")
 }
 
 async fn cmd_in_dir(dir: &std::path::Path, bin: &str, args: &[&str]) -> Option<String> {
@@ -380,7 +390,9 @@ async fn gh_release(client: &reqwest::Client, repo: &str) -> Option<String> {
         return None;
     }
     let json: serde_json::Value = resp.json().await.ok()?;
-    json.get("tag_name").and_then(|v| v.as_str()).map(str::to_string)
+    json.get("tag_name")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
 }
 
 async fn pypi_version(client: &reqwest::Client, pkg: &str) -> Option<String> {

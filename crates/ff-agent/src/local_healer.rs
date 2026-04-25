@@ -171,7 +171,10 @@ impl LocalHealer {
 /// Avoids a libc dependency for a value we only need when composing the
 /// `gui/<uid>/<label>` launchctl target on macOS.
 async fn current_uid() -> anyhow::Result<u32> {
-    let output = tokio::process::Command::new("id").arg("-u").output().await?;
+    let output = tokio::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .await?;
     let text = String::from_utf8_lossy(&output.stdout);
     Ok(text.trim().parse::<u32>()?)
 }

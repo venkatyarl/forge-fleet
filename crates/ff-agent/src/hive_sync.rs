@@ -44,12 +44,14 @@ impl HiveSync {
         // Create starter HIVE.md
         let hive_md = self.local_path.join("HIVE.md");
         if !hive_md.exists() {
-            let _ = fs::write(&hive_md,
+            let _ = fs::write(
+                &hive_md,
                 "# Hive Mind\n\n\
                  Shared knowledge across the ForgeFleet.\n\
                  Fleet coding standards, topology facts, and best practices.\n\n\
-                 This is auto-populated from high-confidence learnings across all fleet members.\n"
-            ).await;
+                 This is auto-populated from high-confidence learnings across all fleet members.\n",
+            )
+            .await;
         }
 
         // Create empty learnings.json
@@ -146,13 +148,15 @@ impl HiveSync {
         let _ = tokio::process::Command::new("git")
             .args(["add", "."])
             .current_dir(&self.local_path)
-            .status().await;
+            .status()
+            .await;
 
         let _ = tokio::process::Command::new("git")
             .args(["commit", "-m", "hive: auto-sync learnings"])
             .current_dir(&self.local_path)
             .stdout(std::process::Stdio::null())
-            .status().await;
+            .status()
+            .await;
 
         let result = tokio::process::Command::new("git")
             .args(["push", "origin", "main"])

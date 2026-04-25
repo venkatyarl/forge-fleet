@@ -37,8 +37,8 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use ff_db::pg_enqueue_deferred;
 use ff_db::leader_state::pg_get_current_leader;
+use ff_db::pg_enqueue_deferred;
 use ff_db::{pg_get_secret, pg_set_secret};
 
 /// fleet_secrets key that stores the age X25519 recipient (public key).
@@ -156,7 +156,11 @@ impl BackupOrchestrator {
     /// Run a single backup cycle for the given kind (`"postgres"`,
     /// `"redis"`, or `"all"`). Silently short-circuits when we're not
     /// the current fleet leader *unless* `force` is true.
-    pub async fn run_once(&self, kind: &str, force: bool) -> Result<Vec<BackupReport>, BackupError> {
+    pub async fn run_once(
+        &self,
+        kind: &str,
+        force: bool,
+    ) -> Result<Vec<BackupReport>, BackupError> {
         if !force && !self.i_am_leader().await? {
             debug!(node = %self.my_node_name, kind, "backup skipped — not leader");
             return Ok(vec![BackupReport::not_leader(kind)]);
@@ -442,7 +446,9 @@ impl BackupOrchestrator {
 
     async fn i_am_leader(&self) -> Result<bool, BackupError> {
         let cur = pg_get_current_leader(&self.pg).await?;
-        Ok(cur.map(|l| l.member_name == self.my_node_name).unwrap_or(false))
+        Ok(cur
+            .map(|l| l.member_name == self.my_node_name)
+            .unwrap_or(false))
     }
 
     async fn insert_backup_row(
@@ -478,12 +484,11 @@ impl BackupOrchestrator {
         file_name: &str,
     ) -> Result<Vec<String>, BackupError> {
         // Look up my own IP so peers know where to rsync from.
-        let my_ip: String =
-            sqlx::query_scalar("SELECT primary_ip FROM computers WHERE id = $1")
-                .bind(self.my_computer_id)
-                .fetch_optional(&self.pg)
-                .await?
-                .unwrap_or_else(|| "127.0.0.1".to_string());
+        let my_ip: String = sqlx::query_scalar("SELECT primary_ip FROM computers WHERE id = $1")
+            .bind(self.my_computer_id)
+            .fetch_optional(&self.pg)
+            .await?
+            .unwrap_or_else(|| "127.0.0.1".to_string());
 
         // Target every computer except me that has a live `last_seen_at`
         // within the last 24h. Fresh-on-disk peers are picked up by the
@@ -597,12 +602,7 @@ impl BackupOrchestrator {
         Ok(())
     }
 
-    async fn delete_excess(
-        &self,
-        kind: &str,
-        tier: &str,
-        keep: usize,
-    ) -> Result<(), BackupError> {
+    async fn delete_excess(&self, kind: &str, tier: &str, keep: usize) -> Result<(), BackupError> {
         sqlx::query(
             "DELETE FROM backups
               WHERE id IN (

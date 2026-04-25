@@ -11,7 +11,9 @@ pub struct NodeSetupTool;
 
 #[async_trait]
 impl AgentTool for NodeSetupTool {
-    fn name(&self) -> &str { "NodeSetup" }
+    fn name(&self) -> &str {
+        "NodeSetup"
+    }
     fn description(&self) -> &str {
         "Set up a new fleet node via SSH. Installs prerequisites (Rust, llama.cpp, Docker, system tools), creates the forgefleet user, and configures the system for fleet membership."
     }
@@ -39,9 +41,14 @@ impl AgentTool for NodeSetupTool {
             None => return AgentToolResult::err("Missing 'host'"),
         };
         let user = input.get("user").and_then(Value::as_str).unwrap_or("root");
-        let node_name = input.get("node_name").and_then(Value::as_str).unwrap_or("new-node");
+        let node_name = input
+            .get("node_name")
+            .and_then(Value::as_str)
+            .unwrap_or("new-node");
 
-        let install_list: Vec<&str> = input.get("install").and_then(Value::as_array)
+        let install_list: Vec<&str> = input
+            .get("install")
+            .and_then(Value::as_array)
             .map(|a| a.iter().filter_map(Value::as_str).collect())
             .unwrap_or_else(|| vec!["rust", "llamacpp", "docker"]);
 
@@ -50,16 +57,34 @@ impl AgentTool for NodeSetupTool {
         // Step 1: Test SSH connectivity
         results.push("Step 1: Testing SSH connectivity...".into());
         let ssh_test = Command::new("ssh")
-            .args(["-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=no", &format!("{user}@{host}"), "echo", "ok"])
-            .output().await;
+            .args([
+                "-o",
+                "ConnectTimeout=5",
+                "-o",
+                "StrictHostKeyChecking=no",
+                &format!("{user}@{host}"),
+                "echo",
+                "ok",
+            ])
+            .output()
+            .await;
 
         match ssh_test {
             Ok(out) if out.status.success() => results.push("  SSH: Connected".into()),
-            _ => return AgentToolResult::err(format!("Cannot SSH to {user}@{host}. Check connectivity and credentials.")),
+            _ => {
+                return AgentToolResult::err(format!(
+                    "Cannot SSH to {user}@{host}. Check connectivity and credentials."
+                ));
+            }
         }
 
         // Step 2: Detect OS
-        let _os_detect = ssh_cmd(user, host, "uname -s && cat /etc/os-release 2>/dev/null | head -3 || sw_vers 2>/dev/null").await;
+        let _os_detect = ssh_cmd(
+            user,
+            host,
+            "uname -s && cat /etc/os-release 2>/dev/null | head -3 || sw_vers 2>/dev/null",
+        )
+        .await;
         results.push("Step 2: OS detected".into());
 
         // Step 3: Install components
@@ -82,7 +107,8 @@ impl AgentTool for NodeSetupTool {
         }
 
         // Step 4: Create forgefleet directory structure
-        install_script.push_str(&format!(r#"
+        install_script.push_str(&format!(
+            r#"
 # ForgeFleet setup
 mkdir -p ~/.forgefleet/memory/global
 mkdir -p ~/.forgefleet/sessions
@@ -90,7 +116,8 @@ mkdir -p ~/.forgefleet/plugins
 mkdir -p ~/projects
 echo '{node_name}' > ~/.forgefleet/node_name
 echo 'ForgeFleet node setup complete'
-"#));
+"#
+        ));
 
         results.push("Step 3: Installing components...".into());
 
@@ -102,7 +129,9 @@ echo 'ForgeFleet node setup complete'
 
         AgentToolResult::ok(format!(
             "Node Setup Report — {node_name} ({host})\n\n{}\n\nInstall output:\n{}\n\nVerification:\n{}\n\nNext steps:\n  1. Run NodeEnroll to add this node to fleet.toml\n  2. Run ModelDeploy to download a model\n  3. Start the LLM server on the node",
-            results.join("\n"), truncate_output(&install_result, 2000), truncate_output(&verify, 500)
+            results.join("\n"),
+            truncate_output(&install_result, 2000),
+            truncate_output(&verify, 500)
         ))
     }
 }
@@ -112,7 +141,9 @@ pub struct NodeEnrollTool;
 
 #[async_trait]
 impl AgentTool for NodeEnrollTool {
-    fn name(&self) -> &str { "NodeEnroll" }
+    fn name(&self) -> &str {
+        "NodeEnroll"
+    }
     fn description(&self) -> &str {
         "Enroll a new node into the ForgeFleet fleet. Updates fleet.toml, sets up SSH key exchange, and verifies bidirectional connectivity."
     }
@@ -137,10 +168,19 @@ impl AgentTool for NodeEnrollTool {
         let ip = input.get("ip").and_then(Value::as_str).unwrap_or("");
         let port = input.get("port").and_then(Value::as_u64).unwrap_or(51000);
         let user = input.get("user").and_then(Value::as_str).unwrap_or("root");
-        let role = input.get("role").and_then(Value::as_str).unwrap_or("worker");
+        let role = input
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("worker");
         let ram_gb = input.get("ram_gb").and_then(Value::as_u64).unwrap_or(0);
-        let gpu = input.get("gpu_type").and_then(Value::as_str).unwrap_or("cpu");
-        let setup_keys = input.get("setup_ssh_keys").and_then(Value::as_bool).unwrap_or(true);
+        let gpu = input
+            .get("gpu_type")
+            .and_then(Value::as_str)
+            .unwrap_or("cpu");
+        let setup_keys = input
+            .get("setup_ssh_keys")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
 
         if name.is_empty() || ip.is_empty() {
             return AgentToolResult::err("Both 'node_name' and 'ip' are required");
@@ -152,7 +192,8 @@ impl AgentTool for NodeEnrollTool {
         if setup_keys {
             let key_copy = Command::new("ssh-copy-id")
                 .args(["-o", "StrictHostKeyChecking=no", &format!("{user}@{ip}")])
-                .output().await;
+                .output()
+                .await;
             match key_copy {
                 Ok(out) if out.status.success() => steps.push("SSH keys: exchanged".into()),
                 _ => steps.push("SSH keys: manual setup may be needed".into()),
@@ -161,8 +202,14 @@ impl AgentTool for NodeEnrollTool {
 
         // Step 2: Verify connectivity
         let verify = Command::new("ssh")
-            .args(["-o", "ConnectTimeout=5", &format!("{user}@{ip}"), "hostname"])
-            .output().await;
+            .args([
+                "-o",
+                "ConnectTimeout=5",
+                &format!("{user}@{ip}"),
+                "hostname",
+            ])
+            .output()
+            .await;
         match verify {
             Ok(out) if out.status.success() => {
                 let hostname = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -172,7 +219,8 @@ impl AgentTool for NodeEnrollTool {
         }
 
         // Step 3: Generate fleet.toml entry
-        let toml_entry = format!(r#"
+        let toml_entry = format!(
+            r#"
 [nodes.{name}]
 ip = "{ip}"
 port = {port}
@@ -180,17 +228,22 @@ role = "{role}"
 user = "{user}"
 ram_gb = {ram_gb}
 gpu_type = "{gpu}"
-"#);
+"#
+        );
         steps.push(format!("Fleet config entry generated"));
 
         // Step 4: Check if LLM server is running
         let llm_check = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(3))
-            .build().unwrap_or_default()
+            .build()
+            .unwrap_or_default()
             .get(format!("http://{ip}:{port}/health"))
-            .send().await;
+            .send()
+            .await;
         match llm_check {
-            Ok(r) if r.status().is_success() => steps.push(format!("LLM server: ONLINE at {ip}:{port}")),
+            Ok(r) if r.status().is_success() => {
+                steps.push(format!("LLM server: ONLINE at {ip}:{port}"))
+            }
             _ => steps.push(format!("LLM server: not running at {ip}:{port}")),
         }
 
@@ -206,7 +259,9 @@ pub struct ModelDeployTool;
 
 #[async_trait]
 impl AgentTool for ModelDeployTool {
-    fn name(&self) -> &str { "ModelDeploy" }
+    fn name(&self) -> &str {
+        "ModelDeploy"
+    }
     fn description(&self) -> &str {
         "Download and deploy an LLM model to a fleet node. Supports GGUF download, Ollama pull, and HuggingFace models."
     }
@@ -229,9 +284,18 @@ impl AgentTool for ModelDeployTool {
         let host = input.get("host").and_then(Value::as_str).unwrap_or("");
         let user = input.get("user").and_then(Value::as_str).unwrap_or("root");
         let model = input.get("model").and_then(Value::as_str).unwrap_or("");
-        let method = input.get("method").and_then(Value::as_str).unwrap_or("ollama");
-        let dest = input.get("destination").and_then(Value::as_str).unwrap_or("~/models");
-        let start = input.get("start_server").and_then(Value::as_bool).unwrap_or(false);
+        let method = input
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or("ollama");
+        let dest = input
+            .get("destination")
+            .and_then(Value::as_str)
+            .unwrap_or("~/models");
+        let start = input
+            .get("start_server")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let port = input.get("port").and_then(Value::as_u64).unwrap_or(51000);
 
         if host.is_empty() || model.is_empty() {
@@ -241,7 +305,9 @@ impl AgentTool for ModelDeployTool {
         let download_cmd = match method {
             "ollama" => format!("ollama pull {model}"),
             "wget" => format!("mkdir -p {dest} && cd {dest} && wget -c '{model}'"),
-            "huggingface" => format!("pip install huggingface-hub && huggingface-cli download {model} --local-dir {dest}"),
+            "huggingface" => format!(
+                "pip install huggingface-hub && huggingface-cli download {model} --local-dir {dest}"
+            ),
             _ => return AgentToolResult::err(format!("Unknown method: {method}")),
         };
 
@@ -254,7 +320,11 @@ impl AgentTool for ModelDeployTool {
 
         AgentToolResult::ok(format!(
             "Model Deploy — {model} → {host}\n\n  Method: {method}\n  Destination: {dest}\n  Server: {}\n\nOutput:\n{}",
-            if start { format!("starting on port {port}") } else { "not started".into() },
+            if start {
+                format!("starting on port {port}")
+            } else {
+                "not started".into()
+            },
             truncate_output(&result, 2000)
         ))
     }
@@ -265,7 +335,9 @@ pub struct FleetInventoryTool;
 
 #[async_trait]
 impl AgentTool for FleetInventoryTool {
-    fn name(&self) -> &str { "FleetInventory" }
+    fn name(&self) -> &str {
+        "FleetInventory"
+    }
     fn description(&self) -> &str {
         "Scan the fleet network and report all discovered nodes with hardware specs, running models, and health status."
     }
@@ -279,14 +351,22 @@ impl AgentTool for FleetInventoryTool {
         })
     }
     async fn execute(&self, input: Value, _ctx: &AgentToolContext) -> AgentToolResult {
-        let ports: Vec<u16> = input.get("ports").and_then(Value::as_array)
-            .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u16)).collect())
+        let ports: Vec<u16> = input
+            .get("ports")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_u64().map(|n| n as u16))
+                    .collect()
+            })
             .unwrap_or_else(|| vec![51000, 51001, 11434]);
 
         // Load known fleet nodes from Postgres (no hardcoded node list).
         let known_nodes: Vec<(String, String)> = match crate::fleet_info::fetch_nodes().await {
             Ok(rows) => rows.into_iter().map(|r| (r.name, r.ip)).collect(),
-            Err(e) => return AgentToolResult::err(format!("Failed to load fleet from database: {e}")),
+            Err(e) => {
+                return AgentToolResult::err(format!("Failed to load fleet from database: {e}"));
+            }
         };
 
         if known_nodes.is_empty() {
@@ -295,7 +375,8 @@ impl AgentTool for FleetInventoryTool {
 
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(3))
-            .build().unwrap_or_default();
+            .build()
+            .unwrap_or_default();
 
         let mut inventory = Vec::new();
 
@@ -308,8 +389,16 @@ impl AgentTool for FleetInventoryTool {
                 if let Ok(resp) = client.get(&url).send().await {
                     if resp.status().is_success() {
                         if let Ok(body) = resp.text().await {
-                            let model_name = serde_json::from_str::<Value>(&body).ok()
-                                .and_then(|v| v.get("data")?.as_array()?.first()?.get("id")?.as_str().map(String::from))
+                            let model_name = serde_json::from_str::<Value>(&body)
+                                .ok()
+                                .and_then(|v| {
+                                    v.get("data")?
+                                        .as_array()?
+                                        .first()?
+                                        .get("id")?
+                                        .as_str()
+                                        .map(String::from)
+                                })
                                 .unwrap_or_else(|| "unknown".into());
                             found_services.push(format!("    port {port}: {model_name} (ONLINE)"));
                         }
@@ -319,7 +408,9 @@ impl AgentTool for FleetInventoryTool {
                     if let Ok(_) = tokio::time::timeout(
                         std::time::Duration::from_secs(1),
                         tokio::net::TcpStream::connect(format!("{ip}:{port}")),
-                    ).await {
+                    )
+                    .await
+                    {
                         found_services.push(format!("    port {port}: service running (not LLM)"));
                     }
                 }
@@ -343,7 +434,9 @@ pub struct NodeHealthCheckTool;
 
 #[async_trait]
 impl AgentTool for NodeHealthCheckTool {
-    fn name(&self) -> &str { "NodeHealthCheck" }
+    fn name(&self) -> &str {
+        "NodeHealthCheck"
+    }
     fn description(&self) -> &str {
         "Deep health check for a fleet node: SSH connectivity, disk space, GPU detection, model availability, memory usage."
     }
@@ -363,20 +456,44 @@ impl AgentTool for NodeHealthCheckTool {
         let user = input.get("user").and_then(Value::as_str).unwrap_or("root");
         let port = input.get("port").and_then(Value::as_u64).unwrap_or(51000);
 
-        if host.is_empty() { return AgentToolResult::err("Missing 'host'"); }
+        if host.is_empty() {
+            return AgentToolResult::err("Missing 'host'");
+        }
 
         let mut checks = Vec::new();
 
         // SSH connectivity
         let ssh = Command::new("ssh")
-            .args(["-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=no", &format!("{user}@{host}"), "echo ok"])
-            .output().await;
-        checks.push(format!("SSH: {}", if ssh.as_ref().map(|o| o.status.success()).unwrap_or(false) { "OK" } else { "FAIL" }));
+            .args([
+                "-o",
+                "ConnectTimeout=5",
+                "-o",
+                "StrictHostKeyChecking=no",
+                &format!("{user}@{host}"),
+                "echo ok",
+            ])
+            .output()
+            .await;
+        checks.push(format!(
+            "SSH: {}",
+            if ssh.as_ref().map(|o| o.status.success()).unwrap_or(false) {
+                "OK"
+            } else {
+                "FAIL"
+            }
+        ));
 
         // System info via SSH
         let sys_info = ssh_cmd(user, host, "hostname && uname -sr && free -h 2>/dev/null | head -2 || sysctl -n hw.memsize 2>/dev/null && df -h / | tail -1").await;
         if !sys_info.is_empty() {
-            checks.push(format!("System:\n{}", sys_info.lines().map(|l| format!("    {l}")).collect::<Vec<_>>().join("\n")));
+            checks.push(format!(
+                "System:\n{}",
+                sys_info
+                    .lines()
+                    .map(|l| format!("    {l}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ));
         }
 
         // GPU detection
@@ -384,21 +501,46 @@ impl AgentTool for NodeHealthCheckTool {
         checks.push(format!("GPU: {}", gpu.lines().next().unwrap_or("unknown")));
 
         // LLM server health
-        let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(3)).build().unwrap_or_default();
-        let llm_health = client.get(format!("http://{host}:{port}/health")).send().await;
-        checks.push(format!("LLM ({port}): {}", match llm_health {
-            Ok(r) if r.status().is_success() => "ONLINE",
-            _ => "OFFLINE",
-        }));
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+            .unwrap_or_default();
+        let llm_health = client
+            .get(format!("http://{host}:{port}/health"))
+            .send()
+            .await;
+        checks.push(format!(
+            "LLM ({port}): {}",
+            match llm_health {
+                Ok(r) if r.status().is_success() => "ONLINE",
+                _ => "OFFLINE",
+            }
+        ));
 
         // Models available
-        if let Ok(resp) = client.get(format!("http://{host}:{port}/v1/models")).send().await {
+        if let Ok(resp) = client
+            .get(format!("http://{host}:{port}/v1/models"))
+            .send()
+            .await
+        {
             if let Ok(body) = resp.text().await {
-                let models: Vec<String> = serde_json::from_str::<Value>(&body).ok()
+                let models: Vec<String> = serde_json::from_str::<Value>(&body)
+                    .ok()
                     .and_then(|v| v.get("data")?.as_array().cloned())
-                    .map(|arr| arr.iter().filter_map(|m| m.get("id").and_then(Value::as_str).map(String::from)).collect())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|m| m.get("id").and_then(Value::as_str).map(String::from))
+                            .collect()
+                    })
                     .unwrap_or_default();
-                checks.push(format!("Models: {}", if models.is_empty() { "none".into() } else { models.join(", ") }));
+                checks.push(format!(
+                    "Models: {}",
+                    if models.is_empty() {
+                        "none".into()
+                    } else {
+                        models.join(", ")
+                    }
+                ));
             }
         }
 
@@ -411,7 +553,9 @@ pub struct BinaryDeployTool;
 
 #[async_trait]
 impl AgentTool for BinaryDeployTool {
-    fn name(&self) -> &str { "BinaryDeploy" }
+    fn name(&self) -> &str {
+        "BinaryDeploy"
+    }
     fn description(&self) -> &str {
         "Build and deploy the ForgeFleet binary to a fleet node via SSH. Cross-compiles if needed."
     }
@@ -431,29 +575,46 @@ impl AgentTool for BinaryDeployTool {
         let host = input.get("host").and_then(Value::as_str).unwrap_or("");
         let user = input.get("user").and_then(Value::as_str).unwrap_or("root");
         let binary = input.get("binary").and_then(Value::as_str).unwrap_or("ff");
-        let build_local = input.get("build_locally").and_then(Value::as_bool).unwrap_or(true);
+        let build_local = input
+            .get("build_locally")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
 
-        if host.is_empty() { return AgentToolResult::err("Missing 'host'"); }
+        if host.is_empty() {
+            return AgentToolResult::err("Missing 'host'");
+        }
 
         if build_local {
             // Build locally
-            let build = Command::new("cargo").args(["build", "--release", "-p", "ff-terminal"])
-                .current_dir(&ctx.working_dir).output().await;
+            let build = Command::new("cargo")
+                .args(["build", "--release", "-p", "ff-terminal"])
+                .current_dir(&ctx.working_dir)
+                .output()
+                .await;
             match build {
                 Ok(out) if out.status.success() => {
                     // SCP to target
                     let binary_path = ctx.working_dir.join("target/release/ff");
                     let scp = Command::new("scp")
-                        .args([&binary_path.to_string_lossy().to_string(), &format!("{user}@{host}:/usr/local/bin/{binary}")])
-                        .output().await;
+                        .args([
+                            &binary_path.to_string_lossy().to_string(),
+                            &format!("{user}@{host}:/usr/local/bin/{binary}"),
+                        ])
+                        .output()
+                        .await;
                     match scp {
-                        Ok(out) if out.status.success() => {
-                            AgentToolResult::ok(format!("Binary deployed: {binary} → {host}:/usr/local/bin/{binary}"))
-                        }
-                        _ => AgentToolResult::err("SCP failed. Check SSH access and permissions.".to_string()),
+                        Ok(out) if out.status.success() => AgentToolResult::ok(format!(
+                            "Binary deployed: {binary} → {host}:/usr/local/bin/{binary}"
+                        )),
+                        _ => AgentToolResult::err(
+                            "SCP failed. Check SSH access and permissions.".to_string(),
+                        ),
                     }
                 }
-                Ok(out) => AgentToolResult::err(format!("Build failed:\n{}", String::from_utf8_lossy(&out.stderr))),
+                Ok(out) => AgentToolResult::err(format!(
+                    "Build failed:\n{}",
+                    String::from_utf8_lossy(&out.stderr)
+                )),
                 Err(e) => AgentToolResult::err(format!("Build command failed: {e}")),
             }
         } else {
@@ -462,7 +623,10 @@ impl AgentTool for BinaryDeployTool {
                 "cd ~/projects/forge-fleet && git pull && cargo build --release -p ff-terminal && cp target/release/ff /usr/local/bin/ff"
             );
             let result = ssh_cmd(user, host, &build_cmd).await;
-            AgentToolResult::ok(format!("Remote build on {host}:\n{}", truncate_output(&result, 2000)))
+            AgentToolResult::ok(format!(
+                "Remote build on {host}:\n{}",
+                truncate_output(&result, 2000)
+            ))
         }
     }
 }
@@ -470,8 +634,16 @@ impl AgentTool for BinaryDeployTool {
 // Helper: run a command over SSH
 async fn ssh_cmd(user: &str, host: &str, command: &str) -> String {
     match Command::new("ssh")
-        .args(["-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=no", &format!("{user}@{host}"), command])
-        .output().await
+        .args([
+            "-o",
+            "ConnectTimeout=10",
+            "-o",
+            "StrictHostKeyChecking=no",
+            &format!("{user}@{host}"),
+            command,
+        ])
+        .output()
+        .await
     {
         Ok(out) => {
             let stdout = String::from_utf8_lossy(&out.stdout);

@@ -14,7 +14,9 @@ pub struct ModelDiscoveryTool;
 
 #[async_trait]
 impl AgentTool for ModelDiscoveryTool {
-    fn name(&self) -> &str { "ModelDiscovery" }
+    fn name(&self) -> &str {
+        "ModelDiscovery"
+    }
     fn description(&self) -> &str {
         "Discover new LLM models from multiple sources: Ollama library, HuggingFace trending, web search for new releases, and independent model sites. Also researches which inference engine is best for your hardware."
     }
@@ -30,21 +32,30 @@ impl AgentTool for ModelDiscoveryTool {
     async fn execute(&self, input: Value, _ctx: &AgentToolContext) -> AgentToolResult {
         let action = input.get("action").and_then(Value::as_str).unwrap_or("");
         let query = input.get("query").and_then(Value::as_str).unwrap_or("");
-        let hardware = input.get("hardware").and_then(Value::as_str).unwrap_or("any");
+        let hardware = input
+            .get("hardware")
+            .and_then(Value::as_str)
+            .unwrap_or("any");
         let ram_gb = input.get("ram_gb").and_then(Value::as_u64).unwrap_or(32);
 
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(15))
             .user_agent("ForgeFleet-Agent/0.1")
-            .build().unwrap_or_default();
+            .build()
+            .unwrap_or_default();
 
         match action {
             "search_all" => {
-                if query.is_empty() { return AgentToolResult::err("'query' required for search_all"); }
+                if query.is_empty() {
+                    return AgentToolResult::err("'query' required for search_all");
+                }
                 let mut results = Vec::new();
 
                 // 1. HuggingFace
-                let hf_url = format!("https://huggingface.co/api/models?search={}&sort=trending&direction=-1&limit=5&filter=text-generation", urlenc(query));
+                let hf_url = format!(
+                    "https://huggingface.co/api/models?search={}&sort=trending&direction=-1&limit=5&filter=text-generation",
+                    urlenc(query)
+                );
                 if let Ok(resp) = client.get(&hf_url).send().await {
                     if let Ok(models) = resp.json::<Vec<Value>>().await {
                         results.push("## HuggingFace".into());
@@ -57,7 +68,10 @@ impl AgentTool for ModelDiscoveryTool {
                 }
 
                 // 2. Ollama search
-                let ollama_search = Command::new("ollama").args(["search", query]).output().await;
+                let ollama_search = Command::new("ollama")
+                    .args(["search", query])
+                    .output()
+                    .await;
                 if let Ok(out) = ollama_search {
                     if out.status.success() {
                         let stdout = String::from_utf8_lossy(&out.stdout);
@@ -74,26 +88,42 @@ impl AgentTool for ModelDiscoveryTool {
                 results.push("  - https://falconllm.tii.ae/falcon-models.html (Falcon 3)".into());
                 results.push("  - https://www.together.ai/models (Together AI)".into());
                 results.push("  - https://openrouter.ai/models (OpenRouter catalog)".into());
-                results.push("  - https://lmsys.org/blog/2024-01-17-swe-bench/ (SWE-bench rankings)".into());
-                results.push("  - Use WebSearch tool for: 'best coding LLM 2026', 'new open source models'".into());
+                results.push(
+                    "  - https://lmsys.org/blog/2024-01-17-swe-bench/ (SWE-bench rankings)".into(),
+                );
+                results.push(
+                    "  - Use WebSearch tool for: 'best coding LLM 2026', 'new open source models'"
+                        .into(),
+                );
 
                 if results.is_empty() {
                     AgentToolResult::ok("No results. Try a different query.".to_string())
                 } else {
-                    AgentToolResult::ok(format!("Model Search: \"{query}\"\n\n{}", results.join("\n")))
+                    AgentToolResult::ok(format!(
+                        "Model Search: \"{query}\"\n\n{}",
+                        results.join("\n")
+                    ))
                 }
             }
 
             "search_ollama" => {
                 // Ollama has a search command in newer versions
-                let result = Command::new("ollama").args(["search", if query.is_empty() { "coding" } else { query }]).output().await;
+                let result = Command::new("ollama")
+                    .args(["search", if query.is_empty() { "coding" } else { query }])
+                    .output()
+                    .await;
                 match result {
-                    Ok(out) if out.status.success() => {
-                        AgentToolResult::ok(format!("Ollama Search:\n{}", truncate_output(&String::from_utf8_lossy(&out.stdout), MAX_TOOL_RESULT_CHARS)))
-                    }
+                    Ok(out) if out.status.success() => AgentToolResult::ok(format!(
+                        "Ollama Search:\n{}",
+                        truncate_output(
+                            &String::from_utf8_lossy(&out.stdout),
+                            MAX_TOOL_RESULT_CHARS
+                        )
+                    )),
                     _ => {
                         // Fallback: list popular models
-                        AgentToolResult::ok("Ollama Popular Models:\n\n\
+                        AgentToolResult::ok(
+                            "Ollama Popular Models:\n\n\
   Coding:\n\
     - qwen2.5-coder:32b (20GB) — best open coding model\n\
     - qwen2.5-coder:14b (9GB) — balanced coding\n\
@@ -111,24 +141,40 @@ impl AgentTool for ModelDiscoveryTool {
   Reasoning:\n\
     - deepseek-r1:32b (20GB) — chain-of-thought\n\
     - qwen3:32b (20GB) — latest Qwen\n\n\
-  Use: ollama pull <model> to download".to_string())
+  Use: ollama pull <model> to download"
+                                .to_string(),
+                        )
                     }
                 }
             }
 
             "search_huggingface" => {
-                let hf_query = if query.is_empty() { "text-generation" } else { query };
-                let url = format!("https://huggingface.co/api/models?search={}&sort=trending&direction=-1&limit=15&filter=text-generation", urlenc(hf_query));
+                let hf_query = if query.is_empty() {
+                    "text-generation"
+                } else {
+                    query
+                };
+                let url = format!(
+                    "https://huggingface.co/api/models?search={}&sort=trending&direction=-1&limit=15&filter=text-generation",
+                    urlenc(hf_query)
+                );
                 match client.get(&url).send().await {
                     Ok(resp) if resp.status().is_success() => {
                         match resp.json::<Vec<Value>>().await {
                             Ok(models) => {
-                                let mut output = format!("HuggingFace Trending ('{hf_query}'):\n\n");
+                                let mut output =
+                                    format!("HuggingFace Trending ('{hf_query}'):\n\n");
                                 for (i, m) in models.iter().take(15).enumerate() {
                                     let id = m.get("id").and_then(Value::as_str).unwrap_or("?");
-                                    let downloads = m.get("downloads").and_then(Value::as_u64).unwrap_or(0);
+                                    let downloads =
+                                        m.get("downloads").and_then(Value::as_u64).unwrap_or(0);
                                     let likes = m.get("likes").and_then(Value::as_u64).unwrap_or(0);
-                                    output.push_str(&format!("  {}. {id} — {} downloads, {} likes\n", i+1, fmt_num(downloads), likes));
+                                    output.push_str(&format!(
+                                        "  {}. {id} — {} downloads, {} likes\n",
+                                        i + 1,
+                                        fmt_num(downloads),
+                                        likes
+                                    ));
                                 }
                                 output.push_str("\nFor GGUF versions, search: <model>-GGUF (e.g. 'Qwen/Qwen2.5-Coder-32B-Instruct-GGUF')");
                                 AgentToolResult::ok(output)
@@ -149,8 +195,13 @@ impl AgentTool for ModelDiscoveryTool {
                                 let mut output = String::from("Trending LLMs Right Now:\n\n");
                                 for (i, m) in models.iter().take(10).enumerate() {
                                     let id = m.get("id").and_then(Value::as_str).unwrap_or("?");
-                                    let downloads = m.get("downloads").and_then(Value::as_u64).unwrap_or(0);
-                                    output.push_str(&format!("  {}. {id} ({} downloads)\n", i+1, fmt_num(downloads)));
+                                    let downloads =
+                                        m.get("downloads").and_then(Value::as_u64).unwrap_or(0);
+                                    output.push_str(&format!(
+                                        "  {}. {id} ({} downloads)\n",
+                                        i + 1,
+                                        fmt_num(downloads)
+                                    ));
                                 }
                                 output.push_str("\nUse ModelDiscovery model_card model_name='<id>' for details.");
                                 AgentToolResult::ok(output)
@@ -168,46 +219,75 @@ impl AgentTool for ModelDiscoveryTool {
             }
 
             "model_card" => {
-                let model_name = input.get("model_name").and_then(Value::as_str).or(Some(query)).unwrap_or("");
-                if model_name.is_empty() { return AgentToolResult::err("'model_name' required"); }
+                let model_name = input
+                    .get("model_name")
+                    .and_then(Value::as_str)
+                    .or(Some(query))
+                    .unwrap_or("");
+                if model_name.is_empty() {
+                    return AgentToolResult::err("'model_name' required");
+                }
 
                 let url = format!("https://huggingface.co/api/models/{model_name}");
                 match client.get(&url).send().await {
-                    Ok(resp) if resp.status().is_success() => {
-                        match resp.json::<Value>().await {
-                            Ok(model) => {
-                                let id = model.get("id").and_then(Value::as_str).unwrap_or("?");
-                                let pipeline = model.get("pipeline_tag").and_then(Value::as_str).unwrap_or("?");
-                                let downloads = model.get("downloads").and_then(Value::as_u64).unwrap_or(0);
-                                let likes = model.get("likes").and_then(Value::as_u64).unwrap_or(0);
-                                let tags: Vec<&str> = model.get("tags").and_then(Value::as_array)
-                                    .map(|a| a.iter().filter_map(Value::as_str).take(15).collect()).unwrap_or_default();
-                                let siblings: Vec<&str> = model.get("siblings").and_then(Value::as_array)
-                                    .map(|a| a.iter().filter_map(|s| s.get("rfilename").and_then(Value::as_str))
-                                        .filter(|f| f.ends_with(".gguf") || f.ends_with(".safetensors"))
-                                        .take(10).collect())
-                                    .unwrap_or_default();
+                    Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
+                        Ok(model) => {
+                            let id = model.get("id").and_then(Value::as_str).unwrap_or("?");
+                            let pipeline = model
+                                .get("pipeline_tag")
+                                .and_then(Value::as_str)
+                                .unwrap_or("?");
+                            let downloads =
+                                model.get("downloads").and_then(Value::as_u64).unwrap_or(0);
+                            let likes = model.get("likes").and_then(Value::as_u64).unwrap_or(0);
+                            let tags: Vec<&str> = model
+                                .get("tags")
+                                .and_then(Value::as_array)
+                                .map(|a| a.iter().filter_map(Value::as_str).take(15).collect())
+                                .unwrap_or_default();
+                            let siblings: Vec<&str> = model
+                                .get("siblings")
+                                .and_then(Value::as_array)
+                                .map(|a| {
+                                    a.iter()
+                                        .filter_map(|s| s.get("rfilename").and_then(Value::as_str))
+                                        .filter(|f| {
+                                            f.ends_with(".gguf") || f.ends_with(".safetensors")
+                                        })
+                                        .take(10)
+                                        .collect()
+                                })
+                                .unwrap_or_default();
 
-                                let mut output = format!(
-                                    "Model Card: {id}\n\n\
+                            let mut output = format!(
+                                "Model Card: {id}\n\n\
                                      Pipeline: {pipeline}\n\
                                      Downloads: {}\n\
                                      Likes: {likes}\n\
                                      Tags: {}\n",
-                                    fmt_num(downloads), tags.join(", ")
-                                );
+                                fmt_num(downloads),
+                                tags.join(", ")
+                            );
 
-                                if !siblings.is_empty() {
-                                    output.push_str(&format!("\nAvailable files:\n{}\n", siblings.iter().map(|f| format!("  - {f}")).collect::<Vec<_>>().join("\n")));
-                                }
-
-                                output.push_str(&format!("\nhttps://huggingface.co/{id}"));
-                                AgentToolResult::ok(output)
+                            if !siblings.is_empty() {
+                                output.push_str(&format!(
+                                    "\nAvailable files:\n{}\n",
+                                    siblings
+                                        .iter()
+                                        .map(|f| format!("  - {f}"))
+                                        .collect::<Vec<_>>()
+                                        .join("\n")
+                                ));
                             }
-                            Err(e) => AgentToolResult::err(format!("Parse error: {e}")),
+
+                            output.push_str(&format!("\nhttps://huggingface.co/{id}"));
+                            AgentToolResult::ok(output)
                         }
+                        Err(e) => AgentToolResult::err(format!("Parse error: {e}")),
+                    },
+                    Ok(resp) => {
+                        AgentToolResult::err(format!("Model not found: HTTP {}", resp.status()))
                     }
-                    Ok(resp) => AgentToolResult::err(format!("Model not found: HTTP {}", resp.status())),
                     Err(e) => AgentToolResult::err(format!("Request failed: {e}")),
                 }
             }
@@ -219,7 +299,8 @@ impl AgentTool for ModelDiscoveryTool {
 
 /// Recommend the best inference engine for given hardware.
 fn recommend_engines(hardware: &str, ram_gb: u64) -> String {
-    let mut output = format!("Inference Engine Recommendations for {hardware} ({ram_gb}GB RAM):\n\n");
+    let mut output =
+        format!("Inference Engine Recommendations for {hardware} ({ram_gb}GB RAM):\n\n");
 
     match hardware {
         "mac_m3_ultra" | "mac_m4" => {
@@ -289,8 +370,10 @@ fn recommend_engines(hardware: &str, ram_gb: u64) -> String {
         }
         _ => {
             output.push_str("## General Recommendations\n\n");
-            output.push_str("  | Engine | Mac | Ubuntu (Intel) | Ubuntu (NVIDIA) | Ubuntu (AMD) |\n");
-            output.push_str("  |--------|-----|----------------|-----------------|-------------|\n");
+            output
+                .push_str("  | Engine | Mac | Ubuntu (Intel) | Ubuntu (NVIDIA) | Ubuntu (AMD) |\n");
+            output
+                .push_str("  |--------|-----|----------------|-----------------|-------------|\n");
             output.push_str("  | llama.cpp | ✅ Metal | ✅ CPU | ✅ CUDA | ✅ ROCm |\n");
             output.push_str("  | Ollama | ✅ | ✅ | ✅ | ✅ |\n");
             output.push_str("  | vLLM | ❌ | ❌ | ✅ Best | ⚠ Limited |\n");
@@ -323,17 +406,24 @@ fn recommend_engines(hardware: &str, ram_gb: u64) -> String {
 }
 
 fn urlenc(input: &str) -> String {
-    input.chars().map(|c| match c {
-        'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => c.to_string(),
-        ' ' => "+".to_string(),
-        _ => format!("%{:02X}", c as u8),
-    }).collect()
+    input
+        .chars()
+        .map(|c| match c {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => c.to_string(),
+            ' ' => "+".to_string(),
+            _ => format!("%{:02X}", c as u8),
+        })
+        .collect()
 }
 
 fn fmt_num(n: u64) -> String {
-    if n >= 1_000_000 { format!("{:.1}M", n as f64 / 1_000_000.0) }
-    else if n >= 1_000 { format!("{:.1}K", n as f64 / 1_000.0) }
-    else { format!("{n}") }
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}K", n as f64 / 1_000.0)
+    } else {
+        format!("{n}")
+    }
 }
 
 /// ClusterInference — manage distributed LLM inference across fleet nodes.
@@ -341,7 +431,9 @@ pub struct ClusterInferenceTool;
 
 #[async_trait]
 impl AgentTool for ClusterInferenceTool {
-    fn name(&self) -> &str { "ClusterInference" }
+    fn name(&self) -> &str {
+        "ClusterInference"
+    }
     fn description(&self) -> &str {
         "Set up and manage clustered LLM inference — split one large model across multiple fleet nodes for combined memory. Supports llama.cpp RPC, Exo pipeline parallelism, and vLLM tensor parallelism."
     }
@@ -357,9 +449,15 @@ impl AgentTool for ClusterInferenceTool {
     async fn execute(&self, input: Value, _ctx: &AgentToolContext) -> AgentToolResult {
         let action = input.get("action").and_then(Value::as_str).unwrap_or("");
         let model = input.get("model").and_then(Value::as_str).unwrap_or("");
-        let nodes: Vec<&str> = input.get("nodes").and_then(Value::as_array)
-            .map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_default();
-        let method = input.get("method").and_then(Value::as_str).unwrap_or("auto");
+        let nodes: Vec<&str> = input
+            .get("nodes")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        let method = input
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or("auto");
 
         match action {
             "plan" => {

@@ -160,9 +160,7 @@ impl AgentTool for GrepTool {
         let stdout = String::from_utf8_lossy(&output.stdout);
 
         if stdout.trim().is_empty() {
-            return AgentToolResult::ok(format!(
-                "No matches found for pattern: {pattern}"
-            ));
+            return AgentToolResult::ok(format!("No matches found for pattern: {pattern}"));
         }
 
         // Apply head limit

@@ -247,11 +247,22 @@ fn build_outgoing_request(
         // rejects `null` for these with 400 "object expected as reply markup".
         let mut payload = serde_json::Map::new();
         payload.insert("chat_id".into(), json!(outgoing.chat_id));
-        payload.insert("text".into(), json!(outgoing.text.clone().unwrap_or_default()));
-        if let Some(id) = outgoing.reply_to.as_deref().and_then(|id| id.parse::<i64>().ok()) {
+        payload.insert(
+            "text".into(),
+            json!(outgoing.text.clone().unwrap_or_default()),
+        );
+        if let Some(id) = outgoing
+            .reply_to
+            .as_deref()
+            .and_then(|id| id.parse::<i64>().ok())
+        {
             payload.insert("reply_to_message_id".into(), json!(id));
         }
-        if let Some(id) = outgoing.thread_id.as_deref().and_then(|id| id.parse::<i64>().ok()) {
+        if let Some(id) = outgoing
+            .thread_id
+            .as_deref()
+            .and_then(|id| id.parse::<i64>().ok())
+        {
             payload.insert("message_thread_id".into(), json!(id));
         }
         if let Some(kb) = inline_keyboard_json(&outgoing.buttons) {
@@ -300,10 +311,18 @@ fn build_media_request(
             payload.insert("caption".to_string(), json!(text));
         }
     }
-    if let Some(id) = outgoing.reply_to.as_deref().and_then(|id| id.parse::<i64>().ok()) {
+    if let Some(id) = outgoing
+        .reply_to
+        .as_deref()
+        .and_then(|id| id.parse::<i64>().ok())
+    {
         payload.insert("reply_to_message_id".to_string(), json!(id));
     }
-    if let Some(id) = outgoing.thread_id.as_deref().and_then(|id| id.parse::<i64>().ok()) {
+    if let Some(id) = outgoing
+        .thread_id
+        .as_deref()
+        .and_then(|id| id.parse::<i64>().ok())
+    {
         payload.insert("message_thread_id".to_string(), json!(id));
     }
     if let Some(kb) = inline_keyboard_json(&outgoing.buttons) {

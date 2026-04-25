@@ -352,9 +352,7 @@ async fn query_upstream(
                     fetch_github_branch_head(http, repo, branch, github_token).await
                 }
                 "commit" => {
-                    let Some(sha) =
-                        version_source.get("commit").and_then(|v| v.as_str())
-                    else {
+                    let Some(sha) = version_source.get("commit").and_then(|v| v.as_str()) else {
                         return UpstreamResult::Error(
                             "github_release ref_kind='commit' needs 'commit' field".to_string(),
                         );
@@ -395,12 +393,11 @@ async fn query_upstream(
             "sw_vers is macOS-local; no reliable upstream catalog API".to_string(),
         ),
         "apt_dist" => UpstreamResult::Skipped(
-            "apt_dist skipped — Canonical release catalog is too complex to query here"
-                .to_string(),
+            "apt_dist skipped — Canonical release catalog is too complex to query here".to_string(),
         ),
-        "cmd" => UpstreamResult::Skipped(
-            "cmd method is for locally-detected versions only".to_string(),
-        ),
+        "cmd" => {
+            UpstreamResult::Skipped("cmd method is for locally-detected versions only".to_string())
+        }
         "" => UpstreamResult::Error("version_source missing 'method' field".to_string()),
         other => UpstreamResult::Skipped(format!("unknown method '{other}'")),
     }
@@ -414,7 +411,9 @@ async fn fetch_github_latest(
     token: Option<&str>,
 ) -> Result<String, String> {
     let url = format!("https://api.github.com/repos/{repo}/releases/latest");
-    let mut req = http.get(&url).header("Accept", "application/vnd.github+json");
+    let mut req = http
+        .get(&url)
+        .header("Accept", "application/vnd.github+json");
     if let Some(t) = token {
         if !t.is_empty() {
             req = req.header("Authorization", format!("Bearer {t}"));
@@ -448,7 +447,9 @@ async fn fetch_github_branch_head(
     token: Option<&str>,
 ) -> Result<String, String> {
     let url = format!("https://api.github.com/repos/{repo}/branches/{branch}");
-    let mut req = http.get(&url).header("Accept", "application/vnd.github+json");
+    let mut req = http
+        .get(&url)
+        .header("Accept", "application/vnd.github+json");
     if let Some(t) = token {
         if !t.is_empty() {
             req = req.header("Authorization", format!("Bearer {t}"));
@@ -472,7 +473,11 @@ async fn fetch_github_branch_head(
 /// Fetch the stable version of a Homebrew formula.
 async fn fetch_brew_latest(http: &reqwest::Client, formula: &str) -> Result<String, String> {
     let url = format!("https://formulae.brew.sh/api/formula/{formula}.json");
-    let resp = http.get(&url).send().await.map_err(|e| format!("GET {url}: {e}"))?;
+    let resp = http
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("GET {url}: {e}"))?;
 
     if !resp.status().is_success() {
         return Err(format!("GET {url}: HTTP {}", resp.status()));
@@ -495,7 +500,11 @@ async fn fetch_brew_latest(http: &reqwest::Client, formula: &str) -> Result<Stri
 /// Fetch the latest version of a PyPI package.
 async fn fetch_pip_latest(http: &reqwest::Client, package: &str) -> Result<String, String> {
     let url = format!("https://pypi.org/pypi/{package}/json");
-    let resp = http.get(&url).send().await.map_err(|e| format!("GET {url}: {e}"))?;
+    let resp = http
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("GET {url}: {e}"))?;
 
     if !resp.status().is_success() {
         return Err(format!("GET {url}: HTTP {}", resp.status()));
@@ -519,7 +528,12 @@ async fn fetch_pip_latest(http: &reqwest::Client, package: &str) -> Result<Strin
 fn strip_v_prefix(tag: &str) -> &str {
     if let Some(rest) = tag.strip_prefix('v') {
         // Only strip when it looks like a SemVer tag (next char digit).
-        if rest.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+        if rest
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_digit())
+            .unwrap_or(false)
+        {
             return rest;
         }
     }

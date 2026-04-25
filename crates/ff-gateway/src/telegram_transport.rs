@@ -332,10 +332,12 @@ impl TelegramPollingTransport {
             let response = match command.command.as_str() {
                 // Legacy commands
                 "start" => {
-                    format!("ForgeFleet Telegram transport online on node {}.", self.node_name)
+                    format!(
+                        "ForgeFleet Telegram transport online on node {}.",
+                        self.node_name
+                    )
                 }
-                "help" => {
-                    "Commands:\n\
+                "help" => "Commands:\n\
                      /start - Check bot status\n\
                      /help - This help\n\
                      /ping - Heartbeat\n\
@@ -345,8 +347,7 @@ impl TelegramPollingTransport {
                      /switch <slug> - Switch thread\n\
                      /archive <slug> - Archive thread\n\
                      /where - Current thread"
-                        .to_string()
-                }
+                    .to_string(),
                 "ping" => "pong".to_string(),
                 "status" => format!("node: {}\nroute: {:?}", self.node_name, _route.target),
 
@@ -390,9 +391,7 @@ impl TelegramPollingTransport {
                 }
                 "callback" => {
                     if let Some(pool) = pool {
-                        return self
-                            .handle_callback(pool, &incoming, &command.args)
-                            .await;
+                        return self.handle_callback(pool, &incoming, &command.args).await;
                     }
                     "Brain not available (no Postgres)".to_string()
                 }
@@ -419,7 +418,9 @@ impl TelegramPollingTransport {
 
         // ── Regular message → brain chat with LLM ────────────────────────
         if let Some(pool) = pool {
-            return self.handle_brain_message(pool, &incoming, media_summary.as_ref()).await;
+            return self
+                .handle_brain_message(pool, &incoming, media_summary.as_ref())
+                .await;
         }
 
         // Fallback: no Postgres available, echo stub
@@ -458,19 +459,18 @@ impl TelegramPollingTransport {
             .unwrap_or(&incoming.from_user_id);
 
         // Resolve or create user
-        let user_id =
-            match ff_db::pg_resolve_channel_user(pool, "telegram", chat_id).await? {
-                Some(uid) => uid,
-                None => {
-                    let uid = ff_db::pg_create_brain_user(pool, display_name, Some(display_name))
-                        .await
-                        .context("failed to create brain user for telegram chat")?;
-                    ff_db::pg_upsert_channel_identity(pool, "telegram", chat_id, uid)
-                        .await
-                        .context("failed to upsert telegram channel identity")?;
-                    uid
-                }
-            };
+        let user_id = match ff_db::pg_resolve_channel_user(pool, "telegram", chat_id).await? {
+            Some(uid) => uid,
+            None => {
+                let uid = ff_db::pg_create_brain_user(pool, display_name, Some(display_name))
+                    .await
+                    .context("failed to create brain user for telegram chat")?;
+                ff_db::pg_upsert_channel_identity(pool, "telegram", chat_id, uid)
+                    .await
+                    .context("failed to upsert telegram channel identity")?;
+                uid
+            }
+        };
 
         // Resolve or create attached thread
         let (thread_id, thread_slug) =
@@ -483,11 +483,10 @@ impl TelegramPollingTransport {
                     (tid, slug)
                 }
                 None => {
-                    let tid = ff_db::pg_create_brain_thread(
-                        pool, user_id, "inbox", Some("Inbox"), None,
-                    )
-                    .await
-                    .context("failed to create default inbox thread")?;
+                    let tid =
+                        ff_db::pg_create_brain_thread(pool, user_id, "inbox", Some("Inbox"), None)
+                            .await
+                            .context("failed to create default inbox thread")?;
                     ff_db::pg_attach_thread(pool, "telegram", chat_id, user_id, tid)
                         .await
                         .context("failed to attach default inbox thread")?;
@@ -527,10 +526,7 @@ impl TelegramPollingTransport {
             } else {
                 ""
             };
-            let title = thread
-                .title
-                .as_deref()
-                .unwrap_or(&thread.slug);
+            let title = thread.title.as_deref().unwrap_or(&thread.slug);
             text_lines.push(format!("- {}{marker}", title));
             button_rows.push(vec![MessageButton::callback(
                 format!("{}{marker}", title),
@@ -563,15 +559,9 @@ impl TelegramPollingTransport {
         };
 
         let (user_id, _, _) = self.ensure_brain_user_and_thread(pool, incoming).await?;
-        let tid = ff_db::pg_create_brain_thread(
-            pool,
-            user_id,
-            slug,
-            title.as_deref(),
-            None,
-        )
-        .await
-        .context("failed to create brain thread")?;
+        let tid = ff_db::pg_create_brain_thread(pool, user_id, slug, title.as_deref(), None)
+            .await
+            .context("failed to create brain thread")?;
 
         // Auto-switch to the new thread
         ff_db::pg_attach_thread(pool, "telegram", &incoming.chat_id, user_id, tid).await?;
@@ -616,8 +606,7 @@ impl TelegramPollingTransport {
 
         let reply = match thread {
             Some(t) => {
-                ff_db::pg_attach_thread(pool, "telegram", &incoming.chat_id, user_id, t.id)
-                    .await?;
+                ff_db::pg_attach_thread(pool, "telegram", &incoming.chat_id, user_id, t.id).await?;
                 format!(
                     "Switched to thread '{}'",
                     t.title.as_deref().unwrap_or(&t.slug)
@@ -671,11 +660,7 @@ impl TelegramPollingTransport {
         Ok(())
     }
 
-    async fn handle_where_command(
-        &self,
-        pool: &PgPool,
-        incoming: &IncomingMessage,
-    ) -> Result<()> {
+    async fn handle_where_command(&self, pool: &PgPool, incoming: &IncomingMessage) -> Result<()> {
         let (_, _, thread_slug) = self.ensure_brain_user_and_thread(pool, incoming).await?;
         let reply = format!("You are in thread: {thread_slug}");
         let mut outgoing =
@@ -748,19 +733,16 @@ impl TelegramPollingTransport {
         let _ = ff_db::pg_touch_brain_thread(pool, thread_id).await;
 
         // Build conversation history for LLM
-        let display_name = incoming
-            .from_username
-            .as_deref()
-            .unwrap_or("user");
+        let display_name = incoming.from_username.as_deref().unwrap_or("user");
 
-        let assistant_text =
-            match call_fleet_llm(pool, &thread_slug, display_name, thread_id).await {
-                Ok(text) => text,
-                Err(e) => {
-                    warn!(error = %e, "LLM call failed, returning error message");
-                    format!("(LLM error: {e})")
-                }
-            };
+        let assistant_text = match call_fleet_llm(pool, &thread_slug, display_name, thread_id).await
+        {
+            Ok(text) => text,
+            Err(e) => {
+                warn!(error = %e, "LLM call failed, returning error message");
+                format!("(LLM error: {e})")
+            }
+        };
 
         // Insert assistant response
         ff_db::pg_insert_brain_message(
@@ -778,11 +760,8 @@ impl TelegramPollingTransport {
         let _ = ff_db::pg_touch_brain_thread(pool, thread_id).await;
 
         // Send reply via Telegram
-        let mut outgoing = OutgoingMessage::text(
-            Channel::Telegram,
-            incoming.chat_id.clone(),
-            assistant_text,
-        );
+        let mut outgoing =
+            OutgoingMessage::text(Channel::Telegram, incoming.chat_id.clone(), assistant_text);
         outgoing.reply_to = incoming.external_id.clone();
         outgoing.thread_id = incoming.thread_id.clone();
         self.client
@@ -1108,13 +1087,18 @@ async fn call_fleet_llm(
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("LLM returned HTTP {status}: {}", body.chars().take(200).collect::<String>());
+        anyhow::bail!(
+            "LLM returned HTTP {status}: {}",
+            body.chars().take(200).collect::<String>()
+        );
     }
 
-    let body = resp.text().await.context("failed to read LLM response body")?;
-    let parsed: ChatCompletionResponse = serde_json::from_str(&body).map_err(|e| {
-        anyhow::anyhow!("failed to parse LLM response: {e}")
-    })?;
+    let body = resp
+        .text()
+        .await
+        .context("failed to read LLM response body")?;
+    let parsed: ChatCompletionResponse = serde_json::from_str(&body)
+        .map_err(|e| anyhow::anyhow!("failed to parse LLM response: {e}"))?;
 
     let content = parsed
         .choices

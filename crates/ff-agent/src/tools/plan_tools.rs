@@ -13,7 +13,9 @@ pub struct AskUserQuestionTool;
 
 #[async_trait]
 impl AgentTool for AskUserQuestionTool {
-    fn name(&self) -> &str { "AskUserQuestion" }
+    fn name(&self) -> &str {
+        "AskUserQuestion"
+    }
 
     fn description(&self) -> &str {
         "Ask the user a question and wait for their response. Use this when you need clarification, a decision, or approval before proceeding."
@@ -62,7 +64,9 @@ pub struct EnterPlanModeTool;
 
 #[async_trait]
 impl AgentTool for EnterPlanModeTool {
-    fn name(&self) -> &str { "EnterPlanMode" }
+    fn name(&self) -> &str {
+        "EnterPlanMode"
+    }
 
     fn description(&self) -> &str {
         "Enter plan mode for designing an implementation approach before writing code. In plan mode, focus on reading code and designing a plan, not making changes."
@@ -76,7 +80,9 @@ impl AgentTool for EnterPlanModeTool {
         // Plan mode is a state flag in the agent session.
         // For now, return an acknowledgment. The agent loop can check this
         // and restrict to read-only tools.
-        AgentToolResult::ok("Entered plan mode. Focus on reading and exploring the codebase to design your approach. Do not make edits until you exit plan mode.")
+        AgentToolResult::ok(
+            "Entered plan mode. Focus on reading and exploring the codebase to design your approach. Do not make edits until you exit plan mode.",
+        )
     }
 }
 
@@ -88,7 +94,9 @@ pub struct ExitPlanModeTool;
 
 #[async_trait]
 impl AgentTool for ExitPlanModeTool {
-    fn name(&self) -> &str { "ExitPlanMode" }
+    fn name(&self) -> &str {
+        "ExitPlanMode"
+    }
 
     fn description(&self) -> &str {
         "Exit plan mode after designing your approach. You can now make edits and implement your plan."

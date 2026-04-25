@@ -10,7 +10,9 @@ pub struct GitPRTool;
 
 #[async_trait]
 impl AgentTool for GitPRTool {
-    fn name(&self) -> &str { "GitPR" }
+    fn name(&self) -> &str {
+        "GitPR"
+    }
 
     fn description(&self) -> &str {
         "Manage GitHub pull requests using the gh CLI. Create PRs, list PRs, review, merge, and check PR status."
@@ -53,7 +55,9 @@ impl AgentTool for GitPRTool {
                     cmd.arg("--base").arg(base);
                 }
             }
-            "list" => { cmd.arg("pr").arg("list"); }
+            "list" => {
+                cmd.arg("pr").arg("list");
+            }
             "view" => {
                 cmd.arg("pr").arg("view");
                 if let Some(n) = input.get("pr_number").and_then(Value::as_u64) {
@@ -100,7 +104,9 @@ impl AgentTool for GitPRTool {
                     AgentToolResult::err(truncate_output(&combined, MAX_TOOL_RESULT_CHARS))
                 }
             }
-            Err(e) => AgentToolResult::err(format!("gh command failed: {e}. Is GitHub CLI installed?")),
+            Err(e) => {
+                AgentToolResult::err(format!("gh command failed: {e}. Is GitHub CLI installed?"))
+            }
         }
     }
 }

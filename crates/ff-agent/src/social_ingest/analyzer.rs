@@ -5,7 +5,7 @@
 //! format (content = array of parts, image parts as data-URIs), then
 //! rolls per-frame JSON responses up into a single [`Analysis`].
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -43,11 +43,7 @@ const STRICT_PROMPT: &str = "Reply with ONLY a JSON object — no prose, no code
 
 /// Run the vision-LLM over every image/frame in `post` and roll up the
 /// results.
-pub async fn analyze(
-    post: &FetchedPost,
-    llm_endpoint: &str,
-    model_id: &str,
-) -> Result<Analysis> {
+pub async fn analyze(post: &FetchedPost, llm_endpoint: &str, model_id: &str) -> Result<Analysis> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(300))
         .build()

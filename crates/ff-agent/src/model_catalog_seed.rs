@@ -177,11 +177,7 @@ pub async fn seed_from_toml(
 /// retired (see module docs + V39).
 #[allow(dead_code)]
 fn opt_str(s: &str) -> Option<&str> {
-    if s.trim().is_empty() {
-        None
-    } else {
-        Some(s)
-    }
+    if s.trim().is_empty() { None } else { Some(s) }
 }
 
 /// Parse an optional `YYYY-MM-DD` string into a `chrono::NaiveDate`.
@@ -262,7 +258,10 @@ license = "gemma"
         assert_eq!(coder.family, "qwen");
         assert_eq!(coder.parameters, "30B");
         assert_eq!(coder.tier, Some(2));
-        assert_eq!(coder.description.as_deref(), Some("Qwen3 MoE coding model."));
+        assert_eq!(
+            coder.description.as_deref(),
+            Some("Qwen3 MoE coding model.")
+        );
         assert!(!coder.gated);
         assert_eq!(coder.preferred_workloads.len(), 2);
         assert_eq!(coder.tasks, vec!["text-generation", "code"]);

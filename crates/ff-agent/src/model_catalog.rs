@@ -14,7 +14,7 @@
 
 use std::path::{Path, PathBuf};
 
-use ff_db::{pg_upsert_catalog, ModelCatalogRow};
+use ff_db::{ModelCatalogRow, pg_upsert_catalog};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
@@ -75,8 +75,8 @@ pub fn load_catalog_file(path: &Path) -> Result<Vec<ModelCatalogRow>, String> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let raw = std::fs::read_to_string(path)
-        .map_err(|e| format!("read {}: {}", path.display(), e))?;
+    let raw =
+        std::fs::read_to_string(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
     let doc: CatalogFile =
         toml::from_str(&raw).map_err(|e| format!("parse {}: {}", path.display(), e))?;
 

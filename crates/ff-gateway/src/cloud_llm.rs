@@ -93,8 +93,10 @@ pub async fn try_route_to_cloud(
                 "cloud_llm: api_key secret is missing/empty; use `ff cloud-llm set-key` to add it");
             return Some(Err(error_response(
                 StatusCode::UNAUTHORIZED,
-                format!("API key not configured for cloud provider '{}'. Run `ff cloud-llm set-key {}`.",
-                    provider.id, provider.id),
+                format!(
+                    "API key not configured for cloud provider '{}'. Run `ff cloud-llm set-key {}`.",
+                    provider.id, provider.id
+                ),
                 "cloud_auth_missing",
             )));
         }
@@ -113,7 +115,10 @@ pub async fn try_route_to_cloud(
 
     let client = build_client();
     let start = Instant::now();
-    let streaming = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+    let streaming = body
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     let res = match provider.request_format.as_str() {
         "openai_chat" => call_openai_chat(&client, &provider, &api_key, body, streaming).await,
@@ -124,7 +129,10 @@ pub async fn try_route_to_cloud(
         other => {
             return Some(Err(error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("unknown request_format '{other}' for provider '{}'", provider.id),
+                format!(
+                    "unknown request_format '{other}' for provider '{}'",
+                    provider.id
+                ),
                 "cloud_config_error",
             )));
         }
@@ -133,21 +141,43 @@ pub async fn try_route_to_cloud(
     let duration_ms = start.elapsed().as_millis().min(i32::MAX as u128) as i32;
 
     match res {
-        Ok(CallOutcome::Json { status, body: rb, tokens_in, tokens_out }) => {
-            let _ = record_usage(pool, &provider.id, model_id, tokens_in, tokens_out,
-                session_id, duration_ms).await;
+        Ok(CallOutcome::Json {
+            status,
+            body: rb,
+            tokens_in,
+            tokens_out,
+        }) => {
+            let _ = record_usage(
+                pool,
+                &provider.id,
+                model_id,
+                tokens_in,
+                tokens_out,
+                session_id,
+                duration_ms,
+            )
+            .await;
             Some(Ok(ok_response(rb, &provider, status)))
         }
         Ok(CallOutcome::Stream(resp)) => Some(Ok(resp)),
-        Err(CloudCallError::Http { status, message }) =>
-            Some(Err(error_response(status, message, "cloud_upstream_error"))),
-        Err(CloudCallError::Local(msg)) =>
-            Some(Err(error_response(StatusCode::BAD_GATEWAY, msg, "cloud_upstream_error"))),
+        Err(CloudCallError::Http { status, message }) => {
+            Some(Err(error_response(status, message, "cloud_upstream_error")))
+        }
+        Err(CloudCallError::Local(msg)) => Some(Err(error_response(
+            StatusCode::BAD_GATEWAY,
+            msg,
+            "cloud_upstream_error",
+        ))),
     }
 }
 
 enum CallOutcome {
-    Json { status: StatusCode, body: Value, tokens_in: Option<i32>, tokens_out: Option<i32> },
+    Json {
+        status: StatusCode,
+        body: Value,
+        tokens_in: Option<i32>,
+        tokens_out: Option<i32>,
+    },
     Stream(Response<Body>),
 }
 
@@ -175,7 +205,10 @@ async fn call_openai_chat(
     body: &Value,
     streaming: bool,
 ) -> Result<CallOutcome, CloudCallError> {
-    let url = format!("{}/chat/completions", provider.base_url.trim_end_matches('/'));
+    let url = format!(
+        "{}/chat/completions",
+        provider.base_url.trim_end_matches('/')
+    );
     let resp = client
         .post(&url)
         .bearer_auth(api_key)
@@ -188,10 +221,16 @@ async fn call_openai_chat(
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
 
     if streaming && status.is_success() {
-        let content_type = resp.headers().get("content-type")
-            .and_then(|v| v.to_str().ok()).unwrap_or("text/event-stream").to_string();
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("text/event-stream")
+            .to_string();
         use futures::TryStreamExt;
-        let mapped = resp.bytes_stream().map_err(|e| std::io::Error::other(e.to_string()));
+        let mapped = resp
+            .bytes_stream()
+            .map_err(|e| std::io::Error::other(e.to_string()));
         let axum_resp = Response::builder()
             .status(status)
             .header("content-type", content_type)
@@ -203,7 +242,9 @@ async fn call_openai_chat(
         return Ok(CallOutcome::Stream(axum_resp));
     }
 
-    let value: Value = resp.json().await
+    let value: Value = resp
+        .json()
+        .await
         .map_err(|e| CloudCallError::Local(format!("parse upstream json: {e}")))?;
 
     if !status.is_success() {
@@ -214,13 +255,24 @@ async fn call_openai_chat(
     }
 
     let (tokens_in, tokens_out) = extract_openai_usage(&value);
-    Ok(CallOutcome::Json { status, body: value, tokens_in, tokens_out })
+    Ok(CallOutcome::Json {
+        status,
+        body: value,
+        tokens_in,
+        tokens_out,
+    })
 }
 
 fn extract_openai_usage(v: &Value) -> (Option<i32>, Option<i32>) {
     let usage = v.get("usage");
-    let ti = usage.and_then(|u| u.get("prompt_tokens")).and_then(|n| n.as_i64()).map(|n| n as i32);
-    let to = usage.and_then(|u| u.get("completion_tokens")).and_then(|n| n.as_i64()).map(|n| n as i32);
+    let ti = usage
+        .and_then(|u| u.get("prompt_tokens"))
+        .and_then(|n| n.as_i64())
+        .map(|n| n as i32);
+    let to = usage
+        .and_then(|u| u.get("completion_tokens"))
+        .and_then(|n| n.as_i64())
+        .map(|n| n as i32);
     (ti, to)
 }
 
@@ -246,7 +298,9 @@ async fn call_anthropic_messages(
         .map_err(|e| CloudCallError::Local(format!("upstream request failed: {e}")))?;
 
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    let value: Value = resp.json().await
+    let value: Value = resp
+        .json()
+        .await
         .map_err(|e| CloudCallError::Local(format!("parse upstream json: {e}")))?;
 
     if !status.is_success() {
@@ -257,12 +311,23 @@ async fn call_anthropic_messages(
     }
 
     let openai_shape = anthropic_to_openai_response(&value);
-    let tokens_in = value.get("usage").and_then(|u| u.get("input_tokens"))
-        .and_then(|n| n.as_i64()).map(|n| n as i32);
-    let tokens_out = value.get("usage").and_then(|u| u.get("output_tokens"))
-        .and_then(|n| n.as_i64()).map(|n| n as i32);
+    let tokens_in = value
+        .get("usage")
+        .and_then(|u| u.get("input_tokens"))
+        .and_then(|n| n.as_i64())
+        .map(|n| n as i32);
+    let tokens_out = value
+        .get("usage")
+        .and_then(|u| u.get("output_tokens"))
+        .and_then(|n| n.as_i64())
+        .map(|n| n as i32);
 
-    Ok(CallOutcome::Json { status, body: openai_shape, tokens_in, tokens_out })
+    Ok(CallOutcome::Json {
+        status,
+        body: openai_shape,
+        tokens_in,
+        tokens_out,
+    })
 }
 
 /// OpenAI chat body → Anthropic `/v1/messages`.
@@ -271,7 +336,10 @@ async fn call_anthropic_messages(
 /// - `max_tokens` is REQUIRED by Anthropic; default 4096 when absent.
 fn translate_openai_to_anthropic(body: &Value) -> Result<(Value, bool), CloudCallError> {
     let empty: Vec<Value> = Vec::new();
-    let messages = body.get("messages").and_then(|m| m.as_array()).unwrap_or(&empty);
+    let messages = body
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .unwrap_or(&empty);
 
     let mut system_parts: Vec<String> = Vec::new();
     let mut out_messages: Vec<Value> = Vec::new();
@@ -287,7 +355,9 @@ fn translate_openai_to_anthropic(body: &Value) -> Result<(Value, bool), CloudCal
             "user" | "assistant" => {
                 out_messages.push(json!({ "role": role, "content": content }));
             }
-            other => tracing::debug!(role = %other, "anthropic translate: dropping unsupported role"),
+            other => {
+                tracing::debug!(role = %other, "anthropic translate: dropping unsupported role")
+            }
         }
     }
 
@@ -299,7 +369,11 @@ fn translate_openai_to_anthropic(body: &Value) -> Result<(Value, bool), CloudCal
     if !system_parts.is_empty() {
         anth["system"] = Value::String(system_parts.join("\n\n"));
     }
-    for (src, dst) in [("temperature", "temperature"), ("top_p", "top_p"), ("stop", "stop_sequences")] {
+    for (src, dst) in [
+        ("temperature", "temperature"),
+        ("top_p", "top_p"),
+        ("stop", "stop_sequences"),
+    ] {
         if let Some(v) = body.get(src) {
             anth[dst] = v.clone();
         }
@@ -310,19 +384,40 @@ fn translate_openai_to_anthropic(body: &Value) -> Result<(Value, bool), CloudCal
 
 /// Anthropic `/v1/messages` response → OpenAI chat completion shape.
 fn anthropic_to_openai_response(v: &Value) -> Value {
-    let id = v.get("id").cloned().unwrap_or_else(|| json!("anthropic-msg"));
+    let id = v
+        .get("id")
+        .cloned()
+        .unwrap_or_else(|| json!("anthropic-msg"));
     let model = v.get("model").cloned().unwrap_or(Value::Null);
-    let text = v.get("content").and_then(|c| c.as_array()).map(|arr| {
-        arr.iter().filter_map(|p| p.get("text").and_then(|t| t.as_str()))
-            .collect::<Vec<_>>().join("")
-    }).unwrap_or_default();
-    let finish_reason = v.get("stop_reason").and_then(|s| s.as_str()).map(|s| match s {
-        "end_turn" | "stop_sequence" => "stop",
-        "max_tokens" => "length",
-        other => other,
-    }).unwrap_or("stop");
-    let ti = v.get("usage").and_then(|u| u.get("input_tokens")).and_then(|n| n.as_i64()).unwrap_or(0);
-    let to = v.get("usage").and_then(|u| u.get("output_tokens")).and_then(|n| n.as_i64()).unwrap_or(0);
+    let text = v
+        .get("content")
+        .and_then(|c| c.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .unwrap_or_default();
+    let finish_reason = v
+        .get("stop_reason")
+        .and_then(|s| s.as_str())
+        .map(|s| match s {
+            "end_turn" | "stop_sequence" => "stop",
+            "max_tokens" => "length",
+            other => other,
+        })
+        .unwrap_or("stop");
+    let ti = v
+        .get("usage")
+        .and_then(|u| u.get("input_tokens"))
+        .and_then(|n| n.as_i64())
+        .unwrap_or(0);
+    let to = v
+        .get("usage")
+        .and_then(|u| u.get("output_tokens"))
+        .and_then(|n| n.as_i64())
+        .unwrap_or(0);
 
     json!({
         "id": id, "object": "chat.completion", "model": model,
@@ -345,8 +440,12 @@ async fn call_google_generate_content(
     body: &Value,
 ) -> Result<CallOutcome, CloudCallError> {
     let bare_model = model_id.strip_prefix("gemini/").unwrap_or(model_id);
-    let url = format!("{}/models/{}:generateContent?key={}",
-        provider.base_url.trim_end_matches('/'), bare_model, api_key);
+    let url = format!(
+        "{}/models/{}:generateContent?key={}",
+        provider.base_url.trim_end_matches('/'),
+        bare_model,
+        api_key
+    );
     let gbody = translate_openai_to_google(body);
 
     let resp = client
@@ -358,7 +457,9 @@ async fn call_google_generate_content(
         .map_err(|e| CloudCallError::Local(format!("upstream request failed: {e}")))?;
 
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    let value: Value = resp.json().await
+    let value: Value = resp
+        .json()
+        .await
         .map_err(|e| CloudCallError::Local(format!("parse upstream json: {e}")))?;
 
     if !status.is_success() {
@@ -369,12 +470,23 @@ async fn call_google_generate_content(
     }
 
     let openai_shape = google_to_openai_response(&value, bare_model);
-    let tokens_in = value.get("usageMetadata").and_then(|u| u.get("promptTokenCount"))
-        .and_then(|n| n.as_i64()).map(|n| n as i32);
-    let tokens_out = value.get("usageMetadata").and_then(|u| u.get("candidatesTokenCount"))
-        .and_then(|n| n.as_i64()).map(|n| n as i32);
+    let tokens_in = value
+        .get("usageMetadata")
+        .and_then(|u| u.get("promptTokenCount"))
+        .and_then(|n| n.as_i64())
+        .map(|n| n as i32);
+    let tokens_out = value
+        .get("usageMetadata")
+        .and_then(|u| u.get("candidatesTokenCount"))
+        .and_then(|n| n.as_i64())
+        .map(|n| n as i32);
 
-    Ok(CallOutcome::Json { status, body: openai_shape, tokens_in, tokens_out })
+    Ok(CallOutcome::Json {
+        status,
+        body: openai_shape,
+        tokens_in,
+        tokens_out,
+    })
 }
 
 /// OpenAI chat body → Google Gemini `:generateContent`.
@@ -382,13 +494,20 @@ async fn call_google_generate_content(
 /// role values are `user` / `model` (NOT `assistant`).
 fn translate_openai_to_google(body: &Value) -> Value {
     let empty: Vec<Value> = Vec::new();
-    let messages = body.get("messages").and_then(|m| m.as_array()).unwrap_or(&empty);
+    let messages = body
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .unwrap_or(&empty);
 
     let mut system_parts: Vec<String> = Vec::new();
     let mut contents: Vec<Value> = Vec::new();
     for m in messages {
         let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
-        let text = m.get("content").and_then(|c| c.as_str()).unwrap_or("").to_string();
+        let text = m
+            .get("content")
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .to_string();
         match role {
             "system" => system_parts.push(text),
             "user" => contents.push(json!({ "role": "user", "parts": [{"text": text}] })),
@@ -402,7 +521,11 @@ fn translate_openai_to_google(body: &Value) -> Value {
         out["systemInstruction"] = json!({ "parts": [{"text": system_parts.join("\n\n")}] });
     }
     let mut gc = serde_json::Map::new();
-    for (src, dst) in [("temperature", "temperature"), ("top_p", "topP"), ("max_tokens", "maxOutputTokens")] {
+    for (src, dst) in [
+        ("temperature", "temperature"),
+        ("top_p", "topP"),
+        ("max_tokens", "maxOutputTokens"),
+    ] {
         if let Some(v) = body.get(src) {
             gc.insert(dst.into(), v.clone());
         }
@@ -415,21 +538,39 @@ fn translate_openai_to_google(body: &Value) -> Value {
 
 fn google_to_openai_response(v: &Value, model: &str) -> Value {
     let candidates = v.get("candidates").and_then(|c| c.as_array());
-    let text = candidates.and_then(|arr| arr.first())
+    let text = candidates
+        .and_then(|arr| arr.first())
         .and_then(|c| c.get("content"))
         .and_then(|c| c.get("parts"))
         .and_then(|p| p.as_array())
-        .map(|parts| parts.iter().filter_map(|p| p.get("text").and_then(|t| t.as_str()))
-            .collect::<Vec<_>>().join(""))
+        .map(|parts| {
+            parts
+                .iter()
+                .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join("")
+        })
         .unwrap_or_default();
-    let finish_reason = candidates.and_then(|arr| arr.first())
-        .and_then(|c| c.get("finishReason")).and_then(|s| s.as_str())
-        .map(|s| match s { "STOP" => "stop", "MAX_TOKENS" => "length", other => other })
+    let finish_reason = candidates
+        .and_then(|arr| arr.first())
+        .and_then(|c| c.get("finishReason"))
+        .and_then(|s| s.as_str())
+        .map(|s| match s {
+            "STOP" => "stop",
+            "MAX_TOKENS" => "length",
+            other => other,
+        })
         .unwrap_or("stop");
-    let ti = v.get("usageMetadata").and_then(|u| u.get("promptTokenCount"))
-        .and_then(|n| n.as_i64()).unwrap_or(0);
-    let to = v.get("usageMetadata").and_then(|u| u.get("candidatesTokenCount"))
-        .and_then(|n| n.as_i64()).unwrap_or(0);
+    let ti = v
+        .get("usageMetadata")
+        .and_then(|u| u.get("promptTokenCount"))
+        .and_then(|n| n.as_i64())
+        .unwrap_or(0);
+    let to = v
+        .get("usageMetadata")
+        .and_then(|u| u.get("candidatesTokenCount"))
+        .and_then(|n| n.as_i64())
+        .unwrap_or(0);
 
     json!({
         "id": format!("gemini-{}", chrono::Utc::now().timestamp_millis()),
@@ -459,9 +600,14 @@ async fn record_usage(
            (provider_id, model, tokens_input, tokens_output, session_id, request_duration_ms)
          VALUES ($1, $2, $3, $4, $5, $6)",
     )
-    .bind(provider_id).bind(model).bind(tokens_in).bind(tokens_out)
-    .bind(session_id).bind(duration_ms)
-    .execute(pool).await?;
+    .bind(provider_id)
+    .bind(model)
+    .bind(tokens_in)
+    .bind(tokens_out)
+    .bind(session_id)
+    .bind(duration_ms)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -512,7 +658,10 @@ mod tests {
         assert_eq!(g["systemInstruction"]["parts"][0]["text"], "Be concise.");
         assert_eq!(g["contents"][0]["role"], "user");
         assert_eq!(g["contents"][1]["role"], "model");
-        assert_eq!(g["generationConfig"]["maxOutputTokens"].as_i64().unwrap(), 128);
+        assert_eq!(
+            g["generationConfig"]["maxOutputTokens"].as_i64().unwrap(),
+            128
+        );
     }
 
     #[test]

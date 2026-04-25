@@ -9,7 +9,9 @@ pub struct SleepTool;
 
 #[async_trait]
 impl AgentTool for SleepTool {
-    fn name(&self) -> &str { "Sleep" }
+    fn name(&self) -> &str {
+        "Sleep"
+    }
 
     fn description(&self) -> &str {
         "Pause execution for a specified number of seconds. Use sparingly — prefer polling or event-driven approaches."

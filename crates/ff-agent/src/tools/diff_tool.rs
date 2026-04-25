@@ -10,7 +10,9 @@ pub struct DiffTool;
 
 #[async_trait]
 impl AgentTool for DiffTool {
-    fn name(&self) -> &str { "Diff" }
+    fn name(&self) -> &str {
+        "Diff"
+    }
 
     fn description(&self) -> &str {
         "Generate diffs: between two files, between git versions, or show working directory changes."
@@ -34,24 +36,48 @@ impl AgentTool for DiffTool {
     }
 
     async fn execute(&self, input: Value, ctx: &AgentToolContext) -> AgentToolResult {
-        let mode = input.get("mode").and_then(Value::as_str).unwrap_or("working");
+        let mode = input
+            .get("mode")
+            .and_then(Value::as_str)
+            .unwrap_or("working");
 
         let output = match mode {
             "files" => {
                 let a = input.get("file_a").and_then(Value::as_str).unwrap_or("");
                 let b = input.get("file_b").and_then(Value::as_str).unwrap_or("");
-                if a.is_empty() || b.is_empty() { return AgentToolResult::err("Both 'file_a' and 'file_b' required"); }
-                Command::new("diff").args(["-u", a, b]).current_dir(&ctx.working_dir).output().await
+                if a.is_empty() || b.is_empty() {
+                    return AgentToolResult::err("Both 'file_a' and 'file_b' required");
+                }
+                Command::new("diff")
+                    .args(["-u", a, b])
+                    .current_dir(&ctx.working_dir)
+                    .output()
+                    .await
             }
             "git" => {
-                let range = input.get("range").and_then(Value::as_str).unwrap_or("HEAD~1..HEAD");
-                Command::new("git").args(["diff", range]).current_dir(&ctx.working_dir).output().await
+                let range = input
+                    .get("range")
+                    .and_then(Value::as_str)
+                    .unwrap_or("HEAD~1..HEAD");
+                Command::new("git")
+                    .args(["diff", range])
+                    .current_dir(&ctx.working_dir)
+                    .output()
+                    .await
             }
             "staged" => {
-                Command::new("git").args(["diff", "--staged"]).current_dir(&ctx.working_dir).output().await
+                Command::new("git")
+                    .args(["diff", "--staged"])
+                    .current_dir(&ctx.working_dir)
+                    .output()
+                    .await
             }
             "working" => {
-                Command::new("git").args(["diff"]).current_dir(&ctx.working_dir).output().await
+                Command::new("git")
+                    .args(["diff"])
+                    .current_dir(&ctx.working_dir)
+                    .output()
+                    .await
             }
             _ => return AgentToolResult::err(format!("Unknown diff mode: {mode}")),
         };

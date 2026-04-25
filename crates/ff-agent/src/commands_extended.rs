@@ -1,10 +1,10 @@
 //! Extended slash commands — /context, /doctor, /commit, /review, /security-review,
 //! /mcp, /hooks, /permissions, /advisor, /init, /branch, /add-dir, and more.
 
-use async_trait::async_trait;
 use crate::agent_loop::AgentSession;
 use crate::commands::Command;
 use crate::compaction;
+use async_trait::async_trait;
 
 pub fn extended_commands() -> Vec<Box<dyn Command>> {
     vec![
@@ -47,14 +47,21 @@ pub fn extended_commands() -> Vec<Box<dyn Command>> {
 struct ContextCommand;
 #[async_trait]
 impl Command for ContextCommand {
-    fn name(&self) -> &str { "context" }
-    fn description(&self) -> &str { "Show context window usage and message breakdown" }
+    fn name(&self) -> &str {
+        "context"
+    }
+    fn description(&self) -> &str {
+        "Show context window usage and message breakdown"
+    }
     async fn execute(&self, _args: &str, session: &mut AgentSession) -> String {
         let tokens = compaction::estimate_message_tokens(&session.messages);
         let window = session.config.context_window_tokens;
         let pct = (tokens as f64 / window as f64) * 100.0;
-        let mut output = format!("Context window: {tokens} / {window} tokens ({pct:.0}%)\n\nMessage breakdown:\n");
-        let mut by_role: std::collections::HashMap<String, (usize, usize)> = std::collections::HashMap::new();
+        let mut output = format!(
+            "Context window: {tokens} / {window} tokens ({pct:.0}%)\n\nMessage breakdown:\n"
+        );
+        let mut by_role: std::collections::HashMap<String, (usize, usize)> =
+            std::collections::HashMap::new();
         for msg in &session.messages {
             let entry = by_role.entry(msg.role.clone()).or_insert((0, 0));
             entry.0 += 1;
@@ -71,31 +78,62 @@ impl Command for ContextCommand {
 struct DoctorCommand;
 #[async_trait]
 impl Command for DoctorCommand {
-    fn name(&self) -> &str { "doctor" }
-    fn description(&self) -> &str { "Run diagnostics on the agent and fleet connectivity" }
+    fn name(&self) -> &str {
+        "doctor"
+    }
+    fn description(&self) -> &str {
+        "Run diagnostics on the agent and fleet connectivity"
+    }
     async fn execute(&self, _args: &str, session: &mut AgentSession) -> String {
         let mut output = String::from("ForgeFleet Diagnostics\n\n");
 
         // Check LLM connectivity
-        let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(5)).build().unwrap_or_default();
-        let health_url = format!("{}/health", session.config.llm_base_url.trim_end_matches('/'));
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap_or_default();
+        let health_url = format!(
+            "{}/health",
+            session.config.llm_base_url.trim_end_matches('/')
+        );
         match client.get(&health_url).send().await {
-            Ok(resp) if resp.status().is_success() => output.push_str(&format!("  LLM endpoint: OK ({})\n", session.config.llm_base_url)),
-            Ok(resp) => output.push_str(&format!("  LLM endpoint: WARN (HTTP {})\n", resp.status())),
+            Ok(resp) if resp.status().is_success() => output.push_str(&format!(
+                "  LLM endpoint: OK ({})\n",
+                session.config.llm_base_url
+            )),
+            Ok(resp) => {
+                output.push_str(&format!("  LLM endpoint: WARN (HTTP {})\n", resp.status()))
+            }
             Err(e) => output.push_str(&format!("  LLM endpoint: FAIL ({e})\n")),
         }
 
         // Check working directory
-        output.push_str(&format!("  Working dir: {}\n", session.config.working_dir.display()));
-        output.push_str(&format!("  Git repo: {}\n", session.config.working_dir.join(".git").exists()));
+        output.push_str(&format!(
+            "  Working dir: {}\n",
+            session.config.working_dir.display()
+        ));
+        output.push_str(&format!(
+            "  Git repo: {}\n",
+            session.config.working_dir.join(".git").exists()
+        ));
         output.push_str(&format!("  Tools loaded: {}\n", session.tools.len()));
         output.push_str(&format!("  Messages: {}\n", session.messages.len()));
         output.push_str(&format!("  Turns: {}\n", session.turn_count));
-        output.push_str(&format!("  Compactions: {}\n", session.usage.compaction_count));
+        output.push_str(&format!(
+            "  Compactions: {}\n",
+            session.usage.compaction_count
+        ));
 
         // Check FORGEFLEET.md
         let memory_file = session.config.working_dir.join("FORGEFLEET.md");
-        output.push_str(&format!("  FORGEFLEET.md: {}\n", if memory_file.exists() { "found" } else { "not found" }));
+        output.push_str(&format!(
+            "  FORGEFLEET.md: {}\n",
+            if memory_file.exists() {
+                "found"
+            } else {
+                "not found"
+            }
+        ));
 
         output
     }
@@ -105,14 +143,27 @@ impl Command for DoctorCommand {
 struct CommitCommand;
 #[async_trait]
 impl Command for CommitCommand {
-    fn name(&self) -> &str { "commit" }
-    fn description(&self) -> &str { "Create a git commit with auto-generated message" }
+    fn name(&self) -> &str {
+        "commit"
+    }
+    fn description(&self) -> &str {
+        "Create a git commit with auto-generated message"
+    }
     async fn execute(&self, args: &str, session: &mut AgentSession) -> String {
-        let msg = if args.is_empty() { "agent changes" } else { args };
+        let msg = if args.is_empty() {
+            "agent changes"
+        } else {
+            args
+        };
         let output = tokio::process::Command::new("git")
-            .args(["commit", "-am", msg]).current_dir(&session.config.working_dir).output().await;
+            .args(["commit", "-am", msg])
+            .current_dir(&session.config.working_dir)
+            .output()
+            .await;
         match output {
-            Ok(o) => String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr),
+            Ok(o) => {
+                String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr)
+            }
             Err(e) => format!("git commit failed: {e}"),
         }
     }
@@ -122,8 +173,12 @@ impl Command for CommitCommand {
 struct ReviewCommand;
 #[async_trait]
 impl Command for ReviewCommand {
-    fn name(&self) -> &str { "review" }
-    fn description(&self) -> &str { "Request a code review of recent changes" }
+    fn name(&self) -> &str {
+        "review"
+    }
+    fn description(&self) -> &str {
+        "Request a code review of recent changes"
+    }
     async fn execute(&self, _args: &str, _session: &mut AgentSession) -> String {
         "Injecting code review request into conversation. The agent will review staged changes on the next turn.".into()
     }
@@ -133,8 +188,12 @@ impl Command for ReviewCommand {
 struct SecurityReviewCommand;
 #[async_trait]
 impl Command for SecurityReviewCommand {
-    fn name(&self) -> &str { "security-review" }
-    fn description(&self) -> &str { "Request a security review of the codebase" }
+    fn name(&self) -> &str {
+        "security-review"
+    }
+    fn description(&self) -> &str {
+        "Request a security review of the codebase"
+    }
     async fn execute(&self, _args: &str, _session: &mut AgentSession) -> String {
         "Security review request queued. The agent will analyze for OWASP top 10, dependency vulnerabilities, and secrets on the next turn.".into()
     }
@@ -144,11 +203,16 @@ impl Command for SecurityReviewCommand {
 struct McpCommand;
 #[async_trait]
 impl Command for McpCommand {
-    fn name(&self) -> &str { "mcp" }
-    fn description(&self) -> &str { "Manage MCP server connections" }
+    fn name(&self) -> &str {
+        "mcp"
+    }
+    fn description(&self) -> &str {
+        "Manage MCP server connections"
+    }
     async fn execute(&self, args: &str, _session: &mut AgentSession) -> String {
         if args.is_empty() {
-            return "Usage: /mcp list | /mcp connect <name> <command> | /mcp disconnect <name>".into();
+            return "Usage: /mcp list | /mcp connect <name> <command> | /mcp disconnect <name>"
+                .into();
         }
         format!("MCP management: {args} (pending full implementation)")
     }
@@ -158,8 +222,12 @@ impl Command for McpCommand {
 struct HooksCommand;
 #[async_trait]
 impl Command for HooksCommand {
-    fn name(&self) -> &str { "hooks" }
-    fn description(&self) -> &str { "Show or manage hook configuration" }
+    fn name(&self) -> &str {
+        "hooks"
+    }
+    fn description(&self) -> &str {
+        "Show or manage hook configuration"
+    }
     async fn execute(&self, _args: &str, _session: &mut AgentSession) -> String {
         "Hook events: pre_tool_use, post_tool_use, post_model_turn, stop, user_prompt_submit, notification\nConfigure in fleet.toml [hooks] section.".into()
     }
@@ -169,8 +237,12 @@ impl Command for HooksCommand {
 struct PermissionsCommand;
 #[async_trait]
 impl Command for PermissionsCommand {
-    fn name(&self) -> &str { "permissions" }
-    fn description(&self) -> &str { "Show or change permission mode (default|accept_edits|bypass|plan)" }
+    fn name(&self) -> &str {
+        "permissions"
+    }
+    fn description(&self) -> &str {
+        "Show or change permission mode (default|accept_edits|bypass|plan)"
+    }
     async fn execute(&self, args: &str, session: &mut AgentSession) -> String {
         let arg = args.trim();
         if arg.is_empty() {
@@ -191,9 +263,7 @@ impl Command for PermissionsCommand {
                 session.config.permission_mode = mode.clone();
                 format!("Permission mode set to: {mode}")
             }
-            _ => format!(
-                "Invalid mode: '{arg}'. Valid modes: default, accept_edits, bypass, plan"
-            ),
+            _ => format!("Invalid mode: '{arg}'. Valid modes: default, accept_edits, bypass, plan"),
         }
     }
 }
@@ -202,16 +272,28 @@ impl Command for PermissionsCommand {
 struct AdvisorCommand;
 #[async_trait]
 impl Command for AdvisorCommand {
-    fn name(&self) -> &str { "advisor" }
-    fn description(&self) -> &str { "Get usage advice and optimization tips" }
+    fn name(&self) -> &str {
+        "advisor"
+    }
+    fn description(&self) -> &str {
+        "Get usage advice and optimization tips"
+    }
     async fn execute(&self, _args: &str, session: &mut AgentSession) -> String {
         let tokens = compaction::estimate_message_tokens(&session.messages);
         let pct = (tokens as f64 / session.config.context_window_tokens as f64) * 100.0;
         let mut tips = Vec::new();
-        if pct > 60.0 { tips.push("Context window is getting full. Consider /compact to free space."); }
-        if session.turn_count > 15 { tips.push("Many turns used. Consider breaking work into sub-agents."); }
-        if session.messages.len() > 50 { tips.push("Long conversation. Use /clear to start fresh if topic changed."); }
-        if tips.is_empty() { tips.push("Session looks healthy. No optimization needed."); }
+        if pct > 60.0 {
+            tips.push("Context window is getting full. Consider /compact to free space.");
+        }
+        if session.turn_count > 15 {
+            tips.push("Many turns used. Consider breaking work into sub-agents.");
+        }
+        if session.messages.len() > 50 {
+            tips.push("Long conversation. Use /clear to start fresh if topic changed.");
+        }
+        if tips.is_empty() {
+            tips.push("Session looks healthy. No optimization needed.");
+        }
         tips.join("\n")
     }
 }
@@ -220,11 +302,17 @@ impl Command for AdvisorCommand {
 struct InitCommand;
 #[async_trait]
 impl Command for InitCommand {
-    fn name(&self) -> &str { "init" }
-    fn description(&self) -> &str { "Initialize FORGEFLEET.md in the current project" }
+    fn name(&self) -> &str {
+        "init"
+    }
+    fn description(&self) -> &str {
+        "Initialize FORGEFLEET.md in the current project"
+    }
     async fn execute(&self, _args: &str, session: &mut AgentSession) -> String {
         let path = session.config.working_dir.join("FORGEFLEET.md");
-        if path.exists() { return "FORGEFLEET.md already exists.".into(); }
+        if path.exists() {
+            return "FORGEFLEET.md already exists.".into();
+        }
         let content = "# Project Memory\n\nThis file provides persistent context to ForgeFleet agents.\nAdd project-specific instructions, conventions, and context here.\n";
         match tokio::fs::write(&path, content).await {
             Ok(()) => format!("Created {}", path.display()),
@@ -237,13 +325,27 @@ impl Command for InitCommand {
 struct BranchCommand;
 #[async_trait]
 impl Command for BranchCommand {
-    fn name(&self) -> &str { "branch" }
-    fn description(&self) -> &str { "Show or create git branches" }
+    fn name(&self) -> &str {
+        "branch"
+    }
+    fn description(&self) -> &str {
+        "Show or create git branches"
+    }
     async fn execute(&self, args: &str, session: &mut AgentSession) -> String {
-        let git_args = if args.is_empty() { vec!["branch", "--list"] } else { vec!["checkout", "-b", args] };
-        let output = tokio::process::Command::new("git").args(&git_args).current_dir(&session.config.working_dir).output().await;
+        let git_args = if args.is_empty() {
+            vec!["branch", "--list"]
+        } else {
+            vec!["checkout", "-b", args]
+        };
+        let output = tokio::process::Command::new("git")
+            .args(&git_args)
+            .current_dir(&session.config.working_dir)
+            .output()
+            .await;
         match output {
-            Ok(o) => String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr),
+            Ok(o) => {
+                String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr)
+            }
             Err(e) => format!("git branch failed: {e}"),
         }
     }
@@ -253,10 +355,16 @@ impl Command for BranchCommand {
 struct AddDirCommand;
 #[async_trait]
 impl Command for AddDirCommand {
-    fn name(&self) -> &str { "add-dir" }
-    fn description(&self) -> &str { "Add a directory to the agent's context" }
+    fn name(&self) -> &str {
+        "add-dir"
+    }
+    fn description(&self) -> &str {
+        "Add a directory to the agent's context"
+    }
     async fn execute(&self, args: &str, _session: &mut AgentSession) -> String {
-        if args.is_empty() { return "Usage: /add-dir <path>".into(); }
+        if args.is_empty() {
+            return "Usage: /add-dir <path>".into();
+        }
         format!("Directory added to context: {args}")
     }
 }
@@ -265,8 +373,12 @@ impl Command for AddDirCommand {
 struct FilesCommand;
 #[async_trait]
 impl Command for FilesCommand {
-    fn name(&self) -> &str { "files" }
-    fn description(&self) -> &str { "Show files accessed in this session" }
+    fn name(&self) -> &str {
+        "files"
+    }
+    fn description(&self) -> &str {
+        "Show files accessed in this session"
+    }
     async fn execute(&self, _args: &str, _session: &mut AgentSession) -> String {
         "File history tracking: use /stats for detailed file access information.".into()
     }
@@ -276,15 +388,25 @@ impl Command for FilesCommand {
 struct CopyCommand;
 #[async_trait]
 impl Command for CopyCommand {
-    fn name(&self) -> &str { "copy" }
-    fn description(&self) -> &str { "Copy last assistant message to clipboard" }
+    fn name(&self) -> &str {
+        "copy"
+    }
+    fn description(&self) -> &str {
+        "Copy last assistant message to clipboard"
+    }
     async fn execute(&self, _args: &str, session: &mut AgentSession) -> String {
-        let last = session.messages.iter().rev().find(|m| m.role == "assistant");
+        let last = session
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == "assistant");
         match last {
             Some(msg) => {
                 let text = msg.text_content().unwrap_or("(no text)");
                 // Try to copy to clipboard via pbcopy (macOS) or xclip
-                let result = tokio::process::Command::new("pbcopy").stdin(std::process::Stdio::piped()).spawn();
+                let result = tokio::process::Command::new("pbcopy")
+                    .stdin(std::process::Stdio::piped())
+                    .spawn();
                 match result {
                     Ok(mut child) => {
                         if let Some(stdin) = child.stdin.as_mut() {
@@ -294,7 +416,10 @@ impl Command for CopyCommand {
                         let _ = child.wait().await;
                         "Copied to clipboard.".into()
                     }
-                    Err(_) => format!("Clipboard not available. Last message:\n{}", &text[..text.len().min(500)]),
+                    Err(_) => format!(
+                        "Clipboard not available. Last message:\n{}",
+                        &text[..text.len().min(500)]
+                    ),
                 }
             }
             None => "No assistant message to copy.".into(),
@@ -306,8 +431,12 @@ impl Command for CopyCommand {
 struct VersionCommand;
 #[async_trait]
 impl Command for VersionCommand {
-    fn name(&self) -> &str { "version" }
-    fn description(&self) -> &str { "Show ForgeFleet version" }
+    fn name(&self) -> &str {
+        "version"
+    }
+    fn description(&self) -> &str {
+        "Show ForgeFleet version"
+    }
     async fn execute(&self, _args: &str, _session: &mut AgentSession) -> String {
         format!("ForgeFleet Agent v{}", env!("CARGO_PKG_VERSION"))
     }
@@ -317,14 +446,24 @@ impl Command for VersionCommand {
 struct FleetCommand;
 #[async_trait]
 impl Command for FleetCommand {
-    fn name(&self) -> &str { "fleet" }
-    fn description(&self) -> &str { "Show fleet node status" }
+    fn name(&self) -> &str {
+        "fleet"
+    }
+    fn description(&self) -> &str {
+        "Show fleet node status"
+    }
     async fn execute(&self, _args: &str, _session: &mut AgentSession) -> String {
-        let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(3)).build().unwrap_or_default();
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+            .unwrap_or_default();
         let nodes = [
-            ("Taylor", "192.168.5.100:55000"), ("Taylor-2", "192.168.5.100:55001"),
-            ("Marcus", "192.168.5.102:55000"), ("Sophie", "192.168.5.103:55000"),
-            ("Priya", "192.168.5.104:55000"), ("James", "192.168.5.108:55000"),
+            ("Taylor", "192.168.5.100:55000"),
+            ("Taylor-2", "192.168.5.100:55001"),
+            ("Marcus", "192.168.5.102:55000"),
+            ("Sophie", "192.168.5.103:55000"),
+            ("Priya", "192.168.5.104:55000"),
+            ("James", "192.168.5.108:55000"),
             ("James-2", "192.168.5.108:55001"),
         ];
         let mut output = String::from("Fleet LLM Status:\n\n");
@@ -344,8 +483,12 @@ impl Command for FleetCommand {
 struct ModelsCommand;
 #[async_trait]
 impl Command for ModelsCommand {
-    fn name(&self) -> &str { "models" }
-    fn description(&self) -> &str { "List available models across the fleet (deduplicated)" }
+    fn name(&self) -> &str {
+        "models"
+    }
+    fn description(&self) -> &str {
+        "List available models across the fleet (deduplicated)"
+    }
     async fn execute(&self, _args: &str, session: &mut AgentSession) -> String {
         match crate::fleet_info::fetch_snapshot().await {
             Ok(snapshot) => {
@@ -353,7 +496,9 @@ impl Command for ModelsCommand {
                 // Map: model_name -> (tier, Vec<node_name>)
                 let mut by_name: BTreeMap<String, (i32, Vec<String>)> = BTreeMap::new();
                 for m in &snapshot.models {
-                    let entry = by_name.entry(m.name.clone()).or_insert((m.tier, Vec::new()));
+                    let entry = by_name
+                        .entry(m.name.clone())
+                        .or_insert((m.tier, Vec::new()));
                     if !entry.1.contains(&m.node_name) {
                         entry.1.push(m.node_name.clone());
                     }
@@ -367,18 +512,31 @@ impl Command for ModelsCommand {
                         .to_string();
                 }
                 let mut out = String::new();
-                out.push_str(&format!("Available models ({} unique, {} total across fleet):\n\n", by_name.len(), snapshot.models.len()));
+                out.push_str(&format!(
+                    "Available models ({} unique, {} total across fleet):\n\n",
+                    by_name.len(),
+                    snapshot.models.len()
+                ));
                 // Sort by tier desc, then name
                 let mut entries: Vec<_> = by_name.into_iter().collect();
                 entries.sort_by(|a, b| b.1.0.cmp(&a.1.0).then(a.0.cmp(&b.0)));
                 for (name, (tier, mut nodes)) in entries {
                     nodes.sort();
-                    out.push_str(&format!("  [T{tier}] {name}\n       on: {}\n", nodes.join(", ")));
+                    out.push_str(&format!(
+                        "  [T{tier}] {name}\n       on: {}\n",
+                        nodes.join(", ")
+                    ));
                 }
-                out.push_str(&format!("\nCurrent: {} @ {}\nUse /model <name> to switch.", session.config.model, session.config.llm_base_url));
+                out.push_str(&format!(
+                    "\nCurrent: {} @ {}\nUse /model <name> to switch.",
+                    session.config.model, session.config.llm_base_url
+                ));
                 out
             }
-            Err(e) => format!("Failed to load fleet snapshot: {e}\n\nFalling back to endpoint query...\nEndpoint: {}", session.config.llm_base_url),
+            Err(e) => format!(
+                "Failed to load fleet snapshot: {e}\n\nFalling back to endpoint query...\nEndpoint: {}",
+                session.config.llm_base_url
+            ),
         }
     }
 }
@@ -387,8 +545,12 @@ impl Command for ModelsCommand {
 struct NodesCommand;
 #[async_trait]
 impl Command for NodesCommand {
-    fn name(&self) -> &str { "nodes" }
-    fn description(&self) -> &str { "List fleet nodes" }
+    fn name(&self) -> &str {
+        "nodes"
+    }
+    fn description(&self) -> &str {
+        "List fleet nodes"
+    }
     async fn execute(&self, _args: &str, _session: &mut AgentSession) -> String {
         "Fleet nodes: Taylor (M3 Ultra 96GB), James (Intel 64GB), Ace (M4 16GB), Marcus (i7 32GB), Sophie (i5 32GB), Priya (i9 32GB)\nPending: 4× DGX Spark (128GB), 4× GMKtec EVO-X2 (128GB Ryzen AI Max+ 395)".into()
     }
@@ -398,8 +560,12 @@ impl Command for NodesCommand {
 struct MemoryCommand;
 #[async_trait]
 impl Command for MemoryCommand {
-    fn name(&self) -> &str { "memory" }
-    fn description(&self) -> &str { "Show or edit FORGEFLEET.md project memory" }
+    fn name(&self) -> &str {
+        "memory"
+    }
+    fn description(&self) -> &str {
+        "Show or edit FORGEFLEET.md project memory"
+    }
     async fn execute(&self, _args: &str, session: &mut AgentSession) -> String {
         let path = session.config.working_dir.join("FORGEFLEET.md");
         match tokio::fs::read_to_string(&path).await {
@@ -413,8 +579,12 @@ impl Command for MemoryCommand {
 struct UndoCommand;
 #[async_trait]
 impl Command for UndoCommand {
-    fn name(&self) -> &str { "undo" }
-    fn description(&self) -> &str { "Undo the last file change (from file history)" }
+    fn name(&self) -> &str {
+        "undo"
+    }
+    fn description(&self) -> &str {
+        "Undo the last file change (from file history)"
+    }
     async fn execute(&self, _args: &str, _session: &mut AgentSession) -> String {
         "File undo: pending file history integration. Use /rewind to undo the last turn.".into()
     }
@@ -424,14 +594,26 @@ impl Command for UndoCommand {
 struct SummaryCommand;
 #[async_trait]
 impl Command for SummaryCommand {
-    fn name(&self) -> &str { "summary" }
-    fn description(&self) -> &str { "Show a summary of the current session" }
+    fn name(&self) -> &str {
+        "summary"
+    }
+    fn description(&self) -> &str {
+        "Show a summary of the current session"
+    }
     async fn execute(&self, _args: &str, session: &mut AgentSession) -> String {
-        let user_msgs: Vec<_> = session.messages.iter().filter(|m| m.role == "user").collect();
+        let user_msgs: Vec<_> = session
+            .messages
+            .iter()
+            .filter(|m| m.role == "user")
+            .collect();
         let tool_calls = session.messages.iter().filter(|m| m.role == "tool").count();
         format!(
             "Session Summary:\n  ID: {}\n  Turns: {}\n  User messages: {}\n  Tool calls: {}\n  Total messages: {}",
-            session.id, session.turn_count, user_msgs.len(), tool_calls, session.messages.len()
+            session.id,
+            session.turn_count,
+            user_msgs.len(),
+            tool_calls,
+            session.messages.len()
         )
     }
 }
@@ -440,8 +622,12 @@ impl Command for SummaryCommand {
 struct StatsCommand;
 #[async_trait]
 impl Command for StatsCommand {
-    fn name(&self) -> &str { "stats" }
-    fn description(&self) -> &str { "Show detailed session statistics" }
+    fn name(&self) -> &str {
+        "stats"
+    }
+    fn description(&self) -> &str {
+        "Show detailed session statistics"
+    }
     async fn execute(&self, _args: &str, session: &mut AgentSession) -> String {
         let tokens = compaction::estimate_message_tokens(&session.messages);
         format!(
@@ -454,10 +640,15 @@ impl Command for StatsCommand {
              Output tokens: {}\n\
              Compactions: {}\n\
              Tools: {} registered",
-            session.id, session.turn_count, session.messages.len(),
-            tokens, session.config.context_window_tokens,
-            session.usage.total_input_tokens, session.usage.total_output_tokens,
-            session.usage.compaction_count, session.tools.len(),
+            session.id,
+            session.turn_count,
+            session.messages.len(),
+            tokens,
+            session.config.context_window_tokens,
+            session.usage.total_input_tokens,
+            session.usage.total_output_tokens,
+            session.usage.compaction_count,
+            session.tools.len(),
         )
     }
 }
@@ -466,10 +657,15 @@ impl Command for StatsCommand {
 struct PluginsCommand;
 #[async_trait]
 impl Command for PluginsCommand {
-    fn name(&self) -> &str { "plugins" }
-    fn description(&self) -> &str { "List installed plugins" }
+    fn name(&self) -> &str {
+        "plugins"
+    }
+    fn description(&self) -> &str {
+        "List installed plugins"
+    }
     async fn execute(&self, _args: &str, _session: &mut AgentSession) -> String {
-        "Plugin system ready. Place plugins in ~/.forgefleet/plugins/ or .forgefleet/plugins/".into()
+        "Plugin system ready. Place plugins in ~/.forgefleet/plugins/ or .forgefleet/plugins/"
+            .into()
     }
 }
 
@@ -477,8 +673,12 @@ impl Command for PluginsCommand {
 struct SkillsCommand;
 #[async_trait]
 impl Command for SkillsCommand {
-    fn name(&self) -> &str { "skills" }
-    fn description(&self) -> &str { "List available skills" }
+    fn name(&self) -> &str {
+        "skills"
+    }
+    fn description(&self) -> &str {
+        "List available skills"
+    }
     async fn execute(&self, _args: &str, session: &mut AgentSession) -> String {
         let mut output = String::from("Available tools/skills:\n\n");
         for tool in &session.tools {
@@ -492,8 +692,12 @@ impl Command for SkillsCommand {
 struct OutputStyleCommand;
 #[async_trait]
 impl Command for OutputStyleCommand {
-    fn name(&self) -> &str { "output-style" }
-    fn description(&self) -> &str { "Set output verbosity (concise|normal|verbose)" }
+    fn name(&self) -> &str {
+        "output-style"
+    }
+    fn description(&self) -> &str {
+        "Set output verbosity (concise|normal|verbose)"
+    }
     async fn execute(&self, args: &str, session: &mut AgentSession) -> String {
         let arg = args.trim();
         if arg.is_empty() {
@@ -522,14 +726,25 @@ impl Command for OutputStyleCommand {
 struct WebCommand;
 #[async_trait]
 impl Command for WebCommand {
-    fn name(&self) -> &str { "web" }
-    fn description(&self) -> &str { "Open ForgeFleet web UI in browser" }
+    fn name(&self) -> &str {
+        "web"
+    }
+    fn description(&self) -> &str {
+        "Open ForgeFleet web UI in browser"
+    }
     async fn execute(&self, _args: &str, _session: &mut AgentSession) -> String {
         let url = "http://localhost:51002";
         #[cfg(target_os = "macos")]
-        { let _ = tokio::process::Command::new("open").arg(url).output().await; }
+        {
+            let _ = tokio::process::Command::new("open").arg(url).output().await;
+        }
         #[cfg(target_os = "linux")]
-        { let _ = tokio::process::Command::new("xdg-open").arg(url).output().await; }
+        {
+            let _ = tokio::process::Command::new("xdg-open")
+                .arg(url)
+                .output()
+                .await;
+        }
         format!("Opening web UI: {url}")
     }
 }
@@ -538,12 +753,22 @@ impl Command for WebCommand {
 struct ProjectCommand;
 #[async_trait]
 impl Command for ProjectCommand {
-    fn name(&self) -> &str { "project" }
-    fn description(&self) -> &str { "Show or switch current project" }
+    fn name(&self) -> &str {
+        "project"
+    }
+    fn description(&self) -> &str {
+        "Show or switch current project"
+    }
     async fn execute(&self, args: &str, session: &mut AgentSession) -> String {
         if args.is_empty() {
             let dir = &session.config.working_dir;
-            format!("Current project: {}\nWorking dir: {}", dir.file_name().and_then(|n| n.to_str()).unwrap_or("unknown"), dir.display())
+            format!(
+                "Current project: {}\nWorking dir: {}",
+                dir.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("unknown"),
+                dir.display()
+            )
         } else {
             let path = std::path::PathBuf::from(args);
             if path.exists() {
@@ -560,8 +785,12 @@ impl Command for ProjectCommand {
 struct SessionSwitchCommand;
 #[async_trait]
 impl Command for SessionSwitchCommand {
-    fn name(&self) -> &str { "switch" }
-    fn description(&self) -> &str { "Switch to a different chat session or create a new one" }
+    fn name(&self) -> &str {
+        "switch"
+    }
+    fn description(&self) -> &str {
+        "Switch to a different chat session or create a new one"
+    }
     async fn execute(&self, args: &str, _session: &mut AgentSession) -> String {
         if args.is_empty() || args == "new" {
             "Creating new session. Use /switch <session_id> to switch back.".into()
@@ -575,15 +804,24 @@ impl Command for SessionSwitchCommand {
 struct PasteImageCommand;
 #[async_trait]
 impl Command for PasteImageCommand {
-    fn name(&self) -> &str { "paste-image" }
-    fn aliases(&self) -> Vec<&str> { vec!["pi", "image"] }
-    fn description(&self) -> &str { "Paste an image from clipboard or file path for analysis" }
+    fn name(&self) -> &str {
+        "paste-image"
+    }
+    fn aliases(&self) -> Vec<&str> {
+        vec!["pi", "image"]
+    }
+    fn description(&self) -> &str {
+        "Paste an image from clipboard or file path for analysis"
+    }
     async fn execute(&self, args: &str, _session: &mut AgentSession) -> String {
         if !args.is_empty() {
             // Treat args as file path
             let path = std::path::Path::new(args.trim());
             if path.exists() {
-                return format!("Image loaded: {}\nThe agent will analyze this image using the PhotoAnalysis tool.", path.display());
+                return format!(
+                    "Image loaded: {}\nThe agent will analyze this image using the PhotoAnalysis tool.",
+                    path.display()
+                );
             }
             return format!("File not found: {args}");
         }
@@ -594,7 +832,8 @@ impl Command for PasteImageCommand {
             // Check if clipboard has image
             let check = tokio::process::Command::new("osascript")
                 .args(["-e", "the clipboard as «class PNGf»"])
-                .output().await;
+                .output()
+                .await;
 
             if let Ok(out) = check {
                 if out.status.success() {
@@ -604,8 +843,14 @@ impl Command for PasteImageCommand {
                         "osascript -e 'set png_data to the clipboard as «class PNGf»' -e 'set fp to open for access POSIX file \"{}\" with write permission' -e 'write png_data to fp' -e 'close access fp'",
                         temp_path
                     );
-                    let _ = tokio::process::Command::new("bash").arg("-c").arg(&save_cmd).output().await;
-                    return format!("Image saved from clipboard: {temp_path}\nUse: PhotoAnalysis file_path=\"{temp_path}\" to analyze it.");
+                    let _ = tokio::process::Command::new("bash")
+                        .arg("-c")
+                        .arg(&save_cmd)
+                        .output()
+                        .await;
+                    return format!(
+                        "Image saved from clipboard: {temp_path}\nUse: PhotoAnalysis file_path=\"{temp_path}\" to analyze it."
+                    );
                 }
             }
         }
@@ -618,10 +863,16 @@ impl Command for PasteImageCommand {
 struct PushCommand;
 #[async_trait]
 impl Command for PushCommand {
-    fn name(&self) -> &str { "push" }
-    fn description(&self) -> &str { "Push current topic to Focus Stack (pause it for later)" }
+    fn name(&self) -> &str {
+        "push"
+    }
+    fn description(&self) -> &str {
+        "Push current topic to Focus Stack (pause it for later)"
+    }
     async fn execute(&self, args: &str, _session: &mut AgentSession) -> String {
-        if args.is_empty() { return "Usage: /push <topic description>".into(); }
+        if args.is_empty() {
+            return "Usage: /push <topic description>".into();
+        }
         // The actual push happens in the TUI event handler since it needs the tab's tracker
         format!("PUSH:{args}")
     }
@@ -631,8 +882,12 @@ impl Command for PushCommand {
 struct PopCommand;
 #[async_trait]
 impl Command for PopCommand {
-    fn name(&self) -> &str { "pop" }
-    fn description(&self) -> &str { "Pop from Focus Stack (resume previous topic)" }
+    fn name(&self) -> &str {
+        "pop"
+    }
+    fn description(&self) -> &str {
+        "Pop from Focus Stack (resume previous topic)"
+    }
     async fn execute(&self, _args: &str, _session: &mut AgentSession) -> String {
         "POP".into()
     }
@@ -642,10 +897,16 @@ impl Command for PopCommand {
 struct BacklogCommand;
 #[async_trait]
 impl Command for BacklogCommand {
-    fn name(&self) -> &str { "backlog" }
-    fn description(&self) -> &str { "Add item to backlog or view backlog" }
+    fn name(&self) -> &str {
+        "backlog"
+    }
+    fn description(&self) -> &str {
+        "Add item to backlog or view backlog"
+    }
     async fn execute(&self, args: &str, _session: &mut AgentSession) -> String {
-        if args.is_empty() { return "BACKLOG_VIEW".into(); }
+        if args.is_empty() {
+            return "BACKLOG_VIEW".into();
+        }
         format!("BACKLOG_ADD:{args}")
     }
 }

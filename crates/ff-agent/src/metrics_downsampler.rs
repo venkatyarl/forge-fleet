@@ -54,11 +54,9 @@ impl MetricsDownsampler {
 
     /// Check whether this node currently owns the leader singleton.
     async fn is_leader(&self) -> bool {
-        match sqlx::query_scalar::<_, String>(
-            "SELECT member_name FROM fleet_leader_state LIMIT 1",
-        )
-        .fetch_optional(&self.pg)
-        .await
+        match sqlx::query_scalar::<_, String>("SELECT member_name FROM fleet_leader_state LIMIT 1")
+            .fetch_optional(&self.pg)
+            .await
         {
             Ok(Some(leader)) => leader == self.my_name,
             Ok(None) => false,
@@ -87,11 +85,16 @@ impl MetricsDownsampler {
 
             // Aggregate LLM metrics across all active servers on this node.
             let llm_ram_allocated_gb = beat.memory.llm_ram_allocated_gb;
-            let (llm_queue_depth, llm_active_requests, llm_tokens_per_sec) =
-                beat.llm_servers.iter().fold(
-                    (0i32, 0i32, 0.0f64),
-                    |(q, a, t), s| (q + s.queue_depth, a + s.active_requests, t + s.tokens_per_sec_last_min),
-                );
+            let (llm_queue_depth, llm_active_requests, llm_tokens_per_sec) = beat
+                .llm_servers
+                .iter()
+                .fold((0i32, 0i32, 0.0f64), |(q, a, t), s| {
+                    (
+                        q + s.queue_depth,
+                        a + s.active_requests,
+                        t + s.tokens_per_sec_last_min,
+                    )
+                });
 
             let result = sqlx::query(
                 r#"

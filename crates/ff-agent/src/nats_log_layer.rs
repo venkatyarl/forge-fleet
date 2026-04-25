@@ -127,10 +127,7 @@ where
             Err(_) => return,
         };
 
-        let subject = format!(
-            "logs.{}.{}.{}",
-            self.computer_name, self.service, level
-        );
+        let subject = format!("logs.{}.{}.{}", self.computer_name, self.service, level);
 
         // Fire-and-forget. Clone the client handle (cheap — it's an Arc inside).
         let client = self.client.clone();

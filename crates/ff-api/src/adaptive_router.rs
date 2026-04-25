@@ -390,7 +390,9 @@ impl AdaptiveRouter {
 /// Parse a `http://host:port` URL into `(host, port)`. Returns `None` if the
 /// URL doesn't have the expected shape.
 fn parse_host_port(url: &str) -> Option<(String, u16)> {
-    let rest = url.strip_prefix("http://").or_else(|| url.strip_prefix("https://"))?;
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))?;
     let rest = rest.split('/').next().unwrap_or(rest);
     let (host, port_str) = rest.rsplit_once(':')?;
     let port: u16 = port_str.parse().ok()?;

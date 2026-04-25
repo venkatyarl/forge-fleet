@@ -161,10 +161,7 @@ impl ReviveManager {
     /// Tailscale fallback — via `fleet_info::resolve_best_ip`. This means
     /// SSH probes for a tailscale-only computer automatically target the
     /// 100.64.x address rather than a stale LAN IP.
-    pub async fn load_target(
-        &self,
-        computer_id: uuid::Uuid,
-    ) -> Result<ReviveTarget, ReviveError> {
+    pub async fn load_target(&self, computer_id: uuid::Uuid) -> Result<ReviveTarget, ReviveError> {
         let row = sqlx::query(
             "SELECT id, name, primary_ip, ssh_user, ssh_port, mac_addresses, os_family,
                     COALESCE(network_scope, 'lan') AS network_scope
@@ -286,9 +283,7 @@ impl ReviveManager {
                     "com.forgefleet.ffdaemon",
                 ];
                 for label in MAC_LABELS {
-                    let restart_cmd = format!(
-                        "launchctl kickstart -k gui/$(id -u)/{label}"
-                    );
+                    let restart_cmd = format!("launchctl kickstart -k gui/$(id -u)/{label}");
                     let mut cmd = Command::new("ssh");
                     cmd.args(ssh_base_args(target.ssh_port))
                         .arg(format!("{}@{}", target.ssh_user, target.primary_ip))
@@ -436,8 +431,8 @@ async fn run_ssh_output(mut cmd: Command) -> Result<String, ReviveError> {
 
 /// Send a WoL magic packet to `mac` via UDP broadcast.
 pub async fn send_wol(mac: &str) -> Result<(), ReviveError> {
-    let bytes = parse_mac(mac)
-        .ok_or_else(|| ReviveError::InvalidTarget(format!("bad MAC: {mac}")))?;
+    let bytes =
+        parse_mac(mac).ok_or_else(|| ReviveError::InvalidTarget(format!("bad MAC: {mac}")))?;
     let mut packet = Vec::with_capacity(6 + 16 * 6);
     packet.extend_from_slice(&[0xFFu8; 6]);
     for _ in 0..16 {
@@ -452,10 +447,7 @@ pub async fn send_wol(mac: &str) -> Result<(), ReviveError> {
 
 /// Parse a 6-byte MAC from "aa:bb:cc:dd:ee:ff" or "aa-bb-..." etc.
 fn parse_mac(s: &str) -> Option<[u8; 6]> {
-    let cleaned: String = s
-        .chars()
-        .filter(|c| c.is_ascii_hexdigit())
-        .collect();
+    let cleaned: String = s.chars().filter(|c| c.is_ascii_hexdigit()).collect();
     if cleaned.len() != 12 {
         return None;
     }

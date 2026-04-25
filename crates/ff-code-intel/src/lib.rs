@@ -7,7 +7,7 @@
 //! - Semantic compression for context-efficient code retrieval
 //! - Distributed indexing across fleet nodes
 
-pub mod parser;
 pub mod graph;
-pub mod search;
 pub mod index;
+pub mod parser;
+pub mod search;

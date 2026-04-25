@@ -111,11 +111,7 @@ pub fn drain() -> Vec<CapturedBug> {
 /// don't have proper stack info.
 pub fn record_external_panic(msg: &str, source_hint: Option<&str>) {
     let error_class = classify_panic(msg);
-    let signature = compute_signature(
-        &source_hint.map(|s| s.to_string()),
-        None,
-        &error_class,
-    );
+    let signature = compute_signature(&source_hint.map(|s| s.to_string()), None, &error_class);
     let bug = CapturedBug {
         signature,
         file_path: source_hint.map(|s| s.to_string()),
@@ -152,16 +148,8 @@ mod tests {
 
     #[test]
     fn signature_stable_across_inputs() {
-        let a = compute_signature(
-            &Some("src/main.rs".into()),
-            Some(1534),
-            "panic:str_index",
-        );
-        let b = compute_signature(
-            &Some("src/main.rs".into()),
-            Some(1534),
-            "panic:str_index",
-        );
+        let a = compute_signature(&Some("src/main.rs".into()), Some(1534), "panic:str_index");
+        let b = compute_signature(&Some("src/main.rs".into()), Some(1534), "panic:str_index");
         assert_eq!(a, b);
     }
 

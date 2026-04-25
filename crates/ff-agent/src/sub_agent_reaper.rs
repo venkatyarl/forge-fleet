@@ -26,11 +26,9 @@ use tokio::task::JoinHandle;
 
 /// Is this pool's leader the computer whose name matches `my_name`?
 async fn is_leader(pool: &PgPool, my_name: &str) -> bool {
-    match sqlx::query_scalar::<_, String>(
-        "SELECT member_name FROM fleet_leader_state LIMIT 1",
-    )
-    .fetch_optional(pool)
-    .await
+    match sqlx::query_scalar::<_, String>("SELECT member_name FROM fleet_leader_state LIMIT 1")
+        .fetch_optional(pool)
+        .await
     {
         Ok(Some(leader)) => leader.eq_ignore_ascii_case(my_name),
         _ => false,

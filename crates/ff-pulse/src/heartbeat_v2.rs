@@ -23,8 +23,7 @@ use tracing::{debug, error, info, warn};
 use crate::nats::{get_or_init_nats, publish_pulse_beat};
 
 use crate::beat_v2::{
-    Capabilities, DbTopology, HardwareInfo, Ip, LoadInfo, MemoryInfo,
-    NetworkInfo, PulseBeatV2,
+    Capabilities, DbTopology, HardwareInfo, Ip, LoadInfo, MemoryInfo, NetworkInfo, PulseBeatV2,
 };
 use crate::docker_probe::DockerProbe;
 use crate::llm_probe::LlmProbe;
@@ -92,7 +91,11 @@ impl HeartbeatV2Publisher {
     pub async fn build_beat(&self) -> PulseBeatV2 {
         let mut beat = PulseBeatV2::skeleton(&self.computer_name);
         beat.epoch = self.epoch.load(Ordering::Relaxed);
-        beat.role_claimed = self.role.read().map(|r| r.clone()).unwrap_or_else(|_| "member".to_string());
+        beat.role_claimed = self
+            .role
+            .read()
+            .map(|r| r.clone())
+            .unwrap_or_else(|_| "member".to_string());
         beat.election_priority = self.election_priority;
         beat.timestamp = Utc::now();
 
@@ -375,27 +378,25 @@ fn detect_gpu_model() -> Option<String> {
             // Return a generic label; precise model filled in by a later phase.
             Some("Apple Silicon GPU (Metal)".to_string())
         }
-        "linux" => {
-            std::process::Command::new("nvidia-smi")
-                .args(["--query-gpu=name", "--format=csv,noheader"])
-                .output()
-                .ok()
-                .and_then(|o| {
-                    if o.status.success() {
-                        Some(
-                            String::from_utf8_lossy(&o.stdout)
-                                .lines()
-                                .next()
-                                .unwrap_or("")
-                                .trim()
-                                .to_string(),
-                        )
-                    } else {
-                        None
-                    }
-                })
-                .filter(|s| !s.is_empty())
-        }
+        "linux" => std::process::Command::new("nvidia-smi")
+            .args(["--query-gpu=name", "--format=csv,noheader"])
+            .output()
+            .ok()
+            .and_then(|o| {
+                if o.status.success() {
+                    Some(
+                        String::from_utf8_lossy(&o.stdout)
+                            .lines()
+                            .next()
+                            .unwrap_or("")
+                            .trim()
+                            .to_string(),
+                    )
+                } else {
+                    None
+                }
+            })
+            .filter(|s| !s.is_empty()),
         _ => None,
     }
 }
@@ -516,7 +517,13 @@ fn probe_iface_linux(iface: &str) -> (Option<String>, Option<u32>) {
             .env("PATH", "/usr/sbin:/sbin:/usr/bin:/bin")
             .output()
             .ok()
-            .and_then(|o| if o.status.success() { Some(String::from_utf8_lossy(&o.stdout).into_owned()) } else { None })
+            .and_then(|o| {
+                if o.status.success() {
+                    Some(String::from_utf8_lossy(&o.stdout).into_owned())
+                } else {
+                    None
+                }
+            })
             .and_then(|s| {
                 s.lines()
                     .find(|l| l.trim_start().starts_with("tx bitrate:"))
@@ -527,7 +534,9 @@ fn probe_iface_linux(iface: &str) -> (Option<String>, Option<u32>) {
         return (Some("wifi".to_string()), rate);
     }
     let speed_mbps: Option<u32> = std::fs::read_to_string(
-        std::path::Path::new("/sys/class/net").join(iface).join("speed"),
+        std::path::Path::new("/sys/class/net")
+            .join(iface)
+            .join("speed"),
     )
     .ok()
     .and_then(|s| s.trim().parse::<i32>().ok())
@@ -564,7 +573,13 @@ fn probe_iface_macos(iface: &str) -> (Option<String>, Option<u32>) {
         .arg(iface)
         .output()
         .ok()
-        .and_then(|o| if o.status.success() { Some(String::from_utf8_lossy(&o.stdout).into_owned()) } else { None })
+        .and_then(|o| {
+            if o.status.success() {
+                Some(String::from_utf8_lossy(&o.stdout).into_owned())
+            } else {
+                None
+            }
+        })
         .unwrap_or_default();
 
     // Hardware-port lookup: AirPort/Wi-Fi → wifi medium.
@@ -572,7 +587,13 @@ fn probe_iface_macos(iface: &str) -> (Option<String>, Option<u32>) {
         .args(["-listallhardwareports"])
         .output()
         .ok()
-        .and_then(|o| if o.status.success() { Some(String::from_utf8_lossy(&o.stdout).into_owned()) } else { None })
+        .and_then(|o| {
+            if o.status.success() {
+                Some(String::from_utf8_lossy(&o.stdout).into_owned())
+            } else {
+                None
+            }
+        })
         .unwrap_or_default();
 
     let medium = {
@@ -589,7 +610,9 @@ fn probe_iface_macos(iface: &str) -> (Option<String>, Option<u32>) {
                 }
             }
         }
-        let hw_lc = hw_for_iface.map(|s| s.to_ascii_lowercase()).unwrap_or_default();
+        let hw_lc = hw_for_iface
+            .map(|s| s.to_ascii_lowercase())
+            .unwrap_or_default();
         if hw_lc.contains("wi-fi") || hw_lc.contains("airport") {
             "wifi"
         } else if hw_lc.contains("thunderbolt") && hw_lc.contains("bridge") {
@@ -609,19 +632,34 @@ fn probe_iface_macos(iface: &str) -> (Option<String>, Option<u32>) {
             // Match patterns: 100baseT (0.1G), 1000baseT (1G), 2.5GBase (2G/3G),
             // 10GBase-T (10G), etc.
             let lc = line.to_ascii_lowercase();
-            if lc.contains("10gbase") { Some(10) }
-            else if lc.contains("5gbase") { Some(5) }
-            else if lc.contains("2.5gbase") { Some(2) }  // round to 2
-            else if lc.contains("1000base") || lc.contains("1gbase") { Some(1) }
-            else if lc.contains("100base") { Some(0) }    // <1 Gbps → round to 0
-            else { None }
+            if lc.contains("10gbase") {
+                Some(10)
+            } else if lc.contains("5gbase") {
+                Some(5)
+            } else if lc.contains("2.5gbase") {
+                Some(2)
+            }
+            // round to 2
+            else if lc.contains("1000base") || lc.contains("1gbase") {
+                Some(1)
+            } else if lc.contains("100base") {
+                Some(0)
+            }
+            // <1 Gbps → round to 0
+            else {
+                None
+            }
         });
 
     (Some(medium.to_string()), speed_gbps)
 }
 
 fn classify_iface(iface: &str, ip: &str) -> String {
-    if iface.starts_with("utun") || iface.starts_with("tailscale") || ip.starts_with("100.64.") || ip.starts_with("100.65.") {
+    if iface.starts_with("utun")
+        || iface.starts_with("tailscale")
+        || ip.starts_with("100.64.")
+        || ip.starts_with("100.65.")
+    {
         "tailscale".to_string()
     } else if iface.starts_with("wg") {
         "wireguard".to_string()
@@ -648,7 +686,8 @@ mod tests {
     #[tokio::test]
     async fn build_beat_roundtrips_through_json() {
         let client = redis::Client::open("redis://localhost:6380").unwrap();
-        let pub_ = HeartbeatV2Publisher::new(client, "test-computer".into(), Duration::from_secs(15), 100);
+        let pub_ =
+            HeartbeatV2Publisher::new(client, "test-computer".into(), Duration::from_secs(15), 100);
         let beat = pub_.build_beat().await;
         assert_eq!(beat.pulse_protocol_version, 2);
         assert_eq!(beat.computer_name, "test-computer");
@@ -663,7 +702,10 @@ mod tests {
     fn gpu_detection_returns_known_value() {
         let kind = detect_gpu_kind();
         assert!(
-            matches!(kind.as_str(), "apple_silicon" | "nvidia_cuda" | "amd_rocm" | "none"),
+            matches!(
+                kind.as_str(),
+                "apple_silicon" | "nvidia_cuda" | "amd_rocm" | "none"
+            ),
             "unexpected gpu_kind: {}",
             kind
         );

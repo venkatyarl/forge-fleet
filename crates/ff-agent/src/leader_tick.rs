@@ -36,9 +36,8 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use ff_db::leader_state::{
-    LeaderState, pg_claim_leader_initial, pg_claim_leader_pulse_silent,
-    pg_claim_leader_takeover, pg_get_current_leader, pg_refresh_leader_heartbeat,
-    pg_yield_leader,
+    LeaderState, pg_claim_leader_initial, pg_claim_leader_pulse_silent, pg_claim_leader_takeover,
+    pg_get_current_leader, pg_refresh_leader_heartbeat, pg_yield_leader,
 };
 use ff_pulse::reader::{PulseError, PulseReader};
 
@@ -197,11 +196,7 @@ impl LeaderTick {
 
     /// Spawn the periodic loop. Runs `tick()` every `interval_secs` until
     /// `shutdown` flips to `true`.
-    pub fn spawn(
-        self,
-        interval_secs: u64,
-        mut shutdown: watch::Receiver<bool>,
-    ) -> JoinHandle<()> {
+    pub fn spawn(self, interval_secs: u64, mut shutdown: watch::Receiver<bool>) -> JoinHandle<()> {
         let period = Duration::from_secs(interval_secs.max(1));
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(period);
@@ -368,8 +363,7 @@ impl LeaderTick {
                     }
                 } else {
                     // We remain best → just refresh our heartbeat.
-                    let refreshed =
-                        pg_refresh_leader_heartbeat(&self.pg, &self.my_name).await?;
+                    let refreshed = pg_refresh_leader_heartbeat(&self.pg, &self.my_name).await?;
                     if refreshed {
                         // Keep our in-memory epoch aligned with the row.
                         self.observe_epoch(cur.epoch);
@@ -398,12 +392,9 @@ impl LeaderTick {
             // Someone else is leader.
             (Some(cur), Some(best)) => {
                 let stale = leader_is_stale(&cur);
-                let leader_alive_in_pulse =
-                    alive.get(&cur.member_name).copied().unwrap_or(false);
-                let pulse_silence = self.observe_leader_pulse_silence(
-                    &cur.member_name,
-                    leader_alive_in_pulse,
-                );
+                let leader_alive_in_pulse = alive.get(&cur.member_name).copied().unwrap_or(false);
+                let pulse_silence =
+                    self.observe_leader_pulse_silence(&cur.member_name, leader_alive_in_pulse);
                 let pulse_silent_long_enough = pulse_silence
                     .map(|d| d.as_secs() >= MIN_PULSE_SILENT_SECS)
                     .unwrap_or(false);
@@ -550,9 +541,7 @@ impl LeaderTick {
             //    immediately. The revive call runs on the leader itself
             //    (preferred_node = self) because the target is offline.
             let title = format!("revive_member: {name}");
-            let script = format!(
-                "ff fleet revive {name} --internal"
-            );
+            let script = format!("ff fleet revive {name} --internal");
             let payload = serde_json::json!({ "command": script });
             let trigger_spec = serde_json::json!({});
             let required_caps = serde_json::json!([]);

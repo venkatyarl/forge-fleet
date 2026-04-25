@@ -10,7 +10,9 @@ pub struct LintFixTool;
 
 #[async_trait]
 impl AgentTool for LintFixTool {
-    fn name(&self) -> &str { "LintFix" }
+    fn name(&self) -> &str {
+        "LintFix"
+    }
 
     fn description(&self) -> &str {
         "Run linters, formatters, and test suites. Auto-detects the project type (Rust/Node/Python) and runs the appropriate tools. Reports pass/fail with error details."
@@ -34,7 +36,10 @@ impl AgentTool for LintFixTool {
     }
 
     async fn execute(&self, input: Value, ctx: &AgentToolContext) -> AgentToolResult {
-        let action = input.get("action").and_then(Value::as_str).unwrap_or("check");
+        let action = input
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or("check");
         let auto_fix = input.get("fix").and_then(Value::as_bool).unwrap_or(false);
 
         // Detect project type
@@ -76,21 +81,50 @@ impl AgentTool for LintFixTool {
     }
 }
 
-enum ProjectType { Rust, Node, Python, Go, Unknown }
+enum ProjectType {
+    Rust,
+    Node,
+    Python,
+    Go,
+    Unknown,
+}
 
 async fn detect_project_type(dir: &std::path::Path) -> ProjectType {
-    if dir.join("Cargo.toml").exists() { ProjectType::Rust }
-    else if dir.join("package.json").exists() { ProjectType::Node }
-    else if dir.join("pyproject.toml").exists() || dir.join("setup.py").exists() { ProjectType::Python }
-    else if dir.join("go.mod").exists() { ProjectType::Go }
-    else { ProjectType::Unknown }
+    if dir.join("Cargo.toml").exists() {
+        ProjectType::Rust
+    } else if dir.join("package.json").exists() {
+        ProjectType::Node
+    } else if dir.join("pyproject.toml").exists() || dir.join("setup.py").exists() {
+        ProjectType::Python
+    } else if dir.join("go.mod").exists() {
+        ProjectType::Go
+    } else {
+        ProjectType::Unknown
+    }
 }
 
 async fn run_lint(dir: &std::path::Path, project: &ProjectType, fix: bool) -> String {
     let (cmd, args) = match project {
-        ProjectType::Rust => ("cargo", if fix { vec!["clippy", "--fix", "--allow-dirty"] } else { vec!["clippy"] }),
-        ProjectType::Node => ("npx", if fix { vec!["eslint", ".", "--fix"] } else { vec!["eslint", "."] }),
-        ProjectType::Python => ("python3", vec!["-m", "ruff", "check", if fix { "--fix" } else { "" }]),
+        ProjectType::Rust => (
+            "cargo",
+            if fix {
+                vec!["clippy", "--fix", "--allow-dirty"]
+            } else {
+                vec!["clippy"]
+            },
+        ),
+        ProjectType::Node => (
+            "npx",
+            if fix {
+                vec!["eslint", ".", "--fix"]
+            } else {
+                vec!["eslint", "."]
+            },
+        ),
+        ProjectType::Python => (
+            "python3",
+            vec!["-m", "ruff", "check", if fix { "--fix" } else { "" }],
+        ),
         ProjectType::Go => ("golangci-lint", vec!["run"]),
         ProjectType::Unknown => return "Unknown project type — cannot lint".into(),
     };
@@ -101,8 +135,14 @@ async fn run_lint(dir: &std::path::Path, project: &ProjectType, fix: bool) -> St
 async fn run_format(dir: &std::path::Path, project: &ProjectType, fix: bool) -> String {
     let (cmd, args) = match project {
         ProjectType::Rust => ("cargo", vec!["fmt", if fix { "" } else { "--check" }]),
-        ProjectType::Node => ("npx", vec!["prettier", if fix { "--write" } else { "--check" }, "."]),
-        ProjectType::Python => ("python3", vec!["-m", "ruff", "format", if fix { "" } else { "--check" }]),
+        ProjectType::Node => (
+            "npx",
+            vec!["prettier", if fix { "--write" } else { "--check" }, "."],
+        ),
+        ProjectType::Python => (
+            "python3",
+            vec!["-m", "ruff", "format", if fix { "" } else { "--check" }],
+        ),
         ProjectType::Go => ("gofmt", vec![if fix { "-w" } else { "-l" }, "."]),
         ProjectType::Unknown => return "Unknown project type — cannot format".into(),
     };
@@ -124,7 +164,12 @@ async fn run_tests(dir: &std::path::Path, project: &ProjectType) -> String {
 
 async fn run_command(dir: &std::path::Path, cmd: &str, args: &[&str]) -> String {
     let args: Vec<&str> = args.iter().filter(|a| !a.is_empty()).copied().collect();
-    match Command::new(cmd).args(&args).current_dir(dir).output().await {
+    match Command::new(cmd)
+        .args(&args)
+        .current_dir(dir)
+        .output()
+        .await
+    {
         Ok(out) => {
             let status = if out.status.success() { "PASS" } else { "FAIL" };
             let stdout = String::from_utf8_lossy(&out.stdout);

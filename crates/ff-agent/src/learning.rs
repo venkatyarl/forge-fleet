@@ -54,32 +54,70 @@ pub struct LearningReport {
 // ---------------------------------------------------------------------------
 
 const DECISION_SIGNALS: &[&str] = &[
-    "decided to", "we'll use", "going with", "chose", "switched to",
-    "prefer", "instead of", "better to", "should always", "never use",
-    "from now on", "let's go with", "the approach is",
+    "decided to",
+    "we'll use",
+    "going with",
+    "chose",
+    "switched to",
+    "prefer",
+    "instead of",
+    "better to",
+    "should always",
+    "never use",
+    "from now on",
+    "let's go with",
+    "the approach is",
 ];
 
 const PREFERENCE_SIGNALS: &[&str] = &[
-    "i prefer", "i like", "don't like", "always use", "never",
-    "i want", "please always", "please don't", "stop doing",
-    "keep doing", "that's perfect", "exactly right",
+    "i prefer",
+    "i like",
+    "don't like",
+    "always use",
+    "never",
+    "i want",
+    "please always",
+    "please don't",
+    "stop doing",
+    "keep doing",
+    "that's perfect",
+    "exactly right",
 ];
 
 const FACT_SIGNALS: &[&str] = &[
-    "the architecture", "the database", "uses postgresql", "uses sqlite",
-    "runs on port", "the api", "the endpoint", "built with",
-    "depends on", "configured at", "stored in", "deployed to",
+    "the architecture",
+    "the database",
+    "uses postgresql",
+    "uses sqlite",
+    "runs on port",
+    "the api",
+    "the endpoint",
+    "built with",
+    "depends on",
+    "configured at",
+    "stored in",
+    "deployed to",
 ];
 
 const TOOL_PATTERN_SIGNALS: &[&str] = &[
-    "use edit instead of", "use bash for", "use grep to", "use glob for",
-    "always read before", "don't use write for", "the right tool for",
+    "use edit instead of",
+    "use bash for",
+    "use grep to",
+    "use glob for",
+    "always read before",
+    "don't use write for",
+    "the right tool for",
 ];
 
 const STANDARD_SIGNALS: &[&str] = &[
-    "all code should", "every function must", "naming convention",
-    "code style", "always include tests", "documentation required",
-    "error handling pattern", "logging standard",
+    "all code should",
+    "every function must",
+    "naming convention",
+    "code style",
+    "always include tests",
+    "documentation required",
+    "error handling pattern",
+    "logging standard",
 ];
 
 // ---------------------------------------------------------------------------
@@ -151,7 +189,10 @@ pub async fn extract_and_route(
 // Candidate extraction
 // ---------------------------------------------------------------------------
 
-fn extract_candidates(messages: &[ToolChatMessage], brain_ctx: &BrainContext) -> Vec<LearningCandidate> {
+fn extract_candidates(
+    messages: &[ToolChatMessage],
+    brain_ctx: &BrainContext,
+) -> Vec<LearningCandidate> {
     let mut candidates = Vec::new();
     let project_name = brain_ctx.project_name.as_deref().unwrap_or("");
 
@@ -256,11 +297,13 @@ fn extract_sentence_around(text: &str, signal: &str) -> String {
     let lower = text.to_ascii_lowercase();
     if let Some(pos) = lower.find(signal) {
         // Find sentence boundaries
-        let start = text[..pos].rfind(|c: char| c == '.' || c == '\n' || c == '!' || c == '?')
+        let start = text[..pos]
+            .rfind(|c: char| c == '.' || c == '\n' || c == '!' || c == '?')
             .map(|p| p + 1)
             .unwrap_or(0);
         let after = &text[pos..];
-        let end = after.find(|c: char| c == '.' || c == '\n' || c == '!' || c == '?')
+        let end = after
+            .find(|c: char| c == '.' || c == '\n' || c == '!' || c == '?')
             .map(|p| pos + p + 1)
             .unwrap_or_else(|| text.len().min(pos + 200));
 
@@ -273,7 +316,9 @@ fn extract_sentence_around(text: &str, signal: &str) -> String {
 }
 
 fn mentions_project(lower_text: &str, project_name: &str) -> bool {
-    if project_name.is_empty() { return false; }
+    if project_name.is_empty() {
+        return false;
+    }
     lower_text.contains(&project_name.to_ascii_lowercase())
 }
 
@@ -281,7 +326,12 @@ fn dedup_candidates(candidates: &mut Vec<LearningCandidate>) {
     let mut seen_prefixes = std::collections::HashSet::new();
     candidates.retain(|c| {
         // Use first 50 chars as dedup key
-        let key = c.content.chars().take(50).collect::<String>().to_ascii_lowercase();
+        let key = c
+            .content
+            .chars()
+            .take(50)
+            .collect::<String>()
+            .to_ascii_lowercase();
         seen_prefixes.insert(key)
     });
 }
@@ -292,26 +342,34 @@ fn dedup_candidates(candidates: &mut Vec<LearningCandidate>) {
 
 fn route_candidate(candidate: &LearningCandidate, brain_ctx: &BrainContext) -> LearningSink {
     // High-confidence coding standards → Hive Mind (shared with fleet)
-    if matches!(candidate.category, MemoryCategory::CodingStandard) && candidate.confidence >= 0.75 {
+    if matches!(candidate.category, MemoryCategory::CodingStandard) && candidate.confidence >= 0.75
+    {
         return LearningSink::HiveMind;
     }
 
     // Project-specific content → Project Memory
     if candidate.is_project_specific {
         if let Some(root) = &brain_ctx.project_root {
-            return LearningSink::ProjectMemory { project_root: root.clone() };
+            return LearningSink::ProjectMemory {
+                project_root: root.clone(),
+            };
         }
     }
 
     // Preferences and tool patterns → Fleet Brain (personal)
-    if matches!(candidate.category, MemoryCategory::Preference | MemoryCategory::ToolPattern) {
+    if matches!(
+        candidate.category,
+        MemoryCategory::Preference | MemoryCategory::ToolPattern
+    ) {
         return LearningSink::FleetBrain;
     }
 
     // Decisions in a project context → Project Memory
     if matches!(candidate.category, MemoryCategory::Decision) {
         if let Some(root) = &brain_ctx.project_root {
-            return LearningSink::ProjectMemory { project_root: root.clone() };
+            return LearningSink::ProjectMemory {
+                project_root: root.clone(),
+            };
         }
     }
 
@@ -324,7 +382,10 @@ fn route_candidate(candidate: &LearningCandidate, brain_ctx: &BrainContext) -> L
 // ---------------------------------------------------------------------------
 
 async fn write_to_project(project_root: &Path, entry: &MemoryEntry) -> anyhow::Result<()> {
-    let entries_path = project_root.join(".forgefleet").join("memory").join("entries.json");
+    let entries_path = project_root
+        .join(".forgefleet")
+        .join("memory")
+        .join("entries.json");
     write_entry(&entries_path, entry).await
 }
 
@@ -359,9 +420,9 @@ async fn write_entry(path: &Path, entry: &MemoryEntry) -> anyhow::Result<()> {
     };
 
     // Check for duplicates — boost relevance if similar content exists
-    let dominated = entries.iter_mut().find(|e| {
-        content_similarity(&e.content, &entry.content) > 0.6
-    });
+    let dominated = entries
+        .iter_mut()
+        .find(|e| content_similarity(&e.content, &entry.content) > 0.6);
 
     if let Some(existing) = dominated {
         // Boost relevance instead of adding duplicate
@@ -386,11 +447,13 @@ pub async fn apply_entry(path: &std::path::Path, entry: &MemoryEntry) -> anyhow:
 
 /// Simple word-overlap similarity (0.0 to 1.0).
 fn content_similarity(a: &str, b: &str) -> f64 {
-    let words_a: std::collections::HashSet<&str> = a.split_whitespace()
+    let words_a: std::collections::HashSet<&str> = a
+        .split_whitespace()
         .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()))
         .filter(|w| w.len() > 3)
         .collect();
-    let words_b: std::collections::HashSet<&str> = b.split_whitespace()
+    let words_b: std::collections::HashSet<&str> = b
+        .split_whitespace()
         .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()))
         .filter(|w| w.len() > 3)
         .collect();
@@ -444,10 +507,16 @@ pub async fn apply_decay(path: &Path, days_threshold: i64) -> anyhow::Result<usi
 
 /// Run decay across all three brains.
 pub async fn decay_all_brains(brain_ctx: &BrainContext) {
-    let brain_path = dirs::home_dir().unwrap_or_default()
-        .join(".forgefleet").join("brain").join("learnings.json");
-    let hive_path = dirs::home_dir().unwrap_or_default()
-        .join(".forgefleet").join("hive").join("learnings.json");
+    let brain_path = dirs::home_dir()
+        .unwrap_or_default()
+        .join(".forgefleet")
+        .join("brain")
+        .join("learnings.json");
+    let hive_path = dirs::home_dir()
+        .unwrap_or_default()
+        .join(".forgefleet")
+        .join("hive")
+        .join("learnings.json");
 
     let _ = apply_decay(&brain_path, 30).await;
     let _ = apply_decay(&hive_path, 60).await; // hive decays slower

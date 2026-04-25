@@ -9,8 +9,12 @@ use super::{AgentTool, AgentToolContext, AgentToolResult, MAX_TOOL_RESULT_CHARS,
 pub struct PhotoAnalysisTool;
 #[async_trait]
 impl AgentTool for PhotoAnalysisTool {
-    fn name(&self) -> &str { "PhotoAnalysis" }
-    fn description(&self) -> &str { "Analyze photos: describe content, extract text (OCR), get EXIF data, detect faces, identify colors. Works with local files or URLs." }
+    fn name(&self) -> &str {
+        "PhotoAnalysis"
+    }
+    fn description(&self) -> &str {
+        "Analyze photos: describe content, extract text (OCR), get EXIF data, detect faces, identify colors. Works with local files or URLs."
+    }
     fn parameters_schema(&self) -> Value {
         json!({"type":"object","properties":{
             "file_path":{"type":"string","description":"Path to image file or URL"},
@@ -19,54 +23,98 @@ impl AgentTool for PhotoAnalysisTool {
     }
     async fn execute(&self, input: Value, ctx: &AgentToolContext) -> AgentToolResult {
         let file = input.get("file_path").and_then(Value::as_str).unwrap_or("");
-        let actions: Vec<&str> = input.get("actions").and_then(Value::as_array)
-            .map(|a| a.iter().filter_map(Value::as_str).collect()).unwrap_or_else(|| vec!["dimensions", "exif", "ocr"]);
+        let actions: Vec<&str> = input
+            .get("actions")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_else(|| vec!["dimensions", "exif", "ocr"]);
 
-        let path = if std::path::Path::new(file).is_absolute() { file.to_string() } else { ctx.working_dir.join(file).to_string_lossy().to_string() };
+        let path = if std::path::Path::new(file).is_absolute() {
+            file.to_string()
+        } else {
+            ctx.working_dir.join(file).to_string_lossy().to_string()
+        };
         let mut results = Vec::new();
 
         for action in &actions {
             match *action {
                 "dimensions" => {
-                    let cmd = format!("identify -format '%wx%h %m %b' '{}' 2>/dev/null || sips -g pixelWidth -g pixelHeight '{}' 2>/dev/null", path, path);
+                    let cmd = format!(
+                        "identify -format '%wx%h %m %b' '{}' 2>/dev/null || sips -g pixelWidth -g pixelHeight '{}' 2>/dev/null",
+                        path, path
+                    );
                     if let Ok(o) = Command::new("bash").arg("-c").arg(&cmd).output().await {
-                        results.push(format!("Dimensions: {}", String::from_utf8_lossy(&o.stdout).trim()));
+                        results.push(format!(
+                            "Dimensions: {}",
+                            String::from_utf8_lossy(&o.stdout).trim()
+                        ));
                     }
                 }
                 "exif" => {
-                    let cmd = format!("exiftool '{}' 2>/dev/null | head -20 || identify -verbose '{}' 2>/dev/null | head -20", path, path);
+                    let cmd = format!(
+                        "exiftool '{}' 2>/dev/null | head -20 || identify -verbose '{}' 2>/dev/null | head -20",
+                        path, path
+                    );
                     if let Ok(o) = Command::new("bash").arg("-c").arg(&cmd).output().await {
-                        results.push(format!("EXIF:\n{}", truncate_output(&String::from_utf8_lossy(&o.stdout), 1000)));
+                        results.push(format!(
+                            "EXIF:\n{}",
+                            truncate_output(&String::from_utf8_lossy(&o.stdout), 1000)
+                        ));
                     }
                 }
                 "ocr" => {
-                    if let Ok(o) = Command::new("tesseract").args([&path, "stdout"]).output().await {
+                    if let Ok(o) = Command::new("tesseract")
+                        .args([&path, "stdout"])
+                        .output()
+                        .await
+                    {
                         if o.status.success() {
                             let text = String::from_utf8_lossy(&o.stdout);
                             results.push(format!("OCR Text:\n{}", truncate_output(&text, 2000)));
-                        } else { results.push("OCR: tesseract not available".into()); }
+                        } else {
+                            results.push("OCR: tesseract not available".into());
+                        }
                     }
                 }
                 "colors" => {
-                    let cmd = format!("convert '{}' -colors 5 -format '%c' histogram:info:- 2>/dev/null | head -5", path);
+                    let cmd = format!(
+                        "convert '{}' -colors 5 -format '%c' histogram:info:- 2>/dev/null | head -5",
+                        path
+                    );
                     if let Ok(o) = Command::new("bash").arg("-c").arg(&cmd).output().await {
-                        results.push(format!("Dominant colors:\n{}", String::from_utf8_lossy(&o.stdout)));
+                        results.push(format!(
+                            "Dominant colors:\n{}",
+                            String::from_utf8_lossy(&o.stdout)
+                        ));
                     }
                 }
                 _ => {}
             }
         }
 
-        if results.is_empty() { AgentToolResult::err("No analysis results. Check if the file exists and tools are installed.".to_string()) }
-        else { AgentToolResult::ok(format!("Photo Analysis: {file}\n\n{}", results.join("\n\n"))) }
+        if results.is_empty() {
+            AgentToolResult::err(
+                "No analysis results. Check if the file exists and tools are installed."
+                    .to_string(),
+            )
+        } else {
+            AgentToolResult::ok(format!(
+                "Photo Analysis: {file}\n\n{}",
+                results.join("\n\n")
+            ))
+        }
     }
 }
 
 pub struct VideoAnalysisTool;
 #[async_trait]
 impl AgentTool for VideoAnalysisTool {
-    fn name(&self) -> &str { "VideoAnalysis" }
-    fn description(&self) -> &str { "Analyze videos: get metadata (duration, resolution, codec), extract frames, extract audio, transcribe speech." }
+    fn name(&self) -> &str {
+        "VideoAnalysis"
+    }
+    fn description(&self) -> &str {
+        "Analyze videos: get metadata (duration, resolution, codec), extract frames, extract audio, transcribe speech."
+    }
     fn parameters_schema(&self) -> Value {
         json!({"type":"object","properties":{
             "file_path":{"type":"string","description":"Path to video file"},
@@ -77,32 +125,77 @@ impl AgentTool for VideoAnalysisTool {
     }
     async fn execute(&self, input: Value, ctx: &AgentToolContext) -> AgentToolResult {
         let file = input.get("file_path").and_then(Value::as_str).unwrap_or("");
-        let action = input.get("action").and_then(Value::as_str).unwrap_or("info");
-        let path = if std::path::Path::new(file).is_absolute() { file.to_string() } else { ctx.working_dir.join(file).to_string_lossy().to_string() };
+        let action = input
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or("info");
+        let path = if std::path::Path::new(file).is_absolute() {
+            file.to_string()
+        } else {
+            ctx.working_dir.join(file).to_string_lossy().to_string()
+        };
 
         match action {
             "info" => {
-                let cmd = format!("ffprobe -v quiet -print_format json -show_format -show_streams '{}' 2>/dev/null || echo 'ffprobe not installed (brew install ffmpeg)'", path);
+                let cmd = format!(
+                    "ffprobe -v quiet -print_format json -show_format -show_streams '{}' 2>/dev/null || echo 'ffprobe not installed (brew install ffmpeg)'",
+                    path
+                );
                 match Command::new("bash").arg("-c").arg(&cmd).output().await {
-                    Ok(o) => AgentToolResult::ok(truncate_output(&String::from_utf8_lossy(&o.stdout), MAX_TOOL_RESULT_CHARS)),
+                    Ok(o) => AgentToolResult::ok(truncate_output(
+                        &String::from_utf8_lossy(&o.stdout),
+                        MAX_TOOL_RESULT_CHARS,
+                    )),
                     Err(e) => AgentToolResult::err(format!("ffprobe failed: {e}")),
                 }
             }
             "extract_frames" => {
-                let count = input.get("frame_count").and_then(Value::as_u64).unwrap_or(5);
-                let out_dir = input.get("output_dir").and_then(Value::as_str).unwrap_or("./frames");
-                let cmd = format!("mkdir -p '{}' && ffmpeg -i '{}' -vf 'select=not(mod(n\\,{}))' -frames:v {} -vsync vfr '{}'/frame_%03d.png 2>/dev/null", out_dir, path, 30, count, out_dir);
-                match Command::new("bash").arg("-c").arg(&cmd).current_dir(&ctx.working_dir).output().await {
-                    Ok(o) if o.status.success() => AgentToolResult::ok(format!("Extracted {count} frames to {out_dir}/")),
-                    _ => AgentToolResult::err("Frame extraction failed. Is ffmpeg installed?".to_string()),
+                let count = input
+                    .get("frame_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(5);
+                let out_dir = input
+                    .get("output_dir")
+                    .and_then(Value::as_str)
+                    .unwrap_or("./frames");
+                let cmd = format!(
+                    "mkdir -p '{}' && ffmpeg -i '{}' -vf 'select=not(mod(n\\,{}))' -frames:v {} -vsync vfr '{}'/frame_%03d.png 2>/dev/null",
+                    out_dir, path, 30, count, out_dir
+                );
+                match Command::new("bash")
+                    .arg("-c")
+                    .arg(&cmd)
+                    .current_dir(&ctx.working_dir)
+                    .output()
+                    .await
+                {
+                    Ok(o) if o.status.success() => {
+                        AgentToolResult::ok(format!("Extracted {count} frames to {out_dir}/"))
+                    }
+                    _ => AgentToolResult::err(
+                        "Frame extraction failed. Is ffmpeg installed?".to_string(),
+                    ),
                 }
             }
             "extract_audio" => {
-                let out = input.get("output_dir").and_then(Value::as_str).unwrap_or("./audio.mp3");
+                let out = input
+                    .get("output_dir")
+                    .and_then(Value::as_str)
+                    .unwrap_or("./audio.mp3");
                 let cmd = format!("ffmpeg -i '{}' -vn -acodec mp3 '{}' 2>/dev/null", path, out);
-                match Command::new("bash").arg("-c").arg(&cmd).current_dir(&ctx.working_dir).output().await {
-                    Ok(o) if o.status.success() => AgentToolResult::ok(format!("Audio extracted to {out}")),
-                    _ => AgentToolResult::err("Audio extraction failed. Is ffmpeg installed?".to_string()),
+                match Command::new("bash")
+                    .arg("-c")
+                    .arg(&cmd)
+                    .current_dir(&ctx.working_dir)
+                    .output()
+                    .await
+                {
+                    Ok(o) if o.status.success() => {
+                        AgentToolResult::ok(format!("Audio extracted to {out}"))
+                    }
+                    _ => AgentToolResult::err(
+                        "Audio extraction failed. Is ffmpeg installed?".to_string(),
+                    ),
                 }
             }
             "transcribe" => {
@@ -112,10 +205,13 @@ impl AgentTool for VideoAnalysisTool {
                     path
                 );
                 match Command::new("bash").arg("-c").arg(&cmd).output().await {
-                    Ok(o) if o.status.success() => {
-                        AgentToolResult::ok(format!("Transcription:\n{}", truncate_output(&String::from_utf8_lossy(&o.stdout), MAX_TOOL_RESULT_CHARS)))
-                    }
-                    _ => AgentToolResult::err("Transcription failed. Install: pip install openai-whisper".to_string()),
+                    Ok(o) if o.status.success() => AgentToolResult::ok(format!(
+                        "Transcription:\n{}",
+                        truncate_output(&String::from_utf8_lossy(&o.stdout), MAX_TOOL_RESULT_CHARS)
+                    )),
+                    _ => AgentToolResult::err(
+                        "Transcription failed. Install: pip install openai-whisper".to_string(),
+                    ),
                 }
             }
             _ => AgentToolResult::err(format!("Unknown action: {action}")),
@@ -126,8 +222,12 @@ impl AgentTool for VideoAnalysisTool {
 pub struct AudioAnalysisTool;
 #[async_trait]
 impl AgentTool for AudioAnalysisTool {
-    fn name(&self) -> &str { "AudioAnalysis" }
-    fn description(&self) -> &str { "Analyze audio: transcribe speech (Whisper), get metadata, convert formats." }
+    fn name(&self) -> &str {
+        "AudioAnalysis"
+    }
+    fn description(&self) -> &str {
+        "Analyze audio: transcribe speech (Whisper), get metadata, convert formats."
+    }
     fn parameters_schema(&self) -> Value {
         json!({"type":"object","properties":{
             "file_path":{"type":"string","description":"Path to audio file"},
@@ -138,31 +238,77 @@ impl AgentTool for AudioAnalysisTool {
     }
     async fn execute(&self, input: Value, ctx: &AgentToolContext) -> AgentToolResult {
         let file = input.get("file_path").and_then(Value::as_str).unwrap_or("");
-        let action = input.get("action").and_then(Value::as_str).unwrap_or("info");
-        let path = if std::path::Path::new(file).is_absolute() { file.to_string() } else { ctx.working_dir.join(file).to_string_lossy().to_string() };
+        let action = input
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or("info");
+        let path = if std::path::Path::new(file).is_absolute() {
+            file.to_string()
+        } else {
+            ctx.working_dir.join(file).to_string_lossy().to_string()
+        };
 
         match action {
             "transcribe" => {
-                let lang = input.get("language").and_then(Value::as_str).map(|l| format!("--language {l}")).unwrap_or_default();
-                let cmd = format!("whisper '{}' --model base --output_format txt {} 2>/dev/null && cat '{}.txt'", path, lang, path.trim_end_matches(|c: char| c != '.'));
-                match Command::new("bash").arg("-c").arg(&cmd).current_dir(&ctx.working_dir).output().await {
-                    Ok(o) if o.status.success() => AgentToolResult::ok(format!("Transcription:\n{}", truncate_output(&String::from_utf8_lossy(&o.stdout), MAX_TOOL_RESULT_CHARS))),
-                    _ => AgentToolResult::err("Transcription failed. Install: pip install openai-whisper".to_string()),
+                let lang = input
+                    .get("language")
+                    .and_then(Value::as_str)
+                    .map(|l| format!("--language {l}"))
+                    .unwrap_or_default();
+                let cmd = format!(
+                    "whisper '{}' --model base --output_format txt {} 2>/dev/null && cat '{}.txt'",
+                    path,
+                    lang,
+                    path.trim_end_matches(|c: char| c != '.')
+                );
+                match Command::new("bash")
+                    .arg("-c")
+                    .arg(&cmd)
+                    .current_dir(&ctx.working_dir)
+                    .output()
+                    .await
+                {
+                    Ok(o) if o.status.success() => AgentToolResult::ok(format!(
+                        "Transcription:\n{}",
+                        truncate_output(&String::from_utf8_lossy(&o.stdout), MAX_TOOL_RESULT_CHARS)
+                    )),
+                    _ => AgentToolResult::err(
+                        "Transcription failed. Install: pip install openai-whisper".to_string(),
+                    ),
                 }
             }
             "info" => {
-                let cmd = format!("ffprobe -v quiet -print_format json -show_format '{}' 2>/dev/null", path);
+                let cmd = format!(
+                    "ffprobe -v quiet -print_format json -show_format '{}' 2>/dev/null",
+                    path
+                );
                 match Command::new("bash").arg("-c").arg(&cmd).output().await {
-                    Ok(o) => AgentToolResult::ok(truncate_output(&String::from_utf8_lossy(&o.stdout), MAX_TOOL_RESULT_CHARS)),
+                    Ok(o) => AgentToolResult::ok(truncate_output(
+                        &String::from_utf8_lossy(&o.stdout),
+                        MAX_TOOL_RESULT_CHARS,
+                    )),
                     Err(e) => AgentToolResult::err(format!("ffprobe failed: {e}")),
                 }
             }
             "convert" => {
-                let output = input.get("output").and_then(Value::as_str).unwrap_or("output.mp3");
+                let output = input
+                    .get("output")
+                    .and_then(Value::as_str)
+                    .unwrap_or("output.mp3");
                 let cmd = format!("ffmpeg -i '{}' '{}' 2>/dev/null", path, output);
-                match Command::new("bash").arg("-c").arg(&cmd).current_dir(&ctx.working_dir).output().await {
-                    Ok(o) if o.status.success() => AgentToolResult::ok(format!("Converted: {file} → {output}")),
-                    _ => AgentToolResult::err("Conversion failed. Is ffmpeg installed?".to_string()),
+                match Command::new("bash")
+                    .arg("-c")
+                    .arg(&cmd)
+                    .current_dir(&ctx.working_dir)
+                    .output()
+                    .await
+                {
+                    Ok(o) if o.status.success() => {
+                        AgentToolResult::ok(format!("Converted: {file} → {output}"))
+                    }
+                    _ => {
+                        AgentToolResult::err("Conversion failed. Is ffmpeg installed?".to_string())
+                    }
                 }
             }
             _ => AgentToolResult::err(format!("Unknown action: {action}")),
@@ -173,8 +319,12 @@ impl AgentTool for AudioAnalysisTool {
 pub struct SelfHealTool;
 #[async_trait]
 impl AgentTool for SelfHealTool {
-    fn name(&self) -> &str { "SelfHeal" }
-    fn description(&self) -> &str { "Detect failures in fleet nodes, diagnose root cause, apply fixes automatically. Monitors LLM servers, services, disk space, and network connectivity." }
+    fn name(&self) -> &str {
+        "SelfHeal"
+    }
+    fn description(&self) -> &str {
+        "Detect failures in fleet nodes, diagnose root cause, apply fixes automatically. Monitors LLM servers, services, disk space, and network connectivity."
+    }
     fn parameters_schema(&self) -> Value {
         json!({"type":"object","properties":{
             "action":{"type":"string","enum":["diagnose","heal","status","auto"]},
@@ -183,7 +333,10 @@ impl AgentTool for SelfHealTool {
         },"required":["action"]})
     }
     async fn execute(&self, input: Value, _ctx: &AgentToolContext) -> AgentToolResult {
-        let action = input.get("action").and_then(Value::as_str).unwrap_or("status");
+        let action = input
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or("status");
         let node = input.get("node").and_then(Value::as_str);
 
         // Build node list from DB (no hardcoded fleet).
@@ -192,7 +345,9 @@ impl AgentTool for SelfHealTool {
         } else {
             match crate::fleet_info::fetch_nodes().await {
                 Ok(rows) => rows.into_iter().map(|r| (r.name, r.ip)).collect(),
-                Err(e) => return AgentToolResult::err(format!("Failed to load fleet from database: {e}")),
+                Err(e) => {
+                    return AgentToolResult::err(format!("Failed to load fleet from database: {e}"));
+                }
             }
         };
 
@@ -200,15 +355,35 @@ impl AgentTool for SelfHealTool {
             return AgentToolResult::ok("No fleet nodes registered in the database.".to_string());
         }
 
-        let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(3)).build().unwrap_or_default();
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+            .unwrap_or_default();
         let mut issues = Vec::new();
         let mut healthy = Vec::new();
 
         for (name, ip) in &nodes {
             // Check LLM server
-            let llm_ok = client.get(format!("http://{ip}:55000/health")).send().await.map(|r| r.status().is_success()).unwrap_or(false);
+            let llm_ok = client
+                .get(format!("http://{ip}:55000/health"))
+                .send()
+                .await
+                .map(|r| r.status().is_success())
+                .unwrap_or(false);
             // Check SSH
-            let ssh_ok = Command::new("ssh").args(["-o", "ConnectTimeout=3", "-o", "StrictHostKeyChecking=no", &format!("root@{ip}"), "echo ok"]).output().await.map(|o| o.status.success()).unwrap_or(false);
+            let ssh_ok = Command::new("ssh")
+                .args([
+                    "-o",
+                    "ConnectTimeout=3",
+                    "-o",
+                    "StrictHostKeyChecking=no",
+                    &format!("root@{ip}"),
+                    "echo ok",
+                ])
+                .output()
+                .await
+                .map(|o| o.status.success())
+                .unwrap_or(false);
 
             if !llm_ok && ssh_ok {
                 issues.push(format!("  {name} ({ip}): LLM server DOWN (SSH ok)\n    Fix: ssh root@{ip} 'systemctl restart llama-server || ollama serve &'"));
@@ -221,16 +396,32 @@ impl AgentTool for SelfHealTool {
 
         match action {
             "diagnose" | "status" => {
-                let mut output = format!("Fleet Health ({} nodes):\n\nHealthy:\n{}\n", nodes.len(), healthy.join("\n"));
-                if !issues.is_empty() { output.push_str(&format!("\nIssues Found:\n{}\n", issues.join("\n\n"))); }
-                else { output.push_str("\nNo issues detected.\n"); }
+                let mut output = format!(
+                    "Fleet Health ({} nodes):\n\nHealthy:\n{}\n",
+                    nodes.len(),
+                    healthy.join("\n")
+                );
+                if !issues.is_empty() {
+                    output.push_str(&format!("\nIssues Found:\n{}\n", issues.join("\n\n")));
+                } else {
+                    output.push_str("\nNo issues detected.\n");
+                }
                 AgentToolResult::ok(output)
             }
             "heal" | "auto" => {
-                if issues.is_empty() { return AgentToolResult::ok("No issues to heal. All nodes healthy.".to_string()); }
+                if issues.is_empty() {
+                    return AgentToolResult::ok(
+                        "No issues to heal. All nodes healthy.".to_string(),
+                    );
+                }
                 let mut healed = Vec::new();
                 for (name, ip) in &nodes {
-                    let llm_ok = client.get(format!("http://{ip}:55000/health")).send().await.map(|r| r.status().is_success()).unwrap_or(false);
+                    let llm_ok = client
+                        .get(format!("http://{ip}:55000/health"))
+                        .send()
+                        .await
+                        .map(|r| r.status().is_success())
+                        .unwrap_or(false);
                     if !llm_ok {
                         // Try to restart LLM server
                         let _restart = Command::new("ssh").args(["-o", "ConnectTimeout=5", &format!("root@{ip}"), "pkill -f llama-server; sleep 2; nohup llama-server -m /models/*.gguf --host 0.0.0.0 --port 51000 &>/tmp/llama.log &"]).output().await;
@@ -247,8 +438,12 @@ impl AgentTool for SelfHealTool {
 pub struct AutoFleetTool;
 #[async_trait]
 impl AgentTool for AutoFleetTool {
-    fn name(&self) -> &str { "AutoFleet" }
-    fn description(&self) -> &str { "Fully autonomous fleet management: scan for new hardware, auto-onboard, configure, deploy models, optimize placement, rebalance workloads." }
+    fn name(&self) -> &str {
+        "AutoFleet"
+    }
+    fn description(&self) -> &str {
+        "Fully autonomous fleet management: scan for new hardware, auto-onboard, configure, deploy models, optimize placement, rebalance workloads."
+    }
     fn parameters_schema(&self) -> Value {
         json!({"type":"object","properties":{
             "action":{"type":"string","enum":["scan","optimize","rebalance","auto","report"]},
@@ -256,7 +451,10 @@ impl AgentTool for AutoFleetTool {
         },"required":["action"]})
     }
     async fn execute(&self, input: Value, _ctx: &AgentToolContext) -> AgentToolResult {
-        let action = input.get("action").and_then(Value::as_str).unwrap_or("report");
+        let action = input
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or("report");
 
         match action {
             "scan" => {
@@ -369,8 +567,12 @@ impl AgentTool for AutoFleetTool {
 pub struct TaskDecomposerTool;
 #[async_trait]
 impl AgentTool for TaskDecomposerTool {
-    fn name(&self) -> &str { "TaskDecomposer" }
-    fn description(&self) -> &str { "Break a complex task into a tree of subtasks with dependencies, priorities, and estimated effort. Useful for planning large projects." }
+    fn name(&self) -> &str {
+        "TaskDecomposer"
+    }
+    fn description(&self) -> &str {
+        "Break a complex task into a tree of subtasks with dependencies, priorities, and estimated effort. Useful for planning large projects."
+    }
     fn parameters_schema(&self) -> Value {
         json!({"type":"object","properties":{
             "task":{"type":"string","description":"Complex task to break down"},
@@ -381,7 +583,9 @@ impl AgentTool for TaskDecomposerTool {
     async fn execute(&self, input: Value, _ctx: &AgentToolContext) -> AgentToolResult {
         let task = input.get("task").and_then(Value::as_str).unwrap_or("");
         let depth = input.get("depth").and_then(Value::as_u64).unwrap_or(2);
-        if task.is_empty() { return AgentToolResult::err("'task' required"); }
+        if task.is_empty() {
+            return AgentToolResult::err("'task' required");
+        }
 
         AgentToolResult::ok(format!(
             "Task Decomposition: \"{task}\"\n\n\

@@ -94,13 +94,10 @@ struct StartArgs {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let command = cli
-        .command
-        .as_ref()
-        .unwrap_or(&Command::Start(StartArgs {
-            leader: false,
-            disable_pulse_v2: false,
-        }));
+    let command = cli.command.as_ref().unwrap_or(&Command::Start(StartArgs {
+        leader: false,
+        disable_pulse_v2: false,
+    }));
 
     match command {
         Command::Start(args) => run_daemon(&cli, args).await,
@@ -122,7 +119,9 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
     // Publish node identity for in-process consumers (agent, MCP tools, callbacks).
     // SAFETY: single-threaded at this point — daemon subsystems haven't spawned yet.
     #[allow(unused_unsafe)]
-    unsafe { std::env::set_var("FORGEFLEET_NODE_NAME", &node_name); }
+    unsafe {
+        std::env::set_var("FORGEFLEET_NODE_NAME", &node_name);
+    }
 
     // ─── NATS client (optional) ─────────────────────────────────────────────
     // Initialize the process-global NATS client BEFORE tracing so the
@@ -135,7 +134,9 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
     // `init_logging` succeeds.
     let nats_url = ff_agent::nats_client::resolve_nats_url();
     #[allow(unused_unsafe)]
-    unsafe { std::env::set_var("FORGEFLEET_NATS_URL", &nats_url); }
+    unsafe {
+        std::env::set_var("FORGEFLEET_NATS_URL", &nats_url);
+    }
     let nats_init_outcome: Result<(), String> = ff_agent::nats_client::init_nats(&nats_url)
         .await
         .map_err(|e| e.to_string());
@@ -143,7 +144,9 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
     init_logging(cli, &node_name).await?;
     match &nats_init_outcome {
         Ok(_) => info!(url = %nats_url, "NATS connected"),
-        Err(e) => warn!(url = %nats_url, error = %e, "NATS unavailable — continuing without event bus"),
+        Err(e) => {
+            warn!(url = %nats_url, error = %e, "NATS unavailable — continuing without event bus")
+        }
     }
     print_startup_banner(&node_name, &role, &config_path);
 
@@ -301,9 +304,8 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
     info!("starting subsystem: agent");
     let mut embedded_agent_config = build_embedded_agent_config(&config, node_name.clone());
     // Wire in the inference router so autonomous LLM tasks use local-first fleet routing.
-    let inference_router = Arc::new(
-        ff_agent::inference_router::InferenceRouter::from_config(&config_path).await,
-    );
+    let inference_router =
+        Arc::new(ff_agent::inference_router::InferenceRouter::from_config(&config_path).await);
     embedded_agent_config.inference_router = Some(inference_router);
     subsystem_tasks.push(start_agent_subsystem(
         embedded_agent_config,
@@ -355,7 +357,9 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
                             } else {
                                 tg.bot_token_env.as_str()
                             };
-                            unsafe { std::env::set_var(key, token.trim()); }
+                            unsafe {
+                                std::env::set_var(key, token.trim());
+                            }
                             info!("telegram bot token loaded from fleet_secrets");
                         }
                         Ok(_) => info!("telegram bot token absent in fleet_secrets"),
@@ -1763,8 +1767,8 @@ async fn start_pulse_v2_subsystems(
     let node_name_for_auto_upgrade = node_name.clone();
 
     // Build the redis::Client once — both publisher and materializer need one.
-    let redis_client = redis::Client::open(redis_url.as_str())
-        .context("pulse v2: failed to open redis client")?;
+    let redis_client =
+        redis::Client::open(redis_url.as_str()).context("pulse v2: failed to open redis client")?;
 
     // (2) HeartbeatV2Publisher — always runs when computer row exists.
     info!(
@@ -1789,16 +1793,14 @@ async fn start_pulse_v2_subsystems(
     // If no key is configured we publish unsigned (rollout compat).
     {
         let cache = ff_pulse::pulse_hmac::KeyCache::global().clone();
-        handles.push(cache.spawn_refresher(
-            pg_pool.clone(),
-            std::time::Duration::from_secs(300),
-        ));
+        handles.push(cache.spawn_refresher(pg_pool.clone(), std::time::Duration::from_secs(300)));
     }
 
     // (3) Materializer — runs on every daemon for this phase. See NOTE
     // at call-site in run_daemon.
     info!("starting subsystem: pulse v2 materializer");
-    let materializer = ff_pulse::materializer::Materializer::new(pg_pool.clone(), redis_client.clone());
+    let materializer =
+        ff_pulse::materializer::Materializer::new(pg_pool.clone(), redis_client.clone());
     handles.push(materializer.spawn(shutdown_rx.clone()));
 
     // OpenClawManager — built BEFORE the fleet_members gate so the
@@ -1827,10 +1829,7 @@ async fn start_pulse_v2_subsystems(
     let oc_reconciler_shutdown = shutdown_rx.clone();
     handles.push(tokio::spawn(async move {
         oc_reconciler
-            .run_reconciler(
-                oc_reconciler_shutdown,
-                std::time::Duration::from_secs(60),
-            )
+            .run_reconciler(oc_reconciler_shutdown, std::time::Duration::from_secs(60))
             .await;
     }));
 
@@ -1853,80 +1852,82 @@ async fn start_pulse_v2_subsystems(
         let my_name_for_promote = node_name.clone();
         let my_name_for_demote = node_name.clone();
 
-        let on_became: ff_agent::leader_tick::OnBecameLeader = std::sync::Arc::new(move |prev: Option<String>| {
-            let oc = oc_promote.clone();
-            let my_name = my_name_for_promote.clone();
-            let pool = pool_for_promote.clone();
-            tokio::spawn(async move {
-                // Publish leader-change event to NATS (best-effort).
-                ff_agent::fleet_events_nats::FleetEventBus::publish_leader_change(
-                    prev.as_deref(),
-                    &my_name,
-                    0,
-                )
-                .await;
-
-                if let Err(e) = oc.promote_to_gateway(prev.as_deref()).await {
-                    tracing::error!(error = %e, "openclaw: promote_to_gateway failed");
-                } else {
-                    // Surface promotion as a deployment.started event for the openclaw-gateway.
-                    ff_agent::fleet_events_nats::FleetEventBus::publish_deployment_change(
+        let on_became: ff_agent::leader_tick::OnBecameLeader = std::sync::Arc::new(
+            move |prev: Option<String>| {
+                let oc = oc_promote.clone();
+                let my_name = my_name_for_promote.clone();
+                let pool = pool_for_promote.clone();
+                tokio::spawn(async move {
+                    // Publish leader-change event to NATS (best-effort).
+                    ff_agent::fleet_events_nats::FleetEventBus::publish_leader_change(
+                        prev.as_deref(),
                         &my_name,
-                        uuid::Uuid::nil(),
-                        "started",
-                        "openclaw-gateway",
+                        0,
                     )
                     .await;
 
-                    // Re-import paired devices stashed by the previous
-                    // leader on its way out (if any). Best-effort: if
-                    // the secret is missing or the import fails, just
-                    // log — phones/IoT will need to re-pair but the
-                    // gateway is still functional.
-                    match ff_agent::openclaw::lookup_device_pairings_export(&pool).await {
-                        Ok(Some(export)) if !export.trim().is_empty() => {
-                            match oc.import_devices(&export).await {
-                                Ok(n) => {
-                                    tracing::info!(
-                                        count = n,
-                                        "openclaw: imported paired devices from previous leader"
-                                    );
-                                    if let Err(e) =
-                                        ff_agent::openclaw::clear_device_pairings_export(&pool)
-                                            .await
-                                    {
-                                        tracing::warn!(
+                    if let Err(e) = oc.promote_to_gateway(prev.as_deref()).await {
+                        tracing::error!(error = %e, "openclaw: promote_to_gateway failed");
+                    } else {
+                        // Surface promotion as a deployment.started event for the openclaw-gateway.
+                        ff_agent::fleet_events_nats::FleetEventBus::publish_deployment_change(
+                            &my_name,
+                            uuid::Uuid::nil(),
+                            "started",
+                            "openclaw-gateway",
+                        )
+                        .await;
+
+                        // Re-import paired devices stashed by the previous
+                        // leader on its way out (if any). Best-effort: if
+                        // the secret is missing or the import fails, just
+                        // log — phones/IoT will need to re-pair but the
+                        // gateway is still functional.
+                        match ff_agent::openclaw::lookup_device_pairings_export(&pool).await {
+                            Ok(Some(export)) if !export.trim().is_empty() => {
+                                match oc.import_devices(&export).await {
+                                    Ok(n) => {
+                                        tracing::info!(
+                                            count = n,
+                                            "openclaw: imported paired devices from previous leader"
+                                        );
+                                        if let Err(e) =
+                                            ff_agent::openclaw::clear_device_pairings_export(&pool)
+                                                .await
+                                        {
+                                            tracing::warn!(
+                                                error = %e,
+                                                "openclaw: failed to clear device pairings secret"
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
                                             error = %e,
-                                            "openclaw: failed to clear device pairings secret"
+                                            "openclaw: import_devices failed — devices may need to re-pair"
                                         );
                                     }
                                 }
-                                Err(e) => {
-                                    tracing::error!(
-                                        error = %e,
-                                        "openclaw: import_devices failed — devices may need to re-pair"
-                                    );
-                                }
+                            }
+                            Ok(_) => {
+                                tracing::debug!(
+                                    "openclaw: no device pairings stashed (cold start or previous leader crashed before export)"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    "openclaw: could not read device pairings secret"
+                                );
                             }
                         }
-                        Ok(_) => {
-                            tracing::debug!(
-                                "openclaw: no device pairings stashed (cold start or previous leader crashed before export)"
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                "openclaw: could not read device pairings secret"
-                            );
-                        }
                     }
-                }
-            });
-        });
+                });
+            },
+        );
 
-        let on_lost: ff_agent::leader_tick::OnLostLeader =
-            std::sync::Arc::new(move |new_leader_name: String| {
+        let on_lost: ff_agent::leader_tick::OnLostLeader = std::sync::Arc::new(
+            move |new_leader_name: String| {
                 let oc = oc_demote.clone();
                 let pool = pool_for_url.clone();
                 let pool_export = pool_for_demote.clone();
@@ -1987,9 +1988,7 @@ async fn start_pulse_v2_subsystems(
                         .flatten()
                         .unwrap_or_default();
                     if url.is_empty() {
-                        tracing::warn!(
-                            "openclaw: lost leader but no gateway URL published yet"
-                        );
+                        tracing::warn!("openclaw: lost leader but no gateway URL published yet");
                         return;
                     }
                     if let Err(e) = oc.demote_to_node(&url).await {
@@ -2004,17 +2003,15 @@ async fn start_pulse_v2_subsystems(
                         .await;
                     }
                 });
-            });
+            },
+        );
 
         // Phase 6 HA — auto Postgres failover manager. Runs inside every
         // leader tick (only when we are the current fleet leader). The
         // whole path is no-op'd by the env var
         // FORGEFLEET_DISABLE_AUTO_PG_FAILOVER=true for safety drills.
         let pg_failover_manager = std::sync::Arc::new(
-            ff_agent::ha::pg_failover::PostgresFailoverManager::new(
-                pg_pool.clone(),
-                computer_id,
-            ),
+            ff_agent::ha::pg_failover::PostgresFailoverManager::new(pg_pool.clone(), computer_id),
         );
         info!(
             node = %node_name,

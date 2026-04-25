@@ -16,7 +16,11 @@ pub async fn index_directory(dir: &Path) -> anyhow::Result<CodeGraph> {
 
     walk_and_index(dir, dir, &mut graph, &mut file_count, &mut entity_count).await?;
 
-    info!(files = file_count, entities = entity_count, "codebase indexed");
+    info!(
+        files = file_count,
+        entities = entity_count,
+        "codebase indexed"
+    );
     Ok(graph)
 }
 
@@ -69,9 +73,20 @@ async fn walk_and_index(
 }
 
 const SKIP_DIRS: &[&str] = &[
-    "node_modules", "target", ".git", "__pycache__", ".next",
-    "dist", "build", "vendor", ".venv", "venv", ".tox",
-    "coverage", ".nyc_output", ".cache",
+    "node_modules",
+    "target",
+    ".git",
+    "__pycache__",
+    ".next",
+    "dist",
+    "build",
+    "vendor",
+    ".venv",
+    "venv",
+    ".tox",
+    "coverage",
+    ".nyc_output",
+    ".cache",
 ];
 
 fn simple_hash(content: &str) -> String {
@@ -92,8 +107,11 @@ mod tests {
     async fn index_forge_fleet_crate() {
         // Index just the ff-agent/src/tools directory as a quick test
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent().unwrap()
-            .join("ff-agent").join("src").join("tools");
+            .parent()
+            .unwrap()
+            .join("ff-agent")
+            .join("src")
+            .join("tools");
 
         if !dir.exists() {
             return; // skip if not in workspace

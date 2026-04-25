@@ -2,7 +2,9 @@
 
 /// Default LLM model ports used across the fleet.
 /// Convention: each node uses 55000 for first model, 55001 for second, etc.
-pub const LLM_MODEL_PORTS: [u16; 11] = [55000, 55001, 55002, 55003, 55004, 55005, 55006, 55007, 55008, 55009, 55010];
+pub const LLM_MODEL_PORTS: [u16; 11] = [
+    55000, 55001, 55002, 55003, 55004, 55005, 55006, 55007, 55008, 55009, 55010,
+];
 
 /// Legacy llama.cpp ports (kept for backward compatibility in scanning).
 pub const LLAMA_CPP_PORTS: [u16; 4] = [55000, 55001, 55002, 55003];

@@ -170,10 +170,7 @@ impl ModelBenchmarker {
                 ),
             )
         } else if max_ctx == 0 && total_gen_tokens == 0 {
-            (
-                false,
-                "no prompt produced a non-empty response".to_string(),
-            )
+            (false, "no prompt produced a non-empty response".to_string())
         } else {
             (true, String::new())
         };
@@ -237,10 +234,7 @@ impl ModelBenchmarker {
             .map_err(|e| BenchError::Http(format!("POST {url}: {e}")))?;
 
         if !resp.status().is_success() {
-            return Err(BenchError::Http(format!(
-                "{url} → {}",
-                resp.status()
-            )));
+            return Err(BenchError::Http(format!("{url} → {}", resp.status())));
         }
 
         let ttft_ms = t_start.elapsed().as_millis().min(u32::MAX as u128) as u32;
@@ -431,17 +425,15 @@ pub async fn benchmark_with_defaults(
     model_id: &str,
     computer: &str,
 ) -> Result<BenchmarkReport, BenchError> {
-    let redis_url = std::env::var("FORGEFLEET_REDIS_URL")
-        .unwrap_or_else(|_| "redis://127.0.0.1:6380".into());
-    let pulse =
-        PulseReader::new(&redis_url).map_err(|e| BenchError::Pulse(e.to_string()))?;
+    let redis_url =
+        std::env::var("FORGEFLEET_REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6380".into());
+    let pulse = PulseReader::new(&redis_url).map_err(|e| BenchError::Pulse(e.to_string()))?;
     let b = ModelBenchmarker::new(pg.clone(), pulse);
     b.benchmark(model_id, computer).await.or_else(|e| {
         if matches!(e, BenchError::NotLoaded(_, _)) {
             warn!(
                 model = model_id,
-                computer,
-                "model not loaded on target; reporting as not-yet-implemented"
+                computer, "model not loaded on target; reporting as not-yet-implemented"
             );
         }
         Err(e)

@@ -146,11 +146,9 @@ impl AlertEvaluator {
     }
 
     async fn is_leader(&self) -> bool {
-        match sqlx::query_scalar::<_, String>(
-            "SELECT member_name FROM fleet_leader_state LIMIT 1",
-        )
-        .fetch_optional(&self.pg)
-        .await
+        match sqlx::query_scalar::<_, String>("SELECT member_name FROM fleet_leader_state LIMIT 1")
+            .fetch_optional(&self.pg)
+            .await
         {
             Ok(Some(leader)) => leader == self.my_name,
             Ok(None) => false,
@@ -188,12 +186,11 @@ impl AlertEvaluator {
                 }
                 "specific" => {
                     if let Some(id) = policy.scope_computer_id {
-                        let row: Option<(Uuid, String)> = sqlx::query_as(
-                            "SELECT id, name FROM computers WHERE id = $1",
-                        )
-                        .bind(id)
-                        .fetch_optional(&self.pg)
-                        .await?;
+                        let row: Option<(Uuid, String)> =
+                            sqlx::query_as("SELECT id, name FROM computers WHERE id = $1")
+                                .bind(id)
+                                .fetch_optional(&self.pg)
+                                .await?;
                         row.into_iter().collect()
                     } else {
                         Vec::new()
@@ -216,14 +213,9 @@ impl AlertEvaluator {
             };
 
             for (computer_id, computer_name) in targets {
-                let (cur_matches, cur_value_num, cur_value_str) = evaluate_current(
-                    &policy.metric,
-                    &cond,
-                    &computer_name,
-                    &beats,
-                    &self.pg,
-                )
-                .await?;
+                let (cur_matches, cur_value_num, cur_value_str) =
+                    evaluate_current(&policy.metric, &cond, &computer_name, &beats, &self.pg)
+                        .await?;
 
                 // Find any existing unresolved event for this (policy, computer).
                 let unresolved_row: Option<(Uuid, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
@@ -306,13 +298,8 @@ impl AlertEvaluator {
                             .unwrap_or_else(|| "(n/a)".into())
                     );
 
-                    let channel_result = dispatch_alert(
-                        &self.pg,
-                        &policy.channel,
-                        &policy.severity,
-                        &message,
-                    )
-                    .await;
+                    let channel_result =
+                        dispatch_alert(&self.pg, &policy.channel, &policy.severity, &message).await;
 
                     sqlx::query(
                         r#"
@@ -340,12 +327,10 @@ impl AlertEvaluator {
                     report.events_fired += 1;
                 } else if let Some((event_id, _)) = unresolved_row {
                     // Condition no longer true → resolve.
-                    sqlx::query(
-                        "UPDATE alert_events SET resolved_at = NOW() WHERE id = $1",
-                    )
-                    .bind(event_id)
-                    .execute(&self.pg)
-                    .await?;
+                    sqlx::query("UPDATE alert_events SET resolved_at = NOW() WHERE id = $1")
+                        .bind(event_id)
+                        .execute(&self.pg)
+                        .await?;
 
                     tracing::info!(
                         policy = %policy.name,
@@ -482,7 +467,12 @@ async fn evaluate_current(
         }
         "llm_tokens_per_sec" => {
             let v: f64 = beat
-                .map(|b| b.llm_servers.iter().map(|s| s.tokens_per_sec_last_min).sum())
+                .map(|b| {
+                    b.llm_servers
+                        .iter()
+                        .map(|s| s.tokens_per_sec_last_min)
+                        .sum()
+                })
                 .unwrap_or(0.0);
             Ok((eval_numeric(cond, v), Some(v), None))
         }

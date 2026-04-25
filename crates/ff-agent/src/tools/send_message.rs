@@ -36,8 +36,18 @@ impl AgentTool for SendMessageTool {
     }
 
     async fn execute(&self, input: Value, ctx: &AgentToolContext) -> AgentToolResult {
-        let to = input.get("to").and_then(Value::as_str).unwrap_or("").trim().to_string();
-        let message = input.get("message").and_then(Value::as_str).unwrap_or("").trim().to_string();
+        let to = input
+            .get("to")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let message = input
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
 
         if to.is_empty() || message.is_empty() {
             return AgentToolResult::err("Both 'to' and 'message' are required");
@@ -69,12 +79,12 @@ impl AgentTool for SendMessageTool {
             Ok(resp) if resp.status().is_success() => {
                 AgentToolResult::ok(format!("Message delivered to '{to}' ({})", resp.status()))
             }
-            Ok(resp) => {
-                AgentToolResult::err(format!("Delivery failed: {} returned {}", target_url, resp.status()))
-            }
-            Err(e) => {
-                AgentToolResult::err(format!("Failed to reach '{to}' at {target_url}: {e}"))
-            }
+            Ok(resp) => AgentToolResult::err(format!(
+                "Delivery failed: {} returned {}",
+                target_url,
+                resp.status()
+            )),
+            Err(e) => AgentToolResult::err(format!("Failed to reach '{to}' at {target_url}: {e}")),
         }
     }
 }
@@ -88,17 +98,18 @@ async fn resolve_node_url(name: &str) -> String {
     }
     // Fallback to known-good table
     let known: std::collections::HashMap<&str, &str> = [
-        ("taylor",   "192.168.5.100"),
-        ("marcus",   "192.168.5.102"),
-        ("sophie",   "192.168.5.103"),
-        ("priya",    "192.168.5.104"),
-        ("james",    "192.168.5.108"),
-        ("logan",    "192.168.5.111"),
+        ("taylor", "192.168.5.100"),
+        ("marcus", "192.168.5.102"),
+        ("sophie", "192.168.5.103"),
+        ("priya", "192.168.5.104"),
+        ("james", "192.168.5.108"),
+        ("logan", "192.168.5.111"),
         ("veronica", "192.168.5.112"),
-        ("lily",     "192.168.5.113"),
-        ("duncan",   "192.168.5.114"),
-        ("aura",     "192.168.5.110"),
-    ].into();
+        ("lily", "192.168.5.113"),
+        ("duncan", "192.168.5.114"),
+        ("aura", "192.168.5.110"),
+    ]
+    .into();
     if let Some(ip) = known.get(name.to_lowercase().as_str()) {
         format!("http://{}:50002/agent/message", ip)
     } else {
@@ -110,11 +121,12 @@ async fn lookup_node_ip_from_db(name: &str) -> anyhow::Result<String> {
     let toml_str = std::fs::read_to_string(
         dirs::home_dir()
             .unwrap_or_default()
-            .join(".forgefleet/fleet.toml")
+            .join(".forgefleet/fleet.toml"),
     )?;
     let config: toml::Value = toml::from_str(&toml_str)?;
     let db_url = config
-        .get("database").and_then(|d| d.get("url"))
+        .get("database")
+        .and_then(|d| d.get("url"))
         .and_then(|u| u.as_str())
         .ok_or_else(|| anyhow::anyhow!("no db url"))?
         .to_string();

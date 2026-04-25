@@ -114,9 +114,7 @@ pub async fn seed_from_toml(
 /// Retained for backwards-compat tests; the main seeder path no longer
 /// uses it (see [`seed_from_toml`] no-op stub).
 #[allow(dead_code)]
-fn toml_table_to_json(
-    table: &toml::value::Table,
-) -> Result<serde_json::Value, serde_json::Error> {
+fn toml_table_to_json(table: &toml::value::Table) -> Result<serde_json::Value, serde_json::Error> {
     serde_json::to_value(table)
 }
 

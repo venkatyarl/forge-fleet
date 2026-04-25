@@ -18,7 +18,9 @@ pub enum ThinkingMode {
 }
 
 impl Default for ThinkingMode {
-    fn default() -> Self { Self::Adaptive }
+    fn default() -> Self {
+        Self::Adaptive
+    }
 }
 
 /// Thinking configuration for a session.
@@ -80,12 +82,26 @@ pub fn estimate_complexity(prompt: &str) -> Complexity {
 
     // Simple heuristics for complexity estimation
     let complex_keywords = [
-        "refactor", "redesign", "architect", "migrate", "implement",
-        "debug", "investigate", "optimize", "security", "performance",
-        "multiple files", "entire", "all of", "comprehensive",
+        "refactor",
+        "redesign",
+        "architect",
+        "migrate",
+        "implement",
+        "debug",
+        "investigate",
+        "optimize",
+        "security",
+        "performance",
+        "multiple files",
+        "entire",
+        "all of",
+        "comprehensive",
     ];
 
-    let complex_count = complex_keywords.iter().filter(|k| lower.contains(*k)).count();
+    let complex_count = complex_keywords
+        .iter()
+        .filter(|k| lower.contains(*k))
+        .count();
 
     if complex_count >= 2 || word_count > 50 {
         Complexity::High

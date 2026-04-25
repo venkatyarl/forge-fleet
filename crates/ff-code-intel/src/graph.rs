@@ -60,18 +60,23 @@ impl CodeGraph {
             self.entities.insert(key, entity);
         }
 
-        self.file_hashes.insert(file_path.to_string(), file_hash.to_string());
+        self.file_hashes
+            .insert(file_path.to_string(), file_hash.to_string());
     }
 
     /// Check if a file needs re-indexing (hash changed).
     pub fn needs_reindex(&self, file_path: &str, current_hash: &str) -> bool {
-        self.file_hashes.get(file_path).map(|h| h != current_hash).unwrap_or(true)
+        self.file_hashes
+            .get(file_path)
+            .map(|h| h != current_hash)
+            .unwrap_or(true)
     }
 
     /// Find all entities matching a query (case-insensitive name search).
     pub fn search(&self, query: &str) -> Vec<&CodeEntity> {
         let lower = query.to_ascii_lowercase();
-        self.entities.values()
+        self.entities
+            .values()
             .filter(|e| e.name.to_ascii_lowercase().contains(&lower))
             .collect()
     }
@@ -83,17 +88,26 @@ impl CodeGraph {
 
     /// Find all entities in a specific file.
     pub fn find_in_file(&self, file_path: &str) -> Vec<&CodeEntity> {
-        self.entities.values().filter(|e| e.file_path == file_path).collect()
+        self.entities
+            .values()
+            .filter(|e| e.file_path == file_path)
+            .collect()
     }
 
     /// Get callers of a function (entities that call it).
     pub fn callers_of(&self, name: &str) -> Vec<&Edge> {
-        self.edges.iter().filter(|e| e.to == name && e.kind == EdgeKind::CalledBy).collect()
+        self.edges
+            .iter()
+            .filter(|e| e.to == name && e.kind == EdgeKind::CalledBy)
+            .collect()
     }
 
     /// Get callees of a function (entities it calls).
     pub fn callees_of(&self, name: &str) -> Vec<&Edge> {
-        self.edges.iter().filter(|e| e.from == name && e.kind == EdgeKind::Calls).collect()
+        self.edges
+            .iter()
+            .filter(|e| e.from == name && e.kind == EdgeKind::Calls)
+            .collect()
     }
 
     /// Summary statistics.

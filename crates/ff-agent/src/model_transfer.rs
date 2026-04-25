@@ -42,8 +42,8 @@ struct LibraryRow {
 }
 
 async fn fetch_library(pool: &PgPool, id: &str) -> Result<LibraryRow, String> {
-    let uuid = sqlx::types::Uuid::parse_str(id)
-        .map_err(|e| format!("bad library uuid {id}: {e}"))?;
+    let uuid =
+        sqlx::types::Uuid::parse_str(id).map_err(|e| format!("bad library uuid {id}: {e}"))?;
     let row = sqlx::query(
         "SELECT node_name, catalog_id, runtime, quant, file_path, size_bytes, sha256, source_url
          FROM fleet_model_library WHERE id = $1",
@@ -73,9 +73,12 @@ async fn fetch_library(pool: &PgPool, id: &str) -> Result<LibraryRow, String> {
 pub async fn ssh_exec(user: &str, host: &str, cmd: &str) -> Result<(i32, String, String), String> {
     let target = format!("{user}@{host}");
     let output = Command::new("ssh")
-        .arg("-o").arg("ConnectTimeout=10")
-        .arg("-o").arg("StrictHostKeyChecking=accept-new")
-        .arg("-o").arg("BatchMode=yes")
+        .arg("-o")
+        .arg("ConnectTimeout=10")
+        .arg("-o")
+        .arg("StrictHostKeyChecking=accept-new")
+        .arg("-o")
+        .arg("BatchMode=yes")
         .arg(&target)
         .arg(cmd)
         .output()
@@ -207,7 +210,10 @@ pub async fn transfer_model(
     );
     let (sc, sstdout, _sstderr) = ssh_exec(&dst_node.ssh_user, &dst_node.ip, &stat_cmd).await?;
     let bytes_transferred = if sc == 0 {
-        sstdout.trim().parse::<u64>().unwrap_or(src_lib.size_bytes.max(0) as u64)
+        sstdout
+            .trim()
+            .parse::<u64>()
+            .unwrap_or(src_lib.size_bytes.max(0) as u64)
     } else {
         src_lib.size_bytes.max(0) as u64
     };
@@ -261,10 +267,19 @@ mod tests {
 
     #[test]
     fn tilde_expansion() {
-        assert_eq!(expand_tilde_with_home("~/models", "/home/alice"), "/home/alice/models");
+        assert_eq!(
+            expand_tilde_with_home("~/models", "/home/alice"),
+            "/home/alice/models"
+        );
         assert_eq!(expand_tilde_with_home("~", "/home/alice"), "/home/alice");
-        assert_eq!(expand_tilde_with_home("/abs/path", "/home/alice"), "/abs/path");
-        assert_eq!(expand_tilde_with_home("~/a/b/", "/home/alice/"), "/home/alice/a/b/");
+        assert_eq!(
+            expand_tilde_with_home("/abs/path", "/home/alice"),
+            "/abs/path"
+        );
+        assert_eq!(
+            expand_tilde_with_home("~/a/b/", "/home/alice/"),
+            "/home/alice/a/b/"
+        );
     }
 
     #[test]

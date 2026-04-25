@@ -17,15 +17,15 @@ pub mod stack_backlog;
 pub mod vault;
 
 pub use chat::{
-    attach_thread, create_thread, get_attached_thread, list_threads, receive_message,
-    resolve_user, ThreadSummary,
+    ThreadSummary, attach_thread, create_thread, get_attached_thread, list_threads,
+    receive_message, resolve_user,
 };
-pub use communities::{detect_communities, CommunitySummary};
-pub use context::{select_context, BrainMessage, ContextBundle, ResolvedNode};
+pub use communities::{CommunitySummary, detect_communities};
+pub use context::{BrainMessage, ContextBundle, ResolvedNode, select_context};
 pub use embeddings::EmbeddingClient;
 pub use facts::{contains_signal_phrases, extract_candidates};
-pub use stack_backlog::{BrainStateClient, StackItem, BacklogItem};
+pub use stack_backlog::{BacklogItem, BrainStateClient, StackItem};
 pub use vault::{
-    chunk_markdown, extract_wikilinks, index_changed_files, index_vault, parse_frontmatter,
-    parse_vault_file, IndexReport, ParsedNode, VaultChunk, VaultConfig,
+    IndexReport, ParsedNode, VaultChunk, VaultConfig, chunk_markdown, extract_wikilinks,
+    index_changed_files, index_vault, parse_frontmatter, parse_vault_file,
 };

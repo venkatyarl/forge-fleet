@@ -1380,11 +1380,21 @@ pub struct FleetNodeRow {
     pub tooling: JsonValue,
 }
 
-fn default_runtime() -> String { "unknown".to_string() }
-fn default_models_dir() -> String { "~/models".to_string() }
-fn default_disk_quota_pct() -> i32 { 80 }
-fn default_sub_agent_count() -> i32 { 1 }
-fn default_tooling() -> JsonValue { serde_json::json!({}) }
+fn default_runtime() -> String {
+    "unknown".to_string()
+}
+fn default_models_dir() -> String {
+    "~/models".to_string()
+}
+fn default_disk_quota_pct() -> i32 {
+    80
+}
+fn default_sub_agent_count() -> i32 {
+    1
+}
+fn default_tooling() -> JsonValue {
+    serde_json::json!({})
+}
 
 /// A fleet model row from the Postgres `fleet_models` table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1745,10 +1755,7 @@ pub struct ModelCatalogRow {
 }
 
 /// Upsert a catalog entry. Returns the id.
-pub async fn pg_upsert_catalog(
-    pool: &PgPool,
-    row: &ModelCatalogRow,
-) -> Result<String> {
+pub async fn pg_upsert_catalog(pool: &PgPool, row: &ModelCatalogRow) -> Result<String> {
     sqlx::query(
         "INSERT INTO fleet_model_catalog
             (id, name, family, parameters, tier, description, gated, preferred_workloads, variants, updated_at)
@@ -1787,17 +1794,20 @@ pub async fn pg_list_catalog(pool: &PgPool) -> Result<Vec<ModelCatalogRow>> {
     )
     .fetch_all(pool)
     .await?;
-    Ok(rows.iter().map(|r| ModelCatalogRow {
-        id: r.get("id"),
-        name: r.get("name"),
-        family: r.get("family"),
-        parameters: r.get("parameters"),
-        tier: r.get("tier"),
-        description: r.get("description"),
-        gated: r.get("gated"),
-        preferred_workloads: r.get("preferred_workloads"),
-        variants: r.get("variants"),
-    }).collect())
+    Ok(rows
+        .iter()
+        .map(|r| ModelCatalogRow {
+            id: r.get("id"),
+            name: r.get("name"),
+            family: r.get("family"),
+            parameters: r.get("parameters"),
+            tier: r.get("tier"),
+            description: r.get("description"),
+            gated: r.get("gated"),
+            preferred_workloads: r.get("preferred_workloads"),
+            variants: r.get("variants"),
+        })
+        .collect())
 }
 
 /// Search catalog by substring on name/family/id (case-insensitive).
@@ -1812,17 +1822,20 @@ pub async fn pg_search_catalog(pool: &PgPool, query: &str) -> Result<Vec<ModelCa
     .bind(&pattern)
     .fetch_all(pool)
     .await?;
-    Ok(rows.iter().map(|r| ModelCatalogRow {
-        id: r.get("id"),
-        name: r.get("name"),
-        family: r.get("family"),
-        parameters: r.get("parameters"),
-        tier: r.get("tier"),
-        description: r.get("description"),
-        gated: r.get("gated"),
-        preferred_workloads: r.get("preferred_workloads"),
-        variants: r.get("variants"),
-    }).collect())
+    Ok(rows
+        .iter()
+        .map(|r| ModelCatalogRow {
+            id: r.get("id"),
+            name: r.get("name"),
+            family: r.get("family"),
+            parameters: r.get("parameters"),
+            tier: r.get("tier"),
+            description: r.get("description"),
+            gated: r.get("gated"),
+            preferred_workloads: r.get("preferred_workloads"),
+            variants: r.get("variants"),
+        })
+        .collect())
 }
 
 /// Fetch one catalog entry by id.
@@ -1903,7 +1916,10 @@ pub async fn pg_upsert_library(
 }
 
 /// List all library entries, optionally filtered by node.
-pub async fn pg_list_library(pool: &PgPool, node_name: Option<&str>) -> Result<Vec<ModelLibraryRow>> {
+pub async fn pg_list_library(
+    pool: &PgPool,
+    node_name: Option<&str>,
+) -> Result<Vec<ModelLibraryRow>> {
     let rows = if let Some(n) = node_name {
         sqlx::query(
             "SELECT * FROM fleet_model_library WHERE node_name = $1 ORDER BY node_name, catalog_id",
@@ -1916,22 +1932,25 @@ pub async fn pg_list_library(pool: &PgPool, node_name: Option<&str>) -> Result<V
             .fetch_all(pool)
             .await?
     };
-    Ok(rows.iter().map(|r| {
-        let id: sqlx::types::Uuid = r.get("id");
-        ModelLibraryRow {
-            id: id.to_string(),
-            node_name: r.get("node_name"),
-            catalog_id: r.get("catalog_id"),
-            runtime: r.get("runtime"),
-            quant: r.get("quant"),
-            file_path: r.get("file_path"),
-            size_bytes: r.get("size_bytes"),
-            sha256: r.get("sha256"),
-            downloaded_at: r.get("downloaded_at"),
-            last_used_at: r.get("last_used_at"),
-            source_url: r.get("source_url"),
-        }
-    }).collect())
+    Ok(rows
+        .iter()
+        .map(|r| {
+            let id: sqlx::types::Uuid = r.get("id");
+            ModelLibraryRow {
+                id: id.to_string(),
+                node_name: r.get("node_name"),
+                catalog_id: r.get("catalog_id"),
+                runtime: r.get("runtime"),
+                quant: r.get("quant"),
+                file_path: r.get("file_path"),
+                size_bytes: r.get("size_bytes"),
+                sha256: r.get("sha256"),
+                downloaded_at: r.get("downloaded_at"),
+                last_used_at: r.get("last_used_at"),
+                source_url: r.get("source_url"),
+            }
+        })
+        .collect())
 }
 
 /// Delete a library entry. Returns true if a row was removed.
@@ -1964,36 +1983,44 @@ pub struct ModelDeploymentRow {
 }
 
 /// List deployments optionally filtered by node.
-pub async fn pg_list_deployments(pool: &PgPool, node_name: Option<&str>) -> Result<Vec<ModelDeploymentRow>> {
+pub async fn pg_list_deployments(
+    pool: &PgPool,
+    node_name: Option<&str>,
+) -> Result<Vec<ModelDeploymentRow>> {
     let rows = if let Some(n) = node_name {
-        sqlx::query("SELECT * FROM fleet_model_deployments WHERE node_name = $1 ORDER BY node_name, port")
-            .bind(n)
-            .fetch_all(pool)
-            .await?
+        sqlx::query(
+            "SELECT * FROM fleet_model_deployments WHERE node_name = $1 ORDER BY node_name, port",
+        )
+        .bind(n)
+        .fetch_all(pool)
+        .await?
     } else {
         sqlx::query("SELECT * FROM fleet_model_deployments ORDER BY node_name, port")
             .fetch_all(pool)
             .await?
     };
-    Ok(rows.iter().map(|r| {
-        let id: sqlx::types::Uuid = r.get("id");
-        let lib_id: Option<sqlx::types::Uuid> = r.get("library_id");
-        ModelDeploymentRow {
-            id: id.to_string(),
-            node_name: r.get("node_name"),
-            library_id: lib_id.map(|u| u.to_string()),
-            catalog_id: r.get("catalog_id"),
-            runtime: r.get("runtime"),
-            port: r.get("port"),
-            pid: r.get("pid"),
-            started_at: r.get("started_at"),
-            last_health_at: r.get("last_health_at"),
-            health_status: r.get("health_status"),
-            context_window: r.get("context_window"),
-            tokens_used: r.get("tokens_used"),
-            request_count: r.get("request_count"),
-        }
-    }).collect())
+    Ok(rows
+        .iter()
+        .map(|r| {
+            let id: sqlx::types::Uuid = r.get("id");
+            let lib_id: Option<sqlx::types::Uuid> = r.get("library_id");
+            ModelDeploymentRow {
+                id: id.to_string(),
+                node_name: r.get("node_name"),
+                library_id: lib_id.map(|u| u.to_string()),
+                catalog_id: r.get("catalog_id"),
+                runtime: r.get("runtime"),
+                port: r.get("port"),
+                pid: r.get("pid"),
+                started_at: r.get("started_at"),
+                last_health_at: r.get("last_health_at"),
+                health_status: r.get("health_status"),
+                context_window: r.get("context_window"),
+                tokens_used: r.get("tokens_used"),
+                request_count: r.get("request_count"),
+            }
+        })
+        .collect())
 }
 
 /// Upsert a deployment (node + port is unique).
@@ -2009,8 +2036,10 @@ pub async fn pg_upsert_deployment(
     context_window: Option<i32>,
 ) -> Result<String> {
     let lib_uuid = library_id
-        .map(|s| sqlx::types::Uuid::parse_str(s)
-            .map_err(|e| crate::error::DbError::NotFound(format!("bad library uuid {s}: {e}"))))
+        .map(|s| {
+            sqlx::types::Uuid::parse_str(s)
+                .map_err(|e| crate::error::DbError::NotFound(format!("bad library uuid {s}: {e}")))
+        })
         .transpose()?;
     let row = sqlx::query(
         "INSERT INTO fleet_model_deployments
@@ -2077,7 +2106,19 @@ pub async fn pg_insert_disk_usage(
 }
 
 /// Get the latest disk usage sample per node.
-pub async fn pg_latest_disk_usage(pool: &PgPool) -> Result<Vec<(String, String, i64, i64, i64, i64, chrono::DateTime<chrono::Utc>)>> {
+pub async fn pg_latest_disk_usage(
+    pool: &PgPool,
+) -> Result<
+    Vec<(
+        String,
+        String,
+        i64,
+        i64,
+        i64,
+        i64,
+        chrono::DateTime<chrono::Utc>,
+    )>,
+> {
     let rows = sqlx::query(
         "SELECT DISTINCT ON (node_name)
                 node_name, models_dir, total_bytes, used_bytes, free_bytes, models_bytes, sampled_at
@@ -2086,15 +2127,20 @@ pub async fn pg_latest_disk_usage(pool: &PgPool) -> Result<Vec<(String, String, 
     )
     .fetch_all(pool)
     .await?;
-    Ok(rows.iter().map(|r| (
-        r.get::<String, _>("node_name"),
-        r.get::<String, _>("models_dir"),
-        r.get::<i64, _>("total_bytes"),
-        r.get::<i64, _>("used_bytes"),
-        r.get::<i64, _>("free_bytes"),
-        r.get::<i64, _>("models_bytes"),
-        r.get::<chrono::DateTime<chrono::Utc>, _>("sampled_at"),
-    )).collect())
+    Ok(rows
+        .iter()
+        .map(|r| {
+            (
+                r.get::<String, _>("node_name"),
+                r.get::<String, _>("models_dir"),
+                r.get::<i64, _>("total_bytes"),
+                r.get::<i64, _>("used_bytes"),
+                r.get::<i64, _>("free_bytes"),
+                r.get::<i64, _>("models_bytes"),
+                r.get::<chrono::DateTime<chrono::Utc>, _>("sampled_at"),
+            )
+        })
+        .collect())
 }
 
 /// A model lifecycle job (download, delete, load, etc.) — tracks progress.
@@ -2127,8 +2173,10 @@ pub async fn pg_create_job(
     params: &JsonValue,
 ) -> Result<String> {
     let lib_uuid = target_library_id
-        .map(|s| sqlx::types::Uuid::parse_str(s)
-            .map_err(|e| crate::error::DbError::NotFound(format!("bad library uuid {s}: {e}"))))
+        .map(|s| {
+            sqlx::types::Uuid::parse_str(s)
+                .map_err(|e| crate::error::DbError::NotFound(format!("bad library uuid {s}: {e}")))
+        })
         .transpose()?;
     let row = sqlx::query(
         "INSERT INTO fleet_model_jobs (node_name, kind, target_catalog_id, target_library_id, params)
@@ -2184,40 +2232,49 @@ pub async fn pg_update_job_progress(
 }
 
 /// List jobs (optionally filtered by status).
-pub async fn pg_list_jobs(pool: &PgPool, status: Option<&str>, limit: i64) -> Result<Vec<ModelJobRow>> {
+pub async fn pg_list_jobs(
+    pool: &PgPool,
+    status: Option<&str>,
+    limit: i64,
+) -> Result<Vec<ModelJobRow>> {
     let rows = if let Some(s) = status {
-        sqlx::query("SELECT * FROM fleet_model_jobs WHERE status = $1 ORDER BY created_at DESC LIMIT $2")
-            .bind(s)
-            .bind(limit)
-            .fetch_all(pool)
-            .await?
+        sqlx::query(
+            "SELECT * FROM fleet_model_jobs WHERE status = $1 ORDER BY created_at DESC LIMIT $2",
+        )
+        .bind(s)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?
     } else {
         sqlx::query("SELECT * FROM fleet_model_jobs ORDER BY created_at DESC LIMIT $1")
             .bind(limit)
             .fetch_all(pool)
             .await?
     };
-    Ok(rows.iter().map(|r| {
-        let id: sqlx::types::Uuid = r.get("id");
-        let lib_id: Option<sqlx::types::Uuid> = r.get("target_library_id");
-        ModelJobRow {
-            id: id.to_string(),
-            node_name: r.get("node_name"),
-            kind: r.get("kind"),
-            target_catalog_id: r.get("target_catalog_id"),
-            target_library_id: lib_id.map(|u| u.to_string()),
-            params: r.get("params"),
-            status: r.get("status"),
-            progress_pct: r.get("progress_pct"),
-            bytes_done: r.get("bytes_done"),
-            bytes_total: r.get("bytes_total"),
-            eta_seconds: r.get("eta_seconds"),
-            started_at: r.get("started_at"),
-            completed_at: r.get("completed_at"),
-            created_at: r.get("created_at"),
-            error_message: r.get("error_message"),
-        }
-    }).collect())
+    Ok(rows
+        .iter()
+        .map(|r| {
+            let id: sqlx::types::Uuid = r.get("id");
+            let lib_id: Option<sqlx::types::Uuid> = r.get("target_library_id");
+            ModelJobRow {
+                id: id.to_string(),
+                node_name: r.get("node_name"),
+                kind: r.get("kind"),
+                target_catalog_id: r.get("target_catalog_id"),
+                target_library_id: lib_id.map(|u| u.to_string()),
+                params: r.get("params"),
+                status: r.get("status"),
+                progress_pct: r.get("progress_pct"),
+                bytes_done: r.get("bytes_done"),
+                bytes_total: r.get("bytes_total"),
+                eta_seconds: r.get("eta_seconds"),
+                started_at: r.get("started_at"),
+                completed_at: r.get("completed_at"),
+                created_at: r.get("created_at"),
+                error_message: r.get("error_message"),
+            }
+        })
+        .collect())
 }
 
 // ─── Onboarding: SSH keys + mesh status (schema V12) ──────────────────────
@@ -2226,9 +2283,9 @@ pub async fn pg_list_jobs(pool: &PgPool, status: Option<&str>, limit: i64) -> Re
 #[derive(Debug, Clone)]
 pub struct NodeSshKeyRow {
     pub node_name: String,
-    pub key_purpose: String,   // 'user' | 'host'
+    pub key_purpose: String, // 'user' | 'host'
     pub public_key: String,
-    pub key_type: String,      // 'ed25519' | 'rsa' | 'ecdsa'
+    pub key_type: String, // 'ed25519' | 'rsa' | 'ecdsa'
     pub fingerprint: String,
     pub added_at: chrono::DateTime<chrono::Utc>,
 }
@@ -2277,21 +2334,22 @@ pub async fn pg_list_node_ssh_keys(
         .fetch_all(pool)
         .await?
     } else {
-        sqlx::query(
-            "SELECT * FROM fleet_node_ssh_keys WHERE node_name = $1 ORDER BY added_at",
-        )
-        .bind(node_name)
-        .fetch_all(pool)
-        .await?
+        sqlx::query("SELECT * FROM fleet_node_ssh_keys WHERE node_name = $1 ORDER BY added_at")
+            .bind(node_name)
+            .fetch_all(pool)
+            .await?
     };
-    Ok(rows.iter().map(|r| NodeSshKeyRow {
-        node_name: r.get("node_name"),
-        key_purpose: r.get("key_purpose"),
-        public_key: r.get("public_key"),
-        key_type: r.get("key_type"),
-        fingerprint: r.get("fingerprint"),
-        added_at: r.get("added_at"),
-    }).collect())
+    Ok(rows
+        .iter()
+        .map(|r| NodeSshKeyRow {
+            node_name: r.get("node_name"),
+            key_purpose: r.get("key_purpose"),
+            public_key: r.get("public_key"),
+            key_type: r.get("key_type"),
+            fingerprint: r.get("fingerprint"),
+            added_at: r.get("added_at"),
+        })
+        .collect())
 }
 
 /// Delete all SSH keys for a node (used during `ff onboard revoke`).
@@ -2308,7 +2366,7 @@ pub async fn pg_delete_node_ssh_keys(pool: &PgPool, node_name: &str) -> Result<u
 pub struct MeshStatusRow {
     pub src_node: String,
     pub dst_node: String,
-    pub status: String,             // 'ok' | 'failed' | 'pending'
+    pub status: String, // 'ok' | 'failed' | 'pending'
     pub last_checked: Option<chrono::DateTime<chrono::Utc>>,
     pub last_error: Option<String>,
     pub attempts: i32,
@@ -2342,10 +2400,7 @@ pub async fn pg_upsert_mesh_status(
 
 /// Fetch the full mesh matrix; optionally filter by node (returns rows where
 /// src_node = node OR dst_node = node).
-pub async fn pg_list_mesh_status(
-    pool: &PgPool,
-    node: Option<&str>,
-) -> Result<Vec<MeshStatusRow>> {
+pub async fn pg_list_mesh_status(pool: &PgPool, node: Option<&str>) -> Result<Vec<MeshStatusRow>> {
     let rows = if let Some(n) = node {
         sqlx::query(
             "SELECT * FROM fleet_mesh_status
@@ -2360,24 +2415,25 @@ pub async fn pg_list_mesh_status(
             .fetch_all(pool)
             .await?
     };
-    Ok(rows.iter().map(|r| MeshStatusRow {
-        src_node: r.get("src_node"),
-        dst_node: r.get("dst_node"),
-        status: r.get("status"),
-        last_checked: r.get("last_checked"),
-        last_error: r.get("last_error"),
-        attempts: r.get("attempts"),
-    }).collect())
+    Ok(rows
+        .iter()
+        .map(|r| MeshStatusRow {
+            src_node: r.get("src_node"),
+            dst_node: r.get("dst_node"),
+            status: r.get("status"),
+            last_checked: r.get("last_checked"),
+            last_error: r.get("last_error"),
+            attempts: r.get("attempts"),
+        })
+        .collect())
 }
 
 /// Remove all mesh-status rows involving a given node (used during revoke).
 pub async fn pg_delete_mesh_status_for_node(pool: &PgPool, node: &str) -> Result<u64> {
-    let r = sqlx::query(
-        "DELETE FROM fleet_mesh_status WHERE src_node = $1 OR dst_node = $1",
-    )
-    .bind(node)
-    .execute(pool)
-    .await?;
+    let r = sqlx::query("DELETE FROM fleet_mesh_status WHERE src_node = $1 OR dst_node = $1")
+        .bind(node)
+        .execute(pool)
+        .await?;
     Ok(r.rows_affected())
 }
 
@@ -2720,19 +2776,33 @@ fn row_to_deferred(r: &sqlx::postgres::PgRow) -> DeferredTaskRow {
 
 /// List secrets metadata (key, description, updated_by, updated_at) — does NOT return values.
 /// Use `pg_get_secret` when a specific value is needed.
-pub async fn pg_list_secrets(pool: &PgPool) -> Result<Vec<(String, Option<String>, Option<String>, chrono::DateTime<chrono::Utc>)>> {
+pub async fn pg_list_secrets(
+    pool: &PgPool,
+) -> Result<
+    Vec<(
+        String,
+        Option<String>,
+        Option<String>,
+        chrono::DateTime<chrono::Utc>,
+    )>,
+> {
     let rows = sqlx::query(
         "SELECT key, description, updated_by, updated_at
          FROM fleet_secrets ORDER BY key",
     )
     .fetch_all(pool)
     .await?;
-    Ok(rows.iter().map(|r| (
-        r.get::<String, _>("key"),
-        r.get::<Option<String>, _>("description"),
-        r.get::<Option<String>, _>("updated_by"),
-        r.get::<chrono::DateTime<chrono::Utc>, _>("updated_at"),
-    )).collect())
+    Ok(rows
+        .iter()
+        .map(|r| {
+            (
+                r.get::<String, _>("key"),
+                r.get::<Option<String>, _>("description"),
+                r.get::<Option<String>, _>("updated_by"),
+                r.get::<chrono::DateTime<chrono::Utc>, _>("updated_at"),
+            )
+        })
+        .collect())
 }
 
 // ─── Seed from FleetConfig ───────────────────────────────────────────────────
@@ -2817,7 +2887,10 @@ pub async fn seed_from_fleet_toml(
                 port: model_cfg.port.unwrap_or(0) as i32,
                 tier: model_cfg.tier as i32,
                 local_model: model_cfg.local.unwrap_or(true),
-                lifecycle: model_cfg.lifecycle.clone().unwrap_or_else(|| "production".into()),
+                lifecycle: model_cfg
+                    .lifecycle
+                    .clone()
+                    .unwrap_or_else(|| "production".into()),
                 mode: model_cfg.mode.clone().unwrap_or_else(|| "always_on".into()),
                 preferred_workloads: serde_json::to_value(&model_cfg.preferred_workloads)
                     .unwrap_or_default(),
@@ -2829,10 +2902,20 @@ pub async fn seed_from_fleet_toml(
     }
 
     // Seed settings from various config sections.
-    pg_set_setting(pool, "scheduling", &serde_json::to_value(&config.scheduling)?).await?;
+    pg_set_setting(
+        pool,
+        "scheduling",
+        &serde_json::to_value(&config.scheduling)?,
+    )
+    .await?;
     pg_set_setting(pool, "ports", &serde_json::to_value(&config.ports)?).await?;
     pg_set_setting(pool, "llm", &serde_json::to_value(&config.llm)?).await?;
-    pg_set_setting(pool, "enrollment", &serde_json::to_value(&config.enrollment)?).await?;
+    pg_set_setting(
+        pool,
+        "enrollment",
+        &serde_json::to_value(&config.enrollment)?,
+    )
+    .await?;
     pg_set_setting(pool, "fleet", &serde_json::to_value(&config.fleet)?).await?;
 
     info!(
@@ -3466,14 +3549,17 @@ pub async fn pg_get_task_lineage(pool: &PgPool, task_id: &str) -> Result<serde_j
     .await
     .unwrap_or_default();
 
-    let hops_json: Vec<serde_json::Value> = hops.iter().map(|r| {
-        serde_json::json!({
-            "from": r.try_get::<String, _>("from_node").unwrap_or_default(),
-            "to": r.try_get::<String, _>("to_node").unwrap_or_default(),
-            "reason": r.try_get::<String, _>("reason").unwrap_or_default(),
-            "at": r.try_get::<String, _>("routed_at").unwrap_or_default(),
+    let hops_json: Vec<serde_json::Value> = hops
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "from": r.try_get::<String, _>("from_node").unwrap_or_default(),
+                "to": r.try_get::<String, _>("to_node").unwrap_or_default(),
+                "reason": r.try_get::<String, _>("reason").unwrap_or_default(),
+                "at": r.try_get::<String, _>("routed_at").unwrap_or_default(),
+            })
         })
-    }).collect();
+        .collect();
 
     // Ownership events
     let events = sqlx::query(
@@ -3485,15 +3571,18 @@ pub async fn pg_get_task_lineage(pool: &PgPool, task_id: &str) -> Result<serde_j
     .await
     .unwrap_or_default();
 
-    let events_json: Vec<serde_json::Value> = events.iter().map(|r| {
-        serde_json::json!({
-            "event": r.try_get::<String, _>("event_type").unwrap_or_default(),
-            "from": r.try_get::<Option<String>, _>("from_owner").unwrap_or_default(),
-            "to": r.try_get::<Option<String>, _>("to_owner").unwrap_or_default(),
-            "reason": r.try_get::<Option<String>, _>("reason").unwrap_or_default(),
-            "at": r.try_get::<String, _>("created_at").unwrap_or_default(),
+    let events_json: Vec<serde_json::Value> = events
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "event": r.try_get::<String, _>("event_type").unwrap_or_default(),
+                "from": r.try_get::<Option<String>, _>("from_owner").unwrap_or_default(),
+                "to": r.try_get::<Option<String>, _>("to_owner").unwrap_or_default(),
+                "reason": r.try_get::<Option<String>, _>("reason").unwrap_or_default(),
+                "at": r.try_get::<String, _>("created_at").unwrap_or_default(),
+            })
         })
-    }).collect();
+        .collect();
 
     Ok(serde_json::json!({
         "task_id": task_id,
@@ -3546,7 +3635,10 @@ pub async fn pg_get_brain_user(pool: &PgPool, name: &str) -> Result<Option<Brain
     }))
 }
 
-pub async fn pg_get_brain_user_by_id(pool: &PgPool, id: uuid::Uuid) -> Result<Option<BrainUserRow>> {
+pub async fn pg_get_brain_user_by_id(
+    pool: &PgPool,
+    id: uuid::Uuid,
+) -> Result<Option<BrainUserRow>> {
     let row = sqlx::query("SELECT * FROM brain_users WHERE id = $1")
         .bind(id)
         .fetch_optional(pool)
@@ -3646,7 +3738,11 @@ pub async fn pg_create_brain_thread(
     Ok(row.get("id"))
 }
 
-pub async fn pg_get_brain_thread(pool: &PgPool, user_id: uuid::Uuid, slug: &str) -> Result<Option<BrainThreadRow>> {
+pub async fn pg_get_brain_thread(
+    pool: &PgPool,
+    user_id: uuid::Uuid,
+    slug: &str,
+) -> Result<Option<BrainThreadRow>> {
     let row = sqlx::query("SELECT * FROM brain_threads WHERE user_id = $1 AND slug = $2")
         .bind(user_id)
         .bind(slug)
@@ -3655,7 +3751,10 @@ pub async fn pg_get_brain_thread(pool: &PgPool, user_id: uuid::Uuid, slug: &str)
     Ok(row.as_ref().map(row_to_brain_thread))
 }
 
-pub async fn pg_get_brain_thread_by_id(pool: &PgPool, id: uuid::Uuid) -> Result<Option<BrainThreadRow>> {
+pub async fn pg_get_brain_thread_by_id(
+    pool: &PgPool,
+    id: uuid::Uuid,
+) -> Result<Option<BrainThreadRow>> {
     let row = sqlx::query("SELECT * FROM brain_threads WHERE id = $1")
         .bind(id)
         .fetch_optional(pool)
@@ -3663,7 +3762,10 @@ pub async fn pg_get_brain_thread_by_id(pool: &PgPool, id: uuid::Uuid) -> Result<
     Ok(row.as_ref().map(row_to_brain_thread))
 }
 
-pub async fn pg_list_brain_threads(pool: &PgPool, user_id: uuid::Uuid) -> Result<Vec<BrainThreadRow>> {
+pub async fn pg_list_brain_threads(
+    pool: &PgPool,
+    user_id: uuid::Uuid,
+) -> Result<Vec<BrainThreadRow>> {
     let rows = sqlx::query(
         "SELECT * FROM brain_threads WHERE user_id = $1 AND status = 'active'
          ORDER BY last_message_at DESC NULLS LAST, created_at DESC",
@@ -3895,7 +3997,10 @@ pub async fn pg_upsert_brain_vault_node(
     Ok(row.get("id"))
 }
 
-pub async fn pg_get_brain_vault_node(pool: &PgPool, path: &str) -> Result<Option<BrainVaultNodeRow>> {
+pub async fn pg_get_brain_vault_node(
+    pool: &PgPool,
+    path: &str,
+) -> Result<Option<BrainVaultNodeRow>> {
     let row = sqlx::query("SELECT * FROM brain_vault_nodes WHERE path = $1")
         .bind(path)
         .fetch_optional(pool)
@@ -3903,21 +4008,30 @@ pub async fn pg_get_brain_vault_node(pool: &PgPool, path: &str) -> Result<Option
     Ok(row.as_ref().map(row_to_brain_vault_node))
 }
 
-pub async fn pg_list_brain_vault_nodes_current(pool: &PgPool, project: Option<&str>) -> Result<Vec<BrainVaultNodeRow>> {
+pub async fn pg_list_brain_vault_nodes_current(
+    pool: &PgPool,
+    project: Option<&str>,
+) -> Result<Vec<BrainVaultNodeRow>> {
     let rows = if let Some(p) = project {
         sqlx::query("SELECT * FROM brain_vault_nodes WHERE valid_until IS NULL AND project = $1 ORDER BY updated_at DESC")
             .bind(p)
             .fetch_all(pool)
             .await?
     } else {
-        sqlx::query("SELECT * FROM brain_vault_nodes WHERE valid_until IS NULL ORDER BY updated_at DESC")
-            .fetch_all(pool)
-            .await?
+        sqlx::query(
+            "SELECT * FROM brain_vault_nodes WHERE valid_until IS NULL ORDER BY updated_at DESC",
+        )
+        .fetch_all(pool)
+        .await?
     };
     Ok(rows.iter().map(row_to_brain_vault_node).collect())
 }
 
-pub async fn pg_search_brain_vault_nodes(pool: &PgPool, query: &str, limit: i64) -> Result<Vec<BrainVaultNodeRow>> {
+pub async fn pg_search_brain_vault_nodes(
+    pool: &PgPool,
+    query: &str,
+    limit: i64,
+) -> Result<Vec<BrainVaultNodeRow>> {
     let pattern = format!("%{}%", query);
     let rows = sqlx::query(
         "SELECT * FROM brain_vault_nodes
@@ -3934,14 +4048,20 @@ pub async fn pg_search_brain_vault_nodes(pool: &PgPool, query: &str, limit: i64)
 }
 
 pub async fn pg_bump_vault_node_hits(pool: &PgPool, id: uuid::Uuid) -> Result<()> {
-    sqlx::query("UPDATE brain_vault_nodes SET hits = hits + 1, last_accessed = NOW() WHERE id = $1")
-        .bind(id)
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        "UPDATE brain_vault_nodes SET hits = hits + 1, last_accessed = NOW() WHERE id = $1",
+    )
+    .bind(id)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
-pub async fn pg_supersede_vault_node(pool: &PgPool, old_path: &str, new_id: uuid::Uuid) -> Result<()> {
+pub async fn pg_supersede_vault_node(
+    pool: &PgPool,
+    old_path: &str,
+    new_id: uuid::Uuid,
+) -> Result<()> {
     sqlx::query(
         "UPDATE brain_vault_nodes SET valid_until = NOW(), superseded_by = $2 WHERE path = $1 AND valid_until IS NULL",
     )
@@ -3987,20 +4107,24 @@ pub async fn pg_upsert_brain_vault_edge(
     Ok(())
 }
 
-pub async fn pg_list_brain_vault_edges_for_node(pool: &PgPool, node_id: uuid::Uuid) -> Result<Vec<BrainVaultEdgeRow>> {
-    let rows = sqlx::query(
-        "SELECT * FROM brain_vault_edges WHERE src_id = $1 OR dst_id = $1",
-    )
-    .bind(node_id)
-    .fetch_all(pool)
-    .await?;
-    Ok(rows.iter().map(|r| BrainVaultEdgeRow {
-        src_id: r.get("src_id"),
-        dst_id: r.get("dst_id"),
-        edge_type: r.get("edge_type"),
-        confidence: r.get("confidence"),
-        provenance: r.get("provenance"),
-    }).collect())
+pub async fn pg_list_brain_vault_edges_for_node(
+    pool: &PgPool,
+    node_id: uuid::Uuid,
+) -> Result<Vec<BrainVaultEdgeRow>> {
+    let rows = sqlx::query("SELECT * FROM brain_vault_edges WHERE src_id = $1 OR dst_id = $1")
+        .bind(node_id)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows
+        .iter()
+        .map(|r| BrainVaultEdgeRow {
+            src_id: r.get("src_id"),
+            dst_id: r.get("dst_id"),
+            edge_type: r.get("edge_type"),
+            confidence: r.get("confidence"),
+            provenance: r.get("provenance"),
+        })
+        .collect())
 }
 
 // ── brain_knowledge_candidates ───────────────────────────────────────────
@@ -4060,7 +4184,10 @@ pub async fn pg_insert_brain_candidate(
     Ok(row.get("id"))
 }
 
-pub async fn pg_list_brain_candidates_pending(pool: &PgPool, user_id: uuid::Uuid) -> Result<Vec<BrainCandidateRow>> {
+pub async fn pg_list_brain_candidates_pending(
+    pool: &PgPool,
+    user_id: uuid::Uuid,
+) -> Result<Vec<BrainCandidateRow>> {
     let rows = sqlx::query(
         "SELECT * FROM brain_knowledge_candidates WHERE user_id = $1 AND status = 'pending'
          ORDER BY created_at DESC",
@@ -4068,25 +4195,32 @@ pub async fn pg_list_brain_candidates_pending(pool: &PgPool, user_id: uuid::Uuid
     .bind(user_id)
     .fetch_all(pool)
     .await?;
-    Ok(rows.iter().map(|r| BrainCandidateRow {
-        id: r.get("id"),
-        user_id: r.get("user_id"),
-        thread_id: r.get("thread_id"),
-        action: r.get("action"),
-        kind: r.get("kind"),
-        title: r.get("title"),
-        body: r.get("body"),
-        tags: r.get("tags"),
-        project: r.get("project"),
-        target_path: r.get("target_path"),
-        from_thread: r.get("from_thread"),
-        confidence: r.get("confidence"),
-        status: r.get("status"),
-        created_at: r.get("created_at"),
-    }).collect())
+    Ok(rows
+        .iter()
+        .map(|r| BrainCandidateRow {
+            id: r.get("id"),
+            user_id: r.get("user_id"),
+            thread_id: r.get("thread_id"),
+            action: r.get("action"),
+            kind: r.get("kind"),
+            title: r.get("title"),
+            body: r.get("body"),
+            tags: r.get("tags"),
+            project: r.get("project"),
+            target_path: r.get("target_path"),
+            from_thread: r.get("from_thread"),
+            confidence: r.get("confidence"),
+            status: r.get("status"),
+            created_at: r.get("created_at"),
+        })
+        .collect())
 }
 
-pub async fn pg_update_brain_candidate_status(pool: &PgPool, id: uuid::Uuid, status: &str) -> Result<()> {
+pub async fn pg_update_brain_candidate_status(
+    pool: &PgPool,
+    id: uuid::Uuid,
+    status: &str,
+) -> Result<()> {
     sqlx::query(
         "UPDATE brain_knowledge_candidates SET status = $2, reviewed_at = NOW() WHERE id = $1",
     )
@@ -4140,16 +4274,19 @@ pub async fn pg_list_due_reminders(pool: &PgPool) -> Result<Vec<BrainReminderRow
     )
     .fetch_all(pool)
     .await?;
-    Ok(rows.iter().map(|r| BrainReminderRow {
-        id: r.get("id"),
-        user_id: r.get("user_id"),
-        thread_id: r.get("thread_id"),
-        content: r.get("content"),
-        remind_at: r.get("remind_at"),
-        channel_pref: r.get("channel_pref"),
-        status: r.get("status"),
-        created_at: r.get("created_at"),
-    }).collect())
+    Ok(rows
+        .iter()
+        .map(|r| BrainReminderRow {
+            id: r.get("id"),
+            user_id: r.get("user_id"),
+            thread_id: r.get("thread_id"),
+            content: r.get("content"),
+            remind_at: r.get("remind_at"),
+            channel_pref: r.get("channel_pref"),
+            status: r.get("status"),
+            created_at: r.get("created_at"),
+        })
+        .collect())
 }
 
 pub async fn pg_fire_brain_reminder(pool: &PgPool, id: uuid::Uuid) -> Result<()> {
@@ -4160,7 +4297,11 @@ pub async fn pg_fire_brain_reminder(pool: &PgPool, id: uuid::Uuid) -> Result<()>
     Ok(())
 }
 
-pub async fn pg_snooze_brain_reminder(pool: &PgPool, id: uuid::Uuid, until: chrono::DateTime<chrono::Utc>) -> Result<()> {
+pub async fn pg_snooze_brain_reminder(
+    pool: &PgPool,
+    id: uuid::Uuid,
+    until: chrono::DateTime<chrono::Utc>,
+) -> Result<()> {
     sqlx::query(
         "UPDATE brain_reminders SET status = 'pending', remind_at = $2, snoozed_until = $2 WHERE id = $1",
     )
@@ -4193,7 +4334,11 @@ pub async fn pg_upsert_brain_community(
     Ok(row.get("id"))
 }
 
-pub async fn pg_set_vault_node_community(pool: &PgPool, node_id: uuid::Uuid, community_id: i32) -> Result<()> {
+pub async fn pg_set_vault_node_community(
+    pool: &PgPool,
+    node_id: uuid::Uuid,
+    community_id: i32,
+) -> Result<()> {
     sqlx::query("UPDATE brain_vault_nodes SET community_id = $2 WHERE id = $1")
         .bind(node_id)
         .bind(community_id)
@@ -4215,13 +4360,16 @@ pub async fn pg_list_brain_communities(pool: &PgPool) -> Result<Vec<BrainCommuni
     let rows = sqlx::query("SELECT * FROM brain_communities ORDER BY id")
         .fetch_all(pool)
         .await?;
-    Ok(rows.iter().map(|r| BrainCommunityRow {
-        id: r.get("id"),
-        label: r.get("label"),
-        god_node_id: r.get("god_node_id"),
-        member_count: r.get("member_count"),
-        color: r.get("color"),
-    }).collect())
+    Ok(rows
+        .iter()
+        .map(|r| BrainCommunityRow {
+            id: r.get("id"),
+            label: r.get("label"),
+            god_node_id: r.get("god_node_id"),
+            member_count: r.get("member_count"),
+            color: r.get("color"),
+        })
+        .collect())
 }
 
 // ─── V19: shared volumes / computer schedules / training jobs ──────────────
@@ -4283,10 +4431,7 @@ pub async fn pg_create_shared_volume(
     Ok(row.get("id"))
 }
 
-pub async fn pg_get_shared_volume(
-    pool: &PgPool,
-    name: &str,
-) -> Result<Option<SharedVolumeRow>> {
+pub async fn pg_get_shared_volume(pool: &PgPool, name: &str) -> Result<Option<SharedVolumeRow>> {
     let row = sqlx::query(
         "SELECT v.*, c.name as host_name
          FROM shared_volumes v
@@ -4322,21 +4467,24 @@ pub async fn pg_list_shared_volumes(pool: &PgPool) -> Result<Vec<SharedVolumeRow
     )
     .fetch_all(pool)
     .await?;
-    Ok(rows.iter().map(|r| SharedVolumeRow {
-        id: r.get("id"),
-        name: r.get("name"),
-        host_computer_id: r.get("host_computer_id"),
-        host_name: r.try_get("host_name").ok(),
-        export_path: r.get("export_path"),
-        mount_path: r.get("mount_path"),
-        nfs_version: r.get("nfs_version"),
-        read_only: r.get("read_only"),
-        size_gb: r.try_get("size_gb").ok(),
-        used_gb: r.try_get("used_gb").ok(),
-        purpose: r.try_get("purpose").ok(),
-        created_at: r.get("created_at"),
-        metadata: r.get("metadata"),
-    }).collect())
+    Ok(rows
+        .iter()
+        .map(|r| SharedVolumeRow {
+            id: r.get("id"),
+            name: r.get("name"),
+            host_computer_id: r.get("host_computer_id"),
+            host_name: r.try_get("host_name").ok(),
+            export_path: r.get("export_path"),
+            mount_path: r.get("mount_path"),
+            nfs_version: r.get("nfs_version"),
+            read_only: r.get("read_only"),
+            size_gb: r.try_get("size_gb").ok(),
+            used_gb: r.try_get("used_gb").ok(),
+            purpose: r.try_get("purpose").ok(),
+            created_at: r.get("created_at"),
+            metadata: r.get("metadata"),
+        })
+        .collect())
 }
 
 pub async fn pg_upsert_shared_volume_mount(
@@ -4372,13 +4520,12 @@ pub async fn pg_delete_shared_volume_mount(
     volume_id: sqlx::types::Uuid,
     computer_id: sqlx::types::Uuid,
 ) -> Result<bool> {
-    let res = sqlx::query(
-        "DELETE FROM shared_volume_mounts WHERE volume_id = $1 AND computer_id = $2",
-    )
-    .bind(volume_id)
-    .bind(computer_id)
-    .execute(pool)
-    .await?;
+    let res =
+        sqlx::query("DELETE FROM shared_volume_mounts WHERE volume_id = $1 AND computer_id = $2")
+            .bind(volume_id)
+            .bind(computer_id)
+            .execute(pool)
+            .await?;
     Ok(res.rows_affected() > 0)
 }
 
@@ -4409,17 +4556,20 @@ pub async fn pg_list_shared_volume_mounts(
         .fetch_all(pool)
         .await?
     };
-    Ok(rows.iter().map(|r| SharedVolumeMountRow {
-        volume_id: r.get("volume_id"),
-        volume_name: r.try_get("volume_name").ok(),
-        computer_id: r.get("computer_id"),
-        computer_name: r.try_get("computer_name").ok(),
-        mount_path: r.try_get("mount_path").ok(),
-        mounted_at: r.get("mounted_at"),
-        status: r.get("status"),
-        last_check_at: r.try_get("last_check_at").ok(),
-        last_error: r.try_get("last_error").ok(),
-    }).collect())
+    Ok(rows
+        .iter()
+        .map(|r| SharedVolumeMountRow {
+            volume_id: r.get("volume_id"),
+            volume_name: r.try_get("volume_name").ok(),
+            computer_id: r.get("computer_id"),
+            computer_name: r.try_get("computer_name").ok(),
+            mount_path: r.try_get("mount_path").ok(),
+            mounted_at: r.get("mounted_at"),
+            status: r.get("status"),
+            last_check_at: r.try_get("last_check_at").ok(),
+            last_error: r.try_get("last_error").ok(),
+        })
+        .collect())
 }
 
 // ─── computer_schedules ────────────────────────────────────────────────────
@@ -4469,57 +4619,68 @@ pub async fn pg_list_schedules(
     only_enabled: bool,
 ) -> Result<Vec<ComputerScheduleRow>> {
     let rows = match (computer_id, only_enabled) {
-        (Some(cid), true) => sqlx::query(
-            "SELECT s.*, c.name as computer_name
+        (Some(cid), true) => {
+            sqlx::query(
+                "SELECT s.*, c.name as computer_name
              FROM computer_schedules s
              LEFT JOIN computers c ON c.id = s.computer_id
              WHERE s.computer_id = $1 AND s.enabled = true
              ORDER BY s.created_at DESC",
-        )
-        .bind(cid)
-        .fetch_all(pool)
-        .await?,
-        (Some(cid), false) => sqlx::query(
-            "SELECT s.*, c.name as computer_name
+            )
+            .bind(cid)
+            .fetch_all(pool)
+            .await?
+        }
+        (Some(cid), false) => {
+            sqlx::query(
+                "SELECT s.*, c.name as computer_name
              FROM computer_schedules s
              LEFT JOIN computers c ON c.id = s.computer_id
              WHERE s.computer_id = $1
              ORDER BY s.created_at DESC",
-        )
-        .bind(cid)
-        .fetch_all(pool)
-        .await?,
-        (None, true) => sqlx::query(
-            "SELECT s.*, c.name as computer_name
+            )
+            .bind(cid)
+            .fetch_all(pool)
+            .await?
+        }
+        (None, true) => {
+            sqlx::query(
+                "SELECT s.*, c.name as computer_name
              FROM computer_schedules s
              LEFT JOIN computers c ON c.id = s.computer_id
              WHERE s.enabled = true
              ORDER BY s.created_at DESC",
-        )
-        .fetch_all(pool)
-        .await?,
-        (None, false) => sqlx::query(
-            "SELECT s.*, c.name as computer_name
+            )
+            .fetch_all(pool)
+            .await?
+        }
+        (None, false) => {
+            sqlx::query(
+                "SELECT s.*, c.name as computer_name
              FROM computer_schedules s
              LEFT JOIN computers c ON c.id = s.computer_id
              ORDER BY s.created_at DESC",
-        )
-        .fetch_all(pool)
-        .await?,
+            )
+            .fetch_all(pool)
+            .await?
+        }
     };
-    Ok(rows.iter().map(|r| ComputerScheduleRow {
-        id: r.get("id"),
-        computer_id: r.get("computer_id"),
-        computer_name: r.try_get("computer_name").ok(),
-        kind: r.get("kind"),
-        cron_expr: r.get("cron_expr"),
-        condition: r.try_get("condition").ok(),
-        enabled: r.get("enabled"),
-        last_fired_at: r.try_get("last_fired_at").ok(),
-        last_result: r.try_get("last_result").ok(),
-        created_at: r.get("created_at"),
-        created_by: r.try_get("created_by").ok(),
-    }).collect())
+    Ok(rows
+        .iter()
+        .map(|r| ComputerScheduleRow {
+            id: r.get("id"),
+            computer_id: r.get("computer_id"),
+            computer_name: r.try_get("computer_name").ok(),
+            kind: r.get("kind"),
+            cron_expr: r.get("cron_expr"),
+            condition: r.try_get("condition").ok(),
+            enabled: r.get("enabled"),
+            last_fired_at: r.try_get("last_fired_at").ok(),
+            last_result: r.try_get("last_result").ok(),
+            created_at: r.get("created_at"),
+            created_by: r.try_get("created_by").ok(),
+        })
+        .collect())
 }
 
 pub async fn pg_mark_schedule_fired(
@@ -4667,26 +4828,29 @@ pub async fn pg_list_training_jobs(
         .fetch_all(pool)
         .await?
     };
-    Ok(rows.iter().map(|r| TrainingJobRow {
-        id: r.get("id"),
-        name: r.get("name"),
-        base_model_id: r.try_get("base_model_id").ok(),
-        training_data_path: r.get("training_data_path"),
-        adapter_output_path: r.try_get("adapter_output_path").ok(),
-        training_type: r.get("training_type"),
-        computer_id: r.try_get("computer_id").ok(),
-        computer_name: r.try_get("computer_name").ok(),
-        status: r.get("status"),
-        started_at: r.try_get("started_at").ok(),
-        completed_at: r.try_get("completed_at").ok(),
-        loss_curve: r.get("loss_curve"),
-        params: r.get("params"),
-        result_model_id: r.try_get("result_model_id").ok(),
-        deferred_task_id: r.try_get("deferred_task_id").ok(),
-        error_message: r.try_get("error_message").ok(),
-        created_at: r.get("created_at"),
-        created_by: r.try_get("created_by").ok(),
-    }).collect())
+    Ok(rows
+        .iter()
+        .map(|r| TrainingJobRow {
+            id: r.get("id"),
+            name: r.get("name"),
+            base_model_id: r.try_get("base_model_id").ok(),
+            training_data_path: r.get("training_data_path"),
+            adapter_output_path: r.try_get("adapter_output_path").ok(),
+            training_type: r.get("training_type"),
+            computer_id: r.try_get("computer_id").ok(),
+            computer_name: r.try_get("computer_name").ok(),
+            status: r.get("status"),
+            started_at: r.try_get("started_at").ok(),
+            completed_at: r.try_get("completed_at").ok(),
+            loss_curve: r.get("loss_curve"),
+            params: r.get("params"),
+            result_model_id: r.try_get("result_model_id").ok(),
+            deferred_task_id: r.try_get("deferred_task_id").ok(),
+            error_message: r.try_get("error_message").ok(),
+            created_at: r.get("created_at"),
+            created_by: r.try_get("created_by").ok(),
+        })
+        .collect())
 }
 
 pub async fn pg_update_training_job_status(

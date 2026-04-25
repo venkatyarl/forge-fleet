@@ -36,8 +36,12 @@ fn workspaces_root() -> PathBuf {
 }
 
 fn home_dir_xplat() -> Option<PathBuf> {
-    if let Ok(h) = std::env::var("HOME") { return Some(PathBuf::from(h)); }
-    if let Ok(h) = std::env::var("USERPROFILE") { return Some(PathBuf::from(h)); }
+    if let Ok(h) = std::env::var("HOME") {
+        return Some(PathBuf::from(h));
+    }
+    if let Ok(h) = std::env::var("USERPROFILE") {
+        return Some(PathBuf::from(h));
+    }
     None
 }
 
@@ -47,16 +51,14 @@ fn home_dir_xplat() -> Option<PathBuf> {
 /// order.
 pub fn ensure_workspaces(count: u32) -> Result<Vec<PathBuf>, String> {
     let root = workspaces_root();
-    std::fs::create_dir_all(&root)
-        .map_err(|e| format!("create {}: {e}", root.display()))?;
+    std::fs::create_dir_all(&root).map_err(|e| format!("create {}: {e}", root.display()))?;
 
     let mut out = Vec::with_capacity(count as usize);
     for i in 0..count {
         let ws = root.join(format!("sub-agent-{i}"));
         for sub in ["scratch", "checkpoints", "cache"] {
             let p = ws.join(sub);
-            std::fs::create_dir_all(&p)
-                .map_err(|e| format!("create {}: {e}", p.display()))?;
+            std::fs::create_dir_all(&p).map_err(|e| format!("create {}: {e}", p.display()))?;
         }
         out.push(ws);
     }
@@ -83,7 +85,9 @@ impl Slots {
     pub fn new(count: u32) -> Self {
         let workspaces = ensure_workspaces(count).unwrap_or_else(|e| {
             eprintln!("sub_agents: ensure_workspaces({count}) failed: {e}");
-            (0..count).map(|i| workspaces_root().join(format!("sub-agent-{i}"))).collect()
+            (0..count)
+                .map(|i| workspaces_root().join(format!("sub-agent-{i}")))
+                .collect()
         });
         Self {
             inner: Arc::new(Mutex::new(SlotsInner {
@@ -153,7 +157,13 @@ impl Slots {
 
     /// Number of slots currently reserved.
     pub fn in_use(&self) -> u32 {
-        self.inner.lock().unwrap().in_use.iter().filter(|b| **b).count() as u32
+        self.inner
+            .lock()
+            .unwrap()
+            .in_use
+            .iter()
+            .filter(|b| **b)
+            .count() as u32
     }
 
     fn release(&self, index: u32) {

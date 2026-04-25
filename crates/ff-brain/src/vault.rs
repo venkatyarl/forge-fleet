@@ -109,10 +109,14 @@ const MAX_FILE_SIZE: u64 = 500_000; // 500KB — skip huge generated/API-dump fi
 pub fn parse_vault_file(path: &Path, vault_root: &Path) -> Result<ParsedNode, String> {
     let meta = std::fs::metadata(path).map_err(|e| format!("metadata {}: {e}", path.display()))?;
     if meta.len() > MAX_FILE_SIZE {
-        return Err(format!("skipping oversized file ({} bytes): {}", meta.len(), path.display()));
+        return Err(format!(
+            "skipping oversized file ({} bytes): {}",
+            meta.len(),
+            path.display()
+        ));
     }
-    let content =
-        std::fs::read_to_string(path).map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
 
     let relative = path
         .strip_prefix(vault_root)
@@ -136,21 +140,26 @@ pub fn parse_vault_file(path: &Path, vault_root: &Path) -> Result<ParsedNode, St
     // Extract fields from frontmatter
     let node_type = fm.get("type").and_then(|v| v.as_str()).map(String::from);
     let tags: Vec<String> = match fm.get("tags") {
-        Some(serde_json::Value::Array(arr)) => {
-            arr.iter().filter_map(|v| v.as_str().map(String::from)).collect()
-        }
+        Some(serde_json::Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect(),
         Some(serde_json::Value::String(s)) => s.split(',').map(|t| t.trim().to_string()).collect(),
         _ => Vec::new(),
     };
     let extends_path = fm.get("extends").and_then(|v| v.as_str()).map(String::from);
     let applies_to: Vec<String> = match fm.get("applies_to") {
-        Some(serde_json::Value::Array(arr)) => {
-            arr.iter().filter_map(|v| v.as_str().map(String::from)).collect()
-        }
+        Some(serde_json::Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect(),
         Some(serde_json::Value::String(s)) => vec![s.clone()],
         _ => Vec::new(),
     };
-    let from_thread = fm.get("from_thread").and_then(|v| v.as_str()).map(String::from);
+    let from_thread = fm
+        .get("from_thread")
+        .and_then(|v| v.as_str())
+        .map(String::from);
     let confidence = fm
         .get("confidence")
         .and_then(|v| v.as_f64())
@@ -191,64 +200,69 @@ pub fn chunk_markdown(body: &str, file_path: &str) -> Vec<VaultChunk> {
         parts.join(" > ")
     };
 
-    let flush_section =
-        |text: &str, offset: usize, breadcrumb: &str, out: &mut Vec<VaultChunk>| {
-            let trimmed = text.trim();
-            if trimmed.is_empty() {
-                return;
-            }
+    let flush_section = |text: &str, offset: usize, breadcrumb: &str, out: &mut Vec<VaultChunk>| {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return;
+        }
 
-            if trimmed.len() <= max_chunk_chars {
+        if trimmed.len() <= max_chunk_chars {
+            out.push(VaultChunk {
+                breadcrumb: breadcrumb.to_string(),
+                text: trimmed.to_string(),
+                char_offset: offset,
+                token_estimate: trimmed.len() / 4,
+            });
+        } else {
+            // Split large sections with overlap — char-boundary safe.
+            let chars: Vec<char> = trimmed.chars().collect();
+            let total = chars.len();
+            let chunk_chars = max_chunk_chars / 4; // work in char count not byte count
+            let overlap = chunk_chars / 5;
+            let mut pos = 0;
+            let mut chunk_idx = 0;
+            while pos < total {
+                let end = (pos + chunk_chars).min(total);
+                let actual_end = if end < total {
+                    // Find space near end
+                    let window: String = chars[pos..end].iter().collect();
+                    match window.rfind(' ') {
+                        Some(sp) => pos + sp,
+                        None => end,
+                    }
+                } else {
+                    end
+                };
+                let slice: String = chars[pos..actual_end].iter().collect();
+                let byte_offset = trimmed
+                    .chars()
+                    .take(pos)
+                    .map(|c| c.len_utf8())
+                    .sum::<usize>();
                 out.push(VaultChunk {
-                    breadcrumb: breadcrumb.to_string(),
-                    text: trimmed.to_string(),
-                    char_offset: offset,
-                    token_estimate: trimmed.len() / 4,
+                    breadcrumb: if chunk_idx == 0 {
+                        breadcrumb.to_string()
+                    } else {
+                        format!("{breadcrumb} (cont.)")
+                    },
+                    text: slice.clone(),
+                    char_offset: offset + byte_offset,
+                    token_estimate: slice.len() / 4,
                 });
-            } else {
-                // Split large sections with overlap — char-boundary safe.
-                let chars: Vec<char> = trimmed.chars().collect();
-                let total = chars.len();
-                let chunk_chars = max_chunk_chars / 4; // work in char count not byte count
-                let overlap = chunk_chars / 5;
-                let mut pos = 0;
-                let mut chunk_idx = 0;
-                while pos < total {
-                    let end = (pos + chunk_chars).min(total);
-                    let actual_end = if end < total {
-                        // Find space near end
-                        let window: String = chars[pos..end].iter().collect();
-                        match window.rfind(' ') {
-                            Some(sp) => pos + sp,
-                            None => end,
-                        }
-                    } else {
-                        end
-                    };
-                    let slice: String = chars[pos..actual_end].iter().collect();
-                    let byte_offset = trimmed.chars().take(pos).map(|c| c.len_utf8()).sum::<usize>();
-                    out.push(VaultChunk {
-                        breadcrumb: if chunk_idx == 0 {
-                            breadcrumb.to_string()
-                        } else {
-                            format!("{breadcrumb} (cont.)")
-                        },
-                        text: slice.clone(),
-                        char_offset: offset + byte_offset,
-                        token_estimate: slice.len() / 4,
-                    });
-                    chunk_idx += 1;
+                chunk_idx += 1;
 
-                    if actual_end >= total { break; }
-                    let advance = if actual_end > pos + overlap {
-                        actual_end - pos - overlap
-                    } else {
-                        actual_end - pos
-                    };
-                    pos += advance;
+                if actual_end >= total {
+                    break;
                 }
+                let advance = if actual_end > pos + overlap {
+                    actual_end - pos - overlap
+                } else {
+                    actual_end - pos
+                };
+                pos += advance;
             }
-        };
+        }
+    };
 
     let mut offset = 0;
     for line in &lines {
@@ -309,7 +323,10 @@ fn heading_level(line: &str) -> Option<usize> {
 pub async fn index_vault(pool: &PgPool, config: &VaultConfig) -> Result<IndexReport, String> {
     let brain_root = config.brain_root();
     if !brain_root.exists() {
-        return Err(format!("Brain root does not exist: {}", brain_root.display()));
+        return Err(format!(
+            "Brain root does not exist: {}",
+            brain_root.display()
+        ));
     }
 
     // Collect all .md files
@@ -494,9 +511,8 @@ async fn upsert_edges(pool: &PgPool, node: &ParsedNode) -> Result<usize, String>
     // existing node path (basename match, Obsidian-style shortest path).
     for target in &node.wikilinks {
         if let Some(dst) = resolve_wikilink_target(pool, target).await {
-            let _ = ff_db::pg_upsert_brain_vault_edge(
-                pool, src_id, dst, "link", 1.0, "extracted",
-            ).await;
+            let _ = ff_db::pg_upsert_brain_vault_edge(pool, src_id, dst, "link", 1.0, "extracted")
+                .await;
             count += 1;
         }
     }
@@ -505,9 +521,9 @@ async fn upsert_edges(pool: &PgPool, node: &ParsedNode) -> Result<usize, String>
     if let Some(extends) = &node.extends_path {
         let clean = extends.trim_start_matches("[[").trim_end_matches("]]");
         if let Some(dst) = resolve_wikilink_target(pool, clean).await {
-            let _ = ff_db::pg_upsert_brain_vault_edge(
-                pool, src_id, dst, "extends", 1.0, "extracted",
-            ).await;
+            let _ =
+                ff_db::pg_upsert_brain_vault_edge(pool, src_id, dst, "extends", 1.0, "extracted")
+                    .await;
             count += 1;
         }
     }
@@ -517,8 +533,14 @@ async fn upsert_edges(pool: &PgPool, node: &ParsedNode) -> Result<usize, String>
         let clean = target.trim_start_matches("[[").trim_end_matches("]]");
         if let Some(dst) = resolve_wikilink_target(pool, clean).await {
             let _ = ff_db::pg_upsert_brain_vault_edge(
-                pool, src_id, dst, "applies_to", 1.0, "extracted",
-            ).await;
+                pool,
+                src_id,
+                dst,
+                "applies_to",
+                1.0,
+                "extracted",
+            )
+            .await;
             count += 1;
         }
     }
@@ -531,7 +553,11 @@ async fn upsert_edges(pool: &PgPool, node: &ParsedNode) -> Result<usize, String>
 /// first try exact path match, then basename match.
 async fn resolve_wikilink_target(pool: &PgPool, target: &str) -> Option<uuid::Uuid> {
     // Try exact path match (e.g. "Projects/ForgeFleet/UI Design.md")
-    let with_md = if target.ends_with(".md") { target.to_string() } else { format!("{target}.md") };
+    let with_md = if target.ends_with(".md") {
+        target.to_string()
+    } else {
+        format!("{target}.md")
+    };
     if let Ok(Some(node)) = ff_db::pg_get_brain_vault_node(pool, &with_md).await {
         return Some(node.id);
     }
@@ -563,10 +589,12 @@ async fn write_chunks(pool: &PgPool, node_path: &str, chunks: &[VaultChunk]) -> 
         return Ok(());
     }
 
-    let _ = sqlx::query("DELETE FROM rag_chunks WHERE workspace_id = 'brain_vault' AND source_path = $1")
-        .bind(node_path)
-        .execute(pool)
-        .await;
+    let _ = sqlx::query(
+        "DELETE FROM rag_chunks WHERE workspace_id = 'brain_vault' AND source_path = $1",
+    )
+    .bind(node_path)
+    .execute(pool)
+    .await;
 
     // Deterministic document_id from path (simple hash-based).
     let mut hasher = Sha256::new();

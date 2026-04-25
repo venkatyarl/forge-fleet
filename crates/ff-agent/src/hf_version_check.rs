@@ -39,7 +39,9 @@ pub async fn check_catalog_updates(
     // Map (catalog_id, runtime) -> count of library rows.
     let mut lib_count: BTreeMap<(String, String), usize> = BTreeMap::new();
     for r in &library {
-        *lib_count.entry((r.catalog_id.clone(), r.runtime.clone())).or_insert(0) += 1;
+        *lib_count
+            .entry((r.catalog_id.clone(), r.runtime.clone()))
+            .or_insert(0) += 1;
     }
 
     let client = reqwest::Client::builder()
@@ -101,17 +103,11 @@ async fn fetch_repo_info(
     if let Some(t) = token {
         req = req.header("Authorization", format!("Bearer {t}"));
     }
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| format!("send: {e}"))?;
+    let resp = req.send().await.map_err(|e| format!("send: {e}"))?;
     if !resp.status().is_success() {
         return Err(format!("HTTP {}", resp.status().as_u16()));
     }
-    let json: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("json: {e}"))?;
+    let json: serde_json::Value = resp.json().await.map_err(|e| format!("json: {e}"))?;
     let sha = json
         .get("sha")
         .and_then(|s| s.as_str())

@@ -6,7 +6,7 @@
 //!   3. mkdir + mount on <peer>.
 //!   4. Record in `shared_volumes`.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use sqlx::{PgPool, Row};
 use tokio::process::Command;
 use uuid::Uuid;
@@ -41,18 +41,17 @@ pub async fn handle_storage_share(
         } else {
             format!("{}-{}", to_peer, from_host)
         };
-        let pr = sqlx::query(
-            "SELECT a_ip, b_ip, computer_a_id FROM fabric_pairs WHERE pair_name = $1",
-        )
-        .bind(&pair_name)
-        .fetch_optional(pg)
-        .await?
-        .with_context(|| {
-            format!(
-                "fabric pair '{}' not found; run `ff fabric pair {} {}` first",
-                pair_name, from_host, to_peer
-            )
-        })?;
+        let pr =
+            sqlx::query("SELECT a_ip, b_ip, computer_a_id FROM fabric_pairs WHERE pair_name = $1")
+                .bind(&pair_name)
+                .fetch_optional(pg)
+                .await?
+                .with_context(|| {
+                    format!(
+                        "fabric pair '{}' not found; run `ff fabric pair {} {}` first",
+                        pair_name, from_host, to_peer
+                    )
+                })?;
         let a_ip: String = pr.try_get("a_ip")?;
         let b_ip: String = pr.try_get("b_ip")?;
         let a_id: Uuid = pr.try_get("computer_a_id")?;
@@ -70,7 +69,12 @@ pub async fn handle_storage_share(
     }
 
     println!("[1/4] Installing nfs-kernel-server on {}...", from_host);
-    run_ssh(&from_user, &from_ip, "sudo apt-get install -y nfs-kernel-server").await?;
+    run_ssh(
+        &from_user,
+        &from_ip,
+        "sudo apt-get install -y nfs-kernel-server",
+    )
+    .await?;
 
     println!("[2/4] Exporting {} from {}...", export_path, from_host);
     let subnet = host_fabric_ip

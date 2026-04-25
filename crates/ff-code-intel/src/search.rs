@@ -47,7 +47,9 @@ pub fn semantic_search(graph: &CodeGraph, query: &str, max_results: usize) -> Ve
         // Boost by entity kind importance
         score *= match entity.kind {
             EntityKind::Function | EntityKind::Method => 1.5,
-            EntityKind::Struct | EntityKind::Class | EntityKind::Trait | EntityKind::Interface => 2.0,
+            EntityKind::Struct | EntityKind::Class | EntityKind::Trait | EntityKind::Interface => {
+                2.0
+            }
             EntityKind::Enum | EntityKind::Type => 1.3,
             _ => 1.0,
         };
@@ -61,7 +63,11 @@ pub fn semantic_search(graph: &CodeGraph, query: &str, max_results: usize) -> Ve
         }
     }
 
-    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    results.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     results.truncate(max_results);
     results
 }
@@ -69,7 +75,9 @@ pub fn semantic_search(graph: &CodeGraph, query: &str, max_results: usize) -> Ve
 /// Find all definitions of a symbol across the graph.
 pub fn find_definitions<'a>(graph: &'a CodeGraph, name: &str) -> Vec<&'a CodeEntity> {
     let lower = name.to_ascii_lowercase();
-    graph.entities.values()
+    graph
+        .entities
+        .values()
         .filter(|e| e.name.to_ascii_lowercase() == lower)
         .filter(|e| !matches!(e.kind, EntityKind::Import))
         .collect()
@@ -78,7 +86,9 @@ pub fn find_definitions<'a>(graph: &'a CodeGraph, name: &str) -> Vec<&'a CodeEnt
 /// Find all references/usages of a symbol (imports + calls).
 pub fn find_references<'a>(graph: &'a CodeGraph, name: &str) -> Vec<&'a CodeEntity> {
     let lower = name.to_ascii_lowercase();
-    graph.entities.values()
+    graph
+        .entities
+        .values()
         .filter(|e| {
             e.source.to_ascii_lowercase().contains(&lower) && e.name.to_ascii_lowercase() != lower
         })

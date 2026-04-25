@@ -37,10 +37,16 @@ pub async fn scan_local_library(
     models_dir: &Path,
 ) -> Result<ScanSummary, String> {
     if !models_dir.exists() {
-        return Err(format!("models_dir does not exist: {}", models_dir.display()));
+        return Err(format!(
+            "models_dir does not exist: {}",
+            models_dir.display()
+        ));
     }
     if !models_dir.is_dir() {
-        return Err(format!("models_dir is not a directory: {}", models_dir.display()));
+        return Err(format!(
+            "models_dir is not a directory: {}",
+            models_dir.display()
+        ));
     }
 
     // Fetch catalog once for fuzzy matching.
@@ -66,7 +72,9 @@ pub async fn scan_local_library(
             Ok(e) => e,
             Err(e) => {
                 tracing::warn!("read_dir entry error: {e}");
-                if verbose { eprintln!("[scan] read_dir entry error: {e}"); }
+                if verbose {
+                    eprintln!("[scan] read_dir entry error: {e}");
+                }
                 continue;
             }
         };
@@ -75,7 +83,9 @@ pub async fn scan_local_library(
             Ok(ft) => ft,
             Err(e) => {
                 tracing::warn!("file_type({}) failed: {e}", path.display());
-                if verbose { eprintln!("[scan] file_type({}) failed: {e}", path.display()); }
+                if verbose {
+                    eprintln!("[scan] file_type({}) failed: {e}", path.display());
+                }
                 continue;
             }
         };
@@ -84,31 +94,43 @@ pub async fn scan_local_library(
             match classify_file(&path, &catalog) {
                 Some(d) => {
                     if verbose {
-                        eprintln!("[scan]  file  → catalog={} runtime={} size={}", d.catalog_id, d.runtime, d.size_bytes);
+                        eprintln!(
+                            "[scan]  file  → catalog={} runtime={} size={}",
+                            d.catalog_id, d.runtime, d.size_bytes
+                        );
                     }
                     discovered.push(d);
                 }
                 None => {
-                    if verbose { eprintln!("[scan]  file  skip: {}", path.display()); }
+                    if verbose {
+                        eprintln!("[scan]  file  skip: {}", path.display());
+                    }
                 }
             }
         } else if file_type.is_dir() {
             match classify_dir(&path, &catalog) {
                 Some(d) => {
                     if verbose {
-                        eprintln!("[scan]  dir   → catalog={} runtime={} size={}", d.catalog_id, d.runtime, d.size_bytes);
+                        eprintln!(
+                            "[scan]  dir   → catalog={} runtime={} size={}",
+                            d.catalog_id, d.runtime, d.size_bytes
+                        );
                     }
                     discovered.push(d);
                 }
                 None => {
-                    if verbose { eprintln!("[scan]  dir   skip: {}", path.display()); }
+                    if verbose {
+                        eprintln!("[scan]  dir   skip: {}", path.display());
+                    }
                 }
             }
         } else if verbose {
             eprintln!("[scan]  other skip: {}", path.display());
         }
     }
-    if verbose { eprintln!("[scan] discovered {} entries total", discovered.len()); }
+    if verbose {
+        eprintln!("[scan] discovered {} entries total", discovered.len());
+    }
 
     // Index existing rows by file_path for added/updated bookkeeping.
     let existing_paths: std::collections::HashSet<String> =
@@ -143,7 +165,9 @@ pub async fn scan_local_library(
             }
             Err(e) => {
                 tracing::error!("pg_upsert_library failed for {}: {e}", d.file_path);
-                if verbose { eprintln!("[scan] UPSERT FAILED for {}: {e}", d.file_path); }
+                if verbose {
+                    eprintln!("[scan] UPSERT FAILED for {}: {e}", d.file_path);
+                }
             }
         }
     }
@@ -174,7 +198,8 @@ fn classify_file(path: &Path, catalog: &[ff_db::ModelCatalogRow]) -> Option<Disc
     }
 
     let size = std::fs::metadata(path).ok().map(|m| m.len()).unwrap_or(0);
-    let stem = name.trim_end_matches(|c: char| c == 'f' || c == 'F')
+    let stem = name
+        .trim_end_matches(|c: char| c == 'f' || c == 'F')
         .trim_end_matches(|c: char| c == 'g' || c == 'G')
         .trim_end_matches(|c: char| c == 'g' || c == 'G')
         .trim_end_matches('.')
@@ -238,12 +263,13 @@ fn classify_dir(path: &Path, catalog: &[ff_db::ModelCatalogRow]) -> Option<Disco
 
     // --- Safetensors path ---
     if has_index || !safetensor_paths.is_empty() {
-        let runtime = if lower.ends_with("-mlx") || lower.ends_with("-4bit") || lower.contains("mlx") {
-            "mlx"
-        } else {
-            "vllm"
-        }
-        .to_string();
+        let runtime =
+            if lower.ends_with("-mlx") || lower.ends_with("-4bit") || lower.contains("mlx") {
+                "mlx"
+            } else {
+                "vllm"
+            }
+            .to_string();
         let quant = extract_hf_quant(&lower);
         let total_size: u64 = safetensor_paths
             .iter()
@@ -268,7 +294,10 @@ fn classify_dir(path: &Path, catalog: &[ff_db::ModelCatalogRow]) -> Option<Disco
             .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
             .sum();
         let first = &gguf_paths[0];
-        let first_name = first.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let first_name = first
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
         let stem = strip_ext(&first_name, ".gguf").unwrap_or_else(|| first_name.clone());
         let quant = extract_gguf_quant(&stem).or_else(|| extract_gguf_quant(&dir_name));
         let catalog_id = match_catalog(&dir_name, catalog)
@@ -341,8 +370,8 @@ fn extract_gguf_quant(stem: &str) -> Option<String> {
     let upper = stem.to_uppercase();
     // Common quant patterns — search the tail of the stem.
     let candidates = [
-        "Q2_K", "Q3_K_S", "Q3_K_M", "Q3_K_L", "Q4_0", "Q4_1", "Q4_K_S", "Q4_K_M", "Q5_0",
-        "Q5_1", "Q5_K_S", "Q5_K_M", "Q6_K", "Q8_0", "F16", "FP16", "BF16", "F32",
+        "Q2_K", "Q3_K_S", "Q3_K_M", "Q3_K_L", "Q4_0", "Q4_1", "Q4_K_S", "Q4_K_M", "Q5_0", "Q5_1",
+        "Q5_K_S", "Q5_K_M", "Q6_K", "Q8_0", "F16", "FP16", "BF16", "F32",
     ];
     let mut best: Option<(usize, &str)> = None;
     for c in candidates {
@@ -387,7 +416,8 @@ fn match_catalog(needle: &str, catalog: &[ff_db::ModelCatalogRow]) -> Option<Str
         let id_c = canon(&row.id);
         let name_c = canon(&row.name);
         // Direct-contains match (either direction)
-        let hit = n.contains(&id_c) || id_c.contains(&n) || n.contains(&name_c) || name_c.contains(&n);
+        let hit =
+            n.contains(&id_c) || id_c.contains(&n) || n.contains(&name_c) || name_c.contains(&n);
         if hit {
             // Prefer longer catalog-id match — "qwen3-coder-30b" over "qwen3-14b" when both hit.
             let score = id_c.len();

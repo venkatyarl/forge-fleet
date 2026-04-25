@@ -9,10 +9,10 @@
 //! - **router** — Message routing for chat, command, and tool-execution flows
 //! - **embed** — Embeddable web widget JavaScript endpoint
 
-pub mod discord;
-pub mod embed;
 pub mod brain_api;
 pub mod cloud_llm;
+pub mod discord;
+pub mod embed;
 pub mod llm_routing;
 pub mod message;
 pub mod middleware;

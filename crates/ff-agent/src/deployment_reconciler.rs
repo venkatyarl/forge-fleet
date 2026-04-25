@@ -154,10 +154,14 @@ fn match_library_to_path(
     }
     let path = Path::new(model_path);
     // Try matching by parent dir or filename.
-    if let Some(by_prefix) = libs.iter().find(|r| {
-        path.starts_with(&r.file_path) || model_path.starts_with(&r.file_path)
-    }) {
-        return (Some(by_prefix.id.clone()), Some(by_prefix.catalog_id.clone()));
+    if let Some(by_prefix) = libs
+        .iter()
+        .find(|r| path.starts_with(&r.file_path) || model_path.starts_with(&r.file_path))
+    {
+        return (
+            Some(by_prefix.id.clone()),
+            Some(by_prefix.catalog_id.clone()),
+        );
     }
     (None, None)
 }

@@ -198,7 +198,10 @@ pub fn find_role(name: &str) -> Option<AgentRole> {
 
 /// List roles by category.
 pub fn roles_by_category(category: RoleCategory) -> Vec<AgentRole> {
-    builtin_roles().into_iter().filter(|r| r.category == category).collect()
+    builtin_roles()
+        .into_iter()
+        .filter(|r| r.category == category)
+        .collect()
 }
 
 /// List all role names.
