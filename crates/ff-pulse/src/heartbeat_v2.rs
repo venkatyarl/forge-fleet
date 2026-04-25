@@ -466,6 +466,22 @@ fn detect_all_ips() -> Vec<Ip> {
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() >= 4 {
                 let iface = parts[1];
+                // Skip container / virtual / bridge interfaces that pollute
+                // the fleet's network identity. These aren't "the computer's
+                // address," they're internal docker/k8s/libvirt plumbing.
+                if iface.starts_with("docker")
+                    || iface.starts_with("br-")
+                    || iface == "br0"
+                    || iface.starts_with("virbr")
+                    || iface.starts_with("veth")
+                    || iface.starts_with("cni")
+                    || iface.starts_with("flannel")
+                    || iface.starts_with("cali")
+                    || iface.starts_with("tap")
+                    || iface.starts_with("tun")
+                {
+                    continue;
+                }
                 if let Some(addr) = parts[3].split('/').next() {
                     if !addr.starts_with("127.") && !addr.starts_with("169.254.") {
                         let kind = classify_iface(iface, addr);
@@ -517,16 +533,27 @@ fn probe_iface_linux(iface: &str) -> (Option<String>, Option<u32>) {
     .and_then(|s| s.trim().parse::<i32>().ok())
     .filter(|n| *n > 0)
     .map(|n| (n as u32) / 1000);
-    let medium = if iface.starts_with("eno") || iface.starts_with("enp") || iface.starts_with("eth") {
-        "ethernet"
-    } else if iface.starts_with("usb") {
-        "usb-eth"
+    let medium = if iface.starts_with("thunderbolt") || iface.starts_with("tbt") {
+        "thunderbolt"
     } else if iface.starts_with("rocep") || iface.starts_with("ib") {
         "cx7"
+    } else if iface.starts_with("usb") {
+        "usb-eth"
+    } else if iface.starts_with("eno") || iface.starts_with("enp") || iface.starts_with("eth") {
+        "ethernet"
     } else {
         "ethernet"
     };
-    (Some(medium.to_string()), speed_mbps)
+    // /sys/class/net/thunderbolt0/speed reports something the kernel
+    // can't determine for TB-IP. Use the measured ceiling (20 Gbps for TB3,
+    // observed empirically with iperf3 on 2018-Mac-mini ↔ Mac-Studio-M3-Ultra)
+    // when speed_mbps came back as None for a TB interface.
+    let speed_final = if speed_mbps.is_none() && medium == "thunderbolt" {
+        Some(20)
+    } else {
+        speed_mbps
+    };
+    (Some(medium.to_string()), speed_final)
 }
 
 /// macOS: parse `ifconfig <iface>` for the `media:` line which encodes
@@ -598,6 +625,15 @@ fn classify_iface(iface: &str, ip: &str) -> String {
         "tailscale".to_string()
     } else if iface.starts_with("wg") {
         "wireguard".to_string()
+    } else if ip.starts_with("10.42.") || ip.starts_with("10.43.") {
+        // CX-7 fabric subnets — sia↔adele on 10.42, rihanna↔beyonce on 10.43.
+        // Already kind-classified by cx7_detect::enrich_ip after creation,
+        // but we tag here too so even non-cx7-detected nodes get the right
+        // kind on first beat.
+        "cx7-fabric".to_string()
+    } else if ip.starts_with("10.44.") {
+        // Thunderbolt fabric subnet — taylor↔james 2026-04-25.
+        "tb-fabric".to_string()
     } else if ip.starts_with("10.") || ip.starts_with("192.168.") || ip.starts_with("172.") {
         "lan".to_string()
     } else {
