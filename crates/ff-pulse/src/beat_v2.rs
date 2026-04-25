@@ -89,6 +89,12 @@ pub struct Ip {
     /// Physical link speed in Gbps, if known (from ethtool or similar).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub link_speed_gbps: Option<u32>,
+    /// Physical medium: `"ethernet"` | `"wifi"` | `"cx7"` | `"usb-eth"` |
+    /// `"thunderbolt"` | `"loopback"`. Distinct from `kind` (routing
+    /// semantics) — `medium` is the link layer so ff can prefer faster
+    /// paths for bulk transfers and avoid wifi for tensor-parallel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub medium: Option<String>,
 }
 
 // -----------------------------------------------------------------------------

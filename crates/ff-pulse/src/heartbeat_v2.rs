@@ -416,11 +416,17 @@ fn detect_primary_ip() -> String {
 }
 
 fn detect_all_ips() -> Vec<Ip> {
+    // Use absolute paths because launchd / systemd user services often
+    // strip /sbin from PATH, and `ifconfig` lives there on macOS. Without
+    // this, Command::new("ifconfig") returns "not found" → empty all_ips.
+    // (Hit on ace 2026-04-25 — primary_ip wrongly fell back to 127.0.0.1.)
     let output = if std::env::consts::OS == "macos" {
-        std::process::Command::new("ifconfig").output()
+        std::process::Command::new("/sbin/ifconfig").output()
     } else {
+        // /sbin/ip on Debian/Ubuntu, /usr/sbin/ip on RHEL — try both.
         std::process::Command::new("ip")
             .args(["-4", "-o", "addr", "show"])
+            .env("PATH", "/usr/sbin:/sbin:/usr/bin:/bin")
             .output()
     };
 
@@ -440,12 +446,14 @@ fn detect_all_ips() -> Vec<Ip> {
                 if let Some(ip) = line.split_whitespace().nth(1) {
                     if !ip.starts_with("127.") && !ip.starts_with("169.254.") {
                         let kind = classify_iface(&current_iface, ip);
+                        let (medium, link_speed_gbps) = probe_iface_macos(&current_iface);
                         result.push(Ip {
                             iface: current_iface.clone(),
                             ip: ip.to_string(),
                             kind,
                             paired_with: None,
-                            link_speed_gbps: None,
+                            link_speed_gbps,
+                            medium,
                         });
                     }
                 }
@@ -461,12 +469,14 @@ fn detect_all_ips() -> Vec<Ip> {
                 if let Some(addr) = parts[3].split('/').next() {
                     if !addr.starts_with("127.") && !addr.starts_with("169.254.") {
                         let kind = classify_iface(iface, addr);
+                        let (medium, link_speed_gbps) = probe_iface_linux(iface);
                         result.push(Ip {
                             iface: iface.to_string(),
                             ip: addr.to_string(),
                             kind,
                             paired_with: None,
-                            link_speed_gbps: None,
+                            link_speed_gbps,
+                            medium,
                         });
                     }
                 }
@@ -474,6 +484,113 @@ fn detect_all_ips() -> Vec<Ip> {
         }
     }
     result
+}
+
+/// Linux: read `/sys/class/net/<iface>/speed` (Mbps for ethernet) and
+/// detect wifi via `/sys/class/net/<iface>/wireless` directory presence.
+fn probe_iface_linux(iface: &str) -> (Option<String>, Option<u32>) {
+    let wireless = std::path::Path::new("/sys/class/net")
+        .join(iface)
+        .join("wireless")
+        .exists();
+    if wireless {
+        // Wifi link rate via `iw dev <iface> link` if available; otherwise leave None.
+        let rate = std::process::Command::new("iw")
+            .args(["dev", iface, "link"])
+            .env("PATH", "/usr/sbin:/sbin:/usr/bin:/bin")
+            .output()
+            .ok()
+            .and_then(|o| if o.status.success() { Some(String::from_utf8_lossy(&o.stdout).into_owned()) } else { None })
+            .and_then(|s| {
+                s.lines()
+                    .find(|l| l.trim_start().starts_with("tx bitrate:"))
+                    .and_then(|l| l.split_whitespace().nth(2).map(str::to_string))
+                    .and_then(|n| n.parse::<f64>().ok())
+                    .map(|mbps| (mbps / 1000.0).round() as u32)
+            });
+        return (Some("wifi".to_string()), rate);
+    }
+    let speed_mbps: Option<u32> = std::fs::read_to_string(
+        std::path::Path::new("/sys/class/net").join(iface).join("speed"),
+    )
+    .ok()
+    .and_then(|s| s.trim().parse::<i32>().ok())
+    .filter(|n| *n > 0)
+    .map(|n| (n as u32) / 1000);
+    let medium = if iface.starts_with("eno") || iface.starts_with("enp") || iface.starts_with("eth") {
+        "ethernet"
+    } else if iface.starts_with("usb") {
+        "usb-eth"
+    } else if iface.starts_with("rocep") || iface.starts_with("ib") {
+        "cx7"
+    } else {
+        "ethernet"
+    };
+    (Some(medium.to_string()), speed_mbps)
+}
+
+/// macOS: parse `ifconfig <iface>` for the `media:` line which encodes
+/// link speed (e.g. `media: autoselect (1000baseT <full-duplex>)`).
+/// Cross-references `networksetup -listallhardwareports` to detect wifi.
+fn probe_iface_macos(iface: &str) -> (Option<String>, Option<u32>) {
+    let media = std::process::Command::new("/sbin/ifconfig")
+        .arg(iface)
+        .output()
+        .ok()
+        .and_then(|o| if o.status.success() { Some(String::from_utf8_lossy(&o.stdout).into_owned()) } else { None })
+        .unwrap_or_default();
+
+    // Hardware-port lookup: AirPort/Wi-Fi → wifi medium.
+    let hw_ports = std::process::Command::new("/usr/sbin/networksetup")
+        .args(["-listallhardwareports"])
+        .output()
+        .ok()
+        .and_then(|o| if o.status.success() { Some(String::from_utf8_lossy(&o.stdout).into_owned()) } else { None })
+        .unwrap_or_default();
+
+    let medium = {
+        // Walk hardware ports list looking for "Hardware Port: Foo / Device: <iface>".
+        let mut hw_for_iface: Option<&str> = None;
+        let mut last_hw: Option<&str> = None;
+        for line in hw_ports.lines() {
+            if let Some(rest) = line.strip_prefix("Hardware Port: ") {
+                last_hw = Some(rest.trim());
+            } else if let Some(rest) = line.strip_prefix("Device: ") {
+                if rest.trim() == iface {
+                    hw_for_iface = last_hw;
+                    break;
+                }
+            }
+        }
+        let hw_lc = hw_for_iface.map(|s| s.to_ascii_lowercase()).unwrap_or_default();
+        if hw_lc.contains("wi-fi") || hw_lc.contains("airport") {
+            "wifi"
+        } else if hw_lc.contains("thunderbolt") && hw_lc.contains("bridge") {
+            "thunderbolt"
+        } else if hw_lc.contains("usb") {
+            "usb-eth"
+        } else {
+            "ethernet"
+        }
+    };
+
+    // Speed parse — looks for 1000baseT / 10GbaseT / etc in the active media.
+    let speed_gbps: Option<u32> = media
+        .lines()
+        .find(|l| l.trim_start().starts_with("media:"))
+        .and_then(|line| {
+            // Match patterns: 100baseT (0.1G), 1000baseT (1G), 2.5GBase (2G/3G),
+            // 10GBase-T (10G), etc.
+            let lc = line.to_ascii_lowercase();
+            if lc.contains("10gbase") { Some(10) }
+            else if lc.contains("5gbase") { Some(5) }
+            else if lc.contains("2.5gbase") { Some(2) }  // round to 2
+            else if lc.contains("1000base") || lc.contains("1gbase") { Some(1) }
+            else if lc.contains("100base") { Some(0) }    // <1 Gbps → round to 0
+            else { None }
+        });
+
+    (Some(medium.to_string()), speed_gbps)
 }
 
 fn classify_iface(iface: &str, ip: &str) -> String {
