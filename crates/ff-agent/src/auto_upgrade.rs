@@ -739,6 +739,10 @@ where
                 continue;
             }
         };
+        // Dual-write: software_registry is the auto-upgrade catalog,
+        // external_tools is the `ff ext` catalog. They overlap for tools
+        // that live in both (openclaw, codex, claude-code, …). Update
+        // both so `ff ext drift` and `ff software drift` agree.
         let res = sqlx::query(
             r#"
             UPDATE software_registry
@@ -758,13 +762,27 @@ where
                     software_id = %id,
                     method,
                     version = %version,
-                    "upstream version refreshed"
+                    "upstream version refreshed (software_registry)"
                 );
                 updated += 1;
             }
             Ok(_) => { /* unchanged */ }
-            Err(e) => tracing::warn!(software_id = %id, error = %e, "registry update failed"),
+            Err(e) => tracing::warn!(software_id = %id, error = %e, "software_registry update failed"),
         }
+        // Mirror to external_tools when an entry exists. Soft-fail.
+        let _ = sqlx::query(
+            r#"
+            UPDATE external_tools
+               SET latest_version    = $2,
+                   latest_version_at = NOW()
+             WHERE id = $1
+               AND (latest_version IS NULL OR latest_version <> $2)
+            "#,
+        )
+        .bind(&id)
+        .bind(&version)
+        .execute(pool)
+        .await;
     }
     Ok(updated)
 }

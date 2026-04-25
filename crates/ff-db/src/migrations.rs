@@ -367,6 +367,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "beat_age_alerts",
         sql: schema::SCHEMA_V45_BEAT_AGE_ALERTS,
     },
+    PgMigration {
+        version: 46,
+        name: "npm_cli_catalog",
+        sql: schema::SCHEMA_V46_NPM_CLI_CATALOG,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.

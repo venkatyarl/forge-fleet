@@ -4225,3 +4225,79 @@ VALUES
 
 ON CONFLICT (name) DO NOTHING;
 "#;
+
+// ─── V46: npm-distributed CLI tools (openclaw, codex, claude-code) ─────────
+//
+// These three tools are installed via `npm install -g <package>` on every
+// fleet member. Before this migration they were tracked manually via direct
+// SQL INSERTs during the 2026-04-25 session. Bake them into the schema so
+// fresh fleets get the catalog rows automatically.
+//
+// `version_source.method=npm_registry` makes the auto-upgrade tick query
+// https://registry.npmjs.org/<package>/latest hourly. Drift detection then
+// fires a fleet-wide upgrade dispatch through deferred_tasks. Critical
+// detail in the upgrade_playbook: macOS `npm install -g` (homebrew npm)
+// writes to user-owned /opt/homebrew/lib/node_modules and does NOT need
+// sudo. Linux `sudo npm install -g` writes to root-owned /usr/lib/...
+// and DOES need sudo. Each os_family playbook key handles its own case.
+//
+// The macOS playbook prepends /opt/homebrew/bin to PATH because
+// non-interactive SSH sessions on Mac don't source ~/.zprofile, so the
+// vanilla command would fail "npm: command not found" (the ace bug from
+// 2026-04-25).
+pub const SCHEMA_V46_NPM_CLI_CATALOG: &str = r#"
+INSERT INTO software_registry
+    (id, display_name, kind, version_source, upgrade_playbook)
+VALUES
+  ('openclaw', 'OpenClaw (gateway/node)', 'binary',
+   '{"method":"npm_registry","package":"openclaw"}'::jsonb,
+   '{"macos":"export PATH=/opt/homebrew/bin:$PATH && npm install -g openclaw@latest","linux":"sudo npm install -g openclaw@latest"}'::jsonb),
+
+  ('codex', 'OpenAI Codex CLI', 'binary',
+   '{"method":"npm_registry","package":"@openai/codex"}'::jsonb,
+   '{"macos":"export PATH=/opt/homebrew/bin:$PATH && npm install -g @openai/codex@latest","linux":"sudo npm install -g @openai/codex@latest"}'::jsonb),
+
+  ('claude-code', 'Claude Code CLI (Anthropic)', 'binary',
+   '{"method":"npm_registry","package":"@anthropic-ai/claude-code"}'::jsonb,
+   '{"macos":"export PATH=/opt/homebrew/bin:$PATH && npm install -g @anthropic-ai/claude-code@latest","linux":"sudo npm install -g @anthropic-ai/claude-code@latest"}'::jsonb)
+
+ON CONFLICT (id) DO UPDATE SET
+  version_source   = EXCLUDED.version_source,
+  upgrade_playbook = EXCLUDED.upgrade_playbook;
+
+INSERT INTO external_tools
+    (id, display_name, github_url, kind, install_method, install_spec,
+     cli_entrypoint, register_as_mcp, version_source, upgrade_playbook,
+     intake_source, added_by)
+VALUES
+  ('openclaw', 'OpenClaw (gateway/node)',
+   'https://github.com/openclaw/openclaw', 'cli', 'npm_global',
+   '{"package":"openclaw"}'::jsonb,
+   'openclaw', false,
+   '{"method":"npm_registry","package":"openclaw"}'::jsonb,
+   '{"macos":"export PATH=/opt/homebrew/bin:$PATH && npm install -g openclaw@latest","linux":"sudo npm install -g openclaw@latest"}'::jsonb,
+   'migration', 'V46'),
+
+  ('codex', 'OpenAI Codex CLI',
+   'https://github.com/openai/codex', 'cli', 'npm_global',
+   '{"package":"@openai/codex"}'::jsonb,
+   'codex', false,
+   '{"method":"npm_registry","package":"@openai/codex"}'::jsonb,
+   '{"macos":"export PATH=/opt/homebrew/bin:$PATH && npm install -g @openai/codex@latest","linux":"sudo npm install -g @openai/codex@latest"}'::jsonb,
+   'migration', 'V46'),
+
+  ('claude-code', 'Claude Code CLI (Anthropic)',
+   'https://github.com/anthropics/claude-code', 'cli', 'npm_global',
+   '{"package":"@anthropic-ai/claude-code"}'::jsonb,
+   'claude', false,
+   '{"method":"npm_registry","package":"@anthropic-ai/claude-code"}'::jsonb,
+   '{"macos":"export PATH=/opt/homebrew/bin:$PATH && npm install -g @anthropic-ai/claude-code@latest","linux":"sudo npm install -g @anthropic-ai/claude-code@latest"}'::jsonb,
+   'migration', 'V46')
+
+ON CONFLICT (id) DO UPDATE SET
+  install_method   = EXCLUDED.install_method,
+  install_spec     = EXCLUDED.install_spec,
+  cli_entrypoint   = EXCLUDED.cli_entrypoint,
+  version_source   = EXCLUDED.version_source,
+  upgrade_playbook = EXCLUDED.upgrade_playbook;
+"#;

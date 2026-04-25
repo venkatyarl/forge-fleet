@@ -1752,12 +1752,15 @@ async fn start_pulse_v2_subsystems(
     // need their own PulseReaders, built from `redis_url`.
     let pg_pool_for_metrics = pg_pool.clone();
     let pg_pool_for_alerts = pg_pool.clone();
+    let pg_pool_for_auto_upgrade = pg_pool.clone();
     let shutdown_rx_for_metrics = shutdown_rx.clone();
     let shutdown_rx_for_alerts = shutdown_rx.clone();
+    let shutdown_rx_for_auto_upgrade = shutdown_rx.clone();
     let redis_url_for_metrics = redis_url.clone();
     let redis_url_for_alerts = redis_url.clone();
     let node_name_for_metrics = node_name.clone();
     let node_name_for_alerts = node_name.clone();
+    let node_name_for_auto_upgrade = node_name.clone();
 
     // Build the redis::Client once — both publisher and materializer need one.
     let redis_client = redis::Client::open(redis_url.as_str())
@@ -1798,6 +1801,39 @@ async fn start_pulse_v2_subsystems(
     let materializer = ff_pulse::materializer::Materializer::new(pg_pool.clone(), redis_client.clone());
     handles.push(materializer.spawn(shutdown_rx.clone()));
 
+    // OpenClawManager — built BEFORE the fleet_members gate so the
+    // reconciler runs on every daemon, including unenrolled workers.
+    // Election callbacks (promote/demote) are wired only inside the
+    // LeaderTick branch since they fire on transitions, but the
+    // periodic reconcile_role on every node closes the gap for nodes
+    // that never saw a transition.
+    let my_primary_ip: String =
+        sqlx::query_scalar("SELECT primary_ip FROM computers WHERE id = $1")
+            .bind(computer_id)
+            .fetch_one(&pg_pool)
+            .await
+            .unwrap_or_else(|_| "127.0.0.1".to_string());
+
+    let openclaw = std::sync::Arc::new(ff_agent::openclaw::OpenClawManager::new(
+        pg_pool.clone(),
+        computer_id,
+        my_primary_ip,
+    ));
+
+    // Reconciler — runs on EVERY daemon, every 60s. Reads
+    // fleet_leader_state and ensures local OpenClaw role matches.
+    // Idempotent. Doesn't depend on fleet_members enrollment.
+    let oc_reconciler = openclaw.clone();
+    let oc_reconciler_shutdown = shutdown_rx.clone();
+    handles.push(tokio::spawn(async move {
+        oc_reconciler
+            .run_reconciler(
+                oc_reconciler_shutdown,
+                std::time::Duration::from_secs(60),
+            )
+            .await;
+    }));
+
     // (4) LeaderTick — only when enrolled in fleet_members.
     if enrolled_in_fleet {
         info!(
@@ -1807,41 +1843,6 @@ async fn start_pulse_v2_subsystems(
         );
         let pulse_reader = ff_pulse::reader::PulseReader::new(&redis_url)
             .context("pulse v2: failed to build PulseReader for leader_tick")?;
-
-        // Resolve my primary IP from the computers table — OpenClawManager
-        // needs it to publish the gateway URL on promotion.
-        let my_primary_ip: String =
-            sqlx::query_scalar("SELECT primary_ip FROM computers WHERE id = $1")
-                .bind(computer_id)
-                .fetch_one(&pg_pool)
-                .await
-                .unwrap_or_else(|_| "127.0.0.1".to_string());
-
-        // Build the OpenClaw manager that will be driven by leader-election
-        // callbacks (promote_to_gateway on became-leader, demote_to_node on
-        // lost-leader).
-        let openclaw = std::sync::Arc::new(ff_agent::openclaw::OpenClawManager::new(
-            pg_pool.clone(),
-            computer_id,
-            my_primary_ip,
-        ));
-
-        // Reconciler — closes the gap that LeaderTick callbacks only fire on
-        // state transitions. A node that has been a non-leader its entire
-        // uptime never sees a transition, so its `demote_to_node` callback
-        // never fires and OpenClaw stays unconfigured. The reconciler runs
-        // every minute and ensures the local OpenClaw role matches durable
-        // leader state in `fleet_leader_state`. Idempotent.
-        let oc_reconciler = openclaw.clone();
-        let oc_reconciler_shutdown = shutdown_rx.clone();
-        handles.push(tokio::spawn(async move {
-            oc_reconciler
-                .run_reconciler(
-                    oc_reconciler_shutdown,
-                    std::time::Duration::from_secs(60),
-                )
-                .await;
-        }));
 
         let oc_promote = openclaw.clone();
         let oc_demote = openclaw.clone();
@@ -2096,6 +2097,22 @@ async fn start_pulse_v2_subsystems(
         }
         Err(e) => warn!(error = %e, "alert evaluator: failed to build PulseReader"),
     }
+
+    // (8) Auto-upgrade hourly tick — runs on every daemon, internally
+    // gated on leader + fleet_secrets.auto_upgrade_enabled. Refreshes
+    // upstream versions (npm/pypi/github_release/self_built), flips
+    // drift status, and dispatches upgrade tasks. Without this, version
+    // checking only happens when an operator runs
+    // `ff software auto-upgrade-run-once --force` manually.
+    info!(
+        node = %node_name_for_auto_upgrade,
+        "starting subsystem: auto-upgrade tick (hourly, leader-gated)"
+    );
+    let auto_upgrade_tick = ff_agent::auto_upgrade::AutoUpgradeTick::new(
+        pg_pool_for_auto_upgrade,
+        node_name_for_auto_upgrade,
+    );
+    handles.push(auto_upgrade_tick.spawn(shutdown_rx_for_auto_upgrade));
 
     Ok(handles)
 }

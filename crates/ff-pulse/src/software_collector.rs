@@ -35,6 +35,8 @@ impl SoftwareCollector {
                 "forgefleetd",
                 "forgefleetd_git",
                 "openclaw",
+                "codex",
+                "claude-code",
                 "gh",
                 "op",
                 "rustup",
@@ -161,6 +163,39 @@ impl SoftwareCollector {
                         id: "openclaw".into(),
                         version: ver,
                         install_source: src,
+                        install_path: Some(path),
+                        metadata: None,
+                    });
+                }
+            }
+        }
+
+        // ── codex (@openai/codex) ──────────────────────────────────────
+        // `codex --version` prints e.g. "codex-cli 0.125.0". Regex pulls
+        // the dotted version regardless of the leading word.
+        if let Some(path) = which("codex") {
+            if let Some(raw) = run("codex", &["--version"]) {
+                if let Some(ver) = regex_capture(&raw, r"(\d+\.\d+\.\d+(?:[\w.-]*)?)") {
+                    out.push(InstalledSoftware {
+                        id: "codex".into(),
+                        version: ver,
+                        install_source: Some("npm".to_string()),
+                        install_path: Some(path),
+                        metadata: None,
+                    });
+                }
+            }
+        }
+
+        // ── claude-code (@anthropic-ai/claude-code) ───────────────────
+        // `claude --version` prints e.g. "2.1.119 (Claude Code)".
+        if let Some(path) = which("claude") {
+            if let Some(raw) = run("claude", &["--version"]) {
+                if let Some(ver) = regex_capture(&raw, r"(\d+\.\d+\.\d+(?:[\w.-]*)?)") {
+                    out.push(InstalledSoftware {
+                        id: "claude-code".into(),
+                        version: ver,
+                        install_source: Some("npm".to_string()),
                         install_path: Some(path),
                         metadata: None,
                     });
