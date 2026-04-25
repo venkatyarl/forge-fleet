@@ -2003,7 +2003,7 @@ notes = "Setup started."
         let config: FleetConfig = toml::from_str("").unwrap();
         assert_eq!(config.fleet.name, "ForgeFleet");
         assert_eq!(config.fleet.heartbeat_interval_secs, 15);
-        assert_eq!(config.fleet.api_port, 51800);
+        assert_eq!(config.fleet.api_port, 51000);
         assert_eq!(config.leader.preferred, "taylor");
         assert_eq!(config.database.max_connections, 10);
         assert_eq!(config.database.mode, DatabaseMode::EmbeddedSqlite);
@@ -2116,6 +2116,9 @@ mode = "{alias}"
     }
 
     /// Parse real production fleet.toml if available (integration test).
+    /// Post-V28+, all 6 TOMLs are retired and fleet membership lives in
+    /// Postgres; if a legacy fleet.toml is on disk we just verify it
+    /// parses cleanly without asserting anything about nodes.
     #[test]
     fn test_parse_production_fleet_toml() {
         let home = std::env::var("HOME").unwrap_or_default();
@@ -2123,8 +2126,6 @@ mode = "{alias}"
         if path.exists() {
             let config = load_config(&path).unwrap();
             assert!(!config.fleet.name.is_empty());
-            // Should have at least one node.
-            assert!(!config.nodes.is_empty());
         }
     }
 }

@@ -4375,3 +4375,43 @@ ON CONFLICT (id) DO UPDATE SET
   version_source   = EXCLUDED.version_source,
   upgrade_playbook = EXCLUDED.upgrade_playbook;
 "#;
+
+// ─── V48: upgrade playbook restart-unit fix ─────────────────────────────────
+//
+// V32 added XDG_RUNTIME_DIR to the linux playbooks but kept a single
+// `systemctl --user restart <unit>` at the end of each command. The installed
+// unit on every linux fleet host is `forgefleetd.service`; the unit names used
+// in V32/V33 (`forgefleet-node.service` for forgefleetd_git, `forgefleet-
+// daemon.service` for ff_git) are non-existent on most nodes so the restart
+// step errored silently and the old daemon kept running. Traced as a
+// contributing factor in the 2026-04-22 9-hour outage.
+//
+// Fix: replace the single restart with the revive.rs fallback chain that
+// tries all three known unit names in order. Also re-exports XDG_RUNTIME_DIR
+// with the ${:-} form so it's self-contained even if the earlier export was
+// on a branch that didn't execute.
+//
+// Idempotent: the WHERE guard checks for `reset-failed` which only appears
+// after this migration has applied.
+pub const SCHEMA_V48_UPGRADE_PLAYBOOK_RESTART_FIX: &str = r#"
+UPDATE software_registry
+   SET upgrade_playbook = jsonb_set(
+           jsonb_set(
+               upgrade_playbook,
+               '{linux-ubuntu}',
+               to_jsonb(regexp_replace(
+                   upgrade_playbook->>'linux-ubuntu',
+                   'systemctl --user restart forgefleet-(daemon|node)\.service$',
+                   'export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" && systemctl --user reset-failed forgefleetd.service forgefleet-node.service forgefleet-daemon.service 2>/dev/null; systemctl --user restart forgefleetd.service || systemctl --user restart forgefleet-node.service || systemctl --user restart forgefleet-daemon.service'
+               ))
+           ),
+           '{linux-dgx}',
+           to_jsonb(regexp_replace(
+               upgrade_playbook->>'linux-dgx',
+               'systemctl --user restart forgefleet-(daemon|node)\.service$',
+               'export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" && systemctl --user reset-failed forgefleetd.service forgefleet-node.service forgefleet-daemon.service 2>/dev/null; systemctl --user restart forgefleetd.service || systemctl --user restart forgefleet-node.service || systemctl --user restart forgefleet-daemon.service'
+           ))
+       )
+ WHERE id IN ('ff_git', 'forgefleetd_git')
+   AND upgrade_playbook->>'linux-ubuntu' NOT LIKE '%reset-failed%';
+"#;

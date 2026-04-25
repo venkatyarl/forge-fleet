@@ -346,7 +346,9 @@ impl AgentTool for SelfHealTool {
             match crate::fleet_info::fetch_nodes().await {
                 Ok(rows) => rows.into_iter().map(|r| (r.name, r.ip)).collect(),
                 Err(e) => {
-                    return AgentToolResult::err(format!("Failed to load fleet from database: {e}"));
+                    return AgentToolResult::err(format!(
+                        "Failed to load fleet from database: {e}"
+                    ));
                 }
             }
         };

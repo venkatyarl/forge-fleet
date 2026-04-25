@@ -377,6 +377,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "fabric_measurements_and_docker",
         sql: schema::SCHEMA_V47_FABRIC_MEASUREMENTS_AND_DOCKER,
     },
+    PgMigration {
+        version: 48,
+        name: "upgrade_playbook_restart_fix",
+        sql: schema::SCHEMA_V48_UPGRADE_PLAYBOOK_RESTART_FIX,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.

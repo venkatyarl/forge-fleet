@@ -168,6 +168,9 @@ mod tests {
             iface: "en0".into(),
             ip: "192.168.5.100".into(),
             kind: "v4".into(),
+            paired_with: None,
+            link_speed_gbps: None,
+            medium: None,
         }];
         b
     }
