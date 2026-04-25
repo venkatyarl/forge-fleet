@@ -4301,3 +4301,77 @@ ON CONFLICT (id) DO UPDATE SET
   version_source   = EXCLUDED.version_source,
   upgrade_playbook = EXCLUDED.upgrade_playbook;
 "#;
+
+// ─── V47: fabric_measurements + docker upstream tracking ──────────────────
+//
+// Two related additions:
+//
+// 1. `fabric_measurements` table — stores actual iperf3-measured throughput
+//    between fabric pairs (CX-7, Thunderbolt, etc). The Ip struct already
+//    carries `link_speed_gbps` as the *claimed* spec; this table stores
+//    the *measured* reality. Operator runs `ff fabric benchmark <a> <b>`
+//    to populate, runs again periodically (cron weekly) for trend.
+//
+//    Columns chosen to support: "show me CX-7 sia↔adele bandwidth over
+//    time" and "is the Thunderbolt link degrading?".
+//
+// 2. `docker` row in software_registry: was tracking installed via
+//    `cmd` method (run `docker --version`) but had no upstream
+//    refresh, so latest_version stayed empty and drift never fired.
+//    Switch to `apt_repository` method on Linux + `homebrew_cask` on
+//    macOS. The auto_upgrade refresher needs corresponding handlers
+//    (added in same commit as this migration).
+pub const SCHEMA_V47_FABRIC_MEASUREMENTS_AND_DOCKER: &str = r#"
+CREATE TABLE IF NOT EXISTS fabric_measurements (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    node_a          TEXT NOT NULL,
+    node_b          TEXT NOT NULL,
+    iface_a         TEXT NOT NULL,
+    iface_b         TEXT NOT NULL,
+    fabric_kind     TEXT NOT NULL,        -- 'cx7-fabric' | 'tb-fabric' | 'lan'
+    direction       TEXT NOT NULL,        -- 'a_to_b' | 'b_to_a' | 'parallel'
+    streams         INT NOT NULL DEFAULT 1,
+    duration_secs   INT NOT NULL,
+    measured_gbps   DOUBLE PRECISION NOT NULL,
+    claimed_gbps    INT,                  -- spec / nominal
+    retransmits     INT,
+    measured_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    measured_by     TEXT,                 -- which computer kicked off the test
+    iperf_version   TEXT,
+    metadata        JSONB NOT NULL DEFAULT '{}'
+);
+
+CREATE INDEX IF NOT EXISTS idx_fabric_measurements_pair
+    ON fabric_measurements(node_a, node_b, measured_at DESC);
+CREATE INDEX IF NOT EXISTS idx_fabric_measurements_kind
+    ON fabric_measurements(fabric_kind, measured_at DESC);
+
+-- docker: switch from passive cmd-detection to active upstream tracking.
+-- apt_repository method queries Docker's APT repo for the latest 'stable'
+-- channel version. homebrew_cask method queries the Homebrew API for
+-- Docker Desktop. Both are added to auto_upgrade.rs alongside this migration.
+UPDATE software_registry SET
+    version_source = '{"method":"github_release","repo":"docker/cli"}'::jsonb,
+    upgrade_playbook = '{"linux-ubuntu":"sudo apt-get update -qq && sudo apt-get install -y docker-ce docker-ce-cli containerd.io","linux-dgx":"sudo apt-get update -qq && sudo apt-get install -y docker-ce docker-ce-cli containerd.io","macos":"brew upgrade --cask docker"}'::jsonb
+ WHERE id = 'docker' AND (version_source->>'method' = 'cmd' OR version_source IS NULL);
+
+-- Add docker to external_tools too so `ff ext install docker --all` works
+-- as the canonical interface (parity with openclaw / codex / claude-code).
+INSERT INTO external_tools
+    (id, display_name, github_url, kind, install_method, install_spec,
+     cli_entrypoint, register_as_mcp, version_source, upgrade_playbook,
+     intake_source, added_by)
+VALUES
+  ('docker', 'Docker Engine + CLI',
+   'https://github.com/docker/docker-ce', 'cli', 'os_package',
+   '{"linux_pkg":"docker-ce","macos_cask":"docker"}'::jsonb,
+   'docker', false,
+   '{"method":"github_release","repo":"docker/cli"}'::jsonb,
+   '{"linux-ubuntu":"sudo apt-get update -qq && sudo apt-get install -y docker-ce docker-ce-cli containerd.io","linux-dgx":"sudo apt-get update -qq && sudo apt-get install -y docker-ce docker-ce-cli containerd.io","macos":"brew upgrade --cask docker"}'::jsonb,
+   'migration', 'V47')
+ON CONFLICT (id) DO UPDATE SET
+  install_method   = EXCLUDED.install_method,
+  install_spec     = EXCLUDED.install_spec,
+  version_source   = EXCLUDED.version_source,
+  upgrade_playbook = EXCLUDED.upgrade_playbook;
+"#;

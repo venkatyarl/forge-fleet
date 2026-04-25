@@ -372,6 +372,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "npm_cli_catalog",
         sql: schema::SCHEMA_V46_NPM_CLI_CATALOG,
     },
+    PgMigration {
+        version: 47,
+        name: "fabric_measurements_and_docker",
+        sql: schema::SCHEMA_V47_FABRIC_MEASUREMENTS_AND_DOCKER,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.

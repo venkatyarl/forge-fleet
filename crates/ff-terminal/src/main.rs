@@ -289,9 +289,36 @@ enum FabricCommand {
         a: String,
         /// Second computer name.
         b: String,
-        /// Fabric kind: cx7-200g | cx7-400g | ib-100g | roce-100g.
+        /// Fabric kind: cx7-200g | cx7-400g | ib-100g | roce-100g | tb3 | tb4 | tb5.
         #[arg(long, default_value = "cx7-200g")]
         kind: String,
+    },
+    /// Run iperf3 across a fabric pair and record measured throughput.
+    /// Stores into `fabric_measurements` table for trend tracking.
+    /// Both directions tested by default; pass `--reverse` for B→A only.
+    Benchmark {
+        /// First computer name (iperf3 client).
+        a: String,
+        /// Second computer name (iperf3 server).
+        b: String,
+        /// Test duration in seconds (default 30).
+        #[arg(long, default_value = "30")]
+        duration: u32,
+        /// Number of parallel streams (default 1).
+        #[arg(long, default_value = "1")]
+        streams: u32,
+        /// Skip A→B direction.
+        #[arg(long)]
+        reverse_only: bool,
+    },
+    /// Show fabric measurements (trend over time).
+    Measurements {
+        /// Filter by node pair.
+        #[arg(long)] a: Option<String>,
+        #[arg(long)] b: Option<String>,
+        /// How many recent rows to show.
+        #[arg(long, default_value = "20")]
+        limit: i64,
     },
 }
 
@@ -1599,6 +1626,12 @@ async fn main() -> Result<()> {
             match command {
                 FabricCommand::Pair { a, b, kind } => {
                     fabric_cmd::handle_fabric_pair(&pool, &a, &b, &kind).await
+                }
+                FabricCommand::Benchmark { a, b, duration, streams, reverse_only } => {
+                    fabric_cmd::handle_fabric_benchmark(&pool, &a, &b, duration, streams, reverse_only).await
+                }
+                FabricCommand::Measurements { a, b, limit } => {
+                    fabric_cmd::handle_fabric_measurements(&pool, a.as_deref(), b.as_deref(), limit).await
                 }
             }
         }

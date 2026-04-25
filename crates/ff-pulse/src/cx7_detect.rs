@@ -35,15 +35,22 @@ pub fn link_speed_gbps(iface: &str) -> Option<u32> {
     None
 }
 
-/// Look up the paired-peer name for a fabric IP. Uses the DGX CX-7 pair map
-/// from `reference_dgx_connectx7_pairs.md` as a fallback. Eventually should
-/// consult the `fabric_pairs` table for operator-configured pairings.
+/// Look up the paired-peer name for a fabric IP. Uses static maps for
+/// known pairs; eventually should consult the `fabric_pairs` table for
+/// operator-configured pairings.
+///
+/// Pairs (subnet → endpoints):
+///   10.42.0.0/24  CX-7      sia ↔ adele
+///   10.43.0.0/24  CX-7      rihanna ↔ beyonce
+///   10.44.0.0/24  TB-3      taylor ↔ james
 pub fn paired_peer_for(my_name: &str) -> Option<String> {
     let map: &[(&str, &str)] = &[
         ("sia", "adele"),
         ("adele", "sia"),
         ("rihanna", "beyonce"),
         ("beyonce", "rihanna"),
+        ("taylor", "james"),
+        ("james", "taylor"),
     ];
     for (a, b) in map {
         if my_name.eq_ignore_ascii_case(a) {
@@ -53,11 +60,22 @@ pub fn paired_peer_for(my_name: &str) -> Option<String> {
     None
 }
 
-/// Enrich an Ip entry with fabric metadata if its interface is mlx5_core.
+/// Enrich an Ip entry with fabric metadata. Handles two fabric types:
+/// - CX-7 (mlx5_core driver) → `cx7-fabric` kind, ethtool speed
+/// - Thunderbolt (10.44.x or `medium=thunderbolt`) → `tb-fabric` kind,
+///   already classified upstream by classify_iface; this just fills
+///   paired_with based on the computer's name.
 pub fn enrich_ip(ip: &mut Ip, my_computer_name: &str) {
+    // CX-7: detected by driver. Overrides kind to cx7-fabric.
     if let Some(kind) = detect_fabric_kind(&ip.iface) {
         ip.kind = kind;
         ip.paired_with = paired_peer_for(my_computer_name);
         ip.link_speed_gbps = link_speed_gbps(&ip.iface);
+        return;
+    }
+    // Thunderbolt: kind=tb-fabric was set upstream by classify_iface for
+    // 10.44.x IPs. Fill paired_with from the static map.
+    if ip.kind == "tb-fabric" {
+        ip.paired_with = paired_peer_for(my_computer_name);
     }
 }
