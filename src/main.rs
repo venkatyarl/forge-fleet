@@ -1826,6 +1826,23 @@ async fn start_pulse_v2_subsystems(
             my_primary_ip,
         ));
 
+        // Reconciler — closes the gap that LeaderTick callbacks only fire on
+        // state transitions. A node that has been a non-leader its entire
+        // uptime never sees a transition, so its `demote_to_node` callback
+        // never fires and OpenClaw stays unconfigured. The reconciler runs
+        // every minute and ensures the local OpenClaw role matches durable
+        // leader state in `fleet_leader_state`. Idempotent.
+        let oc_reconciler = openclaw.clone();
+        let oc_reconciler_shutdown = shutdown_rx.clone();
+        handles.push(tokio::spawn(async move {
+            oc_reconciler
+                .run_reconciler(
+                    oc_reconciler_shutdown,
+                    std::time::Duration::from_secs(60),
+                )
+                .await;
+        }));
+
         let oc_promote = openclaw.clone();
         let oc_demote = openclaw.clone();
         let pool_for_url = pg_pool.clone();

@@ -278,6 +278,89 @@ impl OpenClawManager {
         info!(leader_url, "openclaw: demoted to node");
         Ok(())
     }
+
+    /// Reconcile this machine's OpenClaw role against the durable leader
+    /// state in `fleet_leader_state`. Idempotent and safe to call on a
+    /// timer.
+    ///
+    /// Why this exists: `LeaderTick` only fires `on_became_leader` /
+    /// `on_lost_leader` on **state transitions**. A node that has been a
+    /// non-leader its entire uptime never sees a transition, so its
+    /// `demote_to_node` callback never fires and its OpenClaw role stays
+    /// whatever it was last manually configured (often: nothing).
+    ///
+    /// `reconcile_role` closes the gap: read the durable leader, compare
+    /// to `self`, and ensure the underlying mode matches. Both
+    /// `promote_to_gateway` and `demote_to_node` already no-op when the
+    /// DB row matches the desired mode, so calling this every minute is
+    /// cheap.
+    pub async fn reconcile_role(&self) -> Result<(), OpenClawError> {
+        let leader: Option<(uuid::Uuid, String)> = sqlx::query_as(
+            "SELECT computer_id, member_name FROM fleet_leader_state LIMIT 1",
+        )
+        .fetch_optional(&self.pg)
+        .await?;
+
+        match leader {
+            None => {
+                tracing::debug!("openclaw: reconcile skipped — no durable leader yet");
+                Ok(())
+            }
+            Some((leader_id, _)) if leader_id == self.my_computer_id => {
+                self.promote_to_gateway(None).await
+            }
+            Some((_, leader_name)) => {
+                let url: Option<(String,)> = sqlx::query_as(
+                    "SELECT primary_ip FROM computers WHERE name = $1",
+                )
+                .bind(&leader_name)
+                .fetch_optional(&self.pg)
+                .await?;
+                let Some((leader_ip,)) = url else {
+                    tracing::warn!(
+                        leader = %leader_name,
+                        "openclaw: reconcile can't resolve leader IP"
+                    );
+                    return Ok(());
+                };
+                let url = format!("ws://{leader_ip}:50000");
+                self.demote_to_node(&url).await
+            }
+        }
+    }
+
+    /// Run `reconcile_role` on a timer until shutdown. Spawned from
+    /// `forgefleetd` startup.
+    pub async fn run_reconciler(
+        self: std::sync::Arc<Self>,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+        interval: std::time::Duration,
+    ) {
+        info!(?interval, "openclaw: role reconciler started");
+        let mut tick = tokio::time::interval(interval);
+        // Skip the immediate fire — first tick happens after `interval`.
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Do an initial reconcile so a freshly-booted worker doesn't sit
+        // unconfigured for the first interval.
+        if let Err(e) = self.reconcile_role().await {
+            warn!(error = %e, "openclaw: initial reconcile failed");
+        }
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {
+                    if let Err(e) = self.reconcile_role().await {
+                        warn!(error = %e, "openclaw: reconcile_role failed");
+                    }
+                }
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        info!("openclaw: role reconciler shutting down");
+                        break;
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Read the currently-published gateway URL from `fleet_secrets`. Returns

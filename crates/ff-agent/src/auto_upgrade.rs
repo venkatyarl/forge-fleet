@@ -406,9 +406,18 @@ impl AutoUpgradeTick {
         // auto-upgrade tick — one SQL UPDATE per row. If leader's row just flipped,
         // the next line (drift check) will see upgrade_available immediately.
         let _ = refresh_self_built_latest_versions(&self.pool).await;
+        // npm-distributed tools (openclaw, codex, context-mode, …): query
+        // registry.npmjs.org/<pkg>/latest. Same-tick refresh for parity with
+        // self_built — without this, npm releases sit unnoticed indefinitely.
+        let _ = refresh_npm_registry_latest_versions(&self.pool).await;
+        // PyPI-distributed (vllm, mlx_lm, …) and GitHub-released (gh, etc.)
+        // follow the same shape, different upstream URL.
+        let _ = refresh_pypi_latest_versions(&self.pool).await;
+        let _ = refresh_github_release_latest_versions(&self.pool).await;
         // Then: flip computer_software.status = 'upgrade_available' for any row
         // where installed_version != latest_version and status is currently 'ok'.
-        let _ = flip_self_built_drift_status(&self.pool).await;
+        // Generic across all methods.
+        let _ = flip_drift_status(&self.pool).await;
 
         let ids = software_ids_with_drift(&self.pool).await?;
         if ids.is_empty() {
@@ -577,19 +586,20 @@ async fn refresh_self_built_latest_versions(pool: &PgPool) -> Result<u64> {
     Ok(res.rows_affected())
 }
 
-/// For every self_built computer_software row where installed_version differs
-/// from software_registry.latest_version AND status is currently 'ok', flip to
-/// 'upgrade_available' so the drift query picks it up. Runs after
-/// [`refresh_self_built_latest_versions`] so `latest_version` is current.
-async fn flip_self_built_drift_status(pool: &PgPool) -> Result<u64> {
+/// For every computer_software row where installed_version differs from
+/// software_registry.latest_version AND status is currently 'ok', flip to
+/// 'upgrade_available' so the drift query picks it up. Runs after the
+/// per-method refresh fns so `latest_version` is current. Method-agnostic —
+/// handles self_built, npm_registry, pypi, github_release, etc. uniformly.
+async fn flip_drift_status(pool: &PgPool) -> Result<u64> {
     let res = sqlx::query(
         r#"
         UPDATE computer_software cs
            SET status = 'upgrade_available'
           FROM software_registry sr
          WHERE sr.id = cs.software_id
-           AND sr.version_source->>'method' = 'self_built'
            AND sr.latest_version IS NOT NULL
+           AND sr.latest_version <> ''
            AND cs.installed_version IS NOT NULL
            AND cs.installed_version <> sr.latest_version
            AND cs.status = 'ok'
@@ -597,6 +607,164 @@ async fn flip_self_built_drift_status(pool: &PgPool) -> Result<u64> {
     )
     .execute(pool)
     .await
-    .context("flip self_built drift status")?;
+    .context("flip drift status")?;
     Ok(res.rows_affected())
+}
+
+/// For every `software_registry` row with `version_source.method='npm_registry'`,
+/// query `https://registry.npmjs.org/<package>/latest` and write the returned
+/// `version` field into `software_registry.latest_version`. Soft-fail per row
+/// — a single registry hiccup must not poison the whole tick. The HTTP layer
+/// honors a 5s timeout to keep the auto-upgrade tick bounded.
+async fn refresh_npm_registry_latest_versions(pool: &PgPool) -> Result<u64> {
+    refresh_via_http(
+        pool,
+        "npm_registry",
+        |vs| {
+            let pkg = vs.get("package")?.as_str()?;
+            Some(format!("https://registry.npmjs.org/{pkg}/latest"))
+        },
+        |body| {
+            let v: serde_json::Value = serde_json::from_str(body).ok()?;
+            v.get("version")?.as_str().map(str::to_string)
+        },
+    )
+    .await
+}
+
+/// PyPI version refresh. `version_source = {"method":"pypi","package":"vllm"}`.
+async fn refresh_pypi_latest_versions(pool: &PgPool) -> Result<u64> {
+    refresh_via_http(
+        pool,
+        "pypi",
+        |vs| {
+            let pkg = vs.get("package")?.as_str()?;
+            Some(format!("https://pypi.org/pypi/{pkg}/json"))
+        },
+        |body| {
+            let v: serde_json::Value = serde_json::from_str(body).ok()?;
+            v.get("info")?.get("version")?.as_str().map(str::to_string)
+        },
+    )
+    .await
+}
+
+/// GitHub release tag refresh.
+/// `version_source = {"method":"github_release","repo":"cli/cli"}`.
+/// Strips a leading 'v' from the tag (v2.91.0 → 2.91.0) so versions match
+/// `--version` outputs.
+async fn refresh_github_release_latest_versions(pool: &PgPool) -> Result<u64> {
+    refresh_via_http(
+        pool,
+        "github_release",
+        |vs| {
+            let repo = vs.get("repo")?.as_str()?;
+            Some(format!("https://api.github.com/repos/{repo}/releases/latest"))
+        },
+        |body| {
+            let v: serde_json::Value = serde_json::from_str(body).ok()?;
+            let tag = v.get("tag_name")?.as_str()?;
+            Some(tag.strip_prefix('v').unwrap_or(tag).to_string())
+        },
+    )
+    .await
+}
+
+/// Shared HTTP-based refresher. Walks every software_registry row whose
+/// `version_source.method` matches `method`, builds a URL via `url_for`,
+/// fetches it, parses the response with `extract_version`, and writes the
+/// result. Per-row failures are logged at debug and skipped.
+async fn refresh_via_http<UrlFn, ParseFn>(
+    pool: &PgPool,
+    method: &str,
+    url_for: UrlFn,
+    extract_version: ParseFn,
+) -> Result<u64>
+where
+    UrlFn: Fn(&serde_json::Value) -> Option<String>,
+    ParseFn: Fn(&str) -> Option<String>,
+{
+    let rows: Vec<(String, serde_json::Value)> = sqlx::query_as(
+        r#"
+        SELECT id, version_source
+          FROM software_registry
+         WHERE version_source->>'method' = $1
+        "#,
+    )
+    .bind(method)
+    .fetch_all(pool)
+    .await
+    .with_context(|| format!("list software_registry for method={method}"))?;
+
+    if rows.is_empty() {
+        return Ok(0);
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .user_agent("forgefleetd/auto-upgrade")
+        .build()
+        .context("build reqwest client for upstream version refresh")?;
+
+    let mut updated = 0u64;
+    for (id, vs) in rows {
+        let url = match url_for(&vs) {
+            Some(u) => u,
+            None => {
+                tracing::debug!(software_id = %id, method, "skipping: version_source missing required field");
+                continue;
+            }
+        };
+        let body = match client.get(&url).send().await {
+            Ok(r) if r.status().is_success() => match r.text().await {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::debug!(software_id = %id, %url, error = %e, "upstream body read failed");
+                    continue;
+                }
+            },
+            Ok(r) => {
+                tracing::debug!(software_id = %id, %url, status = %r.status(), "upstream non-2xx");
+                continue;
+            }
+            Err(e) => {
+                tracing::debug!(software_id = %id, %url, error = %e, "upstream fetch failed");
+                continue;
+            }
+        };
+        let version = match extract_version(&body) {
+            Some(v) if !v.is_empty() => v,
+            _ => {
+                tracing::debug!(software_id = %id, %url, "upstream response missing version field");
+                continue;
+            }
+        };
+        let res = sqlx::query(
+            r#"
+            UPDATE software_registry
+               SET latest_version    = $2,
+                   latest_version_at = NOW()
+             WHERE id = $1
+               AND (latest_version IS NULL OR latest_version <> $2)
+            "#,
+        )
+        .bind(&id)
+        .bind(&version)
+        .execute(pool)
+        .await;
+        match res {
+            Ok(r) if r.rows_affected() > 0 => {
+                tracing::info!(
+                    software_id = %id,
+                    method,
+                    version = %version,
+                    "upstream version refreshed"
+                );
+                updated += 1;
+            }
+            Ok(_) => { /* unchanged */ }
+            Err(e) => tracing::warn!(software_id = %id, error = %e, "registry update failed"),
+        }
+    }
+    Ok(updated)
 }
