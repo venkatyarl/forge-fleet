@@ -90,13 +90,27 @@ pub async fn handle_fabric_benchmark(
 
     let a_target = format!("{}@{}", a_meta.ssh_user, a_meta.ip);
     let b_target = format!("{}@{}", b_meta.ssh_user, b_meta.ip);
+    let me = ff_agent::fleet_info::resolve_this_node_name().await;
+    let a_is_me = me.eq_ignore_ascii_case(a);
+    let b_is_me = me.eq_ignore_ascii_case(b);
+
+    // run_remote_or_local: if `target` matches my node name, run locally
+    // (skip SSH); otherwise SSH. Avoids "Connection closed by self" when
+    // the operator runs benchmark from one of the endpoints.
+    let run_or_local = |is_me: bool, target: &str, cmd: &str| -> std::io::Result<std::process::Output> {
+        if is_me {
+            StdCommand::new("sh").args(["-c", cmd]).output()
+        } else {
+            StdCommand::new("ssh")
+                .args(["-o", "BatchMode=yes", target, cmd])
+                .output()
+        }
+    };
 
     // 3. Start iperf3 -s on b in background.
     println!("Starting iperf3 server on {}...", b);
-    let _ = StdCommand::new("ssh")
-        .args(["-o", "BatchMode=yes", &b_target,
-               "pkill iperf3 2>/dev/null; iperf3 -s -D --logfile /tmp/iperf3.log"])
-        .status();
+    let _ = run_or_local(b_is_me, &b_target,
+        "pkill iperf3 2>/dev/null; iperf3 -s -D --logfile /tmp/iperf3.log");
     std::thread::sleep(std::time::Duration::from_millis(800));
 
     let mut measurements: Vec<(String, f64, Option<i32>)> = Vec::new();
@@ -109,10 +123,8 @@ pub async fn handle_fabric_benchmark(
             "iperf3 -c {} -t {} -P {} -J",
             b_fabric_ip, duration, streams
         );
-        let out = StdCommand::new("ssh")
-            .args(["-o", "BatchMode=yes", &a_target, &cmd])
-            .output()
-            .context("ssh-iperf3 forward failed")?;
+        let out = run_or_local(a_is_me, &a_target, &cmd)
+            .context("iperf3 forward failed")?;
         let body = String::from_utf8_lossy(&out.stdout);
         let (gbps, retr) = parse_iperf3_json(&body);
         if gbps > 0.0 {
@@ -131,10 +143,8 @@ pub async fn handle_fabric_benchmark(
         "iperf3 -c {} -t {} -P {} -R -J",
         b_fabric_ip, duration, streams
     );
-    let out = StdCommand::new("ssh")
-        .args(["-o", "BatchMode=yes", &a_target, &cmd])
-        .output()
-        .context("ssh-iperf3 reverse failed")?;
+    let out = run_or_local(a_is_me, &a_target, &cmd)
+        .context("iperf3 reverse failed")?;
     let body = String::from_utf8_lossy(&out.stdout);
     let (gbps, retr) = parse_iperf3_json(&body);
     if gbps > 0.0 {
@@ -146,9 +156,7 @@ pub async fn handle_fabric_benchmark(
     }
 
     // 6. Stop iperf3 server.
-    let _ = StdCommand::new("ssh")
-        .args(["-o", "BatchMode=yes", &b_target, "pkill iperf3 2>/dev/null"])
-        .status();
+    let _ = run_or_local(b_is_me, &b_target, "pkill iperf3 2>/dev/null");
 
     // 7. Record measurements.
     let measured_by = ff_agent::fleet_info::resolve_this_node_name().await;
