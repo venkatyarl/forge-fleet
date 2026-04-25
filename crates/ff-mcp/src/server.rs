@@ -197,7 +197,8 @@ impl McpServer {
         id: Option<Value>,
         params: Option<Value>,
     ) -> JsonRpcResponse {
-        let result = if self.registry.contains(method) {
+        let known_locally = self.registry.contains(method);
+        let result = if known_locally {
             handlers::dispatch(method, params.clone()).await
         } else {
             self.try_federated_tool_call(method, params.clone()).await
@@ -206,8 +207,13 @@ impl McpServer {
         match result {
             Ok(result) => JsonRpcResponse::success(id, result),
             Err(e) => {
-                warn!(method, error = %e, "unknown MCP method");
-                if e.contains("not found") {
+                warn!(method, error = %e, "MCP method failed");
+                // Methods not in our registry that also can't be served via
+                // federation are METHOD_NOT_FOUND regardless of *why*
+                // federation declined (no targets, target unreachable,
+                // target doesn't expose this name). INTERNAL_ERROR is
+                // reserved for genuine handler failures.
+                if !known_locally {
                     JsonRpcResponse::error(id, JsonRpcError::method_not_found(method))
                 } else {
                     JsonRpcResponse::error(id, JsonRpcError::internal_error(e))
