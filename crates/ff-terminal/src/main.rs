@@ -9206,7 +9206,7 @@ async fn handle_auto_upgrade_run_once(pool: &sqlx::PgPool, force: bool) -> Resul
     );
     let tick = ff_agent::auto_upgrade::AutoUpgradeTick::new(pool.clone(), worker);
     let enqueued = tick
-        .run_once()
+        .run_once(force)
         .await
         .map_err(|e| anyhow::anyhow!("auto_upgrade run_once: {e}"))?;
     println!("{GREEN}✓ dispatched {enqueued} upgrade task(s){RESET}");

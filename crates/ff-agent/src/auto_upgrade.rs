@@ -388,11 +388,14 @@ impl AutoUpgradeTick {
     }
 
     /// One tick: gate, find drift, enqueue.
-    pub async fn run_once(&self) -> Result<usize> {
+    ///
+    /// Pass `force = true` to bypass the `auto_upgrade_enabled` secret gate.
+    /// The leader check is never bypassed — run this on the leader.
+    pub async fn run_once(&self, force: bool) -> Result<usize> {
         if !is_leader(&self.pool, &self.my_name).await {
             return Ok(0);
         }
-        if !is_enabled(&self.pool).await {
+        if !force && !is_enabled(&self.pool).await {
             tracing::debug!(
                 "auto-upgrade disabled (fleet_secrets.auto_upgrade_enabled not truthy)"
             );
@@ -547,7 +550,7 @@ impl AutoUpgradeTick {
             }
 
             loop {
-                match self.run_once().await {
+                match self.run_once(false).await {
                     Ok(n) if n > 0 => tracing::info!(dispatched = n, "auto-upgrade tick"),
                     Ok(_) => tracing::debug!("auto-upgrade tick: nothing to do"),
                     Err(e) => tracing::warn!(error = %e, "auto-upgrade tick failed"),
