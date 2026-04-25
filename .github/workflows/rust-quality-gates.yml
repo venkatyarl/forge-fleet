@@ -16,8 +16,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Install Rust 1.85.0
-        uses: dtolnay/rust-toolchain@1.85.0
+      - name: Install Rust 1.88.0
+        uses: dtolnay/rust-toolchain@1.88.0
         with:
           components: rustfmt
       - name: Run formatter check
@@ -29,8 +29,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Install Rust 1.85.0
-        uses: dtolnay/rust-toolchain@1.85.0
+      - name: Install Rust 1.88.0
+        uses: dtolnay/rust-toolchain@1.88.0
         with:
           components: clippy
       - name: Run clippy
@@ -42,8 +42,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Install Rust 1.85.0
-        uses: dtolnay/rust-toolchain@1.85.0
+      - name: Install Rust 1.88.0
+        uses: dtolnay/rust-toolchain@1.88.0
       - name: Compile workspace
         run: cargo check --workspace
 
@@ -53,7 +53,7 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Install Rust 1.85.0
-        uses: dtolnay/rust-toolchain@1.85.0
+      - name: Install Rust 1.88.0
+        uses: dtolnay/rust-toolchain@1.88.0
       - name: Run library tests
         run: cargo test --workspace --lib
