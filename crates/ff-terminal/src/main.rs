@@ -3889,12 +3889,15 @@ async fn handle_status_inner(p: PathBuf) -> Result<()> {
     .await;
     let pool_opt: Option<sqlx::PgPool> = match pool_res {
         Ok(Ok(pool)) => {
-            // Count applied migrations.
-            let migs: Option<i64> =
-                sqlx::query_scalar::<_, i64>("SELECT COUNT(*)::bigint FROM _migrations")
-                    .fetch_one(&pool)
-                    .await
-                    .ok();
+            // Report the highest applied version number, not a row count.
+            // COUNT(*) would return 39 on a V45 DB because Postgres migrations
+            // start at V7 (V1-V6 are SQLite-only), giving 39 rows for 45 versions.
+            let migs: Option<i64> = sqlx::query_scalar::<_, i64>(
+                "SELECT COALESCE(MAX(version),0)::bigint FROM _migrations",
+            )
+            .fetch_one(&pool)
+            .await
+            .ok();
             match migs {
                 Some(n) => println!("{GREEN}✓ connected{RESET} ({n} migrations applied)"),
                 None => println!("{GREEN}✓ connected{RESET} (migrations table missing)"),
