@@ -1757,14 +1757,19 @@ async fn start_pulse_v2_subsystems(
     let pg_pool_for_metrics = pg_pool.clone();
     let pg_pool_for_alerts = pg_pool.clone();
     let pg_pool_for_auto_upgrade = pg_pool.clone();
+    let pg_pool_for_task_runner = pg_pool.clone();
+    let pg_pool_for_task_watchdog = pg_pool.clone();
     let shutdown_rx_for_metrics = shutdown_rx.clone();
     let shutdown_rx_for_alerts = shutdown_rx.clone();
     let shutdown_rx_for_auto_upgrade = shutdown_rx.clone();
+    let shutdown_rx_for_task_runner = shutdown_rx.clone();
+    let shutdown_rx_for_task_watchdog = shutdown_rx.clone();
     let redis_url_for_metrics = redis_url.clone();
     let redis_url_for_alerts = redis_url.clone();
     let node_name_for_metrics = node_name.clone();
     let node_name_for_alerts = node_name.clone();
     let node_name_for_auto_upgrade = node_name.clone();
+    let node_name_for_task_runner = node_name.clone();
 
     // Build the redis::Client once — both publisher and materializer need one.
     let redis_client =
@@ -2110,6 +2115,104 @@ async fn start_pulse_v2_subsystems(
         node_name_for_auto_upgrade,
     );
     handles.push(auto_upgrade_tick.spawn(shutdown_rx_for_auto_upgrade));
+
+    // (9) fleet_tasks worker — every daemon polls fleet_tasks for shell
+    // payloads whose `requires_capability` ⊆ this computer's set, claims
+    // via SKIP LOCKED, and runs them. Cooperative work-stealing across
+    // the fleet. Capabilities derived below from os_family + name +
+    // local probes for redis-cli / hf-cli / etc.
+    info!(
+        node = %node_name_for_task_runner,
+        "starting subsystem: fleet_tasks worker (every 10s)"
+    );
+    {
+        let pool = pg_pool_for_task_runner.clone();
+        let name = node_name_for_task_runner.clone();
+        let shutdown = shutdown_rx_for_task_runner;
+        tokio::spawn(async move {
+            // Look up our computer_id + capabilities once.
+            let row: Option<(uuid::Uuid, String, Option<String>)> = sqlx::query_as(
+                "SELECT id, COALESCE(os_family, 'unknown') as os_family, name \
+                 FROM computers WHERE name = $1",
+            )
+            .bind(&name)
+            .fetch_optional(&pool)
+            .await
+            .ok()
+            .flatten();
+            let Some((my_id, os_family, _)) = row else {
+                warn!(node = %name, "task_runner: no computers row, worker disabled");
+                return;
+            };
+            let mut caps: std::collections::HashSet<String> = std::collections::HashSet::new();
+            caps.insert(os_family.clone());
+            caps.insert(name.clone());
+            // Cross-cutting capability flags. Detected by looking for
+            // the binary on $PATH; cheap, runs once per daemon start.
+            for tool in [
+                "redis-cli",
+                "hf",
+                "ssh",
+                "iperf3",
+                "nc",
+                "curl",
+                "git",
+                "ff",
+            ] {
+                let out = std::process::Command::new("/bin/sh")
+                    .arg("-lc")
+                    .arg(format!("command -v {tool} >/dev/null 2>&1"))
+                    .status();
+                if matches!(out, Ok(s) if s.success()) {
+                    caps.insert(tool.to_string());
+                }
+            }
+            // Leader gets a separate tag — composers can reserve work
+            // that only the elected leader should run (e.g. coordinated
+            // bootstraps).
+            let is_leader: Option<String> =
+                sqlx::query_scalar("SELECT member_name FROM fleet_leader_state LIMIT 1")
+                    .fetch_optional(&pool)
+                    .await
+                    .ok()
+                    .flatten();
+            if let Some(l) = is_leader {
+                if l.eq_ignore_ascii_case(&name) {
+                    caps.insert("leader".to_string());
+                }
+            }
+            // FF_* env bag (FF_NODE, FF_SOURCE_TREE, FF_LEADER_NAME,
+            // FF_GATEWAY_URL, …) — resolved from the DB so shell tasks
+            // never have to embed IPs / paths / users in source.
+            let task_env =
+                match ff_agent::task_runner::TaskRunner::resolve_env_from_db(&pool, &name).await {
+                    Ok(e) => e,
+                    Err(e) => {
+                        warn!(node = %name, error = %e, "task_runner: env resolve failed");
+                        Vec::new()
+                    }
+                };
+            info!(
+                node = %name,
+                computer_id = %my_id,
+                capabilities = ?caps,
+                env_keys = ?task_env.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+                "task_runner ready"
+            );
+            let runner = ff_agent::task_runner::TaskRunner::new(pool, my_id, name, caps, task_env);
+            let _ = runner.spawn(10, shutdown).await;
+        });
+    }
+
+    // (10) fleet_tasks watchdog — gated internally on is_leader.
+    // Re-queues stalled `running` tasks whose worker has gone quiet
+    // for >120s, eventually marking them `failed` after MAX_HANDOFFS.
+    info!("starting subsystem: fleet_tasks leader watchdog (every 60s)");
+    handles.push(ff_agent::task_runner::spawn_leader_watchdog(
+        pg_pool_for_task_watchdog,
+        node_name.clone(),
+        shutdown_rx_for_task_watchdog,
+    ));
 
     Ok(handles)
 }

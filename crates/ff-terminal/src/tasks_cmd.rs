@@ -3,6 +3,7 @@
 //! Fleet-wide task view. Queries `fleet_tasks` (V44) and renders a table.
 
 use anyhow::Result;
+use serde_json::Value;
 use sqlx::{PgPool, Row};
 
 pub async fn handle_tasks_list(
@@ -24,9 +25,23 @@ pub async fn handle_tasks_list(
         args.push(cf.to_string());
         sql.push_str(&format!(" AND c.name = ${}", args.len()));
     }
+    // Allow comma-separated list of statuses, e.g. "pending,running".
     if let Some(sf) = status_filter {
-        args.push(sf.to_string());
-        sql.push_str(&format!(" AND t.status = ${}", args.len()));
+        let parts: Vec<&str> = sf
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !parts.is_empty() {
+            let placeholders: Vec<String> = parts
+                .iter()
+                .map(|p| {
+                    args.push(p.to_string());
+                    format!("${}", args.len())
+                })
+                .collect();
+            sql.push_str(&format!(" AND t.status IN ({})", placeholders.join(", ")));
+        }
     }
     if let Some(tf) = type_filter {
         args.push(tf.to_string());
@@ -76,6 +91,103 @@ pub async fn handle_tasks_list(
             pct_str,
             summary_short
         );
+    }
+    Ok(())
+}
+
+/// Show full detail for one task.
+pub async fn handle_tasks_get(pg: &PgPool, id: uuid::Uuid) -> Result<()> {
+    let row = sqlx::query(
+        "SELECT t.id, t.parent_task_id, t.task_type, t.summary, t.payload,
+                t.priority, t.requires_capability, t.status, c.name as claimer_name,
+                t.progress_pct, t.progress_message, t.result, t.error,
+                t.handoff_count, t.handoff_reason,
+                t.created_at, t.claimed_at, t.started_at, t.completed_at,
+                t.last_heartbeat_at
+           FROM fleet_tasks t
+           LEFT JOIN computers c ON t.claimed_by_computer_id = c.id
+          WHERE t.id = $1",
+    )
+    .bind(id)
+    .fetch_optional(pg)
+    .await?;
+
+    let Some(r) = row else {
+        anyhow::bail!("task {id} not found");
+    };
+
+    let task_type: String = r.try_get("task_type")?;
+    let summary: String = r.try_get("summary")?;
+    let status: String = r.try_get("status")?;
+    let priority: i32 = r.try_get("priority")?;
+    let parent: Option<uuid::Uuid> = r.try_get("parent_task_id").ok();
+    let claimer: Option<String> = r.try_get("claimer_name").ok();
+    let payload: Value = r.try_get("payload")?;
+    let caps: Value = r.try_get("requires_capability")?;
+    let pct: Option<f32> = r.try_get("progress_pct").ok();
+    let prog_msg: Option<String> = r.try_get("progress_message").ok();
+    let result: Option<Value> = r.try_get("result").ok();
+    let error: Option<String> = r.try_get("error").ok();
+    let handoff_count: i32 = r.try_get("handoff_count")?;
+    let handoff_reason: Option<String> = r.try_get("handoff_reason").ok();
+    let created_at: chrono::DateTime<chrono::Utc> = r.try_get("created_at")?;
+    let started_at: Option<chrono::DateTime<chrono::Utc>> = r.try_get("started_at").ok();
+    let completed_at: Option<chrono::DateTime<chrono::Utc>> = r.try_get("completed_at").ok();
+    let heartbeat_at: Option<chrono::DateTime<chrono::Utc>> = r.try_get("last_heartbeat_at").ok();
+
+    println!("ID:              {id}");
+    if let Some(p) = parent {
+        println!("Parent:          {p}");
+    }
+    println!("Type:            {task_type}");
+    println!("Summary:         {summary}");
+    println!("Status:          {status}");
+    println!("Priority:        {priority}");
+    println!("Capabilities:    {}", caps);
+    println!("Claimed by:      {}", claimer.as_deref().unwrap_or("-"));
+    if handoff_count > 0 {
+        println!(
+            "Handoffs:        {handoff_count}{}",
+            handoff_reason
+                .as_deref()
+                .map(|r| format!(" ({r})"))
+                .unwrap_or_default()
+        );
+    }
+    if let Some(p) = pct {
+        println!("Progress:        {p:.0}%");
+    }
+    if let Some(m) = prog_msg {
+        println!("Progress msg:    {m}");
+    }
+    println!(
+        "Created:         {}",
+        created_at.format("%Y-%m-%d %H:%M:%S UTC")
+    );
+    if let Some(s) = started_at {
+        println!("Started:         {}", s.format("%Y-%m-%d %H:%M:%S UTC"));
+    }
+    if let Some(h) = heartbeat_at {
+        let age = (chrono::Utc::now() - h).num_seconds();
+        println!("Last heartbeat:  {age}s ago");
+    }
+    if let Some(c) = completed_at {
+        println!("Completed:       {}", c.format("%Y-%m-%d %H:%M:%S UTC"));
+    }
+    println!();
+    println!("Payload:");
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&payload).unwrap_or_default()
+    );
+    if let Some(r) = result {
+        println!();
+        println!("Result:");
+        println!("{}", serde_json::to_string_pretty(&r).unwrap_or_default());
+    }
+    if let Some(e) = error {
+        println!();
+        println!("Error: {e}");
     }
     Ok(())
 }

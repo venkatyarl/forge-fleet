@@ -4415,3 +4415,43 @@ UPDATE software_registry
  WHERE id IN ('ff_git', 'forgefleetd_git')
    AND upgrade_playbook->>'linux-ubuntu' NOT LIKE '%reset-failed%';
 "#;
+
+// ─── V49: connectivity_mode + election_eligibility on computers ─────────────
+//
+// First-step support for fleet members that travel off-LAN (laptops).
+//
+// `connectivity_mode` (string): the daemon's self-reported connection
+// state — `lan_attached` | `roaming` | `island`. Workers off-LAN
+// stop publishing pulse beats and write any task work to a local
+// SQLite mirror until they're back. NULL == legacy / unknown; treat
+// as `lan_attached` for back-compat.
+//
+// `election_eligibility` (string): `eligible` | `prefer_skip` |
+// `never_leader`. Marks members that should never be promoted to fleet
+// leader. Aura is the first such member — a laptop dropping off-LAN
+// while holding leader would freeze the whole fleet's coordination
+// surface (auto-upgrade, model dispatch, alert evaluator). The
+// existing leader-election code reads this at candidate-collection
+// time and skips `never_leader` rows even if their pulse priority is
+// favorable.
+pub const SCHEMA_V49_CONNECTIVITY_MODE_AND_ELIGIBILITY: &str = r#"
+ALTER TABLE computers
+    ADD COLUMN IF NOT EXISTS connectivity_mode TEXT,
+    ADD COLUMN IF NOT EXISTS election_eligibility TEXT NOT NULL DEFAULT 'eligible';
+
+ALTER TABLE computers
+    ADD CONSTRAINT computers_connectivity_mode_check
+    CHECK (connectivity_mode IS NULL
+           OR connectivity_mode IN ('lan_attached', 'roaming', 'island'));
+
+ALTER TABLE computers
+    ADD CONSTRAINT computers_eligibility_check
+    CHECK (election_eligibility IN ('eligible', 'prefer_skip', 'never_leader'));
+
+-- Aura is a laptop today. Until we have heartscale support to track
+-- which laptops are LAN-attached vs. away, never let any laptop hold
+-- the leader role.
+UPDATE computers
+   SET election_eligibility = 'never_leader'
+ WHERE name = 'aura';
+"#;
