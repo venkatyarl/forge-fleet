@@ -382,6 +382,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "upgrade_playbook_restart_fix",
         sql: schema::SCHEMA_V48_UPGRADE_PLAYBOOK_RESTART_FIX,
     },
+    PgMigration {
+        version: 49,
+        name: "connectivity_mode_and_eligibility",
+        sql: schema::SCHEMA_V49_CONNECTIVITY_MODE_AND_ELIGIBILITY,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.

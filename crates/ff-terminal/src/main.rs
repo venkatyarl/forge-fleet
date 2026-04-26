@@ -456,6 +456,32 @@ enum TasksCommand {
         #[arg(long = "type")]
         task_type: Option<String>,
     },
+    /// Enqueue a shell task. Workers on members whose capability set
+    /// covers `--capability` will compete for it.
+    Add {
+        /// Human-readable summary.
+        #[arg(long)]
+        summary: String,
+        /// Shell command to run. Pass via single quotes.
+        #[arg(long)]
+        command: String,
+        /// Required capabilities, comma-separated. e.g. "linux,redis-cli".
+        #[arg(long, default_value = "")]
+        capability: String,
+        /// Pin to a specific computer name. If absent, any eligible worker may claim.
+        #[arg(long)]
+        preferred: Option<String>,
+        /// Higher = picked first. Default 50.
+        #[arg(long, default_value_t = 50)]
+        priority: i32,
+    },
+    /// Show detailed status, payload, and result for one task.
+    Get {
+        id: String,
+    },
+    /// Compose the multi-step "bring aura online" task graph.
+    /// Creates a parent + 4 children atomically.
+    ComposeAuraBootstrap,
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -2032,6 +2058,61 @@ async fn main() -> Result<()> {
                         task_type.as_deref(),
                     )
                     .await
+                }
+                TasksCommand::Add {
+                    summary,
+                    command,
+                    capability,
+                    preferred,
+                    priority,
+                } => {
+                    let caps: Vec<String> = capability
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(String::from)
+                        .collect();
+                    let me = ff_agent::fleet_info::resolve_this_node_name().await;
+                    let my_id: Option<uuid::Uuid> =
+                        sqlx::query_scalar("SELECT id FROM computers WHERE name = $1")
+                            .bind(&me)
+                            .fetch_optional(&pool)
+                            .await
+                            .ok()
+                            .flatten();
+                    let id = ff_agent::task_runner::pg_enqueue_shell_task(
+                        &pool,
+                        &summary,
+                        &command,
+                        &caps,
+                        preferred.as_deref(),
+                        None,
+                        priority,
+                        my_id,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("enqueue: {e}"))?;
+                    println!("{id}");
+                    Ok(())
+                }
+                TasksCommand::Get { id } => {
+                    let task_id = uuid::Uuid::parse_str(&id)
+                        .map_err(|e| anyhow::anyhow!("invalid uuid: {e}"))?;
+                    tasks_cmd::handle_tasks_get(&pool, task_id).await
+                }
+                TasksCommand::ComposeAuraBootstrap => {
+                    let me = ff_agent::fleet_info::resolve_this_node_name().await;
+                    let my_id: uuid::Uuid =
+                        sqlx::query_scalar("SELECT id FROM computers WHERE name = $1")
+                            .bind(&me)
+                            .fetch_one(&pool)
+                            .await?;
+                    let parent = ff_agent::task_runner::compose_aura_bootstrap(&pool, my_id)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("compose: {e}"))?;
+                    println!("composed parent task: {parent}");
+                    println!("watch progress with: ff tasks list --status pending,running");
+                    Ok(())
                 }
             }
         }

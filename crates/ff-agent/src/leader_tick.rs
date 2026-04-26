@@ -619,12 +619,19 @@ struct Candidate {
 /// whose `computers.name` is present is a candidate — Pulse decides
 /// which of them is currently alive.
 async fn load_candidates(pool: &PgPool) -> Result<Vec<Candidate>, sqlx::Error> {
+    // Filter out computers explicitly marked `never_leader` (V49).
+    // Laptops that travel off-LAN should never be promoted — if they
+    // win and then drop wifi, the whole fleet's leader-gated subsystems
+    // (auto-upgrade, sub-agent reaper, openclaw reconciler, task
+    // watchdog) freeze until the laptop returns. Reads through
+    // COALESCE so legacy rows (NULL eligibility) still count.
     let rows = sqlx::query(
         "SELECT c.id          AS computer_id,
                 c.name        AS member_name,
                 fm.election_priority AS election_priority
          FROM fleet_members fm
-         JOIN computers c ON c.id = fm.computer_id",
+         JOIN computers c ON c.id = fm.computer_id
+         WHERE COALESCE(c.election_eligibility, 'eligible') <> 'never_leader'",
     )
     .fetch_all(pool)
     .await?;
