@@ -2174,14 +2174,30 @@ async fn start_pulse_v2_subsystems(
                     caps.insert("leader".to_string());
                 }
             }
+            // FF_* env bag (FF_NODE, FF_SOURCE_TREE, FF_LEADER_NAME,
+            // FF_GATEWAY_URL, …) — resolved from the DB so shell tasks
+            // never have to embed IPs / paths / users in source.
+            let task_env = match ff_agent::task_runner::TaskRunner::resolve_env_from_db(
+                &pool, &name,
+            )
+            .await
+            {
+                Ok(e) => e,
+                Err(e) => {
+                    warn!(node = %name, error = %e, "task_runner: env resolve failed");
+                    Vec::new()
+                }
+            };
             info!(
                 node = %name,
                 computer_id = %my_id,
                 capabilities = ?caps,
+                env_keys = ?task_env.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
                 "task_runner ready"
             );
-            let runner =
-                ff_agent::task_runner::TaskRunner::new(pool, my_id, name, caps);
+            let runner = ff_agent::task_runner::TaskRunner::new(
+                pool, my_id, name, caps, task_env,
+            );
             let _ = runner.spawn(10, shutdown).await;
         });
     }

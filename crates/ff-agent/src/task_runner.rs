@@ -61,6 +61,12 @@ pub struct TaskRunner {
     /// Capabilities advertised by this computer. The runner will only
     /// claim a task whose `requires_capability` ⊆ this set.
     my_capabilities: Arc<HashSet<String>>,
+    /// Per-computer environment exposed to every shell payload — the
+    /// canonical "things that come from the DB, not from source code"
+    /// surface. Tasks reference these as `$FF_SOURCE_TREE`, `$FF_NODE`,
+    /// `$FF_LEADER_NAME`, etc. Resolved once at startup; if the leader
+    /// or source_tree_path changes the daemon is restarted.
+    env: Arc<Vec<(String, String)>>,
 }
 
 impl TaskRunner {
@@ -69,13 +75,65 @@ impl TaskRunner {
         my_computer_id: uuid::Uuid,
         my_name: String,
         my_capabilities: HashSet<String>,
+        env: Vec<(String, String)>,
     ) -> Self {
         Self {
             pg,
             my_computer_id,
             my_name,
             my_capabilities: Arc::new(my_capabilities),
+            env: Arc::new(env),
         }
+    }
+
+    /// Resolve the standard env-var bag from the DB. Reads both this
+    /// computer's row (for `FF_SOURCE_TREE`, `FF_NODE`, `FF_PRIMARY_IP`)
+    /// and the leader's row (for `FF_LEADER_NAME`, `FF_LEADER_IP`,
+    /// `FF_GATEWAY_URL`). Falls back gracefully when columns are NULL.
+    pub async fn resolve_env_from_db(
+        pg: &PgPool,
+        my_name: &str,
+    ) -> Result<Vec<(String, String)>, sqlx::Error> {
+        let mut env = vec![("FF_NODE".to_string(), my_name.to_string())];
+
+        if let Some(row) = sqlx::query(
+            "SELECT primary_ip, source_tree_path, ssh_user, os_family
+               FROM computers WHERE name = $1",
+        )
+        .bind(my_name)
+        .fetch_optional(pg)
+        .await?
+        {
+            let primary_ip: String = row.get("primary_ip");
+            let stp: Option<String> = row.try_get("source_tree_path").ok();
+            let ssh_user: String = row.get("ssh_user");
+            let os_family: String = row.get("os_family");
+            env.push(("FF_PRIMARY_IP".to_string(), primary_ip));
+            env.push(("FF_SSH_USER".to_string(), ssh_user));
+            env.push(("FF_OS_FAMILY".to_string(), os_family));
+            if let Some(s) = stp.filter(|s| !s.is_empty()) {
+                env.push(("FF_SOURCE_TREE".to_string(), s));
+            }
+        }
+
+        if let Some(row) = sqlx::query(
+            "SELECT ls.member_name, c.primary_ip
+               FROM fleet_leader_state ls
+               JOIN computers c ON c.id = ls.computer_id
+              LIMIT 1",
+        )
+        .fetch_optional(pg)
+        .await?
+        {
+            let leader_name: String = row.get("member_name");
+            let leader_ip: String = row.get("primary_ip");
+            // Canonical fleet gateway port — see reference_canonical_ports.md.
+            let gateway_url = format!("http://{leader_ip}:51002");
+            env.push(("FF_LEADER_NAME".to_string(), leader_name));
+            env.push(("FF_LEADER_IP".to_string(), leader_ip));
+            env.push(("FF_GATEWAY_URL".to_string(), gateway_url));
+        }
+        Ok(env)
     }
 
     /// One worker tick — claim at most one ready task and run it.
@@ -138,8 +196,9 @@ impl TaskRunner {
             }
         });
 
-        // 3. Run the payload.
-        let outcome = run_shell_payload(&payload).await;
+        // 3. Run the payload — with FF_* env vars injected so tasks
+        // never have to embed IPs, paths, or names in source.
+        let outcome = run_shell_payload(&payload, &self.env).await;
         let _ = cancel_tx.send(());
         let _ = hb_task.await;
 
@@ -362,7 +421,12 @@ pub async fn pg_enqueue_shell_task(
 }
 
 /// Run a `task_type=shell` payload via `/bin/bash -lc <command>`.
-async fn run_shell_payload(payload: &Value) -> Result<Value, TaskRunnerError> {
+/// `env` is injected on top of the inherited daemon env — these are
+/// the `FF_*` values resolved from the DB at worker startup.
+async fn run_shell_payload(
+    payload: &Value,
+    env: &[(String, String)],
+) -> Result<Value, TaskRunnerError> {
     let command = payload
         .get("command")
         .and_then(Value::as_str)
@@ -375,12 +439,16 @@ async fn run_shell_payload(payload: &Value) -> Result<Value, TaskRunnerError> {
         .unwrap_or("/bin/bash")
         .to_string();
 
+    let env_owned: Vec<(String, String)> = env.to_vec();
+
     // Run in a blocking thread so we don't tie up the runtime.
     let out = tokio::task::spawn_blocking(move || {
-        std::process::Command::new(&shell)
-            .arg("-lc")
-            .arg(&command)
-            .output()
+        let mut cmd = std::process::Command::new(&shell);
+        cmd.arg("-lc").arg(&command);
+        for (k, v) in &env_owned {
+            cmd.env(k, v);
+        }
+        cmd.output()
     })
     .await
     .map_err(|e| TaskRunnerError::BadPayload(Box::leak(format!("join: {e}").into_boxed_str())))?
