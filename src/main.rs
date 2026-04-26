@@ -2144,13 +2144,21 @@ async fn start_pulse_v2_subsystems(
                 warn!(node = %name, "task_runner: no computers row, worker disabled");
                 return;
             };
-            let mut caps: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
+            let mut caps: std::collections::HashSet<String> = std::collections::HashSet::new();
             caps.insert(os_family.clone());
             caps.insert(name.clone());
             // Cross-cutting capability flags. Detected by looking for
             // the binary on $PATH; cheap, runs once per daemon start.
-            for tool in ["redis-cli", "hf", "ssh", "iperf3", "nc", "curl", "git", "ff"] {
+            for tool in [
+                "redis-cli",
+                "hf",
+                "ssh",
+                "iperf3",
+                "nc",
+                "curl",
+                "git",
+                "ff",
+            ] {
                 let out = std::process::Command::new("/bin/sh")
                     .arg("-lc")
                     .arg(format!("command -v {tool} >/dev/null 2>&1"))
@@ -2162,13 +2170,12 @@ async fn start_pulse_v2_subsystems(
             // Leader gets a separate tag — composers can reserve work
             // that only the elected leader should run (e.g. coordinated
             // bootstraps).
-            let is_leader: Option<String> = sqlx::query_scalar(
-                "SELECT member_name FROM fleet_leader_state LIMIT 1",
-            )
-            .fetch_optional(&pool)
-            .await
-            .ok()
-            .flatten();
+            let is_leader: Option<String> =
+                sqlx::query_scalar("SELECT member_name FROM fleet_leader_state LIMIT 1")
+                    .fetch_optional(&pool)
+                    .await
+                    .ok()
+                    .flatten();
             if let Some(l) = is_leader {
                 if l.eq_ignore_ascii_case(&name) {
                     caps.insert("leader".to_string());
@@ -2177,17 +2184,14 @@ async fn start_pulse_v2_subsystems(
             // FF_* env bag (FF_NODE, FF_SOURCE_TREE, FF_LEADER_NAME,
             // FF_GATEWAY_URL, …) — resolved from the DB so shell tasks
             // never have to embed IPs / paths / users in source.
-            let task_env = match ff_agent::task_runner::TaskRunner::resolve_env_from_db(
-                &pool, &name,
-            )
-            .await
-            {
-                Ok(e) => e,
-                Err(e) => {
-                    warn!(node = %name, error = %e, "task_runner: env resolve failed");
-                    Vec::new()
-                }
-            };
+            let task_env =
+                match ff_agent::task_runner::TaskRunner::resolve_env_from_db(&pool, &name).await {
+                    Ok(e) => e,
+                    Err(e) => {
+                        warn!(node = %name, error = %e, "task_runner: env resolve failed");
+                        Vec::new()
+                    }
+                };
             info!(
                 node = %name,
                 computer_id = %my_id,
@@ -2195,9 +2199,7 @@ async fn start_pulse_v2_subsystems(
                 env_keys = ?task_env.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
                 "task_runner ready"
             );
-            let runner = ff_agent::task_runner::TaskRunner::new(
-                pool, my_id, name, caps, task_env,
-            );
+            let runner = ff_agent::task_runner::TaskRunner::new(pool, my_id, name, caps, task_env);
             let _ = runner.spawn(10, shutdown).await;
         });
     }

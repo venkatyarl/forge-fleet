@@ -27,7 +27,11 @@ pub async fn handle_tasks_list(
     }
     // Allow comma-separated list of statuses, e.g. "pending,running".
     if let Some(sf) = status_filter {
-        let parts: Vec<&str> = sf.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+        let parts: Vec<&str> = sf
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
         if !parts.is_empty() {
             let placeholders: Vec<String> = parts
                 .iter()
@@ -156,7 +160,10 @@ pub async fn handle_tasks_get(pg: &PgPool, id: uuid::Uuid) -> Result<()> {
     if let Some(m) = prog_msg {
         println!("Progress msg:    {m}");
     }
-    println!("Created:         {}", created_at.format("%Y-%m-%d %H:%M:%S UTC"));
+    println!(
+        "Created:         {}",
+        created_at.format("%Y-%m-%d %H:%M:%S UTC")
+    );
     if let Some(s) = started_at {
         println!("Started:         {}", s.format("%Y-%m-%d %H:%M:%S UTC"));
     }
@@ -169,7 +176,10 @@ pub async fn handle_tasks_get(pg: &PgPool, id: uuid::Uuid) -> Result<()> {
     }
     println!();
     println!("Payload:");
-    println!("{}", serde_json::to_string_pretty(&payload).unwrap_or_default());
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&payload).unwrap_or_default()
+    );
     if let Some(r) = result {
         println!();
         println!("Result:");

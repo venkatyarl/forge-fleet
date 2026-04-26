@@ -476,9 +476,7 @@ enum TasksCommand {
         priority: i32,
     },
     /// Show detailed status, payload, and result for one task.
-    Get {
-        id: String,
-    },
+    Get { id: String },
     /// Compose the multi-step "bring `<target>` online" task graph.
     /// Reads the target's IPs / ssh user / OS family from `computers`
     /// at compose time — no hardcoded values.

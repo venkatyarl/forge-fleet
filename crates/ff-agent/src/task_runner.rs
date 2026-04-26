@@ -205,10 +205,7 @@ impl TaskRunner {
         // 4. Persist result.
         match outcome {
             Ok(result) => {
-                let exit = result
-                    .get("exit")
-                    .and_then(Value::as_i64)
-                    .unwrap_or(-1);
+                let exit = result.get("exit").and_then(Value::as_i64).unwrap_or(-1);
                 if exit == 0 {
                     sqlx::query(
                         "UPDATE fleet_tasks
@@ -340,13 +337,12 @@ pub fn spawn_leader_watchdog(
         // 60s tick — half the stuck threshold so detection latency stays bounded.
         let interval = Duration::from_secs(60);
         loop {
-            let leader: Option<String> = sqlx::query_scalar(
-                "SELECT member_name FROM fleet_leader_state LIMIT 1",
-            )
-            .fetch_optional(&pg)
-            .await
-            .ok()
-            .flatten();
+            let leader: Option<String> =
+                sqlx::query_scalar("SELECT member_name FROM fleet_leader_state LIMIT 1")
+                    .fetch_optional(&pg)
+                    .await
+                    .ok()
+                    .flatten();
             if matches!(leader, Some(ref l) if l.eq_ignore_ascii_case(&my_name)) {
                 match handoff_stuck_tasks(&pg).await {
                     Ok(n) if n > 0 => {
@@ -452,9 +448,7 @@ async fn run_shell_payload(
     })
     .await
     .map_err(|e| TaskRunnerError::BadPayload(Box::leak(format!("join: {e}").into_boxed_str())))?
-    .map_err(|e| {
-        TaskRunnerError::BadPayload(Box::leak(format!("spawn: {e}").into_boxed_str()))
-    })?;
+    .map_err(|e| TaskRunnerError::BadPayload(Box::leak(format!("spawn: {e}").into_boxed_str())))?;
 
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
@@ -520,12 +514,10 @@ pub async fn compose_node_bootstrap(
         _ => vec![target_primary_ip.clone()],
     };
 
-    let leader_ip: String = sqlx::query_scalar(
-        "SELECT primary_ip FROM computers WHERE id = $1",
-    )
-    .bind(leader_computer_id)
-    .fetch_one(pg)
-    .await?;
+    let leader_ip: String = sqlx::query_scalar("SELECT primary_ip FROM computers WHERE id = $1")
+        .bind(leader_computer_id)
+        .fetch_one(pg)
+        .await?;
     // 51002 is the canonical fleet gateway port. Per
     // reference_canonical_ports.md it is fixed across the fleet, so
     // hardcoding it here is consistent with the project rule that
