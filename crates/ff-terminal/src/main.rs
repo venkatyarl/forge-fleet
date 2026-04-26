@@ -479,9 +479,13 @@ enum TasksCommand {
     Get {
         id: String,
     },
-    /// Compose the multi-step "bring aura online" task graph.
-    /// Creates a parent + 4 children atomically.
-    ComposeAuraBootstrap,
+    /// Compose the multi-step "bring `<target>` online" task graph.
+    /// Reads the target's IPs / ssh user / OS family from `computers`
+    /// at compose time — no hardcoded values.
+    ComposeNodeBootstrap {
+        /// Computer name (must already have a row in `computers`).
+        target: String,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -2100,16 +2104,17 @@ async fn main() -> Result<()> {
                         .map_err(|e| anyhow::anyhow!("invalid uuid: {e}"))?;
                     tasks_cmd::handle_tasks_get(&pool, task_id).await
                 }
-                TasksCommand::ComposeAuraBootstrap => {
+                TasksCommand::ComposeNodeBootstrap { target } => {
                     let me = ff_agent::fleet_info::resolve_this_node_name().await;
                     let my_id: uuid::Uuid =
                         sqlx::query_scalar("SELECT id FROM computers WHERE name = $1")
                             .bind(&me)
                             .fetch_one(&pool)
                             .await?;
-                    let parent = ff_agent::task_runner::compose_aura_bootstrap(&pool, my_id)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("compose: {e}"))?;
+                    let parent =
+                        ff_agent::task_runner::compose_node_bootstrap(&pool, &target, my_id)
+                            .await
+                            .map_err(|e| anyhow::anyhow!("compose: {e}"))?;
                     println!("composed parent task: {parent}");
                     println!("watch progress with: ff tasks list --status pending,running");
                     Ok(())

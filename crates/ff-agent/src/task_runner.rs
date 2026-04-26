@@ -399,45 +399,109 @@ async fn run_shell_payload(payload: &Value) -> Result<Value, TaskRunnerError> {
     }))
 }
 
-/// Compose the multi-step "bring aura online" task graph atomically.
+/// Compose the multi-step "bring `<target>` online" task graph atomically.
 ///
-/// One parent (no shell) plus N children, one per fleet member who
-/// helps. The members work in parallel where they can; the bootstrap
-/// child has a `depends_on` style ordering done at the application
-/// level by the watcher (we don't have a true DAG dependency column —
-/// the watcher creates the next child only after the previous
-/// completed). For now the children are sequenced in time-priority
-/// (priority decreasing) so the leader picks them in order.
-pub async fn compose_aura_bootstrap(
+/// All node-specific values (IPs, ssh user, role) are read from the
+/// `computers` row at compose time — no IPs, names, or usernames in
+/// source. The leader's gateway URL is derived from the leader's own
+/// `computers.primary_ip` row (port 51002 is the canonical fleet
+/// gateway port — see `reference_canonical_ports.md`).
+///
+/// One parent (compound, no shell) plus N children, one per
+/// cooperative step. Children are sequenced by descending priority so
+/// the leader picks them in order; for a true DAG with edges we'd add
+/// a `depends_on` column to V44.
+pub async fn compose_node_bootstrap(
     pg: &PgPool,
+    target_name: &str,
     leader_computer_id: uuid::Uuid,
 ) -> Result<uuid::Uuid, sqlx::Error> {
+    // ── 1. Pull everything we need from the DB. ──────────────────────────
+    let target_row = sqlx::query(
+        "SELECT name, primary_ip, all_ips, ssh_user, ssh_port, os_family
+           FROM computers WHERE name = $1",
+    )
+    .bind(target_name)
+    .fetch_optional(pg)
+    .await?
+    .ok_or_else(|| {
+        sqlx::Error::RowNotFound // mapped by caller
+    })?;
+
+    let target_name: String = target_row.get("name");
+    let target_primary_ip: String = target_row.get("primary_ip");
+    let target_all_ips_json: serde_json::Value = target_row.get("all_ips");
+    let target_ssh_user: String = target_row.get("ssh_user");
+    let target_ssh_port: i32 = target_row.get("ssh_port");
+    let target_os_family: String = target_row.get("os_family");
+
+    // Flatten all_ips JSONB → Vec<String>. The column may be a list of
+    // strings or a list of {ip,iface,kind,…} objects depending on the
+    // writer's vintage; tolerate both.
+    let target_ips: Vec<String> = match &target_all_ips_json {
+        serde_json::Value::Array(arr) if !arr.is_empty() => arr
+            .iter()
+            .filter_map(|v| match v {
+                serde_json::Value::String(s) => Some(s.clone()),
+                serde_json::Value::Object(o) => {
+                    o.get("ip").and_then(|x| x.as_str()).map(String::from)
+                }
+                _ => None,
+            })
+            .collect(),
+        _ => vec![target_primary_ip.clone()],
+    };
+
+    let leader_ip: String = sqlx::query_scalar(
+        "SELECT primary_ip FROM computers WHERE id = $1",
+    )
+    .bind(leader_computer_id)
+    .fetch_one(pg)
+    .await?;
+    // 51002 is the canonical fleet gateway port. Per
+    // reference_canonical_ports.md it is fixed across the fleet, so
+    // hardcoding it here is consistent with the project rule that
+    // *data* lives in the DB while *constants* (ports, schema names)
+    // live in code.
+    let gateway_url = format!("http://{leader_ip}:51002");
+
+    // ── 2. Parent task. ──────────────────────────────────────────────────
+    let parent_summary = format!("{target_name}: bring online via fleet cooperation");
     let parent: uuid::Uuid = sqlx::query_scalar(
         r#"
         INSERT INTO fleet_tasks (
             task_type, summary, payload, priority, created_by_computer_id
         )
-        VALUES ('compound', 'aura: bring online via fleet cooperation', '{}'::jsonb, 80, $1)
+        VALUES ('compound', $1, '{}'::jsonb, 80, $2)
         RETURNING id
         "#,
     )
+    .bind(&parent_summary)
     .bind(leader_computer_id)
     .fetch_one(pg)
     .await?;
 
-    // Step 1 (priority 90): probe aura on both IPs from whoever has
-    // SSH trust today (today only the leader does — once aura's
-    // bootstrap finishes, mesh propagate fans the trust out and a
-    // non-leader peer could legitimately handle this).
+    let port_arg = if target_ssh_port == 22 {
+        String::new()
+    } else {
+        format!(" -p {target_ssh_port}")
+    };
+    let ssh_target_for_iter = format!("{target_ssh_user}@$ip");
+    let ssh_target_primary = format!("{target_ssh_user}@{target_primary_ip}");
+
+    // ── Step 1: probe every known IP. ────────────────────────────────────
+    let ip_list = target_ips.join(" ");
+    let step1 = format!(
+        "set -e; for ip in {ip_list}; do \
+           echo \"== $ip ==\"; \
+           timeout 5 ssh{port_arg} -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+             {ssh_target_for_iter} 'echo ok && uname -srvmo' || echo 'unreachable'; \
+         done"
+    );
     pg_enqueue_shell_task(
         pg,
-        "aura/1: ssh-probe both interfaces",
-        "set -e; \
-         for ip in 192.168.5.109 192.168.5.110; do \
-           echo \"== $ip ==\"; \
-           timeout 5 ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
-             aura@$ip 'echo ok && uname -srvmo' || echo 'unreachable'; \
-         done",
+        &format!("{target_name}/1: ssh-probe all known IPs"),
+        &step1,
         &["leader".to_string()],
         None,
         Some(parent),
@@ -446,13 +510,17 @@ pub async fn compose_aura_bootstrap(
     )
     .await?;
 
-    // Step 2 (priority 85): leader runs the bootstrap on aura.
+    // ── Step 2: leader runs the bootstrap script. ────────────────────────
+    let step2 = format!(
+        "ssh{port_arg} -o BatchMode=yes {ssh_target_primary} \
+         \"curl -fsSL '{gateway_url}/onboard/bootstrap.sh\
+?name={target_name}&ip={target_primary_ip}&ssh_user={target_ssh_user}&role=builder&runtime=auto' \
+         | sudo bash\""
+    );
     pg_enqueue_shell_task(
         pg,
-        "aura/2: install forgefleetd via gateway bootstrap",
-        "ssh -o BatchMode=yes aura@192.168.5.109 \
-         \"curl -fsSL 'http://192.168.5.100:51002/onboard/bootstrap.sh\
-?name=aura&ip=192.168.5.109&ssh_user=aura&role=builder&runtime=auto' | sudo bash\"",
+        &format!("{target_name}/2: install forgefleetd via gateway bootstrap"),
+        &step2,
         &["leader".to_string()],
         None,
         Some(parent),
@@ -461,15 +529,31 @@ pub async fn compose_aura_bootstrap(
     )
     .await?;
 
-    // Step 3 (priority 80): verify forgefleetd is running on aura.
+    // ── Step 3: verify forgefleetd active. ───────────────────────────────
+    // Unit names are project-fixed deploy artifacts (see deploy/linux/
+    // forgefleet.service and revive.rs fallback chain) — keeping them
+    // here is consistent with treating them as constants. `grep -qx`
+    // (exact line match) avoids the bug where 'inactive' matches.
+    // macOS uses launchctl rather than systemctl; gate the check.
+    let step3 = if target_os_family == "macos" {
+        format!(
+            "ssh{port_arg} -o BatchMode=yes {ssh_target_primary} \
+             'launchctl list | grep -E \"com\\.forgefleet\\.(forgefleetd|daemon)\" >/dev/null'"
+        )
+    } else {
+        format!(
+            "ssh{port_arg} -o BatchMode=yes {ssh_target_primary} \
+             'systemctl --user is-active forgefleetd.service \
+                || systemctl --user is-active forgefleet-node.service \
+                || systemctl --user is-active forgefleet-daemon.service \
+                || systemctl --user is-active forgefleet-agent.service' \
+             | grep -qx active"
+        )
+    };
     pg_enqueue_shell_task(
         pg,
-        "aura/3: verify forgefleetd running on aura",
-        "ssh -o BatchMode=yes aura@192.168.5.109 \
-         'systemctl --user is-active forgefleetd.service \
-            || systemctl --user is-active forgefleet-node.service \
-            || systemctl --user is-active forgefleet-daemon.service' \
-         | grep -q active",
+        &format!("{target_name}/3: verify forgefleetd running on {target_name}"),
+        &step3,
         &["leader".to_string()],
         None,
         Some(parent),
@@ -478,18 +562,19 @@ pub async fn compose_aura_bootstrap(
     )
     .await?;
 
-    // Step 4 (priority 75): confirm aura is reporting online via ff.
-    // Any fleet member with ff installed can run this — the work
-    // is intentionally NOT pinned to leader, so we exercise the
-    // cross-member work-stealing path.
+    // ── Step 4: confirm online via ff (any peer with ff). ────────────────
+    let step4 = format!(
+        "for i in $(seq 1 30); do \
+           if ff fleet health 2>/dev/null | awk '$1 == \"{target_name}\" {{print $3}}' \
+              | grep -qx online; then \
+             echo '{target_name} online in fleet health'; exit 0; \
+           fi; sleep 2; \
+         done; echo 'timeout: {target_name} still not online after 60s'; exit 1"
+    );
     pg_enqueue_shell_task(
         pg,
-        "aura/4: confirm aura shows online in ff fleet health",
-        "for i in $(seq 1 30); do \
-           if ff fleet health 2>/dev/null | awk '$1 == \"aura\" {print $3}' | grep -q online; then \
-             echo 'aura online in fleet health'; exit 0; \
-           fi; sleep 2; \
-         done; echo 'timeout: aura still not online after 60s'; exit 1",
+        &format!("{target_name}/4: confirm {target_name} shows online in ff fleet health"),
+        &step4,
         &["ff".to_string()],
         None,
         Some(parent),
