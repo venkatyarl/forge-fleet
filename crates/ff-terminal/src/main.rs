@@ -480,6 +480,17 @@ enum TasksCommand {
     },
     /// Show detailed status, payload, and result for one task.
     Get { id: String },
+    /// Cancel a pending or running task. The row flips to `cancelled`;
+    /// the worker's completion UPDATE is gated on status='running' so
+    /// a late-completing hung worker won't clobber the cancellation.
+    /// The child process keeps running on the worker until it exits
+    /// or hits MAX_TASK_DURATION (30 min default).
+    Cancel {
+        id: String,
+        /// Reason recorded in the task's `error` field.
+        #[arg(long, default_value = "cancelled by operator")]
+        reason: String,
+    },
     /// Compose the multi-step "bring `<target>` online" task graph.
     /// Reads the target's IPs / ssh user / OS family from `computers`
     /// at compose time — no hardcoded values.
@@ -2117,6 +2128,26 @@ async fn main() -> Result<()> {
                     let task_id = uuid::Uuid::parse_str(&id)
                         .map_err(|e| anyhow::anyhow!("invalid uuid: {e}"))?;
                     tasks_cmd::handle_tasks_get(&pool, task_id).await
+                }
+                TasksCommand::Cancel { id, reason } => {
+                    let task_id = uuid::Uuid::parse_str(&id)
+                        .map_err(|e| anyhow::anyhow!("invalid uuid: {e}"))?;
+                    let prev = ff_agent::task_runner::pg_cancel_task(&pool, task_id, &reason)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("cancel: {e}"))?;
+                    match prev {
+                        Some(prev_status) => {
+                            println!(
+                                "{GREEN}✓{RESET} cancelled {task_id} (was {prev_status})"
+                            );
+                        }
+                        None => {
+                            println!(
+                                "{YELLOW}—{RESET} {task_id} already terminal (completed/failed/cancelled); nothing to cancel"
+                            );
+                        }
+                    }
+                    Ok(())
                 }
                 TasksCommand::ComposeNodeBootstrap { target } => {
                     let me = ff_agent::fleet_info::resolve_this_node_name().await;
