@@ -269,12 +269,12 @@ pub async fn tick(pool: &PgPool) -> Result<TickStats> {
             model = override_model.to_string();
         }
 
-        let prompt = step_memory
+        let raw_prompt = step_memory
             .get("prompt")
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        if prompt.is_empty() {
+        if raw_prompt.is_empty() {
             warn!(step = %step_id, "skipping step with empty step_memory.prompt");
             sqlx::query("UPDATE agent_steps SET status='failed', error=$1 WHERE id=$2")
                 .bind("step_memory.prompt is empty")
@@ -286,9 +286,23 @@ pub async fn tick(pool: &PgPool) -> Result<TickStats> {
             continue;
         }
 
+        // Pre-session brain context injection: pull top-K relevant
+        // vault entries for this prompt and prepend them as a system
+        // preamble. Closes the "each role re-derives everything from
+        // scratch" gap noted in PR-E's deferred work. Skipped silently
+        // when the brain has no matches or the query fails.
+        let brain_context = gather_brain_context(pool, &raw_prompt).await.unwrap_or_default();
+        let prompt_with_context = if brain_context.is_empty() {
+            raw_prompt.clone()
+        } else {
+            format!(
+                "<system>\n## Relevant context from your shared brain\n\n{brain_context}\n</system>\n\n<user>\n{raw_prompt}\n</user>"
+            )
+        };
+
         // Encode for shell. Single-quote the prompt; replace any
         // embedded single-quote with `'\''`.
-        let shell_safe = prompt.replace('\'', "'\\''");
+        let shell_safe = prompt_with_context.replace('\'', "'\\''");
         let cmd = format!("ff agent --model '{model}' '{shell_safe}'");
 
         let summary = format!(
@@ -521,6 +535,79 @@ async fn mirror_session_to_vault(pool: &PgPool, session_id: uuid::Uuid) -> Resul
 
     info!(session = %session_id, dir = %dir.display(), "session mirrored to vault Inbox");
     Ok(())
+}
+
+/// Pull up to 5 relevant `brain_vault_nodes` for `prompt` and format
+/// them as a markdown bullet list. Tokenises the prompt by whitespace
+/// (simple but works for keyword-style retrieval), then matches each
+/// token against `title`, `path`, and `tags` arrays. Returns empty
+/// string if nothing matches — the caller skips the preamble in that
+/// case.
+async fn gather_brain_context(pool: &PgPool, prompt: &str) -> Result<String> {
+    let tokens: Vec<String> = prompt
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.len() >= 4)
+        .map(|t| t.to_lowercase())
+        .filter(|t| {
+            // Stop-words a single-line stop list. Same idea as the
+            // existing brain_search MCP tool — drops the most common
+            // tokens to focus the match on substantive ones.
+            !matches!(
+                t.as_str(),
+                "this" | "that" | "with" | "from" | "have" | "what" | "when"
+                    | "where" | "would" | "should" | "could" | "their" | "there"
+                    | "them" | "then" | "than" | "they" | "your" | "yours"
+                    | "into" | "over" | "under" | "above" | "below" | "about"
+                    | "after" | "before" | "between" | "during" | "while"
+            )
+        })
+        .take(8)
+        .collect();
+    if tokens.is_empty() {
+        return Ok(String::new());
+    }
+
+    // Build a query that matches any of the tokens against title or
+    // path (case-insensitive) or tags. Limit 5; only currently-valid
+    // entries (`valid_until IS NULL`).
+    let pattern: Vec<String> = tokens.iter().map(|t| format!("%{t}%")).collect();
+    let rows = sqlx::query(
+        "SELECT path, title,
+                COALESCE(array_to_string(tags, ', '), '') AS tagstr
+           FROM brain_vault_nodes
+          WHERE valid_until IS NULL
+            AND (
+              EXISTS (
+                SELECT 1 FROM unnest($1::text[]) AS pat
+                 WHERE LOWER(title) LIKE pat OR LOWER(path) LIKE pat
+              )
+              OR tags && $2::text[]
+            )
+          ORDER BY hits DESC, last_accessed DESC
+          LIMIT 5",
+    )
+    .bind(&pattern)
+    .bind(&tokens)
+    .fetch_all(pool)
+    .await
+    .context("brain context query")?;
+
+    if rows.is_empty() {
+        return Ok(String::new());
+    }
+    let mut out = String::new();
+    for r in rows {
+        let path: String = r.get("path");
+        let title: String = r.get("title");
+        let tags: String = r.try_get("tagstr").unwrap_or_default();
+        let snippet = if tags.is_empty() {
+            format!("- **{title}** (`{path}`)\n")
+        } else {
+            format!("- **{title}** (`{path}`) — tags: {tags}\n")
+        };
+        out.push_str(&snippet);
+    }
+    Ok(out)
 }
 
 async fn resolve_vault_root_for_session(pool: &PgPool) -> Option<std::path::PathBuf> {
