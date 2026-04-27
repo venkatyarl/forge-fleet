@@ -417,6 +417,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "session_brain",
         sql: schema::SCHEMA_V55_SESSION_BRAIN,
     },
+    PgMigration {
+        version: 56,
+        name: "retire_last_tomls_and_cli_build",
+        sql: schema::SCHEMA_V56_RETIRE_LAST_TOMLS_AND_CLI_BUILD,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.

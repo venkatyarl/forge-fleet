@@ -6607,23 +6607,17 @@ async fn handle_model(cmd: ModelCommand) -> Result<()> {
             }
 
             if let Some(up) = upstream_id {
-                let path = PathBuf::from(ff_agent::model_scout::DEFAULT_DENYLIST_PATH);
-                let existing = fs::read_to_string(&path).unwrap_or_default();
-                if !existing.contains(&up) {
-                    let mut parsed: toml::Value = toml::from_str(&existing)
-                        .unwrap_or_else(|_| toml::Value::Table(Default::default()));
-                    let arr = parsed.as_table_mut().and_then(|t| {
-                        t.entry("deny")
-                            .or_insert_with(|| toml::Value::Array(vec![]))
-                            .as_array_mut()
-                    });
-                    if let Some(list) = arr {
-                        list.push(toml::Value::String(up.clone()));
-                    }
-                    if let Some(parent) = path.parent() {
-                        let _ = fs::create_dir_all(parent);
-                    }
-                    let _ = fs::write(&path, toml::to_string_pretty(&parsed).unwrap_or_default());
+                let inserted = sqlx::query(
+                    "INSERT INTO model_scout_denylist (model_id, reason, added_by)
+                     VALUES ($1, $2, $3)
+                     ON CONFLICT (model_id) DO NOTHING",
+                )
+                .bind(up.to_ascii_lowercase())
+                .bind(Some("ff model reject"))
+                .bind(whoami_tag())
+                .execute(&pool)
+                .await?;
+                if inserted.rows_affected() == 1 {
                     println!(
                         "{GREEN}✓{RESET} Rejected '{id}' and added upstream_id '{up}' to denylist"
                     );
@@ -9248,16 +9242,19 @@ fn build_migrate_source_tree_script(canonical: &str) -> String {
 CANONICAL="{canonical}"
 mkdir -p "$(dirname "$CANONICAL")"
 if [ -d "$CANONICAL/.git" ]; then
-  rm -rf ~/taylorProjects/forge-fleet
+  rm -rf ~/taylorProjects/forge-fleet 2>/dev/null || true
+  rmdir ~/taylorProjects 2>/dev/null || true
   echo "canonical already present — dropped legacy"
   exit 0
 fi
 if [ -d ~/taylorProjects/forge-fleet/.git ]; then
   mv ~/taylorProjects/forge-fleet "$CANONICAL"
+  rmdir ~/taylorProjects 2>/dev/null || true
   echo "moved legacy → canonical"
 else
   git clone https://github.com/venkatyarl/forge-fleet "$CANONICAL"
-  rm -rf ~/taylorProjects/forge-fleet
+  rm -rf ~/taylorProjects/forge-fleet 2>/dev/null || true
+  rmdir ~/taylorProjects 2>/dev/null || true
   echo "fresh clone into canonical"
 fi
 "#,
@@ -11443,10 +11440,8 @@ if [ ! -d "$NEW_DIR/.git" ]; then
     git clone --depth 50 "https://github.com/{new_owner}/forge-fleet.git" "$NEW_DIR"
   fi
 fi
-if [ ! -e "$OLD_DIR" ]; then
-  mkdir -p "$HOME_BASE/taylorProjects"
-  ln -sfn "$NEW_DIR" "$OLD_DIR"
-fi
+# Retire ~/taylorProjects fully. If the legacy dir or symlink lingers, drop it.
+rm -rf "$OLD_DIR" 2>/dev/null || true
 cd "$NEW_DIR"
 git remote set-url origin "https://github.com/{new_owner}/forge-fleet.git"
 git fetch origin main
