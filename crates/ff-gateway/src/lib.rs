@@ -12,6 +12,7 @@
 pub mod brain_api;
 pub mod cli_bridge;
 pub mod cloud_llm;
+pub mod screen_ctrl;
 pub mod voice_api;
 pub mod discord;
 pub mod embed;

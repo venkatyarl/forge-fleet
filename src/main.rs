@@ -349,6 +349,14 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         }
     }
 
+    // 6.55) Screen-control daemon (Pillar 1 — Computer Use). Listens
+    // on 127.0.0.1:51200 and exposes screenshot / click / type / key
+    // / goto endpoints by shelling out to platform tools
+    // (screencapture / cliclick on macOS, scrot / xdotool on Linux).
+    // Endpoints return 503 with install hints when the underlying
+    // tool isn't on $PATH.
+    subsystem_tasks.push(ff_gateway::screen_ctrl::spawn());
+
     // 6.6) Brain mirror — watches per-CLI memory dirs (Claude Code,
     // Codex, Gemini) and copies new markdown into the Obsidian vault's
     // `Inbox/<source>/` folder. AI writes only to Inbox per the V13
