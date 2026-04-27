@@ -1156,12 +1156,6 @@ enum FleetDbCommand {
 
 #[derive(Debug, Clone, Subcommand)]
 enum TaskCoverageCommand {
-    /// Upsert task-coverage rows from config/task_coverage.toml.
-    Seed {
-        /// Override TOML path (defaults to config/task_coverage.toml).
-        #[arg(long)]
-        from_toml: Option<PathBuf>,
-    },
     /// Show the current fleet_task_coverage table.
     #[command(alias = "ls")]
     List,
@@ -1252,11 +1246,6 @@ enum ExtCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Upsert external_tools rows from `config/external_tools.toml`.
-    Seed {
-        #[arg(long)]
-        from_toml: Option<PathBuf>,
-    },
     /// Dispatch an install to one or every online computer.
     Install {
         tool_id: String,
@@ -1290,8 +1279,6 @@ enum PortsCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Seed (upsert) the port_registry table from config/ports.toml.
-    Seed,
     /// Scan a computer to see what's actually listening, and cross-reference
     /// with port_registry. Reports unexpected listeners and missing
     /// expected services.
@@ -1901,21 +1888,6 @@ enum AlertCommand {
         active: bool,
         #[arg(long, default_value_t = 50)]
         limit: i64,
-    },
-    /// Alert policy subcommands (seeding, etc.).
-    Policy {
-        #[command(subcommand)]
-        command: AlertPolicyCommand,
-    },
-}
-
-#[derive(Debug, Clone, Subcommand)]
-enum AlertPolicyCommand {
-    /// Reseed alert_policies from config/alert_policies.toml.
-    Seed {
-        /// Optional alternate path to alert_policies.toml.
-        #[arg(long)]
-        path: Option<PathBuf>,
     },
 }
 
@@ -9343,27 +9315,6 @@ async fn handle_fleet_backup(pool: &sqlx::PgPool, kind: &str, force: bool) -> Re
 
 async fn handle_fleet_task_coverage(pool: &sqlx::PgPool, cmd: TaskCoverageCommand) -> Result<()> {
     match cmd {
-        TaskCoverageCommand::Seed { from_toml } => {
-            let path =
-                from_toml.unwrap_or_else(ff_agent::task_coverage_seed::resolve_task_coverage_path);
-            println!(
-                "{CYAN}▶ Seeding fleet_task_coverage from {}{RESET}",
-                path.display()
-            );
-            let report = ff_agent::task_coverage_seed::seed_from_toml(pool, &path)
-                .await
-                .map_err(|e| anyhow::anyhow!("seed: {e}"))?;
-            println!(
-                "{GREEN}✓{RESET} inserted={} updated={} unchanged={} total={}",
-                report.inserted, report.updated, report.unchanged, report.total,
-            );
-            // Wake every gateway's routing cache warmer immediately so operator
-            // edits show up without the 15s polling lag (issue #98). This is
-            // best-effort — a Redis outage here must not fail the CLI.
-            if report.inserted + report.updated > 0 {
-                ff_agent::fleet_events::publish_routing_invalidate("task_coverage_seed").await;
-            }
-        }
         TaskCoverageCommand::List => {
             let rows = sqlx::query(
                 "SELECT task, min_models_loaded, priority, preferred_model_ids, notes
@@ -10436,7 +10387,6 @@ async fn handle_ext(cmd: ExtCommand) -> Result<()> {
             tool,
             json,
         } => handle_ext_installed(&pool, computer, tool, json).await,
-        ExtCommand::Seed { from_toml } => handle_ext_seed(&pool, from_toml).await,
         ExtCommand::Install {
             tool_id,
             computer,
@@ -10446,27 +10396,6 @@ async fn handle_ext(cmd: ExtCommand) -> Result<()> {
         } => handle_ext_install(&pool, &tool_id, computer, all, dry_run, yes).await,
         ExtCommand::Drift { json } => handle_ext_drift(&pool, json).await,
     }
-}
-
-async fn handle_ext_seed(pool: &sqlx::PgPool, from_toml: Option<PathBuf>) -> Result<()> {
-    let path = from_toml.unwrap_or_else(|| {
-        let mut p = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        p.push("config");
-        p.push("external_tools.toml");
-        p
-    });
-    println!(
-        "{CYAN}▶ Seeding external_tools from {}{RESET}",
-        path.display()
-    );
-    let report = ff_agent::external_tools_registry::seed_from_toml(pool, &path)
-        .await
-        .map_err(|e| anyhow::anyhow!("seed external_tools: {e}"))?;
-    println!(
-        "{GREEN}✓ external_tools seed:{RESET} total={} inserted={} updated={} unchanged={}",
-        report.total, report.inserted, report.updated, report.unchanged,
-    );
-    Ok(())
 }
 
 async fn handle_ext_list(pool: &sqlx::PgPool, json: bool) -> Result<()> {
@@ -10790,25 +10719,8 @@ async fn handle_ports(cmd: PortsCommand) -> Result<()> {
         PortsCommand::List { kind, scope, json } => {
             handle_ports_list(&pool, kind, scope, json).await
         }
-        PortsCommand::Seed => handle_ports_seed(&pool).await,
         PortsCommand::Scan { computer } => handle_ports_scan(&pool, &computer).await,
     }
-}
-
-async fn handle_ports_seed(pool: &sqlx::PgPool) -> Result<()> {
-    let path = ff_agent::ports_registry::resolve_ports_path();
-    println!(
-        "{CYAN}▶ Seeding port_registry from {}{RESET}",
-        path.display()
-    );
-    let report = ff_agent::ports_registry::seed_from_toml(pool, &path)
-        .await
-        .map_err(|e| anyhow::anyhow!("seed ports: {e}"))?;
-    println!(
-        "{GREEN}✓ port_registry seed:{RESET} total={} inserted={} updated={} unchanged={}",
-        report.total, report.inserted, report.updated, report.unchanged,
-    );
-    Ok(())
 }
 
 async fn handle_ports_list(
@@ -14005,22 +13917,6 @@ async fn handle_alert(cmd: AlertCommand) -> Result<()> {
                 );
             }
         }
-        AlertCommand::Policy { command } => match command {
-            AlertPolicyCommand::Seed { path } => {
-                let toml_path = path.unwrap_or_else(resolve_alert_toml_path);
-                let report = ff_agent::seed_alert_policies_from_toml(&pool, &toml_path)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("seed alert_policies: {e}"))?;
-                println!(
-                    "Seeded alert_policies from {}: inserted={} updated={} unchanged={} total={}",
-                    toml_path.display(),
-                    report.inserted,
-                    report.updated,
-                    report.unchanged,
-                    report.total
-                );
-            }
-        },
     }
     Ok(())
 }
@@ -14161,21 +14057,6 @@ async fn handle_events(cmd: EventsCommand) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// Locate config/alert_policies.toml relative to the binary or the cwd.
-fn resolve_alert_toml_path() -> PathBuf {
-    if let Ok(md) = std::env::current_exe()
-        && let Some(p) = md
-            .parent()
-            .and_then(|d| d.parent())
-            .and_then(|d| d.parent())
-            .map(|d| d.join("config/alert_policies.toml"))
-        && p.exists()
-    {
-        return p;
-    }
-    PathBuf::from("config/alert_policies.toml")
 }
 
 /// Parse a duration like "5m", "1h", "24h", "30s" into seconds.
