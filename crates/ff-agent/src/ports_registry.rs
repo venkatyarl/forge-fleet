@@ -177,13 +177,14 @@ pub fn resolve_ports_path() -> PathBuf {
     // Also probe the repo root explicitly — handy when invoked from a
     // launchd / systemd unit with a fixed working directory.
     if let Ok(home) = std::env::var("HOME") {
-        let explicit = PathBuf::from(&home).join("taylorProjects/forge-fleet/config/ports.toml");
+        let explicit = PathBuf::from(&home).join("projects/forge-fleet/config/ports.toml");
         if explicit.exists() {
             return explicit;
         }
-        let alt = PathBuf::from(&home).join("projects/forge-fleet/config/ports.toml");
-        if alt.exists() {
-            return alt;
+        let worker =
+            PathBuf::from(&home).join(".forgefleet/sub-agent-0/forge-fleet/config/ports.toml");
+        if worker.exists() {
+            return worker;
         }
     }
     PathBuf::from("config/ports.toml")

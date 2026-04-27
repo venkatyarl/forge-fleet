@@ -1,12 +1,11 @@
 //! Project registry loader.
 //!
-//! Parses `config/projects.toml` and upserts each entry into the `projects`
-//! Postgres table (schema V15). Mirrors [`software_registry::seed_from_toml`]
-//! in shape — it returns an insert/update/unchanged breakdown, treats the
-//! columns owned by the GitHub sync loop (`main_commit_sha`,
-//! `main_commit_message`, `main_committed_at`, `main_committed_by`,
-//! `main_last_synced_at`) as read-only from this seeder's perspective,
-//! and never writes them during upsert.
+//! Historically this parsed `config/projects.toml` and upserted each entry
+//! into the `projects` Postgres table (schema V15). The TOML has been
+//! retired — migration `SCHEMA_V56_RETIRE_LAST_TOMLS_AND_CLI_BUILD` seeds
+//! the canonical row set directly. The seeder is preserved as a compat
+//! shim that no-ops cleanly when the file is absent so any predate
+//! callers (`ff project seed`) keep compiling.
 
 use std::path::{Path, PathBuf};
 
@@ -99,10 +98,25 @@ pub async fn seed_from_toml(
     pool: &PgPool,
     toml_path: &Path,
 ) -> Result<ProjectSeedReport, ProjectError> {
-    let raw = std::fs::read_to_string(toml_path).map_err(|source| ProjectError::Io {
-        path: toml_path.to_path_buf(),
-        source,
-    })?;
+    let raw = match std::fs::read_to_string(toml_path) {
+        Ok(s) => s,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static LOGGED: AtomicBool = AtomicBool::new(false);
+            if !LOGGED.swap(true, Ordering::Relaxed) {
+                tracing::info!(
+                    "projects: TOML seeder retired; canonical rows come from migration V56"
+                );
+            }
+            return Ok(ProjectSeedReport::default());
+        }
+        Err(source) => {
+            return Err(ProjectError::Io {
+                path: toml_path.to_path_buf(),
+                source,
+            });
+        }
+    };
 
     let doc: ProjectFile = toml::from_str(&raw).map_err(|source| ProjectError::Toml {
         path: toml_path.to_path_buf(),

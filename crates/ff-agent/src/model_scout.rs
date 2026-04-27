@@ -17,7 +17,6 @@
 //! opening HF.
 
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -60,10 +59,6 @@ const ALLOWED_LICENSES: &[&str] = &[
     "mpl-2.0",
 ];
 
-/// Default denylist path. Soft-fails if missing.
-pub const DEFAULT_DENYLIST_PATH: &str =
-    "/Users/venkat/projects/forge-fleet/config/scout_denylist.toml";
-
 /// Errors that can occur during a scout pass.
 #[derive(Debug, Error)]
 pub enum ScoutError {
@@ -90,22 +85,12 @@ pub struct ScoutReport {
 /// Model scout.
 pub struct ModelScout {
     pg: PgPool,
-    denylist_path: PathBuf,
 }
 
 impl ModelScout {
-    /// Build a scout with the given pool and the default denylist path.
+    /// Build a scout with the given pool.
     pub fn new(pg: PgPool) -> Self {
-        Self {
-            pg,
-            denylist_path: PathBuf::from(DEFAULT_DENYLIST_PATH),
-        }
-    }
-
-    /// Override the denylist path (tests, alt configs).
-    pub fn with_denylist<P: AsRef<Path>>(mut self, path: P) -> Self {
-        self.denylist_path = path.as_ref().to_path_buf();
-        self
+        Self { pg }
     }
 
     /// Run one scout pass. Returns a summary — no panics; any HF/DB
@@ -120,7 +105,7 @@ impl ModelScout {
             .await
             .unwrap_or(None);
 
-        let denylist = load_denylist(&self.denylist_path);
+        let denylist = load_denylist(&self.pg).await;
         let existing = load_existing_catalog_keys(&self.pg).await?;
 
         let tasks: Vec<String> = sqlx::query_scalar("SELECT task FROM fleet_task_coverage")
@@ -430,22 +415,19 @@ async fn load_existing_catalog_keys(pg: &PgPool) -> Result<HashSet<String>, sqlx
     Ok(set)
 }
 
-fn load_denylist(path: &Path) -> HashSet<String> {
-    #[derive(Deserialize, Default)]
-    struct DenyFile {
-        #[serde(default)]
-        deny: Vec<String>,
-    }
-
-    let raw = match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(_) => return HashSet::new(),
+async fn load_denylist(pool: &PgPool) -> HashSet<String> {
+    let rows: Vec<(String,)> = match sqlx::query_as("SELECT model_id FROM model_scout_denylist")
+        .fetch_all(pool)
+        .await
+    {
+        Ok(r) => r,
+        Err(err) => {
+            warn!(error = %err, "scout: failed to load denylist from DB; using empty");
+            return HashSet::new();
+        }
     };
-    let parsed: DenyFile = toml::from_str(&raw).unwrap_or_default();
-    parsed
-        .deny
-        .into_iter()
-        .map(|s| s.to_ascii_lowercase())
+    rows.into_iter()
+        .map(|(s,)| s.to_ascii_lowercase())
         .collect()
 }
 
@@ -488,11 +470,5 @@ mod tests {
             short_id("meta-llama/Llama-3.3-70B-Instruct"),
             "llama-3-3-70b-instruct"
         );
-    }
-
-    #[test]
-    fn denylist_load_missing_returns_empty() {
-        let s = load_denylist(Path::new("/nonexistent/path/denylist.toml"));
-        assert!(s.is_empty());
     }
 }

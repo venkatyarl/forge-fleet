@@ -317,9 +317,14 @@ pub async fn health_check_deployment(
 
 fn llama_server_binary() -> String {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
-    let candidate = PathBuf::from(&home).join("taylorProjects/llama.cpp/build/bin/llama-server");
-    if candidate.is_file() {
-        return candidate.to_string_lossy().to_string();
+    for rel in [
+        "projects/llama.cpp/build/bin/llama-server",
+        ".forgefleet/llama.cpp/build/bin/llama-server",
+    ] {
+        let candidate = PathBuf::from(&home).join(rel);
+        if candidate.is_file() {
+            return candidate.to_string_lossy().to_string();
+        }
     }
     // Fallback: rely on PATH.
     "llama-server".to_string()

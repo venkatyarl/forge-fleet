@@ -4924,3 +4924,123 @@ CREATE INDEX IF NOT EXISTS idx_session_brain_by_step
     ON session_brain(written_by_step)
     WHERE written_by_step IS NOT NULL;
 "#;
+
+// ─── V56: retire last 2 TOMLs + ensure CLI is rebuilt on workers ───────────
+//
+// Three coupled cleanups:
+//
+// 1. `config/scout_denylist.toml` → `model_scout_denylist` table. Single
+//    column `model_id TEXT PRIMARY KEY` (case-folded). Empty by default;
+//    operators add via `ff model reject <id>`.
+//
+// 2. `config/projects.toml` → seed the existing `projects` table directly
+//    (V15). The TOML can then be deleted; runtime additions already go to
+//    Postgres per the DB-first catalog rule.
+//
+// 3. Worker `ff` CLI binary stayed stale across upgrades because the V51
+//    playbook only built `-p forge-fleet` (the daemon package). Switch to
+//    `-p forge-fleet -p ff-terminal` so `target/release/ff` is rebuilt
+//    alongside `forgefleetd` on every upgrade tick.
+pub const SCHEMA_V56_RETIRE_LAST_TOMLS_AND_CLI_BUILD: &str = r#"
+-- Drop the orphan V11 software_registry rows (display_name 'ForgeFleet
+-- CLI (ff)' / 'ForgeFleet Daemon (forgefleetd)') if they're still around.
+-- The active rollout uses 'ff_git' / 'forgefleetd_git'.
+DELETE FROM software_registry WHERE id IN ('ff', 'forgefleetd');
+
+-- Model scout denylist — replaces config/scout_denylist.toml.
+CREATE TABLE IF NOT EXISTS model_scout_denylist (
+    model_id      TEXT PRIMARY KEY,
+    reason        TEXT,
+    added_by      TEXT,
+    added_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Seed projects directly from the retired TOML.
+INSERT INTO projects (id, display_name, repo_url, default_branch, compose_file, target_computers, status)
+VALUES
+  ('forge-fleet', 'ForgeFleet',  'https://github.com/venkatyarl/forge-fleet',  'main', 'deploy/docker-compose.yml', '["taylor","marcus","sophie","priya","james","ace"]'::jsonb, 'active'),
+  ('hireflow360', 'HireFlow360', 'https://github.com/venkatyarl/hireflow360', 'main', 'docker-compose.yml',         '["taylor"]'::jsonb,                                          'active'),
+  ('auraos',      'AuraOS',      'https://github.com/venkatyarl/auraos',      'main', NULL,                          '["taylor"]'::jsonb,                                          'active')
+ON CONFLICT (id) DO UPDATE SET
+  display_name     = EXCLUDED.display_name,
+  repo_url         = EXCLUDED.repo_url,
+  default_branch   = EXCLUDED.default_branch,
+  compose_file     = EXCLUDED.compose_file,
+  target_computers = EXCLUDED.target_computers,
+  status           = EXCLUDED.status;
+
+-- Build both the daemon AND the CLI on every upgrade tick. Without this,
+-- target/release/ff is whatever was built last time ff-terminal was
+-- compiled — typically stale by weeks.
+UPDATE software_registry
+   SET upgrade_playbook = jsonb_set(
+           jsonb_set(
+               jsonb_set(
+                   jsonb_set(
+                       upgrade_playbook,
+                       '{linux-ubuntu}',
+                       to_jsonb(
+                          'export PATH="$HOME/.cargo/bin:$PATH" && '
+                       || 'export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" && '
+                       || 'mkdir -p "$(dirname $HOME/.forgefleet/sub-agent-0/forge-fleet)" && '
+                       || '{ [ -d "$HOME/.forgefleet/sub-agent-0/forge-fleet/.git" ] || git clone https://github.com/venkatyarl/forge-fleet "$HOME/.forgefleet/sub-agent-0/forge-fleet"; } && '
+                       || 'cd "$HOME/.forgefleet/sub-agent-0/forge-fleet" && '
+                       || 'git fetch origin main && '
+                       || 'NEED_BUILD=1; '
+                       || 'if [ "$(git rev-parse HEAD 2>/dev/null)" = "$(git rev-parse origin/main 2>/dev/null)" ] && [ -x target/release/forgefleetd ] && [ -x target/release/ff ]; then NEED_BUILD=0; fi; '
+                       || 'if [ "$NEED_BUILD" = "1" ]; then git reset --hard origin/main && cargo build --release -p forge-fleet -p ff-terminal; fi && '
+                       || 'install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && '
+                       || 'install -m 755 target/release/ff ~/.local/bin/ff && '
+                       || 'systemctl --user reset-failed forgefleetd.service forgefleet-node.service forgefleet-daemon.service 2>/dev/null; '
+                       || 'systemctl --user restart forgefleetd.service || systemctl --user restart forgefleet-node.service || systemctl --user restart forgefleet-daemon.service'
+                       )
+                   ),
+                   '{linux-dgx}',
+                   to_jsonb(
+                      'export PATH="$HOME/.cargo/bin:$PATH" && '
+                   || 'export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" && '
+                   || 'mkdir -p "$(dirname $HOME/.forgefleet/sub-agent-0/forge-fleet)" && '
+                   || '{ [ -d "$HOME/.forgefleet/sub-agent-0/forge-fleet/.git" ] || git clone https://github.com/venkatyarl/forge-fleet "$HOME/.forgefleet/sub-agent-0/forge-fleet"; } && '
+                   || 'cd "$HOME/.forgefleet/sub-agent-0/forge-fleet" && '
+                   || 'git fetch origin main && '
+                   || 'NEED_BUILD=1; '
+                   || 'if [ "$(git rev-parse HEAD 2>/dev/null)" = "$(git rev-parse origin/main 2>/dev/null)" ] && [ -x target/release/forgefleetd ] && [ -x target/release/ff ]; then NEED_BUILD=0; fi; '
+                   || 'if [ "$NEED_BUILD" = "1" ]; then git reset --hard origin/main && cargo build --release -p forge-fleet -p ff-terminal; fi && '
+                   || 'install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && '
+                   || 'install -m 755 target/release/ff ~/.local/bin/ff && '
+                   || 'systemctl --user reset-failed forgefleetd.service forgefleet-node.service forgefleet-daemon.service 2>/dev/null; '
+                   || 'systemctl --user restart forgefleetd.service || systemctl --user restart forgefleet-node.service || systemctl --user restart forgefleet-daemon.service'
+                   )
+               ),
+               '{linux-ubuntu-build-only}',
+               to_jsonb(
+                  'export PATH="$HOME/.cargo/bin:$PATH" && '
+               || 'export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" && '
+               || 'mkdir -p "$(dirname $HOME/.forgefleet/sub-agent-0/forge-fleet)" && '
+               || '{ [ -d "$HOME/.forgefleet/sub-agent-0/forge-fleet/.git" ] || git clone https://github.com/venkatyarl/forge-fleet "$HOME/.forgefleet/sub-agent-0/forge-fleet"; } && '
+               || 'cd "$HOME/.forgefleet/sub-agent-0/forge-fleet" && '
+               || 'git fetch origin main && '
+               || 'NEED_BUILD=1; '
+               || 'if [ "$(git rev-parse HEAD 2>/dev/null)" = "$(git rev-parse origin/main 2>/dev/null)" ] && [ -x target/release/forgefleetd ] && [ -x target/release/ff ]; then NEED_BUILD=0; fi; '
+               || 'if [ "$NEED_BUILD" = "1" ]; then git reset --hard origin/main && cargo build --release -p forge-fleet -p ff-terminal; fi && '
+               || 'install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && '
+               || 'install -m 755 target/release/ff ~/.local/bin/ff'
+               )
+           ),
+           '{linux-dgx-build-only}',
+           to_jsonb(
+              'export PATH="$HOME/.cargo/bin:$PATH" && '
+           || 'export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" && '
+           || 'mkdir -p "$(dirname $HOME/.forgefleet/sub-agent-0/forge-fleet)" && '
+           || '{ [ -d "$HOME/.forgefleet/sub-agent-0/forge-fleet/.git" ] || git clone https://github.com/venkatyarl/forge-fleet "$HOME/.forgefleet/sub-agent-0/forge-fleet"; } && '
+           || 'cd "$HOME/.forgefleet/sub-agent-0/forge-fleet" && '
+           || 'git fetch origin main && '
+           || 'NEED_BUILD=1; '
+           || 'if [ "$(git rev-parse HEAD 2>/dev/null)" = "$(git rev-parse origin/main 2>/dev/null)" ] && [ -x target/release/forgefleetd ] && [ -x target/release/ff ]; then NEED_BUILD=0; fi; '
+           || 'if [ "$NEED_BUILD" = "1" ]; then git reset --hard origin/main && cargo build --release -p forge-fleet -p ff-terminal; fi && '
+           || 'install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && '
+           || 'install -m 755 target/release/ff ~/.local/bin/ff'
+           )
+       )
+ WHERE id IN ('ff_git', 'forgefleetd_git');
+"#;
