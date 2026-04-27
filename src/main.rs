@@ -361,6 +361,18 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         subsystem_tasks.push(h);
     }
 
+    // 6.7) Session orchestrator — V54 outcome-driven multi-LLM sessions.
+    // Walks each session's step DAG, dispatches each step's prompt as
+    // a fleet_task, reconciles the result back. Runs on every member
+    // (the SQL UPDATEs are not yet atomic; concurrent runners may race
+    // on dispatch — fine for early-stage; future PR-L follow-up adds
+    // SKIP LOCKED on the pending-step claim).
+    if let Some(pg_pool) = operational_store.pg_pool() {
+        let (_session_runner_tx, session_runner_rx) = tokio::sync::watch::channel(false);
+        let h = ff_agent::session_runner::spawn(pg_pool.clone(), session_runner_rx);
+        subsystem_tasks.push(h);
+    }
+
     // 7) telegram polling transport (bidirectional control channel)
     if config
         .transport

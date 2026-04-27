@@ -413,6 +413,15 @@ enum Command {
         #[command(subcommand)]
         command: TasksCommand,
     },
+    /// V54: outcome-driven multi-LLM sessions. A session has a goal,
+    /// a step DAG, and a team of role→model assignments. The
+    /// orchestrator (running on the leader) walks the DAG, dispatches
+    /// each step via fleet_tasks, and finalises the session when all
+    /// steps are terminal.
+    Session {
+        #[command(subcommand)]
+        command: SessionCommand,
+    },
     /// OAuth subscription credentials — harvest from a vendor CLI's local
     /// cred file on the leader, distribute to fleet members. Powers
     /// Layer 1 (`oauth_subscription` auth_kind) of the multi-LLM CLI
@@ -693,6 +702,45 @@ enum DeferCommand {
     Cancel { id: String },
     /// Retry a failed or cancelled task (resets attempts-aware status, runs ASAP).
     Retry { id: String },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum SessionCommand {
+    /// Create a new outcome-driven session. No steps are added
+    /// automatically — use `ff session step add` to compose the DAG
+    /// (LLM-driven decomposition by the planner role is a follow-up).
+    Spawn {
+        /// The user-stated outcome.
+        goal: String,
+        /// Optional per-session budget cap (USD). Orchestrator stops
+        /// dispatching when cumulative cost reaches this.
+        #[arg(long)]
+        budget: Option<f64>,
+    },
+    /// Append a step to an existing session.
+    AddStep {
+        session: String,
+        /// Step name (free-form, shown in `ff session get`).
+        #[arg(long)]
+        name: String,
+        /// Role tag (planner / coder / reviewer / browser / synthesiser).
+        /// When unset, the step uses the default LLM (qwen2.5-coder-32b).
+        #[arg(long)]
+        role: Option<String>,
+        /// The LLM prompt this step should run.
+        #[arg(long)]
+        prompt: String,
+        /// IDs of sibling steps that must complete first. Repeatable.
+        #[arg(long = "depends-on")]
+        depends_on: Vec<String>,
+    },
+    /// List recent sessions with progress counters.
+    List {
+        #[arg(long, default_value_t = 30)]
+        limit: i64,
+    },
+    /// Show one session: full step DAG + per-step results.
+    Get { id: String },
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -2288,6 +2336,89 @@ async fn main() -> Result<()> {
                     .map_err(|e| anyhow::anyhow!("compose: {e}"))?;
                     println!("composed parent task: {parent}");
                     println!("watch progress with: ff tasks list --status pending,running");
+                    Ok(())
+                }
+            }
+        }
+        Some(Command::Session { command }) => {
+            let pool = ff_agent::fleet_info::get_fleet_pool()
+                .await
+                .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
+            ff_db::run_postgres_migrations(&pool)
+                .await
+                .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
+            match command {
+                SessionCommand::Spawn { goal, budget } => {
+                    let who = ff_agent::fleet_info::resolve_this_node_name().await;
+                    let id = ff_agent::session_runner::create_session(
+                        &pool,
+                        &goal,
+                        None,
+                        budget,
+                        Some(&who),
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("create session: {e}"))?;
+                    println!("{id}");
+                    Ok(())
+                }
+                SessionCommand::AddStep {
+                    session,
+                    name,
+                    role,
+                    prompt,
+                    depends_on,
+                } => {
+                    let session_id = uuid::Uuid::parse_str(&session)
+                        .map_err(|e| anyhow::anyhow!("invalid session uuid: {e}"))?;
+                    let dep_ids: Vec<uuid::Uuid> = depends_on
+                        .iter()
+                        .map(|s| uuid::Uuid::parse_str(s))
+                        .collect::<Result<_, _>>()
+                        .map_err(|e| anyhow::anyhow!("invalid --depends-on: {e}"))?;
+                    let id = ff_agent::session_runner::add_step(
+                        &pool,
+                        session_id,
+                        &name,
+                        role.as_deref(),
+                        &prompt,
+                        &dep_ids,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("add step: {e}"))?;
+                    println!("{id}");
+                    Ok(())
+                }
+                SessionCommand::List { limit } => {
+                    let rows = ff_agent::session_runner::list_sessions(&pool, limit)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("list: {e}"))?;
+                    println!(
+                        "{:<36} {:<10} {:<6} {:<6} {:<6} GOAL",
+                        "ID", "STATUS", "DONE", "FAIL", "TOTAL"
+                    );
+                    for r in rows {
+                        let id = r.get("id").and_then(|v| v.as_str()).unwrap_or("-");
+                        let status = r.get("status").and_then(|v| v.as_str()).unwrap_or("-");
+                        let done = r.get("steps_done").and_then(|v| v.as_i64()).unwrap_or(0);
+                        let failed = r.get("steps_failed").and_then(|v| v.as_i64()).unwrap_or(0);
+                        let total = r.get("steps_total").and_then(|v| v.as_i64()).unwrap_or(0);
+                        let goal = r.get("goal").and_then(|v| v.as_str()).unwrap_or("");
+                        let goal_short: String = goal.chars().take(60).collect();
+                        println!(
+                            "{:<36} {:<10} {:<6} {:<6} {:<6} {}",
+                            id, status, done, failed, total, goal_short
+                        );
+                    }
+                    Ok(())
+                }
+                SessionCommand::Get { id } => {
+                    let sid = uuid::Uuid::parse_str(&id)
+                        .map_err(|e| anyhow::anyhow!("invalid uuid: {e}"))?;
+                    let json = ff_agent::session_runner::get_session(&pool, sid)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("get: {e}"))?;
+                    println!("{}", serde_json::to_string_pretty(&json).unwrap_or_default());
                     Ok(())
                 }
             }

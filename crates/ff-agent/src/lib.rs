@@ -60,6 +60,7 @@ pub mod nats_log_layer;
 pub mod notifications;
 pub mod brain_mirror;
 pub mod cli_executor;
+pub mod session_runner;
 pub mod oauth_distributor;
 pub mod openai_bridge;
 pub mod openclaw;

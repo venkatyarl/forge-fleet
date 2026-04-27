@@ -19,12 +19,13 @@ ff-observability = { path = "../ff-observability" }
 ff-pulse = { path = "../ff-pulse" }
 ff-voice = { path = "../ff-voice" }
 
+axum = { workspace = true, features = ["multipart"] }
+
 # Workspace dependencies requested by architecture spec
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
-axum.workspace = true
 reqwest.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
