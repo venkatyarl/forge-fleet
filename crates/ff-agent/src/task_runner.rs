@@ -40,6 +40,13 @@ const STUCK_AFTER_SECS: i64 = 120;
 const HEARTBEAT_EVERY: Duration = Duration::from_secs(30);
 /// Max times a row can be handed off before we give up and fail it.
 const MAX_HANDOFFS: i32 = 3;
+/// Max wall-clock duration for a single shell task. Closes the
+/// heartbeat-fresh-but-stuck-forever class of bug (worker's heartbeat
+/// task keeps firing while the actual SSH/cargo child is wedged).
+/// Generous default — a from-scratch fleet build can take 10+ min on
+/// slower nodes; 30 min covers that with margin. Per-task override via
+/// `payload.max_duration_secs` if needed.
+const MAX_TASK_DURATION: Duration = Duration::from_secs(30 * 60);
 
 /// Read a port-shaped row from `fleet_secrets`. Panics loudly if the
 /// row is missing — better than silently falling back to a hardcoded
@@ -242,12 +249,33 @@ impl TaskRunner {
         });
 
         // 3. Run the payload — with FF_* env vars injected so tasks
-        // never have to embed IPs, paths, or names in source.
-        let outcome = run_shell_payload(&payload, &self.env).await;
+        // never have to embed IPs, paths, or names in source. Per-task
+        // override of MAX_TASK_DURATION via `payload.max_duration_secs`.
+        let max_duration = payload
+            .get("max_duration_secs")
+            .and_then(Value::as_u64)
+            .map(Duration::from_secs)
+            .unwrap_or(MAX_TASK_DURATION);
+        let outcome = match tokio::time::timeout(
+            max_duration,
+            run_shell_payload(&payload, &self.env),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(TaskRunnerError::BadPayload(Box::leak(
+                format!("task exceeded max duration of {}s", max_duration.as_secs())
+                    .into_boxed_str(),
+            ))),
+        };
         let _ = cancel_tx.send(());
         let _ = hb_task.await;
 
-        // 4. Persist result.
+        // 4. Persist result. The `WHERE status = 'running'` guard makes
+        // the completion update idempotent against operator
+        // cancellation — `ff tasks cancel <id>` flips status to
+        // `cancelled`, and a subsequent late-completing worker won't
+        // overwrite that.
         match outcome {
             Ok(result) => {
                 let exit = result.get("exit").and_then(Value::as_i64).unwrap_or(-1);
@@ -258,7 +286,7 @@ impl TaskRunner {
                                 completed_at  = NOW(),
                                 progress_pct  = 100.0,
                                 result        = $1
-                          WHERE id = $2",
+                          WHERE id = $2 AND status = 'running'",
                     )
                     .bind(&result)
                     .bind(task_id)
@@ -272,7 +300,7 @@ impl TaskRunner {
                                 completed_at  = NOW(),
                                 result        = $1,
                                 error         = $2
-                          WHERE id = $3",
+                          WHERE id = $3 AND status = 'running'",
                     )
                     .bind(&result)
                     .bind(format!("non-zero exit: {exit}"))
@@ -288,7 +316,7 @@ impl TaskRunner {
                         SET status       = 'failed',
                             completed_at = NOW(),
                             error        = $1
-                      WHERE id = $2",
+                      WHERE id = $2 AND status = 'running'",
                 )
                 .bind(format!("{e}"))
                 .bind(task_id)
@@ -365,6 +393,36 @@ pub async fn handoff_stuck_tasks(pg: &PgPool) -> Result<usize, sqlx::Error> {
     .await?;
 
     Ok(demoted.len())
+}
+
+/// Operator escape hatch — mark a task `cancelled` regardless of its
+/// current state. Returns the previous status so the caller can warn
+/// when there's nothing to cancel. The worker's completion UPDATE is
+/// gated on `status = 'running'`, so a hung worker that finishes late
+/// won't clobber the cancellation. The actual child process keeps
+/// running on the worker until it exits or hits MAX_TASK_DURATION;
+/// its row stays `cancelled` either way.
+pub async fn pg_cancel_task(
+    pg: &PgPool,
+    task_id: uuid::Uuid,
+    reason: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    let prev_status: Option<String> = sqlx::query_scalar(
+        "UPDATE fleet_tasks
+            SET status       = 'cancelled',
+                completed_at = COALESCE(completed_at, NOW()),
+                error        = COALESCE(error, $1)
+          WHERE id = $2
+            AND status NOT IN ('completed', 'failed', 'cancelled')
+        RETURNING (
+          SELECT status FROM fleet_tasks WHERE id = $2
+        )",
+    )
+    .bind(reason)
+    .bind(task_id)
+    .fetch_optional(pg)
+    .await?;
+    Ok(prev_status)
 }
 
 /// Convenience: spawn the leader watchdog as a background tick.
@@ -513,20 +571,23 @@ async fn run_shell_payload(
         .unwrap_or("/bin/bash")
         .to_string();
 
-    let env_owned: Vec<(String, String)> = env.to_vec();
+    // Use tokio::process so the child can actually be killed if the
+    // outer Future is dropped (e.g. by tokio::time::timeout). The
+    // `kill_on_drop(true)` flag makes the runtime SIGKILL the child
+    // when the Child handle is dropped — closes the
+    // heartbeat-fresh-but-stuck-forever class of bug documented in
+    // feedback_priya_worker_hangs_with_fresh_heartbeat.md.
+    let mut cmd = tokio::process::Command::new(&shell);
+    cmd.arg("-lc").arg(&command);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    cmd.kill_on_drop(true);
 
-    // Run in a blocking thread so we don't tie up the runtime.
-    let out = tokio::task::spawn_blocking(move || {
-        let mut cmd = std::process::Command::new(&shell);
-        cmd.arg("-lc").arg(&command);
-        for (k, v) in &env_owned {
-            cmd.env(k, v);
-        }
-        cmd.output()
-    })
-    .await
-    .map_err(|e| TaskRunnerError::BadPayload(Box::leak(format!("join: {e}").into_boxed_str())))?
-    .map_err(|e| TaskRunnerError::BadPayload(Box::leak(format!("spawn: {e}").into_boxed_str())))?;
+    let out = cmd
+        .output()
+        .await
+        .map_err(|e| TaskRunnerError::BadPayload(Box::leak(format!("spawn: {e}").into_boxed_str())))?;
 
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
