@@ -75,17 +75,34 @@ impl LocalHealer {
 
     /// Synchronous pgrep — cheap and avoids pulling in a tokio::process
     /// dependency just for a pid lookup.
+    ///
+    /// Also detects the multi-daemon orphan pattern (two forgefleetd
+    /// PIDs from a legacy `forgefleet-node.service` / `forgefleet-agent
+    /// .service` racing against the canonical `forgefleetd.service`).
+    /// Emits a warn log so operators see it; cleanup is via
+    /// `bootstrap-node-template.sh` § "Sweep legacy units" or a manual
+    /// systemctl disable. We do NOT auto-kill — too easy to take out
+    /// the canonical daemon by mistake.
     fn forgefleetd_running(&self) -> bool {
-        let pattern = format!("forgefleetd --node-name {}", self.my_name);
-        match std::process::Command::new("pgrep")
-            .arg("-f")
-            .arg(&pattern)
-            .stdout(Stdio::null())
+        let output = std::process::Command::new("pgrep")
+            .arg("-x")
+            .arg("forgefleetd")
+            .stdout(std::process::Stdio::piped())
             .stderr(Stdio::null())
-            .status()
-        {
-            Ok(status) => status.success(),
-            Err(_) => false,
+            .output();
+        match output {
+            Ok(out) if out.status.success() => {
+                let pid_count = String::from_utf8_lossy(&out.stdout).lines().count();
+                if pid_count > 1 {
+                    tracing::warn!(
+                        node = %self.my_name,
+                        pid_count,
+                        "local_healer: multiple forgefleetd processes detected — likely a legacy `forgefleet-node.service` or `forgefleet-agent.service` racing the canonical unit. Run bootstrap or manual systemctl disable on the legacy."
+                    );
+                }
+                true
+            }
+            _ => false,
         }
     }
 

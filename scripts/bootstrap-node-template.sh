@@ -511,6 +511,26 @@ fi
 # ─── 11. systemd unit ────────────────────────────────────────────────────
 
 if [ "$OS_ID" != "macos" ]; then
+  # Sweep legacy user-scope units that ship the `forgefleetd --node-name <h>
+  # start` ExecStart pattern. When they coexist with the canonical
+  # `forgefleetd.service`, both fire on boot and the one with --node-name
+  # creates a "shell-launcher → forgefleetd" pair that looks like an
+  # orphan to the wave dispatcher. Discovered 2026-04-27 — present on 9
+  # of 13 Linux fleet hosts at that point. Idempotent: noop when absent.
+  USER_SYSTEMD_DIR="$USER_HOME/.config/systemd/user"
+  if [ -d "$USER_SYSTEMD_DIR" ]; then
+    for legacy in forgefleet-node.service forgefleet-agent.service; do
+      if [ -f "$USER_SYSTEMD_DIR/$legacy" ]; then
+        run_as_user systemctl --user stop "$legacy" 2>/dev/null || true
+        run_as_user systemctl --user disable "$legacy" 2>/dev/null || true
+        rm -f "$USER_SYSTEMD_DIR/$legacy"
+        rm -f "$USER_SYSTEMD_DIR/default.target.wants/$legacy"
+        report "legacy_unit_swept" ok "$legacy"
+      fi
+    done
+    run_as_user systemctl --user daemon-reload 2>/dev/null || true
+  fi
+
   report "service" running
   UNIT=/etc/systemd/system/forgefleet-daemon@.service
   cp "$REPO_DIR/deploy/systemd/forgefleet-daemon.service" "$UNIT"
