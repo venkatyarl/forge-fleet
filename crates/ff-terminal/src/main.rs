@@ -772,6 +772,30 @@ enum SessionCommand {
         #[arg(long = "from-step")]
         from_step: Option<String>,
     },
+    /// Add a parallel multi-LLM vote: N voters run the same prompt
+    /// against different models; a tally step depends on all and
+    /// picks consensus. Voters are model names (claude-opus-4-7,
+    /// gpt-5, gemini-2.5-pro, etc.).
+    Vote {
+        session: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        prompt: String,
+        /// Comma-separated model names. Each becomes one voter.
+        #[arg(long, value_delimiter = ',')]
+        voters: Vec<String>,
+        /// Role used for the tally step (default: synthesiser).
+        #[arg(long = "tally-role")]
+        tally_role: Option<String>,
+    },
+    /// Collect the raw answers from a completed vote and store them
+    /// in session_brain under `vote_<name>` for operator review.
+    VoteCollect {
+        session: String,
+        #[arg(long)]
+        name: String,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -2536,6 +2560,49 @@ async fn main() -> Result<()> {
                     for id in ids {
                         println!("  {id}");
                     }
+                    Ok(())
+                }
+                SessionCommand::Vote {
+                    session,
+                    name,
+                    prompt,
+                    voters,
+                    tally_role,
+                } => {
+                    let sid = uuid::Uuid::parse_str(&session)
+                        .map_err(|e| anyhow::anyhow!("invalid uuid: {e}"))?;
+                    if voters.is_empty() {
+                        return Err(anyhow::anyhow!(
+                            "--voters required (comma-separated model names)"
+                        ));
+                    }
+                    let (voter_ids, tally_id) = ff_agent::session_runner::create_vote(
+                        &pool,
+                        sid,
+                        &name,
+                        &prompt,
+                        &voters,
+                        tally_role.as_deref(),
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("create vote: {e}"))?;
+                    println!(
+                        "{GREEN}✓{RESET} created vote step graph: {} voter(s) + tally",
+                        voter_ids.len()
+                    );
+                    for (i, id) in voter_ids.iter().enumerate() {
+                        println!("  voter {i}: {id} ({})", voters[i]);
+                    }
+                    println!("  tally:    {tally_id}");
+                    Ok(())
+                }
+                SessionCommand::VoteCollect { session, name } => {
+                    let sid = uuid::Uuid::parse_str(&session)
+                        .map_err(|e| anyhow::anyhow!("invalid uuid: {e}"))?;
+                    let snap = ff_agent::session_runner::collect_vote_answers(&pool, sid, &name)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("collect: {e}"))?;
+                    println!("{}", serde_json::to_string_pretty(&snap).unwrap_or_default());
                     Ok(())
                 }
             }
