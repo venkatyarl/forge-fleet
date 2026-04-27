@@ -412,6 +412,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "agent_orchestration",
         sql: schema::SCHEMA_V54_AGENT_ORCHESTRATION,
     },
+    PgMigration {
+        version: 55,
+        name: "session_brain",
+        sql: schema::SCHEMA_V55_SESSION_BRAIN,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.

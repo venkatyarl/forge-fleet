@@ -407,6 +407,90 @@ pub fn spawn(pool: PgPool, mut shutdown: watch::Receiver<bool>) -> JoinHandle<()
     })
 }
 
+/// Write a session-scoped memory entry. Roles within a session use
+/// this to share structured findings without polluting each other's
+/// context windows. JSONB value lets roles pass structured data
+/// (lists, citations, code blocks) across steps.
+///
+/// Idempotent: if `key` already exists for the session, it's
+/// overwritten (last-write-wins).
+pub async fn brain_set(
+    pool: &PgPool,
+    session_id: uuid::Uuid,
+    key: &str,
+    value: &Value,
+    written_by_role: Option<&str>,
+    written_by_step: Option<uuid::Uuid>,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO session_brain
+            (session_id, key, value, written_by_role, written_by_step, written_at)
+         VALUES ($1, $2, $3, $4, $5, NOW())
+         ON CONFLICT (session_id, key) DO UPDATE SET
+            value = EXCLUDED.value,
+            written_by_role = EXCLUDED.written_by_role,
+            written_by_step = EXCLUDED.written_by_step,
+            written_at = NOW()",
+    )
+    .bind(session_id)
+    .bind(key)
+    .bind(value)
+    .bind(written_by_role)
+    .bind(written_by_step)
+    .execute(pool)
+    .await
+    .context("session_brain set")?;
+    Ok(())
+}
+
+/// Read a session-scoped memory entry. `None` if not set.
+pub async fn brain_get(
+    pool: &PgPool,
+    session_id: uuid::Uuid,
+    key: &str,
+) -> Result<Option<Value>> {
+    let row: Option<Value> = sqlx::query_scalar(
+        "SELECT value FROM session_brain WHERE session_id = $1 AND key = $2",
+    )
+    .bind(session_id)
+    .bind(key)
+    .fetch_optional(pool)
+    .await
+    .context("session_brain get")?;
+    Ok(row)
+}
+
+/// List every session_brain entry for a session, newest first. Useful
+/// when a role needs to see "what does the team know so far?" before
+/// generating its own contribution.
+pub async fn brain_list(
+    pool: &PgPool,
+    session_id: uuid::Uuid,
+) -> Result<Vec<Value>> {
+    let rows = sqlx::query(
+        "SELECT key, value, written_by_role, written_by_step, written_at
+           FROM session_brain
+          WHERE session_id = $1
+          ORDER BY written_at DESC",
+    )
+    .bind(session_id)
+    .fetch_all(pool)
+    .await
+    .context("session_brain list")?;
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            json!({
+                "key":             r.get::<String, _>("key"),
+                "value":           r.try_get::<Value, _>("value").unwrap_or(json!(null)),
+                "written_by_role": r.try_get::<String, _>("written_by_role").ok(),
+                "written_by_step": r.try_get::<uuid::Uuid, _>("written_by_step").ok(),
+                "written_at":      r.get::<chrono::DateTime<chrono::Utc>, _>("written_at"),
+            })
+        })
+        .collect())
+}
+
 /// Helper for `ff session list` — return one row per session with
 /// progress counters.
 pub async fn list_sessions(pool: &PgPool, limit: i64) -> Result<Vec<Value>> {
