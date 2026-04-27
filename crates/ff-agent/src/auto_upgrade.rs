@@ -572,6 +572,55 @@ impl AutoUpgradeTick {
                 continue;
             }
 
+            // For daemon-self software (*_git), dispatch via the
+            // two-phase wave dispatcher (fleet_tasks) instead of the
+            // deferred queue. The wave dispatcher's Phase-2 restart is
+            // serialized on the leader via the `wait_for_siblings`
+            // barrier, eliminating the self-kill race documented in
+            // feedback_wave_dispatcher_self_kill_race.md and giving
+            // macOS targets a launchctl restart path. Other software
+            // (apt/brew/pip-managed) keeps using the deferred queue.
+            if is_daemon_self_software(software_id) {
+                let leader_id: Option<uuid::Uuid> = sqlx::query_scalar(
+                    "SELECT computer_id FROM fleet_leader_state LIMIT 1",
+                )
+                .fetch_optional(&self.pool)
+                .await
+                .ok()
+                .flatten();
+                let Some(leader_id) = leader_id else {
+                    tracing::warn!(
+                        software_id = %software_id,
+                        "auto-upgrade: no leader_computer_id available; skipping wave dispatch"
+                    );
+                    continue;
+                };
+                match crate::task_runner::compose_fleet_upgrade_wave(
+                    &self.pool,
+                    software_id,
+                    4,
+                    leader_id,
+                )
+                .await
+                {
+                    Ok(parent) => {
+                        tracing::info!(
+                            software_id = %software_id,
+                            parent_task_id = %parent,
+                            target_count = plans.len(),
+                            "auto-upgrade dispatched via two-phase wave"
+                        );
+                        total += plans.len();
+                    }
+                    Err(e) => tracing::warn!(
+                        software_id = %software_id,
+                        error = %e,
+                        "auto-upgrade: compose_fleet_upgrade_wave failed"
+                    ),
+                }
+                continue;
+            }
+
             match enqueue_plans(&self.pool, &plans, &who).await {
                 Ok(enqueued) => {
                     tracing::info!(

@@ -859,12 +859,14 @@ pub async fn compose_fleet_upgrade_wave(
         if plan.computer_name.eq_ignore_ascii_case(&leader_lower) {
             continue;
         }
-        let row: Option<(String, String, i32)> =
-            sqlx::query_as("SELECT ssh_user, primary_ip, ssh_port FROM computers WHERE name = $1")
-                .bind(&plan.computer_name)
-                .fetch_optional(pg)
-                .await?;
-        let Some((ssh_user, primary_ip, ssh_port)) = row else {
+        let row: Option<(String, String, i32, String)> = sqlx::query_as(
+            "SELECT ssh_user, primary_ip, ssh_port, COALESCE(os_family, 'unknown') \
+               FROM computers WHERE name = $1",
+        )
+        .bind(&plan.computer_name)
+        .fetch_optional(pg)
+        .await?;
+        let Some((ssh_user, primary_ip, ssh_port, os_family)) = row else {
             tracing::warn!(
                 computer = %plan.computer_name,
                 "fleet-upgrade-wave: no computers row, skipping"
@@ -876,6 +878,7 @@ pub async fn compose_fleet_upgrade_wave(
             ssh_user,
             primary_ip,
             ssh_port,
+            os_family,
             playbook_command: plan.command,
         });
     }
@@ -975,19 +978,33 @@ pub async fn compose_fleet_upgrade_wave(
         } else {
             format!(" -p {}", t.ssh_port)
         };
+        // OS-aware restart body. Linux flavors use systemd --user;
+        // macOS targets (e.g. ace) need launchctl because systemctl
+        // doesn't exist there — closes the ace-restart gap that left
+        // 1/14 daemons stuck on old code in the 2026-04-27 rollout.
+        let inner_restart = if t.os_family.starts_with("macos") {
+            "USER_ID=$(id -u); \
+             launchctl kickstart -k \"gui/${USER_ID}/com.forgefleet.forgefleetd\" 2>/dev/null \
+             || launchctl asuser \"${USER_ID}\" launchctl kickstart -k \"gui/${USER_ID}/com.forgefleet.forgefleetd\" 2>/dev/null \
+             || launchctl kickstart -k \"user/${USER_ID}/com.forgefleet.forgefleetd\""
+                .to_string()
+        } else {
+            "export XDG_RUNTIME_DIR=\"${XDG_RUNTIME_DIR:-/run/user/$(id -u)}\"; \
+             systemctl --user reset-failed forgefleetd.service forgefleet-node.service forgefleet-daemon.service 2>/dev/null; \
+             systemctl --user restart forgefleetd.service || systemctl --user restart forgefleet-node.service || systemctl --user restart forgefleet-daemon.service"
+                .to_string()
+        };
         let restart_command = format!(
             "set -e\n\
-             echo \"== restarting forgefleetd on {target} via ssh from $(hostname) ==\"\n\
+             echo \"== restarting forgefleetd on {target} ({os}) via ssh from $(hostname) ==\"\n\
              ssh -T{port_arg} -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
-                 {ssh_user}@{primary_ip} bash -l <<'FF_RESTART_EOF'\n\
-             export XDG_RUNTIME_DIR=\"${{XDG_RUNTIME_DIR:-/run/user/$(id -u)}}\"\n\
-             systemctl --user reset-failed forgefleetd.service forgefleet-node.service forgefleet-daemon.service 2>/dev/null\n\
-             systemctl --user restart forgefleetd.service || systemctl --user restart forgefleet-node.service || systemctl --user restart forgefleet-daemon.service\n\
-             FF_RESTART_EOF\n",
+                 {ssh_user}@{primary_ip} bash -l -c '{inner}'\n",
             target = t.target_name,
+            os = t.os_family,
             port_arg = port_arg,
             ssh_user = t.ssh_user,
             primary_ip = t.primary_ip,
+            inner = inner_restart.replace('\'', "'\\''"),
         );
 
         pg_enqueue_shell_task_ext(
@@ -1016,5 +1033,8 @@ struct WaveTarget {
     ssh_user: String,
     primary_ip: String,
     ssh_port: i32,
+    /// `linux-ubuntu`, `linux-dgx`, `macos`, etc. Used to pick the
+    /// right Phase-2 restart command (systemctl vs launchctl).
+    os_family: String,
     playbook_command: String,
 }
