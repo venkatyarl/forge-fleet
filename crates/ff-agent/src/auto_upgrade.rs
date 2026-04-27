@@ -567,29 +567,123 @@ impl AutoUpgradeTick {
 }
 
 /// For every `software_registry` row with `version_source.method='self_built'`,
-/// set `latest_version` to the current fleet leader's installed_version for
-/// that software_id. Runs inline on every auto-upgrade tick so same-day drift
-/// gets caught within the tick interval, not the 6h upstream interval.
+/// set `latest_version` to the canonical git ref's HEAD SHA in the leader's
+/// source tree (default ref: `origin/main`). Runs inline on every
+/// auto-upgrade tick so same-day drift gets caught within the tick interval,
+/// not the 6h upstream interval.
+///
+/// Reads the ref from `version_source.git_ref` (default `origin/main`) and
+/// the path from `computers.source_tree_path` for the leader. Shells out to
+/// `git -C <path> rev-parse <ref>` — a single fast read.
+///
+/// **Why this is correct.** Treating the leader's currently-installed binary
+/// as upstream truth was a chicken-and-egg: the leader could never detect
+/// drift against itself, so the leader could never auto-upgrade itself, and
+/// since `latest_version` flows from the leader, no other member could
+/// either. Reading from git decouples the source of truth from any node's
+/// current binary; drift now fires on the leader too.
 async fn refresh_self_built_latest_versions(pool: &PgPool) -> Result<u64> {
-    let res = sqlx::query(
+    // 1. Resolve the leader's source_tree_path. If we can't (no leader
+    //    elected, no source_tree set), bail with 0 affected rather than
+    //    erroring the whole upgrade tick.
+    let source_tree: Option<String> = sqlx::query_scalar(
         r#"
-        UPDATE software_registry sr
-           SET latest_version    = leader_cs.installed_version,
-               latest_version_at = NOW()
-          FROM computer_software leader_cs
-          JOIN computers leader_c ON leader_c.id = leader_cs.computer_id
-          JOIN fleet_leader_state ls ON ls.computer_id = leader_c.id
-         WHERE sr.id = leader_cs.software_id
-           AND sr.version_source->>'method' = 'self_built'
-           AND leader_cs.installed_version IS NOT NULL
-           AND leader_cs.installed_version <> ''
-           AND (sr.latest_version IS NULL OR sr.latest_version <> leader_cs.installed_version)
+        SELECT c.source_tree_path
+          FROM fleet_leader_state ls
+          JOIN computers c ON c.id = ls.computer_id
+         WHERE c.source_tree_path IS NOT NULL AND c.source_tree_path <> ''
+         LIMIT 1
         "#,
     )
-    .execute(pool)
+    .fetch_optional(pool)
     .await
-    .context("refresh self_built latest_versions")?;
-    Ok(res.rows_affected())
+    .context("read leader source_tree_path")?;
+
+    let Some(source_tree) = source_tree else {
+        tracing::debug!("refresh_self_built: no leader source_tree_path; skipping");
+        return Ok(0);
+    };
+
+    // 2. For each self_built row, run `git -C <source_tree> rev-parse <ref>`
+    //    and write the SHA back. ref defaults to origin/main.
+    let rows: Vec<(String, serde_json::Value)> = sqlx::query_as(
+        "SELECT id, version_source FROM software_registry \
+         WHERE version_source->>'method' = 'self_built'",
+    )
+    .fetch_all(pool)
+    .await
+    .context("list self_built software")?;
+
+    let expanded_path = expand_tilde(&source_tree);
+    let mut updated: u64 = 0;
+    for (sw_id, vs) in rows {
+        let git_ref = vs
+            .get("git_ref")
+            .and_then(|v| v.as_str())
+            .unwrap_or("origin/main")
+            .to_string();
+        let path = expanded_path.clone();
+        let sha = match tokio::task::spawn_blocking(move || {
+            std::process::Command::new("git")
+                .args(["-C", &path, "rev-parse", &git_ref])
+                .output()
+        })
+        .await
+        {
+            Ok(Ok(out)) if out.status.success() => {
+                String::from_utf8_lossy(&out.stdout).trim().to_string()
+            }
+            Ok(Ok(out)) => {
+                tracing::warn!(
+                    sw = %sw_id,
+                    stderr = %String::from_utf8_lossy(&out.stderr),
+                    "refresh_self_built: git rev-parse failed"
+                );
+                continue;
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(sw = %sw_id, error = %e, "refresh_self_built: git spawn failed");
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(sw = %sw_id, error = %e, "refresh_self_built: join error");
+                continue;
+            }
+        };
+        if sha.is_empty() {
+            continue;
+        }
+        let res = sqlx::query(
+            r#"
+            UPDATE software_registry
+               SET latest_version    = $1,
+                   latest_version_at = NOW()
+             WHERE id = $2
+               AND (latest_version IS NULL OR latest_version <> $1)
+            "#,
+        )
+        .bind(&sha)
+        .bind(&sw_id)
+        .execute(pool)
+        .await
+        .with_context(|| format!("update latest_version for {sw_id}"))?;
+        if res.rows_affected() > 0 {
+            tracing::info!(sw = %sw_id, sha = %sha, "refresh_self_built: latest_version advanced");
+            updated += 1;
+        }
+    }
+    Ok(updated)
+}
+
+/// Expand a leading `~` in a path string. The DB stores paths like
+/// `~/projects/forge-fleet`; child commands inherit the daemon's `$HOME`.
+fn expand_tilde(s: &str) -> String {
+    if let Some(rest) = s.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return format!("{home}/{rest}");
+        }
+    }
+    s.to_string()
 }
 
 /// For every computer_software row where installed_version differs from
