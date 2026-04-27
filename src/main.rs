@@ -336,6 +336,19 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         mc_db_path,
     ));
 
+    // 6.5) CLI bridge daemons (Layer 3 of the multi-LLM CLI integration).
+    // Per-port (51100-51104) listener that translates OpenAI chat shape
+    // to a vendor CLI invocation. Each port is gated on the
+    // corresponding binary being on `$PATH`, so a member with no Claude
+    // installed simply doesn't open 51100. Bridges are bound to
+    // 127.0.0.1 only — never publicly reachable.
+    {
+        let handles = ff_gateway::cli_bridge::spawn_all_bridges();
+        for h in handles {
+            subsystem_tasks.push(h);
+        }
+    }
+
     // 7) telegram polling transport (bidirectional control channel)
     if config
         .transport
