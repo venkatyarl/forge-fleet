@@ -4892,3 +4892,33 @@ VALUES
    '[]'::jsonb)
 ON CONFLICT (name) DO NOTHING;
 "#;
+
+// ─── V55: session_brain — per-session shared memory across roles ───────────
+//
+// Pillar 4 / PR-O: roles within a session need a shared scratch surface.
+// step_memory (V54) is per-step; this table is per-session, so the
+// reviewer can read what the planner wrote, the synthesiser can read
+// what the coder produced, etc.
+//
+// On session finalisation, session_brain is mirrored to the Obsidian
+// vault under `Inbox/sessions/<session-id>/<key>.md` (per the V13
+// design — AI writes only to Inbox, operator promotes from there).
+// The mirror is a follow-up PR; this migration just lays the table.
+//
+// Schema is intentionally simple — operator can always query directly
+// for bespoke needs. JSONB values let roles pass structured findings
+// across without re-stringifying.
+pub const SCHEMA_V55_SESSION_BRAIN: &str = r#"
+CREATE TABLE IF NOT EXISTS session_brain (
+    session_id        UUID NOT NULL REFERENCES agent_sessions(id) ON DELETE CASCADE,
+    key               TEXT NOT NULL,
+    value             JSONB NOT NULL,
+    written_by_role   TEXT,
+    written_by_step   UUID REFERENCES agent_steps(id) ON DELETE SET NULL,
+    written_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (session_id, key)
+);
+CREATE INDEX IF NOT EXISTS idx_session_brain_by_step
+    ON session_brain(written_by_step)
+    WHERE written_by_step IS NOT NULL;
+"#;

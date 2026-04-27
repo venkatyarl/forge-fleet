@@ -741,6 +741,25 @@ enum SessionCommand {
     },
     /// Show one session: full step DAG + per-step results.
     Get { id: String },
+    /// Read a session_brain entry — per-session shared memory across
+    /// roles. JSON value is printed verbatim.
+    BrainGet {
+        session: String,
+        key: String,
+    },
+    /// Write a session_brain entry. Value is parsed as JSON; if the
+    /// parse fails it's stored as a JSON string.
+    BrainSet {
+        session: String,
+        key: String,
+        /// JSON value (or any string — falls back to JSON string).
+        value: String,
+        /// Optional role tag.
+        #[arg(long)]
+        role: Option<String>,
+    },
+    /// List every session_brain entry for a session, newest first.
+    BrainList { session: String },
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -2419,6 +2438,58 @@ async fn main() -> Result<()> {
                         .await
                         .map_err(|e| anyhow::anyhow!("get: {e}"))?;
                     println!("{}", serde_json::to_string_pretty(&json).unwrap_or_default());
+                    Ok(())
+                }
+                SessionCommand::BrainGet { session, key } => {
+                    let sid = uuid::Uuid::parse_str(&session)
+                        .map_err(|e| anyhow::anyhow!("invalid uuid: {e}"))?;
+                    match ff_agent::session_runner::brain_get(&pool, sid, &key)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("brain_get: {e}"))?
+                    {
+                        Some(v) => {
+                            println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+                            Ok(())
+                        }
+                        None => {
+                            println!("{YELLOW}—{RESET} key '{key}' not found");
+                            Ok(())
+                        }
+                    }
+                }
+                SessionCommand::BrainSet {
+                    session,
+                    key,
+                    value,
+                    role,
+                } => {
+                    let sid = uuid::Uuid::parse_str(&session)
+                        .map_err(|e| anyhow::anyhow!("invalid uuid: {e}"))?;
+                    let parsed: serde_json::Value = serde_json::from_str(&value)
+                        .unwrap_or_else(|_| serde_json::Value::String(value.clone()));
+                    ff_agent::session_runner::brain_set(
+                        &pool,
+                        sid,
+                        &key,
+                        &parsed,
+                        role.as_deref(),
+                        None,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("brain_set: {e}"))?;
+                    println!("{GREEN}✓{RESET} stored {key} ({} bytes)", value.len());
+                    Ok(())
+                }
+                SessionCommand::BrainList { session } => {
+                    let sid = uuid::Uuid::parse_str(&session)
+                        .map_err(|e| anyhow::anyhow!("invalid uuid: {e}"))?;
+                    let rows = ff_agent::session_runner::brain_list(&pool, sid)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("brain_list: {e}"))?;
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&rows).unwrap_or_default()
+                    );
                     Ok(())
                 }
             }
