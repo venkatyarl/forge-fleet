@@ -742,12 +742,11 @@ pub async fn compose_fleet_upgrade_wave(
         if plan.computer_name.eq_ignore_ascii_case(&leader_lower) {
             continue;
         }
-        let row: Option<(String, String, i32)> = sqlx::query_as(
-            "SELECT ssh_user, primary_ip, ssh_port FROM computers WHERE name = $1",
-        )
-        .bind(&plan.computer_name)
-        .fetch_optional(pg)
-        .await?;
+        let row: Option<(String, String, i32)> =
+            sqlx::query_as("SELECT ssh_user, primary_ip, ssh_port FROM computers WHERE name = $1")
+                .bind(&plan.computer_name)
+                .fetch_optional(pg)
+                .await?;
         let Some((ssh_user, primary_ip, ssh_port)) = row else {
             tracing::warn!(
                 computer = %plan.computer_name,
