@@ -338,10 +338,19 @@ impl CoverageGuard {
     ) -> Result<Option<String>, sqlx::Error> {
         let required = min_vram_gb.unwrap_or(0.0);
 
+        // Only consider hosts that ALREADY have the model file in their
+        // library — otherwise `ff model load <id>` fails on the chosen host
+        // with `no library entry with id '<id>'`. Auto-download is a
+        // separate concern (handled by hf_download / model_library_scanner).
         let row = sqlx::query(
             "SELECT c.name AS name
              FROM computers c
              WHERE c.status = 'online'
+               AND EXISTS (
+                   SELECT 1 FROM fleet_model_library lib
+                    WHERE lib.node_name = c.name
+                      AND lib.catalog_id = $1
+               )
                AND NOT EXISTS (
                    SELECT 1 FROM computer_model_deployments d
                     WHERE d.computer_id = c.id
