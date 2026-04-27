@@ -338,6 +338,14 @@ pub async fn enqueue_plans(
     Ok(out)
 }
 
+/// Does this `software_id` represent the daemon's own binary — i.e.
+/// upgrading it requires restarting the daemon process that is
+/// currently dispatching the upgrade? Used by [`AutoUpgradeTick::run_once`]
+/// to gate the leader out of self-suicide.
+fn is_daemon_self_software(software_id: &str) -> bool {
+    matches!(software_id, "ff_git" | "forgefleetd_git" | "forgefleet")
+}
+
 /// Is this pool's leader the computer whose name matches `my_name`?
 async fn is_leader(pool: &PgPool, my_name: &str) -> bool {
     match sqlx::query_scalar::<_, String>("SELECT member_name FROM fleet_leader_state LIMIT 1")
@@ -492,6 +500,49 @@ impl AutoUpgradeTick {
                     .await;
                 }
                 GitStateGate::Allow => {}
+            }
+
+            // ── Leader-suicide safety gate ─────────────────────────
+            // If this software's `version_source.method` is `self_built`
+            // and this row's playbook restarts the daemon (i.e. it's
+            // the daemon's own binary — `ff_git`, `forgefleetd_git`),
+            // running the upgrade in the deferred-task worker on the
+            // leader would mid-execution kill the worker. The launchd
+            // / systemd supervisor sends SIGKILL to the whole unit
+            // process group; the worker dies with the daemon, the
+            // task is left `running`, the watchdog re-queues it 120s
+            // later, infinite loop until MAX_HANDOFFS. We hit this
+            // live on 2026-04-26.
+            //
+            // Fix: drop the leader from the per-target plan list for
+            // these rows. The wave dispatcher
+            // (`ff tasks compose-fleet-upgrade`) is the right path
+            // for upgrading the leader — it's peer-driven and avoids
+            // the suicide entirely. The hourly tick stays on the
+            // defer queue for everyone else.
+            let plans: Vec<_> = if is_daemon_self_software(software_id) {
+                let leader_name_lc = self.my_name.to_ascii_lowercase();
+                let dropped = plans
+                    .iter()
+                    .filter(|p| p.computer_name.eq_ignore_ascii_case(&leader_name_lc))
+                    .count();
+                if dropped > 0 {
+                    tracing::info!(
+                        software_id = %software_id,
+                        leader = %self.my_name,
+                        "auto-upgrade: skipping leader (would suicide-restart its own worker); \
+                         use `ff tasks compose-fleet-upgrade` to upgrade the leader peer-driven"
+                    );
+                }
+                plans
+                    .into_iter()
+                    .filter(|p| !p.computer_name.eq_ignore_ascii_case(&leader_name_lc))
+                    .collect()
+            } else {
+                plans
+            };
+            if plans.is_empty() {
+                continue;
             }
 
             match enqueue_plans(&self.pool, &plans, &who).await {
