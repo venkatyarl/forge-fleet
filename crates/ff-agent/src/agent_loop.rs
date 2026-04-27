@@ -689,6 +689,26 @@ async fn run_agent_loop(
                             messages_after: after,
                         },
                     );
+
+                    // Bail out if compaction is a no-op — a single oversized
+                    // user message can't shrink, so retrying would loop forever.
+                    // Caller should split the prompt or raise context_window_tokens.
+                    if after >= before {
+                        let msg = format!(
+                            "Context overflow with {after} message(s) — compaction can't reduce \
+                             further (prompt itself exceeds context window). \
+                             Split the input or use a model with a larger context."
+                        );
+                        emit(
+                            &event_tx,
+                            AgentEvent::Error {
+                                session_id: session_id.clone(),
+                                message: msg.clone(),
+                            },
+                        );
+                        return AgentOutcome::Error(msg);
+                    }
+
                     emit(
                         &event_tx,
                         AgentEvent::Status {
@@ -1434,8 +1454,8 @@ async fn execute_single_tool(
     }
 }
 
-fn truncate_for_error(s: &str) -> &str {
-    if s.len() > 500 { &s[..500] } else { s }
+fn truncate_for_error(s: &str) -> String {
+    s.chars().take(500).collect()
 }
 
 /// Attempt to fix common JSON issues from LLMs.

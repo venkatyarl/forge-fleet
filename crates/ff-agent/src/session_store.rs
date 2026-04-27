@@ -57,8 +57,8 @@ pub async fn save_session(
         .find(|m| m.role == "user")
         .and_then(|m| m.text_content())
         .map(|t| {
-            if t.len() > 100 {
-                format!("{}...", &t[..100])
+            if t.chars().count() > 100 {
+                format!("{}...", t.chars().take(100).collect::<String>())
             } else {
                 t.to_string()
             }
