@@ -931,6 +931,8 @@ mod tests {
             "brain_thread_append",
             "brain_stack_push",
             "brain_backlog_add",
+            // Pillar 1 — Computer Use (PR-H, #37)
+            "computer_use",
         ];
         for name in &expected {
             assert!(registry.contains(name), "missing tool: {name}");
