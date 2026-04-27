@@ -1989,7 +1989,133 @@ pub async fn dispatch(method: &str, params: Option<Value>) -> HandlerResult {
         "brain_thread_append" => crate::brain_tools::brain_thread_append(params).await,
         "brain_stack_push" => crate::brain_tools::brain_stack_push(params).await,
         "brain_backlog_add" => crate::brain_tools::brain_backlog_add(params).await,
+        // Computer Use (Pillar 1)
+        "computer_use" => computer_use(params).await,
         _ => Err(format!("unknown method: {method}")),
+    }
+}
+
+/// Dispatcher for the `computer_use` MCP tool. Translates the action
+/// payload into an HTTP call against the local screen-control daemon
+/// at 127.0.0.1:51200 (PR-G). The MCP layer doesn't return PNG bytes
+/// directly — for `screenshot` we save to a tmp file and return the
+/// path, which the LLM can then read via the existing file-read tool.
+async fn computer_use(params: Option<Value>) -> Result<Value, String> {
+    let params = params.unwrap_or_else(|| serde_json::json!({}));
+    let action = params
+        .get("action")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "computer_use: 'action' is required".to_string())?;
+
+    let client = reqwest::Client::new();
+    let base = "http://127.0.0.1:51200";
+
+    match action {
+        "screenshot" => {
+            let url = if let Some(region) = params.get("region").and_then(Value::as_str) {
+                format!("{base}/screenshot?region={region}")
+            } else {
+                format!("{base}/screenshot")
+            };
+            let resp = client
+                .get(&url)
+                .send()
+                .await
+                .map_err(|e| format!("screenshot HTTP: {e}"))?;
+            let status = resp.status();
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                return Err(format!("screenshot {status}: {body}"));
+            }
+            let bytes = resp.bytes().await.map_err(|e| format!("read png: {e}"))?;
+            // Save to tmp + return path. Multi-modal LLMs can read the
+            // file; bytes-over-MCP would balloon the protocol.
+            let path = std::env::temp_dir().join(format!(
+                "ff-mcp-screen-{}.png",
+                chrono::Utc::now().timestamp_millis()
+            ));
+            std::fs::write(&path, &bytes).map_err(|e| format!("write png: {e}"))?;
+            Ok(serde_json::json!({
+                "screenshot_path": path.display().to_string(),
+                "size_bytes": bytes.len(),
+            }))
+        }
+        "click" | "double_click" | "move" => {
+            let x = params.get("x").and_then(Value::as_i64).ok_or_else(|| {
+                format!("computer_use {action}: 'x' (integer) is required")
+            })?;
+            let y = params.get("y").and_then(Value::as_i64).ok_or_else(|| {
+                format!("computer_use {action}: 'y' (integer) is required")
+            })?;
+            let endpoint = match action {
+                "click" => "click",
+                "double_click" => "double-click",
+                "move" => "move",
+                _ => unreachable!(),
+            };
+            let resp = client
+                .post(format!("{base}/{endpoint}"))
+                .json(&serde_json::json!({"x": x, "y": y}))
+                .send()
+                .await
+                .map_err(|e| format!("{action} HTTP: {e}"))?;
+            relay_resp(resp).await
+        }
+        "type" => {
+            let text = params
+                .get("text")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "computer_use type: 'text' is required".to_string())?;
+            let resp = client
+                .post(format!("{base}/type"))
+                .json(&serde_json::json!({"text": text}))
+                .send()
+                .await
+                .map_err(|e| format!("type HTTP: {e}"))?;
+            relay_resp(resp).await
+        }
+        "key" => {
+            let key = params
+                .get("key")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "computer_use key: 'key' is required".to_string())?;
+            let resp = client
+                .post(format!("{base}/key"))
+                .json(&serde_json::json!({"key": key}))
+                .send()
+                .await
+                .map_err(|e| format!("key HTTP: {e}"))?;
+            relay_resp(resp).await
+        }
+        "goto" => {
+            let url = params
+                .get("url")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "computer_use goto: 'url' is required".to_string())?;
+            let resp = client
+                .post(format!("{base}/goto"))
+                .json(&serde_json::json!({"url": url}))
+                .send()
+                .await
+                .map_err(|e| format!("goto HTTP: {e}"))?;
+            relay_resp(resp).await
+        }
+        other => Err(format!(
+            "computer_use: unknown action '{other}' (expected screenshot|click|double_click|move|type|key|goto)"
+        )),
+    }
+}
+
+async fn relay_resp(resp: reqwest::Response) -> Result<Value, String> {
+    let status = resp.status();
+    let body: Value = resp
+        .json()
+        .await
+        .unwrap_or_else(|_| serde_json::json!({"ok": status.is_success()}));
+    if status.is_success() {
+        Ok(body)
+    } else {
+        Err(format!("{status}: {body}"))
     }
 }
 
