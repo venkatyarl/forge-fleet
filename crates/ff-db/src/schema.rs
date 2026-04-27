@@ -4716,15 +4716,17 @@ ON CONFLICT (id) DO NOTHING;
 
 -- 4. Append @google/gemini-cli to the npm CLI catalog so the install
 --    pipeline picks it up alongside claude-code and codex (V46).
+--    Schema V21 columns: id / display_name / kind / version_source /
+--    upgrade_playbook / requires_restart / requires_reboot. The
+--    npm-registry method + package live inside `version_source` JSONB,
+--    matching how V46 seeds `claude-code` and `codex`.
 INSERT INTO software_registry
-  (id, display_name, kind, install_method, install_source,
+  (id, display_name, kind,
    version_source, upgrade_playbook, requires_restart, requires_reboot)
 VALUES
   ('gemini-cli',
    'Google Gemini CLI',
    'binary',
-   'npm_global',
-   '@google/gemini-cli',
    '{"method":"npm_registry","package":"@google/gemini-cli"}'::jsonb,
    '{"linux-ubuntu":"npm install -g @google/gemini-cli","linux-dgx":"npm install -g @google/gemini-cli","macos":"npm install -g @google/gemini-cli"}'::jsonb,
    false,
