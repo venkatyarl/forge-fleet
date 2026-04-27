@@ -796,6 +796,10 @@ enum SessionCommand {
         #[arg(long)]
         name: String,
     },
+    /// Cancel a session in flight: flips status to `cancelled`,
+    /// marks pending steps `cancelled`, and cancels still-running
+    /// fleet_tasks via the existing pg_cancel_task helper.
+    Cancel { id: String },
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -2603,6 +2607,15 @@ async fn main() -> Result<()> {
                         .await
                         .map_err(|e| anyhow::anyhow!("collect: {e}"))?;
                     println!("{}", serde_json::to_string_pretty(&snap).unwrap_or_default());
+                    Ok(())
+                }
+                SessionCommand::Cancel { id } => {
+                    let sid = uuid::Uuid::parse_str(&id)
+                        .map_err(|e| anyhow::anyhow!("invalid uuid: {e}"))?;
+                    ff_agent::session_runner::cancel_session(&pool, sid)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("cancel session: {e}"))?;
+                    println!("{GREEN}✓{RESET} session cancelled: {sid}");
                     Ok(())
                 }
             }
