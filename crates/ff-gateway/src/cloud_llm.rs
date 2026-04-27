@@ -133,44 +133,42 @@ pub async fn try_route_to_cloud(
     // wired) still bails — the new oauth_subscription path replaces it
     // for the subscription use case.
     let api_key = match provider.auth_kind.as_str() {
-        "api_key" | "oauth_subscription" => {
-            match pg_get_secret(pool, &provider.secret_key).await {
-                Ok(Some(k)) if !k.is_empty() => k,
-                Ok(_) => {
-                    let kind_label = if provider.auth_kind == "oauth_subscription" {
-                        "OAuth subscription token"
-                    } else {
-                        "API key"
-                    };
-                    let hint = if provider.auth_kind == "oauth_subscription" {
-                        format!(
-                            "Run `ff oauth import {}` on the leader (after `<cli> login`).",
-                            provider.id.split('_').next().unwrap_or("claude")
-                        )
-                    } else {
-                        format!("Run `ff cloud-llm set-key {}`.", provider.id)
-                    };
-                    tracing::warn!(provider = %provider.id, secret_key = %provider.secret_key,
+        "api_key" | "oauth_subscription" => match pg_get_secret(pool, &provider.secret_key).await {
+            Ok(Some(k)) if !k.is_empty() => k,
+            Ok(_) => {
+                let kind_label = if provider.auth_kind == "oauth_subscription" {
+                    "OAuth subscription token"
+                } else {
+                    "API key"
+                };
+                let hint = if provider.auth_kind == "oauth_subscription" {
+                    format!(
+                        "Run `ff oauth import {}` on the leader (after `<cli> login`).",
+                        provider.id.split('_').next().unwrap_or("claude")
+                    )
+                } else {
+                    format!("Run `ff cloud-llm set-key {}`.", provider.id)
+                };
+                tracing::warn!(provider = %provider.id, secret_key = %provider.secret_key,
                         "cloud_llm: {} secret is missing/empty", kind_label);
-                    return Some(Err(error_response(
-                        StatusCode::UNAUTHORIZED,
-                        format!(
-                            "{kind_label} not configured for cloud provider '{}'. {hint}",
-                            provider.id
-                        ),
-                        "cloud_auth_missing",
-                    )));
-                }
-                Err(e) => {
-                    tracing::warn!(provider = %provider.id, error = %e, "cloud_llm: fetch secret failed");
-                    return Some(Err(error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("failed to load credentials for '{}'", provider.id),
-                        "cloud_auth_error",
-                    )));
-                }
+                return Some(Err(error_response(
+                    StatusCode::UNAUTHORIZED,
+                    format!(
+                        "{kind_label} not configured for cloud provider '{}'. {hint}",
+                        provider.id
+                    ),
+                    "cloud_auth_missing",
+                )));
             }
-        }
+            Err(e) => {
+                tracing::warn!(provider = %provider.id, error = %e, "cloud_llm: fetch secret failed");
+                return Some(Err(error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to load credentials for '{}'", provider.id),
+                    "cloud_auth_error",
+                )));
+            }
+        },
         "local_bridge" => {
             // Local bridge daemons (51100-51104) don't need an
             // Authorization header — they own credentials internally.

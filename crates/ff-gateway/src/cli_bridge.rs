@@ -24,13 +24,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use axum::{
-    Json, Router,
-    extract::State,
-    http::StatusCode,
-    response::IntoResponse,
-    routing::post,
-};
+use axum::{Json, Router, extract::State, http::StatusCode, response::IntoResponse, routing::post};
 use ff_agent::cli_executor::{BACKENDS, CliBackend, execute_cli};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

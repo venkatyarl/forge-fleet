@@ -116,7 +116,11 @@ pub async fn execute_cli(
     let cfg = backend_by_name(backend).ok_or_else(|| {
         anyhow!(
             "unknown backend '{backend}'; expected one of: {}",
-            BACKENDS.iter().map(|b| b.name).collect::<Vec<_>>().join(", ")
+            BACKENDS
+                .iter()
+                .map(|b| b.name)
+                .collect::<Vec<_>>()
+                .join(", ")
         )
     })?;
 

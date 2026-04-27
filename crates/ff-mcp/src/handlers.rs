@@ -2041,12 +2041,14 @@ async fn computer_use(params: Option<Value>) -> Result<Value, String> {
             }))
         }
         "click" | "double_click" | "move" => {
-            let x = params.get("x").and_then(Value::as_i64).ok_or_else(|| {
-                format!("computer_use {action}: 'x' (integer) is required")
-            })?;
-            let y = params.get("y").and_then(Value::as_i64).ok_or_else(|| {
-                format!("computer_use {action}: 'y' (integer) is required")
-            })?;
+            let x = params
+                .get("x")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| format!("computer_use {action}: 'x' (integer) is required"))?;
+            let y = params
+                .get("y")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| format!("computer_use {action}: 'y' (integer) is required"))?;
             let endpoint = match action {
                 "click" => "click",
                 "double_click" => "double-click",

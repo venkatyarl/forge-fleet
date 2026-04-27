@@ -99,7 +99,9 @@ pub const REFRESH_POLL_SECS: u64 = 30;
 
 /// Look up a provider by name. Returns `None` for unknown names.
 pub fn provider_by_name(name: &str) -> Option<&'static OauthProvider> {
-    OAUTH_PROVIDERS.iter().find(|p| p.name.eq_ignore_ascii_case(name))
+    OAUTH_PROVIDERS
+        .iter()
+        .find(|p| p.name.eq_ignore_ascii_case(name))
 }
 
 /// Expand `~/` prefix to `$HOME/`. Pure path manipulation, no I/O.
@@ -176,7 +178,10 @@ pub async fn import_token(pool: &PgPool, provider: &OauthProvider) -> Result<()>
     .await
     .context("write token to fleet_secrets")?;
 
-    info!(provider = provider.name, "imported OAuth token to fleet_secrets");
+    info!(
+        provider = provider.name,
+        "imported OAuth token to fleet_secrets"
+    );
     Ok(())
 }
 
@@ -188,8 +193,12 @@ pub async fn import_token(pool: &PgPool, provider: &OauthProvider) -> Result<()>
 /// the local CLI sees the same login the leader did. Members without
 /// the directory get it created (`mkdir -p`) before write.
 pub async fn distribute_token(pool: &PgPool, provider: &OauthProvider) -> Result<usize> {
-    let path = expand_home(provider.cred_path)
-        .ok_or_else(|| anyhow!("provider {} has no cred_path — distribute is N/A", provider.name))?;
+    let path = expand_home(provider.cred_path).ok_or_else(|| {
+        anyhow!(
+            "provider {} has no cred_path — distribute is N/A",
+            provider.name
+        )
+    })?;
 
     let bytes = tokio::fs::read(&path)
         .await
@@ -248,7 +257,10 @@ pub async fn distribute_token(pool: &PgPool, provider: &OauthProvider) -> Result
 
         pg_enqueue_shell_task(
             pool,
-            &format!("oauth-distribute/{}: {} → {}", provider.name, provider.name, name),
+            &format!(
+                "oauth-distribute/{}: {} → {}",
+                provider.name, provider.name, name
+            ),
             &cmd,
             &[],
             Some(&name),
@@ -263,8 +275,7 @@ pub async fn distribute_token(pool: &PgPool, provider: &OauthProvider) -> Result
 
     info!(
         provider = provider.name,
-        enqueued,
-        "OAuth distribute tasks enqueued"
+        enqueued, "OAuth distribute tasks enqueued"
     );
     Ok(enqueued)
 }
@@ -288,7 +299,10 @@ pub async fn status(pool: &PgPool) -> Result<Vec<ProviderStatus>> {
             None => (false, None),
         };
 
-        let token = ff_db::pg_get_secret(pool, p.secret_key).await.ok().flatten();
+        let token = ff_db::pg_get_secret(pool, p.secret_key)
+            .await
+            .ok()
+            .flatten();
         let preview = token.as_deref().map(|t| {
             let head: String = t.chars().take(8).collect();
             format!("{head}…({} chars)", t.chars().count())
@@ -308,10 +322,7 @@ pub async fn status(pool: &PgPool) -> Result<Vec<ProviderStatus>> {
 /// Long-lived foreground loop. Polls every leader cred file every
 /// `REFRESH_POLL_SECS`; on mtime change, re-imports + redistributes.
 /// Exits when `shutdown` flips to true.
-pub fn spawn_refresh_watch(
-    pool: PgPool,
-    mut shutdown: watch::Receiver<bool>,
-) -> JoinHandle<()> {
+pub fn spawn_refresh_watch(pool: PgPool, mut shutdown: watch::Receiver<bool>) -> JoinHandle<()> {
     tokio::spawn(async move {
         // Track last-seen mtime per provider so we only fire on change.
         let mut last_mtime: std::collections::HashMap<&str, SystemTime> =

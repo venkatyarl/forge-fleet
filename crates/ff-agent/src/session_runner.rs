@@ -96,10 +96,12 @@ pub async fn add_step(
     prompt: &str,
     depends_on: &[uuid::Uuid],
 ) -> Result<uuid::Uuid> {
-    let depends_json = json!(depends_on
-        .iter()
-        .map(|id| id.to_string())
-        .collect::<Vec<_>>());
+    let depends_json = json!(
+        depends_on
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+    );
     let memory = json!({ "prompt": prompt });
     let id: uuid::Uuid = sqlx::query_scalar(
         "INSERT INTO agent_steps (session_id, name, role, depends_on, step_memory)
@@ -262,10 +264,7 @@ pub async fn tick(pool: &PgPool) -> Result<TickStats> {
             .unwrap_or_else(|| ("qwen2.5-coder-32b".into(), Vec::new())),
             None => ("qwen2.5-coder-32b".into(), Vec::new()),
         };
-        if let Some(override_model) = step_memory
-            .get("model_override")
-            .and_then(Value::as_str)
-        {
+        if let Some(override_model) = step_memory.get("model_override").and_then(Value::as_str) {
             model = override_model.to_string();
         }
 
@@ -291,7 +290,9 @@ pub async fn tick(pool: &PgPool) -> Result<TickStats> {
         // preamble. Closes the "each role re-derives everything from
         // scratch" gap noted in PR-E's deferred work. Skipped silently
         // when the brain has no matches or the query fails.
-        let brain_context = gather_brain_context(pool, &raw_prompt).await.unwrap_or_default();
+        let brain_context = gather_brain_context(pool, &raw_prompt)
+            .await
+            .unwrap_or_default();
         let prompt_with_context = if brain_context.is_empty() {
             raw_prompt.clone()
         } else {
@@ -311,18 +312,10 @@ pub async fn tick(pool: &PgPool) -> Result<TickStats> {
             session_id
         );
 
-        let task_id = pg_enqueue_shell_task(
-            pool,
-            &summary,
-            &cmd,
-            &capability,
-            None,
-            None,
-            70,
-            None,
-        )
-        .await
-        .with_context(|| format!("enqueue fleet_task for step {step_id}"))?;
+        let task_id =
+            pg_enqueue_shell_task(pool, &summary, &cmd, &capability, None, None, 70, None)
+                .await
+                .with_context(|| format!("enqueue fleet_task for step {step_id}"))?;
 
         sqlx::query(
             "UPDATE agent_steps
@@ -381,7 +374,11 @@ pub async fn tick(pool: &PgPool) -> Result<TickStats> {
         .fetch_one(pool)
         .await
         .context("count failed steps")?;
-        let outcome = if any_failed.0 > 0 { "failed" } else { "succeeded" };
+        let outcome = if any_failed.0 > 0 {
+            "failed"
+        } else {
+            "succeeded"
+        };
         sqlx::query(
             "UPDATE agent_sessions
                 SET status = $1, completed_at = NOW()
@@ -459,7 +456,9 @@ async fn mirror_session_to_vault(pool: &PgPool, session_id: uuid::Uuid) -> Resul
          **Status**: {status}\n\n\
          {}",
         chrono::Utc::now().to_rfc3339(),
-        error.map(|e| format!("**Error**: {e}\n\n")).unwrap_or_default()
+        error
+            .map(|e| format!("**Error**: {e}\n\n"))
+            .unwrap_or_default()
     );
     std::fs::write(dir.join("_summary.md"), summary).context("write session summary")?;
 
@@ -554,11 +553,36 @@ async fn gather_brain_context(pool: &PgPool, prompt: &str) -> Result<String> {
             // tokens to focus the match on substantive ones.
             !matches!(
                 t.as_str(),
-                "this" | "that" | "with" | "from" | "have" | "what" | "when"
-                    | "where" | "would" | "should" | "could" | "their" | "there"
-                    | "them" | "then" | "than" | "they" | "your" | "yours"
-                    | "into" | "over" | "under" | "above" | "below" | "about"
-                    | "after" | "before" | "between" | "during" | "while"
+                "this"
+                    | "that"
+                    | "with"
+                    | "from"
+                    | "have"
+                    | "what"
+                    | "when"
+                    | "where"
+                    | "would"
+                    | "should"
+                    | "could"
+                    | "their"
+                    | "there"
+                    | "them"
+                    | "then"
+                    | "than"
+                    | "they"
+                    | "your"
+                    | "yours"
+                    | "into"
+                    | "over"
+                    | "under"
+                    | "above"
+                    | "below"
+                    | "about"
+                    | "after"
+                    | "before"
+                    | "between"
+                    | "during"
+                    | "while"
             )
         })
         .take(8)
@@ -646,7 +670,13 @@ pub fn spawn(pool: PgPool, mut shutdown: watch::Receiver<bool>) -> JoinHandle<()
     tokio::spawn(async move {
         loop {
             match tick(&pool).await {
-                Ok(s) if s.steps_dispatched + s.steps_completed + s.steps_failed + s.sessions_finalised > 0 => {
+                Ok(s)
+                    if s.steps_dispatched
+                        + s.steps_completed
+                        + s.steps_failed
+                        + s.sessions_finalised
+                        > 0 =>
+                {
                     info!(
                         dispatched = s.steps_dispatched,
                         completed = s.steps_completed,
@@ -705,29 +735,21 @@ pub async fn brain_set(
 }
 
 /// Read a session-scoped memory entry. `None` if not set.
-pub async fn brain_get(
-    pool: &PgPool,
-    session_id: uuid::Uuid,
-    key: &str,
-) -> Result<Option<Value>> {
-    let row: Option<Value> = sqlx::query_scalar(
-        "SELECT value FROM session_brain WHERE session_id = $1 AND key = $2",
-    )
-    .bind(session_id)
-    .bind(key)
-    .fetch_optional(pool)
-    .await
-    .context("session_brain get")?;
+pub async fn brain_get(pool: &PgPool, session_id: uuid::Uuid, key: &str) -> Result<Option<Value>> {
+    let row: Option<Value> =
+        sqlx::query_scalar("SELECT value FROM session_brain WHERE session_id = $1 AND key = $2")
+            .bind(session_id)
+            .bind(key)
+            .fetch_optional(pool)
+            .await
+            .context("session_brain get")?;
     Ok(row)
 }
 
 /// List every session_brain entry for a session, newest first. Useful
 /// when a role needs to see "what does the team know so far?" before
 /// generating its own contribution.
-pub async fn brain_list(
-    pool: &PgPool,
-    session_id: uuid::Uuid,
-) -> Result<Vec<Value>> {
+pub async fn brain_list(pool: &PgPool, session_id: uuid::Uuid) -> Result<Vec<Value>> {
     let rows = sqlx::query(
         "SELECT key, value, written_by_role, written_by_step, written_at
            FROM session_brain
@@ -966,10 +988,7 @@ pub async fn collect_vote_answers(
 /// Two-step flow lets the operator inspect the plan before committing
 /// (some plans are bad / missing constraints; review-before-apply
 /// catches that).
-pub async fn add_planner_step(
-    pool: &PgPool,
-    session_id: uuid::Uuid,
-) -> Result<uuid::Uuid> {
+pub async fn add_planner_step(pool: &PgPool, session_id: uuid::Uuid) -> Result<uuid::Uuid> {
     let goal: String = sqlx::query_scalar("SELECT goal FROM agent_sessions WHERE id = $1")
         .bind(session_id)
         .fetch_one(pool)
@@ -1044,22 +1063,21 @@ pub async fn apply_plan(
 
     // Try strict JSON first; fall back to extracting from a fenced
     // code block (some LLMs ignore the no-fences instruction).
-    let plan_json: Value = serde_json::from_str(stdout.trim())
-        .or_else(|_| {
-            // Look for the first {…} block.
-            let s = stdout
-                .find('{')
-                .and_then(|start| {
-                    let end = stdout.rfind('}')?;
-                    if end > start {
-                        Some(&stdout[start..=end])
-                    } else {
-                        None
-                    }
-                })
-                .ok_or_else(|| anyhow!("no JSON object found in planner output"))?;
-            serde_json::from_str::<Value>(s).context("parse fallback JSON")
-        })?;
+    let plan_json: Value = serde_json::from_str(stdout.trim()).or_else(|_| {
+        // Look for the first {…} block.
+        let s = stdout
+            .find('{')
+            .and_then(|start| {
+                let end = stdout.rfind('}')?;
+                if end > start {
+                    Some(&stdout[start..=end])
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| anyhow!("no JSON object found in planner output"))?;
+        serde_json::from_str::<Value>(s).context("parse fallback JSON")
+    })?;
 
     let steps_arr = plan_json
         .get("steps")

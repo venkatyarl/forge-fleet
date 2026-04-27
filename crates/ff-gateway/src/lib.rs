@@ -12,8 +12,6 @@
 pub mod brain_api;
 pub mod cli_bridge;
 pub mod cloud_llm;
-pub mod screen_ctrl;
-pub mod voice_api;
 pub mod discord;
 pub mod embed;
 pub mod llm_routing;
@@ -22,10 +20,12 @@ pub mod middleware;
 pub mod onboard;
 pub mod pulse_api;
 pub mod router;
+pub mod screen_ctrl;
 pub mod server;
 pub mod static_files;
 pub mod telegram;
 pub mod telegram_transport;
+pub mod voice_api;
 pub mod webhook;
 pub mod websocket;
 
