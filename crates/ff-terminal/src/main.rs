@@ -760,6 +760,18 @@ enum SessionCommand {
     },
     /// List every session_brain entry for a session, newest first.
     BrainList { session: String },
+    /// Add an LLM-driven planner step to a session. The planner role
+    /// is asked to decompose the session's goal into a JSON DAG;
+    /// follow up with `ff session apply-plan` once it completes.
+    Plan { session: String },
+    /// Read the most recent completed planner step's output and
+    /// insert its planned children as agent_steps. If --from-step is
+    /// passed, uses that specific step's output instead.
+    ApplyPlan {
+        session: String,
+        #[arg(long = "from-step")]
+        from_step: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -2490,6 +2502,40 @@ async fn main() -> Result<()> {
                         "{}",
                         serde_json::to_string_pretty(&rows).unwrap_or_default()
                     );
+                    Ok(())
+                }
+                SessionCommand::Plan { session } => {
+                    let sid = uuid::Uuid::parse_str(&session)
+                        .map_err(|e| anyhow::anyhow!("invalid uuid: {e}"))?;
+                    let id = ff_agent::session_runner::add_planner_step(&pool, sid)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("add planner step: {e}"))?;
+                    println!("{GREEN}✓{RESET} planner step created: {id}");
+                    println!(
+                        "  next: wait for it to complete, then run `ff session apply-plan {session}`"
+                    );
+                    Ok(())
+                }
+                SessionCommand::ApplyPlan { session, from_step } => {
+                    let sid = uuid::Uuid::parse_str(&session)
+                        .map_err(|e| anyhow::anyhow!("invalid uuid: {e}"))?;
+                    let from = match from_step {
+                        Some(s) => Some(
+                            uuid::Uuid::parse_str(&s)
+                                .map_err(|e| anyhow::anyhow!("invalid --from-step: {e}"))?,
+                        ),
+                        None => None,
+                    };
+                    let ids = ff_agent::session_runner::apply_plan(&pool, sid, from)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("apply plan: {e}"))?;
+                    println!(
+                        "{GREEN}✓{RESET} inserted {} planned step(s):",
+                        ids.len()
+                    );
+                    for id in ids {
+                        println!("  {id}");
+                    }
                     Ok(())
                 }
             }

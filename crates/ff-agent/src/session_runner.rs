@@ -491,6 +491,149 @@ pub async fn brain_list(
         .collect())
 }
 
+/// Add a planner step to a session — the planner role decomposes the
+/// session's goal into a concrete step DAG. The dispatched LLM is
+/// asked to emit JSON; a follow-up `apply_plan` reads the completed
+/// step's stdout and inserts children accordingly.
+///
+/// Two-step flow lets the operator inspect the plan before committing
+/// (some plans are bad / missing constraints; review-before-apply
+/// catches that).
+pub async fn add_planner_step(
+    pool: &PgPool,
+    session_id: uuid::Uuid,
+) -> Result<uuid::Uuid> {
+    let goal: String = sqlx::query_scalar("SELECT goal FROM agent_sessions WHERE id = $1")
+        .bind(session_id)
+        .fetch_one(pool)
+        .await
+        .context("read session goal")?;
+
+    let prompt = format!(
+        "You are decomposing a user goal into a concrete plan for a multi-LLM team \
+         (planner / coder / reviewer / browser / synthesiser).\n\n\
+         User goal: {goal}\n\n\
+         Output ONLY a JSON object of this shape, with no commentary or markdown fences:\n\
+         {{\n  \
+           \"steps\": [\n    \
+             {{\n      \"name\": \"step name\",\n      \"role\": \"coder|reviewer|browser|synthesiser|planner\",\n      \"prompt\": \"what this step's LLM should do\",\n      \"depends_on\": [\"name of an earlier step\", ...]\n    }}\n  ]\n\
+         }}\n\n\
+         Rules:\n- 3-7 steps total.\n- depends_on uses step names (not UUIDs); the orchestrator resolves them.\n- The last step should typically be a synthesiser that combines the team's findings.\n- Keep prompts specific and actionable."
+    );
+
+    add_step(pool, session_id, "plan", Some("planner"), &prompt, &[]).await
+}
+
+/// Read the most recent completed planner step in a session, parse its
+/// stdout as the planner JSON, and insert the planned children as
+/// agent_steps rows. Names in `depends_on` are resolved against
+/// previously-added steps in this session.
+///
+/// If the planner output isn't valid JSON or doesn't match the
+/// expected shape, returns an error rather than corrupting the DAG —
+/// operator inspects via `ff session get`.
+pub async fn apply_plan(
+    pool: &PgPool,
+    session_id: uuid::Uuid,
+    planner_step_id: Option<uuid::Uuid>,
+) -> Result<Vec<uuid::Uuid>> {
+    // Resolve which planner step's output to consume.
+    let step_id = match planner_step_id {
+        Some(id) => id,
+        None => sqlx::query_scalar(
+            "SELECT id FROM agent_steps
+              WHERE session_id = $1
+                AND role = 'planner'
+                AND status = 'completed'
+              ORDER BY completed_at DESC NULLS LAST
+              LIMIT 1",
+        )
+        .bind(session_id)
+        .fetch_optional(pool)
+        .await
+        .context("find latest completed planner step")?
+        .ok_or_else(|| anyhow!(
+            "no completed planner step found for session {session_id}; run `ff session plan` first and wait for it to finish"
+        ))?,
+    };
+
+    // The fleet_task result has shape {exit, stdout, stderr}. Parse the
+    // stdout as JSON; that's the planner's plan.
+    let result: Option<Value> = sqlx::query_scalar(
+        "SELECT t.result
+           FROM agent_steps s
+           JOIN fleet_tasks t ON t.id = s.fleet_task_id
+          WHERE s.id = $1",
+    )
+    .bind(step_id)
+    .fetch_optional(pool)
+    .await
+    .context("read planner step result")?;
+    let result = result.ok_or_else(|| anyhow!("planner step has no fleet_task result"))?;
+    let stdout = result
+        .get("stdout")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("planner step result missing stdout"))?;
+
+    // Try strict JSON first; fall back to extracting from a fenced
+    // code block (some LLMs ignore the no-fences instruction).
+    let plan_json: Value = serde_json::from_str(stdout.trim())
+        .or_else(|_| {
+            // Look for the first {…} block.
+            let s = stdout
+                .find('{')
+                .and_then(|start| {
+                    let end = stdout.rfind('}')?;
+                    if end > start {
+                        Some(&stdout[start..=end])
+                    } else {
+                        None
+                    }
+                })
+                .ok_or_else(|| anyhow!("no JSON object found in planner output"))?;
+            serde_json::from_str::<Value>(s).context("parse fallback JSON")
+        })?;
+
+    let steps_arr = plan_json
+        .get("steps")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("planner output missing 'steps' array"))?;
+
+    // Two-pass: first insert without deps to get IDs, then update
+    // deps once we know name → id mapping. Simpler: assume the
+    // planner emits steps in a topo-sort-friendly order and insert
+    // sequentially, resolving deps from prior names.
+    let mut name_to_id: std::collections::HashMap<String, uuid::Uuid> =
+        std::collections::HashMap::new();
+    let mut inserted = Vec::with_capacity(steps_arr.len());
+    for v in steps_arr {
+        let name = v
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("planned step missing 'name'"))?;
+        let role = v.get("role").and_then(Value::as_str);
+        let prompt = v
+            .get("prompt")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("planned step '{name}' missing 'prompt'"))?;
+        let dep_names = v
+            .get("depends_on")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let dep_ids: Vec<uuid::Uuid> = dep_names
+            .iter()
+            .filter_map(|n| n.as_str())
+            .filter_map(|n| name_to_id.get(n).copied())
+            .collect();
+        let id = add_step(pool, session_id, name, role, prompt, &dep_ids).await?;
+        name_to_id.insert(name.to_string(), id);
+        inserted.push(id);
+    }
+    info!(session = %session_id, count = inserted.len(), "applied planner plan");
+    Ok(inserted)
+}
+
 /// Helper for `ff session list` — return one row per session with
 /// progress counters.
 pub async fn list_sessions(pool: &PgPool, limit: i64) -> Result<Vec<Value>> {
