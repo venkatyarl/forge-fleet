@@ -9659,11 +9659,7 @@ async fn handle_social(cmd: SocialCommand) -> Result<()> {
                 "id", "platform", "status", "by", "ingested_at"
             );
             for (id, url, platform, status, by, at) in &rows {
-                let url_short = if url.len() > 60 {
-                    &url[..60]
-                } else {
-                    url.as_str()
-                };
+                let url_short: String = url.chars().take(60).collect();
                 println!(
                     "{id}  {:<10} {:<10} {:<16} {}",
                     platform,
@@ -9735,8 +9731,8 @@ async fn handle_social(cmd: SocialCommand) -> Result<()> {
                 println!("author   {a}");
             }
             if let Some(c) = caption {
-                let trunc = if c.len() > 400 {
-                    format!("{}…", &c[..400])
+                let trunc = if c.chars().count() > 400 {
+                    format!("{}…", c.chars().take(400).collect::<String>())
                 } else {
                     c
                 };
@@ -11583,8 +11579,8 @@ async fn handle_pm(cmd: PmCommand) -> Result<()> {
                 "ID", "PROJECT", "KIND", "STATUS", "PRIORITY", "ASSIGNEE", "TITLE"
             );
             for (id, pid, kind, title, st, prio, asgn, _created) in rows {
-                let title_clip = if title.len() > 60 {
-                    format!("{}…", &title[..59])
+                let title_clip = if title.chars().count() > 60 {
+                    format!("{}…", title.chars().take(59).collect::<String>())
                 } else {
                     title
                 };
@@ -11860,8 +11856,8 @@ async fn handle_pm_import_claude_tasks(
     if dry_run {
         println!("\n{YELLOW}Dry run — not writing.{RESET}");
         for (id, (status, subject)) in &snapshot {
-            let clip = if subject.len() > 60 {
-                format!("{}…", &subject[..59])
+            let clip = if subject.chars().count() > 60 {
+                format!("{}…", subject.chars().take(59).collect::<String>())
             } else {
                 subject.clone()
             };

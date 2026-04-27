@@ -155,8 +155,8 @@ fn build_summary(messages: &[ToolChatMessage]) -> String {
         match msg.role.as_str() {
             "user" => {
                 if let Some(text) = msg.text_content() {
-                    let truncated = if text.len() > 200 {
-                        format!("{}...", &text[..200])
+                    let truncated = if text.chars().count() > 200 {
+                        format!("{}...", text.chars().take(200).collect::<String>())
                     } else {
                         text.to_string()
                     };
@@ -175,8 +175,8 @@ fn build_summary(messages: &[ToolChatMessage]) -> String {
                 }
                 if let Some(text) = msg.text_content() {
                     if !text.is_empty() && text.len() > 20 {
-                        let truncated = if text.len() > 300 {
-                            format!("{}...", &text[..300])
+                        let truncated = if text.chars().count() > 300 {
+                            format!("{}...", text.chars().take(300).collect::<String>())
                         } else {
                             text.to_string()
                         };

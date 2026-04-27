@@ -315,8 +315,8 @@ impl ChatManager {
             chat.turn_count = turn_count;
             chat.last_active_at = Utc::now();
             if chat.preview.is_empty() && !preview.is_empty() {
-                chat.preview = if preview.len() > 100 {
-                    format!("{}...", &preview[..100])
+                chat.preview = if preview.chars().count() > 100 {
+                    format!("{}...", preview.chars().take(100).collect::<String>())
                 } else {
                     preview.to_string()
                 };
