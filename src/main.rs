@@ -2215,9 +2215,9 @@ async fn start_pulse_v2_subsystems(
                 // Screen-control helpers (PR-G). Members with these
                 // can run computer_use MCP actions; tasks with
                 // requires_capability=[screen] route only there.
-                "cliclick",  // macOS click/type/key driver
-                "xdotool",   // Linux click/type/key driver
-                "scrot",     // Linux screenshot
+                "cliclick", // macOS click/type/key driver
+                "xdotool",  // Linux click/type/key driver
+                "scrot",    // Linux screenshot
             ] {
                 let out = std::process::Command::new("/bin/sh")
                     .arg("-lc")

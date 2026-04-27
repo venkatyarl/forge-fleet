@@ -63,8 +63,14 @@ pub async fn resolve_upgrade_plans(
     only_computer: Option<&str>,
     upgrade_available_only: bool,
 ) -> Result<(Vec<UpgradePlan>, Vec<(String, String)>)> {
-    resolve_upgrade_plans_with_suffix(pool, software_id, only_computer, upgrade_available_only, None)
-        .await
+    resolve_upgrade_plans_with_suffix(
+        pool,
+        software_id,
+        only_computer,
+        upgrade_available_only,
+        None,
+    )
+    .await
 }
 
 /// Like [`resolve_upgrade_plans`] but with an optional `key_suffix` that
@@ -564,13 +570,12 @@ impl AutoUpgradeTick {
             // would otherwise be filtered to empty), the wave still
             // sees and processes every non-leader target.
             if is_daemon_self_software(software_id) {
-                let leader_id: Option<uuid::Uuid> = sqlx::query_scalar(
-                    "SELECT computer_id FROM fleet_leader_state LIMIT 1",
-                )
-                .fetch_optional(&self.pool)
-                .await
-                .ok()
-                .flatten();
+                let leader_id: Option<uuid::Uuid> =
+                    sqlx::query_scalar("SELECT computer_id FROM fleet_leader_state LIMIT 1")
+                        .fetch_optional(&self.pool)
+                        .await
+                        .ok()
+                        .flatten();
                 let Some(leader_id) = leader_id else {
                     tracing::warn!(
                         software_id = %software_id,

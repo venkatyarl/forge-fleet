@@ -377,10 +377,7 @@ pub fn build_router(state: Arc<GatewayState>, mc_db_path: Option<&str>) -> Route
         .route("/api/fleet/enroll", post(fleet_enroll))
         .route("/api/fleet/heartbeat", post(fleet_heartbeat))
         .route("/api/fleet/llm-usage", get(fleet_llm_usage))
-        .route(
-            "/api/voice/transcribe",
-            post(crate::voice_api::transcribe),
-        )
+        .route("/api/voice/transcribe", post(crate::voice_api::transcribe))
         .route("/api/voice/speak", post(crate::voice_api::speak))
         // Onboarding (see crates/ff-gateway/src/onboard.rs + plan §§3–3h)
         .route(
@@ -509,10 +506,7 @@ pub fn build_router(state: Arc<GatewayState>, mc_db_path: Option<&str>) -> Route
         .route("/api/agent/session/{id}/cancel", post(cancel_agent_session))
         .route("/api/agent/session/{id}/status", get(agent_session_status))
         .route("/api/agent/sessions", get(list_agent_sessions))
-        .route(
-            "/api/agent/v54/session/{id}",
-            get(get_v54_session),
-        )
+        .route("/api/agent/v54/session/{id}", get(get_v54_session))
         // ─── Pulse v2 dashboard routes ──────────────────────────────
         .route(
             "/api/fleet/computers",
@@ -1339,10 +1333,7 @@ async fn fleet_llm_usage(
         ));
     };
 
-    let since = params
-        .get("since")
-        .map(String::as_str)
-        .unwrap_or("24h");
+    let since = params.get("since").map(String::as_str).unwrap_or("24h");
     let since_secs: i64 = match since {
         "1h" => 3600,
         "6h" => 6 * 3600,
@@ -5386,12 +5377,13 @@ async fn list_agent_sessions(State(state): State<Arc<GatewayState>>) -> impl Int
     // sessions AND multi-LLM-team sessions in one place per the
     // multi-LLM CLI integration plan ("dashboard view becomes the
     // multi-LLM observability surface — no new namespace").
-    let v54_sessions: Vec<Value> = match state.operational_store.as_ref().and_then(|os| os.pg_pool()) {
-        Some(pool) => ff_agent::session_runner::list_sessions(pool, 50)
-            .await
-            .unwrap_or_default(),
-        None => Vec::new(),
-    };
+    let v54_sessions: Vec<Value> =
+        match state.operational_store.as_ref().and_then(|os| os.pg_pool()) {
+            Some(pool) => ff_agent::session_runner::list_sessions(pool, 50)
+                .await
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
 
     Json(json!({
         "sessions": sessions,

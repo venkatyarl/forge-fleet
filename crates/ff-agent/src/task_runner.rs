@@ -587,10 +587,9 @@ async fn run_shell_payload(
     }
     cmd.kill_on_drop(true);
 
-    let out = cmd
-        .output()
-        .await
-        .map_err(|e| TaskRunnerError::BadPayload(Box::leak(format!("spawn: {e}").into_boxed_str())))?;
+    let out = cmd.output().await.map_err(|e| {
+        TaskRunnerError::BadPayload(Box::leak(format!("spawn: {e}").into_boxed_str()))
+    })?;
 
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
@@ -837,7 +836,9 @@ pub async fn compose_fleet_upgrade_wave(
     let (plans, skipped) =
         resolve_upgrade_plans_with_suffix(pg, software_id, None, false, Some("build-only"))
             .await
-            .map_err(|e| sqlx::Error::Configuration(format!("resolve_upgrade_plans: {e}").into()))?;
+            .map_err(|e| {
+                sqlx::Error::Configuration(format!("resolve_upgrade_plans: {e}").into())
+            })?;
 
     if !skipped.is_empty() {
         tracing::info!(

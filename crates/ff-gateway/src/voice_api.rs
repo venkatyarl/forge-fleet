@@ -112,12 +112,15 @@ pub async fn transcribe(
             response_format: Some("json".to_string()),
             temperature: None,
         };
-        let transcript = client.transcribe_with_model(&bytes, req).await.map_err(|e| {
-            (
-                StatusCode::BAD_GATEWAY,
-                Json(json!({"error": format!("transcribe failed: {e}")})),
-            )
-        })?;
+        let transcript = client
+            .transcribe_with_model(&bytes, req)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({"error": format!("transcribe failed: {e}")})),
+                )
+            })?;
         return Ok(Json(json!({
             "text": transcript.text,
             "language": transcript.language,

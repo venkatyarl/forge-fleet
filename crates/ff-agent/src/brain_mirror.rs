@@ -84,9 +84,7 @@ fn walk_md_files(dir: &Path) -> Vec<(PathBuf, SystemTime)> {
             if let Ok(meta) = ent.metadata() {
                 if meta.is_dir() {
                     walk(&p, out);
-                } else if meta.is_file()
-                    && p.extension().and_then(|s| s.to_str()) == Some("md")
-                {
+                } else if meta.is_file() && p.extension().and_then(|s| s.to_str()) == Some("md") {
                     if let Ok(mtime) = meta.modified() {
                         out.push((p, mtime));
                     }
@@ -150,7 +148,9 @@ pub fn spawn_brain_mirror(
             };
 
             for src in MIRROR_SOURCES {
-                let Some(dir) = expand_home(src.source_dir) else { continue };
+                let Some(dir) = expand_home(src.source_dir) else {
+                    continue;
+                };
                 if !dir.is_dir() {
                     continue;
                 }

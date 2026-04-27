@@ -743,10 +743,7 @@ enum SessionCommand {
     Get { id: String },
     /// Read a session_brain entry — per-session shared memory across
     /// roles. JSON value is printed verbatim.
-    BrainGet {
-        session: String,
-        key: String,
-    },
+    BrainGet { session: String, key: String },
     /// Write a session_brain entry. Value is parsed as JSON; if the
     /// parse fails it's stored as a JSON string.
     BrainSet {
@@ -2178,14 +2175,9 @@ async fn main() -> Result<()> {
             // codex / gemini / kimi / grok) instead of the local agent
             // loop. `local` keeps existing behaviour.
             if !backend.eq_ignore_ascii_case("local") {
-                let r = ff_agent::cli_executor::execute_cli(
-                    &backend,
-                    &prompt,
-                    &backend_args,
-                    None,
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("backend `{backend}`: {e}"))?;
+                let r = ff_agent::cli_executor::execute_cli(&backend, &prompt, &backend_args, None)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("backend `{backend}`: {e}"))?;
                 if !r.stderr.is_empty() {
                     eprintln!("{}", r.stderr);
                 }
@@ -2348,9 +2340,7 @@ async fn main() -> Result<()> {
                         .map_err(|e| anyhow::anyhow!("cancel: {e}"))?;
                     match prev {
                         Some(prev_status) => {
-                            println!(
-                                "{GREEN}✓{RESET} cancelled {task_id} (was {prev_status})"
-                            );
+                            println!("{GREEN}✓{RESET} cancelled {task_id} (was {prev_status})");
                         }
                         None => {
                             println!(
@@ -2477,7 +2467,10 @@ async fn main() -> Result<()> {
                     let json = ff_agent::session_runner::get_session(&pool, sid)
                         .await
                         .map_err(|e| anyhow::anyhow!("get: {e}"))?;
-                    println!("{}", serde_json::to_string_pretty(&json).unwrap_or_default());
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&json).unwrap_or_default()
+                    );
                     Ok(())
                 }
                 SessionCommand::BrainGet { session, key } => {
@@ -2557,10 +2550,7 @@ async fn main() -> Result<()> {
                     let ids = ff_agent::session_runner::apply_plan(&pool, sid, from)
                         .await
                         .map_err(|e| anyhow::anyhow!("apply plan: {e}"))?;
-                    println!(
-                        "{GREEN}✓{RESET} inserted {} planned step(s):",
-                        ids.len()
-                    );
+                    println!("{GREEN}✓{RESET} inserted {} planned step(s):", ids.len());
                     for id in ids {
                         println!("  {id}");
                     }
@@ -2606,7 +2596,10 @@ async fn main() -> Result<()> {
                     let snap = ff_agent::session_runner::collect_vote_answers(&pool, sid, &name)
                         .await
                         .map_err(|e| anyhow::anyhow!("collect: {e}"))?;
-                    println!("{}", serde_json::to_string_pretty(&snap).unwrap_or_default());
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&snap).unwrap_or_default()
+                    );
                     Ok(())
                 }
                 SessionCommand::Cancel { id } => {
@@ -2633,7 +2626,9 @@ async fn main() -> Result<()> {
             };
             // Resolve `all` to every catalog entry; otherwise look up the
             // single named provider.
-            let resolve = |name: &str| -> anyhow::Result<Vec<&'static ff_agent::oauth_distributor::OauthProvider>> {
+            let resolve = |name: &str| -> anyhow::Result<
+                Vec<&'static ff_agent::oauth_distributor::OauthProvider>,
+            > {
                 if name.eq_ignore_ascii_case("all") {
                     Ok(OAUTH_PROVIDERS.iter().collect())
                 } else {
@@ -2646,7 +2641,10 @@ async fn main() -> Result<()> {
                 OauthCommand::Import { provider } => {
                     for p in resolve(&provider)? {
                         match import_token(&pool, p).await {
-                            Ok(()) => println!("{GREEN}✓{RESET} imported {} → fleet_secrets[{}]", p.name, p.secret_key),
+                            Ok(()) => println!(
+                                "{GREEN}✓{RESET} imported {} → fleet_secrets[{}]",
+                                p.name, p.secret_key
+                            ),
                             Err(e) => println!("{RED}✗{RESET} {}: {e}", p.name),
                         }
                     }
@@ -2697,7 +2695,11 @@ async fn main() -> Result<()> {
                         println!(
                             "{:<10} {:<14} {:<18} {:<10} {}",
                             s.name,
-                            if s.cred_file_present { "present" } else { "missing" },
+                            if s.cred_file_present {
+                                "present"
+                            } else {
+                                "missing"
+                            },
                             mtime,
                             if s.token_in_secrets { "yes" } else { "no" },
                             s.token_preview.unwrap_or_else(|| "-".into()),
@@ -2793,14 +2795,20 @@ async fn main() -> Result<()> {
                         })
                         .collect();
                     if r.exit_code == 0 && missing.is_empty() {
-                        eprintln!("{GREEN}✓ Task completed on attempt {attempt}/{max_attempts}{RESET}");
+                        eprintln!(
+                            "{GREEN}✓ Task completed on attempt {attempt}/{max_attempts}{RESET}"
+                        );
                         if !r.stdout.is_empty() {
                             println!("{}", r.stdout);
                         }
                         return Ok(());
                     }
                     last_err = if r.exit_code != 0 {
-                        format!("non-zero exit {}: {}", r.exit_code, r.stderr.chars().take(400).collect::<String>())
+                        format!(
+                            "non-zero exit {}: {}",
+                            r.exit_code,
+                            r.stderr.chars().take(400).collect::<String>()
+                        )
                     } else {
                         format!(
                             "{} declared deliverable(s) missing/empty: {}",
@@ -11891,9 +11899,7 @@ async fn handle_agent_fanout(
     }
 
     println!("composed parent task: {parent}");
-    println!(
-        "watch progress with: ff tasks list --status pending,running --show-id"
-    );
+    println!("watch progress with: ff tasks list --status pending,running --show-id");
     Ok(())
 }
 
@@ -11919,12 +11925,11 @@ async fn handle_agent_dispatch_each(
     // computers whose status='ok' — the per-task `requires_capability`
     // matcher will skip incapable members at claim time anyway, so a
     // task to a member without the backend simply stays pending.
-    let members: Vec<(uuid::Uuid, String)> = sqlx::query_as(
-        "SELECT id, name FROM computers WHERE status IN ('ok', 'pending')",
-    )
-    .fetch_all(pool)
-    .await
-    .map_err(|e| anyhow::anyhow!("list computers: {e}"))?;
+    let members: Vec<(uuid::Uuid, String)> =
+        sqlx::query_as("SELECT id, name FROM computers WHERE status IN ('ok', 'pending')")
+            .fetch_all(pool)
+            .await
+            .map_err(|e| anyhow::anyhow!("list computers: {e}"))?;
 
     let leader_computer_id: Option<uuid::Uuid> =
         sqlx::query_scalar("SELECT computer_id FROM fleet_leader_state LIMIT 1")
@@ -11974,9 +11979,7 @@ async fn handle_agent_dispatch_each(
     }
 
     println!("composed parent task: {parent}");
-    println!(
-        "watch progress with: ff tasks list --status pending,running --show-id"
-    );
+    println!("watch progress with: ff tasks list --status pending,running --show-id");
     Ok(())
 }
 
