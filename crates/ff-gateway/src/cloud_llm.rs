@@ -76,6 +76,45 @@ pub async fn try_route_to_cloud(
         }
     };
 
+    // Budget guard (Pillar 3 / PR-T3). Reads
+    // `fleet_secrets[budget.daily_usd_cap]` (string parsed as f64). If
+    // set and today's `cloud_llm_usage` cost ≥ cap, returns 402 with a
+    // clear error so the caller can fall back to a local LLM. Skipped
+    // for `oauth_subscription` and `local_bridge` rows since those don't
+    // accumulate `cost_usd` (subscription = $0/call). Also skipped when
+    // the secret is unset, so default behavior is unchanged.
+    if provider.auth_kind == "api_key" {
+        if let Some(cap) = pg_get_secret(pool, "budget.daily_usd_cap")
+            .await
+            .ok()
+            .flatten()
+            .and_then(|s| s.trim().parse::<f64>().ok())
+        {
+            let today_cost: Option<f64> = sqlx::query_scalar(
+                "SELECT COALESCE(SUM(cost_usd)::FLOAT8, 0.0)
+                   FROM cloud_llm_usage
+                  WHERE used_at > NOW() - INTERVAL '24 hours'",
+            )
+            .fetch_one(pool)
+            .await
+            .ok();
+            let today_cost = today_cost.unwrap_or(0.0);
+            if today_cost >= cap {
+                tracing::warn!(provider = %provider.id, today_cost, cap,
+                    "cloud_llm: budget.daily_usd_cap reached; refusing api_key call");
+                return Some(Err(error_response(
+                    StatusCode::PAYMENT_REQUIRED,
+                    format!(
+                        "daily budget cap ${:.2} reached (today: ${:.2}); falling back to local LLM. \
+                         Adjust with `ff secrets set budget.daily_usd_cap <usd>` or wait for the 24h window.",
+                        cap, today_cost
+                    ),
+                    "budget_cap_reached",
+                )));
+            }
+        }
+    }
+
     // Resolve the bearer token (or pass-through for local_bridge) based
     // on auth_kind. Three supported variants today (V53):
     //
