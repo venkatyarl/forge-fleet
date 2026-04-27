@@ -990,13 +990,25 @@ pub async fn compose_fleet_upgrade_wave(
         // the system domain as a last-resort fallback for daemons
         // loaded as system LaunchDaemons rather than user LaunchAgents.
         let inner_restart = if t.os_family.starts_with("macos") {
+            // launchctl is the happy path when forgefleetd is registered
+            // as a LaunchAgent. Some hosts (notably ace 2026-04-27)
+            // never had the plist installed — bootstrap gap, same shape
+            // as the missing-systemd-unit gap on Linux. Final fallback
+            // is a manual pkill + nohup respawn so the restart works
+            // regardless of how the daemon was originally started.
             "USER_ID=$(stat -f \"%u\" \"$HOME\" 2>/dev/null); \
              [ -z \"$USER_ID\" ] && USER_ID=$(id -u); \
              echo \"resolved USER_ID=$USER_ID HOME=$HOME\"; \
              launchctl kickstart -k \"gui/${USER_ID}/com.forgefleet.forgefleetd\" 2>/dev/null \
              || launchctl asuser \"${USER_ID}\" launchctl kickstart -k \"gui/${USER_ID}/com.forgefleet.forgefleetd\" 2>/dev/null \
              || launchctl kickstart -k \"user/${USER_ID}/com.forgefleet.forgefleetd\" 2>/dev/null \
-             || launchctl kickstart -k \"system/com.forgefleet.forgefleetd\""
+             || launchctl kickstart -k \"system/com.forgefleet.forgefleetd\" 2>/dev/null \
+             || (echo \"launchd has no registered service — falling back to pkill+nohup respawn\"; \
+                 pkill -TERM -f \"$HOME/.local/bin/forgefleetd\" 2>/dev/null; \
+                 sleep 1; \
+                 nohup \"$HOME/.local/bin/forgefleetd\" >/tmp/forgefleetd.out 2>&1 </dev/null & \
+                 disown; \
+                 echo \"respawned via nohup, pid=$!\")"
                 .to_string()
         } else {
             "export XDG_RUNTIME_DIR=\"${XDG_RUNTIME_DIR:-/run/user/$(id -u)}\"; \
