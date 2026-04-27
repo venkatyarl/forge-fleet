@@ -319,6 +319,135 @@ pub async fn status(pool: &PgPool) -> Result<Vec<ProviderStatus>> {
     Ok(out)
 }
 
+/// Outcome of one OAuth probe.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProbeResult {
+    pub provider: String,
+    /// `ok` (200/2xx), `unauthorized` (401), `forbidden` (403),
+    /// `no_token` (no fleet_secrets entry), `network_error`,
+    /// `http_<code>` for other status codes.
+    pub status: String,
+    pub http_status: Option<u16>,
+    pub message: Option<String>,
+}
+
+/// Probe one OAuth provider's token by hitting its `/v1/models`-style
+/// endpoint. Returns shape suitable for CLI rendering or alert dispatch.
+pub async fn probe_one(pool: &PgPool, provider: &OauthProvider) -> ProbeResult {
+    let token = match ff_db::pg_get_secret(pool, provider.secret_key).await {
+        Ok(Some(t)) if !t.is_empty() => t,
+        _ => {
+            return ProbeResult {
+                provider: provider.name.to_string(),
+                status: "no_token".to_string(),
+                http_status: None,
+                message: Some(format!(
+                    "fleet_secrets[{}] is unset; run `ff oauth import {}` first",
+                    provider.secret_key, provider.name
+                )),
+            };
+        }
+    };
+
+    // Per-provider probe URL + auth header. All endpoints return JSON
+    // and 200/2xx on a valid token, 401 on an invalid/expired one.
+    let (url, header_name, header_value, extra) = match provider.name {
+        "claude" => (
+            "https://api.anthropic.com/v1/models",
+            "authorization",
+            format!("Bearer {token}"),
+            Some(("anthropic-version", "2023-06-01")),
+        ),
+        "codex" => (
+            "https://api.openai.com/v1/models",
+            "authorization",
+            format!("Bearer {token}"),
+            None,
+        ),
+        "gemini" => (
+            "https://generativelanguage.googleapis.com/v1/models",
+            "authorization",
+            format!("Bearer {token}"),
+            None,
+        ),
+        "kimi" => (
+            "https://api.moonshot.cn/v1/models",
+            "authorization",
+            format!("Bearer {token}"),
+            None,
+        ),
+        "grok" => (
+            "https://api.x.ai/v1/models",
+            "authorization",
+            format!("Bearer {token}"),
+            None,
+        ),
+        other => {
+            return ProbeResult {
+                provider: other.to_string(),
+                status: "no_token".to_string(),
+                http_status: None,
+                message: Some(format!("unknown provider `{other}`; no probe URL")),
+            };
+        }
+    };
+
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return ProbeResult {
+                provider: provider.name.to_string(),
+                status: "network_error".to_string(),
+                http_status: None,
+                message: Some(format!("client build: {e}")),
+            };
+        }
+    };
+
+    let mut req = client.get(url).header(header_name, header_value);
+    if let Some((k, v)) = extra {
+        req = req.header(k, v);
+    }
+
+    match req.send().await {
+        Ok(resp) => {
+            let code = resp.status().as_u16();
+            let status = match code {
+                200..=299 => "ok",
+                401 => "unauthorized",
+                403 => "forbidden",
+                _ => {
+                    return ProbeResult {
+                        provider: provider.name.to_string(),
+                        status: format!("http_{code}"),
+                        http_status: Some(code),
+                        message: resp
+                            .text()
+                            .await
+                            .ok()
+                            .map(|s| s.chars().take(200).collect()),
+                    };
+                }
+            };
+            ProbeResult {
+                provider: provider.name.to_string(),
+                status: status.to_string(),
+                http_status: Some(code),
+                message: None,
+            }
+        }
+        Err(e) => ProbeResult {
+            provider: provider.name.to_string(),
+            status: "network_error".to_string(),
+            http_status: None,
+            message: Some(format!("{e}")),
+        },
+    }
+}
+
 /// Long-lived foreground loop. Polls every leader cred file every
 /// `REFRESH_POLL_SECS`; on mtime change, re-imports + redistributes.
 /// Exits when `shutdown` flips to true.

@@ -27,12 +27,61 @@ use ff_db::pg_get_secret;
 
 const CLOUD_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Max attempts when the upstream returns 429. Counts the initial call,
+/// so 3 = one call + two retries.
+const MAX_429_ATTEMPTS: usize = 3;
+
+/// Cap on `Retry-After` honoring. Vendors occasionally return absurdly
+/// long values; clamp to keep the request within `CLOUD_TIMEOUT` budget.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
+
+/// Default backoff when 429 came back without a `Retry-After` header.
+const DEFAULT_429_BACKOFF: Duration = Duration::from_secs(2);
+
 fn build_client() -> Client {
     Client::builder()
         .timeout(CLOUD_TIMEOUT)
         .pool_idle_timeout(Duration::from_secs(60))
         .build()
         .unwrap_or_else(|_| Client::new())
+}
+
+/// Send a request with retry-on-429. Honors `Retry-After` (capped at
+/// [`MAX_RETRY_AFTER`]) when present; falls back to
+/// [`DEFAULT_429_BACKOFF`] otherwise. Non-429 responses (success or
+/// other errors) return immediately. Builder must be cloneable, so the
+/// JSON body is set on each attempt's clone.
+async fn send_with_429_retry(
+    builder: reqwest::RequestBuilder,
+) -> Result<reqwest::Response, reqwest::Error> {
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        // try_clone returns None if the body is a stream. Our cloud
+        // calls all use JSON bodies, so this should always succeed.
+        let req = match builder.try_clone() {
+            Some(r) => r,
+            None => return builder.send().await,
+        };
+        let resp = req.send().await?;
+        if resp.status().as_u16() != 429 || attempt >= MAX_429_ATTEMPTS {
+            return Ok(resp);
+        }
+        let wait = resp
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .map(Duration::from_secs)
+            .map(|d| d.min(MAX_RETRY_AFTER))
+            .unwrap_or(DEFAULT_429_BACKOFF);
+        tracing::warn!(
+            attempt,
+            wait_secs = wait.as_secs(),
+            "cloud_llm: upstream 429, backing off"
+        );
+        tokio::time::sleep(wait).await;
+    }
 }
 
 fn error_response(status: StatusCode, message: impl Into<String>, kind: &str) -> Response<Body> {
@@ -290,12 +339,12 @@ async fn call_openai_chat(
         "{}/chat/completions",
         provider.base_url.trim_end_matches('/')
     );
-    let resp = client
+    let req = client
         .post(&url)
         .bearer_auth(api_key)
         .header("content-type", "application/json")
-        .json(body)
-        .send()
+        .json(body);
+    let resp = send_with_429_retry(req)
         .await
         .map_err(|e| CloudCallError::Local(format!("upstream request failed: {e}")))?;
 
@@ -382,8 +431,7 @@ async fn call_anthropic_messages(
         req.header("x-api-key", api_key)
     };
 
-    let resp = req
-        .send()
+    let resp = send_with_429_retry(req)
         .await
         .map_err(|e| CloudCallError::Local(format!("upstream request failed: {e}")))?;
 
