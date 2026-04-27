@@ -555,6 +555,88 @@ pub async fn pg_enqueue_shell_task_ext(
     Ok(id)
 }
 
+/// Method passed to [`pg_enqueue_pr_merge_task`].
+#[derive(Debug, Clone, Copy)]
+pub enum PrMergeMethod {
+    Merge,
+    Squash,
+    Rebase,
+}
+
+impl PrMergeMethod {
+    fn flag(self) -> &'static str {
+        match self {
+            PrMergeMethod::Merge => "--merge",
+            PrMergeMethod::Squash => "--squash",
+            PrMergeMethod::Rebase => "--rebase",
+        }
+    }
+}
+
+/// Enqueue a fleet task that watches `<pr_number>` for CI green and then
+/// merges it via `gh pr merge --<method> --delete-branch`. The
+/// `--delete-branch` flag is **always** included — branch cleanup is
+/// project policy (see `feedback_pr_merge_delete_branch.md`). Use this
+/// helper instead of inlining `gh pr merge` so the policy lives in one
+/// place.
+///
+/// `ci_timeout_iters` × 30s = the maximum wait for CI to settle. Set to
+/// 0 for no CI watch (merge unconditionally — useful when the operator
+/// has already verified CI).
+#[allow(clippy::too_many_arguments)]
+pub async fn pg_enqueue_pr_merge_task(
+    pg: &PgPool,
+    pr_number: u32,
+    method: PrMergeMethod,
+    ci_timeout_iters: u32,
+    parent_task_id: Option<uuid::Uuid>,
+    priority: i32,
+    created_by_computer_id: Option<uuid::Uuid>,
+) -> Result<uuid::Uuid, sqlx::Error> {
+    let summary = format!("ff: merge PR #{pr_number} ({:?}) + delete branch", method);
+    let merge_flag = method.flag();
+    let command = if ci_timeout_iters > 0 {
+        format!(
+            "set -e; cd ${{FF_SOURCE_TREE/#\\~/$HOME}}\n\
+             PR={pr_number}\n\
+             echo \"watching PR #$PR CI ({iters} iters × 30s = {secs}s max)...\"\n\
+             for i in $(seq 1 {iters}); do\n\
+               out=$(gh pr checks $PR --json name,bucket 2>/dev/null || echo '[]')\n\
+               pending=$(echo \"$out\" | jq '[.[] | select(.bucket==\"pending\")] | length')\n\
+               fail=$(echo \"$out\" | jq '[.[] | select(.bucket==\"fail\")] | length')\n\
+               pass=$(echo \"$out\" | jq '[.[] | select(.bucket==\"pass\")] | length')\n\
+               echo \"iter=$i pending=$pending pass=$pass fail=$fail\"\n\
+               if [ \"$fail\" != \"0\" ]; then echo 'CI red'; gh pr checks $PR; exit 1; fi\n\
+               if [ \"$pending\" = \"0\" ] && [ \"$pass\" -gt 0 ]; then break; fi\n\
+               sleep 30\n\
+             done\n\
+             echo 'merging...'\n\
+             gh pr merge $PR {merge_flag} --delete-branch\n\
+             gh pr view $PR --json state,mergedAt\n",
+            iters = ci_timeout_iters,
+            secs = ci_timeout_iters * 30,
+        )
+    } else {
+        format!(
+            "set -e; cd ${{FF_SOURCE_TREE/#\\~/$HOME}}\n\
+             gh pr merge {pr_number} {merge_flag} --delete-branch\n\
+             gh pr view {pr_number} --json state,mergedAt\n",
+        )
+    };
+
+    pg_enqueue_shell_task(
+        pg,
+        &summary,
+        &command,
+        &["leader".to_string()],
+        None,
+        parent_task_id,
+        priority,
+        created_by_computer_id,
+    )
+    .await
+}
+
 /// Run a `task_type=shell` payload via `/bin/bash -lc <command>`.
 /// `env` is injected on top of the inherited daemon env — these are
 /// the `FF_*` values resolved from the DB at worker startup.
