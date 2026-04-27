@@ -2212,6 +2212,12 @@ async fn start_pulse_v2_subsystems(
                 "gemini",
                 "kimi",
                 "grok",
+                // Screen-control helpers (PR-G). Members with these
+                // can run computer_use MCP actions; tasks with
+                // requires_capability=[screen] route only there.
+                "cliclick",  // macOS click/type/key driver
+                "xdotool",   // Linux click/type/key driver
+                "scrot",     // Linux screenshot
             ] {
                 let out = std::process::Command::new("/bin/sh")
                     .arg("-lc")
@@ -2220,6 +2226,17 @@ async fn start_pulse_v2_subsystems(
                 if matches!(out, Ok(s) if s.success()) {
                     caps.insert(tool.to_string());
                 }
+            }
+            // Synthetic `screen` capability: fleet member can drive
+            // its own screen if either the macOS path (cliclick +
+            // built-in screencapture) or the Linux path
+            // (xdotool + scrot) is fully present. Lets task dispatch
+            // route screen work to the right member without
+            // hardcoding per-tool requirements.
+            let macos_screen = caps.contains("cliclick"); // screencapture is always present on macOS
+            let linux_screen = caps.contains("xdotool") && caps.contains("scrot");
+            if macos_screen || linux_screen {
+                caps.insert("screen".to_string());
             }
             // Leader gets a separate tag — composers can reserve work
             // that only the elected leader should run (e.g. coordinated
