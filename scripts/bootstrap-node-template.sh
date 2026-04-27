@@ -523,8 +523,34 @@ if [ "$OS_ID" != "macos" ]; then
     report "service" failed "systemctl reports inactive"
   fi
 else
-  # macOS: leave launchd setup to the operator per CLAUDE.md.
-  report "service" ok "macOS — operator installs launchd plist"
+  # macOS: install LaunchAgent plist so `launchctl kickstart -k` works
+  # for the wave dispatcher's Phase-2 restart. Skipping this step left
+  # ace stranded with no registered service on 2026-04-27 — every
+  # launchctl-domain probe failed and the wave's pkill+nohup fallback
+  # had to handle the restart instead. Bootstrap should install the
+  # supervisor unit unconditionally; the fallback is for crash-recovery,
+  # not normal operation.
+  PLIST_TEMPLATE="$REPO_DIR/deploy/launchd/com.forgefleet.forgefleetd.template.plist"
+  PLIST_TARGET_DIR="$USER_HOME/Library/LaunchAgents"
+  PLIST_TARGET="$PLIST_TARGET_DIR/com.forgefleet.forgefleetd.plist"
+  if [ -f "$PLIST_TEMPLATE" ]; then
+    USER_UID="$(run_as_user id -u)"
+    GUI_DOMAIN="gui/$USER_UID/com.forgefleet.forgefleetd"
+    run_as_user mkdir -p "$PLIST_TARGET_DIR" "$USER_HOME/.forgefleet/logs"
+    run_as_user bash -c "sed -e 's|__USER_HOME__|$USER_HOME|g' -e 's|__NODE_NAME__|$NAME|g' '$PLIST_TEMPLATE' > '$PLIST_TARGET'"
+    # Bootstrap into the GUI domain so live `launchctl kickstart -k` works.
+    run_as_user launchctl bootstrap "gui/$USER_UID" "$PLIST_TARGET" 2>/dev/null || true
+    run_as_user launchctl enable "$GUI_DOMAIN" 2>/dev/null || true
+    run_as_user launchctl kickstart -k "$GUI_DOMAIN" 2>/dev/null || true
+    sleep 2
+    if run_as_user launchctl print "$GUI_DOMAIN" >/dev/null 2>&1; then
+      report "service" ok "launchd plist registered"
+    else
+      report "service" warn "launchd plist installed but not yet registered (may need user re-login)"
+    fi
+  else
+    report "service" failed "missing $PLIST_TEMPLATE"
+  fi
 fi
 
 # ─── Done ────────────────────────────────────────────────────────────────
