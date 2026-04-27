@@ -484,6 +484,17 @@ enum TasksCommand {
         /// Computer name (must already have a row in `computers`).
         target: String,
     },
+    /// Compose a wave-based fleet upgrade for `<software_id>`.
+    /// Each task is "executor SSHs into target and runs the playbook";
+    /// peer-driven, no daemon-restarts-itself bug. Leader is excluded
+    /// from the graph (restart manually).
+    ComposeFleetUpgrade {
+        /// software_registry id, e.g. `forgefleetd_git`.
+        software_id: String,
+        /// Targets per wave; subsequent waves run after earlier ones.
+        #[arg(long, default_value_t = 4)]
+        fanout: usize,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -2113,6 +2124,28 @@ async fn main() -> Result<()> {
                         ff_agent::task_runner::compose_node_bootstrap(&pool, &target, my_id)
                             .await
                             .map_err(|e| anyhow::anyhow!("compose: {e}"))?;
+                    println!("composed parent task: {parent}");
+                    println!("watch progress with: ff tasks list --status pending,running");
+                    Ok(())
+                }
+                TasksCommand::ComposeFleetUpgrade {
+                    software_id,
+                    fanout,
+                } => {
+                    let me = ff_agent::fleet_info::resolve_this_node_name().await;
+                    let my_id: uuid::Uuid =
+                        sqlx::query_scalar("SELECT id FROM computers WHERE name = $1")
+                            .bind(&me)
+                            .fetch_one(&pool)
+                            .await?;
+                    let parent = ff_agent::task_runner::compose_fleet_upgrade_wave(
+                        &pool,
+                        &software_id,
+                        fanout,
+                        my_id,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("compose: {e}"))?;
                     println!("composed parent task: {parent}");
                     println!("watch progress with: ff tasks list --status pending,running");
                     Ok(())
