@@ -166,6 +166,14 @@ impl TaskRunner {
     pub async fn tick_once(&self) -> Result<Option<uuid::Uuid>, TaskRunnerError> {
         // 1. Atomically claim a task whose capabilities we satisfy.
         let cap_array: Vec<String> = self.my_capabilities.iter().cloned().collect();
+        // Two-phase / barrier note: tasks with `wait_for_siblings = true`
+        // are only claimable when no non-barrier sibling under the same
+        // `parent_task_id` is still `pending` or `running`. This lets the
+        // dispatcher emit a Phase-1 (parallel build/install, capability=[])
+        // and Phase-2 (serialized restart, capability=[leader]) under one
+        // parent without scheduling state — Phase-2 rows literally can't
+        // be claimed until Phase-1 drains. Closes the self-kill race
+        // documented in feedback_wave_dispatcher_self_kill_race.md.
         let row = sqlx::query(
             r#"
             UPDATE fleet_tasks
@@ -175,13 +183,24 @@ impl TaskRunner {
                    started_at             = COALESCE(started_at, NOW()),
                    last_heartbeat_at      = NOW()
              WHERE id = (
-               SELECT id FROM fleet_tasks
-                WHERE status = 'pending'
-                  AND task_type = 'shell'
-                  AND (preferred_computer_id IS NULL
-                       OR preferred_computer_id = $1)
-                  AND requires_capability <@ to_jsonb($2::text[])
-                ORDER BY priority DESC, created_at ASC
+               SELECT id FROM fleet_tasks t
+                WHERE t.status = 'pending'
+                  AND t.task_type = 'shell'
+                  AND (t.preferred_computer_id IS NULL
+                       OR t.preferred_computer_id = $1)
+                  AND t.requires_capability <@ to_jsonb($2::text[])
+                  AND (
+                    t.wait_for_siblings = false
+                    OR t.parent_task_id IS NULL
+                    OR NOT EXISTS (
+                      SELECT 1 FROM fleet_tasks s
+                       WHERE s.parent_task_id = t.parent_task_id
+                         AND s.id != t.id
+                         AND s.wait_for_siblings = false
+                         AND s.status IN ('pending', 'running')
+                    )
+                  )
+                ORDER BY t.priority DESC, t.created_at ASC
                   FOR UPDATE SKIP LOCKED
                 LIMIT 1
              )
@@ -389,7 +408,8 @@ pub fn spawn_leader_watchdog(
 }
 
 /// Enqueue a single shell task. Used by the CLI and by the
-/// `compose_aura_bootstrap` helper.
+/// `compose_aura_bootstrap` helper. Equivalent to
+/// [`pg_enqueue_shell_task_ext`] with `wait_for_siblings = false`.
 #[allow(clippy::too_many_arguments)]
 pub async fn pg_enqueue_shell_task(
     pg: &PgPool,
@@ -400,6 +420,37 @@ pub async fn pg_enqueue_shell_task(
     parent_task_id: Option<uuid::Uuid>,
     priority: i32,
     created_by_computer_id: Option<uuid::Uuid>,
+) -> Result<uuid::Uuid, sqlx::Error> {
+    pg_enqueue_shell_task_ext(
+        pg,
+        summary,
+        command,
+        capabilities,
+        preferred_computer,
+        parent_task_id,
+        priority,
+        created_by_computer_id,
+        false,
+    )
+    .await
+}
+
+/// Like [`pg_enqueue_shell_task`] but with `wait_for_siblings`. When set,
+/// the row is only claimable when no non-barrier sibling under the same
+/// `parent_task_id` is still pending or running. Used by the two-phase
+/// wave dispatcher to gate Phase-2 (restart) tasks behind Phase-1
+/// (build/install) completion.
+#[allow(clippy::too_many_arguments)]
+pub async fn pg_enqueue_shell_task_ext(
+    pg: &PgPool,
+    summary: &str,
+    command: &str,
+    capabilities: &[String],
+    preferred_computer: Option<&str>,
+    parent_task_id: Option<uuid::Uuid>,
+    priority: i32,
+    created_by_computer_id: Option<uuid::Uuid>,
+    wait_for_siblings: bool,
 ) -> Result<uuid::Uuid, sqlx::Error> {
     let preferred_id: Option<uuid::Uuid> = if let Some(name) = preferred_computer {
         sqlx::query_scalar("SELECT id FROM computers WHERE name = $1")
@@ -423,9 +474,9 @@ pub async fn pg_enqueue_shell_task(
         INSERT INTO fleet_tasks (
             parent_task_id, task_type, summary, payload,
             priority, requires_capability, preferred_computer_id,
-            created_by_computer_id
+            created_by_computer_id, wait_for_siblings
         )
-        VALUES ($1, 'shell', $2, $3, $4, $5, $6, $7)
+        VALUES ($1, 'shell', $2, $3, $4, $5, $6, $7, $8)
         RETURNING id
         "#,
     )
@@ -436,6 +487,7 @@ pub async fn pg_enqueue_shell_task(
     .bind(&caps)
     .bind(preferred_id)
     .bind(created_by_computer_id)
+    .bind(wait_for_siblings)
     .fetch_one(pg)
     .await?;
 
@@ -708,16 +760,20 @@ pub async fn compose_fleet_upgrade_wave(
     fanout: usize,
     leader_computer_id: uuid::Uuid,
 ) -> Result<uuid::Uuid, sqlx::Error> {
-    use crate::auto_upgrade::resolve_upgrade_plans;
+    use crate::auto_upgrade::resolve_upgrade_plans_with_suffix;
 
     let fanout = fanout.max(1);
 
     // 1. Resolve playbook for every member that has this software.
     //    `upgrade_available_only=false` means we get ALL targets, not
     //    just drift candidates — the dispatcher itself is the trigger.
-    let (plans, skipped) = resolve_upgrade_plans(pg, software_id, None, false)
-        .await
-        .map_err(|e| sqlx::Error::Configuration(format!("resolve_upgrade_plans: {e}").into()))?;
+    //    `key_suffix=Some("build-only")` requests the V52 build-only
+    //    playbook variant for Phase-1; resolver falls through to the
+    //    plain key on older deployments where V52 hasn't run.
+    let (plans, skipped) =
+        resolve_upgrade_plans_with_suffix(pg, software_id, None, false, Some("build-only"))
+            .await
+            .map_err(|e| sqlx::Error::Configuration(format!("resolve_upgrade_plans: {e}").into()))?;
 
     if !skipped.is_empty() {
         tracing::info!(
@@ -795,9 +851,11 @@ pub async fn compose_fleet_upgrade_wave(
     .fetch_one(pg)
     .await?;
 
-    // 4. Chunk targets into waves; one shell task per (wave, target).
-    //    Empty capability set = any worker may claim, so the fleet
-    //    self-parallelizes as Wave 0 expands the worker pool.
+    // 4. Phase 1 — chunk targets into waves; one build/install shell task
+    //    per (wave, target). Empty capability set = any worker may claim,
+    //    so the fleet self-parallelizes as Wave 0 expands the worker
+    //    pool. NO daemon restart in this phase — closes the self-kill
+    //    race documented in feedback_wave_dispatcher_self_kill_race.md.
     for (wave_idx, chunk) in wave_targets.chunks(fanout).enumerate() {
         let priority = 95i32.saturating_sub((wave_idx as i32).saturating_mul(3));
         for t in chunk {
@@ -829,7 +887,7 @@ pub async fn compose_fleet_upgrade_wave(
             pg_enqueue_shell_task(
                 pg,
                 &format!(
-                    "fleet-upgrade-wave/wave{wave_idx}: {software_id} on {}",
+                    "fleet-upgrade-wave/wave{wave_idx}/build: {software_id} on {}",
                     t.target_name
                 ),
                 &command,
@@ -841,6 +899,51 @@ pub async fn compose_fleet_upgrade_wave(
             )
             .await?;
         }
+    }
+
+    // 5. Phase 2 — restart tasks. One per target, capability=[leader],
+    //    wait_for_siblings=true so they're only claimable AFTER every
+    //    Phase-1 sibling completes. Leader is excluded as a target so
+    //    it never restarts itself; leader runs one task at a time, so
+    //    the restarts naturally serialize. Lower priority than Phase-1
+    //    so they sit at the end of the leader's queue.
+    let restart_priority = 30i32;
+    for t in &wave_targets {
+        let port_arg = if t.ssh_port == 22 {
+            String::new()
+        } else {
+            format!(" -p {}", t.ssh_port)
+        };
+        let restart_command = format!(
+            "set -e\n\
+             echo \"== restarting forgefleetd on {target} via ssh from $(hostname) ==\"\n\
+             ssh -T{port_arg} -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+                 {ssh_user}@{primary_ip} bash -l <<'FF_RESTART_EOF'\n\
+             export XDG_RUNTIME_DIR=\"${{XDG_RUNTIME_DIR:-/run/user/$(id -u)}}\"\n\
+             systemctl --user reset-failed forgefleetd.service forgefleet-node.service forgefleet-daemon.service 2>/dev/null\n\
+             systemctl --user restart forgefleetd.service || systemctl --user restart forgefleet-node.service || systemctl --user restart forgefleet-daemon.service\n\
+             FF_RESTART_EOF\n",
+            target = t.target_name,
+            port_arg = port_arg,
+            ssh_user = t.ssh_user,
+            primary_ip = t.primary_ip,
+        );
+
+        pg_enqueue_shell_task_ext(
+            pg,
+            &format!(
+                "fleet-upgrade-wave/restart: {software_id} on {}",
+                t.target_name
+            ),
+            &restart_command,
+            &["leader".to_string()],
+            None,
+            Some(parent),
+            restart_priority,
+            Some(leader_computer_id),
+            true, // wait_for_siblings — Phase-2 barrier
+        )
+        .await?;
     }
 
     Ok(parent)
