@@ -819,7 +819,23 @@ fn expand_tilde(s: &str) -> String {
 /// per-method refresh fns so `latest_version` is current. Method-agnostic —
 /// handles self_built, npm_registry, pypi, github_release, etc. uniformly.
 async fn flip_drift_status(pool: &PgPool) -> Result<u64> {
-    let res = sqlx::query(
+    // Rewrites status from authoritative inputs (installed_version,
+    // latest_version, leader's git_state) so the field stays accurate
+    // tick-to-tick instead of drifting after a transient leader-dirty
+    // state set rows to `upgrade_blocked_dirty`.
+    //
+    // Rules:
+    // - drift exists (installed != latest) AND leader git_state != dirty
+    //   → `upgrade_available` (handles both `ok` and stale
+    //   `upgrade_blocked_dirty` rows).
+    // - drift exists AND leader git_state == dirty
+    //   → `upgrade_blocked_dirty` (gate fires before any upgrade
+    //   attempt, including outside run_once).
+    //
+    // Both clauses are scoped to status IN ('ok', 'upgrade_available',
+    // 'upgrade_blocked_dirty') so we never clobber `upgrading` /
+    // `failed` / other in-flight terminal states.
+    let unblocked = sqlx::query(
         r#"
         UPDATE computer_software cs
            SET status = 'upgrade_available'
@@ -829,13 +845,45 @@ async fn flip_drift_status(pool: &PgPool) -> Result<u64> {
            AND sr.latest_version <> ''
            AND cs.installed_version IS NOT NULL
            AND cs.installed_version <> sr.latest_version
-           AND cs.status = 'ok'
+           AND cs.status IN ('ok', 'upgrade_blocked_dirty')
+           AND (
+             sr.id NOT IN ('ff_git', 'forgefleetd_git')
+             OR NOT EXISTS (
+               SELECT 1 FROM computer_software cs2
+                 JOIN computers c2 ON c2.id = cs2.computer_id
+                 JOIN fleet_leader_state fls ON LOWER(fls.member_name) = LOWER(c2.name)
+                WHERE cs2.software_id = sr.id
+                  AND cs2.metadata->>'git_state' = 'dirty'
+             )
+           )
         "#,
     )
     .execute(pool)
     .await
-    .context("flip drift status")?;
-    Ok(res.rows_affected())
+    .context("flip drift status — unblock")?;
+
+    let blocked = sqlx::query(
+        r#"
+        UPDATE computer_software cs
+           SET status = 'upgrade_blocked_dirty'
+          FROM software_registry sr
+         WHERE sr.id = cs.software_id
+           AND sr.id IN ('ff_git', 'forgefleetd_git')
+           AND cs.status IN ('ok', 'upgrade_available')
+           AND EXISTS (
+             SELECT 1 FROM computer_software cs2
+               JOIN computers c2 ON c2.id = cs2.computer_id
+               JOIN fleet_leader_state fls ON LOWER(fls.member_name) = LOWER(c2.name)
+              WHERE cs2.software_id = sr.id
+                AND cs2.metadata->>'git_state' = 'dirty'
+           )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .context("flip drift status — block on dirty leader")?;
+
+    Ok(unblocked.rows_affected() + blocked.rows_affected())
 }
 
 /// For every `software_registry` row with `version_source.method='npm_registry'`,
