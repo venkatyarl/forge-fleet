@@ -349,6 +349,18 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         }
     }
 
+    // 6.6) Brain mirror — watches per-CLI memory dirs (Claude Code,
+    // Codex, Gemini) and copies new markdown into the Obsidian vault's
+    // `Inbox/<source>/` folder. AI writes only to Inbox per the V13
+    // design; operator promotes from there. Runs on every fleet member
+    // since each has its own per-CLI state when the user works there
+    // directly.
+    if let Some(pg_pool) = operational_store.pg_pool() {
+        let (_brain_mirror_tx, brain_mirror_rx) = tokio::sync::watch::channel(false);
+        let h = ff_agent::brain_mirror::spawn_brain_mirror(pg_pool.clone(), brain_mirror_rx);
+        subsystem_tasks.push(h);
+    }
+
     // 7) telegram polling transport (bidirectional control channel)
     if config
         .transport
