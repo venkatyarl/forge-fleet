@@ -76,37 +76,81 @@ pub async fn try_route_to_cloud(
         }
     };
 
-    // TODO(oauth): implement refresh_token flow reading the refresh token
-    // from fleet_secrets[provider.oauth_token_secret], POSTing to
-    // provider.oauth_token_url with provider.oauth_client_id, and caching
-    // the resulting access_token in fleet_secrets with a short TTL.
-    if provider.auth_kind == "oauth2" {
-        tracing::warn!(provider = %provider.id,
-            "cloud_llm: oauth2 providers not yet wired; falling back to local routing");
-        return None;
-    }
-
-    let api_key = match pg_get_secret(pool, &provider.secret_key).await {
-        Ok(Some(k)) if !k.is_empty() => k,
-        Ok(_) => {
-            tracing::warn!(provider = %provider.id, secret_key = %provider.secret_key,
-                "cloud_llm: api_key secret is missing/empty; use `ff cloud-llm set-key` to add it");
-            return Some(Err(error_response(
-                StatusCode::UNAUTHORIZED,
-                format!(
-                    "API key not configured for cloud provider '{}'. Run `ff cloud-llm set-key {}`.",
-                    provider.id, provider.id
-                ),
-                "cloud_auth_missing",
-            )));
+    // Resolve the bearer token (or pass-through for local_bridge) based
+    // on auth_kind. Three supported variants today (V53):
+    //
+    //   `api_key`             — pay-per-token vendor billing. secret_key
+    //                           points at the API key in fleet_secrets.
+    //   `oauth_subscription`  — bearer is the harvested CLI subscription
+    //                           token (cred-file → fleet_secrets via
+    //                           `ff oauth import`). Same Bearer header
+    //                           dance as api_key downstream.
+    //   `local_bridge`        — no auth; the call goes to a local
+    //                           127.0.0.1:5110X bridge that owns
+    //                           credentials internally (PR-D will wire
+    //                           the bridge daemon).
+    //
+    // Legacy `oauth2` (refresh-token flow scaffolded in V26 but never
+    // wired) still bails — the new oauth_subscription path replaces it
+    // for the subscription use case.
+    let api_key = match provider.auth_kind.as_str() {
+        "api_key" | "oauth_subscription" => {
+            match pg_get_secret(pool, &provider.secret_key).await {
+                Ok(Some(k)) if !k.is_empty() => k,
+                Ok(_) => {
+                    let kind_label = if provider.auth_kind == "oauth_subscription" {
+                        "OAuth subscription token"
+                    } else {
+                        "API key"
+                    };
+                    let hint = if provider.auth_kind == "oauth_subscription" {
+                        format!(
+                            "Run `ff oauth import {}` on the leader (after `<cli> login`).",
+                            provider.id.split('_').next().unwrap_or("claude")
+                        )
+                    } else {
+                        format!("Run `ff cloud-llm set-key {}`.", provider.id)
+                    };
+                    tracing::warn!(provider = %provider.id, secret_key = %provider.secret_key,
+                        "cloud_llm: {} secret is missing/empty", kind_label);
+                    return Some(Err(error_response(
+                        StatusCode::UNAUTHORIZED,
+                        format!(
+                            "{kind_label} not configured for cloud provider '{}'. {hint}",
+                            provider.id
+                        ),
+                        "cloud_auth_missing",
+                    )));
+                }
+                Err(e) => {
+                    tracing::warn!(provider = %provider.id, error = %e, "cloud_llm: fetch secret failed");
+                    return Some(Err(error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("failed to load credentials for '{}'", provider.id),
+                        "cloud_auth_error",
+                    )));
+                }
+            }
         }
-        Err(e) => {
-            tracing::warn!(provider = %provider.id, error = %e, "cloud_llm: fetch secret failed");
-            return Some(Err(error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to load credentials for '{}'", provider.id),
-                "cloud_auth_error",
-            )));
+        "local_bridge" => {
+            // Local bridge daemons (51100-51104) don't need an
+            // Authorization header — they own credentials internally.
+            // Pass an empty string; the call_* helpers send no Bearer
+            // when the value is empty (see send_request).
+            String::new()
+        }
+        "oauth2" => {
+            // Legacy refresh-token flow — never wired. The new
+            // oauth_subscription path replaces it for subscription
+            // billing.
+            tracing::warn!(provider = %provider.id,
+                "cloud_llm: legacy oauth2 auth_kind not wired; falling back to local routing");
+            return None;
+        }
+        other => {
+            tracing::warn!(provider = %provider.id, auth_kind = %other,
+                "cloud_llm: unknown auth_kind; falling back to local routing");
+            return None;
         }
     };
 
@@ -287,12 +331,21 @@ async fn call_anthropic_messages(
     let (anth_body, _) = translate_openai_to_anthropic(body)?;
     let url = format!("{}/messages", provider.base_url.trim_end_matches('/'));
 
-    let resp = client
+    // Anthropic accepts either `x-api-key` (api-key billing) or
+    // `Authorization: Bearer <oauth_token>` (subscription). Pick by
+    // auth_kind so the harvested CLI token works for `anthropic_oauth`.
+    let mut req = client
         .post(&url)
-        .header("x-api-key", api_key)
         .header("anthropic-version", "2023-06-01")
         .header("content-type", "application/json")
-        .json(&anth_body)
+        .json(&anth_body);
+    req = if provider.auth_kind == "oauth_subscription" {
+        req.bearer_auth(api_key)
+    } else {
+        req.header("x-api-key", api_key)
+    };
+
+    let resp = req
         .send()
         .await
         .map_err(|e| CloudCallError::Local(format!("upstream request failed: {e}")))?;
@@ -439,19 +492,40 @@ async fn call_google_generate_content(
     model_id: &str,
     body: &Value,
 ) -> Result<CallOutcome, CloudCallError> {
-    let bare_model = model_id.strip_prefix("gemini/").unwrap_or(model_id);
-    let url = format!(
-        "{}/models/{}:generateContent?key={}",
-        provider.base_url.trim_end_matches('/'),
-        bare_model,
-        api_key
-    );
+    // Strip the prefix so the bare model name flows to the URL. Both
+    // `gemini/` (api_key path) and `gemini-` (oauth path) prefixes are
+    // valid model-name leads today.
+    let bare_model = model_id
+        .strip_prefix("gemini/")
+        .or_else(|| model_id.strip_prefix("gemini-"))
+        .unwrap_or(model_id);
+    // Google supports either `?key=API_KEY` (api-key billing) or
+    // `Authorization: Bearer <oauth_token>` (subscription). Pick by
+    // auth_kind so the OAuth-harvested token works for `google_oauth`.
+    let url = if provider.auth_kind == "oauth_subscription" {
+        format!(
+            "{}/models/{}:generateContent",
+            provider.base_url.trim_end_matches('/'),
+            bare_model,
+        )
+    } else {
+        format!(
+            "{}/models/{}:generateContent?key={}",
+            provider.base_url.trim_end_matches('/'),
+            bare_model,
+            api_key
+        )
+    };
     let gbody = translate_openai_to_google(body);
 
-    let resp = client
+    let mut req = client
         .post(&url)
         .header("content-type", "application/json")
-        .json(&gbody)
+        .json(&gbody);
+    if provider.auth_kind == "oauth_subscription" {
+        req = req.bearer_auth(api_key);
+    }
+    let resp = req
         .send()
         .await
         .map_err(|e| CloudCallError::Local(format!("upstream request failed: {e}")))?;

@@ -553,6 +553,67 @@ else
   fi
 fi
 
+# ─── 12. CLI MCP auto-config ─────────────────────────────────────────────
+#
+# Wire each vendor CLI (Claude Code, Codex, Gemini) to the local ff-mcp
+# server at port 50001 so the agent loops in those CLIs see ff's brain
+# tools (brain_search, brain_write_to_inbox, etc.) and the standard 36
+# fleet MCP tools. Per the multi-LLM roadmap (PR-A4), this closes the
+# manual `claude mcp add ...` gap.
+#
+# Each CLI has its own config-file convention; we write only when the
+# CLI binary itself is installed (gated by `command -v <cli>`). Idempotent
+# via merge-or-create logic.
+report "mcp-config" running
+
+MCP_URL="http://127.0.0.1:50001/mcp"
+
+# Claude Code: ~/.claude/.mcp-servers.json (JSON array of server objs)
+if run_as_user bash -lc 'command -v claude >/dev/null 2>&1'; then
+  CLAUDE_MCP_DIR="$USER_HOME/.claude"
+  CLAUDE_MCP_FILE="$CLAUDE_MCP_DIR/.mcp-servers.json"
+  run_as_user mkdir -p "$CLAUDE_MCP_DIR"
+  if [ ! -f "$CLAUDE_MCP_FILE" ]; then
+    run_as_user bash -c "cat > '$CLAUDE_MCP_FILE' <<EOF
+{\"mcpServers\":{\"forgefleet\":{\"url\":\"$MCP_URL\"}}}
+EOF"
+    report "mcp-config" ok "wrote claude mcp config"
+  else
+    # File exists — try `claude mcp add` if available, else leave alone.
+    run_as_user bash -lc "claude mcp add forgefleet $MCP_URL 2>/dev/null" || true
+  fi
+fi
+
+# Codex: ~/.codex/config.toml (TOML; append [mcp_servers.forgefleet] block)
+if run_as_user bash -lc 'command -v codex >/dev/null 2>&1'; then
+  CODEX_CONFIG_DIR="$USER_HOME/.codex"
+  CODEX_CONFIG_FILE="$CODEX_CONFIG_DIR/config.toml"
+  run_as_user mkdir -p "$CODEX_CONFIG_DIR"
+  if ! run_as_user bash -lc "grep -q 'mcp_servers.forgefleet' '$CODEX_CONFIG_FILE' 2>/dev/null"; then
+    run_as_user bash -c "cat >> '$CODEX_CONFIG_FILE' <<EOF
+
+[mcp_servers.forgefleet]
+url = \"$MCP_URL\"
+EOF"
+    report "mcp-config" ok "appended codex mcp config"
+  fi
+fi
+
+# Gemini CLI: ~/.gemini/settings.json (JSON; mcpServers map, similar shape)
+if run_as_user bash -lc 'command -v gemini >/dev/null 2>&1'; then
+  GEMINI_DIR="$USER_HOME/.gemini"
+  GEMINI_FILE="$GEMINI_DIR/settings.json"
+  run_as_user mkdir -p "$GEMINI_DIR"
+  if [ ! -f "$GEMINI_FILE" ]; then
+    run_as_user bash -c "cat > '$GEMINI_FILE' <<EOF
+{\"mcpServers\":{\"forgefleet\":{\"url\":\"$MCP_URL\"}}}
+EOF"
+    report "mcp-config" ok "wrote gemini mcp config"
+  fi
+fi
+
+report "mcp-config" ok
+
 # ─── Done ────────────────────────────────────────────────────────────────
 
 report "done" ok "$NAME is now a ForgeFleet node"
