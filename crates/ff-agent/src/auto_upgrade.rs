@@ -63,6 +63,22 @@ pub async fn resolve_upgrade_plans(
     only_computer: Option<&str>,
     upgrade_available_only: bool,
 ) -> Result<(Vec<UpgradePlan>, Vec<(String, String)>)> {
+    resolve_upgrade_plans_with_suffix(pool, software_id, only_computer, upgrade_available_only, None)
+        .await
+}
+
+/// Like [`resolve_upgrade_plans`] but with an optional `key_suffix` that
+/// is prepended to the playbook-key candidates. Lets the wave dispatcher
+/// request a build-only playbook (suffix=`build-only`) for Phase-1 of
+/// the two-phase upgrade graph — `linux-ubuntu-build-only` is tried
+/// before `linux-ubuntu`, falling through to the plain key if absent.
+pub async fn resolve_upgrade_plans_with_suffix(
+    pool: &PgPool,
+    software_id: &str,
+    only_computer: Option<&str>,
+    upgrade_available_only: bool,
+    key_suffix: Option<&str>,
+) -> Result<(Vec<UpgradePlan>, Vec<(String, String)>)> {
     // Pull the registry metadata first so we can carry display_name +
     // upgrade_playbook into each plan.
     let sw_row = sqlx::query(
@@ -149,6 +165,17 @@ pub async fn resolve_upgrade_plans(
 
         let candidates: Vec<String> = {
             let mut v = Vec::new();
+            // If a key_suffix is requested, try suffixed variants FIRST so
+            // a build-only / restart-only playbook key wins over the plain
+            // key when present. Falls through to the plain key if the
+            // suffixed variant doesn't exist for this os_family.
+            if let Some(suffix) = key_suffix {
+                if let Some(src) = &install_source {
+                    v.push(format!("{os_family}-{src}-{suffix}"));
+                }
+                v.push(format!("{os_family}-{suffix}"));
+                v.push(format!("all-{suffix}"));
+            }
             if let Some(src) = &install_source {
                 v.push(format!("{os_family}-{src}"));
             }

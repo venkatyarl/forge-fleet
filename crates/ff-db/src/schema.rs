@@ -4544,3 +4544,64 @@ UPDATE software_registry
        )
  WHERE id IN ('ff_git', 'forgefleetd_git');
 "#;
+
+// ─── V52: wait_for_siblings barrier flag + build-only playbook keys ─────────
+//
+// Two coupled additions that together let the wave dispatcher run a true
+// two-phase upgrade graph:
+//
+// 1. `fleet_tasks.wait_for_siblings BOOLEAN`. A row with this flag set is
+//    only claimable when no sibling under the same `parent_task_id` (with
+//    `wait_for_siblings = false`, i.e. a non-barrier sibling) is still
+//    `pending` or `running`. The TaskRunner checks this in tick_once.
+//    Phase-2 tasks naturally barrier on Phase-1 with no extra polling.
+//
+// 2. New playbook keys `linux-ubuntu-build-only` / `linux-dgx-build-only`
+//    on `forgefleetd_git` and `ff_git`. Identical to the existing
+//    `linux-ubuntu` / `linux-dgx` playbooks except WITHOUT the trailing
+//    systemctl restart. The two-phase dispatcher uses these for Phase 1
+//    (build+install on every target, no daemon restart). Phase 2 then
+//    issues SSH+restart from the leader, sequentially.
+//
+// This eliminates the self-kill race documented in
+// `feedback_wave_dispatcher_self_kill_race.md`.
+pub const SCHEMA_V52_WAIT_FOR_SIBLINGS_BARRIER: &str = r#"
+ALTER TABLE fleet_tasks
+    ADD COLUMN IF NOT EXISTS wait_for_siblings BOOLEAN NOT NULL DEFAULT false;
+
+UPDATE software_registry
+   SET upgrade_playbook = jsonb_set(
+           jsonb_set(
+               upgrade_playbook,
+               '{linux-ubuntu-build-only}',
+               to_jsonb(
+                  'export PATH="$HOME/.cargo/bin:$PATH" && '
+               || 'export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" && '
+               || 'mkdir -p "$(dirname $HOME/.forgefleet/sub-agent-0/forge-fleet)" && '
+               || '{ [ -d "$HOME/.forgefleet/sub-agent-0/forge-fleet/.git" ] || git clone https://github.com/venkatyarl/forge-fleet "$HOME/.forgefleet/sub-agent-0/forge-fleet"; } && '
+               || 'cd "$HOME/.forgefleet/sub-agent-0/forge-fleet" && '
+               || 'git fetch origin main && '
+               || 'NEED_BUILD=1; '
+               || 'if [ "$(git rev-parse HEAD 2>/dev/null)" = "$(git rev-parse origin/main 2>/dev/null)" ] && [ -x target/release/forgefleetd ] && [ -x target/release/ff ]; then NEED_BUILD=0; fi; '
+               || 'if [ "$NEED_BUILD" = "1" ]; then git reset --hard origin/main && cargo build --release -p forge-fleet; fi && '
+               || 'install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && '
+               || 'install -m 755 target/release/ff ~/.local/bin/ff'
+               )
+           ),
+           '{linux-dgx-build-only}',
+           to_jsonb(
+              'export PATH="$HOME/.cargo/bin:$PATH" && '
+           || 'export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" && '
+           || 'mkdir -p "$(dirname $HOME/.forgefleet/sub-agent-0/forge-fleet)" && '
+           || '{ [ -d "$HOME/.forgefleet/sub-agent-0/forge-fleet/.git" ] || git clone https://github.com/venkatyarl/forge-fleet "$HOME/.forgefleet/sub-agent-0/forge-fleet"; } && '
+           || 'cd "$HOME/.forgefleet/sub-agent-0/forge-fleet" && '
+           || 'git fetch origin main && '
+           || 'NEED_BUILD=1; '
+           || 'if [ "$(git rev-parse HEAD 2>/dev/null)" = "$(git rev-parse origin/main 2>/dev/null)" ] && [ -x target/release/forgefleetd ] && [ -x target/release/ff ]; then NEED_BUILD=0; fi; '
+           || 'if [ "$NEED_BUILD" = "1" ]; then git reset --hard origin/main && cargo build --release -p forge-fleet; fi && '
+           || 'install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && '
+           || 'install -m 755 target/release/ff ~/.local/bin/ff'
+           )
+       )
+ WHERE id IN ('ff_git', 'forgefleetd_git');
+"#;

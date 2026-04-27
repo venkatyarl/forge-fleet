@@ -36,7 +36,11 @@ pub async fn collect_current() -> BTreeMap<String, String> {
         out.insert("ff".into(), v);
     }
     if let Some(sha) = git_head_sha().await {
-        out.insert("ff_git".into(), sha);
+        // Both ff and forgefleetd are built from the same repo, so they
+        // share the HEAD sha. Reporting both keys keeps the registry's
+        // installed_version accurate for both software_registry rows.
+        out.insert("ff_git".into(), sha.clone());
+        out.insert("forgefleetd_git".into(), sha);
     }
     for (key, bin, args) in [
         ("openclaw", "openclaw", vec!["--version"]),
@@ -88,7 +92,7 @@ pub async fn fetch_latest(keys: &[&str]) -> BTreeMap<String, String> {
                 "llama.cpp" => gh_release(&client, "ggerganov/llama.cpp").await,
                 "mlx_lm" => pypi_version(&client, "mlx-lm").await,
                 "vllm" => pypi_version(&client, "vllm").await,
-                "ff_git" => git_ls_remote_main().await,
+                "ff_git" | "forgefleetd_git" => git_ls_remote_main().await,
                 _ => None,
             };
             (key, val)

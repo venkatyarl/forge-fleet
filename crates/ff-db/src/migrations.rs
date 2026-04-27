@@ -397,6 +397,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "idempotent_upgrade_playbook",
         sql: schema::SCHEMA_V51_IDEMPOTENT_UPGRADE_PLAYBOOK,
     },
+    PgMigration {
+        version: 52,
+        name: "wait_for_siblings_barrier",
+        sql: schema::SCHEMA_V52_WAIT_FOR_SIBLINGS_BARRIER,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.
