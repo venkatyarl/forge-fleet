@@ -371,9 +371,174 @@ pub async fn tick(pool: &PgPool) -> Result<TickStats> {
         .ok();
         info!(session = %sid, %outcome, "session finalised");
         stats.sessions_finalised += 1;
+
+        // Mirror this session's findings into the vault. Per V13's
+        // "AI writes only to Inbox" design, all session artefacts go
+        // under `Inbox/sessions/<session-id>/`. Operator promotes from
+        // there. Errors are non-fatal — the session is already
+        // finalised in the DB, the mirror is a nice-to-have.
+        if let Err(e) = mirror_session_to_vault(pool, sid).await {
+            warn!(session = %sid, error = %e, "session vault mirror failed (non-fatal)");
+        }
     }
 
     Ok(stats)
+}
+
+/// Copy a finalised session's brain entries + step results into the
+/// Obsidian vault as markdown files. Layout:
+///
+///   <vault>/Inbox/sessions/<session-id>/
+///     ├── _summary.md           — session metadata + step list + outcome
+///     ├── brain-<key>.md        — one per session_brain entry
+///     └── step-<step-name>.md   — one per step's stdout
+///
+/// Each file has frontmatter with `source: "ff-session"`,
+/// `session_id`, `role` etc. so future brain promotions know where
+/// the entry came from.
+async fn mirror_session_to_vault(pool: &PgPool, session_id: uuid::Uuid) -> Result<()> {
+    let vault = match resolve_vault_root_for_session(pool).await {
+        Some(v) => v,
+        None => {
+            debug!("no vault configured; skipping session mirror");
+            return Ok(());
+        }
+    };
+
+    let dir = vault
+        .join("Inbox")
+        .join("sessions")
+        .join(session_id.to_string());
+    std::fs::create_dir_all(&dir).context("create session inbox dir")?;
+
+    // Pull session metadata + steps + brain entries.
+    let session_row = sqlx::query(
+        "SELECT goal, team, status, error, created_at, completed_at
+           FROM agent_sessions WHERE id = $1",
+    )
+    .bind(session_id)
+    .fetch_one(pool)
+    .await
+    .context("read session for mirror")?;
+    let goal: String = session_row.get("goal");
+    let status: String = session_row.get("status");
+    let error: Option<String> = session_row.try_get("error").ok();
+
+    // _summary.md — session-level overview.
+    let summary = format!(
+        "---\n\
+         source: ff-session\n\
+         session_id: {session_id}\n\
+         status: {status}\n\
+         finalized_at: {}\n\
+         ---\n\n\
+         # Session: {goal}\n\n\
+         **Status**: {status}\n\n\
+         {}",
+        chrono::Utc::now().to_rfc3339(),
+        error.map(|e| format!("**Error**: {e}\n\n")).unwrap_or_default()
+    );
+    std::fs::write(dir.join("_summary.md"), summary).context("write session summary")?;
+
+    // Per-step files.
+    let steps = sqlx::query(
+        "SELECT s.id, s.name, s.role, s.status, t.result
+           FROM agent_steps s
+           LEFT JOIN fleet_tasks t ON t.id = s.fleet_task_id
+          WHERE s.session_id = $1
+          ORDER BY s.created_at",
+    )
+    .bind(session_id)
+    .fetch_all(pool)
+    .await
+    .context("read session steps for mirror")?;
+    for s in steps {
+        let name: String = s.get("name");
+        let role: Option<String> = s.try_get("role").ok();
+        let step_status: String = s.get("status");
+        let result: Option<Value> = s.try_get("result").ok();
+        let stdout = result
+            .as_ref()
+            .and_then(|r| r.get("stdout"))
+            .and_then(Value::as_str)
+            .unwrap_or("(no stdout captured)");
+        let safe_name = sanitize_filename(&name);
+        let body = format!(
+            "---\n\
+             source: ff-session\n\
+             session_id: {session_id}\n\
+             step_name: {name}\n\
+             role: {}\n\
+             status: {step_status}\n\
+             ---\n\n\
+             # Step: {name}\n\n\
+             ```\n{stdout}\n```\n",
+            role.as_deref().unwrap_or("-")
+        );
+        std::fs::write(dir.join(format!("step-{safe_name}.md")), body)
+            .context("write step file")?;
+    }
+
+    // session_brain entries.
+    let brain = sqlx::query(
+        "SELECT key, value, written_by_role, written_at
+           FROM session_brain WHERE session_id = $1
+          ORDER BY written_at",
+    )
+    .bind(session_id)
+    .fetch_all(pool)
+    .await
+    .context("read session_brain for mirror")?;
+    for b in brain {
+        let key: String = b.get("key");
+        let value: Value = b.try_get("value").unwrap_or_else(|_| json!(null));
+        let by_role: Option<String> = b.try_get("written_by_role").ok();
+        let safe_key = sanitize_filename(&key);
+        let body = format!(
+            "---\n\
+             source: ff-session\n\
+             session_id: {session_id}\n\
+             brain_key: {key}\n\
+             written_by_role: {}\n\
+             ---\n\n\
+             # Brain entry: {key}\n\n\
+             ```json\n{}\n```\n",
+            by_role.as_deref().unwrap_or("-"),
+            serde_json::to_string_pretty(&value).unwrap_or_default(),
+        );
+        std::fs::write(dir.join(format!("brain-{safe_key}.md")), body)
+            .context("write brain file")?;
+    }
+
+    info!(session = %session_id, dir = %dir.display(), "session mirrored to vault Inbox");
+    Ok(())
+}
+
+async fn resolve_vault_root_for_session(pool: &PgPool) -> Option<std::path::PathBuf> {
+    let from_secrets = ff_db::pg_get_secret(pool, "brain.vault_path")
+        .await
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty());
+    let raw = from_secrets.unwrap_or_else(|| "~/projects/Yarli_KnowledgeBase".into());
+    if let Some(rest) = raw.strip_prefix("~/") {
+        Some(dirs::home_dir()?.join(rest))
+    } else {
+        Some(std::path::PathBuf::from(raw))
+    }
+}
+
+fn sanitize_filename(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect::<String>()
+        .chars()
+        .take(120)
+        .collect()
 }
 
 /// Spawn the long-lived runner. Idempotent — multiple processes may
