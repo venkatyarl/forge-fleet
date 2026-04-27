@@ -103,6 +103,9 @@ impl ToolRegistry {
         self.register(Self::brain_thread_append());
         self.register(Self::brain_stack_push());
         self.register(Self::brain_backlog_add());
+
+        // ── Computer Use (Pillar 1) ─────────────────────────────────────
+        self.register(Self::computer_use());
     }
 
     // ── Tool definitions ─────────────────────────────────────────────────
@@ -848,6 +851,30 @@ impl ToolRegistry {
                     }
                 },
                 "required": ["task_id"]
+            }),
+        }
+    }
+
+    fn computer_use() -> ToolDefinition {
+        ToolDefinition {
+            name: "computer_use".to_string(),
+            description: "Drive the local fleet member's screen via screenshot/click/type/key/goto/move actions. Mirrors Anthropic's Computer Use API surface. Backed by `screencapture`+`cliclick` (macOS) or `scrot`+`xdotool` (Linux). Returns 503 with install hints when the helper binary is missing. Use this for browser automation, form fills, file dialogs — anything the human user could click on.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["screenshot", "click", "double_click", "move", "type", "key", "goto"],
+                        "description": "Which screen-control action to perform."
+                    },
+                    "x": { "type": "integer", "description": "X coord (click/double_click/move only)" },
+                    "y": { "type": "integer", "description": "Y coord (click/double_click/move only)" },
+                    "text": { "type": "string", "description": "Text to type (action=type)" },
+                    "key": { "type": "string", "description": "Keystroke name (e.g. 'Return', 'cmd+c'); action=key" },
+                    "url": { "type": "string", "description": "URL to open in default browser (action=goto)" },
+                    "region": { "type": "string", "description": "Optional region for screenshot: 'x,y,w,h'. Defaults to full screen." }
+                },
+                "required": ["action"]
             }),
         }
     }
