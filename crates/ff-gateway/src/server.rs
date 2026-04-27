@@ -376,6 +376,7 @@ pub fn build_router(state: Arc<GatewayState>, mc_db_path: Option<&str>) -> Route
         .route("/api/status", get(fleet_status))
         .route("/api/fleet/enroll", post(fleet_enroll))
         .route("/api/fleet/heartbeat", post(fleet_heartbeat))
+        .route("/api/fleet/llm-usage", get(fleet_llm_usage))
         // Onboarding (see crates/ff-gateway/src/onboard.rs + plan §§3–3h)
         .route(
             "/onboard/bootstrap.sh",
@@ -1308,6 +1309,115 @@ async fn fleet_status(
     let payload = build_fleet_status_payload(&state).await?;
     let value = serde_json::to_value(payload).unwrap_or_else(|_| json!({"status": "error"}));
     Ok(Json(value))
+}
+
+/// GET /api/fleet/llm-usage — aggregate token + cost from the
+/// existing `cloud_llm_usage` ledger. Optional filters via query
+/// string: `?since=1h|24h|7d` (default 24h), `?provider=<id>`,
+/// `?session_id=<id>`. Returns one row per provider with totals.
+///
+/// Foundation of Pillar 3 (token + billing accounting). The data is
+/// already captured by `record_usage()` for every cloud_llm call —
+/// this endpoint exposes it.
+async fn fleet_llm_usage(
+    State(state): State<Arc<GatewayState>>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(pool) = state.operational_store.as_ref().and_then(|os| os.pg_pool()) else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error":"postgres not configured"})),
+        ));
+    };
+
+    let since = params
+        .get("since")
+        .map(String::as_str)
+        .unwrap_or("24h");
+    let since_secs: i64 = match since {
+        "1h" => 3600,
+        "6h" => 6 * 3600,
+        "12h" => 12 * 3600,
+        "24h" | "1d" => 24 * 3600,
+        "7d" => 7 * 24 * 3600,
+        "30d" => 30 * 24 * 3600,
+        _ => 24 * 3600,
+    };
+
+    let provider_filter = params.get("provider").cloned();
+    let session_filter = params.get("session_id").cloned();
+
+    let mut sql = String::from(
+        "SELECT provider_id,
+                COUNT(*)                                  AS call_count,
+                COALESCE(SUM(tokens_input), 0)            AS total_in,
+                COALESCE(SUM(tokens_output), 0)           AS total_out,
+                COALESCE(SUM(cost_usd)::FLOAT8, 0.0)      AS total_cost_usd
+           FROM cloud_llm_usage
+          WHERE used_at > NOW() - make_interval(secs => $1::int)",
+    );
+    let mut bindings: Vec<String> = Vec::new();
+    if let Some(p) = &provider_filter {
+        bindings.push(p.clone());
+        sql.push_str(&format!(" AND provider_id = ${}", bindings.len() + 1));
+    }
+    if let Some(s) = &session_filter {
+        bindings.push(s.clone());
+        sql.push_str(&format!(" AND session_id = ${}", bindings.len() + 1));
+    }
+    sql.push_str(" GROUP BY provider_id ORDER BY total_cost_usd DESC, total_in DESC");
+
+    let mut q = sqlx::query(&sql).bind(since_secs as i32);
+    for b in &bindings {
+        q = q.bind(b);
+    }
+    let rows = q.fetch_all(pool).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("query: {e}")})),
+        )
+    })?;
+
+    use sqlx::Row;
+    let mut out = Vec::with_capacity(rows.len());
+    let mut grand_in: i64 = 0;
+    let mut grand_out: i64 = 0;
+    let mut grand_calls: i64 = 0;
+    let mut grand_cost = 0.0_f64;
+    for r in rows {
+        let provider_id: String = r.get("provider_id");
+        let call_count: i64 = r.get("call_count");
+        let total_in: i64 = r.get("total_in");
+        let total_out: i64 = r.get("total_out");
+        let cost_usd: f64 = r.get("total_cost_usd");
+        grand_in += total_in;
+        grand_out += total_out;
+        grand_calls += call_count;
+        grand_cost += cost_usd;
+        out.push(json!({
+            "provider_id": provider_id,
+            "call_count": call_count,
+            "tokens_input": total_in,
+            "tokens_output": total_out,
+            "tokens_total": total_in + total_out,
+            "cost_usd": cost_usd,
+        }));
+    }
+
+    Ok(Json(json!({
+        "since": since,
+        "since_secs": since_secs,
+        "provider_filter": provider_filter,
+        "session_filter": session_filter,
+        "providers": out,
+        "totals": {
+            "call_count":     grand_calls,
+            "tokens_input":   grand_in,
+            "tokens_output":  grand_out,
+            "tokens_total":   grand_in + grand_out,
+            "cost_usd":       grand_cost,
+        }
+    })))
 }
 
 /// GET /api/fleet/nodes/{id} — direct node detail endpoint used by dashboard.
