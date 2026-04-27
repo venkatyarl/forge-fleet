@@ -392,6 +392,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "seed_canonical_ports",
         sql: schema::SCHEMA_V50_SEED_CANONICAL_PORTS,
     },
+    PgMigration {
+        version: 51,
+        name: "idempotent_upgrade_playbook",
+        sql: schema::SCHEMA_V51_IDEMPOTENT_UPGRADE_PLAYBOOK,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.

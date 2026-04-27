@@ -4479,3 +4479,68 @@ VALUES
     ('port.mcp',      '50001', 'MCP HTTP server on every member',                   'migration-V50')
 ON CONFLICT (key) DO NOTHING;
 "#;
+
+// ─── V51: idempotent upgrade playbook ───────────────────────────────────────
+//
+// Rewrites the `linux-ubuntu` and `linux-dgx` playbooks for `forgefleetd_git`
+// and `ff_git` to be idempotent. Two changes:
+//
+// 1. **Skip rebuild when nothing changed.** Previously every wave round did
+//    `git reset --hard origin/main && cargo build --release`, which touched
+//    every source mtime and forced cargo to rebuild from scratch (~30s per
+//    target) even when origin/main hadn't moved. The new playbook checks
+//    `git rev-parse HEAD == git rev-parse origin/main` AND that both
+//    `target/release/{forgefleetd,ff}` exist; only then skips the
+//    fetch+build. On a re-dispatched wave this collapses the per-target
+//    work from ~30s to ~3s.
+//
+// 2. **Install both binaries.** The previous playbook only installed
+//    `forgefleetd`, leaving `~/.local/bin/ff` stale. Now installs both.
+//
+// Why this matters: the wave dispatcher has a known self-kill race (when
+// worker A is mid-upgrade for target B, another worker upgrading target A
+// restarts A's daemon, killing A's in-flight task — see
+// feedback_wave_dispatcher_self_kill_race.md). Shrinking each task's
+// duration from ~30s to ~3s shrinks the race window proportionally, so
+// re-dispatching converges in 1-2 rounds instead of 4+.
+pub const SCHEMA_V51_IDEMPOTENT_UPGRADE_PLAYBOOK: &str = r#"
+UPDATE software_registry
+   SET upgrade_playbook = jsonb_set(
+           jsonb_set(
+               upgrade_playbook,
+               '{linux-ubuntu}',
+               to_jsonb(
+                  'export PATH="$HOME/.cargo/bin:$PATH" && '
+               || 'export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" && '
+               || 'mkdir -p "$(dirname $HOME/.forgefleet/sub-agent-0/forge-fleet)" && '
+               || '{ [ -d "$HOME/.forgefleet/sub-agent-0/forge-fleet/.git" ] || git clone https://github.com/venkatyarl/forge-fleet "$HOME/.forgefleet/sub-agent-0/forge-fleet"; } && '
+               || 'cd "$HOME/.forgefleet/sub-agent-0/forge-fleet" && '
+               || 'git fetch origin main && '
+               || 'NEED_BUILD=1; '
+               || 'if [ "$(git rev-parse HEAD 2>/dev/null)" = "$(git rev-parse origin/main 2>/dev/null)" ] && [ -x target/release/forgefleetd ] && [ -x target/release/ff ]; then NEED_BUILD=0; fi; '
+               || 'if [ "$NEED_BUILD" = "1" ]; then git reset --hard origin/main && cargo build --release -p forge-fleet; fi && '
+               || 'install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && '
+               || 'install -m 755 target/release/ff ~/.local/bin/ff && '
+               || 'systemctl --user reset-failed forgefleetd.service forgefleet-node.service forgefleet-daemon.service 2>/dev/null; '
+               || 'systemctl --user restart forgefleetd.service || systemctl --user restart forgefleet-node.service || systemctl --user restart forgefleet-daemon.service'
+               )
+           ),
+           '{linux-dgx}',
+           to_jsonb(
+              'export PATH="$HOME/.cargo/bin:$PATH" && '
+           || 'export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" && '
+           || 'mkdir -p "$(dirname $HOME/.forgefleet/sub-agent-0/forge-fleet)" && '
+           || '{ [ -d "$HOME/.forgefleet/sub-agent-0/forge-fleet/.git" ] || git clone https://github.com/venkatyarl/forge-fleet "$HOME/.forgefleet/sub-agent-0/forge-fleet"; } && '
+           || 'cd "$HOME/.forgefleet/sub-agent-0/forge-fleet" && '
+           || 'git fetch origin main && '
+           || 'NEED_BUILD=1; '
+           || 'if [ "$(git rev-parse HEAD 2>/dev/null)" = "$(git rev-parse origin/main 2>/dev/null)" ] && [ -x target/release/forgefleetd ] && [ -x target/release/ff ]; then NEED_BUILD=0; fi; '
+           || 'if [ "$NEED_BUILD" = "1" ]; then git reset --hard origin/main && cargo build --release -p forge-fleet; fi && '
+           || 'install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && '
+           || 'install -m 755 target/release/ff ~/.local/bin/ff && '
+           || 'systemctl --user reset-failed forgefleetd.service forgefleet-node.service forgefleet-daemon.service 2>/dev/null; '
+           || 'systemctl --user restart forgefleetd.service || systemctl --user restart forgefleet-node.service || systemctl --user restart forgefleet-daemon.service'
+           )
+       )
+ WHERE id IN ('ff_git', 'forgefleetd_git');
+"#;
