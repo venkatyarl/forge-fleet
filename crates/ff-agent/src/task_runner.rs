@@ -43,10 +43,13 @@ const MAX_HANDOFFS: i32 = 3;
 /// Max wall-clock duration for a single shell task. Closes the
 /// heartbeat-fresh-but-stuck-forever class of bug (worker's heartbeat
 /// task keeps firing while the actual SSH/cargo child is wedged).
-/// Generous default — a from-scratch fleet build can take 10+ min on
-/// slower nodes; 30 min covers that with margin. Per-task override via
-/// `payload.max_duration_secs` if needed.
-const MAX_TASK_DURATION: Duration = Duration::from_secs(30 * 60);
+///
+/// 10 min default — covers a cold cargo build (~3-5 min observed) with
+/// 2x margin. Earlier 30 min default was too lenient: when priya hung,
+/// the wave's barrier held Phase-2 for 15+ min waiting for the timeout.
+/// Per-task override via `payload.max_duration_secs` for known-slow
+/// jobs (e.g. model downloads).
+const MAX_TASK_DURATION: Duration = Duration::from_secs(10 * 60);
 
 /// Read a port-shaped row from `fleet_secrets`. Panics loudly if the
 /// row is missing — better than silently falling back to a hardcoded
