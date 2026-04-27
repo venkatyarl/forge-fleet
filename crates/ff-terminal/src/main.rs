@@ -603,6 +603,33 @@ enum AgentCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// Fan out `N` copies of one prompt across the fleet via
+    /// `fleet_tasks` — each task runs `ff run --backend <backend>` on
+    /// a member that has the matching capability tag (e.g. `claude`).
+    /// With ~14 members × 5 CLIs the fleet has ~70 concurrent slots.
+    /// Returns the parent task UUID so the caller can `ff tasks list`
+    /// to watch progress.
+    Fanout {
+        /// The prompt to fan out.
+        prompt: String,
+        /// Vendor backend: claude / codex / gemini / kimi / grok.
+        /// Maps to a `requires_capability=[<backend>]` constraint on
+        /// each child task.
+        #[arg(long, default_value = "claude")]
+        backend: String,
+        /// Number of parallel copies. Each is a separate task; workers
+        /// compete via SKIP LOCKED.
+        #[arg(long, default_value_t = 5)]
+        fanout: u32,
+    },
+    /// Run the same prompt on every fleet member that has `<backend>`'s
+    /// CLI installed. One task per capable member; observable via
+    /// `ff tasks list`.
+    DispatchEach {
+        prompt: String,
+        #[arg(long, default_value = "claude")]
+        backend: String,
+    },
     /// Seed slot 0 for every computer in the `computers` table.
     /// Idempotent — existing rows are left alone.
     Seed,
@@ -11457,7 +11484,172 @@ async fn handle_agent(cmd: AgentCommand) -> Result<()> {
         AgentCommand::CommitBack { session, push, pr } => {
             handle_agent_commit_back(&pool, &session, push, pr).await
         }
+        AgentCommand::Fanout {
+            prompt,
+            backend,
+            fanout,
+        } => handle_agent_fanout(&pool, prompt, backend, fanout).await,
+        AgentCommand::DispatchEach { prompt, backend } => {
+            handle_agent_dispatch_each(&pool, prompt, backend).await
+        }
     }
+}
+
+/// Emit `fanout` shell tasks, each requiring capability `[backend]`.
+/// Each task runs `ff run --backend <backend> "<prompt>"` on whichever
+/// fleet worker grabs it. Workers compete via the existing SKIP LOCKED
+/// claim — natural parallelism up to the count of capable members.
+async fn handle_agent_fanout(
+    pool: &sqlx::PgPool,
+    prompt: String,
+    backend: String,
+    fanout: u32,
+) -> Result<()> {
+    use ff_agent::cli_executor::backend_by_name;
+    let cfg = backend_by_name(&backend).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unknown backend '{backend}'; expected one of: claude, codex, gemini, kimi, grok"
+        )
+    })?;
+
+    // Parent compound task — gives the user a single UUID to watch.
+    let leader_computer_id: Option<uuid::Uuid> =
+        sqlx::query_scalar("SELECT computer_id FROM fleet_leader_state LIMIT 1")
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten();
+    let parent: uuid::Uuid = sqlx::query_scalar(
+        r#"
+        INSERT INTO fleet_tasks (
+            task_type, summary, payload, priority, created_by_computer_id
+        )
+        VALUES ('compound', $1, $2, 80, $3)
+        RETURNING id
+        "#,
+    )
+    .bind(format!(
+        "agent-fanout: {} copies via backend={}",
+        fanout, cfg.name
+    ))
+    .bind(serde_json::json!({
+        "kind": "agent_fanout",
+        "backend": cfg.name,
+        "fanout": fanout,
+        "prompt_preview": prompt.chars().take(200).collect::<String>(),
+    }))
+    .bind(leader_computer_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("insert parent: {e}"))?;
+
+    // Encode the prompt as a single-quoted shell argument. Replace any
+    // single-quote with `'\''` so embedded quotes survive.
+    let shell_safe_prompt = prompt.replace('\'', "'\\''");
+    let cmd = format!("ff run --backend {} '{shell_safe_prompt}'", cfg.name);
+    for i in 0..fanout {
+        ff_agent::task_runner::pg_enqueue_shell_task(
+            pool,
+            &format!("agent-fanout/{i}: {} backend={}", cfg.name, cfg.name),
+            &cmd,
+            &[cfg.name.to_string()],
+            None,
+            Some(parent),
+            70,
+            leader_computer_id,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("enqueue child {i}: {e}"))?;
+    }
+
+    println!("composed parent task: {parent}");
+    println!(
+        "watch progress with: ff tasks list --status pending,running --show-id"
+    );
+    Ok(())
+}
+
+/// One shell task per capable member: the same prompt runs on every
+/// member that advertises capability `[backend]`. Useful for "have
+/// every member summarise their own logs in parallel" patterns.
+async fn handle_agent_dispatch_each(
+    pool: &sqlx::PgPool,
+    prompt: String,
+    backend: String,
+) -> Result<()> {
+    use ff_agent::cli_executor::backend_by_name;
+    let cfg = backend_by_name(&backend).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unknown backend '{backend}'; expected one of: claude, codex, gemini, kimi, grok"
+        )
+    })?;
+
+    // Find every member whose advertised capability set includes the
+    // backend tag. Capabilities are computed on daemon startup (see
+    // src/main.rs ~line 2152) and stored implicitly in fleet_workers
+    // via the worker registration. Here we approximate by querying
+    // computers whose status='ok' — the per-task `requires_capability`
+    // matcher will skip incapable members at claim time anyway, so a
+    // task to a member without the backend simply stays pending.
+    let members: Vec<(uuid::Uuid, String)> = sqlx::query_as(
+        "SELECT id, name FROM computers WHERE status IN ('ok', 'pending')",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("list computers: {e}"))?;
+
+    let leader_computer_id: Option<uuid::Uuid> =
+        sqlx::query_scalar("SELECT computer_id FROM fleet_leader_state LIMIT 1")
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten();
+
+    let parent: uuid::Uuid = sqlx::query_scalar(
+        r#"
+        INSERT INTO fleet_tasks (task_type, summary, payload, priority, created_by_computer_id)
+        VALUES ('compound', $1, $2, 80, $3)
+        RETURNING id
+        "#,
+    )
+    .bind(format!(
+        "agent-dispatch-each: {} member(s) via backend={}",
+        members.len(),
+        cfg.name
+    ))
+    .bind(serde_json::json!({
+        "kind": "agent_dispatch_each",
+        "backend": cfg.name,
+        "members": members.iter().map(|(_, n)| n.clone()).collect::<Vec<_>>(),
+        "prompt_preview": prompt.chars().take(200).collect::<String>(),
+    }))
+    .bind(leader_computer_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("insert parent: {e}"))?;
+
+    let shell_safe_prompt = prompt.replace('\'', "'\\''");
+    let cmd = format!("ff run --backend {} '{shell_safe_prompt}'", cfg.name);
+    for (_id, name) in &members {
+        ff_agent::task_runner::pg_enqueue_shell_task(
+            pool,
+            &format!("agent-dispatch-each: {} on {}", cfg.name, name),
+            &cmd,
+            &[cfg.name.to_string()],
+            Some(name),
+            Some(parent),
+            70,
+            leader_computer_id,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("enqueue task on {name}: {e}"))?;
+    }
+
+    println!("composed parent task: {parent}");
+    println!(
+        "watch progress with: ff tasks list --status pending,running --show-id"
+    );
+    Ok(())
 }
 
 // ─── #118: ff agent commit-back — fleet-LLM work → PR on origin/main ────────
