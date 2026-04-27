@@ -387,6 +387,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "connectivity_mode_and_eligibility",
         sql: schema::SCHEMA_V49_CONNECTIVITY_MODE_AND_ELIGIBILITY,
     },
+    PgMigration {
+        version: 50,
+        name: "seed_canonical_ports",
+        sql: schema::SCHEMA_V50_SEED_CANONICAL_PORTS,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.

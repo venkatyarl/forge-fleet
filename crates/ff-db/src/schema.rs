@@ -4455,3 +4455,27 @@ UPDATE computers
    SET election_eligibility = 'never_leader'
  WHERE name = 'aura';
 "#;
+
+// ─── V50: seed canonical fleet ports into fleet_secrets ─────────────────────
+//
+// Even values that are "canonical" (the single number used across the
+// fleet) get a single source of truth in the DB rather than a string
+// literal in source. Code reads `fleet_secrets WHERE key = 'port.gateway'`
+// at startup and panics if missing — so accidentally clearing the row
+// is loud, not silent. To change a port operationally, edit one row;
+// no recompile.
+//
+// Seeded values come from reference_canonical_ports.md and are the
+// values the rest of the fleet has been using. ON CONFLICT DO NOTHING
+// so a future operator override survives migration replays.
+pub const SCHEMA_V50_SEED_CANONICAL_PORTS: &str = r#"
+INSERT INTO fleet_secrets (key, value, description, updated_by)
+VALUES
+    ('port.gateway',  '51002', 'ForgeFleet HTTP gateway / dashboard / onboard.sh', 'migration-V50'),
+    ('port.openclaw', '50000', 'OpenClaw WebSocket gateway',                       'migration-V50'),
+    ('port.postgres', '55432', 'Postgres on the leader',                            'migration-V50'),
+    ('port.redis',    '6380',  'Redis on the leader',                               'migration-V50'),
+    ('port.nats',     '4222',  'NATS pub/sub on every member',                      'migration-V50'),
+    ('port.mcp',      '50001', 'MCP HTTP server on every member',                   'migration-V50')
+ON CONFLICT (key) DO NOTHING;
+"#;

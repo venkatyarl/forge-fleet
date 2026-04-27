@@ -41,6 +41,31 @@ const HEARTBEAT_EVERY: Duration = Duration::from_secs(30);
 /// Max times a row can be handed off before we give up and fail it.
 const MAX_HANDOFFS: i32 = 3;
 
+/// Read a port-shaped row from `fleet_secrets`. Panics loudly if the
+/// row is missing — better than silently falling back to a hardcoded
+/// default and drifting away from operational truth. Operators can
+/// always re-seed via the V50 migration or `ff secrets set`.
+async fn read_port_secret(pg: &PgPool, key: &str) -> Result<u16, sqlx::Error> {
+    let val: Option<String> = sqlx::query_scalar("SELECT value FROM fleet_secrets WHERE key = $1")
+        .bind(key)
+        .fetch_optional(pg)
+        .await?;
+    let s = val.ok_or_else(|| {
+        sqlx::Error::Configuration(
+            format!(
+                "fleet_secrets is missing required key '{key}' — \
+                 run V50 migration or `ff secrets set {key} <port>`"
+            )
+            .into(),
+        )
+    })?;
+    s.parse::<u16>().map_err(|e| {
+        sqlx::Error::Configuration(
+            format!("fleet_secrets['{key}']='{s}' is not a u16 port: {e}").into(),
+        )
+    })
+}
+
 /// Errors that can occur while running the task runner.
 #[derive(Debug, thiserror::Error)]
 pub enum TaskRunnerError {
@@ -127,11 +152,12 @@ impl TaskRunner {
         {
             let leader_name: String = row.get("member_name");
             let leader_ip: String = row.get("primary_ip");
-            // Canonical fleet gateway port — see reference_canonical_ports.md.
-            let gateway_url = format!("http://{leader_ip}:51002");
+            let gateway_port = read_port_secret(pg, "port.gateway").await?;
+            let gateway_url = format!("http://{leader_ip}:{gateway_port}");
             env.push(("FF_LEADER_NAME".to_string(), leader_name));
             env.push(("FF_LEADER_IP".to_string(), leader_ip));
             env.push(("FF_GATEWAY_URL".to_string(), gateway_url));
+            env.push(("FF_GATEWAY_PORT".to_string(), gateway_port.to_string()));
         }
         Ok(env)
     }
@@ -463,11 +489,12 @@ async fn run_shell_payload(
 
 /// Compose the multi-step "bring `<target>` online" task graph atomically.
 ///
-/// All node-specific values (IPs, ssh user, role) are read from the
-/// `computers` row at compose time — no IPs, names, or usernames in
-/// source. The leader's gateway URL is derived from the leader's own
-/// `computers.primary_ip` row (port 51002 is the canonical fleet
-/// gateway port — see `reference_canonical_ports.md`).
+/// Every node-specific value (IPs, ssh user, role) and every fleet
+/// constant (gateway port) is read from the DB at compose time — no
+/// IPs, names, usernames, or port numbers in source. Ports come from
+/// `fleet_secrets` (seeded by V50: `port.gateway`, `port.openclaw`, …)
+/// so an operator can change one row to change a port fleet-wide
+/// without a recompile.
 ///
 /// One parent (compound, no shell) plus N children, one per
 /// cooperative step. Children are sequenced by descending priority so
@@ -518,12 +545,9 @@ pub async fn compose_node_bootstrap(
         .bind(leader_computer_id)
         .fetch_one(pg)
         .await?;
-    // 51002 is the canonical fleet gateway port. Per
-    // reference_canonical_ports.md it is fixed across the fleet, so
-    // hardcoding it here is consistent with the project rule that
-    // *data* lives in the DB while *constants* (ports, schema names)
-    // live in code.
-    let gateway_url = format!("http://{leader_ip}:51002");
+    // Single source of truth: fleet_secrets['port.gateway'] (V50).
+    let gateway_port = read_port_secret(pg, "port.gateway").await?;
+    let gateway_url = format!("http://{leader_ip}:{gateway_port}");
 
     // ── 2. Parent task. ──────────────────────────────────────────────────
     let parent_summary = format!("{target_name}: bring online via fleet cooperation");
