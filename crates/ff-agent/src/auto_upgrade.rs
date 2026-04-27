@@ -547,31 +547,6 @@ impl AutoUpgradeTick {
             // for upgrading the leader — it's peer-driven and avoids
             // the suicide entirely. The hourly tick stays on the
             // defer queue for everyone else.
-            let plans: Vec<_> = if is_daemon_self_software(software_id) {
-                let leader_name_lc = self.my_name.to_ascii_lowercase();
-                let dropped = plans
-                    .iter()
-                    .filter(|p| p.computer_name.eq_ignore_ascii_case(&leader_name_lc))
-                    .count();
-                if dropped > 0 {
-                    tracing::info!(
-                        software_id = %software_id,
-                        leader = %self.my_name,
-                        "auto-upgrade: skipping leader (would suicide-restart its own worker); \
-                         use `ff tasks compose-fleet-upgrade` to upgrade the leader peer-driven"
-                    );
-                }
-                plans
-                    .into_iter()
-                    .filter(|p| !p.computer_name.eq_ignore_ascii_case(&leader_name_lc))
-                    .collect()
-            } else {
-                plans
-            };
-            if plans.is_empty() {
-                continue;
-            }
-
             // For daemon-self software (*_git), dispatch via the
             // two-phase wave dispatcher (fleet_tasks) instead of the
             // deferred queue. The wave dispatcher's Phase-2 restart is
@@ -580,6 +555,14 @@ impl AutoUpgradeTick {
             // feedback_wave_dispatcher_self_kill_race.md and giving
             // macOS targets a launchctl restart path. Other software
             // (apt/brew/pip-managed) keeps using the deferred queue.
+            //
+            // Important: this branch runs BEFORE the leader-filter
+            // and plans-empty short-circuit below. compose_fleet_upgrade_wave
+            // does its own resolve with `upgrade_available_only=false`
+            // and handles leader exclusion internally — so even if the
+            // tick's pre-filtered plans only contained the leader (and
+            // would otherwise be filtered to empty), the wave still
+            // sees and processes every non-leader target.
             if is_daemon_self_software(software_id) {
                 let leader_id: Option<uuid::Uuid> = sqlx::query_scalar(
                     "SELECT computer_id FROM fleet_leader_state LIMIT 1",
@@ -607,10 +590,9 @@ impl AutoUpgradeTick {
                         tracing::info!(
                             software_id = %software_id,
                             parent_task_id = %parent,
-                            target_count = plans.len(),
                             "auto-upgrade dispatched via two-phase wave"
                         );
-                        total += plans.len();
+                        total += plans.len().max(1);
                     }
                     Err(e) => tracing::warn!(
                         software_id = %software_id,
@@ -618,6 +600,21 @@ impl AutoUpgradeTick {
                         "auto-upgrade: compose_fleet_upgrade_wave failed"
                     ),
                 }
+                continue;
+            }
+
+            // Non-*_git path: drop leader from plans (suicide protection,
+            // historic — package-manager upgrades don't restart the
+            // daemon, but keep the filter for parity with old behavior),
+            // then enqueue via the deferred queue.
+            let plans: Vec<_> = {
+                let leader_name_lc = self.my_name.to_ascii_lowercase();
+                plans
+                    .into_iter()
+                    .filter(|p| !p.computer_name.eq_ignore_ascii_case(&leader_name_lc))
+                    .collect()
+            };
+            if plans.is_empty() {
                 continue;
             }
 
