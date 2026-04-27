@@ -407,6 +407,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "oauth_subscription_providers",
         sql: schema::SCHEMA_V53_OAUTH_SUBSCRIPTION_PROVIDERS,
     },
+    PgMigration {
+        version: 54,
+        name: "agent_orchestration",
+        sql: schema::SCHEMA_V54_AGENT_ORCHESTRATION,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.
