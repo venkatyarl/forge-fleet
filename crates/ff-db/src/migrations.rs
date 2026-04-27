@@ -402,6 +402,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "wait_for_siblings_barrier",
         sql: schema::SCHEMA_V52_WAIT_FOR_SIBLINGS_BARRIER,
     },
+    PgMigration {
+        version: 53,
+        name: "oauth_subscription_providers",
+        sql: schema::SCHEMA_V53_OAUTH_SUBSCRIPTION_PROVIDERS,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.

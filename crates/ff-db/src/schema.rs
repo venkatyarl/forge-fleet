@@ -4605,3 +4605,129 @@ UPDATE software_registry
        )
  WHERE id IN ('ff_git', 'forgefleetd_git');
 "#;
+
+// ─── V53: OAuth-subscription + CLI-bridge cloud_llm_providers rows ──────────
+//
+// Foundation for the multi-LLM CLI integration roadmap (see
+// `~/.claude/plans/cosmic-splashing-chipmunk.md`). Adds two new
+// `auth_kind` values:
+//
+//   `oauth_subscription` — ff calls the vendor API directly with a Bearer
+//      token harvested from each CLI's local credential file. Token lives
+//      in `fleet_secrets` keyed by `secret_key`. Pays from the user's
+//      Pro / Plus / Premium+ subscription quota, not pay-per-token.
+//
+//   `local_bridge` — ff routes to a local HTTP server (bridge daemon)
+//      that spawns the CLI per request and translates the JSON to
+//      OpenAI's chat-completion shape. base_url is `http://127.0.0.1:51100..51104`.
+//
+// Routing: `find_for_model` already picks the longest matching prefix.
+// The existing api_key `anthropic` row uses prefix `claude-`, which would
+// clash with the new oauth row's natural `claude-` prefix. We move the
+// api_key row to `anthropic/claude-` so an operator who wants
+// pay-per-token billing must opt in explicitly with
+// `--model anthropic/claude-haiku-3-5`. Default `--model claude-opus-4-7`
+// then routes through OAuth subscription.
+//
+// `record_usage()` in `crates/ff-gateway/src/cloud_llm.rs:589` already
+// captures token counts for any provider returning OpenAI-style `usage`
+// — the new oauth rows automatically get billing visibility once
+// Layer 1 is wired (PR-B). For oauth_subscription `cost_usd = 0` (call
+// is included in subscription) but token counts are still recorded.
+pub const SCHEMA_V53_OAUTH_SUBSCRIPTION_PROVIDERS: &str = r#"
+-- 1. Disambiguate the existing anthropic api_key row's prefix so the new
+--    oauth row can claim `claude-` as its natural prefix.
+UPDATE cloud_llm_providers
+   SET model_prefix = 'anthropic/claude-'
+ WHERE id = 'anthropic'
+   AND model_prefix = 'claude-';
+
+-- 2. New OAuth-subscription rows (one per provider).
+INSERT INTO cloud_llm_providers
+    (id, display_name, base_url, auth_kind, secret_key,
+     oauth_token_secret, model_prefix, request_format, enabled)
+VALUES
+  ('anthropic_oauth',
+   'Anthropic Claude (Pro/Max subscription)',
+   'https://api.anthropic.com/v1',
+   'oauth_subscription', 'anthropic.oauth_token',
+   'anthropic.oauth_token', 'claude-', 'anthropic_messages', true),
+
+  ('openai_oauth',
+   'OpenAI ChatGPT (Plus/Pro subscription)',
+   'https://api.openai.com/v1',
+   'oauth_subscription', 'openai.oauth_token',
+   'openai.oauth_token', 'gpt-', 'openai_chat', true),
+
+  ('moonshot_oauth',
+   'Moonshot Kimi (Pro subscription)',
+   'https://api.moonshot.ai/v1',
+   'oauth_subscription', 'moonshot.oauth_token',
+   'moonshot.oauth_token', 'kimi-', 'openai_chat', true),
+
+  ('xai_oauth',
+   'xAI Grok (X Premium+ subscription)',
+   'https://api.x.ai/v1',
+   'oauth_subscription', 'xai.oauth_token',
+   'xai.oauth_token', 'grok-', 'openai_chat', true),
+
+  ('google_oauth',
+   'Google Gemini (Advanced subscription)',
+   'https://generativelanguage.googleapis.com/v1beta',
+   'oauth_subscription', 'google.oauth_token',
+   'google.oauth_token', 'gemini-', 'google_generate_content', true)
+ON CONFLICT (id) DO NOTHING;
+
+-- 3. Local-bridge rows (one per provider, one port each).
+INSERT INTO cloud_llm_providers
+    (id, display_name, base_url, auth_kind, secret_key,
+     model_prefix, request_format, enabled)
+VALUES
+  ('claude_cli',
+   'Claude Code CLI bridge (local)',
+   'http://127.0.0.1:51100',
+   'local_bridge', '',
+   'claude-cli-', 'openai_chat', true),
+
+  ('codex_cli',
+   'OpenAI Codex CLI bridge (local)',
+   'http://127.0.0.1:51101',
+   'local_bridge', '',
+   'codex-cli-', 'openai_chat', true),
+
+  ('kimi_cli',
+   'Moonshot Kimi CLI bridge (local)',
+   'http://127.0.0.1:51102',
+   'local_bridge', '',
+   'kimi-cli-', 'openai_chat', true),
+
+  ('gemini_cli',
+   'Google Gemini CLI bridge (local)',
+   'http://127.0.0.1:51103',
+   'local_bridge', '',
+   'gemini-cli-', 'openai_chat', true),
+
+  ('grok_cli',
+   'xAI Grok CLI bridge (local)',
+   'http://127.0.0.1:51104',
+   'local_bridge', '',
+   'grok-cli-', 'openai_chat', true)
+ON CONFLICT (id) DO NOTHING;
+
+-- 4. Append @google/gemini-cli to the npm CLI catalog so the install
+--    pipeline picks it up alongside claude-code and codex (V46).
+INSERT INTO software_registry
+  (id, display_name, kind, install_method, install_source,
+   version_source, upgrade_playbook, requires_restart, requires_reboot)
+VALUES
+  ('gemini-cli',
+   'Google Gemini CLI',
+   'binary',
+   'npm_global',
+   '@google/gemini-cli',
+   '{"method":"npm_registry","package":"@google/gemini-cli"}'::jsonb,
+   '{"linux-ubuntu":"npm install -g @google/gemini-cli","linux-dgx":"npm install -g @google/gemini-cli","macos":"npm install -g @google/gemini-cli"}'::jsonb,
+   false,
+   false)
+ON CONFLICT (id) DO NOTHING;
+"#;
