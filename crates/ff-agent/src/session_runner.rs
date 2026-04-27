@@ -752,6 +752,61 @@ pub async fn brain_list(
         .collect())
 }
 
+/// Cancel a session — flips its status to `cancelled` and cancels
+/// every still-running fleet_task it dispatched. The orchestrator's
+/// next tick will see no work to do and skip the session. Pending
+/// steps (status='pending') are also marked `cancelled` so the runner
+/// won't pick them up.
+pub async fn cancel_session(pool: &PgPool, session_id: uuid::Uuid) -> Result<()> {
+    // 1. Cancel the session row.
+    sqlx::query(
+        "UPDATE agent_sessions
+            SET status = 'cancelled',
+                completed_at = COALESCE(completed_at, NOW()),
+                error = COALESCE(error, 'cancelled by operator')
+          WHERE id = $1
+            AND status NOT IN ('succeeded', 'failed', 'cancelled')",
+    )
+    .bind(session_id)
+    .execute(pool)
+    .await
+    .context("cancel session row")?;
+
+    // 2. Mark pending steps as cancelled so the runner skips them.
+    sqlx::query(
+        "UPDATE agent_steps
+            SET status = 'cancelled',
+                completed_at = NOW(),
+                error = COALESCE(error, 'session cancelled')
+          WHERE session_id = $1
+            AND status = 'pending'",
+    )
+    .bind(session_id)
+    .execute(pool)
+    .await
+    .context("cancel pending steps")?;
+
+    // 3. Cancel running fleet_tasks for running steps. The
+    //    pg_cancel_task helper sets status='cancelled' atomically;
+    //    when the step's tick reconciler next runs, it'll fold the
+    //    cancellation back into the step row.
+    let running_task_ids: Vec<uuid::Uuid> = sqlx::query_scalar(
+        "SELECT fleet_task_id FROM agent_steps
+          WHERE session_id = $1
+            AND status = 'running'
+            AND fleet_task_id IS NOT NULL",
+    )
+    .bind(session_id)
+    .fetch_all(pool)
+    .await
+    .context("list running fleet_tasks for session")?;
+    for tid in running_task_ids {
+        let _ = crate::task_runner::pg_cancel_task(pool, tid, "session cancelled").await;
+    }
+    info!(session = %session_id, "session cancelled");
+    Ok(())
+}
+
 /// Add a parallel vote: N voter steps (each running the same prompt
 /// on a different model) plus a tally step depending on all of them.
 /// When the tally step runs, its LLM is asked to read the voter
