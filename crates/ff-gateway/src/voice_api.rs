@@ -22,10 +22,7 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::IntoResponse,
 };
-use ff_voice::stt::{
-    LocalWhisperConfig, LocalWhisperEngine, SttEngine, SttRequest, WhisperApiClient,
-    WhisperApiConfig, WhisperTranscriptionRequest,
-};
+use ff_voice::stt::{WhisperApiClient, WhisperApiConfig, WhisperTranscriptionRequest};
 use ff_voice::tts::{ElevenLabsClient, ElevenLabsConfig, TtsEngine, VoiceConfig};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -128,42 +125,15 @@ pub async fn transcribe(
         })));
     }
 
-    // Local fallback.
-    if let Some(model_path) = ff_db::pg_get_secret(pool, "voice.whisper.local_model")
-        .await
-        .ok()
-        .flatten()
-        .filter(|s| !s.is_empty())
-    {
-        let cfg = LocalWhisperConfig {
-            model_path: model_path.into(),
-            language: language.clone(),
-            ..Default::default()
-        };
-        let engine = LocalWhisperEngine::new(cfg);
-        let req = SttRequest {
-            language,
-            prompt,
-            ..Default::default()
-        };
-        let transcript = engine.transcribe(&bytes, req).await.map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("local whisper: {e}")})),
-            )
-        })?;
-        return Ok(Json(json!({
-            "text": transcript.text,
-            "language": transcript.language,
-            "backend": "whisper-local",
-        })));
-    }
-
+    // Local whisper.cpp fallback is a follow-up PR — the existing
+    // ff-voice LocalWhisperEngine wraps a subprocess (whisper-cli),
+    // which we'll wire when the cli + ggml model are present on each
+    // member.
     Err((
         StatusCode::SERVICE_UNAVAILABLE,
         Json(json!({
             "error": "no whisper backend configured",
-            "hint": "set `voice.whisper.api_key` (OpenAI-compatible) or `voice.whisper.local_model` (path to whisper.cpp ggml model) via `ff secrets set`"
+            "hint": "set `voice.whisper.api_key` (OpenAI-compatible) via `ff secrets set voice.whisper.api_key <key>`"
         })),
     ))
 }
