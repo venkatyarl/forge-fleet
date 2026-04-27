@@ -509,6 +509,10 @@ pub fn build_router(state: Arc<GatewayState>, mc_db_path: Option<&str>) -> Route
         .route("/api/agent/session/{id}/cancel", post(cancel_agent_session))
         .route("/api/agent/session/{id}/status", get(agent_session_status))
         .route("/api/agent/sessions", get(list_agent_sessions))
+        .route(
+            "/api/agent/v54/session/{id}",
+            get(get_v54_session),
+        )
         // ─── Pulse v2 dashboard routes ──────────────────────────────
         .route(
             "/api/fleet/computers",
@@ -5377,7 +5381,59 @@ async fn list_agent_sessions(State(state): State<Arc<GatewayState>>) -> impl Int
         })
         .collect();
 
-    Json(json!({ "sessions": sessions }))
+    // Also return V54 outcome-driven sessions from the agent_sessions
+    // table. Surfacing both lets the dashboard show ad-hoc agent
+    // sessions AND multi-LLM-team sessions in one place per the
+    // multi-LLM CLI integration plan ("dashboard view becomes the
+    // multi-LLM observability surface — no new namespace").
+    let v54_sessions: Vec<Value> = match state.operational_store.as_ref().and_then(|os| os.pg_pool()) {
+        Some(pool) => ff_agent::session_runner::list_sessions(pool, 50)
+            .await
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+
+    Json(json!({
+        "sessions": sessions,
+        "v54_sessions": v54_sessions,
+    }))
+}
+
+/// `GET /api/agent/v54/session/{id}` — full V54 session detail with
+/// step DAG, per-step results, and brain entries. Powers the
+/// dashboard's per-session drill-down.
+async fn get_v54_session(
+    axum::extract::Path(id): axum::extract::Path<String>,
+    State(state): State<Arc<GatewayState>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(pool) = state.operational_store.as_ref().and_then(|os| os.pg_pool()) else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error":"postgres not configured"})),
+        ));
+    };
+    let sid = uuid::Uuid::parse_str(&id).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("invalid uuid: {e}")})),
+        )
+    })?;
+    let mut session = ff_agent::session_runner::get_session(pool, sid)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": format!("{e}")})),
+            )
+        })?;
+    // Append session_brain entries — observability surface.
+    let brain = ff_agent::session_runner::brain_list(pool, sid)
+        .await
+        .unwrap_or_default();
+    if let Some(obj) = session.as_object_mut() {
+        obj.insert("brain".to_string(), Value::Array(brain));
+    }
+    Ok(Json(session))
 }
 
 // ─── Chat Management Endpoints ──────────────────────────────────────────────
