@@ -455,6 +455,9 @@ enum TasksCommand {
         status: Option<String>,
         #[arg(long = "type")]
         task_type: Option<String>,
+        /// Prefix every row with the task UUID.
+        #[arg(long, default_value_t = false)]
+        show_id: bool,
     },
     /// Enqueue a shell task. Workers on members whose capability set
     /// covers `--capability` will compete for it.
@@ -2063,12 +2066,14 @@ async fn main() -> Result<()> {
                     computer,
                     status,
                     task_type,
+                    show_id,
                 } => {
                     tasks_cmd::handle_tasks_list(
                         &pool,
                         computer.as_deref(),
                         status.as_deref(),
                         task_type.as_deref(),
+                        show_id,
                     )
                     .await
                 }
