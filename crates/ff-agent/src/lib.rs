@@ -58,6 +58,7 @@ pub mod multi_agent;
 pub mod nats_client;
 pub mod nats_log_layer;
 pub mod notifications;
+pub mod oauth_distributor;
 pub mod openai_bridge;
 pub mod openclaw;
 pub mod orchestrator_agent;

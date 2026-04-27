@@ -2149,6 +2149,10 @@ async fn start_pulse_v2_subsystems(
             caps.insert(name.clone());
             // Cross-cutting capability flags. Detected by looking for
             // the binary on $PATH; cheap, runs once per daemon start.
+            // The CLI tools (claude / codex / gemini / kimi / grok) gate
+            // Phase-3 of the multi-LLM CLI integration roadmap — tasks
+            // with `requires_capability=[claude]` only dispatch to
+            // members where the binary is present.
             for tool in [
                 "redis-cli",
                 "hf",
@@ -2158,6 +2162,11 @@ async fn start_pulse_v2_subsystems(
                 "curl",
                 "git",
                 "ff",
+                "claude",
+                "codex",
+                "gemini",
+                "kimi",
+                "grok",
             ] {
                 let out = std::process::Command::new("/bin/sh")
                     .arg("-lc")

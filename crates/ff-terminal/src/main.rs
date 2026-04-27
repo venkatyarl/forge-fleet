@@ -393,6 +393,14 @@ enum Command {
         #[command(subcommand)]
         command: TasksCommand,
     },
+    /// OAuth subscription credentials — harvest from a vendor CLI's local
+    /// cred file on the leader, distribute to fleet members. Powers
+    /// Layer 1 (`oauth_subscription` auth_kind) of the multi-LLM CLI
+    /// integration. Verbs are provider-agnostic; pass `all` to fan out.
+    Oauth {
+        #[command(subcommand)]
+        command: OauthCommand,
+    },
     /// V43: self-heal coordination (operator escape-hatches).
     SelfHeal {
         #[command(subcommand)]
@@ -638,6 +646,32 @@ enum DeferCommand {
     Cancel { id: String },
     /// Retry a failed or cancelled task (resets attempts-aware status, runs ASAP).
     Retry { id: String },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum OauthCommand {
+    /// Harvest the OAuth/session token from one provider's local cred file
+    /// on the leader and store it in `fleet_secrets[<provider>.oauth_token]`.
+    /// Pass `all` to harvest every configured provider at once.
+    Import {
+        /// Provider name: `claude`, `codex`, `gemini`, `kimi`, `grok`, or `all`.
+        provider: String,
+    },
+    /// Push the leader's credential file out to every other fleet member's
+    /// matching path (mode 0600). After this, ff-driven CLI invocations on
+    /// any member use the centralised token. Pass `all` to fan out for
+    /// every provider at once.
+    Distribute {
+        /// Provider name: `claude`, `codex`, `gemini`, `kimi`, `grok`, or `all`.
+        provider: String,
+    },
+    /// Show per-provider OAuth state: cred-file present on leader,
+    /// mtime, token-in-fleet_secrets, token-preview.
+    Status,
+    /// Long-running foreground watcher: re-imports + re-distributes
+    /// whenever any leader cred file changes (vendor CLI refreshed its
+    /// token). Run on the leader; ctrl-C to exit.
+    RefreshWatch,
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -2184,6 +2218,105 @@ async fn main() -> Result<()> {
                     .map_err(|e| anyhow::anyhow!("compose: {e}"))?;
                     println!("composed parent task: {parent}");
                     println!("watch progress with: ff tasks list --status pending,running");
+                    Ok(())
+                }
+            }
+        }
+        Some(Command::Oauth { command }) => {
+            let pool = ff_agent::fleet_info::get_fleet_pool()
+                .await
+                .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
+            ff_db::run_postgres_migrations(&pool)
+                .await
+                .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
+            use ff_agent::oauth_distributor::{
+                OAUTH_PROVIDERS, distribute_token, import_token, provider_by_name,
+                spawn_refresh_watch, status,
+            };
+            // Resolve `all` to every catalog entry; otherwise look up the
+            // single named provider.
+            let resolve = |name: &str| -> anyhow::Result<Vec<&'static ff_agent::oauth_distributor::OauthProvider>> {
+                if name.eq_ignore_ascii_case("all") {
+                    Ok(OAUTH_PROVIDERS.iter().collect())
+                } else {
+                    Ok(vec![provider_by_name(name).ok_or_else(|| anyhow::anyhow!(
+                        "unknown provider {name}; expected one of: claude, codex, gemini, kimi, grok, all"
+                    ))?])
+                }
+            };
+            match command {
+                OauthCommand::Import { provider } => {
+                    for p in resolve(&provider)? {
+                        match import_token(&pool, p).await {
+                            Ok(()) => println!("{GREEN}✓{RESET} imported {} → fleet_secrets[{}]", p.name, p.secret_key),
+                            Err(e) => println!("{RED}✗{RESET} {}: {e}", p.name),
+                        }
+                    }
+                    Ok(())
+                }
+                OauthCommand::Distribute { provider } => {
+                    println!(
+                        "{YELLOW}!{RESET} TOS reminder: distributing one subscription's OAuth token \
+                         to multiple machines is grey-area on most vendor TOS — running one Pro/Plus \
+                         account on N concurrent fleet boxes may not be permitted under strict \
+                         compliance. Use per-node logins (skip this command) for compliance, OR \
+                         continue knowing the risk."
+                    );
+                    for p in resolve(&provider)? {
+                        match distribute_token(&pool, p).await {
+                            Ok(n) => println!(
+                                "{GREEN}✓{RESET} {}: enqueued {n} distribute task(s); follow with `ff tasks list`",
+                                p.name
+                            ),
+                            Err(e) => println!("{RED}✗{RESET} {}: {e}", p.name),
+                        }
+                    }
+                    Ok(())
+                }
+                OauthCommand::Status => {
+                    let snap = status(&pool)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("status: {e}"))?;
+                    println!(
+                        "{:<10} {:<14} {:<18} {:<10} {}",
+                        "PROVIDER", "CRED FILE", "FILE MTIME", "IN SECRETS", "TOKEN PREVIEW"
+                    );
+                    for s in snap {
+                        let mtime = s
+                            .cred_file_mtime_secs_ago
+                            .map(|secs| {
+                                if secs < 60 {
+                                    format!("{secs}s ago")
+                                } else if secs < 3600 {
+                                    format!("{}m ago", secs / 60)
+                                } else if secs < 86400 {
+                                    format!("{}h ago", secs / 3600)
+                                } else {
+                                    format!("{}d ago", secs / 86400)
+                                }
+                            })
+                            .unwrap_or_else(|| "-".into());
+                        println!(
+                            "{:<10} {:<14} {:<18} {:<10} {}",
+                            s.name,
+                            if s.cred_file_present { "present" } else { "missing" },
+                            mtime,
+                            if s.token_in_secrets { "yes" } else { "no" },
+                            s.token_preview.unwrap_or_else(|| "-".into()),
+                        );
+                    }
+                    Ok(())
+                }
+                OauthCommand::RefreshWatch => {
+                    println!(
+                        "{CYAN}▶ OAuth refresh-watch{RESET} polling every {}s; ctrl-C to stop",
+                        ff_agent::oauth_distributor::REFRESH_POLL_SECS
+                    );
+                    let (_tx, rx) = tokio::sync::watch::channel(false);
+                    let h = spawn_refresh_watch(pool, rx);
+                    tokio::signal::ctrl_c().await.ok();
+                    println!("{YELLOW}!{RESET} shutdown signal received");
+                    drop(h);
                     Ok(())
                 }
             }
