@@ -11,6 +11,7 @@ pub async fn handle_tasks_list(
     computer_filter: Option<&str>,
     status_filter: Option<&str>,
     type_filter: Option<&str>,
+    show_id: bool,
 ) -> Result<()> {
     let mut sql = String::from(
         "SELECT t.id, t.task_type, t.summary, t.status, \
@@ -55,11 +56,19 @@ pub async fn handle_tasks_list(
     }
     let rows = q.fetch_all(pg).await?;
 
-    println!(
-        "{:<10} {:<20} {:<12} {:<10} {:>5} {}",
-        "COMPUTER", "TYPE", "STATUS", "AGE", "PCT", "SUMMARY"
-    );
+    if show_id {
+        println!(
+            "{:<36} {:<10} {:<20} {:<12} {:<10} {:>5} {}",
+            "ID", "COMPUTER", "TYPE", "STATUS", "AGE", "PCT", "SUMMARY"
+        );
+    } else {
+        println!(
+            "{:<10} {:<20} {:<12} {:<10} {:>5} {}",
+            "COMPUTER", "TYPE", "STATUS", "AGE", "PCT", "SUMMARY"
+        );
+    }
     for r in rows {
+        let id: uuid::Uuid = r.try_get("id")?;
         let computer: Option<String> = r.try_get("claimer_name").ok();
         let ty: String = r.try_get("task_type")?;
         let status: String = r.try_get("status")?;
@@ -82,15 +91,28 @@ pub async fn handle_tasks_list(
         let ty_short: String = ty.chars().take(20).collect();
         let status_short: String = status.chars().take(12).collect();
         let summary_short: String = summary.chars().take(60).collect();
-        println!(
-            "{:<10} {:<20} {:<12} {:<10} {:>5} {}",
-            computer.as_deref().unwrap_or("-"),
-            ty_short,
-            status_short,
-            age_str,
-            pct_str,
-            summary_short
-        );
+        if show_id {
+            println!(
+                "{:<36} {:<10} {:<20} {:<12} {:<10} {:>5} {}",
+                id,
+                computer.as_deref().unwrap_or("-"),
+                ty_short,
+                status_short,
+                age_str,
+                pct_str,
+                summary_short
+            );
+        } else {
+            println!(
+                "{:<10} {:<20} {:<12} {:<10} {:>5} {}",
+                computer.as_deref().unwrap_or("-"),
+                ty_short,
+                status_short,
+                age_str,
+                pct_str,
+                summary_short
+            );
+        }
     }
     Ok(())
 }
