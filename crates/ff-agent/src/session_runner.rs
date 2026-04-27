@@ -236,8 +236,11 @@ pub async fn tick(pool: &PgPool) -> Result<TickStats> {
             }
         }
 
-        // Resolve role config — model + capability tag.
-        let (model, capability): (String, Vec<String>) = match role.as_deref() {
+        // Resolve role config — model + capability tag. Per-step
+        // `step_memory.model_override` wins over the role default,
+        // letting `ff session vote` ship N voters that all share a
+        // role but use different models.
+        let (mut model, capability): (String, Vec<String>) = match role.as_deref() {
             Some(r_name) => sqlx::query_as::<_, (String, Value)>(
                 "SELECT default_model, requires_capability
                    FROM agent_roles WHERE name = $1 AND enabled = true",
@@ -259,6 +262,12 @@ pub async fn tick(pool: &PgPool) -> Result<TickStats> {
             .unwrap_or_else(|| ("qwen2.5-coder-32b".into(), Vec::new())),
             None => ("qwen2.5-coder-32b".into(), Vec::new()),
         };
+        if let Some(override_model) = step_memory
+            .get("model_override")
+            .and_then(Value::as_str)
+        {
+            model = override_model.to_string();
+        }
 
         let prompt = step_memory
             .get("prompt")
@@ -654,6 +663,157 @@ pub async fn brain_list(
             })
         })
         .collect())
+}
+
+/// Add a parallel vote: N voter steps (each running the same prompt
+/// on a different model) plus a tally step depending on all of them.
+/// When the tally step runs, its LLM is asked to read the voter
+/// answers and pick the consensus, writing the result into
+/// `session_brain[vote_<step_name>]`.
+///
+/// Returns `(voter_ids, tally_id)`.
+///
+/// Each voter is a model name (`claude-opus-4-7`, `gpt-5`,
+/// `gemini-2.5-pro`, `qwen2.5-coder-32b`, etc.). The orchestrator
+/// reads `step_memory.model_override` to dispatch with that model
+/// regardless of role.
+pub async fn create_vote(
+    pool: &PgPool,
+    session_id: uuid::Uuid,
+    step_name: &str,
+    prompt: &str,
+    voter_models: &[String],
+    tally_role: Option<&str>,
+) -> Result<(Vec<uuid::Uuid>, uuid::Uuid)> {
+    if voter_models.len() < 2 {
+        return Err(anyhow!("a vote needs at least 2 voters"));
+    }
+
+    // Insert voter steps. Each gets the same prompt but a distinct
+    // model_override.
+    let mut voter_ids = Vec::with_capacity(voter_models.len());
+    for (i, model) in voter_models.iter().enumerate() {
+        let voter_name = format!("{step_name}/voter-{i}-{model}");
+        let memory = json!({
+            "prompt": prompt,
+            "model_override": model,
+            "vote_step": step_name,
+            "voter_index": i,
+        });
+        let id: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_steps (session_id, name, role, depends_on, step_memory)
+             VALUES ($1, $2, NULL, '[]'::jsonb, $3)
+             RETURNING id",
+        )
+        .bind(session_id)
+        .bind(&voter_name)
+        .bind(memory)
+        .fetch_one(pool)
+        .await
+        .context("insert voter step")?;
+        voter_ids.push(id);
+    }
+
+    // Tally step: depends on all voters; LLM reads their stdouts and
+    // picks consensus. We embed the voter step IDs in step_memory so
+    // the tally prompt can reference them at dispatch time.
+    let tally_prompt = format!(
+        "You are tallying a multi-LLM vote on the question:\n\n\
+         '{prompt}'\n\n\
+         {} voters answered. Read each answer below, identify the consensus, \
+         and emit JSON of shape:\n\
+         {{\n  \"chosen\": \"…\",\n  \"reasoning\": \"why you picked this consensus\",\n  \"agreement\": \"unanimous|majority|split\"\n}}\n\n\
+         The orchestrator will fetch each voter's stdout from `agent_steps.result.stdout` \
+         and present them in order. For now, output the JSON shape based on the prompt alone — \
+         in a future PR the tally step's pre-context will inject the voter answers automatically.",
+        voter_models.len()
+    );
+    let tally_role = tally_role.unwrap_or("synthesiser");
+    let tally_id = add_step(
+        pool,
+        session_id,
+        &format!("{step_name}/tally"),
+        Some(tally_role),
+        &tally_prompt,
+        &voter_ids,
+    )
+    .await?;
+
+    info!(
+        session = %session_id,
+        step_name = %step_name,
+        voters = voter_models.len(),
+        "created vote step graph"
+    );
+    Ok((voter_ids, tally_id))
+}
+
+/// Read the completed voter steps for a vote-style step group and
+/// store the per-voter answers into session_brain under
+/// `vote_<step_name>`. Useful as a follow-up after the tally step
+/// runs — surfaces the raw voter answers for operator review.
+pub async fn collect_vote_answers(
+    pool: &PgPool,
+    session_id: uuid::Uuid,
+    step_name: &str,
+) -> Result<Value> {
+    let rows = sqlx::query(
+        "SELECT s.id, s.name, s.step_memory, t.result
+           FROM agent_steps s
+           LEFT JOIN fleet_tasks t ON t.id = s.fleet_task_id
+          WHERE s.session_id = $1
+            AND s.name LIKE $2
+            AND s.status = 'completed'
+          ORDER BY (s.step_memory->>'voter_index')::int",
+    )
+    .bind(session_id)
+    .bind(format!("{step_name}/voter-%"))
+    .fetch_all(pool)
+    .await
+    .context("read voter step results")?;
+
+    let answers: Vec<Value> = rows
+        .into_iter()
+        .map(|r| {
+            let mem: Value = r.try_get("step_memory").unwrap_or_else(|_| json!({}));
+            let model = mem
+                .get("model_override")
+                .and_then(Value::as_str)
+                .unwrap_or("?");
+            let result: Option<Value> = r.try_get("result").ok();
+            let stdout = result
+                .as_ref()
+                .and_then(|v| v.get("stdout"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .chars()
+                .take(8192)
+                .collect::<String>();
+            json!({
+                "model": model,
+                "stdout": stdout,
+            })
+        })
+        .collect();
+
+    let snapshot = json!({
+        "step_name": step_name,
+        "voter_count": answers.len(),
+        "answers": answers,
+        "collected_at": chrono::Utc::now().to_rfc3339(),
+    });
+
+    brain_set(
+        pool,
+        session_id,
+        &format!("vote_{step_name}"),
+        &snapshot,
+        Some("system"),
+        None,
+    )
+    .await?;
+
+    Ok(snapshot)
 }
 
 /// Add a planner step to a session — the planner role decomposes the
