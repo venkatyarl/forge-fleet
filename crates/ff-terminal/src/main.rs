@@ -823,6 +823,16 @@ enum OauthCommand {
     /// whenever any leader cred file changes (vendor CLI refreshed its
     /// token). Run on the leader; ctrl-C to exit.
     RefreshWatch,
+    /// Probe each oauth_subscription provider's API to verify the
+    /// harvested token still authenticates. Reports OK / 401 / network
+    /// error per provider. Pass `all` (default) to probe every
+    /// configured provider, or a name to probe one.
+    Probe {
+        /// Provider name: `claude`, `codex`, `gemini`, `kimi`, `grok`,
+        /// or `all`.
+        #[arg(default_value = "all")]
+        provider: String,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -1295,8 +1305,6 @@ enum CloudLlmCommand {
         #[arg(long)]
         json: bool,
     },
-    /// (Re)seed cloud_llm_providers from config/cloud_llm_providers.toml.
-    Seed,
     /// Prompt for an API key and store it in fleet_secrets under the
     /// provider's configured `secret_key`. The key is read from stdin
     /// (not an argv argument) so it never lands in shell history.
@@ -1498,12 +1506,6 @@ enum ProjectCommand {
     Sync {
         #[arg(long, default_value_t = false)]
         all: bool,
-    },
-    /// Seed projects from config/projects.toml into Postgres.
-    Seed {
-        /// Path to projects.toml (defaults to ./config/projects.toml).
-        #[arg(long)]
-        from_toml: Option<PathBuf>,
     },
 }
 
@@ -2055,7 +2057,7 @@ async fn main() -> Result<()> {
         Some(Command::Pm { command }) => return handle_pm(command.clone()).await,
         Some(Command::Agent { command }) => return handle_agent(command.clone()).await,
         Some(Command::Project { command }) => {
-            return handle_project(command.clone(), &config_path).await;
+            return handle_project(command.clone()).await;
         }
         Some(Command::Alert { command }) => return handle_alert(command.clone()).await,
         Some(Command::Metrics { command }) => return handle_metrics(command.clone()).await,
@@ -2239,7 +2241,7 @@ async fn main() -> Result<()> {
         Some(Command::Openclaw { command }) => handle_openclaw(command).await,
         Some(Command::Pm { command }) => handle_pm(command).await,
         Some(Command::Agent { command }) => handle_agent(command).await,
-        Some(Command::Project { command }) => handle_project(command, &config_path).await,
+        Some(Command::Project { command }) => handle_project(command).await,
         Some(Command::Fabric { command }) => {
             let pool = ff_agent::fleet_info::get_fleet_pool()
                 .await
@@ -2717,6 +2719,31 @@ async fn main() -> Result<()> {
                     tokio::signal::ctrl_c().await.ok();
                     println!("{YELLOW}!{RESET} shutdown signal received");
                     drop(h);
+                    Ok(())
+                }
+                OauthCommand::Probe { provider } => {
+                    let providers = resolve(&provider)?;
+                    println!(
+                        "{:<10} {:<14} {:<5} {}",
+                        "provider", "status", "code", "detail"
+                    );
+                    for p in providers {
+                        let r = ff_agent::oauth_distributor::probe_one(&pool, p).await;
+                        let color = match r.status.as_str() {
+                            "ok" => GREEN,
+                            "unauthorized" | "forbidden" => RED,
+                            _ => YELLOW,
+                        };
+                        let code = r
+                            .http_status
+                            .map(|c| c.to_string())
+                            .unwrap_or_else(|| "-".into());
+                        let detail = r.message.unwrap_or_default();
+                        println!(
+                            "{:<10} {color}{:<14}{RESET} {:<5} {}",
+                            r.provider, r.status, code, detail
+                        );
+                    }
                     Ok(())
                 }
             }
@@ -11063,7 +11090,6 @@ async fn handle_cloud_llm(cmd: CloudLlmCommand) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
 
     match cmd {
-        CloudLlmCommand::Seed => handle_cloud_llm_seed(&pool).await,
         CloudLlmCommand::List { json } => handle_cloud_llm_list(&pool, json).await,
         CloudLlmCommand::SetKey { provider_id, value } => {
             handle_cloud_llm_set_key(&pool, &provider_id, value).await
@@ -11075,29 +11101,15 @@ async fn handle_cloud_llm(cmd: CloudLlmCommand) -> Result<()> {
     }
 }
 
-async fn handle_cloud_llm_seed(pool: &sqlx::PgPool) -> Result<()> {
-    let path = ff_agent::cloud_llm_registry::resolve_config_path();
-    println!(
-        "{CYAN}▶ Seeding cloud_llm_providers from {}{RESET}",
-        path.display()
-    );
-    let report = ff_agent::cloud_llm_registry::seed_from_toml(pool, &path)
-        .await
-        .map_err(|e| anyhow::anyhow!("seed cloud_llm_providers: {e}"))?;
-    println!(
-        "{GREEN}✓ cloud_llm_providers seed:{RESET} total={} inserted={} updated={} unchanged={}",
-        report.total, report.inserted, report.updated, report.unchanged,
-    );
-    Ok(())
-}
-
 async fn handle_cloud_llm_list(pool: &sqlx::PgPool, json: bool) -> Result<()> {
     let providers = ff_agent::cloud_llm_registry::list_providers(pool)
         .await
         .map_err(|e| anyhow::anyhow!("list cloud_llm_providers: {e}"))?;
 
     if providers.is_empty() {
-        println!("{YELLOW}No cloud providers registered. Run `ff cloud-llm seed`.{RESET}");
+        println!(
+            "{YELLOW}No cloud providers registered. Migration V35 seeds them at startup.{RESET}"
+        );
         return Ok(());
     }
 
@@ -12715,7 +12727,7 @@ async fn handle_pm_import_claude_tasks(
     Ok(())
 }
 
-async fn handle_project(cmd: ProjectCommand, config_path: &Path) -> Result<()> {
+async fn handle_project(cmd: ProjectCommand) -> Result<()> {
     let pool = ff_agent::fleet_info::get_fleet_pool()
         .await
         .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
@@ -12954,50 +12966,8 @@ async fn handle_project(cmd: ProjectCommand, config_path: &Path) -> Result<()> {
                 println!("{GREEN}✓ Done{RESET}");
             }
         }
-        ProjectCommand::Seed { from_toml } => {
-            let toml_path = match from_toml {
-                Some(p) => p,
-                None => resolve_projects_toml_path(config_path),
-            };
-            println!(
-                "{CYAN}▶ Seeding projects from {}{RESET}",
-                toml_path.display()
-            );
-            let report = ff_agent::seed_projects_from_toml(&pool, &toml_path)
-                .await
-                .map_err(|e| anyhow::anyhow!("seed projects: {e}"))?;
-            println!("  inserted:  {}", report.inserted);
-            println!("  updated:   {}", report.updated);
-            println!("  unchanged: {}", report.unchanged);
-            println!("  total:     {}", report.total);
-            println!("{GREEN}✓ Done{RESET}");
-        }
     }
     Ok(())
-}
-
-/// Resolve the projects.toml path: prefer a `projects.toml` sibling to the
-/// fleet config, fall back to `./config/projects.toml` relative to cwd.
-fn resolve_projects_toml_path(config_path: &Path) -> PathBuf {
-    if let Some(parent) = config_path.parent() {
-        let candidate = parent.join("projects.toml");
-        if candidate.exists() {
-            return candidate;
-        }
-    }
-    // Walk up from cwd looking for config/projects.toml (supports running from
-    // subdirectories inside the repo).
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let mut probe = Some(cwd.as_path());
-    while let Some(dir) = probe {
-        let candidate = dir.join("config").join("projects.toml");
-        if candidate.exists() {
-            return candidate;
-        }
-        probe = dir.parent();
-    }
-    // Default: ./config/projects.toml (even if it doesn't exist — error comes from seeder).
-    PathBuf::from("config/projects.toml")
 }
 
 async fn handle_onboard(cmd: OnboardCommand) -> Result<()> {
