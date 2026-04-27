@@ -669,3 +669,189 @@ pub async fn compose_node_bootstrap(
 
     Ok(parent)
 }
+
+/// Compose a wave-based fleet-upgrade graph for `software_id`.
+///
+/// **Why waves.** A node cannot reliably restart its own daemon from a
+/// task running inside that daemon — the supervisor (`launchd` on
+/// macOS, `systemd --user` on Linux) sends `SIGKILL` to the whole
+/// process group when it kills the unit, so the restart command takes
+/// the task itself down with it; the task is left in `running` state,
+/// the watchdog re-queues it 120s later, and the loop repeats until
+/// `MAX_HANDOFFS` retries are exhausted.
+///
+/// The fix is structural: a peer SSHs into the target and runs the
+/// upgrade remotely. The executor's daemon stays alive throughout (it
+/// only spawns an `ssh` subshell); the target's daemon dies after its
+/// session ends, but by then the executor has captured stdout / stderr
+/// / exit and marked the row `completed`.
+///
+/// **Wave layout.** Every non-leader online member with a row in
+/// `computer_software` for this `software_id` is a target. Targets are
+/// chunked into waves of `fanout`. Wave 0 has the highest priority so
+/// the workers pick them first; subsequent waves descend by 3 in
+/// priority. Tasks have an empty `requires_capability` set, so any
+/// online worker can claim them — the fleet self-parallelizes once
+/// Wave 0 has expanded the worker pool from 1 (just the leader) to
+/// `1 + fanout`. The leader is intentionally excluded from this graph
+/// (cycles back into the suicide-restart problem); restart it
+/// manually after the fleet is upgraded, e.g. by SSHing from any
+/// upgraded peer.
+///
+/// **No hardcoded fleet data.** Every per-target value (ssh_user,
+/// primary_ip, ssh_port, the playbook command itself) is read from
+/// the DB at compose time via
+/// [`crate::auto_upgrade::resolve_upgrade_plans`].
+pub async fn compose_fleet_upgrade_wave(
+    pg: &PgPool,
+    software_id: &str,
+    fanout: usize,
+    leader_computer_id: uuid::Uuid,
+) -> Result<uuid::Uuid, sqlx::Error> {
+    use crate::auto_upgrade::resolve_upgrade_plans;
+
+    let fanout = fanout.max(1);
+
+    // 1. Resolve playbook for every member that has this software.
+    //    `upgrade_available_only=false` means we get ALL targets, not
+    //    just drift candidates — the dispatcher itself is the trigger.
+    let (plans, skipped) = resolve_upgrade_plans(pg, software_id, None, false)
+        .await
+        .map_err(|e| sqlx::Error::Configuration(format!("resolve_upgrade_plans: {e}").into()))?;
+
+    if !skipped.is_empty() {
+        tracing::info!(
+            count = skipped.len(),
+            "fleet-upgrade-wave: members skipped (no playbook key matched)"
+        );
+    }
+
+    // 2. Pull leader name; non-leader plans become wave targets.
+    let leader_name: Option<String> =
+        sqlx::query_scalar("SELECT name FROM computers WHERE id = $1")
+            .bind(leader_computer_id)
+            .fetch_optional(pg)
+            .await?;
+    let leader_lower = leader_name
+        .as_deref()
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    let mut wave_targets: Vec<WaveTarget> = Vec::with_capacity(plans.len());
+    for plan in plans {
+        if plan.computer_name.eq_ignore_ascii_case(&leader_lower) {
+            continue;
+        }
+        let row: Option<(String, String, i32)> = sqlx::query_as(
+            "SELECT ssh_user, primary_ip, ssh_port FROM computers WHERE name = $1",
+        )
+        .bind(&plan.computer_name)
+        .fetch_optional(pg)
+        .await?;
+        let Some((ssh_user, primary_ip, ssh_port)) = row else {
+            tracing::warn!(
+                computer = %plan.computer_name,
+                "fleet-upgrade-wave: no computers row, skipping"
+            );
+            continue;
+        };
+        wave_targets.push(WaveTarget {
+            target_name: plan.computer_name.clone(),
+            ssh_user,
+            primary_ip,
+            ssh_port,
+            playbook_command: plan.command,
+        });
+    }
+
+    if wave_targets.is_empty() {
+        return Err(sqlx::Error::Configuration(
+            format!("no non-leader targets for software_id='{software_id}'").into(),
+        ));
+    }
+
+    // 3. Parent task for the whole graph.
+    let wave_count = wave_targets.len().div_ceil(fanout);
+    let parent_summary = format!(
+        "fleet-upgrade-wave: {software_id} ({n} target(s), fanout {fanout}, {wave_count} wave(s))",
+        n = wave_targets.len()
+    );
+    let parent: uuid::Uuid = sqlx::query_scalar(
+        r#"
+        INSERT INTO fleet_tasks (
+            task_type, summary, payload, priority, created_by_computer_id
+        )
+        VALUES ('compound', $1, $2, 90, $3)
+        RETURNING id
+        "#,
+    )
+    .bind(&parent_summary)
+    .bind(serde_json::json!({
+        "software_id": software_id,
+        "fanout": fanout,
+        "wave_count": wave_count,
+        "target_count": wave_targets.len(),
+    }))
+    .bind(leader_computer_id)
+    .fetch_one(pg)
+    .await?;
+
+    // 4. Chunk targets into waves; one shell task per (wave, target).
+    //    Empty capability set = any worker may claim, so the fleet
+    //    self-parallelizes as Wave 0 expands the worker pool.
+    for (wave_idx, chunk) in wave_targets.chunks(fanout).enumerate() {
+        let priority = 95i32.saturating_sub((wave_idx as i32).saturating_mul(3));
+        for t in chunk {
+            let port_arg = if t.ssh_port == 22 {
+                String::new()
+            } else {
+                format!(" -p {}", t.ssh_port)
+            };
+            // The playbook is sent over ssh stdin to a remote login
+            // bash. Quoting `'FF_PLAYBOOK_EOF'` prevents the local
+            // shell from expanding `$` / backticks in the playbook —
+            // remote bash sees the script verbatim. `ssh -T`
+            // suppresses pseudo-tty allocation so the heredoc flows
+            // cleanly.
+            let command = format!(
+                "set -e\n\
+                 echo \"== upgrading {target} via ssh from $(hostname) ==\"\n\
+                 ssh -T{port_arg} -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+                     {ssh_user}@{primary_ip} bash -l <<'FF_PLAYBOOK_EOF'\n\
+                 {playbook}\n\
+                 FF_PLAYBOOK_EOF\n",
+                target = t.target_name,
+                port_arg = port_arg,
+                ssh_user = t.ssh_user,
+                primary_ip = t.primary_ip,
+                playbook = t.playbook_command,
+            );
+
+            pg_enqueue_shell_task(
+                pg,
+                &format!(
+                    "fleet-upgrade-wave/wave{wave_idx}: {software_id} on {}",
+                    t.target_name
+                ),
+                &command,
+                &[],
+                None,
+                Some(parent),
+                priority,
+                Some(leader_computer_id),
+            )
+            .await?;
+        }
+    }
+
+    Ok(parent)
+}
+
+/// One row in [`compose_fleet_upgrade_wave`]'s working set.
+struct WaveTarget {
+    target_name: String,
+    ssh_user: String,
+    primary_ip: String,
+    ssh_port: i32,
+    playbook_command: String,
+}
