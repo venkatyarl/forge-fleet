@@ -982,11 +982,21 @@ pub async fn compose_fleet_upgrade_wave(
         // macOS targets (e.g. ace) need launchctl because systemctl
         // doesn't exist there — closes the ace-restart gap that left
         // 1/14 daemons stuck on old code in the 2026-04-27 rollout.
+        //
+        // UID resolution on macOS: `id -u` over SSH was unreliable on
+        // some hosts (returned 0 even for non-root SSH users — observed
+        // on ace 2026-04-27). Derive the uid from $HOME ownership via
+        // `stat -f %u`; HOME is always set correctly by sshd. Also try
+        // the system domain as a last-resort fallback for daemons
+        // loaded as system LaunchDaemons rather than user LaunchAgents.
         let inner_restart = if t.os_family.starts_with("macos") {
-            "USER_ID=$(id -u); \
+            "USER_ID=$(stat -f \"%u\" \"$HOME\" 2>/dev/null); \
+             [ -z \"$USER_ID\" ] && USER_ID=$(id -u); \
+             echo \"resolved USER_ID=$USER_ID HOME=$HOME\"; \
              launchctl kickstart -k \"gui/${USER_ID}/com.forgefleet.forgefleetd\" 2>/dev/null \
              || launchctl asuser \"${USER_ID}\" launchctl kickstart -k \"gui/${USER_ID}/com.forgefleet.forgefleetd\" 2>/dev/null \
-             || launchctl kickstart -k \"user/${USER_ID}/com.forgefleet.forgefleetd\""
+             || launchctl kickstart -k \"user/${USER_ID}/com.forgefleet.forgefleetd\" 2>/dev/null \
+             || launchctl kickstart -k \"system/com.forgefleet.forgefleetd\""
                 .to_string()
         } else {
             "export XDG_RUNTIME_DIR=\"${XDG_RUNTIME_DIR:-/run/user/$(id -u)}\"; \
