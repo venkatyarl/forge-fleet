@@ -377,6 +377,11 @@ pub fn build_router(state: Arc<GatewayState>, mc_db_path: Option<&str>) -> Route
         .route("/api/fleet/enroll", post(fleet_enroll))
         .route("/api/fleet/heartbeat", post(fleet_heartbeat))
         .route("/api/fleet/llm-usage", get(fleet_llm_usage))
+        .route(
+            "/api/voice/transcribe",
+            post(crate::voice_api::transcribe),
+        )
+        .route("/api/voice/speak", post(crate::voice_api::speak))
         // Onboarding (see crates/ff-gateway/src/onboard.rs + plan §§3–3h)
         .route(
             "/onboard/bootstrap.sh",
