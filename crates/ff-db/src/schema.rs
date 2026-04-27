@@ -4731,3 +4731,164 @@ VALUES
    false)
 ON CONFLICT (id) DO NOTHING;
 "#;
+
+// ─── V54: outcome-driven orchestration foundation ──────────────────────────
+//
+// Pillar 4 of the multi-LLM CLI integration roadmap. Adds the data
+// model for multi-LLM, multi-step sessions where ff orchestrates a
+// team of LLMs (planner / coder / reviewer / browser / synthesiser)
+// converging on a user-stated outcome.
+//
+// Three new tables:
+//
+//   `agent_sessions`  — one row per high-level user goal. The outer
+//      task ("fix issue #42", "research X then draft Y").
+//   `agent_steps`     — the DAG of substeps. Each row references its
+//      parent session and optional `depends_on` (JSONB array of step
+//      IDs). The runner picks the next step whose dependencies are
+//      satisfied, dispatches via the existing wave dispatcher
+//      (fleet_tasks), parses the LLM output, advances state.
+//   `agent_roles`     — declared role catalog (planner/coder/reviewer/
+//      browser/synthesiser). Each is a `(provider, model, system_prompt)`
+//      triple. Sessions declare which roles they use; steps tag which
+//      role they expect.
+//
+// Sessions reference one or more `fleet_tasks` rows for actual
+// execution; the step graph layer sits above. Reuses the existing
+// `/api/agent/sessions` route for observability — no new namespace.
+//
+// PR-L (session orchestrator) consumes this schema. PR-N (roles
+// catalog seed), PR-O (session_brain memory-sharing), PR-P (consensus)
+// build on top.
+pub const SCHEMA_V54_AGENT_ORCHESTRATION: &str = r#"
+CREATE TABLE IF NOT EXISTS agent_sessions (
+    id                       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    goal                     TEXT NOT NULL,
+    -- Free-form team composition: {"planner":"claude-opus-4-7","coder":"gpt-5",…}
+    team                     JSONB NOT NULL DEFAULT '{}',
+    status                   TEXT NOT NULL DEFAULT 'pending',
+                             -- pending | running | succeeded | failed | cancelled
+    -- Optional per-session budget cap. Orchestrator checks before each
+    -- LLM call; on hit, marks session 'failed' with reason='budget'.
+    budget_usd_cap           NUMERIC(10, 2),
+    -- Cumulative cost across all steps in this session (rolled up
+    -- from cloud_llm_usage rows whose session_id matches).
+    cost_usd_so_far          NUMERIC(10, 6) NOT NULL DEFAULT 0,
+    -- Final result, when the session reaches a terminal state.
+    final_result             JSONB,
+    error                    TEXT,
+    created_at               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    started_at               TIMESTAMPTZ,
+    completed_at             TIMESTAMPTZ,
+    created_by               TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_agent_sessions_pending
+    ON agent_sessions(created_at DESC)
+    WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS idx_agent_sessions_running
+    ON agent_sessions(started_at DESC)
+    WHERE status = 'running';
+
+CREATE TABLE IF NOT EXISTS agent_steps (
+    id                       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id               UUID NOT NULL REFERENCES agent_sessions(id) ON DELETE CASCADE,
+    -- Human-readable step name ("read issue", "edit src/main.rs", "open PR").
+    name                     TEXT NOT NULL,
+    -- Which role the orchestrator should dispatch this to. Optional —
+    -- when null, the step runs on the session's default role (usually
+    -- the planner, which decides which sub-role to use).
+    role                     TEXT,
+    -- DAG dependencies: array of step IDs that must reach 'completed'
+    -- (or 'skipped') before this step is claimable. Empty = no deps.
+    depends_on               JSONB NOT NULL DEFAULT '[]',
+    -- Conditional branching: SQL-style boolean expression evaluated
+    -- against parent step results. Null = unconditional.
+    branch_condition         TEXT,
+    -- Per-step memory: anything the orchestrator wants to thread
+    -- through (intermediate findings, tool-call traces, etc.).
+    step_memory              JSONB NOT NULL DEFAULT '{}',
+    status                   TEXT NOT NULL DEFAULT 'pending',
+                             -- pending | running | completed | failed | skipped
+    -- The fleet_tasks row dispatched for this step. Lets the
+    -- orchestrator track stdout/stderr without duplicating the
+    -- streaming surface.
+    fleet_task_id            UUID REFERENCES fleet_tasks(id) ON DELETE SET NULL,
+    -- LLM output as parsed by the orchestrator (typically the
+    -- structured JSON the role's system prompt asks for).
+    result                   JSONB,
+    -- Path to a screenshot artifact when the step was a browser/
+    -- computer-use action (Pillar 1).
+    screenshot_path          TEXT,
+    -- Free-form retry counter — orchestrator may retry a step with
+    -- a refined prompt before giving up.
+    retry_count              INT NOT NULL DEFAULT 0,
+    error                    TEXT,
+    created_at               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    started_at               TIMESTAMPTZ,
+    completed_at             TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_agent_steps_pending
+    ON agent_steps(session_id, created_at)
+    WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS idx_agent_steps_by_session
+    ON agent_steps(session_id);
+
+CREATE TABLE IF NOT EXISTS agent_roles (
+    name                     TEXT PRIMARY KEY,
+                             -- 'planner' | 'coder' | 'reviewer' | 'browser' | 'synthesiser'
+    description              TEXT NOT NULL,
+    -- Default model for this role (e.g. 'claude-opus-4-7'). The
+    -- session's `team` JSONB can override per-session.
+    default_model            TEXT NOT NULL,
+    -- System prompt prepended to every dispatch for this role.
+    system_prompt            TEXT NOT NULL,
+    -- Default `requires_capability` set on dispatched fleet_tasks
+    -- (e.g. ["claude"] for the coder role). Lets capability-tagged
+    -- workers (PR-A3) pick up role-specific work.
+    requires_capability      JSONB NOT NULL DEFAULT '[]',
+    enabled                  BOOLEAN NOT NULL DEFAULT true,
+    created_at               TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Seed the canonical 5 roles. Operator can edit/disable via SQL or
+-- a future `ff agent-role set` verb. The defaults map to the
+-- multi-LLM strategic-routing table in the plan:
+--   planner       → Claude Opus / GPT-5 (deep reasoning)
+--   coder         → Codex / Claude (code editing + tool use)
+--   reviewer      → Gemini Pro (different lens, catches blind spots)
+--   browser       → Claude Computer Use (browser automation via PR-H)
+--   synthesiser   → Gemini (final-report write-up)
+INSERT INTO agent_roles
+    (name, description, default_model, system_prompt, requires_capability)
+VALUES
+  ('planner',
+   'Decomposes the user goal into a step DAG. Produces a JSON plan that the orchestrator emits as agent_steps rows.',
+   'claude-opus-4-7',
+   'You are the planner role in a ForgeFleet multi-LLM team. Read the user goal carefully. Output a JSON plan with steps, dependencies, and the role each step should be dispatched to. Be specific.',
+   '[]'::jsonb),
+
+  ('coder',
+   'Edits code, runs tests, commits. Uses the assigned role''s native CLI agent loop with tool calling.',
+   'claude-opus-4-7',
+   'You are the coder role. Make the smallest correct change that satisfies the step. Do not refactor surrounding code unless asked. Run the project test suite if present and report results.',
+   '["claude"]'::jsonb),
+
+  ('reviewer',
+   'Reviews work the coder produced. Flags bugs, missing edge cases, style issues. Independent lens.',
+   'gemini-2.5-pro',
+   'You are the reviewer role. Critically review the work the coder produced. Report concrete issues (file:line where possible). If the work is acceptable, say so explicitly.',
+   '["gemini"]'::jsonb),
+
+  ('browser',
+   'Drives a headless browser via the computer_use MCP tool (PR-H). Web research, form fills, screenshot reading.',
+   'claude-opus-4-7',
+   'You are the browser role. Use the computer_use MCP tool to perform web tasks. Take screenshots before each click, narrate what you see, never click destructive UI without explicit user confirmation.',
+   '["claude","browser"]'::jsonb),
+
+  ('synthesiser',
+   'Writes the final user-facing summary from all step results. Cited, structured, readable.',
+   'gemini-2.5-pro',
+   'You are the synthesiser role. Combine the team''s step results into a single user-facing markdown report. Cite which step (and which role) produced each finding.',
+   '[]'::jsonb)
+ON CONFLICT (name) DO NOTHING;
+"#;
