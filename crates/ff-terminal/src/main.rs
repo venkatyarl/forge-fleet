@@ -150,6 +150,18 @@ enum Command {
         /// Max turns (default: 30 in agent mode, 1 in oneshot mode).
         #[arg(long)]
         max_turns: Option<u32>,
+        /// Layer-2 backend: `local` (default — ff's own agent loop on a
+        /// fleet LLM) or one of `claude` / `codex` / `gemini` / `kimi` /
+        /// `grok` (spawns the vendor CLI as a subprocess and returns its
+        /// stdout). Vendor CLI uses whatever credentials are at
+        /// `~/.<vendor>/`; for centralised auth run `ff oauth distribute`
+        /// first.
+        #[arg(long, default_value = "local")]
+        backend: String,
+        /// Extra args passed through to the vendor CLI (only used when
+        /// `--backend` != `local`). Repeatable.
+        #[arg(long = "backend-args")]
+        backend_args: Vec<String>,
     },
     /// Run with supervisor — auto-detect failures, fix, and retry
     Supervise {
@@ -168,6 +180,14 @@ enum Command {
         /// `--allowed-tools Write,Bash`. When unset, all core tools are exposed.
         #[arg(long = "allowed-tools", value_delimiter = ',')]
         allowed_tools: Vec<String>,
+        /// Layer-2 backend: `local` (default — ff supervisor) or one of
+        /// `claude` / `codex` / `gemini` / `kimi` / `grok` (spawns the
+        /// vendor CLI per attempt; ff still owns the
+        /// failure-detect-and-retry loop).
+        #[arg(long, default_value = "local")]
+        backend: String,
+        #[arg(long = "backend-args")]
+        backend_args: Vec<String>,
     },
     /// Fleet-parallel research — decomposes a query into N sub-questions,
     /// dispatches each to a different fleet LLM in parallel, and synthesizes
@@ -2017,7 +2037,30 @@ async fn main() -> Result<()> {
             output,
             mode,
             max_turns,
+            backend,
+            backend_args,
         }) => {
+            // Layer-2 backend: spawn a vendor CLI directly (claude /
+            // codex / gemini / kimi / grok) instead of the local agent
+            // loop. `local` keeps existing behaviour.
+            if !backend.eq_ignore_ascii_case("local") {
+                let r = ff_agent::cli_executor::execute_cli(
+                    &backend,
+                    &prompt,
+                    &backend_args,
+                    None,
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("backend `{backend}`: {e}"))?;
+                if !r.stderr.is_empty() {
+                    eprintln!("{}", r.stderr);
+                }
+                println!("{}", r.stdout);
+                if r.exit_code != 0 {
+                    std::process::exit(r.exit_code as i32);
+                }
+                return Ok(());
+            }
             let mode_norm = mode.to_lowercase();
             if mode_norm != "agent" && mode_norm != "oneshot" {
                 eprintln!("{RED}✗ invalid --mode '{mode}' (expected 'agent' or 'oneshot'){RESET}");
@@ -2358,7 +2401,67 @@ async fn main() -> Result<()> {
             max_attempts,
             verify_files,
             allowed_tools,
+            backend,
+            backend_args,
         }) => {
+            // Layer-2 supervised: vendor CLI per attempt, ff still owns
+            // failure-detect-and-retry. Implementation delegates to
+            // cli_executor.rs and stat-checks verify_files between
+            // attempts (same logic as the local supervisor uses).
+            if !backend.eq_ignore_ascii_case("local") {
+                eprintln!(
+                    "{CYAN}▶ ForgeFleet Supervisor{RESET} (backend={backend}, {} attempt(s) max)",
+                    max_attempts
+                );
+                let mut last_err = String::new();
+                for attempt in 1..=max_attempts {
+                    eprintln!("\x1b[2m  attempt {attempt}/{max_attempts}…{RESET}");
+                    let r = match ff_agent::cli_executor::execute_cli(
+                        &backend,
+                        &prompt,
+                        &backend_args,
+                        None,
+                    )
+                    .await
+                    {
+                        Ok(r) => r,
+                        Err(e) => {
+                            last_err = format!("spawn: {e}");
+                            continue;
+                        }
+                    };
+                    let missing: Vec<_> = verify_files
+                        .iter()
+                        .filter(|p| match std::fs::metadata(p) {
+                            Ok(m) => !m.is_file() || m.len() == 0,
+                            Err(_) => true,
+                        })
+                        .collect();
+                    if r.exit_code == 0 && missing.is_empty() {
+                        eprintln!("{GREEN}✓ Task completed on attempt {attempt}/{max_attempts}{RESET}");
+                        if !r.stdout.is_empty() {
+                            println!("{}", r.stdout);
+                        }
+                        return Ok(());
+                    }
+                    last_err = if r.exit_code != 0 {
+                        format!("non-zero exit {}: {}", r.exit_code, r.stderr.chars().take(400).collect::<String>())
+                    } else {
+                        format!(
+                            "{} declared deliverable(s) missing/empty: {}",
+                            missing.len(),
+                            missing
+                                .iter()
+                                .map(|p| p.display().to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    };
+                }
+                eprintln!("{RED}✗ Task failed after {max_attempts} attempt(s){RESET}");
+                eprintln!("\x1b[2m  last error: {last_err}{RESET}");
+                std::process::exit(1);
+            }
             let sup_config = ff_agent::supervisor::SupervisorConfig {
                 max_attempts,
                 verify_files: verify_files.clone(),
