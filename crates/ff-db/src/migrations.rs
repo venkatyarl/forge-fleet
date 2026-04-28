@@ -422,6 +422,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "retire_last_tomls_and_cli_build",
         sql: schema::SCHEMA_V56_RETIRE_LAST_TOMLS_AND_CLI_BUILD,
     },
+    PgMigration {
+        version: 57,
+        name: "macos_ff_git_parity",
+        sql: schema::SCHEMA_V57_MACOS_FF_GIT_PARITY,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.
