@@ -215,6 +215,14 @@ pub async fn tick(pool: &PgPool) -> Result<TickStats> {
             continue;
         }
 
+        // Per-session budget cap (V54 columns + Pillar 3 spec). Roll up
+        // cumulative cost from cloud_llm_usage; if a cap is set and we're
+        // at or past it, fail the session and skip dispatch.
+        if enforce_session_budget(pool, session_id).await? {
+            stats.steps_failed += 1;
+            continue;
+        }
+
         // Check all dependencies terminal.
         let dep_ids: Vec<uuid::Uuid> = depends_on
             .as_array()
@@ -696,6 +704,81 @@ pub fn spawn(pool: PgPool, mut shutdown: watch::Receiver<bool>) -> JoinHandle<()
             }
         }
     })
+}
+
+/// Roll up `cloud_llm_usage` cost into `agent_sessions.cost_usd_so_far`,
+/// then check the session's `budget_usd_cap`. Returns `Ok(true)` if the
+/// session is over-budget (and was just marked `failed`), `Ok(false)`
+/// otherwise. Cost rollup happens unconditionally so the column stays
+/// fresh even for sessions without a cap.
+async fn enforce_session_budget(pool: &PgPool, session_id: uuid::Uuid) -> Result<bool> {
+    // Sum all cloud_llm_usage rows pinned to this session. If a session
+    // calls only local LLMs (no cloud_llm_usage rows), this returns 0
+    // and the cap check trivially passes.
+    let cost: f64 = sqlx::query_scalar::<_, Option<f64>>(
+        "SELECT SUM(cost_usd)::FLOAT8
+           FROM cloud_llm_usage
+          WHERE session_id = $1::text",
+    )
+    .bind(session_id.to_string())
+    .fetch_one(pool)
+    .await
+    .context("sum cloud_llm_usage for session")?
+    .unwrap_or(0.0);
+
+    sqlx::query("UPDATE agent_sessions SET cost_usd_so_far = $2 WHERE id = $1")
+        .bind(session_id)
+        .bind(cost)
+        .execute(pool)
+        .await
+        .context("update session cost rollup")?;
+
+    let cap: Option<f64> =
+        sqlx::query_scalar("SELECT budget_usd_cap::FLOAT8 FROM agent_sessions WHERE id = $1")
+            .bind(session_id)
+            .fetch_one(pool)
+            .await
+            .context("read session budget cap")?;
+
+    let Some(cap) = cap else {
+        return Ok(false); // no cap configured
+    };
+    if cost < cap {
+        return Ok(false);
+    }
+
+    let msg = format!(
+        "session over budget: spent ${cost:.4} of ${cap:.2} cap; refusing further dispatch"
+    );
+    warn!(session = %session_id, cost, cap, "session over budget — failing");
+    sqlx::query(
+        "UPDATE agent_sessions
+            SET status = 'failed',
+                error  = $2,
+                completed_at = COALESCE(completed_at, NOW())
+          WHERE id = $1
+            AND status IN ('pending', 'running')",
+    )
+    .bind(session_id)
+    .bind(&msg)
+    .execute(pool)
+    .await
+    .context("mark session failed (budget)")?;
+    // Cancel any still-pending sibling steps so they don't dispatch.
+    sqlx::query(
+        "UPDATE agent_steps
+            SET status = 'cancelled',
+                error  = $2,
+                completed_at = NOW()
+          WHERE session_id = $1
+            AND status = 'pending'",
+    )
+    .bind(session_id)
+    .bind(&msg)
+    .execute(pool)
+    .await
+    .context("cancel pending steps after budget hit")?;
+    Ok(true)
 }
 
 /// Write a session-scoped memory entry. Roles within a session use
