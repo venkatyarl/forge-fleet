@@ -331,6 +331,21 @@ pub struct ProbeResult {
     pub message: Option<String>,
 }
 
+/// Probe every configured provider in [`OAUTH_PROVIDERS`]. Skips entries
+/// that have no `cred_path` configured (e.g. grok today, where the token
+/// is set manually rather than harvested) — they have nothing to probe.
+pub async fn probe_all(pool: &PgPool) -> Vec<ProbeResult> {
+    let mut out = Vec::with_capacity(OAUTH_PROVIDERS.len());
+    for p in OAUTH_PROVIDERS {
+        if p.cred_path.is_empty() {
+            // Provider has no on-disk cred file (manual-set token).
+            // Probe still runs because we just need a token, not a file.
+        }
+        out.push(probe_one(pool, p).await);
+    }
+    out
+}
+
 /// Probe one OAuth provider's token by hitting its `/v1/models`-style
 /// endpoint. Returns shape suitable for CLI rendering or alert dispatch.
 pub async fn probe_one(pool: &PgPool, provider: &OauthProvider) -> ProbeResult {

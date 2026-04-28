@@ -13321,7 +13321,12 @@ async fn handle_daemon(
     // benchmark-all` so `fabric_pairs.measured_bandwidth_gbps` stays
     // fresh across the fleet without operator intervention.
     let mut fabric_tick = tokio::time::interval(Duration::from_secs(24 * 3600));
-    // First tick fires immediately for each — prime all eight.
+    // OAuth probe: every 6h (leader-only). Hits each oauth_subscription
+    // provider's /v1/models with the harvested token and logs the
+    // result. Catches token expiry before the next inference call
+    // surfaces it as a 401 to a user.
+    let mut oauth_tick = tokio::time::interval(Duration::from_secs(6 * 3600));
+    // First tick fires immediately for each — prime all nine.
     defer_tick.tick().await;
     disk_tick.tick().await;
     recon_tick.tick().await;
@@ -13330,6 +13335,7 @@ async fn handle_daemon(
     brain_tick.tick().await;
     gh_sync_tick.tick().await;
     fabric_tick.tick().await;
+    oauth_tick.tick().await;
 
     // Do an initial pass immediately on startup.
     let _ = defer_pass(&pool, &worker_name, scheduler, &slots).await;
@@ -13560,6 +13566,45 @@ async fn handle_daemon(
                 match fabric_cmd::handle_fabric_benchmark_all(&pool, 5, 1).await {
                     Ok(()) => println!("{CYAN}[fabric]{RESET} 24h benchmark sweep complete"),
                     Err(e) => eprintln!("{RED}[fabric] sweep error: {e}{RESET}"),
+                }
+            }
+            _ = oauth_tick.tick(), if scheduler => {
+                let results = ff_agent::oauth_distributor::probe_all(&pool).await;
+                let mut bad = 0usize;
+                for r in &results {
+                    match r.status.as_str() {
+                        "ok" => tracing::debug!(provider = %r.provider, "oauth_probe ok"),
+                        "no_token" => tracing::debug!(
+                            provider = %r.provider, "oauth_probe: no token configured"
+                        ),
+                        "unauthorized" | "forbidden" => {
+                            tracing::error!(
+                                provider = %r.provider,
+                                status = %r.status,
+                                http = ?r.http_status,
+                                "oauth_probe: token rejected — re-import via `ff oauth import {} && ff oauth distribute {}`",
+                                r.provider, r.provider
+                            );
+                            bad += 1;
+                        }
+                        _ => {
+                            tracing::warn!(
+                                provider = %r.provider,
+                                status = %r.status,
+                                http = ?r.http_status,
+                                msg = ?r.message,
+                                "oauth_probe: unexpected status"
+                            );
+                            bad += 1;
+                        }
+                    }
+                }
+                if bad > 0 {
+                    println!(
+                        "{YELLOW}[oauth]{RESET} probe: {}/{} provider(s) need attention — see logs",
+                        bad,
+                        results.len(),
+                    );
                 }
             }
         }
