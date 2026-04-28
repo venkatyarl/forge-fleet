@@ -81,6 +81,31 @@ pub fn code_identity(version_string: &str) -> String {
         .unwrap_or_else(|| version_string.to_string())
 }
 
+/// Universal "what should this cell display?" helper for any version
+/// string a generic display column will render. Tries each form in
+/// turn, falling back to a plain prefix:
+///
+///   1. Full ff-style `<date>_<n> (<state> <sha>)` → 8-char SHA prefix.
+///   2. Raw hex string ≥10 chars (the `tooling.ff_git.current` shape,
+///      where the value is just `git rev-parse HEAD` output) → first
+///      8 chars (matches `git --short=8`).
+///   3. Anything else (e.g. `gh version 2.50.0 (2024-...)`) → first
+///      10 chars.
+///
+/// Use this everywhere a column has heterogeneous version strings (mix
+/// of ff-style, raw SHAs, and vendor `--version` outputs) and you want
+/// "is this the same code?" to read consistently across hosts.
+pub fn display_version_short(s: &str) -> String {
+    if let Some(v) = BuildVersion::parse(s) {
+        return v.short_sha().to_string();
+    }
+    let trimmed = s.trim();
+    if trimmed.len() >= 10 && trimmed.chars().take(10).all(|c| c.is_ascii_hexdigit()) {
+        return trimmed.chars().take(8).collect();
+    }
+    trimmed.chars().take(10).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,5 +167,35 @@ mod tests {
     fn code_identity_falls_back_on_garbage() {
         let s = code_identity("garbage in");
         assert_eq!(s, "garbage in");
+    }
+
+    #[test]
+    fn display_version_short_handles_ff_shape() {
+        assert_eq!(
+            display_version_short("ff 2026.4.27_64 (pushed db1a950e4c)"),
+            "db1a950e"
+        );
+    }
+
+    #[test]
+    fn display_version_short_handles_raw_sha() {
+        // 40-char rev-parse output, stored under tooling.ff_git.current.
+        let s = display_version_short("a37997621134e1d8b5c4d6e7f890123456789012");
+        assert_eq!(s, "a3799762");
+    }
+
+    #[test]
+    fn display_version_short_handles_short_sha() {
+        // Already-short SHA; still 8 chars out.
+        let s = display_version_short("a37997621134");
+        assert_eq!(s, "a3799762");
+    }
+
+    #[test]
+    fn display_version_short_truncates_vendor_strings() {
+        // gh's `--version` shape isn't ff/SHA — fall through to plain
+        // truncation. We just want stable behavior.
+        let s = display_version_short("gh version 2.50.0 (2024-09-01)");
+        assert_eq!(s, "gh version");
     }
 }
