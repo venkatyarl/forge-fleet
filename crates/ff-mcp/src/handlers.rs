@@ -2000,12 +2000,29 @@ pub async fn dispatch(method: &str, params: Option<Value>) -> HandlerResult {
 /// at 127.0.0.1:51200 (PR-G). The MCP layer doesn't return PNG bytes
 /// directly — for `screenshot` we save to a tmp file and return the
 /// path, which the LLM can then read via the existing file-read tool.
+///
+/// **Read-only by default**: every action that mutates display state
+/// (click / double_click / move / type / key / goto) is refused unless
+/// env `FF_COMPUTER_USE_WRITE_ENABLED=true` is set in the daemon's
+/// process environment. `screenshot` is always allowed since it's
+/// purely observational. Operators opt in per host by exporting the
+/// env var in their systemd unit or launchd plist.
 async fn computer_use(params: Option<Value>) -> Result<Value, String> {
     let params = params.unwrap_or_else(|| serde_json::json!({}));
     let action = params
         .get("action")
         .and_then(Value::as_str)
         .ok_or_else(|| "computer_use: 'action' is required".to_string())?;
+
+    let mutating = !matches!(action, "screenshot");
+    if mutating && !computer_use_write_enabled() {
+        return Err(format!(
+            "computer_use refused: action '{action}' is mutating but \
+             FF_COMPUTER_USE_WRITE_ENABLED is not 'true' \
+             (read-only mode is the default; opt in by exporting \
+             FF_COMPUTER_USE_WRITE_ENABLED=true in the daemon's env)"
+        ));
+    }
 
     let client = reqwest::Client::new();
     let base = "http://127.0.0.1:51200";
@@ -2119,6 +2136,17 @@ async fn relay_resp(resp: reqwest::Response) -> Result<Value, String> {
     } else {
         Err(format!("{status}: {body}"))
     }
+}
+
+/// Returns true only when env var `FF_COMPUTER_USE_WRITE_ENABLED` is
+/// exactly `"true"` (case-insensitive). Defaults to false — the safe
+/// default for a tool that can drive arbitrary UI. Operators opt in
+/// per host by setting the env var in their systemd unit / launchd
+/// plist (matches the per-host scope of the screen daemon itself).
+fn computer_use_write_enabled() -> bool {
+    std::env::var("FF_COMPUTER_USE_WRITE_ENABLED")
+        .map(|v| v.trim().eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
