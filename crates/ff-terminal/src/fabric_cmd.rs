@@ -224,10 +224,75 @@ pub async fn handle_fabric_benchmark(
         .execute(pg)
         .await?;
     }
+    // Roll up the best forward-direction Gbps into fabric_pairs as the
+    // canonical "current" measurement so `ff fabric pairs` and the
+    // dashboard show fresh data without scanning fabric_measurements.
+    let best_gbps = measurements
+        .iter()
+        .map(|(_, g, _)| *g)
+        .fold(0.0_f64, f64::max);
+    if best_gbps > 0.0 {
+        let pair_name = if a < b {
+            format!("{a}-{b}")
+        } else {
+            format!("{b}-{a}")
+        };
+        sqlx::query(
+            "UPDATE fabric_pairs
+                SET measured_bandwidth_gbps = $2,
+                    last_probed_at          = NOW()
+              WHERE pair_name = $1",
+        )
+        .bind(&pair_name)
+        .bind(best_gbps)
+        .execute(pg)
+        .await?;
+    }
+
     println!(
-        "Recorded {} measurement(s) into fabric_measurements.",
-        measurements.len()
+        "Recorded {} measurement(s) into fabric_measurements; rolled best={:.2} Gbps into fabric_pairs.",
+        measurements.len(),
+        best_gbps,
     );
+    Ok(())
+}
+
+/// `ff fabric benchmark-all` — iterate every row in `fabric_pairs` and
+/// run a short benchmark against each. Useful in cron (`@daily ff fabric
+/// benchmark-all --duration 5`) to keep `measured_bandwidth_gbps` fresh
+/// fleet-wide.
+pub async fn handle_fabric_benchmark_all(pg: &PgPool, duration: u32, streams: u32) -> Result<()> {
+    let rows = sqlx::query(
+        "SELECT pair_name, c_a.name AS a_name, c_b.name AS b_name
+           FROM fabric_pairs fp
+           JOIN computers c_a ON c_a.id = fp.computer_a_id
+           JOIN computers c_b ON c_b.id = fp.computer_b_id
+          ORDER BY pair_name",
+    )
+    .fetch_all(pg)
+    .await?;
+
+    if rows.is_empty() {
+        println!("(no fabric_pairs rows — nothing to benchmark)");
+        return Ok(());
+    }
+
+    println!("Benchmarking {} pair(s)...", rows.len());
+    let mut ok = 0usize;
+    let mut failed = 0usize;
+    for r in rows {
+        let a: String = r.try_get("a_name")?;
+        let b: String = r.try_get("b_name")?;
+        println!("\n── {a} ↔ {b} ──");
+        match handle_fabric_benchmark(pg, &a, &b, duration, streams, false).await {
+            Ok(()) => ok += 1,
+            Err(e) => {
+                eprintln!("  ! {a}↔{b} failed: {e}");
+                failed += 1;
+            }
+        }
+    }
+    println!("\nbenchmark-all summary: ok={ok} failed={failed}");
     Ok(())
 }
 
