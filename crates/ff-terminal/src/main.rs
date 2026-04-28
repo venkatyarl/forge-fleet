@@ -881,6 +881,14 @@ enum FleetCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Show per-host code identity (SHA) + convergence status. Designed
+    /// to answer "is the whole fleet on the same code?" without the
+    /// per-machine build counter confusing the picture.
+    Versions {
+        /// Show the verbose per-machine build counter alongside the SHA.
+        #[arg(long, default_value_t = false)]
+        verbose: bool,
+    },
     /// Debug: dump local peer_map + what each member sees.
     Gossip,
     /// Migrate every fleet node to a new GitHub owner + move the repo from
@@ -7524,6 +7532,9 @@ async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
         FleetCommand::Health { json } => {
             handle_fleet_health(&pool, json).await?;
         }
+        FleetCommand::Versions { verbose } => {
+            handle_fleet_versions(&pool, verbose).await?;
+        }
         FleetCommand::Gossip => {
             handle_fleet_gossip().await?;
         }
@@ -9765,6 +9776,135 @@ async fn handle_fleet_health(pool: &sqlx::PgPool, json: bool) -> Result<()> {
             h.name, h.ip, status, beat, cpu, ram, llms, sw
         );
     }
+    Ok(())
+}
+
+/// Show per-host code identity (SHA-first), with a convergence summary.
+/// Designed so a glance at the table answers "are all hosts on the same
+/// code?" — the per-machine build counter is only shown with --verbose.
+async fn handle_fleet_versions(pool: &sqlx::PgPool, verbose: bool) -> Result<()> {
+    use ff_core::build_version::{BuildVersion, code_identity};
+
+    // Pull the installed_version cell stored on each (computer, software_id)
+    // pair. ff_git's installed_version is the full 40-char git SHA written
+    // by version_check::collect_current; ff_terminal's regex-extracted
+    // build_version is what predates the V56 cleanup but rare nodes may
+    // still have it cached. Either path falls through code_identity().
+    let rows = sqlx::query(
+        "SELECT c.name AS name,
+                cs.installed_version AS installed,
+                sr.latest_version AS latest
+           FROM computers c
+           JOIN computer_software cs ON cs.computer_id = c.id
+           JOIN software_registry sr ON sr.id = cs.software_id
+          WHERE cs.software_id = 'ff_git'
+          ORDER BY c.name",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("query versions: {e}"))?;
+
+    if rows.is_empty() {
+        println!(
+            "(no ff_git rows in computer_software — fleet may not have run a version_check tick yet)"
+        );
+        return Ok(());
+    }
+
+    // Pick the most-common installed SHA as the "fleet target". A host
+    // matches when its installed SHA equals that — regardless of build
+    // counter, build date, or local-tree state.
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut hosts: Vec<(String, String, String)> = Vec::with_capacity(rows.len());
+    for r in &rows {
+        let name: String = sqlx::Row::try_get(r, "name").unwrap_or_default();
+        let installed: Option<String> = sqlx::Row::try_get(r, "installed").ok();
+        let latest: Option<String> = sqlx::Row::try_get(r, "latest").ok();
+        let installed = installed.unwrap_or_default();
+        let latest = latest.unwrap_or_default();
+        if !installed.is_empty() {
+            *counts.entry(installed.clone()).or_insert(0) += 1;
+        }
+        hosts.push((name, installed, latest));
+    }
+    let target_sha: Option<String> = counts
+        .iter()
+        .max_by_key(|(_, n)| *n)
+        .map(|(sha, _)| sha.clone());
+
+    // Format an 8-char prefix consistently: full SHAs get truncated;
+    // pre-V56 strings get parsed via code_identity for the same view.
+    let short = |raw: &str| -> String {
+        if raw.is_empty() {
+            "-".to_string()
+        } else if raw.contains(" (") {
+            // pre-V56 raw string like "ff 2026.4.27_64 (pushed db1a950e4c)"
+            code_identity(raw)
+        } else {
+            raw.chars().take(8).collect()
+        }
+    };
+
+    if verbose {
+        println!(
+            "{:<12} {:<10} {:<10} {:<10} {:<8}",
+            "NAME", "INSTALLED", "LATEST", "STATE", "BUILD#"
+        );
+    } else {
+        println!(
+            "{:<12} {:<10} {:<10} {:<8}",
+            "NAME", "INSTALLED", "LATEST", "STATE"
+        );
+    }
+    let mut converged = 0usize;
+    for (name, installed, latest) in &hosts {
+        let inst_short = short(installed);
+        let lat_short = short(latest);
+        let state = match target_sha.as_deref() {
+            Some(t) if installed == t => {
+                converged += 1;
+                "✓"
+            }
+            Some(_) => "drift",
+            None => "?",
+        };
+        if verbose {
+            // Try to parse a build counter / date from any embedded
+            // BuildVersion-shaped string. Pre-V56 cells may have one;
+            // SHA-only cells legitimately don't.
+            let parsed = BuildVersion::parse(installed);
+            let count = parsed
+                .as_ref()
+                .map(|v| v.build_count.to_string())
+                .unwrap_or_else(|| "-".into());
+            println!(
+                "{:<12} {:<10} {:<10} {:<10} {:<8}",
+                name, inst_short, lat_short, state, count
+            );
+        } else {
+            println!(
+                "{:<12} {:<10} {:<10} {:<8}",
+                name, inst_short, lat_short, state
+            );
+        }
+    }
+
+    let total = hosts.len();
+    let target_disp = target_sha
+        .as_deref()
+        .map(|s| s.chars().take(8).collect::<String>())
+        .unwrap_or_else(|| "-".into());
+    println!();
+    if converged == total {
+        println!("{GREEN}✓ converged{RESET}: all {total} host(s) at {target_disp}");
+    } else {
+        println!(
+            "{YELLOW}⚠ drift{RESET}: {}/{total} on {target_disp}; {} drifted",
+            converged,
+            total - converged,
+        );
+    }
+
     Ok(())
 }
 
