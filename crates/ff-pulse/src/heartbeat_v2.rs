@@ -223,6 +223,13 @@ impl HeartbeatV2Publisher {
         // ── Docker daemon probe ──────────────────────────────────────────
         beat.docker = DockerProbe::detect().await;
 
+        // ── Ray cluster membership (item 4.6) — populates
+        //    multi_host_participation so the leader-side materializer
+        //    auto-fills the llm_clusters table without operator action.
+        //    Returns None on hosts that aren't ray members (most fleet
+        //    machines today), which is the correct shape.
+        beat.multi_host_participation = crate::ray_detect::detect_ray_membership().await;
+
         // ── peers_seen populated by a separate loop (reader_tick) ────────
 
         beat.db_topology = DbTopology {

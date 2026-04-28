@@ -23,6 +23,7 @@ pub mod metrics;
 pub mod nats;
 pub mod peer_map;
 pub mod pulse_hmac;
+pub mod ray_detect;
 pub mod reader;
 pub mod software_collector;
 pub mod subscriber;
