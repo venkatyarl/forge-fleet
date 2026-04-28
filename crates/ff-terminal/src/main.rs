@@ -480,6 +480,17 @@ enum FabricCommand {
         #[arg(long, default_value = "20")]
         limit: i64,
     },
+    /// Iterate every `fabric_pairs` row and benchmark each — keeps
+    /// `measured_bandwidth_gbps` fresh fleet-wide. Suitable for daily cron.
+    BenchmarkAll {
+        /// Test duration in seconds per pair (default 10 — shorter than
+        /// the per-pair default since this is a sweep).
+        #[arg(long, default_value = "10")]
+        duration: u32,
+        /// Number of parallel streams (default 1).
+        #[arg(long, default_value = "1")]
+        streams: u32,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -2270,6 +2281,9 @@ async fn main() -> Result<()> {
                 FabricCommand::Measurements { a, b, limit } => {
                     fabric_cmd::handle_fabric_measurements(&pool, a.as_deref(), b.as_deref(), limit)
                         .await
+                }
+                FabricCommand::BenchmarkAll { duration, streams } => {
+                    fabric_cmd::handle_fabric_benchmark_all(&pool, duration, streams).await
                 }
             }
         }
