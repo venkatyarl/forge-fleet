@@ -5044,3 +5044,42 @@ UPDATE software_registry
        )
  WHERE id IN ('ff_git', 'forgefleetd_git');
 "#;
+
+// ─── V57: macOS ff_git playbook parity with V56's linux fix ────────────────
+//
+// V56 closed the worker-CLI rebuild gap on Linux (ff_git playbook now builds
+// `-p forge-fleet -p ff-terminal` and installs both binaries) but left the
+// macOS variant alone. Surfaced 2026-04-27 during the post-V56 fleet rollout
+// — taylor + ace's `forgefleetd` binary stayed at `pushed 751c99b79e` even
+// after `ff fleet upgrade ff_git --all` because the macOS playbook only built
+// `-p ff-terminal` and only installed `ff`. Operators had to run a separate
+// `ff fleet upgrade forgefleetd_git --computer <mac>` pass to update the
+// daemon; that's a reproducibility hazard.
+//
+// V57 brings macOS ff_git to parity: build both packages, install both
+// binaries, codesign both, and `launchctl kickstart -k` the daemon. Keeps
+// the existing forgefleet/ForgeFleet aliases (V33).
+pub const SCHEMA_V57_MACOS_FF_GIT_PARITY: &str = r#"
+UPDATE software_registry
+   SET upgrade_playbook = jsonb_set(
+           upgrade_playbook,
+           '{macos}',
+           to_jsonb(
+              'export PATH="$HOME/.cargo/bin:$PATH" && '
+           || 'mkdir -p "$(dirname {{source_tree_path}})" && '
+           || '{ [ -d "{{source_tree_path}}/.git" ] || git clone https://github.com/venkatyarl/forge-fleet "{{source_tree_path}}"; } && '
+           || 'cd "{{source_tree_path}}" && '
+           || 'git fetch origin main && '
+           || 'git reset --hard origin/main && '
+           || 'cargo build --release -p forge-fleet -p ff-terminal && '
+           || 'install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && '
+           || 'install -m 755 target/release/ff ~/.local/bin/ff && '
+           || 'codesign --force --sign - ~/.local/bin/forgefleetd && '
+           || 'codesign --force --sign - ~/.local/bin/ff && '
+           || 'ln -sf ~/.local/bin/ff ~/.local/bin/forgefleet && '
+           || 'ln -sf ~/.local/bin/ff ~/.local/bin/ForgeFleet && '
+           || 'launchctl kickstart -k gui/$(id -u)/com.forgefleet.forgefleetd 2>/dev/null || true'
+           )
+       )
+ WHERE id = 'ff_git';
+"#;
