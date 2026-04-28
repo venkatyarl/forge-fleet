@@ -823,9 +823,23 @@ enum OauthCommand {
     /// matching path (mode 0600). After this, ff-driven CLI invocations on
     /// any member use the centralised token. Pass `all` to fan out for
     /// every provider at once.
+    ///
+    /// TOS WARNING: most vendor consumer subscriptions (Claude Pro,
+    /// ChatGPT Plus, Kimi Pro) prohibit using one account on N concurrent
+    /// machines. This verb is TOS-grey; running it acknowledges that you
+    /// take responsibility for compliance. Strict-compliance shops should
+    /// run a separate per-member subscription instead.
+    ///
+    /// Without `--yes`, the verb prints a confirmation prompt before
+    /// fanning out. CI / cron callers should pass `--yes` once they've
+    /// made the decision.
     Distribute {
         /// Provider name: `claude`, `codex`, `gemini`, `kimi`, `grok`, or `all`.
         provider: String,
+        /// Skip the interactive TOS-acknowledgement prompt. Required for
+        /// non-interactive callers (cron, CI, deferred tasks).
+        #[arg(long, default_value_t = false)]
+        yes: bool,
     },
     /// Show per-provider OAuth state: cred-file present on leader,
     /// mtime, token-in-fleet_secrets, token-preview.
@@ -2653,7 +2667,7 @@ async fn main() -> Result<()> {
                     }
                     Ok(())
                 }
-                OauthCommand::Distribute { provider } => {
+                OauthCommand::Distribute { provider, yes } => {
                     println!(
                         "{YELLOW}!{RESET} TOS reminder: distributing one subscription's OAuth token \
                          to multiple machines is grey-area on most vendor TOS — running one Pro/Plus \
@@ -2661,6 +2675,28 @@ async fn main() -> Result<()> {
                          compliance. Use per-node logins (skip this command) for compliance, OR \
                          continue knowing the risk."
                     );
+                    if !yes {
+                        // Interactive confirmation. Non-tty callers (cron,
+                        // deferred tasks) must pass --yes; we abort on EOF
+                        // / non-tty to avoid silent hangs.
+                        use std::io::{BufRead, IsTerminal, Write};
+                        if !std::io::stdin().is_terminal() {
+                            anyhow::bail!(
+                                "non-interactive caller must pass --yes to acknowledge the TOS reminder"
+                            );
+                        }
+                        print!("Continue and distribute? (y/N) ");
+                        std::io::stdout().flush().ok();
+                        let mut line = String::new();
+                        std::io::stdin().lock().read_line(&mut line)?;
+                        let answer = line.trim().to_ascii_lowercase();
+                        if answer != "y" && answer != "yes" {
+                            println!(
+                                "{YELLOW}✗{RESET} aborted (pass --yes to skip prompt next time)"
+                            );
+                            return Ok(());
+                        }
+                    }
                     for p in resolve(&provider)? {
                         match distribute_token(&pool, p).await {
                             Ok(n) => println!(
@@ -3587,8 +3623,7 @@ fn summarize_tool_input(tool_name: &str, input_json: &str) -> String {
 
     if !key.is_empty() {
         if let Some(val) = v.get(key).and_then(|v| v.as_str()) {
-            let truncated = &val[..val.len().min(60)];
-            return truncated.replace('\n', " ").to_string();
+            return truncate_str(val, 60).replace('\n', " ");
         }
     }
 
@@ -3596,7 +3631,7 @@ fn summarize_tool_input(tool_name: &str, input_json: &str) -> String {
     if let Some(obj) = v.as_object() {
         for (_, val) in obj.iter().take(1) {
             if let Some(s) = val.as_str() {
-                return s[..s.len().min(60)].replace('\n', " ").to_string();
+                return truncate_str(s, 60).replace('\n', " ");
             }
         }
     }
@@ -4160,7 +4195,7 @@ async fn run_headless(
                         eprintln!("{RED}✗ ({duration_ms}ms){RESET}");
                         let first_line = result.lines().next().unwrap_or("").trim();
                         if !first_line.is_empty() {
-                            eprintln!("  {RED}{}{RESET}", &first_line[..first_line.len().min(120)]);
+                            eprintln!("  {RED}{}{RESET}", truncate_str(first_line, 120));
                         }
                     } else {
                         eprintln!("{GREEN}✓ ({duration_ms}ms){RESET}");
@@ -4171,10 +4206,7 @@ async fn run_headless(
                                 for line in lines {
                                     let trimmed = line.trim();
                                     if !trimmed.is_empty() {
-                                        eprintln!(
-                                            "  \x1b[2m{}\x1b[0m",
-                                            &trimmed[..trimmed.len().min(120)]
-                                        );
+                                        eprintln!("  \x1b[2m{}\x1b[0m", truncate_str(trimmed, 120));
                                     }
                                 }
                             }
@@ -4910,11 +4942,11 @@ async fn handle_status_inner(p: PathBuf) -> Result<()> {
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}…", &s[..max])
-    }
+    // Char-safe — `&s[..max]` panicked on multi-byte codepoints (box-drawing,
+    // emoji, CJK). Delegate to the canonical helper at line 14460 so this
+    // never recurs. Both helpers exist for historical-callsite reasons;
+    // future code should call `truncate_str` directly.
+    truncate_str(s, max)
 }
 
 async fn tcp_probe(host: &str, port: u16, timeout: Duration) -> bool {
@@ -13975,8 +14007,8 @@ async fn handle_task(cmd: TaskCommand, _config_path: &Path) -> Result<()> {
                     "in_progress" => CYAN,
                     _ => YELLOW,
                 };
-                let short_subject = &subject[..subject.len().min(39)];
-                let short_created = &created[..created.len().min(19)];
+                let short_subject = truncate_str(subject, 39);
+                let short_created = truncate_str(created, 19);
                 println!(
                     "  {id:<6} {short_subject:<40} {status_color}{status_str:<12}{RESET} {node:<16} {short_created}"
                 );
@@ -14020,7 +14052,7 @@ async fn handle_task(cmd: TaskCommand, _config_path: &Path) -> Result<()> {
                     println!("  created:     {created}");
                     if let Some(output) = t.get("output").and_then(|v| v.as_str()) {
                         if !output.is_empty() {
-                            println!("\n  Output:\n    {}", &output[..output.len().min(500)]);
+                            println!("\n  Output:\n    {}", truncate_str(output, 500));
                         }
                     }
                 }
@@ -14884,7 +14916,7 @@ async fn handle_research(
                 ResearchProgress::Planning { query } => {
                     eprintln!(
                         "{CYAN}[planner]{RESET} decomposing: {}",
-                        &query[..query.len().min(80)]
+                        truncate_str(&query, 80)
                     );
                 }
                 ResearchProgress::Dispatching { sub_count } => {

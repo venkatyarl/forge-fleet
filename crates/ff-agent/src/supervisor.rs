@@ -272,7 +272,9 @@ fn detect_failure(
             tool_name, result, ..
         } = ev
         {
-            let sig = format!("{}:{}", tool_name, &result[..result.len().min(50)]);
+            // Char-safe truncation — tool results often contain UTF-8.
+            let sig_tail: String = result.chars().take(50).collect();
+            let sig = format!("{tool_name}:{sig_tail}");
             *sig_counts.entry(sig).or_insert(0usize) += 1;
         }
     }
@@ -335,7 +337,8 @@ fn diagnose_and_fix(
         FailureType::LlmError(msg) => FailureDiagnosis {
             attempt,
             failure_type: "llm_error".into(),
-            evidence: msg[..msg.len().min(200)].to_string(),
+            // Char-safe truncation — `[..200]` panics on multi-byte codepoints.
+            evidence: msg.chars().take(200).collect::<String>(),
             fix_applied: "Retrying with backoff (already built into agent loop)".into(),
         },
         FailureType::ToolLoop { tool, count } => {

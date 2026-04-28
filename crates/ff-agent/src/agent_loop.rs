@@ -550,6 +550,15 @@ async fn run_agent_loop(
     let session_id = session.id.to_string();
     let openai_tools = openai_bridge::tools_to_openai_arc(&session.tools);
 
+    // Cap on context-overflow → compact → retry cycles. The existing no-op
+    // bailout at the bottom of this loop catches the "single oversized
+    // message" case (compaction can't reduce further). This cap catches the
+    // weaker case where compaction shrinks by 1 each time — without it,
+    // a long history with a tight context window can spin through 20+
+    // retries before the model finally fits.
+    const MAX_COMPACTION_RETRIES: u32 = 5;
+    let mut compaction_retries: u32 = 0;
+
     for turn in 1..=session.config.max_turns {
         session.turn_count = turn;
         let mut llm_retry_count = 0u32;
@@ -698,6 +707,26 @@ async fn run_agent_loop(
                             "Context overflow with {after} message(s) — compaction can't reduce \
                              further (prompt itself exceeds context window). \
                              Split the input or use a model with a larger context."
+                        );
+                        emit(
+                            &event_tx,
+                            AgentEvent::Error {
+                                session_id: session_id.clone(),
+                                message: msg.clone(),
+                            },
+                        );
+                        return AgentOutcome::Error(msg);
+                    }
+
+                    // Cap repeated shrink-by-1 cycles. Without this the for-loop's
+                    // max_turns bound is the only escape, which can be 30+ retries
+                    // for an interactive session.
+                    compaction_retries = compaction_retries.saturating_add(1);
+                    if compaction_retries > MAX_COMPACTION_RETRIES {
+                        let msg = format!(
+                            "Exceeded {MAX_COMPACTION_RETRIES} compaction retries — \
+                             prompt is too large for this model's context window. \
+                             Split the input or pick a model with a larger context."
                         );
                         emit(
                             &event_tx,
