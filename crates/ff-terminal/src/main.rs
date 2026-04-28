@@ -888,6 +888,13 @@ enum FleetCommand {
         /// Show the verbose per-machine build counter alongside the SHA.
         #[arg(long, default_value_t = false)]
         verbose: bool,
+        /// SSH each host in parallel and read the live `forgefleetd
+        /// --version` output, instead of using the cached
+        /// `computer_software.installed_version` (refreshed every 6h
+        /// by the version_check tick). Slower but truthful right
+        /// after an upgrade.
+        #[arg(long, default_value_t = false)]
+        live: bool,
     },
     /// Debug: dump local peer_map + what each member sees.
     Gossip,
@@ -7532,8 +7539,8 @@ async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
         FleetCommand::Health { json } => {
             handle_fleet_health(&pool, json).await?;
         }
-        FleetCommand::Versions { verbose } => {
-            handle_fleet_versions(&pool, verbose).await?;
+        FleetCommand::Versions { verbose, live } => {
+            handle_fleet_versions(&pool, verbose, live).await?;
         }
         FleetCommand::Gossip => {
             handle_fleet_gossip().await?;
@@ -9782,8 +9789,17 @@ async fn handle_fleet_health(pool: &sqlx::PgPool, json: bool) -> Result<()> {
 /// Show per-host code identity (SHA-first), with a convergence summary.
 /// Designed so a glance at the table answers "are all hosts on the same
 /// code?" — the per-machine build counter is only shown with --verbose.
-async fn handle_fleet_versions(pool: &sqlx::PgPool, verbose: bool) -> Result<()> {
+///
+/// `live=true` SSHes each host in parallel and reads `forgefleetd
+/// --version` directly, so the view is accurate right after an upgrade.
+/// `live=false` reads the DB-cached `computer_software.installed_version`
+/// (refreshed every 6h) — fast but stale.
+async fn handle_fleet_versions(pool: &sqlx::PgPool, verbose: bool, live: bool) -> Result<()> {
     use ff_core::build_version::{BuildVersion, code_identity};
+
+    if live {
+        return handle_fleet_versions_live(pool, verbose).await;
+    }
 
     // Pull the installed_version cell stored on each (computer, software_id)
     // pair. ff_git's installed_version is the full 40-char git SHA written
@@ -9902,6 +9918,148 @@ async fn handle_fleet_versions(pool: &sqlx::PgPool, verbose: bool) -> Result<()>
             "{YELLOW}⚠ drift{RESET}: {}/{total} on {target_disp}; {} drifted",
             converged,
             total - converged,
+        );
+    }
+
+    Ok(())
+}
+
+/// Live variant of `ff fleet versions` — SSHes every computer in
+/// parallel and reads `forgefleetd --version` directly. Slower than the
+/// cached path (one SSH round-trip per host, capped at ~5s each) but
+/// truthful right after a fleet upgrade when the version_check tick
+/// hasn't refreshed `installed_version` yet.
+async fn handle_fleet_versions_live(pool: &sqlx::PgPool, verbose: bool) -> Result<()> {
+    use ff_core::build_version::BuildVersion;
+    use futures::stream::{FuturesUnordered, StreamExt};
+    use tokio::process::Command;
+
+    let nodes = ff_db::pg_list_nodes(pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("pg_list_nodes: {e}"))?;
+    if nodes.is_empty() {
+        println!("(no computers registered)");
+        return Ok(());
+    }
+
+    let me = ff_agent::fleet_info::resolve_this_node_name().await;
+    let mut futs = FuturesUnordered::new();
+    for n in nodes {
+        let name = n.name.clone();
+        let ip = n.ip.clone();
+        let user = n.ssh_user.clone();
+        let is_me = me.eq_ignore_ascii_case(&name);
+        futs.push(async move {
+            let cmd = "~/.local/bin/forgefleetd --version 2>&1 | head -1";
+            let out = if is_me {
+                Command::new("sh").args(["-c", cmd]).output().await
+            } else {
+                Command::new("ssh")
+                    .args([
+                        "-T",
+                        "-o",
+                        "BatchMode=yes",
+                        "-o",
+                        "ConnectTimeout=5",
+                        &format!("{user}@{ip}"),
+                        cmd,
+                    ])
+                    .output()
+                    .await
+            };
+            let raw = match out {
+                Ok(o) if o.status.success() => {
+                    String::from_utf8_lossy(&o.stdout).trim().to_string()
+                }
+                Ok(o) => format!("ssh-exit:{}", o.status.code().unwrap_or(-1)),
+                Err(e) => format!("ssh-error:{e}"),
+            };
+            (name, raw)
+        });
+    }
+
+    let mut rows: Vec<(String, String, Option<BuildVersion>)> = Vec::new();
+    while let Some((name, raw)) = futs.next().await {
+        let parsed = BuildVersion::parse(&raw);
+        rows.push((name, raw, parsed));
+    }
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // Pick the most-common SHA as the fleet target.
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (_, _, parsed) in &rows {
+        if let Some(p) = parsed {
+            *counts.entry(p.sha.clone()).or_insert(0) += 1;
+        }
+    }
+    let target_sha: Option<String> = counts
+        .iter()
+        .max_by_key(|(_, n)| *n)
+        .map(|(sha, _)| sha.clone());
+
+    if verbose {
+        println!(
+            "{:<12} {:<10} {:<8} {:<8} {:<8}",
+            "NAME", "SHA", "STATE", "BUILD#", "STATUS"
+        );
+    } else {
+        println!("{:<12} {:<10} {:<8}", "NAME", "SHA", "STATUS");
+    }
+    let mut converged = 0usize;
+    let mut unreachable = 0usize;
+    for (name, raw, parsed) in &rows {
+        match parsed {
+            Some(v) => {
+                let status = match target_sha.as_deref() {
+                    Some(t) if v.sha == t => {
+                        converged += 1;
+                        "✓".to_string()
+                    }
+                    Some(_) => "drift".to_string(),
+                    None => "?".to_string(),
+                };
+                if verbose {
+                    println!(
+                        "{:<12} {:<10} {:<8} {:<8} {:<8}",
+                        name,
+                        v.short_sha(),
+                        v.state,
+                        v.build_count,
+                        status
+                    );
+                } else {
+                    println!("{:<12} {:<10} {:<8}", name, v.short_sha(), status);
+                }
+            }
+            None => {
+                unreachable += 1;
+                let snippet: String = raw.chars().take(20).collect();
+                if verbose {
+                    println!("{:<12} {:<10} {:<8} {:<8} {snippet}", name, "?", "?", "?");
+                } else {
+                    println!("{:<12} {:<10} {snippet}", name, "?");
+                }
+            }
+        }
+    }
+
+    let total = rows.len();
+    let target_disp = target_sha
+        .as_deref()
+        .map(|s| {
+            let n = s.chars().count().min(8);
+            s[..n].to_string()
+        })
+        .unwrap_or_else(|| "-".into());
+    println!();
+    if unreachable == 0 && converged == total {
+        println!("{GREEN}✓ converged{RESET}: all {total} host(s) live at {target_disp}");
+    } else {
+        println!(
+            "{YELLOW}⚠ {}/{total} live at {target_disp}{RESET}; {} drifted, {} unreachable",
+            converged,
+            total - converged - unreachable,
+            unreachable,
         );
     }
 
