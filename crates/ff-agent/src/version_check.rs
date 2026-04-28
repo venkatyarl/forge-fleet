@@ -234,10 +234,17 @@ async fn enqueue_upgrade_tasks(
 /// Best-effort version equivalence. Tool `--version` output and upstream
 /// release tags are almost never byte-identical: "gh version 2.89.0 (date)"
 /// vs "v2.89.0", "2.32.1" vs "v2.32.1", "OpenClaw 2.4.0" vs "2.4.0", etc.
-/// We extract the first dotted numeric sequence from each side and compare
-/// those; if either side has no numeric version, fall back to literal compare
-/// (which will usually be unequal — safer to over-report drift than miss it).
+///
+/// For `ff` / `ff_git` / `forgefleetd_git` rows the inputs follow the
+/// `<date>_<n> (pushed <sha>)` shape — those should compare on SHA only,
+/// not on the per-machine build counter. `BuildVersion::is_same_code`
+/// handles that path; for anything else we fall back to the dotted-numeric
+/// extraction.
 fn versions_equivalent(a: &str, b: &str) -> bool {
+    use ff_core::build_version::BuildVersion;
+    if let (Some(va), Some(vb)) = (BuildVersion::parse(a), BuildVersion::parse(b)) {
+        return va.is_same_code(&vb);
+    }
     match (extract_semver(a), extract_semver(b)) {
         (Some(x), Some(y)) => x == y,
         _ => a == b,
@@ -410,4 +417,36 @@ async fn pypi_version(client: &reqwest::Client, pkg: &str) -> Option<String> {
         .and_then(|i| i.get("version"))
         .and_then(|v| v.as_str())
         .map(str::to_string)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn versions_equivalent_same_sha_different_build_counter() {
+        // Two ff binaries built on different hosts at the same commit
+        // legitimately disagree on the build counter. They must compare
+        // equal — that's the whole point of the SHA-first display fix.
+        let a = "2026.4.27_12 (pushed db1a950e4c)";
+        let b = "2026.4.27_64 (pushed db1a950e4c)";
+        assert!(versions_equivalent(a, b));
+    }
+
+    #[test]
+    fn versions_equivalent_different_sha_is_drift() {
+        let a = "2026.4.27_12 (pushed db1a950e4c)";
+        let b = "2026.4.27_12 (pushed 33e05f9beb)";
+        assert!(!versions_equivalent(a, b));
+    }
+
+    #[test]
+    fn versions_equivalent_falls_back_to_semver_for_vendor_strings() {
+        // Pre-existing semver path still works for `gh`, `op`, etc.
+        assert!(versions_equivalent("gh version 2.89.0 (date)", "v2.89.0"));
+        assert!(!versions_equivalent(
+            "gh version 2.89.0",
+            "gh version 2.90.0"
+        ));
+    }
 }
