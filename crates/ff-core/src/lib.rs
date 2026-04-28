@@ -12,6 +12,7 @@
 
 pub mod activity;
 pub mod audit;
+pub mod build_version;
 pub mod chaos;
 pub mod circuit_breaker;
 pub mod config;
