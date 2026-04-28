@@ -13317,7 +13317,11 @@ async fn handle_daemon(
     let mut brain_tick = tokio::time::interval(Duration::from_secs(30 * 60));
     // Project GitHub sync: every 5 minutes (leader-only to avoid rate-limit waste).
     let mut gh_sync_tick = tokio::time::interval(Duration::from_secs(5 * 60));
-    // First tick fires immediately for each — prime all seven.
+    // Fabric benchmark: every 24h (leader-only). Fires `ff fabric
+    // benchmark-all` so `fabric_pairs.measured_bandwidth_gbps` stays
+    // fresh across the fleet without operator intervention.
+    let mut fabric_tick = tokio::time::interval(Duration::from_secs(24 * 3600));
+    // First tick fires immediately for each — prime all eight.
     defer_tick.tick().await;
     disk_tick.tick().await;
     recon_tick.tick().await;
@@ -13325,6 +13329,7 @@ async fn handle_daemon(
     version_tick.tick().await;
     brain_tick.tick().await;
     gh_sync_tick.tick().await;
+    fabric_tick.tick().await;
 
     // Do an initial pass immediately on startup.
     let _ = defer_pass(&pool, &worker_name, scheduler, &slots).await;
@@ -13546,6 +13551,15 @@ async fn handle_daemon(
                         r.updated_main, r.branches_upserted, r.prs_attached, r.errors.len()),
                     Ok(_) => {}
                     Err(e) => eprintln!("{RED}[projects] gh sync error: {e}{RESET}"),
+                }
+            }
+            _ = fabric_tick.tick(), if scheduler => {
+                // Short duration (5s) — sweeping every pair, not benchmarking
+                // throughput exhaustively. Operators run the full 30s probe
+                // manually via `ff fabric benchmark <a> <b>` when needed.
+                match fabric_cmd::handle_fabric_benchmark_all(&pool, 5, 1).await {
+                    Ok(()) => println!("{CYAN}[fabric]{RESET} 24h benchmark sweep complete"),
+                    Err(e) => eprintln!("{RED}[fabric] sweep error: {e}{RESET}"),
                 }
             }
         }
