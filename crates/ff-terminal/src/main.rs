@@ -7407,12 +7407,20 @@ async fn handle_versions(node_filter: Option<String>) -> Result<()> {
                 ),
                 None => ("—", None),
             };
+            // Compare on code-identity (SHA prefix) so the same SHA in two
+            // different shapes (e.g. short SHA vs full ff-version string)
+            // still reads as ✓ rather than ⚠. Without this the ff row
+            // (which stores the full --version string) and the ff_git row
+            // (which stores the raw SHA) compared against the same upstream
+            // SHA would always show drift.
+            use ff_core::build_version::display_version_short;
+            let cur_short = display_version_short(cur);
             let marker = match lat {
-                Some(l) if l == cur => "✓",
+                Some(l) if display_version_short(l) == cur_short => "✓",
                 Some(_) => "⚠",
                 None => " ",
             };
-            let disp = format!("{} {}", truncate_for_col(cur, 11), marker);
+            let disp = format!("{} {}", cur_short, marker);
             print!(" {:<14}", disp);
         }
         println!();
@@ -9795,7 +9803,7 @@ async fn handle_fleet_health(pool: &sqlx::PgPool, json: bool) -> Result<()> {
 /// `live=false` reads the DB-cached `computer_software.installed_version`
 /// (refreshed every 6h) — fast but stale.
 async fn handle_fleet_versions(pool: &sqlx::PgPool, verbose: bool, live: bool) -> Result<()> {
-    use ff_core::build_version::{BuildVersion, code_identity};
+    use ff_core::build_version::{BuildVersion, display_version_short};
 
     if live {
         return handle_fleet_versions_live(pool, verbose).await;
@@ -9848,16 +9856,14 @@ async fn handle_fleet_versions(pool: &sqlx::PgPool, verbose: bool, live: bool) -
         .max_by_key(|(_, n)| *n)
         .map(|(sha, _)| sha.clone());
 
-    // Format an 8-char prefix consistently: full SHAs get truncated;
-    // pre-V56 strings get parsed via code_identity for the same view.
+    // Route every cell through display_version_short — the unified
+    // helper handles ff-shape strings, raw 40-char SHAs, and vendor
+    // version strings consistently. Empty cells render as `-`.
     let short = |raw: &str| -> String {
         if raw.is_empty() {
             "-".to_string()
-        } else if raw.contains(" (") {
-            // pre-V56 raw string like "ff 2026.4.27_64 (pushed db1a950e4c)"
-            code_identity(raw)
         } else {
-            raw.chars().take(8).collect()
+            display_version_short(raw)
         }
     };
 
