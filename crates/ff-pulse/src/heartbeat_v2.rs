@@ -484,12 +484,29 @@ fn detect_primary_ip() -> String {
             return ip;
         }
     }
-    // Fall back to the first non-loopback IPv4 from `ifconfig`/`ip addr`.
-    detect_all_ips()
-        .into_iter()
-        .find(|ip| ip.kind == "lan")
-        .map(|ip| ip.ip)
-        .unwrap_or_else(|| "127.0.0.1".to_string())
+    pick_primary_lan_ip(&detect_all_ips()).unwrap_or_else(|| "127.0.0.1".to_string())
+}
+
+/// Pick the most-stable LAN IP from a list of detected interfaces.
+///
+/// Wired beats wireless: a wifi address is unstable (DHCP renewals, mesh
+/// roaming, signal drops all change the address) and breaks
+/// `computers.primary_ip` as the canonical address of record. When a host
+/// is dual-homed, ethernet/thunderbolt/usb-eth wins — wifi is the fallback
+/// only when no wired interface is up. Aura specifically: ethernet (.110)
+/// is canonical, wifi is the tiebreaker.
+///
+/// Tiebreaker within each group is the order returned by ifconfig/ip addr
+/// (i.e. lower interface index first).
+fn pick_primary_lan_ip(ips: &[Ip]) -> Option<String> {
+    let lan_ips: Vec<&Ip> = ips.iter().filter(|ip| ip.kind == "lan").collect();
+    if let Some(wired) = lan_ips
+        .iter()
+        .find(|ip| ip.medium.as_deref() != Some("wifi"))
+    {
+        return Some(wired.ip.clone());
+    }
+    lan_ips.first().map(|ip| ip.ip.clone())
 }
 
 fn detect_all_ips() -> Vec<Ip> {
@@ -792,5 +809,51 @@ mod tests {
         assert_eq!(classify_iface("en0", "192.168.5.100"), "lan");
         assert_eq!(classify_iface("utun3", "100.64.5.100"), "tailscale");
         assert_eq!(classify_iface("eth0", "10.0.0.5"), "lan");
+    }
+
+    fn lan_ip(iface: &str, ip: &str, medium: &str) -> Ip {
+        Ip {
+            iface: iface.to_string(),
+            ip: ip.to_string(),
+            kind: "lan".to_string(),
+            paired_with: None,
+            link_speed_gbps: None,
+            medium: Some(medium.to_string()),
+        }
+    }
+
+    #[test]
+    fn pick_primary_lan_ip_prefers_ethernet_over_wifi() {
+        // Wifi listed first by ifconfig — ethernet must still win.
+        let ips = vec![
+            lan_ip("en1", "192.168.5.50", "wifi"),
+            lan_ip("en0", "192.168.5.110", "ethernet"),
+        ];
+        assert_eq!(
+            pick_primary_lan_ip(&ips),
+            Some("192.168.5.110".to_string()),
+            "ethernet must beat wifi regardless of ifconfig order"
+        );
+    }
+
+    #[test]
+    fn pick_primary_lan_ip_falls_back_to_wifi_when_only_choice() {
+        let ips = vec![lan_ip("en1", "192.168.5.50", "wifi")];
+        assert_eq!(pick_primary_lan_ip(&ips), Some("192.168.5.50".to_string()));
+    }
+
+    #[test]
+    fn pick_primary_lan_ip_prefers_thunderbolt_over_wifi() {
+        // Mediums that aren't "wifi" all count as wired for this selection.
+        let ips = vec![
+            lan_ip("en1", "192.168.5.50", "wifi"),
+            lan_ip("usb0", "192.168.5.110", "usb-eth"),
+        ];
+        assert_eq!(pick_primary_lan_ip(&ips), Some("192.168.5.110".to_string()));
+    }
+
+    #[test]
+    fn pick_primary_lan_ip_returns_none_for_empty() {
+        assert_eq!(pick_primary_lan_ip(&[]), None);
     }
 }
