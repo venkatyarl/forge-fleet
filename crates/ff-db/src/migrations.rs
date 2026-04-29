@@ -442,6 +442,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "auto_upgrade_memory",
         sql: schema::SCHEMA_V60_AUTO_UPGRADE_MEMORY,
     },
+    PgMigration {
+        version: 61,
+        name: "peer_driven_upgrades",
+        sql: schema::SCHEMA_V61_PEER_DRIVEN_UPGRADES,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.
