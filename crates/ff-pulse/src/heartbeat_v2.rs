@@ -244,15 +244,26 @@ impl HeartbeatV2Publisher {
 
     /// Spawn the publisher loop. Emits a final beat with `going_offline=true`
     /// on shutdown.
+    ///
+    /// Reconnect-on-error: the multiplexed Redis connection is wrapped in
+    /// `Option`. On any publish error we drop the connection and the next
+    /// tick rebuilds it. Without this, a single network event (sleep/wake,
+    /// NIC change, NAT timeout) leaves the daemon stuck publishing on a
+    /// broken pipe forever — confirmed 2026-04-28 on aura, where 7+ hours
+    /// of silent broken-pipe errors hid the heartbeat from the leader.
     pub fn spawn(self, mut shutdown: watch::Receiver<bool>) -> JoinHandle<()> {
         tokio::spawn(async move {
-            let mut conn = match self.redis.get_multiplexed_async_connection().await {
-                Ok(c) => c,
-                Err(e) => {
-                    error!("heartbeat_v2: failed to connect Redis: {e}");
-                    return;
-                }
-            };
+            // Initial connect — failure here is fatal because we never had
+            // a working connection. Operator must investigate Redis before
+            // the daemon starts at all.
+            let mut conn: Option<redis::aio::MultiplexedConnection> =
+                match self.redis.get_multiplexed_async_connection().await {
+                    Ok(c) => Some(c),
+                    Err(e) => {
+                        error!("heartbeat_v2: failed to connect Redis: {e}");
+                        return;
+                    }
+                };
 
             // Best-effort: initialize the NATS client so publishes reach
             // fleet.pulse.{name}. A failure here just means NATS is offline;
@@ -270,23 +281,77 @@ impl HeartbeatV2Publisher {
             let mut beat_count: u64 = 0;
             const INFO_LOG_EVERY_N_BEATS: u64 = 60;
 
+            // Reconnect bookkeeping. Suppresses the warn-spam loop when
+            // Redis is genuinely unreachable for an extended window.
+            let mut consecutive_reconnect_failures: u32 = 0;
+            const WARN_RECONNECT_EVERY_N: u32 = 10;
+
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(self.interval) => {
+                        // Rebuild the connection if a previous publish dropped it.
+                        if conn.is_none() {
+                            match self.redis.get_multiplexed_async_connection().await {
+                                Ok(c) => {
+                                    if consecutive_reconnect_failures > 0 {
+                                        info!(
+                                            after_failures = consecutive_reconnect_failures,
+                                            "heartbeat_v2: redis connection re-established for '{}'",
+                                            self.computer_name
+                                        );
+                                    }
+                                    conn = Some(c);
+                                    consecutive_reconnect_failures = 0;
+                                }
+                                Err(e) => {
+                                    consecutive_reconnect_failures =
+                                        consecutive_reconnect_failures.saturating_add(1);
+                                    if consecutive_reconnect_failures == 1
+                                        || consecutive_reconnect_failures
+                                            % WARN_RECONNECT_EVERY_N
+                                            == 0
+                                    {
+                                        warn!(
+                                            attempt = consecutive_reconnect_failures,
+                                            error = %e,
+                                            "heartbeat_v2: redis reconnect failed; will retry next tick"
+                                        );
+                                    }
+                                    // Skip this tick. Try again next interval.
+                                    // NATS mirror also skipped — without redis the
+                                    // beat is incomplete anyway.
+                                    continue;
+                                }
+                            }
+                        }
+
                         let beat = self.build_beat().await;
-                        if let Err(e) = publish_beat(&mut conn, &self.computer_name, &beat).await {
-                            error!("heartbeat_v2: publish failed: {e}");
+                        // Borrow the connection for the publish; on error,
+                        // drop it so the next iteration rebuilds.
+                        let publish_result = if let Some(c) = conn.as_mut() {
+                            publish_beat(c, &self.computer_name, &beat).await
                         } else {
-                            beat_count = beat_count.wrapping_add(1);
-                            debug!("heartbeat_v2 published for '{}'", self.computer_name);
-                            // Emit a heartbeat-of-life line at INFO every N beats so
-                            // operators can confirm the publisher is alive without
-                            // raising the whole crate to debug.
-                            if beat_count == 1 || beat_count % INFO_LOG_EVERY_N_BEATS == 0 {
-                                info!(
-                                    "heartbeat_v2: published beat #{} to redis+nats for '{}'",
-                                    beat_count, self.computer_name
+                            // Should never hit this branch given the reconnect
+                            // block above, but defensive — treat as transient.
+                            continue;
+                        };
+                        match publish_result {
+                            Ok(()) => {
+                                beat_count = beat_count.wrapping_add(1);
+                                debug!("heartbeat_v2 published for '{}'", self.computer_name);
+                                if beat_count == 1 || beat_count % INFO_LOG_EVERY_N_BEATS == 0 {
+                                    info!(
+                                        "heartbeat_v2: published beat #{} to redis+nats for '{}'",
+                                        beat_count, self.computer_name
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                error!(
+                                    error = %e,
+                                    "heartbeat_v2: publish failed; dropping connection for rebuild on next tick"
                                 );
+                                conn = None;
                             }
                         }
                         // Fire-and-forget NATS mirror. Best-effort — never errors the loop.
@@ -297,8 +362,12 @@ impl HeartbeatV2Publisher {
                             info!("heartbeat_v2 for '{}' emitting final LWT beat", self.computer_name);
                             let mut final_beat = self.build_beat().await;
                             final_beat.going_offline = true;
-                            if let Err(e) = publish_beat(&mut conn, &self.computer_name, &final_beat).await {
-                                warn!("heartbeat_v2: LWT publish failed: {e}");
+                            if let Some(c) = conn.as_mut() {
+                                if let Err(e) = publish_beat(c, &self.computer_name, &final_beat).await {
+                                    warn!("heartbeat_v2: LWT publish failed: {e}");
+                                }
+                            } else {
+                                warn!("heartbeat_v2: LWT skipped (no live redis connection)");
                             }
                             publish_pulse_beat(&self.computer_name, &final_beat).await;
                             break;
