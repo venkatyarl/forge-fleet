@@ -5219,3 +5219,103 @@ ALTER TABLE fleet_tasks
 CREATE INDEX IF NOT EXISTS idx_fleet_tasks_excludes
     ON fleet_tasks USING GIN (excludes_computer_ids);
 "#;
+
+// ─── V63: drop NEED_BUILD shortcut — always rebuild from origin/main ───────
+//
+// Surfaced 2026-04-29 while debugging "wave reports completed but member
+// is still on old SHA":
+//
+// V51's playbook had:
+//   NEED_BUILD=1
+//   if [ HEAD == origin/main ] && [ -x target/release/forgefleetd ]; then NEED_BUILD=0
+//   if [ NEED_BUILD = 1 ]; then git reset --hard origin/main && cargo build
+//
+// The optimization assumed "binaries on disk match HEAD". They don't if a
+// previous wave reset HEAD forward but failed mid-build (or was killed
+// mid-cargo by the self-kill race we fixed in V52). Subsequent wave finds
+// HEAD == origin/main, target/release/forgefleetd exists, NEED_BUILD=0,
+// installs the STALE binary built at the old SHA.
+//
+// Concrete: marcus's checkout HEAD was at b6e44f5e but its
+// target/release/forgefleetd was an older f9da42ce3a binary. New wave's
+// Phase-1 took 1 second (skipped build), installed the f9da42ce3a binary,
+// Phase-2 restarted the daemon. Daemon reported ff_git=f9da42ce3a even
+// though source HEAD was b6e44f5e. Fleet drift never closed.
+//
+// Fix: always `git reset --hard origin/main && cargo build --release`.
+// Cargo's incremental build is fast (~3-5s) when nothing changed; the
+// ~30-60s cold-build cost on first wave only is acceptable. Correctness
+// wins over the few seconds saved.
+//
+// Updates four playbook keys: linux-ubuntu, linux-dgx,
+// linux-ubuntu-build-only, linux-dgx-build-only. macOS playbook (V57)
+// already always rebuilds — no change there.
+pub const SCHEMA_V63_DROP_NEED_BUILD_SHORTCUT: &str = r#"
+UPDATE software_registry
+   SET upgrade_playbook = jsonb_set(
+           jsonb_set(
+               jsonb_set(
+                   jsonb_set(
+                       upgrade_playbook,
+                       '{linux-ubuntu}',
+                       to_jsonb(
+                           'export PATH="$HOME/.cargo/bin:$PATH" && '
+                        || 'export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" && '
+                        || 'mkdir -p "$(dirname $HOME/.forgefleet/sub-agent-0/forge-fleet)" && '
+                        || '{ [ -d "$HOME/.forgefleet/sub-agent-0/forge-fleet/.git" ] || git clone https://github.com/venkatyarl/forge-fleet "$HOME/.forgefleet/sub-agent-0/forge-fleet"; } && '
+                        || 'cd "$HOME/.forgefleet/sub-agent-0/forge-fleet" && '
+                        || 'git fetch origin main && '
+                        || 'git reset --hard origin/main && '
+                        || 'cargo build --release -p forge-fleet && '
+                        || 'install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && '
+                        || 'install -m 755 target/release/ff ~/.local/bin/ff && '
+                        || 'systemctl --user reset-failed forgefleetd.service forgefleet-node.service forgefleet-daemon.service 2>/dev/null; '
+                        || 'systemctl --user restart forgefleetd.service || systemctl --user restart forgefleet-node.service || systemctl --user restart forgefleet-daemon.service'
+                       )
+                   ),
+                   '{linux-dgx}',
+                   to_jsonb(
+                       'export PATH="$HOME/.cargo/bin:$PATH" && '
+                    || 'export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" && '
+                    || 'mkdir -p "$(dirname $HOME/.forgefleet/sub-agent-0/forge-fleet)" && '
+                    || '{ [ -d "$HOME/.forgefleet/sub-agent-0/forge-fleet/.git" ] || git clone https://github.com/venkatyarl/forge-fleet "$HOME/.forgefleet/sub-agent-0/forge-fleet"; } && '
+                    || 'cd "$HOME/.forgefleet/sub-agent-0/forge-fleet" && '
+                    || 'git fetch origin main && '
+                    || 'git reset --hard origin/main && '
+                    || 'cargo build --release -p forge-fleet && '
+                    || 'install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && '
+                    || 'install -m 755 target/release/ff ~/.local/bin/ff && '
+                    || 'systemctl --user reset-failed forgefleetd.service forgefleet-node.service forgefleet-daemon.service 2>/dev/null; '
+                    || 'systemctl --user restart forgefleetd.service || systemctl --user restart forgefleet-node.service || systemctl --user restart forgefleet-daemon.service'
+                   )
+               ),
+               '{linux-ubuntu-build-only}',
+               to_jsonb(
+                   'export PATH="$HOME/.cargo/bin:$PATH" && '
+                || 'export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" && '
+                || 'mkdir -p "$(dirname $HOME/.forgefleet/sub-agent-0/forge-fleet)" && '
+                || '{ [ -d "$HOME/.forgefleet/sub-agent-0/forge-fleet/.git" ] || git clone https://github.com/venkatyarl/forge-fleet "$HOME/.forgefleet/sub-agent-0/forge-fleet"; } && '
+                || 'cd "$HOME/.forgefleet/sub-agent-0/forge-fleet" && '
+                || 'git fetch origin main && '
+                || 'git reset --hard origin/main && '
+                || 'cargo build --release -p forge-fleet && '
+                || 'install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && '
+                || 'install -m 755 target/release/ff ~/.local/bin/ff'
+               )
+           ),
+           '{linux-dgx-build-only}',
+           to_jsonb(
+               'export PATH="$HOME/.cargo/bin:$PATH" && '
+            || 'export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" && '
+            || 'mkdir -p "$(dirname $HOME/.forgefleet/sub-agent-0/forge-fleet)" && '
+            || '{ [ -d "$HOME/.forgefleet/sub-agent-0/forge-fleet/.git" ] || git clone https://github.com/venkatyarl/forge-fleet "$HOME/.forgefleet/sub-agent-0/forge-fleet"; } && '
+            || 'cd "$HOME/.forgefleet/sub-agent-0/forge-fleet" && '
+            || 'git fetch origin main && '
+            || 'git reset --hard origin/main && '
+            || 'cargo build --release -p forge-fleet && '
+            || 'install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && '
+            || 'install -m 755 target/release/ff ~/.local/bin/ff'
+           )
+       )
+ WHERE id IN ('ff_git', 'forgefleetd_git');
+"#;

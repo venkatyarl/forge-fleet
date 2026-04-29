@@ -447,6 +447,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "peer_driven_upgrades",
         sql: schema::SCHEMA_V61_PEER_DRIVEN_UPGRADES,
     },
+    PgMigration {
+        version: 63,
+        name: "drop_need_build_shortcut",
+        sql: schema::SCHEMA_V63_DROP_NEED_BUILD_SHORTCUT,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.
