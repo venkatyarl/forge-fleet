@@ -610,9 +610,32 @@ impl Materializer {
         }
 
         // Software upserts (Q8, Q9).
+        //
+        // Per-row resilience: a single FK violation (software_id not in
+        // software_registry) used to propagate via `?`, aborting the entire
+        // beat — and silently zeroing every subsequent upsert. Surfaced
+        // 2026-04-29: the collector emits `ff` and `forgefleetd` rows but
+        // software_registry only had `ff_git` and `forgefleetd_git`, so the
+        // very first iteration FK'd and no software_upsert had run for ~2
+        // days. ALL fleet drift was frozen as a result.
+        //
+        // V64 adds the missing registry rows. This change makes the loop
+        // resilient even if the schemas drift again: log + skip unknown
+        // software_ids, keep processing the rest of the beat.
         for sw in &beat.installed_software {
-            self.upsert_software(computer_id, sw).await?;
-            report.software_upserts += 1;
+            match self.upsert_software(computer_id, sw).await {
+                Ok(_) => {
+                    report.software_upserts += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        computer = %beat.computer_name,
+                        software_id = %sw.id,
+                        error = %e,
+                        "materializer: skipping software upsert (continuing with rest of beat)"
+                    );
+                }
+            }
         }
 
         // Model presence upserts (Q10).

@@ -5250,6 +5250,41 @@ CREATE INDEX IF NOT EXISTS idx_fleet_tasks_excludes
 // Updates four playbook keys: linux-ubuntu, linux-dgx,
 // linux-ubuntu-build-only, linux-dgx-build-only. macOS playbook (V57)
 // already always rebuilds — no change there.
+// ─── V64: register `ff` and `forgefleetd` companion rows ───────────────────
+//
+// Surfaced 2026-04-29: the SoftwareCollector emits 14 software entries per
+// beat, including `ff` (semver/build-version) and `forgefleetd` (same).
+// software_registry only had `ff_git` and `forgefleetd_git` (the SHA-tracked
+// rows). Every beat's FIRST upsert hit
+//
+//     insert or update on table "computer_software" violates foreign key
+//     constraint "computer_software_software_id_fkey"
+//
+// for software_id='ff' — the `?` operator propagated the error, the entire
+// process_beat returned Err, and ALL subsequent software upserts in the
+// same beat (including `ff_git`, `forgefleetd_git`) were skipped. Result:
+// computer_software hadn't been touched in 2+ days. Fleet drift could not
+// close even when waves succeeded perfectly.
+//
+// V64 adds the two missing rows. They're informational-only:
+//   - `kind = 'binary'` (matches the SHA-tracked siblings)
+//   - `version_source = NULL` (no auto-detection; SoftwareCollector
+//     populates installed_version directly from `<binary> --version`)
+//   - `upgrade_playbook = NULL` (no auto-upgrade — the SHA-tracked rows
+//     `ff_git`/`forgefleetd_git` drive the actual upgrade flow)
+//   - `requires_restart`/`requires_reboot` = false
+//
+// Companion code change in the materializer makes the upsert loop
+// per-row-resilient so future schema drift is logged + skipped instead of
+// silently aborting every beat.
+pub const SCHEMA_V64_REGISTER_FF_FORGEFLEETD: &str = r#"
+INSERT INTO software_registry (id, display_name, kind, version_source, upgrade_playbook, requires_restart, requires_reboot)
+VALUES
+    ('ff',           'ForgeFleet CLI (build-version row)',     'binary', NULL, NULL, false, false),
+    ('forgefleetd',  'ForgeFleet daemon (build-version row)',  'binary', NULL, NULL, false, false)
+ON CONFLICT (id) DO NOTHING;
+"#;
+
 pub const SCHEMA_V63_DROP_NEED_BUILD_SHORTCUT: &str = r#"
 UPDATE software_registry
    SET upgrade_playbook = jsonb_set(

@@ -452,6 +452,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "drop_need_build_shortcut",
         sql: schema::SCHEMA_V63_DROP_NEED_BUILD_SHORTCUT,
     },
+    PgMigration {
+        version: 64,
+        name: "register_ff_forgefleetd",
+        sql: schema::SCHEMA_V64_REGISTER_FF_FORGEFLEETD,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.
