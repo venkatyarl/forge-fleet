@@ -1738,6 +1738,98 @@ pub async fn pg_delete_secret(pool: &PgPool, key: &str) -> Result<bool> {
     Ok(result.rows_affected() > 0)
 }
 
+/// Read a self-expiring safety gate stored in `fleet_secrets`.
+///
+/// Returns the parsed boolean from the row, with two TTL-aware exceptions:
+///   - Missing row                                  → `default_when_missing`
+///   - Row with falsy value and `expires_at < NOW()` → `restore_when_expired`
+///
+/// Permanent-off rows (no `expires_at`) are honored as-is. The TTL path
+/// converts an operator's temporary disable into "extend or auto-restore"
+/// — the kill-switch can't outlive its purpose by accident.
+///
+/// Falsy parses: `false | 0 | no | off | disabled` (case-insensitive).
+/// Anything else parses as `true`.
+///
+/// For `auto_upgrade_enabled`: pass `default_when_missing = false`
+/// (preserves pre-V58 behavior on a fleet with no row) and
+/// `restore_when_expired = true` (the safe "feature ON" default that the
+/// expired kill-switch should auto-restore to).
+pub async fn pg_read_safety_gate(
+    pool: &PgPool,
+    key: &str,
+    default_when_missing: bool,
+    restore_when_expired: bool,
+) -> Result<bool> {
+    let row = sqlx::query(
+        "SELECT value, expires_at, disabled_reason
+           FROM fleet_secrets WHERE key = $1",
+    )
+    .bind(key)
+    .fetch_optional(pool)
+    .await?;
+
+    let Some(row) = row else {
+        return Ok(default_when_missing);
+    };
+    let value: String = row.get("value");
+    let expires_at: Option<chrono::DateTime<chrono::Utc>> = row.try_get("expires_at").ok();
+
+    let parsed = matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "true" | "1" | "yes" | "on" | "enabled"
+    );
+
+    // Falsy + expired TTL → auto-restore to the safe "on" default. Log a
+    // warning so the auto-restore is visible in journalctl.
+    if !parsed {
+        if let Some(exp) = expires_at {
+            if exp < chrono::Utc::now() {
+                let reason: Option<String> = row.try_get("disabled_reason").ok();
+                tracing::warn!(
+                    key = %key,
+                    expired_at = %exp,
+                    reason = ?reason,
+                    "safety gate auto-restoring: kill-switch TTL expired"
+                );
+                return Ok(restore_when_expired);
+            }
+        }
+    }
+
+    Ok(parsed)
+}
+
+/// Set a safety gate to `false` (disabled) with a TTL and a required
+/// reason. Used by `ff secrets disable-gate` so operators can never
+/// leave a permanent off-state without explicit context.
+pub async fn pg_disable_safety_gate(
+    pool: &PgPool,
+    key: &str,
+    reason: &str,
+    expires_at: chrono::DateTime<chrono::Utc>,
+    updated_by: Option<&str>,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO fleet_secrets
+            (key, value, expires_at, disabled_reason, updated_at, updated_by)
+         VALUES ($1, 'false', $2, $3, NOW(), $4)
+         ON CONFLICT (key) DO UPDATE SET
+            value = 'false',
+            expires_at = EXCLUDED.expires_at,
+            disabled_reason = EXCLUDED.disabled_reason,
+            updated_at = NOW(),
+            updated_by = EXCLUDED.updated_by",
+    )
+    .bind(key)
+    .bind(expires_at)
+    .bind(reason)
+    .bind(updated_by)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 // ─── Model Lifecycle ───────────────────────────────────────────────────────
 
 /// Catalog entry — what we can download.

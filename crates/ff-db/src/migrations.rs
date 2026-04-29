@@ -427,6 +427,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "macos_ff_git_parity",
         sql: schema::SCHEMA_V57_MACOS_FF_GIT_PARITY,
     },
+    PgMigration {
+        version: 58,
+        name: "kill_switch_ttl",
+        sql: schema::SCHEMA_V58_KILL_SWITCH_TTL,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.

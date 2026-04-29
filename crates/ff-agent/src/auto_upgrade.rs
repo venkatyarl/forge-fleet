@@ -391,11 +391,20 @@ async fn is_leader(pool: &PgPool, my_name: &str) -> bool {
 }
 
 /// Is the auto-upgrade feature turned on via `fleet_secrets`?
+///
+/// Treated as a self-expiring safety gate (V58): if an operator flipped
+/// it off with `ff secrets disable-gate ... --hours N --reason "..."`
+/// and the TTL has expired, this returns `true` (the safe default — fleet
+/// expected posture is auto-upgrades flowing). Permanent-off rows
+/// (no `expires_at`) still suppress the tick, so existing operators
+/// who explicitly disable via `ff secrets set` are unaffected.
 async fn is_enabled(pool: &PgPool) -> bool {
-    match ff_db::pg_get_secret(pool, AUTO_UPGRADE_ENABLED_KEY).await {
-        Ok(Some(v)) => matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "on"),
-        _ => false,
-    }
+    // default_when_missing = false   (preserve pre-V58 "off if no row")
+    // restore_when_expired = true    (TTL'd disable auto-restores to ON,
+    //                                 fleet's expected posture)
+    ff_db::pg_read_safety_gate(pool, AUTO_UPGRADE_ENABLED_KEY, false, true)
+        .await
+        .unwrap_or(false)
 }
 
 /// Pick every software_id that has at least one computer with
