@@ -200,6 +200,17 @@ impl TaskRunner {
         // computer_id. The wave dispatcher sets this to `[target_id]`
         // for `*_git` build/restart tasks so the target never claims its
         // own ff upgrade — a peer always does the ssh+build+restart.
+        //
+        // V62 target quarantine: the claim ALSO refuses ANY task while
+        // this worker is itself the target of a wave-task currently
+        // running. Reuses excludes_computer_ids as the "I'm the target"
+        // marker (V61 only sets it on wave-tasks, so the semantics are
+        // tight: a row with my_id in its excludes IS targeting me).
+        // Effect: while peer C is upgrading me, my task tick stops
+        // claiming new fleet_tasks. My in-flight upgrade can complete +
+        // Phase-2 restart can fire without killing in-progress work.
+        // Deferred-tasks queue is unaffected — non-`*_git` software
+        // continues to flow through this node normally.
         let row = sqlx::query(
             r#"
             UPDATE fleet_tasks
@@ -216,6 +227,13 @@ impl TaskRunner {
                        OR t.preferred_computer_id = $1)
                   AND t.requires_capability <@ to_jsonb($2::text[])
                   AND NOT (t.excludes_computer_ids @> to_jsonb(ARRAY[$1::uuid]))
+                  AND NOT EXISTS (
+                    -- V62 target quarantine: I am being upgraded by a peer.
+                    SELECT 1 FROM fleet_tasks q
+                     WHERE q.status = 'running'
+                       AND q.summary LIKE 'fleet-upgrade-wave/%'
+                       AND q.excludes_computer_ids @> to_jsonb(ARRAY[$1::uuid])
+                  )
                   AND (
                     t.wait_for_siblings = false
                     OR t.parent_task_id IS NULL
@@ -915,12 +933,44 @@ pub async fn compose_fleet_upgrade_wave(
         .map(|s| s.to_ascii_lowercase())
         .unwrap_or_default();
 
-    // V61 dedup: if any wave-build or wave-restart task for the same
-    // (software_id, target) is already pending or running, this dispatch
-    // is a duplicate. Skip adding to wave_targets so back-to-back ticks
-    // don't pile up parallel ssh-builds against the same host (the cargo
-    // file-lock failure mode observed 2026-04-29 — 4 workers all ssh'd
-    // into ace simultaneously).
+    // V62 wave-level singleton: refuse to dispatch a new wave for this
+    // software if ANY wave-task for the same software is currently
+    // pending or running. Tightens V61's per-target dedup to per-software.
+    //
+    // Why: per-target dedup leaves the door open to cross-wave races. A
+    // worker B running Wave-N "build on D" can be Phase-2-restarted by
+    // Wave-N+1 (different parent_task_id, so wait_for_siblings doesn't
+    // see Wave-N's running task) — B's daemon dies mid-build on D and
+    // the task fails. Wave-level singleton means only one wave per
+    // software is in flight at any time, eliminating the cross-wave
+    // race entirely. Operator running back-to-back ticks gets a no-op
+    // on the second one until the first wave drains.
+    let wave_inflight: bool = sqlx::query_scalar(
+        r#"
+        SELECT EXISTS (
+            SELECT 1 FROM fleet_tasks
+             WHERE status IN ('pending', 'running')
+               AND summary LIKE $1
+        )
+        "#,
+    )
+    .bind(format!("fleet-upgrade-wave/%: {software_id} on %"))
+    .fetch_one(pg)
+    .await?;
+    if wave_inflight {
+        tracing::info!(
+            software_id = %software_id,
+            "fleet-upgrade-wave: refusing dispatch — existing wave for this software still in flight"
+        );
+        return Err(sqlx::Error::Configuration(
+            format!(
+                "wave already in flight for software_id='{software_id}' \
+                 (V62 singleton — wait for current wave to drain)"
+            )
+            .into(),
+        ));
+    }
+
     let mut wave_targets: Vec<WaveTarget> = Vec::with_capacity(plans.len());
     for plan in plans {
         if plan.computer_name.eq_ignore_ascii_case(&leader_lower) {
@@ -940,28 +990,6 @@ pub async fn compose_fleet_upgrade_wave(
             );
             continue;
         };
-
-        // V61 dedup check.
-        let already_inflight: bool = sqlx::query_scalar(
-            r#"
-            SELECT EXISTS (
-                SELECT 1 FROM fleet_tasks
-                 WHERE status IN ('pending', 'running')
-                   AND summary LIKE $1
-            )
-            "#,
-        )
-        .bind(format!("fleet-upgrade-wave/%: {software_id} on {}", plan.computer_name))
-        .fetch_one(pg)
-        .await?;
-        if already_inflight {
-            tracing::info!(
-                software_id = %software_id,
-                target = %plan.computer_name,
-                "fleet-upgrade-wave: skipping duplicate dispatch (existing wave still in flight)"
-            );
-            continue;
-        }
 
         wave_targets.push(WaveTarget {
             target_id,
