@@ -5105,3 +5105,34 @@ UPDATE software_registry
 pub const SCHEMA_V58_KILL_SWITCH_TTL: &str = r#"
 ALTER TABLE fleet_secrets ADD COLUMN IF NOT EXISTS disabled_reason TEXT;
 "#;
+
+// ─── V59: openclaw macOS upgrade playbook needs sudo ───────────────────────
+//
+// Surfaced 2026-04-28 by operator: "on taylor ff always has to do sudo
+// openclaw upgrade". On macOS, `npm install -g openclaw@latest` writes into
+// `/opt/homebrew/lib/node_modules/openclaw` which is owned by root (Homebrew
+// default ownership for global npm packages). Without sudo, npm fails with
+//
+//     EACCES: permission denied, rename
+//     '/opt/homebrew/lib/node_modules/openclaw' ->
+//     '/opt/homebrew/lib/node_modules/.openclaw-XXXX'
+//
+// Taylor recorded 14 consecutive failed openclaw auto-upgrades because of
+// this. The Linux playbook already uses `sudo`; macOS was the missing piece.
+//
+// Note: Taylor is the one fleet member without passwordless sudo (per
+// `feedback_taylor_sudo_excluded.md`). Adding `sudo` to the playbook means
+// Taylor needs either:
+//   (a) a narrow NOPASSWD sudoers entry for the npm openclaw upgrade, or
+//   (b) the operator runs the upgrade manually (existing behavior).
+// The other macOS members (Ace, James) already have passwordless sudo, so
+// auto-upgrades will succeed there immediately.
+pub const SCHEMA_V59_OPENCLAW_MACOS_SUDO: &str = r#"
+UPDATE software_registry
+   SET upgrade_playbook = jsonb_set(
+           upgrade_playbook,
+           '{macos}',
+           to_jsonb('export PATH=/opt/homebrew/bin:$PATH && sudo -n npm install -g openclaw@latest'::text)
+       )
+ WHERE id = 'openclaw';
+"#;
