@@ -1267,6 +1267,19 @@ enum SoftwareCommand {
         #[arg(long, default_value_t = false)]
         force: bool,
     },
+    /// Clear `status='upgrade_blocked'` and reset the failure counter for one row.
+    ///
+    /// After 3 consecutive auto-upgrade failures, the finalizer flips a
+    /// row to `upgrade_blocked` to stop redispatching the same broken
+    /// upgrade every hour. Once the root cause is fixed (e.g. sudoers
+    /// entry added, disk freed, broken playbook patched), use this to
+    /// hand the row back to the auto-upgrade tick.
+    Unblock {
+        /// Computer name (case-insensitive). E.g. `taylor`.
+        computer: String,
+        /// Software ID. E.g. `openclaw`, `claude-code`, `ff_git`.
+        software_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -7062,12 +7075,23 @@ async fn execute_deferred(
     }
 }
 
+/// Threshold for auto-upgrade `consecutive_failures` → `upgrade_blocked`.
+/// Hit this count and the row stops getting auto-retried until an operator
+/// clears the block manually. 3 = "transient flake retried twice, third
+/// strike means there's a real problem".
+const AUTO_UPGRADE_FAILURE_THRESHOLD: i32 = 3;
+
 /// Post-completion hook for `meta.auto_upgrade` deferred tasks.
 ///
 /// Runs whether the task succeeded or failed. Always:
-///   1. Clears `computer_software.status='upgrading'` back to either `ok`
-///      (on success) or `upgrade_available` (on failure) so the next
-///      hourly tick can retry.
+///   1a. On success: writes `installed_version=$latest_version` (authoritative —
+///       don't wait for the next beat to refresh it), resets
+///       `consecutive_failures=0`, clears `last_upgrade_error`, sets `status='ok'`.
+///   1b. On failure: bumps `consecutive_failures` and sets
+///       `last_upgrade_error=$err`. If the bumped count reaches
+///       `AUTO_UPGRADE_FAILURE_THRESHOLD`, flips `status='upgrade_blocked'`
+///       so the next tick won't redispatch; otherwise sets
+///       `status='upgrade_available'` for retry.
 ///   2. Publishes `fleet.events.software.upgrade_completed.{computer}` on NATS.
 ///   3. Fires a Telegram message via fleet_secrets (no-op if not configured).
 async fn finalize_upgrade_event(
@@ -7095,22 +7119,64 @@ async fn finalize_upgrade_event(
         .and_then(|v| v.as_str())
         .unwrap_or("-");
 
-    // 1. Clear status flag.
-    let new_status = if ok { "ok" } else { "upgrade_available" };
-    let _ = sqlx::query(
-        "UPDATE computer_software cs
-            SET status = $1,
-                last_upgraded_at = CASE WHEN $1 = 'ok' THEN NOW() ELSE last_upgraded_at END
-           FROM computers c
-          WHERE cs.computer_id = c.id
-            AND cs.software_id = $2
-            AND LOWER(c.name)  = LOWER($3)",
-    )
-    .bind(new_status)
-    .bind(software_id)
-    .bind(computer)
-    .execute(pool)
-    .await;
+    // 1. Record outcome.
+    if ok {
+        // Success path — write authoritative installed_version, reset counter.
+        // Skip the installed_version update if meta didn't carry a usable
+        // latest_version (placeholder "-" or empty); fall back to the next
+        // beat's collector-reported version.
+        let installed_version_to_write =
+            if latest_version == "-" || latest_version.is_empty() {
+                None
+            } else {
+                Some(latest_version.to_string())
+            };
+        let _ = sqlx::query(
+            "UPDATE computer_software cs
+                SET status               = 'ok',
+                    installed_version    = COALESCE($3, cs.installed_version),
+                    last_upgraded_at     = NOW(),
+                    last_checked_at      = NOW(),
+                    last_upgrade_error   = NULL,
+                    consecutive_failures = 0
+               FROM computers c
+              WHERE cs.computer_id = c.id
+                AND cs.software_id = $1
+                AND LOWER(c.name)  = LOWER($2)",
+        )
+        .bind(software_id)
+        .bind(computer)
+        .bind(installed_version_to_write)
+        .execute(pool)
+        .await;
+    } else {
+        // Failure path — bump counter, flip to upgrade_blocked at threshold.
+        // Only triggers when status is currently 'upgrading' (i.e. we're
+        // finalizing a real dispatched run, not a phantom).
+        let truncated_err = err.map(|s| s.chars().take(2000).collect::<String>());
+        let _ = sqlx::query(
+            "UPDATE computer_software cs
+                SET consecutive_failures = cs.consecutive_failures + 1,
+                    last_upgrade_error   = $3,
+                    last_checked_at      = NOW(),
+                    status = CASE
+                        WHEN cs.consecutive_failures + 1 >= $4
+                        THEN 'upgrade_blocked'
+                        ELSE 'upgrade_available'
+                    END
+               FROM computers c
+              WHERE cs.computer_id = c.id
+                AND cs.software_id = $1
+                AND LOWER(c.name)  = LOWER($2)
+                AND cs.status      = 'upgrading'",
+        )
+        .bind(software_id)
+        .bind(computer)
+        .bind(truncated_err)
+        .bind(AUTO_UPGRADE_FAILURE_THRESHOLD)
+        .execute(pool)
+        .await;
+    }
 
     // 2. NATS event — everyone subscribed to fleet.events.software.> sees it.
     let status_word = if ok { "success" } else { "failed" };
@@ -7144,8 +7210,35 @@ async fn finalize_upgrade_event(
     let body = if ok {
         format!("{old_version} → {latest_version}\nNo operator action needed.",)
     } else {
+        // Read the post-update consecutive_failures count so the message
+        // tells the operator whether more retries are coming or the row
+        // just got blocked.
+        let count: i32 = sqlx::query_scalar::<_, i32>(
+            "SELECT cs.consecutive_failures
+               FROM computer_software cs
+               JOIN computers c ON c.id = cs.computer_id
+              WHERE cs.software_id = $1
+                AND LOWER(c.name)  = LOWER($2)
+              LIMIT 1",
+        )
+        .bind(software_id)
+        .bind(computer)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(0);
+        let tail = if count >= AUTO_UPGRADE_FAILURE_THRESHOLD {
+            format!(
+                "Hit {AUTO_UPGRADE_FAILURE_THRESHOLD} consecutive failures — \
+                 status flipped to upgrade_blocked. Auto-retry stopped. \
+                 Clear with: ff software auto-upgrade-run-once after fixing the root cause."
+            )
+        } else {
+            format!("Failure {count}/{AUTO_UPGRADE_FAILURE_THRESHOLD} — will retry on next hourly tick.")
+        };
         format!(
-            "Tried to bump {old_version} → {latest_version}\nerror: {}\nWill retry on next hourly tick.",
+            "Tried to bump {old_version} → {latest_version}\nerror: {}\n{tail}",
             err.unwrap_or("(unknown)"),
         )
     };
@@ -10295,7 +10388,56 @@ async fn handle_software(cmd: SoftwareCommand) -> Result<()> {
         SoftwareCommand::AutoUpgradeRunOnce { force } => {
             handle_auto_upgrade_run_once(&pool, force).await
         }
+        SoftwareCommand::Unblock {
+            computer,
+            software_id,
+        } => handle_software_unblock(&pool, &computer, &software_id).await,
     }
+}
+
+/// Implementation of `ff software unblock <computer> <software_id>`.
+///
+/// Resets the failure counter and flips the row from `upgrade_blocked`
+/// (or any other status that's not `upgrading`) back to either `ok` or
+/// `upgrade_available` — `flip_drift_status` recalculates on the next
+/// auto-upgrade tick so the row gets the right post-clear state.
+async fn handle_software_unblock(
+    pool: &sqlx::PgPool,
+    computer: &str,
+    software_id: &str,
+) -> Result<()> {
+    let updated = sqlx::query(
+        "UPDATE computer_software cs
+            SET status               = 'ok',
+                consecutive_failures = 0,
+                last_upgrade_error   = NULL
+           FROM computers c
+          WHERE cs.computer_id = c.id
+            AND cs.software_id = $1
+            AND LOWER(c.name)  = LOWER($2)
+            AND cs.status      <> 'upgrading'",
+    )
+    .bind(software_id)
+    .bind(computer)
+    .execute(pool)
+    .await?
+    .rows_affected();
+
+    if updated == 0 {
+        println!(
+            "{YELLOW}no row matched (computer={computer}, software_id={software_id}) \
+             — or the row is currently 'upgrading' (refusing to clobber an in-flight task).{RESET}"
+        );
+    } else {
+        println!(
+            "{GREEN}✓ cleared {updated} row(s) — status='ok', consecutive_failures=0.{RESET}"
+        );
+        println!(
+            "  Next auto-upgrade tick (`ff software auto-upgrade-run-once`) will \
+             re-evaluate drift and dispatch if needed."
+        );
+    }
+    Ok(())
 }
 
 /// Implementation of `ff software auto-upgrade-run-once`.

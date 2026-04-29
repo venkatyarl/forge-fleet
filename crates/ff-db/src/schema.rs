@@ -5136,3 +5136,39 @@ UPDATE software_registry
        )
  WHERE id = 'openclaw';
 "#;
+
+// ─── V60: auto-upgrade success/failure memory ──────────────────────────────
+//
+// Twin gaps surfaced 2026-04-29 while debugging "openclaw not auto-upgrading":
+//
+// A) Deferred-task auto-upgrade finalizer set status='ok' but never wrote
+//    `installed_version`. Drift detection waited for the next beat from the
+//    target node to refresh installed_version via software_collector. If the
+//    npm install actually succeeded but the beat hadn't yet re-scanned, the
+//    next tick saw the SAME old installed_version, flipped status back to
+//    'upgrade_available', and dispatched the upgrade AGAIN. Ace ran the
+//    openclaw upgrade 17 times this way — every successful run was followed
+//    by another redundant run.
+//
+// B) On failure, finalizer flipped status='upgrade_available' so the next
+//    tick would retry. No counter, no ceiling. Taylor failed the openclaw
+//    auto-upgrade 14 times in a row (EACCES — pre-V59 playbook had no sudo)
+//    with no telemetry surfacing the run-storm. Operator only noticed when
+//    the dashboard showed "v2026.4.24 → v2026.4.26" stuck for 36 h.
+//
+// V60 adds the missing column. Pairs with finalizer changes in
+// ff-terminal::finalize_software_upgrade_event:
+//   - on success: write installed_version=latest_version, reset counter to 0
+//   - on failure: increment counter; if >= 3, flip status='upgrade_blocked'
+//     instead of 'upgrade_available'. flip_drift_status already filters
+//     status IN ('ok', 'upgrade_blocked_dirty') so 'upgrade_blocked' is
+//     naturally skipped.
+//
+// To clear an upgrade_blocked row, operator runs:
+//   UPDATE computer_software SET status='ok', consecutive_failures=0
+//    WHERE software_id='X' AND computer_id=(SELECT id FROM computers WHERE name='Y');
+// (No new ff verb yet — add when this becomes routine.)
+pub const SCHEMA_V60_AUTO_UPGRADE_MEMORY: &str = r#"
+ALTER TABLE computer_software
+    ADD COLUMN IF NOT EXISTS consecutive_failures INTEGER NOT NULL DEFAULT 0;
+"#;

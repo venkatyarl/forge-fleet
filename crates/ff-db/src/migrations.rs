@@ -437,6 +437,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "openclaw_macos_sudo",
         sql: schema::SCHEMA_V59_OPENCLAW_MACOS_SUDO,
     },
+    PgMigration {
+        version: 60,
+        name: "auto_upgrade_memory",
+        sql: schema::SCHEMA_V60_AUTO_UPGRADE_MEMORY,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.
