@@ -5280,8 +5280,10 @@ CREATE INDEX IF NOT EXISTS idx_fleet_tasks_excludes
 pub const SCHEMA_V64_REGISTER_FF_FORGEFLEETD: &str = r#"
 INSERT INTO software_registry (id, display_name, kind, version_source, upgrade_playbook, requires_restart, requires_reboot)
 VALUES
-    ('ff',           'ForgeFleet CLI (build-version row)',     'binary', NULL, NULL, false, false),
-    ('forgefleetd',  'ForgeFleet daemon (build-version row)',  'binary', NULL, NULL, false, false)
+    ('ff',           'ForgeFleet CLI (build-version row)',     'binary',
+     '{"method":"informational"}'::jsonb, '{}'::jsonb, false, false),
+    ('forgefleetd',  'ForgeFleet daemon (build-version row)',  'binary',
+     '{"method":"informational"}'::jsonb, '{}'::jsonb, false, false)
 ON CONFLICT (id) DO NOTHING;
 "#;
 
