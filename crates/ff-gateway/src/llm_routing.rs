@@ -645,6 +645,17 @@ impl LlmRoutingCache {
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             // First tick fires immediately; absorb it since we just ran.
             ticker.tick().await;
+            // Rate-limit the poke-driven path: a runaway publisher (observed
+            // 2026-04-29 — 550 invalidations/sec on the leader's redis,
+            // 34M log lines accumulated, task_runner CPU-starved) must not
+            // be able to flood the warmer. Each warmer_tick re-reads the
+            // whole fleet; a 2-second floor between pokes loses zero info
+            // (every tick after the first sees the same authoritative state)
+            // and trims runaway loads to ≤ 30/min.
+            const POKE_RATE_LIMIT: Duration = Duration::from_secs(2);
+            let mut last_poke_tick = std::time::Instant::now()
+                .checked_sub(POKE_RATE_LIMIT)
+                .unwrap_or_else(std::time::Instant::now);
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {
@@ -653,7 +664,19 @@ impl LlmRoutingCache {
                         }
                     }
                     _ = poke_rx.recv() => {
-                        tracing::info!(
+                        let elapsed = last_poke_tick.elapsed();
+                        if elapsed < POKE_RATE_LIMIT {
+                            // Drop — the periodic ticker will catch this within WARMER_INTERVAL.
+                            tracing::trace!(
+                                elapsed_ms = elapsed.as_millis() as u64,
+                                "llm routing cache: poke rate-limited (within 2s of last)"
+                            );
+                            continue;
+                        }
+                        last_poke_tick = std::time::Instant::now();
+                        // Demoted from info to debug — the immediate-tick log
+                        // line was producing 550/sec spam under storm conditions.
+                        tracing::debug!(
                             "llm routing cache: immediate tick triggered by routing:invalidate"
                         );
                         if let Err(e) = warmer_tick(&router, &cache).await {
