@@ -574,6 +574,25 @@ impl Materializer {
                     .bind(computer_id)
                     .execute(&self.pg)
                     .await?;
+
+                    // Wake the deferred-task scheduler: any task with
+                    // trigger=node_online targeting this computer is
+                    // queued waiting on this exact event. Without this
+                    // publish, those tasks sit forever even though the
+                    // node has been online for hours — only `version_check_pass`
+                    // (every 6h, drift-only) was firing the event before.
+                    // Publish channel name is mirrored from
+                    // `ff_agent::fleet_events::CHANNEL_NODE_ONLINE`; we
+                    // can't import that without a circular crate dep.
+                    use redis::AsyncCommands;
+                    let _: Result<(), _> = redis_conn
+                        .publish::<_, _, ()>("fleet:node_online", &beat.computer_name)
+                        .await;
+                    tracing::info!(
+                        computer = %beat.computer_name,
+                        prev_status = %prev_status,
+                        "materializer: published fleet:node_online for sdown→online transition"
+                    );
                 }
             }
         }
