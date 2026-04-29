@@ -397,8 +397,8 @@ impl Materializer {
 
         // Q1: look up computer row
         let row = sqlx::query(
-            "SELECT id, status, all_ips::text AS all_ips_text, cpu_cores, total_ram_gb, \
-             total_disk_gb, gpu_kind, gpu_count, gpu_total_vram_gb \
+            "SELECT id, status, primary_ip, all_ips::text AS all_ips_text, cpu_cores, \
+             total_ram_gb, total_disk_gb, gpu_kind, gpu_count, gpu_total_vram_gb \
              FROM computers WHERE name = $1",
         )
         .bind(&beat.computer_name)
@@ -410,6 +410,7 @@ impl Materializer {
 
         let computer_id: Uuid = row.try_get("id")?;
         let prev_status: String = row.try_get("status")?;
+        let prev_primary_ip: Option<String> = row.try_get("primary_ip").ok();
         let prev_all_ips_text: Option<String> = row.try_get("all_ips_text").ok();
         let prev_cpu_cores: Option<i32> = row.try_get("cpu_cores").ok();
         let prev_ram_gb: Option<i32> = row.try_get("total_ram_gb").ok();
@@ -491,11 +492,21 @@ impl Materializer {
             || prev_gpu_count != Some(beat.capabilities.gpu_count)
             || prev_gpu_total_vram_gb != beat.capabilities.gpu_total_vram_gb;
 
+        // primary_ip comparison. Without this the column would be frozen to
+        // whichever interface the node had at first enrollment — surfaced
+        // 2026-04-28 on aura, where DB primary_ip was a dead wifi address
+        // (192.168.5.109) long after the laptop switched to ethernet
+        // (192.168.5.110). `ff fleet versions --live` (and any other
+        // primary_ip-using ssh path) was effectively unreachable.
+        let primary_ip_differ =
+            prev_primary_ip.as_deref() != Some(beat.network.primary_ip.as_str());
+
         // Q4: UPDATE_COMPUTER_PERSISTENT_FIELDS
-        if ips_differ || hw_differ || cap_differ {
+        if ips_differ || hw_differ || cap_differ || primary_ip_differ {
             sqlx::query(
                 "UPDATE computers SET \
                     last_seen_at = NOW(), \
+                    primary_ip = $9, \
                     all_ips = $2::jsonb, \
                     cpu_cores = $3, \
                     total_ram_gb = $4, \
@@ -514,6 +525,7 @@ impl Materializer {
             .bind(&beat.capabilities.gpu_kind)
             .bind(beat.capabilities.gpu_count)
             .bind(beat.capabilities.gpu_total_vram_gb)
+            .bind(&beat.network.primary_ip)
             .execute(&self.pg)
             .await?;
             report.wrote_computer_row = true;
