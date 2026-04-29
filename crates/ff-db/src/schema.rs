@@ -5172,3 +5172,50 @@ pub const SCHEMA_V60_AUTO_UPGRADE_MEMORY: &str = r#"
 ALTER TABLE computer_software
     ADD COLUMN IF NOT EXISTS consecutive_failures INTEGER NOT NULL DEFAULT 0;
 "#;
+
+// ─── V61: peer-driven daemon-self upgrades + worker exclusion ──────────────
+//
+// Surfaced 2026-04-29 by operator: "we don't want a ff to fix itself on a
+// computer ... another computer can help you for ff ... if one of the
+// computers dies what do we do? we might add a third computer to monitor."
+//
+// Three coordinated mechanisms:
+//
+// (1) WORKER EXCLUSION
+//     `fleet_tasks.excludes_computer_ids JSONB DEFAULT '[]'`. The claim
+//     query in task_runner::tick_once refuses to claim a task whose
+//     excludes list contains the claiming worker's computer_id. The wave
+//     dispatcher sets this to `[target_id]` for `*_git` build/restart
+//     tasks. Result: target NEVER claims its own ff upgrade — a peer
+//     always does the ssh+build+restart. Closes the priya→priya self-ssh
+//     failure mode and the conceptual self-suicide hazard.
+//
+//     Non-`*_git` software (openclaw, gh, claude-code, codex, ...) keeps
+//     using the deferred_tasks queue with `preferred_computer_id =
+//     target_id`. The target IS the worker for those — runs the playbook
+//     locally, no ssh, no exclusion needed. That path was always correct.
+//
+// (2) WAVE DEDUP (enforced application-side in compose_fleet_upgrade_wave)
+//     Today, two ticks back-to-back create two parallel "build
+//     forgefleetd_git on ace" tasks; two workers ssh into ace; cargo
+//     locks fight. The dispatcher now skips creating a duplicate when
+//     `(software_id, target, phase)` is already pending or running.
+//
+// (3) DISTRIBUTED WATCHDOG (code change in task_runner::tick_once)
+//     `handoff_stuck_tasks` moves from leader-only (BundledScheduler) to
+//     every worker's tick. `FOR UPDATE SKIP LOCKED` in the demote path
+//     ensures only one worker wins the race per stuck task. Result: if
+//     worker A dies mid-task, the next tick from any peer demotes the row
+//     back to pending; another peer re-claims and owns to completion.
+//     The "third computer to monitor" emerges naturally — it's whichever
+//     peer's tick fires first.
+//
+// V61 only carries the column. The other two pieces are pure code (no
+// schema needed).
+pub const SCHEMA_V61_PEER_DRIVEN_UPGRADES: &str = r#"
+ALTER TABLE fleet_tasks
+    ADD COLUMN IF NOT EXISTS excludes_computer_ids JSONB NOT NULL DEFAULT '[]'::jsonb;
+
+CREATE INDEX IF NOT EXISTS idx_fleet_tasks_excludes
+    ON fleet_tasks USING GIN (excludes_computer_ids);
+"#;

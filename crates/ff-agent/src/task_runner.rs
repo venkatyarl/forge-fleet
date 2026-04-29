@@ -174,6 +174,16 @@ impl TaskRunner {
 
     /// One worker tick — claim at most one ready task and run it.
     pub async fn tick_once(&self) -> Result<Option<uuid::Uuid>, TaskRunnerError> {
+        // 0. Distributed watchdog (V61): every tick on every worker scans
+        // for stale-heartbeat tasks and demotes them back to `pending`.
+        // FOR UPDATE SKIP LOCKED in handoff_stuck_tasks ensures only one
+        // peer wins per stuck task. Replaces the leader-only watchdog
+        // formerly run from BundledScheduler — closes the SPOF where the
+        // leader was both the sole supervisor AND a possible victim.
+        if let Err(e) = handoff_stuck_tasks(&self.pg).await {
+            debug!(error = %e, "distributed watchdog: handoff sweep failed");
+        }
+
         // 1. Atomically claim a task whose capabilities we satisfy.
         let cap_array: Vec<String> = self.my_capabilities.iter().cloned().collect();
         // Two-phase / barrier note: tasks with `wait_for_siblings = true`
@@ -184,6 +194,12 @@ impl TaskRunner {
         // parent without scheduling state — Phase-2 rows literally can't
         // be claimed until Phase-1 drains. Closes the self-kill race
         // documented in feedback_wave_dispatcher_self_kill_race.md.
+        //
+        // V61 worker-exclusion: the claim refuses tasks whose
+        // `excludes_computer_ids` array contains this worker's
+        // computer_id. The wave dispatcher sets this to `[target_id]`
+        // for `*_git` build/restart tasks so the target never claims its
+        // own ff upgrade — a peer always does the ssh+build+restart.
         let row = sqlx::query(
             r#"
             UPDATE fleet_tasks
@@ -199,6 +215,7 @@ impl TaskRunner {
                   AND (t.preferred_computer_id IS NULL
                        OR t.preferred_computer_id = $1)
                   AND t.requires_capability <@ to_jsonb($2::text[])
+                  AND NOT (t.excludes_computer_ids @> to_jsonb(ARRAY[$1::uuid]))
                   AND (
                     t.wait_for_siblings = false
                     OR t.parent_task_id IS NULL
@@ -428,12 +445,16 @@ pub async fn pg_cancel_task(
     Ok(prev_status)
 }
 
-/// Convenience: spawn the leader watchdog as a background tick.
+/// Spawn the distributed handoff watchdog as a background tick.
 ///
-/// `my_name` is compared (case-insensitive) against
-/// `fleet_leader_state.member_name`; only the elected leader actually
-/// performs handoffs. Every daemon spawns this; the gate keeps it idle
-/// on followers.
+/// V61: every daemon runs this — no leader gate. `handoff_stuck_tasks`
+/// uses `FOR UPDATE SKIP LOCKED`, so concurrent watchdogs across peers
+/// race safely and only one wins per stuck task. Closes the SPOF where
+/// the leader was both the sole watchdog AND a possible victim:
+/// previously, if the leader died mid-task, the watchdog died with it
+/// and stuck rows sat indefinitely until election + recovery.
+///
+/// `my_name` is kept for log context only.
 pub fn spawn_leader_watchdog(
     pg: PgPool,
     my_name: String,
@@ -443,20 +464,16 @@ pub fn spawn_leader_watchdog(
         // 60s tick — half the stuck threshold so detection latency stays bounded.
         let interval = Duration::from_secs(60);
         loop {
-            let leader: Option<String> =
-                sqlx::query_scalar("SELECT member_name FROM fleet_leader_state LIMIT 1")
-                    .fetch_optional(&pg)
-                    .await
-                    .ok()
-                    .flatten();
-            if matches!(leader, Some(ref l) if l.eq_ignore_ascii_case(&my_name)) {
-                match handoff_stuck_tasks(&pg).await {
-                    Ok(n) if n > 0 => {
-                        info!(handed_off = n, "task watchdog re-queued stale tasks");
-                    }
-                    Ok(_) => {}
-                    Err(e) => warn!(error = %e, "task watchdog query failed"),
+            match handoff_stuck_tasks(&pg).await {
+                Ok(n) if n > 0 => {
+                    info!(
+                        handed_off = n,
+                        watchdog_node = %my_name,
+                        "distributed task watchdog re-queued stale tasks"
+                    );
                 }
+                Ok(_) => {}
+                Err(e) => warn!(error = %e, "task watchdog query failed"),
             }
             tokio::select! {
                 _ = tokio::time::sleep(interval) => {}
@@ -513,6 +530,38 @@ pub async fn pg_enqueue_shell_task_ext(
     created_by_computer_id: Option<uuid::Uuid>,
     wait_for_siblings: bool,
 ) -> Result<uuid::Uuid, sqlx::Error> {
+    pg_enqueue_shell_task_with_options(
+        pg,
+        summary,
+        command,
+        capabilities,
+        preferred_computer,
+        parent_task_id,
+        priority,
+        created_by_computer_id,
+        wait_for_siblings,
+        &[],
+    )
+    .await
+}
+
+/// Most general enqueue: also accepts `excludes_computer_ids` (V61) so
+/// a task can refuse to be claimed by named workers. Used by the wave
+/// dispatcher to keep `*_git` upgrades peer-driven (target excluded
+/// from claiming its own ff upgrade).
+#[allow(clippy::too_many_arguments)]
+pub async fn pg_enqueue_shell_task_with_options(
+    pg: &PgPool,
+    summary: &str,
+    command: &str,
+    capabilities: &[String],
+    preferred_computer: Option<&str>,
+    parent_task_id: Option<uuid::Uuid>,
+    priority: i32,
+    created_by_computer_id: Option<uuid::Uuid>,
+    wait_for_siblings: bool,
+    excludes_computer_ids: &[uuid::Uuid],
+) -> Result<uuid::Uuid, sqlx::Error> {
     let preferred_id: Option<uuid::Uuid> = if let Some(name) = preferred_computer {
         sqlx::query_scalar("SELECT id FROM computers WHERE name = $1")
             .bind(name)
@@ -529,15 +578,22 @@ pub async fn pg_enqueue_shell_task_ext(
             .map(|c| Value::String(c.clone()))
             .collect(),
     );
+    let excludes_json = serde_json::Value::Array(
+        excludes_computer_ids
+            .iter()
+            .map(|id| Value::String(id.to_string()))
+            .collect(),
+    );
 
     let id: uuid::Uuid = sqlx::query_scalar(
         r#"
         INSERT INTO fleet_tasks (
             parent_task_id, task_type, summary, payload,
             priority, requires_capability, preferred_computer_id,
-            created_by_computer_id, wait_for_siblings
+            created_by_computer_id, wait_for_siblings,
+            excludes_computer_ids
         )
-        VALUES ($1, 'shell', $2, $3, $4, $5, $6, $7, $8)
+        VALUES ($1, 'shell', $2, $3, $4, $5, $6, $7, $8, $9)
         RETURNING id
         "#,
     )
@@ -549,6 +605,7 @@ pub async fn pg_enqueue_shell_task_ext(
     .bind(preferred_id)
     .bind(created_by_computer_id)
     .bind(wait_for_siblings)
+    .bind(&excludes_json)
     .fetch_one(pg)
     .await?;
 
@@ -858,26 +915,56 @@ pub async fn compose_fleet_upgrade_wave(
         .map(|s| s.to_ascii_lowercase())
         .unwrap_or_default();
 
+    // V61 dedup: if any wave-build or wave-restart task for the same
+    // (software_id, target) is already pending or running, this dispatch
+    // is a duplicate. Skip adding to wave_targets so back-to-back ticks
+    // don't pile up parallel ssh-builds against the same host (the cargo
+    // file-lock failure mode observed 2026-04-29 — 4 workers all ssh'd
+    // into ace simultaneously).
     let mut wave_targets: Vec<WaveTarget> = Vec::with_capacity(plans.len());
     for plan in plans {
         if plan.computer_name.eq_ignore_ascii_case(&leader_lower) {
             continue;
         }
-        let row: Option<(String, String, i32, String)> = sqlx::query_as(
-            "SELECT ssh_user, primary_ip, ssh_port, COALESCE(os_family, 'unknown') \
+        let row: Option<(uuid::Uuid, String, String, i32, String)> = sqlx::query_as(
+            "SELECT id, ssh_user, primary_ip, ssh_port, COALESCE(os_family, 'unknown') \
                FROM computers WHERE name = $1",
         )
         .bind(&plan.computer_name)
         .fetch_optional(pg)
         .await?;
-        let Some((ssh_user, primary_ip, ssh_port, os_family)) = row else {
+        let Some((target_id, ssh_user, primary_ip, ssh_port, os_family)) = row else {
             tracing::warn!(
                 computer = %plan.computer_name,
                 "fleet-upgrade-wave: no computers row, skipping"
             );
             continue;
         };
+
+        // V61 dedup check.
+        let already_inflight: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS (
+                SELECT 1 FROM fleet_tasks
+                 WHERE status IN ('pending', 'running')
+                   AND summary LIKE $1
+            )
+            "#,
+        )
+        .bind(format!("fleet-upgrade-wave/%: {software_id} on {}", plan.computer_name))
+        .fetch_one(pg)
+        .await?;
+        if already_inflight {
+            tracing::info!(
+                software_id = %software_id,
+                target = %plan.computer_name,
+                "fleet-upgrade-wave: skipping duplicate dispatch (existing wave still in flight)"
+            );
+            continue;
+        }
+
         wave_targets.push(WaveTarget {
+            target_id,
             target_name: plan.computer_name.clone(),
             ssh_user,
             primary_ip,
@@ -952,7 +1039,11 @@ pub async fn compose_fleet_upgrade_wave(
                 playbook = t.playbook_command,
             );
 
-            pg_enqueue_shell_task(
+            // V61 worker-exclusion: target NEVER claims its own ff
+            // upgrade. A peer always does the ssh+build. The exclusion
+            // also closes the priya→priya self-ssh failure mode (worker
+            // and target both being priya hits a stale known_hosts line).
+            pg_enqueue_shell_task_with_options(
                 pg,
                 &format!(
                     "fleet-upgrade-wave/wave{wave_idx}/build: {software_id} on {}",
@@ -964,6 +1055,8 @@ pub async fn compose_fleet_upgrade_wave(
                 Some(parent),
                 priority,
                 Some(leader_computer_id),
+                false,
+                &[t.target_id],
             )
             .await?;
         }
@@ -1033,7 +1126,11 @@ pub async fn compose_fleet_upgrade_wave(
             inner = inner_restart.replace('\'', "'\\''"),
         );
 
-        pg_enqueue_shell_task_ext(
+        // V61: target excluded from claiming its own restart. Phase-2
+        // already requires capability=[leader], so today only the
+        // leader claims; if a peer ever earns the leader cap (failover),
+        // the exclusion still keeps the target itself out of the pool.
+        pg_enqueue_shell_task_with_options(
             pg,
             &format!(
                 "fleet-upgrade-wave/restart: {software_id} on {}",
@@ -1046,6 +1143,7 @@ pub async fn compose_fleet_upgrade_wave(
             restart_priority,
             Some(leader_computer_id),
             true, // wait_for_siblings — Phase-2 barrier
+            &[t.target_id],
         )
         .await?;
     }
@@ -1055,6 +1153,7 @@ pub async fn compose_fleet_upgrade_wave(
 
 /// One row in [`compose_fleet_upgrade_wave`]'s working set.
 struct WaveTarget {
+    target_id: uuid::Uuid,
     target_name: String,
     ssh_user: String,
     primary_ip: String,
