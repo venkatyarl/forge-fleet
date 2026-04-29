@@ -432,6 +432,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "kill_switch_ttl",
         sql: schema::SCHEMA_V58_KILL_SWITCH_TTL,
     },
+    PgMigration {
+        version: 59,
+        name: "openclaw_macos_sudo",
+        sql: schema::SCHEMA_V59_OPENCLAW_MACOS_SUDO,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.
