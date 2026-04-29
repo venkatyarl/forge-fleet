@@ -1970,6 +1970,29 @@ enum SecretsCommand {
     },
     /// List secrets whose `expires_at` is within `rotate_before_days`.
     Expirations,
+    /// Disable a safety-gate fleet_secret with a required TTL and reason.
+    /// The kill-switch auto-restores after `--hours` so a forgotten flip
+    /// can't silently outlive its purpose (V58 behavior). Use this instead
+    /// of `ff secrets set <key> false` for any *_enabled gate.
+    ///
+    /// Example:
+    ///   ff secrets disable-gate auto_upgrade_enabled \
+    ///       --hours 6 \
+    ///       --reason "wave dispatcher self-kill debug"
+    DisableGate {
+        /// Secret key (typically a `*_enabled` boolean gate).
+        key: String,
+        /// How long the disable should last. After this many hours, gate-
+        /// check helpers (`pg_read_safety_gate`) auto-restore to the
+        /// safe default.
+        #[arg(long)]
+        hours: u32,
+        /// Required free-form reason. Lands in fleet_secrets.disabled_reason
+        /// + audit log so a future operator can see why the switch was
+        /// flipped.
+        #[arg(long)]
+        reason: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -5224,6 +5247,26 @@ async fn handle_secrets(cmd: SecretsCommand) -> Result<()> {
                 report.alerts_dispatched,
                 report.near_expiry.len(),
                 report.already_expired.len(),
+            );
+        }
+        SecretsCommand::DisableGate { key, hours, reason } => {
+            if reason.trim().is_empty() {
+                anyhow::bail!(
+                    "--reason cannot be empty (the whole point of this verb is non-anonymous disables)"
+                );
+            }
+            if hours == 0 {
+                anyhow::bail!("--hours must be > 0 (zero would auto-restore immediately)");
+            }
+            let expires_at = chrono::Utc::now() + chrono::Duration::hours(hours as i64);
+            let me = whoami_tag();
+            ff_db::pg_disable_safety_gate(&pool, &key, &reason, expires_at, Some(&me)).await?;
+            println!(
+                "{YELLOW}!{RESET} {key} disabled until {} ({hours}h)\n  reason: {reason}\n  by:     {me}",
+                expires_at.format("%Y-%m-%d %H:%M UTC"),
+            );
+            println!(
+                "  After expiry, gate-check helpers (e.g. auto_upgrade_tick) auto-restore to the safe default.\n  To extend, re-run this verb with new --hours."
             );
         }
     }

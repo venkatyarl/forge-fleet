@@ -5083,3 +5083,25 @@ UPDATE software_registry
        )
  WHERE id = 'ff_git';
 "#;
+
+// ─── V58: self-expiring safety-gate fleet_secrets ──────────────────────────
+//
+// Surfaced 2026-04-28: `auto_upgrade_enabled` was flipped to `false` during
+// the auto-upgrade overhaul (PRs #8-#18, 2026-04-27) for safety while the
+// wave dispatcher was under active debugging. Nobody flipped it back. The
+// fleet silently skipped 36 h of upgrades — openclaw drifted from
+// 2026.4.23 → 2026.4.26 with no auto-dispatch, and the npm `latest_version`
+// refresh stayed stale because `refresh_npm_registry_latest_versions` is
+// itself gated by the same kill-switch.
+//
+// Root cause: a boolean kill-switch with no TTL and no required reason.
+// Operator must remember to flip it back. Operator forgot.
+//
+// V58 adds the missing column. `expires_at` already existed (for rotation
+// semantics) — overload it as the kill-switch TTL too. After expiry, the
+// gate-check helper treats the row as if it didn't exist (default ON).
+// `disabled_reason` is required by the new `ff secrets disable-gate` verb;
+// the existing `ff secrets set` path is untouched (no breaking change).
+pub const SCHEMA_V58_KILL_SWITCH_TTL: &str = r#"
+ALTER TABLE fleet_secrets ADD COLUMN IF NOT EXISTS disabled_reason TEXT;
+"#;
