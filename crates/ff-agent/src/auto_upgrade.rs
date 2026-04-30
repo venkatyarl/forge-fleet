@@ -391,6 +391,37 @@ fn is_daemon_self_software(software_id: &str) -> bool {
     matches!(software_id, "ff_git" | "forgefleetd_git" | "forgefleet")
 }
 
+/// V67 install bootstrap: for every `software_registry.auto_install=true`
+/// row, insert a `computer_software` row (status='upgrade_available')
+/// for any computer that doesn't already have one. Idempotent — re-runs
+/// are no-ops once every member has its row. Closes the
+/// new-software-never-installs gap caused by the materializer-only-from-
+/// beats path.
+async fn seed_auto_install_rows(pool: &PgPool) -> Result<u64> {
+    let res = sqlx::query(
+        r#"
+        INSERT INTO computer_software (computer_id, software_id, status)
+        SELECT c.id, sr.id, 'upgrade_available'
+          FROM computers c
+         CROSS JOIN software_registry sr
+         WHERE sr.auto_install = true
+           AND NOT EXISTS (
+                SELECT 1 FROM computer_software cs
+                 WHERE cs.computer_id = c.id
+                   AND cs.software_id = sr.id
+           )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .context("seed_auto_install_rows")?;
+    let n = res.rows_affected();
+    if n > 0 {
+        tracing::info!(rows = n, "auto-upgrade: seeded auto_install rows");
+    }
+    Ok(n)
+}
+
 /// Map a fleet `os_family` (e.g. `linux-ubuntu`, `linux-dgx`,
 /// `macos-26`) to a base family (`linux`, `macos`, `windows`) so the
 /// playbook resolver can fall back when a software entry only ships
@@ -502,6 +533,14 @@ impl AutoUpgradeTick {
         // Git-head: tools we install by git-clone that don't ship versioned
         // releases yet (open-design, etc.). Returns 10-char SHA of named ref.
         let _ = refresh_git_head_latest_versions(&self.pool).await;
+        // V67 install bootstrap: for `software_registry.auto_install = true`
+        // rows, seed a `computer_software` row (status='upgrade_available')
+        // for every member that doesn't already have one. Without this,
+        // newly-registered software with no installed members would never
+        // dispatch — flip_drift_status only operates on existing rows,
+        // and the materializer only creates rows when a beat reports the
+        // software detected. Closes the install-bootstrap loop.
+        let _ = seed_auto_install_rows(&self.pool).await;
         // Then: flip computer_software.status = 'upgrade_available' for any row
         // where installed_version != latest_version and status is currently 'ok'.
         // Generic across all methods.

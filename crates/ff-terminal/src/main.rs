@@ -2249,6 +2249,11 @@ async fn main() -> Result<()> {
                 // Oneshot: no tool-use loop, larger response budget.
                 cfg.max_tokens = 8192;
             }
+            // V67 agent hints: inject a "tools available on this machine"
+            // section into the system prompt so the agent self-routes to
+            // pre-installed software (open-design, etc.) without ff
+            // needing a per-tool verb.
+            cfg.system_prompt = inject_agent_hints(cfg.system_prompt.clone()).await;
             run_headless(&prompt, cfg, &output, oneshot).await
         }
         Some(Command::Task { command }) => handle_task(command, &config_path).await,
@@ -2963,6 +2968,11 @@ async fn main() -> Result<()> {
                 );
             }
             eprintln!();
+
+            // V67 agent hints: prepend "tools available" section so the
+            // agent decides whether the prompt needs open-design, etc.
+            agent_config.system_prompt =
+                inject_agent_hints(agent_config.system_prompt.clone()).await;
 
             let result = ff_agent::supervisor::supervise(&prompt, agent_config, sup_config).await;
 
@@ -4163,6 +4173,24 @@ fn should_show_result_preview(tool_name: &str) -> bool {
             | "TaskGet"
             | "SendMessage"
     )
+}
+
+/// V67 helper: load `software_registry.agent_hint` for software currently
+/// installed (`status='ok'`) on this machine and prepend the merged block
+/// to the agent's system prompt. Best-effort — DB unreachable or the
+/// `agent_hint` column missing (pre-V67 deployment) returns the prompt
+/// unchanged.
+async fn inject_agent_hints(existing: Option<String>) -> Option<String> {
+    let pool = match ff_agent::pg::pool().await {
+        Ok(p) => p,
+        Err(_) => return existing,
+    };
+    let computer = ff_agent::fleet_info::resolve_this_node_name().await;
+    let hints = match ff_agent::agent_hint::load_for_host(&pool, &computer).await {
+        Ok(h) => h,
+        Err(_) => return existing,
+    };
+    ff_agent::agent_hint::prepend_to_system_prompt(&hints, existing)
 }
 
 async fn run_headless(

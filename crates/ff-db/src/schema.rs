@@ -5600,3 +5600,54 @@ UPDATE software_registry SET detection = '{
     "method":"os_release","expected_id":"windows"
 }'::jsonb WHERE id='os-windows' AND detection IS NULL;
 "#;
+
+// ─── V67: auto_install + agent_hint columns on software_registry ───────────
+//
+// Two coupled additions:
+//
+// (A) `auto_install BOOLEAN` — when TRUE, the auto-upgrade tick seeds a
+//     `computer_software` row (status='upgrade_available') for every
+//     `computers.id` that doesn't already have one, then dispatches the
+//     install. Closes the install-bootstrap loop discovered 2026-04-30
+//     while rolling out open-design: the dispatcher only operates on
+//     existing computer_software rows, but those rows are only created
+//     by the materializer when a beat reports the software installed.
+//     Without a way to bootstrap, software_registry entries with no
+//     installed members never get installed anywhere.
+//
+// (B) `agent_hint TEXT` — a free-form natural-language hint the
+//     `ff supervise` / `ff run` dispatcher injects into the agent's
+//     system prompt when the target host has this software installed
+//     (status='ok'). The agent reads the hints and decides on its own
+//     whether the user's prompt warrants invoking the tool. Operator's
+//     directive 2026-04-30: "I dont want to add more commands... I
+//     want ff to decide when to use it."
+//
+//     For open-design, the hint tells the agent: this machine has a
+//     pre-installed Next.js + Node design platform at
+//     `~/.forgefleet/sub-agent-0/open-design`; for design-shaped
+//     prompts (decks, prototypes, dashboards, landing pages, magazine
+//     layouts), spin up the OD daemon via `pnpm --dir <path> tools-dev
+//     run web` and drive its API. The agent doesn't need a custom ff
+//     verb — the hint is enough context for it to route itself.
+//
+// Both columns default to neutral values (auto_install=false,
+// agent_hint=NULL) so existing rows are unaffected. open-design opts
+// in by setting both.
+pub const SCHEMA_V67_AUTO_INSTALL_AGENT_HINT: &str = r#"
+ALTER TABLE software_registry
+    ADD COLUMN IF NOT EXISTS auto_install BOOLEAN NOT NULL DEFAULT false;
+
+ALTER TABLE software_registry
+    ADD COLUMN IF NOT EXISTS agent_hint TEXT;
+
+UPDATE software_registry
+   SET auto_install = true,
+       agent_hint   = 'A pre-installed open-source design platform (open-design, nexu-io/open-design) is available at $HOME/.forgefleet/sub-agent-0/open-design on this machine. ' ||
+                      'It turns natural-language briefs into editable design artifacts (HTML prototypes, decks, dashboards, landing pages, magazine layouts) by spawning the host''s coding-agent CLI. ' ||
+                      'When the user''s request looks like a design task (deck, slides, prototype, mock, landing page, dashboard, magazine layout, brand assets, design system), bring it up with: ' ||
+                      'pnpm --dir $HOME/.forgefleet/sub-agent-0/open-design tools-dev run web ' ||
+                      '(the daemon listens on localhost:7456; the web UI on localhost:3000). ' ||
+                      'For non-design tasks, ignore this hint.'
+ WHERE id = 'open_design_git';
+"#;
