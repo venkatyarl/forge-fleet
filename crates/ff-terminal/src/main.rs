@@ -4175,22 +4175,45 @@ fn should_show_result_preview(tool_name: &str) -> bool {
     )
 }
 
-/// V67 helper: load `software_registry.agent_hint` for software currently
-/// installed (`status='ok'`) on this machine and prepend the merged block
-/// to the agent's system prompt. Best-effort — DB unreachable or the
-/// `agent_hint` column missing (pre-V67 deployment) returns the prompt
-/// unchanged.
+/// V67/V68 helper: prepend two auto-discovered blocks to the agent's
+/// system prompt before dispatch.
+///
+/// 1) **Skill catalog** (V68) — walks `<cwd>/.claude/skills/`,
+///    `<cwd>/skills/`, `~/.claude/skills/`, and the fleet-installed
+///    `~/.forgefleet/sub-agent-0/open-design/skills/`. Each `SKILL.md`'s
+///    YAML frontmatter (name, description, triggers) is summarized into a
+///    catalog the agent reads at decision time. The agent picks a skill
+///    based on prompt match and uses the Read tool to load the full
+///    SKILL.md before following its instructions. Mirrors how Claude
+///    Code dynamically loads skills mid-conversation.
+///
+/// 2) **Agent hints** (V67) — pulls `software_registry.agent_hint` strings
+///    for software at `status='ok'` on this host. DB-backed.
+///
+/// Both are best-effort. DB unreachable / no skills found / no hints
+/// configured all return the prompt unchanged.
 async fn inject_agent_hints(existing: Option<String>) -> Option<String> {
-    let pool = match ff_agent::pg::pool().await {
-        Ok(p) => p,
-        Err(_) => return existing,
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+    let skills_block = ff_agent::skill_catalog::catalog_for(&cwd);
+
+    // Try to load DB-backed agent hints; ignore failures.
+    let hints_block = match ff_agent::pg::pool().await {
+        Ok(pool) => {
+            let computer = ff_agent::fleet_info::resolve_this_node_name().await;
+            ff_agent::agent_hint::load_for_host(&pool, &computer)
+                .await
+                .unwrap_or_default()
+        }
+        Err(_) => String::new(),
     };
-    let computer = ff_agent::fleet_info::resolve_this_node_name().await;
-    let hints = match ff_agent::agent_hint::load_for_host(&pool, &computer).await {
-        Ok(h) => h,
-        Err(_) => return existing,
+
+    let combined = match (skills_block.is_empty(), hints_block.is_empty()) {
+        (true, true) => return existing,
+        (false, true) => skills_block,
+        (true, false) => hints_block,
+        (false, false) => format!("{skills_block}{hints_block}"),
     };
-    ff_agent::agent_hint::prepend_to_system_prompt(&hints, existing)
+    ff_agent::agent_hint::prepend_to_system_prompt(&combined, existing)
 }
 
 async fn run_headless(
