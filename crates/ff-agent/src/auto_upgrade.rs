@@ -180,12 +180,24 @@ pub async fn resolve_upgrade_plans_with_suffix(
                     v.push(format!("{os_family}-{src}-{suffix}"));
                 }
                 v.push(format!("{os_family}-{suffix}"));
+                if let Some(base) = base_family(&os_family) {
+                    v.push(format!("{base}-{suffix}"));
+                }
                 v.push(format!("all-{suffix}"));
             }
             if let Some(src) = &install_source {
                 v.push(format!("{os_family}-{src}"));
             }
             v.push(os_family.clone());
+            // Base-family fallback: openclaw/claude-code/codex ship a
+            // `linux` key that pre-dates the linux-ubuntu / linux-dgx
+            // split. Try the bare base family before falling back to
+            // `all`. Surfaced 2026-04-30 — drift was stuck on every
+            // Linux host because the dispatcher only tried `linux-ubuntu`
+            // and `all`, both missing from openclaw's playbook.
+            if let Some(base) = base_family(&os_family) {
+                v.push(base.to_string());
+            }
             v.push("all".to_string());
             v
         };
@@ -377,6 +389,26 @@ pub async fn enqueue_plans(
 /// to gate the leader out of self-suicide.
 fn is_daemon_self_software(software_id: &str) -> bool {
     matches!(software_id, "ff_git" | "forgefleetd_git" | "forgefleet")
+}
+
+/// Map a fleet `os_family` (e.g. `linux-ubuntu`, `linux-dgx`,
+/// `macos-26`) to a base family (`linux`, `macos`, `windows`) so the
+/// playbook resolver can fall back when a software entry only ships
+/// the broader key. openclaw / claude-code / codex still use `linux`
+/// as their playbook key (pre-dating the linux-ubuntu / linux-dgx
+/// split); without this fallback the dispatcher fails to find any
+/// matching key and skips every Linux target with `no playbook key
+/// for os='linux-ubuntu' source='-'`.
+fn base_family(os_family: &str) -> Option<&'static str> {
+    if os_family.starts_with("linux") {
+        Some("linux")
+    } else if os_family.starts_with("macos") {
+        Some("macos")
+    } else if os_family.starts_with("windows") {
+        Some("windows")
+    } else {
+        None
+    }
 }
 
 /// Is this pool's leader the computer whose name matches `my_name`?
