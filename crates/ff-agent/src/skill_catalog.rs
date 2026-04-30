@@ -39,10 +39,22 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
+use sqlx::PgPool;
 use tracing::{debug, warn};
 
 const MAX_SKILLS: usize = 256;
 const MAX_DESCRIPTION_CHARS: usize = 400;
+
+/// One scan root, either loaded from V69 `skill_sources` or constructed
+/// from the legacy hardcoded defaults.
+#[derive(Debug, Clone)]
+pub struct SkillSource {
+    pub id: String,
+    pub label: String,
+    /// Pre-expansion path (may contain `$HOME` / `$CWD` / `~/`).
+    pub path_template: String,
+    pub priority: i32,
+}
 
 /// One skill discovered on disk.
 #[derive(Debug, Clone)]
@@ -63,26 +75,110 @@ struct Frontmatter {
     triggers: Vec<String>,
 }
 
-/// Walk the standard skill roots and return a deduplicated catalog.
-/// Roots earlier in the list take priority over later ones (Claude Code's
-/// project > user > fleet ordering).
-pub fn discover(working_dir: &Path) -> Vec<Skill> {
+/// Default scan roots used when V69 `skill_sources` is unreachable
+/// (test, DB down, pre-V69 deployment). Same four locations the
+/// hardcoded V68 implementation walked.
+fn legacy_default_sources() -> Vec<SkillSource> {
+    vec![
+        SkillSource {
+            id: "project-private".into(),
+            label: "project-private (.claude/skills)".into(),
+            path_template: "$CWD/.claude/skills".into(),
+            priority: 110,
+        },
+        SkillSource {
+            id: "project-declared".into(),
+            label: "project-declared (skills/)".into(),
+            path_template: "$CWD/skills".into(),
+            priority: 100,
+        },
+        SkillSource {
+            id: "user-global".into(),
+            label: "user-global (~/.claude/skills)".into(),
+            path_template: "$HOME/.claude/skills".into(),
+            priority: 50,
+        },
+        SkillSource {
+            id: "fleet-open-design".into(),
+            label: "fleet-installed open-design skills".into(),
+            path_template: "$HOME/.forgefleet/sub-agent-0/open-design/skills".into(),
+            priority: 30,
+        },
+    ]
+}
+
+/// Load enabled scan roots from V69 `skill_sources`, sorted by priority
+/// (highest first). Returns the legacy default set when the table is
+/// unreachable / empty.
+pub async fn load_sources(pool: &PgPool) -> Vec<SkillSource> {
+    let rows: Result<Vec<(String, String, String, i32)>, sqlx::Error> = sqlx::query_as(
+        r#"
+        SELECT id, label, path, priority
+          FROM skill_sources
+         WHERE enabled = true
+         ORDER BY priority DESC, id ASC
+        "#,
+    )
+    .fetch_all(pool)
+    .await;
+    match rows {
+        Ok(r) if !r.is_empty() => r
+            .into_iter()
+            .map(|(id, label, path, priority)| SkillSource {
+                id,
+                label,
+                path_template: path,
+                priority,
+            })
+            .collect(),
+        Ok(_) => {
+            debug!("skill_catalog: skill_sources empty, using legacy defaults");
+            legacy_default_sources()
+        }
+        Err(e) => {
+            debug!(error = %e, "skill_catalog: skill_sources unreachable, using legacy defaults");
+            legacy_default_sources()
+        }
+    }
+}
+
+/// Expand `$CWD`, `$HOME`, `${HOME}`, `~/` placeholders in a source path.
+fn expand_path(template: &str, working_dir: &Path) -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_default();
-    let roots: Vec<(PathBuf, String)> = vec![
-        (
-            working_dir.join(".claude/skills"),
-            "project-private".to_string(),
-        ),
-        (working_dir.join("skills"), "project-declared".to_string()),
-        (
-            PathBuf::from(&home).join(".claude/skills"),
-            "user-global".to_string(),
-        ),
-        (
-            PathBuf::from(&home).join(".forgefleet/sub-agent-0/open-design/skills"),
-            "fleet:open-design".to_string(),
-        ),
-    ];
+    let cwd = working_dir.to_string_lossy();
+    let expanded = template
+        .replace("$CWD", &cwd)
+        .replace("${CWD}", &cwd)
+        .replace("$HOME", &home)
+        .replace("${HOME}", &home);
+    let expanded = if let Some(rest) = expanded.strip_prefix("~/") {
+        format!("{home}/{rest}")
+    } else {
+        expanded
+    };
+    PathBuf::from(expanded)
+}
+
+/// Walk the registered skill sources (V69 + legacy fallback) and return
+/// a deduplicated catalog. Higher-priority source wins on id collision.
+///
+/// `discover` (sync) uses legacy defaults only — it's the no-DB path used
+/// in tests. Production callers go through [`discover_with_pool`].
+pub fn discover(working_dir: &Path) -> Vec<Skill> {
+    discover_with_sources(working_dir, &legacy_default_sources())
+}
+
+/// Production discovery path: load sources from DB, then walk.
+pub async fn discover_with_pool(pool: &PgPool, working_dir: &Path) -> Vec<Skill> {
+    let sources = load_sources(pool).await;
+    discover_with_sources(working_dir, &sources)
+}
+
+fn discover_with_sources(working_dir: &Path, sources: &[SkillSource]) -> Vec<Skill> {
+    let roots: Vec<(PathBuf, String)> = sources
+        .iter()
+        .map(|s| (expand_path(&s.path_template, working_dir), s.label.clone()))
+        .collect();
 
     let mut by_id: HashMap<String, Skill> = HashMap::new();
     for (root, label) in roots {
@@ -209,9 +305,16 @@ pub fn render_catalog(skills: &[Skill]) -> String {
 }
 
 /// Convenience: discover + render in one call. Returns an empty string
-/// when no skills exist.
+/// when no skills exist. Uses the legacy hardcoded source list — for
+/// the DB-aware path (V69), use [`catalog_for_with_pool`].
 pub fn catalog_for(working_dir: &Path) -> String {
     let skills = discover(working_dir);
+    render_catalog(&skills)
+}
+
+/// V69 production path: load sources from `skill_sources`, walk, render.
+pub async fn catalog_for_with_pool(pool: &PgPool, working_dir: &Path) -> String {
+    let skills = discover_with_pool(pool, working_dir).await;
     render_catalog(&skills)
 }
 
