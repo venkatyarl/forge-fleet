@@ -1820,6 +1820,12 @@ async fn start_pulse_v2_subsystems(
     let redis_client =
         redis::Client::open(redis_url.as_str()).context("pulse v2: failed to open redis client")?;
 
+    // (V66) Spawn the detection-registry refresher so SoftwareCollector
+    // has rules loaded before the first beat fires. Initial load happens
+    // immediately, then every 5 min. Empty cache = empty inventory; the
+    // refresher closes that gap on its first successful query.
+    ff_pulse::detection_registry::spawn_refresher(pg_pool.clone());
+
     // (2) HeartbeatV2Publisher — always runs when computer row exists.
     info!(
         node = %node_name,

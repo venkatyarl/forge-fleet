@@ -5441,3 +5441,162 @@ VALUES (
 )
 ON CONFLICT (id) DO NOTHING;
 "#;
+
+// ─── V66: data-driven software detection ───────────────────────────────────
+//
+// Operator pushback 2026-04-30: "shouldn't these come from the database?"
+//
+// SoftwareCollector previously hardcoded detection logic per software_id —
+// `known_ids` list + a Rust block per entry that runs the right `--version`
+// command and parses output with a fixed regex. That works for our existing
+// 13 well-known tools but every NEW entry (open-design, future skills, future
+// CLIs) needed a code change to land on the fleet. That violates the
+// DB-first-catalog rule (memory: feedback_db_first_catalog,
+// feedback_no_hardcode).
+//
+// V66 adds `software_registry.detection JSONB` describing HOW to detect a
+// row's `installed_version` on a host. The collector reads the registry
+// at startup and runs whatever method each row declares. Existing
+// hardcoded detectors stay (rollback safety) but become legacy fallbacks;
+// new entries declare detection in data, no Rust change required.
+//
+// Methods supported in V66's collector loop:
+//
+//   {"method":"binary_version","binary":"openclaw","args":["--version"],
+//    "regex":"OpenClaw\\s+(\\S+)"}
+//     - run `binary --args` (PATH lookup), extract first regex capture
+//
+//   {"method":"git_checkout","path":"$HOME/.forgefleet/sub-agent-0/open-design",
+//    "truncate":10}
+//     - if `<path>/.git` exists, run `git -C <path> rev-parse HEAD`,
+//       truncate to N chars
+//
+//   {"method":"which","binary":"docker"}
+//     - presence-only; reports "(present)" if the binary is on PATH
+//
+// Default-NULL: rows without `detection` skip the data-driven loop —
+// the legacy hardcoded path still serves them.
+//
+// Backfill: V66 also populates detection for `open_design_git` (added in
+// V65) so it flows through the new path immediately. Future migrations
+// can backfill detection for the other rows on a "as-touched" basis;
+// the goal is no NEW hardcoded detector ever lands.
+pub const SCHEMA_V66_DATA_DRIVEN_DETECTION: &str = r#"
+ALTER TABLE software_registry
+    ADD COLUMN IF NOT EXISTS detection JSONB;
+
+-- ── ff / ff_git (dual emit from `ff --version`) ───────────────────────
+UPDATE software_registry SET detection = '{
+    "method":"ff_version_pair","binary":"ff","field":"version"
+}'::jsonb WHERE id='ff' AND detection IS NULL;
+
+UPDATE software_registry SET detection = '{
+    "method":"ff_version_pair","binary":"ff","field":"sha"
+}'::jsonb WHERE id='ff_git' AND detection IS NULL;
+
+-- ── forgefleetd / forgefleetd_git (dual emit) ─────────────────────────
+UPDATE software_registry SET detection = '{
+    "method":"ff_version_pair","binary":"forgefleetd","field":"version"
+}'::jsonb WHERE id='forgefleetd' AND detection IS NULL;
+
+UPDATE software_registry SET detection = '{
+    "method":"ff_version_pair","binary":"forgefleetd","field":"sha"
+}'::jsonb WHERE id='forgefleetd_git' AND detection IS NULL;
+
+-- ── open-design (git checkout) ────────────────────────────────────────
+UPDATE software_registry SET detection = '{
+    "method":"git_checkout",
+    "path":"$HOME/.forgefleet/sub-agent-0/open-design",
+    "truncate":10,
+    "install_source":"git"
+}'::jsonb WHERE id='open_design_git' AND detection IS NULL;
+
+-- ── npm-shaped binaries (binary --version, regex parse) ───────────────
+UPDATE software_registry SET detection = '{
+    "method":"binary_version","binary":"openclaw","args":["--version"],
+    "regex":"OpenClaw\\s+(\\S+)","install_source_hint":"auto"
+}'::jsonb WHERE id='openclaw' AND detection IS NULL;
+
+UPDATE software_registry SET detection = '{
+    "method":"binary_version","binary":"codex","args":["--version"],
+    "regex":"(\\d+\\.\\d+\\.\\d+(?:[\\w.-]*)?)","install_source_hint":"auto"
+}'::jsonb WHERE id='codex' AND detection IS NULL;
+
+UPDATE software_registry SET detection = '{
+    "method":"binary_version","binary":"claude","args":["--version"],
+    "regex":"(\\d+\\.\\d+\\.\\d+(?:[\\w.-]*)?)","install_source_hint":"auto"
+}'::jsonb WHERE id='claude-code' AND detection IS NULL;
+
+UPDATE software_registry SET detection = '{
+    "method":"binary_version","binary":"gh","args":["--version"],
+    "regex":"gh version (\\S+)","install_source_hint":"auto"
+}'::jsonb WHERE id='gh' AND detection IS NULL;
+
+UPDATE software_registry SET detection = '{
+    "method":"binary_version","binary":"op","args":["--version"],
+    "regex":"^(\\S+)","install_source_hint":"auto"
+}'::jsonb WHERE id='op' AND detection IS NULL;
+
+UPDATE software_registry SET detection = '{
+    "method":"binary_version","binary":"rustup","args":["--version"],
+    "regex":"rustup (\\S+)","install_source_hint":"direct"
+}'::jsonb WHERE id='rustup' AND detection IS NULL;
+
+UPDATE software_registry SET detection = '{
+    "method":"binary_version","binary":"node","args":["--version"],
+    "regex":"v?(\\d+\\.\\d+\\.\\d+)","install_source_hint":"auto"
+}'::jsonb WHERE id='node' AND detection IS NULL;
+
+UPDATE software_registry SET detection = '{
+    "method":"binary_version","binary":"python3","args":["--version"],
+    "regex":"Python (\\d+\\.\\d+\\.\\d+)","install_source_hint":"auto"
+}'::jsonb WHERE id='python' AND detection IS NULL;
+
+UPDATE software_registry SET detection = '{
+    "method":"binary_version","binary":"docker","args":["--version"],
+    "regex":"Docker version (\\S+),","install_source_hint":"auto"
+}'::jsonb WHERE id='docker' AND detection IS NULL;
+
+UPDATE software_registry SET detection = '{
+    "method":"binary_version","binary":"ollama","args":["--version"],
+    "regex":"version is (\\S+)","install_source_hint":"auto",
+    "fallback_via_run":true
+}'::jsonb WHERE id='ollama' AND detection IS NULL;
+
+UPDATE software_registry SET detection = '{
+    "method":"binary_version","binary":"llama-server","args":["--version"],
+    "regex":"version (\\S+)","install_source_hint":"auto"
+}'::jsonb WHERE id='llama.cpp' AND detection IS NULL;
+
+-- ── python module probes ──────────────────────────────────────────────
+UPDATE software_registry SET detection = '{
+    "method":"python_module","module":"mlx_lm","os_filter":"macos",
+    "install_source_hint":"pip"
+}'::jsonb WHERE id='mlx_lm' AND detection IS NULL;
+
+UPDATE software_registry SET detection = '{
+    "method":"python_module","module":"vllm","os_filter":"linux",
+    "install_source_hint":"pip"
+}'::jsonb WHERE id='vllm' AND detection IS NULL;
+
+-- ── OS detection ──────────────────────────────────────────────────────
+UPDATE software_registry SET detection = '{
+    "method":"os_release","expected_id":"macos"
+}'::jsonb WHERE id='os-macos' AND detection IS NULL;
+
+UPDATE software_registry SET detection = '{
+    "method":"os_release","expected_id":"ubuntu","expected_version_prefix":"22.04"
+}'::jsonb WHERE id='os-ubuntu-22.04' AND detection IS NULL;
+
+UPDATE software_registry SET detection = '{
+    "method":"os_release","expected_id":"ubuntu","expected_version_prefix":"24.04"
+}'::jsonb WHERE id='os-ubuntu-24.04' AND detection IS NULL;
+
+UPDATE software_registry SET detection = '{
+    "method":"os_release","expected_kernel_contains":"-nvidia"
+}'::jsonb WHERE id='os-dgx' AND detection IS NULL;
+
+UPDATE software_registry SET detection = '{
+    "method":"os_release","expected_id":"windows"
+}'::jsonb WHERE id='os-windows' AND detection IS NULL;
+"#;

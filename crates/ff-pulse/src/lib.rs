@@ -12,6 +12,7 @@
 pub mod beat_v2;
 pub mod client;
 pub mod cx7_detect;
+pub mod detection_registry;
 pub mod docker_probe;
 pub mod error;
 pub mod fabric_upsert;

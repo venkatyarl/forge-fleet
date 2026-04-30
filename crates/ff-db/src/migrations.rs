@@ -462,6 +462,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "register_open_design",
         sql: schema::SCHEMA_V65_REGISTER_OPEN_DESIGN,
     },
+    PgMigration {
+        version: 66,
+        name: "data_driven_detection",
+        sql: schema::SCHEMA_V66_DATA_DRIVEN_DETECTION,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.

@@ -2,22 +2,27 @@
 //! developer/runtime software and reports `(id, version, install_source,
 //! install_path)` tuples suitable for inclusion in [`PulseBeatV2::installed_software`].
 //!
-//! Detection is best-effort: each probe runs a small shell command
-//! (`which <bin>`, `<bin> --version`, etc.), and any failure silently omits
-//! that entry from the returned `Vec`. No errors are surfaced to the caller.
+//! V66+ (data-driven): the set of probed software_ids and the detection
+//! method per id come from `software_registry.detection JSONB`, loaded
+//! into a process-wide cache by [`crate::detection_registry::spawn_refresher`].
+//! The collector below is a pure dispatcher — for each rule it runs the
+//! method's probe and emits an `InstalledSoftware` entry on success.
 //!
-//! The set of probed IDs matches what the ForgeFleet config seeds in
-//! `config/software.toml` — so the materializer can join on ID.
+//! Adding a new tool to fleet inventory requires zero Rust code: insert
+//! a `software_registry` row with a `detection` JSONB. Pre-V66 hardcoded
+//! detection blocks are removed; the helpers below (`run`, `which`,
+//! `regex_capture`, `parse_ff_version_line`, etc.) are now generic
+//! primitives the dispatcher composes.
 
 use regex::Regex;
 
 use crate::beat_v2::InstalledSoftware;
+use crate::detection_registry::{self, DetectionRule};
 
-/// Probes the local machine for installed software.
+/// Probes the local machine for installed software using rules loaded
+/// from `software_registry.detection` (V66+).
 pub struct SoftwareCollector {
-    /// IDs that this collector knows how to probe for. Used by callers who
-    /// want to cross-check against the catalog.
-    pub known_ids: Vec<&'static str>,
+    rules: Vec<DetectionRule>,
 }
 
 impl Default for SoftwareCollector {
@@ -27,416 +32,321 @@ impl Default for SoftwareCollector {
 }
 
 impl SoftwareCollector {
+    /// Snapshot the registry cache. Empty when the cache hasn't been
+    /// populated yet (early daemon startup, tests without DB plumbing) —
+    /// `detect()` returns Vec::new() in that case.
     pub fn new() -> Self {
         Self {
-            known_ids: vec![
-                "ff",
-                "ff_git",
-                "forgefleetd",
-                "forgefleetd_git",
-                "open_design_git",
-                "openclaw",
-                "codex",
-                "claude-code",
-                "gh",
-                "op",
-                "rustup",
-                "llama.cpp",
-                "mlx_lm",
-                "vllm",
-                "ollama",
-                "node",
-                "python",
-                "docker",
-                // OS is derived at runtime: one of
-                // os-macos / os-ubuntu-22.04 / os-ubuntu-24.04 / os-dgx / os-windows.
-                "os-macos",
-                "os-ubuntu-22.04",
-                "os-ubuntu-24.04",
-                "os-dgx",
-                "os-windows",
-            ],
+            rules: detection_registry::current_rules(),
         }
     }
 
-    /// Detect installed software on this machine. Entries that can't be
-    /// resolved are simply omitted.
+    /// `software_id`s the collector currently knows how to probe — derived
+    /// from the loaded registry rules.
+    pub fn known_ids(&self) -> Vec<String> {
+        self.rules.iter().map(|r| r.software_id.clone()).collect()
+    }
+
+    /// Detect installed software on this machine. Iterates the registry
+    /// snapshot and dispatches each rule by `detection.method`. Per-rule
+    /// failures (missing binary, regex no-match, etc.) are silently
+    /// omitted — same semantics the hardcoded path used.
     pub fn detect(&self) -> Vec<InstalledSoftware> {
+        if self.rules.is_empty() {
+            tracing::debug!(
+                "software_collector: detection registry empty — \
+                 returning empty inventory (cache not yet refreshed?)"
+            );
+            return Vec::new();
+        }
+
         let mut out: Vec<InstalledSoftware> = Vec::new();
-
-        // ── ff ──────────────────────────────────────────────────────────
-        //
-        // `ff --version` prints one of two shapes, both supported here:
-        //   - legacy:  `ff 2026.4.7 (build 8355028d1)`
-        //   - current: `ff 2026.4.21_5 (pushed 8355028d12)`
-        //
-        // Semver / build-version goes to `ff`; the SHA goes to `ff_git`.
-        // When the new shape is detected, the git-state token is stashed
-        // in the `metadata` JSONB field on BOTH rows so the auto-upgrade
-        // gate can read it without re-probing the leader.
-        if let Some(path) = which("ff") {
-            if let Some(raw) = run("ff", &["--version"]) {
-                let parsed = parse_ff_version_line(&raw);
-                if let Some(ver) = parsed.version.clone() {
-                    let meta = parsed
-                        .git_state
-                        .clone()
-                        .map(|s| serde_json::json!({ "git_state": s }));
-                    out.push(InstalledSoftware {
-                        id: "ff".into(),
-                        version: ver,
-                        install_source: Some(classify_ff_source(&path)),
-                        install_path: Some(path.clone()),
-                        metadata: meta,
-                    });
-                }
-                if let Some(sha) = parsed.sha {
-                    let meta = parsed
-                        .git_state
-                        .map(|s| serde_json::json!({ "git_state": s }));
-                    out.push(InstalledSoftware {
-                        id: "ff_git".into(),
-                        version: sha,
-                        install_source: Some(classify_ff_source(&path)),
-                        install_path: Some(path),
-                        metadata: meta,
-                    });
-                } else {
-                    tracing::debug!(
-                        raw = %raw,
-                        "ff --version has no SHA suffix — skipping ff_git row"
-                    );
-                }
+        for rule in &self.rules {
+            if let Some(entry) = dispatch_rule(rule) {
+                out.push(entry);
             }
         }
-
-        // ── forgefleetd ─────────────────────────────────────────────────
-        //
-        // Same dual-shape parse as `ff` above: semver/build-version →
-        // `forgefleetd`, SHA → `forgefleetd_git`, plus `git_state` in
-        // `metadata` when present. Banner word is "forgefleet", not
-        // "forgefleetd" — the parser normalizes either prefix.
-        if let Some(path) = which("forgefleetd") {
-            if let Some(raw) = run("forgefleetd", &["--version"]) {
-                let parsed = parse_ff_version_line(&raw);
-                if let Some(ver) = parsed.version.clone() {
-                    let meta = parsed
-                        .git_state
-                        .clone()
-                        .map(|s| serde_json::json!({ "git_state": s }));
-                    out.push(InstalledSoftware {
-                        id: "forgefleetd".into(),
-                        version: ver,
-                        install_source: Some(classify_ff_source(&path)),
-                        install_path: Some(path.clone()),
-                        metadata: meta,
-                    });
-                }
-                if let Some(sha) = parsed.sha {
-                    let meta = parsed
-                        .git_state
-                        .map(|s| serde_json::json!({ "git_state": s }));
-                    out.push(InstalledSoftware {
-                        id: "forgefleetd_git".into(),
-                        version: sha,
-                        install_source: Some(classify_ff_source(&path)),
-                        install_path: Some(path),
-                        metadata: meta,
-                    });
-                } else {
-                    tracing::debug!(
-                        raw = %raw,
-                        "forgefleetd --version has no SHA suffix — skipping forgefleetd_git row"
-                    );
-                }
-            }
-        }
-
-        // ── open_design_git (V65) ───────────────────────────────────────
-        //
-        // Open Design has no installed binary and ships no version string —
-        // it's a Next.js + Node app cloned to the fleet workspace. Report
-        // the SHA of HEAD in the checkout (truncated to 10 chars to match
-        // ff_git/forgefleetd_git). Skip the row entirely when no checkout
-        // exists (member never picked up the auto-upgrade tick yet, or
-        // pnpm install failed and was rolled back).
-        if let Some(home) = std::env::var_os("HOME") {
-            let checkout = std::path::PathBuf::from(home)
-                .join(".forgefleet/sub-agent-0/open-design");
-            if checkout.join(".git").exists() {
-                if let Some(sha_raw) = run(
-                    "git",
-                    &[
-                        "-C",
-                        checkout.to_str().unwrap_or(""),
-                        "rev-parse",
-                        "HEAD",
-                    ],
-                ) {
-                    let sha: String = sha_raw.trim().chars().take(10).collect();
-                    if !sha.is_empty() {
-                        out.push(InstalledSoftware {
-                            id: "open_design_git".into(),
-                            version: sha,
-                            install_source: Some("git".to_string()),
-                            install_path: checkout.to_str().map(str::to_string),
-                            metadata: None,
-                        });
-                    }
-                }
-            }
-        }
-
-        // ── openclaw ────────────────────────────────────────────────────
-        if let Some(path) = which("openclaw") {
-            if let Some(raw) = run("openclaw", &["--version"]) {
-                let first = raw.lines().next().unwrap_or("").to_string();
-                if let Some(ver) = regex_capture(&first, r"OpenClaw\s+(\S+)") {
-                    let src =
-                        if path.starts_with("/opt/homebrew/") || path.starts_with("/usr/local/") {
-                            Some("npm".to_string())
-                        } else {
-                            None
-                        };
-                    out.push(InstalledSoftware {
-                        id: "openclaw".into(),
-                        version: ver,
-                        install_source: src,
-                        install_path: Some(path),
-                        metadata: None,
-                    });
-                }
-            }
-        }
-
-        // ── codex (@openai/codex) ──────────────────────────────────────
-        // `codex --version` prints e.g. "codex-cli 0.125.0". Regex pulls
-        // the dotted version regardless of the leading word.
-        if let Some(path) = which("codex") {
-            if let Some(raw) = run("codex", &["--version"]) {
-                if let Some(ver) = regex_capture(&raw, r"(\d+\.\d+\.\d+(?:[\w.-]*)?)") {
-                    out.push(InstalledSoftware {
-                        id: "codex".into(),
-                        version: ver,
-                        install_source: Some("npm".to_string()),
-                        install_path: Some(path),
-                        metadata: None,
-                    });
-                }
-            }
-        }
-
-        // ── claude-code (@anthropic-ai/claude-code) ───────────────────
-        // `claude --version` prints e.g. "2.1.119 (Claude Code)".
-        if let Some(path) = which("claude") {
-            if let Some(raw) = run("claude", &["--version"]) {
-                if let Some(ver) = regex_capture(&raw, r"(\d+\.\d+\.\d+(?:[\w.-]*)?)") {
-                    out.push(InstalledSoftware {
-                        id: "claude-code".into(),
-                        version: ver,
-                        install_source: Some("npm".to_string()),
-                        install_path: Some(path),
-                        metadata: None,
-                    });
-                }
-            }
-        }
-
-        // ── gh ──────────────────────────────────────────────────────────
-        if let Some(path) = which("gh") {
-            if let Some(raw) = run("gh", &["--version"]) {
-                let first = raw.lines().next().unwrap_or("").to_string();
-                if let Some(ver) = regex_capture(&first, r"gh version\s+(\S+)") {
-                    out.push(InstalledSoftware {
-                        id: "gh".into(),
-                        version: ver,
-                        install_source: classify_pkg_source(&path),
-                        install_path: Some(path),
-                        metadata: None,
-                    });
-                }
-            }
-        }
-
-        // ── op ──────────────────────────────────────────────────────────
-        if let Some(path) = which("op") {
-            if let Some(raw) = run("op", &["--version"]) {
-                let ver = raw.trim().to_string();
-                if !ver.is_empty() {
-                    out.push(InstalledSoftware {
-                        id: "op".into(),
-                        version: ver,
-                        install_source: classify_pkg_source(&path),
-                        install_path: Some(path),
-                        metadata: None,
-                    });
-                }
-            }
-        }
-
-        // ── rustup ──────────────────────────────────────────────────────
-        if let Some(path) = which("rustup") {
-            if let Some(raw) = run("rustup", &["--version"]) {
-                let first = raw.lines().next().unwrap_or("").to_string();
-                if let Some(ver) = regex_capture(&first, r"rustup\s+(\S+)") {
-                    out.push(InstalledSoftware {
-                        id: "rustup".into(),
-                        version: ver,
-                        install_source: Some("direct".to_string()),
-                        install_path: Some(path),
-                        metadata: None,
-                    });
-                }
-            }
-        }
-
-        // ── llama.cpp (llama-server) ────────────────────────────────────
-        if let Some(path) = which("llama-server") {
-            let ver = run("llama-server", &["--version"])
-                .and_then(|raw| {
-                    let first = raw.lines().next().unwrap_or("").to_string();
-                    regex_capture(&first, r"version:\s*(\S+)")
-                })
-                .or_else(|| {
-                    // Fallback: try git log in ~/llama.cpp
-                    let home = std::env::var("HOME").ok()?;
-                    let llama_dir = format!("{home}/llama.cpp");
-                    run("git", &["-C", &llama_dir, "log", "-1", "--format=%h"])
-                });
-            if let Some(ver) = ver {
-                out.push(InstalledSoftware {
-                    id: "llama.cpp".into(),
-                    version: ver,
-                    install_source: Some("direct".to_string()),
-                    install_path: Some(path),
-                    metadata: None,
-                });
-            }
-        }
-
-        // ── mlx_lm (macOS only, via python3 -c) ────────────────────────
-        // Only record a version when `python3 -c "import mlx_lm; ..."` exits 0
-        // AND stdout is a clean short version string. If the module isn't
-        // installed, the command exits non-zero and we silently omit the row.
-        if std::env::consts::OS == "macos" {
-            if let Some(ver) = run_python_version_probe("mlx_lm") {
-                out.push(InstalledSoftware {
-                    id: "mlx_lm".into(),
-                    version: ver,
-                    install_source: Some("pip".to_string()),
-                    install_path: None,
-                    metadata: None,
-                });
-            }
-        }
-
-        // ── vllm (Linux only, via python3 -c) ──────────────────────────
-        // Same guardrail as mlx_lm above — must exit 0 with a clean version.
-        if std::env::consts::OS == "linux" {
-            if let Some(ver) = run_python_version_probe("vllm") {
-                out.push(InstalledSoftware {
-                    id: "vllm".into(),
-                    version: ver,
-                    install_source: Some("pip".to_string()),
-                    install_path: None,
-                    metadata: None,
-                });
-            }
-        }
-
-        // ── ollama ──────────────────────────────────────────────────────
-        if let Some(path) = which("ollama") {
-            if let Some(raw) = run("ollama", &["--version"]) {
-                let first = raw.lines().next().unwrap_or("").to_string();
-                let ver = regex_capture(&first, r"ollama version is\s+(\S+)")
-                    .or_else(|| regex_capture(&first, r"v(\S+)"))
-                    .or_else(|| regex_capture(&first, r"(\d+\.\d+\.\d+)"));
-                if let Some(ver) = ver {
-                    out.push(InstalledSoftware {
-                        id: "ollama".into(),
-                        version: ver,
-                        install_source: classify_pkg_source(&path),
-                        install_path: Some(path),
-                        metadata: None,
-                    });
-                }
-            }
-        }
-
-        // ── node ────────────────────────────────────────────────────────
-        if let Some(path) = which("node") {
-            if let Some(raw) = run("node", &["--version"]) {
-                // Strip leading 'v'
-                let ver = raw.trim().trim_start_matches('v').to_string();
-                if !ver.is_empty() {
-                    let src = if std::env::consts::OS == "macos" {
-                        if path.starts_with("/opt/homebrew/") {
-                            Some("brew".to_string())
-                        } else {
-                            None
-                        }
-                    } else {
-                        Some("apt".to_string())
-                    };
-                    out.push(InstalledSoftware {
-                        id: "node".into(),
-                        version: ver,
-                        install_source: src,
-                        install_path: Some(path),
-                        metadata: None,
-                    });
-                }
-            }
-        }
-
-        // ── python3 ─────────────────────────────────────────────────────
-        if let Some(path) = which("python3") {
-            if let Some(raw) = run("python3", &["--version"]) {
-                if let Some(ver) = regex_capture(&raw, r"Python\s+(\S+)") {
-                    let src = if std::env::consts::OS == "macos" {
-                        Some("brew".to_string())
-                    } else {
-                        Some("apt".to_string())
-                    };
-                    out.push(InstalledSoftware {
-                        id: "python".into(),
-                        version: ver,
-                        install_source: src,
-                        install_path: Some(path),
-                        metadata: None,
-                    });
-                }
-            }
-        }
-
-        // ── docker ──────────────────────────────────────────────────────
-        if let Some(path) = which("docker") {
-            if let Some(raw) = run("docker", &["--version"]) {
-                if let Some(ver) = regex_capture(&raw, r"Docker version\s+(\S+)") {
-                    let src = if std::env::consts::OS == "macos" {
-                        Some("brew-cask".to_string())
-                    } else {
-                        Some("apt".to_string())
-                    };
-                    // docker --version sometimes prints with a trailing comma.
-                    let ver = ver.trim_end_matches(',').to_string();
-                    out.push(InstalledSoftware {
-                        id: "docker".into(),
-                        version: ver,
-                        install_source: src,
-                        install_path: Some(path),
-                        metadata: None,
-                    });
-                }
-            }
-        }
-
-        // ── OS ──────────────────────────────────────────────────────────
-        if let Some(os_entry) = detect_os() {
-            out.push(os_entry);
-        }
-
         out
+    }
+}
+
+/// Top-level dispatcher: read `detection.method` and call the matching
+/// probe helper. Returns `None` on any per-rule failure (missing binary,
+/// no-match, IO error). The collector's contract is best-effort.
+fn dispatch_rule(rule: &DetectionRule) -> Option<InstalledSoftware> {
+    let method = rule.detection.get("method")?.as_str()?;
+    match method {
+        "ff_version_pair" => detect_ff_version_pair(rule),
+        "binary_version" => detect_binary_version(rule),
+        "git_checkout" => detect_git_checkout(rule),
+        "python_module" => detect_python_module(rule),
+        "os_release" => detect_os_release(rule),
+        other => {
+            tracing::debug!(
+                software_id = %rule.software_id,
+                method = %other,
+                "software_collector: unknown detection method, skipping"
+            );
+            None
+        }
+    }
+}
+
+/// `ff_version_pair`: run `<binary> --version`, parse with the shared
+/// `parse_ff_version_line`, emit either the semver/build-version
+/// (`field="version"`) or the SHA (`field="sha"`) per the rule.
+fn detect_ff_version_pair(rule: &DetectionRule) -> Option<InstalledSoftware> {
+    let binary = rule.detection.get("binary")?.as_str()?;
+    let field = rule.detection.get("field")?.as_str()?;
+    let path = which(binary)?;
+    let raw = run(binary, &["--version"])?;
+    let parsed = parse_ff_version_line(&raw);
+    let version = match field {
+        "version" => parsed.version.clone()?,
+        "sha" => parsed.sha.clone()?,
+        _ => return None,
+    };
+    let metadata = parsed
+        .git_state
+        .as_ref()
+        .map(|s| serde_json::json!({ "git_state": s }));
+    Some(InstalledSoftware {
+        id: rule.software_id.clone(),
+        version,
+        install_source: Some(classify_ff_source(&path)),
+        install_path: Some(path),
+        metadata,
+    })
+}
+
+/// `binary_version`: `which <binary>`, run with optional args, regex
+/// capture group 1. `install_source_hint`:
+///   - `"auto"` → classify by path (brew/apt/npm/direct).
+///   - explicit string (e.g. `"direct"`, `"pip"`) → use it verbatim.
+fn detect_binary_version(rule: &DetectionRule) -> Option<InstalledSoftware> {
+    let binary = rule.detection.get("binary")?.as_str()?;
+    let args: Vec<&str> = rule
+        .detection
+        .get("args")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
+        .unwrap_or_else(|| vec!["--version"]);
+    let pattern = rule.detection.get("regex").and_then(|v| v.as_str())?;
+
+    let path = which(binary)?;
+    let raw = if rule
+        .detection
+        .get("fallback_via_run")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        run_allow_nonzero(binary, &args)?
+    } else {
+        run(binary, &args)?
+    };
+    let version = regex_capture(&raw, pattern)?;
+    let install_source = classify_install_source(rule, &path);
+    Some(InstalledSoftware {
+        id: rule.software_id.clone(),
+        version,
+        install_source,
+        install_path: Some(path),
+        metadata: None,
+    })
+}
+
+/// `git_checkout`: if `<path>/.git` exists, report
+/// `git -C <path> rev-parse HEAD`. Optional `truncate` clamps the SHA.
+fn detect_git_checkout(rule: &DetectionRule) -> Option<InstalledSoftware> {
+    let path_template = rule.detection.get("path")?.as_str()?;
+    let truncate = rule
+        .detection
+        .get("truncate")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+    let install_source = rule
+        .detection
+        .get("install_source")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
+    let resolved = expand_home(path_template);
+    let p = std::path::PathBuf::from(&resolved);
+    if !p.join(".git").exists() {
+        return None;
+    }
+    let sha_raw = run("git", &["-C", p.to_str()?, "rev-parse", "HEAD"])?;
+    let sha_trimmed = sha_raw.trim();
+    let sha = if truncate > 0 {
+        sha_trimmed.chars().take(truncate).collect()
+    } else {
+        sha_trimmed.to_string()
+    };
+    if sha.is_empty() {
+        return None;
+    }
+    Some(InstalledSoftware {
+        id: rule.software_id.clone(),
+        version: sha,
+        install_source,
+        install_path: p.to_str().map(str::to_string),
+        metadata: None,
+    })
+}
+
+/// `python_module`: `python3 -c "import <m>; print(<m>.__version__)"`.
+/// `os_filter` ("macos" or "linux") gates so we don't probe vllm on
+/// macOS or mlx_lm on Linux.
+fn detect_python_module(rule: &DetectionRule) -> Option<InstalledSoftware> {
+    let module = rule.detection.get("module")?.as_str()?;
+    if let Some(filter) = rule.detection.get("os_filter").and_then(|v| v.as_str()) {
+        if std::env::consts::OS != filter {
+            return None;
+        }
+    }
+    let version = run_python_version_probe(module)?;
+    let install_source = rule
+        .detection
+        .get("install_source_hint")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    Some(InstalledSoftware {
+        id: rule.software_id.clone(),
+        version,
+        install_source,
+        install_path: None,
+        metadata: None,
+    })
+}
+
+/// `os_release`: emit ONLY when this host's OS markers match the rule's
+/// `expected_*` fields. Lets every os-* registry row fire its own probe
+/// — only one matches per host, so the collector emits exactly one OS
+/// entry without coordination.
+fn detect_os_release(rule: &DetectionRule) -> Option<InstalledSoftware> {
+    let det = &rule.detection;
+    let expected_id = det.get("expected_id").and_then(|v| v.as_str());
+    let expected_version_prefix = det
+        .get("expected_version_prefix")
+        .and_then(|v| v.as_str());
+    let expected_kernel_contains = det
+        .get("expected_kernel_contains")
+        .and_then(|v| v.as_str());
+
+    match std::env::consts::OS {
+        "macos" => {
+            if expected_id != Some("macos") {
+                return None;
+            }
+            let ver = run("sw_vers", &["-productVersion"])?;
+            Some(InstalledSoftware {
+                id: rule.software_id.clone(),
+                version: ver,
+                install_source: Some("system".into()),
+                install_path: None,
+                metadata: None,
+            })
+        }
+        "linux" => {
+            // Kernel-string match (DGX OS layers atop Ubuntu).
+            if let Some(needle) = expected_kernel_contains {
+                let kernel = run("uname", &["-r"]).unwrap_or_default();
+                if !kernel.contains(needle) {
+                    return None;
+                }
+                let ver = std::fs::read_to_string("/etc/dgx-release")
+                    .ok()
+                    .and_then(|raw| regex_capture(&raw, r#"DGX_OS_VERSION\s*=\s*"?([^"\n]+)"?"#))
+                    .unwrap_or_else(|| kernel.clone());
+                return Some(InstalledSoftware {
+                    id: rule.software_id.clone(),
+                    version: ver,
+                    install_source: Some("system".into()),
+                    install_path: None,
+                    metadata: None,
+                });
+            }
+            // /etc/os-release ID + VERSION_ID match.
+            let osr = std::fs::read_to_string("/etc/os-release").ok()?;
+            let id = regex_capture(&osr, r#"^ID\s*=\s*"?([^"\n]+)"?"#)
+                .or_else(|| regex_capture(&osr, r#"\nID\s*=\s*"?([^"\n]+)"?"#))
+                .unwrap_or_default();
+            if let Some(want) = expected_id {
+                if id != want {
+                    return None;
+                }
+            }
+            let version_id =
+                regex_capture(&osr, r#"VERSION_ID\s*=\s*"([^"]+)""#).unwrap_or_default();
+            if let Some(prefix) = expected_version_prefix {
+                if !version_id.starts_with(prefix) {
+                    return None;
+                }
+            }
+            Some(InstalledSoftware {
+                id: rule.software_id.clone(),
+                version: version_id,
+                install_source: Some("system".into()),
+                install_path: None,
+                metadata: None,
+            })
+        }
+        "windows" => {
+            if expected_id != Some("windows") {
+                return None;
+            }
+            let ver = run(
+                "powershell",
+                &[
+                    "-NoProfile",
+                    "-Command",
+                    "(Get-CimInstance Win32_OperatingSystem).Version",
+                ],
+            )?;
+            Some(InstalledSoftware {
+                id: rule.software_id.clone(),
+                version: ver,
+                install_source: Some("system".into()),
+                install_path: None,
+                metadata: None,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Expand `$HOME` (and bare `~`) in path templates loaded from JSONB.
+fn expand_home(template: &str) -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    template
+        .replace("$HOME", &home)
+        .replace("${HOME}", &home)
+        .replacen("~/", &format!("{home}/"), 1)
+}
+
+/// Resolve the rule's `install_source_hint`:
+///   - `"auto"` → classify by path (brew/apt/etc.) via `classify_pkg_source`.
+///   - explicit string → use it verbatim.
+///   - missing → None.
+fn classify_install_source(rule: &DetectionRule, path: &str) -> Option<String> {
+    let hint = rule
+        .detection
+        .get("install_source_hint")
+        .and_then(|v| v.as_str())?;
+    match hint {
+        "auto" => classify_pkg_source(path).or_else(|| {
+            // npm-installed CLIs typically land in /opt/homebrew/lib/node_modules
+            // or /usr/local/lib/node_modules — classify_pkg_source returns
+            // brew for these (which is technically true: brew's npm)
+            // but operators read it as "npm" for the CLI. Surface npm
+            // explicitly when path matches the node_modules pattern.
+            if path.contains("/node_modules/") {
+                Some("npm".to_string())
+            } else {
+                None
+            }
+        }),
+        other => Some(other.to_string()),
     }
 }
 
@@ -656,121 +566,28 @@ fn classify_pkg_source(path: &str) -> Option<String> {
     None
 }
 
-/// Derive an `InstalledSoftware` entry for the host OS.
-fn detect_os() -> Option<InstalledSoftware> {
-    match std::env::consts::OS {
-        "macos" => {
-            let ver = run("sw_vers", &["-productVersion"])?;
-            Some(InstalledSoftware {
-                id: "os-macos".into(),
-                version: ver,
-                install_source: Some("system".to_string()),
-                install_path: None,
-                metadata: None,
-            })
-        }
-        "linux" => {
-            // DGX OS takes priority.
-            if std::path::Path::new("/etc/dgx-release").exists() {
-                let ver = std::fs::read_to_string("/etc/dgx-release")
-                    .ok()
-                    .and_then(|raw| regex_capture(&raw, r#"DGX_OS_VERSION\s*=\s*"?([^"\n]+)"?"#))
-                    .unwrap_or_else(|| "unknown".to_string());
-                return Some(InstalledSoftware {
-                    id: "os-dgx".into(),
-                    version: ver,
-                    install_source: Some("system".to_string()),
-                    install_path: None,
-                    metadata: None,
-                });
-            }
-            // Parse /etc/os-release for Ubuntu version.
-            let osr = std::fs::read_to_string("/etc/os-release").ok()?;
-            let pretty = regex_capture(&osr, r#"PRETTY_NAME\s*=\s*"([^"]+)""#).unwrap_or_default();
-            let version_id =
-                regex_capture(&osr, r#"VERSION_ID\s*=\s*"([^"]+)""#).unwrap_or_default();
-
-            let (id, ver) = if pretty.contains("Ubuntu") {
-                let id = match version_id.as_str() {
-                    "22.04" => "os-ubuntu-22.04",
-                    "24.04" => "os-ubuntu-24.04",
-                    _ => return None,
-                };
-                (id.to_string(), version_id)
-            } else {
-                return None;
-            };
-
-            Some(InstalledSoftware {
-                id,
-                version: ver,
-                install_source: Some("system".to_string()),
-                install_path: None,
-                metadata: None,
-            })
-        }
-        "windows" => {
-            // Best-effort probe via PowerShell. UNTESTED — Windows is
-            // future fleet hardware. Two attempts:
-            //   1. `Get-CimInstance Win32_OperatingSystem` — modern + fast.
-            //   2. Registry fallback for stripped-down SKUs.
-            let ver = run(
-                "powershell",
-                &[
-                    "-NoProfile",
-                    "-Command",
-                    "(Get-CimInstance Win32_OperatingSystem).Version",
-                ],
-            )
-            .or_else(|| {
-                run(
-                    "powershell",
-                    &[
-                        "-NoProfile",
-                        "-Command",
-                        "(Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion').DisplayVersion",
-                    ],
-                )
-            })?;
-            Some(InstalledSoftware {
-                id: "os-windows".into(),
-                version: ver,
-                install_source: Some("system".to_string()),
-                install_path: None,
-                metadata: None,
-            })
-        }
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn new_populates_known_ids() {
-        let c = SoftwareCollector::new();
-        assert!(c.known_ids.contains(&"ff"));
-        assert!(c.known_ids.contains(&"docker"));
+    fn new_with_empty_registry_returns_empty_inventory() {
+        // V66+: collector reads from the global detection_registry cache,
+        // which is empty in unit tests (no DB plumbing). Empty rules in →
+        // empty inventory out (no false negatives, no panics).
+        let items = SoftwareCollector::new().detect();
+        assert!(
+            items.is_empty(),
+            "expected empty inventory with empty registry; got {:?}",
+            items.iter().map(|i| &i.id).collect::<Vec<_>>()
+        );
     }
 
     #[test]
-    fn detect_returns_host_marker() {
-        // Running the ForgeFleet test suite on a host means at minimum the OS
-        // entry should resolve, and in most dev environments `ff` is on PATH
-        // too. Require at least ONE of:
-        //   - id == "ff"
-        //   - id starts with "os-"
-        let items = SoftwareCollector::new().detect();
-        let has_marker = items
-            .iter()
-            .any(|i| i.id == "ff" || i.id.starts_with("os-"));
-        assert!(
-            has_marker,
-            "expected at least one entry with id=ff or id=os-*; got: {:?}",
-            items.iter().map(|i| &i.id).collect::<Vec<_>>()
-        );
+    fn known_ids_reflects_loaded_rules() {
+        // With an empty registry cache, known_ids() is also empty.
+        let c = SoftwareCollector::new();
+        assert!(c.known_ids().is_empty());
     }
 
     #[test]
