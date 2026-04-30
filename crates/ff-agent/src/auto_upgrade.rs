@@ -467,6 +467,9 @@ impl AutoUpgradeTick {
         // follow the same shape, different upstream URL.
         let _ = refresh_pypi_latest_versions(&self.pool).await;
         let _ = refresh_github_release_latest_versions(&self.pool).await;
+        // Git-head: tools we install by git-clone that don't ship versioned
+        // releases yet (open-design, etc.). Returns 10-char SHA of named ref.
+        let _ = refresh_git_head_latest_versions(&self.pool).await;
         // Then: flip computer_software.status = 'upgrade_available' for any row
         // where installed_version != latest_version and status is currently 'ok'.
         // Generic across all methods.
@@ -953,6 +956,36 @@ async fn refresh_github_release_latest_versions(pool: &PgPool) -> Result<u64> {
             let v: serde_json::Value = serde_json::from_str(body).ok()?;
             let tag = v.get("tag_name")?.as_str()?;
             Some(tag.strip_prefix('v').unwrap_or(tag).to_string())
+        },
+    )
+    .await
+}
+
+/// `version_source = {"method":"git_head","repo":"https://github.com/nexu-io/open-design","ref_kind":"main"}`.
+/// Used for tools we install by git-clone but that don't ship npm/pypi/github
+/// releases (e.g. open-design as of 2026-04-30 — `latestRelease: null`).
+/// Returns the SHA of the named branch's HEAD, truncated to 10 chars to match
+/// what `software_collector` reports for `*_git` rows.
+async fn refresh_git_head_latest_versions(pool: &PgPool) -> Result<u64> {
+    refresh_via_http(
+        pool,
+        "git_head",
+        |vs| {
+            // repo can be either "owner/name" or a full https URL.
+            let repo_raw = vs.get("repo")?.as_str()?;
+            let repo = repo_raw
+                .trim_start_matches("https://github.com/")
+                .trim_end_matches(".git");
+            let ref_kind = vs.get("ref_kind").and_then(|v| v.as_str()).unwrap_or("main");
+            Some(format!(
+                "https://api.github.com/repos/{repo}/commits/{ref_kind}"
+            ))
+        },
+        |body| {
+            let v: serde_json::Value = serde_json::from_str(body).ok()?;
+            let sha = v.get("sha")?.as_str()?;
+            // Match SoftwareCollector's 10-char truncation for ff_git/forgefleetd_git.
+            Some(sha.chars().take(10).collect())
         },
     )
     .await

@@ -5356,3 +5356,88 @@ UPDATE software_registry
        )
  WHERE id IN ('ff_git', 'forgefleetd_git');
 "#;
+
+// ─── V65: register `open_design_git` as fleet-wide software ────────────────
+//
+// Operator directive 2026-04-30: "treat it as software in ff and have it
+// installed in all the computers so all the computers can use it to build
+// when we do things via ff."
+//
+// Open Design (https://github.com/nexu-io/open-design) is a Next.js + Node
+// daemon stack that turns natural-language briefs into editable design
+// artifacts (prototypes, decks, dashboards, landing pages) by spawning the
+// host's installed coding agent CLI (Claude Code / Codex / Gemini /
+// OpenCode / Qwen / Copilot / Hermes / Kimi / pi). Same dispatch model
+// ForgeFleet already uses — so installing it on every member lets any
+// `ff run` / `ff supervise` task on any node lean on a 71-design-system
+// catalog + 19 skills for design output.
+//
+// Install model: git clone + pnpm install. There's no released npm package
+// or homebrew tap yet (`latestRelease: null` as of 2026-04-30; the project
+// is 2 days old). The shape mirrors `ff_git` / `forgefleetd_git`:
+//   - clone to `~/.forgefleet/sub-agent-0/open-design` (fleet workspace)
+//   - `git fetch origin main && git reset --hard origin/main`
+//   - `pnpm install` (idempotent — no-op when deps unchanged)
+//
+// We don't auto-start the OD daemon. Agents invoke OD on demand via
+// `pnpm --dir ~/.forgefleet/sub-agent-0/open-design tools-dev run web`
+// when a design task lands. Treating it like an installed library, not a
+// persistent service, keeps the fleet's daemon footprint flat.
+//
+// version_source uses `git_head` against `main` so the auto-upgrade tick's
+// `refresh_self_built_latest_versions` (or its git-equivalent path) drives
+// drift detection. Refresh cadence is the same 6h/1h pipeline that already
+// keeps `ff_git` / `forgefleetd_git` current.
+//
+// Skipped V62 in the migration sequence (PR #65 was code-only). V63 ships
+// as `drop_need_build_shortcut`, V64 as `register_ff_forgefleetd`. V65
+// continues the sequence here.
+//
+// macOS playbook uses corepack to materialize the pinned pnpm version
+// (10.33.2 per the repo's `packageManager` field). Linux/DGX path is
+// identical — both have node 24+ and corepack via apt.
+pub const SCHEMA_V65_REGISTER_OPEN_DESIGN: &str = r#"
+INSERT INTO software_registry (
+    id, display_name, kind,
+    version_source,
+    upgrade_playbook,
+    requires_restart, requires_reboot
+)
+VALUES (
+    'open_design_git',
+    'Open Design (nexu-io/open-design)',
+    'binary',
+    '{"method":"git_head","repo":"https://github.com/nexu-io/open-design","ref_kind":"main"}'::jsonb,
+    jsonb_build_object(
+        'macos',
+            'export PATH=/opt/homebrew/bin:$PATH && '
+         || 'mkdir -p "$(dirname $HOME/.forgefleet/sub-agent-0/open-design)" && '
+         || '{ [ -d "$HOME/.forgefleet/sub-agent-0/open-design/.git" ] || git clone https://github.com/nexu-io/open-design "$HOME/.forgefleet/sub-agent-0/open-design"; } && '
+         || 'cd "$HOME/.forgefleet/sub-agent-0/open-design" && '
+         || 'git fetch origin main && '
+         || 'git reset --hard origin/main && '
+         || 'corepack enable >/dev/null 2>&1 && '
+         || 'corepack pnpm install --frozen-lockfile',
+        'linux-ubuntu',
+            'export PATH="$HOME/.local/bin:$PATH" && '
+         || 'mkdir -p "$(dirname $HOME/.forgefleet/sub-agent-0/open-design)" && '
+         || '{ [ -d "$HOME/.forgefleet/sub-agent-0/open-design/.git" ] || git clone https://github.com/nexu-io/open-design "$HOME/.forgefleet/sub-agent-0/open-design"; } && '
+         || 'cd "$HOME/.forgefleet/sub-agent-0/open-design" && '
+         || 'git fetch origin main && '
+         || 'git reset --hard origin/main && '
+         || 'corepack enable >/dev/null 2>&1 && '
+         || 'corepack pnpm install --frozen-lockfile',
+        'linux-dgx',
+            'export PATH="$HOME/.local/bin:$PATH" && '
+         || 'mkdir -p "$(dirname $HOME/.forgefleet/sub-agent-0/open-design)" && '
+         || '{ [ -d "$HOME/.forgefleet/sub-agent-0/open-design/.git" ] || git clone https://github.com/nexu-io/open-design "$HOME/.forgefleet/sub-agent-0/open-design"; } && '
+         || 'cd "$HOME/.forgefleet/sub-agent-0/open-design" && '
+         || 'git fetch origin main && '
+         || 'git reset --hard origin/main && '
+         || 'corepack enable >/dev/null 2>&1 && '
+         || 'corepack pnpm install --frozen-lockfile'
+    )::jsonb,
+    false, false
+)
+ON CONFLICT (id) DO NOTHING;
+"#;
