@@ -34,6 +34,7 @@ impl SoftwareCollector {
                 "ff_git",
                 "forgefleetd",
                 "forgefleetd_git",
+                "open_design_git",
                 "openclaw",
                 "codex",
                 "claude-code",
@@ -147,6 +148,41 @@ impl SoftwareCollector {
                         raw = %raw,
                         "forgefleetd --version has no SHA suffix — skipping forgefleetd_git row"
                     );
+                }
+            }
+        }
+
+        // ── open_design_git (V65) ───────────────────────────────────────
+        //
+        // Open Design has no installed binary and ships no version string —
+        // it's a Next.js + Node app cloned to the fleet workspace. Report
+        // the SHA of HEAD in the checkout (truncated to 10 chars to match
+        // ff_git/forgefleetd_git). Skip the row entirely when no checkout
+        // exists (member never picked up the auto-upgrade tick yet, or
+        // pnpm install failed and was rolled back).
+        if let Some(home) = std::env::var_os("HOME") {
+            let checkout = std::path::PathBuf::from(home)
+                .join(".forgefleet/sub-agent-0/open-design");
+            if checkout.join(".git").exists() {
+                if let Some(sha_raw) = run(
+                    "git",
+                    &[
+                        "-C",
+                        checkout.to_str().unwrap_or(""),
+                        "rev-parse",
+                        "HEAD",
+                    ],
+                ) {
+                    let sha: String = sha_raw.trim().chars().take(10).collect();
+                    if !sha.is_empty() {
+                        out.push(InstalledSoftware {
+                            id: "open_design_git".into(),
+                            version: sha,
+                            install_source: Some("git".to_string()),
+                            install_path: checkout.to_str().map(str::to_string),
+                            metadata: None,
+                        });
+                    }
                 }
             }
         }

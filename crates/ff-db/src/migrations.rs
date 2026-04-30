@@ -457,6 +457,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "register_ff_forgefleetd",
         sql: schema::SCHEMA_V64_REGISTER_FF_FORGEFLEETD,
     },
+    PgMigration {
+        version: 65,
+        name: "register_open_design",
+        sql: schema::SCHEMA_V65_REGISTER_OPEN_DESIGN,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.
