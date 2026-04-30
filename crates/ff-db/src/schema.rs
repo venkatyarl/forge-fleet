@@ -5651,3 +5651,59 @@ UPDATE software_registry
                       'For non-design tasks, ignore this hint.'
  WHERE id = 'open_design_git';
 "#;
+
+// ─── V69: skill_sources table — runtime-configurable skill scan roots ──────
+//
+// Operator directive 2026-04-30: "make it so that I can easily add new
+// skills and tools. also we shouldn't hardcode individual skill ... ff
+// should be able to add new skills (.md) file or tools on the fly."
+//
+// Before V69, ff_agent::skill_catalog walked four hardcoded paths
+// (project/.claude/skills, project/skills, ~/.claude/skills, and the
+// fleet-installed open-design skills dir). Adding a new scan root —
+// a forked skills repo, an alternate vendor's skill collection —
+// required a code change.
+//
+// V69 moves the roots into a `skill_sources` table. Operators add/remove
+// rows at runtime via `ff skills source add/remove` (future verb) or by
+// direct INSERT. The skill_catalog reads this table at session start,
+// merges with sane built-in defaults, and walks every enabled root.
+//
+// Design notes:
+//   - `path` may contain `$HOME` / `~/` — expanded by the collector.
+//   - `priority` resolves id collisions (higher = wins). Project-private
+//     defaults to 100, fleet-installed defaults to 30. New custom sources
+//     default to 50.
+//   - `enabled` lets operators temporarily mute a source without DELETE.
+//   - Default rows seed the four legacy hardcoded roots so behavior is
+//     identical out-of-the-box. Operators can DELETE / UPDATE freely.
+//
+// Tools follow a different pattern (built-in primitives in code, runtime
+// extensibility via MCP servers — already supported per
+// reference_mcp_access). Skills are the data-driven path; this table
+// is the abstraction.
+pub const SCHEMA_V69_SKILL_SOURCES: &str = r#"
+CREATE TABLE IF NOT EXISTS skill_sources (
+    id          TEXT PRIMARY KEY,
+    label       TEXT NOT NULL,
+    path        TEXT NOT NULL,
+    priority    INTEGER NOT NULL DEFAULT 50,
+    enabled     BOOLEAN NOT NULL DEFAULT true,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_skill_sources_enabled
+    ON skill_sources (enabled, priority DESC);
+
+INSERT INTO skill_sources (id, label, path, priority, enabled)
+VALUES
+    ('project-private', 'project-private (.claude/skills)',
+     '$CWD/.claude/skills', 110, true),
+    ('project-declared', 'project-declared (skills/)',
+     '$CWD/skills', 100, true),
+    ('user-global', 'user-global (~/.claude/skills)',
+     '$HOME/.claude/skills', 50, true),
+    ('fleet-open-design', 'fleet-installed open-design skills',
+     '$HOME/.forgefleet/sub-agent-0/open-design/skills', 30, true)
+ON CONFLICT (id) DO NOTHING;
+"#;

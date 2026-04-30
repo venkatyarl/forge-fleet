@@ -4194,13 +4194,19 @@ fn should_show_result_preview(tool_name: &str) -> bool {
 /// configured all return the prompt unchanged.
 async fn inject_agent_hints(existing: Option<String>) -> Option<String> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
-    let skills_block = ff_agent::skill_catalog::catalog_for(&cwd);
 
-    // Try to load DB-backed agent hints; ignore failures.
-    let hints_block = match ff_agent::pg::pool().await {
+    // V69 DB-driven scan roots when reachable; legacy hardcoded set as fallback.
+    let pool_result = ff_agent::pg::pool().await;
+    let skills_block = match &pool_result {
+        Ok(pool) => ff_agent::skill_catalog::catalog_for_with_pool(pool, &cwd).await,
+        Err(_) => ff_agent::skill_catalog::catalog_for(&cwd),
+    };
+
+    // V67 DB-backed agent hints (only when pool is available).
+    let hints_block = match &pool_result {
         Ok(pool) => {
             let computer = ff_agent::fleet_info::resolve_this_node_name().await;
-            ff_agent::agent_hint::load_for_host(&pool, &computer)
+            ff_agent::agent_hint::load_for_host(pool, &computer)
                 .await
                 .unwrap_or_default()
         }

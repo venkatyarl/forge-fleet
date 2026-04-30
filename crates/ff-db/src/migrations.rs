@@ -472,6 +472,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "auto_install_agent_hint",
         sql: schema::SCHEMA_V67_AUTO_INSTALL_AGENT_HINT,
     },
+    PgMigration {
+        version: 69,
+        name: "skill_sources",
+        sql: schema::SCHEMA_V69_SKILL_SOURCES,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.
