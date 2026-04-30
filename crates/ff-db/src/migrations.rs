@@ -467,6 +467,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "data_driven_detection",
         sql: schema::SCHEMA_V66_DATA_DRIVEN_DETECTION,
     },
+    PgMigration {
+        version: 67,
+        name: "auto_install_agent_hint",
+        sql: schema::SCHEMA_V67_AUTO_INSTALL_AGENT_HINT,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.
