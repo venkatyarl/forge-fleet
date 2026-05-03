@@ -4196,7 +4196,7 @@ async fn inject_agent_hints(existing: Option<String>) -> Option<String> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
 
     // V69 DB-driven scan roots when reachable; legacy hardcoded set as fallback.
-    let pool_result = ff_agent::pg::pool().await;
+    let pool_result = ff_agent::fleet_info::get_fleet_pool().await;
     let skills_block = match &pool_result {
         Ok(pool) => ff_agent::skill_catalog::catalog_for_with_pool(pool, &cwd).await,
         Err(_) => ff_agent::skill_catalog::catalog_for(&cwd),
