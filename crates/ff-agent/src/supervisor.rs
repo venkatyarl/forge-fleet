@@ -363,7 +363,9 @@ fn detect_failure(
         std::collections::HashMap::new();
     for ev in events {
         if let AgentEvent::ToolStart {
-            tool_id, input_json, ..
+            tool_id,
+            input_json,
+            ..
         } = ev
         {
             tool_inputs.insert(tool_id.clone(), input_json.clone());
