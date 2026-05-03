@@ -2,9 +2,9 @@ pub mod agent_coordinator;
 pub mod agent_hint;
 pub mod agent_loop;
 pub mod agent_roles;
-pub mod skill_catalog;
 pub mod auto_upgrade;
 pub mod research;
+pub mod skill_catalog;
 
 /// Re-export of the panic-hook module that lives in `ff-core`. Keeps
 /// existing call sites (`ff_agent::panic_hook::install()`) working.

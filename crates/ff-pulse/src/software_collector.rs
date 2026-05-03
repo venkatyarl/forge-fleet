@@ -226,12 +226,8 @@ fn detect_python_module(rule: &DetectionRule) -> Option<InstalledSoftware> {
 fn detect_os_release(rule: &DetectionRule) -> Option<InstalledSoftware> {
     let det = &rule.detection;
     let expected_id = det.get("expected_id").and_then(|v| v.as_str());
-    let expected_version_prefix = det
-        .get("expected_version_prefix")
-        .and_then(|v| v.as_str());
-    let expected_kernel_contains = det
-        .get("expected_kernel_contains")
-        .and_then(|v| v.as_str());
+    let expected_version_prefix = det.get("expected_version_prefix").and_then(|v| v.as_str());
+    let expected_kernel_contains = det.get("expected_kernel_contains").and_then(|v| v.as_str());
 
     match std::env::consts::OS {
         "macos" => {

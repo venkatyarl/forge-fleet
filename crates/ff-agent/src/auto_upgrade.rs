@@ -1047,7 +1047,10 @@ async fn refresh_git_head_latest_versions(pool: &PgPool) -> Result<u64> {
             let repo = repo_raw
                 .trim_start_matches("https://github.com/")
                 .trim_end_matches(".git");
-            let ref_kind = vs.get("ref_kind").and_then(|v| v.as_str()).unwrap_or("main");
+            let ref_kind = vs
+                .get("ref_kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or("main");
             Some(format!(
                 "https://api.github.com/repos/{repo}/commits/{ref_kind}"
             ))

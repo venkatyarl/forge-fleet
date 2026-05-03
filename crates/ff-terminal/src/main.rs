@@ -7182,12 +7182,11 @@ async fn finalize_upgrade_event(
         // Skip the installed_version update if meta didn't carry a usable
         // latest_version (placeholder "-" or empty); fall back to the next
         // beat's collector-reported version.
-        let installed_version_to_write =
-            if latest_version == "-" || latest_version.is_empty() {
-                None
-            } else {
-                Some(latest_version.to_string())
-            };
+        let installed_version_to_write = if latest_version == "-" || latest_version.is_empty() {
+            None
+        } else {
+            Some(latest_version.to_string())
+        };
         let _ = sqlx::query(
             "UPDATE computer_software cs
                 SET status               = 'ok',
@@ -7292,7 +7291,9 @@ async fn finalize_upgrade_event(
                  Clear with: ff software auto-upgrade-run-once after fixing the root cause."
             )
         } else {
-            format!("Failure {count}/{AUTO_UPGRADE_FAILURE_THRESHOLD} — will retry on next hourly tick.")
+            format!(
+                "Failure {count}/{AUTO_UPGRADE_FAILURE_THRESHOLD} — will retry on next hourly tick."
+            )
         };
         format!(
             "Tried to bump {old_version} → {latest_version}\nerror: {}\n{tail}",
@@ -10486,9 +10487,7 @@ async fn handle_software_unblock(
              — or the row is currently 'upgrading' (refusing to clobber an in-flight task).{RESET}"
         );
     } else {
-        println!(
-            "{GREEN}✓ cleared {updated} row(s) — status='ok', consecutive_failures=0.{RESET}"
-        );
+        println!("{GREEN}✓ cleared {updated} row(s) — status='ok', consecutive_failures=0.{RESET}");
         println!(
             "  Next auto-upgrade tick (`ff software auto-upgrade-run-once`) will \
              re-evaluate drift and dispatch if needed."
