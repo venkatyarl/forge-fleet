@@ -5,6 +5,8 @@
 //! When the agent gets stuck, the supervisor diagnoses why and applies
 //! targeted fixes without human intervention.
 
+use std::io::Write;
+
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
@@ -30,6 +32,11 @@ pub struct SupervisorConfig {
     /// completed" without producing the artifact named in the prompt.
     /// See `feedback_ff_supervise_verify_deliverable.md`.
     pub verify_files: Vec<std::path::PathBuf>,
+    /// Stream agent events to stderr as they arrive, matching `ff run`'s UX.
+    /// When false (library callers wanting silent operation), events are still
+    /// collected for failure detection but nothing is printed during the run.
+    /// See `feedback_ff_supervise_no_live_progress.md`.
+    pub verbose: bool,
 }
 
 impl Default for SupervisorConfig {
@@ -40,8 +47,93 @@ impl Default for SupervisorConfig {
             loop_detection_window: 3,
             early_stop_min_tools: 1,
             verify_files: Vec::new(),
+            verbose: true,
         }
     }
+}
+
+/// Print one AgentEvent to stderr in the same format `ff run` uses.
+/// Hardcoded ANSI codes so this crate doesn't depend on the CLI's color consts.
+fn print_event(ev: &AgentEvent) {
+    let mut err = std::io::stderr().lock();
+    match ev {
+        AgentEvent::Status { message, .. } => {
+            let _ = writeln!(err, "\x1b[2m  → {message}\x1b[0m");
+        }
+        AgentEvent::TurnComplete { turn, .. } => {
+            let _ = writeln!(
+                err,
+                "\x1b[2m── turn {turn} ──────────────────────────────\x1b[0m"
+            );
+        }
+        AgentEvent::ToolStart {
+            tool_name,
+            input_json,
+            ..
+        } => {
+            let summary = first_string_arg(input_json);
+            let _ = write!(err, "\x1b[33m⚡ {tool_name}\x1b[0m");
+            if !summary.is_empty() {
+                let _ = write!(err, "\x1b[2m({summary})\x1b[0m");
+            }
+            let _ = write!(err, " ");
+            let _ = err.flush();
+        }
+        AgentEvent::ToolEnd {
+            result,
+            is_error,
+            duration_ms,
+            ..
+        } => {
+            if *is_error {
+                let _ = writeln!(err, "\x1b[31m✗ ({duration_ms}ms)\x1b[0m");
+                let first = result.lines().next().unwrap_or("").trim();
+                if !first.is_empty() {
+                    let snippet: String = first.chars().take(120).collect();
+                    let _ = writeln!(err, "  \x1b[31m{snippet}\x1b[0m");
+                }
+            } else {
+                let _ = writeln!(err, "\x1b[32m✓ ({duration_ms}ms)\x1b[0m");
+            }
+        }
+        AgentEvent::AssistantText { text, .. } => {
+            let _ = write!(err, "{text}");
+            let _ = err.flush();
+        }
+        AgentEvent::Compaction {
+            messages_before,
+            messages_after,
+            ..
+        } => {
+            let _ = writeln!(
+                err,
+                "\x1b[2m  ⟳ context compacted: {messages_before} → {messages_after} messages\x1b[0m"
+            );
+        }
+        AgentEvent::TokenWarning { usage_pct, .. } => {
+            let pct = (*usage_pct * 100.0) as u32;
+            let _ = writeln!(err, "\x1b[33m  ⚠ context {pct}% full\x1b[0m");
+        }
+        AgentEvent::Error { message, .. } => {
+            let _ = writeln!(err, "\x1b[31m  ✗ {message}\x1b[0m");
+        }
+        AgentEvent::Done { .. } => {}
+    }
+}
+
+fn first_string_arg(input_json: &str) -> String {
+    let v: serde_json::Value = match serde_json::from_str(input_json) {
+        Ok(v) => v,
+        Err(_) => return String::new(),
+    };
+    if let Some(obj) = v.as_object() {
+        for (_, val) in obj.iter().take(1) {
+            if let Some(s) = val.as_str() {
+                return s.chars().take(60).collect();
+            }
+        }
+    }
+    String::new()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,10 +189,18 @@ pub async fn supervise(
             (session, outcome)
         });
 
-        // Collect all events
+        // Collect all events. Stream to stderr live (matching `ff run`'s UX)
+        // when verbose=true, otherwise stay silent for library callers.
+        // See `feedback_ff_supervise_no_live_progress.md`.
         let mut events = Vec::new();
         while let Some(ev) = event_rx.recv().await {
+            if sup_config.verbose {
+                print_event(&ev);
+            }
             events.push(ev);
+        }
+        if sup_config.verbose {
+            eprintln!();
         }
 
         let (_, outcome) = match handle.await {
