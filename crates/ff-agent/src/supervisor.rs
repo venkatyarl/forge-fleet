@@ -97,9 +97,12 @@ pub async fn supervise(
             (session, outcome)
         });
 
-        // Collect all events
+        // Stream events to stderr so the operator sees live progress
+        // (closes feedback_ff_supervise_no_live_progress.md gap), and
+        // collect them for post-hoc failure detection.
         let mut events = Vec::new();
         while let Some(ev) = event_rx.recv().await {
+            print_event_stderr(&ev);
             events.push(ev);
         }
 
@@ -245,6 +248,92 @@ pub async fn supervise(
 }
 
 // ---------------------------------------------------------------------------
+// Live event streaming (stderr)
+// ---------------------------------------------------------------------------
+
+fn print_event_stderr(ev: &AgentEvent) {
+    // ANSI dim/cyan/red — matches the existing supervisor banner style.
+    const DIM: &str = "\x1b[2m";
+    const CYAN: &str = "\x1b[36m";
+    const RED: &str = "\x1b[31m";
+    const YELLOW: &str = "\x1b[33m";
+    const RESET: &str = "\x1b[0m";
+
+    fn truncate_chars(s: &str, n: usize) -> String {
+        let mut out: String = s.chars().take(n).collect();
+        if s.chars().count() > n {
+            out.push('…');
+        }
+        out
+    }
+
+    match ev {
+        AgentEvent::Status { message, .. } => {
+            eprintln!("    {DIM}· {message}{RESET}");
+        }
+        AgentEvent::AssistantText { text, .. } => {
+            let preview = truncate_chars(text.trim(), 200);
+            if !preview.is_empty() {
+                eprintln!("    {CYAN}» {preview}{RESET}");
+            }
+        }
+        AgentEvent::ToolStart {
+            tool_name,
+            input_json,
+            ..
+        } => {
+            let preview = truncate_chars(input_json, 160);
+            eprintln!("    {CYAN}⚒ {tool_name}{RESET} {DIM}{preview}{RESET}");
+        }
+        AgentEvent::ToolEnd {
+            tool_name,
+            is_error,
+            duration_ms,
+            result,
+            ..
+        } => {
+            let icon = if *is_error { "✗" } else { "✓" };
+            let color = if *is_error { RED } else { DIM };
+            let preview = truncate_chars(result.trim(), 120);
+            eprintln!(
+                "    {color}{icon} {tool_name} ({duration_ms}ms){RESET} {DIM}{preview}{RESET}"
+            );
+        }
+        AgentEvent::TurnComplete {
+            turn,
+            finish_reason,
+            ..
+        } => {
+            eprintln!("    {DIM}— turn {turn} complete ({finish_reason}){RESET}");
+        }
+        AgentEvent::Compaction {
+            messages_before,
+            messages_after,
+            ..
+        } => {
+            eprintln!(
+                "    {YELLOW}⟳ compacted {messages_before} → {messages_after} messages{RESET}"
+            );
+        }
+        AgentEvent::TokenWarning {
+            usage_pct,
+            estimated_tokens,
+            ..
+        } => {
+            eprintln!(
+                "    {YELLOW}⚠ context {usage_pct:.0}% full ({estimated_tokens} tokens){RESET}"
+            );
+        }
+        AgentEvent::Error { message, .. } => {
+            eprintln!("    {RED}✗ {message}{RESET}");
+        }
+        AgentEvent::Done { .. } => {
+            eprintln!("    {DIM}✓ done{RESET}");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Failure detection
 // ---------------------------------------------------------------------------
 
@@ -265,16 +354,37 @@ fn detect_failure(
         .collect();
     let tool_count = tool_ends.len();
 
-    // 2. Loop detection — same tool+result hash repeated
+    // 2. Loop detection — same tool+INPUT+result repeated.
+    // Input must be in the signature because many tools have generic success
+    // messages (e.g. Edit returns "Successfully edited <path> (1 replacement)"
+    // for every call against the same file). Without input in the sig, N Edits
+    // to N different sections of the same file would falsely trip loop detection.
+    let mut tool_inputs: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for ev in events {
+        if let AgentEvent::ToolStart {
+            tool_id, input_json, ..
+        } = ev
+        {
+            tool_inputs.insert(tool_id.clone(), input_json.clone());
+        }
+    }
     let mut sig_counts = std::collections::HashMap::new();
     for ev in &tool_ends {
         if let AgentEvent::ToolEnd {
-            tool_name, result, ..
+            tool_name,
+            tool_id,
+            result,
+            ..
         } = ev
         {
-            // Char-safe truncation — tool results often contain UTF-8.
-            let sig_tail: String = result.chars().take(50).collect();
-            let sig = format!("{tool_name}:{sig_tail}");
+            // Char-safe truncation — tool args / results often contain UTF-8.
+            let input_sig: String = tool_inputs
+                .get(tool_id)
+                .map(|s| s.chars().take(200).collect())
+                .unwrap_or_default();
+            let result_sig: String = result.chars().take(50).collect();
+            let sig = format!("{tool_name}:{input_sig}:{result_sig}");
             *sig_counts.entry(sig).or_insert(0usize) += 1;
         }
     }
