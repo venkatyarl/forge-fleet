@@ -30,6 +30,12 @@ pub struct SupervisorConfig {
     /// completed" without producing the artifact named in the prompt.
     /// See `feedback_ff_supervise_verify_deliverable.md`.
     pub verify_files: Vec<std::path::PathBuf>,
+    /// Placeholder strings that must NOT appear in any verify_files file.
+    /// Closes the gap where the agent writes a skeleton (size > 0 — passes
+    /// the basic gate) but leaves "TBD" markers in place. If any placeholder
+    /// is found, the attempt is treated as missing_deliverable and the
+    /// retry prompt is augmented with the offending file + pattern.
+    pub verify_no_placeholder: Vec<String>,
 }
 
 impl Default for SupervisorConfig {
@@ -40,6 +46,7 @@ impl Default for SupervisorConfig {
             loop_detection_window: 3,
             early_stop_min_tools: 1,
             verify_files: Vec::new(),
+            verify_no_placeholder: Vec::new(),
         }
     }
 }
@@ -179,6 +186,59 @@ pub async fn supervise(
                     let delay = sup_config.retry_delay_ms * (1u64 << attempt);
                     tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                     continue;
+                }
+                // Placeholder scan — files exist + non-empty, but check that
+                // the agent didn't ship a skeleton with TBDs left in. Closes
+                // the verify-files-too-lenient gap.
+                if !sup_config.verify_no_placeholder.is_empty() {
+                    let mut hits: Vec<(String, String, usize)> = Vec::new();
+                    for path in &sup_config.verify_files {
+                        let content = match std::fs::read_to_string(path) {
+                            Ok(c) => c,
+                            Err(_) => continue,
+                        };
+                        for needle in &sup_config.verify_no_placeholder {
+                            let count = content.matches(needle.as_str()).count();
+                            if count > 0 {
+                                hits.push((path.display().to_string(), needle.clone(), count));
+                            }
+                        }
+                    }
+                    if !hits.is_empty() {
+                        let evidence = format!(
+                            "agent declared done but {} placeholder(s) still present: {}",
+                            hits.len(),
+                            hits.iter()
+                                .map(|(p, n, c)| format!("{p}:{n}×{c}"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
+                        warn!(attempt, "{}", evidence);
+                        diagnoses.push(FailureDiagnosis {
+                            attempt,
+                            failure_type: "placeholder_unfilled".into(),
+                            evidence: evidence.clone(),
+                            fix_applied: "Prepending placeholder-replacement directive on retry"
+                                .into(),
+                        });
+                        let hits_list = hits
+                            .iter()
+                            .map(|(p, n, c)| format!("  - {p}: {c} occurrence(s) of `{n}`"))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        let reminder = format!(
+                            "CRITICAL: the previous attempt left placeholder strings in the \
+                             deliverable files. You MUST use the Edit tool to replace EVERY \
+                             occurrence of these placeholders with real content before stopping:\n\
+                             {}\n\nVerify with `grep -c` before declaring done.\n\n",
+                            hits_list
+                        );
+                        let existing = agent_config.system_prompt.take().unwrap_or_default();
+                        agent_config.system_prompt = Some(format!("{}\n{}", reminder, existing));
+                        let delay = sup_config.retry_delay_ms * (1u64 << attempt);
+                        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                        continue;
+                    }
                 }
                 info!(attempt, "supervisor: task completed successfully");
                 return SupervisorResult {

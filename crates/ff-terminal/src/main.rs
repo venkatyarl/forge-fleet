@@ -175,6 +175,13 @@ enum Command {
         /// `--verify-files a.rs --verify-files b.rs`.
         #[arg(long = "verify-files")]
         verify_files: Vec<PathBuf>,
+        /// Placeholder strings that must NOT remain in any verify-files
+        /// file. If found, the attempt is treated as missing_deliverable
+        /// and the retry prompt names the offending file + count. Use to
+        /// catch skeletons-with-TBDs where size > 0 but content isn't real.
+        /// Repeatable: `--verify-no-placeholder TBD --verify-no-placeholder XXX`.
+        #[arg(long = "verify-no-placeholder")]
+        verify_no_placeholder: Vec<String>,
         /// Restrict the agent's tool belt to these tools only (comma-separated).
         /// Forbid Read on pure-create tasks to prevent Read-loops:
         /// `--allowed-tools Write,Bash`. When unset, all core tools are exposed.
@@ -2862,6 +2869,7 @@ async fn main() -> Result<()> {
             prompt,
             max_attempts,
             verify_files,
+            verify_no_placeholder,
             allowed_tools,
             backend,
             backend_args,
@@ -2933,6 +2941,7 @@ async fn main() -> Result<()> {
             let sup_config = ff_agent::supervisor::SupervisorConfig {
                 max_attempts,
                 verify_files: verify_files.clone(),
+                verify_no_placeholder: verify_no_placeholder.clone(),
                 ..Default::default()
             };
             if !allowed_tools.is_empty() {
