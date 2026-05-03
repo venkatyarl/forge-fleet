@@ -156,6 +156,15 @@ pub async fn import_token(pool: &PgPool, provider: &OauthProvider) -> Result<()>
         .token_fields
         .iter()
         .find_map(|field| json.get(field).and_then(Value::as_str))
+        // Fall back to the common nested layout `{"tokens": {"<field>": "..."}}`
+        // used by e.g. OpenAI's codex CLI (~/.codex/auth.json).
+        .or_else(|| {
+            provider.token_fields.iter().find_map(|field| {
+                json.get("tokens")
+                    .and_then(|t| t.get(field))
+                    .and_then(Value::as_str)
+            })
+        })
         .ok_or_else(|| {
             anyhow!(
                 "no token field found in {} (tried {:?}); the cred file shape may have changed",
