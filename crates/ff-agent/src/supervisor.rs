@@ -200,11 +200,7 @@ pub async fn supervise(
                         for needle in &sup_config.verify_no_placeholder {
                             let count = content.matches(needle.as_str()).count();
                             if count > 0 {
-                                hits.push((
-                                    path.display().to_string(),
-                                    needle.clone(),
-                                    count,
-                                ));
+                                hits.push((path.display().to_string(), needle.clone(), count));
                             }
                         }
                     }
@@ -238,8 +234,7 @@ pub async fn supervise(
                             hits_list
                         );
                         let existing = agent_config.system_prompt.take().unwrap_or_default();
-                        agent_config.system_prompt =
-                            Some(format!("{}\n{}", reminder, existing));
+                        agent_config.system_prompt = Some(format!("{}\n{}", reminder, existing));
                         let delay = sup_config.retry_delay_ms * (1u64 << attempt);
                         tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                         continue;
