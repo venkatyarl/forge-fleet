@@ -24,7 +24,7 @@
 
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use tracing::{debug, info};
 
 /// Default per-CLI invocation timeout. Mirrors the worker timeout shipped

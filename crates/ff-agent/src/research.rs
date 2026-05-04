@@ -39,7 +39,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::multi_agent::{
-    AgentTask, AgentTaskResult, MultiAgentOrchestrator, OrchestratorEvent, TaskStatus,
+    AgentTaskResult, OrchestratorEvent, TaskStatus,
 };
 
 // ─── Public types ───────────────────────────────────────────────────────────
@@ -653,7 +653,7 @@ impl ResearchSession {
                 ordinal: i as u32,
                 sub_question: q.clone(),
                 assigned_computer: b.computer_name.clone(),
-                assigned_endpoint: b.endpoint.clone(),
+                _assigned_endpoint: b.endpoint.clone(),
                 assigned_model: b.model_id.clone(),
             });
         }
@@ -858,7 +858,7 @@ struct SubtaskRow {
     ordinal: u32,
     sub_question: String,
     assigned_computer: String,
-    assigned_endpoint: String,
+    _assigned_endpoint: String,
     assigned_model: String,
 }
 

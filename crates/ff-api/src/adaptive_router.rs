@@ -333,7 +333,7 @@ impl AdaptiveRouter {
             return None;
         }
 
-        let best_quality = confident[0]; // Already sorted by quality descending
+        let _best_quality = confident[0]; // Already sorted by quality descending
         let policy = self.config.policy;
         let is_complex = profile.complexity == crate::classifier::Complexity::Complex
             || profile.recommended_tier >= self.config.cloud_complexity_threshold;
@@ -746,5 +746,162 @@ mod tests {
         // Should be tier fallback (no quality data), not explicit
         assert_eq!(decision.strategy, RoutingStrategy::TierFallback);
         assert_eq!(decision.profile.task_type, TaskType::Debug);
+    }
+
+    // ── Routing policy affects reason string ─────────────────────────────
+    // Note: The current router applies the same epsilon-based selection
+    // regardless of policy. Policy mainly affects logging/reason text.
+
+    #[tokio::test]
+    async fn test_policy_quality_first_reason() {
+        let registry = Arc::new(BackendRegistry::new(vec![
+            make_backend("t1-a", 1, "qwen-9b"),
+            make_backend("t2-a", 2, "qwen-32b"),
+        ]));
+        let tier_router = Arc::new(TierRouter::with_defaults(registry.clone()));
+        let tracker = Arc::new(QualityTracker::new(QualityTrackerConfig {
+            min_samples: 2,
+            ..Default::default()
+        }));
+        let config = AdaptiveRouterConfig {
+            confidence_threshold: 2,
+            policy: RoutingPolicy::QualityFirst,
+            ..Default::default()
+        };
+        let router = AdaptiveRouter::new(config, registry, tier_router, tracker.clone());
+
+        for _ in 0..3 {
+            tracker.record("qwen-9b", TaskType::Chat, &Outcome::success(50.0));
+            tracker.record("qwen-32b", TaskType::Chat, &Outcome::success(100.0));
+        }
+
+        let messages = [user_msg("Hello there")];
+        let (decision, _chain) = router.route("auto", &messages, None, None).await;
+
+        assert_eq!(decision.strategy, RoutingStrategy::Adaptive);
+        assert!(decision.reason.contains("quality"));
+    }
+
+    #[tokio::test]
+    async fn test_policy_local_first_reason() {
+        let registry = Arc::new(BackendRegistry::new(vec![
+            make_backend("t1-a", 1, "qwen-9b"),
+            make_backend("t2-a", 2, "qwen-32b"),
+        ]));
+        let tier_router = Arc::new(TierRouter::with_defaults(registry.clone()));
+        let tracker = Arc::new(QualityTracker::new(QualityTrackerConfig {
+            min_samples: 2,
+            ..Default::default()
+        }));
+        let config = AdaptiveRouterConfig {
+            confidence_threshold: 2,
+            policy: RoutingPolicy::LocalFirst,
+            ..Default::default()
+        };
+        let router = AdaptiveRouter::new(config, registry, tier_router, tracker.clone());
+
+        for _ in 0..3 {
+            tracker.record("qwen-9b", TaskType::Chat, &Outcome::success(50.0));
+            tracker.record("qwen-32b", TaskType::Chat, &Outcome::success(100.0));
+        }
+
+        let messages = [user_msg("Hello there")];
+        let (decision, _chain) = router.route("auto", &messages, None, None).await;
+
+        assert_eq!(decision.strategy, RoutingStrategy::Adaptive);
+        assert!(decision.reason.contains("local-first") || decision.reason.contains("cheaper tier"));
+    }
+
+    #[tokio::test]
+    async fn test_policy_cost_optimized_reason() {
+        let registry = Arc::new(BackendRegistry::new(vec![
+            make_backend("t1-a", 1, "qwen-9b"),
+            make_backend("t2-a", 2, "qwen-32b"),
+        ]));
+        let tier_router = Arc::new(TierRouter::with_defaults(registry.clone()));
+        let tracker = Arc::new(QualityTracker::new(QualityTrackerConfig {
+            min_samples: 2,
+            ..Default::default()
+        }));
+        let config = AdaptiveRouterConfig {
+            confidence_threshold: 2,
+            policy: RoutingPolicy::CostOptimized,
+            ..Default::default()
+        };
+        let router = AdaptiveRouter::new(config, registry, tier_router, tracker.clone());
+
+        for _ in 0..3 {
+            tracker.record("qwen-9b", TaskType::Chat, &Outcome::success(50.0));
+            tracker.record("qwen-32b", TaskType::Chat, &Outcome::success(100.0));
+        }
+
+        let messages = [user_msg("Hello there")];
+        let (decision, _chain) = router.route("auto", &messages, None, None).await;
+
+        assert_eq!(decision.strategy, RoutingStrategy::Adaptive);
+        assert!(decision.reason.contains("cost"));
+    }
+
+    #[tokio::test]
+    async fn test_policy_balanced_reason() {
+        let registry = Arc::new(BackendRegistry::new(vec![
+            make_backend("t1-a", 1, "qwen-9b"),
+            make_backend("t2-a", 2, "qwen-32b"),
+        ]));
+        let tier_router = Arc::new(TierRouter::with_defaults(registry.clone()));
+        let tracker = Arc::new(QualityTracker::new(QualityTrackerConfig {
+            min_samples: 2,
+            ..Default::default()
+        }));
+        let config = AdaptiveRouterConfig {
+            confidence_threshold: 2,
+            policy: RoutingPolicy::Balanced,
+            ..Default::default()
+        };
+        let router = AdaptiveRouter::new(config, registry, tier_router, tracker.clone());
+
+        for _ in 0..3 {
+            tracker.record("qwen-9b", TaskType::Chat, &Outcome::success(50.0));
+            tracker.record("qwen-32b", TaskType::Chat, &Outcome::success(100.0));
+        }
+
+        let messages = [user_msg("Hello there")];
+        let (decision, _chain) = router.route("auto", &messages, None, None).await;
+
+        assert_eq!(decision.strategy, RoutingStrategy::Adaptive);
+        assert!(decision.reason.contains("balanced") || decision.reason.contains("cheaper tier") || decision.reason.contains("similar quality"));
+    }
+
+    // ── Local model preference ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_local_model_preference_when_similar_quality() {
+        let registry = Arc::new(BackendRegistry::new(vec![
+            make_backend("local1", 1, "qwen-7b"),
+            make_backend("cloud1", 2, "gpt-4o"),
+        ]));
+        let tier_router = Arc::new(TierRouter::with_defaults(registry.clone()));
+        let tracker = Arc::new(QualityTracker::new(QualityTrackerConfig {
+            min_samples: 2,
+            ..Default::default()
+        }));
+        let config = AdaptiveRouterConfig {
+            confidence_threshold: 2,
+            ..Default::default()
+        };
+        let router = AdaptiveRouter::new(config, registry, tier_router, tracker.clone());
+
+        // Similar quality for both
+        for _ in 0..3 {
+            tracker.record("qwen-7b", TaskType::Chat, &Outcome::success(50.0));
+            tracker.record("gpt-4o", TaskType::Chat, &Outcome::success(60.0));
+        }
+
+        let messages = [user_msg("Hello there")];
+        let (decision, _chain) = router.route("auto", &messages, None, None).await;
+
+        assert_eq!(decision.strategy, RoutingStrategy::Adaptive);
+        // Should prefer local (qwen) since quality is similar and it's free
+        assert_eq!(decision.recommended_model.as_deref(), Some("qwen-7b"));
     }
 }
