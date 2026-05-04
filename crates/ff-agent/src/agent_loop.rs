@@ -1272,11 +1272,12 @@ async fn run_agent_loop(
 
         // --- Loop detection ---
         for tc in &tool_calls {
-            let sig = format!(
-                "{}:{}",
-                tc.function.name,
-                &tc.function.arguments[..tc.function.arguments.len().min(80)]
-            );
+            // char-safe truncation — byte-slice panics on multi-byte UTF-8
+            // (e.g. an em-dash `—` straddling byte 80). Discovered when a
+            // user prompt with `—` triggered a panic at this exact site
+            // during ff supervise probe-fix dispatch on 2026-05-03.
+            let args_short: String = tc.function.arguments.chars().take(80).collect();
+            let sig = format!("{}:{}", tc.function.name, args_short);
             session.recent_tool_sigs.push(sig);
         }
         // Keep sliding window of last 20 signatures
