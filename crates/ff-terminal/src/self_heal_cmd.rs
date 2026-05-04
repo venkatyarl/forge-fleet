@@ -96,8 +96,61 @@ pub async fn handle_freeze_tier(pg: &PgPool, tier: &str, hours: u32) -> Result<(
     Ok(())
 }
 
-pub async fn handle_revert(_pg: &PgPool, bug_sig: &str) -> Result<()> {
-    println!("TODO: rollback fix for bug_signature={}", bug_sig);
+pub async fn handle_revert(pg: &PgPool, bug_sig: &str) -> Result<()> {
+    let row = sqlx::query(
+        "SELECT id, bug_signature, tier, status, rollback_playbook, computer_id \
+         FROM fleet_self_heal_queue WHERE bug_signature = $1",
+    )
+    .bind(bug_sig)
+    .fetch_optional(pg)
+    .await?;
+
+    let Some(row) = row else {
+        println!("No self-heal entry found for bug_signature={}", bug_sig);
+        return Ok(());
+    };
+
+    let id: i64 = row.try_get("id")?;
+    let status: String = row.try_get("status")?;
+    let rollback: serde_json::Value = row.try_get("rollback_playbook")?;
+
+    if status == "reverted" {
+        println!("Fix {} is already reverted.", bug_sig);
+        return Ok(());
+    }
+
+    // If a rollback playbook exists, enqueue it as a deferred task.
+    if let Some(cmd) = rollback.as_object().and_then(|o| o.get("command")).and_then(|c| c.as_str()) {
+        let task_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO deferred_tasks (id, kind, payload, status, priority, created_at, meta) \
+             VALUES ($1, 'shell', $2, 'queued', 100, NOW(), $3)",
+        )
+        .bind(task_id)
+        .bind(serde_json::json!({ "command": cmd }))
+        .bind(serde_json::json!({
+            "self_heal_revert": { "queue_id": id, "bug_signature": bug_sig }
+        }))
+        .execute(pg)
+        .await?;
+        println!("Enqueued rollback task {} for bug_signature={}", task_id, bug_sig);
+    } else {
+        println!(
+            "No rollback playbook for bug_signature={}; marking reverted without action.",
+            bug_sig
+        );
+    }
+
+    sqlx::query(
+        "UPDATE fleet_self_heal_queue \
+         SET status = 'reverted', updated_at = NOW() \
+         WHERE id = $1",
+    )
+    .bind(id)
+    .execute(pg)
+    .await?;
+
+    println!("Marked bug_signature={} as reverted.", bug_sig);
     Ok(())
 }
 

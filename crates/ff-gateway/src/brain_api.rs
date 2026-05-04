@@ -261,7 +261,14 @@ async fn build_chat_messages(
         .await
         .map_err(|e| anyhow::anyhow!("list messages: {e}"))?;
 
-    let mut messages: Vec<Value> = Vec::with_capacity(history.len() + 1);
+    let mut messages: Vec<Value> = Vec::with_capacity(history.len() + 2);
+
+    // System prompt so the model knows what ForgeFleet actually is.
+    messages.push(json!({
+        "role": "system",
+        "content": "You are the ForgeFleet AI assistant. ForgeFleet is an open-source platform for orchestrating fleets of AI models across multiple computers (nodes). You help users manage their AI fleet: deploy models, route inference requests, monitor node health, manage costs, schedule tasks, and coordinate multi-agent workflows. You are NOT a logistics or trucking fleet management system."
+    }));
+
     // History is newest-first; reverse to oldest-first for the LLM.
     for msg in history.iter().rev() {
         let role = match msg.role.as_str() {

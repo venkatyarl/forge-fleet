@@ -7353,17 +7353,61 @@ async fn finalize_upgrade_event(
     }
 }
 
+/// Best-effort register an external tool as an MCP stdio server in the
+/// local `.mcp.json` config. The config is searched in the current working
+/// directory first, then the user's home directory.
+async fn register_mcp_server(tool_id: &str, server_command: &str) -> anyhow::Result<()> {
+    let candidates = [
+        std::path::PathBuf::from(".mcp.json"),
+        dirs::home_dir().map(|h| h.join(".mcp.json")).unwrap_or_default(),
+    ];
+
+    let path = candidates.iter().find(|p| p.exists()).cloned();
+    let path = match path {
+        Some(p) => p,
+        None => candidates[0].clone(), // create in cwd
+    };
+
+    let mut config: serde_json::Value = if path.exists() {
+        let text = tokio::fs::read_to_string(&path).await?;
+        serde_json::from_str(&text).unwrap_or_else(|_| {
+            serde_json::json!({ "mcpServers": {} })
+        })
+    } else {
+        serde_json::json!({ "mcpServers": {} })
+    };
+
+    let servers = config
+        .get_mut("mcpServers")
+        .and_then(|v| v.as_object_mut())
+        .ok_or_else(|| anyhow::anyhow!(".mcp.json missing mcpServers object"))?;
+
+    // Parse command into command + args (simple whitespace split).
+    let parts: Vec<&str> = server_command.split_whitespace().collect();
+    let (cmd, args) = parts.split_first().unwrap_or((&"", &[]));
+
+    servers.insert(
+        tool_id.to_string(),
+        serde_json::json!({
+            "command": cmd,
+            "args": args,
+            "type": "stdio",
+        }),
+    );
+
+    let text = serde_json::to_string_pretty(&config)?;
+    tokio::fs::write(&path, text).await?;
+
+    Ok(())
+}
+
 /// Post-completion hook for `meta.external_tool` deferred tasks.
 ///
 /// Runs whether the task succeeded or failed. Flips
 /// `computer_external_tools.status` from `'installing'` / `'upgrading'`
 /// to `'ok'` (success) or `'install_failed'` (failure), and makes a
 /// best-effort attempt to parse `installed_version` / `install_path`
-/// out of the task stdout.
-///
-/// TODO: when MCP auto-registration lands (see project memory
-/// `project_external_tools_subsystem.md`), also flip `mcp_registered=true`
-/// after running the registration command on the target computer.
+/// out of the task stdout. Also handles MCP auto-registration.
 async fn finalize_external_tool_event(
     pool: &sqlx::PgPool,
     task: &ff_db::DeferredTaskRow,
@@ -7426,6 +7470,30 @@ async fn finalize_external_tool_event(
 
     let new_status = if ok { "ok" } else { "install_failed" };
 
+    let register_as_mcp = meta
+        .get("register_as_mcp")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let mcp_server_command = meta
+        .get("mcp_server_command")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+
+    let mut mcp_registered = false;
+    if ok && register_as_mcp {
+        if let Some(cmd) = mcp_server_command {
+            match register_mcp_server(tool_id, cmd).await {
+                Ok(_) => {
+                    mcp_registered = true;
+                    tracing::info!(tool_id, computer, "MCP auto-registration succeeded");
+                }
+                Err(e) => {
+                    tracing::warn!(tool_id, computer, error = %e, "MCP auto-registration failed");
+                }
+            }
+        }
+    }
+
     let _ = sqlx::query(
         "UPDATE computer_external_tools cet
             SET status = $1,
@@ -7433,7 +7501,8 @@ async fn finalize_external_tool_event(
                 last_checked_at  = NOW(),
                 installed_version = COALESCE($4, cet.installed_version),
                 install_path      = COALESCE($5, cet.install_path),
-                last_error        = CASE WHEN $1 = 'ok' THEN NULL ELSE $6 END
+                last_error        = CASE WHEN $1 = 'ok' THEN NULL ELSE $6 END,
+                mcp_registered    = CASE WHEN $7 THEN true ELSE mcp_registered END
            FROM computers c
           WHERE cet.computer_id = c.id
             AND cet.tool_id     = $2
@@ -7445,6 +7514,7 @@ async fn finalize_external_tool_event(
     .bind(version_guess.as_deref())
     .bind(path_guess.as_deref())
     .bind(err)
+    .bind(mcp_registered)
     .execute(pool)
     .await;
 
