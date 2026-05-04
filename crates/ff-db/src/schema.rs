@@ -5278,6 +5278,11 @@ CREATE INDEX IF NOT EXISTS idx_fleet_tasks_excludes
 // per-row-resilient so future schema drift is logged + skipped instead of
 // silently aborting every beat.
 pub const SCHEMA_V64_REGISTER_FF_FORGEFLEETD: &str = r#"
+-- Defensive: ensure version_source has a default so legacy inserts
+-- (and any triggers) that omit the column do not fail.
+ALTER TABLE software_registry
+    ALTER COLUMN version_source SET DEFAULT '{}'::jsonb;
+
 INSERT INTO software_registry (id, display_name, kind, version_source, upgrade_playbook, requires_restart, requires_reboot)
 VALUES
     ('ff',           'ForgeFleet CLI (build-version row)',     'binary',

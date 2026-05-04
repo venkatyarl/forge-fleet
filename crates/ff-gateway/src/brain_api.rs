@@ -11,6 +11,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tracing::{debug, info, warn};
 
 use crate::server::GatewayState;
 
@@ -143,6 +144,9 @@ pub struct SendMessageBody {
     pub content: String,
     pub channel: Option<String>,
     pub user: Option<String>,
+    /// Target model for the LLM reply. If omitted, the system tries to pick
+    /// a sensible default from available fleet models.
+    pub model: Option<String>,
 }
 
 pub async fn send_thread_message(
@@ -187,14 +191,16 @@ pub async fn send_thread_message(
 
     let _ = ff_db::pg_touch_brain_thread(pool, thread.id).await;
 
-    // TODO: Phase 2 — call brain_chat::stream_assistant_response here
-    // to generate an LLM reply. For now, echo-acknowledge.
-    let assistant_reply = format!(
-        "Received on thread '{}': {}",
-        slug,
-        body.content.chars().take(100).collect::<String>()
-    );
-    let _ = ff_db::pg_insert_brain_message(
+    // Generate LLM reply via fleet routing (cloud → pulse → tier → model).
+    let assistant_reply = match generate_brain_reply(&state, pool, &thread, &user, &body).await {
+        Ok(reply) => reply,
+        Err(e) => {
+            warn!(error = %e, thread = %slug, "brain reply generation failed; storing error as assistant message");
+            format!("(Unable to generate reply: {e})")
+        }
+    };
+
+    let assistant_msg_id = ff_db::pg_insert_brain_message(
         pool,
         thread.id,
         user.id,
@@ -204,9 +210,269 @@ pub async fn send_thread_message(
         &assistant_reply,
         None,
     )
-    .await;
+    .await
+    .map_err(|e| db_err("pg_insert_brain_message (assistant)", e))?;
 
-    Ok(Json(json!({ "message_id": msg_id, "thread_slug": slug })))
+    let _ = ff_db::pg_touch_brain_thread(pool, thread.id).await;
+
+    Ok(Json(json!({
+        "message_id": msg_id,
+        "assistant_message_id": assistant_msg_id,
+        "thread_slug": slug,
+        "reply_preview": assistant_reply.chars().take(120).collect::<String>(),
+    })))
+}
+
+// ─── Brain reply generation ──────────────────────────────────────────────
+
+/// Build an OpenAI-compatible messages array from the thread history.
+async fn build_chat_messages(
+    pool: &ff_db::PgPool,
+    thread_id: uuid::Uuid,
+    new_user_content: &str,
+) -> Result<Vec<Value>, anyhow::Error> {
+    let history = ff_db::pg_list_brain_messages(pool, thread_id, 20)
+        .await
+        .map_err(|e| anyhow::anyhow!("list messages: {e}"))?;
+
+    let mut messages: Vec<Value> = Vec::with_capacity(history.len() + 1);
+    // History is newest-first; reverse to oldest-first for the LLM.
+    for msg in history.iter().rev() {
+        let role = match msg.role.as_str() {
+            "user" | "assistant" | "system" => msg.role.clone(),
+            _ => "user".to_string(),
+        };
+        messages.push(json!({
+            "role": role,
+            "content": msg.content,
+        }));
+    }
+    messages.push(json!({
+        "role": "user",
+        "content": new_user_content,
+    }));
+    Ok(messages)
+}
+
+/// Extract assistant text from an OpenAI-shaped chat completion JSON value.
+fn extract_assistant_content(v: &Value) -> Option<String> {
+    v.get("choices")?
+        .as_array()?
+        .first()?
+        .get("message")?
+        .get("content")?
+        .as_str()
+        .map(|s| s.to_string())
+}
+
+/// Pick a default model when the caller does not specify one.
+/// Priority: first available from Pulse router live scan.
+async fn pick_default_model(state: &GatewayState) -> Option<String> {
+    if let Some(pulse) = state.pulse_router.as_ref() {
+        if let Ok(servers) = pulse.list_servers().await {
+            for s in servers {
+                if let Some(model) = s.get("model").and_then(|v| v.as_str()) {
+                    return Some(model.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Generate an assistant reply for a brain thread by routing through the
+/// fleet's LLM infrastructure: cloud providers → Pulse local fleet → tier
+/// escalation → legacy model router.
+async fn generate_brain_reply(
+    state: &GatewayState,
+    pool: &ff_db::PgPool,
+    thread: &ff_db::BrainThreadRow,
+    _user: &ff_db::BrainUserRow,
+    body: &SendMessageBody,
+) -> Result<String, anyhow::Error> {
+    let model = match body.model.as_deref() {
+        Some(m) if !m.is_empty() => m.to_string(),
+        _ => pick_default_model(state)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("no models available in fleet; start an LLM server or configure a cloud provider"))?,
+    };
+
+    let messages = build_chat_messages(pool, thread.id, &body.content).await?;
+
+    let payload = json!({
+        "model": model,
+        "messages": messages,
+        "stream": false,
+        "max_tokens": 2048,
+    });
+
+    // ── 1) Cloud-LLM routing (first pass) ───────────────────────────────
+    if let Some(result) =
+        crate::cloud_llm::try_route_to_cloud(pool, &model, &payload, None).await
+    {
+        match result {
+            Ok(resp) => {
+                let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("read cloud response body: {e}"))?;
+                let v: Value = serde_json::from_slice(&bytes)
+                    .map_err(|e| anyhow::anyhow!("parse cloud response: {e}"))?;
+                if let Some(content) = extract_assistant_content(&v) {
+                    info!(model = %model, provider = "cloud", thread = %thread.slug, "brain reply from cloud");
+                    return Ok(content);
+                }
+                return Err(anyhow::anyhow!("cloud response missing content"));
+            }
+            Err(resp) => {
+                let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("read cloud error body: {e}"))?;
+                let txt = String::from_utf8_lossy(&bytes);
+                return Err(anyhow::anyhow!("cloud routing error: {txt}"));
+            }
+        }
+    }
+
+    // ── 2) Pulse-backed local fleet routing ──────────────────────────────
+    if let Some(pulse) = state.pulse_router.as_ref() {
+        let cache_ref = state.pulse_cache.as_deref();
+        let pg_ref = Some(pool);
+        match pulse.route_completion_cached(payload.clone(), cache_ref, pg_ref).await {
+            Ok(v) => {
+                if let Some(content) = extract_assistant_content(&v) {
+                    info!(model = %model, provider = "pulse", thread = %thread.slug, "brain reply from pulse");
+                    // Record usage if the response has usage info.
+                    if let Some(usage) = v.get("usage") {
+                        if let (Some(prompt), Some(comp)) = (
+                            usage.get("prompt_tokens").and_then(|x| x.as_u64()),
+                            usage.get("completion_tokens").and_then(|x| x.as_u64()),
+                        ) {
+                            let record = ff_api::token_ledger::TokenUsageRecord::new(
+                                uuid::Uuid::new_v4().to_string(),
+                                &model,
+                                "pulse",
+                            )
+                            .with_tokens(prompt as u32, comp as u32);
+                            state.cost_tracker.record_usage(record).await;
+                        }
+                    }
+                    return Ok(content);
+                }
+                return Err(anyhow::anyhow!("pulse response missing content"));
+            }
+            Err(crate::llm_routing::LlmRoutingError::NoMatch { .. }) => {
+                debug!(model = %model, "pulse found no matching server");
+            }
+            Err(crate::llm_routing::LlmRoutingError::MissingModel) => {
+                return Err(anyhow::anyhow!("model '{model}' not recognized by pulse router"));
+            }
+            Err(e) => {
+                warn!(error = %e, "pulse routing failed; trying tier fallback");
+            }
+        }
+    }
+
+    // ── 3) Tier-router fallback ─────────────────────────────────────────
+    if let Some(tier_router) = state.tier_router.as_ref() {
+        let payload_typed: ff_api::types::ChatCompletionRequest =
+            serde_json::from_value(payload.clone())
+                .map_err(|e| anyhow::anyhow!("invalid payload for tier router: {e}"))?;
+
+        let chain = tier_router
+            .route_with_escalation(&payload_typed.model, None, None)
+            .await;
+
+        if !chain.is_empty() {
+            let mut last_error = None::<String>;
+            for (_tier, backends) in &chain {
+                for backend in backends {
+                    let url = format!("{}/v1/chat/completions", backend.base_url());
+                    let start = std::time::Instant::now();
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(60),
+                        state.http_client.post(&url).json(&payload).send(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(upstream)) if upstream.status().is_success() => {
+                            let latency = start.elapsed();
+                            tier_router.record_success(&backend.id, latency);
+                            let bytes = upstream.bytes().await.unwrap_or_default();
+                            let v: Value = serde_json::from_slice(&bytes)
+                                .map_err(|e| anyhow::anyhow!("parse tier response: {e}"))?;
+                            if let Some(content) = extract_assistant_content(&v) {
+                                info!(model = %model, backend = %backend.id, "brain reply from tier router");
+                                let prompt = v
+                                    .get("usage")
+                                    .and_then(|u| u.get("prompt_tokens"))
+                                    .and_then(|x| x.as_u64())
+                                    .unwrap_or(0) as u32;
+                                let comp = v
+                                    .get("usage")
+                                    .and_then(|u| u.get("completion_tokens"))
+                                    .and_then(|x| x.as_u64())
+                                    .unwrap_or(0) as u32;
+                                let record = ff_api::token_ledger::TokenUsageRecord::new(
+                                    uuid::Uuid::new_v4().to_string(),
+                                    &model,
+                                    &backend.id,
+                                )
+                                .with_tokens(prompt, comp);
+                                state.cost_tracker.record_usage(record).await;
+                                return Ok(content);
+                            }
+                        }
+                        Ok(Ok(upstream)) => {
+                            let status = upstream.status();
+                            let latency = start.elapsed();
+                            tier_router.record_failure(&backend.id, latency);
+                            last_error = Some(format!("{} returned {}", backend.id, status));
+                        }
+                        Ok(Err(e)) => {
+                            let latency = start.elapsed();
+                            tier_router.record_failure(&backend.id, latency);
+                            last_error = Some(format!("{} request failed: {e}", backend.id));
+                        }
+                        Err(_) => {
+                            let latency = start.elapsed();
+                            tier_router.record_failure(&backend.id, latency);
+                            last_error = Some(format!("{} timed out", backend.id));
+                        }
+                    }
+                }
+            }
+            if let Some(e) = last_error {
+                return Err(anyhow::anyhow!("tier router failed: {e}"));
+            }
+        }
+    }
+
+    // ── 4) Legacy model-router fallback ─────────────────────────────────
+    if let Some(model_router) = state.model_router.as_ref() {
+        let target_model = payload["model"].as_str().unwrap_or(&model);
+        if let Some(backend) = model_router.route(target_model).await {
+            let url = format!("{}/v1/chat/completions", backend.base_url());
+            let resp = state
+                .http_client
+                .post(&url)
+                .json(&payload)
+                .send()
+                .await
+                .map_err(|e| anyhow::anyhow!("legacy router request failed: {e}"))?;
+            let bytes = resp.bytes().await.unwrap_or_default();
+            let v: Value = serde_json::from_slice(&bytes)
+                .map_err(|e| anyhow::anyhow!("parse legacy response: {e}"))?;
+            if let Some(content) = extract_assistant_content(&v) {
+                info!(model = %model, backend = %backend.id, "brain reply from legacy model router");
+                return Ok(content);
+            }
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "no LLM backend available for model '{}'. Start a local model or configure a cloud provider.",
+        model
+    ))
 }
 
 // ─── Thread attachment ───────────────────────────────────────────────────

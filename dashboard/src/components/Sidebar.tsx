@@ -36,15 +36,6 @@ const mainSections: NavSection[] = [
     ],
   },
   {
-    id: 'chats',
-    title: 'Chats',
-    icon: '💬',
-    items: [
-      { to: '/chat', label: 'New Chat', icon: '✨' },
-      { to: '/chats', label: 'Chat History', icon: '📝' },
-    ],
-  },
-  {
     id: 'project-management',
     title: 'Project Management',
     icon: '📋',

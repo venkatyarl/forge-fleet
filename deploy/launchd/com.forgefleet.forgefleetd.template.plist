@@ -30,6 +30,11 @@
         <string>__USER_HOME__</string>
         <key>PATH</key>
         <string>__USER_HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/usr/sbin:/bin:/sbin</string>
+        <!-- Telegram bot token can be injected here for non-Postgres setups.
+             RECOMMENDED: use fleet_secrets instead (see docs/TELEGRAM_SETUP.md).
+             Leave empty or remove this key if using fleet_secrets. -->
+        <key>FORGEFLEET_TELEGRAM_BOT_TOKEN</key>
+        <string>__TELEGRAM_BOT_TOKEN__</string>
     </dict>
 
     <key>WorkingDirectory</key>

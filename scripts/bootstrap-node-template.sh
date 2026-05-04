@@ -557,7 +557,8 @@ else
     USER_UID="$(run_as_user id -u)"
     GUI_DOMAIN="gui/$USER_UID/com.forgefleet.forgefleetd"
     run_as_user mkdir -p "$PLIST_TARGET_DIR" "$USER_HOME/.forgefleet/logs"
-    run_as_user bash -c "sed -e 's|__USER_HOME__|$USER_HOME|g' -e 's|__NODE_NAME__|$NAME|g' '$PLIST_TEMPLATE' > '$PLIST_TARGET'"
+    TG_TOKEN="${TELEGRAM_BOT_TOKEN:-${FORGEFLEET_TELEGRAM_BOT_TOKEN:-}}"
+    run_as_user bash -c "sed -e 's|__USER_HOME__|$USER_HOME|g' -e 's|__NODE_NAME__|$NAME|g' -e 's|__TELEGRAM_BOT_TOKEN__|$TG_TOKEN|g' '$PLIST_TEMPLATE' > '$PLIST_TARGET'"
     # Bootstrap into the GUI domain so live `launchctl kickstart -k` works.
     run_as_user launchctl bootstrap "gui/$USER_UID" "$PLIST_TARGET" 2>/dev/null || true
     run_as_user launchctl enable "$GUI_DOMAIN" 2>/dev/null || true

@@ -35,18 +35,39 @@ Notes:
 
 ## 3) Provide bot token securely
 
-Prefer env var over inline token in TOML:
+### Recommended: fleet_secrets (Postgres-backed, survives restarts)
+
+Store the token in Postgres `fleet_secrets` so every node can resolve it
+without editing plist/systemd files:
+
+```bash
+ff secrets set telegram.bot_token "<bot-token-from-botfather>"
+```
+
+The daemon loads this automatically on startup (via `pg_get_secret`) and
+injects it into the process environment before initializing the transport.
+
+### Alternative: inline config (NOT recommended for production)
+
+```toml
+[transport.telegram]
+bot_token = "<bot-token-from-botfather>"
+```
+
+### Alternative: environment variable
 
 ```bash
 export FORGEFLEET_TELEGRAM_BOT_TOKEN="<bot-token-from-botfather>"
 ```
 
-If you run ForgeFleet as a service, set this env var in the service environment (LaunchAgent/systemd), not just an interactive shell.
+If you run ForgeFleet as a service, set this env var in the service
+environment (LaunchAgent/systemd), not just an interactive shell.
 
-## 3b) Persist token for daemon/runtime restarts (recommended)
+## 3b) Persist token for daemon/runtime restarts (service manager)
 
-If you only `export` in a shell, Telegram will stop working after process restart.
-Set env var in your service manager.
+If you only `export` in a shell, Telegram will stop working after process
+restart. The `fleet_secrets` approach above avoids this entirely. If you
+prefer env-in-plist instead:
 
 ### macOS (LaunchAgent)
 

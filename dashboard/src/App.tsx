@@ -6,7 +6,6 @@ import { CommandPalette } from './components/CommandPalette'
 import { useWsFeed } from './hooks/useWsFeed'
 import { AuditLog } from './pages/AuditLog'
 import { ConfigEditor } from './pages/ConfigEditor'
-import { ChatStudio } from './pages/ChatStudio'
 import { FleetOverview } from './pages/FleetOverview'
 import { LLMProxy } from './pages/LLMProxy'
 import { Metrics } from './pages/Metrics'
@@ -24,7 +23,6 @@ import { MeshStatus } from './pages/MeshStatus'
 import { Updates } from './pages/Updates'
 import { WorkflowWorkbench } from './pages/WorkflowWorkbench'
 import { Settings } from './pages/Settings'
-import { Chats } from './pages/Chats'
 import { ToolInventory } from './pages/ToolInventory'
 import { ModelHub } from './pages/ModelHub'
 import { Brain } from './pages/Brain'
@@ -72,10 +70,10 @@ export default function App() {
       <Route path="/" element={<Shell />}>
         {/* Mission Control = home */}
         <Route index element={<MissionControl />} />
-        {/* Chats */}
-        <Route path="chat" element={<ChatStudio />} />
-        <Route path="chat/:chatId" element={<ChatStudio />} />
-        <Route path="chats" element={<Chats />} />
+        {/* Chats — consolidated into Brain */}
+        <Route path="chat" element={<Navigate to="/brain" replace />} />
+        <Route path="chat/:chatId" element={<Navigate to="/brain" replace />} />
+        <Route path="chats" element={<Navigate to="/brain" replace />} />
         {/* Project Management */}
         <Route path="my-tasks" element={<MyTasks />} />
         <Route path="projects" element={<Projects />} />
