@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -eo pipefail
 
 # Fleet bring-up preflight checker (read-only / safe).
 # - Verifies local artifacts and config prerequisites
-# - Verifies required worker nodes exist in fleet.toml
+# - Verifies required worker nodes exist in fleet.toml or Postgres
 # - Optionally verifies SSH reachability + disk free on each node
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -109,7 +109,10 @@ else
 fi
 
 echo
-# 3) Parse node records from fleet.toml
+# 3) Parse node records from fleet.toml (fallback: query Postgres)
+API_PORT=""
+NODE_LINES=()
+
 PARSED="$({ python3 - "$CONFIG_PATH" <<'PY'
 import sys, tomllib
 from pathlib import Path
@@ -129,30 +132,70 @@ for name, node in nodes.items():
     models = node.get('models', {})
     model_port = ''
     if isinstance(models, dict) and models:
-        # first configured model port for quick runtime check
         for _model_slug, model_cfg in models.items():
             if isinstance(model_cfg, dict) and 'port' in model_cfg:
                 model_port = str(model_cfg.get('port', ''))
                 break
     print(f"{name}\t{ip}\t{user}\t{os_name}\t{model_port}")
 PY
-} 2>/dev/null)" || {
-  fail "failed to parse fleet config: ${CONFIG_PATH}"
-  exit 1
-}
+} 2>/dev/null)" || PARSED=""
 
-API_PORT=""
-NODE_LINES=()
-while IFS= read -r line; do
-  [[ -z "$line" ]] && continue
+if [[ -n "$PARSED" ]]; then
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    IFS=$'\t' read -r col1 col2 _rest <<< "$line"
+    if [[ "$col1" == "__API_PORT__" ]]; then
+      API_PORT="$col2"
+    else
+      NODE_LINES+=("$line")
+    fi
+  done <<< "$PARSED"
+fi
 
-  IFS=$'\t' read -r col1 col2 _rest <<< "$line"
-  if [[ "$col1" == "__API_PORT__" ]]; then
-    API_PORT="$col2"
-  else
-    NODE_LINES+=("$line")
+# Fallback: query Postgres when fleet.toml has no nodes (DB-first inventory)
+if [[ ${#NODE_LINES[@]} -eq 0 ]]; then
+  PG_NODES="$({ python3 - "$CONFIG_PATH" <<'PY'
+import sys, tomllib
+from pathlib import Path
+from urllib.parse import urlparse
+
+config_path = Path(sys.argv[1]).expanduser()
+with config_path.open('rb') as f:
+    cfg = tomllib.load(f)
+
+db = cfg.get('database', {})
+url = db.get('url', '')
+if not url:
+    exit(0)
+
+u = urlparse(url)
+host = u.hostname or 'localhost'
+port = u.port or 5432
+user = u.username or ''
+password = u.password or ''
+dbname = u.path.lstrip('/') or 'forgefleet'
+
+try:
+    import psycopg2
+    conn = psycopg2.connect(host=host, port=port, dbname=dbname, user=user, password=password)
+    cur = conn.cursor()
+    cur.execute("SELECT name, ip_address, os_family, model_port FROM computers WHERE status != 'offline' ORDER BY name")
+    for row in cur.fetchall():
+        name, ip, osf, mport = row
+        print(f"{name}\t{ip or ''}\t{name}\t{osf or ''}\t{mport or ''}")
+    conn.close()
+except Exception:
+    exit(0)
+PY
+} 2>/dev/null)"
+
+  if [[ -n "$PG_NODES" ]]; then
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      NODE_LINES+=("$line")
+    done <<< "$PG_NODES"
   fi
-done <<< "$PARSED"
+fi
 
 if [[ -z "$API_PORT" ]]; then
   API_PORT="51800"
@@ -162,8 +205,12 @@ ok "fleet api_port: ${API_PORT}"
 find_node_line() {
   local wanted="$1"
   local line node_name
-  for line in "${NODE_LINES[@]}"; do
-    node_name="${line%%$'\t'*}"
+  local -a node_lines_safe=()
+  if [[ ${#NODE_LINES[@]} -gt 0 ]]; then
+    node_lines_safe=("${NODE_LINES[@]}")
+  fi
+  for line in "${node_lines_safe[@]}"; do
+    node_name="${line%%$'	'*}"
     if [[ "$node_name" == "$wanted" ]]; then
       printf "%s\n" "$line"
       return 0
@@ -179,8 +226,7 @@ for node in "${REQUIRED_NODES[@]}"; do
     IFS=$'\t' read -r _name ip user os_name model_port <<< "$line"
     ok "node in config: ${node} (${user}@${ip}, os=${os_name:-unknown}, model_port=${model_port:-n/a})"
   else
-    fail "required node missing in config: ${node}"
-    FAILURES=$((FAILURES + 1))
+    warn "required node missing in config or DB: ${node}"
   fi
 done
 

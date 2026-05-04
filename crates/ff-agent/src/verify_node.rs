@@ -37,7 +37,7 @@ pub async fn verify_node(pool: &PgPool, node_name: &str) -> Result<VerifyReport,
     let db_cmd = if is_windows {
         r#"powershell -NoProfile -Command "& { $out = & \"$env:USERPROFILE\.local\bin\ff.exe\" status --no-color 2>&1 | Out-String; if ($out -match 'connected|Database') { exit 0 } else { exit 1 } }""#
     } else {
-        "~/.local/bin/ff status --no-color 2>&1 | head -5 | grep -q 'connected\\|Database'"
+        "~/.local/bin/ff status 2>&1 | head -5 | grep -q 'connected\\|Database'"
     };
     details.push(check_ssh_cmd(&ssh_dest, "db_reachable_from_node", db_cmd).await);
     // 3. redis_reachable_from_node
