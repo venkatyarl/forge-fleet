@@ -41,7 +41,7 @@ const STORE_SCAN_LIMIT: u32 = 20_000;
 
 // ─── Helper: generic config_kv CRUD ─────────────────────────────────────────
 
-async fn config_kv_get<T: serde::de::DeserializeOwned>(
+pub async fn config_kv_get<T: serde::de::DeserializeOwned>(
     store: &OperationalStore,
     key: &str,
 ) -> McResult<Option<T>> {
@@ -51,7 +51,7 @@ async fn config_kv_get<T: serde::de::DeserializeOwned>(
     }
 }
 
-async fn config_kv_set<T: serde::Serialize>(
+pub async fn config_kv_set<T: serde::Serialize>(
     store: &OperationalStore,
     key: &str,
     value: &T,
@@ -60,11 +60,11 @@ async fn config_kv_set<T: serde::Serialize>(
     store.config_set(key, &json).await.map_err(|e| to_other_error("config_set", e))
 }
 
-async fn config_kv_delete(store: &OperationalStore, key: &str) -> McResult<bool> {
+pub async fn config_kv_delete(store: &OperationalStore, key: &str) -> McResult<bool> {
     store.config_delete(key).await.map_err(|e| to_other_error("config_delete", e))
 }
 
-async fn config_kv_list<T: serde::de::DeserializeOwned>(
+pub async fn config_kv_list<T: serde::de::DeserializeOwned>(
     store: &OperationalStore,
     prefix: &str,
 ) -> McResult<Vec<T>> {
@@ -83,12 +83,12 @@ async fn config_kv_list<T: serde::de::DeserializeOwned>(
 
 // ─── Company handlers ───────────────────────────────────────────────────────
 
-async fn list_companies(State(state): State<std::sync::Arc<McOperationalState>>) -> Json<Vec<Company>> {
+pub async fn list_companies(State(state): State<std::sync::Arc<McOperationalState>>) -> Json<Vec<Company>> {
     let items = config_kv_list::<Company>(&state.store, COMPANY_PREFIX).await.unwrap_or_default();
     Json(items)
 }
 
-async fn create_company(
+pub async fn create_company(
     State(state): State<std::sync::Arc<McOperationalState>>,
     Json(params): Json<CreateCompany>,
 ) -> Result<Json<Company>, (StatusCode, Json<ErrorResponse>)> {
@@ -140,7 +140,7 @@ async fn create_company(
     Ok(Json(company))
 }
 
-async fn get_company(
+pub async fn get_company(
     State(state): State<std::sync::Arc<McOperationalState>>,
     Path(id): Path<String>,
 ) -> Result<Json<Company>, (StatusCode, Json<ErrorResponse>)> {
@@ -150,7 +150,7 @@ async fn get_company(
     }
 }
 
-async fn update_company(
+pub async fn update_company(
     State(state): State<std::sync::Arc<McOperationalState>>,
     Path(id): Path<String>,
     Json(params): Json<UpdateCompany>,
@@ -197,7 +197,7 @@ async fn update_company(
     Ok(Json(company))
 }
 
-async fn delete_company(
+pub async fn delete_company(
     State(state): State<std::sync::Arc<McOperationalState>>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
@@ -210,12 +210,12 @@ async fn delete_company(
 
 // ─── Project handlers ───────────────────────────────────────────────────────
 
-async fn list_projects(State(state): State<std::sync::Arc<McOperationalState>>) -> Json<Vec<Project>> {
+pub async fn list_projects(State(state): State<std::sync::Arc<McOperationalState>>) -> Json<Vec<Project>> {
     let items = config_kv_list::<Project>(&state.store, PROJECT_PREFIX).await.unwrap_or_default();
     Json(items)
 }
 
-async fn create_project(
+pub async fn create_project(
     State(state): State<std::sync::Arc<McOperationalState>>,
     Json(params): Json<CreateProject>,
 ) -> Result<Json<Project>, (StatusCode, Json<ErrorResponse>)> {
@@ -268,7 +268,7 @@ async fn create_project(
     Ok(Json(project))
 }
 
-async fn get_project(
+pub async fn get_project(
     State(state): State<std::sync::Arc<McOperationalState>>,
     Path(id): Path<String>,
 ) -> Result<Json<Project>, (StatusCode, Json<ErrorResponse>)> {
@@ -278,7 +278,7 @@ async fn get_project(
     }
 }
 
-async fn update_project(
+pub async fn update_project(
     State(state): State<std::sync::Arc<McOperationalState>>,
     Path(id): Path<String>,
     Json(params): Json<UpdateProject>,
@@ -325,7 +325,7 @@ async fn update_project(
     Ok(Json(project))
 }
 
-async fn delete_project(
+pub async fn delete_project(
     State(state): State<std::sync::Arc<McOperationalState>>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
@@ -337,7 +337,7 @@ async fn delete_project(
 
 // ─── Project repos ──────────────────────────────────────────────────────────
 
-async fn list_project_repos(
+pub async fn list_project_repos(
     State(state): State<std::sync::Arc<McOperationalState>>,
     Path(project_id): Path<String>,
 ) -> Json<Vec<ProjectRepo>> {
@@ -345,7 +345,7 @@ async fn list_project_repos(
     Json(all.into_iter().filter(|r| r.project_id == project_id).collect())
 }
 
-async fn create_project_repo(
+pub async fn create_project_repo(
     State(state): State<std::sync::Arc<McOperationalState>>,
     Path(project_id): Path<String>,
     Json(params): Json<CreateProjectRepo>,
@@ -378,7 +378,7 @@ async fn create_project_repo(
 
 // ─── Project environments ───────────────────────────────────────────────────
 
-async fn list_project_environments(
+pub async fn list_project_environments(
     State(state): State<std::sync::Arc<McOperationalState>>,
     Path(project_id): Path<String>,
 ) -> Json<Vec<ProjectEnvironment>> {
@@ -386,7 +386,7 @@ async fn list_project_environments(
     Json(all.into_iter().filter(|e| e.project_id == project_id).collect())
 }
 
-async fn create_project_environment(
+pub async fn create_project_environment(
     State(state): State<std::sync::Arc<McOperationalState>>,
     Path(project_id): Path<String>,
     Json(params): Json<CreateProjectEnvironment>,
@@ -420,7 +420,7 @@ async fn create_project_environment(
 
 // ─── Portfolio summary ──────────────────────────────────────────────────────
 
-async fn get_portfolio_summary(
+pub async fn get_portfolio_summary(
     State(state): State<std::sync::Arc<McOperationalState>>,
 ) -> Json<PortfolioSummary> {
     let companies = config_kv_list::<crate::portfolio::Company>(&state.store, COMPANY_PREFIX).await.unwrap_or_default();
@@ -457,12 +457,12 @@ async fn get_portfolio_summary(
 
 // ─── Epic handlers ──────────────────────────────────────────────────────────
 
-async fn list_epics(State(state): State<std::sync::Arc<McOperationalState>>) -> Json<Vec<Epic>> {
+pub async fn list_epics(State(state): State<std::sync::Arc<McOperationalState>>) -> Json<Vec<Epic>> {
     let items = config_kv_list::<Epic>(&state.store, EPIC_PREFIX).await.unwrap_or_default();
     Json(items)
 }
 
-async fn create_epic(
+pub async fn create_epic(
     State(state): State<std::sync::Arc<McOperationalState>>,
     Json(params): Json<CreateEpic>,
 ) -> Result<Json<Epic>, (StatusCode, Json<ErrorResponse>)> {
@@ -490,7 +490,7 @@ async fn create_epic(
     Ok(Json(epic))
 }
 
-async fn get_epic(
+pub async fn get_epic(
     State(state): State<std::sync::Arc<McOperationalState>>,
     Path(id): Path<String>,
 ) -> Result<Json<Epic>, (StatusCode, Json<ErrorResponse>)> {
@@ -500,7 +500,7 @@ async fn get_epic(
     }
 }
 
-async fn update_epic(
+pub async fn update_epic(
     State(state): State<std::sync::Arc<McOperationalState>>,
     Path(id): Path<String>,
     Json(params): Json<UpdateEpic>,
@@ -529,7 +529,7 @@ async fn update_epic(
     Ok(Json(epic))
 }
 
-async fn delete_epic(
+pub async fn delete_epic(
     State(state): State<std::sync::Arc<McOperationalState>>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
@@ -539,7 +539,7 @@ async fn delete_epic(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn get_epic_progress(
+pub async fn get_epic_progress(
     State(state): State<std::sync::Arc<McOperationalState>>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
@@ -564,12 +564,12 @@ async fn get_epic_progress(
 
 // ─── Sprint handlers ────────────────────────────────────────────────────────
 
-async fn list_sprints(State(state): State<std::sync::Arc<McOperationalState>>) -> Json<Vec<Sprint>> {
+pub async fn list_sprints(State(state): State<std::sync::Arc<McOperationalState>>) -> Json<Vec<Sprint>> {
     let items = config_kv_list::<Sprint>(&state.store, SPRINT_PREFIX).await.unwrap_or_default();
     Json(items)
 }
 
-async fn create_sprint(
+pub async fn create_sprint(
     State(state): State<std::sync::Arc<McOperationalState>>,
     Json(params): Json<CreateSprint>,
 ) -> Result<Json<Sprint>, (StatusCode, Json<ErrorResponse>)> {
@@ -593,7 +593,7 @@ async fn create_sprint(
     Ok(Json(sprint))
 }
 
-async fn get_sprint(
+pub async fn get_sprint(
     State(state): State<std::sync::Arc<McOperationalState>>,
     Path(id): Path<String>,
 ) -> Result<Json<Sprint>, (StatusCode, Json<ErrorResponse>)> {
@@ -603,7 +603,7 @@ async fn get_sprint(
     }
 }
 
-async fn update_sprint(
+pub async fn update_sprint(
     State(state): State<std::sync::Arc<McOperationalState>>,
     Path(id): Path<String>,
     Json(params): Json<UpdateSprint>,
@@ -634,7 +634,7 @@ async fn update_sprint(
     Ok(Json(sprint))
 }
 
-async fn delete_sprint(
+pub async fn delete_sprint(
     State(state): State<std::sync::Arc<McOperationalState>>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
@@ -644,7 +644,7 @@ async fn delete_sprint(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn get_sprint_stats(
+pub async fn get_sprint_stats(
     State(state): State<std::sync::Arc<McOperationalState>>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
@@ -668,7 +668,7 @@ async fn get_sprint_stats(
     })))
 }
 
-async fn get_sprint_burndown(
+pub async fn get_sprint_burndown(
     State(state): State<std::sync::Arc<McOperationalState>>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
@@ -692,12 +692,12 @@ async fn get_sprint_burndown(
 
 // ─── Task group handlers ────────────────────────────────────────────────────
 
-async fn list_task_groups(State(state): State<std::sync::Arc<McOperationalState>>) -> Json<Vec<TaskGroup>> {
+pub async fn list_task_groups(State(state): State<std::sync::Arc<McOperationalState>>) -> Json<Vec<TaskGroup>> {
     let items = config_kv_list::<TaskGroup>(&state.store, TASK_GROUP_PREFIX).await.unwrap_or_default();
     Json(items)
 }
 
-async fn create_task_group(
+pub async fn create_task_group(
     State(state): State<std::sync::Arc<McOperationalState>>,
     Json(params): Json<CreateTaskGroup>,
 ) -> Result<Json<TaskGroup>, (StatusCode, Json<ErrorResponse>)> {
@@ -716,7 +716,7 @@ async fn create_task_group(
     Ok(Json(tg))
 }
 
-async fn get_task_group(
+pub async fn get_task_group(
     State(state): State<std::sync::Arc<McOperationalState>>,
     Path(id): Path<String>,
 ) -> Result<Json<TaskGroup>, (StatusCode, Json<ErrorResponse>)> {
@@ -726,7 +726,7 @@ async fn get_task_group(
     }
 }
 
-async fn update_task_group(
+pub async fn update_task_group(
     State(state): State<std::sync::Arc<McOperationalState>>,
     Path(id): Path<String>,
     Json(params): Json<UpdateTaskGroup>,
@@ -751,7 +751,7 @@ async fn update_task_group(
     Ok(Json(tg))
 }
 
-async fn delete_task_group(
+pub async fn delete_task_group(
     State(state): State<std::sync::Arc<McOperationalState>>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
@@ -761,7 +761,7 @@ async fn delete_task_group(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn list_task_group_items(
+pub async fn list_task_group_items(
     State(state): State<std::sync::Arc<McOperationalState>>,
     Path(id): Path<String>,
 ) -> Json<Vec<crate::work_item::WorkItem>> {

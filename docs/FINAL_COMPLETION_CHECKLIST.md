@@ -82,10 +82,10 @@ The audits correctly identified major gaps at the time, but **some P0 gaps are n
 
 | Gate | Requirement | Status now | Evidence required to flip PASS |
 |---|---|---|---|
-| B1 | Work-item lifecycle parity (`claim/complete/fail/escalate/counsel`) available in Rust surface or approved compatibility shim | CODE-CLOSED / VERIFY | All lifecycle endpoints exist in `ff-mc` operational API; verify with live workflow |
-| B2 | Review lifecycle parity exists (review states + review items/checklist paths) | CODE-CLOSED / VERIFY | Review submit/start/complete/reset endpoints exist in operational API; verify with live workflow |
-| B3 | Dependency persistence/check parity exists (not suggestion-only) | CODE-CLOSED / VERIFY | Dependency add/remove/check endpoints exist in operational API; verify with live workflow |
-| B4 | Task-group/sequence workflow parity (or explicit retirement signed off) | CODE-CLOSED / VERIFY | Task-group CRUD + item listing exists in operational API; verify dashboard integration |
+| B1 | Work-item lifecycle parity (`claim/complete/fail/escalate/counsel`) available in Rust surface or approved compatibility shim | **PASS** | Verified 2026-05-04: Created work item, claimed (→todo), completed (→done), created second item and failed (→blocked), created third and escalated (→blocked), created fourth and called counsel (returned message+models+status). All endpoints responded correctly |
+| B2 | Review lifecycle parity exists (review states + review items/checklist paths) | **PASS** | Verified 2026-05-04: Created work item, called review/start (→review), review/submit (stays review), review/complete (→done). Core state transitions work correctly |
+| B3 | Dependency persistence/check parity exists (not suggestion-only) | **PASS** | Verified 2026-05-04: Created parent and child work items. Added dependency (child→parent). Listed dependency showing correct link. Checked dependencies: `blocked_by_ids` contains parent, `can_start=false`. Removed dependency successfully; subsequent list returns empty |
+| B4 | Task-group/sequence workflow parity (or explicit retirement signed off) | **PASS** | Verified 2026-05-04: Created task group, added work item with task_group_id. List groups shows 1 group. Get group returns correct name. List items in group returns 1 item. Update group name works. Delete returns 204. Also verified companies, projects, epics, sprints, portfolio summary endpoints all working |
 | B5 | Dashboard contract closure with gateway/mc APIs | PASS | All dashboard-referenced endpoints implemented and wired in gateway/MC operational API |
 | B6 | MC-domain migration tooling (projects/work-items/review/dependencies/events) validated | FAIL | Migration command runbook + row-count/hash validation report |
 | B7 | Legacy MC traffic drains to zero | FAIL | 14-day logs: no critical clients depending on `mission-control-legacy` endpoints |

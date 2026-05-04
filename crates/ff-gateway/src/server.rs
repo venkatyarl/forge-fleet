@@ -597,9 +597,8 @@ pub fn build_router(state: Arc<GatewayState>, mc_db_path: Option<&str>) -> Route
     if let Some(store) = state.operational_store.clone()
         && (matches!(store, OperationalStore::Postgres(_)) || mc_db_path.is_none())
     {
-        let mc_routes = ff_mc::operational_api::mc_router_operational(store.clone());
-        let portfolio_routes = ff_mc::operational_portfolio::portfolio_router(std::sync::Arc::new(ff_mc::operational_api::McOperationalState { store }));
-        app = app.merge(mc_routes.with_state(())).merge(portfolio_routes.with_state(()));
+        let mc_routes = ff_mc::operational_api::mc_router_operational(store);
+        app = app.merge(mc_routes.with_state(()));
         mounted_mc_routes = true;
         info!("mission control API mounted at /api/mc/* (operational store backend)");
     }

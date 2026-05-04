@@ -24,6 +24,10 @@ The Rust rewrite implementation and documentation campaign across Phases 1–12 
   - A1: `fleet_crew` end-to-end execution verified (3/3 steps succeeded, audit persisted)
   - A2: Autonomous daemon task-claim→done verified (transition trail + task_results captured)
   - A3: Ownership lease/handoff verified (claim→handoff→release chain in ownership_events)
+  - B1: Work-item lifecycle verified (create/claim/complete/fail/escalate/counsel all working)
+  - B2: Review lifecycle verified (start/submit/complete state transitions working)
+  - B3: Dependency persistence verified (add/list/check/remove working with blocked status)
+  - B4: Task-group + portfolio/planning verified (CRUD for companies, projects, epics, sprints, task-groups)
 
 ## Latest Verification (fresh)
 
