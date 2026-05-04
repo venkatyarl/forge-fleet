@@ -865,6 +865,20 @@ enum OauthCommand {
         #[arg(default_value = "all")]
         provider: String,
     },
+    /// Refresh — spawn the vendor CLI to trigger its internal token
+    /// refresh, then re-import the (potentially newer) token to
+    /// `fleet_secrets`. Useful as a periodic cron tick to keep the
+    /// harvested token fresh as access_tokens age toward expiry.
+    /// Runs `probe` (which spawns the CLI with a tiny prompt — that
+    /// causes the CLI to refresh its tokens if stale) and then
+    /// `import` (which re-reads the cred source). Pass `all` to
+    /// refresh every provider whose cred is currently importable.
+    Refresh {
+        /// Provider name: `claude`, `codex`, `gemini`, `kimi`, `grok`,
+        /// or `all`.
+        #[arg(default_value = "all")]
+        provider: String,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -2828,6 +2842,31 @@ async fn main() -> Result<()> {
                             "{:<10} {color}{:<14}{RESET} {:<5} {}",
                             r.provider, r.status, code, detail
                         );
+                    }
+                    Ok(())
+                }
+                OauthCommand::Refresh { provider } => {
+                    let providers = resolve(&provider)?;
+                    for p in providers {
+                        // Step 1: probe — spawns vendor CLI with a tiny
+                        // prompt; that causes the CLI to refresh stale
+                        // tokens against its own backend if needed.
+                        let r = ff_agent::oauth_distributor::probe_one(&pool, p).await;
+                        let probe_color = match r.status.as_str() {
+                            "ok" => GREEN,
+                            _ => YELLOW,
+                        };
+                        println!("{:<10} probe → {probe_color}{}{RESET}", p.name, r.status);
+                        // Step 2: re-import — re-reads the cred source
+                        // (file or Keychain), capturing any token the
+                        // CLI just wrote during step 1.
+                        match ff_agent::oauth_distributor::import_token(&pool, p).await {
+                            Ok(()) => println!(
+                                "{:<10} {GREEN}✓{RESET} re-imported to fleet_secrets[{}]",
+                                p.name, p.secret_key
+                            ),
+                            Err(e) => println!("{:<10} {RED}✗{RESET} import: {e}", p.name),
+                        }
                     }
                     Ok(())
                 }
