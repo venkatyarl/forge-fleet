@@ -28,6 +28,7 @@ import { ToolInventory } from './pages/ToolInventory'
 import { ModelHub } from './pages/ModelHub'
 import { Brain } from './pages/Brain'
 import { BrainGraph } from './pages/BrainGraph'
+import { CostLedger } from './pages/CostLedger'
 import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts'
 
 function Shell() {
@@ -102,6 +103,7 @@ export default function App() {
         <Route path="onboard" element={<Navigate to="/onboarding" replace />} />
         <Route path="versions" element={<Versions />} />
         <Route path="mesh" element={<MeshStatus />} />
+        <Route path="cost-ledger" element={<CostLedger />} />
         {/* Legacy redirects */}
         <Route path="mission-control" element={<Navigate to="/" replace />} />
         <Route path="nodes/:nodeId" element={<Navigate to="/settings#fleet" replace />} />

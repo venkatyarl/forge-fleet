@@ -26,6 +26,12 @@ struct BackendEnvConfig {
     busy: bool,
     #[serde(default = "default_http")]
     scheme: String,
+    #[serde(default = "default_true")]
+    is_local: bool,
+    #[serde(default)]
+    cost_per_1k_input: f64,
+    #[serde(default)]
+    cost_per_1k_output: f64,
 }
 
 impl ApiConfig {
@@ -54,6 +60,9 @@ impl ApiConfig {
                         healthy: entry.healthy,
                         busy: entry.busy,
                         scheme: entry.scheme,
+                        is_local: entry.is_local,
+                        cost_per_1k_input: entry.cost_per_1k_input,
+                        cost_per_1k_output: entry.cost_per_1k_output,
                     })
                     .collect()
             })

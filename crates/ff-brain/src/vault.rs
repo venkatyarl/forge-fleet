@@ -190,7 +190,7 @@ pub fn chunk_markdown(body: &str, file_path: &str) -> Vec<VaultChunk> {
 
     let lines: Vec<&str> = body.lines().collect();
     let max_chunk_chars = 512 * 4; // ~512 tokens at 4 chars/token
-    let overlap_chars = max_chunk_chars / 5; // ~20% overlap
+    let _overlap_chars = max_chunk_chars / 5; // ~20% overlap
 
     let build_breadcrumb = |stack: &[(usize, String)]| -> String {
         let mut parts: Vec<&str> = vec![file_path];

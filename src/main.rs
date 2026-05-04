@@ -2336,6 +2336,7 @@ async fn build_api_config(config: &FleetConfig, pg_pool: Option<&ff_db::PgPool>)
     for (node_name, node_cfg) in &config.nodes {
         for (model_slug, model_cfg) in &node_cfg.models {
             let port = model_cfg.port.unwrap_or(config.fleet.api_port);
+            let is_local = !model_slug.starts_with("gpt") && !model_slug.starts_with("claude") && !model_slug.starts_with("gemini");
             backends.push(BackendEndpoint {
                 id: format!("{}:{}:{}", node_name, model_slug, port),
                 node: node_name.clone(),
@@ -2346,6 +2347,9 @@ async fn build_api_config(config: &FleetConfig, pg_pool: Option<&ff_db::PgPool>)
                 healthy: true,
                 busy: false,
                 scheme: "http".to_string(),
+                is_local,
+                cost_per_1k_input: if is_local { 0.0 } else { 0.001 },
+                cost_per_1k_output: if is_local { 0.0 } else { 0.003 },
             });
         }
     }
@@ -2374,6 +2378,7 @@ async fn build_api_config(config: &FleetConfig, pg_pool: Option<&ff_db::PgPool>)
                 continue;
             }
 
+            let is_local = !model.id.starts_with("gpt") && !model.id.starts_with("claude") && !model.id.starts_with("gemini");
             backends.push(BackendEndpoint {
                 id,
                 node: node_name.clone(),
@@ -2384,6 +2389,9 @@ async fn build_api_config(config: &FleetConfig, pg_pool: Option<&ff_db::PgPool>)
                 healthy: true,
                 busy: false,
                 scheme: "http".to_string(),
+                is_local,
+                cost_per_1k_input: if is_local { 0.0 } else { 0.001 },
+                cost_per_1k_output: if is_local { 0.0 } else { 0.003 },
             });
         }
     }
@@ -2407,6 +2415,7 @@ async fn build_api_config(config: &FleetConfig, pg_pool: Option<&ff_db::PgPool>)
                     if backends.iter().any(|b| b.id == id) {
                         continue;
                     }
+                    let is_local = !m.slug.starts_with("gpt") && !m.slug.starts_with("claude") && !m.slug.starts_with("gemini");
                     backends.push(BackendEndpoint {
                         id,
                         node: m.node_name.clone(),
@@ -2417,6 +2426,9 @@ async fn build_api_config(config: &FleetConfig, pg_pool: Option<&ff_db::PgPool>)
                         healthy: true,
                         busy: false,
                         scheme: "http".to_string(),
+                        is_local,
+                        cost_per_1k_input: if is_local { 0.0 } else { 0.001 },
+                        cost_per_1k_output: if is_local { 0.0 } else { 0.003 },
                     });
                     info!(
                         node = %m.node_name,

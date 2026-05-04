@@ -17,11 +17,27 @@ pub struct BackendEndpoint {
     pub busy: bool,
     #[serde(default = "default_http")]
     pub scheme: String,
+    /// Whether this is a local (self-hosted, free) endpoint.
+    #[serde(default = "default_true")]
+    pub is_local: bool,
+    /// Cost per 1K input tokens in USD (0.0 for local).
+    #[serde(default)]
+    pub cost_per_1k_input: f64,
+    /// Cost per 1K output tokens in USD (0.0 for local).
+    #[serde(default)]
+    pub cost_per_1k_output: f64,
 }
 
 impl BackendEndpoint {
     pub fn base_url(&self) -> String {
         format!("{}://{}:{}", self.scheme, self.host, self.port)
+    }
+
+    /// Calculate estimated cost for given token counts.
+    pub fn estimate_cost(&self, prompt_tokens: u32, completion_tokens: u32) -> f64 {
+        let input_cost = (prompt_tokens as f64 / 1000.0) * self.cost_per_1k_input;
+        let output_cost = (completion_tokens as f64 / 1000.0) * self.cost_per_1k_output;
+        input_cost + output_cost
     }
 }
 

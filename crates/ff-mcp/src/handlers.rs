@@ -2446,6 +2446,7 @@ fn backends_from_config(config: &FleetConfig) -> Vec<BackendEndpoint> {
                 model.name.clone()
             };
 
+            let is_local = !model_name.starts_with("gpt") && !model_name.starts_with("claude") && !model_name.starts_with("gemini");
             endpoints.push(BackendEndpoint {
                 id: format!("{}:{}:{}", node_name, slug, port),
                 node: node_name.clone(),
@@ -2456,6 +2457,9 @@ fn backends_from_config(config: &FleetConfig) -> Vec<BackendEndpoint> {
                 healthy: true,
                 busy: false,
                 scheme: "http".to_string(),
+                is_local,
+                cost_per_1k_input: if is_local { 0.0 } else { 0.001 },
+                cost_per_1k_output: if is_local { 0.0 } else { 0.003 },
             });
         }
     }

@@ -525,6 +525,7 @@ mod tests {
     use super::*;
 
     fn make_backend(id: &str, tier: u8, model: &str) -> BackendEndpoint {
+        let is_local = !model.starts_with("gpt") && !model.starts_with("claude") && !model.starts_with("gemini");
         BackendEndpoint {
             id: id.to_string(),
             node: "test-node".to_string(),
@@ -535,6 +536,9 @@ mod tests {
             healthy: true,
             busy: false,
             scheme: "http".to_string(),
+            is_local,
+            cost_per_1k_input: if is_local { 0.0 } else { 0.001 },
+            cost_per_1k_output: if is_local { 0.0 } else { 0.003 },
         }
     }
 

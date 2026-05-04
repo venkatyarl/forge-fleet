@@ -19,6 +19,25 @@ use crate::types::ChatMessage;
 
 // ─── Configuration ───────────────────────────────────────────────────────────
 
+/// Routing policy for local vs cloud model selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoutingPolicy {
+    /// Prefer local models, only escalate to cloud for complex tasks or when local fails.
+    LocalFirst,
+    /// Optimize for lowest cost (prefer local, then cheapest cloud).
+    CostOptimized,
+    /// Optimize for highest quality (use adaptive quality tracking).
+    QualityFirst,
+    /// Balanced: consider quality, cost, and locality together.
+    Balanced,
+}
+
+impl Default for RoutingPolicy {
+    fn default() -> Self {
+        RoutingPolicy::LocalFirst
+    }
+}
+
 /// Configuration for the adaptive router.
 #[derive(Debug, Clone)]
 pub struct AdaptiveRouterConfig {
@@ -41,6 +60,13 @@ pub struct AdaptiveRouterConfig {
     /// [`AdaptiveRouter::autoload_if_missing`] to spawn the inference server
     /// for a catalog model before routing falls over.
     pub autoload_enabled: bool,
+
+    /// Routing policy for local vs cloud selection.
+    pub policy: RoutingPolicy,
+
+    /// Complexity threshold above which cloud models are allowed even with LocalFirst policy.
+    /// Complex tasks (tier >= this) may use cloud if no local model can handle them.
+    pub cloud_complexity_threshold: u8,
 }
 
 impl Default for AdaptiveRouterConfig {
@@ -51,6 +77,8 @@ impl Default for AdaptiveRouterConfig {
             max_latency_ratio: 3.0,
             enabled: true,
             autoload_enabled: true,
+            policy: RoutingPolicy::LocalFirst,
+            cloud_complexity_threshold: 3,
         }
     }
 }
@@ -168,6 +196,9 @@ impl AdaptiveRouter {
             healthy: true,
             busy: false,
             scheme: "http".to_string(),
+            is_local: true,
+            cost_per_1k_input: 0.0,
+            cost_per_1k_output: 0.0,
         };
         self.registry.add_endpoint(endpoint).await;
         Ok(Some(url))
@@ -289,7 +320,7 @@ impl AdaptiveRouter {
         }
     }
 
-    /// Select the best model from rankings considering quality, cost, and latency.
+    /// Select the best model from rankings considering quality, cost, locality, and latency.
     fn select_best_model(
         &self,
         rankings: &[crate::quality_tracker::ModelRanking],
@@ -303,34 +334,114 @@ impl AdaptiveRouter {
         }
 
         let best_quality = confident[0]; // Already sorted by quality descending
+        let policy = self.config.policy;
+        let is_complex = profile.complexity == crate::classifier::Complexity::Complex
+            || profile.recommended_tier >= self.config.cloud_complexity_threshold;
 
-        // Find the cheapest model whose quality is within epsilon of the best
-        let mut candidate = best_quality;
-        let mut reason = format!(
-            "best quality ({:.2}) for {}",
-            best_quality.score, profile.task_type
-        );
+        // Apply policy-based filtering
+        let filtered: Vec<_> = match policy {
+            RoutingPolicy::LocalFirst => {
+                // Try local models first for non-complex tasks
+                if !is_complex {
+                    let local_models: Vec<_> = confident.iter().filter(|r| self.is_local_model(&r.model_id)).copied().collect();
+                    if !local_models.is_empty() {
+                        local_models
+                    } else {
+                        confident.clone()
+                    }
+                } else {
+                    confident.clone()
+                }
+            }
+            RoutingPolicy::CostOptimized => {
+                // Prefer local (free), then cheapest tier
+                let mut sorted = confident.clone();
+                sorted.sort_by(|a, b| {
+                    let a_local = self.is_local_model(&a.model_id);
+                    let b_local = self.is_local_model(&b.model_id);
+                    match (a_local, b_local) {
+                        (true, false) => std::cmp::Ordering::Less,
+                        (false, true) => std::cmp::Ordering::Greater,
+                        _ => a.tier.cmp(&b.tier).then(a.avg_latency_ms.partial_cmp(&b.avg_latency_ms).unwrap_or(std::cmp::Ordering::Equal)),
+                    }
+                });
+                sorted
+            }
+            RoutingPolicy::QualityFirst => {
+                // Use quality rankings as-is
+                confident.clone()
+            }
+            RoutingPolicy::Balanced => {
+                // Score each model: quality * 0.4 + locality_bonus * 0.3 + cost_bonus * 0.3
+                let mut scored: Vec<_> = confident.iter().map(|r| {
+                    let locality_bonus = if self.is_local_model(&r.model_id) { 0.3 } else { 0.0 };
+                    let cost_bonus = if r.tier <= 2 { 0.2 } else { 0.0 };
+                    let score = r.score * 0.5 + locality_bonus + cost_bonus;
+                    (*r, score)
+                }).collect();
+                scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                scored.into_iter().map(|(r, _)| r).collect()
+            }
+        };
 
-        for r in &confident {
-            // Skip models with much worse quality
-            if best_quality.score - r.score > self.config.quality_epsilon {
+        if filtered.is_empty() {
+            return None;
+        }
+
+        // Find the best model within filtered set
+        let mut candidate = filtered[0];
+        let mut reason = match policy {
+            RoutingPolicy::LocalFirst => {
+                if self.is_local_model(&candidate.model_id) {
+                    format!("local-first: best local model ({:.2}) for {}", candidate.score, profile.task_type)
+                } else {
+                    format!("local-first fallback: no local model available, using cloud ({:.2}) for {}", candidate.score, profile.task_type)
+                }
+            }
+            RoutingPolicy::CostOptimized => {
+                if self.is_local_model(&candidate.model_id) {
+                    format!("cost-optimized: free local model ({:.2}) for {}", candidate.score, profile.task_type)
+                } else {
+                    format!("cost-optimized: cheapest cloud model ({:.2}, tier {}) for {}", candidate.score, candidate.tier, profile.task_type)
+                }
+            }
+            RoutingPolicy::QualityFirst => {
+                format!("quality-first: best quality ({:.2}) for {}", candidate.score, profile.task_type)
+            }
+            RoutingPolicy::Balanced => {
+                format!("balanced: best overall score ({:.2}) for {}", candidate.score, profile.task_type)
+            }
+        };
+
+        // Within the filtered set, apply epsilon-based optimization
+        for r in &filtered {
+            // Skip models with much worse quality than best in filtered set
+            if filtered[0].score - r.score > self.config.quality_epsilon {
                 continue;
             }
 
-            // Prefer cheaper tier (lower tier number = cheaper)
+            // Prefer local models when quality is similar
+            let r_local = self.is_local_model(&r.model_id);
+            let cand_local = self.is_local_model(&candidate.model_id);
+            if r_local && !cand_local {
+                candidate = r;
+                reason = format!("similar quality ({:.2}) but local (free) vs cloud", r.score);
+                continue;
+            }
+
+            // Prefer cheaper tier when quality is similar
             if r.tier < candidate.tier {
                 candidate = r;
                 reason = format!(
                     "similar quality ({:.2} vs {:.2}) but cheaper tier {} vs {}",
-                    r.score, best_quality.score, r.tier, best_quality.tier
+                    r.score, filtered[0].score, r.tier, candidate.tier
                 );
             }
 
             // If same tier, prefer lower latency
             if r.tier == candidate.tier && r.avg_latency_ms < candidate.avg_latency_ms {
-                // Check latency ratio isn't too extreme
-                if best_quality.avg_latency_ms > 0.0
-                    && r.avg_latency_ms / best_quality.avg_latency_ms
+                if filtered[0].avg_latency_ms > 0.0
+                    && r.avg_latency_ms / filtered[0].avg_latency_ms
                         < self.config.max_latency_ratio
                 {
                     candidate = r;
@@ -343,6 +454,17 @@ impl AdaptiveRouter {
         }
 
         Some((candidate.model_id.clone(), reason))
+    }
+
+    /// Check if a model_id corresponds to a local (free) model.
+    /// Uses a simple heuristic based on model naming conventions.
+    fn is_local_model(&self, model_id: &str) -> bool {
+        let local_prefixes = [
+            "qwen", "llama", "mistral", "mixtral", "codellama",
+            "deepseek-coder", "phi-", "gemma", "yi-",
+        ];
+        let lower = model_id.to_lowercase();
+        local_prefixes.iter().any(|prefix| lower.starts_with(prefix))
     }
 
     // ── Tier Fallback ────────────────────────────────────────────────────
@@ -427,6 +549,7 @@ mod tests {
     use crate::router::TierRouter;
 
     fn make_backend(id: &str, tier: u8, model: &str) -> BackendEndpoint {
+        let is_local = !model.starts_with("gpt") && !model.starts_with("claude") && !model.starts_with("gemini");
         BackendEndpoint {
             id: id.to_string(),
             node: "test-node".to_string(),
@@ -437,6 +560,9 @@ mod tests {
             healthy: true,
             busy: false,
             scheme: "http".to_string(),
+            is_local,
+            cost_per_1k_input: if is_local { 0.0 } else { 0.001 },
+            cost_per_1k_output: if is_local { 0.0 } else { 0.003 },
         }
     }
 

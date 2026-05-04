@@ -66,3 +66,30 @@ jobs:
         uses: dtolnay/rust-toolchain@1.88.0
       - name: Run library tests
         run: cargo test --workspace --lib
+
+  test_integration:
+    name: cargo test -p forge-fleet --test integration_boot
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust 1.88.0
+        uses: dtolnay/rust-toolchain@1.88.0
+      - name: Run integration tests
+        run: cargo test -p forge-fleet --test integration_boot
+
+  build_release:
+    name: cargo build --release --bin forgefleetd
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust 1.88.0
+        uses: dtolnay/rust-toolchain@1.88.0
+      - name: Build release binary
+        run: cargo build --release --bin forgefleetd
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: forgefleetd-linux-x64
+          path: target/release/forgefleetd

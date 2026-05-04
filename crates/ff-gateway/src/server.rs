@@ -26,9 +26,11 @@ use ff_agent::agent_loop::{AgentEvent, AgentOutcome, AgentSession, AgentSessionC
 use ff_api::openai_compat::{self, validate_request};
 use ff_api::registry::BackendRegistry;
 use ff_api::router::{ModelRouter, TierRouter, TierRouterConfig, TierTimeouts};
+use ff_api::token_ledger::{CostTracker, FleetCostSummary, ModelCostStats, TokenUsageRecord};
 use ff_api::types::ChatCompletionRequest;
 use ff_db::sync::LeaderSync;
 use ff_db::{OperationalStore, RuntimeRegistryStore, queries};
+use sqlx::Row;
 use ff_discovery::health::HealthStatus;
 use ff_discovery::{FleetNode, NodeRegistry};
 use ff_mcp::McpServer;
@@ -130,6 +132,8 @@ pub struct GatewayState {
     pub ws_hub: crate::websocket::WsHub,
     /// Active agent sessions keyed by session UUID.
     pub agent_sessions: Arc<DashMap<Uuid, AgentSessionHandle>>,
+    /// Token usage and cost tracker for LLM requests.
+    pub cost_tracker: Arc<CostTracker>,
 }
 
 /// Handle to a running agent session managed by the gateway.
@@ -177,6 +181,7 @@ impl GatewayState {
             update_state: Arc::new(tokio::sync::RwLock::new(UpdateRolloutState::default())),
             ws_hub: crate::websocket::WsHub::new(),
             agent_sessions: Arc::new(DashMap::new()),
+            cost_tracker: Arc::new(CostTracker::new()),
         }
     }
 
@@ -330,6 +335,28 @@ impl GatewayServer {
             .unwrap_or_else(|_| reqwest::Client::new());
 
         let state = Arc::new(state);
+
+        // Spawn background token ledger flush task (every 5 minutes)
+        let flush_state = state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(300));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                if let Some(pool) = flush_state.operational_store.as_ref().and_then(|os| os.pg_pool()) {
+                    match flush_state.cost_tracker.flush_to_db(pool).await {
+                        Ok(count) if count > 0 => {
+                            tracing::info!(records = count, "token ledger flushed to database");
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!(error = %e, "token ledger flush failed");
+                        }
+                    }
+                }
+            }
+        });
+
         Ok(Self { config, state })
     }
 
@@ -377,6 +404,11 @@ pub fn build_router(state: Arc<GatewayState>, mc_db_path: Option<&str>) -> Route
         .route("/api/fleet/enroll", post(fleet_enroll))
         .route("/api/fleet/heartbeat", post(fleet_heartbeat))
         .route("/api/fleet/llm-usage", get(fleet_llm_usage))
+        .route("/api/ledger/summary", get(ledger_summary))
+        .route("/api/ledger/models", get(ledger_models))
+        .route("/api/ledger/budget", get(ledger_budget).post(ledger_budget_update))
+        .route("/api/ledger/flush", post(ledger_flush))
+        .route("/api/ledger/records", get(ledger_records))
         .route("/api/voice/transcribe", post(crate::voice_api::transcribe))
         .route("/api/voice/speak", post(crate::voice_api::speak))
         // Onboarding (see crates/ff-gateway/src/onboard.rs + plan §§3–3h)
@@ -1417,6 +1449,90 @@ async fn fleet_llm_usage(
             "tokens_total":   grand_in + grand_out,
             "cost_usd":       grand_cost,
         }
+    })))
+}
+
+// ─── Token Ledger API endpoints ──────────────────────────────────────────────
+
+/// GET /api/ledger/summary — Fleet-wide token usage and cost summary.
+async fn ledger_summary(
+    State(state): State<Arc<GatewayState>>,
+) -> Result<Json<FleetCostSummary>, (StatusCode, Json<Value>)> {
+    let summary = state.cost_tracker.summary().await;
+    Ok(Json(summary))
+}
+
+/// GET /api/ledger/models — Per-model token usage and cost stats.
+async fn ledger_models(
+    State(state): State<Arc<GatewayState>>,
+) -> Result<Json<Vec<ModelCostStats>>, (StatusCode, Json<Value>)> {
+    let stats = state.cost_tracker.model_stats();
+    Ok(Json(stats))
+}
+
+/// GET /api/ledger/budget — Current budget configuration.
+async fn ledger_budget(
+    State(state): State<Arc<GatewayState>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let budget = state.cost_tracker.budget_config().await;
+    Ok(Json(json!(budget)))
+}
+
+/// POST /api/ledger/budget — Update budget configuration.
+async fn ledger_budget_update(
+    State(state): State<Arc<GatewayState>>,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let config = match serde_json::from_value::<ff_api::token_ledger::BudgetConfig>(payload) {
+        Ok(c) => c,
+        Err(e) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("invalid budget config: {e}")})),
+            ));
+        }
+    };
+    state.cost_tracker.set_budget(config.clone()).await;
+    Ok(Json(json!({"status": "ok", "budget": config })))
+}
+
+/// POST /api/ledger/flush — Persist in-memory token ledger to Postgres.
+async fn ledger_flush(
+    State(state): State<Arc<GatewayState>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(pool) = state.operational_store.as_ref().and_then(|os| os.pg_pool()) else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "postgres not configured"})),
+        ));
+    };
+
+    match state.cost_tracker.flush_to_db(pool).await {
+        Ok(count) => Ok(Json(json!({"status": "ok", "records_flushed": count }))),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("flush failed: {e}")})),
+        )),
+    }
+}
+
+/// GET /api/ledger/records — Recent token usage records.
+async fn ledger_records(
+    State(state): State<Arc<GatewayState>>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let day = params.get("day").cloned().unwrap_or_else(|| {
+        chrono::Utc::now().format("%Y-%m-%d").to_string()
+    });
+    let limit = params.get("limit").and_then(|s| s.parse::<usize>().ok()).unwrap_or(100);
+
+    let records = state.cost_tracker.daily_records(&day).await;
+    let limited: Vec<_> = records.into_iter().rev().take(limit).collect();
+
+    Ok(Json(json!({
+        "day": day,
+        "count": limited.len(),
+        "records": limited,
     })))
 }
 
@@ -4287,6 +4403,9 @@ async fn proxy_chat_completions(
                                 healthy: true,
                                 busy: false,
                                 scheme: "http".to_string(),
+                                is_local: true,
+                                cost_per_1k_input: 0.0,
+                                cost_per_1k_output: 0.0,
                             };
                             registry.add_endpoint(endpoint).await;
                             info!(model = %payload.model, %url, "autoloaded model for chat request");
@@ -4353,11 +4472,15 @@ async fn proxy_chat_completions(
                                         Json(json!({"error": {"message": e, "type": "upstream_error"}})),
                                     ));
                             }
-                            return openai_compat::passthrough_response(upstream)
-                                .await
+                            // Non-streaming: record usage then passthrough
+                            let bytes = upstream.bytes().await.unwrap_or_default();
+                            let bytes = record_usage_from_response(&state, backend, &payload, bytes, latency.as_millis() as u64).await;
+                            let mut response = Response::builder().status(status);
+                            response = response.header(header::CONTENT_TYPE, "application/json");
+                            return response.body(Body::from(bytes))
                                 .map_err(|e| (
                                     StatusCode::BAD_GATEWAY,
-                                    Json(json!({"error": {"message": e, "type": "upstream_error"}})),
+                                    Json(json!({"error": {"message": e.to_string(), "type": "upstream_error"}})),
                                 ));
                         }
 
@@ -4390,16 +4513,16 @@ async fn proxy_chat_completions(
                                     Json(json!({"error": {"message": e, "type": "upstream_error"}})),
                                 ));
                         }
-                        return openai_compat::passthrough_response(upstream)
-                            .await
-                            .map_err(|e| {
-                                (
-                                    StatusCode::BAD_GATEWAY,
-                                    Json(
-                                        json!({"error": {"message": e, "type": "upstream_error"}}),
-                                    ),
-                                )
-                            });
+                        // Non-streaming: record usage then passthrough
+                        let bytes = upstream.bytes().await.unwrap_or_default();
+                        let bytes = record_usage_from_response(&state, backend, &payload, bytes, latency.as_millis() as u64).await;
+                        let mut response = Response::builder().status(status);
+                        response = response.header(header::CONTENT_TYPE, "application/json");
+                        return response.body(Body::from(bytes))
+                            .map_err(|e| (
+                                StatusCode::BAD_GATEWAY,
+                                Json(json!({"error": {"message": e.to_string(), "type": "upstream_error"}})),
+                            ));
                     }
                     Ok(Err(err)) => {
                         let latency = start.elapsed();
@@ -4485,14 +4608,18 @@ async fn proxy_chat_completions(
                             )
                         });
                 }
-                return openai_compat::passthrough_response(upstream)
-                    .await
-                    .map_err(|e| {
-                        (
-                            StatusCode::BAD_GATEWAY,
-                            Json(json!({"error": {"message": e, "type": "upstream_error"}})),
-                        )
-                    });
+                // Non-streaming: record usage
+                let status = upstream.status();
+                let bytes = upstream.bytes().await.unwrap_or_default();
+                let latency_ms = 0u64; // Legacy path doesn't track latency
+                let bytes = record_usage_from_response(&state, backend, &payload, bytes, latency_ms).await;
+                let mut response = Response::builder().status(status);
+                response = response.header(header::CONTENT_TYPE, "application/json");
+                return response.body(Body::from(bytes))
+                    .map_err(|e| (
+                        StatusCode::BAD_GATEWAY,
+                        Json(json!({"error": {"message": e.to_string(), "type": "upstream_error"}})),
+                    ));
             }
             Err(err) => {
                 warn!(backend = %backend.id, %err, "upstream request failed; trying fallback");
@@ -4510,30 +4637,108 @@ async fn proxy_chat_completions(
     ))
 }
 
+/// Record token usage from a non-streaming upstream response.
+async fn record_usage_from_response(
+    state: &GatewayState,
+    backend: &ff_api::registry::BackendEndpoint,
+    _payload: &ChatCompletionRequest,
+    upstream_body: bytes::Bytes,
+    latency_ms: u64,
+) -> bytes::Bytes {
+    // Try to parse usage from the response
+    if let Ok(resp_json) = serde_json::from_slice::<Value>(&upstream_body) {
+        let model = resp_json
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&backend.model)
+            .to_string();
+        let prompt_tokens = resp_json
+            .get("usage")
+            .and_then(|u| u.get("prompt_tokens"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+        let completion_tokens = resp_json
+            .get("usage")
+            .and_then(|u| u.get("completion_tokens"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+        let _total_tokens = prompt_tokens + completion_tokens;
+
+        let cost = if backend.is_local {
+            0.0
+        } else {
+            backend.estimate_cost(prompt_tokens, completion_tokens)
+        };
+
+        let record = TokenUsageRecord::new(
+            uuid::Uuid::new_v4().to_string(),
+            &model,
+            &backend.id,
+        )
+        .with_tokens(prompt_tokens, completion_tokens)
+        .with_cost(cost, backend.is_local)
+        .with_latency(latency_ms);
+
+        state.cost_tracker.record_usage(record).await;
+    }
+    upstream_body
+}
+
 /// GET /v1/models — list available models from the backend registry.
 async fn list_models(
     State(state): State<Arc<GatewayState>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let Some(registry) = &state.api_registry else {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(
-                json!({"error": {"message": "backend registry not initialized", "type": "not_ready"}}),
-            ),
-        ));
-    };
-
     let now = Utc::now().timestamp();
-    let models = registry.available_models().await;
-    let data: Vec<Value> = models
+    let mut model_map: std::collections::BTreeMap<String, (u8, bool, f64, f64)> = std::collections::BTreeMap::new();
+
+    // 1) Static registry models
+    if let Some(registry) = &state.api_registry {
+        let models = registry.available_models().await;
+        let endpoints = registry.all_endpoints().await;
+        for (model, tier) in models {
+            let model_eps: Vec<_> = endpoints.iter().filter(|e| e.model == model).collect();
+            let is_local = model_eps.first().map(|e| e.is_local).unwrap_or(true);
+            let cost_in = model_eps.first().map(|e| e.cost_per_1k_input).unwrap_or(0.0);
+            let cost_out = model_eps.first().map(|e| e.cost_per_1k_output).unwrap_or(0.0);
+            model_map.insert(model, (tier, is_local, cost_in, cost_out));
+        }
+    }
+
+    // 2) Operational store models (Postgres)
+    if let Some(store) = state.operational_store.as_ref() {
+        if let Some(pool) = store.pg_pool() {
+            match sqlx::query("SELECT slug, tier FROM fleet_models")
+                .fetch_all(pool)
+                .await
+            {
+                Ok(rows) => {
+                    for row in rows {
+                        let slug: String = row.get("slug");
+                        let tier: i32 = row.get("tier");
+                        let is_local = !slug.starts_with("gpt") && !slug.starts_with("claude") && !slug.starts_with("gemini");
+                        let entry = model_map.entry(slug).or_insert((tier as u8, is_local, 0.0, 0.0));
+                        entry.0 = entry.0.min(tier as u8);
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "list_models: fleet_models query failed");
+                }
+            }
+        }
+    }
+
+    let data: Vec<Value> = model_map
         .into_iter()
-        .map(|(model, tier)| {
+        .map(|(model, (tier, is_local, cost_in, cost_out))| {
             json!({
                 "id": model,
                 "object": "model",
                 "created": now,
                 "owned_by": "forgefleet",
                 "tier": tier,
+                "is_local": is_local,
+                "cost_per_1k_input": cost_in,
+                "cost_per_1k_output": cost_out,
             })
         })
         .collect();

@@ -48,7 +48,7 @@ use axum::{
     routing::{get, post},
 };
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::json;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
@@ -197,7 +197,7 @@ async fn double_click(Json(r): Json<ClickReq>) -> impl IntoResponse {
 
 async fn run_click(x: i32, y: i32, double: bool) -> axum::response::Response {
     #[cfg(target_os = "macos")]
-    let mut cmd = {
+    let cmd = {
         let mut c = tokio::process::Command::new("cliclick");
         let action = if double {
             format!("dc:{},{}", x, y)

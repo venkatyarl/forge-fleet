@@ -55,6 +55,13 @@ const mainSections: NavSection[] = [
       { to: '/workflow', label: 'Workflows', icon: '🔄' },
     ],
   },
+  {
+    id: 'cost-ledger',
+    title: 'Cost Ledger',
+    icon: '💰',
+    link: '/cost-ledger',
+    items: [],
+  },
 ]
 
 function loadExpandedState(): Record<string, boolean> {
