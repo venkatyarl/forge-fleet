@@ -56,9 +56,9 @@ They are **not** the primary operational source of truth anymore.
 ## Current decision snapshot
 
 As of now:
-- delete `forge-fleet-py-legacy` → **NO-GO**
-- delete `mission-control-legacy` → **NO-GO**
+- delete `forge-fleet-py-legacy` → **NO-GO** (operational verification + soak pending)
+- delete `mission-control-legacy` → **NO-GO** (MC parity now code-closed; verify + migration tooling pending)
 - archive migration docs → **DONE (moved to archive path)**
-- declare ForgeFleet complete → **NO-GO**
+- declare ForgeFleet complete → **NO-GO** (governance sign-offs + soak pending)
 
 Use [FINAL_COMPLETION_CHECKLIST.md](./FINAL_COMPLETION_CHECKLIST.md) for the authoritative gate status.

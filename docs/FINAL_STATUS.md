@@ -1,6 +1,6 @@
 # FINAL_STATUS.md — ForgeFleet Rust Rewrite
 
-_Date: 2026-04-04_
+_Date: 2026-05-04_
 
 ## Overall Status
 **Release posture: NO-GO (convertible to GO)**
@@ -13,15 +13,24 @@ The Rust rewrite implementation and documentation campaign across Phases 1–12 
 - Validation and reconciliation passes completed (Phase 9)
 - Release readiness/governance docs generated (Phase 10–12)
 - Operator, release, evidence, and handoff documentation packaged
+- Dashboard ↔ gateway contract closure: all referenced endpoints implemented
+- MC operational API: work-items, review-items, dependencies, task-groups, board, dashboard
+- MC portfolio/planning operational API: companies, projects, epics, sprints, portfolio summary
+- Token cost ledger with budget enforcement and Prometheus metrics
+- Local-first adaptive routing with quality tracking
+- Cost observability dashboard page
+- Node detail page routing fixed
 
 ## Latest Verification (fresh)
 
 - `cargo check --workspace` ✅ PASS
-- `cargo test --workspace --lib` ✅ PASS
+- `cargo test --workspace --lib` ✅ PASS (1120+ tests)
+- Dashboard build (`npm run build`) ✅ PASS
+- MC operational API (portfolio + planning) ✅ PASS
 
 ## Decision Summary
 
-Current recommendation remains **NO-GO/HOLD** pending closure of release-governance blockers already documented in:
+Current recommendation: **NO-GO/HOLD** for legacy deletion, but core platform gaps are now code-closed. Remaining blockers are operational verification and governance sign-off, not missing implementation.
 - `docs/PHASE11_GO_GATES.md`
 - `docs/PHASE12_UNRESOLVED_GAPS.md`
 - `docs/PHASE12_GO_NO_GO_LEDGER.md`

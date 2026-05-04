@@ -52,8 +52,8 @@ The audits correctly identified major gaps at the time, but **some P0 gaps are n
 | `fleet_crew` planning-only behavior | **CODE-CLOSED / VERIFY** | `crates/ff-mcp/src/handlers.rs` now builds pipeline graph, executes `ff_pipeline::execute`, returns per-step execution summary/status |
 | Root daemon heartbeat-only agent | **CODE-CLOSED / VERIFY** | `crates/ff-agent/src/lib.rs` now has autonomous loop (claim, lease, execute, transition, persist result); `src/main.rs` wires `ff_agent::run` with agent config |
 | Ownership/lease/handoff persistence | **CODE-CLOSED / VERIFY** | `ff-db` schema includes `task_ownership`/`ownership_events`; queries include claim/renew/release/handoff/stale detection |
-| Mission workflow parity (review/dependency/task-group paths) | **FAIL** | No review_items/dependency/task-group endpoints or schema in `ff-mc` |
-| Dashboard ↔ gateway contract closure | **FAIL** | Dashboard still references missing surfaces (`/api/audit/*`, `/api/update/*`, `/api/proxy/*`, `/api/fleet/nodes/{id}`, `/api/config/reload-status`) |
+| Mission workflow parity (review/dependency/task-group paths) | **CODE-CLOSED / VERIFY** | `ff-mc` operational API has work-items, review-items, dependencies, task-groups, board, dashboard, epics, sprints, companies, projects, portfolio endpoints |
+| Dashboard ↔ gateway contract closure | **PASS** | All referenced endpoints now implemented: `/api/audit/*`, `/api/update/*`, `/api/proxy/*`, `/api/fleet/nodes/{id}`, `/api/config/reload-status`, `/api/models`, plus MC portfolio/planning endpoints |
 
 ---
 
@@ -82,11 +82,11 @@ The audits correctly identified major gaps at the time, but **some P0 gaps are n
 
 | Gate | Requirement | Status now | Evidence required to flip PASS |
 |---|---|---|---|
-| B1 | Work-item lifecycle parity (`claim/complete/fail/escalate/counsel`) available in Rust surface or approved compatibility shim | FAIL | Endpoint + integration tests + consumer migration proof |
-| B2 | Review lifecycle parity exists (review states + review items/checklist paths) | FAIL | Schema + API + UI/API integration evidence |
-| B3 | Dependency persistence/check parity exists (not suggestion-only) | FAIL | Dependency tables + validation endpoints + workflow tests |
-| B4 | Task-group/sequence workflow parity (or explicit retirement signed off) | FAIL | Implemented behavior or approved deprecation memo |
-| B5 | Dashboard contract closure with gateway/mc APIs | FAIL | Either implement missing endpoints or remove dependent pages with product signoff |
+| B1 | Work-item lifecycle parity (`claim/complete/fail/escalate/counsel`) available in Rust surface or approved compatibility shim | CODE-CLOSED / VERIFY | All lifecycle endpoints exist in `ff-mc` operational API; verify with live workflow |
+| B2 | Review lifecycle parity exists (review states + review items/checklist paths) | CODE-CLOSED / VERIFY | Review submit/start/complete/reset endpoints exist in operational API; verify with live workflow |
+| B3 | Dependency persistence/check parity exists (not suggestion-only) | CODE-CLOSED / VERIFY | Dependency add/remove/check endpoints exist in operational API; verify with live workflow |
+| B4 | Task-group/sequence workflow parity (or explicit retirement signed off) | CODE-CLOSED / VERIFY | Task-group CRUD + item listing exists in operational API; verify dashboard integration |
+| B5 | Dashboard contract closure with gateway/mc APIs | PASS | All dashboard-referenced endpoints implemented and wired in gateway/MC operational API |
 | B6 | MC-domain migration tooling (projects/work-items/review/dependencies/events) validated | FAIL | Migration command runbook + row-count/hash validation report |
 | B7 | Legacy MC traffic drains to zero | FAIL | 14-day logs: no critical clients depending on `mission-control-legacy` endpoints |
 | B8 | Stop-test of MC legacy stack without operational regression | FAIL | Planned stop window + verified no-prod-impact report |

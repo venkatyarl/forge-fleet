@@ -15,6 +15,7 @@ import { ModelInventory } from './pages/ModelInventory'
 import { MyTasks } from './pages/MyTasks'
 import { OperatorOnboarding } from './pages/OperatorOnboarding'
 import { Versions } from './pages/Versions'
+import { NodeDetail } from './pages/NodeDetail'
 import { PlanningHub } from './pages/PlanningHub'
 import { Projects } from './pages/Projects'
 import { Pulse } from './pages/Pulse'
@@ -106,7 +107,7 @@ export default function App() {
         <Route path="cost-ledger" element={<CostLedger />} />
         {/* Legacy redirects */}
         <Route path="mission-control" element={<Navigate to="/" replace />} />
-        <Route path="nodes/:nodeId" element={<Navigate to="/settings#fleet" replace />} />
+        <Route path="nodes/:nodeId" element={<NodeDetail />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Route>
     </Routes>

@@ -32,7 +32,7 @@ use crate::work_item::{
     CreateWorkItem, Priority, UpdateWorkItem, WorkItem, WorkItemFilter, WorkItemStatus,
 };
 
-const WORK_ITEM_KEY_PREFIX: &str = "ff_mc.work_item.";
+pub const WORK_ITEM_KEY_PREFIX: &str = "ff_mc.work_item.";
 const REVIEW_ITEM_KEY_PREFIX: &str = "ff_mc.review_item.";
 const DEPENDENCY_KEY_PREFIX: &str = "ff_mc.dependency.";
 const STORE_SCAN_LIMIT: u32 = 20_000;
@@ -43,11 +43,11 @@ pub struct McOperationalState {
 }
 
 #[derive(Debug, Serialize)]
-struct ErrorResponse {
+pub struct ErrorResponse {
     error: String,
 }
 
-fn mc_error(status: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<ErrorResponse>) {
+pub fn mc_error(status: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<ErrorResponse>) {
     (status, Json(ErrorResponse { error: msg.into() }))
 }
 
@@ -462,7 +462,7 @@ fn review_item_storage_key(work_item_id: &str, review_item_id: &str) -> String {
     format!("{REVIEW_ITEM_KEY_PREFIX}{work_item_id}.{review_item_id}")
 }
 
-fn to_other_error(context: &str, err: impl std::fmt::Display) -> McError {
+pub fn to_other_error(context: &str, err: impl std::fmt::Display) -> McError {
     McError::Other(anyhow!("{context}: {err}"))
 }
 

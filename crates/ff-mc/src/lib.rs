@@ -40,6 +40,7 @@ pub mod epic;
 pub mod error;
 pub mod legal;
 pub mod operational_api;
+pub mod operational_portfolio;
 pub mod portfolio;
 pub mod review_item;
 pub mod sprint;
