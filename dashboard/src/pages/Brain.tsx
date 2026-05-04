@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { getJson, postJson } from '../lib/api'
+import { useWsFeed } from '../hooks/useWsFeed'
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                              */
@@ -435,6 +436,9 @@ export function Brain() {
     }
   }, [])
 
+  // WebSocket feed for real-time message push
+  const { lastEvent } = useWsFeed('/ws')
+
   // Fetch messages for active thread
   useEffect(() => {
     if (!threadSlug) {
@@ -460,12 +464,29 @@ export function Brain() {
       }
     }
     load()
-    const timer = setInterval(load, 5_000)
+    // Fallback polling every 30s; primary updates come via WebSocket.
+    const timer = setInterval(load, 30_000)
     return () => {
       cancelled = true
       clearInterval(timer)
     }
   }, [threadSlug])
+
+  // React to WebSocket message events for the current thread
+  useEffect(() => {
+    if (!lastEvent || lastEvent.type !== 'message') return
+    const payload = lastEvent.payload as Record<string, unknown> | undefined
+    if (payload && payload.thread_slug === threadSlug) {
+      // Refresh messages when a new message arrives for this thread
+      setMsgsLoading(true)
+      getJson<{ messages: BrainMessage[] }>(`/api/brain/threads/${threadSlug}/messages`)
+        .then((d) => {
+          setMessages(d.messages || [])
+          setMsgsLoading(false)
+        })
+        .catch(() => setMsgsLoading(false))
+    }
+  }, [lastEvent, threadSlug])
 
   // Cmd+K listener
   useEffect(() => {

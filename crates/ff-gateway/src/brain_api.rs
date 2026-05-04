@@ -192,6 +192,19 @@ pub async fn send_thread_message(
     let _ = ff_db::pg_touch_brain_thread(pool, thread.id).await;
 
     // Generate LLM reply via fleet routing (cloud → pulse → tier → model).
+    // Broadcast user message to WebSocket subscribers.
+    state.ws_hub.broadcast_event(
+        crate::websocket::EventType::Message,
+        json!({
+            "thread_id": thread.id,
+            "thread_slug": slug,
+            "message_id": msg_id,
+            "role": "user",
+            "content": body.content,
+            "channel": channel,
+        }),
+    );
+
     let assistant_reply = match generate_brain_reply(&state, pool, &thread, &user, &body).await {
         Ok(reply) => reply,
         Err(e) => {
@@ -214,6 +227,19 @@ pub async fn send_thread_message(
     .map_err(|e| db_err("pg_insert_brain_message (assistant)", e))?;
 
     let _ = ff_db::pg_touch_brain_thread(pool, thread.id).await;
+
+    // Broadcast assistant message to WebSocket subscribers.
+    state.ws_hub.broadcast_event(
+        crate::websocket::EventType::Message,
+        json!({
+            "thread_id": thread.id,
+            "thread_slug": slug,
+            "message_id": assistant_msg_id,
+            "role": "assistant",
+            "content": assistant_reply,
+            "channel": "brain",
+        }),
+    );
 
     Ok(Json(json!({
         "message_id": msg_id,
