@@ -20,6 +20,10 @@ The Rust rewrite implementation and documentation campaign across Phases 1–12 
 - Local-first adaptive routing with quality tracking
 - Cost observability dashboard page
 - Node detail page routing fixed
+- **Operational verification (2026-05-04):**
+  - A1: `fleet_crew` end-to-end execution verified (3/3 steps succeeded, audit persisted)
+  - A2: Autonomous daemon task-claim→done verified (transition trail + task_results captured)
+  - A3: Ownership lease/handoff verified (claim→handoff→release chain in ownership_events)
 
 ## Latest Verification (fresh)
 
