@@ -348,6 +348,32 @@ lazy_static! {
         &["model", "tier"],
     ).unwrap();
 
+    // ── Token cost metrics ───────────────────────────────────────────
+
+    /// Total tokens consumed (labels: model, token_type).
+    pub static ref LLM_TOKENS_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new("llm_tokens_total", "Total tokens consumed by LLM requests"),
+        &["model", "token_type"],
+    ).unwrap();
+
+    /// Total cost in USD (labels: model, is_local).
+    pub static ref LLM_COST_USD_TOTAL: GaugeVec = GaugeVec::new(
+        Opts::new("llm_cost_usd_total", "Total LLM cost in USD"),
+        &["model", "is_local"],
+    ).unwrap();
+
+    /// Daily budget remaining in USD.
+    pub static ref LLM_BUDGET_REMAINING_USD: IntGauge = IntGauge::new(
+        "llm_budget_remaining_usd",
+        "Remaining daily cloud budget in USD",
+    ).unwrap();
+
+    /// Budget percent used (0-100).
+    pub static ref LLM_BUDGET_PERCENT_USED: IntGauge = IntGauge::new(
+        "llm_budget_percent_used",
+        "Daily cloud budget percent used",
+    ).unwrap();
+
     // ── Node & model health ──────────────────────────────────────────
 
     /// Node health gauge (labels: node_name, status). 1 = healthy, 0 = unhealthy.
@@ -428,6 +454,10 @@ pub fn init_prometheus_metrics() {
         r.register(Box::new(LEADER_ELECTIONS_TOTAL.clone()))
             .unwrap();
         r.register(Box::new(SELF_UPDATES_TOTAL.clone())).unwrap();
+        r.register(Box::new(LLM_TOKENS_TOTAL.clone())).unwrap();
+        r.register(Box::new(LLM_COST_USD_TOTAL.clone())).unwrap();
+        r.register(Box::new(LLM_BUDGET_REMAINING_USD.clone())).unwrap();
+        r.register(Box::new(LLM_BUDGET_PERCENT_USED.clone())).unwrap();
     });
 }
 

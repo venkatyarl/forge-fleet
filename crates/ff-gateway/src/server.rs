@@ -409,6 +409,7 @@ pub fn build_router(state: Arc<GatewayState>, mc_db_path: Option<&str>) -> Route
         .route("/api/ledger/budget", get(ledger_budget).post(ledger_budget_update))
         .route("/api/ledger/flush", post(ledger_flush))
         .route("/api/ledger/records", get(ledger_records))
+        .route("/api/ledger/health", get(ledger_health))
         .route("/api/voice/transcribe", post(crate::voice_api::transcribe))
         .route("/api/voice/speak", post(crate::voice_api::speak))
         // Onboarding (see crates/ff-gateway/src/onboard.rs + plan §§3–3h)
@@ -1533,6 +1534,26 @@ async fn ledger_records(
         "day": day,
         "count": limited.len(),
         "records": limited,
+    })))
+}
+
+/// GET /api/ledger/health — Health check for the token ledger subsystem.
+async fn ledger_health(
+    State(state): State<Arc<GatewayState>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let summary = state.cost_tracker.summary().await;
+    let budget = state.cost_tracker.budget_config().await;
+    let healthy = summary.budget_percent_used < 100.0 || !budget.enforce_budget;
+
+    Ok(Json(json!({
+        "status": if healthy { "ok" } else { "budget_exceeded" },
+        "healthy": healthy,
+        "daily_cost_usd": summary.daily_cost_usd,
+        "daily_budget_usd": summary.daily_budget_usd,
+        "budget_remaining_usd": summary.budget_remaining_usd,
+        "budget_percent_used": summary.budget_percent_used,
+        "total_requests": summary.total_requests,
+        "total_cost_usd": summary.total_cost_usd,
     })))
 }
 
@@ -4680,6 +4701,17 @@ async fn record_usage_from_response(
         .with_latency(latency_ms);
 
         state.cost_tracker.record_usage(record).await;
+
+        // Update Prometheus metrics
+        ff_observability::metrics::LLM_TOKENS_TOTAL
+            .with_label_values(&[&model, "prompt"])
+            .inc_by(prompt_tokens as u64);
+        ff_observability::metrics::LLM_TOKENS_TOTAL
+            .with_label_values(&[&model, "completion"])
+            .inc_by(completion_tokens as u64);
+        ff_observability::metrics::LLM_COST_USD_TOTAL
+            .with_label_values(&[&model, if backend.is_local { "true" } else { "false" }])
+            .add(cost);
     }
     upstream_body
 }
