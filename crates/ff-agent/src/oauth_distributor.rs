@@ -97,6 +97,44 @@ pub const OAUTH_PROVIDERS: &[OauthProvider] = &[
 /// provider per cycle) and ensures peers see new tokens fast.
 pub const REFRESH_POLL_SECS: u64 = 30;
 
+/// Read the password value of a macOS Keychain generic-password entry
+/// via `security find-generic-password -s <service> -a $USER -w`. Used
+/// by `import_token` when the vendor CLI stores creds in Keychain
+/// instead of (or in addition to) a flat file. Returns the raw bytes;
+/// caller parses as JSON.
+#[cfg(target_os = "macos")]
+async fn keychain_read(service_name: &str) -> Result<Vec<u8>> {
+    let user = std::env::var("USER").context("USER env var not set")?;
+    let out = tokio::process::Command::new("security")
+        .args([
+            "find-generic-password",
+            "-s",
+            service_name,
+            "-a",
+            user.as_str(),
+            "-w",
+        ])
+        .output()
+        .await
+        .context("spawn security")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "keychain entry `{service_name}` not found (security exit {:?})",
+            out.status.code()
+        );
+    }
+    let mut bytes = out.stdout;
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+    }
+    Ok(bytes)
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn keychain_read(_service_name: &str) -> Result<Vec<u8>> {
+    anyhow::bail!("Keychain not available on this OS")
+}
+
 /// Look up a provider by name. Returns `None` for unknown names.
 pub fn provider_by_name(name: &str) -> Option<&'static OauthProvider> {
     OAUTH_PROVIDERS
@@ -137,27 +175,47 @@ pub async fn import_token(pool: &PgPool, provider: &OauthProvider) -> Result<()>
     let path = expand_home(provider.cred_path)
         .ok_or_else(|| anyhow!("provider {} has no cred_path configured — set the token manually with `ff secrets set {}`", provider.name, provider.secret_key))?;
 
-    let bytes = tokio::fs::read(&path).await.with_context(|| {
-        format!(
-            "read cred file {} for provider {} — run `{} login` first",
-            path.display(),
-            provider.name,
-            provider.name
-        )
-    })?;
+    // Source-of-truth for credentials varies by OS / vendor:
+    //  • Linux: every vendor CLI stores creds in a file at `cred_path`.
+    //  • macOS: Claude Code stores creds in macOS Keychain (service name
+    //    "Claude Code-credentials") instead of `~/.claude/.credentials.json`.
+    //    Other vendor CLIs on macOS still use a file.
+    // Keychain-first, file-fallback for `claude` on macOS; file-only otherwise.
+    let bytes = if cfg!(target_os = "macos") && provider.name == "claude" {
+        match keychain_read("Claude Code-credentials").await {
+            Ok(b) if !b.is_empty() => b,
+            _ => tokio::fs::read(&path).await.with_context(|| {
+                format!(
+                    "read cred file {} for provider {} — run `{} login` first \
+                     (also tried macOS Keychain `Claude Code-credentials`)",
+                    path.display(),
+                    provider.name,
+                    provider.name
+                )
+            })?,
+        }
+    } else {
+        tokio::fs::read(&path).await.with_context(|| {
+            format!(
+                "read cred file {} for provider {} — run `{} login` first",
+                path.display(),
+                provider.name,
+                provider.name
+            )
+        })?
+    };
 
     let json: Value = serde_json::from_slice(&bytes)
-        .with_context(|| format!("parse cred file {} as JSON", path.display()))?;
+        .with_context(|| format!("parse cred for provider {} as JSON", provider.name))?;
 
-    // Try each known token field in order. Some CLIs nest the token
-    // under e.g. `tokens.access_token`; we don't currently descend, but
-    // the most common shapes are flat top-level fields.
+    // Try each known token field. Walk three layouts:
+    //   • flat top-level (most CLIs)
+    //   • `tokens.<field>` (OpenAI codex CLI, ~/.codex/auth.json)
+    //   • `claudeAiOauth.<field>` (Claude Code on macOS, Keychain blob)
     let token = provider
         .token_fields
         .iter()
         .find_map(|field| json.get(field).and_then(Value::as_str))
-        // Fall back to the common nested layout `{"tokens": {"<field>": "..."}}`
-        // used by e.g. OpenAI's codex CLI (~/.codex/auth.json).
         .or_else(|| {
             provider.token_fields.iter().find_map(|field| {
                 json.get("tokens")
@@ -165,10 +223,17 @@ pub async fn import_token(pool: &PgPool, provider: &OauthProvider) -> Result<()>
                     .and_then(Value::as_str)
             })
         })
+        .or_else(|| {
+            provider.token_fields.iter().find_map(|field| {
+                json.get("claudeAiOauth")
+                    .and_then(|t| t.get(field))
+                    .and_then(Value::as_str)
+            })
+        })
         .ok_or_else(|| {
             anyhow!(
-                "no token field found in {} (tried {:?}); the cred file shape may have changed",
-                path.display(),
+                "no token field found for provider {} (tried {:?} flat, under `tokens.*`, and under `claudeAiOauth.*`); cred shape may have changed",
+                provider.name,
                 provider.token_fields
             )
         })?;
