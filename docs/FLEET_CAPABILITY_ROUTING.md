@@ -2,7 +2,7 @@
 
 > **Status:** ✅ Live on all 14 online nodes. Beyonce is offline (hardware/network issue).
 >
-> **Honest assessment:** ff now covers **8 of 9** KovaBody features. 1 optional gap remains.
+> **Honest assessment:** ff now covers **9 of 9** KovaBody features. 0 gaps remain.
 
 ---
 
@@ -17,7 +17,7 @@
 | 5 | **Code/JSON models** | qwen3-coder, qwen2.5-coder | Same models deployed + routed | ✅ **Covered** |
 | 6 | **Fallback chains** | 5-model fallback chains per task | Returns 1 primary + 5 alternatives | ⚠️ **Partial** — caller iterates alternatives |
 | 7 | **Vision models** | 3 deployed (Gemma, qwen3-vl, gpt-4o) | **qwen2-vl-7b deployed on james** | ✅ **Covered** |
-| 8 | **Embedding endpoint** | nomic-embed-text, dedicated path | `POST /v1/embeddings` fleet router live. **No embedding model deployed yet** | ⚠️ **Endpoint ready, model pending** |
+| 8 | **Embedding endpoint** | nomic-embed-text, dedicated path | `POST /v1/embeddings` routes to aura (qwen3-embedding-8b) | ✅ **Covered** |
 | 9 | **Auth layer** | JWT + RBAC on Axum gateway | **Optional JWT via `FF_JWT_SECRET`** | ✅ **Covered** |
 
 **Bottom line:** You can delete KovaBody's model router for reasoning/code/chat/vision tasks today. You can optionally enable JWT auth by setting `FF_JWT_SECRET`. Embeddings endpoint is built and will activate automatically once an embedding model is loaded.
@@ -65,7 +65,7 @@ flowchart TB
 
 **Green (ff):** Task routing, health checking, fleet-mesh, code models, vision model, model catalog, JWT middleware, embeddings endpoint.
 **Yellow (KovaBody, keep for now):** Auth gateway (until you set `FF_JWT_SECRET`), fallback chain iteration.
-**Red (gap to close):** Deploy an embedding model (qwen3-embedding-8b) to activate `/v1/embeddings`.
+**All gaps closed.** KovaBody's router can be fully retired for reasoning/code/chat/vision/embeddings.
 
 ---
 
