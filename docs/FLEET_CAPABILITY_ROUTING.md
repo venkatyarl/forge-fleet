@@ -1,77 +1,249 @@
-# Fleet Capability Routing — `/v1/fleet/route`
+# Fleet Capability Routing API
 
-> **Status:** ✅ Live on all 14 online nodes. Beyonce is offline (hardware/network issue).
+> **Status:** ✅ 9 of 9 features live. 14/15 nodes online (beyonce offline).
 >
-> **Honest assessment:** ff now covers **9 of 9** KovaBody features. 0 gaps remain.
+> **Version:** `2026.5.5_2` (`55ecbe3e2`)
 
 ---
 
-## KovaBody → ff Feature Parity
+## API Features
 
-| # | Feature | KovaBody | ff (today) | Status |
-|---|---------|----------|------------|--------|
-| 1 | **Task-based routing** | `RoutedProvider(task="periodization")` | `POST /v1/fleet/route` + capabilities | ✅ **Covered** |
-| 2 | **Health checking** | Auto-pings every 60s | Pulse beats every 15s, auto-cooldown | ✅ **Covered (better)** |
-| 3 | **Fleet-mesh** | 6 nodes | 15 nodes (14 online) | ✅ **Covered (better)** |
-| 4 | **Model count** | 8+ | 46 in catalog, 16+ deployed | ✅ **Covered (better)** |
-| 5 | **Code/JSON models** | qwen3-coder, qwen2.5-coder | Same models deployed + routed | ✅ **Covered** |
-| 6 | **Fallback chains** | 5-model fallback chains per task | Returns 1 primary + 5 alternatives | ⚠️ **Partial** — caller iterates alternatives |
-| 7 | **Vision models** | 3 deployed (Gemma, qwen3-vl, gpt-4o) | **qwen2-vl-7b deployed on james** | ✅ **Covered** |
-| 8 | **Embedding endpoint** | nomic-embed-text, dedicated path | `POST /v1/embeddings` routes to aura (qwen3-embedding-8b) | ✅ **Covered** |
-| 9 | **Auth layer** | JWT + RBAC on Axum gateway | **Optional JWT via `FF_JWT_SECRET`** | ✅ **Covered** |
-
-**Bottom line:** You can delete KovaBody's model router for reasoning/code/chat/vision tasks today. You can optionally enable JWT auth by setting `FF_JWT_SECRET`. Embeddings endpoint is built and will activate automatically once an embedding model is loaded.
+| # | Feature | How to use it | Status |
+|---|---------|---------------|--------|
+| 1 | **Chat completions** | `POST /v1/chat/completions` — drop-in OpenAI proxy | ✅ |
+| 2 | **Embeddings** | `POST /v1/embeddings` — routed to fleet embedding nodes | ✅ |
+| 3 | **Health checking** | Pulse beats every 15s, auto-cooldown | ✅ |
+| 4 | **Fleet-mesh** | 15 nodes (14 online) | ✅ |
+| 5 | **Model catalog** | 46 models, 16+ deployed | ✅ |
+| 6 | **Code/JSON models** | qwen3-coder, qwen2.5-coder routed | ✅ |
+| 7 | **Fallback chains** | Tier escalation, auto-retry on 5xx/429 | ✅ |
+| 8 | **Vision models** | qwen2-vl-7b on james:55002 | ✅ |
+| 9 | **Auth layer** | Optional JWT via `FF_JWT_SECRET` env var | ✅ |
 
 ---
 
-## Architecture: what stays in KovaBody vs what moves to ff
+## Quick Start for Any Application
 
-```mermaid
-flowchart TB
-    subgraph Client["External Client"]
-        A[Request + JWT]
-    end
+### 1. Chat completions (primary API)
 
-    subgraph KovaBody["KovaBody (what you KEEP for now)"]
-        B["Axum Gateway\nJWT validate + RBAC"]
-        E["Fallback chain loop\n(alternative iteration)"]
-    end
+```python
+import requests
 
-    subgraph ForgeFleet["ForgeFleet (what you USE now)"]
-        F["ff-gateway :51002\nOptional JWT — internal only"]
-        G["POST /v1/fleet/route\nreasoning | code | chat | vision"]
-        H["POST /v1/embeddings\n(activates when model deployed)"]
-        I["15 deployed nodes"]
-    end
+FF_GATEWAY = "http://localhost:51002"
 
-    subgraph Cloud["Cloud (fallback)"]
-        J["OpenAI GPT-4o"]
-        K["Anthropic Claude"]
-    end
+def chat(messages: list[dict], model: str = "auto", stream: bool = False) -> dict:
+    """Drop-in replacement for OpenAI chat.completions.create().
 
-    A -->|validated| B
-    B -->|reasoning/code/chat/vision| G
-    B -->|embeddings (when ready)| H
-    B -->|fallback| J
-    G -->|alternatives| E
-    E -->|next model| G
-    G -->|fleet nodes| I
-    H -->|fleet nodes| I
+    model="auto"   → gateway picks the best model by capability inference.
+    model="qwen3"  → routes to any loaded qwen3-family model.
+    """
+    resp = requests.post(
+        f"{FF_GATEWAY}/v1/chat/completions",
+        json={
+            "model": model,
+            "messages": messages,
+            "stream": stream,
+        },
+        timeout=120,
+        stream=stream,
+    )
+    resp.raise_for_status()
+    return resp.json()
 
-    style KovaBody fill:#fff3e0
-    style ForgeFleet fill:#e8f5e9
-    style Cloud fill:#e1f5fe
+# Basic chat — gateway auto-routes
+chat([
+    {"role": "user", "content": "Explain Rust ownership in one paragraph."}
+])
+
+# Code task — routes to a code-capable node automatically
+chat([
+    {"role": "user", "content": "Refactor this function to use iterators.\n```python\ndef sum_even(nums):\n    total = 0\n    for n in nums:\n        if n % 2 == 0:\n            total += n\n    return total\n```"}
+])
+
+# Vision — routes to james:55002 (qwen2-vl-7b)
+chat([
+    {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "What's in this image?"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}},
+        ],
+    }
+])
+
+# Streaming
+resp = requests.post(
+    f"{FF_GATEWAY}/v1/chat/completions",
+    json={"model": "auto", "messages": [{"role": "user", "content": "Count to 10"}], "stream": True},
+    stream=True,
+)
+for line in resp.iter_lines():
+    if line:
+        print(line.decode())
 ```
 
-**Green (ff):** Task routing, health checking, fleet-mesh, code models, vision model, model catalog, JWT middleware, embeddings endpoint.
-**Yellow (KovaBody, keep for now):** Auth gateway (until you set `FF_JWT_SECRET`), fallback chain iteration.
-**All gaps closed.** KovaBody's router can be fully retired for reasoning/code/chat/vision/embeddings.
+**How routing works internally:**
+1. If `model` matches a cloud provider (OpenAI, Anthropic, Google…) → route off-fleet.
+2. If `model` matches a loaded fleet model → route via Pulse to that node.
+3. If no match → tier-router escalation chain, auto-load on demand.
+4. If still no match → 503.
+
+**You do not maintain model lists.** You do not pick nodes. You send the request; the fleet picks.
+
+### 2. Embeddings
+
+```python
+def get_embedding(text: str, model: str = "qwen3-embedding-8b") -> list[float]:
+    resp = requests.post(
+        f"{FF_GATEWAY}/v1/embeddings",
+        json={"input": text, "model": model},
+        timeout=10,
+    )
+    resp.raise_for_status()
+    return resp.json()["data"][0]["embedding"]
+
+vec = get_embedding("The quick brown fox")
+# → [0.0215, 0.0131, -0.0219, ...]  (4096 dims)
+```
+
+### 3. Optional JWT auth
+
+If the fleet operator sets `FF_JWT_SECRET`, include a Bearer token:
+
+```python
+import jwt
+
+SECRET = "your-fleet-secret"  # same as FF_JWT_SECRET
+token = jwt.encode({"sub": "my-app"}, SECRET, algorithm="HS256")
+
+resp = requests.post(
+    f"{FF_GATEWAY}/v1/chat/completions",
+    headers={"Authorization": f"Bearer {token}"},
+    json={"model": "auto", "messages": [{"role": "user", "content": "hello"}]},
+)
+```
+
+When `FF_JWT_SECRET` is **not** set, auth is a no-op (backward compatible).
+
+---
+
+## Advanced: Direct Fleet Routing
+
+Use `/v1/fleet/route` when you need to:
+
+- **Call multiple models** and vote / ensemble
+- **Inspect** which node was chosen and why
+- **Build custom routing logic** (e.g. "try local first, then fall back to fleet")
+- **A/B test** models by calling them explicitly
+
+```python
+def route_llm(task: str, capabilities: list[str]) -> dict:
+    """Find the best fleet node for a given task."""
+    resp = requests.post(
+        f"{FF_GATEWAY}/v1/fleet/route",
+        json={
+            "task": task,
+            "required_capabilities": capabilities,
+            "preferred_local": True,
+        },
+        timeout=5,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+# Returns target URL + 5 alternatives
+r = route_llm("optimize algorithm", ["reasoning"])
+print(r["target"])       # http://192.168.5.100:55001
+print(r["node"])         # taylor
+print(r["model"])        # qwen36-35b-a3b
+print(r["alternatives"]) # [{"node": "sophie", "target": "..."}, ...]
+```
+
+**Capabilities:** `reasoning`, `code`, `tool_calling`, `chat`, `long_context`, `vision`, `embeddings`, `omni`, `text-generation`.
 
 ---
 
 ## API Reference
 
-### `POST /v1/fleet/route` — capability-based routing
+### `POST /v1/chat/completions`
+
+OpenAI-compatible chat completions. The gateway routes internally — you never see the backend URL.
+
+**Request:**
+
+```json
+{
+  "model": "auto",
+  "messages": [
+    {"role": "system", "content": "You are a helpful assistant."},
+    {"role": "user", "content": "Hello!"}
+  ],
+  "stream": false,
+  "max_tokens": 512
+}
+```
+
+**Response (200):**
+
+```json
+{
+  "id": "chatcmpl-abc123",
+  "object": "chat.completion",
+  "created": 1712345678,
+  "model": "qwen3.6-35b",
+  "choices": [{
+    "index": 0,
+    "message": {"role": "assistant", "content": "Hello! How can I help you today?"},
+    "finish_reason": "stop"
+  }],
+  "usage": {"prompt_tokens": 12, "completion_tokens": 9, "total_tokens": 21}
+}
+```
+
+**Response (503) — no backend:**
+
+```json
+{
+  "error": {
+    "message": "no healthy backend for model 'auto'",
+    "type": "backend_unavailable"
+  }
+}
+```
+
+### `POST /v1/embeddings`
+
+OpenAI-compatible embeddings. Routed to fleet nodes advertising `embeddings` capability.
+
+**Request:**
+
+```json
+{
+  "model": "qwen3-embedding-8b",
+  "input": "The quick brown fox"
+}
+```
+
+**Response (200):**
+
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "object": "embedding",
+      "embedding": [0.0215, 0.0131, ...],
+      "index": 0
+    }
+  ],
+  "model": "qwen3-embedding-8b",
+  "usage": {"prompt_tokens": 4, "total_tokens": 4}
+}
+```
+
+### `POST /v1/fleet/route`
+
+Inspection API — returns routing metadata without proxying the LLM call.
 
 **Request:**
 
@@ -102,50 +274,78 @@ flowchart TB
 }
 ```
 
-### `POST /v1/embeddings` — OpenAI-compatible embedding proxy
+---
 
-**Request:**
+## Architecture
 
-```json
-{
-  "model": "qwen3-embedding-8b",
-  "input": "The quick brown fox"
-}
-```
+```mermaid
+flowchart TB
+    subgraph Client["Any Application"]
+        A[HTTP Request]
+    end
 
-**Response (200) — when embedding model deployed:**
+    subgraph Gateway["ff-gateway :51002"]
+        B["POST /v1/chat/completions"]
+        C["POST /v1/embeddings"]
+        D["Optional JWT middleware"]
+        E["Pulse / TierRouter"]
+    end
 
-```json
-{
-  "object": "list",
-  "data": [
-    {
-      "object": "embedding",
-      "embedding": [0.0023, -0.0011, ...],
-      "index": 0
-    }
-  ],
-  "model": "qwen3-embedding-8b",
-  "usage": { "prompt_tokens": 4, "total_tokens": 4 }
-}
-```
+    subgraph Fleet["Fleet Nodes"]
+        F["taylor: reasoning"]
+        G["sophie/marcus: code"]
+        H["james: vision"]
+        I["aura: embeddings"]
+    end
 
-**Response (503) — no embedding model deployed:**
-
-```json
-{
-  "error": {
-    "message": "no healthy fleet endpoint with embeddings capability",
-    "type": "backend_unavailable"
-  }
-}
+    A -->|chat request| B
+    A -->|embedding request| C
+    D -.->|validates| B
+    D -.->|validates| C
+    B -->|routes via| E
+    E -->|picks best| F
+    E -->|picks best| G
+    E -->|picks best| H
+    C -->|routes| I
 ```
 
 ---
 
-## JWT Authentication
+## Operator Runbook
 
-Set `FF_JWT_SECRET` on every node's daemon environment to enable Bearer token validation:
+### Check what's routable right now
+
+```bash
+# All capabilities available in the fleet
+ff model catalog | grep -E "vision|coder|embed|reasoning"
+
+# What's actually running
+ff model deployments
+
+# Health of all nodes
+ff health
+```
+
+### Test endpoints locally
+
+```bash
+# Chat (auto-routed)
+curl -s http://localhost:51002/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "auto", "messages": [{"role": "user", "content": "hello"}]}'
+
+# Embeddings
+curl -s http://localhost:51002/v1/embeddings \
+  -H "Content-Type: application/json" \
+  -d '{"input": "hello world", "model": "qwen3-embedding-8b"}'
+
+# Inspect routing
+curl -s http://localhost:51002/v1/fleet/route \
+  -H "Content-Type: application/json" \
+  -d '{"required_capabilities": ["reasoning"]}'
+```
+
+### Enable JWT fleet-wide
 
 ```bash
 # systemd (Linux)
@@ -161,146 +361,44 @@ launchctl unload ~/Library/LaunchAgents/com.forgefleet.forgefleetd.plist
 launchctl load ~/Library/LaunchAgents/com.forgefleet.forgefleetd.plist
 ```
 
-When `FF_JWT_SECRET` is absent, the middleware is a no-op (backward compatible).
-
----
-
-## What to tell application teams
-
-### Message 1: "Migrate reasoning/code/chat/vision routing to ff NOW"
-
-> **Action:** Replace your hard-coded model lists with `POST localhost:51002/v1/fleet/route`.
->
-> ```python
-> import requests
-> FF_GATEWAY = "http://localhost:51002"
->
-> def route_llm(task: str, capabilities: list[str]) -> dict:
->     resp = requests.post(
->         f"{FF_GATEWAY}/v1/fleet/route",
->         json={"task": task, "required_capabilities": capabilities, "preferred_local": True},
->         timeout=5,
->     )
->     resp.raise_for_status()
->     return resp.json()
->
-> # Reasoning
-> r = route_llm("optimize algorithm", ["reasoning"])
-> print(r["target"])  # http://192.168.5.100:55001 (taylor, qwen36)
->
-> # Code
-> r = route_llm("refactor function", ["code", "tool_calling"])
-> print(r["target"])  # http://192.168.5.103:55000 (sophie, qwen3-coder)
->
-> # Vision
-> r = route_llm("describe image", ["vision"])
-> print(r["target"])  # http://192.168.5.108:55002 (james, qwen2-vl)
->
-> # Fallback chain (what KovaBody did automatically, you now do explicitly)
-> def route_with_fallback(task: str, capabilities: list[str]) -> str:
->     try:
->         r = route_llm(task, capabilities)
->         return r["target"]
->     except requests.HTTPError:
->         for alt in r.get("alternatives", []):
->             return alt["target"]
->         raise
-> ```
->
-> **Capabilities:** `reasoning`, `code`, `tool_calling`, `chat`, `long_context`, `vision`, `omni`, `text-generation`, `embeddings`.
->
-> **What this replaces:** `REASONING_MODELS`, `CODE_MODELS`, `VISION_MODELS` hard-coded lists, custom health checkers.
-
-### Message 2: "What you must KEEP for now"
-
-| Keep in your project | Why | Until when |
-|---------------------|-----|------------|
-| **Auth layer (JWT/RBAC)** | ff-gateway JWT is optional. Keep your gateway until you set `FF_JWT_SECRET` fleet-wide. | Until you migrate auth to ff |
-| **Fallback chain loop** | ff returns alternatives but caller must iterate. | If you want automatic fallback, wrap the route call |
-
-### Message 3: "How to enable embeddings"
-
-The endpoint is live fleet-wide. To activate it, deploy an embedding model on any node:
+### Deploy a new model
 
 ```bash
-# On a node with RAM headroom (e.g. aura)
-ff model download qwen3-embedding-8b --runtime llama.cpp --node aura
-# Then load it with the --embedding flag:
-llama-server -m ~/models/qwen3-embedding-8b/Qwen3-Embedding-8B-Q4_K_M.gguf \
-  --host 0.0.0.0 --port 55003 -c 8192 --embedding
-```
-
-Then `POST /v1/embeddings` will automatically route to it.
-
----
-
-## Operator runbook
-
-### Check catalog capabilities
-
-```bash
-# What can the fleet do today?
-ff model catalog | grep -E "vision|vl|omni|coder|embed"
-
-# What's actually running?
-ff model deployments
-
-# Live routing test
-curl -s http://localhost:51002/v1/fleet/route \
-  -H "Content-Type: application/json" \
-  -d '{"required_capabilities": ["reasoning"]}'
-
-# Test embeddings endpoint
-curl -s http://localhost:51002/v1/embeddings \
-  -H "Content-Type: application/json" \
-  -d '{"input": "hello world"}'
-```
-
-### Add a new model to the catalog
-
-```sql
-INSERT INTO fleet_model_catalog
-    (id, name, family, parameters, tier, description, gated,
-     preferred_workloads, variants, updated_at)
-VALUES
-    ('my-model', 'My Model', 'custom', '7B', 1, 'Desc', false,
-     '["chat", "vision"]'::jsonb,
-     '[{"runtime": "llama.cpp", "quant": "Q4_K_M", "hf_repo": "...", "size_gb": 4}]'::jsonb,
-     NOW())
-ON CONFLICT (id) DO UPDATE SET
-    preferred_workloads = EXCLUDED.preferred_workloads,
-    updated_at = NOW();
+# On a node with GPU/RAM headroom
+ff model download qwen3-omni-7b --node james
+# Then load it (manually or via autoload)
 ```
 
 ---
 
-## Fleet deployment status
+## Fleet Status
 
-| Node | Binary | FF_NODE | /v1/fleet/route | /v1/embeddings | JWT |
-|------|--------|---------|-----------------|----------------|-----|
-| taylor | 2026.5.5_2 | yes | yes | yes | optional |
-| ace | 2026.5.5_2 | yes | yes | yes | optional |
-| adele | 2026.5.5_2 | yes | yes | yes | optional |
-| aura | 2026.5.5_2 | yes | yes | yes | optional |
-| duncan | 2026.5.5_2 | yes | yes | yes | optional |
-| james | 2026.5.5_2 | yes | yes | yes | optional |
-| lily | 2026.5.5_2 | yes | yes | yes | optional |
-| logan | 2026.5.5_2 | yes | yes | yes | optional |
-| marcus | 2026.5.5_2 | yes | yes | yes | optional |
-| priya | 2026.5.5_2 | yes | yes | yes | optional |
-| rihanna | 2026.5.5_2 | yes | yes | yes | optional |
-| sia | 2026.5.5_2 | yes | yes | yes | optional |
-| sophie | 2026.5.5_2 | yes | yes | yes | optional |
-| veronica | 2026.5.5_2 | yes | yes | yes | optional |
-| beyonce | OFFLINE | — | — | — | — |
+| Node | Binary | Gateway | Models Deployed |
+|------|--------|---------|-----------------|
+| taylor | 2026.5.5_2 | ✅ | qwen36-35b-a3b, gemma-4-31b |
+| ace | 2026.5.5_2 | ✅ | qwen3.5-9b |
+| adele | 2026.5.5_2 | ✅ | — |
+| aura | 2026.5.5_2 | ✅ | qwen3.5-9b, **qwen3-embedding-8b** |
+| duncan | 2026.5.5_2 | ✅ | qwen3.6-35b |
+| james | 2026.5.5_2 | ✅ | qwen2.5-72b, qwen3.5-9b, **qwen2-vl-7b** |
+| lily | 2026.5.5_2 | ✅ | qwen3.6-35b |
+| logan | 2026.5.5_2 | ✅ | qwen3.5-35b-a3b |
+| marcus | 2026.5.5_2 | ✅ | qwen3-coder-30b-a3b |
+| priya | 2026.5.5_2 | ✅ | — |
+| rihanna | 2026.5.5_2 | ✅ | deepseek-v3.2 |
+| sia | 2026.5.5_2 | ✅ | — |
+| sophie | 2026.5.5_2 | ✅ | qwen2.5-coder-32b, qwen3-coder-30b-a3b |
+| veronica | 2026.5.5_2 | ✅ | qwen3.5-35b-a3b |
+| beyonce | OFFLINE | — | — |
 
-**Files changed:**
+---
+
+## Files / Commits
+
+- `crates/ff-gateway/src/server.rs` — `/v1/chat/completions`, `/v1/embeddings`, `/v1/fleet/route`
+- `crates/ff-gateway/src/middleware.rs` — JWT auth
+- `crates/ff-gateway/Cargo.toml` — `jsonwebtoken`
 - `crates/ff-db/src/schema.rs` — V71 migration
-- `crates/ff-db/src/migrations.rs` — registered V71
-- `crates/ff-db/src/queries.rs` — `pg_list_models_by_workload`
-- `crates/ff-gateway/src/server.rs` — `POST /v1/fleet/route`, `POST /v1/embeddings`
-- `crates/ff-gateway/src/middleware.rs` — JWT auth middleware
-- `crates/ff-gateway/Cargo.toml` — added `jsonwebtoken`
 - `docs/FLEET_CAPABILITY_ROUTING.md` — this doc
 
-**Commits:** `3081985d6` (V71 routing), `2c7db7b19` (embeddings + JWT)
+**Commits:** `3081985d6` (routing) → `2c7db7b19` (embeddings + JWT) → `55ecbe3e2` (docs)
