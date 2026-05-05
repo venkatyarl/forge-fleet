@@ -23,6 +23,7 @@ pub mod router;
 pub mod screen_ctrl;
 pub mod server;
 pub mod static_files;
+pub mod tasks;
 pub mod telegram;
 pub mod telegram_transport;
 pub mod voice_api;
