@@ -528,7 +528,7 @@ pub fn build_router(state: Arc<GatewayState>, mc_db_path: Option<&str>) -> Route
         .route("/v1/fleet/route", post(route_fleet_capability))
         .route("/v1/embeddings", post(proxy_embeddings))
         .route("/v1/tasks", post(crate::tasks::handle_task))
-        .route("/v1/tasks/{task_type}", post(crate::tasks::handle_task))
+        .route("/v1/tasks/{task_type}", post(crate::tasks::handle_task_from_path))
         .route("/v1/images/generations", post(crate::tasks::handle_image_generation))
         .route("/v1/audio/transcriptions", post(crate::tasks::handle_audio_transcription))
         // ─── Replication routes ──────────────────────────────────────

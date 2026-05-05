@@ -14,6 +14,7 @@ use crate::server::GatewayState;
 
 #[derive(Debug, Deserialize)]
 pub struct TaskRequest {
+    #[serde(default)]
     pub task: String,
     pub input: Value,
     #[serde(default)]
@@ -201,14 +202,30 @@ pub async fn handle_task(
     State(state): State<Arc<GatewayState>>,
     Json(req): Json<TaskRequest>,
 ) -> Result<Response<Body>, (StatusCode, Json<Value>)> {
-    let task_def = match get_task_def(&req.task) {
+    handle_task_inner(state, req.task.clone(), req).await
+}
+
+pub async fn handle_task_from_path(
+    State(state): State<Arc<GatewayState>>,
+    axum::extract::Path(task_type): axum::extract::Path<String>,
+    Json(req): Json<TaskRequest>,
+) -> Result<Response<Body>, (StatusCode, Json<Value>)> {
+    handle_task_inner(state, task_type, req).await
+}
+
+async fn handle_task_inner(
+    state: Arc<GatewayState>,
+    task_type: String,
+    req: TaskRequest,
+) -> Result<Response<Body>, (StatusCode, Json<Value>)> {
+    let task_def = match get_task_def(&task_type) {
         Some(td) => td,
         None => {
             return Err((
                 StatusCode::BAD_REQUEST,
                 Json(json!({
                     "error": {
-                        "message": format!("unknown task type '{}'", req.task),
+                        "message": format!("unknown task type '{}'", task_type),
                         "type": "invalid_request_error",
                         "available_tasks": TASK_DEFINITIONS.iter().map(|t| t.task).collect::<Vec<_>>(),
                     }
@@ -227,7 +244,7 @@ pub async fn handle_task(
                 let pg = state.operational_store.as_ref().and_then(|s| s.pg_pool());
                 match router.route_completion_cached(body.clone(), cache, pg).await {
                     Ok(result) => {
-                        info!(task = %req.task, model = %model, "task routed directly via pulse router");
+                        info!(task = %task_type, model = %model, "task routed directly via pulse router");
                         return Response::builder()
                             .status(StatusCode::OK)
                             .header("content-type", "application/json")
@@ -247,7 +264,7 @@ pub async fn handle_task(
                     Err(crate::llm_routing::LlmRoutingError::NoMatch { .. })
                     | Err(crate::llm_routing::LlmRoutingError::MissingModel) => {
                         debug!(
-                            task = %req.task,
+                            task = %task_type,
                             model = %model,
                             "direct pulse routing missed, falling back to capability routing"
                         );
@@ -269,7 +286,7 @@ pub async fn handle_task(
         Some(p) => p,
         None => {
             warn!("task routing: no postgres pool available for capability routing");
-            return try_cloud_then_fail(state, &req, task_def, &body, &[]).await;
+            return try_cloud_then_fail(state, &task_type, &req, task_def, &body, &[]).await;
         }
     };
 
@@ -424,7 +441,7 @@ pub async fn handle_task(
         };
 
         info!(
-            task = %req.task,
+            task = %task_type,
             model = %model_id,
             endpoint = %url,
             "task routed via capability matching"
@@ -452,7 +469,7 @@ pub async fn handle_task(
             }
             Err(err) => {
                 warn!(
-                    task = %req.task,
+                    task = %task_type,
                     model = %model_id,
                     %err,
                     "capability-routed upstream request failed; falling back to cloud"
@@ -462,11 +479,12 @@ pub async fn handle_task(
     }
 
     // ── 3c / 3d. Cloud fallback or final 503 ─────────────────────────────────
-    try_cloud_then_fail(state, &req, task_def, &body, &available_caps).await
+    try_cloud_then_fail(state, &task_type, &req, task_def, &body, &available_caps).await
 }
 
 async fn try_cloud_then_fail(
     state: Arc<GatewayState>,
+    task_type: &str,
     req: &TaskRequest,
     task_def: &TaskDef,
     body: &Value,
@@ -478,7 +496,7 @@ async fn try_cloud_then_fail(
         {
             match result {
                 Ok(resp) => {
-                    info!(task = %req.task, model = %model_id, "task routed to cloud fallback");
+                    info!(task = %task_type, model = %model_id, "task routed to cloud fallback");
                     return Ok(resp);
                 }
                 Err(resp) => return Ok(resp),
@@ -492,7 +510,7 @@ async fn try_cloud_then_fail(
             "error": {
                 "message": "no healthy fleet endpoint matches the required capabilities and no cloud fallback is available",
                 "type": "backend_unavailable",
-                "task": req.task,
+                "task": task_type,
                 "required_capabilities": task_def.capabilities,
                 "available_capabilities": available_caps,
             }
