@@ -5775,3 +5775,153 @@ VALUES
      '$HOME/.forgefleet/sub-agent-0/open-design/skills', 30, true)
 ON CONFLICT (id) DO NOTHING;
 "#;
+
+// ─── V72: Consolidate legacy SQLite databases into Postgres ────────────────
+//
+// Migrates data from the following legacy SQLite files that were never
+// wired to the Postgres operational store:
+//   - context.db   → local_context_sources, local_context_chunks
+//   - evolution.db → fleet_evolution_insights, fleet_evolution_task_records, fleet_evolution_version_proposals
+//   - learnings.db → fleet_learnings, fleet_error_fixes, fleet_model_scores
+//   - governance.db→ fleet_governance_recommendations, fleet_governance_runs
+
+pub const SCHEMA_V72_SQLITE_CONSOLIDATION: &str = r#"
+-- ─── Local Context (was context.db) ────────────────────────────────────────
+-- RAG / document sources and their chunked text for local retrieval.
+CREATE TABLE IF NOT EXISTS local_context_sources (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    uri         TEXT NOT NULL,                        -- file path, URL, or identifier
+    title       TEXT NOT NULL DEFAULT '',
+    source_type TEXT NOT NULL DEFAULT 'file',         -- file | url | note | paste
+    metadata    JSONB NOT NULL DEFAULT '{}',
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS local_context_chunks (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    source_id   UUID NOT NULL REFERENCES local_context_sources(id) ON DELETE CASCADE,
+    chunk_index INTEGER NOT NULL,
+    content     TEXT NOT NULL,
+    embedding   JSONB,                                -- embedding vector as JSON array; nullable until generated
+    metadata    JSONB NOT NULL DEFAULT '{}',
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(source_id, chunk_index)
+);
+
+CREATE INDEX IF NOT EXISTS idx_local_context_chunks_source
+    ON local_context_chunks (source_id);
+
+-- ─── Fleet Evolution (was evolution.db) ────────────────────────────────────
+-- Self-improvement insights and version proposals tracked by the fleet.
+CREATE TABLE IF NOT EXISTS fleet_evolution_insights (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    category    TEXT NOT NULL,                        -- performance | reliability | UX | security
+    summary     TEXT NOT NULL,
+    detail      TEXT NOT NULL DEFAULT '',
+    confidence  REAL NOT NULL DEFAULT 0.5,            -- 0.0–1.0
+    source_json JSONB NOT NULL DEFAULT '{}',          -- task_id, node, model, etc.
+    applied     BOOLEAN NOT NULL DEFAULT false,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS fleet_evolution_task_records (
+    id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    task_type    TEXT NOT NULL,
+    model_used   TEXT NOT NULL,
+    tier         INTEGER NOT NULL DEFAULT 2,
+    outcome      TEXT NOT NULL,                       -- success | failure | partial
+    duration_sec REAL NOT NULL DEFAULT 0,
+    metadata     JSONB NOT NULL DEFAULT '{}',
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS fleet_evolution_version_proposals (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    target_version  TEXT NOT NULL,
+    change_summary  TEXT NOT NULL,
+    risk_level      TEXT NOT NULL DEFAULT 'low',      -- low | medium | high | critical
+    status          TEXT NOT NULL DEFAULT 'pending',  -- pending | approved | rejected | implemented
+    proposed_by     TEXT NOT NULL DEFAULT '',         -- node or agent name
+    reviewed_at     TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_fleet_evolution_insights_category
+    ON fleet_evolution_insights (category, applied);
+
+-- ─── Fleet Learnings (was learnings.db) ────────────────────────────────────
+-- Error patterns, fixes, and per-model performance scores.
+CREATE TABLE IF NOT EXISTS fleet_learnings (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    task_type       TEXT NOT NULL,
+    model_used      TEXT NOT NULL,
+    tier            INTEGER NOT NULL DEFAULT 2,
+    outcome         TEXT NOT NULL,                    -- success | failure | partial
+    error_pattern   TEXT NOT NULL DEFAULT '',
+    fix_applied     TEXT NOT NULL DEFAULT '',
+    task_hash       TEXT NOT NULL DEFAULT '',         -- deterministic hash of task input
+    duration_sec    REAL NOT NULL DEFAULT 0,
+    metadata        JSONB NOT NULL DEFAULT '{}',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS fleet_error_fixes (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    error_pattern   TEXT NOT NULL,
+    fix_description TEXT NOT NULL,
+    times_applied   INTEGER NOT NULL DEFAULT 1,
+    success_rate    REAL NOT NULL DEFAULT 1.0,
+    metadata        JSONB NOT NULL DEFAULT '{}',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS fleet_model_scores (
+    id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    model_name   TEXT NOT NULL,
+    task_type    TEXT NOT NULL,
+    total_tasks  INTEGER NOT NULL DEFAULT 0,
+    successes    INTEGER NOT NULL DEFAULT 0,
+    avg_duration REAL NOT NULL DEFAULT 0,
+    metadata     JSONB NOT NULL DEFAULT '{}',
+    last_updated TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(model_name, task_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_fleet_learnings_type
+    ON fleet_learnings (task_type, outcome);
+CREATE INDEX IF NOT EXISTS idx_fleet_error_fixes_pattern
+    ON fleet_error_fixes (error_pattern);
+CREATE INDEX IF NOT EXISTS idx_fleet_model_scores_model
+    ON fleet_model_scores (model_name, task_type);
+
+-- ─── Fleet Governance (was governance.db) ──────────────────────────────────
+-- Task recommendation policy and governance run tracking.
+CREATE TABLE IF NOT EXISTS fleet_governance_recommendations (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    task_type       TEXT NOT NULL,
+    recommended_model TEXT NOT NULL,
+    reason          TEXT NOT NULL DEFAULT '',
+    confidence      REAL NOT NULL DEFAULT 0.5,
+    policy_json     JSONB NOT NULL DEFAULT '{}',
+    enabled         BOOLEAN NOT NULL DEFAULT true,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS fleet_governance_runs (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    run_type        TEXT NOT NULL,                    -- audit | policy_check | compliance
+    status          TEXT NOT NULL DEFAULT 'running',  -- running | completed | failed
+    findings_json   JSONB NOT NULL DEFAULT '[]',
+    summary         TEXT NOT NULL DEFAULT '',
+    triggered_by    TEXT NOT NULL DEFAULT '',         -- node or agent name
+    completed_at    TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_fleet_governance_rec_type
+    ON fleet_governance_recommendations (task_type, enabled);
+CREATE INDEX IF NOT EXISTS idx_fleet_governance_runs_status
+    ON fleet_governance_runs (status, created_at DESC);
+"#;

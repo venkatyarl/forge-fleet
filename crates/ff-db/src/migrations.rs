@@ -487,6 +487,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "backfill_fleet_model_catalog",
         sql: schema::SCHEMA_V71_BACKFILL_FLEET_MODEL_CATALOG,
     },
+    PgMigration {
+        version: 72,
+        name: "sqlite_consolidation",
+        sql: schema::SCHEMA_V72_SQLITE_CONSOLIDATION,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.
