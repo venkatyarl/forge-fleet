@@ -179,63 +179,96 @@ pub async fn verify_node(pool: &PgPool, node_name: &str) -> Result<VerifyReport,
         }
     });
     // 11. defer_end_to_end
-    let title = format!("verify-{}-{}", node_name, chrono::Utc::now().timestamp());
-    let payload =
-        serde_json::json!({"command": format!("echo verify-{}", chrono::Utc::now().timestamp())});
-    let task_id_res = ff_db::pg_enqueue_deferred(
-        pool,
-        &title,
-        "shell",
-        &payload,
-        "now",
-        &serde_json::json!({}),
-        Some(node_name),
-        &serde_json::json!([]),
-        Some("verify_node"),
-        Some(1),
-    )
-    .await;
-    details.push(match task_id_res {
-        Ok(tid) => {
-            let deadline = std::time::Instant::now() + Duration::from_secs(30);
-            let mut final_status = None;
-            while std::time::Instant::now() < deadline {
-                if let Ok(Some(row)) = ff_db::pg_get_deferred(pool, &tid).await {
-                    if row.status == "completed" || row.status == "failed" {
-                        final_status = Some(row.status);
-                        break;
-                    }
-                }
-                tokio::time::sleep(Duration::from_millis(1500)).await;
-            }
-            match final_status.as_deref() {
-                Some("completed") => CheckResult {
-                    check: "defer_end_to_end".into(),
-                    status: "pass".into(),
-                    message: Some(format!("task {tid} completed")),
-                    retry_task_id: None,
-                },
-                Some(s) => CheckResult {
-                    check: "defer_end_to_end".into(),
-                    status: "fail".into(),
-                    message: Some(format!("task {tid} status={s}")),
-                    retry_task_id: Some(tid),
-                },
-                None => CheckResult {
-                    check: "defer_end_to_end".into(),
-                    status: "fail".into(),
-                    message: Some(format!("task {tid} not claimed within 30s")),
-                    retry_task_id: Some(tid),
-                },
-            }
-        }
-        Err(e) => CheckResult {
+    // Skip on nodes whose ff binary predates the defer-worker subcommand
+    // (added 2026-05-04). Without defer-worker the task enqueues but is
+    // never claimed, causing a 30s timeout that looks like a failure.
+    let defer_worker_check = if is_windows {
+        ssh_capture(
+            &ssh_dest,
+            r#"powershell -NoProfile -Command "$out = & \"$env:USERPROFILE\.local\bin\ff.exe\" --help 2>&1 | Out-String; if ($out -match 'defer-worker') { exit 0 } else { exit 1 }""#,
+        )
+        .await
+    } else {
+        ssh_capture(
+            &ssh_dest,
+            "~/.local/bin/ff --help 2>&1 | grep -q defer-worker",
+        )
+        .await
+    };
+    if let Err(ref e) = defer_worker_check {
+        details.push(CheckResult {
             check: "defer_end_to_end".into(),
-            status: "fail".into(),
-            message: Some(format!("enqueue failed: {e}")),
+            status: "skip".into(),
+            message: Some(format!(
+                "remote ff binary lacks defer-worker subcommand ({e}); upgrade binary to enable"
+            )),
             retry_task_id: None,
-        },
-    });
+        });
+    } else {
+        let title =
+            format!("verify-{}-{}", node_name, chrono::Utc::now().timestamp());
+        let payload = serde_json::json!({
+            "command": format!("echo verify-{}", chrono::Utc::now().timestamp())
+        });
+        let task_id_res = ff_db::pg_enqueue_deferred(
+            pool,
+            &title,
+            "shell",
+            &payload,
+            "now",
+            &serde_json::json!({}),
+            Some(node_name),
+            &serde_json::json!([]),
+            Some("verify_node"),
+            Some(1),
+        )
+        .await;
+        details.push(match task_id_res {
+            Ok(tid) => {
+                let deadline =
+                    std::time::Instant::now() + Duration::from_secs(30);
+                let mut final_status = None;
+                while std::time::Instant::now() < deadline {
+                    if let Ok(Some(row)) = ff_db::pg_get_deferred(pool, &tid).await
+                    {
+                        if row.status == "completed" || row.status == "failed" {
+                            final_status = Some(row.status);
+                            break;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(1500)).await;
+                }
+                match final_status.as_deref() {
+                    Some("completed") => CheckResult {
+                        check: "defer_end_to_end".into(),
+                        status: "pass".into(),
+                        message: Some(format!("task {tid} completed")),
+                        retry_task_id: None,
+                    },
+                    Some(s) => CheckResult {
+                        check: "defer_end_to_end".into(),
+                        status: "fail".into(),
+                        message: Some(format!("task {tid} status={s}")),
+                        retry_task_id: Some(tid),
+                    },
+                    None => CheckResult {
+                        check: "defer_end_to_end".into(),
+                        status: "fail".into(),
+                        message: Some(format!(
+                            "task {tid} not claimed within 30s"
+                        )),
+                        retry_task_id: Some(tid),
+                    },
+                }
+            }
+            Err(e) => CheckResult {
+                check: "defer_end_to_end".into(),
+                status: "fail".into(),
+                message: Some(format!("enqueue failed: {e}")),
+                retry_task_id: None,
+            },
+        });
+    }
     // 12. library_health — optional
     details.push(CheckResult {
         check: "library_health".into(),

@@ -88,147 +88,244 @@ impl HeartbeatV2Publisher {
     }
 
     /// Build a single beat from local system state.
+    ///
+    /// **Blocking safety**: all synchronous blocking work (sysinfo, subprocess
+    /// probes, disk enumeration) is moved into `tokio::task::spawn_blocking`.
+    /// This prevents the async runtime from stalling when `networksetup` or
+    /// `ifconfig` hang — confirmed on ace 2026-05-04 where beats never
+    /// reached Redis because `build_beat()` blocked the publisher loop.
     pub async fn build_beat(&self) -> PulseBeatV2 {
-        let mut beat = PulseBeatV2::skeleton(&self.computer_name);
-        beat.epoch = self.epoch.load(Ordering::Relaxed);
-        beat.role_claimed = self
-            .role
-            .read()
-            .map(|r| r.clone())
-            .unwrap_or_else(|_| "member".to_string());
-        beat.election_priority = self.election_priority;
-        beat.timestamp = Utc::now();
+        let computer_name = self.computer_name.clone();
+        let epoch = self.epoch.clone();
+        let role = self.role.clone();
+        let election_priority = self.election_priority;
 
-        // V43: drain any queued panics from the local panic_hook into the
-        // beat. Leader's materializer deduplicates into fleet_bug_reports.
-        let captured = ff_core::panic_hook::drain();
-        if !captured.is_empty() {
-            beat.encountered_bugs = captured
-                .into_iter()
-                .map(|b| crate::beat_v2::EncounteredBug {
-                    signature: b.signature,
-                    file_path: b.file_path,
-                    line_number: b.line_number,
-                    error_class: b.error_class,
-                    stack_excerpt: b.stack_excerpt,
-                    binary_version: b.binary_version,
-                    tier: b.tier,
-                })
-                .collect();
-        }
+        // Phase A: blocking system probes — must not block the async runtime.
+        // Hard timeout: if any macOS framework call (IOKit, DiskArbitration,
+        // SystemConfiguration via networksetup) hangs in a launchd context,
+        // we degrade gracefully rather than stall the heartbeat forever.
+        const BUILD_BEAT_TIMEOUT: Duration = Duration::from_secs(30);
+        let blocking_result = tokio::time::timeout(BUILD_BEAT_TIMEOUT, tokio::task::spawn_blocking(move || {
+            let t0 = std::time::Instant::now();
+            let mut beat = PulseBeatV2::skeleton(&computer_name);
+            beat.epoch = epoch.load(Ordering::Relaxed);
+            beat.role_claimed = role
+                .read()
+                .map(|r| r.clone())
+                .unwrap_or_else(|_| "member".to_string());
+            beat.election_priority = election_priority;
+            beat.timestamp = Utc::now();
 
-        // ── Hardware + memory snapshot ─────────────────────────────────────
-        let mut sys = System::new_all();
-        sys.refresh_all();
+            // V43: drain any queued panics from the local panic_hook into the
+            // beat. Leader's materializer deduplicates into fleet_bug_reports.
+            let captured = ff_core::panic_hook::drain();
+            if !captured.is_empty() {
+                beat.encountered_bugs = captured
+                    .into_iter()
+                    .map(|b| crate::beat_v2::EncounteredBug {
+                        signature: b.signature,
+                        file_path: b.file_path,
+                        line_number: b.line_number,
+                        error_class: b.error_class,
+                        stack_excerpt: b.stack_excerpt,
+                        binary_version: b.binary_version,
+                        tier: b.tier,
+                    })
+                    .collect();
+            }
 
-        let cpu_cores = std::thread::available_parallelism()
-            .map(|n| n.get() as i32)
-            .unwrap_or(1);
-        let ram_total_gb = (sys.total_memory() as f64 / 1_073_741_824.0).round() as i32;
-        let ram_used_bytes = sys.used_memory();
-        let ram_used_gb = ram_used_bytes as f64 / 1_073_741_824.0;
-        let ram_free_gb = (sys.total_memory() - ram_used_bytes) as f64 / 1_073_741_824.0;
-        let ram_pct = if sys.total_memory() > 0 {
-            (ram_used_bytes as f64 / sys.total_memory() as f64) * 100.0
-        } else {
-            0.0
-        };
-
-        let disks = Disks::new_with_refreshed_list();
-        let (disk_total, disk_used) = disks.iter().fold((0u64, 0u64), |(t, u), d| {
-            (
-                t + d.total_space(),
-                u + (d.total_space() - d.available_space()),
+            // ── Hardware + memory snapshot ─────────────────────────────────
+            // Inner timeouts for macOS framework calls that can hang in a
+            // launchd context (IOKit, DiskArbitration, etc.).
+            let mut sys = run_with_timeout(
+                || {
+                    // Skip process enumeration — it can hang on macOS when
+                    // run from a launchd agent (no user session / WindowServer).
+                    let mut s = System::new_with_specifics(
+                        sysinfo::RefreshKind::everything()
+                            .without_processes(),
+                    );
+                    s.refresh_all();
+                    s
+                },
+                5,
             )
-        });
-        let disk_total_gb = (disk_total as f64 / 1_073_741_824.0) as i32;
-        let disk_free_gb = (disk_total - disk_used) as f64 / 1_073_741_824.0;
+            .unwrap_or_else(|| {
+                tracing::debug!("System::new_all() timed out; using fallback");
+                System::new()
+            });
 
-        beat.hardware = HardwareInfo {
-            cpu_cores,
-            ram_gb: ram_total_gb,
-            disk_gb: disk_total_gb,
-            gpu: detect_gpu_model(),
+            let cpu_cores = std::thread::available_parallelism()
+                .map(|n| n.get() as i32)
+                .unwrap_or(1);
+            let ram_total_gb =
+                (sys.total_memory() as f64 / 1_073_741_824.0).round() as i32;
+            let ram_used_bytes = sys.used_memory();
+            let ram_used_gb = ram_used_bytes as f64 / 1_073_741_824.0;
+            let ram_free_gb =
+                (sys.total_memory() - ram_used_bytes) as f64 / 1_073_741_824.0;
+            let ram_pct = if sys.total_memory() > 0 {
+                (ram_used_bytes as f64 / sys.total_memory() as f64) * 100.0
+            } else {
+                0.0
+            };
+
+            let disks = run_with_timeout(Disks::new_with_refreshed_list, 5)
+                .unwrap_or_else(|| {
+                    tracing::debug!("Disks::new_with_refreshed_list() timed out; using empty list");
+                    Disks::new()
+                });
+            let (disk_total, disk_used) =
+                disks.iter().fold((0u64, 0u64), |(t, u), d| {
+                    (
+                        t + d.total_space(),
+                        u + (d.total_space() - d.available_space()),
+                    )
+                });
+            let disk_total_gb = (disk_total as f64 / 1_073_741_824.0) as i32;
+            let disk_free_gb =
+                (disk_total - disk_used) as f64 / 1_073_741_824.0;
+
+            beat.hardware = HardwareInfo {
+                cpu_cores,
+                ram_gb: ram_total_gb,
+                disk_gb: disk_total_gb,
+                gpu: detect_gpu_model(),
+            };
+
+            beat.load = LoadInfo {
+                cpu_pct: sys.global_cpu_usage() as f64,
+                ram_pct,
+                disk_free_gb,
+                gpu_pct: 0.0, // Phase 7 fills this in
+                active_inference_requests: 0,
+                active_agent_sessions: 0,
+            };
+
+            beat.memory = MemoryInfo {
+                ram_total_gb: ram_total_gb as f64,
+                ram_used_gb,
+                ram_free_gb,
+                llm_ram_allocated_gb: 0.0, // Phase 7
+                ram_available_for_new_llm_gb: (ram_free_gb - 3.0).max(0.0), // reserve 3GB for OS
+                vram_total_gb: None,
+                vram_used_gb: None,
+                vram_free_gb: None,
+                llm_vram_allocated_gb: None,
+            };
+
+            // ── Network identity ─────────────────────────────────────────
+            let mut all_ips = detect_all_ips();
+            // V43: annotate mlx5_core NICs with cx7-fabric kind + paired_with + link_speed.
+            for ip in all_ips.iter_mut() {
+                crate::cx7_detect::enrich_ip(ip, &computer_name);
+            }
+            beat.network = NetworkInfo {
+                primary_ip: detect_primary_ip(),
+                all_ips,
+            };
+
+            // ── Capabilities ─────────────────────────────────────────────
+            let gpu_kind = detect_gpu_kind();
+            let gpu_count = if gpu_kind == "none" { 0 } else { 1 };
+            let can_run_metal = gpu_kind == "apple_silicon";
+            let can_run_cuda = gpu_kind == "nvidia_cuda";
+            let can_run_rocm = gpu_kind == "amd_rocm";
+
+            let recommended_runtimes: Vec<String> = match gpu_kind.as_str() {
+                "apple_silicon" => {
+                    vec!["mlx_lm".into(), "llama.cpp".into()]
+                }
+                "nvidia_cuda" => {
+                    vec!["vllm".into(), "llama.cpp".into(), "ollama".into()]
+                }
+                "amd_rocm" => vec!["llama.cpp".into(), "ollama".into()],
+                _ => vec!["llama.cpp".into()],
+            };
+
+            beat.capabilities = Capabilities {
+                can_serve_ff_gateway: true,
+                can_serve_openclaw_gateway: true,
+                can_host_postgres_replica: disk_free_gb > 100.0,
+                can_host_redis_replica: ram_total_gb >= 16,
+                gpu_kind: gpu_kind.clone(),
+                gpu_count,
+                gpu_vram_gb: None,
+                gpu_total_vram_gb: None,
+                can_run_cuda,
+                can_run_metal,
+                can_run_rocm,
+                recommended_runtimes,
+                max_runnable_model_gb: None,
+            };
+
+            // ── Installed software inventory ─────────────────────────────
+            beat.installed_software = SoftwareCollector::new().detect();
+
+            // ── Available models (sync probe of ~/models) ────────────────
+            beat.available_models = LlmProbe::available_models();
+
+            debug!(
+                "build_beat blocking phase completed in {:?}",
+                t0.elapsed()
+            );
+            beat
+        })).await;
+
+        let (mut beat, blocking_ok) = match blocking_result {
+            Ok(Ok(beat)) => (beat, true),
+            Ok(Err(e)) => {
+                error!("build_beat spawn_blocking panicked: {e}");
+                let mut skeleton = PulseBeatV2::skeleton(&self.computer_name);
+                skeleton.epoch = self.epoch.load(Ordering::Relaxed);
+                skeleton.role_claimed = self
+                    .role
+                    .read()
+                    .map(|r| r.clone())
+                    .unwrap_or_else(|_| "member".to_string());
+                skeleton.election_priority = self.election_priority;
+                skeleton.timestamp = Utc::now();
+                (skeleton, false)
+            }
+            Err(_) => {
+                warn!(
+                    "build_beat: blocking probe timed out after {:?}; \
+                     returning skeleton beat (macOS framework hang in launchd context)",
+                    BUILD_BEAT_TIMEOUT
+                );
+                let mut skeleton = PulseBeatV2::skeleton(&self.computer_name);
+                skeleton.epoch = self.epoch.load(Ordering::Relaxed);
+                skeleton.role_claimed = self
+                    .role
+                    .read()
+                    .map(|r| r.clone())
+                    .unwrap_or_else(|_| "member".to_string());
+                skeleton.election_priority = self.election_priority;
+                skeleton.timestamp = Utc::now();
+                (skeleton, false)
+            }
         };
 
-        beat.load = LoadInfo {
-            cpu_pct: sys.global_cpu_usage() as f64,
-            ram_pct,
-            disk_free_gb,
-            gpu_pct: 0.0, // Phase 7 fills this in
-            active_inference_requests: 0,
-            active_agent_sessions: 0,
-        };
-
-        beat.memory = MemoryInfo {
-            ram_total_gb: ram_total_gb as f64,
-            ram_used_gb,
-            ram_free_gb,
-            llm_ram_allocated_gb: 0.0, // Phase 7
-            ram_available_for_new_llm_gb: (ram_free_gb - 3.0).max(0.0), // reserve 3GB for OS
-            vram_total_gb: None,
-            vram_used_gb: None,
-            vram_free_gb: None,
-            llm_vram_allocated_gb: None,
-        };
-
-        // ── Network identity ─────────────────────────────────────────────
-        let mut all_ips = detect_all_ips();
-        // V43: annotate mlx5_core NICs with cx7-fabric kind + paired_with + link_speed.
-        for ip in all_ips.iter_mut() {
-            crate::cx7_detect::enrich_ip(ip, &self.computer_name);
+        // Phase B: async probes — safe to .await because blocking work above
+        // is now on a separate thread.
+        // If the blocking phase timed out, skip the async probes to avoid
+        // cascading hangs (e.g. DockerProbe::detect() also uses spawn_blocking
+        // and may stall if the blocking pool is saturated by the hung thread).
+        if blocking_ok {
+            beat.llm_servers = LlmProbe::detect().await;
+            beat.docker = DockerProbe::detect().await;
+            beat.multi_host_participation = crate::ray_detect::detect_ray_membership().await;
+        } else {
+            beat.llm_servers = Vec::new();
+            beat.docker = crate::beat_v2::DockerStatus {
+                daemon_running: false,
+                total_cpu_pct: 0.0,
+                total_memory_mb: 0.0,
+                memory_limit_mb: 0.0,
+                projects: Vec::new(),
+            };
+            beat.multi_host_participation = None;
         }
-        beat.network = NetworkInfo {
-            primary_ip: detect_primary_ip(),
-            all_ips,
-        };
-
-        // ── Capabilities ─────────────────────────────────────────────────
-        let gpu_kind = detect_gpu_kind();
-        let gpu_count = if gpu_kind == "none" { 0 } else { 1 };
-        let can_run_metal = gpu_kind == "apple_silicon";
-        let can_run_cuda = gpu_kind == "nvidia_cuda";
-        let can_run_rocm = gpu_kind == "amd_rocm";
-
-        let recommended_runtimes: Vec<String> = match gpu_kind.as_str() {
-            "apple_silicon" => vec!["mlx_lm".into(), "llama.cpp".into()],
-            "nvidia_cuda" => vec!["vllm".into(), "llama.cpp".into(), "ollama".into()],
-            "amd_rocm" => vec!["llama.cpp".into(), "ollama".into()],
-            _ => vec!["llama.cpp".into()],
-        };
-
-        beat.capabilities = Capabilities {
-            can_serve_ff_gateway: true,
-            can_serve_openclaw_gateway: true,
-            can_host_postgres_replica: disk_free_gb > 100.0,
-            can_host_redis_replica: ram_total_gb >= 16,
-            gpu_kind: gpu_kind.clone(),
-            gpu_count,
-            gpu_vram_gb: None,
-            gpu_total_vram_gb: None,
-            can_run_cuda,
-            can_run_metal,
-            can_run_rocm,
-            recommended_runtimes,
-            max_runnable_model_gb: None,
-        };
-
-        // ── Installed software inventory ─────────────────────────────────
-        beat.installed_software = SoftwareCollector::new().detect();
-
-        // ── LLM servers + available models (probe localhost) ─────────────
-        beat.llm_servers = LlmProbe::detect().await;
-        beat.available_models = LlmProbe::available_models();
-
-        // ── Docker daemon probe ──────────────────────────────────────────
-        beat.docker = DockerProbe::detect().await;
-
-        // ── Ray cluster membership (item 4.6) — populates
-        //    multi_host_participation so the leader-side materializer
-        //    auto-fills the llm_clusters table without operator action.
-        //    Returns None on hosts that aren't ray members (most fleet
-        //    machines today), which is the correct shape.
-        beat.multi_host_participation = crate::ray_detect::detect_ray_membership().await;
 
         // ── peers_seen populated by a separate loop (reader_tick) ────────
 
@@ -422,23 +519,27 @@ fn detect_gpu_kind() -> String {
 
     // Linux: probe for nvidia-smi, then rocm-smi.
     if std::env::consts::OS == "linux" {
-        if std::process::Command::new("nvidia-smi")
-            .arg("--version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+        if command_output_with_timeout(&mut
+            std::process::Command::new("nvidia-smi")
+                .arg("--version")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null()),
+            3,
+        )
+        .map(|o| o.status.success())
+        .unwrap_or(false)
         {
             return "nvidia_cuda".to_string();
         }
-        if std::process::Command::new("rocm-smi")
-            .arg("--version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+        if command_output_with_timeout(&mut
+            std::process::Command::new("rocm-smi")
+                .arg("--version")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null()),
+            3,
+        )
+        .map(|o| o.status.success())
+        .unwrap_or(false)
         {
             return "amd_rocm".to_string();
         }
@@ -454,25 +555,19 @@ fn detect_gpu_model() -> Option<String> {
             // Return a generic label; precise model filled in by a later phase.
             Some("Apple Silicon GPU (Metal)".to_string())
         }
-        "linux" => std::process::Command::new("nvidia-smi")
-            .args(["--query-gpu=name", "--format=csv,noheader"])
-            .output()
-            .ok()
-            .and_then(|o| {
-                if o.status.success() {
-                    Some(
-                        String::from_utf8_lossy(&o.stdout)
-                            .lines()
-                            .next()
-                            .unwrap_or("")
-                            .trim()
-                            .to_string(),
-                    )
-                } else {
-                    None
-                }
-            })
-            .filter(|s| !s.is_empty()),
+        "linux" => command_output_with_timeout(&mut
+            std::process::Command::new("nvidia-smi")
+                .args(["--query-gpu=name", "--format=csv,noheader"]),
+            3,
+        )
+        .filter(|o| o.status.success())
+        .and_then(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .next()
+                .map(|s| s.trim().to_string())
+        })
+        .filter(|s| !s.is_empty()),
         _ => None,
     }
 }
@@ -509,23 +604,100 @@ fn pick_primary_lan_ip(ips: &[Ip]) -> Option<String> {
     lan_ips.first().map(|ip| ip.ip.clone())
 }
 
+/// Run a subprocess with a hard wall-clock timeout (blocking thread).
+/// Returns None if the command doesn't complete within `timeout_secs`.
+/// Run a closure on a new thread with a wall-clock timeout.
+/// Returns None if the closure doesn't complete within `timeout_secs`.
+fn run_with_timeout<T: Send + 'static>(
+    f: impl FnOnce() -> T + Send + 'static,
+    timeout_secs: u64,
+) -> Option<T> {
+    use std::sync::mpsc;
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(timeout_secs)) {
+        Ok(v) => Some(v),
+        Err(_) => {
+            tracing::debug!(
+                "run_with_timeout: closure did not complete within {timeout_secs}s"
+            );
+            None
+        }
+    }
+}
+
+fn command_output_with_timeout(
+    cmd: &mut std::process::Command,
+    timeout_secs: u64,
+) -> Option<std::process::Output> {
+    use std::time::Duration;
+    let mut child = cmd
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .ok()?;
+    let pid = child.id();
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait().ok()? {
+            Some(status) => {
+                let mut out = std::process::Output {
+                    status,
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                };
+                // best-effort read stdout/stderr; ignore errors
+                let _ = child.stdout.take().map(|mut r| {
+                    use std::io::Read;
+                    let _ = r.read_to_end(&mut out.stdout);
+                });
+                let _ = child.stderr.take().map(|mut r| {
+                    use std::io::Read;
+                    let _ = r.read_to_end(&mut out.stderr);
+                });
+                return Some(out);
+            }
+            None => {
+                if start.elapsed() > Duration::from_secs(timeout_secs) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    tracing::debug!(
+                        pid,
+                        ?cmd,
+                        "command_output_with_timeout: killed subprocess after {timeout_secs}s"
+                    );
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+}
+
 fn detect_all_ips() -> Vec<Ip> {
     // Use absolute paths because launchd / systemd user services often
     // strip /sbin from PATH, and `ifconfig` lives there on macOS. Without
     // this, Command::new("ifconfig") returns "not found" → empty all_ips.
     // (Hit on ace 2026-04-25 — primary_ip wrongly fell back to 127.0.0.1.)
     let output = if std::env::consts::OS == "macos" {
-        std::process::Command::new("/sbin/ifconfig").output()
+        command_output_with_timeout(&mut
+            std::process::Command::new("/sbin/ifconfig"),
+            3,
+        )
     } else {
         // /sbin/ip on Debian/Ubuntu, /usr/sbin/ip on RHEL — try both.
-        std::process::Command::new("ip")
-            .args(["-4", "-o", "addr", "show"])
-            .env("PATH", "/usr/sbin:/sbin:/usr/bin:/bin")
-            .output()
+        command_output_with_timeout(&mut
+            std::process::Command::new("ip")
+                .args(["-4", "-o", "addr", "show"])
+                .env("PATH", "/usr/sbin:/sbin:/usr/bin:/bin"),
+            3,
+        )
     };
 
     let stdout = match output {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+        Some(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
         _ => return Vec::new(),
     };
 
@@ -605,19 +777,15 @@ fn probe_iface_linux(iface: &str) -> (Option<String>, Option<u32>) {
         .exists();
     if wireless {
         // Wifi link rate via `iw dev <iface> link` if available; otherwise leave None.
-        let rate = std::process::Command::new("iw")
-            .args(["dev", iface, "link"])
-            .env("PATH", "/usr/sbin:/sbin:/usr/bin:/bin")
-            .output()
-            .ok()
-            .and_then(|o| {
-                if o.status.success() {
-                    Some(String::from_utf8_lossy(&o.stdout).into_owned())
-                } else {
-                    None
-                }
-            })
-            .and_then(|s| {
+        let rate = command_output_with_timeout(&mut
+            std::process::Command::new("iw")
+                .args(["dev", iface, "link"])
+                .env("PATH", "/usr/sbin:/sbin:/usr/bin:/bin"),
+            3,
+        )
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .and_then(|s| {
                 s.lines()
                     .find(|l| l.trim_start().starts_with("tx bitrate:"))
                     .and_then(|l| l.split_whitespace().nth(2).map(str::to_string))
@@ -662,32 +830,23 @@ fn probe_iface_linux(iface: &str) -> (Option<String>, Option<u32>) {
 /// link speed (e.g. `media: autoselect (1000baseT <full-duplex>)`).
 /// Cross-references `networksetup -listallhardwareports` to detect wifi.
 fn probe_iface_macos(iface: &str) -> (Option<String>, Option<u32>) {
-    let media = std::process::Command::new("/sbin/ifconfig")
-        .arg(iface)
-        .output()
-        .ok()
-        .and_then(|o| {
-            if o.status.success() {
-                Some(String::from_utf8_lossy(&o.stdout).into_owned())
-            } else {
-                None
-            }
-        })
-        .unwrap_or_default();
+    let media = command_output_with_timeout(&mut
+        std::process::Command::new("/sbin/ifconfig").arg(iface),
+        3,
+    )
+    .filter(|o| o.status.success())
+    .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+    .unwrap_or_default();
 
     // Hardware-port lookup: AirPort/Wi-Fi → wifi medium.
-    let hw_ports = std::process::Command::new("/usr/sbin/networksetup")
-        .args(["-listallhardwareports"])
-        .output()
-        .ok()
-        .and_then(|o| {
-            if o.status.success() {
-                Some(String::from_utf8_lossy(&o.stdout).into_owned())
-            } else {
-                None
-            }
-        })
-        .unwrap_or_default();
+    let hw_ports = command_output_with_timeout(&mut
+        std::process::Command::new("/usr/sbin/networksetup")
+            .args(["-listallhardwareports"]),
+        3,
+    )
+    .filter(|o| o.status.success())
+    .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+    .unwrap_or_default();
 
     let medium = {
         // Walk hardware ports list looking for "Hardware Port: Foo / Device: <iface>".

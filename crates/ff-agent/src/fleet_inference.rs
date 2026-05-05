@@ -93,7 +93,7 @@ impl FleetInferenceManager {
             FleetEndpoint {
                 name: "taylor-qwen35".into(),
                 url: "http://192.168.5.100:55001".into(),
-                model_name: "qwen3.5-35b-a3b".into(),
+                model_name: "/Users/venkat/models/qwen36-35b-a3b".into(),
                 model_params: 35_000_000_000,
                 memory_gb: 96,
                 gpu_type: GpuType::AppleSilicon,
@@ -158,7 +158,7 @@ impl FleetInferenceManager {
             FleetEndpoint {
                 name: "logan".into(),
                 url: "http://192.168.5.111:55000".into(),
-                model_name: "qwen3.5-35b-a3b".into(),
+                model_name: "qwen3.6-35b-a3b".into(),
                 model_params: 35_000_000_000,
                 memory_gb: 128,
                 gpu_type: GpuType::Cpu,
@@ -171,7 +171,7 @@ impl FleetInferenceManager {
             FleetEndpoint {
                 name: "veronica".into(),
                 url: "http://192.168.5.112:55000".into(),
-                model_name: "qwen3.5-35b-a3b".into(),
+                model_name: "qwen3.6-35b-a3b".into(),
                 model_params: 35_000_000_000,
                 memory_gb: 128,
                 gpu_type: GpuType::Cpu,
@@ -184,7 +184,7 @@ impl FleetInferenceManager {
             FleetEndpoint {
                 name: "lily".into(),
                 url: "http://192.168.5.113:55000".into(),
-                model_name: "qwen3.5-35b-a3b".into(),
+                model_name: "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf".into(),
                 model_params: 35_000_000_000,
                 memory_gb: 128,
                 gpu_type: GpuType::Cpu,
@@ -197,7 +197,7 @@ impl FleetInferenceManager {
             FleetEndpoint {
                 name: "duncan".into(),
                 url: "http://192.168.5.114:55000".into(),
-                model_name: "qwen3.5-35b-a3b".into(),
+                model_name: "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf".into(),
                 model_params: 35_000_000_000,
                 memory_gb: 128,
                 gpu_type: GpuType::Cpu,

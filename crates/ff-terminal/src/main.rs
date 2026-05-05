@@ -582,6 +582,11 @@ enum SelfHealCommand {
     Revert { bug_signature: String },
     /// Reset a daemon's trust score back to operator-approve probation.
     TrustReset { computer: String },
+    /// Run the writer LLM for a given bug signature (internal pipeline).
+    RunWriter {
+        #[arg(long)]
+        bug_sig: String,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -2887,6 +2892,9 @@ async fn main() -> Result<()> {
                 }
                 SelfHealCommand::TrustReset { computer } => {
                     self_heal_cmd::handle_trust_reset(&pool, &computer).await
+                }
+                SelfHealCommand::RunWriter { bug_sig } => {
+                    self_heal_cmd::handle_run_writer(&pool, &bug_sig).await
                 }
             }
         }

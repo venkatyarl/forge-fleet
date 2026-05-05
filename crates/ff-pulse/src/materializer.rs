@@ -66,6 +66,8 @@ pub struct ProcessReport {
     pub ips_updated: bool,
     /// (old_status, new_status) if a status transition occurred.
     pub status_transition: Option<(String, String)>,
+    /// How many `fleet_bug_reports` rows were inserted from this beat.
+    pub bug_reports_inserted: usize,
 }
 
 // -----------------------------------------------------------------------------
@@ -288,6 +290,16 @@ impl Materializer {
         &self,
         shutdown: &mut watch::Receiver<bool>,
     ) -> Result<(), MaterializerError> {
+        // One-time schema guard: ensure the metadata column exists before we
+        // start processing beats. Previously this ran inside upsert_software
+        // (hot path), generating ~10 NOTICEs/sec in Postgres logs.
+        let _ = sqlx::query(
+            "ALTER TABLE computer_software \
+                ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'::jsonb",
+        )
+        .execute(&self.pg)
+        .await;
+
         let mut pubsub = self.redis.get_async_pubsub().await?;
         pubsub.subscribe(PULSE_EVENTS_CHANNEL).await?;
         info!(
@@ -347,6 +359,7 @@ impl Materializer {
                                 software_upserts = report.software_upserts,
                                 deployment_upserts = report.deployment_upserts,
                                 container_upserts = report.docker_container_upserts,
+                                bug_reports_inserted = report.bug_reports_inserted,
                                 "materializer: beat processed"
                             );
                             // Mirror member status transitions to NATS (best-effort).
@@ -420,6 +433,19 @@ impl Materializer {
         let prev_gpu_total_vram_gb: Option<f64> = row.try_get("gpu_total_vram_gb").ok();
 
         report.computer_id = Some(computer_id);
+
+        // V43+: persist encountered bugs before the fast-path exit so panics
+        // are recorded even when the rest of the beat is unchanged.
+        match self.insert_bug_reports(beat, computer_id).await {
+            Ok(n) => report.bug_reports_inserted = n,
+            Err(e) => {
+                tracing::warn!(
+                    computer = %beat.computer_name,
+                    error = %e,
+                    "materializer: bug report insert failed"
+                );
+            }
+        }
 
         // Build the persistent snapshot for this beat.
         let new_snapshot = PersistedSnapshot::from_beat(beat);
@@ -776,15 +802,7 @@ impl Materializer {
         //
         // `metadata` is merged into the existing row (jsonb concat) so
         // keys like `git_state` are preserved across beats that don't
-        // resend them. The `ADD COLUMN IF NOT EXISTS` guards against
-        // running against an older DB where the column isn't deployed
-        // yet — it's a no-op when the column is already there.
-        let _ = sqlx::query(
-            "ALTER TABLE computer_software \
-                ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'::jsonb",
-        )
-        .execute(&self.pg)
-        .await;
+        // resend them.
         let meta = sw.metadata.clone().unwrap_or_else(|| serde_json::json!({}));
         sqlx::query(
             "INSERT INTO computer_software \
@@ -1033,6 +1051,43 @@ impl Materializer {
         .await?;
 
         Ok(())
+    }
+
+    /// Insert `encountered_bugs` from a beat into `fleet_bug_reports`.
+    /// Uses ON CONFLICT DO NOTHING so duplicate signatures from the same
+    /// daemon are silently deduped within the unique-constraint window.
+    async fn insert_bug_reports(
+        &self,
+        beat: &PulseBeatV2,
+        computer_id: Uuid,
+    ) -> Result<usize, MaterializerError> {
+        if beat.encountered_bugs.is_empty() {
+            return Ok(0);
+        }
+        let mut count = 0usize;
+        for bug in &beat.encountered_bugs {
+            let rows_affected = sqlx::query(
+                "INSERT INTO fleet_bug_reports \
+                    (bug_signature, file_path, line_number, error_class, \
+                     stack_excerpt, reporting_computer_id, reported_at, \
+                     binary_version, tier) \
+                 VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7, $8) \
+                 ON CONFLICT DO NOTHING",
+            )
+            .bind(&bug.signature)
+            .bind(&bug.file_path)
+            .bind(bug.line_number.map(|n| n as i32))
+            .bind(&bug.error_class)
+            .bind(&bug.stack_excerpt)
+            .bind(computer_id)
+            .bind(&bug.binary_version)
+            .bind(&bug.tier)
+            .execute(&self.pg)
+            .await?
+            .rows_affected();
+            count += rows_affected as usize;
+        }
+        Ok(count)
     }
 }
 

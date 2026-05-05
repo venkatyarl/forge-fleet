@@ -525,6 +525,7 @@ pub fn build_router(state: Arc<GatewayState>, mc_db_path: Option<&str>) -> Route
         .route("/v1/chat/completions", post(proxy_chat_completions))
         .route("/v1/models", get(list_models))
         .route("/api/models", get(list_models))
+        .route("/v1/fleet/route", post(route_fleet_capability))
         // ─── Replication routes ──────────────────────────────────────
         .route("/api/fleet/replicate/snapshot", post(replicate_snapshot))
         .route("/api/fleet/replicate/sequence", get(replicate_sequence))
@@ -4780,6 +4781,252 @@ async fn list_models(
         "object": "list",
         "data": data,
     })))
+}
+
+// ─── POST /v1/fleet/route — capability-based fleet routing ───────────────────
+
+#[derive(Debug, Deserialize)]
+struct RouteFleetRequest {
+    /// Human-readable task description (for logging / reasoning).
+    #[serde(default)]
+    task: String,
+    /// Required capabilities the chosen model must support, e.g.
+    /// `["vision"]` or `["reasoning", "tool_calling"]`.
+    required_capabilities: Vec<String>,
+    /// Prefer a model running on the local node (same host as gateway).
+    #[serde(default)]
+    preferred_local: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct RouteFleetResponse {
+    /// The resolved upstream URL for the chosen model.
+    target: String,
+    /// Node name hosting the chosen model.
+    node: String,
+    /// Model slug / identifier.
+    model: String,
+    /// Human-readable model name.
+    model_name: String,
+    /// Capabilities this model advertises.
+    capabilities: Vec<String>,
+    /// Whether the chosen endpoint is on the local node.
+    is_local: bool,
+    /// Why this endpoint was chosen.
+    reason: String,
+    /// Current queue depth on the chosen server (if known from pulse).
+    queue_depth: Option<i32>,
+    /// Tokens/sec served in the last minute (if known from pulse).
+    tokens_per_sec: Option<f64>,
+    /// Alternative candidates that also matched (for debugging).
+    alternatives: Vec<AlternativeCandidate>,
+}
+
+#[derive(Debug, Serialize)]
+struct AlternativeCandidate {
+    node: String,
+    model: String,
+    target: String,
+    reason_skipped: String,
+}
+
+/// POST /v1/fleet/route
+///
+/// Accepts a task description + required capabilities and returns the best
+/// live fleet endpoint that can serve it.  Uses two sources of truth:
+///   1. Postgres `fleet_models` × `fleet_nodes` for capability metadata + health.
+///   2. Redis Pulse beats for live server state (queue depth, throughput).
+///
+/// This is the primitive that project sidecars should call instead of
+/// hard-coding node:port mappings.
+async fn route_fleet_capability(
+    State(state): State<Arc<GatewayState>>,
+    Json(req): Json<RouteFleetRequest>,
+) -> Result<Json<RouteFleetResponse>, (StatusCode, Json<Value>)> {
+    let cap_set: HashSet<String> = req.required_capabilities.iter().cloned().collect();
+    if cap_set.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "required_capabilities must not be empty"})),
+        ));
+    }
+
+    // ── 1. Load catalog entries for capability enrichment ──
+    // Query BOTH fleet_model_catalog (new, preferred) and model_catalog (legacy V39).
+    let mut catalog_entries: HashMap<String, (String, i32, Value)> = HashMap::new();
+
+    if let Some(pool) = state.operational_store.as_ref().and_then(|s| s.pg_pool()) {
+        // 1a. New table
+        match sqlx::query("SELECT id, name, tier, preferred_workloads FROM fleet_model_catalog")
+            .fetch_all(pool)
+            .await
+        {
+            Ok(rows) => {
+                for r in rows {
+                    let id: String = r.get("id");
+                    let name: String = r.get("name");
+                    let tier: i32 = r.get("tier");
+                    let pw: Value = r.get("preferred_workloads");
+                    catalog_entries.insert(id, (name, tier, pw));
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "route_fleet_capability: fleet_model_catalog query failed"),
+        }
+
+        // 1b. Legacy table (V39) — merge in anything missing
+        match sqlx::query(
+            "SELECT id, display_name, COALESCE((metadata->>'tier')::int, 2) as tier, metadata->>'preferred_workloads' as pw FROM model_catalog WHERE metadata->>'preferred_workloads' IS NOT NULL"
+        )
+        .fetch_all(pool)
+        .await
+        {
+            Ok(rows) => {
+                for r in rows {
+                    let id: String = r.get("id");
+                    if catalog_entries.contains_key(&id) {
+                        continue;
+                    }
+                    let name: String = r.get("display_name");
+                    let tier: i32 = r.get("tier");
+                    let pw_raw: Option<String> = r.get("pw");
+                    let pw = pw_raw.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(Value::Array(vec![]));
+                    catalog_entries.insert(id, (name, tier, pw));
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "route_fleet_capability: model_catalog query failed"),
+        }
+    }
+
+    // ── 2. Fetch live Pulse servers ──
+    let live_servers = match state.pulse_router.as_ref() {
+        Some(router) => router.list_servers().await.unwrap_or_default(),
+        None => Vec::new(),
+    };
+
+    // ── 3. Enrich live servers with catalog capabilities ──
+    let mut candidates: Vec<(String, String, String, i32, String, Value, &Value)> = Vec::new();
+    for s in &live_servers {
+        let computer = s.get("computer").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let endpoint = s.get("endpoint").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let raw_model_id = s.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let healthy = s.get("healthy").and_then(|v| v.as_bool()).unwrap_or(false);
+        if !healthy {
+            continue;
+        }
+
+        // Normalize model id: basename for paths, lowercase for matching
+        let model_id = std::path::Path::new(&raw_model_id)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(&raw_model_id)
+            .to_string();
+
+        // Try exact catalog match first, then fuzzy prefix match
+        let catalog_match: Option<&(String, i32, Value)> = catalog_entries.get(&model_id)
+            .or_else(|| {
+                let model_lower = model_id.to_lowercase();
+                catalog_entries.iter().find(|(cat_id, _)| {
+                    model_lower.contains(&cat_id.to_lowercase()) || cat_id.to_lowercase().contains(&model_lower)
+                }).map(|(_, v)| v)
+            });
+
+        let (name, tier, pw): (String, i32, Value) = match catalog_match {
+            Some((n, t, p)) => (n.clone(), *t, p.clone()),
+            None => (model_id.clone(), 2, Value::Array(vec![])),
+        };
+
+        // Filter by required capabilities
+        let has_all_caps = req.required_capabilities.iter().all(|cap| {
+            pw.as_array()
+                .map(|arr: &Vec<Value>| arr.iter().any(|v| v.as_str() == Some(cap)))
+                .unwrap_or(false)
+        });
+
+        if has_all_caps {
+            candidates.push((computer, model_id, name, tier, endpoint, pw, s));
+        }
+    }
+
+    // ── 3. Score candidates ──
+    //   Priority: exact local match > lower tier > lower queue depth > higher tps
+    let local_hostname = std::env::var("FF_NODE")
+        .ok()
+        .or_else(|| std::env::var("HOSTNAME").ok())
+        .or_else(|| std::process::Command::new("hostname").arg("-s").output().ok().and_then(|o| String::from_utf8(o.stdout).ok()))
+        .unwrap_or_default()
+        .trim()
+        .to_lowercase();
+
+    let mut scored: Vec<(i32, i32, i32, f64, String, String, String, String, Value, &Value)> = Vec::new();
+    let mut alternatives: Vec<AlternativeCandidate> = Vec::new();
+
+    for (node_name, slug, name, tier, endpoint, pw, beat) in &candidates {
+        let is_local = node_name.to_lowercase() == local_hostname
+            || local_hostname.starts_with(&node_name.to_lowercase())
+            || node_name.to_lowercase().starts_with(&local_hostname);
+        let qd = beat.get("queue_depth").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+        let tps = beat.get("tokens_per_sec_last_min").and_then(|v| v.as_f64()).unwrap_or(0.0);
+
+        // Scoring tuple: (local_bonus, tier_asc, queue_asc, tps_desc)
+        let local_bonus = if is_local && req.preferred_local { 1 } else { 0 };
+
+        scored.push((local_bonus, *tier, qd, tps, slug.clone(), name.clone(), node_name.clone(), endpoint.clone(), pw.clone(), *beat));
+    }
+
+    // Sort: local first, then lower tier, then lower queue, then higher tps
+    scored.sort_by(|a, b| {
+        b.0.cmp(&a.0)                    // local bonus descending
+            .then_with(|| a.1.cmp(&b.1)) // tier ascending
+            .then_with(|| a.2.cmp(&b.2)) // queue depth ascending
+            .then_with(|| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal)) // tps descending
+    });
+
+    if let Some((_, tier, qd, tps, slug, name, node_name, endpoint, pw, _beat)) = scored.first() {
+        let caps = pw.as_array()
+            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+
+        let is_local = node_name.to_lowercase() == local_hostname;
+        let reason = if is_local && req.preferred_local {
+            format!("local match, tier {tier}, queue_depth {qd}")
+        } else {
+            format!("fleet match, tier {tier}, queue_depth {qd}, tps {tps:.1}")
+        };
+
+        // Build alternatives list from remaining scored items + skipped items
+        for (_, _, _, _, alt_slug, _, alt_node, alt_endpoint, _, _) in scored.iter().skip(1).take(5) {
+            alternatives.push(AlternativeCandidate {
+                node: alt_node.clone(),
+                model: alt_slug.clone(),
+                target: alt_endpoint.clone(),
+                reason_skipped: "lower priority".to_string(),
+            });
+        }
+
+        return Ok(Json(RouteFleetResponse {
+            target: endpoint.clone(),
+            node: node_name.clone(),
+            model: slug.clone(),
+            model_name: name.clone(),
+            capabilities: caps,
+            is_local,
+            reason,
+            queue_depth: Some(*qd),
+            tokens_per_sec: Some(*tps),
+            alternatives,
+        }));
+    }
+
+    // ── 4. No match ──
+    Err((
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "error": "no healthy fleet endpoint matches the required capabilities",
+            "required_capabilities": req.required_capabilities,
+            "task": req.task,
+            "alternatives_considered": alternatives.len(),
+        })),
+    ))
 }
 
 /// GET /api/proxy/stats (and /v1/proxy/stats) — dashboard-friendly proxy metrics.

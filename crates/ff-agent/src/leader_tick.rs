@@ -230,6 +230,15 @@ impl LeaderTick {
                                         );
                                     }
 
+                                    // V43+: self-heal bug-fix pipeline.
+                                    if let Err(err) = self.self_heal_scan().await {
+                                        tracing::warn!(
+                                            node = %self.my_name,
+                                            error = %err,
+                                            "self_heal_scan failed"
+                                        );
+                                    }
+
                                     // Phase 6 HA: auto-failover check. Only
                                     // runs on the currently-elected ForgeFleet
                                     // leader. Disabled via env var
@@ -570,6 +579,148 @@ impl LeaderTick {
                     error = %err,
                     "failed to enqueue revive_member task"
                 ),
+            }
+        }
+
+        Ok(())
+    }
+
+    /// V43+: self-heal coordination scan.
+    ///
+    /// 1. Aggregate recent `fleet_bug_reports` by signature and upsert into
+    ///    `fleet_self_heal_queue` (single-flight via UNIQUE on bug_signature).
+    /// 2. Dispatch `self_heal_writer` deferred tasks for rows in `detected`.
+    /// 3. Recover stale claims (`fixing` older than 5 min) — retry or escalate.
+    pub async fn self_heal_scan(&self) -> Result<(), LeaderError> {
+        // ── 1. Aggregate bug reports into the queue ──────────────────────────
+        sqlx::query(
+            "INSERT INTO fleet_self_heal_queue \
+                (bug_signature, tier, status, report_count, created_at) \
+             SELECT bug_signature, MAX(tier), 'detected', COUNT(*), NOW() \
+             FROM fleet_bug_reports \
+             WHERE reported_at > NOW() - INTERVAL '5 minutes' \
+             GROUP BY bug_signature \
+             ON CONFLICT (bug_signature) DO UPDATE SET \
+                 report_count = fleet_self_heal_queue.report_count \
+                     + EXCLUDED.report_count,
+                 tier = EXCLUDED.tier",
+        )
+        .execute(&self.pg)
+        .await?;
+
+        // ── 2. Stale-claim recovery ─────────────────────────────────────────
+        let stale_rows = sqlx::query(
+            "UPDATE fleet_self_heal_queue \
+             SET status = CASE \
+                 WHEN attempts >= 2 THEN 'escalated' \
+                 ELSE 'detected' \
+             END, \
+                 attempts = attempts + 1, \
+                 escalated_to_operator_at = CASE \
+                     WHEN attempts >= 2 THEN NOW() \
+                     ELSE escalated_to_operator_at \
+                 END \
+             WHERE status = 'fixing' \
+               AND (last_attempt_at IS NULL OR last_attempt_at < NOW() - INTERVAL '5 minutes') \
+             RETURNING bug_signature, status",
+        )
+        .fetch_all(&self.pg)
+        .await?;
+
+        for row in &stale_rows {
+            let sig: String = row.try_get("bug_signature")?;
+            let status: String = row.try_get("status")?;
+            if status == "escalated" {
+                tracing::warn!(
+                    bug_signature = %sig,
+                    "self_heal: bug escalated to operator after max retries"
+                );
+            } else {
+                tracing::info!(
+                    bug_signature = %sig,
+                    "self_heal: stale claim recovered, re-dispatching"
+                );
+            }
+        }
+
+        // ── 3. Dispatch writer tasks for detected rows ──────────────────────
+        let detected = sqlx::query(
+            "SELECT bug_signature, tier \
+             FROM fleet_self_heal_queue \
+             WHERE status = 'detected' \
+             ORDER BY CASE tier \
+                 WHEN 'T1' THEN 1 WHEN 'T0' THEN 2 WHEN 'T2' THEN 3 ELSE 4 \
+             END, created_at",
+        )
+        .fetch_all(&self.pg)
+        .await?;
+
+        for row in &detected {
+            let sig: String = row.try_get("bug_signature")?;
+
+            // De-dupe: is a writer task already in-flight?
+            let inflight = sqlx::query(
+                "SELECT 1 FROM deferred_tasks \
+                 WHERE kind = 'shell_command' \
+                   AND status IN ('pending', 'dispatchable', 'running') \
+                   AND title = $1",
+            )
+            .bind(format!("self_heal_writer: {sig}"))
+            .fetch_optional(&self.pg)
+            .await?;
+            if inflight.is_some() {
+                tracing::debug!(bug_signature = %sig, "self_heal: writer task already in-flight");
+                continue;
+            }
+
+            // Enqueue writer task.
+            let title = format!("self_heal_writer: {sig}");
+            let payload = serde_json::json!({
+                "command": format!("ff self-heal run-writer --bug-sig {sig}"),
+                "summary": format!("Self-heal writer for bug {sig}")
+            });
+            let trigger_spec = serde_json::json!({});
+            let required_caps = serde_json::json!([]);
+
+            match ff_db::queries::pg_enqueue_deferred(
+                &self.pg,
+                &title,
+                "shell_command",
+                &payload,
+                "now",
+                &trigger_spec,
+                Some(&self.my_name),
+                &required_caps,
+                Some(&format!("leader:{}", self.my_name)),
+                Some(3),
+            )
+            .await
+            {
+                Ok(id) => {
+                    tracing::info!(
+                        bug_signature = %sig,
+                        task_id = %id,
+                        "self_heal: enqueued writer deferred task"
+                    );
+                    // Mark as fixing so we don't re-dispatch next tick.
+                    sqlx::query(
+                        "UPDATE fleet_self_heal_queue \
+                         SET status = 'fixing', attempts = attempts + 1, \
+                             last_attempt_at = NOW(), writer_computer_id = $2 \
+                         WHERE bug_signature = $1",
+                    )
+                    .bind(&sig)
+                    .bind(self.my_computer_id)
+                    .execute(&self.pg)
+                    .await?;
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        bug_signature = %sig,
+                        error = %err,
+                        "self_heal: failed to enqueue writer task"
+                    );
+                }
             }
         }
 

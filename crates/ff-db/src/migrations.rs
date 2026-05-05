@@ -477,6 +477,16 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "skill_sources",
         sql: schema::SCHEMA_V69_SKILL_SOURCES,
     },
+    PgMigration {
+        version: 70,
+        name: "fleet_model_catalog_qwen36",
+        sql: schema::SCHEMA_V70_FLEET_MODEL_CATALOG_QWEN36,
+    },
+    PgMigration {
+        version: 71,
+        name: "backfill_fleet_model_catalog",
+        sql: schema::SCHEMA_V71_BACKFILL_FLEET_MODEL_CATALOG,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.

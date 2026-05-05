@@ -1903,6 +1903,69 @@ VALUES
 ON CONFLICT (id) DO NOTHING;
 "#;
 
+// ─── V70: Add Qwen3.6-35B-A3B to fleet_model_catalog ─────────────────────────
+//
+// The model was released April 2026 and is already on disk on several fleet
+// nodes (james, lily, logan, duncan) but never made it into the catalog.
+// Taylor (this machine) still runs Qwen3.5-35B-A3B and needs the catalog
+// entry so `ff model download` can pull the MLX variant.
+pub const SCHEMA_V70_FLEET_MODEL_CATALOG_QWEN36: &str = r#"
+INSERT INTO fleet_model_catalog
+    (id, name, family, parameters, tier, description, gated,
+     preferred_workloads, variants, updated_at)
+VALUES
+    ('qwen36-35b-a3b',
+     'Qwen3.6-35B-A3B-Instruct',
+     'qwen',
+     '35B',
+     1,
+     'Qwen 3.6 35B A3B (MoE, ~3B active). April 2026 release. Straight upgrade over Qwen3.5-35B-A3B: +37% MCPMark, +27% Terminal-Bench, +43% QwenWebBench. Best tool-calling accuracy in fleet.',
+     false,
+     '["text-generation", "code", "reasoning", "tool_calling"]'::jsonb,
+     '[{"runtime": "llama.cpp", "quant": "Q4_K_M", "hf_repo": "Qwen/Qwen3.6-35B-A3B-Instruct-GGUF", "size_gb": 20},
+       {"runtime": "mlx", "quant": "4bit", "hf_repo": "mlx-community/Qwen3.6-35B-A3B-4bit", "size_gb": 19}]'::jsonb,
+     NOW())
+ON CONFLICT (id) DO UPDATE SET
+    name = EXCLUDED.name,
+    family = EXCLUDED.family,
+    parameters = EXCLUDED.parameters,
+    tier = EXCLUDED.tier,
+    description = EXCLUDED.description,
+    gated = EXCLUDED.gated,
+    preferred_workloads = EXCLUDED.preferred_workloads,
+    variants = EXCLUDED.variants,
+    updated_at = NOW();
+"#;
+
+// ─── V71: Backfill fleet_model_catalog from legacy model_catalog ───────────
+//
+// V39 seeded 46 models into `model_catalog` (old comprehensive table).
+// V70+ code paths prefer `fleet_model_catalog` (new slim table).
+// This migration copies every model_catalog entry that has capability metadata
+// into fleet_model_catalog so /v1/fleet/route has a single table to query.
+//
+// ON CONFLICT DO NOTHING protects any operator edits made directly to
+// fleet_model_catalog after V70.
+pub const SCHEMA_V71_BACKFILL_FLEET_MODEL_CATALOG: &str = r#"
+INSERT INTO fleet_model_catalog
+    (id, name, family, parameters, tier, description, gated,
+     preferred_workloads, variants, updated_at)
+SELECT
+    id,
+    display_name,
+    family,
+    COALESCE(metadata->>'parameters', parameter_count),
+    COALESCE((metadata->>'tier')::int, 2),
+    metadata->>'description',
+    COALESCE((metadata->>'gated')::boolean, false),
+    COALESCE((metadata->>'preferred_workloads')::jsonb, '[]'::jsonb),
+    COALESCE((metadata->>'variants')::jsonb, '[]'::jsonb),
+    NOW()
+FROM model_catalog
+WHERE metadata->>'preferred_workloads' IS NOT NULL
+ON CONFLICT (id) DO NOTHING;
+"#;
+
 // ─── V29: fix V28's arch-blind Linux playbook ────────────────────────────
 //
 // V28 seeded `ff_git` and `forgefleetd_git` with a Linux playbook that

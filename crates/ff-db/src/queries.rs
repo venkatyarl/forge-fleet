@@ -1618,6 +1618,52 @@ pub async fn pg_list_models_for_node(pool: &PgPool, node: &str) -> Result<Vec<Fl
         .collect())
 }
 
+/// List fleet models whose `preferred_workloads` JSONB array contains *all*
+/// of the given workload tags.  Joins with `fleet_nodes` so the caller also
+/// gets the node's primary IP and current health status.
+pub async fn pg_list_models_by_workload(
+    pool: &PgPool,
+    workloads: &[String],
+) -> Result<Vec<(FleetModelRow, String, String)>> {
+    let workloads_json = serde_json::to_value(workloads)?;
+    let rows = sqlx::query(
+        "SELECT
+            m.id, m.node_name, m.slug, m.name, m.family, m.port, m.tier,
+            m.local_model, m.lifecycle, m.mode, m.preferred_workloads,
+            n.primary_ip, n.status
+         FROM fleet_models m
+         JOIN fleet_nodes n ON n.name = m.node_name
+         WHERE m.preferred_workloads @> $1::jsonb
+           AND n.status IN ('online', 'degraded')
+         ORDER BY m.tier ASC, m.node_name, m.slug",
+    )
+    .bind(&workloads_json)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .iter()
+        .map(|r| {
+            let model = FleetModelRow {
+                id: r.get("id"),
+                node_name: r.get("node_name"),
+                slug: r.get("slug"),
+                name: r.get("name"),
+                family: r.get("family"),
+                port: r.get("port"),
+                tier: r.get("tier"),
+                local_model: r.get("local_model"),
+                lifecycle: r.get("lifecycle"),
+                mode: r.get("mode"),
+                preferred_workloads: r.get("preferred_workloads"),
+            };
+            let primary_ip: String = r.get("primary_ip");
+            let node_status: String = r.get("status");
+            (model, primary_ip, node_status)
+        })
+        .collect())
+}
+
 /// Upsert a fleet model in Postgres.
 pub async fn pg_upsert_model(pool: &PgPool, model: &FleetModelRow) -> Result<()> {
     sqlx::query(
