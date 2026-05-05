@@ -121,6 +121,59 @@ pub fn json_error(status: StatusCode, message: &str) -> impl IntoResponse {
         })
 }
 
+// ─── JWT auth middleware ─────────────────────────────────────────────────────
+
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct JwtClaims {
+    pub sub: String,
+    pub exp: Option<usize>,
+    pub iat: Option<usize>,
+}
+
+/// Axum middleware that validates `Authorization: Bearer <token>` when
+/// `FF_JWT_SECRET` is configured.  When absent the middleware is a no-op
+/// so existing deployments stay backward-compatible.
+pub async fn jwt_auth_middleware(request: Request<Body>, next: Next) -> Response<Body> {
+    let secret = match std::env::var("FF_JWT_SECRET") {
+        Ok(s) if !s.is_empty() => s,
+        _ => return next.run(request).await,
+    };
+
+    let auth_header = request
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok());
+
+    let token = match auth_header {
+        Some(hdr) if hdr.starts_with("Bearer ") => &hdr[7..],
+        _ => {
+            return json_error(StatusCode::UNAUTHORIZED, "missing or malformed Authorization header").into_response();
+        }
+    };
+
+    let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
+    validation.validate_exp = false; // allow non-expiring service tokens
+    validation.required_spec_claims.clear();
+
+    match jsonwebtoken::decode::<JwtClaims>(
+        token,
+        &jsonwebtoken::DecodingKey::from_secret(secret.as_bytes()),
+        &validation,
+    ) {
+        Ok(_decoded) => next.run(request).await,
+        Err(e) => {
+            warn!(error = %e, "jwt validation failed");
+            json_error(StatusCode::UNAUTHORIZED, &format!(
+                "invalid token: {}",
+                e
+            ))
+            .into_response()
+        }
+    }
+}
+
 fn error_type_for_status(status: StatusCode) -> &'static str {
     match status {
         StatusCode::NOT_FOUND => "not_found",

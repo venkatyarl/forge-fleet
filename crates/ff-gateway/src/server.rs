@@ -526,6 +526,7 @@ pub fn build_router(state: Arc<GatewayState>, mc_db_path: Option<&str>) -> Route
         .route("/v1/models", get(list_models))
         .route("/api/models", get(list_models))
         .route("/v1/fleet/route", post(route_fleet_capability))
+        .route("/v1/embeddings", post(proxy_embeddings))
         // ─── Replication routes ──────────────────────────────────────
         .route("/api/fleet/replicate/snapshot", post(replicate_snapshot))
         .route("/api/fleet/replicate/sequence", get(replicate_sequence))
@@ -626,6 +627,7 @@ pub fn build_router(state: Arc<GatewayState>, mc_db_path: Option<&str>) -> Route
 
     app.route("/metrics", get(serve_prometheus_metrics))
         .fallback(crate::static_files::serve_dashboard)
+        .layer(middleware::from_fn(crate::middleware::jwt_auth_middleware))
         .layer(middleware::from_fn(crate::middleware::trace_id_middleware))
         .layer(middleware::from_fn(prometheus_metrics_middleware))
         .layer(TraceLayer::new_for_http())
@@ -5025,6 +5027,169 @@ async fn route_fleet_capability(
             "required_capabilities": req.required_capabilities,
             "task": req.task,
             "alternatives_considered": alternatives.len(),
+        })),
+    ))
+}
+
+/// POST /v1/embeddings — OpenAI-compatible embedding proxy routed to fleet nodes
+/// that advertise an `embeddings` capability.
+async fn proxy_embeddings(
+    State(state): State<Arc<GatewayState>>,
+    Json(raw_payload): Json<Value>,
+) -> Result<Response<Body>, (StatusCode, Json<Value>)> {
+    let requested_model = raw_payload.get("model").and_then(|v| v.as_str()).map(String::from);
+
+    // ── 1. Load catalog entries with embedding capability ──
+    let mut catalog_entries: HashMap<String, (String, i32, Value)> = HashMap::new();
+
+    if let Some(pool) = state.operational_store.as_ref().and_then(|s| s.pg_pool()) {
+        match sqlx::query("SELECT id, name, tier, preferred_workloads FROM fleet_model_catalog")
+            .fetch_all(pool)
+            .await
+        {
+            Ok(rows) => {
+                for r in rows {
+                    let id: String = r.get("id");
+                    let name: String = r.get("name");
+                    let tier: i32 = r.get("tier");
+                    let pw: Value = r.get("preferred_workloads");
+                    catalog_entries.insert(id, (name, tier, pw));
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "proxy_embeddings: fleet_model_catalog query failed"),
+        }
+
+        match sqlx::query(
+            "SELECT id, display_name, COALESCE((metadata->>'tier')::int, 2) as tier, metadata->>'preferred_workloads' as pw FROM model_catalog WHERE metadata->>'preferred_workloads' IS NOT NULL"
+        )
+        .fetch_all(pool)
+        .await
+        {
+            Ok(rows) => {
+                for r in rows {
+                    let id: String = r.get("id");
+                    if catalog_entries.contains_key(&id) {
+                        continue;
+                    }
+                    let name: String = r.get("display_name");
+                    let tier: i32 = r.get("tier");
+                    let pw_raw: Option<String> = r.get("pw");
+                    let pw = pw_raw.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(Value::Array(vec![]));
+                    catalog_entries.insert(id, (name, tier, pw));
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "proxy_embeddings: model_catalog query failed"),
+        }
+    }
+
+    // ── 2. Fetch live Pulse servers ──
+    let live_servers = match state.pulse_router.as_ref() {
+        Some(router) => router.list_servers().await.unwrap_or_default(),
+        None => Vec::new(),
+    };
+
+    // ── 3. Find embedding-capable candidates ──
+    let mut candidates: Vec<(String, String, String, i32, String, Value, &Value)> = Vec::new();
+    for s in &live_servers {
+        let computer = s.get("computer").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let endpoint = s.get("endpoint").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let raw_model_id = s.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let healthy = s.get("healthy").and_then(|v| v.as_bool()).unwrap_or(false);
+        if !healthy {
+            continue;
+        }
+
+        let model_id = std::path::Path::new(&raw_model_id)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(&raw_model_id)
+            .to_string();
+
+        let catalog_match: Option<&(String, i32, Value)> = catalog_entries.get(&model_id)
+            .or_else(|| {
+                let model_lower = model_id.to_lowercase();
+                catalog_entries.iter().find(|(cat_id, _)| {
+                    model_lower.contains(&cat_id.to_lowercase()) || cat_id.to_lowercase().contains(&model_lower)
+                }).map(|(_, v)| v)
+            });
+
+        let (name, tier, pw): (String, i32, Value) = match catalog_match {
+            Some((n, t, p)) => (n.clone(), *t, p.clone()),
+            None => (model_id.clone(), 2, Value::Array(vec![])),
+        };
+
+        // Must have embeddings capability
+        let has_embedding_cap = pw.as_array()
+            .map(|arr: &Vec<Value>| arr.iter().any(|v| v.as_str() == Some("embeddings") || v.as_str() == Some("embedding")))
+            .unwrap_or(false);
+
+        if !has_embedding_cap {
+            continue;
+        }
+
+        // If a specific model was requested, filter by it
+        if let Some(ref req_model) = requested_model {
+            let req_lower = req_model.to_lowercase();
+            let model_lower = model_id.to_lowercase();
+            let name_lower = name.to_lowercase();
+            if !model_lower.contains(&req_lower) && !name_lower.contains(&req_lower) && !req_lower.contains(&model_lower) {
+                continue;
+            }
+        }
+
+        candidates.push((computer, model_id, name, tier, endpoint, pw, s));
+    }
+
+    // ── 4. Score candidates (lower tier > lower queue depth > higher tps) ──
+    let mut scored: Vec<(i32, i32, f64, String, String, String)> = Vec::new();
+    for (_node_name, slug, name, tier, endpoint, _pw, beat) in &candidates {
+        let qd = beat.get("queue_depth").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+        let tps = beat.get("tokens_per_sec_last_min").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        scored.push((*tier, qd, tps, slug.clone(), name.clone(), endpoint.clone()));
+    }
+
+    scored.sort_by(|a, b| {
+        a.0.cmp(&b.0) // tier ascending
+            .then_with(|| a.1.cmp(&b.1)) // queue depth ascending
+            .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal)) // tps descending
+    });
+
+    // ── 5. Proxy to best candidate ──
+    if let Some((_tier, _qd, _tps, slug, _name, endpoint)) = scored.first() {
+        let url = format!("{}/v1/embeddings", endpoint);
+        debug!(model = %slug, %url, "proxying embeddings request");
+
+        match state.http_client.post(&url).json(&raw_payload).send().await {
+            Ok(upstream) => {
+                let status = upstream.status();
+                let bytes = upstream.bytes().await.unwrap_or_default();
+                let mut response = Response::builder().status(status.as_u16());
+                response = response.header(header::CONTENT_TYPE, "application/json");
+                return response.body(Body::from(bytes))
+                    .map_err(|e| (
+                        StatusCode::BAD_GATEWAY,
+                        Json(json!({"error": {"message": e.to_string(), "type": "upstream_error"}})),
+                    ));
+            }
+            Err(err) => {
+                warn!(model = %slug, %err, "embeddings upstream request failed");
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({"error": {"message": format!("embeddings upstream failed: {}", err), "type": "upstream_error"}})),
+                ));
+            }
+        }
+    }
+
+    // ── 6. No match ──
+    Err((
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "error": {
+                "message": "no healthy fleet endpoint with embeddings capability",
+                "type": "backend_unavailable",
+            },
+            "model": requested_model,
         })),
     ))
 }
