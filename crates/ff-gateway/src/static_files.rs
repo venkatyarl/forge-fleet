@@ -30,6 +30,15 @@ struct DashboardAssets;
 pub async fn serve_dashboard(req: Request<Body>) -> impl IntoResponse {
     let path = req.uri().path().trim_start_matches('/');
 
+    // API routes should never fall back to the SPA — return a JSON 404.
+    if path.starts_with("api/") {
+        return Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"error":"not found"}"#))
+            .unwrap_or_else(|_| Response::new(Body::from("not found")));
+    }
+
     // 1. Try the exact path.
     if let Some(resp) = serve_embedded(path) {
         return resp;

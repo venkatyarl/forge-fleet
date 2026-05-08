@@ -13,8 +13,10 @@ pub mod communities;
 pub mod context;
 pub mod embeddings;
 pub mod facts;
+pub mod procedural_memory;
 pub mod stack_backlog;
 pub mod vault;
+pub mod vector_search;
 
 pub use chat::{
     ThreadSummary, attach_thread, create_thread, get_attached_thread, list_threads,
@@ -22,10 +24,12 @@ pub use chat::{
 };
 pub use communities::{CommunitySummary, detect_communities};
 pub use context::{BrainMessage, ContextBundle, ResolvedNode, select_context};
-pub use embeddings::EmbeddingClient;
+pub use embeddings::{EmbeddingClient, generate_embedding};
 pub use facts::{contains_signal_phrases, extract_candidates};
 pub use stack_backlog::{BacklogItem, BrainStateClient, StackItem};
 pub use vault::{
     IndexReport, ParsedNode, VaultChunk, VaultConfig, chunk_markdown, extract_wikilinks,
     index_changed_files, index_vault, parse_frontmatter, parse_vault_file,
 };
+pub use procedural_memory::{consolidate, spawn_consolidation_loop};
+pub use vector_search::{VaultNode, hybrid_search, vector_search};

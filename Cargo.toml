@@ -112,6 +112,7 @@ ff-updater = { path = "crates/ff-updater" }
 ff-mcp = { path = "crates/ff-mcp" }
 ff-mc = { path = "crates/ff-mc" }
 ff-pulse = { path = "crates/ff-pulse" }
+ff-brain = { path = "crates/ff-brain" }
 
 tokio.workspace = true
 clap.workspace = true

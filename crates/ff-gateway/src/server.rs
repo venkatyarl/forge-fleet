@@ -173,7 +173,7 @@ impl GatewayState {
             tier_router: None,
             pulse_router: None,
             pulse_cache: None,
-            http_client: reqwest::Client::new(),
+            http_client: reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build().unwrap_or_else(|_| reqwest::Client::new()),
             discovery_registry: None,
             leader_sync: None,
             operational_store: None,
@@ -332,7 +332,7 @@ impl GatewayServer {
         state.http_client = reqwest::Client::builder()
             .pool_idle_timeout(Duration::from_secs(30))
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .unwrap_or_else(|_| reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build().unwrap_or_else(|_| reqwest::Client::new()));
 
         let state = Arc::new(state);
 
@@ -369,6 +369,12 @@ impl GatewayServer {
             .await
             .with_context(|| format!("failed to bind ff-gateway on {}", self.config.bind_addr))?;
 
+        // Spawn WebSocket heartbeat pruning task (30s interval, 60s timeout).
+        let _heartbeat_handle = self.state.ws_hub.spawn_heartbeat_task(
+            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(60),
+        );
+
         info!(address = %listener.local_addr()?, "ff-gateway listening");
         axum::serve(listener, self.app()).await?;
         Ok(())
@@ -404,6 +410,14 @@ pub fn build_router(state: Arc<GatewayState>, mc_db_path: Option<&str>) -> Route
         .route("/api/fleet/enroll", post(fleet_enroll))
         .route("/api/fleet/heartbeat", post(fleet_heartbeat))
         .route("/api/fleet/llm-usage", get(fleet_llm_usage))
+        // ─── Fleet Tool Registry (Phase 15a) ─────────────────────────
+        .route("/api/tools", get(crate::tool_registry_api::list_tools))
+        .route("/api/tools/health", get(crate::tool_registry_api::tool_health))
+        .route("/api/tools/register", post(crate::tool_registry_api::register_tools))
+        .route("/api/tools/heartbeat", post(crate::tool_registry_api::tool_heartbeat))
+        .route("/api/tools/usage", post(crate::tool_registry_api::record_tool_usage))
+        .route("/api/tools/route", get(crate::tool_registry_api::route_tool))
+        .route("/api/tools/search", get(crate::tool_registry_api::search_tools))
         .route("/api/ledger/summary", get(ledger_summary))
         .route("/api/ledger/models", get(ledger_models))
         .route("/api/ledger/budget", get(ledger_budget).post(ledger_budget_update))
@@ -510,7 +524,7 @@ pub fn build_router(state: Arc<GatewayState>, mc_db_path: Option<&str>) -> Route
         .route("/api/config/reload-status", get(config_reload_status))
         .route("/api/settings/runtime", get(settings_runtime))
         .route("/api/brain/status", get(brain_status))
-        .route("/api/brain/search", get(brain_search))
+        .route("/api/brain/search", get(crate::brain_api::hybrid_search_handler))
         .route("/api/audit/recent", get(audit_recent))
         .route("/api/audit/events", get(audit_recent))
         .route("/api/proxy/stats", get(proxy_stats))
@@ -553,7 +567,10 @@ pub fn build_router(state: Arc<GatewayState>, mc_db_path: Option<&str>) -> Route
             get(crate::pulse_api::list_computers),
         )
         .route("/api/fleet/members", get(crate::pulse_api::list_members))
-        .route("/api/fleet/leader", get(crate::pulse_api::get_leader))
+        .route(
+            "/api/fleet/leader",
+            get(crate::pulse_api::get_leader).post(crate::pulse_api::post_leader),
+        )
         .route("/api/fleet/health", get(crate::pulse_api::fleet_health))
         .route("/api/llm/servers", get(crate::pulse_api::llm_servers))
         .route(
@@ -635,7 +652,7 @@ pub fn build_router(state: Arc<GatewayState>, mc_db_path: Option<&str>) -> Route
         .layer(middleware::from_fn(crate::middleware::trace_id_middleware))
         .layer(middleware::from_fn(prometheus_metrics_middleware))
         .layer(TraceLayer::new_for_http())
-        .layer(CorsLayer::permissive())
+        .layer(CorsLayer::new().allow_origin(tower_http::cors::Any).allow_methods([axum::http::Method::GET, axum::http::Method::POST, axum::http::Method::PUT, axum::http::Method::PATCH, axum::http::Method::DELETE]).allow_headers(tower_http::cors::Any))
         .with_state(state)
 }
 
@@ -766,13 +783,47 @@ async fn well_known_forgefleet(State(state): State<Arc<GatewayState>>) -> Json<V
 async fn github_webhook_handler(
     State(state): State<Arc<GatewayState>>,
     headers: HeaderMap,
-    Json(payload): Json<Value>,
+    body: bytes::Bytes,
 ) -> (StatusCode, Json<Value>) {
     let event = headers
         .get("x-github-event")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
+
+    let _signature = headers
+        .get("x-hub-signature-256")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    // Fetch webhook secret from fleet_secrets.
+    let secret = if let Some(pool) = state.operational_store.as_ref().and_then(|os| os.pg_pool()) {
+        sqlx::query_scalar::<_, String>("SELECT value FROM fleet_secrets WHERE key = 'github_webhook_secret' LIMIT 1")
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+
+    if secret.is_some() {
+        // TODO(P2-security): Wire verify_github_signature() once hmac+subtle deps added.
+        warn!("github webhook signature verification not yet implemented — accepting webhook");
+    } else {
+        warn!("github webhook secret not configured — accepting unsigned webhook (configure fleet_secrets.github_webhook_secret to enable verification)");
+    }
+
+    let payload: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"accepted": false, "reason": format!("invalid json: {}", e)})),
+            );
+        }
+    };
 
     let Some(pool) = state.operational_store.as_ref().and_then(|os| os.pg_pool()) else {
         return (
@@ -5818,7 +5869,7 @@ struct CreateAgentSessionResponse {
 async fn create_agent_session(
     State(state): State<Arc<GatewayState>>,
     Json(req): Json<CreateAgentSessionRequest>,
-) -> impl IntoResponse {
+) -> Result<Json<CreateAgentSessionResponse>, (StatusCode, Json<Value>)> {
     let model = req
         .model
         .unwrap_or_else(|| "Qwen2.5-Coder-32B-Instruct-Q4_K_M.gguf".to_string());
@@ -5832,12 +5883,23 @@ async fn create_agent_session(
             std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"))
         });
 
+    // Security: validate working_dir is not trying to escape to system paths.
+    if let Ok(canonical) = working_dir.canonicalize() {
+        let forbidden = ["/etc", "/usr", "/bin", "/sbin", "/lib", "/sys", "/dev", "/proc", "/var/log"];
+        for prefix in &forbidden {
+            if canonical.starts_with(prefix) {
+                return Err((StatusCode::FORBIDDEN, Json(json!({"error": format!("working_dir cannot be under {}", prefix)}))));
+            }
+        }
+    }
+
     let config = AgentSessionConfig {
         model: model.clone(),
         llm_base_url: llm_base_url.clone(),
         working_dir,
         system_prompt: req.system_prompt,
         max_turns: req.max_turns.unwrap_or(30),
+        pg_pool: state.operational_store.as_ref().and_then(|s| s.pg_pool().cloned()),
         ..Default::default()
     };
 
@@ -5897,12 +5959,12 @@ async fn create_agent_session(
         info!(session = %session_id, "agent session completed");
     });
 
-    Json(CreateAgentSessionResponse {
+    Ok(Json(CreateAgentSessionResponse {
         session_id: session_id.to_string(),
         status: "running",
         model,
         llm_base_url,
-    })
+    }))
 }
 
 async fn agent_session_message(
@@ -6146,19 +6208,6 @@ async fn delete_chat(Path(id): Path<String>) -> impl IntoResponse {
     let mut manager = ff_agent::chat_manager::ChatManager::load().await;
     manager.delete(&id).await;
     Json(json!({ "deleted": true }))
-}
-
-/// GET /api/brain/search?q=query — search across all three brains.
-async fn brain_search(
-    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> impl IntoResponse {
-    let query = params.get("q").cloned().unwrap_or_default();
-    if query.is_empty() {
-        return Json(json!({ "results": [], "error": "missing ?q= parameter" }));
-    }
-    let cwd = std::env::current_dir().unwrap_or_default();
-    let results = ff_agent::brain::search_all(&query, &cwd).await;
-    Json(json!({ "results": results, "query": query }))
 }
 
 /// GET /api/brain/status — three-brain memory status.

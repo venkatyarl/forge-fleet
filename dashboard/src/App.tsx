@@ -29,6 +29,7 @@ import { Brain } from './pages/Brain'
 import { BrainGraph } from './pages/BrainGraph'
 import { CostLedger } from './pages/CostLedger'
 import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts'
+import { NotFound } from './pages/NotFound'
 
 function Shell() {
   useKeyboardShortcuts()
@@ -106,7 +107,7 @@ export default function App() {
         {/* Legacy redirects */}
         <Route path="mission-control" element={<Navigate to="/" replace />} />
         <Route path="nodes/:nodeId" element={<NodeDetail />} />
-        <Route path="*" element={<Navigate to="/" replace />} />
+        <Route path="*" element={<NotFound />} />
       </Route>
     </Routes>
   )

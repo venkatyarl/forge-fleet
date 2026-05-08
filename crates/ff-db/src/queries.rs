@@ -564,7 +564,7 @@ pub fn list_tasks_by_status(conn: &Connection, status: &str) -> Result<Vec<TaskR
     let mut stmt = conn.prepare(
         "SELECT id, kind, payload_json, status, assigned_node, priority,
                 created_at, started_at, completed_at
-         FROM tasks WHERE status = ?1 ORDER BY priority DESC, created_at",
+         FROM tasks WHERE status = ?1 ORDER BY priority DESC, created_at LIMIT 100",
     )?;
 
     let rows = stmt.query_map([status], |row| {
@@ -929,7 +929,8 @@ pub fn ownership_list_stale(conn: &Connection, now_iso: &str) -> Result<Vec<Stri
          FROM task_ownership
          WHERE status IN ('claimed', 'handoff_requested')
            AND lease_expires_at <= ?1
-         ORDER BY task_id",
+         ORDER BY task_id
+         LIMIT 100",
     )?;
 
     let rows = stmt.query_map([now_iso], |row| row.get::<_, String>(0))?;
@@ -1090,7 +1091,8 @@ pub fn find_active_sessions(
                 created_at, last_activity, closed_at
          FROM sessions
          WHERE channel = ?1 AND user_id = ?2 AND status = 'active'
-         ORDER BY last_activity DESC",
+         ORDER BY last_activity DESC
+         LIMIT 100",
     )?;
 
     let rows = stmt.query_map(params![channel, user_id], |row| {
@@ -1326,7 +1328,7 @@ pub fn config_delete(conn: &Connection, key: &str) -> Result<bool> {
 
 /// List all config key-value pairs.
 pub fn config_list(conn: &Connection) -> Result<Vec<(String, String)>> {
-    let mut stmt = conn.prepare("SELECT key, value FROM config_kv ORDER BY key")?;
+    let mut stmt = conn.prepare("SELECT key, value FROM config_kv ORDER BY key LIMIT 100")?;
     let rows = stmt.query_map([], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
     })?;
@@ -1426,7 +1428,8 @@ pub async fn pg_list_nodes(pool: &PgPool) -> Result<Vec<FleetNodeRow>> {
                 COALESCE(sub_agent_count, 1) AS sub_agent_count,
                 gh_account,
                 COALESCE(tooling, '{}'::jsonb) AS tooling
-         FROM fleet_nodes ORDER BY election_priority, name",
+         FROM fleet_nodes ORDER BY election_priority, name
+         LIMIT 100",
     )
     .fetch_all(pool)
     .await?;
@@ -1566,7 +1569,8 @@ pub async fn pg_list_models(pool: &PgPool) -> Result<Vec<FleetModelRow>> {
     let rows = sqlx::query(
         "SELECT id, node_name, slug, name, family, port, tier,
                 local_model, lifecycle, mode, preferred_workloads
-         FROM fleet_models ORDER BY node_name, slug",
+         FROM fleet_models ORDER BY node_name, slug
+         LIMIT 100",
     )
     .fetch_all(pool)
     .await?;
@@ -1928,7 +1932,8 @@ pub async fn pg_list_catalog(pool: &PgPool) -> Result<Vec<ModelCatalogRow>> {
     let rows = sqlx::query(
         "SELECT id, name, family, parameters, tier, description, gated, preferred_workloads, variants
            FROM fleet_model_catalog
-          ORDER BY tier DESC, name ASC",
+          ORDER BY tier DESC, name ASC
+         LIMIT 100",
     )
     .fetch_all(pool)
     .await?;
@@ -3906,7 +3911,8 @@ pub async fn pg_list_brain_threads(
 ) -> Result<Vec<BrainThreadRow>> {
     let rows = sqlx::query(
         "SELECT * FROM brain_threads WHERE user_id = $1 AND status = 'active'
-         ORDER BY last_message_at DESC NULLS LAST, created_at DESC",
+         ORDER BY last_message_at DESC NULLS LAST, created_at DESC
+         LIMIT 100",
     )
     .bind(user_id)
     .fetch_all(pool)
@@ -4151,7 +4157,8 @@ pub async fn pg_list_brain_vault_nodes_current(
     project: Option<&str>,
 ) -> Result<Vec<BrainVaultNodeRow>> {
     let rows = if let Some(p) = project {
-        sqlx::query("SELECT * FROM brain_vault_nodes WHERE valid_until IS NULL AND project = $1 ORDER BY updated_at DESC")
+        sqlx::query("SELECT * FROM brain_vault_nodes WHERE valid_until IS NULL AND project = $1 ORDER BY updated_at DESC
+         LIMIT 100")
             .bind(p)
             .fetch_all(pool)
             .await?
@@ -4495,7 +4502,8 @@ pub struct BrainCommunityRow {
 }
 
 pub async fn pg_list_brain_communities(pool: &PgPool) -> Result<Vec<BrainCommunityRow>> {
-    let rows = sqlx::query("SELECT * FROM brain_communities ORDER BY id")
+    let rows = sqlx::query("SELECT * FROM brain_communities ORDER BY id
+         LIMIT 100")
         .fetch_all(pool)
         .await?;
     Ok(rows

@@ -292,6 +292,49 @@ pub async fn get_leader(
     })))
 }
 
+/// POST /api/fleet/leader — leader heartbeat / announcement.
+///
+/// Accepts a leader announcement from a running daemon and updates the
+/// heartbeat timestamp.  This is the HTTP equivalent of the Postgres
+/// `pg_refresh_leader_heartbeat` call used by the leader-election tick.
+#[derive(Deserialize)]
+pub struct PostLeaderRequest {
+    pub member_name: String,
+}
+
+pub async fn post_leader(
+    State(state): State<Arc<GatewayState>>,
+    Json(req): Json<PostLeaderRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let pool = pool_from_state(&state)?;
+
+    let result = sqlx::query(
+        r#"
+        UPDATE fleet_leader_state
+        SET heartbeat_at = NOW()
+        WHERE singleton_key = 'current'
+          AND member_name = $1
+        "#,
+    )
+    .bind(&req.member_name)
+    .execute(pool)
+    .await
+    .map_err(|e| db_err("post_leader", e))?;
+
+    if result.rows_affected() == 0 {
+        return Ok(Json(json!({
+            "updated": false,
+            "message": "no matching leader row — either not leader or election pending",
+        })));
+    }
+
+    Ok(Json(json!({
+        "updated": true,
+        "member_name": req.member_name,
+        "heartbeat_at": iso(Some(chrono::Utc::now())),
+    })))
+}
+
 // ─── /api/fleet/health ──────────────────────────────────────────────────
 
 pub async fn fleet_health(

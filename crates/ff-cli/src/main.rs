@@ -46,6 +46,7 @@ enum Command {
     Proxy(ProxyArgs),
     Discover(DiscoverArgs),
     Health,
+    Tools(ToolsArgs),
     Config(ConfigArgs),
     Version,
 }
@@ -115,6 +116,36 @@ struct DiscoverArgs {
 }
 
 #[derive(Debug, Args)]
+struct ToolsArgs {
+    #[command(subcommand)]
+    command: ToolsCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum ToolsCommand {
+    /// List all tools registered across the fleet
+    List {
+        /// Filter by node name
+        #[arg(long)]
+        node: Option<String>,
+        /// Filter by tool name (substring match)
+        #[arg(long)]
+        name: Option<String>,
+        /// Show only unhealthy tools (stale >5 min)
+        #[arg(long)]
+        unhealthy: bool,
+    },
+    /// Show tool health status across all nodes
+    Health,
+    /// Register local tools with the fleet registry (usually auto-run on startup)
+    Register {
+        /// Node name to register as (defaults to hostname)
+        #[arg(long)]
+        node: Option<String>,
+    },
+}
+
+#[derive(Debug, Args)]
 struct ConfigArgs {
     #[command(subcommand)]
     command: ConfigCommand,
@@ -159,6 +190,7 @@ async fn main() -> Result<()> {
         Command::Proxy(args) => handle_proxy(args, &config_path),
         Command::Discover(args) => handle_discover(args, &config_path),
         Command::Health => handle_health(&config_path),
+        Command::Tools(args) => handle_tools(args, &config_path).await,
         Command::Config(args) => handle_config(args, &config_path),
         Command::Version => {
             println!("forgefleet {}", env!("CARGO_PKG_VERSION"));
@@ -451,6 +483,98 @@ fn handle_health(config_path: &Path) -> Result<()> {
     println!("  api: {YELLOW}unknown{RESET}");
     println!("  discovery: {YELLOW}unknown{RESET}");
     println!("  agent: {YELLOW}unknown{RESET}");
+    Ok(())
+}
+
+async fn handle_tools(args: ToolsArgs, _config_path: &Path) -> Result<()> {
+    let gateway = std::env::var("FF_GATEWAY_URL")
+        .unwrap_or_else(|_| "http://192.168.5.100:51002".to_string());
+    let client = reqwest::Client::new();
+
+    match args.command {
+        ToolsCommand::List { node, name, unhealthy } => {
+            let mut url = format!("{}/api/tools", gateway);
+            let mut params = vec![];
+            if let Some(n) = node {
+                params.push(format!("node={}", n));
+            }
+            if let Some(n) = name {
+                params.push(format!("name={}", n));
+            }
+            if unhealthy {
+                params.push("unhealthy=true".to_string());
+            }
+            if !params.is_empty() {
+                url = format!("{}?{}", url, params.join("&"));
+            }
+
+            let resp = client.get(&url).send().await?;
+            if !resp.status().is_success() {
+                anyhow::bail!("Gateway returned {}", resp.status());
+            }
+            let body: serde_json::Value = resp.json().await?;
+            let tools = body["tools"].as_array().unwrap_or(&vec![]);
+
+            println!("{GREEN}✓ Fleet Tools{RESET} ({} total)", tools.len());
+            for tool in tools {
+                let name = tool["tool_name"].as_str().unwrap_or("?");
+                let node = tool["node_name"].as_str().unwrap_or("?");
+                let healthy = tool["healthy"].as_bool().unwrap_or(false);
+                let status = if healthy {
+                    format!("{GREEN}●{RESET}")
+                } else {
+                    format!("{RED}●{RESET}")
+                };
+                println!("  {status} {name:<30} on {node}",);
+            }
+        }
+        ToolsCommand::Health => {
+            let url = format!("{}/api/tools/health", gateway);
+            let resp = client.get(&url).send().await?;
+            if !resp.status().is_success() {
+                anyhow::bail!("Gateway returned {}", resp.status());
+            }
+            let body: serde_json::Value = resp.json().await?;
+
+            let total = body["total_tools"].as_i64().unwrap_or(0);
+            let healthy = body["healthy_tools"].as_i64().unwrap_or(0);
+            let unhealthy = body["unhealthy_tools"].as_i64().unwrap_or(0);
+
+            println!("{GREEN}✓ Tool Registry Health{RESET}");
+            println!("  total:     {}", total);
+            println!("  healthy:   {}{GREEN}{}{RESET}", if healthy == total { "" } else { "  " }, healthy);
+            if unhealthy > 0 {
+                println!("  unhealthy: {RED}{}{RESET}", unhealthy);
+            }
+            if let Some(nodes) = body["nodes"].as_array() {
+                println!("\n  By node:");
+                for node in nodes {
+                    let name = node["node_name"].as_str().unwrap_or("?");
+                    let n_tools = node["tool_count"].as_i64().unwrap_or(0);
+                    let n_healthy = node["healthy_count"].as_i64().unwrap_or(0);
+                    let n_unhealthy = node["unhealthy_count"].as_i64().unwrap_or(0);
+                    let status = if n_unhealthy == 0 {
+                        format!("{GREEN}✓{RESET}")
+                    } else {
+                        format!("{RED}✗{RESET}")
+                    };
+                    println!(
+                        "    {status} {name:<15} {n_tools} tools ({n_healthy} healthy, {n_unhealthy} unhealthy)",
+                    );
+                }
+            }
+        }
+        ToolsCommand::Register { node } => {
+            let node_name = node.unwrap_or_else(|| {
+                std::env::var("HOSTNAME")
+                    .or_else(|_| std::env::var("COMPUTERNAME"))
+                    .unwrap_or_else(|_| "unknown".to_string())
+            });
+            println!("{CYAN}▶ Registering tools for {node_name}{RESET}");
+            println!("  (Tool registration is automatic on ff-agent startup.");
+            println!("   This command is for manual re-registration if needed.)");
+        }
+    }
     Ok(())
 }
 

@@ -26,6 +26,7 @@ pub mod static_files;
 pub mod tasks;
 pub mod telegram;
 pub mod telegram_transport;
+pub mod tool_registry_api;
 pub mod voice_api;
 pub mod webhook;
 pub mod websocket;

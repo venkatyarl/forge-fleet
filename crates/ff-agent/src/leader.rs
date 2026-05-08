@@ -13,7 +13,7 @@ pub struct LeaderClient {
 impl LeaderClient {
     pub fn new(leader_url: String, node_id: String) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build().unwrap_or_else(|_| reqwest::Client::new()),
             leader_url,
             node_id,
         }

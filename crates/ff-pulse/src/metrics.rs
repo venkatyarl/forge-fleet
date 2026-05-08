@@ -22,6 +22,7 @@ pub struct NodeMetrics {
     pub tokens_per_sec: f64,
     pub temperature_c: Option<f64>,
     pub uptime_secs: u64,
+    pub gpu_util_percent: Option<f64>,
 }
 
 /// Snapshot of the entire fleet at a point in time.

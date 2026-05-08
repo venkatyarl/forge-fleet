@@ -3,6 +3,28 @@
 //! Posts text to a local embedding endpoint (e.g. mlx_lm.server,
 //! ollama, or llama.cpp) and receives float vectors back.
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+
+/// Generate a deterministic fake embedding for testing / infrastructure.
+/// Produces a 384-dimensional vector derived from the hash of `text`.
+///
+/// TODO: Replace with real embedding model (e.g. all-MiniLM-L6-v2 via ONNX)
+pub fn generate_embedding(text: &str) -> Vec<f32> {
+    let mut hasher = DefaultHasher::new();
+    text.hash(&mut hasher);
+    let seed = hasher.finish();
+
+    let mut vec = Vec::with_capacity(384);
+    for i in 0..384 {
+        let mut h = DefaultHasher::new();
+        (seed, i).hash(&mut h);
+        let val = (h.finish() as f32 / u64::MAX as f32) * 2.0 - 1.0;
+        vec.push(val);
+    }
+    vec
+}
+
 /// Client for a local OpenAI-compatible embedding endpoint.
 pub struct EmbeddingClient {
     pub endpoint: String,
@@ -21,7 +43,7 @@ impl EmbeddingClient {
 
     /// Embed a single text. Returns vector of f32.
     pub async fn embed(&self, text: &str) -> Result<Vec<f32>, String> {
-        let resp = reqwest::Client::new()
+        let resp = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build().unwrap_or_else(|_| reqwest::Client::new())
             .post(format!("{}/v1/embeddings", self.endpoint))
             .json(&serde_json::json!({
                 "model": self.model_id,
@@ -68,7 +90,7 @@ impl EmbeddingClient {
             return Ok(Vec::new());
         }
 
-        let resp = reqwest::Client::new()
+        let resp = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build().unwrap_or_else(|_| reqwest::Client::new())
             .post(format!("{}/v1/embeddings", self.endpoint))
             .json(&serde_json::json!({
                 "model": self.model_id,

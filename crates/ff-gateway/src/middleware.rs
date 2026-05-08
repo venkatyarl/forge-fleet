@@ -132,14 +132,47 @@ pub struct JwtClaims {
     pub iat: Option<usize>,
 }
 
-/// Axum middleware that validates `Authorization: Bearer <token>` when
-/// `FF_JWT_SECRET` is configured.  When absent the middleware is a no-op
-/// so existing deployments stay backward-compatible.
+/// Public routes that do NOT require authentication.
+/// All other routes mandate a valid JWT when FF_JWT_SECRET is set.
+const PUBLIC_ROUTES: &[&str] = &[
+    "/health",
+    "/.well-known/forgefleet.json",
+    "/api/webhook",
+    "/api/github/webhook",
+    "/metrics",
+    "/ws",
+];
+
+fn is_public_route(path: &str) -> bool {
+    PUBLIC_ROUTES.iter().any(|p| path == *p || path.starts_with(&format!("{}/", p)))
+}
+
+/// Axum middleware that validates `Authorization: Bearer <token>`.
+///
+/// - When `FF_JWT_SECRET` is **set**: all routes except `PUBLIC_ROUTES` require
+///   a valid Bearer token with standard claims (exp, iat).
+/// - When `FF_JWT_SECRET` is **unset**: mutating routes (`POST`, `PUT`, `PATCH`,
+///   `DELETE`) still reject with 401. Read-only public routes pass through.
 pub async fn jwt_auth_middleware(request: Request<Body>, next: Next) -> Response<Body> {
+    let path = request.uri().path().to_string();
+    let method = request.method().clone();
+    let is_mutating = matches!(method, axum::http::Method::POST | axum::http::Method::PUT | axum::http::Method::PATCH | axum::http::Method::DELETE);
+
     let secret = match std::env::var("FF_JWT_SECRET") {
         Ok(s) if !s.is_empty() => s,
-        _ => return next.run(request).await,
+        _ => {
+            // No JWT secret configured — still block mutating routes.
+            if is_mutating && !is_public_route(&path) {
+                return json_error(StatusCode::UNAUTHORIZED, "authentication required for mutating requests").into_response();
+            }
+            return next.run(request).await;
+        }
     };
+
+    // Public routes bypass JWT check even when secret is set.
+    if is_public_route(&path) {
+        return next.run(request).await;
+    }
 
     let auth_header = request
         .headers()
@@ -154,8 +187,9 @@ pub async fn jwt_auth_middleware(request: Request<Body>, next: Next) -> Response
     };
 
     let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
-    validation.validate_exp = false; // allow non-expiring service tokens
-    validation.required_spec_claims.clear();
+    // Standard JWT security: tokens MUST have an expiration.
+    validation.validate_exp = true;
+    validation.required_spec_claims = std::collections::HashSet::from(["exp".into(), "iat".into()]);
 
     match jsonwebtoken::decode::<JwtClaims>(
         token,
@@ -163,13 +197,10 @@ pub async fn jwt_auth_middleware(request: Request<Body>, next: Next) -> Response
         &validation,
     ) {
         Ok(_decoded) => next.run(request).await,
-        Err(e) => {
-            warn!(error = %e, "jwt validation failed");
-            json_error(StatusCode::UNAUTHORIZED, &format!(
-                "invalid token: {}",
-                e
-            ))
-            .into_response()
+        Err(_e) => {
+            warn!("jwt validation failed");
+            // Generic error — do not leak internal validation details.
+            json_error(StatusCode::UNAUTHORIZED, "invalid token").into_response()
         }
     }
 }

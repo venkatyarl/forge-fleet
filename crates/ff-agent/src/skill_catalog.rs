@@ -8,18 +8,20 @@
 //!
 //! Skill format (from Claude Code; matched by Open Design):
 //!
-//!     ./<skill_id>/SKILL.md:
-//!     ---
-//!     name: critique
-//!     description: |
-//!       Run a 5-dimension expert design review on any HTML artifact ...
-//!     triggers:
-//!       - "critique"
-//!       - "design review"
-//!       - "audit my design"
-//!     ---
+//! ```text
+//! ./<skill_id>/SKILL.md:
+//! ---
+//! name: critique
+//! description: |
+//!   Run a 5-dimension expert design review on any HTML artifact ...
+//! triggers:
+//!   - "critique"
+//!   - "design review"
+//!   - "audit my design"
+//! ---
 //!
-//!     # body — full instructions for the agent
+//! # body - full instructions for the agent
+//! ```
 //!
 //! The catalog parses just the frontmatter (name, description, triggers,
 //! optional `od` metadata block) and emits a compact summary; the agent

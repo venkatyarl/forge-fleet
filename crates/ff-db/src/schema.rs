@@ -5925,3 +5925,345 @@ CREATE INDEX IF NOT EXISTS idx_fleet_governance_rec_type
 CREATE INDEX IF NOT EXISTS idx_fleet_governance_runs_status
     ON fleet_governance_runs (status, created_at DESC);
 "#;
+
+// ─── V74: Fleet-First Selfish Routing ───────────────────────────────────────
+// Phase 15b — Adds routing_mode to fleet_tasks so the task queue respects
+// fleet-first, local-first, local-only, and balanced routing strategies.
+
+pub const SCHEMA_V74_ROUTING_MODE: &str = r#"
+-- Routing strategy for each task. Affects claim ordering in TaskRunner.
+ALTER TABLE fleet_tasks ADD COLUMN IF NOT EXISTS routing_mode TEXT NOT NULL DEFAULT 'fleet_first'
+    CHECK (routing_mode IN ('local_first', 'fleet_first', 'local_only', 'balanced'));
+
+-- Index to speed up fleet-first claim queries (deprioritize own tasks).
+CREATE INDEX IF NOT EXISTS idx_fleet_tasks_routing ON fleet_tasks(routing_mode, created_by_computer_id, status)
+    WHERE status = 'pending';
+"#;
+
+// ─── V73: Fleet Tool Registry ───────────────────────────────────────────────
+// Phase 15a — Central tool registry where every node registers its tools.
+// Enables fleet-wide tool discovery, health tracking, and usage attribution.
+
+pub const SCHEMA_V73_FLEET_TOOL_REGISTRY: &str = r#"
+-- ─── Fleet Tools ────────────────────────────────────────────────────────────
+-- Every node registers its tools on startup. One row per (tool_name, node_name).
+CREATE TABLE IF NOT EXISTS fleet_tools (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tool_name           TEXT NOT NULL,
+    node_name           TEXT NOT NULL REFERENCES fleet_nodes(name) ON DELETE CASCADE,
+    description         TEXT NOT NULL DEFAULT '',
+    parameters_schema   JSONB NOT NULL DEFAULT '{}',
+    capabilities_required TEXT[] NOT NULL DEFAULT '{}',
+    health_checked_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    call_count          INTEGER NOT NULL DEFAULT 0,
+    avg_latency_ms      REAL,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(tool_name, node_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_fleet_tools_name ON fleet_tools(tool_name);
+CREATE INDEX IF NOT EXISTS idx_fleet_tools_node_health ON fleet_tools(node_name, health_checked_at);
+
+-- ─── Fleet Tool Usage ───────────────────────────────────────────────────────
+-- Every tool invocation across the fleet is logged here for observability.
+CREATE TABLE IF NOT EXISTS fleet_tool_usage (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tool_name       TEXT NOT NULL,
+    node_name       TEXT NOT NULL REFERENCES fleet_nodes(name),
+    session_id      UUID REFERENCES agent_sessions(id),
+    task_id         UUID,
+    work_item_id    UUID,
+    subagent_id     TEXT NOT NULL DEFAULT '',
+    input_summary   TEXT NOT NULL DEFAULT '',
+    started_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at    TIMESTAMPTZ,
+    latency_ms      INTEGER,
+    success         BOOLEAN,
+    tokens_in       INTEGER NOT NULL DEFAULT 0,
+    tokens_out      INTEGER NOT NULL DEFAULT 0,
+    cost_usd        REAL NOT NULL DEFAULT 0.0,
+    workspace_path  TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_tool_usage_tool ON fleet_tool_usage(tool_name, started_at);
+CREATE INDEX IF NOT EXISTS idx_tool_usage_node ON fleet_tool_usage(node_name, started_at);
+CREATE INDEX IF NOT EXISTS idx_tool_usage_session ON fleet_tool_usage(session_id);
+"#;
+
+// ─── V75: Work Items + Work Batches ─────────────────────────────────────────
+// Phase 15c — Fine-grained task decomposition with weighted partitioning.
+// Enables map-reduce style execution across the fleet.
+
+pub const SCHEMA_V75_WORK_ITEMS: &str = r#"
+-- ─── Work Items ─────────────────────────────────────────────────────────────
+-- Individual units of work within a decomposed task.
+CREATE TABLE IF NOT EXISTS work_items (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    parent_task_id      UUID NOT NULL REFERENCES fleet_tasks(id) ON DELETE CASCADE,
+    batch_id            INT NOT NULL DEFAULT 0,
+    item_index          INT NOT NULL,
+    item_key            TEXT NOT NULL DEFAULT '',
+    item_type           TEXT NOT NULL DEFAULT 'document',
+    item_metadata       JSONB NOT NULL DEFAULT '{}',
+
+    -- Weighted estimation
+    estimated_weight    REAL NOT NULL DEFAULT 1.0,
+    actual_weight       REAL,
+    complexity_factors  JSONB NOT NULL DEFAULT '{}',
+
+    -- Assignment
+    assigned_node_id    UUID REFERENCES computers(id),
+    assigned_agent_id   TEXT,
+    assigned_session_id UUID REFERENCES agent_sessions(id),
+    claimed_at          TIMESTAMPTZ,
+
+    -- Progress
+    status              TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'claimed', 'in_progress', 'completed', 'failed', 'yielded', 'stolen')),
+    progress_percent    INT DEFAULT 0,
+    checkpoint_data     JSONB NOT NULL DEFAULT '{}',
+    yielded_at          TIMESTAMPTZ,
+    stolen_from         UUID REFERENCES computers(id),
+
+    -- Result
+    result_summary      TEXT,
+    result_artifact_id  UUID,
+    result_tokens_in    INT DEFAULT 0,
+    result_tokens_out   INT DEFAULT 0,
+    completed_at        TIMESTAMPTZ,
+    error_message       TEXT,
+
+    -- Retry
+    retry_count         INT DEFAULT 0,
+    max_retries         INT DEFAULT 2,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    UNIQUE(parent_task_id, item_index)
+);
+
+CREATE INDEX IF NOT EXISTS idx_work_items_parent ON work_items(parent_task_id, status);
+CREATE INDEX IF NOT EXISTS idx_work_items_batch ON work_items(parent_task_id, batch_id, status);
+CREATE INDEX IF NOT EXISTS idx_work_items_claimed ON work_items(assigned_node_id, status)
+    WHERE status IN ('claimed', 'in_progress');
+CREATE INDEX IF NOT EXISTS idx_work_items_yielded ON work_items(parent_task_id, status)
+    WHERE status = 'yielded';
+
+-- ─── Work Batches ───────────────────────────────────────────────────────────
+-- A batch is a group of work_items assigned to one node.
+CREATE TABLE IF NOT EXISTS work_batches (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    parent_task_id      UUID NOT NULL REFERENCES fleet_tasks(id) ON DELETE CASCADE,
+    batch_index         INT NOT NULL,
+    total_estimated_weight REAL NOT NULL DEFAULT 0,
+    total_actual_weight REAL,
+    items_count         INT NOT NULL DEFAULT 0,
+    assigned_node_id    UUID REFERENCES computers(id),
+    assigned_agent_id   TEXT,
+    assigned_session_id UUID REFERENCES agent_sessions(id),
+    status              TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'claimed', 'in_progress', 'completed', 'rebalancing')),
+    progress_percent    INT DEFAULT 0,
+    rebalanced_at       TIMESTAMPTZ,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(parent_task_id, batch_index)
+);
+
+-- ─── Fleet Workspaces ───────────────────────────────────────────────────────
+-- Shared workspace state for sub-agent execution.
+CREATE TABLE IF NOT EXISTS fleet_workspaces (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    owner_node_id       UUID REFERENCES computers(id),
+    workspace_path      TEXT NOT NULL,
+    sync_method         TEXT NOT NULL CHECK (sync_method IN ('git', 'nfs', 's3')),
+    sync_config         JSONB NOT NULL DEFAULT '{}',
+    shell_state         JSONB NOT NULL DEFAULT '{}',
+    last_synced_at      TIMESTAMPTZ,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- ─── Sub-Agent Cleanup Log ──────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS subagent_cleanup_log (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    node_id             UUID REFERENCES computers(id),
+    subagent_id         TEXT NOT NULL,
+    item_type           TEXT NOT NULL CHECK (item_type IN ('git_folder','artifact','temp','empty_dir')),
+    item_path           TEXT NOT NULL,
+    bytes_freed         BIGINT,
+    reason              TEXT NOT NULL,
+    deleted_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+"#;
+
+// ─── V76: Vault Sync Tables ─────────────────────────────────────────────────
+// Phase 16 — Fleet Memory Architecture: vault file indexing, link graph,
+// and TODO extraction for Obsidian vault integration.
+
+pub const SCHEMA_V77_FLEET_TASK_NOTIFY: &str = r#"
+-- ─── V77: Real-Time Task Queue ────────────────────────────────────────────
+-- NOTIFY trigger so TaskRunner workers wake immediately when new tasks
+-- are inserted, instead of polling every 10s.  The trigger fires AFTER
+-- INSERT so the row is visible to the worker before any listener wakes.
+
+CREATE OR REPLACE FUNCTION notify_new_fleet_task()
+RETURNS TRIGGER AS $$
+BEGIN
+    PERFORM pg_notify('fleet_task_inserted', NEW.id::text);
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_fleet_tasks_notify ON fleet_tasks;
+CREATE TRIGGER trg_fleet_tasks_notify
+    AFTER INSERT ON fleet_tasks
+    FOR EACH ROW
+    EXECUTE FUNCTION notify_new_fleet_task();
+"#;
+
+pub const SCHEMA_V76_VAULT_SYNC: &str = r#"
+-- ─── Vault Files ────────────────────────────────────────────────────────────
+-- Every markdown file in the vault, indexed for fast lookup.
+CREATE TABLE IF NOT EXISTS vault_files (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    file_path       TEXT NOT NULL UNIQUE,
+    file_name       TEXT NOT NULL,
+    parent_dir      TEXT NOT NULL,
+    size_bytes      BIGINT,
+    modified_at     TIMESTAMPTZ,
+    frontmatter     JSONB NOT NULL DEFAULT '{}',
+    tags            TEXT[] NOT NULL DEFAULT '{}',
+    indexed_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_vault_files_dir ON vault_files(parent_dir);
+CREATE INDEX IF NOT EXISTS idx_vault_files_name ON vault_files(file_name);
+
+-- ─── Vault Links ────────────────────────────────────────────────────────────
+-- Bidirectional link graph between vault files (Obsidian [[links]]).
+CREATE TABLE IF NOT EXISTS vault_links (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    source_path     TEXT NOT NULL REFERENCES vault_files(file_path) ON DELETE CASCADE,
+    target_path     TEXT NOT NULL REFERENCES vault_files(file_path) ON DELETE CASCADE,
+    link_text       TEXT,
+    link_type       TEXT NOT NULL DEFAULT 'wiki' CHECK (link_type IN ('wiki', 'markdown', 'embed')),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(source_path, target_path, link_text)
+);
+
+CREATE INDEX IF NOT EXISTS idx_vault_links_source ON vault_links(source_path);
+CREATE INDEX IF NOT EXISTS idx_vault_links_target ON vault_links(target_path);
+
+-- ─── Vault Todos ────────────────────────────────────────────────────────────
+-- TODO items extracted from vault markdown files (- [ ] / - [x]).
+CREATE TABLE IF NOT EXISTS vault_todos (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    file_path       TEXT NOT NULL REFERENCES vault_files(file_path) ON DELETE CASCADE,
+    todo_text       TEXT NOT NULL,
+    done            BOOLEAN NOT NULL DEFAULT false,
+    line_number     INT,
+    extracted_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(file_path, todo_text)
+);
+
+CREATE INDEX IF NOT EXISTS idx_vault_todos_file ON vault_todos(file_path);
+CREATE INDEX IF NOT EXISTS idx_vault_todos_done ON vault_todos(done)
+    WHERE done = false;
+"#;
+
+// ─── V78: pgvector embeddings for vault nodes ─────────────────────────────
+// Phase 7 — Context Engine. Enables vector similarity search on the vault.
+
+pub const SCHEMA_V78_PGVECTOR_EMBEDDINGS: &str = r#"
+-- Phase 7: pgvector embeddings for semantic search.
+-- NOTE: The pgvector extension must be installed by a superuser first:
+--   CREATE EXTENSION IF NOT EXISTS vector;
+-- If the extension is not available, this migration is a no-op.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'vector') THEN
+        ALTER TABLE brain_vault_nodes ADD COLUMN IF NOT EXISTS embedding vector(384);
+        CREATE INDEX IF NOT EXISTS idx_vault_nodes_embedding
+            ON brain_vault_nodes USING hnsw (embedding vector_cosine_ops)
+            WHERE embedding IS NOT NULL;
+    END IF;
+END $$;
+"#;
+
+// ─── V79: Project Schedules ───────────────────────────────────────────────
+// Phase 10 — FinOps + Project Scheduling. Cron-driven recurring tasks per project.
+
+pub const SCHEMA_V79_PROJECT_SCHEDULES: &str = r#"
+CREATE TABLE IF NOT EXISTS project_schedules (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id      TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    name            TEXT NOT NULL,
+    cron_expression TEXT NOT NULL,
+    next_run_at     TIMESTAMPTZ NOT NULL,
+    task_template   JSONB NOT NULL DEFAULT '{}',
+    enabled         BOOLEAN DEFAULT true,
+    last_run_at     TIMESTAMPTZ,
+    run_count       INT DEFAULT 0,
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_project_schedules_next_run
+    ON project_schedules(next_run_at)
+    WHERE enabled = true;
+
+CREATE INDEX IF NOT EXISTS idx_project_schedules_project
+    ON project_schedules(project_id);
+"#;
+
+// ─── V80: Agent Procedures (Procedural Memory) ────────────────────────────
+// Phase 14 — Memory Consolidation. Learned skills from successful sessions.
+
+pub const SCHEMA_V80_AGENT_PROCEDURES: &str = r#"
+CREATE TABLE IF NOT EXISTS agent_procedures (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name                TEXT NOT NULL UNIQUE,
+    trigger_pattern     TEXT NOT NULL,
+    steps               JSONB NOT NULL DEFAULT '[]',
+    success_rate        FLOAT CHECK (success_rate BETWEEN 0 AND 1),
+    usage_count         INT DEFAULT 0,
+    last_used           TIMESTAMPTZ,
+    created_from_session UUID REFERENCES agent_sessions(id),
+    created_at          TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_procedures_name
+    ON agent_procedures(name);
+
+CREATE INDEX IF NOT EXISTS idx_agent_procedures_trigger
+    ON agent_procedures(trigger_pattern);
+"#;
+
+// ─── V81: Security Hardening ──────────────────────────────────────────────
+// Phase 5 — Tool allow-lists, timeout enforcement, structured tool audit.
+
+pub const SCHEMA_V81_SECURITY_HARDENING: &str = r#"
+-- Per-step tool allow-list: empty array = all tools allowed.
+ALTER TABLE agent_steps ADD COLUMN IF NOT EXISTS allowed_tools JSONB NOT NULL DEFAULT '[]';
+
+-- Task timeout: NULL = default (300s), explicit override in payload.
+ALTER TABLE fleet_tasks ADD COLUMN IF NOT EXISTS timeout_secs INT;
+
+-- Enhanced tool audit log for Postgres (separate from legacy SQLite audit_log).
+CREATE TABLE IF NOT EXISTS tool_audit_log (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id      UUID REFERENCES agent_sessions(id) ON DELETE SET NULL,
+    step_id         UUID REFERENCES agent_steps(id) ON DELETE SET NULL,
+    agent_id        TEXT NOT NULL DEFAULT 'unknown',
+    tool_name       TEXT NOT NULL,
+    params_json     JSONB NOT NULL DEFAULT '{}',
+    prompt_hash     TEXT,
+    outcome         TEXT NOT NULL CHECK (outcome IN ('success', 'failure', 'denied', 'timeout')),
+    error           TEXT,
+    duration_ms     INT,
+    node_name       TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_tool_audit_session ON tool_audit_log(session_id);
+CREATE INDEX IF NOT EXISTS idx_tool_audit_tool ON tool_audit_log(tool_name);
+CREATE INDEX IF NOT EXISTS idx_tool_audit_outcome ON tool_audit_log(outcome);
+CREATE INDEX IF NOT EXISTS idx_tool_audit_created ON tool_audit_log(created_at);
+"#;

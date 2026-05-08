@@ -888,7 +888,7 @@ async fn openai_single_completion(
         "max_tokens": max_tokens,
         "temperature": 0.2,
     });
-    let resp = reqwest::Client::new()
+    let resp = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build().unwrap_or_else(|_| reqwest::Client::new())
         .post(&url)
         .json(&body)
         .timeout(std::time::Duration::from_secs(600))

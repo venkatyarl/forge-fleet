@@ -8,9 +8,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use dashmap::DashMap;
 use serde::Serialize;
 use tracing::{debug, info};
 
+use crate::circuit_breaker::CircuitBreaker;
 use crate::classifier::{self, TaskProfile};
 use crate::quality_tracker::QualityTracker;
 use crate::registry::{BackendEndpoint, BackendRegistry};
@@ -116,6 +118,19 @@ pub enum RoutingStrategy {
 
 // ─── Adaptive Router ─────────────────────────────────────────────────────────
 
+/// Snapshot of node load metrics used for GPU-aware scoring.
+#[derive(Debug, Clone, Default)]
+pub struct NodeSnapshot {
+    /// CPU utilisation percent (0–100).
+    pub cpu_percent: f64,
+    /// Current request queue depth.
+    pub queue_depth: u32,
+    /// Average latency in milliseconds.
+    pub avg_latency_ms: f64,
+    /// GPU utilisation percent (0–100).
+    pub gpu_util_percent: f64,
+}
+
 /// Smart router that combines prompt classification, quality tracking, and
 /// tier-based fallback.
 pub struct AdaptiveRouter {
@@ -123,6 +138,8 @@ pub struct AdaptiveRouter {
     registry: Arc<BackendRegistry>,
     tier_router: Arc<TierRouter>,
     quality_tracker: Arc<QualityTracker>,
+    circuit_breakers: Arc<DashMap<String, CircuitBreaker>>,
+    node_metrics: Arc<DashMap<String, NodeSnapshot>>,
 }
 
 impl AdaptiveRouter {
@@ -138,6 +155,8 @@ impl AdaptiveRouter {
             registry,
             tier_router,
             quality_tracker,
+            circuit_breakers: Arc::new(DashMap::new()),
+            node_metrics: Arc::new(DashMap::new()),
         }
     }
 
@@ -163,6 +182,151 @@ impl AdaptiveRouter {
     /// Get a reference to the tier router.
     pub fn tier_router(&self) -> &Arc<TierRouter> {
         &self.tier_router
+    }
+
+    /// Get a reference to the circuit breakers map.
+    pub fn circuit_breakers(&self) -> &Arc<DashMap<String, CircuitBreaker>> {
+        &self.circuit_breakers
+    }
+
+    /// Get a reference to the node metrics map.
+    pub fn node_metrics(&self) -> &Arc<DashMap<String, NodeSnapshot>> {
+        &self.node_metrics
+    }
+
+    /// Update metrics for a given node.
+    pub fn update_node_metrics(&self, node: &str, metrics: NodeSnapshot) {
+        self.node_metrics.insert(node.to_string(), metrics);
+    }
+
+    /// Compute a GPU-aware load score for a node.
+    ///
+    /// Formula: `score = 0.3 * load + 0.3 * queue + 0.2 * latency + 0.2 * gpu_util`
+    ///
+    /// Inputs are normalised to the 0–1 range:
+    /// - load   = cpu_percent / 100
+    /// - queue  = queue_depth / 50
+    /// - latency = avg_latency_ms / 3000
+    /// - gpu_util = gpu_util_percent / 100
+    pub fn score_node(&self, node: &str) -> f64 {
+        let m = self
+            .node_metrics
+            .get(node)
+            .map(|e| e.clone())
+            .unwrap_or_default();
+        let load = (m.cpu_percent / 100.0).clamp(0.0, 1.0);
+        let queue = (m.queue_depth as f64 / 50.0).clamp(0.0, 1.0);
+        let latency = (m.avg_latency_ms / 3000.0).clamp(0.0, 1.0);
+        let gpu_util = (m.gpu_util_percent / 100.0).clamp(0.0, 1.0);
+        0.3 * load + 0.3 * queue + 0.2 * latency + 0.2 * gpu_util
+    }
+
+    /// Returns `true` when the node's circuit breaker allows traffic.
+    fn is_node_allowed(&self, node: &str) -> bool {
+        self.circuit_breakers
+            .get(node)
+            .map(|cb| cb.allow_request())
+            .unwrap_or(true)
+    }
+
+    /// Filter and sort a tier escalation chain by circuit breaker state and
+    /// GPU-aware node score (lower score = preferred).
+    fn filter_and_score_chain(
+        &self,
+        chain: Vec<(u8, Vec<BackendEndpoint>)>,
+    ) -> Vec<BackendEndpoint> {
+        let mut result = Vec::new();
+        for (_tier, backends) in chain {
+            let mut scored: Vec<_> = backends
+                .into_iter()
+                .filter(|b| self.is_node_allowed(&b.node))
+                .map(|b| {
+                    let score = self.score_node(&b.node);
+                    (b, score)
+                })
+                .collect();
+            scored.sort_by(|a, b| {
+                a.1.partial_cmp(&b.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            result.extend(scored.into_iter().map(|(b, _)| b));
+        }
+        result
+    }
+
+    /// Build a flat, ordered backend chain for a request.
+    ///
+    /// Applies circuit-breaker filtering and GPU-aware scoring.
+    pub async fn route_chain(
+        &self,
+        model: &str,
+        messages: &[ChatMessage],
+    ) -> Vec<BackendEndpoint> {
+        let (_decision, chain) = self.route(model, messages, None, None).await;
+        self.filter_and_score_chain(chain)
+    }
+
+    /// Build a backend chain with model-family fallback.
+    ///
+    /// Fallback order: Claude → GPT → Gemini → local.
+    pub async fn route_chain_with_fallback(
+        &self,
+        model: &str,
+        messages: &[ChatMessage],
+    ) -> Vec<BackendEndpoint> {
+        let model_chain = build_model_chain(model);
+
+        // Try each model in the fallback chain
+        for try_model in &model_chain {
+            let exact = self.registry.healthy_by_model(try_model).await;
+            let healthy: Vec<_> = exact
+                .into_iter()
+                .filter(|b| self.is_node_allowed(&b.node))
+                .collect();
+            if !healthy.is_empty() {
+                let mut scored: Vec<_> = healthy
+                    .into_iter()
+                    .map(|b| {
+                        let node = b.node.clone();
+                        let score = self.score_node(&node);
+                        (b, score)
+                    })
+                    .collect();
+                scored.sort_by(|a, b| {
+                    a.1.partial_cmp(&b.1)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                return scored.into_iter().map(|(b, _)| b).collect();
+            }
+        }
+
+        // Final fallback: any healthy local endpoint
+        let local = self
+            .registry
+            .healthy_endpoints()
+            .await
+            .into_iter()
+            .filter(|b| b.is_local && self.is_node_allowed(&b.node))
+            .collect::<Vec<_>>();
+        if !local.is_empty() {
+            let mut scored: Vec<_> = local
+                .into_iter()
+                .map(|b| {
+                    let node = b.node.clone();
+                    let score = self.score_node(&node);
+                    (b, score)
+                })
+                .collect();
+            scored.sort_by(|a, b| {
+                a.1.partial_cmp(&b.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            return scored.into_iter().map(|(b, _)| b).collect();
+        }
+
+        // Ultimate fallback to normal adaptive / tier routing
+        let (_decision, chain) = self.route(model, messages, None, None).await;
+        self.filter_and_score_chain(chain)
     }
 
     /// If no healthy backend exists for `catalog_id`, attempt to auto-load it
@@ -534,6 +698,26 @@ fn is_explicit_request(model: &str) -> bool {
     }
     // Anything else is an explicit request
     true
+}
+
+/// Build a model-family fallback chain.
+///
+/// Order: Claude → GPT → Gemini → local.
+fn build_model_chain(requested: &str) -> Vec<String> {
+    let lower = requested.trim().to_lowercase();
+    let mut chain = vec![requested.to_string()];
+
+    if lower.starts_with("claude") {
+        chain.extend([
+            "gpt-4o".to_string(),
+            "gpt-4".to_string(),
+            "gemini-pro".to_string(),
+        ]);
+    } else if lower.starts_with("gpt") {
+        chain.push("gemini-pro".to_string());
+    }
+
+    chain
 }
 
 // ═════════════════════════════════════════════════════════════════════════════

@@ -110,7 +110,7 @@ impl OllamaEngine {
     /// Wait for the health endpoint.
     async fn wait_for_health(&self, host: &str, port: u16, timeout: Duration) -> Result<()> {
         let url = format!("http://{}:{}/api/tags", host, port);
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build().unwrap_or_else(|_| reqwest::Client::new());
         let start = Instant::now();
 
         loop {

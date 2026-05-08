@@ -91,7 +91,13 @@ pub mod sub_agents;
 pub mod supervisor;
 pub mod system_prompt;
 pub mod task_coverage_seed;
+pub mod audit_logger;
+pub mod batch_manager;
+pub mod scheduler_tick;
+pub mod shared_workspace;
 pub mod task_runner;
+pub mod vault_sync;
+pub mod work_stealer;
 pub mod telegram;
 pub mod template_registry;
 pub mod thinking;
@@ -191,7 +197,7 @@ impl LeaseClient {
         Self {
             base_url,
             node_name,
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build().unwrap_or_else(|_| reqwest::Client::new()),
         }
     }
 

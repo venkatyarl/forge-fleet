@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::Context;
 use axum::{
@@ -9,16 +10,21 @@ use axum::{
     routing::{get, post},
 };
 use chrono::Utc;
+use dashmap::DashMap;
 use serde::Serialize;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::warn;
 
 use crate::{
+    adaptive_router::AdaptiveRouter,
+    circuit_breaker::{CircuitBreaker, CircuitState},
     error::ApiError,
+    quality_tracker::QualityTracker,
     registry::BackendRegistry,
-    router::ModelRouter,
+    router::{ModelRouter, TierRouter},
     types::{
-        ChatCompletionRequest, CompletionRequest, HealthResponse, ModelInfo, ModelListResponse,
+        ChatCompletionRequest, ChatMessage, CompletionRequest, HealthResponse, ModelInfo,
+        ModelListResponse,
     },
 };
 
@@ -26,7 +32,9 @@ use crate::{
 pub struct AppState {
     pub registry: Arc<BackendRegistry>,
     pub model_router: Arc<ModelRouter>,
+    pub adaptive_router: Arc<AdaptiveRouter>,
     pub http_client: reqwest::Client,
+    pub request_metrics: Arc<RequestMetrics>,
 }
 
 impl AppState {
@@ -37,18 +45,48 @@ impl AppState {
             .context("failed to create reqwest client")?;
 
         let model_router = Arc::new(ModelRouter::new(registry.clone()));
+        let tier_router = Arc::new(TierRouter::with_defaults(registry.clone()));
+        let quality_tracker = Arc::new(QualityTracker::with_defaults());
+        let adaptive_router = Arc::new(AdaptiveRouter::with_defaults(
+            registry.clone(),
+            tier_router,
+            quality_tracker,
+        ));
 
         Ok(Self {
             registry,
             model_router,
+            adaptive_router,
             http_client,
+            request_metrics: Arc::new(RequestMetrics::default()),
         })
+    }
+}
+
+/// Simple Prometheus-style metrics collector.
+#[derive(Default)]
+pub struct RequestMetrics {
+    requests_total: DashMap<(String, String), u64>,
+    duration_ms_total: DashMap<(String, String), u64>,
+}
+
+impl RequestMetrics {
+    pub fn record(&self, node: &str, model: &str, duration_ms: u64) {
+        *self
+            .requests_total
+            .entry((node.to_string(), model.to_string()))
+            .or_insert(0) += 1;
+        *self
+            .duration_ms_total
+            .entry((node.to_string(), model.to_string()))
+            .or_insert(0) += duration_ms;
     }
 }
 
 pub fn build_http_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/metrics", get(metrics))
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
@@ -67,6 +105,49 @@ pub async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> 
         healthy_backends: stats.healthy,
         busy_backends: stats.busy,
     })
+}
+
+pub async fn metrics(State(state): State<Arc<AppState>>) -> Response<Body> {
+    let mut lines = Vec::new();
+
+    // forgefleet_requests_total{node, model}
+    for entry in state.request_metrics.requests_total.iter() {
+        let (node, model) = entry.key();
+        lines.push(format!(
+            "forgefleet_requests_total{{node=\"{}\",model=\"{}\"}} {}",
+            node, model, entry.value()
+        ));
+    }
+
+    // forgefleet_request_duration_ms{node, model}
+    for entry in state.request_metrics.duration_ms_total.iter() {
+        let (node, model) = entry.key();
+        lines.push(format!(
+            "forgefleet_request_duration_ms{{node=\"{}\",model=\"{}\"}} {}",
+            node, model, entry.value()
+        ));
+    }
+
+    // forgefleet_circuit_breaker_state{node} (0=closed, 1=open, 2=halfopen)
+    for entry in state.adaptive_router.circuit_breakers().iter() {
+        let node = entry.key();
+        let state_num = match entry.value().state() {
+            CircuitState::Closed => 0,
+            CircuitState::Open => 1,
+            CircuitState::HalfOpen => 2,
+        };
+        lines.push(format!(
+            "forgefleet_circuit_breaker_state{{node=\"{}\"}} {}",
+            node, state_num
+        ));
+    }
+
+    let body = lines.join("\n");
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(Body::from(body))
+        .unwrap_or_else(|_| Response::new(Body::empty()))
 }
 
 pub async fn list_models(
@@ -98,10 +179,11 @@ pub async fn chat_completions(
     Json(payload): Json<ChatCompletionRequest>,
 ) -> Result<Response<Body>, ApiError> {
     let streaming = payload.stream.unwrap_or(false);
-    forward_with_fallback(
+    forward_chat_adaptive(
         state,
         "/v1/chat/completions",
         &payload.model,
+        &payload.messages,
         streaming,
         &payload,
     )
@@ -123,14 +205,19 @@ pub async fn completions(
     .await
 }
 
-async fn forward_with_fallback<T: Serialize>(
+async fn forward_chat_adaptive<T: Serialize>(
     state: Arc<AppState>,
     path: &str,
     model: &str,
+    messages: &[ChatMessage],
     stream: bool,
     payload: &T,
 ) -> Result<Response<Body>, ApiError> {
-    let route_chain = state.model_router.route_chain(model).await;
+    let start = Instant::now();
+    let route_chain = state
+        .adaptive_router
+        .route_chain_with_fallback(model, messages)
+        .await;
 
     if route_chain.is_empty() {
         return Err(ApiError::BackendUnavailable(format!(
@@ -145,7 +232,14 @@ async fn forward_with_fallback<T: Serialize>(
 
         match state.http_client.post(&url).json(payload).send().await {
             Ok(upstream) => {
+                let latency = start.elapsed().as_millis() as u64;
                 if is_busy_status(upstream.status()) {
+                    state
+                        .adaptive_router
+                        .circuit_breakers()
+                        .entry(backend.node.clone())
+                        .or_insert_with(CircuitBreaker::default)
+                        .record_failure();
                     last_error = Some(format!(
                         "{} responded {} (busy)",
                         backend.id,
@@ -153,6 +247,100 @@ async fn forward_with_fallback<T: Serialize>(
                     ));
                     continue;
                 }
+
+                state
+                    .request_metrics
+                    .record(&backend.node, &backend.model, latency);
+                state
+                    .adaptive_router
+                    .circuit_breakers()
+                    .entry(backend.node.clone())
+                    .or_insert_with(CircuitBreaker::default)
+                    .record_success();
+
+                if stream {
+                    return passthrough_streaming_response(upstream).await;
+                }
+                return passthrough_response(upstream).await;
+            }
+            Err(error) => {
+                warn!(backend = %backend.id, %error, "upstream request failed; trying fallback");
+                state
+                    .adaptive_router
+                    .circuit_breakers()
+                    .entry(backend.node.clone())
+                    .or_insert_with(CircuitBreaker::default)
+                    .record_failure();
+                last_error = Some(format!("{} request failed: {}", backend.id, error));
+            }
+        }
+    }
+
+    Err(ApiError::BackendUnavailable(last_error.unwrap_or_else(
+        || "all fallback backends failed".to_string(),
+    )))
+}
+
+async fn forward_with_fallback<T: Serialize>(
+    state: Arc<AppState>,
+    path: &str,
+    model: &str,
+    stream: bool,
+    payload: &T,
+) -> Result<Response<Body>, ApiError> {
+    let start = Instant::now();
+    let route_chain = state.model_router.route_chain(model).await;
+
+    if route_chain.is_empty() {
+        return Err(ApiError::BackendUnavailable(format!(
+            "no healthy backend for model selector '{model}'"
+        )));
+    }
+
+    let mut last_error = None::<String>;
+
+    for backend in route_chain {
+        // Check circuit breaker
+        let allowed = state
+            .adaptive_router
+            .circuit_breakers()
+            .get(&backend.node)
+            .map(|cb| cb.allow_request())
+            .unwrap_or(true);
+        if !allowed {
+            last_error = Some(format!("{} circuit breaker open", backend.id));
+            continue;
+        }
+
+        let url = format!("{}{}", backend.base_url(), path);
+
+        match state.http_client.post(&url).json(payload).send().await {
+            Ok(upstream) => {
+                let latency = start.elapsed().as_millis() as u64;
+                if is_busy_status(upstream.status()) {
+                    state
+                        .adaptive_router
+                        .circuit_breakers()
+                        .entry(backend.node.clone())
+                        .or_insert_with(CircuitBreaker::default)
+                        .record_failure();
+                    last_error = Some(format!(
+                        "{} responded {} (busy)",
+                        backend.id,
+                        upstream.status()
+                    ));
+                    continue;
+                }
+
+                state
+                    .request_metrics
+                    .record(&backend.node, &backend.model, latency);
+                state
+                    .adaptive_router
+                    .circuit_breakers()
+                    .entry(backend.node.clone())
+                    .or_insert_with(CircuitBreaker::default)
+                    .record_success();
 
                 if stream {
                     return passthrough_streaming_response(upstream).await;
@@ -162,6 +350,12 @@ async fn forward_with_fallback<T: Serialize>(
             }
             Err(error) => {
                 warn!(backend = %backend.id, %error, "upstream request failed; trying fallback");
+                state
+                    .adaptive_router
+                    .circuit_breakers()
+                    .entry(backend.node.clone())
+                    .or_insert_with(CircuitBreaker::default)
+                    .record_failure();
                 last_error = Some(format!("{} request failed: {}", backend.id, error));
             }
         }

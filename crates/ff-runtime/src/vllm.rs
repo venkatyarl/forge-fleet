@@ -153,7 +153,7 @@ impl VllmEngine {
     /// Wait for vLLM health endpoint.
     async fn wait_for_health(&self, config: &EngineConfig, timeout: Duration) -> Result<()> {
         let url = format!("http://{}:{}/health", config.host, config.port);
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build().unwrap_or_else(|_| reqwest::Client::new());
         let start = Instant::now();
 
         loop {

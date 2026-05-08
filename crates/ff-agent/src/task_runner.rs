@@ -29,6 +29,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use sqlx::{PgPool, Row};
+use sqlx::postgres::PgListener;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
@@ -222,11 +223,14 @@ impl TaskRunner {
              WHERE id = (
                SELECT id FROM fleet_tasks t
                 WHERE t.status = 'pending'
-                  AND t.task_type = 'shell'
+                  AND t.task_type IN ('shell', 'decomposed')
                   AND (t.preferred_computer_id IS NULL
                        OR t.preferred_computer_id = $1)
                   AND t.requires_capability <@ to_jsonb($2::text[])
                   AND NOT (t.excludes_computer_ids @> to_jsonb(ARRAY[$1::uuid]))
+                  -- V74 local_only: only the creator node can claim
+                  AND (t.routing_mode != 'local_only'
+                       OR t.created_by_computer_id = $1)
                   AND NOT EXISTS (
                     -- V62 target quarantine: I am being upgraded by a peer.
                     SELECT 1 FROM fleet_tasks q
@@ -245,11 +249,24 @@ impl TaskRunner {
                          AND s.status IN ('pending', 'running')
                     )
                   )
-                ORDER BY t.priority DESC, t.created_at ASC
+                -- V74 selfish routing: fleet_first deprioritizes local tasks;
+                -- local_first/balanced prioritizes local tasks.
+                ORDER BY
+                  CASE t.routing_mode
+                    WHEN 'fleet_first' THEN
+                      CASE WHEN t.created_by_computer_id = $1 THEN 1 ELSE 0 END
+                    WHEN 'local_first' THEN
+                      CASE WHEN t.created_by_computer_id = $1 THEN 0 ELSE 1 END
+                    WHEN 'balanced' THEN
+                      CASE WHEN t.created_by_computer_id = $1 THEN 0 ELSE 1 END
+                    ELSE 0
+                  END ASC,
+                  t.priority DESC,
+                  t.created_at ASC
                   FOR UPDATE SKIP LOCKED
                 LIMIT 1
              )
-            RETURNING id, payload, summary
+            RETURNING id, payload, summary, task_type, timeout_secs
             "#,
         )
         .bind(self.my_computer_id)
@@ -264,8 +281,84 @@ impl TaskRunner {
         let task_id: uuid::Uuid = row.get("id");
         let payload: Value = row.get("payload");
         let summary: String = row.get("summary");
+        let task_type: String = row.get("task_type");
+        let timeout_secs: Option<i32> = row.get("timeout_secs");
 
-        info!(task_id = %task_id, summary = %summary, "task claimed");
+        info!(task_id = %task_id, summary = %summary, task_type = %task_type, "task claimed");
+
+        // ── Decomposed task: create work items and return ──────────────────
+        if task_type == "decomposed" {
+            let items: Vec<Value> = payload
+                .get("items")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let num_batches = payload
+                .get("num_batches")
+                .and_then(Value::as_u64)
+                .unwrap_or(1)
+                as usize;
+
+            let mut weighted_items = Vec::new();
+            for item in &items {
+                let key = item.get("key").and_then(Value::as_str).unwrap_or("").to_string();
+                let item_type = item.get("item_type").and_then(Value::as_str).unwrap_or("shell").to_string();
+                let weight = crate::batch_manager::ItemWeight {
+                    base: item.get("base_weight").and_then(Value::as_f64).unwrap_or(1.0),
+                    pages: item.get("pages").and_then(Value::as_f64).unwrap_or(0.0),
+                    words: item.get("words").and_then(Value::as_f64).unwrap_or(0.0),
+                    has_images: item.get("has_images").and_then(Value::as_f64).unwrap_or(0.0),
+                    has_code: item.get("has_code").and_then(Value::as_f64).unwrap_or(0.0),
+                };
+                weighted_items.push((key, item_type, weight));
+            }
+
+            if weighted_items.is_empty() {
+                warn!(task_id = %task_id, "decomposed task has no items — failing immediately");
+                sqlx::query(
+                    "UPDATE fleet_tasks SET status = 'failed', completed_at = NOW(), error = $1 WHERE id = $2"
+                )
+                .bind("decomposed task payload has no items")
+                .bind(task_id)
+                .execute(&self.pg)
+                .await?;
+                return Ok(Some(task_id));
+            }
+
+            match crate::batch_manager::create_work_items(
+                &self.pg,
+                task_id,
+                &weighted_items,
+                num_batches,
+            ).await {
+                Ok(batches) => {
+                    info!(task_id = %task_id, batches = batches.len(), "decomposed task into work items");
+                }
+                Err(e) => {
+                    warn!(task_id = %task_id, error = %e, "failed to create work items");
+                    sqlx::query(
+                        "UPDATE fleet_tasks SET status = 'failed', completed_at = NOW(), error = $1 WHERE id = $2"
+                    )
+                    .bind(format!("decomposition failed: {e}"))
+                    .bind(task_id)
+                    .execute(&self.pg)
+                    .await?;
+                    return Ok(Some(task_id));
+                }
+            }
+
+            // Keep task in running state; completion watcher will mark it
+            // done when all work_items finish. Heartbeat is bumped by the
+            // watcher every 30s so the watchdog doesn't re-queue us.
+            sqlx::query(
+                "UPDATE fleet_tasks SET progress_message = 'waiting for work items', progress_pct = 0.0 WHERE id = $1"
+            )
+            .bind(task_id)
+            .execute(&self.pg)
+            .await?;
+
+            return Ok(Some(task_id));
+        }
 
         // 2. Spawn a heartbeat ticker for the duration of the run.
         let pg_hb = self.pg.clone();
@@ -288,11 +381,13 @@ impl TaskRunner {
 
         // 3. Run the payload — with FF_* env vars injected so tasks
         // never have to embed IPs, paths, or names in source. Per-task
-        // override of MAX_TASK_DURATION via `payload.max_duration_secs`.
+        // override of MAX_TASK_DURATION via `payload.max_duration_secs`;
+        // falls back to `fleet_tasks.timeout_secs` (V81) if present.
         let max_duration = payload
             .get("max_duration_secs")
             .and_then(Value::as_u64)
             .map(Duration::from_secs)
+            .or_else(|| timeout_secs.map(|s| Duration::from_secs(s as u64)))
             .unwrap_or(MAX_TASK_DURATION);
         let outcome = match tokio::time::timeout(
             max_duration,
@@ -369,6 +464,10 @@ impl TaskRunner {
 
     /// Spawn the worker tick loop. Tries to claim one task every
     /// `interval_secs`. Exits when `shutdown` flips to true.
+    ///
+    /// Phase 3 (V77): Uses PostgreSQL LISTEN/NOTIFY to wake immediately
+    /// when a new task is inserted.  A 10s fallback interval remains for
+    /// resilience if NOTIFY is lost or the DB connection drops.
     pub fn spawn(self, interval_secs: u64, mut shutdown: watch::Receiver<bool>) -> JoinHandle<()> {
         let interval = Duration::from_secs(interval_secs.max(2));
         tokio::spawn(async move {
@@ -377,6 +476,13 @@ impl TaskRunner {
                     debug!(error = %e, computer = %self.my_name, "task tick error");
                 }
                 tokio::select! {
+                    result = listen_for_tasks(&self.pg) => {
+                        if let Err(e) = result {
+                            debug!(error = %e, "task listener error, falling back to interval");
+                        } else {
+                            debug!("woken by fleet_task_inserted notification");
+                        }
+                    }
                     _ = tokio::time::sleep(interval) => {}
                     changed = shutdown.changed() => {
                         if changed.is_err() || *shutdown.borrow() { break; }
@@ -385,6 +491,17 @@ impl TaskRunner {
             }
         })
     }
+}
+
+/// Wait for a `fleet_task_inserted` NOTIFY on a dedicated connection.
+/// Returns when a notification is received so the caller can call
+/// `tick_once` immediately.
+async fn listen_for_tasks(pg: &PgPool) -> Result<(), sqlx::Error> {
+    let mut listener = PgListener::connect_with(pg).await?;
+    listener.listen("fleet_task_inserted").await?;
+    // Block until at least one notification arrives.
+    let _ = listener.recv().await?;
+    Ok(())
 }
 
 /// Leader-only watchdog: detect `running` tasks whose worker has gone
@@ -630,6 +747,74 @@ pub async fn pg_enqueue_shell_task_with_options(
     Ok(id)
 }
 
+/// Like [`pg_enqueue_shell_task_with_options`] but with explicit routing mode.
+/// Use this when you need `fleet_first`, `local_only`, or `balanced` instead
+/// of the default `fleet_first`.
+#[allow(clippy::too_many_arguments)]
+pub async fn pg_enqueue_shell_task_routed(
+    pg: &PgPool,
+    summary: &str,
+    command: &str,
+    capabilities: &[String],
+    preferred_computer: Option<&str>,
+    parent_task_id: Option<uuid::Uuid>,
+    priority: i32,
+    created_by_computer_id: Option<uuid::Uuid>,
+    wait_for_siblings: bool,
+    excludes_computer_ids: &[uuid::Uuid],
+    routing_mode: &str,
+) -> Result<uuid::Uuid, sqlx::Error> {
+    let preferred_id: Option<uuid::Uuid> = if let Some(name) = preferred_computer {
+        sqlx::query_scalar("SELECT id FROM computers WHERE name = $1")
+            .bind(name)
+            .fetch_optional(pg)
+            .await?
+    } else {
+        None
+    };
+
+    let payload = json!({ "command": command });
+    let caps = serde_json::Value::Array(
+        capabilities
+            .iter()
+            .map(|c| Value::String(c.clone()))
+            .collect(),
+    );
+    let excludes_json = serde_json::Value::Array(
+        excludes_computer_ids
+            .iter()
+            .map(|id| Value::String(id.to_string()))
+            .collect(),
+    );
+
+    let id: uuid::Uuid = sqlx::query_scalar(
+        r#"
+        INSERT INTO fleet_tasks (
+            parent_task_id, task_type, summary, payload,
+            priority, requires_capability, preferred_computer_id,
+            created_by_computer_id, wait_for_siblings,
+            excludes_computer_ids, routing_mode
+        )
+        VALUES ($1, 'shell', $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        RETURNING id
+        "#,
+    )
+    .bind(parent_task_id)
+    .bind(summary)
+    .bind(&payload)
+    .bind(priority)
+    .bind(&caps)
+    .bind(preferred_id)
+    .bind(created_by_computer_id)
+    .bind(wait_for_siblings)
+    .bind(&excludes_json)
+    .bind(routing_mode)
+    .fetch_one(pg)
+    .await?;
+
+    Ok(id)
+}
+
 /// Run a `task_type=shell` payload via `/bin/bash -lc <command>`.
 /// `env` is injected on top of the inherited daemon env — these are
 /// the `FF_*` values resolved from the DB at worker startup.
@@ -648,6 +833,14 @@ async fn run_shell_payload(
         .and_then(Value::as_str)
         .unwrap_or("/bin/bash")
         .to_string();
+
+    // Security: validate shell path against allowlist.
+    const ALLOWED_SHELLS: &[&str] = &["/bin/bash", "/bin/sh", "/bin/zsh", "/usr/bin/bash", "/usr/bin/sh", "/usr/bin/zsh"];
+    if !ALLOWED_SHELLS.contains(&shell.as_str()) {
+        return Err(TaskRunnerError::BadPayload(Box::leak(
+            format!("shell '{}' is not in the allowed list: {:?}", shell, ALLOWED_SHELLS).into_boxed_str()
+        )));
+    }
 
     // Use tokio::process so the child can actually be killed if the
     // outer Future is dropped (e.g. by tokio::time::timeout). The

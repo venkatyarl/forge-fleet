@@ -492,6 +492,51 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "sqlite_consolidation",
         sql: schema::SCHEMA_V72_SQLITE_CONSOLIDATION,
     },
+    PgMigration {
+        version: 73,
+        name: "fleet_tool_registry",
+        sql: schema::SCHEMA_V73_FLEET_TOOL_REGISTRY,
+    },
+    PgMigration {
+        version: 74,
+        name: "routing_mode",
+        sql: schema::SCHEMA_V74_ROUTING_MODE,
+    },
+    PgMigration {
+        version: 75,
+        name: "work_items",
+        sql: schema::SCHEMA_V75_WORK_ITEMS,
+    },
+    PgMigration {
+        version: 76,
+        name: "vault_sync",
+        sql: schema::SCHEMA_V76_VAULT_SYNC,
+    },
+    PgMigration {
+        version: 77,
+        name: "fleet_task_notify",
+        sql: schema::SCHEMA_V77_FLEET_TASK_NOTIFY,
+    },
+    PgMigration {
+        version: 78,
+        name: "pgvector_embeddings",
+        sql: schema::SCHEMA_V78_PGVECTOR_EMBEDDINGS,
+    },
+    PgMigration {
+        version: 79,
+        name: "project_schedules",
+        sql: schema::SCHEMA_V79_PROJECT_SCHEDULES,
+    },
+    PgMigration {
+        version: 80,
+        name: "agent_procedures",
+        sql: schema::SCHEMA_V80_AGENT_PROCEDURES,
+    },
+    PgMigration {
+        version: 81,
+        name: "security_hardening",
+        sql: schema::SCHEMA_V81_SECURITY_HARDENING,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.

@@ -212,7 +212,7 @@ impl UpdateChecker {
         // Fetch remote SHA from GitHub
         let url = format!("https://api.github.com/repos/{github_repo}/commits/{branch}");
 
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build().unwrap_or_else(|_| reqwest::Client::new());
         let mut req = client
             .get(&url)
             .header("User-Agent", "ForgeFleet-Updater")

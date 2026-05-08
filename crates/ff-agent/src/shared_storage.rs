@@ -22,14 +22,14 @@
 //! ## Manual setup procedure
 //!
 //! 1. On the host (e.g. `taylor`):
-//!    ```
+//!    ```text
 //!    sudo sh -c 'echo "/Users/venkat/models -network 192.168.5.0 -mask 255.255.255.0" >> /etc/exports'
 //!    sudo nfsd update     # macOS
 //!    # or:
 //!    sudo exportfs -ra    # Linux
 //!    ```
 //! 2. On each client:
-//!    ```
+//!    ```text
 //!    sudo mkdir -p ~/models
 //!    sudo mount -t nfs taylor:/Users/venkat/models ~/models
 //!    ```

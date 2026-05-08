@@ -33,6 +33,76 @@ use std::sync::Arc;
 use crate::inference_router::InferenceRouter;
 use crate::tools::{self, AgentTool, AgentToolContext};
 
+/// Fire-and-forget tool usage logging to the gateway.
+/// Reads FF_GATEWAY_URL and FF_NODE from env; silently skips if unavailable.
+fn log_tool_usage(tool_name: &str, session_id: &str, success: bool, duration_ms: u64) {
+    let gateway = std::env::var("FF_GATEWAY_URL").unwrap_or_default();
+    let node = std::env::var("FF_NODE").unwrap_or_default();
+    if gateway.is_empty() || node.is_empty() {
+        return;
+    }
+    let payload = serde_json::json!({
+        "node_name": node,
+        "tool_name": tool_name,
+        "session_id": session_id,
+        "success": success,
+        "duration_ms": duration_ms as i64,
+    });
+    let name = tool_name.to_string();
+    tokio::spawn(async move {
+        let _ = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build().unwrap_or_else(|_| reqwest::Client::new())
+            .post(format!("{}/api/tools/usage", gateway))
+            .json(&payload)
+            .send()
+            .await;
+        tracing::debug!(tool = %name, "tool usage logged");
+    });
+}
+
+/// Security gate + audit log for a single tool invocation.
+///
+/// Returns `true` if the tool is permitted to run. When denied, emits the
+/// appropriate events and writes a "denied" entry to `tool_audit_log`.
+fn check_tool_allowed(
+    tool_name: &str,
+    allowed: &Option<std::collections::HashSet<String>>,
+) -> bool {
+    let allowed_json = allowed.as_ref().map(|set| {
+        serde_json::Value::Array(set.iter().map(|s| serde_json::Value::String(s.clone())).collect())
+    });
+    let empty = serde_json::json!([]);
+    let allowed_val = allowed_json.as_ref().unwrap_or(&empty);
+    crate::audit_logger::tool_is_allowed(tool_name, allowed_val)
+}
+
+/// Fire-and-forget audit log write.
+async fn audit_tool_call(
+    pg: Option<&sqlx::PgPool>,
+    session_id: &str,
+    tool_name: &str,
+    params: &serde_json::Value,
+    outcome: crate::audit_logger::ToolOutcome,
+    duration_ms: Option<u64>,
+) {
+    let Some(pool) = pg else { return };
+    let session_uuid = uuid::Uuid::parse_str(session_id).ok();
+    let node = std::env::var("FF_NODE").unwrap_or_else(|_| "unknown".into());
+    crate::audit_logger::log_tool_call(
+        pool,
+        session_uuid,
+        None, // step_id — agent loop does not track DB steps
+        session_id,
+        tool_name,
+        params,
+        None, // prompt_hash
+        outcome,
+        None, // error
+        duration_ms,
+        &node,
+    )
+    .await;
+}
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -87,6 +157,8 @@ pub struct AgentSessionConfig {
     /// in a Read-loop without ever calling Write. See
     /// `feedback_ff_supervise_read_loop.md`.
     pub allowed_tools: Option<std::collections::HashSet<String>>,
+    /// Optional Postgres pool for security audit logging.
+    pub pg_pool: Option<sqlx::PgPool>,
 }
 
 impl Default for AgentSessionConfig {
@@ -108,6 +180,7 @@ impl Default for AgentSessionConfig {
             permission_mode: "default".into(),
             output_style: "normal".into(),
             allowed_tools: None,
+            pg_pool: None,
         }
     }
 }
@@ -199,6 +272,7 @@ impl AgentSession {
             working_dir: config.working_dir.clone(),
             session_id: session_id.to_string(),
             shell_state: tools::session_shell_state(&session_id.to_string()),
+            pg_pool: config.pg_pool.clone(),
         };
 
         let system_prompt = config
@@ -256,6 +330,7 @@ impl AgentSession {
             working_dir: config.working_dir.clone(),
             session_id: session_id.to_string(),
             shell_state: tools::session_shell_state(&session_id.to_string()),
+            pg_pool: config.pg_pool.clone(),
         };
 
         let compaction_config = CompactionConfig {
@@ -981,6 +1056,32 @@ async fn run_agent_loop(
                     continue;
                 }
 
+                // Security gate (V81): check step-level allow-list.
+                if !check_tool_allowed(&tool_name, &session.config.allowed_tools) {
+                    let denied_msg = format!("Tool '{tool_name}' is not in the allowed-tools list for this step.");
+                    emit(
+                        &event_tx,
+                        AgentEvent::ToolEnd {
+                            session_id: session_id.clone(),
+                            tool_name: tool_name.clone(),
+                            tool_id: tool_id.clone(),
+                            result: denied_msg.clone(),
+                            is_error: true,
+                            duration_ms: 0,
+                        },
+                    );
+                    let pg = session.tool_ctx.pg_pool.clone();
+                    let sid = session_id.clone();
+                    let tn = tool_name.clone();
+                    tokio::spawn(async move {
+                        if let Ok(args) = serde_json::from_str::<serde_json::Value>(&args_str) {
+                            audit_tool_call(pg.as_ref(), &sid, &tn, &args, crate::audit_logger::ToolOutcome::Denied, Some(0)).await;
+                        }
+                    });
+                    pre_blocked.push((tool_id, denied_msg, true));
+                    continue;
+                }
+
                 let ctx = tool_ctx_arc.clone();
                 let tools_clone = session.tools.clone();
                 let event_tx_clone = event_tx.clone();
@@ -1100,11 +1201,54 @@ async fn run_agent_loop(
                     continue;
                 }
 
+                // Security gate (V81): check step-level allow-list.
+                if !check_tool_allowed(&tool_name, &session.config.allowed_tools) {
+                    let denied_msg = format!("Tool '{tool_name}' is not in the allowed-tools list for this step.");
+                    emit(
+                        &event_tx,
+                        AgentEvent::ToolEnd {
+                            session_id: session_id.clone(),
+                            tool_name: tool_name.clone(),
+                            tool_id: tool_id.clone(),
+                            result: denied_msg.clone(),
+                            is_error: true,
+                            duration_ms: 0,
+                        },
+                    );
+                    session
+                        .messages
+                        .push(ToolChatMessage::tool_result(&tool_id, &denied_msg));
+                    let pg = session.tool_ctx.pg_pool.clone();
+                    let sid = session_id.clone();
+                    tokio::spawn(async move {
+                        audit_tool_call(pg.as_ref(), &sid, &tool_name, &args, crate::audit_logger::ToolOutcome::Denied, Some(0)).await;
+                    });
+                    continue;
+                }
+
                 // Find and execute tool
                 if let Some(idx) = tools::find_tool_arc(&tool_name, &session.tools) {
                     let start = std::time::Instant::now();
-                    let result = session.tools[idx].execute(args, &session.tool_ctx).await;
+                    let result = session.tools[idx].execute(args.clone(), &session.tool_ctx).await;
                     let duration_ms = start.elapsed().as_millis() as u64;
+                    log_tool_usage(
+                        &tool_name,
+                        &session.tool_ctx.session_id,
+                        !result.is_error,
+                        duration_ms,
+                    );
+                    let outcome = if result.is_error {
+                        crate::audit_logger::ToolOutcome::Failure
+                    } else {
+                        crate::audit_logger::ToolOutcome::Success
+                    };
+                    let pg = session.tool_ctx.pg_pool.clone();
+                    let sid = session_id.clone();
+                    let tn = tool_name.clone();
+                    let a = args.clone();
+                    tokio::spawn(async move {
+                        audit_tool_call(pg.as_ref(), &sid, &tn, &a, outcome, Some(duration_ms)).await;
+                    });
 
                     let result_content =
                         tools::truncate_output(&result.content, tools::MAX_TOOL_RESULT_CHARS);
@@ -1445,8 +1589,23 @@ async fn execute_single_tool(
 
     if let Some(idx) = tools::find_tool_arc(tool_name, tools_list) {
         let start = std::time::Instant::now();
-        let result = tools_list[idx].execute(args, ctx).await;
+        let result = tools_list[idx].execute(args.clone(), ctx).await;
         let duration_ms = start.elapsed().as_millis() as u64;
+        log_tool_usage(tool_name, session_id, !result.is_error, duration_ms);
+        let outcome = if result.is_error {
+            crate::audit_logger::ToolOutcome::Failure
+        } else {
+            crate::audit_logger::ToolOutcome::Success
+        };
+        if let Some(pool) = ctx.pg_pool.as_ref() {
+            let pool = pool.clone();
+            let sid = session_id.to_string();
+            let tn = tool_name.to_string();
+            let a = args.clone();
+            tokio::spawn(async move {
+                audit_tool_call(Some(&pool), &sid, &tn, &a, outcome, Some(duration_ms)).await;
+            });
+        }
         let content = tools::truncate_output(&result.content, tools::MAX_TOOL_RESULT_CHARS);
 
         emit(

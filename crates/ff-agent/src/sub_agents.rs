@@ -174,15 +174,9 @@ impl Slots {
         }
         // Trim any trailing idle slots that were left over from a
         // shrink-while-busy.
-        while inner.in_use.len() > 0 {
-            let last = inner.in_use.len() - 1;
-            // Only trim if we are above the "committed" count; however
-            // since we treat the vec length as the committed count,
-            // there's nothing to trim here unless set_count shrank it
-            // below this slot. We keep this simple: no auto-trim.
-            let _ = last;
-            break;
-        }
+        // NOTE: we intentionally do NOT auto-trim here because the vec
+        // length is the committed count.  set_count() handles trimming
+        // when it shrinks below the current length.
     }
 }
 

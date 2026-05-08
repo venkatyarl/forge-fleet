@@ -336,6 +336,70 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         mc_db_path,
     ));
 
+    // 6.4) Tool registry auto-prune — removes stale fleet_tools rows every 60s.
+    if let Some(pg_pool) = operational_store.pg_pool().cloned() {
+        subsystem_tasks.push(start_tool_prune_subsystem(pg_pool, shutdown_rx.clone()));
+    }
+
+    // 6.45) Tool registry registration + heartbeat — register local tools
+    // with the fleet-wide tool registry and keep them alive.
+    {
+        let name = node_name.clone();
+        let shutdown = shutdown_rx.clone();
+        subsystem_tasks.push(tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            let gateway = format!("http://127.0.0.1:51002");
+            let client = match reqwest::Client::builder().timeout(Duration::from_secs(30)).build() {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(error = %e, "failed to build HTTP client for tool registry");
+                    return;
+                }
+            };
+            // Initial registration
+            let tools: Vec<serde_json::Value> = ff_agent::tools::all_tools_arc()
+                .iter()
+                .map(|tool| {
+                    serde_json::json!({
+                        "name": tool.name(),
+                        "description": tool.description(),
+                        "parameters_schema": tool.parameters_schema(),
+                        "capabilities_required": [],
+                    })
+                })
+                .collect();
+            let register_body = serde_json::json!({
+                "node_name": name,
+                "tools": tools,
+            });
+            match client.post(format!("{}/api/tools/register", gateway))
+                .json(&register_body)
+                .send().await
+            {
+                Ok(resp) if resp.status().is_success() => {
+                    info!(count = tools.len(), "fleet tools registered from daemon");
+                }
+                Ok(resp) => warn!(status = %resp.status(), "tool registration failed"),
+                Err(e) => warn!(error = %e, "tool registration request failed"),
+            }
+            // Heartbeat loop
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            let mut shutdown = shutdown;
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let _ = client.post(format!("{}/api/tools/heartbeat", gateway))
+                            .json(&serde_json::json!({"node_name": name}))
+                            .send().await;
+                    }
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() { break; }
+                    }
+                }
+            }
+        }));
+    }
+
     // 6.5) CLI bridge daemons (Layer 3 of the multi-LLM CLI integration).
     // Per-port (51100-51104) listener that translates OpenAI chat shape
     // to a vendor CLI invocation. Each port is gated on the
@@ -542,6 +606,30 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         }
     } else {
         info!("subsystem disabled: pulse v2 (--disable-pulse-v2)");
+    }
+
+    // 15) Project scheduler tick — every 60s, leader-gated.
+    // Phase 10: evaluates cron expressions in project_schedules and enqueues fleet_tasks.
+    if let Some(pg_pool) = operational_store.pg_pool().cloned() {
+        info!("starting subsystem: project scheduler tick (60s, leader-gated)");
+        subsystem_tasks.push(ff_agent::scheduler_tick::spawn_scheduler_tick(
+            pg_pool,
+            node_name.clone(),
+            60,
+            shutdown_rx.clone(),
+        ));
+    }
+
+    // 16) Procedural memory consolidation — every 6h, leader-gated.
+    // Phase 14: scans completed sessions, extracts successful patterns into agent_procedures.
+    if let Some(pg_pool) = operational_store.pg_pool().cloned() {
+        info!("starting subsystem: procedural memory consolidation (6h, leader-gated)");
+        subsystem_tasks.push(ff_brain::procedural_memory::spawn_consolidation_loop(
+            pg_pool,
+            node_name.clone(),
+            6 * 3600,
+            shutdown_rx.clone(),
+        ));
     }
 
     info!("all subsystems started; waiting for shutdown signal");
@@ -1236,6 +1324,44 @@ fn start_gateway_subsystem(
     })
 }
 
+fn start_tool_prune_subsystem(
+    pg_pool: ff_db::PgPool,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(60));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        info!("starting subsystem: tool registry auto-prune");
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    match sqlx::query(
+                        "DELETE FROM fleet_tools WHERE health_checked_at < NOW() - INTERVAL '5 minutes'",
+                    )
+                    .execute(&pg_pool)
+                    .await
+                    {
+                        Ok(result) => {
+                            if result.rows_affected() > 0 {
+                                info!(pruned = result.rows_affected(), "auto-pruned stale fleet_tools");
+                            }
+                        }
+                        Err(err) => {
+                            warn!(error = %err, "tool registry auto-prune query failed");
+                        }
+                    }
+                }
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        info!("tool registry auto-prune subsystem stopping");
+                        break;
+                    }
+                }
+            }
+        }
+    })
+}
+
 fn start_telegram_transport_subsystem(
     config: FleetConfig,
     operational_store: OperationalStore,
@@ -1791,30 +1917,8 @@ async fn start_pulse_v2_subsystems(
     let enrolled_in_fleet = priority_row.is_some();
     let election_priority = priority_row.map(|(p,)| p).unwrap_or(1000);
 
-    // Clone pg_pool + shutdown_rx for the backup orchestrator *before*
-    // the LeaderTick branch below consumes its copy (Phase 6 HA).
-    let pg_pool_for_backup = pg_pool.clone();
-    let shutdown_rx_for_backup = shutdown_rx.clone();
-
-    // Additional clones for Phase 10 observability subsystems (metrics
-    // downsampler + alert evaluator). They start after leader_tick and also
-    // need their own PulseReaders, built from `redis_url`.
-    let pg_pool_for_metrics = pg_pool.clone();
-    let pg_pool_for_alerts = pg_pool.clone();
-    let pg_pool_for_auto_upgrade = pg_pool.clone();
-    let pg_pool_for_task_runner = pg_pool.clone();
-    let pg_pool_for_task_watchdog = pg_pool.clone();
-    let shutdown_rx_for_metrics = shutdown_rx.clone();
-    let shutdown_rx_for_alerts = shutdown_rx.clone();
-    let shutdown_rx_for_auto_upgrade = shutdown_rx.clone();
-    let shutdown_rx_for_task_runner = shutdown_rx.clone();
-    let shutdown_rx_for_task_watchdog = shutdown_rx.clone();
-    let redis_url_for_metrics = redis_url.clone();
-    let redis_url_for_alerts = redis_url.clone();
-    let node_name_for_metrics = node_name.clone();
-    let node_name_for_alerts = node_name.clone();
-    let node_name_for_auto_upgrade = node_name.clone();
-    let node_name_for_task_runner = node_name.clone();
+    // (All pg_pool / shutdown_rx / node_name / redis_url clones are done
+    // inline at the call site — PgPool and watch::Receiver are cheap to clone.)
 
     // Build the redis::Client once — both publisher and materializer need one.
     let redis_client =
@@ -2078,7 +2182,7 @@ async fn start_pulse_v2_subsystems(
         );
 
         let leader_tick = ff_agent::leader_tick::LeaderTick::new(
-            pg_pool,
+            pg_pool.clone(),
             pulse_reader,
             computer_id,
             node_name.clone(),
@@ -2087,7 +2191,7 @@ async fn start_pulse_v2_subsystems(
         .with_on_became_leader(on_became)
         .with_on_lost_leader(on_lost)
         .with_pg_failover(pg_failover_manager);
-        handles.push(leader_tick.spawn(15, shutdown_rx));
+        handles.push(leader_tick.spawn(15, shutdown_rx.clone()));
     } else {
         info!(
             node = %node_name,
@@ -2108,45 +2212,45 @@ async fn start_pulse_v2_subsystems(
         "starting subsystem: backup orchestrator (pg=4h, redis=2h)"
     );
     let backup = ff_agent::ha::backup::BackupOrchestrator::new(
-        pg_pool_for_backup,
+        pg_pool.clone(),
         computer_id,
         node_name.clone(),
         None,
     );
-    handles.push(backup.spawn(shutdown_rx_for_backup));
+    handles.push(backup.spawn(shutdown_rx.clone()));
 
     // (6) Phase 10 — metrics downsampler. Each tick is gated internally on
     // leadership via `fleet_leader_state`, so we start it on every daemon and
     // it no-ops on followers.
-    match ff_pulse::reader::PulseReader::new(&redis_url_for_metrics) {
+    match ff_pulse::reader::PulseReader::new(&redis_url.clone()) {
         Ok(metrics_reader) => {
             info!(
-                node = %node_name_for_metrics,
+                node = %node_name.clone(),
                 "starting subsystem: metrics downsampler (60s, leader-gated)"
             );
             let dsamp = ff_agent::metrics_downsampler::MetricsDownsampler::new(
-                pg_pool_for_metrics,
+                pg_pool.clone(),
                 metrics_reader,
-                node_name_for_metrics.clone(),
+                node_name.clone(),
             );
-            handles.push(dsamp.spawn(shutdown_rx_for_metrics));
+            handles.push(dsamp.spawn(shutdown_rx.clone()));
         }
         Err(e) => warn!(error = %e, "metrics downsampler: failed to build PulseReader"),
     }
 
     // (7) Phase 10 — alert evaluator. Also leader-gated internally.
-    match ff_pulse::reader::PulseReader::new(&redis_url_for_alerts) {
+    match ff_pulse::reader::PulseReader::new(&redis_url.clone()) {
         Ok(alert_reader) => {
             info!(
-                node = %node_name_for_alerts,
+                node = %node_name.clone(),
                 "starting subsystem: alert evaluator (60s, leader-gated)"
             );
             let evaluator = ff_agent::alert_evaluator::AlertEvaluator::new(
-                pg_pool_for_alerts,
+                pg_pool.clone(),
                 alert_reader,
-                node_name_for_alerts.clone(),
+                node_name.clone(),
             );
-            handles.push(evaluator.spawn(shutdown_rx_for_alerts));
+            handles.push(evaluator.spawn(shutdown_rx.clone()));
         }
         Err(e) => warn!(error = %e, "alert evaluator: failed to build PulseReader"),
     }
@@ -2158,14 +2262,14 @@ async fn start_pulse_v2_subsystems(
     // checking only happens when an operator runs
     // `ff software auto-upgrade-run-once --force` manually.
     info!(
-        node = %node_name_for_auto_upgrade,
+        node = %node_name.clone(),
         "starting subsystem: auto-upgrade tick (hourly, leader-gated)"
     );
     let auto_upgrade_tick = ff_agent::auto_upgrade::AutoUpgradeTick::new(
-        pg_pool_for_auto_upgrade,
-        node_name_for_auto_upgrade,
+        pg_pool.clone(),
+        node_name.clone(),
     );
-    handles.push(auto_upgrade_tick.spawn(shutdown_rx_for_auto_upgrade));
+    handles.push(auto_upgrade_tick.spawn(shutdown_rx.clone()));
 
     // (9) fleet_tasks worker — every daemon polls fleet_tasks for shell
     // payloads whose `requires_capability` ⊆ this computer's set, claims
@@ -2173,13 +2277,13 @@ async fn start_pulse_v2_subsystems(
     // the fleet. Capabilities derived below from os_family + name +
     // local probes for redis-cli / hf-cli / etc.
     info!(
-        node = %node_name_for_task_runner,
+        node = %node_name.clone(),
         "starting subsystem: fleet_tasks worker (every 10s)"
     );
     {
-        let pool = pg_pool_for_task_runner.clone();
-        let name = node_name_for_task_runner.clone();
-        let shutdown = shutdown_rx_for_task_runner;
+        let pool = pg_pool.clone();
+        let name = node_name.clone();
+        let shutdown = shutdown_rx.clone();
         tokio::spawn(async move {
             // Look up our computer_id + capabilities once.
             let row: Option<(uuid::Uuid, String, Option<String>)> = sqlx::query_as(
@@ -2281,15 +2385,235 @@ async fn start_pulse_v2_subsystems(
         });
     }
 
-    // (10) fleet_tasks watchdog — gated internally on is_leader.
-    // Re-queues stalled `running` tasks whose worker has gone quiet
-    // for >120s, eventually marking them `failed` after MAX_HANDOFFS.
+    // (9b) Work-item processor — every daemon claims and runs individual
+    // work_items from decomposed tasks. Works alongside the fleet_tasks
+    // runner; claims via SKIP LOCKED so they race safely.
+    info!("starting subsystem: work-item processor (every 5s)");
+    {
+        let pool = pg_pool.clone();
+        let name = node_name.clone();
+        let mut shutdown = shutdown_rx.clone();
+        tokio::spawn(async move {
+            let row: Option<uuid::Uuid> = sqlx::query_scalar(
+                "SELECT id FROM computers WHERE name = $1"
+            )
+            .bind(&name)
+            .fetch_optional(&pool)
+            .await
+            .ok()
+            .flatten();
+            let Some(my_id) = row else {
+                warn!(node = %name, "work-item processor: no computers row, disabled");
+                return;
+            };
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() { break; }
+                    }
+                }
+                match ff_agent::batch_manager::claim_work_item(&pool, my_id, None).await {
+                    Ok(Some(item)) => {
+                        tracing::info!(item = %item.id, item_type = %item.item_type, "work item claimed");
+                        // Mark as in_progress before executing
+                        let _ = sqlx::query(
+                            "UPDATE work_items SET status = 'in_progress' WHERE id = $1"
+                        )
+                        .bind(item.id)
+                        .execute(&pool)
+                        .await;
+                        let result = match item.item_type.as_str() {
+                            "shell" => {
+                                let mut cmd = tokio::process::Command::new("/bin/bash");
+                                cmd.arg("-lc").arg(&item.item_key);
+                                cmd.kill_on_drop(true);
+                                match cmd.output().await {
+                                    Ok(out) => {
+                                        let stdout = String::from_utf8_lossy(&out.stdout);
+                                        let stderr = String::from_utf8_lossy(&out.stderr);
+                                        let exit = out.status.code().unwrap_or(-1);
+                                        if exit == 0 {
+                                            Ok(format!("ok: {}", stdout.chars().take(500).collect::<String>()))
+                                        } else {
+                                            Err(format!("exit {}: {}", exit, stderr.chars().take(500).collect::<String>()))
+                                        }
+                                    }
+                                    Err(e) => Err(format!("spawn error: {e}")),
+                                }
+                            }
+                            _ => {
+                                Ok(format!("unhandled item_type '{}' — marking complete", item.item_type))
+                            }
+                        };
+                        match result {
+                            Ok(summary) => {
+                                let _ = ff_agent::batch_manager::complete_work_item(
+                                    &pool, item.id, &summary, 0, 0,
+                                ).await;
+                                let _ = ff_agent::batch_manager::update_batch_progress(
+                                    &pool, item.parent_task_id, item.batch_id,
+                                ).await;
+                            }
+                            Err(err) => {
+                                let _ = ff_agent::batch_manager::fail_work_item(
+                                    &pool, item.id, &err,
+                                ).await;
+                            }
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => tracing::debug!(error = %e, "work item claim failed"),
+                }
+            }
+        });
+    }
+
+    // (10) fleet_tasks watchdog — every daemon runs the distributed
+    // handoff sweep. Re-queues stalled `running` tasks whose worker has
+    // gone quiet for >120s.
     info!("starting subsystem: fleet_tasks leader watchdog (every 60s)");
     handles.push(ff_agent::task_runner::spawn_leader_watchdog(
-        pg_pool_for_task_watchdog,
+        pg_pool.clone(),
         node_name.clone(),
-        shutdown_rx_for_task_watchdog,
+        shutdown_rx.clone(),
     ));
+
+    // (10b) Work-item watchdog + steal loop — distributed handoff for
+    // work_items, plus proactive stealing from overloaded peers.
+    info!("starting subsystem: work-item watchdog + steal loop");
+    handles.push(ff_agent::work_stealer::spawn_work_item_watchdog(
+        pg_pool.clone(),
+        node_name.clone(),
+        shutdown_rx.clone(),
+    ));
+    {
+        let pool = pg_pool.clone();
+        let name = node_name.clone();
+        let shutdown = shutdown_rx.clone();
+        tokio::spawn(async move {
+            let row: Option<uuid::Uuid> = sqlx::query_scalar(
+                "SELECT id FROM computers WHERE name = $1"
+            )
+            .bind(&name)
+            .fetch_optional(&pool)
+            .await
+            .ok()
+            .flatten();
+            let Some(my_id) = row else { return; };
+            let _ = ff_agent::work_stealer::spawn_steal_loop(
+                pool, my_id, None, name, shutdown,
+            ).await;
+        });
+    }
+
+    // (10c) Parent completion watcher — marks decomposed fleet_tasks as
+    // completed when all their work_items are done.
+    info!("starting subsystem: parent completion watcher (every 30s)");
+    handles.push(ff_agent::batch_manager::spawn_completion_watcher(
+        pg_pool.clone(),
+        30,
+        shutdown_rx.clone(),
+    ));
+
+    // (11) Shared workspace cleanup — daily temp/artifact purge for
+    // sub-agent workspaces. Leader-gated to avoid N-way races.
+    info!("starting subsystem: shared workspace cleanup (daily, leader-gated)");
+    {
+        let pool = pg_pool.clone();
+        let name = node_name.clone();
+        let mut shutdown = shutdown_rx.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(24 * 3600));
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() { break; }
+                    }
+                }
+                // Only run on leader
+                let is_leader: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM fleet_leader_state WHERE member_name = $1)"
+                )
+                .bind(&name)
+                .fetch_one(&pool)
+                .await
+                .unwrap_or(false);
+                if !is_leader { continue; }
+
+                // Run cleanup for all agent workspaces
+                let agents = match ff_agent::shared_workspace::list_agent_workspaces().await {
+                    Ok(a) => a,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to list agent workspaces");
+                        continue;
+                    }
+                };
+                let node_id: Option<uuid::Uuid> = sqlx::query_scalar(
+                    "SELECT id FROM computers WHERE name = $1"
+                )
+                .bind(&name)
+                .fetch_optional(&pool)
+                .await
+                .ok()
+                .flatten();
+                for agent_id in agents {
+                    if let Err(e) = ff_agent::shared_workspace::run_cleanup(&agent_id, Some(&pool), node_id).await {
+                        tracing::warn!(agent_id = %agent_id, error = %e, "workspace cleanup failed");
+                    }
+                }
+            }
+        });
+    }
+
+    // (12) Vault sync — hourly index regeneration + TODO scan.
+    // Leader-gated to avoid N-way races.
+    info!("starting subsystem: vault sync (hourly, leader-gated)");
+    {
+        let pool = pg_pool.clone();
+        let name = node_name.clone();
+        let mut shutdown = shutdown_rx.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+            let vault_path = std::path::PathBuf::from(
+                std::env::var("FF_VAULT_PATH").unwrap_or_else(|_| {
+                    std::env::var("HOME")
+                        .map(|h| std::path::PathBuf::from(h).join("projects").join("Yarli_KnowledgeBase"))
+                        .unwrap_or_else(|_| std::path::PathBuf::from("/tmp/vault"))
+                        .to_string_lossy()
+                        .to_string()
+                })
+            );
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() { break; }
+                    }
+                }
+                let is_leader: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM fleet_leader_state WHERE member_name = $1)"
+                )
+                .bind(&name)
+                .fetch_one(&pool)
+                .await
+                .unwrap_or(false);
+                if !is_leader { continue; }
+
+                if let Err(e) = ff_agent::vault_sync::setup_forgefleet_vault(&vault_path).await {
+                    tracing::warn!(error = %e, "vault setup failed");
+                }
+                if let Err(e) = ff_agent::vault_sync::regenerate_index_md(&vault_path, &name, &pool).await {
+                    tracing::warn!(error = %e, "vault index regeneration failed");
+                }
+                if let Err(e) = ff_agent::vault_sync::scan_vault_todos(&vault_path, &pool).await {
+                    tracing::warn!(error = %e, "vault TODO scan failed");
+                }
+            }
+        });
+    }
 
     Ok(handles)
 }

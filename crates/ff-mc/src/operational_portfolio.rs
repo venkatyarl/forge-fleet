@@ -11,11 +11,11 @@ use axum::{
     Json, Router,
     extract::{Path, State},
     http::StatusCode,
-    routing::{delete, get, patch, post},
+    routing::get,
 };
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{NaiveDate, Utc};
 use ff_db::OperationalStore;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::epic::{CreateEpic, Epic, EpicStatus, UpdateEpic};
@@ -769,6 +769,54 @@ pub async fn list_task_group_items(
         .await
         .unwrap_or_default();
     Json(work_items.into_iter().filter(|wi| wi.task_group_id.as_deref() == Some(&id)).collect())
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct AssignTaskGroupItemRequest {
+    sequence_order: Option<i32>,
+}
+
+pub async fn assign_task_group_item(
+    State(state): State<std::sync::Arc<McOperationalState>>,
+    Path((_id, work_item_id)): Path<(String, String)>,
+    body: Option<Json<AssignTaskGroupItemRequest>>,
+) -> Result<Json<crate::work_item::WorkItem>, (StatusCode, Json<crate::operational_api::ErrorResponse>)> {
+    let sequence_order = body.and_then(|Json(v)| v.sequence_order);
+    let prefix = crate::operational_api::WORK_ITEM_KEY_PREFIX;
+    let mut work_items = config_kv_list::<crate::work_item::WorkItem>(&state.store, prefix)
+        .await
+        .map_err(|e| mc_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let item = work_items.iter_mut().find(|wi| wi.id == work_item_id)
+        .ok_or_else(|| mc_error(StatusCode::NOT_FOUND, "work item not found"))?;
+    item.task_group_id = Some(_id);
+    item.sequence_order = sequence_order;
+    item.updated_at = Utc::now();
+    config_kv_set(&state.store, &format!("{prefix}{}", item.id), item)
+        .await
+        .map_err(|e| mc_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(item.clone()))
+}
+
+pub async fn unassign_task_group_item(
+    State(state): State<std::sync::Arc<McOperationalState>>,
+    Path((_id, work_item_id)): Path<(String, String)>,
+) -> Result<Json<crate::work_item::WorkItem>, (StatusCode, Json<crate::operational_api::ErrorResponse>)> {
+    let prefix = crate::operational_api::WORK_ITEM_KEY_PREFIX;
+    let mut work_items = config_kv_list::<crate::work_item::WorkItem>(&state.store, prefix)
+        .await
+        .map_err(|e| mc_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let item = work_items.iter_mut().find(|wi| wi.id == work_item_id)
+        .ok_or_else(|| mc_error(StatusCode::NOT_FOUND, "work item not found"))?;
+    if item.task_group_id.as_deref() != Some(&_id) {
+        return Err(mc_error(StatusCode::BAD_REQUEST, "work item is not assigned to this task group"));
+    }
+    item.task_group_id = None;
+    item.sequence_order = None;
+    item.updated_at = Utc::now();
+    config_kv_set(&state.store, &format!("{prefix}{}", item.id), item)
+        .await
+        .map_err(|e| mc_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(item.clone()))
 }
 
 // ─── Router assembly ────────────────────────────────────────────────────────

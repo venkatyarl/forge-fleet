@@ -713,6 +713,26 @@ pub async fn vault_search(
     Ok(Json(json!({ "results": nodes })))
 }
 
+// ─── Hybrid search (vector + keyword) ────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct HybridSearchQuery {
+    pub q: String,
+    pub limit: Option<i64>,
+}
+
+pub async fn hybrid_search_handler(
+    State(state): State<Arc<GatewayState>>,
+    Query(query): Query<HybridSearchQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let pool = pool_from_state(&state)?;
+    let limit = query.limit.unwrap_or(10);
+    let results = ff_brain::hybrid_search(&query.q, limit, pool)
+        .await
+        .map_err(|e| db_err("hybrid_search", e))?;
+    Ok(Json(json!({ "results": results, "query": query.q })))
+}
+
 // ─── User identity (whoami) ──────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]

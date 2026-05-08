@@ -105,6 +105,7 @@ impl HeartbeatPublisher {
             tokens_per_sec: 0.0,
             temperature_c: None,
             uptime_secs,
+            gpu_util_percent: None,
         }
     }
 

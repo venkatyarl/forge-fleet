@@ -62,6 +62,12 @@ async fn main() -> anyhow::Result<()> {
 
     tokio::spawn(run_http_server(config.http_port, http_ctx));
 
+    // Register tools with fleet tool registry (Phase 15a)
+    tokio::spawn(run_tool_registry_reporter(
+        config.node_id.clone(),
+        config.leader_url.clone(),
+    ));
+
     tokio::spawn(run_health_reporter(
         shared_state.clone(),
         leader.clone(),
@@ -135,6 +141,77 @@ async fn run_health_reporter(state: SharedState, leader: LeaderClient, interval_
         }
 
         tokio::time::sleep(interval).await;
+    }
+}
+
+async fn run_tool_registry_reporter(node_id: String, leader_url: String) {
+    // Wait a bit for the gateway to be fully up
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    let gateway = if leader_url.contains(':') {
+        // Convert leader URL (e.g., http://192.168.5.100:50001) to gateway URL
+        leader_url.replace(":50001", ":51002").replace(":50000", ":51002")
+    } else {
+        "http://192.168.5.100:51002".to_string()
+    };
+
+    let client = match reqwest::Client::builder().timeout(Duration::from_secs(30)).build() {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, "failed to build HTTP client for tool registry");
+            return;
+        }
+    };
+
+    // Build tool registration payload from actual tool implementations
+    let tools: Vec<serde_json::Value> = ff_agent::tools::all_tools_arc()
+        .iter()
+        .map(|tool| {
+            serde_json::json!({
+                "name": tool.name(),
+                "description": tool.description(),
+                "parameters_schema": tool.parameters_schema(),
+                "capabilities_required": [],
+            })
+        })
+        .collect();
+
+    let register_body = serde_json::json!({
+        "node_name": node_id,
+        "tools": tools,
+    });
+
+    let register_url = format!("{}/api/tools/register", gateway);
+    match client.post(&register_url).json(&register_body).send().await {
+        Ok(resp) => {
+            if resp.status().is_success() {
+                info!(count = tools.len(), "fleet tools registered");
+            } else {
+                warn!(status = %resp.status(), "fleet tool registration returned non-success");
+            }
+        }
+        Err(e) => {
+            warn!(error = %e, "fleet tool registration failed");
+        }
+    }
+
+    // Periodic heartbeat to keep tools healthy
+    let heartbeat_interval = Duration::from_secs(60);
+    loop {
+        tokio::time::sleep(heartbeat_interval).await;
+
+        let heartbeat_body = serde_json::json!({"node_name": node_id});
+        let heartbeat_url = format!("{}/api/tools/heartbeat", gateway);
+        match client.post(&heartbeat_url).json(&heartbeat_body).send().await {
+            Ok(resp) => {
+                if !resp.status().is_success() {
+                    warn!(status = %resp.status(), "fleet tool heartbeat returned non-success");
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "fleet tool heartbeat failed");
+            }
+        }
     }
 }
 

@@ -37,7 +37,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-use crate::task_runner::pg_enqueue_shell_task;
+use crate::task_runner::pg_enqueue_shell_task_routed;
 
 /// How often the runner ticks. 5s is responsive without burning CPU
 /// when the session pool is idle.
@@ -321,7 +321,9 @@ pub async fn tick(pool: &PgPool) -> Result<TickStats> {
         );
 
         let task_id =
-            pg_enqueue_shell_task(pool, &summary, &cmd, &capability, None, None, 70, None)
+            pg_enqueue_shell_task_routed(
+                pool, &summary, &cmd, &capability, None, None, 70, None, false, &[], "fleet_first",
+            )
                 .await
                 .with_context(|| format!("enqueue fleet_task for step {step_id}"))?;
 

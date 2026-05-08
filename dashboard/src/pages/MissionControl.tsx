@@ -104,7 +104,7 @@ export function MissionControl() {
       const [fleetData, taskData, auditData, chatData] = await Promise.allSettled([
         getJson<FleetStatusResponse>('/api/fleet/status').catch(() => getJson<FleetStatusResponse>('/api/status')),
         getJson<TaskSummary[]>('/api/mc/work-items').catch(() => []),
-        getJson<AuditEntry[]>('/api/audit?limit=10').catch(() => []),
+        getJson<AuditEntry[]>('/api/audit/recent?limit=10').catch(() => []),
         getJson<ChatSummary[]>('/api/agent/sessions').catch(() => []),
       ])
 

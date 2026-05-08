@@ -98,6 +98,8 @@ pub struct AgentToolContext {
     pub session_id: String,
     /// Persistent shell state (cwd + env vars) across Bash invocations.
     pub shell_state: Arc<Mutex<ShellState>>,
+    /// Optional Postgres pool for audit logging and security checks.
+    pub pg_pool: Option<sqlx::PgPool>,
 }
 
 /// Persistent shell state across multiple Bash tool invocations within a session.

@@ -32,8 +32,9 @@ use crate::operational_portfolio::{
     create_sprint, create_task_group, delete_company, delete_epic, delete_project, delete_sprint,
     delete_task_group, get_company, get_epic, get_epic_progress, get_portfolio_summary, get_project,
     get_sprint, get_sprint_burndown, get_sprint_stats, get_task_group, list_companies, list_epics,
-    list_project_environments, list_project_repos, list_projects, list_sprints, list_task_group_items,
-    list_task_groups, update_company, update_epic, update_project, update_sprint, update_task_group,
+    assign_task_group_item, list_project_environments, list_project_repos, list_projects, list_sprints,
+    list_task_group_items, list_task_groups, unassign_task_group_item, update_company, update_epic,
+    update_project, update_sprint, update_task_group,
 };
 use crate::review_item::{CreateReviewItem, ReviewItem, ReviewItemStatus, UpdateReviewItem};
 use crate::work_item::{
@@ -157,6 +158,8 @@ pub fn mc_router_operational(store: OperationalStore) -> Router {
         .route("/api/mc/task-groups", get(list_task_groups).post(create_task_group))
         .route("/api/mc/task-groups/{id}", get(get_task_group).patch(update_task_group).delete(delete_task_group))
         .route("/api/mc/task-groups/{id}/items", get(list_task_group_items))
+        .route("/api/mc/task-groups/{id}/items/{work_item_id}", post(assign_task_group_item))
+        .route("/api/mc/task-groups/{id}/items/{work_item_id}", delete(unassign_task_group_item))
         .with_state(state)
 }
 

@@ -38,6 +38,7 @@ mod model_serve_cmd;
 mod self_heal_cmd;
 mod storage_cmd;
 mod tasks_cmd;
+mod tools_cmd;
 
 const GREEN: &str = "\x1b[32m";
 const CYAN: &str = "\x1b[36m";
@@ -442,6 +443,11 @@ enum Command {
         #[command(subcommand)]
         command: SelfHealCommand,
     },
+    /// Fleet Tool Registry — discover, inspect, and manage tools across all nodes.
+    Tools {
+        #[command(subcommand)]
+        command: ToolsCommand,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -586,6 +592,30 @@ enum SelfHealCommand {
     RunWriter {
         #[arg(long)]
         bug_sig: String,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum ToolsCommand {
+    /// List all tools registered across the fleet.
+    List {
+        /// Filter by node name.
+        #[arg(long)]
+        node: Option<String>,
+        /// Filter by tool name (substring match).
+        #[arg(long)]
+        name: Option<String>,
+        /// Show only unhealthy tools (stale >5 min).
+        #[arg(long)]
+        unhealthy: bool,
+    },
+    /// Show tool health status across all nodes.
+    Health,
+    /// Register local tools with the fleet registry.
+    Register {
+        /// Node name to register as (defaults to hostname).
+        #[arg(long)]
+        node: Option<String>,
     },
 }
 
@@ -2896,6 +2926,18 @@ async fn main() -> Result<()> {
                 SelfHealCommand::RunWriter { bug_sig } => {
                     self_heal_cmd::handle_run_writer(&pool, &bug_sig).await
                 }
+            }
+        }
+        Some(Command::Tools { command }) => {
+            let pool = ff_agent::fleet_info::get_fleet_pool()
+                .await
+                .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
+            match command {
+                ToolsCommand::List { node, name, unhealthy } => {
+                    tools_cmd::handle_list(&pool, node, name, unhealthy).await
+                }
+                ToolsCommand::Health => tools_cmd::handle_health(&pool).await,
+                ToolsCommand::Register { node } => tools_cmd::handle_register(&pool, node).await,
             }
         }
         Some(Command::Alert { command }) => handle_alert(command).await,
