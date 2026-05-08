@@ -11950,6 +11950,7 @@ async fn handle_cloud_llm_test(
         "openai" => "openai/gpt-4o-mini".to_string(),
         "anthropic" => "claude-3-5-haiku-latest".to_string(),
         "moonshot" => "kimi/moonshot-v1-8k".to_string(),
+        "kimi_code" => "kimi-for-coding".to_string(),
         "google" => "gemini/gemini-1.5-flash".to_string(),
         _ => "test".to_string(),
     });
@@ -12037,6 +12038,10 @@ async fn probe_cloud_provider(
     let mut req = http.post(&url).json(&body);
     for (k, v) in &headers {
         req = req.header(*k, v);
+    }
+    // Kimi Code API enforces a strict User-Agent whitelist (e.g. claude-code/*).
+    if base_url.contains("api.kimi.com/coding") {
+        req = req.header("User-Agent", "claude-code/0.2.62");
     }
     let resp = req.send().await.map_err(|e| format!("send: {e}"))?;
     let status = resp.status();

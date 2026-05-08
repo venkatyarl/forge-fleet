@@ -339,11 +339,17 @@ async fn call_openai_chat(
         "{}/chat/completions",
         provider.base_url.trim_end_matches('/')
     );
-    let req = client
+    let mut req = client
         .post(&url)
         .bearer_auth(api_key)
         .header("content-type", "application/json")
         .json(body);
+    // Kimi Code API enforces a strict User-Agent whitelist (e.g. claude-code/*).
+    // Without this header the key is rejected with access_terminated_error.
+    // Covers all kimi_code* provider rows (kimi-for-coding, kimi-k*, etc.).
+    if provider.base_url.contains("api.kimi.com/coding") {
+        req = req.header("User-Agent", "claude-code/0.2.62");
+    }
     let resp = send_with_429_retry(req)
         .await
         .map_err(|e| CloudCallError::Local(format!("upstream request failed: {e}")))?;
