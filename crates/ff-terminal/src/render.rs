@@ -270,14 +270,13 @@ fn render_model_picker(frame: &mut Frame, app: &App, _theme: &Theme) {
                 m.detail.clone(),
                 Style::default().fg(detail_color).bg(bg),
             ));
-            if let Some(ep) = &m.endpoint_display {
-                if matches!(m.state, PickerItemState::Loaded) {
+            if let Some(ep) = &m.endpoint_display
+                && matches!(m.state, PickerItemState::Loaded) {
                     spans.push(Span::styled(
                         format!("  {ep}"),
                         Style::default().fg(dim_color).bg(bg),
                     ));
                 }
-            }
             if let Some(rt) = &m.runtime {
                 spans.push(Span::styled(
                     format!("  [{rt}]"),

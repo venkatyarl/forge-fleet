@@ -88,8 +88,7 @@ pub async fn handle_health(pg: &PgPool) -> Result<()> {
     println!("{GREEN}✓ Tool Registry Health{RESET}");
     println!("  total:     {}", total);
     println!(
-        "  healthy:   {}{GREEN}{}{RESET}",
-        if healthy == total { "  " } else { "  " },
+        "  healthy:   {GREEN}{}{RESET}",
         healthy
     );
     if total - healthy > 0 {

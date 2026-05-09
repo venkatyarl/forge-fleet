@@ -144,8 +144,7 @@ fn extract_rust_entities(source: &str, file_path: &str) -> Vec<CodeEntity> {
             || trimmed.starts_with("pub(crate) fn ")
             || trimmed.starts_with("pub(super) fn "))
             && !trimmed.starts_with("//")
-        {
-            if let Some(name) = extract_name_after(trimmed, "fn ") {
+            && let Some(name) = extract_name_after(trimmed, "fn ") {
                 let end = find_block_end(&lines, i);
                 entities.push(CodeEntity {
                     kind: EntityKind::Function,
@@ -159,13 +158,11 @@ fn extract_rust_entities(source: &str, file_path: &str) -> Vec<CodeEntity> {
                     language: Language::Rust,
                 });
             }
-        }
 
         // Structs
         if (trimmed.starts_with("pub struct ") || trimmed.starts_with("struct "))
             && !trimmed.starts_with("//")
-        {
-            if let Some(name) = extract_name_after(trimmed, "struct ") {
+            && let Some(name) = extract_name_after(trimmed, "struct ") {
                 entities.push(CodeEntity {
                     kind: EntityKind::Struct,
                     name,
@@ -178,13 +175,11 @@ fn extract_rust_entities(source: &str, file_path: &str) -> Vec<CodeEntity> {
                     language: Language::Rust,
                 });
             }
-        }
 
         // Enums
         if (trimmed.starts_with("pub enum ") || trimmed.starts_with("enum "))
             && !trimmed.starts_with("//")
-        {
-            if let Some(name) = extract_name_after(trimmed, "enum ") {
+            && let Some(name) = extract_name_after(trimmed, "enum ") {
                 entities.push(CodeEntity {
                     kind: EntityKind::Enum,
                     name,
@@ -197,13 +192,11 @@ fn extract_rust_entities(source: &str, file_path: &str) -> Vec<CodeEntity> {
                     language: Language::Rust,
                 });
             }
-        }
 
         // Traits
         if (trimmed.starts_with("pub trait ") || trimmed.starts_with("trait "))
             && !trimmed.starts_with("//")
-        {
-            if let Some(name) = extract_name_after(trimmed, "trait ") {
+            && let Some(name) = extract_name_after(trimmed, "trait ") {
                 entities.push(CodeEntity {
                     kind: EntityKind::Trait,
                     name,
@@ -216,7 +209,6 @@ fn extract_rust_entities(source: &str, file_path: &str) -> Vec<CodeEntity> {
                     language: Language::Rust,
                 });
             }
-        }
 
         // Imports
         if trimmed.starts_with("use ") && !trimmed.starts_with("//") {
@@ -254,8 +246,7 @@ fn extract_ts_entities(source: &str, file_path: &str, lang: Language) -> Vec<Cod
             || trimmed.contains("=> ("))
             && !trimmed.starts_with("//")
             && !trimmed.starts_with("*")
-        {
-            if let Some(name) = extract_name_after(trimmed, "function ") {
+            && let Some(name) = extract_name_after(trimmed, "function ") {
                 entities.push(CodeEntity {
                     kind: EntityKind::Function,
                     name,
@@ -268,13 +259,11 @@ fn extract_ts_entities(source: &str, file_path: &str, lang: Language) -> Vec<Cod
                     language: lang,
                 });
             }
-        }
 
         // Classes
         if (trimmed.starts_with("class ") || trimmed.starts_with("export class "))
             && !trimmed.starts_with("//")
-        {
-            if let Some(name) = extract_name_after(trimmed, "class ") {
+            && let Some(name) = extract_name_after(trimmed, "class ") {
                 entities.push(CodeEntity {
                     kind: EntityKind::Class,
                     name,
@@ -287,13 +276,11 @@ fn extract_ts_entities(source: &str, file_path: &str, lang: Language) -> Vec<Cod
                     language: lang,
                 });
             }
-        }
 
         // Interfaces (TypeScript)
         if (trimmed.starts_with("interface ") || trimmed.starts_with("export interface "))
             && lang == Language::TypeScript
-        {
-            if let Some(name) = extract_name_after(trimmed, "interface ") {
+            && let Some(name) = extract_name_after(trimmed, "interface ") {
                 entities.push(CodeEntity {
                     kind: EntityKind::Interface,
                     name,
@@ -306,7 +293,6 @@ fn extract_ts_entities(source: &str, file_path: &str, lang: Language) -> Vec<Cod
                     language: lang,
                 });
             }
-        }
 
         // Imports
         if trimmed.starts_with("import ") {
@@ -337,8 +323,7 @@ fn extract_python_entities(source: &str, file_path: &str) -> Vec<CodeEntity> {
 
         if (trimmed.starts_with("def ") || trimmed.starts_with("async def "))
             && !trimmed.starts_with("#")
-        {
-            if let Some(name) = extract_name_after(trimmed, "def ") {
+            && let Some(name) = extract_name_after(trimmed, "def ") {
                 entities.push(CodeEntity {
                     kind: EntityKind::Function,
                     name,
@@ -351,10 +336,9 @@ fn extract_python_entities(source: &str, file_path: &str) -> Vec<CodeEntity> {
                     language: Language::Python,
                 });
             }
-        }
 
-        if trimmed.starts_with("class ") && !trimmed.starts_with("#") {
-            if let Some(name) = extract_name_after(trimmed, "class ") {
+        if trimmed.starts_with("class ") && !trimmed.starts_with("#")
+            && let Some(name) = extract_name_after(trimmed, "class ") {
                 entities.push(CodeEntity {
                     kind: EntityKind::Class,
                     name,
@@ -367,7 +351,6 @@ fn extract_python_entities(source: &str, file_path: &str) -> Vec<CodeEntity> {
                     language: Language::Python,
                 });
             }
-        }
 
         if trimmed.starts_with("import ") || trimmed.starts_with("from ") {
             entities.push(CodeEntity {
@@ -395,8 +378,8 @@ fn extract_go_entities(source: &str, file_path: &str) -> Vec<CodeEntity> {
         let trimmed = line.trim();
         let line_num = i + 1;
 
-        if trimmed.starts_with("func ") && !trimmed.starts_with("//") {
-            if let Some(name) = extract_name_after(trimmed, "func ") {
+        if trimmed.starts_with("func ") && !trimmed.starts_with("//")
+            && let Some(name) = extract_name_after(trimmed, "func ") {
                 entities.push(CodeEntity {
                     kind: EntityKind::Function,
                     name,
@@ -409,12 +392,10 @@ fn extract_go_entities(source: &str, file_path: &str) -> Vec<CodeEntity> {
                     language: Language::Go,
                 });
             }
-        }
 
         if trimmed.starts_with("type ")
             && (trimmed.contains("struct") || trimmed.contains("interface"))
-        {
-            if let Some(name) = extract_name_after(trimmed, "type ") {
+            && let Some(name) = extract_name_after(trimmed, "type ") {
                 let kind = if trimmed.contains("interface") {
                     EntityKind::Interface
                 } else {
@@ -432,7 +413,6 @@ fn extract_go_entities(source: &str, file_path: &str) -> Vec<CodeEntity> {
                     language: Language::Go,
                 });
             }
-        }
     }
 
     entities
@@ -491,8 +471,8 @@ fn extract_name_after(line: &str, keyword: &str) -> Option<String> {
 
 fn find_block_end(lines: &[&str], start: usize) -> usize {
     let mut depth = 0i32;
-    for i in start..lines.len() {
-        for ch in lines[i].chars() {
+    for (i, line) in lines.iter().enumerate().skip(start) {
+        for ch in line.chars() {
             if ch == '{' {
                 depth += 1;
             }
@@ -504,13 +484,12 @@ fn find_block_end(lines: &[&str], start: usize) -> usize {
             return i;
         }
     }
-    (start + 20).min(lines.len() - 1)
+    (start + 20).min(lines.len().saturating_sub(1))
 }
 
 fn find_python_block_end(lines: &[&str], start: usize) -> usize {
     let indent = lines[start].len() - lines[start].trim_start().len();
-    for i in (start + 1)..lines.len() {
-        let line = lines[i];
+    for (i, line) in lines.iter().enumerate().skip(start + 1) {
         if line.trim().is_empty() {
             continue;
         }

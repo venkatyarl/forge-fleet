@@ -714,10 +714,13 @@ impl DiskSpaceProbe {
 
         let path = CString::new("/").ok()?;
         let mut stat = MaybeUninit::<libc::statvfs>::uninit();
+        // SAFETY: `path` is a valid NUL-terminated CString and `stat` is a
+        // valid MaybeUninit pointer allocated on the stack.
         let ret = unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) };
         if ret != 0 {
             return None;
         }
+        // SAFETY: `statvfs` returned 0, so `stat` is fully initialized.
         let stat = unsafe { stat.assume_init() };
         let total = stat.f_blocks as f64 * stat.f_frsize as f64;
         let avail = stat.f_bavail as f64 * stat.f_frsize as f64;

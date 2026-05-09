@@ -29,12 +29,14 @@
 //! # Why not headless Chromium / Playwright?
 //!
 //! The plan called for a headless-browser daemon. In practice:
+//!
 //! 1. Anthropic's Computer Use API is screen+mouse, not browser.
 //! 2. Most fleet members have a real desktop; using their actual
 //!    screen lets agents do anything (browsers, apps, file dialogs),
 //!    not just web pages.
 //! 3. No multi-hundred-MB Chromium dep per member; native tools are
 //!    smaller, already-installed-or-easily-installed.
+//!
 //! Headless-Chromium is a future add (members without a screen, e.g.
 //! DGX Sparks) but not the MVP.
 

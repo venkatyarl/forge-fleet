@@ -115,16 +115,20 @@ pub fn is_request_fresh(timestamp: i64, max_age_secs: i64) -> bool {
 mod tests {
     use super::*;
 
-    const SECRET: &str = "test-shared-secret-42";
+    // Generate a unique secret per test run to avoid hardcoded test credentials.
+    fn test_secret() -> String {
+        format!("test-secret-{}", uuid::Uuid::new_v4())
+    }
 
     #[test]
     fn test_sign_and_verify() {
+        let secret = test_secret();
         let ts = Utc::now().timestamp();
-        let sig = sign_request(SECRET, "POST", "/api/v1/task", ts, r#"{"hello":"world"}"#);
+        let sig = sign_request(&secret, "POST", "/api/v1/task", ts, r#"{"hello":"world"}"#);
 
         assert!(
             verify_signature(
-                SECRET,
+                &secret,
                 "POST",
                 "/api/v1/task",
                 ts,
@@ -137,8 +141,9 @@ mod tests {
 
     #[test]
     fn test_wrong_secret_fails() {
+        let secret = test_secret();
         let ts = Utc::now().timestamp();
-        let sig = sign_request(SECRET, "GET", "/health", ts, "");
+        let sig = sign_request(&secret, "GET", "/health", ts, "");
 
         assert!(
             !verify_signature("wrong-secret", "GET", "/health", ts, "", &sig),
@@ -148,31 +153,34 @@ mod tests {
 
     #[test]
     fn test_tampered_body_fails() {
+        let secret = test_secret();
         let ts = Utc::now().timestamp();
-        let sig = sign_request(SECRET, "POST", "/run", ts, "original");
+        let sig = sign_request(&secret, "POST", "/run", ts, "original");
 
         assert!(
-            !verify_signature(SECRET, "POST", "/run", ts, "tampered", &sig),
+            !verify_signature(&secret, "POST", "/run", ts, "tampered", &sig),
             "tampered body must fail"
         );
     }
 
     #[test]
     fn test_tampered_path_fails() {
+        let secret = test_secret();
         let ts = Utc::now().timestamp();
-        let sig = sign_request(SECRET, "GET", "/api/v1/nodes", ts, "");
+        let sig = sign_request(&secret, "GET", "/api/v1/nodes", ts, "");
 
         assert!(
-            !verify_signature(SECRET, "GET", "/api/v1/EVIL", ts, "", &sig),
+            !verify_signature(&secret, "GET", "/api/v1/EVIL", ts, "", &sig),
             "tampered path must fail"
         );
     }
 
     #[test]
     fn test_invalid_hex_signature_fails() {
+        let secret = test_secret();
         let ts = Utc::now().timestamp();
         assert!(
-            !verify_signature(SECRET, "GET", "/x", ts, "", "not-hex!!"),
+            !verify_signature(&secret, "GET", "/x", ts, "", "not-hex!!"),
             "invalid hex must fail"
         );
     }
@@ -205,8 +213,9 @@ mod tests {
 
     #[test]
     fn test_deterministic_signature() {
-        let sig1 = sign_request(SECRET, "PUT", "/a", 1700000000, "body");
-        let sig2 = sign_request(SECRET, "PUT", "/a", 1700000000, "body");
+        let secret = test_secret();
+        let sig1 = sign_request(&secret, "PUT", "/a", 1700000000, "body");
+        let sig2 = sign_request(&secret, "PUT", "/a", 1700000000, "body");
         assert_eq!(sig1, sig2, "same inputs must produce same signature");
     }
 }

@@ -509,6 +509,7 @@ mod tests {
         }
         let out = LlmProbe::available_models();
         assert!(out.is_empty());
+        // SAFETY: single-threaded test context.
         unsafe {
             if let Some(h) = prev {
                 std::env::set_var("HOME", h);

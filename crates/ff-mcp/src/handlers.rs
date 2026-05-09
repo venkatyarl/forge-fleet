@@ -600,8 +600,8 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
         .route(model_selector, &messages, Some(start_tier), Some(max_tier))
         .await;
 
-    if let Some(policy) = applied_policy.as_ref() {
-        if !policy.policy.routing.allowed_models.is_empty() {
+    if let Some(policy) = applied_policy.as_ref()
+        && !policy.policy.routing.allowed_models.is_empty() {
             chain = chain
                 .into_iter()
                 .filter_map(|(tier, backends)| {
@@ -624,7 +624,6 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
                 })
                 .collect();
         }
-    }
 
     if chain.is_empty() {
         return Err(
@@ -3089,6 +3088,7 @@ mod tests {
         let _ = std::fs::remove_file(&db_path);
 
         let prev = std::env::var("FORGEFLEET_DB_PATH").ok();
+        // SAFETY: single-threaded test context; no other threads read this env var.
         unsafe {
             std::env::set_var("FORGEFLEET_DB_PATH", db_path.as_os_str());
         }
@@ -3099,9 +3099,11 @@ mod tests {
     fn restore_test_db_env(path: &str, prev: Option<String>) {
         match prev {
             Some(value) => unsafe {
+                // SAFETY: single-threaded test context.
                 std::env::set_var("FORGEFLEET_DB_PATH", value);
             },
             None => unsafe {
+                // SAFETY: single-threaded test context.
                 std::env::remove_var("FORGEFLEET_DB_PATH");
             },
         }

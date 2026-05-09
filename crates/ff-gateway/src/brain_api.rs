@@ -301,15 +301,14 @@ fn extract_assistant_content(v: &Value) -> Option<String> {
 /// Pick a default model when the caller does not specify one.
 /// Priority: first available from Pulse router live scan.
 async fn pick_default_model(state: &GatewayState) -> Option<String> {
-    if let Some(pulse) = state.pulse_router.as_ref() {
-        if let Ok(servers) = pulse.list_servers().await {
+    if let Some(pulse) = state.pulse_router.as_ref()
+        && let Ok(servers) = pulse.list_servers().await {
             for s in servers {
                 if let Some(model) = s.get("model").and_then(|v| v.as_str()) {
                     return Some(model.to_string());
                 }
             }
         }
-    }
     None
 }
 
@@ -375,8 +374,8 @@ async fn generate_brain_reply(
                 if let Some(content) = extract_assistant_content(&v) {
                     info!(model = %model, provider = "pulse", thread = %thread.slug, "brain reply from pulse");
                     // Record usage if the response has usage info.
-                    if let Some(usage) = v.get("usage") {
-                        if let (Some(prompt), Some(comp)) = (
+                    if let Some(usage) = v.get("usage")
+                        && let (Some(prompt), Some(comp)) = (
                             usage.get("prompt_tokens").and_then(|x| x.as_u64()),
                             usage.get("completion_tokens").and_then(|x| x.as_u64()),
                         ) {
@@ -388,7 +387,6 @@ async fn generate_brain_reply(
                             .with_tokens(prompt as u32, comp as u32);
                             state.cost_tracker.record_usage(record).await;
                         }
-                    }
                     return Ok(content);
                 }
                 return Err(anyhow::anyhow!("pulse response missing content"));

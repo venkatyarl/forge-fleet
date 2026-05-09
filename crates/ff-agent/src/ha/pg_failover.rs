@@ -498,25 +498,17 @@ mod tests {
 
     #[test]
     fn disabled_flag_parses() {
-        unsafe {
-            std::env::remove_var(DISABLE_ENV);
-        }
+        // SAFETY: single-threaded test; no concurrent env access.
+        unsafe { std::env::remove_var(DISABLE_ENV); }
         assert!(!is_disabled());
-        unsafe {
-            std::env::set_var(DISABLE_ENV, "true");
-        }
+        unsafe { std::env::set_var(DISABLE_ENV, "true"); }
         assert!(is_disabled());
-        unsafe {
-            std::env::set_var(DISABLE_ENV, "1");
-        }
+        unsafe { std::env::set_var(DISABLE_ENV, "1"); }
         assert!(is_disabled());
-        unsafe {
-            std::env::set_var(DISABLE_ENV, "no");
-        }
+        unsafe { std::env::set_var(DISABLE_ENV, "no"); }
         assert!(!is_disabled());
-        unsafe {
-            std::env::remove_var(DISABLE_ENV);
-        }
+        // SAFETY: single-threaded test; no concurrent env access.
+        unsafe { std::env::remove_var(DISABLE_ENV); }
     }
 
     #[test]

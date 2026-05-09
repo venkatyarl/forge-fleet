@@ -58,13 +58,13 @@ pub async fn handle_tasks_list(
 
     if show_id {
         println!(
-            "{:<36} {:<10} {:<20} {:<12} {:<10} {:>5} {}",
-            "ID", "COMPUTER", "TYPE", "STATUS", "AGE", "PCT", "SUMMARY"
+            "{:<36} {:<10} {:<20} {:<12} {:<10} {:>5} SUMMARY",
+            "ID", "COMPUTER", "TYPE", "STATUS", "AGE", "PCT"
         );
     } else {
         println!(
-            "{:<10} {:<20} {:<12} {:<10} {:>5} {}",
-            "COMPUTER", "TYPE", "STATUS", "AGE", "PCT", "SUMMARY"
+            "{:<10} {:<20} {:<12} {:<10} {:>5} SUMMARY",
+            "COMPUTER", "TYPE", "STATUS", "AGE", "PCT"
         );
     }
     for r in rows {

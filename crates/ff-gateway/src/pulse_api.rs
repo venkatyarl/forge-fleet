@@ -722,13 +722,15 @@ pub async fn list_work_items(
         args.push(a.clone());
         sql.push_str(&format!(" AND assigned_to = ${}", args.len()));
     }
-    // `limit` is clamped to 1-1000 above, so direct interpolation is safe.
-    sql.push_str(&format!(" ORDER BY created_at DESC LIMIT {}", limit));
+    sql.push_str(" ORDER BY created_at DESC LIMIT $");
+    let limit_idx = args.len() + 1;
+    sql.push_str(&limit_idx.to_string());
 
     let mut query = sqlx::query(&sql);
     for a in &args {
         query = query.bind(a);
     }
+    query = query.bind(limit);
     let rows = query
         .fetch_all(pool)
         .await
@@ -839,17 +841,17 @@ pub async fn alert_events(
         LEFT JOIN computers c ON c.id = ae.computer_id
         {}
         ORDER BY ae.fired_at DESC
-        LIMIT {}
+        LIMIT $1
         "#,
         if only_active {
             "WHERE ae.resolved_at IS NULL"
         } else {
             ""
         },
-        limit,
     );
 
     let rows = sqlx::query(&sql)
+        .bind(limit)
         .fetch_all(pool)
         .await
         .map_err(|e| db_err("alert_events", e))?;

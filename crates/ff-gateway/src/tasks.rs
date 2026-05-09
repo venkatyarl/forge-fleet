@@ -150,11 +150,10 @@ fn build_chat_payload(task_def: &TaskDef, req: &TaskRequest) -> Value {
         "stream": req.stream.unwrap_or(false),
     });
 
-    if let Some(ref model) = req.model {
-        if !model.eq_ignore_ascii_case("auto") {
+    if let Some(ref model) = req.model
+        && !model.eq_ignore_ascii_case("auto") {
             payload["model"] = json!(model);
         }
-    }
 
     if req.output_format.as_deref() == Some("json") {
         payload["response_format"] = json!({ "type": "json_object" });
@@ -237,9 +236,9 @@ async fn handle_task_inner(
     let mut body = build_chat_payload(task_def, &req);
 
     // ── 3a. Direct model routing if a specific model was requested ───────────
-    if let Some(ref model) = req.model {
-        if !model.eq_ignore_ascii_case("auto") {
-            if let Some(ref router) = state.pulse_router {
+    if let Some(ref model) = req.model
+        && !model.eq_ignore_ascii_case("auto")
+            && let Some(ref router) = state.pulse_router {
                 let cache = state.pulse_cache.as_deref();
                 let pg = state.operational_store.as_ref().and_then(|s| s.pg_pool());
                 match router.route_completion_cached(body.clone(), cache, pg).await {
@@ -278,8 +277,6 @@ async fn handle_task_inner(
                     }
                 }
             }
-        }
-    }
 
     // ── 3b. Capability-based fleet routing ───────────────────────────────────
     let pool = match state.operational_store.as_ref().and_then(|s| s.pg_pool()) {

@@ -83,13 +83,15 @@ pub async fn webhook_http_handler(
     Json(payload): Json<Value>,
 ) -> Result<Json<WebhookAcceptedResponse>, (StatusCode, Json<Value>)> {
     // Generic webhook auth: require X-Webhook-Secret when FF_WEBHOOK_SECRET is configured.
+    // Uses constant-time comparison to prevent timing attacks.
     let expected = std::env::var("FF_WEBHOOK_SECRET").unwrap_or_default();
     if !expected.is_empty() {
         let provided = headers
             .get("x-webhook-secret")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        if provided != expected {
+        use subtle::ConstantTimeEq;
+        if !bool::from(provided.as_bytes().ct_eq(expected.as_bytes())) {
             return Err((
                 StatusCode::UNAUTHORIZED,
                 Json(json!({

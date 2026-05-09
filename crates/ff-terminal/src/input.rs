@@ -307,15 +307,13 @@ impl InputState {
     /// one `/`, regardless of how many slashes the user typed or whether the
     /// stored command name itself contained a leading slash.
     pub fn accept_suggestion(&mut self) {
-        if let Some(idx) = self.suggestion_index {
-            if let Some(suggestion) = self.suggestions.get(idx) {
-                if let Some(cmd) = suggestion.split(' ').next() {
+        if let Some(idx) = self.suggestion_index
+            && let Some(suggestion) = self.suggestions.get(idx)
+                && let Some(cmd) = suggestion.split(' ').next() {
                     let cmd_clean = cmd.trim_start_matches('/');
                     self.text = format!("/{cmd_clean} ");
                     self.cursor = self.text.len();
                 }
-            }
-        }
         self.clear_suggestions();
     }
 

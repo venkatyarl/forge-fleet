@@ -89,7 +89,7 @@ pub async fn handle_fabric_benchmark(
     let (a_ssh_user, _) = ff_agent::fleet_info::fetch_node_ip_user(a)
         .await
         .with_context(|| format!("could not resolve SSH for {}", a))?;
-    let (b_ssh_user, _) = ff_agent::fleet_info::fetch_node_ip_user(b)
+    let (_b_ssh_user, _) = ff_agent::fleet_info::fetch_node_ip_user(b)
         .await
         .with_context(|| format!("could not resolve SSH for {}", b))?;
     let a_lan_ip = a_ssh_user.clone();
@@ -417,7 +417,7 @@ async fn resolve_fabric_endpoints(
         if !akind.ends_with("-fabric") {
             continue;
         }
-        let prefix: String = aip.rsplitn(2, '.').nth(1).unwrap_or("").to_string();
+        let prefix: String = aip.rsplit_once('.').map(|x| x.0).unwrap_or("").to_string();
         if prefix.is_empty() {
             continue;
         }
@@ -425,7 +425,7 @@ async fn resolve_fabric_endpoints(
             if bkind != akind {
                 continue;
             }
-            let bprefix: String = bip.rsplitn(2, '.').nth(1).unwrap_or("").to_string();
+            let bprefix: String = bip.rsplit_once('.').map(|x| x.0).unwrap_or("").to_string();
             if prefix == bprefix && aip != bip {
                 return Ok((
                     aip.clone(),

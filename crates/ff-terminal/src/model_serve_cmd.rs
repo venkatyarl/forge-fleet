@@ -10,6 +10,7 @@ use sqlx::{PgPool, Row};
 use tokio::process::Command;
 use uuid::Uuid;
 
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_model_serve_tp2(
     pg: &PgPool,
     model_id: &str,

@@ -11,6 +11,7 @@ use sqlx::{PgPool, Row};
 use tokio::process::Command;
 use uuid::Uuid;
 
+#[allow(dead_code)]
 pub async fn handle_storage_share(
     pg: &PgPool,
     from_host: &str,
@@ -119,6 +120,7 @@ pub async fn handle_storage_share(
     Ok(())
 }
 
+#[allow(dead_code)]
 async fn run_ssh(user: &str, ip: &str, cmd: &str) -> Result<()> {
     let status = Command::new("ssh")
         .args([

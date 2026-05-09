@@ -894,6 +894,13 @@ async fn run_shell_payload(
         .ok_or(TaskRunnerError::BadPayload("command"))?
         .to_string();
 
+    // Security: block obviously destructive commands (same list as BashTool).
+    if is_blocked_command(&command) {
+        return Err(TaskRunnerError::BadPayload(Box::leak(
+            "Command blocked for safety: potentially destructive operation".to_string().into_boxed_str()
+        )));
+    }
+
     let shell = payload
         .get("shell")
         .and_then(Value::as_str)
@@ -1449,4 +1456,25 @@ struct WaveTarget {
     /// right Phase-2 restart command (systemctl vs launchctl).
     os_family: String,
     playbook_command: String,
+}
+
+/// Block obviously destructive shell commands.
+fn is_blocked_command(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    let blocked = [
+        "rm -rf /",
+        "rm -rf /*",
+        "mkfs.",
+        ":(){ :|:& };:",
+        "dd if=/dev/zero of=/dev/sd",
+        "dd if=/dev/random of=/dev/sd",
+        "> /dev/sda",
+        "shutdown -h",
+        "shutdown now",
+        "reboot",
+        "halt",
+        "init 0",
+        "init 6",
+    ];
+    blocked.iter().any(|b| lower.contains(b))
 }

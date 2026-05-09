@@ -166,8 +166,8 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
     );
 
     // ─── Postgres fleet config seed (fleet.toml → Postgres, first boot only) ──
-    if config.database.mode != DatabaseMode::EmbeddedSqlite {
-        if let Some(pg_pool) = operational_store.pg_pool() {
+    if config.database.mode != DatabaseMode::EmbeddedSqlite
+        && let Some(pg_pool) = operational_store.pg_pool() {
             ff_db::run_postgres_migrations(pg_pool)
                 .await
                 .context("postgres fleet-config migrations failed")?;
@@ -217,7 +217,6 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
                 );
             }
         }
-    }
 
     // ─── Config hot-reload handle ────────────────────────────────────────────
     let (config_handle, config_tx) = ConfigHandle::new(config.clone(), config_path.clone());
@@ -254,8 +253,8 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
     seed_registry_from_config(&config, &registry);
 
     // If Postgres is available, also seed from DB (more authoritative)
-    if let Some(pg_pool) = operational_store.pg_pool() {
-        if let Ok(db_nodes) = ff_db::pg_list_nodes(pg_pool).await {
+    if let Some(pg_pool) = operational_store.pg_pool()
+        && let Ok(db_nodes) = ff_db::pg_list_nodes(pg_pool).await {
             let default_port = config.fleet.api_port;
             for node in &db_nodes {
                 if let Ok(ip) = node.ip.parse::<std::net::IpAddr>() {
@@ -272,7 +271,6 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
                 }
             }
         }
-    }
 
     // 1) discovery — fleet node scanning + subnet scanning
     info!("starting subsystem: discovery");
@@ -348,7 +346,7 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         let shutdown = shutdown_rx.clone();
         subsystem_tasks.push(tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(10)).await;
-            let gateway = format!("http://127.0.0.1:51002");
+            let gateway = "http://127.0.0.1:51002".to_string();
             let client = match reqwest::Client::builder().timeout(Duration::from_secs(30)).build() {
                 Ok(c) => c,
                 Err(e) => {
@@ -456,9 +454,9 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         // bot token from fleet_secrets (`telegram.bot_token`) and export it
         // via the configured env var so resolve_bot_token() finds it. Keeps
         // secrets out of shell rc files and launchd plists.
-        if let Some(tg) = config.transport.telegram.as_ref() {
-            if tg.resolve_bot_token().is_none() {
-                if let Some(pg_pool) = operational_store.pg_pool() {
+        if let Some(tg) = config.transport.telegram.as_ref()
+            && tg.resolve_bot_token().is_none()
+                && let Some(pg_pool) = operational_store.pg_pool() {
                     match ff_db::pg_get_secret(pg_pool, "telegram.bot_token").await {
                         Ok(Some(token)) if !token.trim().is_empty() => {
                             let key = if tg.bot_token_env.trim().is_empty() {
@@ -475,8 +473,6 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
                         Err(e) => error!(error = %e, "fleet_secrets lookup failed"),
                     }
                 }
-            }
-        }
         info!("starting subsystem: telegram transport");
         subsystem_tasks.push(start_telegram_transport_subsystem(
             config.clone(),
@@ -913,8 +909,8 @@ fn redact_database_url(raw: &str) -> String {
         return "<empty>".to_string();
     }
 
-    if let Some((scheme, rest)) = trimmed.split_once("://") {
-        if let Some((userinfo, host_part)) = rest.split_once('@') {
+    if let Some((scheme, rest)) = trimmed.split_once("://")
+        && let Some((userinfo, host_part)) = rest.split_once('@') {
             let redacted_userinfo = if let Some((user, _)) = userinfo.split_once(':') {
                 format!("{user}:***")
             } else {
@@ -922,7 +918,6 @@ fn redact_database_url(raw: &str) -> String {
             };
             return format!("{scheme}://{redacted_userinfo}@{host_part}");
         }
-    }
 
     "***".to_string()
 }
@@ -1235,9 +1230,9 @@ fn start_leader_election_subsystem(
 
                     // Periodic election check — failover or preferred-return.
                     if let Some(ref leader) = current_leader {
-                        if let Some(result) = check_failover(leader, &config, &health) {
-                            if let Some(ref new_leader) = result.elected {
-                                if new_leader != leader {
+                        if let Some(result) = check_failover(leader, &config, &health)
+                            && let Some(ref new_leader) = result.elected
+                                && new_leader != leader {
                                     info!(
                                         old_leader = %leader,
                                         new_leader = %new_leader,
@@ -1247,8 +1242,6 @@ fn start_leader_election_subsystem(
                                     current_leader = Some(new_leader.clone());
                                     announce_leader_to_fleet(new_leader, &config, &registry).await;
                                 }
-                            }
-                        }
                     } else {
                         // No current leader — try to elect one.
                         let result = elect_leader(&config, &health);
@@ -2357,11 +2350,10 @@ async fn start_pulse_v2_subsystems(
                     .await
                     .ok()
                     .flatten();
-            if let Some(l) = is_leader {
-                if l.eq_ignore_ascii_case(&name) {
+            if let Some(l) = is_leader
+                && l.eq_ignore_ascii_case(&name) {
                     caps.insert("leader".to_string());
                 }
-            }
             // FF_* env bag (FF_NODE, FF_SOURCE_TREE, FF_LEADER_NAME,
             // FF_GATEWAY_URL, …) — resolved from the DB so shell tasks
             // never have to embed IPs / paths / users in source.

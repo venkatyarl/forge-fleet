@@ -27,7 +27,7 @@ fn embedding_to_pgvector(vec: &[f32]) -> String {
 /// Uses pgvector `<->` (Euclidean distance) operator.  Results are
 /// scored as `1 / (1 + distance)` so higher = more similar.
 pub async fn vector_search(query: &str, top_k: i64, pg: &PgPool) -> anyhow::Result<Vec<VaultNode>> {
-    let embedding = generate_embedding(query);
+    let embedding = generate_embedding(query).await;
     let embedding_str = embedding_to_pgvector(&embedding);
 
     let rows = sqlx::query(
@@ -67,7 +67,7 @@ pub async fn vector_search(query: &str, top_k: i64, pg: &PgPool) -> anyhow::Resu
 /// - Keyword results are fetched with 2× `top_k` and scored by a flat match bonus.
 /// - Combined score = vector_score×0.6 + keyword_score×0.4 (boosted when both match).
 pub async fn hybrid_search(query: &str, top_k: i64, pg: &PgPool) -> anyhow::Result<Vec<VaultNode>> {
-    let embedding = generate_embedding(query);
+    let embedding = generate_embedding(query).await;
     let embedding_str = embedding_to_pgvector(&embedding);
     let pattern = format!("%{}%", query);
 

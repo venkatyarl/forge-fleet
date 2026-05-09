@@ -6,11 +6,26 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-/// Generate a deterministic fake embedding for testing / infrastructure.
-/// Produces a 384-dimensional vector derived from the hash of `text`.
+/// Generate an embedding for `text`.
 ///
-/// TODO: Replace with real embedding model (e.g. all-MiniLM-L6-v2 via ONNX)
-pub fn generate_embedding(text: &str) -> Vec<f32> {
+/// When `FF_EMBEDDING_ENDPOINT` is set, delegates to an OpenAI-compatible
+/// embedding server (ollama, llama.cpp, etc.).  Otherwise falls back to a
+/// deterministic hash-based vector for testing / offline operation.
+pub async fn generate_embedding(text: &str) -> Vec<f32> {
+    if let (Ok(endpoint), Ok(model)) = (
+        std::env::var("FF_EMBEDDING_ENDPOINT"),
+        std::env::var("FF_EMBEDDING_MODEL"),
+    ) {
+        let client = EmbeddingClient::new(&endpoint, &model);
+        match client.embed(text).await {
+            Ok(vec) => return vec,
+            Err(e) => {
+                tracing::warn!("embedding server failed, falling back to hash stub: {e}");
+            }
+        }
+    }
+
+    // Deterministic fallback for testing / infrastructure.
     let mut hasher = DefaultHasher::new();
     text.hash(&mut hasher);
     let seed = hasher.finish();

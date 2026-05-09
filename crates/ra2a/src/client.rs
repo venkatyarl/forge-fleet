@@ -4,11 +4,16 @@ use crate::card::AgentCard;
 use crate::task::{Task, TaskMessage};
 use reqwest::Client;
 use tracing::{debug, info};
-use uuid::Uuid;
 
 /// Client for Agent-to-Agent protocol calls.
 pub struct A2aClient {
     http: Client,
+}
+
+impl Default for A2aClient {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl A2aClient {

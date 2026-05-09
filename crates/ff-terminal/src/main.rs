@@ -1,3 +1,6 @@
+#![allow(clippy::type_complexity)]
+#![allow(clippy::too_many_arguments)]
+
 //! `ff` — ForgeFleet unified CLI.
 //!
 //! Usage:
@@ -2057,8 +2060,8 @@ enum SecretsCommand {
         #[arg(long)]
         hours: u32,
         /// Required free-form reason. Lands in fleet_secrets.disabled_reason
-        /// + audit log so a future operator can see why the switch was
-        /// flipped.
+        /// + audit log so a future operator can see why the switch
+        ///   was flipped.
         #[arg(long)]
         reason: String,
     },
@@ -2189,7 +2192,7 @@ async fn main() -> Result<()> {
             (explicit_url, None)
         } else {
             let r = ff_agent::inference_router::InferenceRouter::from_config(&config_path).await;
-            let primary = if let Some(url) = r.active_url() {
+            let primary = if let Some(url) = r.active_url().await {
                 url
             } else {
                 detect_llm_from_db_or_local(&config_path).await
@@ -2214,8 +2217,8 @@ async fn main() -> Result<()> {
             .await
         {
             Ok(resp) => {
-                if let Ok(body) = resp.json::<serde_json::Value>().await {
-                    if let Some(id) = body
+                if let Ok(body) = resp.json::<serde_json::Value>().await
+                    && let Some(id) = body
                         .get("data")
                         .and_then(|d| d.as_array())
                         .and_then(|arr| arr.last())
@@ -2224,7 +2227,6 @@ async fn main() -> Result<()> {
                     {
                         model = id.to_string();
                     }
-                }
             }
             Err(_) => {
                 if llm.contains("51005") {
@@ -2810,8 +2812,8 @@ async fn main() -> Result<()> {
                         .await
                         .map_err(|e| anyhow::anyhow!("status: {e}"))?;
                     println!(
-                        "{:<10} {:<14} {:<18} {:<10} {}",
-                        "PROVIDER", "CRED FILE", "FILE MTIME", "IN SECRETS", "TOKEN PREVIEW"
+                        "{:<10} {:<14} {:<18} {:<10} TOKEN PREVIEW",
+                        "PROVIDER", "CRED FILE", "FILE MTIME", "IN SECRETS"
                     );
                     for s in snap {
                         let mtime = s
@@ -2858,8 +2860,8 @@ async fn main() -> Result<()> {
                 OauthCommand::Probe { provider } => {
                     let providers = resolve(&provider)?;
                     println!(
-                        "{:<10} {:<14} {:<5} {}",
-                        "provider", "status", "code", "detail"
+                        "{:<10} {:<14} {:<5} detail",
+                        "provider", "status", "code"
                     );
                     for p in providers {
                         let r = ff_agent::oauth_distributor::probe_one(&pool, p).await;
@@ -3284,14 +3286,13 @@ async fn run_event_loop(
         }
 
         // Check if agent finished
-        if let Some(handle) = &agent_handle {
-            if handle.is_finished() {
-                if let Some(handle) = agent_handle.take() {
-                    if let Ok((session, _)) = handle.await {
+        if let Some(handle) = &agent_handle
+            && handle.is_finished() {
+                if let Some(handle) = agent_handle.take()
+                    && let Ok((session, _)) = handle.await {
                         app.tab_mut().session_id = session.id.to_string();
                         app.tab_mut().session = Some(session);
                     }
-                }
                 event_rx = None;
                 app.tab_mut().is_running = false;
                 app.tab_mut().status = "Ready".into();
@@ -3317,7 +3318,6 @@ async fn run_event_loop(
                     event_rx = Some(rx);
                 }
             }
-        }
 
         // Poll any in-flight async picker load
         poll_picker_load(app);
@@ -3326,7 +3326,7 @@ async fn run_event_loop(
         poll_fleet_health_refresh(app);
 
         // Kick off a fleet health refresh every ~30s (20 fps × 30s = 600 frames).
-        if app.frame % 600 == 0 && app.frame > 0 {
+        if app.frame.is_multiple_of(600) && app.frame > 0 {
             kick_fleet_health_refresh(&app.fleet_nodes);
         }
 
@@ -3540,8 +3540,7 @@ async fn run_event_loop(
                             if let Some(output) = commands.try_execute(&trimmed, &mut session).await
                             {
                                 // Handle Focus Stack / Backlog commands
-                                if output.starts_with("PUSH:") {
-                                    let topic = &output[5..];
+                                if let Some(topic) = output.strip_prefix("PUSH:") {
                                     app.tab_mut().push_focus(
                                         topic,
                                         "",
@@ -3566,8 +3565,7 @@ async fn run_event_loop(
                                             ),
                                         );
                                     }
-                                } else if output.starts_with("BACKLOG_ADD:") {
-                                    let item = &output[12..];
+                                } else if let Some(item) = output.strip_prefix("BACKLOG_ADD:") {
                                     app.tab_mut().add_backlog(
                                         item,
                                         "",
@@ -3765,11 +3763,10 @@ fn summarize_tool_input(tool_name: &str, input_json: &str) -> String {
         _ => "",
     };
 
-    if !key.is_empty() {
-        if let Some(val) = v.get(key).and_then(|v| v.as_str()) {
+    if !key.is_empty()
+        && let Some(val) = v.get(key).and_then(|v| v.as_str()) {
             return truncate_str(val, 60).replace('\n', " ");
         }
-    }
 
     // Fallback: first string value in the object
     if let Some(obj) = v.as_object() {
@@ -4106,11 +4103,10 @@ async fn load_picker_items() -> Result<Vec<ff_terminal::app::ModelPickerItem>, S
 
         let mut nodes_v = a.lib_nodes.clone();
         nodes_v.sort();
-        if let Some((n, _, _, _)) = a.deploy.as_ref() {
-            if !nodes_v.contains(n) {
+        if let Some((n, _, _, _)) = a.deploy.as_ref()
+            && !nodes_v.contains(n) {
                 nodes_v.push(n.clone());
             }
-        }
 
         items.push(ModelPickerItem {
             name: meta.name,
@@ -4437,11 +4433,10 @@ async fn run_headless(
             ff_agent::agent_loop::AgentOutcome::Cancelled => serde_json::json!({"status":"cancelled"}),
         }, "events": events });
         println!("{}", serde_json::to_string_pretty(&result)?);
-    } else if let ff_agent::agent_loop::AgentOutcome::EndTurn { final_message } = &outcome {
-        if !final_message.is_empty() {
+    } else if let ff_agent::agent_loop::AgentOutcome::EndTurn { final_message } = &outcome
+        && !final_message.is_empty() {
             println!("{final_message}");
         }
-    }
     Ok(())
 }
 
@@ -4548,8 +4543,8 @@ fn detect_dropped_content(input: &str) -> String {
 /// then probing each for a healthy connection. Falls back to localhost:55000.
 async fn detect_llm_from_db_or_local(config_path: &std::path::Path) -> String {
     // Try to load fleet.toml to get the database URL
-    if let Ok(toml_str) = std::fs::read_to_string(config_path) {
-        if let Ok(config) = toml::from_str::<ff_core::config::FleetConfig>(&toml_str) {
+    if let Ok(toml_str) = std::fs::read_to_string(config_path)
+        && let Ok(config) = toml::from_str::<ff_core::config::FleetConfig>(&toml_str) {
             let db_url = config.database.url.trim();
             if !db_url.is_empty() {
                 // Query Postgres for fleet nodes and their model ports
@@ -4558,8 +4553,7 @@ async fn detect_llm_from_db_or_local(config_path: &std::path::Path) -> String {
                     .acquire_timeout(Duration::from_secs(3))
                     .connect(db_url)
                     .await
-                {
-                    if let Ok(nodes) = ff_db::pg_list_nodes(&pool).await {
+                    && let Ok(nodes) = ff_db::pg_list_nodes(&pool).await {
                         // Also get models to find ports
                         let models = ff_db::pg_list_models(&pool).await.unwrap_or_default();
 
@@ -4597,8 +4591,8 @@ async fn detect_llm_from_db_or_local(config_path: &std::path::Path) -> String {
                         endpoints.sort_by(|a, b| b.3.cmp(&a.3).then(b.2.cmp(&a.2)));
 
                         for (ip, port, _, _) in &endpoints {
-                            if let Ok(addr) = format!("{ip}:{port}").parse() {
-                                if std::net::TcpStream::connect_timeout(
+                            if let Ok(addr) = format!("{ip}:{port}").parse()
+                                && std::net::TcpStream::connect_timeout(
                                     &addr,
                                     Duration::from_millis(200),
                                 )
@@ -4607,21 +4601,17 @@ async fn detect_llm_from_db_or_local(config_path: &std::path::Path) -> String {
                                     tracing::info!(ip = %ip, port, "auto-detected LLM endpoint from database");
                                     return format!("http://{ip}:{port}");
                                 }
-                            }
                         }
                     }
-                }
             }
         }
-    }
 
     // Fallback: probe localhost
     for port in [55000, 55001, 11434] {
-        if let Ok(addr) = format!("127.0.0.1:{port}").parse() {
-            if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_ok() {
+        if let Ok(addr) = format!("127.0.0.1:{port}").parse()
+            && std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_ok() {
                 return format!("http://127.0.0.1:{port}");
             }
-        }
     }
 
     "http://localhost:55000".into()
@@ -4851,14 +4841,12 @@ fn find_daemon_binary(working_dir: &Path) -> Option<PathBuf> {
     if let Ok(output) = std::process::Command::new("which")
         .arg("forgefleetd")
         .output()
-    {
-        if output.status.success() {
+        && output.status.success() {
             let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if !path.is_empty() {
                 return Some(PathBuf::from(path));
             }
         }
-    }
 
     None
 }
@@ -5142,10 +5130,10 @@ fn truncate(s: &str, max: usize) -> String {
 
 async fn tcp_probe(host: &str, port: u16, timeout: Duration) -> bool {
     let addr = format!("{host}:{port}");
-    match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(&addr)).await {
-        Ok(Ok(_)) => true,
-        _ => false,
-    }
+    matches!(
+        tokio::time::timeout(timeout, tokio::net::TcpStream::connect(&addr)).await,
+        Ok(Ok(_))
+    )
 }
 
 /// Lightweight Redis PING — speaks RESP directly without a redis client dep.
@@ -5271,11 +5259,11 @@ async fn load_fleet_nodes_for_health(c: &AgentSessionConfig) -> Vec<(String, Str
         .unwrap_or_default()
         .join(".forgefleet/fleet.toml");
 
-    if let Ok(toml_str) = fs::read_to_string(&config_path) {
-        if let Ok(cfg) = toml::from_str::<ff_core::config::FleetConfig>(&toml_str) {
+    if let Ok(toml_str) = fs::read_to_string(&config_path)
+        && let Ok(cfg) = toml::from_str::<ff_core::config::FleetConfig>(&toml_str) {
             let db_url = cfg.database.url.trim().to_string();
-            if !db_url.is_empty() {
-                if let Ok(pool) = sqlx::postgres::PgPoolOptions::new()
+            if !db_url.is_empty()
+                && let Ok(pool) = sqlx::postgres::PgPoolOptions::new()
                     .max_connections(1)
                     .acquire_timeout(Duration::from_secs(3))
                     .connect(&db_url)
@@ -5292,9 +5280,7 @@ async fn load_fleet_nodes_for_health(c: &AgentSessionConfig) -> Vec<(String, Str
                         return rows.into_iter().map(|(n, ip)| (n, ip, 51000u16)).collect();
                     }
                 }
-            }
         }
-    }
 
     // Fallback: probe the local daemon + known hardcoded list
     let _ = c; // suppress unused warning
@@ -5328,8 +5314,8 @@ async fn handle_secrets(cmd: SecretsCommand) -> Result<()> {
                 return Ok(());
             }
             println!(
-                "{:<28} {:<14} {:<20} {}",
-                "KEY", "UPDATED BY", "UPDATED AT", "DESCRIPTION"
+                "{:<28} {:<14} {:<20} DESCRIPTION",
+                "KEY", "UPDATED BY", "UPDATED AT"
             );
             for (key, desc, updated_by, updated_at) in rows {
                 let ts = updated_at.format("%Y-%m-%d %H:%M UTC").to_string();
@@ -5389,8 +5375,8 @@ async fn handle_secrets(cmd: SecretsCommand) -> Result<()> {
                 return Ok(());
             }
             println!(
-                "{:<30} {:>10} {:>5} {}",
-                "KEY", "DAYS_LEFT", "ROT#", "EXPIRES_AT"
+                "{:<30} {:>10} {:>5} EXPIRES_AT",
+                "KEY", "DAYS_LEFT", "ROT#"
             );
             for row in report
                 .already_expired
@@ -5485,13 +5471,11 @@ async fn handle_defer(cmd: DeferCommand) -> Result<()> {
                 return Ok(());
             }
             println!(
-                "{:<38} {:<10} {:<12} {:<16} {:<6} {}",
-                "ID", "STATUS", "TRIGGER", "TARGET", "TRY", "TITLE"
+                "{:<38} {:<10} {:<12} {:<16} {:<6} TITLE",
+                "ID", "STATUS", "TRIGGER", "TARGET", "TRY"
             );
             for r in rows {
-                let trigger = format!(
-                    "{}",
-                    match r.trigger_type.as_str() {
+                let trigger = (match r.trigger_type.as_str() {
                         "node_online" => r
                             .trigger_spec
                             .get("node")
@@ -5505,8 +5489,7 @@ async fn handle_defer(cmd: DeferCommand) -> Result<()> {
                             .unwrap_or("at_time")
                             .to_string(),
                         other => other.to_string(),
-                    }
-                );
+                    }).to_string();
                 let target = r.preferred_node.clone().unwrap_or_else(|| "-".into());
                 println!(
                     "{:<38} {:<10} {:<12} {:<16} {:<6} {}",
@@ -5682,8 +5665,8 @@ async fn handle_model(cmd: ModelCommand) -> Result<()> {
                 return Ok(());
             }
             println!(
-                "{:<28} {:<10} {:<6} {:<7} {}",
-                "ID", "FAMILY", "TIER", "GATED", "NAME"
+                "{:<28} {:<10} {:<6} {:<7} NAME",
+                "ID", "FAMILY", "TIER", "GATED"
             );
             for r in rows {
                 let gated = if r.gated { "yes" } else { "-" };
@@ -5700,8 +5683,8 @@ async fn handle_model(cmd: ModelCommand) -> Result<()> {
                 return Ok(());
             }
             println!(
-                "{:<28} {:<10} {:<6} {:<7} {:<7} {}",
-                "ID", "FAMILY", "TIER", "PARAMS", "GATED", "NAME"
+                "{:<28} {:<10} {:<6} {:<7} {:<7} NAME",
+                "ID", "FAMILY", "TIER", "PARAMS", "GATED"
             );
             for r in rows {
                 let gated = if r.gated { "yes" } else { "-" };
@@ -5718,8 +5701,8 @@ async fn handle_model(cmd: ModelCommand) -> Result<()> {
                 return Ok(());
             }
             println!(
-                "{:<10} {:<28} {:<10} {:<10} {:<10} {}",
-                "NODE", "CATALOG_ID", "RUNTIME", "QUANT", "SIZE", "PATH"
+                "{:<10} {:<28} {:<10} {:<10} {:<10} PATH",
+                "NODE", "CATALOG_ID", "RUNTIME", "QUANT", "SIZE"
             );
             for r in rows {
                 let sz = human_bytes(r.size_bytes as u64);
@@ -5737,8 +5720,8 @@ async fn handle_model(cmd: ModelCommand) -> Result<()> {
                 return Ok(());
             }
             println!(
-                "{:<10} {:<28} {:<10} {:<6} {:<10} {}",
-                "NODE", "CATALOG_ID", "RUNTIME", "PORT", "HEALTH", "STARTED"
+                "{:<10} {:<28} {:<10} {:<6} {:<10} STARTED",
+                "NODE", "CATALOG_ID", "RUNTIME", "PORT", "HEALTH"
             );
             for r in rows {
                 let catalog = r.catalog_id.clone().unwrap_or_else(|| "-".into());
@@ -5786,8 +5769,8 @@ async fn handle_model(cmd: ModelCommand) -> Result<()> {
                 return Ok(());
             }
             println!(
-                "{:<10} {:<24} {:<10} {:<10} {:<10} {}",
-                "NODE", "MODELS_DIR", "FREE", "USED", "MODELS", "SAMPLED"
+                "{:<10} {:<24} {:<10} {:<10} {:<10} SAMPLED",
+                "NODE", "MODELS_DIR", "FREE", "USED", "MODELS"
             );
             for (node, dir, total, used, free, models_sz, ts) in rows {
                 let _ = total;
@@ -6261,7 +6244,7 @@ async fn handle_model(cmd: ModelCommand) -> Result<()> {
                 println!("(no inference servers running)");
                 return Ok(());
             }
-            println!("{:<8} {:<10} {:<8} {}", "PID", "RUNTIME", "PORT", "MODEL");
+            println!("{:<8} {:<10} {:<8} MODEL", "PID", "RUNTIME", "PORT");
             for p in procs {
                 println!(
                     "{:<8} {:<10} {:<8} {}",
@@ -6435,8 +6418,8 @@ async fn handle_model(cmd: ModelCommand) -> Result<()> {
                 human_bytes(plan.total_bytes_freed)
             );
             println!(
-                "{:<38} {:<24} {:<10} {:<10} {}",
-                "LIBRARY_ID", "CATALOG", "RUNTIME", "SIZE", "REASONS"
+                "{:<38} {:<24} {:<10} {:<10} REASONS",
+                "LIBRARY_ID", "CATALOG", "RUNTIME", "SIZE"
             );
             for c in &plan.candidates {
                 println!(
@@ -6516,8 +6499,8 @@ async fn handle_model(cmd: ModelCommand) -> Result<()> {
                 return Ok(());
             }
             println!(
-                "{:<38} {:<10} {:<12} {:<10} {:<7} {}",
-                "ID", "NODE", "KIND", "STATUS", "PCT", "TARGET"
+                "{:<38} {:<10} {:<12} {:<10} {:<7} TARGET",
+                "ID", "NODE", "KIND", "STATUS", "PCT"
             );
             for r in rows {
                 let target = r
@@ -7511,11 +7494,7 @@ async fn finalize_external_tool_event(
 
     // Matches "Installing to /path/to/bin" or "/home/.../bin/<cli>".
     let path_guess: Option<String> = stdout.lines().rev().find_map(|line| {
-        if let Some(rest) = line.strip_prefix("Installing to ") {
-            Some(rest.trim().to_string())
-        } else {
-            None
-        }
+        line.strip_prefix("Installing to ").map(|rest| rest.trim().to_string())
     });
 
     let new_status = if ok { "ok" } else { "install_failed" };
@@ -7530,8 +7509,8 @@ async fn finalize_external_tool_event(
         .filter(|s| !s.is_empty());
 
     let mut mcp_registered = false;
-    if ok && register_as_mcp {
-        if let Some(cmd) = mcp_server_command {
+    if ok && register_as_mcp
+        && let Some(cmd) = mcp_server_command {
             match register_mcp_server(tool_id, cmd).await {
                 Ok(_) => {
                     mcp_registered = true;
@@ -7542,7 +7521,6 @@ async fn finalize_external_tool_event(
                 }
             }
         }
-    }
 
     let _ = sqlx::query(
         "UPDATE computer_external_tools cet
@@ -7682,11 +7660,10 @@ async fn execute_shell(
 
     let mut cmd = TokCmd::new(program);
     cmd.args(&args);
-    if local {
-        if let Some(ws) = workspace {
+    if local
+        && let Some(ws) = workspace {
             cmd.current_dir(ws);
         }
-    }
     let output = cmd.output().await;
     match output {
         Ok(o) => {
@@ -8302,6 +8279,7 @@ async fn handle_fleet_unquarantine(pool: &sqlx::PgPool, computer: &str, yes: boo
 ///   1. `{os_family}-{install_source}`  (e.g. `"macos-brew"`)
 ///   2. `{os_family}`                   (e.g. `"macos"`)
 ///   3. `"all"`
+///
 /// Targets with no matching key are warned about and skipped. Dry-run mode
 /// prints the plan and exits; `--yes` without `--dry-run` enqueues one
 /// deferred shell task per target with trigger_type=`node_online`.
@@ -9061,8 +9039,8 @@ async fn handle_fleet_db_verify_backups(
 
     println!();
     println!(
-        "{:<38} {:<8} {:<10} {:<20} {:<8} {:<8} {}",
-        "ID", "KIND", "SIZE", "CREATED", "CHKSUM", "DECRYPT", "FILE"
+        "{:<38} {:<8} {:<10} {:<20} {:<8} {:<8} FILE",
+        "ID", "KIND", "SIZE", "CREATED", "CHKSUM", "DECRYPT"
     );
     let mut most_recent_pg: Option<BackupRow> = None;
     for (id, kind, file_name, size_bytes, checksum_sha256, created_at, tier) in rows {
@@ -9580,8 +9558,8 @@ async fn handle_fleet_migrate_source_trees(
     }
 
     println!(
-        "\n  {:<14} {:<16} {:<7} {:<10} {:<10} {}",
-        "node", "ip", "ssh", "legacy", "canonical", "action"
+        "\n  {:<14} {:<16} {:<7} {:<10} {:<10} action",
+        "node", "ip", "ssh", "legacy", "canonical"
     );
     let mut to_enqueue: Vec<&Probed> = Vec::new();
     for p in &probed {
@@ -9877,7 +9855,7 @@ async fn handle_fleet_revive(
                 println!("{YELLOW}— skipped: {reason}{RESET}");
             }
             ff_agent::revive::ReviveOutcome::Failed(reason) => {
-                println!("{}✗ failed: {reason}{RESET}", "\x1b[31m");
+                println!("\x1b[31m✗ failed: {reason}{RESET}");
             }
         }
     }
@@ -9887,11 +9865,10 @@ async fn handle_fleet_revive(
 /// Resolve the Redis URL for Pulse reads. Prefers `$FORGEFLEET_REDIS_URL`,
 /// then `~/.forgefleet/fleet.toml` `[redis] url`, then a localhost fallback.
 fn resolve_pulse_redis_url() -> String {
-    if let Ok(url) = std::env::var("FORGEFLEET_REDIS_URL") {
-        if !url.trim().is_empty() {
+    if let Ok(url) = std::env::var("FORGEFLEET_REDIS_URL")
+        && !url.trim().is_empty() {
             return url;
         }
-    }
     const FALLBACK: &str = "redis://localhost:6380";
     let Some(home) = dirs::home_dir() else {
         return FALLBACK.to_string();
@@ -9950,13 +9927,12 @@ async fn handle_fleet_leader(pool: &sqlx::PgPool, json: bool) -> Result<()> {
     // Pulse info: alive + yielding from beats.
     let mut alive_map: std::collections::HashMap<String, (bool, bool)> =
         std::collections::HashMap::new();
-    if let Ok(reader) = pulse_reader() {
-        if let Ok(beats) = reader.all_beats().await {
+    if let Ok(reader) = pulse_reader()
+        && let Ok(beats) = reader.all_beats().await {
             for b in beats {
                 alive_map.insert(b.computer_name.clone(), (!b.going_offline, b.is_yielding));
             }
         }
-    }
 
     if json {
         let cur = leader.as_ref().map(|l| {
@@ -11019,8 +10995,8 @@ async fn handle_social(cmd: SocialCommand) -> Result<()> {
             let rows = q.fetch_all(&pool).await?;
 
             println!(
-                "{:<38} {:<10} {:<10} {:<16} {}",
-                "id", "platform", "status", "by", "ingested_at"
+                "{:<38} {:<10} {:<10} {:<16} ingested_at",
+                "id", "platform", "status", "by"
             );
             for (id, url, platform, status, by, at) in &rows {
                 let url_short: String = url.chars().take(60).collect();
@@ -11109,11 +11085,10 @@ async fn handle_social(cmd: SocialCommand) -> Result<()> {
                 let path = m.get("local_path").and_then(|v| v.as_str()).unwrap_or("?");
                 println!("  • [{kind}] {path}");
             }
-            if let Some(t) = extracted_text {
-                if !t.trim().is_empty() {
+            if let Some(t) = extracted_text
+                && !t.trim().is_empty() {
                     println!("\n{CYAN}extracted_text{RESET}\n{t}");
                 }
-            }
             if let Some(a) = analysis {
                 let pretty = serde_json::to_string_pretty(&a).unwrap_or_default();
                 println!("\n{CYAN}analysis{RESET}\n{pretty}");
@@ -11542,8 +11517,8 @@ async fn handle_ports_list(
     }
 
     println!(
-        "{:<6} {:<22} {:<18} {:<26} {:<10} {:<11} {}",
-        "PORT", "SERVICE", "KIND", "EXPOSED_ON", "SCOPE", "STATUS", "DESCRIPTION",
+        "{:<6} {:<22} {:<18} {:<26} {:<10} {:<11} DESCRIPTION",
+        "PORT", "SERVICE", "KIND", "EXPOSED_ON", "SCOPE", "STATUS",
     );
     println!("  {}", "-".repeat(130));
 
@@ -11816,8 +11791,8 @@ async fn handle_cloud_llm_list(pool: &sqlx::PgPool, json: bool) -> Result<()> {
     }
 
     println!(
-        "{:<12} {:<22} {:<14} {:<10} {:<22} {:<7} {}",
-        "ID", "NAME", "MODEL_PREFIX", "AUTH", "REQUEST_FORMAT", "ENABLED", "SECRET",
+        "{:<12} {:<22} {:<14} {:<10} {:<22} {:<7} SECRET",
+        "ID", "NAME", "MODEL_PREFIX", "AUTH", "REQUEST_FORMAT", "ENABLED",
     );
     println!("  {}", "-".repeat(110));
     for (p, has_key) in &enriched {
@@ -12279,8 +12254,8 @@ async fn handle_openclaw(cmd: OpenclawCommand) -> Result<()> {
             }
 
             println!(
-                "{:<14} {:<16} {:<8} {:<34} {:<22} {}",
-                "NAME", "IP", "MODE", "GATEWAY URL", "LAST RECONFIG", "OPENCLAW"
+                "{:<14} {:<16} {:<8} {:<34} {:<22} OPENCLAW",
+                "NAME", "IP", "MODE", "GATEWAY URL", "LAST RECONFIG"
             );
             for (name, ip, mode, url, reconfigured, version) in rows {
                 let mode_s = mode.as_deref().unwrap_or("-");
@@ -12391,11 +12366,10 @@ async fn handle_openclaw_devices(pool: &sqlx::PgPool, cmd: OpenclawDevicesComman
 
             println!("{GREEN}✓{RESET} imported {n} device(s)");
 
-            if from_secret {
-                if let Err(e) = ff_agent::openclaw::clear_device_pairings_export(pool).await {
+            if from_secret
+                && let Err(e) = ff_agent::openclaw::clear_device_pairings_export(pool).await {
                     eprintln!("{YELLOW}warning:{RESET} failed to clear stashed secret: {e}");
                 }
-            }
         }
     }
     Ok(())
@@ -12430,8 +12404,8 @@ async fn handle_agent(cmd: AgentCommand) -> Result<()> {
                 return Ok(());
             }
             println!(
-                "{:<14} {:<4} {:<8} {:<36} {}",
-                "COMPUTER", "SLOT", "STATUS", "ID", "WORKSPACE"
+                "{:<14} {:<4} {:<8} {:<36} WORKSPACE",
+                "COMPUTER", "SLOT", "STATUS", "ID"
             );
             for r in rows {
                 println!(
@@ -13048,8 +13022,8 @@ async fn handle_pm(cmd: PmCommand) -> Result<()> {
             }
 
             println!(
-                "{:<38} {:<14} {:<6} {:<10} {:<8} {:<14} {}",
-                "ID", "PROJECT", "KIND", "STATUS", "PRIORITY", "ASSIGNEE", "TITLE"
+                "{:<38} {:<14} {:<6} {:<10} {:<8} {:<14} TITLE",
+                "ID", "PROJECT", "KIND", "STATUS", "PRIORITY", "ASSIGNEE"
             );
             for (id, pid, kind, title, st, prio, asgn, _created) in rows {
                 let title_clip = if title.chars().count() > 60 {
@@ -13250,13 +13224,11 @@ async fn handle_pm_import_claude_tasks(
                 if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
                     continue;
                 }
-                if let Ok(md) = e.metadata() {
-                    if let Ok(mtime) = md.modified() {
-                        if newest.as_ref().map(|(_, t)| mtime > *t).unwrap_or(true) {
+                if let Ok(md) = e.metadata()
+                    && let Ok(mtime) = md.modified()
+                        && newest.as_ref().map(|(_, t)| mtime > *t).unwrap_or(true) {
                             newest = Some((path, mtime));
                         }
-                    }
-                }
             }
         }
         newest
@@ -13436,8 +13408,8 @@ async fn handle_project(cmd: ProjectCommand) -> Result<()> {
             }
 
             println!(
-                "{:<14} {:<14} {:<8} {:<10} {:<18} {}",
-                "ID", "NAME", "BRANCH", "SHA", "SYNCED", "REPO"
+                "{:<14} {:<14} {:<8} {:<10} {:<18} REPO",
+                "ID", "NAME", "BRANCH", "SHA", "SYNCED"
             );
             let now = chrono::Utc::now();
             for (id, name, repo, branch, sha, synced, _status) in rows {
@@ -13530,8 +13502,8 @@ async fn handle_project(cmd: ProjectCommand) -> Result<()> {
                 println!();
                 println!("{CYAN}Branches ({}){RESET}", branches.len());
                 println!(
-                    "  {:<30} {:<10} {:<6} {:<8} {}",
-                    "BRANCH", "SHA", "PR#", "PR STATE", "PR URL"
+                    "  {:<30} {:<10} {:<6} {:<8} PR URL",
+                    "BRANCH", "SHA", "PR#", "PR STATE"
                 );
                 for (br, sha, num, st, url, _status) in branches {
                     let sha_s = sha.as_deref().map(|s| &s[..s.len().min(8)]).unwrap_or("-");
@@ -13684,8 +13656,8 @@ async fn handle_onboard(cmd: OnboardCommand) -> Result<()> {
             let mut sorted: Vec<&ff_db::FleetNodeRow> = nodes.iter().collect();
             sorted.sort_by(|a, b| b.election_priority.cmp(&a.election_priority));
             println!(
-                "{:<15} {:<16} {:<10} {:<6} {}",
-                "NAME", "IP", "RUNTIME", "PRIO", "GH"
+                "{:<15} {:<16} {:<10} {:<6} GH",
+                "NAME", "IP", "RUNTIME", "PRIO"
             );
             for n in sorted.into_iter().take(limit as usize) {
                 println!(
@@ -14405,8 +14377,8 @@ async fn handle_task(cmd: TaskCommand, _config_path: &Path) -> Result<()> {
 
             println!("{GREEN}✓ Tasks ({} shown){RESET}", tasks.len());
             println!(
-                "  {:<6} {:<40} {:<12} {:<16} {}",
-                "ID", "SUBJECT", "STATUS", "NODE", "CREATED"
+                "  {:<6} {:<40} {:<12} {:<16} CREATED",
+                "ID", "SUBJECT", "STATUS", "NODE"
             );
             println!("  {}", "-".repeat(95));
             for t in &tasks {
@@ -14464,11 +14436,10 @@ async fn handle_task(cmd: TaskCommand, _config_path: &Path) -> Result<()> {
                     println!("  status:      {status}");
                     println!("  origin_node: {node}");
                     println!("  created:     {created}");
-                    if let Some(output) = t.get("output").and_then(|v| v.as_str()) {
-                        if !output.is_empty() {
+                    if let Some(output) = t.get("output").and_then(|v| v.as_str())
+                        && !output.is_empty() {
                             println!("\n  Output:\n    {}", truncate_str(output, 500));
                         }
-                    }
                 }
             }
         }
@@ -14721,8 +14692,8 @@ async fn handle_alert(cmd: AlertCommand) -> Result<()> {
                 return Ok(());
             }
             println!(
-                "{:<20} {:<18} {:<12} {:<10} {}",
-                "FIRED", "POLICY", "COMPUTER", "STATE", "MESSAGE"
+                "{:<20} {:<18} {:<12} {:<10} MESSAGE",
+                "FIRED", "POLICY", "COMPUTER", "STATE"
             );
             for (_id, policy, computer, fired_at, resolved_at, _v, _vt, message, _cr) in rows {
                 let state = if resolved_at.is_some() {
@@ -14991,8 +14962,8 @@ async fn handle_storage(cmd: StorageCommand) -> Result<()> {
                     return Ok(());
                 }
                 println!(
-                    "{:<18} {:<10} {:<22} {:<18} {:<7} {}",
-                    "NAME", "HOST", "EXPORT", "PURPOSE", "RO", "MOUNTS"
+                    "{:<18} {:<10} {:<22} {:<18} {:<7} MOUNTS",
+                    "NAME", "HOST", "EXPORT", "PURPOSE", "RO"
                 );
                 for s in shares {
                     let mounts = if s.mounts.is_empty() {
@@ -15094,8 +15065,8 @@ async fn handle_power(cmd: PowerCommand) -> Result<()> {
                 return Ok(());
             }
             println!(
-                "{:<38} {:<10} {:<9} {:<18} {:<10} {}",
-                "ID", "COMPUTER", "KIND", "CRON", "ENABLED", "LAST"
+                "{:<38} {:<10} {:<9} {:<18} {:<10} LAST",
+                "ID", "COMPUTER", "KIND", "CRON", "ENABLED"
             );
             for r in rows {
                 let last = r
@@ -15199,8 +15170,8 @@ async fn handle_train(cmd: TrainCommand) -> Result<()> {
                 return Ok(());
             }
             println!(
-                "{:<38} {:<22} {:<12} {:<10} {:<10} {}",
-                "ID", "NAME", "STATUS", "TYPE", "COMPUTER", "CREATED"
+                "{:<38} {:<22} {:<12} {:<10} {:<10} CREATED",
+                "ID", "NAME", "STATUS", "TYPE", "COMPUTER"
             );
             for r in rows {
                 let created = r.created_at.format("%Y-%m-%d %H:%M").to_string();
@@ -15292,20 +15263,16 @@ async fn handle_research(
         .await
         .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
 
-    let mut config = ff_agent::research::ResearchConfig::default();
-    config.query = prompt.to_string();
-    config.parallel = parallel;
-    config.depth = depth;
-    config.output_path = output;
-    if let Some(g) = gateway {
-        config.gateway_url = g;
-    }
-    if let Some(m) = planner_model {
-        config.planner_model = m;
-    }
-    if let Some(m) = subagent_model {
-        config.subagent_model = m;
-    }
+    let config = ff_agent::research::ResearchConfig {
+        query: prompt.to_string(),
+        parallel,
+        depth,
+        output_path: output,
+        gateway_url: gateway.unwrap_or_default(),
+        planner_model: planner_model.unwrap_or_default(),
+        subagent_model: subagent_model.unwrap_or_default(),
+        ..Default::default()
+    };
 
     eprintln!(
         "{CYAN}▶ ff research{RESET}  \x1b[2mparallel={parallel} depth={depth} \

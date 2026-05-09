@@ -132,8 +132,8 @@ pub async fn try_route_to_cloud(
     // for `oauth_subscription` and `local_bridge` rows since those don't
     // accumulate `cost_usd` (subscription = $0/call). Also skipped when
     // the secret is unset, so default behavior is unchanged.
-    if provider.auth_kind == "api_key" {
-        if let Some(cap) = pg_get_secret(pool, "budget.daily_usd_cap")
+    if provider.auth_kind == "api_key"
+        && let Some(cap) = pg_get_secret(pool, "budget.daily_usd_cap")
             .await
             .ok()
             .flatten()
@@ -162,7 +162,6 @@ pub async fn try_route_to_cloud(
                 )));
             }
         }
-    }
 
     // Resolve the bearer token (or pass-through for local_bridge) based
     // on auth_kind. Three supported variants today (V53):

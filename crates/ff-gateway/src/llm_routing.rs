@@ -374,10 +374,10 @@ impl PulseLlmRouter {
 /// can be matched against user-supplied model names.
 ///
 /// Handles (at least):
-/// - Ollama tags:  `qwen2.5-coder:14b`        → `qwen2.5-coder`
-/// - GGUF files:   `Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf`
-///                                             → `qwen3-coder-30b-a3b-instruct`
-/// - Mixed case + underscore separators        → lowercased, dashed
+/// - Ollama tags: `qwen2.5-coder:14b` → `qwen2.5-coder`
+/// - GGUF files: `Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf` →
+///   `qwen3-coder-30b-a3b-instruct`
+/// - Mixed case + underscore separators → lowercased, dashed
 /// - Common llama.cpp/HF quantization suffixes are stripped so a bare
 ///   family name (`qwen3-coder-30b-a3b`) prefix-matches the richer id.
 pub(crate) fn normalize_model_id(raw: &str) -> String {
@@ -742,6 +742,12 @@ impl LlmRoutingCache {
     #[allow(dead_code)]
     pub async fn len(&self) -> usize {
         self.cache.read().await.len()
+    }
+
+    /// Test/diagnostics helper: true when the cache has no entries.
+    #[allow(dead_code)]
+    pub async fn is_empty(&self) -> bool {
+        self.cache.read().await.is_empty()
     }
 }
 

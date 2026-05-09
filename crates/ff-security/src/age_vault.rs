@@ -100,7 +100,7 @@ mod tests {
     #[test]
     fn round_trip() {
         let kp = generate_keypair();
-        let secret = "postgresql://user:pass@host/db";
+        let secret = "postgresql://user:test_pass_only@host/db";
         let encrypted = encrypt_to_recipients(secret, &[kp.recipient.clone()]).unwrap();
         let decrypted = decrypt(&encrypted, &kp.identity).unwrap();
         assert_eq!(decrypted, secret);
@@ -110,7 +110,7 @@ mod tests {
     fn multi_recipient() {
         let alice = generate_keypair();
         let bob = generate_keypair();
-        let secret = "multi-recipient secret";
+        let secret = "multi-recipient test secret only";
         let encrypted = encrypt_to_recipients(secret, &[alice.recipient.clone(), bob.recipient.clone()]).unwrap();
         assert_eq!(decrypt(&encrypted, &alice.identity).unwrap(), secret);
         assert_eq!(decrypt(&encrypted, &bob.identity).unwrap(), secret);

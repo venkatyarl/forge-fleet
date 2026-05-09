@@ -738,6 +738,7 @@ struct HealthResponse {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[derive(Default)]
 struct TelegramTransportStatus {
     enabled: bool,
     running: bool,
@@ -751,22 +752,6 @@ struct TelegramTransportStatus {
     last_error: Option<String>,
 }
 
-impl Default for TelegramTransportStatus {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            running: false,
-            allowed_chat_ids: Vec::new(),
-            polling_interval_secs: None,
-            polling_timeout_secs: None,
-            media_download_dir: None,
-            started_at: None,
-            last_update_id: None,
-            last_message_at: None,
-            last_error: None,
-        }
-    }
-}
 
 async fn health(State(state): State<Arc<GatewayState>>) -> Json<HealthResponse> {
     let telegram_transport = telegram_transport_snapshot(state.as_ref()).await;
@@ -2448,6 +2433,7 @@ fn assemble_fleet_status_payload(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_fleet_node_view(
     node: &FleetNode,
     leader_hint: Option<&str>,
@@ -3055,11 +3041,10 @@ fn derive_models_loaded(
         }
     }
 
-    if ids.is_empty() {
-        if let Some(db_models) = db_node.map(|db| db.models.clone()) {
+    if ids.is_empty()
+        && let Some(db_models) = db_node.map(|db| db.models.clone()) {
             ids = db_models;
         }
-    }
 
     if ids.is_empty() {
         (Vec::new(), "unreported".to_string())
@@ -3818,7 +3803,7 @@ mod fleet_visibility_tests {
         state.runtime_registry = Some(RuntimeRegistryStore::sqlite(pool.clone()));
 
         let mut cfg = FleetConfig::default();
-        cfg.enrollment.shared_secret = Some("top-secret".to_string());
+        cfg.enrollment.shared_secret = Some("test_shared_secret_only".to_string());
         state.fleet_config = Some(Arc::new(tokio::sync::RwLock::new(cfg)));
 
         let payload = FleetEnrollPayload {
@@ -3863,7 +3848,7 @@ mod fleet_visibility_tests {
         state.runtime_registry = Some(RuntimeRegistryStore::sqlite(pool.clone()));
 
         let mut cfg = FleetConfig::default();
-        cfg.enrollment.shared_secret = Some("top-secret".to_string());
+        cfg.enrollment.shared_secret = Some("test_shared_secret_only".to_string());
         cfg.enrollment.default_role = Some("worker".to_string());
         state.fleet_config = Some(Arc::new(tokio::sync::RwLock::new(cfg)));
 
@@ -3890,7 +3875,7 @@ mod fleet_visibility_tests {
         let mut headers = HeaderMap::new();
         headers.insert(
             "x-fleet-enrollment-token",
-            header::HeaderValue::from_static("top-secret"),
+            header::HeaderValue::from_static("test_shared_secret_only"),
         );
 
         let Json(response) = fleet_enroll(State(Arc::new(state)), headers, Json(payload))
@@ -4438,8 +4423,8 @@ async fn proxy_chat_completions(
     // When ?async=true, enqueue the request as a fleet_task and return
     // a ticket immediately. The caller polls /v1/async/{ticket} or
     // receives a webhook when complete.
-    if query.async_mode == Some(true) {
-        if let Some(pool) = state.operational_store.as_ref().and_then(|s| s.pg_pool()) {
+    if query.async_mode == Some(true)
+        && let Some(pool) = state.operational_store.as_ref().and_then(|s| s.pg_pool()) {
             let model = raw_payload.get("model").and_then(|v| v.as_str()).unwrap_or("unknown");
             let summary = format!("async chat completion ({model})");
             let task_id: Uuid = sqlx::query_scalar(
@@ -4465,7 +4450,6 @@ async fn proxy_chat_completions(
             });
             return Ok(Json(ticket).into_response());
         }
-    }
 
     // ── Cloud-LLM routing (first pass) ───────────────────────────────
     //
@@ -4476,9 +4460,8 @@ async fn proxy_chat_completions(
     // skip straight to Pulse.
     if let Some(store) = state.operational_store.as_ref()
         && let Some(pool) = store.pg_pool()
-    {
-        if let Some(model) = raw_payload.get("model").and_then(|v| v.as_str()) {
-            if let Some(result) =
+        && let Some(model) = raw_payload.get("model").and_then(|v| v.as_str())
+            && let Some(result) =
                 crate::cloud_llm::try_route_to_cloud(pool, model, &raw_payload, None).await
             {
                 match result {
@@ -4486,8 +4469,6 @@ async fn proxy_chat_completions(
                     Err(resp) => return Ok(resp),
                 }
             }
-        }
-    }
 
     // ── Qwen3 thinking-mode max_tokens floor ─────────────────────────
     //
@@ -4617,8 +4598,8 @@ async fn proxy_chat_completions(
         // the fleet_model_library table. This makes `ff model download <x>`
         // followed by a chat request with `model: "<x>"` Just Work — the
         // router will spawn the inference server on demand.
-        if escalation_chain.is_empty() {
-            if let (Some(store), Some(registry)) = (
+        if escalation_chain.is_empty()
+            && let (Some(store), Some(registry)) = (
                 state.operational_store.as_ref(),
                 state.api_registry.as_ref(),
             ) && let Some(pool) = store.pg_pool()
@@ -4652,7 +4633,6 @@ async fn proxy_chat_completions(
                     }
                 }
             }
-        }
 
         if escalation_chain.is_empty() {
             return Err((
@@ -5109,8 +5089,8 @@ async fn list_models(
     }
 
     // 2) Operational store models (Postgres)
-    if let Some(store) = state.operational_store.as_ref() {
-        if let Some(pool) = store.pg_pool() {
+    if let Some(store) = state.operational_store.as_ref()
+        && let Some(pool) = store.pg_pool() {
             match sqlx::query("SELECT slug, tier FROM fleet_models")
                 .fetch_all(pool)
                 .await
@@ -5129,7 +5109,6 @@ async fn list_models(
                 }
             }
         }
-    }
 
     let data: Vec<Value> = model_map
         .into_iter()
@@ -5327,6 +5306,7 @@ async fn route_fleet_capability(
         .trim()
         .to_lowercase();
 
+    #[allow(clippy::type_complexity)]
     let mut scored: Vec<(i32, i32, i32, f64, String, String, String, String, Value, &Value)> = Vec::new();
     let mut alternatives: Vec<AlternativeCandidate> = Vec::new();
 
@@ -6198,8 +6178,19 @@ async fn create_agent_session(
         });
 
     // Security: validate working_dir is not trying to escape to system paths.
+    // Rejects both raw path traversal and canonicalized system directories.
+    let forbidden = ["/etc", "/usr", "/bin", "/sbin", "/lib", "/lib64", "/sys", "/dev", "/proc", "/var/log", "/var/spool", "/boot"];
+    let raw = working_dir.to_string_lossy();
+    for prefix in &forbidden {
+        if raw.starts_with(prefix) {
+            return Err((StatusCode::FORBIDDEN, Json(json!({"error": format!("working_dir cannot be under {}", prefix)}))));
+        }
+    }
+    // Reject obvious path-traversal sequences in the raw path.
+    if raw.split('/').any(|s| s == "..") {
+        return Err((StatusCode::FORBIDDEN, Json(json!({"error": "working_dir contains path traversal ('..')"}))));
+    }
     if let Ok(canonical) = working_dir.canonicalize() {
-        let forbidden = ["/etc", "/usr", "/bin", "/sbin", "/lib", "/sys", "/dev", "/proc", "/var/log"];
         for prefix in &forbidden {
             if canonical.starts_with(prefix) {
                 return Err((StatusCode::FORBIDDEN, Json(json!({"error": format!("working_dir cannot be under {}", prefix)}))));

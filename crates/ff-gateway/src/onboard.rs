@@ -145,18 +145,15 @@ pub async fn bootstrap_script(
     let github_owner: String = {
         let mut found: Option<String> = None;
         if let Some(pool) = state.operational_store.as_ref().and_then(|os| os.pg_pool()) {
-            if let Ok(Some(v)) = ff_db::pg_get_setting(pool, "github.default_owner").await {
-                if let Some(s) = v.as_str() {
+            if let Ok(Some(v)) = ff_db::pg_get_setting(pool, "github.default_owner").await
+                && let Some(s) = v.as_str() {
                     found = Some(s.to_string());
                 }
-            }
-            if found.is_none() {
-                if let Ok(Some(s)) = ff_db::pg_get_secret(pool, "github.default_owner").await {
-                    if !s.is_empty() {
+            if found.is_none()
+                && let Ok(Some(s)) = ff_db::pg_get_secret(pool, "github.default_owner").await
+                    && !s.is_empty() {
                         found = Some(s);
                     }
-                }
-            }
         }
         found
             .or_else(|| std::env::var("FORGEFLEET_GITHUB_OWNER").ok())
@@ -267,18 +264,15 @@ pub async fn bootstrap_script_ps1(
     let github_owner: String = {
         let mut found: Option<String> = None;
         if let Some(pool) = state.operational_store.as_ref().and_then(|os| os.pg_pool()) {
-            if let Ok(Some(v)) = ff_db::pg_get_setting(pool, "github.default_owner").await {
-                if let Some(s) = v.as_str() {
+            if let Ok(Some(v)) = ff_db::pg_get_setting(pool, "github.default_owner").await
+                && let Some(s) = v.as_str() {
                     found = Some(s.to_string());
                 }
-            }
-            if found.is_none() {
-                if let Ok(Some(s)) = ff_db::pg_get_secret(pool, "github.default_owner").await {
-                    if !s.is_empty() {
+            if found.is_none()
+                && let Ok(Some(s)) = ff_db::pg_get_secret(pool, "github.default_owner").await
+                    && !s.is_empty() {
                         found = Some(s);
                     }
-                }
-            }
         }
         found
             .or_else(|| std::env::var("FORGEFLEET_GITHUB_OWNER").ok())

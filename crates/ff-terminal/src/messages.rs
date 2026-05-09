@@ -122,7 +122,7 @@ pub fn render_assistant_message(text: &str) -> DisplayMessage {
         // Headers
         if line.starts_with("#### ") {
             lines.push(Line::from(Span::styled(
-                format!("  {}", &line[5..]),
+                format!("  {}", line.strip_prefix("#### ").unwrap_or(line)),
                 Style::default()
                     .fg(Color::Rgb(251, 191, 36))
                     .add_modifier(Modifier::BOLD),
@@ -131,7 +131,7 @@ pub fn render_assistant_message(text: &str) -> DisplayMessage {
         }
         if line.starts_with("### ") {
             lines.push(Line::from(Span::styled(
-                format!("  {}", &line[4..]),
+                format!("  {}", line.strip_prefix("### ").unwrap_or(line)),
                 Style::default()
                     .fg(Color::Rgb(251, 191, 36))
                     .add_modifier(Modifier::BOLD),
@@ -140,7 +140,7 @@ pub fn render_assistant_message(text: &str) -> DisplayMessage {
         }
         if line.starts_with("## ") {
             lines.push(Line::from(Span::styled(
-                line[3..].to_string(),
+                line.strip_prefix("## ").unwrap_or(line).to_string(),
                 Style::default()
                     .fg(Color::Rgb(251, 191, 36))
                     .add_modifier(Modifier::BOLD),
@@ -149,7 +149,7 @@ pub fn render_assistant_message(text: &str) -> DisplayMessage {
         }
         if line.starts_with("# ") {
             lines.push(Line::from(Span::styled(
-                line[2..].to_string(),
+                line.strip_prefix("# ").unwrap_or(line).to_string(),
                 Style::default()
                     .fg(Color::Rgb(251, 191, 36))
                     .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
@@ -221,13 +221,13 @@ fn strip_numbered_list(line: &str) -> Option<&str> {
     let trimmed = line.trim_start();
     let mut chars = trimmed.chars();
     // Must start with a digit
-    if !chars.next().map_or(false, |c| c.is_ascii_digit()) {
+    if !chars.next().is_some_and(|c| c.is_ascii_digit()) {
         return None;
     }
     // Consume remaining digits
     let rest = trimmed.trim_start_matches(|c: char| c.is_ascii_digit());
     if rest.starts_with(". ") {
-        Some(&rest[2..])
+        rest.strip_prefix(". ")
     } else {
         None
     }

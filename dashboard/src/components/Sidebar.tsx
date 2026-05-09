@@ -53,6 +53,48 @@ const mainSections: NavSection[] = [
     link: '/cost-ledger',
     items: [],
   },
+  {
+    id: 'fleet',
+    title: 'Fleet',
+    icon: '🚀',
+    items: [
+      { to: '/fleet', label: 'Overview', icon: '📊' },
+      { to: '/topology', label: 'Topology', icon: '🕸️' },
+      { to: '/mesh', label: 'Mesh Status', icon: '🔗' },
+    ],
+  },
+  {
+    id: 'models',
+    title: 'Models & Tools',
+    icon: '🤖',
+    items: [
+      { to: '/model-hub', label: 'Model Hub', icon: '🏗️' },
+      { to: '/models', label: 'Inventory', icon: '📋' },
+      { to: '/tools', label: 'Tool Inventory', icon: '🛠️' },
+      { to: '/llm-proxy', label: 'LLM Proxy', icon: '🔀' },
+    ],
+  },
+  {
+    id: 'operations',
+    title: 'Operations',
+    icon: '⚙️',
+    items: [
+      { to: '/metrics', label: 'Metrics', icon: '📈' },
+      { to: '/audit', label: 'Audit Log', icon: '📜' },
+      { to: '/updates', label: 'Updates', icon: '🔄' },
+      { to: '/versions', label: 'Versions', icon: '🏷️' },
+    ],
+  },
+  {
+    id: 'system',
+    title: 'System',
+    icon: '🔧',
+    items: [
+      { to: '/settings', label: 'Settings', icon: '⚙️' },
+      { to: '/config', label: 'Config Editor', icon: '📝' },
+      { to: '/onboarding', label: 'Onboarding', icon: '🎓' },
+    ],
+  },
 ]
 
 function loadExpandedState(): Record<string, boolean> {
