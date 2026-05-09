@@ -60,6 +60,7 @@ pub mod model_transfer;
 pub mod model_upstream;
 pub mod multi_agent;
 pub mod nats_client;
+pub mod nats_jetstream;
 pub mod nats_log_layer;
 pub mod notifications;
 pub mod oauth_distributor;
