@@ -4012,10 +4012,25 @@ async fn get_config(
 }
 
 /// POST /api/config — update fleet config (full replacement) and trigger reload.
+/// Requires admin token via `X-Admin-Token` header (set `FF_ADMIN_TOKEN` env).
 async fn update_config(
     State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
     Json(payload): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // RBAC: require admin token for config mutation.
+    let admin_token = std::env::var("FF_ADMIN_TOKEN").unwrap_or_default();
+    let provided = headers
+        .get("x-admin-token")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !admin_token.is_empty() && provided != admin_token {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": {"message": "admin token required", "type": "forbidden"}})),
+        ));
+    }
+
     let Some(config_lock) = &state.fleet_config else {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,

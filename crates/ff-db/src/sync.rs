@@ -448,7 +448,7 @@ impl FollowerSync {
             .join(format!("received_snapshot_{}.db", meta.sequence));
 
         // Write snapshot to disk.
-        std::fs::write(&snapshot_path, bytes)?;
+        tokio::fs::write(&snapshot_path, bytes).await?;
 
         let db_path = self.pool.path().to_path_buf();
 

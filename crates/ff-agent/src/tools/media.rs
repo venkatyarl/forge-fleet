@@ -853,9 +853,10 @@ async fn find_omni_endpoint() -> String {
 }
 
 async fn query_omni_endpoint() -> anyhow::Result<String> {
-    let toml_str = std::fs::read_to_string(
+    let toml_str = tokio::fs::read_to_string(
         std::env::var("HOME").unwrap_or_default() + "/.forgefleet/fleet.toml",
-    )?;
+    )
+    .await?;
     let config: toml::Value = toml::from_str(&toml_str)?;
     let db_url = config
         .get("database")

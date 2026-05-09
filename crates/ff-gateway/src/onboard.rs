@@ -119,6 +119,20 @@ pub async fn bootstrap_script(
     let ssh_user = q.ssh_user.unwrap_or_else(|| name.clone());
     let role = q.role.unwrap_or_else(|| "builder".into());
     let runtime = q.runtime.unwrap_or_else(|| "auto".into());
+
+    // Sanitize bootstrap parameters to prevent shell injection in the rendered script.
+    fn sanitize_bootstrap_value(s: &str, max_len: usize) -> String {
+        let trimmed = s.trim();
+        let valid: String = trimmed.chars().take(max_len).filter(|&c| {
+            c.is_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '@' || c == '+' || c == ':' || c == '/'
+        }).collect();
+        if valid.is_empty() { "unknown".into() } else { valid }
+    }
+    let name = sanitize_bootstrap_value(&name, 64);
+    let ssh_user = sanitize_bootstrap_value(&ssh_user, 64);
+    let role = sanitize_bootstrap_value(&role, 32);
+    let runtime = sanitize_bootstrap_value(&runtime, 32);
+    let ip = sanitize_bootstrap_value(&ip, 64);
     let is_taylor = if name.eq_ignore_ascii_case("taylor") || ip == "192.168.5.100" {
         "true"
     } else {
@@ -230,6 +244,21 @@ pub async fn bootstrap_script_ps1(
     let ssh_user = q.ssh_user.unwrap_or_else(|| name.clone());
     let role = q.role.unwrap_or_else(|| "builder".into());
     let runtime = q.runtime.unwrap_or_else(|| "auto".into());
+
+    // Sanitize bootstrap parameters to prevent shell injection in the rendered script.
+    fn sanitize_bootstrap_value(s: &str, max_len: usize) -> String {
+        let trimmed = s.trim();
+        let valid: String = trimmed.chars().take(max_len).filter(|&c| {
+            c.is_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '@' || c == '+' || c == ':' || c == '/'
+        }).collect();
+        if valid.is_empty() { "unknown".into() } else { valid }
+    }
+    let name = sanitize_bootstrap_value(&name, 64);
+    let ssh_user = sanitize_bootstrap_value(&ssh_user, 64);
+    let role = sanitize_bootstrap_value(&role, 32);
+    let runtime = sanitize_bootstrap_value(&runtime, 32);
+    let ip = sanitize_bootstrap_value(&ip, 64);
+
     let is_taylor = if name.eq_ignore_ascii_case("taylor") || ip == "192.168.5.100" {
         "true"
     } else {

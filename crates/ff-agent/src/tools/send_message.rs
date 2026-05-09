@@ -118,11 +118,12 @@ async fn resolve_node_url(name: &str) -> String {
 }
 
 async fn lookup_node_ip_from_db(name: &str) -> anyhow::Result<String> {
-    let toml_str = std::fs::read_to_string(
+    let toml_str = tokio::fs::read_to_string(
         dirs::home_dir()
             .unwrap_or_default()
             .join(".forgefleet/fleet.toml"),
-    )?;
+    )
+    .await?;
     let config: toml::Value = toml::from_str(&toml_str)?;
     let db_url = config
         .get("database")

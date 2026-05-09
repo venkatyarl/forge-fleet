@@ -439,7 +439,9 @@ async fn mirror_session_to_vault(pool: &PgPool, session_id: uuid::Uuid) -> Resul
         .join("Inbox")
         .join("sessions")
         .join(session_id.to_string());
-    std::fs::create_dir_all(&dir).context("create session inbox dir")?;
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .context("create session inbox dir")?;
 
     // Pull session metadata + steps + brain entries.
     let session_row = sqlx::query(

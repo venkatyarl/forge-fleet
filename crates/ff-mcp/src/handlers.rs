@@ -3204,7 +3204,7 @@ mod tests {
         let (base_url, server_handle) = spawn_mock_llm_server(false).await;
 
         let repo_dir = std::env::temp_dir().join(format!("ff-mcp-repo-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&repo_dir).unwrap();
+        tokio::fs::create_dir_all(&repo_dir).await.unwrap();
 
         let response = fleet_crew(Some(json!({
             "task": "build a new API endpoint",
@@ -3239,7 +3239,7 @@ mod tests {
         let (base_url, server_handle) = spawn_mock_llm_server(true).await;
 
         let repo_dir = std::env::temp_dir().join(format!("ff-mcp-repo-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&repo_dir).unwrap();
+        tokio::fs::create_dir_all(&repo_dir).await.unwrap();
 
         let response = fleet_crew(Some(json!({
             "task": "build a new API endpoint",
