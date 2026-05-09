@@ -545,6 +545,8 @@ pub fn build_router(state: Arc<GatewayState>, mc_db_path: Option<&str>) -> Route
         .route("/v1/tasks/{task_type}", post(crate::tasks::handle_task_from_path))
         .route("/v1/images/generations", post(crate::tasks::handle_image_generation))
         .route("/v1/audio/transcriptions", post(crate::tasks::handle_audio_transcription))
+        .route("/v1/internal/delegate", post(internal_delegate))
+        .route("/v1/async/{ticket}", get(async_poll))
         // ─── Replication routes ──────────────────────────────────────
         .route("/api/fleet/replicate/snapshot", post(replicate_snapshot))
         .route("/api/fleet/replicate/sequence", get(replicate_sequence))
@@ -4312,8 +4314,43 @@ async fn settings_runtime(State(state): State<Arc<GatewayState>>) -> Json<Value>
 /// for backward compatibility.
 async fn proxy_chat_completions(
     State(state): State<Arc<GatewayState>>,
+    Query(query): Query<AsyncQuery>,
     Json(mut raw_payload): Json<Value>,
 ) -> Result<Response<Body>, (StatusCode, Json<Value>)> {
+    // ── Async mode (P1.6) ────────────────────────────────────────────
+    //
+    // When ?async=true, enqueue the request as a fleet_task and return
+    // a ticket immediately. The caller polls /v1/async/{ticket} or
+    // receives a webhook when complete.
+    if query.async_mode == Some(true) {
+        if let Some(pool) = state.operational_store.as_ref().and_then(|s| s.pg_pool()) {
+            let model = raw_payload.get("model").and_then(|v| v.as_str()).unwrap_or("unknown");
+            let summary = format!("async chat completion ({model})");
+            let task_id: Uuid = sqlx::query_scalar(
+                r#"
+                INSERT INTO fleet_tasks (task_type, summary, payload, priority, status, created_at)
+                VALUES ('async_chat', $1, $2, 50, 'pending', NOW())
+                RETURNING id
+                "#,
+            )
+            .bind(&summary)
+            .bind(&raw_payload)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("db error: {e}")})),
+            ))?;
+
+            let ticket = json!({
+                "ticket": task_id,
+                "status": "pending",
+                "poll_url": format!("/v1/async/{task_id}"),
+            });
+            return Ok(Json(ticket).into_response());
+        }
+    }
+
     // ── Cloud-LLM routing (first pass) ───────────────────────────────
     //
     // If the `model` field matches a row in `cloud_llm_providers`
@@ -4773,6 +4810,166 @@ async fn record_usage_from_response(
             .add(cost);
     }
     upstream_body
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  P1.2 Inter-Node RPC  +  P1.6 Async Job Queue
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Deserialize)]
+struct AsyncQuery {
+    async_mode: Option<bool>,
+}
+
+/// POST /v1/internal/delegate — accept a signed task from another fleet node.
+///
+/// The caller must include:
+///   - `X-ForgeFleet-Signature`: hex HMAC-SHA256 of `{method}\n{path}\n{ts}\n{body}`
+///   - `X-ForgeFleet-Timestamp`: unix seconds
+///
+/// Verified against `config.enrollment.resolve_shared_secret()`.
+async fn internal_delegate(
+    State(state): State<Arc<GatewayState>>,
+    headers: HeaderMap,
+    body: String,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let signature = headers
+        .get("x-forgefleet-signature")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let timestamp_str = headers
+        .get("x-forgefleet-timestamp")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("0");
+    let timestamp: i64 = timestamp_str.parse().unwrap_or(0);
+
+    let secret = if let Some(cfg_lock) = &state.fleet_config {
+        let cfg = cfg_lock.read().await;
+        cfg.enrollment.resolve_shared_secret().unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    if secret.is_empty() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "inter-node auth not configured"})),
+        ));
+    }
+
+    if !ff_security::node_auth::is_request_fresh(timestamp, 300) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "request expired / replay detected"})),
+        ));
+    }
+
+    if !ff_security::node_auth::verify_signature(
+        &secret, "POST", "/v1/internal/delegate", timestamp, &body, signature,
+    ) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "invalid signature"})),
+        ));
+    }
+
+    let payload: Value = serde_json::from_str(&body).map_err(|e| (
+        StatusCode::BAD_REQUEST,
+        Json(json!({"error": format!("invalid json: {e}")})),
+    ))?;
+
+    let pool = match state.operational_store.as_ref().and_then(|s| s.pg_pool()) {
+        Some(p) => p,
+        None => {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "postgres unavailable"})),
+            ));
+        }
+    };
+
+    let task_type = payload.get("task_type").and_then(|v| v.as_str()).unwrap_or("delegate");
+    let summary = payload.get("summary").and_then(|v| v.as_str()).unwrap_or("delegated task");
+    let task_payload = payload.get("payload").cloned().unwrap_or(json!({}));
+    let priority = payload.get("priority").and_then(|v| v.as_i64()).unwrap_or(50) as i32;
+    let capabilities = payload.get("capabilities").cloned().unwrap_or(json!([]));
+
+    let task_id: Uuid = sqlx::query_scalar(
+        r#"
+        INSERT INTO fleet_tasks (task_type, summary, payload, priority, requires_capability, status, created_at)
+        VALUES ($1, $2, $3, $4, $5, 'pending', NOW())
+        RETURNING id
+        "#,
+    )
+    .bind(task_type)
+    .bind(summary)
+    .bind(&task_payload)
+    .bind(priority)
+    .bind(&capabilities)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({"error": format!("db error: {e}")})),
+    ))?;
+
+    Ok(Json(json!({
+        "task_id": task_id,
+        "status": "pending",
+        "poll_url": format!("/v1/async/{task_id}"),
+    })))
+}
+
+/// GET /v1/async/{ticket} — poll the status of an async job.
+async fn async_poll(
+    State(state): State<Arc<GatewayState>>,
+    Path(ticket): Path<Uuid>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let pool = match state.operational_store.as_ref().and_then(|s| s.pg_pool()) {
+        Some(p) => p,
+        None => {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "postgres unavailable"})),
+            ));
+        }
+    };
+
+    let row = sqlx::query(
+        "SELECT status, result, error, progress_pct, progress_message, completed_at FROM fleet_tasks WHERE id = $1"
+    )
+    .bind(ticket)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({"error": format!("db error: {e}")})),
+    ))?;
+
+    match row {
+        Some(r) => {
+            let status: String = r.get("status");
+            let result: Option<Value> = r.get("result");
+            let error: Option<String> = r.get("error");
+            let progress_pct: Option<f32> = r.get("progress_pct");
+            let progress_message: Option<String> = r.get("progress_message");
+            let completed_at: Option<chrono::DateTime<Utc>> = r.get("completed_at");
+
+            Ok(Json(json!({
+                "ticket": ticket,
+                "status": status,
+                "result": result,
+                "error": error,
+                "progress_pct": progress_pct,
+                "progress_message": progress_message,
+                "completed_at": completed_at,
+            })))
+        }
+        None => Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "ticket not found"})),
+        )),
+    }
 }
 
 /// GET /v1/models — list available models from the backend registry.

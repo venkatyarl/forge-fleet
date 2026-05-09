@@ -1348,6 +1348,7 @@ dependencies = [
  "ff-mcp",
  "ff-observability",
  "ff-pulse",
+ "ff-security",
  "ff-voice",
  "futures",
  "hyper",
