@@ -101,7 +101,7 @@ pub struct GatewayState {
     pub router: Arc<MessageRouter>,
     pub inbound_messages: Arc<DashMap<Uuid, IncomingMessage>>,
     pub outbound_messages: Arc<DashMap<Uuid, OutgoingMessage>>,
-    pub web_clients: Arc<DashMap<Uuid, mpsc::UnboundedSender<WsMessage>>>,
+    pub web_clients: Arc<DashMap<Uuid, mpsc::Sender<WsMessage>>>,
     /// Fleet config (for /api/config endpoint).
     pub fleet_config: Option<Arc<tokio::sync::RwLock<ff_core::config::FleetConfig>>>,
     /// Absolute path to the active fleet.toml file.
@@ -194,7 +194,7 @@ impl GatewayState {
         for entry in self.web_clients.iter() {
             if entry
                 .value()
-                .send(WsMessage::Text(text.clone().into()))
+                .try_send(WsMessage::Text(text.clone().into()))
                 .is_err()
             {
                 disconnected.push(*entry.key());
@@ -5982,7 +5982,7 @@ async fn websocket_upgrade(
 
 async fn websocket_session(state: Arc<GatewayState>, mut socket: axum::extract::ws::WebSocket) {
     let session_id = Uuid::new_v4();
-    let (tx, mut rx) = mpsc::unbounded_channel::<WsMessage>();
+    let (tx, mut rx) = mpsc::channel::<WsMessage>(256);
 
     state.web_clients.insert(session_id, tx);
     info!(session = %session_id, "web client connected");

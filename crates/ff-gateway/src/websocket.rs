@@ -51,7 +51,7 @@ impl std::fmt::Display for EventType {
 // ─── Client entry ────────────────────────────────────────────────────────────
 
 struct WsClient {
-    sender: mpsc::UnboundedSender<Message>,
+    sender: mpsc::Sender<Message>,
     subscriptions: HashSet<EventType>,
     last_pong: Instant,
 }
@@ -79,9 +79,9 @@ impl WsHub {
     pub fn register(
         &self,
         subscriptions: Option<HashSet<EventType>>,
-    ) -> (Uuid, mpsc::UnboundedReceiver<Message>) {
+    ) -> (Uuid, mpsc::Receiver<Message>) {
         let id = Uuid::new_v4();
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(256);
 
         let subs = subscriptions.unwrap_or_else(|| {
             let mut s = HashSet::new();
@@ -138,7 +138,7 @@ impl WsHub {
         for entry in self.clients.iter() {
             if entry
                 .sender
-                .send(Message::Text(text.clone().into()))
+                .try_send(Message::Text(text.clone().into()))
                 .is_err()
             {
                 dead.push(*entry.key());
@@ -167,7 +167,7 @@ impl WsHub {
             if subscribed
                 && entry
                     .sender
-                    .send(Message::Text(text.clone().into()))
+                    .try_send(Message::Text(text.clone().into()))
                     .is_err()
             {
                 dead.push(*entry.key());
@@ -208,7 +208,7 @@ impl WsHub {
                     }
 
                     // Send a ping
-                    if entry.sender.send(Message::Ping(Vec::new().into())).is_err() {
+                    if entry.sender.try_send(Message::Ping(Vec::new().into())).is_err() {
                         dead.push(*entry.key());
                     }
                 }
