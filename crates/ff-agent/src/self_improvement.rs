@@ -159,8 +159,8 @@ mod tests {
                 timestamp: chrono::Utc::now(),
                 task_type: "code_review".to_string(),
                 duration_ms: 45_000,
-                success: i >= 2,
-                error_kind: if i < 2 { Some("timeout".to_string()) } else { None },
+                success: i >= 3,
+                error_kind: if i < 3 { Some("timeout".to_string()) } else { None },
                 tokens_used: 12_000,
                 model: "qwen3-30b".to_string(),
             }).await;
