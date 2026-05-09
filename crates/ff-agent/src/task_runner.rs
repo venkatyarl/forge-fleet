@@ -173,6 +173,58 @@ impl TaskRunner {
         Ok(env)
     }
 
+    /// Load-aware gate (P1.3). Returns `false` when this node is
+    /// sufficiently overloaded that it should skip claiming new tasks.
+    /// Thresholds are conservative — a node at 85% CPU, 90% RAM, or 95%
+    /// GPU is considered saturated. Also gates on active task count (>10).
+    async fn should_claim_by_load(&self) -> Result<bool, sqlx::Error> {
+        // Latest metrics from Pulse (leader-gated downsampler writes these
+        // once per minute; if stale >5 min we ignore them).
+        let metrics = sqlx::query(
+            r#"
+            SELECT cpu_pct, ram_pct, gpu_pct
+            FROM computer_metrics_history
+            WHERE computer_id = $1
+            ORDER BY recorded_at DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(self.my_computer_id)
+        .fetch_optional(&self.pg)
+        .await?;
+
+        if let Some(row) = metrics {
+            let cpu: Option<f64> = row.try_get("cpu_pct").ok();
+            let ram: Option<f64> = row.try_get("ram_pct").ok();
+            let gpu: Option<f64> = row.try_get("gpu_pct").ok();
+
+            if cpu.unwrap_or(0.0) > 85.0 {
+                return Ok(false);
+            }
+            if ram.unwrap_or(0.0) > 90.0 {
+                return Ok(false);
+            }
+            if gpu.unwrap_or(0.0) > 95.0 {
+                return Ok(false);
+            }
+        }
+
+        // Also gate on active task count — if we're already running a lot,
+        // let other nodes help.
+        let active_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM fleet_tasks WHERE claimed_by_computer_id = $1 AND status = 'running'",
+        )
+        .bind(self.my_computer_id)
+        .fetch_one(&self.pg)
+        .await?;
+
+        if active_count > 10 {
+            return Ok(false);
+        }
+
+        Ok(true)
+    }
+
     /// One worker tick — claim at most one ready task and run it.
     pub async fn tick_once(&self) -> Result<Option<uuid::Uuid>, TaskRunnerError> {
         // 0. Distributed watchdog (V61): every tick on every worker scans
@@ -185,7 +237,21 @@ impl TaskRunner {
             debug!(error = %e, "distributed watchdog: handoff sweep failed");
         }
 
-        // 1. Atomically claim a task whose capabilities we satisfy.
+        // 1. Load-aware gate (P1.3): skip claiming if this node is overloaded.
+        // Other nodes will pick up the work. Thresholds are conservative to
+        // prevent cascading overload while still utilizing fleet capacity.
+        match self.should_claim_by_load().await {
+            Ok(false) => {
+                debug!(node = %self.my_name, "load-aware gate: node overloaded — skipping claim");
+                return Ok(None);
+            }
+            Ok(true) => {}
+            Err(e) => {
+                debug!(error = %e, "load-aware gate query failed — proceeding with claim");
+            }
+        }
+
+        // 2. Atomically claim a task whose capabilities we satisfy.
         let cap_array: Vec<String> = self.my_capabilities.iter().cloned().collect();
         // Two-phase / barrier note: tasks with `wait_for_siblings = true`
         // are only claimable when no non-barrier sibling under the same
