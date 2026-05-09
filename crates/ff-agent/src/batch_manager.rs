@@ -105,7 +105,7 @@ pub fn weighted_partition(items: Vec<(String, ItemWeight)>, num_batches: usize) 
 
 // ─── Database Operations ────────────────────────────────────────────────────
 
-/// Create work_items and work_batches for a decomposed task.
+/// Create fleet_work_items and fleet_work_batches for a decomposed task.
 pub async fn create_work_items(
     pg: &PgPool,
     parent_task_id: Uuid,
@@ -134,7 +134,7 @@ pub async fn create_work_items(
         // Create batch row
         let batch_id: Uuid = sqlx::query_scalar(
             r#"
-            INSERT INTO work_batches (
+            INSERT INTO fleet_work_batches (
                 parent_task_id, batch_index, total_estimated_weight, items_count, status
             )
             VALUES ($1, $2, $3, $4, 'pending')
@@ -158,7 +158,7 @@ pub async fn create_work_items(
 
             sqlx::query(
                 r#"
-                INSERT INTO work_items (
+                INSERT INTO fleet_work_items (
                     parent_task_id, batch_id, item_index, item_key, item_type,
                     estimated_weight, complexity_factors, status
                 )
@@ -211,13 +211,13 @@ pub async fn claim_work_item(
 ) -> Result<Option<WorkItem>> {
     let row = sqlx::query(
         r#"
-        UPDATE work_items
+        UPDATE fleet_work_items
            SET status = 'claimed',
                assigned_node_id = $1,
                assigned_agent_id = $2,
                claimed_at = NOW()
          WHERE id = (
-            SELECT id FROM work_items
+            SELECT id FROM fleet_work_items
              WHERE status = 'pending'
                AND (assigned_node_id IS NULL OR assigned_node_id = $1)
              ORDER BY estimated_weight DESC, item_index ASC
@@ -255,7 +255,7 @@ pub async fn yield_work_item(
 ) -> Result<()> {
     sqlx::query(
         r#"
-        UPDATE work_items
+        UPDATE fleet_work_items
            SET status = 'pending',
                checkpoint_data = $1,
                yielded_at = NOW(),
@@ -284,7 +284,7 @@ pub async fn resume_work_item(
 ) -> Result<Option<WorkItem>> {
     let row = sqlx::query(
         r#"
-        UPDATE work_items
+        UPDATE fleet_work_items
            SET status = 'claimed',
                assigned_node_id = $1,
                assigned_agent_id = $2,
@@ -326,7 +326,7 @@ pub async fn complete_work_item(
 ) -> Result<()> {
     sqlx::query(
         r#"
-        UPDATE work_items
+        UPDATE fleet_work_items
            SET status = 'completed',
                result_summary = $1,
                result_tokens_in = $2,
@@ -353,7 +353,7 @@ pub async fn fail_work_item(
 ) -> Result<()> {
     sqlx::query(
         r#"
-        UPDATE work_items
+        UPDATE fleet_work_items
            SET status = 'failed',
                error_message = $1,
                completed_at = NOW(),
@@ -373,7 +373,7 @@ pub async fn fail_work_item(
 pub async fn update_batch_progress(pg: &PgPool, parent_task_id: Uuid, batch_id: i32) -> Result<()> {
     sqlx::query(
         r#"
-        UPDATE work_batches
+        UPDATE fleet_work_batches
            SET progress_percent = (
                SELECT COALESCE(AVG(
                    CASE status
@@ -383,16 +383,16 @@ pub async fn update_batch_progress(pg: &PgPool, parent_task_id: Uuid, batch_id: 
                        ELSE progress_percent
                    END
                ), 0)::INT
-               FROM work_items
+               FROM fleet_work_items
                WHERE parent_task_id = $1 AND batch_id = $2
            ),
            status = CASE
                WHEN (
-                   SELECT COUNT(*) FROM work_items
+                   SELECT COUNT(*) FROM fleet_work_items
                    WHERE parent_task_id = $1 AND batch_id = $2 AND status = 'completed'
                ) = items_count THEN 'completed'
                WHEN (
-                   SELECT COUNT(*) FROM work_items
+                   SELECT COUNT(*) FROM fleet_work_items
                    WHERE parent_task_id = $1 AND batch_id = $2 AND status IN ('claimed', 'in_progress')
                ) > 0 THEN 'in_progress'
                ELSE 'pending'
@@ -420,7 +420,7 @@ pub async fn get_task_progress(pg: &PgPool, parent_task_id: Uuid) -> Result<Task
             COUNT(*) FILTER (WHERE status = 'failed') as failed,
             COUNT(*) FILTER (WHERE status = 'yielded') as yielded,
             COUNT(*) as total
-        FROM work_items
+        FROM fleet_work_items
         WHERE parent_task_id = $1
         "#,
     )
@@ -466,7 +466,7 @@ impl TaskProgress {
 // ─── Parent Task Completion Watcher ─────────────────────────────────────────
 
 /// Check all `running` decomposed tasks and mark them complete when
-/// their work_items are all done (completed or failed).
+/// their fleet_work_items are all done (completed or failed).
 /// Also bumps `last_heartbeat_at` on all running decomposed tasks so
 /// the fleet_tasks watchdog doesn't re-queue them while work is in
 /// progress.
@@ -484,7 +484,7 @@ pub async fn complete_finished_parents(pg: &PgPool) -> Result<usize> {
     .execute(pg)
     .await;
 
-    // 2. Find parents whose work_items are all done.
+    // 2. Find parents whose fleet_work_items are all done.
     let ids: Vec<uuid::Uuid> = sqlx::query_scalar(
         r#"
         SELECT t.id
@@ -492,11 +492,11 @@ pub async fn complete_finished_parents(pg: &PgPool) -> Result<usize> {
          WHERE t.task_type = 'decomposed'
            AND t.status = 'running'
            AND EXISTS (
-               SELECT 1 FROM work_items w
+               SELECT 1 FROM fleet_work_items w
                 WHERE w.parent_task_id = t.id
            )
            AND NOT EXISTS (
-               SELECT 1 FROM work_items w
+               SELECT 1 FROM fleet_work_items w
                 WHERE w.parent_task_id = t.id
                   AND w.status NOT IN ('completed', 'failed')
            )

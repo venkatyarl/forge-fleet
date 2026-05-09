@@ -54,9 +54,12 @@ pub async fn get_fleet_pool() -> Result<PgPool, String> {
 }
 
 async fn build_fleet_pool() -> Result<PgPool, String> {
-    let config_path = dirs::home_dir()
-        .ok_or_else(|| "no home dir".to_string())?
-        .join(".forgefleet/fleet.toml");
+    let home = std::env::var("FORGEFLEET_HOME")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".forgefleet")))
+        .ok_or_else(|| "no home dir".to_string())?;
+    let config_path = home.join("fleet.toml");
     let toml_str =
         std::fs::read_to_string(&config_path).map_err(|e| format!("read fleet.toml: {e}"))?;
     let config: ff_core::config::FleetConfig =

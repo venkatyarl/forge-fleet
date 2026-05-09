@@ -152,6 +152,7 @@ pub use queries::{
     pg_upsert_node,
     pg_upsert_shared_volume_mount,
     seed_from_fleet_toml,
+    load_fleet_config_from_postgres,
 };
 pub use runtime_registry::RuntimeRegistryStore;
 pub use sqlx::PgPool;

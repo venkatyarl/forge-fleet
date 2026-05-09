@@ -1,7 +1,7 @@
 //! Work Stealer (Phase 15d)
 //!
 //! Distributed work-item handoff watchdog. Every daemon runs this —
-//! no leader gate. It finds `claimed`/`in_progress` work_items whose
+//! no leader gate. It finds `claimed`/`in_progress` fleet_work_items whose
 //! assigned node has gone stale (no heartbeat / no progress for a
 //! threshold) and yields them back to `pending` so any peer can claim
 //! them.
@@ -25,14 +25,14 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 /// Max times a work item can be handed off before it's marked failed.
 const MAX_ITEM_HANDOFFS: i32 = 3;
 
-/// Distributed watchdog: yield stale work_items back to pending.
+/// Distributed watchdog: yield stale fleet_work_items back to pending.
 ///
 /// Uses `FOR UPDATE SKIP LOCKED` so concurrent daemons race safely.
 pub async fn handoff_stuck_work_items(pg: &PgPool) -> Result<usize, sqlx::Error> {
     // Demote stale claimed/in_progress items back to pending.
     let demoted = sqlx::query(
         r#"
-        UPDATE work_items
+        UPDATE fleet_work_items
            SET status = 'pending',
                assigned_node_id = NULL,
                assigned_agent_id = NULL,
@@ -41,7 +41,7 @@ pub async fn handoff_stuck_work_items(pg: &PgPool) -> Result<usize, sqlx::Error>
                checkpoint_data = COALESCE(checkpoint_data, '{}') || jsonb_build_object('handoff_at', NOW()),
                retry_count = retry_count + 1
          WHERE id IN (
-            SELECT id FROM work_items
+            SELECT id FROM fleet_work_items
              WHERE status IN ('claimed', 'in_progress')
                AND claimed_at < NOW() - make_interval(secs => $1::int)
                AND retry_count < $2
@@ -58,7 +58,7 @@ pub async fn handoff_stuck_work_items(pg: &PgPool) -> Result<usize, sqlx::Error>
     // Permanently fail items that have exceeded max handoffs.
     let _ = sqlx::query(
         r#"
-        UPDATE work_items
+        UPDATE fleet_work_items
            SET status = 'failed',
                completed_at = NOW(),
                error_message = 'exceeded MAX_ITEM_HANDOFFS retries'
@@ -86,7 +86,7 @@ pub async fn try_steal_work_item(
 ) -> Result<Option<Uuid>, sqlx::Error> {
     // Only steal if this node has no pending work of its own.
     let my_pending: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM work_items WHERE assigned_node_id = $1 AND status IN ('pending', 'claimed', 'in_progress')"
+        "SELECT COUNT(*) FROM fleet_work_items WHERE assigned_node_id = $1 AND status IN ('pending', 'claimed', 'in_progress')"
     )
     .bind(thief_node_id)
     .fetch_one(pg)
@@ -101,7 +101,7 @@ pub async fn try_steal_work_item(
     let victim = sqlx::query(
         r#"
         SELECT assigned_node_id, COUNT(*) as cnt
-          FROM work_items
+          FROM fleet_work_items
          WHERE status IN ('claimed', 'in_progress')
            AND assigned_node_id != $1
          GROUP BY assigned_node_id
@@ -122,7 +122,7 @@ pub async fn try_steal_work_item(
     // Atomically steal the oldest/heaviest item from the victim.
     let stolen: Option<Uuid> = sqlx::query_scalar(
         r#"
-        UPDATE work_items
+        UPDATE fleet_work_items
            SET status = 'claimed',
                assigned_node_id = $1,
                assigned_agent_id = $2,
@@ -130,7 +130,7 @@ pub async fn try_steal_work_item(
                stolen_from = assigned_node_id,
                checkpoint_data = COALESCE(checkpoint_data, '{}') || jsonb_build_object('stolen_at', NOW())
          WHERE id = (
-            SELECT id FROM work_items
+            SELECT id FROM fleet_work_items
              WHERE status IN ('claimed', 'in_progress')
                AND assigned_node_id = $3
              ORDER BY estimated_weight DESC, claimed_at ASC

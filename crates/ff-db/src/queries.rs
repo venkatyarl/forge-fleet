@@ -3,6 +3,8 @@
 //! Provides a clean Rust API over raw SQL. All functions take a `&Connection`
 //! to work with both pooled and standalone connections.
 
+use std::collections::HashMap;
+
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -3068,6 +3070,122 @@ pub async fn seed_from_fleet_toml(
     );
 
     Ok(())
+}
+
+// ─── Load FleetConfig FROM Postgres ─────────────────────────────────────────
+
+/// Load a `FleetConfig` from Postgres tables.
+///
+/// This is the inverse of `seed_from_fleet_toml`.  Nodes that already have a
+/// minimal `fleet.toml` with a `[database]` section can call this on startup
+/// to pull the rest of the fleet state from the shared Postgres.
+///
+/// The returned `FleetConfig` contains:
+/// - `nodes`  → from `fleet_nodes` + `fleet_models`
+/// - `fleet`, `scheduling`, `ports`, `llm`, `enrollment`  → from `fleet_settings`
+/// - `database` and `redis` are **NOT** overwritten (keep local bootstrap values)
+pub async fn load_fleet_config_from_postgres(
+    pool: &PgPool,
+    bootstrap: &ff_core::config::FleetConfig,
+) -> Result<ff_core::config::FleetConfig> {
+    use ff_core::config::*;
+    use ff_core::types::Role;
+    use tracing::{info, warn};
+
+    let mut config = bootstrap.clone();
+
+    // ── Nodes + Models ──
+    let pg_nodes = pg_list_nodes(pool).await?;
+    let pg_models = pg_list_models(pool).await?;
+
+    let mut nodes: HashMap<String, NodeConfig> = HashMap::new();
+    for n in pg_nodes {
+        let role = serde_json::from_value::<Role>(serde_json::Value::String(n.role.clone()))
+            .unwrap_or(Role::Worker);
+        let mut node = NodeConfig {
+            ip: n.ip,
+            ssh_user: Some(n.ssh_user).filter(|s| !s.is_empty()),
+            ram_gb: Some(n.ram_gb as u64),
+            cpu_cores: Some(n.cpu_cores as u32),
+            os: Some(n.os).filter(|s| !s.is_empty()),
+            role,
+            election_priority: Some(n.election_priority as u32),
+            alt_ips: serde_json::from_value(n.alt_ips).unwrap_or_default(),
+            resources: serde_json::from_value(n.resources).ok(),
+            capabilities: serde_json::from_value(n.capabilities).ok(),
+            preferences: serde_json::from_value(n.preferences).ok(),
+            ..Default::default()
+        };
+
+        // Attach models that belong to this node.
+        for m in pg_models.iter().filter(|m| m.node_name == n.name) {
+            let model_cfg = NodeModelConfig {
+                name: m.name.clone(),
+                family: Some(m.family.clone()).filter(|s| !s.is_empty()),
+                port: Some(m.port as u16),
+                tier: m.tier as u32,
+                local: Some(m.local_model),
+                lifecycle: Some(m.lifecycle.clone()),
+                mode: Some(m.mode.clone()),
+                preferred_workloads: serde_json::from_value(m.preferred_workloads.clone())
+                    .unwrap_or_default(),
+            };
+            node.models.insert(m.slug.clone(), model_cfg);
+        }
+
+        nodes.insert(n.name, node);
+    }
+    config.nodes = nodes;
+
+    // ── Settings ──
+    macro_rules! load_setting {
+        ($key:expr, $ty:ty, $field:ident) => {
+            match pg_get_setting(pool, $key).await? {
+                Some(v) => match serde_json::from_value::<$ty>(v) {
+                    Ok(parsed) => {
+                        config.$field = parsed;
+                    }
+                    Err(e) => {
+                        warn!(key = $key, error = %e, "failed to parse fleet_setting");
+                    }
+                },
+                None => {
+                    warn!(key = $key, "fleet_setting missing in postgres");
+                }
+            }
+        };
+    }
+
+    load_setting!("fleet", FleetSettings, fleet);
+    load_setting!("scheduling", SchedulingConfig, scheduling);
+    load_setting!("ports", PortsConfig, ports);
+    load_setting!("llm", LlmConfig, llm);
+    load_setting!("enrollment", EnrollmentConfig, enrollment);
+    load_setting!("notifications", NotificationsConfig, notifications);
+    load_setting!("transport", TransportConfig, transport);
+    load_setting!("agent", AgentSettings, agent);
+    load_setting!("loops", LoopSettings, loops);
+
+    // ── Services ──
+    if let Some(services_val) = pg_get_setting(pool, "services").await? {
+        if let Ok(map) = serde_json::from_value::<HashMap<String, ServiceConfig>>(services_val) {
+            config.services = map;
+        }
+    }
+
+    // ── MCP configs ──
+    if let Some(mcp_val) = pg_get_setting(pool, "mcp").await? {
+        if let Ok(map) = serde_json::from_value::<HashMap<String, McpConfig>>(mcp_val) {
+            config.mcp = map;
+        }
+    }
+
+    info!(
+        nodes = config.nodes.len(),
+        "loaded fleet config from postgres"
+    );
+
+    Ok(config)
 }
 
 #[cfg(test)]

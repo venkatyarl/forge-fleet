@@ -743,6 +743,19 @@ CREATE TABLE IF NOT EXISTS fleet_secrets (
 "#;
 
 pub const SCHEMA_V8_TASK_PROVENANCE: &str = r#"
+-- Ensure base tasks table exists before altering (fresh Postgres installs).
+CREATE TABLE IF NOT EXISTS tasks (
+    id            TEXT PRIMARY KEY,
+    kind          TEXT NOT NULL,
+    payload_json  TEXT NOT NULL DEFAULT '{}',
+    status        TEXT NOT NULL DEFAULT 'pending',
+    assigned_node TEXT,
+    priority      BIGINT NOT NULL DEFAULT 0,
+    created_at    TEXT NOT NULL,
+    started_at    TEXT,
+    completed_at  TEXT
+);
+
 -- ALTER TABLE tasks: add provenance columns (IF NOT EXISTS guards for idempotency)
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS origin_node TEXT;      -- which node created this task
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS parent_task_id TEXT;   -- spawning task ID (for sub-tasks)
@@ -1106,7 +1119,7 @@ CREATE TABLE IF NOT EXISTS milestones (
     status      TEXT NOT NULL DEFAULT 'active'
 );
 
-CREATE TABLE IF NOT EXISTS work_items (
+CREATE TABLE IF NOT EXISTS fleet_work_items (
     id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     project_id          TEXT NOT NULL REFERENCES projects(id),
     milestone_id        UUID REFERENCES milestones(id),
@@ -1131,9 +1144,9 @@ CREATE TABLE IF NOT EXISTS work_items (
     metadata            JSONB NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS idx_work_items_project_status
-    ON work_items(project_id, status);
+    ON fleet_work_items(project_id, status);
 CREATE INDEX IF NOT EXISTS idx_work_items_assigned
-    ON work_items(assigned_to, status);
+    ON fleet_work_items(assigned_to, status);
 
 CREATE TABLE IF NOT EXISTS work_outputs (
     id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -5997,7 +6010,7 @@ CREATE INDEX IF NOT EXISTS idx_tool_usage_session ON fleet_tool_usage(session_id
 pub const SCHEMA_V75_WORK_ITEMS: &str = r#"
 -- ─── Work Items ─────────────────────────────────────────────────────────────
 -- Individual units of work within a decomposed task.
-CREATE TABLE IF NOT EXISTS work_items (
+CREATE TABLE IF NOT EXISTS fleet_work_items (
     id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     parent_task_id      UUID NOT NULL REFERENCES fleet_tasks(id) ON DELETE CASCADE,
     batch_id            INT NOT NULL DEFAULT 0,
@@ -6041,16 +6054,16 @@ CREATE TABLE IF NOT EXISTS work_items (
     UNIQUE(parent_task_id, item_index)
 );
 
-CREATE INDEX IF NOT EXISTS idx_work_items_parent ON work_items(parent_task_id, status);
-CREATE INDEX IF NOT EXISTS idx_work_items_batch ON work_items(parent_task_id, batch_id, status);
-CREATE INDEX IF NOT EXISTS idx_work_items_claimed ON work_items(assigned_node_id, status)
+CREATE INDEX IF NOT EXISTS idx_work_items_parent ON fleet_work_items(parent_task_id, status);
+CREATE INDEX IF NOT EXISTS idx_work_items_batch ON fleet_work_items(parent_task_id, batch_id, status);
+CREATE INDEX IF NOT EXISTS idx_work_items_claimed ON fleet_work_items(assigned_node_id, status)
     WHERE status IN ('claimed', 'in_progress');
-CREATE INDEX IF NOT EXISTS idx_work_items_yielded ON work_items(parent_task_id, status)
+CREATE INDEX IF NOT EXISTS idx_work_items_yielded ON fleet_work_items(parent_task_id, status)
     WHERE status = 'yielded';
 
 -- ─── Work Batches ───────────────────────────────────────────────────────────
 -- A batch is a group of work_items assigned to one node.
-CREATE TABLE IF NOT EXISTS work_batches (
+CREATE TABLE IF NOT EXISTS fleet_work_batches (
     id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     parent_task_id      UUID NOT NULL REFERENCES fleet_tasks(id) ON DELETE CASCADE,
     batch_index         INT NOT NULL,
