@@ -1555,6 +1555,7 @@ dependencies = [
 name = "ff-security"
 version = "2026.4.7"
 dependencies = [
+ "age",
  "anyhow",
  "axum",
  "base64 0.22.1",

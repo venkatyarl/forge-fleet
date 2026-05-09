@@ -9,6 +9,7 @@ pub mod policy;
 pub mod rate_limit;
 pub mod sandbox;
 pub mod secrets;
+pub mod age_vault;
 
 pub use ff_core::{ForgeFleetError, Result as CoreResult};
 
