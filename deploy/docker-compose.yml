@@ -34,15 +34,15 @@ services:
     command:
       - "postgres"
       - "-c"
-      - "shared_buffers=1GB"
+      - "shared_buffers=256MB"
       - "-c"
-      - "work_mem=64MB"
+      - "work_mem=32MB"
       - "-c"
-      - "maintenance_work_mem=256MB"
+      - "maintenance_work_mem=128MB"
       - "-c"
-      - "effective_cache_size=4GB"
+      - "effective_cache_size=512MB"
       - "-c"
-      - "max_connections=500"
+      - "max_connections=100"
       - "-c"
       - "log_min_duration_statement=1000"
       # ─── Streaming-replication knobs (Phase 6 HA) ─────────────────────
@@ -63,6 +63,7 @@ services:
       - "hot_standby=on"
       - "-c"
       - "synchronous_commit=off"
+    mem_limit: 768m
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U forgefleet -d forgefleet"]
       interval: 10s
@@ -93,9 +94,10 @@ services:
       - "--appendfsync"
       - "everysec"
       - "--maxmemory"
-      - "2gb"
+      - "96mb"
       - "--maxmemory-policy"
-      - "noeviction"
+      - "allkeys-lru"
+    mem_limit: 128m
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -137,6 +139,7 @@ services:
       timeout: 3s
       retries: 5
       start_period: 5s
+    mem_limit: 128m
     restart: unless-stopped
     networks:
       - forgefleet
