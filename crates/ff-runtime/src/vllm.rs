@@ -156,7 +156,7 @@ impl VllmEngine {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .expect("build reqwest client");
         let start = Instant::now();
 
         loop {

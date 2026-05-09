@@ -41,7 +41,7 @@ pub async fn query_models_endpoint(endpoint: &str, timeout: Duration) -> Endpoin
     let client = reqwest::Client::builder()
         .timeout(timeout)
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
+        .expect("build reqwest client");
 
     match client.get(&url).send().await {
         Ok(response) => {

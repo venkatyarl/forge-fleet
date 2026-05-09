@@ -50,7 +50,7 @@ impl Default for ExecutorConfig {
             http_client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
+                .expect("build reqwest client"),
             llm_base_url: None,
             llm_api_key: None,
             llm_model: None,

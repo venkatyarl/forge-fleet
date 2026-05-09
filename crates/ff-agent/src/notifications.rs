@@ -137,7 +137,7 @@ async fn send_webhook(url: &str, headers: &HashMap<String, String>, notification
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
+        .expect("build reqwest client");
     let mut req = client.post(url).json(notification);
     for (k, v) in headers {
         req = req.header(k.as_str(), v.as_str());
@@ -154,7 +154,7 @@ async fn send_slack(webhook_url: &str, notification: &Notification) {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
+        .expect("build reqwest client");
     if let Err(e) = client.post(webhook_url).json(&payload).send().await {
         warn!(error = %e, "slack notification failed");
     }
@@ -167,7 +167,7 @@ async fn send_discord(webhook_url: &str, notification: &Notification) {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
+        .expect("build reqwest client");
     if let Err(e) = client.post(webhook_url).json(&payload).send().await {
         warn!(error = %e, "discord notification failed");
     }
@@ -183,7 +183,7 @@ async fn send_telegram(bot_token: &str, chat_id: &str, notification: &Notificati
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
+        .expect("build reqwest client");
     if let Err(e) = client.post(&url).json(&payload).send().await {
         warn!(error = %e, "telegram notification failed");
     }

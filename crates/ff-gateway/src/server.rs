@@ -178,7 +178,7 @@ impl GatewayState {
             http_client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
+                .expect("build reqwest client"),
             discovery_registry: None,
             leader_sync: None,
             operational_store: None,
@@ -382,7 +382,7 @@ impl GatewayServer {
                 reqwest::Client::builder()
                     .timeout(std::time::Duration::from_secs(30))
                     .build()
-                    .unwrap_or_else(|_| reqwest::Client::new())
+                    .expect("build reqwest client")
             });
 
         let state = Arc::new(state);

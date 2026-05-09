@@ -234,7 +234,7 @@ impl NodeScanner {
         let client = reqwest::Client::builder()
             .timeout(DEFAULT_HEALTH_TIMEOUT)
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .expect("build reqwest client");
 
         Self {
             targets,
@@ -248,7 +248,7 @@ impl NodeScanner {
         let client = reqwest::Client::builder()
             .timeout(health_timeout)
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .expect("build reqwest client");
 
         Self {
             targets,

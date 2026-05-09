@@ -633,7 +633,7 @@ tier = 2
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .expect("build reqwest client");
 
         let first = client.get(&url).send().await.unwrap();
         assert_eq!(first.status().as_u16(), 200);

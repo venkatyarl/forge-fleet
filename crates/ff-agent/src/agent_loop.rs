@@ -53,7 +53,7 @@ fn log_tool_usage(tool_name: &str, session_id: &str, success: bool, duration_ms:
         let _ = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new())
+            .expect("build reqwest client")
             .post(format!("{}/api/tools/usage", gateway))
             .json(&payload)
             .send()

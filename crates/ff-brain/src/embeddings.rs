@@ -61,7 +61,7 @@ impl EmbeddingClient {
         let resp = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new())
+            .expect("build reqwest client")
             .post(format!("{}/v1/embeddings", self.endpoint))
             .json(&serde_json::json!({
                 "model": self.model_id,
@@ -111,7 +111,7 @@ impl EmbeddingClient {
         let resp = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new())
+            .expect("build reqwest client")
             .post(format!("{}/v1/embeddings", self.endpoint))
             .json(&serde_json::json!({
                 "model": self.model_id,

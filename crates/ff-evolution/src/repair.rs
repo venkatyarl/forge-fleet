@@ -112,7 +112,7 @@ impl RepairPlanner {
             http_client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
+                .expect("build reqwest client"),
             webhook: None,
             audit_pool: None,
         }

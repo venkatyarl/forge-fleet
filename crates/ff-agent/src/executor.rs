@@ -169,7 +169,7 @@ async fn execute_model_inference(
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
+        .expect("build reqwest client");
     let body = json!({
         "model": model.clone().unwrap_or_else(|| "local-model".to_string()),
         "prompt": prompt,
