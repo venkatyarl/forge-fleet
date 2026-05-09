@@ -10,6 +10,10 @@ description = "ForgeFleet Terminal — rich interactive TUI for the ForgeFleet a
 name = "ff"
 path = "src/main.rs"
 
+[[bin]]
+name = "aura"
+path = "src/bin/aura.rs"
+
 [dependencies]
 ff-agent = { path = "../ff-agent" }
 ff-api = { path = "../ff-api" }
@@ -23,6 +27,9 @@ ratatui = { version = "0.29", features = ["crossterm"] }
 crossterm = "0.29"
 
 reqwest.workspace = true
+rusqlite = { version = "0.32", features = ["bundled"] }
+shellexpand = "3"
+tracing-subscriber.workspace = true
 dirs = "5"
 anyhow.workspace = true
 chrono.workspace = true
