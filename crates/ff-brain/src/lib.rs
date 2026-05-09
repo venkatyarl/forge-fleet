@@ -11,6 +11,7 @@
 pub mod chat;
 pub mod communities;
 pub mod context;
+pub mod distillation;
 pub mod embeddings;
 pub mod facts;
 pub mod procedural_memory;

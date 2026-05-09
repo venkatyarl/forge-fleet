@@ -43,6 +43,9 @@ pub struct App {
 
     /// Active modal overlay (e.g. model picker). When Some, key input is captured by the overlay.
     pub picker: Option<ModelPicker>,
+
+    /// Live task queue displayed in the TUI sidebar.
+    pub task_queue: Vec<QueuedTask>,
 }
 
 /// Interactive model picker overlay shown when user runs `/model` with no args.
@@ -205,6 +208,19 @@ pub struct FleetNode {
     pub daemon_online: bool,
     /// Models loaded on this node.
     pub models: Vec<NodeModel>,
+    /// Recent GPU utilization samples (0-100) for sparkline rendering.
+    pub gpu_history: Vec<u8>,
+    /// Current role in fleet topology.
+    pub role: String,
+}
+
+/// A pending task in the fleet queue.
+#[derive(Debug, Clone)]
+pub struct QueuedTask {
+    pub id: String,
+    pub title: String,
+    pub priority: u8,
+    pub status: String,
 }
 
 /// A model running on a fleet node.
@@ -258,6 +274,7 @@ impl App {
             working_dir,
             brain_status: None,
             picker: None,
+            task_queue: Vec::new(),
         }
     }
 
@@ -692,11 +709,13 @@ async fn fleet_nodes_from_db() -> Vec<FleetNode> {
                     .collect();
             }
             FleetNode {
-                name: n.name,
+                name: n.name.clone(),
                 ip: n.ip,
                 os: n.os,
                 daemon_online: false,
                 models: node_models,
+                gpu_history: vec![], // populated by background refresh
+                role: n.role.clone(),
             }
         })
         .collect()

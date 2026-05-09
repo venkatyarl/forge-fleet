@@ -9,6 +9,34 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use crate::app::App;
 use crate::theme::Theme;
 
+/// Render a sparkline from GPU utilization history using ASCII blocks.
+fn sparkline_ascii(values: &[u8], width: usize) -> String {
+    const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    if values.is_empty() { return String::new(); }
+    let max = *values.iter().max().unwrap_or(&1).max(&1);
+    values.iter().rev().take(width).rev().map(|&v| {
+        let idx = ((v as usize * 7) / max as usize).min(7);
+        BARS[idx]
+    }).collect()
+}
+
+/// Color for GPU utilization heat (0 = green, 50 = yellow, 100 = red).
+fn gpu_heat_color(value: u8) -> Color {
+    if value < 50 {
+        Color::Rgb(74, 222, 128)
+    } else if value < 80 {
+        Color::Rgb(251, 191, 36)
+    } else {
+        Color::Rgb(248, 113, 113)
+    }
+}
+
+/// Truncate a string to max length with ellipsis.
+fn truncate_str(s: &str, max: usize) -> String {
+    if s.chars().count() <= max { s.to_string() }
+    else { s.chars().take(max.saturating_sub(1)).collect::<String>() + "…" }
+}
+
 /// Pretty-print an `os_family` slug for fleet-panel display.
 /// Maps: macos→macOS, linux-ubuntu→Ubuntu, linux-dgx→DGX OS,
 /// linux-debian→Debian, windows→Windows, anything else→title-cased as-is.
@@ -517,6 +545,85 @@ fn render_left_sidebar(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) 
     }
 
     lines.push(Line::from(""));
+
+    // Fleet Topology ASCII — show nodes connected to a central hub
+    lines.push(Line::from(Span::styled(
+        " Topology ",
+        Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
+    )));
+    if app.fleet_nodes.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  (no nodes)",
+            Style::default().fg(Color::Rgb(71, 85, 105)),
+        )));
+    } else {
+        // Simple star topology ASCII
+        let center = " ◉ Gateway".to_string();
+        lines.push(Line::from(Span::styled(center, Style::default().fg(Color::Rgb(99, 102, 241)).add_modifier(Modifier::BOLD))));
+        for (i, node) in app.fleet_nodes.iter().take(6).enumerate() {
+            let is_last = i == app.fleet_nodes.len().min(6) - 1;
+            let branch = if is_last { " └─" } else { " ├─" };
+            let role_icon = match node.role.as_str() {
+                "leader" => "★",
+                "builder" => "🔨",
+                "gateway" => "🌐",
+                _ => "●",
+            };
+            let status_color = if node.daemon_online { Color::Rgb(74, 222, 128) } else { Color::Rgb(248, 113, 113) };
+            lines.push(Line::from(vec![
+                Span::styled(branch, Style::default().fg(Color::Rgb(100, 116, 139))),
+                Span::styled(format!(" {role_icon} "), Style::default().fg(status_color)),
+                Span::styled(&node.name, Style::default().fg(theme.fg)),
+                Span::styled(format!(" [{}]", &node.role), Style::default().fg(Color::Rgb(100, 116, 139))),
+            ]));
+            // GPU sparkline
+            if !node.gpu_history.is_empty() {
+                let spark = sparkline_ascii(&node.gpu_history, 12);
+                let avg = node.gpu_history.iter().map(|&v| v as u32).sum::<u32>() / node.gpu_history.len() as u32;
+                lines.push(Line::from(vec![
+                    Span::styled("    ", Style::default()),
+                    Span::styled(spark, Style::default().fg(gpu_heat_color(avg as u8))),
+                    Span::styled(format!(" {avg}% GPU"), Style::default().fg(Color::Rgb(100, 116, 139))),
+                ]));
+            }
+        }
+        if app.fleet_nodes.len() > 6 {
+            lines.push(Line::from(Span::styled(
+                format!(" ... +{} more", app.fleet_nodes.len() - 6),
+                Style::default().fg(Color::Rgb(71, 85, 105)),
+            )));
+        }
+    }
+
+    lines.push(Line::from(""));
+
+    // Live Task Queue
+    if !app.task_queue.is_empty() {
+        lines.push(Line::from(Span::styled(
+            " Queue ",
+            Style::default().fg(Color::Rgb(251, 191, 36)).add_modifier(Modifier::BOLD),
+        )));
+        for task in app.task_queue.iter().take(5) {
+            let p_icon = match task.priority {
+                1 => "🔴",
+                2 => "🟠",
+                3 => "🟡",
+                _ => "🟢",
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!(" {p_icon} "), Style::default()),
+                Span::styled(truncate_str(&task.title, 24), Style::default().fg(Color::Rgb(226, 232, 240))),
+                Span::styled(format!(" [{}]", &task.status), Style::default().fg(Color::Rgb(100, 116, 139))),
+            ]));
+        }
+        if app.task_queue.len() > 5 {
+            lines.push(Line::from(Span::styled(
+                format!(" ... +{} more", app.task_queue.len() - 5),
+                Style::default().fg(Color::Rgb(71, 85, 105)),
+            )));
+        }
+        lines.push(Line::from(""));
+    }
 
     // Fleet — node + model status (moved from former right sidebar)
     lines.push(Line::from(Span::styled(
