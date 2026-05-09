@@ -9,7 +9,8 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use tracing::{debug, info, warn};
@@ -103,8 +104,8 @@ impl InferenceRouter {
     ///
     /// Always favours local over remote, and tool-capable over non-tool.
     /// Call `report_failure` when a request to the returned URL fails.
-    pub fn active_url(&self) -> Option<String> {
-        let state = self.failures.lock().unwrap();
+    pub async fn active_url(&self) -> Option<String> {
+        let state = self.failures.lock().await;
         for ep in &self.endpoints {
             if !state.is_cooling_down(&ep.url, self.cooldown) {
                 debug!(label = %ep.label, url = %ep.url, "InferenceRouter selected endpoint");
@@ -130,8 +131,8 @@ impl InferenceRouter {
 
     /// Mark an endpoint as failed. It will be skipped for `cooldown` seconds,
     /// then automatically reconsidered.
-    pub fn report_failure(&self, url: &str) {
-        let mut state = self.failures.lock().unwrap();
+    pub async fn report_failure(&self, url: &str) {
+        let mut state = self.failures.lock().await;
         state.mark_failed(url);
         warn!(
             url,
@@ -141,14 +142,14 @@ impl InferenceRouter {
     }
 
     /// Mark an endpoint as healthy (clears any failure state).
-    pub fn report_success(&self, url: &str) {
-        let mut state = self.failures.lock().unwrap();
+    pub async fn report_success(&self, url: &str) {
+        let mut state = self.failures.lock().await;
         state.clear(url);
     }
 
     /// Return a snapshot of all endpoints and their current health status.
-    pub fn status(&self) -> Vec<(String, String, bool)> {
-        let state = self.failures.lock().unwrap();
+    pub async fn status(&self) -> Vec<(String, String, bool)> {
+        let state = self.failures.lock().await;
         self.endpoints
             .iter()
             .map(|ep| {

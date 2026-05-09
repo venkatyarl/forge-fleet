@@ -721,6 +721,7 @@ async fn run_agent_loop(
         let active_base = if let Some(router) = &session.config.inference_router {
             router
                 .active_url()
+                .await
                 .unwrap_or_else(|| session.config.llm_base_url.clone())
         } else {
             session.config.llm_base_url.clone()
@@ -741,7 +742,7 @@ async fn run_agent_loop(
             Ok(resp) => {
                 // Mark the endpoint healthy on success
                 if let Some(router) = &session.config.inference_router {
-                    router.report_success(&active_base);
+                    router.report_success(&active_base).await;
                 }
                 resp
             }
@@ -829,8 +830,8 @@ async fn run_agent_loop(
                 // On LLM failure: mark endpoint as down and immediately try the
                 // next available fleet node (rather than waiting with backoff).
                 if let Some(router) = &session.config.inference_router {
-                    router.report_failure(&active_base);
-                    let next = router.active_url();
+                    router.report_failure(&active_base).await;
+                    let next = router.active_url().await;
                     if next.as_deref() != Some(active_base.as_str()) {
                         emit(
                             &event_tx,

@@ -94,6 +94,7 @@ impl AgentCoordinator {
     /// `PulseReader` pointed at the fleet Redis.
     pub fn new(pg: PgPool, pulse: Arc<PulseReader>) -> Self {
         let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
             .pool_idle_timeout(Duration::from_secs(30))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());

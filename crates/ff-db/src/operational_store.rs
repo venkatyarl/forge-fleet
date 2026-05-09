@@ -161,6 +161,7 @@ impl OperationalStore {
                         registered_at
                     FROM nodes
                     ORDER BY election_priority, name
+                    LIMIT 100
                     "#,
                 )
                 .fetch_all(pool.as_ref())
@@ -268,6 +269,7 @@ impl OperationalStore {
                     FROM tasks
                     WHERE status = $1
                     ORDER BY priority DESC, created_at
+                    LIMIT 100
                     "#,
                 )
                 .bind(status)

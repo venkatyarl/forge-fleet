@@ -489,7 +489,7 @@ fn handle_health(config_path: &Path) -> Result<()> {
 async fn handle_tools(args: ToolsArgs, _config_path: &Path) -> Result<()> {
     let gateway = std::env::var("FF_GATEWAY_URL")
         .unwrap_or_else(|_| "http://192.168.5.100:51002".to_string());
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build().unwrap_or_else(|_| reqwest::Client::new());
 
     match args.command {
         ToolsCommand::List { node, name, unhealthy } => {

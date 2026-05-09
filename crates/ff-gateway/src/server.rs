@@ -18,6 +18,8 @@ use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::{net::TcpListener, sync::mpsc};
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -648,13 +650,35 @@ pub fn build_router(state: Arc<GatewayState>, mc_db_path: Option<&str>) -> Route
     // Initialize Prometheus metrics (idempotent).
     init_prometheus_metrics();
 
+    // CORS: restrict to known origins instead of permissive Any.
+    let cors_origins: Vec<_> = std::env::var("FF_CORS_ORIGINS")
+        .ok()
+        .map(|s| s.split(',').map(|o| o.trim().to_string()).collect())
+        .unwrap_or_else(|| vec![
+            "http://localhost:51002".to_string(),
+            "http://localhost:5173".to_string(),
+            "http://127.0.0.1:51002".to_string(),
+            "http://127.0.0.1:5173".to_string(),
+        ]);
+    let cors = if cors_origins.iter().any(|o| o == "*") {
+        CorsLayer::new().allow_origin(tower_http::cors::Any)
+    } else {
+        let origins: Vec<_> = cors_origins
+            .iter()
+            .filter_map(|o| o.parse::<header::HeaderValue>().ok())
+            .collect();
+        CorsLayer::new().allow_origin(origins)
+    }
+    .allow_methods([axum::http::Method::GET, axum::http::Method::POST, axum::http::Method::PUT, axum::http::Method::PATCH, axum::http::Method::DELETE, axum::http::Method::DELETE])
+    .allow_headers(tower_http::cors::Any);
+
     app.route("/metrics", get(serve_prometheus_metrics))
         .fallback(crate::static_files::serve_dashboard)
         .layer(middleware::from_fn(crate::middleware::jwt_auth_middleware))
         .layer(middleware::from_fn(crate::middleware::trace_id_middleware))
         .layer(middleware::from_fn(prometheus_metrics_middleware))
         .layer(TraceLayer::new_for_http())
-        .layer(CorsLayer::new().allow_origin(tower_http::cors::Any).allow_methods([axum::http::Method::GET, axum::http::Method::POST, axum::http::Method::PUT, axum::http::Method::PATCH, axum::http::Method::DELETE]).allow_headers(tower_http::cors::Any))
+        .layer(cors)
         .with_state(state)
 }
 
@@ -774,14 +798,37 @@ async fn well_known_forgefleet(State(state): State<Arc<GatewayState>>) -> Json<V
     }))
 }
 
+/// Verify GitHub webhook HMAC-SHA256 signature.
+///
+/// `signature` is the `x-hub-signature-256` header value (e.g. `sha256=abc123...`).
+/// `secret` is the webhook secret configured in the GitHub repo settings.
+fn verify_github_signature(body: &[u8], signature: &str, secret: &str) -> bool {
+    let expected = signature.strip_prefix("sha256=").unwrap_or(signature);
+    let expected = match hex::decode(expected) {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+    type HmacSha256 = Hmac<Sha256>;
+    let mut mac = match HmacSha256::new_from_slice(secret.as_bytes()) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    mac.update(body);
+    let result = mac.finalize().into_bytes();
+    // Constant-time comparison to prevent timing attacks.
+    if result.len() != expected.len() {
+        return false;
+    }
+    use subtle::ConstantTimeEq;
+    result.as_slice().ct_eq(&expected).into()
+}
+
 /// GitHub webhook receiver — drops `workflow_run` + `check_run` events
 /// into `project_ci_runs` so `ff project status <id>` + the dashboard
 /// can show live CI state without polling the GitHub API.
 ///
-/// Closes #105. No signature verification yet (add HMAC with
-/// `fleet_secrets.github_webhook_secret` in a follow-up); mesh is assumed
-/// trusted (webhooks arrive from GitHub hitting the public-facing URL the
-/// operator configured in their repo's webhook settings).
+/// HMAC-SHA256 signature verification is enforced when `fleet_secrets.github_webhook_secret`
+/// is configured. Unsigned webhooks are rejected in that case.
 async fn github_webhook_handler(
     State(state): State<Arc<GatewayState>>,
     headers: HeaderMap,
@@ -793,7 +840,7 @@ async fn github_webhook_handler(
         .unwrap_or("")
         .to_string();
 
-    let _signature = headers
+    let signature = headers
         .get("x-hub-signature-256")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
@@ -810,9 +857,22 @@ async fn github_webhook_handler(
         None
     };
 
-    if secret.is_some() {
-        // TODO(P2-security): Wire verify_github_signature() once hmac+subtle deps added.
-        warn!("github webhook signature verification not yet implemented — accepting webhook");
+    if let Some(ref sec) = secret {
+        if signature.is_empty() {
+            warn!("github webhook rejected: signature header missing but secret is configured");
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"accepted": false, "reason": "signature required"})),
+            );
+        }
+        if !verify_github_signature(&body, &signature, sec) {
+            warn!("github webhook rejected: HMAC signature mismatch");
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"accepted": false, "reason": "invalid signature"})),
+            );
+        }
+        debug!("github webhook signature verified");
     } else {
         warn!("github webhook secret not configured — accepting unsigned webhook (configure fleet_secrets.github_webhook_secret to enable verification)");
     }

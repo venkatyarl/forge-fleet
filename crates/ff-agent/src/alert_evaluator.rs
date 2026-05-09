@@ -541,11 +541,13 @@ async fn condition_held_for_duration(
         _ => return Ok(true),
     };
 
+    // `col` is derived from a hardcoded whitelist above; safe to interpolate.
     let sql = format!(
         "SELECT {col}::FLOAT8 AS v FROM computer_metrics_history
          WHERE computer_id = $1
            AND recorded_at > NOW() - ($2 || ' seconds')::interval
-         ORDER BY recorded_at ASC"
+         ORDER BY recorded_at ASC
+         LIMIT 1000"
     );
     let rows = sqlx::query(&sql)
         .bind(computer_id)

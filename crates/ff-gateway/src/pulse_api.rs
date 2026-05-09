@@ -705,7 +705,7 @@ pub async fn list_work_items(
                labels, status, priority, assigned_to, assigned_computer,
                branch_name, pr_url, created_at, created_by, started_at,
                completed_at, due_date, estimated_hours
-        FROM work_items
+        FROM fleet_work_items
         WHERE 1=1
         "#,
     );
@@ -722,6 +722,7 @@ pub async fn list_work_items(
         args.push(a.clone());
         sql.push_str(&format!(" AND assigned_to = ${}", args.len()));
     }
+    // `limit` is clamped to 1-1000 above, so direct interpolation is safe.
     sql.push_str(&format!(" ORDER BY created_at DESC LIMIT {}", limit));
 
     let mut query = sqlx::query(&sql);

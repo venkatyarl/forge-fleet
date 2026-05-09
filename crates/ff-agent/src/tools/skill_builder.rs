@@ -112,7 +112,7 @@ impl AgentTool for SkillBuilderTool {
 
                 if !url.is_empty() {
                     // Download from URL
-                    let client = reqwest::Client::new();
+                    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build().unwrap_or_else(|_| reqwest::Client::new());
                     match client.get(url).send().await {
                         Ok(resp) if resp.status().is_success() => {
                             let content = resp.text().await.unwrap_or_default();

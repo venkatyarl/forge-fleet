@@ -347,6 +347,7 @@ impl RuntimeRegistryStore {
                         updated_at
                     FROM fleet_node_runtime
                     ORDER BY hostname, node_id
+                    LIMIT 100
                     "#,
                 )
                 .fetch_all(pool.as_ref())

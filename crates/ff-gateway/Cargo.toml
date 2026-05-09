@@ -37,6 +37,9 @@ dashmap.workspace = true
 tower-http.workspace = true
 hyper.workspace = true
 sha2.workspace = true  # onboard::parse_pubkey_meta
+hmac.workspace = true
+subtle.workspace = true
+hex.workspace = true
 bytes.workspace = true
 tokio-util = { version = "0.7", features = ["rt"] }
 rust-embed = "8"

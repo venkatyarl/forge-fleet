@@ -124,7 +124,7 @@ pub struct LeaderTick {
     /// Reset to `None` whenever the leader becomes pulse-alive again OR
     /// the leader name changes. Used to gate [`pg_claim_leader_pulse_silent`]
     /// via [`MIN_PULSE_SILENT_SECS`] — closes #91.
-    leader_pulse_silent_since: std::sync::Mutex<Option<(String, std::time::Instant)>>,
+    leader_pulse_silent_since: tokio::sync::Mutex<Option<(String, std::time::Instant)>>,
 }
 
 impl LeaderTick {
@@ -146,7 +146,7 @@ impl LeaderTick {
             on_became_leader: Arc::new(|_| {}),
             on_lost_leader: Arc::new(|_| {}),
             pg_failover_manager: None,
-            leader_pulse_silent_since: std::sync::Mutex::new(None),
+            leader_pulse_silent_since: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -154,12 +154,12 @@ impl LeaderTick {
     /// Returns `Some(duration)` once the leader has been continuously
     /// pulse-silent; `None` otherwise. Resets whenever the leader name
     /// changes (different leader → different silence window).
-    fn observe_leader_pulse_silence(
+    async fn observe_leader_pulse_silence(
         &self,
         leader_name: &str,
         leader_alive_in_pulse: bool,
     ) -> Option<std::time::Duration> {
-        let mut guard = self.leader_pulse_silent_since.lock().ok()?;
+        let mut guard = self.leader_pulse_silent_since.lock().await;
         if leader_alive_in_pulse {
             *guard = None;
             return None;
@@ -402,8 +402,9 @@ impl LeaderTick {
             (Some(cur), Some(best)) => {
                 let stale = leader_is_stale(&cur);
                 let leader_alive_in_pulse = alive.get(&cur.member_name).copied().unwrap_or(false);
-                let pulse_silence =
-                    self.observe_leader_pulse_silence(&cur.member_name, leader_alive_in_pulse);
+                let pulse_silence = self
+                    .observe_leader_pulse_silence(&cur.member_name, leader_alive_in_pulse)
+                    .await;
                 let pulse_silent_long_enough = pulse_silence
                     .map(|d| d.as_secs() >= MIN_PULSE_SILENT_SECS)
                     .unwrap_or(false);
@@ -453,9 +454,8 @@ impl LeaderTick {
                     .await?;
                     if took {
                         // Reset silence tracker: there's a new leader now.
-                        if let Ok(mut g) = self.leader_pulse_silent_since.lock() {
-                            *g = None;
-                        }
+                        let mut g = self.leader_pulse_silent_since.lock().await;
+                        *g = None;
                         (self.on_became_leader)(Some(displaced_name.clone()));
                         Ok(TickOutcome::TookOver(displaced_name))
                     } else {

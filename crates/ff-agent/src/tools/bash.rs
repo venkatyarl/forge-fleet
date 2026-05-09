@@ -83,29 +83,12 @@ impl AgentTool for BashTool {
         let env_vars = shell_state.env_vars.clone();
         drop(shell_state);
 
-        // Build a wrapper script that:
-        // 1. Sets env vars from persistent state
-        // 2. cd's to the persistent cwd
-        // 3. Runs the command
-        // 4. Outputs a sentinel block with the final cwd and new exports
-        // Simpler approach: run the command directly, then capture pwd separately.
-        // Avoids leaking env vars into tool output.
-        let wrapper = format!(
-            r#"cd {cwd} 2>/dev/null || true
-{exports}
-{command}"#,
-            cwd = shell_quote(&effective_cwd.to_string_lossy()),
-            exports = env_vars
-                .iter()
-                .map(|(k, v)| format!("export {}={}", k, shell_quote(v)))
-                .collect::<Vec<_>>()
-                .join("\n"),
-            command = command,
-        );
-
+        // Run the command directly via bash -c with current_dir and env vars set
+        // on the Command itself, avoiding wrapper-script construction that could
+        // be vulnerable to injection through cwd or env values.
         let result = tokio::time::timeout(
             std::time::Duration::from_millis(timeout_ms),
-            run_shell(&wrapper),
+            run_shell_command(command, &effective_cwd, &env_vars),
         )
         .await;
 
@@ -138,8 +121,18 @@ impl AgentTool for BashTool {
     }
 }
 
-async fn run_shell(script: &str) -> anyhow::Result<(i32, String, String)> {
-    let output = Command::new("bash").arg("-c").arg(script).output().await?;
+async fn run_shell_command(
+    command: &str,
+    cwd: &std::path::Path,
+    env_vars: &std::collections::HashMap<String, String>,
+) -> anyhow::Result<(i32, String, String)> {
+    let output = Command::new("bash")
+        .arg("-c")
+        .arg(command)
+        .current_dir(cwd)
+        .envs(env_vars)
+        .output()
+        .await?;
 
     let exit_code = output.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();

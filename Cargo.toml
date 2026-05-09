@@ -78,6 +78,9 @@ clap = { version = "4", features = ["derive"] }
 dashmap = "6"
 bytes = "1"
 sha2 = { version = "0.10", features = [] }
+hmac = "0.12"
+subtle = "2"
+hex = "0.4"
 
 # ─── Root binary (ForgeFleet daemon) ─────────────────────────────────────────
 

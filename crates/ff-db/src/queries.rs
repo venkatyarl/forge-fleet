@@ -246,7 +246,8 @@ pub fn list_nodes(conn: &Connection) -> Result<Vec<NodeRow>> {
     let mut stmt = conn.prepare(
         "SELECT id, name, host, port, role, election_priority, status,
                 hardware_json, models_json, last_heartbeat, registered_at
-         FROM nodes ORDER BY election_priority, name",
+         FROM nodes ORDER BY election_priority, name
+         LIMIT 100",
     )?;
 
     let rows = stmt.query_map([], |row| {
@@ -409,7 +410,8 @@ pub fn list_fleet_node_runtime_at(
                 resources_json, services_json, models_json, capabilities_json,
                 stale_degraded_after_secs, stale_offline_after_secs, updated_at
          FROM fleet_node_runtime
-         ORDER BY hostname, node_id",
+         ORDER BY hostname, node_id
+         LIMIT 100",
     )?;
 
     let rows = stmt.query_map([], |row| {
@@ -1600,7 +1602,8 @@ pub async fn pg_list_models_for_node(pool: &PgPool, node: &str) -> Result<Vec<Fl
     let rows = sqlx::query(
         "SELECT id, node_name, slug, name, family, port, tier,
                 local_model, lifecycle, mode, preferred_workloads
-         FROM fleet_models WHERE node_name = $1 ORDER BY slug",
+         FROM fleet_models WHERE node_name = $1 ORDER BY slug
+         LIMIT 100",
     )
     .bind(node)
     .fetch_all(pool)
@@ -1641,7 +1644,8 @@ pub async fn pg_list_models_by_workload(
          JOIN fleet_nodes n ON n.name = m.node_name
          WHERE m.preferred_workloads @> $1::jsonb
            AND n.status IN ('online', 'degraded')
-         ORDER BY m.tier ASC, m.node_name, m.slug",
+         ORDER BY m.tier ASC, m.node_name, m.slug
+         LIMIT 100",
     )
     .bind(&workloads_json)
     .fetch_all(pool)
@@ -1962,7 +1966,8 @@ pub async fn pg_search_catalog(pool: &PgPool, query: &str) -> Result<Vec<ModelCa
         "SELECT id, name, family, parameters, tier, description, gated, preferred_workloads, variants
            FROM fleet_model_catalog
           WHERE LOWER(id) LIKE $1 OR LOWER(name) LIKE $1 OR LOWER(family) LIKE $1
-          ORDER BY tier DESC, name ASC",
+          ORDER BY tier DESC, name ASC
+         LIMIT 100",
     )
     .bind(&pattern)
     .fetch_all(pool)
@@ -2067,13 +2072,13 @@ pub async fn pg_list_library(
 ) -> Result<Vec<ModelLibraryRow>> {
     let rows = if let Some(n) = node_name {
         sqlx::query(
-            "SELECT * FROM fleet_model_library WHERE node_name = $1 ORDER BY node_name, catalog_id",
+            "SELECT * FROM fleet_model_library WHERE node_name = $1 ORDER BY node_name, catalog_id LIMIT 100",
         )
         .bind(n)
         .fetch_all(pool)
         .await?
     } else {
-        sqlx::query("SELECT * FROM fleet_model_library ORDER BY node_name, catalog_id")
+        sqlx::query("SELECT * FROM fleet_model_library ORDER BY node_name, catalog_id LIMIT 100")
             .fetch_all(pool)
             .await?
     };
@@ -2134,13 +2139,13 @@ pub async fn pg_list_deployments(
 ) -> Result<Vec<ModelDeploymentRow>> {
     let rows = if let Some(n) = node_name {
         sqlx::query(
-            "SELECT * FROM fleet_model_deployments WHERE node_name = $1 ORDER BY node_name, port",
+            "SELECT * FROM fleet_model_deployments WHERE node_name = $1 ORDER BY node_name, port LIMIT 100",
         )
         .bind(n)
         .fetch_all(pool)
         .await?
     } else {
-        sqlx::query("SELECT * FROM fleet_model_deployments ORDER BY node_name, port")
+        sqlx::query("SELECT * FROM fleet_model_deployments ORDER BY node_name, port LIMIT 100")
             .fetch_all(pool)
             .await?
     };
@@ -2472,14 +2477,15 @@ pub async fn pg_list_node_ssh_keys(
         sqlx::query(
             "SELECT * FROM fleet_node_ssh_keys
               WHERE node_name = $1 AND key_purpose = $2
-              ORDER BY added_at",
+              ORDER BY added_at
+              LIMIT 100",
         )
         .bind(node_name)
         .bind(p)
         .fetch_all(pool)
         .await?
     } else {
-        sqlx::query("SELECT * FROM fleet_node_ssh_keys WHERE node_name = $1 ORDER BY added_at")
+        sqlx::query("SELECT * FROM fleet_node_ssh_keys WHERE node_name = $1 ORDER BY added_at LIMIT 100")
             .bind(node_name)
             .fetch_all(pool)
             .await?
@@ -2550,13 +2556,14 @@ pub async fn pg_list_mesh_status(pool: &PgPool, node: Option<&str>) -> Result<Ve
         sqlx::query(
             "SELECT * FROM fleet_mesh_status
               WHERE src_node = $1 OR dst_node = $1
-              ORDER BY src_node, dst_node",
+              ORDER BY src_node, dst_node
+              LIMIT 100",
         )
         .bind(n)
         .fetch_all(pool)
         .await?
     } else {
-        sqlx::query("SELECT * FROM fleet_mesh_status ORDER BY src_node, dst_node")
+        sqlx::query("SELECT * FROM fleet_mesh_status ORDER BY src_node, dst_node LIMIT 100")
             .fetch_all(pool)
             .await?
     };
@@ -2933,7 +2940,8 @@ pub async fn pg_list_secrets(
 > {
     let rows = sqlx::query(
         "SELECT key, description, updated_by, updated_at
-         FROM fleet_secrets ORDER BY key",
+         FROM fleet_secrets ORDER BY key
+         LIMIT 100",
     )
     .fetch_all(pool)
     .await?;
@@ -4275,14 +4283,13 @@ pub async fn pg_list_brain_vault_nodes_current(
     project: Option<&str>,
 ) -> Result<Vec<BrainVaultNodeRow>> {
     let rows = if let Some(p) = project {
-        sqlx::query("SELECT * FROM brain_vault_nodes WHERE valid_until IS NULL AND project = $1 ORDER BY updated_at DESC
-         LIMIT 100")
+        sqlx::query("SELECT * FROM brain_vault_nodes WHERE valid_until IS NULL AND project = $1 ORDER BY updated_at DESC LIMIT 100")
             .bind(p)
             .fetch_all(pool)
             .await?
     } else {
         sqlx::query(
-            "SELECT * FROM brain_vault_nodes WHERE valid_until IS NULL ORDER BY updated_at DESC",
+            "SELECT * FROM brain_vault_nodes WHERE valid_until IS NULL ORDER BY updated_at DESC LIMIT 100",
         )
         .fetch_all(pool)
         .await?
@@ -4374,7 +4381,7 @@ pub async fn pg_list_brain_vault_edges_for_node(
     pool: &PgPool,
     node_id: uuid::Uuid,
 ) -> Result<Vec<BrainVaultEdgeRow>> {
-    let rows = sqlx::query("SELECT * FROM brain_vault_edges WHERE src_id = $1 OR dst_id = $1")
+    let rows = sqlx::query("SELECT * FROM brain_vault_edges WHERE src_id = $1 OR dst_id = $1 LIMIT 100")
         .bind(node_id)
         .fetch_all(pool)
         .await?;
@@ -4453,7 +4460,8 @@ pub async fn pg_list_brain_candidates_pending(
 ) -> Result<Vec<BrainCandidateRow>> {
     let rows = sqlx::query(
         "SELECT * FROM brain_knowledge_candidates WHERE user_id = $1 AND status = 'pending'
-         ORDER BY created_at DESC",
+         ORDER BY created_at DESC
+         LIMIT 100",
     )
     .bind(user_id)
     .fetch_all(pool)
@@ -4727,7 +4735,8 @@ pub async fn pg_list_shared_volumes(pool: &PgPool) -> Result<Vec<SharedVolumeRow
         "SELECT v.*, c.name as host_name
          FROM shared_volumes v
          LEFT JOIN computers c ON c.id = v.host_computer_id
-         ORDER BY v.created_at DESC",
+         ORDER BY v.created_at DESC
+         LIMIT 100",
     )
     .fetch_all(pool)
     .await?;
@@ -4804,7 +4813,8 @@ pub async fn pg_list_shared_volume_mounts(
              LEFT JOIN shared_volumes v ON v.id = m.volume_id
              LEFT JOIN computers c       ON c.id = m.computer_id
              WHERE m.volume_id = $1
-             ORDER BY m.mounted_at DESC",
+             ORDER BY m.mounted_at DESC
+             LIMIT 100",
         )
         .bind(vid)
         .fetch_all(pool)
@@ -4815,7 +4825,8 @@ pub async fn pg_list_shared_volume_mounts(
              FROM shared_volume_mounts m
              LEFT JOIN shared_volumes v ON v.id = m.volume_id
              LEFT JOIN computers c       ON c.id = m.computer_id
-             ORDER BY m.mounted_at DESC",
+             ORDER BY m.mounted_at DESC
+             LIMIT 100",
         )
         .fetch_all(pool)
         .await?
@@ -4889,7 +4900,8 @@ pub async fn pg_list_schedules(
              FROM computer_schedules s
              LEFT JOIN computers c ON c.id = s.computer_id
              WHERE s.computer_id = $1 AND s.enabled = true
-             ORDER BY s.created_at DESC",
+             ORDER BY s.created_at DESC
+             LIMIT 100",
             )
             .bind(cid)
             .fetch_all(pool)
@@ -4901,7 +4913,8 @@ pub async fn pg_list_schedules(
              FROM computer_schedules s
              LEFT JOIN computers c ON c.id = s.computer_id
              WHERE s.computer_id = $1
-             ORDER BY s.created_at DESC",
+             ORDER BY s.created_at DESC
+             LIMIT 100",
             )
             .bind(cid)
             .fetch_all(pool)
@@ -4913,7 +4926,8 @@ pub async fn pg_list_schedules(
              FROM computer_schedules s
              LEFT JOIN computers c ON c.id = s.computer_id
              WHERE s.enabled = true
-             ORDER BY s.created_at DESC",
+             ORDER BY s.created_at DESC
+             LIMIT 100",
             )
             .fetch_all(pool)
             .await?
@@ -4923,7 +4937,8 @@ pub async fn pg_list_schedules(
                 "SELECT s.*, c.name as computer_name
              FROM computer_schedules s
              LEFT JOIN computers c ON c.id = s.computer_id
-             ORDER BY s.created_at DESC",
+             ORDER BY s.created_at DESC
+             LIMIT 100",
             )
             .fetch_all(pool)
             .await?
