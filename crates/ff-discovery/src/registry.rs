@@ -92,9 +92,9 @@ impl FleetNode {
 
     /// Returns `true` if the node is considered healthy (Healthy or Degraded).
     pub fn is_healthy(&self) -> bool {
-        self.health.as_ref().is_some_and(|h| {
-            matches!(h.status, HealthStatus::Healthy | HealthStatus::Degraded)
-        })
+        self.health
+            .as_ref()
+            .is_some_and(|h| matches!(h.status, HealthStatus::Healthy | HealthStatus::Degraded))
     }
 
     /// Returns `true` if the node is online (Healthy status only).

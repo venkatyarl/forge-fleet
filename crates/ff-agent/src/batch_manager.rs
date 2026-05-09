@@ -5,7 +5,7 @@
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sqlx::{PgPool, Row};
 use tracing::{debug, info};
 use uuid::Uuid;
@@ -69,7 +69,10 @@ impl ItemWeight {
 /// Partition items into `num_batches` using greedy bin-packing.
 /// Sorts by weight descending, then assigns each item to the batch
 /// with the lowest current weight.
-pub fn weighted_partition(items: Vec<(String, ItemWeight)>, num_batches: usize) -> Vec<Vec<(String, ItemWeight)>> {
+pub fn weighted_partition(
+    items: Vec<(String, ItemWeight)>,
+    num_batches: usize,
+) -> Vec<Vec<(String, ItemWeight)>> {
     if num_batches == 0 || items.is_empty() {
         return vec![];
     }
@@ -78,7 +81,8 @@ pub fn weighted_partition(items: Vec<(String, ItemWeight)>, num_batches: usize) 
     // Sort by weight descending (heaviest first — critical for bin-packing quality)
     items.sort_by(|a, b| b.1.total().partial_cmp(&a.1.total()).unwrap());
 
-    let mut batches: Vec<Vec<(String, ItemWeight)>> = (0..num_batches).map(|_| Vec::new()).collect();
+    let mut batches: Vec<Vec<(String, ItemWeight)>> =
+        (0..num_batches).map(|_| Vec::new()).collect();
     let mut batch_weights: Vec<f64> = vec![0.0; num_batches];
 
     for (key, weight) in items {
@@ -346,11 +350,7 @@ pub async fn complete_work_item(
 }
 
 /// Mark a work item as failed.
-pub async fn fail_work_item(
-    pg: &PgPool,
-    item_id: Uuid,
-    error: &str,
-) -> Result<()> {
+pub async fn fail_work_item(pg: &PgPool, item_id: Uuid, error: &str) -> Result<()> {
     sqlx::query(
         r#"
         UPDATE fleet_work_items
@@ -604,7 +604,10 @@ pub async fn pg_enqueue_decomposed_task(
     });
 
     let caps = serde_json::Value::Array(
-        capabilities.iter().map(|c| Value::String(c.clone())).collect(),
+        capabilities
+            .iter()
+            .map(|c| Value::String(c.clone()))
+            .collect(),
     );
 
     let id: uuid::Uuid = sqlx::query_scalar(
@@ -656,10 +659,34 @@ mod tests {
     #[test]
     fn test_weighted_partition_basic() {
         let items = vec![
-            ("a".to_string(), ItemWeight { base: 10.0, ..Default::default() }),
-            ("b".to_string(), ItemWeight { base: 5.0, ..Default::default() }),
-            ("c".to_string(), ItemWeight { base: 3.0, ..Default::default() }),
-            ("d".to_string(), ItemWeight { base: 2.0, ..Default::default() }),
+            (
+                "a".to_string(),
+                ItemWeight {
+                    base: 10.0,
+                    ..Default::default()
+                },
+            ),
+            (
+                "b".to_string(),
+                ItemWeight {
+                    base: 5.0,
+                    ..Default::default()
+                },
+            ),
+            (
+                "c".to_string(),
+                ItemWeight {
+                    base: 3.0,
+                    ..Default::default()
+                },
+            ),
+            (
+                "d".to_string(),
+                ItemWeight {
+                    base: 2.0,
+                    ..Default::default()
+                },
+            ),
         ];
         let batches = weighted_partition(items, 2);
         assert_eq!(batches.len(), 2);
@@ -678,9 +705,7 @@ mod tests {
 
     #[test]
     fn test_weighted_partition_zero_batches() {
-        let items = vec![
-            ("a".to_string(), ItemWeight::default()),
-        ];
+        let items = vec![("a".to_string(), ItemWeight::default())];
         let batches = weighted_partition(items, 0);
         assert!(batches.is_empty());
     }
@@ -703,8 +728,13 @@ mod tests {
     #[test]
     fn test_task_progress_empty() {
         let p = TaskProgress {
-            pending: 0, claimed: 0, in_progress: 0,
-            completed: 0, failed: 0, yielded: 0, total: 0,
+            pending: 0,
+            claimed: 0,
+            in_progress: 0,
+            completed: 0,
+            failed: 0,
+            yielded: 0,
+            total: 0,
         };
         assert_eq!(p.percent_complete(), 0.0);
         assert!(!p.is_done());

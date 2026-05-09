@@ -50,7 +50,10 @@ fn log_tool_usage(tool_name: &str, session_id: &str, success: bool, duration_ms:
     });
     let name = tool_name.to_string();
     tokio::spawn(async move {
-        let _ = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build().unwrap_or_else(|_| reqwest::Client::new())
+        let _ = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
             .post(format!("{}/api/tools/usage", gateway))
             .json(&payload)
             .send()
@@ -68,7 +71,11 @@ fn check_tool_allowed(
     allowed: &Option<std::collections::HashSet<String>>,
 ) -> bool {
     let allowed_json = allowed.as_ref().map(|set| {
-        serde_json::Value::Array(set.iter().map(|s| serde_json::Value::String(s.clone())).collect())
+        serde_json::Value::Array(
+            set.iter()
+                .map(|s| serde_json::Value::String(s.clone()))
+                .collect(),
+        )
     });
     let empty = serde_json::json!([]);
     let allowed_val = allowed_json.as_ref().unwrap_or(&empty);
@@ -376,30 +383,31 @@ impl AgentSession {
         // Re-apply output-style directive to the system prompt on every run,
         // so `/output-style` changes take effect on the NEXT request.
         if let Some(sys_msg) = self.messages.first_mut()
-            && let Some(current) = sys_msg.text_content().map(String::from) {
-                // Strip any previously-applied directive (marker-bounded).
-                const START: &str = "\n\n<!--ff:output_style-->";
-                const END: &str = "<!--/ff:output_style-->";
-                let base = if let (Some(s), Some(e)) = (current.find(START), current.find(END)) {
-                    if e > s {
-                        let mut b = String::new();
-                        b.push_str(&current[..s]);
-                        b.push_str(&current[e + END.len()..]);
-                        b
-                    } else {
-                        current.clone()
-                    }
+            && let Some(current) = sys_msg.text_content().map(String::from)
+        {
+            // Strip any previously-applied directive (marker-bounded).
+            const START: &str = "\n\n<!--ff:output_style-->";
+            const END: &str = "<!--/ff:output_style-->";
+            let base = if let (Some(s), Some(e)) = (current.find(START), current.find(END)) {
+                if e > s {
+                    let mut b = String::new();
+                    b.push_str(&current[..s]);
+                    b.push_str(&current[e + END.len()..]);
+                    b
                 } else {
                     current.clone()
-                };
-                let directive = output_style_directive(&self.config.output_style);
-                let new_prompt = if directive.is_empty() {
-                    base
-                } else {
-                    format!("{base}{START}{directive}{END}")
-                };
-                *sys_msg = ToolChatMessage::system(new_prompt);
-            }
+                }
+            } else {
+                current.clone()
+            };
+            let directive = output_style_directive(&self.config.output_style);
+            let new_prompt = if directive.is_empty() {
+                base
+            } else {
+                format!("{base}{START}{directive}{END}")
+            };
+            *sys_msg = ToolChatMessage::system(new_prompt);
+        }
 
         // Load three-brain memory and inject into system prompt (first turn only)
         if self.turn_count == 0 {
@@ -407,9 +415,10 @@ impl AgentSession {
             let injection = crate::brain::BrainLoader::build_injection(&brain_ctx, 3000);
             if !injection.is_empty()
                 && let Some(sys_msg) = self.messages.first_mut()
-                    && let Some(current) = sys_msg.text_content().map(String::from) {
-                        *sys_msg = ToolChatMessage::system(format!("{current}{injection}"));
-                    }
+                && let Some(current) = sys_msg.text_content().map(String::from)
+            {
+                *sys_msg = ToolChatMessage::system(format!("{current}{injection}"));
+            }
         }
 
         // Inject Focus Stack + Backlog context as a system reminder
@@ -466,9 +475,9 @@ impl AgentSession {
                 self.turn_count,
             )
             .await
-            {
-                warn!(error = %e, "failed to auto-save session");
-            }
+        {
+            warn!(error = %e, "failed to auto-save session");
+        }
 
         // Auto-collect training data for future LoRA fine-tuning
         if self.config.auto_save {
@@ -943,16 +952,17 @@ async fn run_agent_loop(
 
         // Text-mode fallback parsing
         if tool_calls.is_empty()
-            && let Some(text) = assistant_msg.text_content() {
-                let text_calls = openai_bridge::parse_text_tool_calls(text);
-                if !text_calls.is_empty() {
-                    debug!(
-                        count = text_calls.len(),
-                        "parsed tool calls from text fallback"
-                    );
-                    tool_calls = text_calls;
-                }
+            && let Some(text) = assistant_msg.text_content()
+        {
+            let text_calls = openai_bridge::parse_text_tool_calls(text);
+            if !text_calls.is_empty() {
+                debug!(
+                    count = text_calls.len(),
+                    "parsed tool calls from text fallback"
+                );
+                tool_calls = text_calls;
             }
+        }
 
         if tool_calls.is_empty() {
             // No tool calls — agent is done
@@ -1054,7 +1064,9 @@ async fn run_agent_loop(
 
                 // Security gate (V81): check step-level allow-list.
                 if !check_tool_allowed(&tool_name, &session.config.allowed_tools) {
-                    let denied_msg = format!("Tool '{tool_name}' is not in the allowed-tools list for this step.");
+                    let denied_msg = format!(
+                        "Tool '{tool_name}' is not in the allowed-tools list for this step."
+                    );
                     emit(
                         &event_tx,
                         AgentEvent::ToolEnd {
@@ -1071,7 +1083,15 @@ async fn run_agent_loop(
                     let tn = tool_name.clone();
                     tokio::spawn(async move {
                         if let Ok(args) = serde_json::from_str::<serde_json::Value>(&args_str) {
-                            audit_tool_call(pg.as_ref(), &sid, &tn, &args, crate::audit_logger::ToolOutcome::Denied, Some(0)).await;
+                            audit_tool_call(
+                                pg.as_ref(),
+                                &sid,
+                                &tn,
+                                &args,
+                                crate::audit_logger::ToolOutcome::Denied,
+                                Some(0),
+                            )
+                            .await;
                         }
                     });
                     pre_blocked.push((tool_id, denied_msg, true));
@@ -1199,7 +1219,9 @@ async fn run_agent_loop(
 
                 // Security gate (V81): check step-level allow-list.
                 if !check_tool_allowed(&tool_name, &session.config.allowed_tools) {
-                    let denied_msg = format!("Tool '{tool_name}' is not in the allowed-tools list for this step.");
+                    let denied_msg = format!(
+                        "Tool '{tool_name}' is not in the allowed-tools list for this step."
+                    );
                     emit(
                         &event_tx,
                         AgentEvent::ToolEnd {
@@ -1217,7 +1239,15 @@ async fn run_agent_loop(
                     let pg = session.tool_ctx.pg_pool.clone();
                     let sid = session_id.clone();
                     tokio::spawn(async move {
-                        audit_tool_call(pg.as_ref(), &sid, &tool_name, &args, crate::audit_logger::ToolOutcome::Denied, Some(0)).await;
+                        audit_tool_call(
+                            pg.as_ref(),
+                            &sid,
+                            &tool_name,
+                            &args,
+                            crate::audit_logger::ToolOutcome::Denied,
+                            Some(0),
+                        )
+                        .await;
                     });
                     continue;
                 }
@@ -1225,7 +1255,9 @@ async fn run_agent_loop(
                 // Find and execute tool
                 if let Some(idx) = tools::find_tool_arc(&tool_name, &session.tools) {
                     let start = std::time::Instant::now();
-                    let result = session.tools[idx].execute(args.clone(), &session.tool_ctx).await;
+                    let result = session.tools[idx]
+                        .execute(args.clone(), &session.tool_ctx)
+                        .await;
                     let duration_ms = start.elapsed().as_millis() as u64;
                     log_tool_usage(
                         &tool_name,
@@ -1243,7 +1275,8 @@ async fn run_agent_loop(
                     let tn = tool_name.clone();
                     let a = args.clone();
                     tokio::spawn(async move {
-                        audit_tool_call(pg.as_ref(), &sid, &tn, &a, outcome, Some(duration_ms)).await;
+                        audit_tool_call(pg.as_ref(), &sid, &tn, &a, outcome, Some(duration_ms))
+                            .await;
                     });
 
                     let result_content =

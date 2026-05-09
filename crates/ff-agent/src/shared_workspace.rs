@@ -4,9 +4,9 @@
 //! Each sub-agent gets an isolated workspace under:
 //! ~/.forgefleet/agents/agent-{id}/sub-agents/sub-agent-{m}/
 
-use std::path::{Path, PathBuf};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 use tokio::fs;
 use tracing::{info, warn};
 
@@ -83,7 +83,11 @@ impl SubAgentWorkspace {
             "created_at": chrono::Utc::now().to_rfc3339(),
             "status": "active",
         });
-        fs::write(self.metadata_path(), serde_json::to_string_pretty(&metadata)?).await?;
+        fs::write(
+            self.metadata_path(),
+            serde_json::to_string_pretty(&metadata)?,
+        )
+        .await?;
 
         info!(path = %self.base_path.display(), "sub-agent workspace created");
         Ok(())
@@ -121,7 +125,15 @@ pub async fn setup_agent_workspace(agent_id: &str) -> Result<PathBuf> {
         .join("agents")
         .join(agent_id);
 
-    for dir in &["config", "memory", "sessions", "checkpoints", "workspace", "sub-agents", "logs"] {
+    for dir in &[
+        "config",
+        "memory",
+        "sessions",
+        "checkpoints",
+        "workspace",
+        "sub-agents",
+        "logs",
+    ] {
         fs::create_dir_all(base.join(dir)).await?;
     }
 
@@ -131,7 +143,11 @@ pub async fn setup_agent_workspace(agent_id: &str) -> Result<PathBuf> {
         "created_at": chrono::Utc::now().to_rfc3339(),
         "role": "general",
     });
-    fs::write(base.join(".metadata.json"), serde_json::to_string_pretty(&metadata)?).await?;
+    fs::write(
+        base.join(".metadata.json"),
+        serde_json::to_string_pretty(&metadata)?,
+    )
+    .await?;
 
     info!(agent_id = agent_id, path = %base.display(), "agent workspace created");
     Ok(base)
@@ -160,7 +176,8 @@ pub async fn run_cleanup(
             match entries.next_entry().await {
                 Ok(Some(entry)) => {
                     let path = entry.path();
-                    let subagent_id = path.file_name()
+                    let subagent_id = path
+                        .file_name()
                         .and_then(|n| n.to_str())
                         .unwrap_or("unknown")
                         .to_string();
@@ -185,7 +202,9 @@ pub async fn run_cleanup(
                                     .await;
                                 }
                             }
-                            Err(e) => warn!(path = %temp.display(), error = %e, "failed to clear temp"),
+                            Err(e) => {
+                                warn!(path = %temp.display(), error = %e, "failed to clear temp")
+                            }
                         }
                     }
                 }
@@ -247,9 +266,10 @@ pub async fn list_agent_workspaces() -> Result<Vec<String>> {
             Ok(Some(entry)) => {
                 let path = entry.path();
                 if path.is_dir()
-                    && let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                        agents.push(name.to_string());
-                    }
+                    && let Some(name) = path.file_name().and_then(|n| n.to_str())
+                {
+                    agents.push(name.to_string());
+                }
             }
             Ok(None) => break,
             Err(_) => break,

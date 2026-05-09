@@ -81,15 +81,16 @@ impl AgentTool for TrendAnalysisTool {
             .unwrap_or_default();
         if let Ok(resp) = client.get(&hn_url).send().await
             && let Ok(data) = resp.json::<Value>().await
-                && let Some(hits) = data.get("hits").and_then(Value::as_array) {
-                    results.push("## HackerNews".into());
-                    for hit in hits.iter().take(5) {
-                        let title = hit.get("title").and_then(Value::as_str).unwrap_or("?");
-                        let points = hit.get("points").and_then(Value::as_u64).unwrap_or(0);
-                        let comments = hit.get("num_comments").and_then(Value::as_u64).unwrap_or(0);
-                        results.push(format!("  - {title} ({points} pts, {comments} comments)"));
-                    }
-                }
+            && let Some(hits) = data.get("hits").and_then(Value::as_array)
+        {
+            results.push("## HackerNews".into());
+            for hit in hits.iter().take(5) {
+                let title = hit.get("title").and_then(Value::as_str).unwrap_or("?");
+                let points = hit.get("points").and_then(Value::as_u64).unwrap_or(0);
+                let comments = hit.get("num_comments").and_then(Value::as_u64).unwrap_or(0);
+                results.push(format!("  - {title} ({points} pts, {comments} comments)"));
+            }
+        }
 
         // GitHub trending (via search API)
         let gh_url = format!(
@@ -102,22 +103,23 @@ impl AgentTool for TrendAnalysisTool {
             .send()
             .await
             && let Ok(data) = resp.json::<Value>().await
-                && let Some(items) = data.get("items").and_then(Value::as_array) {
-                    results.push("## GitHub Trending".into());
-                    for item in items.iter().take(5) {
-                        let name = item.get("full_name").and_then(Value::as_str).unwrap_or("?");
-                        let stars = item
-                            .get("stargazers_count")
-                            .and_then(Value::as_u64)
-                            .unwrap_or(0);
-                        let desc = item
-                            .get("description")
-                            .and_then(Value::as_str)
-                            .unwrap_or("");
-                        let desc_preview: String = desc.chars().take(60).collect();
-                        results.push(format!("  - {name} (⭐{stars}) — {desc_preview}"));
-                    }
-                }
+            && let Some(items) = data.get("items").and_then(Value::as_array)
+        {
+            results.push("## GitHub Trending".into());
+            for item in items.iter().take(5) {
+                let name = item.get("full_name").and_then(Value::as_str).unwrap_or("?");
+                let stars = item
+                    .get("stargazers_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let desc = item
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let desc_preview: String = desc.chars().take(60).collect();
+                results.push(format!("  - {name} (⭐{stars}) — {desc_preview}"));
+            }
+        }
 
         // Web search for broader trends
         let search = WebSearchTool;

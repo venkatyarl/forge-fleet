@@ -150,12 +150,17 @@ async fn run_tool_registry_reporter(node_id: String, leader_url: String) {
 
     let gateway = if leader_url.contains(':') {
         // Convert leader URL (e.g., http://192.168.5.100:50001) to gateway URL
-        leader_url.replace(":50001", ":51002").replace(":50000", ":51002")
+        leader_url
+            .replace(":50001", ":51002")
+            .replace(":50000", ":51002")
     } else {
         "http://192.168.5.100:51002".to_string()
     };
 
-    let client = match reqwest::Client::builder().timeout(Duration::from_secs(30)).build() {
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+    {
         Ok(c) => c,
         Err(e) => {
             warn!(error = %e, "failed to build HTTP client for tool registry");
@@ -202,7 +207,12 @@ async fn run_tool_registry_reporter(node_id: String, leader_url: String) {
 
         let heartbeat_body = serde_json::json!({"node_name": node_id});
         let heartbeat_url = format!("{}/api/tools/heartbeat", gateway);
-        match client.post(&heartbeat_url).json(&heartbeat_body).send().await {
+        match client
+            .post(&heartbeat_url)
+            .json(&heartbeat_body)
+            .send()
+            .await
+        {
             Ok(resp) => {
                 if !resp.status().is_success() {
                     warn!(status = %resp.status(), "fleet tool heartbeat returned non-success");

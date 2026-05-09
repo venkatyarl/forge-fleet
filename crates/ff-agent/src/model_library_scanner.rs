@@ -320,9 +320,10 @@ fn classify_dir(path: &Path, catalog: &[ff_db::ModelCatalogRow]) -> Option<Disco
                 let p = e.path();
                 if p.is_file()
                     && let Some(ext) = p.extension()
-                        && ext.eq_ignore_ascii_case("gguf") {
-                            nested_ggufs.push(p);
-                        }
+                    && ext.eq_ignore_ascii_case("gguf")
+                {
+                    nested_ggufs.push(p);
+                }
             }
         }
     }

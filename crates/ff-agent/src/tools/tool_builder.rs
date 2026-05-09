@@ -167,27 +167,28 @@ impl AgentTool for {struct_name} {{
                             .get("rebuild")
                             .and_then(Value::as_bool)
                             .unwrap_or(false)
-                            && let Some(ref root) = ff_root {
-                                let build = tokio::process::Command::new("cargo")
-                                    .args(["build", "-p", "ff-terminal"])
-                                    .current_dir(root)
-                                    .output()
-                                    .await;
-                                match build {
-                                    Ok(out) if out.status.success() => {
-                                        result.push_str("\n\nAuto-rebuild: SUCCESS");
-                                    }
-                                    Ok(out) => {
-                                        result.push_str(&format!(
-                                            "\n\nAuto-rebuild: FAILED\n{}",
-                                            String::from_utf8_lossy(&out.stderr)
-                                        ));
-                                    }
-                                    Err(e) => {
-                                        result.push_str(&format!("\n\nAuto-rebuild: ERROR — {e}"));
-                                    }
+                            && let Some(ref root) = ff_root
+                        {
+                            let build = tokio::process::Command::new("cargo")
+                                .args(["build", "-p", "ff-terminal"])
+                                .current_dir(root)
+                                .output()
+                                .await;
+                            match build {
+                                Ok(out) if out.status.success() => {
+                                    result.push_str("\n\nAuto-rebuild: SUCCESS");
+                                }
+                                Ok(out) => {
+                                    result.push_str(&format!(
+                                        "\n\nAuto-rebuild: FAILED\n{}",
+                                        String::from_utf8_lossy(&out.stderr)
+                                    ));
+                                }
+                                Err(e) => {
+                                    result.push_str(&format!("\n\nAuto-rebuild: ERROR — {e}"));
                                 }
                             }
+                        }
 
                         AgentToolResult::ok(truncate_output(&result, MAX_TOOL_RESULT_CHARS))
                     }
@@ -298,9 +299,10 @@ async fn find_forgefleet_root(ctx: &AgentToolContext) -> Option<std::path::PathB
     loop {
         let cargo = current.join("Cargo.toml");
         if let Ok(content) = fs::read_to_string(&cargo).await
-            && (content.contains("forge-fleet") || content.contains("ff-agent")) {
-                return Some(current);
-            }
+            && (content.contains("forge-fleet") || content.contains("ff-agent"))
+        {
+            return Some(current);
+        }
         if !current.pop() {
             break;
         }

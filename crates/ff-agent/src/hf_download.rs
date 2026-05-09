@@ -203,34 +203,37 @@ pub async fn download_repo(
         // Resume: skip if already complete (and verified when possible).
         if file.size > 0
             && let Ok(meta) = tokio::fs::metadata(&dest_path).await
-                && meta.is_file() && meta.len() == file.size {
-                    let mut accept = true;
-                    if !opts.skip_verify
-                        && let Some(expected) = file.expected_sha256() {
-                            let path_for_hash = dest_path.clone();
-                            let expected_owned = expected.to_string();
-                            let ok = tokio::task::spawn_blocking(move || {
-                                verify_file_sha256(&path_for_hash, &expected_owned)
-                            })
-                            .await
-                            .map_err(|e| format!("hash task join error: {e}"))??;
-                            if !ok {
-                                // Existing file is corrupt — remove and re-download.
-                                let _ = tokio::fs::remove_file(&dest_path).await;
-                                accept = false;
-                            }
-                        }
-                    if accept {
-                        progress(DownloadProgress {
-                            file: file.path.clone(),
-                            bytes_done: file.size,
-                            bytes_total: file.size,
-                            percent: 100.0,
-                        });
-                        downloaded.push(dest_path);
-                        continue;
-                    }
+            && meta.is_file()
+            && meta.len() == file.size
+        {
+            let mut accept = true;
+            if !opts.skip_verify
+                && let Some(expected) = file.expected_sha256()
+            {
+                let path_for_hash = dest_path.clone();
+                let expected_owned = expected.to_string();
+                let ok = tokio::task::spawn_blocking(move || {
+                    verify_file_sha256(&path_for_hash, &expected_owned)
+                })
+                .await
+                .map_err(|e| format!("hash task join error: {e}"))??;
+                if !ok {
+                    // Existing file is corrupt — remove and re-download.
+                    let _ = tokio::fs::remove_file(&dest_path).await;
+                    accept = false;
                 }
+            }
+            if accept {
+                progress(DownloadProgress {
+                    file: file.path.clone(),
+                    bytes_done: file.size,
+                    bytes_total: file.size,
+                    percent: 100.0,
+                });
+                downloaded.push(dest_path);
+                continue;
+            }
+        }
 
         let url = format!(
             "https://huggingface.co/{}/resolve/{}/{}",
@@ -327,22 +330,23 @@ pub async fn download_repo(
 
         // 5. Verify sha256 for LFS files (absent sha256 => skip silently).
         if !opts.skip_verify
-            && let Some(expected) = file.expected_sha256() {
-                let path_for_hash = dest_path.clone();
-                let expected_owned = expected.to_string();
-                let ok = tokio::task::spawn_blocking(move || {
-                    verify_file_sha256(&path_for_hash, &expected_owned)
-                })
-                .await
-                .map_err(|e| format!("hash task join error: {e}"))??;
-                if !ok {
-                    let _ = tokio::fs::remove_file(&dest_path).await;
-                    return Err(format!(
-                        "sha256 mismatch for {}: expected {}",
-                        file.path, expected
-                    ));
-                }
+            && let Some(expected) = file.expected_sha256()
+        {
+            let path_for_hash = dest_path.clone();
+            let expected_owned = expected.to_string();
+            let ok = tokio::task::spawn_blocking(move || {
+                verify_file_sha256(&path_for_hash, &expected_owned)
+            })
+            .await
+            .map_err(|e| format!("hash task join error: {e}"))??;
+            if !ok {
+                let _ = tokio::fs::remove_file(&dest_path).await;
+                return Err(format!(
+                    "sha256 mismatch for {}: expected {}",
+                    file.path, expected
+                ));
             }
+        }
 
         downloaded.push(dest_path);
     }
@@ -371,9 +375,10 @@ fn glob_match(pattern: &str, text: &str) -> bool {
     }
     if !pattern.contains('/')
         && let Some(base) = text.rsplit('/').next()
-            && glob_match_inner(pattern, base) {
-                return true;
-            }
+        && glob_match_inner(pattern, base)
+    {
+        return true;
+    }
     false
 }
 

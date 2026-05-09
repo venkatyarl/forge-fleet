@@ -630,7 +630,10 @@ tier = 2
     async fn test_status_server_changes_status_codes() {
         let (port, _handle, status_tx) = spawn_status_server(200).await;
         let url = format!("http://127.0.0.1:{port}/health");
-        let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build().unwrap_or_else(|_| reqwest::Client::new());
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
 
         let first = client.get(&url).send().await.unwrap();
         assert_eq!(first.status().as_u16(), 200);

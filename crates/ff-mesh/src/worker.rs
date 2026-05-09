@@ -383,7 +383,10 @@ async fn execute_model_inference(
     prompt: &str,
     max_tokens: Option<u32>,
 ) -> (bool, String) {
-    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build().unwrap_or_else(|_| reqwest::Client::new());
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
     let payload = serde_json::json!({
         "model": model.unwrap_or("local-model"),
         "prompt": prompt,

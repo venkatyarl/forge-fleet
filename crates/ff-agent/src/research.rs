@@ -38,9 +38,7 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::multi_agent::{
-    AgentTaskResult, OrchestratorEvent, TaskStatus,
-};
+use crate::multi_agent::{AgentTaskResult, OrchestratorEvent, TaskStatus};
 
 // ─── Public types ───────────────────────────────────────────────────────────
 
@@ -195,9 +193,10 @@ pub async fn resolve_port(pool: &PgPool, service: &str, fallback: u16) -> u16 {
 /// used when the DB can't answer.
 pub async fn resolve_gateway_url(pool: &PgPool) -> String {
     if let Ok(v) = std::env::var("FORGEFLEET_GATEWAY_URL")
-        && !v.is_empty() {
-            return v;
-        }
+        && !v.is_empty()
+    {
+        return v;
+    }
     let port = resolve_port(pool, "forgefleetd", 51002).await;
     let leader_ip: Option<String> = sqlx::query_scalar(
         "SELECT c.primary_ip
@@ -213,9 +212,10 @@ pub async fn resolve_gateway_url(pool: &PgPool) -> String {
         return format!("http://{ip}:{port}");
     }
     if let Ok(host) = std::env::var("FORGEFLEET_LEADER_HOST")
-        && !host.is_empty() {
-            return format!("http://{host}:{port}");
-        }
+        && !host.is_empty()
+    {
+        return format!("http://{host}:{port}");
+    }
     format!("http://127.0.0.1:{port}")
 }
 
@@ -887,7 +887,10 @@ async fn openai_single_completion(
         "max_tokens": max_tokens,
         "temperature": 0.2,
     });
-    let resp = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build().unwrap_or_else(|_| reqwest::Client::new())
+    let resp = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
         .post(&url)
         .json(&body)
         .timeout(std::time::Duration::from_secs(600))

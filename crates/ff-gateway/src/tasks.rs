@@ -1,4 +1,4 @@
-use axum::{body::Body, extract::State, http::StatusCode, response::Response, Json};
+use axum::{Json, body::Body, extract::State, http::StatusCode, response::Response};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sqlx::Row;
@@ -151,9 +151,10 @@ fn build_chat_payload(task_def: &TaskDef, req: &TaskRequest) -> Value {
     });
 
     if let Some(ref model) = req.model
-        && !model.eq_ignore_ascii_case("auto") {
-            payload["model"] = json!(model);
-        }
+        && !model.eq_ignore_ascii_case("auto")
+    {
+        payload["model"] = json!(model);
+    }
 
     if req.output_format.as_deref() == Some("json") {
         payload["response_format"] = json!({ "type": "json_object" });
@@ -238,45 +239,49 @@ async fn handle_task_inner(
     // ── 3a. Direct model routing if a specific model was requested ───────────
     if let Some(ref model) = req.model
         && !model.eq_ignore_ascii_case("auto")
-            && let Some(ref router) = state.pulse_router {
-                let cache = state.pulse_cache.as_deref();
-                let pg = state.operational_store.as_ref().and_then(|s| s.pg_pool());
-                match router.route_completion_cached(body.clone(), cache, pg).await {
-                    Ok(result) => {
-                        info!(task = %task_type, model = %model, "task routed directly via pulse router");
-                        return Response::builder()
-                            .status(StatusCode::OK)
-                            .header("content-type", "application/json")
-                            .body(Body::from(result.to_string()))
-                            .map_err(|e| {
-                                (
-                                    StatusCode::INTERNAL_SERVER_ERROR,
-                                    Json(json!({
-                                        "error": {
-                                            "message": e.to_string(),
-                                            "type": "internal_error",
-                                        }
-                                    })),
-                                )
-                            });
-                    }
-                    Err(crate::llm_routing::LlmRoutingError::NoMatch { .. })
-                    | Err(crate::llm_routing::LlmRoutingError::MissingModel) => {
-                        debug!(
-                            task = %task_type,
-                            model = %model,
-                            "direct pulse routing missed, falling back to capability routing"
-                        );
-                    }
-                    Err(e) => {
-                        let (code, err_body) = crate::llm_routing::error_to_response(e);
-                        return Err((
-                            StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY),
-                            Json(err_body),
-                        ));
-                    }
-                }
+        && let Some(ref router) = state.pulse_router
+    {
+        let cache = state.pulse_cache.as_deref();
+        let pg = state.operational_store.as_ref().and_then(|s| s.pg_pool());
+        match router
+            .route_completion_cached(body.clone(), cache, pg)
+            .await
+        {
+            Ok(result) => {
+                info!(task = %task_type, model = %model, "task routed directly via pulse router");
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Body::from(result.to_string()))
+                    .map_err(|e| {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(json!({
+                                "error": {
+                                    "message": e.to_string(),
+                                    "type": "internal_error",
+                                }
+                            })),
+                        )
+                    });
             }
+            Err(crate::llm_routing::LlmRoutingError::NoMatch { .. })
+            | Err(crate::llm_routing::LlmRoutingError::MissingModel) => {
+                debug!(
+                    task = %task_type,
+                    model = %model,
+                    "direct pulse routing missed, falling back to capability routing"
+                );
+            }
+            Err(e) => {
+                let (code, err_body) = crate::llm_routing::error_to_response(e);
+                return Err((
+                    StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_GATEWAY),
+                    Json(err_body),
+                ));
+            }
+        }
+    }
 
     // ── 3b. Capability-based fleet routing ───────────────────────────────────
     let pool = match state.operational_store.as_ref().and_then(|s| s.pg_pool()) {
@@ -290,11 +295,9 @@ async fn handle_task_inner(
     // Load catalog entries
     let mut catalog_entries: HashMap<String, (String, i32, Value)> = HashMap::new();
 
-    match sqlx::query(
-        "SELECT id, name, tier, preferred_workloads FROM fleet_model_catalog",
-    )
-    .fetch_all(pool)
-    .await
+    match sqlx::query("SELECT id, name, tier, preferred_workloads FROM fleet_model_catalog")
+        .fetch_all(pool)
+        .await
     {
         Ok(rows) => {
             for r in rows {
@@ -346,7 +349,11 @@ async fn handle_task_inner(
     let mut candidates: Vec<(i32, i32, f64, String, String, String)> = Vec::new();
 
     for s in &live_servers {
-        let _computer = s.get("computer").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let _computer = s
+            .get("computer")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         let endpoint_raw = s
             .get("endpoint_raw")
             .and_then(|v| v.as_str())
@@ -370,19 +377,25 @@ async fn handle_task_inner(
         let normalized_server_id = crate::llm_routing::normalize_model_id(&raw_model_id);
 
         // Find matching catalog entry by normalized model id
-        let catalog_match = catalog_entries.iter().find(|(cat_id, _)| {
-            crate::llm_routing::normalize_model_id(cat_id) == normalized_server_id
-        }).map(|(_, v)| v);
+        let catalog_match = catalog_entries
+            .iter()
+            .find(|(cat_id, _)| {
+                crate::llm_routing::normalize_model_id(cat_id) == normalized_server_id
+            })
+            .map(|(_, v)| v);
 
         let (name, tier, pw) = match catalog_match {
             Some((n, t, p)) => (n.clone(), *t, p.clone()),
             None => {
                 // Fallback: substring match on normalized ids
-                let fallback = catalog_entries.iter().find(|(cat_id, _)| {
-                    let cat_norm = crate::llm_routing::normalize_model_id(cat_id);
-                    normalized_server_id.contains(&cat_norm)
-                        || cat_norm.contains(&normalized_server_id)
-                }).map(|(_, v)| v);
+                let fallback = catalog_entries
+                    .iter()
+                    .find(|(cat_id, _)| {
+                        let cat_norm = crate::llm_routing::normalize_model_id(cat_id);
+                        normalized_server_id.contains(&cat_norm)
+                            || cat_norm.contains(&normalized_server_id)
+                    })
+                    .map(|(_, v)| v);
                 match fallback {
                     Some((n, t, p)) => (n.clone(), *t, p.clone()),
                     None => (raw_model_id.clone(), 2, Value::Array(vec![])),
@@ -391,7 +404,8 @@ async fn handle_task_inner(
         };
 
         // Check if model has ANY of the task's capabilities
-        let has_any_cap = pw.as_array()
+        let has_any_cap = pw
+            .as_array()
             .map(|arr| {
                 arr.iter().any(|v| {
                     v.as_str()
@@ -405,10 +419,7 @@ async fn handle_task_inner(
             continue;
         }
 
-        let qd = s
-            .get("queue_depth")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0) as i32;
+        let qd = s.get("queue_depth").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
         let tps = s
             .get("tokens_per_sec_last_min")
             .and_then(|v| v.as_f64())

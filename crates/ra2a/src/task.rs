@@ -38,9 +38,18 @@ pub struct TaskMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum MessagePart {
-    Text { text: String },
-    File { name: String, mime_type: String, bytes: Option<Vec<u8>> },
-    Data { mime_type: String, data: serde_json::Value },
+    Text {
+        text: String,
+    },
+    File {
+        name: String,
+        mime_type: String,
+        bytes: Option<Vec<u8>>,
+    },
+    Data {
+        mime_type: String,
+        data: serde_json::Value,
+    },
 }
 
 /// An artifact produced by a task.

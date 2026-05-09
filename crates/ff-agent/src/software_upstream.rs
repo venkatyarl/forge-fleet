@@ -415,9 +415,10 @@ async fn fetch_github_latest(
         .get(&url)
         .header("Accept", "application/vnd.github+json");
     if let Some(t) = token
-        && !t.is_empty() {
-            req = req.header("Authorization", format!("Bearer {t}"));
-        }
+        && !t.is_empty()
+    {
+        req = req.header("Authorization", format!("Bearer {t}"));
+    }
     let resp = req.send().await.map_err(|e| format!("GET {url}: {e}"))?;
 
     if !resp.status().is_success() {
@@ -450,9 +451,10 @@ async fn fetch_github_branch_head(
         .get(&url)
         .header("Accept", "application/vnd.github+json");
     if let Some(t) = token
-        && !t.is_empty() {
-            req = req.header("Authorization", format!("Bearer {t}"));
-        }
+        && !t.is_empty()
+    {
+        req = req.header("Authorization", format!("Bearer {t}"));
+    }
     let resp = req.send().await.map_err(|e| format!("GET {url}: {e}"))?;
     if !resp.status().is_success() {
         return Err(format!("GET {url}: HTTP {}", resp.status()));

@@ -71,19 +71,21 @@ pub fn build_system_prompt(config: &SystemPromptConfig) -> String {
 
     // Section 5: Dynamic context
     if let Some(git) = config.git_status
-        && !git.trim().is_empty() {
-            prompt.push_str("\n\n## Git Status\n\n```\n");
-            prompt.push_str(git.trim());
-            prompt.push_str("\n```\n");
-        }
+        && !git.trim().is_empty()
+    {
+        prompt.push_str("\n\n## Git Status\n\n```\n");
+        prompt.push_str(git.trim());
+        prompt.push_str("\n```\n");
+    }
 
     // Section 6: Custom prompt (appended)
     if let Some(custom) = config.custom_prompt
-        && !custom.trim().is_empty() {
-            prompt.push_str("\n\n## Additional Instructions\n\n");
-            prompt.push_str(custom.trim());
-            prompt.push('\n');
-        }
+        && !custom.trim().is_empty()
+    {
+        prompt.push_str("\n\n## Additional Instructions\n\n");
+        prompt.push_str(custom.trim());
+        prompt.push('\n');
+    }
 
     prompt
 }

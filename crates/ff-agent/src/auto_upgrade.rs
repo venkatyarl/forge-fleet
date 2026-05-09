@@ -891,9 +891,10 @@ async fn refresh_self_built_latest_versions(pool: &PgPool) -> Result<u64> {
 /// `~/projects/forge-fleet`; child commands inherit the daemon's `$HOME`.
 fn expand_tilde(s: &str) -> String {
     if let Some(rest) = s.strip_prefix("~/")
-        && let Ok(home) = std::env::var("HOME") {
-            return format!("{home}/{rest}");
-        }
+        && let Ok(home) = std::env::var("HOME")
+    {
+        return format!("{home}/{rest}");
+    }
     s.to_string()
 }
 

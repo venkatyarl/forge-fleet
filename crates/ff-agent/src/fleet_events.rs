@@ -159,10 +159,11 @@ where
                 }
             };
             if let Some(item) = parse(payload)
-                && tx.send(item).await.is_err() {
-                    debug!("fleet_events: {channel} receiver dropped");
-                    break;
-                }
+                && tx.send(item).await.is_err()
+            {
+                debug!("fleet_events: {channel} receiver dropped");
+                break;
+            }
         }
     });
     McpStream { rx }

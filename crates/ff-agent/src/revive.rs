@@ -462,16 +462,17 @@ fn parse_mac(s: &str) -> Option<[u8; 6]> {
 /// the stored `primary_ip` is a safe fallback.
 async fn rewrite_primary_ip_if_possible(target: &mut ReviveTarget) {
     if let Some((ip, kind)) = crate::fleet_info::resolve_best_ip(&target.name).await
-        && ip != target.primary_ip {
-            debug!(
-                node = %target.name,
-                old_ip = %target.primary_ip,
-                new_ip = %ip,
-                kind = %kind,
-                "revive: resolved better IP for target"
-            );
-            target.primary_ip = ip;
-        }
+        && ip != target.primary_ip
+    {
+        debug!(
+            node = %target.name,
+            old_ip = %target.primary_ip,
+            new_ip = %ip,
+            kind = %kind,
+            "revive: resolved better IP for target"
+        );
+        target.primary_ip = ip;
+    }
 }
 
 /// Shared row-extraction helper — pulls a `ReviveTarget` from a selected row.

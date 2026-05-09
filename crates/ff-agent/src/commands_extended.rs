@@ -836,22 +836,23 @@ impl Command for PasteImageCommand {
                 .await;
 
             if let Ok(out) = check
-                && out.status.success() {
-                    // Save clipboard image to temp file
-                    let temp_path = "/tmp/ff_clipboard_image.png";
-                    let save_cmd = format!(
-                        "osascript -e 'set png_data to the clipboard as «class PNGf»' -e 'set fp to open for access POSIX file \"{}\" with write permission' -e 'write png_data to fp' -e 'close access fp'",
-                        temp_path
-                    );
-                    let _ = tokio::process::Command::new("bash")
-                        .arg("-c")
-                        .arg(&save_cmd)
-                        .output()
-                        .await;
-                    return format!(
-                        "Image saved from clipboard: {temp_path}\nUse: PhotoAnalysis file_path=\"{temp_path}\" to analyze it."
-                    );
-                }
+                && out.status.success()
+            {
+                // Save clipboard image to temp file
+                let temp_path = "/tmp/ff_clipboard_image.png";
+                let save_cmd = format!(
+                    "osascript -e 'set png_data to the clipboard as «class PNGf»' -e 'set fp to open for access POSIX file \"{}\" with write permission' -e 'write png_data to fp' -e 'close access fp'",
+                    temp_path
+                );
+                let _ = tokio::process::Command::new("bash")
+                    .arg("-c")
+                    .arg(&save_cmd)
+                    .output()
+                    .await;
+                return format!(
+                    "Image saved from clipboard: {temp_path}\nUse: PhotoAnalysis file_path=\"{temp_path}\" to analyze it."
+                );
+            }
         }
 
         "No image in clipboard. Usage:\n  /paste-image /path/to/image.png\n  Or copy an image to clipboard first, then /paste-image".into()

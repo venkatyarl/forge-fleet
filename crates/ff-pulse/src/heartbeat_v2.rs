@@ -105,172 +105,170 @@ impl HeartbeatV2Publisher {
         // SystemConfiguration via networksetup) hangs in a launchd context,
         // we degrade gracefully rather than stall the heartbeat forever.
         const BUILD_BEAT_TIMEOUT: Duration = Duration::from_secs(30);
-        let blocking_result = tokio::time::timeout(BUILD_BEAT_TIMEOUT, tokio::task::spawn_blocking(move || {
-            let t0 = std::time::Instant::now();
-            let mut beat = PulseBeatV2::skeleton(&computer_name);
-            beat.epoch = epoch.load(Ordering::Relaxed);
-            beat.role_claimed = role
-                .read()
-                .map(|r| r.clone())
-                .unwrap_or_else(|_| "member".to_string());
-            beat.election_priority = election_priority;
-            beat.timestamp = Utc::now();
+        let blocking_result = tokio::time::timeout(
+            BUILD_BEAT_TIMEOUT,
+            tokio::task::spawn_blocking(move || {
+                let t0 = std::time::Instant::now();
+                let mut beat = PulseBeatV2::skeleton(&computer_name);
+                beat.epoch = epoch.load(Ordering::Relaxed);
+                beat.role_claimed = role
+                    .read()
+                    .map(|r| r.clone())
+                    .unwrap_or_else(|_| "member".to_string());
+                beat.election_priority = election_priority;
+                beat.timestamp = Utc::now();
 
-            // V43: drain any queued panics from the local panic_hook into the
-            // beat. Leader's materializer deduplicates into fleet_bug_reports.
-            let captured = ff_core::panic_hook::drain();
-            if !captured.is_empty() {
-                beat.encountered_bugs = captured
-                    .into_iter()
-                    .map(|b| crate::beat_v2::EncounteredBug {
-                        signature: b.signature,
-                        file_path: b.file_path,
-                        line_number: b.line_number,
-                        error_class: b.error_class,
-                        stack_excerpt: b.stack_excerpt,
-                        binary_version: b.binary_version,
-                        tier: b.tier,
-                    })
-                    .collect();
-            }
+                // V43: drain any queued panics from the local panic_hook into the
+                // beat. Leader's materializer deduplicates into fleet_bug_reports.
+                let captured = ff_core::panic_hook::drain();
+                if !captured.is_empty() {
+                    beat.encountered_bugs = captured
+                        .into_iter()
+                        .map(|b| crate::beat_v2::EncounteredBug {
+                            signature: b.signature,
+                            file_path: b.file_path,
+                            line_number: b.line_number,
+                            error_class: b.error_class,
+                            stack_excerpt: b.stack_excerpt,
+                            binary_version: b.binary_version,
+                            tier: b.tier,
+                        })
+                        .collect();
+                }
 
-            // ── Hardware + memory snapshot ─────────────────────────────────
-            // Inner timeouts for macOS framework calls that can hang in a
-            // launchd context (IOKit, DiskArbitration, etc.).
-            let sys = run_with_timeout(
-                || {
-                    // Skip process enumeration — it can hang on macOS when
-                    // run from a launchd agent (no user session / WindowServer).
-                    let mut s = System::new_with_specifics(
-                        sysinfo::RefreshKind::everything()
-                            .without_processes(),
-                    );
-                    s.refresh_all();
-                    s
-                },
-                5,
-            )
-            .unwrap_or_else(|| {
-                tracing::debug!("System::new_all() timed out; using fallback");
-                System::new()
-            });
-
-            let cpu_cores = std::thread::available_parallelism()
-                .map(|n| n.get() as i32)
-                .unwrap_or(1);
-            let ram_total_gb =
-                (sys.total_memory() as f64 / 1_073_741_824.0).round() as i32;
-            let ram_used_bytes = sys.used_memory();
-            let ram_used_gb = ram_used_bytes as f64 / 1_073_741_824.0;
-            let ram_free_gb =
-                (sys.total_memory() - ram_used_bytes) as f64 / 1_073_741_824.0;
-            let ram_pct = if sys.total_memory() > 0 {
-                (ram_used_bytes as f64 / sys.total_memory() as f64) * 100.0
-            } else {
-                0.0
-            };
-
-            let disks = run_with_timeout(Disks::new_with_refreshed_list, 5)
+                // ── Hardware + memory snapshot ─────────────────────────────────
+                // Inner timeouts for macOS framework calls that can hang in a
+                // launchd context (IOKit, DiskArbitration, etc.).
+                let sys = run_with_timeout(
+                    || {
+                        // Skip process enumeration — it can hang on macOS when
+                        // run from a launchd agent (no user session / WindowServer).
+                        let mut s = System::new_with_specifics(
+                            sysinfo::RefreshKind::everything().without_processes(),
+                        );
+                        s.refresh_all();
+                        s
+                    },
+                    5,
+                )
                 .unwrap_or_else(|| {
-                    tracing::debug!("Disks::new_with_refreshed_list() timed out; using empty list");
-                    Disks::new()
+                    tracing::debug!("System::new_all() timed out; using fallback");
+                    System::new()
                 });
-            let (disk_total, disk_used) =
-                disks.iter().fold((0u64, 0u64), |(t, u), d| {
+
+                let cpu_cores = std::thread::available_parallelism()
+                    .map(|n| n.get() as i32)
+                    .unwrap_or(1);
+                let ram_total_gb = (sys.total_memory() as f64 / 1_073_741_824.0).round() as i32;
+                let ram_used_bytes = sys.used_memory();
+                let ram_used_gb = ram_used_bytes as f64 / 1_073_741_824.0;
+                let ram_free_gb = (sys.total_memory() - ram_used_bytes) as f64 / 1_073_741_824.0;
+                let ram_pct = if sys.total_memory() > 0 {
+                    (ram_used_bytes as f64 / sys.total_memory() as f64) * 100.0
+                } else {
+                    0.0
+                };
+
+                let disks =
+                    run_with_timeout(Disks::new_with_refreshed_list, 5).unwrap_or_else(|| {
+                        tracing::debug!(
+                            "Disks::new_with_refreshed_list() timed out; using empty list"
+                        );
+                        Disks::new()
+                    });
+                let (disk_total, disk_used) = disks.iter().fold((0u64, 0u64), |(t, u), d| {
                     (
                         t + d.total_space(),
                         u + (d.total_space() - d.available_space()),
                     )
                 });
-            let disk_total_gb = (disk_total as f64 / 1_073_741_824.0) as i32;
-            let disk_free_gb =
-                (disk_total - disk_used) as f64 / 1_073_741_824.0;
+                let disk_total_gb = (disk_total as f64 / 1_073_741_824.0) as i32;
+                let disk_free_gb = (disk_total - disk_used) as f64 / 1_073_741_824.0;
 
-            beat.hardware = HardwareInfo {
-                cpu_cores,
-                ram_gb: ram_total_gb,
-                disk_gb: disk_total_gb,
-                gpu: detect_gpu_model(),
-            };
+                beat.hardware = HardwareInfo {
+                    cpu_cores,
+                    ram_gb: ram_total_gb,
+                    disk_gb: disk_total_gb,
+                    gpu: detect_gpu_model(),
+                };
 
-            beat.load = LoadInfo {
-                cpu_pct: sys.global_cpu_usage() as f64,
-                ram_pct,
-                disk_free_gb,
-                gpu_pct: 0.0, // Phase 7 fills this in
-                active_inference_requests: 0,
-                active_agent_sessions: 0,
-            };
+                beat.load = LoadInfo {
+                    cpu_pct: sys.global_cpu_usage() as f64,
+                    ram_pct,
+                    disk_free_gb,
+                    gpu_pct: 0.0, // Phase 7 fills this in
+                    active_inference_requests: 0,
+                    active_agent_sessions: 0,
+                };
 
-            beat.memory = MemoryInfo {
-                ram_total_gb: ram_total_gb as f64,
-                ram_used_gb,
-                ram_free_gb,
-                llm_ram_allocated_gb: 0.0, // Phase 7
-                ram_available_for_new_llm_gb: (ram_free_gb - 3.0).max(0.0), // reserve 3GB for OS
-                vram_total_gb: None,
-                vram_used_gb: None,
-                vram_free_gb: None,
-                llm_vram_allocated_gb: None,
-            };
+                beat.memory = MemoryInfo {
+                    ram_total_gb: ram_total_gb as f64,
+                    ram_used_gb,
+                    ram_free_gb,
+                    llm_ram_allocated_gb: 0.0, // Phase 7
+                    ram_available_for_new_llm_gb: (ram_free_gb - 3.0).max(0.0), // reserve 3GB for OS
+                    vram_total_gb: None,
+                    vram_used_gb: None,
+                    vram_free_gb: None,
+                    llm_vram_allocated_gb: None,
+                };
 
-            // ── Network identity ─────────────────────────────────────────
-            let mut all_ips = detect_all_ips();
-            // V43: annotate mlx5_core NICs with cx7-fabric kind + paired_with + link_speed.
-            for ip in all_ips.iter_mut() {
-                crate::cx7_detect::enrich_ip(ip, &computer_name);
-            }
-            beat.network = NetworkInfo {
-                primary_ip: detect_primary_ip(),
-                all_ips,
-            };
-
-            // ── Capabilities ─────────────────────────────────────────────
-            let gpu_kind = detect_gpu_kind();
-            let gpu_count = if gpu_kind == "none" { 0 } else { 1 };
-            let can_run_metal = gpu_kind == "apple_silicon";
-            let can_run_cuda = gpu_kind == "nvidia_cuda";
-            let can_run_rocm = gpu_kind == "amd_rocm";
-
-            let recommended_runtimes: Vec<String> = match gpu_kind.as_str() {
-                "apple_silicon" => {
-                    vec!["mlx_lm".into(), "llama.cpp".into()]
+                // ── Network identity ─────────────────────────────────────────
+                let mut all_ips = detect_all_ips();
+                // V43: annotate mlx5_core NICs with cx7-fabric kind + paired_with + link_speed.
+                for ip in all_ips.iter_mut() {
+                    crate::cx7_detect::enrich_ip(ip, &computer_name);
                 }
-                "nvidia_cuda" => {
-                    vec!["vllm".into(), "llama.cpp".into(), "ollama".into()]
-                }
-                "amd_rocm" => vec!["llama.cpp".into(), "ollama".into()],
-                _ => vec!["llama.cpp".into()],
-            };
+                beat.network = NetworkInfo {
+                    primary_ip: detect_primary_ip(),
+                    all_ips,
+                };
 
-            beat.capabilities = Capabilities {
-                can_serve_ff_gateway: true,
-                can_serve_openclaw_gateway: true,
-                can_host_postgres_replica: disk_free_gb > 100.0,
-                can_host_redis_replica: ram_total_gb >= 16,
-                gpu_kind: gpu_kind.clone(),
-                gpu_count,
-                gpu_vram_gb: None,
-                gpu_total_vram_gb: None,
-                can_run_cuda,
-                can_run_metal,
-                can_run_rocm,
-                recommended_runtimes,
-                max_runnable_model_gb: None,
-            };
+                // ── Capabilities ─────────────────────────────────────────────
+                let gpu_kind = detect_gpu_kind();
+                let gpu_count = if gpu_kind == "none" { 0 } else { 1 };
+                let can_run_metal = gpu_kind == "apple_silicon";
+                let can_run_cuda = gpu_kind == "nvidia_cuda";
+                let can_run_rocm = gpu_kind == "amd_rocm";
 
-            // ── Installed software inventory ─────────────────────────────
-            beat.installed_software = SoftwareCollector::new().detect();
+                let recommended_runtimes: Vec<String> = match gpu_kind.as_str() {
+                    "apple_silicon" => {
+                        vec!["mlx_lm".into(), "llama.cpp".into()]
+                    }
+                    "nvidia_cuda" => {
+                        vec!["vllm".into(), "llama.cpp".into(), "ollama".into()]
+                    }
+                    "amd_rocm" => vec!["llama.cpp".into(), "ollama".into()],
+                    _ => vec!["llama.cpp".into()],
+                };
 
-            // ── Available models (sync probe of ~/models) ────────────────
-            beat.available_models = LlmProbe::available_models();
+                beat.capabilities = Capabilities {
+                    can_serve_ff_gateway: true,
+                    can_serve_openclaw_gateway: true,
+                    can_host_postgres_replica: disk_free_gb > 100.0,
+                    can_host_redis_replica: ram_total_gb >= 16,
+                    gpu_kind: gpu_kind.clone(),
+                    gpu_count,
+                    gpu_vram_gb: None,
+                    gpu_total_vram_gb: None,
+                    can_run_cuda,
+                    can_run_metal,
+                    can_run_rocm,
+                    recommended_runtimes,
+                    max_runnable_model_gb: None,
+                };
 
-            debug!(
-                "build_beat blocking phase completed in {:?}",
-                t0.elapsed()
-            );
-            beat
-        })).await;
+                // ── Installed software inventory ─────────────────────────────
+                beat.installed_software = SoftwareCollector::new().detect();
+
+                // ── Available models (sync probe of ~/models) ────────────────
+                beat.available_models = LlmProbe::available_models();
+
+                debug!("build_beat blocking phase completed in {:?}", t0.elapsed());
+                beat
+            }),
+        )
+        .await;
 
         let (mut beat, blocking_ok) = match blocking_result {
             Ok(Ok(beat)) => (beat, true),
@@ -621,9 +619,7 @@ fn run_with_timeout<T: Send + 'static>(
     match rx.recv_timeout(std::time::Duration::from_secs(timeout_secs)) {
         Ok(v) => Some(v),
         Err(_) => {
-            tracing::debug!(
-                "run_with_timeout: closure did not complete within {timeout_secs}s"
-            );
+            tracing::debug!("run_with_timeout: closure did not complete within {timeout_secs}s");
             None
         }
     }
@@ -683,10 +679,7 @@ fn detect_all_ips() -> Vec<Ip> {
     // this, Command::new("ifconfig") returns "not found" → empty all_ips.
     // (Hit on ace 2026-04-25 — primary_ip wrongly fell back to 127.0.0.1.)
     let output = if std::env::consts::OS == "macos" {
-        command_output_with_timeout(&mut
-            std::process::Command::new("/sbin/ifconfig"),
-            3,
-        )
+        command_output_with_timeout(&mut std::process::Command::new("/sbin/ifconfig"), 3)
     } else {
         // /sbin/ip on Debian/Ubuntu, /usr/sbin/ip on RHEL — try both.
         command_output_with_timeout(
@@ -711,7 +704,8 @@ fn detect_all_ips() -> Vec<Ip> {
                 current_iface = line.split(':').next().unwrap_or("").to_string();
             } else if line.trim_start().starts_with("inet ")
                 && let Some(ip) = line.split_whitespace().nth(1)
-                && !ip.starts_with("127.") && !ip.starts_with("169.254.")
+                && !ip.starts_with("127.")
+                && !ip.starts_with("169.254.")
             {
                 let kind = classify_iface(&current_iface, ip);
                 let (medium, link_speed_gbps) = probe_iface_macos(&current_iface);
@@ -749,7 +743,8 @@ fn detect_all_ips() -> Vec<Ip> {
                     continue;
                 }
                 if let Some(addr) = parts[3].split('/').next()
-                    && !addr.starts_with("127.") && !addr.starts_with("169.254.")
+                    && !addr.starts_with("127.")
+                    && !addr.starts_with("169.254.")
                 {
                     let kind = classify_iface(iface, addr);
                     let (medium, link_speed_gbps) = probe_iface_linux(iface);
@@ -786,12 +781,12 @@ fn probe_iface_linux(iface: &str) -> (Option<String>, Option<u32>) {
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
         .and_then(|s| {
-                s.lines()
-                    .find(|l| l.trim_start().starts_with("tx bitrate:"))
-                    .and_then(|l| l.split_whitespace().nth(2).map(str::to_string))
-                    .and_then(|n| n.parse::<f64>().ok())
-                    .map(|mbps| (mbps / 1000.0).round() as u32)
-            });
+            s.lines()
+                .find(|l| l.trim_start().starts_with("tx bitrate:"))
+                .and_then(|l| l.split_whitespace().nth(2).map(str::to_string))
+                .and_then(|n| n.parse::<f64>().ok())
+                .map(|mbps| (mbps / 1000.0).round() as u32)
+        });
         return (Some("wifi".to_string()), rate);
     }
     let speed_mbps: Option<u32> = std::fs::read_to_string(
@@ -828,18 +823,15 @@ fn probe_iface_linux(iface: &str) -> (Option<String>, Option<u32>) {
 /// link speed (e.g. `media: autoselect (1000baseT <full-duplex>)`).
 /// Cross-references `networksetup -listallhardwareports` to detect wifi.
 fn probe_iface_macos(iface: &str) -> (Option<String>, Option<u32>) {
-    let media = command_output_with_timeout(
-        std::process::Command::new("/sbin/ifconfig").arg(iface),
-        3,
-    )
-    .filter(|o| o.status.success())
-    .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-    .unwrap_or_default();
+    let media =
+        command_output_with_timeout(std::process::Command::new("/sbin/ifconfig").arg(iface), 3)
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
 
     // Hardware-port lookup: AirPort/Wi-Fi → wifi medium.
     let hw_ports = command_output_with_timeout(
-        std::process::Command::new("/usr/sbin/networksetup")
-            .args(["-listallhardwareports"]),
+        std::process::Command::new("/usr/sbin/networksetup").args(["-listallhardwareports"]),
         3,
     )
     .filter(|o| o.status.success())

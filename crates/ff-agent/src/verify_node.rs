@@ -205,8 +205,7 @@ pub async fn verify_node(pool: &PgPool, node_name: &str) -> Result<VerifyReport,
             retry_task_id: None,
         });
     } else {
-        let title =
-            format!("verify-{}-{}", node_name, chrono::Utc::now().timestamp());
+        let title = format!("verify-{}-{}", node_name, chrono::Utc::now().timestamp());
         let payload = serde_json::json!({
             "command": format!("echo verify-{}", chrono::Utc::now().timestamp())
         });
@@ -225,15 +224,15 @@ pub async fn verify_node(pool: &PgPool, node_name: &str) -> Result<VerifyReport,
         .await;
         details.push(match task_id_res {
             Ok(tid) => {
-                let deadline =
-                    std::time::Instant::now() + Duration::from_secs(30);
+                let deadline = std::time::Instant::now() + Duration::from_secs(30);
                 let mut final_status = None;
                 while std::time::Instant::now() < deadline {
                     if let Ok(Some(row)) = ff_db::pg_get_deferred(pool, &tid).await
-                        && (row.status == "completed" || row.status == "failed") {
-                            final_status = Some(row.status);
-                            break;
-                        }
+                        && (row.status == "completed" || row.status == "failed")
+                    {
+                        final_status = Some(row.status);
+                        break;
+                    }
                     tokio::time::sleep(Duration::from_millis(1500)).await;
                 }
                 match final_status.as_deref() {
@@ -252,9 +251,7 @@ pub async fn verify_node(pool: &PgPool, node_name: &str) -> Result<VerifyReport,
                     None => CheckResult {
                         check: "defer_end_to_end".into(),
                         status: "fail".into(),
-                        message: Some(format!(
-                            "task {tid} not claimed within 30s"
-                        )),
+                        message: Some(format!("task {tid} not claimed within 30s")),
                         retry_task_id: Some(tid),
                     },
                 }

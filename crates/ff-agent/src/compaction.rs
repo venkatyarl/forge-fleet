@@ -64,10 +64,7 @@ impl TokenUsage {
 
 /// Estimate token count for a list of messages.
 pub fn estimate_message_tokens(messages: &[ToolChatMessage]) -> usize {
-    messages
-        .iter()
-        .map(estimate_single_message_tokens)
-        .sum()
+    messages.iter().map(estimate_single_message_tokens).sum()
 }
 
 fn estimate_single_message_tokens(msg: &ToolChatMessage) -> usize {
@@ -174,14 +171,16 @@ fn build_summary(messages: &[ToolChatMessage]) -> String {
                     }
                 }
                 if let Some(text) = msg.text_content()
-                    && !text.is_empty() && text.len() > 20 {
-                        let truncated = if text.chars().count() > 300 {
-                            format!("{}...", text.chars().take(300).collect::<String>())
-                        } else {
-                            text.to_string()
-                        };
-                        key_decisions.push(format!("Assistant: {truncated}"));
-                    }
+                    && !text.is_empty()
+                    && text.len() > 20
+                {
+                    let truncated = if text.chars().count() > 300 {
+                        format!("{}...", text.chars().take(300).collect::<String>())
+                    } else {
+                        text.to_string()
+                    };
+                    key_decisions.push(format!("Assistant: {truncated}"));
+                }
             }
             "tool" => {
                 // Tool results are the bulkiest — just note they happened
@@ -252,14 +251,15 @@ pub fn apply_tool_result_budget(messages: &mut [ToolChatMessage], budget_chars: 
             continue;
         }
         if let Some(content) = msg.text_content()
-            && content.len() > 100 {
-                let freed = content.len() - 50;
-                msg.content = Some(Value::String(
-                    "[tool result truncated — context budget exceeded]".into(),
-                ));
-                to_free = to_free.saturating_sub(freed);
-                truncated += 1;
-            }
+            && content.len() > 100
+        {
+            let freed = content.len() - 50;
+            msg.content = Some(Value::String(
+                "[tool result truncated — context budget exceeded]".into(),
+            ));
+            to_free = to_free.saturating_sub(freed);
+            truncated += 1;
+        }
     }
 
     truncated

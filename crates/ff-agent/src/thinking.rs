@@ -19,7 +19,6 @@ pub enum ThinkingMode {
     Adaptive,
 }
 
-
 /// Thinking configuration for a session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThinkingConfig {

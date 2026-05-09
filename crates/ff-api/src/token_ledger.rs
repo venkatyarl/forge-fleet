@@ -422,8 +422,7 @@ impl CostTracker {
         }
         // Rolling average latency
         let n = stats.request_count as f64;
-        stats.avg_latency_ms =
-            (stats.avg_latency_ms * (n - 1.0) + record.latency_ms as f64) / n;
+        stats.avg_latency_ms = (stats.avg_latency_ms * (n - 1.0) + record.latency_ms as f64) / n;
 
         // Check budget
         self.check_budget(&day).await;
@@ -445,7 +444,12 @@ impl CostTracker {
     }
 
     /// Check if a request would exceed the cloud budget.
-    pub async fn would_exceed_budget(&self, model: &str, prompt_tokens: u32, completion_tokens: u32) -> bool {
+    pub async fn would_exceed_budget(
+        &self,
+        model: &str,
+        prompt_tokens: u32,
+        completion_tokens: u32,
+    ) -> bool {
         let budget = self.budget.read().await;
         if !budget.enforce_budget {
             return false;
@@ -648,7 +652,13 @@ impl CostTracker {
         let daily_cloud = self.daily_cloud_cost(day).await;
         let pct = daily_cloud / budget.cloud_daily_budget_usd;
 
-        if pct >= budget.alert_threshold && !self.alert_fired.get("threshold").map(|v| *v).unwrap_or(false) {
+        if pct >= budget.alert_threshold
+            && !self
+                .alert_fired
+                .get("threshold")
+                .map(|v| *v)
+                .unwrap_or(false)
+        {
             warn!(
                 daily_cloud_cost = %format!("{:.4}", daily_cloud),
                 budget = %format!("{:.4}", budget.cloud_daily_budget_usd),
@@ -658,7 +668,13 @@ impl CostTracker {
             self.alert_fired.insert("threshold".to_string(), true);
         }
 
-        if daily_cloud >= budget.cloud_daily_budget_usd && !self.alert_fired.get("exceeded").map(|v| *v).unwrap_or(false) {
+        if daily_cloud >= budget.cloud_daily_budget_usd
+            && !self
+                .alert_fired
+                .get("exceeded")
+                .map(|v| *v)
+                .unwrap_or(false)
+        {
             warn!(
                 daily_cloud_cost = %format!("{:.4}", daily_cloud),
                 "CLOUD BUDGET EXCEEDED: daily cloud budget has been exceeded"
@@ -699,7 +715,11 @@ mod tests {
             tier: 4,
         };
         let cost = pricing.calculate_cost(1000, 500);
-        assert!((cost - 0.00750).abs() < 0.00001, "cost should be ~0.00750, got {}", cost);
+        assert!(
+            (cost - 0.00750).abs() < 0.00001,
+            "cost should be ~0.00750, got {}",
+            cost
+        );
     }
 
     #[test]
@@ -749,7 +769,7 @@ mod tests {
     #[tokio::test]
     async fn test_fleet_summary() {
         let tracker = CostTracker::new();
-        
+
         tracker
             .record_usage(
                 TokenUsageRecord::new("req-1", "qwen-32b", "local-1")

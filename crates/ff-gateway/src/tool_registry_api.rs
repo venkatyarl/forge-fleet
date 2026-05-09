@@ -123,7 +123,9 @@ pub async fn list_tools(
             tool_name: row.get("tool_name"),
             node_name: row.get("node_name"),
             description: row.get("description"),
-            health_checked_at: row.get::<chrono::DateTime<chrono::Utc>, _>("health_checked_at").to_rfc3339(),
+            health_checked_at: row
+                .get::<chrono::DateTime<chrono::Utc>, _>("health_checked_at")
+                .to_rfc3339(),
             call_count: row.get("call_count"),
             avg_latency_ms: row.get("avg_latency_ms"),
             healthy: row.get("healthy"),
@@ -251,13 +253,12 @@ pub async fn tool_heartbeat(
         .and_then(|v| v.as_str())
         .ok_or(StatusCode::BAD_REQUEST)?;
 
-    let result = sqlx::query(
-        "UPDATE fleet_tools SET health_checked_at = NOW() WHERE node_name = $1",
-    )
-    .bind(node_name)
-    .execute(pool)
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let result =
+        sqlx::query("UPDATE fleet_tools SET health_checked_at = NOW() WHERE node_name = $1")
+            .bind(node_name)
+            .execute(pool)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(json!({
         "node": node_name,
@@ -399,7 +400,7 @@ pub async fn record_tool_usage(
 
     // Verify the tool exists before logging usage (optional validation)
     let _tool_id: Option<uuid::Uuid> = sqlx::query_scalar(
-        "SELECT id FROM fleet_tools WHERE node_name = $1 AND tool_name = $2 LIMIT 1"
+        "SELECT id FROM fleet_tools WHERE node_name = $1 AND tool_name = $2 LIMIT 1",
     )
     .bind(&req.node_name)
     .bind(&req.tool_name)

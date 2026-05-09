@@ -167,56 +167,57 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
 
     // ─── Postgres fleet config seed (fleet.toml → Postgres, first boot only) ──
     if config.database.mode != DatabaseMode::EmbeddedSqlite
-        && let Some(pg_pool) = operational_store.pg_pool() {
-            ff_db::run_postgres_migrations(pg_pool)
+        && let Some(pg_pool) = operational_store.pg_pool()
+    {
+        ff_db::run_postgres_migrations(pg_pool)
+            .await
+            .context("postgres fleet-config migrations failed")?;
+
+        // Only seed if Postgres fleet_nodes table is empty (first boot)
+        let existing = ff_db::pg_list_nodes(pg_pool).await.unwrap_or_default();
+        if existing.is_empty() {
+            info!("first boot: seeding Postgres from fleet.toml");
+            ff_db::seed_from_fleet_toml(pg_pool, &config)
                 .await
-                .context("postgres fleet-config migrations failed")?;
-
-            // Only seed if Postgres fleet_nodes table is empty (first boot)
-            let existing = ff_db::pg_list_nodes(pg_pool).await.unwrap_or_default();
-            if existing.is_empty() {
-                info!("first boot: seeding Postgres from fleet.toml");
-                ff_db::seed_from_fleet_toml(pg_pool, &config)
-                    .await
-                    .context("failed to seed postgres from fleet.toml")?;
-            } else {
-                info!(
-                    nodes = existing.len(),
-                    "Postgres fleet tables already populated, skipping seed"
-                );
-            }
-
-            // ─── Port registry seed (config/ports.toml → port_registry) ──
-            //
-            // Runs on every startup (the seed is idempotent — it UPSERTs).
-            // Mirrors how software_registry / model_catalog / task_coverage
-            // are seeded when their CLI entry points run; doing it here
-            // guarantees the registry is fresh without requiring an operator
-            // to remember to run `ff ports seed`.
-            let ports_path = ff_agent::ports_registry::resolve_ports_path();
-            if ports_path.exists() {
-                match ff_agent::ports_registry::seed_from_toml(pg_pool, &ports_path).await {
-                    Ok(rep) => info!(
-                        path = %ports_path.display(),
-                        total = rep.total,
-                        inserted = rep.inserted,
-                        updated = rep.updated,
-                        unchanged = rep.unchanged,
-                        "port_registry seeded from config/ports.toml"
-                    ),
-                    Err(e) => warn!(
-                        path = %ports_path.display(),
-                        error = %e,
-                        "port_registry seed failed (continuing)"
-                    ),
-                }
-            } else {
-                warn!(
-                    path = %ports_path.display(),
-                    "config/ports.toml not found — skipping port_registry seed"
-                );
-            }
+                .context("failed to seed postgres from fleet.toml")?;
+        } else {
+            info!(
+                nodes = existing.len(),
+                "Postgres fleet tables already populated, skipping seed"
+            );
         }
+
+        // ─── Port registry seed (config/ports.toml → port_registry) ──
+        //
+        // Runs on every startup (the seed is idempotent — it UPSERTs).
+        // Mirrors how software_registry / model_catalog / task_coverage
+        // are seeded when their CLI entry points run; doing it here
+        // guarantees the registry is fresh without requiring an operator
+        // to remember to run `ff ports seed`.
+        let ports_path = ff_agent::ports_registry::resolve_ports_path();
+        if ports_path.exists() {
+            match ff_agent::ports_registry::seed_from_toml(pg_pool, &ports_path).await {
+                Ok(rep) => info!(
+                    path = %ports_path.display(),
+                    total = rep.total,
+                    inserted = rep.inserted,
+                    updated = rep.updated,
+                    unchanged = rep.unchanged,
+                    "port_registry seeded from config/ports.toml"
+                ),
+                Err(e) => warn!(
+                    path = %ports_path.display(),
+                    error = %e,
+                    "port_registry seed failed (continuing)"
+                ),
+            }
+        } else {
+            warn!(
+                path = %ports_path.display(),
+                "config/ports.toml not found — skipping port_registry seed"
+            );
+        }
+    }
 
     // ─── Config hot-reload handle ────────────────────────────────────────────
     let (config_handle, config_tx) = ConfigHandle::new(config.clone(), config_path.clone());
@@ -254,23 +255,24 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
 
     // If Postgres is available, also seed from DB (more authoritative)
     if let Some(pg_pool) = operational_store.pg_pool()
-        && let Ok(db_nodes) = ff_db::pg_list_nodes(pg_pool).await {
-            let default_port = config.fleet.api_port;
-            for node in &db_nodes {
-                if let Ok(ip) = node.ip.parse::<std::net::IpAddr>() {
-                    let port = default_port;
-                    let priority = node.election_priority as u32;
-                    registry.upsert_config_node(&node.name, ip, port, priority);
-                    info!(
-                        node = %node.name,
-                        ip = %node.ip,
-                        port,
-                        priority,
-                        "seeded node from Postgres"
-                    );
-                }
+        && let Ok(db_nodes) = ff_db::pg_list_nodes(pg_pool).await
+    {
+        let default_port = config.fleet.api_port;
+        for node in &db_nodes {
+            if let Ok(ip) = node.ip.parse::<std::net::IpAddr>() {
+                let port = default_port;
+                let priority = node.election_priority as u32;
+                registry.upsert_config_node(&node.name, ip, port, priority);
+                info!(
+                    node = %node.name,
+                    ip = %node.ip,
+                    port,
+                    priority,
+                    "seeded node from Postgres"
+                );
             }
         }
+    }
 
     // 1) discovery — fleet node scanning + subnet scanning
     info!("starting subsystem: discovery");
@@ -347,7 +349,10 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         subsystem_tasks.push(tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(10)).await;
             let gateway = "http://127.0.0.1:51002".to_string();
-            let client = match reqwest::Client::builder().timeout(Duration::from_secs(30)).build() {
+            let client = match reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+            {
                 Ok(c) => c,
                 Err(e) => {
                     warn!(error = %e, "failed to build HTTP client for tool registry");
@@ -370,9 +375,11 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
                 "node_name": name,
                 "tools": tools,
             });
-            match client.post(format!("{}/api/tools/register", gateway))
+            match client
+                .post(format!("{}/api/tools/register", gateway))
                 .json(&register_body)
-                .send().await
+                .send()
+                .await
             {
                 Ok(resp) if resp.status().is_success() => {
                     info!(count = tools.len(), "fleet tools registered from daemon");
@@ -456,23 +463,24 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         // secrets out of shell rc files and launchd plists.
         if let Some(tg) = config.transport.telegram.as_ref()
             && tg.resolve_bot_token().is_none()
-                && let Some(pg_pool) = operational_store.pg_pool() {
-                    match ff_db::pg_get_secret(pg_pool, "telegram.bot_token").await {
-                        Ok(Some(token)) if !token.trim().is_empty() => {
-                            let key = if tg.bot_token_env.trim().is_empty() {
-                                "FORGEFLEET_TELEGRAM_BOT_TOKEN"
-                            } else {
-                                tg.bot_token_env.as_str()
-                            };
-                            unsafe {
-                                std::env::set_var(key, token.trim());
-                            }
-                            info!("telegram bot token loaded from fleet_secrets");
-                        }
-                        Ok(_) => info!("telegram bot token absent in fleet_secrets"),
-                        Err(e) => error!(error = %e, "fleet_secrets lookup failed"),
+            && let Some(pg_pool) = operational_store.pg_pool()
+        {
+            match ff_db::pg_get_secret(pg_pool, "telegram.bot_token").await {
+                Ok(Some(token)) if !token.trim().is_empty() => {
+                    let key = if tg.bot_token_env.trim().is_empty() {
+                        "FORGEFLEET_TELEGRAM_BOT_TOKEN"
+                    } else {
+                        tg.bot_token_env.as_str()
+                    };
+                    unsafe {
+                        std::env::set_var(key, token.trim());
                     }
+                    info!("telegram bot token loaded from fleet_secrets");
                 }
+                Ok(_) => info!("telegram bot token absent in fleet_secrets"),
+                Err(e) => error!(error = %e, "fleet_secrets lookup failed"),
+            }
+        }
         info!("starting subsystem: telegram transport");
         subsystem_tasks.push(start_telegram_transport_subsystem(
             config.clone(),
@@ -910,14 +918,15 @@ fn redact_database_url(raw: &str) -> String {
     }
 
     if let Some((scheme, rest)) = trimmed.split_once("://")
-        && let Some((userinfo, host_part)) = rest.split_once('@') {
-            let redacted_userinfo = if let Some((user, _)) = userinfo.split_once(':') {
-                format!("{user}:***")
-            } else {
-                "***".to_string()
-            };
-            return format!("{scheme}://{redacted_userinfo}@{host_part}");
-        }
+        && let Some((userinfo, host_part)) = rest.split_once('@')
+    {
+        let redacted_userinfo = if let Some((user, _)) = userinfo.split_once(':') {
+            format!("{user}:***")
+        } else {
+            "***".to_string()
+        };
+        return format!("{scheme}://{redacted_userinfo}@{host_part}");
+    }
 
     "***".to_string()
 }
@@ -2258,10 +2267,8 @@ async fn start_pulse_v2_subsystems(
         node = %node_name.clone(),
         "starting subsystem: auto-upgrade tick (hourly, leader-gated)"
     );
-    let auto_upgrade_tick = ff_agent::auto_upgrade::AutoUpgradeTick::new(
-        pg_pool.clone(),
-        node_name.clone(),
-    );
+    let auto_upgrade_tick =
+        ff_agent::auto_upgrade::AutoUpgradeTick::new(pg_pool.clone(), node_name.clone());
     handles.push(auto_upgrade_tick.spawn(shutdown_rx.clone()));
 
     // (9) fleet_tasks worker — every daemon polls fleet_tasks for shell
@@ -2351,9 +2358,10 @@ async fn start_pulse_v2_subsystems(
                     .ok()
                     .flatten();
             if let Some(l) = is_leader
-                && l.eq_ignore_ascii_case(&name) {
-                    caps.insert("leader".to_string());
-                }
+                && l.eq_ignore_ascii_case(&name)
+            {
+                caps.insert("leader".to_string());
+            }
             // FF_* env bag (FF_NODE, FF_SOURCE_TREE, FF_LEADER_NAME,
             // FF_GATEWAY_URL, …) — resolved from the DB so shell tasks
             // never have to embed IPs / paths / users in source.
@@ -2386,14 +2394,13 @@ async fn start_pulse_v2_subsystems(
         let name = node_name.clone();
         let mut shutdown = shutdown_rx.clone();
         tokio::spawn(async move {
-            let row: Option<uuid::Uuid> = sqlx::query_scalar(
-                "SELECT id FROM computers WHERE name = $1"
-            )
-            .bind(&name)
-            .fetch_optional(&pool)
-            .await
-            .ok()
-            .flatten();
+            let row: Option<uuid::Uuid> =
+                sqlx::query_scalar("SELECT id FROM computers WHERE name = $1")
+                    .bind(&name)
+                    .fetch_optional(&pool)
+                    .await
+                    .ok()
+                    .flatten();
             let Some(my_id) = row else {
                 warn!(node = %name, "work-item processor: no computers row, disabled");
                 return;
@@ -2411,7 +2418,7 @@ async fn start_pulse_v2_subsystems(
                         tracing::info!(item = %item.id, item_type = %item.item_type, "work item claimed");
                         // Mark as in_progress before executing
                         let _ = sqlx::query(
-                            "UPDATE work_items SET status = 'in_progress' WHERE id = $1"
+                            "UPDATE work_items SET status = 'in_progress' WHERE id = $1",
                         )
                         .bind(item.id)
                         .execute(&pool)
@@ -2427,31 +2434,43 @@ async fn start_pulse_v2_subsystems(
                                         let stderr = String::from_utf8_lossy(&out.stderr);
                                         let exit = out.status.code().unwrap_or(-1);
                                         if exit == 0 {
-                                            Ok(format!("ok: {}", stdout.chars().take(500).collect::<String>()))
+                                            Ok(format!(
+                                                "ok: {}",
+                                                stdout.chars().take(500).collect::<String>()
+                                            ))
                                         } else {
-                                            Err(format!("exit {}: {}", exit, stderr.chars().take(500).collect::<String>()))
+                                            Err(format!(
+                                                "exit {}: {}",
+                                                exit,
+                                                stderr.chars().take(500).collect::<String>()
+                                            ))
                                         }
                                     }
                                     Err(e) => Err(format!("spawn error: {e}")),
                                 }
                             }
-                            _ => {
-                                Ok(format!("unhandled item_type '{}' — marking complete", item.item_type))
-                            }
+                            _ => Ok(format!(
+                                "unhandled item_type '{}' — marking complete",
+                                item.item_type
+                            )),
                         };
                         match result {
                             Ok(summary) => {
                                 let _ = ff_agent::batch_manager::complete_work_item(
                                     &pool, item.id, &summary, 0, 0,
-                                ).await;
+                                )
+                                .await;
                                 let _ = ff_agent::batch_manager::update_batch_progress(
-                                    &pool, item.parent_task_id, item.batch_id,
-                                ).await;
+                                    &pool,
+                                    item.parent_task_id,
+                                    item.batch_id,
+                                )
+                                .await;
                             }
                             Err(err) => {
-                                let _ = ff_agent::batch_manager::fail_work_item(
-                                    &pool, item.id, &err,
-                                ).await;
+                                let _ =
+                                    ff_agent::batch_manager::fail_work_item(&pool, item.id, &err)
+                                        .await;
                             }
                         }
                     }
@@ -2485,18 +2504,18 @@ async fn start_pulse_v2_subsystems(
         let name = node_name.clone();
         let shutdown = shutdown_rx.clone();
         tokio::spawn(async move {
-            let row: Option<uuid::Uuid> = sqlx::query_scalar(
-                "SELECT id FROM computers WHERE name = $1"
-            )
-            .bind(&name)
-            .fetch_optional(&pool)
-            .await
-            .ok()
-            .flatten();
-            let Some(my_id) = row else { return; };
-            let _ = ff_agent::work_stealer::spawn_steal_loop(
-                pool, my_id, None, name, shutdown,
-            ).await;
+            let row: Option<uuid::Uuid> =
+                sqlx::query_scalar("SELECT id FROM computers WHERE name = $1")
+                    .bind(&name)
+                    .fetch_optional(&pool)
+                    .await
+                    .ok()
+                    .flatten();
+            let Some(my_id) = row else {
+                return;
+            };
+            let _ =
+                ff_agent::work_stealer::spawn_steal_loop(pool, my_id, None, name, shutdown).await;
         });
     }
 
@@ -2527,13 +2546,15 @@ async fn start_pulse_v2_subsystems(
                 }
                 // Only run on leader
                 let is_leader: bool = sqlx::query_scalar(
-                    "SELECT EXISTS(SELECT 1 FROM fleet_leader_state WHERE member_name = $1)"
+                    "SELECT EXISTS(SELECT 1 FROM fleet_leader_state WHERE member_name = $1)",
                 )
                 .bind(&name)
                 .fetch_one(&pool)
                 .await
                 .unwrap_or(false);
-                if !is_leader { continue; }
+                if !is_leader {
+                    continue;
+                }
 
                 // Run cleanup for all agent workspaces
                 let agents = match ff_agent::shared_workspace::list_agent_workspaces().await {
@@ -2543,16 +2564,18 @@ async fn start_pulse_v2_subsystems(
                         continue;
                     }
                 };
-                let node_id: Option<uuid::Uuid> = sqlx::query_scalar(
-                    "SELECT id FROM computers WHERE name = $1"
-                )
-                .bind(&name)
-                .fetch_optional(&pool)
-                .await
-                .ok()
-                .flatten();
+                let node_id: Option<uuid::Uuid> =
+                    sqlx::query_scalar("SELECT id FROM computers WHERE name = $1")
+                        .bind(&name)
+                        .fetch_optional(&pool)
+                        .await
+                        .ok()
+                        .flatten();
                 for agent_id in agents {
-                    if let Err(e) = ff_agent::shared_workspace::run_cleanup(&agent_id, Some(&pool), node_id).await {
+                    if let Err(e) =
+                        ff_agent::shared_workspace::run_cleanup(&agent_id, Some(&pool), node_id)
+                            .await
+                    {
                         tracing::warn!(agent_id = %agent_id, error = %e, "workspace cleanup failed");
                     }
                 }
@@ -2569,15 +2592,18 @@ async fn start_pulse_v2_subsystems(
         let mut shutdown = shutdown_rx.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
-            let vault_path = std::path::PathBuf::from(
-                std::env::var("FF_VAULT_PATH").unwrap_or_else(|_| {
+            let vault_path =
+                std::path::PathBuf::from(std::env::var("FF_VAULT_PATH").unwrap_or_else(|_| {
                     std::env::var("HOME")
-                        .map(|h| std::path::PathBuf::from(h).join("projects").join("Yarli_KnowledgeBase"))
+                        .map(|h| {
+                            std::path::PathBuf::from(h)
+                                .join("projects")
+                                .join("Yarli_KnowledgeBase")
+                        })
                         .unwrap_or_else(|_| std::path::PathBuf::from("/tmp/vault"))
                         .to_string_lossy()
                         .to_string()
-                })
-            );
+                }));
             loop {
                 tokio::select! {
                     _ = interval.tick() => {}
@@ -2586,18 +2612,22 @@ async fn start_pulse_v2_subsystems(
                     }
                 }
                 let is_leader: bool = sqlx::query_scalar(
-                    "SELECT EXISTS(SELECT 1 FROM fleet_leader_state WHERE member_name = $1)"
+                    "SELECT EXISTS(SELECT 1 FROM fleet_leader_state WHERE member_name = $1)",
                 )
                 .bind(&name)
                 .fetch_one(&pool)
                 .await
                 .unwrap_or(false);
-                if !is_leader { continue; }
+                if !is_leader {
+                    continue;
+                }
 
                 if let Err(e) = ff_agent::vault_sync::setup_forgefleet_vault(&vault_path).await {
                     tracing::warn!(error = %e, "vault setup failed");
                 }
-                if let Err(e) = ff_agent::vault_sync::regenerate_index_md(&vault_path, &name, &pool).await {
+                if let Err(e) =
+                    ff_agent::vault_sync::regenerate_index_md(&vault_path, &name, &pool).await
+                {
                     tracing::warn!(error = %e, "vault index regeneration failed");
                 }
                 if let Err(e) = ff_agent::vault_sync::scan_vault_todos(&vault_path, &pool).await {
@@ -2652,7 +2682,9 @@ async fn build_api_config(config: &FleetConfig, pg_pool: Option<&ff_db::PgPool>)
     for (node_name, node_cfg) in &config.nodes {
         for (model_slug, model_cfg) in &node_cfg.models {
             let port = model_cfg.port.unwrap_or(config.fleet.api_port);
-            let is_local = !model_slug.starts_with("gpt") && !model_slug.starts_with("claude") && !model_slug.starts_with("gemini");
+            let is_local = !model_slug.starts_with("gpt")
+                && !model_slug.starts_with("claude")
+                && !model_slug.starts_with("gemini");
             backends.push(BackendEndpoint {
                 id: format!("{}:{}:{}", node_name, model_slug, port),
                 node: node_name.clone(),
@@ -2694,7 +2726,9 @@ async fn build_api_config(config: &FleetConfig, pg_pool: Option<&ff_db::PgPool>)
                 continue;
             }
 
-            let is_local = !model.id.starts_with("gpt") && !model.id.starts_with("claude") && !model.id.starts_with("gemini");
+            let is_local = !model.id.starts_with("gpt")
+                && !model.id.starts_with("claude")
+                && !model.id.starts_with("gemini");
             backends.push(BackendEndpoint {
                 id,
                 node: node_name.clone(),
@@ -2731,7 +2765,9 @@ async fn build_api_config(config: &FleetConfig, pg_pool: Option<&ff_db::PgPool>)
                     if backends.iter().any(|b| b.id == id) {
                         continue;
                     }
-                    let is_local = !m.slug.starts_with("gpt") && !m.slug.starts_with("claude") && !m.slug.starts_with("gemini");
+                    let is_local = !m.slug.starts_with("gpt")
+                        && !m.slug.starts_with("claude")
+                        && !m.slug.starts_with("gemini");
                     backends.push(BackendEndpoint {
                         id,
                         node: m.node_name.clone(),

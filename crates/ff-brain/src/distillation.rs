@@ -175,7 +175,10 @@ impl DistillationPipeline {
             // Adapt config for next attempt
             self.config.dataset_size = (self.config.dataset_size as f32 * 1.5) as usize;
             self.config.temperature = (self.config.temperature * 0.9).max(0.2);
-            info!("Adapting config: dataset={}, temp={}", self.config.dataset_size, self.config.temperature);
+            info!(
+                "Adapting config: dataset={}, temp={}",
+                self.config.dataset_size, self.config.temperature
+            );
         }
     }
 
@@ -188,8 +191,10 @@ impl DistillationPipeline {
     pub fn summary(&self) -> HashMap<String, f32> {
         let mut map = HashMap::new();
         if !self.history.is_empty() {
-            let avg_score: f32 = self.history.iter().map(|r| r.avg_score).sum::<f32>() / self.history.len() as f32;
-            let pass_rate = self.history.iter().filter(|r| r.passed).count() as f32 / self.history.len() as f32;
+            let avg_score: f32 =
+                self.history.iter().map(|r| r.avg_score).sum::<f32>() / self.history.len() as f32;
+            let pass_rate =
+                self.history.iter().filter(|r| r.passed).count() as f32 / self.history.len() as f32;
             map.insert("avg_score".to_string(), avg_score);
             map.insert("pass_rate".to_string(), pass_rate);
             map.insert("total_runs".to_string(), self.history.len() as f32);

@@ -110,7 +110,6 @@ impl HttpTransport {
         axum::serve(listener, self.router()).await?;
         Ok(())
     }
-
 }
 
 /// Axum handler for `POST /mcp`.

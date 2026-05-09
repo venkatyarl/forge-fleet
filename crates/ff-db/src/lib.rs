@@ -54,6 +54,7 @@ pub use queries::{
     // Phase 12 (V19) — shared volumes / power schedules / training jobs
     SharedVolumeRow,
     TrainingJobRow,
+    load_fleet_config_from_postgres,
     pg_append_benchmark_result,
     pg_append_routing_log,
     pg_append_training_loss_sample,
@@ -152,7 +153,6 @@ pub use queries::{
     pg_upsert_node,
     pg_upsert_shared_volume_mount,
     seed_from_fleet_toml,
-    load_fleet_config_from_postgres,
 };
 pub use runtime_registry::RuntimeRegistryStore;
 pub use sqlx::PgPool;

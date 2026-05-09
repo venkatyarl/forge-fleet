@@ -47,7 +47,10 @@ impl Default for ExecutorConfig {
         Self {
             max_parallelism: 4,
             rust_fn_registry: None,
-            http_client: reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build().unwrap_or_else(|_| reqwest::Client::new()),
+            http_client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
             llm_base_url: None,
             llm_api_key: None,
             llm_model: None,

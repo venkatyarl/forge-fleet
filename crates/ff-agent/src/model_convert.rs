@@ -131,10 +131,10 @@ pub async fn convert_safetensors_to_mlx(
     // Ensure the parent of the output dir exists (mlx_lm.convert will create
     // output_dir itself, but it won't create missing ancestors reliably).
     if let Some(parent) = output_dir.parent()
-        && !parent.exists() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("create {}: {e}", parent.display()))?;
-        }
+        && !parent.exists()
+    {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+    }
 
     // ── 5. prepare log file ──────────────────────────────────────────────
     let home = dirs::home_dir().ok_or_else(|| "no home dir".to_string())?;

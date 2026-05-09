@@ -62,9 +62,10 @@ impl SelfImprovementLoop {
 
         for s in hist.iter() {
             if !s.success
-                && let Some(ref err) = s.error_kind {
-                    by_error.entry(err.clone()).or_default().push(s);
-                }
+                && let Some(ref err) = s.error_kind
+            {
+                by_error.entry(err.clone()).or_default().push(s);
+            }
             let entry = by_model.entry(s.model.clone()).or_insert((0, 0));
             entry.0 += s.duration_ms;
             entry.1 += 1;
@@ -123,7 +124,10 @@ impl SelfImprovementLoop {
 
         let mut store = self.insights.write().await;
         *store = insights.clone();
-        info!("Self-improvement analysis complete: {} insights generated", insights.len());
+        info!(
+            "Self-improvement analysis complete: {} insights generated",
+            insights.len()
+        );
         insights
     }
 
@@ -138,7 +142,10 @@ impl SelfImprovementLoop {
         let mut applied = Vec::new();
         for insight in insights.iter() {
             if insight.confidence > 0.8 && insight.category == "recurring_error" {
-                warn!("Auto-applying retry policy for: {}", insight.suggested_action);
+                warn!(
+                    "Auto-applying retry policy for: {}",
+                    insight.suggested_action
+                );
                 applied.push(insight.suggested_action.clone());
             }
         }
@@ -154,15 +161,21 @@ mod tests {
     async fn test_self_improvement_analysis() {
         let engine = SelfImprovementLoop::new(100);
         for i in 0..5 {
-            engine.record(PerformanceSample {
-                timestamp: chrono::Utc::now(),
-                task_type: "code_review".to_string(),
-                duration_ms: 45_000,
-                success: i >= 3,
-                error_kind: if i < 3 { Some("timeout".to_string()) } else { None },
-                tokens_used: 12_000,
-                model: "qwen3-30b".to_string(),
-            }).await;
+            engine
+                .record(PerformanceSample {
+                    timestamp: chrono::Utc::now(),
+                    task_type: "code_review".to_string(),
+                    duration_ms: 45_000,
+                    success: i >= 3,
+                    error_kind: if i < 3 {
+                        Some("timeout".to_string())
+                    } else {
+                        None
+                    },
+                    tokens_used: 12_000,
+                    model: "qwen3-30b".to_string(),
+                })
+                .await;
         }
         let insights = engine.analyze().await;
         assert!(!insights.is_empty());

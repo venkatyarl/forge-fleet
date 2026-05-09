@@ -12,7 +12,9 @@ pub mod skill_catalog;
 pub use ff_core::panic_hook;
 pub mod alert_evaluator;
 pub mod alert_policy_seed;
+pub mod audit_logger;
 pub mod bash_security;
+pub mod batch_manager;
 pub mod brain;
 pub mod brain_mirror;
 pub mod chat_manager;
@@ -78,30 +80,26 @@ pub mod project_github_sync;
 pub mod project_registry;
 pub mod revive;
 pub mod rpc_inference;
+pub mod scheduler_tick;
 pub mod scoped_memory;
 pub mod secrets_rotation;
+pub mod self_improvement;
 pub mod session_runner;
 pub mod session_store;
 pub mod shared_storage;
+pub mod shared_workspace;
 pub mod smart_lru;
 pub mod social_ingest;
 pub mod software_registry;
 pub mod software_upstream;
 pub mod ssh_key_manager;
-pub mod self_improvement;
 pub mod streaming;
 pub mod sub_agent_reaper;
 pub mod sub_agents;
 pub mod supervisor;
 pub mod system_prompt;
 pub mod task_coverage_seed;
-pub mod audit_logger;
-pub mod batch_manager;
-pub mod scheduler_tick;
-pub mod shared_workspace;
 pub mod task_runner;
-pub mod vault_sync;
-pub mod work_stealer;
 pub mod telegram;
 pub mod template_registry;
 pub mod thinking;
@@ -109,8 +107,10 @@ pub mod tools;
 pub mod training;
 pub mod training_orchestrator;
 pub mod upgrade_playbooks;
+pub mod vault_sync;
 pub mod verify_node;
 pub mod version_check;
+pub mod work_stealer;
 
 pub use alert_policy_seed::{AlertSeedReport, seed_from_toml as seed_alert_policies_from_toml};
 pub use model_catalog_seed::{ModelSeedReport, seed_from_toml as seed_model_catalog_from_toml};
@@ -201,7 +201,10 @@ impl LeaseClient {
         Self {
             base_url,
             node_name,
-            http: reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build().unwrap_or_else(|_| reqwest::Client::new()),
+            http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
         }
     }
 
@@ -226,9 +229,10 @@ impl LeaseClient {
             match self.http.post(&url).json(&payload).send().await {
                 Ok(resp) if resp.status().is_success() => {
                     if let Ok(value) = resp.json::<Value>().await
-                        && let Some(granted) = value.get("granted").and_then(Value::as_bool) {
-                            return Ok(granted);
-                        }
+                        && let Some(granted) = value.get("granted").and_then(Value::as_bool)
+                    {
+                        return Ok(granted);
+                    }
                     return Ok(true);
                 }
                 Ok(resp) => {

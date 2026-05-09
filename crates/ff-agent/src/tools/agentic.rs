@@ -176,9 +176,10 @@ impl AgentTool for PdfExtractTool {
         let mut cmd = Command::new("pdftotext");
         cmd.arg(&path).arg("-"); // output to stdout
         if let Some(pages) = input.get("pages").and_then(Value::as_str)
-            && let Some((start, end)) = pages.split_once('-') {
-                cmd.arg("-f").arg(start).arg("-l").arg(end);
-            }
+            && let Some((start, end)) = pages.split_once('-')
+        {
+            cmd.arg("-f").arg(start).arg("-l").arg(end);
+        }
 
         match cmd.output().await {
             Ok(out) if out.status.success() => {

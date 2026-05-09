@@ -80,14 +80,20 @@ pub async fn regenerate_index_md(
     let projects_md = if projects_rows.is_empty() {
         "| *No active projects* | | | |".to_string()
     } else {
-        projects_rows.iter().map(|r| {
-            let id: String = r.get("id");
-            let name: String = r.get("display_name");
-            let status: String = r.get("status");
-            let last: Option<chrono::DateTime<chrono::Utc>> = r.get("main_last_synced_at");
-            let last_str = last.map(|d| d.format("%Y-%m-%d").to_string()).unwrap_or_else(|| "—".to_string());
-            format!("| {} | {} | {} | {} |", id, name, status, last_str)
-        }).collect::<Vec<_>>().join("\n")
+        projects_rows
+            .iter()
+            .map(|r| {
+                let id: String = r.get("id");
+                let name: String = r.get("display_name");
+                let status: String = r.get("status");
+                let last: Option<chrono::DateTime<chrono::Utc>> = r.get("main_last_synced_at");
+                let last_str = last
+                    .map(|d| d.format("%Y-%m-%d").to_string())
+                    .unwrap_or_else(|| "—".to_string());
+                format!("| {} | {} | {} | {} |", id, name, status, last_str)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     };
 
     // Query today's activity (completed fleet_tasks)
@@ -98,11 +104,15 @@ pub async fn regenerate_index_md(
     let activity_md = if activity_rows.is_empty() {
         "- *No activity in the last 24h*".to_string()
     } else {
-        activity_rows.iter().map(|r| {
-            let summary: String = r.get("summary");
-            let status: String = r.get("status");
-            format!("- [{}] {}", status, summary)
-        }).collect::<Vec<_>>().join("\n")
+        activity_rows
+            .iter()
+            .map(|r| {
+                let summary: String = r.get("summary");
+                let status: String = r.get("status");
+                format!("- [{}] {}", status, summary)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     };
 
     // Query open tasks (pending fleet_tasks + unfinished vault_todos)
@@ -113,12 +123,16 @@ pub async fn regenerate_index_md(
     let tasks_md = if task_rows.is_empty() {
         "- [ ] *No open fleet tasks*".to_string()
     } else {
-        task_rows.iter().map(|r| {
-            let summary: String = r.get("summary");
-            let status: String = r.get("status");
-            let mark = if status == "completed" { "x" } else { " " };
-            format!("- [{}] {} ({})", mark, summary, status)
-        }).collect::<Vec<_>>().join("\n")
+        task_rows
+            .iter()
+            .map(|r| {
+                let summary: String = r.get("summary");
+                let status: String = r.get("status");
+                let mark = if status == "completed" { "x" } else { " " };
+                format!("- [{}] {} ({})", mark, summary, status)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     };
 
     // Query recent changes (vault files modified in last 7 days)
@@ -129,30 +143,43 @@ pub async fn regenerate_index_md(
     let changes_md = if change_rows.is_empty() {
         "- *No vault changes in the last 7 days*".to_string()
     } else {
-        change_rows.iter().map(|r| {
-            let path: String = r.get("file_path");
-            let updated: Option<chrono::DateTime<chrono::Utc>> = r.get("updated_at");
-            let date = updated.map(|d| d.format("%Y-%m-%d").to_string()).unwrap_or_else(|| "—".to_string());
-            format!("- `{}` ({})", path, date)
-        }).collect::<Vec<_>>().join("\n")
+        change_rows
+            .iter()
+            .map(|r| {
+                let path: String = r.get("file_path");
+                let updated: Option<chrono::DateTime<chrono::Utc>> = r.get("updated_at");
+                let date = updated
+                    .map(|d| d.format("%Y-%m-%d").to_string())
+                    .unwrap_or_else(|| "—".to_string());
+                format!("- `{}` ({})", path, date)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     };
 
     // Query computer/node status
-    let node_rows = sqlx::query(
-        "SELECT name, role, status, cpu_percent FROM computers ORDER BY name LIMIT 30"
-    )
-    .fetch_all(pg).await.unwrap_or_default();
+    let node_rows =
+        sqlx::query("SELECT name, role, status, cpu_percent FROM computers ORDER BY name LIMIT 30")
+            .fetch_all(pg)
+            .await
+            .unwrap_or_default();
     let nodes_md = if node_rows.is_empty() {
         "| *No nodes registered* | | | |".to_string()
     } else {
-        node_rows.iter().map(|r| {
-            let name: String = r.get("name");
-            let role: String = r.get("role");
-            let status: String = r.get("status");
-            let load: Option<f64> = r.get("cpu_percent");
-            let load_str = load.map(|l| format!("{:.1}%", l)).unwrap_or_else(|| "—".to_string());
-            format!("| {} | {} | {} | {} |", name, role, status, load_str)
-        }).collect::<Vec<_>>().join("\n")
+        node_rows
+            .iter()
+            .map(|r| {
+                let name: String = r.get("name");
+                let role: String = r.get("role");
+                let status: String = r.get("status");
+                let load: Option<f64> = r.get("cpu_percent");
+                let load_str = load
+                    .map(|l| format!("{:.1}%", l))
+                    .unwrap_or_else(|| "—".to_string());
+                format!("| {} | {} | {} | {} |", name, role, status, load_str)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     };
 
     let content = INDEX_TEMPLATE

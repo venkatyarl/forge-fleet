@@ -222,19 +222,20 @@ impl AgentTool for TaskUpdateTool {
 
         // Fire best-effort callback if task just completed and has a reply_to_node.
         if status_clone == "completed"
-            && let Some(reply_url) = reply_to {
-                let callback_url = format!("{}/agent/message", reply_url.trim_end_matches('/'));
-                let payload = json!({
-                    "task_id": task_id_clone,
-                    "from_node": session_id,
-                    "status": "completed",
-                    "output": output_clone.unwrap_or_default(),
-                });
-                tokio::spawn(async move {
-                    let client = Client::new();
-                    let _ = client.post(&callback_url).json(&payload).send().await;
-                });
-            }
+            && let Some(reply_url) = reply_to
+        {
+            let callback_url = format!("{}/agent/message", reply_url.trim_end_matches('/'));
+            let payload = json!({
+                "task_id": task_id_clone,
+                "from_node": session_id,
+                "status": "completed",
+                "output": output_clone.unwrap_or_default(),
+            });
+            tokio::spawn(async move {
+                let client = Client::new();
+                let _ = client.post(&callback_url).json(&payload).send().await;
+            });
+        }
 
         AgentToolResult::ok(format!("Task #{id} updated (status: {})", status_clone))
     }

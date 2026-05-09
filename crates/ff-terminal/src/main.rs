@@ -2224,9 +2224,9 @@ async fn main() -> Result<()> {
                         .and_then(|arr| arr.last())
                         .and_then(|m| m.get("id"))
                         .and_then(|id| id.as_str())
-                    {
-                        model = id.to_string();
-                    }
+                {
+                    model = id.to_string();
+                }
             }
             Err(_) => {
                 if llm.contains("51005") {
@@ -2859,10 +2859,7 @@ async fn main() -> Result<()> {
                 }
                 OauthCommand::Probe { provider } => {
                     let providers = resolve(&provider)?;
-                    println!(
-                        "{:<10} {:<14} {:<5} detail",
-                        "provider", "status", "code"
-                    );
+                    println!("{:<10} {:<14} {:<5} detail", "provider", "status", "code");
                     for p in providers {
                         let r = ff_agent::oauth_distributor::probe_one(&pool, p).await;
                         let color = match r.status.as_str() {
@@ -2935,9 +2932,11 @@ async fn main() -> Result<()> {
                 .await
                 .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
             match command {
-                ToolsCommand::List { node, name, unhealthy } => {
-                    tools_cmd::handle_list(&pool, node, name, unhealthy).await
-                }
+                ToolsCommand::List {
+                    node,
+                    name,
+                    unhealthy,
+                } => tools_cmd::handle_list(&pool, node, name, unhealthy).await,
                 ToolsCommand::Health => tools_cmd::handle_health(&pool).await,
                 ToolsCommand::Register { node } => tools_cmd::handle_register(&pool, node).await,
             }
@@ -3287,37 +3286,39 @@ async fn run_event_loop(
 
         // Check if agent finished
         if let Some(handle) = &agent_handle
-            && handle.is_finished() {
-                if let Some(handle) = agent_handle.take()
-                    && let Ok((session, _)) = handle.await {
-                        app.tab_mut().session_id = session.id.to_string();
-                        app.tab_mut().session = Some(session);
-                    }
-                event_rx = None;
-                app.tab_mut().is_running = false;
-                app.tab_mut().status = "Ready".into();
-
-                // Auto-send queued message if one was waiting
-                if let Some(queued) = app.tab_mut().queued_message.take() {
-                    let prompt = detect_dropped_content(&queued);
-                    // Show user message
-                    app.tab_mut().input.text = queued;
-                    app.submit_input();
-                    // Start agent with queued message
-                    let mut session = app
-                        .tab_mut()
-                        .session
-                        .take()
-                        .unwrap_or_else(|| AgentSession::new(config.clone()));
-                    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
-                    let handle = tokio::spawn(async move {
-                        let outcome = session.run(&prompt, Some(tx)).await;
-                        (session, outcome)
-                    });
-                    agent_handle = Some(handle);
-                    event_rx = Some(rx);
-                }
+            && handle.is_finished()
+        {
+            if let Some(handle) = agent_handle.take()
+                && let Ok((session, _)) = handle.await
+            {
+                app.tab_mut().session_id = session.id.to_string();
+                app.tab_mut().session = Some(session);
             }
+            event_rx = None;
+            app.tab_mut().is_running = false;
+            app.tab_mut().status = "Ready".into();
+
+            // Auto-send queued message if one was waiting
+            if let Some(queued) = app.tab_mut().queued_message.take() {
+                let prompt = detect_dropped_content(&queued);
+                // Show user message
+                app.tab_mut().input.text = queued;
+                app.submit_input();
+                // Start agent with queued message
+                let mut session = app
+                    .tab_mut()
+                    .session
+                    .take()
+                    .unwrap_or_else(|| AgentSession::new(config.clone()));
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+                let handle = tokio::spawn(async move {
+                    let outcome = session.run(&prompt, Some(tx)).await;
+                    (session, outcome)
+                });
+                agent_handle = Some(handle);
+                event_rx = Some(rx);
+            }
+        }
 
         // Poll any in-flight async picker load
         poll_picker_load(app);
@@ -3764,9 +3765,10 @@ fn summarize_tool_input(tool_name: &str, input_json: &str) -> String {
     };
 
     if !key.is_empty()
-        && let Some(val) = v.get(key).and_then(|v| v.as_str()) {
-            return truncate_str(val, 60).replace('\n', " ");
-        }
+        && let Some(val) = v.get(key).and_then(|v| v.as_str())
+    {
+        return truncate_str(val, 60).replace('\n', " ");
+    }
 
     // Fallback: first string value in the object
     if let Some(obj) = v.as_object() {
@@ -4104,9 +4106,10 @@ async fn load_picker_items() -> Result<Vec<ff_terminal::app::ModelPickerItem>, S
         let mut nodes_v = a.lib_nodes.clone();
         nodes_v.sort();
         if let Some((n, _, _, _)) = a.deploy.as_ref()
-            && !nodes_v.contains(n) {
-                nodes_v.push(n.clone());
-            }
+            && !nodes_v.contains(n)
+        {
+            nodes_v.push(n.clone());
+        }
 
         items.push(ModelPickerItem {
             name: meta.name,
@@ -4434,9 +4437,10 @@ async fn run_headless(
         }, "events": events });
         println!("{}", serde_json::to_string_pretty(&result)?);
     } else if let ff_agent::agent_loop::AgentOutcome::EndTurn { final_message } = &outcome
-        && !final_message.is_empty() {
-            println!("{final_message}");
-        }
+        && !final_message.is_empty()
+    {
+        println!("{final_message}");
+    }
     Ok(())
 }
 
@@ -4544,74 +4548,74 @@ fn detect_dropped_content(input: &str) -> String {
 async fn detect_llm_from_db_or_local(config_path: &std::path::Path) -> String {
     // Try to load fleet.toml to get the database URL
     if let Ok(toml_str) = std::fs::read_to_string(config_path)
-        && let Ok(config) = toml::from_str::<ff_core::config::FleetConfig>(&toml_str) {
-            let db_url = config.database.url.trim();
-            if !db_url.is_empty() {
-                // Query Postgres for fleet nodes and their model ports
-                if let Ok(pool) = sqlx::postgres::PgPoolOptions::new()
-                    .max_connections(1)
-                    .acquire_timeout(Duration::from_secs(3))
-                    .connect(db_url)
-                    .await
-                    && let Ok(nodes) = ff_db::pg_list_nodes(&pool).await {
-                        // Also get models to find ports
-                        let models = ff_db::pg_list_models(&pool).await.unwrap_or_default();
+        && let Ok(config) = toml::from_str::<ff_core::config::FleetConfig>(&toml_str)
+    {
+        let db_url = config.database.url.trim();
+        if !db_url.is_empty() {
+            // Query Postgres for fleet nodes and their model ports
+            if let Ok(pool) = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(1)
+                .acquire_timeout(Duration::from_secs(3))
+                .connect(db_url)
+                .await
+                && let Ok(nodes) = ff_db::pg_list_nodes(&pool).await
+            {
+                // Also get models to find ports
+                let models = ff_db::pg_list_models(&pool).await.unwrap_or_default();
 
-                        // Build (ip, port, cores, supports_tools) pairs
-                        // Prefer models that support tool calling (Qwen) over those that don't (Gemma)
-                        let mut endpoints: Vec<(String, u16, i32, bool)> = Vec::new();
-                        for node in &nodes {
-                            let node_models: Vec<_> =
-                                models.iter().filter(|m| m.node_name == node.name).collect();
-                            if node_models.is_empty() {
-                                endpoints.push((node.ip.clone(), 55000, node.cpu_cores, true));
-                            } else {
-                                for m in node_models {
-                                    // Qwen and Gemma-4 (via MLX) both support OpenAI tool calling.
-                                    // Check id/slug/name for "gemma-4" or "gemma4" to distinguish from older Gemma variants.
-                                    let fam = m.family.to_lowercase();
-                                    let id_lower = m.id.to_lowercase();
-                                    let name_lower = m.name.to_lowercase();
-                                    let is_gemma4 = (id_lower.contains("gemma-4")
-                                        || id_lower.contains("gemma4")
-                                        || name_lower.contains("gemma-4")
-                                        || name_lower.contains("gemma4"))
-                                        && fam.contains("gemma");
-                                    let supports_tools = fam.contains("qwen") || is_gemma4;
-                                    endpoints.push((
-                                        node.ip.clone(),
-                                        m.port as u16,
-                                        node.cpu_cores,
-                                        supports_tools,
-                                    ));
-                                }
-                            }
-                        }
-                        // Sort: tool-calling models first, then by cores descending
-                        endpoints.sort_by(|a, b| b.3.cmp(&a.3).then(b.2.cmp(&a.2)));
-
-                        for (ip, port, _, _) in &endpoints {
-                            if let Ok(addr) = format!("{ip}:{port}").parse()
-                                && std::net::TcpStream::connect_timeout(
-                                    &addr,
-                                    Duration::from_millis(200),
-                                )
-                                .is_ok()
-                                {
-                                    tracing::info!(ip = %ip, port, "auto-detected LLM endpoint from database");
-                                    return format!("http://{ip}:{port}");
-                                }
+                // Build (ip, port, cores, supports_tools) pairs
+                // Prefer models that support tool calling (Qwen) over those that don't (Gemma)
+                let mut endpoints: Vec<(String, u16, i32, bool)> = Vec::new();
+                for node in &nodes {
+                    let node_models: Vec<_> =
+                        models.iter().filter(|m| m.node_name == node.name).collect();
+                    if node_models.is_empty() {
+                        endpoints.push((node.ip.clone(), 55000, node.cpu_cores, true));
+                    } else {
+                        for m in node_models {
+                            // Qwen and Gemma-4 (via MLX) both support OpenAI tool calling.
+                            // Check id/slug/name for "gemma-4" or "gemma4" to distinguish from older Gemma variants.
+                            let fam = m.family.to_lowercase();
+                            let id_lower = m.id.to_lowercase();
+                            let name_lower = m.name.to_lowercase();
+                            let is_gemma4 = (id_lower.contains("gemma-4")
+                                || id_lower.contains("gemma4")
+                                || name_lower.contains("gemma-4")
+                                || name_lower.contains("gemma4"))
+                                && fam.contains("gemma");
+                            let supports_tools = fam.contains("qwen") || is_gemma4;
+                            endpoints.push((
+                                node.ip.clone(),
+                                m.port as u16,
+                                node.cpu_cores,
+                                supports_tools,
+                            ));
                         }
                     }
+                }
+                // Sort: tool-calling models first, then by cores descending
+                endpoints.sort_by(|a, b| b.3.cmp(&a.3).then(b.2.cmp(&a.2)));
+
+                for (ip, port, _, _) in &endpoints {
+                    if let Ok(addr) = format!("{ip}:{port}").parse()
+                        && std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200))
+                            .is_ok()
+                    {
+                        tracing::info!(ip = %ip, port, "auto-detected LLM endpoint from database");
+                        return format!("http://{ip}:{port}");
+                    }
+                }
             }
         }
+    }
 
     // Fallback: probe localhost
     for port in [55000, 55001, 11434] {
         if let Ok(addr) = format!("127.0.0.1:{port}").parse()
-            && std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_ok() {
-                return format!("http://127.0.0.1:{port}");
-            }
+            && std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_ok()
+        {
+            return format!("http://127.0.0.1:{port}");
+        }
     }
 
     "http://localhost:55000".into()
@@ -4841,12 +4845,13 @@ fn find_daemon_binary(working_dir: &Path) -> Option<PathBuf> {
     if let Ok(output) = std::process::Command::new("which")
         .arg("forgefleetd")
         .output()
-        && output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !path.is_empty() {
-                return Some(PathBuf::from(path));
-            }
+        && output.status.success()
+    {
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !path.is_empty() {
+            return Some(PathBuf::from(path));
         }
+    }
 
     None
 }
@@ -5260,27 +5265,27 @@ async fn load_fleet_nodes_for_health(c: &AgentSessionConfig) -> Vec<(String, Str
         .join(".forgefleet/fleet.toml");
 
     if let Ok(toml_str) = fs::read_to_string(&config_path)
-        && let Ok(cfg) = toml::from_str::<ff_core::config::FleetConfig>(&toml_str) {
-            let db_url = cfg.database.url.trim().to_string();
-            if !db_url.is_empty()
-                && let Ok(pool) = sqlx::postgres::PgPoolOptions::new()
-                    .max_connections(1)
-                    .acquire_timeout(Duration::from_secs(3))
-                    .connect(&db_url)
-                    .await
-                {
-                    let rows: Vec<(String, String)> = sqlx::query_as(
-                        "SELECT name, ip FROM fleet_nodes ORDER BY election_priority, name",
-                    )
+        && let Ok(cfg) = toml::from_str::<ff_core::config::FleetConfig>(&toml_str)
+    {
+        let db_url = cfg.database.url.trim().to_string();
+        if !db_url.is_empty()
+            && let Ok(pool) = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(1)
+                .acquire_timeout(Duration::from_secs(3))
+                .connect(&db_url)
+                .await
+        {
+            let rows: Vec<(String, String)> =
+                sqlx::query_as("SELECT name, ip FROM fleet_nodes ORDER BY election_priority, name")
                     .fetch_all(&pool)
                     .await
                     .unwrap_or_default();
 
-                    if !rows.is_empty() {
-                        return rows.into_iter().map(|(n, ip)| (n, ip, 51000u16)).collect();
-                    }
-                }
+            if !rows.is_empty() {
+                return rows.into_iter().map(|(n, ip)| (n, ip, 51000u16)).collect();
+            }
         }
+    }
 
     // Fallback: probe the local daemon + known hardcoded list
     let _ = c; // suppress unused warning
@@ -5374,10 +5379,7 @@ async fn handle_secrets(cmd: SecretsCommand) -> Result<()> {
                 println!("(no secrets near expiry)");
                 return Ok(());
             }
-            println!(
-                "{:<30} {:>10} {:>5} EXPIRES_AT",
-                "KEY", "DAYS_LEFT", "ROT#"
-            );
+            println!("{:<30} {:>10} {:>5} EXPIRES_AT", "KEY", "DAYS_LEFT", "ROT#");
             for row in report
                 .already_expired
                 .iter()
@@ -5476,20 +5478,21 @@ async fn handle_defer(cmd: DeferCommand) -> Result<()> {
             );
             for r in rows {
                 let trigger = (match r.trigger_type.as_str() {
-                        "node_online" => r
-                            .trigger_spec
-                            .get("node")
-                            .and_then(|v| v.as_str())
-                            .map(|n| format!("node={n}"))
-                            .unwrap_or_else(|| "node_online".into()),
-                        "at_time" => r
-                            .trigger_spec
-                            .get("at")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("at_time")
-                            .to_string(),
-                        other => other.to_string(),
-                    }).to_string();
+                    "node_online" => r
+                        .trigger_spec
+                        .get("node")
+                        .and_then(|v| v.as_str())
+                        .map(|n| format!("node={n}"))
+                        .unwrap_or_else(|| "node_online".into()),
+                    "at_time" => r
+                        .trigger_spec
+                        .get("at")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("at_time")
+                        .to_string(),
+                    other => other.to_string(),
+                })
+                .to_string();
                 let target = r.preferred_node.clone().unwrap_or_else(|| "-".into());
                 println!(
                     "{:<38} {:<10} {:<12} {:<16} {:<6} {}",
@@ -7392,7 +7395,9 @@ async fn finalize_upgrade_event(
 async fn register_mcp_server(tool_id: &str, server_command: &str) -> anyhow::Result<()> {
     let candidates = [
         std::path::PathBuf::from(".mcp.json"),
-        dirs::home_dir().map(|h| h.join(".mcp.json")).unwrap_or_default(),
+        dirs::home_dir()
+            .map(|h| h.join(".mcp.json"))
+            .unwrap_or_default(),
     ];
 
     let path = candidates.iter().find(|p| p.exists()).cloned();
@@ -7403,9 +7408,7 @@ async fn register_mcp_server(tool_id: &str, server_command: &str) -> anyhow::Res
 
     let mut config: serde_json::Value = if path.exists() {
         let text = tokio::fs::read_to_string(&path).await?;
-        serde_json::from_str(&text).unwrap_or_else(|_| {
-            serde_json::json!({ "mcpServers": {} })
-        })
+        serde_json::from_str(&text).unwrap_or_else(|_| serde_json::json!({ "mcpServers": {} }))
     } else {
         serde_json::json!({ "mcpServers": {} })
     };
@@ -7494,7 +7497,8 @@ async fn finalize_external_tool_event(
 
     // Matches "Installing to /path/to/bin" or "/home/.../bin/<cli>".
     let path_guess: Option<String> = stdout.lines().rev().find_map(|line| {
-        line.strip_prefix("Installing to ").map(|rest| rest.trim().to_string())
+        line.strip_prefix("Installing to ")
+            .map(|rest| rest.trim().to_string())
     });
 
     let new_status = if ok { "ok" } else { "install_failed" };
@@ -7509,18 +7513,20 @@ async fn finalize_external_tool_event(
         .filter(|s| !s.is_empty());
 
     let mut mcp_registered = false;
-    if ok && register_as_mcp
-        && let Some(cmd) = mcp_server_command {
-            match register_mcp_server(tool_id, cmd).await {
-                Ok(_) => {
-                    mcp_registered = true;
-                    tracing::info!(tool_id, computer, "MCP auto-registration succeeded");
-                }
-                Err(e) => {
-                    tracing::warn!(tool_id, computer, error = %e, "MCP auto-registration failed");
-                }
+    if ok
+        && register_as_mcp
+        && let Some(cmd) = mcp_server_command
+    {
+        match register_mcp_server(tool_id, cmd).await {
+            Ok(_) => {
+                mcp_registered = true;
+                tracing::info!(tool_id, computer, "MCP auto-registration succeeded");
+            }
+            Err(e) => {
+                tracing::warn!(tool_id, computer, error = %e, "MCP auto-registration failed");
             }
         }
+    }
 
     let _ = sqlx::query(
         "UPDATE computer_external_tools cet
@@ -7660,10 +7666,9 @@ async fn execute_shell(
 
     let mut cmd = TokCmd::new(program);
     cmd.args(&args);
-    if local
-        && let Some(ws) = workspace {
-            cmd.current_dir(ws);
-        }
+    if local && let Some(ws) = workspace {
+        cmd.current_dir(ws);
+    }
     let output = cmd.output().await;
     match output {
         Ok(o) => {
@@ -9866,9 +9871,10 @@ async fn handle_fleet_revive(
 /// then `~/.forgefleet/fleet.toml` `[redis] url`, then a localhost fallback.
 fn resolve_pulse_redis_url() -> String {
     if let Ok(url) = std::env::var("FORGEFLEET_REDIS_URL")
-        && !url.trim().is_empty() {
-            return url;
-        }
+        && !url.trim().is_empty()
+    {
+        return url;
+    }
     const FALLBACK: &str = "redis://localhost:6380";
     let Some(home) = dirs::home_dir() else {
         return FALLBACK.to_string();
@@ -9928,11 +9934,12 @@ async fn handle_fleet_leader(pool: &sqlx::PgPool, json: bool) -> Result<()> {
     let mut alive_map: std::collections::HashMap<String, (bool, bool)> =
         std::collections::HashMap::new();
     if let Ok(reader) = pulse_reader()
-        && let Ok(beats) = reader.all_beats().await {
-            for b in beats {
-                alive_map.insert(b.computer_name.clone(), (!b.going_offline, b.is_yielding));
-            }
+        && let Ok(beats) = reader.all_beats().await
+    {
+        for b in beats {
+            alive_map.insert(b.computer_name.clone(), (!b.going_offline, b.is_yielding));
         }
+    }
 
     if json {
         let cur = leader.as_ref().map(|l| {
@@ -11086,9 +11093,10 @@ async fn handle_social(cmd: SocialCommand) -> Result<()> {
                 println!("  • [{kind}] {path}");
             }
             if let Some(t) = extracted_text
-                && !t.trim().is_empty() {
-                    println!("\n{CYAN}extracted_text{RESET}\n{t}");
-                }
+                && !t.trim().is_empty()
+            {
+                println!("\n{CYAN}extracted_text{RESET}\n{t}");
+            }
             if let Some(a) = analysis {
                 let pretty = serde_json::to_string_pretty(&a).unwrap_or_default();
                 println!("\n{CYAN}analysis{RESET}\n{pretty}");
@@ -12367,9 +12375,10 @@ async fn handle_openclaw_devices(pool: &sqlx::PgPool, cmd: OpenclawDevicesComman
             println!("{GREEN}✓{RESET} imported {n} device(s)");
 
             if from_secret
-                && let Err(e) = ff_agent::openclaw::clear_device_pairings_export(pool).await {
-                    eprintln!("{YELLOW}warning:{RESET} failed to clear stashed secret: {e}");
-                }
+                && let Err(e) = ff_agent::openclaw::clear_device_pairings_export(pool).await
+            {
+                eprintln!("{YELLOW}warning:{RESET} failed to clear stashed secret: {e}");
+            }
         }
     }
     Ok(())
@@ -13226,9 +13235,10 @@ async fn handle_pm_import_claude_tasks(
                 }
                 if let Ok(md) = e.metadata()
                     && let Ok(mtime) = md.modified()
-                        && newest.as_ref().map(|(_, t)| mtime > *t).unwrap_or(true) {
-                            newest = Some((path, mtime));
-                        }
+                    && newest.as_ref().map(|(_, t)| mtime > *t).unwrap_or(true)
+                {
+                    newest = Some((path, mtime));
+                }
             }
         }
         newest
@@ -14437,9 +14447,10 @@ async fn handle_task(cmd: TaskCommand, _config_path: &Path) -> Result<()> {
                     println!("  origin_node: {node}");
                     println!("  created:     {created}");
                     if let Some(output) = t.get("output").and_then(|v| v.as_str())
-                        && !output.is_empty() {
-                            println!("\n  Output:\n    {}", truncate_str(output, 500));
-                        }
+                        && !output.is_empty()
+                    {
+                        println!("\n  Output:\n    {}", truncate_str(output, 500));
+                    }
                 }
             }
         }

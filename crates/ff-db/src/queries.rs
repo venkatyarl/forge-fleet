@@ -330,10 +330,7 @@ pub fn derive_runtime_node_status(
     let offline_threshold = offline_after_secs.max(degraded_threshold + 1);
 
     let heartbeat = parse_utc_timestamp(last_heartbeat).unwrap_or(*now);
-    let age_secs = now
-        .signed_duration_since(heartbeat)
-        .num_seconds()
-        .max(0);
+    let age_secs = now.signed_duration_since(heartbeat).num_seconds().max(0);
 
     if age_secs >= offline_threshold {
         return ("offline".to_string(), age_secs);
@@ -2486,10 +2483,12 @@ pub async fn pg_list_node_ssh_keys(
         .fetch_all(pool)
         .await?
     } else {
-        sqlx::query("SELECT * FROM fleet_node_ssh_keys WHERE node_name = $1 ORDER BY added_at LIMIT 100")
-            .bind(node_name)
-            .fetch_all(pool)
-            .await?
+        sqlx::query(
+            "SELECT * FROM fleet_node_ssh_keys WHERE node_name = $1 ORDER BY added_at LIMIT 100",
+        )
+        .bind(node_name)
+        .fetch_all(pool)
+        .await?
     };
     Ok(rows
         .iter()
@@ -4385,10 +4384,11 @@ pub async fn pg_list_brain_vault_edges_for_node(
     pool: &PgPool,
     node_id: uuid::Uuid,
 ) -> Result<Vec<BrainVaultEdgeRow>> {
-    let rows = sqlx::query("SELECT * FROM brain_vault_edges WHERE src_id = $1 OR dst_id = $1 LIMIT 100")
-        .bind(node_id)
-        .fetch_all(pool)
-        .await?;
+    let rows =
+        sqlx::query("SELECT * FROM brain_vault_edges WHERE src_id = $1 OR dst_id = $1 LIMIT 100")
+            .bind(node_id)
+            .fetch_all(pool)
+            .await?;
     Ok(rows
         .iter()
         .map(|r| BrainVaultEdgeRow {
@@ -4633,10 +4633,12 @@ pub struct BrainCommunityRow {
 }
 
 pub async fn pg_list_brain_communities(pool: &PgPool) -> Result<Vec<BrainCommunityRow>> {
-    let rows = sqlx::query("SELECT * FROM brain_communities ORDER BY id
-         LIMIT 100")
-        .fetch_all(pool)
-        .await?;
+    let rows = sqlx::query(
+        "SELECT * FROM brain_communities ORDER BY id
+         LIMIT 100",
+    )
+    .fetch_all(pool)
+    .await?;
     Ok(rows
         .iter()
         .map(|r| BrainCommunityRow {

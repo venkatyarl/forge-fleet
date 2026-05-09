@@ -181,7 +181,7 @@ impl AlertEvaluator {
             let targets = match policy.scope.as_str() {
                 "any_computer" => {
                     // All known computers currently beating, or sdown by name.
-                    
+
                     list_all_computers(&self.pg).await?
                 }
                 "specific" => {

@@ -388,20 +388,21 @@ impl AgentTool for FleetInventoryTool {
                 let url = format!("http://{ip}:{port}/v1/models");
                 if let Ok(resp) = client.get(&url).send().await {
                     if resp.status().is_success()
-                        && let Ok(body) = resp.text().await {
-                            let model_name = serde_json::from_str::<Value>(&body)
-                                .ok()
-                                .and_then(|v| {
-                                    v.get("data")?
-                                        .as_array()?
-                                        .first()?
-                                        .get("id")?
-                                        .as_str()
-                                        .map(String::from)
-                                })
-                                .unwrap_or_else(|| "unknown".into());
-                            found_services.push(format!("    port {port}: {model_name} (ONLINE)"));
-                        }
+                        && let Ok(body) = resp.text().await
+                    {
+                        let model_name = serde_json::from_str::<Value>(&body)
+                            .ok()
+                            .and_then(|v| {
+                                v.get("data")?
+                                    .as_array()?
+                                    .first()?
+                                    .get("id")?
+                                    .as_str()
+                                    .map(String::from)
+                            })
+                            .unwrap_or_else(|| "unknown".into());
+                        found_services.push(format!("    port {port}: {model_name} (ONLINE)"));
+                    }
                 } else {
                     // Check if port is open but not LLM
                     if tokio::time::timeout(
@@ -522,25 +523,26 @@ impl AgentTool for NodeHealthCheckTool {
             .get(format!("http://{host}:{port}/v1/models"))
             .send()
             .await
-            && let Ok(body) = resp.text().await {
-                let models: Vec<String> = serde_json::from_str::<Value>(&body)
-                    .ok()
-                    .and_then(|v| v.get("data")?.as_array().cloned())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|m| m.get("id").and_then(Value::as_str).map(String::from))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                checks.push(format!(
-                    "Models: {}",
-                    if models.is_empty() {
-                        "none".into()
-                    } else {
-                        models.join(", ")
-                    }
-                ));
-            }
+            && let Ok(body) = resp.text().await
+        {
+            let models: Vec<String> = serde_json::from_str::<Value>(&body)
+                .ok()
+                .and_then(|v| v.get("data")?.as_array().cloned())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|m| m.get("id").and_then(Value::as_str).map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            checks.push(format!(
+                "Models: {}",
+                if models.is_empty() {
+                    "none".into()
+                } else {
+                    models.join(", ")
+                }
+            ));
+        }
 
         AgentToolResult::ok(format!("Health Check — {host}\n\n{}", checks.join("\n")))
     }

@@ -111,12 +111,13 @@ pub async fn fetch_snapshot() -> Result<FleetSnapshot, String> {
 /// Returns `None` if neither source has a value.
 pub async fn fetch_secret(key: &str) -> Option<String> {
     if let Ok(pool) = get_fleet_pool().await
-        && let Ok(Some(value)) = pg_get_secret(&pool, key).await {
-            let trimmed = value.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
-            }
+        && let Ok(Some(value)) = pg_get_secret(&pool, key).await
+    {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
         }
+    }
     // Fallback: environment variable.
     let env_key = env_key_for_secret(key);
     if let Ok(val) = std::env::var(&env_key) {
@@ -149,22 +150,24 @@ pub async fn resolve_this_node_name() -> String {
     let local_ips = local_ipv4_addrs();
 
     if let Ok(pool) = get_fleet_pool().await
-        && let Ok(nodes) = pg_list_nodes(&pool).await {
-            for n in &nodes {
-                if local_ips.contains(&n.ip) {
-                    return n.name.clone();
-                }
-                // alt_ips is JSONB array of strings
-                if let Some(alt) = n.alt_ips.as_array() {
-                    for v in alt {
-                        if let Some(s) = v.as_str()
-                            && local_ips.contains(&s.to_string()) {
-                                return n.name.clone();
-                            }
+        && let Ok(nodes) = pg_list_nodes(&pool).await
+    {
+        for n in &nodes {
+            if local_ips.contains(&n.ip) {
+                return n.name.clone();
+            }
+            // alt_ips is JSONB array of strings
+            if let Some(alt) = n.alt_ips.as_array() {
+                for v in alt {
+                    if let Some(s) = v.as_str()
+                        && local_ips.contains(&s.to_string())
+                    {
+                        return n.name.clone();
                     }
                 }
             }
         }
+    }
 
     // Fallback: hostname short name.
     std::process::Command::new("hostname")
@@ -194,9 +197,11 @@ fn local_ipv4_addrs() -> Vec<String> {
         if let Some(rest) = line.strip_prefix("inet ") {
             // rest looks like "192.168.5.100 netmask ..."
             if let Some(addr) = rest.split_whitespace().next()
-                && !addr.starts_with("127.") && !addr.starts_with("169.254") {
-                    ips.push(addr.to_string());
-                }
+                && !addr.starts_with("127.")
+                && !addr.starts_with("169.254")
+            {
+                ips.push(addr.to_string());
+            }
         }
     }
     ips
@@ -291,9 +296,10 @@ pub async fn resolve_best_ip(computer_name: &str) -> Option<(String, String)> {
 
     // If explicitly tailscale_only, prefer the tailscale entry straight away.
     if network_scope == "tailscale_only"
-        && let Some((ip, kind)) = pairs.iter().find(|(_, k)| k == "tailscale") {
-            return Some((ip.clone(), kind.clone()));
-        }
+        && let Some((ip, kind)) = pairs.iter().find(|(_, k)| k == "tailscale")
+    {
+        return Some((ip.clone(), kind.clone()));
+    }
 
     // 1. LAN from all_ips.
     if let Some((ip, kind)) = pairs.iter().find(|(_, k)| k == "lan") {

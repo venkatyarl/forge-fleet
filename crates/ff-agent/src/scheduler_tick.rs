@@ -48,7 +48,9 @@ pub async fn evaluate_schedules(pg: &PgPool, node_name: &str) -> Result<usize> {
             }
         };
 
-        let next_run = schedule.next_after(Utc::now()).unwrap_or_else(|| Utc::now() + chrono::Duration::days(1));
+        let next_run = schedule
+            .next_after(Utc::now())
+            .unwrap_or_else(|| Utc::now() + chrono::Duration::days(1));
 
         // Build fleet_tasks payload from template.
         let template = task_template.0;
@@ -82,7 +84,12 @@ pub async fn evaluate_schedules(pg: &PgPool, node_name: &str) -> Result<usize> {
         .bind(&summary)
         .bind(&payload)
         .bind(template.get("task_type").and_then(|v| v.as_str()))
-        .bind(template.get("priority").and_then(|v| v.as_i64()).map(|v| v as i32))
+        .bind(
+            template
+                .get("priority")
+                .and_then(|v| v.as_i64())
+                .map(|v| v as i32),
+        )
         .bind(template.get("requires_capability").cloned())
         .bind(node_name)
         .fetch_one(pg)

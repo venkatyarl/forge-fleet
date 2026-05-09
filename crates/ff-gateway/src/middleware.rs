@@ -144,7 +144,9 @@ const PUBLIC_ROUTES: &[&str] = &[
 ];
 
 fn is_public_route(path: &str) -> bool {
-    PUBLIC_ROUTES.iter().any(|p| path == *p || path.starts_with(&format!("{}/", p)))
+    PUBLIC_ROUTES
+        .iter()
+        .any(|p| path == *p || path.starts_with(&format!("{}/", p)))
 }
 
 /// Axum middleware that validates `Authorization: Bearer <token>`.
@@ -156,14 +158,24 @@ fn is_public_route(path: &str) -> bool {
 pub async fn jwt_auth_middleware(request: Request<Body>, next: Next) -> Response<Body> {
     let path = request.uri().path().to_string();
     let method = request.method().clone();
-    let is_mutating = matches!(method, axum::http::Method::POST | axum::http::Method::PUT | axum::http::Method::PATCH | axum::http::Method::DELETE);
+    let is_mutating = matches!(
+        method,
+        axum::http::Method::POST
+            | axum::http::Method::PUT
+            | axum::http::Method::PATCH
+            | axum::http::Method::DELETE
+    );
 
     let secret = match std::env::var("FF_JWT_SECRET") {
         Ok(s) if !s.is_empty() => s,
         _ => {
             // No JWT secret configured — still block mutating routes.
             if is_mutating && !is_public_route(&path) {
-                return json_error(StatusCode::UNAUTHORIZED, "authentication required for mutating requests").into_response();
+                return json_error(
+                    StatusCode::UNAUTHORIZED,
+                    "authentication required for mutating requests",
+                )
+                .into_response();
             }
             return next.run(request).await;
         }
@@ -182,7 +194,11 @@ pub async fn jwt_auth_middleware(request: Request<Body>, next: Next) -> Response
     let token = match auth_header {
         Some(hdr) if hdr.starts_with("Bearer ") => &hdr[7..],
         _ => {
-            return json_error(StatusCode::UNAUTHORIZED, "missing or malformed Authorization header").into_response();
+            return json_error(
+                StatusCode::UNAUTHORIZED,
+                "missing or malformed Authorization header",
+            )
+            .into_response();
         }
     };
 

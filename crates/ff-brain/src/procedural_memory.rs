@@ -71,7 +71,10 @@ pub async fn consolidate(pg: &PgPool) -> Result<usize> {
     }
 
     if sessions.len() < MIN_CLUSTER_SIZE {
-        debug!(count = sessions.len(), "not enough recent sessions to consolidate");
+        debug!(
+            count = sessions.len(),
+            "not enough recent sessions to consolidate"
+        );
         return Ok(0);
     }
 
@@ -84,12 +87,14 @@ pub async fn consolidate(pg: &PgPool) -> Result<usize> {
         }
         // Use the first meaningful token as the cluster key.
         let keyword = tokens[0].clone();
-        let cluster = clusters.entry(keyword.clone()).or_insert_with(|| SessionCluster {
-            keyword: keyword.clone(),
-            session_ids: Vec::new(),
-            successful: 0,
-            total: 0,
-        });
+        let cluster = clusters
+            .entry(keyword.clone())
+            .or_insert_with(|| SessionCluster {
+                keyword: keyword.clone(),
+                session_ids: Vec::new(),
+                successful: 0,
+                total: 0,
+            });
         cluster.session_ids.push(s.id);
         cluster.total += 1;
         if s.succeeded {
@@ -192,7 +197,10 @@ async fn extract_common_steps(pg: &PgPool, session_ids: &[Uuid]) -> Result<Vec<S
     // the first session's sequence as a candidate and scoring others).
     let mut best: Option<(Vec<String>, usize)> = None;
     for seq in by_session.values() {
-        let score = by_session.values().filter(|s| similarity(s, seq) >= 0.5).count();
+        let score = by_session
+            .values()
+            .filter(|s| similarity(s, seq) >= 0.5)
+            .count();
         if best.as_ref().is_none_or(|(_, b)| score > *b) {
             best = Some((seq.clone(), score));
         }
@@ -217,17 +225,20 @@ fn similarity(a: &[String], b: &[String]) -> f64 {
 /// Tokenise a goal string into lowercase keywords, stripping stopwords.
 fn tokenise(goal: &str) -> Vec<String> {
     let stopwords: std::collections::HashSet<&str> = [
-        "the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for",
-        "of", "with", "by", "from", "is", "are", "was", "were", "be", "been",
-        "being", "have", "has", "had", "do", "does", "did", "will", "would",
-        "could", "should", "may", "might", "must", "can", "need", "shall",
+        "the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for", "of", "with", "by",
+        "from", "is", "are", "was", "were", "be", "been", "being", "have", "has", "had", "do",
+        "does", "did", "will", "would", "could", "should", "may", "might", "must", "can", "need",
+        "shall",
     ]
     .iter()
     .copied()
     .collect();
 
     goal.split_whitespace()
-        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_ascii_lowercase())
+        .map(|w| {
+            w.trim_matches(|c: char| !c.is_alphanumeric())
+                .to_ascii_lowercase()
+        })
         .filter(|w| w.len() > 2 && !stopwords.contains(w.as_str()))
         .collect()
 }
@@ -236,7 +247,13 @@ fn tokenise(goal: &str) -> Vec<String> {
 fn sanitize_name(keyword: &str) -> String {
     keyword
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '_' { c.to_ascii_lowercase() } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '_' {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
         .take(40)
         .collect()
 }

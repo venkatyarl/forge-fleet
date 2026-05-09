@@ -240,10 +240,7 @@ impl AdaptiveRouter {
                     (b, score)
                 })
                 .collect();
-            scored.sort_by(|a, b| {
-                a.1.partial_cmp(&b.1)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
+            scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
             result.extend(scored.into_iter().map(|(b, _)| b));
         }
         result
@@ -252,11 +249,7 @@ impl AdaptiveRouter {
     /// Build a flat, ordered backend chain for a request.
     ///
     /// Applies circuit-breaker filtering and GPU-aware scoring.
-    pub async fn route_chain(
-        &self,
-        model: &str,
-        messages: &[ChatMessage],
-    ) -> Vec<BackendEndpoint> {
+    pub async fn route_chain(&self, model: &str, messages: &[ChatMessage]) -> Vec<BackendEndpoint> {
         let (_decision, chain) = self.route(model, messages, None, None).await;
         self.filter_and_score_chain(chain)
     }
@@ -287,10 +280,7 @@ impl AdaptiveRouter {
                         (b, score)
                     })
                     .collect();
-                scored.sort_by(|a, b| {
-                    a.1.partial_cmp(&b.1)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
+                scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
                 return scored.into_iter().map(|(b, _)| b).collect();
             }
         }
@@ -312,10 +302,7 @@ impl AdaptiveRouter {
                     (b, score)
                 })
                 .collect();
-            scored.sort_by(|a, b| {
-                a.1.partial_cmp(&b.1)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
+            scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
             return scored.into_iter().map(|(b, _)| b).collect();
         }
 
@@ -502,7 +489,11 @@ impl AdaptiveRouter {
             RoutingPolicy::LocalFirst => {
                 // Try local models first for non-complex tasks
                 if !is_complex {
-                    let local_models: Vec<_> = confident.iter().filter(|r| self.is_local_model(&r.model_id)).copied().collect();
+                    let local_models: Vec<_> = confident
+                        .iter()
+                        .filter(|r| self.is_local_model(&r.model_id))
+                        .copied()
+                        .collect();
                     if !local_models.is_empty() {
                         local_models
                     } else {
@@ -521,7 +512,11 @@ impl AdaptiveRouter {
                     match (a_local, b_local) {
                         (true, false) => std::cmp::Ordering::Less,
                         (false, true) => std::cmp::Ordering::Greater,
-                        _ => a.tier.cmp(&b.tier).then(a.avg_latency_ms.partial_cmp(&b.avg_latency_ms).unwrap_or(std::cmp::Ordering::Equal)),
+                        _ => a.tier.cmp(&b.tier).then(
+                            a.avg_latency_ms
+                                .partial_cmp(&b.avg_latency_ms)
+                                .unwrap_or(std::cmp::Ordering::Equal),
+                        ),
                     }
                 });
                 sorted
@@ -532,12 +527,19 @@ impl AdaptiveRouter {
             }
             RoutingPolicy::Balanced => {
                 // Score each model: quality * 0.4 + locality_bonus * 0.3 + cost_bonus * 0.3
-                let mut scored: Vec<_> = confident.iter().map(|r| {
-                    let locality_bonus = if self.is_local_model(&r.model_id) { 0.3 } else { 0.0 };
-                    let cost_bonus = if r.tier <= 2 { 0.2 } else { 0.0 };
-                    let score = r.score * 0.5 + locality_bonus + cost_bonus;
-                    (*r, score)
-                }).collect();
+                let mut scored: Vec<_> = confident
+                    .iter()
+                    .map(|r| {
+                        let locality_bonus = if self.is_local_model(&r.model_id) {
+                            0.3
+                        } else {
+                            0.0
+                        };
+                        let cost_bonus = if r.tier <= 2 { 0.2 } else { 0.0 };
+                        let score = r.score * 0.5 + locality_bonus + cost_bonus;
+                        (*r, score)
+                    })
+                    .collect();
                 scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                 scored.into_iter().map(|(r, _)| r).collect()
             }
@@ -552,23 +554,41 @@ impl AdaptiveRouter {
         let mut reason = match policy {
             RoutingPolicy::LocalFirst => {
                 if self.is_local_model(&candidate.model_id) {
-                    format!("local-first: best local model ({:.2}) for {}", candidate.score, profile.task_type)
+                    format!(
+                        "local-first: best local model ({:.2}) for {}",
+                        candidate.score, profile.task_type
+                    )
                 } else {
-                    format!("local-first fallback: no local model available, using cloud ({:.2}) for {}", candidate.score, profile.task_type)
+                    format!(
+                        "local-first fallback: no local model available, using cloud ({:.2}) for {}",
+                        candidate.score, profile.task_type
+                    )
                 }
             }
             RoutingPolicy::CostOptimized => {
                 if self.is_local_model(&candidate.model_id) {
-                    format!("cost-optimized: free local model ({:.2}) for {}", candidate.score, profile.task_type)
+                    format!(
+                        "cost-optimized: free local model ({:.2}) for {}",
+                        candidate.score, profile.task_type
+                    )
                 } else {
-                    format!("cost-optimized: cheapest cloud model ({:.2}, tier {}) for {}", candidate.score, candidate.tier, profile.task_type)
+                    format!(
+                        "cost-optimized: cheapest cloud model ({:.2}, tier {}) for {}",
+                        candidate.score, candidate.tier, profile.task_type
+                    )
                 }
             }
             RoutingPolicy::QualityFirst => {
-                format!("quality-first: best quality ({:.2}) for {}", candidate.score, profile.task_type)
+                format!(
+                    "quality-first: best quality ({:.2}) for {}",
+                    candidate.score, profile.task_type
+                )
             }
             RoutingPolicy::Balanced => {
-                format!("balanced: best overall score ({:.2}) for {}", candidate.score, profile.task_type)
+                format!(
+                    "balanced: best overall score ({:.2}) for {}",
+                    candidate.score, profile.task_type
+                )
             }
         };
 
@@ -601,8 +621,7 @@ impl AdaptiveRouter {
             if r.tier == candidate.tier
                 && r.avg_latency_ms < candidate.avg_latency_ms
                 && filtered[0].avg_latency_ms > 0.0
-                && r.avg_latency_ms / filtered[0].avg_latency_ms
-                    < self.config.max_latency_ratio
+                && r.avg_latency_ms / filtered[0].avg_latency_ms < self.config.max_latency_ratio
             {
                 candidate = r;
                 reason = format!(
@@ -619,11 +638,20 @@ impl AdaptiveRouter {
     /// Uses a simple heuristic based on model naming conventions.
     fn is_local_model(&self, model_id: &str) -> bool {
         let local_prefixes = [
-            "qwen", "llama", "mistral", "mixtral", "codellama",
-            "deepseek-coder", "phi-", "gemma", "yi-",
+            "qwen",
+            "llama",
+            "mistral",
+            "mixtral",
+            "codellama",
+            "deepseek-coder",
+            "phi-",
+            "gemma",
+            "yi-",
         ];
         let lower = model_id.to_lowercase();
-        local_prefixes.iter().any(|prefix| lower.starts_with(prefix))
+        local_prefixes
+            .iter()
+            .any(|prefix| lower.starts_with(prefix))
     }
 
     // ── Tier Fallback ────────────────────────────────────────────────────
@@ -728,7 +756,9 @@ mod tests {
     use crate::router::TierRouter;
 
     fn make_backend(id: &str, tier: u8, model: &str) -> BackendEndpoint {
-        let is_local = !model.starts_with("gpt") && !model.starts_with("claude") && !model.starts_with("gemini");
+        let is_local = !model.starts_with("gpt")
+            && !model.starts_with("claude")
+            && !model.starts_with("gemini");
         BackendEndpoint {
             id: id.to_string(),
             node: "test-node".to_string(),
@@ -988,7 +1018,9 @@ mod tests {
         let (decision, _chain) = router.route("auto", &messages, None, None).await;
 
         assert_eq!(decision.strategy, RoutingStrategy::Adaptive);
-        assert!(decision.reason.contains("local-first") || decision.reason.contains("cheaper tier"));
+        assert!(
+            decision.reason.contains("local-first") || decision.reason.contains("cheaper tier")
+        );
     }
 
     #[tokio::test]
@@ -1048,7 +1080,11 @@ mod tests {
         let (decision, _chain) = router.route("auto", &messages, None, None).await;
 
         assert_eq!(decision.strategy, RoutingStrategy::Adaptive);
-        assert!(decision.reason.contains("balanced") || decision.reason.contains("cheaper tier") || decision.reason.contains("similar quality"));
+        assert!(
+            decision.reason.contains("balanced")
+                || decision.reason.contains("cheaper tier")
+                || decision.reason.contains("similar quality")
+        );
     }
 
     // ── Local model preference ───────────────────────────────────────────

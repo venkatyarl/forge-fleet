@@ -120,7 +120,11 @@ pub async fn handle_revert(pg: &PgPool, bug_sig: &str) -> Result<()> {
     }
 
     // If a rollback playbook exists, enqueue it as a deferred task.
-    if let Some(cmd) = rollback.as_object().and_then(|o| o.get("command")).and_then(|c| c.as_str()) {
+    if let Some(cmd) = rollback
+        .as_object()
+        .and_then(|o| o.get("command"))
+        .and_then(|c| c.as_str())
+    {
         let task_id = uuid::Uuid::new_v4();
         sqlx::query(
             "INSERT INTO deferred_tasks (id, kind, payload, status, priority, created_at, meta) \
@@ -133,7 +137,10 @@ pub async fn handle_revert(pg: &PgPool, bug_sig: &str) -> Result<()> {
         }))
         .execute(pg)
         .await?;
-        println!("Enqueued rollback task {} for bug_signature={}", task_id, bug_sig);
+        println!(
+            "Enqueued rollback task {} for bug_signature={}",
+            task_id, bug_sig
+        );
     } else {
         println!(
             "No rollback playbook for bug_signature={}; marking reverted without action.",
@@ -183,7 +190,10 @@ pub async fn handle_run_writer(pg: &PgPool, bug_sig: &str) -> Result<()> {
     .await?;
 
     let Some(row) = row else {
-        println!("No self-heal queue entry found for bug_signature={}", bug_sig);
+        println!(
+            "No self-heal queue entry found for bug_signature={}",
+            bug_sig
+        );
         return Ok(());
     };
 

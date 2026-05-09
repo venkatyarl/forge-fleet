@@ -130,17 +130,17 @@ impl OpenClawManager {
         // any token rotation so imported devices see a valid gateway
         // state. Best-effort — all failures logged, never propagated.
         if let Some(old) = previous_leader
-            && !old.is_empty() {
-                let my_name: String =
-                    sqlx::query_scalar("SELECT name FROM computers WHERE id = $1")
-                        .bind(self.my_computer_id)
-                        .fetch_optional(&self.pg)
-                        .await?
-                        .unwrap_or_default();
-                if old != my_name {
-                    let _ = migrate_devices_from(&self.pg, old, &my_name).await;
-                }
+            && !old.is_empty()
+        {
+            let my_name: String = sqlx::query_scalar("SELECT name FROM computers WHERE id = $1")
+                .bind(self.my_computer_id)
+                .fetch_optional(&self.pg)
+                .await?
+                .unwrap_or_default();
+            if old != my_name {
+                let _ = migrate_devices_from(&self.pg, old, &my_name).await;
             }
+        }
 
         let url = format!("ws://{}:50000", self.my_primary_ip);
 
@@ -434,12 +434,13 @@ fn restart_openclaw_service() -> Result<(), OpenClawError> {
 /// GUI domain label.
 fn current_uid() -> Option<String> {
     if let Ok(out) = Command::new("id").arg("-u").output()
-        && out.status.success() {
-            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !s.is_empty() {
-                return Some(s);
-            }
+        && out.status.success()
+    {
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !s.is_empty() {
+            return Some(s);
         }
+    }
     std::env::var("UID")
         .ok()
         .or_else(|| std::env::var("SUDO_UID").ok())
@@ -545,12 +546,13 @@ async fn migrate_devices_from(
 /// Resolve the openclaw binary path — prefer `$PATH`, else `/usr/local/bin/openclaw`.
 fn which_openclaw() -> String {
     if let Ok(o) = Command::new("which").arg("openclaw").output()
-        && o.status.success() {
-            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            if !s.is_empty() {
-                return s;
-            }
+        && o.status.success()
+    {
+        let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+        if !s.is_empty() {
+            return s;
         }
+    }
     "/usr/local/bin/openclaw".to_string()
 }
 

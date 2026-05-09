@@ -208,7 +208,11 @@ impl WsHub {
                     }
 
                     // Send a ping
-                    if entry.sender.try_send(Message::Ping(Vec::new().into())).is_err() {
+                    if entry
+                        .sender
+                        .try_send(Message::Ping(Vec::new().into()))
+                        .is_err()
+                    {
                         dead.push(*entry.key());
                     }
                 }

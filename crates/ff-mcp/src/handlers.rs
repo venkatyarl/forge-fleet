@@ -601,29 +601,30 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
         .await;
 
     if let Some(policy) = applied_policy.as_ref()
-        && !policy.policy.routing.allowed_models.is_empty() {
-            chain = chain
-                .into_iter()
-                .filter_map(|(tier, backends)| {
-                    let retained: Vec<_> = backends
-                        .into_iter()
-                        .filter(|backend| {
-                            policy
-                                .policy
-                                .routing
-                                .allowed_models
-                                .iter()
-                                .any(|allowed| allowed.eq_ignore_ascii_case(&backend.model))
-                        })
-                        .collect();
-                    if retained.is_empty() {
-                        None
-                    } else {
-                        Some((tier, retained))
-                    }
-                })
-                .collect();
-        }
+        && !policy.policy.routing.allowed_models.is_empty()
+    {
+        chain = chain
+            .into_iter()
+            .filter_map(|(tier, backends)| {
+                let retained: Vec<_> = backends
+                    .into_iter()
+                    .filter(|backend| {
+                        policy
+                            .policy
+                            .routing
+                            .allowed_models
+                            .iter()
+                            .any(|allowed| allowed.eq_ignore_ascii_case(&backend.model))
+                    })
+                    .collect();
+                if retained.is_empty() {
+                    None
+                } else {
+                    Some((tier, retained))
+                }
+            })
+            .collect();
+    }
 
     if chain.is_empty() {
         return Err(
@@ -631,7 +632,10 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
         );
     }
 
-    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build().unwrap_or_else(|_| reqwest::Client::new());
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
     let mut last_error = String::new();
 
     for (tier, backends) in chain {
@@ -2023,7 +2027,10 @@ async fn computer_use(params: Option<Value>) -> Result<Value, String> {
         ));
     }
 
-    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build().unwrap_or_else(|_| reqwest::Client::new());
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
     let base = "http://127.0.0.1:51200";
 
     match action {
@@ -2445,7 +2452,9 @@ fn backends_from_config(config: &FleetConfig) -> Vec<BackendEndpoint> {
                 model.name.clone()
             };
 
-            let is_local = !model_name.starts_with("gpt") && !model_name.starts_with("claude") && !model_name.starts_with("gemini");
+            let is_local = !model_name.starts_with("gpt")
+                && !model_name.starts_with("claude")
+                && !model_name.starts_with("gemini");
             endpoints.push(BackendEndpoint {
                 id: format!("{}:{}:{}", node_name, slug, port),
                 node: node_name.clone(),

@@ -302,13 +302,14 @@ fn extract_assistant_content(v: &Value) -> Option<String> {
 /// Priority: first available from Pulse router live scan.
 async fn pick_default_model(state: &GatewayState) -> Option<String> {
     if let Some(pulse) = state.pulse_router.as_ref()
-        && let Ok(servers) = pulse.list_servers().await {
-            for s in servers {
-                if let Some(model) = s.get("model").and_then(|v| v.as_str()) {
-                    return Some(model.to_string());
-                }
+        && let Ok(servers) = pulse.list_servers().await
+    {
+        for s in servers {
+            if let Some(model) = s.get("model").and_then(|v| v.as_str()) {
+                return Some(model.to_string());
             }
         }
+    }
     None
 }
 
@@ -324,9 +325,11 @@ async fn generate_brain_reply(
 ) -> Result<String, anyhow::Error> {
     let model = match body.model.as_deref() {
         Some(m) if !m.is_empty() => m.to_string(),
-        _ => pick_default_model(state)
-            .await
-            .ok_or_else(|| anyhow::anyhow!("no models available in fleet; start an LLM server or configure a cloud provider"))?,
+        _ => pick_default_model(state).await.ok_or_else(|| {
+            anyhow::anyhow!(
+                "no models available in fleet; start an LLM server or configure a cloud provider"
+            )
+        })?,
     };
 
     let messages = build_chat_messages(pool, thread.id, &body.content).await?;
@@ -339,9 +342,7 @@ async fn generate_brain_reply(
     });
 
     // ── 1) Cloud-LLM routing (first pass) ───────────────────────────────
-    if let Some(result) =
-        crate::cloud_llm::try_route_to_cloud(pool, &model, &payload, None).await
-    {
+    if let Some(result) = crate::cloud_llm::try_route_to_cloud(pool, &model, &payload, None).await {
         match result {
             Ok(resp) => {
                 let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
@@ -369,7 +370,10 @@ async fn generate_brain_reply(
     if let Some(pulse) = state.pulse_router.as_ref() {
         let cache_ref = state.pulse_cache.as_deref();
         let pg_ref = Some(pool);
-        match pulse.route_completion_cached(payload.clone(), cache_ref, pg_ref).await {
+        match pulse
+            .route_completion_cached(payload.clone(), cache_ref, pg_ref)
+            .await
+        {
             Ok(v) => {
                 if let Some(content) = extract_assistant_content(&v) {
                     info!(model = %model, provider = "pulse", thread = %thread.slug, "brain reply from pulse");
@@ -378,15 +382,16 @@ async fn generate_brain_reply(
                         && let (Some(prompt), Some(comp)) = (
                             usage.get("prompt_tokens").and_then(|x| x.as_u64()),
                             usage.get("completion_tokens").and_then(|x| x.as_u64()),
-                        ) {
-                            let record = ff_api::token_ledger::TokenUsageRecord::new(
-                                uuid::Uuid::new_v4().to_string(),
-                                &model,
-                                "pulse",
-                            )
-                            .with_tokens(prompt as u32, comp as u32);
-                            state.cost_tracker.record_usage(record).await;
-                        }
+                        )
+                    {
+                        let record = ff_api::token_ledger::TokenUsageRecord::new(
+                            uuid::Uuid::new_v4().to_string(),
+                            &model,
+                            "pulse",
+                        )
+                        .with_tokens(prompt as u32, comp as u32);
+                        state.cost_tracker.record_usage(record).await;
+                    }
                     return Ok(content);
                 }
                 return Err(anyhow::anyhow!("pulse response missing content"));
@@ -395,7 +400,9 @@ async fn generate_brain_reply(
                 debug!(model = %model, "pulse found no matching server");
             }
             Err(crate::llm_routing::LlmRoutingError::MissingModel) => {
-                return Err(anyhow::anyhow!("model '{model}' not recognized by pulse router"));
+                return Err(anyhow::anyhow!(
+                    "model '{model}' not recognized by pulse router"
+                ));
             }
             Err(e) => {
                 warn!(error = %e, "pulse routing failed; trying tier fallback");
@@ -433,11 +440,11 @@ async fn generate_brain_reply(
                                 .map_err(|e| anyhow::anyhow!("parse tier response: {e}"))?;
                             if let Some(content) = extract_assistant_content(&v) {
                                 info!(model = %model, backend = %backend.id, "brain reply from tier router");
-                                let prompt = v
-                                    .get("usage")
-                                    .and_then(|u| u.get("prompt_tokens"))
-                                    .and_then(|x| x.as_u64())
-                                    .unwrap_or(0) as u32;
+                                let prompt =
+                                    v.get("usage")
+                                        .and_then(|u| u.get("prompt_tokens"))
+                                        .and_then(|x| x.as_u64())
+                                        .unwrap_or(0) as u32;
                                 let comp = v
                                     .get("usage")
                                     .and_then(|u| u.get("completion_tokens"))

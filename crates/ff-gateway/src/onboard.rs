@@ -123,10 +123,25 @@ pub async fn bootstrap_script(
     // Sanitize bootstrap parameters to prevent shell injection in the rendered script.
     fn sanitize_bootstrap_value(s: &str, max_len: usize) -> String {
         let trimmed = s.trim();
-        let valid: String = trimmed.chars().take(max_len).filter(|&c| {
-            c.is_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '@' || c == '+' || c == ':' || c == '/'
-        }).collect();
-        if valid.is_empty() { "unknown".into() } else { valid }
+        let valid: String = trimmed
+            .chars()
+            .take(max_len)
+            .filter(|&c| {
+                c.is_alphanumeric()
+                    || c == '-'
+                    || c == '_'
+                    || c == '.'
+                    || c == '@'
+                    || c == '+'
+                    || c == ':'
+                    || c == '/'
+            })
+            .collect();
+        if valid.is_empty() {
+            "unknown".into()
+        } else {
+            valid
+        }
     }
     let name = sanitize_bootstrap_value(&name, 64);
     let ssh_user = sanitize_bootstrap_value(&ssh_user, 64);
@@ -146,14 +161,16 @@ pub async fn bootstrap_script(
         let mut found: Option<String> = None;
         if let Some(pool) = state.operational_store.as_ref().and_then(|os| os.pg_pool()) {
             if let Ok(Some(v)) = ff_db::pg_get_setting(pool, "github.default_owner").await
-                && let Some(s) = v.as_str() {
-                    found = Some(s.to_string());
-                }
+                && let Some(s) = v.as_str()
+            {
+                found = Some(s.to_string());
+            }
             if found.is_none()
                 && let Ok(Some(s)) = ff_db::pg_get_secret(pool, "github.default_owner").await
-                    && !s.is_empty() {
-                        found = Some(s);
-                    }
+                && !s.is_empty()
+            {
+                found = Some(s);
+            }
         }
         found
             .or_else(|| std::env::var("FORGEFLEET_GITHUB_OWNER").ok())
@@ -245,10 +262,25 @@ pub async fn bootstrap_script_ps1(
     // Sanitize bootstrap parameters to prevent shell injection in the rendered script.
     fn sanitize_bootstrap_value(s: &str, max_len: usize) -> String {
         let trimmed = s.trim();
-        let valid: String = trimmed.chars().take(max_len).filter(|&c| {
-            c.is_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '@' || c == '+' || c == ':' || c == '/'
-        }).collect();
-        if valid.is_empty() { "unknown".into() } else { valid }
+        let valid: String = trimmed
+            .chars()
+            .take(max_len)
+            .filter(|&c| {
+                c.is_alphanumeric()
+                    || c == '-'
+                    || c == '_'
+                    || c == '.'
+                    || c == '@'
+                    || c == '+'
+                    || c == ':'
+                    || c == '/'
+            })
+            .collect();
+        if valid.is_empty() {
+            "unknown".into()
+        } else {
+            valid
+        }
     }
     let name = sanitize_bootstrap_value(&name, 64);
     let ssh_user = sanitize_bootstrap_value(&ssh_user, 64);
@@ -265,14 +297,16 @@ pub async fn bootstrap_script_ps1(
         let mut found: Option<String> = None;
         if let Some(pool) = state.operational_store.as_ref().and_then(|os| os.pg_pool()) {
             if let Ok(Some(v)) = ff_db::pg_get_setting(pool, "github.default_owner").await
-                && let Some(s) = v.as_str() {
-                    found = Some(s.to_string());
-                }
+                && let Some(s) = v.as_str()
+            {
+                found = Some(s.to_string());
+            }
             if found.is_none()
                 && let Ok(Some(s)) = ff_db::pg_get_secret(pool, "github.default_owner").await
-                    && !s.is_empty() {
-                        found = Some(s);
-                    }
+                && !s.is_empty()
+            {
+                found = Some(s);
+            }
         }
         found
             .or_else(|| std::env::var("FORGEFLEET_GITHUB_OWNER").ok())

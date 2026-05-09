@@ -24,7 +24,10 @@ pub fn generate_keypair() -> AgeKeypair {
     let secret = age::x25519::Identity::generate();
     let recipient = secret.to_public().to_string();
     let identity = secret.to_string().expose_secret().to_string();
-    AgeKeypair { identity, recipient }
+    AgeKeypair {
+        identity,
+        recipient,
+    }
 }
 
 /// Encrypt plaintext to one or more age recipients.
@@ -58,12 +61,15 @@ pub fn encrypt_to_recipients(plaintext: &str, recipients: &[String]) -> Result<S
 
     // Armor for easy transport.
     let mut armored = vec![];
-    let mut armor_writer = age::armor::ArmoredWriter::wrap_output(&mut armored, age::armor::Format::AsciiArmor)
-        .map_err(|e| format!("armor wrap: {e}"))?;
+    let mut armor_writer =
+        age::armor::ArmoredWriter::wrap_output(&mut armored, age::armor::Format::AsciiArmor)
+            .map_err(|e| format!("armor wrap: {e}"))?;
     armor_writer
         .write_all(&encrypted)
         .map_err(|e| format!("armor write: {e}"))?;
-    armor_writer.finish().map_err(|e| format!("armor finish: {e}"))?;
+    armor_writer
+        .finish()
+        .map_err(|e| format!("armor finish: {e}"))?;
 
     String::from_utf8(armored).map_err(|e| format!("utf8: {e}"))
 }
@@ -111,7 +117,9 @@ mod tests {
         let alice = generate_keypair();
         let bob = generate_keypair();
         let secret = "multi-recipient test secret only";
-        let encrypted = encrypt_to_recipients(secret, &[alice.recipient.clone(), bob.recipient.clone()]).unwrap();
+        let encrypted =
+            encrypt_to_recipients(secret, &[alice.recipient.clone(), bob.recipient.clone()])
+                .unwrap();
         assert_eq!(decrypt(&encrypted, &alice.identity).unwrap(), secret);
         assert_eq!(decrypt(&encrypted, &bob.identity).unwrap(), secret);
     }

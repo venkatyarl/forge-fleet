@@ -320,12 +320,21 @@ pub async fn tick(pool: &PgPool) -> Result<TickStats> {
             session_id
         );
 
-        let task_id =
-            pg_enqueue_shell_task_routed(
-                pool, &summary, &cmd, &capability, None, None, 70, None, false, &[], "fleet_first",
-            )
-                .await
-                .with_context(|| format!("enqueue fleet_task for step {step_id}"))?;
+        let task_id = pg_enqueue_shell_task_routed(
+            pool,
+            &summary,
+            &cmd,
+            &capability,
+            None,
+            None,
+            70,
+            None,
+            false,
+            &[],
+            "fleet_first",
+        )
+        .await
+        .with_context(|| format!("enqueue fleet_task for step {step_id}"))?;
 
         sqlx::query(
             "UPDATE agent_steps

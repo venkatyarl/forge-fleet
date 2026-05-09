@@ -109,7 +109,10 @@ impl RepairPlanner {
     pub fn new() -> Self {
         Self {
             tracked: Arc::new(DashMap::new()),
-            http_client: reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build().unwrap_or_else(|_| reqwest::Client::new()),
+            http_client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
             webhook: None,
             audit_pool: None,
         }

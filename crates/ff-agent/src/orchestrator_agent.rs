@@ -170,10 +170,12 @@ fn infer_params_from_name(name: &str) -> u64 {
             while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
                 i += 1;
             }
-            if i < bytes.len() && bytes[i] == b'b'
-                && let Ok(n) = lower[start..i].parse::<f64>() {
-                    return (n * 1_000_000_000.0) as u64;
-                }
+            if i < bytes.len()
+                && bytes[i] == b'b'
+                && let Ok(n) = lower[start..i].parse::<f64>()
+            {
+                return (n * 1_000_000_000.0) as u64;
+            }
         } else {
             i += 1;
         }
@@ -390,10 +392,7 @@ pub fn analyze_task(prompt: &str) -> TaskType {
 
     // ---- Complex patterns ----
     if (lower.contains(" and ") && lower.contains(" then "))
-        || lower
-            .split(['.', ';', ','])
-            .count()
-            > 3
+        || lower.split(['.', ';', ',']).count() > 3
         || lower.len() > 300
         || words.len() > 50
     {

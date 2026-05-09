@@ -16,16 +16,18 @@ use crate::task::{Task, TaskMessage, TaskStatus, TaskUpdate};
 /// Mount A2A routes onto the given router.
 pub fn routes(card: AgentCard) -> Router {
     Router::new()
-        .route("/.well-known/agent.json", get(move || async move { Json(card.clone()) }))
+        .route(
+            "/.well-known/agent.json",
+            get(move || async move { Json(card.clone()) }),
+        )
         .route("/tasks/send", post(handle_send_task))
         .route("/tasks/{task_id}/updates", get(handle_task_updates))
 }
 
 async fn handle_send_task(Json(body): Json<Value>) -> Result<Json<Task>, StatusCode> {
-    let messages: Vec<TaskMessage> = serde_json::from_value(
-        body.get("messages").cloned().unwrap_or(json!([])),
-    )
-    .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let messages: Vec<TaskMessage> =
+        serde_json::from_value(body.get("messages").cloned().unwrap_or(json!([])))
+            .map_err(|_| StatusCode::BAD_REQUEST)?;
 
     let task = Task {
         id: Uuid::new_v4(),

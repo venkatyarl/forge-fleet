@@ -16,7 +16,7 @@ pub mod client;
 pub mod server;
 pub mod task;
 
-pub use card::{AgentCard, AgentCapability, AgentEndpoint, AgentSkill};
+pub use card::{AgentCapability, AgentCard, AgentEndpoint, AgentSkill};
 pub use client::A2aClient;
 pub use server::routes;
 pub use task::{Task, TaskMessage, TaskStatus, TaskUpdate};

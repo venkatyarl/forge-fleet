@@ -49,10 +49,7 @@ impl AgentTool for ProcessManagerTool {
                     return AgentToolResult::err("'query' parameter required for search");
                 }
                 // Avoid shell injection by using pgrep directly instead of bash -c with interpolated query.
-                let out = Command::new("pgrep")
-                    .args(["-afil", query])
-                    .output()
-                    .await;
+                let out = Command::new("pgrep").args(["-afil", query]).output().await;
                 match out {
                     Ok(o) => AgentToolResult::ok(truncate_output(
                         &String::from_utf8_lossy(&o.stdout),
@@ -187,7 +184,9 @@ impl AgentTool for ClipboardTool {
                             _ => AgentToolResult::err("Clipboard write failed".to_string()),
                         }
                     }
-                    Err(_) => AgentToolResult::err("Clipboard write failed (no pbcopy or xclip available)".to_string()),
+                    Err(_) => AgentToolResult::err(
+                        "Clipboard write failed (no pbcopy or xclip available)".to_string(),
+                    ),
                 }
             }
             _ => AgentToolResult::err(format!("Unknown action: {action}")),
@@ -358,25 +357,33 @@ impl AgentTool for ServiceManagerTool {
                     return AgentToolResult::err("'service' name required");
                 }
                 // Validate service name to prevent injection (alphanumeric, hyphens, dots, underscores only)
-                if !service.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '.' || c == '_') {
+                if !service
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '-' || c == '.' || c == '_')
+                {
                     return AgentToolResult::err("Invalid service name");
                 }
                 let result = if is_macos {
                     match Command::new("brew")
                         .args(["services", action, service])
-                        .output().await
+                        .output()
+                        .await
                     {
                         Ok(o) => Ok(o),
-                        Err(_) => Command::new("launchctl")
-                            .arg(action)
-                            .arg(service)
-                            .output().await,
+                        Err(_) => {
+                            Command::new("launchctl")
+                                .arg(action)
+                                .arg(service)
+                                .output()
+                                .await
+                        }
                     }
                 } else {
                     Command::new("systemctl")
                         .arg(action)
                         .arg(service)
-                        .output().await
+                        .output()
+                        .await
                 };
                 match result {
                     Ok(o) => {
@@ -436,23 +443,83 @@ impl AgentTool for PackageManagerTool {
         }
 
         // Validate package name to prevent injection
-        if !package.is_empty() && !package.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '.' || c == '_' || c == '+' || c == '@' || c == ':') {
+        if !package.is_empty()
+            && !package.chars().all(|c| {
+                c.is_alphanumeric()
+                    || c == '-'
+                    || c == '.'
+                    || c == '_'
+                    || c == '+'
+                    || c == '@'
+                    || c == ':'
+            })
+        {
             return AgentToolResult::err("Invalid package name".to_string());
         }
 
         let result = match (action, pm) {
-            ("search", "brew") => Command::new("brew").args(["search", package]).output().await,
+            ("search", "brew") => {
+                Command::new("brew")
+                    .args(["search", package])
+                    .output()
+                    .await
+            }
             ("search", "apt") => Command::new("apt").args(["search", package]).output().await,
             ("search", _) => Command::new("dnf").args(["search", package]).output().await,
-            ("install", "brew") => Command::new("brew").args(["install", package]).output().await,
-            ("install", "apt") => Command::new("sudo").args(["apt", "install", "-y", package]).output().await,
-            ("install", _) => Command::new("sudo").args(["dnf", "install", "-y", package]).output().await,
-            ("update", "brew") => Command::new("bash").arg("-c").arg("brew update && brew upgrade").output().await,
-            ("update", "apt") => Command::new("bash").arg("-c").arg("sudo apt update && sudo apt upgrade -y").output().await,
-            ("update", _) => Command::new("bash").arg("-c").arg("sudo dnf update -y").output().await,
+            ("install", "brew") => {
+                Command::new("brew")
+                    .args(["install", package])
+                    .output()
+                    .await
+            }
+            ("install", "apt") => {
+                Command::new("sudo")
+                    .args(["apt", "install", "-y", package])
+                    .output()
+                    .await
+            }
+            ("install", _) => {
+                Command::new("sudo")
+                    .args(["dnf", "install", "-y", package])
+                    .output()
+                    .await
+            }
+            ("update", "brew") => {
+                Command::new("bash")
+                    .arg("-c")
+                    .arg("brew update && brew upgrade")
+                    .output()
+                    .await
+            }
+            ("update", "apt") => {
+                Command::new("bash")
+                    .arg("-c")
+                    .arg("sudo apt update && sudo apt upgrade -y")
+                    .output()
+                    .await
+            }
+            ("update", _) => {
+                Command::new("bash")
+                    .arg("-c")
+                    .arg("sudo dnf update -y")
+                    .output()
+                    .await
+            }
             ("list", "brew") => Command::new("brew").arg("list").output().await,
-            ("list", "apt") => Command::new("bash").arg("-c").arg("dpkg --list | tail -20").output().await,
-            ("list", _) => Command::new("bash").arg("-c").arg("dnf list installed | tail -20").output().await,
+            ("list", "apt") => {
+                Command::new("bash")
+                    .arg("-c")
+                    .arg("dpkg --list | tail -20")
+                    .output()
+                    .await
+            }
+            ("list", _) => {
+                Command::new("bash")
+                    .arg("-c")
+                    .arg("dnf list installed | tail -20")
+                    .output()
+                    .await
+            }
             ("info", "brew") => Command::new("brew").args(["info", package]).output().await,
             ("info", "apt") => Command::new("apt").args(["show", package]).output().await,
             ("info", _) => Command::new("dnf").args(["info", package]).output().await,

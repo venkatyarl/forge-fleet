@@ -56,11 +56,7 @@ pub async fn init_jetstream_streams(client: &async_nats::Client) {
 
 /// Publish a message to a JetStream stream with durability guarantees.
 /// Falls back to fire-and-forget NATS publish if JetStream is unavailable.
-pub async fn publish_js(
-    client: &async_nats::Client,
-    subject: impl Into<String>,
-    payload: Vec<u8>,
-) {
+pub async fn publish_js(client: &async_nats::Client, subject: impl Into<String>, payload: Vec<u8>) {
     let js = async_nats::jetstream::new(client.clone());
     let subject = subject.into();
     match js.publish(subject.clone(), payload.clone().into()).await {

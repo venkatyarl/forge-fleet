@@ -578,7 +578,10 @@ async fn main() {
 
     println!("ForgeFleet Postgres → SQLite Migration Tool");
     println!("============================================");
-    println!("  Source: {}", pg_url.split('@').next_back().unwrap_or(&pg_url));
+    println!(
+        "  Source: {}",
+        pg_url.split('@').next_back().unwrap_or(&pg_url)
+    );
     println!("  Target (core): {}", cli.out.display());
     if let Some(mc_out) = &cli.mc_out {
         println!("  Target (mc):   {}", mc_out.display());

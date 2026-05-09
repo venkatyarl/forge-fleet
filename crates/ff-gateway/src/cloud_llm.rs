@@ -138,30 +138,30 @@ pub async fn try_route_to_cloud(
             .ok()
             .flatten()
             .and_then(|s| s.trim().parse::<f64>().ok())
-        {
-            let today_cost: Option<f64> = sqlx::query_scalar(
-                "SELECT COALESCE(SUM(cost_usd)::FLOAT8, 0.0)
+    {
+        let today_cost: Option<f64> = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(cost_usd)::FLOAT8, 0.0)
                    FROM cloud_llm_usage
                   WHERE used_at > NOW() - INTERVAL '24 hours'",
-            )
-            .fetch_one(pool)
-            .await
-            .ok();
-            let today_cost = today_cost.unwrap_or(0.0);
-            if today_cost >= cap {
-                tracing::warn!(provider = %provider.id, today_cost, cap,
+        )
+        .fetch_one(pool)
+        .await
+        .ok();
+        let today_cost = today_cost.unwrap_or(0.0);
+        if today_cost >= cap {
+            tracing::warn!(provider = %provider.id, today_cost, cap,
                     "cloud_llm: budget.daily_usd_cap reached; refusing api_key call");
-                return Some(Err(error_response(
-                    StatusCode::PAYMENT_REQUIRED,
-                    format!(
-                        "daily budget cap ${:.2} reached (today: ${:.2}); falling back to local LLM. \
+            return Some(Err(error_response(
+                StatusCode::PAYMENT_REQUIRED,
+                format!(
+                    "daily budget cap ${:.2} reached (today: ${:.2}); falling back to local LLM. \
                          Adjust with `ff secrets set budget.daily_usd_cap <usd>` or wait for the 24h window.",
-                        cap, today_cost
-                    ),
-                    "budget_cap_reached",
-                )));
-            }
+                    cap, today_cost
+                ),
+                "budget_cap_reached",
+            )));
         }
+    }
 
     // Resolve the bearer token (or pass-through for local_bridge) based
     // on auth_kind. Three supported variants today (V53):

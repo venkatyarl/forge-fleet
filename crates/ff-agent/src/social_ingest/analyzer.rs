@@ -184,9 +184,10 @@ fn rollup(per_frame: Vec<FrameAnalysis>, post: &FetchedPost) -> Analysis {
 
     // Fold caption text into OCR so downstream search picks it up.
     if let Some(caption) = &post.caption
-        && !caption.trim().is_empty() {
-            ocr_parts.push(caption.trim().to_string());
-        }
+        && !caption.trim().is_empty()
+    {
+        ocr_parts.push(caption.trim().to_string());
+    }
 
     let summary = if longest_desc.is_empty() {
         post.caption.clone().unwrap_or_default()

@@ -176,17 +176,18 @@ impl SshKeyManager {
 
         // 3. Mark computer_trust edges as revoked (both directions).
         if let Ok(rev_id) = lookup_computer_id(&self.pg, computer_name).await
-            && let Some(rev_id) = rev_id {
-                let _ = sqlx::query(
-                    "UPDATE computer_trust SET revoked_at = NOW(), revoked_by = $1
+            && let Some(rev_id) = rev_id
+        {
+            let _ = sqlx::query(
+                "UPDATE computer_trust SET revoked_at = NOW(), revoked_by = $1
                       WHERE (source_computer_id = $2 OR target_computer_id = $2)
                         AND revoked_at IS NULL",
-                )
-                .bind(who)
-                .bind(rev_id)
-                .execute(&self.pg)
-                .await;
-            }
+            )
+            .bind(who)
+            .bind(rev_id)
+            .execute(&self.pg)
+            .await;
+        }
 
         info!(
             revoked = %computer_name,

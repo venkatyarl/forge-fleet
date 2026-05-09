@@ -27,10 +27,10 @@ pub use communities::{CommunitySummary, detect_communities};
 pub use context::{BrainMessage, ContextBundle, ResolvedNode, select_context};
 pub use embeddings::{EmbeddingClient, generate_embedding};
 pub use facts::{contains_signal_phrases, extract_candidates};
+pub use procedural_memory::{consolidate, spawn_consolidation_loop};
 pub use stack_backlog::{BacklogItem, BrainStateClient, StackItem};
 pub use vault::{
     IndexReport, ParsedNode, VaultChunk, VaultConfig, chunk_markdown, extract_wikilinks,
     index_changed_files, index_vault, parse_frontmatter, parse_vault_file,
 };
-pub use procedural_memory::{consolidate, spawn_consolidation_loop};
 pub use vector_search::{VaultNode, hybrid_search, vector_search};

@@ -54,12 +54,13 @@ impl AgentTool for FileWriteTool {
 
         // Create parent directories
         if let Some(parent) = path.parent()
-            && let Err(e) = fs::create_dir_all(parent).await {
-                return AgentToolResult::err(format!(
-                    "Failed to create parent directories for {}: {e}",
-                    path.display()
-                ));
-            }
+            && let Err(e) = fs::create_dir_all(parent).await
+        {
+            return AgentToolResult::err(format!(
+                "Failed to create parent directories for {}: {e}",
+                path.display()
+            ));
+        }
 
         match fs::write(&path, content).await {
             Ok(()) => {

@@ -84,10 +84,12 @@ fn walk_md_files(dir: &Path) -> Vec<(PathBuf, SystemTime)> {
             if let Ok(meta) = ent.metadata() {
                 if meta.is_dir() {
                     walk(&p, out);
-                } else if meta.is_file() && p.extension().and_then(|s| s.to_str()) == Some("md")
-                    && let Ok(mtime) = meta.modified() {
-                        out.push((p, mtime));
-                    }
+                } else if meta.is_file()
+                    && p.extension().and_then(|s| s.to_str()) == Some("md")
+                    && let Ok(mtime) = meta.modified()
+                {
+                    out.push((p, mtime));
+                }
             }
         }
     }

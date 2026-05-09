@@ -234,9 +234,10 @@ async fn fetch_hf_latest_sha(
     let url = format!("https://huggingface.co/api/models/{upstream_id}");
     let mut req = http.get(&url).header("Accept", "application/json");
     if let Some(t) = token
-        && !t.is_empty() {
-            req = req.header("Authorization", format!("Bearer {t}"));
-        }
+        && !t.is_empty()
+    {
+        req = req.header("Authorization", format!("Bearer {t}"));
+    }
 
     let resp = req.send().await.map_err(|e| format!("GET {url}: {e}"))?;
     if !resp.status().is_success() {

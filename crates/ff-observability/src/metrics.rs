@@ -456,8 +456,10 @@ pub fn init_prometheus_metrics() {
         r.register(Box::new(SELF_UPDATES_TOTAL.clone())).unwrap();
         r.register(Box::new(LLM_TOKENS_TOTAL.clone())).unwrap();
         r.register(Box::new(LLM_COST_USD_TOTAL.clone())).unwrap();
-        r.register(Box::new(LLM_BUDGET_REMAINING_USD.clone())).unwrap();
-        r.register(Box::new(LLM_BUDGET_PERCENT_USED.clone())).unwrap();
+        r.register(Box::new(LLM_BUDGET_REMAINING_USD.clone()))
+            .unwrap();
+        r.register(Box::new(LLM_BUDGET_PERCENT_USED.clone()))
+            .unwrap();
     });
 }
 

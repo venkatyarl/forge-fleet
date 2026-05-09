@@ -309,26 +309,26 @@ impl BrainStateClient {
             if let Ok(bi) = serde_json::from_str::<BacklogItem>(raw)
                 && bi.id == item_id
             {
-                    let _: () = self
-                        .redis
-                        .zrem(&key, raw)
-                        .await
-                        .map_err(|e| format!("zrem: {e}"))?;
-                    let _ = self
-                        .archive_backlog_completed(user_id, project, &bi, "completed")
-                        .await;
-                    let event = serde_json::json!({
-                        "kind": "backlog_done",
-                        "user": user_id.to_string(),
-                        "project": project,
-                        "item_id": item_id,
-                    });
-                    let _: () = self
-                        .redis
-                        .publish("brain:events", event.to_string())
-                        .await
-                        .map_err(|e| format!("publish: {e}"))?;
-                    return Ok(true);
+                let _: () = self
+                    .redis
+                    .zrem(&key, raw)
+                    .await
+                    .map_err(|e| format!("zrem: {e}"))?;
+                let _ = self
+                    .archive_backlog_completed(user_id, project, &bi, "completed")
+                    .await;
+                let event = serde_json::json!({
+                    "kind": "backlog_done",
+                    "user": user_id.to_string(),
+                    "project": project,
+                    "item_id": item_id,
+                });
+                let _: () = self
+                    .redis
+                    .publish("brain:events", event.to_string())
+                    .await
+                    .map_err(|e| format!("publish: {e}"))?;
+                return Ok(true);
             }
         }
         Ok(false)

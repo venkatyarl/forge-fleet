@@ -15,11 +15,11 @@ use axum::{
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::{net::TcpListener, sync::mpsc};
-use hmac::{Hmac, Mac};
 use sha2::Sha256;
+use tokio::{net::TcpListener, sync::mpsc};
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -32,7 +32,6 @@ use ff_api::token_ledger::{CostTracker, FleetCostSummary, ModelCostStats, TokenU
 use ff_api::types::ChatCompletionRequest;
 use ff_db::sync::LeaderSync;
 use ff_db::{OperationalStore, RuntimeRegistryStore, queries};
-use sqlx::Row;
 use ff_discovery::health::HealthStatus;
 use ff_discovery::{FleetNode, NodeRegistry};
 use ff_mcp::McpServer;
@@ -40,6 +39,7 @@ use ff_mcp::transport::HttpTransport;
 use ff_observability::metrics::{
     init_prometheus_metrics, metrics_handler, prometheus_metrics_middleware,
 };
+use sqlx::Row;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -175,7 +175,10 @@ impl GatewayState {
             tier_router: None,
             pulse_router: None,
             pulse_cache: None,
-            http_client: reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build().unwrap_or_else(|_| reqwest::Client::new()),
+            http_client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
             discovery_registry: None,
             leader_sync: None,
             operational_store: None,
@@ -375,7 +378,12 @@ impl GatewayServer {
         state.http_client = reqwest::Client::builder()
             .pool_idle_timeout(Duration::from_secs(30))
             .build()
-            .unwrap_or_else(|_| reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build().unwrap_or_else(|_| reqwest::Client::new()));
+            .unwrap_or_else(|_| {
+                reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(30))
+                    .build()
+                    .unwrap_or_else(|_| reqwest::Client::new())
+            });
 
         let state = Arc::new(state);
 
@@ -386,7 +394,11 @@ impl GatewayServer {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
-                if let Some(pool) = flush_state.operational_store.as_ref().and_then(|os| os.pg_pool()) {
+                if let Some(pool) = flush_state
+                    .operational_store
+                    .as_ref()
+                    .and_then(|os| os.pg_pool())
+                {
                     match flush_state.cost_tracker.flush_to_db(pool).await {
                         Ok(count) if count > 0 => {
                             tracing::info!(records = count, "token ledger flushed to database");
@@ -455,15 +467,36 @@ pub fn build_router(state: Arc<GatewayState>, mc_db_path: Option<&str>) -> Route
         .route("/api/fleet/llm-usage", get(fleet_llm_usage))
         // ─── Fleet Tool Registry (Phase 15a) ─────────────────────────
         .route("/api/tools", get(crate::tool_registry_api::list_tools))
-        .route("/api/tools/health", get(crate::tool_registry_api::tool_health))
-        .route("/api/tools/register", post(crate::tool_registry_api::register_tools))
-        .route("/api/tools/heartbeat", post(crate::tool_registry_api::tool_heartbeat))
-        .route("/api/tools/usage", post(crate::tool_registry_api::record_tool_usage))
-        .route("/api/tools/route", get(crate::tool_registry_api::route_tool))
-        .route("/api/tools/search", get(crate::tool_registry_api::search_tools))
+        .route(
+            "/api/tools/health",
+            get(crate::tool_registry_api::tool_health),
+        )
+        .route(
+            "/api/tools/register",
+            post(crate::tool_registry_api::register_tools),
+        )
+        .route(
+            "/api/tools/heartbeat",
+            post(crate::tool_registry_api::tool_heartbeat),
+        )
+        .route(
+            "/api/tools/usage",
+            post(crate::tool_registry_api::record_tool_usage),
+        )
+        .route(
+            "/api/tools/route",
+            get(crate::tool_registry_api::route_tool),
+        )
+        .route(
+            "/api/tools/search",
+            get(crate::tool_registry_api::search_tools),
+        )
         .route("/api/ledger/summary", get(ledger_summary))
         .route("/api/ledger/models", get(ledger_models))
-        .route("/api/ledger/budget", get(ledger_budget).post(ledger_budget_update))
+        .route(
+            "/api/ledger/budget",
+            get(ledger_budget).post(ledger_budget_update),
+        )
         .route("/api/ledger/flush", post(ledger_flush))
         .route("/api/ledger/records", get(ledger_records))
         .route("/api/ledger/health", get(ledger_health))
@@ -567,7 +600,10 @@ pub fn build_router(state: Arc<GatewayState>, mc_db_path: Option<&str>) -> Route
         .route("/api/config/reload-status", get(config_reload_status))
         .route("/api/settings/runtime", get(settings_runtime))
         .route("/api/brain/status", get(brain_status))
-        .route("/api/brain/search", get(crate::brain_api::hybrid_search_handler))
+        .route(
+            "/api/brain/search",
+            get(crate::brain_api::hybrid_search_handler),
+        )
         .route("/api/audit/recent", get(audit_recent))
         .route("/api/audit/events", get(audit_recent))
         .route("/api/proxy/stats", get(proxy_stats))
@@ -585,9 +621,18 @@ pub fn build_router(state: Arc<GatewayState>, mc_db_path: Option<&str>) -> Route
         .route("/v1/fleet/route", post(route_fleet_capability))
         .route("/v1/embeddings", post(proxy_embeddings))
         .route("/v1/tasks", post(crate::tasks::handle_task))
-        .route("/v1/tasks/{task_type}", post(crate::tasks::handle_task_from_path))
-        .route("/v1/images/generations", post(crate::tasks::handle_image_generation))
-        .route("/v1/audio/transcriptions", post(crate::tasks::handle_audio_transcription))
+        .route(
+            "/v1/tasks/{task_type}",
+            post(crate::tasks::handle_task_from_path),
+        )
+        .route(
+            "/v1/images/generations",
+            post(crate::tasks::handle_image_generation),
+        )
+        .route(
+            "/v1/audio/transcriptions",
+            post(crate::tasks::handle_audio_transcription),
+        )
         .route("/v1/internal/delegate", post(internal_delegate))
         .route("/v1/async/{ticket}", get(async_poll))
         // ─── Replication routes ──────────────────────────────────────
@@ -695,12 +740,14 @@ pub fn build_router(state: Arc<GatewayState>, mc_db_path: Option<&str>) -> Route
     let cors_origins: Vec<_> = std::env::var("FF_CORS_ORIGINS")
         .ok()
         .map(|s| s.split(',').map(|o| o.trim().to_string()).collect())
-        .unwrap_or_else(|| vec![
-            "http://localhost:51002".to_string(),
-            "http://localhost:5173".to_string(),
-            "http://127.0.0.1:51002".to_string(),
-            "http://127.0.0.1:5173".to_string(),
-        ]);
+        .unwrap_or_else(|| {
+            vec![
+                "http://localhost:51002".to_string(),
+                "http://localhost:5173".to_string(),
+                "http://127.0.0.1:51002".to_string(),
+                "http://127.0.0.1:5173".to_string(),
+            ]
+        });
     let cors = if cors_origins.iter().any(|o| o == "*") {
         CorsLayer::new().allow_origin(tower_http::cors::Any)
     } else {
@@ -710,7 +757,14 @@ pub fn build_router(state: Arc<GatewayState>, mc_db_path: Option<&str>) -> Route
             .collect();
         CorsLayer::new().allow_origin(origins)
     }
-    .allow_methods([axum::http::Method::GET, axum::http::Method::POST, axum::http::Method::PUT, axum::http::Method::PATCH, axum::http::Method::DELETE, axum::http::Method::DELETE])
+    .allow_methods([
+        axum::http::Method::GET,
+        axum::http::Method::POST,
+        axum::http::Method::PUT,
+        axum::http::Method::PATCH,
+        axum::http::Method::DELETE,
+        axum::http::Method::DELETE,
+    ])
     .allow_headers(tower_http::cors::Any);
 
     app.route("/metrics", get(serve_prometheus_metrics))
@@ -737,8 +791,7 @@ struct HealthResponse {
     telegram_transport: TelegramTransportStatus,
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Default)]
 struct TelegramTransportStatus {
     enabled: bool,
     running: bool,
@@ -751,7 +804,6 @@ struct TelegramTransportStatus {
     last_message_at: Option<String>,
     last_error: Option<String>,
 }
-
 
 async fn health(State(state): State<Arc<GatewayState>>) -> Json<HealthResponse> {
     let telegram_transport = telegram_transport_snapshot(state.as_ref()).await;
@@ -874,11 +926,13 @@ async fn github_webhook_handler(
 
     // Fetch webhook secret from fleet_secrets.
     let secret = if let Some(pool) = state.operational_store.as_ref().and_then(|os| os.pg_pool()) {
-        sqlx::query_scalar::<_, String>("SELECT value FROM fleet_secrets WHERE key = 'github_webhook_secret' LIMIT 1")
-            .fetch_optional(pool)
-            .await
-            .ok()
-            .flatten()
+        sqlx::query_scalar::<_, String>(
+            "SELECT value FROM fleet_secrets WHERE key = 'github_webhook_secret' LIMIT 1",
+        )
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
     } else {
         None
     };
@@ -900,7 +954,9 @@ async fn github_webhook_handler(
         }
         debug!("github webhook signature verified");
     } else {
-        warn!("github webhook secret not configured — accepting unsigned webhook (configure fleet_secrets.github_webhook_secret to enable verification)");
+        warn!(
+            "github webhook secret not configured — accepting unsigned webhook (configure fleet_secrets.github_webhook_secret to enable verification)"
+        );
     }
 
     let payload: Value = match serde_json::from_slice(&body) {
@@ -1669,10 +1725,14 @@ async fn ledger_records(
     State(state): State<Arc<GatewayState>>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let day = params.get("day").cloned().unwrap_or_else(|| {
-        chrono::Utc::now().format("%Y-%m-%d").to_string()
-    });
-    let limit = params.get("limit").and_then(|s| s.parse::<usize>().ok()).unwrap_or(100);
+    let day = params
+        .get("day")
+        .cloned()
+        .unwrap_or_else(|| chrono::Utc::now().format("%Y-%m-%d").to_string());
+    let limit = params
+        .get("limit")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(100);
 
     let records = state.cost_tracker.daily_records(&day).await;
     let limited: Vec<_> = records.into_iter().rev().take(limit).collect();
@@ -3042,9 +3102,10 @@ fn derive_models_loaded(
     }
 
     if ids.is_empty()
-        && let Some(db_models) = db_node.map(|db| db.models.clone()) {
-            ids = db_models;
-        }
+        && let Some(db_models) = db_node.map(|db| db.models.clone())
+    {
+        ids = db_models;
+    }
 
     if ids.is_empty() {
         (Vec::new(), "unreported".to_string())
@@ -4424,32 +4485,38 @@ async fn proxy_chat_completions(
     // a ticket immediately. The caller polls /v1/async/{ticket} or
     // receives a webhook when complete.
     if query.async_mode == Some(true)
-        && let Some(pool) = state.operational_store.as_ref().and_then(|s| s.pg_pool()) {
-            let model = raw_payload.get("model").and_then(|v| v.as_str()).unwrap_or("unknown");
-            let summary = format!("async chat completion ({model})");
-            let task_id: Uuid = sqlx::query_scalar(
-                r#"
+        && let Some(pool) = state.operational_store.as_ref().and_then(|s| s.pg_pool())
+    {
+        let model = raw_payload
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let summary = format!("async chat completion ({model})");
+        let task_id: Uuid = sqlx::query_scalar(
+            r#"
                 INSERT INTO fleet_tasks (task_type, summary, payload, priority, status, created_at)
                 VALUES ('async_chat', $1, $2, 50, 'pending', NOW())
                 RETURNING id
                 "#,
-            )
-            .bind(&summary)
-            .bind(&raw_payload)
-            .fetch_one(pool)
-            .await
-            .map_err(|e| (
+        )
+        .bind(&summary)
+        .bind(&raw_payload)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| {
+            (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": format!("db error: {e}")})),
-            ))?;
+            )
+        })?;
 
-            let ticket = json!({
-                "ticket": task_id,
-                "status": "pending",
-                "poll_url": format!("/v1/async/{task_id}"),
-            });
-            return Ok(Json(ticket).into_response());
-        }
+        let ticket = json!({
+            "ticket": task_id,
+            "status": "pending",
+            "poll_url": format!("/v1/async/{task_id}"),
+        });
+        return Ok(Json(ticket).into_response());
+    }
 
     // ── Cloud-LLM routing (first pass) ───────────────────────────────
     //
@@ -4461,14 +4528,14 @@ async fn proxy_chat_completions(
     if let Some(store) = state.operational_store.as_ref()
         && let Some(pool) = store.pg_pool()
         && let Some(model) = raw_payload.get("model").and_then(|v| v.as_str())
-            && let Some(result) =
-                crate::cloud_llm::try_route_to_cloud(pool, model, &raw_payload, None).await
-            {
-                match result {
-                    Ok(resp) => return Ok(resp),
-                    Err(resp) => return Ok(resp),
-                }
-            }
+        && let Some(result) =
+            crate::cloud_llm::try_route_to_cloud(pool, model, &raw_payload, None).await
+    {
+        match result {
+            Ok(resp) => return Ok(resp),
+            Err(resp) => return Ok(resp),
+        }
+    }
 
     // ── Qwen3 thinking-mode max_tokens floor ─────────────────────────
     //
@@ -4602,37 +4669,38 @@ async fn proxy_chat_completions(
             && let (Some(store), Some(registry)) = (
                 state.operational_store.as_ref(),
                 state.api_registry.as_ref(),
-            ) && let Some(pool) = store.pg_pool()
-            {
-                match ff_api::autoload::ensure_deployed(pool, &payload.model).await {
-                    Ok(url) => {
-                        if let Some((host, port)) = parse_autoload_url(&url) {
-                            let endpoint = ff_api::registry::BackendEndpoint {
-                                id: format!("autoload-{}-{}", payload.model, port),
-                                node: "local".to_string(),
-                                host,
-                                port,
-                                model: payload.model.clone(),
-                                tier: 2,
-                                healthy: true,
-                                busy: false,
-                                scheme: "http".to_string(),
-                                is_local: true,
-                                cost_per_1k_input: 0.0,
-                                cost_per_1k_output: 0.0,
-                            };
-                            registry.add_endpoint(endpoint).await;
-                            info!(model = %payload.model, %url, "autoloaded model for chat request");
-                            escalation_chain = tier_router
-                                .route_with_escalation(&payload.model, None, None)
-                                .await;
-                        }
-                    }
-                    Err(e) => {
-                        warn!(model = %payload.model, error = %e, "autoload failed");
+            )
+            && let Some(pool) = store.pg_pool()
+        {
+            match ff_api::autoload::ensure_deployed(pool, &payload.model).await {
+                Ok(url) => {
+                    if let Some((host, port)) = parse_autoload_url(&url) {
+                        let endpoint = ff_api::registry::BackendEndpoint {
+                            id: format!("autoload-{}-{}", payload.model, port),
+                            node: "local".to_string(),
+                            host,
+                            port,
+                            model: payload.model.clone(),
+                            tier: 2,
+                            healthy: true,
+                            busy: false,
+                            scheme: "http".to_string(),
+                            is_local: true,
+                            cost_per_1k_input: 0.0,
+                            cost_per_1k_output: 0.0,
+                        };
+                        registry.add_endpoint(endpoint).await;
+                        info!(model = %payload.model, %url, "autoloaded model for chat request");
+                        escalation_chain = tier_router
+                            .route_with_escalation(&payload.model, None, None)
+                            .await;
                     }
                 }
+                Err(e) => {
+                    warn!(model = %payload.model, error = %e, "autoload failed");
+                }
             }
+        }
 
         if escalation_chain.is_empty() {
             return Err((
@@ -4687,7 +4755,14 @@ async fn proxy_chat_completions(
                             }
                             // Non-streaming: record usage then passthrough
                             let bytes = upstream.bytes().await.unwrap_or_default();
-                            let bytes = record_usage_from_response(&state, backend, &payload, bytes, latency.as_millis() as u64).await;
+                            let bytes = record_usage_from_response(
+                                &state,
+                                backend,
+                                &payload,
+                                bytes,
+                                latency.as_millis() as u64,
+                            )
+                            .await;
                             let mut response = Response::builder().status(status);
                             response = response.header(header::CONTENT_TYPE, "application/json");
                             return response.body(Body::from(bytes))
@@ -4728,7 +4803,14 @@ async fn proxy_chat_completions(
                         }
                         // Non-streaming: record usage then passthrough
                         let bytes = upstream.bytes().await.unwrap_or_default();
-                        let bytes = record_usage_from_response(&state, backend, &payload, bytes, latency.as_millis() as u64).await;
+                        let bytes = record_usage_from_response(
+                            &state,
+                            backend,
+                            &payload,
+                            bytes,
+                            latency.as_millis() as u64,
+                        )
+                        .await;
                         let mut response = Response::builder().status(status);
                         response = response.header(header::CONTENT_TYPE, "application/json");
                         return response.body(Body::from(bytes))
@@ -4825,14 +4907,18 @@ async fn proxy_chat_completions(
                 let status = upstream.status();
                 let bytes = upstream.bytes().await.unwrap_or_default();
                 let latency_ms = 0u64; // Legacy path doesn't track latency
-                let bytes = record_usage_from_response(&state, backend, &payload, bytes, latency_ms).await;
+                let bytes =
+                    record_usage_from_response(&state, backend, &payload, bytes, latency_ms).await;
                 let mut response = Response::builder().status(status);
                 response = response.header(header::CONTENT_TYPE, "application/json");
-                return response.body(Body::from(bytes))
-                    .map_err(|e| (
+                return response.body(Body::from(bytes)).map_err(|e| {
+                    (
                         StatusCode::BAD_GATEWAY,
-                        Json(json!({"error": {"message": e.to_string(), "type": "upstream_error"}})),
-                    ));
+                        Json(
+                            json!({"error": {"message": e.to_string(), "type": "upstream_error"}}),
+                        ),
+                    )
+                });
             }
             Err(err) => {
                 warn!(backend = %backend.id, %err, "upstream request failed; trying fallback");
@@ -4883,14 +4969,10 @@ async fn record_usage_from_response(
             backend.estimate_cost(prompt_tokens, completion_tokens)
         };
 
-        let record = TokenUsageRecord::new(
-            uuid::Uuid::new_v4().to_string(),
-            &model,
-            &backend.id,
-        )
-        .with_tokens(prompt_tokens, completion_tokens)
-        .with_cost(cost, backend.is_local)
-        .with_latency(latency_ms);
+        let record = TokenUsageRecord::new(uuid::Uuid::new_v4().to_string(), &model, &backend.id)
+            .with_tokens(prompt_tokens, completion_tokens)
+            .with_cost(cost, backend.is_local)
+            .with_latency(latency_ms);
 
         state.cost_tracker.record_usage(record).await;
 
@@ -4961,7 +5043,12 @@ async fn internal_delegate(
     }
 
     if !ff_security::node_auth::verify_signature(
-        &secret, "POST", "/v1/internal/delegate", timestamp, &body, signature,
+        &secret,
+        "POST",
+        "/v1/internal/delegate",
+        timestamp,
+        &body,
+        signature,
     ) {
         return Err((
             StatusCode::UNAUTHORIZED,
@@ -4969,10 +5056,12 @@ async fn internal_delegate(
         ));
     }
 
-    let payload: Value = serde_json::from_str(&body).map_err(|e| (
-        StatusCode::BAD_REQUEST,
-        Json(json!({"error": format!("invalid json: {e}")})),
-    ))?;
+    let payload: Value = serde_json::from_str(&body).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("invalid json: {e}")})),
+        )
+    })?;
 
     let pool = match state.operational_store.as_ref().and_then(|s| s.pg_pool()) {
         Some(p) => p,
@@ -4984,10 +5073,19 @@ async fn internal_delegate(
         }
     };
 
-    let task_type = payload.get("task_type").and_then(|v| v.as_str()).unwrap_or("delegate");
-    let summary = payload.get("summary").and_then(|v| v.as_str()).unwrap_or("delegated task");
+    let task_type = payload
+        .get("task_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("delegate");
+    let summary = payload
+        .get("summary")
+        .and_then(|v| v.as_str())
+        .unwrap_or("delegated task");
     let task_payload = payload.get("payload").cloned().unwrap_or(json!({}));
-    let priority = payload.get("priority").and_then(|v| v.as_i64()).unwrap_or(50) as i32;
+    let priority = payload
+        .get("priority")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(50) as i32;
     let capabilities = payload.get("capabilities").cloned().unwrap_or(json!([]));
 
     let task_id: Uuid = sqlx::query_scalar(
@@ -5073,7 +5171,8 @@ async fn list_models(
     State(state): State<Arc<GatewayState>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let now = Utc::now().timestamp();
-    let mut model_map: std::collections::BTreeMap<String, (u8, bool, f64, f64)> = std::collections::BTreeMap::new();
+    let mut model_map: std::collections::BTreeMap<String, (u8, bool, f64, f64)> =
+        std::collections::BTreeMap::new();
 
     // 1) Static registry models
     if let Some(registry) = &state.api_registry {
@@ -5082,33 +5181,44 @@ async fn list_models(
         for (model, tier) in models {
             let model_eps: Vec<_> = endpoints.iter().filter(|e| e.model == model).collect();
             let is_local = model_eps.first().map(|e| e.is_local).unwrap_or(true);
-            let cost_in = model_eps.first().map(|e| e.cost_per_1k_input).unwrap_or(0.0);
-            let cost_out = model_eps.first().map(|e| e.cost_per_1k_output).unwrap_or(0.0);
+            let cost_in = model_eps
+                .first()
+                .map(|e| e.cost_per_1k_input)
+                .unwrap_or(0.0);
+            let cost_out = model_eps
+                .first()
+                .map(|e| e.cost_per_1k_output)
+                .unwrap_or(0.0);
             model_map.insert(model, (tier, is_local, cost_in, cost_out));
         }
     }
 
     // 2) Operational store models (Postgres)
     if let Some(store) = state.operational_store.as_ref()
-        && let Some(pool) = store.pg_pool() {
-            match sqlx::query("SELECT slug, tier FROM fleet_models")
-                .fetch_all(pool)
-                .await
-            {
-                Ok(rows) => {
-                    for row in rows {
-                        let slug: String = row.get("slug");
-                        let tier: i32 = row.get("tier");
-                        let is_local = !slug.starts_with("gpt") && !slug.starts_with("claude") && !slug.starts_with("gemini");
-                        let entry = model_map.entry(slug).or_insert((tier as u8, is_local, 0.0, 0.0));
-                        entry.0 = entry.0.min(tier as u8);
-                    }
-                }
-                Err(e) => {
-                    tracing::debug!(error = %e, "list_models: fleet_models query failed");
+        && let Some(pool) = store.pg_pool()
+    {
+        match sqlx::query("SELECT slug, tier FROM fleet_models")
+            .fetch_all(pool)
+            .await
+        {
+            Ok(rows) => {
+                for row in rows {
+                    let slug: String = row.get("slug");
+                    let tier: i32 = row.get("tier");
+                    let is_local = !slug.starts_with("gpt")
+                        && !slug.starts_with("claude")
+                        && !slug.starts_with("gemini");
+                    let entry = model_map
+                        .entry(slug)
+                        .or_insert((tier as u8, is_local, 0.0, 0.0));
+                    entry.0 = entry.0.min(tier as u8);
                 }
             }
+            Err(e) => {
+                tracing::debug!(error = %e, "list_models: fleet_models query failed");
+            }
         }
+    }
 
     let data: Vec<Value> = model_map
         .into_iter()
@@ -5219,7 +5329,9 @@ async fn route_fleet_capability(
                     catalog_entries.insert(id, (name, tier, pw));
                 }
             }
-            Err(e) => tracing::warn!(error = %e, "route_fleet_capability: fleet_model_catalog query failed"),
+            Err(e) => {
+                tracing::warn!(error = %e, "route_fleet_capability: fleet_model_catalog query failed")
+            }
         }
 
         // 1b. Legacy table (V39) — merge in anything missing
@@ -5255,9 +5367,21 @@ async fn route_fleet_capability(
     // ── 3. Enrich live servers with catalog capabilities ──
     let mut candidates: Vec<(String, String, String, i32, String, Value, &Value)> = Vec::new();
     for s in &live_servers {
-        let computer = s.get("computer").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let endpoint = s.get("endpoint").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let raw_model_id = s.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let computer = s
+            .get("computer")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let endpoint = s
+            .get("endpoint")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let raw_model_id = s
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         let healthy = s.get("healthy").and_then(|v| v.as_bool()).unwrap_or(false);
         if !healthy {
             continue;
@@ -5271,12 +5395,16 @@ async fn route_fleet_capability(
             .to_string();
 
         // Try exact catalog match first, then fuzzy prefix match
-        let catalog_match: Option<&(String, i32, Value)> = catalog_entries.get(&model_id)
-            .or_else(|| {
+        let catalog_match: Option<&(String, i32, Value)> =
+            catalog_entries.get(&model_id).or_else(|| {
                 let model_lower = model_id.to_lowercase();
-                catalog_entries.iter().find(|(cat_id, _)| {
-                    model_lower.contains(&cat_id.to_lowercase()) || cat_id.to_lowercase().contains(&model_lower)
-                }).map(|(_, v)| v)
+                catalog_entries
+                    .iter()
+                    .find(|(cat_id, _)| {
+                        model_lower.contains(&cat_id.to_lowercase())
+                            || cat_id.to_lowercase().contains(&model_lower)
+                    })
+                    .map(|(_, v)| v)
             });
 
         let (name, tier, pw): (String, i32, Value) = match catalog_match {
@@ -5301,39 +5429,82 @@ async fn route_fleet_capability(
     let local_hostname = std::env::var("FF_NODE")
         .ok()
         .or_else(|| std::env::var("HOSTNAME").ok())
-        .or_else(|| std::process::Command::new("hostname").arg("-s").output().ok().and_then(|o| String::from_utf8(o.stdout).ok()))
+        .or_else(|| {
+            std::process::Command::new("hostname")
+                .arg("-s")
+                .output()
+                .ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+        })
         .unwrap_or_default()
         .trim()
         .to_lowercase();
 
     #[allow(clippy::type_complexity)]
-    let mut scored: Vec<(i32, i32, i32, f64, String, String, String, String, Value, &Value)> = Vec::new();
+    let mut scored: Vec<(
+        i32,
+        i32,
+        i32,
+        f64,
+        String,
+        String,
+        String,
+        String,
+        Value,
+        &Value,
+    )> = Vec::new();
     let mut alternatives: Vec<AlternativeCandidate> = Vec::new();
 
     for (node_name, slug, name, tier, endpoint, pw, beat) in &candidates {
         let is_local = node_name.to_lowercase() == local_hostname
             || local_hostname.starts_with(&node_name.to_lowercase())
             || node_name.to_lowercase().starts_with(&local_hostname);
-        let qd = beat.get("queue_depth").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-        let tps = beat.get("tokens_per_sec_last_min").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let qd = beat
+            .get("queue_depth")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0) as i32;
+        let tps = beat
+            .get("tokens_per_sec_last_min")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
 
         // Scoring tuple: (local_bonus, tier_asc, queue_asc, tps_desc)
-        let local_bonus = if is_local && req.preferred_local { 1 } else { 0 };
+        let local_bonus = if is_local && req.preferred_local {
+            1
+        } else {
+            0
+        };
 
-        scored.push((local_bonus, *tier, qd, tps, slug.clone(), name.clone(), node_name.clone(), endpoint.clone(), pw.clone(), *beat));
+        scored.push((
+            local_bonus,
+            *tier,
+            qd,
+            tps,
+            slug.clone(),
+            name.clone(),
+            node_name.clone(),
+            endpoint.clone(),
+            pw.clone(),
+            *beat,
+        ));
     }
 
     // Sort: local first, then lower tier, then lower queue, then higher tps
     scored.sort_by(|a, b| {
-        b.0.cmp(&a.0)                    // local bonus descending
+        b.0.cmp(&a.0) // local bonus descending
             .then_with(|| a.1.cmp(&b.1)) // tier ascending
             .then_with(|| a.2.cmp(&b.2)) // queue depth ascending
             .then_with(|| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal)) // tps descending
     });
 
     if let Some((_, tier, qd, tps, slug, name, node_name, endpoint, pw, _beat)) = scored.first() {
-        let caps = pw.as_array()
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        let caps = pw
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
 
         let is_local = node_name.to_lowercase() == local_hostname;
@@ -5344,7 +5515,8 @@ async fn route_fleet_capability(
         };
 
         // Build alternatives list from remaining scored items + skipped items
-        for (_, _, _, _, alt_slug, _, alt_node, alt_endpoint, _, _) in scored.iter().skip(1).take(5) {
+        for (_, _, _, _, alt_slug, _, alt_node, alt_endpoint, _, _) in scored.iter().skip(1).take(5)
+        {
             alternatives.push(AlternativeCandidate {
                 node: alt_node.clone(),
                 model: alt_slug.clone(),
@@ -5385,7 +5557,10 @@ async fn proxy_embeddings(
     State(state): State<Arc<GatewayState>>,
     Json(raw_payload): Json<Value>,
 ) -> Result<Response<Body>, (StatusCode, Json<Value>)> {
-    let requested_model = raw_payload.get("model").and_then(|v| v.as_str()).map(String::from);
+    let requested_model = raw_payload
+        .get("model")
+        .and_then(|v| v.as_str())
+        .map(String::from);
 
     // ── 1. Load catalog entries with embedding capability ──
     let mut catalog_entries: HashMap<String, (String, i32, Value)> = HashMap::new();
@@ -5404,7 +5579,9 @@ async fn proxy_embeddings(
                     catalog_entries.insert(id, (name, tier, pw));
                 }
             }
-            Err(e) => tracing::warn!(error = %e, "proxy_embeddings: fleet_model_catalog query failed"),
+            Err(e) => {
+                tracing::warn!(error = %e, "proxy_embeddings: fleet_model_catalog query failed")
+            }
         }
 
         match sqlx::query(
@@ -5439,9 +5616,21 @@ async fn proxy_embeddings(
     // ── 3. Find embedding-capable candidates ──
     let mut candidates: Vec<(String, String, String, i32, String, Value, &Value)> = Vec::new();
     for s in &live_servers {
-        let computer = s.get("computer").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let endpoint = s.get("endpoint").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let raw_model_id = s.get("model").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let computer = s
+            .get("computer")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let endpoint = s
+            .get("endpoint")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let raw_model_id = s
+            .get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         let healthy = s.get("healthy").and_then(|v| v.as_bool()).unwrap_or(false);
         if !healthy {
             continue;
@@ -5453,12 +5642,16 @@ async fn proxy_embeddings(
             .unwrap_or(&raw_model_id)
             .to_string();
 
-        let catalog_match: Option<&(String, i32, Value)> = catalog_entries.get(&model_id)
-            .or_else(|| {
+        let catalog_match: Option<&(String, i32, Value)> =
+            catalog_entries.get(&model_id).or_else(|| {
                 let model_lower = model_id.to_lowercase();
-                catalog_entries.iter().find(|(cat_id, _)| {
-                    model_lower.contains(&cat_id.to_lowercase()) || cat_id.to_lowercase().contains(&model_lower)
-                }).map(|(_, v)| v)
+                catalog_entries
+                    .iter()
+                    .find(|(cat_id, _)| {
+                        model_lower.contains(&cat_id.to_lowercase())
+                            || cat_id.to_lowercase().contains(&model_lower)
+                    })
+                    .map(|(_, v)| v)
             });
 
         let (name, tier, pw): (String, i32, Value) = match catalog_match {
@@ -5467,8 +5660,12 @@ async fn proxy_embeddings(
         };
 
         // Must have embeddings capability
-        let has_embedding_cap = pw.as_array()
-            .map(|arr: &Vec<Value>| arr.iter().any(|v| v.as_str() == Some("embeddings") || v.as_str() == Some("embedding")))
+        let has_embedding_cap = pw
+            .as_array()
+            .map(|arr: &Vec<Value>| {
+                arr.iter()
+                    .any(|v| v.as_str() == Some("embeddings") || v.as_str() == Some("embedding"))
+            })
             .unwrap_or(false);
 
         if !has_embedding_cap {
@@ -5480,7 +5677,10 @@ async fn proxy_embeddings(
             let req_lower = req_model.to_lowercase();
             let model_lower = model_id.to_lowercase();
             let name_lower = name.to_lowercase();
-            if !model_lower.contains(&req_lower) && !name_lower.contains(&req_lower) && !req_lower.contains(&model_lower) {
+            if !model_lower.contains(&req_lower)
+                && !name_lower.contains(&req_lower)
+                && !req_lower.contains(&model_lower)
+            {
                 continue;
             }
         }
@@ -5491,8 +5691,14 @@ async fn proxy_embeddings(
     // ── 4. Score candidates (lower tier > lower queue depth > higher tps) ──
     let mut scored: Vec<(i32, i32, f64, String, String, String)> = Vec::new();
     for (_node_name, slug, name, tier, endpoint, _pw, beat) in &candidates {
-        let qd = beat.get("queue_depth").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-        let tps = beat.get("tokens_per_sec_last_min").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let qd = beat
+            .get("queue_depth")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0) as i32;
+        let tps = beat
+            .get("tokens_per_sec_last_min")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
         scored.push((*tier, qd, tps, slug.clone(), name.clone(), endpoint.clone()));
     }
 
@@ -5513,17 +5719,22 @@ async fn proxy_embeddings(
                 let bytes = upstream.bytes().await.unwrap_or_default();
                 let mut response = Response::builder().status(status.as_u16());
                 response = response.header(header::CONTENT_TYPE, "application/json");
-                return response.body(Body::from(bytes))
-                    .map_err(|e| (
+                return response.body(Body::from(bytes)).map_err(|e| {
+                    (
                         StatusCode::BAD_GATEWAY,
-                        Json(json!({"error": {"message": e.to_string(), "type": "upstream_error"}})),
-                    ));
+                        Json(
+                            json!({"error": {"message": e.to_string(), "type": "upstream_error"}}),
+                        ),
+                    )
+                });
             }
             Err(err) => {
                 warn!(model = %slug, %err, "embeddings upstream request failed");
                 return Err((
                     StatusCode::BAD_GATEWAY,
-                    Json(json!({"error": {"message": format!("embeddings upstream failed: {}", err), "type": "upstream_error"}})),
+                    Json(
+                        json!({"error": {"message": format!("embeddings upstream failed: {}", err), "type": "upstream_error"}}),
+                    ),
                 ));
             }
         }
@@ -6179,21 +6390,43 @@ async fn create_agent_session(
 
     // Security: validate working_dir is not trying to escape to system paths.
     // Rejects both raw path traversal and canonicalized system directories.
-    let forbidden = ["/etc", "/usr", "/bin", "/sbin", "/lib", "/lib64", "/sys", "/dev", "/proc", "/var/log", "/var/spool", "/boot"];
+    let forbidden = [
+        "/etc",
+        "/usr",
+        "/bin",
+        "/sbin",
+        "/lib",
+        "/lib64",
+        "/sys",
+        "/dev",
+        "/proc",
+        "/var/log",
+        "/var/spool",
+        "/boot",
+    ];
     let raw = working_dir.to_string_lossy();
     for prefix in &forbidden {
         if raw.starts_with(prefix) {
-            return Err((StatusCode::FORBIDDEN, Json(json!({"error": format!("working_dir cannot be under {}", prefix)}))));
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(json!({"error": format!("working_dir cannot be under {}", prefix)})),
+            ));
         }
     }
     // Reject obvious path-traversal sequences in the raw path.
     if raw.split('/').any(|s| s == "..") {
-        return Err((StatusCode::FORBIDDEN, Json(json!({"error": "working_dir contains path traversal ('..')"}))));
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "working_dir contains path traversal ('..')"})),
+        ));
     }
     if let Ok(canonical) = working_dir.canonicalize() {
         for prefix in &forbidden {
             if canonical.starts_with(prefix) {
-                return Err((StatusCode::FORBIDDEN, Json(json!({"error": format!("working_dir cannot be under {}", prefix)}))));
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    Json(json!({"error": format!("working_dir cannot be under {}", prefix)})),
+                ));
             }
         }
     }
@@ -6204,7 +6437,10 @@ async fn create_agent_session(
         working_dir,
         system_prompt: req.system_prompt,
         max_turns: req.max_turns.unwrap_or(30),
-        pg_pool: state.operational_store.as_ref().and_then(|s| s.pg_pool().cloned()),
+        pg_pool: state
+            .operational_store
+            .as_ref()
+            .and_then(|s| s.pg_pool().cloned()),
         ..Default::default()
     };
 

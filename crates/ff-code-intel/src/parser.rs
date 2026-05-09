@@ -144,71 +144,75 @@ fn extract_rust_entities(source: &str, file_path: &str) -> Vec<CodeEntity> {
             || trimmed.starts_with("pub(crate) fn ")
             || trimmed.starts_with("pub(super) fn "))
             && !trimmed.starts_with("//")
-            && let Some(name) = extract_name_after(trimmed, "fn ") {
-                let end = find_block_end(&lines, i);
-                entities.push(CodeEntity {
-                    kind: EntityKind::Function,
-                    name: name.clone(),
-                    file_path: file_path.into(),
-                    start_line: line_num,
-                    end_line: end + 1,
-                    source: lines[i..=end.min(lines.len() - 1)].join("\n"),
-                    signature: trimmed.to_string(),
-                    parent: None,
-                    language: Language::Rust,
-                });
-            }
+            && let Some(name) = extract_name_after(trimmed, "fn ")
+        {
+            let end = find_block_end(&lines, i);
+            entities.push(CodeEntity {
+                kind: EntityKind::Function,
+                name: name.clone(),
+                file_path: file_path.into(),
+                start_line: line_num,
+                end_line: end + 1,
+                source: lines[i..=end.min(lines.len() - 1)].join("\n"),
+                signature: trimmed.to_string(),
+                parent: None,
+                language: Language::Rust,
+            });
+        }
 
         // Structs
         if (trimmed.starts_with("pub struct ") || trimmed.starts_with("struct "))
             && !trimmed.starts_with("//")
-            && let Some(name) = extract_name_after(trimmed, "struct ") {
-                entities.push(CodeEntity {
-                    kind: EntityKind::Struct,
-                    name,
-                    file_path: file_path.into(),
-                    start_line: line_num,
-                    end_line: find_block_end(&lines, i) + 1,
-                    source: trimmed.to_string(),
-                    signature: trimmed.to_string(),
-                    parent: None,
-                    language: Language::Rust,
-                });
-            }
+            && let Some(name) = extract_name_after(trimmed, "struct ")
+        {
+            entities.push(CodeEntity {
+                kind: EntityKind::Struct,
+                name,
+                file_path: file_path.into(),
+                start_line: line_num,
+                end_line: find_block_end(&lines, i) + 1,
+                source: trimmed.to_string(),
+                signature: trimmed.to_string(),
+                parent: None,
+                language: Language::Rust,
+            });
+        }
 
         // Enums
         if (trimmed.starts_with("pub enum ") || trimmed.starts_with("enum "))
             && !trimmed.starts_with("//")
-            && let Some(name) = extract_name_after(trimmed, "enum ") {
-                entities.push(CodeEntity {
-                    kind: EntityKind::Enum,
-                    name,
-                    file_path: file_path.into(),
-                    start_line: line_num,
-                    end_line: find_block_end(&lines, i) + 1,
-                    source: trimmed.to_string(),
-                    signature: trimmed.to_string(),
-                    parent: None,
-                    language: Language::Rust,
-                });
-            }
+            && let Some(name) = extract_name_after(trimmed, "enum ")
+        {
+            entities.push(CodeEntity {
+                kind: EntityKind::Enum,
+                name,
+                file_path: file_path.into(),
+                start_line: line_num,
+                end_line: find_block_end(&lines, i) + 1,
+                source: trimmed.to_string(),
+                signature: trimmed.to_string(),
+                parent: None,
+                language: Language::Rust,
+            });
+        }
 
         // Traits
         if (trimmed.starts_with("pub trait ") || trimmed.starts_with("trait "))
             && !trimmed.starts_with("//")
-            && let Some(name) = extract_name_after(trimmed, "trait ") {
-                entities.push(CodeEntity {
-                    kind: EntityKind::Trait,
-                    name,
-                    file_path: file_path.into(),
-                    start_line: line_num,
-                    end_line: find_block_end(&lines, i) + 1,
-                    source: trimmed.to_string(),
-                    signature: trimmed.to_string(),
-                    parent: None,
-                    language: Language::Rust,
-                });
-            }
+            && let Some(name) = extract_name_after(trimmed, "trait ")
+        {
+            entities.push(CodeEntity {
+                kind: EntityKind::Trait,
+                name,
+                file_path: file_path.into(),
+                start_line: line_num,
+                end_line: find_block_end(&lines, i) + 1,
+                source: trimmed.to_string(),
+                signature: trimmed.to_string(),
+                parent: None,
+                language: Language::Rust,
+            });
+        }
 
         // Imports
         if trimmed.starts_with("use ") && !trimmed.starts_with("//") {
@@ -246,53 +250,56 @@ fn extract_ts_entities(source: &str, file_path: &str, lang: Language) -> Vec<Cod
             || trimmed.contains("=> ("))
             && !trimmed.starts_with("//")
             && !trimmed.starts_with("*")
-            && let Some(name) = extract_name_after(trimmed, "function ") {
-                entities.push(CodeEntity {
-                    kind: EntityKind::Function,
-                    name,
-                    file_path: file_path.into(),
-                    start_line: line_num,
-                    end_line: find_block_end(&lines, i) + 1,
-                    source: trimmed.to_string(),
-                    signature: trimmed.to_string(),
-                    parent: None,
-                    language: lang,
-                });
-            }
+            && let Some(name) = extract_name_after(trimmed, "function ")
+        {
+            entities.push(CodeEntity {
+                kind: EntityKind::Function,
+                name,
+                file_path: file_path.into(),
+                start_line: line_num,
+                end_line: find_block_end(&lines, i) + 1,
+                source: trimmed.to_string(),
+                signature: trimmed.to_string(),
+                parent: None,
+                language: lang,
+            });
+        }
 
         // Classes
         if (trimmed.starts_with("class ") || trimmed.starts_with("export class "))
             && !trimmed.starts_with("//")
-            && let Some(name) = extract_name_after(trimmed, "class ") {
-                entities.push(CodeEntity {
-                    kind: EntityKind::Class,
-                    name,
-                    file_path: file_path.into(),
-                    start_line: line_num,
-                    end_line: find_block_end(&lines, i) + 1,
-                    source: trimmed.to_string(),
-                    signature: trimmed.to_string(),
-                    parent: None,
-                    language: lang,
-                });
-            }
+            && let Some(name) = extract_name_after(trimmed, "class ")
+        {
+            entities.push(CodeEntity {
+                kind: EntityKind::Class,
+                name,
+                file_path: file_path.into(),
+                start_line: line_num,
+                end_line: find_block_end(&lines, i) + 1,
+                source: trimmed.to_string(),
+                signature: trimmed.to_string(),
+                parent: None,
+                language: lang,
+            });
+        }
 
         // Interfaces (TypeScript)
         if (trimmed.starts_with("interface ") || trimmed.starts_with("export interface "))
             && lang == Language::TypeScript
-            && let Some(name) = extract_name_after(trimmed, "interface ") {
-                entities.push(CodeEntity {
-                    kind: EntityKind::Interface,
-                    name,
-                    file_path: file_path.into(),
-                    start_line: line_num,
-                    end_line: find_block_end(&lines, i) + 1,
-                    source: trimmed.to_string(),
-                    signature: trimmed.to_string(),
-                    parent: None,
-                    language: lang,
-                });
-            }
+            && let Some(name) = extract_name_after(trimmed, "interface ")
+        {
+            entities.push(CodeEntity {
+                kind: EntityKind::Interface,
+                name,
+                file_path: file_path.into(),
+                start_line: line_num,
+                end_line: find_block_end(&lines, i) + 1,
+                source: trimmed.to_string(),
+                signature: trimmed.to_string(),
+                parent: None,
+                language: lang,
+            });
+        }
 
         // Imports
         if trimmed.starts_with("import ") {
@@ -323,34 +330,37 @@ fn extract_python_entities(source: &str, file_path: &str) -> Vec<CodeEntity> {
 
         if (trimmed.starts_with("def ") || trimmed.starts_with("async def "))
             && !trimmed.starts_with("#")
-            && let Some(name) = extract_name_after(trimmed, "def ") {
-                entities.push(CodeEntity {
-                    kind: EntityKind::Function,
-                    name,
-                    file_path: file_path.into(),
-                    start_line: line_num,
-                    end_line: find_python_block_end(&lines, i) + 1,
-                    source: trimmed.to_string(),
-                    signature: trimmed.to_string(),
-                    parent: None,
-                    language: Language::Python,
-                });
-            }
+            && let Some(name) = extract_name_after(trimmed, "def ")
+        {
+            entities.push(CodeEntity {
+                kind: EntityKind::Function,
+                name,
+                file_path: file_path.into(),
+                start_line: line_num,
+                end_line: find_python_block_end(&lines, i) + 1,
+                source: trimmed.to_string(),
+                signature: trimmed.to_string(),
+                parent: None,
+                language: Language::Python,
+            });
+        }
 
-        if trimmed.starts_with("class ") && !trimmed.starts_with("#")
-            && let Some(name) = extract_name_after(trimmed, "class ") {
-                entities.push(CodeEntity {
-                    kind: EntityKind::Class,
-                    name,
-                    file_path: file_path.into(),
-                    start_line: line_num,
-                    end_line: find_python_block_end(&lines, i) + 1,
-                    source: trimmed.to_string(),
-                    signature: trimmed.to_string(),
-                    parent: None,
-                    language: Language::Python,
-                });
-            }
+        if trimmed.starts_with("class ")
+            && !trimmed.starts_with("#")
+            && let Some(name) = extract_name_after(trimmed, "class ")
+        {
+            entities.push(CodeEntity {
+                kind: EntityKind::Class,
+                name,
+                file_path: file_path.into(),
+                start_line: line_num,
+                end_line: find_python_block_end(&lines, i) + 1,
+                source: trimmed.to_string(),
+                signature: trimmed.to_string(),
+                parent: None,
+                language: Language::Python,
+            });
+        }
 
         if trimmed.starts_with("import ") || trimmed.starts_with("from ") {
             entities.push(CodeEntity {
@@ -378,41 +388,44 @@ fn extract_go_entities(source: &str, file_path: &str) -> Vec<CodeEntity> {
         let trimmed = line.trim();
         let line_num = i + 1;
 
-        if trimmed.starts_with("func ") && !trimmed.starts_with("//")
-            && let Some(name) = extract_name_after(trimmed, "func ") {
-                entities.push(CodeEntity {
-                    kind: EntityKind::Function,
-                    name,
-                    file_path: file_path.into(),
-                    start_line: line_num,
-                    end_line: find_block_end(&lines, i) + 1,
-                    source: trimmed.to_string(),
-                    signature: trimmed.to_string(),
-                    parent: None,
-                    language: Language::Go,
-                });
-            }
+        if trimmed.starts_with("func ")
+            && !trimmed.starts_with("//")
+            && let Some(name) = extract_name_after(trimmed, "func ")
+        {
+            entities.push(CodeEntity {
+                kind: EntityKind::Function,
+                name,
+                file_path: file_path.into(),
+                start_line: line_num,
+                end_line: find_block_end(&lines, i) + 1,
+                source: trimmed.to_string(),
+                signature: trimmed.to_string(),
+                parent: None,
+                language: Language::Go,
+            });
+        }
 
         if trimmed.starts_with("type ")
             && (trimmed.contains("struct") || trimmed.contains("interface"))
-            && let Some(name) = extract_name_after(trimmed, "type ") {
-                let kind = if trimmed.contains("interface") {
-                    EntityKind::Interface
-                } else {
-                    EntityKind::Struct
-                };
-                entities.push(CodeEntity {
-                    kind,
-                    name,
-                    file_path: file_path.into(),
-                    start_line: line_num,
-                    end_line: find_block_end(&lines, i) + 1,
-                    source: trimmed.to_string(),
-                    signature: trimmed.to_string(),
-                    parent: None,
-                    language: Language::Go,
-                });
-            }
+            && let Some(name) = extract_name_after(trimmed, "type ")
+        {
+            let kind = if trimmed.contains("interface") {
+                EntityKind::Interface
+            } else {
+                EntityKind::Struct
+            };
+            entities.push(CodeEntity {
+                kind,
+                name,
+                file_path: file_path.into(),
+                start_line: line_num,
+                end_line: find_block_end(&lines, i) + 1,
+                source: trimmed.to_string(),
+                signature: trimmed.to_string(),
+                parent: None,
+                language: Language::Go,
+            });
+        }
     }
 
     entities

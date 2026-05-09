@@ -58,7 +58,10 @@ impl EmbeddingClient {
 
     /// Embed a single text. Returns vector of f32.
     pub async fn embed(&self, text: &str) -> Result<Vec<f32>, String> {
-        let resp = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build().unwrap_or_else(|_| reqwest::Client::new())
+        let resp = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
             .post(format!("{}/v1/embeddings", self.endpoint))
             .json(&serde_json::json!({
                 "model": self.model_id,
@@ -105,7 +108,10 @@ impl EmbeddingClient {
             return Ok(Vec::new());
         }
 
-        let resp = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build().unwrap_or_else(|_| reqwest::Client::new())
+        let resp = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
             .post(format!("{}/v1/embeddings", self.endpoint))
             .json(&serde_json::json!({
                 "model": self.model_id,

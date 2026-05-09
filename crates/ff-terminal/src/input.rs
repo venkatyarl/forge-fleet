@@ -309,11 +309,12 @@ impl InputState {
     pub fn accept_suggestion(&mut self) {
         if let Some(idx) = self.suggestion_index
             && let Some(suggestion) = self.suggestions.get(idx)
-                && let Some(cmd) = suggestion.split(' ').next() {
-                    let cmd_clean = cmd.trim_start_matches('/');
-                    self.text = format!("/{cmd_clean} ");
-                    self.cursor = self.text.len();
-                }
+            && let Some(cmd) = suggestion.split(' ').next()
+        {
+            let cmd_clean = cmd.trim_start_matches('/');
+            self.text = format!("/{cmd_clean} ");
+            self.cursor = self.text.len();
+        }
         self.clear_suggestions();
     }
 

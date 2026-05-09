@@ -28,8 +28,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use sqlx::{PgPool, Row};
 use sqlx::postgres::PgListener;
+use sqlx::{PgPool, Row};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
@@ -362,18 +362,31 @@ impl TaskRunner {
             let num_batches = payload
                 .get("num_batches")
                 .and_then(Value::as_u64)
-                .unwrap_or(1)
-                as usize;
+                .unwrap_or(1) as usize;
 
             let mut weighted_items = Vec::new();
             for item in &items {
-                let key = item.get("key").and_then(Value::as_str).unwrap_or("").to_string();
-                let item_type = item.get("item_type").and_then(Value::as_str).unwrap_or("shell").to_string();
+                let key = item
+                    .get("key")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let item_type = item
+                    .get("item_type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("shell")
+                    .to_string();
                 let weight = crate::batch_manager::ItemWeight {
-                    base: item.get("base_weight").and_then(Value::as_f64).unwrap_or(1.0),
+                    base: item
+                        .get("base_weight")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(1.0),
                     pages: item.get("pages").and_then(Value::as_f64).unwrap_or(0.0),
                     words: item.get("words").and_then(Value::as_f64).unwrap_or(0.0),
-                    has_images: item.get("has_images").and_then(Value::as_f64).unwrap_or(0.0),
+                    has_images: item
+                        .get("has_images")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(0.0),
                     has_code: item.get("has_code").and_then(Value::as_f64).unwrap_or(0.0),
                 };
                 weighted_items.push((key, item_type, weight));
@@ -396,7 +409,9 @@ impl TaskRunner {
                 task_id,
                 &weighted_items,
                 num_batches,
-            ).await {
+            )
+            .await
+            {
                 Ok(batches) => {
                     info!(task_id = %task_id, batches = batches.len(), "decomposed task into work items");
                 }
@@ -897,7 +912,9 @@ async fn run_shell_payload(
     // Security: block obviously destructive commands (same list as BashTool).
     if is_blocked_command(&command) {
         return Err(TaskRunnerError::BadPayload(Box::leak(
-            "Command blocked for safety: potentially destructive operation".to_string().into_boxed_str()
+            "Command blocked for safety: potentially destructive operation"
+                .to_string()
+                .into_boxed_str(),
         )));
     }
 
@@ -908,10 +925,21 @@ async fn run_shell_payload(
         .to_string();
 
     // Security: validate shell path against allowlist.
-    const ALLOWED_SHELLS: &[&str] = &["/bin/bash", "/bin/sh", "/bin/zsh", "/usr/bin/bash", "/usr/bin/sh", "/usr/bin/zsh"];
+    const ALLOWED_SHELLS: &[&str] = &[
+        "/bin/bash",
+        "/bin/sh",
+        "/bin/zsh",
+        "/usr/bin/bash",
+        "/usr/bin/sh",
+        "/usr/bin/zsh",
+    ];
     if !ALLOWED_SHELLS.contains(&shell.as_str()) {
         return Err(TaskRunnerError::BadPayload(Box::leak(
-            format!("shell '{}' is not in the allowed list: {:?}", shell, ALLOWED_SHELLS).into_boxed_str()
+            format!(
+                "shell '{}' is not in the allowed list: {:?}",
+                shell, ALLOWED_SHELLS
+            )
+            .into_boxed_str(),
         )));
     }
 

@@ -66,14 +66,15 @@ impl AgentTool for ScreenshotCaptureTool {
                 .output()
                 .await;
             if let Ok(out) = result
-                && out.status.success() {
-                    return AgentToolResult::ok(format!(
-                        "Screenshot saved: {}\nSize: {}x{}\nURL: {url}",
-                        output_path.display(),
-                        width,
-                        height
-                    ));
-                }
+                && out.status.success()
+            {
+                return AgentToolResult::ok(format!(
+                    "Screenshot saved: {}\nSize: {}x{}\nURL: {url}",
+                    output_path.display(),
+                    width,
+                    height
+                ));
+            }
         }
 
         // 2. Try wkhtmltoimage
@@ -89,9 +90,10 @@ impl AgentTool for ScreenshotCaptureTool {
             .output()
             .await;
         if let Ok(out) = wk_result
-            && out.status.success() {
-                return AgentToolResult::ok(format!("Screenshot saved: {}", output_path.display()));
-            }
+            && out.status.success()
+        {
+            return AgentToolResult::ok(format!("Screenshot saved: {}", output_path.display()));
+        }
 
         // 3. Try playwright
         let pw_cmd = format!(
@@ -100,9 +102,10 @@ impl AgentTool for ScreenshotCaptureTool {
         );
         let pw_result = Command::new("bash").arg("-c").arg(&pw_cmd).output().await;
         if let Ok(out) = pw_result
-            && out.status.success() {
-                return AgentToolResult::ok(format!("Screenshot saved: {}", output_path.display()));
-            }
+            && out.status.success()
+        {
+            return AgentToolResult::ok(format!("Screenshot saved: {}", output_path.display()));
+        }
 
         AgentToolResult::err(
             "Screenshot failed. Install Chrome, wkhtmltoimage, or Playwright.".to_string(),
@@ -169,12 +172,13 @@ impl AgentTool for ImageAnalyzeTool {
                     .output()
                     .await;
                 if let Ok(out) = sips
-                    && out.status.success() {
-                        let output = String::from_utf8_lossy(&out.stdout);
-                        for line in output.lines().take(10) {
-                            info.push(format!("  {}", line.trim()));
-                        }
+                    && out.status.success()
+                {
+                    let output = String::from_utf8_lossy(&out.stdout);
+                    for line in output.lines().take(10) {
+                        info.push(format!("  {}", line.trim()));
                     }
+                }
             }
         }
 
@@ -411,9 +415,10 @@ impl AgentTool for ImageConvertTool {
                     .unwrap_or("png");
                 sips_args.push(ext.to_string());
                 if let Some(r) = resize
-                    && let Some((w, h)) = r.split_once('x') {
-                        sips_args.extend(["-z".to_string(), h.to_string(), w.to_string()]);
-                    }
+                    && let Some((w, h)) = r.split_once('x')
+                {
+                    sips_args.extend(["-z".to_string(), h.to_string(), w.to_string()]);
+                }
                 sips_args.extend(["--out".to_string(), out_path.clone(), in_path]);
                 match Command::new("sips").args(&sips_args).output().await {
                     Ok(out) if out.status.success() => {
@@ -612,9 +617,10 @@ impl AgentTool for VideoAnalyzeTool {
 
             if let Ok(out) = whisper
                 && out.status.success()
-                    && let Ok(txt) = tokio::fs::read_to_string(tmp_dir.join("audio.txt")).await {
-                        audio_text = txt;
-                    }
+                && let Ok(txt) = tokio::fs::read_to_string(tmp_dir.join("audio.txt")).await
+            {
+                audio_text = txt;
+            }
         }
 
         // Step 4: Send frames to multimodal LLM for analysis
@@ -670,10 +676,10 @@ impl AgentTool for VideoAnalyzeTool {
                         && let Some(content) = data
                             .pointer("/choices/0/message/content")
                             .and_then(Value::as_str)
-                        {
-                            llm_analysis = content.to_string();
-                            break;
-                        }
+                    {
+                        llm_analysis = content.to_string();
+                        break;
+                    }
                 }
                 Err(_) => continue,
             }
@@ -775,31 +781,33 @@ impl AgentTool for AudioAnalyzeTool {
             .await;
 
         if let Ok(out) = probe
-            && out.status.success() {
-                let json_str = String::from_utf8_lossy(&out.stdout);
-                if let Ok(data) = serde_json::from_str::<Value>(&json_str)
-                    && let Some(fmt) = data.get("format") {
-                        info.push(format!(
-                            "Duration: {}s",
-                            fmt.get("duration").and_then(Value::as_str).unwrap_or("?")
-                        ));
-                        info.push(format!(
-                            "Format: {}",
-                            fmt.get("format_long_name")
-                                .and_then(Value::as_str)
-                                .unwrap_or("?")
-                        ));
-                        info.push(format!(
-                            "Bitrate: {}kbps",
-                            fmt.get("bit_rate")
-                                .and_then(Value::as_str)
-                                .unwrap_or("0")
-                                .parse::<u64>()
-                                .unwrap_or(0)
-                                / 1000
-                        ));
-                    }
+            && out.status.success()
+        {
+            let json_str = String::from_utf8_lossy(&out.stdout);
+            if let Ok(data) = serde_json::from_str::<Value>(&json_str)
+                && let Some(fmt) = data.get("format")
+            {
+                info.push(format!(
+                    "Duration: {}s",
+                    fmt.get("duration").and_then(Value::as_str).unwrap_or("?")
+                ));
+                info.push(format!(
+                    "Format: {}",
+                    fmt.get("format_long_name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("?")
+                ));
+                info.push(format!(
+                    "Bitrate: {}kbps",
+                    fmt.get("bit_rate")
+                        .and_then(Value::as_str)
+                        .unwrap_or("0")
+                        .parse::<u64>()
+                        .unwrap_or(0)
+                        / 1000
+                ));
             }
+        }
 
         // Transcribe with whisper
         if transcribe {

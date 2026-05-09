@@ -209,9 +209,10 @@ async fn fetch_hf_models_for_task(
     );
     let mut req = http.get(&url).header("Accept", "application/json");
     if let Some(t) = token
-        && !t.is_empty() {
-            req = req.header("Authorization", format!("Bearer {t}"));
-        }
+        && !t.is_empty()
+    {
+        req = req.header("Authorization", format!("Bearer {t}"));
+    }
     let resp = req.send().await.map_err(|e| format!("GET {url}: {e}"))?;
     if !resp.status().is_success() {
         return Err(format!("GET {url}: HTTP {}", resp.status()));
@@ -293,9 +294,10 @@ fn extract_license(item: &JsonValue) -> Option<String> {
     if let Some(tags) = item.get("tags").and_then(|v| v.as_array()) {
         for t in tags {
             if let Some(s) = t.as_str()
-                && let Some(rest) = s.strip_prefix("license:") {
-                    return Some(rest.to_string());
-                }
+                && let Some(rest) = s.strip_prefix("license:")
+            {
+                return Some(rest.to_string());
+            }
         }
     }
     None
@@ -344,10 +346,11 @@ fn evaluate(
     }
 
     if let Some(sz) = m.size_gb
-        && sz > MAX_CANDIDATE_SIZE_GB {
-            debug!(id = %m.model_id, size_gb = sz, "scout filter: oversize");
-            return None;
-        }
+        && sz > MAX_CANDIDATE_SIZE_GB
+    {
+        debug!(id = %m.model_id, size_gb = sz, "scout filter: oversize");
+        return None;
+    }
 
     if denylist.contains(&m.model_id.to_ascii_lowercase()) {
         debug!(id = %m.model_id, "scout filter: denylist hit");

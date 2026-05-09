@@ -90,7 +90,6 @@ pub enum ModelSelection {
     },
 }
 
-
 // ---------------------------------------------------------------------------
 // Chat list for navigation
 // ---------------------------------------------------------------------------
@@ -144,10 +143,11 @@ impl ChatManager {
                     continue;
                 }
                 if let Ok(content) = fs::read_to_string(&path).await
-                    && let Ok(chat) = serde_json::from_str::<ChatSession>(&content) {
-                        manager.index_chat(&chat);
-                        manager.chats.insert(chat.id.clone(), chat);
-                    }
+                    && let Ok(chat) = serde_json::from_str::<ChatSession>(&content)
+                {
+                    manager.index_chat(&chat);
+                    manager.chats.insert(chat.id.clone(), chat);
+                }
             }
         }
 
@@ -278,7 +278,15 @@ impl ChatManager {
     pub fn list_by_scope(&self, scope_type: &str) -> Vec<ChatListEntry> {
         self.chats
             .values()
-            .filter(|c| matches!((&c.scope, scope_type), (MemoryScope::Global, "global") | (MemoryScope::Project { .. }, "project") | (MemoryScope::Folder { .. }, "folder") | (MemoryScope::Temp, "temp")))
+            .filter(|c| {
+                matches!(
+                    (&c.scope, scope_type),
+                    (MemoryScope::Global, "global")
+                        | (MemoryScope::Project { .. }, "project")
+                        | (MemoryScope::Folder { .. }, "folder")
+                        | (MemoryScope::Temp, "temp")
+                )
+            })
             .map(chat_to_list_entry)
             .collect()
     }

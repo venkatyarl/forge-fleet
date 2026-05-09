@@ -98,9 +98,9 @@ impl AgentTool for EnvInfoTool {
                 .current_dir(&ctx.working_dir)
                 .output()
                 .await
-            {
-                info.push(format!("Disk:\n{}", String::from_utf8_lossy(&out.stdout)));
-            }
+        {
+            info.push(format!("Disk:\n{}", String::from_utf8_lossy(&out.stdout)));
+        }
 
         if section == "all" || section == "env_vars" {
             info.push(format!("Working dir: {}", ctx.working_dir.display()));

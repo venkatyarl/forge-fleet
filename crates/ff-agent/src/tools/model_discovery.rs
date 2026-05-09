@@ -57,14 +57,15 @@ impl AgentTool for ModelDiscoveryTool {
                     urlenc(query)
                 );
                 if let Ok(resp) = client.get(&hf_url).send().await
-                    && let Ok(models) = resp.json::<Vec<Value>>().await {
-                        results.push("## HuggingFace".into());
-                        for m in models.iter().take(5) {
-                            let id = m.get("id").and_then(Value::as_str).unwrap_or("?");
-                            let downloads = m.get("downloads").and_then(Value::as_u64).unwrap_or(0);
-                            results.push(format!("  - {id} ({} downloads)", fmt_num(downloads)));
-                        }
+                    && let Ok(models) = resp.json::<Vec<Value>>().await
+                {
+                    results.push("## HuggingFace".into());
+                    for m in models.iter().take(5) {
+                        let id = m.get("id").and_then(Value::as_str).unwrap_or("?");
+                        let downloads = m.get("downloads").and_then(Value::as_u64).unwrap_or(0);
+                        results.push(format!("  - {id} ({} downloads)", fmt_num(downloads)));
                     }
+                }
 
                 // 2. Ollama search
                 let ollama_search = Command::new("ollama")
@@ -72,13 +73,14 @@ impl AgentTool for ModelDiscoveryTool {
                     .output()
                     .await;
                 if let Ok(out) = ollama_search
-                    && out.status.success() {
-                        let stdout = String::from_utf8_lossy(&out.stdout);
-                        results.push("## Ollama".into());
-                        for line in stdout.lines().take(6) {
-                            results.push(format!("  {line}"));
-                        }
+                    && out.status.success()
+                {
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    results.push("## Ollama".into());
+                    for line in stdout.lines().take(6) {
+                        results.push(format!("  {line}"));
                     }
+                }
 
                 // 3. Web search for independent models
                 results.push("## Other Sources".into());

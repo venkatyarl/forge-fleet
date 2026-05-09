@@ -60,7 +60,11 @@ pub async fn scan_and_enqueue(
 ) -> Result<usize, sqlx::Error> {
     let since = last_reviewed_sha.unwrap_or("HEAD~10");
     let output = tokio::process::Command::new("git")
-        .args(["log", &format!("{}..HEAD", since), "--pretty=format:%H|%s|%an"])
+        .args([
+            "log",
+            &format!("{}..HEAD", since),
+            "--pretty=format:%H|%s|%an",
+        ])
         .current_dir(repo_path)
         .output()
         .await;

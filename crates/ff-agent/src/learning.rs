@@ -349,11 +349,12 @@ fn route_candidate(candidate: &LearningCandidate, brain_ctx: &BrainContext) -> L
 
     // Project-specific content → Project Memory
     if candidate.is_project_specific
-        && let Some(root) = &brain_ctx.project_root {
-            return LearningSink::ProjectMemory {
-                project_root: root.clone(),
-            };
-        }
+        && let Some(root) = &brain_ctx.project_root
+    {
+        return LearningSink::ProjectMemory {
+            project_root: root.clone(),
+        };
+    }
 
     // Preferences and tool patterns → Fleet Brain (personal)
     if matches!(
@@ -365,11 +366,12 @@ fn route_candidate(candidate: &LearningCandidate, brain_ctx: &BrainContext) -> L
 
     // Decisions in a project context → Project Memory
     if matches!(candidate.category, MemoryCategory::Decision)
-        && let Some(root) = &brain_ctx.project_root {
-            return LearningSink::ProjectMemory {
-                project_root: root.clone(),
-            };
-        }
+        && let Some(root) = &brain_ctx.project_root
+    {
+        return LearningSink::ProjectMemory {
+            project_root: root.clone(),
+        };
+    }
 
     // Default → Fleet Brain
     LearningSink::FleetBrain

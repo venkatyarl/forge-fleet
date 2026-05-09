@@ -272,12 +272,14 @@ impl FleetInferenceManager {
         }
 
         // Update TPS estimate from latency
-        if success && latency_ms > 0
-            && let Some(mut ep) = self.endpoints.get_mut(endpoint_name) {
-                // Very rough TPS estimate: assume 100 output tokens / latency
-                let estimated_tps = 100_000.0 / latency_ms as f64;
-                ep.tps = Some(estimated_tps);
-            }
+        if success
+            && latency_ms > 0
+            && let Some(mut ep) = self.endpoints.get_mut(endpoint_name)
+        {
+            // Very rough TPS estimate: assume 100 output tokens / latency
+            let estimated_tps = 100_000.0 / latency_ms as f64;
+            ep.tps = Some(estimated_tps);
+        }
     }
 
     /// Health check all endpoints.

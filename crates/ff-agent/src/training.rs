@@ -100,9 +100,10 @@ pub async fn load_all_examples() -> Vec<TrainingConversation> {
         while let Ok(Some(entry)) = entries.next_entry().await {
             if entry.path().extension().and_then(|e| e.to_str()) == Some("json")
                 && let Ok(content) = fs::read_to_string(entry.path()).await
-                    && let Ok(conv) = serde_json::from_str::<TrainingConversation>(&content) {
-                        examples.push(conv);
-                    }
+                && let Ok(conv) = serde_json::from_str::<TrainingConversation>(&content)
+            {
+                examples.push(conv);
+            }
         }
     }
 
@@ -488,14 +489,15 @@ impl ClaudeCodeImporter {
                                     "text" => {
                                         if let Some(text) =
                                             block.get("text").and_then(Value::as_str)
-                                            && !text.is_empty() {
-                                                turns.push(TrainingTurn {
-                                                    role: "user".into(),
-                                                    content: text.to_string(),
-                                                    tool_calls: None,
-                                                    tool_call_id: None,
-                                                });
-                                            }
+                                            && !text.is_empty()
+                                        {
+                                            turns.push(TrainingTurn {
+                                                role: "user".into(),
+                                                content: text.to_string(),
+                                                tool_calls: None,
+                                                tool_call_id: None,
+                                            });
+                                        }
                                     }
                                     "tool_result" => {
                                         let tool_use_id = block
@@ -542,9 +544,10 @@ impl ClaudeCodeImporter {
                         match block_type {
                             "text" => {
                                 if let Some(text) = block.get("text").and_then(Value::as_str)
-                                    && !text.is_empty() {
-                                        text_parts.push(text.to_string());
-                                    }
+                                    && !text.is_empty()
+                                {
+                                    text_parts.push(text.to_string());
+                                }
                             }
                             "tool_use" => {
                                 let name = block

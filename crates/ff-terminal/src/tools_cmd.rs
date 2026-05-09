@@ -29,7 +29,10 @@ pub async fn handle_list(
     }
     if name.is_some() {
         params.push("name".to_string());
-        sql.push_str(&format!(" AND tool_name ILIKE '%' || ${} || '%'", params.len()));
+        sql.push_str(&format!(
+            " AND tool_name ILIKE '%' || ${} || '%'",
+            params.len()
+        ));
     }
     if unhealthy {
         sql.push_str(" AND health_checked_at <= NOW() - INTERVAL '5 minutes'");
@@ -87,10 +90,7 @@ pub async fn handle_health(pg: &PgPool) -> Result<()> {
 
     println!("{GREEN}✓ Tool Registry Health{RESET}");
     println!("  total:     {}", total);
-    println!(
-        "  healthy:   {GREEN}{}{RESET}",
-        healthy
-    );
+    println!("  healthy:   {GREEN}{}{RESET}", healthy);
     if total - healthy > 0 {
         println!("  unhealthy: {RED}{}{RESET}", total - healthy);
     }
@@ -112,7 +112,9 @@ pub async fn handle_health(pg: &PgPool) -> Result<()> {
             );
         }
     } else {
-        println!("\n  {YELLOW}No tools registered yet. Run `ff tools register` on each node.{RESET}");
+        println!(
+            "\n  {YELLOW}No tools registered yet. Run `ff tools register` on each node.{RESET}"
+        );
     }
 
     Ok(())

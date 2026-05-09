@@ -525,7 +525,9 @@ mod tests {
     use super::*;
 
     fn make_backend(id: &str, tier: u8, model: &str) -> BackendEndpoint {
-        let is_local = !model.starts_with("gpt") && !model.starts_with("claude") && !model.starts_with("gemini");
+        let is_local = !model.starts_with("gpt")
+            && !model.starts_with("claude")
+            && !model.starts_with("gemini");
         BackendEndpoint {
             id: id.to_string(),
             node: "test-node".to_string(),

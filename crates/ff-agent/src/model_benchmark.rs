@@ -389,15 +389,17 @@ pub async fn pick_benchmark_target(
 
         // RAM fit check (used as "does the model fit?").
         if let Some(min_vram) = reqs.min_vram_gb
-            && (b.hardware.ram_gb as f64) < min_vram {
-                continue;
-            }
+            && (b.hardware.ram_gb as f64) < min_vram
+        {
+            continue;
+        }
 
         // Disk headroom check: file_size + 5GB slack.
         if let Some(fs_gb) = reqs.file_size_gb
-            && b.load.disk_free_gb < fs_gb + 5.0 {
-                continue;
-            }
+            && b.load.disk_free_gb < fs_gb + 5.0
+        {
+            continue;
+        }
 
         candidates.push((
             b.computer_name.clone(),

@@ -28,11 +28,12 @@ use crate::dashboard::{BlockedItemSummary, DashboardStats};
 use crate::dependency::{DependencyCheck, WorkItemDependency};
 use crate::error::{McError, McResult};
 use crate::operational_portfolio::{
-    create_company, create_epic, create_project, create_project_environment, create_project_repo,
-    create_sprint, create_task_group, delete_company, delete_epic, delete_project, delete_sprint,
-    delete_task_group, get_company, get_epic, get_epic_progress, get_portfolio_summary, get_project,
-    get_sprint, get_sprint_burndown, get_sprint_stats, get_task_group, list_companies, list_epics,
-    assign_task_group_item, list_project_environments, list_project_repos, list_projects, list_sprints,
+    assign_task_group_item, create_company, create_epic, create_project,
+    create_project_environment, create_project_repo, create_sprint, create_task_group,
+    delete_company, delete_epic, delete_project, delete_sprint, delete_task_group, get_company,
+    get_epic, get_epic_progress, get_portfolio_summary, get_project, get_sprint,
+    get_sprint_burndown, get_sprint_stats, get_task_group, list_companies, list_epics,
+    list_project_environments, list_project_repos, list_projects, list_sprints,
     list_task_group_items, list_task_groups, unassign_task_group_item, update_company, update_epic,
     update_project, update_sprint, update_task_group,
 };
@@ -141,25 +142,64 @@ pub fn mc_router_operational(store: OperationalStore) -> Router {
         .route("/api/mc/work-items/generate", post(generate_work_items))
         .route("/api/mc/fleet/status", get(fleet_mc_status))
         // ─── Portfolio + Planning routes ─────────────────────────────
-        .route("/api/mc/companies", get(list_companies).post(create_company))
-        .route("/api/mc/companies/{id}", get(get_company).patch(update_company).delete(delete_company))
+        .route(
+            "/api/mc/companies",
+            get(list_companies).post(create_company),
+        )
+        .route(
+            "/api/mc/companies/{id}",
+            get(get_company)
+                .patch(update_company)
+                .delete(delete_company),
+        )
         .route("/api/mc/projects", get(list_projects).post(create_project))
-        .route("/api/mc/projects/{id}", get(get_project).patch(update_project).delete(delete_project))
-        .route("/api/mc/projects/{id}/repos", get(list_project_repos).post(create_project_repo))
-        .route("/api/mc/projects/{id}/environments", get(list_project_environments).post(create_project_environment))
+        .route(
+            "/api/mc/projects/{id}",
+            get(get_project)
+                .patch(update_project)
+                .delete(delete_project),
+        )
+        .route(
+            "/api/mc/projects/{id}/repos",
+            get(list_project_repos).post(create_project_repo),
+        )
+        .route(
+            "/api/mc/projects/{id}/environments",
+            get(list_project_environments).post(create_project_environment),
+        )
         .route("/api/mc/portfolio/summary", get(get_portfolio_summary))
         .route("/api/mc/epics", get(list_epics).post(create_epic))
-        .route("/api/mc/epics/{id}", get(get_epic).patch(update_epic).delete(delete_epic))
+        .route(
+            "/api/mc/epics/{id}",
+            get(get_epic).patch(update_epic).delete(delete_epic),
+        )
         .route("/api/mc/epics/{id}/progress", get(get_epic_progress))
         .route("/api/mc/sprints", get(list_sprints).post(create_sprint))
-        .route("/api/mc/sprints/{id}", get(get_sprint).patch(update_sprint).delete(delete_sprint))
+        .route(
+            "/api/mc/sprints/{id}",
+            get(get_sprint).patch(update_sprint).delete(delete_sprint),
+        )
         .route("/api/mc/sprints/{id}/stats", get(get_sprint_stats))
         .route("/api/mc/sprints/{id}/burndown", get(get_sprint_burndown))
-        .route("/api/mc/task-groups", get(list_task_groups).post(create_task_group))
-        .route("/api/mc/task-groups/{id}", get(get_task_group).patch(update_task_group).delete(delete_task_group))
+        .route(
+            "/api/mc/task-groups",
+            get(list_task_groups).post(create_task_group),
+        )
+        .route(
+            "/api/mc/task-groups/{id}",
+            get(get_task_group)
+                .patch(update_task_group)
+                .delete(delete_task_group),
+        )
         .route("/api/mc/task-groups/{id}/items", get(list_task_group_items))
-        .route("/api/mc/task-groups/{id}/items/{work_item_id}", post(assign_task_group_item))
-        .route("/api/mc/task-groups/{id}/items/{work_item_id}", delete(unassign_task_group_item))
+        .route(
+            "/api/mc/task-groups/{id}/items/{work_item_id}",
+            post(assign_task_group_item),
+        )
+        .route(
+            "/api/mc/task-groups/{id}/items/{work_item_id}",
+            delete(unassign_task_group_item),
+        )
         .with_state(state)
 }
 

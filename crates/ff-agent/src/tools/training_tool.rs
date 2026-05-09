@@ -104,32 +104,35 @@ async fn execute_status() -> AgentToolResult {
         .join(".forgefleet")
         .join("lora_adapters");
     if adapter_dir.exists()
-        && let Ok(mut entries) = tokio::fs::read_dir(&adapter_dir).await {
-            status.push_str("\nExisting adapters:\n");
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                if entry.path().is_dir() {
-                    status.push_str(&format!("  - {}\n", entry.file_name().to_string_lossy()));
-                }
+        && let Ok(mut entries) = tokio::fs::read_dir(&adapter_dir).await
+    {
+        status.push_str("\nExisting adapters:\n");
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            if entry.path().is_dir() {
+                status.push_str(&format!("  - {}\n", entry.file_name().to_string_lossy()));
             }
         }
+    }
 
     // Check if training is currently running
     let log_path = std::path::Path::new("/tmp/forgefleet-lora-training.log");
     if log_path.exists()
         && let Ok(content) = tokio::fs::read_to_string(log_path).await
-            && content.contains("Starting training") && !content.contains("Training complete") {
-                status.push_str("\n⚡ Training is currently in progress!\n");
-                // Show last few lines
-                let lines: Vec<&str> = content.lines().collect();
-                let last = lines
-                    .iter()
-                    .rev()
-                    .take(3)
-                    .rev()
-                    .cloned()
-                    .collect::<Vec<_>>();
-                status.push_str(&format!("Latest: {}\n", last.join(" | ")));
-            }
+        && content.contains("Starting training")
+        && !content.contains("Training complete")
+    {
+        status.push_str("\n⚡ Training is currently in progress!\n");
+        // Show last few lines
+        let lines: Vec<&str> = content.lines().collect();
+        let last = lines
+            .iter()
+            .rev()
+            .take(3)
+            .rev()
+            .cloned()
+            .collect::<Vec<_>>();
+        status.push_str(&format!("Latest: {}\n", last.join(" | ")));
+    }
 
     AgentToolResult::ok(status)
 }

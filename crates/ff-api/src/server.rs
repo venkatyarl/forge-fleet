@@ -115,7 +115,9 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response<Body> {
         let (node, model) = entry.key();
         lines.push(format!(
             "forgefleet_requests_total{{node=\"{}\",model=\"{}\"}} {}",
-            node, model, entry.value()
+            node,
+            model,
+            entry.value()
         ));
     }
 
@@ -124,7 +126,9 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> Response<Body> {
         let (node, model) = entry.key();
         lines.push(format!(
             "forgefleet_request_duration_ms{{node=\"{}\",model=\"{}\"}} {}",
-            node, model, entry.value()
+            node,
+            model,
+            entry.value()
         ));
     }
 

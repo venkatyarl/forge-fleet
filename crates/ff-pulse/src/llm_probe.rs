@@ -206,8 +206,7 @@ impl LlmProbe {
                 {
                     let size_gb = file_size_bytes(&path) as f64 / 1_073_741_824.0;
                     let id = model_id_from_name(
-                        path
-                            .file_stem()
+                        path.file_stem()
                             .and_then(|s| s.to_str())
                             .unwrap_or("unknown"),
                     );

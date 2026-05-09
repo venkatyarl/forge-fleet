@@ -79,7 +79,10 @@ impl DynamicLoader {
         // Check VRAM budget before loading
         let used_vram = self.used_vram().await;
         if used_vram + model.vram_gb > self.vram_budget_gb {
-            info!("VRAM budget exceeded ({} + {} > {}); evicting idle models", used_vram, model.vram_gb, self.vram_budget_gb);
+            info!(
+                "VRAM budget exceeded ({} + {} > {}); evicting idle models",
+                used_vram, model.vram_gb, self.vram_budget_gb
+            );
             self.evict_idle().await;
         }
 
@@ -156,18 +159,25 @@ mod tests {
     #[tokio::test]
     async fn test_dynamic_load_and_evict() {
         let loader = DynamicLoader::new(48.0, 60);
-        loader.register(DynamicModel {
-            id: "qwen3-30b".to_string(),
-            catalog_id: "mlx:qwen3-30b".to_string(),
-            runtime: "mlx".to_string(),
-            vram_gb: 24.0,
-            load_time_ms: 100,
-            last_used: std::time::Instant::now(),
-            load_count: 0,
-        }).await;
+        loader
+            .register(DynamicModel {
+                id: "qwen3-30b".to_string(),
+                catalog_id: "mlx:qwen3-30b".to_string(),
+                runtime: "mlx".to_string(),
+                vram_gb: 24.0,
+                load_time_ms: 100,
+                last_used: std::time::Instant::now(),
+                load_count: 0,
+            })
+            .await;
 
         assert!(loader.request_load("qwen3-30b").await);
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-        assert!(loader.loaded_models().await.contains(&"qwen3-30b".to_string()));
+        assert!(
+            loader
+                .loaded_models()
+                .await
+                .contains(&"qwen3-30b".to_string())
+        );
     }
 }

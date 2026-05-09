@@ -307,9 +307,10 @@ fn build_media_request(
     payload.insert("chat_id".to_string(), json!(outgoing.chat_id));
     payload.insert(media_key.to_string(), json!(media_value));
     if let Some(text) = outgoing.text.as_ref()
-        && !text.is_empty() {
-            payload.insert("caption".to_string(), json!(text));
-        }
+        && !text.is_empty()
+    {
+        payload.insert("caption".to_string(), json!(text));
+    }
     if let Some(id) = outgoing
         .reply_to
         .as_deref()

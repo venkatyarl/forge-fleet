@@ -10,8 +10,8 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
 
 use tracing::{debug, info, warn};
 
@@ -201,95 +201,96 @@ async fn build_endpoint_list(config_path: &Path) -> Vec<RouterEndpoint> {
 
     // --- Remote endpoints from Postgres ---
     if let Ok(toml_str) = std::fs::read_to_string(config_path)
-        && let Ok(config) = toml::from_str::<ff_core::config::FleetConfig>(&toml_str) {
-            let db_url = config.database.url.trim().to_string();
-            if !db_url.is_empty()
-                && let Ok(pool) = sqlx::postgres::PgPoolOptions::new()
-                    .max_connections(1)
-                    .acquire_timeout(Duration::from_secs(3))
-                    .connect(&db_url)
-                    .await
-                {
-                    let nodes = ff_db::pg_list_nodes(&pool).await.unwrap_or_default();
-                    let models = ff_db::pg_list_models(&pool).await.unwrap_or_default();
+        && let Ok(config) = toml::from_str::<ff_core::config::FleetConfig>(&toml_str)
+    {
+        let db_url = config.database.url.trim().to_string();
+        if !db_url.is_empty()
+            && let Ok(pool) = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(1)
+                .acquire_timeout(Duration::from_secs(3))
+                .connect(&db_url)
+                .await
+        {
+            let nodes = ff_db::pg_list_nodes(&pool).await.unwrap_or_default();
+            let models = ff_db::pg_list_models(&pool).await.unwrap_or_default();
 
-                    // Collect (ip, port, cores, supports_tools, label, model_id)
-                    let mut candidates: Vec<(String, u16, i32, bool, String, String)> = Vec::new();
+            // Collect (ip, port, cores, supports_tools, label, model_id)
+            let mut candidates: Vec<(String, u16, i32, bool, String, String)> = Vec::new();
 
-                    for node in &nodes {
-                        // Skip if this is the local node (already covered above)
-                        if is_local_node(&node.ip) {
-                            continue;
-                        }
+            for node in &nodes {
+                // Skip if this is the local node (already covered above)
+                if is_local_node(&node.ip) {
+                    continue;
+                }
 
-                        let node_models: Vec<_> =
-                            models.iter().filter(|m| m.node_name == node.name).collect();
-                        if node_models.is_empty() {
-                            candidates.push((
-                                node.ip.clone(),
-                                55000,
-                                node.cpu_cores,
-                                true, // assume capable if we don't know
-                                node.name.clone(),
-                                "auto".into(),
-                            ));
-                        } else {
-                            for m in node_models {
-                                let fam = m.family.to_lowercase();
-                                let id_lower = m.id.to_lowercase();
-                                let name_lower = m.name.to_lowercase();
-                                let is_gemma4 = fam.contains("gemma")
-                                    && (id_lower.contains("gemma-4")
-                                        || id_lower.contains("gemma4")
-                                        || name_lower.contains("gemma-4")
-                                        || name_lower.contains("gemma4"));
-                                let supports_tools = fam.contains("qwen") || is_gemma4;
-                                candidates.push((
-                                    node.ip.clone(),
-                                    m.port as u16,
-                                    node.cpu_cores,
-                                    supports_tools,
-                                    format!("{}:{}", node.name, m.port),
-                                    m.id.clone(),
-                                ));
-                            }
-                        }
-                    }
-
-                    // Sort: tool-capable first, then by cpu_cores desc
-                    candidates.sort_by(|a, b| b.3.cmp(&a.3).then(b.2.cmp(&a.2)));
-
-                    // Probe reachability (parallel, short timeout)
-                    let probe_futs: Vec<_> = candidates
-                        .iter()
-                        .map(|(ip, port, _, supports_tools, label, model_id)| {
-                            let ip = ip.clone();
-                            let label = label.clone();
-                            let model_id = model_id.clone();
-                            let st = *supports_tools;
-                            let port = *port;
-                            async move {
-                                if tcp_reachable(&ip, port).await {
-                                    Some(RouterEndpoint {
-                                        url: format!("http://{ip}:{port}"),
-                                        model_id,
-                                        label,
-                                        supports_tools: st,
-                                        is_local: false,
-                                    })
-                                } else {
-                                    None
-                                }
-                            }
-                        })
-                        .collect();
-
-                    let results = futures::future::join_all(probe_futs).await;
-                    for ep in results.into_iter().flatten() {
-                        remote.push(ep);
+                let node_models: Vec<_> =
+                    models.iter().filter(|m| m.node_name == node.name).collect();
+                if node_models.is_empty() {
+                    candidates.push((
+                        node.ip.clone(),
+                        55000,
+                        node.cpu_cores,
+                        true, // assume capable if we don't know
+                        node.name.clone(),
+                        "auto".into(),
+                    ));
+                } else {
+                    for m in node_models {
+                        let fam = m.family.to_lowercase();
+                        let id_lower = m.id.to_lowercase();
+                        let name_lower = m.name.to_lowercase();
+                        let is_gemma4 = fam.contains("gemma")
+                            && (id_lower.contains("gemma-4")
+                                || id_lower.contains("gemma4")
+                                || name_lower.contains("gemma-4")
+                                || name_lower.contains("gemma4"));
+                        let supports_tools = fam.contains("qwen") || is_gemma4;
+                        candidates.push((
+                            node.ip.clone(),
+                            m.port as u16,
+                            node.cpu_cores,
+                            supports_tools,
+                            format!("{}:{}", node.name, m.port),
+                            m.id.clone(),
+                        ));
                     }
                 }
+            }
+
+            // Sort: tool-capable first, then by cpu_cores desc
+            candidates.sort_by(|a, b| b.3.cmp(&a.3).then(b.2.cmp(&a.2)));
+
+            // Probe reachability (parallel, short timeout)
+            let probe_futs: Vec<_> = candidates
+                .iter()
+                .map(|(ip, port, _, supports_tools, label, model_id)| {
+                    let ip = ip.clone();
+                    let label = label.clone();
+                    let model_id = model_id.clone();
+                    let st = *supports_tools;
+                    let port = *port;
+                    async move {
+                        if tcp_reachable(&ip, port).await {
+                            Some(RouterEndpoint {
+                                url: format!("http://{ip}:{port}"),
+                                model_id,
+                                label,
+                                supports_tools: st,
+                                is_local: false,
+                            })
+                        } else {
+                            None
+                        }
+                    }
+                })
+                .collect();
+
+            let results = futures::future::join_all(probe_futs).await;
+            for ep in results.into_iter().flatten() {
+                remote.push(ep);
+            }
         }
+    }
 
     // Final order: local tool-capable → local non-tool → remote tool-capable → remote non-tool
     let mut all = local;
@@ -331,10 +332,11 @@ async fn fetch_first_model_id(base_url: &str) -> String {
         .unwrap_or_default();
     if let Ok(resp) = client.get(&url).send().await
         && let Ok(body) = resp.text().await
-            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&body)
-                && let Some(id) = v["data"][0]["id"].as_str() {
-                    return id.to_string();
-                }
+        && let Ok(v) = serde_json::from_str::<serde_json::Value>(&body)
+        && let Some(id) = v["data"][0]["id"].as_str()
+    {
+        return id.to_string();
+    }
     "auto".into()
 }
 
