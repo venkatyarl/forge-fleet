@@ -4,6 +4,7 @@ pub mod agent_loop;
 pub mod agent_roles;
 pub mod auto_upgrade;
 pub mod research;
+pub mod review_pipeline;
 pub mod skill_catalog;
 
 /// Re-export of the panic-hook module that lives in `ff-core`. Keeps
