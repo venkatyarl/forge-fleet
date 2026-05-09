@@ -104,15 +104,6 @@ impl HttpTransport {
             .with_state(self.server.clone())
     }
 
-    /// Start the HTTP server on the given address.
-    pub async fn run(&self, addr: &str) -> anyhow::Result<()> {
-        let listener = tokio::net::TcpListener::bind(addr).await?;
-        info!(addr, "MCP HTTP transport listening");
-
-        axum::serve(listener, self.router()).await?;
-
-        Ok(())
-    }
 }
 
 /// Axum handler for `POST /mcp`.

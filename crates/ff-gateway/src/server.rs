@@ -205,6 +205,47 @@ impl GatewayState {
             self.web_clients.remove(&key);
         }
     }
+
+    /// Prune oldest agent sessions when the map exceeds `max` entries.
+    pub fn prune_agent_sessions(&self, max: usize) {
+        while self.agent_sessions.len() > max {
+            let oldest = self
+                .agent_sessions
+                .iter()
+                .min_by_key(|e| e.value().created_at);
+            if let Some(entry) = oldest {
+                let id = *entry.key();
+                drop(entry);
+                self.agent_sessions.remove(&id);
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Prune oldest inbound/outbound messages when maps exceed `max` entries each.
+    pub fn prune_messages(&self, max: usize) {
+        while self.inbound_messages.len() > max {
+            let oldest = self.inbound_messages.iter().next();
+            if let Some(entry) = oldest {
+                let id = *entry.key();
+                drop(entry);
+                self.inbound_messages.remove(&id);
+            } else {
+                break;
+            }
+        }
+        while self.outbound_messages.len() > max {
+            let oldest = self.outbound_messages.iter().next();
+            if let Some(entry) = oldest {
+                let id = *entry.key();
+                drop(entry);
+                self.outbound_messages.remove(&id);
+            } else {
+                break;
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -783,7 +824,7 @@ async fn well_known_forgefleet(State(state): State<Arc<GatewayState>>) -> Json<V
             "self_enroll":  "/api/fleet/self-enroll",
             "openai_chat":  "/v1/chat/completions",
             "openai_models":"/v1/models",
-            "mcp":          "http://{host}:50001/mcp",
+            "mcp":          "http://{host}:{port}/mcp",
             "websocket":    "/ws",
             "metrics":      "/metrics"
         },
@@ -6084,6 +6125,7 @@ async fn process_incoming_message(
     incoming: IncomingMessage,
 ) -> InboundAcceptedResponse {
     let route = state.router.route(&incoming);
+    state.prune_messages(10_000);
     state.inbound_messages.insert(incoming.id, incoming.clone());
 
     state.broadcast_json(json!({
@@ -6187,6 +6229,7 @@ async fn create_agent_session(
         status: Arc::new(std::sync::atomic::AtomicU8::new(0)),
     };
 
+    state.prune_agent_sessions(100);
     state.agent_sessions.insert(session_id, handle.clone());
 
     // Spawn the agent loop in a background task

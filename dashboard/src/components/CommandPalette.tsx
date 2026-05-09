@@ -13,9 +13,8 @@ type CommandItem = {
 const COMMANDS: CommandItem[] = [
   // Mission Control
   { id: 'home', label: 'Mission Control', category: 'Navigate', path: '/', shortcut: 'G H' },
-  // Chats
-  { id: 'chat', label: 'New Chat', category: 'Chats', path: '/chat', shortcut: 'G C' },
-  { id: 'chats', label: 'Chat History', category: 'Chats', path: '/chats' },
+  // Brain (consolidated chats)
+  { id: 'brain', label: 'Brain / Chat', category: 'Brain', path: '/brain', shortcut: 'G C' },
   // Project Management
   { id: 'tasks', label: 'My Tasks', category: 'Projects', path: '/my-tasks' },
   { id: 'projects', label: 'Projects', category: 'Projects', path: '/projects', shortcut: 'G P' },
@@ -35,7 +34,7 @@ const COMMANDS: CommandItem[] = [
   { id: 'audit', label: 'Audit Log', category: 'Admin', path: '/audit' },
   { id: 'updates', label: 'Updates', category: 'Admin', path: '/updates' },
   // Actions
-  { id: 'new-chat', label: 'Start New Chat', category: 'Action', path: '/chat' },
+  { id: 'new-chat', label: 'Start New Chat', category: 'Action', path: '/brain' },
   { id: 'fleet-health', label: 'Check Fleet Health', category: 'Action', path: '/fleet' },
   { id: 'refresh', label: 'Refresh Page', category: 'Action', action: () => window.location.reload() },
 ]

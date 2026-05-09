@@ -79,8 +79,29 @@ pub async fn receive_webhook(
 }
 
 pub async fn webhook_http_handler(
+    headers: axum::http::HeaderMap,
     Json(payload): Json<Value>,
 ) -> Result<Json<WebhookAcceptedResponse>, (StatusCode, Json<Value>)> {
+    // Generic webhook auth: require X-Webhook-Secret when FF_WEBHOOK_SECRET is configured.
+    let expected = std::env::var("FF_WEBHOOK_SECRET").unwrap_or_default();
+    if !expected.is_empty() {
+        let provided = headers
+            .get("x-webhook-secret")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if provided != expected {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                Json(json!({
+                    "error": {
+                        "message": "invalid or missing webhook secret",
+                        "type": "unauthorized"
+                    }
+                })),
+            ));
+        }
+    }
+
     match receive_webhook(payload, None).await {
         Ok(response) => Ok(Json(response)),
         Err(error) => Err((
