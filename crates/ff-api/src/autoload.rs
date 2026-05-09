@@ -64,13 +64,12 @@ pub async fn ensure_deployed(pool: &PgPool, catalog_id: &str) -> Result<String, 
             Some(url) => return Ok(url),
             None => {
                 // Not yet healthy — record the latest status for diagnostics.
-                if let Ok(deps) = pg_list_deployments(pool, Some(&node_name)).await {
-                    if let Some(d) = deps
+                if let Ok(deps) = pg_list_deployments(pool, Some(&node_name)).await
+                    && let Some(d) = deps
                         .iter()
                         .find(|d| d.catalog_id.as_deref() == Some(catalog_id))
-                    {
-                        last_status = d.health_status.clone();
-                    }
+                {
+                    last_status = d.health_status.clone();
                 }
             }
         }
@@ -122,10 +121,10 @@ async fn resolve_this_node_name(pool: &PgPool) -> String {
             }
             if let Some(alt) = n.alt_ips.as_array() {
                 for v in alt {
-                    if let Some(s) = v.as_str() {
-                        if local_ips.contains(&s.to_string()) {
-                            return n.name.clone();
-                        }
+                    if let Some(s) = v.as_str()
+                        && local_ips.contains(&s.to_string())
+                    {
+                        return n.name.clone();
                     }
                 }
             }
@@ -153,12 +152,11 @@ fn local_ipv4_addrs() -> Vec<String> {
     let mut ips = Vec::new();
     for line in text.lines() {
         let line = line.trim();
-        if let Some(rest) = line.strip_prefix("inet ") {
-            if let Some(ip) = rest.split_whitespace().next() {
-                if !ip.starts_with("127.") {
-                    ips.push(ip.to_string());
-                }
-            }
+        if let Some(rest) = line.strip_prefix("inet ")
+            && let Some(ip) = rest.split_whitespace().next()
+            && !ip.starts_with("127.")
+        {
+            ips.push(ip.to_string());
         }
     }
     ips

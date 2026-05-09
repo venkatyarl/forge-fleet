@@ -92,7 +92,7 @@ impl FleetNode {
 
     /// Returns `true` if the node is considered healthy (Healthy or Degraded).
     pub fn is_healthy(&self) -> bool {
-        self.health.as_ref().map_or(false, |h| {
+        self.health.as_ref().is_some_and(|h| {
             matches!(h.status, HealthStatus::Healthy | HealthStatus::Degraded)
         })
     }
@@ -101,7 +101,7 @@ impl FleetNode {
     pub fn is_online(&self) -> bool {
         self.health
             .as_ref()
-            .map_or(false, |h| matches!(h.status, HealthStatus::Healthy))
+            .is_some_and(|h| matches!(h.status, HealthStatus::Healthy))
     }
 
     /// Returns `true` if last_seen is older than `stale_after_secs`.
@@ -436,10 +436,8 @@ impl NodeRegistry {
                 }
 
                 // Only report if the node was previously healthy.
-                if was_healthy {
-                    if let Some(ref name) = node.config_name {
-                        stale_names.push(name.clone());
-                    }
+                if was_healthy && let Some(ref name) = node.config_name {
+                    stale_names.push(name.clone());
                 }
             }
         }

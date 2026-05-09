@@ -61,25 +61,22 @@ pub fn parse_text_tool_calls(text: &str) -> Vec<ToolCall> {
     // Second try: raw JSON object with "name" and "arguments" fields
     // This handles the case where llama.cpp returns the tool call as plain text content
     let trimmed = text.trim();
-    if trimmed.starts_with('{') && trimmed.ends_with('}') {
-        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(trimmed) {
-            if let Some(call) = try_parse_single_tool_call(&parsed, calls.len()) {
+    if trimmed.starts_with('{') && trimmed.ends_with('}')
+        && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(trimmed)
+            && let Some(call) = try_parse_single_tool_call(&parsed, calls.len()) {
                 calls.push(call);
                 return calls;
             }
-        }
-    }
 
     // Third try: JSON array of tool calls
-    if trimmed.starts_with('[') && trimmed.ends_with(']') {
-        if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(trimmed) {
+    if trimmed.starts_with('[') && trimmed.ends_with(']')
+        && let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(trimmed) {
             for item in &arr {
                 if let Some(call) = try_parse_single_tool_call(item, calls.len()) {
                     calls.push(call);
                 }
             }
         }
-    }
 
     calls
 }
@@ -92,11 +89,10 @@ fn parse_tagged_tool_calls(text: &str) -> Vec<ToolCall> {
         let start = search_from + start + "<tool_call>".len();
         if let Some(end) = text[start..].find("</tool_call>") {
             let json_str = text[start..start + end].trim();
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) {
-                if let Some(call) = try_parse_single_tool_call(&parsed, calls.len()) {
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str)
+                && let Some(call) = try_parse_single_tool_call(&parsed, calls.len()) {
                     calls.push(call);
                 }
-            }
             search_from = start + end + "</tool_call>".len();
         } else {
             break;

@@ -111,10 +111,7 @@ impl LocalHealer {
     /// sufficient proof that the gateway bound its listener.
     async fn gateway_port_listening(&self) -> bool {
         let target = format!("127.0.0.1:{GATEWAY_PORT}");
-        match tokio::time::timeout(PORT_PROBE_TIMEOUT, TcpStream::connect(&target)).await {
-            Ok(Ok(_stream)) => true,
-            _ => false,
-        }
+        matches!(tokio::time::timeout(PORT_PROBE_TIMEOUT, TcpStream::connect(&target)).await, Ok(Ok(_stream)))
     }
 
     /// Platform-specific restart. macOS uses launchctl kickstart so the

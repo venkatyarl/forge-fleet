@@ -72,21 +72,21 @@ fn probe_sync() -> DockerStatus {
     let mut stats_by_name: BTreeMap<String, (f64, f64, f64)> = BTreeMap::new();
     let mut total_cpu_pct = 0.0f64;
     let mut total_memory_mb = 0.0f64;
-    if let Ok(out) = stats_out {
-        if out.status.success() {
-            let text = String::from_utf8_lossy(&out.stdout);
-            for line in text.lines() {
-                let parts: Vec<&str> = line.split('\t').collect();
-                if parts.len() < 3 {
-                    continue;
-                }
-                let name = parts[0].trim().to_string();
-                let cpu_pct = parse_percent(parts[1]);
-                let (mem_mb, limit_mb) = parse_mem_usage(parts[2]);
-                total_cpu_pct += cpu_pct;
-                total_memory_mb += mem_mb;
-                stats_by_name.insert(name, (cpu_pct, mem_mb, limit_mb));
+    if let Ok(out) = stats_out
+        && out.status.success()
+    {
+        let text = String::from_utf8_lossy(&out.stdout);
+        for line in text.lines() {
+            let parts: Vec<&str> = line.split('\t').collect();
+            if parts.len() < 3 {
+                continue;
             }
+            let name = parts[0].trim().to_string();
+            let cpu_pct = parse_percent(parts[1]);
+            let (mem_mb, limit_mb) = parse_mem_usage(parts[2]);
+            total_cpu_pct += cpu_pct;
+            total_memory_mb += mem_mb;
+            stats_by_name.insert(name, (cpu_pct, mem_mb, limit_mb));
         }
     }
 

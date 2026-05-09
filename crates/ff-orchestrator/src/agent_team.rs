@@ -19,7 +19,7 @@ use crate::crew::AgentRole;
 // ─── Model Preference ────────────────────────────────────────────────────────
 
 /// How an agent assignment specifies which model to use.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ModelPreference {
     /// Use any model in this tier.
@@ -27,6 +27,7 @@ pub enum ModelPreference {
     /// Use a specific model by name (e.g. "qwen3-72b-q4").
     Specific { model_id: String },
     /// Let the router decide (default).
+    #[default]
     Auto,
 }
 
@@ -54,12 +55,6 @@ impl ModelPreference {
             Self::Tier { tier } => Some(*tier),
             _ => None,
         }
-    }
-}
-
-impl Default for ModelPreference {
-    fn default() -> Self {
-        Self::Auto
     }
 }
 

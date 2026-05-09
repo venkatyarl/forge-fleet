@@ -35,8 +35,7 @@ impl AgentTool for SleepTool {
             .get("seconds")
             .and_then(Value::as_f64)
             .unwrap_or(1.0)
-            .min(300.0)
-            .max(0.0);
+            .clamp(0.0, 300.0);
 
         tokio::time::sleep(std::time::Duration::from_secs_f64(seconds)).await;
         AgentToolResult::ok(format!("Slept for {seconds:.1} seconds"))

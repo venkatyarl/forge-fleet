@@ -10,8 +10,10 @@ use serde::{Deserialize, Serialize};
 /// Permission mode for the agent session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum PermissionMode {
     /// Default: read-only tools auto-allowed, write/execute tools ask.
+    #[default]
     Default,
     /// Accept all edits automatically (no prompts for file changes).
     AcceptEdits,
@@ -21,11 +23,6 @@ pub enum PermissionMode {
     Plan,
 }
 
-impl Default for PermissionMode {
-    fn default() -> Self {
-        Self::Default
-    }
-}
 
 /// Permission level for a tool operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -78,8 +75,8 @@ const BLOCKED_PATHS: &[&str] = &[
 pub fn is_blocked_path(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     BLOCKED_PATHS.iter().any(|pattern| {
-        if pattern.starts_with('*') {
-            lower.ends_with(&pattern[1..])
+        if let Some(rest) = pattern.strip_prefix('*') {
+            lower.ends_with(rest)
         } else {
             lower.ends_with(pattern) || lower.contains(&format!("/{pattern}"))
         }
@@ -139,9 +136,7 @@ pub fn check_permission(
         }
         PermissionMode::AcceptEdits => {
             // Accept edits: allow up to Write, ask for Execute+
-            if level <= PermissionLevel::Write {
-                PermissionDecision::Allow
-            } else if level == PermissionLevel::Execute {
+            if level <= PermissionLevel::Write || level == PermissionLevel::Execute {
                 PermissionDecision::Allow // auto-accept bash too in this mode
             } else {
                 PermissionDecision::Ask

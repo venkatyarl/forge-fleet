@@ -65,14 +65,12 @@ async fn get_cluster_id() -> String {
         .output()
         .await;
 
-    if let Ok(out) = output {
-        if let Ok(stdout) = String::from_utf8(out.stdout) {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&stdout) {
-                if let Some(id) = json.get("cluster_id").and_then(|v| v.as_str()) {
-                    return id.to_string();
-                }
-            }
-        }
+    if let Ok(out) = output
+        && let Ok(stdout) = String::from_utf8(out.stdout)
+        && let Ok(json) = serde_json::from_str::<serde_json::Value>(&stdout)
+        && let Some(id) = json.get("cluster_id").and_then(|v| v.as_str())
+    {
+        return id.to_string();
     }
 
     // Fallback: local-ray-{hostname}. Run `hostname` directly since the

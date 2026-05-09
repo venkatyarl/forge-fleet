@@ -201,22 +201,21 @@ impl LlmProbe {
             let path = entry.path();
             if !path.is_dir() {
                 // Support top-level single-file GGUFs as well.
-                if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                    if ext == "gguf" {
-                        let size_gb = file_size_bytes(&path) as f64 / 1_073_741_824.0;
-                        let id = model_id_from_name(
-                            &path
-                                .file_stem()
-                                .and_then(|s| s.to_str())
-                                .unwrap_or("unknown")
-                                .to_string(),
-                        );
-                        out.push(AvailableModel {
-                            id,
-                            size_gb,
-                            runtime_compat: vec!["llama.cpp".into(), "ollama".into()],
-                        });
-                    }
+                if let Some(ext) = path.extension().and_then(|e| e.to_str())
+                    && ext == "gguf"
+                {
+                    let size_gb = file_size_bytes(&path) as f64 / 1_073_741_824.0;
+                    let id = model_id_from_name(
+                        path
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("unknown"),
+                    );
+                    out.push(AvailableModel {
+                        id,
+                        size_gb,
+                        runtime_compat: vec!["llama.cpp".into(), "ollama".into()],
+                    });
                 }
                 continue;
             }

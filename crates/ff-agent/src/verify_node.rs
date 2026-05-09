@@ -230,12 +230,10 @@ pub async fn verify_node(pool: &PgPool, node_name: &str) -> Result<VerifyReport,
                 let mut final_status = None;
                 while std::time::Instant::now() < deadline {
                     if let Ok(Some(row)) = ff_db::pg_get_deferred(pool, &tid).await
-                    {
-                        if row.status == "completed" || row.status == "failed" {
+                        && (row.status == "completed" || row.status == "failed") {
                             final_status = Some(row.status);
                             break;
                         }
-                    }
                     tokio::time::sleep(Duration::from_millis(1500)).await;
                 }
                 match final_status.as_deref() {

@@ -165,13 +165,12 @@ async fn rewrite_fleet_ssh(command: &str) -> String {
         if parts.len() == 2 {
             let target = parts[1];
             // Check if target is a fleet node name (no @ sign, no IP)
-            if !target.contains('@') && !target.contains('.') {
-                if let Some((ip, user)) = fleet_node_ip(target).await {
+            if !target.contains('@') && !target.contains('.')
+                && let Some((ip, user)) = fleet_node_ip(target).await {
                     return format!(
                         "ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no {user}@{ip} 'echo \"=== {target} ({ip}) ===\"  && hostname && echo \"---\" && uptime && echo \"---\" && uname -sr && echo \"---\" && free -h 2>/dev/null || sysctl -n hw.memsize 2>/dev/null && echo \"---\" && df -h / && echo \"---\" && echo \"Running processes:\" && ps aux --sort=-%cpu 2>/dev/null | head -6 || ps aux | head -6'"
                     );
                 }
-            }
         }
     }
 
@@ -255,6 +254,7 @@ fn is_blocked_command(command: &str) -> bool {
     blocked.iter().any(|b| lower.contains(b))
 }
 
+#[allow(dead_code)]
 fn shell_quote(input: &str) -> String {
     if input.is_empty() {
         return "''".to_string();

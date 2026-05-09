@@ -56,8 +56,8 @@ impl AgentTool for ModelDiscoveryTool {
                     "https://huggingface.co/api/models?search={}&sort=trending&direction=-1&limit=5&filter=text-generation",
                     urlenc(query)
                 );
-                if let Ok(resp) = client.get(&hf_url).send().await {
-                    if let Ok(models) = resp.json::<Vec<Value>>().await {
+                if let Ok(resp) = client.get(&hf_url).send().await
+                    && let Ok(models) = resp.json::<Vec<Value>>().await {
                         results.push("## HuggingFace".into());
                         for m in models.iter().take(5) {
                             let id = m.get("id").and_then(Value::as_str).unwrap_or("?");
@@ -65,22 +65,20 @@ impl AgentTool for ModelDiscoveryTool {
                             results.push(format!("  - {id} ({} downloads)", fmt_num(downloads)));
                         }
                     }
-                }
 
                 // 2. Ollama search
                 let ollama_search = Command::new("ollama")
                     .args(["search", query])
                     .output()
                     .await;
-                if let Ok(out) = ollama_search {
-                    if out.status.success() {
+                if let Ok(out) = ollama_search
+                    && out.status.success() {
                         let stdout = String::from_utf8_lossy(&out.stdout);
                         results.push("## Ollama".into());
                         for line in stdout.lines().take(6) {
                             results.push(format!("  {line}"));
                         }
                     }
-                }
 
                 // 3. Web search for independent models
                 results.push("## Other Sources".into());
@@ -495,10 +493,10 @@ impl AgentTool for ClusterInferenceTool {
                         plan.push_str("## llama.cpp RPC Setup\n\n");
                         plan.push_str(&format!("Controller: {} (runs llama-server)\n", nodes[0]));
                         plan.push_str("Workers:\n");
-                        for (_i, node) in nodes.iter().skip(1).enumerate() {
+                        for node in nodes.iter().skip(1) {
                             plan.push_str(&format!("  {}: rpc-server on port 50052\n", node));
                         }
-                        plan.push_str(&format!("\nCommands:\n"));
+                        plan.push_str("\nCommands:\n");
                         for node in nodes.iter().skip(1) {
                             plan.push_str(&format!("  ssh root@{node} 'rpc-server --host 0.0.0.0 --port 50052' &\n"));
                         }

@@ -97,13 +97,11 @@ pub async fn fetch_latest(keys: &[&str]) -> BTreeMap<String, String> {
             };
             (key, val)
         });
-        if futs.len() >= 4 {
-            if let Some((k, v)) = futs.next().await {
-                if let Some(v) = v {
+        if futs.len() >= 4
+            && let Some((k, v)) = futs.next().await
+                && let Some(v) = v {
                     return_also(&k, &v);
                 }
-            }
-        }
     }
     let mut out = BTreeMap::new();
     while let Some((k, v)) = futs.next().await {
@@ -132,11 +130,10 @@ pub async fn version_check_pass(pool: &PgPool) -> Result<DriftSummary, String> {
     for (k, cur) in &current {
         total += 1;
         let lat = latest.get(k).cloned();
-        if let Some(ref l) = lat {
-            if !versions_equivalent(cur, l) {
+        if let Some(ref l) = lat
+            && !versions_equivalent(cur, l) {
                 drifted.push(k.clone());
             }
-        }
         let mut entry = serde_json::Map::new();
         entry.insert("current".into(), serde_json::Value::String(cur.clone()));
         entry.insert(

@@ -209,8 +209,8 @@ fn parse_skill_md(content: &str, dir: &Path) -> anyhow::Result<PluginManifest> {
     let tools = Vec::new();
 
     for line in content.lines() {
-        if line.starts_with("# ") {
-            name = line[2..].trim().to_string();
+        if let Some(rest) = line.strip_prefix("# ") {
+            name = rest.trim().to_string();
         } else if description.is_empty() && !line.starts_with('#') && !line.trim().is_empty() {
             description = line.trim().to_string();
         }

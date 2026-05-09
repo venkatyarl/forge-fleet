@@ -115,7 +115,7 @@ impl CronPersistence {
                 let name = job.name.clone();
                 let schedule = job.schedule_expression.clone();
                 let task_kind = task_kind.to_string();
-                let payload = payload;
+
                 let enabled = job.enabled;
                 let node_affinity = job.ownership.owner_node.clone();
                 let created_at = to_rfc3339(job.created_at);

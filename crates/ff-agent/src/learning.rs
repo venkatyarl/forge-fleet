@@ -298,12 +298,12 @@ fn extract_sentence_around(text: &str, signal: &str) -> String {
     if let Some(pos) = lower.find(signal) {
         // Find sentence boundaries
         let start = text[..pos]
-            .rfind(|c: char| c == '.' || c == '\n' || c == '!' || c == '?')
+            .rfind(['.', '\n', '!', '?'])
             .map(|p| p + 1)
             .unwrap_or(0);
         let after = &text[pos..];
         let end = after
-            .find(|c: char| c == '.' || c == '\n' || c == '!' || c == '?')
+            .find(['.', '\n', '!', '?'])
             .map(|p| pos + p + 1)
             .unwrap_or_else(|| text.len().min(pos + 200));
 
@@ -348,13 +348,12 @@ fn route_candidate(candidate: &LearningCandidate, brain_ctx: &BrainContext) -> L
     }
 
     // Project-specific content → Project Memory
-    if candidate.is_project_specific {
-        if let Some(root) = &brain_ctx.project_root {
+    if candidate.is_project_specific
+        && let Some(root) = &brain_ctx.project_root {
             return LearningSink::ProjectMemory {
                 project_root: root.clone(),
             };
         }
-    }
 
     // Preferences and tool patterns → Fleet Brain (personal)
     if matches!(
@@ -365,13 +364,12 @@ fn route_candidate(candidate: &LearningCandidate, brain_ctx: &BrainContext) -> L
     }
 
     // Decisions in a project context → Project Memory
-    if matches!(candidate.category, MemoryCategory::Decision) {
-        if let Some(root) = &brain_ctx.project_root {
+    if matches!(candidate.category, MemoryCategory::Decision)
+        && let Some(root) = &brain_ctx.project_root {
             return LearningSink::ProjectMemory {
                 project_root: root.clone(),
             };
         }
-    }
 
     // Default → Fleet Brain
     LearningSink::FleetBrain

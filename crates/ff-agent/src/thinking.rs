@@ -8,20 +8,17 @@ use serde::{Deserialize, Serialize};
 /// Thinking mode configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ThinkingMode {
     /// No thinking blocks.
     Off,
     /// Always include thinking.
     On,
     /// Adaptively enable thinking based on task complexity.
+    #[default]
     Adaptive,
 }
 
-impl Default for ThinkingMode {
-    fn default() -> Self {
-        Self::Adaptive
-    }
-}
 
 /// Thinking configuration for a session.
 #[derive(Debug, Clone, Serialize, Deserialize)]

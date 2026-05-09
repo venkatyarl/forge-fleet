@@ -294,11 +294,10 @@ async fn fetch_github_latest(
     let mut req = http
         .get(&url)
         .header("Accept", "application/vnd.github+json");
-    if let Some(t) = token {
-        if !t.is_empty() {
+    if let Some(t) = token
+        && !t.is_empty() {
             req = req.header("Authorization", format!("Bearer {t}"));
         }
-    }
     let resp = req.send().await.map_err(|e| format!("GET {url}: {e}"))?;
     if !resp.status().is_success() {
         return Err(format!("GET {url}: HTTP {}", resp.status()));
@@ -359,8 +358,8 @@ async fn fetch_pip_latest(http: &reqwest::Client, package: &str) -> Result<Strin
 }
 
 fn strip_v_prefix(tag: &str) -> &str {
-    if let Some(rest) = tag.strip_prefix('v') {
-        if rest
+    if let Some(rest) = tag.strip_prefix('v')
+        && rest
             .chars()
             .next()
             .map(|c| c.is_ascii_digit())
@@ -368,7 +367,6 @@ fn strip_v_prefix(tag: &str) -> &str {
         {
             return rest;
         }
-    }
     tag
 }
 

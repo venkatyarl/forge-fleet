@@ -77,6 +77,7 @@ pub async fn select_context(
 
     // 2. Text search on vault nodes (ILIKE proxy for BM25)
     let search_pattern = format!("%{query}%");
+    #[allow(clippy::type_complexity)]
     let node_rows: Vec<(
         String,
         String,
@@ -163,6 +164,7 @@ pub async fn select_context(
     let top_paths: Vec<String> = candidates.iter().take(5).map(|n| n.path.clone()).collect();
 
     for source_path in &top_paths {
+        #[allow(clippy::type_complexity)]
         let neighbor_rows: Vec<(String, String, String, Option<String>, Option<i32>)> =
             sqlx::query_as(
                 r#"

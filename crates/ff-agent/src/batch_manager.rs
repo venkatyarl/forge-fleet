@@ -566,6 +566,7 @@ pub fn spawn_completion_watcher(
 /// Enqueue a decomposed task whose payload contains a list of work items.
 /// The task runner will claim it, call `create_work_items()`, and then
 /// the work-item processor + completion watcher handle the rest.
+#[allow(clippy::too_many_arguments)]
 pub async fn pg_enqueue_decomposed_task(
     pg: &PgPool,
     summary: &str,

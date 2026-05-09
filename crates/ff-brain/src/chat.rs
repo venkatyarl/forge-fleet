@@ -190,6 +190,7 @@ pub async fn create_thread(
 }
 
 /// List threads for a user.
+#[allow(clippy::type_complexity)]
 pub async fn list_threads(pool: &PgPool, user_id: Uuid) -> Result<Vec<ThreadSummary>, String> {
     let rows: Vec<(
         Uuid,

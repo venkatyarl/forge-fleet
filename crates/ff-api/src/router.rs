@@ -188,10 +188,10 @@ impl TierRouter {
         }
 
         // Cooldown recovery: if enough time has passed, consider it eligible
-        if let Some(last_failure) = health.last_failure {
-            if last_failure.elapsed() >= self.config.health_cooldown {
-                return true;
-            }
+        if let Some(last_failure) = health.last_failure
+            && last_failure.elapsed() >= self.config.health_cooldown
+        {
+            return true;
         }
 
         false
@@ -292,7 +292,7 @@ impl TierRouter {
         self.health.get(backend_id).map(|h| {
             let effectively_healthy = h.healthy
                 || h.last_failure
-                    .map_or(false, |t| t.elapsed() >= self.config.health_cooldown);
+                    .is_some_and(|t| t.elapsed() >= self.config.health_cooldown);
             BackendHealthInfo {
                 backend_id: backend_id.to_string(),
                 healthy: effectively_healthy,

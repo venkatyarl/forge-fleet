@@ -375,8 +375,8 @@ impl AgentSession {
     ) -> AgentOutcome {
         // Re-apply output-style directive to the system prompt on every run,
         // so `/output-style` changes take effect on the NEXT request.
-        if let Some(sys_msg) = self.messages.first_mut() {
-            if let Some(current) = sys_msg.text_content().map(String::from) {
+        if let Some(sys_msg) = self.messages.first_mut()
+            && let Some(current) = sys_msg.text_content().map(String::from) {
                 // Strip any previously-applied directive (marker-bounded).
                 const START: &str = "\n\n<!--ff:output_style-->";
                 const END: &str = "<!--/ff:output_style-->";
@@ -400,19 +400,16 @@ impl AgentSession {
                 };
                 *sys_msg = ToolChatMessage::system(new_prompt);
             }
-        }
 
         // Load three-brain memory and inject into system prompt (first turn only)
         if self.turn_count == 0 {
             let brain_ctx = crate::brain::BrainLoader::load_for_dir(&self.config.working_dir).await;
             let injection = crate::brain::BrainLoader::build_injection(&brain_ctx, 3000);
-            if !injection.is_empty() {
-                if let Some(sys_msg) = self.messages.first_mut() {
-                    if let Some(current) = sys_msg.text_content().map(String::from) {
+            if !injection.is_empty()
+                && let Some(sys_msg) = self.messages.first_mut()
+                    && let Some(current) = sys_msg.text_content().map(String::from) {
                         *sys_msg = ToolChatMessage::system(format!("{current}{injection}"));
                     }
-                }
-            }
         }
 
         // Inject Focus Stack + Backlog context as a system reminder
@@ -459,8 +456,8 @@ impl AgentSession {
         let outcome = run_agent_loop(self, &http_client, event_tx).await;
 
         // Auto-save session
-        if self.config.auto_save {
-            if let Err(e) = session_store::save_session(
+        if self.config.auto_save
+            && let Err(e) = session_store::save_session(
                 &self.id.to_string(),
                 &self.config.model,
                 &self.config.llm_base_url,
@@ -472,7 +469,6 @@ impl AgentSession {
             {
                 warn!(error = %e, "failed to auto-save session");
             }
-        }
 
         // Auto-collect training data for future LoRA fine-tuning
         if self.config.auto_save {
@@ -529,7 +525,7 @@ impl AgentSession {
             }
 
             // Apply relevance decay periodically (roughly every 10 sessions)
-            if self.turn_count % 10 == 0 {
+            if self.turn_count.is_multiple_of(10) {
                 crate::learning::decay_all_brains(&brain_ctx).await;
             }
         }
@@ -946,8 +942,8 @@ async fn run_agent_loop(
         let mut tool_calls = openai_bridge::extract_tool_calls(&assistant_msg);
 
         // Text-mode fallback parsing
-        if tool_calls.is_empty() {
-            if let Some(text) = assistant_msg.text_content() {
+        if tool_calls.is_empty()
+            && let Some(text) = assistant_msg.text_content() {
                 let text_calls = openai_bridge::parse_text_tool_calls(text);
                 if !text_calls.is_empty() {
                     debug!(
@@ -957,7 +953,6 @@ async fn run_agent_loop(
                     tool_calls = text_calls;
                 }
             }
-        }
 
         if tool_calls.is_empty() {
             // No tool calls — agent is done

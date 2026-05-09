@@ -201,12 +201,12 @@ pub async fn download_repo(
         }
 
         // Resume: skip if already complete (and verified when possible).
-        if file.size > 0 {
-            if let Ok(meta) = tokio::fs::metadata(&dest_path).await {
-                if meta.is_file() && meta.len() == file.size {
+        if file.size > 0
+            && let Ok(meta) = tokio::fs::metadata(&dest_path).await
+                && meta.is_file() && meta.len() == file.size {
                     let mut accept = true;
-                    if !opts.skip_verify {
-                        if let Some(expected) = file.expected_sha256() {
+                    if !opts.skip_verify
+                        && let Some(expected) = file.expected_sha256() {
                             let path_for_hash = dest_path.clone();
                             let expected_owned = expected.to_string();
                             let ok = tokio::task::spawn_blocking(move || {
@@ -220,7 +220,6 @@ pub async fn download_repo(
                                 accept = false;
                             }
                         }
-                    }
                     if accept {
                         progress(DownloadProgress {
                             file: file.path.clone(),
@@ -232,8 +231,6 @@ pub async fn download_repo(
                         continue;
                     }
                 }
-            }
-        }
 
         let url = format!(
             "https://huggingface.co/{}/resolve/{}/{}",
@@ -329,8 +326,8 @@ pub async fn download_repo(
         }
 
         // 5. Verify sha256 for LFS files (absent sha256 => skip silently).
-        if !opts.skip_verify {
-            if let Some(expected) = file.expected_sha256() {
+        if !opts.skip_verify
+            && let Some(expected) = file.expected_sha256() {
                 let path_for_hash = dest_path.clone();
                 let expected_owned = expected.to_string();
                 let ok = tokio::task::spawn_blocking(move || {
@@ -346,7 +343,6 @@ pub async fn download_repo(
                     ));
                 }
             }
-        }
 
         downloaded.push(dest_path);
     }
@@ -373,13 +369,11 @@ fn glob_match(pattern: &str, text: &str) -> bool {
     if glob_match_inner(pattern, text) {
         return true;
     }
-    if !pattern.contains('/') {
-        if let Some(base) = text.rsplit('/').next() {
-            if glob_match_inner(pattern, base) {
+    if !pattern.contains('/')
+        && let Some(base) = text.rsplit('/').next()
+            && glob_match_inner(pattern, base) {
                 return true;
             }
-        }
-    }
     false
 }
 

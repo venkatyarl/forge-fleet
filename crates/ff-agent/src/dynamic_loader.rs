@@ -107,7 +107,7 @@ impl DynamicLoader {
 
     /// Evict idle models to free VRAM.
     pub async fn evict_idle(&self) {
-        let mut models = self.models.write().await;
+        let models = self.models.write().await;
         let mut states = self.states.write().await;
         let now = std::time::Instant::now();
         let threshold = std::time::Duration::from_secs(self.eviction_idle_secs);

@@ -306,8 +306,9 @@ impl BrainStateClient {
             .await
             .map_err(|e| format!("zrange: {e}"))?;
         for raw in &all {
-            if let Ok(bi) = serde_json::from_str::<BacklogItem>(raw) {
-                if bi.id == item_id {
+            if let Ok(bi) = serde_json::from_str::<BacklogItem>(raw)
+                && bi.id == item_id
+            {
                     let _: () = self
                         .redis
                         .zrem(&key, raw)
@@ -328,7 +329,6 @@ impl BrainStateClient {
                         .await
                         .map_err(|e| format!("publish: {e}"))?;
                     return Ok(true);
-                }
             }
         }
         Ok(false)

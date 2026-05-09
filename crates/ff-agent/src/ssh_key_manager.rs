@@ -175,8 +175,8 @@ impl SshKeyManager {
         }
 
         // 3. Mark computer_trust edges as revoked (both directions).
-        if let Ok(rev_id) = lookup_computer_id(&self.pg, computer_name).await {
-            if let Some(rev_id) = rev_id {
+        if let Ok(rev_id) = lookup_computer_id(&self.pg, computer_name).await
+            && let Some(rev_id) = rev_id {
                 let _ = sqlx::query(
                     "UPDATE computer_trust SET revoked_at = NOW(), revoked_by = $1
                       WHERE (source_computer_id = $2 OR target_computer_id = $2)
@@ -187,7 +187,6 @@ impl SshKeyManager {
                 .execute(&self.pg)
                 .await;
             }
-        }
 
         info!(
             revoked = %computer_name,
@@ -223,20 +222,16 @@ impl SshKeyManager {
         &self,
         target: &str,
         primary_ip: Option<&str>,
-        os_family: &str,
+        _os_family: &str,
         _public_key: &str,
         fingerprint: &str,
     ) -> Result<String, SshError> {
         // Escape the fingerprint for a sed regex. Only "/" is problematic
         // since we use "/" as the delimiter — use "#" instead.
-        let safe_fp = fingerprint.replace('\n', "").replace('\r', "");
+        let safe_fp = fingerprint.replace(['\n', '\r'], "");
 
         // macOS sed requires `-i ''`, GNU sed wants `-i`.
-        let sed_inplace = if os_family.contains("macos") {
-            "sed -i.bak"
-        } else {
-            "sed -i.bak"
-        };
+        let sed_inplace = "sed -i.bak";
 
         // We can't match by fingerprint directly (fingerprint is derived,
         // not a literal substring). Instead, match by the comment tail —

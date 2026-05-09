@@ -191,9 +191,9 @@ async fn extract_common_steps(pg: &PgPool, session_ids: &[Uuid]) -> Result<Vec<S
     // Find the most common sequence (allowing slight variation by using
     // the first session's sequence as a candidate and scoring others).
     let mut best: Option<(Vec<String>, usize)> = None;
-    for (_sid, seq) in &by_session {
+    for seq in by_session.values() {
         let score = by_session.values().filter(|s| similarity(s, seq) >= 0.5).count();
-        if best.as_ref().map_or(true, |(_, b)| score > *b) {
+        if best.as_ref().is_none_or(|(_, b)| score > *b) {
             best = Some((seq.clone(), score));
         }
     }

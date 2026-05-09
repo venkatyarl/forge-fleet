@@ -163,11 +163,10 @@ async fn find_first_with_suffix(dir: &Path, suffix: &str) -> Result<PathBuf> {
         .with_context(|| format!("read_dir {}", dir.display()))?;
     while let Some(entry) = rd.next_entry().await? {
         let name = entry.file_name();
-        if let Some(n) = name.to_str() {
-            if n.ends_with(suffix) {
+        if let Some(n) = name.to_str()
+            && n.ends_with(suffix) {
                 return Ok(entry.path());
             }
-        }
     }
     Err(anyhow!("no file with suffix {suffix} in {}", dir.display()))
 }

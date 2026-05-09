@@ -110,13 +110,13 @@ fn parse_ddg_results(html: &str, max: usize) -> Vec<SearchResult> {
         if chunk.contains("href=\"") {
             let url = extract_between(chunk, "href=\"", "\"").unwrap_or_default();
             let title = extract_between(chunk, ">", "</a>")
-                .map(|t| strip_tags(t))
+                .map(strip_tags)
                 .unwrap_or_default();
 
             let snippet = if let Some(snip_start) = chunk.find("result__snippet") {
                 let snip_chunk = &chunk[snip_start..];
                 extract_between(snip_chunk, ">", "</")
-                    .map(|s| strip_tags(s))
+                    .map(strip_tags)
                     .unwrap_or_default()
             } else {
                 String::new()

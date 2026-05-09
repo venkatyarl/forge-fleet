@@ -225,11 +225,10 @@ impl LeaseClient {
             let url = format!("{}{}", base.trim_end_matches('/'), endpoint);
             match self.http.post(&url).json(&payload).send().await {
                 Ok(resp) if resp.status().is_success() => {
-                    if let Ok(value) = resp.json::<Value>().await {
-                        if let Some(granted) = value.get("granted").and_then(Value::as_bool) {
+                    if let Ok(value) = resp.json::<Value>().await
+                        && let Some(granted) = value.get("granted").and_then(Value::as_bool) {
                             return Ok(granted);
                         }
-                    }
                     return Ok(true);
                 }
                 Ok(resp) => {

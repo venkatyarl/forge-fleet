@@ -529,8 +529,8 @@ pub async fn search_all(query: &str, cwd: &Path) -> Vec<SearchResult> {
     }
 
     // Search project markdown files
-    if let Some(md) = &ctx.project_forgefleet_md {
-        if md.to_ascii_lowercase().contains(&lower) {
+    if let Some(md) = &ctx.project_forgefleet_md
+        && md.to_ascii_lowercase().contains(&lower) {
             results.push(SearchResult {
                 layer: "Project".into(),
                 category: "FORGEFLEET.md".into(),
@@ -538,7 +538,6 @@ pub async fn search_all(query: &str, cwd: &Path) -> Vec<SearchResult> {
                 relevance: 1.0,
             });
         }
-    }
 
     // Search brain entries
     for entry in &ctx.brain_entries {

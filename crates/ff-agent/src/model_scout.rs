@@ -208,11 +208,10 @@ async fn fetch_hf_models_for_task(
         "https://huggingface.co/api/models?pipeline_tag={task}&sort=downloads&limit={HF_LIMIT_PER_TASK}&full=true"
     );
     let mut req = http.get(&url).header("Accept", "application/json");
-    if let Some(t) = token {
-        if !t.is_empty() {
+    if let Some(t) = token
+        && !t.is_empty() {
             req = req.header("Authorization", format!("Bearer {t}"));
         }
-    }
     let resp = req.send().await.map_err(|e| format!("GET {url}: {e}"))?;
     if !resp.status().is_success() {
         return Err(format!("GET {url}: HTTP {}", resp.status()));
@@ -293,11 +292,10 @@ fn extract_license(item: &JsonValue) -> Option<String> {
     // HF sometimes attaches license as a `license:...` tag.
     if let Some(tags) = item.get("tags").and_then(|v| v.as_array()) {
         for t in tags {
-            if let Some(s) = t.as_str() {
-                if let Some(rest) = s.strip_prefix("license:") {
+            if let Some(s) = t.as_str()
+                && let Some(rest) = s.strip_prefix("license:") {
                     return Some(rest.to_string());
                 }
-            }
         }
     }
     None
@@ -345,12 +343,11 @@ fn evaluate(
         return None;
     }
 
-    if let Some(sz) = m.size_gb {
-        if sz > MAX_CANDIDATE_SIZE_GB {
+    if let Some(sz) = m.size_gb
+        && sz > MAX_CANDIDATE_SIZE_GB {
             debug!(id = %m.model_id, size_gb = sz, "scout filter: oversize");
             return None;
         }
-    }
 
     if denylist.contains(&m.model_id.to_ascii_lowercase()) {
         debug!(id = %m.model_id, "scout filter: denylist hit");

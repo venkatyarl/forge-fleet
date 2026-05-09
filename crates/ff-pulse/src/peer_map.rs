@@ -73,11 +73,11 @@ impl PeerMap {
     /// Mark `computer_name` as offline (sets `going_offline=true` and
     /// `is_healthy=false`). No-op if the peer is not in the map.
     pub fn mark_offline(&self, computer_name: &str) {
-        if let Ok(mut guard) = self.inner.write() {
-            if let Some(entry) = guard.get_mut(computer_name) {
-                entry.going_offline = true;
-                entry.is_healthy = false;
-            }
+        if let Ok(mut guard) = self.inner.write()
+            && let Some(entry) = guard.get_mut(computer_name)
+        {
+            entry.going_offline = true;
+            entry.is_healthy = false;
         }
     }
 

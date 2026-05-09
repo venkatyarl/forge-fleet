@@ -186,10 +186,10 @@ impl LeaderSync {
         // Swap the cached snapshot (remove old file).
         {
             let mut cached = self.latest_snapshot.write().await;
-            if let Some(old) = cached.as_ref() {
-                if old.path != snapshot_path {
-                    let _ = std::fs::remove_file(&old.path);
-                }
+            if let Some(old) = cached.as_ref()
+                && old.path != snapshot_path
+            {
+                let _ = std::fs::remove_file(&old.path);
             }
             *cached = Some(CachedSnapshot {
                 meta: meta.clone(),

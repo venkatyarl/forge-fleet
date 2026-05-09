@@ -116,13 +116,11 @@ pub async fn run_hooks(
 
     for entry in entries {
         // Apply tool filter if present
-        if let Some(filter) = &entry.tool_filter {
-            if let Some(tool_name) = env_vars.get("FORGEFLEET_TOOL_NAME") {
-                if !tool_name.eq_ignore_ascii_case(filter) {
+        if let Some(filter) = &entry.tool_filter
+            && let Some(tool_name) = env_vars.get("FORGEFLEET_TOOL_NAME")
+                && !tool_name.eq_ignore_ascii_case(filter) {
                     continue;
                 }
-            }
-        }
 
         let timeout = std::time::Duration::from_secs(entry.timeout_secs);
         let cmd_result = tokio::time::timeout(

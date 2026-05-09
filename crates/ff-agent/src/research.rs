@@ -194,11 +194,10 @@ pub async fn resolve_port(pool: &PgPool, service: &str, fallback: u16) -> u16 {
 /// No hardcoded ports; the 51002 literal is a last-resort fallback only
 /// used when the DB can't answer.
 pub async fn resolve_gateway_url(pool: &PgPool) -> String {
-    if let Ok(v) = std::env::var("FORGEFLEET_GATEWAY_URL") {
-        if !v.is_empty() {
+    if let Ok(v) = std::env::var("FORGEFLEET_GATEWAY_URL")
+        && !v.is_empty() {
             return v;
         }
-    }
     let port = resolve_port(pool, "forgefleetd", 51002).await;
     let leader_ip: Option<String> = sqlx::query_scalar(
         "SELECT c.primary_ip
@@ -213,11 +212,10 @@ pub async fn resolve_gateway_url(pool: &PgPool) -> String {
     if let Some(ip) = leader_ip {
         return format!("http://{ip}:{port}");
     }
-    if let Ok(host) = std::env::var("FORGEFLEET_LEADER_HOST") {
-        if !host.is_empty() {
+    if let Ok(host) = std::env::var("FORGEFLEET_LEADER_HOST")
+        && !host.is_empty() {
             return format!("http://{host}:{port}");
         }
-    }
     format!("http://127.0.0.1:{port}")
 }
 
@@ -337,6 +335,7 @@ impl ResearchSession {
         // sub-agents can actually call WebSearch / Grep / etc.
         update_session_status(&self.pool, self.session_id, "dispatching").await?;
 
+        #[allow(clippy::type_complexity)]
         let mut handles: Vec<tokio::task::JoinHandle<(Uuid, Result<(String, u64)>)>> =
             Vec::with_capacity(plan.sub_questions.len());
         for (i, ((q, row), backend)) in plan
@@ -945,7 +944,7 @@ fn parse_findings(output: &str) -> Vec<(String, Option<f64>, Option<String>)> {
             continue;
         }
         // Strip leading list markers.
-        let s = t.trim_start_matches(|c: char| c == '-' || c == '*').trim();
+        let s = t.trim_start_matches(['-', '*']).trim();
         // Try to pull [0.xx] prefix.
         let (conf, rest) = if let Some(end) = s.find(']') {
             let inner = &s[1..end];

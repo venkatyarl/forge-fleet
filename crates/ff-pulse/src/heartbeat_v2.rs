@@ -137,7 +137,7 @@ impl HeartbeatV2Publisher {
             // ── Hardware + memory snapshot ─────────────────────────────────
             // Inner timeouts for macOS framework calls that can hang in a
             // launchd context (IOKit, DiskArbitration, etc.).
-            let mut sys = run_with_timeout(
+            let sys = run_with_timeout(
                 || {
                     // Skip process enumeration — it can hang on macOS when
                     // run from a launchd agent (no user session / WindowServer).
@@ -405,8 +405,7 @@ impl HeartbeatV2Publisher {
                                         consecutive_reconnect_failures.saturating_add(1);
                                     if consecutive_reconnect_failures == 1
                                         || consecutive_reconnect_failures
-                                            % WARN_RECONNECT_EVERY_N
-                                            == 0
+                                            .is_multiple_of(WARN_RECONNECT_EVERY_N)
                                     {
                                         warn!(
                                             attempt = consecutive_reconnect_failures,
@@ -436,7 +435,9 @@ impl HeartbeatV2Publisher {
                             Ok(()) => {
                                 beat_count = beat_count.wrapping_add(1);
                                 debug!("heartbeat_v2 published for '{}'", self.computer_name);
-                                if beat_count == 1 || beat_count % INFO_LOG_EVERY_N_BEATS == 0 {
+                                if beat_count == 1
+                                    || beat_count.is_multiple_of(INFO_LOG_EVERY_N_BEATS)
+                                {
                                     info!(
                                         "heartbeat_v2: published beat #{} to redis+nats for '{}'",
                                         beat_count, self.computer_name
@@ -519,7 +520,7 @@ fn detect_gpu_kind() -> String {
 
     // Linux: probe for nvidia-smi, then rocm-smi.
     if std::env::consts::OS == "linux" {
-        if command_output_with_timeout(&mut
+        if command_output_with_timeout(
             std::process::Command::new("nvidia-smi")
                 .arg("--version")
                 .stdout(std::process::Stdio::null())
@@ -531,7 +532,7 @@ fn detect_gpu_kind() -> String {
         {
             return "nvidia_cuda".to_string();
         }
-        if command_output_with_timeout(&mut
+        if command_output_with_timeout(
             std::process::Command::new("rocm-smi")
                 .arg("--version")
                 .stdout(std::process::Stdio::null())
@@ -555,7 +556,7 @@ fn detect_gpu_model() -> Option<String> {
             // Return a generic label; precise model filled in by a later phase.
             Some("Apple Silicon GPU (Metal)".to_string())
         }
-        "linux" => command_output_with_timeout(&mut
+        "linux" => command_output_with_timeout(
             std::process::Command::new("nvidia-smi")
                 .args(["--query-gpu=name", "--format=csv,noheader"]),
             3,
@@ -574,10 +575,10 @@ fn detect_gpu_model() -> Option<String> {
 
 fn detect_primary_ip() -> String {
     // Try env override first.
-    if let Ok(ip) = std::env::var("FORGEFLEET_PRIMARY_IP") {
-        if !ip.is_empty() {
-            return ip;
-        }
+    if let Ok(ip) = std::env::var("FORGEFLEET_PRIMARY_IP")
+        && !ip.is_empty()
+    {
+        return ip;
     }
     pick_primary_lan_ip(&detect_all_ips()).unwrap_or_else(|| "127.0.0.1".to_string())
 }
@@ -688,7 +689,7 @@ fn detect_all_ips() -> Vec<Ip> {
         )
     } else {
         // /sbin/ip on Debian/Ubuntu, /usr/sbin/ip on RHEL — try both.
-        command_output_with_timeout(&mut
+        command_output_with_timeout(
             std::process::Command::new("ip")
                 .args(["-4", "-o", "addr", "show"])
                 .env("PATH", "/usr/sbin:/sbin:/usr/bin:/bin"),
@@ -708,21 +709,20 @@ fn detect_all_ips() -> Vec<Ip> {
         for line in stdout.lines() {
             if !line.starts_with('\t') && !line.starts_with(' ') && line.contains(':') {
                 current_iface = line.split(':').next().unwrap_or("").to_string();
-            } else if line.trim_start().starts_with("inet ") {
-                if let Some(ip) = line.split_whitespace().nth(1) {
-                    if !ip.starts_with("127.") && !ip.starts_with("169.254.") {
-                        let kind = classify_iface(&current_iface, ip);
-                        let (medium, link_speed_gbps) = probe_iface_macos(&current_iface);
-                        result.push(Ip {
-                            iface: current_iface.clone(),
-                            ip: ip.to_string(),
-                            kind,
-                            paired_with: None,
-                            link_speed_gbps,
-                            medium,
-                        });
-                    }
-                }
+            } else if line.trim_start().starts_with("inet ")
+                && let Some(ip) = line.split_whitespace().nth(1)
+                && !ip.starts_with("127.") && !ip.starts_with("169.254.")
+            {
+                let kind = classify_iface(&current_iface, ip);
+                let (medium, link_speed_gbps) = probe_iface_macos(&current_iface);
+                result.push(Ip {
+                    iface: current_iface.clone(),
+                    ip: ip.to_string(),
+                    kind,
+                    paired_with: None,
+                    link_speed_gbps,
+                    medium,
+                });
             }
         }
     } else {
@@ -748,19 +748,19 @@ fn detect_all_ips() -> Vec<Ip> {
                 {
                     continue;
                 }
-                if let Some(addr) = parts[3].split('/').next() {
-                    if !addr.starts_with("127.") && !addr.starts_with("169.254.") {
-                        let kind = classify_iface(iface, addr);
-                        let (medium, link_speed_gbps) = probe_iface_linux(iface);
-                        result.push(Ip {
-                            iface: iface.to_string(),
-                            ip: addr.to_string(),
-                            kind,
-                            paired_with: None,
-                            link_speed_gbps,
-                            medium,
-                        });
-                    }
+                if let Some(addr) = parts[3].split('/').next()
+                    && !addr.starts_with("127.") && !addr.starts_with("169.254.")
+                {
+                    let kind = classify_iface(iface, addr);
+                    let (medium, link_speed_gbps) = probe_iface_linux(iface);
+                    result.push(Ip {
+                        iface: iface.to_string(),
+                        ip: addr.to_string(),
+                        kind,
+                        paired_with: None,
+                        link_speed_gbps,
+                        medium,
+                    });
                 }
             }
         }
@@ -777,7 +777,7 @@ fn probe_iface_linux(iface: &str) -> (Option<String>, Option<u32>) {
         .exists();
     if wireless {
         // Wifi link rate via `iw dev <iface> link` if available; otherwise leave None.
-        let rate = command_output_with_timeout(&mut
+        let rate = command_output_with_timeout(
             std::process::Command::new("iw")
                 .args(["dev", iface, "link"])
                 .env("PATH", "/usr/sbin:/sbin:/usr/bin:/bin"),
@@ -809,8 +809,6 @@ fn probe_iface_linux(iface: &str) -> (Option<String>, Option<u32>) {
         "cx7"
     } else if iface.starts_with("usb") {
         "usb-eth"
-    } else if iface.starts_with("eno") || iface.starts_with("enp") || iface.starts_with("eth") {
-        "ethernet"
     } else {
         "ethernet"
     };
@@ -830,7 +828,7 @@ fn probe_iface_linux(iface: &str) -> (Option<String>, Option<u32>) {
 /// link speed (e.g. `media: autoselect (1000baseT <full-duplex>)`).
 /// Cross-references `networksetup -listallhardwareports` to detect wifi.
 fn probe_iface_macos(iface: &str) -> (Option<String>, Option<u32>) {
-    let media = command_output_with_timeout(&mut
+    let media = command_output_with_timeout(
         std::process::Command::new("/sbin/ifconfig").arg(iface),
         3,
     )
@@ -839,7 +837,7 @@ fn probe_iface_macos(iface: &str) -> (Option<String>, Option<u32>) {
     .unwrap_or_default();
 
     // Hardware-port lookup: AirPort/Wi-Fi → wifi medium.
-    let hw_ports = command_output_with_timeout(&mut
+    let hw_ports = command_output_with_timeout(
         std::process::Command::new("/usr/sbin/networksetup")
             .args(["-listallhardwareports"]),
         3,
@@ -855,11 +853,11 @@ fn probe_iface_macos(iface: &str) -> (Option<String>, Option<u32>) {
         for line in hw_ports.lines() {
             if let Some(rest) = line.strip_prefix("Hardware Port: ") {
                 last_hw = Some(rest.trim());
-            } else if let Some(rest) = line.strip_prefix("Device: ") {
-                if rest.trim() == iface {
-                    hw_for_iface = last_hw;
-                    break;
-                }
+            } else if let Some(rest) = line.strip_prefix("Device: ")
+                && rest.trim() == iface
+            {
+                hw_for_iface = last_hw;
+                break;
             }
         }
         let hw_lc = hw_for_iface

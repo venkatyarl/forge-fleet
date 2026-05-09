@@ -238,7 +238,7 @@ impl ReviveManager {
         cmd.args(ssh_base_args(port))
             .arg(format!("{user}@{host}"))
             .arg("echo ok");
-        run_ssh(cmd).await.map(|ok| ok).unwrap_or(false)
+        run_ssh(cmd).await.unwrap_or(false)
     }
 
     /// Check whether `forgefleetd` is alive on the target via pgrep.
@@ -273,7 +273,7 @@ impl ReviveManager {
     ///   - `com.forgefleet.forgefleetd` — newer ff-daemon installs
     ///   - `com.forgefleet.node`        — older installs (e.g. Ace)
     ///   - `com.forgefleet.ffdaemon`    — variant used on Taylor
-    /// We try each in order and return on the first success.
+    ///     We try each in order and return on the first success.
     async fn ssh_restart_daemon(&self, target: &ReviveTarget) -> Result<(), ReviveError> {
         match target.os_family.as_str() {
             "macos" => {
@@ -303,8 +303,7 @@ impl ReviveManager {
                         "launchctl kickstart failed; trying next label"
                     );
                 }
-                Err(ReviveError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                Err(ReviveError::Io(std::io::Error::other(
                     "daemon restart: no macOS launchd label matched",
                 )))
             }
@@ -335,8 +334,7 @@ impl ReviveManager {
                 if run_ssh(cmd).await.unwrap_or(false) {
                     Ok(())
                 } else {
-                    Err(ReviveError::Io(std::io::Error::new(
-                        std::io::ErrorKind::Other,
+                    Err(ReviveError::Io(std::io::Error::other(
                         "daemon restart ssh call returned non-zero",
                     )))
                 }
@@ -463,8 +461,8 @@ fn parse_mac(s: &str) -> Option<[u8; 6]> {
 /// the right interface. Silently leaves the target unchanged on any error —
 /// the stored `primary_ip` is a safe fallback.
 async fn rewrite_primary_ip_if_possible(target: &mut ReviveTarget) {
-    if let Some((ip, kind)) = crate::fleet_info::resolve_best_ip(&target.name).await {
-        if ip != target.primary_ip {
+    if let Some((ip, kind)) = crate::fleet_info::resolve_best_ip(&target.name).await
+        && ip != target.primary_ip {
             debug!(
                 node = %target.name,
                 old_ip = %target.primary_ip,
@@ -474,7 +472,6 @@ async fn rewrite_primary_ip_if_possible(target: &mut ReviveTarget) {
             );
             target.primary_ip = ip;
         }
-    }
 }
 
 /// Shared row-extraction helper — pulls a `ReviveTarget` from a selected row.

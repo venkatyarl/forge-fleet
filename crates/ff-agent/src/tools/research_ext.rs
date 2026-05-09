@@ -79,9 +79,9 @@ impl AgentTool for TrendAnalysisTool {
             .timeout(std::time::Duration::from_secs(10))
             .build()
             .unwrap_or_default();
-        if let Ok(resp) = client.get(&hn_url).send().await {
-            if let Ok(data) = resp.json::<Value>().await {
-                if let Some(hits) = data.get("hits").and_then(Value::as_array) {
+        if let Ok(resp) = client.get(&hn_url).send().await
+            && let Ok(data) = resp.json::<Value>().await
+                && let Some(hits) = data.get("hits").and_then(Value::as_array) {
                     results.push("## HackerNews".into());
                     for hit in hits.iter().take(5) {
                         let title = hit.get("title").and_then(Value::as_str).unwrap_or("?");
@@ -90,8 +90,6 @@ impl AgentTool for TrendAnalysisTool {
                         results.push(format!("  - {title} ({points} pts, {comments} comments)"));
                     }
                 }
-            }
-        }
 
         // GitHub trending (via search API)
         let gh_url = format!(
@@ -103,9 +101,8 @@ impl AgentTool for TrendAnalysisTool {
             .header("User-Agent", "ForgeFleet")
             .send()
             .await
-        {
-            if let Ok(data) = resp.json::<Value>().await {
-                if let Some(items) = data.get("items").and_then(Value::as_array) {
+            && let Ok(data) = resp.json::<Value>().await
+                && let Some(items) = data.get("items").and_then(Value::as_array) {
                     results.push("## GitHub Trending".into());
                     for item in items.iter().take(5) {
                         let name = item.get("full_name").and_then(Value::as_str).unwrap_or("?");
@@ -121,8 +118,6 @@ impl AgentTool for TrendAnalysisTool {
                         results.push(format!("  - {name} (⭐{stars}) — {desc_preview}"));
                     }
                 }
-            }
-        }
 
         // Web search for broader trends
         let search = WebSearchTool;

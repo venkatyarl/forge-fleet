@@ -835,8 +835,8 @@ impl Command for PasteImageCommand {
                 .output()
                 .await;
 
-            if let Ok(out) = check {
-                if out.status.success() {
+            if let Ok(out) = check
+                && out.status.success() {
                     // Save clipboard image to temp file
                     let temp_path = "/tmp/ff_clipboard_image.png";
                     let save_cmd = format!(
@@ -852,7 +852,6 @@ impl Command for PasteImageCommand {
                         "Image saved from clipboard: {temp_path}\nUse: PhotoAnalysis file_path=\"{temp_path}\" to analyze it."
                     );
                 }
-            }
         }
 
         "No image in clipboard. Usage:\n  /paste-image /path/to/image.png\n  Or copy an image to clipboard first, then /paste-image".into()

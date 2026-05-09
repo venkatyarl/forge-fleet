@@ -17,7 +17,7 @@ use tracing::warn;
 
 use crate::{
     adaptive_router::AdaptiveRouter,
-    circuit_breaker::{CircuitBreaker, CircuitState},
+    circuit_breaker::CircuitState,
     error::ApiError,
     quality_tracker::QualityTracker,
     registry::BackendRegistry,
@@ -238,7 +238,7 @@ async fn forward_chat_adaptive<T: Serialize>(
                         .adaptive_router
                         .circuit_breakers()
                         .entry(backend.node.clone())
-                        .or_insert_with(CircuitBreaker::default)
+                        .or_default()
                         .record_failure();
                     last_error = Some(format!(
                         "{} responded {} (busy)",
@@ -255,7 +255,7 @@ async fn forward_chat_adaptive<T: Serialize>(
                     .adaptive_router
                     .circuit_breakers()
                     .entry(backend.node.clone())
-                    .or_insert_with(CircuitBreaker::default)
+                    .or_default()
                     .record_success();
 
                 if stream {
@@ -269,7 +269,7 @@ async fn forward_chat_adaptive<T: Serialize>(
                     .adaptive_router
                     .circuit_breakers()
                     .entry(backend.node.clone())
-                    .or_insert_with(CircuitBreaker::default)
+                    .or_default()
                     .record_failure();
                 last_error = Some(format!("{} request failed: {}", backend.id, error));
             }
@@ -322,7 +322,7 @@ async fn forward_with_fallback<T: Serialize>(
                         .adaptive_router
                         .circuit_breakers()
                         .entry(backend.node.clone())
-                        .or_insert_with(CircuitBreaker::default)
+                        .or_default()
                         .record_failure();
                     last_error = Some(format!(
                         "{} responded {} (busy)",
@@ -339,7 +339,7 @@ async fn forward_with_fallback<T: Serialize>(
                     .adaptive_router
                     .circuit_breakers()
                     .entry(backend.node.clone())
-                    .or_insert_with(CircuitBreaker::default)
+                    .or_default()
                     .record_success();
 
                 if stream {
@@ -354,7 +354,7 @@ async fn forward_with_fallback<T: Serialize>(
                     .adaptive_router
                     .circuit_breakers()
                     .entry(backend.node.clone())
-                    .or_insert_with(CircuitBreaker::default)
+                    .or_default()
                     .record_failure();
                 last_error = Some(format!("{} request failed: {}", backend.id, error));
             }

@@ -35,6 +35,7 @@ impl ToolOutcome {
 /// Log a single tool call to `tool_audit_log`.
 ///
 /// Fire-and-forget: errors are logged but not propagated.
+#[allow(clippy::too_many_arguments)]
 pub async fn log_tool_call(
     pg: &PgPool,
     session_id: Option<Uuid>,

@@ -75,7 +75,7 @@ pub async fn scan_and_enqueue(
                     continue;
                 }
                 let sha = parts[0];
-                let subject = parts[1];
+                let _subject = parts[1];
                 let author = parts[2];
 
                 // Get diff for this commit

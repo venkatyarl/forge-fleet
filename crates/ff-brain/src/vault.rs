@@ -319,7 +319,7 @@ fn heading_level(line: &str) -> Option<usize> {
 
 /// Full index pass: walk the vault, parse every .md file, upsert brain_vault_nodes
 /// + brain_vault_edges, chunk and write to rag_chunks. Incremental: only processes
-/// files whose content_hash changed since last run.
+///   files whose content_hash changed since last run.
 pub async fn index_vault(pool: &PgPool, config: &VaultConfig) -> Result<IndexReport, String> {
     let brain_root = config.brain_root();
     if !brain_root.exists() {
@@ -359,11 +359,11 @@ pub async fn index_vault(pool: &PgPool, config: &VaultConfig) -> Result<IndexRep
         };
 
         // Check if content changed
-        if let Some(old_hash) = existing_hashes.get(&node.path) {
-            if *old_hash == node.content_hash {
-                report.unchanged_skipped += 1;
-                continue;
-            }
+        if let Some(old_hash) = existing_hashes.get(&node.path)
+            && *old_hash == node.content_hash
+        {
+            report.unchanged_skipped += 1;
+            continue;
         }
 
         upsert_node(pool, &node).await?;

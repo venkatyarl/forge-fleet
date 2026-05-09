@@ -5,7 +5,7 @@
 //! the existing `fleet_leader_state` row). Dispatched actions:
 //!
 //!   - `sleep`:   SSH in and run `pmset sleepnow` (macOS) or
-//!                `systemctl suspend` (Linux).
+//!     `systemctl suspend` (Linux).
 //!   - `wake`:    Wake-on-LAN magic packet (reuses `revive::send_wol`).
 //!   - `restart`: SSH in and run `sudo reboot`.
 //!

@@ -463,8 +463,7 @@ fn detect_failure(
     // 3. Early stop — completed but did almost nothing
     if matches!(outcome, AgentOutcome::EndTurn { .. })
         && tool_count < config.early_stop_min_tools as usize
-    {
-        if let AgentOutcome::EndTurn { final_message } = outcome {
+        && let AgentOutcome::EndTurn { final_message } = outcome {
             let lower = final_message.to_ascii_lowercase();
             if lower.contains("i'll")
                 || lower.contains("i will")
@@ -475,14 +474,12 @@ fn detect_failure(
                 return FailureType::EarlyStop { tool_count };
             }
         }
-    }
 
     // 4. MaxTurns with little output
-    if let AgentOutcome::MaxTurns { partial_message } = outcome {
-        if partial_message.len() < 100 {
+    if let AgentOutcome::MaxTurns { partial_message } = outcome
+        && partial_message.len() < 100 {
             return FailureType::MaxTurnsNoProgress;
         }
-    }
 
     // 5. High error rate
     let error_count = events

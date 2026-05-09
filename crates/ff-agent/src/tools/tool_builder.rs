@@ -167,8 +167,7 @@ impl AgentTool for {struct_name} {{
                             .get("rebuild")
                             .and_then(Value::as_bool)
                             .unwrap_or(false)
-                        {
-                            if let Some(ref root) = ff_root {
+                            && let Some(ref root) = ff_root {
                                 let build = tokio::process::Command::new("cargo")
                                     .args(["build", "-p", "ff-terminal"])
                                     .current_dir(root)
@@ -189,7 +188,6 @@ impl AgentTool for {struct_name} {{
                                     }
                                 }
                             }
-                        }
 
                         AgentToolResult::ok(truncate_output(&result, MAX_TOOL_RESULT_CHARS))
                     }
@@ -299,11 +297,10 @@ async fn find_forgefleet_root(ctx: &AgentToolContext) -> Option<std::path::PathB
     let mut current = ctx.working_dir.clone();
     loop {
         let cargo = current.join("Cargo.toml");
-        if let Ok(content) = fs::read_to_string(&cargo).await {
-            if content.contains("forge-fleet") || content.contains("ff-agent") {
+        if let Ok(content) = fs::read_to_string(&cargo).await
+            && (content.contains("forge-fleet") || content.contains("ff-agent")) {
                 return Some(current);
             }
-        }
         if !current.pop() {
             break;
         }

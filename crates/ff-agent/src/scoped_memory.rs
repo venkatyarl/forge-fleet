@@ -387,8 +387,8 @@ pub async fn scrub_temp_sessions() -> anyhow::Result<u32> {
                 let path = day_entry.path();
                 if path.extension().and_then(|e| e.to_str()) == Some("json") {
                     // Read temp chat, extract learnings to global memory
-                    if let Ok(content) = fs::read_to_string(&path).await {
-                        if let Ok(data) = serde_json::from_str::<serde_json::Value>(&content) {
+                    if let Ok(content) = fs::read_to_string(&path).await
+                        && let Ok(data) = serde_json::from_str::<serde_json::Value>(&content) {
                             // Extract any high-relevance entries
                             if let Some(entries) = data.get("entries").and_then(|v| v.as_array()) {
                                 let mut global = ScopedMemoryStore::open(MemoryScope::Global).await;
@@ -397,8 +397,8 @@ pub async fn scrub_temp_sessions() -> anyhow::Result<u32> {
                                         .get("relevance")
                                         .and_then(|v| v.as_f64())
                                         .unwrap_or(0.0);
-                                    if relevance > 0.3 {
-                                        if let Some(content) =
+                                    if relevance > 0.3
+                                        && let Some(content) =
                                             entry.get("content").and_then(|v| v.as_str())
                                         {
                                             global.add(
@@ -407,12 +407,10 @@ pub async fn scrub_temp_sessions() -> anyhow::Result<u32> {
                                                 vec!["scrubbed".into()],
                                             );
                                         }
-                                    }
                                 }
                                 let _ = global.save().await;
                             }
                         }
-                    }
                     // Remove the temp file
                     let _ = fs::remove_file(&path).await;
                     scrubbed += 1;

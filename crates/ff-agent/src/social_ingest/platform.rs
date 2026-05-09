@@ -33,7 +33,7 @@ pub fn detect_platform(url: &str) -> Platform {
         .or_else(|| lowered.strip_prefix("http://"))
         .unwrap_or(&lowered);
     // Extract host (up to the first `/` or `?`).
-    let host_end = rest.find(|c| c == '/' || c == '?').unwrap_or(rest.len());
+    let host_end = rest.find(['/', '?']).unwrap_or(rest.len());
     let host = rest[..host_end].trim_start_matches("www.");
 
     if host == "x.com" || host == "twitter.com" || host.ends_with(".twitter.com") {

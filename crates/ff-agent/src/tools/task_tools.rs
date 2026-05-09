@@ -221,8 +221,8 @@ impl AgentTool for TaskUpdateTool {
         let session_id = ctx.session_id.clone();
 
         // Fire best-effort callback if task just completed and has a reply_to_node.
-        if status_clone == "completed" {
-            if let Some(reply_url) = reply_to {
+        if status_clone == "completed"
+            && let Some(reply_url) = reply_to {
                 let callback_url = format!("{}/agent/message", reply_url.trim_end_matches('/'));
                 let payload = json!({
                     "task_id": task_id_clone,
@@ -235,7 +235,6 @@ impl AgentTool for TaskUpdateTool {
                     let _ = client.post(&callback_url).json(&payload).send().await;
                 });
             }
-        }
 
         AgentToolResult::ok(format!("Task #{id} updated (status: {})", status_clone))
     }

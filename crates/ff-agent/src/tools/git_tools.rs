@@ -79,13 +79,12 @@ fn parse_blame_porcelain(output: &str) -> String {
     let mut line_num = 0u32;
 
     for line in output.lines() {
-        if line.starts_with("author ") {
-            current_author = line["author ".len()..].to_string();
-        } else if line.starts_with("summary ") {
-            current_summary = line["summary ".len()..].to_string();
-        } else if line.starts_with('\t') {
+        if let Some(rest) = line.strip_prefix("author ") {
+            current_author = rest.to_string();
+        } else if let Some(rest) = line.strip_prefix("summary ") {
+            current_summary = rest.to_string();
+        } else if let Some(code) = line.strip_prefix('\t') {
             line_num += 1;
-            let code = &line[1..];
             if !current_author.is_empty() {
                 let author_preview: String = current_author.chars().take(20).collect();
                 let summary_preview: String = current_summary.chars().take(40).collect();

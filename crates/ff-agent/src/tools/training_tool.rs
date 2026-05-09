@@ -103,8 +103,8 @@ async fn execute_status() -> AgentToolResult {
         .unwrap_or_default()
         .join(".forgefleet")
         .join("lora_adapters");
-    if adapter_dir.exists() {
-        if let Ok(mut entries) = tokio::fs::read_dir(&adapter_dir).await {
+    if adapter_dir.exists()
+        && let Ok(mut entries) = tokio::fs::read_dir(&adapter_dir).await {
             status.push_str("\nExisting adapters:\n");
             while let Ok(Some(entry)) = entries.next_entry().await {
                 if entry.path().is_dir() {
@@ -112,13 +112,12 @@ async fn execute_status() -> AgentToolResult {
                 }
             }
         }
-    }
 
     // Check if training is currently running
     let log_path = std::path::Path::new("/tmp/forgefleet-lora-training.log");
-    if log_path.exists() {
-        if let Ok(content) = tokio::fs::read_to_string(log_path).await {
-            if content.contains("Starting training") && !content.contains("Training complete") {
+    if log_path.exists()
+        && let Ok(content) = tokio::fs::read_to_string(log_path).await
+            && content.contains("Starting training") && !content.contains("Training complete") {
                 status.push_str("\n⚡ Training is currently in progress!\n");
                 // Show last few lines
                 let lines: Vec<&str> = content.lines().collect();
@@ -131,8 +130,6 @@ async fn execute_status() -> AgentToolResult {
                     .collect::<Vec<_>>();
                 status.push_str(&format!("Latest: {}\n", last.join(" | ")));
             }
-        }
-    }
 
     AgentToolResult::ok(status)
 }

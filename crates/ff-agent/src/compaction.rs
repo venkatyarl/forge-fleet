@@ -66,7 +66,7 @@ impl TokenUsage {
 pub fn estimate_message_tokens(messages: &[ToolChatMessage]) -> usize {
     messages
         .iter()
-        .map(|m| estimate_single_message_tokens(m))
+        .map(estimate_single_message_tokens)
         .sum()
 }
 
@@ -173,8 +173,8 @@ fn build_summary(messages: &[ToolChatMessage]) -> String {
                         ));
                     }
                 }
-                if let Some(text) = msg.text_content() {
-                    if !text.is_empty() && text.len() > 20 {
+                if let Some(text) = msg.text_content()
+                    && !text.is_empty() && text.len() > 20 {
                         let truncated = if text.chars().count() > 300 {
                             format!("{}...", text.chars().take(300).collect::<String>())
                         } else {
@@ -182,7 +182,6 @@ fn build_summary(messages: &[ToolChatMessage]) -> String {
                         };
                         key_decisions.push(format!("Assistant: {truncated}"));
                     }
-                }
             }
             "tool" => {
                 // Tool results are the bulkiest — just note they happened
@@ -252,8 +251,8 @@ pub fn apply_tool_result_budget(messages: &mut [ToolChatMessage], budget_chars: 
         if msg.role != "tool" {
             continue;
         }
-        if let Some(content) = msg.text_content() {
-            if content.len() > 100 {
+        if let Some(content) = msg.text_content()
+            && content.len() > 100 {
                 let freed = content.len() - 50;
                 msg.content = Some(Value::String(
                     "[tool result truncated — context budget exceeded]".into(),
@@ -261,7 +260,6 @@ pub fn apply_tool_result_budget(messages: &mut [ToolChatMessage], budget_chars: 
                 to_free = to_free.saturating_sub(freed);
                 truncated += 1;
             }
-        }
     }
 
     truncated

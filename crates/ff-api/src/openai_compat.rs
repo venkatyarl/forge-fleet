@@ -159,16 +159,16 @@ pub fn validate_request(req: &ChatCompletionRequest) -> Result<(), String> {
         return Err("messages array must not be empty".to_string());
     }
 
-    if let Some(temp) = req.temperature {
-        if !(0.0..=2.0).contains(&temp) {
-            return Err(format!("temperature must be between 0 and 2, got {temp}"));
-        }
+    if let Some(temp) = req.temperature
+        && !(0.0..=2.0).contains(&temp)
+    {
+        return Err(format!("temperature must be between 0 and 2, got {temp}"));
     }
 
-    if let Some(top_p) = req.top_p {
-        if !(0.0..=1.0).contains(&top_p) {
-            return Err(format!("top_p must be between 0 and 1, got {top_p}"));
-        }
+    if let Some(top_p) = req.top_p
+        && !(0.0..=1.0).contains(&top_p)
+    {
+        return Err(format!("top_p must be between 0 and 1, got {top_p}"));
     }
 
     Ok(())

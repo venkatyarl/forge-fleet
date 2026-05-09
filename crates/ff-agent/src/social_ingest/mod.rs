@@ -185,11 +185,10 @@ async fn pick_vision_server() -> Result<(String, String)> {
 fn extract_endpoint(server: &ff_pulse::beat_v2::LlmServer) -> Option<String> {
     let v = serde_json::to_value(server).ok()?;
     for key in ["base_url", "endpoint", "url"] {
-        if let Some(s) = v.get(key).and_then(|x| x.as_str()) {
-            if !s.is_empty() {
+        if let Some(s) = v.get(key).and_then(|x| x.as_str())
+            && !s.is_empty() {
                 return Some(s.to_string());
             }
-        }
     }
     // Fall back to host + port if present.
     let host = v.get("host").and_then(|x| x.as_str())?;

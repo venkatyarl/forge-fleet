@@ -371,7 +371,7 @@ impl CostTracker {
     pub fn get_pricing(&self, model: &str) -> ModelPricing {
         // Try exact match first
         if let Some(p) = self.pricing_db.get(model) {
-            return p.clone();
+            return *p;
         }
         // Try prefix match for local models (e.g., "qwen-32b-instruct" -> "qwen-32b")
         for entry in self.pricing_db.iter() {
@@ -379,7 +379,7 @@ impl CostTracker {
                 continue;
             }
             if model.starts_with(entry.key().as_str()) || entry.key().as_str().starts_with(model) {
-                return entry.clone();
+                return *entry;
             }
         }
         // Default: assume local/free

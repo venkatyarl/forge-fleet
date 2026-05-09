@@ -447,15 +447,14 @@ impl AgentTool for ResponsiveTestTool {
                     ])
                     .output()
                     .await;
-                if let Ok(out) = result {
-                    if out.status.success() {
+                if let Ok(out) = result
+                    && out.status.success() {
                         results.push(format!(
                             "  ✓ {name} ({width}×{height}): {}",
                             output_path.display()
                         ));
                         break;
                     }
-                }
             }
         }
 

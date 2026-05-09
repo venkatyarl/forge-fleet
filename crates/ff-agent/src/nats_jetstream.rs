@@ -45,7 +45,7 @@ pub async fn init_jetstream_streams(client: &async_nats::Client) {
         match js.get_or_create_stream(cfg).await {
             Ok(mut stream) => {
                 info!(stream = name, "jetstream stream ready");
-                let _ = stream.info();
+                let _ = stream.info().await;
             }
             Err(e) => {
                 warn!(stream = name, error = %e, "jetstream stream creation failed");

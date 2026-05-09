@@ -368,10 +368,10 @@ impl ConfidenceExtractor {
                     .chars()
                     .rev()
                     .collect();
-                if let Ok(pct) = num_str.parse::<f64>() {
-                    if (0.0..=100.0).contains(&pct) {
-                        return Some(pct / 100.0);
-                    }
+                if let Ok(pct) = num_str.parse::<f64>()
+                    && (0.0..=100.0).contains(&pct)
+                {
+                    return Some(pct / 100.0);
                 }
             }
 
@@ -380,10 +380,10 @@ impl ConfidenceExtractor {
                 if let Ok(val) = word
                     .trim_matches(|c: char| !c.is_ascii_digit() && c != '.')
                     .parse::<f64>()
+                    && (0.0..=1.0).contains(&val)
+                    && word.contains('.')
                 {
-                    if (0.0..=1.0).contains(&val) && word.contains('.') {
-                        return Some(val);
-                    }
+                    return Some(val);
                 }
             }
 

@@ -92,8 +92,8 @@ impl AgentTool for EnvInfoTool {
             }
         }
 
-        if section == "all" || section == "disk" {
-            if let Ok(out) = tokio::process::Command::new("df")
+        if (section == "all" || section == "disk")
+            && let Ok(out) = tokio::process::Command::new("df")
                 .args(["-h", "."])
                 .current_dir(&ctx.working_dir)
                 .output()
@@ -101,7 +101,6 @@ impl AgentTool for EnvInfoTool {
             {
                 info.push(format!("Disk:\n{}", String::from_utf8_lossy(&out.stdout)));
             }
-        }
 
         if section == "all" || section == "env_vars" {
             info.push(format!("Working dir: {}", ctx.working_dir.display()));

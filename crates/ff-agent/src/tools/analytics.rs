@@ -30,7 +30,7 @@ impl AgentTool for StatsCalcTool {
         let n = data.len() as f64;
         let sum: f64 = data.iter().sum();
         let mean = sum / n;
-        let median = if data.len() % 2 == 0 {
+        let median = if data.len().is_multiple_of(2) {
             (data[data.len() / 2 - 1] + data[data.len() / 2]) / 2.0
         } else {
             data[data.len() / 2]

@@ -98,13 +98,11 @@ pub async fn load_all_examples() -> Vec<TrainingConversation> {
 
     if let Ok(mut entries) = fs::read_dir(&dir).await {
         while let Ok(Some(entry)) = entries.next_entry().await {
-            if entry.path().extension().and_then(|e| e.to_str()) == Some("json") {
-                if let Ok(content) = fs::read_to_string(entry.path()).await {
-                    if let Ok(conv) = serde_json::from_str::<TrainingConversation>(&content) {
+            if entry.path().extension().and_then(|e| e.to_str()) == Some("json")
+                && let Ok(content) = fs::read_to_string(entry.path()).await
+                    && let Ok(conv) = serde_json::from_str::<TrainingConversation>(&content) {
                         examples.push(conv);
                     }
-                }
-            }
         }
     }
 
@@ -490,8 +488,7 @@ impl ClaudeCodeImporter {
                                     "text" => {
                                         if let Some(text) =
                                             block.get("text").and_then(Value::as_str)
-                                        {
-                                            if !text.is_empty() {
+                                            && !text.is_empty() {
                                                 turns.push(TrainingTurn {
                                                     role: "user".into(),
                                                     content: text.to_string(),
@@ -499,7 +496,6 @@ impl ClaudeCodeImporter {
                                                     tool_call_id: None,
                                                 });
                                             }
-                                        }
                                     }
                                     "tool_result" => {
                                         let tool_use_id = block
@@ -545,11 +541,10 @@ impl ClaudeCodeImporter {
                         let block_type = block.get("type").and_then(Value::as_str).unwrap_or("");
                         match block_type {
                             "text" => {
-                                if let Some(text) = block.get("text").and_then(Value::as_str) {
-                                    if !text.is_empty() {
+                                if let Some(text) = block.get("text").and_then(Value::as_str)
+                                    && !text.is_empty() {
                                         text_parts.push(text.to_string());
                                     }
-                                }
                             }
                             "tool_use" => {
                                 let name = block

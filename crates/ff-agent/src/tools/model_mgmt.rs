@@ -89,9 +89,7 @@ impl AgentTool for ModelBrowserTool {
                             .build()
                             .unwrap_or_default();
                         match client.get("https://ollama.com/api/tags").send().await {
-                            Ok(resp) if resp.status().is_success() => AgentToolResult::ok(format!(
-                                "Ollama: Use 'ollama pull <model>' to download. Popular: qwen2.5-coder, llama3.2, gemma2, codestral, deepseek-coder-v2"
-                            )),
+                            Ok(resp) if resp.status().is_success() => AgentToolResult::ok("Ollama: Use 'ollama pull <model>' to download. Popular: qwen2.5-coder, llama3.2, gemma2, codestral, deepseek-coder-v2".to_string()),
                             _ => AgentToolResult::err(
                                 "Ollama not installed or API unreachable".to_string(),
                             ),

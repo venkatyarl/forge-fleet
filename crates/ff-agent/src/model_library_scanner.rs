@@ -199,9 +199,9 @@ fn classify_file(path: &Path, catalog: &[ff_db::ModelCatalogRow]) -> Option<Disc
 
     let size = std::fs::metadata(path).ok().map(|m| m.len()).unwrap_or(0);
     let stem = name
-        .trim_end_matches(|c: char| c == 'f' || c == 'F')
-        .trim_end_matches(|c: char| c == 'g' || c == 'G')
-        .trim_end_matches(|c: char| c == 'g' || c == 'G')
+        .trim_end_matches(['f', 'F'])
+        .trim_end_matches(['g', 'G'])
+        .trim_end_matches(['g', 'G'])
         .trim_end_matches('.')
         .to_string();
     // Simpler: strip .gguf extension case-insensitively.
@@ -211,7 +211,7 @@ fn classify_file(path: &Path, catalog: &[ff_db::ModelCatalogRow]) -> Option<Disc
     // Base name without the quant suffix (best-effort).
     let base_name = if let Some(q) = &quant {
         stem.trim_end_matches(q)
-            .trim_end_matches(|c: char| c == '-' || c == '_' || c == '.')
+            .trim_end_matches(['-', '_', '.'])
             .to_string()
     } else {
         stem.clone()
@@ -318,13 +318,11 @@ fn classify_dir(path: &Path, catalog: &[ff_db::ModelCatalogRow]) -> Option<Disco
         if let Ok(rd) = std::fs::read_dir(sd) {
             for e in rd.flatten() {
                 let p = e.path();
-                if p.is_file() {
-                    if let Some(ext) = p.extension() {
-                        if ext.eq_ignore_ascii_case("gguf") {
+                if p.is_file()
+                    && let Some(ext) = p.extension()
+                        && ext.eq_ignore_ascii_case("gguf") {
                             nested_ggufs.push(p);
                         }
-                    }
-                }
             }
         }
     }

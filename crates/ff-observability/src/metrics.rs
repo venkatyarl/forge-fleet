@@ -476,9 +476,9 @@ pub fn metrics_handler() -> String {
 pub fn normalize_path(path: &str) -> String {
     path.split('/')
         .map(|seg| {
-            if seg.len() == 36 && seg.chars().filter(|c| *c == '-').count() == 4 {
-                ":id"
-            } else if !seg.is_empty() && seg.chars().all(|c| c.is_ascii_digit()) {
+            if (seg.len() == 36 && seg.chars().filter(|c| *c == '-').count() == 4)
+                || (!seg.is_empty() && seg.chars().all(|c| c.is_ascii_digit()))
+            {
                 ":id"
             } else {
                 seg

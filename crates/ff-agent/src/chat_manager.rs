@@ -77,8 +77,10 @@ pub enum ChatStatus {
 /// How the model is selected for this chat.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ModelSelection {
     /// ForgeFleet auto-selects based on the question/task.
+    #[default]
     Auto,
     /// User explicitly chose a specific model/endpoint.
     Manual { model: String, llm_base_url: String },
@@ -88,11 +90,6 @@ pub enum ModelSelection {
     },
 }
 
-impl Default for ModelSelection {
-    fn default() -> Self {
-        Self::Auto
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Chat list for navigation
@@ -146,12 +143,11 @@ impl ChatManager {
                 if path.extension().and_then(|e| e.to_str()) != Some("json") {
                     continue;
                 }
-                if let Ok(content) = fs::read_to_string(&path).await {
-                    if let Ok(chat) = serde_json::from_str::<ChatSession>(&content) {
+                if let Ok(content) = fs::read_to_string(&path).await
+                    && let Ok(chat) = serde_json::from_str::<ChatSession>(&content) {
                         manager.index_chat(&chat);
                         manager.chats.insert(chat.id.clone(), chat);
                     }
-                }
             }
         }
 
@@ -282,13 +278,7 @@ impl ChatManager {
     pub fn list_by_scope(&self, scope_type: &str) -> Vec<ChatListEntry> {
         self.chats
             .values()
-            .filter(|c| match (&c.scope, scope_type) {
-                (MemoryScope::Global, "global") => true,
-                (MemoryScope::Project { .. }, "project") => true,
-                (MemoryScope::Folder { .. }, "folder") => true,
-                (MemoryScope::Temp { .. }, "temp") => true,
-                _ => false,
-            })
+            .filter(|c| matches!((&c.scope, scope_type), (MemoryScope::Global, "global") | (MemoryScope::Project { .. }, "project") | (MemoryScope::Folder { .. }, "folder") | (MemoryScope::Temp, "temp")))
             .map(chat_to_list_entry)
             .collect()
     }

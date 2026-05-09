@@ -135,10 +135,7 @@ fn infer_strengths(model: &ff_db::FleetModelRow) -> Vec<Strength> {
         if family.contains("coder") || name.contains("coder") {
             set.push(Strength::Coding);
             set.push(Strength::Review);
-        } else if family.contains("gemma") || family.contains("llama") {
-            set.push(Strength::General);
-            set.push(Strength::Reasoning);
-        } else if family.contains("qwen") {
+        } else if family.contains("gemma") || family.contains("llama") || family.contains("qwen") {
             set.push(Strength::General);
             set.push(Strength::Reasoning);
         } else {
@@ -173,11 +170,10 @@ fn infer_params_from_name(name: &str) -> u64 {
             while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
                 i += 1;
             }
-            if i < bytes.len() && bytes[i] == b'b' {
-                if let Ok(n) = lower[start..i].parse::<f64>() {
+            if i < bytes.len() && bytes[i] == b'b'
+                && let Ok(n) = lower[start..i].parse::<f64>() {
                     return (n * 1_000_000_000.0) as u64;
                 }
-            }
         } else {
             i += 1;
         }
@@ -395,7 +391,7 @@ pub fn analyze_task(prompt: &str) -> TaskType {
     // ---- Complex patterns ----
     if (lower.contains(" and ") && lower.contains(" then "))
         || lower
-            .split(|c: char| c == '.' || c == ';' || c == ',')
+            .split(['.', ';', ','])
             .count()
             > 3
         || lower.len() > 300

@@ -525,7 +525,7 @@ async fn mirror_session_to_vault(pool: &PgPool, session_id: uuid::Uuid) -> Resul
     .context("read session_brain for mirror")?;
     for b in brain {
         let key: String = b.get("key");
-        let value: Value = b.try_get("value").unwrap_or_else(|_| json!(null));
+        let value: Value = b.try_get("value").unwrap_or(Value::Null);
         let by_role: Option<String> = b.try_get("written_by_role").ok();
         let safe_key = sanitize_filename(&key);
         let body = format!(

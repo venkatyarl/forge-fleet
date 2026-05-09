@@ -97,9 +97,7 @@ impl AgentTool for PasswordGenTool {
         let mut passwords = Vec::new();
         for _ in 0..count {
             let cmd = match format {
-                "passphrase" => format!(
-                    "LC_ALL=C tr -dc 'a-z' < /dev/urandom | fold -w 5 | head -6 | paste -sd'-' -"
-                ),
+                "passphrase" => "LC_ALL=C tr -dc 'a-z' < /dev/urandom | fold -w 5 | head -6 | paste -sd'-' -".to_string(),
                 "pin" => format!("LC_ALL=C tr -dc '0-9' < /dev/urandom | head -c {length}"),
                 _ => {
                     let charset = if input
@@ -260,15 +258,14 @@ impl AgentTool for CalculatorTool {
             "python3 -c \"from math import *; print({})\"",
             expr.replace('"', "\\\"")
         );
-        if let Ok(out) = Command::new("bash").arg("-c").arg(&py_cmd).output().await {
-            if out.status.success() {
+        if let Ok(out) = Command::new("bash").arg("-c").arg(&py_cmd).output().await
+            && out.status.success() {
                 return AgentToolResult::ok(format!(
                     "{} = {}",
                     expr,
                     String::from_utf8_lossy(&out.stdout).trim()
                 ));
             }
-        }
 
         // Fallback to bc
         let bc_cmd = format!("echo 'scale=6; {}' | bc -l", expr);

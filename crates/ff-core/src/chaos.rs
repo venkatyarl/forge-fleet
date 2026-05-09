@@ -188,40 +188,35 @@ pub struct ChaosEngine {
     hooks: Arc<Mutex<ChaosHooks>>,
 }
 
+/// Type alias for a node-level chaos hook callback.
+pub type NodeHook = Box<dyn Fn(&str) -> Result<()> + Send + Sync>;
+
+/// Type alias for a model-level chaos hook callback.
+pub type ModelHook = Box<dyn Fn(&str, &str) -> Result<()> + Send + Sync>;
+
+/// Type alias for a leader-level chaos hook callback.
+pub type LeaderHook = Box<dyn Fn() -> Result<()> + Send + Sync>;
+
 /// Callbacks for applying and reverting chaos simulations.
 /// The fleet runtime wires these up to actual node/model/leader state.
+#[derive(Default)]
 pub struct ChaosHooks {
     /// Called to mark a node offline. Returns Ok(()) if applied.
-    pub on_node_failure: Option<Box<dyn Fn(&str) -> Result<()> + Send + Sync>>,
+    pub on_node_failure: Option<NodeHook>,
     /// Called to restore a node. Returns Ok(()) if reverted.
-    pub on_node_recover: Option<Box<dyn Fn(&str) -> Result<()> + Send + Sync>>,
+    pub on_node_recover: Option<NodeHook>,
     /// Called to crash a model endpoint. Returns Ok(()) if applied.
-    pub on_model_crash: Option<Box<dyn Fn(&str, &str) -> Result<()> + Send + Sync>>,
+    pub on_model_crash: Option<ModelHook>,
     /// Called to restore a model endpoint. Returns Ok(()) if reverted.
-    pub on_model_recover: Option<Box<dyn Fn(&str, &str) -> Result<()> + Send + Sync>>,
+    pub on_model_recover: Option<ModelHook>,
     /// Called to force leader to yield. Returns Ok(()) if applied.
-    pub on_leader_yield: Option<Box<dyn Fn() -> Result<()> + Send + Sync>>,
+    pub on_leader_yield: Option<LeaderHook>,
     /// Called to resume normal leader election. Returns Ok(()) if reverted.
-    pub on_leader_resume: Option<Box<dyn Fn() -> Result<()> + Send + Sync>>,
+    pub on_leader_resume: Option<LeaderHook>,
     /// Called to partition two nodes. Returns Ok(()) if applied.
-    pub on_partition: Option<Box<dyn Fn(&str, &str) -> Result<()> + Send + Sync>>,
+    pub on_partition: Option<ModelHook>,
     /// Called to heal a partition. Returns Ok(()) if reverted.
-    pub on_heal_partition: Option<Box<dyn Fn(&str, &str) -> Result<()> + Send + Sync>>,
-}
-
-impl Default for ChaosHooks {
-    fn default() -> Self {
-        Self {
-            on_node_failure: None,
-            on_node_recover: None,
-            on_model_crash: None,
-            on_model_recover: None,
-            on_leader_yield: None,
-            on_leader_resume: None,
-            on_partition: None,
-            on_heal_partition: None,
-        }
-    }
+    pub on_heal_partition: Option<ModelHook>,
 }
 
 impl ChaosEngine {
@@ -500,19 +495,19 @@ impl ChaosEngine {
 
         // Update simulation state
         let mut sims = simulations.lock().await;
-        if let Some(sim) = sims.get_mut(sim_id) {
-            if sim.state == SimulationState::Active {
-                match revert_result {
-                    Ok(()) => {
-                        sim.state = SimulationState::Recovered;
-                        info!(id = %sim_id, "Chaos simulation auto-recovered");
-                    }
-                    Err(e) => {
-                        sim.state = SimulationState::Error {
-                            reason: format!("recovery failed: {e}"),
-                        };
-                        warn!(id = %sim_id, error = %e, "Chaos simulation recovery failed");
-                    }
+        if let Some(sim) = sims.get_mut(sim_id)
+            && sim.state == SimulationState::Active
+        {
+            match revert_result {
+                Ok(()) => {
+                    sim.state = SimulationState::Recovered;
+                    info!(id = %sim_id, "Chaos simulation auto-recovered");
+                }
+                Err(e) => {
+                    sim.state = SimulationState::Error {
+                        reason: format!("recovery failed: {e}"),
+                    };
+                    warn!(id = %sim_id, error = %e, "Chaos simulation recovery failed");
                 }
             }
         }

@@ -3,7 +3,7 @@
 //! Enables running N independent coding agents simultaneously, each on a
 //! different fleet node, with coordination, event streaming, and result aggregation.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -312,11 +312,11 @@ pub struct VerificationPipeline {
 
 impl VerificationPipeline {
     /// Run the full pipeline: code → test → verify.
-    pub async fn run(&self, prompt: &str, working_dir: &PathBuf) -> VerificationResult {
+    pub async fn run(&self, prompt: &str, working_dir: &Path) -> VerificationResult {
         // Step 1: Generate code on the code endpoint
         let code_config = AgentSessionConfig {
             llm_base_url: self.code_endpoint.clone(),
-            working_dir: working_dir.clone(),
+            working_dir: working_dir.to_path_buf(),
             system_prompt: Some(
                 "You are a coding agent. Write code to accomplish the task. Run tests after."
                     .into(),
@@ -353,7 +353,7 @@ impl VerificationPipeline {
         // Step 2: Run tests on the test endpoint
         let test_config = AgentSessionConfig {
             llm_base_url: self.test_endpoint.clone(),
-            working_dir: working_dir.clone(),
+            working_dir: working_dir.to_path_buf(),
             system_prompt: Some("You are a test runner. Run the project's test suite and report results. Use Bash to run tests.".into()),
             max_turns: 5,
             auto_save: false,
@@ -373,7 +373,7 @@ impl VerificationPipeline {
         // Step 3: Verify on the verify endpoint
         let verify_config = AgentSessionConfig {
             llm_base_url: self.verify_endpoint.clone(),
-            working_dir: working_dir.clone(),
+            working_dir: working_dir.to_path_buf(),
             system_prompt: Some("You are a code reviewer. Review the recent changes and test results. Report whether the implementation is correct.".into()),
             max_turns: 3,
             auto_save: false,

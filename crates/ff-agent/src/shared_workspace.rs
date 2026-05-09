@@ -246,11 +246,10 @@ pub async fn list_agent_workspaces() -> Result<Vec<String>> {
         match entries.next_entry().await {
             Ok(Some(entry)) => {
                 let path = entry.path();
-                if path.is_dir() {
-                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if path.is_dir()
+                    && let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                         agents.push(name.to_string());
                     }
-                }
             }
             Ok(None) => break,
             Err(_) => break,

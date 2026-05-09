@@ -650,7 +650,7 @@ impl SyntheticProbe for ReplicationLagProbe {
             results.push(
                 ProbeResult::new("replication_lag", status, latency, Some(node_name.clone()))
                     .with_meta("leader", leader_name)
-                    .with_meta("leader_seq", &leader_seq.to_string()),
+                    .with_meta("leader_seq", leader_seq.to_string()),
             );
         }
 

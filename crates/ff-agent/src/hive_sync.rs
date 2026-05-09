@@ -23,6 +23,12 @@ pub struct HiveSync {
     local_path: PathBuf,
 }
 
+impl Default for HiveSync {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl HiveSync {
     pub fn new() -> Self {
         Self {

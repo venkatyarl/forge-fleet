@@ -1038,10 +1038,11 @@ fn default_require_shared_secret() -> bool {
 // ── Database ─────────────────────────────────────────────────────────────────
 
 /// Database mode selector for runtime persistence.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum DatabaseMode {
     /// Full embedded SQLite runtime (default).
+    #[default]
     EmbeddedSqlite,
     /// Transitional mode: runtime registry + enrollment events in Postgres,
     /// while legacy tables remain in embedded SQLite.
@@ -1053,12 +1054,6 @@ pub enum DatabaseMode {
     /// loudly when any SQLite-only dependency remains.
     #[serde(alias = "full_postgres", alias = "full-postgres")]
     PostgresFull,
-}
-
-impl Default for DatabaseMode {
-    fn default() -> Self {
-        Self::EmbeddedSqlite
-    }
 }
 
 impl DatabaseMode {

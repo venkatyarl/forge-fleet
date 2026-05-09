@@ -61,11 +61,10 @@ impl SelfImprovementLoop {
         let mut by_model: HashMap<String, (u64, usize)> = HashMap::new(); // (total_ms, count)
 
         for s in hist.iter() {
-            if !s.success {
-                if let Some(ref err) = s.error_kind {
+            if !s.success
+                && let Some(ref err) = s.error_kind {
                     by_error.entry(err.clone()).or_default().push(s);
                 }
-            }
             let entry = by_model.entry(s.model.clone()).or_insert((0, 0));
             entry.0 += s.duration_ms;
             entry.1 += 1;

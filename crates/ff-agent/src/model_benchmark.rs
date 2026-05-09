@@ -388,18 +388,16 @@ pub async fn pick_benchmark_target(
         }
 
         // RAM fit check (used as "does the model fit?").
-        if let Some(min_vram) = reqs.min_vram_gb {
-            if (b.hardware.ram_gb as f64) < min_vram {
+        if let Some(min_vram) = reqs.min_vram_gb
+            && (b.hardware.ram_gb as f64) < min_vram {
                 continue;
             }
-        }
 
         // Disk headroom check: file_size + 5GB slack.
-        if let Some(fs_gb) = reqs.file_size_gb {
-            if b.load.disk_free_gb < fs_gb + 5.0 {
+        if let Some(fs_gb) = reqs.file_size_gb
+            && b.load.disk_free_gb < fs_gb + 5.0 {
                 continue;
             }
-        }
 
         candidates.push((
             b.computer_name.clone(),
@@ -429,14 +427,14 @@ pub async fn benchmark_with_defaults(
         std::env::var("FORGEFLEET_REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6380".into());
     let pulse = PulseReader::new(&redis_url).map_err(|e| BenchError::Pulse(e.to_string()))?;
     let b = ModelBenchmarker::new(pg.clone(), pulse);
-    b.benchmark(model_id, computer).await.or_else(|e| {
+    b.benchmark(model_id, computer).await.map_err(|e| {
         if matches!(e, BenchError::NotLoaded(_, _)) {
             warn!(
                 model = model_id,
                 computer, "model not loaded on target; reporting as not-yet-implemented"
             );
         }
-        Err(e)
+        e
     })
 }
 

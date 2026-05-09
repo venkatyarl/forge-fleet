@@ -230,7 +230,7 @@ ram_gb = {ram_gb}
 gpu_type = "{gpu}"
 "#
         );
-        steps.push(format!("Fleet config entry generated"));
+        steps.push("Fleet config entry generated".to_string());
 
         // Step 4: Check if LLM server is running
         let llm_check = reqwest::Client::builder()
@@ -387,8 +387,8 @@ impl AgentTool for FleetInventoryTool {
             for port in &ports {
                 let url = format!("http://{ip}:{port}/v1/models");
                 if let Ok(resp) = client.get(&url).send().await {
-                    if resp.status().is_success() {
-                        if let Ok(body) = resp.text().await {
+                    if resp.status().is_success()
+                        && let Ok(body) = resp.text().await {
                             let model_name = serde_json::from_str::<Value>(&body)
                                 .ok()
                                 .and_then(|v| {
@@ -402,14 +402,14 @@ impl AgentTool for FleetInventoryTool {
                                 .unwrap_or_else(|| "unknown".into());
                             found_services.push(format!("    port {port}: {model_name} (ONLINE)"));
                         }
-                    }
                 } else {
                     // Check if port is open but not LLM
-                    if let Ok(_) = tokio::time::timeout(
+                    if tokio::time::timeout(
                         std::time::Duration::from_secs(1),
                         tokio::net::TcpStream::connect(format!("{ip}:{port}")),
                     )
                     .await
+                    .is_ok()
                     {
                         found_services.push(format!("    port {port}: service running (not LLM)"));
                     }
@@ -419,7 +419,7 @@ impl AgentTool for FleetInventoryTool {
             if found_services.is_empty() {
                 node_info.push_str(" OFFLINE or no LLM services");
             } else {
-                node_info.push_str("\n");
+                node_info.push('\n');
                 node_info.push_str(&found_services.join("\n"));
             }
             inventory.push(node_info);
@@ -522,8 +522,7 @@ impl AgentTool for NodeHealthCheckTool {
             .get(format!("http://{host}:{port}/v1/models"))
             .send()
             .await
-        {
-            if let Ok(body) = resp.text().await {
+            && let Ok(body) = resp.text().await {
                 let models: Vec<String> = serde_json::from_str::<Value>(&body)
                     .ok()
                     .and_then(|v| v.get("data")?.as_array().cloned())
@@ -542,7 +541,6 @@ impl AgentTool for NodeHealthCheckTool {
                     }
                 ));
             }
-        }
 
         AgentToolResult::ok(format!("Health Check — {host}\n\n{}", checks.join("\n")))
     }
@@ -619,9 +617,7 @@ impl AgentTool for BinaryDeployTool {
             }
         } else {
             // Build on target
-            let build_cmd = format!(
-                "cd ~/projects/forge-fleet && git pull && cargo build --release -p ff-terminal && cp target/release/ff /usr/local/bin/ff"
-            );
+            let build_cmd = "cd ~/projects/forge-fleet && git pull && cargo build --release -p ff-terminal && cp target/release/ff /usr/local/bin/ff".to_string();
             let result = ssh_cmd(user, host, &build_cmd).await;
             AgentToolResult::ok(format!(
                 "Remote build on {host}:\n{}",

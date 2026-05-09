@@ -53,12 +53,15 @@ impl CircuitBreaker {
             config,
         }
     }
+}
 
-    /// Create with default configuration.
-    pub fn default() -> Self {
+impl Default for CircuitBreaker {
+    fn default() -> Self {
         Self::new(CircuitBreakerConfig::default())
     }
+}
 
+impl CircuitBreaker {
     /// Record a successful request.
     /// Resets failure count and closes the circuit if it was half-open.
     pub fn record_success(&self) {

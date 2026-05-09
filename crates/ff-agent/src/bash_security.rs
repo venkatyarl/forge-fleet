@@ -119,9 +119,7 @@ pub fn scan_command(command: &str) -> SecurityScanResult {
         .min(100);
 
     // Determine action
-    let action = if threats.iter().any(|t| t.severity == Severity::Critical) {
-        SecurityAction::Block
-    } else if risk_score > 50 {
+    let action = if threats.iter().any(|t| t.severity == Severity::Critical) || risk_score > 50 {
         SecurityAction::Block
     } else if risk_score > 20 {
         SecurityAction::Warn
@@ -236,7 +234,7 @@ fn detect_quote_desync(cmd: &str, threats: &mut Vec<SecurityThreat>) {
         }
         prev = ch;
     }
-    if single_count % 2 != 0 || double_count % 2 != 0 {
+    if !single_count.is_multiple_of(2) || !double_count.is_multiple_of(2) {
         threats.push(SecurityThreat {
             category: ThreatCategory::QuoteDesync,
             description: "Unmatched quotes detected — possible injection vector".into(),
@@ -666,7 +664,7 @@ pub fn validate_command_paths(
 
         // Check for escaping working directory
         if path_str.starts_with('/')
-            && !path_str.starts_with(&working_dir.to_string_lossy().as_ref())
+            && !path_str.starts_with(working_dir.to_string_lossy().as_ref())
         {
             // Accessing absolute path outside working dir — not blocked but noted
         }

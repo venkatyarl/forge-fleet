@@ -157,20 +157,17 @@ impl AgentTool for ClipboardTool {
                 let result = Command::new("pbcopy")
                     .stdin(std::process::Stdio::piped())
                     .spawn();
-                match result {
-                    Ok(mut child) => {
-                        use tokio::io::AsyncWriteExt;
-                        if let Some(mut stdin) = child.stdin.take() {
-                            let _ = stdin.write_all(content.as_bytes()).await;
-                        }
-                        match child.wait_with_output().await {
-                            Ok(o) if o.status.success() => {
-                                return AgentToolResult::ok("Content copied to clipboard".to_string());
-                            }
-                            _ => {}
-                        }
+                if let Ok(mut child) = result {
+                    use tokio::io::AsyncWriteExt;
+                    if let Some(mut stdin) = child.stdin.take() {
+                        let _ = stdin.write_all(content.as_bytes()).await;
                     }
-                    Err(_) => {}
+                    match child.wait_with_output().await {
+                        Ok(o) if o.status.success() => {
+                            return AgentToolResult::ok("Content copied to clipboard".to_string());
+                        }
+                        _ => {}
+                    }
                 }
                 // Fallback to xclip
                 let result = Command::new("xclip")
@@ -273,11 +270,8 @@ impl AgentTool for SystemControlTool {
             }
             "battery" => {
                 #[cfg(target_os = "macos")]
-                match Command::new("pmset").args(["-g", "batt"]).output().await {
-                    Ok(o) => {
-                        return AgentToolResult::ok(String::from_utf8_lossy(&o.stdout).to_string());
-                    }
-                    Err(_) => {}
+                if let Ok(o) = Command::new("pmset").args(["-g", "batt"]).output().await {
+                    return AgentToolResult::ok(String::from_utf8_lossy(&o.stdout).to_string());
                 }
                 match Command::new("cat")
                     .arg("/sys/class/power_supply/BAT0/capacity")

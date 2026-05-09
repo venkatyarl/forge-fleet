@@ -199,7 +199,7 @@ pub fn core_tools() -> Vec<Box<dyn AgentTool>> {
 
 /// Returns core tools as Arc (for parallel execution).
 pub fn core_tools_arc() -> Vec<Arc<dyn AgentTool>> {
-    core_tools().into_iter().map(|t| Arc::from(t)).collect()
+    core_tools().into_iter().map(Arc::from).collect()
 }
 
 /// Returns all built-in agent tools (boxed) — used for ToolSearch discovery.
@@ -368,7 +368,7 @@ pub fn all_tools() -> Vec<Box<dyn AgentTool>> {
 
 /// Returns all built-in agent tools as Arc (for parallel execution).
 pub fn all_tools_arc() -> Vec<Arc<dyn AgentTool>> {
-    all_tools().into_iter().map(|t| Arc::from(t)).collect()
+    all_tools().into_iter().map(Arc::from).collect()
 }
 
 /// Find a tool by name (case-insensitive).

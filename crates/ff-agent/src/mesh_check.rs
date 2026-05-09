@@ -54,11 +54,10 @@ async fn pairwise_ssh_check_inner(
             if src.name == dst.name {
                 continue;
             }
-            if let Some(n) = only_node {
-                if src.name != n && dst.name != n {
+            if let Some(n) = only_node
+                && src.name != n && dst.name != n {
                     continue;
                 }
-            }
             pairs.push((
                 src.name.clone(),
                 src.ssh_user.clone(),
@@ -83,8 +82,8 @@ async fn pairwise_ssh_check_inner(
             .map(|n| n.ip.clone())
             .unwrap_or_default();
         futs.push(probe_pair(src, src_user, src_ip, dst, dst_user, dst_ip));
-        if futs.len() >= 8 {
-            if let Some(cell) = futs.next().await {
+        if futs.len() >= 8
+            && let Some(cell) = futs.next().await {
                 let _ = ff_db::pg_upsert_mesh_status(
                     pool,
                     &cell.src,
@@ -95,7 +94,6 @@ async fn pairwise_ssh_check_inner(
                 .await;
                 cells.push(cell);
             }
-        }
     }
     while let Some(cell) = futs.next().await {
         let _ = ff_db::pg_upsert_mesh_status(

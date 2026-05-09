@@ -199,10 +199,10 @@ fn detect_git_checkout(rule: &DetectionRule) -> Option<InstalledSoftware> {
 /// macOS or mlx_lm on Linux.
 fn detect_python_module(rule: &DetectionRule) -> Option<InstalledSoftware> {
     let module = rule.detection.get("module")?.as_str()?;
-    if let Some(filter) = rule.detection.get("os_filter").and_then(|v| v.as_str()) {
-        if std::env::consts::OS != filter {
-            return None;
-        }
+    if let Some(filter) = rule.detection.get("os_filter").and_then(|v| v.as_str())
+        && std::env::consts::OS != filter
+    {
+        return None;
     }
     let version = run_python_version_probe(module)?;
     let install_source = rule
@@ -267,17 +267,17 @@ fn detect_os_release(rule: &DetectionRule) -> Option<InstalledSoftware> {
             let id = regex_capture(&osr, r#"^ID\s*=\s*"?([^"\n]+)"?"#)
                 .or_else(|| regex_capture(&osr, r#"\nID\s*=\s*"?([^"\n]+)"?"#))
                 .unwrap_or_default();
-            if let Some(want) = expected_id {
-                if id != want {
-                    return None;
-                }
+            if let Some(want) = expected_id
+                && id != want
+            {
+                return None;
             }
             let version_id =
                 regex_capture(&osr, r#"VERSION_ID\s*=\s*"([^"]+)""#).unwrap_or_default();
-            if let Some(prefix) = expected_version_prefix {
-                if !version_id.starts_with(prefix) {
-                    return None;
-                }
+            if let Some(prefix) = expected_version_prefix
+                && !version_id.starts_with(prefix)
+            {
+                return None;
             }
             Some(InstalledSoftware {
                 id: rule.software_id.clone(),
@@ -497,9 +497,10 @@ struct ParsedVersionLine {
 /// legacy shape leaves `git_state = None` so callers know this is an
 /// older fleet node that can't be safety-gated.
 fn parse_ff_version_line(raw: &str) -> ParsedVersionLine {
-    let mut out = ParsedVersionLine::default();
-    // Version token follows the leading binary name ("ff"/"forgefleet"/"forgefleetd").
-    out.version = regex_capture(raw, r"(?:ff|forgefleet\S*)\s+(\S+)");
+    let mut out = ParsedVersionLine {
+        version: regex_capture(raw, r"(?:ff|forgefleet\S*)\s+(\S+)"),
+        ..Default::default()
+    };
 
     // Suffix — current shape first, then legacy.
     if let Some(caps) = Regex::new(r"\((pushed|unpushed|dirty|unknown)\s+([0-9a-f]{6,40}\+?\S*)\)")
@@ -509,10 +510,10 @@ fn parse_ff_version_line(raw: &str) -> ParsedVersionLine {
         out.git_state = caps.get(1).map(|m| m.as_str().to_string());
         let sha = caps.get(2).map(|m| m.as_str().to_string());
         out.sha = sha.filter(|s| s != "unknown");
-    } else if let Some(sha) = regex_capture(raw, r"\(build\s+([0-9a-f]{6,40})\)") {
-        if sha != "unknown" {
-            out.sha = Some(sha);
-        }
+    } else if let Some(sha) = regex_capture(raw, r"\(build\s+([0-9a-f]{6,40})\)")
+        && sha != "unknown"
+    {
+        out.sha = Some(sha);
     }
     out
 }

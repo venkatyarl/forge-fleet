@@ -329,9 +329,8 @@ pub fn derive_runtime_node_status(
     let degraded_threshold = degraded_after_secs.max(1);
     let offline_threshold = offline_after_secs.max(degraded_threshold + 1);
 
-    let heartbeat = parse_utc_timestamp(last_heartbeat).unwrap_or_else(|| now.clone());
+    let heartbeat = parse_utc_timestamp(last_heartbeat).unwrap_or(*now);
     let age_secs = now
-        .clone()
         .signed_duration_since(heartbeat)
         .num_seconds()
         .max(0);
@@ -1838,19 +1837,18 @@ pub async fn pg_read_safety_gate(
 
     // Falsy + expired TTL → auto-restore to the safe "on" default. Log a
     // warning so the auto-restore is visible in journalctl.
-    if !parsed {
-        if let Some(exp) = expires_at {
-            if exp < chrono::Utc::now() {
-                let reason: Option<String> = row.try_get("disabled_reason").ok();
-                tracing::warn!(
-                    key = %key,
-                    expired_at = %exp,
-                    reason = ?reason,
-                    "safety gate auto-restoring: kill-switch TTL expired"
-                );
-                return Ok(restore_when_expired);
-            }
-        }
+    if !parsed
+        && let Some(exp) = expires_at
+        && exp < chrono::Utc::now()
+    {
+        let reason: Option<String> = row.try_get("disabled_reason").ok();
+        tracing::warn!(
+            key = %key,
+            expired_at = %exp,
+            reason = ?reason,
+            "safety gate auto-restoring: kill-switch TTL expired"
+        );
+        return Ok(restore_when_expired);
     }
 
     Ok(parsed)
@@ -2027,6 +2025,7 @@ pub struct ModelLibraryRow {
 }
 
 /// Upsert a library entry keyed by (node_name, file_path). Returns library id.
+#[allow(clippy::too_many_arguments)]
 pub async fn pg_upsert_library(
     pool: &PgPool,
     node_name: &str,
@@ -2174,6 +2173,7 @@ pub async fn pg_list_deployments(
 }
 
 /// Upsert a deployment (node + port is unique).
+#[allow(clippy::too_many_arguments)]
 pub async fn pg_upsert_deployment(
     pool: &PgPool,
     node_name: &str,
@@ -2345,6 +2345,7 @@ pub async fn pg_create_job(
 }
 
 /// Update job progress. Any field can be left None to keep its current value.
+#[allow(clippy::too_many_arguments)]
 pub async fn pg_update_job_progress(
     pool: &PgPool,
     id: &str,
@@ -2616,6 +2617,7 @@ pub struct DeferredTaskRow {
 }
 
 /// Insert a new deferred task. Returns the generated UUID.
+#[allow(clippy::too_many_arguments)]
 pub async fn pg_enqueue_deferred(
     pool: &PgPool,
     title: &str,
@@ -3175,17 +3177,17 @@ pub async fn load_fleet_config_from_postgres(
     load_setting!("loops", LoopSettings, loops);
 
     // ── Services ──
-    if let Some(services_val) = pg_get_setting(pool, "services").await? {
-        if let Ok(map) = serde_json::from_value::<HashMap<String, ServiceConfig>>(services_val) {
-            config.services = map;
-        }
+    if let Some(services_val) = pg_get_setting(pool, "services").await?
+        && let Ok(map) = serde_json::from_value::<HashMap<String, ServiceConfig>>(services_val)
+    {
+        config.services = map;
     }
 
     // ── MCP configs ──
-    if let Some(mcp_val) = pg_get_setting(pool, "mcp").await? {
-        if let Ok(map) = serde_json::from_value::<HashMap<String, McpConfig>>(mcp_val) {
-            config.mcp = map;
-        }
+    if let Some(mcp_val) = pg_get_setting(pool, "mcp").await?
+        && let Ok(map) = serde_json::from_value::<HashMap<String, McpConfig>>(mcp_val)
+    {
+        config.mcp = map;
     }
 
     info!(
@@ -4129,6 +4131,7 @@ fn row_to_brain_message(r: &sqlx::postgres::PgRow) -> BrainMessageRow {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn pg_insert_brain_message(
     pool: &PgPool,
     thread_id: uuid::Uuid,
@@ -4221,6 +4224,7 @@ fn row_to_brain_vault_node(r: &sqlx::postgres::PgRow) -> BrainVaultNodeRow {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn pg_upsert_brain_vault_node(
     pool: &PgPool,
     path: &str,
@@ -4417,6 +4421,7 @@ pub struct BrainCandidateRow {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn pg_insert_brain_candidate(
     pool: &PgPool,
     user_id: uuid::Uuid,
@@ -5011,6 +5016,7 @@ pub struct TrainingJobRow {
     pub created_by: Option<String>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn pg_create_training_job(
     pool: &PgPool,
     name: &str,

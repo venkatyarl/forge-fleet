@@ -22,9 +22,10 @@ use crate::types::ChatMessage;
 // ─── Configuration ───────────────────────────────────────────────────────────
 
 /// Routing policy for local vs cloud model selection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RoutingPolicy {
     /// Prefer local models, only escalate to cloud for complex tasks or when local fails.
+    #[default]
     LocalFirst,
     /// Optimize for lowest cost (prefer local, then cheapest cloud).
     CostOptimized,
@@ -32,12 +33,6 @@ pub enum RoutingPolicy {
     QualityFirst,
     /// Balanced: consider quality, cost, and locality together.
     Balanced,
-}
-
-impl Default for RoutingPolicy {
-    fn default() -> Self {
-        RoutingPolicy::LocalFirst
-    }
 }
 
 /// Configuration for the adaptive router.
@@ -603,17 +598,17 @@ impl AdaptiveRouter {
             }
 
             // If same tier, prefer lower latency
-            if r.tier == candidate.tier && r.avg_latency_ms < candidate.avg_latency_ms {
-                if filtered[0].avg_latency_ms > 0.0
-                    && r.avg_latency_ms / filtered[0].avg_latency_ms
-                        < self.config.max_latency_ratio
-                {
-                    candidate = r;
-                    reason = format!(
-                        "similar quality ({:.2}) with lower latency ({:.0}ms vs {:.0}ms)",
-                        r.score, r.avg_latency_ms, candidate.avg_latency_ms
-                    );
-                }
+            if r.tier == candidate.tier
+                && r.avg_latency_ms < candidate.avg_latency_ms
+                && filtered[0].avg_latency_ms > 0.0
+                && r.avg_latency_ms / filtered[0].avg_latency_ms
+                    < self.config.max_latency_ratio
+            {
+                candidate = r;
+                reason = format!(
+                    "similar quality ({:.2}) with lower latency ({:.0}ms vs {:.0}ms)",
+                    r.score, r.avg_latency_ms, candidate.avg_latency_ms
+                );
             }
         }
 

@@ -181,10 +181,7 @@ impl AgentTool for LogAnalyzerTool {
             Ok(out) => {
                 let output = String::from_utf8_lossy(&out.stdout);
                 // Count errors and warnings
-                let content = match tokio::fs::read_to_string(&path).await {
-                    Ok(c) => c,
-                    Err(_) => String::new(),
-                };
+                let content = tokio::fs::read_to_string(&path).await.unwrap_or_default();
                 let lines = content.lines().count();
                 let errors = content
                     .lines()

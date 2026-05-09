@@ -511,6 +511,7 @@ pub struct SubAgentListRow {
 }
 
 /// List every sub_agent row joined to its computer name.
+#[allow(clippy::type_complexity)]
 pub async fn list_sub_agents(pool: &PgPool) -> Result<Vec<SubAgentListRow>, CoordError> {
     let rows: Vec<(
         Uuid,

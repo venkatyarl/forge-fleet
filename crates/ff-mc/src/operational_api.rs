@@ -1426,7 +1426,7 @@ async fn list_work_item_events(
                     }))
                 })?;
                 let mut events = Vec::new();
-                for row in rows { if let Ok(v) = row { events.push(v); } }
+                for v in rows.flatten() { events.push(v); }
                 Ok(events)
             }).await;
 

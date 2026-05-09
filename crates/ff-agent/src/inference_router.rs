@@ -200,11 +200,11 @@ async fn build_endpoint_list(config_path: &Path) -> Vec<RouterEndpoint> {
     local.sort_by(|a, b| b.supports_tools.cmp(&a.supports_tools));
 
     // --- Remote endpoints from Postgres ---
-    if let Ok(toml_str) = std::fs::read_to_string(config_path) {
-        if let Ok(config) = toml::from_str::<ff_core::config::FleetConfig>(&toml_str) {
+    if let Ok(toml_str) = std::fs::read_to_string(config_path)
+        && let Ok(config) = toml::from_str::<ff_core::config::FleetConfig>(&toml_str) {
             let db_url = config.database.url.trim().to_string();
-            if !db_url.is_empty() {
-                if let Ok(pool) = sqlx::postgres::PgPoolOptions::new()
+            if !db_url.is_empty()
+                && let Ok(pool) = sqlx::postgres::PgPoolOptions::new()
                     .max_connections(1)
                     .acquire_timeout(Duration::from_secs(3))
                     .connect(&db_url)
@@ -289,9 +289,7 @@ async fn build_endpoint_list(config_path: &Path) -> Vec<RouterEndpoint> {
                         remote.push(ep);
                     }
                 }
-            }
         }
-    }
 
     // Final order: local tool-capable → local non-tool → remote tool-capable → remote non-tool
     let mut all = local;
@@ -331,15 +329,12 @@ async fn fetch_first_model_id(base_url: &str) -> String {
         .timeout(Duration::from_secs(2))
         .build()
         .unwrap_or_default();
-    if let Ok(resp) = client.get(&url).send().await {
-        if let Ok(body) = resp.text().await {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
-                if let Some(id) = v["data"][0]["id"].as_str() {
+    if let Ok(resp) = client.get(&url).send().await
+        && let Ok(body) = resp.text().await
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&body)
+                && let Some(id) = v["data"][0]["id"].as_str() {
                     return id.to_string();
                 }
-            }
-        }
-    }
     "auto".into()
 }
 
