@@ -13,7 +13,7 @@
 use std::path::PathBuf;
 
 use ff_api::tool_calling::{
-    ToolChatCompletionRequest, ToolChatCompletionResponse, ToolChatMessage,
+    OpenAiTool, ToolChatCompletionResponse, ToolChatMessage,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -33,6 +33,20 @@ use std::sync::Arc;
 use crate::inference_router::InferenceRouter;
 use crate::tools::{self, AgentTool, AgentToolContext};
 
+/// Shared HTTP client for tool-usage logging (avoids spawning a new
+/// connection-pool thread on every tool call).
+static TOOL_USAGE_CLIENT: std::sync::LazyLock<reqwest::Client> =
+    std::sync::LazyLock::new(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .expect("build reqwest client")
+    });
+
+/// Semaphore to cap concurrent tool-usage logging requests.
+static TOOL_USAGE_SEM: std::sync::LazyLock<tokio::sync::Semaphore> =
+    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(8));
+
 /// Fire-and-forget tool usage logging to the gateway.
 /// Reads FF_GATEWAY_URL and FF_NODE from env; silently skips if unavailable.
 fn log_tool_usage(tool_name: &str, session_id: &str, success: bool, duration_ms: u64) {
@@ -49,17 +63,14 @@ fn log_tool_usage(tool_name: &str, session_id: &str, success: bool, duration_ms:
         "duration_ms": duration_ms as i64,
     });
     let name = tool_name.to_string();
-    tokio::spawn(async move {
-        let _ = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .expect("build reqwest client")
-            .post(format!("{}/api/tools/usage", gateway))
-            .json(&payload)
-            .send()
-            .await;
-        tracing::debug!(tool = %name, "tool usage logged");
-    });
+    let url = format!("{}/api/tools/usage", gateway);
+    if let Ok(permit) = TOOL_USAGE_SEM.try_acquire() {
+        tokio::spawn(async move {
+            let _permit = permit;
+            let _ = TOOL_USAGE_CLIENT.post(&url).json(&payload).send().await;
+            tracing::debug!(tool = %name, "tool usage logged");
+        });
+    }
 }
 
 /// Security gate + audit log for a single tool invocation.
@@ -714,14 +725,31 @@ async fn run_agent_loop(
             debug!(truncated, "applied tool-result budget");
         }
 
-        // --- Build request ---
-        let request = ToolChatCompletionRequest {
-            model: session.config.model.clone(),
-            messages: session.messages.clone(),
+        // --- Build request (borrowed to avoid cloning the message history) ---
+        #[derive(serde::Serialize)]
+        struct ChatRequest<'a> {
+            model: &'a str,
+            messages: &'a [ToolChatMessage],
+            #[serde(skip_serializing_if = "Option::is_none")]
+            tools: Option<&'a [OpenAiTool]>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            tool_choice: Option<serde_json::Value>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            temperature: Option<f32>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            max_tokens: Option<u32>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            stream: Option<bool>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            cache_prompt: Option<bool>,
+        }
+        let request = ChatRequest {
+            model: &session.config.model,
+            messages: &session.messages,
             tools: if openai_tools.is_empty() {
                 None
             } else {
-                Some(openai_tools.clone())
+                Some(&openai_tools)
             },
             tool_choice: Some(serde_json::json!("auto")),
             temperature: Some(session.config.temperature),
@@ -1556,10 +1584,10 @@ async fn run_agent_loop(
 // HTTP helpers
 // ---------------------------------------------------------------------------
 
-async fn send_request(
+async fn send_request<T: serde::Serialize>(
     client: &reqwest::Client,
     url: &str,
-    request: &ToolChatCompletionRequest,
+    request: &T,
 ) -> anyhow::Result<ToolChatCompletionResponse> {
     let resp = client.post(url).json(request).send().await?;
 
