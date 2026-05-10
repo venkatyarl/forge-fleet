@@ -181,7 +181,7 @@ impl HealthMonitor {
         let http_client = Client::builder()
             .timeout(http_timeout)
             .build()
-            .unwrap_or_else(|_| Client::new());
+            .expect("build reqwest client");
 
         Self {
             http_client,

@@ -43,7 +43,7 @@ fn build_client() -> Client {
         .timeout(CLOUD_TIMEOUT)
         .pool_idle_timeout(Duration::from_secs(60))
         .build()
-        .unwrap_or_else(|_| Client::new())
+        .expect("build reqwest client")
 }
 
 /// Send a request with retry-on-429. Honors `Retry-After` (capped at

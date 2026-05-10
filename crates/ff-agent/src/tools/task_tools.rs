@@ -232,7 +232,10 @@ impl AgentTool for TaskUpdateTool {
                 "output": output_clone.unwrap_or_default(),
             });
             tokio::spawn(async move {
-                let client = Client::new();
+                let client = Client::builder()
+                    .timeout(std::time::Duration::from_secs(30))
+                    .build()
+                    .expect("build reqwest client");
                 let _ = client.post(&callback_url).json(&payload).send().await;
             });
         }

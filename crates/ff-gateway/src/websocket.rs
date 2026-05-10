@@ -7,11 +7,12 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::extract::ws::Message;
+use axum::extract::ws::{Message, Utf8Bytes};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -157,7 +158,8 @@ impl WsHub {
             "data": payload,
             "ts": chrono::Utc::now().to_rfc3339(),
         });
-        let text = envelope.to_string();
+        // Convert once to Utf8Bytes (cheap Arc clone per client, not string alloc).
+        let text = Utf8Bytes::from(envelope.to_string());
         let mut dead = Vec::new();
 
         for entry in self.clients.iter() {
@@ -167,7 +169,7 @@ impl WsHub {
             if subscribed
                 && entry
                     .sender
-                    .try_send(Message::Text(text.clone().into()))
+                    .try_send(Message::Text(text.clone()))
                     .is_err()
             {
                 dead.push(*entry.key());
@@ -187,6 +189,7 @@ impl WsHub {
         &self,
         interval: Duration,
         timeout: Duration,
+        cancel: CancellationToken,
     ) -> tokio::task::JoinHandle<()> {
         let clients = self.clients.clone();
 
@@ -195,30 +198,37 @@ impl WsHub {
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             loop {
-                tick.tick().await;
-                let now = Instant::now();
-                let mut dead = Vec::new();
+                tokio::select! {
+                    _ = tick.tick() => {
+                        let now = Instant::now();
+                        let mut dead = Vec::new();
 
-                for entry in clients.iter() {
-                    // Prune clients whose last pong exceeds timeout
-                    if now.duration_since(entry.last_pong) > timeout {
-                        warn!(session = %entry.key(), "ws client timed out — disconnecting");
-                        dead.push(*entry.key());
-                        continue;
+                        for entry in clients.iter() {
+                            // Prune clients whose last pong exceeds timeout
+                            if now.duration_since(entry.last_pong) > timeout {
+                                warn!(session = %entry.key(), "ws client timed out — disconnecting");
+                                dead.push(*entry.key());
+                                continue;
+                            }
+
+                            // Send a ping
+                            if entry
+                                .sender
+                                .try_send(Message::Ping(Vec::new().into()))
+                                .is_err()
+                            {
+                                dead.push(*entry.key());
+                            }
+                        }
+
+                        for id in dead {
+                            clients.remove(&id);
+                        }
                     }
-
-                    // Send a ping
-                    if entry
-                        .sender
-                        .try_send(Message::Ping(Vec::new().into()))
-                        .is_err()
-                    {
-                        dead.push(*entry.key());
+                    _ = cancel.cancelled() => {
+                        debug!("ws heartbeat task shutting down");
+                        break;
                     }
-                }
-
-                for id in dead {
-                    clients.remove(&id);
                 }
             }
         })

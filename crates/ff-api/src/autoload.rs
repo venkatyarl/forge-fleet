@@ -167,15 +167,17 @@ fn local_ipv4_addrs() -> Vec<String> {
 /// This lets us surface partial progress and a bounded timeout uniformly.
 fn spawn_ff_autoload(catalog_id: &str) -> Result<(), String> {
     let bin = resolve_ff_binary();
-    let child = std::process::Command::new(&bin)
+    let mut child = std::process::Command::new(&bin)
         .args(["model", "autoload", catalog_id])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
         .map_err(|e| format!("spawn {bin} model autoload {catalog_id}: {e}"))?;
-    // Detach: we don't care about exit status; we poll the DB for progress.
-    std::mem::forget(child);
+    // Reap in background so the child doesn't become a zombie.
+    tokio::task::spawn_blocking(move || {
+        let _ = child.wait();
+    });
     Ok(())
 }
 

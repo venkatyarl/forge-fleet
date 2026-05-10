@@ -1636,6 +1636,7 @@ impl ConfigHandle {
 pub fn spawn_watcher(
     handle: ConfigHandle,
     tx: watch::Sender<Arc<FleetConfig>>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut last_modified = tokio::fs::metadata(&handle.path)
@@ -1644,17 +1645,26 @@ pub fn spawn_watcher(
             .ok();
 
         loop {
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            let current = tokio::fs::metadata(&handle.path)
-                .await
-                .and_then(|m| m.modified())
-                .ok();
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+                    let current = tokio::fs::metadata(&handle.path)
+                        .await
+                        .and_then(|m| m.modified())
+                        .ok();
 
-            if current != last_modified {
-                last_modified = current;
-                match handle.reload(&tx) {
-                    Ok(()) => info!("config hot-reloaded"),
-                    Err(e) => warn!(error = %e, "config reload failed — keeping previous"),
+                    if current != last_modified {
+                        last_modified = current;
+                        match handle.reload(&tx) {
+                            Ok(()) => info!("config hot-reloaded"),
+                            Err(e) => warn!(error = %e, "config reload failed — keeping previous"),
+                        }
+                    }
+                }
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        tracing::debug!("config watcher shutting down");
+                        break;
+                    }
                 }
             }
         }

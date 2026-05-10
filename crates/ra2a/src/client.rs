@@ -19,7 +19,10 @@ impl Default for A2aClient {
 impl A2aClient {
     pub fn new() -> Self {
         Self {
-            http: Client::new(),
+            http: Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .expect("build reqwest client"),
         }
     }
 

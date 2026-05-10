@@ -337,7 +337,7 @@ impl PulseLlmRouter {
         let http = Client::builder()
             .pool_idle_timeout(Duration::from_secs(30))
             .build()
-            .unwrap_or_else(|_| Client::new());
+            .expect("build reqwest client");
         Ok(Self {
             reader: std::sync::Arc::new(reader),
             http,

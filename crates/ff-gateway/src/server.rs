@@ -137,6 +137,10 @@ pub struct GatewayState {
     pub agent_sessions: Arc<DashMap<Uuid, AgentSessionHandle>>,
     /// Token usage and cost tracker for LLM requests.
     pub cost_tracker: Arc<CostTracker>,
+    /// Cancellation token for background tasks (flush, heartbeat, warmer).
+    pub cancel_token: CancellationToken,
+    /// Shutdown sender for the routing cache warmer.
+    pub warmer_shutdown: Option<tokio::sync::watch::Sender<bool>>,
 }
 
 /// Handle to a running agent session managed by the gateway.
@@ -188,6 +192,8 @@ impl GatewayState {
             ws_hub: crate::websocket::WsHub::new(),
             agent_sessions: Arc::new(DashMap::new()),
             cost_tracker: Arc::new(CostTracker::new()),
+            cancel_token: CancellationToken::new(),
+            warmer_shutdown: None,
         }
     }
 
@@ -366,10 +372,7 @@ impl GatewayServer {
                 let cache = Arc::new(LlmRoutingCache::new(router_arc.clone()));
                 let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
                 cache.spawn_warmer(shutdown_rx);
-                // Forget the tx so the channel is never closed (cache lives
-                // for the process lifetime). If shutdown is ever wired in,
-                // replace this with a held field on GatewayState.
-                std::mem::forget(shutdown_tx);
+                state.warmer_shutdown = Some(shutdown_tx);
 
                 state.pulse_router = Some(router_arc);
                 state.pulse_cache = Some(cache);
@@ -396,24 +399,32 @@ impl GatewayServer {
 
         // Spawn background token ledger flush task (every 5 minutes)
         let flush_state = state.clone();
+        let flush_cancel = state.cancel_token.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(300));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                interval.tick().await;
-                if let Some(pool) = flush_state
-                    .operational_store
-                    .as_ref()
-                    .and_then(|os| os.pg_pool())
-                {
-                    match flush_state.cost_tracker.flush_to_db(pool).await {
-                        Ok(count) if count > 0 => {
-                            tracing::info!(records = count, "token ledger flushed to database");
+                tokio::select! {
+                    _ = interval.tick() => {
+                        if let Some(pool) = flush_state
+                            .operational_store
+                            .as_ref()
+                            .and_then(|os| os.pg_pool())
+                        {
+                            match flush_state.cost_tracker.flush_to_db(pool).await {
+                                Ok(count) if count > 0 => {
+                                    tracing::info!(records = count, "token ledger flushed to database");
+                                }
+                                Ok(_) => {}
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "token ledger flush failed");
+                                }
+                            }
                         }
-                        Ok(_) => {}
-                        Err(e) => {
-                            tracing::warn!(error = %e, "token ledger flush failed");
-                        }
+                    }
+                    _ = flush_cancel.cancelled() => {
+                        tracing::debug!("token ledger flush task shutting down");
+                        break;
                     }
                 }
             }
@@ -431,20 +442,62 @@ impl GatewayServer {
             .await
             .with_context(|| format!("failed to bind ff-gateway on {}", self.config.bind_addr))?;
 
+        let cancel_token = self.state.cancel_token.clone();
+
         // Spawn WebSocket heartbeat pruning task (30s interval, 60s timeout).
-        let _heartbeat_handle = self.state.ws_hub.spawn_heartbeat_task(
+        let heartbeat_handle = self.state.ws_hub.spawn_heartbeat_task(
             std::time::Duration::from_secs(30),
             std::time::Duration::from_secs(60),
+            cancel_token.clone(),
         );
 
         info!(address = %listener.local_addr()?, "ff-gateway listening");
-        axum::serve(listener, self.app()).await?;
+        axum::serve(listener, self.app())
+            .with_graceful_shutdown(shutdown_signal(cancel_token.clone()))
+            .await?;
+
+        // Graceful shutdown: cancel background tasks and signal warmer.
+        cancel_token.cancel();
+        if let Some(tx) = &self.state.warmer_shutdown {
+            let _ = tx.send(true);
+        }
+        heartbeat_handle.abort();
+        info!("ff-gateway shutdown complete");
         Ok(())
     }
 
     pub fn shared_state(&self) -> Arc<GatewayState> {
         self.state.clone()
     }
+}
+
+async fn shutdown_signal(cancel: CancellationToken) {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    let sigterm = async {
+        #[cfg(unix)]
+        {
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("failed to install signal handler")
+                .recv()
+                .await;
+        }
+        #[cfg(not(unix))]
+        {
+            futures::future::pending::<()>().await;
+        }
+    };
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = sigterm => {}
+        _ = cancel.cancelled() => {}
+    }
+    info!("shutdown signal received");
 }
 
 pub async fn run(config: GatewayConfig) -> anyhow::Result<()> {

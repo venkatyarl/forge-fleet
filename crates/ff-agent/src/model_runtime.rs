@@ -130,7 +130,7 @@ pub async fn load_model(pool: &sqlx::PgPool, opts: LoadOptions) -> Result<LoadRe
         .try_clone()
         .map_err(|e| format!("clone log handle: {e}"))?;
 
-    let child = std::process::Command::new(&program)
+    let mut child = std::process::Command::new(&program)
         .args(&args)
         .stdout(log_file)
         .stderr(log_err)
@@ -138,8 +138,10 @@ pub async fn load_model(pool: &sqlx::PgPool, opts: LoadOptions) -> Result<LoadRe
         .spawn()
         .map_err(|e| format!("spawn {program}: {e}"))?;
     let pid = child.id();
-    // We let the OS parent the process by dropping the handle.
-    std::mem::forget(child);
+    // Reap in background so the child doesn't become a zombie.
+    tokio::task::spawn_blocking(move || {
+        let _ = child.wait();
+    });
 
     // Wait for health endpoint to come up (up to 90s).
     let health_ok = wait_for_health(runtime_label, port, std::time::Duration::from_secs(90)).await;

@@ -221,7 +221,8 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
 
     // ─── Config hot-reload handle ────────────────────────────────────────────
     let (config_handle, config_tx) = ConfigHandle::new(config.clone(), config_path.clone());
-    let config_watcher = spawn_watcher(config_handle, config_tx);
+    let (_config_shutdown_tx, config_shutdown_rx) = tokio::sync::watch::channel(false);
+    let config_watcher = spawn_watcher(config_handle, config_tx, config_shutdown_rx);
 
     // ─── Control-plane bootstrap ─────────────────────────────────────────────
     let bootstrap_opts = BootstrapOptions {
@@ -1147,7 +1148,7 @@ async fn announce_leader_to_fleet(
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
+        .expect("build reqwest client");
 
     let payload = serde_json::json!({
         "leader": leader_name,
