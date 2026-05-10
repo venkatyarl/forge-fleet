@@ -338,3 +338,49 @@ pub async fn handle_software_remove(
     );
     Ok(())
 }
+
+
+pub async fn handle_software(cmd: crate::SoftwareCommand) -> Result<()> {
+    let pool = ff_agent::fleet_info::get_fleet_pool()
+        .await
+        .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
+    ff_db::run_postgres_migrations(&pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
+
+    match cmd {
+        crate::SoftwareCommand::List {
+            computer,
+            software,
+            json,
+        } => handle_software_list(&pool, computer, software, json).await,
+        crate::SoftwareCommand::Drift { json } => handle_software_drift(&pool, json).await,
+        crate::SoftwareCommand::Add {
+            id,
+            kind,
+            version_source,
+            upgrade_playbook,
+            display_name,
+        } => {
+            handle_software_add(
+                &pool,
+                &id,
+                &kind,
+                &version_source,
+                &upgrade_playbook,
+                display_name,
+            )
+            .await
+        }
+        crate::SoftwareCommand::Remove { id, yes } => {
+            handle_software_remove(&pool, &id, yes).await
+        }
+        crate::SoftwareCommand::AutoUpgradeRunOnce { force } => {
+            handle_auto_upgrade_run_once(&pool, force).await
+        }
+        crate::SoftwareCommand::Unblock {
+            computer,
+            software_id,
+        } => handle_software_unblock(&pool, &computer, &software_id).await,
+    }
+}

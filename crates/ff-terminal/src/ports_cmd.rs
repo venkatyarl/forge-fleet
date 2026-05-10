@@ -267,3 +267,20 @@ pub async fn handle_ports_scan(pool: &sqlx::PgPool, computer: &str) -> Result<()
 
     Ok(())
 }
+
+
+pub async fn handle_ports(cmd: crate::PortsCommand) -> Result<()> {
+    let pool = ff_agent::fleet_info::get_fleet_pool()
+        .await
+        .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
+    ff_db::run_postgres_migrations(&pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
+
+    match cmd {
+        crate::PortsCommand::List { kind, scope, json } => {
+            handle_ports_list(&pool, kind, scope, json).await
+        }
+        crate::PortsCommand::Scan { computer } => handle_ports_scan(&pool, &computer).await,
+    }
+}

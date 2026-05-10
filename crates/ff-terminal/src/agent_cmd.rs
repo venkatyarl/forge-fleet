@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 
-use crate::{CYAN, GREEN, RESET, YELLOW};
+use crate::{CYAN, GREEN, RESET, YELLOW, resolve_pulse_redis_url};
 
 pub async fn handle_agent_fanout(
     pool: &sqlx::PgPool,
@@ -488,3 +488,115 @@ pub fn shell_quote(s: &str) -> String {
     out
 }
 
+
+
+pub async fn handle_agent(cmd: crate::AgentCommand) -> Result<()> {
+    let pool = ff_agent::fleet_info::get_fleet_pool()
+        .await
+        .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
+    ff_db::run_postgres_migrations(&pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
+
+    match cmd {
+        crate::AgentCommand::Seed => {
+            let n = ff_agent::agent_coordinator::seed_slot_zero_for_all(&pool)
+                .await
+                .map_err(|e| anyhow::anyhow!("seed: {e}"))?;
+            println!("{GREEN}✓{RESET} seeded {n} new sub_agent row(s)");
+            Ok(())
+        }
+        crate::AgentCommand::SubAgents { json } => {
+            let rows = ff_agent::agent_coordinator::list_sub_agents(&pool)
+                .await
+                .map_err(|e| anyhow::anyhow!("list: {e}"))?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+                return Ok(());
+            }
+            if rows.is_empty() {
+                println!("(no sub_agent rows — run `ff agent seed`)");
+                return Ok(());
+            }
+            println!(
+                "{:<14} {:<4} {:<8} {:<36} WORKSPACE",
+                "COMPUTER", "SLOT", "STATUS", "ID"
+            );
+            for r in rows {
+                println!(
+                    "{:<14} {:<4} {:<8} {:<36} {}",
+                    r.computer,
+                    r.slot,
+                    r.status,
+                    r.id.to_string(),
+                    r.workspace_dir
+                );
+            }
+            Ok(())
+        }
+        crate::AgentCommand::Dispatch {
+            prompt,
+            to_computer,
+            work_item_id,
+            json,
+        } => {
+            let wi_id = if let Some(id_str) = work_item_id.clone() {
+                uuid::Uuid::parse_str(&id_str)
+                    .map_err(|e| anyhow::anyhow!("invalid --work-item-id: {e}"))?
+            } else {
+                let created_by = ff_agent::fleet_info::resolve_this_node_name().await;
+                ff_agent::agent_coordinator::create_transient_work_item(&pool, &prompt, &created_by)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("create transient work_item: {e}"))?
+            };
+
+            let redis_url = resolve_pulse_redis_url();
+            let reader = ff_pulse::reader::PulseReader::new(&redis_url)
+                .map_err(|e| anyhow::anyhow!("pulse reader: {e}"))?;
+            let coord = ff_agent::agent_coordinator::AgentCoordinator::new(
+                pool.clone(),
+                std::sync::Arc::new(reader),
+            );
+
+            let receipt = coord
+                .dispatch_task(wi_id, prompt.clone(), to_computer.clone())
+                .await
+                .map_err(|e| anyhow::anyhow!("dispatch: {e}"))?;
+
+            if json {
+                let out = serde_json::json!({
+                    "work_item_id": receipt.work_item_id,
+                    "sub_agent_id": receipt.sub_agent_id,
+                    "work_output_id": receipt.work_output_id,
+                    "computer": receipt.computer_name,
+                    "model": receipt.model_id,
+                    "duration_ms": receipt.duration_ms,
+                    "response": receipt.response_text,
+                });
+                println!("{}", serde_json::to_string_pretty(&out)?);
+            } else {
+                println!("{GREEN}✓ dispatched{RESET}");
+                println!("  work_item: {}", receipt.work_item_id);
+                println!("  computer:  {}", receipt.computer_name);
+                println!("  model:     {}", receipt.model_id);
+                println!("  duration:  {}ms", receipt.duration_ms);
+                if let Some(wo) = receipt.work_output_id {
+                    println!("  output:    {wo}");
+                }
+                println!("\n{CYAN}── response ──{RESET}\n{}", receipt.response_text);
+            }
+            Ok(())
+        }
+        crate::AgentCommand::CommitBack { session, push, pr } => {
+            handle_agent_commit_back(&pool, &session, push, pr).await
+        }
+        crate::AgentCommand::Fanout {
+            prompt,
+            backend,
+            fanout,
+        } => handle_agent_fanout(&pool, prompt, backend, fanout).await,
+        crate::AgentCommand::DispatchEach { prompt, backend } => {
+            handle_agent_dispatch_each(&pool, prompt, backend).await
+        }
+    }
+}

@@ -310,3 +310,30 @@ pub async fn handle_ext_install(
     println!("\nTrack progress with: ff defer list");
     Ok(())
 }
+
+
+pub async fn handle_ext(cmd: crate::ExtCommand) -> Result<()> {
+    let pool = ff_agent::fleet_info::get_fleet_pool()
+        .await
+        .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
+    ff_db::run_postgres_migrations(&pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
+
+    match cmd {
+        crate::ExtCommand::List { json } => handle_ext_list(&pool, json).await,
+        crate::ExtCommand::Installed {
+            computer,
+            tool,
+            json,
+        } => handle_ext_installed(&pool, computer, tool, json).await,
+        crate::ExtCommand::Install {
+            tool_id,
+            computer,
+            all,
+            dry_run,
+            yes,
+        } => handle_ext_install(&pool, &tool_id, computer, all, dry_run, yes).await,
+        crate::ExtCommand::Drift { json } => handle_ext_drift(&pool, json).await,
+    }
+}

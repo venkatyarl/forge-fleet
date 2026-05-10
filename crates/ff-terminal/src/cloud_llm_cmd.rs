@@ -336,3 +336,26 @@ async fn probe_cloud_provider(
     };
     Ok(text.unwrap_or("(no content)").to_string())
 }
+
+
+pub async fn handle_cloud_llm(cmd: crate::CloudLlmCommand) -> Result<()> {
+    let pool = ff_agent::fleet_info::get_fleet_pool()
+        .await
+        .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
+    ff_db::run_postgres_migrations(&pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
+
+    match cmd {
+        crate::CloudLlmCommand::List { json } => handle_cloud_llm_list(&pool, json).await,
+        crate::CloudLlmCommand::SetKey { provider_id, value } => {
+            handle_cloud_llm_set_key(&pool, &provider_id, value).await
+        }
+        crate::CloudLlmCommand::Usage { since } => {
+            handle_cloud_llm_usage(&pool, &since).await
+        }
+        crate::CloudLlmCommand::Test { provider_id, model } => {
+            handle_cloud_llm_test(&pool, &provider_id, model).await
+        }
+    }
+}

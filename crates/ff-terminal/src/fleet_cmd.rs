@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 
 use crate::{
-    CYAN, FleetDbCommand, GREEN, RED, RESET, TaskCoverageCommand, YELLOW, pulse_reader, whoami_tag,
+    CYAN, FleetCommand, FleetDbCommand, GREEN, RED, RESET, TaskCoverageCommand, YELLOW, pulse_reader,
+    whoami_tag,
 };
 
 /// `ff fleet panic-stop` — emergency halt of every daemon.
@@ -2392,4 +2393,335 @@ pub async fn handle_fleet_gossip() -> Result<()> {
         }
     }
     Ok(())
+}
+
+
+pub async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
+    let pool = ff_agent::fleet_info::get_fleet_pool()
+        .await
+        .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
+    ff_db::run_postgres_migrations(&pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
+
+    match cmd {
+        FleetCommand::SshMeshCheck {
+            node,
+            json,
+            since,
+            repair,
+            yes,
+        } => {
+            if repair && !yes {
+                anyhow::bail!(
+                    "--repair rewrites authorized_keys / known_hosts on every failed peer — pass --yes to proceed"
+                );
+            }
+            if repair {
+                println!("{CYAN}▶ Repairing mesh before probing...{RESET}");
+                let failed = ff_db::pg_list_mesh_status(&pool, None)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("pg_list_mesh_status: {e}"))?
+                    .into_iter()
+                    .filter(|r| r.status == "failed")
+                    .collect::<Vec<_>>();
+                println!(
+                    "  found {} failed pair(s) — re-enqueuing as mesh_retry tasks",
+                    failed.len()
+                );
+                let created = ff_agent::mesh_check::enqueue_retries(&pool)
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                println!("  enqueued {} mesh_retry task(s)", created);
+            }
+            if let Some(spec) = &since {
+                let age = parse_duration(spec).ok_or_else(|| {
+                    anyhow::anyhow!("unrecognized --since value '{spec}' (try 1h, 30m, 2d)")
+                })?;
+                println!("{CYAN}▶ Refreshing pairs older than {spec}...{RESET}");
+                let n = ff_agent::mesh_check::refresh_stale(&pool, age)
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                println!("  refreshed {n} stale pair(s)");
+                return Ok(());
+            }
+            println!("{CYAN}▶ Running pairwise SSH mesh check...{RESET}");
+            let matrix = match &node {
+                Some(n) => ff_agent::mesh_check::pairwise_ssh_check_node(&pool, n).await,
+                None => ff_agent::mesh_check::pairwise_ssh_check(&pool).await,
+            }
+            .map_err(|e| anyhow::anyhow!(e))?;
+            if json {
+                let arr: Vec<_> = matrix.cells.iter().map(|c| serde_json::json!({
+                    "src": c.src, "dst": c.dst, "status": c.status, "last_error": c.last_error,
+                })).collect();
+                println!("{}", serde_json::to_string_pretty(&arr).unwrap_or_default());
+            } else {
+                let mut ok = 0;
+                let mut fail = 0;
+                for c in &matrix.cells {
+                    let marker = if c.status == "ok" { "✓" } else { "✗" };
+                    if c.status == "ok" {
+                        ok += 1;
+                    } else {
+                        fail += 1;
+                    }
+                    let err = c.last_error.as_deref().unwrap_or("");
+                    println!("  {:<10} → {:<10}  {}  {}", c.src, c.dst, marker, err);
+                }
+                println!(
+                    "\n{ok} ok, {fail} failed — checked {} pairs",
+                    matrix.cells.len()
+                );
+            }
+        }
+        FleetCommand::VerifyNode { name, json } => {
+            println!("{CYAN}▶ Running verify-node battery for {name}...{RESET}");
+            let report = ff_agent::verify_node::verify_node(&pool, &name)
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).unwrap_or_default()
+                );
+            } else {
+                println!(
+                    "\nResults for {}: {} pass, {} fail, {} skip",
+                    report.node, report.passed, report.failed, report.skipped
+                );
+                for r in &report.details {
+                    let marker = match r.status.as_str() {
+                        "pass" => "✓",
+                        "fail" => "✗",
+                        _ => "—",
+                    };
+                    let msg = r.message.as_deref().unwrap_or("");
+                    println!("  {}  {:<28}  {}", marker, r.check, msg);
+                }
+            }
+        }
+        FleetCommand::Leader { json } => {
+            handle_fleet_leader(&pool, json).await?;
+        }
+        FleetCommand::Health { json } => {
+            handle_fleet_health(&pool, json).await?;
+        }
+        FleetCommand::Versions { verbose, live } => {
+            handle_fleet_versions(&pool, verbose, live).await?;
+        }
+        FleetCommand::Gossip => {
+            handle_fleet_gossip().await?;
+        }
+        FleetCommand::MigrateGithub {
+            new_owner,
+            skip_local,
+            only,
+            dry_run,
+            yes,
+        } => {
+            let nodes = ff_db::pg_list_nodes(&pool).await?;
+            let local = ff_agent::fleet_info::resolve_this_node_name().await;
+            let mut targets: Vec<&ff_db::FleetNodeRow> = nodes.iter().collect();
+            if let Some(name) = &only {
+                targets.retain(|n| &n.name == name);
+                if targets.is_empty() {
+                    anyhow::bail!("no fleet node named '{name}'");
+                }
+            } else if skip_local {
+                targets.retain(|n| n.name != local);
+            }
+            println!("{CYAN}▶ ff fleet migrate-github{RESET}");
+            println!("  new owner:       {new_owner}");
+            println!(
+                "  local node:      {local}{}",
+                if skip_local { " (skipped)" } else { "" }
+            );
+            println!("  targets:         {} node(s)", targets.len());
+            for n in &targets {
+                println!(
+                    "    {:<15} {:<16} {}",
+                    n.name,
+                    n.ip,
+                    n.gh_account.clone().unwrap_or_else(|| "-".into())
+                );
+            }
+            if targets.is_empty() {
+                println!("{YELLOW}No nodes to enqueue. Nothing to do.{RESET}");
+                return Ok(());
+            }
+            if dry_run || !yes {
+                println!(
+                    "\n{YELLOW}Dry run — not enqueuing. Pass --yes to actually enqueue.{RESET}"
+                );
+                return Ok(());
+            }
+
+            let who = whoami_tag();
+            let mut enqueued: Vec<(String, String)> = Vec::with_capacity(targets.len());
+            for n in &targets {
+                let script = build_migrate_github_script(&new_owner);
+                let title = format!("Migrate GitHub owner → {new_owner} on {}", n.name);
+                let payload = serde_json::json!({ "command": script });
+                let trigger_spec = serde_json::json!({ "node": n.name });
+                let defer_id = ff_db::pg_enqueue_deferred(
+                    &pool,
+                    &title,
+                    "shell",
+                    &payload,
+                    "node_online",
+                    &trigger_spec,
+                    Some(&n.name),
+                    &serde_json::json!([]),
+                    Some(&who),
+                    Some(3),
+                )
+                .await?;
+                enqueued.push((n.name.clone(), defer_id));
+            }
+            println!(
+                "\n{GREEN}✓ Enqueued {} migration task(s):{RESET}",
+                enqueued.len()
+            );
+            for (node, id) in &enqueued {
+                println!("  {:<15} {id}", node);
+            }
+            println!("\nTrack progress with: ff defer list");
+        }
+        FleetCommand::Revive {
+            computer,
+            wol_only,
+            internal,
+        } => {
+            handle_fleet_revive(&pool, &computer, wol_only, internal).await?;
+        }
+        FleetCommand::TaskCoverage { command } => {
+            handle_fleet_task_coverage(&pool, command).await?;
+        }
+        FleetCommand::RevokeTrust { computer, yes } => {
+            handle_fleet_revoke_trust(&pool, &computer, yes).await?;
+        }
+        FleetCommand::RemoveComputer { name, yes } => {
+            handle_fleet_remove_computer(&pool, &name, yes).await?;
+        }
+        FleetCommand::Disband {
+            yes,
+            i_know_what_im_doing,
+        } => {
+            handle_fleet_disband(&pool, yes, i_know_what_im_doing).await?;
+        }
+        FleetCommand::MigrateSourceTrees { dry_run, yes } => {
+            handle_fleet_migrate_source_trees(&pool, dry_run, yes).await?;
+        }
+        FleetCommand::RotateSshKey { computer } => {
+            let mgr = ff_agent::ssh_key_manager::SshKeyManager::new(pool.clone());
+            match mgr.rotate_computer_keypair(&computer).await {
+                Ok(()) => println!("{GREEN}✓ rotate complete{RESET}"),
+                Err(e) => {
+                    eprintln!("{YELLOW}Not yet implemented:{RESET} {e}");
+                    std::process::exit(2);
+                }
+            }
+        }
+        FleetCommand::RotatePulseHmac { value } => {
+            handle_fleet_rotate_pulse_hmac(&pool, value).await?;
+        }
+        FleetCommand::Backup { kind, force } => {
+            handle_fleet_backup(&pool, &kind, force).await?;
+        }
+        FleetCommand::SetNetworkScope { computer, scope } => {
+            handle_fleet_set_network_scope(&pool, &computer, &scope).await?;
+        }
+        FleetCommand::Db { command } => {
+            handle_fleet_db(&pool, command).await?;
+        }
+        FleetCommand::PanicStop { yes, halt_dbs } => {
+            handle_fleet_panic_stop(&pool, yes, halt_dbs).await?;
+        }
+        FleetCommand::Resume { yes } => {
+            handle_fleet_resume(&pool, yes).await?;
+        }
+        FleetCommand::Quarantine { computer, yes } => {
+            handle_fleet_quarantine(&pool, &computer, yes).await?;
+        }
+        FleetCommand::Unquarantine { computer, yes } => {
+            handle_fleet_unquarantine(&pool, &computer, yes).await?;
+        }
+        FleetCommand::Upgrade {
+            software_id,
+            computer,
+            all,
+            dry_run,
+            yes,
+            force_dirty,
+        } => {
+            handle_fleet_upgrade(
+                &pool,
+                &software_id,
+                computer,
+                all,
+                dry_run,
+                yes,
+                force_dirty,
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+fn build_migrate_github_script(new_owner: &str) -> String {
+    format!(
+        r#"set -e
+if [ -d "/Users/$USER" ]; then
+  HOME_BASE="/Users/$USER"
+  OS_TYPE="mac"
+else
+  HOME_BASE="/home/$USER"
+  OS_TYPE="linux"
+fi
+OLD_DIR="$HOME_BASE/taylorProjects/forge-fleet"
+NEW_DIR="$HOME_BASE/projects/forge-fleet"
+mkdir -p "$HOME_BASE/projects"
+if [ ! -d "$NEW_DIR/.git" ]; then
+  if [ -d "$OLD_DIR/.git" ]; then
+    mv "$OLD_DIR" "$NEW_DIR"
+  else
+    git clone --depth 50 "https://github.com/{new_owner}/forge-fleet.git" "$NEW_DIR"
+  fi
+fi
+# Retire ~/taylorProjects fully. If the legacy dir or symlink lingers, drop it.
+rm -rf "$OLD_DIR" 2>/dev/null || true
+cd "$NEW_DIR"
+git remote set-url origin "https://github.com/{new_owner}/forge-fleet.git"
+git fetch origin main
+git reset --hard origin/main
+cargo build --release -p ff-terminal
+install -m 755 target/release/ff "$HOME_BASE/.local/bin/ff"
+if [ "$OS_TYPE" = "mac" ]; then
+  codesign --force --sign - "$HOME_BASE/.local/bin/ff" || true
+fi
+if [ "$OS_TYPE" = "linux" ]; then
+  UNIT="/etc/systemd/system/forgefleet-daemon.service"
+  if [ -f "$UNIT" ]; then
+    sudo sed -i "s|WorkingDirectory=.*taylorProjects.*forge-fleet|WorkingDirectory=$NEW_DIR|" "$UNIT" || true
+    sudo systemctl daemon-reload || true
+    sudo systemctl restart forgefleet-daemon.service || true
+  fi
+fi
+echo "migrate-github complete on $(hostname): remote=https://github.com/{new_owner}/forge-fleet.git path=$NEW_DIR"
+"#
+    )
+}
+
+fn parse_duration(spec: &str) -> Option<chrono::Duration> {
+    let spec = spec.trim();
+    let (num, unit) = spec.split_at(spec.find(|c: char| !c.is_ascii_digit())?);
+    let n: i64 = num.parse().ok()?;
+    match unit {
+        "s" | "sec" => Some(chrono::Duration::seconds(n)),
+        "m" | "min" => Some(chrono::Duration::minutes(n)),
+        "d" | "day" => Some(chrono::Duration::days(n)),
+        _ => None,
+    }
 }
