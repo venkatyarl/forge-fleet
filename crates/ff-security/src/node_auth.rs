@@ -64,8 +64,14 @@ fn canonical_string(method: &str, path: &str, timestamp: i64, body: &str) -> Str
 /// Sign an outgoing request, returning a hex-encoded HMAC-SHA256 signature.
 pub fn sign_request(secret: &str, method: &str, path: &str, timestamp: i64, body: &str) -> String {
     let payload = canonical_string(method, path, timestamp, body);
-    let mut mac =
-        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
+    let mut mac = match HmacSha256::new_from_slice(secret.as_bytes()) {
+        Ok(m) => m,
+        Err(_) => {
+            // HMAC-SHA256 accepts any key length by design; this can only fail on OOM.
+            tracing::error!("HMAC initialization failed — out of memory?");
+            return String::new();
+        }
+    };
     mac.update(payload.as_bytes());
     hex::encode(mac.finalize().into_bytes())
 }
@@ -85,8 +91,14 @@ pub fn verify_signature(
     signature: &str,
 ) -> bool {
     let payload = canonical_string(method, path, timestamp, body);
-    let mut mac =
-        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
+    let mut mac = match HmacSha256::new_from_slice(secret.as_bytes()) {
+        Ok(m) => m,
+        Err(_) => {
+            // HMAC-SHA256 accepts any key length by design; this can only fail on OOM.
+            tracing::error!("HMAC initialization failed — out of memory?");
+            return false;
+        }
+    };
     mac.update(payload.as_bytes());
 
     match hex::decode(signature) {

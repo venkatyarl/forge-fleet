@@ -67,6 +67,44 @@ pub async fn handle_model_serve_tp2(
 
     let cluster_id = format!("{}-tp2-{}-{}", model_id, host_a, host_b);
 
+    // Validate database-derived values to prevent shell injection.
+    let validate_username = |u: &str| -> Result<()> {
+        if u.is_empty()
+            || u.len() > 32
+            || !u
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        {
+            bail!("invalid SSH username: {}", u);
+        }
+        Ok(())
+    };
+    let validate_iface = |i: &str| -> Result<()> {
+        if i.is_empty()
+            || i.len() > 64
+            || !i
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        {
+            bail!("invalid interface name: {}", i);
+        }
+        Ok(())
+    };
+    validate_username(&a_user)?;
+    validate_username(&b_user)?;
+    validate_iface(&iface)?;
+    if a_fabric.parse::<std::net::IpAddr>().is_err() {
+        bail!("invalid fabric IP for host A: {}", a_fabric);
+    }
+    if b_fabric.parse::<std::net::IpAddr>().is_err() {
+        bail!("invalid fabric IP for host B: {}", b_fabric);
+    }
+
+    // Escape a string for safe use inside a single-quoted shell argument.
+    fn sq(s: &str) -> String {
+        s.replace('\'', "'\"'\"'")
+    }
+
     println!(
         "[1/4] Starting ray-head on {} (fabric {})...",
         host_a, a_fabric
@@ -116,10 +154,10 @@ pub async fn handle_model_serve_tp2(
             --host 0.0.0.0 --port {port} --trust-remote-code \
             --max-model-len {mml} --served-model-name {mid} \
             --gpu-memory-utilization {gmu} --enforce-eager > /tmp/vllm.log 2>&1'",
-        path = model_path_inside_container,
+        path = sq(model_path_inside_container),
         port = port,
         mml = max_model_len,
-        mid = model_id,
+        mid = sq(model_id),
         gmu = gpu_memory_utilization
     );
     run_ssh(&a_user, &a_ip, &serve_cmd).await?;

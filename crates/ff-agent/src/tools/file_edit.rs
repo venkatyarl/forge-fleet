@@ -68,10 +68,9 @@ impl AgentTool for FileEditTool {
             .and_then(Value::as_bool)
             .unwrap_or(false);
 
-        let path = if std::path::Path::new(file_path).is_absolute() {
-            std::path::PathBuf::from(file_path)
-        } else {
-            ctx.working_dir.join(file_path)
+        let path = match resolve_path(file_path, &ctx.working_dir) {
+            Ok(p) => p,
+            Err(e) => return AgentToolResult::err(e),
         };
 
         let content = match fs::read_to_string(&path).await {
@@ -124,4 +123,32 @@ impl AgentTool for FileEditTool {
             Err(e) => AgentToolResult::err(format!("Failed to write {}: {e}", path.display())),
         }
     }
+}
+
+/// Resolve a user-provided file path, sandboxing it to the working directory.
+/// Blocks path traversal (`..`) and absolute paths outside the workspace.
+fn resolve_path(
+    file_path: &str,
+    working_dir: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    let path = std::path::Path::new(file_path);
+
+    // Block parent directory traversal attempts
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err("Path traversal ('..') is not allowed".to_string());
+    }
+
+    let resolved = if path.is_absolute() {
+        if !path.starts_with(working_dir) {
+            return Err("Absolute path must be within the working directory".to_string());
+        }
+        path.to_path_buf()
+    } else {
+        working_dir.join(path)
+    };
+
+    Ok(resolved)
 }

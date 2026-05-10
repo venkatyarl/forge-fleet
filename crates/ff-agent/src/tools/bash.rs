@@ -153,6 +153,20 @@ async fn fleet_node_ip(name: &str) -> Option<(String, String)> {
     crate::fleet_info::fetch_node_ip_user(name).await
 }
 
+/// Validate that `ip` looks like a real IPv4 or IPv6 address.
+fn is_valid_ip(ip: &str) -> bool {
+    ip.parse::<std::net::IpAddr>().is_ok()
+}
+
+/// Validate that `user` is a safe Unix username (alphanumeric + limited specials).
+fn is_valid_username(user: &str) -> bool {
+    !user.is_empty()
+        && user.len() <= 32
+        && user
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
 /// Rewrite bare SSH commands to fleet nodes into non-interactive commands.
 /// e.g. "ssh <node>" → "ssh -o ConnectTimeout=10 <user>@<ip> 'hostname && uptime && ...'"
 /// where `<ip>` and `<user>` are resolved from Postgres via `fleet_node_ip`.
@@ -168,6 +182,8 @@ async fn rewrite_fleet_ssh(command: &str) -> String {
             if !target.contains('@')
                 && !target.contains('.')
                 && let Some((ip, user)) = fleet_node_ip(target).await
+                && is_valid_ip(&ip)
+                && is_valid_username(&user)
             {
                 return format!(
                     "ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no {user}@{ip} 'echo \"=== {target} ({ip}) ===\"  && hostname && echo \"---\" && uptime && echo \"---\" && uname -sr && echo \"---\" && free -h 2>/dev/null || sysctl -n hw.memsize 2>/dev/null && echo \"---\" && df -h / && echo \"---\" && echo \"Running processes:\" && ps aux --sort=-%cpu 2>/dev/null | head -6 || ps aux | head -6'"
@@ -179,7 +195,10 @@ async fn rewrite_fleet_ssh(command: &str) -> String {
     // Match "ssh into <nodename>" pattern
     if trimmed.starts_with("ssh into ") || trimmed.starts_with("ssh to ") {
         let node_name = trimmed.split_whitespace().last().unwrap_or("");
-        if let Some((ip, user)) = fleet_node_ip(node_name).await {
+        if let Some((ip, user)) = fleet_node_ip(node_name).await
+            && is_valid_ip(&ip)
+            && is_valid_username(&user)
+        {
             return format!(
                 "ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no {user}@{ip} 'echo \"=== {node_name} ({ip}) ===\" && hostname && uptime && uname -sr'"
             );

@@ -1824,7 +1824,7 @@ host = "127.0.0.1"
 port = 55432
 name = "forgefleet"
 user = "forgefleet"
-password = "forgefleet"
+password = "CHANGEME_IN_PRODUCTION"
 url = "postgresql://forgefleet:forgefleet@127.0.0.1:55432/forgefleet"
 
 [leader]

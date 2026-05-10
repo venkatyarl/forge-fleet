@@ -49,7 +49,10 @@ impl AgentTool for FileReadTool {
 
         let limit = input.get("limit").and_then(Value::as_u64).unwrap_or(2000) as usize;
 
-        let path = resolve_path(file_path, &ctx.working_dir);
+        let path = match resolve_path(file_path, &ctx.working_dir) {
+            Ok(p) => p,
+            Err(e) => return AgentToolResult::err(e),
+        };
 
         // Check if file exists
         let metadata = match fs::metadata(&path).await {
@@ -120,13 +123,32 @@ impl AgentTool for FileReadTool {
     }
 }
 
-fn resolve_path(file_path: &str, working_dir: &std::path::Path) -> std::path::PathBuf {
+/// Resolve a user-provided file path, sandboxing it to the working directory.
+/// Blocks path traversal (`..`) and absolute paths outside the workspace.
+fn resolve_path(
+    file_path: &str,
+    working_dir: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
     let path = std::path::Path::new(file_path);
-    if path.is_absolute() {
+
+    // Block parent directory traversal attempts
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err("Path traversal ('..') is not allowed".to_string());
+    }
+
+    let resolved = if path.is_absolute() {
+        if !path.starts_with(working_dir) {
+            return Err("Absolute path must be within the working directory".to_string());
+        }
         path.to_path_buf()
     } else {
         working_dir.join(path)
-    }
+    };
+
+    Ok(resolved)
 }
 
 fn is_binary_extension(ext: &str) -> bool {
