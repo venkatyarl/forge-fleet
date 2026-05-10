@@ -143,3 +143,29 @@ pub fn pulse_reader() -> anyhow::Result<ff_pulse::reader::PulseReader> {
     ff_pulse::reader::PulseReader::new(&url)
         .map_err(|e| anyhow::anyhow!("pulse: connect {url}: {e}"))
 }
+
+/// Alias for `truncate_for_col` — same semantics, different name used in legacy code.
+pub fn truncate_str(s: &str, max: usize) -> String {
+    truncate_for_col(s, max)
+}
+
+/// Parse a duration like "5m", "1h", "24h", "30s" into seconds.
+pub fn parse_duration_secs(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let (num, unit) = match s.chars().position(|c| !c.is_ascii_digit() && c != '.') {
+        Some(i) => (&s[..i], &s[i..]),
+        None => (s, "s"),
+    };
+    let n: f64 = num.parse().ok()?;
+    let mult: f64 = match unit {
+        "s" | "" => 1.0,
+        "m" => 60.0,
+        "h" => 3600.0,
+        "d" => 86400.0,
+        _ => return None,
+    };
+    Some((n * mult).round() as u64)
+}
