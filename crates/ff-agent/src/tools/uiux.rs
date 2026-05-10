@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio::process::Command;
 
-use super::{AgentTool, AgentToolContext, AgentToolResult};
+use super::{AgentTool, AgentToolContext, AgentToolResult, shell_escape_single};
 
 /// ColorPalette — generate color palettes, convert formats, check contrast.
 pub struct ColorPaletteTool;
@@ -501,12 +501,13 @@ impl AgentTool for CSSAnalyzerTool {
             ctx.working_dir.join(path)
         };
 
+        let target_escaped = shell_escape_single(&target.to_string_lossy());
+
         match action {
             "colors" => {
                 // Find all hex colors in CSS/TSX files
                 let cmd = format!(
-                    "grep -roh '#[0-9a-fA-F]\\{{3,8\\}}' '{}' --include='*.css' --include='*.tsx' --include='*.jsx' --include='*.html' 2>/dev/null | sort | uniq -c | sort -rn | head -20",
-                    target.display()
+                    "grep -roh '#[0-9a-fA-F]\\{{3,8\\}}' {target_escaped} --include='*.css' --include='*.tsx' --include='*.jsx' --include='*.html' 2>/dev/null | sort | uniq -c | sort -rn | head -20",
                 );
                 match Command::new("bash").arg("-c").arg(&cmd).output().await {
                     Ok(o) => AgentToolResult::ok(format!(
@@ -518,9 +519,7 @@ impl AgentTool for CSSAnalyzerTool {
             }
             "fonts" => {
                 let cmd = format!(
-                    "grep -roh 'font-family:[^;]*' '{}' --include='*.css' 2>/dev/null | sort | uniq -c | sort -rn; grep -roh 'font-[a-z]*' '{}' --include='*.tsx' --include='*.jsx' 2>/dev/null | sort | uniq -c | sort -rn | head -10",
-                    target.display(),
-                    target.display()
+                    "grep -roh 'font-family:[^;]*' {target_escaped} --include='*.css' 2>/dev/null | sort | uniq -c | sort -rn; grep -roh 'font-[a-z]*' {target_escaped} --include='*.tsx' --include='*.jsx' 2>/dev/null | sort | uniq -c | sort -rn | head -10",
                 );
                 match Command::new("bash").arg("-c").arg(&cmd).output().await {
                     Ok(o) => AgentToolResult::ok(format!(
@@ -532,8 +531,7 @@ impl AgentTool for CSSAnalyzerTool {
             }
             "tailwind" => {
                 let cmd = format!(
-                    "grep -roh 'className=\"[^\"]*\"' '{}' --include='*.tsx' --include='*.jsx' 2>/dev/null | sed 's/className=\"//;s/\"//' | tr ' ' '\\n' | sort | uniq -c | sort -rn | head -30",
-                    target.display()
+                    "grep -roh 'className=\"[^\"]*\"' {target_escaped} --include='*.tsx' --include='*.jsx' 2>/dev/null | sed 's/className=\"//;s/\"//' | tr ' ' '\\n' | sort | uniq -c | sort -rn | head -30",
                 );
                 match Command::new("bash").arg("-c").arg(&cmd).output().await {
                     Ok(o) => AgentToolResult::ok(format!(
@@ -545,8 +543,7 @@ impl AgentTool for CSSAnalyzerTool {
             }
             "bundle_size" => {
                 let cmd = format!(
-                    "find '{}' -name '*.css' -o -name '*.js' | head -20 | xargs wc -c 2>/dev/null | sort -rn | head -10",
-                    target.display()
+                    "find {target_escaped} -name '*.css' -o -name '*.js' | head -20 | xargs wc -c 2>/dev/null | sort -rn | head -10",
                 );
                 match Command::new("bash").arg("-c").arg(&cmd).output().await {
                     Ok(o) => AgentToolResult::ok(format!(
@@ -558,10 +555,7 @@ impl AgentTool for CSSAnalyzerTool {
             }
             _ => {
                 let cmd = format!(
-                    "echo 'CSS files:' && find '{}' -name '*.css' 2>/dev/null | wc -l && echo 'TSX/JSX files:' && find '{}' \\( -name '*.tsx' -o -name '*.jsx' \\) 2>/dev/null | wc -l && echo 'Total CSS lines:' && find '{}' -name '*.css' -exec cat {{}} + 2>/dev/null | wc -l",
-                    target.display(),
-                    target.display(),
-                    target.display()
+                    "echo 'CSS files:' && find {target_escaped} -name '*.css' 2>/dev/null | wc -l && echo 'TSX/JSX files:' && find {target_escaped} \\( -name '*.tsx' -o -name '*.jsx' \\) 2>/dev/null | wc -l && echo 'Total CSS lines:' && find {target_escaped} -name '*.css' -exec cat {{}} + 2>/dev/null | wc -l",
                 );
                 match Command::new("bash").arg("-c").arg(&cmd).output().await {
                     Ok(o) => AgentToolResult::ok(format!(

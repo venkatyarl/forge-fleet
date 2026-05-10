@@ -11,8 +11,8 @@ use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use lazy_static::lazy_static;
 use prometheus::{
-    Encoder, GaugeVec, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, Opts,
-    Registry, TextEncoder,
+    Encoder, GaugeVec, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge,
+    Opts, Registry, TextEncoder,
 };
 use serde::{Deserialize, Serialize};
 
@@ -348,6 +348,55 @@ lazy_static! {
         &["model", "tier"],
     ).unwrap();
 
+    // ── Pulse router metrics ─────────────────────────────────────────
+
+    /// Total Pulse router requests (labels: model, computer, result).
+    pub static ref PULSE_ROUTER_REQUESTS_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new("pulse_router_requests_total", "Total Pulse router requests"),
+        &["model", "computer", "result"],
+    ).unwrap();
+
+    /// Session affinity hits (labels: model).
+    pub static ref PULSE_ROUTER_AFFINITY_HITS_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new("pulse_router_affinity_hits_total", "Session affinity hits in Pulse router"),
+        &["model"],
+    ).unwrap();
+
+    /// Circuit breaker trips (labels: computer).
+    pub static ref PULSE_CIRCUIT_BREAKER_TRIPS_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new("pulse_circuit_breaker_trips_total", "Circuit breaker trips in Pulse router"),
+        &["computer"],
+    ).unwrap();
+
+    /// Routing cache hits (labels: model).
+    pub static ref PULSE_ROUTER_CACHE_HITS_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new("pulse_router_cache_hits_total", "Routing cache hits in Pulse router"),
+        &["model"],
+    ).unwrap();
+
+    // ── Orchestrate metrics ──────────────────────────────────────────
+
+    /// Total orchestrate requests (labels: status).
+    pub static ref ORCHESTRATE_REQUESTS_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new("orchestrate_requests_total", "Total orchestrate requests"),
+        &["status"],
+    ).unwrap();
+
+    /// Total subtasks dispatched by orchestrator (labels: status).
+    pub static ref ORCHESTRATE_SUBTASKS_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new("orchestrate_subtasks_total", "Total subtasks dispatched by orchestrator"),
+        &["status"],
+    ).unwrap();
+
+    /// Orchestrate request duration in seconds.
+    pub static ref ORCHESTRATE_DURATION_SECONDS: Histogram = Histogram::with_opts(
+        HistogramOpts::new(
+            "orchestrate_duration_seconds",
+            "Orchestrate request duration in seconds",
+        )
+        .buckets(vec![0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0]),
+    ).unwrap();
+
     // ── Token cost metrics ───────────────────────────────────────────
 
     /// Total tokens consumed (labels: model, token_type).
@@ -459,6 +508,12 @@ pub fn init_prometheus_metrics() {
         r.register(Box::new(LLM_BUDGET_REMAINING_USD.clone()))
             .unwrap();
         r.register(Box::new(LLM_BUDGET_PERCENT_USED.clone()))
+            .unwrap();
+        r.register(Box::new(ORCHESTRATE_REQUESTS_TOTAL.clone()))
+            .unwrap();
+        r.register(Box::new(ORCHESTRATE_SUBTASKS_TOTAL.clone()))
+            .unwrap();
+        r.register(Box::new(ORCHESTRATE_DURATION_SECONDS.clone()))
             .unwrap();
     });
 }

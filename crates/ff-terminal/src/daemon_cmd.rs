@@ -44,9 +44,7 @@ async fn probe_online_nodes(nodes: &[ff_db::FleetNodeRow]) -> Vec<String> {
 /// as `cwd` when running locally; SSH-dispatched shell tasks ignore it
 /// (the remote node sets its own cwd). Future `agent_run` kind will use
 /// this for checkpoint/scratch isolation across concurrent sub-agents.
-
-/// Parse shorthand duration specs like "1h", "30m", "2d", "45s".
-
+// Parse shorthand duration specs like "1h", "30m", "2d", "45s".
 async fn execute_deferred(
     task: &ff_db::DeferredTaskRow,
     nodes: &[ff_db::FleetNodeRow],
@@ -756,7 +754,7 @@ async fn execute_http(
             // Reject early if the server advertises a body larger than our cap.
             if resp
                 .content_length()
-                .map_or(false, |len| len > MAX_HTTP_RESPONSE_BYTES as u64)
+                .is_some_and(|len| len > MAX_HTTP_RESPONSE_BYTES as u64)
             {
                 return (
                     false,
@@ -818,9 +816,6 @@ async fn execute_http(
 /// Dedupe key: the Claude task ID is stored in
 /// `work_items.metadata->>'claude_task_id'`; repeat imports UPDATE the
 /// same row rather than creating a new one.
-
-
-
 pub async fn handle_defer_worker(
     as_node: Option<String>,
     interval: u64,

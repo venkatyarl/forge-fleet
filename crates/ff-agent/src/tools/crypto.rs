@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 use super::{AgentTool, AgentToolContext, AgentToolResult};
@@ -28,22 +29,33 @@ impl AgentTool for HashGeneratorTool {
             .get("algorithm")
             .and_then(Value::as_str)
             .unwrap_or("sha256");
-        let cmd_name = match algo {
-            "sha256" => "shasum -a 256",
-            "sha512" => "shasum -a 512",
-            "md5" => "md5sum",
-            "sha1" => "shasum",
-            _ => "shasum -a 256",
+        let (prog, args) = match algo {
+            "sha256" => ("shasum", vec!["-a", "256"]),
+            "sha512" => ("shasum", vec!["-a", "512"]),
+            "md5" => ("md5sum", vec![]),
+            "sha1" => ("shasum", vec![]),
+            _ => ("shasum", vec!["-a", "256"]),
         };
 
         if let Some(text) = input.get("input").and_then(Value::as_str) {
-            let cmd = format!("echo -n '{}' | {}", text.replace('\'', "'\"'\"'"), cmd_name);
-            match Command::new("bash").arg("-c").arg(&cmd).output().await {
+            let mut child = match Command::new(prog)
+                .args(&args)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+            {
+                Ok(c) => c,
+                Err(e) => return AgentToolResult::err(format!("Hash failed: {e}")),
+            };
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(text.as_bytes()).await;
+            }
+            match child.wait_with_output().await {
                 Ok(o) => AgentToolResult::ok(format!(
                     "{} ({}): {}",
                     algo.to_uppercase(),
                     "string",
-                    String::from_utf8_lossy(&o.stdout).trim()
+                    String::from_utf8_lossy(&o.stdout).split_whitespace().next().unwrap_or("")
                 )),
                 Err(e) => AgentToolResult::err(format!("Hash failed: {e}")),
             }
@@ -53,12 +65,11 @@ impl AgentTool for HashGeneratorTool {
             } else {
                 ctx.working_dir.join(file).to_string_lossy().to_string()
             };
-            let cmd = format!("{} '{}'", cmd_name, path);
-            match Command::new("bash").arg("-c").arg(&cmd).output().await {
+            match Command::new(prog).args(&args).arg(&path).output().await {
                 Ok(o) => AgentToolResult::ok(format!(
                     "{} (file): {}",
                     algo.to_uppercase(),
-                    String::from_utf8_lossy(&o.stdout).trim()
+                    String::from_utf8_lossy(&o.stdout).split_whitespace().next().unwrap_or("")
                 )),
                 Err(e) => AgentToolResult::err(format!("Hash failed: {e}")),
             }
@@ -154,29 +165,16 @@ impl AgentTool for TextTransformTool {
 
         match action {
             "base64_encode" => {
-                match Command::new("bash")
-                    .arg("-c")
-                    .arg(format!(
-                        "echo -n '{}' | base64",
-                        text.replace('\'', "'\"'\"'")
-                    ))
-                    .output()
-                    .await
-                {
-                    Ok(o) => {
-                        AgentToolResult::ok(String::from_utf8_lossy(&o.stdout).trim().to_string())
-                    }
-                    Err(e) => AgentToolResult::err(format!("base64 encode failed: {e}")),
-                }
+                use base64::Engine;
+                AgentToolResult::ok(base64::engine::general_purpose::STANDARD.encode(text))
             }
             "base64_decode" => {
-                match Command::new("bash")
-                    .arg("-c")
-                    .arg(format!("echo '{}' | base64 -d", text))
-                    .output()
-                    .await
-                {
-                    Ok(o) => AgentToolResult::ok(String::from_utf8_lossy(&o.stdout).to_string()),
+                use base64::Engine;
+                match base64::engine::general_purpose::STANDARD.decode(text) {
+                    Ok(bytes) => match String::from_utf8(bytes) {
+                        Ok(s) => AgentToolResult::ok(s),
+                        Err(_) => AgentToolResult::err("base64 decode: invalid UTF-8".to_string()),
+                    },
                     Err(e) => AgentToolResult::err(format!("base64 decode failed: {e}")),
                 }
             }
@@ -256,24 +254,68 @@ impl AgentTool for CalculatorTool {
             return AgentToolResult::err("'expression' required");
         }
 
-        // Try Python first (most capable)
-        let py_cmd = format!(
-            "python3 -c \"from math import *; print({})\"",
-            expr.replace('"', "\\\"")
-        );
-        if let Ok(out) = Command::new("bash").arg("-c").arg(&py_cmd).output().await
-            && out.status.success()
-        {
-            return AgentToolResult::ok(format!(
-                "{} = {}",
-                expr,
-                String::from_utf8_lossy(&out.stdout).trim()
-            ));
+        // Validate expression: only allow safe characters
+        if !expr.chars().all(|c| {
+            c.is_ascii_digit()
+                || c.is_ascii_whitespace()
+                || matches!(c, '+' | '-' | '*' | '/' | '%' | '^' | '(' | ')' | '.' | ',')
+                || c.is_ascii_alphabetic()
+        }) {
+            return AgentToolResult::err(
+                "Expression contains invalid characters".to_string(),
+            );
         }
 
-        // Fallback to bc
-        let bc_cmd = format!("echo 'scale=6; {}' | bc -l", expr);
-        match Command::new("bash").arg("-c").arg(&bc_cmd).output().await {
+        // Try Python first (most capable) — pass expression via stdin to avoid shell injection
+        let py_script = format!(
+            "from math import *;\ntry:\n    print({expr})\nexcept Exception as e:\n    print('ERROR:', e)\n"
+        );
+        let mut child = match Command::new("python3")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(_) => {
+                // Python not available, fall through to bc
+                return self.run_bc(expr).await;
+            }
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(py_script.as_bytes()).await;
+        }
+        match child.wait_with_output().await {
+            Ok(out) if out.status.success() => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                if stdout.trim().starts_with("ERROR:") {
+                    return self.run_bc(expr).await;
+                }
+                return AgentToolResult::ok(format!(
+                    "{} = {}",
+                    expr,
+                    stdout.trim()
+                ));
+            }
+            _ => self.run_bc(expr).await,
+        }
+    }
+}
+
+impl CalculatorTool {
+    async fn run_bc(&self, expr: &str) -> AgentToolResult {
+        let mut child = match Command::new("bc")
+            .arg("-l")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => return AgentToolResult::err(format!("Calculation failed: {e}")),
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(format!("scale=6; {expr}\n").as_bytes()).await;
+        }
+        match child.wait_with_output().await {
             Ok(out) if out.status.success() => AgentToolResult::ok(format!(
                 "{} = {}",
                 expr,

@@ -16,6 +16,8 @@ pub mod discord;
 pub mod embed;
 pub mod llm_routing;
 pub mod message;
+pub mod orchestrator_adapter;
+pub mod orchestrate;
 pub mod middleware;
 pub mod onboard;
 pub mod pulse_api;

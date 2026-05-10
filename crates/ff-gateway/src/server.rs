@@ -14,6 +14,7 @@ use axum::{
 };
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use futures::stream::StreamExt;
 use dashmap::DashMap;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
@@ -44,7 +45,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     embed,
-    llm_routing::{self, LlmRoutingCache, PulseLlmRouter},
+    llm_routing::{self, CircuitBreaker, LlmRoutingCache, PulseLlmRouter, SessionAffinityCache},
     message::{Channel, IncomingMessage, OutgoingMessage},
     router::{MessageRouter, RouteTarget},
     telegram::TelegramClient,
@@ -351,7 +352,12 @@ impl GatewayServer {
             .unwrap_or_else(|_| "redis://127.0.0.1:6380/".to_string());
         match PulseLlmRouter::new(&redis_url) {
             Ok(pr) => {
-                let router_arc = Arc::new(pr);
+                let affinity = Arc::new(SessionAffinityCache::new());
+                let breaker = Arc::new(CircuitBreaker::new());
+                let router = pr
+                    .with_session_affinity(affinity)
+                    .with_circuit_breaker(breaker);
+                let router_arc = Arc::new(router);
                 // Build the routing cache + warmer. The warmer JoinHandle is
                 // detached; it exits on a shutdown watch channel. We leak the
                 // sender so the watch channel stays alive for the process
@@ -367,7 +373,7 @@ impl GatewayServer {
 
                 state.pulse_router = Some(router_arc);
                 state.pulse_cache = Some(cache);
-                info!(redis_url = %redis_url, "pulse-backed LLM router + routing cache initialized");
+                info!(redis_url = %redis_url, "pulse-backed LLM router + routing cache + session affinity initialized");
             }
             Err(e) => {
                 warn!(redis_url = %redis_url, error = %e, "failed to construct PulseLlmRouter; tier-router fallback only");
@@ -376,11 +382,12 @@ impl GatewayServer {
 
         // Build a proper HTTP client for upstream proxying
         state.http_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(120))
             .pool_idle_timeout(Duration::from_secs(30))
             .build()
             .unwrap_or_else(|_| {
                 reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_secs(30))
+                    .timeout(Duration::from_secs(120))
                     .build()
                     .expect("build reqwest client")
             });
@@ -616,6 +623,7 @@ pub fn build_router(state: Arc<GatewayState>, mc_db_path: Option<&str>) -> Route
         .route("/api/update/resume", post(update_resume))
         .route("/api/update/abort", post(update_abort))
         .route("/v1/chat/completions", post(proxy_chat_completions))
+        .route("/v1/orchestrate", post(crate::orchestrate::handle_orchestrate))
         .route("/v1/models", get(list_models))
         .route("/api/models", get(list_models))
         .route("/v1/fleet/route", post(route_fleet_capability))
@@ -663,6 +671,7 @@ pub fn build_router(state: Arc<GatewayState>, mc_db_path: Option<&str>) -> Route
         )
         .route("/api/fleet/health", get(crate::pulse_api::fleet_health))
         .route("/api/llm/servers", get(crate::pulse_api::llm_servers))
+        .route("/api/router/diagnostics", get(router_diagnostics))
         .route(
             "/api/software/computers",
             get(crate::pulse_api::software_computers),
@@ -1548,6 +1557,28 @@ async fn fleet_status(
     let payload = build_fleet_status_payload(&state).await?;
     let value = serde_json::to_value(payload).unwrap_or_else(|_| json!({"status": "error"}));
     Ok(Json(value))
+}
+
+/// GET /api/router/diagnostics — Pulse router internal state.
+///
+/// Exposes session affinity entry count and circuit breaker status
+/// so operators can debug routing decisions without reading logs.
+async fn router_diagnostics(
+    State(state): State<Arc<GatewayState>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let diag = match state.pulse_router.as_ref() {
+        Some(router) => router.diagnostics(),
+        None => {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "Pulse router not initialized"})),
+            ));
+        }
+    };
+    Ok(Json(json!({
+        "session_affinity_entries": diag.session_affinity_entries,
+        "circuit_breaker_nodes": diag.circuit_breaker_nodes,
+    })))
 }
 
 /// GET /api/fleet/llm-usage — aggregate token + cost from the
@@ -4477,8 +4508,21 @@ async fn settings_runtime(State(state): State<Arc<GatewayState>>) -> Json<Value>
 async fn proxy_chat_completions(
     State(state): State<Arc<GatewayState>>,
     Query(query): Query<AsyncQuery>,
+    headers: HeaderMap,
     Json(mut raw_payload): Json<Value>,
 ) -> Result<Response<Body>, (StatusCode, Json<Value>)> {
+    // ── Session affinity hint from header ────────────────────────────
+    // Clients may pass X-ForgeFleet-Session to explicitly pin a
+    // conversation to a specific affinity key. This overrides the
+    // body-derived key in extract_session_key.
+    if let Some(session_header) = headers
+        .get("X-ForgeFleet-Session")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+        && let Some(obj) = raw_payload.as_object_mut() {
+            obj.insert("session_id".to_string(), json!(session_header));
+        }
+
     // ── Async mode (P1.6) ────────────────────────────────────────────
     //
     // When ?async=true, enqueue the request as a fleet_task and return
@@ -4591,29 +4635,88 @@ async fn proxy_chat_completions(
         // (`fleet_task_coverage.alias`, schema V27) before doing the
         // normal exact/prefix model-id match.
         let pg_ref = state.operational_store.as_ref().and_then(|s| s.pg_pool());
-        match pulse
-            .route_completion_cached(raw_payload.clone(), cache_ref, pg_ref)
-            .await
-        {
-            Ok(value) => {
-                return Ok(Json(value).into_response());
+        let is_streaming = raw_payload
+            .get("stream")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        if is_streaming {
+            match pulse
+                .route_completion_streaming(raw_payload.clone(), cache_ref, pg_ref)
+                .await
+            {
+                Ok(result) => {
+                    let status = result.upstream.status();
+                    let content_type = result
+                        .upstream
+                        .headers()
+                        .get(header::CONTENT_TYPE)
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            header::HeaderValue::from_static("text/event-stream; charset=utf-8")
+                        });
+                    let byte_stream = result.upstream.bytes_stream().map(|chunk| {
+                        chunk.map_err(|e| {
+                            std::io::Error::new(std::io::ErrorKind::BrokenPipe, e.to_string())
+                        })
+                    });
+                    return Response::builder()
+                        .status(status)
+                        .header(header::CONTENT_TYPE, content_type)
+                        .header(header::CACHE_CONTROL, "no-cache")
+                        .header(header::CONNECTION, "keep-alive")
+                        .header("X-Accel-Buffering", "no")
+                        .header("X-ForgeFleet-Computer", result.routed.computer)
+                        .header("X-ForgeFleet-Model", result.routed.model_id)
+                        .header("X-ForgeFleet-Runtime", result.routed.runtime)
+                        .header(
+                            "X-ForgeFleet-QueueDepth",
+                            result.routed.queue_depth.to_string(),
+                        )
+                        .body(Body::from_stream(byte_stream))
+                        .map_err(|e| (
+                            StatusCode::BAD_GATEWAY,
+                            Json(json!({"error": {"message": e.to_string(), "type": "upstream_error"}})),
+                        ));
+                }
+                Err(llm_routing::LlmRoutingError::NoMatch { .. }) => {
+                    debug!("pulse found no matching server for streaming; trying tier-router fallback");
+                }
+                Err(llm_routing::LlmRoutingError::MissingModel) => {
+                    let (code, body) =
+                        llm_routing::error_to_response(llm_routing::LlmRoutingError::MissingModel);
+                    return Err((
+                        StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_REQUEST),
+                        Json(body),
+                    ));
+                }
+                Err(e) => {
+                    warn!(error = %e, "pulse streaming routing failed; falling back to tier-router");
+                }
             }
-            Err(llm_routing::LlmRoutingError::NoMatch { .. }) => {
-                // No Pulse-visible server loaded for this model — fall back
-                // to the tier-router, which can auto-load on demand.
-                debug!("pulse found no matching server; trying tier-router fallback");
-            }
-            Err(llm_routing::LlmRoutingError::MissingModel) => {
-                let (code, body) =
-                    llm_routing::error_to_response(llm_routing::LlmRoutingError::MissingModel);
-                return Err((
-                    StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_REQUEST),
-                    Json(body),
-                ));
-            }
-            Err(e) => {
-                // Pulse upstream failure — log and fall back.
-                warn!(error = %e, "pulse routing failed; falling back to tier-router");
+        } else {
+            match pulse
+                .route_completion_cached(raw_payload.clone(), cache_ref, pg_ref)
+                .await
+            {
+                Ok(value) => {
+                    record_pulse_usage(&state, &value).await;
+                    return Ok(Json(value).into_response());
+                }
+                Err(llm_routing::LlmRoutingError::NoMatch { .. }) => {
+                    debug!("pulse found no matching server; trying tier-router fallback");
+                }
+                Err(llm_routing::LlmRoutingError::MissingModel) => {
+                    let (code, body) =
+                        llm_routing::error_to_response(llm_routing::LlmRoutingError::MissingModel);
+                    return Err((
+                        StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_REQUEST),
+                        Json(body),
+                    ));
+                }
+                Err(e) => {
+                    warn!(error = %e, "pulse routing failed; falling back to tier-router");
+                }
             }
         }
     }
@@ -4988,6 +5091,51 @@ async fn record_usage_from_response(
             .add(cost);
     }
     upstream_body
+}
+
+/// Record token usage from a Pulse-routed (local fleet) response.
+///
+/// Unlike the legacy tier-router path, Pulse responses carry routing
+/// metadata under `_forgefleet_route` but the upstream `usage` block
+/// is standard OpenAI shape. We parse it and update the cost tracker
+/// and Prometheus counters so local fleet inference is visible in the
+/// ledger alongside cloud provider usage.
+async fn record_pulse_usage(state: &GatewayState, value: &Value) {
+    let Some(usage) = value.get("usage") else { return };
+    let prompt_tokens = usage
+        .get("prompt_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
+    let completion_tokens = usage
+        .get("completion_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
+    let model = value
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    let record = TokenUsageRecord::new(
+        uuid::Uuid::new_v4().to_string(),
+        &model,
+        "pulse-local",
+    )
+    .with_tokens(prompt_tokens, completion_tokens)
+    .with_cost(0.0, true) // local inference has no external cost
+    .with_latency(0); // latency not captured in this path yet
+
+    state.cost_tracker.record_usage(record).await;
+
+    ff_observability::metrics::LLM_TOKENS_TOTAL
+        .with_label_values(&[&model, "prompt"])
+        .inc_by(prompt_tokens as u64);
+    ff_observability::metrics::LLM_TOKENS_TOTAL
+        .with_label_values(&[&model, "completion"])
+        .inc_by(completion_tokens as u64);
+    ff_observability::metrics::LLM_COST_USD_TOTAL
+        .with_label_values(&[&model, "true"])
+        .add(0.0);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

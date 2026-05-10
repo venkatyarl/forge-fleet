@@ -35,6 +35,7 @@ pub struct TelegramClient {
 impl TelegramClient {
     pub fn new(token: impl Into<String>) -> anyhow::Result<Self> {
         let http_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
             .pool_idle_timeout(std::time::Duration::from_secs(30))
             .build()
             .context("failed to create telegram reqwest client")?;

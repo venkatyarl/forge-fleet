@@ -20,10 +20,13 @@
 //!   so the caller sees what they *could* have asked for.
 
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use dashmap::DashMap;
 use reqwest::Client;
+use serde::Serialize;
 use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::sync::{RwLock, watch};
@@ -55,6 +58,238 @@ pub enum LlmRoutingError {
     Timeout(Duration),
 }
 
+// ─── Session affinity (KV-cache / prefix-cache aware routing) ───────────────
+
+/// How long a session→node mapping stays valid without a follow-up request.
+const SESSION_AFFINITY_TTL: Duration = Duration::from_secs(300);
+/// Hard cap on the number of affinity entries to prevent unbounded growth.
+const SESSION_AFFINITY_MAX_ENTRIES: usize = 10_000;
+/// If the preferred node has a queue_depth higher than this we route
+/// elsewhere to avoid overloading a hot node, even at the cost of a
+/// prefix-cache miss.
+const SESSION_AFFINITY_QUEUE_THRESHOLD: i32 = 10;
+
+// ─── Circuit breaker (failure-aware routing) ────────────────────────────────
+
+/// Rolling window for failure counting.
+const CIRCUIT_WINDOW: Duration = Duration::from_secs(60);
+/// How many failures within [`CIRCUIT_WINDOW`] trip the breaker.
+const CIRCUIT_THRESHOLD: usize = 3;
+/// How long the breaker stays open before allowing probe traffic.
+const CIRCUIT_COOLDOWN: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Clone)]
+struct FailureWindow {
+    failures: Vec<Instant>,
+}
+
+impl FailureWindow {
+    fn new() -> Self {
+        Self {
+            failures: Vec::with_capacity(CIRCUIT_THRESHOLD + 1),
+        }
+    }
+
+    fn record(&mut self) {
+        self.failures.push(Instant::now());
+        self.prune();
+    }
+
+    fn prune(&mut self) {
+        self.failures.retain(|t| t.elapsed() < CIRCUIT_WINDOW);
+    }
+
+    fn count_recent(&self) -> usize {
+        self.failures.iter().filter(|t| t.elapsed() < CIRCUIT_WINDOW).count()
+    }
+
+    fn is_open(&self) -> bool {
+        self.count_recent() >= CIRCUIT_THRESHOLD
+    }
+
+    fn last_failure(&self) -> Option<Instant> {
+        self.failures.last().copied()
+    }
+
+    /// True if the breaker is open AND still within the cooldown period.
+    fn is_open_and_cooling(&self) -> bool {
+        if !self.is_open() {
+            return false;
+        }
+        self.last_failure()
+            .map(|t| t.elapsed() < CIRCUIT_COOLDOWN)
+            .unwrap_or(false)
+    }
+}
+
+/// Per-node circuit breaker for the LLM router.
+///
+/// When an upstream inference server starts failing (connection refused,
+/// timeout, 5xx) the breaker temporarily blocks further traffic to that
+/// node even if its Pulse heartbeat still reports healthy. This prevents
+/// a half-dead node from absorbing requests and failing them.
+#[derive(Clone)]
+pub struct CircuitBreaker {
+    inner: Arc<DashMap<String, FailureWindow>>,
+}
+
+impl CircuitBreaker {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(DashMap::new()),
+        }
+    }
+
+    /// Record a failure for `computer`.
+    pub fn record_failure(&self, computer: &str) {
+        self.inner
+            .entry(computer.to_string())
+            .or_insert_with(FailureWindow::new)
+            .record();
+        tracing::debug!(
+            computer = %computer,
+            "pulse: circuit breaker recorded failure"
+        );
+    }
+
+    /// Returns `true` if `computer` should be avoided (breaker is open and
+    /// still cooling down).
+    pub fn is_open(&self, computer: &str) -> bool {
+        self.inner
+            .get(computer)
+            .map(|w| w.is_open_and_cooling())
+            .unwrap_or(false)
+    }
+
+    /// Diagnostic view: every tracked node and its current failure count.
+    pub fn snapshot(&self) -> Vec<(String, usize, bool)> {
+        self.inner
+            .iter()
+            .map(|e| {
+                let w = e.value();
+                let open = w.is_open_and_cooling();
+                (e.key().clone(), w.count_recent(), open)
+            })
+            .collect()
+    }
+}
+
+impl Default for CircuitBreaker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AffinityEntry {
+    pub computer: String,
+    pub model_id: String,
+    pub last_used: Instant,
+}
+
+/// In-memory conversation→node affinity cache.
+///
+/// When a multi-turn conversation hits the gateway, routing follow-up
+/// turns to the same node that handled the previous turn yields a
+/// prefix-cache hit (the KV cache for the prior context is already
+/// resident). This dramatically reduces latency for chat sessions.
+///
+/// The cache is keyed by a session identifier extracted from the request
+/// body (see [`extract_session_key`]). Entries auto-expire after
+/// [`SESSION_AFFINITY_TTL`] of inactivity and are evicted when the
+/// capacity exceeds [`SESSION_AFFINITY_MAX_ENTRIES`].
+#[derive(Clone)]
+pub struct SessionAffinityCache {
+    inner: Arc<DashMap<String, AffinityEntry>>,
+}
+
+impl SessionAffinityCache {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(DashMap::new()),
+        }
+    }
+
+    /// Look up an affinity entry. Returns `None` if expired or missing.
+    pub fn get(&self, key: &str) -> Option<AffinityEntry> {
+        let entry = self.inner.get(key)?;
+        if entry.last_used.elapsed() > SESSION_AFFINITY_TTL {
+            drop(entry);
+            self.inner.remove(key);
+            return None;
+        }
+        Some(entry.clone())
+    }
+
+    /// Store (or refresh) an affinity mapping.
+    pub fn set(&self, key: String, computer: String, model_id: String) {
+        if self.inner.len() > SESSION_AFFINITY_MAX_ENTRIES {
+            // Simple eviction: drop the first entry we can grab.
+            if let Some(first) = self.inner.iter().next() {
+                let k = first.key().clone();
+                drop(first);
+                self.inner.remove(&k);
+            }
+        }
+        self.inner.insert(
+            key,
+            AffinityEntry {
+                computer,
+                model_id,
+                last_used: Instant::now(),
+            },
+        );
+    }
+
+    /// Bump the `last_used` timestamp for an existing entry.
+    pub fn refresh(&self, key: &str) {
+        if let Some(mut entry) = self.inner.get_mut(key) {
+            entry.last_used = Instant::now();
+        }
+    }
+
+    /// Current number of tracked affinity entries.
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    /// True when no affinity entries are tracked.
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+}
+
+impl Default for SessionAffinityCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Derive a stable session key from the request body.
+///
+/// Priority:
+/// 1. Top-level `session_id` field (ForgeFleet extension).
+/// 2. Hash of `model` + first user message content (standard OpenAI-style
+///    chat where the full history is sent each turn).
+fn extract_session_key(body: &Value) -> Option<String> {
+    // 1. Explicit session identifier.
+    if let Some(id) = body.get("session_id").and_then(|v| v.as_str()) {
+        return Some(format!("sess:{id}"));
+    }
+
+    // 2. Derived from model + first user message.
+    let model = body.get("model").and_then(|v| v.as_str())?;
+    let messages = body.get("messages")?.as_array()?;
+    let first_user_content = messages
+        .iter()
+        .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+        .and_then(|m| m.get("content").and_then(|c| c.as_str()))?;
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (model, first_user_content).hash(&mut hasher);
+    Some(format!("derived:{:x}", hasher.finish()))
+}
+
 /// A resolved routing decision — which server was picked for this request.
 #[derive(Debug, Clone)]
 pub struct RoutedServer {
@@ -65,6 +300,22 @@ pub struct RoutedServer {
     pub queue_depth: i32,
 }
 
+/// Result of a streaming route request. Holds the raw upstream [`reqwest::Response`]
+/// plus routing metadata so the caller can proxy the stream and decorate headers.
+#[derive(Debug)]
+pub struct StreamRouteResult {
+    pub upstream: reqwest::Response,
+    pub routed: RoutedServer,
+    pub cached: bool,
+}
+
+/// Diagnostic snapshot of the Pulse router's internal state.
+#[derive(Debug, Clone, Serialize)]
+pub struct RouterDiagnostics {
+    pub session_affinity_entries: usize,
+    pub circuit_breaker_nodes: Vec<(String, usize, bool)>,
+}
+
 /// Pulse-backed LLM router. Wraps a [`PulseReader`] and a reusable reqwest
 /// client so upstream connections pool across many requests.
 #[derive(Clone)]
@@ -72,6 +323,8 @@ pub struct PulseLlmRouter {
     reader: std::sync::Arc<PulseReader>,
     http: Client,
     upstream_timeout: Duration,
+    session_cache: Option<Arc<SessionAffinityCache>>,
+    circuit_breaker: Option<Arc<CircuitBreaker>>,
 }
 
 impl PulseLlmRouter {
@@ -89,7 +342,52 @@ impl PulseLlmRouter {
             reader: std::sync::Arc::new(reader),
             http,
             upstream_timeout: Duration::from_secs(120),
+            session_cache: None,
+            circuit_breaker: None,
         })
+    }
+
+    /// Attach a [`SessionAffinityCache`] so follow-up turns in the same
+    /// conversation are preferentially routed back to the node that handled
+    /// the previous turn, yielding prefix-cache / KV-cache hits.
+    pub fn with_session_affinity(self, cache: Arc<SessionAffinityCache>) -> Self {
+        Self {
+            session_cache: Some(cache),
+            ..self
+        }
+    }
+
+    /// Attach a [`CircuitBreaker`] so nodes that repeatedly fail upstream
+    /// requests are temporarily excluded from routing even when their
+    /// heartbeat is still reporting healthy.
+    pub fn with_circuit_breaker(self, cb: Arc<CircuitBreaker>) -> Self {
+        Self {
+            circuit_breaker: Some(cb),
+            ..self
+        }
+    }
+
+    /// Snapshot of router-internal state for diagnostics.
+    pub fn diagnostics(&self) -> RouterDiagnostics {
+        RouterDiagnostics {
+            session_affinity_entries: self.session_cache.as_ref().map(|c| c.len()).unwrap_or(0),
+            circuit_breaker_nodes: self
+                .circuit_breaker
+                .as_ref()
+                .map(|cb| cb.snapshot())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Return all raw Pulse beats (including offline/unhealthy nodes).
+    /// Thin wrapper over the internal `PulseReader`.
+    pub async fn all_beats(&self) -> Result<Vec<PulseBeatV2>, LlmRoutingError> {
+        self.reader.all_beats().await.map_err(Into::into)
+    }
+
+    /// Return the circuit breaker, if one was wired.
+    pub fn circuit_breaker(&self) -> Option<Arc<CircuitBreaker>> {
+        self.circuit_breaker.clone()
     }
 
     /// Collect every active+healthy LLM server paired with the beat it
@@ -119,6 +417,7 @@ impl PulseLlmRouter {
             .into_iter()
             .map(|(beat, s)| {
                 let routed_endpoint = rewrite_endpoint(&s.endpoint, &beat.network.primary_ip);
+                let load_score = compute_load_score(&beat, &s);
                 json!({
                     "computer": beat.computer_name,
                     "endpoint": routed_endpoint,
@@ -129,7 +428,13 @@ impl PulseLlmRouter {
                     "healthy": s.is_healthy,
                     "status": s.status,
                     "queue_depth": s.queue_depth,
+                    "active_requests": s.active_requests,
                     "tokens_per_sec_last_min": s.tokens_per_sec_last_min,
+                    "gpu_pct": beat.load.gpu_pct,
+                    "gpu_memory_used_gb": s.gpu_memory_used_gb,
+                    "kv_cache_gb": s.memory_used.kv_cache_gb,
+                    "load_score": load_score,
+                    "circuit_open": self.circuit_breaker.as_ref().map(|cb| cb.is_open(&beat.computer_name)).unwrap_or(false),
                 })
             })
             .collect())
@@ -162,6 +467,18 @@ impl PulseLlmRouter {
         //   2 = normalized prefix match in either direction
         let mut candidates: Vec<(u8, PulseBeatV2, LlmServer)> = all
             .into_iter()
+            .filter(|(b, _)| {
+                // Skip nodes that are currently circuit-opened.
+                if let Some(ref cb) = self.circuit_breaker
+                    && cb.is_open(&b.computer_name) {
+                        tracing::debug!(
+                            computer = %b.computer_name,
+                            "pulse: skipping circuit-opened node"
+                        );
+                        return false;
+                    }
+                true
+            })
             .filter_map(|(b, s)| {
                 let id_raw = s.model.id.to_ascii_lowercase();
                 let id_norm = normalize_model_id(&s.model.id);
@@ -179,17 +496,21 @@ impl PulseLlmRouter {
             })
             .collect();
 
-        // Primary: best match rank. Secondary: lowest queue_depth.
+        // Primary: best match rank.
+        // Secondary: composite load score (lower = better).
         // Tertiary: highest tokens/sec_last_min.
-        candidates.sort_by(|(a_rank, _, a), (b_rank, _, b)| {
-            a_rank
-                .cmp(b_rank)
-                .then_with(|| a.queue_depth.cmp(&b.queue_depth))
-                .then_with(|| {
-                    b.tokens_per_sec_last_min
-                        .partial_cmp(&a.tokens_per_sec_last_min)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
+        candidates.sort_by(|(a_rank, a_beat, a), (b_rank, b_beat, b)| {
+            a_rank.cmp(b_rank).then_with(|| {
+                let a_score = compute_load_score(a_beat, a);
+                let b_score = compute_load_score(b_beat, b);
+                a_score
+                    .partial_cmp(&b_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }).then_with(|| {
+                b.tokens_per_sec_last_min
+                    .partial_cmp(&a.tokens_per_sec_last_min)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
         });
 
         Ok(candidates
@@ -231,42 +552,68 @@ impl PulseLlmRouter {
         Ok(Some((computer, primary_ip, server)))
     }
 
-    /// Full end-to-end: extract `model` from the body, pick a server, and
-    /// proxy the JSON request to that server's `/v1/chat/completions`.
+    /// Shared helper: pick a server, rewrite the body, and build the upstream URL.
     ///
-    /// Streaming is NOT supported in v1 — if the request has `"stream": true`,
-    /// it is downgraded to non-streaming transparently.
-    pub async fn route_completion(&self, body: Value) -> Result<Value, LlmRoutingError> {
-        self.route_completion_cached(body, None, None).await
-    }
-
-    /// Like [`route_completion`] but consults `cache` first (sub-ms HashMap
-    /// lookup) and falls through to a live `pick_server` call only on miss.
-    /// Pass `None` for `cache` to use the legacy (uncached) path.
-    ///
-    /// If `pg` is provided, a pool-alias lookup runs first: when the
-    /// requested `model` matches `fleet_task_coverage.alias` (schema V27),
-    /// the lowest-load live endpoint serving any pool member is used.
-    pub async fn route_completion_cached(
+    /// Returns `(RoutedServer, url, modified_body)` on success. Does **not**
+    /// send the request — callers decide whether to downgrade streaming, proxy
+    /// as SSE, etc.
+    async fn resolve_target(
         &self,
         mut body: Value,
         cache: Option<&LlmRoutingCache>,
         pg: Option<&sqlx::PgPool>,
-    ) -> Result<Value, LlmRoutingError> {
+    ) -> Result<(RoutedServer, String, Value), LlmRoutingError> {
         let requested_model = body
             .get("model")
             .and_then(|v| v.as_str())
             .map(str::to_owned)
             .ok_or(LlmRoutingError::MissingModel)?;
 
-        // Downgrade streaming for v1.
-        if body.get("stream").and_then(|v| v.as_bool()) == Some(true) {
-            body["stream"] = Value::Bool(false);
-        }
+        // ── Session affinity (prefix-cache / KV-cache aware) ─────────────
+        // If this conversation was recently routed to a healthy node that
+        // still has the model loaded and isn't overloaded, prefer it.
+        let mut affinity_pick: Option<(String, String, LlmServer)> = None;
+        if let Some(ref session_cache) = self.session_cache
+            && let Some(session_key) = extract_session_key(&body)
+                && let Some(entry) = session_cache.get(&session_key) {
+                    if let Ok(Some(beat)) = self.reader.latest_beat(&entry.computer).await
+                        && !beat.going_offline {
+                            for s in &beat.llm_servers {
+                                if s.status == "active"
+                                    && s.is_healthy
+                                    && normalize_model_id(&s.model.id)
+                                        == normalize_model_id(&entry.model_id)
+                                    && s.queue_depth <= SESSION_AFFINITY_QUEUE_THRESHOLD
+                                {
+                                    affinity_pick = Some((
+                                        beat.computer_name.clone(),
+                                        beat.network.primary_ip.clone(),
+                                        s.clone(),
+                                    ));
+                                    ff_observability::metrics::PULSE_ROUTER_AFFINITY_HITS_TOTAL
+                                        .with_label_values(&[&requested_model])
+                                        .inc();
+                                    tracing::debug!(
+                                        session = %session_key,
+                                        computer = %entry.computer,
+                                        model = %entry.model_id,
+                                        queue_depth = s.queue_depth,
+                                        "pulse: session affinity hit"
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                    if affinity_pick.is_none() {
+                        tracing::debug!(
+                            session = %session_key,
+                            computer = %entry.computer,
+                            "pulse: session affinity stale (node offline or model unloaded)"
+                        );
+                    }
+                }
 
-        // 1. Pool-alias expansion (optional). If we have a pool hit, use it
-        //    directly and skip the cache. Alias traffic is rare enough that
-        //    a per-request beat scan is fine.
+        // 1. Pool-alias expansion (optional).
         let pool_pick = match pg {
             Some(pool) => self
                 .pick_server_with_pools(pool, &requested_model)
@@ -275,17 +622,20 @@ impl PulseLlmRouter {
             None => None,
         };
 
-        // 2. Cache-first pick for the normal (exact/prefix-id) path.
-        let picked = match pool_pick {
-            Some(t) => Some(t),
-            None => match cache {
-                Some(c) => c.pick(&requested_model).await,
-                None => self.pick_server(&requested_model).await?,
-            },
+        // 2. Cache-first pick for the normal path, unless affinity won.
+        let picked = if let Some(t) = affinity_pick {
+            Some(t)
+        } else {
+            match pool_pick {
+                Some(t) => Some(t),
+                None => match cache {
+                    Some(c) => c.pick(&requested_model).await,
+                    None => self.pick_server(&requested_model).await?,
+                },
+            }
         };
 
         let Some((computer, primary_ip, server)) = picked else {
-            // Gather available model ids fleet-wide for a helpful error.
             let all = self.reader.list_llm_servers().await?;
             let available: Vec<String> = all.into_iter().map(|(_, s)| s.model.id).collect();
             return Err(LlmRoutingError::NoMatch {
@@ -294,48 +644,84 @@ impl PulseLlmRouter {
             });
         };
 
-        // Rewrite body.model to the concrete backend's model_id. llama.cpp
-        // servers ignore the model field (they use whatever was loaded with
-        // -m), but mlx_lm.server dispatches on it — without this rewrite,
-        // MLX tries to fetch the pool alias literal ("multimodal", "coder")
-        // from HuggingFace and 404s.
+        // Rewrite body.model to the concrete backend model id.
         if requested_model != server.model.id {
             body["model"] = Value::String(server.model.id.clone());
         }
-
-        // Re-apply the qwen3-family max_tokens floor against the RESOLVED
-        // backend model (issue #94). The gateway applies an initial floor
-        // before this router sees the request, but when a pool alias like
-        // `thinking` expands to `qwen3-35b-thinking` the floor check never
-        // re-ran against the concrete model — so a request with
-        // `max_tokens=512` would land on a qwen3 server and silently return
-        // empty `content`. Apply the floor here so the resolved model's
-        // limit wins regardless of what the caller sent.
         apply_qwen3_max_tokens_floor(&mut body, &server.model.id);
 
-        // Beats report endpoints as `http://127.0.0.1:PORT` (because the LLM
-        // probe runs on the same host as the inference server). Rewrite the
-        // loopback host to the node's primary IP so the gateway can reach it
-        // across the LAN.
         let rewritten_endpoint = rewrite_endpoint(&server.endpoint, &primary_ip);
+        let url = if rewritten_endpoint.contains("/chat/completions") {
+            rewritten_endpoint.clone()
+        } else {
+            let base = rewritten_endpoint.trim_end_matches('/');
+            format!("{base}/v1/chat/completions")
+        };
 
         let routed = RoutedServer {
             computer,
-            endpoint: rewritten_endpoint.clone(),
+            endpoint: rewritten_endpoint,
             runtime: server.runtime.clone(),
             model_id: server.model.id.clone(),
             queue_depth: server.queue_depth,
         };
 
-        // Build the upstream URL. If the endpoint already ends in
-        // `/v1/chat/completions` (or similar), use it as-is; otherwise append.
-        let url = if rewritten_endpoint.contains("/chat/completions") {
-            rewritten_endpoint.clone()
-        } else {
-            let base = rewritten_endpoint.trim_end_matches('/');
-            // Ollama uses /v1/chat/completions too (it has an OpenAI shim).
-            format!("{base}/v1/chat/completions")
-        };
+        Ok((routed, url, body))
+    }
+
+    /// Record (or refresh) a session→node affinity mapping after a
+    /// successful routing decision.
+    fn record_affinity(&self, session_key: Option<String>, routed: &RoutedServer) {
+        if let (Some(session_cache), Some(key)) = (self.session_cache.as_ref(), session_key) {
+            session_cache.set(
+                key.clone(),
+                routed.computer.clone(),
+                routed.model_id.clone(),
+            );
+            tracing::debug!(
+                session = %key,
+                computer = %routed.computer,
+                model = %routed.model_id,
+                "pulse: session affinity recorded"
+            );
+        }
+    }
+
+    /// Record a failure against `computer` for circuit-breaking purposes.
+    fn record_failure(&self, computer: &str) {
+        if let Some(ref cb) = self.circuit_breaker {
+            cb.record_failure(computer);
+            ff_observability::metrics::PULSE_CIRCUIT_BREAKER_TRIPS_TOTAL
+                .with_label_values(&[computer])
+                .inc();
+        }
+    }
+
+    /// Full end-to-end non-streaming route.
+    ///
+    /// If the request body has `"stream": true` it is downgraded to
+    /// non-streaming transparently. For true streaming proxying use
+    /// [`Self::route_completion_streaming`].
+    pub async fn route_completion(&self, body: Value) -> Result<Value, LlmRoutingError> {
+        self.route_completion_cached(body, None, None).await
+    }
+
+    /// Like [`route_completion`] but consults `cache` first and falls through
+    /// to a live `pick_server` call only on miss.
+    pub async fn route_completion_cached(
+        &self,
+        mut body: Value,
+        cache: Option<&LlmRoutingCache>,
+        pg: Option<&sqlx::PgPool>,
+    ) -> Result<Value, LlmRoutingError> {
+        // Downgrade streaming for the non-streaming path.
+        if body.get("stream").and_then(|v| v.as_bool()) == Some(true) {
+            body["stream"] = Value::Bool(false);
+        }
+
+        let session_key = extract_session_key(&body);
+        let (routed, url, body) = self.resolve_target(body, cache, pg).await?;
+        self.record_affinity(session_key, &routed);
 
         tracing::debug!(
             computer = %routed.computer,
@@ -344,19 +730,35 @@ impl PulseLlmRouter {
             model_id = %routed.model_id,
             queue_depth = routed.queue_depth,
             cached = cache.is_some(),
-            "pulse: proxying chat completion"
+            "pulse: proxying chat completion (non-streaming)"
         );
 
         let fut = self.http.post(&url).json(&body).send();
-        let resp = tokio::time::timeout(self.upstream_timeout, fut)
-            .await
-            .map_err(|_| LlmRoutingError::Timeout(self.upstream_timeout))??;
+        let resp = match tokio::time::timeout(self.upstream_timeout, fut).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                self.record_failure(&routed.computer);
+                ff_observability::metrics::PULSE_ROUTER_REQUESTS_TOTAL
+                    .with_label_values(&[&routed.model_id, &routed.computer, "upstream_error"])
+                    .inc();
+                return Err(e.into());
+            }
+            Err(_) => {
+                self.record_failure(&routed.computer);
+                ff_observability::metrics::PULSE_ROUTER_REQUESTS_TOTAL
+                    .with_label_values(&[&routed.model_id, &routed.computer, "timeout"])
+                    .inc();
+                return Err(LlmRoutingError::Timeout(self.upstream_timeout));
+            }
+        };
+
+        if resp.status().is_server_error() {
+            self.record_failure(&routed.computer);
+        }
 
         let status = resp.status();
         let mut v: Value = resp.json().await?;
 
-        // Decorate with routing info for diagnostics; put it under an internal
-        // key so it does not collide with OpenAI's schema.
         if v.is_object() {
             v["_forgefleet_route"] = json!({
                 "computer": routed.computer,
@@ -366,8 +768,106 @@ impl PulseLlmRouter {
                 "cached": cache.is_some(),
             });
         }
+
+        let result_label = if status.is_success() { "success" } else { "upstream_error" };
+        ff_observability::metrics::PULSE_ROUTER_REQUESTS_TOTAL
+            .with_label_values(&[&routed.model_id, &routed.computer, result_label])
+            .inc();
+
         Ok(v)
     }
+
+    /// Streaming variant of [`route_completion_cached`].
+    ///
+    /// Preserves `"stream": true` in the upstream request and returns the raw
+    /// [`reqwest::Response`] so the caller can proxy SSE chunks back to the
+    /// client. Routing metadata is returned alongside the response so the
+    /// caller can inject `X-ForgeFleet-*` headers if desired.
+    pub async fn route_completion_streaming(
+        &self,
+        body: Value,
+        cache: Option<&LlmRoutingCache>,
+        pg: Option<&sqlx::PgPool>,
+    ) -> Result<StreamRouteResult, LlmRoutingError> {
+        let session_key = extract_session_key(&body);
+        let (routed, url, body) = self.resolve_target(body, cache, pg).await?;
+        self.record_affinity(session_key, &routed);
+
+        tracing::debug!(
+            computer = %routed.computer,
+            endpoint = %routed.endpoint,
+            runtime = %routed.runtime,
+            model_id = %routed.model_id,
+            queue_depth = routed.queue_depth,
+            cached = cache.is_some(),
+            "pulse: proxying chat completion (streaming)"
+        );
+
+        let fut = self.http.post(&url).json(&body).send();
+        let upstream = match tokio::time::timeout(self.upstream_timeout, fut).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                self.record_failure(&routed.computer);
+                ff_observability::metrics::PULSE_ROUTER_REQUESTS_TOTAL
+                    .with_label_values(&[&routed.model_id, &routed.computer, "upstream_error"])
+                    .inc();
+                return Err(e.into());
+            }
+            Err(_) => {
+                self.record_failure(&routed.computer);
+                ff_observability::metrics::PULSE_ROUTER_REQUESTS_TOTAL
+                    .with_label_values(&[&routed.model_id, &routed.computer, "timeout"])
+                    .inc();
+                return Err(LlmRoutingError::Timeout(self.upstream_timeout));
+            }
+        };
+
+        let status = upstream.status();
+        if status.is_server_error() {
+            self.record_failure(&routed.computer);
+        }
+
+        let result_label = if status.is_success() { "success" } else { "upstream_error" };
+        ff_observability::metrics::PULSE_ROUTER_REQUESTS_TOTAL
+            .with_label_values(&[&routed.model_id, &routed.computer, result_label])
+            .inc();
+
+        Ok(StreamRouteResult {
+            upstream,
+            routed,
+            cached: cache.is_some(),
+        })
+    }
+}
+
+/// Composite load score for candidate ranking.
+///
+/// Lower = better (less loaded). Combines queue depth, active requests,
+/// GPU memory pressure, GPU utilization, and KV-cache size into a single
+/// scalar so the router can preferentially send traffic to the least
+/// stressed inference server.
+///
+/// The weights are heuristic and biased toward:
+/// - queue_depth (1.0×) — most direct signal of load
+/// - active_requests (0.5×) — overlapping work
+/// - GPU memory used (1.0× per 8 GB) — caps at +10
+/// - GPU utilization (1.0× per 10%%) — caps at +5
+/// - KV cache size (1.0× per 4 GB) — caps at +5
+fn compute_load_score(beat: &PulseBeatV2, server: &LlmServer) -> f64 {
+    let mut score = server.queue_depth as f64;
+    score += server.active_requests as f64 * 0.5;
+
+    if let Some(gpu_mem) = server.gpu_memory_used_gb {
+        score += (gpu_mem / 8.0).min(10.0);
+    }
+
+    if beat.load.gpu_pct > 0.0 {
+        score += (beat.load.gpu_pct / 10.0).min(5.0);
+    }
+
+    score += (server.memory_used.kv_cache_gb / 4.0).min(5.0);
+
+    score
 }
 
 /// Normalize a model identifier so heterogeneous fleet-reported model IDs
@@ -709,6 +1209,9 @@ impl LlmRoutingCache {
             if let Some(entry) = guard.get(&key)
                 && entry.refreshed_at.elapsed() < CACHE_TTL
             {
+                ff_observability::metrics::PULSE_ROUTER_CACHE_HITS_TOTAL
+                    .with_label_values(&[model_id])
+                    .inc();
                 return Some((
                     entry.computer.clone(),
                     entry.primary_ip.clone(),

@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio::process::Command;
 
-use super::{AgentTool, AgentToolContext, AgentToolResult, MAX_TOOL_RESULT_CHARS, truncate_output};
+use super::{AgentTool, AgentToolContext, AgentToolResult, MAX_TOOL_RESULT_CHARS, truncate_output, shell_escape_single};
 
 pub struct CodeComplexityTool;
 #[async_trait]
@@ -49,9 +49,9 @@ impl AgentTool for CodeComplexityTool {
                     .map(|l| format!("*.{l}"))
                     .unwrap_or_else(|| "*".to_string());
                 let cmd = format!(
-                    "find '{}' -name '{}' -not -path '*/target/*' -not -path '*/node_modules/*' -not -path '*/.git/*' | head -100 | xargs wc -l 2>/dev/null | sort -rn | head -20",
-                    target.display(),
-                    ext_filter
+                    "find {} -name {} -not -path '*/target/*' -not -path '*/node_modules/*' -not -path '*/.git/*' | head -100 | xargs wc -l 2>/dev/null | sort -rn | head -20",
+                    shell_escape_single(&target.to_string_lossy()),
+                    shell_escape_single(&ext_filter)
                 );
                 match Command::new("bash").arg("-c").arg(&cmd).output().await {
                     Ok(out) => AgentToolResult::ok(format!(
@@ -113,9 +113,9 @@ impl AgentTool for DuplicateDetectorTool {
                     .and_then(Value::as_str)
                     .unwrap_or("rs");
                 let cmd = format!(
-                    "find '{}' -name '*.{}' -not -path '*/target/*' | xargs cat 2>/dev/null | sed 's/^[[:space:]]*//' | sort | uniq -cd | sort -rn | head -20",
-                    target.display(),
-                    lang
+                    "find {} -name {} -not -path '*/target/*' | xargs cat 2>/dev/null | sed 's/^[[:space:]]*//' | sort | uniq -cd | sort -rn | head -20",
+                    shell_escape_single(&target.to_string_lossy()),
+                    shell_escape_single(&format!("*.{lang}"))
                 );
                 match Command::new("bash").arg("-c").arg(&cmd).output().await {
                     Ok(out) => {
@@ -162,18 +162,15 @@ impl AgentTool for LogAnalyzerTool {
             return AgentToolResult::err(format!("File not found: {}", path.display()));
         }
 
+        let path_escaped = shell_escape_single(&path.to_string_lossy());
         let cmd = if filter.is_empty() {
             format!(
-                "tail -n {} '{}' | sort | uniq -c | sort -rn | head -30",
-                tail,
-                path.display()
+                "tail -n {tail} {path_escaped} | sort | uniq -c | sort -rn | head -30",
             )
         } else {
             format!(
-                "tail -n {} '{}' | grep -i '{}' | head -50",
-                tail,
-                path.display(),
-                filter
+                "tail -n {tail} {path_escaped} | grep -i {} | head -50",
+                shell_escape_single(filter)
             )
         };
 

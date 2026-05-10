@@ -40,6 +40,7 @@ pub struct AppState {
 impl AppState {
     pub fn new(registry: Arc<BackendRegistry>) -> anyhow::Result<Self> {
         let http_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
             .pool_idle_timeout(std::time::Duration::from_secs(30))
             .build()
             .context("failed to create reqwest client")?;

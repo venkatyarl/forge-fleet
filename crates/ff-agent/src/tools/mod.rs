@@ -390,6 +390,22 @@ pub fn find_tool_arc(name: &str, tools: &[Arc<dyn AgentTool>]) -> Option<usize> 
 /// Maximum tool result size in characters before truncation.
 pub const MAX_TOOL_RESULT_CHARS: usize = 16_384;
 
+/// POSIX shell single-quote escape: wraps the argument in single quotes and
+/// escapes any embedded single quotes. Safe for pasting into `sh -c`.
+pub fn shell_escape_single(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
+}
+
 /// Truncate output to a safe UTF-8 boundary with a marker.
 pub fn truncate_output(output: &str, max_chars: usize) -> String {
     if output.len() <= max_chars {

@@ -1347,6 +1347,7 @@ dependencies = [
  "ff-mc",
  "ff-mcp",
  "ff-observability",
+ "ff-orchestrator",
  "ff-pulse",
  "ff-security",
  "ff-voice",

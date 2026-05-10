@@ -25,6 +25,10 @@ export type FleetWorkload = {
   active_tasks?: number | null
   task_ids?: string[]
   status_breakdown?: Record<string, number>
+  gpu_util?: number | null
+  vram_used_gb?: number | null
+  vram_total_gb?: number | null
+  gpu_temp_c?: number | null
 }
 
 export type FleetNodeHardware = {

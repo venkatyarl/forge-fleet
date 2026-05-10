@@ -16,6 +16,7 @@ ff-mc = { path = "../ff-mc" }
 ff-mcp = { path = "../ff-mcp" }
 ff-db = { path = "../ff-db" }
 ff-observability = { path = "../ff-observability" }
+ff-orchestrator = { path = "../ff-orchestrator" }
 ff-pulse = { path = "../ff-pulse" }
 ff-security = { path = "../ff-security" }
 ff-voice = { path = "../ff-voice" }

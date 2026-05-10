@@ -2908,6 +2908,11 @@ fn open_legacy_sqlite_store() -> Result<OperationalStore, String> {
 }
 
 async fn open_operational_store() -> Result<OperationalStore, String> {
+    // Test override: if FORGEFLEET_DB_PATH is set, use it directly as SQLite.
+    if let Ok(db_path) = std::env::var("FORGEFLEET_DB_PATH") {
+        return open_embedded_sqlite_store(std::path::Path::new(&db_path));
+    }
+
     match load_config_auto() {
         Ok((config, config_path)) => match config.database.mode {
             DatabaseMode::EmbeddedSqlite => {

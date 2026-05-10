@@ -426,7 +426,13 @@ pub async fn llm_servers(
                 "runtime": v.get("runtime").cloned().unwrap_or(Value::Null),
                 "model": v.get("model").cloned().unwrap_or(Value::Null),
                 "queue_depth": v.get("queue_depth").cloned().unwrap_or(Value::Null),
+                "active_requests": v.get("active_requests").cloned().unwrap_or(Value::Null),
                 "tokens_per_sec": v.get("tokens_per_sec_last_min").cloned().unwrap_or(Value::Null),
+                "gpu_pct": v.get("gpu_pct").cloned().unwrap_or(Value::Null),
+                "gpu_memory_used_gb": v.get("gpu_memory_used_gb").cloned().unwrap_or(Value::Null),
+                "kv_cache_gb": v.get("kv_cache_gb").cloned().unwrap_or(Value::Null),
+                "load_score": v.get("load_score").cloned().unwrap_or(Value::Null),
+                "circuit_open": v.get("circuit_open").cloned().unwrap_or(Value::Null),
                 "healthy": v.get("healthy").cloned().unwrap_or(Value::Null),
                 "status": v.get("status").cloned().unwrap_or(Value::Null),
             })

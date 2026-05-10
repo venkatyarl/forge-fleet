@@ -1808,9 +1808,6 @@ pub async fn handle_fleet_revive(
     Ok(())
 }
 
-/// Resolve the Redis URL for Pulse reads. Prefers `$FORGEFLEET_REDIS_URL`,
-/// then `~/.forgefleet/fleet.toml` `[redis] url`, then a localhost fallback.
-
 fn secs_ago(ts: chrono::DateTime<chrono::Utc>) -> i64 {
     (chrono::Utc::now() - ts).num_seconds().max(0)
 }
