@@ -248,7 +248,7 @@ impl ProcessManager {
             "starting llama-server"
         );
 
-        let child = Command::new(&binary)
+        let mut child = Command::new(&binary)
             .args(&args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -258,6 +258,11 @@ impl ProcessManager {
             })?;
 
         let pid = child.id();
+
+        // Reap the child in a blocking thread so it doesn't become a zombie.
+        tokio::task::spawn_blocking(move || {
+            let _ = child.wait();
+        });
 
         let mut models = self.models.write().await;
         models.insert(

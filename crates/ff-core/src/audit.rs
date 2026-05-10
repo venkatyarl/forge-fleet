@@ -416,6 +416,9 @@ impl AuditLogger {
 
 // ─── In-Memory Store (for testing) ───────────────────────────────────────────
 
+/// Hard cap on in-memory events to prevent unbounded growth.
+const IN_MEMORY_AUDIT_CAP: usize = 10_000;
+
 /// Simple in-memory audit store, useful for unit tests.
 ///
 /// Not intended for production use — events are lost on drop.
@@ -455,6 +458,11 @@ impl AuditStore for InMemoryAuditStore {
         let mut stored = event.clone();
         stored.id = id;
         events.push(stored);
+        // Prevent unbounded growth.
+        if events.len() > IN_MEMORY_AUDIT_CAP {
+            let excess = events.len() - IN_MEMORY_AUDIT_CAP;
+            events.drain(0..excess);
+        }
         Ok(id)
     }
 

@@ -83,7 +83,7 @@ pub enum TaskRunnerError {
     #[error("database error: {0}")]
     Sqlx(#[from] sqlx::Error),
     #[error("task payload missing required field: {0}")]
-    BadPayload(&'static str),
+    BadPayload(String),
     #[error("unsupported task_type: {0}")]
     UnsupportedType(String),
 }
@@ -477,9 +477,9 @@ impl TaskRunner {
         .await
         {
             Ok(result) => result,
-            Err(_) => Err(TaskRunnerError::BadPayload(Box::leak(
-                format!("task exceeded max duration of {}s", max_duration.as_secs())
-                    .into_boxed_str(),
+            Err(_) => Err(TaskRunnerError::BadPayload(format!(
+                "task exceeded max duration of {}s",
+                max_duration.as_secs()
             ))),
         };
         let _ = cancel_tx.send(());
@@ -906,16 +906,14 @@ async fn run_shell_payload(
     let command = payload
         .get("command")
         .and_then(Value::as_str)
-        .ok_or(TaskRunnerError::BadPayload("command"))?
+        .ok_or(TaskRunnerError::BadPayload("command".to_string()))?
         .to_string();
 
     // Security: block obviously destructive commands (same list as BashTool).
     if is_blocked_command(&command) {
-        return Err(TaskRunnerError::BadPayload(Box::leak(
-            "Command blocked for safety: potentially destructive operation"
-                .to_string()
-                .into_boxed_str(),
-        )));
+        return Err(TaskRunnerError::BadPayload(
+            "Command blocked for safety: potentially destructive operation".to_string(),
+        ));
     }
 
     let shell = payload
@@ -934,12 +932,9 @@ async fn run_shell_payload(
         "/usr/bin/zsh",
     ];
     if !ALLOWED_SHELLS.contains(&shell.as_str()) {
-        return Err(TaskRunnerError::BadPayload(Box::leak(
-            format!(
-                "shell '{}' is not in the allowed list: {:?}",
-                shell, ALLOWED_SHELLS
-            )
-            .into_boxed_str(),
+        return Err(TaskRunnerError::BadPayload(format!(
+            "shell '{}' is not in the allowed list: {:?}",
+            shell, ALLOWED_SHELLS
         )));
     }
 
@@ -957,7 +952,7 @@ async fn run_shell_payload(
     cmd.kill_on_drop(true);
 
     let out = cmd.output().await.map_err(|e| {
-        TaskRunnerError::BadPayload(Box::leak(format!("spawn: {e}").into_boxed_str()))
+        TaskRunnerError::BadPayload(format!("spawn: {e}"))
     })?;
 
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();

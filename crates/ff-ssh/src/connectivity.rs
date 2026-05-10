@@ -104,8 +104,12 @@ impl ConnectivityChecker {
             let now = Utc::now();
             let started = Instant::now();
 
-            match self.probe_candidate(&candidate) {
-                Ok(()) => {
+            match tokio::task::spawn_blocking({
+                let checker = self.clone();
+                let candidate = candidate.clone();
+                move || checker.probe_candidate(&candidate)
+            }).await {
+                Ok(Ok(())) => {
                     return NodeConnectivityResult {
                         node: node.name.clone(),
                         host: candidate.host,
@@ -115,7 +119,7 @@ impl ConnectivityChecker {
                         details: None,
                     };
                 }
-                Err((status, details)) => {
+                Ok(Err((status, details))) => {
                     last_failure = Some(NodeConnectivityResult {
                         node: node.name.clone(),
                         host: candidate.host,
@@ -123,6 +127,16 @@ impl ConnectivityChecker {
                         latency_ms: Some(started.elapsed().as_millis()),
                         status,
                         details: Some(details),
+                    });
+                }
+                Err(_) => {
+                    last_failure = Some(NodeConnectivityResult {
+                        node: node.name.clone(),
+                        host: candidate.host,
+                        checked_at: now,
+                        latency_ms: Some(started.elapsed().as_millis()),
+                        status: ConnectivityStatus::Unknown,
+                        details: Some("connectivity check task panicked".to_string()),
                     });
                 }
             }

@@ -83,6 +83,30 @@ fn check_tool_allowed(
 }
 
 /// Fire-and-forget audit log write.
+/// Limits concurrent audit-log DB writes to prevent unbounded task growth
+/// under high tool-call throughput.
+static AUDIT_SEM: std::sync::LazyLock<tokio::sync::Semaphore> =
+    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(8));
+
+/// Fire-and-forget audit helper with backpressure: if all 8 permits are in
+/// use the audit event is silently dropped.
+fn spawn_audit(
+    pg: Option<sqlx::PgPool>,
+    session_id: String,
+    tool_name: String,
+    params: serde_json::Value,
+    outcome: crate::audit_logger::ToolOutcome,
+    duration_ms: Option<u64>,
+) {
+    if let Ok(permit) = AUDIT_SEM.try_acquire() {
+        tokio::spawn(async move {
+            let _permit = permit;
+            audit_tool_call(pg.as_ref(), &session_id, &tool_name, &params, outcome, duration_ms)
+                .await;
+        });
+    }
+}
+
 async fn audit_tool_call(
     pg: Option<&sqlx::PgPool>,
     session_id: &str,
@@ -1078,22 +1102,16 @@ async fn run_agent_loop(
                             duration_ms: 0,
                         },
                     );
-                    let pg = session.tool_ctx.pg_pool.clone();
-                    let sid = session_id.clone();
-                    let tn = tool_name.clone();
-                    tokio::spawn(async move {
-                        if let Ok(args) = serde_json::from_str::<serde_json::Value>(&args_str) {
-                            audit_tool_call(
-                                pg.as_ref(),
-                                &sid,
-                                &tn,
-                                &args,
-                                crate::audit_logger::ToolOutcome::Denied,
-                                Some(0),
-                            )
-                            .await;
-                        }
-                    });
+                    if let Ok(args) = serde_json::from_str::<serde_json::Value>(&args_str) {
+                        spawn_audit(
+                            session.tool_ctx.pg_pool.clone(),
+                            session_id.clone(),
+                            tool_name.clone(),
+                            args,
+                            crate::audit_logger::ToolOutcome::Denied,
+                            Some(0),
+                        );
+                    }
                     pre_blocked.push((tool_id, denied_msg, true));
                     continue;
                 }
@@ -1236,19 +1254,14 @@ async fn run_agent_loop(
                     session
                         .messages
                         .push(ToolChatMessage::tool_result(&tool_id, &denied_msg));
-                    let pg = session.tool_ctx.pg_pool.clone();
-                    let sid = session_id.clone();
-                    tokio::spawn(async move {
-                        audit_tool_call(
-                            pg.as_ref(),
-                            &sid,
-                            &tool_name,
-                            &args,
-                            crate::audit_logger::ToolOutcome::Denied,
-                            Some(0),
-                        )
-                        .await;
-                    });
+                    spawn_audit(
+                        session.tool_ctx.pg_pool.clone(),
+                        session_id.clone(),
+                        tool_name.clone(),
+                        args.clone(),
+                        crate::audit_logger::ToolOutcome::Denied,
+                        Some(0),
+                    );
                     continue;
                 }
 
@@ -1270,14 +1283,14 @@ async fn run_agent_loop(
                     } else {
                         crate::audit_logger::ToolOutcome::Success
                     };
-                    let pg = session.tool_ctx.pg_pool.clone();
-                    let sid = session_id.clone();
-                    let tn = tool_name.clone();
-                    let a = args.clone();
-                    tokio::spawn(async move {
-                        audit_tool_call(pg.as_ref(), &sid, &tn, &a, outcome, Some(duration_ms))
-                            .await;
-                    });
+                    spawn_audit(
+                        session.tool_ctx.pg_pool.clone(),
+                        session_id.clone(),
+                        tool_name.clone(),
+                        args.clone(),
+                        outcome,
+                        Some(duration_ms),
+                    );
 
                     let result_content =
                         tools::truncate_output(&result.content, tools::MAX_TOOL_RESULT_CHARS);
@@ -1626,15 +1639,14 @@ async fn execute_single_tool(
         } else {
             crate::audit_logger::ToolOutcome::Success
         };
-        if let Some(pool) = ctx.pg_pool.as_ref() {
-            let pool = pool.clone();
-            let sid = session_id.to_string();
-            let tn = tool_name.to_string();
-            let a = args.clone();
-            tokio::spawn(async move {
-                audit_tool_call(Some(&pool), &sid, &tn, &a, outcome, Some(duration_ms)).await;
-            });
-        }
+        spawn_audit(
+            ctx.pg_pool.clone(),
+            session_id.to_string(),
+            tool_name.to_string(),
+            args.clone(),
+            outcome,
+            Some(duration_ms),
+        );
         let content = tools::truncate_output(&result.content, tools::MAX_TOOL_RESULT_CHARS);
 
         emit(

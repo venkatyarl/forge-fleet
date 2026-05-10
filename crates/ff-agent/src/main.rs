@@ -16,6 +16,7 @@ use crate::{
 use ff_discovery::{collect_health_snapshot, detect_hardware_profile, read_activity_signals};
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio::sync::{RwLock, mpsc};
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 #[tokio::main]
@@ -54,39 +55,44 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let (task_tx, task_rx) = mpsc::channel(128);
+    let cancel = CancellationToken::new();
 
     let http_ctx = AppContext {
         state: shared_state.clone(),
         task_tx: task_tx.clone(),
     };
 
-    tokio::spawn(run_http_server(config.http_port, http_ctx));
+    let http_cancel = cancel.clone();
 
-    // Register tools with fleet tool registry (Phase 15a)
-    tokio::spawn(run_tool_registry_reporter(
+    let http_handle = tokio::spawn(run_http_server(config.http_port, http_ctx, http_cancel));
+
+    let registry_handle = tokio::spawn(run_tool_registry_reporter(
         config.node_id.clone(),
         config.leader_url.clone(),
+        cancel.clone(),
     ));
 
-    tokio::spawn(run_health_reporter(
+    let health_handle = tokio::spawn(run_health_reporter(
         shared_state.clone(),
         leader.clone(),
         config.heartbeat_interval_secs,
+        cancel.clone(),
     ));
 
-    tokio::spawn(run_activity_monitor(
+    let activity_handle = tokio::spawn(run_activity_monitor(
         shared_state.clone(),
         config.activity_override,
         config.activity_poll_interval_secs,
+        cancel.clone(),
     ));
 
-    tokio::spawn(run_task_poller(
+    let poller_handle = tokio::spawn(run_task_poller(
         task_tx,
         leader.clone(),
         config.task_poll_interval_secs,
     ));
 
-    tokio::spawn(run_task_executor(
+    let executor_handle = tokio::spawn(run_task_executor(
         shared_state,
         task_rx,
         leader,
@@ -97,17 +103,33 @@ async fn main() -> anyhow::Result<()> {
     tokio::signal::ctrl_c().await?;
     info!("ff-agent shutdown signal received");
 
+    // Signal graceful shutdown to cancellable tasks.
+    cancel.cancel();
+
+    // Abort the rest and wait up to 5s for cleanup.
+    let timeout = Duration::from_secs(5);
+    let _ = tokio::time::timeout(timeout, http_handle).await;
+    registry_handle.abort();
+    health_handle.abort();
+    activity_handle.abort();
+    poller_handle.abort();
+    executor_handle.abort();
+
     Ok(())
 }
 
-async fn run_http_server(port: u16, ctx: AppContext) {
+async fn run_http_server(port: u16, ctx: AppContext, cancel: CancellationToken) {
     let app = build_router(ctx);
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
 
     match tokio::net::TcpListener::bind(addr).await {
         Ok(listener) => {
             info!(%addr, "status endpoint listening");
-            if let Err(err) = axum::serve(listener, app).await {
+            let serve = axum::serve(listener, app);
+            if let Err(err) = serve
+                .with_graceful_shutdown(async move { cancel.cancelled().await })
+                .await
+            {
                 error!(error = %err, "http server stopped");
             }
         }
@@ -115,10 +137,23 @@ async fn run_http_server(port: u16, ctx: AppContext) {
     }
 }
 
-async fn run_health_reporter(state: SharedState, leader: LeaderClient, interval_secs: u64) {
+async fn run_health_reporter(
+    state: SharedState,
+    leader: LeaderClient,
+    interval_secs: u64,
+    cancel: CancellationToken,
+) {
     let interval = Duration::from_secs(interval_secs.max(5));
 
     loop {
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {}
+            _ = cancel.cancelled() => {
+                info!("health reporter shutting down");
+                break;
+            }
+        }
+
         let (active_tasks, running_models, role, activity_level) = {
             let locked = state.read().await;
             (
@@ -139,14 +174,19 @@ async fn run_health_reporter(state: SharedState, leader: LeaderClient, interval_
         if let Err(err) = leader.send_heartbeat(role, activity_level, &health).await {
             warn!(error = %err, "heartbeat report failed");
         }
-
-        tokio::time::sleep(interval).await;
     }
 }
 
-async fn run_tool_registry_reporter(node_id: String, leader_url: String) {
+async fn run_tool_registry_reporter(
+    node_id: String,
+    leader_url: String,
+    cancel: CancellationToken,
+) {
     // Wait a bit for the gateway to be fully up
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    tokio::select! {
+        _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+        _ = cancel.cancelled() => return,
+    }
 
     let gateway = if leader_url.contains(':') {
         // Convert leader URL (e.g., http://192.168.5.100:50001) to gateway URL
@@ -203,7 +243,13 @@ async fn run_tool_registry_reporter(node_id: String, leader_url: String) {
     // Periodic heartbeat to keep tools healthy
     let heartbeat_interval = Duration::from_secs(60);
     loop {
-        tokio::time::sleep(heartbeat_interval).await;
+        tokio::select! {
+            _ = tokio::time::sleep(heartbeat_interval) => {}
+            _ = cancel.cancelled() => {
+                info!("tool registry reporter shutting down");
+                break;
+            }
+        }
 
         let heartbeat_body = serde_json::json!({"node_name": node_id});
         let heartbeat_url = format!("{}/api/tools/heartbeat", gateway);
@@ -229,10 +275,19 @@ async fn run_activity_monitor(
     state: SharedState,
     override_level: Option<ff_core::ActivityLevel>,
     interval_secs: u64,
+    cancel: CancellationToken,
 ) {
     let interval = Duration::from_secs(interval_secs.max(2));
 
     loop {
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {}
+            _ = cancel.cancelled() => {
+                info!("activity monitor shutting down");
+                break;
+            }
+        }
+
         let signals = read_activity_signals();
         let level = decide_activity_level(&signals, override_level);
         let yield_resources = should_yield_resources(level);
@@ -242,7 +297,5 @@ async fn run_activity_monitor(
             locked.activity_level = level;
             locked.yield_resources = yield_resources;
         }
-
-        tokio::time::sleep(interval).await;
     }
 }

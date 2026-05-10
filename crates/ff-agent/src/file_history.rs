@@ -8,6 +8,8 @@ use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 
+/// Maximum number of changes tracked per session.
+const MAX_CHANGES_PER_SESSION: usize = 10_000;
 /// Global file history store keyed by session ID.
 static HISTORY_STORE: std::sync::LazyLock<Arc<DashMap<String, FileHistory>>> =
     std::sync::LazyLock::new(|| Arc::new(DashMap::new()));
@@ -80,6 +82,11 @@ impl FileHistory {
             turn,
             timestamp: Utc::now(),
         });
+        // Prevent unbounded growth.
+        if self.changes.len() > MAX_CHANGES_PER_SESSION {
+            let excess = self.changes.len() - MAX_CHANGES_PER_SESSION;
+            self.changes.drain(0..excess);
+        }
     }
 
     /// Get the N most accessed files (for post-compact recovery).

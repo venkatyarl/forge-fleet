@@ -356,7 +356,10 @@ impl ChaosEngine {
         sim.state = SimulationState::Cancelled;
         info!(id = %id, "Chaos simulation cancelled");
 
-        Ok(sim.clone())
+        // Remove from map to prevent unbounded growth.
+        let sim_clone = sim.clone();
+        sims.remove(id);
+        Ok(sim_clone)
     }
 
     /// Cancel all active simulations (e.g. on shutdown).
@@ -493,7 +496,8 @@ impl ChaosEngine {
         };
         drop(hooks_guard);
 
-        // Update simulation state
+        // Update simulation state and remove completed entries to prevent
+        // unbounded growth.
         let mut sims = simulations.lock().await;
         if let Some(sim) = sims.get_mut(sim_id)
             && sim.state == SimulationState::Active
@@ -511,6 +515,7 @@ impl ChaosEngine {
                 }
             }
         }
+        sims.remove(sim_id);
     }
 }
 

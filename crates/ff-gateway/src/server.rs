@@ -286,6 +286,7 @@ impl Default for UpdateRolloutState {
 pub struct GatewayServer {
     config: GatewayConfig,
     state: Arc<GatewayState>,
+    flush_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl GatewayServer {
@@ -400,7 +401,7 @@ impl GatewayServer {
         // Spawn background token ledger flush task (every 5 minutes)
         let flush_state = state.clone();
         let flush_cancel = state.cancel_token.clone();
-        tokio::spawn(async move {
+        let flush_handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(300));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
@@ -430,14 +431,14 @@ impl GatewayServer {
             }
         });
 
-        Ok(Self { config, state })
+        Ok(Self { config, state, flush_handle: Some(flush_handle) })
     }
 
     pub fn app(&self) -> Router {
         build_router(self.state.clone(), self.config.mc_db_path.as_deref())
     }
 
-    pub async fn run(self) -> anyhow::Result<()> {
+    pub async fn run(mut self) -> anyhow::Result<()> {
         let listener = TcpListener::bind(&self.config.bind_addr)
             .await
             .with_context(|| format!("failed to bind ff-gateway on {}", self.config.bind_addr))?;
@@ -462,6 +463,9 @@ impl GatewayServer {
             let _ = tx.send(true);
         }
         heartbeat_handle.abort();
+        if let Some(flush_handle) = self.flush_handle.take() {
+            let _ = tokio::time::timeout(Duration::from_secs(5), flush_handle).await;
+        }
         info!("ff-gateway shutdown complete");
         Ok(())
     }
