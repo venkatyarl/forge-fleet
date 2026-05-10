@@ -175,7 +175,7 @@ async fn run_single_agent_task(
     let mut session = AgentSession::new(config);
 
     // Collect events
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<AgentEvent>();
+    let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(256);
     let events_collector = tokio::spawn(async move {
         let mut events = Vec::new();
         while let Some(event) = event_rx.recv().await {

@@ -1117,7 +1117,7 @@ pub async fn fleet_crew(params: Option<Value>) -> HandlerResult {
         executor_cfg = executor_cfg.with_llm_model(model);
     }
 
-    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(256);
 
     let run = ff_pipeline::execute(&graph, executor_cfg, Some(event_tx))
         .await

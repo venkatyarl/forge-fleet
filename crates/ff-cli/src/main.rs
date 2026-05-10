@@ -248,7 +248,7 @@ async fn handle_chat(args: ChatArgs) -> Result<()> {
         }
 
         // Run agent loop
-        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<AgentEvent>();
+        let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(256);
 
         // Print events in background
         let printer = tokio::spawn(async move {
@@ -315,7 +315,7 @@ async fn handle_run(args: RunArgs) -> Result<()> {
     };
 
     let mut session = AgentSession::new(config);
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<AgentEvent>();
+    let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(256);
 
     // Collect events for JSON output
     let is_json = args.output == "json";

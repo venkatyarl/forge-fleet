@@ -38,7 +38,7 @@ async fn agent_executes_bash_via_tool() {
     };
 
     let mut session = AgentSession::new(config);
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<AgentEvent>();
+    let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(256);
 
     // Collect events in background
     let events_handle = tokio::spawn(async move {

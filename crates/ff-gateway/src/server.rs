@@ -6671,9 +6671,9 @@ async fn create_agent_session(
     let prompt = req.prompt;
 
     tokio::spawn(async move {
-        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<AgentEvent>();
+        let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(256);
 
-        // Forward agent events to WebSocket hub
+        // Forward agent events to WebSocket hub in real-time
         let ws_hub_fwd = ws_hub.clone();
         let fwd_handle = tokio::spawn(async move {
             while let Some(event) = event_rx.recv().await {
@@ -6684,6 +6684,7 @@ async fn create_agent_session(
         });
 
         let outcome = session.run(&prompt, Some(event_tx)).await;
+        let _ = fwd_handle.await;
 
         match &outcome {
             AgentOutcome::EndTurn { .. } => {
@@ -6699,9 +6700,6 @@ async fn create_agent_session(
                 status.store(2, std::sync::atomic::Ordering::Relaxed);
             }
         }
-
-        // Clean up forwarding task
-        fwd_handle.abort();
 
         info!(session = %session_id, "agent session completed");
     });

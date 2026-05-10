@@ -169,7 +169,7 @@ pub struct PipelineRunResult {
 pub async fn execute(
     graph: &PipelineGraph,
     config: ExecutorConfig,
-    event_tx: Option<mpsc::UnboundedSender<PipelineEvent>>,
+    event_tx: Option<mpsc::Sender<PipelineEvent>>,
 ) -> Result<PipelineRunResult, PipelineError> {
     if graph.is_empty() {
         return Err(PipelineError::EmptyPipeline);
@@ -185,8 +185,9 @@ pub async fn execute(
     let mut statuses: HashMap<StepId, StepStatus> = HashMap::new();
     let mut results: HashMap<StepId, StepResult> = HashMap::new();
 
-    // Channel for step completions.
-    let (done_tx, mut done_rx) = mpsc::unbounded_channel::<StepResult>();
+    // Channel for step completions (bounded to avoid unbounded growth).
+    let done_cap = config.max_parallelism.saturating_mul(4).max(16);
+    let (done_tx, mut done_rx) = mpsc::channel::<StepResult>(done_cap);
 
     let mut in_flight: usize = 0;
 
@@ -199,10 +200,12 @@ pub async fn execute(
             let result = StepResult::skipped(id.clone(), reason.clone());
             results.insert(id.clone(), result);
             if let Some(tx) = &event_tx {
-                let _ = tx.send(PipelineEvent::StepSkipped {
-                    step_id: id,
-                    reason,
-                });
+                let _ = tx
+                    .send(PipelineEvent::StepSkipped {
+                        step_id: id,
+                        reason,
+                    })
+                    .await;
             }
         }
 
@@ -227,7 +230,7 @@ pub async fn execute(
 
                 for attempt in 1..=max_attempts {
                     if let Some(etx) = &evt_tx {
-                        let _ = etx.send(PipelineEvent::StepStarted {
+                        let _ = etx.try_send(PipelineEvent::StepStarted {
                             step_id: step.id.clone(),
                             attempt,
                         });
@@ -274,7 +277,8 @@ pub async fn execute(
                 }
 
                 let result = last_result.expect("at least one execution attempt");
-                let _ = tx.send(result);
+                drop(_permit);
+                let _ = tx.send(result).await;
             });
         }
 
@@ -290,9 +294,11 @@ pub async fn execute(
             statuses.insert(result.step_id.clone(), final_status);
 
             if let Some(tx) = &event_tx {
-                let _ = tx.send(PipelineEvent::StepCompleted {
-                    result: result.clone(),
-                });
+                let _ = tx
+                    .send(PipelineEvent::StepCompleted {
+                        result: result.clone(),
+                    })
+                    .await;
             }
 
             debug!(
@@ -322,13 +328,15 @@ pub async fn execute(
     let success = failed == 0;
 
     if let Some(tx) = &event_tx {
-        let _ = tx.send(PipelineEvent::PipelineFinished {
-            success,
-            total_steps: graph.len(),
-            succeeded,
-            failed,
-            skipped,
-        });
+        let _ = tx
+            .send(PipelineEvent::PipelineFinished {
+                success,
+                total_steps: graph.len(),
+                succeeded,
+                failed,
+                skipped,
+            })
+            .await;
     }
 
     info!(
@@ -703,7 +711,7 @@ mod tests {
         let mut g = PipelineGraph::new();
         g.add_step(Step::shell("a", "Echo", "echo hello")).unwrap();
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(16);
         let _result = execute(&g, ExecutorConfig::default(), Some(tx))
             .await
             .unwrap();

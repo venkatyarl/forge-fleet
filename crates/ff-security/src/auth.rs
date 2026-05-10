@@ -5,7 +5,7 @@ use dashmap::DashMap;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -205,10 +205,14 @@ pub fn extract_api_key_from_headers(headers: &http::HeaderMap) -> Option<String>
 // ---------------------------------------------------------------------------
 
 /// Per-key sliding-window counter for rate limiting.
+///
+/// Uses atomics only — no `std::sync::Mutex` — so the limiter never blocks
+/// an async task.
 #[derive(Debug)]
 struct KeyBucket {
     count: AtomicU32,
-    window_start: std::sync::Mutex<DateTime<Utc>>,
+    /// Unix timestamp (seconds) when the current window started. 0 = unset.
+    window_start_ts: AtomicI64,
 }
 
 /// Simple fixed-window rate limiter keyed by arbitrary string (typically key id).
@@ -230,7 +234,7 @@ impl ApiRateLimiter {
 
     /// Returns `true` if the request is allowed, `false` if rate-limited.
     pub fn check(&self, key_id: &str) -> bool {
-        let now = Utc::now();
+        let now_ts = Utc::now().timestamp();
 
         // Get or create bucket
         let bucket = self
@@ -238,15 +242,15 @@ impl ApiRateLimiter {
             .entry(key_id.to_string())
             .or_insert_with(|| KeyBucket {
                 count: AtomicU32::new(0),
-                window_start: std::sync::Mutex::new(now),
+                window_start_ts: AtomicI64::new(now_ts),
             });
 
-        let mut start = bucket.window_start.lock().unwrap();
-        let elapsed = (now - *start).num_seconds();
+        let start_ts = bucket.window_start_ts.load(Ordering::SeqCst);
+        let elapsed = now_ts - start_ts;
 
         if elapsed >= self.window_secs {
             // Reset window
-            *start = now;
+            bucket.window_start_ts.store(now_ts, Ordering::SeqCst);
             bucket.count.store(1, Ordering::SeqCst);
             return true;
         }

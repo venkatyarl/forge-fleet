@@ -3304,7 +3304,7 @@ async fn run_event_loop(
     let mut agent_handle: Option<
         tokio::task::JoinHandle<(AgentSession, ff_agent::agent_loop::AgentOutcome)>,
     > = None;
-    let mut event_rx: Option<tokio::sync::mpsc::UnboundedReceiver<AgentEvent>> = None;
+    let mut event_rx: Option<tokio::sync::mpsc::Receiver<AgentEvent>> = None;
 
     loop {
         // Process agent events if running
@@ -3340,7 +3340,7 @@ async fn run_event_loop(
                     .session
                     .take()
                     .unwrap_or_else(|| AgentSession::new(config.clone()));
-                let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+                let (tx, rx) = tokio::sync::mpsc::channel::<AgentEvent>(256);
                 let handle = tokio::spawn(async move {
                     let outcome = session.run(&prompt, Some(tx)).await;
                     (session, outcome)
@@ -3651,7 +3651,7 @@ async fn run_event_loop(
                             .session
                             .take()
                             .unwrap_or_else(|| AgentSession::new(config.clone()));
-                        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+                        let (tx, rx) = tokio::sync::mpsc::channel::<AgentEvent>(256);
 
                         let handle = tokio::spawn(async move {
                             let outcome = session.run(&prompt, Some(tx)).await;
@@ -4369,7 +4369,7 @@ async fn run_headless(
         // in run_agent_loop, so clearing here suppresses tool advertisement.
         session.tools.clear();
     }
-    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<AgentEvent>(256);
     let prompt = prompt.to_string();
 
     let handle = tokio::spawn(async move { session.run(&prompt, Some(event_tx)).await });

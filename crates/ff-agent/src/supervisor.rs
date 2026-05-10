@@ -96,7 +96,7 @@ pub async fn supervise(
 
         // Run the agent session
         let mut session = AgentSession::new(agent_config.clone());
-        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<AgentEvent>(256);
 
         let task_owned = task.to_string();
         let handle = tokio::spawn(async move {

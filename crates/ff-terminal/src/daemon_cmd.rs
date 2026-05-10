@@ -912,14 +912,11 @@ async fn defer_pass(
                 // Detect online/offline transitions and publish to Redis so
                 // workers on newly-online nodes can wake up immediately
                 // instead of waiting for the next poll tick.
-                static LAST_ONLINE: std::sync::OnceLock<
-                    std::sync::Mutex<std::collections::HashSet<String>>,
-                > = std::sync::OnceLock::new();
-                let last_online = LAST_ONLINE
-                    .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+                static LAST_ONLINE: std::sync::LazyLock<tokio::sync::Mutex<std::collections::HashSet<String>>> =
+                    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(std::collections::HashSet::new()));
                 let current: std::collections::HashSet<String> = online.iter().cloned().collect();
                 let (newly_online, newly_offline) = {
-                    let mut prev = last_online.lock().unwrap();
+                    let mut prev = LAST_ONLINE.lock().await;
                     let newly_online: Vec<String> = current.difference(&*prev).cloned().collect();
                     let newly_offline: Vec<String> = prev.difference(&current).cloned().collect();
                     *prev = current.clone();

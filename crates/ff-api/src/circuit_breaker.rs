@@ -2,19 +2,32 @@
 //!
 //! Prevents cascading failures by temporarily blocking requests to a node
 //! that has exceeded the failure threshold.
+//!
+//! All mutable state is stored in atomics so the breaker never blocks an
+//! async task (no `std::sync::Mutex` in hot paths).
 
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// Circuit breaker states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CircuitState {
     /// Normal operation — requests are allowed.
-    Closed,
+    Closed = 0,
     /// Failure threshold exceeded — requests are blocked.
-    Open,
+    Open = 1,
     /// Testing whether the node has recovered.
-    HalfOpen,
+    HalfOpen = 2,
+}
+
+impl CircuitState {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => CircuitState::Open,
+            2 => CircuitState::HalfOpen,
+            _ => CircuitState::Closed,
+        }
+    }
 }
 
 /// Configuration for a circuit breaker.
@@ -35,11 +48,13 @@ impl Default for CircuitBreakerConfig {
     }
 }
 
-/// Thread-safe circuit breaker.
+/// Thread-safe circuit breaker backed by atomics (no mutex in hot paths).
 pub struct CircuitBreaker {
-    state: Mutex<CircuitState>,
-    failure_count: Mutex<u32>,
-    last_failure_time: Mutex<Option<Instant>>,
+    state: AtomicU32,
+    failure_count: AtomicU32,
+    /// u64::MAX = None, otherwise millis since `base_instant`.
+    last_failure_time_ms: AtomicU64,
+    base_instant: Instant,
     config: CircuitBreakerConfig,
 }
 
@@ -47,10 +62,25 @@ impl CircuitBreaker {
     /// Create a new circuit breaker with the given configuration.
     pub fn new(config: CircuitBreakerConfig) -> Self {
         Self {
-            state: Mutex::new(CircuitState::Closed),
-            failure_count: Mutex::new(0),
-            last_failure_time: Mutex::new(None),
+            state: AtomicU32::new(CircuitState::Closed as u32),
+            failure_count: AtomicU32::new(0),
+            last_failure_time_ms: AtomicU64::new(u64::MAX),
+            base_instant: Instant::now(),
             config,
+        }
+    }
+
+    fn store_last_failure(&self, instant: Instant) {
+        let ms = instant.duration_since(self.base_instant).as_millis() as u64;
+        self.last_failure_time_ms.store(ms, Ordering::SeqCst);
+    }
+
+    fn load_last_failure(&self) -> Option<Instant> {
+        let ms = self.last_failure_time_ms.load(Ordering::SeqCst);
+        if ms == u64::MAX {
+            None
+        } else {
+            Some(self.base_instant + Duration::from_millis(ms))
         }
     }
 }
@@ -65,48 +95,32 @@ impl CircuitBreaker {
     /// Record a successful request.
     /// Resets failure count and closes the circuit if it was half-open.
     pub fn record_success(&self) {
-        let mut failures = self.failure_count.lock().unwrap();
-        *failures = 0;
-        drop(failures);
-
-        let mut state = self.state.lock().unwrap();
-        *state = CircuitState::Closed;
-        drop(state);
-
-        let mut last = self.last_failure_time.lock().unwrap();
-        *last = None;
+        self.failure_count.store(0, Ordering::SeqCst);
+        self.state.store(CircuitState::Closed as u32, Ordering::SeqCst);
+        self.last_failure_time_ms.store(u64::MAX, Ordering::SeqCst);
     }
 
     /// Record a failed request.
     /// Increments failure count and may open the circuit.
     pub fn record_failure(&self) {
-        let mut failures = self.failure_count.lock().unwrap();
-        *failures += 1;
-        let count = *failures;
-        drop(failures);
-
-        let mut last = self.last_failure_time.lock().unwrap();
-        *last = Some(Instant::now());
-        drop(last);
+        let count = self.failure_count.fetch_add(1, Ordering::SeqCst) + 1;
+        self.store_last_failure(Instant::now());
 
         if count >= self.config.failure_threshold {
-            let mut state = self.state.lock().unwrap();
-            *state = CircuitState::Open;
+            self.state.store(CircuitState::Open as u32, Ordering::SeqCst);
         }
     }
 
     /// Determine whether a request should be allowed.
     pub fn allow_request(&self) -> bool {
-        let state = *self.state.lock().unwrap();
+        let state = CircuitState::from_u8(self.state.load(Ordering::SeqCst) as u8);
         match state {
             CircuitState::Closed => true,
             CircuitState::Open => {
                 // Check if recovery timeout has elapsed
-                let last = *self.last_failure_time.lock().unwrap();
-                if let Some(t) = last {
+                if let Some(t) = self.load_last_failure() {
                     if t.elapsed() >= self.config.recovery_timeout {
-                        let mut state = self.state.lock().unwrap();
-                        *state = CircuitState::HalfOpen;
+                        self.state.store(CircuitState::HalfOpen as u32, Ordering::SeqCst);
                         true
                     } else {
                         false
@@ -121,7 +135,7 @@ impl CircuitBreaker {
 
     /// Get the current state.
     pub fn state(&self) -> CircuitState {
-        *self.state.lock().unwrap()
+        CircuitState::from_u8(self.state.load(Ordering::SeqCst) as u8)
     }
 }
 
@@ -170,7 +184,9 @@ mod tests {
         let cb = CircuitBreaker::new(config);
         cb.record_failure();
         assert_eq!(cb.state(), CircuitState::Open);
-        std::thread::sleep(Duration::from_millis(20));
+        assert!(!cb.allow_request());
+
+        std::thread::sleep(Duration::from_millis(15));
         assert!(cb.allow_request());
         assert_eq!(cb.state(), CircuitState::HalfOpen);
     }

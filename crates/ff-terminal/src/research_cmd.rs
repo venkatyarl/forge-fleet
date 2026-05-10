@@ -42,7 +42,7 @@ pub async fn handle_research(
         .map_err(|e| anyhow::anyhow!("create research_session: {e}"))?;
     eprintln!("\x1b[2m  Session: {}{RESET}", session.id());
 
-    let (prog_tx, mut prog_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (prog_tx, mut prog_rx) = tokio::sync::mpsc::channel(256);
     let verbose_flag = verbose;
     let progress_task = tokio::spawn(async move {
         while let Some(ev) = prog_rx.recv().await {

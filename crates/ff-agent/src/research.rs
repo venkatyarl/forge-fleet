@@ -301,23 +301,27 @@ impl ResearchSession {
 
     pub async fn run(
         &self,
-        progress: Option<mpsc::UnboundedSender<ResearchProgress>>,
+        progress: Option<mpsc::Sender<ResearchProgress>>,
     ) -> Result<ResearchReport> {
         let start = Instant::now();
-        let _ = progress.as_ref().map(|tx| {
-            tx.send(ResearchProgress::Planning {
-                query: self.config.query.clone(),
-            })
-        });
+        if let Some(tx) = &progress {
+            let _ = tx
+                .send(ResearchProgress::Planning {
+                    query: self.config.query.clone(),
+                })
+                .await;
+        }
 
         // Phase 1 — planner decomposes the query.
         let plan = self.plan().await.context("planner phase")?;
         self.store_plan(&plan).await?;
-        let _ = progress.as_ref().map(|tx| {
-            tx.send(ResearchProgress::Dispatching {
-                sub_count: plan.sub_questions.len(),
-            })
-        });
+        if let Some(tx) = &progress {
+            let _ = tx
+                .send(ResearchProgress::Dispatching {
+                    sub_count: plan.sub_questions.len(),
+                })
+                .await;
+        }
 
         // Phase 2 — pick distinct fleet backends, build AgentTasks.
         let backends = self
@@ -382,8 +386,8 @@ impl ResearchSession {
             });
         }
 
-        if let Some(prog_tx) = progress.clone() {
-            let _ = prog_tx.send(ResearchProgress::Synthesizing);
+        if let Some(tx) = &progress {
+            let _ = tx.send(ResearchProgress::Synthesizing).await;
         }
 
         // Phase 4 — persist each sub-agent's output.
@@ -410,9 +414,9 @@ impl ResearchSession {
 
         // Phase 5 — synthesizer merges sub-agent outputs into a report.
         update_session_status(&self.pool, self.session_id, "synthesizing").await?;
-        let _ = progress
-            .as_ref()
-            .map(|tx| tx.send(ResearchProgress::Synthesizing));
+        if let Some(tx) = &progress {
+            let _ = tx.send(ResearchProgress::Synthesizing).await;
+        }
 
         let markdown = self
             .synthesize(&plan, &subtask_rows, &results)

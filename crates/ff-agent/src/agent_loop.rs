@@ -378,7 +378,7 @@ impl AgentSession {
     pub async fn run(
         &mut self,
         prompt: &str,
-        event_tx: Option<mpsc::UnboundedSender<AgentEvent>>,
+        event_tx: Option<mpsc::Sender<AgentEvent>>,
     ) -> AgentOutcome {
         // Re-apply output-style directive to the system prompt on every run,
         // so `/output-style` changes take effect on the NEXT request.
@@ -625,7 +625,7 @@ pub enum AgentOutcome {
 async fn run_agent_loop(
     session: &mut AgentSession,
     http_client: &reqwest::Client,
-    event_tx: Option<mpsc::UnboundedSender<AgentEvent>>,
+    event_tx: Option<mpsc::Sender<AgentEvent>>,
 ) -> AgentOutcome {
     let session_id = session.id.to_string();
     let openai_tools = openai_bridge::tools_to_openai_arc(&session.tools);
@@ -1581,7 +1581,7 @@ async fn execute_single_tool(
     args_str: &str,
     tools_list: &[Arc<dyn AgentTool>],
     ctx: &AgentToolContext,
-    event_tx: &Option<mpsc::UnboundedSender<AgentEvent>>,
+    event_tx: &Option<mpsc::Sender<AgentEvent>>,
     session_id: &str,
 ) -> (String, String, bool, bool) {
     emit(
@@ -1686,9 +1686,9 @@ fn try_fix_json(raw: &str) -> Option<serde_json::Value> {
 // Event emission helper
 // ---------------------------------------------------------------------------
 
-fn emit(tx: &Option<mpsc::UnboundedSender<AgentEvent>>, event: AgentEvent) {
+fn emit(tx: &Option<mpsc::Sender<AgentEvent>>, event: AgentEvent) {
     if let Some(tx) = tx {
-        let _ = tx.send(event);
+        let _ = tx.try_send(event);
     }
 }
 
