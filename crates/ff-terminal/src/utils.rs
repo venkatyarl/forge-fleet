@@ -111,3 +111,35 @@ pub fn expand_tilde(p: &str, home: &str) -> PathBuf {
         PathBuf::from(p)
     }
 }
+
+// ─── Pulse helpers ─────────────────────────────────────────────────────────
+
+pub fn resolve_pulse_redis_url() -> String {
+    if let Ok(url) = std::env::var("FORGEFLEET_REDIS_URL")
+        && !url.trim().is_empty()
+    {
+        return url;
+    }
+    const FALLBACK: &str = "redis://localhost:6380";
+    let Some(home) = dirs::home_dir() else {
+        return FALLBACK.to_string();
+    };
+    let path = home.join(".forgefleet/fleet.toml");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return FALLBACK.to_string();
+    };
+    let Ok(val) = toml::from_str::<toml::Value>(&text) else {
+        return FALLBACK.to_string();
+    };
+    val.get("redis")
+        .and_then(|r| r.get("url"))
+        .and_then(|u| u.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| FALLBACK.to_string())
+}
+
+pub fn pulse_reader() -> anyhow::Result<ff_pulse::reader::PulseReader> {
+    let url = resolve_pulse_redis_url();
+    ff_pulse::reader::PulseReader::new(&url)
+        .map_err(|e| anyhow::anyhow!("pulse: connect {url}: {e}"))
+}
