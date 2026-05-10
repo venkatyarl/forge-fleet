@@ -1,10 +1,7 @@
-//! `ff brain` subcommand implementation.
-
 use anyhow::Result;
-
 use crate::{CYAN, RESET};
 
-pub async fn handle_brain(cmd: ff_terminal::BrainCommand) -> Result<()> {
+pub async fn handle_brain(cmd: crate::BrainCommand) -> Result<()> {
     let pool = ff_agent::fleet_info::get_fleet_pool()
         .await
         .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
@@ -13,7 +10,7 @@ pub async fn handle_brain(cmd: ff_terminal::BrainCommand) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
 
     match cmd {
-        ff_terminal::BrainCommand::Index {
+        crate::BrainCommand::Index {
             vault_path,
             subfolder,
         } => {
@@ -41,7 +38,7 @@ pub async fn handle_brain(cmd: ff_terminal::BrainCommand) -> Result<()> {
             println!("  unchanged skipped: {}", report.unchanged_skipped);
             println!("{CYAN}✓ Done{RESET}");
         }
-        ff_terminal::BrainCommand::Communities => {
+        crate::BrainCommand::Communities => {
             println!("{CYAN}▶ Running community detection...{RESET}");
             let summary = ff_brain::detect_communities(&pool)
                 .await
@@ -49,7 +46,7 @@ pub async fn handle_brain(cmd: ff_terminal::BrainCommand) -> Result<()> {
             println!("  communities: {}", summary.communities_found);
             println!("  largest:     {} nodes", summary.largest_community);
         }
-        ff_terminal::BrainCommand::Stats => {
+        crate::BrainCommand::Stats => {
             let nodes = ff_db::pg_list_brain_vault_nodes_current(&pool, None)
                 .await
                 .map_err(|e| anyhow::anyhow!("list nodes: {e}"))?;

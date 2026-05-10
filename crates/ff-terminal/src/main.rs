@@ -37,13 +37,16 @@ use ff_terminal::render;
 // Wired here as mod decls; Command enum integration lives in the separate
 // V131/V132 PRs so this commit only delivers the handlers.
 mod agent_cmd;
+mod brain_cmd;
 mod cloud_llm_cmd;
 mod ext_cmd;
 mod fabric_cmd;
 mod fleet_cmd;
 mod model_serve_cmd;
+mod openclaw_cmd;
 mod ports_cmd;
 mod self_heal_cmd;
+mod social_cmd;
 mod software_cmd;
 mod storage_cmd;
 mod tasks_cmd;
@@ -1439,7 +1442,7 @@ enum CloudLlmCommand {
 }
 
 #[derive(Debug, Clone, Subcommand)]
-enum SocialCommand {
+pub enum SocialCommand {
     /// Ingest a social-media URL. Inserts a `queued` row in
     /// `social_media_posts`, kicks off the fetch→analyze pipeline in a
     /// detached task, and prints the post UUID.
@@ -1467,7 +1470,7 @@ enum SocialCommand {
 }
 
 #[derive(Debug, Clone, Subcommand)]
-enum BrainCommand {
+pub enum BrainCommand {
     /// Run a full vault index (parse all .md files, upsert nodes + edges).
     Index {
         /// Vault root path (default: ~/projects/Yarli_KnowledgeBase).
@@ -1484,7 +1487,7 @@ enum BrainCommand {
 }
 
 #[derive(Debug, Clone, Subcommand)]
-enum OpenclawCommand {
+pub enum OpenclawCommand {
     /// Show OpenClaw mode across all fleet members (gateway vs node + version).
     Status {
         #[arg(long)]
@@ -1499,7 +1502,7 @@ enum OpenclawCommand {
 }
 
 #[derive(Debug, Clone, Subcommand)]
-enum OpenclawDevicesCommand {
+pub enum OpenclawDevicesCommand {
     /// Export paired devices from the local OpenClaw gateway to stdout.
     /// Equivalent to `openclaw devices export --format json`, but routed
     /// through the ForgeFleet OpenClawManager so we can also stash the
@@ -2165,8 +2168,8 @@ async fn main() -> Result<()> {
         Some(Command::Software { command }) => return handle_software(command.clone()).await,
         Some(Command::Ext { command }) => return handle_ext(command.clone()).await,
         Some(Command::Onboard { command }) => return handle_onboard(command.clone()).await,
-        Some(Command::VirtualBrain { command }) => return handle_brain(command.clone()).await,
-        Some(Command::Openclaw { command }) => return handle_openclaw(command.clone()).await,
+        Some(Command::VirtualBrain { command }) => return brain_cmd::handle_brain(command.clone()).await,
+        Some(Command::Openclaw { command }) => return openclaw_cmd::handle_openclaw(command.clone()).await,
         Some(Command::Pm { command }) => return handle_pm(command.clone()).await,
         Some(Command::Agent { command }) => return handle_agent(command.clone()).await,
         Some(Command::Project { command }) => {
@@ -2187,7 +2190,7 @@ async fn main() -> Result<()> {
         Some(Command::Train { command }) => return handle_train(command.clone()).await,
         Some(Command::Ports { command }) => return handle_ports(command.clone()).await,
         Some(Command::CloudLlm { command }) => return handle_cloud_llm(command.clone()).await,
-        Some(Command::Social { command }) => return handle_social(command.clone()).await,
+        Some(Command::Social { command }) => return social_cmd::handle_social(command.clone()).await,
         _ => {}
     }
 
@@ -2354,8 +2357,8 @@ async fn main() -> Result<()> {
         Some(Command::Software { command }) => handle_software(command).await,
         Some(Command::Ext { command }) => handle_ext(command).await,
         Some(Command::Onboard { command }) => handle_onboard(command).await,
-        Some(Command::VirtualBrain { command }) => handle_brain(command).await,
-        Some(Command::Openclaw { command }) => handle_openclaw(command).await,
+        Some(Command::VirtualBrain { command }) => brain_cmd::handle_brain(command).await,
+        Some(Command::Openclaw { command }) => openclaw_cmd::handle_openclaw(command).await,
         Some(Command::Pm { command }) => handle_pm(command).await,
         Some(Command::Agent { command }) => handle_agent(command).await,
         Some(Command::Project { command }) => handle_project(command).await,
@@ -2960,7 +2963,7 @@ async fn main() -> Result<()> {
         Some(Command::Train { command }) => handle_train(command).await,
         Some(Command::Ports { command }) => handle_ports(command).await,
         Some(Command::CloudLlm { command }) => handle_cloud_llm(command).await,
-        Some(Command::Social { command }) => handle_social(command).await,
+        Some(Command::Social { command }) => social_cmd::handle_social(command).await,
         Some(Command::Supervise {
             prompt,
             max_attempts,
@@ -8247,169 +8250,6 @@ async fn handle_software(cmd: SoftwareCommand) -> Result<()> {
 /// (or any other status that's not `upgrading`) back to either `ok` or
 /// `upgrade_available` — `flip_drift_status` recalculates on the next
 /// auto-upgrade tick so the row gets the right post-clear state.
-// ─── ff social ─────────────────────────────────────────────────────────────
-
-async fn handle_social(cmd: SocialCommand) -> Result<()> {
-    let pool = ff_agent::fleet_info::get_fleet_pool()
-        .await
-        .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
-    ff_db::run_postgres_migrations(&pool)
-        .await
-        .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
-
-    match cmd {
-        SocialCommand::Ingest { url, by } => {
-            let id = ff_agent::social_ingest::ingest(pool.clone(), url, by).await?;
-            println!("{GREEN}✓ ingest queued{RESET}  post_id = {id}");
-            println!("  \x1b[2mUse `ff social show {id}` to check status.{RESET}");
-            Ok(())
-        }
-        SocialCommand::List {
-            status,
-            platform,
-            limit,
-        } => {
-            let mut sql = String::from(
-                "SELECT id, url, platform, status, ingested_by, ingested_at \
-                 FROM social_media_posts WHERE 1=1",
-            );
-            let mut idx = 1;
-            if status.is_some() {
-                sql.push_str(&format!(" AND status = ${idx}"));
-                idx += 1;
-            }
-            if platform.is_some() {
-                sql.push_str(&format!(" AND platform = ${idx}"));
-            }
-            sql.push_str(" ORDER BY ingested_at DESC LIMIT ");
-            sql.push_str(&limit.to_string());
-
-            let mut q = sqlx::query_as::<
-                _,
-                (
-                    uuid::Uuid,
-                    String,
-                    String,
-                    String,
-                    Option<String>,
-                    chrono::DateTime<chrono::Utc>,
-                ),
-            >(&sql);
-            if let Some(s) = &status {
-                q = q.bind(s);
-            }
-            if let Some(p) = &platform {
-                q = q.bind(p);
-            }
-            let rows = q.fetch_all(&pool).await?;
-
-            println!(
-                "{:<38} {:<10} {:<10} {:<16} ingested_at",
-                "id", "platform", "status", "by"
-            );
-            for (id, url, platform, status, by, at) in &rows {
-                let url_short: String = url.chars().take(60).collect();
-                println!(
-                    "{id}  {:<10} {:<10} {:<16} {}",
-                    platform,
-                    status,
-                    by.clone().unwrap_or_default(),
-                    at.format("%Y-%m-%d %H:%M")
-                );
-                println!("  \x1b[2m{url_short}{RESET}");
-            }
-            println!("\n{} row(s).", rows.len());
-            Ok(())
-        }
-        SocialCommand::Show { id } => {
-            let post_id = uuid::Uuid::parse_str(&id)
-                .map_err(|e| anyhow::anyhow!("invalid UUID '{id}': {e}"))?;
-            let row: Option<(
-                uuid::Uuid,
-                String,
-                String,
-                Option<String>,
-                Option<String>,
-                serde_json::Value,
-                Option<String>,
-                Option<serde_json::Value>,
-                String,
-                Option<String>,
-                chrono::DateTime<chrono::Utc>,
-                Option<chrono::DateTime<chrono::Utc>>,
-                Option<String>,
-            )> = sqlx::query_as(
-                "SELECT id, url, platform, author, caption, media_items, \
-                        extracted_text, analysis, status, ingested_by, \
-                        ingested_at, analyzed_at, last_error \
-                 FROM social_media_posts WHERE id = $1",
-            )
-            .bind(post_id)
-            .fetch_optional(&pool)
-            .await?;
-            let Some((
-                id,
-                url,
-                platform,
-                author,
-                caption,
-                media_items,
-                extracted_text,
-                analysis,
-                status,
-                ingested_by,
-                ingested_at,
-                analyzed_at,
-                last_error,
-            )) = row
-            else {
-                println!("{RED}✗ no social_media_posts row with id = {id}{RESET}");
-                return Ok(());
-            };
-
-            println!("{CYAN}post{RESET}    {id}");
-            println!("url      {url}");
-            println!("platform {platform}");
-            println!("status   {status}");
-            println!("by       {}", ingested_by.unwrap_or_default());
-            println!("ingested {}", ingested_at.format("%Y-%m-%d %H:%M:%S"));
-            if let Some(a) = analyzed_at {
-                println!("analyzed {}", a.format("%Y-%m-%d %H:%M:%S"));
-            }
-            if let Some(a) = author {
-                println!("author   {a}");
-            }
-            if let Some(c) = caption {
-                let trunc = if c.chars().count() > 400 {
-                    format!("{}…", c.chars().take(400).collect::<String>())
-                } else {
-                    c
-                };
-                println!("caption  {trunc}");
-            }
-            let media_arr = media_items.as_array().cloned().unwrap_or_default();
-            println!("media    {} item(s)", media_arr.len());
-            for m in &media_arr {
-                let kind = m.get("kind").and_then(|v| v.as_str()).unwrap_or("?");
-                let path = m.get("local_path").and_then(|v| v.as_str()).unwrap_or("?");
-                println!("  • [{kind}] {path}");
-            }
-            if let Some(t) = extracted_text
-                && !t.trim().is_empty()
-            {
-                println!("\n{CYAN}extracted_text{RESET}\n{t}");
-            }
-            if let Some(a) = analysis {
-                let pretty = serde_json::to_string_pretty(&a).unwrap_or_default();
-                println!("\n{CYAN}analysis{RESET}\n{pretty}");
-            }
-            if let Some(e) = last_error {
-                println!("\n{RED}last_error{RESET} {e}");
-            }
-            Ok(())
-        }
-    }
-}
 
 // ─── ff ext ────────────────────────────────────────────────────────────────
 //
@@ -8526,254 +8366,8 @@ echo "migrate-github complete on $(hostname): remote=https://github.com/{new_own
     )
 }
 
-async fn handle_brain(cmd: BrainCommand) -> Result<()> {
-    let pool = ff_agent::fleet_info::get_fleet_pool()
-        .await
-        .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
-    ff_db::run_postgres_migrations(&pool)
-        .await
-        .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
 
-    match cmd {
-        BrainCommand::Index {
-            vault_path,
-            subfolder,
-        } => {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/venkat".into());
-            let vault =
-                vault_path.unwrap_or_else(|| format!("{home}/projects/Yarli_KnowledgeBase"));
-            let sub = subfolder.unwrap_or_default();
-            let config = ff_brain::VaultConfig {
-                vault_path: std::path::PathBuf::from(&vault),
-                brain_subfolder: sub.clone(),
-            };
-            let root = if sub.is_empty() {
-                vault.clone()
-            } else {
-                format!("{vault}/{sub}")
-            };
-            println!("{CYAN}▶ Indexing vault: {root}{RESET}");
-            let report = ff_brain::index_vault(&pool, &config)
-                .await
-                .map_err(|e| anyhow::anyhow!(e))?;
-            println!("  files scanned:    {}", report.files_scanned);
-            println!("  nodes upserted:   {}", report.nodes_upserted);
-            println!("  edges created:    {}", report.edges_created);
-            println!("  chunks written:   {}", report.chunks_written);
-            println!("  unchanged skipped: {}", report.unchanged_skipped);
-            println!("{CYAN}✓ Done{RESET}");
-        }
-        BrainCommand::Communities => {
-            println!("{CYAN}▶ Running community detection...{RESET}");
-            let summary = ff_brain::detect_communities(&pool)
-                .await
-                .map_err(|e| anyhow::anyhow!(e))?;
-            println!("  communities: {}", summary.communities_found);
-            println!("  largest:     {} nodes", summary.largest_community);
-        }
-        BrainCommand::Stats => {
-            let nodes = ff_db::pg_list_brain_vault_nodes_current(&pool, None)
-                .await
-                .map_err(|e| anyhow::anyhow!("list nodes: {e}"))?;
-            let total_edges: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM brain_vault_edges")
-                .fetch_one(&pool)
-                .await
-                .unwrap_or(0);
-            let communities: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM brain_communities")
-                .fetch_one(&pool)
-                .await
-                .unwrap_or(0);
-            println!("Vault graph stats:");
-            println!("  nodes (current): {}", nodes.len());
-            println!("  edges:           {total_edges}");
-            println!("  communities:     {communities}");
-        }
-    }
-    Ok(())
-}
 
-async fn handle_openclaw(cmd: OpenclawCommand) -> Result<()> {
-    let pool = ff_agent::fleet_info::get_fleet_pool()
-        .await
-        .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
-    ff_db::run_postgres_migrations(&pool)
-        .await
-        .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
-
-    match cmd {
-        OpenclawCommand::Status { json } => {
-            // Join computers → openclaw_installations → computer_software
-            // (software_id = 'openclaw'). LEFT JOINs so every computer shows
-            // up even if OpenClaw hasn't been installed/configured yet.
-            let rows: Vec<(
-                String,                                // name
-                String,                                // primary_ip
-                Option<String>,                        // mode
-                Option<String>,                        // gateway_url
-                Option<chrono::DateTime<chrono::Utc>>, // last_reconfigured_at
-                Option<String>,                        // installed_version
-            )> = sqlx::query_as(
-                "SELECT c.name, \
-                        c.primary_ip, \
-                        oi.mode, \
-                        oi.gateway_url, \
-                        oi.last_reconfigured_at, \
-                        cs.installed_version AS openclaw_version \
-                 FROM computers c \
-                 LEFT JOIN openclaw_installations oi ON oi.computer_id = c.id \
-                 LEFT JOIN computer_software cs \
-                        ON cs.computer_id = c.id AND cs.software_id = 'openclaw' \
-                 ORDER BY c.name",
-            )
-            .fetch_all(&pool)
-            .await
-            .map_err(|e| anyhow::anyhow!("query openclaw status: {e}"))?;
-
-            if json {
-                let items: Vec<serde_json::Value> = rows
-                    .into_iter()
-                    .map(|(name, ip, mode, url, reconfigured, version)| {
-                        serde_json::json!({
-                            "name": name,
-                            "primary_ip": ip,
-                            "mode": mode,
-                            "gateway_url": url,
-                            "last_reconfigured_at": reconfigured.map(|t| t.to_rfc3339()),
-                            "openclaw_version": version,
-                        })
-                    })
-                    .collect();
-                println!("{}", serde_json::to_string_pretty(&items)?);
-                return Ok(());
-            }
-
-            if rows.is_empty() {
-                println!("(no computers registered)");
-                return Ok(());
-            }
-
-            println!(
-                "{:<14} {:<16} {:<8} {:<34} {:<22} OPENCLAW",
-                "NAME", "IP", "MODE", "GATEWAY URL", "LAST RECONFIG"
-            );
-            for (name, ip, mode, url, reconfigured, version) in rows {
-                let mode_s = mode.as_deref().unwrap_or("-");
-                let url_s = url.as_deref().unwrap_or("-");
-                let ts_s = reconfigured
-                    .map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string())
-                    .unwrap_or_else(|| "-".into());
-                let ver_s = version.as_deref().unwrap_or("-");
-                let mode_colored = match mode_s {
-                    "gateway" => format!("{GREEN}{mode_s}{RESET}"),
-                    "node" => format!("{CYAN}{mode_s}{RESET}"),
-                    _ => mode_s.to_string(),
-                };
-                // Account for color escape width when padding.
-                let mode_pad = if matches!(mode_s, "gateway" | "node") {
-                    format!("{:<8}", mode_colored)
-                } else {
-                    format!("{:<8}", mode_s)
-                };
-                println!(
-                    "{:<14} {:<16} {} {:<34} {:<22} {}",
-                    name, ip, mode_pad, url_s, ts_s, ver_s
-                );
-            }
-        }
-        OpenclawCommand::Devices { command } => {
-            handle_openclaw_devices(&pool, command).await?;
-        }
-    }
-    Ok(())
-}
-
-async fn handle_openclaw_devices(pool: &sqlx::PgPool, cmd: OpenclawDevicesCommand) -> Result<()> {
-    // Need a local OpenClawManager — the my_computer_id / my_primary_ip
-    // arguments aren't consulted by export_devices/import_devices (those
-    // just shell out to the local `openclaw` CLI), so we pass placeholders.
-    let local_name = ff_agent::fleet_info::resolve_this_node_name().await;
-    let (computer_id, primary_ip) = sqlx::query_as::<_, (uuid::Uuid, String)>(
-        "SELECT id, primary_ip FROM computers WHERE LOWER(name) = LOWER($1)",
-    )
-    .bind(&local_name)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| anyhow::anyhow!("query computers: {e}"))?
-    .unwrap_or((uuid::Uuid::nil(), "127.0.0.1".to_string()));
-
-    let mgr = ff_agent::openclaw::OpenClawManager::new(pool.clone(), computer_id, primary_ip);
-
-    match cmd {
-        OpenclawDevicesCommand::Export { stash } => {
-            let export = mgr
-                .export_devices()
-                .await
-                .map_err(|e| anyhow::anyhow!("export_devices: {e}"))?;
-
-            if stash {
-                sqlx::query(
-                    "INSERT INTO fleet_secrets (key, value, updated_by, updated_at) \
-                     VALUES ($1, $2, 'ff openclaw devices export', NOW()) \
-                     ON CONFLICT (key) DO UPDATE \
-                     SET value = $2, updated_at = NOW()",
-                )
-                .bind(ff_agent::openclaw::DEVICE_PAIRINGS_SECRET_KEY)
-                .bind(&export)
-                .execute(pool)
-                .await
-                .map_err(|e| anyhow::anyhow!("stash secret: {e}"))?;
-                eprintln!(
-                    "{GREEN}✓{RESET} stashed {} bytes into fleet_secrets.{}",
-                    export.len(),
-                    ff_agent::openclaw::DEVICE_PAIRINGS_SECRET_KEY,
-                );
-            }
-            // Emit the JSON to stdout so a caller can pipe it.
-            print!("{export}");
-            if !export.ends_with('\n') {
-                println!();
-            }
-        }
-        OpenclawDevicesCommand::Import { from_secret } => {
-            let json = if from_secret {
-                match ff_agent::openclaw::lookup_device_pairings_export(pool)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("lookup stash: {e}"))?
-                {
-                    Some(v) => v,
-                    None => {
-                        eprintln!(
-                            "{YELLOW}no stashed export found in fleet_secrets.{}{RESET}",
-                            ff_agent::openclaw::DEVICE_PAIRINGS_SECRET_KEY
-                        );
-                        return Ok(());
-                    }
-                }
-            } else {
-                use std::io::Read;
-                let mut buf = String::new();
-                std::io::stdin()
-                    .read_to_string(&mut buf)
-                    .map_err(|e| anyhow::anyhow!("read stdin: {e}"))?;
-                buf
-            };
-
-            let n = mgr
-                .import_devices(&json)
-                .await
-                .map_err(|e| anyhow::anyhow!("import_devices: {e}"))?;
-
-            println!("{GREEN}✓{RESET} imported {n} device(s)");
-
-            if from_secret
-                && let Err(e) = ff_agent::openclaw::clear_device_pairings_export(pool).await
-            {
-                eprintln!("{YELLOW}warning:{RESET} failed to clear stashed secret: {e}");
-            }
-        }
-    }
-    Ok(())
-}
 
 async fn handle_agent(cmd: AgentCommand) -> Result<()> {
     let pool = ff_agent::fleet_info::get_fleet_pool()
