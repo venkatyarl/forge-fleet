@@ -131,7 +131,7 @@ pub async fn handle_fabric_benchmark(
         &b_target,
         "pkill iperf3 2>/dev/null; iperf3 -s -D --logfile /tmp/iperf3.log",
     );
-    std::thread::sleep(std::time::Duration::from_millis(800));
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
 
     let mut measurements: Vec<(String, f64, Option<i32>)> = Vec::new();
 

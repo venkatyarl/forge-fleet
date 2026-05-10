@@ -226,7 +226,7 @@ impl InferenceEngine for MlxEngine {
                             let _ = child.wait();
                             break;
                         }
-                        std::thread::sleep(Duration::from_millis(200));
+                        tokio::time::sleep(Duration::from_millis(200)).await;
                     }
                     Err(e) => {
                         error!(pid, err = %e, "error waiting for MLX server to stop");

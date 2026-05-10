@@ -189,7 +189,7 @@ impl LeaderSync {
             if let Some(old) = cached.as_ref()
                 && old.path != snapshot_path
             {
-                let _ = std::fs::remove_file(&old.path);
+                let _ = tokio::fs::remove_file(&old.path).await;
             }
             *cached = Some(CachedSnapshot {
                 meta: meta.clone(),
@@ -464,7 +464,7 @@ impl FollowerSync {
             .await?;
 
         // Clean up downloaded snapshot.
-        let _ = std::fs::remove_file(&snapshot_path);
+        let _ = tokio::fs::remove_file(&snapshot_path).await;
 
         info!(
             sequence = meta.sequence,

@@ -5426,19 +5426,23 @@ async fn route_fleet_capability(
 
     // ── 3. Score candidates ──
     //   Priority: exact local match > lower tier > lower queue depth > higher tps
-    let local_hostname = std::env::var("FF_NODE")
-        .ok()
-        .or_else(|| std::env::var("HOSTNAME").ok())
-        .or_else(|| {
-            std::process::Command::new("hostname")
-                .arg("-s")
-                .output()
-                .ok()
-                .and_then(|o| String::from_utf8(o.stdout).ok())
-        })
-        .unwrap_or_default()
-        .trim()
-        .to_lowercase();
+    let local_hostname = tokio::task::spawn_blocking(|| {
+        std::env::var("FF_NODE")
+            .ok()
+            .or_else(|| std::env::var("HOSTNAME").ok())
+            .or_else(|| {
+                std::process::Command::new("hostname")
+                    .arg("-s")
+                    .output()
+                    .ok()
+                    .and_then(|o| String::from_utf8(o.stdout).ok())
+            })
+            .unwrap_or_default()
+            .trim()
+            .to_lowercase()
+    })
+    .await
+    .unwrap_or_default();
 
     #[allow(clippy::type_complexity)]
     let mut scored: Vec<(

@@ -1638,13 +1638,15 @@ pub fn spawn_watcher(
     tx: watch::Sender<Arc<FleetConfig>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut last_modified = std::fs::metadata(&handle.path)
+        let mut last_modified = tokio::fs::metadata(&handle.path)
+            .await
             .and_then(|m| m.modified())
             .ok();
 
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            let current = std::fs::metadata(&handle.path)
+            let current = tokio::fs::metadata(&handle.path)
+                .await
                 .and_then(|m| m.modified())
                 .ok();
 

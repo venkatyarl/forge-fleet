@@ -629,7 +629,7 @@ async fn dispatch_alert(pg: &PgPool, channel: &str, severity: &str, message: &st
             if channel == "telegram" {
                 return "failed: no bot token configured".into();
             }
-            let output = std::process::Command::new("openclaw")
+            let output = tokio::process::Command::new("openclaw")
                 .args([
                     "agent",
                     "--channel",
@@ -638,7 +638,8 @@ async fn dispatch_alert(pg: &PgPool, channel: &str, severity: &str, message: &st
                     &chat_id,
                     &format!("ALERT: {message}"),
                 ])
-                .output();
+                .output()
+                .await;
             match output {
                 Ok(out) if out.status.success() => "sent".into(),
                 Ok(out) => format!(

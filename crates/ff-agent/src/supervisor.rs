@@ -142,15 +142,13 @@ pub async fn supervise(
                 // Verify declared deliverables exist before accepting success.
                 // Closes the feedback_ff_supervise_verify_deliverable.md gap
                 // where agents emitted "DONE" without writing the named files.
-                let missing: Vec<_> = sup_config
-                    .verify_files
-                    .iter()
-                    .filter(|p| {
-                        std::fs::metadata(p)
-                            .map(|m| !m.is_file() || m.len() == 0)
-                            .unwrap_or(true)
-                    })
-                    .collect();
+                let mut missing = Vec::new();
+                for p in &sup_config.verify_files {
+                    match tokio::fs::metadata(p).await {
+                        Ok(m) if m.is_file() && m.len() > 0 => {}
+                        _ => missing.push(p),
+                    }
+                }
                 if !missing.is_empty() {
                     let evidence = format!(
                         "agent declared done but {} deliverable(s) missing or empty: {}",
@@ -193,7 +191,7 @@ pub async fn supervise(
                 if !sup_config.verify_no_placeholder.is_empty() {
                     let mut hits: Vec<(String, String, usize)> = Vec::new();
                     for path in &sup_config.verify_files {
-                        let content = match std::fs::read_to_string(path) {
+                        let content = match tokio::fs::read_to_string(path).await {
                             Ok(c) => c,
                             Err(_) => continue,
                         };

@@ -2990,13 +2990,13 @@ async fn main() -> Result<()> {
                             continue;
                         }
                     };
-                    let missing: Vec<_> = verify_files
-                        .iter()
-                        .filter(|p| match std::fs::metadata(p) {
-                            Ok(m) => !m.is_file() || m.len() == 0,
-                            Err(_) => true,
-                        })
-                        .collect();
+                    let mut missing = Vec::new();
+                    for p in &verify_files {
+                        match tokio::fs::metadata(p).await {
+                            Ok(m) if m.is_file() && m.len() > 0 => {}
+                            _ => missing.push(p),
+                        }
+                    }
                     if r.exit_code == 0 && missing.is_empty() {
                         eprintln!(
                             "{GREEN}✓ Task completed on attempt {attempt}/{max_attempts}{RESET}"
@@ -3915,8 +3915,9 @@ async fn load_picker_items() -> Result<Vec<ff_terminal::app::ModelPickerItem>, S
     // Connect to Postgres using ~/.forgefleet/fleet.toml (same pattern as fleet_nodes_from_db).
     let home = dirs::home_dir().ok_or_else(|| "no home dir".to_string())?;
     let config_path = home.join(".forgefleet/fleet.toml");
-    let toml_str =
-        std::fs::read_to_string(&config_path).map_err(|e| format!("read fleet.toml: {e}"))?;
+    let toml_str = tokio::fs::read_to_string(&config_path)
+        .await
+        .map_err(|e| format!("read fleet.toml: {e}"))?;
     let config: ff_core::config::FleetConfig =
         toml::from_str(&toml_str).map_err(|e| format!("parse fleet.toml: {e}"))?;
     let db_url = config.database.url.trim().to_string();
@@ -4547,7 +4548,7 @@ fn detect_dropped_content(input: &str) -> String {
 /// then probing each for a healthy connection. Falls back to localhost:55000.
 async fn detect_llm_from_db_or_local(config_path: &std::path::Path) -> String {
     // Try to load fleet.toml to get the database URL
-    if let Ok(toml_str) = std::fs::read_to_string(config_path)
+    if let Ok(toml_str) = tokio::fs::read_to_string(config_path).await
         && let Ok(config) = toml::from_str::<ff_core::config::FleetConfig>(&toml_str)
     {
         let db_url = config.database.url.trim();
@@ -5446,16 +5447,22 @@ fn shell_escape_single(s: &str) -> String {
 }
 
 /// Best-effort tag for `updated_by`: `user@host`.
+static WHOAMI_TAG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 fn whoami_tag() -> String {
-    let user = std::env::var("USER").unwrap_or_else(|_| "unknown".into());
-    let host = std::process::Command::new("hostname")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "unknown".into());
-    format!("{user}@{host}")
+    WHOAMI_TAG
+        .get_or_init(|| {
+            let user = std::env::var("USER").unwrap_or_else(|_| "unknown".into());
+            let host = std::process::Command::new("hostname")
+                .output()
+                .ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "unknown".into());
+            format!("{user}@{host}")
+        })
+        .clone()
 }
 
 async fn handle_defer(cmd: DeferCommand) -> Result<()> {
@@ -6139,9 +6146,9 @@ async fn handle_model(cmd: ModelCommand) -> Result<()> {
 
             let path = std::path::Path::new(&row.file_path);
             let result = if path.is_dir() {
-                std::fs::remove_dir_all(path)
+                tokio::fs::remove_dir_all(path).await
             } else {
-                std::fs::remove_file(path)
+                tokio::fs::remove_file(path).await
             };
             match result {
                 Ok(()) => {
@@ -7620,8 +7627,9 @@ async fn execute_shell(
     use tokio::process::Command as TokCmd;
     use tokio::time::timeout;
 
-    let this_hostname = std::process::Command::new("hostname")
+    let this_hostname = tokio::process::Command::new("hostname")
         .output()
+        .await
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_lowercase())
@@ -11683,8 +11691,9 @@ async fn handle_ports_scan(pool: &sqlx::PgPool, computer: &str) -> Result<()> {
 
     println!("{CYAN}▶ Scanning {computer} for listening ports{RESET}");
 
-    let this_hostname = std::process::Command::new("hostname")
+    let this_hostname = tokio::process::Command::new("hostname")
         .output()
+        .await
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_lowercase())
@@ -13338,13 +13347,13 @@ async fn handle_pm_import_claude_tasks(
         let home = std::env::var("HOME").unwrap_or_default();
         let project_dir = PathBuf::from(format!("{home}/.claude/projects/{slug}"));
         let mut newest: Option<(PathBuf, std::time::SystemTime)> = None;
-        if let Ok(entries) = std::fs::read_dir(&project_dir) {
-            for e in entries.flatten() {
+        if let Ok(mut entries) = tokio::fs::read_dir(&project_dir).await {
+            while let Some(e) = entries.next_entry().await.unwrap_or(None) {
                 let path = e.path();
                 if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
                     continue;
                 }
-                if let Ok(md) = e.metadata()
+                if let Ok(md) = e.metadata().await
                     && let Ok(mtime) = md.modified()
                     && newest.as_ref().map(|(_, t)| mtime > *t).unwrap_or(true)
                 {
@@ -13365,7 +13374,8 @@ async fn handle_pm_import_claude_tasks(
     // Stream the JSONL, tracking the LAST task-list snapshot. Each line
     // we care about has content like `#<N> [<status>] <subject>` — we
     // find them inside tool_result `content` strings.
-    let content = std::fs::read_to_string(&resolved)
+    let content = tokio::fs::read_to_string(&resolved)
+        .await
         .map_err(|e| anyhow::anyhow!("read {}: {e}", resolved.display()))?;
     let task_line_re =
         regex::Regex::new(r"#(\d+)\s*(?:\.\s*)?\[(pending|in_progress|completed|deleted)\]\s+(.+)")

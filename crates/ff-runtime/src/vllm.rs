@@ -287,7 +287,7 @@ impl InferenceEngine for VllmEngine {
                             let _ = child.wait();
                             break;
                         }
-                        std::thread::sleep(Duration::from_millis(500));
+                        tokio::time::sleep(Duration::from_millis(500)).await;
                     }
                     Err(e) => {
                         error!(pid, err = %e, "error waiting for vLLM to stop");

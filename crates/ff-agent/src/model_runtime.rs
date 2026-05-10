@@ -192,9 +192,10 @@ pub async fn unload_model(pool: &sqlx::PgPool, deployment_id: &str) -> Result<()
     let pid = pid_i32 as u32;
 
     // SIGTERM
-    let _ = std::process::Command::new("kill")
+    let _ = tokio::process::Command::new("kill")
         .args(["-TERM", &pid.to_string()])
-        .output();
+        .output()
+        .await;
 
     // Wait up to 10s for process to exit.
     for _ in 0..20 {
@@ -205,9 +206,10 @@ pub async fn unload_model(pool: &sqlx::PgPool, deployment_id: &str) -> Result<()
     }
     if pid_is_alive(pid) {
         tracing::warn!(pid, "SIGTERM didn't stop process; escalating to SIGKILL");
-        let _ = std::process::Command::new("kill")
+        let _ = tokio::process::Command::new("kill")
             .args(["-KILL", &pid.to_string()])
-            .output();
+            .output()
+            .await;
     }
 
     ff_db::pg_delete_deployment(pool, deployment_id)
@@ -218,9 +220,10 @@ pub async fn unload_model(pool: &sqlx::PgPool, deployment_id: &str) -> Result<()
 
 /// Scan local processes for running inference servers (llama.cpp/MLX/vLLM).
 pub async fn list_local_processes() -> Vec<RunningProcess> {
-    let output = std::process::Command::new("ps")
+    let output = tokio::process::Command::new("ps")
         .args(["-axo", "pid=,command="])
-        .output();
+        .output()
+        .await;
     let Ok(output) = output else {
         return Vec::new();
     };
