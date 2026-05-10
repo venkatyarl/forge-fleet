@@ -2270,7 +2270,8 @@ pub async fn pg_latest_disk_usage(
         "SELECT DISTINCT ON (node_name)
                 node_name, models_dir, total_bytes, used_bytes, free_bytes, models_bytes, sampled_at
            FROM fleet_disk_usage
-          ORDER BY node_name, sampled_at DESC",
+          ORDER BY node_name, sampled_at DESC
+          LIMIT 100",
     )
     .fetch_all(pool)
     .await?;
@@ -3812,7 +3813,7 @@ pub async fn pg_get_task_lineage(pool: &PgPool, task_id: &str) -> Result<serde_j
     // Routing hops
     let hops = sqlx::query(
         "SELECT task_id, from_node, to_node, reason, routed_at::text FROM task_routing_log
-         WHERE task_id = $1 ORDER BY id",
+         WHERE task_id = $1 ORDER BY id LIMIT 100",
     )
     .bind(task_id)
     .fetch_all(pool)
@@ -3834,7 +3835,7 @@ pub async fn pg_get_task_lineage(pool: &PgPool, task_id: &str) -> Result<serde_j
     // Ownership events
     let events = sqlx::query(
         "SELECT event_type, from_owner, to_owner, reason, created_at FROM ownership_events
-         WHERE task_id = $1 ORDER BY id",
+         WHERE task_id = $1 ORDER BY id LIMIT 100",
     )
     .bind(task_id)
     .fetch_all(pool)

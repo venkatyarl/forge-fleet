@@ -7604,13 +7604,22 @@ fn wrap_for_detachment(user_cmd: &str, is_linux_target: bool) -> String {
 }
 
 /// Run a shell command either locally (when target is this host or None) or via SSH.
+/// Max time a shell payload may run before it is killed.
+const SHELL_TIMEOUT: Duration = Duration::from_secs(1800); // 30 min
+/// Max bytes to capture per stream (stdout / stderr). Anything beyond this
+/// is dropped and the pipe is closed so the child gets SIGPIPE.
+const MAX_SHELL_OUTPUT_BYTES: usize = 10 * 1024 * 1024; // 10 MB
+
 async fn execute_shell(
     target_node: Option<&str>,
     command: &str,
     nodes: &[ff_db::FleetNodeRow],
     workspace: Option<&std::path::Path>,
 ) -> (bool, Option<serde_json::Value>, Option<String>) {
+    use tokio::io::AsyncReadExt;
     use tokio::process::Command as TokCmd;
+    use tokio::time::timeout;
+
     let this_hostname = std::process::Command::new("hostname")
         .output()
         .ok()
@@ -7666,33 +7675,114 @@ async fn execute_shell(
 
     let mut cmd = TokCmd::new(program);
     cmd.args(&args);
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
     if local && let Some(ws) = workspace {
         cmd.current_dir(ws);
     }
-    let output = cmd.output().await;
-    match output {
-        Ok(o) => {
-            let stdout = String::from_utf8_lossy(&o.stdout).to_string();
-            let stderr = String::from_utf8_lossy(&o.stderr).to_string();
-            let result = serde_json::json!({
-                "exit_code": o.status.code(),
-                "stdout": stdout,
-                "stderr": stderr,
-            });
-            if o.status.success() {
-                (true, Some(result), None)
-            } else {
-                let err = format!(
-                    "exit {}: {}",
-                    o.status.code().unwrap_or(-1),
-                    stderr.trim().lines().last().unwrap_or("")
-                );
-                (false, Some(result), Some(err))
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return (false, None, Some(format!("spawn {program} failed: {e}"))),
+    };
+
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+
+    let stdout_fut = async move {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = stdout_pipe {
+            let mut chunk = [0u8; 8192];
+            while buf.len() < MAX_SHELL_OUTPUT_BYTES {
+                match pipe.read(&mut chunk).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let to_add = n.min(MAX_SHELL_OUTPUT_BYTES - buf.len());
+                        buf.extend_from_slice(&chunk[..to_add]);
+                    }
+                    Err(_) => break,
+                }
+            }
+            // Pipe dropped here → child gets SIGPIPE on further writes.
+        }
+        buf
+    };
+
+    let stderr_fut = async move {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = stderr_pipe {
+            let mut chunk = [0u8; 8192];
+            while buf.len() < MAX_SHELL_OUTPUT_BYTES {
+                match pipe.read(&mut chunk).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let to_add = n.min(MAX_SHELL_OUTPUT_BYTES - buf.len());
+                        buf.extend_from_slice(&chunk[..to_add]);
+                    }
+                    Err(_) => break,
+                }
             }
         }
-        Err(e) => (false, None, Some(format!("spawn {program} failed: {e}"))),
+        buf
+    };
+
+    let (stdout, stderr, status) = match timeout(SHELL_TIMEOUT, async {
+        let (stdout, stderr) = tokio::join!(stdout_fut, stderr_fut);
+        let status = child.wait().await.map_err(|e| e.to_string())?;
+        Ok::<_, String>((stdout, stderr, status))
+    })
+    .await
+    {
+        Ok(Ok(triple)) => triple,
+        Ok(Err(e)) => return (false, None, Some(format!("shell execution failed: {e}"))),
+        Err(_) => {
+            let _ = child.start_kill();
+            return (
+                false,
+                None,
+                Some(format!(
+                    "shell command timed out after {}s",
+                    SHELL_TIMEOUT.as_secs()
+                )),
+            );
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&stdout).to_string();
+    let stderr = String::from_utf8_lossy(&stderr).to_string();
+    let result = serde_json::json!({
+        "exit_code": status.code(),
+        "stdout": stdout,
+        "stderr": stderr,
+    });
+    if status.success() {
+        (true, Some(result), None)
+    } else {
+        let err = format!(
+            "exit {}: {}",
+            status.code().unwrap_or(-1),
+            stderr.trim().lines().last().unwrap_or("")
+        );
+        (false, Some(result), Some(err))
     }
 }
+
+/// Shared reqwest client for HTTP deferred tasks (avoids creating a new
+/// connection pool on every call).
+static HTTP_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+
+fn http_client() -> &'static reqwest::Client {
+    HTTP_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .expect("reqwest client build must succeed")
+    })
+}
+
+/// Max HTTP response body we will load into memory (prevents unbounded
+/// buffering if a server returns a massive payload).
+const MAX_HTTP_RESPONSE_BYTES: usize = 10 * 1024 * 1024; // 10 MB
 
 /// Execute an HTTP request task.
 async fn execute_http(
@@ -7700,13 +7790,6 @@ async fn execute_http(
     url: &str,
     body: Option<serde_json::Value>,
 ) -> (bool, Option<serde_json::Value>, Option<String>) {
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => return (false, None, Some(format!("http client: {e}"))),
-    };
     let method_obj = match method.to_uppercase().as_str() {
         "GET" => reqwest::Method::GET,
         "POST" => reqwest::Method::POST,
@@ -7715,14 +7798,42 @@ async fn execute_http(
         "PATCH" => reqwest::Method::PATCH,
         other => return (false, None, Some(format!("bad http method: {other}"))),
     };
-    let mut req = client.request(method_obj, url);
+    let mut req = http_client().request(method_obj, url);
     if let Some(b) = body {
         req = req.json(&b);
     }
     match req.send().await {
         Ok(resp) => {
             let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
+            // Reject early if the server advertises a body larger than our cap.
+            if resp
+                .content_length()
+                .map_or(false, |len| len > MAX_HTTP_RESPONSE_BYTES as u64)
+            {
+                return (
+                    false,
+                    None,
+                    Some(format!(
+                        "HTTP response body exceeds {}MB (Content-Length)",
+                        MAX_HTTP_RESPONSE_BYTES / 1_048_576
+                    )),
+                );
+            }
+            let bytes = match resp.bytes().await {
+                Ok(b) => b,
+                Err(e) => return (false, None, Some(format!("http body read: {e}"))),
+            };
+            if bytes.len() > MAX_HTTP_RESPONSE_BYTES {
+                return (
+                    false,
+                    None,
+                    Some(format!(
+                        "HTTP response body exceeds {}MB",
+                        MAX_HTTP_RESPONSE_BYTES / 1_048_576
+                    )),
+                );
+            }
+            let text = String::from_utf8_lossy(&bytes).to_string();
             let result = serde_json::json!({"status": status.as_u16(), "body": text});
             if status.is_success() {
                 (true, Some(result), None)
