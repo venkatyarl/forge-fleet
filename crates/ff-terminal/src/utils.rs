@@ -1,5 +1,6 @@
 //! Shared CLI utilities — formatting helpers, color constants, etc.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 // ─── Color constants ───────────────────────────────────────────────────────
@@ -147,6 +148,27 @@ pub fn pulse_reader() -> anyhow::Result<ff_pulse::reader::PulseReader> {
 /// Alias for `truncate_for_col` — same semantics, different name used in legacy code.
 pub fn truncate_str(s: &str, max: usize) -> String {
     truncate_for_col(s, max)
+}
+
+/// Simple TOML-backed config used by `ff config` CLI.
+#[derive(Debug, Default, serde::Deserialize, serde::Serialize)]
+pub struct FleetConfig {
+    #[serde(default)]
+    pub general: BTreeMap<String, toml::Value>,
+    #[serde(default)]
+    pub nodes: BTreeMap<String, toml::Value>,
+    #[serde(default)]
+    pub models: BTreeMap<String, toml::Value>,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, toml::Value>,
+}
+
+/// Load fleet config from path, returning default if file doesn't exist.
+pub fn load_config(p: &std::path::Path) -> anyhow::Result<FleetConfig> {
+    if !p.exists() {
+        return Ok(FleetConfig::default());
+    }
+    Ok(toml::from_str(&std::fs::read_to_string(p)?)?)
 }
 
 /// Parse a duration like "5m", "1h", "24h", "30s" into seconds.
