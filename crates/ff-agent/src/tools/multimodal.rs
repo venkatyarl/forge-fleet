@@ -316,7 +316,21 @@ impl AgentTool for AudioAnalysisTool {
     }
 }
 
-pub struct SelfHealTool;
+pub struct SelfHealTool {
+    client: reqwest::Client,
+}
+
+impl Default for SelfHealTool {
+    fn default() -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(3))
+                .build()
+                .unwrap_or_default(),
+        }
+    }
+}
+
 #[async_trait]
 impl AgentTool for SelfHealTool {
     fn name(&self) -> &str {
@@ -357,16 +371,12 @@ impl AgentTool for SelfHealTool {
             return AgentToolResult::ok("No fleet nodes registered in the database.".to_string());
         }
 
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(3))
-            .build()
-            .unwrap_or_default();
         let mut issues = Vec::new();
         let mut healthy = Vec::new();
 
         for (name, ip) in &nodes {
             // Check LLM server
-            let llm_ok = client
+            let llm_ok = self.client
                 .get(format!("http://{ip}:55000/health"))
                 .send()
                 .await
@@ -418,7 +428,7 @@ impl AgentTool for SelfHealTool {
                 }
                 let mut healed = Vec::new();
                 for (name, ip) in &nodes {
-                    let llm_ok = client
+                    let llm_ok = self.client
                         .get(format!("http://{ip}:55000/health"))
                         .send()
                         .await
@@ -437,7 +447,21 @@ impl AgentTool for SelfHealTool {
     }
 }
 
-pub struct AutoFleetTool;
+pub struct AutoFleetTool {
+    client: reqwest::Client,
+}
+
+impl Default for AutoFleetTool {
+    fn default() -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(3))
+                .build()
+                .unwrap_or_default(),
+        }
+    }
+}
+
 #[async_trait]
 impl AgentTool for AutoFleetTool {
     fn name(&self) -> &str {
@@ -482,7 +506,6 @@ impl AgentTool for AutoFleetTool {
                     );
                 }
 
-                let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(3)).build().unwrap_or_default();
                 let mut report = String::from("AutoFleet Report:\n\n");
                 let mut total_ram: i64 = 0;
                 let mut online = 0usize;
@@ -496,7 +519,7 @@ impl AgentTool for AutoFleetTool {
                         .find(|m| m.node_name == node.name)
                         .map(|m| m.port as u16)
                         .unwrap_or(55000);
-                    let status = client
+                    let status = self.client
                         .get(format!("http://{}:{}/health", node.ip, port))
                         .send()
                         .await

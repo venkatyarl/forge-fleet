@@ -77,6 +77,8 @@ pub struct WorkerAgent {
     shutdown_tx: watch::Sender<bool>,
     /// Shutdown receiver (clonable).
     shutdown_rx: watch::Receiver<bool>,
+    /// Shared HTTP client.
+    client: reqwest::Client,
 }
 
 /// A task actively being processed by this worker.
@@ -104,6 +106,7 @@ impl WorkerAgent {
             activity_state: Arc::new(RwLock::new(ActivityState::initial())),
             shutdown_tx,
             shutdown_rx,
+            client: reqwest::Client::new(),
         }
     }
 
@@ -245,7 +248,7 @@ impl WorkerAgent {
                     "model inference requested"
                 );
                 let inference_base = self.inference_base_url();
-                execute_model_inference(&inference_base, model.as_deref(), prompt, *max_tokens)
+                execute_model_inference(&inference_base, model.as_deref(), prompt, *max_tokens, &self.client)
                     .await
             }
         };
@@ -382,11 +385,8 @@ async fn execute_model_inference(
     model: Option<&str>,
     prompt: &str,
     max_tokens: Option<u32>,
+    client: &reqwest::Client,
 ) -> (bool, String) {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .expect("build reqwest client");
     let payload = serde_json::json!({
         "model": model.unwrap_or("local-model"),
         "prompt": prompt,

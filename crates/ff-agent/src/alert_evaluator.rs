@@ -17,6 +17,8 @@
 use std::time::Duration;
 
 use sqlx::{PgPool, Row};
+
+use crate::notifications::SHARED_HTTP;
 use thiserror::Error;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -609,11 +611,13 @@ async fn dispatch_alert(pg: &PgPool, channel: &str, severity: &str, message: &st
                     "text": format!("[{severity}] {message}"),
                     "disable_web_page_preview": true,
                 });
-                let client = reqwest::Client::builder()
+                return match SHARED_HTTP
+                    .post(&url)
+                    .json(&payload)
                     .timeout(Duration::from_secs(10))
-                    .build()
-                    .unwrap_or_default();
-                return match client.post(&url).json(&payload).send().await {
+                    .send()
+                    .await
+                {
                     Ok(resp) if resp.status().is_success() => "sent".into(),
                     Ok(resp) => {
                         let status = resp.status();
@@ -662,11 +666,13 @@ async fn dispatch_alert(pg: &PgPool, channel: &str, severity: &str, message: &st
                 "severity": severity,
                 "message": message,
             });
-            let client = reqwest::Client::builder()
+            match SHARED_HTTP
+                .post(&url)
+                .json(&payload)
                 .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap_or_default();
-            match client.post(&url).json(&payload).send().await {
+                .send()
+                .await
+            {
                 Ok(resp) if resp.status().is_success() => "sent".into(),
                 Ok(resp) => format!("failed: webhook HTTP {}", resp.status()),
                 Err(e) => format!("failed: webhook: {e}"),

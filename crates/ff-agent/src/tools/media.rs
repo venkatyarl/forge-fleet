@@ -275,7 +275,21 @@ impl AgentTool for VideoDownloadTool {
 }
 
 /// LinkPreview — fetch metadata from URLs (OpenGraph, title, description).
-pub struct LinkPreviewTool;
+pub struct LinkPreviewTool {
+    client: reqwest::Client,
+}
+
+impl Default for LinkPreviewTool {
+    fn default() -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .user_agent("ForgeFleet-Agent/0.1")
+                .build()
+                .unwrap_or_default(),
+        }
+    }
+}
 
 #[async_trait]
 impl AgentTool for LinkPreviewTool {
@@ -307,15 +321,9 @@ impl AgentTool for LinkPreviewTool {
             return AgentToolResult::err("Provide 'url' or 'urls'");
         }
 
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .user_agent("ForgeFleet-Agent/0.1")
-            .build()
-            .unwrap_or_default();
-
         let mut results = Vec::new();
         for url in &urls {
-            match client.get(url).send().await {
+            match self.client.get(url).send().await {
                 Ok(resp) if resp.status().is_success() => {
                     let html = resp.text().await.unwrap_or_default();
                     let title = extract_meta(&html, "<title>", "</title>").unwrap_or_default();
@@ -435,7 +443,20 @@ impl AgentTool for ImageConvertTool {
 }
 
 /// VideoAnalyze — download a video, extract key frames + audio, analyze with multimodal LLM.
-pub struct VideoAnalyzeTool;
+pub struct VideoAnalyzeTool {
+    client: reqwest::Client,
+}
+
+impl Default for VideoAnalyzeTool {
+    fn default() -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(120))
+                .build()
+                .unwrap_or_default(),
+        }
+    }
+}
 
 #[async_trait]
 impl AgentTool for VideoAnalyzeTool {
@@ -634,11 +655,6 @@ impl AgentTool for VideoAnalyzeTool {
         let omni_base = find_omni_endpoint().await;
         let omni_endpoints = [omni_base.as_str(), "http://127.0.0.1:55000"];
 
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(120))
-            .build()
-            .unwrap_or_default();
-
         let mut llm_analysis = String::new();
         for endpoint in &omni_endpoints {
             // Build multimodal request with image URLs (base64 encoded)
@@ -670,7 +686,7 @@ impl AgentTool for VideoAnalyzeTool {
             });
 
             let req_url = format!("{endpoint}/v1/chat/completions");
-            match client.post(&req_url).json(&body).send().await {
+            match self.client.post(&req_url).json(&body).send().await {
                 Ok(resp) => {
                     if let Ok(data) = resp.json::<Value>().await
                         && let Some(content) = data

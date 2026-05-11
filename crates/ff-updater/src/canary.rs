@@ -7,7 +7,6 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -276,6 +275,7 @@ impl RolloutProgress {
 pub struct CanaryOrchestrator {
     policy: CanaryPolicy,
     progress: RolloutProgress,
+    client: reqwest::Client,
 }
 
 impl CanaryOrchestrator {
@@ -293,6 +293,7 @@ impl CanaryOrchestrator {
                 target_version,
                 gate_results: Vec::new(),
             },
+            client: reqwest::Client::new(),
         }
     }
 
@@ -430,23 +431,19 @@ impl CanaryOrchestrator {
         node: &FleetNode,
         expected_version: &str,
     ) -> Vec<HealthGateResult> {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(self.policy.health_timeout_secs))
-            .build()
-            .unwrap_or_default();
-
+        let client = &self.client;
         let mut results = Vec::new();
 
         // If no explicit gates configured, use the default HTTP health check.
         if self.policy.health_gates.is_empty() {
-            let res = Self::check_http_health(&client, &node.health_url).await;
+            let res = Self::check_http_health(client, &node.health_url).await;
             results.push(res);
 
             // Also do a version match if we have a version endpoint.
             // Convention: health_url + "/version" or health_url itself returns version
             // We'll use the health URL and check the body for the version string.
             let ver_res =
-                Self::check_version_match(&client, &node.health_url, expected_version).await;
+                Self::check_version_match(client, &node.health_url, expected_version).await;
             results.push(ver_res);
 
             return results;
@@ -454,11 +451,11 @@ impl CanaryOrchestrator {
 
         for gate in &self.policy.health_gates {
             let res = match &gate.kind {
-                HealthGateKind::HttpStatus { url } => Self::check_http_health(&client, url).await,
+                HealthGateKind::HttpStatus { url } => Self::check_http_health(client, url).await,
                 HealthGateKind::VersionMatch {
                     url,
                     expected_version: ver,
-                } => Self::check_version_match(&client, url, ver).await,
+                } => Self::check_version_match(client, url, ver).await,
                 HealthGateKind::Command { command } => Self::check_command(command),
             };
             let res = HealthGateResult {

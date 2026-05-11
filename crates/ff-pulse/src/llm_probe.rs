@@ -8,7 +8,6 @@
 //! richer `LlmServer` struct expected by PulseBeatV2.
 
 use std::path::Path;
-use std::time::Duration;
 
 use chrono::Utc;
 use tracing::debug;
@@ -32,22 +31,21 @@ const EXCLUDED_PORTS: &[u16] = &[
     51100, // pulse P2P TCP (future)
 ];
 
-pub struct LlmProbe;
+pub struct LlmProbe {
+    client: reqwest::Client,
+}
 
 impl LlmProbe {
+    pub fn new() -> Self {
+        Self {
+            client: reqwest::Client::new(),
+        }
+    }
+
     /// Scan localhost ports for running LLM servers, returning fully-populated
     /// `LlmServer` entries for each reachable endpoint.
-    pub async fn detect() -> Vec<LlmServer> {
-        let client = match reqwest::Client::builder()
-            .timeout(Duration::from_secs(1))
-            .build()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                debug!("llm_probe: failed to build reqwest client: {e}");
-                return Vec::new();
-            }
-        };
+    pub async fn detect(&self) -> Vec<LlmServer> {
+        let client = &self.client;
 
         let mut servers = Vec::new();
 
@@ -491,7 +489,7 @@ mod tests {
     async fn detect_returns_vec_when_nothing_listening() {
         // We can't guarantee *no* LLM is running on the test host, so we
         // simply verify the call completes and returns a Vec.
-        let _servers = LlmProbe::detect().await;
+        let _servers = LlmProbe::new().detect().await;
     }
 
     #[test]

@@ -120,16 +120,11 @@ fn hex_encode(bytes: &[u8]) -> String {
 ///
 /// Returns the list of files successfully materialised on disk.
 pub async fn download_repo(
+    client: &reqwest::Client,
     opts: DownloadOptions,
     mut progress: impl FnMut(DownloadProgress) + Send + 'static,
 ) -> Result<Vec<PathBuf>, String> {
     let revision = opts.revision.clone().unwrap_or_else(|| "main".to_string());
-
-    let client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(30))
-        // No overall timeout: model files are multi-GB.
-        .build()
-        .map_err(|e| format!("failed to build http client: {e}"))?;
 
     // 1. List tree (recursive).
     let list_url = format!(

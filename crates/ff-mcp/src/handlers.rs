@@ -6,7 +6,11 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
+
+static SHARED_HTTP: LazyLock<reqwest::Client> =
+    LazyLock::new(|| reqwest::Client::new());
 
 use chrono::Utc;
 use ff_api::adaptive_router::AdaptiveRouter;
@@ -632,10 +636,7 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
         );
     }
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .expect("build reqwest client");
+    let client = &*SHARED_HTTP;
     let mut last_error = String::new();
 
     for (tier, backends) in chain {
@@ -2027,10 +2028,7 @@ async fn computer_use(params: Option<Value>) -> Result<Value, String> {
         ));
     }
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .expect("build reqwest client");
+    let client = &*SHARED_HTTP;
     let base = "http://127.0.0.1:51200";
 
     match action {

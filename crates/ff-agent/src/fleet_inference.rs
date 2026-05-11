@@ -49,6 +49,7 @@ pub enum GpuType {
 pub struct FleetInferenceManager {
     endpoints: Arc<DashMap<String, FleetEndpoint>>,
     metrics: Arc<DashMap<String, EndpointMetrics>>,
+    client: reqwest::Client,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -64,6 +65,10 @@ impl FleetInferenceManager {
         Self {
             endpoints: Arc::new(DashMap::new()),
             metrics: Arc::new(DashMap::new()),
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap_or_default(),
         }
     }
 
@@ -284,17 +289,12 @@ impl FleetInferenceManager {
 
     /// Health check all endpoints.
     pub async fn health_check_all(&self) {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()
-            .unwrap_or_default();
-
         let names: Vec<String> = self.endpoints.iter().map(|e| e.key().clone()).collect();
 
         for name in names {
             if let Some(mut ep) = self.endpoints.get_mut(&name) {
                 let url = format!("{}/health", ep.url.trim_end_matches('/'));
-                let healthy = client
+                let healthy = self.client
                     .get(&url)
                     .send()
                     .await

@@ -342,7 +342,7 @@ async fn generate_brain_reply(
     });
 
     // ── 1) Cloud-LLM routing (first pass) ───────────────────────────────
-    if let Some(result) = crate::cloud_llm::try_route_to_cloud(pool, &model, &payload, None).await {
+    if let Some(result) = crate::cloud_llm::try_route_to_cloud(pool, &model, &payload, None, &state.http_client).await {
         match result {
             Ok(resp) => {
                 let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)

@@ -3,17 +3,15 @@ use ff_agent::agent_loop::AgentSessionConfig;
 use crate::{GREEN, RED, RESET, YELLOW};
 
 pub async fn handle_health(c: &AgentSessionConfig) -> Result<()> {
+    static SHARED_HTTP: std::sync::LazyLock<reqwest::Client> =
+        std::sync::LazyLock::new(|| reqwest::Client::new());
+
     let nodes = load_fleet_nodes_for_health(c).await;
-    let client = std::sync::Arc::new(
-        reqwest::Client::builder()
-            .timeout(std::time::Duration::from_millis(2500))
-            .build()?,
-    );
 
     let futs: Vec<_> = nodes
         .iter()
         .map(|(name, ip, port)| {
-            let client = client.clone();
+            let client = &*SHARED_HTTP;
             let url = format!("http://{ip}:{port}/health");
             let agent_url = format!("http://{ip}:50002/health");
             let name = name.clone();

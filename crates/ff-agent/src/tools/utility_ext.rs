@@ -399,7 +399,18 @@ impl AgentTool for FileSyncTool {
     }
 }
 
-pub struct HealthMonitorTool;
+pub struct HealthMonitorTool {
+    client: reqwest::Client,
+}
+
+impl Default for HealthMonitorTool {
+    fn default() -> Self {
+        Self {
+            client: reqwest::Client::new(),
+        }
+    }
+}
+
 #[async_trait]
 impl AgentTool for HealthMonitorTool {
     fn name(&self) -> &str {
@@ -427,15 +438,11 @@ impl AgentTool for HealthMonitorTool {
             .and_then(Value::as_u64)
             .unwrap_or(5);
 
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(timeout))
-            .build()
-            .unwrap_or_default();
         let mut results = Vec::new();
 
         for url in &urls {
             let start = std::time::Instant::now();
-            match client.get(*url).send().await {
+            match self.client.get(*url).timeout(std::time::Duration::from_secs(timeout)).send().await {
                 Ok(resp) => {
                     let status = resp.status().as_u16();
                     let elapsed = start.elapsed().as_millis();

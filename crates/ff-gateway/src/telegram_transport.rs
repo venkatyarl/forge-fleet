@@ -735,7 +735,7 @@ impl TelegramPollingTransport {
         // Build conversation history for LLM
         let display_name = incoming.from_username.as_deref().unwrap_or("user");
 
-        let assistant_text = match call_fleet_llm(pool, &thread_slug, display_name, thread_id).await
+        let assistant_text = match call_fleet_llm(pool, &thread_slug, display_name, thread_id, self.client.http_client()).await
         {
             Ok(text) => text,
             Err(e) => {
@@ -1005,7 +1005,6 @@ fn build_media_ack(summary: &MediaIngestSummary) -> String {
 
 const DEFAULT_LLM_ENDPOINT: &str = "http://127.0.0.1:55001/v1/chat/completions";
 const LLM_HISTORY_LIMIT: i64 = 10;
-const LLM_REQUEST_TIMEOUT_SECS: u64 = 120;
 
 #[derive(Debug, Deserialize)]
 struct ChatCompletionResponse {
@@ -1027,6 +1026,7 @@ async fn call_fleet_llm(
     thread_slug: &str,
     display_name: &str,
     thread_id: uuid::Uuid,
+    client: &reqwest::Client,
 ) -> Result<String> {
     // Build conversation messages
     let mut messages = Vec::new();
@@ -1071,11 +1071,6 @@ async fn call_fleet_llm(
         "max_tokens": 1024,
         "temperature": 0.7,
     });
-
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(LLM_REQUEST_TIMEOUT_SECS))
-        .build()
-        .context("failed to build HTTP client for LLM")?;
 
     let resp = client
         .post(&endpoint)

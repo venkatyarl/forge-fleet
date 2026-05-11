@@ -188,8 +188,8 @@ pub fn core_tools() -> Vec<Box<dyn AgentTool>> {
         Box::new(glob_tool::GlobTool),
         Box::new(grep_tool::GrepTool),
         Box::new(agent_tool::SubAgentTool),
-        Box::new(web_fetch::WebFetchTool),
-        Box::new(web_search::WebSearchTool),
+        Box::new(web_fetch::WebFetchTool::default()),
+        Box::new(web_search::WebSearchTool::default()),
         Box::new(plan_tools::AskUserQuestionTool),
         Box::new(orchestrate::OrchestrateTool),
         Box::new(tool_search::ToolSearchTool),
@@ -214,17 +214,17 @@ pub fn all_tools() -> Vec<Box<dyn AgentTool>> {
         Box::new(grep_tool::GrepTool),
         // Agent & coordination tools
         Box::new(agent_tool::SubAgentTool),
-        Box::new(send_message::SendMessageTool),
+        Box::new(send_message::SendMessageTool::default()),
         // Task management tools
         Box::new(task_tools::TaskCreateTool),
         Box::new(task_tools::TaskGetTool),
-        Box::new(task_tools::TaskUpdateTool),
+        Box::new(task_tools::TaskUpdateTool::default()),
         Box::new(task_tools::TaskListTool),
         Box::new(task_tools::TaskStopTool),
         Box::new(task_tools::TaskOutputTool),
         // Web tools
-        Box::new(web_fetch::WebFetchTool),
-        Box::new(web_search::WebSearchTool),
+        Box::new(web_fetch::WebFetchTool::default()),
+        Box::new(web_search::WebSearchTool::default()),
         // Planning tools
         Box::new(plan_tools::AskUserQuestionTool),
         Box::new(orchestrate::OrchestrateTool),
@@ -246,15 +246,15 @@ pub fn all_tools() -> Vec<Box<dyn AgentTool>> {
         Box::new(dep_check::DepCheckTool),
         Box::new(cron_tool::CronScheduleTool),
         // Utility tools
-        Box::new(http_request::HttpRequestTool),
+        Box::new(http_request::HttpRequestTool::default()),
         Box::new(diff_tool::DiffTool),
         Box::new(json_query::JsonQueryTool),
         Box::new(env_info::EnvInfoTool),
-        Box::new(network_check::NetworkCheckTool),
+        Box::new(network_check::NetworkCheckTool::default()),
         // Research tools
         Box::new(research::DeepResearchTool),
-        Box::new(research::WikiLookupTool),
-        Box::new(research::ScholarSearchTool),
+        Box::new(research::WikiLookupTool::default()),
+        Box::new(research::ScholarSearchTool::default()),
         // Agentic tools
         Box::new(agentic::VerifyAndRetryTool),
         Box::new(agentic::DelegateTool),
@@ -286,10 +286,10 @@ pub fn all_tools() -> Vec<Box<dyn AgentTool>> {
         Box::new(code_quality::LogAnalyzerTool),
         // Fleet operations tools
         Box::new(fleet_ops::NodeSetupTool),
-        Box::new(fleet_ops::NodeEnrollTool),
+        Box::new(fleet_ops::NodeEnrollTool::default()),
         Box::new(fleet_ops::ModelDeployTool),
-        Box::new(fleet_ops::FleetInventoryTool),
-        Box::new(fleet_ops::NodeHealthCheckTool),
+        Box::new(fleet_ops::FleetInventoryTool::default()),
+        Box::new(fleet_ops::NodeHealthCheckTool::default()),
         Box::new(fleet_ops::BinaryDeployTool),
         // Intelligence & self-improvement tools
         Box::new(intelligence::PatternLearnerTool),
@@ -303,12 +303,12 @@ pub fn all_tools() -> Vec<Box<dyn AgentTool>> {
         Box::new(media::ScreenshotCaptureTool),
         Box::new(media::ImageAnalyzeTool),
         Box::new(media::VideoDownloadTool),
-        Box::new(media::VideoAnalyzeTool),
+        Box::new(media::VideoAnalyzeTool::default()),
         Box::new(media::AudioAnalyzeTool),
-        Box::new(media::LinkPreviewTool),
+        Box::new(media::LinkPreviewTool::default()),
         Box::new(media::ImageConvertTool),
         // Skill builder
-        Box::new(skill_builder::SkillBuilderTool),
+        Box::new(skill_builder::SkillBuilderTool::default()),
         // Tool builder
         Box::new(tool_builder::ToolBuilderTool),
         // Computer tools
@@ -324,14 +324,14 @@ pub fn all_tools() -> Vec<Box<dyn AgentTool>> {
         Box::new(crypto::TextTransformTool),
         Box::new(crypto::CalculatorTool),
         // Model management tools
-        Box::new(model_mgmt::ModelBrowserTool),
+        Box::new(model_mgmt::ModelBrowserTool::default()),
         Box::new(model_mgmt::ModelDownloaderTool),
         Box::new(model_mgmt::ModelCompareTool),
         // Version management
         Box::new(version_mgmt::VersionManagerTool),
         // Model discovery & clustering
-        Box::new(model_discovery::ModelDiscoveryTool),
-        Box::new(model_discovery::ClusterInferenceTool),
+        Box::new(model_discovery::ModelDiscoveryTool::default()),
+        Box::new(model_discovery::ClusterInferenceTool::default()),
         // Extended utility tools
         Box::new(utility_ext::ReminderTool),
         Box::new(utility_ext::TimerTool),
@@ -341,7 +341,7 @@ pub fn all_tools() -> Vec<Box<dyn AgentTool>> {
         Box::new(utility_ext::TranslateTool),
         Box::new(utility_ext::FileCompressTool),
         Box::new(utility_ext::FileSyncTool),
-        Box::new(utility_ext::HealthMonitorTool),
+        Box::new(utility_ext::HealthMonitorTool::default()),
         Box::new(utility_ext::GithubIssuesTool),
         Box::new(utility_ext::MarkdownTool),
         // Multimodal tools
@@ -349,8 +349,8 @@ pub fn all_tools() -> Vec<Box<dyn AgentTool>> {
         Box::new(multimodal::VideoAnalysisTool),
         Box::new(multimodal::AudioAnalysisTool),
         // Self-healing & fleet automation
-        Box::new(multimodal::SelfHealTool),
-        Box::new(multimodal::AutoFleetTool),
+        Box::new(multimodal::SelfHealTool::default()),
+        Box::new(multimodal::AutoFleetTool::default()),
         Box::new(multimodal::TaskDecomposerTool),
         // UI/UX tools
         Box::new(uiux::ColorPaletteTool),
@@ -361,7 +361,7 @@ pub fn all_tools() -> Vec<Box<dyn AgentTool>> {
         Box::new(uiux::StyleGuideGenTool),
         // Extended research tools
         Box::new(research_ext::CompetitorAnalysisTool),
-        Box::new(research_ext::TrendAnalysisTool),
+        Box::new(research_ext::TrendAnalysisTool::default()),
         Box::new(research_ext::MarketResearchTool),
     ]
 }

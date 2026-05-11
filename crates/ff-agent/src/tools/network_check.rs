@@ -6,7 +6,20 @@ use tokio::process::Command;
 
 use super::{AgentTool, AgentToolContext, AgentToolResult};
 
-pub struct NetworkCheckTool;
+pub struct NetworkCheckTool {
+    client: reqwest::Client,
+}
+
+impl Default for NetworkCheckTool {
+    fn default() -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(3))
+                .build()
+                .unwrap_or_default(),
+        }
+    }
+}
 
 #[async_trait]
 impl AgentTool for NetworkCheckTool {
@@ -95,10 +108,6 @@ impl AgentTool for NetworkCheckTool {
                     );
                 }
 
-                let client = reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_secs(3))
-                    .build()
-                    .unwrap_or_default();
                 let mut results = Vec::new();
                 for node in &snapshot.nodes {
                     // Prefer a model-specific port if one exists; otherwise default to 51000.
@@ -114,7 +123,7 @@ impl AgentTool for NetworkCheckTool {
                     };
                     for port in ports {
                         let url = format!("http://{}:{}/health", node.ip, port);
-                        let status = match client.get(&url).send().await {
+                        let status = match self.client.get(&url).send().await {
                             Ok(r) if r.status().is_success() => "ONLINE",
                             _ => "OFFLINE",
                         };

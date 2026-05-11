@@ -14,6 +14,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use sqlx::PgPool;
 
+use crate::notifications::SHARED_HTTP;
+
 const TELEGRAM_BOT_TOKEN_KEY: &str = "openclaw.telegram_bot_token";
 const TELEGRAM_CHAT_ID_KEY: &str = "openclaw.telegram_chat_id";
 
@@ -57,14 +59,10 @@ pub async fn send_telegram_from_secrets(pool: &PgPool, title: &str, body: &str) 
         "disable_web_page_preview": true,
     });
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .context("build reqwest client")?;
-
-    let resp = client
+    let resp = SHARED_HTTP
         .post(&url)
         .json(&payload)
+        .timeout(Duration::from_secs(10))
         .send()
         .await
         .context("POST telegram sendMessage")?;

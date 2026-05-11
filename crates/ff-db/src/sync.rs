@@ -452,10 +452,12 @@ impl FollowerSync {
 
         let db_path = self.pool.path().to_path_buf();
 
-        // Apply the snapshot.
-        // NOTE: This uses the SQLite backup API which handles concurrent readers,
-        // but for maximum safety the pool should be quiesced before applying.
-        apply_snapshot(&db_path, &snapshot_path)?;
+        // Apply the snapshot on a blocking thread — SQLite backup API is synchronous
+        // and may touch large files.
+        let sp = snapshot_path.clone();
+        tokio::task::spawn_blocking(move || apply_snapshot(&db_path, &sp))
+            .await
+            .map_err(|e| DbError::Replication(format!("spawn blocking failed: {e}")))??;
 
         // Update local sequence.
         let seq = meta.sequence;

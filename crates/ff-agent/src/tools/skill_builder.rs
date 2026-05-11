@@ -7,7 +7,20 @@ use tokio::fs;
 use super::{AgentTool, AgentToolContext, AgentToolResult};
 
 /// SkillBuilder — create new skills from natural language descriptions.
-pub struct SkillBuilderTool;
+pub struct SkillBuilderTool {
+    client: reqwest::Client,
+}
+
+impl Default for SkillBuilderTool {
+    fn default() -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap_or_default(),
+        }
+    }
+}
 
 #[async_trait]
 impl AgentTool for SkillBuilderTool {
@@ -112,11 +125,7 @@ impl AgentTool for SkillBuilderTool {
 
                 if !url.is_empty() {
                     // Download from URL
-                    let client = reqwest::Client::builder()
-                        .timeout(std::time::Duration::from_secs(30))
-                        .build()
-                        .expect("build reqwest client");
-                    match client.get(url).send().await {
+                    match self.client.get(url).send().await {
                         Ok(resp) if resp.status().is_success() => {
                             let content = resp.text().await.unwrap_or_default();
                             let skill_dir = skills_dir.join(if name.is_empty() {

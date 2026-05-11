@@ -55,17 +55,23 @@ pub struct VllmEngine {
     pid: Option<u32>,
     config: Option<EngineConfig>,
     started_at: Option<Instant>,
+    client: reqwest::Client,
 }
 
 impl VllmEngine {
     /// Create a new vLLM engine manager.
     pub fn new(vllm_config: VllmConfig) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .expect("build reqwest client");
         Self {
             vllm_config,
             process: None,
             pid: None,
             config: None,
             started_at: None,
+            client,
         }
     }
 
@@ -153,10 +159,6 @@ impl VllmEngine {
     /// Wait for vLLM health endpoint.
     async fn wait_for_health(&self, config: &EngineConfig, timeout: Duration) -> Result<()> {
         let url = format!("http://{}:{}/health", config.host, config.port);
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .expect("build reqwest client");
         let start = Instant::now();
 
         loop {
@@ -164,7 +166,7 @@ impl VllmEngine {
                 return Err(RuntimeError::HealthTimeout);
             }
 
-            match client.get(&url).send().await {
+            match self.client.get(&url).send().await {
                 Ok(resp) if resp.status().is_success() => {
                     info!(url, "vLLM server is healthy");
                     return Ok(());
@@ -311,14 +313,7 @@ impl InferenceEngine for VllmEngine {
             };
 
             let url = format!("http://{}:{}/health", config.host, config.port);
-            let client = reqwest::Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .map_err(|e| RuntimeError::HealthCheckFailed {
-                    reason: e.to_string(),
-                })?;
-
-            match client.get(&url).send().await {
+            match self.client.get(&url).timeout(Duration::from_secs(5)).send().await {
                 Ok(resp) => Ok(resp.status().is_success()),
                 Err(_) => Ok(false),
             }
@@ -335,12 +330,7 @@ impl InferenceEngine for VllmEngine {
             };
 
             let url = format!("http://{}:{}/v1/models", config.host, config.port);
-            let client = reqwest::Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .map_err(|e| RuntimeError::Other(e.to_string()))?;
-
-            let resp = client.get(&url).send().await?;
+            let resp = self.client.get(&url).timeout(Duration::from_secs(5)).send().await?;
             let body: serde_json::Value = resp.json().await?;
 
             let models = body

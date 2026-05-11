@@ -310,7 +310,7 @@ impl HeartbeatV2Publisher {
         // cascading hangs (e.g. DockerProbe::detect() also uses spawn_blocking
         // and may stall if the blocking pool is saturated by the hung thread).
         if blocking_ok {
-            beat.llm_servers = LlmProbe::detect().await;
+            beat.llm_servers = LlmProbe::new().detect().await;
             beat.docker = DockerProbe::detect().await;
             beat.multi_host_participation = crate::ray_detect::detect_ray_membership().await;
         } else {

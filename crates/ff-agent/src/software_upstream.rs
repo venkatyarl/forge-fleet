@@ -82,12 +82,18 @@ pub struct CheckDetail {
 /// row in `software_registry`.
 pub struct UpstreamChecker {
     pg: PgPool,
+    client: reqwest::Client,
 }
 
 impl UpstreamChecker {
     /// Build a checker with the given Postgres pool.
     pub fn new(pg: PgPool) -> Self {
-        Self { pg }
+        let client = reqwest::Client::builder()
+            .timeout(HTTP_TIMEOUT)
+            .user_agent(USER_AGENT)
+            .build()
+            .expect("build reqwest client");
+        Self { pg, client }
     }
 
     /// Run one pass over every `software_registry` row.
@@ -97,10 +103,7 @@ impl UpstreamChecker {
     /// counted as `skipped`. Errors are collected per-row so one failure
     /// doesn't break the whole pass.
     pub async fn check_all(&self) -> Result<CheckReport, UpstreamError> {
-        let http = reqwest::Client::builder()
-            .timeout(HTTP_TIMEOUT)
-            .user_agent(USER_AGENT)
-            .build()?;
+        let http = &self.client;
 
         // Pick up the optional GitHub PAT for higher rate limits.
         let github_token = ff_db::pg_get_secret(&self.pg, "github.venkat_pat")

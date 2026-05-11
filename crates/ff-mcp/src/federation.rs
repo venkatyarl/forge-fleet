@@ -7,9 +7,13 @@
 //! - required/optional dependency and tool validation
 
 use std::collections::{HashMap, HashSet};
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use chrono::Utc;
+
+static SHARED_HTTP: LazyLock<reqwest::Client> =
+    LazyLock::new(|| reqwest::Client::new());
 use ff_core::config::{FleetConfig, McpConfig};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
@@ -455,10 +459,7 @@ async fn jsonrpc_request(
     method: &str,
     params: Option<Value>,
 ) -> Result<Value, String> {
-    let client = reqwest::Client::builder()
-        .timeout(timeout)
-        .build()
-        .map_err(|e| format!("failed to build HTTP client: {e}"))?;
+    let client = &*SHARED_HTTP;
 
     let request = json!({
         "jsonrpc": "2.0",
@@ -469,6 +470,7 @@ async fn jsonrpc_request(
 
     let response = client
         .post(endpoint)
+        .timeout(timeout)
         .json(&request)
         .send()
         .await

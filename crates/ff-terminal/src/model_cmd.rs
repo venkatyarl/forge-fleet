@@ -342,7 +342,11 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                 skip_verify: false,
             };
 
-            let result = ff_agent::hf_download::download_repo(opts, move |p| {
+            let client = reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(30))
+                .build()
+                .map_err(|e| anyhow::anyhow!("build http client: {e}"))?;
+            let result = ff_agent::hf_download::download_repo(&client, opts, move |p| {
                 let pct = p.percent as i32;
                 if pct != last_pct {
                     last_pct = pct;

@@ -361,6 +361,7 @@ pub struct DbWriteReadProbe {
     #[allow(dead_code)]
     db_path: String,
     interval: Duration,
+    client: reqwest::Client,
 }
 
 impl DbWriteReadProbe {
@@ -368,6 +369,7 @@ impl DbWriteReadProbe {
         Self {
             db_path: db_path.into(),
             interval: Duration::from_secs(60),
+            client: reqwest::Client::new(),
         }
     }
 
@@ -461,12 +463,6 @@ impl SyntheticProbe for DbWriteReadProbe {
     }
 
     async fn execute(&self, config: &FleetConfig) -> Vec<ProbeResult> {
-        // Probe the leader node's database via its API
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-            .expect("failed to build reqwest client");
-
         // Find the leader/gateway node
         let leader = config
             .nodes
@@ -489,7 +485,7 @@ impl SyntheticProbe for DbWriteReadProbe {
         let base_url = format!("http://{}:{}", node.ip, port);
 
         let start = Instant::now();
-        let status = self.probe_via_api(&client, &base_url).await;
+        let status = self.probe_via_api(&self.client, &base_url).await;
         let latency = start.elapsed();
 
         debug!(probe = "db_write_read", node = %node_name, ?status, ?latency);

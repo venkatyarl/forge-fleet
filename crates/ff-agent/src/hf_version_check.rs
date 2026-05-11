@@ -26,6 +26,7 @@ pub struct HfUpdate {
 /// Optional `token` (e.g. from `fleet_secrets.huggingface.token`) used for
 /// gated models.
 pub async fn check_catalog_updates(
+    client: &reqwest::Client,
     pool: &sqlx::PgPool,
     token: Option<&str>,
 ) -> Result<Vec<HfUpdate>, String> {
@@ -43,12 +44,6 @@ pub async fn check_catalog_updates(
             .entry((r.catalog_id.clone(), r.runtime.clone()))
             .or_insert(0) += 1;
     }
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(8))
-        .user_agent("ForgeFleet/1.0")
-        .build()
-        .map_err(|e| format!("reqwest client: {e}"))?;
 
     let mut updates: Vec<HfUpdate> = Vec::new();
     for entry in &catalog {

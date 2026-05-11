@@ -17,6 +17,7 @@ pub struct HeartbeatPublisher {
     client: PulseClient,
     node_name: String,
     interval: Duration,
+    http_client: reqwest::Client,
 }
 
 impl HeartbeatPublisher {
@@ -26,6 +27,7 @@ impl HeartbeatPublisher {
             client,
             node_name,
             interval,
+            http_client: reqwest::Client::new(),
         }
     }
 
@@ -89,7 +91,7 @@ impl HeartbeatPublisher {
         let uptime_secs = System::uptime();
 
         // Auto-detect running LLM servers on ports 55000-55010
-        let loaded_models = Self::scan_local_models().await;
+        let loaded_models = self.scan_local_models().await;
 
         NodeMetrics {
             node_name: self.node_name.clone(),
@@ -112,12 +114,8 @@ impl HeartbeatPublisher {
     /// Scan localhost ports 55000-55010 for running LLM servers.
     ///
     /// Hits /health and /v1/models on each port to detect what's loaded.
-    async fn scan_local_models() -> Vec<LoadedModel> {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(2))
-            .build()
-            .unwrap_or_default();
-
+    async fn scan_local_models(&self) -> Vec<LoadedModel> {
+        let client = &self.http_client;
         let mut models = Vec::new();
 
         for port in 55000..=55010 {

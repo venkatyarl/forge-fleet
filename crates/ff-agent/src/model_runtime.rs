@@ -6,6 +6,9 @@
 
 use std::path::PathBuf;
 
+static SHARED_HTTP: std::sync::LazyLock<reqwest::Client> =
+    std::sync::LazyLock::new(|| reqwest::Client::new());
+
 /// Options for [`load_model`].
 #[derive(Debug, Clone)]
 pub struct LoadOptions {
@@ -144,7 +147,7 @@ pub async fn load_model(pool: &sqlx::PgPool, opts: LoadOptions) -> Result<LoadRe
     });
 
     // Wait for health endpoint to come up (up to 90s).
-    let health_ok = wait_for_health(runtime_label, port, std::time::Duration::from_secs(90)).await;
+    let health_ok = wait_for_health(runtime_label, port, std::time::Duration::from_secs(90), &*SHARED_HTTP).await;
 
     // Upsert deployment row.
     let deployment_id = ff_db::pg_upsert_deployment(
@@ -299,6 +302,7 @@ pub async fn health_check_deployment(
         &dep.runtime,
         dep.port as u16,
         std::time::Duration::from_secs(3),
+        &*SHARED_HTTP,
     )
     .await;
     let status_new = if ok { "healthy" } else { "unhealthy" };
@@ -335,10 +339,15 @@ fn llama_server_binary() -> String {
     "llama-server".to_string()
 }
 
-async fn wait_for_health(runtime: &str, port: u16, timeout: std::time::Duration) -> bool {
+async fn wait_for_health(
+    runtime: &str,
+    port: u16,
+    timeout: std::time::Duration,
+    client: &reqwest::Client,
+) -> bool {
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
-        if probe_health(runtime, port, std::time::Duration::from_secs(2)).await {
+        if probe_health(runtime, port, std::time::Duration::from_secs(2), client).await {
             return true;
         }
         tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
@@ -348,22 +357,24 @@ async fn wait_for_health(runtime: &str, port: u16, timeout: std::time::Duration)
 
 /// Public re-export of [`probe_health`] for other modules (e.g. reconciler).
 pub async fn probe_health_public(runtime: &str, port: u16, timeout: std::time::Duration) -> bool {
-    probe_health(runtime, port, timeout).await
+    probe_health(runtime, port, timeout, &*SHARED_HTTP).await
 }
 
-async fn probe_health(runtime: &str, port: u16, timeout: std::time::Duration) -> bool {
+async fn probe_health(
+    runtime: &str,
+    port: u16,
+    timeout: std::time::Duration,
+    client: &reqwest::Client,
+) -> bool {
     // llama.cpp and vllm expose /health; MLX uses /v1/models.
     let endpoint = match runtime {
         "mlx" => "/v1/models",
         _ => "/health",
     };
     let url = format!("http://127.0.0.1:{port}{endpoint}");
-    let client = match reqwest::Client::builder().timeout(timeout).build() {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
     client
         .get(&url)
+        .timeout(timeout)
         .send()
         .await
         .map(|r| r.status().is_success())

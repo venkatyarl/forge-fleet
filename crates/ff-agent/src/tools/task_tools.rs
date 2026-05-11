@@ -5,7 +5,6 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use dashmap::DashMap;
-use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -171,7 +170,20 @@ impl AgentTool for TaskGetTool {
 // TaskUpdate
 // ---------------------------------------------------------------------------
 
-pub struct TaskUpdateTool;
+pub struct TaskUpdateTool {
+    client: reqwest::Client,
+}
+
+impl Default for TaskUpdateTool {
+    fn default() -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .expect("build reqwest client"),
+        }
+    }
+}
 
 #[async_trait]
 impl AgentTool for TaskUpdateTool {
@@ -231,11 +243,8 @@ impl AgentTool for TaskUpdateTool {
                 "status": "completed",
                 "output": output_clone.unwrap_or_default(),
             });
+            let client = self.client.clone();
             tokio::spawn(async move {
-                let client = Client::builder()
-                    .timeout(std::time::Duration::from_secs(30))
-                    .build()
-                    .expect("build reqwest client");
                 let _ = client.post(&callback_url).json(&payload).send().await;
             });
         }

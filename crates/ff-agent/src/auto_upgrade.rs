@@ -493,11 +493,17 @@ async fn software_ids_with_drift(pool: &PgPool) -> Result<Vec<String>> {
 pub struct AutoUpgradeTick {
     pool: PgPool,
     my_name: String,
+    client: reqwest::Client,
 }
 
 impl AutoUpgradeTick {
     pub fn new(pool: PgPool, my_name: String) -> Self {
-        Self { pool, my_name }
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .user_agent("forgefleetd/auto-upgrade")
+            .build()
+            .expect("build reqwest client");
+        Self { pool, my_name, client }
     }
 
     /// One tick: gate, find drift, enqueue.
@@ -525,14 +531,14 @@ impl AutoUpgradeTick {
         // npm-distributed tools (openclaw, codex, context-mode, …): query
         // registry.npmjs.org/<pkg>/latest. Same-tick refresh for parity with
         // self_built — without this, npm releases sit unnoticed indefinitely.
-        let _ = refresh_npm_registry_latest_versions(&self.pool).await;
+        let _ = refresh_npm_registry_latest_versions(&self.client, &self.pool).await;
         // PyPI-distributed (vllm, mlx_lm, …) and GitHub-released (gh, etc.)
         // follow the same shape, different upstream URL.
-        let _ = refresh_pypi_latest_versions(&self.pool).await;
-        let _ = refresh_github_release_latest_versions(&self.pool).await;
+        let _ = refresh_pypi_latest_versions(&self.client, &self.pool).await;
+        let _ = refresh_github_release_latest_versions(&self.client, &self.pool).await;
         // Git-head: tools we install by git-clone that don't ship versioned
         // releases yet (open-design, etc.). Returns 10-char SHA of named ref.
-        let _ = refresh_git_head_latest_versions(&self.pool).await;
+        let _ = refresh_git_head_latest_versions(&self.client, &self.pool).await;
         // V67 install bootstrap: for `software_registry.auto_install = true`
         // rows, seed a `computer_software` row (status='upgrade_available')
         // for every member that doesn't already have one. Without this,
@@ -976,8 +982,9 @@ async fn flip_drift_status(pool: &PgPool) -> Result<u64> {
 /// `version` field into `software_registry.latest_version`. Soft-fail per row
 /// — a single registry hiccup must not poison the whole tick. The HTTP layer
 /// honors a 5s timeout to keep the auto-upgrade tick bounded.
-async fn refresh_npm_registry_latest_versions(pool: &PgPool) -> Result<u64> {
+async fn refresh_npm_registry_latest_versions(client: &reqwest::Client, pool: &PgPool) -> Result<u64> {
     refresh_via_http(
+        client,
         pool,
         "npm_registry",
         |vs| {
@@ -993,8 +1000,9 @@ async fn refresh_npm_registry_latest_versions(pool: &PgPool) -> Result<u64> {
 }
 
 /// PyPI version refresh. `version_source = {"method":"pypi","package":"vllm"}`.
-async fn refresh_pypi_latest_versions(pool: &PgPool) -> Result<u64> {
+async fn refresh_pypi_latest_versions(client: &reqwest::Client, pool: &PgPool) -> Result<u64> {
     refresh_via_http(
+        client,
         pool,
         "pypi",
         |vs| {
@@ -1013,8 +1021,9 @@ async fn refresh_pypi_latest_versions(pool: &PgPool) -> Result<u64> {
 /// `version_source = {"method":"github_release","repo":"cli/cli"}`.
 /// Strips a leading 'v' from the tag (v2.91.0 → 2.91.0) so versions match
 /// `--version` outputs.
-async fn refresh_github_release_latest_versions(pool: &PgPool) -> Result<u64> {
+async fn refresh_github_release_latest_versions(client: &reqwest::Client, pool: &PgPool) -> Result<u64> {
     refresh_via_http(
+        client,
         pool,
         "github_release",
         |vs| {
@@ -1037,8 +1046,9 @@ async fn refresh_github_release_latest_versions(pool: &PgPool) -> Result<u64> {
 /// releases (e.g. open-design as of 2026-04-30 — `latestRelease: null`).
 /// Returns the SHA of the named branch's HEAD, truncated to 10 chars to match
 /// what `software_collector` reports for `*_git` rows.
-async fn refresh_git_head_latest_versions(pool: &PgPool) -> Result<u64> {
+async fn refresh_git_head_latest_versions(client: &reqwest::Client, pool: &PgPool) -> Result<u64> {
     refresh_via_http(
+        client,
         pool,
         "git_head",
         |vs| {
@@ -1070,6 +1080,7 @@ async fn refresh_git_head_latest_versions(pool: &PgPool) -> Result<u64> {
 /// fetches it, parses the response with `extract_version`, and writes the
 /// result. Per-row failures are logged at debug and skipped.
 async fn refresh_via_http<UrlFn, ParseFn>(
+    client: &reqwest::Client,
     pool: &PgPool,
     method: &str,
     url_for: UrlFn,
@@ -1094,12 +1105,6 @@ where
     if rows.is_empty() {
         return Ok(0);
     }
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .user_agent("forgefleetd/auto-upgrade")
-        .build()
-        .context("build reqwest client for upstream version refresh")?;
 
     let mut updated = 0u64;
     for (id, vs) in rows {

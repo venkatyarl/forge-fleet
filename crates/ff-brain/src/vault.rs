@@ -329,8 +329,13 @@ pub async fn index_vault(pool: &PgPool, config: &VaultConfig) -> Result<IndexRep
         ));
     }
 
-    // Collect all .md files
-    let md_files = collect_md_files(&brain_root)?;
+    // Collect all .md files on a blocking thread — vault may be large.
+    let md_files = tokio::task::spawn_blocking({
+        let root = brain_root.clone();
+        move || collect_md_files(&root)
+    })
+    .await
+    .map_err(|e| format!("spawn error: {e}"))??;
     info!("Found {} .md files in vault", md_files.len());
 
     // Fetch existing hashes from DB for incremental indexing
@@ -345,7 +350,13 @@ pub async fn index_vault(pool: &PgPool, config: &VaultConfig) -> Result<IndexRep
     };
 
     for file_path in &md_files {
-        let node = match parse_vault_file(file_path, &brain_root) {
+        let file_path = file_path.clone();
+        let brain_root = brain_root.clone();
+        let node = match tokio::task::spawn_blocking(move || parse_vault_file(&file_path, &brain_root))
+            .await
+            .map_err(|e| format!("spawn error: {e}"))
+            .and_then(|r| r)
+        {
             Ok(n) => n,
             Err(e) => {
                 if e.contains("skipping oversized") {
@@ -421,7 +432,11 @@ pub async fn index_changed_files(
             continue;
         }
 
-        let node = parse_vault_file(&full_path, &brain_root)?;
+        let fp = full_path.clone();
+        let br = brain_root.clone();
+        let node = tokio::task::spawn_blocking(move || parse_vault_file(&fp, &br))
+            .await
+            .map_err(|e| format!("spawn error: {e}"))??;
         upsert_node(pool, &node).await?;
         report.nodes_upserted += 1;
 

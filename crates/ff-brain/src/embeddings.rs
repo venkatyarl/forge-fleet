@@ -45,6 +45,7 @@ pub struct EmbeddingClient {
     pub endpoint: String,
     pub model_id: String,
     pub dimensions: usize,
+    client: reqwest::Client,
 }
 
 impl EmbeddingClient {
@@ -53,15 +54,14 @@ impl EmbeddingClient {
             endpoint: endpoint.to_string(),
             model_id: model_id.to_string(),
             dimensions: 384,
+            client: reqwest::Client::new(),
         }
     }
 
     /// Embed a single text. Returns vector of f32.
     pub async fn embed(&self, text: &str) -> Result<Vec<f32>, String> {
-        let resp = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .expect("build reqwest client")
+        let resp = self
+            .client
             .post(format!("{}/v1/embeddings", self.endpoint))
             .json(&serde_json::json!({
                 "model": self.model_id,
@@ -108,10 +108,8 @@ impl EmbeddingClient {
             return Ok(Vec::new());
         }
 
-        let resp = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .expect("build reqwest client")
+        let resp = self
+            .client
             .post(format!("{}/v1/embeddings", self.endpoint))
             .json(&serde_json::json!({
                 "model": self.model_id,

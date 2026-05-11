@@ -5,7 +5,21 @@ use serde_json::{Value, json};
 
 use super::{AgentTool, AgentToolContext, AgentToolResult, MAX_TOOL_RESULT_CHARS, truncate_output};
 
-pub struct WebSearchTool;
+pub struct WebSearchTool {
+    client: reqwest::Client,
+}
+
+impl Default for WebSearchTool {
+    fn default() -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(15))
+                .user_agent("ForgeFleet-Agent/0.1")
+                .build()
+                .unwrap_or_default(),
+        }
+    }
+}
 
 #[async_trait]
 impl AgentTool for WebSearchTool {
@@ -45,16 +59,9 @@ impl AgentTool for WebSearchTool {
             .and_then(Value::as_u64)
             .unwrap_or(8) as usize;
 
-        // Use DuckDuckGo HTML lite (no API key required)
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(15))
-            .user_agent("ForgeFleet-Agent/0.1")
-            .build()
-            .unwrap_or_default();
-
         let url = format!("https://html.duckduckgo.com/html/?q={}", urlencoding(query));
 
-        match client.get(&url).send().await {
+        match self.client.get(&url).send().await {
             Ok(resp) => {
                 if !resp.status().is_success() {
                     return AgentToolResult::err(format!("Search returned HTTP {}", resp.status()));

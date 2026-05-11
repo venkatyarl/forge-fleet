@@ -300,6 +300,7 @@ pub struct AgentSession {
     /// Cached answer for "is Rust auto-verify enabled for this session?"
     /// Populated lazily on the first `.rs` edit of the session.
     auto_verify_rust: Option<bool>,
+    client: reqwest::Client,
 }
 
 /// Max mid-session cargo-check retries before a task aborts with
@@ -343,6 +344,11 @@ impl AgentSession {
             tools::core_tools_arc()
         };
 
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(600))
+            .build()
+            .unwrap_or_default();
+
         Self {
             id: session_id,
             config,
@@ -358,6 +364,7 @@ impl AgentSession {
             consecutive_errors: 0,
             build_verify_retries: 0,
             auto_verify_rust: None,
+            client,
         }
     }
 
@@ -391,6 +398,11 @@ impl AgentSession {
             tools::core_tools_arc()
         };
 
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(600))
+            .build()
+            .unwrap_or_default();
+
         Self {
             id: session_id,
             config,
@@ -406,6 +418,7 @@ impl AgentSession {
             consecutive_errors: 0,
             build_verify_retries: 0,
             auto_verify_rust: None,
+            client,
         }
     }
 
@@ -492,12 +505,8 @@ impl AgentSession {
             self.messages.push(ToolChatMessage::user(full_prompt));
         }
 
-        let http_client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(600))
-            .build()
-            .unwrap_or_default();
-
-        let outcome = run_agent_loop(self, &http_client, event_tx).await;
+        let client = self.client.clone();
+        let outcome = run_agent_loop(self, &client, event_tx).await;
 
         // Auto-save session
         if self.config.auto_save

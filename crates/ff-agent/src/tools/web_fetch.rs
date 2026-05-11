@@ -5,7 +5,21 @@ use serde_json::{Value, json};
 
 use super::{AgentTool, AgentToolContext, AgentToolResult, MAX_TOOL_RESULT_CHARS, truncate_output};
 
-pub struct WebFetchTool;
+pub struct WebFetchTool {
+    client: reqwest::Client,
+}
+
+impl Default for WebFetchTool {
+    fn default() -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .user_agent("ForgeFleet-Agent/0.1")
+                .build()
+                .unwrap_or_default(),
+        }
+    }
+}
 
 #[async_trait]
 impl AgentTool for WebFetchTool {
@@ -40,13 +54,7 @@ impl AgentTool for WebFetchTool {
             _ => return AgentToolResult::err("Missing or empty 'url' parameter"),
         };
 
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .user_agent("ForgeFleet-Agent/0.1")
-            .build()
-            .unwrap_or_default();
-
-        let mut req = client.get(url);
+        let mut req = self.client.get(url);
 
         // Add custom headers if provided
         if let Some(headers) = input.get("headers").and_then(Value::as_object) {

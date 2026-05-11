@@ -5,7 +5,20 @@ use serde_json::{Value, json};
 
 use super::{AgentTool, AgentToolContext, AgentToolResult, MAX_TOOL_RESULT_CHARS, truncate_output};
 
-pub struct HttpRequestTool;
+pub struct HttpRequestTool {
+    client: reqwest::Client,
+}
+
+impl Default for HttpRequestTool {
+    fn default() -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap_or_default(),
+        }
+    }
+}
 
 #[async_trait]
 impl AgentTool for HttpRequestTool {
@@ -42,17 +55,12 @@ impl AgentTool for HttpRequestTool {
             .and_then(Value::as_str)
             .unwrap_or("GET")
             .to_uppercase();
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .unwrap_or_default();
-
         let mut req = match method.as_str() {
-            "GET" => client.get(url),
-            "POST" => client.post(url),
-            "PUT" => client.put(url),
-            "DELETE" => client.delete(url),
-            "PATCH" => client.patch(url),
+            "GET" => self.client.get(url),
+            "POST" => self.client.post(url),
+            "PUT" => self.client.put(url),
+            "DELETE" => self.client.delete(url),
+            "PATCH" => self.client.patch(url),
             _ => return AgentToolResult::err(format!("Unknown method: {method}")),
         };
 

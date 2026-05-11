@@ -16,10 +16,15 @@ pub mod fetcher;
 pub mod platform;
 
 use std::path::PathBuf;
+use std::sync::LazyLock;
 
 use anyhow::{Context, Result, anyhow};
 use sqlx::PgPool;
+use tokio::sync::Semaphore;
 use uuid::Uuid;
+
+/// Limit concurrent social-ingest pipelines to prevent resource exhaustion.
+static INGEST_SEM: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(8));
 
 use self::analyzer::Analysis;
 use self::fetcher::FetchedPost;
@@ -53,6 +58,22 @@ pub async fn ingest(pool: PgPool, url: String, ingested_by: Option<String>) -> R
     let pool_task = pool.clone();
     let url_task = url.clone();
     tokio::spawn(async move {
+        // Acquire backpressure semaphore; if full, pipeline waits.
+        let _permit = match INGEST_SEM.acquire().await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!(post_id = %post_id, error = %e, "social_ingest semaphore closed");
+                let _ = sqlx::query(
+                    "UPDATE social_media_posts SET status='failed', last_error=$2 WHERE id=$1",
+                )
+                .bind(post_id)
+                .bind("ingest semaphore closed".to_string())
+                .execute(&pool_task)
+                .await;
+                return;
+            }
+        };
+
         if let Err(e) = run_pipeline(pool_task.clone(), post_id, url_task).await {
             tracing::error!(post_id = %post_id, error = %e, "social_ingest pipeline failed");
             let _ = sqlx::query(
@@ -98,7 +119,11 @@ async fn run_pipeline(pool: PgPool, post_id: Uuid, url: String) -> Result<()> {
     // ── analyzing ────────────────────────────────────────────────────
     update_status(&pool, post_id, "analyzing", None).await?;
     let (endpoint, model_id) = pick_vision_server().await?;
-    let analysis: Analysis = analyzer::analyze(&fetched, &endpoint, &model_id).await?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()
+        .context("build reqwest client")?;
+    let analysis: Analysis = analyzer::analyze(&client, &fetched, &endpoint, &model_id).await?;
 
     // ── done ─────────────────────────────────────────────────────────
     let analysis_json = serde_json::to_value(&analysis)

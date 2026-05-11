@@ -1127,13 +1127,14 @@ impl LlmRoutingCache {
         // Spawn the pub/sub listener as a sibling task. It owns its own
         // reconnect loop so a dropped Redis connection doesn't wedge the
         // warmer — the warmer still ticks on the 15s interval.
-        if let Some(url) = redis_url {
-            tokio::spawn(invalidate_subscriber(url, poke_tx.clone()));
+        let subscriber_handle = if let Some(url) = redis_url {
+            Some(tokio::spawn(invalidate_subscriber(url, poke_tx.clone())))
         } else {
             tracing::debug!(
                 "llm routing cache: FORGEFLEET_REDIS_URL not set; skipping pub/sub invalidation listener"
             );
-        }
+            None
+        };
 
         tokio::spawn(async move {
             // Run once immediately so the cache is warm by the time the
@@ -1190,6 +1191,9 @@ impl LlmRoutingCache {
                         }
                     }
                 }
+            }
+            if let Some(h) = subscriber_handle {
+                h.abort();
             }
         })
     }

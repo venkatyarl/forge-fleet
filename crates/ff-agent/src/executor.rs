@@ -12,13 +12,17 @@ pub async fn run_task_executor(
     leader: LeaderClient,
     runtime_url: String,
 ) {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("build reqwest client");
     while let Some(task) = task_rx.recv().await {
         {
             let mut locked = state.write().await;
             locked.active_tasks.insert(task.id, task.clone());
         }
 
-        let result = execute_task(&state, task.clone(), &runtime_url).await;
+        let result = execute_task(&state, task.clone(), &runtime_url, &client).await;
 
         {
             let mut locked = state.write().await;
@@ -55,7 +59,12 @@ pub async fn run_task_poller(
     }
 }
 
-async fn execute_task(state: &SharedState, task: AgentTask, runtime_url: &str) -> TaskResult {
+async fn execute_task(
+    state: &SharedState,
+    task: AgentTask,
+    runtime_url: &str,
+    client: &reqwest::Client,
+) -> TaskResult {
     let started = Instant::now();
 
     let (success, output) = match task.kind.clone() {
@@ -67,7 +76,7 @@ async fn execute_task(state: &SharedState, task: AgentTask, runtime_url: &str) -
             model,
             prompt,
             max_tokens,
-        } => execute_model_inference(state, runtime_url, model, prompt, max_tokens).await,
+        } => execute_model_inference(state, runtime_url, model, prompt, max_tokens, client).await,
     };
 
     let duration_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
@@ -146,6 +155,7 @@ async fn execute_model_inference(
     model: Option<String>,
     prompt: String,
     max_tokens: Option<u32>,
+    client: &reqwest::Client,
 ) -> (bool, String) {
     let should_yield = {
         let locked = state.read().await;
@@ -166,10 +176,6 @@ async fn execute_model_inference(
         }
     }
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .expect("build reqwest client");
     let body = json!({
         "model": model.clone().unwrap_or_else(|| "local-model".to_string()),
         "prompt": prompt,

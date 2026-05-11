@@ -67,16 +67,8 @@ pub async fn collect_current() -> BTreeMap<String, String> {
 }
 
 /// Upstream "latest" for a set of keys. Concurrency cap = 4.
-pub async fn fetch_latest(keys: &[&str]) -> BTreeMap<String, String> {
+pub async fn fetch_latest(client: &reqwest::Client, keys: &[&str]) -> BTreeMap<String, String> {
     use futures::stream::{FuturesUnordered, StreamExt};
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .user_agent("ForgeFleet/1.0")
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => return BTreeMap::new(),
-    };
 
     let mut futs: FuturesUnordered<_> = FuturesUnordered::new();
     for key in keys {
@@ -121,7 +113,15 @@ pub async fn version_check_pass(pool: &PgPool) -> Result<DriftSummary, String> {
     let node_name = crate::fleet_info::resolve_this_node_name().await;
     let current = collect_current().await;
     let keys: Vec<&str> = current.keys().map(|s| s.as_str()).collect();
-    let latest = fetch_latest(&keys).await;
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .user_agent("ForgeFleet/1.0")
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return Err("Failed to build reqwest client".to_string()),
+    };
+    let latest = fetch_latest(&client, &keys).await;
     let now = chrono::Utc::now().to_rfc3339();
 
     // Build the tooling JSONB shape.

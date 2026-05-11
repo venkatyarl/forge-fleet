@@ -10,7 +10,21 @@ use tokio::process::Command;
 use super::{AgentTool, AgentToolContext, AgentToolResult, MAX_TOOL_RESULT_CHARS, truncate_output};
 
 /// ModelDiscovery — find new models from all sources.
-pub struct ModelDiscoveryTool;
+pub struct ModelDiscoveryTool {
+    client: reqwest::Client,
+}
+
+impl Default for ModelDiscoveryTool {
+    fn default() -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(15))
+                .user_agent("ForgeFleet-Agent/0.1")
+                .build()
+                .unwrap_or_default(),
+        }
+    }
+}
 
 #[async_trait]
 impl AgentTool for ModelDiscoveryTool {
@@ -38,12 +52,6 @@ impl AgentTool for ModelDiscoveryTool {
             .unwrap_or("any");
         let ram_gb = input.get("ram_gb").and_then(Value::as_u64).unwrap_or(32);
 
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(15))
-            .user_agent("ForgeFleet-Agent/0.1")
-            .build()
-            .unwrap_or_default();
-
         match action {
             "search_all" => {
                 if query.is_empty() {
@@ -56,7 +64,7 @@ impl AgentTool for ModelDiscoveryTool {
                     "https://huggingface.co/api/models?search={}&sort=trending&direction=-1&limit=5&filter=text-generation",
                     urlenc(query)
                 );
-                if let Ok(resp) = client.get(&hf_url).send().await
+                if let Ok(resp) = self.client.get(&hf_url).send().await
                     && let Ok(models) = resp.json::<Vec<Value>>().await
                 {
                     results.push("## HuggingFace".into());
@@ -158,7 +166,7 @@ impl AgentTool for ModelDiscoveryTool {
                     "https://huggingface.co/api/models?search={}&sort=trending&direction=-1&limit=15&filter=text-generation",
                     urlenc(hf_query)
                 );
-                match client.get(&url).send().await {
+                match self.client.get(&url).send().await {
                     Ok(resp) if resp.status().is_success() => {
                         match resp.json::<Vec<Value>>().await {
                             Ok(models) => {
@@ -188,7 +196,7 @@ impl AgentTool for ModelDiscoveryTool {
 
             "trending" | "new_releases" => {
                 let url = "https://huggingface.co/api/models?sort=trending&direction=-1&limit=10&filter=text-generation";
-                match client.get(url).send().await {
+                match self.client.get(url).send().await {
                     Ok(resp) if resp.status().is_success() => {
                         match resp.json::<Vec<Value>>().await {
                             Ok(models) => {
@@ -229,7 +237,7 @@ impl AgentTool for ModelDiscoveryTool {
                 }
 
                 let url = format!("https://huggingface.co/api/models/{model_name}");
-                match client.get(&url).send().await {
+                match self.client.get(&url).send().await {
                     Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
                         Ok(model) => {
                             let id = model.get("id").and_then(Value::as_str).unwrap_or("?");
@@ -427,7 +435,20 @@ fn fmt_num(n: u64) -> String {
 }
 
 /// ClusterInference — manage distributed LLM inference across fleet nodes.
-pub struct ClusterInferenceTool;
+pub struct ClusterInferenceTool {
+    client: reqwest::Client,
+}
+
+impl Default for ClusterInferenceTool {
+    fn default() -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(3))
+                .build()
+                .unwrap_or_default(),
+        }
+    }
+}
 
 #[async_trait]
 impl AgentTool for ClusterInferenceTool {
@@ -526,7 +547,6 @@ impl AgentTool for ClusterInferenceTool {
             }
 
             "status" => {
-                let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(3)).build().unwrap_or_default();
                 let mut status = Vec::new();
                 for node in &nodes {
                     // Check RPC server
@@ -535,7 +555,7 @@ impl AgentTool for ClusterInferenceTool {
 
                     // Check LLM server
                     let llm_url = format!("http://{node}:55000/health");
-                    let llm_ok = client.get(&llm_url).send().await.map(|r| r.status().is_success()).unwrap_or(false);
+                    let llm_ok = self.client.get(&llm_url).send().await.map(|r| r.status().is_success()).unwrap_or(false);
 
                     status.push(format!("  {node}: RPC={} LLM={}", if rpc_ok {"ON"} else {"OFF"}, if llm_ok {"ON"} else {"OFF"}));
                 }

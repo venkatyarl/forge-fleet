@@ -1,7 +1,7 @@
 //! Hot-reload system for ForgeFleet configuration.
 //!
-//! Provides SHA256-based file watching and atomic config updates:
-//! - [`ConfigWatcher`] — polls `fleet.toml` every 2 seconds, detects changes via SHA256
+//! Provides file-watching and atomic config updates:
+//! - [`ConfigWatcher`] — watches `fleet.toml` via `notify`, detects changes via SHA256
 //! - [`ConfigBroadcaster`] — `tokio::watch` channel for broadcasting config changes
 //! - [`atomic_write`] — write-to-tmp + rename for crash-safe config updates
 //! - [`validate_config`] — pre-flight validation before applying changes
@@ -113,14 +113,13 @@ pub fn atomic_write(path: &Path, config: &FleetConfig) -> Result<()> {
 
 // ─── ConfigWatcher ───────────────────────────────────────────────────────────
 
-/// Watches a config file for changes using SHA256 polling.
+/// Watches a config file for changes using `notify` and SHA256 verification.
 ///
 /// When a change is detected, the new config is parsed, validated,
 /// and broadcast to all subscribers via the `ConfigBroadcaster`.
 pub struct ConfigWatcher {
     path: PathBuf,
     tx: ConfigBroadcaster,
-    poll_interval: std::time::Duration,
     last_hash: Option<String>,
 }
 
@@ -132,14 +131,13 @@ impl ConfigWatcher {
         Self {
             path,
             tx,
-            poll_interval: std::time::Duration::from_secs(2),
             last_hash,
         }
     }
 
-    /// Override the poll interval (useful for tests).
-    pub fn with_poll_interval(mut self, interval: std::time::Duration) -> Self {
-        self.poll_interval = interval;
+    /// Override the poll interval (deprecated, kept for API compatibility).
+    #[allow(dead_code)]
+    pub fn with_poll_interval(self, _interval: std::time::Duration) -> Self {
         self
     }
 
@@ -148,24 +146,51 @@ impl ConfigWatcher {
     ///
     /// Call this via `tokio::spawn(watcher.run())`.
     pub async fn run(mut self) {
-        info!(
-            path = %self.path.display(),
-            poll_ms = self.poll_interval.as_millis(),
-            "config watcher started"
-        );
+        info!(path = %self.path.display(), "config watcher started (notify-based)");
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(4);
+
+        let watcher_path = self.path.clone();
+        let mut watcher = match notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
+            if let Ok(event) = res {
+                if event.kind.is_modify() || event.kind.is_create() {
+                    let _ = event_tx.try_send(());
+                }
+            }
+        }) {
+            Ok(w) => w,
+            Err(e) => {
+                error!(error = %e, "failed to create file watcher");
+                return;
+            }
+        };
+
+        if let Err(e) = watcher.watch(&watcher_path, notify::RecursiveMode::NonRecursive) {
+            error!(error = %e, "failed to watch config file");
+            return;
+        }
+
+        // Keep watcher alive for the duration of the loop.
+        let _watcher = watcher;
 
         loop {
-            tokio::time::sleep(self.poll_interval).await;
-
-            match self.check_and_reload() {
-                Ok(true) => {
-                    debug!("config change detected and broadcast");
+            match event_rx.recv().await {
+                Some(()) => {
+                    match self.check_and_reload() {
+                        Ok(true) => {
+                            debug!("config change detected and broadcast");
+                        }
+                        Ok(false) => {
+                            // No change — nothing to do.
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "config reload failed — keeping previous config");
+                        }
+                    }
                 }
-                Ok(false) => {
-                    // No change — nothing to do.
-                }
-                Err(e) => {
-                    warn!(error = %e, "config reload failed — keeping previous config");
+                None => {
+                    debug!("config watcher event channel closed — shutting down");
+                    break;
                 }
             }
         }
@@ -474,9 +499,8 @@ heartbeat_interval_secs = 15
 
         let (tx, mut rx) = new_broadcast(config);
 
-        // Spawn watcher with fast polling for tests.
-        let watcher = ConfigWatcher::new(path.clone(), tx)
-            .with_poll_interval(std::time::Duration::from_millis(50));
+        // Spawn watcher.
+        let watcher = ConfigWatcher::new(path.clone(), tx);
         let handle = tokio::spawn(watcher.run());
 
         // Give the watcher a moment to start.
@@ -487,7 +511,7 @@ heartbeat_interval_secs = 15
         atomic_write(&path, &config2).unwrap();
 
         // Wait for the change to propagate.
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
         assert!(rx.has_changed().unwrap());
         let new_cfg = rx.borrow_and_update();

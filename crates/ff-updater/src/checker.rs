@@ -92,6 +92,7 @@ pub struct CheckResult {
 pub struct UpdateChecker {
     config: CheckerConfig,
     last_check: Option<CheckResult>,
+    client: reqwest::Client,
 }
 
 impl UpdateChecker {
@@ -100,6 +101,7 @@ impl UpdateChecker {
         Self {
             config,
             last_check: None,
+            client: reqwest::Client::new(),
         }
     }
 
@@ -212,11 +214,7 @@ impl UpdateChecker {
         // Fetch remote SHA from GitHub
         let url = format!("https://api.github.com/repos/{github_repo}/commits/{branch}");
 
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .expect("build reqwest client");
-        let mut req = client
+        let mut req = self.client
             .get(&url)
             .header("User-Agent", "ForgeFleet-Updater")
             .header("Accept", "application/vnd.github.v3+json");

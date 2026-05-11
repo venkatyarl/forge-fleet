@@ -3,9 +3,9 @@ use std::path::Path;
 use crate::{CYAN, GREEN, RED, RESET, YELLOW, truncate_str};
 
 pub async fn handle_task(cmd: crate::TaskCommand, _config_path: &Path) -> Result<()> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()?;
+    static SHARED_HTTP: std::sync::LazyLock<reqwest::Client> =
+        std::sync::LazyLock::new(|| reqwest::Client::new());
+    let client = &*SHARED_HTTP;
     let base = "http://127.0.0.1:50002";
 
     match cmd {

@@ -137,7 +137,20 @@ echo 'ForgeFleet node setup complete'
 }
 
 /// NodeEnroll — register a node in fleet.toml and set up SSH keys.
-pub struct NodeEnrollTool;
+pub struct NodeEnrollTool {
+    client: reqwest::Client,
+}
+
+impl Default for NodeEnrollTool {
+    fn default() -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(3))
+                .build()
+                .unwrap_or_default(),
+        }
+    }
+}
 
 #[async_trait]
 impl AgentTool for NodeEnrollTool {
@@ -233,10 +246,8 @@ gpu_type = "{gpu}"
         steps.push("Fleet config entry generated".to_string());
 
         // Step 4: Check if LLM server is running
-        let llm_check = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(3))
-            .build()
-            .unwrap_or_default()
+        let llm_check = self
+            .client
             .get(format!("http://{ip}:{port}/health"))
             .send()
             .await;
@@ -331,7 +342,20 @@ impl AgentTool for ModelDeployTool {
 }
 
 /// FleetInventory — scan network and report all nodes with hardware details.
-pub struct FleetInventoryTool;
+pub struct FleetInventoryTool {
+    client: reqwest::Client,
+}
+
+impl Default for FleetInventoryTool {
+    fn default() -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(3))
+                .build()
+                .unwrap_or_default(),
+        }
+    }
+}
 
 #[async_trait]
 impl AgentTool for FleetInventoryTool {
@@ -373,11 +397,6 @@ impl AgentTool for FleetInventoryTool {
             return AgentToolResult::ok("No fleet nodes registered in the database.".to_string());
         }
 
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(3))
-            .build()
-            .unwrap_or_default();
-
         let mut inventory = Vec::new();
 
         for (name, ip) in &known_nodes {
@@ -386,7 +405,7 @@ impl AgentTool for FleetInventoryTool {
 
             for port in &ports {
                 let url = format!("http://{ip}:{port}/v1/models");
-                if let Ok(resp) = client.get(&url).send().await {
+                if let Ok(resp) = self.client.get(&url).send().await {
                     if resp.status().is_success()
                         && let Ok(body) = resp.text().await
                     {
@@ -431,7 +450,20 @@ impl AgentTool for FleetInventoryTool {
 }
 
 /// NodeHealthCheck — deep health check for a specific node.
-pub struct NodeHealthCheckTool;
+pub struct NodeHealthCheckTool {
+    client: reqwest::Client,
+}
+
+impl Default for NodeHealthCheckTool {
+    fn default() -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(3))
+                .build()
+                .unwrap_or_default(),
+        }
+    }
+}
 
 #[async_trait]
 impl AgentTool for NodeHealthCheckTool {
@@ -502,11 +534,8 @@ impl AgentTool for NodeHealthCheckTool {
         checks.push(format!("GPU: {}", gpu.lines().next().unwrap_or("unknown")));
 
         // LLM server health
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(3))
-            .build()
-            .unwrap_or_default();
-        let llm_health = client
+        let llm_health = self
+            .client
             .get(format!("http://{host}:{port}/health"))
             .send()
             .await;
@@ -519,7 +548,8 @@ impl AgentTool for NodeHealthCheckTool {
         ));
 
         // Models available
-        if let Ok(resp) = client
+        if let Ok(resp) = self
+            .client
             .get(format!("http://{host}:{port}/v1/models"))
             .send()
             .await

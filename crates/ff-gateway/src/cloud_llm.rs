@@ -25,8 +25,6 @@ use sqlx::PgPool;
 use ff_agent::cloud_llm_registry::{self, Provider};
 use ff_db::pg_get_secret;
 
-const CLOUD_TIMEOUT: Duration = Duration::from_secs(120);
-
 /// Max attempts when the upstream returns 429. Counts the initial call,
 /// so 3 = one call + two retries.
 const MAX_429_ATTEMPTS: usize = 3;
@@ -37,14 +35,6 @@ const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
 
 /// Default backoff when 429 came back without a `Retry-After` header.
 const DEFAULT_429_BACKOFF: Duration = Duration::from_secs(2);
-
-fn build_client() -> Client {
-    Client::builder()
-        .timeout(CLOUD_TIMEOUT)
-        .pool_idle_timeout(Duration::from_secs(60))
-        .build()
-        .expect("build reqwest client")
-}
 
 /// Send a request with retry-on-429. Honors `Retry-After` (capped at
 /// [`MAX_RETRY_AFTER`]) when present; falls back to
@@ -115,6 +105,7 @@ pub async fn try_route_to_cloud(
     model_id: &str,
     body: &Value,
     session_id: Option<&str>,
+    client: &reqwest::Client,
 ) -> Option<Result<Response<Body>, Response<Body>>> {
     let provider = match cloud_llm_registry::find_for_model(pool, model_id).await {
         Ok(Some(p)) => p,
@@ -242,7 +233,6 @@ pub async fn try_route_to_cloud(
     tracing::info!(provider = %provider.id, model = %model_id, format = %provider.request_format,
         "cloud_llm: routing to cloud provider (api_key=<redacted>)");
 
-    let client = build_client();
     let start = Instant::now();
     let streaming = body
         .get("stream")

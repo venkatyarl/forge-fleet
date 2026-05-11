@@ -19,10 +19,9 @@ pub async fn handle_stop() -> Result<()> {
 
     // Verify
     tokio::time::sleep(Duration::from_secs(1)).await;
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(1))
-        .build()?;
-    let still_running = client
+    static SHARED_HTTP: std::sync::LazyLock<reqwest::Client> =
+        std::sync::LazyLock::new(|| reqwest::Client::new());
+    let still_running = SHARED_HTTP
         .get(format!(
             "http://127.0.0.1:{}/health",
             ff_terminal::app::PORT_DAEMON
@@ -54,10 +53,9 @@ pub async fn handle_start(leader: bool, config_path: &Path, working_dir: &Path) 
     println!();
 
     // Check if daemon is already running (check web UI port — only daemon serves this)
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()?;
-    let daemon_running = client
+    static SHARED_HTTP: std::sync::LazyLock<reqwest::Client> =
+        std::sync::LazyLock::new(|| reqwest::Client::new());
+    let daemon_running = SHARED_HTTP
         .get(format!(
             "http://127.0.0.1:{}/health",
             ff_terminal::app::PORT_WEB
@@ -127,7 +125,7 @@ pub async fn handle_start(leader: bool, config_path: &Path, working_dir: &Path) 
                     tokio::time::sleep(Duration::from_secs(2)).await;
 
                     // Verify it's running
-                    let health = client
+                    let health = SHARED_HTTP
                         .get(format!(
                             "http://127.0.0.1:{}/health",
                             ff_terminal::app::PORT_DAEMON
@@ -169,7 +167,7 @@ pub async fn handle_start(leader: bool, config_path: &Path, working_dir: &Path) 
     ];
     let mut online = 0;
     for (name, ip) in &nodes {
-        let ok = client
+        let ok = SHARED_HTTP
             .get(format!("http://{ip}:51000/health"))
             .send()
             .await
@@ -252,11 +250,10 @@ pub fn find_daemon_binary(working_dir: &Path) -> Option<PathBuf> {
     None
 }
 pub async fn handle_models(c: &ff_agent::agent_loop::AgentSessionConfig) -> Result<()> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()?;
+    static SHARED_HTTP: std::sync::LazyLock<reqwest::Client> =
+        std::sync::LazyLock::new(|| reqwest::Client::new());
     let url = format!("{}/v1/models", c.llm_base_url.trim_end_matches('/'));
-    match client.get(&url).send().await {
+    match SHARED_HTTP.get(&url).send().await {
         Ok(r) => println!("{}", r.text().await.unwrap_or_default()),
         Err(e) => println!("{RED}Failed: {e}{RESET}"),
     }

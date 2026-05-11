@@ -37,7 +37,7 @@ impl AgentTool for DeepResearchTool {
 
         // Step 1: Search
         let search_input = json!({"query": topic, "max_results": max_sources});
-        let search = WebSearchTool;
+        let search = WebSearchTool::default();
         let search_result = search.execute(search_input, ctx).await;
 
         // Step 2: Compile report
@@ -51,7 +51,21 @@ impl AgentTool for DeepResearchTool {
 }
 
 /// Wikipedia lookup tool.
-pub struct WikiLookupTool;
+pub struct WikiLookupTool {
+    client: reqwest::Client,
+}
+
+impl Default for WikiLookupTool {
+    fn default() -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .user_agent("ForgeFleet-Agent/0.1")
+                .build()
+                .unwrap_or_default(),
+        }
+    }
+}
 
 #[async_trait]
 impl AgentTool for WikiLookupTool {
@@ -81,13 +95,7 @@ impl AgentTool for WikiLookupTool {
             topic.replace(' ', "_")
         );
 
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .user_agent("ForgeFleet-Agent/0.1")
-            .build()
-            .unwrap_or_default();
-
-        match client.get(&url).send().await {
+        match self.client.get(&url).send().await {
             Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
                 Ok(data) => {
                     let title = data.get("title").and_then(Value::as_str).unwrap_or(topic);
@@ -112,7 +120,20 @@ impl AgentTool for WikiLookupTool {
 }
 
 /// Scholar search tool — search academic papers.
-pub struct ScholarSearchTool;
+pub struct ScholarSearchTool {
+    client: reqwest::Client,
+}
+
+impl Default for ScholarSearchTool {
+    fn default() -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(15))
+                .build()
+                .unwrap_or_default(),
+        }
+    }
+}
 
 #[async_trait]
 impl AgentTool for ScholarSearchTool {
@@ -145,11 +166,7 @@ impl AgentTool for ScholarSearchTool {
             limit
         );
 
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(15))
-            .build()
-            .unwrap_or_default();
-        match client.get(&url).send().await {
+        match self.client.get(&url).send().await {
             Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
                 Ok(data) => {
                     let papers = data.get("data").and_then(Value::as_array);

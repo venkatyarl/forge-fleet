@@ -86,7 +86,11 @@ impl InferenceRouter {
     /// Probes each candidate endpoint via TCP within a short timeout and
     /// builds the ordered list. Always puts localhost first if reachable.
     pub async fn from_config(config_path: &Path) -> Self {
-        let endpoints = build_endpoint_list(config_path).await;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap_or_default();
+        let endpoints = build_endpoint_list(config_path, &client).await;
         info!(
             count = endpoints.len(),
             "InferenceRouter built: {}",
@@ -175,7 +179,7 @@ impl InferenceRouter {
 // ---------------------------------------------------------------------------
 
 /// Build the ordered endpoint list: local first, then fleet from Postgres.
-async fn build_endpoint_list(config_path: &Path) -> Vec<RouterEndpoint> {
+async fn build_endpoint_list(config_path: &Path, client: &reqwest::Client) -> Vec<RouterEndpoint> {
     let mut local: Vec<RouterEndpoint> = Vec::new();
     let mut remote: Vec<RouterEndpoint> = Vec::new();
 
@@ -184,7 +188,7 @@ async fn build_endpoint_list(config_path: &Path) -> Vec<RouterEndpoint> {
     for port in 55000u16..=55003 {
         if tcp_reachable("127.0.0.1", port).await {
             // Ask the server which model it's running so we can detect tool support.
-            let model_id = fetch_first_model_id(&format!("http://127.0.0.1:{port}")).await;
+            let model_id = fetch_first_model_id(&format!("http://127.0.0.1:{port}"), client).await;
             let supports_tools = model_supports_tools(&model_id);
             local.push(RouterEndpoint {
                 url: format!("http://127.0.0.1:{port}"),
@@ -324,12 +328,8 @@ async fn tcp_reachable(host: &str, port: u16) -> bool {
 }
 
 /// Query /v1/models and return the first model ID, or "auto" on error.
-async fn fetch_first_model_id(base_url: &str) -> String {
+async fn fetch_first_model_id(base_url: &str, client: &reqwest::Client) -> String {
     let url = format!("{}/v1/models", base_url.trim_end_matches('/'));
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .unwrap_or_default();
     if let Ok(resp) = client.get(&url).send().await
         && let Ok(body) = resp.text().await
         && let Ok(v) = serde_json::from_str::<serde_json::Value>(&body)

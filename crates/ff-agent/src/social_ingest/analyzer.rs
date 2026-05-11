@@ -43,11 +43,12 @@ const STRICT_PROMPT: &str = "Reply with ONLY a JSON object — no prose, no code
 
 /// Run the vision-LLM over every image/frame in `post` and roll up the
 /// results.
-pub async fn analyze(post: &FetchedPost, llm_endpoint: &str, model_id: &str) -> Result<Analysis> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(300))
-        .build()
-        .context("build reqwest client")?;
+pub async fn analyze(
+    client: &reqwest::Client,
+    post: &FetchedPost,
+    llm_endpoint: &str,
+    model_id: &str,
+) -> Result<Analysis> {
 
     let mut per_frame: Vec<FrameAnalysis> = Vec::new();
     for item in &post.media_items {

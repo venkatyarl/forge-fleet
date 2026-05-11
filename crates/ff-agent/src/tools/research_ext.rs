@@ -30,7 +30,7 @@ impl AgentTool for CompetitorAnalysisTool {
             return AgentToolResult::err("'competitor' required");
         }
 
-        let search = WebSearchTool;
+        let search = WebSearchTool::default();
         let search_result = search.execute(json!({"query": format!("{competitor} product features pricing"), "max_results": 5}), ctx).await;
 
         AgentToolResult::ok(format!(
@@ -47,7 +47,21 @@ impl AgentTool for CompetitorAnalysisTool {
     }
 }
 
-pub struct TrendAnalysisTool;
+pub struct TrendAnalysisTool {
+    client: reqwest::Client,
+}
+
+impl Default for TrendAnalysisTool {
+    fn default() -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap_or_default(),
+        }
+    }
+}
+
 #[async_trait]
 impl AgentTool for TrendAnalysisTool {
     fn name(&self) -> &str {
@@ -75,11 +89,7 @@ impl AgentTool for TrendAnalysisTool {
             "https://hn.algolia.com/api/v1/search?query={}&tags=story&hitsPerPage=5",
             urlenc(topic)
         );
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-            .unwrap_or_default();
-        if let Ok(resp) = client.get(&hn_url).send().await
+        if let Ok(resp) = self.client.get(&hn_url).send().await
             && let Ok(data) = resp.json::<Value>().await
             && let Some(hits) = data.get("hits").and_then(Value::as_array)
         {
@@ -97,7 +107,7 @@ impl AgentTool for TrendAnalysisTool {
             "https://api.github.com/search/repositories?q={}&sort=stars&order=desc&per_page=5",
             urlenc(topic)
         );
-        if let Ok(resp) = client
+        if let Ok(resp) = self.client
             .get(&gh_url)
             .header("User-Agent", "ForgeFleet")
             .send()
@@ -122,7 +132,7 @@ impl AgentTool for TrendAnalysisTool {
         }
 
         // Web search for broader trends
-        let search = WebSearchTool;
+        let search = WebSearchTool::default();
         let web_result = search
             .execute(
                 json!({"query": format!("{topic} trends 2026"), "max_results": 3}),
@@ -159,7 +169,7 @@ impl AgentTool for MarketResearchTool {
             return AgentToolResult::err("'market' required");
         }
 
-        let search = WebSearchTool;
+        let search = WebSearchTool::default();
         let result = search
             .execute(
                 json!({"query": format!("{market} market size growth 2026 TAM"), "max_results": 5}),

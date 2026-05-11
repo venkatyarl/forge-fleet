@@ -104,11 +104,15 @@ pub struct RollbackResult {
 /// Manages rollback to a previous binary version.
 pub struct RollbackManager {
     config: RollbackConfig,
+    client: reqwest::Client,
 }
 
 impl RollbackManager {
     pub fn new(config: RollbackConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            client: reqwest::Client::new(),
+        }
     }
 
     /// Get the backup file path.
@@ -205,10 +209,7 @@ impl RollbackManager {
 
     /// Run health checks with retries.
     async fn health_check(&self, url: &str) -> bool {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(self.config.health_check_timeout_secs))
-            .build()
-            .unwrap_or_default();
+        let client = &self.client;
 
         for attempt in 1..=self.config.health_check_retries {
             debug!(attempt, url, "health check attempt");

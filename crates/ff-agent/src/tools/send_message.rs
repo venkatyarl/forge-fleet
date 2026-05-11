@@ -6,7 +6,20 @@ use sqlx::Row;
 
 use super::{AgentTool, AgentToolContext, AgentToolResult};
 
-pub struct SendMessageTool;
+pub struct SendMessageTool {
+    client: reqwest::Client,
+}
+
+impl Default for SendMessageTool {
+    fn default() -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap_or_default(),
+        }
+    }
+}
 
 #[async_trait]
 impl AgentTool for SendMessageTool {
@@ -70,12 +83,7 @@ impl AgentTool for SendMessageTool {
             "timestamp": chrono::Utc::now().to_rfc3339(),
         });
 
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-            .unwrap_or_default();
-
-        match client.post(&target_url).json(&payload).send().await {
+        match self.client.post(&target_url).json(&payload).send().await {
             Ok(resp) if resp.status().is_success() => {
                 AgentToolResult::ok(format!("Message delivered to '{to}' ({})", resp.status()))
             }

@@ -4630,7 +4630,7 @@ async fn proxy_chat_completions(
         && let Some(pool) = store.pg_pool()
         && let Some(model) = raw_payload.get("model").and_then(|v| v.as_str())
         && let Some(result) =
-            crate::cloud_llm::try_route_to_cloud(pool, model, &raw_payload, None).await
+            crate::cloud_llm::try_route_to_cloud(pool, model, &raw_payload, None, &state.http_client).await
     {
         match result {
             Ok(resp) => return Ok(resp),

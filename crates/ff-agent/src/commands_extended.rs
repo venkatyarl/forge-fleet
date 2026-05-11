@@ -4,6 +4,7 @@
 use crate::agent_loop::AgentSession;
 use crate::commands::Command;
 use crate::compaction;
+use crate::notifications::SHARED_HTTP;
 use async_trait::async_trait;
 
 pub fn extended_commands() -> Vec<Box<dyn Command>> {
@@ -88,15 +89,16 @@ impl Command for DoctorCommand {
         let mut output = String::from("ForgeFleet Diagnostics\n\n");
 
         // Check LLM connectivity
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()
-            .unwrap_or_default();
         let health_url = format!(
             "{}/health",
             session.config.llm_base_url.trim_end_matches('/')
         );
-        match client.get(&health_url).send().await {
+        match SHARED_HTTP
+            .get(&health_url)
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+        {
             Ok(resp) if resp.status().is_success() => output.push_str(&format!(
                 "  LLM endpoint: OK ({})\n",
                 session.config.llm_base_url
@@ -453,10 +455,6 @@ impl Command for FleetCommand {
         "Show fleet node status"
     }
     async fn execute(&self, _args: &str, _session: &mut AgentSession) -> String {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(3))
-            .build()
-            .unwrap_or_default();
         let nodes = [
             ("Taylor", "192.168.5.100:55000"),
             ("Taylor-2", "192.168.5.100:55001"),
@@ -469,7 +467,12 @@ impl Command for FleetCommand {
         let mut output = String::from("Fleet LLM Status:\n\n");
         for (name, addr) in &nodes {
             let url = format!("http://{addr}/health");
-            let status = match client.get(&url).send().await {
+            let status = match SHARED_HTTP
+                .get(&url)
+                .timeout(std::time::Duration::from_secs(3))
+                .send()
+                .await
+            {
                 Ok(r) if r.status().is_success() => "ONLINE",
                 _ => "OFFLINE",
             };

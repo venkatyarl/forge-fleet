@@ -32,16 +32,15 @@ pub struct EndpointModelInfo {
 }
 
 /// Query a single OpenAI-compatible endpoint for available models via GET /v1/models.
-pub async fn query_models_endpoint(endpoint: &str, timeout: Duration) -> EndpointModelInfo {
+pub async fn query_models_endpoint(
+    endpoint: &str,
+    _timeout: Duration,
+    client: &reqwest::Client,
+) -> EndpointModelInfo {
     let endpoint = endpoint.trim_end_matches('/').to_string();
     let url = format!("{endpoint}/v1/models");
     let started = Instant::now();
     let queried_at = Utc::now();
-
-    let client = reqwest::Client::builder()
-        .timeout(timeout)
-        .build()
-        .expect("build reqwest client");
 
     match client.get(&url).send().await {
         Ok(response) => {
@@ -88,11 +87,16 @@ pub async fn query_models_endpoints(
     endpoints: &[String],
     timeout: Duration,
 ) -> Vec<EndpointModelInfo> {
+    let client = reqwest::Client::builder()
+        .timeout(timeout)
+        .build()
+        .expect("build reqwest client");
     let mut tasks = JoinSet::new();
 
     for endpoint in endpoints {
         let endpoint = endpoint.clone();
-        tasks.spawn(async move { query_models_endpoint(&endpoint, timeout).await });
+        let client = client.clone();
+        tasks.spawn(async move { query_models_endpoint(&endpoint, timeout, &client).await });
     }
 
     let mut results = Vec::with_capacity(endpoints.len());

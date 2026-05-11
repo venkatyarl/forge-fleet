@@ -69,20 +69,23 @@ pub struct UpstreamReport {
 /// Upstream revision checker for `model_catalog`.
 pub struct ModelUpstreamChecker {
     pg: PgPool,
+    client: reqwest::Client,
 }
 
 impl ModelUpstreamChecker {
     /// Build a checker with the given Postgres pool.
     pub fn new(pg: PgPool) -> Self {
-        Self { pg }
+        let client = reqwest::Client::builder()
+            .timeout(HTTP_TIMEOUT)
+            .user_agent(USER_AGENT)
+            .build()
+            .expect("build reqwest client");
+        Self { pg, client }
     }
 
     /// Run one pass over every eligible `model_catalog` row.
     pub async fn check_all(&self) -> Result<UpstreamReport, ModelUpstreamError> {
-        let http = reqwest::Client::builder()
-            .timeout(HTTP_TIMEOUT)
-            .user_agent(USER_AGENT)
-            .build()?;
+        let http = &self.client;
 
         // Optional HF token for gated repos / higher rate limit.
         let hf_token = ff_db::pg_get_secret(&self.pg, "huggingface_api_token")

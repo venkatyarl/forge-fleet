@@ -68,19 +68,22 @@ pub struct CheckDetail {
 /// Upstream checker for the external-tools catalog.
 pub struct ExternalToolsUpstreamChecker {
     pg: PgPool,
+    client: reqwest::Client,
 }
 
 impl ExternalToolsUpstreamChecker {
     pub fn new(pg: PgPool) -> Self {
-        Self { pg }
+        let client = reqwest::Client::builder()
+            .timeout(HTTP_TIMEOUT)
+            .user_agent(USER_AGENT)
+            .build()
+            .expect("build reqwest client");
+        Self { pg, client }
     }
 
     /// Run one pass over every `external_tools` row.
     pub async fn check_all(&self) -> Result<CheckReport, UpstreamError> {
-        let http = reqwest::Client::builder()
-            .timeout(HTTP_TIMEOUT)
-            .user_agent(USER_AGENT)
-            .build()?;
+        let http = &self.client;
 
         let github_token = ff_db::pg_get_secret(&self.pg, "github.venkat_pat")
             .await

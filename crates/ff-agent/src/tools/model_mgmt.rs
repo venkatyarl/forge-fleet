@@ -7,7 +7,20 @@ use tokio::process::Command;
 use super::{AgentTool, AgentToolContext, AgentToolResult};
 
 /// ModelBrowser — search and browse models from HuggingFace and Ollama.
-pub struct ModelBrowserTool;
+pub struct ModelBrowserTool {
+    client: reqwest::Client,
+}
+
+impl Default for ModelBrowserTool {
+    fn default() -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(15))
+                .build()
+                .unwrap_or_default(),
+        }
+    }
+}
 
 #[async_trait]
 impl AgentTool for ModelBrowserTool {
@@ -38,11 +51,7 @@ impl AgentTool for ModelBrowserTool {
                     "https://huggingface.co/api/models?search={}&sort=downloads&direction=-1&limit=10&filter=text-generation",
                     urlencoding(hf_query)
                 );
-                let client = reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_secs(15))
-                    .build()
-                    .unwrap_or_default();
-                match client.get(&url).send().await {
+                match self.client.get(&url).send().await {
                     Ok(resp) if resp.status().is_success() => {
                         match resp.json::<Vec<Value>>().await {
                             Ok(models) => {
@@ -83,12 +92,7 @@ impl AgentTool for ModelBrowserTool {
                         String::from_utf8_lossy(&out.stdout)
                     )),
                     _ => {
-                        // Try the Ollama library API
-                        let client = reqwest::Client::builder()
-                            .timeout(std::time::Duration::from_secs(10))
-                            .build()
-                            .unwrap_or_default();
-                        match client.get("https://ollama.com/api/tags").send().await {
+                        match self.client.get("https://ollama.com/api/tags").send().await {
                             Ok(resp) if resp.status().is_success() => AgentToolResult::ok("Ollama: Use 'ollama pull <model>' to download. Popular: qwen2.5-coder, llama3.2, gemma2, codestral, deepseek-coder-v2".to_string()),
                             _ => AgentToolResult::err(
                                 "Ollama not installed or API unreachable".to_string(),
@@ -100,10 +104,6 @@ impl AgentTool for ModelBrowserTool {
 
             "list_fleet" => {
                 // Query all fleet LLM endpoints
-                let client = reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_secs(3))
-                    .build()
-                    .unwrap_or_default();
                 let nodes = [
                     ("Taylor", "192.168.5.100:55000"),
                     ("Taylor-2", "192.168.5.100:55001"),
@@ -116,7 +116,7 @@ impl AgentTool for ModelBrowserTool {
                 let mut output = String::from("Fleet Models:\n\n");
                 for (name, addr) in &nodes {
                     let url = format!("http://{addr}/v1/models");
-                    match client.get(&url).send().await {
+                    match self.client.get(&url).send().await {
                         Ok(resp) if resp.status().is_success() => {
                             if let Ok(data) = resp.json::<Value>().await {
                                 let models: Vec<String> = data
@@ -147,11 +147,7 @@ impl AgentTool for ModelBrowserTool {
                 }
                 // Get model info from HuggingFace
                 let url = format!("https://huggingface.co/api/models/{query}");
-                let client = reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_secs(10))
-                    .build()
-                    .unwrap_or_default();
-                match client.get(&url).send().await {
+                match self.client.get(&url).send().await {
                     Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
                         Ok(model) => {
                             let id = model.get("id").and_then(Value::as_str).unwrap_or("?");

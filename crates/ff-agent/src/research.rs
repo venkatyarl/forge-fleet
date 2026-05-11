@@ -312,8 +312,13 @@ impl ResearchSession {
                 .await;
         }
 
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .expect("build reqwest client");
+
         // Phase 1 — planner decomposes the query.
-        let plan = self.plan().await.context("planner phase")?;
+        let plan = self.plan(&client).await.context("planner phase")?;
         self.store_plan(&plan).await?;
         if let Some(tx) = &progress {
             let _ = tx
@@ -353,12 +358,15 @@ impl ResearchSession {
             let endpoint = backend.endpoint.clone();
             let model = backend.model_id.clone();
             let row_id = row.id;
-            handles.push(tokio::spawn(async move {
-                let t0 = Instant::now();
-                let out = openai_single_completion(&endpoint, &model, &prompt, 8192)
-                    .await
-                    .map(|s| (s, t0.elapsed().as_millis() as u64));
-                (row_id, out)
+            handles.push(tokio::spawn({
+                let client = client.clone();
+                async move {
+                    let t0 = Instant::now();
+                    let out = openai_single_completion(&endpoint, &model, &prompt, 8192, &client)
+                        .await
+                        .map(|s| (s, t0.elapsed().as_millis() as u64));
+                    (row_id, out)
+                }
             }));
         }
 
@@ -419,7 +427,7 @@ impl ResearchSession {
         }
 
         let markdown = self
-            .synthesize(&plan, &subtask_rows, &results)
+            .synthesize(&plan, &subtask_rows, &results, &client)
             .await
             .context("synthesizer phase")?;
         let duration_ms = start.elapsed().as_millis() as u64;
@@ -469,7 +477,7 @@ impl ResearchSession {
 
     // ─── Planner turn ────────────────────────────────────────────────────
 
-    async fn plan(&self) -> Result<PlanDecomposition> {
+    async fn plan(&self, client: &reqwest::Client) -> Result<PlanDecomposition> {
         let prompt = format!(
             "You are the research planner for a multi-agent investigation.\n\n\
              The operator's question:\n{}\n\n\
@@ -496,6 +504,7 @@ impl ResearchSession {
             &self.config.planner_model,
             &prompt,
             16384,
+            client,
         )
         .await
         .context("planner OpenAI call")?;
@@ -772,6 +781,7 @@ impl ResearchSession {
         plan: &PlanDecomposition,
         subtasks: &[SubtaskRow],
         results: &[AgentTaskResult],
+        client: &reqwest::Client,
     ) -> Result<String> {
         let mut sub_section = String::new();
         for (row, result) in subtasks.iter().zip(results.iter()) {
@@ -829,6 +839,7 @@ impl ResearchSession {
             &self.config.planner_model, // reuse planner alias for synthesis
             &prompt,
             32768,
+            client,
         )
         .await
         .context("synthesizer OpenAI call")
@@ -883,6 +894,7 @@ async fn openai_single_completion(
     model: &str,
     prompt: &str,
     max_tokens: u32,
+    client: &reqwest::Client,
 ) -> Result<String> {
     let url = format!("{}/v1/chat/completions", gateway_url.trim_end_matches('/'));
     let body = json!({
@@ -891,10 +903,7 @@ async fn openai_single_completion(
         "max_tokens": max_tokens,
         "temperature": 0.2,
     });
-    let resp = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .expect("build reqwest client")
+    let resp = client
         .post(&url)
         .json(&body)
         .timeout(std::time::Duration::from_secs(600))

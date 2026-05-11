@@ -2236,12 +2236,12 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| "auto".into());
 
     // If model is "auto", query the LLM server for its actual model name
+    static SHARED_HTTP: std::sync::LazyLock<reqwest::Client> =
+        std::sync::LazyLock::new(|| reqwest::Client::new());
+
     if model == "auto" {
         let detect_url = format!("{}/v1/models", llm.trim_end_matches('/'));
-        match reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()
-            .unwrap_or_default()
+        match SHARED_HTTP
             .get(&detect_url)
             .send()
             .await
@@ -3262,10 +3262,8 @@ async fn run_tui(config: AgentSessionConfig) -> Result<()> {
 
 /// Check fleet node health on startup.
 async fn check_fleet_health(app: &mut App) {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .unwrap_or_default();
+    static SHARED_HTTP: std::sync::LazyLock<reqwest::Client> =
+        std::sync::LazyLock::new(|| reqwest::Client::new());
     for node in &mut app.fleet_nodes {
         // Check daemon
         let daemon_url = format!(
@@ -3273,7 +3271,7 @@ async fn check_fleet_health(app: &mut App) {
             node.ip,
             ff_terminal::app::PORT_DAEMON
         );
-        node.daemon_online = client
+        node.daemon_online = SHARED_HTTP
             .get(&daemon_url)
             .send()
             .await
@@ -3283,7 +3281,7 @@ async fn check_fleet_health(app: &mut App) {
         // Check each model endpoint
         for model in &mut node.models {
             let model_url = format!("http://{}:{}/health", node.ip, model.port);
-            model.online = client
+            model.online = SHARED_HTTP
                 .get(&model_url)
                 .send()
                 .await
@@ -3893,11 +3891,10 @@ pub fn kick_fleet_health_refresh(current_nodes: &[ff_terminal::app::FleetNode]) 
     // Snapshot the current node list so the background task can work without sharing &mut.
     let nodes_snapshot = current_nodes.to_vec();
 
+    static SHARED_HTTP: std::sync::LazyLock<reqwest::Client> =
+        std::sync::LazyLock::new(|| reqwest::Client::new());
+
     tokio::spawn(async move {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(2))
-            .build()
-            .unwrap_or_default();
         let mut refreshed = nodes_snapshot;
         for node in refreshed.iter_mut() {
             let daemon_url = format!(
@@ -3905,7 +3902,7 @@ pub fn kick_fleet_health_refresh(current_nodes: &[ff_terminal::app::FleetNode]) 
                 node.ip,
                 ff_terminal::app::PORT_DAEMON
             );
-            node.daemon_online = client
+            node.daemon_online = SHARED_HTTP
                 .get(&daemon_url)
                 .send()
                 .await
@@ -3913,7 +3910,7 @@ pub fn kick_fleet_health_refresh(current_nodes: &[ff_terminal::app::FleetNode]) 
                 .unwrap_or(false);
             for model in node.models.iter_mut() {
                 let model_url = format!("http://{}:{}/health", node.ip, model.port);
-                model.online = client
+                model.online = SHARED_HTTP
                     .get(&model_url)
                     .send()
                     .await

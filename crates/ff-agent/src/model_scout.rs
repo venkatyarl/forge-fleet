@@ -85,21 +85,24 @@ pub struct ScoutReport {
 /// Model scout.
 pub struct ModelScout {
     pg: PgPool,
+    client: reqwest::Client,
 }
 
 impl ModelScout {
     /// Build a scout with the given pool.
     pub fn new(pg: PgPool) -> Self {
-        Self { pg }
+        let client = reqwest::Client::builder()
+            .timeout(HTTP_TIMEOUT)
+            .user_agent(USER_AGENT)
+            .build()
+            .expect("build reqwest client");
+        Self { pg, client }
     }
 
     /// Run one scout pass. Returns a summary — no panics; any HF/DB
     /// error for a single task is logged and skipped.
     pub async fn scout_once(&self) -> Result<ScoutReport, ScoutError> {
-        let http = reqwest::Client::builder()
-            .timeout(HTTP_TIMEOUT)
-            .user_agent(USER_AGENT)
-            .build()?;
+        let http = &self.client;
 
         let hf_token = ff_db::pg_get_secret(&self.pg, "huggingface_api_token")
             .await

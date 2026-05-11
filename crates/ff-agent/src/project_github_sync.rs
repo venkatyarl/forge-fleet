@@ -66,22 +66,25 @@ pub struct SyncReport {
 /// GitHub sync worker. Owns a Postgres pool.
 pub struct GitHubSync {
     pg: PgPool,
+    client: reqwest::Client,
 }
 
 impl GitHubSync {
     /// Build a new sync worker.
     pub fn new(pg: PgPool) -> Self {
-        Self { pg }
+        let client = reqwest::Client::builder()
+            .timeout(HTTP_TIMEOUT)
+            .user_agent(USER_AGENT)
+            .build()
+            .expect("build reqwest client");
+        Self { pg, client }
     }
 
     /// Run one full pass: for every project with a `repo_url`, refresh main
     /// commit + branches + PR metadata. Errors on individual projects are
     /// captured in the returned [`SyncReport`] rather than returned as `Err`.
     pub async fn sync_all_projects(&self) -> Result<SyncReport, GitHubError> {
-        let http = reqwest::Client::builder()
-            .timeout(HTTP_TIMEOUT)
-            .user_agent(USER_AGENT)
-            .build()?;
+        let http = &self.client;
 
         let token = ff_db::pg_get_secret(&self.pg, "github.venkat_pat")
             .await

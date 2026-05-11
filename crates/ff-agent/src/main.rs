@@ -66,10 +66,15 @@ async fn main() -> anyhow::Result<()> {
 
     let http_handle = tokio::spawn(run_http_server(config.http_port, http_ctx, http_cancel));
 
+    let registry_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .unwrap_or_default();
     let registry_handle = tokio::spawn(run_tool_registry_reporter(
         config.node_id.clone(),
         config.leader_url.clone(),
         cancel.clone(),
+        registry_client,
     ));
 
     let health_handle = tokio::spawn(run_health_reporter(
@@ -181,6 +186,7 @@ async fn run_tool_registry_reporter(
     node_id: String,
     leader_url: String,
     cancel: CancellationToken,
+    client: reqwest::Client,
 ) {
     // Wait a bit for the gateway to be fully up
     tokio::select! {
@@ -195,17 +201,6 @@ async fn run_tool_registry_reporter(
             .replace(":50000", ":51002")
     } else {
         "http://192.168.5.100:51002".to_string()
-    };
-
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            warn!(error = %e, "failed to build HTTP client for tool registry");
-            return;
-        }
     };
 
     // Build tool registration payload from actual tool implementations

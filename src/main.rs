@@ -347,19 +347,13 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
     {
         let name = node_name.clone();
         let shutdown = shutdown_rx.clone();
+        let tool_registry_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .unwrap_or_default();
         subsystem_tasks.push(tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(10)).await;
             let gateway = "http://127.0.0.1:51002".to_string();
-            let client = match reqwest::Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-            {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!(error = %e, "failed to build HTTP client for tool registry");
-                    return;
-                }
-            };
             // Initial registration
             let tools: Vec<serde_json::Value> = ff_agent::tools::all_tools_arc()
                 .iter()
@@ -376,7 +370,7 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
                 "node_name": name,
                 "tools": tools,
             });
-            match client
+            match tool_registry_client
                 .post(format!("{}/api/tools/register", gateway))
                 .json(&register_body)
                 .send()
@@ -394,7 +388,7 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
-                        let _ = client.post(format!("{}/api/tools/heartbeat", gateway))
+                        let _ = tool_registry_client.post(format!("{}/api/tools/heartbeat", gateway))
                             .json(&serde_json::json!({"node_name": name}))
                             .send().await;
                     }
@@ -1144,12 +1138,8 @@ async fn announce_leader_to_fleet(
     leader_name: &str,
     config: &FleetConfig,
     registry: &NodeRegistry,
+    client: &reqwest::Client,
 ) {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(3))
-        .build()
-        .expect("build reqwest client");
-
     let payload = serde_json::json!({
         "leader": leader_name,
         "announced_at": chrono::Utc::now().to_rfc3339(),
@@ -1205,6 +1195,10 @@ fn start_leader_election_subsystem(
         let mut ticker = tokio::time::interval(election_interval);
         let mut current_leader: Option<String> = None;
         let mut initial_election_done = false;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap_or_default();
 
         loop {
             tokio::select! {
@@ -1227,7 +1221,7 @@ fn start_leader_election_subsystem(
                                 "initial leader election completed"
                             );
                             current_leader = Some(elected.clone());
-                            announce_leader_to_fleet(elected, &config, &registry).await;
+                            announce_leader_to_fleet(elected, &config, &registry, &client).await;
                         } else {
                             warn!(
                                 reason = %result.reason,
@@ -1250,7 +1244,7 @@ fn start_leader_election_subsystem(
                                         "leader change detected"
                                     );
                                     current_leader = Some(new_leader.clone());
-                                    announce_leader_to_fleet(new_leader, &config, &registry).await;
+                                    announce_leader_to_fleet(new_leader, &config, &registry, &client).await;
                                 }
                     } else {
                         // No current leader — try to elect one.
@@ -1262,7 +1256,7 @@ fn start_leader_election_subsystem(
                                 "leader elected (was none)"
                             );
                             current_leader = Some(elected.clone());
-                            announce_leader_to_fleet(elected, &config, &registry).await;
+                            announce_leader_to_fleet(elected, &config, &registry, &client).await;
                         }
                     }
                 }
@@ -1780,17 +1774,16 @@ fn start_self_heal_subsystem(
                         nodes
                     };
 
-                    let http = reqwest::Client::builder()
+                    let mut fleet_healthy = 0u32;
+                    let mut fleet_issues = Vec::new();
+                    let client = reqwest::Client::builder()
                         .timeout(Duration::from_secs(5))
                         .build()
                         .unwrap_or_default();
 
-                    let mut fleet_healthy = 0u32;
-                    let mut fleet_issues = Vec::new();
-
                     for (name, ip, restart_cmd) in &fleet_nodes {
                         let url = format!("http://{}:55000/health", ip);
-                        match http.get(&url).send().await {
+                        match client.get(&url).send().await {
                             Ok(r) if r.status().is_success() => { fleet_healthy += 1; }
                             _ => {
                                 fleet_issues.push(format!("{name} ({ip})"));

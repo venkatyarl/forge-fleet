@@ -1,7 +1,6 @@
 //! `ff cloud-llm` subcommand implementations.
 
 use std::io;
-use std::time::Duration;
 
 use anyhow::{Context, Result};
 
@@ -235,10 +234,9 @@ pub async fn handle_cloud_llm_test(
         provider.id, provider.request_format, probe_model,
     );
 
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .unwrap_or_default();
+    static SHARED_HTTP: std::sync::LazyLock<reqwest::Client> =
+        std::sync::LazyLock::new(|| reqwest::Client::new());
+    let http = &*SHARED_HTTP;
 
     let wire_model = if provider.request_format == "google_generate_content" {
         probe_model
@@ -250,7 +248,7 @@ pub async fn handle_cloud_llm_test(
     };
 
     let result = probe_cloud_provider(
-        &http,
+        http,
         &provider.request_format,
         &provider.base_url,
         &api_key,

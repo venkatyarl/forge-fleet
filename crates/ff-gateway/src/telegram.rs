@@ -52,6 +52,11 @@ impl TelegramClient {
         self
     }
 
+    /// Borrow the underlying HTTP client.
+    pub fn http_client(&self) -> &reqwest::Client {
+        &self.http_client
+    }
+
     pub async fn set_webhook(&self, webhook_url: &str) -> Result<(), TelegramError> {
         let payload = json!({
             "url": webhook_url,

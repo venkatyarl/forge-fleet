@@ -7,6 +7,9 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
+pub(crate) static SHARED_HTTP: std::sync::LazyLock<reqwest::Client> =
+    std::sync::LazyLock::new(|| reqwest::Client::new());
+
 /// Notification event types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -134,11 +137,10 @@ async fn send_desktop_notification(title: &str, message: &str) {
 }
 
 async fn send_webhook(url: &str, headers: &HashMap<String, String>, notification: &Notification) {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .expect("build reqwest client");
-    let mut req = client.post(url).json(notification);
+    let mut req = SHARED_HTTP
+        .post(url)
+        .json(notification)
+        .timeout(std::time::Duration::from_secs(30));
     for (k, v) in headers {
         req = req.header(k.as_str(), v.as_str());
     }
@@ -151,11 +153,13 @@ async fn send_slack(webhook_url: &str, notification: &Notification) {
     let payload = serde_json::json!({
         "text": format!("*{}*\n{}", notification.title, notification.message),
     });
-    let client = reqwest::Client::builder()
+    if let Err(e) = SHARED_HTTP
+        .post(webhook_url)
+        .json(&payload)
         .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .expect("build reqwest client");
-    if let Err(e) = client.post(webhook_url).json(&payload).send().await {
+        .send()
+        .await
+    {
         warn!(error = %e, "slack notification failed");
     }
 }
@@ -164,11 +168,13 @@ async fn send_discord(webhook_url: &str, notification: &Notification) {
     let payload = serde_json::json!({
         "content": format!("**{}**\n{}", notification.title, notification.message),
     });
-    let client = reqwest::Client::builder()
+    if let Err(e) = SHARED_HTTP
+        .post(webhook_url)
+        .json(&payload)
         .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .expect("build reqwest client");
-    if let Err(e) = client.post(webhook_url).json(&payload).send().await {
+        .send()
+        .await
+    {
         warn!(error = %e, "discord notification failed");
     }
 }
@@ -180,11 +186,13 @@ async fn send_telegram(bot_token: &str, chat_id: &str, notification: &Notificati
         "text": format!("*{}*\n{}", notification.title, notification.message),
         "parse_mode": "Markdown",
     });
-    let client = reqwest::Client::builder()
+    if let Err(e) = SHARED_HTTP
+        .post(&url)
+        .json(&payload)
         .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .expect("build reqwest client");
-    if let Err(e) = client.post(&url).json(&payload).send().await {
+        .send()
+        .await
+    {
         warn!(error = %e, "telegram notification failed");
     }
 }
