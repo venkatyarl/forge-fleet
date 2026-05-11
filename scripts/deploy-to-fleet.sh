@@ -3,10 +3,16 @@
 # ========================================
 # Builds release binary and deploys to all reachable fleet nodes.
 #
+# Node discovery (in order):
+#   1. Postgres fleet_nodes table
+#   2. ~/.ssh/config (fleet host entries)
+#   3. ~/.forgefleet/fleet.json
+#   4. --nodes CLI override
+#
 # Usage:
 #   ./scripts/deploy-to-fleet.sh
-#   ./scripts/deploy-to-fleet.sh --dry-run    # Show what would be deployed
-#   ./scripts/deploy-to-fleet.sh --nodes n1,n2,n3  # Deploy to specific nodes
+#   ./scripts/deploy-to-fleet.sh --dry-run
+#   ./scripts/deploy-to-fleet.sh --nodes n1,n2,n3
 
 set -euo pipefail
 
@@ -80,16 +86,84 @@ ok "Binary ready: $BINARY_PATH ($BINARY_SIZE)"
 
 # ─── Discover fleet nodes ────────────────────────────────────────────────────
 
+discover_nodes() {
+    local nodes=()
+
+    # 1. Try Postgres fleet_nodes
+    if command -v python3 >/dev/null && command -v psql >/dev/null 2>&1; then
+        while IFS= read -r ip; do
+            [[ -n "$ip" ]] && nodes+=("$ip")
+        done < <(python3 -c "
+import psycopg2, os, sys
+try:
+    conn = psycopg2.connect(os.environ.get('PGURL','postgresql://forgefleet:forgefleet@192.168.5.100:55432/forgefleet'))
+    cur = conn.cursor()
+    cur.execute('SELECT ip FROM fleet_nodes ORDER BY name')
+    for r in cur.fetchall():
+        print(r[0])
+except Exception as e:
+    sys.exit(1)
+" 2>/dev/null)
+        if [[ ${#nodes[@]} -gt 0 ]]; then
+            info "Discovered ${#nodes[@]} node(s) from Postgres fleet_nodes"
+            printf '%s\n' "${nodes[@]}"
+            return 0
+        fi
+    fi
+
+    # 2. Try ~/.ssh/config fleet entries
+    if [[ -f "$HOME/.ssh/config" ]]; then
+        while IFS= read -r ip; do
+            [[ -n "$ip" ]] && nodes+=("$ip")
+        done < <(awk '
+        /^Host[ \t]+/ {
+            host = $2
+            hostname = ""
+        }
+        /[ \t]*HostName[ \t]+/ { hostname = $2 }
+        host && hostname && host !~ /\*/ && host !~ /^github/ {
+            print hostname
+            host = ""
+        }
+        ' "$HOME/.ssh/config" | sort -u)
+        if [[ ${#nodes[@]} -gt 0 ]]; then
+            info "Discovered ${#nodes[@]} node(s) from ~/.ssh/config"
+            printf '%s\n' "${nodes[@]}"
+            return 0
+        fi
+    fi
+
+    # 3. Try ~/.forgefleet/fleet.json
+    if [[ -f "$HOME/.forgefleet/fleet.json" ]]; then
+        while IFS= read -r ip; do
+            [[ -n "$ip" ]] && nodes+=("$ip")
+        done < <(python3 -c "
+import sys, json
+try:
+    with open('$HOME/.forgefleet/fleet.json') as f:
+        data = json.load(f)
+    for n in data.get('nodes', []):
+        print(n.get('ip',''))
+except Exception:
+    pass
+" 2>/dev/null)
+        if [[ ${#nodes[@]} -gt 0 ]]; then
+            info "Discovered ${#nodes[@]} node(s) from ~/.forgefleet/fleet.json"
+            printf '%s\n' "${nodes[@]}"
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+NODE_LIST=()
 if [[ -n "$NODES" ]]; then
     IFS=',' read -ra NODE_LIST <<< "$NODES"
 else
-    # Try to discover nodes from the local daemon
-    info "Discovering fleet nodes from local daemon..."
-    NODE_LIST=()
     while IFS= read -r ip; do
         [[ -n "$ip" ]] && NODE_LIST+=("$ip")
-    done < <(curl -s http://127.0.0.1:51002/api/fleet/status 2>/dev/null | \
-        python3 -c "import sys,json; [print(n['ip']) for n in json.load(sys.stdin).get('nodes',[])]" 2>/dev/null || true)
+    done < <(discover_nodes)
 fi
 
 if [[ ${#NODE_LIST[@]} -eq 0 ]]; then
