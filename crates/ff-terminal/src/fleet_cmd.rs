@@ -1145,7 +1145,7 @@ async fn remove_computer_core(pool: &sqlx::PgPool, name: &str) -> Result<RemoveC
         .await?;
     report.leader_state_rows = r.rows_affected();
 
-    // fleet_nodes cascades: fleet_node_ssh_keys, fleet_model_library,
+    // fleet_nodes cascades: fleet_workers_ssh_keys, fleet_model_library,
     // fleet_model_deployments, fleet_disk_usage (all ON DELETE CASCADE).
     let r = sqlx::query("DELETE FROM fleet_nodes WHERE name = $1")
         .bind(name)
@@ -1168,7 +1168,7 @@ async fn remove_computer_core(pool: &sqlx::PgPool, name: &str) -> Result<RemoveC
     // offline or the operator running this from a non-leader. Payload is a
     // shell script that invokes `ff fleet revoke-trust`, which re-reads the
     // (now-deleted) key from fleet_ssh_revocations… wait — the key is gone
-    // with fleet_node_ssh_keys. So we have to embed the pubkey in the task
+    // with fleet_workers_ssh_keys. So we have to embed the pubkey in the task
     // payload BEFORE the deletion. That requires a pre-delete lookup — do it
     // via a follow-up patch if the existing trust manager can't cope. For
     // now, fan out a best-effort `ff fleet revoke-trust` which is a no-op on
@@ -1281,7 +1281,7 @@ pub async fn handle_fleet_remove_computer(
     } else {
         println!("  computers row:    (none)");
     }
-    println!("  cascades:         fleet_node_ssh_keys, fleet_model_library,");
+    println!("  cascades:         fleet_workers_ssh_keys, fleet_model_library,");
     println!("                    fleet_model_deployments, fleet_disk_usage,");
     println!("                    computer_software, computer_models,");
     println!("                    computer_model_deployments, computer_trust,");

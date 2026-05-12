@@ -6280,3 +6280,43 @@ CREATE INDEX IF NOT EXISTS idx_tool_audit_tool ON tool_audit_log(tool_name);
 CREATE INDEX IF NOT EXISTS idx_tool_audit_outcome ON tool_audit_log(outcome);
 CREATE INDEX IF NOT EXISTS idx_tool_audit_created ON tool_audit_log(created_at);
 "#;
+
+pub const SCHEMA_V82_RENAME_FLEET_NODE_SSH_KEYS: &str = r#"
+-- ─── V82: rename fleet_node_ssh_keys → fleet_workers_ssh_keys ──────────────
+-- Aligns the table name with the broader fleet_nodes → fleet_workers rename
+-- target (see memory: fleet_workers_naming). The underlying FK still points
+-- at fleet_nodes(name) until that table is renamed in a later migration.
+--
+-- Idempotent: skips work if the new table already exists OR the old table is
+-- missing (e.g., on a fresh install that ran V12 with the new name).
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.tables
+               WHERE table_schema = 'public' AND table_name = 'fleet_node_ssh_keys')
+       AND NOT EXISTS (SELECT 1 FROM information_schema.tables
+               WHERE table_schema = 'public' AND table_name = 'fleet_workers_ssh_keys')
+    THEN
+        ALTER TABLE fleet_node_ssh_keys RENAME TO fleet_workers_ssh_keys;
+        ALTER INDEX IF EXISTS idx_ssh_keys_node_purpose
+            RENAME TO idx_workers_ssh_keys_node_purpose;
+    END IF;
+END $$;
+
+-- If a fresh install never had the old name, create the new table directly.
+CREATE TABLE IF NOT EXISTS fleet_workers_ssh_keys (
+    node_name    TEXT NOT NULL REFERENCES fleet_nodes(name) ON DELETE CASCADE,
+    key_purpose  TEXT NOT NULL,
+    public_key   TEXT NOT NULL,
+    key_type     TEXT NOT NULL,
+    fingerprint  TEXT NOT NULL,
+    added_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (node_name, fingerprint)
+);
+CREATE INDEX IF NOT EXISTS idx_workers_ssh_keys_node_purpose
+    ON fleet_workers_ssh_keys (node_name, key_purpose);
+
+-- Compatibility view for callers still on the old name during the upgrade
+-- window. Dropped in a future migration once all daemons have been pushed.
+CREATE OR REPLACE VIEW fleet_node_ssh_keys AS
+    SELECT * FROM fleet_workers_ssh_keys;
+"#;

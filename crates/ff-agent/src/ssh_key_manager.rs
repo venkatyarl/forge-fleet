@@ -86,7 +86,7 @@ impl SshKeyManager {
     ) -> Result<RevocationReport, SshError> {
         // 1. Look up the revoked node's user key.
         let key_row = sqlx::query(
-            "SELECT public_key, fingerprint FROM fleet_node_ssh_keys
+            "SELECT public_key, fingerprint FROM fleet_workers_ssh_keys
               WHERE node_name = $1 AND key_purpose = 'user'
               ORDER BY added_at DESC
               LIMIT 1",
@@ -204,7 +204,7 @@ impl SshKeyManager {
     /// Currently unimplemented — this phase only wires up revocation.
     /// Full rotation requires:
     ///   1. `ssh <target> "ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_ed25519.new"`
-    ///   2. Read new pubkey back, insert into `fleet_node_ssh_keys`.
+    ///   2. Read new pubkey back, insert into `fleet_workers_ssh_keys`.
     ///   3. Distribute pubkey to every peer's `authorized_keys`.
     ///   4. Atomically swap `.new` → primary on the target.
     ///   5. Verify new key works by probing each peer.

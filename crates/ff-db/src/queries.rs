@@ -2449,7 +2449,7 @@ pub async fn pg_insert_node_ssh_key(
     fingerprint: &str,
 ) -> Result<()> {
     sqlx::query(
-        "INSERT INTO fleet_node_ssh_keys (node_name, key_purpose, public_key, key_type, fingerprint)
+        "INSERT INTO fleet_workers_ssh_keys (node_name, key_purpose, public_key, key_type, fingerprint)
          VALUES ($1, $2, $3, $4, $5)
          ON CONFLICT (node_name, fingerprint) DO UPDATE SET
             public_key = EXCLUDED.public_key,
@@ -2474,7 +2474,7 @@ pub async fn pg_list_node_ssh_keys(
 ) -> Result<Vec<NodeSshKeyRow>> {
     let rows = if let Some(p) = purpose {
         sqlx::query(
-            "SELECT * FROM fleet_node_ssh_keys
+            "SELECT * FROM fleet_workers_ssh_keys
               WHERE node_name = $1 AND key_purpose = $2
               ORDER BY added_at
               LIMIT 100",
@@ -2485,7 +2485,7 @@ pub async fn pg_list_node_ssh_keys(
         .await?
     } else {
         sqlx::query(
-            "SELECT * FROM fleet_node_ssh_keys WHERE node_name = $1 ORDER BY added_at LIMIT 100",
+            "SELECT * FROM fleet_workers_ssh_keys WHERE node_name = $1 ORDER BY added_at LIMIT 100",
         )
         .bind(node_name)
         .fetch_all(pool)
@@ -2506,7 +2506,7 @@ pub async fn pg_list_node_ssh_keys(
 
 /// Delete all SSH keys for a node (used during `ff onboard revoke`).
 pub async fn pg_delete_node_ssh_keys(pool: &PgPool, node_name: &str) -> Result<u64> {
-    let r = sqlx::query("DELETE FROM fleet_node_ssh_keys WHERE node_name = $1")
+    let r = sqlx::query("DELETE FROM fleet_workers_ssh_keys WHERE node_name = $1")
         .bind(node_name)
         .execute(pool)
         .await?;
