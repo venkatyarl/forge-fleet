@@ -283,6 +283,8 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         scan_targets,
         registry.clone(),
         shutdown_rx.clone(),
+        Duration::from_secs(config.discovery.subnet_scan_interval_secs),
+        config.discovery.subnet_scan_enabled,
     ));
 
     // 2) leader election — periodic election using discovery data
@@ -1076,9 +1078,19 @@ fn start_discovery_subsystem(
     scan_targets: Vec<ScanTarget>,
     registry: Arc<NodeRegistry>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    subnet_scan_interval: Duration,
+    subnet_scan_enabled: bool,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(Duration::from_secs(30));
+        let mut health_ticker = tokio::time::interval(Duration::from_secs(30));
+        let mut subnet_ticker = if subnet_scan_enabled {
+            let mut t = tokio::time::interval(subnet_scan_interval);
+            // Ensure the first tick fires after the interval, not immediately.
+            t.reset();
+            Some(t)
+        } else {
+            None
+        };
         let node_scanner = NodeScanner::new(scan_targets);
 
         // Stale threshold: 90 seconds without heartbeat.
@@ -1086,7 +1098,7 @@ fn start_discovery_subsystem(
 
         loop {
             tokio::select! {
-                _ = ticker.tick() => {
+                _ = health_ticker.tick() => {
                     // 1) Fleet node health scan (HTTP /health).
                     let scan_results = node_scanner.scan_once().await;
                     let online = scan_results.iter().filter(|r| r.status == ff_discovery::NodeScanStatus::Online).count();
@@ -1102,6 +1114,18 @@ fn start_discovery_subsystem(
                         "fleet node scan completed"
                     );
 
+                    // 3) Mark stale nodes.
+                    let stale = registry.mark_stale_nodes(stale_threshold_secs);
+                    if !stale.is_empty() {
+                        warn!(stale_nodes = ?stale, "marked nodes as stale (no heartbeat > 90s)");
+                    }
+                }
+                _ = async {
+                    match subnet_ticker.as_mut() {
+                        Some(t) => t.tick().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
                     // 2) Subnet scan for new/unknown nodes.
                     match scan_subnet(&scanner_config).await {
                         Ok(nodes) => {
@@ -1112,12 +1136,6 @@ fn start_discovery_subsystem(
                         Err(err) => {
                             warn!(error = %err, "subnet discovery scan failed");
                         }
-                    }
-
-                    // 3) Mark stale nodes.
-                    let stale = registry.mark_stale_nodes(stale_threshold_secs);
-                    if !stale.is_empty() {
-                        warn!(stale_nodes = ?stale, "marked nodes as stale (no heartbeat > 90s)");
                     }
                 }
                 changed = shutdown_rx.changed() => {

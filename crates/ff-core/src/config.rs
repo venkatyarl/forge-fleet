@@ -111,6 +111,10 @@ pub struct FleetConfig {
     #[serde(default)]
     pub leader: LeaderConfig,
 
+    /// Discovery and subnet scanning settings — `[discovery]`.
+    #[serde(default)]
+    pub discovery: DiscoveryConfig,
+
     /// Standalone model definitions — backward compat for programmatic construction.
     /// Real fleet.toml nests models under `[nodes.<name>.models.<slug>]`.
     #[serde(default)]
@@ -137,6 +141,7 @@ impl Default for FleetConfig {
             redis: RedisConfig::default(),
             bootstrap_targets: vec![],
             leader: LeaderConfig::default(),
+            discovery: DiscoveryConfig::default(),
             models: vec![],
         }
     }
@@ -199,19 +204,6 @@ pub struct FleetSettings {
     pub api_port: u16,
 }
 
-impl Default for FleetSettings {
-    fn default() -> Self {
-        Self {
-            name: default_fleet_name(),
-            version: None,
-            default_repo: None,
-            heartbeat_interval_secs: default_heartbeat_interval(),
-            heartbeat_timeout_secs: default_heartbeat_timeout(),
-            api_port: default_api_port(),
-        }
-    }
-}
-
 /// Backward-compatible type alias.
 pub type GeneralConfig = FleetSettings;
 
@@ -226,6 +218,50 @@ fn default_heartbeat_timeout() -> u64 {
 }
 fn default_api_port() -> u16 {
     51000
+}
+
+impl Default for FleetSettings {
+    fn default() -> Self {
+        Self {
+            name: default_fleet_name(),
+            version: None,
+            default_repo: None,
+            heartbeat_interval_secs: default_heartbeat_interval(),
+            heartbeat_timeout_secs: default_heartbeat_timeout(),
+            api_port: default_api_port(),
+        }
+    }
+}
+
+// ── DiscoveryConfig (maps to [discovery]) ────────────────────────────────────
+
+/// Discovery/subnet scanning settings from `[discovery]` in fleet.toml.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscoveryConfig {
+    /// Interval in seconds between subnet scans for new/unknown nodes.
+    #[serde(default = "default_subnet_scan_interval")]
+    pub subnet_scan_interval_secs: u64,
+
+    /// Whether subnet scanning is enabled at all.
+    /// Disabling this avoids thousands of TCP probes on large subnets.
+    #[serde(default = "default_subnet_scan_enabled")]
+    pub subnet_scan_enabled: bool,
+}
+
+impl Default for DiscoveryConfig {
+    fn default() -> Self {
+        Self {
+            subnet_scan_interval_secs: default_subnet_scan_interval(),
+            subnet_scan_enabled: default_subnet_scan_enabled(),
+        }
+    }
+}
+
+fn default_subnet_scan_interval() -> u64 {
+    300
+}
+fn default_subnet_scan_enabled() -> bool {
+    false
 }
 
 // ── NodeConfig (maps to [nodes.<name>]) ──────────────────────────────────────

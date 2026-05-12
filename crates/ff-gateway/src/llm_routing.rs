@@ -1164,7 +1164,13 @@ impl LlmRoutingCache {
                             tracing::warn!(error = %e, "llm routing cache: warmer tick failed");
                         }
                     }
-                    _ = poke_rx.recv() => {
+                    maybe_poke = poke_rx.recv() => {
+                        if maybe_poke.is_none() {
+                            // Channel closed (sender dropped). Stop listening for
+                            // pokes and let the periodic ticker carry on alone.
+                            tracing::debug!("llm routing cache: poke channel closed; disabling pub/sub-driven ticks");
+                            break;
+                        }
                         let elapsed = last_poke_tick.elapsed();
                         if elapsed < POKE_RATE_LIMIT {
                             // Drop — the periodic ticker will catch this within WARMER_INTERVAL.

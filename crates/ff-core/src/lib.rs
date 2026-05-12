@@ -18,6 +18,7 @@ pub mod circuit_breaker;
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod fleet_resolver;
 pub mod hardware;
 pub mod leader;
 pub mod maintenance;
@@ -42,6 +43,9 @@ pub use circuit_breaker::{
     CircuitBreakerSnapshot, CircuitState,
 };
 pub use error::{ForgeFleetError, Result};
+pub use fleet_resolver::{
+    FleetNodeInfo, FleetResolveError, FleetResolver, resolve_fleet_nodes, resolve_fleet_nodes_sync,
+};
 pub use maintenance::{MaintenanceEntry, MaintenanceManager, MaintenancePhase, MaintenanceWindow};
 pub use monitor::{
     AlertCondition, DiskMonitor, FleetMonitor, ModelMonitor, MonitorAlert, MonitorSettings,

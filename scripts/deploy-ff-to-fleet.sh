@@ -4,115 +4,33 @@
 # Strategy: SSH to each node, git pull, cargo build -p ff-terminal --release,
 # install to ~/.local/bin/ff, deploy the systemd service for ff daemon.
 #
-# Runs builds in parallel. Apple Silicon nodes (Taylor, Ace, James per DB)
-# are skipped — those must be built locally on each Mac.
+# Runs builds in parallel. Apple Silicon nodes are skipped — those must be
+# built locally on each Mac.
 #
-# Node discovery (in order):
-#   1. Postgres fleet_nodes table
-#   2. ~/.ssh/config (fleet host entries)
-#   3. ~/.forgefleet/fleet.json
+# Node discovery is delegated to scripts/lib/fleet.sh (canonical resolver).
 
 set -u
 
-PGURL="${PGURL:-postgresql://forgefleet:forgefleet@192.168.5.100:55432/forgefleet}"
-
-if ! command -v python3 >/dev/null; then
-    echo "python3 required" >&2
-    exit 1
-fi
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/lib/fleet.sh"
 
 # ─── Resolve node list ──────────────────────────────────────────────────────
 
 NODES=()
-
-# 1. Try Postgres fleet_nodes
-while IFS= read -r line; do
-    [ -n "$line" ] && NODES+=("$line")
-done < <(python3 -c "
-import psycopg2, os
-conn = psycopg2.connect(os.environ['PGURL'])
-cur = conn.cursor()
-cur.execute('''
-    SELECT name, ip, ssh_user, runtime FROM fleet_nodes
-     WHERE LOWER(os) NOT LIKE 'macos%'
-     ORDER BY election_priority, name
-''')
-for r in cur.fetchall():
-    print(f'{r[0]}|{r[1]}|{r[2]}')
-" 2>/dev/null)
-
-# 2. Fallback to ~/.ssh/config
-if [[ ${#NODES[@]} -eq 0 && -f "$HOME/.ssh/config" ]]; then
-    while IFS= read -r line; do
-        [ -n "$line" ] && NODES+=("$line")
-    done < <(python3 -c "
-import re, os
-
-hosts = []
-current = {}
-with open(os.path.expanduser('~/.ssh/config')) as f:
-    for line in f:
-        line = line.strip()
-        if not line or line.startswith('#'):
-            continue
-        m = re.match(r'Host\s+(\S+)', line)
-        if m:
-            if current.get('host') and current.get('hostname') and current.get('user'):
-                hosts.append(current)
-            current = {'host': m.group(1)}
-            continue
-        m = re.match(r'HostName\s+(\S+)', line)
-        if m:
-            current['hostname'] = m.group(1)
-            continue
-        m = re.match(r'User\s+(\S+)', line)
-        if m:
-            current['user'] = m.group(1)
-            continue
-
-if current.get('host') and current.get('hostname') and current.get('user'):
-    hosts.append(current)
-
-for h in hosts:
-    name = h['host']
-    ip = h['hostname']
-    user = h['user']
-    if '*' in name or 'github' in name.lower():
+while IFS='|' read -r name ip user os role; do
+    # Skip macOS nodes — this script builds on Linux nodes only
+    if [[ "${os,,}" == *"macos"* || "${os,,}" == *"darwin"* ]]; then
         continue
-    print(f'{name}|{ip}|{user}')
-" 2>/dev/null)
-    if [[ ${#NODES[@]} -gt 0 ]]; then
-        echo "[deploy-ff] Discovered ${#NODES[@]} node(s) from ~/.ssh/config" >&2
     fi
-fi
-
-# 3. Fallback to ~/.forgefleet/fleet.json
-if [[ ${#NODES[@]} -eq 0 && -f "$HOME/.forgefleet/fleet.json" ]]; then
-    while IFS= read -r line; do
-        [ -n "$line" ] && NODES+=("$line")
-    done < <(python3 -c "
-import json, os
-with open(os.path.expanduser('~/.forgefleet/fleet.json')) as f:
-    data = json.load(f)
-for n in data.get('nodes', []):
-    name = n.get('name','')
-    ip = n.get('ip','')
-    user = n.get('ssh_user','')
-    os_name = n.get('os','').lower()
-    if 'macos' in os_name:
-        continue
-    if name and ip and user:
-        print(f'{name}|{ip}|{user}')
-" 2>/dev/null)
-    if [[ ${#NODES[@]} -gt 0 ]]; then
-        echo "[deploy-ff] Discovered ${#NODES[@]} node(s) from ~/.forgefleet/fleet.json" >&2
-    fi
-fi
+    [[ -n "$name" && -n "$ip" && -n "$user" ]] && NODES+=("${name}|${ip}|${user}")
+done < <(discover_fleet_nodes)
 
 if [[ ${#NODES[@]} -eq 0 ]]; then
-    echo "No fleet nodes found. Is Postgres reachable and are nodes registered?" >&2
+    echo "No Linux fleet nodes found. Is Postgres reachable and are nodes registered?" >&2
     exit 1
 fi
+
+echo "[deploy-ff] Discovered ${#NODES[@]} Linux node(s) from fleet resolver" >&2
 
 # ─── Deploy to one node ───────────────────────────────────────────────────
 
@@ -185,8 +103,6 @@ REMOTE
 export -f deploy_one
 
 # ─── Run in parallel ──────────────────────────────────────────────────────
-
-PGURL="$PGURL" # pass env
 
 failed=0
 pids=()

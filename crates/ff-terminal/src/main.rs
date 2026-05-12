@@ -1203,6 +1203,18 @@ enum FleetCommand {
         #[arg(long, default_value_t = false)]
         force_dirty: bool,
     },
+    /// Resolve fleet nodes from all sources (Postgres → fleet.toml → SSH config → fleet.json).
+    Nodes {
+        /// Output format: text or json
+        #[arg(long, default_value = "text")]
+        format: String,
+        /// Filter by OS substring (e.g. "linux", "macos")
+        #[arg(long)]
+        os: Option<String>,
+        /// Filter by role substring (e.g. "worker", "leader")
+        #[arg(long)]
+        role: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]

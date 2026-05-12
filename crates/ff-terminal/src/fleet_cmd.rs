@@ -2663,6 +2663,49 @@ pub async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
             )
             .await?;
         }
+        FleetCommand::Nodes { format, os, role } => {
+            let resolver = ff_core::FleetResolver::new();
+            let mut nodes = resolver.resolve().await.map_err(|e| {
+                anyhow::anyhow!("failed to resolve fleet nodes: {e}")
+            })?;
+
+            if let Some(filter) = os {
+                let lower = filter.to_ascii_lowercase();
+                nodes.retain(|n| n.os.to_ascii_lowercase().contains(&lower));
+            }
+            if let Some(filter) = role {
+                let lower = filter.to_ascii_lowercase();
+                nodes.retain(|n| n.role.to_ascii_lowercase().contains(&lower));
+            }
+
+            match format.as_str() {
+                "json" => {
+                    println!("{}", serde_json::to_string_pretty(&nodes)?);
+                }
+                _ => {
+                    println!("{GREEN}✓ Fleet Nodes{RESET} ({} total)", nodes.len());
+                    for n in &nodes {
+                        let os_tag = if n.os.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" — {}", n.os)
+                        };
+                        let role_tag = if n.role.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" [{}]", n.role)
+                        };
+                        println!(
+                            "  - {name} ({ip}){role_tag}{os_tag}",
+                            name = n.name,
+                            ip = n.ip,
+                            role_tag = role_tag,
+                            os_tag = os_tag,
+                        );
+                    }
+                }
+            }
+        }
     }
     Ok(())
 }
