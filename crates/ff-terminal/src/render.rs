@@ -381,6 +381,22 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         .map(|p| format!(" │ {} ({}) ", p.name, working_dir))
         .unwrap_or_else(|| format!(" │ {} ", working_dir));
 
+    // Compact elapsed marker when an agent turn is in flight.
+    let elapsed_marker = tab
+        .elapsed_str()
+        .map(|e| format!("│ ⏱ {e} "))
+        .unwrap_or_default();
+
+    let model_truncated = {
+        let m = &tab.current_model;
+        let end = m
+            .char_indices()
+            .nth(30)
+            .map(|(i, _)| i)
+            .unwrap_or(m.len());
+        &m[..end]
+    };
+
     let header = Line::from(vec![
         Span::styled(format!(" {spinner} "), Style::default().fg(spinner_color)),
         Span::styled("ForgeFleet", theme.header),
@@ -390,13 +406,13 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         ),
         Span::styled(
             format!(
-                "│ {} │ Turn: {}/{} │ ",
-                &tab.current_model[..tab.current_model.len().min(30)],
-                tab.turn,
-                app.config.max_turns,
+                "│ {model_truncated} │ Turn: {}/{} ",
+                tab.turn, app.config.max_turns,
             ),
             theme.status_text,
         ),
+        Span::styled(elapsed_marker, Style::default().fg(Color::Rgb(251, 191, 36))),
+        Span::styled("│ ", theme.status_text),
         Span::styled(app.web_url(), Style::default().fg(Color::Rgb(99, 102, 241))),
     ]);
 
@@ -960,22 +976,53 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     } else {
         tab.name.clone()
     };
+
+    // Leading indicator: spinner + status while running, dot + status when idle.
+    let (indicator, indicator_color) = if tab.is_running {
+        (app.spinner(), Color::Rgb(251, 191, 36))
+    } else {
+        ("●", Color::Rgb(74, 222, 128))
+    };
+
     let mut spans: Vec<Span> = vec![
-        Span::styled(" ", Style::default()),
-        Span::styled(&tab.status, theme.status_text),
         Span::styled(
-            format!(
-                "  │  {}  │  Turn {}/{}  │  Model: {}  │  msgs {}  │  v{}",
-                session_name,
-                tab.turn,
-                app.config.max_turns,
-                tab.current_model,
-                tab.messages.len(),
-                env!("CARGO_PKG_VERSION"),
-            ),
-            theme.footer,
+            format!(" {indicator} "),
+            Style::default().fg(indicator_color),
         ),
+        Span::styled(&tab.status, theme.status_text),
     ];
+
+    // Elapsed timer — bright + prominent when an agent turn is in flight.
+    if let Some(elapsed) = tab.elapsed_str() {
+        spans.push(Span::styled("  ⏱ ", Style::default().fg(Color::Rgb(148, 163, 184))));
+        spans.push(Span::styled(
+            elapsed,
+            Style::default()
+                .fg(Color::Rgb(251, 191, 36))
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    // Current activity — what's actually happening right now (tool / dispatch / etc).
+    if tab.is_running && !tab.last_activity.is_empty() && tab.last_activity != tab.status {
+        spans.push(Span::styled(
+            format!("  · {}", tab.last_activity),
+            Style::default().fg(Color::Rgb(148, 163, 184)),
+        ));
+    }
+
+    spans.push(Span::styled(
+        format!(
+            "  │  {}  │  Turn {}/{}  │  Model: {}  │  msgs {}  │  v{}",
+            session_name,
+            tab.turn,
+            app.config.max_turns,
+            tab.current_model,
+            tab.messages.len(),
+            env!("CARGO_PKG_VERSION"),
+        ),
+        theme.footer,
+    ));
 
     // Memory status (P/B/H counts) — only show if brain_status has been loaded.
     if let Some(status) = &app.brain_status {

@@ -1,6 +1,7 @@
 //! App state — the central state container for ForgeFleet Terminal.
 
 use std::path::PathBuf;
+use std::time::Instant;
 
 use ff_agent::agent_loop::{AgentEvent, AgentSession, AgentSessionConfig};
 use ff_agent::commands::CommandRegistry;
@@ -135,6 +136,36 @@ pub struct SessionTab {
     pub tracker: ConversationTracker,
     /// Message queued while agent is running — sent automatically when agent finishes.
     pub queued_message: Option<String>,
+    /// When the current agent turn started — drives the elapsed-time display.
+    /// Set in `submit_input`, cleared on Done / Error / Cancelled.
+    pub running_since: Option<Instant>,
+    /// Last activity emitted by the agent (tool start/end, status update). Drives
+    /// the "what's happening right now" line in the footer.
+    pub last_activity: String,
+}
+
+impl SessionTab {
+    /// Elapsed time since the current turn started, formatted as `Hh Mm Ss` /
+    /// `Mm Ss` / `Ss`. Returns None when no agent turn is running.
+    pub fn elapsed_str(&self) -> Option<String> {
+        let started = self.running_since?;
+        let secs = started.elapsed().as_secs();
+        Some(format_elapsed(secs))
+    }
+}
+
+/// Format `n` seconds as a compact human string: "12s", "1m 42s", "1h 3m 5s".
+pub fn format_elapsed(secs: u64) -> String {
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    if h > 0 {
+        format!("{h}h {m}m {s}s")
+    } else if m > 0 {
+        format!("{m}m {s}s")
+    } else {
+        format!("{s}s")
+    }
 }
 
 impl SessionTab {
@@ -150,6 +181,8 @@ impl SessionTab {
         }
         self.is_running = false;
         self.status = "Cancelling…".into();
+        self.running_since = None;
+        self.last_activity = "Cancelling…".into();
         true
     }
 }
@@ -172,6 +205,8 @@ impl SessionTab {
             turn: 0,
             tracker: ConversationTracker::new(),
             queued_message: None,
+            running_since: None,
+            last_activity: String::new(),
         }
     }
 
@@ -346,15 +381,43 @@ impl App {
             AgentEvent::Done { .. } => {
                 tab.is_running = false;
                 tab.status = "Ready".into();
+                tab.running_since = None;
+                tab.last_activity.clear();
             }
             AgentEvent::Error { message, .. } => {
                 tab.is_running = false;
-                tab.status = format!("Error: {}", &message[..message.len().min(50)]);
+                let preview: String = message.chars().take(50).collect();
+                tab.status = format!("Error: {preview}");
+                tab.running_since = None;
+                tab.last_activity.clear();
             }
             AgentEvent::Status { message, .. } => {
                 tab.status = message.clone();
+                tab.last_activity = message.clone();
             }
-            _ => {}
+            AgentEvent::ToolStart { tool_name, .. } => {
+                tab.last_activity = format!("Running tool: {tool_name}");
+            }
+            AgentEvent::ToolEnd {
+                tool_name,
+                is_error,
+                duration_ms,
+                ..
+            } => {
+                let mark = if *is_error { "✗" } else { "✓" };
+                tab.last_activity = format!("{mark} {tool_name} ({duration_ms} ms)");
+            }
+            AgentEvent::AssistantText { .. } => {
+                tab.last_activity = "Assistant replied".into();
+            }
+            AgentEvent::Compaction {
+                messages_before,
+                messages_after,
+                ..
+            } => {
+                tab.last_activity =
+                    format!("Compacted history {messages_before}→{messages_after}");
+            }
         }
     }
 
@@ -368,6 +431,8 @@ impl App {
         tab.messages.push(render_user_message(&text));
         tab.is_running = true;
         tab.status = "Thinking...".into();
+        tab.running_since = Some(Instant::now());
+        tab.last_activity = "Dispatching to LLM…".into();
     }
 
     /// Get spinner for animation.
