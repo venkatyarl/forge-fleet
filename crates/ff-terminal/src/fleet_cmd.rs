@@ -2663,42 +2663,45 @@ pub async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
             )
             .await?;
         }
-        FleetCommand::Nodes { format, os, role } => {
+        FleetCommand::Computers { format, os, role } => {
             let resolver = ff_core::FleetResolver::new();
-            let mut nodes = resolver.resolve().await.map_err(|e| {
-                anyhow::anyhow!("failed to resolve fleet nodes: {e}")
+            let mut computers = resolver.resolve().await.map_err(|e| {
+                anyhow::anyhow!("failed to resolve fleet computers: {e}")
             })?;
 
             if let Some(filter) = os {
                 let lower = filter.to_ascii_lowercase();
-                nodes.retain(|n| n.os.to_ascii_lowercase().contains(&lower));
+                computers.retain(|c| c.os.to_ascii_lowercase().contains(&lower));
             }
             if let Some(filter) = role {
                 let lower = filter.to_ascii_lowercase();
-                nodes.retain(|n| n.role.to_ascii_lowercase().contains(&lower));
+                computers.retain(|c| c.role.to_ascii_lowercase().contains(&lower));
             }
 
             match format.as_str() {
                 "json" => {
-                    println!("{}", serde_json::to_string_pretty(&nodes)?);
+                    println!("{}", serde_json::to_string_pretty(&computers)?);
                 }
                 _ => {
-                    println!("{GREEN}✓ Fleet Nodes{RESET} ({} total)", nodes.len());
-                    for n in &nodes {
-                        let os_tag = if n.os.is_empty() {
+                    println!(
+                        "{GREEN}✓ Fleet Computers{RESET} ({} total)",
+                        computers.len()
+                    );
+                    for c in &computers {
+                        let os_tag = if c.os.is_empty() {
                             String::new()
                         } else {
-                            format!(" — {}", n.os)
+                            format!(" — {}", c.os)
                         };
-                        let role_tag = if n.role.is_empty() {
+                        let role_tag = if c.role.is_empty() {
                             String::new()
                         } else {
-                            format!(" [{}]", n.role)
+                            format!(" [{}]", c.role)
                         };
                         println!(
                             "  - {name} ({ip}){role_tag}{os_tag}",
-                            name = n.name,
-                            ip = n.ip,
+                            name = c.name,
+                            ip = c.ip,
                             role_tag = role_tag,
                             os_tag = os_tag,
                         );

@@ -1203,8 +1203,8 @@ enum FleetCommand {
         #[arg(long, default_value_t = false)]
         force_dirty: bool,
     },
-    /// Resolve fleet nodes from all sources (Postgres → fleet.toml → SSH config → fleet.json).
-    Nodes {
+    /// Resolve fleet computers from all sources (Postgres → fleet.toml → SSH config → fleet.json).
+    Computers {
         /// Output format: text or json
         #[arg(long, default_value = "text")]
         format: String,

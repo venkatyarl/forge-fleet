@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Centralized fleet node discovery library.
+# Centralized fleet computer discovery library.
 # ═══════════════════════════════════════════════════════════════════════════════
 #
-# Source this file in any script that needs fleet node information:
+# Source this file in any script that needs fleet computer information:
 #   source "$(dirname "$0")/../lib/fleet.sh"
 #
 # All fleet-related scripts should use this library instead of implementing
-# their own node discovery. The canonical resolution chain is:
-#   1. Postgres fleet_nodes table  (via `ff fleet nodes --format json`)
+# their own discovery. The canonical resolution chain is:
+#   1. Postgres fleet_nodes table  (via `ff fleet computers --format json`)
 #   2. fleet.toml [nodes.*]        (fallback)
 #   3. ~/.ssh/config               (fallback)
 #   4. ~/.forgefleet/fleet.json    (last resort)
@@ -33,12 +33,18 @@ FLEET_JSON="${FORGEFLEET_HOME}/fleet.json"
 _ff_fleet_nodes_json() {
     # Try the compiled `ff` CLI first — this is the canonical resolver that
     # uses the same code path as the daemon (Postgres → config → SSH → JSON).
+    # Try the new `computers` verb first, then fall back to the legacy `nodes`
+    # name so mixed-fleet upgrade windows still resolve.
     if command -v ff >/dev/null 2>&1; then
+        ff fleet computers --format json 2>/dev/null && return 0
         ff fleet nodes --format json 2>/dev/null && return 0
     fi
     # Also try local dev build
-    if [[ -x "$(dirname "${BASH_SOURCE[0]}")/../../target/release/ff" ]]; then
-        "$(dirname "${BASH_SOURCE[0]}")/../../target/release/ff" fleet nodes --format json 2>/dev/null && return 0
+    local local_ff
+    local_ff="$(dirname "${BASH_SOURCE[0]}")/../../target/release/ff"
+    if [[ -x "$local_ff" ]]; then
+        "$local_ff" fleet computers --format json 2>/dev/null && return 0
+        "$local_ff" fleet nodes --format json 2>/dev/null && return 0
     fi
     return 1
 }
