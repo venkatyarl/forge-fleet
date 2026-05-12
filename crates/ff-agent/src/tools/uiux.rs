@@ -182,11 +182,10 @@ impl AgentTool for AccessibilityCheckTool {
                 .await
                 .unwrap_or_default()
         } else if let Some(u) = url {
-            reqwest::get(u)
-                .await
-                .ok()
-                .and_then(|r| futures::executor::block_on(r.text()).ok())
-                .unwrap_or_default()
+            match reqwest::get(u).await {
+                Ok(resp) => resp.text().await.unwrap_or_default(),
+                Err(_) => String::new(),
+            }
         } else {
             return AgentToolResult::err("Provide 'file_path' or 'url'");
         };

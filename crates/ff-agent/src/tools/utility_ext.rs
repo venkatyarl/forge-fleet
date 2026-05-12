@@ -406,7 +406,7 @@ pub struct HealthMonitorTool {
 impl Default for HealthMonitorTool {
     fn default() -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: super::shared_http_client(),
         }
     }
 }

@@ -4699,7 +4699,7 @@ async fn proxy_chat_completions(
 
         if is_streaming {
             match pulse
-                .route_completion_streaming(raw_payload.clone(), cache_ref, pg_ref)
+                .route_completion_streaming(&raw_payload, cache_ref, pg_ref)
                 .await
             {
                 Ok(result) => {
@@ -4753,7 +4753,7 @@ async fn proxy_chat_completions(
             }
         } else {
             match pulse
-                .route_completion_cached(raw_payload.clone(), cache_ref, pg_ref)
+                .route_completion_cached(&raw_payload, cache_ref, pg_ref)
                 .await
             {
                 Ok(value) => {

@@ -702,19 +702,30 @@ impl PulseLlmRouter {
     /// If the request body has `"stream": true` it is downgraded to
     /// non-streaming transparently. For true streaming proxying use
     /// [`Self::route_completion_streaming`].
-    pub async fn route_completion(&self, body: Value) -> Result<Value, LlmRoutingError> {
+    pub async fn route_completion(&self, body: &Value) -> Result<Value, LlmRoutingError> {
         self.route_completion_cached(body, None, None).await
     }
 
     /// Like [`route_completion`] but consults `cache` first and falls through
     /// to a live `pick_server` call only on miss.
+    ///
+    /// Accepts the body by reference. The body is only cloned once we've
+    /// confirmed it has a `model` field — callers that pass clearly-invalid
+    /// payloads pay no allocation. On success / NoMatch / upstream-error, the
+    /// caller still owns the original body for any fallback path.
     pub async fn route_completion_cached(
         &self,
-        mut body: Value,
+        body: &Value,
         cache: Option<&LlmRoutingCache>,
         pg: Option<&sqlx::PgPool>,
     ) -> Result<Value, LlmRoutingError> {
-        // Downgrade streaming for the non-streaming path.
+        // Cheap pre-check: bail out before cloning if the payload can't be routed.
+        body.get("model")
+            .and_then(|v| v.as_str())
+            .ok_or(LlmRoutingError::MissingModel)?;
+
+        // From here on we mutate (stream downgrade + model rewrite) so clone once.
+        let mut body = body.clone();
         if body.get("stream").and_then(|v| v.as_bool()) == Some(true) {
             body["stream"] = Value::Bool(false);
         }
@@ -783,12 +794,20 @@ impl PulseLlmRouter {
     /// [`reqwest::Response`] so the caller can proxy SSE chunks back to the
     /// client. Routing metadata is returned alongside the response so the
     /// caller can inject `X-ForgeFleet-*` headers if desired.
+    ///
+    /// Accepts the body by reference; see [`Self::route_completion_cached`].
     pub async fn route_completion_streaming(
         &self,
-        body: Value,
+        body: &Value,
         cache: Option<&LlmRoutingCache>,
         pg: Option<&sqlx::PgPool>,
     ) -> Result<StreamRouteResult, LlmRoutingError> {
+        // Cheap pre-check before cloning.
+        body.get("model")
+            .and_then(|v| v.as_str())
+            .ok_or(LlmRoutingError::MissingModel)?;
+
+        let body = body.clone();
         let session_key = extract_session_key(&body);
         let (routed, url, body) = self.resolve_target(body, cache, pg).await?;
         self.record_affinity(session_key, &routed);

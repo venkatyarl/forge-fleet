@@ -28,13 +28,14 @@ impl AgentTool for ProcessManagerTool {
         let action = input.get("action").and_then(Value::as_str).unwrap_or("");
         match action {
             "list" => {
-                let out = Command::new("ps")
+                let out = match Command::new("ps")
                     .args(["aux", "--sort=-%mem"])
                     .output()
                     .await
-                    .or_else(|_| {
-                        futures::executor::block_on(Command::new("ps").args(["aux"]).output())
-                    });
+                {
+                    Ok(o) => Ok(o),
+                    Err(_) => Command::new("ps").args(["aux"]).output().await,
+                };
                 match out {
                     Ok(o) => AgentToolResult::ok(truncate_output(
                         &String::from_utf8_lossy(&o.stdout),
@@ -132,13 +133,15 @@ impl AgentTool for ClipboardTool {
         match action {
             "read" => {
                 // macOS: pbpaste, Linux: xclip -o
-                let result = Command::new("pbpaste").output().await.or_else(|_| {
-                    futures::executor::block_on(
+                let result = match Command::new("pbpaste").output().await {
+                    Ok(o) => Ok(o),
+                    Err(_) => {
                         Command::new("xclip")
                             .args(["-selection", "clipboard", "-o"])
-                            .output(),
-                    )
-                });
+                            .output()
+                            .await
+                    }
+                };
                 match result {
                     Ok(o) if o.status.success() => AgentToolResult::ok(truncate_output(
                         &String::from_utf8_lossy(&o.stdout),

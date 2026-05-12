@@ -247,6 +247,23 @@ impl Default for McpClientManager {
     }
 }
 
+impl Drop for McpClientManager {
+    fn drop(&mut self) {
+        // Stdio MCP servers are child processes spawned by this manager. If the
+        // manager is dropped without `disconnect_all()` being called (e.g., on an
+        // error path), the children would otherwise outlive us as orphans. Send
+        // SIGKILL via the non-blocking `start_kill` — the actual reap happens
+        // when the OS notices the parent exiting, which is good enough here.
+        for (name, conn) in self.connections.drain() {
+            if let McpTransport::Stdio { mut child, .. } = conn.transport {
+                if let Err(e) = child.start_kill() {
+                    tracing::debug!(server = %name, error = %e, "MCP child kill on drop failed");
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct McpServerInfo {
     pub name: String,

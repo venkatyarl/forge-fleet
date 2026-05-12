@@ -282,11 +282,7 @@ pub struct LinkPreviewTool {
 impl Default for LinkPreviewTool {
     fn default() -> Self {
         Self {
-            client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(10))
-                .user_agent("ForgeFleet-Agent/0.1")
-                .build()
-                .unwrap_or_default(),
+            client: super::shared_http_client(),
         }
     }
 }
@@ -323,7 +319,13 @@ impl AgentTool for LinkPreviewTool {
 
         let mut results = Vec::new();
         for url in &urls {
-            match self.client.get(url).send().await {
+            match self
+                .client
+                .get(url)
+                .timeout(std::time::Duration::from_secs(10))
+                .send()
+                .await
+            {
                 Ok(resp) if resp.status().is_success() => {
                     let html = resp.text().await.unwrap_or_default();
                     let title = extract_meta(&html, "<title>", "</title>").unwrap_or_default();
@@ -450,10 +452,7 @@ pub struct VideoAnalyzeTool {
 impl Default for VideoAnalyzeTool {
     fn default() -> Self {
         Self {
-            client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(120))
-                .build()
-                .unwrap_or_default(),
+            client: super::shared_http_client(),
         }
     }
 }
@@ -867,23 +866,9 @@ async fn find_omni_endpoint() -> String {
 }
 
 async fn query_omni_endpoint() -> anyhow::Result<String> {
-    let toml_str = tokio::fs::read_to_string(
-        std::env::var("HOME").unwrap_or_default() + "/.forgefleet/fleet.toml",
-    )
-    .await?;
-    let config: toml::Value = toml::from_str(&toml_str)?;
-    let db_url = config
-        .get("database")
-        .and_then(|d| d.get("url"))
-        .and_then(|u| u.as_str())
-        .ok_or_else(|| anyhow::anyhow!("no db url"))?
-        .to_string();
-
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(1)
-        .acquire_timeout(std::time::Duration::from_secs(2))
-        .connect(&db_url)
-        .await?;
+    let pool = crate::fleet_info::get_fleet_pool()
+        .await
+        .map_err(|e| anyhow::anyhow!("get_fleet_pool: {e}"))?;
 
     let row = sqlx::query(
         "SELECT fn.ip, fm.port FROM fleet_models fm

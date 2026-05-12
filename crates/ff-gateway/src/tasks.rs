@@ -244,7 +244,7 @@ async fn handle_task_inner(
         let cache = state.pulse_cache.as_deref();
         let pg = state.operational_store.as_ref().and_then(|s| s.pg_pool());
         match router
-            .route_completion_cached(body.clone(), cache, pg)
+            .route_completion_cached(&body, cache, pg)
             .await
         {
             Ok(result) => {

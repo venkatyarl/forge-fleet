@@ -209,8 +209,12 @@ async fn execute_train(model: &str, ctx: &AgentToolContext) -> AgentToolResult {
         .spawn();
 
     match output {
-        Ok(child) => {
+        Ok(mut child) => {
             let pid = child.id().unwrap_or(0);
+            // Reap the child to avoid leaving a zombie when training finishes.
+            tokio::spawn(async move {
+                let _ = child.wait().await;
+            });
             AgentToolResult::ok(format!(
                 "LoRA training started in background (PID {})!\n\
                  Model: {}\n\

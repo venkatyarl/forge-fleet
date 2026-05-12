@@ -13,10 +13,7 @@ pub struct SendMessageTool {
 impl Default for SendMessageTool {
     fn default() -> Self {
         Self {
-            client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(10))
-                .build()
-                .unwrap_or_default(),
+            client: super::shared_http_client(),
         }
     }
 }
@@ -126,25 +123,9 @@ async fn resolve_node_url(name: &str) -> String {
 }
 
 async fn lookup_node_ip_from_db(name: &str) -> anyhow::Result<String> {
-    let toml_str = tokio::fs::read_to_string(
-        dirs::home_dir()
-            .unwrap_or_default()
-            .join(".forgefleet/fleet.toml"),
-    )
-    .await?;
-    let config: toml::Value = toml::from_str(&toml_str)?;
-    let db_url = config
-        .get("database")
-        .and_then(|d| d.get("url"))
-        .and_then(|u| u.as_str())
-        .ok_or_else(|| anyhow::anyhow!("no db url"))?
-        .to_string();
-
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(1)
-        .acquire_timeout(std::time::Duration::from_secs(2))
-        .connect(&db_url)
-        .await?;
+    let pool = crate::fleet_info::get_fleet_pool()
+        .await
+        .map_err(|e| anyhow::anyhow!("get_fleet_pool: {e}"))?;
 
     let row = sqlx::query("SELECT ip FROM fleet_nodes WHERE name = $1")
         .bind(name)

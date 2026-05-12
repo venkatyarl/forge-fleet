@@ -427,6 +427,80 @@ impl AlertEngine {
     pub fn active_count(&self) -> usize {
         self.active_alerts.len()
     }
+
+    /// Drop alerts from history older than `max_age`. Also caps total entries at
+    /// `max_entries` (drops oldest by `fired_at` once the cap is exceeded).
+    /// Returns the number of entries removed.
+    pub fn prune_history(&self, max_age: chrono::Duration, max_entries: usize) -> usize {
+        prune_history_map(&self.history, max_age, max_entries)
+    }
+
+    /// Clone the internal history `Arc` so a background pruner task can
+    /// operate on it without needing to hold a reference to the engine itself.
+    pub fn history_handle(&self) -> Arc<DashMap<Uuid, Alert>> {
+        Arc::clone(&self.history)
+    }
+
+    /// Spawn a background task that periodically prunes the alert history
+    /// DashMap. Pass `engine.history_handle()` as the first argument.
+    ///
+    /// The history grows on every fire_alert / resolve transition; without
+    /// this task it accumulates for the lifetime of the daemon.
+    pub fn spawn_history_pruner(
+        history: Arc<DashMap<Uuid, Alert>>,
+        interval: std::time::Duration,
+        max_age: chrono::Duration,
+        max_entries: usize,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // Skip the immediate first tick so we don't churn on startup.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let removed = prune_history_map(&history, max_age, max_entries);
+                if removed > 0 {
+                    tracing::debug!(removed, "pruned alert history");
+                }
+            }
+        })
+    }
+}
+
+/// Shared pruning logic — drops entries older than `max_age`, then enforces a
+/// hard cap of `max_entries` by dropping the oldest by `fired_at`.
+fn prune_history_map(
+    history: &DashMap<Uuid, Alert>,
+    max_age: chrono::Duration,
+    max_entries: usize,
+) -> usize {
+    let cutoff = Utc::now() - max_age;
+    let mut removed = 0;
+    let stale: Vec<Uuid> = history
+        .iter()
+        .filter(|e| e.value().fired_at < cutoff)
+        .map(|e| *e.key())
+        .collect();
+    for id in stale {
+        if history.remove(&id).is_some() {
+            removed += 1;
+        }
+    }
+    if history.len() > max_entries {
+        let mut by_age: Vec<(Uuid, chrono::DateTime<Utc>)> = history
+            .iter()
+            .map(|e| (*e.key(), e.value().fired_at))
+            .collect();
+        by_age.sort_by_key(|(_, t)| *t);
+        let overflow = history.len() - max_entries;
+        for (id, _) in by_age.into_iter().take(overflow) {
+            if history.remove(&id).is_some() {
+                removed += 1;
+            }
+        }
+    }
+    removed
 }
 
 #[cfg(test)]

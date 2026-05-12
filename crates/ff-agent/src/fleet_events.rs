@@ -17,7 +17,7 @@
 
 use futures::Stream;
 use redis::AsyncCommands;
-use tokio::sync::mpsc;
+use tokio::sync::{OnceCell, mpsc};
 use tracing::{debug, error, warn};
 
 pub const CHANNEL_NODE_ONLINE: &str = "fleet:node_online";
@@ -51,13 +51,35 @@ fn resolve_redis_url() -> String {
         .unwrap_or_else(|| FALLBACK.to_string())
 }
 
+/// Shared, auto-reconnecting Redis connection for *publish* paths.
+///
+/// Before this cache, every `publish_node_online` / `publish_node_offline` /
+/// `publish_routing_invalidate` call opened a fresh `redis::Client` and a
+/// fresh multiplexed TCP connection. Under sustained churn (one event per
+/// fleet transition × many transitions per minute) that meant hundreds of
+/// socket open/close pairs per hour, all going to the same Redis host.
+///
+/// `ConnectionManager` is cheap to clone, multiplexed, and reconnects in the
+/// background — see `ff-pulse/reader.rs` for the same pattern on the read
+/// side.
+static PUBLISH_CONN: OnceCell<redis::aio::ConnectionManager> = OnceCell::const_new();
+
+async fn publish_conn() -> Result<redis::aio::ConnectionManager, String> {
+    let conn = PUBLISH_CONN
+        .get_or_try_init(|| async {
+            let url = resolve_redis_url();
+            let client = redis::Client::open(url.as_str())
+                .map_err(|e| format!("redis open {url}: {e}"))?;
+            redis::aio::ConnectionManager::new(client)
+                .await
+                .map_err(|e| format!("redis connect {url}: {e}"))
+        })
+        .await?;
+    Ok(conn.clone())
+}
+
 async fn publish_raw(channel: &str, payload: &str) -> Result<(), String> {
-    let url = resolve_redis_url();
-    let client = redis::Client::open(url.as_str()).map_err(|e| format!("redis open {url}: {e}"))?;
-    let mut conn = client
-        .get_multiplexed_async_connection()
-        .await
-        .map_err(|e| format!("redis connect {url}: {e}"))?;
+    let mut conn = publish_conn().await?;
     conn.publish::<_, _, ()>(channel, payload)
         .await
         .map_err(|e| format!("redis publish {channel}: {e}"))?;

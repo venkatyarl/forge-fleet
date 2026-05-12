@@ -359,6 +359,42 @@ impl ApprovalManager {
         count
     }
 
+    /// Cleanup completed requests across **all** sessions. Used by the periodic
+    /// reaper task to keep `requests` from growing unbounded under sustained
+    /// operator load (no per-session call required).
+    pub fn cleanup_all_completed(&self, max_age: chrono::Duration) -> usize {
+        reap_completed_map(&self.requests, max_age)
+    }
+
+    /// Clone the internal requests `Arc` so a reaper task can prune entries
+    /// without needing a reference to the manager itself.
+    pub fn requests_handle(&self) -> std::sync::Arc<DashMap<Uuid, Approval>> {
+        std::sync::Arc::clone(&self.requests)
+    }
+
+    /// Spawn a background task that periodically drops resolved approval
+    /// requests older than `max_age`. Without this the `requests` DashMap
+    /// grows for the lifetime of the daemon. Pass `mgr.requests_handle()` as
+    /// the first argument.
+    pub fn spawn_reaper(
+        requests: std::sync::Arc<DashMap<Uuid, Approval>>,
+        interval: std::time::Duration,
+        max_age: chrono::Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ticker.tick().await; // skip the immediate first tick
+            loop {
+                ticker.tick().await;
+                let removed = reap_completed_map(&requests, max_age);
+                if removed > 0 {
+                    tracing::debug!(removed, "reaped completed approval requests");
+                }
+            }
+        })
+    }
+
     fn create_pending(&self, session_id: Uuid, command: &str, reason: &str) -> ApprovalDecision {
         let req = Approval::pending(session_id, command, reason);
         let id = req.id;
@@ -412,6 +448,32 @@ impl Default for ApprovalManager {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Shared reaper logic — drops resolved (non-Pending) approvals whose
+/// `decided_at` is older than `max_age`. Returns the removed count.
+fn reap_completed_map(
+    requests: &DashMap<Uuid, Approval>,
+    max_age: chrono::Duration,
+) -> usize {
+    let now = Utc::now();
+    let to_remove: Vec<Uuid> = requests
+        .iter()
+        .filter_map(|r| {
+            let req = r.value();
+            let done = req.state != ApprovalState::Pending;
+            let old_enough = req
+                .decided_at
+                .map(|t| now.signed_duration_since(t) >= max_age)
+                .unwrap_or(false);
+            if done && old_enough { Some(req.id) } else { None }
+        })
+        .collect();
+    let count = to_remove.len();
+    for id in to_remove {
+        requests.remove(&id);
+    }
+    count
 }
 
 #[cfg(test)]

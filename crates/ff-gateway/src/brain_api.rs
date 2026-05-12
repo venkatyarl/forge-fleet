@@ -371,7 +371,7 @@ async fn generate_brain_reply(
         let cache_ref = state.pulse_cache.as_deref();
         let pg_ref = Some(pool);
         match pulse
-            .route_completion_cached(payload.clone(), cache_ref, pg_ref)
+            .route_completion_cached(&payload, cache_ref, pg_ref)
             .await
         {
             Ok(v) => {

@@ -66,6 +66,35 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 
 // ---------------------------------------------------------------------------
+// Shared HTTP client for tools
+// ---------------------------------------------------------------------------
+//
+// Several tools (SendMessage, HealthMonitor, LinkPreview, VideoAnalyze) used
+// to construct their own `reqwest::Client` in `Default::default()`. Each
+// instance carried its own DNS resolver, TLS state, and connection pool.
+// Because tool instances are created per agent and discarded between turns,
+// these clients churned heavily under load.
+//
+// `reqwest::Client` is already internally `Arc<Inner>` — cloning is cheap, so
+// one shared client serves every tool. Per-request timeouts (set via
+// `RequestBuilder::timeout`) override the client default, so call sites that
+// care about a specific deadline still set their own.
+static SHARED_HTTP_CLIENT: std::sync::LazyLock<reqwest::Client> =
+    std::sync::LazyLock::new(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .user_agent("ForgeFleet-Agent/1.0")
+            .build()
+            .expect("build shared tool reqwest client")
+    });
+
+/// Returns a shared `reqwest::Client` used by all tools that need HTTP.
+/// Cloning the result is cheap (internal Arc).
+pub fn shared_http_client() -> reqwest::Client {
+    SHARED_HTTP_CLIENT.clone()
+}
+
+// ---------------------------------------------------------------------------
 // Core trait
 // ---------------------------------------------------------------------------
 
