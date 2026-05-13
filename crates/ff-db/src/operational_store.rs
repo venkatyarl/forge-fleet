@@ -41,6 +41,18 @@ impl OperationalStore {
         Ok(store)
     }
 
+    /// Construct from an already-built shared pool. Lets the daemon use one
+    /// pool across [`OperationalStore`], [`RuntimeRegistryStore`], and any
+    /// other subsystem instead of each opening its own (which was producing
+    /// ~4 pools × 15 daemons = 60+ baseline connections, exhausting
+    /// max_connections=100 within 8h — see the 2026-05-13 connection
+    /// exhaustion incident).
+    pub async fn postgres_with_pool(pool: Arc<PgPool>) -> Result<Self, DbError> {
+        let store = Self::Postgres(pool);
+        store.ensure_postgres_schema().await?;
+        Ok(store)
+    }
+
     pub fn backend_label(&self) -> &'static str {
         match self {
             Self::Sqlite(_) => "embedded_sqlite",

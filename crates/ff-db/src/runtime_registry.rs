@@ -42,6 +42,15 @@ impl RuntimeRegistryStore {
         Ok(store)
     }
 
+    /// Construct from an already-built shared pool. See
+    /// [`OperationalStore::postgres_with_pool`] for why this exists — the
+    /// daemon should share a single pool across all subsystems.
+    pub async fn postgres_with_pool(pool: Arc<PgPool>) -> Result<Self, DbError> {
+        let store = Self::Postgres(pool);
+        store.ensure_postgres_schema().await?;
+        Ok(store)
+    }
+
     /// Human-readable backend label for logs and diagnostics.
     pub fn backend_label(&self) -> &'static str {
         match self {

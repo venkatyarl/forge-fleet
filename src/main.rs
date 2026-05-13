@@ -152,12 +152,45 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
 
     enforce_database_mode_preflight(&config)?;
 
+    // ─── Shared Postgres pool ───────────────────────────────────────────────
+    // Single pool reused across OperationalStore + RuntimeRegistryStore so
+    // each daemon opens one set of connections, not two. Before this, each
+    // store called PgPoolOptions::new().connect() independently — the same
+    // database URL produced two pools × 15 daemons = 30 baseline conns just
+    // for the two stores, and that's before fleet_resolver / get_fleet_pool
+    // / per-call sqlx::query helpers piled on.
+    let shared_pg_pool: Option<std::sync::Arc<sqlx::PgPool>> = match config.database.mode {
+        DatabaseMode::EmbeddedSqlite => None,
+        DatabaseMode::PostgresRuntime | DatabaseMode::PostgresFull => {
+            let url = config.database.url.trim();
+            if url.is_empty() {
+                None
+            } else {
+                let pool = sqlx::postgres::PgPoolOptions::new()
+                    .max_connections(config.database.max_connections.max(2))
+                    .min_connections(0)
+                    .idle_timeout(Some(std::time::Duration::from_secs(60)))
+                    .max_lifetime(Some(std::time::Duration::from_secs(30 * 60)))
+                    .connect(url)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to open shared Postgres pool ({})",
+                            redact_database_url(url)
+                        )
+                    })?;
+                Some(std::sync::Arc::new(pool))
+            }
+        }
+    };
+
     // ─── Operational persistence backend (SQLite or Postgres) ──────────────
     let (operational_store, sqlite_pool, sqlite_path) =
-        initialize_operational_store(&config, &config_path).await?;
+        initialize_operational_store(&config, &config_path, shared_pg_pool.clone()).await?;
 
     // ─── Runtime registry persistence backend ────────────────────────────────
-    let runtime_registry = initialize_runtime_registry(&config, sqlite_pool.clone()).await?;
+    let runtime_registry =
+        initialize_runtime_registry(&config, sqlite_pool.clone(), shared_pg_pool.clone()).await?;
     log_database_mode_summary(
         &config,
         sqlite_path.as_deref(),
@@ -781,6 +814,7 @@ fn resolve_embedded_db_path(config: &FleetConfig, config_path: &Path) -> Result<
 async fn initialize_operational_store(
     config: &FleetConfig,
     config_path: &Path,
+    shared_pg_pool: Option<std::sync::Arc<sqlx::PgPool>>,
 ) -> Result<(OperationalStore, Option<DbPool>, Option<PathBuf>)> {
     match config.database.mode {
         DatabaseMode::EmbeddedSqlite => {
@@ -810,14 +844,18 @@ async fn initialize_operational_store(
                 );
             }
 
-            let store = OperationalStore::postgres(database_url, config.database.max_connections)
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to initialize Postgres operational store ({})",
-                        redact_database_url(database_url)
-                    )
-                })?;
+            let store = match shared_pg_pool {
+                Some(pool) => OperationalStore::postgres_with_pool(pool).await,
+                None => {
+                    OperationalStore::postgres(database_url, config.database.max_connections).await
+                }
+            }
+            .with_context(|| {
+                format!(
+                    "failed to initialize Postgres operational store ({})",
+                    redact_database_url(database_url)
+                )
+            })?;
 
             Ok((store, None, None))
         }
@@ -827,6 +865,7 @@ async fn initialize_operational_store(
 async fn initialize_runtime_registry(
     config: &FleetConfig,
     sqlite_pool: Option<DbPool>,
+    shared_pg_pool: Option<std::sync::Arc<sqlx::PgPool>>,
 ) -> Result<RuntimeRegistryStore> {
     match config.database.mode {
         DatabaseMode::EmbeddedSqlite => {
@@ -846,14 +885,19 @@ async fn initialize_runtime_registry(
                 );
             }
 
-            RuntimeRegistryStore::postgres(database_url, config.database.max_connections)
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to initialize Postgres runtime registry ({})",
-                        redact_database_url(database_url)
-                    )
-                })
+            match shared_pg_pool {
+                Some(pool) => RuntimeRegistryStore::postgres_with_pool(pool).await,
+                None => {
+                    RuntimeRegistryStore::postgres(database_url, config.database.max_connections)
+                        .await
+                }
+            }
+            .with_context(|| {
+                format!(
+                    "failed to initialize Postgres runtime registry ({})",
+                    redact_database_url(database_url)
+                )
+            })
         }
     }
 }
