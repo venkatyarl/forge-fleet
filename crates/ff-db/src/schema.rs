@@ -6430,3 +6430,16 @@ pub const SCHEMA_V85_DROP_COMPAT_VIEWS: &str = r#"
 DROP VIEW IF EXISTS fleet_node_ssh_keys;
 DROP VIEW IF EXISTS fleet_nodes;
 "#;
+
+pub const SCHEMA_V86_DROP_FLEET_MEMBERS: &str = r#"
+-- ─── V86: drop fleet_members table ─────────────────────────────────────────
+-- fleet_members was a redundant projection of fleet_workers — same
+-- election_priority, role, runtime, gh_account, models_dir, disk_quota_pct
+-- columns existed in both tables, with fleet_members joining `computers` by
+-- UUID and fleet_workers joining by name. Every consumer
+-- (leader_tick, pulse_api list/leader endpoints, fleet_cmd sanity checks)
+-- has been migrated to fleet_workers via JOIN computers c ON c.name = fw.name.
+--
+-- Idempotent.
+DROP TABLE IF EXISTS fleet_members CASCADE;
+"#;

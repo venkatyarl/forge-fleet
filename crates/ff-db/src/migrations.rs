@@ -557,6 +557,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "drop_compat_views",
         sql: schema::SCHEMA_V85_DROP_COMPAT_VIEWS,
     },
+    PgMigration {
+        version: 86,
+        name: "drop_fleet_members",
+        sql: schema::SCHEMA_V86_DROP_FLEET_MEMBERS,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.

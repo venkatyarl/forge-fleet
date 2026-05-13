@@ -38,7 +38,7 @@ pub struct HeartbeatV2Publisher {
     epoch: Arc<AtomicU64>,
     /// Current role_claimed — shared with leader_tick.
     role: Arc<parking_lot_compat::RwLock<String>>,
-    /// Cached election priority from fleet_members (set at startup).
+    /// Cached election priority from fleet_workers (set at startup).
     election_priority: i32,
 }
 

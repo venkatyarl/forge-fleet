@@ -113,7 +113,7 @@ pub async fn list_computers(
                 ORDER BY m.recorded_at DESC LIMIT 1
             ) AS latest_recorded_at
         FROM computers c
-        LEFT JOIN fleet_members fm ON fm.computer_id = c.id
+        LEFT JOIN fleet_workers fm ON fm.name = c.name
         ORDER BY c.name
         "#,
     )
@@ -170,22 +170,22 @@ pub async fn list_members(
     let rows = sqlx::query(
         r#"
         SELECT
-            fm.computer_id,
+            c.id AS computer_id,
             fm.role,
             fm.election_priority,
             fm.gh_account,
             fm.runtime,
             fm.models_dir,
             fm.disk_quota_pct,
-            fm.enrolled_at,
+            fm.registered_at AS enrolled_at,
             c.name,
             c.primary_ip,
             c.hostname,
             c.os_family,
             c.status,
             c.last_seen_at
-        FROM fleet_members fm
-        JOIN computers c ON c.id = fm.computer_id
+        FROM fleet_workers fm
+        JOIN computers c ON c.name = fm.name
         ORDER BY fm.election_priority DESC, c.name
         "#,
     )
@@ -259,10 +259,10 @@ pub async fn get_leader(
 
     let candidate_rows = sqlx::query(
         r#"
-        SELECT fm.computer_id, fm.role, fm.election_priority,
+        SELECT c.id AS computer_id, fm.role, fm.election_priority,
                c.name, c.primary_ip, c.status, c.last_seen_at
-        FROM fleet_members fm
-        JOIN computers c ON c.id = fm.computer_id
+        FROM fleet_workers fm
+        JOIN computers c ON c.name = fm.name
         ORDER BY fm.election_priority DESC, c.name
         "#,
     )

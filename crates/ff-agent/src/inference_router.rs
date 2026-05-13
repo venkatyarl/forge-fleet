@@ -204,7 +204,7 @@ async fn build_endpoint_list(config_path: &Path, client: &reqwest::Client) -> Ve
     local.sort_by(|a, b| b.supports_tools.cmp(&a.supports_tools));
 
     // --- Remote endpoints from Postgres ---
-    if let Ok(toml_str) = std::fs::read_to_string(config_path)
+    if let Ok(toml_str) = tokio::fs::read_to_string(config_path).await
         && let Ok(config) = toml::from_str::<ff_core::config::FleetConfig>(&toml_str)
     {
         let db_url = config.database.url.trim().to_string();

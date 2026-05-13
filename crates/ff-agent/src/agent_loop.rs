@@ -81,16 +81,17 @@ fn check_tool_allowed(
     tool_name: &str,
     allowed: &Option<std::collections::HashSet<String>>,
 ) -> bool {
-    let allowed_json = allowed.as_ref().map(|set| {
-        serde_json::Value::Array(
-            set.iter()
-                .map(|s| serde_json::Value::String(s.clone()))
-                .collect(),
-        )
-    });
-    let empty = serde_json::json!([]);
-    let allowed_val = allowed_json.as_ref().unwrap_or(&empty);
-    crate::audit_logger::tool_is_allowed(tool_name, allowed_val)
+    // Fast path: no allow-list at all → tool is allowed (tool_is_allowed
+    // treats an empty json array the same way, so we can skip the build).
+    let Some(set) = allowed else {
+        return crate::audit_logger::tool_is_allowed(tool_name, &serde_json::Value::Null);
+    };
+    // O(1) membership check against the allow-set, no JSON allocation. The
+    // legacy path built a `Value::Array` by cloning every String in the set
+    // on every tool invocation — for tool-heavy turns that was hundreds of
+    // small allocs per agent turn just to be thrown away.
+    let allowed = set.contains(tool_name);
+    crate::audit_logger::tool_is_allowed_bool(allowed)
 }
 
 /// Fire-and-forget audit log write.

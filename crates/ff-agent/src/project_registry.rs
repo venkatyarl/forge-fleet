@@ -98,7 +98,7 @@ pub async fn seed_from_toml(
     pool: &PgPool,
     toml_path: &Path,
 ) -> Result<ProjectSeedReport, ProjectError> {
-    let raw = match std::fs::read_to_string(toml_path) {
+    let raw = match tokio::fs::read_to_string(toml_path).await {
         Ok(s) => s,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             use std::sync::atomic::{AtomicBool, Ordering};

@@ -776,12 +776,17 @@ async fn load_candidates(pool: &PgPool) -> Result<Vec<Candidate>, sqlx::Error> {
     // (auto-upgrade, sub-agent reaper, openclaw reconciler, task
     // watchdog) freeze until the laptop returns. Reads through
     // COALESCE so legacy rows (NULL eligibility) still count.
+    // Read worker rows + their election_priority directly from
+    // `fleet_workers` (canonical post-V83). Joined to `computers` for the
+    // eligibility filter on the human-physical-machine side. The previous
+    // implementation joined `fleet_members` instead — that table was a
+    // redundant projection of fleet_workers and is now retired.
     let rows = sqlx::query(
-        "SELECT c.id          AS computer_id,
-                c.name        AS member_name,
-                fm.election_priority AS election_priority
-         FROM fleet_members fm
-         JOIN computers c ON c.id = fm.computer_id
+        "SELECT c.id   AS computer_id,
+                fw.name AS member_name,
+                fw.election_priority AS election_priority
+         FROM fleet_workers fw
+         JOIN computers c ON c.name = fw.name
          WHERE COALESCE(c.election_eligibility, 'eligible') <> 'never_leader'",
     )
     .fetch_all(pool)

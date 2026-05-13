@@ -59,7 +59,7 @@ async fn load_fleet_nodes_for_health(_c: &AgentSessionConfig) -> Vec<(String, St
         .unwrap_or_default()
         .join(".forgefleet/fleet.toml");
 
-    if let Ok(toml_str) = std::fs::read_to_string(&config_path)
+    if let Ok(toml_str) = tokio::fs::read_to_string(&config_path).await
         && let Ok(cfg) = toml::from_str::<ff_core::config::FleetConfig>(&toml_str)
     {
         let db_url = cfg.database.url.trim().to_string();

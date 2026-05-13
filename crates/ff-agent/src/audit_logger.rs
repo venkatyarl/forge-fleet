@@ -79,18 +79,25 @@ pub async fn log_tool_call(
 
 /// Check whether a tool is in the step's allow-list.
 ///
-/// - `allowed_tools` is empty (`[]`) → all tools permitted.
+/// - `allowed_tools` is empty (`[]`) or null → all tools permitted.
 /// - `allowed_tools` contains entries → only listed tools permitted.
 pub fn tool_is_allowed(tool_name: &str, allowed_tools: &serde_json::Value) -> bool {
     let allowed = match allowed_tools.as_array() {
         Some(arr) if !arr.is_empty() => arr,
-        _ => return true, // empty array = allow all
+        _ => return true, // empty array / null = allow all
     };
 
     allowed
         .iter()
         .filter_map(|v| v.as_str())
         .any(|allowed_name| allowed_name.eq_ignore_ascii_case(tool_name))
+}
+
+/// Fast-path companion to [`tool_is_allowed`] used by the agent loop when the
+/// caller already has the membership answer (e.g. via a `HashSet<String>`
+/// lookup) — avoids building a `Value::Array` just to throw it away.
+pub fn tool_is_allowed_bool(membership_hit: bool) -> bool {
+    membership_hit
 }
 
 /// Hash a prompt string for audit trail integrity.

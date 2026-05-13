@@ -681,7 +681,7 @@ async fn has_age_header(path: &Path) -> Result<bool> {
 /// 4. `docker exec forgefleet-postgres createdb <target_db>` (idempotent).
 /// 5. Stream the plaintext archive into the container and run
 ///    `pg_restore` (tar format) or `psql` (plain SQL, fallback).
-/// 6. Print `SELECT COUNT(*) FROM fleet_members` as a sanity check.
+/// 6. Print `SELECT COUNT(*) FROM fleet_workers` as a sanity check.
 pub async fn handle_fleet_db_restore(
     pool: &sqlx::PgPool,
     backup_id: &str,
@@ -831,9 +831,9 @@ pub async fn handle_fleet_db_restore(
              scratch DB. Plaintext is at {}.",
             plaintext_path.display()
         );
-        let fm_count = count_fleet_members_live(pool).await.unwrap_or(-1);
+        let fm_count = count_fleet_workers_live(pool).await.unwrap_or(-1);
         println!(
-            "{GREEN}✓{RESET} sanity check — live fleet_members row count: {fm_count} \
+            "{GREEN}✓{RESET} sanity check — live fleet_workers row count: {fm_count} \
              (no load performed; scratch DB '{target_db}' is empty)"
         );
         return Ok(());
@@ -873,7 +873,7 @@ pub async fn handle_fleet_db_restore(
     }
     println!("{GREEN}✓{RESET} {prog} completed");
 
-    // 3) Sanity check — count fleet_members rows in the restored DB.
+    // 3) Sanity check — count fleet_workers rows in the restored DB.
     let count_out = tokio::process::Command::new("docker")
         .args([
             "exec",
@@ -884,7 +884,7 @@ pub async fn handle_fleet_db_restore(
             "-d",
             target_db,
             "-tAc",
-            "SELECT COUNT(*) FROM fleet_members",
+            "SELECT COUNT(*) FROM fleet_workers",
         ])
         .output()
         .await?;
@@ -892,19 +892,20 @@ pub async fn handle_fleet_db_restore(
         let c = String::from_utf8_lossy(&count_out.stdout)
             .trim()
             .to_string();
-        println!("{GREEN}✓{RESET} restored '{target_db}'.fleet_members row count: {c}");
+        println!("{GREEN}✓{RESET} restored '{target_db}'.fleet_workers row count: {c}");
     } else {
         println!(
-            "{YELLOW}note:{RESET} could not count fleet_members in '{target_db}': {}",
+            "{YELLOW}note:{RESET} could not count fleet_workers in '{target_db}': {}",
             String::from_utf8_lossy(&count_out.stderr).trim()
         );
     }
     Ok(())
 }
 
-/// Count rows in the *live* fleet_members table via the existing pool.
-async fn count_fleet_members_live(pool: &sqlx::PgPool) -> Result<i64> {
-    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fleet_members")
+/// Count rows in the *live* fleet_workers table via the existing pool.
+/// Count rows in the *live* fleet_workers table via the existing pool.
+async fn count_fleet_workers_live(pool: &sqlx::PgPool) -> Result<i64> {
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fleet_workers")
         .fetch_one(pool)
         .await?;
     Ok(n)
@@ -1155,7 +1156,7 @@ async fn remove_computer_core(pool: &sqlx::PgPool, name: &str) -> Result<RemoveC
 
     // computers cascades: computer_software, computer_models,
     // computer_model_deployments, computer_downtime_events, computer_trust,
-    // fleet_members, openclaw_installations, computer_docker_containers.
+    // fleet_workers, openclaw_installations, computer_docker_containers.
     let r = sqlx::query("DELETE FROM computers WHERE name = $1")
         .bind(name)
         .execute(&mut *tx)
@@ -1285,7 +1286,7 @@ pub async fn handle_fleet_remove_computer(
     println!("                    fleet_model_deployments, fleet_disk_usage,");
     println!("                    computer_software, computer_models,");
     println!("                    computer_model_deployments, computer_trust,");
-    println!("                    computer_downtime_events, fleet_members,");
+    println!("                    computer_downtime_events, fleet_workers,");
     println!("                    openclaw_installations, computer_docker_containers");
     println!("  explicit deletes: fleet_models (no cascade),");
     println!("                    fleet_leader_state WHERE member_name=<name>");
@@ -1817,13 +1818,13 @@ pub async fn handle_fleet_leader(pool: &sqlx::PgPool, json: bool) -> Result<()> 
         .await
         .map_err(|e| anyhow::anyhow!("pg_get_current_leader: {e}"))?;
 
-    // Candidate pool: fleet_members × computers, sorted by election_priority.
+    // Candidate pool: fleet_workers × computers, sorted by election_priority.
     let cand_rows = sqlx::query(
-        "SELECT c.name        AS name,
-                fm.election_priority AS election_priority
-         FROM fleet_members fm
-         JOIN computers c ON c.id = fm.computer_id
-         ORDER BY fm.election_priority ASC, c.name ASC",
+        "SELECT c.name AS name,
+                fw.election_priority AS election_priority
+         FROM fleet_workers fw
+         JOIN computers c ON c.name = fw.name
+         ORDER BY fw.election_priority ASC, c.name ASC",
     )
     .fetch_all(pool)
     .await
@@ -1920,7 +1921,7 @@ pub async fn handle_fleet_leader(pool: &sqlx::PgPool, json: bool) -> Result<()> 
             );
         }
     } else {
-        println!("\n  (no candidates in fleet_members)");
+        println!("\n  (no candidates in fleet_workers)");
     }
     Ok(())
 }
