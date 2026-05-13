@@ -6320,3 +6320,65 @@ CREATE INDEX IF NOT EXISTS idx_workers_ssh_keys_node_purpose
 CREATE OR REPLACE VIEW fleet_node_ssh_keys AS
     SELECT * FROM fleet_workers_ssh_keys;
 "#;
+
+pub const SCHEMA_V83_RENAME_FLEET_NODES: &str = r#"
+-- ─── V83: rename fleet_nodes → fleet_workers ───────────────────────────────
+-- Final step of the long-running fleet_nodes → fleet_workers rename
+-- (see memory: fleet_workers_naming). The 8 existing FK columns
+-- (`node_name`) continue to reference the renamed table — PostgreSQL
+-- updates FK targets automatically across ALTER TABLE RENAME.
+--
+-- A compatibility VIEW preserves the old name so the 131 unrenamed
+-- Rust call sites (37 files) keep working without a coordinated
+-- redeploy. Single-table views are auto-updatable in Postgres, so
+-- INSERTs / UPDATEs through `fleet_nodes` still hit fleet_workers.
+--
+-- Idempotent: no-op on fresh installs and on already-migrated DBs.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.tables
+               WHERE table_schema = 'public' AND table_name = 'fleet_nodes'
+                 AND table_type = 'BASE TABLE')
+       AND NOT EXISTS (SELECT 1 FROM information_schema.tables
+               WHERE table_schema = 'public' AND table_name = 'fleet_workers'
+                 AND table_type = 'BASE TABLE')
+    THEN
+        ALTER TABLE fleet_nodes RENAME TO fleet_workers;
+        -- Rename any indexes that were named after the old table.
+        ALTER INDEX IF EXISTS fleet_nodes_pkey RENAME TO fleet_workers_pkey;
+        ALTER INDEX IF EXISTS fleet_nodes_name_key RENAME TO fleet_workers_name_key;
+    END IF;
+END $$;
+
+-- Fresh installs may never have had the old name.
+CREATE TABLE IF NOT EXISTS fleet_workers (
+    name              TEXT PRIMARY KEY,
+    ip                TEXT NOT NULL,
+    ssh_user          TEXT NOT NULL DEFAULT 'root',
+    ram_gb            INTEGER NOT NULL DEFAULT 0,
+    cpu_cores         INTEGER NOT NULL DEFAULT 0,
+    os                TEXT NOT NULL DEFAULT '',
+    role              TEXT NOT NULL DEFAULT 'worker',
+    election_priority INTEGER NOT NULL DEFAULT 50,
+    hardware          TEXT NOT NULL DEFAULT '',
+    alt_ips           JSONB NOT NULL DEFAULT '[]'::jsonb,
+    capabilities      JSONB NOT NULL DEFAULT '{}'::jsonb,
+    preferences       JSONB NOT NULL DEFAULT '{}'::jsonb,
+    resources         JSONB NOT NULL DEFAULT '{}'::jsonb,
+    status            TEXT NOT NULL DEFAULT 'online',
+    registered_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    runtime           TEXT NOT NULL DEFAULT 'unknown',
+    models_dir        TEXT NOT NULL DEFAULT '~/models',
+    disk_quota_pct    INTEGER NOT NULL DEFAULT 80,
+    sub_agent_count   INTEGER NOT NULL DEFAULT 1,
+    gh_account        TEXT,
+    tooling           JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+
+-- Compatibility view so the 131 unrenamed call sites keep resolving.
+-- Single-table views are auto-updatable in Postgres ≥ 9.3, so
+-- INSERT / UPDATE / DELETE via `fleet_nodes` continue to work.
+CREATE OR REPLACE VIEW fleet_nodes AS
+    SELECT * FROM fleet_workers;
+"#;
