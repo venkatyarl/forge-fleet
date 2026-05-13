@@ -4,7 +4,10 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio::process::Command;
 
-use super::{AgentTool, AgentToolContext, AgentToolResult, MAX_TOOL_RESULT_CHARS, truncate_output, shell_escape_single};
+use super::{
+    AgentTool, AgentToolContext, AgentToolResult, MAX_TOOL_RESULT_CHARS, shell_escape_single,
+    truncate_output,
+};
 
 pub struct CodeComplexityTool;
 #[async_trait]
@@ -164,9 +167,7 @@ impl AgentTool for LogAnalyzerTool {
 
         let path_escaped = shell_escape_single(&path.to_string_lossy());
         let cmd = if filter.is_empty() {
-            format!(
-                "tail -n {tail} {path_escaped} | sort | uniq -c | sort -rn | head -30",
-            )
+            format!("tail -n {tail} {path_escaped} | sort | uniq -c | sort -rn | head -30",)
         } else {
             format!(
                 "tail -n {tail} {path_escaped} | grep -i {} | head -50",

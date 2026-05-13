@@ -1,5 +1,5 @@
-use anyhow::Result;
 use crate::truncate_for_col;
+use anyhow::Result;
 
 pub async fn handle_versions(node_filter: Option<String>) -> Result<()> {
     let pool = ff_agent::fleet_info::get_fleet_pool()

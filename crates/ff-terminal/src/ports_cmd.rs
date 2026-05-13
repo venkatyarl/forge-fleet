@@ -268,7 +268,6 @@ pub async fn handle_ports_scan(pool: &sqlx::PgPool, computer: &str) -> Result<()
     Ok(())
 }
 
-
 pub async fn handle_ports(cmd: crate::PortsCommand) -> Result<()> {
     let pool = ff_agent::fleet_info::get_fleet_pool()
         .await

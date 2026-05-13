@@ -1,5 +1,5 @@
-use anyhow::Result;
 use crate::truncate_for_col;
+use anyhow::Result;
 
 pub async fn handle_llm(cmd: crate::LlmCommand) -> Result<()> {
     match cmd {

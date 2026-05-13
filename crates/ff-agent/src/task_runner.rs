@@ -951,9 +951,10 @@ async fn run_shell_payload(
     }
     cmd.kill_on_drop(true);
 
-    let out = cmd.output().await.map_err(|e| {
-        TaskRunnerError::BadPayload(format!("spawn: {e}"))
-    })?;
+    let out = cmd
+        .output()
+        .await
+        .map_err(|e| TaskRunnerError::BadPayload(format!("spawn: {e}")))?;
 
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();

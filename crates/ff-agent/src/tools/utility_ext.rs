@@ -442,7 +442,13 @@ impl AgentTool for HealthMonitorTool {
 
         for url in &urls {
             let start = std::time::Instant::now();
-            match self.client.get(*url).timeout(std::time::Duration::from_secs(timeout)).send().await {
+            match self
+                .client
+                .get(*url)
+                .timeout(std::time::Duration::from_secs(timeout))
+                .send()
+                .await
+            {
                 Ok(resp) => {
                     let status = resp.status().as_u16();
                     let elapsed = start.elapsed().as_millis();

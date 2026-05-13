@@ -1,5 +1,5 @@
-use anyhow::Result;
 use crate::{CYAN, GREEN, RESET, YELLOW};
+use anyhow::Result;
 
 pub async fn handle_openclaw(cmd: crate::OpenclawCommand) -> Result<()> {
     let pool = ff_agent::fleet_info::get_fleet_pool()

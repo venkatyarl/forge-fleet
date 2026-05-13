@@ -147,7 +147,13 @@ pub async fn load_model(pool: &sqlx::PgPool, opts: LoadOptions) -> Result<LoadRe
     });
 
     // Wait for health endpoint to come up (up to 90s).
-    let health_ok = wait_for_health(runtime_label, port, std::time::Duration::from_secs(90), &*SHARED_HTTP).await;
+    let health_ok = wait_for_health(
+        runtime_label,
+        port,
+        std::time::Duration::from_secs(90),
+        &*SHARED_HTTP,
+    )
+    .await;
 
     // Upsert deployment row.
     let deployment_id = ff_db::pg_upsert_deployment(

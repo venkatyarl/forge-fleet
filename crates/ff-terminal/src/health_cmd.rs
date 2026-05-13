@@ -1,6 +1,6 @@
+use crate::{GREEN, RED, RESET, YELLOW};
 use anyhow::Result;
 use ff_agent::agent_loop::AgentSessionConfig;
-use crate::{GREEN, RED, RESET, YELLOW};
 
 pub async fn handle_health(c: &AgentSessionConfig) -> Result<()> {
     static SHARED_HTTP: std::sync::LazyLock<reqwest::Client> =
@@ -70,11 +70,12 @@ async fn load_fleet_nodes_for_health(_c: &AgentSessionConfig) -> Vec<(String, St
                 .connect(&db_url)
                 .await
         {
-            let rows: Vec<(String, String)> =
-                sqlx::query_as("SELECT name, ip FROM fleet_workers ORDER BY election_priority, name")
-                    .fetch_all(&pool)
-                    .await
-                    .unwrap_or_default();
+            let rows: Vec<(String, String)> = sqlx::query_as(
+                "SELECT name, ip FROM fleet_workers ORDER BY election_priority, name",
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap_or_default();
 
             if !rows.is_empty() {
                 return rows.into_iter().map(|(n, ip)| (n, ip, 51000u16)).collect();

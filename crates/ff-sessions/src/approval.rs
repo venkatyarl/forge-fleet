@@ -465,10 +465,7 @@ impl Default for ApprovalManager {
 
 /// Shared reaper logic — drops resolved (non-Pending) approvals whose
 /// `decided_at` is older than `max_age`. Returns the removed count.
-fn reap_completed_map(
-    requests: &DashMap<Uuid, Approval>,
-    max_age: chrono::Duration,
-) -> usize {
+fn reap_completed_map(requests: &DashMap<Uuid, Approval>, max_age: chrono::Duration) -> usize {
     let now = Utc::now();
     let to_remove: Vec<Uuid> = requests
         .iter()
@@ -479,7 +476,11 @@ fn reap_completed_map(
                 .decided_at
                 .map(|t| now.signed_duration_since(t) >= max_age)
                 .unwrap_or(false);
-            if done && old_enough { Some(req.id) } else { None }
+            if done && old_enough {
+                Some(req.id)
+            } else {
+                None
+            }
         })
         .collect();
     let count = to_remove.len();

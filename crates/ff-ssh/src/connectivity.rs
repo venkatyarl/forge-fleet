@@ -108,7 +108,9 @@ impl ConnectivityChecker {
                 let checker = self.clone();
                 let candidate = candidate.clone();
                 move || checker.probe_candidate(&candidate)
-            }).await {
+            })
+            .await
+            {
                 Ok(Ok(())) => {
                     return NodeConnectivityResult {
                         node: node.name.clone(),

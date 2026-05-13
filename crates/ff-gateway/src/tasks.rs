@@ -243,10 +243,7 @@ async fn handle_task_inner(
     {
         let cache = state.pulse_cache.as_deref();
         let pg = state.operational_store.as_ref().and_then(|s| s.pg_pool());
-        match router
-            .route_completion_cached(&body, cache, pg)
-            .await
-        {
+        match router.route_completion_cached(&body, cache, pg).await {
             Ok(result) => {
                 info!(task = %task_type, model = %model, "task routed directly via pulse router");
                 return Response::builder()
@@ -500,7 +497,9 @@ async fn try_cloud_then_fail(
 ) -> Result<Response<Body>, (StatusCode, Json<Value>)> {
     if let Some(pool) = state.operational_store.as_ref().and_then(|s| s.pg_pool()) {
         let model_id = req.model.as_deref().unwrap_or("gpt-4o-mini");
-        if let Some(result) = crate::cloud_llm::try_route_to_cloud(pool, model_id, body, None, &state.http_client).await
+        if let Some(result) =
+            crate::cloud_llm::try_route_to_cloud(pool, model_id, body, None, &state.http_client)
+                .await
         {
             match result {
                 Ok(resp) => {

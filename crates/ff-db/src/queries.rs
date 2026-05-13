@@ -2479,7 +2479,15 @@ pub async fn pg_insert_node_ssh_key(
     key_type: &str,
     fingerprint: &str,
 ) -> Result<()> {
-    pg_insert_worker_ssh_key(pool, node_name, key_purpose, public_key, key_type, fingerprint).await
+    pg_insert_worker_ssh_key(
+        pool,
+        node_name,
+        key_purpose,
+        public_key,
+        key_type,
+        fingerprint,
+    )
+    .await
 }
 
 /// List SSH keys for a worker (optionally filtered by purpose: 'user' or 'host').

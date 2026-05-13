@@ -107,7 +107,8 @@ impl AgentTool for TrendAnalysisTool {
             "https://api.github.com/search/repositories?q={}&sort=stars&order=desc&per_page=5",
             urlenc(topic)
         );
-        if let Ok(resp) = self.client
+        if let Ok(resp) = self
+            .client
             .get(&gh_url)
             .header("User-Agent", "ForgeFleet")
             .send()

@@ -1,5 +1,5 @@
-use anyhow::Result;
 use crate::{GREEN, RESET, whoami_tag};
+use anyhow::Result;
 
 pub async fn handle_power(cmd: crate::PowerCommand) -> Result<()> {
     let pool = ff_agent::fleet_info::get_fleet_pool()

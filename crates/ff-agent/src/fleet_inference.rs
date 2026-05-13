@@ -294,7 +294,8 @@ impl FleetInferenceManager {
         for name in names {
             if let Some(mut ep) = self.endpoints.get_mut(&name) {
                 let url = format!("{}/health", ep.url.trim_end_matches('/'));
-                let healthy = self.client
+                let healthy = self
+                    .client
                     .get(&url)
                     .send()
                     .await

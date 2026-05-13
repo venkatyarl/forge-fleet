@@ -376,7 +376,8 @@ impl AgentTool for SelfHealTool {
 
         for (name, ip) in &nodes {
             // Check LLM server
-            let llm_ok = self.client
+            let llm_ok = self
+                .client
                 .get(format!("http://{ip}:55000/health"))
                 .send()
                 .await
@@ -428,7 +429,8 @@ impl AgentTool for SelfHealTool {
                 }
                 let mut healed = Vec::new();
                 for (name, ip) in &nodes {
-                    let llm_ok = self.client
+                    let llm_ok = self
+                        .client
                         .get(format!("http://{ip}:55000/health"))
                         .send()
                         .await

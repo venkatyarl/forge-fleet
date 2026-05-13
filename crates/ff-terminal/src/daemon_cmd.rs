@@ -591,7 +591,13 @@ async fn execute_shell(
             // SSH to target: look up user@ip from DB.
             let node = match nodes.iter().find(|x| x.name.eq_ignore_ascii_case(n)) {
                 Some(n) => n,
-                None => return (false, None, Some(format!("node '{n}' not in fleet_workers"))),
+                None => {
+                    return (
+                        false,
+                        None,
+                        Some(format!("node '{n}' not in fleet_workers")),
+                    );
+                }
             };
             let dest = format!("{}@{}", node.ssh_user, node.ip);
             // Assume remote targets are Linux (Marcus/Sophie/Priya are Ubuntu;
@@ -793,16 +799,6 @@ async fn execute_http(
 
 // ─── Versions / Fleet / Onboard CLI handlers (Phase 3+5) ──────────────────
 
-
-
-
-
-
-
-
-
-
-
 /// `ff pm import-claude-tasks` — parses the Claude Code session JSONL
 /// and upserts each task as a `work_items` row.
 ///
@@ -912,8 +908,11 @@ async fn defer_pass(
                 // Detect online/offline transitions and publish to Redis so
                 // workers on newly-online nodes can wake up immediately
                 // instead of waiting for the next poll tick.
-                static LAST_ONLINE: std::sync::LazyLock<tokio::sync::Mutex<std::collections::HashSet<String>>> =
-                    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(std::collections::HashSet::new()));
+                static LAST_ONLINE: std::sync::LazyLock<
+                    tokio::sync::Mutex<std::collections::HashSet<String>>,
+                > = std::sync::LazyLock::new(|| {
+                    tokio::sync::Mutex::new(std::collections::HashSet::new())
+                });
                 let current: std::collections::HashSet<String> = online.iter().cloned().collect();
                 let (newly_online, newly_offline) = {
                     let mut prev = LAST_ONLINE.lock().await;

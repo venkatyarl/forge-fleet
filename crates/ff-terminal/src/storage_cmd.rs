@@ -1,5 +1,5 @@
+use crate::{GREEN, RED, RESET, truncate_str};
 use anyhow::Result;
-use crate::{truncate_str, GREEN, RED, RESET};
 
 pub async fn handle_storage(cmd: crate::StorageCommand) -> Result<()> {
     let pool = ff_agent::fleet_info::get_fleet_pool()

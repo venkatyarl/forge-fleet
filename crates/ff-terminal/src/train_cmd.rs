@@ -1,5 +1,5 @@
+use crate::{GREEN, RESET, truncate_str, whoami_tag};
 use anyhow::Result;
-use crate::{truncate_str, GREEN, RESET, whoami_tag};
 
 pub async fn handle_train(cmd: crate::TrainCommand) -> Result<()> {
     let pool = ff_agent::fleet_info::get_fleet_pool()

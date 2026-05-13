@@ -248,8 +248,14 @@ impl WorkerAgent {
                     "model inference requested"
                 );
                 let inference_base = self.inference_base_url();
-                execute_model_inference(&inference_base, model.as_deref(), prompt, *max_tokens, &self.client)
-                    .await
+                execute_model_inference(
+                    &inference_base,
+                    model.as_deref(),
+                    prompt,
+                    *max_tokens,
+                    &self.client,
+                )
+                .await
             }
         };
 

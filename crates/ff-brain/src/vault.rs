@@ -352,22 +352,23 @@ pub async fn index_vault(pool: &PgPool, config: &VaultConfig) -> Result<IndexRep
     for file_path in &md_files {
         let file_path = file_path.clone();
         let brain_root = brain_root.clone();
-        let node = match tokio::task::spawn_blocking(move || parse_vault_file(&file_path, &brain_root))
-            .await
-            .map_err(|e| format!("spawn error: {e}"))
-            .and_then(|r| r)
-        {
-            Ok(n) => n,
-            Err(e) => {
-                if e.contains("skipping oversized") {
-                    debug!("{e}");
-                } else {
-                    warn!("parse error: {e}");
+        let node =
+            match tokio::task::spawn_blocking(move || parse_vault_file(&file_path, &brain_root))
+                .await
+                .map_err(|e| format!("spawn error: {e}"))
+                .and_then(|r| r)
+            {
+                Ok(n) => n,
+                Err(e) => {
+                    if e.contains("skipping oversized") {
+                        debug!("{e}");
+                    } else {
+                        warn!("parse error: {e}");
+                    }
+                    report.unchanged_skipped += 1;
+                    continue;
                 }
-                report.unchanged_skipped += 1;
-                continue;
-            }
-        };
+            };
 
         // Check if content changed
         if let Some(old_hash) = existing_hashes.get(&node.path)

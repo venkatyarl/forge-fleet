@@ -138,7 +138,10 @@ impl FleetResolver {
         // 2. ~/.ssh/config
         match self.resolve_from_ssh_config() {
             Ok(nodes) if !nodes.is_empty() => {
-                debug!(count = nodes.len(), "resolved fleet nodes from ~/.ssh/config");
+                debug!(
+                    count = nodes.len(),
+                    "resolved fleet nodes from ~/.ssh/config"
+                );
                 return Ok(nodes);
             }
             Ok(_) => debug!("~/.ssh/config has no fleet nodes"),
@@ -364,9 +367,7 @@ impl FleetResolver {
     }
 
     fn home_dir() -> Option<PathBuf> {
-        std::env::var("HOME")
-            .ok()
-            .map(PathBuf::from)
+        std::env::var("HOME").ok().map(PathBuf::from)
     }
 }
 

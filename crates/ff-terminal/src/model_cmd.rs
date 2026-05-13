@@ -1,5 +1,8 @@
+use crate::{
+    CYAN, GREEN, RED, RESET, YELLOW, expand_tilde, human_bytes, shell_escape_single,
+    trunc_for_status, whoami_tag,
+};
 use anyhow::Result;
-use crate::{expand_tilde, human_bytes, shell_escape_single, trunc_for_status, whoami_tag, CYAN, GREEN, RED, RESET, YELLOW};
 use std::path::PathBuf;
 
 pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
@@ -823,19 +826,21 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
             }
             println!("\n(dry-run; use `ff model delete <library-id> --yes` to actually remove)");
         }
-        crate::ModelCommand::DiskSample => match ff_agent::disk_sampler::sample_local_disk(&pool).await {
-            Ok(s) => {
-                println!("Node:        {}", s.node_name);
-                println!("Models dir:  {}", s.models_dir.display());
-                println!("Total:       {}", human_bytes(s.total_bytes));
-                println!("Used:        {}", human_bytes(s.used_bytes));
-                println!("Free:        {}", human_bytes(s.free_bytes));
-                println!("Models size: {}", human_bytes(s.models_bytes));
-                println!("Quota:       {}%", s.quota_pct);
-                println!("Over quota:  {}", s.over_quota);
+        crate::ModelCommand::DiskSample => {
+            match ff_agent::disk_sampler::sample_local_disk(&pool).await {
+                Ok(s) => {
+                    println!("Node:        {}", s.node_name);
+                    println!("Models dir:  {}", s.models_dir.display());
+                    println!("Total:       {}", human_bytes(s.total_bytes));
+                    println!("Used:        {}", human_bytes(s.used_bytes));
+                    println!("Free:        {}", human_bytes(s.free_bytes));
+                    println!("Models size: {}", human_bytes(s.models_bytes));
+                    println!("Quota:       {}%", s.quota_pct);
+                    println!("Over quota:  {}", s.over_quota);
+                }
+                Err(e) => anyhow::bail!("disk sample failed: {e}"),
             }
-            Err(e) => anyhow::bail!("disk sample failed: {e}"),
-        },
+        }
         crate::ModelCommand::Ping { id } => {
             match ff_agent::model_runtime::health_check_deployment(&pool, &id).await {
                 Ok(true) => println!("{CYAN}✓ healthy{RESET}"),

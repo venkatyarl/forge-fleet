@@ -389,11 +389,7 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
 
     let model_truncated = {
         let m = &tab.current_model;
-        let end = m
-            .char_indices()
-            .nth(30)
-            .map(|(i, _)| i)
-            .unwrap_or(m.len());
+        let end = m.char_indices().nth(30).map(|(i, _)| i).unwrap_or(m.len());
         &m[..end]
     };
 
@@ -411,7 +407,10 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             ),
             theme.status_text,
         ),
-        Span::styled(elapsed_marker, Style::default().fg(Color::Rgb(251, 191, 36))),
+        Span::styled(
+            elapsed_marker,
+            Style::default().fg(Color::Rgb(251, 191, 36)),
+        ),
         Span::styled("│ ", theme.status_text),
         Span::styled(app.web_url(), Style::default().fg(Color::Rgb(99, 102, 241))),
     ]);
@@ -994,7 +993,10 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
 
     // Elapsed timer — bright + prominent when an agent turn is in flight.
     if let Some(elapsed) = tab.elapsed_str() {
-        spans.push(Span::styled("  ⏱ ", Style::default().fg(Color::Rgb(148, 163, 184))));
+        spans.push(Span::styled(
+            "  ⏱ ",
+            Style::default().fg(Color::Rgb(148, 163, 184)),
+        ));
         spans.push(Span::styled(
             elapsed,
             Style::default()

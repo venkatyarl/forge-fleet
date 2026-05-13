@@ -1,6 +1,6 @@
+use crate::{GREEN, RESET, load_config};
 use anyhow::Result;
 use std::path::Path;
-use crate::{GREEN, RESET, load_config};
 
 pub async fn handle_config(cmd: crate::ConfigCommand, p: &Path) -> Result<()> {
     match cmd {

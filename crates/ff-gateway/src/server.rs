@@ -14,8 +14,8 @@ use axum::{
 };
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use futures::stream::StreamExt;
 use dashmap::DashMap;
+use futures::stream::StreamExt;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -457,7 +457,11 @@ impl GatewayServer {
             }
         });
 
-        Ok(Self { config, state, flush_handle: Some(flush_handle) })
+        Ok(Self {
+            config,
+            state,
+            flush_handle: Some(flush_handle),
+        })
     }
 
     pub fn app(&self) -> Router {
@@ -706,7 +710,10 @@ pub fn build_router(state: Arc<GatewayState>, mc_db_path: Option<&str>) -> Route
         .route("/api/update/resume", post(update_resume))
         .route("/api/update/abort", post(update_abort))
         .route("/v1/chat/completions", post(proxy_chat_completions))
-        .route("/v1/orchestrate", post(crate::orchestrate::handle_orchestrate))
+        .route(
+            "/v1/orchestrate",
+            post(crate::orchestrate::handle_orchestrate),
+        )
         .route("/v1/models", get(list_models))
         .route("/api/models", get(list_models))
         .route("/v1/fleet/route", post(route_fleet_capability))
@@ -4602,9 +4609,10 @@ async fn proxy_chat_completions(
         .get("X-ForgeFleet-Session")
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned)
-        && let Some(obj) = raw_payload.as_object_mut() {
-            obj.insert("session_id".to_string(), json!(session_header));
-        }
+        && let Some(obj) = raw_payload.as_object_mut()
+    {
+        obj.insert("session_id".to_string(), json!(session_header));
+    }
 
     // ── Async mode (P1.6) ────────────────────────────────────────────
     //
@@ -4655,8 +4663,14 @@ async fn proxy_chat_completions(
     if let Some(store) = state.operational_store.as_ref()
         && let Some(pool) = store.pg_pool()
         && let Some(model) = raw_payload.get("model").and_then(|v| v.as_str())
-        && let Some(result) =
-            crate::cloud_llm::try_route_to_cloud(pool, model, &raw_payload, None, &state.http_client).await
+        && let Some(result) = crate::cloud_llm::try_route_to_cloud(
+            pool,
+            model,
+            &raw_payload,
+            None,
+            &state.http_client,
+        )
+        .await
     {
         match result {
             Ok(resp) => return Ok(resp),
@@ -4763,7 +4777,9 @@ async fn proxy_chat_completions(
                         ));
                 }
                 Err(llm_routing::LlmRoutingError::NoMatch { .. }) => {
-                    debug!("pulse found no matching server for streaming; trying tier-router fallback");
+                    debug!(
+                        "pulse found no matching server for streaming; trying tier-router fallback"
+                    );
                 }
                 Err(llm_routing::LlmRoutingError::MissingModel) => {
                     let (code, body) =
@@ -5184,7 +5200,9 @@ async fn record_usage_from_response(
 /// and Prometheus counters so local fleet inference is visible in the
 /// ledger alongside cloud provider usage.
 async fn record_pulse_usage(state: &GatewayState, value: &Value) {
-    let Some(usage) = value.get("usage") else { return };
+    let Some(usage) = value.get("usage") else {
+        return;
+    };
     let prompt_tokens = usage
         .get("prompt_tokens")
         .and_then(|v| v.as_u64())
@@ -5199,14 +5217,10 @@ async fn record_pulse_usage(state: &GatewayState, value: &Value) {
         .unwrap_or("unknown")
         .to_string();
 
-    let record = TokenUsageRecord::new(
-        uuid::Uuid::new_v4().to_string(),
-        &model,
-        "pulse-local",
-    )
-    .with_tokens(prompt_tokens, completion_tokens)
-    .with_cost(0.0, true) // local inference has no external cost
-    .with_latency(0); // latency not captured in this path yet
+    let record = TokenUsageRecord::new(uuid::Uuid::new_v4().to_string(), &model, "pulse-local")
+        .with_tokens(prompt_tokens, completion_tokens)
+        .with_cost(0.0, true) // local inference has no external cost
+        .with_latency(0); // latency not captured in this path yet
 
     state.cost_tracker.record_usage(record).await;
 

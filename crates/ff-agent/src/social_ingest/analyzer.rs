@@ -49,7 +49,6 @@ pub async fn analyze(
     llm_endpoint: &str,
     model_id: &str,
 ) -> Result<Analysis> {
-
     let mut per_frame: Vec<FrameAnalysis> = Vec::new();
     for item in &post.media_items {
         if item.kind != "image" && item.kind != "frame" {

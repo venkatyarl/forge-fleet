@@ -1,5 +1,5 @@
-use anyhow::Result;
 use crate::{CYAN, RESET, YELLOW};
+use anyhow::Result;
 
 pub async fn handle_events(cmd: crate::EventsCommand) -> Result<()> {
     use futures::StreamExt;

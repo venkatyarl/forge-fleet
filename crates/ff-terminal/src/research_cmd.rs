@@ -1,6 +1,6 @@
+use crate::{CYAN, GREEN, RESET, truncate_str};
 use anyhow::Result;
 use std::path::PathBuf;
-use crate::{CYAN, GREEN, RESET, truncate_str};
 
 pub async fn handle_research(
     prompt: &str,

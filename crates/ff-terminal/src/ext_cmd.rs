@@ -311,7 +311,6 @@ pub async fn handle_ext_install(
     Ok(())
 }
 
-
 pub async fn handle_ext(cmd: crate::ExtCommand) -> Result<()> {
     let pool = ff_agent::fleet_info::get_fleet_pool()
         .await

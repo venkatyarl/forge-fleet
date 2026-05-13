@@ -735,7 +735,14 @@ impl TelegramPollingTransport {
         // Build conversation history for LLM
         let display_name = incoming.from_username.as_deref().unwrap_or("user");
 
-        let assistant_text = match call_fleet_llm(pool, &thread_slug, display_name, thread_id, self.client.http_client()).await
+        let assistant_text = match call_fleet_llm(
+            pool,
+            &thread_slug,
+            display_name,
+            thread_id,
+            self.client.http_client(),
+        )
+        .await
         {
             Ok(text) => text,
             Err(e) => {

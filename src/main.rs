@@ -1134,7 +1134,11 @@ async fn build_fleet_scan_targets(config: &FleetConfig) -> Vec<ScanTarget> {
     build_scan_targets(
         computers.iter().map(|c| {
             // Priority: keep the leader (50 default) hot, others 100.
-            let prio: u32 = if c.role.eq_ignore_ascii_case("leader") { 50 } else { 100 };
+            let prio: u32 = if c.role.eq_ignore_ascii_case("leader") {
+                50
+            } else {
+                100
+            };
             (c.name.as_str(), c.ip.as_str(), None, prio)
         }),
         config.fleet.api_port,

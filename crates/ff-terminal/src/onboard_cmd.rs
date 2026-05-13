@@ -1,5 +1,5 @@
-use anyhow::Result;
 use crate::{CYAN, RESET};
+use anyhow::Result;
 
 pub async fn handle_onboard(cmd: crate::OnboardCommand) -> Result<()> {
     let pool = ff_agent::fleet_info::get_fleet_pool()

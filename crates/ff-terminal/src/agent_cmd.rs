@@ -488,8 +488,6 @@ pub fn shell_quote(s: &str) -> String {
     out
 }
 
-
-
 pub async fn handle_agent(cmd: crate::AgentCommand) -> Result<()> {
     let pool = ff_agent::fleet_info::get_fleet_pool()
         .await

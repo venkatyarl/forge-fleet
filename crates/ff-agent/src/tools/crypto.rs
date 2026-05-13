@@ -55,7 +55,10 @@ impl AgentTool for HashGeneratorTool {
                     "{} ({}): {}",
                     algo.to_uppercase(),
                     "string",
-                    String::from_utf8_lossy(&o.stdout).split_whitespace().next().unwrap_or("")
+                    String::from_utf8_lossy(&o.stdout)
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
                 )),
                 Err(e) => AgentToolResult::err(format!("Hash failed: {e}")),
             }
@@ -69,7 +72,10 @@ impl AgentTool for HashGeneratorTool {
                 Ok(o) => AgentToolResult::ok(format!(
                     "{} (file): {}",
                     algo.to_uppercase(),
-                    String::from_utf8_lossy(&o.stdout).split_whitespace().next().unwrap_or("")
+                    String::from_utf8_lossy(&o.stdout)
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
                 )),
                 Err(e) => AgentToolResult::err(format!("Hash failed: {e}")),
             }
@@ -261,9 +267,7 @@ impl AgentTool for CalculatorTool {
                 || matches!(c, '+' | '-' | '*' | '/' | '%' | '^' | '(' | ')' | '.' | ',')
                 || c.is_ascii_alphabetic()
         }) {
-            return AgentToolResult::err(
-                "Expression contains invalid characters".to_string(),
-            );
+            return AgentToolResult::err("Expression contains invalid characters".to_string());
         }
 
         // Try Python first (most capable) — pass expression via stdin to avoid shell injection
@@ -290,11 +294,7 @@ impl AgentTool for CalculatorTool {
                 if stdout.trim().starts_with("ERROR:") {
                     return self.run_bc(expr).await;
                 }
-                return AgentToolResult::ok(format!(
-                    "{} = {}",
-                    expr,
-                    stdout.trim()
-                ));
+                return AgentToolResult::ok(format!("{} = {}", expr, stdout.trim()));
             }
             _ => self.run_bc(expr).await,
         }
@@ -313,7 +313,9 @@ impl CalculatorTool {
             Err(e) => return AgentToolResult::err(format!("Calculation failed: {e}")),
         };
         if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(format!("scale=6; {expr}\n").as_bytes()).await;
+            let _ = stdin
+                .write_all(format!("scale=6; {expr}\n").as_bytes())
+                .await;
         }
         match child.wait_with_output().await {
             Ok(out) if out.status.success() => AgentToolResult::ok(format!(

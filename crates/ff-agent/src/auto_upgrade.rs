@@ -503,7 +503,11 @@ impl AutoUpgradeTick {
             .user_agent("forgefleetd/auto-upgrade")
             .build()
             .expect("build reqwest client");
-        Self { pool, my_name, client }
+        Self {
+            pool,
+            my_name,
+            client,
+        }
     }
 
     /// One tick: gate, find drift, enqueue.
@@ -982,7 +986,10 @@ async fn flip_drift_status(pool: &PgPool) -> Result<u64> {
 /// `version` field into `software_registry.latest_version`. Soft-fail per row
 /// — a single registry hiccup must not poison the whole tick. The HTTP layer
 /// honors a 5s timeout to keep the auto-upgrade tick bounded.
-async fn refresh_npm_registry_latest_versions(client: &reqwest::Client, pool: &PgPool) -> Result<u64> {
+async fn refresh_npm_registry_latest_versions(
+    client: &reqwest::Client,
+    pool: &PgPool,
+) -> Result<u64> {
     refresh_via_http(
         client,
         pool,
@@ -1021,7 +1028,10 @@ async fn refresh_pypi_latest_versions(client: &reqwest::Client, pool: &PgPool) -
 /// `version_source = {"method":"github_release","repo":"cli/cli"}`.
 /// Strips a leading 'v' from the tag (v2.91.0 → 2.91.0) so versions match
 /// `--version` outputs.
-async fn refresh_github_release_latest_versions(client: &reqwest::Client, pool: &PgPool) -> Result<u64> {
+async fn refresh_github_release_latest_versions(
+    client: &reqwest::Client,
+    pool: &PgPool,
+) -> Result<u64> {
     refresh_via_http(
         client,
         pool,

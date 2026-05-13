@@ -16,7 +16,7 @@ use chrono::Utc;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sqlx::Row;
-use tracing::{info, info_span, warn, Instrument};
+use tracing::{Instrument, info, info_span, warn};
 use uuid::Uuid;
 
 use ff_core::Node as CoreNode;
@@ -25,7 +25,6 @@ use ff_orchestrator::decomposer::Decomposer;
 use ff_orchestrator::parallel::ParallelExecutor;
 use ff_orchestrator::planner::Planner;
 use ff_orchestrator::router::{RouteConstraints, RouteDecision, TaskRouter};
-
 
 use crate::llm_routing::CircuitBreaker;
 use crate::orchestrator_adapter::{build_dispatch_fn, pulse_beats_to_fleet_state};
@@ -145,11 +144,7 @@ async fn do_orchestrate(
     }
 
     // Query catalog from DB if available
-    let catalog = if let Some(pool) = state
-        .operational_store
-        .as_ref()
-        .and_then(|s| s.pg_pool())
-    {
+    let catalog = if let Some(pool) = state.operational_store.as_ref().and_then(|s| s.pg_pool()) {
         match query_model_catalog(pool).await {
             Ok(c) => c,
             Err(e) => {
@@ -217,11 +212,17 @@ async fn do_orchestrate(
 
     // 7. Execute
     let executor = ParallelExecutor::new(&plan, routes.clone(), assignments, req.fail_fast);
-    let subtask_map: HashMap<_, _> =
-        decomposition.subtasks.into_iter().map(|s| (s.id, s)).collect();
+    let subtask_map: HashMap<_, _> = decomposition
+        .subtasks
+        .into_iter()
+        .map(|s| (s.id, s))
+        .collect();
     let dispatch = build_dispatch_fn(state, subtask_map, model_endpoints);
 
-    info!(stage_count = plan.stages.len(), "orchestrate: executing plan");
+    info!(
+        stage_count = plan.stages.len(),
+        "orchestrate: executing plan"
+    );
     let result = executor
         .execute(&plan, dispatch)
         .instrument(info_span!("orchestrate_execute"))
@@ -390,8 +391,8 @@ mod tests {
     use ff_orchestrator::parallel::{DispatchFn, SubTaskStatus};
     use ff_orchestrator::router::ModelScore;
     use ff_pulse::beat_v2::{
-        Capabilities, ClusterInfo, DbTopology, DockerStatus, HardwareInfo, LoadInfo, LlmMemoryUsage,
-        LlmServer, LlmServerModel, MemoryInfo, NetworkInfo, PulseBeatV2,
+        Capabilities, ClusterInfo, DbTopology, DockerStatus, HardwareInfo, LlmMemoryUsage,
+        LlmServer, LlmServerModel, LoadInfo, MemoryInfo, NetworkInfo, PulseBeatV2,
     };
 
     fn mock_beat() -> PulseBeatV2 {

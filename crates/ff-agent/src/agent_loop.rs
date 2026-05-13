@@ -12,9 +12,7 @@
 
 use std::path::PathBuf;
 
-use ff_api::tool_calling::{
-    OpenAiTool, ToolChatCompletionResponse, ToolChatMessage,
-};
+use ff_api::tool_calling::{OpenAiTool, ToolChatCompletionResponse, ToolChatMessage};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -35,13 +33,12 @@ use crate::tools::{self, AgentTool, AgentToolContext};
 
 /// Shared HTTP client for tool-usage logging (avoids spawning a new
 /// connection-pool thread on every tool call).
-static TOOL_USAGE_CLIENT: std::sync::LazyLock<reqwest::Client> =
-    std::sync::LazyLock::new(|| {
-        reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .expect("build reqwest client")
-    });
+static TOOL_USAGE_CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("build reqwest client")
+});
 
 /// Semaphore to cap concurrent tool-usage logging requests.
 static TOOL_USAGE_SEM: std::sync::LazyLock<tokio::sync::Semaphore> =
@@ -113,8 +110,15 @@ fn spawn_audit(
     if let Ok(permit) = AUDIT_SEM.try_acquire() {
         tokio::spawn(async move {
             let _permit = permit;
-            audit_tool_call(pg.as_ref(), &session_id, &tool_name, &params, outcome, duration_ms)
-                .await;
+            audit_tool_call(
+                pg.as_ref(),
+                &session_id,
+                &tool_name,
+                &params,
+                outcome,
+                duration_ms,
+            )
+            .await;
         });
     }
 }

@@ -68,8 +68,8 @@ async fn publish_conn() -> Result<redis::aio::ConnectionManager, String> {
     let conn = PUBLISH_CONN
         .get_or_try_init(|| async {
             let url = resolve_redis_url();
-            let client = redis::Client::open(url.as_str())
-                .map_err(|e| format!("redis open {url}: {e}"))?;
+            let client =
+                redis::Client::open(url.as_str()).map_err(|e| format!("redis open {url}: {e}"))?;
             redis::aio::ConnectionManager::new(client)
                 .await
                 .map_err(|e| format!("redis connect {url}: {e}"))

@@ -1,5 +1,5 @@
-use anyhow::Result;
 use crate::truncate_str;
+use anyhow::Result;
 
 pub async fn handle_alert(cmd: crate::AlertCommand) -> Result<()> {
     let pool = ff_agent::fleet_info::get_fleet_pool()

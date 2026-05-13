@@ -166,12 +166,7 @@ impl WsHub {
             let subscribed = entry.subscriptions.contains(&EventType::All)
                 || entry.subscriptions.contains(&event_type);
 
-            if subscribed
-                && entry
-                    .sender
-                    .try_send(Message::Text(text.clone()))
-                    .is_err()
-            {
+            if subscribed && entry.sender.try_send(Message::Text(text.clone())).is_err() {
                 dead.push(*entry.key());
             }
         }

@@ -214,7 +214,8 @@ impl UpdateChecker {
         // Fetch remote SHA from GitHub
         let url = format!("https://api.github.com/repos/{github_repo}/commits/{branch}");
 
-        let mut req = self.client
+        let mut req = self
+            .client
             .get(&url)
             .header("User-Agent", "ForgeFleet-Updater")
             .header("Accept", "application/vnd.github.v3+json");

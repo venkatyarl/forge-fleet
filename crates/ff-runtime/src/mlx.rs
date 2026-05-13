@@ -252,7 +252,13 @@ impl InferenceEngine for MlxEngine {
             };
 
             let url = format!("http://{}:{}/v1/models", config.host, config.port);
-            match self.client.get(&url).timeout(Duration::from_secs(5)).send().await {
+            match self
+                .client
+                .get(&url)
+                .timeout(Duration::from_secs(5))
+                .send()
+                .await
+            {
                 Ok(resp) => Ok(resp.status().is_success()),
                 Err(_) => Ok(false),
             }
@@ -269,7 +275,12 @@ impl InferenceEngine for MlxEngine {
             };
 
             let url = format!("http://{}:{}/v1/models", config.host, config.port);
-            let resp = self.client.get(&url).timeout(Duration::from_secs(5)).send().await?;
+            let resp = self
+                .client
+                .get(&url)
+                .timeout(Duration::from_secs(5))
+                .send()
+                .await?;
             let body: serde_json::Value = resp.json().await?;
 
             let models = body

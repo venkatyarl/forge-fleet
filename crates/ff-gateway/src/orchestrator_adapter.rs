@@ -11,17 +11,17 @@ use chrono::Utc;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use ff_core::{
-    GpuType, Hardware, Interconnect, MemoryType, Model as CoreModel, Node as CoreNode,
-    NodeStatus, OsType, Role, Runtime, Tier,
-};
 use ff_api::token_ledger::TokenUsageRecord;
-use ff_orchestrator::router::NodeLoad as OrchestratorNodeLoad;
+use ff_core::{
+    GpuType, Hardware, Interconnect, MemoryType, Model as CoreModel, Node as CoreNode, NodeStatus,
+    OsType, Role, Runtime, Tier,
+};
 use ff_orchestrator::crew::CrewAssignment;
 use ff_orchestrator::decomposer::SubTask;
 use ff_orchestrator::parallel::{DispatchFn, SubTaskResult, SubTaskStatus};
+use ff_orchestrator::router::NodeLoad as OrchestratorNodeLoad;
 use ff_orchestrator::router::RouteDecision;
-use ff_pulse::beat_v2::{PulseBeatV2, LlmServer};
+use ff_pulse::beat_v2::{LlmServer, PulseBeatV2};
 
 // ─── Fleet state conversion ─────────────────────────────────────────────────
 
@@ -33,7 +33,11 @@ use ff_pulse::beat_v2::{PulseBeatV2, LlmServer};
 pub fn pulse_beats_to_fleet_state(
     beats: Vec<PulseBeatV2>,
     catalog: &HashMap<String, (String, i32)>,
-) -> (Vec<CoreNode>, Vec<CoreModel>, HashMap<String, OrchestratorNodeLoad>) {
+) -> (
+    Vec<CoreNode>,
+    Vec<CoreModel>,
+    HashMap<String, OrchestratorNodeLoad>,
+) {
     let mut nodes = Vec::new();
     let mut models: Vec<CoreModel> = Vec::new();
     let mut loads = HashMap::new();
@@ -224,7 +228,13 @@ fn infer_tier(model_id: &str) -> Tier {
         Tier::Tier3
     } else if lower.contains("32b") || lower.contains("27b") || lower.contains("30b") {
         Tier::Tier2
-    } else if lower.contains("9b") || lower.contains("7b") || lower.contains("8b") || lower.contains("3b") || lower.contains("2b") || lower.contains("1b") {
+    } else if lower.contains("9b")
+        || lower.contains("7b")
+        || lower.contains("8b")
+        || lower.contains("3b")
+        || lower.contains("2b")
+        || lower.contains("1b")
+    {
         Tier::Tier1
     } else {
         Tier::Tier2
@@ -235,7 +245,10 @@ fn infer_tier(model_id: &str) -> Tier {
 fn infer_params_b(model_id: &str) -> f32 {
     let lower = model_id.to_ascii_lowercase();
     // Try to find patterns like "32b", "7b", "200b", "405b"
-    for pat in ["405b", "200b", "72b", "70b", "65b", "40b", "32b", "30b", "27b", "9b", "8b", "7b", "3b", "2b", "1b"] {
+    for pat in [
+        "405b", "200b", "72b", "70b", "65b", "40b", "32b", "30b", "27b", "9b", "8b", "7b", "3b",
+        "2b", "1b",
+    ] {
         if lower.contains(pat) {
             return pat.trim_end_matches('b').parse::<f32>().unwrap_or(7.0);
         }
@@ -252,57 +265,97 @@ pub fn build_dispatch_fn(
     subtasks: HashMap<Uuid, SubTask>,
     model_endpoints: HashMap<String, String>,
 ) -> DispatchFn {
-    Arc::new(move |subtask_id: Uuid, decision: RouteDecision, assignment: CrewAssignment| {
-        let state = state.clone();
-        let subtasks = subtasks.clone();
-        let model_endpoints = model_endpoints.clone();
+    Arc::new(
+        move |subtask_id: Uuid, decision: RouteDecision, assignment: CrewAssignment| {
+            let state = state.clone();
+            let subtasks = subtasks.clone();
+            let model_endpoints = model_endpoints.clone();
 
-        tokio::spawn(async move {
-            let started_at = Utc::now();
-            let prompt = subtasks
-                .get(&subtask_id)
-                .map(|st| st.prompt.clone())
-                .unwrap_or_default();
+            tokio::spawn(async move {
+                let started_at = Utc::now();
+                let prompt = subtasks
+                    .get(&subtask_id)
+                    .map(|st| st.prompt.clone())
+                    .unwrap_or_default();
 
-            let system = if let Some(extra) = &assignment.extra_instructions {
-                format!("{}\n\n{}", assignment.role.system_prompt(), extra)
-            } else {
-                assignment.role.system_prompt().to_string()
-            };
+                let system = if let Some(extra) = &assignment.extra_instructions {
+                    format!("{}\n\n{}", assignment.role.system_prompt(), extra)
+                } else {
+                    assignment.role.system_prompt().to_string()
+                };
 
-            let body = json!({
-                "model": decision.model_id,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": prompt}
-                ],
-                "stream": false,
-            });
-
-            let endpoint = model_endpoints
-                .get(&decision.model_id)
-                .cloned()
-                .unwrap_or_else(|| {
-                    format!("http://{}", decision.endpoint)
+                let body = json!({
+                    "model": decision.model_id,
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": prompt}
+                    ],
+                    "stream": false,
                 });
 
-            let url = if endpoint.contains("/chat/completions") {
-                endpoint
-            } else {
-                format!("{}/v1/chat/completions", endpoint.trim_end_matches('/'))
-            };
+                let endpoint = model_endpoints
+                    .get(&decision.model_id)
+                    .cloned()
+                    .unwrap_or_else(|| format!("http://{}", decision.endpoint));
 
-            let resp = match state.http_client.post(&url).json(&body).send().await {
-                Ok(r) => r,
-                Err(e) => {
+                let url = if endpoint.contains("/chat/completions") {
+                    endpoint
+                } else {
+                    format!("{}/v1/chat/completions", endpoint.trim_end_matches('/'))
+                };
+
+                let resp = match state.http_client.post(&url).json(&body).send().await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        ff_observability::metrics::ORCHESTRATE_SUBTASKS_TOTAL
+                            .with_label_values(&["failed"])
+                            .inc();
+                        return SubTaskResult {
+                            subtask_id,
+                            status: SubTaskStatus::Failed,
+                            output: String::new(),
+                            error: Some(format!("HTTP dispatch failed: {e}")),
+                            model_id: Some(decision.model_id),
+                            node_name: Some(decision.node_name),
+                            started_at: Some(started_at),
+                            completed_at: Some(Utc::now()),
+                            duration_ms: Some((Utc::now() - started_at).num_milliseconds() as u64),
+                            tokens_used: None,
+                        };
+                    }
+                };
+
+                let status_code = resp.status();
+                let body_text = match resp.text().await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        ff_observability::metrics::ORCHESTRATE_SUBTASKS_TOTAL
+                            .with_label_values(&["failed"])
+                            .inc();
+                        return SubTaskResult {
+                            subtask_id,
+                            status: SubTaskStatus::Failed,
+                            output: String::new(),
+                            error: Some(format!("Failed to read response body: {e}")),
+                            model_id: Some(decision.model_id),
+                            node_name: Some(decision.node_name),
+                            started_at: Some(started_at),
+                            completed_at: Some(Utc::now()),
+                            duration_ms: Some((Utc::now() - started_at).num_milliseconds() as u64),
+                            tokens_used: None,
+                        };
+                    }
+                };
+
+                if !status_code.is_success() {
                     ff_observability::metrics::ORCHESTRATE_SUBTASKS_TOTAL
-                    .with_label_values(&["failed"])
-                    .inc();
-                return SubTaskResult {
+                        .with_label_values(&["failed"])
+                        .inc();
+                    return SubTaskResult {
                         subtask_id,
                         status: SubTaskStatus::Failed,
                         output: String::new(),
-                        error: Some(format!("HTTP dispatch failed: {e}")),
+                        error: Some(format!("Upstream returned {status_code}: {body_text}")),
                         model_id: Some(decision.model_id),
                         node_name: Some(decision.node_name),
                         started_at: Some(started_at),
@@ -311,146 +364,106 @@ pub fn build_dispatch_fn(
                         tokens_used: None,
                     };
                 }
-            };
 
-            let status_code = resp.status();
-            let body_text = match resp.text().await {
-                Ok(t) => t,
-                Err(e) => {
-                    ff_observability::metrics::ORCHESTRATE_SUBTASKS_TOTAL
-                    .with_label_values(&["failed"])
-                    .inc();
-                return SubTaskResult {
-                        subtask_id,
-                        status: SubTaskStatus::Failed,
-                        output: String::new(),
-                        error: Some(format!("Failed to read response body: {e}")),
-                        model_id: Some(decision.model_id),
-                        node_name: Some(decision.node_name),
-                        started_at: Some(started_at),
-                        completed_at: Some(Utc::now()),
-                        duration_ms: Some((Utc::now() - started_at).num_milliseconds() as u64),
-                        tokens_used: None,
-                    };
-                }
-            };
+                let parsed: Value = match serde_json::from_str(&body_text) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        // Non-JSON success — treat body as raw output
+                        return SubTaskResult {
+                            subtask_id,
+                            status: SubTaskStatus::Completed,
+                            output: body_text,
+                            error: None,
+                            model_id: Some(decision.model_id),
+                            node_name: Some(decision.node_name),
+                            started_at: Some(started_at),
+                            completed_at: Some(Utc::now()),
+                            duration_ms: Some((Utc::now() - started_at).num_milliseconds() as u64),
+                            tokens_used: None,
+                        };
+                    }
+                };
 
-            if !status_code.is_success() {
+                let content = parsed
+                    .get("choices")
+                    .and_then(|c| c.as_array())
+                    .and_then(|arr| arr.first())
+                    .and_then(|choice| choice.get("message"))
+                    .and_then(|msg| msg.get("content"))
+                    .and_then(|c| c.as_str())
+                    .unwrap_or(&body_text)
+                    .to_string();
+
+                let prompt_tokens = parsed
+                    .get("usage")
+                    .and_then(|u| u.get("prompt_tokens"))
+                    .and_then(|t| t.as_u64())
+                    .unwrap_or(0) as u32;
+                let completion_tokens = parsed
+                    .get("usage")
+                    .and_then(|u| u.get("completion_tokens"))
+                    .and_then(|t| t.as_u64())
+                    .unwrap_or(0) as u32;
+                let total_tokens = prompt_tokens + completion_tokens;
+                let tokens_used = if total_tokens > 0 {
+                    Some(total_tokens as u64)
+                } else {
+                    parsed
+                        .get("usage")
+                        .and_then(|u| u.get("total_tokens"))
+                        .and_then(|t| t.as_u64())
+                };
+                let latency_ms = (Utc::now() - started_at).num_milliseconds() as u64;
+
+                // Record cost tracking
+                let record = TokenUsageRecord::new(
+                    uuid::Uuid::new_v4().to_string(),
+                    &decision.model_id,
+                    &decision.node_name,
+                )
+                .with_tokens(prompt_tokens, completion_tokens)
+                .with_cost(0.0, true) // fleet inference is local / free
+                .with_latency(latency_ms);
+
+                state.cost_tracker.record_usage(record).await;
+
+                // Update Prometheus counters
+                ff_observability::metrics::LLM_TOKENS_TOTAL
+                    .with_label_values(&[&decision.model_id, "prompt"])
+                    .inc_by(prompt_tokens as u64);
+                ff_observability::metrics::LLM_TOKENS_TOTAL
+                    .with_label_values(&[&decision.model_id, "completion"])
+                    .inc_by(completion_tokens as u64);
+                ff_observability::metrics::LLM_COST_USD_TOTAL
+                    .with_label_values(&[&decision.model_id, "true"])
+                    .add(0.0);
                 ff_observability::metrics::ORCHESTRATE_SUBTASKS_TOTAL
-                    .with_label_values(&["failed"])
+                    .with_label_values(&["completed"])
                     .inc();
-                return SubTaskResult {
+
+                SubTaskResult {
                     subtask_id,
-                    status: SubTaskStatus::Failed,
-                    output: String::new(),
-                    error: Some(format!("Upstream returned {status_code}: {body_text}")),
+                    status: SubTaskStatus::Completed,
+                    output: content,
+                    error: None,
                     model_id: Some(decision.model_id),
                     node_name: Some(decision.node_name),
                     started_at: Some(started_at),
                     completed_at: Some(Utc::now()),
-                    duration_ms: Some((Utc::now() - started_at).num_milliseconds() as u64),
-                    tokens_used: None,
-                };
-            }
-
-            let parsed: Value = match serde_json::from_str(&body_text) {
-                Ok(v) => v,
-                Err(_) => {
-                    // Non-JSON success — treat body as raw output
-                    return SubTaskResult {
-                        subtask_id,
-                        status: SubTaskStatus::Completed,
-                        output: body_text,
-                        error: None,
-                        model_id: Some(decision.model_id),
-                        node_name: Some(decision.node_name),
-                        started_at: Some(started_at),
-                        completed_at: Some(Utc::now()),
-                        duration_ms: Some((Utc::now() - started_at).num_milliseconds() as u64),
-                        tokens_used: None,
-                    };
+                    duration_ms: Some(latency_ms),
+                    tokens_used,
                 }
-            };
-
-            let content = parsed
-                .get("choices")
-                .and_then(|c| c.as_array())
-                .and_then(|arr| arr.first())
-                .and_then(|choice| choice.get("message"))
-                .and_then(|msg| msg.get("content"))
-                .and_then(|c| c.as_str())
-                .unwrap_or(&body_text)
-                .to_string();
-
-            let prompt_tokens = parsed
-                .get("usage")
-                .and_then(|u| u.get("prompt_tokens"))
-                .and_then(|t| t.as_u64())
-                .unwrap_or(0) as u32;
-            let completion_tokens = parsed
-                .get("usage")
-                .and_then(|u| u.get("completion_tokens"))
-                .and_then(|t| t.as_u64())
-                .unwrap_or(0) as u32;
-            let total_tokens = prompt_tokens + completion_tokens;
-            let tokens_used = if total_tokens > 0 {
-                Some(total_tokens as u64)
-            } else {
-                parsed
-                    .get("usage")
-                    .and_then(|u| u.get("total_tokens"))
-                    .and_then(|t| t.as_u64())
-            };
-            let latency_ms = (Utc::now() - started_at).num_milliseconds() as u64;
-
-            // Record cost tracking
-            let record = TokenUsageRecord::new(
-                uuid::Uuid::new_v4().to_string(),
-                &decision.model_id,
-                &decision.node_name,
-            )
-            .with_tokens(prompt_tokens, completion_tokens)
-            .with_cost(0.0, true) // fleet inference is local / free
-            .with_latency(latency_ms);
-
-            state.cost_tracker.record_usage(record).await;
-
-            // Update Prometheus counters
-            ff_observability::metrics::LLM_TOKENS_TOTAL
-                .with_label_values(&[&decision.model_id, "prompt"])
-                .inc_by(prompt_tokens as u64);
-            ff_observability::metrics::LLM_TOKENS_TOTAL
-                .with_label_values(&[&decision.model_id, "completion"])
-                .inc_by(completion_tokens as u64);
-            ff_observability::metrics::LLM_COST_USD_TOTAL
-                .with_label_values(&[&decision.model_id, "true"])
-                .add(0.0);
-            ff_observability::metrics::ORCHESTRATE_SUBTASKS_TOTAL
-                .with_label_values(&["completed"])
-                .inc();
-
-            SubTaskResult {
-                subtask_id,
-                status: SubTaskStatus::Completed,
-                output: content,
-                error: None,
-                model_id: Some(decision.model_id),
-                node_name: Some(decision.node_name),
-                started_at: Some(started_at),
-                completed_at: Some(Utc::now()),
-                duration_ms: Some(latency_ms),
-                tokens_used,
-            }
-        })
-    })
+            })
+        },
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use ff_pulse::beat_v2::{
-        Capabilities, ClusterInfo, DbTopology, DockerStatus, HardwareInfo, LoadInfo, LlmMemoryUsage,
-        LlmServer, LlmServerModel, MemoryInfo, NetworkInfo, PulseBeatV2,
+        Capabilities, ClusterInfo, DbTopology, DockerStatus, HardwareInfo, LlmMemoryUsage,
+        LlmServer, LlmServerModel, LoadInfo, MemoryInfo, NetworkInfo, PulseBeatV2,
     };
 
     fn mock_beat() -> PulseBeatV2 {

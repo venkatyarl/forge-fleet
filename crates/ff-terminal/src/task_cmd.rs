@@ -1,6 +1,6 @@
+use crate::{CYAN, GREEN, RED, RESET, YELLOW, truncate_str};
 use anyhow::Result;
 use std::path::Path;
-use crate::{CYAN, GREEN, RED, RESET, YELLOW, truncate_str};
 
 pub async fn handle_task(cmd: crate::TaskCommand, _config_path: &Path) -> Result<()> {
     static SHARED_HTTP: std::sync::LazyLock<reqwest::Client> =

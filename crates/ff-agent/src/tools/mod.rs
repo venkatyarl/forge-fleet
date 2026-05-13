@@ -79,14 +79,13 @@ use tokio::sync::Mutex;
 // one shared client serves every tool. Per-request timeouts (set via
 // `RequestBuilder::timeout`) override the client default, so call sites that
 // care about a specific deadline still set their own.
-static SHARED_HTTP_CLIENT: std::sync::LazyLock<reqwest::Client> =
-    std::sync::LazyLock::new(|| {
-        reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(120))
-            .user_agent("ForgeFleet-Agent/1.0")
-            .build()
-            .expect("build shared tool reqwest client")
-    });
+static SHARED_HTTP_CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .user_agent("ForgeFleet-Agent/1.0")
+        .build()
+        .expect("build shared tool reqwest client")
+});
 
 /// Returns a shared `reqwest::Client` used by all tools that need HTTP.
 /// Cloning the result is cheap (internal Arc).

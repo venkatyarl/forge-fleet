@@ -96,7 +96,8 @@ impl CircuitBreaker {
     /// Resets failure count and closes the circuit if it was half-open.
     pub fn record_success(&self) {
         self.failure_count.store(0, Ordering::SeqCst);
-        self.state.store(CircuitState::Closed as u32, Ordering::SeqCst);
+        self.state
+            .store(CircuitState::Closed as u32, Ordering::SeqCst);
         self.last_failure_time_ms.store(u64::MAX, Ordering::SeqCst);
     }
 
@@ -107,7 +108,8 @@ impl CircuitBreaker {
         self.store_last_failure(Instant::now());
 
         if count >= self.config.failure_threshold {
-            self.state.store(CircuitState::Open as u32, Ordering::SeqCst);
+            self.state
+                .store(CircuitState::Open as u32, Ordering::SeqCst);
         }
     }
 
@@ -120,7 +122,8 @@ impl CircuitBreaker {
                 // Check if recovery timeout has elapsed
                 if let Some(t) = self.load_last_failure() {
                     if t.elapsed() >= self.config.recovery_timeout {
-                        self.state.store(CircuitState::HalfOpen as u32, Ordering::SeqCst);
+                        self.state
+                            .store(CircuitState::HalfOpen as u32, Ordering::SeqCst);
                         true
                     } else {
                         false

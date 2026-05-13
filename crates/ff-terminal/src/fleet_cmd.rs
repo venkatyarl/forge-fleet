@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 
 use crate::{
-    CYAN, FleetCommand, FleetDbCommand, GREEN, RED, RESET, TaskCoverageCommand, YELLOW, pulse_reader,
-    whoami_tag,
+    CYAN, FleetCommand, FleetDbCommand, GREEN, RED, RESET, TaskCoverageCommand, YELLOW,
+    pulse_reader, whoami_tag,
 };
 
 /// `ff fleet panic-stop` — emergency halt of every daemon.
@@ -1267,7 +1267,9 @@ pub async fn handle_fleet_remove_computer(
     .await?;
 
     if fleet_node.is_none() && computer.is_none() {
-        eprintln!("{YELLOW}No fleet_workers or computers row named '{name}' — nothing to do.{RESET}");
+        eprintln!(
+            "{YELLOW}No fleet_workers or computers row named '{name}' — nothing to do.{RESET}"
+        );
         std::process::exit(2);
     }
 
@@ -2393,7 +2395,6 @@ pub async fn handle_fleet_gossip() -> Result<()> {
     Ok(())
 }
 
-
 pub async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
     let pool = ff_agent::fleet_info::get_fleet_pool()
         .await
@@ -2666,9 +2667,10 @@ pub async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
         }
         FleetCommand::Computers { format, os, role } => {
             let resolver = ff_core::FleetResolver::new();
-            let mut computers = resolver.resolve().await.map_err(|e| {
-                anyhow::anyhow!("failed to resolve fleet computers: {e}")
-            })?;
+            let mut computers = resolver
+                .resolve()
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to resolve fleet computers: {e}"))?;
 
             if let Some(filter) = os {
                 let lower = filter.to_ascii_lowercase();

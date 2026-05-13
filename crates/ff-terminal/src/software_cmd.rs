@@ -339,7 +339,6 @@ pub async fn handle_software_remove(
     Ok(())
 }
 
-
 pub async fn handle_software(cmd: crate::SoftwareCommand) -> Result<()> {
     let pool = ff_agent::fleet_info::get_fleet_pool()
         .await
@@ -372,9 +371,7 @@ pub async fn handle_software(cmd: crate::SoftwareCommand) -> Result<()> {
             )
             .await
         }
-        crate::SoftwareCommand::Remove { id, yes } => {
-            handle_software_remove(&pool, &id, yes).await
-        }
+        crate::SoftwareCommand::Remove { id, yes } => handle_software_remove(&pool, &id, yes).await,
         crate::SoftwareCommand::AutoUpgradeRunOnce { force } => {
             handle_auto_upgrade_run_once(&pool, force).await
         }

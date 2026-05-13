@@ -12,8 +12,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 
-static SHARED_HTTP: LazyLock<reqwest::Client> =
-    LazyLock::new(|| reqwest::Client::new());
+static SHARED_HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| reqwest::Client::new());
 use ff_core::config::{FleetConfig, McpConfig};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};

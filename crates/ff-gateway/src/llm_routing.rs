@@ -100,7 +100,10 @@ impl FailureWindow {
     }
 
     fn count_recent(&self) -> usize {
-        self.failures.iter().filter(|t| t.elapsed() < CIRCUIT_WINDOW).count()
+        self.failures
+            .iter()
+            .filter(|t| t.elapsed() < CIRCUIT_WINDOW)
+            .count()
     }
 
     fn is_open(&self) -> bool {
@@ -470,13 +473,14 @@ impl PulseLlmRouter {
             .filter(|(b, _)| {
                 // Skip nodes that are currently circuit-opened.
                 if let Some(ref cb) = self.circuit_breaker
-                    && cb.is_open(&b.computer_name) {
-                        tracing::debug!(
-                            computer = %b.computer_name,
-                            "pulse: skipping circuit-opened node"
-                        );
-                        return false;
-                    }
+                    && cb.is_open(&b.computer_name)
+                {
+                    tracing::debug!(
+                        computer = %b.computer_name,
+                        "pulse: skipping circuit-opened node"
+                    );
+                    return false;
+                }
                 true
             })
             .filter_map(|(b, s)| {
@@ -500,17 +504,20 @@ impl PulseLlmRouter {
         // Secondary: composite load score (lower = better).
         // Tertiary: highest tokens/sec_last_min.
         candidates.sort_by(|(a_rank, a_beat, a), (b_rank, b_beat, b)| {
-            a_rank.cmp(b_rank).then_with(|| {
-                let a_score = compute_load_score(a_beat, a);
-                let b_score = compute_load_score(b_beat, b);
-                a_score
-                    .partial_cmp(&b_score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            }).then_with(|| {
-                b.tokens_per_sec_last_min
-                    .partial_cmp(&a.tokens_per_sec_last_min)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
+            a_rank
+                .cmp(b_rank)
+                .then_with(|| {
+                    let a_score = compute_load_score(a_beat, a);
+                    let b_score = compute_load_score(b_beat, b);
+                    a_score
+                        .partial_cmp(&b_score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| {
+                    b.tokens_per_sec_last_min
+                        .partial_cmp(&a.tokens_per_sec_last_min)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
         });
 
         Ok(candidates
@@ -575,43 +582,44 @@ impl PulseLlmRouter {
         let mut affinity_pick: Option<(String, String, LlmServer)> = None;
         if let Some(ref session_cache) = self.session_cache
             && let Some(session_key) = extract_session_key(&body)
-                && let Some(entry) = session_cache.get(&session_key) {
-                    if let Ok(Some(beat)) = self.reader.latest_beat(&entry.computer).await
-                        && !beat.going_offline {
-                            for s in &beat.llm_servers {
-                                if s.status == "active"
-                                    && s.is_healthy
-                                    && normalize_model_id(&s.model.id)
-                                        == normalize_model_id(&entry.model_id)
-                                    && s.queue_depth <= SESSION_AFFINITY_QUEUE_THRESHOLD
-                                {
-                                    affinity_pick = Some((
-                                        beat.computer_name.clone(),
-                                        beat.network.primary_ip.clone(),
-                                        s.clone(),
-                                    ));
-                                    ff_observability::metrics::PULSE_ROUTER_AFFINITY_HITS_TOTAL
-                                        .with_label_values(&[&requested_model])
-                                        .inc();
-                                    tracing::debug!(
-                                        session = %session_key,
-                                        computer = %entry.computer,
-                                        model = %entry.model_id,
-                                        queue_depth = s.queue_depth,
-                                        "pulse: session affinity hit"
-                                    );
-                                    break;
-                                }
-                            }
-                        }
-                    if affinity_pick.is_none() {
+            && let Some(entry) = session_cache.get(&session_key)
+        {
+            if let Ok(Some(beat)) = self.reader.latest_beat(&entry.computer).await
+                && !beat.going_offline
+            {
+                for s in &beat.llm_servers {
+                    if s.status == "active"
+                        && s.is_healthy
+                        && normalize_model_id(&s.model.id) == normalize_model_id(&entry.model_id)
+                        && s.queue_depth <= SESSION_AFFINITY_QUEUE_THRESHOLD
+                    {
+                        affinity_pick = Some((
+                            beat.computer_name.clone(),
+                            beat.network.primary_ip.clone(),
+                            s.clone(),
+                        ));
+                        ff_observability::metrics::PULSE_ROUTER_AFFINITY_HITS_TOTAL
+                            .with_label_values(&[&requested_model])
+                            .inc();
                         tracing::debug!(
                             session = %session_key,
                             computer = %entry.computer,
-                            "pulse: session affinity stale (node offline or model unloaded)"
+                            model = %entry.model_id,
+                            queue_depth = s.queue_depth,
+                            "pulse: session affinity hit"
                         );
+                        break;
                     }
                 }
+            }
+            if affinity_pick.is_none() {
+                tracing::debug!(
+                    session = %session_key,
+                    computer = %entry.computer,
+                    "pulse: session affinity stale (node offline or model unloaded)"
+                );
+            }
+        }
 
         // 1. Pool-alias expansion (optional).
         let pool_pick = match pg {
@@ -780,7 +788,11 @@ impl PulseLlmRouter {
             });
         }
 
-        let result_label = if status.is_success() { "success" } else { "upstream_error" };
+        let result_label = if status.is_success() {
+            "success"
+        } else {
+            "upstream_error"
+        };
         ff_observability::metrics::PULSE_ROUTER_REQUESTS_TOTAL
             .with_label_values(&[&routed.model_id, &routed.computer, result_label])
             .inc();
@@ -846,7 +858,11 @@ impl PulseLlmRouter {
             self.record_failure(&routed.computer);
         }
 
-        let result_label = if status.is_success() { "success" } else { "upstream_error" };
+        let result_label = if status.is_success() {
+            "success"
+        } else {
+            "upstream_error"
+        };
         ff_observability::metrics::PULSE_ROUTER_REQUESTS_TOTAL
             .with_label_values(&[&routed.model_id, &routed.computer, result_label])
             .inc();

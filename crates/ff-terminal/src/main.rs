@@ -9,10 +9,10 @@
 //!   ff start                    — start ForgeFleet daemon
 //!   ff status / nodes / models / health / config / version
 
+use std::env;
 use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
-use std::env;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -56,27 +56,27 @@ mod model_serve_cmd;
 mod onboard_cmd;
 mod openclaw_cmd;
 mod pm_cmd;
-mod project_cmd;
 mod ports_cmd;
 mod power_cmd;
+mod project_cmd;
 mod research_cmd;
 mod secrets_cmd;
 mod self_heal_cmd;
-mod status_cmd;
 mod social_cmd;
 mod software_cmd;
+mod status_cmd;
 mod storage_cmd;
 mod task_cmd;
 mod tasks_cmd;
 mod tools_cmd;
 mod train_cmd;
-mod versions_cmd;
 mod utils;
+mod versions_cmd;
 
 pub use utils::{
     CYAN, GREEN, RED, RESET, YELLOW, expand_tilde, human_bytes, human_bytes_i64, load_config,
-    parse_duration_secs, pulse_reader, resolve_pulse_redis_url, shell_escape_single, trunc_for_status,
-    truncate_for_col, truncate_str, whoami_tag,
+    parse_duration_secs, pulse_reader, resolve_pulse_redis_url, shell_escape_single,
+    trunc_for_status, truncate_for_col, truncate_str, whoami_tag,
 };
 
 /// clap's `--version` flag prints THIS string. Must match the `Command::Version`
@@ -2161,7 +2161,9 @@ async fn main() -> Result<()> {
             print_ff_version_long();
             return Ok(());
         }
-        Some(Command::Secrets { command }) => return secrets_cmd::handle_secrets(command.clone()).await,
+        Some(Command::Secrets { command }) => {
+            return secrets_cmd::handle_secrets(command.clone()).await;
+        }
         Some(Command::Defer { command }) => return defer_cmd::handle_defer(command.clone()).await,
         Some(Command::Model { command }) => return model_cmd::handle_model(command.clone()).await,
         Some(Command::DeferWorker {
@@ -2170,7 +2172,8 @@ async fn main() -> Result<()> {
             scheduler,
             once,
         }) => {
-            return daemon_cmd::handle_defer_worker(as_node.clone(), *interval, *scheduler, *once).await;
+            return daemon_cmd::handle_defer_worker(as_node.clone(), *interval, *scheduler, *once)
+                .await;
         }
         Some(Command::Daemon {
             as_node,
@@ -2195,21 +2198,33 @@ async fn main() -> Result<()> {
         }
         Some(Command::Status) => return status_cmd::handle_status(&config_path).await,
         Some(Command::Nodes) => return helpers::handle_nodes(&config_path),
-        Some(Command::Versions { node }) => return versions_cmd::handle_versions(node.clone()).await,
+        Some(Command::Versions { node }) => {
+            return versions_cmd::handle_versions(node.clone()).await;
+        }
         Some(Command::Fleet { command }) => return fleet_cmd::handle_fleet(command.clone()).await,
         Some(Command::Llm { command }) => return llm_cmd::handle_llm(command.clone()).await,
-        Some(Command::Software { command }) => return software_cmd::handle_software(command.clone()).await,
+        Some(Command::Software { command }) => {
+            return software_cmd::handle_software(command.clone()).await;
+        }
         Some(Command::Ext { command }) => return ext_cmd::handle_ext(command.clone()).await,
-        Some(Command::Onboard { command }) => return onboard_cmd::handle_onboard(command.clone()).await,
-        Some(Command::VirtualBrain { command }) => return brain_cmd::handle_brain(command.clone()).await,
-        Some(Command::Openclaw { command }) => return openclaw_cmd::handle_openclaw(command.clone()).await,
+        Some(Command::Onboard { command }) => {
+            return onboard_cmd::handle_onboard(command.clone()).await;
+        }
+        Some(Command::VirtualBrain { command }) => {
+            return brain_cmd::handle_brain(command.clone()).await;
+        }
+        Some(Command::Openclaw { command }) => {
+            return openclaw_cmd::handle_openclaw(command.clone()).await;
+        }
         Some(Command::Pm { command }) => return pm_cmd::handle_pm(command.clone()).await,
         Some(Command::Agent { command }) => return agent_cmd::handle_agent(command.clone()).await,
         Some(Command::Project { command }) => {
             return project_cmd::handle_project(command.clone()).await;
         }
         Some(Command::Alert { command }) => return alert_cmd::handle_alert(command.clone()).await,
-        Some(Command::Metrics { command }) => return metrics_cmd::handle_metrics(command.clone()).await,
+        Some(Command::Metrics { command }) => {
+            return metrics_cmd::handle_metrics(command.clone()).await;
+        }
         Some(Command::Logs {
             computer,
             service,
@@ -2217,13 +2232,21 @@ async fn main() -> Result<()> {
         }) => {
             return logs_cmd::handle_logs(computer.clone(), service.clone(), *tail).await;
         }
-        Some(Command::Events { command }) => return events_cmd::handle_events(command.clone()).await,
-        Some(Command::Storage { command }) => return storage_cmd::handle_storage(command.clone()).await,
+        Some(Command::Events { command }) => {
+            return events_cmd::handle_events(command.clone()).await;
+        }
+        Some(Command::Storage { command }) => {
+            return storage_cmd::handle_storage(command.clone()).await;
+        }
         Some(Command::Power { command }) => return power_cmd::handle_power(command.clone()).await,
         Some(Command::Train { command }) => return train_cmd::handle_train(command.clone()).await,
         Some(Command::Ports { command }) => return ports_cmd::handle_ports(command.clone()).await,
-        Some(Command::CloudLlm { command }) => return cloud_llm_cmd::handle_cloud_llm(command.clone()).await,
-        Some(Command::Social { command }) => return social_cmd::handle_social(command.clone()).await,
+        Some(Command::CloudLlm { command }) => {
+            return cloud_llm_cmd::handle_cloud_llm(command.clone()).await;
+        }
+        Some(Command::Social { command }) => {
+            return social_cmd::handle_social(command.clone()).await;
+        }
         _ => {}
     }
 
@@ -2253,11 +2276,7 @@ async fn main() -> Result<()> {
 
     if model == "auto" {
         let detect_url = format!("{}/v1/models", llm.trim_end_matches('/'));
-        match SHARED_HTTP
-            .get(&detect_url)
-            .send()
-            .await
-        {
+        match SHARED_HTTP.get(&detect_url).send().await {
             Ok(resp) => {
                 if let Ok(body) = resp.json::<serde_json::Value>().await
                     && let Some(id) = body
@@ -2294,7 +2313,9 @@ async fn main() -> Result<()> {
     };
 
     match cli.command {
-        Some(Command::Start { leader }) => lifecycle_cmd::handle_start(leader, &config_path, &working_dir).await,
+        Some(Command::Start { leader }) => {
+            lifecycle_cmd::handle_start(leader, &config_path, &working_dir).await
+        }
         Some(Command::Stop) => lifecycle_cmd::handle_stop().await,
         Some(Command::Status) => status_cmd::handle_status(&config_path).await,
         Some(Command::Nodes) => helpers::handle_nodes(&config_path),
@@ -4477,22 +4498,4 @@ async fn run_headless(
     Ok(())
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 // ─── Phase 10: alerts / metrics / logs ─────────────────────────────────
-
-
-
-

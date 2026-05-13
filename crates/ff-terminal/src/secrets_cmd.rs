@@ -1,5 +1,5 @@
+use crate::{RESET, YELLOW, whoami_tag};
 use anyhow::Result;
-use crate::{whoami_tag, RESET, YELLOW};
 
 pub async fn handle_secrets(cmd: crate::SecretsCommand) -> Result<()> {
     let pool = ff_agent::fleet_info::get_fleet_pool()

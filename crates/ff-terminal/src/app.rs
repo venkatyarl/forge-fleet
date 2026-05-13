@@ -415,8 +415,7 @@ impl App {
                 messages_after,
                 ..
             } => {
-                tab.last_activity =
-                    format!("Compacted history {messages_before}→{messages_after}");
+                tab.last_activity = format!("Compacted history {messages_before}→{messages_after}");
             }
         }
     }

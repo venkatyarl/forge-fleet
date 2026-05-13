@@ -1,5 +1,5 @@
-use anyhow::Result;
 use crate::{CYAN, GREEN, RED, RESET, YELLOW};
+use anyhow::Result;
 
 pub async fn handle_project(cmd: crate::ProjectCommand) -> Result<()> {
     let pool = ff_agent::fleet_info::get_fleet_pool()
@@ -243,5 +243,3 @@ pub async fn handle_project(cmd: crate::ProjectCommand) -> Result<()> {
     }
     Ok(())
 }
-
-

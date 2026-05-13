@@ -1,8 +1,8 @@
+use crate::{CYAN, GREEN, RED, RESET, YELLOW, truncate_str};
 use anyhow::Result;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use crate::{CYAN, GREEN, RED, RESET, YELLOW, truncate_str};
 
 pub async fn handle_status(p: &Path) -> Result<()> {
     // Cap total runtime at 15s.

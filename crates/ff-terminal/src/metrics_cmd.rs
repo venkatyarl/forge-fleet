@@ -1,5 +1,5 @@
-use anyhow::Result;
 use crate::parse_duration_secs;
+use anyhow::Result;
 
 pub async fn handle_metrics(cmd: crate::MetricsCommand) -> Result<()> {
     let pool = ff_agent::fleet_info::get_fleet_pool()
