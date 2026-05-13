@@ -573,14 +573,14 @@ fn render_left_sidebar(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) 
 
     lines.push(Line::from(""));
 
-    // Fleet Topology ASCII — show nodes connected to a central hub
+    // Fleet Topology ASCII — show computers connected to a central hub
     lines.push(Line::from(Span::styled(
         " Topology ",
         Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
     )));
     if app.fleet_workers.is_empty() {
         lines.push(Line::from(Span::styled(
-            "  (no nodes)",
+            "  (no computers)",
             Style::default().fg(Color::Rgb(71, 85, 105)),
         )));
     } else {
@@ -683,7 +683,7 @@ fn render_left_sidebar(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) 
     )));
     if app.fleet_workers.is_empty() {
         lines.push(Line::from(Span::styled(
-            "  (no nodes)",
+            "  (no computers)",
             Style::default().fg(Color::Rgb(71, 85, 105)),
         )));
     } else {
@@ -781,7 +781,7 @@ fn render_messages(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             )),
             Line::from(""),
             Line::from(Span::styled(
-                "  /help for commands  •  /fleet for node status  •  /exit to quit",
+                "  /help for commands  •  /fleet for computer status  •  /exit to quit",
                 theme.command_hint,
             )),
             Line::from(""),

@@ -15,7 +15,16 @@
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
+use tokio::sync::OnceCell;
 use tracing::debug;
+
+/// Process-wide shared Postgres pool used by [`FleetResolver::resolve`].
+/// Before this cache, every resolve() call built a fresh 2-connection pool;
+/// with the discovery loop firing every 30s on every daemon × 15 daemons,
+/// that was hundreds of pool constructions per minute, all hitting the same
+/// Postgres host. One singleton serves every resolve call in the process.
+static RESOLVER_POOL: OnceCell<PgPool> = OnceCell::const_new();
 
 use crate::config::{FleetConfig, NodeConfig};
 
@@ -152,15 +161,22 @@ impl FleetResolver {
     // ── Individual source resolvers ─────────────────────────────────────────
 
     async fn resolve_from_postgres(&self) -> Result<Vec<FleetNodeInfo>, FleetResolveError> {
-        let config = self.load_fleet_config()?;
-        let db_url = &config.database.url;
-
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(2)
-            .acquire_timeout(std::time::Duration::from_secs(5))
-            .connect(db_url)
-            .await
-            .map_err(|e| FleetResolveError::Postgres(e.to_string()))?;
+        let pool = RESOLVER_POOL
+            .get_or_try_init(|| async {
+                let config = self.load_fleet_config()?;
+                let db_url = config.database.url.clone();
+                sqlx::postgres::PgPoolOptions::new()
+                    .max_connections(2)
+                    .min_connections(0)
+                    .idle_timeout(Some(std::time::Duration::from_secs(60)))
+                    .max_lifetime(Some(std::time::Duration::from_secs(30 * 60)))
+                    .acquire_timeout(std::time::Duration::from_secs(5))
+                    .connect(&db_url)
+                    .await
+                    .map_err(|e| FleetResolveError::Postgres(e.to_string()))
+            })
+            .await?;
+        let pool = pool.clone();
 
         #[derive(sqlx::FromRow)]
         struct NodeRow {
