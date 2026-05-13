@@ -256,7 +256,12 @@ impl ReviveManager {
         cmd.args(ssh_base_args(port))
             .arg(format!("{user}@{host}"))
             .arg(
-                "if pgrep -f 'forgefleetd.*start' | grep -v \"^$$\\$\" >/dev/null; \
+                // Match any forgefleetd binary in the user's PATH, not just
+                // ones launched with the `start` arg. Zombie daemons from
+                // older deploys (e.g. systemd-launched, no argv suffix) get
+                // missed by `forgefleetd.*start` and a revive cycle then
+                // tries to spawn a second daemon. Use a broader pattern.
+                "if pgrep -f '/forgefleetd($| )' | grep -v \"^$$\\$\" >/dev/null; \
                  then echo yes; else echo no; fi",
             );
 

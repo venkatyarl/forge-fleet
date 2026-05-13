@@ -99,10 +99,10 @@ done <<< "$ROWS"
 # Bonus: alert if forgefleetd itself is dead on Taylor (this script runs
 # here, so a local check is cheap and catches "daemon died but we didn't
 # notice for N minutes" — the exact 9h DGX outage scenario in reverse).
-if ! pgrep -f 'forgefleetd.*start' >/dev/null 2>&1; then
+if ! pgrep -f '/forgefleetd($| )' >/dev/null 2>&1; then
   KEY="taylor/daemon_dead"
   if ! on_cooldown "$KEY"; then
-    page_telegram critical "forgefleetd is NOT running on taylor — no process matches 'forgefleetd.*start'"
+    page_telegram critical "forgefleetd is NOT running on taylor — no process matches forgefleetd"
     mark_paged "$KEY"
   fi
 fi

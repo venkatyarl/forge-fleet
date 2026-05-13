@@ -277,7 +277,11 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
 
     // 1) discovery — fleet node scanning + subnet scanning
     info!("starting subsystem: discovery");
-    let scan_targets = build_fleet_scan_targets(&config);
+    let scan_targets = build_fleet_scan_targets(&config).await;
+    info!(
+        target_count = scan_targets.len(),
+        "discovery: resolved scan targets from FleetResolver"
+    );
     subsystem_tasks.push(start_discovery_subsystem(
         control_plane.handles.discovery.scanner_config.clone(),
         scan_targets,
@@ -1059,14 +1063,36 @@ fn seed_registry_from_config(config: &FleetConfig, registry: &NodeRegistry) {
     }
 }
 
-// ─── Build scan targets from fleet.toml ──────────────────────────────────────
+// ─── Build scan targets from the canonical FleetResolver ────────────────────
 
-fn build_fleet_scan_targets(config: &FleetConfig) -> Vec<ScanTarget> {
+/// Build [`ScanTarget`]s by resolving the fleet through the canonical
+/// [`ff_core::FleetResolver`] (Postgres → fleet.toml → SSH config → fleet.json).
+///
+/// Previously this read only from `config.nodes` (i.e. the `[nodes.*]` section
+/// of `fleet.toml`). When that section was empty — which is the steady state
+/// post-website-onboarding, since the source of truth is Postgres — the
+/// discovery loop scanned an empty list and reported `total=0` indefinitely.
+async fn build_fleet_scan_targets(config: &FleetConfig) -> Vec<ScanTarget> {
+    let resolver = ff_core::FleetResolver::new();
+    let computers = match resolver.resolve().await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "fleet resolver failed; falling back to fleet.toml [nodes.*]");
+            return build_scan_targets(
+                config
+                    .nodes
+                    .iter()
+                    .map(|(n, node)| (n.as_str(), node.ip.as_str(), node.port, node.priority())),
+                config.fleet.api_port,
+            );
+        }
+    };
     build_scan_targets(
-        config
-            .nodes
-            .iter()
-            .map(|(name, node)| (name.as_str(), node.ip.as_str(), node.port, node.priority())),
+        computers.iter().map(|c| {
+            // Priority: keep the leader (50 default) hot, others 100.
+            let prio: u32 = if c.role.eq_ignore_ascii_case("leader") { 50 } else { 100 };
+            (c.name.as_str(), c.ip.as_str(), None, prio)
+        }),
         config.fleet.api_port,
     )
 }
