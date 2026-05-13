@@ -212,14 +212,27 @@ impl AlertEngine {
     }
 
     /// Create an engine with sensible default rules for ForgeFleet.
+    ///
+    /// When called from a tokio runtime context this also spawns the history
+    /// pruner so the `history` DashMap doesn't grow unbounded. Tests that
+    /// construct an engine outside of a runtime get a no-pruner instance.
     pub fn with_defaults() -> Self {
-        Self::new(vec![
+        let engine = Self::new(vec![
             AlertRule::node_down(60),
             AlertRule::model_down(),
             AlertRule::high_cpu(90.0),
             AlertRule::high_memory(0.9),
             AlertRule::high_error_rate(0.1),
-        ])
+        ]);
+        if tokio::runtime::Handle::try_current().is_ok() {
+            let _ = Self::spawn_history_pruner(
+                engine.history_handle(),
+                std::time::Duration::from_secs(300),
+                chrono::Duration::days(7),
+                10_000,
+            );
+        }
+        engine
     }
 
     /// Add a rule dynamically.

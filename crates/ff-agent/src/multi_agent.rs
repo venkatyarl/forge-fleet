@@ -82,12 +82,21 @@ impl MultiAgentOrchestrator {
         let mut handles = Vec::new();
         let cancel = self.cancel_token.clone();
 
+        // Cap concurrency so a caller submitting thousands of tasks doesn't
+        // overwhelm the tokio runtime. 64 is enough headroom for normal
+        // fan-out across the fleet and well below tokio's blocking-thread
+        // limit. Each task holds a permit until it completes.
+        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(64));
+
         for task in tasks {
             let event_tx = event_tx.clone();
             let cancel = cancel.clone();
+            let permit = semaphore.clone().acquire_owned().await.expect("semaphore");
 
-            let handle =
-                tokio::spawn(async move { run_single_agent_task(task, event_tx, cancel).await });
+            let handle = tokio::spawn(async move {
+                let _permit = permit; // dropped when task finishes
+                run_single_agent_task(task, event_tx, cancel).await
+            });
 
             handles.push(handle);
         }

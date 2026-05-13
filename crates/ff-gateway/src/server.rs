@@ -431,6 +431,32 @@ impl GatewayServer {
             }
         });
 
+        // Background message-map trim. `prune_messages` runs inline on every
+        // accepted message but only kicks in once the map already exceeds the
+        // threshold — under bursty concurrent inserts both maps can briefly
+        // overshoot. Trimming proactively every 30s smooths that out and
+        // bounds memory growth even when traffic is steady.
+        let trim_state = state.clone();
+        let trim_cancel = state.cancel_token.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(30));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ticker.tick().await; // skip the immediate first tick
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        // Trim to 80% of the threshold so we have headroom
+                        // before the next inline prune fires.
+                        trim_state.prune_messages(8_000);
+                    }
+                    _ = trim_cancel.cancelled() => {
+                        tracing::debug!("gateway message trim task shutting down");
+                        break;
+                    }
+                }
+            }
+        });
+
         Ok(Self { config, state, flush_handle: Some(flush_handle) })
     }
 

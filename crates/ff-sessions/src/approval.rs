@@ -159,11 +159,24 @@ pub struct ApprovalManager {
 }
 
 impl ApprovalManager {
+    /// Create a new manager. When called from a tokio runtime context this
+    /// also spawns the periodic reaper so the `requests` DashMap doesn't grow
+    /// unbounded (see [[pool-per-call-antipattern]] sibling: unbounded
+    /// DashMap is the same shape of leak). Tests outside of a runtime get a
+    /// no-reaper instance.
     pub fn new() -> Self {
-        Self {
+        let mgr = Self {
             policies: Arc::new(DashMap::new()),
             requests: Arc::new(DashMap::new()),
+        };
+        if tokio::runtime::Handle::try_current().is_ok() {
+            let _ = Self::spawn_reaper(
+                mgr.requests_handle(),
+                std::time::Duration::from_secs(1800),
+                chrono::Duration::hours(2),
+            );
         }
+        mgr
     }
 
     /// Ensure a session policy exists and return it.

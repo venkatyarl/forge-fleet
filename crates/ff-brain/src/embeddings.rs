@@ -48,13 +48,25 @@ pub struct EmbeddingClient {
     client: reqwest::Client,
 }
 
+/// Shared reqwest client for every `EmbeddingClient`. Each instance used to
+/// build its own (with DNS resolver + TLS state); under heavy brain traffic
+/// that was per-message churn. `reqwest::Client` is internally `Arc<Inner>`
+/// so cloning the shared one is cheap.
+static EMBEDDING_HTTP_CLIENT: std::sync::LazyLock<reqwest::Client> =
+    std::sync::LazyLock::new(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .expect("build shared embedding reqwest client")
+    });
+
 impl EmbeddingClient {
     pub fn new(endpoint: &str, model_id: &str) -> Self {
         Self {
             endpoint: endpoint.to_string(),
             model_id: model_id.to_string(),
             dimensions: 384,
-            client: reqwest::Client::new(),
+            client: EMBEDDING_HTTP_CLIENT.clone(),
         }
     }
 

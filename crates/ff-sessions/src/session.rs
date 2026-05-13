@@ -290,13 +290,33 @@ impl SessionStore {
     }
 
     /// Sweep timed-out sessions. Returns the number of sessions expired.
+    ///
+    /// Also defensively reaps the `channel_index` for any session that has
+    /// transitioned to a terminal state (Ended / TimedOut / Error) without
+    /// going through `end()`. External code that mutates `session.state`
+    /// directly would otherwise leave dangling index entries.
     pub fn sweep_timed_out(&self) -> usize {
         let mut expired = Vec::new();
+        let mut orphan_keys: Vec<String> = Vec::new();
 
         for entry in self.sessions.iter() {
             let session = entry.value();
             if session.state == SessionState::Active && session.is_timed_out(self.timeout) {
                 expired.push(*entry.key());
+            } else if matches!(
+                session.state,
+                SessionState::Ended | SessionState::TimedOut | SessionState::Error
+            ) {
+                // Terminal — make sure the index doesn't still point at this.
+                let key = Self::channel_key(&session.channel, &session.user);
+                if self
+                    .channel_index
+                    .get(&key)
+                    .map(|v| *v.value() == session.id)
+                    .unwrap_or(false)
+                {
+                    orphan_keys.push(key);
+                }
             }
         }
 
@@ -308,6 +328,9 @@ impl SessionStore {
                 self.channel_index.remove(&key);
                 info!(session_id = %id, "session timed out during sweep");
             }
+        }
+        for key in orphan_keys {
+            self.channel_index.remove(&key);
         }
 
         expired.len()
