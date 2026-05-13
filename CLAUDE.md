@@ -60,7 +60,7 @@ Worker: `ff defer-worker --scheduler --as-node <name>`.
 - `fleet_model_deployments` — what's running per node (llama-server / mlx_lm.server / vllm)
 - `fleet_model_jobs`        — in-flight downloads/deletes/loads/swaps with progress
 - `fleet_disk_usage`        — periodic disk snapshots for quota monitoring
-- `fleet_nodes` extended with `runtime`, `models_dir`, `disk_quota_pct`
+- `fleet_workers` extended with `runtime`, `models_dir`, `disk_quota_pct`
 
 Modules in `ff-agent`:
 - `model_catalog` — load + sync TOML to DB
@@ -91,7 +91,7 @@ Daemon:
 ### Node naming
 `ff_agent::fleet_info::resolve_this_node_name()` picks in order:
 1. `$FORGEFLEET_NODE_NAME` env
-2. Postgres `fleet_nodes` row matching a local IPv4 address
+2. Postgres `fleet_workers` row matching a local IPv4 address
 3. `hostname` short-name fallback
 
 ### macOS code-signing gotcha

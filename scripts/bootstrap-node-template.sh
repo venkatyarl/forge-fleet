@@ -5,7 +5,7 @@
 #   {{LEADER_HOST}}            — e.g. "192.168.5.100"
 #   {{LEADER_PORT}}            — e.g. "51002"
 #   {{TOKEN}}                  — one-use-ish enrollment token
-#   {{NODE_NAME}}              — desired fleet_nodes.name (from form)
+#   {{NODE_NAME}}              — desired fleet_workers.name (from form)
 #   {{NODE_IP}}                — node's LAN IP (from form / server remote_addr)
 #   {{SSH_USER}}               — ssh_user for this node
 #   {{ROLE}}                   — "builder" | "gateway" | "testbed"

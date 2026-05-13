@@ -136,7 +136,7 @@ flowchart TB
 | `ff-agent::TaskRunner` | ✅ Complete | ✅ Yes (every node) | Postgres `fleet_tasks` | SQL + shell |
 | `ff-agent::SessionRunner` | ✅ Complete | ✅ Yes (every node) | Postgres `agent_sessions`/`agent_steps` | SQL + shell |
 | `ff-agent::AgentCoordinator` | ✅ Complete | ❌ No | Postgres `sub_agents` + `work_items` | HTTP + SQL |
-| `ff-agent::OrchestratorAgent` | ✅ Complete | ❌ No | Postgres `fleet_nodes`/`fleet_models` | HTTP + SQL |
+| `ff-agent::OrchestratorAgent` | ✅ Complete | ❌ No | Postgres `fleet_workers`/`fleet_models` | HTTP + SQL |
 | `ff-agent::MultiAgentOrchestrator` | ✅ Complete | ❌ No | In-memory | HTTP |
 | `ff-orchestrator::ParallelExecutor` | ✅ Complete | ⚠️ Indirect (ff-agent lib imports) | In-memory (`DashMap`) | N/A |
 

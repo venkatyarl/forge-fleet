@@ -89,7 +89,7 @@ if [[ -n "$NODES" ]]; then
 else
     while IFS='|' read -r name ip user os role; do
         [[ -n "$ip" ]] && NODE_LIST+=("$ip")
-    done < <(discover_fleet_nodes)
+    done < <(discover_fleet_computers)
 fi
 
 if [[ ${#NODE_LIST[@]} -eq 0 ]]; then

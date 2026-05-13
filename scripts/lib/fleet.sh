@@ -7,17 +7,20 @@
 #
 # All fleet-related scripts should use this library instead of implementing
 # their own discovery. The canonical resolution chain is:
-#   1. Postgres fleet_nodes table  (via `ff fleet computers --format json`)
-#   2. fleet.toml [nodes.*]        (fallback)
-#   3. ~/.ssh/config               (fallback)
-#   4. ~/.forgefleet/fleet.json    (last resort)
+#   1. Postgres fleet_workers table  (via `ff fleet computers --format json`)
+#   2. fleet.toml [nodes.*]          (fallback)
+#   3. ~/.ssh/config                 (fallback)
+#   4. ~/.forgefleet/fleet.json      (last resort)
 #
 # Provided functions:
-#   discover_fleet_nodes          → outputs "name|ip|ssh_user" lines
-#   discover_fleet_nodes_json     → outputs JSON array
+#   discover_fleet_computers      → outputs "name|ip|ssh_user" lines
+#   discover_fleet_computers_json → outputs JSON array
 #   discover_fleet_ips            → outputs IPs only (for simple SCP/SSH loops)
-#   fleet_nodes_linux             → filters to Linux nodes only
-#   fleet_nodes_exclude_macos     → filters out macOS nodes
+#   fleet_computers_linux         → filters to Linux only
+#   fleet_computers_exclude_macos → filters out macOS
+#
+# Legacy aliases (discover_fleet_nodes, fleet_nodes_linux, etc.) remain
+# during the node→computer rename window — they delegate to the new names.
 
 set -euo pipefail
 
@@ -61,7 +64,7 @@ import psycopg2, os, sys
 try:
     conn = psycopg2.connect(os.environ.get('PGURL','$pgurl'))
     cur = conn.cursor()
-    cur.execute('SELECT name, ip, ssh_user, os, role FROM fleet_nodes ORDER BY election_priority, name')
+    cur.execute('SELECT name, ip, ssh_user, os, role FROM fleet_workers ORDER BY election_priority, name')
     for r in cur.fetchall():
         print(f'{r[0]}|{r[1]}|{r[2]}|{r[3]}|{r[4]}')
 except Exception as e:
@@ -175,15 +178,20 @@ for n in data:
 
 # ─── Public API ──────────────────────────────────────────────────────────────
 
-# Discover fleet nodes and output one "name|ip|ssh_user|os|role" line per node.
-# Usage: while IFS='|' read -r name ip user os role; do ...; done < <(discover_fleet_nodes)
-discover_fleet_nodes() {
+# Discover fleet computers and output one "name|ip|ssh_user|os|role" line each.
+# Usage: while IFS='|' read -r name ip user os role; do ...; done < <(discover_fleet_computers)
+discover_fleet_computers() {
     _resolve_fleet_nodes
 }
 
-# Discover fleet nodes as a JSON array (delegates to `ff fleet nodes --format json`).
+# Legacy alias retained during the node→computer rename window.
+discover_fleet_nodes() {
+    discover_fleet_computers
+}
+
+# Discover fleet computers as a JSON array (delegates to `ff fleet computers --format json`).
 # Falls back to inline JSON generation if `ff` is not available.
-discover_fleet_nodes_json() {
+discover_fleet_computers_json() {
     if output=$(_ff_fleet_nodes_json 2>/dev/null) && [[ -n "$output" ]]; then
         echo "$output"
         return 0
@@ -219,26 +227,46 @@ print(json.dumps(out, indent=2))
 
 # Output IPs only (one per line), useful for simple SSH/SCP loops.
 discover_fleet_ips() {
-    discover_fleet_nodes | awk -F'|' '{print $2}'
+    discover_fleet_computers | awk -F'|' '{print $2}'
 }
 
-# Filter fleet nodes to Linux only (excludes macOS and empty OS).
-fleet_nodes_linux() {
-    discover_fleet_nodes | awk -F'|' '
+# Legacy alias for discover_fleet_computers_json.
+discover_fleet_nodes_json() {
+    discover_fleet_computers_json
+}
+
+# Filter fleet computers to Linux only (excludes macOS and empty OS).
+fleet_computers_linux() {
+    discover_fleet_computers | awk -F'|' '
         BEGIN { IGNORECASE=1 }
         $4 ~ /linux/ { print }
     '
 }
 
-# Filter fleet nodes excluding macOS.
-fleet_nodes_exclude_macos() {
-    discover_fleet_nodes | awk -F'|' '
+# Legacy alias retained during the rename window.
+fleet_nodes_linux() {
+    fleet_computers_linux
+}
+
+# Filter fleet computers excluding macOS.
+fleet_computers_exclude_macos() {
+    discover_fleet_computers | awk -F'|' '
         BEGIN { IGNORECASE=1 }
         $4 !~ /macos|darwin/ { print }
     '
 }
 
-# Count fleet nodes.
+# Legacy alias.
+fleet_nodes_exclude_macos() {
+    fleet_computers_exclude_macos
+}
+
+# Count fleet computers.
+fleet_computer_count() {
+    discover_fleet_computers | wc -l | tr -d ' '
+}
+
+# Legacy alias.
 fleet_node_count() {
-    discover_fleet_nodes | wc -l | tr -d ' '
+    fleet_computer_count
 }

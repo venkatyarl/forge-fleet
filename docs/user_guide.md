@@ -32,7 +32,7 @@ ff model sync-catalog
 ### c. Tag each node's runtime
 
 ForgeFleet supports three inference runtimes. Each node has ONE based on
-hardware. Set via the `runtime` column in `fleet_nodes`:
+hardware. Set via the `runtime` column in `fleet_workers`:
 
 | Hardware                | Runtime     |
 |-------------------------|-------------|
