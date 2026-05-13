@@ -4,14 +4,14 @@
 //!
 //! Routes registered in `server.rs::build_router`:
 //!   GET  /onboard/bootstrap.sh              — render the per-node install script
-//!   POST /api/fleet/self-enroll             — full admission flow (writes fleet_nodes)
+//!   POST /api/fleet/self-enroll             — full admission flow (writes fleet_workers)
 //!   POST /api/fleet/enrollment-progress     — bootstrap script callbacks for live UI
 //!   GET  /api/fleet/check-ip                — server-side ping probe (for verify actions)
 //!   GET  /api/fleet/check-tcp               — server-side TCP probe
 //!
 //! These endpoints are *complementary* to the existing `/api/fleet/enroll` (which
 //! only upserts `fleet_node_runtime`). Self-enroll handles first-join flow: it
-//! creates the `fleet_nodes` row, stashes the SSH identity, records hardware/
+//! creates the `fleet_workers` row, stashes the SSH identity, records hardware/
 //! tooling metadata, and kicks off mesh-propagation via the deferred queue.
 
 use std::sync::Arc;

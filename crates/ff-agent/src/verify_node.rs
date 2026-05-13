@@ -26,7 +26,7 @@ pub async fn verify_node(pool: &PgPool, node_name: &str) -> Result<VerifyReport,
     let node = ff_db::pg_get_node(pool, node_name)
         .await
         .map_err(|e| format!("pg_get_node: {e}"))?
-        .ok_or_else(|| format!("node '{node_name}' not in fleet_nodes"))?;
+        .ok_or_else(|| format!("node '{node_name}' not in fleet_workers"))?;
     let ssh_dest = format!("{}@{}", node.ssh_user, node.ip);
     let is_windows = node.os.to_lowercase().contains("windows");
     let mut details = Vec::new();
@@ -95,7 +95,7 @@ pub async fn verify_node(pool: &PgPool, node_name: &str) -> Result<VerifyReport,
         CheckResult { check: "tool_versions_reported".into(), status: "pass".into(), message: None, retry_task_id: None }
     } else {
         CheckResult { check: "tool_versions_reported".into(), status: "fail".into(),
-            message: Some("fleet_nodes.tooling is empty; run `ff daemon` long enough for a version_check tick".into()),
+            message: Some("fleet_workers.tooling is empty; run `ff daemon` long enough for a version_check tick".into()),
             retry_task_id: None }
     });
     // 7. models_scanned

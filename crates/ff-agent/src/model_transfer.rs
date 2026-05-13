@@ -93,7 +93,7 @@ pub async fn ssh_exec(user: &str, host: &str, cmd: &str) -> Result<(i32, String,
 
 /// Expand a leading `~` / `~/` in a remote path by prefixing the user's
 /// home directory on the remote node. Non-tilde paths are returned as-is.
-/// This is used to turn `~/models` (as stored in `fleet_nodes.models_dir`)
+/// This is used to turn `~/models` (as stored in `fleet_workers.models_dir`)
 /// into an absolute path usable as an rsync destination.
 fn expand_tilde_with_home(path: &str, home: &str) -> String {
     if path == "~" {

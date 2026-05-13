@@ -43,7 +43,7 @@ pub enum Strength {
     General,
 }
 
-/// Get the fleet's capabilities from the Postgres `fleet_nodes` + `fleet_models` tables.
+/// Get the fleet's capabilities from the Postgres `fleet_workers` + `fleet_models` tables.
 ///
 /// Each (node, model) pair becomes one `NodeCapability`. Strengths are inferred
 /// from the model's family, size, and preferred workloads so that `select_nodes`

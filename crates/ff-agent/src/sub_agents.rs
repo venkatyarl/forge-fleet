@@ -1,7 +1,7 @@
 //! Sub-agent slot manager.
 //!
 //! Each daemon host gets N concurrent worker slots (N =
-//! `fleet_nodes.sub_agent_count`), each with its own workspace directory
+//! `fleet_workers.sub_agent_count`), each with its own workspace directory
 //! at `~/.forgefleet/sub-agent-{i}/` containing `scratch/`,
 //! `checkpoints/`, and `cache/` subdirs.
 //!

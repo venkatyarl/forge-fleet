@@ -591,7 +591,7 @@ async fn execute_shell(
             // SSH to target: look up user@ip from DB.
             let node = match nodes.iter().find(|x| x.name.eq_ignore_ascii_case(n)) {
                 Some(n) => n,
-                None => return (false, None, Some(format!("node '{n}' not in fleet_nodes"))),
+                None => return (false, None, Some(format!("node '{n}' not in fleet_workers"))),
             };
             let dest = format!("{}@{}", node.ssh_user, node.ip);
             // Assume remote targets are Linux (Marcus/Sophie/Priya are Ubuntu;
@@ -834,7 +834,7 @@ pub async fn handle_defer_worker(
         .await
         .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
 
-    // Sub-agent concurrency slots — read fleet_nodes.sub_agent_count for this node.
+    // Sub-agent concurrency slots — read fleet_workers.sub_agent_count for this node.
     let slot_count = ff_db::pg_get_node(&pool, &worker_name)
         .await
         .ok()
@@ -1070,7 +1070,7 @@ pub async fn handle_daemon(
         .await
         .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
 
-    // Sub-agent concurrency slots — read fleet_nodes.sub_agent_count for this node.
+    // Sub-agent concurrency slots — read fleet_workers.sub_agent_count for this node.
     let slot_count = ff_db::pg_get_node(&pool, &worker_name)
         .await
         .ok()

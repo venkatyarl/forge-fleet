@@ -127,11 +127,11 @@ pub async fn handle_ports_scan(pool: &sqlx::PgPool, computer: &str) -> Result<()
     let output = if is_local {
         TokCmd::new("sh").args(["-c", probe_cmd]).output().await
     } else {
-        let row = sqlx::query("SELECT ssh_user, ip FROM fleet_nodes WHERE name = $1 LIMIT 1")
+        let row = sqlx::query("SELECT ssh_user, ip FROM fleet_workers WHERE name = $1 LIMIT 1")
             .bind(computer)
             .fetch_optional(pool)
             .await
-            .map_err(|e| anyhow::anyhow!("lookup fleet_nodes: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("lookup fleet_workers: {e}"))?;
 
         let (ssh_user, ip) = match row {
             Some(r) => (
@@ -139,7 +139,7 @@ pub async fn handle_ports_scan(pool: &sqlx::PgPool, computer: &str) -> Result<()
                 sqlx::Row::get::<String, _>(&r, "ip"),
             ),
             None => {
-                println!("{RED}✗ Unknown computer '{computer}' — not in fleet_nodes.{RESET}");
+                println!("{RED}✗ Unknown computer '{computer}' — not in fleet_workers.{RESET}");
                 return Ok(());
             }
         };

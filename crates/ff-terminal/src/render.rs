@@ -578,7 +578,7 @@ fn render_left_sidebar(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) 
         " Topology ",
         Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
     )));
-    if app.fleet_nodes.is_empty() {
+    if app.fleet_workers.is_empty() {
         lines.push(Line::from(Span::styled(
             "  (no nodes)",
             Style::default().fg(Color::Rgb(71, 85, 105)),
@@ -592,8 +592,8 @@ fn render_left_sidebar(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) 
                 .fg(Color::Rgb(99, 102, 241))
                 .add_modifier(Modifier::BOLD),
         )));
-        for (i, node) in app.fleet_nodes.iter().take(6).enumerate() {
-            let is_last = i == app.fleet_nodes.len().min(6) - 1;
+        for (i, node) in app.fleet_workers.iter().take(6).enumerate() {
+            let is_last = i == app.fleet_workers.len().min(6) - 1;
             let branch = if is_last { " └─" } else { " ├─" };
             let role_icon = match node.role.as_str() {
                 "leader" => "★",
@@ -630,9 +630,9 @@ fn render_left_sidebar(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) 
                 ]));
             }
         }
-        if app.fleet_nodes.len() > 6 {
+        if app.fleet_workers.len() > 6 {
             lines.push(Line::from(Span::styled(
-                format!(" ... +{} more", app.fleet_nodes.len() - 6),
+                format!(" ... +{} more", app.fleet_workers.len() - 6),
                 Style::default().fg(Color::Rgb(71, 85, 105)),
             )));
         }
@@ -681,13 +681,13 @@ fn render_left_sidebar(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) 
         " Fleet ",
         Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
     )));
-    if app.fleet_nodes.is_empty() {
+    if app.fleet_workers.is_empty() {
         lines.push(Line::from(Span::styled(
             "  (no nodes)",
             Style::default().fg(Color::Rgb(71, 85, 105)),
         )));
     } else {
-        for node in &app.fleet_nodes {
+        for node in &app.fleet_workers {
             let (daemon_icon, daemon_color) = if node.daemon_online {
                 ("●", Color::Rgb(74, 222, 128))
             } else {

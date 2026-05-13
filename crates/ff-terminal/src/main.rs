@@ -1050,7 +1050,7 @@ enum FleetCommand {
     },
     /// Permanently remove a computer from the fleet.
     ///
-    /// Deletes every DB row tied to the computer (fleet_nodes + computers
+    /// Deletes every DB row tied to the computer (fleet_workers + computers
     /// and their cascades), clears leader state if it was the elected leader,
     /// and enqueues a deferred `node_online` task on Taylor that fans out an
     /// SSH revocation of the removed node's public key across every remaining
@@ -1244,7 +1244,7 @@ pub enum FleetDbCommand {
     /// failover. Must be run on the target computer (the new primary).
     Failover {
         /// Name of the computer whose local replica should be promoted.
-        /// Must match `hostname` / `fleet_nodes.name`.
+        /// Must match `hostname` / `fleet_workers.name`.
         #[arg(long = "to")]
         to: String,
         /// Proceed even if the target isn't the current ForgeFleet leader
@@ -1580,7 +1580,7 @@ pub enum OnboardCommand {
         #[arg(long, default_value_t = 25)]
         limit: i64,
     },
-    /// Revoke a node: delete its fleet_nodes row, ssh keys, and mesh rows.
+    /// Revoke a node: delete its fleet_workers row, ssh keys, and mesh rows.
     Revoke {
         name: String,
         #[arg(long, default_value_t = false)]
@@ -3276,7 +3276,7 @@ async fn run_tui(config: AgentSessionConfig) -> Result<()> {
 async fn check_fleet_health(app: &mut App) {
     static SHARED_HTTP: std::sync::LazyLock<reqwest::Client> =
         std::sync::LazyLock::new(|| reqwest::Client::new());
-    for node in &mut app.fleet_nodes {
+    for node in &mut app.fleet_workers {
         // Check daemon
         let daemon_url = format!(
             "http://{}:{}/health",
@@ -3368,7 +3368,7 @@ async fn run_event_loop(
 
         // Kick off a fleet health refresh every ~30s (20 fps × 30s = 600 frames).
         if app.frame.is_multiple_of(600) && app.frame > 0 {
-            kick_fleet_health_refresh(&app.fleet_nodes);
+            kick_fleet_health_refresh(&app.fleet_workers);
         }
 
         // Render
@@ -3944,7 +3944,7 @@ pub fn poll_fleet_health_refresh(app: &mut ff_terminal::app::App) {
     };
     let Some(fresh) = result else { return };
     *FLEET_HEALTH_SLOT.lock().unwrap() = None;
-    app.fleet_nodes = fresh;
+    app.fleet_workers = fresh;
 }
 
 async fn load_picker_items() -> Result<Vec<ff_terminal::app::ModelPickerItem>, String> {

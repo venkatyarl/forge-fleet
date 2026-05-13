@@ -5524,7 +5524,7 @@ struct AlternativeCandidate {
 ///
 /// Accepts a task description + required capabilities and returns the best
 /// live fleet endpoint that can serve it.  Uses two sources of truth:
-///   1. Postgres `fleet_models` × `fleet_nodes` for capability metadata + health.
+///   1. Postgres `fleet_models` × `fleet_workers` for capability metadata + health.
 ///   2. Redis Pulse beats for live server state (queue depth, throughput).
 ///
 /// This is the primitive that project sidecars should call instead of

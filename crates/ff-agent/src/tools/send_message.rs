@@ -127,7 +127,7 @@ async fn lookup_node_ip_from_db(name: &str) -> anyhow::Result<String> {
         .await
         .map_err(|e| anyhow::anyhow!("get_fleet_pool: {e}"))?;
 
-    let row = sqlx::query("SELECT ip FROM fleet_nodes WHERE name = $1")
+    let row = sqlx::query("SELECT ip FROM fleet_workers WHERE name = $1")
         .bind(name)
         .fetch_one(&pool)
         .await?;

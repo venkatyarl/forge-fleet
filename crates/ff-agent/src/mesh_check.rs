@@ -334,11 +334,11 @@ pub async fn probe_single_pair(pool: &PgPool, src: &str, dst: &str) -> Result<Me
     let s = nodes
         .iter()
         .find(|n| n.name == src)
-        .ok_or_else(|| format!("src node '{src}' not in fleet_nodes"))?;
+        .ok_or_else(|| format!("src node '{src}' not in fleet_workers"))?;
     let d = nodes
         .iter()
         .find(|n| n.name == dst)
-        .ok_or_else(|| format!("dst node '{dst}' not in fleet_nodes"))?;
+        .ok_or_else(|| format!("dst node '{dst}' not in fleet_workers"))?;
     let cell = probe_pair(
         s.name.clone(),
         s.ssh_user.clone(),

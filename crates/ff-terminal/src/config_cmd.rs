@@ -69,7 +69,7 @@ pub async fn handle_config(cmd: crate::ConfigCommand, p: &Path) -> Result<()> {
                 .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
             let mut row = ff_db::pg_get_node(&pool, &name)
                 .await?
-                .ok_or_else(|| anyhow::anyhow!("node '{name}' not found in fleet_nodes"))?;
+                .ok_or_else(|| anyhow::anyhow!("node '{name}' not found in fleet_workers"))?;
             match key.as_str() {
                 "runtime" => {
                     let allowed = ["mlx", "llama.cpp", "vllm", "unknown"];

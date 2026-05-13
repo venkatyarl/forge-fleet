@@ -83,7 +83,7 @@ pub async fn plan_eviction(
     let node = ff_db::pg_get_node(pool, node_name)
         .await
         .map_err(|e| format!("pg_get_node: {e}"))?
-        .ok_or_else(|| format!("node '{node_name}' not in fleet_nodes"))?;
+        .ok_or_else(|| format!("node '{node_name}' not in fleet_workers"))?;
     let quota_bytes = (total as f64 * node.disk_quota_pct as f64 / 100.0) as u64;
 
     // Nothing to do if not over quota.

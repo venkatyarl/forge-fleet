@@ -4,7 +4,7 @@
 //! every consumer — Rust daemons, CLI tools, and shell scripts.
 //!
 //! Resolution chain (in priority order):
-//!   1. Postgres `fleet_nodes` table  — canonical source of truth
+//!   1. Postgres `fleet_workers` table  — canonical source of truth
 //!   2. `fleet.toml` `[nodes.*]`       — static config fallback
 //!   3. `~/.ssh/config`                — SSH-based discovery
 //!   4. `~/.forgefleet/fleet.json`    — JSON fallback
@@ -172,7 +172,7 @@ impl FleetResolver {
         }
 
         let rows = sqlx::query_as::<_, NodeRow>(
-            "SELECT name, ip, ssh_user, os, role FROM fleet_nodes ORDER BY election_priority, name",
+            "SELECT name, ip, ssh_user, os, role FROM fleet_workers ORDER BY election_priority, name",
         )
         .fetch_all(&pool)
         .await

@@ -2,7 +2,7 @@
 //!
 //! ForgeFleet is open-source and must not contain hardcoded fleet identities.
 //! All fleet-specific data (node names, IPs, SSH users, model ports) lives in
-//! the Postgres `fleet_nodes` and `fleet_models` tables. This module centralizes
+//! the Postgres `fleet_workers` and `fleet_models` tables. This module centralizes
 //! the query logic so every call site uses the same cached/async API.
 
 use std::time::Duration;
@@ -136,7 +136,7 @@ pub async fn get_hf_token() -> Option<String> {
 
 /// Resolve the ForgeFleet node name for the CURRENT host, in priority order:
 ///   1. `$FORGEFLEET_NODE_NAME` env var (explicit override)
-///   2. Postgres `fleet_nodes` row whose `ip` or `alt_ips` matches any local IPv4 address
+///   2. Postgres `fleet_workers` row whose `ip` or `alt_ips` matches any local IPv4 address
 ///   3. `hostname` short-name fallback (lowercased, first label)
 pub async fn resolve_this_node_name() -> String {
     if let Ok(v) = std::env::var("FORGEFLEET_NODE_NAME") {
@@ -437,7 +437,7 @@ pub async fn ensure_fleet_description_cached() -> &'static String {
                 Err(err) => {
                     debug!(error = %err, "fleet description unavailable; using placeholder");
                     "No fleet nodes could be loaded from the database. \
-Check ~/.forgefleet/fleet.toml [database] url and the fleet_nodes table."
+Check ~/.forgefleet/fleet.toml [database] url and the fleet_workers table."
                         .to_string()
                 }
             }

@@ -1129,7 +1129,7 @@ async fn resolve_llm_endpoint(pool: &PgPool) -> String {
         }
     };
 
-    // Resolve node_name → IP via fleet_nodes
+    // Resolve node_name → IP via fleet_workers
     let ip = match ff_db::pg_list_nodes(pool).await {
         Ok(nodes) => nodes
             .iter()

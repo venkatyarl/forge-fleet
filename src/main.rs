@@ -173,7 +173,7 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
             .await
             .context("postgres fleet-config migrations failed")?;
 
-        // Only seed if Postgres fleet_nodes table is empty (first boot)
+        // Only seed if Postgres fleet_workers table is empty (first boot)
         let existing = ff_db::pg_list_nodes(pg_pool).await.unwrap_or_default();
         if existing.is_empty() {
             info!("first boot: seeding Postgres from fleet.toml");
@@ -1765,7 +1765,7 @@ fn start_self_heal_subsystem(
 
                     // Fleet-wide health check — read node list from Postgres if available,
                     // restart commands from fleet_settings or hardcoded fallback.
-                    let fleet_nodes: Vec<(String, String, String)> = {
+                    let fleet_workers: Vec<(String, String, String)> = {
                         let mut nodes = Vec::new();
 
                         // Try to read restart_commands from Postgres fleet_settings
@@ -1825,7 +1825,7 @@ fn start_self_heal_subsystem(
                         .build()
                         .unwrap_or_default();
 
-                    for (name, ip, restart_cmd) in &fleet_nodes {
+                    for (name, ip, restart_cmd) in &fleet_workers {
                         let url = format!("http://{}:55000/health", ip);
                         match client.get(&url).send().await {
                             Ok(r) if r.status().is_success() => { fleet_healthy += 1; }
@@ -1853,7 +1853,7 @@ fn start_self_heal_subsystem(
                     if !fleet_issues.is_empty() {
                         warn!(
                             healthy = fleet_healthy,
-                            total = fleet_nodes.len(),
+                            total = fleet_workers.len(),
                             issues = ?fleet_issues,
                             "fleet health: some nodes unhealthy"
                         );
@@ -2784,10 +2784,10 @@ async fn build_api_config(config: &FleetConfig, pg_pool: Option<&ff_db::PgPool>)
         }
     }
 
-    // 3) Primary source: Postgres fleet_models + fleet_nodes (authoritative when daemon runs in
+    // 3) Primary source: Postgres fleet_models + fleet_workers (authoritative when daemon runs in
     //    postgres_full mode — fleet.toml [nodes] sections will be empty).
     if let Some(pool) = pg_pool {
-        // Build a node-name → IP map from fleet_nodes.
+        // Build a node-name → IP map from fleet_workers.
         let node_ips: HashMap<String, String> = ff_db::pg_list_nodes(pool)
             .await
             .unwrap_or_default()

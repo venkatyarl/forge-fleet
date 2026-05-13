@@ -27,7 +27,7 @@ pub async fn sample_local_disk(pool: &sqlx::PgPool) -> Result<DiskSample, String
     let node = ff_db::pg_get_node(pool, &node_name)
         .await
         .map_err(|e| format!("pg_get_node({node_name}): {e}"))?
-        .ok_or_else(|| format!("node '{node_name}' not in fleet_nodes"))?;
+        .ok_or_else(|| format!("node '{node_name}' not in fleet_workers"))?;
 
     let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
     let models_dir = expand_tilde(&node.models_dir, &home);

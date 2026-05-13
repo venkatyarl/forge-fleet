@@ -87,7 +87,7 @@ impl SshKeyManager {
         // 1. Look up the revoked node's user key.
         let key_row = sqlx::query(
             "SELECT public_key, fingerprint FROM fleet_workers_ssh_keys
-              WHERE node_name = $1 AND key_purpose = 'user'
+              WHERE worker_name = $1 AND key_purpose = 'user'
               ORDER BY added_at DESC
               LIMIT 1",
         )

@@ -547,6 +547,16 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "rename_fleet_nodes",
         sql: schema::SCHEMA_V83_RENAME_FLEET_NODES,
     },
+    PgMigration {
+        version: 84,
+        name: "rename_node_name_column",
+        sql: schema::SCHEMA_V84_RENAME_NODE_NAME_COLUMN,
+    },
+    PgMigration {
+        version: 85,
+        name: "drop_compat_views",
+        sql: schema::SCHEMA_V85_DROP_COMPAT_VIEWS,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.

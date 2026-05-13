@@ -134,15 +134,15 @@ pub async fn handle_register(pg: &PgPool, node: Option<String>) -> Result<()> {
             })
     });
 
-    // Check if node exists in fleet_nodes
+    // Check if node exists in fleet_workers
     let node_exists: bool =
-        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM fleet_nodes WHERE name = $1)")
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM fleet_workers WHERE name = $1)")
             .bind(&node_name)
             .fetch_one(pg)
             .await?;
 
     if !node_exists {
-        println!("{RED}✗{RESET} Node '{node_name}' not found in fleet_nodes.");
+        println!("{RED}✗{RESET} Node '{node_name}' not found in fleet_workers.");
         println!("  Register the node first: ff fleet enroll {node_name}");
         return Ok(());
     }

@@ -108,7 +108,7 @@ pub async fn fetch_latest(client: &reqwest::Client, keys: &[&str]) -> BTreeMap<S
 fn return_also(_k: &str, _v: &str) { /* helper hook for tracing; noop */
 }
 
-/// Full roundtrip: merge current + latest, write to fleet_nodes.tooling.
+/// Full roundtrip: merge current + latest, write to fleet_workers.tooling.
 pub async fn version_check_pass(pool: &PgPool) -> Result<DriftSummary, String> {
     let node_name = crate::fleet_info::resolve_this_node_name().await;
     let current = collect_current().await;

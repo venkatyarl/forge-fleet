@@ -10,7 +10,7 @@
 //! ```
 //!
 //! # Features
-//! - SQLite mirror of `fleet_tasks`, `fleet_nodes`, `fleet_settings`
+//! - SQLite mirror of `fleet_tasks`, `fleet_workers`, `fleet_settings`
 //! - Local task queue (claimed when offline, replayed when online)
 //! - Tailscale integration (optional) for secure mesh when off-LAN
 //! - Cron-driven sync attempts every 60s
@@ -102,7 +102,7 @@ async fn try_sync_upstream(_data_dir: &std::path::Path) -> anyhow::Result<usize>
     // In a full implementation this would:
     // 1. Read ~/.forgefleet/fleet.toml for the DB URL
     // 2. Connect to Postgres
-    // 3. Pull fleet_nodes, fleet_settings into SQLite
+    // 3. Pull fleet_workers, fleet_settings into SQLite
     // 4. Push pending aura_tasks into fleet_tasks
     // 5. Mark synced tasks in SQLite
     //

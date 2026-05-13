@@ -1130,7 +1130,7 @@ async fn remove_computer_core(pool: &sqlx::PgPool, name: &str) -> Result<RemoveC
     let mut tx = pool.begin().await?;
     let mut report = RemoveComputerReport::default();
 
-    // fleet_models has no ON DELETE CASCADE on the fleet_nodes FK.
+    // fleet_models has no ON DELETE CASCADE on the fleet_workers FK.
     let r = sqlx::query("DELETE FROM fleet_models WHERE node_name = $1")
         .bind(name)
         .execute(&mut *tx)
@@ -1145,9 +1145,9 @@ async fn remove_computer_core(pool: &sqlx::PgPool, name: &str) -> Result<RemoveC
         .await?;
     report.leader_state_rows = r.rows_affected();
 
-    // fleet_nodes cascades: fleet_workers_ssh_keys, fleet_model_library,
+    // fleet_workers cascades: fleet_workers_ssh_keys, fleet_model_library,
     // fleet_model_deployments, fleet_disk_usage (all ON DELETE CASCADE).
-    let r = sqlx::query("DELETE FROM fleet_nodes WHERE name = $1")
+    let r = sqlx::query("DELETE FROM fleet_workers WHERE name = $1")
         .bind(name)
         .execute(&mut *tx)
         .await?;
@@ -1254,7 +1254,7 @@ pub async fn handle_fleet_remove_computer(
 ) -> Result<()> {
     // 1. Look up what actually exists so we can print an honest plan.
     let fleet_node: Option<(String, String, String)> =
-        sqlx::query_as("SELECT name, ip, ssh_user FROM fleet_nodes WHERE name = $1")
+        sqlx::query_as("SELECT name, ip, ssh_user FROM fleet_workers WHERE name = $1")
             .bind(name)
             .fetch_optional(pool)
             .await?;
@@ -1266,15 +1266,15 @@ pub async fn handle_fleet_remove_computer(
     .await?;
 
     if fleet_node.is_none() && computer.is_none() {
-        eprintln!("{YELLOW}No fleet_nodes or computers row named '{name}' — nothing to do.{RESET}");
+        eprintln!("{YELLOW}No fleet_workers or computers row named '{name}' — nothing to do.{RESET}");
         std::process::exit(2);
     }
 
     println!("{CYAN}▶ ff fleet remove-computer {name}{RESET}");
     if let Some((n, ip, user)) = &fleet_node {
-        println!("  fleet_nodes row:  name={n} ip={ip} ssh_user={user}");
+        println!("  fleet_workers row:  name={n} ip={ip} ssh_user={user}");
     } else {
-        println!("  fleet_nodes row:  (none)");
+        println!("  fleet_workers row:  (none)");
     }
     if let Some((n, ip, osf)) = &computer {
         println!("  computers row:    name={n} primary_ip={ip} os_family={osf}");
@@ -1303,7 +1303,7 @@ pub async fn handle_fleet_remove_computer(
         + report.leader_state_rows;
     println!(
         "\n{GREEN}✓ removed {name}{RESET} — {total} row(s) across \
-         computers({cr}), fleet_nodes({fn_}), fleet_models({fm}), \
+         computers({cr}), fleet_workers({fn_}), fleet_models({fm}), \
          fleet_leader_state({fls})",
         cr = report.computer_rows,
         fn_ = report.fleet_node_rows,
@@ -1326,7 +1326,7 @@ pub async fn handle_fleet_disband(
     // because a computer may exist in one but not the other if something
     // went sideways during onboarding.
     let fleet_names: Vec<String> = sqlx::query_scalar(
-        "SELECT name FROM fleet_nodes WHERE LOWER(name) <> 'taylor' ORDER BY name",
+        "SELECT name FROM fleet_workers WHERE LOWER(name) <> 'taylor' ORDER BY name",
     )
     .fetch_all(pool)
     .await?;
@@ -1345,7 +1345,7 @@ pub async fn handle_fleet_disband(
     targets.sort();
 
     println!("{CYAN}▶ ff fleet disband{RESET}");
-    println!("  This will DELETE every fleet_nodes/computers row except 'taylor'.");
+    println!("  This will DELETE every fleet_workers/computers row except 'taylor'.");
     println!("  Requires BOTH --yes AND --i-know-what-im-doing to actually run.");
     println!("  targets:         {} computer(s)", targets.len());
     for n in &targets {
@@ -1407,7 +1407,7 @@ pub async fn handle_fleet_migrate_source_trees(
     yes: bool,
 ) -> Result<()> {
     // Build the candidate set: every computer that isn't Taylor.
-    // We join fleet_nodes (for ssh_user/ip) with computers (for
+    // We join fleet_workers (for ssh_user/ip) with computers (for
     // source_tree_path) on name.
     #[derive(Debug)]
     struct Candidate {
@@ -1419,7 +1419,7 @@ pub async fn handle_fleet_migrate_source_trees(
     let rows = sqlx::query(
         "SELECT n.name, n.ip, n.ssh_user,
                 COALESCE(c.source_tree_path, '~/.forgefleet/sub-agent-0/forge-fleet') AS canonical
-           FROM fleet_nodes n
+           FROM fleet_workers n
            LEFT JOIN computers c ON c.name = n.name
           WHERE LOWER(n.name) <> 'taylor'
           ORDER BY n.name",

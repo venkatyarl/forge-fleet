@@ -54,14 +54,14 @@ pub async fn handle_onboard(cmd: crate::OnboardCommand) -> Result<()> {
         crate::OnboardCommand::Revoke { name, yes } => {
             if !yes {
                 println!(
-                    "This will DELETE fleet_nodes row '{name}', all its SSH keys, and mesh-status rows."
+                    "This will DELETE fleet_workers row '{name}', all its SSH keys, and mesh-status rows."
                 );
                 println!("Re-run with --yes to confirm.");
                 return Ok(());
             }
             let removed_keys = ff_db::pg_delete_node_ssh_keys(&pool, &name).await?;
             let removed_mesh = ff_db::pg_delete_mesh_status_for_node(&pool, &name).await?;
-            let r = sqlx::query("DELETE FROM fleet_nodes WHERE name = $1")
+            let r = sqlx::query("DELETE FROM fleet_workers WHERE name = $1")
                 .bind(&name)
                 .execute(&pool)
                 .await?;

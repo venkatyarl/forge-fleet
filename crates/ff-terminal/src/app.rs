@@ -37,7 +37,7 @@ pub struct App {
     // Global state
     pub frame: u64,
     pub should_quit: bool,
-    pub fleet_nodes: Vec<FleetNode>,
+    pub fleet_workers: Vec<FleetNode>,
     pub current_project: Option<ProjectInfo>,
     pub working_dir: PathBuf,
     pub brain_status: Option<ff_agent::brain::BrainLoadedStatus>,
@@ -235,7 +235,7 @@ impl SessionTab {
 pub struct FleetNode {
     pub name: String,
     pub ip: String,
-    /// OS family as stored in computers.os_family / fleet_nodes.os:
+    /// OS family as stored in computers.os_family / fleet_workers.os:
     /// "macos", "linux-ubuntu", "linux-dgx", "windows". Rendered in the
     /// fleet panel header as a pretty name in parens.
     pub os: String,
@@ -304,7 +304,7 @@ impl App {
             active_tab: 0,
             frame: 0,
             should_quit: false,
-            fleet_nodes: fleet_nodes_from_db().await,
+            fleet_workers: fleet_nodes_from_db().await,
             current_project,
             working_dir,
             brain_status: None,

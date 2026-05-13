@@ -184,7 +184,7 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
             };
             let node_row = ff_db::pg_get_node(&pool, &node_name)
                 .await?
-                .ok_or_else(|| anyhow::anyhow!("node '{node_name}' not in fleet_nodes"))?;
+                .ok_or_else(|| anyhow::anyhow!("node '{node_name}' not in fleet_workers"))?;
             let target_runtime = runtime.unwrap_or_else(|| node_row.runtime.clone());
             if target_runtime == "unknown" {
                 anyhow::bail!(
@@ -435,7 +435,7 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
             // Resolve target node + its runtime.
             let node_row = ff_db::pg_get_node(&pool, &node)
                 .await?
-                .ok_or_else(|| anyhow::anyhow!("node '{node}' not in fleet_nodes"))?;
+                .ok_or_else(|| anyhow::anyhow!("node '{node}' not in fleet_workers"))?;
             let target_runtime = node_row.runtime.clone();
             if target_runtime == "unknown" {
                 anyhow::bail!(

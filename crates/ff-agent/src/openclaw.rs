@@ -457,7 +457,7 @@ async fn migrate_devices_from(
     new_leader: &str,
 ) -> anyhow::Result<usize> {
     // 1) Look up old leader's ssh_user + ip. Prefer `computers`; fall
-    //    back to `fleet_nodes` (legacy terminology still carries data).
+    //    back to `fleet_workers` (legacy terminology still carries data).
     let found: Option<(String, String)> =
         sqlx::query_as("SELECT ssh_user, primary_ip FROM computers WHERE name = $1")
             .bind(old_leader)
@@ -465,7 +465,7 @@ async fn migrate_devices_from(
             .await
             .unwrap_or(None)
             .or(sqlx::query_as::<_, (String, String)>(
-                "SELECT ssh_user, ip FROM fleet_nodes WHERE name = $1",
+                "SELECT ssh_user, ip FROM fleet_workers WHERE name = $1",
             )
             .bind(old_leader)
             .fetch_optional(pool)
@@ -474,7 +474,7 @@ async fn migrate_devices_from(
     let (ssh_user, ip) = match found {
         Some(x) => x,
         None => {
-            warn!(%old_leader, "migrate_devices: no ssh_user/ip in computers or fleet_nodes");
+            warn!(%old_leader, "migrate_devices: no ssh_user/ip in computers or fleet_workers");
             return Ok(0);
         }
     };

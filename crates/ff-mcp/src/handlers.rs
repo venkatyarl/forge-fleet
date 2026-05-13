@@ -90,7 +90,7 @@ pub async fn fleet_status(params: Option<Value>) -> HandlerResult {
             let nodes = ff_db::pg_list_nodes(&pool).await.unwrap_or_default();
             let models = ff_db::pg_list_models(&pool).await.unwrap_or_default();
             if nodes.is_empty() {
-                info!("fleet_status: Postgres fleet_nodes empty, falling back to fleet.toml");
+                info!("fleet_status: Postgres fleet_workers empty, falling back to fleet.toml");
                 (None, None)
             } else {
                 info!(

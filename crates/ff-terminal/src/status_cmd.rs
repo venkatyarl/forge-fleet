@@ -171,7 +171,7 @@ pub async fn handle_status_inner(p: PathBuf) -> Result<()> {
                     d.node_name, d.total_bytes, d.used_bytes, d.models_bytes, \
                     COALESCE(n.disk_quota_pct, 80) \
              FROM fleet_disk_usage d \
-             LEFT JOIN fleet_nodes n ON n.name = d.node_name \
+             LEFT JOIN fleet_workers n ON n.name = d.node_name \
              ORDER BY d.node_name, d.sampled_at DESC",
         )
         .fetch_all(pool)

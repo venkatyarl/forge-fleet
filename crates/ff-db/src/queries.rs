@@ -1340,7 +1340,7 @@ pub fn config_list(conn: &Connection) -> Result<Vec<(String, String)>> {
 // Postgres fleet config — row types, query helpers, seed function
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// A fleet node row from the Postgres `fleet_nodes` table.
+/// A fleet node row from the Postgres `fleet_workers` table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FleetNodeRow {
     pub name: String,
@@ -1428,7 +1428,7 @@ pub async fn pg_list_nodes(pool: &PgPool) -> Result<Vec<FleetNodeRow>> {
                 COALESCE(sub_agent_count, 1) AS sub_agent_count,
                 gh_account,
                 COALESCE(tooling, '{}'::jsonb) AS tooling
-         FROM fleet_nodes ORDER BY election_priority, name
+         FROM fleet_workers ORDER BY election_priority, name
          LIMIT 100",
     )
     .fetch_all(pool)
@@ -1473,7 +1473,7 @@ pub async fn pg_get_node(pool: &PgPool, name: &str) -> Result<Option<FleetNodeRo
                 COALESCE(sub_agent_count, 1) AS sub_agent_count,
                 gh_account,
                 COALESCE(tooling, '{}'::jsonb) AS tooling
-         FROM fleet_nodes WHERE name = $1",
+         FROM fleet_workers WHERE name = $1",
     )
     .bind(name)
     .fetch_optional(pool)
@@ -1506,7 +1506,7 @@ pub async fn pg_get_node(pool: &PgPool, name: &str) -> Result<Option<FleetNodeRo
 /// Upsert a fleet node in Postgres.
 pub async fn pg_upsert_node(pool: &PgPool, node: &FleetNodeRow) -> Result<()> {
     sqlx::query(
-        "INSERT INTO fleet_nodes (name, ip, ssh_user, ram_gb, cpu_cores, os, role,
+        "INSERT INTO fleet_workers (name, ip, ssh_user, ram_gb, cpu_cores, os, role,
                 election_priority, hardware, alt_ips, capabilities, preferences, resources, status,
                 runtime, models_dir, disk_quota_pct,
                 sub_agent_count, gh_account, tooling, updated_at)
@@ -1526,13 +1526,13 @@ pub async fn pg_upsert_node(pool: &PgPool, node: &FleetNodeRow) -> Result<()> {
             preferences = EXCLUDED.preferences,
             resources = EXCLUDED.resources,
             status = EXCLUDED.status,
-            runtime = COALESCE(NULLIF(EXCLUDED.runtime, ''), fleet_nodes.runtime),
-            models_dir = COALESCE(NULLIF(EXCLUDED.models_dir, ''), fleet_nodes.models_dir),
-            disk_quota_pct = COALESCE(NULLIF(EXCLUDED.disk_quota_pct, 0), fleet_nodes.disk_quota_pct),
-            sub_agent_count = COALESCE(NULLIF(EXCLUDED.sub_agent_count, 0), fleet_nodes.sub_agent_count),
-            gh_account = COALESCE(EXCLUDED.gh_account, fleet_nodes.gh_account),
+            runtime = COALESCE(NULLIF(EXCLUDED.runtime, ''), fleet_workers.runtime),
+            models_dir = COALESCE(NULLIF(EXCLUDED.models_dir, ''), fleet_workers.models_dir),
+            disk_quota_pct = COALESCE(NULLIF(EXCLUDED.disk_quota_pct, 0), fleet_workers.disk_quota_pct),
+            sub_agent_count = COALESCE(NULLIF(EXCLUDED.sub_agent_count, 0), fleet_workers.sub_agent_count),
+            gh_account = COALESCE(EXCLUDED.gh_account, fleet_workers.gh_account),
             tooling = CASE
-                WHEN EXCLUDED.tooling = '{}'::jsonb THEN fleet_nodes.tooling
+                WHEN EXCLUDED.tooling = '{}'::jsonb THEN fleet_workers.tooling
                 ELSE EXCLUDED.tooling
             END,
             updated_at = NOW()",
@@ -1624,7 +1624,7 @@ pub async fn pg_list_models_for_node(pool: &PgPool, node: &str) -> Result<Vec<Fl
 }
 
 /// List fleet models whose `preferred_workloads` JSONB array contains *all*
-/// of the given workload tags.  Joins with `fleet_nodes` so the caller also
+/// of the given workload tags.  Joins with `fleet_workers` so the caller also
 /// gets the node's primary IP and current health status.
 pub async fn pg_list_models_by_workload(
     pool: &PgPool,
@@ -1637,7 +1637,7 @@ pub async fn pg_list_models_by_workload(
             m.local_model, m.lifecycle, m.mode, m.preferred_workloads,
             n.primary_ip, n.status
          FROM fleet_models m
-         JOIN fleet_nodes n ON n.name = m.node_name
+         JOIN fleet_workers n ON n.name = m.node_name
          WHERE m.preferred_workloads @> $1::jsonb
            AND n.status IN ('online', 'degraded')
          ORDER BY m.tier ASC, m.node_name, m.slug
@@ -2428,10 +2428,10 @@ pub async fn pg_list_jobs(
 
 // ─── Onboarding: SSH keys + mesh status (schema V12) ──────────────────────
 
-/// One SSH key row for a fleet node.
+/// One SSH key row for a fleet worker.
 #[derive(Debug, Clone)]
-pub struct NodeSshKeyRow {
-    pub node_name: String,
+pub struct WorkerSshKeyRow {
+    pub worker_name: String,
     pub key_purpose: String, // 'user' | 'host'
     pub public_key: String,
     pub key_type: String, // 'ed25519' | 'rsa' | 'ecdsa'
@@ -2439,24 +2439,27 @@ pub struct NodeSshKeyRow {
     pub added_at: chrono::DateTime<chrono::Utc>,
 }
 
-/// Upsert a public key for a node. Idempotent on (node_name, fingerprint).
-pub async fn pg_insert_node_ssh_key(
+/// Legacy alias retained during the node→worker rename window.
+pub type NodeSshKeyRow = WorkerSshKeyRow;
+
+/// Upsert a public key for a worker. Idempotent on (worker_name, fingerprint).
+pub async fn pg_insert_worker_ssh_key(
     pool: &PgPool,
-    node_name: &str,
+    worker_name: &str,
     key_purpose: &str,
     public_key: &str,
     key_type: &str,
     fingerprint: &str,
 ) -> Result<()> {
     sqlx::query(
-        "INSERT INTO fleet_workers_ssh_keys (node_name, key_purpose, public_key, key_type, fingerprint)
+        "INSERT INTO fleet_workers_ssh_keys (worker_name, key_purpose, public_key, key_type, fingerprint)
          VALUES ($1, $2, $3, $4, $5)
-         ON CONFLICT (node_name, fingerprint) DO UPDATE SET
+         ON CONFLICT (worker_name, fingerprint) DO UPDATE SET
             public_key = EXCLUDED.public_key,
             key_type = EXCLUDED.key_type,
             key_purpose = EXCLUDED.key_purpose",
     )
-    .bind(node_name)
+    .bind(worker_name)
     .bind(key_purpose)
     .bind(public_key)
     .bind(key_type)
@@ -2466,35 +2469,48 @@ pub async fn pg_insert_node_ssh_key(
     Ok(())
 }
 
-/// List SSH keys for a node (optionally filtered by purpose: 'user' or 'host').
-pub async fn pg_list_node_ssh_keys(
+/// Legacy alias retained during the rename window. Calls
+/// [`pg_insert_worker_ssh_key`] unchanged.
+pub async fn pg_insert_node_ssh_key(
     pool: &PgPool,
     node_name: &str,
+    key_purpose: &str,
+    public_key: &str,
+    key_type: &str,
+    fingerprint: &str,
+) -> Result<()> {
+    pg_insert_worker_ssh_key(pool, node_name, key_purpose, public_key, key_type, fingerprint).await
+}
+
+/// List SSH keys for a worker (optionally filtered by purpose: 'user' or 'host').
+pub async fn pg_list_worker_ssh_keys(
+    pool: &PgPool,
+    worker_name: &str,
     purpose: Option<&str>,
-) -> Result<Vec<NodeSshKeyRow>> {
+) -> Result<Vec<WorkerSshKeyRow>> {
     let rows = if let Some(p) = purpose {
         sqlx::query(
             "SELECT * FROM fleet_workers_ssh_keys
-              WHERE node_name = $1 AND key_purpose = $2
+              WHERE worker_name = $1 AND key_purpose = $2
               ORDER BY added_at
               LIMIT 100",
         )
-        .bind(node_name)
+        .bind(worker_name)
         .bind(p)
         .fetch_all(pool)
         .await?
     } else {
         sqlx::query(
-            "SELECT * FROM fleet_workers_ssh_keys WHERE node_name = $1 ORDER BY added_at LIMIT 100",
+            "SELECT * FROM fleet_workers_ssh_keys WHERE worker_name = $1 ORDER BY added_at LIMIT 100",
         )
-        .bind(node_name)
+        .bind(worker_name)
         .fetch_all(pool)
         .await?
     };
     Ok(rows
         .iter()
-        .map(|r| NodeSshKeyRow {
-            node_name: r.get("node_name"),
+        .map(|r| WorkerSshKeyRow {
+            worker_name: r.get("worker_name"),
             key_purpose: r.get("key_purpose"),
             public_key: r.get("public_key"),
             key_type: r.get("key_type"),
@@ -2504,13 +2520,27 @@ pub async fn pg_list_node_ssh_keys(
         .collect())
 }
 
-/// Delete all SSH keys for a node (used during `ff onboard revoke`).
-pub async fn pg_delete_node_ssh_keys(pool: &PgPool, node_name: &str) -> Result<u64> {
-    let r = sqlx::query("DELETE FROM fleet_workers_ssh_keys WHERE node_name = $1")
-        .bind(node_name)
+/// Legacy alias retained during the rename window.
+pub async fn pg_list_node_ssh_keys(
+    pool: &PgPool,
+    node_name: &str,
+    purpose: Option<&str>,
+) -> Result<Vec<WorkerSshKeyRow>> {
+    pg_list_worker_ssh_keys(pool, node_name, purpose).await
+}
+
+/// Delete all SSH keys for a worker (used during `ff onboard revoke`).
+pub async fn pg_delete_worker_ssh_keys(pool: &PgPool, worker_name: &str) -> Result<u64> {
+    let r = sqlx::query("DELETE FROM fleet_workers_ssh_keys WHERE worker_name = $1")
+        .bind(worker_name)
         .execute(pool)
         .await?;
     Ok(r.rows_affected())
+}
+
+/// Legacy alias retained during the rename window.
+pub async fn pg_delete_node_ssh_keys(pool: &PgPool, node_name: &str) -> Result<u64> {
+    pg_delete_worker_ssh_keys(pool, node_name).await
 }
 
 /// One row in the mesh-reachability matrix.
@@ -3091,7 +3121,7 @@ pub async fn seed_from_fleet_toml(
 /// to pull the rest of the fleet state from the shared Postgres.
 ///
 /// The returned `FleetConfig` contains:
-/// - `nodes`  → from `fleet_nodes` + `fleet_models`
+/// - `nodes`  → from `fleet_workers` + `fleet_models`
 /// - `fleet`, `scheduling`, `ports`, `llm`, `enrollment`  → from `fleet_settings`
 /// - `database` and `redis` are **NOT** overwritten (keep local bootstrap values)
 pub async fn load_fleet_config_from_postgres(

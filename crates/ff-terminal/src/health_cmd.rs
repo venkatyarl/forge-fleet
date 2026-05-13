@@ -71,7 +71,7 @@ async fn load_fleet_nodes_for_health(_c: &AgentSessionConfig) -> Vec<(String, St
                 .await
         {
             let rows: Vec<(String, String)> =
-                sqlx::query_as("SELECT name, ip FROM fleet_nodes ORDER BY election_priority, name")
+                sqlx::query_as("SELECT name, ip FROM fleet_workers ORDER BY election_priority, name")
                     .fetch_all(&pool)
                     .await
                     .unwrap_or_default();

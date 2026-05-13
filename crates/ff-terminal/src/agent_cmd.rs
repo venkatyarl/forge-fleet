@@ -160,7 +160,7 @@ pub async fn handle_agent_dispatch_each(
 // Flow:
 //   1. Look up `work_outputs` WHERE agent_session_id = <session>. Pick the
 //      latest row. Extract `produced_on_computer`, `modified_files`, title.
-//   2. Resolve the worker's ssh_user + primary_ip from `fleet_nodes`.
+//   2. Resolve the worker's ssh_user + primary_ip from `fleet_workers`.
 //      Resolve the canonical source-tree path via `software_registry.install_path`
 //      (falls back to `~/.forgefleet/sub-agent-0/forge-fleet` per convention).
 //   3. SSH into the worker and run git checkout -b / add / commit / (push / gh pr create).
@@ -220,12 +220,12 @@ pub async fn handle_agent_commit_back(
 
     // 2. Resolve SSH target + workspace path.
     let (ssh_user, primary_ip): (String, String) =
-        sqlx::query_as("SELECT ssh_user, ip FROM fleet_nodes WHERE name = $1")
+        sqlx::query_as("SELECT ssh_user, ip FROM fleet_workers WHERE name = $1")
             .bind(&worker)
             .fetch_optional(pool)
             .await
-            .map_err(|e| anyhow::anyhow!("lookup fleet_nodes: {e}"))?
-            .ok_or_else(|| anyhow::anyhow!("no fleet_nodes row for computer={worker}"))?;
+            .map_err(|e| anyhow::anyhow!("lookup fleet_workers: {e}"))?
+            .ok_or_else(|| anyhow::anyhow!("no fleet_workers row for computer={worker}"))?;
 
     // Per reference_source_tree_locations.md: non-Taylor members use
     // ~/.forgefleet/sub-agent-0/forge-fleet. Taylor itself uses ~/projects/forge-fleet.
