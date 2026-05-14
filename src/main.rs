@@ -1963,13 +1963,13 @@ fn start_mcp_federation_subsystem(
 // ─── Pulse v2 subsystems (heartbeat_v2 + materializer + leader_tick) ────────
 //
 // Does three things, in order:
-//   1) Look up this computer's `id` and `fleet_members.election_priority`.
+//   1) Look up this computer's `id` and `fleet_workers.election_priority`.
 //      If the host isn't enrolled, log warn and return Ok(empty) — v2 stays
 //      disabled for that host until enrollment.
 //   2) Start HeartbeatV2Publisher unconditionally when the computer row
 //      exists (it writes only its own `pulse:computer:{name}` key).
 //   3) Start the Materializer on every daemon (see NOTE at call-site), and
-//      start LeaderTick only if the computer is enrolled in `fleet_members`.
+//      start LeaderTick only if the computer is enrolled in `fleet_workers`.
 async fn start_pulse_v2_subsystems(
     pg_pool: ff_db::PgPool,
     redis_url: String,
@@ -1994,14 +1994,18 @@ async fn start_pulse_v2_subsystems(
         return Ok(handles);
     };
 
-    // (1b) election_priority — optional; fleet_members may not exist yet.
+    // (1b) election_priority — optional; the worker row may not exist yet.
+    // Query fleet_workers directly (V83/V86: fleet_members was dropped, its
+    // election_priority lives on fleet_workers now, joined by name).
     let priority_row: Option<(i32,)> = sqlx::query_as::<_, (i32,)>(
-        "SELECT election_priority FROM fleet_members WHERE computer_id = $1",
+        "SELECT fw.election_priority FROM fleet_workers fw \
+         JOIN computers c ON c.name = fw.name \
+         WHERE c.id = $1",
     )
     .bind(computer_id)
     .fetch_optional(&pg_pool)
     .await
-    .context("pulse v2: failed to query fleet_members")?;
+    .context("pulse v2: failed to query fleet_workers")?;
     let enrolled_in_fleet = priority_row.is_some();
     let election_priority = priority_row.map(|(p,)| p).unwrap_or(1000);
 
