@@ -258,6 +258,12 @@ impl HeartbeatV2Publisher {
                     max_runnable_model_gb: None,
                 };
 
+                // ── OS classification (V87+) ─────────────────────────────────
+                // Pre-classified here so the materializer can write
+                // computers.os_family directly without re-deriving from
+                // kernel + /etc/os-release on the leader.
+                beat.os = detect_os_info();
+
                 // ── Installed software inventory ─────────────────────────────
                 beat.installed_software = SoftwareCollector::new().detect();
 
@@ -505,6 +511,96 @@ async fn publish_beat(
 }
 
 // ─── GPU / network / OS detection helpers ───────────────────────────────
+
+/// Detect the operating system family + distribution + kernel for this host.
+///
+/// Returns an [`OsInfo`] populated with one of:
+///   - `family = "macos"` on Darwin (with `version` from `sw_vers`)
+///   - `family = "linux-dgx"` on Linux when `uname -r` ends in `-nvidia`
+///     (NVIDIA DGX OS / Spark — see memory: dgx-spark-specs)
+///   - `family = "linux-ubuntu"` on Linux when /etc/os-release ID=ubuntu
+///   - `family = "linux-debian"` on Linux when ID=debian
+///   - `family = "linux"` otherwise on Linux
+///   - `family = "windows"` on Windows
+///   - `family = "unknown"` everywhere else
+///
+/// The materializer writes this to `computers.os_family` so the
+/// auto-upgrade playbook resolver can pick the right key
+/// (linux-ubuntu vs linux-dgx) without manual classification.
+fn detect_os_info() -> crate::beat_v2::OsInfo {
+    use crate::beat_v2::OsInfo;
+    if cfg!(target_os = "macos") {
+        let version = std::process::Command::new("sw_vers")
+            .arg("-productVersion")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        let kernel = std::process::Command::new("uname")
+            .arg("-r")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        return OsInfo {
+            family: "macos".to_string(),
+            distribution: "macOS".to_string(),
+            version,
+            kernel,
+        };
+    }
+    if cfg!(target_os = "windows") {
+        return OsInfo {
+            family: "windows".to_string(),
+            distribution: "Windows".to_string(),
+            version: String::new(),
+            kernel: String::new(),
+        };
+    }
+    if cfg!(target_os = "linux") {
+        let kernel = std::process::Command::new("uname")
+            .arg("-r")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        let osr = std::fs::read_to_string("/etc/os-release").unwrap_or_default();
+        let distribution = osr
+            .lines()
+            .find_map(|l| l.strip_prefix("ID="))
+            .map(|v| v.trim_matches('"').to_string())
+            .unwrap_or_else(|| "linux".to_string());
+        let version = osr
+            .lines()
+            .find_map(|l| l.strip_prefix("VERSION_ID="))
+            .map(|v| v.trim_matches('"').to_string())
+            .unwrap_or_default();
+        // DGX OS layers an `-nvidia` kernel onto Ubuntu — detect via uname
+        // since /etc/os-release still reads `ID=ubuntu`.
+        let family = if kernel.ends_with("-nvidia") {
+            "linux-dgx".to_string()
+        } else {
+            match distribution.as_str() {
+                "ubuntu" => "linux-ubuntu".to_string(),
+                "debian" => "linux-debian".to_string(),
+                _ => "linux".to_string(),
+            }
+        };
+        return OsInfo {
+            family,
+            distribution,
+            version,
+            kernel,
+        };
+    }
+    OsInfo {
+        family: "unknown".to_string(),
+        ..Default::default()
+    }
+}
 
 fn detect_gpu_kind() -> String {
     // macOS: aarch64 = Apple Silicon (Metal/MLX), x86_64 = Intel (no useful GPU).

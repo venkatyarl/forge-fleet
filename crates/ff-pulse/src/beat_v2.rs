@@ -15,6 +15,28 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Operating system descriptor reported per beat. Optional on the wire so
+/// daemons running old code can publish beats without an `os` field; the
+/// materializer treats absence as "unknown, don't touch the computers row".
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OsInfo {
+    /// "macos", "linux-ubuntu", "linux-dgx", "linux-debian", "windows", "unknown".
+    /// Pre-classified by the daemon so consumers (auto-upgrade playbook
+    /// resolver, etc.) don't have to re-derive it.
+    pub family: String,
+    /// Distribution ID from /etc/os-release ID= field on Linux, "macOS" on Mac,
+    /// "Windows" on Windows, "" otherwise.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub distribution: String,
+    /// VERSION_ID from /etc/os-release on Linux, product version on Mac, "" otherwise.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub version: String,
+    /// Output of `uname -r` (kernel release). DGX OS is detected by this
+    /// ending in `-nvidia`; see memory: dgx-spark-specs.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub kernel: String,
+}
+
 /// Top-level Pulse v2 beat payload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PulseBeatV2 {
@@ -34,6 +56,10 @@ pub struct PulseBeatV2 {
     pub going_offline: bool,
     pub maintenance_mode: bool,
     pub network: NetworkInfo,
+    /// V87+: OS family + distribution. Default-empty for backward compat with
+    /// daemons that publish beats before this field was added.
+    #[serde(default)]
+    pub os: OsInfo,
     pub hardware: HardwareInfo,
     pub load: LoadInfo,
     pub memory: MemoryInfo,
@@ -401,6 +427,7 @@ impl PulseBeatV2 {
                 primary_ip: String::new(),
                 all_ips: Vec::new(),
             },
+            os: OsInfo::default(),
             hardware: HardwareInfo {
                 cpu_cores: 0,
                 ram_gb: 0,

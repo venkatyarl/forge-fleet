@@ -584,6 +584,33 @@ impl Materializer {
         .execute(&self.pg)
         .await;
 
+        // V87: keep computers.os_family / os_distribution / os_version in sync
+        // with the beat's pre-classified OsInfo. Daemons detect their own
+        // OS (kernel + /etc/os-release) and ship it through `beat.os`, so
+        // the auto-upgrade playbook resolver always finds the right key
+        // (linux-ubuntu vs linux-dgx vs macos) without manual classification.
+        // Empty family means the beat was published by an older daemon
+        // that doesn't carry `os` yet — skip in that case.
+        if !beat.os.family.is_empty() && beat.os.family != "unknown" {
+            let _ = sqlx::query(
+                "UPDATE computers SET \
+                    os_family = $1, \
+                    os_distribution = NULLIF($2, ''), \
+                    os_version = NULLIF($3, '') \
+                 WHERE id = $4 AND ( \
+                    os_family <> $1 \
+                    OR COALESCE(os_distribution, '') <> $2 \
+                    OR COALESCE(os_version, '') <> $3 \
+                 )",
+            )
+            .bind(&beat.os.family)
+            .bind(&beat.os.distribution)
+            .bind(&beat.os.version)
+            .bind(computer_id)
+            .execute(&self.pg)
+            .await;
+        }
+
         // Status transition handling.
         if status_changed {
             report.wrote_computer_row = true;
