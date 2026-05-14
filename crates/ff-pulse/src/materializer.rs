@@ -555,24 +555,6 @@ impl Materializer {
             .execute(&self.pg)
             .await?;
             report.wrote_computer_row = true;
-
-            // Also keep fleet_workers.ip in sync. This table is a separate
-            // worker-role registry (V83 rename from fleet_nodes); the
-            // materializer used to only touch `computers`, so when a host's
-            // primary_ip changed in heartbeats the fleet_workers.ip column
-            // silently went stale — see [[db-ip-corruption-20260512]] for
-            // the operational bite this caused (9/15 computers with wrong
-            // IPs, undetected for weeks).
-            if primary_ip_differ {
-                let _ = sqlx::query(
-                    "UPDATE fleet_workers SET ip = $1, updated_at = NOW() \
-                     WHERE name = $2 AND ip <> $1",
-                )
-                .bind(&beat.network.primary_ip)
-                .bind(&beat.computer_name)
-                .execute(&self.pg)
-                .await;
-            }
         } else {
             // At minimum refresh last_seen_at.
             sqlx::query("UPDATE computers SET last_seen_at = NOW() WHERE id = $1")
@@ -580,6 +562,27 @@ impl Materializer {
                 .execute(&self.pg)
                 .await?;
         }
+
+        // Always keep fleet_workers.ip in sync with the heartbeat's
+        // primary_ip — this is the worker-role registry (V83 rename from
+        // fleet_nodes) that ff fleet computers / deploy scripts read from.
+        // Without this, the column drifted (operationally bit us: 9/15
+        // computers wrong, undetected for weeks — see [[db-ip-corruption-20260512]]).
+        //
+        // Cheap no-op UPDATE: the WHERE `ip <> $1` filter means PG only
+        // writes a tuple if the IP actually changed. The earlier `if
+        // primary_ip_differ` gate was wrong — it only fired when
+        // `computers.primary_ip` had drifted, which is a different signal
+        // from `fleet_workers.ip` drift. Always-run with row-level guard
+        // is correct.
+        let _ = sqlx::query(
+            "UPDATE fleet_workers SET ip = $1, updated_at = NOW() \
+             WHERE name = $2 AND ip <> $1",
+        )
+        .bind(&beat.network.primary_ip)
+        .bind(&beat.computer_name)
+        .execute(&self.pg)
+        .await;
 
         // Status transition handling.
         if status_changed {
