@@ -1113,7 +1113,7 @@ pub async fn handle_fleet_revoke_trust(
 #[derive(Debug, Default, Clone)]
 struct RemoveComputerReport {
     computer_rows: u64,
-    fleet_node_rows: u64,
+    fleet_worker_rows: u64,
     fleet_models_rows: u64,
     leader_state_rows: u64,
     revocation_task_id: Option<String>,
@@ -1152,7 +1152,7 @@ async fn remove_computer_core(pool: &sqlx::PgPool, name: &str) -> Result<RemoveC
         .bind(name)
         .execute(&mut *tx)
         .await?;
-    report.fleet_node_rows = r.rows_affected();
+    report.fleet_worker_rows = r.rows_affected();
 
     // computers cascades: computer_software, computer_models,
     // computer_model_deployments, computer_downtime_events, computer_trust,
@@ -1301,7 +1301,7 @@ pub async fn handle_fleet_remove_computer(
 
     let report = remove_computer_core(pool, name).await?;
     let total = report.computer_rows
-        + report.fleet_node_rows
+        + report.fleet_worker_rows
         + report.fleet_models_rows
         + report.leader_state_rows;
     println!(
@@ -1309,7 +1309,7 @@ pub async fn handle_fleet_remove_computer(
          computers({cr}), fleet_workers({fn_}), fleet_models({fm}), \
          fleet_leader_state({fls})",
         cr = report.computer_rows,
-        fn_ = report.fleet_node_rows,
+        fn_ = report.fleet_worker_rows,
         fm = report.fleet_models_rows,
         fls = report.leader_state_rows,
     );
@@ -1374,8 +1374,10 @@ pub async fn handle_fleet_disband(
         print!("  removing {name}... ");
         match remove_computer_core(pool, name).await {
             Ok(r) => {
-                let sub =
-                    r.computer_rows + r.fleet_node_rows + r.fleet_models_rows + r.leader_state_rows;
+                let sub = r.computer_rows
+                    + r.fleet_worker_rows
+                    + r.fleet_models_rows
+                    + r.leader_state_rows;
                 total_rows += sub;
                 if r.revocation_task_id.is_some() {
                     total_tasks += 1;

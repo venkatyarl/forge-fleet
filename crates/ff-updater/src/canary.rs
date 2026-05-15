@@ -54,7 +54,7 @@ impl fmt::Display for CanaryStage {
 
 /// Minimal information about a fleet node needed for canary selection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FleetNode {
+pub struct FleetComputer {
     /// Node name (e.g. "james", "marcus").
     pub name: String,
 
@@ -320,7 +320,7 @@ impl CanaryOrchestrator {
     /// - Lowest-priority nodes first (NOT the leader).
     /// - Respects `canary_count` (or `canary_percentage` if count is 0).
     /// - Returns the ordered list of canary node names.
-    pub fn select_canary_nodes(&mut self, fleet: &[FleetNode]) -> UpdateResult<Vec<String>> {
+    pub fn select_canary_nodes(&mut self, fleet: &[FleetComputer]) -> UpdateResult<Vec<String>> {
         if fleet.is_empty() {
             return Err(UpdateError::FleetCoordination {
                 reason: "no fleet nodes provided".into(),
@@ -328,7 +328,7 @@ impl CanaryOrchestrator {
         }
 
         // Sort non-leader nodes by priority (ascending = lowest first).
-        let mut candidates: Vec<&FleetNode> = fleet.iter().filter(|n| !n.is_leader).collect();
+        let mut candidates: Vec<&FleetComputer> = fleet.iter().filter(|n| !n.is_leader).collect();
         candidates.sort_by_key(|n| n.priority);
 
         if candidates.is_empty() {
@@ -428,7 +428,7 @@ impl CanaryOrchestrator {
     /// This is an async operation because it performs HTTP requests.
     pub async fn evaluate_health_gates(
         &self,
-        node: &FleetNode,
+        node: &FleetComputer,
         expected_version: &str,
     ) -> Vec<HealthGateResult> {
         let client = &self.client;
@@ -469,7 +469,7 @@ impl CanaryOrchestrator {
     }
 
     /// Check whether ALL health gates pass for all canary nodes.
-    pub async fn check_canary_health(&mut self, fleet: &[FleetNode]) -> bool {
+    pub async fn check_canary_health(&mut self, fleet: &[FleetComputer]) -> bool {
         let canary_names = self.progress.canary_nodes.clone();
         let version = self.progress.target_version.clone();
         let mut all_healthy = true;
@@ -653,30 +653,30 @@ impl CanaryOrchestrator {
 mod tests {
     use super::*;
 
-    fn test_fleet() -> Vec<FleetNode> {
+    fn test_fleet() -> Vec<FleetComputer> {
         vec![
-            FleetNode {
+            FleetComputer {
                 name: "james".into(),
                 priority: 10,
                 is_leader: false,
                 health_url: "http://192.168.5.101:51800/health".into(),
                 current_version: Some("abc123".into()),
             },
-            FleetNode {
+            FleetComputer {
                 name: "marcus".into(),
                 priority: 20,
                 is_leader: false,
                 health_url: "http://192.168.5.102:51800/health".into(),
                 current_version: Some("abc123".into()),
             },
-            FleetNode {
+            FleetComputer {
                 name: "sophie".into(),
                 priority: 30,
                 is_leader: false,
                 health_url: "http://192.168.5.103:51800/health".into(),
                 current_version: Some("abc123".into()),
             },
-            FleetNode {
+            FleetComputer {
                 name: "taylor".into(),
                 priority: 100,
                 is_leader: true,
@@ -762,7 +762,7 @@ mod tests {
 
     #[test]
     fn test_select_canary_all_leaders() {
-        let fleet = vec![FleetNode {
+        let fleet = vec![FleetComputer {
             name: "taylor".into(),
             priority: 100,
             is_leader: true,
@@ -916,28 +916,28 @@ mod tests {
     fn test_priority_ordering() {
         // Ensure the lowest-priority node goes first
         let fleet = vec![
-            FleetNode {
+            FleetComputer {
                 name: "high".into(),
                 priority: 50,
                 is_leader: false,
                 health_url: "http://h/health".into(),
                 current_version: None,
             },
-            FleetNode {
+            FleetComputer {
                 name: "low".into(),
                 priority: 5,
                 is_leader: false,
                 health_url: "http://l/health".into(),
                 current_version: None,
             },
-            FleetNode {
+            FleetComputer {
                 name: "mid".into(),
                 priority: 25,
                 is_leader: false,
                 health_url: "http://m/health".into(),
                 current_version: None,
             },
-            FleetNode {
+            FleetComputer {
                 name: "leader".into(),
                 priority: 1,
                 is_leader: true,

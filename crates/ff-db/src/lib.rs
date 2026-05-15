@@ -48,12 +48,12 @@ pub use queries::{
     ModelDeploymentRow,
     ModelJobRow,
     ModelLibraryRow,
-    NodeSshKeyRow,
     RoutingHop,
     SharedVolumeMountRow,
     // Phase 12 (V19) — shared volumes / power schedules / training jobs
     SharedVolumeRow,
     TrainingJobRow,
+    WorkerSshKeyRow,
     load_fleet_config_from_postgres,
     pg_append_benchmark_result,
     pg_append_routing_log,

@@ -14,7 +14,7 @@ use tracing::info;
 use crate::{
     DbPool,
     error::DbError,
-    queries::{self, AuditLogRow, AutonomyEventRow, NodeRow, TaskRow},
+    queries::{self, AuditLogRow, AutonomyEventRow, TaskRow, WorkerRow},
 };
 
 #[derive(Debug, Clone)]
@@ -98,7 +98,7 @@ impl OperationalStore {
         }
     }
 
-    pub async fn upsert_node(&self, node: &NodeRow) -> Result<(), DbError> {
+    pub async fn upsert_node(&self, node: &WorkerRow) -> Result<(), DbError> {
         match self {
             Self::Sqlite(pool) => {
                 let node = node.clone();
@@ -153,7 +153,7 @@ impl OperationalStore {
         }
     }
 
-    pub async fn list_nodes(&self) -> Result<Vec<NodeRow>, DbError> {
+    pub async fn list_nodes(&self) -> Result<Vec<WorkerRow>, DbError> {
         match self {
             Self::Sqlite(pool) => pool.with_conn(queries::list_nodes).await,
             Self::Postgres(pool) => {
@@ -1160,8 +1160,8 @@ fn now_iso() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
-fn map_postgres_node_row(row: sqlx::postgres::PgRow) -> Result<NodeRow, DbError> {
-    Ok(NodeRow {
+fn map_postgres_node_row(row: sqlx::postgres::PgRow) -> Result<WorkerRow, DbError> {
+    Ok(WorkerRow {
         id: row.try_get("id")?,
         name: row.try_get("name")?,
         host: row.try_get("host")?,

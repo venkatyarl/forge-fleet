@@ -34,7 +34,7 @@ use ff_api::types::ChatCompletionRequest;
 use ff_db::sync::LeaderSync;
 use ff_db::{OperationalStore, RuntimeRegistryStore, queries};
 use ff_discovery::health::HealthStatus;
-use ff_discovery::{FleetNode, NodeRegistry};
+use ff_discovery::{FleetComputer, NodeRegistry};
 use ff_mcp::McpServer;
 use ff_mcp::transport::HttpTransport;
 use ff_observability::metrics::{
@@ -689,7 +689,7 @@ pub fn build_router(state: Arc<GatewayState>, mc_db_path: Option<&str>) -> Route
             "/api/transports/telegram/status",
             get(telegram_transport_status),
         )
-        .route("/api/fleet/nodes/{id}", get(fleet_node_detail))
+        .route("/api/fleet/nodes/{id}", get(fleet_worker_detail))
         .route("/api/config", get(get_config).post(update_config))
         .route("/api/config/reload-status", get(config_reload_status))
         .route("/api/settings/runtime", get(settings_runtime))
@@ -1886,7 +1886,7 @@ async fn ledger_health(
 }
 
 /// GET /api/fleet/nodes/{id} — direct node detail endpoint used by dashboard.
-async fn fleet_node_detail(
+async fn fleet_worker_detail(
     Path(id): Path<String>,
     State(state): State<Arc<GatewayState>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
@@ -2437,7 +2437,7 @@ async fn build_fleet_status_payload(
 }
 
 fn assemble_fleet_status_payload(
-    nodes: Vec<FleetNode>,
+    nodes: Vec<FleetComputer>,
     leader_hint: Option<String>,
     fleet_config: Option<&ff_core::config::FleetConfig>,
     db_snapshot: Option<&DbFleetSnapshot>,
@@ -2471,7 +2471,7 @@ fn assemble_fleet_status_payload(
                 .or_else(|| snapshot.workloads.get(&ip))
         });
 
-        let view = build_fleet_node_view(
+        let view = build_fleet_worker_view(
             node,
             leader_hint.as_deref(),
             config_hint,
@@ -2615,8 +2615,8 @@ fn assemble_fleet_status_payload(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_fleet_node_view(
-    node: &FleetNode,
+fn build_fleet_worker_view(
+    node: &FleetComputer,
     leader_hint: Option<&str>,
     config_hint: Option<&ConfigNodeHints>,
     db_node: Option<&DbNodeSnapshot>,
@@ -3024,7 +3024,7 @@ fn build_runtime_node_view(
         })
         .collect::<Vec<_>>();
 
-    let mut runtime_provenance = vec!["db.fleet_node_runtime".to_string()];
+    let mut runtime_provenance = vec!["db.fleet_worker_runtime".to_string()];
     if runtime
         .services
         .as_array()
@@ -3088,7 +3088,7 @@ fn role_to_string_runtime(raw: &str) -> String {
     }
 }
 
-fn is_runtime_enrolled(node: &FleetNode, db_node: Option<&DbNodeSnapshot>) -> bool {
+fn is_runtime_enrolled(node: &FleetComputer, db_node: Option<&DbNodeSnapshot>) -> bool {
     node.config_name.is_none()
         || node.health.is_some()
         || node.hardware.is_some()
@@ -3097,7 +3097,7 @@ fn is_runtime_enrolled(node: &FleetNode, db_node: Option<&DbNodeSnapshot>) -> bo
 }
 
 fn derive_runtime_provenance(
-    node: &FleetNode,
+    node: &FleetComputer,
     db_node: Option<&DbNodeSnapshot>,
     seeded_from_config: bool,
     runtime_enrolled: bool,
@@ -3152,7 +3152,7 @@ fn derive_node_status(health: Option<&HealthStatus>, db_status: Option<&str>) ->
 }
 
 fn derive_node_resources(
-    node: &FleetNode,
+    node: &FleetComputer,
     config_hint: Option<&ConfigNodeHints>,
 ) -> (String, String, String) {
     if let Some(hw) = &node.hardware {
@@ -3185,7 +3185,7 @@ fn derive_node_resources(
 }
 
 fn derive_node_capacity(
-    node: &FleetNode,
+    node: &FleetComputer,
     config_hint: Option<&ConfigNodeHints>,
 ) -> (Option<u32>, Option<u64>) {
     if let Some(hw) = &node.hardware {
@@ -3211,7 +3211,7 @@ fn derive_node_capacity(
 }
 
 fn derive_models_loaded(
-    node: &FleetNode,
+    node: &FleetComputer,
     db_node: Option<&DbNodeSnapshot>,
 ) -> (Vec<String>, String) {
     let mut ids = Vec::new();
@@ -3238,7 +3238,7 @@ fn derive_models_loaded(
 }
 
 fn derive_last_heartbeat(
-    node: &FleetNode,
+    node: &FleetComputer,
     db_node: Option<&DbNodeSnapshot>,
     runtime_enrolled: bool,
 ) -> HeartbeatView {
@@ -3465,7 +3465,7 @@ fn extract_json_string(value: &Value, pointers: &[&str]) -> Option<String> {
         .map(str::to_string)
 }
 
-fn parse_db_node_snapshot(row: &queries::NodeRow) -> DbNodeSnapshot {
+fn parse_db_node_snapshot(row: &queries::WorkerRow) -> DbNodeSnapshot {
     let parsed_hardware = serde_json::from_str::<Value>(&row.hardware_json).ok();
     let models = serde_json::from_str::<Vec<String>>(&row.models_json).unwrap_or_default();
 
@@ -3702,7 +3702,7 @@ mod fleet_visibility_tests {
 
     #[test]
     fn node_view_marks_unreported_fields_when_data_missing() {
-        let node = FleetNode {
+        let node = FleetComputer {
             id: Uuid::new_v4(),
             ip: IpAddr::V4(Ipv4Addr::new(192, 168, 5, 42)),
             hostname: None,
@@ -3718,7 +3718,7 @@ mod fleet_visibility_tests {
         };
 
         let view =
-            build_fleet_node_view(&node, Some("leader"), None, None, None, false, None, None);
+            build_fleet_worker_view(&node, Some("leader"), None, None, None, false, None, None);
 
         assert_eq!(view.status, "unknown");
         assert_eq!(view.models_loaded_state, "unreported");
@@ -3729,7 +3729,7 @@ mod fleet_visibility_tests {
 
     #[test]
     fn fleet_payload_serializes_required_visibility_fields() {
-        let node = FleetNode {
+        let node = FleetComputer {
             id: Uuid::new_v4(),
             ip: IpAddr::V4(Ipv4Addr::new(192, 168, 5, 100)),
             hostname: Some("alpha.local".to_string()),
@@ -3780,7 +3780,7 @@ mod fleet_visibility_tests {
     #[test]
     fn heartbeat_prefers_runtime_registry_over_db_snapshot() {
         let runtime_checked_at = Utc::now();
-        let node = FleetNode {
+        let node = FleetComputer {
             id: Uuid::new_v4(),
             ip: IpAddr::V4(Ipv4Addr::new(192, 168, 5, 55)),
             hostname: Some("alpha.local".to_string()),
@@ -3815,7 +3815,7 @@ mod fleet_visibility_tests {
             replication_state: None,
         };
 
-        let view = build_fleet_node_view(
+        let view = build_fleet_worker_view(
             &node,
             Some("alpha"),
             None,
@@ -3835,7 +3835,7 @@ mod fleet_visibility_tests {
 
     #[test]
     fn runtime_metadata_overrides_static_role_hint() {
-        let node = FleetNode {
+        let node = FleetComputer {
             id: Uuid::new_v4(),
             ip: IpAddr::V4(Ipv4Addr::new(192, 168, 5, 56)),
             hostname: Some("alpha.local".to_string()),
@@ -3868,7 +3868,7 @@ mod fleet_visibility_tests {
             replication_state: None,
         };
 
-        let view = build_fleet_node_view(
+        let view = build_fleet_worker_view(
             &node,
             None,
             Some(&config_hint),
@@ -3905,7 +3905,7 @@ mod fleet_visibility_tests {
             },
         );
 
-        let runtime_alpha = FleetNode {
+        let runtime_alpha = FleetComputer {
             id: Uuid::new_v4(),
             ip: IpAddr::V4(Ipv4Addr::new(192, 168, 5, 10)),
             hostname: Some("alpha.local".to_string()),
@@ -4069,7 +4069,7 @@ mod fleet_visibility_tests {
         assert_eq!(response["enrollment"]["node_id"], "enroll-node-2");
 
         let runtime_rows = pool
-            .with_conn(|conn| queries::list_fleet_node_runtime(conn))
+            .with_conn(|conn| queries::list_fleet_worker_runtime(conn))
             .await
             .expect("query runtime rows");
         assert_eq!(runtime_rows.len(), 1);
@@ -4127,7 +4127,7 @@ mod fleet_visibility_tests {
         assert_eq!(response["derived_status"], "online");
 
         let runtime_rows = pool
-            .with_conn(|conn| queries::list_fleet_node_runtime(conn))
+            .with_conn(|conn| queries::list_fleet_worker_runtime(conn))
             .await
             .expect("query runtime rows");
 
@@ -4154,7 +4154,7 @@ mod fleet_visibility_tests {
             .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
         pool.with_conn(move |conn| {
-            queries::upsert_fleet_node_runtime(
+            queries::upsert_fleet_worker_runtime(
                 conn,
                 &queries::FleetNodeRuntimeHeartbeatRow {
                     node_id: "node-runtime-stale".to_string(),

@@ -21,11 +21,11 @@ use std::sync::RwLock;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-// ─── FleetNode ───────────────────────────────────────────────────────────────
+// ─── FleetComputer ───────────────────────────────────────────────────────────────
 
 /// A tracked node in the fleet registry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FleetNode {
+pub struct FleetComputer {
     /// Unique node ID (auto-generated).
     pub id: Uuid,
     /// IP address.
@@ -52,8 +52,8 @@ pub struct FleetNode {
     pub models: Vec<ModelCard>,
 }
 
-impl FleetNode {
-    /// Create a FleetNode from a subnet-discovered node.
+impl FleetComputer {
+    /// Create a FleetComputer from a subnet-discovered node.
     fn from_discovery(id: Uuid, discovered: DiscoveredNode) -> Self {
         Self {
             id,
@@ -71,7 +71,7 @@ impl FleetNode {
         }
     }
 
-    /// Create a FleetNode from fleet.toml configuration.
+    /// Create a FleetComputer from fleet.toml configuration.
     pub fn from_config(name: &str, ip: IpAddr, port: u16, priority: u32) -> Self {
         let now = Utc::now();
         Self {
@@ -121,8 +121,8 @@ impl FleetNode {
 /// multiple indices: by UUID, by IP address, and by config name.
 #[derive(Debug)]
 pub struct NodeRegistry {
-    /// Primary store: node ID → FleetNode.
-    nodes: DashMap<Uuid, FleetNode>,
+    /// Primary store: node ID → FleetComputer.
+    nodes: DashMap<Uuid, FleetComputer>,
     /// IP address → node ID index.
     ip_index: DashMap<IpAddr, Uuid>,
     /// Config name → node ID index (e.g. "taylor" → uuid).
@@ -158,25 +158,25 @@ impl NodeRegistry {
     }
 
     /// List all nodes, sorted by IP address.
-    pub fn list_nodes(&self) -> Vec<FleetNode> {
-        let mut nodes: Vec<FleetNode> = self.nodes.iter().map(|n| n.value().clone()).collect();
+    pub fn list_nodes(&self) -> Vec<FleetComputer> {
+        let mut nodes: Vec<FleetComputer> = self.nodes.iter().map(|n| n.value().clone()).collect();
         nodes.sort_by_key(|node| node.ip);
         nodes
     }
 
     /// Get a node by its UUID.
-    pub fn get_node(&self, id: Uuid) -> Option<FleetNode> {
+    pub fn get_node(&self, id: Uuid) -> Option<FleetComputer> {
         self.nodes.get(&id).map(|n| n.value().clone())
     }
 
     /// Get a node by IP address.
-    pub fn get_node_by_ip(&self, ip: IpAddr) -> Option<FleetNode> {
+    pub fn get_node_by_ip(&self, ip: IpAddr) -> Option<FleetComputer> {
         let id = self.ip_index.get(&ip).map(|v| *v.value())?;
         self.get_node(id)
     }
 
     /// Get a node by config name (e.g. "taylor").
-    pub fn get_node_by_name(&self, name: &str) -> Option<FleetNode> {
+    pub fn get_node_by_name(&self, name: &str) -> Option<FleetComputer> {
         let id = self.name_index.get(name).map(|v| *v.value())?;
         self.get_node(id)
     }
@@ -223,7 +223,7 @@ impl NodeRegistry {
         }
 
         // New node from config.
-        let node = FleetNode::from_config(name, ip, port, priority);
+        let node = FleetComputer::from_config(name, ip, port, priority);
         let id = node.id;
 
         self.ip_index.insert(ip, id);
@@ -248,7 +248,7 @@ impl NodeRegistry {
 
         let id = Uuid::new_v4();
         let ip = discovered.ip;
-        let node = FleetNode::from_discovery(id, discovered);
+        let node = FleetComputer::from_discovery(id, discovered);
 
         self.nodes.insert(id, node);
         self.ip_index.insert(ip, id);
@@ -267,7 +267,7 @@ impl NodeRegistry {
     // ── Remove ───────────────────────────────────────────────────────────────
 
     /// Remove a node by ID. Returns the removed node if it existed.
-    pub fn remove_node(&self, id: Uuid) -> Option<FleetNode> {
+    pub fn remove_node(&self, id: Uuid) -> Option<FleetComputer> {
         let removed = self.nodes.remove(&id).map(|(_, node)| node);
         if let Some(node) = &removed {
             self.ip_index.remove(&node.ip);

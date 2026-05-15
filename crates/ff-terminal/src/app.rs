@@ -37,7 +37,7 @@ pub struct App {
     // Global state
     pub frame: u64,
     pub should_quit: bool,
-    pub fleet_workers: Vec<FleetNode>,
+    pub fleet_workers: Vec<FleetComputer>,
     pub current_project: Option<ProjectInfo>,
     pub working_dir: PathBuf,
     pub brain_status: Option<ff_agent::brain::BrainLoadedStatus>,
@@ -232,7 +232,7 @@ impl SessionTab {
 
 /// A fleet node with its ForgeFleet daemon and model status.
 #[derive(Debug, Clone)]
-pub struct FleetNode {
+pub struct FleetComputer {
     pub name: String,
     pub ip: String,
     /// OS family as stored in computers.os_family / fleet_workers.os:
@@ -491,7 +491,7 @@ fn detect_project(dir: &std::path::Path) -> Option<ProjectInfo> {
 
 /// Load the fleet topology from Postgres. Returns an empty vec if the
 /// database is unreachable — the TUI health-check loop will populate it later.
-async fn fleet_nodes_from_db() -> Vec<FleetNode> {
+async fn fleet_nodes_from_db() -> Vec<FleetComputer> {
     // Read fleet.toml to get the database URL.
     let Some(home) = dirs::home_dir() else {
         return Vec::new();
@@ -772,7 +772,7 @@ async fn fleet_nodes_from_db() -> Vec<FleetNode> {
                     })
                     .collect();
             }
-            FleetNode {
+            FleetComputer {
                 name: n.name.clone(),
                 ip: n.ip,
                 os: n.os,

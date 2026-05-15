@@ -3905,12 +3905,12 @@ pub fn poll_picker_load(app: &mut ff_terminal::app::App) {
 
 /// Result slot for an in-flight health refresh. Keyed only by presence.
 static FLEET_HEALTH_SLOT: std::sync::Mutex<
-    Option<std::sync::Arc<std::sync::Mutex<Option<Vec<ff_terminal::app::FleetNode>>>>>,
+    Option<std::sync::Arc<std::sync::Mutex<Option<Vec<ff_terminal::app::FleetComputer>>>>>,
 > = std::sync::Mutex::new(None);
 
 /// Kick off a background task that pings every node + its model endpoints.
 /// Idempotent — if one is already in flight, this does nothing.
-pub fn kick_fleet_health_refresh(current_nodes: &[ff_terminal::app::FleetNode]) {
+pub fn kick_fleet_health_refresh(current_nodes: &[ff_terminal::app::FleetComputer]) {
     // Already a refresh in flight? Skip.
     {
         let guard = FLEET_HEALTH_SLOT.lock().unwrap();

@@ -41,7 +41,7 @@ static MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 5,
-        name: "fleet_node_runtime_schema",
+        name: "fleet_worker_runtime_schema",
         sql: schema::SCHEMA_V5_FLEET_NODE_RUNTIME,
     },
     Migration {

@@ -1045,7 +1045,7 @@ mod tests {
             let _ = run_migrations(conn)?;
             queries::upsert_node(
                 conn,
-                &queries::NodeRow {
+                &queries::WorkerRow {
                     id: Uuid::new_v4().to_string(),
                     name: "taylor".into(),
                     host: "127.0.0.1".into(),

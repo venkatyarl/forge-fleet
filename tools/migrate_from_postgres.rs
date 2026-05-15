@@ -18,7 +18,7 @@ use clap::Parser;
 
 use tokio_postgres::{NoTls, Row};
 
-use ff_db::queries::{self, MemoryRow, NodeRow, TaskRow};
+use ff_db::queries::{self, MemoryRow, TaskRow, WorkerRow};
 use ff_db::{DbPool, DbPoolConfig, run_migrations};
 use ff_mc::McDb;
 
@@ -147,7 +147,7 @@ async fn migrate_nodes(
     }
 
     for row in &rows {
-        let node = NodeRow {
+        let node = WorkerRow {
             id: col_or_str(row, "id"),
             name: col_or_str(row, "name"),
             host: col_or_str(row, "host"),

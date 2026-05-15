@@ -15,7 +15,7 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::builder::{BuildResult, BuilderConfig, SourceBuilder};
-use crate::canary::{CanaryOrchestrator, CanaryPolicy, FleetNode, RolloutProgress};
+use crate::canary::{CanaryOrchestrator, CanaryPolicy, FleetComputer, RolloutProgress};
 use crate::checker::{CheckResult, CheckerConfig, UpdateChecker};
 use crate::error::{UpdateError, UpdateResult};
 use crate::rollback::{RollbackConfig, RollbackManager, RollbackResult};
@@ -317,7 +317,7 @@ impl UpdateOrchestrator {
     /// Returns the list of canary node names to update first.
     pub fn begin_canary_update(
         &mut self,
-        fleet: &[FleetNode],
+        fleet: &[FleetComputer],
         target_version: &str,
     ) -> UpdateResult<Vec<String>> {
         if self.is_busy() {
@@ -356,7 +356,7 @@ impl UpdateOrchestrator {
     }
 
     /// Evaluate canary health gates. Returns `true` if all canaries are healthy.
-    pub async fn check_canary_health(&mut self, fleet: &[FleetNode]) -> bool {
+    pub async fn check_canary_health(&mut self, fleet: &[FleetComputer]) -> bool {
         match self.canary.as_mut() {
             Some(c) => c.check_canary_health(fleet).await,
             None => false,
@@ -756,7 +756,7 @@ mod tests {
 
     #[test]
     fn test_begin_canary_update() {
-        use crate::canary::{CanaryStage, FleetNode};
+        use crate::canary::{CanaryStage, FleetComputer};
 
         let mut orch = UpdateOrchestrator::new(
             test_config("taylor", RollingUpdateConfig::default()),
@@ -764,21 +764,21 @@ mod tests {
         );
 
         let fleet = vec![
-            FleetNode {
+            FleetComputer {
                 name: "james".into(),
                 priority: 10,
                 is_leader: false,
                 health_url: "http://james/health".into(),
                 current_version: Some("v1".into()),
             },
-            FleetNode {
+            FleetComputer {
                 name: "marcus".into(),
                 priority: 20,
                 is_leader: false,
                 health_url: "http://marcus/health".into(),
                 current_version: Some("v1".into()),
             },
-            FleetNode {
+            FleetComputer {
                 name: "taylor".into(),
                 priority: 100,
                 is_leader: true,
@@ -797,7 +797,7 @@ mod tests {
 
     #[test]
     fn test_promote_and_rollout() {
-        use crate::canary::{CanaryStage, FleetNode};
+        use crate::canary::{CanaryStage, FleetComputer};
         use crate::rollout::RolloutState;
 
         let mut orch = UpdateOrchestrator::new(
@@ -806,21 +806,21 @@ mod tests {
         );
 
         let fleet = vec![
-            FleetNode {
+            FleetComputer {
                 name: "james".into(),
                 priority: 10,
                 is_leader: false,
                 health_url: "http://james/health".into(),
                 current_version: Some("v1".into()),
             },
-            FleetNode {
+            FleetComputer {
                 name: "marcus".into(),
                 priority: 20,
                 is_leader: false,
                 health_url: "http://marcus/health".into(),
                 current_version: Some("v1".into()),
             },
-            FleetNode {
+            FleetComputer {
                 name: "taylor".into(),
                 priority: 100,
                 is_leader: true,
@@ -848,7 +848,7 @@ mod tests {
 
     #[test]
     fn test_abort_canary_rollout() {
-        use crate::canary::{CanaryStage, FleetNode};
+        use crate::canary::{CanaryStage, FleetComputer};
 
         let mut orch = UpdateOrchestrator::new(
             test_config("taylor", RollingUpdateConfig::default()),
@@ -856,14 +856,14 @@ mod tests {
         );
 
         let fleet = vec![
-            FleetNode {
+            FleetComputer {
                 name: "james".into(),
                 priority: 10,
                 is_leader: false,
                 health_url: "http://james/health".into(),
                 current_version: None,
             },
-            FleetNode {
+            FleetComputer {
                 name: "taylor".into(),
                 priority: 100,
                 is_leader: true,

@@ -10,7 +10,7 @@
 //!   GET  /api/fleet/check-tcp               — server-side TCP probe
 //!
 //! These endpoints are *complementary* to the existing `/api/fleet/enroll` (which
-//! only upserts `fleet_node_runtime`). Self-enroll handles first-join flow: it
+//! only upserts `fleet_worker_runtime`). Self-enroll handles first-join flow: it
 //! creates the `fleet_workers` row, stashes the SSH identity, records hardware/
 //! tooling metadata, and kicks off mesh-propagation via the deferred queue.
 

@@ -182,7 +182,7 @@ impl FleetResolver {
         let pool = pool.clone();
 
         #[derive(sqlx::FromRow)]
-        struct NodeRow {
+        struct WorkerRow {
             name: String,
             ip: String,
             ssh_user: String,
@@ -190,7 +190,7 @@ impl FleetResolver {
             role: String,
         }
 
-        let rows = sqlx::query_as::<_, NodeRow>(
+        let rows = sqlx::query_as::<_, WorkerRow>(
             "SELECT name, ip, ssh_user, os, role FROM fleet_workers ORDER BY election_priority, name",
         )
         .fetch_all(&pool)

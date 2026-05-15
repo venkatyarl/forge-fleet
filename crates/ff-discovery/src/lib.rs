@@ -22,7 +22,7 @@ pub use models::{
     EndpointModelInfo, ModelCard, ModelListResponse, query_models_endpoint, query_models_endpoints,
 };
 pub use ports::{known_llm_ports, known_service_ports};
-pub use registry::{FleetNode, NodeRegistry};
+pub use registry::{FleetComputer, NodeRegistry};
 pub use scanner::{
     DiscoveredNode, DiscoveryError, NodeScanResult, NodeScanStatus, NodeScanner, ScanTarget,
     ScannerConfig, build_scan_targets, scan_subnet,

@@ -26,7 +26,7 @@ fn lease_expiry_iso(now: chrono::DateTime<Utc>, lease_secs: i64) -> String {
 
 /// A node row from the database.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NodeRow {
+pub struct WorkerRow {
     pub id: String,
     pub name: String,
     pub host: String,
@@ -189,7 +189,7 @@ pub struct FleetEnrollmentEventRow {
 // ─── Node Queries ──────────────────────────────────────────────────────────
 
 /// Insert or replace a node.
-pub fn upsert_node(conn: &Connection, node: &NodeRow) -> Result<()> {
+pub fn upsert_node(conn: &Connection, node: &WorkerRow) -> Result<()> {
     conn.execute(
         "INSERT INTO nodes (id, name, host, port, role, election_priority, status, hardware_json, models_json, last_heartbeat, registered_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
@@ -214,7 +214,7 @@ pub fn upsert_node(conn: &Connection, node: &NodeRow) -> Result<()> {
 }
 
 /// Get a node by name.
-pub fn get_node_by_name(conn: &Connection, name: &str) -> Result<Option<NodeRow>> {
+pub fn get_node_by_name(conn: &Connection, name: &str) -> Result<Option<WorkerRow>> {
     let row = conn
         .query_row(
             "SELECT id, name, host, port, role, election_priority, status,
@@ -222,7 +222,7 @@ pub fn get_node_by_name(conn: &Connection, name: &str) -> Result<Option<NodeRow>
              FROM nodes WHERE name = ?1",
             [name],
             |row| {
-                Ok(NodeRow {
+                Ok(WorkerRow {
                     id: row.get(0)?,
                     name: row.get(1)?,
                     host: row.get(2)?,
@@ -242,7 +242,7 @@ pub fn get_node_by_name(conn: &Connection, name: &str) -> Result<Option<NodeRow>
 }
 
 /// Get all nodes.
-pub fn list_nodes(conn: &Connection) -> Result<Vec<NodeRow>> {
+pub fn list_nodes(conn: &Connection) -> Result<Vec<WorkerRow>> {
     let mut stmt = conn.prepare(
         "SELECT id, name, host, port, role, election_priority, status,
                 hardware_json, models_json, last_heartbeat, registered_at
@@ -251,7 +251,7 @@ pub fn list_nodes(conn: &Connection) -> Result<Vec<NodeRow>> {
     )?;
 
     let rows = stmt.query_map([], |row| {
-        Ok(NodeRow {
+        Ok(WorkerRow {
             id: row.get(0)?,
             name: row.get(1)?,
             host: row.get(2)?,
@@ -344,7 +344,7 @@ pub fn derive_runtime_node_status(
 }
 
 /// Insert or update a fleet runtime node heartbeat/state snapshot.
-pub fn upsert_fleet_node_runtime(
+pub fn upsert_fleet_worker_runtime(
     conn: &Connection,
     row: &FleetNodeRuntimeHeartbeatRow,
 ) -> Result<()> {
@@ -352,7 +352,7 @@ pub fn upsert_fleet_node_runtime(
     let offline_threshold = row.stale_offline_after_secs.max(degraded_threshold + 1);
 
     conn.execute(
-        "INSERT INTO fleet_node_runtime (
+        "INSERT INTO fleet_worker_runtime (
             node_id, hostname, ips_json, role, reported_status, last_heartbeat,
             resources_json, services_json, models_json, capabilities_json,
             stale_degraded_after_secs, stale_offline_after_secs, updated_at
@@ -392,12 +392,12 @@ pub fn upsert_fleet_node_runtime(
 }
 
 /// List live fleet runtime nodes, deriving staleness at query time.
-pub fn list_fleet_node_runtime(conn: &Connection) -> Result<Vec<FleetNodeRuntimeRow>> {
-    list_fleet_node_runtime_at(conn, Utc::now())
+pub fn list_fleet_worker_runtime(conn: &Connection) -> Result<Vec<FleetNodeRuntimeRow>> {
+    list_fleet_worker_runtime_at(conn, Utc::now())
 }
 
 /// List live fleet runtime nodes with status derived relative to `now`.
-pub fn list_fleet_node_runtime_at(
+pub fn list_fleet_worker_runtime_at(
     conn: &Connection,
     now: DateTime<Utc>,
 ) -> Result<Vec<FleetNodeRuntimeRow>> {
@@ -405,7 +405,7 @@ pub fn list_fleet_node_runtime_at(
         "SELECT node_id, hostname, ips_json, role, reported_status, last_heartbeat,
                 resources_json, services_json, models_json, capabilities_json,
                 stale_degraded_after_secs, stale_offline_after_secs, updated_at
-         FROM fleet_node_runtime
+         FROM fleet_worker_runtime
          ORDER BY hostname, node_id
          LIMIT 100",
     )?;
@@ -448,9 +448,9 @@ pub fn list_fleet_node_runtime_at(
 }
 
 /// Check whether a runtime fleet node row exists for `node_id`.
-pub fn fleet_node_runtime_exists(conn: &Connection, node_id: &str) -> Result<bool> {
+pub fn fleet_worker_runtime_exists(conn: &Connection, node_id: &str) -> Result<bool> {
     let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM fleet_node_runtime WHERE node_id = ?1",
+        "SELECT COUNT(*) FROM fleet_worker_runtime WHERE node_id = ?1",
         [node_id],
         |row| row.get(0),
     )?;
@@ -2439,9 +2439,6 @@ pub struct WorkerSshKeyRow {
     pub added_at: chrono::DateTime<chrono::Utc>,
 }
 
-/// Legacy alias retained during the node→worker rename window.
-pub type NodeSshKeyRow = WorkerSshKeyRow;
-
 /// Upsert a public key for a worker. Idempotent on (worker_name, fingerprint).
 pub async fn pg_insert_worker_ssh_key(
     pool: &PgPool,
@@ -3252,7 +3249,7 @@ mod tests {
     #[test]
     fn test_node_crud() {
         let conn = setup();
-        let node = NodeRow {
+        let node = WorkerRow {
             id: Uuid::new_v4().to_string(),
             name: "taylor".into(),
             host: "192.168.5.100".into(),
@@ -3284,7 +3281,7 @@ mod tests {
         let conn = setup();
 
         // Insert a node first (foreign key).
-        let node = NodeRow {
+        let node = WorkerRow {
             id: Uuid::new_v4().to_string(),
             name: "marcus".into(),
             host: "192.168.5.200".into(),
@@ -3332,7 +3329,7 @@ mod tests {
         // Seed worker node for assignment references.
         upsert_node(
             &conn,
-            &NodeRow {
+            &WorkerRow {
                 id: Uuid::new_v4().to_string(),
                 name: "taylor".into(),
                 host: "127.0.0.1".into(),
@@ -3714,7 +3711,7 @@ mod tests {
         let conn = setup();
         let now = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
 
-        upsert_fleet_node_runtime(
+        upsert_fleet_worker_runtime(
             &conn,
             &FleetNodeRuntimeHeartbeatRow {
                 node_id: "node-alpha".to_string(),
@@ -3733,7 +3730,7 @@ mod tests {
         )
         .unwrap();
 
-        let rows = list_fleet_node_runtime(&conn).unwrap();
+        let rows = list_fleet_worker_runtime(&conn).unwrap();
         assert_eq!(rows.len(), 1);
         let row = &rows[0];
 
@@ -3752,7 +3749,7 @@ mod tests {
         let conn = setup();
         let heartbeat_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
 
-        upsert_fleet_node_runtime(
+        upsert_fleet_worker_runtime(
             &conn,
             &FleetNodeRuntimeHeartbeatRow {
                 node_id: "node-beta".to_string(),
@@ -3772,13 +3769,13 @@ mod tests {
         .unwrap();
 
         let degraded_now = Utc::now() + Duration::seconds(12);
-        let degraded_rows = list_fleet_node_runtime_at(&conn, degraded_now).unwrap();
+        let degraded_rows = list_fleet_worker_runtime_at(&conn, degraded_now).unwrap();
         assert_eq!(degraded_rows.len(), 1);
         assert_eq!(degraded_rows[0].derived_status, "degraded");
         assert!(degraded_rows[0].heartbeat_age_secs >= 12);
 
         let offline_now = Utc::now() + Duration::seconds(25);
-        let offline_rows = list_fleet_node_runtime_at(&conn, offline_now).unwrap();
+        let offline_rows = list_fleet_worker_runtime_at(&conn, offline_now).unwrap();
         assert_eq!(offline_rows.len(), 1);
         assert_eq!(offline_rows[0].derived_status, "offline");
         assert!(offline_rows[0].heartbeat_age_secs >= 25);

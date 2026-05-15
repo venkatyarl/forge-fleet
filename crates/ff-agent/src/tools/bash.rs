@@ -149,7 +149,7 @@ async fn run_shell_command(
 }
 
 /// Fleet node name → (ip, ssh_user) lookup via Postgres.
-async fn fleet_node_ip(name: &str) -> Option<(String, String)> {
+async fn fleet_worker_ip(name: &str) -> Option<(String, String)> {
     crate::fleet_info::fetch_node_ip_user(name).await
 }
 
@@ -169,7 +169,7 @@ fn is_valid_username(user: &str) -> bool {
 
 /// Rewrite bare SSH commands to fleet nodes into non-interactive commands.
 /// e.g. "ssh <node>" → "ssh -o ConnectTimeout=10 <user>@<ip> 'hostname && uptime && ...'"
-/// where `<ip>` and `<user>` are resolved from Postgres via `fleet_node_ip`.
+/// where `<ip>` and `<user>` are resolved from Postgres via `fleet_worker_ip`.
 async fn rewrite_fleet_ssh(command: &str) -> String {
     let trimmed = command.trim();
 
@@ -181,7 +181,7 @@ async fn rewrite_fleet_ssh(command: &str) -> String {
             // Check if target is a fleet node name (no @ sign, no IP)
             if !target.contains('@')
                 && !target.contains('.')
-                && let Some((ip, user)) = fleet_node_ip(target).await
+                && let Some((ip, user)) = fleet_worker_ip(target).await
                 && is_valid_ip(&ip)
                 && is_valid_username(&user)
             {
@@ -195,7 +195,7 @@ async fn rewrite_fleet_ssh(command: &str) -> String {
     // Match "ssh into <nodename>" pattern
     if trimmed.starts_with("ssh into ") || trimmed.starts_with("ssh to ") {
         let worker_name = trimmed.split_whitespace().last().unwrap_or("");
-        if let Some((ip, user)) = fleet_node_ip(worker_name).await
+        if let Some((ip, user)) = fleet_worker_ip(worker_name).await
             && is_valid_ip(&ip)
             && is_valid_username(&user)
         {

@@ -235,7 +235,7 @@ CREATE INDEX IF NOT EXISTS idx_tg_media_ingest_message
 pub const SCHEMA_V5_FLEET_NODE_RUNTIME: &str = r#"
 -- ─── Fleet Runtime Node Registry ──────────────────────────────────────────
 -- Live source of truth for node runtime state (heartbeats + capabilities).
-CREATE TABLE IF NOT EXISTS fleet_node_runtime (
+CREATE TABLE IF NOT EXISTS fleet_worker_runtime (
     node_id                      TEXT PRIMARY KEY,
     hostname                     TEXT NOT NULL,
     ips_json                     TEXT NOT NULL DEFAULT '[]',
@@ -252,9 +252,9 @@ CREATE TABLE IF NOT EXISTS fleet_node_runtime (
 );
 
 CREATE INDEX IF NOT EXISTS idx_fleet_runtime_hostname
-    ON fleet_node_runtime(hostname);
+    ON fleet_worker_runtime(hostname);
 CREATE INDEX IF NOT EXISTS idx_fleet_runtime_heartbeat
-    ON fleet_node_runtime(last_heartbeat);
+    ON fleet_worker_runtime(last_heartbeat);
 "#;
 
 /// SQL to add explicit fleet enrollment event history.
@@ -545,7 +545,7 @@ pub const SCHEMA_V12_ONBOARDING: &str = r#"
 
 -- SSH public keys per node. Separate from fleet_workers so we can stash both
 -- the daemon user's pubkey AND the machine's host keys (multiple per node).
-CREATE TABLE IF NOT EXISTS fleet_node_ssh_keys (
+CREATE TABLE IF NOT EXISTS fleet_worker_ssh_keys (
     worker_name    TEXT NOT NULL REFERENCES fleet_workers(name) ON DELETE CASCADE,
     key_purpose  TEXT NOT NULL,             -- 'user' | 'host'
     public_key   TEXT NOT NULL,             -- full OpenSSH format line
@@ -555,7 +555,7 @@ CREATE TABLE IF NOT EXISTS fleet_node_ssh_keys (
     PRIMARY KEY (worker_name, fingerprint)
 );
 CREATE INDEX IF NOT EXISTS idx_ssh_keys_node_purpose
-    ON fleet_node_ssh_keys (worker_name, key_purpose);
+    ON fleet_worker_ssh_keys (worker_name, key_purpose);
 
 -- Bidirectional SSH reachability matrix. One row per ordered (src, dst) pair.
 -- Written by the mesh-propagation deferred task and the periodic re-verify
@@ -784,7 +784,7 @@ pub const TABLES: &[&str] = &[
     "ownership_events",
     "autonomy_events",
     "telegram_media_ingest",
-    "fleet_node_runtime",
+    "fleet_worker_runtime",
     "fleet_enrollment_events",
     "memories",
     "sessions",
@@ -6282,7 +6282,7 @@ CREATE INDEX IF NOT EXISTS idx_tool_audit_created ON tool_audit_log(created_at);
 "#;
 
 pub const SCHEMA_V82_RENAME_FLEET_NODE_SSH_KEYS: &str = r#"
--- ─── V82: rename fleet_node_ssh_keys → fleet_workers_ssh_keys ──────────────
+-- ─── V82: rename fleet_worker_ssh_keys → fleet_workers_ssh_keys ──────────────
 -- Aligns the table name with the broader fleet_workers → fleet_workers rename
 -- target (see memory: fleet_workers_naming). The underlying FK still points
 -- at fleet_workers(name) until that table is renamed in a later migration.
@@ -6292,11 +6292,11 @@ pub const SCHEMA_V82_RENAME_FLEET_NODE_SSH_KEYS: &str = r#"
 DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM information_schema.tables
-               WHERE table_schema = 'public' AND table_name = 'fleet_node_ssh_keys')
+               WHERE table_schema = 'public' AND table_name = 'fleet_worker_ssh_keys')
        AND NOT EXISTS (SELECT 1 FROM information_schema.tables
                WHERE table_schema = 'public' AND table_name = 'fleet_workers_ssh_keys')
     THEN
-        ALTER TABLE fleet_node_ssh_keys RENAME TO fleet_workers_ssh_keys;
+        ALTER TABLE fleet_worker_ssh_keys RENAME TO fleet_workers_ssh_keys;
         ALTER INDEX IF EXISTS idx_ssh_keys_node_purpose
             RENAME TO idx_workers_ssh_keys_node_purpose;
     END IF;
@@ -6317,7 +6317,7 @@ CREATE INDEX IF NOT EXISTS idx_workers_ssh_keys_node_purpose
 
 -- Compatibility view for callers still on the old name during the upgrade
 -- window. Dropped in a future migration once all daemons have been pushed.
-CREATE OR REPLACE VIEW fleet_node_ssh_keys AS
+CREATE OR REPLACE VIEW fleet_worker_ssh_keys AS
     SELECT * FROM fleet_workers_ssh_keys;
 "#;
 
@@ -6388,7 +6388,7 @@ pub const SCHEMA_V84_RENAME_NODE_NAME_COLUMN: &str = r#"
 -- Finishes the node → worker rename inside fleet_workers_ssh_keys. The FK
 -- to fleet_workers(name) is preserved automatically across the rename.
 --
--- The fleet_node_ssh_keys compatibility view is rewritten to alias
+-- The fleet_worker_ssh_keys compatibility view is rewritten to alias
 -- `worker_name AS worker_name` so any unrenamed callers (SELECT or
 -- INSERT INTO ... (worker_name, ...)) continue to work during the
 -- upgrade window. The view stays auto-updatable because the alias is
@@ -6407,8 +6407,8 @@ BEGIN
 END $$;
 
 -- Rebuild the compat view to expose `worker_name` under the old name.
-DROP VIEW IF EXISTS fleet_node_ssh_keys;
-CREATE VIEW fleet_node_ssh_keys AS
+DROP VIEW IF EXISTS fleet_worker_ssh_keys;
+CREATE VIEW fleet_worker_ssh_keys AS
     SELECT
         worker_name AS worker_name,
         key_purpose,
@@ -6420,14 +6420,14 @@ CREATE VIEW fleet_node_ssh_keys AS
 "#;
 
 pub const SCHEMA_V85_DROP_COMPAT_VIEWS: &str = r#"
--- ─── V85: drop the fleet_node_* compat views ───────────────────────────────
+-- ─── V85: drop the fleet_worker_* compat views ───────────────────────────────
 -- The full rename across all Rust call sites is complete (0 remaining
--- `fleet_nodes` or `fleet_node_ssh_keys` references in runtime code as of
+-- `fleet_nodes` or `fleet_worker_ssh_keys` references in runtime code as of
 -- this commit), so the compatibility shims from V82/V83/V84 are no longer
 -- load-bearing. Drop them to remove the rename debt.
 --
 -- Idempotent: views may not exist on fresh installs that never ran V82/V83.
-DROP VIEW IF EXISTS fleet_node_ssh_keys;
+DROP VIEW IF EXISTS fleet_worker_ssh_keys;
 DROP VIEW IF EXISTS fleet_nodes;
 "#;
 

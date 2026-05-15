@@ -5,7 +5,7 @@
 //! - Allow runtime registry + enrollment event tables to be primary on Postgres.
 //!
 //! This module intentionally scopes Postgres writes to operational runtime tables:
-//! `fleet_node_runtime` and `fleet_enrollment_events`.
+//! `fleet_worker_runtime` and `fleet_enrollment_events`.
 
 use std::sync::Arc;
 
@@ -70,8 +70,8 @@ impl RuntimeRegistryStore {
                 let node_id = heartbeat.node_id.clone();
                 let row = pool
                     .with_conn(move |conn| {
-                        queries::upsert_fleet_node_runtime(conn, &heartbeat)?;
-                        let rows = queries::list_fleet_node_runtime(conn)?;
+                        queries::upsert_fleet_worker_runtime(conn, &heartbeat)?;
+                        let rows = queries::list_fleet_worker_runtime(conn)?;
                         Ok(rows.into_iter().find(|row| row.node_id == node_id))
                     })
                     .await?;
@@ -84,7 +84,7 @@ impl RuntimeRegistryStore {
 
                 sqlx::query(
                     r#"
-                    INSERT INTO fleet_node_runtime (
+                    INSERT INTO fleet_worker_runtime (
                         node_id,
                         hostname,
                         ips_json,
@@ -154,9 +154,9 @@ impl RuntimeRegistryStore {
                 let node_id = heartbeat.node_id.clone();
                 let row = pool
                     .with_conn(move |conn| {
-                        queries::upsert_fleet_node_runtime(conn, &heartbeat)?;
+                        queries::upsert_fleet_worker_runtime(conn, &heartbeat)?;
                         queries::insert_fleet_enrollment_event(conn, &event)?;
-                        let rows = queries::list_fleet_node_runtime(conn)?;
+                        let rows = queries::list_fleet_worker_runtime(conn)?;
                         Ok(rows.into_iter().find(|row| row.node_id == node_id))
                     })
                     .await?;
@@ -170,7 +170,7 @@ impl RuntimeRegistryStore {
 
                 sqlx::query(
                     r#"
-                    INSERT INTO fleet_node_runtime (
+                    INSERT INTO fleet_worker_runtime (
                         node_id,
                         hostname,
                         ips_json,
@@ -267,7 +267,7 @@ impl RuntimeRegistryStore {
                         stale_degraded_after_secs,
                         stale_offline_after_secs,
                         updated_at
-                    FROM fleet_node_runtime
+                    FROM fleet_worker_runtime
                     WHERE node_id = $1
                     "#,
                 )
@@ -336,7 +336,7 @@ impl RuntimeRegistryStore {
     /// List runtime nodes.
     pub async fn list_runtime_nodes(&self) -> Result<Vec<queries::FleetNodeRuntimeRow>, DbError> {
         match self {
-            Self::Sqlite(pool) => pool.with_conn(queries::list_fleet_node_runtime).await,
+            Self::Sqlite(pool) => pool.with_conn(queries::list_fleet_worker_runtime).await,
             Self::Postgres(pool) => {
                 let rows = sqlx::query(
                     r#"
@@ -354,7 +354,7 @@ impl RuntimeRegistryStore {
                         stale_degraded_after_secs,
                         stale_offline_after_secs,
                         updated_at
-                    FROM fleet_node_runtime
+                    FROM fleet_worker_runtime
                     ORDER BY hostname, node_id
                     LIMIT 100
                     "#,
@@ -416,7 +416,7 @@ impl RuntimeRegistryStore {
                 let node_id = node_id.to_string();
                 let row = pool
                     .with_conn(move |conn| {
-                        let rows = queries::list_fleet_node_runtime(conn)?;
+                        let rows = queries::list_fleet_worker_runtime(conn)?;
                         Ok(rows.into_iter().find(|row| row.node_id == node_id))
                     })
                     .await?;
@@ -440,7 +440,7 @@ impl RuntimeRegistryStore {
                         stale_degraded_after_secs,
                         stale_offline_after_secs,
                         updated_at
-                    FROM fleet_node_runtime
+                    FROM fleet_worker_runtime
                     WHERE node_id = $1
                     "#,
                 )
@@ -463,7 +463,7 @@ impl RuntimeRegistryStore {
 
         sqlx::query(
             r#"
-            CREATE TABLE IF NOT EXISTS fleet_node_runtime (
+            CREATE TABLE IF NOT EXISTS fleet_worker_runtime (
                 node_id                    TEXT PRIMARY KEY,
                 hostname                   TEXT NOT NULL,
                 ips_json                   TEXT NOT NULL DEFAULT '[]',
@@ -484,13 +484,13 @@ impl RuntimeRegistryStore {
         .await?;
 
         sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_fleet_runtime_hostname ON fleet_node_runtime(hostname)",
+            "CREATE INDEX IF NOT EXISTS idx_fleet_runtime_hostname ON fleet_worker_runtime(hostname)",
         )
         .execute(pool.as_ref())
         .await?;
 
         sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_fleet_runtime_heartbeat ON fleet_node_runtime(last_heartbeat)",
+            "CREATE INDEX IF NOT EXISTS idx_fleet_runtime_heartbeat ON fleet_worker_runtime(last_heartbeat)",
         )
         .execute(pool.as_ref())
         .await?;

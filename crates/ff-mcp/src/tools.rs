@@ -83,7 +83,7 @@ impl ToolRegistry {
         self.register(Self::project_policy_resolve());
         self.register(Self::fleet_pulse());
         self.register(Self::fleet_nodes_db());
-        self.register(Self::fleet_node_detail());
+        self.register(Self::fleet_worker_detail());
         self.register(Self::fleet_models_db());
         self.register(Self::task_lineage());
         self.register(Self::fleet_models_catalog());
@@ -498,9 +498,9 @@ impl ToolRegistry {
         }
     }
 
-    fn fleet_node_detail() -> ToolDefinition {
+    fn fleet_worker_detail() -> ToolDefinition {
         ToolDefinition {
-            name: "fleet_node_detail".to_string(),
+            name: "fleet_worker_detail".to_string(),
             description: "Get detailed info for a single node: Postgres record (persistent registry) combined with live Redis metrics (CPU/RAM/disk/tokens_per_sec).".to_string(),
             input_schema: json!({
                 "type": "object",
@@ -912,7 +912,7 @@ mod tests {
             "project_policy_resolve",
             "fleet_pulse",
             "fleet_nodes_db",
-            "fleet_node_detail",
+            "fleet_worker_detail",
             "fleet_models_db",
             "task_lineage",
             "fleet_models_catalog",

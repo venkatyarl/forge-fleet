@@ -1682,12 +1682,12 @@ pub async fn fleet_nodes_db(_params: Option<Value>) -> HandlerResult {
 
 // ─── Fleet Node Detail (Postgres + Redis combined) ──────────────────────────
 
-pub async fn fleet_node_detail(params: Option<Value>) -> HandlerResult {
+pub async fn fleet_worker_detail(params: Option<Value>) -> HandlerResult {
     let node = params
         .as_ref()
         .and_then(|p| p.get("node"))
         .and_then(|v| v.as_str())
-        .ok_or_else(|| "fleet_node_detail requires 'node' parameter".to_string())?;
+        .ok_or_else(|| "fleet_worker_detail requires 'node' parameter".to_string())?;
 
     let (config, _) = load_config_auto()?;
     let pool = get_pg_pool(&config).await?;
@@ -1705,12 +1705,12 @@ pub async fn fleet_node_detail(params: Option<Value>) -> HandlerResult {
         Ok(mut pulse) => match pulse.get_metrics(node).await {
             Ok(metrics) => metrics,
             Err(e) => {
-                warn!("fleet_node_detail: Redis fetch failed (non-fatal): {e}");
+                warn!("fleet_worker_detail: Redis fetch failed (non-fatal): {e}");
                 None
             }
         },
         Err(e) => {
-            warn!("fleet_node_detail: Redis connection failed (non-fatal): {e}");
+            warn!("fleet_worker_detail: Redis connection failed (non-fatal): {e}");
             None
         }
     };
@@ -1973,7 +1973,7 @@ pub async fn dispatch(method: &str, params: Option<Value>) -> HandlerResult {
         "project_policy_resolve" => project_policy_resolve(params).await,
         "fleet_pulse" => fleet_pulse(params).await,
         "fleet_nodes_db" => fleet_nodes_db(params).await,
-        "fleet_node_detail" => fleet_node_detail(params).await,
+        "fleet_worker_detail" => fleet_worker_detail(params).await,
         "fleet_models_db" => fleet_models_db(params).await,
         "task_lineage" => task_lineage(params).await,
         "fleet_models_catalog" => fleet_models_catalog(params).await,

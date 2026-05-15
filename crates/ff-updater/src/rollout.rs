@@ -12,7 +12,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
-use crate::canary::{FleetNode, NodeProgress, NodeUpdateStatus};
+use crate::canary::{FleetComputer, NodeProgress, NodeUpdateStatus};
 use crate::error::{UpdateError, UpdateResult};
 
 // ─── Rollout command (manual controls) ───────────────────────────────────────
@@ -90,12 +90,12 @@ fn default_abort_on_failure() -> bool {
 impl RolloutPlan {
     /// Build a plan from a fleet list. Leader goes last.
     pub fn from_fleet(
-        nodes: &[FleetNode],
+        nodes: &[FleetComputer],
         canary_nodes: &[String],
         target_version: String,
     ) -> Self {
         // Filter out canary nodes, sort: non-leaders by priority, leader last.
-        let mut remaining: Vec<&FleetNode> = nodes
+        let mut remaining: Vec<&FleetComputer> = nodes
             .iter()
             .filter(|n| !canary_nodes.contains(&n.name))
             .collect();
@@ -471,32 +471,32 @@ impl RolloutController {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::canary::FleetNode;
+    use crate::canary::FleetComputer;
 
-    fn test_fleet() -> Vec<FleetNode> {
+    fn test_fleet() -> Vec<FleetComputer> {
         vec![
-            FleetNode {
+            FleetComputer {
                 name: "james".into(),
                 priority: 10,
                 is_leader: false,
                 health_url: "http://james/health".into(),
                 current_version: Some("v1".into()),
             },
-            FleetNode {
+            FleetComputer {
                 name: "marcus".into(),
                 priority: 20,
                 is_leader: false,
                 health_url: "http://marcus/health".into(),
                 current_version: Some("v1".into()),
             },
-            FleetNode {
+            FleetComputer {
                 name: "sophie".into(),
                 priority: 30,
                 is_leader: false,
                 health_url: "http://sophie/health".into(),
                 current_version: Some("v1".into()),
             },
-            FleetNode {
+            FleetComputer {
                 name: "taylor".into(),
                 priority: 100,
                 is_leader: true,
@@ -794,21 +794,21 @@ mod tests {
     #[test]
     fn test_rollout_order_respects_priority() {
         let fleet = vec![
-            FleetNode {
+            FleetComputer {
                 name: "high".into(),
                 priority: 50,
                 is_leader: false,
                 health_url: "http://h/health".into(),
                 current_version: None,
             },
-            FleetNode {
+            FleetComputer {
                 name: "low".into(),
                 priority: 5,
                 is_leader: false,
                 health_url: "http://l/health".into(),
                 current_version: None,
             },
-            FleetNode {
+            FleetComputer {
                 name: "leader".into(),
                 priority: 1,
                 is_leader: true,
