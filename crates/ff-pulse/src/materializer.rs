@@ -470,6 +470,27 @@ impl Materializer {
             report.status_transition = Some((prev_status.clone(), new_status.clone()));
         }
 
+        // V89: build_sha auto-refresh — must run BEFORE the fast-path exit
+        // below, otherwise it's skipped on every beat after the snapshot
+        // first matches (which is most of them, since SHA only changes on
+        // redeploy). The WHERE `installed_version <> $1` guard makes the
+        // UPDATE a true no-op once the row is correct, so running on every
+        // beat is cheap.
+        if let Some(sha) = beat.build_sha.as_deref() {
+            let _ = sqlx::query(
+                "UPDATE computer_software SET \
+                    installed_version = $1, \
+                    last_checked_at = NOW() \
+                 WHERE computer_id = $2 \
+                   AND software_id IN ('ff_git', 'forgefleetd_git') \
+                   AND COALESCE(installed_version, '') <> $1",
+            )
+            .bind(sha)
+            .bind(computer_id)
+            .execute(&self.pg)
+            .await;
+        }
+
         // Fast path: if the snapshot matches exactly AND no status transition,
         // only update last_seen_at.
         let snapshots_match = prior_snapshot
@@ -611,26 +632,8 @@ impl Materializer {
             .await;
         }
 
-        // V89: refresh computer_software.installed_version for ff_git and
-        // forgefleetd_git from the publishing daemon's own build SHA.
-        // Previously this column only updated through the auto-upgrade
-        // success callback, so `ff fleet versions` lagged reality whenever
-        // the operator pushed a manual rebuild or used deploy-ff-to-fleet.
-        // Now the daemon's heartbeat is authoritative.
-        if let Some(sha) = beat.build_sha.as_deref() {
-            let _ = sqlx::query(
-                "UPDATE computer_software SET \
-                    installed_version = $1, \
-                    last_checked_at = NOW() \
-                 WHERE computer_id = $2 \
-                   AND software_id IN ('ff_git', 'forgefleetd_git') \
-                   AND COALESCE(installed_version, '') <> $1",
-            )
-            .bind(sha)
-            .bind(computer_id)
-            .execute(&self.pg)
-            .await;
-        }
+        // build_sha auto-refresh moved earlier in this function so it
+        // runs before the fast-path exit; see V89 note above.
 
         // Status transition handling.
         if status_changed {
