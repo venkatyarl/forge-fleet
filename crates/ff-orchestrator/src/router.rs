@@ -29,7 +29,7 @@ pub struct ModelScore {
     /// Which model was scored.
     pub model_id: String,
     /// Which node this model lives on.
-    pub node_name: String,
+    pub worker_name: String,
     /// Specialty match score (0.0–1.0).
     pub specialty_score: f64,
     /// Node health score (0.0–1.0).
@@ -66,7 +66,7 @@ pub struct RouteDecision {
     /// The winning model.
     pub model_id: String,
     /// The node to send the request to.
-    pub node_name: String,
+    pub worker_name: String,
     /// The node's host:port for the inference endpoint.
     pub endpoint: String,
     /// Full score breakdown of the winner.
@@ -147,8 +147,8 @@ impl TaskRouter {
     }
 
     /// Update live load data for a node.
-    pub fn update_load(&mut self, node_name: &str, load: NodeLoad) {
-        self.node_loads.insert(node_name.to_string(), load);
+    pub fn update_load(&mut self, worker_name: &str, load: NodeLoad) {
+        self.node_loads.insert(worker_name.to_string(), load);
     }
 
     /// Route a single subtask to the best model/node.
@@ -164,8 +164,8 @@ impl TaskRouter {
 
         for model in &self.models {
             // Find the node(s) that serve this model
-            for node_name in &model.nodes {
-                let Some(node) = self.nodes.iter().find(|n| &n.name == node_name) else {
+            for worker_name in &model.nodes {
+                let Some(node) = self.nodes.iter().find(|n| &n.name == worker_name) else {
                     continue;
                 };
 
@@ -213,13 +213,13 @@ impl TaskRouter {
         });
 
         let winner = scores.first()?.clone();
-        let node = self.nodes.iter().find(|n| n.name == winner.node_name)?;
+        let node = self.nodes.iter().find(|n| n.name == winner.worker_name)?;
         let endpoint = format!("{}:{}", node.host, node.port);
 
         Some(RouteDecision {
             subtask_id: subtask.id,
             model_id: winner.model_id.clone(),
-            node_name: winner.node_name.clone(),
+            worker_name: winner.worker_name.clone(),
             endpoint,
             score: winner,
             alternatives: scores.into_iter().skip(1).collect(),
@@ -255,7 +255,7 @@ impl TaskRouter {
 
         ModelScore {
             model_id: model.id.clone(),
-            node_name: node.name.clone(),
+            worker_name: node.name.clone(),
             specialty_score,
             health_score,
             load_score,
@@ -446,7 +446,7 @@ mod tests {
 
         let st = SubTask::new(0, "test", "translate hello", SubTaskType::FastLookup);
         let decision = router.route(&st, &RouteConstraints::default()).unwrap();
-        assert_eq!(decision.node_name, "james");
+        assert_eq!(decision.worker_name, "james");
     }
 
     #[test]
@@ -500,7 +500,7 @@ mod tests {
 
         let st = SubTask::new(0, "test", "translate hello", SubTaskType::FastLookup);
         let decision = router.route(&st, &RouteConstraints::default()).unwrap();
-        assert_eq!(decision.node_name, "james");
+        assert_eq!(decision.worker_name, "james");
     }
 
     #[test]

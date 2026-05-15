@@ -518,7 +518,7 @@ impl AgentTool for AutoFleetTool {
                     let port = snapshot
                         .models
                         .iter()
-                        .find(|m| m.node_name == node.name)
+                        .find(|m| m.worker_name == node.name)
                         .map(|m| m.port as u16)
                         .unwrap_or(55000);
                     let status = self.client
@@ -569,7 +569,7 @@ impl AgentTool for AutoFleetTool {
                     let models: Vec<String> = snapshot
                         .models
                         .iter()
-                        .filter(|m| m.node_name == node.name)
+                        .filter(|m| m.worker_name == node.name)
                         .map(|m| m.name.clone())
                         .collect();
                     lines.push(format!(

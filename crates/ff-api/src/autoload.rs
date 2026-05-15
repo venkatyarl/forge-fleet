@@ -20,26 +20,26 @@ use tracing::{info, warn};
 ///
 /// Returns a `http://host:port` URL on success.
 pub async fn ensure_deployed(pool: &PgPool, catalog_id: &str) -> Result<String, String> {
-    let node_name = resolve_this_node_name(pool).await;
+    let worker_name = resolve_this_node_name(pool).await;
 
     // 1. Already deployed and healthy?
-    if let Some(url) = find_healthy_deployment(pool, &node_name, catalog_id).await? {
+    if let Some(url) = find_healthy_deployment(pool, &worker_name, catalog_id).await? {
         return Ok(url);
     }
 
     // 2. Is there a library row for this catalog_id on this node?
-    let libs = pg_list_library(pool, Some(&node_name))
+    let libs = pg_list_library(pool, Some(&worker_name))
         .await
         .map_err(|e| format!("pg_list_library: {e}"))?;
     if !libs.iter().any(|r| r.catalog_id == catalog_id) {
         return Err(format!(
-            "model '{catalog_id}' not in library on '{node_name}'; \
+            "model '{catalog_id}' not in library on '{worker_name}'; \
              run `ff model download {catalog_id}` first"
         ));
     }
 
     // 3. Pick a free port (51001..=51020, skipping ones in deployments).
-    let deps = pg_list_deployments(pool, Some(&node_name))
+    let deps = pg_list_deployments(pool, Some(&worker_name))
         .await
         .map_err(|e| format!("pg_list_deployments: {e}"))?;
     let used_ports: std::collections::HashSet<i32> = deps.iter().map(|d| d.port).collect();
@@ -53,18 +53,18 @@ pub async fn ensure_deployed(pool: &PgPool, catalog_id: &str) -> Result<String, 
     // because ff-agent already depends on ff-api, so pulling ff-agent in here
     // would form a dependency cycle. The `ff` binary is expected to be on PATH
     // or at $HOME/.local/bin/ff.
-    info!(catalog_id, node = %node_name, "auto-loading model via `ff model autoload`");
+    info!(catalog_id, node = %worker_name, "auto-loading model via `ff model autoload`");
     spawn_ff_autoload(catalog_id)?;
 
     // 5. Poll for a healthy deployment (up to 90s).
     let deadline = Instant::now() + Duration::from_secs(90);
     let mut last_status = "unknown".to_string();
     while Instant::now() < deadline {
-        match find_healthy_deployment(pool, &node_name, catalog_id).await? {
+        match find_healthy_deployment(pool, &worker_name, catalog_id).await? {
             Some(url) => return Ok(url),
             None => {
                 // Not yet healthy — record the latest status for diagnostics.
-                if let Ok(deps) = pg_list_deployments(pool, Some(&node_name)).await
+                if let Ok(deps) = pg_list_deployments(pool, Some(&worker_name)).await
                     && let Some(d) = deps
                         .iter()
                         .find(|d| d.catalog_id.as_deref() == Some(catalog_id))
@@ -87,14 +87,14 @@ pub async fn ensure_deployed(pool: &PgPool, catalog_id: &str) -> Result<String, 
 
 // ─── helpers ──────────────────────────────────────────────────────────────
 
-/// Look up a healthy deployment for (`node_name`, `catalog_id`) and return its
+/// Look up a healthy deployment for (`worker_name`, `catalog_id`) and return its
 /// base URL if one is present.
 async fn find_healthy_deployment(
     pool: &PgPool,
-    node_name: &str,
+    worker_name: &str,
     catalog_id: &str,
 ) -> Result<Option<String>, String> {
-    let deps = pg_list_deployments(pool, Some(node_name))
+    let deps = pg_list_deployments(pool, Some(worker_name))
         .await
         .map_err(|e| format!("pg_list_deployments: {e}"))?;
     Ok(deps

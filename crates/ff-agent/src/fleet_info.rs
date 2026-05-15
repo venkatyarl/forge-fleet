@@ -395,7 +395,7 @@ to add nodes."
         let node_models: Vec<&FleetModelRow> = snapshot
             .models
             .iter()
-            .filter(|m| m.node_name == node.name)
+            .filter(|m| m.worker_name == node.name)
             .collect();
 
         let model_desc = if node_models.is_empty() {

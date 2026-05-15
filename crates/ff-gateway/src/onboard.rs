@@ -993,7 +993,7 @@ fn db_err(op: &str, e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
 
 /// Parse the type and fingerprint of an OpenSSH public-key string. Returns
 /// ("unknown", sha256-of-key-body) if parsing fails — good enough for DB
-/// dedup via unique constraint on (node_name, fingerprint).
+/// dedup via unique constraint on (worker_name, fingerprint).
 fn parse_pubkey_meta(pubkey: &str) -> (String, String) {
     use sha2::{Digest, Sha256};
     let mut parts = pubkey.split_whitespace();

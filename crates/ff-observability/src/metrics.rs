@@ -57,7 +57,7 @@ impl Default for ProcessMetrics {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeMetrics {
     /// Node name (e.g. "taylor", "james").
-    pub node_name: String,
+    pub worker_name: String,
     /// Overall CPU usage percentage.
     pub cpu_percent: f64,
     /// Memory used in GiB.
@@ -111,7 +111,7 @@ pub struct ModelMetrics {
     /// Model identifier (e.g. "qwen3-32b-q4").
     pub model_id: String,
     /// Node hosting this model.
-    pub node_name: String,
+    pub worker_name: String,
     /// Total inference requests served.
     pub total_requests: u64,
     /// Requests currently in flight.
@@ -194,9 +194,9 @@ impl Default for FleetMetrics {
 pub struct MetricsCollector {
     /// Per-node metrics (key = node name).
     pub node_metrics: Arc<DashMap<String, NodeMetrics>>,
-    /// Per-model metrics (key = "model_id@node_name").
+    /// Per-model metrics (key = "model_id@worker_name").
     pub model_metrics: Arc<DashMap<String, ModelMetrics>>,
-    /// Per-process metrics (key = "node_name:pid").
+    /// Per-process metrics (key = "worker_name:pid").
     pub process_metrics: Arc<DashMap<String, ProcessMetrics>>,
 }
 
@@ -212,18 +212,19 @@ impl MetricsCollector {
 
     /// Record a node metrics snapshot.
     pub fn record_node(&self, metrics: NodeMetrics) {
-        self.node_metrics.insert(metrics.node_name.clone(), metrics);
+        self.node_metrics
+            .insert(metrics.worker_name.clone(), metrics);
     }
 
     /// Record a model metrics snapshot.
     pub fn record_model(&self, metrics: ModelMetrics) {
-        let key = format!("{}@{}", metrics.model_id, metrics.node_name);
+        let key = format!("{}@{}", metrics.model_id, metrics.worker_name);
         self.model_metrics.insert(key, metrics);
     }
 
     /// Record a process metrics snapshot.
-    pub fn record_process(&self, node_name: &str, metrics: ProcessMetrics) {
-        let key = format!("{}:{}", node_name, metrics.pid);
+    pub fn record_process(&self, worker_name: &str, metrics: ProcessMetrics) {
+        let key = format!("{}:{}", worker_name, metrics.pid);
         self.process_metrics.insert(key, metrics);
     }
 
@@ -425,16 +426,16 @@ lazy_static! {
 
     // ── Node & model health ──────────────────────────────────────────
 
-    /// Node health gauge (labels: node_name, status). 1 = healthy, 0 = unhealthy.
+    /// Node health gauge (labels: worker_name, status). 1 = healthy, 0 = unhealthy.
     pub static ref NODE_HEALTH: GaugeVec = GaugeVec::new(
         Opts::new("node_health", "Node health (1=healthy, 0=unhealthy)"),
-        &["node_name", "status"],
+        &["worker_name", "status"],
     ).unwrap();
 
-    /// Model health gauge (labels: node_name, model_name). 1 = loaded, 0 = unloaded.
+    /// Model health gauge (labels: worker_name, model_name). 1 = loaded, 0 = unloaded.
     pub static ref MODEL_HEALTH: GaugeVec = GaugeVec::new(
         Opts::new("model_health", "Model health (1=loaded, 0=unloaded)"),
-        &["node_name", "model_name"],
+        &["worker_name", "model_name"],
     ).unwrap();
 
     // ── Infrastructure gauges ────────────────────────────────────────
@@ -581,7 +582,7 @@ mod tests {
 
     fn sample_node(name: &str, cpu: f64, mem_used: f64, mem_total: f64) -> NodeMetrics {
         NodeMetrics {
-            node_name: name.to_string(),
+            worker_name: name.to_string(),
             cpu_percent: cpu,
             memory_used_gib: mem_used,
             memory_total_gib: mem_total,
@@ -607,7 +608,7 @@ mod tests {
     fn test_model_error_rate() {
         let m = ModelMetrics {
             model_id: "qwen-9b".into(),
-            node_name: "taylor".into(),
+            worker_name: "taylor".into(),
             total_requests: 100,
             active_requests: 0,
             avg_latency_ms: 50.0,

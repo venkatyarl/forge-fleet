@@ -51,7 +51,7 @@ pub struct ElectionManager {
     /// Fleet configuration (election order, preferred leader).
     config: Arc<FleetConfig>,
     /// This node's name.
-    node_name: String,
+    worker_name: String,
     /// Current election state.
     state: RwLock<ElectionState>,
     /// Election history (most recent first).
@@ -62,10 +62,10 @@ pub struct ElectionManager {
 
 impl ElectionManager {
     /// Create a new election manager.
-    pub fn new(config: Arc<FleetConfig>, node_name: String) -> Self {
+    pub fn new(config: Arc<FleetConfig>, worker_name: String) -> Self {
         Self {
             config,
-            node_name,
+            worker_name,
             state: RwLock::new(ElectionState::Electing {
                 triggered_at: Utc::now(),
             }),
@@ -88,7 +88,7 @@ impl ElectionManager {
     /// Check if this node is the current leader.
     pub async fn is_leader(&self) -> bool {
         let state = self.state.read().await;
-        state.leader() == Some(self.node_name.as_str())
+        state.leader() == Some(self.worker_name.as_str())
     }
 
     /// Update health information for a node.

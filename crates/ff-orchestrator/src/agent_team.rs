@@ -123,8 +123,8 @@ impl AgentAssignment {
     }
 
     /// Builder: set node preference.
-    pub fn on_node(mut self, node_name: impl Into<String>) -> Self {
-        self.node_preference = Some(node_name.into());
+    pub fn on_node(mut self, worker_name: impl Into<String>) -> Self {
+        self.node_preference = Some(worker_name.into());
         self
     }
 

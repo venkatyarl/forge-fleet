@@ -111,7 +111,7 @@ impl fmt::Display for AuditAction {
 /// A single audit event.
 ///
 /// Maps to the `audit_log` table. The `source_ip` field is stored in the
-/// `node_name` column; if both a node name and IP are needed, the IP can
+/// `worker_name` column; if both a node name and IP are needed, the IP can
 /// also be placed in `details`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditEvent {

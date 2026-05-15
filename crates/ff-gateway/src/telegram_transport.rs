@@ -25,7 +25,7 @@ pub struct TelegramPollingTransport {
     config: TelegramTransportConfig,
     store: OperationalStore,
     router: Arc<MessageRouter>,
-    node_name: String,
+    worker_name: String,
     poll_interval: Duration,
     poll_timeout_secs: u64,
     next_offset: Option<i64>,
@@ -62,7 +62,7 @@ impl TelegramPollingTransport {
     pub fn new(
         config: TelegramTransportConfig,
         store: OperationalStore,
-        node_name: String,
+        worker_name: String,
         router: MessageRouter,
     ) -> Result<Self> {
         let token = config
@@ -94,7 +94,7 @@ impl TelegramPollingTransport {
             config,
             store,
             router: Arc::new(router),
-            node_name,
+            worker_name,
             poll_interval,
             poll_timeout_secs,
             next_offset: None,
@@ -107,7 +107,7 @@ impl TelegramPollingTransport {
 
     pub async fn run(mut self, mut shutdown_rx: watch::Receiver<bool>) -> Result<()> {
         info!(
-            node = %self.node_name,
+            node = %self.worker_name,
             allowed_chat_ids = ?self.config.allowed_chat_ids,
             poll_interval_secs = self.poll_interval.as_secs(),
             poll_timeout_secs = self.poll_timeout_secs,
@@ -130,7 +130,7 @@ impl TelegramPollingTransport {
             tokio::select! {
                 changed = shutdown_rx.changed() => {
                     if changed.is_err() || *shutdown_rx.borrow() {
-                        info!(node=%self.node_name, "telegram polling transport stopping");
+                        info!(node=%self.worker_name, "telegram polling transport stopping");
                         break;
                     }
                 }
@@ -334,7 +334,7 @@ impl TelegramPollingTransport {
                 "start" => {
                     format!(
                         "ForgeFleet Telegram transport online on node {}.",
-                        self.node_name
+                        self.worker_name
                     )
                 }
                 "help" => "Commands:\n\
@@ -349,7 +349,7 @@ impl TelegramPollingTransport {
                      /where - Current thread"
                     .to_string(),
                 "ping" => "pong".to_string(),
-                "status" => format!("node: {}\nroute: {:?}", self.node_name, _route.target),
+                "status" => format!("node: {}\nroute: {:?}", self.worker_name, _route.target),
 
                 // ── Brain thread commands ──────────────────────────────
                 "threads" => {
@@ -432,7 +432,7 @@ impl TelegramPollingTransport {
         } else {
             text.to_string()
         };
-        let fallback = format!("(brain offline) echo on {}: {preview}", self.node_name);
+        let fallback = format!("(brain offline) echo on {}: {preview}", self.worker_name);
 
         let mut outgoing =
             OutgoingMessage::text(Channel::Telegram, incoming.chat_id.clone(), fallback);
@@ -792,7 +792,7 @@ impl TelegramPollingTransport {
             .external_id
             .clone()
             .unwrap_or_else(|| "unknown".to_string());
-        let node_name = self.node_name.clone();
+        let worker_name = self.worker_name.clone();
 
         let mut persisted_media = Vec::with_capacity(media.len());
         for item in media {
@@ -827,7 +827,7 @@ impl TelegramPollingTransport {
             kind: "telegram_media_ingest".to_string(),
             payload_json: payload.clone(),
             status: "pending".to_string(),
-            assigned_node: Some(node_name.clone()),
+            assigned_node: Some(worker_name.clone()),
             priority: 20,
             created_at: Utc::now().to_rfc3339(),
             started_at: None,
@@ -845,7 +845,7 @@ impl TelegramPollingTransport {
                 "telegram_transport",
                 Some(&ingest_task_id),
                 &payload,
-                Some(&node_name),
+                Some(&worker_name),
             )
             .await
             .context("failed to append telegram media ingest audit event")?;
@@ -1136,11 +1136,11 @@ async fn resolve_llm_endpoint(pool: &PgPool) -> String {
         }
     };
 
-    // Resolve node_name → IP via fleet_workers
+    // Resolve worker_name → IP via fleet_workers
     let ip = match ff_db::pg_list_nodes(pool).await {
         Ok(nodes) => nodes
             .iter()
-            .find(|n| n.name == deployment.node_name)
+            .find(|n| n.name == deployment.worker_name)
             .map(|n| n.ip.clone())
             .unwrap_or_else(|| "127.0.0.1".to_string()),
         Err(_) => "127.0.0.1".to_string(),

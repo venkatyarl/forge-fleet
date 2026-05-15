@@ -256,10 +256,10 @@ impl LogIngestor {
     /// Ingest a log entry.
     pub async fn ingest(&self, entry: LogEntry) {
         // Store in per-node buffer.
-        let node_name = entry.node.clone();
+        let worker_name = entry.node.clone();
         let node_buf = self
             .per_node
-            .entry(node_name)
+            .entry(worker_name)
             .or_insert_with(|| LogBuffer::new(self.per_node_capacity))
             .clone();
         node_buf.push(entry.clone()).await;
@@ -270,10 +270,10 @@ impl LogIngestor {
 
     /// Ingest synchronously (best-effort).
     pub fn ingest_sync(&self, entry: LogEntry) {
-        let node_name = entry.node.clone();
+        let worker_name = entry.node.clone();
         let node_buf = self
             .per_node
-            .entry(node_name)
+            .entry(worker_name)
             .or_insert_with(|| LogBuffer::new(self.per_node_capacity))
             .clone();
         node_buf.push_sync(entry.clone());

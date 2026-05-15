@@ -216,7 +216,7 @@ impl SyntheticProbe for HttpHealthProbe {
     async fn execute(&self, config: &FleetConfig) -> Vec<ProbeResult> {
         let mut results = Vec::new();
 
-        for (node_name, node) in &config.nodes {
+        for (worker_name, node) in &config.nodes {
             let port = node.port.unwrap_or(config.fleet.api_port);
             let url = format!("http://{}:{}/health", node.ip, port);
 
@@ -232,9 +232,9 @@ impl SyntheticProbe for HttpHealthProbe {
             };
             let latency = start.elapsed();
 
-            debug!(probe = "http_health", node = %node_name, ?status, ?latency);
+            debug!(probe = "http_health", node = %worker_name, ?status, ?latency);
             results.push(
-                ProbeResult::new("http_health", status, latency, Some(node_name.clone()))
+                ProbeResult::new("http_health", status, latency, Some(worker_name.clone()))
                     .with_meta("url", &url),
             );
         }
@@ -285,7 +285,7 @@ impl SyntheticProbe for LlmSmokeProbe {
     async fn execute(&self, config: &FleetConfig) -> Vec<ProbeResult> {
         let mut results = Vec::new();
 
-        for (node_name, node) in &config.nodes {
+        for (worker_name, node) in &config.nodes {
             for (model_slug, model) in &node.models {
                 let Some(port) = model.port else {
                     continue;
@@ -333,13 +333,13 @@ impl SyntheticProbe for LlmSmokeProbe {
 
                 debug!(
                     probe = "llm_smoke",
-                    node = %node_name,
+                    node = %worker_name,
                     model = %model_slug,
                     ?status,
                     ?latency,
                 );
                 results.push(
-                    ProbeResult::new("llm_smoke", status, latency, Some(node_name.clone()))
+                    ProbeResult::new("llm_smoke", status, latency, Some(worker_name.clone()))
                         .with_meta("model", model_slug)
                         .with_meta("url", &url),
                 );
@@ -470,7 +470,7 @@ impl SyntheticProbe for DbWriteReadProbe {
             .find(|(_, n)| n.role.is_leader_like())
             .or_else(|| config.nodes.iter().next());
 
-        let Some((node_name, node)) = leader else {
+        let Some((worker_name, node)) = leader else {
             return vec![ProbeResult::new(
                 "db_write_read",
                 ProbeStatus::Fail {
@@ -488,13 +488,13 @@ impl SyntheticProbe for DbWriteReadProbe {
         let status = self.probe_via_api(&self.client, &base_url).await;
         let latency = start.elapsed();
 
-        debug!(probe = "db_write_read", node = %node_name, ?status, ?latency);
+        debug!(probe = "db_write_read", node = %worker_name, ?status, ?latency);
 
         vec![ProbeResult::new(
             "db_write_read",
             status,
             latency,
-            Some(node_name.clone()),
+            Some(worker_name.clone()),
         )]
     }
 }
@@ -600,7 +600,7 @@ impl SyntheticProbe for ReplicationLagProbe {
         };
 
         // Check each follower
-        for (node_name, node) in &config.nodes {
+        for (worker_name, node) in &config.nodes {
             if node.role.is_leader_like() {
                 continue;
             }
@@ -638,15 +638,20 @@ impl SyntheticProbe for ReplicationLagProbe {
 
             debug!(
                 probe = "replication_lag",
-                node = %node_name,
+                node = %worker_name,
                 leader = %leader_name,
                 ?status,
                 ?latency,
             );
             results.push(
-                ProbeResult::new("replication_lag", status, latency, Some(node_name.clone()))
-                    .with_meta("leader", leader_name)
-                    .with_meta("leader_seq", leader_seq.to_string()),
+                ProbeResult::new(
+                    "replication_lag",
+                    status,
+                    latency,
+                    Some(worker_name.clone()),
+                )
+                .with_meta("leader", leader_name)
+                .with_meta("leader_seq", leader_seq.to_string()),
             );
         }
 
@@ -749,7 +754,7 @@ impl SyntheticProbe for DiskSpaceProbe {
     async fn execute(&self, config: &FleetConfig) -> Vec<ProbeResult> {
         let mut results = Vec::new();
 
-        for (node_name, node) in &config.nodes {
+        for (worker_name, node) in &config.nodes {
             let port = node.port.unwrap_or(config.fleet.api_port);
             let url = format!("http://{}:{}/api/system/disk", node.ip, port);
 
@@ -806,9 +811,9 @@ impl SyntheticProbe for DiskSpaceProbe {
             };
             let latency = start.elapsed();
 
-            debug!(probe = "disk_space", node = %node_name, ?status, ?latency);
+            debug!(probe = "disk_space", node = %worker_name, ?status, ?latency);
             results.push(
-                ProbeResult::new("disk_space", status, latency, Some(node_name.clone()))
+                ProbeResult::new("disk_space", status, latency, Some(worker_name.clone()))
                     .with_meta("url", &url),
             );
         }
@@ -876,7 +881,7 @@ impl SyntheticProbe for BackupFreshnessProbe {
             .find(|(_, n)| n.role.is_leader_like())
             .or_else(|| config.nodes.iter().next());
 
-        let Some((node_name, node)) = leader else {
+        let Some((worker_name, node)) = leader else {
             return vec![ProbeResult::new(
                 "backup_freshness",
                 ProbeStatus::Fail {
@@ -946,13 +951,13 @@ impl SyntheticProbe for BackupFreshnessProbe {
         };
         let latency = start.elapsed();
 
-        debug!(probe = "backup_freshness", node = %node_name, ?status, ?latency);
+        debug!(probe = "backup_freshness", node = %worker_name, ?status, ?latency);
 
         vec![ProbeResult::new(
             "backup_freshness",
             status,
             latency,
-            Some(node_name.clone()),
+            Some(worker_name.clone()),
         )]
     }
 }

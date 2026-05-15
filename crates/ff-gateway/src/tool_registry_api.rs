@@ -26,7 +26,7 @@ pub struct ListToolsQuery {
 #[derive(Debug, Serialize)]
 pub struct ToolEntry {
     pub tool_name: String,
-    pub node_name: String,
+    pub worker_name: String,
     pub description: String,
     pub health_checked_at: String,
     pub call_count: i32,
@@ -44,7 +44,7 @@ pub struct ToolHealthSummary {
 
 #[derive(Debug, Serialize)]
 pub struct NodeToolHealth {
-    pub node_name: String,
+    pub worker_name: String,
     pub tool_count: i64,
     pub healthy_count: i64,
     pub unhealthy_count: i64,
@@ -52,7 +52,7 @@ pub struct NodeToolHealth {
 
 #[derive(Debug, Deserialize)]
 pub struct RegisterToolsRequest {
-    pub node_name: String,
+    pub worker_name: String,
     pub tools: Vec<ToolRegistration>,
 }
 
@@ -78,7 +78,7 @@ pub async fn list_tools(
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
 
     let mut sql = String::from(
-        "SELECT tool_name, node_name, description, health_checked_at, \
+        "SELECT tool_name, worker_name, description, health_checked_at, \
          call_count, avg_latency_ms, \
          (health_checked_at > NOW() - INTERVAL '5 minutes') as healthy \
          FROM fleet_tools WHERE 1=1",
@@ -88,7 +88,7 @@ pub async fn list_tools(
     // into the SQL string itself.
     let mut next_param = 1;
     if query.node.is_some() {
-        sql.push_str(&format!(" AND node_name = ${}", next_param));
+        sql.push_str(&format!(" AND worker_name = ${}", next_param));
         next_param += 1;
     }
     if query.name.is_some() {
@@ -102,7 +102,7 @@ pub async fn list_tools(
         sql.push_str(" AND health_checked_at <= NOW() - INTERVAL '5 minutes'");
     }
 
-    sql.push_str(" ORDER BY node_name, tool_name");
+    sql.push_str(" ORDER BY worker_name, tool_name");
 
     let mut q = sqlx::query(&sql);
     if let Some(node) = &query.node {
@@ -121,7 +121,7 @@ pub async fn list_tools(
         .iter()
         .map(|row| ToolEntry {
             tool_name: row.get("tool_name"),
-            node_name: row.get("node_name"),
+            worker_name: row.get("worker_name"),
             description: row.get("description"),
             health_checked_at: row
                 .get::<chrono::DateTime<chrono::Utc>, _>("health_checked_at")
@@ -159,13 +159,13 @@ pub async fn tool_health(
 
     let rows = sqlx::query(
         "SELECT \
-            node_name, \
+            worker_name, \
             COUNT(*) as tool_count, \
             COUNT(*) FILTER (WHERE health_checked_at > NOW() - INTERVAL '5 minutes') as healthy_count, \
             COUNT(*) FILTER (WHERE health_checked_at <= NOW() - INTERVAL '5 minutes') as unhealthy_count \
          FROM fleet_tools \
-         GROUP BY node_name \
-         ORDER BY node_name",
+         GROUP BY worker_name \
+         ORDER BY worker_name",
     )
     .fetch_all(pool)
     .await
@@ -174,7 +174,7 @@ pub async fn tool_health(
     let nodes: Vec<NodeToolHealth> = rows
         .iter()
         .map(|row| NodeToolHealth {
-            node_name: row.get("node_name"),
+            worker_name: row.get("worker_name"),
             tool_count: row.get("tool_count"),
             healthy_count: row.get("healthy_count"),
             unhealthy_count: row.get("unhealthy_count"),
@@ -205,16 +205,16 @@ pub async fn register_tools(
 
     for tool in &req.tools {
         let result = sqlx::query(
-            "INSERT INTO fleet_tools (tool_name, node_name, description, parameters_schema, capabilities_required, health_checked_at) \
+            "INSERT INTO fleet_tools (tool_name, worker_name, description, parameters_schema, capabilities_required, health_checked_at) \
              VALUES ($1, $2, $3, $4, $5, NOW()) \
-             ON CONFLICT (tool_name, node_name) \
+             ON CONFLICT (tool_name, worker_name) \
              DO UPDATE SET description = EXCLUDED.description, \
                            parameters_schema = EXCLUDED.parameters_schema, \
                            capabilities_required = EXCLUDED.capabilities_required, \
                            health_checked_at = NOW()",
         )
         .bind(&tool.name)
-        .bind(&req.node_name)
+        .bind(&req.worker_name)
         .bind(&tool.description)
         .bind(&tool.parameters_schema)
         .bind(&tool.capabilities_required)
@@ -230,7 +230,7 @@ pub async fn register_tools(
     }
 
     Ok(Json(json!({
-        "node": req.node_name,
+        "node": req.worker_name,
         "registered": registered,
         "updated": updated,
         "total_tools": req.tools.len(),
@@ -248,20 +248,20 @@ pub async fn tool_heartbeat(
         .and_then(|os| os.pg_pool())
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
 
-    let node_name = req
-        .get("node_name")
+    let worker_name = req
+        .get("worker_name")
         .and_then(|v| v.as_str())
         .ok_or(StatusCode::BAD_REQUEST)?;
 
     let result =
-        sqlx::query("UPDATE fleet_tools SET health_checked_at = NOW() WHERE node_name = $1")
-            .bind(node_name)
+        sqlx::query("UPDATE fleet_tools SET health_checked_at = NOW() WHERE worker_name = $1")
+            .bind(worker_name)
             .execute(pool)
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(json!({
-        "node": node_name,
+        "node": worker_name,
         "tools_refreshed": result.rows_affected(),
     })))
 }
@@ -276,7 +276,7 @@ pub struct RouteToolQuery {
 #[derive(Debug, Serialize)]
 pub struct RouteToolResponse {
     pub tool_name: String,
-    pub node_name: String,
+    pub worker_name: String,
     pub healthy: bool,
     pub avg_latency_ms: Option<f64>,
 }
@@ -293,7 +293,7 @@ pub async fn route_tool(
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
 
     let row = sqlx::query(
-        "SELECT node_name, avg_latency_ms \
+        "SELECT worker_name, avg_latency_ms \
          FROM fleet_tools \
          WHERE tool_name = $1 \
            AND health_checked_at > NOW() - INTERVAL '5 minutes' \
@@ -311,7 +311,7 @@ pub async fn route_tool(
 
     Ok(Json(RouteToolResponse {
         tool_name: query.tool_name,
-        node_name: row.get("node_name"),
+        worker_name: row.get("worker_name"),
         healthy: true,
         avg_latency_ms: row.get("avg_latency_ms"),
     }))
@@ -344,12 +344,12 @@ pub async fn search_tools(
     let pattern = format!("%{}%", query.q);
 
     let rows = sqlx::query(
-        "SELECT tool_name, node_name, description, health_checked_at, \
+        "SELECT tool_name, worker_name, description, health_checked_at, \
          call_count, avg_latency_ms, \
          (health_checked_at > NOW() - INTERVAL '5 minutes') as healthy \
          FROM fleet_tools \
          WHERE tool_name ILIKE $1 OR description ILIKE $1 \
-         ORDER BY tool_name, node_name \
+         ORDER BY tool_name, worker_name \
          LIMIT 20",
     )
     .bind(&pattern)
@@ -361,7 +361,7 @@ pub async fn search_tools(
         .iter()
         .map(|row| ToolEntry {
             tool_name: row.get("tool_name"),
-            node_name: row.get("node_name"),
+            worker_name: row.get("worker_name"),
             description: row.get("description"),
             health_checked_at: row
                 .get::<chrono::DateTime<chrono::Utc>, _>("health_checked_at")
@@ -381,7 +381,7 @@ pub async fn search_tools(
 /// POST /api/tools/usage — Record a tool invocation for analytics.
 #[derive(Debug, Deserialize)]
 pub struct RecordUsageRequest {
-    pub node_name: String,
+    pub worker_name: String,
     pub tool_name: String,
     pub session_id: Option<String>,
     pub success: bool,
@@ -400,9 +400,9 @@ pub async fn record_tool_usage(
 
     // Verify the tool exists before logging usage (optional validation)
     let _tool_id: Option<uuid::Uuid> = sqlx::query_scalar(
-        "SELECT id FROM fleet_tools WHERE node_name = $1 AND tool_name = $2 LIMIT 1",
+        "SELECT id FROM fleet_tools WHERE worker_name = $1 AND tool_name = $2 LIMIT 1",
     )
-    .bind(&req.node_name)
+    .bind(&req.worker_name)
     .bind(&req.tool_name)
     .fetch_optional(pool)
     .await
@@ -411,13 +411,13 @@ pub async fn record_tool_usage(
     match sqlx::query(
         r#"
         INSERT INTO fleet_tool_usage (
-            tool_name, node_name, success, latency_ms
+            tool_name, worker_name, success, latency_ms
         )
         VALUES ($1, $2, $3, $4)
         "#,
     )
     .bind(&req.tool_name)
-    .bind(&req.node_name)
+    .bind(&req.worker_name)
     .bind(req.success)
     .bind(req.duration_ms)
     .execute(pool)
@@ -432,6 +432,6 @@ pub async fn record_tool_usage(
     Ok(Json(json!({
         "recorded": true,
         "tool": req.tool_name,
-        "node": req.node_name,
+        "node": req.worker_name,
     })))
 }

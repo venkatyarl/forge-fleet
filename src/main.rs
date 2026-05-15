@@ -54,7 +54,7 @@ struct Cli {
 
     /// Node name override for startup banner and telemetry tagging
     #[arg(long)]
-    node_name: Option<String>,
+    worker_name: Option<String>,
 
     /// Role override for startup banner
     #[arg(long)]
@@ -113,14 +113,14 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
     let config_path = resolve_config_path(cli.config.clone())?;
     let config = load_or_default_config(&config_path)?;
 
-    let node_name = resolve_node_name(cli, &config);
-    let role = resolve_role(cli, start, &config, &node_name);
+    let worker_name = resolve_node_name(cli, &config);
+    let role = resolve_role(cli, start, &config, &worker_name);
 
     // Publish node identity for in-process consumers (agent, MCP tools, callbacks).
     // SAFETY: single-threaded at this point — daemon subsystems haven't spawned yet.
     #[allow(unused_unsafe)]
     unsafe {
-        std::env::set_var("FORGEFLEET_NODE_NAME", &node_name);
+        std::env::set_var("FORGEFLEET_NODE_NAME", &worker_name);
     }
 
     // ─── NATS client (optional) ─────────────────────────────────────────────
@@ -141,14 +141,14 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         .await
         .map_err(|e| e.to_string());
 
-    init_logging(cli, &node_name).await?;
+    init_logging(cli, &worker_name).await?;
     match &nats_init_outcome {
         Ok(_) => info!(url = %nats_url, "NATS connected"),
         Err(e) => {
             warn!(url = %nats_url, error = %e, "NATS unavailable — continuing without event bus")
         }
     }
-    print_startup_banner(&node_name, &role, &config_path);
+    print_startup_banner(&worker_name, &role, &config_path);
 
     enforce_database_mode_preflight(&config)?;
 
@@ -329,7 +329,7 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
     let election_config = Arc::new(config.clone());
     subsystem_tasks.push(start_leader_election_subsystem(
         election_config,
-        node_name.clone(),
+        worker_name.clone(),
         registry.clone(),
         shutdown_rx.clone(),
     ));
@@ -342,7 +342,7 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
 
     // 4) agent
     info!("starting subsystem: agent");
-    let mut embedded_agent_config = build_embedded_agent_config(&config, node_name.clone());
+    let mut embedded_agent_config = build_embedded_agent_config(&config, worker_name.clone());
     // Wire in the inference router so autonomous LLM tasks use local-first fleet routing.
     let inference_router =
         Arc::new(ff_agent::inference_router::InferenceRouter::from_config(&config_path).await);
@@ -384,7 +384,7 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
     // 6.45) Tool registry registration + heartbeat — register local tools
     // with the fleet-wide tool registry and keep them alive.
     {
-        let name = node_name.clone();
+        let name = worker_name.clone();
         let shutdown = shutdown_rx.clone();
         let tool_registry_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
@@ -406,7 +406,7 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
                 })
                 .collect();
             let register_body = serde_json::json!({
-                "node_name": name,
+                "worker_name": name,
                 "tools": tools,
             });
             match tool_registry_client
@@ -428,7 +428,7 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
                 tokio::select! {
                     _ = interval.tick() => {
                         let _ = tool_registry_client.post(format!("{}/api/tools/heartbeat", gateway))
-                            .json(&serde_json::json!({"node_name": name}))
+                            .json(&serde_json::json!({"worker_name": name}))
                             .send().await;
                     }
                     changed = shutdown.changed() => {
@@ -519,7 +519,7 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         subsystem_tasks.push(start_telegram_transport_subsystem(
             config.clone(),
             operational_store.clone(),
-            node_name.clone(),
+            worker_name.clone(),
             shutdown_rx.clone(),
         ));
     } else {
@@ -543,7 +543,7 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         info!("starting subsystem: updater loop");
         subsystem_tasks.push(start_updater_subsystem(
             config.clone(),
-            node_name.clone(),
+            worker_name.clone(),
             shutdown_rx.clone(),
         ));
     } else {
@@ -555,7 +555,7 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         info!("starting subsystem: self-heal loop");
         subsystem_tasks.push(start_self_heal_subsystem(
             config.clone(),
-            node_name.clone(),
+            worker_name.clone(),
             operational_store.clone(),
             shutdown_rx.clone(),
         ));
@@ -581,7 +581,7 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
     // 13) Fleet Pulse heartbeat (Redis real-time metrics)
     {
         let redis_url = config.redis.url.clone();
-        let pulse_node = node_name.clone();
+        let pulse_node = worker_name.clone();
         let pulse_shutdown = shutdown_rx.clone();
         if !redis_url.is_empty() {
             info!("starting subsystem: fleet pulse heartbeat");
@@ -627,7 +627,7 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
             match start_pulse_v2_subsystems(
                 pg_pool,
                 redis_url,
-                node_name.clone(),
+                worker_name.clone(),
                 shutdown_rx.clone(),
             )
             .await
@@ -652,7 +652,7 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         info!("starting subsystem: project scheduler tick (60s, leader-gated)");
         subsystem_tasks.push(ff_agent::scheduler_tick::spawn_scheduler_tick(
             pg_pool,
-            node_name.clone(),
+            worker_name.clone(),
             60,
             shutdown_rx.clone(),
         ));
@@ -664,7 +664,7 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         info!("starting subsystem: procedural memory consolidation (6h, leader-gated)");
         subsystem_tasks.push(ff_brain::procedural_memory::spawn_consolidation_loop(
             pg_pool,
-            node_name.clone(),
+            worker_name.clone(),
             6 * 3600,
             shutdown_rx.clone(),
         ));
@@ -976,11 +976,11 @@ fn redact_database_url(raw: &str) -> String {
     "***".to_string()
 }
 
-async fn init_logging(cli: &Cli, node_name: &str) -> Result<()> {
+async fn init_logging(cli: &Cli, worker_name: &str) -> Result<()> {
     let telemetry = TelemetryConfig {
         level: cli.log_level.clone(),
         json: cli.json_logs,
-        node_name: Some(node_name.to_string()),
+        worker_name: Some(worker_name.to_string()),
         ..Default::default()
     };
 
@@ -991,7 +991,7 @@ async fn init_logging(cli: &Cli, node_name: &str) -> Result<()> {
     if let Some(nats_client) = ff_agent::nats_client::get_nats().await {
         let nats_layer = ff_agent::nats_log_layer::NatsLogLayer::with_client(
             nats_client.clone(),
-            node_name.to_string(),
+            worker_name.to_string(),
             "forgefleetd".to_string(),
         );
         ff_observability::init_telemetry_with_extra_layer(&telemetry, nats_layer)
@@ -1001,8 +1001,8 @@ async fn init_logging(cli: &Cli, node_name: &str) -> Result<()> {
 }
 
 fn resolve_node_name(cli: &Cli, config: &FleetConfig) -> String {
-    if let Some(node_name) = &cli.node_name {
-        return node_name.clone();
+    if let Some(worker_name) = &cli.worker_name {
+        return worker_name.clone();
     }
 
     // FORGEFLEET_NODE_NAME — the canonical identity override. Mirrors
@@ -1054,7 +1054,7 @@ fn resolve_node_name(cli: &Cli, config: &FleetConfig) -> String {
         .unwrap_or_else(|| "unknown-node".to_string())
 }
 
-fn resolve_role(cli: &Cli, start: &StartArgs, config: &FleetConfig, node_name: &str) -> String {
+fn resolve_role(cli: &Cli, start: &StartArgs, config: &FleetConfig, worker_name: &str) -> String {
     if let Some(role) = &cli.role {
         return role.clone();
     }
@@ -1065,16 +1065,16 @@ fn resolve_role(cli: &Cli, start: &StartArgs, config: &FleetConfig, node_name: &
 
     config
         .nodes
-        .get(node_name)
+        .get(worker_name)
         .map(|n| format!("{:?}", n.role).to_ascii_lowercase())
         .unwrap_or_else(|| "auto".to_string())
 }
 
-fn print_startup_banner(node_name: &str, role: &str, config_path: &Path) {
+fn print_startup_banner(worker_name: &str, role: &str, config_path: &Path) {
     println!(
         "\nForgeFleet v{}\n  node: {}\n  role: {}\n  config: {}\n",
         env!("CARGO_PKG_VERSION"),
-        node_name,
+        worker_name,
         role,
         config_path.display()
     );
@@ -1238,8 +1238,8 @@ async fn announce_leader_to_fleet(
     });
 
     // Announce to all config-sourced nodes (except ourselves).
-    for (node_name, node_cfg) in &config.nodes {
-        if node_name == leader_name {
+    for (worker_name, node_cfg) in &config.nodes {
+        if worker_name == leader_name {
             continue;
         }
 
@@ -1249,20 +1249,20 @@ async fn announce_leader_to_fleet(
         match client.post(&url).json(&payload).send().await {
             Ok(resp) if resp.status().is_success() => {
                 info!(
-                    target_node = %node_name,
+                    target_node = %worker_name,
                     "leader announcement accepted"
                 );
             }
             Ok(resp) => {
                 warn!(
-                    target_node = %node_name,
+                    target_node = %worker_name,
                     status = resp.status().as_u16(),
                     "leader announcement rejected"
                 );
             }
             Err(err) => {
                 warn!(
-                    target_node = %node_name,
+                    target_node = %worker_name,
                     error = %err,
                     "leader announcement failed (node may be offline)"
                 );
@@ -1454,7 +1454,7 @@ fn start_tool_prune_subsystem(
 fn start_telegram_transport_subsystem(
     config: FleetConfig,
     operational_store: OperationalStore,
-    node_name: String,
+    worker_name: String,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -1471,7 +1471,7 @@ fn start_telegram_transport_subsystem(
         match ff_gateway::TelegramPollingTransport::new(
             telegram_cfg,
             operational_store.clone(),
-            node_name,
+            worker_name,
             router,
         ) {
             Ok(transport) => {
@@ -1609,7 +1609,7 @@ fn start_evolution_subsystem(
 
 fn start_updater_subsystem(
     config: FleetConfig,
-    node_name: String,
+    worker_name: String,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -1651,7 +1651,7 @@ fn start_updater_subsystem(
 
                             if check.update_available && loop_cfg.auto_apply {
                                 let mut orchestrator = UpdateOrchestrator::new(
-                                    build_updater_orchestrator_config(&node_name, &repo_path, &loop_cfg),
+                                    build_updater_orchestrator_config(&worker_name, &repo_path, &loop_cfg),
                                     RestartSignal::None,
                                 );
 
@@ -1686,7 +1686,7 @@ fn start_updater_subsystem(
 }
 
 fn build_updater_orchestrator_config(
-    node_name: &str,
+    worker_name: &str,
     repo_path: &Path,
     settings: &ff_core::config::UpdaterLoopSettings,
 ) -> OrchestratorConfig {
@@ -1698,7 +1698,7 @@ fn build_updater_orchestrator_config(
         .unwrap_or_else(|| PathBuf::from("forgefleetd"));
 
     OrchestratorConfig {
-        node_name: node_name.to_string(),
+        worker_name: worker_name.to_string(),
         checker: CheckerConfig {
             repo_path: repo_path.to_path_buf(),
             remote: settings.git_remote.clone(),
@@ -1729,10 +1729,10 @@ fn build_updater_orchestrator_config(
     }
 }
 
-fn expected_model_ports_for_node(config: &FleetConfig, node_name: &str) -> Vec<u16> {
+fn expected_model_ports_for_node(config: &FleetConfig, worker_name: &str) -> Vec<u16> {
     let mut ports = HashSet::new();
 
-    if let Some(node_cfg) = config.nodes.get(node_name) {
+    if let Some(node_cfg) = config.nodes.get(worker_name) {
         for model_cfg in node_cfg.models.values() {
             if let Some(port) = model_cfg.port.or(node_cfg.port) {
                 ports.insert(port);
@@ -1747,7 +1747,7 @@ fn expected_model_ports_for_node(config: &FleetConfig, node_name: &str) -> Vec<u
 
 fn start_self_heal_subsystem(
     config: FleetConfig,
-    node_name: String,
+    worker_name: String,
     operational_store: OperationalStore,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> JoinHandle<()> {
@@ -1760,9 +1760,9 @@ fn start_self_heal_subsystem(
             health_probe_timeout_secs: loop_cfg.health_probe_timeout_secs.max(1),
         });
 
-        let expected_ports = expected_model_ports_for_node(&config, &node_name);
+        let expected_ports = expected_model_ports_for_node(&config, &worker_name);
         if expected_ports.is_empty() {
-            info!(node = %node_name, "self-heal loop started with no expected local model ports");
+            info!(node = %worker_name, "self-heal loop started with no expected local model ports");
         }
 
         // Hardcoded restart commands as fallback — matches the old behaviour
@@ -1839,7 +1839,7 @@ fn start_self_heal_subsystem(
                         if !pg_nodes.is_empty() {
                             for db_node in &pg_nodes {
                                 // Skip the leader node itself
-                                if db_node.name == node_name {
+                                if db_node.name == worker_name {
                                     continue;
                                 }
                                 // Use Postgres restart_commands setting if available,
@@ -1973,7 +1973,7 @@ fn start_mcp_federation_subsystem(
 async fn start_pulse_v2_subsystems(
     pg_pool: ff_db::PgPool,
     redis_url: String,
-    node_name: String,
+    worker_name: String,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<Vec<JoinHandle<()>>> {
     let mut handles: Vec<JoinHandle<()>> = Vec::new();
@@ -1981,14 +1981,14 @@ async fn start_pulse_v2_subsystems(
     // (1a) computer_id — required for everything else.
     let computer_id_row: Option<(uuid::Uuid,)> =
         sqlx::query_as::<_, (uuid::Uuid,)>("SELECT id FROM computers WHERE name = $1")
-            .bind(&node_name)
+            .bind(&worker_name)
             .fetch_optional(&pg_pool)
             .await
             .context("pulse v2: failed to query computers by name")?;
 
     let Some((computer_id,)) = computer_id_row else {
         warn!(
-            node = %node_name,
+            node = %worker_name,
             "pulse v2: no `computers` row for this host; Pulse v2 disabled until enrollment"
         );
         return Ok(handles);
@@ -2009,7 +2009,7 @@ async fn start_pulse_v2_subsystems(
     let enrolled_in_fleet = priority_row.is_some();
     let election_priority = priority_row.map(|(p,)| p).unwrap_or(1000);
 
-    // (All pg_pool / shutdown_rx / node_name / redis_url clones are done
+    // (All pg_pool / shutdown_rx / worker_name / redis_url clones are done
     // inline at the call site — PgPool and watch::Receiver are cheap to clone.)
 
     // Build the redis::Client once — both publisher and materializer need one.
@@ -2024,14 +2024,14 @@ async fn start_pulse_v2_subsystems(
 
     // (2) HeartbeatV2Publisher — always runs when computer row exists.
     info!(
-        node = %node_name,
+        node = %worker_name,
         computer_id = %computer_id,
         election_priority,
         "starting subsystem: pulse v2 heartbeat"
     );
     let v2_pub = ff_pulse::HeartbeatV2Publisher::with_defaults(
         redis_client.clone(),
-        node_name.clone(),
+        worker_name.clone(),
         election_priority,
     );
     // epoch_handle + role_handle are shared with leader_tick below when
@@ -2088,7 +2088,7 @@ async fn start_pulse_v2_subsystems(
     // (4) LeaderTick — only when enrolled in fleet_members.
     if enrolled_in_fleet {
         info!(
-            node = %node_name,
+            node = %worker_name,
             election_priority,
             "starting subsystem: pulse v2 leader_tick"
         );
@@ -2101,8 +2101,8 @@ async fn start_pulse_v2_subsystems(
         let pool_for_promote = pg_pool.clone();
         let pool_for_demote = pg_pool.clone();
 
-        let my_name_for_promote = node_name.clone();
-        let my_name_for_demote = node_name.clone();
+        let my_name_for_promote = worker_name.clone();
+        let my_name_for_demote = worker_name.clone();
 
         let on_became: ff_agent::leader_tick::OnBecameLeader = std::sync::Arc::new(
             move |prev: Option<String>| {
@@ -2266,7 +2266,7 @@ async fn start_pulse_v2_subsystems(
             ff_agent::ha::pg_failover::PostgresFailoverManager::new(pg_pool.clone(), computer_id),
         );
         info!(
-            node = %node_name,
+            node = %worker_name,
             computer_id = %computer_id,
             disabled = ff_agent::ha::pg_failover::DISABLE_ENV,
             "pg_failover manager constructed (auto-failover enabled unless {} is set)",
@@ -2277,7 +2277,7 @@ async fn start_pulse_v2_subsystems(
             pg_pool.clone(),
             pulse_reader,
             computer_id,
-            node_name.clone(),
+            worker_name.clone(),
             election_priority,
         )
         .with_on_became_leader(on_became)
@@ -2286,7 +2286,7 @@ async fn start_pulse_v2_subsystems(
         handles.push(leader_tick.spawn(15, shutdown_rx.clone()));
     } else {
         info!(
-            node = %node_name,
+            node = %worker_name,
             "pulse v2: no fleet_members row — leader_tick NOT started (materializer + heartbeat_v2 still running)"
         );
     }
@@ -2299,14 +2299,14 @@ async fn start_pulse_v2_subsystems(
     // backup task into leader_tick's on_became_leader / on_lost_leader
     // callbacks.
     info!(
-        node = %node_name,
+        node = %worker_name,
         computer_id = %computer_id,
         "starting subsystem: backup orchestrator (pg=4h, redis=2h)"
     );
     let backup = ff_agent::ha::backup::BackupOrchestrator::new(
         pg_pool.clone(),
         computer_id,
-        node_name.clone(),
+        worker_name.clone(),
         None,
     );
     handles.push(backup.spawn(shutdown_rx.clone()));
@@ -2317,13 +2317,13 @@ async fn start_pulse_v2_subsystems(
     match ff_pulse::reader::PulseReader::new(&redis_url.clone()) {
         Ok(metrics_reader) => {
             info!(
-                node = %node_name.clone(),
+                node = %worker_name.clone(),
                 "starting subsystem: metrics downsampler (60s, leader-gated)"
             );
             let dsamp = ff_agent::metrics_downsampler::MetricsDownsampler::new(
                 pg_pool.clone(),
                 metrics_reader,
-                node_name.clone(),
+                worker_name.clone(),
             );
             handles.push(dsamp.spawn(shutdown_rx.clone()));
         }
@@ -2334,13 +2334,13 @@ async fn start_pulse_v2_subsystems(
     match ff_pulse::reader::PulseReader::new(&redis_url.clone()) {
         Ok(alert_reader) => {
             info!(
-                node = %node_name.clone(),
+                node = %worker_name.clone(),
                 "starting subsystem: alert evaluator (60s, leader-gated)"
             );
             let evaluator = ff_agent::alert_evaluator::AlertEvaluator::new(
                 pg_pool.clone(),
                 alert_reader,
-                node_name.clone(),
+                worker_name.clone(),
             );
             handles.push(evaluator.spawn(shutdown_rx.clone()));
         }
@@ -2354,11 +2354,11 @@ async fn start_pulse_v2_subsystems(
     // checking only happens when an operator runs
     // `ff software auto-upgrade-run-once --force` manually.
     info!(
-        node = %node_name.clone(),
+        node = %worker_name.clone(),
         "starting subsystem: auto-upgrade tick (hourly, leader-gated)"
     );
     let auto_upgrade_tick =
-        ff_agent::auto_upgrade::AutoUpgradeTick::new(pg_pool.clone(), node_name.clone());
+        ff_agent::auto_upgrade::AutoUpgradeTick::new(pg_pool.clone(), worker_name.clone());
     handles.push(auto_upgrade_tick.spawn(shutdown_rx.clone()));
 
     // (9) fleet_tasks worker — every daemon polls fleet_tasks for shell
@@ -2367,12 +2367,12 @@ async fn start_pulse_v2_subsystems(
     // the fleet. Capabilities derived below from os_family + name +
     // local probes for redis-cli / hf-cli / etc.
     info!(
-        node = %node_name.clone(),
+        node = %worker_name.clone(),
         "starting subsystem: fleet_tasks worker (every 10s)"
     );
     {
         let pool = pg_pool.clone();
-        let name = node_name.clone();
+        let name = worker_name.clone();
         let shutdown = shutdown_rx.clone();
         tokio::spawn(async move {
             // Look up our computer_id + capabilities once.
@@ -2481,7 +2481,7 @@ async fn start_pulse_v2_subsystems(
     info!("starting subsystem: work-item processor (every 5s)");
     {
         let pool = pg_pool.clone();
-        let name = node_name.clone();
+        let name = worker_name.clone();
         let mut shutdown = shutdown_rx.clone();
         tokio::spawn(async move {
             let row: Option<uuid::Uuid> =
@@ -2577,7 +2577,7 @@ async fn start_pulse_v2_subsystems(
     info!("starting subsystem: fleet_tasks leader watchdog (every 60s)");
     handles.push(ff_agent::task_runner::spawn_leader_watchdog(
         pg_pool.clone(),
-        node_name.clone(),
+        worker_name.clone(),
         shutdown_rx.clone(),
     ));
 
@@ -2586,12 +2586,12 @@ async fn start_pulse_v2_subsystems(
     info!("starting subsystem: work-item watchdog + steal loop");
     handles.push(ff_agent::work_stealer::spawn_work_item_watchdog(
         pg_pool.clone(),
-        node_name.clone(),
+        worker_name.clone(),
         shutdown_rx.clone(),
     ));
     {
         let pool = pg_pool.clone();
-        let name = node_name.clone();
+        let name = worker_name.clone();
         let shutdown = shutdown_rx.clone();
         tokio::spawn(async move {
             let row: Option<uuid::Uuid> =
@@ -2623,7 +2623,7 @@ async fn start_pulse_v2_subsystems(
     info!("starting subsystem: shared workspace cleanup (daily, leader-gated)");
     {
         let pool = pg_pool.clone();
-        let name = node_name.clone();
+        let name = worker_name.clone();
         let mut shutdown = shutdown_rx.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(24 * 3600));
@@ -2678,7 +2678,7 @@ async fn start_pulse_v2_subsystems(
     info!("starting subsystem: vault sync (hourly, leader-gated)");
     {
         let pool = pg_pool.clone();
-        let name = node_name.clone();
+        let name = worker_name.clone();
         let mut shutdown = shutdown_rx.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
@@ -2751,10 +2751,10 @@ fn start_mcp_http_subsystem(config: FleetConfig) -> JoinHandle<()> {
 
 fn build_embedded_agent_config(
     config: &FleetConfig,
-    node_name: String,
+    worker_name: String,
 ) -> ff_agent::EmbeddedAgentConfig {
     ff_agent::EmbeddedAgentConfig {
-        node_name,
+        worker_name,
         autonomous_mode: config.agent.autonomous_mode,
         poll_interval_secs: config.agent.poll_interval_secs,
         ownership_api_base_url: config.agent.ownership_api_base_url.clone(),
@@ -2769,15 +2769,15 @@ async fn build_api_config(config: &FleetConfig, pg_pool: Option<&ff_db::PgPool>)
     let mut backends = Vec::new();
 
     // 1) Node-level model mapping from fleet.toml (may be empty when all config is in Postgres)
-    for (node_name, node_cfg) in &config.nodes {
+    for (worker_name, node_cfg) in &config.nodes {
         for (model_slug, model_cfg) in &node_cfg.models {
             let port = model_cfg.port.unwrap_or(config.fleet.api_port);
             let is_local = !model_slug.starts_with("gpt")
                 && !model_slug.starts_with("claude")
                 && !model_slug.starts_with("gemini");
             backends.push(BackendEndpoint {
-                id: format!("{}:{}:{}", node_name, model_slug, port),
-                node: node_name.clone(),
+                id: format!("{}:{}:{}", worker_name, model_slug, port),
+                node: worker_name.clone(),
                 host: node_cfg.ip.clone(),
                 port,
                 model: model_slug.clone(),
@@ -2805,13 +2805,13 @@ async fn build_api_config(config: &FleetConfig, pg_pool: Option<&ff_db::PgPool>)
         .collect();
 
     for model in &config.models {
-        for node_name in &model.nodes {
+        for worker_name in &model.nodes {
             let (host, port) = node_by_name
-                .get(node_name.as_str())
+                .get(worker_name.as_str())
                 .copied()
                 .unwrap_or(("127.0.0.1", config.fleet.api_port));
 
-            let id = format!("{}:{}:{}", node_name, model.id, port);
+            let id = format!("{}:{}:{}", worker_name, model.id, port);
             if backends.iter().any(|b| b.id == id) {
                 continue;
             }
@@ -2821,7 +2821,7 @@ async fn build_api_config(config: &FleetConfig, pg_pool: Option<&ff_db::PgPool>)
                 && !model.id.starts_with("gemini");
             backends.push(BackendEndpoint {
                 id,
-                node: node_name.clone(),
+                node: worker_name.clone(),
                 host: host.to_string(),
                 port,
                 model: model.id.clone(),
@@ -2849,9 +2849,9 @@ async fn build_api_config(config: &FleetConfig, pg_pool: Option<&ff_db::PgPool>)
 
         if let Ok(db_models) = ff_db::pg_list_models(pool).await {
             for m in db_models {
-                if let Some(host) = node_ips.get(&m.node_name) {
+                if let Some(host) = node_ips.get(&m.worker_name) {
                     let port = m.port as u16;
-                    let id = format!("{}:{}:{}", m.node_name, m.slug, port);
+                    let id = format!("{}:{}:{}", m.worker_name, m.slug, port);
                     if backends.iter().any(|b| b.id == id) {
                         continue;
                     }
@@ -2860,7 +2860,7 @@ async fn build_api_config(config: &FleetConfig, pg_pool: Option<&ff_db::PgPool>)
                         && !m.slug.starts_with("gemini");
                     backends.push(BackendEndpoint {
                         id,
-                        node: m.node_name.clone(),
+                        node: m.worker_name.clone(),
                         host: host.clone(),
                         port,
                         model: m.slug.clone(),
@@ -2873,7 +2873,7 @@ async fn build_api_config(config: &FleetConfig, pg_pool: Option<&ff_db::PgPool>)
                         cost_per_1k_output: if is_local { 0.0 } else { 0.003 },
                     });
                     info!(
-                        node = %m.node_name,
+                        node = %m.worker_name,
                         model = %m.slug,
                         host,
                         port,
@@ -2930,7 +2930,7 @@ mod tests {
 
         assert!(!embedded.autonomous_mode);
         assert_eq!(embedded.poll_interval_secs, 8);
-        assert_eq!(embedded.node_name, "taylor");
+        assert_eq!(embedded.worker_name, "taylor");
     }
 
     #[test]
@@ -2953,7 +2953,7 @@ ownership_api_base_url = "http://127.0.0.1:7777"
             embedded.ownership_api_base_url.as_deref(),
             Some("http://127.0.0.1:7777")
         );
-        assert_eq!(embedded.node_name, "james");
+        assert_eq!(embedded.worker_name, "james");
     }
 
     #[test]

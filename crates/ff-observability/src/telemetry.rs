@@ -66,7 +66,7 @@ pub struct TelemetryConfig {
 
     /// Node name — injected into every log line for fleet-wide correlation.
     #[serde(default)]
-    pub node_name: Option<String>,
+    pub worker_name: Option<String>,
 
     /// Optional file logging configuration.
     /// If omitted, file logging is disabled.
@@ -100,7 +100,7 @@ impl Default for TelemetryConfig {
             include_spans: true,
             include_location: false,
             service_name: default_service_name(),
-            node_name: None,
+            worker_name: None,
             file_log: None,
             enable_opentelemetry: false,
         }
@@ -251,7 +251,7 @@ pub fn init_telemetry(config: &TelemetryConfig) -> anyhow::Result<()> {
 
     tracing::info!(
         service = %config.service_name,
-        node = ?config.node_name,
+        node = ?config.worker_name,
         json = config.json,
         file_logging = file_logging_enabled,
         otel = config.enable_opentelemetry,
@@ -408,7 +408,7 @@ where
 
     tracing::info!(
         service = %config.service_name,
-        node = ?config.node_name,
+        node = ?config.worker_name,
         json = config.json,
         file_logging = file_logging_enabled,
         otel = config.enable_opentelemetry,

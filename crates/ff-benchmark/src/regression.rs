@@ -278,7 +278,7 @@ mod tests {
             finished_at: Utc::now(),
             endpoint_results: vec![EndpointRunResult {
                 endpoint: BenchmarkEndpoint {
-                    node_name: endpoint_name.to_string(),
+                    worker_name: endpoint_name.to_string(),
                     base_url: "http://localhost:8080".to_string(),
                     default_model: Some("qwen".to_string()),
                     api_key: None,

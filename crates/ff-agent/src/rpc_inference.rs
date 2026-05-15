@@ -48,7 +48,7 @@ pub struct RpcClusterConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RpcControllerConfig {
-    pub node_name: String,
+    pub worker_name: String,
     pub bind_port: u16,
     /// GPU layers on controller (0 = CPU only on controller).
     pub gpu_layers: u32,
@@ -56,7 +56,7 @@ pub struct RpcControllerConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RpcWorkerConfig {
-    pub node_name: String,
+    pub worker_name: String,
     pub address: String,
     pub port: u16,
     pub memory_gb: u32,
@@ -91,7 +91,7 @@ impl RpcClusterManager {
         }
 
         info!(
-            controller = %config.controller.node_name,
+            controller = %config.controller.worker_name,
             workers = config.workers.len(),
             total_memory_gb = total_memory,
             model = %config.model,
@@ -160,7 +160,7 @@ impl RpcClusterManager {
         let worker = config
             .workers
             .iter()
-            .find(|w| w.node_name == worker_name)
+            .find(|w| w.worker_name == worker_name)
             .ok_or_else(|| anyhow::anyhow!("Worker '{worker_name}' not found in cluster config"))?;
 
         Ok(vec![
@@ -185,25 +185,25 @@ impl RpcClusterManager {
     pub fn example_dgx_spark_cluster() -> RpcClusterConfig {
         RpcClusterConfig {
             controller: RpcControllerConfig {
-                node_name: "sia".into(),
+                worker_name: "sia".into(),
                 bind_port: 51000,
                 gpu_layers: 999, // offload everything to GPU
             },
             workers: vec![
                 RpcWorkerConfig {
-                    node_name: "adele".into(),
+                    worker_name: "adele".into(),
                     address: "192.168.5.110".into(),
                     port: 50052,
                     memory_gb: 128,
                 },
                 RpcWorkerConfig {
-                    node_name: "rihanna".into(),
+                    worker_name: "rihanna".into(),
                     address: "192.168.5.112".into(),
                     port: 50052,
                     memory_gb: 128,
                 },
                 RpcWorkerConfig {
-                    node_name: "beyonce".into(),
+                    worker_name: "beyonce".into(),
                     address: "192.168.5.114".into(),
                     port: 50052,
                     memory_gb: 128,
@@ -219,25 +219,25 @@ impl RpcClusterManager {
     pub fn example_evo_x2_cluster() -> RpcClusterConfig {
         RpcClusterConfig {
             controller: RpcControllerConfig {
-                node_name: "evo1".into(),
+                worker_name: "evo1".into(),
                 bind_port: 51000,
                 gpu_layers: 999,
             },
             workers: vec![
                 RpcWorkerConfig {
-                    node_name: "evo2".into(),
+                    worker_name: "evo2".into(),
                     address: "192.168.5.120".into(),
                     port: 50052,
                     memory_gb: 128,
                 },
                 RpcWorkerConfig {
-                    node_name: "evo3".into(),
+                    worker_name: "evo3".into(),
                     address: "192.168.5.122".into(),
                     port: 50052,
                     memory_gb: 128,
                 },
                 RpcWorkerConfig {
-                    node_name: "evo4".into(),
+                    worker_name: "evo4".into(),
                     address: "192.168.5.124".into(),
                     port: 50052,
                     memory_gb: 128,

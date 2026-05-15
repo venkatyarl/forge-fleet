@@ -53,11 +53,11 @@ pub async fn load_model(pool: &sqlx::PgPool, opts: LoadOptions) -> Result<LoadRe
         .find(|r| r.id == opts.library_id)
         .ok_or_else(|| format!("no library entry with id '{}'", opts.library_id))?;
 
-    let node_name = crate::fleet_info::resolve_this_node_name().await;
-    if lib.node_name != node_name {
+    let worker_name = crate::fleet_info::resolve_this_node_name().await;
+    if lib.worker_name != worker_name {
         return Err(format!(
             "library row is on '{}', but we're running on '{}'; cross-node load not implemented",
-            lib.node_name, node_name
+            lib.worker_name, worker_name
         ));
     }
 
@@ -158,7 +158,7 @@ pub async fn load_model(pool: &sqlx::PgPool, opts: LoadOptions) -> Result<LoadRe
     // Upsert deployment row.
     let deployment_id = ff_db::pg_upsert_deployment(
         pool,
-        &node_name,
+        &worker_name,
         Some(&lib.id),
         Some(&lib.catalog_id),
         runtime_label,
@@ -190,8 +190,8 @@ pub async fn load_model(pool: &sqlx::PgPool, opts: LoadOptions) -> Result<LoadRe
 /// Stop a running inference server tracked under `deployment_id`.
 /// SIGTERM first (up to 10s), then SIGKILL. Deletes the deployment row on success.
 pub async fn unload_model(pool: &sqlx::PgPool, deployment_id: &str) -> Result<(), String> {
-    let node_name = crate::fleet_info::resolve_this_node_name().await;
-    let deployments = ff_db::pg_list_deployments(pool, Some(&node_name))
+    let worker_name = crate::fleet_info::resolve_this_node_name().await;
+    let deployments = ff_db::pg_list_deployments(pool, Some(&worker_name))
         .await
         .map_err(|e| format!("pg_list_deployments: {e}"))?;
     let dep = deployments
@@ -295,8 +295,8 @@ pub async fn health_check_deployment(
     pool: &sqlx::PgPool,
     deployment_id: &str,
 ) -> Result<bool, String> {
-    let node_name = crate::fleet_info::resolve_this_node_name().await;
-    let deployments = ff_db::pg_list_deployments(pool, Some(&node_name))
+    let worker_name = crate::fleet_info::resolve_this_node_name().await;
+    let deployments = ff_db::pg_list_deployments(pool, Some(&worker_name))
         .await
         .map_err(|e| format!("pg_list_deployments: {e}"))?;
     let dep = deployments

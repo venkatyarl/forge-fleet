@@ -65,7 +65,7 @@ pub struct SubTaskResult {
     /// Which model handled this.
     pub model_id: Option<String>,
     /// Which node handled this.
-    pub node_name: Option<String>,
+    pub worker_name: Option<String>,
     /// When execution started.
     pub started_at: Option<DateTime<Utc>>,
     /// When execution completed.
@@ -82,7 +82,7 @@ impl SubTaskResult {
         subtask_id: Uuid,
         output: impl Into<String>,
         model_id: impl Into<String>,
-        node_name: impl Into<String>,
+        worker_name: impl Into<String>,
         started_at: DateTime<Utc>,
         duration_ms: u64,
     ) -> Self {
@@ -92,7 +92,7 @@ impl SubTaskResult {
             output: output.into(),
             error: None,
             model_id: Some(model_id.into()),
-            node_name: Some(node_name.into()),
+            worker_name: Some(worker_name.into()),
             started_at: Some(started_at),
             completed_at: Some(Utc::now()),
             duration_ms: Some(duration_ms),
@@ -105,7 +105,7 @@ impl SubTaskResult {
         subtask_id: Uuid,
         error: impl Into<String>,
         model_id: Option<String>,
-        node_name: Option<String>,
+        worker_name: Option<String>,
     ) -> Self {
         Self {
             subtask_id,
@@ -113,7 +113,7 @@ impl SubTaskResult {
             output: String::new(),
             error: Some(error.into()),
             model_id,
-            node_name,
+            worker_name,
             started_at: None,
             completed_at: Some(Utc::now()),
             duration_ms: None,
@@ -129,7 +129,7 @@ impl SubTaskResult {
             output: String::new(),
             error: Some(reason.into()),
             model_id: None,
-            node_name: None,
+            worker_name: None,
             started_at: None,
             completed_at: Some(Utc::now()),
             duration_ms: None,
@@ -443,11 +443,11 @@ mod tests {
         RouteDecision {
             subtask_id,
             model_id: "test-model".into(),
-            node_name: "test-node".into(),
+            worker_name: "test-node".into(),
             endpoint: "127.0.0.1:51800".into(),
             score: crate::router::ModelScore {
                 model_id: "test-model".into(),
-                node_name: "test-node".into(),
+                worker_name: "test-node".into(),
                 specialty_score: 1.0,
                 health_score: 1.0,
                 load_score: 1.0,
@@ -473,7 +473,7 @@ mod tests {
                     subtask_id,
                     "mock output",
                     route.model_id,
-                    route.node_name,
+                    route.worker_name,
                     Utc::now(),
                     10,
                 )

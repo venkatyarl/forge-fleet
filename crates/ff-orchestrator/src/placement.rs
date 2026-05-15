@@ -60,13 +60,13 @@ impl AntiAffinityRule {
     }
 
     /// Record that a task from this project is on the given node.
-    pub fn mark_node(&mut self, node_name: impl Into<String>) {
-        self.occupied_nodes.insert(node_name.into());
+    pub fn mark_node(&mut self, worker_name: impl Into<String>) {
+        self.occupied_nodes.insert(worker_name.into());
     }
 
     /// Check if the node already has a task from this project.
-    pub fn is_occupied(&self, node_name: &str) -> bool {
-        self.occupied_nodes.contains(node_name)
+    pub fn is_occupied(&self, worker_name: &str) -> bool {
+        self.occupied_nodes.contains(worker_name)
     }
 }
 
@@ -77,7 +77,7 @@ impl AntiAffinityRule {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NodeWorkloadPreference {
     /// Node name.
-    pub node_name: String,
+    pub worker_name: String,
     /// Workload types this node prefers (e.g. ["coding", "review", "build"]).
     pub preferred_workloads: Vec<String>,
 }
@@ -129,20 +129,20 @@ impl PlacementEngine {
     }
 
     /// Update anti-affinity: mark that a project has a task on a node.
-    pub fn mark_project_on_node(&mut self, project: &str, node_name: &str) {
+    pub fn mark_project_on_node(&mut self, project: &str, worker_name: &str) {
         if let Some(rule) = self.anti_affinity.iter_mut().find(|r| r.project == project) {
-            rule.mark_node(node_name);
+            rule.mark_node(worker_name);
         } else {
             let mut rule = AntiAffinityRule::new(project);
-            rule.mark_node(node_name);
+            rule.mark_node(worker_name);
             self.anti_affinity.push(rule);
         }
     }
 
     /// Clear anti-affinity state for a project on a node (when task completes).
-    pub fn clear_project_on_node(&mut self, project: &str, node_name: &str) {
+    pub fn clear_project_on_node(&mut self, project: &str, worker_name: &str) {
         if let Some(rule) = self.anti_affinity.iter_mut().find(|r| r.project == project) {
-            rule.occupied_nodes.remove(node_name);
+            rule.occupied_nodes.remove(worker_name);
         }
     }
 
@@ -174,7 +174,7 @@ impl PlacementEngine {
 
         // Anti-affinity penalty: reduce score if project already has a task on this node
         let anti_affinity_factor = if let Some(project) = &task.project {
-            if self.is_project_on_node(project, &node.node_name) {
+            if self.is_project_on_node(project, &node.worker_name) {
                 0.5 // Halve the score — still possible, but strongly disfavored
             } else {
                 1.0
@@ -184,7 +184,7 @@ impl PlacementEngine {
         };
 
         // Preferred node bonus (from task.preferred_nodes)
-        let preferred_bonus = if task.preferred_nodes.contains(&node.node_name) {
+        let preferred_bonus = if task.preferred_nodes.contains(&node.worker_name) {
             1.2
         } else {
             1.0
@@ -193,7 +193,7 @@ impl PlacementEngine {
         let final_score = base_score * anti_affinity_factor * preferred_bonus;
 
         debug!(
-            node = %node.node_name,
+            node = %node.worker_name,
             policy = ?self.policy,
             base = base_score,
             anti_affinity = anti_affinity_factor,
@@ -227,7 +227,7 @@ impl PlacementEngine {
             if let Some(pref) = self
                 .node_preferences
                 .iter()
-                .find(|p| p.node_name == node.node_name)
+                .find(|p| p.worker_name == node.worker_name)
             {
                 if pref.prefers(workload_type) {
                     // Affinity match: boost significantly
@@ -240,10 +240,10 @@ impl PlacementEngine {
     }
 
     /// Check if a project has a running task on a node.
-    fn is_project_on_node(&self, project: &str, node_name: &str) -> bool {
+    fn is_project_on_node(&self, project: &str, worker_name: &str) -> bool {
         self.anti_affinity
             .iter()
-            .any(|r| r.project == project && r.is_occupied(node_name))
+            .any(|r| r.project == project && r.is_occupied(worker_name))
     }
 }
 
@@ -330,7 +330,7 @@ mod tests {
         let mut engine = PlacementEngine::new(PlacementPolicy::Affinity);
 
         engine.add_node_preference(NodeWorkloadPreference {
-            node_name: "james".to_string(),
+            worker_name: "james".to_string(),
             preferred_workloads: vec!["coding".to_string(), "build".to_string()],
         });
 
@@ -447,7 +447,7 @@ mod tests {
     #[test]
     fn test_workload_preference_case_insensitive() {
         let pref = NodeWorkloadPreference {
-            node_name: "james".to_string(),
+            worker_name: "james".to_string(),
             preferred_workloads: vec!["Coding".to_string()],
         };
         assert!(pref.prefers("coding"));

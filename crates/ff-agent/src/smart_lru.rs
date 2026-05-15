@@ -45,7 +45,7 @@ impl Default for LruPolicy {
 #[derive(Debug, Clone)]
 pub struct EvictionCandidate {
     pub library_id: String,
-    pub node_name: String,
+    pub worker_name: String,
     pub catalog_id: String,
     pub runtime: String,
     pub file_path: String,
@@ -68,22 +68,22 @@ pub struct EvictionPlan {
 /// to free. Returns an empty plan if the node isn't actually over quota.
 pub async fn plan_eviction(
     pool: &sqlx::PgPool,
-    node_name: &str,
+    worker_name: &str,
     policy: &LruPolicy,
 ) -> Result<EvictionPlan, String> {
     // Fetch latest disk usage row for this node.
     let usage = ff_db::pg_latest_disk_usage(pool)
         .await
         .map_err(|e| format!("pg_latest_disk_usage: {e}"))?;
-    let node_usage = usage.iter().find(|(n, ..)| n == node_name);
+    let node_usage = usage.iter().find(|(n, ..)| n == worker_name);
     let (total, used, _free) = match node_usage {
         Some((_, _, total, used, free, _, _)) => (*total as u64, *used as u64, *free as u64),
         None => return Ok(EvictionPlan::default()), // no disk sample yet
     };
-    let node = ff_db::pg_get_node(pool, node_name)
+    let node = ff_db::pg_get_node(pool, worker_name)
         .await
         .map_err(|e| format!("pg_get_node: {e}"))?
-        .ok_or_else(|| format!("node '{node_name}' not in fleet_workers"))?;
+        .ok_or_else(|| format!("node '{worker_name}' not in fleet_workers"))?;
     let quota_bytes = (total as f64 * node.disk_quota_pct as f64 / 100.0) as u64;
 
     // Nothing to do if not over quota.
@@ -104,16 +104,16 @@ pub async fn plan_eviction(
         peer_copies
             .entry((row.catalog_id.clone(), row.runtime.clone()))
             .or_default()
-            .push(row.node_name.clone());
+            .push(row.worker_name.clone());
     }
     // Keep per-node library (the candidate pool).
     let node_lib: Vec<&ff_db::ModelLibraryRow> = all_lib
         .iter()
-        .filter(|r| r.node_name == node_name)
+        .filter(|r| r.worker_name == worker_name)
         .collect();
 
     // Deployments on this node — rows referenced here are off-limits.
-    let deployments = ff_db::pg_list_deployments(pool, Some(node_name))
+    let deployments = ff_db::pg_list_deployments(pool, Some(worker_name))
         .await
         .map_err(|e| format!("pg_list_deployments: {e}"))?;
     let locked_ids: std::collections::HashSet<String> = deployments
@@ -146,7 +146,7 @@ pub async fn plan_eviction(
         // Peer-copy bonus: if another node has this (catalog_id, runtime), eviction is cheap.
         let key = (row.catalog_id.clone(), row.runtime.clone());
         if let Some(peers) = peer_copies.get(&key) {
-            let others: Vec<&String> = peers.iter().filter(|n| *n != node_name).collect();
+            let others: Vec<&String> = peers.iter().filter(|n| *n != worker_name).collect();
             if !others.is_empty() {
                 score *= 1.5;
                 reasons.push(format!("peer-copies={}", others.len()));
@@ -161,7 +161,7 @@ pub async fn plan_eviction(
 
         candidates.push(EvictionCandidate {
             library_id: row.id.clone(),
-            node_name: row.node_name.clone(),
+            worker_name: row.worker_name.clone(),
             catalog_id: row.catalog_id.clone(),
             runtime: row.runtime.clone(),
             file_path: row.file_path.clone(),

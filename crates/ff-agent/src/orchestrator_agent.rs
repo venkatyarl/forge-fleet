@@ -62,7 +62,7 @@ pub async fn fleet_capabilities() -> Vec<NodeCapability> {
         let node_models: Vec<&ff_db::FleetModelRow> = snapshot
             .models
             .iter()
-            .filter(|m| m.node_name == node.name)
+            .filter(|m| m.worker_name == node.name)
             .collect();
 
         if node_models.is_empty() {

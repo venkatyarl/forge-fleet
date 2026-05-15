@@ -1106,7 +1106,7 @@ pub async fn handle_daemon(
         match ff_agent::disk_sampler::sample_local_disk(&pool).await {
             Ok(s) => println!(
                 "{CYAN}[disk]{RESET} {} total={}MB used={}MB free={}MB models={}MB quota={}%{}",
-                s.node_name,
+                s.worker_name,
                 s.total_bytes / 1_048_576,
                 s.used_bytes / 1_048_576,
                 s.free_bytes / 1_048_576,
@@ -1192,7 +1192,7 @@ pub async fn handle_daemon(
     match ff_agent::disk_sampler::sample_local_disk(&pool).await {
         Ok(s) => println!(
             "{CYAN}[disk]{RESET} {} total={}MB used={}MB free={}MB models={}MB quota={}%{}",
-            s.node_name,
+            s.worker_name,
             s.total_bytes / 1_048_576,
             s.used_bytes / 1_048_576,
             s.free_bytes / 1_048_576,
@@ -1308,7 +1308,7 @@ pub async fn handle_daemon(
                 match ff_agent::disk_sampler::sample_local_disk(&pool).await {
                     Ok(s) => println!(
                         "{CYAN}[disk]{RESET} {} total={}MB used={}MB free={}MB models={}MB quota={}%{}",
-                        s.node_name,
+                        s.worker_name,
                         s.total_bytes / 1_048_576,
                         s.used_bytes / 1_048_576,
                         s.free_bytes / 1_048_576,

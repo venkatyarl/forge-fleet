@@ -15,25 +15,25 @@ use crate::metrics::{LoadedModel, NodeMetrics};
 /// Publishes periodic heartbeats containing system metrics to Redis.
 pub struct HeartbeatPublisher {
     client: PulseClient,
-    node_name: String,
+    worker_name: String,
     interval: Duration,
     http_client: reqwest::Client,
 }
 
 impl HeartbeatPublisher {
     /// Create a new heartbeat publisher.
-    pub fn new(client: PulseClient, node_name: String, interval: Duration) -> Self {
+    pub fn new(client: PulseClient, worker_name: String, interval: Duration) -> Self {
         Self {
             client,
-            node_name,
+            worker_name,
             interval,
             http_client: reqwest::Client::new(),
         }
     }
 
     /// Create with the default 15-second interval.
-    pub fn with_defaults(client: PulseClient, node_name: String) -> Self {
-        Self::new(client, node_name, Duration::from_secs(15))
+    pub fn with_defaults(client: PulseClient, worker_name: String) -> Self {
+        Self::new(client, worker_name, Duration::from_secs(15))
     }
 
     /// Spawn the heartbeat loop as a background tokio task.
@@ -44,22 +44,22 @@ impl HeartbeatPublisher {
         tokio::spawn(async move {
             info!(
                 "Heartbeat publisher started for '{}' (interval: {:?})",
-                self.node_name, self.interval
+                self.worker_name, self.interval
             );
 
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(self.interval) => {
                         let metrics = self.collect_local_metrics().await;
-                        if let Err(e) = self.client.publish_metrics(&self.node_name, &metrics).await {
+                        if let Err(e) = self.client.publish_metrics(&self.worker_name, &metrics).await {
                             error!("Failed to publish heartbeat: {e}");
                         } else {
-                            debug!("Heartbeat published for '{}'", self.node_name);
+                            debug!("Heartbeat published for '{}'", self.worker_name);
                         }
                     }
                     _ = shutdown.changed() => {
                         if *shutdown.borrow() {
-                            info!("Heartbeat publisher for '{}' shutting down", self.node_name);
+                            info!("Heartbeat publisher for '{}' shutting down", self.worker_name);
                             break;
                         }
                     }
@@ -94,7 +94,7 @@ impl HeartbeatPublisher {
         let loaded_models = self.scan_local_models().await;
 
         NodeMetrics {
-            node_name: self.node_name.clone(),
+            worker_name: self.worker_name.clone(),
             timestamp: Utc::now(),
             cpu_percent,
             ram_used_gb,

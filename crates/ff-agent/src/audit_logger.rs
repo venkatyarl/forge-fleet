@@ -4,7 +4,7 @@
 //! - agent_id, session_id, step_id
 //! - tool_name, params_json, prompt_hash
 //! - outcome (success | failure | denied | timeout)
-//! - duration_ms, node_name
+//! - duration_ms, worker_name
 //!
 //! Designed for compliance tracing and security review.
 
@@ -47,13 +47,13 @@ pub async fn log_tool_call(
     outcome: ToolOutcome,
     error: Option<&str>,
     duration_ms: Option<u64>,
-    node_name: &str,
+    worker_name: &str,
 ) {
     let result = sqlx::query(
         r#"
         INSERT INTO tool_audit_log (
             session_id, step_id, agent_id, tool_name, params_json,
-            prompt_hash, outcome, error, duration_ms, node_name
+            prompt_hash, outcome, error, duration_ms, worker_name
         )
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         "#,
@@ -67,7 +67,7 @@ pub async fn log_tool_call(
     .bind(outcome.as_str())
     .bind(error)
     .bind(duration_ms.map(|d| d as i64))
-    .bind(node_name)
+    .bind(worker_name)
     .execute(pg)
     .await;
 

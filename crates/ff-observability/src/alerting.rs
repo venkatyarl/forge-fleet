@@ -256,12 +256,12 @@ impl AlertEngine {
                     for entry in metrics.node_metrics.iter() {
                         let nm = entry.value();
                         if let Some(ref targets) = rule.target_nodes
-                            && !targets.contains(&nm.node_name)
+                            && !targets.contains(&nm.worker_name)
                         {
                             continue;
                         }
                         if nm.cpu_percent >= *threshold_percent {
-                            let dedup_key = format!("{}:{}", rule.id, nm.node_name);
+                            let dedup_key = format!("{}:{}", rule.id, nm.worker_name);
                             if !self.active_alerts.contains_key(&dedup_key) {
                                 let alert = Alert {
                                     id: Uuid::new_v4(),
@@ -269,9 +269,9 @@ impl AlertEngine {
                                     severity: rule.severity,
                                     message: format!(
                                         "{}: CPU at {:.1}% on {}",
-                                        rule.name, nm.cpu_percent, nm.node_name
+                                        rule.name, nm.cpu_percent, nm.worker_name
                                     ),
-                                    node: Some(nm.node_name.clone()),
+                                    node: Some(nm.worker_name.clone()),
                                     model_id: None,
                                     fired_at: Utc::now(),
                                     resolved_at: None,
@@ -288,13 +288,13 @@ impl AlertEngine {
                     for entry in metrics.node_metrics.iter() {
                         let nm = entry.value();
                         if let Some(ref targets) = rule.target_nodes
-                            && !targets.contains(&nm.node_name)
+                            && !targets.contains(&nm.worker_name)
                         {
                             continue;
                         }
                         let util = nm.memory_utilization();
                         if util >= *threshold_ratio {
-                            let dedup_key = format!("{}:{}", rule.id, nm.node_name);
+                            let dedup_key = format!("{}:{}", rule.id, nm.worker_name);
                             if !self.active_alerts.contains_key(&dedup_key) {
                                 let alert = Alert {
                                     id: Uuid::new_v4(),
@@ -304,9 +304,9 @@ impl AlertEngine {
                                         "{}: memory at {:.0}% on {}",
                                         rule.name,
                                         util * 100.0,
-                                        nm.node_name
+                                        nm.worker_name
                                     ),
-                                    node: Some(nm.node_name.clone()),
+                                    node: Some(nm.worker_name.clone()),
                                     model_id: None,
                                     fired_at: Utc::now(),
                                     resolved_at: None,
@@ -328,7 +328,8 @@ impl AlertEngine {
                             continue;
                         }
                         if mm.error_rate() >= *threshold_ratio {
-                            let dedup_key = format!("{}:{}@{}", rule.id, mm.model_id, mm.node_name);
+                            let dedup_key =
+                                format!("{}:{}@{}", rule.id, mm.model_id, mm.worker_name);
                             if !self.active_alerts.contains_key(&dedup_key) {
                                 let alert = Alert {
                                     id: Uuid::new_v4(),
@@ -339,9 +340,9 @@ impl AlertEngine {
                                         rule.name,
                                         mm.error_rate() * 100.0,
                                         mm.model_id,
-                                        mm.node_name
+                                        mm.worker_name
                                     ),
-                                    node: Some(mm.node_name.clone()),
+                                    node: Some(mm.worker_name.clone()),
                                     model_id: Some(mm.model_id.clone()),
                                     fired_at: Utc::now(),
                                     resolved_at: None,
@@ -524,7 +525,7 @@ mod tests {
 
     fn hot_node(name: &str, cpu: f64) -> NodeMetrics {
         NodeMetrics {
-            node_name: name.to_string(),
+            worker_name: name.to_string(),
             cpu_percent: cpu,
             memory_used_gib: 10.0,
             memory_total_gib: 64.0,

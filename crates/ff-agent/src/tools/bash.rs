@@ -194,13 +194,13 @@ async fn rewrite_fleet_ssh(command: &str) -> String {
 
     // Match "ssh into <nodename>" pattern
     if trimmed.starts_with("ssh into ") || trimmed.starts_with("ssh to ") {
-        let node_name = trimmed.split_whitespace().last().unwrap_or("");
-        if let Some((ip, user)) = fleet_node_ip(node_name).await
+        let worker_name = trimmed.split_whitespace().last().unwrap_or("");
+        if let Some((ip, user)) = fleet_node_ip(worker_name).await
             && is_valid_ip(&ip)
             && is_valid_username(&user)
         {
             return format!(
-                "ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no {user}@{ip} 'echo \"=== {node_name} ({ip}) ===\" && hostname && uptime && uname -sr'"
+                "ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no {user}@{ip} 'echo \"=== {worker_name} ({ip}) ===\" && hostname && uptime && uname -sr'"
             );
         }
     }

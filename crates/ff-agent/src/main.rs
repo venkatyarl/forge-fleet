@@ -217,7 +217,7 @@ async fn run_tool_registry_reporter(
         .collect();
 
     let register_body = serde_json::json!({
-        "node_name": node_id,
+        "worker_name": node_id,
         "tools": tools,
     });
 
@@ -246,7 +246,7 @@ async fn run_tool_registry_reporter(
             }
         }
 
-        let heartbeat_body = serde_json::json!({"node_name": node_id});
+        let heartbeat_body = serde_json::json!({"worker_name": node_id});
         let heartbeat_url = format!("{}/api/tools/heartbeat", gateway);
         match client
             .post(&heartbeat_url)

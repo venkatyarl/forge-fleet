@@ -157,7 +157,7 @@ pub async fn fleet_status(params: Option<Value>) -> HandlerResult {
                 Ok(snapshot) => snapshot
                     .nodes
                     .into_iter()
-                    .map(|m| (m.node_name.clone(), m))
+                    .map(|m| (m.worker_name.clone(), m))
                     .collect(),
                 Err(e) => {
                     warn!("fleet_status: Redis pulse fetch failed (non-fatal): {e}");
@@ -176,12 +176,12 @@ pub async fn fleet_status(params: Option<Value>) -> HandlerResult {
     let mut offline_nodes = 0usize;
     let mut models_loaded = 0usize;
 
-    // Group Postgres models by node_name for easy lookup
+    // Group Postgres models by worker_name for easy lookup
     let models_by_node: HashMap<String, Vec<&FleetModelRow>> =
         if let Some(ref db_models) = pg_models {
             let mut map: HashMap<String, Vec<&FleetModelRow>> = HashMap::new();
             for m in db_models {
-                map.entry(m.node_name.clone()).or_default().push(m);
+                map.entry(m.worker_name.clone()).or_default().push(m);
             }
             map
         } else {
@@ -1839,7 +1839,7 @@ pub async fn fleet_models_library(params: Option<Value>) -> HandlerResult {
         .map(|r| {
             json!({
                 "id": r.id,
-                "node_name": r.node_name,
+                "worker_name": r.worker_name,
                 "catalog_id": r.catalog_id,
                 "runtime": r.runtime,
                 "quant": r.quant,
@@ -1878,7 +1878,7 @@ pub async fn fleet_models_deployments(params: Option<Value>) -> HandlerResult {
         .map(|r| {
             json!({
                 "id": r.id,
-                "node_name": r.node_name,
+                "worker_name": r.worker_name,
                 "library_id": r.library_id,
                 "catalog_id": r.catalog_id,
                 "runtime": r.runtime,
@@ -1914,9 +1914,9 @@ pub async fn fleet_models_disk_usage(_params: Option<Value>) -> HandlerResult {
     let items: Vec<Value> = rows
         .iter()
         .map(
-            |(node_name, models_dir, total, used, free, models, sampled_at)| {
+            |(worker_name, models_dir, total, used, free, models, sampled_at)| {
                 json!({
-                    "node_name": node_name,
+                    "worker_name": worker_name,
                     "models_dir": models_dir,
                     "total_bytes": total,
                     "used_bytes": used,
@@ -2437,7 +2437,7 @@ fn resolve_ssh_node(
 fn backends_from_config(config: &FleetConfig) -> Vec<BackendEndpoint> {
     let mut endpoints = Vec::new();
 
-    for (node_name, node_cfg) in &config.nodes {
+    for (worker_name, node_cfg) in &config.nodes {
         for (slug, model) in &node_cfg.models {
             let Some(port) = model.port.or(node_cfg.port) else {
                 continue;
@@ -2453,8 +2453,8 @@ fn backends_from_config(config: &FleetConfig) -> Vec<BackendEndpoint> {
                 && !model_name.starts_with("claude")
                 && !model_name.starts_with("gemini");
             endpoints.push(BackendEndpoint {
-                id: format!("{}:{}:{}", node_name, slug, port),
-                node: node_name.clone(),
+                id: format!("{}:{}:{}", worker_name, slug, port),
+                node: worker_name.clone(),
                 host: node_cfg.ip.clone(),
                 port,
                 model: model_name,

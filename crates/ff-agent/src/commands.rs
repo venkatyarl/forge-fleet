@@ -230,7 +230,7 @@ impl Command for ModelCommand {
                 }
                 // Prefer the first match; find the node to get its IP
                 let chosen = matches[0];
-                let node = snapshot.nodes.iter().find(|n| n.name == chosen.node_name);
+                let node = snapshot.nodes.iter().find(|n| n.name == chosen.worker_name);
                 match node {
                     Some(node) => {
                         let url = format!("http://{}:{}", node.ip, chosen.port);
@@ -239,7 +239,7 @@ impl Command for ModelCommand {
                         let others: Vec<_> = matches
                             .iter()
                             .skip(1)
-                            .map(|m| m.node_name.as_str())
+                            .map(|m| m.worker_name.as_str())
                             .collect();
                         let also = if others.is_empty() {
                             String::new()
@@ -248,12 +248,12 @@ impl Command for ModelCommand {
                         };
                         format!(
                             "Switched to {} on {} @ {}{}",
-                            chosen.name, chosen.node_name, url, also
+                            chosen.name, chosen.worker_name, url, also
                         )
                     }
                     None => format!(
                         "Found model '{target}' but node '{}' is not registered.",
-                        chosen.node_name
+                        chosen.worker_name
                     ),
                 }
             }

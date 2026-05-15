@@ -164,11 +164,11 @@ pub fn validate_fleet_config(
                 .push(format!("model '{}' has no bound nodes", model.id));
         }
 
-        for node_name in &model.nodes {
-            if !node_names.contains(node_name) {
+        for worker_name in &model.nodes {
+            if !node_names.contains(worker_name) {
                 return Err(ControlError::BootstrapValidation(format!(
                     "model '{}' references unknown node '{}'",
-                    model.id, node_name
+                    model.id, worker_name
                 )));
             }
         }

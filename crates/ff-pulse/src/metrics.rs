@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 /// If the key expires, the node is considered offline.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeMetrics {
-    pub node_name: String,
+    pub worker_name: String,
     pub timestamp: DateTime<Utc>,
     pub cpu_percent: f64,
     pub ram_used_gb: f64,
@@ -39,7 +39,7 @@ pub struct FleetSnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PulseEvent {
     pub event_type: PulseEventType,
-    pub node_name: String,
+    pub worker_name: String,
     pub timestamp: DateTime<Utc>,
     pub details: serde_json::Value,
 }

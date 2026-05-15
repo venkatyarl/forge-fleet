@@ -47,7 +47,7 @@ pub fn pulse_beats_to_fleet_state(
             continue;
         }
 
-        let node_name = beat.computer_name.clone();
+        let worker_name = beat.computer_name.clone();
         let node = beat_to_node(&beat);
         let load = beat_to_load(&beat);
 
@@ -55,12 +55,12 @@ pub fn pulse_beats_to_fleet_state(
             if server.status != "active" || !server.is_healthy {
                 continue;
             }
-            let model = server_to_model(server, &node_name, catalog);
+            let model = server_to_model(server, &worker_name, catalog);
             models.push(model);
         }
 
         nodes.push(node);
-        loads.insert(node_name, load);
+        loads.insert(worker_name, load);
     }
 
     (nodes, models, loads)
@@ -162,7 +162,7 @@ fn beat_to_load(beat: &PulseBeatV2) -> OrchestratorNodeLoad {
 
 fn server_to_model(
     server: &LlmServer,
-    node_name: &str,
+    worker_name: &str,
     catalog: &HashMap<String, (String, i32)>,
 ) -> CoreModel {
     let id = server.model.id.clone();
@@ -191,7 +191,7 @@ fn server_to_model(
         path: server.model.loaded_path.clone(),
         ctx_size: server.model.context_window.max(0) as u32,
         runtime,
-        nodes: vec![node_name.to_string()],
+        nodes: vec![worker_name.to_string()],
     }
 }
 
@@ -316,7 +316,7 @@ pub fn build_dispatch_fn(
                             output: String::new(),
                             error: Some(format!("HTTP dispatch failed: {e}")),
                             model_id: Some(decision.model_id),
-                            node_name: Some(decision.node_name),
+                            worker_name: Some(decision.worker_name),
                             started_at: Some(started_at),
                             completed_at: Some(Utc::now()),
                             duration_ms: Some((Utc::now() - started_at).num_milliseconds() as u64),
@@ -338,7 +338,7 @@ pub fn build_dispatch_fn(
                             output: String::new(),
                             error: Some(format!("Failed to read response body: {e}")),
                             model_id: Some(decision.model_id),
-                            node_name: Some(decision.node_name),
+                            worker_name: Some(decision.worker_name),
                             started_at: Some(started_at),
                             completed_at: Some(Utc::now()),
                             duration_ms: Some((Utc::now() - started_at).num_milliseconds() as u64),
@@ -357,7 +357,7 @@ pub fn build_dispatch_fn(
                         output: String::new(),
                         error: Some(format!("Upstream returned {status_code}: {body_text}")),
                         model_id: Some(decision.model_id),
-                        node_name: Some(decision.node_name),
+                        worker_name: Some(decision.worker_name),
                         started_at: Some(started_at),
                         completed_at: Some(Utc::now()),
                         duration_ms: Some((Utc::now() - started_at).num_milliseconds() as u64),
@@ -375,7 +375,7 @@ pub fn build_dispatch_fn(
                             output: body_text,
                             error: None,
                             model_id: Some(decision.model_id),
-                            node_name: Some(decision.node_name),
+                            worker_name: Some(decision.worker_name),
                             started_at: Some(started_at),
                             completed_at: Some(Utc::now()),
                             duration_ms: Some((Utc::now() - started_at).num_milliseconds() as u64),
@@ -419,7 +419,7 @@ pub fn build_dispatch_fn(
                 let record = TokenUsageRecord::new(
                     uuid::Uuid::new_v4().to_string(),
                     &decision.model_id,
-                    &decision.node_name,
+                    &decision.worker_name,
                 )
                 .with_tokens(prompt_tokens, completion_tokens)
                 .with_cost(0.0, true) // fleet inference is local / free
@@ -447,7 +447,7 @@ pub fn build_dispatch_fn(
                     output: content,
                     error: None,
                     model_id: Some(decision.model_id),
-                    node_name: Some(decision.node_name),
+                    worker_name: Some(decision.worker_name),
                     started_at: Some(started_at),
                     completed_at: Some(Utc::now()),
                     duration_ms: Some(latency_ms),

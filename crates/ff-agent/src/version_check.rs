@@ -110,7 +110,7 @@ fn return_also(_k: &str, _v: &str) { /* helper hook for tracing; noop */
 
 /// Full roundtrip: merge current + latest, write to fleet_workers.tooling.
 pub async fn version_check_pass(pool: &PgPool) -> Result<DriftSummary, String> {
-    let node_name = crate::fleet_info::resolve_this_node_name().await;
+    let worker_name = crate::fleet_info::resolve_this_node_name().await;
     let current = collect_current().await;
     let keys: Vec<&str> = current.keys().map(|s| s.as_str()).collect();
     let client = match reqwest::Client::builder()
@@ -149,7 +149,7 @@ pub async fn version_check_pass(pool: &PgPool) -> Result<DriftSummary, String> {
     let tooling = serde_json::Value::Object(tooling_obj);
 
     // Read existing row, update tooling, upsert back.
-    if let Some(mut row) = ff_db::pg_get_node(pool, &node_name)
+    if let Some(mut row) = ff_db::pg_get_node(pool, &worker_name)
         .await
         .map_err(|e| format!("pg_get_node: {e}"))?
     {
@@ -161,10 +161,10 @@ pub async fn version_check_pass(pool: &PgPool) -> Result<DriftSummary, String> {
 
     // Best-effort Redis publish when drift is real.
     if !drifted.is_empty() {
-        let _ = crate::fleet_events::publish_node_online(&format!("drift:{node_name}")).await;
+        let _ = crate::fleet_events::publish_node_online(&format!("drift:{worker_name}")).await;
         // Enqueue one operator-triggered upgrade task per (node, tool) pair,
         // de-duplicated against any already-pending task for the same pair.
-        let _ = enqueue_upgrade_tasks(pool, &node_name, &drifted, &current, &latest).await;
+        let _ = enqueue_upgrade_tasks(pool, &worker_name, &drifted, &current, &latest).await;
     }
 
     Ok(DriftSummary {

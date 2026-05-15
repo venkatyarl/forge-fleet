@@ -293,10 +293,10 @@ impl OperationalStore {
         }
     }
 
-    pub async fn claim_next_task(&self, node_name: &str) -> Result<Option<TaskRow>, DbError> {
+    pub async fn claim_next_task(&self, worker_name: &str) -> Result<Option<TaskRow>, DbError> {
         match self {
             Self::Sqlite(pool) => {
-                let node = node_name.to_string();
+                let node = worker_name.to_string();
                 pool.with_conn_mut(move |conn| queries::claim_next_task(conn, &node))
                     .await
             }
@@ -334,7 +334,7 @@ impl OperationalStore {
                     SELECT * FROM updated
                     "#,
                 )
-                .bind(node_name)
+                .bind(worker_name)
                 .bind(&now)
                 .fetch_optional(pool.as_ref())
                 .await?;
@@ -540,7 +540,7 @@ impl OperationalStore {
         actor: &str,
         target: Option<&str>,
         details_json: &str,
-        node_name: Option<&str>,
+        worker_name: Option<&str>,
     ) -> Result<i64, DbError> {
         match self {
             Self::Sqlite(pool) => {
@@ -548,7 +548,7 @@ impl OperationalStore {
                 let actor = actor.to_string();
                 let target = target.map(ToString::to_string);
                 let details_json = details_json.to_string();
-                let node_name = node_name.map(ToString::to_string);
+                let worker_name = worker_name.map(ToString::to_string);
 
                 pool.with_conn(move |conn| {
                     queries::audit_log(
@@ -557,7 +557,7 @@ impl OperationalStore {
                         &actor,
                         target.as_deref(),
                         &details_json,
-                        node_name.as_deref(),
+                        worker_name.as_deref(),
                     )
                 })
                 .await
@@ -571,7 +571,7 @@ impl OperationalStore {
                         actor,
                         target,
                         details_json,
-                        node_name
+                        worker_name
                     )
                     VALUES ($1, $2, $3, $4, $5, $6)
                     RETURNING id
@@ -582,7 +582,7 @@ impl OperationalStore {
                 .bind(actor)
                 .bind(target)
                 .bind(details_json)
-                .bind(node_name)
+                .bind(worker_name)
                 .fetch_one(pool.as_ref())
                 .await?;
 
@@ -608,7 +608,7 @@ impl OperationalStore {
                         actor,
                         target,
                         details_json,
-                        node_name
+                        worker_name
                     FROM audit_log
                     ORDER BY id DESC
                     LIMIT $1
@@ -1052,7 +1052,7 @@ impl OperationalStore {
                 id            TEXT PRIMARY KEY,
                 channel       TEXT NOT NULL DEFAULT 'unknown',
                 user_id       TEXT,
-                node_name     TEXT,
+                worker_name     TEXT,
                 status        TEXT NOT NULL DEFAULT 'active',
                 metadata_json TEXT NOT NULL DEFAULT '{}',
                 created_at    TEXT NOT NULL,
@@ -1110,7 +1110,7 @@ impl OperationalStore {
                 actor        TEXT NOT NULL DEFAULT 'system',
                 target       TEXT,
                 details_json TEXT NOT NULL DEFAULT '{}',
-                node_name    TEXT
+                worker_name    TEXT
             )
             "#,
         )
@@ -1198,7 +1198,7 @@ fn map_postgres_audit_row(row: sqlx::postgres::PgRow) -> Result<AuditLogRow, DbE
         actor: row.try_get("actor")?,
         target: row.try_get("target")?,
         details_json: row.try_get("details_json")?,
-        node_name: row.try_get("node_name")?,
+        worker_name: row.try_get("worker_name")?,
     })
 }
 

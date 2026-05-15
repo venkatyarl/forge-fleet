@@ -103,7 +103,7 @@ pub struct LeaderDaemon {
     /// Fleet configuration.
     config: Arc<FleetConfig>,
     /// This node's name.
-    node_name: String,
+    worker_name: String,
     /// Registered workers, keyed by node ID.
     workers: Arc<DashMap<Uuid, TrackedWorker>>,
     /// Resource pool for fleet-wide resource tracking.
@@ -122,7 +122,7 @@ pub struct LeaderDaemon {
 
 impl LeaderDaemon {
     /// Create a new leader daemon.
-    pub fn new(config: FleetConfig, node_name: String) -> Self {
+    pub fn new(config: FleetConfig, worker_name: String) -> Self {
         let config = Arc::new(config);
         let workers: Arc<DashMap<Uuid, TrackedWorker>> = Arc::new(DashMap::new());
         let resource_pool = Arc::new(ResourcePool::new());
@@ -131,13 +131,15 @@ impl LeaderDaemon {
             Arc::clone(&workers),
             Arc::clone(&resource_pool),
         ));
-        let election_manager =
-            Arc::new(ElectionManager::new(Arc::clone(&config), node_name.clone()));
+        let election_manager = Arc::new(ElectionManager::new(
+            Arc::clone(&config),
+            worker_name.clone(),
+        ));
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         Self {
             config,
-            node_name,
+            worker_name,
             workers,
             resource_pool,
             scheduler,
@@ -275,7 +277,7 @@ impl LeaderDaemon {
             })
             .collect();
 
-        check_failover(&self.node_name, &self.config, &node_health)
+        check_failover(&self.worker_name, &self.config, &node_health)
     }
 
     /// Submit a task to the work queue and attempt to schedule it.

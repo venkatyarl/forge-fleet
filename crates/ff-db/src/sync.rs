@@ -81,7 +81,7 @@ pub struct SyncConfig {
     /// This node's role.
     pub role: SyncRole,
     /// Human-readable node name (used in snapshot metadata).
-    pub node_name: String,
+    pub worker_name: String,
     /// Base URL of the leader node (required for followers).
     /// Example: `http://192.168.5.100:8787`
     pub leader_url: Option<String>,
@@ -95,7 +95,7 @@ impl Default for SyncConfig {
     fn default() -> Self {
         Self {
             role: SyncRole::Follower,
-            node_name: "unknown".into(),
+            worker_name: "unknown".into(),
             leader_url: None,
             sync_interval: Duration::from_secs(30),
             snapshot_dir: PathBuf::from("snapshots"),
@@ -140,7 +140,7 @@ impl LeaderSync {
             .unwrap_or(0);
 
         info!(
-            node = %config.node_name,
+            node = %config.worker_name,
             sequence = current_seq,
             "leader sync initialized"
         );
@@ -168,13 +168,13 @@ impl LeaderSync {
             .config
             .snapshot_dir
             .join(format!("snapshot_{new_seq}.db"));
-        let node_name = self.config.node_name.clone();
+        let worker_name = self.config.worker_name.clone();
         let sp = snapshot_path.clone();
 
         // Create the snapshot inside a pool connection.
         let meta = self
             .pool
-            .with_conn(move |conn| create_snapshot(conn, &sp, &node_name, new_seq))
+            .with_conn(move |conn| create_snapshot(conn, &sp, &worker_name, new_seq))
             .await?;
 
         // Persist the new sequence number.
@@ -303,7 +303,7 @@ impl FollowerSync {
             .map_err(|e| DbError::Replication(format!("failed to build HTTP client: {e}")))?;
 
         info!(
-            node = %config.node_name,
+            node = %config.worker_name,
             leader = config.leader_url.as_deref().unwrap_or("?"),
             "follower sync initialized"
         );
@@ -711,7 +711,7 @@ mod tests {
     fn leader_config(dir: &Path) -> SyncConfig {
         SyncConfig {
             role: SyncRole::Leader,
-            node_name: "test-leader".into(),
+            worker_name: "test-leader".into(),
             leader_url: None,
             sync_interval: Duration::from_secs(5),
             snapshot_dir: dir.join("snapshots"),
@@ -882,7 +882,7 @@ mod tests {
         let pool = setup_pool(dir.path());
         let config = SyncConfig {
             role: SyncRole::Follower,
-            node_name: "test-follower".into(),
+            worker_name: "test-follower".into(),
             leader_url: None,
             sync_interval: Duration::from_secs(5),
             snapshot_dir: dir.path().join("snapshots"),
@@ -898,7 +898,7 @@ mod tests {
         let pool = setup_pool(dir.path());
         let config = SyncConfig {
             role: SyncRole::Follower,
-            node_name: "test-follower".into(),
+            worker_name: "test-follower".into(),
             leader_url: Some("http://localhost:8787".into()),
             sync_interval: Duration::from_secs(5),
             snapshot_dir: dir.path().join("snapshots"),

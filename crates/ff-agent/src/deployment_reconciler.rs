@@ -25,13 +25,13 @@ pub struct ReconcileSummary {
 
 /// Run one reconcile pass. Returns counts for logging.
 pub async fn reconcile_local(pool: &sqlx::PgPool) -> Result<ReconcileSummary, String> {
-    let node_name = crate::fleet_info::resolve_this_node_name().await;
+    let worker_name = crate::fleet_info::resolve_this_node_name().await;
 
     // 1. Snapshot what's actually running on this host.
     let procs = crate::model_runtime::list_local_processes().await;
 
     // 2. Snapshot what the DB thinks is deployed on this host.
-    let db_rows = ff_db::pg_list_deployments(pool, Some(&node_name))
+    let db_rows = ff_db::pg_list_deployments(pool, Some(&worker_name))
         .await
         .map_err(|e| format!("pg_list_deployments: {e}"))?;
 
@@ -39,7 +39,7 @@ pub async fn reconcile_local(pool: &sqlx::PgPool) -> Result<ReconcileSummary, St
     let db_by_port: HashMap<i32, &ff_db::ModelDeploymentRow> =
         db_rows.iter().map(|r| (r.port, r)).collect();
 
-    let libs = ff_db::pg_list_library(pool, Some(&node_name))
+    let libs = ff_db::pg_list_library(pool, Some(&worker_name))
         .await
         .map_err(|e| format!("pg_list_library: {e}"))?;
 
@@ -111,7 +111,7 @@ pub async fn reconcile_local(pool: &sqlx::PgPool) -> Result<ReconcileSummary, St
 
             match ff_db::pg_upsert_deployment(
                 pool,
-                &node_name,
+                &worker_name,
                 library_id.as_deref(),
                 catalog_id.as_deref(),
                 &proc_info.runtime,

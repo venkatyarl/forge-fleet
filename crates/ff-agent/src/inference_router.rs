@@ -227,8 +227,10 @@ async fn build_endpoint_list(config_path: &Path, client: &reqwest::Client) -> Ve
                     continue;
                 }
 
-                let node_models: Vec<_> =
-                    models.iter().filter(|m| m.node_name == node.name).collect();
+                let node_models: Vec<_> = models
+                    .iter()
+                    .filter(|m| m.worker_name == node.name)
+                    .collect();
                 if node_models.is_empty() {
                     candidates.push((
                         node.ip.clone(),

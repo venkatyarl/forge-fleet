@@ -262,7 +262,7 @@ fn sanitize_name(keyword: &str) -> String {
 /// Leader-gated via Postgres `fleet_leader_state`.
 pub fn spawn_consolidation_loop(
     pg: PgPool,
-    node_name: String,
+    worker_name: String,
     interval_secs: u64,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
@@ -280,7 +280,7 @@ pub fn spawn_consolidation_loop(
                         )
                         "#
                     )
-                    .bind(&node_name)
+                    .bind(&worker_name)
                     .fetch_one(&pg)
                     .await
                     .unwrap_or(false);

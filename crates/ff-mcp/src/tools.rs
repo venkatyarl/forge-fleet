@@ -564,7 +564,7 @@ impl ToolRegistry {
     fn fleet_models_library() -> ToolDefinition {
         ToolDefinition {
             name: "fleet_models_library".to_string(),
-            description: "List models actually on disk across fleet nodes. Returns node_name, catalog_id, runtime, quant, file_path, size_bytes. Optionally filter to a single node.".to_string(),
+            description: "List models actually on disk across fleet nodes. Returns worker_name, catalog_id, runtime, quant, file_path, size_bytes. Optionally filter to a single node.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -581,7 +581,7 @@ impl ToolRegistry {
     fn fleet_models_deployments() -> ToolDefinition {
         ToolDefinition {
             name: "fleet_models_deployments".to_string(),
-            description: "List currently running model deployments across the fleet. Returns node_name, catalog_id, runtime, port, health_status, started_at. Optionally filter to a single node.".to_string(),
+            description: "List currently running model deployments across the fleet. Returns worker_name, catalog_id, runtime, port, health_status, started_at. Optionally filter to a single node.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -598,7 +598,7 @@ impl ToolRegistry {
     fn fleet_models_disk_usage() -> ToolDefinition {
         ToolDefinition {
             name: "fleet_models_disk_usage".to_string(),
-            description: "Latest disk usage sample per fleet node. Returns node_name, total_gb, used_gb, free_gb, models_gb, sampled_at.".to_string(),
+            description: "Latest disk usage sample per fleet node. Returns worker_name, total_gb, used_gb, free_gb, models_gb, sampled_at.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {},

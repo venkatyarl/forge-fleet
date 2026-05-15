@@ -90,7 +90,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     id              TEXT PRIMARY KEY,               -- UUID
     channel         TEXT NOT NULL DEFAULT 'unknown', -- telegram | discord | slack | web
     user_id         TEXT,                             -- external user ID
-    node_name       TEXT,                             -- which node handles this session
+    worker_name       TEXT,                             -- which node handles this session
     status          TEXT NOT NULL DEFAULT 'active',   -- active | closed | expired
     metadata_json   TEXT NOT NULL DEFAULT '{}',
     created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
@@ -140,7 +140,7 @@ CREATE TABLE IF NOT EXISTS audit_log (
     actor           TEXT NOT NULL DEFAULT 'system',    -- who triggered it
     target          TEXT,                              -- what was affected
     details_json    TEXT NOT NULL DEFAULT '{}',
-    node_name       TEXT                               -- where it happened
+    worker_name       TEXT                               -- where it happened
 );
 
 CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_log(timestamp);
@@ -311,7 +311,7 @@ CREATE TABLE IF NOT EXISTS fleet_workers (
 -- Replaces [nodes.*.models.*] sections in fleet.toml.
 CREATE TABLE IF NOT EXISTS fleet_models (
     id              TEXT PRIMARY KEY,
-    node_name       TEXT NOT NULL REFERENCES fleet_workers(name),
+    worker_name       TEXT NOT NULL REFERENCES fleet_workers(name),
     slug            TEXT NOT NULL,
     name            TEXT NOT NULL,
     family          TEXT NOT NULL DEFAULT '',
@@ -323,10 +323,10 @@ CREATE TABLE IF NOT EXISTS fleet_models (
     preferred_workloads JSONB NOT NULL DEFAULT '[]',
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE(node_name, slug)
+    UNIQUE(worker_name, slug)
 );
 
-CREATE INDEX IF NOT EXISTS idx_fleet_models_node ON fleet_models(node_name);
+CREATE INDEX IF NOT EXISTS idx_fleet_models_node ON fleet_models(worker_name);
 
 -- ─── Fleet Settings ───────────────────────────────────────────────────────
 -- Replaces [general], [scheduling], [ports], [llm], [enrollment], etc.
@@ -546,16 +546,16 @@ pub const SCHEMA_V12_ONBOARDING: &str = r#"
 -- SSH public keys per node. Separate from fleet_workers so we can stash both
 -- the daemon user's pubkey AND the machine's host keys (multiple per node).
 CREATE TABLE IF NOT EXISTS fleet_node_ssh_keys (
-    node_name    TEXT NOT NULL REFERENCES fleet_workers(name) ON DELETE CASCADE,
+    worker_name    TEXT NOT NULL REFERENCES fleet_workers(name) ON DELETE CASCADE,
     key_purpose  TEXT NOT NULL,             -- 'user' | 'host'
     public_key   TEXT NOT NULL,             -- full OpenSSH format line
     key_type     TEXT NOT NULL,             -- 'ed25519' | 'rsa' | 'ecdsa'
     fingerprint  TEXT NOT NULL,             -- sha256:... from ssh-keygen -lf
     added_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (node_name, fingerprint)
+    PRIMARY KEY (worker_name, fingerprint)
 );
 CREATE INDEX IF NOT EXISTS idx_ssh_keys_node_purpose
-    ON fleet_node_ssh_keys (node_name, key_purpose);
+    ON fleet_node_ssh_keys (worker_name, key_purpose);
 
 -- Bidirectional SSH reachability matrix. One row per ordered (src, dst) pair.
 -- Written by the mesh-propagation deferred task and the periodic re-verify
@@ -616,7 +616,7 @@ CREATE TABLE IF NOT EXISTS fleet_model_catalog (
 -- Library: what's on disk per node (one row per {node, catalog_id, variant}).
 CREATE TABLE IF NOT EXISTS fleet_model_library (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    node_name       TEXT NOT NULL REFERENCES fleet_workers(name) ON DELETE CASCADE,
+    worker_name       TEXT NOT NULL REFERENCES fleet_workers(name) ON DELETE CASCADE,
     catalog_id      TEXT NOT NULL,                           -- may reference fleet_model_catalog.id
     runtime         TEXT NOT NULL,                           -- 'llama.cpp' | 'mlx' | 'vllm'
     quant           TEXT,                                    -- e.g. 'Q4_K_M' or '4bit'
@@ -626,16 +626,16 @@ CREATE TABLE IF NOT EXISTS fleet_model_library (
     downloaded_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     last_used_at    TIMESTAMPTZ,
     source_url      TEXT,                                    -- e.g. hf://repo or local path
-    UNIQUE (node_name, file_path)
+    UNIQUE (worker_name, file_path)
 );
 
-CREATE INDEX IF NOT EXISTS idx_model_library_node ON fleet_model_library (node_name);
+CREATE INDEX IF NOT EXISTS idx_model_library_node ON fleet_model_library (worker_name);
 CREATE INDEX IF NOT EXISTS idx_model_library_catalog ON fleet_model_library (catalog_id);
 
 -- Deployments: currently running llama-server / mlx_lm.server / vllm processes.
 CREATE TABLE IF NOT EXISTS fleet_model_deployments (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    node_name       TEXT NOT NULL REFERENCES fleet_workers(name) ON DELETE CASCADE,
+    worker_name       TEXT NOT NULL REFERENCES fleet_workers(name) ON DELETE CASCADE,
     library_id      UUID REFERENCES fleet_model_library(id) ON DELETE SET NULL,
     catalog_id      TEXT,                                    -- redundant but useful for offline queries
     runtime         TEXT NOT NULL,
@@ -647,17 +647,17 @@ CREATE TABLE IF NOT EXISTS fleet_model_deployments (
     context_window  INT,
     tokens_used     BIGINT NOT NULL DEFAULT 0,
     request_count   BIGINT NOT NULL DEFAULT 0,
-    UNIQUE (node_name, port)
+    UNIQUE (worker_name, port)
 );
 
-CREATE INDEX IF NOT EXISTS idx_model_deployments_node ON fleet_model_deployments (node_name);
+CREATE INDEX IF NOT EXISTS idx_model_deployments_node ON fleet_model_deployments (worker_name);
 CREATE INDEX IF NOT EXISTS idx_model_deployments_health ON fleet_model_deployments (health_status);
 
 -- Jobs: in-flight operations with progress tracking.
 -- Kinds: 'download' | 'delete' | 'load' | 'unload' | 'swap' | 'convert' | 'transfer' | 'verify'
 CREATE TABLE IF NOT EXISTS fleet_model_jobs (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    node_name       TEXT NOT NULL,
+    worker_name       TEXT NOT NULL,
     kind            TEXT NOT NULL,
     target_catalog_id TEXT,                                  -- for download/load/swap
     target_library_id UUID,                                  -- for delete/load/unload/convert
@@ -673,21 +673,21 @@ CREATE TABLE IF NOT EXISTS fleet_model_jobs (
     error_message   TEXT
 );
 
-CREATE INDEX IF NOT EXISTS idx_model_jobs_node_status ON fleet_model_jobs (node_name, status);
+CREATE INDEX IF NOT EXISTS idx_model_jobs_node_status ON fleet_model_jobs (worker_name, status);
 CREATE INDEX IF NOT EXISTS idx_model_jobs_created ON fleet_model_jobs (created_at DESC);
 
 -- Disk usage snapshots: periodic sampling of disk free/used for quota monitoring.
 CREATE TABLE IF NOT EXISTS fleet_disk_usage (
-    node_name       TEXT NOT NULL REFERENCES fleet_workers(name) ON DELETE CASCADE,
+    worker_name       TEXT NOT NULL REFERENCES fleet_workers(name) ON DELETE CASCADE,
     sampled_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     models_dir      TEXT NOT NULL,
     total_bytes     BIGINT NOT NULL,
     used_bytes      BIGINT NOT NULL,
     free_bytes      BIGINT NOT NULL,
     models_bytes    BIGINT NOT NULL DEFAULT 0,               -- just the models dir
-    PRIMARY KEY (node_name, sampled_at)
+    PRIMARY KEY (worker_name, sampled_at)
 );
-CREATE INDEX IF NOT EXISTS idx_disk_usage_latest ON fleet_disk_usage (node_name, sampled_at DESC);
+CREATE INDEX IF NOT EXISTS idx_disk_usage_latest ON fleet_disk_usage (worker_name, sampled_at DESC);
 "#;
 
 pub const SCHEMA_V10_DEFERRED_TASKS: &str = r#"
@@ -5959,11 +5959,11 @@ CREATE INDEX IF NOT EXISTS idx_fleet_tasks_routing ON fleet_tasks(routing_mode, 
 
 pub const SCHEMA_V73_FLEET_TOOL_REGISTRY: &str = r#"
 -- ─── Fleet Tools ────────────────────────────────────────────────────────────
--- Every node registers its tools on startup. One row per (tool_name, node_name).
+-- Every node registers its tools on startup. One row per (tool_name, worker_name).
 CREATE TABLE IF NOT EXISTS fleet_tools (
     id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     tool_name           TEXT NOT NULL,
-    node_name           TEXT NOT NULL REFERENCES fleet_workers(name) ON DELETE CASCADE,
+    worker_name           TEXT NOT NULL REFERENCES fleet_workers(name) ON DELETE CASCADE,
     description         TEXT NOT NULL DEFAULT '',
     parameters_schema   JSONB NOT NULL DEFAULT '{}',
     capabilities_required TEXT[] NOT NULL DEFAULT '{}',
@@ -5971,18 +5971,18 @@ CREATE TABLE IF NOT EXISTS fleet_tools (
     call_count          INTEGER NOT NULL DEFAULT 0,
     avg_latency_ms      REAL,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE(tool_name, node_name)
+    UNIQUE(tool_name, worker_name)
 );
 
 CREATE INDEX IF NOT EXISTS idx_fleet_tools_name ON fleet_tools(tool_name);
-CREATE INDEX IF NOT EXISTS idx_fleet_tools_node_health ON fleet_tools(node_name, health_checked_at);
+CREATE INDEX IF NOT EXISTS idx_fleet_tools_node_health ON fleet_tools(worker_name, health_checked_at);
 
 -- ─── Fleet Tool Usage ───────────────────────────────────────────────────────
 -- Every tool invocation across the fleet is logged here for observability.
 CREATE TABLE IF NOT EXISTS fleet_tool_usage (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     tool_name       TEXT NOT NULL,
-    node_name       TEXT NOT NULL REFERENCES fleet_workers(name),
+    worker_name       TEXT NOT NULL REFERENCES fleet_workers(name),
     session_id      UUID REFERENCES agent_sessions(id),
     task_id         UUID,
     work_item_id    UUID,
@@ -5999,7 +5999,7 @@ CREATE TABLE IF NOT EXISTS fleet_tool_usage (
 );
 
 CREATE INDEX IF NOT EXISTS idx_tool_usage_tool ON fleet_tool_usage(tool_name, started_at);
-CREATE INDEX IF NOT EXISTS idx_tool_usage_node ON fleet_tool_usage(node_name, started_at);
+CREATE INDEX IF NOT EXISTS idx_tool_usage_node ON fleet_tool_usage(worker_name, started_at);
 CREATE INDEX IF NOT EXISTS idx_tool_usage_session ON fleet_tool_usage(session_id);
 "#;
 
@@ -6271,7 +6271,7 @@ CREATE TABLE IF NOT EXISTS tool_audit_log (
     outcome         TEXT NOT NULL CHECK (outcome IN ('success', 'failure', 'denied', 'timeout')),
     error           TEXT,
     duration_ms     INT,
-    node_name       TEXT,
+    worker_name       TEXT,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -6304,16 +6304,16 @@ END $$;
 
 -- If a fresh install never had the old name, create the new table directly.
 CREATE TABLE IF NOT EXISTS fleet_workers_ssh_keys (
-    node_name    TEXT NOT NULL REFERENCES fleet_workers(name) ON DELETE CASCADE,
+    worker_name    TEXT NOT NULL REFERENCES fleet_workers(name) ON DELETE CASCADE,
     key_purpose  TEXT NOT NULL,
     public_key   TEXT NOT NULL,
     key_type     TEXT NOT NULL,
     fingerprint  TEXT NOT NULL,
     added_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (node_name, fingerprint)
+    PRIMARY KEY (worker_name, fingerprint)
 );
 CREATE INDEX IF NOT EXISTS idx_workers_ssh_keys_node_purpose
-    ON fleet_workers_ssh_keys (node_name, key_purpose);
+    ON fleet_workers_ssh_keys (worker_name, key_purpose);
 
 -- Compatibility view for callers still on the old name during the upgrade
 -- window. Dropped in a future migration once all daemons have been pushed.
@@ -6325,7 +6325,7 @@ pub const SCHEMA_V83_RENAME_FLEET_NODES: &str = r#"
 -- ─── V83: rename fleet_workers → fleet_workers ───────────────────────────────
 -- Final step of the long-running fleet_workers → fleet_workers rename
 -- (see memory: fleet_workers_naming). The 8 existing FK columns
--- (`node_name`) continue to reference the renamed table — PostgreSQL
+-- (`worker_name`) continue to reference the renamed table — PostgreSQL
 -- updates FK targets automatically across ALTER TABLE RENAME.
 --
 -- A compatibility VIEW preserves the old name so the 131 unrenamed
@@ -6384,13 +6384,13 @@ CREATE OR REPLACE VIEW fleet_workers AS
 "#;
 
 pub const SCHEMA_V84_RENAME_NODE_NAME_COLUMN: &str = r#"
--- ─── V84: rename fleet_workers_ssh_keys.node_name → worker_name ────────────
+-- ─── V84: rename fleet_workers_ssh_keys.worker_name → worker_name ────────────
 -- Finishes the node → worker rename inside fleet_workers_ssh_keys. The FK
 -- to fleet_workers(name) is preserved automatically across the rename.
 --
 -- The fleet_node_ssh_keys compatibility view is rewritten to alias
--- `worker_name AS node_name` so any unrenamed callers (SELECT or
--- INSERT INTO ... (node_name, ...)) continue to work during the
+-- `worker_name AS worker_name` so any unrenamed callers (SELECT or
+-- INSERT INTO ... (worker_name, ...)) continue to work during the
 -- upgrade window. The view stays auto-updatable because the alias is
 -- a single-column rename of a base-table column.
 --
@@ -6400,9 +6400,9 @@ BEGIN
     IF EXISTS (
         SELECT 1 FROM information_schema.columns
         WHERE table_schema='public' AND table_name='fleet_workers_ssh_keys'
-          AND column_name='node_name'
+          AND column_name='worker_name'
     ) THEN
-        ALTER TABLE fleet_workers_ssh_keys RENAME COLUMN node_name TO worker_name;
+        ALTER TABLE fleet_workers_ssh_keys RENAME COLUMN worker_name TO worker_name;
     END IF;
 END $$;
 
@@ -6410,7 +6410,7 @@ END $$;
 DROP VIEW IF EXISTS fleet_node_ssh_keys;
 CREATE VIEW fleet_node_ssh_keys AS
     SELECT
-        worker_name AS node_name,
+        worker_name AS worker_name,
         key_purpose,
         public_key,
         key_type,
@@ -6429,6 +6429,39 @@ pub const SCHEMA_V85_DROP_COMPAT_VIEWS: &str = r#"
 -- Idempotent: views may not exist on fresh installs that never ran V82/V83.
 DROP VIEW IF EXISTS fleet_node_ssh_keys;
 DROP VIEW IF EXISTS fleet_nodes;
+"#;
+
+pub const SCHEMA_V87_RENAME_NODE_NAME_COLUMNS: &str = r#"
+-- ─── V87: rename worker_name → worker_name across the remaining tables ──────
+-- Plan 14's fleet_workers naming target leaked into many downstream tables
+-- that each had a `worker_name` column FK'd to fleet_workers(name). V82-V86
+-- handled the core registry; this migration finishes the column-side rename
+-- for: fleet_models, fleet_model_library, fleet_model_deployments,
+-- fleet_model_jobs, fleet_disk_usage, fleet_tools, fleet_tool_usage,
+-- sessions, audit_log, tool_audit_log.
+--
+-- No compat views — the Rust code update is shipped in the same commit
+-- (see the perl mass-rename + build verification).
+-- Idempotent: each ALTER is wrapped in a column-exists check.
+DO $$
+DECLARE
+    t TEXT;
+    tables TEXT[] := ARRAY[
+        'fleet_models', 'fleet_model_library', 'fleet_model_deployments',
+        'fleet_model_jobs', 'fleet_disk_usage', 'fleet_tools',
+        'fleet_tool_usage', 'sessions', 'audit_log', 'tool_audit_log'
+    ];
+BEGIN
+    FOREACH t IN ARRAY tables LOOP
+        IF EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema='public' AND table_name=t AND column_name='worker_name'
+        ) THEN
+            EXECUTE format('ALTER TABLE %I RENAME COLUMN worker_name TO worker_name', t);
+            RAISE NOTICE 'renamed % .worker_name → .worker_name', t;
+        END IF;
+    END LOOP;
+END $$;
 "#;
 
 pub const SCHEMA_V86_DROP_FLEET_MEMBERS: &str = r#"

@@ -676,7 +676,7 @@ async fn fleet_nodes_from_db() -> Vec<FleetNode> {
             // Deployments on this node.
             let mut node_models: Vec<NodeModel> = deployments
                 .iter()
-                .filter(|d| d.node_name == n.name)
+                .filter(|d| d.worker_name == n.name)
                 .map(|d| {
                     // Runtime resolution, most-specific first:
                     //   1. Prefix encoded in catalog_id ("mlx:gemma-4")
@@ -738,7 +738,7 @@ async fn fleet_nodes_from_db() -> Vec<FleetNode> {
             if node_models.is_empty() {
                 node_models = legacy_models
                     .iter()
-                    .filter(|m| m.node_name == n.name)
+                    .filter(|m| m.worker_name == n.name)
                     .map(|m| {
                         let (parsed_rt, raw_name) = split_runtime(&m.name);
                         // Same runtime-fallback as above — prefer the

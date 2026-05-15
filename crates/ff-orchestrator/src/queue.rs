@@ -210,8 +210,8 @@ impl PriorityQueue {
     /// Reserved tasks are skipped by `dequeue()` and `peek()` but remain
     /// in the queue for tracking. Call `confirm_reservation()` to remove
     /// or `cancel_reservation()` to un-reserve.
-    pub fn reserve(&mut self, task_id: Uuid, node_name: impl Into<String>) -> bool {
-        let node = node_name.into();
+    pub fn reserve(&mut self, task_id: Uuid, worker_name: impl Into<String>) -> bool {
+        let node = worker_name.into();
         if let Some(&priority) = self.index.get(&task_id) {
             if let Some(deque) = self.buckets.get_mut(&priority) {
                 if let Some(task) = deque.iter_mut().find(|t| t.id == task_id) {

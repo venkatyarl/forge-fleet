@@ -160,14 +160,14 @@ impl FleetConfig {
         self.nodes.get(name)
     }
 
-    /// Get all node-level model configs as `(node_name, model_slug, model_config)`.
+    /// Get all node-level model configs as `(worker_name, model_slug, model_config)`.
     pub fn all_node_models(&self) -> Vec<(&str, &str, &NodeModelConfig)> {
         self.nodes
             .iter()
-            .flat_map(|(node_name, node)| {
+            .flat_map(|(worker_name, node)| {
                 node.models
                     .iter()
-                    .map(move |(slug, model)| (node_name.as_str(), slug.as_str(), model))
+                    .map(move |(slug, model)| (worker_name.as_str(), slug.as_str(), model))
             })
             .collect()
     }

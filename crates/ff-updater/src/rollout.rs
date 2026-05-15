@@ -185,7 +185,7 @@ impl RolloutController {
             node_statuses.insert(
                 name.clone(),
                 NodeProgress {
-                    node_name: name.clone(),
+                    worker_name: name.clone(),
                     status: NodeUpdateStatus::Pending,
                     updated_at: None,
                     health_checked_at: None,
@@ -290,35 +290,35 @@ impl RolloutController {
     }
 
     /// Report that a node was successfully updated.
-    pub fn mark_node_updated(&mut self, node_name: &str) {
-        if let Some(np) = self.status.node_statuses.get_mut(node_name) {
+    pub fn mark_node_updated(&mut self, worker_name: &str) {
+        if let Some(np) = self.status.node_statuses.get_mut(worker_name) {
             np.status = NodeUpdateStatus::Updated;
             np.updated_at = Some(Utc::now());
         }
-        info!(node = node_name, "rollout: node updated");
+        info!(node = worker_name, "rollout: node updated");
         self.check_completion();
     }
 
     /// Report that a node's health check passed after update.
-    pub fn mark_node_healthy(&mut self, node_name: &str) {
-        if let Some(np) = self.status.node_statuses.get_mut(node_name) {
+    pub fn mark_node_healthy(&mut self, worker_name: &str) {
+        if let Some(np) = self.status.node_statuses.get_mut(worker_name) {
             np.status = NodeUpdateStatus::HealthCheckPassed;
             np.health_checked_at = Some(Utc::now());
         }
-        info!(node = node_name, "rollout: node healthy");
+        info!(node = worker_name, "rollout: node healthy");
         self.check_completion();
     }
 
     /// Report that a node failed (health check or update itself).
-    pub fn mark_node_failed(&mut self, node_name: &str, error: String) {
-        if let Some(np) = self.status.node_statuses.get_mut(node_name) {
+    pub fn mark_node_failed(&mut self, worker_name: &str, error: String) {
+        if let Some(np) = self.status.node_statuses.get_mut(worker_name) {
             np.status = NodeUpdateStatus::HealthCheckFailed;
             np.error = Some(error.clone());
         }
-        warn!(node = node_name, %error, "rollout: node failed");
+        warn!(node = worker_name, %error, "rollout: node failed");
 
         if self.status.plan.abort_on_failure {
-            self.abort_internal(format!("node {node_name} failed: {error}"));
+            self.abort_internal(format!("node {worker_name} failed: {error}"));
         }
     }
 

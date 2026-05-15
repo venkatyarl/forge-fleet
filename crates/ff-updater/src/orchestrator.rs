@@ -74,7 +74,7 @@ pub struct UpdateRecord {
     pub id: Uuid,
 
     /// Node this update is for.
-    pub node_name: String,
+    pub worker_name: String,
 
     /// Current state.
     pub state: UpdateState,
@@ -105,10 +105,10 @@ pub struct UpdateRecord {
 }
 
 impl UpdateRecord {
-    fn new(node_name: &str) -> Self {
+    fn new(worker_name: &str) -> Self {
         Self {
             id: Uuid::new_v4(),
-            node_name: node_name.to_string(),
+            worker_name: worker_name.to_string(),
             state: UpdateState::Idle,
             started_at: Utc::now(),
             completed_at: None,
@@ -182,7 +182,7 @@ impl Default for RollingUpdateConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrchestratorConfig {
     /// This node's name.
-    pub node_name: String,
+    pub worker_name: String,
 
     /// Checker configuration.
     pub checker: CheckerConfig,
@@ -349,9 +349,9 @@ impl UpdateOrchestrator {
     }
 
     /// Called by the fleet coordinator after a canary node has been updated.
-    pub fn report_canary_node_updated(&mut self, node_name: &str) {
+    pub fn report_canary_node_updated(&mut self, worker_name: &str) {
         if let Some(ref mut c) = self.canary {
-            c.mark_node_updated(node_name);
+            c.mark_node_updated(worker_name);
         }
     }
 
@@ -389,23 +389,23 @@ impl UpdateOrchestrator {
     }
 
     /// Report a rollout node as updated.
-    pub fn report_rollout_node_updated(&mut self, node_name: &str) {
+    pub fn report_rollout_node_updated(&mut self, worker_name: &str) {
         if let Some(ref mut r) = self.rollout {
-            r.mark_node_updated(node_name);
+            r.mark_node_updated(worker_name);
         }
     }
 
     /// Report a rollout node as healthy.
-    pub fn report_rollout_node_healthy(&mut self, node_name: &str) {
+    pub fn report_rollout_node_healthy(&mut self, worker_name: &str) {
         if let Some(ref mut r) = self.rollout {
-            r.mark_node_healthy(node_name);
+            r.mark_node_healthy(worker_name);
         }
     }
 
     /// Report a rollout node as failed.
-    pub fn report_rollout_node_failed(&mut self, node_name: &str, error: String) {
+    pub fn report_rollout_node_failed(&mut self, worker_name: &str, error: String) {
         if let Some(ref mut r) = self.rollout {
-            r.mark_node_failed(node_name, error);
+            r.mark_node_failed(worker_name, error);
         }
     }
 
@@ -466,9 +466,9 @@ impl UpdateOrchestrator {
             });
         }
 
-        let mut record = UpdateRecord::new(&self.config.node_name);
+        let mut record = UpdateRecord::new(&self.config.worker_name);
         record.state = UpdateState::Checking;
-        info!(node = %self.config.node_name, "starting update pipeline");
+        info!(node = %self.config.worker_name, "starting update pipeline");
 
         // ── Step 1: Check ────────────────────────────────────────────
         record.state = UpdateState::Checking;
@@ -607,7 +607,7 @@ impl UpdateOrchestrator {
 
     /// Trigger a rollback to the previous binary version.
     pub fn rollback(&mut self) -> UpdateResult<RollbackResult> {
-        info!(node = %self.config.node_name, "triggering rollback");
+        info!(node = %self.config.worker_name, "triggering rollback");
 
         let mgr = RollbackManager::new(self.config.rollback.clone());
         let result = mgr.rollback()?;
@@ -632,7 +632,7 @@ impl UpdateOrchestrator {
             return true;
         }
 
-        let my_name = &self.config.node_name;
+        let my_name = &self.config.worker_name;
         let my_index = order.iter().position(|n| n == my_name);
 
         match my_index {
@@ -691,9 +691,9 @@ mod tests {
     }
 
     /// Helper to build a default OrchestratorConfig for tests.
-    fn test_config(node_name: &str, rolling: RollingUpdateConfig) -> OrchestratorConfig {
+    fn test_config(worker_name: &str, rolling: RollingUpdateConfig) -> OrchestratorConfig {
         OrchestratorConfig {
-            node_name: node_name.into(),
+            worker_name: worker_name.into(),
             checker: CheckerConfig::default(),
             builder: BuilderConfig::default(),
             verifier: VerifierConfig::default(),
@@ -735,7 +735,7 @@ mod tests {
     fn test_update_record_new() {
         let record = UpdateRecord::new("taylor");
         assert_eq!(record.state, UpdateState::Idle);
-        assert_eq!(record.node_name, "taylor");
+        assert_eq!(record.worker_name, "taylor");
         assert!(record.error.is_none());
     }
 

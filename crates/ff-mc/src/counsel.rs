@@ -59,7 +59,7 @@ impl CounselResult {
 pub struct DockerStack {
     pub id: String,
     pub work_item_id: String,
-    pub node_name: String,
+    pub worker_name: String,
     pub compose_path: String,
     pub db_volume_name: Option<String>,
     pub ports: serde_json::Value,

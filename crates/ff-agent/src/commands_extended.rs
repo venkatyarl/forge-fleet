@@ -496,14 +496,14 @@ impl Command for ModelsCommand {
         match crate::fleet_info::fetch_snapshot().await {
             Ok(snapshot) => {
                 use std::collections::BTreeMap;
-                // Map: model_name -> (tier, Vec<node_name>)
+                // Map: model_name -> (tier, Vec<worker_name>)
                 let mut by_name: BTreeMap<String, (i32, Vec<String>)> = BTreeMap::new();
                 for m in &snapshot.models {
                     let entry = by_name
                         .entry(m.name.clone())
                         .or_insert((m.tier, Vec::new()));
-                    if !entry.1.contains(&m.node_name) {
-                        entry.1.push(m.node_name.clone());
+                    if !entry.1.contains(&m.worker_name) {
+                        entry.1.push(m.worker_name.clone());
                     }
                 }
                 if by_name.is_empty() {

@@ -103,7 +103,7 @@ impl fmt::Display for NodeUpdateStatus {
 /// Tracks the state of a single node during rollout.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeProgress {
-    pub node_name: String,
+    pub worker_name: String,
     pub status: NodeUpdateStatus,
     pub updated_at: Option<DateTime<Utc>>,
     pub health_checked_at: Option<DateTime<Utc>>,
@@ -361,7 +361,7 @@ impl CanaryOrchestrator {
             self.progress.node_statuses.insert(
                 node.name.clone(),
                 NodeProgress {
-                    node_name: node.name.clone(),
+                    worker_name: node.name.clone(),
                     status: NodeUpdateStatus::Pending,
                     updated_at: None,
                     health_checked_at: None,
@@ -398,12 +398,12 @@ impl CanaryOrchestrator {
     }
 
     /// Mark a single canary node as having been updated (binary swapped).
-    pub fn mark_node_updated(&mut self, node_name: &str) {
-        if let Some(np) = self.progress.node_statuses.get_mut(node_name) {
+    pub fn mark_node_updated(&mut self, worker_name: &str) {
+        if let Some(np) = self.progress.node_statuses.get_mut(worker_name) {
             np.status = NodeUpdateStatus::Updated;
             np.updated_at = Some(Utc::now());
         }
-        info!(node = node_name, "node marked as updated");
+        info!(node = worker_name, "node marked as updated");
 
         // If all canary nodes are updated → transition to monitoring.
         let all_canary_updated = self.progress.canary_nodes.iter().all(|n| {

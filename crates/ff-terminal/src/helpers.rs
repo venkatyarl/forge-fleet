@@ -91,8 +91,10 @@ pub async fn detect_llm_from_db_or_local(config_path: &std::path::Path) -> Strin
                 // Prefer models that support tool calling (Qwen) over those that don't (Gemma)
                 let mut endpoints: Vec<(String, u16, i32, bool)> = Vec::new();
                 for node in &nodes {
-                    let node_models: Vec<_> =
-                        models.iter().filter(|m| m.node_name == node.name).collect();
+                    let node_models: Vec<_> = models
+                        .iter()
+                        .filter(|m| m.worker_name == node.name)
+                        .collect();
                     if node_models.is_empty() {
                         endpoints.push((node.ip.clone(), 55000, node.cpu_cores, true));
                     } else {

@@ -33,7 +33,7 @@ struct Discovered {
 /// Scan `models_dir` and reconcile against Postgres.
 pub async fn scan_local_library(
     pool: &sqlx::PgPool,
-    node_name: &str,
+    worker_name: &str,
     models_dir: &Path,
 ) -> Result<ScanSummary, String> {
     if !models_dir.exists() {
@@ -56,7 +56,7 @@ pub async fn scan_local_library(
 
     // Existing library rows for this node — used for removal reconciliation &
     // distinguishing added vs updated.
-    let existing = pg_list_library(pool, Some(node_name))
+    let existing = pg_list_library(pool, Some(worker_name))
         .await
         .map_err(|e| format!("pg_list_library failed: {e}"))?;
 
@@ -143,7 +143,7 @@ pub async fn scan_local_library(
         let was_present = existing_paths.contains(&d.file_path);
         match pg_upsert_library(
             pool,
-            node_name,
+            worker_name,
             &d.catalog_id,
             &d.runtime,
             d.quant.as_deref(),

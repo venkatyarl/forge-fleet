@@ -103,10 +103,10 @@ impl ModelManager {
     }
 
     /// List models available on a specific node.
-    pub fn list_for_node(&self, node_name: &str) -> Vec<&ManagedModel> {
+    pub fn list_for_node(&self, worker_name: &str) -> Vec<&ManagedModel> {
         self.registry
             .values()
-            .filter(|m| m.nodes.iter().any(|n| n == node_name))
+            .filter(|m| m.nodes.iter().any(|n| n == worker_name))
             .collect()
     }
 
@@ -153,7 +153,7 @@ impl ModelManager {
         model_id: &str,
         model_name: &str,
         quant: &str,
-        node_name: &str,
+        worker_name: &str,
     ) -> Result<ManagedModel> {
         self.init()?;
 
@@ -216,7 +216,7 @@ impl ModelManager {
             source_url: Some(url.into()),
             downloaded_at: Utc::now(),
             sha256: None,
-            nodes: vec![node_name.into()],
+            nodes: vec![worker_name.into()],
         };
 
         self.register(model.clone());
@@ -231,7 +231,7 @@ impl ModelManager {
         repo_id: &str,
         model_id: &str,
         model_name: &str,
-        node_name: &str,
+        worker_name: &str,
     ) -> Result<ManagedModel> {
         self.init()?;
 
@@ -288,7 +288,7 @@ impl ModelManager {
             source_url: Some(format!("https://huggingface.co/{repo_id}")),
             downloaded_at: Utc::now(),
             sha256: None,
-            nodes: vec![node_name.into()],
+            nodes: vec![worker_name.into()],
         };
 
         self.register(model.clone());

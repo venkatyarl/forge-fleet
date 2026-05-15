@@ -4047,8 +4047,8 @@ async fn load_picker_items() -> Result<Vec<ff_terminal::app::ModelPickerItem>, S
     }
     for l in &library {
         let a = aggs.entry(l.catalog_id.clone()).or_default();
-        if !a.lib_nodes.contains(&l.node_name) {
-            a.lib_nodes.push(l.node_name.clone());
+        if !a.lib_nodes.contains(&l.worker_name) {
+            a.lib_nodes.push(l.worker_name.clone());
         }
         a.lib_runtime.get_or_insert_with(|| l.runtime.clone());
         a.lib_size_bytes = a.lib_size_bytes.max(l.size_bytes);
@@ -4060,8 +4060,8 @@ async fn load_picker_items() -> Result<Vec<ff_terminal::app::ModelPickerItem>, S
         let a = aggs.entry(cid.clone()).or_default();
         let healthy = d.health_status == "healthy";
         if a.deploy.is_none() || (healthy && !a.deploy_healthy) {
-            let ip = node_ip.get(&d.node_name).cloned().unwrap_or_default();
-            a.deploy = Some((d.node_name.clone(), ip, d.port, d.runtime.clone()));
+            let ip = node_ip.get(&d.worker_name).cloned().unwrap_or_default();
+            a.deploy = Some((d.worker_name.clone(), ip, d.port, d.runtime.clone()));
             a.deploy_healthy = healthy;
         }
     }

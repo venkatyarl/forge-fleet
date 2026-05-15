@@ -520,7 +520,7 @@ async fn handle_tools(args: ToolsArgs, _config_path: &Path) -> Result<()> {
             println!("{GREEN}✓ Fleet Tools{RESET} ({} total)", tools.len());
             for tool in tools {
                 let name = tool["tool_name"].as_str().unwrap_or("?");
-                let node = tool["node_name"].as_str().unwrap_or("?");
+                let node = tool["worker_name"].as_str().unwrap_or("?");
                 let healthy = tool["healthy"].as_bool().unwrap_or(false);
                 let status = if healthy {
                     format!("{GREEN}●{RESET}")
@@ -551,7 +551,7 @@ async fn handle_tools(args: ToolsArgs, _config_path: &Path) -> Result<()> {
             if let Some(nodes) = body["nodes"].as_array() {
                 println!("\n  By node:");
                 for node in nodes {
-                    let name = node["node_name"].as_str().unwrap_or("?");
+                    let name = node["worker_name"].as_str().unwrap_or("?");
                     let n_tools = node["tool_count"].as_i64().unwrap_or(0);
                     let n_healthy = node["healthy_count"].as_i64().unwrap_or(0);
                     let n_unhealthy = node["unhealthy_count"].as_i64().unwrap_or(0);
@@ -567,12 +567,12 @@ async fn handle_tools(args: ToolsArgs, _config_path: &Path) -> Result<()> {
             }
         }
         ToolsCommand::Register { node } => {
-            let node_name = node.unwrap_or_else(|| {
+            let worker_name = node.unwrap_or_else(|| {
                 std::env::var("HOSTNAME")
                     .or_else(|_| std::env::var("COMPUTERNAME"))
                     .unwrap_or_else(|_| "unknown".to_string())
             });
-            println!("{CYAN}▶ Registering tools for {node_name}{RESET}");
+            println!("{CYAN}▶ Registering tools for {worker_name}{RESET}");
             println!("  (Tool registration is automatic on ff-agent startup.");
             println!("   This command is for manual re-registration if needed.)");
         }

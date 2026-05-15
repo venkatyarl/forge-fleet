@@ -32,7 +32,7 @@ pub type RunnerResult<T> = std::result::Result<T, BenchmarkRunnerError>;
 /// Node/model endpoint used for benchmark execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BenchmarkEndpoint {
-    pub node_name: String,
+    pub worker_name: String,
     pub base_url: String,
     pub default_model: Option<String>,
     pub api_key: Option<String>,
@@ -40,7 +40,7 @@ pub struct BenchmarkEndpoint {
 
 impl BenchmarkEndpoint {
     pub fn id(&self) -> String {
-        format!("{} ({})", self.node_name, self.base_url)
+        format!("{} ({})", self.worker_name, self.base_url)
     }
 }
 

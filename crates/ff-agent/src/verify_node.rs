@@ -22,11 +22,11 @@ pub struct VerifyReport {
     pub checked_at: chrono::DateTime<chrono::Utc>,
 }
 
-pub async fn verify_node(pool: &PgPool, node_name: &str) -> Result<VerifyReport, String> {
-    let node = ff_db::pg_get_node(pool, node_name)
+pub async fn verify_node(pool: &PgPool, worker_name: &str) -> Result<VerifyReport, String> {
+    let node = ff_db::pg_get_node(pool, worker_name)
         .await
         .map_err(|e| format!("pg_get_node: {e}"))?
-        .ok_or_else(|| format!("node '{node_name}' not in fleet_workers"))?;
+        .ok_or_else(|| format!("node '{worker_name}' not in fleet_workers"))?;
     let ssh_dest = format!("{}@{}", node.ssh_user, node.ip);
     let is_windows = node.os.to_lowercase().contains("windows");
     let mut details = Vec::new();
@@ -99,7 +99,7 @@ pub async fn verify_node(pool: &PgPool, node_name: &str) -> Result<VerifyReport,
             retry_task_id: None }
     });
     // 7. models_scanned
-    let libs = ff_db::pg_list_library(pool, Some(node_name))
+    let libs = ff_db::pg_list_library(pool, Some(worker_name))
         .await
         .unwrap_or_default();
     details.push(if libs.is_empty() {
@@ -126,7 +126,7 @@ pub async fn verify_node(pool: &PgPool, node_name: &str) -> Result<VerifyReport,
     });
     // 9. sudo_passwordless (N/A on Windows — UAC is the equivalent and is
     //    always interactive; Windows daemons run as services, so skip.)
-    details.push(if node_name == "taylor" {
+    details.push(if worker_name == "taylor" {
         CheckResult {
             check: "sudo_passwordless".into(),
             status: "skip".into(),
@@ -144,7 +144,7 @@ pub async fn verify_node(pool: &PgPool, node_name: &str) -> Result<VerifyReport,
         check_ssh_cmd(&ssh_dest, "sudo_passwordless", "sudo -n true").await
     });
     // 10. mesh_ssh_complete
-    let mesh = ff_db::pg_list_mesh_status(pool, Some(node_name))
+    let mesh = ff_db::pg_list_mesh_status(pool, Some(worker_name))
         .await
         .unwrap_or_default();
     details.push(if mesh.is_empty() {
@@ -205,7 +205,7 @@ pub async fn verify_node(pool: &PgPool, node_name: &str) -> Result<VerifyReport,
             retry_task_id: None,
         });
     } else {
-        let title = format!("verify-{}-{}", node_name, chrono::Utc::now().timestamp());
+        let title = format!("verify-{}-{}", worker_name, chrono::Utc::now().timestamp());
         let payload = serde_json::json!({
             "command": format!("echo verify-{}", chrono::Utc::now().timestamp())
         });
@@ -216,7 +216,7 @@ pub async fn verify_node(pool: &PgPool, node_name: &str) -> Result<VerifyReport,
             &payload,
             "now",
             &serde_json::json!({}),
-            Some(node_name),
+            Some(worker_name),
             &serde_json::json!([]),
             Some("verify_node"),
             Some(1),
@@ -276,7 +276,7 @@ pub async fn verify_node(pool: &PgPool, node_name: &str) -> Result<VerifyReport,
     let failed = details.iter().filter(|r| r.status == "fail").count();
     let skipped = details.iter().filter(|r| r.status == "skip").count();
     Ok(VerifyReport {
-        node: node_name.to_string(),
+        node: worker_name.to_string(),
         passed,
         failed,
         skipped,

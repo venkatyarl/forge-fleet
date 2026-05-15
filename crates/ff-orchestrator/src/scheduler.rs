@@ -129,7 +129,7 @@ mod humantime_serde_compat {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeCapacity {
     /// Node identifier (matches node name from fleet.toml).
-    pub node_name: String,
+    pub worker_name: String,
     /// Total CPU cores on this node.
     pub total_cpu_cores: u32,
     /// Currently available CPU cores.
@@ -149,13 +149,13 @@ pub struct NodeCapacity {
 impl NodeCapacity {
     /// Create a capacity snapshot from fleet.toml resource info.
     pub fn from_config(
-        node_name: String,
+        worker_name: String,
         cpu_cores: u32,
         memory_gib: u64,
         has_gpu: bool,
     ) -> Self {
         Self {
-            node_name,
+            worker_name,
             total_cpu_cores: cpu_cores,
             available_cpu_cores: cpu_cores,
             total_memory_gib: memory_gib,
@@ -248,7 +248,7 @@ pub struct RunningTask {
 pub enum ScheduleDecision {
     /// Assign the task to the named node.
     Assign {
-        node_name: String,
+        worker_name: String,
         score: f64,
     },
     /// No capacity — task should be queued.
@@ -258,7 +258,7 @@ pub enum ScheduleDecision {
     /// Preempt a lower-priority task to make room.
     Preempt {
         /// Node where preemption will happen.
-        node_name: String,
+        worker_name: String,
         /// Task to evict.
         evict_task_id: Uuid,
         score: f64,
@@ -274,8 +274,8 @@ impl ScheduleDecision {
     /// The target node name, if assigned.
     pub fn target_node(&self) -> Option<&str> {
         match self {
-            Self::Assign { node_name, .. } | Self::Preempt { node_name, .. } => {
-                Some(node_name.as_str())
+            Self::Assign { worker_name, .. } | Self::Preempt { worker_name, .. } => {
+                Some(worker_name.as_str())
             }
             Self::Queue { .. } => None,
         }
@@ -372,35 +372,35 @@ impl Scheduler {
 
     /// Register a node with its capacity.
     pub fn add_node(&mut self, capacity: NodeCapacity) {
-        info!(node = %capacity.node_name, "registered node in scheduler");
-        self.nodes.insert(capacity.node_name.clone(), capacity);
+        info!(node = %capacity.worker_name, "registered node in scheduler");
+        self.nodes.insert(capacity.worker_name.clone(), capacity);
     }
 
     /// Remove a node from the scheduler.
-    pub fn remove_node(&mut self, node_name: &str) -> Option<NodeCapacity> {
-        self.nodes.remove(node_name)
+    pub fn remove_node(&mut self, worker_name: &str) -> Option<NodeCapacity> {
+        self.nodes.remove(worker_name)
     }
 
     /// Get a reference to a node's capacity.
-    pub fn get_node(&self, node_name: &str) -> Option<&NodeCapacity> {
-        self.nodes.get(node_name)
+    pub fn get_node(&self, worker_name: &str) -> Option<&NodeCapacity> {
+        self.nodes.get(worker_name)
     }
 
     /// Get a mutable reference to a node's capacity.
-    pub fn get_node_mut(&mut self, node_name: &str) -> Option<&mut NodeCapacity> {
-        self.nodes.get_mut(node_name)
+    pub fn get_node_mut(&mut self, worker_name: &str) -> Option<&mut NodeCapacity> {
+        self.nodes.get_mut(worker_name)
     }
 
     /// Update a node's online status.
-    pub fn set_node_online(&mut self, node_name: &str, online: bool) {
-        if let Some(node) = self.nodes.get_mut(node_name) {
+    pub fn set_node_online(&mut self, worker_name: &str, online: bool) {
+        if let Some(node) = self.nodes.get_mut(worker_name) {
             node.online = online;
         }
     }
 
     /// Release resources for a completed task.
-    pub fn release_task(&mut self, node_name: &str, task_id: Uuid) -> Option<RunningTask> {
-        self.nodes.get_mut(node_name).and_then(|n| n.release(task_id))
+    pub fn release_task(&mut self, worker_name: &str, task_id: Uuid) -> Option<RunningTask> {
+        self.nodes.get_mut(worker_name).and_then(|n| n.release(task_id))
     }
 
     /// Number of registered nodes.
@@ -447,22 +447,22 @@ impl Scheduler {
 
         // Step 4: Pick best candidate
         if let Some((ref best_node, score)) = candidates.first().cloned() {
-            let node_name = best_node.to_string();
+            let worker_name = best_node.to_string();
 
             // Allocate resources
-            if let Some(cap) = self.nodes.get_mut(&node_name) {
+            if let Some(cap) = self.nodes.get_mut(&worker_name) {
                 cap.allocate(task.id, req, task.priority);
             }
 
             info!(
                 task_id = %task.id,
-                node = %node_name,
+                node = %worker_name,
                 score = score,
                 priority = %task.priority,
                 "task scheduled"
             );
 
-            return ScheduleDecision::Assign { node_name, score };
+            return ScheduleDecision::Assign { worker_name, score };
         }
 
         // Step 5: Try preemption for Critical tasks
@@ -569,9 +569,9 @@ impl Scheduler {
             b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        if let Some((node_name, evict_task_id, score)) = preempt_candidates.into_iter().next() {
+        if let Some((worker_name, evict_task_id, score)) = preempt_candidates.into_iter().next() {
             // Release the evicted task's resources
-            if let Some(cap) = self.nodes.get_mut(&node_name) {
+            if let Some(cap) = self.nodes.get_mut(&worker_name) {
                 cap.release(evict_task_id);
                 cap.allocate(task.id, req, task.priority);
             }
@@ -579,12 +579,12 @@ impl Scheduler {
             info!(
                 task_id = %task.id,
                 evicted = %evict_task_id,
-                node = %node_name,
+                node = %worker_name,
                 "critical task preempted background task"
             );
 
             return Some(ScheduleDecision::Preempt {
-                node_name,
+                worker_name,
                 evict_task_id,
                 score,
             });
@@ -702,8 +702,8 @@ mod tests {
         let decision = scheduler.schedule_task(&task);
 
         match &decision {
-            ScheduleDecision::Assign { node_name, .. } => {
-                assert_eq!(node_name, "taylor", "GPU task must go to GPU node");
+            ScheduleDecision::Assign { worker_name, .. } => {
+                assert_eq!(worker_name, "taylor", "GPU task must go to GPU node");
             }
             other => panic!("Expected Assign, got {:?}", other),
         }
@@ -743,11 +743,11 @@ mod tests {
 
         match &decision {
             ScheduleDecision::Preempt {
-                node_name,
+                worker_name,
                 evict_task_id,
                 ..
             } => {
-                assert_eq!(node_name, "james");
+                assert_eq!(worker_name, "james");
                 assert_eq!(*evict_task_id, bg_task.id);
             }
             other => panic!("Expected Preempt, got {:?}", other),

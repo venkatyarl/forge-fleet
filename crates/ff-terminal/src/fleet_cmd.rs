@@ -1132,7 +1132,7 @@ async fn remove_computer_core(pool: &sqlx::PgPool, name: &str) -> Result<RemoveC
     let mut report = RemoveComputerReport::default();
 
     // fleet_models has no ON DELETE CASCADE on the fleet_workers FK.
-    let r = sqlx::query("DELETE FROM fleet_models WHERE node_name = $1")
+    let r = sqlx::query("DELETE FROM fleet_models WHERE worker_name = $1")
         .bind(name)
         .execute(&mut *tx)
         .await?;

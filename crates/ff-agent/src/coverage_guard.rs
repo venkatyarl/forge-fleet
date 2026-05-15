@@ -348,7 +348,7 @@ impl CoverageGuard {
              WHERE c.status = 'online'
                AND EXISTS (
                    SELECT 1 FROM fleet_model_library lib
-                    WHERE lib.node_name = c.name
+                    WHERE lib.worker_name = c.name
                       AND lib.catalog_id = $1
                )
                AND NOT EXISTS (

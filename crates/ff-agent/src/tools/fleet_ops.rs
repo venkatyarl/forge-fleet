@@ -30,7 +30,7 @@ impl AgentTool for NodeSetupTool {
                     "items": { "type": "string" },
                     "description": "Components to install: rust, llamacpp, ollama, docker, forgefleet (default: all)"
                 },
-                "node_name": { "type": "string", "description": "Name for this node in the fleet" }
+                "worker_name": { "type": "string", "description": "Name for this node in the fleet" }
             },
             "required": ["host"]
         })
@@ -41,8 +41,8 @@ impl AgentTool for NodeSetupTool {
             None => return AgentToolResult::err("Missing 'host'"),
         };
         let user = input.get("user").and_then(Value::as_str).unwrap_or("root");
-        let node_name = input
-            .get("node_name")
+        let worker_name = input
+            .get("worker_name")
             .and_then(Value::as_str)
             .unwrap_or("new-node");
 
@@ -114,7 +114,7 @@ mkdir -p ~/.forgefleet/memory/global
 mkdir -p ~/.forgefleet/sessions
 mkdir -p ~/.forgefleet/plugins
 mkdir -p ~/projects
-echo '{node_name}' > ~/.forgefleet/node_name
+echo '{worker_name}' > ~/.forgefleet/worker_name
 echo 'ForgeFleet node setup complete'
 "#
         ));
@@ -125,10 +125,10 @@ echo 'ForgeFleet node setup complete'
         results.push("Step 4: Creating ForgeFleet directories...".into());
 
         // Step 5: Verify
-        let verify = ssh_cmd(user, host, "which rustc 2>/dev/null; which docker 2>/dev/null; ls ~/.forgefleet/node_name 2>/dev/null; echo 'Verification complete'").await;
+        let verify = ssh_cmd(user, host, "which rustc 2>/dev/null; which docker 2>/dev/null; ls ~/.forgefleet/worker_name 2>/dev/null; echo 'Verification complete'").await;
 
         AgentToolResult::ok(format!(
-            "Node Setup Report — {node_name} ({host})\n\n{}\n\nInstall output:\n{}\n\nVerification:\n{}\n\nNext steps:\n  1. Run NodeEnroll to add this node to fleet.toml\n  2. Run ModelDeploy to download a model\n  3. Start the LLM server on the node",
+            "Node Setup Report — {worker_name} ({host})\n\n{}\n\nInstall output:\n{}\n\nVerification:\n{}\n\nNext steps:\n  1. Run NodeEnroll to add this node to fleet.toml\n  2. Run ModelDeploy to download a model\n  3. Start the LLM server on the node",
             results.join("\n"),
             truncate_output(&install_result, 2000),
             truncate_output(&verify, 500)
@@ -164,7 +164,7 @@ impl AgentTool for NodeEnrollTool {
         json!({
             "type": "object",
             "properties": {
-                "node_name": { "type": "string", "description": "Name for this node (e.g. 'evo1', 'sia')" },
+                "worker_name": { "type": "string", "description": "Name for this node (e.g. 'evo1', 'sia')" },
                 "ip": { "type": "string", "description": "IP address" },
                 "port": { "type": "number", "description": "LLM server port (default: 51000)" },
                 "user": { "type": "string", "description": "SSH user" },
@@ -173,11 +173,14 @@ impl AgentTool for NodeEnrollTool {
                 "gpu_type": { "type": "string", "description": "GPU type (apple_silicon, nvidia, amd_rocm, cpu)" },
                 "setup_ssh_keys": { "type": "boolean", "description": "Exchange SSH keys (default: true)" }
             },
-            "required": ["node_name", "ip"]
+            "required": ["worker_name", "ip"]
         })
     }
     async fn execute(&self, input: Value, _ctx: &AgentToolContext) -> AgentToolResult {
-        let name = input.get("node_name").and_then(Value::as_str).unwrap_or("");
+        let name = input
+            .get("worker_name")
+            .and_then(Value::as_str)
+            .unwrap_or("");
         let ip = input.get("ip").and_then(Value::as_str).unwrap_or("");
         let port = input.get("port").and_then(Value::as_u64).unwrap_or(51000);
         let user = input.get("user").and_then(Value::as_str).unwrap_or("root");
@@ -196,7 +199,7 @@ impl AgentTool for NodeEnrollTool {
             .unwrap_or(true);
 
         if name.is_empty() || ip.is_empty() {
-            return AgentToolResult::err("Both 'node_name' and 'ip' are required");
+            return AgentToolResult::err("Both 'worker_name' and 'ip' are required");
         }
 
         let mut steps = Vec::new();

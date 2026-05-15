@@ -8,7 +8,7 @@ use std::path::PathBuf;
 /// One disk-usage snapshot for the current node.
 #[derive(Debug, Clone)]
 pub struct DiskSample {
-    pub node_name: String,
+    pub worker_name: String,
     pub models_dir: PathBuf,
     pub total_bytes: u64,
     pub used_bytes: u64,
@@ -21,13 +21,13 @@ pub struct DiskSample {
 /// Sample the current host's disk usage and insert a row into `fleet_disk_usage`.
 /// Returns the sample (also for display / alerting).
 pub async fn sample_local_disk(pool: &sqlx::PgPool) -> Result<DiskSample, String> {
-    let node_name = crate::fleet_info::resolve_this_node_name().await;
+    let worker_name = crate::fleet_info::resolve_this_node_name().await;
 
     // Look up node row for models_dir + quota.
-    let node = ff_db::pg_get_node(pool, &node_name)
+    let node = ff_db::pg_get_node(pool, &worker_name)
         .await
-        .map_err(|e| format!("pg_get_node({node_name}): {e}"))?
-        .ok_or_else(|| format!("node '{node_name}' not in fleet_workers"))?;
+        .map_err(|e| format!("pg_get_node({worker_name}): {e}"))?
+        .ok_or_else(|| format!("node '{worker_name}' not in fleet_workers"))?;
 
     let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
     let models_dir = expand_tilde(&node.models_dir, &home);
@@ -77,7 +77,7 @@ pub async fn sample_local_disk(pool: &sqlx::PgPool) -> Result<DiskSample, String
     // Persist.
     ff_db::pg_insert_disk_usage(
         pool,
-        &node_name,
+        &worker_name,
         &models_dir.to_string_lossy(),
         total_bytes as i64,
         used_bytes as i64,
@@ -90,11 +90,12 @@ pub async fn sample_local_disk(pool: &sqlx::PgPool) -> Result<DiskSample, String
     // If we crossed the quota line, enqueue a deferred task so operators notice.
     // Idempotent: only enqueue if no identical alert is already pending/dispatchable.
     if over_quota {
-        let _ = maybe_alert_over_quota(pool, &node_name, used_bytes, total_bytes, quota_pct).await;
+        let _ =
+            maybe_alert_over_quota(pool, &worker_name, used_bytes, total_bytes, quota_pct).await;
     }
 
     Ok(DiskSample {
-        node_name,
+        worker_name,
         models_dir,
         total_bytes,
         used_bytes,
@@ -109,7 +110,7 @@ pub async fn sample_local_disk(pool: &sqlx::PgPool) -> Result<DiskSample, String
 /// review. No-op if one is already pending for this node.
 async fn maybe_alert_over_quota(
     pool: &sqlx::PgPool,
-    node_name: &str,
+    worker_name: &str,
     used_bytes: u64,
     total_bytes: u64,
     quota_pct: u32,
@@ -120,7 +121,7 @@ async fn maybe_alert_over_quota(
         .map_err(|e| format!("pg_list_deferred: {e}"))?;
     let already_alerted = rows
         .iter()
-        .any(|r| r.title.starts_with("⚠ disk quota exceeded on ") && r.title.contains(node_name));
+        .any(|r| r.title.starts_with("⚠ disk quota exceeded on ") && r.title.contains(worker_name));
     if already_alerted {
         return Ok(());
     }
@@ -130,13 +131,13 @@ async fn maybe_alert_over_quota(
     } else {
         used_bytes * 100 / total_bytes
     };
-    let title = format!("⚠ disk quota exceeded on {node_name} ({}%)", used_pct);
+    let title = format!("⚠ disk quota exceeded on {worker_name} ({}%)", used_pct);
     let payload = serde_json::json!({
         "note": format!(
             "Disk usage {}% exceeds quota {}% on {}. \
              Review with: ff model prune --node {} \
              Delete candidates with: ff model delete <library-id> --yes",
-            used_pct, quota_pct, node_name, node_name
+            used_pct, quota_pct, worker_name, worker_name
         ),
     });
     let _ = ff_db::pg_enqueue_deferred(
@@ -146,7 +147,7 @@ async fn maybe_alert_over_quota(
         &payload,
         "manual", // trigger_type: user must act
         &serde_json::json!({}),
-        Some(node_name),
+        Some(worker_name),
         &serde_json::json!([]),
         Some("disk-sampler"),
         Some(1), // max_attempts — this is informational

@@ -191,8 +191,8 @@ impl CrewAssignment {
     }
 
     /// Builder: override the node.
-    pub fn node(mut self, node_name: impl Into<String>) -> Self {
-        self.node_override = Some(node_name.into());
+    pub fn node(mut self, worker_name: impl Into<String>) -> Self {
+        self.node_override = Some(worker_name.into());
         self
     }
 

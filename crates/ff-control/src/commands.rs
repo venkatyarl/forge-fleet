@@ -28,13 +28,13 @@ pub struct DiscoverResult {
 
 #[derive(Debug, Clone)]
 pub struct StartAgentRequest {
-    pub node_name: String,
+    pub worker_name: String,
     pub role: NodeRole,
 }
 
 #[derive(Debug, Clone)]
 pub struct StartAgentResult {
-    pub node_name: String,
+    pub worker_name: String,
     pub accepted_at: DateTime<Utc>,
     pub registration: AgentRegistrationAck,
 }
@@ -142,13 +142,13 @@ impl ControlPlane {
     }
 
     pub fn start_agent(&self, req: StartAgentRequest) -> Result<StartAgentResult> {
-        let exists = self.config.nodes.contains_key(&req.node_name);
+        let exists = self.config.nodes.contains_key(&req.worker_name);
         if !exists {
-            return Err(ControlError::UnknownNode(req.node_name));
+            return Err(ControlError::UnknownNode(req.worker_name));
         }
 
         Ok(StartAgentResult {
-            node_name: req.node_name,
+            worker_name: req.worker_name,
             accepted_at: Utc::now(),
             registration: AgentRegistrationAck {
                 accepted: true,

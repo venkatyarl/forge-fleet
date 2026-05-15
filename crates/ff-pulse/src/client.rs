@@ -138,7 +138,7 @@ impl PulseClient {
         self.conn.publish::<_, _, ()>(&channel, &json).await?;
         debug!(
             "Published event {:?} for node '{}'",
-            event.event_type, event.node_name
+            event.event_type, event.worker_name
         );
         Ok(())
     }

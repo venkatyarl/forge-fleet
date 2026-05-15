@@ -98,7 +98,7 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                 let quant = r.quant.clone().unwrap_or_else(|| "-".into());
                 println!(
                     "{:<10} {:<28} {:<10} {:<10} {:<10} {}",
-                    r.node_name, r.catalog_id, r.runtime, quant, sz, r.file_path
+                    r.worker_name, r.catalog_id, r.runtime, quant, sz, r.file_path
                 );
             }
         }
@@ -116,7 +116,7 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                 let catalog = r.catalog_id.clone().unwrap_or_else(|| "-".into());
                 println!(
                     "{:<10} {:<28} {:<10} {:<6} {:<10} {}",
-                    r.node_name,
+                    r.worker_name,
                     catalog,
                     r.runtime,
                     r.port,
@@ -127,7 +127,7 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
         }
         crate::ModelCommand::Scan { node, models_dir } => {
             // Default: resolve this host's node name from Postgres by IP.
-            let node_name = match node {
+            let worker_name = match node {
                 Some(n) => n,
                 None => ff_agent::fleet_info::resolve_this_node_name().await,
             };
@@ -138,9 +138,9 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
             if !dir.exists() {
                 anyhow::bail!("models dir does not exist: {}", dir.display());
             }
-            println!("Scanning {} on node {} ...", dir.display(), node_name);
+            println!("Scanning {} on node {} ...", dir.display(), worker_name);
             let summary =
-                ff_agent::model_library_scanner::scan_local_library(&pool, &node_name, &dir)
+                ff_agent::model_library_scanner::scan_local_library(&pool, &worker_name, &dir)
                     .await
                     .map_err(|e| anyhow::anyhow!(e))?;
             println!("  added:   {}", summary.added);
@@ -181,17 +181,17 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
             force,
         } => {
             // Resolve target node + node runtime + models_dir.
-            let node_name = match node {
+            let worker_name = match node {
                 Some(n) => n,
                 None => ff_agent::fleet_info::resolve_this_node_name().await,
             };
-            let node_row = ff_db::pg_get_node(&pool, &node_name)
+            let node_row = ff_db::pg_get_node(&pool, &worker_name)
                 .await?
-                .ok_or_else(|| anyhow::anyhow!("node '{node_name}' not in fleet_workers"))?;
+                .ok_or_else(|| anyhow::anyhow!("node '{worker_name}' not in fleet_workers"))?;
             let target_runtime = runtime.unwrap_or_else(|| node_row.runtime.clone());
             if target_runtime == "unknown" {
                 anyhow::bail!(
-                    "node '{node_name}' has unknown runtime; set with: ff config set fleet.{node_name}.runtime mlx|llama.cpp|vllm"
+                    "node '{worker_name}' has unknown runtime; set with: ff config set fleet.{worker_name}.runtime mlx|llama.cpp|vllm"
                 );
             }
 
@@ -236,7 +236,7 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
             // defer-worker running on the target node will claim it and run
             // `ff model download <id> --runtime <rt>` locally there.
             let this_node = ff_agent::fleet_info::resolve_this_node_name().await;
-            if node_name != this_node {
+            if worker_name != this_node {
                 let escaped_id = shell_escape_single(&id);
                 let command = format!(
                     "ff model download {} --runtime {}",
@@ -244,7 +244,7 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                 );
                 let title = format!(
                     "Download {} ({} variant) on {}",
-                    id, target_runtime, node_name
+                    id, target_runtime, worker_name
                 );
                 let payload = serde_json::json!({ "command": command });
                 let trigger_spec = serde_json::json!({});
@@ -255,14 +255,14 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                     &payload,
                     "now",
                     &trigger_spec,
-                    Some(&node_name),
+                    Some(&worker_name),
                     &serde_json::json!([]),
                     Some(&whoami_tag()),
                     Some(3),
                 )
                 .await?;
                 println!(
-                    "Enqueued cross-node download as deferred task {defer_id}. It will run on {node_name} when a defer-worker there claims it."
+                    "Enqueued cross-node download as deferred task {defer_id}. It will run on {worker_name} when a defer-worker there claims it."
                 );
                 println!("Check status with: ff defer list");
                 return Ok(());
@@ -305,7 +305,7 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                 "dest": dest.to_string_lossy(),
             });
             let job_id =
-                ff_db::pg_create_job(&pool, &node_name, "download", Some(&id), None, &params)
+                ff_db::pg_create_job(&pool, &worker_name, "download", Some(&id), None, &params)
                     .await?;
             ff_db::pg_update_job_progress(
                 &pool,
@@ -406,7 +406,7 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                     println!("Re-scanning library...");
                     let summary = ff_agent::model_library_scanner::scan_local_library(
                         &pool,
-                        &node_name,
+                        &worker_name,
                         &models_dir,
                     )
                     .await
@@ -498,23 +498,23 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
             })?;
 
             // Safety: refuse if a deployment references this library row.
-            let deployments = ff_db::pg_list_deployments(&pool, Some(&row.node_name)).await?;
+            let deployments = ff_db::pg_list_deployments(&pool, Some(&row.worker_name)).await?;
             let in_use = deployments
                 .iter()
                 .any(|d| d.library_id.as_deref() == Some(&id));
             if in_use {
                 anyhow::bail!(
                     "model is currently deployed on {} — unload it first (`ff model unload <deployment_id>`)",
-                    row.node_name
+                    row.worker_name
                 );
             }
 
             // Cross-node delete not yet wired — only this host.
             let this_node = ff_agent::fleet_info::resolve_this_node_name().await;
-            if row.node_name != this_node {
+            if row.worker_name != this_node {
                 anyhow::bail!(
                     "cross-node delete not yet implemented. run on '{}' instead.",
-                    row.node_name
+                    row.worker_name
                 );
             }
 
@@ -540,7 +540,7 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                         "Deleted {} ({}) from {}",
                         row.file_path,
                         human_bytes(row.size_bytes as u64),
-                        row.node_name
+                        row.worker_name
                     );
                 }
                 Err(e) => anyhow::bail!("filesystem remove failed: {e}"),
@@ -570,10 +570,10 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
             }
         }
         crate::ModelCommand::Autoload { catalog_id, ctx } => {
-            let node_name = ff_agent::fleet_info::resolve_this_node_name().await;
+            let worker_name = ff_agent::fleet_info::resolve_this_node_name().await;
 
             // 1. Already deployed?
-            let deps = ff_db::pg_list_deployments(&pool, Some(&node_name)).await?;
+            let deps = ff_db::pg_list_deployments(&pool, Some(&worker_name)).await?;
             if let Some(d) = deps.iter().find(|d| {
                 d.catalog_id.as_deref() == Some(&catalog_id) && d.health_status == "healthy"
             }) {
@@ -582,30 +582,29 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
             }
 
             // 2. Find library row on this node for this catalog_id.
-            let libs = ff_db::pg_list_library(&pool, Some(&node_name)).await?;
+            let libs = ff_db::pg_list_library(&pool, Some(&worker_name)).await?;
             let lib = libs.iter().find(|r| r.catalog_id == catalog_id)
-                .ok_or_else(|| anyhow::anyhow!("model '{catalog_id}' not in library on '{node_name}'. Download it first: ff model download {catalog_id}"))?;
+                .ok_or_else(|| anyhow::anyhow!("model '{catalog_id}' not in library on '{worker_name}'. Download it first: ff model download {catalog_id}"))?;
 
             // 3. Pick a free port via port_registry — canonical mapping
             //    (55000-55002 llama.cpp/mlx, 51001/51003 vllm, 11434 ollama).
             //    Fall back to legacy 51001..=51020 scan only if the registry
             //    lookup fails (e.g. fresh install where it hasn't seeded yet).
-            let port: u16 = match ff_agent::ports_registry::pick_llm_port(
-                &pool,
-                &node_name,
-                &lib.runtime,
-            )
-            .await
-            {
-                Ok(p) => p as u16,
-                Err(_) => {
-                    let used_ports: std::collections::HashSet<i32> =
-                        deps.iter().map(|d| d.port).collect();
-                    (51001u16..=51020)
-                        .find(|p| !used_ports.contains(&(*p as i32)))
-                        .ok_or_else(|| anyhow::anyhow!("no free port in registry or 51001-51020"))?
-                }
-            };
+            let port: u16 =
+                match ff_agent::ports_registry::pick_llm_port(&pool, &worker_name, &lib.runtime)
+                    .await
+                {
+                    Ok(p) => p as u16,
+                    Err(_) => {
+                        let used_ports: std::collections::HashSet<i32> =
+                            deps.iter().map(|d| d.port).collect();
+                        (51001u16..=51020)
+                            .find(|p| !used_ports.contains(&(*p as i32)))
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("no free port in registry or 51001-51020")
+                            })?
+                    }
+                };
 
             // 4. Load.
             let res = ff_agent::model_runtime::load_model(
@@ -697,7 +696,7 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                         let q = r.quant.clone().unwrap_or_else(|| "-".into());
                         println!(
                             "  - {:<10} ({:<10} {:<6}) {}  [{}]",
-                            r.node_name,
+                            r.worker_name,
                             r.runtime,
                             q,
                             human_bytes(r.size_bytes as u64),
@@ -715,7 +714,7 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                     for d in &live {
                         println!(
                             "  - {:<10} port {:<5} {:<10} health={}  [{}]",
-                            d.node_name,
+                            d.worker_name,
                             d.port,
                             d.runtime,
                             d.health_status,
@@ -730,7 +729,7 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
             if let Some(r) = all_lib.iter().find(|r| r.id == id) {
                 println!("{CYAN}━ Library row ━{RESET}");
                 println!("ID:           {}", r.id);
-                println!("Node:         {}", r.node_name);
+                println!("Node:         {}", r.worker_name);
                 println!("Catalog ID:   {}", r.catalog_id);
                 println!("Runtime:      {}", r.runtime);
                 println!(
@@ -759,7 +758,7 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
             if let Some(d) = all_dep.iter().find(|d| d.id == id) {
                 println!("{CYAN}━ Deployment ━{RESET}");
                 println!("ID:           {}", d.id);
-                println!("Node:         {}", d.node_name);
+                println!("Node:         {}", d.worker_name);
                 println!(
                     "Catalog ID:   {}",
                     d.catalog_id.clone().unwrap_or_else(|| "-".into())
@@ -791,7 +790,7 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
             node,
             min_cold_days,
         } => {
-            let node_name = match node {
+            let worker_name = match node {
                 Some(n) => n,
                 None => ff_agent::fleet_info::resolve_this_node_name().await,
             };
@@ -799,15 +798,15 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                 min_cold_days,
                 ..Default::default()
             };
-            let plan = ff_agent::smart_lru::plan_eviction(&pool, &node_name, &policy)
+            let plan = ff_agent::smart_lru::plan_eviction(&pool, &worker_name, &policy)
                 .await
                 .map_err(|e| anyhow::anyhow!(e))?;
             if plan.candidates.is_empty() {
-                println!("Node '{node_name}' is within quota — no eviction needed.");
+                println!("Node '{worker_name}' is within quota — no eviction needed.");
                 return Ok(());
             }
             println!(
-                "Eviction plan for {node_name} (would free {}):\n",
+                "Eviction plan for {worker_name} (would free {}):\n",
                 human_bytes(plan.total_bytes_freed)
             );
             println!(
@@ -829,7 +828,7 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
         crate::ModelCommand::DiskSample => {
             match ff_agent::disk_sampler::sample_local_disk(&pool).await {
                 Ok(s) => {
-                    println!("Node:        {}", s.node_name);
+                    println!("Node:        {}", s.worker_name);
                     println!("Models dir:  {}", s.models_dir.display());
                     println!("Total:       {}", human_bytes(s.total_bytes));
                     println!("Used:        {}", human_bytes(s.used_bytes));
@@ -905,7 +904,7 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                     .unwrap_or_else(|| "-".into());
                 println!(
                     "{:<38} {:<10} {:<12} {:<10} {:<6.1}% {}",
-                    r.id, r.node_name, r.kind, r.status, r.progress_pct, target
+                    r.id, r.worker_name, r.kind, r.status, r.progress_pct, target
                 );
             }
         }

@@ -238,7 +238,7 @@ async fn do_orchestrate(
                 .map(|alt| {
                     json!({
                         "model_id": &alt.model_id,
-                        "node_name": &alt.node_name,
+                        "worker_name": &alt.worker_name,
                         "score": alt.total,
                     })
                 })
@@ -255,7 +255,7 @@ async fn do_orchestrate(
             json!({
                 "subtask_id": r.subtask_id,
                 "model_id": r.model_id,
-                "node_name": r.node_name,
+                "worker_name": r.worker_name,
                 "error": r.error,
             })
         })
@@ -293,24 +293,24 @@ async fn resolve_routes_with_circuit_breaker(
     let mut resolved = HashMap::with_capacity(routes.len());
 
     for (subtask_id, decision) in routes {
-        if !cb.is_open(&decision.node_name) {
+        if !cb.is_open(&decision.worker_name) {
             resolved.insert(subtask_id, decision);
             continue;
         }
 
         tracing::warn!(
             subtask_id = %subtask_id,
-            node = %decision.node_name,
+            node = %decision.worker_name,
             "circuit breaker open for winner, trying alternatives"
         );
 
         ff_observability::metrics::PULSE_CIRCUIT_BREAKER_TRIPS_TOTAL
-            .with_label_values(&[&decision.node_name])
+            .with_label_values(&[&decision.worker_name])
             .inc();
 
         let mut found = false;
         for alt in &decision.alternatives {
-            if cb.is_open(&alt.node_name) {
+            if cb.is_open(&alt.worker_name) {
                 continue;
             }
 
@@ -321,7 +321,7 @@ async fn resolve_routes_with_circuit_breaker(
                 .unwrap_or_else(|| {
                     nodes
                         .iter()
-                        .find(|n| n.name == alt.node_name)
+                        .find(|n| n.name == alt.worker_name)
                         .map(|n| format!("{}:{}", n.host, n.port))
                         .unwrap_or_else(|| decision.endpoint.clone())
                 });
@@ -329,7 +329,7 @@ async fn resolve_routes_with_circuit_breaker(
             let fallback = RouteDecision {
                 subtask_id,
                 model_id: alt.model_id.clone(),
-                node_name: alt.node_name.clone(),
+                worker_name: alt.worker_name.clone(),
                 endpoint,
                 score: alt.clone(),
                 alternatives: vec![], // Simplify: don't chain further
@@ -350,7 +350,7 @@ async fn resolve_routes_with_circuit_breaker(
                         subtask_id
                     ),
                     "subtask_id": subtask_id,
-                    "rejected_node": decision.node_name,
+                    "rejected_node": decision.worker_name,
                 })),
             ));
         }
@@ -520,11 +520,11 @@ mod tests {
         let decision = RouteDecision {
             subtask_id: Uuid::new_v4(),
             model_id: "model-a".to_string(),
-            node_name: "bad-node".to_string(),
+            worker_name: "bad-node".to_string(),
             endpoint: "http://bad-node:8080".to_string(),
             score: ModelScore {
                 model_id: "model-a".to_string(),
-                node_name: "bad-node".to_string(),
+                worker_name: "bad-node".to_string(),
                 specialty_score: 1.0,
                 health_score: 1.0,
                 load_score: 1.0,
@@ -534,7 +534,7 @@ mod tests {
             },
             alternatives: vec![ModelScore {
                 model_id: "model-b".to_string(),
-                node_name: "good-node".to_string(),
+                worker_name: "good-node".to_string(),
                 specialty_score: 0.8,
                 health_score: 1.0,
                 load_score: 1.0,
@@ -584,7 +584,7 @@ mod tests {
 
         assert_eq!(resolved.len(), 1);
         let (_, d) = resolved.into_iter().next().unwrap();
-        assert_eq!(d.node_name, "good-node");
+        assert_eq!(d.worker_name, "good-node");
         assert_eq!(d.model_id, "model-b");
     }
 
@@ -599,11 +599,11 @@ mod tests {
         let decision = RouteDecision {
             subtask_id: Uuid::new_v4(),
             model_id: "model-a".to_string(),
-            node_name: "bad-node".to_string(),
+            worker_name: "bad-node".to_string(),
             endpoint: "http://bad-node:8080".to_string(),
             score: ModelScore {
                 model_id: "model-a".to_string(),
-                node_name: "bad-node".to_string(),
+                worker_name: "bad-node".to_string(),
                 specialty_score: 1.0,
                 health_score: 1.0,
                 load_score: 1.0,
@@ -613,7 +613,7 @@ mod tests {
             },
             alternatives: vec![ModelScore {
                 model_id: "model-b".to_string(),
-                node_name: "bad-node".to_string(),
+                worker_name: "bad-node".to_string(),
                 specialty_score: 0.8,
                 health_score: 1.0,
                 load_score: 1.0,
@@ -693,7 +693,7 @@ mod tests {
                     output: format!("Result for {subtask_id}"),
                     error: None,
                     model_id: Some("qwen3-32b".to_string()),
-                    node_name: Some("test-node".to_string()),
+                    worker_name: Some("test-node".to_string()),
                     started_at: Some(Utc::now()),
                     completed_at: Some(Utc::now()),
                     duration_ms: Some(100),

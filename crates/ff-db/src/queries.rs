@@ -75,7 +75,7 @@ pub struct SessionRow {
     pub id: String,
     pub channel: String,
     pub user_id: Option<String>,
-    pub node_name: Option<String>,
+    pub worker_name: Option<String>,
     pub status: String,
     pub metadata_json: String,
     pub created_at: String,
@@ -92,7 +92,7 @@ pub struct AuditLogRow {
     pub actor: String,
     pub target: Option<String>,
     pub details_json: String,
-    pub node_name: Option<String>,
+    pub worker_name: Option<String>,
 }
 
 /// An autonomy decision event.
@@ -589,7 +589,7 @@ pub fn list_tasks_by_status(conn: &Connection, status: &str) -> Result<Vec<TaskR
 ///
 /// Eligible tasks are those in `pending`, `todo`, or `backlog` state with no
 /// assigned node. Selection order is priority DESC, then oldest created_at.
-pub fn claim_next_task(conn: &mut Connection, node_name: &str) -> Result<Option<TaskRow>> {
+pub fn claim_next_task(conn: &mut Connection, worker_name: &str) -> Result<Option<TaskRow>> {
     let tx = conn.transaction()?;
 
     let mut stmt = tx.prepare(
@@ -631,12 +631,12 @@ pub fn claim_next_task(conn: &mut Connection, node_name: &str) -> Result<Option<
           WHERE id = ?3
             AND status IN ('pending', 'todo', 'backlog')
             AND (assigned_node IS NULL OR assigned_node = '')",
-        params![node_name, now, task.id],
+        params![worker_name, now, task.id],
     )?;
 
     if changed == 1 {
         task.status = "claimed".to_string();
-        task.assigned_node = Some(node_name.to_string());
+        task.assigned_node = Some(worker_name.to_string());
         task.started_at = Some(now);
         tx.commit()?;
         Ok(Some(task))
@@ -702,12 +702,12 @@ pub fn record_task_result(
 }
 
 /// Assign a task to a node and mark it as running.
-pub fn assign_task(conn: &Connection, task_id: &str, node_name: &str) -> Result<bool> {
+pub fn assign_task(conn: &Connection, task_id: &str, worker_name: &str) -> Result<bool> {
     let now = Utc::now().to_rfc3339();
     let changed = conn.execute(
         "UPDATE tasks SET status = 'running', assigned_node = ?1, started_at = ?2
          WHERE id = ?3 AND status = 'pending'",
-        params![node_name, now, task_id],
+        params![worker_name, now, task_id],
     )?;
     Ok(changed > 0)
 }
@@ -1043,10 +1043,10 @@ fn map_memory_row(row: &rusqlite::Row) -> rusqlite::Result<MemoryRow> {
 /// Insert a new session.
 pub fn insert_session(conn: &Connection, session: &SessionRow) -> Result<()> {
     conn.execute(
-        "INSERT INTO sessions (id, channel, user_id, node_name, status, metadata_json, created_at, last_activity, closed_at)
+        "INSERT INTO sessions (id, channel, user_id, worker_name, status, metadata_json, created_at, last_activity, closed_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
-            session.id, session.channel, session.user_id, session.node_name,
+            session.id, session.channel, session.user_id, session.worker_name,
             session.status, session.metadata_json, session.created_at,
             session.last_activity, session.closed_at
         ],
@@ -1058,7 +1058,7 @@ pub fn insert_session(conn: &Connection, session: &SessionRow) -> Result<()> {
 pub fn get_session(conn: &Connection, id: &str) -> Result<Option<SessionRow>> {
     let row = conn
         .query_row(
-            "SELECT id, channel, user_id, node_name, status, metadata_json,
+            "SELECT id, channel, user_id, worker_name, status, metadata_json,
                     created_at, last_activity, closed_at
              FROM sessions WHERE id = ?1",
             [id],
@@ -1067,7 +1067,7 @@ pub fn get_session(conn: &Connection, id: &str) -> Result<Option<SessionRow>> {
                     id: row.get(0)?,
                     channel: row.get(1)?,
                     user_id: row.get(2)?,
-                    node_name: row.get(3)?,
+                    worker_name: row.get(3)?,
                     status: row.get(4)?,
                     metadata_json: row.get(5)?,
                     created_at: row.get(6)?,
@@ -1087,7 +1087,7 @@ pub fn find_active_sessions(
     user_id: &str,
 ) -> Result<Vec<SessionRow>> {
     let mut stmt = conn.prepare(
-        "SELECT id, channel, user_id, node_name, status, metadata_json,
+        "SELECT id, channel, user_id, worker_name, status, metadata_json,
                 created_at, last_activity, closed_at
          FROM sessions
          WHERE channel = ?1 AND user_id = ?2 AND status = 'active'
@@ -1100,7 +1100,7 @@ pub fn find_active_sessions(
             id: row.get(0)?,
             channel: row.get(1)?,
             user_id: row.get(2)?,
-            node_name: row.get(3)?,
+            worker_name: row.get(3)?,
             status: row.get(4)?,
             metadata_json: row.get(5)?,
             created_at: row.get(6)?,
@@ -1142,12 +1142,12 @@ pub fn audit_log(
     actor: &str,
     target: Option<&str>,
     details_json: &str,
-    node_name: Option<&str>,
+    worker_name: Option<&str>,
 ) -> Result<i64> {
     conn.execute(
-        "INSERT INTO audit_log (event_type, actor, target, details_json, node_name)
+        "INSERT INTO audit_log (event_type, actor, target, details_json, worker_name)
          VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![event_type, actor, target, details_json, node_name],
+        params![event_type, actor, target, details_json, worker_name],
     )?;
     Ok(conn.last_insert_rowid())
 }
@@ -1155,7 +1155,7 @@ pub fn audit_log(
 /// Get recent audit log entries.
 pub fn recent_audit_log(conn: &Connection, limit: u32) -> Result<Vec<AuditLogRow>> {
     let mut stmt = conn.prepare(
-        "SELECT id, timestamp, event_type, actor, target, details_json, node_name
+        "SELECT id, timestamp, event_type, actor, target, details_json, worker_name
          FROM audit_log ORDER BY id DESC LIMIT ?1",
     )?;
 
@@ -1167,7 +1167,7 @@ pub fn recent_audit_log(conn: &Connection, limit: u32) -> Result<Vec<AuditLogRow
             actor: row.get(3)?,
             target: row.get(4)?,
             details_json: row.get(5)?,
-            node_name: row.get(6)?,
+            worker_name: row.get(6)?,
         })
     })?;
 
@@ -1402,7 +1402,7 @@ fn default_tooling() -> JsonValue {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FleetModelRow {
     pub id: String,
-    pub node_name: String,
+    pub worker_name: String,
     pub slug: String,
     pub name: String,
     pub family: String,
@@ -1567,9 +1567,9 @@ pub async fn pg_upsert_node(pool: &PgPool, node: &FleetNodeRow) -> Result<()> {
 /// List all fleet models from Postgres.
 pub async fn pg_list_models(pool: &PgPool) -> Result<Vec<FleetModelRow>> {
     let rows = sqlx::query(
-        "SELECT id, node_name, slug, name, family, port, tier,
+        "SELECT id, worker_name, slug, name, family, port, tier,
                 local_model, lifecycle, mode, preferred_workloads
-         FROM fleet_models ORDER BY node_name, slug
+         FROM fleet_models ORDER BY worker_name, slug
          LIMIT 100",
     )
     .fetch_all(pool)
@@ -1579,7 +1579,7 @@ pub async fn pg_list_models(pool: &PgPool) -> Result<Vec<FleetModelRow>> {
         .iter()
         .map(|r| FleetModelRow {
             id: r.get("id"),
-            node_name: r.get("node_name"),
+            worker_name: r.get("worker_name"),
             slug: r.get("slug"),
             name: r.get("name"),
             family: r.get("family"),
@@ -1596,9 +1596,9 @@ pub async fn pg_list_models(pool: &PgPool) -> Result<Vec<FleetModelRow>> {
 /// List fleet models for a specific node from Postgres.
 pub async fn pg_list_models_for_node(pool: &PgPool, node: &str) -> Result<Vec<FleetModelRow>> {
     let rows = sqlx::query(
-        "SELECT id, node_name, slug, name, family, port, tier,
+        "SELECT id, worker_name, slug, name, family, port, tier,
                 local_model, lifecycle, mode, preferred_workloads
-         FROM fleet_models WHERE node_name = $1 ORDER BY slug
+         FROM fleet_models WHERE worker_name = $1 ORDER BY slug
          LIMIT 100",
     )
     .bind(node)
@@ -1609,7 +1609,7 @@ pub async fn pg_list_models_for_node(pool: &PgPool, node: &str) -> Result<Vec<Fl
         .iter()
         .map(|r| FleetModelRow {
             id: r.get("id"),
-            node_name: r.get("node_name"),
+            worker_name: r.get("worker_name"),
             slug: r.get("slug"),
             name: r.get("name"),
             family: r.get("family"),
@@ -1633,14 +1633,14 @@ pub async fn pg_list_models_by_workload(
     let workloads_json = serde_json::to_value(workloads)?;
     let rows = sqlx::query(
         "SELECT
-            m.id, m.node_name, m.slug, m.name, m.family, m.port, m.tier,
+            m.id, m.worker_name, m.slug, m.name, m.family, m.port, m.tier,
             m.local_model, m.lifecycle, m.mode, m.preferred_workloads,
             n.primary_ip, n.status
          FROM fleet_models m
-         JOIN fleet_workers n ON n.name = m.node_name
+         JOIN fleet_workers n ON n.name = m.worker_name
          WHERE m.preferred_workloads @> $1::jsonb
            AND n.status IN ('online', 'degraded')
-         ORDER BY m.tier ASC, m.node_name, m.slug
+         ORDER BY m.tier ASC, m.worker_name, m.slug
          LIMIT 100",
     )
     .bind(&workloads_json)
@@ -1652,7 +1652,7 @@ pub async fn pg_list_models_by_workload(
         .map(|r| {
             let model = FleetModelRow {
                 id: r.get("id"),
-                node_name: r.get("node_name"),
+                worker_name: r.get("worker_name"),
                 slug: r.get("slug"),
                 name: r.get("name"),
                 family: r.get("family"),
@@ -1673,11 +1673,11 @@ pub async fn pg_list_models_by_workload(
 /// Upsert a fleet model in Postgres.
 pub async fn pg_upsert_model(pool: &PgPool, model: &FleetModelRow) -> Result<()> {
     sqlx::query(
-        "INSERT INTO fleet_models (id, node_name, slug, name, family, port, tier,
+        "INSERT INTO fleet_models (id, worker_name, slug, name, family, port, tier,
                 local_model, lifecycle, mode, preferred_workloads, updated_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
          ON CONFLICT (id) DO UPDATE SET
-            node_name = EXCLUDED.node_name,
+            worker_name = EXCLUDED.worker_name,
             slug = EXCLUDED.slug,
             name = EXCLUDED.name,
             family = EXCLUDED.family,
@@ -1690,7 +1690,7 @@ pub async fn pg_upsert_model(pool: &PgPool, model: &FleetModelRow) -> Result<()>
             updated_at = NOW()",
     )
     .bind(&model.id)
-    .bind(&model.node_name)
+    .bind(&model.worker_name)
     .bind(&model.slug)
     .bind(&model.name)
     .bind(&model.family)
@@ -2009,7 +2009,7 @@ pub async fn pg_get_catalog(pool: &PgPool, id: &str) -> Result<Option<ModelCatal
 #[derive(Debug, Clone)]
 pub struct ModelLibraryRow {
     pub id: String,
-    pub node_name: String,
+    pub worker_name: String,
     pub catalog_id: String,
     pub runtime: String,
     pub quant: Option<String>,
@@ -2021,11 +2021,11 @@ pub struct ModelLibraryRow {
     pub source_url: Option<String>,
 }
 
-/// Upsert a library entry keyed by (node_name, file_path). Returns library id.
+/// Upsert a library entry keyed by (worker_name, file_path). Returns library id.
 #[allow(clippy::too_many_arguments)]
 pub async fn pg_upsert_library(
     pool: &PgPool,
-    node_name: &str,
+    worker_name: &str,
     catalog_id: &str,
     runtime: &str,
     quant: Option<&str>,
@@ -2036,9 +2036,9 @@ pub async fn pg_upsert_library(
 ) -> Result<String> {
     let row = sqlx::query(
         "INSERT INTO fleet_model_library
-            (node_name, catalog_id, runtime, quant, file_path, size_bytes, sha256, source_url)
+            (worker_name, catalog_id, runtime, quant, file_path, size_bytes, sha256, source_url)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-         ON CONFLICT (node_name, file_path) DO UPDATE SET
+         ON CONFLICT (worker_name, file_path) DO UPDATE SET
             catalog_id = EXCLUDED.catalog_id,
             runtime = EXCLUDED.runtime,
             quant = COALESCE(EXCLUDED.quant, fleet_model_library.quant),
@@ -2047,7 +2047,7 @@ pub async fn pg_upsert_library(
             source_url = COALESCE(EXCLUDED.source_url, fleet_model_library.source_url)
          RETURNING id",
     )
-    .bind(node_name)
+    .bind(worker_name)
     .bind(catalog_id)
     .bind(runtime)
     .bind(quant)
@@ -2064,17 +2064,17 @@ pub async fn pg_upsert_library(
 /// List all library entries, optionally filtered by node.
 pub async fn pg_list_library(
     pool: &PgPool,
-    node_name: Option<&str>,
+    worker_name: Option<&str>,
 ) -> Result<Vec<ModelLibraryRow>> {
-    let rows = if let Some(n) = node_name {
+    let rows = if let Some(n) = worker_name {
         sqlx::query(
-            "SELECT * FROM fleet_model_library WHERE node_name = $1 ORDER BY node_name, catalog_id LIMIT 100",
+            "SELECT * FROM fleet_model_library WHERE worker_name = $1 ORDER BY worker_name, catalog_id LIMIT 100",
         )
         .bind(n)
         .fetch_all(pool)
         .await?
     } else {
-        sqlx::query("SELECT * FROM fleet_model_library ORDER BY node_name, catalog_id LIMIT 100")
+        sqlx::query("SELECT * FROM fleet_model_library ORDER BY worker_name, catalog_id LIMIT 100")
             .fetch_all(pool)
             .await?
     };
@@ -2084,7 +2084,7 @@ pub async fn pg_list_library(
             let id: sqlx::types::Uuid = r.get("id");
             ModelLibraryRow {
                 id: id.to_string(),
-                node_name: r.get("node_name"),
+                worker_name: r.get("worker_name"),
                 catalog_id: r.get("catalog_id"),
                 runtime: r.get("runtime"),
                 quant: r.get("quant"),
@@ -2114,7 +2114,7 @@ pub async fn pg_delete_library(pool: &PgPool, id: &str) -> Result<bool> {
 #[derive(Debug, Clone)]
 pub struct ModelDeploymentRow {
     pub id: String,
-    pub node_name: String,
+    pub worker_name: String,
     pub library_id: Option<String>,
     pub catalog_id: Option<String>,
     pub runtime: String,
@@ -2131,17 +2131,17 @@ pub struct ModelDeploymentRow {
 /// List deployments optionally filtered by node.
 pub async fn pg_list_deployments(
     pool: &PgPool,
-    node_name: Option<&str>,
+    worker_name: Option<&str>,
 ) -> Result<Vec<ModelDeploymentRow>> {
-    let rows = if let Some(n) = node_name {
+    let rows = if let Some(n) = worker_name {
         sqlx::query(
-            "SELECT * FROM fleet_model_deployments WHERE node_name = $1 ORDER BY node_name, port LIMIT 100",
+            "SELECT * FROM fleet_model_deployments WHERE worker_name = $1 ORDER BY worker_name, port LIMIT 100",
         )
         .bind(n)
         .fetch_all(pool)
         .await?
     } else {
-        sqlx::query("SELECT * FROM fleet_model_deployments ORDER BY node_name, port LIMIT 100")
+        sqlx::query("SELECT * FROM fleet_model_deployments ORDER BY worker_name, port LIMIT 100")
             .fetch_all(pool)
             .await?
     };
@@ -2152,7 +2152,7 @@ pub async fn pg_list_deployments(
             let lib_id: Option<sqlx::types::Uuid> = r.get("library_id");
             ModelDeploymentRow {
                 id: id.to_string(),
-                node_name: r.get("node_name"),
+                worker_name: r.get("worker_name"),
                 library_id: lib_id.map(|u| u.to_string()),
                 catalog_id: r.get("catalog_id"),
                 runtime: r.get("runtime"),
@@ -2173,7 +2173,7 @@ pub async fn pg_list_deployments(
 #[allow(clippy::too_many_arguments)]
 pub async fn pg_upsert_deployment(
     pool: &PgPool,
-    node_name: &str,
+    worker_name: &str,
     library_id: Option<&str>,
     catalog_id: Option<&str>,
     runtime: &str,
@@ -2190,9 +2190,9 @@ pub async fn pg_upsert_deployment(
         .transpose()?;
     let row = sqlx::query(
         "INSERT INTO fleet_model_deployments
-            (node_name, library_id, catalog_id, runtime, port, pid, health_status, context_window, last_health_at)
+            (worker_name, library_id, catalog_id, runtime, port, pid, health_status, context_window, last_health_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
-         ON CONFLICT (node_name, port) DO UPDATE SET
+         ON CONFLICT (worker_name, port) DO UPDATE SET
             library_id = EXCLUDED.library_id,
             catalog_id = EXCLUDED.catalog_id,
             runtime = EXCLUDED.runtime,
@@ -2202,7 +2202,7 @@ pub async fn pg_upsert_deployment(
             last_health_at = NOW()
          RETURNING id",
     )
-    .bind(node_name)
+    .bind(worker_name)
     .bind(lib_uuid)
     .bind(catalog_id)
     .bind(runtime)
@@ -2230,7 +2230,7 @@ pub async fn pg_delete_deployment(pool: &PgPool, id: &str) -> Result<bool> {
 /// Record a disk usage sample.
 pub async fn pg_insert_disk_usage(
     pool: &PgPool,
-    node_name: &str,
+    worker_name: &str,
     models_dir: &str,
     total_bytes: i64,
     used_bytes: i64,
@@ -2238,10 +2238,10 @@ pub async fn pg_insert_disk_usage(
     models_bytes: i64,
 ) -> Result<()> {
     sqlx::query(
-        "INSERT INTO fleet_disk_usage (node_name, models_dir, total_bytes, used_bytes, free_bytes, models_bytes)
+        "INSERT INTO fleet_disk_usage (worker_name, models_dir, total_bytes, used_bytes, free_bytes, models_bytes)
          VALUES ($1, $2, $3, $4, $5, $6)",
     )
-    .bind(node_name)
+    .bind(worker_name)
     .bind(models_dir)
     .bind(total_bytes)
     .bind(used_bytes)
@@ -2267,10 +2267,10 @@ pub async fn pg_latest_disk_usage(
     )>,
 > {
     let rows = sqlx::query(
-        "SELECT DISTINCT ON (node_name)
-                node_name, models_dir, total_bytes, used_bytes, free_bytes, models_bytes, sampled_at
+        "SELECT DISTINCT ON (worker_name)
+                worker_name, models_dir, total_bytes, used_bytes, free_bytes, models_bytes, sampled_at
            FROM fleet_disk_usage
-          ORDER BY node_name, sampled_at DESC
+          ORDER BY worker_name, sampled_at DESC
           LIMIT 100",
     )
     .fetch_all(pool)
@@ -2279,7 +2279,7 @@ pub async fn pg_latest_disk_usage(
         .iter()
         .map(|r| {
             (
-                r.get::<String, _>("node_name"),
+                r.get::<String, _>("worker_name"),
                 r.get::<String, _>("models_dir"),
                 r.get::<i64, _>("total_bytes"),
                 r.get::<i64, _>("used_bytes"),
@@ -2295,7 +2295,7 @@ pub async fn pg_latest_disk_usage(
 #[derive(Debug, Clone)]
 pub struct ModelJobRow {
     pub id: String,
-    pub node_name: String,
+    pub worker_name: String,
     pub kind: String,
     pub target_catalog_id: Option<String>,
     pub target_library_id: Option<String>,
@@ -2314,7 +2314,7 @@ pub struct ModelJobRow {
 /// Insert a new model lifecycle job. Returns job id.
 pub async fn pg_create_job(
     pool: &PgPool,
-    node_name: &str,
+    worker_name: &str,
     kind: &str,
     target_catalog_id: Option<&str>,
     target_library_id: Option<&str>,
@@ -2327,11 +2327,11 @@ pub async fn pg_create_job(
         })
         .transpose()?;
     let row = sqlx::query(
-        "INSERT INTO fleet_model_jobs (node_name, kind, target_catalog_id, target_library_id, params)
+        "INSERT INTO fleet_model_jobs (worker_name, kind, target_catalog_id, target_library_id, params)
          VALUES ($1, $2, $3, $4, $5)
          RETURNING id",
     )
-    .bind(node_name)
+    .bind(worker_name)
     .bind(kind)
     .bind(target_catalog_id)
     .bind(lib_uuid)
@@ -2407,7 +2407,7 @@ pub async fn pg_list_jobs(
             let lib_id: Option<sqlx::types::Uuid> = r.get("target_library_id");
             ModelJobRow {
                 id: id.to_string(),
-                node_name: r.get("node_name"),
+                worker_name: r.get("worker_name"),
                 kind: r.get("kind"),
                 target_catalog_id: r.get("target_catalog_id"),
                 target_library_id: lib_id.map(|u| u.to_string()),
@@ -2473,7 +2473,7 @@ pub async fn pg_insert_worker_ssh_key(
 /// [`pg_insert_worker_ssh_key`] unchanged.
 pub async fn pg_insert_node_ssh_key(
     pool: &PgPool,
-    node_name: &str,
+    worker_name: &str,
     key_purpose: &str,
     public_key: &str,
     key_type: &str,
@@ -2481,7 +2481,7 @@ pub async fn pg_insert_node_ssh_key(
 ) -> Result<()> {
     pg_insert_worker_ssh_key(
         pool,
-        node_name,
+        worker_name,
         key_purpose,
         public_key,
         key_type,
@@ -2531,10 +2531,10 @@ pub async fn pg_list_worker_ssh_keys(
 /// Legacy alias retained during the rename window.
 pub async fn pg_list_node_ssh_keys(
     pool: &PgPool,
-    node_name: &str,
+    worker_name: &str,
     purpose: Option<&str>,
 ) -> Result<Vec<WorkerSshKeyRow>> {
-    pg_list_worker_ssh_keys(pool, node_name, purpose).await
+    pg_list_worker_ssh_keys(pool, worker_name, purpose).await
 }
 
 /// Delete all SSH keys for a worker (used during `ff onboard revoke`).
@@ -2547,8 +2547,8 @@ pub async fn pg_delete_worker_ssh_keys(pool: &PgPool, worker_name: &str) -> Resu
 }
 
 /// Legacy alias retained during the rename window.
-pub async fn pg_delete_node_ssh_keys(pool: &PgPool, node_name: &str) -> Result<u64> {
-    pg_delete_worker_ssh_keys(pool, node_name).await
+pub async fn pg_delete_node_ssh_keys(pool: &PgPool, worker_name: &str) -> Result<u64> {
+    pg_delete_worker_ssh_keys(pool, worker_name).await
 }
 
 /// One row in the mesh-reachability matrix.
@@ -3073,7 +3073,7 @@ pub async fn seed_from_fleet_toml(
             let model_id = format!("{name}:{slug}");
             let model_row = FleetModelRow {
                 id: model_id,
-                node_name: name.clone(),
+                worker_name: name.clone(),
                 slug: slug.clone(),
                 name: model_cfg.name.clone(),
                 family: model_cfg.family.clone().unwrap_or_default(),
@@ -3166,7 +3166,7 @@ pub async fn load_fleet_config_from_postgres(
         };
 
         // Attach models that belong to this node.
-        for m in pg_models.iter().filter(|m| m.node_name == n.name) {
+        for m in pg_models.iter().filter(|m| m.worker_name == n.name) {
             let model_cfg = NodeModelConfig {
                 name: m.name.clone(),
                 family: Some(m.family.clone()).filter(|s| !s.is_empty()),
@@ -3499,7 +3499,7 @@ mod tests {
             id: Uuid::new_v4().to_string(),
             channel: "telegram".into(),
             user_id: Some("user123".into()),
-            node_name: Some("taylor".into()),
+            worker_name: Some("taylor".into()),
             status: "active".into(),
             metadata_json: "{}".into(),
             created_at: Utc::now().to_rfc3339(),

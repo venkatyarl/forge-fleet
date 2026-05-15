@@ -53,7 +53,7 @@ fn log_tool_usage(tool_name: &str, session_id: &str, success: bool, duration_ms:
         return;
     }
     let payload = serde_json::json!({
-        "node_name": node,
+        "worker_name": node,
         "tool_name": tool_name,
         "session_id": session_id,
         "success": success,

@@ -44,7 +44,7 @@ pub struct AppState {
     config_path: PathBuf,
 
     /// This node's name (e.g. "taylor", "marcus").
-    node_name: Arc<String>,
+    worker_name: Arc<String>,
 
     /// This node's role.
     role: Role,
@@ -74,12 +74,12 @@ impl AppState {
         config_rx: ConfigReceiver,
         config_tx: ConfigBroadcaster,
         config_path: PathBuf,
-        node_name: impl Into<String>,
+        worker_name: impl Into<String>,
         role: Role,
     ) -> Self {
-        let node_name = node_name.into();
+        let worker_name = worker_name.into();
         info!(
-            node = %node_name,
+            node = %worker_name,
             role = %role,
             config = %config_path.display(),
             "AppState initialized"
@@ -88,7 +88,7 @@ impl AppState {
             config_rx,
             config_tx: Arc::new(Mutex::new(config_tx)),
             config_path,
-            node_name: Arc::new(node_name),
+            worker_name: Arc::new(worker_name),
             role,
             db_pool: None,
         }
@@ -156,8 +156,8 @@ impl AppState {
     }
 
     /// This node's name.
-    pub fn node_name(&self) -> &str {
-        &self.node_name
+    pub fn worker_name(&self) -> &str {
+        &self.worker_name
     }
 
     /// This node's role.
@@ -181,7 +181,7 @@ impl AppState {
 impl std::fmt::Debug for AppState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AppState")
-            .field("node_name", &self.node_name)
+            .field("worker_name", &self.worker_name)
             .field("role", &self.role)
             .field("config_path", &self.config_path)
             .field("has_db", &self.db_pool.is_some())
@@ -198,7 +198,7 @@ impl std::fmt::Debug for AppState {
 /// let (tx, rx) = hot_reload::new_broadcast(config);
 /// let state = AppStateBuilder::new(rx, tx)
 ///     .config_path(path)
-///     .node_name("taylor")
+///     .worker_name("taylor")
 ///     .role(Role::Gateway)
 ///     .build();
 /// ```
@@ -206,7 +206,7 @@ pub struct AppStateBuilder {
     config_rx: ConfigReceiver,
     config_tx: ConfigBroadcaster,
     config_path: PathBuf,
-    node_name: String,
+    worker_name: String,
     role: Role,
     db_pool: Option<Arc<dyn std::any::Any + Send + Sync>>,
 }
@@ -217,7 +217,7 @@ impl AppStateBuilder {
             config_rx,
             config_tx,
             config_path: PathBuf::from("fleet.toml"),
-            node_name: "unknown".into(),
+            worker_name: "unknown".into(),
             role: Role::Worker,
             db_pool: None,
         }
@@ -228,8 +228,8 @@ impl AppStateBuilder {
         self
     }
 
-    pub fn node_name(mut self, name: impl Into<String>) -> Self {
-        self.node_name = name.into();
+    pub fn worker_name(mut self, name: impl Into<String>) -> Self {
+        self.worker_name = name.into();
         self
     }
 
@@ -245,7 +245,7 @@ impl AppStateBuilder {
 
     pub fn build(self) -> AppState {
         info!(
-            node = %self.node_name,
+            node = %self.worker_name,
             role = %self.role,
             config = %self.config_path.display(),
             "AppState built via builder"
@@ -254,7 +254,7 @@ impl AppStateBuilder {
             config_rx: self.config_rx,
             config_tx: Arc::new(Mutex::new(self.config_tx)),
             config_path: self.config_path,
-            node_name: Arc::new(self.node_name),
+            worker_name: Arc::new(self.worker_name),
             role: self.role,
             db_pool: self.db_pool,
         }
@@ -293,7 +293,7 @@ heartbeat_interval_secs = 15
             Role::Gateway,
         );
 
-        assert_eq!(state.node_name(), "taylor");
+        assert_eq!(state.worker_name(), "taylor");
         assert_eq!(state.role(), Role::Gateway);
         assert_eq!(state.config().fleet.name, "TestFleet");
         assert!(!state.has_db());
@@ -306,11 +306,11 @@ heartbeat_interval_secs = 15
 
         let state = AppStateBuilder::new(rx, tx)
             .config_path("/tmp/fleet.toml")
-            .node_name("marcus")
+            .worker_name("marcus")
             .role(Role::Builder)
             .build();
 
-        assert_eq!(state.node_name(), "marcus");
+        assert_eq!(state.worker_name(), "marcus");
         assert_eq!(state.role(), Role::Builder);
         assert_eq!(state.config().fleet.name, "TestFleet");
     }
@@ -329,7 +329,7 @@ heartbeat_interval_secs = 15
         );
 
         let cloned = state.clone();
-        assert_eq!(cloned.node_name(), "taylor");
+        assert_eq!(cloned.worker_name(), "taylor");
         assert_eq!(cloned.config().fleet.name, "TestFleet");
     }
 
@@ -453,7 +453,7 @@ heartbeat_interval_secs = 15
 
         let state = AppStateBuilder::new(rx, tx)
             .config_path("/tmp/fleet.toml")
-            .node_name("taylor")
+            .worker_name("taylor")
             .role(Role::Gateway)
             .db(42u64)
             .build();

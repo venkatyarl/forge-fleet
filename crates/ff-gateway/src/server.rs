@@ -1374,7 +1374,7 @@ async fn audit_recent(
                 "action": row.event_type,
                 "target": row.target,
                 "details": details,
-                "node": row.node_name,
+                "node": row.worker_name,
             })
         })
         .collect();
@@ -5704,10 +5704,10 @@ async fn route_fleet_capability(
     )> = Vec::new();
     let mut alternatives: Vec<AlternativeCandidate> = Vec::new();
 
-    for (node_name, slug, name, tier, endpoint, pw, beat) in &candidates {
-        let is_local = node_name.to_lowercase() == local_hostname
-            || local_hostname.starts_with(&node_name.to_lowercase())
-            || node_name.to_lowercase().starts_with(&local_hostname);
+    for (worker_name, slug, name, tier, endpoint, pw, beat) in &candidates {
+        let is_local = worker_name.to_lowercase() == local_hostname
+            || local_hostname.starts_with(&worker_name.to_lowercase())
+            || worker_name.to_lowercase().starts_with(&local_hostname);
         let qd = beat
             .get("queue_depth")
             .and_then(|v| v.as_i64())
@@ -5731,7 +5731,7 @@ async fn route_fleet_capability(
             tps,
             slug.clone(),
             name.clone(),
-            node_name.clone(),
+            worker_name.clone(),
             endpoint.clone(),
             pw.clone(),
             *beat,
@@ -5746,7 +5746,7 @@ async fn route_fleet_capability(
             .then_with(|| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal)) // tps descending
     });
 
-    if let Some((_, tier, qd, tps, slug, name, node_name, endpoint, pw, _beat)) = scored.first() {
+    if let Some((_, tier, qd, tps, slug, name, worker_name, endpoint, pw, _beat)) = scored.first() {
         let caps = pw
             .as_array()
             .map(|arr| {
@@ -5756,7 +5756,7 @@ async fn route_fleet_capability(
             })
             .unwrap_or_default();
 
-        let is_local = node_name.to_lowercase() == local_hostname;
+        let is_local = worker_name.to_lowercase() == local_hostname;
         let reason = if is_local && req.preferred_local {
             format!("local match, tier {tier}, queue_depth {qd}")
         } else {
@@ -5776,7 +5776,7 @@ async fn route_fleet_capability(
 
         return Ok(Json(RouteFleetResponse {
             target: endpoint.clone(),
-            node: node_name.clone(),
+            node: worker_name.clone(),
             model: slug.clone(),
             model_name: name.clone(),
             capabilities: caps,

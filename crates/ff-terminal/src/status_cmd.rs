@@ -167,12 +167,12 @@ pub async fn handle_status_inner(p: PathBuf) -> Result<()> {
     if let Some(pool) = &pool_opt {
         // Latest sample per node.
         let rows: Vec<(String, i64, i64, i64, i32)> = sqlx::query_as(
-            "SELECT DISTINCT ON (d.node_name) \
-                    d.node_name, d.total_bytes, d.used_bytes, d.models_bytes, \
+            "SELECT DISTINCT ON (d.worker_name) \
+                    d.worker_name, d.total_bytes, d.used_bytes, d.models_bytes, \
                     COALESCE(n.disk_quota_pct, 80) \
              FROM fleet_disk_usage d \
-             LEFT JOIN fleet_workers n ON n.name = d.node_name \
-             ORDER BY d.node_name, d.sampled_at DESC",
+             LEFT JOIN fleet_workers n ON n.name = d.worker_name \
+             ORDER BY d.worker_name, d.sampled_at DESC",
         )
         .fetch_all(pool)
         .await

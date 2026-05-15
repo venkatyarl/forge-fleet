@@ -31,7 +31,7 @@ pub struct TransferResult {
 
 /// Minimal subset of the library row we need for transfer.
 struct LibraryRow {
-    node_name: String,
+    worker_name: String,
     catalog_id: String,
     runtime: String,
     quant: Option<String>,
@@ -45,7 +45,7 @@ async fn fetch_library(pool: &PgPool, id: &str) -> Result<LibraryRow, String> {
     let uuid =
         sqlx::types::Uuid::parse_str(id).map_err(|e| format!("bad library uuid {id}: {e}"))?;
     let row = sqlx::query(
-        "SELECT node_name, catalog_id, runtime, quant, file_path, size_bytes, sha256, source_url
+        "SELECT worker_name, catalog_id, runtime, quant, file_path, size_bytes, sha256, source_url
          FROM fleet_model_library WHERE id = $1",
     )
     .bind(uuid)
@@ -55,7 +55,7 @@ async fn fetch_library(pool: &PgPool, id: &str) -> Result<LibraryRow, String> {
     .ok_or_else(|| format!("library row {id} not found"))?;
 
     Ok(LibraryRow {
-        node_name: row.get("node_name"),
+        worker_name: row.get("worker_name"),
         catalog_id: row.get("catalog_id"),
         runtime: row.get("runtime"),
         quant: row.get("quant"),
@@ -117,10 +117,10 @@ pub async fn transfer_model(
 ) -> Result<TransferResult, String> {
     // 1. Fetch source library row.
     let src_lib = fetch_library(pool, &opts.library_id).await?;
-    if src_lib.node_name != opts.source_node {
+    if src_lib.worker_name != opts.source_node {
         return Err(format!(
             "library {} belongs to node {}, not {}",
-            opts.library_id, src_lib.node_name, opts.source_node
+            opts.library_id, src_lib.worker_name, opts.source_node
         ));
     }
 

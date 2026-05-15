@@ -872,7 +872,7 @@ async fn query_omni_endpoint() -> anyhow::Result<String> {
 
     let row = sqlx::query(
         "SELECT fn.ip, fm.port FROM fleet_models fm
-         JOIN fleet_workers fn ON fn.name = fm.node_name
+         JOIN fleet_workers fn ON fn.name = fm.worker_name
          WHERE fm.name ILIKE '%omni%' OR fm.name ILIKE '%multimodal%' OR fm.name ILIKE '%vision%'
          ORDER BY fn.cpu_cores DESC LIMIT 1",
     )

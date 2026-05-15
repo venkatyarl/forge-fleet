@@ -14,7 +14,7 @@ use uuid::Uuid;
 /// Evaluate all enabled project schedules and enqueue due tasks.
 ///
 /// Returns the number of tasks enqueued.
-pub async fn evaluate_schedules(pg: &PgPool, node_name: &str) -> Result<usize> {
+pub async fn evaluate_schedules(pg: &PgPool, worker_name: &str) -> Result<usize> {
     let rows = sqlx::query(
         r#"
         SELECT id, project_id, name, cron_expression, task_template
@@ -91,7 +91,7 @@ pub async fn evaluate_schedules(pg: &PgPool, node_name: &str) -> Result<usize> {
                 .map(|v| v as i32),
         )
         .bind(template.get("requires_capability").cloned())
-        .bind(node_name)
+        .bind(worker_name)
         .fetch_one(pg)
         .await?;
 
@@ -133,7 +133,7 @@ pub async fn evaluate_schedules(pg: &PgPool, node_name: &str) -> Result<usize> {
 /// The tick is leader-gated via Postgres `fleet_leader_state`.
 pub fn spawn_scheduler_tick(
     pg: PgPool,
-    node_name: String,
+    worker_name: String,
     interval_secs: u64,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
@@ -151,7 +151,7 @@ pub fn spawn_scheduler_tick(
                         )
                         "#
                     )
-                    .bind(&node_name)
+                    .bind(&worker_name)
                     .fetch_one(&pg)
                     .await
                     .unwrap_or(false);
@@ -160,7 +160,7 @@ pub fn spawn_scheduler_tick(
                         continue;
                     }
 
-                    if let Err(e) = evaluate_schedules(&pg, &node_name).await {
+                    if let Err(e) = evaluate_schedules(&pg, &worker_name).await {
                         warn!(error = %e, "scheduler tick failed");
                     }
                 }

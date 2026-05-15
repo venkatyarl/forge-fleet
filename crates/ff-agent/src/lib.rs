@@ -134,7 +134,7 @@ use tracing::{debug, info, warn};
 #[derive(Debug, Clone)]
 pub struct EmbeddedAgentConfig {
     /// Node name used for ownership and audit metadata.
-    pub node_name: String,
+    pub worker_name: String,
     /// Toggle autonomous claim/decompose/execute/report mode.
     pub autonomous_mode: bool,
     /// Poll interval for autonomous work claiming.
@@ -152,9 +152,9 @@ pub struct EmbeddedAgentConfig {
 
 impl EmbeddedAgentConfig {
     /// Backward-compatible heartbeat-only mode.
-    pub fn heartbeat_only(node_name: String) -> Self {
+    pub fn heartbeat_only(worker_name: String) -> Self {
         Self {
-            node_name,
+            worker_name,
             autonomous_mode: false,
             poll_interval_secs: 8,
             ownership_api_base_url: None,
@@ -192,15 +192,15 @@ struct ExecutionOutcome {
 #[derive(Clone)]
 struct LeaseClient {
     base_url: Option<String>,
-    node_name: String,
+    worker_name: String,
     http: reqwest::Client,
 }
 
 impl LeaseClient {
-    fn new(base_url: Option<String>, node_name: String) -> Self {
+    fn new(base_url: Option<String>, worker_name: String) -> Self {
         Self {
             base_url,
-            node_name,
+            worker_name,
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
@@ -216,7 +216,7 @@ impl LeaseClient {
 
         let payload = serde_json::json!({
             "task_id": task_id,
-            "owner": self.node_name,
+            "owner": self.worker_name,
             "ttl_secs": 90,
         });
 
@@ -257,7 +257,7 @@ impl LeaseClient {
 
         let payload = serde_json::json!({
             "task_id": task_id,
-            "owner": self.node_name,
+            "owner": self.worker_name,
         });
 
         for endpoint in [
@@ -286,7 +286,7 @@ pub async fn run(
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     info!(
-        node = %config.node_name,
+        node = %config.worker_name,
         autonomous = config.autonomous_mode,
         "ff-agent subsystem started"
     );
@@ -317,20 +317,20 @@ pub async fn run(
     if config.autonomous_mode {
         run_autonomous_loop(config, operational_store, &mut shutdown_rx).await?;
     } else {
-        run_heartbeat_loop(config.node_name.clone(), &mut shutdown_rx).await;
+        run_heartbeat_loop(config.worker_name.clone(), &mut shutdown_rx).await;
     }
 
     info!("ff-agent subsystem stopped");
     Ok(())
 }
 
-async fn run_heartbeat_loop(node_name: String, shutdown_rx: &mut watch::Receiver<bool>) {
+async fn run_heartbeat_loop(worker_name: String, shutdown_rx: &mut watch::Receiver<bool>) {
     let mut ticker = tokio::time::interval(Duration::from_secs(15));
 
     loop {
         tokio::select! {
             _ = ticker.tick() => {
-                info!(%node_name, "ff-agent heartbeat");
+                info!(%worker_name, "ff-agent heartbeat");
             }
             changed = shutdown_rx.changed() => {
                 if changed.is_err() || *shutdown_rx.borrow() {
@@ -348,7 +348,7 @@ async fn run_autonomous_loop(
 ) -> Result<()> {
     let lease_client = LeaseClient::new(
         config.ownership_api_base_url.clone(),
-        config.node_name.clone(),
+        config.worker_name.clone(),
     );
 
     let mut ticker = tokio::time::interval(Duration::from_secs(config.poll_interval_secs.max(1)));
@@ -356,7 +356,7 @@ async fn run_autonomous_loop(
     loop {
         tokio::select! {
             _ = ticker.tick() => {
-                if let Some(task) = claim_next(&operational_store, &config.node_name).await? {
+                if let Some(task) = claim_next(&operational_store, &config.worker_name).await? {
                     handle_claimed_task(&config, &operational_store, &lease_client, task).await?;
                 }
             }
@@ -371,9 +371,9 @@ async fn run_autonomous_loop(
     Ok(())
 }
 
-async fn claim_next(store: &OperationalStore, node_name: &str) -> Result<Option<TaskRow>> {
+async fn claim_next(store: &OperationalStore, worker_name: &str) -> Result<Option<TaskRow>> {
     store
-        .claim_next_task(node_name)
+        .claim_next_task(worker_name)
         .await
         .context("failed to claim next autonomous task")
 }
@@ -385,23 +385,23 @@ async fn handle_claimed_task(
     task: TaskRow,
 ) -> Result<()> {
     let task_id = task.id.clone();
-    info!(task_id = %task_id, node = %config.node_name, "claimed autonomous task");
+    info!(task_id = %task_id, node = %config.worker_name, "claimed autonomous task");
 
     persist_transition(
         store,
         &task_id,
         "queued",
         "claimed",
-        &config.node_name,
+        &config.worker_name,
         Some(serde_json::json!({"kind": task.kind})),
     )
     .await?;
 
-    if !acquire_lease(store, lease_client, &task_id, &config.node_name).await? {
+    if !acquire_lease(store, lease_client, &task_id, &config.worker_name).await? {
         persist_failed(
             store,
             &task_id,
-            &config.node_name,
+            &config.worker_name,
             "lease acquisition rejected",
             0,
         )
@@ -436,7 +436,7 @@ async fn handle_claimed_task(
             &claimed.task_id,
             "claimed",
             target_status,
-            &config.node_name,
+            &config.worker_name,
             Some(serde_json::json!({
                 "decision": decision.as_str(),
                 "action_type": action_type.as_str(),
@@ -447,7 +447,7 @@ async fn handle_claimed_task(
         .await?;
 
         persist_result(store, &claimed.task_id, false, &reason, 0).await?;
-        release_lease(store, lease_client, &task_id, &config.node_name).await;
+        release_lease(store, lease_client, &task_id, &config.worker_name).await;
 
         if decision == Decision::RequireHumanApproval {
             warn!(task_id = %claimed.task_id, "autonomous execution paused for human approval");
@@ -463,7 +463,7 @@ async fn handle_claimed_task(
         &task_id,
         "claimed",
         "in_progress",
-        &config.node_name,
+        &config.worker_name,
         None,
     )
     .await?;
@@ -477,7 +477,7 @@ async fn handle_claimed_task(
                 &claimed.task_id,
                 "in_progress",
                 "review",
-                &config.node_name,
+                &config.worker_name,
                 None,
             )
             .await?;
@@ -487,7 +487,7 @@ async fn handle_claimed_task(
                 &claimed.task_id,
                 "review",
                 "done",
-                &config.node_name,
+                &config.worker_name,
                 None,
             )
             .await?;
@@ -507,7 +507,7 @@ async fn handle_claimed_task(
             persist_failed(
                 store,
                 &claimed.task_id,
-                &config.node_name,
+                &config.worker_name,
                 &outcome.output,
                 outcome.duration_ms,
             )
@@ -518,7 +518,7 @@ async fn handle_claimed_task(
             persist_failed(
                 store,
                 &claimed.task_id,
-                &config.node_name,
+                &config.worker_name,
                 &format!("execution error: {err}"),
                 0,
             )
@@ -527,7 +527,7 @@ async fn handle_claimed_task(
         }
     }
 
-    release_lease(store, lease_client, &task_id, &config.node_name).await;
+    release_lease(store, lease_client, &task_id, &config.worker_name).await;
     Ok(())
 }
 
@@ -535,9 +535,9 @@ async fn acquire_lease(
     store: &OperationalStore,
     lease_client: &LeaseClient,
     task_id: &str,
-    node_name: &str,
+    worker_name: &str,
 ) -> Result<bool> {
-    match store.ownership_claim(task_id, node_name, 90).await {
+    match store.ownership_claim(task_id, worker_name, 90).await {
         Ok(granted) => return Ok(granted),
         Err(err) => {
             debug!(task_id, error = %err, "local ownership lease unavailable; falling back to HTTP lease client");
@@ -551,10 +551,10 @@ async fn release_lease(
     store: &OperationalStore,
     lease_client: &LeaseClient,
     task_id: &str,
-    node_name: &str,
+    worker_name: &str,
 ) {
     let released = store
-        .ownership_release(task_id, node_name)
+        .ownership_release(task_id, worker_name)
         .await
         .unwrap_or(false);
 
@@ -566,11 +566,11 @@ async fn release_lease(
 async fn persist_failed(
     store: &OperationalStore,
     task_id: &str,
-    node_name: &str,
+    worker_name: &str,
     output: &str,
     duration_ms: u64,
 ) -> Result<()> {
-    persist_transition(store, task_id, "in_progress", "failed", node_name, None).await?;
+    persist_transition(store, task_id, "in_progress", "failed", worker_name, None).await?;
     persist_result(store, task_id, false, output, duration_ms).await
 }
 
@@ -597,18 +597,18 @@ async fn persist_transition(
     task_id: &str,
     from: &str,
     to: &str,
-    node_name: &str,
+    worker_name: &str,
     extra: Option<Value>,
 ) -> Result<()> {
     let target_status = to.to_string();
     let from_status = from.to_string();
-    let node = node_name.to_string();
+    let node = worker_name.to_string();
 
     let mut details = serde_json::json!({
         "task_id": task_id,
         "from": from,
         "to": to,
-        "node": node_name,
+        "node": worker_name,
     });
 
     if let Some(extra) = extra
@@ -1119,7 +1119,7 @@ mod tests {
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let cfg = EmbeddedAgentConfig {
-            node_name: "taylor".into(),
+            worker_name: "taylor".into(),
             autonomous_mode: true,
             poll_interval_secs: 1,
             ownership_api_base_url: None,
@@ -1208,7 +1208,7 @@ mod tests {
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let cfg = EmbeddedAgentConfig {
-            node_name: "taylor".into(),
+            worker_name: "taylor".into(),
             autonomous_mode: true,
             poll_interval_secs: 1,
             ownership_api_base_url: None,

@@ -167,7 +167,7 @@ impl NodeMonitor {
     pub async fn poll(&self, config: &FleetConfig) -> Vec<MonitorAlert> {
         let mut alerts = Vec::new();
 
-        for (node_name, node) in &config.nodes {
+        for (worker_name, node) in &config.nodes {
             let port = node.port.unwrap_or(config.fleet.api_port);
             let url = format!(
                 "http://{}:{}{}",
@@ -185,7 +185,7 @@ impl NodeMonitor {
 
             let previous = {
                 let mut state = self.state.lock().await;
-                state.insert(node_name.clone(), current)
+                state.insert(worker_name.clone(), current)
             };
 
             if let Some(prev) = previous
@@ -194,21 +194,21 @@ impl NodeMonitor {
                 match current {
                     NodeState::Offline => alerts.push(MonitorAlert {
                         condition: AlertCondition::NodeWentOffline {
-                            node: node_name.clone(),
+                            node: worker_name.clone(),
                         },
                         level: NotificationLevel::Critical,
-                        title: format!("Node offline: {node_name}"),
-                        body: format!("{node_name} at {} stopped responding at {url}", node.ip),
-                        event_key: format!("node_offline:{node_name}"),
+                        title: format!("Node offline: {worker_name}"),
+                        body: format!("{worker_name} at {} stopped responding at {url}", node.ip),
+                        event_key: format!("node_offline:{worker_name}"),
                     }),
                     NodeState::Online => alerts.push(MonitorAlert {
                         condition: AlertCondition::NodeCameBackOnline {
-                            node: node_name.clone(),
+                            node: worker_name.clone(),
                         },
                         level: NotificationLevel::Info,
-                        title: format!("Node recovered: {node_name}"),
-                        body: format!("{node_name} is responding again at {url}"),
-                        event_key: format!("node_online:{node_name}"),
+                        title: format!("Node recovered: {worker_name}"),
+                        body: format!("{worker_name} is responding again at {url}"),
+                        event_key: format!("node_online:{worker_name}"),
                     }),
                 }
             }
@@ -242,7 +242,7 @@ impl ModelMonitor {
     pub async fn poll(&self, config: &FleetConfig) -> Vec<MonitorAlert> {
         let mut alerts = Vec::new();
 
-        for (node_name, node) in &config.nodes {
+        for (worker_name, node) in &config.nodes {
             for (model_slug, model) in &node.models {
                 let Some(port) = model.port else {
                     continue;
@@ -250,7 +250,7 @@ impl ModelMonitor {
 
                 let endpoint = format!("http://{}:{port}/health", node.ip);
                 let current = probe_endpoint_state(&self.client, &endpoint).await;
-                let key = format!("{node_name}:{model_slug}:{port}");
+                let key = format!("{worker_name}:{model_slug}:{port}");
 
                 let previous = {
                     let mut state = self.state.lock().await;
@@ -263,45 +263,45 @@ impl ModelMonitor {
                     match current {
                         ModelState::Offline => alerts.push(MonitorAlert {
                             condition: AlertCondition::ModelEndpointStoppedResponding {
-                                node: node_name.clone(),
+                                node: worker_name.clone(),
                                 model: model_slug.clone(),
                                 endpoint: endpoint.clone(),
                             },
                             level: NotificationLevel::Critical,
-                            title: format!("Model endpoint offline: {node_name}/{model_slug}"),
+                            title: format!("Model endpoint offline: {worker_name}/{model_slug}"),
                             body: format!(
                                 "Model '{}' on node '{}' is unreachable at {endpoint}",
-                                model.name, node_name
+                                model.name, worker_name
                             ),
-                            event_key: format!("model_offline:{node_name}:{model_slug}"),
+                            event_key: format!("model_offline:{worker_name}:{model_slug}"),
                         }),
                         ModelState::Degraded => alerts.push(MonitorAlert {
                             condition: AlertCondition::ModelEndpointDegraded {
-                                node: node_name.clone(),
+                                node: worker_name.clone(),
                                 model: model_slug.clone(),
                                 endpoint: endpoint.clone(),
                             },
                             level: NotificationLevel::Warning,
-                            title: format!("Model degraded: {node_name}/{model_slug}"),
+                            title: format!("Model degraded: {worker_name}/{model_slug}"),
                             body: format!(
                                 "Model '{}' on node '{}' returned unhealthy status at {endpoint}",
-                                model.name, node_name
+                                model.name, worker_name
                             ),
-                            event_key: format!("model_degraded:{node_name}:{model_slug}"),
+                            event_key: format!("model_degraded:{worker_name}:{model_slug}"),
                         }),
                         ModelState::Healthy => alerts.push(MonitorAlert {
                             condition: AlertCondition::ModelEndpointDegraded {
-                                node: node_name.clone(),
+                                node: worker_name.clone(),
                                 model: model_slug.clone(),
                                 endpoint: endpoint.clone(),
                             },
                             level: NotificationLevel::Info,
-                            title: format!("Model recovered: {node_name}/{model_slug}"),
+                            title: format!("Model recovered: {worker_name}/{model_slug}"),
                             body: format!(
                                 "Model '{}' on node '{}' is healthy again at {endpoint}",
-                                model.name, node_name
+                                model.name, worker_name
                             ),
-                            event_key: format!("model_healthy:{node_name}:{model_slug}"),
+                            event_key: format!("model_healthy:{worker_name}:{model_slug}"),
                         }),
                     }
                 }
@@ -333,14 +333,14 @@ impl DiskMonitor {
     }
 
     /// Poll local disk usage and emit alerts on state transitions only.
-    pub async fn poll_local(&self, node_name: &str) -> Result<Vec<MonitorAlert>> {
+    pub async fn poll_local(&self, worker_name: &str) -> Result<Vec<MonitorAlert>> {
         let samples = read_local_disk_usage()?;
-        Ok(self.evaluate_samples(node_name, &samples).await)
+        Ok(self.evaluate_samples(worker_name, &samples).await)
     }
 
     async fn evaluate_samples(
         &self,
-        node_name: &str,
+        worker_name: &str,
         samples: &[DiskUsageSample],
     ) -> Vec<MonitorAlert> {
         let mut alerts = Vec::new();
@@ -354,7 +354,7 @@ impl DiskMonitor {
                 DiskState::Healthy
             };
 
-            let key = format!("{node_name}:{}", sample.mount);
+            let key = format!("{worker_name}:{}", sample.mount);
             let previous = {
                 let mut state = self.state.lock().await;
                 state.insert(key, current)
@@ -366,17 +366,17 @@ impl DiskMonitor {
             {
                 alerts.push(MonitorAlert {
                     condition: AlertCondition::DiskUsageCritical {
-                        node: node_name.to_string(),
+                        node: worker_name.to_string(),
                         mount: sample.mount.clone(),
                         percent_used: sample.percent_used,
                     },
                     level: NotificationLevel::Critical,
-                    title: format!("Disk critical on {node_name}"),
+                    title: format!("Disk critical on {worker_name}"),
                     body: format!(
-                        "Mount {} reached {:.1}% utilization on {node_name}",
+                        "Mount {} reached {:.1}% utilization on {worker_name}",
                         sample.mount, sample.percent_used
                     ),
-                    event_key: format!("disk_critical:{node_name}:{}", sample.mount),
+                    event_key: format!("disk_critical:{worker_name}:{}", sample.mount),
                 });
             }
         }

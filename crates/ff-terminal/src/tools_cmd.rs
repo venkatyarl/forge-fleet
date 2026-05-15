@@ -16,7 +16,7 @@ pub async fn handle_list(
     unhealthy: bool,
 ) -> Result<()> {
     let mut sql = String::from(
-        "SELECT tool_name, node_name, description, health_checked_at, \
+        "SELECT tool_name, worker_name, description, health_checked_at, \
          call_count, avg_latency_ms, \
          (health_checked_at > NOW() - INTERVAL '5 minutes') as healthy \
          FROM fleet_tools WHERE 1=1",
@@ -25,7 +25,7 @@ pub async fn handle_list(
 
     if node.is_some() {
         params.push("node".to_string());
-        sql.push_str(&format!(" AND node_name = ${}", params.len()));
+        sql.push_str(&format!(" AND worker_name = ${}", params.len()));
     }
     if name.is_some() {
         params.push("name".to_string());
@@ -37,7 +37,7 @@ pub async fn handle_list(
     if unhealthy {
         sql.push_str(" AND health_checked_at <= NOW() - INTERVAL '5 minutes'");
     }
-    sql.push_str(" ORDER BY node_name, tool_name");
+    sql.push_str(" ORDER BY worker_name, tool_name");
 
     let mut query = sqlx::query(&sql);
     if let Some(n) = &node {
@@ -52,7 +52,7 @@ pub async fn handle_list(
     println!("{GREEN}✓ Fleet Tools{RESET} ({} total)", rows.len());
     for row in &rows {
         let name: String = row.get("tool_name");
-        let node: String = row.get("node_name");
+        let node: String = row.get("worker_name");
         let healthy: bool = row.get("healthy");
         let status = if healthy {
             format!("{GREEN}●{RESET}")
@@ -77,13 +77,13 @@ pub async fn handle_health(pg: &PgPool) -> Result<()> {
 
     let rows = sqlx::query(
         "SELECT \
-            node_name, \
+            worker_name, \
             COUNT(*) as tool_count, \
             COUNT(*) FILTER (WHERE health_checked_at > NOW() - INTERVAL '5 minutes') as healthy_count, \
             COUNT(*) FILTER (WHERE health_checked_at <= NOW() - INTERVAL '5 minutes') as unhealthy_count \
          FROM fleet_tools \
-         GROUP BY node_name \
-         ORDER BY node_name",
+         GROUP BY worker_name \
+         ORDER BY worker_name",
     )
     .fetch_all(pg)
     .await?;
@@ -98,7 +98,7 @@ pub async fn handle_health(pg: &PgPool) -> Result<()> {
     if !rows.is_empty() {
         println!("\n  By node:");
         for row in &rows {
-            let name: String = row.get("node_name");
+            let name: String = row.get("worker_name");
             let n_tools: i64 = row.get("tool_count");
             let n_healthy: i64 = row.get("healthy_count");
             let n_unhealthy: i64 = row.get("unhealthy_count");
@@ -121,7 +121,7 @@ pub async fn handle_health(pg: &PgPool) -> Result<()> {
 }
 
 pub async fn handle_register(pg: &PgPool, node: Option<String>) -> Result<()> {
-    let node_name = node.unwrap_or_else(|| {
+    let worker_name = node.unwrap_or_else(|| {
         std::env::var("HOSTNAME")
             .or_else(|_| std::env::var("COMPUTERNAME"))
             .unwrap_or_else(|_| {
@@ -137,13 +137,13 @@ pub async fn handle_register(pg: &PgPool, node: Option<String>) -> Result<()> {
     // Check if node exists in fleet_workers
     let node_exists: bool =
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM fleet_workers WHERE name = $1)")
-            .bind(&node_name)
+            .bind(&worker_name)
             .fetch_one(pg)
             .await?;
 
     if !node_exists {
-        println!("{RED}✗{RESET} Node '{node_name}' not found in fleet_workers.");
-        println!("  Register the node first: ff fleet enroll {node_name}");
+        println!("{RED}✗{RESET} Node '{worker_name}' not found in fleet_workers.");
+        println!("  Register the node first: ff fleet enroll {worker_name}");
         return Ok(());
     }
 
@@ -163,13 +163,13 @@ pub async fn handle_register(pg: &PgPool, node: Option<String>) -> Result<()> {
     let mut registered = 0;
     for (tool_name, description) in core_tools {
         let result = sqlx::query(
-            "INSERT INTO fleet_tools (tool_name, node_name, description, parameters_schema, capabilities_required, health_checked_at) \
+            "INSERT INTO fleet_tools (tool_name, worker_name, description, parameters_schema, capabilities_required, health_checked_at) \
              VALUES ($1, $2, $3, '{}', '{}', NOW()) \
-             ON CONFLICT (tool_name, node_name) \
+             ON CONFLICT (tool_name, worker_name) \
              DO UPDATE SET description = EXCLUDED.description, health_checked_at = NOW()",
         )
         .bind(tool_name)
-        .bind(&node_name)
+        .bind(&worker_name)
         .bind(description)
         .execute(pg)
         .await?;
@@ -179,6 +179,6 @@ pub async fn handle_register(pg: &PgPool, node: Option<String>) -> Result<()> {
         }
     }
 
-    println!("{GREEN}✓{RESET} Registered {registered} tools for {CYAN}{node_name}{RESET}");
+    println!("{GREEN}✓{RESET} Registered {registered} tools for {CYAN}{worker_name}{RESET}");
     Ok(())
 }
