@@ -6455,10 +6455,18 @@ BEGIN
     FOREACH t IN ARRAY tables LOOP
         IF EXISTS (
             SELECT 1 FROM information_schema.columns
-            WHERE table_schema='public' AND table_name=t AND column_name='worker_name'
+            WHERE table_schema='public' AND table_name=t
+              AND column_name = 'no' || 'de_name'  -- literal split so the
+            -- repo-wide mass-rename perl pass doesn't transmute this migration's
+            -- idempotency check into a no-op (the rename literally swept
+            -- through SQL string contents otherwise).
         ) THEN
-            EXECUTE format('ALTER TABLE %I RENAME COLUMN worker_name TO worker_name', t);
-            RAISE NOTICE 'renamed % .worker_name → .worker_name', t;
+            EXECUTE format(
+                'ALTER TABLE %I RENAME COLUMN %I TO worker_name',
+                t,
+                'no' || 'de_name'
+            );
+            RAISE NOTICE 'renamed % column → worker_name', t;
         END IF;
     END LOOP;
 END $$;
@@ -6475,4 +6483,25 @@ pub const SCHEMA_V86_DROP_FLEET_MEMBERS: &str = r#"
 --
 -- Idempotent.
 DROP TABLE IF EXISTS fleet_members CASCADE;
+"#;
+
+pub const SCHEMA_V88_RENAME_FLEET_NODE_RUNTIME: &str = r#"
+-- ─── V88: rename fleet_node_runtime → fleet_worker_runtime ──────────────────
+-- Last surviving "fleet_node_*" table — the Postgres-side runtime registry
+-- created by V14. Renamed to match the V83/V87 fleet_worker_* family.
+-- Idempotent: skips if the new name already exists, or the old name is gone.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM information_schema.tables
+        WHERE table_schema = 'public' AND table_name = 'fleet_node_runtime'
+          AND table_type = 'BASE TABLE'
+    ) AND NOT EXISTS (
+        SELECT 1 FROM information_schema.tables
+        WHERE table_schema = 'public' AND table_name = 'fleet_worker_runtime'
+          AND table_type = 'BASE TABLE'
+    ) THEN
+        ALTER TABLE fleet_node_runtime RENAME TO fleet_worker_runtime;
+    END IF;
+END $$;
 "#;
