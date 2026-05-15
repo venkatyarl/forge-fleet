@@ -52,8 +52,10 @@ struct Cli {
     #[arg(long)]
     config: Option<PathBuf>,
 
-    /// Node name override for startup banner and telemetry tagging
-    #[arg(long)]
+    /// Worker name override for startup banner and telemetry tagging.
+    /// Accepts `--worker-name` (canonical) or `--node-name` (legacy alias
+    /// retained so existing deploy scripts + systemd units don't break).
+    #[arg(long, alias = "node-name")]
     worker_name: Option<String>,
 
     /// Role override for startup banner

@@ -200,7 +200,11 @@ enum Command {
     /// Run with supervisor — auto-detect failures, fix, and retry
     Supervise {
         prompt: String,
-        #[arg(long, default_value_t = 3)]
+        /// How many supervisor retries before giving up. Accepts
+        /// `--max-attempts` (canonical) or `--max-turns` (alias for
+        /// consistency with `ff run`'s flag — they're semantically
+        /// different but every user types `--max-turns` out of habit).
+        #[arg(long, alias = "max-turns", default_value_t = 3)]
         max_attempts: u32,
         /// After agent declares done, require these files to exist + be
         /// non-empty. If any are missing, count as a failure and retry
