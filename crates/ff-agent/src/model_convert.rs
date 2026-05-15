@@ -191,7 +191,7 @@ pub async fn convert_safetensors_to_mlx(
 
     // ── 7. register the new MLX library row ──────────────────────────────
     let dir_size = dir_size_bytes(&output_dir).unwrap_or(0);
-    let worker_name = crate::fleet_info::resolve_this_node_name().await;
+    let worker_name = crate::fleet_info::resolve_this_worker_name().await;
     let quant = format!("{}bit", opts.quant_bits);
 
     let new_library_id = pg_upsert_library(

@@ -2483,7 +2483,7 @@ async fn main() -> Result<()> {
                         .filter(|s| !s.is_empty())
                         .map(String::from)
                         .collect();
-                    let me = ff_agent::fleet_info::resolve_this_node_name().await;
+                    let me = ff_agent::fleet_info::resolve_this_worker_name().await;
                     let my_id: Option<uuid::Uuid> =
                         sqlx::query_scalar("SELECT id FROM computers WHERE name = $1")
                             .bind(&me)
@@ -2530,7 +2530,7 @@ async fn main() -> Result<()> {
                     Ok(())
                 }
                 TasksCommand::ComposeNodeBootstrap { target } => {
-                    let me = ff_agent::fleet_info::resolve_this_node_name().await;
+                    let me = ff_agent::fleet_info::resolve_this_worker_name().await;
                     let my_id: uuid::Uuid =
                         sqlx::query_scalar("SELECT id FROM computers WHERE name = $1")
                             .bind(&me)
@@ -2548,7 +2548,7 @@ async fn main() -> Result<()> {
                     software_id,
                     fanout,
                 } => {
-                    let me = ff_agent::fleet_info::resolve_this_node_name().await;
+                    let me = ff_agent::fleet_info::resolve_this_worker_name().await;
                     let my_id: uuid::Uuid =
                         sqlx::query_scalar("SELECT id FROM computers WHERE name = $1")
                             .bind(&me)
@@ -2577,7 +2577,7 @@ async fn main() -> Result<()> {
                 .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
             match command {
                 SessionCommand::Spawn { goal, budget } => {
-                    let who = ff_agent::fleet_info::resolve_this_node_name().await;
+                    let who = ff_agent::fleet_info::resolve_this_worker_name().await;
                     let id = ff_agent::session_runner::create_session(
                         &pool,
                         &goal,
@@ -4356,7 +4356,7 @@ async fn inject_agent_hints(existing: Option<String>) -> Option<String> {
     // V67 DB-backed agent hints (only when pool is available).
     let hints_block = match &pool_result {
         Ok(pool) => {
-            let computer = ff_agent::fleet_info::resolve_this_node_name().await;
+            let computer = ff_agent::fleet_info::resolve_this_worker_name().await;
             ff_agent::agent_hint::load_for_host(pool, &computer)
                 .await
                 .unwrap_or_default()

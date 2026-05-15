@@ -25,7 +25,7 @@ pub struct ReconcileSummary {
 
 /// Run one reconcile pass. Returns counts for logging.
 pub async fn reconcile_local(pool: &sqlx::PgPool) -> Result<ReconcileSummary, String> {
-    let worker_name = crate::fleet_info::resolve_this_node_name().await;
+    let worker_name = crate::fleet_info::resolve_this_worker_name().await;
 
     // 1. Snapshot what's actually running on this host.
     let procs = crate::model_runtime::list_local_processes().await;

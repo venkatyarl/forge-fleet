@@ -61,7 +61,7 @@ pub async fn handle_auto_upgrade_run_once(pool: &sqlx::PgPool, force: bool) -> R
         return Ok(());
     }
 
-    let worker = ff_agent::fleet_info::resolve_this_node_name().await;
+    let worker = ff_agent::fleet_info::resolve_this_worker_name().await;
     println!(
         "{CYAN}[auto-upgrade run-once]{RESET} triggering tick as worker={worker}{}",
         if force && !enabled {

@@ -21,7 +21,7 @@ pub struct DiskSample {
 /// Sample the current host's disk usage and insert a row into `fleet_disk_usage`.
 /// Returns the sample (also for display / alerting).
 pub async fn sample_local_disk(pool: &sqlx::PgPool) -> Result<DiskSample, String> {
-    let worker_name = crate::fleet_info::resolve_this_node_name().await;
+    let worker_name = crate::fleet_info::resolve_this_worker_name().await;
 
     // Look up node row for models_dir + quota.
     let node = ff_db::pg_get_node(pool, &worker_name)

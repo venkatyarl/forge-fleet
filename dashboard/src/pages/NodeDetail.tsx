@@ -2,18 +2,18 @@ import { type ReactNode, useCallback, useEffect, useMemo, useState } from 'react
 import { Link, useParams } from 'react-router-dom'
 import { getJson } from '../lib/api'
 import { extractNodes } from '../lib/normalizers'
-import type { FleetNode, FleetStatusResponse } from '../types'
+import type { FleetComputer, FleetStatusResponse } from '../types'
 
 export function NodeDetail() {
   const { nodeId = '' } = useParams()
-  const [node, setNode] = useState<FleetNode | null>(null)
+  const [node, setNode] = useState<FleetComputer | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
   const load = useCallback(async () => {
     try {
       setError(null)
-      const direct = await getJson<FleetNode>(`/api/fleet/nodes/${encodeURIComponent(nodeId)}`).catch(
+      const direct = await getJson<FleetComputer>(`/api/fleet/nodes/${encodeURIComponent(nodeId)}`).catch(
         () => null,
       )
 

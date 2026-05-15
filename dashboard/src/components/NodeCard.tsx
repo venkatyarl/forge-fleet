@@ -1,7 +1,7 @@
-import type { FleetNode } from '../types'
+import type { FleetComputer } from '../types'
 
 type NodeCardProps = {
-  node: FleetNode
+  node: FleetComputer
 }
 
 function statusClass(status: string) {
@@ -24,7 +24,7 @@ function sourceClass(source: string) {
   return 'bg-violet-500/20 text-violet-200'
 }
 
-function formatWorkload(node: FleetNode): string {
+function formatWorkload(node: FleetComputer): string {
   const workload = node.current_workload
   if (!workload) return 'unreported'
   if (workload.active_tasks == null) return workload.status
@@ -32,7 +32,7 @@ function formatWorkload(node: FleetNode): string {
   return `${workload.active_tasks} active`
 }
 
-function formatHeartbeat(node: FleetNode): string {
+function formatHeartbeat(node: FleetComputer): string {
   const heartbeat = node.last_heartbeat ?? 'unknown'
   const freshness = node.heartbeat_freshness ?? 'unknown'
   if (!node.heartbeat_age_seconds && freshness === 'unknown') return heartbeat

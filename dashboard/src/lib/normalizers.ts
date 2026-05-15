@@ -1,6 +1,6 @@
 import type {
   FleetModel,
-  FleetNode,
+  FleetComputer,
   FleetReplicationState,
   FleetStatusResponse,
   FleetStatusSummary,
@@ -79,7 +79,7 @@ function normalizeWorkload(value: unknown): FleetWorkload | undefined {
   }
 }
 
-function normalizeNode(node: unknown): FleetNode | null {
+function normalizeNode(node: unknown): FleetComputer | null {
   const record = asRecord(node)
   if (!record) return null
 
@@ -92,7 +92,7 @@ function normalizeNode(node: unknown): FleetNode | null {
         .filter((model): model is FleetModel => model !== null))
     : []
 
-  const normalized: FleetNode = {
+  const normalized: FleetComputer = {
     id,
     name,
     hostname: asString(record.hostname) || undefined,
@@ -122,29 +122,29 @@ function normalizeNode(node: unknown): FleetNode | null {
     service_version: asString(record.service_version) || undefined,
     replication_state: normalizeReplicationState(record.replication_state),
     current_workload: normalizeWorkload(record.current_workload),
-    hardware: (asRecord(record.hardware) ?? undefined) as FleetNode['hardware'],
-    metrics: (asRecord(record.metrics) ?? undefined) as FleetNode['metrics'],
+    hardware: (asRecord(record.hardware) ?? undefined) as FleetComputer['hardware'],
+    metrics: (asRecord(record.metrics) ?? undefined) as FleetComputer['metrics'],
     models,
   }
 
   return normalized
 }
 
-export function extractNodes(payload: FleetStatusResponse | Record<string, unknown>): FleetNode[] {
+export function extractNodes(payload: FleetStatusResponse | Record<string, unknown>): FleetComputer[] {
   const root = asRecord(payload) ?? {}
 
   const directNodes = Array.isArray(root.nodes) ? root.nodes : []
   if (directNodes.length > 0) {
     return directNodes
       .map((node) => normalizeNode(node))
-      .filter((node): node is FleetNode => node !== null)
+      .filter((node): node is FleetComputer => node !== null)
   }
 
   const nested = asRecord(root.fleet)
   const nestedNodes = Array.isArray(nested?.nodes) ? nested.nodes : []
   return nestedNodes
     .map((node) => normalizeNode(node))
-    .filter((node): node is FleetNode => node !== null)
+    .filter((node): node is FleetComputer => node !== null)
 }
 
 export function extractSummary(payload: FleetStatusResponse | Record<string, unknown>): FleetStatusSummary {

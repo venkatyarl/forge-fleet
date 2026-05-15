@@ -17,7 +17,7 @@ ForgeFleet now supports a **config-driven runtime persistence mode**:
 ### Postgres-backed in this phase (`postgres_runtime`)
 
 - Runtime registry tables:
-  - `fleet_node_runtime` (live node runtime / heartbeat state)
+  - `fleet_worker_runtime` (live node runtime / heartbeat state)
   - `fleet_enrollment_events` (enrollment accept/reject history)
 - OperationalStore-backed domains used by daemon and MCP handlers:
   - tasks + task results + task ownership
@@ -156,7 +156,7 @@ docker exec -it forgefleet-postgres \
   psql -U forgefleet -d forgefleet -c '\dt fleet_*'
 
 docker exec -it forgefleet-postgres \
-  psql -U forgefleet -d forgefleet -c 'select node_id, hostname, reported_status, last_heartbeat from fleet_node_runtime order by updated_at desc limit 20;'
+  psql -U forgefleet -d forgefleet -c 'select node_id, hostname, reported_status, last_heartbeat from fleet_worker_runtime order by updated_at desc limit 20;'
 
 docker exec -it forgefleet-postgres \
   psql -U forgefleet -d forgefleet -c 'select id, node_id, outcome, created_at from fleet_enrollment_events order by id desc limit 20;'

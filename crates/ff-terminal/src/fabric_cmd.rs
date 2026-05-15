@@ -106,7 +106,7 @@ pub async fn handle_fabric_benchmark(
 
     let a_target = format!("{}@{}", a_meta.ssh_user, a_meta.ip);
     let b_target = format!("{}@{}", b_meta.ssh_user, b_meta.ip);
-    let me = ff_agent::fleet_info::resolve_this_node_name().await;
+    let me = ff_agent::fleet_info::resolve_this_worker_name().await;
     let a_is_me = me.eq_ignore_ascii_case(a);
     let b_is_me = me.eq_ignore_ascii_case(b);
 
@@ -193,7 +193,7 @@ pub async fn handle_fabric_benchmark(
     let _ = run_or_local(b_is_me, &b_target, "pkill iperf3 2>/dev/null");
 
     // 7. Record measurements.
-    let measured_by = ff_agent::fleet_info::resolve_this_node_name().await;
+    let measured_by = ff_agent::fleet_info::resolve_this_worker_name().await;
     let iperf_version = StdCommand::new("iperf3")
         .arg("--version")
         .output()

@@ -5,14 +5,14 @@ import { SkeletonStatCard, SkeletonCard } from '../components/Skeleton'
 import { EmptyState } from '../components/EmptyState'
 import { getJson } from '../lib/api'
 import { extractNodes, extractSummary } from '../lib/normalizers'
-import type { FleetNode, FleetStatusResponse, WsEvent } from '../types'
+import type { FleetComputer, FleetStatusResponse, WsEvent } from '../types'
 
 type HealthResponse = { status?: string; [key: string]: unknown }
 
 export function FleetOverview() {
   
   const { wsEvent } = useOutletContext<{ wsEvent: WsEvent | null }>()
-  const [nodes, setNodes] = useState<FleetNode[]>([])
+  const [nodes, setNodes] = useState<FleetComputer[]>([])
   const [gatewayHealth, setGatewayHealth] = useState('unknown')
   const [summary, setSummary] = useState({
     total_nodes: 0, connected_nodes: 0, unhealthy_nodes: 0,

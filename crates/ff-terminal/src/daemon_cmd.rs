@@ -820,7 +820,7 @@ pub async fn handle_defer_worker(
 ) -> Result<()> {
     let worker_name = match as_node {
         Some(n) => n,
-        None => ff_agent::fleet_info::resolve_this_node_name().await,
+        None => ff_agent::fleet_info::resolve_this_worker_name().await,
     };
 
     let pool = ff_agent::fleet_info::get_fleet_pool()
@@ -1059,7 +1059,7 @@ pub async fn handle_daemon(
 ) -> Result<()> {
     let worker_name = match as_node {
         Some(n) => n,
-        None => ff_agent::fleet_info::resolve_this_node_name().await,
+        None => ff_agent::fleet_info::resolve_this_worker_name().await,
     };
 
     let pool = ff_agent::fleet_info::get_fleet_pool()

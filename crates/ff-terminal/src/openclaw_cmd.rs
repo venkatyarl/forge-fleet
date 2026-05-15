@@ -96,7 +96,7 @@ pub async fn handle_openclaw_devices(
     pool: &sqlx::PgPool,
     cmd: crate::OpenclawDevicesCommand,
 ) -> Result<()> {
-    let local_name = ff_agent::fleet_info::resolve_this_node_name().await;
+    let local_name = ff_agent::fleet_info::resolve_this_worker_name().await;
     let (computer_id, primary_ip) = sqlx::query_as::<_, (uuid::Uuid, String)>(
         "SELECT id, primary_ip FROM computers WHERE LOWER(name) = LOWER($1)",
     )

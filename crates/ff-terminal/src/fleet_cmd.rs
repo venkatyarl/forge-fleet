@@ -29,7 +29,7 @@ pub async fn handle_fleet_panic_stop(pool: &sqlx::PgPool, yes: bool, halt_dbs: b
     let _ = ff_agent::nats_client::init_nats(&ff_agent::nats_client::resolve_nats_url()).await;
 
     println!("{CYAN}▶ ff fleet panic-stop — halting every daemon…{RESET}");
-    let local = ff_agent::fleet_info::resolve_this_node_name().await;
+    let local = ff_agent::fleet_info::resolve_this_worker_name().await;
     let report = ff_agent::panic_stop::fleet_panic_stop(pool, &local)
         .await
         .map_err(|e| anyhow::anyhow!("panic_stop: {e}"))?;
@@ -90,7 +90,7 @@ pub async fn handle_fleet_resume(pool: &sqlx::PgPool, yes: bool) -> Result<()> {
     }
 
     println!("{CYAN}▶ ff fleet resume — starting every daemon…{RESET}");
-    let local = ff_agent::fleet_info::resolve_this_node_name().await;
+    let local = ff_agent::fleet_info::resolve_this_worker_name().await;
     let report = ff_agent::panic_stop::fleet_resume(pool, &local)
         .await
         .map_err(|e| anyhow::anyhow!("resume: {e}"))?;
@@ -543,7 +543,7 @@ pub async fn handle_fleet_db_failover(
     let (target_id, target_name, target_ip) = target;
 
     // 2) Must be running on the target (we shell `docker exec` locally).
-    let my_name = ff_agent::fleet_info::resolve_this_node_name().await;
+    let my_name = ff_agent::fleet_info::resolve_this_worker_name().await;
     if my_name.to_lowercase() != target_name.to_lowercase() && !force {
         anyhow::bail!(
             "refusing to failover: this command must be run ON '{target_name}' \
@@ -690,7 +690,7 @@ pub async fn handle_fleet_db_restore(
     yes: bool,
 ) -> Result<()> {
     if let Some(target_node) = to {
-        let me = ff_agent::fleet_info::resolve_this_node_name().await;
+        let me = ff_agent::fleet_info::resolve_this_worker_name().await;
         if !target_node.eq_ignore_ascii_case(&me) {
             anyhow::bail!(
                 "--to '{target_node}' != current node '{me}'. Cross-node \
@@ -1637,7 +1637,7 @@ pub async fn handle_fleet_rotate_pulse_hmac(
 }
 
 pub async fn handle_fleet_backup(pool: &sqlx::PgPool, kind: &str, force: bool) -> Result<()> {
-    let my_name = ff_agent::fleet_info::resolve_this_node_name().await;
+    let my_name = ff_agent::fleet_info::resolve_this_worker_name().await;
     let my_id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM computers WHERE name = $1")
         .bind(&my_name)
         .fetch_optional(pool)
@@ -2239,7 +2239,7 @@ pub async fn handle_fleet_versions_live(pool: &sqlx::PgPool, verbose: bool) -> R
         return Ok(());
     }
 
-    let me = ff_agent::fleet_info::resolve_this_node_name().await;
+    let me = ff_agent::fleet_info::resolve_this_worker_name().await;
     let mut futs = FuturesUnordered::new();
     for n in nodes {
         let name = n.name.clone();
@@ -2522,7 +2522,7 @@ pub async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
             yes,
         } => {
             let nodes = ff_db::pg_list_nodes(&pool).await?;
-            let local = ff_agent::fleet_info::resolve_this_node_name().await;
+            let local = ff_agent::fleet_info::resolve_this_worker_name().await;
             let mut targets: Vec<&ff_db::FleetNodeRow> = nodes.iter().collect();
             if let Some(name) = &only {
                 targets.retain(|n| &n.name == name);

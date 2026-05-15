@@ -689,6 +689,9 @@ pub fn build_router(state: Arc<GatewayState>, mc_db_path: Option<&str>) -> Route
             "/api/transports/telegram/status",
             get(telegram_transport_status),
         )
+        .route("/api/fleet/computers/{id}", get(fleet_worker_detail))
+        // Legacy alias retained during the node→computer rename window.
+        // Drop once dashboards + clients are confirmed on the new path.
         .route("/api/fleet/nodes/{id}", get(fleet_worker_detail))
         .route("/api/config", get(get_config).post(update_config))
         .route("/api/config/reload-status", get(config_reload_status))

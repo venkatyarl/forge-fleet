@@ -89,7 +89,7 @@ Daemon:
   reconciliation every 60s; `--once` for single-pass/cron mode)
 
 ### Node naming
-`ff_agent::fleet_info::resolve_this_node_name()` picks in order:
+`ff_agent::fleet_info::resolve_this_worker_name()` picks in order:
 1. `$FORGEFLEET_NODE_NAME` env
 2. Postgres `fleet_workers` row matching a local IPv4 address
 3. `hostname` short-name fallback

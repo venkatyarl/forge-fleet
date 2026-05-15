@@ -269,6 +269,8 @@ impl DashboardState {
         Router::new()
             .route("/health", get(health_handler))
             .route("/snapshot", get(snapshot_handler))
+            .route("/computers", get(nodes_handler))
+            // Legacy alias retained during the node→computer rename window.
             .route("/nodes", get(nodes_handler))
             .route("/models", get(models_handler))
             .route("/alerts", get(alerts_handler))

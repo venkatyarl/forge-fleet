@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { getJson } from '../lib/api'
 import { extractNodes, extractSummary } from '../lib/normalizers'
-import type { FleetNode, FleetStatusResponse } from '../types'
+import type { FleetComputer, FleetStatusResponse } from '../types'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -90,7 +90,7 @@ function QuickAction({ label, icon, to }: { label: string; icon: string; to: str
 // ---------------------------------------------------------------------------
 
 export function MissionControl() {
-  const [nodes, setNodes] = useState<FleetNode[]>([])
+  const [nodes, setNodes] = useState<FleetComputer[]>([])
   const [summary, setSummary] = useState<{ total_nodes?: number; connected_nodes?: number; unhealthy_nodes?: number; model_count?: number; leader?: string }>({})
   const [tasks, setTasks] = useState<TaskSummary[]>([])
   const [activity, setActivity] = useState<AuditEntry[]>([])

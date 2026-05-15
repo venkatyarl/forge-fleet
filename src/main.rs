@@ -1006,7 +1006,7 @@ fn resolve_node_name(cli: &Cli, config: &FleetConfig) -> String {
     }
 
     // FORGEFLEET_NODE_NAME — the canonical identity override. Mirrors
-    // ff_agent::fleet_info::resolve_this_node_name (priority 1). The DGX
+    // ff_agent::fleet_info::resolve_this_worker_name (priority 1). The DGX
     // outage of 2026-04-22 traced back to this check being absent here:
     // the systemd unit set the env but main.rs ignored it, so every DGX
     // fell through to `unknown-node` and pulse v2 refused to publish.

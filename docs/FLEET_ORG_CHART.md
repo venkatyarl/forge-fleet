@@ -80,7 +80,7 @@
 │  │  │  • Deliverables + provenance                   │   │    │
 │  │  └───────────────────────────────────────────────┘   │    │
 │  │                                                      │    │
-│  │  ┌─ computers / fleet_nodes / fleet_models ───────┐   │    │
+│  │  ┌─ computers / fleet_workers / fleet_models ───────┐   │    │
 │  │  │  • Node catalog + model catalog                  │   │    │
 │  │  └───────────────────────────────────────────────┘   │    │
 │  │                                                      │    │
@@ -300,7 +300,7 @@ These components exist in the codebase but are **not spawned in src/main.rs**:
 │  │  │  • Poll or webhook on completion               │   │    │
 │  │  └───────────────────────────────────────────────┘   │    │
 │  │                                                      │    │
-│  │  ┌─ computers / fleet_nodes / fleet_models ───────┐   │    │
+│  │  ┌─ computers / fleet_workers / fleet_models ───────┐   │    │
 │  │  │  • Node catalog + model catalog                  │   │    │
 │  │  └───────────────────────────────────────────────┘   │    │
 │  │                                                      │    │

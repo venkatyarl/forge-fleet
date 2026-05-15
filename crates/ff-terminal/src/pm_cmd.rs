@@ -88,7 +88,7 @@ pub async fn handle_pm(cmd: crate::PmCommand) -> Result<()> {
                 ));
             }
 
-            let created_by = ff_agent::fleet_info::resolve_this_node_name().await;
+            let created_by = ff_agent::fleet_info::resolve_this_worker_name().await;
             let prio = priority.unwrap_or_else(|| "normal".to_string());
             let row: (uuid::Uuid,) = sqlx::query_as(
                 "INSERT INTO work_items (project_id, kind, title, description, priority, created_by) \

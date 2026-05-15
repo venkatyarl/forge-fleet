@@ -50,7 +50,7 @@ export type FleetNodeMetrics = {
   [key: string]: unknown
 }
 
-export type FleetNode = {
+export type FleetComputer = {
   id?: string
   name: string
   hostname?: string
@@ -96,7 +96,7 @@ export type FleetStatusResponse = {
   status?: string
   total_nodes?: number
   summary?: FleetStatusSummary
-  nodes?: FleetNode[]
+  nodes?: FleetComputer[]
   models?: FleetModel[]
   scanned_at?: string
   [key: string]: unknown

@@ -131,6 +131,12 @@ pub fn mc_router_operational(store: OperationalStore) -> Router {
         .route("/api/mc/work-items/{id}/pr", put(update_pr_info))
         .route("/api/mc/work-items/{id}/history", get(work_item_history))
         .route(
+            "/api/mc/worker-messages",
+            get(list_node_messages).post(send_node_message),
+        )
+        .route("/api/mc/worker-messages/{id}/read", put(mark_message_read))
+        // Legacy aliases — drop once dashboard rolls over.
+        .route(
             "/api/mc/node-messages",
             get(list_node_messages).post(send_node_message),
         )

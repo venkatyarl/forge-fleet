@@ -6,7 +6,7 @@ import { ModelHub } from './ModelHub'
 import { ToolInventory } from './ToolInventory'
 import { AuditLog } from './AuditLog'
 import { Updates } from './Updates'
-import type { FleetNode, FleetStatusResponse } from '../types'
+import type { FleetComputer, FleetStatusResponse } from '../types'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -203,9 +203,9 @@ function GeneralTab() {
 // ---------------------------------------------------------------------------
 
 function FleetMembersTab() {
-  const [members, setMembers] = useState<FleetNode[]>([])
+  const [members, setMembers] = useState<FleetComputer[]>([])
   const [loading, setLoading] = useState(true)
-  const [selectedMember, setSelectedMember] = useState<FleetNode | null>(null)
+  const [selectedMember, setSelectedMember] = useState<FleetComputer | null>(null)
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -282,7 +282,7 @@ function FleetMembersTab() {
   )
 }
 
-function FleetMemberRow({ member, onClick }: { member: FleetNode; onClick: () => void }) {
+function FleetMemberRow({ member, onClick }: { member: FleetComputer; onClick: () => void }) {
   const status = (member.status ?? member.health ?? 'unknown').toLowerCase()
   const isLeader = member.is_leader || member.leader_state === 'leader'
   const models = member.models_loaded ?? (member.models ?? []).map(m => m.name)

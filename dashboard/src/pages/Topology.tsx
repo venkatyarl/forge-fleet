@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { getJson } from '../lib/api'
 import { extractNodes, extractSummary } from '../lib/normalizers'
-import type { FleetNode, FleetStatusResponse } from '../types'
+import type { FleetComputer, FleetStatusResponse } from '../types'
 
 const STATUS_STYLE: Record<string, string> = {
   online: 'border-emerald-500/40 bg-emerald-500/10',
@@ -12,20 +12,20 @@ const STATUS_STYLE: Record<string, string> = {
   unknown: 'border-slate-500/40 bg-slate-500/10',
 }
 
-function nodeStatus(node: FleetNode): string {
+function nodeStatus(node: FleetComputer): string {
   return (node.status ?? node.health ?? 'unknown').toLowerCase()
 }
 
-function replicationStatus(node: FleetNode): string {
+function replicationStatus(node: FleetComputer): string {
   return node.replication_state?.health ?? 'unknown'
 }
 
-function sourceLabel(node: FleetNode): string {
+function sourceLabel(node: FleetComputer): string {
   return node.source_kind ?? (node.runtime_enrolled ? 'enrolled/live' : 'seed/static')
 }
 
 export function Topology() {
-  const [nodes, setNodes] = useState<FleetNode[]>([])
+  const [nodes, setNodes] = useState<FleetComputer[]>([])
   const [summary, setSummary] = useState({
     connected_nodes: 0,
     unhealthy_nodes: 0,
@@ -137,7 +137,7 @@ export function Topology() {
   )
 }
 
-function TopologyNodeCard({ node }: { node: FleetNode }) {
+function TopologyNodeCard({ node }: { node: FleetComputer }) {
   const status = nodeStatus(node)
   const style = STATUS_STYLE[status] ?? STATUS_STYLE.unknown
   const replication = replicationStatus(node)

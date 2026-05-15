@@ -138,7 +138,7 @@ pub async fn get_hf_token() -> Option<String> {
 ///   1. `$FORGEFLEET_NODE_NAME` env var (explicit override)
 ///   2. Postgres `fleet_workers` row whose `ip` or `alt_ips` matches any local IPv4 address
 ///   3. `hostname` short-name fallback (lowercased, first label)
-pub async fn resolve_this_node_name() -> String {
+pub async fn resolve_this_worker_name() -> String {
     if let Ok(v) = std::env::var("FORGEFLEET_NODE_NAME") {
         let t = v.trim();
         if !t.is_empty() {

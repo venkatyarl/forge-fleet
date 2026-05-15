@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { getJson, getText } from '../lib/api'
 import { extractNodes, extractSummary } from '../lib/normalizers'
-import type { FleetNode, FleetStatusResponse } from '../types'
+import type { FleetComputer, FleetStatusResponse } from '../types'
 import { GpuHeatmap } from '../components/GpuHeatmap'
 
 /* ── types ───────────────────────────────────────────────── */
@@ -107,7 +107,7 @@ function aggregateMetrics(samples: MetricSample[]): ParsedMetrics {
 
 export function Metrics() {
   const [metrics, setMetrics] = useState<ParsedMetrics | null>(null)
-  const [nodes, setNodes] = useState<FleetNode[]>([])
+  const [nodes, setNodes] = useState<FleetComputer[]>([])
   const [fleetSummary, setFleetSummary] = useState({
     connected_nodes: 0,
     unhealthy_nodes: 0,

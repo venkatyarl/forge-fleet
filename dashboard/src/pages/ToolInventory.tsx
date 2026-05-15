@@ -121,7 +121,7 @@ type StaticToolInfo = {
 
 type LiveTool = {
   tool_name: string
-  node_name: string
+  worker_name: string
   description: string
   health_checked_at: string
   call_count: number
@@ -143,7 +143,7 @@ async function fetchTools(): Promise<LiveTool[]> {
 function staticToLive(t: StaticToolInfo): LiveTool {
   return {
     tool_name: t.name,
-    node_name: 'fleet',
+    worker_name: 'fleet',
     description: t.description,
     health_checked_at: new Date().toISOString(),
     call_count: 0,
@@ -174,20 +174,20 @@ export function ToolInventory() {
       const matchesSearch = !search
         || t.tool_name.toLowerCase().includes(search.toLowerCase())
         || t.description.toLowerCase().includes(search.toLowerCase())
-      const matchesCategory = !selectedCategory || t.node_name === selectedCategory
+      const matchesCategory = !selectedCategory || t.worker_name === selectedCategory
       return matchesSearch && matchesCategory
     })
   }, [tools, search, selectedCategory])
 
   const categories = useMemo(() => {
     const cats = new Set<string>()
-    tools.forEach(t => cats.add(t.node_name))
+    tools.forEach(t => cats.add(t.worker_name))
     return [...cats].sort()
   }, [tools])
 
   const categoryCounts = useMemo(() => {
     const counts: Record<string, number> = {}
-    tools.forEach(t => { counts[t.node_name] = (counts[t.node_name] || 0) + 1 })
+    tools.forEach(t => { counts[t.worker_name] = (counts[t.worker_name] || 0) + 1 })
     return counts
   }, [tools])
 
@@ -230,14 +230,14 @@ export function ToolInventory() {
 
       <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
         {filtered.map(tool => (
-          <article key={`${tool.tool_name}-${tool.node_name}`} className="rounded-xl border border-slate-800 bg-slate-900/70 p-4 hover:border-slate-600 transition">
+          <article key={`${tool.tool_name}-${tool.worker_name}`} className="rounded-xl border border-slate-800 bg-slate-900/70 p-4 hover:border-slate-600 transition">
             <div className="flex items-start justify-between">
               <h3 className="font-mono font-semibold text-emerald-400">{tool.tool_name}</h3>
               <div className="flex items-center gap-1.5">
                 {tool.healthy !== undefined && (
                   <span className={`inline-block h-2 w-2 rounded-full ${tool.healthy ? 'bg-emerald-500' : 'bg-red-500'}`} title={tool.healthy ? 'Healthy' : 'Unhealthy'} />
                 )}
-                <span className="rounded-full bg-slate-800 px-2 py-0.5 text-xs text-slate-400">{tool.node_name}</span>
+                <span className="rounded-full bg-slate-800 px-2 py-0.5 text-xs text-slate-400">{tool.worker_name}</span>
               </div>
             </div>
             <p className="mt-2 text-sm text-slate-400">{tool.description}</p>

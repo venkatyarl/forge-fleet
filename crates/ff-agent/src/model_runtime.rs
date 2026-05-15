@@ -53,7 +53,7 @@ pub async fn load_model(pool: &sqlx::PgPool, opts: LoadOptions) -> Result<LoadRe
         .find(|r| r.id == opts.library_id)
         .ok_or_else(|| format!("no library entry with id '{}'", opts.library_id))?;
 
-    let worker_name = crate::fleet_info::resolve_this_node_name().await;
+    let worker_name = crate::fleet_info::resolve_this_worker_name().await;
     if lib.worker_name != worker_name {
         return Err(format!(
             "library row is on '{}', but we're running on '{}'; cross-node load not implemented",
@@ -190,7 +190,7 @@ pub async fn load_model(pool: &sqlx::PgPool, opts: LoadOptions) -> Result<LoadRe
 /// Stop a running inference server tracked under `deployment_id`.
 /// SIGTERM first (up to 10s), then SIGKILL. Deletes the deployment row on success.
 pub async fn unload_model(pool: &sqlx::PgPool, deployment_id: &str) -> Result<(), String> {
-    let worker_name = crate::fleet_info::resolve_this_node_name().await;
+    let worker_name = crate::fleet_info::resolve_this_worker_name().await;
     let deployments = ff_db::pg_list_deployments(pool, Some(&worker_name))
         .await
         .map_err(|e| format!("pg_list_deployments: {e}"))?;
@@ -295,7 +295,7 @@ pub async fn health_check_deployment(
     pool: &sqlx::PgPool,
     deployment_id: &str,
 ) -> Result<bool, String> {
-    let worker_name = crate::fleet_info::resolve_this_node_name().await;
+    let worker_name = crate::fleet_info::resolve_this_worker_name().await;
     let deployments = ff_db::pg_list_deployments(pool, Some(&worker_name))
         .await
         .map_err(|e| format!("pg_list_deployments: {e}"))?;

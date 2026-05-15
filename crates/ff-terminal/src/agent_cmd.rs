@@ -542,7 +542,7 @@ pub async fn handle_agent(cmd: crate::AgentCommand) -> Result<()> {
                 uuid::Uuid::parse_str(&id_str)
                     .map_err(|e| anyhow::anyhow!("invalid --work-item-id: {e}"))?
             } else {
-                let created_by = ff_agent::fleet_info::resolve_this_node_name().await;
+                let created_by = ff_agent::fleet_info::resolve_this_worker_name().await;
                 ff_agent::agent_coordinator::create_transient_work_item(&pool, &prompt, &created_by)
                     .await
                     .map_err(|e| anyhow::anyhow!("create transient work_item: {e}"))?

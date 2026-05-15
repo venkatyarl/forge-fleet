@@ -56,7 +56,7 @@ flowchart TB
         SA["sub_agents<br/>slot registry (idle/busy/error)"]
         WI["work_items<br/>project tasks"]
         WO["work_outputs<br/>LLM responses + artifacts"]
-        CN["computers + fleet_nodes + fleet_models<br/>node & model catalog"]
+        CN["computers + fleet_workers + fleet_models<br/>node & model catalog"]
         FLS["fleet_leader_state<br/>elected leader"]
     end
 
@@ -146,7 +146,7 @@ flowchart TB
 - `ff-mesh` duplicates concepts the production stack already solves via Postgres + Pulse:
   - **Worker tracking** → `computers` table + Pulse beats
   - **Task queue** → `fleet_tasks` with `FOR UPDATE SKIP LOCKED`
-  - **Health checking** → Pulse materializer + `fleet_nodes.status`
+  - **Health checking** → Pulse materializer + `fleet_workers.status`
   - **Leader election** → `fleet_leader_state` table (reconciled every 60s)
   - **Scheduling** → Capability-based SQL query in `TaskRunner::tick_once`
 - **Critical**: `ff-mesh` has **no durability**. Leader crash = lost queue state.
@@ -291,7 +291,7 @@ flowchart TB
         SA["sub_agents"]
         WI["work_items"]
         WO["work_outputs"]
-        CN["computers + fleet_nodes + fleet_models"]
+        CN["computers + fleet_workers + fleet_models"]
     end
 
     subgraph Discovery["Pulse v2"]

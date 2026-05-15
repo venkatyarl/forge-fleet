@@ -1,8 +1,8 @@
 import { useEffect } from 'react'
-import type { FleetNode } from '../types'
+import type { FleetComputer } from '../types'
 
 type Props = {
-  member: FleetNode | null
+  member: FleetComputer | null
   onClose: () => void
 }
 

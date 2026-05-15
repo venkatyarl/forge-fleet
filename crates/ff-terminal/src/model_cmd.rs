@@ -129,7 +129,7 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
             // Default: resolve this host's node name from Postgres by IP.
             let worker_name = match node {
                 Some(n) => n,
-                None => ff_agent::fleet_info::resolve_this_node_name().await,
+                None => ff_agent::fleet_info::resolve_this_worker_name().await,
             };
             let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
             let default_dir = PathBuf::from(home).join("models");
@@ -183,7 +183,7 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
             // Resolve target node + node runtime + models_dir.
             let worker_name = match node {
                 Some(n) => n,
-                None => ff_agent::fleet_info::resolve_this_node_name().await,
+                None => ff_agent::fleet_info::resolve_this_worker_name().await,
             };
             let node_row = ff_db::pg_get_node(&pool, &worker_name)
                 .await?
@@ -235,7 +235,7 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
             // Cross-node downloads are dispatched via the deferred task queue: a
             // defer-worker running on the target node will claim it and run
             // `ff model download <id> --runtime <rt>` locally there.
-            let this_node = ff_agent::fleet_info::resolve_this_node_name().await;
+            let this_node = ff_agent::fleet_info::resolve_this_worker_name().await;
             if worker_name != this_node {
                 let escaped_id = shell_escape_single(&id);
                 let command = format!(
@@ -510,7 +510,7 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
             }
 
             // Cross-node delete not yet wired — only this host.
-            let this_node = ff_agent::fleet_info::resolve_this_node_name().await;
+            let this_node = ff_agent::fleet_info::resolve_this_worker_name().await;
             if row.worker_name != this_node {
                 anyhow::bail!(
                     "cross-node delete not yet implemented. run on '{}' instead.",
@@ -570,7 +570,7 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
             }
         }
         crate::ModelCommand::Autoload { catalog_id, ctx } => {
-            let worker_name = ff_agent::fleet_info::resolve_this_node_name().await;
+            let worker_name = ff_agent::fleet_info::resolve_this_worker_name().await;
 
             // 1. Already deployed?
             let deps = ff_db::pg_list_deployments(&pool, Some(&worker_name)).await?;
@@ -792,7 +792,7 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
         } => {
             let worker_name = match node {
                 Some(n) => n,
-                None => ff_agent::fleet_info::resolve_this_node_name().await,
+                None => ff_agent::fleet_info::resolve_this_worker_name().await,
             };
             let policy = ff_agent::smart_lru::LruPolicy {
                 min_cold_days,
@@ -1312,7 +1312,7 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
             let computer = if let Some(c) = computer {
                 c
             } else {
-                ff_agent::fleet_info::resolve_this_node_name().await
+                ff_agent::fleet_info::resolve_this_worker_name().await
             };
             match ff_agent::model_benchmark::benchmark_with_defaults(&pool, &model_id, &computer)
                 .await

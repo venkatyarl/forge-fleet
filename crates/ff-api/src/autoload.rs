@@ -20,7 +20,7 @@ use tracing::{info, warn};
 ///
 /// Returns a `http://host:port` URL on success.
 pub async fn ensure_deployed(pool: &PgPool, catalog_id: &str) -> Result<String, String> {
-    let worker_name = resolve_this_node_name(pool).await;
+    let worker_name = resolve_this_worker_name(pool).await;
 
     // 1. Already deployed and healthy?
     if let Some(url) = find_healthy_deployment(pool, &worker_name, catalog_id).await? {
@@ -103,9 +103,9 @@ async fn find_healthy_deployment(
         .map(|d| format!("http://127.0.0.1:{}", d.port)))
 }
 
-/// Resolve the local node name. Mirrors `ff_agent::fleet_info::resolve_this_node_name`
+/// Resolve the local node name. Mirrors `ff_agent::fleet_info::resolve_this_worker_name`
 /// but is duplicated here to avoid the ff-api → ff-agent dependency cycle.
-async fn resolve_this_node_name(pool: &PgPool) -> String {
+async fn resolve_this_worker_name(pool: &PgPool) -> String {
     if let Ok(v) = std::env::var("FORGEFLEET_NODE_NAME") {
         let t = v.trim();
         if !t.is_empty() {
