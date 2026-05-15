@@ -611,6 +611,27 @@ impl Materializer {
             .await;
         }
 
+        // V89: refresh computer_software.installed_version for ff_git and
+        // forgefleetd_git from the publishing daemon's own build SHA.
+        // Previously this column only updated through the auto-upgrade
+        // success callback, so `ff fleet versions` lagged reality whenever
+        // the operator pushed a manual rebuild or used deploy-ff-to-fleet.
+        // Now the daemon's heartbeat is authoritative.
+        if let Some(sha) = beat.build_sha.as_deref() {
+            let _ = sqlx::query(
+                "UPDATE computer_software SET \
+                    installed_version = $1, \
+                    last_checked_at = NOW() \
+                 WHERE computer_id = $2 \
+                   AND software_id IN ('ff_git', 'forgefleetd_git') \
+                   AND COALESCE(installed_version, '') <> $1",
+            )
+            .bind(sha)
+            .bind(computer_id)
+            .execute(&self.pg)
+            .await;
+        }
+
         // Status transition handling.
         if status_changed {
             report.wrote_computer_row = true;

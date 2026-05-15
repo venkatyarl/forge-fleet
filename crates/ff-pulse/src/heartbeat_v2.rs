@@ -40,6 +40,10 @@ pub struct HeartbeatV2Publisher {
     role: Arc<parking_lot_compat::RwLock<String>>,
     /// Cached election priority from fleet_workers (set at startup).
     election_priority: i32,
+    /// 10-char git SHA of the binary, captured at compile time and
+    /// published on every beat so the materializer can refresh
+    /// computer_software.installed_version without an explicit upgrade.
+    build_sha: Option<String>,
 }
 
 // Small compatibility shim — we use std RwLock to avoid pulling parking_lot.
@@ -61,6 +65,7 @@ impl HeartbeatV2Publisher {
             epoch: Arc::new(AtomicU64::new(0)),
             role: Arc::new(parking_lot_compat::RwLock::new("member".to_string())),
             election_priority,
+            build_sha: None,
         }
     }
 
@@ -75,6 +80,16 @@ impl HeartbeatV2Publisher {
             Duration::from_secs(15),
             election_priority,
         )
+    }
+
+    /// Attach the build-SHA that every published beat should carry.
+    /// Pass `env!("FF_GIT_SHA")` from the daemon entrypoint.
+    pub fn with_build_sha(mut self, sha: impl Into<String>) -> Self {
+        let sha = sha.into();
+        if !sha.is_empty() && sha != "unknown" {
+            self.build_sha = Some(sha);
+        }
+        self
     }
 
     /// Share the epoch atomic with leader_tick so both agree.
@@ -99,6 +114,7 @@ impl HeartbeatV2Publisher {
         let epoch = self.epoch.clone();
         let role = self.role.clone();
         let election_priority = self.election_priority;
+        let build_sha = self.build_sha.clone();
 
         // Phase A: blocking system probes — must not block the async runtime.
         // Hard timeout: if any macOS framework call (IOKit, DiskArbitration,
@@ -263,6 +279,7 @@ impl HeartbeatV2Publisher {
                 // computers.os_family directly without re-deriving from
                 // kernel + /etc/os-release on the leader.
                 beat.os = detect_os_info();
+                beat.build_sha = build_sha.clone();
 
                 // ── Installed software inventory ─────────────────────────────
                 beat.installed_software = SoftwareCollector::new().detect();

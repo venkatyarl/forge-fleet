@@ -2035,7 +2035,8 @@ async fn start_pulse_v2_subsystems(
         redis_client.clone(),
         worker_name.clone(),
         election_priority,
-    );
+    )
+    .with_build_sha(env!("FF_GIT_SHA"));
     // epoch_handle + role_handle are shared with leader_tick below when
     // available; for now we just spawn the publisher.
     let _epoch_handle = v2_pub.epoch_handle();

@@ -60,6 +60,12 @@ pub struct PulseBeatV2 {
     /// daemons that publish beats before this field was added.
     #[serde(default)]
     pub os: OsInfo,
+    /// V89+: 10-char git SHA prefix of the binary publishing this beat.
+    /// Materializer writes it to `computer_software.installed_version` for
+    /// `ff_git` + `forgefleetd_git` rows so `ff fleet versions` reflects
+    /// live state without an explicit post-upgrade refresh.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_sha: Option<String>,
     pub hardware: HardwareInfo,
     pub load: LoadInfo,
     pub memory: MemoryInfo,
@@ -428,6 +434,7 @@ impl PulseBeatV2 {
                 all_ips: Vec::new(),
             },
             os: OsInfo::default(),
+            build_sha: None,
             hardware: HardwareInfo {
                 cpu_cores: 0,
                 ram_gb: 0,
