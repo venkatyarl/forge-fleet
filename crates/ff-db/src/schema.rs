@@ -6540,3 +6540,21 @@ INSERT INTO github_ssh_aliases (alias_name, identity_file, description) VALUES
      'Default github.com SSH identity used when no -<account> alias is selected')
 ON CONFLICT (alias_name) DO NOTHING;
 "#;
+
+pub const SCHEMA_V90_DEPLOYMENT_DESIRED_STATE: &str = r#"
+-- ─── V90: desired_state on fleet_model_deployments ─────────────────────────
+-- The deployment_reconciler today only adopts existing processes (live → DB);
+-- when a process dies, the reconciler DELETES the row, so on the next tick
+-- we have no record that the operator wanted this LLM up. Add `desired_state`
+-- so the row survives a missing process: 'active' = should be running and
+-- the respawn-aware reconciler brings it back; 'retired' = operator unloaded,
+-- reconciler should clean up and stop.
+--
+-- Default 'active' means existing rows are all managed by the new logic.
+ALTER TABLE fleet_model_deployments
+    ADD COLUMN IF NOT EXISTS desired_state text NOT NULL DEFAULT 'active'
+    CHECK (desired_state IN ('active', 'retired'));
+
+CREATE INDEX IF NOT EXISTS fleet_model_deployments_desired_state_idx
+    ON fleet_model_deployments (desired_state, worker_name);
+"#;

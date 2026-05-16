@@ -577,6 +577,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "github_ssh_aliases",
         sql: schema::SCHEMA_V89_GITHUB_SSH_ALIASES,
     },
+    PgMigration {
+        version: 90,
+        name: "deployment_desired_state",
+        sql: schema::SCHEMA_V90_DEPLOYMENT_DESIRED_STATE,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.

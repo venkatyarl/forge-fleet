@@ -236,6 +236,17 @@ pub async fn unload_model(pool: &sqlx::PgPool, deployment_id: &str) -> Result<()
         .find(|d| d.id == deployment_id)
         .ok_or_else(|| format!("no deployment '{deployment_id}' on this node"))?;
 
+    // Mark desired_state='retired' BEFORE the kill so a racing reconciler
+    // tick doesn't see a missing process for an 'active' row and spawn
+    // a replacement we're about to delete. See V90.
+    let _ = sqlx::query(
+        "UPDATE fleet_model_deployments SET desired_state = 'retired' WHERE id = $1::uuid",
+    )
+    .bind(deployment_id)
+    .execute(pool)
+    .await
+    .map_err(|e| format!("mark retired: {e}"))?;
+
     let pid_i32 = dep.pid.ok_or_else(|| "deployment has no pid".to_string())?;
     let pid = pid_i32 as u32;
 
