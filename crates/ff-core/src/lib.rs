@@ -17,6 +17,7 @@ pub mod chaos;
 pub mod circuit_breaker;
 pub mod config;
 pub mod db;
+pub mod db_health;
 pub mod error;
 pub mod fleet_resolver;
 pub mod hardware;

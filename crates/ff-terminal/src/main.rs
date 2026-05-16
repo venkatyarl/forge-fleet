@@ -45,6 +45,7 @@ mod events_cmd;
 mod ext_cmd;
 mod fabric_cmd;
 mod fleet_cmd;
+mod github_cmd;
 mod health_cmd;
 mod helpers;
 mod lifecycle_cmd;
@@ -337,6 +338,14 @@ enum Command {
     Ext {
         #[command(subcommand)]
         command: ExtCommand,
+    },
+    /// Fleet-wide GitHub SSH identity registry. Manages the `Host
+    /// github.com-*` aliases and the matching id_* keypairs so every
+    /// fleet computer can push to GitHub from day one of enrollment.
+    /// Source of truth: Postgres `github_ssh_aliases` + `fleet_secrets`.
+    Github {
+        #[command(subcommand)]
+        command: GithubCommand,
     },
     /// Self-service onboarding helpers (show curl command, list recent, revoke).
     Onboard {
@@ -1207,7 +1216,7 @@ enum FleetCommand {
         #[arg(long, default_value_t = false)]
         force_dirty: bool,
     },
-    /// Resolve fleet computers from all sources (Postgres → fleet.toml → SSH config → fleet.json).
+    /// Resolve fleet computers from Postgres (with fleet.toml fallback).
     Computers {
         /// Output format: text or json
         #[arg(long, default_value = "text")]
@@ -1218,6 +1227,22 @@ enum FleetCommand {
         /// Filter by role substring (e.g. "worker", "leader")
         #[arg(long)]
         role: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum GithubCommand {
+    /// List the aliases (and key fingerprints) currently registered in
+    /// the DB. Does not print private key material.
+    List,
+    /// Pull aliases + keys from the DB and apply them to *this*
+    /// computer's `~/.ssh/`. Idempotent: skips aliases already present
+    /// in `~/.ssh/config` and skips key files that already match.
+    /// Intended for enrollment bootstrap — also safe to re-run.
+    Sync {
+        /// Show what would happen without writing.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
     },
 }
 
@@ -2211,6 +2236,9 @@ async fn main() -> Result<()> {
             return software_cmd::handle_software(command.clone()).await;
         }
         Some(Command::Ext { command }) => return ext_cmd::handle_ext(command.clone()).await,
+        Some(Command::Github { command }) => {
+            return github_cmd::handle_github(command.clone()).await;
+        }
         Some(Command::Onboard { command }) => {
             return onboard_cmd::handle_onboard(command.clone()).await;
         }
@@ -2414,6 +2442,7 @@ async fn main() -> Result<()> {
         Some(Command::Llm { command }) => llm_cmd::handle_llm(command).await,
         Some(Command::Software { command }) => software_cmd::handle_software(command).await,
         Some(Command::Ext { command }) => ext_cmd::handle_ext(command).await,
+        Some(Command::Github { command }) => github_cmd::handle_github(command).await,
         Some(Command::Onboard { command }) => onboard_cmd::handle_onboard(command).await,
         Some(Command::VirtualBrain { command }) => brain_cmd::handle_brain(command).await,
         Some(Command::Openclaw { command }) => openclaw_cmd::handle_openclaw(command).await,

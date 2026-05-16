@@ -635,6 +635,26 @@ fi
 
 report "mcp-config" ok
 
+# ─── GitHub SSH identity (V89) ───────────────────────────────────────────
+# Pull the canonical github.com SSH aliases + keypairs from Postgres so
+# this new node can `git push` to GitHub from day one. The DB owns the
+# config; `ff github sync` materializes ~/.ssh/id_* (chmod 600/644) and
+# appends any missing `Host github.com-*` blocks to ~/.ssh/config.
+# Idempotent: re-running on an already-bootstrapped node is a no-op.
+report "github-identity" running
+if run_as_user bash -lc 'command -v ff >/dev/null 2>&1'; then
+  if run_as_user bash -lc 'ff github sync 2>&1'; then
+    report "github-identity" ok "synced from fleet_secrets"
+  else
+    # Don't fail the whole bootstrap — operator can run `ff github sync`
+    # manually once they fix whatever blocked it (usually first-time DB
+    # connectivity or empty fleet_secrets).
+    report "github-identity" warn "ff github sync failed — run manually after bootstrap"
+  fi
+else
+  report "github-identity" warn "ff not on PATH — skipping github sync"
+fi
+
 # ─── Done ────────────────────────────────────────────────────────────────
 
 report "done" ok "$NAME is now a ForgeFleet node"

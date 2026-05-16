@@ -6505,3 +6505,38 @@ BEGIN
     END IF;
 END $$;
 "#;
+
+pub const SCHEMA_V89_GITHUB_SSH_ALIASES: &str = r#"
+-- ─── V89: GitHub SSH aliases registry ──────────────────────────────────────
+-- One row per `Host github.com-foo` block that should exist on every fleet
+-- computer's `~/.ssh/config`. Lets a new computer bootstrap the same GitHub
+-- identity setup as Taylor on enrollment, without anything hardcoded.
+--
+-- Private + public key material lives in `fleet_secrets` under well-known
+-- keys (`github_ssh_<file>_priv` / `github_ssh_<file>_pub`) — separating
+-- the *config* (this table) from the *secret material* (fleet_secrets).
+--
+-- A `Host github.com-venkat / IdentityFile ~/.ssh/id_venkat / IdentitiesOnly yes`
+-- block becomes one row with identity_file='~/.ssh/id_venkat'.
+CREATE TABLE IF NOT EXISTS github_ssh_aliases (
+    alias_name       text PRIMARY KEY,
+    hostname         text NOT NULL DEFAULT 'github.com',
+    ssh_user         text NOT NULL DEFAULT 'git',
+    identity_file    text NOT NULL,
+    identities_only  boolean NOT NULL DEFAULT true,
+    description      text,
+    created_at       timestamptz NOT NULL DEFAULT now(),
+    updated_at       timestamptz NOT NULL DEFAULT now()
+);
+
+-- Seed Taylor's existing aliases. ON CONFLICT DO NOTHING keeps the migration
+-- idempotent so we can rerun it without clobbering operator edits.
+INSERT INTO github_ssh_aliases (alias_name, identity_file, description) VALUES
+    ('github.com-venkat', '~/.ssh/id_venkat',
+     'Primary venkatyarl identity — canonical account post-migration'),
+    ('github.com-taylor', '~/.ssh/id_taylor',
+     'Legacy taylor-oclaw account — kept until full repo migration completes'),
+    ('github.com',        '~/.ssh/id_rsa',
+     'Default github.com SSH identity used when no -<account> alias is selected')
+ON CONFLICT (alias_name) DO NOTHING;
+"#;

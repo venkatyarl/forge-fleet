@@ -9,8 +9,11 @@
 # their own discovery. The canonical resolution chain is:
 #   1. Postgres fleet_workers table  (via `ff fleet computers --format json`)
 #   2. fleet.toml [nodes.*]          (fallback)
-#   3. ~/.ssh/config                 (fallback)
-#   4. ~/.forgefleet/fleet.json      (last resort)
+#   3. ~/.forgefleet/fleet.json      (last resort)
+#
+# ~/.ssh/config is intentionally NOT in this chain — it's the operator's
+# personal file, not a ForgeFleet artifact. Scripts that need to SSH a
+# node build `user@ip` from the resolver and invoke `ssh user@ip ...`.
 #
 # Provided functions:
 #   discover_fleet_computers      → outputs "name|ip|ssh_user" lines
@@ -28,7 +31,6 @@ set -euo pipefail
 
 FORGEFLEET_HOME="${FORGEFLEET_HOME:-$HOME/.forgefleet}"
 FLEET_TOML="${FORGEFLEET_HOME}/fleet.toml"
-SSH_CONFIG="${HOME}/.ssh/config"
 FLEET_JSON="${FORGEFLEET_HOME}/fleet.json"
 
 # ─── Internal: try the canonical Rust resolver ───────────────────────────────
@@ -92,25 +94,6 @@ except Exception:
 " 2>/dev/null
 }
 
-_discover_from_ssh_config() {
-    if [[ ! -f "$SSH_CONFIG" ]]; then
-        return 1
-    fi
-    awk '
-    /^Host[ \t]+/ {
-        host = $2
-        hostname = ""
-        user = "venkat"
-    }
-    /[ \t]*HostName[ \t]+/ { hostname = $2 }
-    /[ \t]*User[ \t]+/ { user = $2 }
-    host && hostname && host !~ /\*/ && host !~ /^github/ {
-        print host "|" hostname "|" user "||"
-        host = ""
-    }
-    ' "$SSH_CONFIG" 2>/dev/null
-}
-
 _discover_from_fleet_json() {
     if ! command -v python3 >/dev/null 2>&1 || [[ ! -f "$FLEET_JSON" ]]; then
         return 1
@@ -161,13 +144,7 @@ for n in data:
         return 0
     fi
 
-    # 4. ~/.ssh/config
-    if output=$(_discover_from_ssh_config 2>/dev/null) && [[ -n "$output" ]]; then
-        echo "$output"
-        return 0
-    fi
-
-    # 5. ~/.forgefleet/fleet.json
+    # 4. ~/.forgefleet/fleet.json
     if output=$(_discover_from_fleet_json 2>/dev/null) && [[ -n "$output" ]]; then
         echo "$output"
         return 0

@@ -572,6 +572,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "rename_fleet_node_runtime",
         sql: schema::SCHEMA_V88_RENAME_FLEET_NODE_RUNTIME,
     },
+    PgMigration {
+        version: 89,
+        name: "github_ssh_aliases",
+        sql: schema::SCHEMA_V89_GITHUB_SSH_ALIASES,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.

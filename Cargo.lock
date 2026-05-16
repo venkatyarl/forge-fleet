@@ -1634,6 +1634,7 @@ version = "2026.4.7"
 dependencies = [
  "anyhow",
  "async-nats",
+ "base64 0.22.1",
  "chrono",
  "clap",
  "crossterm 0.29.0",

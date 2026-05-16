@@ -5,9 +5,13 @@
 //!
 //! Resolution chain (in priority order):
 //!   1. Postgres `fleet_workers` table  — canonical source of truth
-//!   2. `fleet.toml` `[nodes.*]`       — static config fallback
-//!   3. `~/.ssh/config`                — SSH-based discovery
-//!   4. `~/.forgefleet/fleet.json`    — JSON fallback
+//!   2. `~/.forgefleet/fleet.toml`     — bootstrap config (DB unreachable)
+//!   3. `~/.forgefleet/fleet.json`    — JSON cache fallback
+//!
+//! `~/.ssh/config` is intentionally NOT in this chain. It belongs to the
+//! operator, not to ForgeFleet — every code path inside ff that needs to
+//! reach a node builds `user@ip` from the resolver directly and invokes
+//! `ssh user@ip ...`, never relying on host aliases that ff doesn't own.
 //!
 //! Both sync (`resolve_sync`) and async (`resolve`) entry points are provided.
 //! The sync path never spawns an async runtime; it reads files only.
@@ -99,8 +103,7 @@ impl FleetResolver {
     ///
     /// 1. Try Postgres via the DB URL in `fleet.toml`.
     /// 2. Fall back to `fleet.toml` `[nodes.*]`.
-    /// 3. Fall back to `~/.ssh/config`.
-    /// 4. Fall back to `~/.forgefleet/fleet.json`.
+    /// 3. Fall back to `~/.forgefleet/fleet.json`.
     pub async fn resolve(&self) -> Result<Vec<FleetNodeInfo>, FleetResolveError> {
         // 1. Postgres
         match self.resolve_from_postgres().await {
@@ -112,7 +115,7 @@ impl FleetResolver {
             Err(e) => debug!(error = %e, "Postgres resolution failed"),
         }
 
-        // 2-4. File-based fallbacks
+        // 2-3. File-based fallbacks
         self.resolve_sync()
     }
 
@@ -122,8 +125,7 @@ impl FleetResolver {
     ///
     /// Chain:
     ///   1. `fleet.toml` `[nodes.*]`
-    ///   2. `~/.ssh/config`
-    ///   3. `~/.forgefleet/fleet.json`
+    ///   2. `~/.forgefleet/fleet.json`
     pub fn resolve_sync(&self) -> Result<Vec<FleetNodeInfo>, FleetResolveError> {
         // 1. fleet.toml
         match self.resolve_from_fleet_toml() {
@@ -135,20 +137,7 @@ impl FleetResolver {
             Err(e) => debug!(error = %e, "fleet.toml resolution failed"),
         }
 
-        // 2. ~/.ssh/config
-        match self.resolve_from_ssh_config() {
-            Ok(nodes) if !nodes.is_empty() => {
-                debug!(
-                    count = nodes.len(),
-                    "resolved fleet nodes from ~/.ssh/config"
-                );
-                return Ok(nodes);
-            }
-            Ok(_) => debug!("~/.ssh/config has no fleet nodes"),
-            Err(e) => debug!(error = %e, "~/.ssh/config resolution failed"),
-        }
-
-        // 3. ~/.forgefleet/fleet.json
+        // 2. ~/.forgefleet/fleet.json
         match self.resolve_from_fleet_json() {
             Ok(nodes) if !nodes.is_empty() => {
                 debug!(count = nodes.len(), "resolved fleet nodes from fleet.json");
@@ -216,80 +205,6 @@ impl FleetResolver {
             .iter()
             .map(|(name, cfg)| node_config_to_info(name, cfg))
             .collect();
-        Ok(nodes)
-    }
-
-    fn resolve_from_ssh_config(&self) -> Result<Vec<FleetNodeInfo>, FleetResolveError> {
-        let path = Self::home_dir()
-            .ok_or(FleetResolveError::NoHomeDir)?
-            .join(".ssh")
-            .join("config");
-
-        if !path.exists() {
-            return Ok(Vec::new());
-        }
-
-        let content =
-            std::fs::read_to_string(&path).map_err(|e| FleetResolveError::Io(e.to_string()))?;
-
-        let mut nodes = Vec::new();
-        let mut current_host: Option<String> = None;
-        let mut current_hostname: Option<String> = None;
-        let mut current_user = "venkat".to_string();
-
-        for line in content.lines() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
-                continue;
-            }
-
-            // Host line starts a new block
-            if let Some(rest) = trimmed.strip_prefix("Host ") {
-                // Flush previous block
-                if let (Some(host), Some(hostname)) = (current_host.take(), current_hostname.take())
-                {
-                    if !host.contains('*') && !host.to_ascii_lowercase().starts_with("github") {
-                        nodes.push(FleetNodeInfo {
-                            name: host.clone(),
-                            ip: hostname,
-                            ssh_user: current_user.clone(),
-                            os: String::new(),
-                            role: String::new(),
-                        });
-                    }
-                }
-                current_host = Some(rest.trim().to_string());
-                current_hostname = None;
-                current_user = "venkat".to_string();
-                continue;
-            }
-
-            // HostName within a block
-            if let Some(rest) = trimmed.strip_prefix("HostName ") {
-                current_hostname = Some(rest.trim().to_string());
-                continue;
-            }
-
-            // User within a block
-            if let Some(rest) = trimmed.strip_prefix("User ") {
-                current_user = rest.trim().to_string();
-                continue;
-            }
-        }
-
-        // Flush final block
-        if let (Some(host), Some(hostname)) = (current_host, current_hostname) {
-            if !host.contains('*') && !host.to_ascii_lowercase().starts_with("github") {
-                nodes.push(FleetNodeInfo {
-                    name: host,
-                    ip: hostname,
-                    ssh_user: current_user,
-                    os: String::new(),
-                    role: String::new(),
-                });
-            }
-        }
-
         Ok(nodes)
     }
 
@@ -402,7 +317,7 @@ impl std::fmt::Display for FleetResolveError {
             Self::NoHomeDir => write!(f, "could not determine home directory"),
             Self::NoSources => write!(
                 f,
-                "no fleet node sources available (tried Postgres, fleet.toml, ~/.ssh/config, fleet.json)"
+                "no fleet node sources available (tried Postgres, fleet.toml, fleet.json)"
             ),
             Self::Io(s) => write!(f, "io error: {s}"),
             Self::Toml(s) => write!(f, "toml parse error: {s}"),
