@@ -2133,6 +2133,90 @@ async fn start_pulse_v2_subsystems(
         }));
     }
 
+    // Deferred-task scheduler — leader-gated, every 15s.
+    //
+    // Without this tick, tasks enqueued via `ff fleet upgrade`, the auto-
+    // upgrade hourly tick, and any operator `ff defer add-shell` sit at
+    // status='pending' forever — no worker claims pending tasks; they
+    // need to be promoted to 'dispatchable' first by a scheduler.
+    //
+    // Before this was inlined into forgefleetd, the only way to drain
+    // the queue was to manually run `ff daemon --scheduler` somewhere.
+    // 2026-05-16 the queue had accumulated 951 pending tasks (up to 7
+    // days old) because no scheduler was running.
+    //
+    // Leader-gated because the scheduler is global state — only one node
+    // should promote, otherwise multiple promotion attempts race on the
+    // same row. When the leader fails over, the new leader's forgefleetd
+    // picks up the scheduler duty automatically.
+    {
+        let pool = pg_pool.clone();
+        let me = worker_name.clone();
+        let mut shutdown_rx_sched = shutdown_rx.clone();
+        handles.push(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
+            // Lead-time skip — first tick after 15s gives pulse v2 + leader
+            // election a chance to settle before we ask "am I leader?".
+            tick.tick().await;
+            // Track online/offline transitions so we publish wake events
+            // to Redis (workers waiting on `node_online` can claim
+            // immediately instead of waiting up to 15s).
+            let mut last_online: std::collections::HashSet<String> = Default::default();
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = shutdown_rx_sched.changed() => break,
+                    _ = tick.tick() => {
+                        // 1. Am I the elected leader?
+                        let is_leader = match ff_db::leader_state::pg_get_current_leader(&pool).await {
+                            Ok(Some(l)) => l.member_name == me,
+                            _ => false,
+                        };
+                        if !is_leader {
+                            continue;
+                        }
+                        // 2. Online set from pulse (computers beaten within 60s).
+                        let online: Vec<String> = match sqlx::query_as::<_, (String,)>(
+                            "SELECT name FROM computers \
+                             WHERE last_seen_at IS NOT NULL \
+                               AND last_seen_at > NOW() - interval '60 seconds'",
+                        )
+                        .fetch_all(&pool)
+                        .await
+                        {
+                            Ok(rows) => rows.into_iter().map(|(n,)| n).collect(),
+                            Err(e) => {
+                                warn!("scheduler: list online: {e}");
+                                continue;
+                            }
+                        };
+                        // 3. Publish online/offline transitions to Redis so
+                        //    workers waiting on `node_online` wake immediately.
+                        let current: std::collections::HashSet<String> = online.iter().cloned().collect();
+                        for n in current.difference(&last_online) {
+                            let _ = ff_agent::fleet_events::publish_node_online(n).await;
+                        }
+                        for n in last_online.difference(&current) {
+                            let _ = ff_agent::fleet_events::publish_node_offline(n).await;
+                        }
+                        last_online = current;
+                        // 4. Promote pending → dispatchable.
+                        let now = chrono::Utc::now();
+                        match ff_db::pg_scheduler_pass(&pool, &online, now).await {
+                            Ok(n) if n > 0 => info!(
+                                promoted = n,
+                                online = online.len(),
+                                "scheduler tick promoted pending → dispatchable"
+                            ),
+                            Ok(_) => {}
+                            Err(e) => warn!("scheduler pg_scheduler_pass: {e}"),
+                        }
+                    }
+                }
+            }
+        }));
+    }
+
     // (4) LeaderTick — only when enrolled in fleet_members.
     if enrolled_in_fleet {
         info!(

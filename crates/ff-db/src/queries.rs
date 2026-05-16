@@ -2800,13 +2800,18 @@ pub async fn pg_scheduler_pass(
     .await?
     .rows_affected();
 
-    // manual / now: promote immediately (manual is for retry loops; 'now' is fire-and-forget).
+    // manual / now / operator: promote immediately. `manual` is for retry
+    // loops; `now` is fire-and-forget; `operator` is a human (or `ff fleet
+    // upgrade`, version_check, mesh_check) enqueue that should dispatch
+    // as soon as the queue is pumped. Before adding `operator` here, those
+    // enqueues sat at status='pending' forever — discovered 2026-05-16
+    // with 38 operator-triggered tasks accumulated indefinitely.
     let immediate_promoted = sqlx::query(
         "UPDATE deferred_tasks
             SET status = 'dispatchable',
                 next_attempt_at = NOW()
           WHERE status = 'pending'
-            AND trigger_type IN ('manual', 'now')
+            AND trigger_type IN ('manual', 'now', 'operator')
             AND (next_attempt_at IS NULL OR next_attempt_at <= NOW())",
     )
     .execute(pool)
