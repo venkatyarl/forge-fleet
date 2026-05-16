@@ -332,7 +332,13 @@ pub async fn health_check_deployment(
 
 fn llama_server_binary() -> String {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
+    // Known install locations across the fleet. The "no-prefix" form
+    // (`llama.cpp/build/bin/llama-server` at `$HOME`) is the layout used
+    // by sophie and other operators who cloned llama.cpp at the home
+    // root rather than under `projects/`. Discovered 2026-05-16 when
+    // `ff model load` on sophie failed with "No such file or directory".
     for rel in [
+        "llama.cpp/build/bin/llama-server",
         "projects/llama.cpp/build/bin/llama-server",
         ".forgefleet/llama.cpp/build/bin/llama-server",
     ] {
