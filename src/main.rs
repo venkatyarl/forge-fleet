@@ -2088,6 +2088,45 @@ async fn start_pulse_v2_subsystems(
             .await;
     }));
 
+    // Deployment reconciler — drives fleet_model_deployments desired_state
+    // toward live process reality, every 60s. Without this tick, a dead
+    // llama-server child stays dead until an operator manually re-runs
+    // `ff model load`. Self-heal lives here. See V90 +
+    // crates/ff-agent/src/deployment_reconciler.rs.
+    {
+        let pool = pg_pool.clone();
+        let mut shutdown_rx_dep = shutdown_rx.clone();
+        handles.push(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+            // Skip the first immediate fire so we don't race forgefleetd
+            // startup before pulse + workers are ready.
+            tick.tick().await;
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = shutdown_rx_dep.changed() => break,
+                    _ = tick.tick() => {
+                        match ff_agent::deployment_reconciler::reconcile_local(&pool).await {
+                            Ok(s) => {
+                                if s.respawned > 0 || s.killed > 0 || s.adopted > 0 || s.removed > 0 {
+                                    info!(
+                                        adopted = s.adopted,
+                                        respawned = s.respawned,
+                                        killed = s.killed,
+                                        removed = s.removed,
+                                        refreshed = s.refreshed,
+                                        "deployment reconciler pass"
+                                    );
+                                }
+                            }
+                            Err(e) => warn!("deployment reconciler failed: {e}"),
+                        }
+                    }
+                }
+            }
+        }));
+    }
+
     // (4) LeaderTick — only when enrolled in fleet_members.
     if enrolled_in_fleet {
         info!(
