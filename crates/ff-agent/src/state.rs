@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use ff_core::{ActivityLevel, AgentTask, NodeRole};
+use ff_core::{ActivityLevel, AgentTask, WorkerRole};
 use ff_discovery::{HardwareProfile, HealthSnapshot};
 use serde::Serialize;
 use std::{collections::HashMap, sync::Arc};
@@ -11,7 +11,7 @@ pub type SharedState = Arc<RwLock<AgentState>>;
 #[derive(Debug)]
 pub struct AgentState {
     pub node_id: String,
-    pub role: NodeRole,
+    pub role: WorkerRole,
     pub started_at: DateTime<Utc>,
     pub hardware: HardwareProfile,
     pub last_health: Option<HealthSnapshot>,
@@ -25,7 +25,7 @@ impl AgentState {
     pub fn new(node_id: String, hardware: HardwareProfile) -> Self {
         Self {
             node_id,
-            role: NodeRole::Worker,
+            role: WorkerRole::Worker,
             started_at: Utc::now(),
             hardware,
             last_health: None,
@@ -54,7 +54,7 @@ impl AgentState {
 #[derive(Debug, Serialize)]
 pub struct AgentStatus {
     pub node_id: String,
-    pub role: NodeRole,
+    pub role: WorkerRole,
     pub started_at: DateTime<Utc>,
     pub hardware: HardwareProfile,
     pub last_health: Option<HealthSnapshot>,

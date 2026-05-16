@@ -1,6 +1,6 @@
 # ForgeFleet Windows bootstrap script.
 # Rendered at serve time from /onboard/bootstrap.ps1; placeholders:
-#   {{LEADER_HOST}}, {{LEADER_PORT}}, {{TOKEN}}, {{NODE_NAME}}, {{NODE_IP}},
+#   {{LEADER_HOST}}, {{LEADER_PORT}}, {{TOKEN}}, {{COMPUTER_NAME}}, {{COMPUTER_IP}},
 #   {{SSH_USER}}, {{ROLE}}, {{RUNTIME}}, {{GITHUB_OWNER}},
 #   {{GITHUB_PAT_SECRET_KEY}}, {{IS_TAYLOR}}
 #
@@ -17,8 +17,8 @@ $ErrorActionPreference = 'Stop'
 $LEADER_HOST           = "{{LEADER_HOST}}"
 $LEADER_PORT           = "{{LEADER_PORT}}"
 $TOKEN                 = "{{TOKEN}}"
-$NAME                  = "{{NODE_NAME}}"
-$IP                    = "{{NODE_IP}}"
+$NAME                  = "{{COMPUTER_NAME}}"
+$IP                    = "{{COMPUTER_IP}}"
 $SSH_USER              = "{{SSH_USER}}"
 $ROLE                  = "{{ROLE}}"
 $RUNTIME_HINT          = "{{RUNTIME}}"

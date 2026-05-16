@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use ff_core::{AgentRegistrationAck, AgentTask, AgentTaskKind, NodeRole};
+use ff_core::{AgentRegistrationAck, AgentTask, AgentTaskKind, WorkerRole};
 use ff_cron::{JobDefinition, JobPriority, JobTask};
 use ff_discovery::DiscoveredNode;
 use uuid::Uuid;
@@ -29,7 +29,7 @@ pub struct DiscoverResult {
 #[derive(Debug, Clone)]
 pub struct StartAgentRequest {
     pub worker_name: String,
-    pub role: NodeRole,
+    pub role: WorkerRole,
 }
 
 #[derive(Debug, Clone)]

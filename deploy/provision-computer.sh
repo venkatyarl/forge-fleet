@@ -2,7 +2,7 @@
 # ForgeFleet Node Provisioning Script
 # ====================================
 # Installs all required software on a fleet node.
-# Run via SSH: ssh user@node "bash -s" < deploy/provision-node.sh
+# Run via SSH: ssh user@node "bash -s" < deploy/provision-computer.sh
 #
 # Installs:
 #   - Node.js + npm (if missing)

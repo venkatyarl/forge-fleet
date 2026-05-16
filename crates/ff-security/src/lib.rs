@@ -5,7 +5,7 @@ pub mod approvals;
 pub mod audit;
 pub mod auth;
 pub mod autonomy_policy;
-pub mod node_auth;
+pub mod computer_auth;
 pub mod policy;
 pub mod rate_limit;
 pub mod sandbox;

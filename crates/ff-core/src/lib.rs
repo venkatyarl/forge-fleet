@@ -15,6 +15,7 @@ pub mod audit;
 pub mod build_version;
 pub mod chaos;
 pub mod circuit_breaker;
+pub mod computer;
 pub mod config;
 pub mod db;
 pub mod db_health;
@@ -24,7 +25,6 @@ pub mod hardware;
 pub mod leader;
 pub mod maintenance;
 pub mod monitor;
-pub mod node;
 pub mod notifications;
 pub mod panic_hook;
 pub mod quarantine;
@@ -43,6 +43,7 @@ pub use circuit_breaker::{
     BackendId, CircuitBreaker, CircuitBreakerConfig, CircuitBreakerRegistry,
     CircuitBreakerSnapshot, CircuitState,
 };
+pub use computer::{ActivityLevel, AgentRegistrationAck, WorkerRole};
 pub use error::{ForgeFleetError, Result};
 pub use fleet_resolver::{
     FleetNodeInfo, FleetResolveError, FleetResolver, resolve_fleet_nodes, resolve_fleet_nodes_sync,
@@ -52,7 +53,6 @@ pub use monitor::{
     AlertCondition, DiskMonitor, FleetMonitor, ModelMonitor, MonitorAlert, MonitorSettings,
     NodeMonitor,
 };
-pub use node::{ActivityLevel, AgentRegistrationAck, NodeRole};
 pub use notifications::{NotificationLevel, NotificationSender, TelegramNotifier};
 pub use quarantine::{NodeQuarantine, QuarantineEntry, QuarantinePolicy};
 pub use run_limits::{RunLimits, should_escalate};

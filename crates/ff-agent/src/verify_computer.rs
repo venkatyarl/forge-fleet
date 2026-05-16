@@ -22,7 +22,7 @@ pub struct VerifyReport {
     pub checked_at: chrono::DateTime<chrono::Utc>,
 }
 
-pub async fn verify_node(pool: &PgPool, worker_name: &str) -> Result<VerifyReport, String> {
+pub async fn verify_computer(pool: &PgPool, worker_name: &str) -> Result<VerifyReport, String> {
     let node = ff_db::pg_get_node(pool, worker_name)
         .await
         .map_err(|e| format!("pg_get_node: {e}"))?
@@ -218,7 +218,7 @@ pub async fn verify_node(pool: &PgPool, worker_name: &str) -> Result<VerifyRepor
             &serde_json::json!({}),
             Some(worker_name),
             &serde_json::json!([]),
-            Some("verify_node"),
+            Some("verify_computer"),
             Some(1),
         )
         .await;

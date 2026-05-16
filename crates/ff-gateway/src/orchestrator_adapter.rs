@@ -577,6 +577,8 @@ mod tests {
             multi_host_participation: None,
             encountered_bugs: vec![],
             local_tasks: vec![],
+            os: Default::default(),
+            build_sha: None,
         }
     }
 

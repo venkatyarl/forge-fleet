@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# ForgeFleet node bootstrap script (rendered from template at serve time).
+# ForgeFleet computer bootstrap script (rendered from template at serve time).
 #
 # Placeholders substituted by crates/ff-gateway/src/onboard.rs::render_bootstrap:
 #   {{LEADER_HOST}}            — e.g. "192.168.5.100"
 #   {{LEADER_PORT}}            — e.g. "51002"
 #   {{TOKEN}}                  — one-use-ish enrollment token
-#   {{NODE_NAME}}              — desired fleet_workers.name (from form)
-#   {{NODE_IP}}                — node's LAN IP (from form / server remote_addr)
-#   {{SSH_USER}}               — ssh_user for this node
+#   {{COMPUTER_NAME}}              — desired fleet_workers.name (from form)
+#   {{COMPUTER_IP}}                — computer's LAN IP (from form / server remote_addr)
+#   {{SSH_USER}}               — ssh_user for this computer
 #   {{ROLE}}                   — "builder" | "gateway" | "testbed"
 #   {{RUNTIME}}                — "auto" | "llama.cpp" | "mlx" | "vllm"
 #   {{GITHUB_OWNER}}           — e.g. "venkatyarl"
@@ -18,7 +18,7 @@
 #   curl -fsSL 'http://...' | sudo bash
 #
 # It is intentionally bash, self-contained, and idempotent: re-running it on
-# a node that's already partially set up just advances to the next unfinished
+# a computer that's already partially set up just advances to the next unfinished
 # step.
 
 set -eu
@@ -26,8 +26,8 @@ set -o pipefail
 
 LEADER="http://{{LEADER_HOST}}:{{LEADER_PORT}}"
 TOKEN="{{TOKEN}}"
-NAME="{{NODE_NAME}}"
-IP="{{NODE_IP}}"
+NAME="{{COMPUTER_NAME}}"
+IP="{{COMPUTER_IP}}"
 SSH_USER="{{SSH_USER}}"
 ROLE="{{ROLE}}"
 RUNTIME_HINT="{{RUNTIME}}"
@@ -85,7 +85,7 @@ OS_FULL="unknown"
 OS_ID="unknown"
 if [ -f /etc/os-release ]; then
   # Source in a subshell so /etc/os-release's NAME=Ubuntu can't clobber
-  # our operator-supplied $NAME (which is this node's fleet name, e.g. "sia").
+  # our operator-supplied $NAME (which is this computer's fleet name, e.g. "sia").
   # Previous bug: Sia enrolled as "ubuntu" because $NAME got overwritten here.
   OS_FULL="$(. /etc/os-release; printf '%s' "${PRETTY_NAME:-${NAME:-linux}}")"
   OS_ID="$(. /etc/os-release; printf '%s' "${ID:-linux}")"
@@ -250,7 +250,7 @@ report "build" ok
 # The `forge-fleet` crate's ff-gateway uses `#[derive(RustEmbed)]` pointing
 # at `dashboard/dist/` — the folder must exist at build time with the
 # compiled React assets. Operator directive: NEVER stub the dashboard —
-# every node must serve the real UI. Vite needs Node ≥ 20.19 / 22.12;
+# every computer must serve the real UI. Vite needs Node ≥ 20.19 / 22.12;
 # Ubuntu 24.04 apt ships Node 18 (too old), so we install Node 22 from
 # NodeSource on Linux and assume brew on macOS.
 case "$OS_ID" in
@@ -291,8 +291,8 @@ run_as_user install -m 755 "$REPO_DIR/target/release/forgefleetd" "$USER_HOME/.l
 report "forgefleetd_build" ok
 
 # ─── 6b. OpenClaw ────────────────────────────────────────────────────────
-# Installs OpenClaw via npm (matches deploy/provision-node.sh). Failure here
-# does NOT abort enrollment — the node can still work as a ForgeFleet member
+# Installs OpenClaw via npm (matches deploy/provision-computer.sh). Failure here
+# does NOT abort enrollment — the computer can still work as a ForgeFleet member
 # and a deferred task is available to retry later.
 report "openclaw" running
 if command -v npm >/dev/null 2>&1; then
@@ -558,7 +558,7 @@ else
     GUI_DOMAIN="gui/$USER_UID/com.forgefleet.forgefleetd"
     run_as_user mkdir -p "$PLIST_TARGET_DIR" "$USER_HOME/.forgefleet/logs"
     TG_TOKEN="${TELEGRAM_BOT_TOKEN:-${FORGEFLEET_TELEGRAM_BOT_TOKEN:-}}"
-    run_as_user bash -c "sed -e 's|__USER_HOME__|$USER_HOME|g' -e 's|__NODE_NAME__|$NAME|g' -e 's|__TELEGRAM_BOT_TOKEN__|$TG_TOKEN|g' '$PLIST_TEMPLATE' > '$PLIST_TARGET'"
+    run_as_user bash -c "sed -e 's|__USER_HOME__|$USER_HOME|g' -e 's|__COMPUTER_NAME__|$NAME|g' -e 's|__TELEGRAM_BOT_TOKEN__|$TG_TOKEN|g' '$PLIST_TEMPLATE' > '$PLIST_TARGET'"
     # Bootstrap into the GUI domain so live `launchctl kickstart -k` works.
     run_as_user launchctl bootstrap "gui/$USER_UID" "$PLIST_TARGET" 2>/dev/null || true
     run_as_user launchctl enable "$GUI_DOMAIN" 2>/dev/null || true
@@ -637,19 +637,19 @@ report "mcp-config" ok
 
 # ─── GitHub SSH identity (V89) ───────────────────────────────────────────
 # Pull the canonical github.com SSH aliases + keypairs from Postgres so
-# this new node can `git push` to GitHub from day one. The DB owns the
+# this new computer can `git push` to GitHub from day one. The DB owns the
 # config; `ff github sync` materializes ~/.ssh/id_* (chmod 600/644) and
 # appends any missing `Host github.com-*` blocks to ~/.ssh/config.
-# Idempotent: re-running on an already-bootstrapped node is a no-op.
+# Idempotent: re-running on an already-bootstrapped computer is a no-op.
 report "github-identity" running
 if run_as_user bash -lc 'command -v ff >/dev/null 2>&1'; then
   if run_as_user bash -lc 'ff github sync 2>&1'; then
     report "github-identity" ok "synced from fleet_secrets"
     # Flip the forge-fleet remote from HTTPS (clone path) to the SSH
-    # alias now that the keys are in place. Without this the node has
-    # working SSH auth but `git push` still hits HTTPS and fails. The
-    # flip is idempotent — re-running on a node that's already on SSH
-    # is a no-op.
+    # alias now that the keys are in place. Without this the computer
+    # has working SSH auth but `git push` still hits HTTPS and fails.
+    # The flip is idempotent — re-running on a computer that's already
+    # on SSH is a no-op.
     run_as_user bash -lc "cd '$REPO_DIR' && \
       old=\$(git remote get-url origin 2>/dev/null); \
       if [[ \"\$old\" =~ ^https://github.com/(.+)\$ ]]; then \
@@ -669,5 +669,5 @@ fi
 
 # ─── Done ────────────────────────────────────────────────────────────────
 
-report "done" ok "$NAME is now a ForgeFleet node"
+report "done" ok "$NAME is now a ForgeFleet computer"
 say "✓ Onboarding complete: $NAME"

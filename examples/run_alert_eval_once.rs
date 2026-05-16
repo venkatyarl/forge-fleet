@@ -35,7 +35,7 @@ async fn main() -> anyhow::Result<()> {
         .connect(&pg_url)
         .await?;
     let pulse = PulseReader::new(&redis_url)?;
-    let my_name = ff_agent::fleet_info::resolve_this_node_name().await;
+    let my_name = ff_agent::fleet_info::resolve_this_worker_name().await;
 
     println!("▶ run_alert_eval_once");
     println!("  pg:    {pg_url}");

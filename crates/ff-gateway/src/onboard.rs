@@ -30,9 +30,10 @@ use crate::server::GatewayState;
 
 // ─── Bootstrap script rendering ──────────────────────────────────────────
 
-const BOOTSTRAP_TEMPLATE: &str = include_str!("../../../scripts/bootstrap-node-template.sh");
+const BOOTSTRAP_TEMPLATE: &str = include_str!("../../../scripts/bootstrap-computer-template.sh");
 
-const BOOTSTRAP_TEMPLATE_PS1: &str = include_str!("../../../scripts/bootstrap-node-template.ps1");
+const BOOTSTRAP_TEMPLATE_PS1: &str =
+    include_str!("../../../scripts/bootstrap-computer-template.ps1");
 
 /// Query params accepted by GET /onboard/bootstrap.sh
 #[derive(Debug, Deserialize)]
@@ -181,8 +182,8 @@ pub async fn bootstrap_script(
         .replace("{{LEADER_HOST}}", &leader_host)
         .replace("{{LEADER_PORT}}", &leader_port)
         .replace("{{TOKEN}}", &token)
-        .replace("{{NODE_NAME}}", &name)
-        .replace("{{NODE_IP}}", &ip)
+        .replace("{{COMPUTER_NAME}}", &name)
+        .replace("{{COMPUTER_IP}}", &ip)
         .replace("{{SSH_USER}}", &ssh_user)
         .replace("{{ROLE}}", &role)
         .replace("{{RUNTIME}}", &runtime)
@@ -317,8 +318,8 @@ pub async fn bootstrap_script_ps1(
         .replace("{{LEADER_HOST}}", &leader_host)
         .replace("{{LEADER_PORT}}", &leader_port)
         .replace("{{TOKEN}}", &token)
-        .replace("{{NODE_NAME}}", &name)
-        .replace("{{NODE_IP}}", &ip)
+        .replace("{{COMPUTER_NAME}}", &name)
+        .replace("{{COMPUTER_IP}}", &ip)
         .replace("{{SSH_USER}}", &ssh_user)
         .replace("{{ROLE}}", &role)
         .replace("{{RUNTIME}}", &runtime)
@@ -778,7 +779,7 @@ pub struct VerifyNodeQuery {
     pub name: String,
 }
 
-pub async fn post_verify_node(
+pub async fn post_verify_computer(
     State(state): State<Arc<GatewayState>>,
     Query(q): Query<VerifyNodeQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
@@ -792,7 +793,7 @@ pub async fn post_verify_node(
                 Json(json!({"error":"postgres pool not available"})),
             )
         })?;
-    let report = ff_agent::verify_node::verify_node(pool, &q.name)
+    let report = ff_agent::verify_computer::verify_computer(pool, &q.name)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))))?;
     Ok(Json(serde_json::to_value(report).unwrap_or(json!({}))))
@@ -812,7 +813,7 @@ pub async fn check_tcp(Query(q): Query<CheckTcpQuery>) -> Json<Value> {
 
 // ─── Secret peek (one-shot bootstrap lookup gated by enrollment token) ──
 //
-// Used by scripts/bootstrap-node-template.sh §5b to fetch the GitHub PAT
+// Used by scripts/bootstrap-computer-template.sh §5b to fetch the GitHub PAT
 // before `ff` is installed. The enrollment token doubles as auth — it's
 // the same gate as self-enroll, so no weaker surface is exposed.
 

@@ -3,9 +3,9 @@
 <!--
   ForgeFleet daemon (forgefleetd) LaunchAgent template.
 
-  Installed by `bootstrap-node-template.sh` on macOS hosts. Tokens
-  `__USER_HOME__` and `__NODE_NAME__` are substituted at install time
-  via sed; the resulting file lives at
+  Installed by `bootstrap-computer-template.sh` on macOS hosts. Tokens
+  `__USER_HOME__` and `__COMPUTER_NAME__` are substituted at install
+  time via sed; the resulting file lives at
   ~/Library/LaunchAgents/com.forgefleet.forgefleetd.plist and is
   loaded with `launchctl bootstrap gui/$(id -u) <path>` (which
   registers it for live `launchctl kickstart -k` restarts later, the
@@ -19,8 +19,8 @@
     <key>ProgramArguments</key>
     <array>
         <string>__USER_HOME__/.local/bin/forgefleetd</string>
-        <string>--node-name</string>
-        <string>__NODE_NAME__</string>
+        <string>--worker-name</string>
+        <string>__COMPUTER_NAME__</string>
         <string>start</string>
     </array>
 

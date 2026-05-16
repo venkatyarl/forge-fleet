@@ -2175,7 +2175,7 @@ UPDATE software_registry
 // `ff fleet upgrade ff_git` (or the autonomous tick) materializes both
 // `forgefleet` and `ForgeFleet` aliases on every worker.
 //
-// Also bootstrap-node-template.sh §6 (build step) creates the same symlinks
+// Also bootstrap-computer-template.sh §6 (build step) creates the same symlinks
 // on first enrollment so new boxes (Rihanna, Beyonce going forward) get the
 // aliases without waiting for an upgrade.
 

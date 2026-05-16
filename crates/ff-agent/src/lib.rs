@@ -108,7 +108,7 @@ pub mod training;
 pub mod training_orchestrator;
 pub mod upgrade_playbooks;
 pub mod vault_sync;
-pub mod verify_node;
+pub mod verify_computer;
 pub mod version_check;
 pub mod work_stealer;
 

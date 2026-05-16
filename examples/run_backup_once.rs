@@ -31,7 +31,7 @@ async fn main() -> anyhow::Result<()> {
         .connect(&url)
         .await?;
 
-    let node_name = ff_agent::fleet_info::resolve_this_node_name().await;
+    let node_name = ff_agent::fleet_info::resolve_this_worker_name().await;
     let computer_id: sqlx::types::Uuid = sqlx::query("SELECT id FROM computers WHERE name = $1")
         .bind(&node_name)
         .fetch_one(&pool)

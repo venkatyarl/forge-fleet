@@ -80,7 +80,7 @@ impl LocalHealer {
     /// PIDs from a legacy `forgefleet-node.service` / `forgefleet-agent
     /// .service` racing against the canonical `forgefleetd.service`).
     /// Emits a warn log so operators see it; cleanup is via
-    /// `bootstrap-node-template.sh` § "Sweep legacy units" or a manual
+    /// `bootstrap-computer-template.sh` § "Sweep legacy units" or a manual
     /// systemctl disable. We do NOT auto-kill — too easy to take out
     /// the canonical daemon by mistake.
     fn forgefleetd_running(&self) -> bool {

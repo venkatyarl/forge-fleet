@@ -678,7 +678,7 @@ pub fn build_router(state: Arc<GatewayState>, mc_db_path: Option<&str>) -> Route
         .route("/api/fleet/mesh-check", get(crate::onboard::get_mesh_check))
         .route(
             "/api/fleet/verify-node",
-            post(crate::onboard::post_verify_node),
+            post(crate::onboard::post_verify_computer),
         )
         .route("/api/fleet/deferred", get(crate::onboard::list_deferred))
         .route(
@@ -5283,14 +5283,14 @@ async fn internal_delegate(
         ));
     }
 
-    if !ff_security::node_auth::is_request_fresh(timestamp, 300) {
+    if !ff_security::computer_auth::is_request_fresh(timestamp, 300) {
         return Err((
             StatusCode::UNAUTHORIZED,
             Json(json!({"error": "request expired / replay detected"})),
         ));
     }
 
-    if !ff_security::node_auth::verify_signature(
+    if !ff_security::computer_auth::verify_signature(
         &secret,
         "POST",
         "/v1/internal/delegate",

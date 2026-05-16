@@ -2478,7 +2478,7 @@ pub async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
         }
         FleetCommand::VerifyNode { name, json } => {
             println!("{CYAN}▶ Running verify-node battery for {name}...{RESET}");
-            let report = ff_agent::verify_node::verify_node(&pool, &name)
+            let report = ff_agent::verify_computer::verify_computer(&pool, &name)
                 .await
                 .map_err(|e| anyhow::anyhow!(e))?;
             if json {

@@ -1,4 +1,4 @@
-use ff_core::{ActivityLevel, AgentRegistrationAck, AgentTask, NodeRole, TaskResult};
+use ff_core::{ActivityLevel, AgentRegistrationAck, AgentTask, TaskResult, WorkerRole};
 use ff_discovery::{HardwareProfile, HealthSnapshot};
 use reqwest::StatusCode;
 use serde::Serialize;
@@ -51,14 +51,14 @@ impl LeaderClient {
 
     pub async fn send_heartbeat(
         &self,
-        role: NodeRole,
+        role: WorkerRole,
         activity_level: ActivityLevel,
         health: &HealthSnapshot,
     ) -> anyhow::Result<()> {
         #[derive(Serialize)]
         struct HeartbeatPayload<'a> {
             node_id: &'a str,
-            role: NodeRole,
+            role: WorkerRole,
             activity_level: ActivityLevel,
             health: &'a HealthSnapshot,
         }
