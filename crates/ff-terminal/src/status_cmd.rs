@@ -71,32 +71,17 @@ pub async fn handle_status_inner(p: PathBuf) -> Result<()> {
         ),
     }
 
-    // ── 3. Fleet nodes ─────────────────────────────────────────────────────
-    println!("{CYAN}Nodes{RESET}     :");
-    let nodes: Vec<ff_db::FleetNodeRow> = match &pool_opt {
-        Some(pool) => ff_db::pg_list_nodes(pool).await.unwrap_or_default(),
-        None => Vec::new(),
-    };
-    if nodes.is_empty() {
-        println!("  {YELLOW}(no nodes — DB unavailable or empty){RESET}");
+    // ── 3. Fleet ───────────────────────────────────────────────────────────
+    // Print one expanded block per computer pulling from the rich `computers`
+    // + `fleet_workers` + `computer_model_deployments` + `llm_clusters` joins
+    // — role, OS, CPU/RAM, GPU, unified-memory flag, and currently-deployed
+    // models. The old single-line "Nodes" output buried all of this behind
+    // `runtime='native'` (which is a bogus enrollment default for every host).
+    if let Some(pool) = &pool_opt {
+        render_fleet_section(pool).await;
     } else {
-        // Probe SSH port 22 on each node in parallel.
-        let probes: Vec<_> = nodes
-            .iter()
-            .map(|n| {
-                let ip = n.ip.clone();
-                async move { tcp_probe(&ip, 22, Duration::from_secs(2)).await }
-            })
-            .collect();
-        let online: Vec<bool> = futures::future::join_all(probes).await;
-        for (n, up) in nodes.iter().zip(online.iter()) {
-            let status = if *up {
-                format!("{GREEN}online{RESET}")
-            } else {
-                format!("{RED}offline{RESET}")
-            };
-            println!("  {:<10} {:<16} {:<10} {}", n.name, n.ip, n.runtime, status);
-        }
+        println!("{CYAN}Fleet{RESET}     :");
+        println!("  {YELLOW}(no fleet data — DB unavailable){RESET}");
     }
 
     // ── 4. Deployments ─────────────────────────────────────────────────────
@@ -271,6 +256,200 @@ pub async fn handle_status_inner(p: PathBuf) -> Result<()> {
 
     Ok(())
 }
+async fn render_fleet_section(pool: &sqlx::PgPool) {
+    // One row per computer with the fields we need to display.
+    // We sort by role priority (leader > standby > worker) then ip so the
+    // leader is always at the top — matches `ff fleet computers`.
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        name: String,
+        primary_ip: String,
+        role: String,
+        os_family: String,
+        cpu_cores: i32,
+        total_ram_gb: i32,
+        has_gpu: bool,
+        gpu_kind: String,
+        gpu_model: Option<String>,
+        gpu_total_vram_gb: Option<i32>,
+    }
+
+    let rows: Vec<Row> = match sqlx::query_as::<_, Row>(
+        "SELECT c.name, c.primary_ip,
+                COALESCE(fw.role, 'unknown') AS role,
+                COALESCE(c.os_family, 'unknown') AS os_family,
+                COALESCE(c.cpu_cores, 0) AS cpu_cores,
+                COALESCE(c.total_ram_gb, 0) AS total_ram_gb,
+                COALESCE(c.has_gpu, false) AS has_gpu,
+                COALESCE(c.gpu_kind, 'none') AS gpu_kind,
+                c.gpu_model,
+                c.gpu_total_vram_gb
+         FROM computers c
+         LEFT JOIN fleet_workers fw ON fw.name = c.name
+         ORDER BY
+            CASE COALESCE(fw.role,'')
+                WHEN 'leader' THEN 0
+                WHEN 'standby' THEN 1
+                WHEN 'worker' THEN 2
+                ELSE 9
+            END,
+            string_to_array(c.primary_ip, '.')::int[]",
+    )
+    .fetch_all(pool)
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            println!("{CYAN}Fleet{RESET}     : {RED}✗ query failed: {}{RESET}", e);
+            return;
+        }
+    };
+
+    // Counts for the header.
+    let leaders = rows.iter().filter(|r| r.role == "leader").count();
+    let standbys = rows.iter().filter(|r| r.role == "standby").count();
+    let workers = rows.iter().filter(|r| r.role == "worker").count();
+    println!(
+        "{CYAN}Fleet{RESET}     : {} total — {} leader, {} standby, {} worker",
+        rows.len(),
+        leaders,
+        standbys,
+        workers
+    );
+
+    // SSH probes in parallel.
+    let probes: Vec<_> = rows
+        .iter()
+        .map(|r| {
+            let ip = r.primary_ip.clone();
+            async move { tcp_probe(&ip, 22, Duration::from_secs(2)).await }
+        })
+        .collect();
+    let online: Vec<bool> = futures::future::join_all(probes).await;
+
+    // Models per computer (one row per deployment).
+    #[derive(sqlx::FromRow)]
+    struct DepRow {
+        computer_name: String,
+        model_id: String,
+        port: i32,
+        status: String,
+    }
+    let deps: Vec<DepRow> = sqlx::query_as::<_, DepRow>(
+        "SELECT c.name AS computer_name, d.model_id, \
+                COALESCE((string_to_array(d.endpoint, ':'))[3]::int, 0) AS port, \
+                d.status \
+         FROM computer_model_deployments d \
+         JOIN computers c ON c.id = d.computer_id \
+         ORDER BY c.name, port",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    // Cluster membership: which computers are in which cluster, and as what role.
+    #[derive(sqlx::FromRow)]
+    struct ClusterMembership {
+        computer_name: String,
+        cluster_id: String,
+        cluster_role: String,
+        model_id: String,
+        topology: String,
+    }
+    let clusters: Vec<ClusterMembership> = sqlx::query_as::<_, ClusterMembership>(
+        "SELECT c.name AS computer_name, cl.id AS cluster_id, \
+                'head' AS cluster_role, cl.model_id, cl.topology \
+         FROM llm_clusters cl JOIN computers c ON c.id = cl.head_computer_id \
+         UNION ALL \
+         SELECT c.name, cl.id, 'worker' AS cluster_role, cl.model_id, cl.topology \
+         FROM llm_clusters cl \
+         CROSS JOIN LATERAL jsonb_array_elements_text(cl.worker_computer_ids) AS wid(id) \
+         JOIN computers c ON c.id = wid.id::uuid",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    for (r, up) in rows.iter().zip(online.iter()) {
+        let status_tag = if *up {
+            format!("{GREEN}online{RESET}")
+        } else {
+            format!("{RED}offline{RESET}")
+        };
+        let role_tag = match r.role.as_str() {
+            "leader" => format!("{GREEN}leader{RESET}"),
+            "standby" => format!("{YELLOW}standby{RESET}"),
+            "worker" => "worker".to_string(),
+            other => other.to_string(),
+        };
+        let hw = if r.has_gpu {
+            // Friendlier label per gpu_kind. Unified-memory architectures
+            // (Apple Silicon, NVIDIA GB10 Grace+Blackwell) share host RAM as
+            // VRAM — flag them so the operator knows total_ram_gb is the
+            // usable model capacity, not separate from GPU memory.
+            let (label, unified) = match r.gpu_kind.as_str() {
+                "apple_silicon" => ("Apple Silicon", true),
+                "gb10" => ("NVIDIA GB10", true),
+                "nvidia_cuda" => ("NVIDIA CUDA", false),
+                "amd_rocm" => ("AMD ROCm", false),
+                other => (other, false),
+            };
+            let detail = match (&r.gpu_model, r.gpu_total_vram_gb) {
+                (Some(m), Some(v)) if !m.is_empty() => format!(" {m} {v}GB"),
+                (Some(m), None) if !m.is_empty() => format!(" {m}"),
+                (_, Some(v)) => format!(" {v}GB VRAM"),
+                _ => String::new(),
+            };
+            let unified_tag = if unified { " (unified)" } else { "" };
+            format!("{label}{detail}{unified_tag}")
+        } else {
+            "(no GPU)".to_string()
+        };
+        println!(
+            "  {name:<10} {ip:<16} {role:<8}  {os:<14} {cores}C/{ram}GB  {hw}  {status}",
+            name = r.name,
+            ip = r.primary_ip,
+            role = role_tag,
+            os = r.os_family,
+            cores = r.cpu_cores,
+            ram = r.total_ram_gb,
+            hw = hw,
+            status = status_tag,
+        );
+        // Deployments line (only if this computer has any).
+        let my_deps: Vec<&DepRow> = deps.iter().filter(|d| d.computer_name == r.name).collect();
+        if !my_deps.is_empty() {
+            let parts: Vec<String> = my_deps
+                .iter()
+                .map(|d| {
+                    let short = d.model_id.rsplit('/').next().unwrap_or(&d.model_id);
+                    let short = short.strip_suffix(".gguf").unwrap_or(short);
+                    let color = if d.status == "active" { GREEN } else { YELLOW };
+                    format!("{color}{}@{}{RESET}", short, d.port)
+                })
+                .collect();
+            println!("             models: {}", parts.join(", "));
+        }
+        // Cluster line (only if this computer is in any cluster).
+        let my_clusters: Vec<&ClusterMembership> = clusters
+            .iter()
+            .filter(|c| c.computer_name == r.name)
+            .collect();
+        if !my_clusters.is_empty() {
+            let parts: Vec<String> = my_clusters
+                .iter()
+                .map(|c| {
+                    format!(
+                        "{CYAN}{}{RESET} ({} {} {})",
+                        c.cluster_id, c.cluster_role, c.topology, c.model_id
+                    )
+                })
+                .collect();
+            println!("             cluster: {}", parts.join(", "));
+        }
+    }
+}
+
 pub async fn tcp_probe(host: &str, port: u16, timeout: Duration) -> bool {
     let addr = format!("{host}:{port}");
     matches!(
