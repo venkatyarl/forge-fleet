@@ -2,6 +2,11 @@
 target/
 *.rs.bk
 
+# code-review-graph build artifacts (regenerated per-commit by the
+# graphify pre-commit hook on enrolled fleet computers; never tracked).
+graphify-out/
+node-compile-cache/
+
 # Python (legacy)
 .venv/
 __pycache__/
