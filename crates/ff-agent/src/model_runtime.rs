@@ -133,11 +133,38 @@ pub async fn load_model(pool: &sqlx::PgPool, opts: LoadOptions) -> Result<LoadRe
         .try_clone()
         .map_err(|e| format!("clone log handle: {e}"))?;
 
-    let mut child = std::process::Command::new(&program)
-        .args(&args)
+    let mut cmd = std::process::Command::new(&program);
+    cmd.args(&args)
         .stdout(log_file)
         .stderr(log_err)
-        .stdin(std::process::Stdio::null())
+        .stdin(std::process::Stdio::null());
+
+    // Detach from the parent's session/process-group so the inference
+    // server survives `ff model load` exiting (and, on Linux, survives
+    // the SSH session ending when we dispatched via ssh+bash).
+    //
+    // Discovered 2026-05-16 on sophie: ff reported "Loaded — pid X" but
+    // the child died seconds later. Cause: systemd-logind tears down the
+    // session's process group at logout regardless of `nohup`. setsid()
+    // before exec() promotes the child to a new session leader, breaking
+    // the parent linkage so the child's lifetime is independent.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(|| {
+                // SAFETY: setsid() is a single syscall with well-defined
+                // semantics in the post-fork pre-exec window — the only
+                // safe Rust we can do here per the pre_exec contract.
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+
+    let mut child = cmd
         .spawn()
         .map_err(|e| format!("spawn {program}: {e}"))?;
     let pid = child.id();
