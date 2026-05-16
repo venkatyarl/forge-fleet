@@ -69,9 +69,19 @@ pub async fn load_model(pool: &sqlx::PgPool, opts: LoadOptions) -> Result<LoadRe
     let (program, args, runtime_label) = match lib.runtime.as_str() {
         "llama.cpp" => {
             let bin = llama_server_binary();
+            // llama-server expects a single .gguf file, not a directory.
+            // The library scanner often registers a directory (the model
+            // root); resolve to the largest .gguf inside so the spawn
+            // command points at real bytes. Discovered 2026-05-16 on
+            // sophie: ff was passing `/home/sophie/models/qwen3-coder-30b-a3b`
+            // and llama-server bailed with `gguf_init_from_file_ptr: failed
+            // to read magic` because that's a directory.
+            let model_path = resolve_gguf_for_llamacpp(&lib.file_path).map_err(|e| {
+                format!("resolve gguf for {}: {e}", lib.file_path)
+            })?;
             let mut args = vec![
                 "--model".into(),
-                lib.file_path.clone(),
+                model_path,
                 "--host".into(),
                 "0.0.0.0".into(),
                 "--port".into(),
@@ -356,6 +366,49 @@ pub async fn health_check_deployment(
 }
 
 // ─── helpers ──────────────────────────────────────────────────────────────
+
+/// Resolve `path` to a concrete `.gguf` file suitable for `llama-server --model`.
+/// If `path` already points at a `.gguf` file, return it unchanged. If it's a
+/// directory, pick the **largest** `.gguf` inside (sharded models put the
+/// real weights in the biggest shard; multi-quant directories typically
+/// have a single canonical gguf and the biggest is the right pick).
+fn resolve_gguf_for_llamacpp(path: &str) -> std::io::Result<String> {
+    let p = PathBuf::from(path);
+    if p.is_file() && path.ends_with(".gguf") {
+        return Ok(path.to_string());
+    }
+    if !p.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("{path} is neither a .gguf file nor a directory"),
+        ));
+    }
+    let mut best: Option<(u64, PathBuf)> = None;
+    for entry in std::fs::read_dir(&p)? {
+        let entry = entry?;
+        let ep = entry.path();
+        if !ep.is_file() {
+            continue;
+        }
+        let Some(name) = ep.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.ends_with(".gguf") {
+            continue;
+        }
+        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        if best.as_ref().is_none_or(|(s, _)| size > *s) {
+            best = Some((size, ep));
+        }
+    }
+    match best {
+        Some((_, ep)) => Ok(ep.to_string_lossy().to_string()),
+        None => Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("no .gguf files in {path}"),
+        )),
+    }
+}
 
 fn llama_server_binary() -> String {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
