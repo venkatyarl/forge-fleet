@@ -2668,50 +2668,142 @@ pub async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
             .await?;
         }
         FleetCommand::Computers { format, os, role } => {
-            let resolver = ff_core::FleetResolver::new();
-            let mut computers = resolver
-                .resolve()
-                .await
-                .map_err(|e| anyhow::anyhow!("failed to resolve fleet computers: {e}"))?;
+            handle_fleet_computers(format, os, role).await?;
+        }
+    }
+    Ok(())
+}
 
-            if let Some(filter) = os {
-                let lower = filter.to_ascii_lowercase();
-                computers.retain(|c| c.os.to_ascii_lowercase().contains(&lower));
-            }
-            if let Some(filter) = role {
-                let lower = filter.to_ascii_lowercase();
-                computers.retain(|c| c.role.to_ascii_lowercase().contains(&lower));
-            }
+async fn handle_fleet_computers(
+    format: String,
+    os_filter: Option<String>,
+    role_filter: Option<String>,
+) -> Result<()> {
+    // Pull from `computers` JOIN `fleet_workers` so every consumer (LLMs
+    // discovering DGX Sparks, humans wondering which machine has a GPU,
+    // automation looking up CPU/RAM) gets the canonical hardware shape
+    // in one call. The thin resolver path only had ip/os/role and forced
+    // callers to round-trip Postgres themselves.
+    use ff_agent::fleet_info::get_fleet_pool;
+    use serde::Serialize;
 
-            match format.as_str() {
-                "json" => {
-                    println!("{}", serde_json::to_string_pretty(&computers)?);
-                }
-                _ => {
-                    println!(
-                        "{GREEN}✓ Fleet Computers{RESET} ({} total)",
-                        computers.len()
-                    );
-                    for c in &computers {
-                        let os_tag = if c.os.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" — {}", c.os)
-                        };
-                        let role_tag = if c.role.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" [{}]", c.role)
-                        };
-                        println!(
-                            "  - {name} ({ip}){role_tag}{os_tag}",
-                            name = c.name,
-                            ip = c.ip,
-                            role_tag = role_tag,
-                            os_tag = os_tag,
-                        );
-                    }
-                }
+    let pool = get_fleet_pool()
+        .await
+        .map_err(|e| anyhow::anyhow!("postgres unreachable: {e}"))?;
+
+    #[derive(sqlx::FromRow, Serialize)]
+    struct Row {
+        name: String,
+        primary_ip: String,
+        ssh_user: String,
+        role: String,
+        os_family: String,
+        os_distribution: String,
+        os_version: Option<String>,
+        cpu_cores: i32,
+        total_ram_gb: i32,
+        has_gpu: bool,
+        gpu_kind: String,
+        gpu_model: Option<String>,
+        gpu_count: i32,
+        gpu_total_vram_gb: Option<f64>,
+        is_dgx: bool,
+        is_unified_memory: bool,
+    }
+
+    let mut rows: Vec<Row> = sqlx::query_as::<_, Row>(
+        "SELECT c.name,
+                c.primary_ip,
+                COALESCE(fw.ssh_user, 'venkat') AS ssh_user,
+                COALESCE(fw.role, 'unknown') AS role,
+                COALESCE(c.os_family, 'unknown') AS os_family,
+                COALESCE(c.os_distribution, '') AS os_distribution,
+                c.os_version,
+                COALESCE(c.cpu_cores, 0) AS cpu_cores,
+                COALESCE(c.total_ram_gb, 0) AS total_ram_gb,
+                COALESCE(c.has_gpu, false) AS has_gpu,
+                COALESCE(c.gpu_kind, 'none') AS gpu_kind,
+                c.gpu_model,
+                COALESCE(c.gpu_count, 0) AS gpu_count,
+                c.gpu_total_vram_gb,
+                (c.os_family = 'linux-dgx') AS is_dgx,
+                (c.gpu_kind IN ('apple_silicon', 'gb10')) AS is_unified_memory
+         FROM computers c
+         LEFT JOIN fleet_workers fw ON fw.name = c.name
+         ORDER BY
+            CASE COALESCE(fw.role,'')
+                WHEN 'leader' THEN 0
+                WHEN 'standby' THEN 1
+                WHEN 'worker' THEN 2
+                ELSE 9
+            END,
+            string_to_array(c.primary_ip, '.')::int[]",
+    )
+    .fetch_all(&pool)
+    .await?;
+
+    if let Some(filter) = os_filter {
+        let lower = filter.to_ascii_lowercase();
+        rows.retain(|c| c.os_family.to_ascii_lowercase().contains(&lower));
+    }
+    if let Some(filter) = role_filter {
+        let lower = filter.to_ascii_lowercase();
+        rows.retain(|c| c.role.to_ascii_lowercase().contains(&lower));
+    }
+
+    match format.as_str() {
+        "json" => {
+            println!("{}", serde_json::to_string_pretty(&rows)?);
+        }
+        _ => {
+            println!(
+                "{GREEN}✓ Fleet Computers{RESET} ({} total)",
+                rows.len()
+            );
+            for c in &rows {
+                let role_tag = match c.role.as_str() {
+                    "leader" => format!("{GREEN}leader{RESET}"),
+                    "standby" => format!("{YELLOW}standby{RESET}"),
+                    "worker" => "worker".to_string(),
+                    other => other.to_string(),
+                };
+                let hw = if c.has_gpu {
+                    // Prefer the gpu_model string when available (it carries
+                    // the canonical "NVIDIA GB10 Grace+Blackwell" name);
+                    // fall back to the kind label otherwise.
+                    let primary = match (&c.gpu_model, c.gpu_kind.as_str()) {
+                        (Some(m), _) if !m.is_empty() => m.clone(),
+                        (_, "apple_silicon") => "Apple Silicon".to_string(),
+                        (_, "gb10") => "NVIDIA GB10".to_string(),
+                        (_, "nvidia_cuda") => "NVIDIA CUDA".to_string(),
+                        (_, "amd_rocm") => "AMD ROCm".to_string(),
+                        (_, other) => other.to_string(),
+                    };
+                    let vram_tag = match c.gpu_total_vram_gb {
+                        Some(v) if v > 0.0 => format!(" {v:.0}GB"),
+                        _ => String::new(),
+                    };
+                    let unified_tag = if c.is_unified_memory { " (unified)" } else { "" };
+                    format!("{primary}{vram_tag}{unified_tag}")
+                } else {
+                    "(no GPU)".to_string()
+                };
+                let dgx_tag = if c.is_dgx {
+                    format!(" {CYAN}[DGX Spark]{RESET}")
+                } else {
+                    String::new()
+                };
+                println!(
+                    "  {name:<10} {ip:<16} {role:<8}  {os:<14} {cores}C/{ram}GB  {hw}{dgx}",
+                    name = c.name,
+                    ip = c.primary_ip,
+                    role = role_tag,
+                    os = c.os_family,
+                    cores = c.cpu_cores,
+                    ram = c.total_ram_gb,
+                    hw = hw,
+                    dgx = dgx_tag,
+                );
             }
         }
     }
