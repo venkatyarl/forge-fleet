@@ -645,6 +645,18 @@ report "github-identity" running
 if run_as_user bash -lc 'command -v ff >/dev/null 2>&1'; then
   if run_as_user bash -lc 'ff github sync 2>&1'; then
     report "github-identity" ok "synced from fleet_secrets"
+    # Flip the forge-fleet remote from HTTPS (clone path) to the SSH
+    # alias now that the keys are in place. Without this the node has
+    # working SSH auth but `git push` still hits HTTPS and fails. The
+    # flip is idempotent — re-running on a node that's already on SSH
+    # is a no-op.
+    run_as_user bash -lc "cd '$REPO_DIR' && \
+      old=\$(git remote get-url origin 2>/dev/null); \
+      if [[ \"\$old\" =~ ^https://github.com/(.+)\$ ]]; then \
+        path=\${BASH_REMATCH[1]%.git}.git; \
+        git remote set-url origin git@github.com-venkat:\$path; \
+        echo 'flipped origin to SSH (github.com-venkat alias)'; \
+      fi" || true
   else
     # Don't fail the whole bootstrap — operator can run `ff github sync`
     # manually once they fix whatever blocked it (usually first-time DB
