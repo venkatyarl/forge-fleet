@@ -2108,12 +2108,18 @@ async fn start_pulse_v2_subsystems(
                     _ = tick.tick() => {
                         match ff_agent::deployment_reconciler::reconcile_local(&pool).await {
                             Ok(s) => {
-                                if s.respawned > 0 || s.killed > 0 || s.adopted > 0 || s.removed > 0 {
+                                if s.respawned > 0
+                                    || s.killed > 0
+                                    || s.adopted > 0
+                                    || s.removed > 0
+                                    || s.port_violations > 0
+                                {
                                     info!(
                                         adopted = s.adopted,
                                         respawned = s.respawned,
                                         killed = s.killed,
                                         removed = s.removed,
+                                        port_violations = s.port_violations,
                                         refreshed = s.refreshed,
                                         "deployment reconciler pass"
                                     );

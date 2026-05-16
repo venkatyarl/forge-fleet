@@ -18,6 +18,17 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+/// Canonical port range for inference servers per the fleet port registry
+/// ([[canonical-ports]]). LLM slots are 55000-55010; anything outside this
+/// window is treated as a policy violation and the reconciler will mark
+/// the deployment retired so it gets killed on the same pass.
+pub const CANONICAL_PORT_MIN: i32 = 55000;
+pub const CANONICAL_PORT_MAX: i32 = 55010;
+
+fn port_is_canonical(port: i32) -> bool {
+    (CANONICAL_PORT_MIN..=CANONICAL_PORT_MAX).contains(&port)
+}
+
 /// Summary of a reconcile pass.
 #[derive(Debug, Clone, Default)]
 pub struct ReconcileSummary {
@@ -31,6 +42,9 @@ pub struct ReconcileSummary {
     pub respawned: usize,
     /// Stray processes for 'retired' deployments that were killed.
     pub killed: usize,
+    /// Non-canonical port violations flipped to desired_state='retired' for
+    /// removal on the same pass.
+    pub port_violations: usize,
 }
 
 /// Run one reconcile pass. Returns counts for logging.
@@ -54,11 +68,44 @@ pub async fn reconcile_local(pool: &sqlx::PgPool) -> Result<ReconcileSummary, St
     let mut summary = ReconcileSummary::default();
     let mut seen_ports: std::collections::HashSet<i32> = std::collections::HashSet::new();
 
-    // ── Pass A — for each live process: adopt or refresh ──────────────────
+    // ── Pass A — for each live process: adopt, refresh, or enforce port ──
     for proc_info in &procs {
         let Some(port) = proc_info.port else { continue };
         let port_i32 = port as i32;
         seen_ports.insert(port_i32);
+
+        // Canonical-port enforcement. Inference servers are required to bind
+        // in 55000-55010 per [[canonical-ports]]. Anything outside is killed
+        // here so a stale operator-launched server (e.g. james's
+        // Qwen2.5-72B on 8082 since May 2) gets cleaned up automatically.
+        // Excludes rpc-server / mesh helpers because list_local_processes
+        // only matches llama-server / mlx_lm.server / vllm serve.
+        if !port_is_canonical(port_i32) {
+            tracing::warn!(
+                pid = proc_info.pid,
+                port,
+                runtime = %proc_info.runtime,
+                "non-canonical port — killing process per canonical-port policy"
+            );
+            let _ = tokio::process::Command::new("kill")
+                .args(["-TERM", &proc_info.pid.to_string()])
+                .output()
+                .await;
+            summary.port_violations += 1;
+            // If a deployment row was tracking this port, mark it retired
+            // so the row gets cleaned up in pass B.
+            if let Some(&existing) = db_by_port.get(&port_i32) {
+                let _ = sqlx::query(
+                    "UPDATE fleet_model_deployments
+                        SET desired_state = 'retired'
+                      WHERE id = $1::uuid AND desired_state = 'active'",
+                )
+                .bind(&existing.id)
+                .execute(pool)
+                .await;
+            }
+            continue;
+        }
 
         let healthy = crate::model_runtime::probe_health_public(
             &proc_info.runtime,
