@@ -184,7 +184,11 @@ impl ToolRegistry {
     fn fleet_run() -> ToolDefinition {
         ToolDefinition {
             name: "fleet_run".to_string(),
-            description: "Execute a prompt through the tiered LLM pipeline. Starts at the fastest model, escalates to more powerful ones if needed.".to_string(),
+            description: "Single-turn LLM call through the tiered pipeline (9B→32B→72B→235B). \
+                Use ONLY for one-shot Q&A: define a term, summarize a doc, classify a string. \
+                For coding work, refactors, multi-step tasks, or anything that benefits from \
+                a review pass, use `fleet_crew` instead (multi-agent, the default)."
+                .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -296,7 +300,13 @@ impl ToolRegistry {
     fn fleet_crew() -> ToolDefinition {
         ToolDefinition {
             name: "fleet_crew".to_string(),
-            description: "Run a multi-agent coding crew on a task. Three agents work sequentially: Context Engineer (9B), Code Writer (32B), Code Reviewer (72B).".to_string(),
+            description: "DEFAULT for coding/refactor/multi-step work. Runs a 3-agent crew \
+                across local LLMs on the fleet: Context Engineer (9B) gathers relevant code, \
+                Code Writer (32B) drafts the change, Code Reviewer (72B) audits it before \
+                returning. Prefer this over `fleet_run` for anything beyond single-turn Q&A — \
+                the review pass catches bugs the writer misses, and the whole pipeline runs \
+                on idle fleet capacity (zero cloud cost)."
+                .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {

@@ -96,7 +96,29 @@ impl McpServer {
                 "serverInfo": {
                     "name": "forgefleet-mcp",
                     "version": crate::VERSION
-                }
+                },
+                // Top-level guidance the client (Claude / Codex / etc.)
+                // surfaces before any tool call. Steers callers toward the
+                // multi-agent path by default so simple one-shots aren't
+                // the reflex choice.
+                "instructions":
+                    "ForgeFleet MCP — distributed AI fleet across LAN.\n\
+                     \n\
+                     DEFAULT for coding/refactor/multi-step work: call `fleet_crew`.\n\
+                     It runs a 3-agent pipeline (Context Engineer 9B → Code Writer 32B →\n\
+                     Code Reviewer 72B) across local LLMs, so the output gets a peer\n\
+                     review before it ships back.\n\
+                     \n\
+                     Use `fleet_run` only for single-turn QA (define a term, summarize\n\
+                     a doc, classify a string). It's a one-shot escalation through\n\
+                     tiered models; no review pass.\n\
+                     \n\
+                     Other helpful tools: `fleet_status` for fleet health, `brain_search`\n\
+                     for knowledge-graph lookup, `fleet_models_search` to find an LLM,\n\
+                     `computer_use` for browser/screenshot on a DGX or Mac.\n\
+                     \n\
+                     Prefer routing work here over doing it locally when the task is\n\
+                     well-scoped — saves your cloud quota and uses idle fleet capacity."
             }),
         )
     }
