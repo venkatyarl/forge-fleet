@@ -97,28 +97,33 @@ impl McpServer {
                     "name": "forgefleet-mcp",
                     "version": crate::VERSION
                 },
-                // Top-level guidance the client (Claude / Codex / etc.)
-                // surfaces before any tool call. Steers callers toward the
-                // multi-agent path by default so simple one-shots aren't
-                // the reflex choice.
+                // Top-level guidance shown to the MCP client before any
+                // tool call. Describes the toolkit by capability and lets
+                // the calling LLM pick the right tool for the task — no
+                // forced default.
                 "instructions":
                     "ForgeFleet MCP — distributed AI fleet across LAN.\n\
                      \n\
-                     DEFAULT for coding/refactor/multi-step work: call `fleet_crew`.\n\
-                     It runs a 3-agent pipeline (Context Engineer 9B → Code Writer 32B →\n\
-                     Code Reviewer 72B) across local LLMs, so the output gets a peer\n\
-                     review before it ships back.\n\
+                     Pick the tool that matches the task shape:\n\
+                     • `fleet_run` — single LLM call (tiered 9B→32B→72B→235B). Self-\n\
+                       contained prompts: definitions, summaries, classifications, \n\
+                       quick rewrites, JSON extraction.\n\
+                     • `fleet_crew` — 3-agent pipeline (Context Engineer → Code Writer\n\
+                       → Code Reviewer). Coding tasks that benefit from a review pass:\n\
+                       refactors, multi-file changes, edge-case-heavy functions.\n\
+                     • `fleet_status`, `fleet_pulse`, `fleet_worker_detail` — query\n\
+                       live fleet state.\n\
+                     • `fleet_models_*` — catalog/library/deployments/disk for the\n\
+                       LLM portfolio.\n\
+                     • `fleet_install_model`, `fleet_scan` — manage local models.\n\
+                     • `fleet_ssh` — run a shell command on a fleet computer.\n\
+                     • `brain_*` — knowledge graph (search, vault read, threads).\n\
+                     • `computer_use` — browser/screenshot on a fleet computer.\n\
                      \n\
-                     Use `fleet_run` only for single-turn QA (define a term, summarize\n\
-                     a doc, classify a string). It's a one-shot escalation through\n\
-                     tiered models; no review pass.\n\
-                     \n\
-                     Other helpful tools: `fleet_status` for fleet health, `brain_search`\n\
-                     for knowledge-graph lookup, `fleet_models_search` to find an LLM,\n\
-                     `computer_use` for browser/screenshot on a DGX or Mac.\n\
-                     \n\
-                     Prefer routing work here over doing it locally when the task is\n\
-                     well-scoped — saves your cloud quota and uses idle fleet capacity."
+                     The fleet has idle local capacity (15 computers, mix of macOS / \n\
+                     Linux / DGX Spark). Routing well-scoped work here is cheaper than\n\
+                     a cloud call, but it's a judgment call per task — there's no\n\
+                     wrong answer between solving inline vs. dispatching."
             }),
         )
     }

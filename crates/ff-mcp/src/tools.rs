@@ -184,10 +184,11 @@ impl ToolRegistry {
     fn fleet_run() -> ToolDefinition {
         ToolDefinition {
             name: "fleet_run".to_string(),
-            description: "Single-turn LLM call through the tiered pipeline (9B→32B→72B→235B). \
-                Use ONLY for one-shot Q&A: define a term, summarize a doc, classify a string. \
-                For coding work, refactors, multi-step tasks, or anything that benefits from \
-                a review pass, use `fleet_crew` instead (multi-agent, the default)."
+            description: "Single-turn LLM call through the tiered pipeline \
+                (9B→32B→72B→235B). Starts at the fastest model and escalates only if \
+                the cheaper tier can't answer. Best when the task is self-contained and \
+                one prompt is enough — definitions, summaries, classifications, quick \
+                rewrites, JSON extraction. No multi-agent review, no follow-up turns."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -300,12 +301,13 @@ impl ToolRegistry {
     fn fleet_crew() -> ToolDefinition {
         ToolDefinition {
             name: "fleet_crew".to_string(),
-            description: "DEFAULT for coding/refactor/multi-step work. Runs a 3-agent crew \
-                across local LLMs on the fleet: Context Engineer (9B) gathers relevant code, \
-                Code Writer (32B) drafts the change, Code Reviewer (72B) audits it before \
-                returning. Prefer this over `fleet_run` for anything beyond single-turn Q&A — \
-                the review pass catches bugs the writer misses, and the whole pipeline runs \
-                on idle fleet capacity (zero cloud cost)."
+            description: "Multi-agent coding pipeline: Context Engineer (9B) gathers \
+                relevant code → Code Writer (32B) drafts the change → Code Reviewer (72B) \
+                audits it. Best when the task benefits from a review pass over the writer's \
+                output: refactors, bug fixes touching multiple files, new functions with \
+                edge cases, anything where 'works but might be wrong' is a real risk. \
+                Slower than `fleet_run` (3 model calls vs 1), so skip it for self-contained \
+                one-shot tasks."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
