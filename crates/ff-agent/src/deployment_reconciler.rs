@@ -213,11 +213,9 @@ pub async fn reconcile_local(pool: &sqlx::PgPool) -> Result<ReconcileSummary, St
                 match respawn_dead_deployment(pool, row, &libs).await {
                     Ok(true) => summary.respawned += 1,
                     Ok(false) => {} // unable, already logged
-                    Err(e) => tracing::warn!(
-                        "respawn deployment {} on port {}: {e}",
-                        row.id,
-                        row.port
-                    ),
+                    Err(e) => {
+                        tracing::warn!("respawn deployment {} on port {}: {e}", row.id, row.port)
+                    }
                 }
             }
             other => {

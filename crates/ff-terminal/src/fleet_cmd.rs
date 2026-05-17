@@ -2756,10 +2756,7 @@ async fn handle_fleet_computers(
             println!("{}", serde_json::to_string_pretty(&rows)?);
         }
         _ => {
-            println!(
-                "{GREEN}✓ Fleet Computers{RESET} ({} total)",
-                rows.len()
-            );
+            println!("{GREEN}✓ Fleet Computers{RESET} ({} total)", rows.len());
             for c in &rows {
                 let role_tag = match c.role.as_str() {
                     "leader" => format!("{GREEN}leader{RESET}"),
@@ -2783,7 +2780,11 @@ async fn handle_fleet_computers(
                         Some(v) if v > 0.0 => format!(" {v:.0}GB"),
                         _ => String::new(),
                     };
-                    let unified_tag = if c.is_unified_memory { " (unified)" } else { "" };
+                    let unified_tag = if c.is_unified_memory {
+                        " (unified)"
+                    } else {
+                        ""
+                    };
                     format!("{primary}{vram_tag}{unified_tag}")
                 } else {
                     "(no GPU)".to_string()

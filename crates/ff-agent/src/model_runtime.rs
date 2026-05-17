@@ -76,9 +76,8 @@ pub async fn load_model(pool: &sqlx::PgPool, opts: LoadOptions) -> Result<LoadRe
             // sophie: ff was passing `/home/sophie/models/qwen3-coder-30b-a3b`
             // and llama-server bailed with `gguf_init_from_file_ptr: failed
             // to read magic` because that's a directory.
-            let model_path = resolve_gguf_for_llamacpp(&lib.file_path).map_err(|e| {
-                format!("resolve gguf for {}: {e}", lib.file_path)
-            })?;
+            let model_path = resolve_gguf_for_llamacpp(&lib.file_path)
+                .map_err(|e| format!("resolve gguf for {}: {e}", lib.file_path))?;
             let mut args = vec![
                 "--model".into(),
                 model_path,
@@ -174,9 +173,7 @@ pub async fn load_model(pool: &sqlx::PgPool, opts: LoadOptions) -> Result<LoadRe
         }
     }
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("spawn {program}: {e}"))?;
+    let mut child = cmd.spawn().map_err(|e| format!("spawn {program}: {e}"))?;
     let pid = child.id();
     // Reap in background so the child doesn't become a zombie.
     tokio::task::spawn_blocking(move || {
