@@ -237,6 +237,37 @@ pub async fn load_model(pool: &sqlx::PgPool, opts: LoadOptions) -> Result<LoadRe
         .stderr(log_err)
         .stdin(std::process::Stdio::null());
 
+    // On Linux, llama-server links against libraries (libmtmd.so.0 and
+    // friends) that live next to the binary in `llama.cpp/build/bin/`.
+    // The default ld.so search path doesn't include that dir, and the
+    // daemon's process environment doesn't carry whatever LD_LIBRARY_PATH
+    // an interactive shell would set — so the spawned server exits
+    // immediately with `error while loading shared libraries: libmtmd.so.0`.
+    //
+    // Discovered 2026-05-18 on veronica: bge-m3 autoload reported success
+    // (PID returned, deployment row upserted) but /health was unreachable.
+    // model-55001.log was three identical "cannot open shared object file"
+    // lines from llama-server's first-attempt loader.
+    //
+    // Fix: when the program is an absolute path to a llama-server binary
+    // inside a llama.cpp build tree, prepend the parent dir to
+    // LD_LIBRARY_PATH so co-located .so files resolve. Harmless on macOS
+    // (Mach-O uses different linker plumbing) and on system-installed
+    // builds where the libs are already on the global loader path.
+    if cfg!(target_os = "linux")
+        && program.contains("llama-server")
+        && let Some(bin_dir) = std::path::Path::new(&program).parent()
+    {
+        let bin_dir_str = bin_dir.display().to_string();
+        let prev = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
+        let new_val = if prev.is_empty() {
+            bin_dir_str.clone()
+        } else {
+            format!("{bin_dir_str}:{prev}")
+        };
+        cmd.env("LD_LIBRARY_PATH", new_val);
+    }
+
     // Detach from the parent's session/process-group so the inference
     // server survives `ff model load` exiting (and, on Linux, survives
     // the SSH session ending when we dispatched via ssh+bash).
