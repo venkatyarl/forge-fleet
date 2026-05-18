@@ -6559,6 +6559,93 @@ CREATE INDEX IF NOT EXISTS fleet_model_deployments_desired_state_idx
     ON fleet_model_deployments (desired_state, worker_name);
 "#;
 
+// ─── V92: restore `-p ff-terminal` in Linux ff_git/forgefleetd_git playbooks ──
+//
+// V56 added `cargo build --release -p forge-fleet -p ff-terminal` to the Linux
+// playbooks so workers rebuilt BOTH binaries (daemon AND CLI). V63 was meant
+// to drop the `NEED_BUILD` shortcut introduced in V61 but accidentally dropped
+// the `-p ff-terminal` flag with it, so since then `ff fleet upgrade ff_git`
+// has only been rebuilding `forgefleetd` — the `target/release/ff` binary
+// installed on each worker has been stale, sometimes by days.
+//
+// Surfaced 2026-05-18 while deploying the new embedder / reranker / reasoning
+// catalog rows to veronica + lily: the deferred-task playbook exited 0 and
+// reported "completed", but `ff --version` on each worker still showed the
+// pre-deploy SHA. Confirmed the regression matches the stored
+// `feedback_ff_build_needs_package` note.
+//
+// V92 restores `-p ff-terminal` on all four Linux variants. macOS (V57) is
+// unchanged — it was correct.
+pub const SCHEMA_V92_FF_GIT_LINUX_PARITY: &str = r#"
+UPDATE software_registry
+   SET upgrade_playbook = jsonb_set(
+           jsonb_set(
+               jsonb_set(
+                   jsonb_set(
+                       upgrade_playbook,
+                       '{linux-ubuntu}',
+                       to_jsonb(
+                           'export PATH="$HOME/.cargo/bin:$PATH" && '
+                        || 'export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" && '
+                        || 'mkdir -p "$(dirname $HOME/.forgefleet/sub-agent-0/forge-fleet)" && '
+                        || '{ [ -d "$HOME/.forgefleet/sub-agent-0/forge-fleet/.git" ] || git clone https://github.com/venkatyarl/forge-fleet "$HOME/.forgefleet/sub-agent-0/forge-fleet"; } && '
+                        || 'cd "$HOME/.forgefleet/sub-agent-0/forge-fleet" && '
+                        || 'git fetch origin main && '
+                        || 'git reset --hard origin/main && '
+                        || 'cargo build --release -p forge-fleet -p ff-terminal && '
+                        || 'install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && '
+                        || 'install -m 755 target/release/ff ~/.local/bin/ff && '
+                        || 'systemctl --user reset-failed forgefleetd.service forgefleet-node.service forgefleet-daemon.service 2>/dev/null; '
+                        || 'systemctl --user restart forgefleetd.service || systemctl --user restart forgefleet-node.service || systemctl --user restart forgefleet-daemon.service'
+                       )
+                   ),
+                   '{linux-dgx}',
+                   to_jsonb(
+                       'export PATH="$HOME/.cargo/bin:$PATH" && '
+                    || 'export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" && '
+                    || 'mkdir -p "$(dirname $HOME/.forgefleet/sub-agent-0/forge-fleet)" && '
+                    || '{ [ -d "$HOME/.forgefleet/sub-agent-0/forge-fleet/.git" ] || git clone https://github.com/venkatyarl/forge-fleet "$HOME/.forgefleet/sub-agent-0/forge-fleet"; } && '
+                    || 'cd "$HOME/.forgefleet/sub-agent-0/forge-fleet" && '
+                    || 'git fetch origin main && '
+                    || 'git reset --hard origin/main && '
+                    || 'cargo build --release -p forge-fleet -p ff-terminal && '
+                    || 'install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && '
+                    || 'install -m 755 target/release/ff ~/.local/bin/ff && '
+                    || 'systemctl --user reset-failed forgefleetd.service forgefleet-node.service forgefleet-daemon.service 2>/dev/null; '
+                    || 'systemctl --user restart forgefleetd.service || systemctl --user restart forgefleet-node.service || systemctl --user restart forgefleet-daemon.service'
+                   )
+               ),
+               '{linux-ubuntu-build-only}',
+               to_jsonb(
+                   'export PATH="$HOME/.cargo/bin:$PATH" && '
+                || 'export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" && '
+                || 'mkdir -p "$(dirname $HOME/.forgefleet/sub-agent-0/forge-fleet)" && '
+                || '{ [ -d "$HOME/.forgefleet/sub-agent-0/forge-fleet/.git" ] || git clone https://github.com/venkatyarl/forge-fleet "$HOME/.forgefleet/sub-agent-0/forge-fleet"; } && '
+                || 'cd "$HOME/.forgefleet/sub-agent-0/forge-fleet" && '
+                || 'git fetch origin main && '
+                || 'git reset --hard origin/main && '
+                || 'cargo build --release -p forge-fleet -p ff-terminal && '
+                || 'install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && '
+                || 'install -m 755 target/release/ff ~/.local/bin/ff'
+               )
+           ),
+           '{linux-dgx-build-only}',
+           to_jsonb(
+               'export PATH="$HOME/.cargo/bin:$PATH" && '
+            || 'export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" && '
+            || 'mkdir -p "$(dirname $HOME/.forgefleet/sub-agent-0/forge-fleet)" && '
+            || '{ [ -d "$HOME/.forgefleet/sub-agent-0/forge-fleet/.git" ] || git clone https://github.com/venkatyarl/forge-fleet "$HOME/.forgefleet/sub-agent-0/forge-fleet"; } && '
+            || 'cd "$HOME/.forgefleet/sub-agent-0/forge-fleet" && '
+            || 'git fetch origin main && '
+            || 'git reset --hard origin/main && '
+            || 'cargo build --release -p forge-fleet -p ff-terminal && '
+            || 'install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && '
+            || 'install -m 755 target/release/ff ~/.local/bin/ff'
+           )
+       )
+ WHERE id IN ('ff_git', 'forgefleetd_git');
+"#;
+
 // ─── V91: Seed fleet_model_catalog with embedder / reranker / reasoning ────
 //
 // Operator goal (2026-05-18): turn the fleet from "8 chat models in a trench

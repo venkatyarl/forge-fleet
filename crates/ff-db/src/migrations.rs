@@ -587,6 +587,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "task_models_seed",
         sql: schema::SCHEMA_V91_TASK_MODELS,
     },
+    PgMigration {
+        version: 92,
+        name: "ff_git_linux_parity",
+        sql: schema::SCHEMA_V92_FF_GIT_LINUX_PARITY,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.
