@@ -1162,7 +1162,7 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                 // Open a Pulse reader so we can pick a target and find
                 // any healthy loaded endpoint.
                 let redis_url = std::env::var("FORGEFLEET_REDIS_URL")
-                    .unwrap_or_else(|_| "redis://127.0.0.1:6380".into());
+                    .unwrap_or_else(|_| "redis://127.0.0.1:56379".into());
                 let pulse = match ff_pulse::reader::PulseReader::new(&redis_url) {
                     Ok(p) => p,
                     Err(e) => {

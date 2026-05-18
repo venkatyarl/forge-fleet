@@ -612,6 +612,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "register_pipeline_llm_alias",
         sql: schema::SCHEMA_V96_REGISTER_PIPELINE_LLM_ALIAS,
     },
+    PgMigration {
+        version: 97,
+        name: "redis_nats_5digit_remap",
+        sql: schema::SCHEMA_V97_REDIS_NATS_5DIGIT,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.

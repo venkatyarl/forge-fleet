@@ -7,7 +7,7 @@
 //! Redis/Postgres-only behavior.
 //!
 //! The URL is read from the `FORGEFLEET_NATS_URL` env var at startup,
-//! defaulting to `nats://127.0.0.1:4222`.
+//! defaulting to `nats://127.0.0.1:54222`.
 
 use async_nats::Client;
 use tokio::sync::OnceCell;
@@ -15,7 +15,7 @@ use tokio::sync::OnceCell;
 static NATS_CLIENT: OnceCell<Client> = OnceCell::const_new();
 
 /// Default NATS URL when `FORGEFLEET_NATS_URL` is unset.
-pub const DEFAULT_NATS_URL: &str = "nats://127.0.0.1:4222";
+pub const DEFAULT_NATS_URL: &str = "nats://127.0.0.1:54222";
 
 /// Resolve the NATS URL: env var `FORGEFLEET_NATS_URL` or fallback.
 pub fn resolve_nats_url() -> String {

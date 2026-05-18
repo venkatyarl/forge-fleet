@@ -8,11 +8,16 @@
 #   docker compose down           # stop everything (data persists in named volumes)
 #   docker compose down -v        # stop + DELETE data volumes (destructive!)
 #
-# Ports exposed on the host:
+# Ports exposed on the host (all 5-digit per the canonical-ports convention):
 #   Postgres:  55432  (connect: psql -h 192.168.5.100 -p 55432 -U forgefleet)
-#   Redis:     6380   (connect: redis-cli -h 192.168.5.100 -p 6380)
-#   Sentinel:  26380  (connect: redis-cli -h 192.168.5.100 -p 26380)
-#   NATS:      4222   (client); 6222 (cluster); 8222 (monitoring, LAN only)
+#   Redis:     56379  (connect: redis-cli -h 192.168.5.100 -p 56379)
+#   Sentinel:  26380  (connect: redis-cli -h 192.168.5.100 -p 26380) [DEPRECATED]
+#   NATS:      54222  (client); 56222 (cluster); 58222 (monitoring, LAN only)
+#
+# Container-internal ports stay native (6379 redis, 4222 NATS) so internal
+# tooling inside each container works without flags. The host-side map
+# enforces the 5-digit rule registered in port_registry. Phase B remap
+# applied 2026-05-18 — see V97 migration + memory feedback_canonical_5digit_ports.
 
 name: forgefleet
 
@@ -85,7 +90,11 @@ services:
     image: redis:7-alpine
     container_name: forgefleet-redis
     ports:
-      - "6380:6379"
+      # Host 56379 → container 6379. 5-digit host port per canonical convention
+      # (see feedback_canonical_5digit_ports memory + V97 migration). Previously
+      # host 6380. Container internal stays native so `redis-cli` inside the
+      # container works without flags.
+      - "56379:6379"
     volumes:
       - redis_data:/data
     command:
@@ -130,9 +139,12 @@ services:
     image: nats:2.10-alpine
     container_name: forgefleet-nats
     ports:
-      - "4222:4222"       # client connections
-      - "6222:6222"       # cluster (for future 3-node cluster on Marcus+Sophie)
-      - "8222:8222"       # HTTP monitoring (LAN only)
+      # 5-digit host ports per canonical convention (V97 migration). Container
+      # internal stays native — `nats-server`'s config inside the container
+      # binds 4222/6222/8222 (see nats.conf).
+      - "54222:4222"       # client connections
+      - "56222:6222"       # cluster (for future 3-node cluster on Marcus+Sophie)
+      - "58222:8222"       # HTTP monitoring (LAN only)
     volumes:
       - nats_data:/data
       - ./docker/nats.conf:/etc/nats/nats.conf:ro

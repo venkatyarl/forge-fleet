@@ -784,7 +784,7 @@ async fn get_brain_state_client(
 ) -> Result<ff_brain::BrainStateClient, (StatusCode, Json<Value>)> {
     let pool = pool_from_state(state)?;
     let redis_url = std::env::var("FORGEFLEET_REDIS_URL")
-        .unwrap_or_else(|_| "redis://192.168.5.100:6380".to_string());
+        .unwrap_or_else(|_| "redis://192.168.5.100:56379".to_string());
     ff_brain::BrainStateClient::new(&redis_url, pool.clone())
         .await
         .map_err(|e| {

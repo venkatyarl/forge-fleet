@@ -6,7 +6,7 @@ pub async fn handle_events(cmd: crate::EventsCommand) -> Result<()> {
     let crate::EventsCommand::Tail { subject, pretty } = cmd;
 
     let url = std::env::var("FORGEFLEET_NATS_URL")
-        .unwrap_or_else(|_| "nats://127.0.0.1:4222".to_string());
+        .unwrap_or_else(|_| "nats://127.0.0.1:54222".to_string());
     let client = match async_nats::connect(&url).await {
         Ok(c) => c,
         Err(e) => {

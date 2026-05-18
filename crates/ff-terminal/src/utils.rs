@@ -121,7 +121,7 @@ pub fn resolve_pulse_redis_url() -> String {
     {
         return url;
     }
-    const FALLBACK: &str = "redis://localhost:6380";
+    const FALLBACK: &str = "redis://localhost:56379";
     let Some(home) = dirs::home_dir() else {
         return FALLBACK.to_string();
     };

@@ -356,7 +356,7 @@ impl GatewayServer {
         // `route_completion` call will fail with a PulseError; the old
         // tier-router path then takes over as the fallback.
         let redis_url = std::env::var("FORGEFLEET_REDIS_URL")
-            .unwrap_or_else(|_| "redis://127.0.0.1:6380/".to_string());
+            .unwrap_or_else(|_| "redis://127.0.0.1:56379/".to_string());
         match PulseLlmRouter::new(&redis_url) {
             Ok(pr) => {
                 let affinity = Arc::new(SessionAffinityCache::new());

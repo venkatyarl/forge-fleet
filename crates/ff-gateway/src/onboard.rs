@@ -1034,9 +1034,9 @@ fn compute_default_sub_agents(cores: i32, ram_gb: i32, has_nvidia: bool) -> i32 
 /// tiny helper to avoid adding another dep on ff-gateway (ff-pulse has the
 /// redis crate). Best-effort: failures are logged, not raised.
 async fn publish_redis(channel: &str, payload: &str) -> Result<(), String> {
-    // Read redis URL from env; default localhost:6380.
+    // Read redis URL from env; default localhost:56379.
     let url = std::env::var("FORGEFLEET_REDIS_URL")
-        .unwrap_or_else(|_| "redis://192.168.5.100:6380".into());
+        .unwrap_or_else(|_| "redis://192.168.5.100:56379".into());
     // Parse host:port from URL (redis://host:port or redis://host:port/db).
     let (host, port) = parse_redis_hostport(&url).unwrap_or(("192.168.5.100".into(), 6380));
     use tokio::io::{AsyncReadExt, AsyncWriteExt};

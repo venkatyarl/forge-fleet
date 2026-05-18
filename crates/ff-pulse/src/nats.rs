@@ -6,7 +6,7 @@
 //! publish calls silently no-op and Pulse keeps working on Redis alone.
 //!
 //! URL is resolved from `FORGEFLEET_NATS_URL`, defaulting to
-//! `nats://127.0.0.1:4222`.
+//! `nats://127.0.0.1:54222`.
 
 use async_nats::Client;
 use tokio::sync::OnceCell;
@@ -17,7 +17,7 @@ use crate::beat_v2::PulseBeatV2;
 static NATS: OnceCell<Option<Client>> = OnceCell::const_new();
 
 /// Default NATS URL.
-pub const DEFAULT_NATS_URL: &str = "nats://127.0.0.1:4222";
+pub const DEFAULT_NATS_URL: &str = "nats://127.0.0.1:54222";
 
 /// Resolve the NATS URL via `FORGEFLEET_NATS_URL`, defaulting locally.
 pub fn resolve_nats_url() -> String {

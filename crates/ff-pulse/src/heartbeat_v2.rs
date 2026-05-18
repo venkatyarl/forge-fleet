@@ -1040,7 +1040,7 @@ mod tests {
 
     #[tokio::test]
     async fn build_beat_roundtrips_through_json() {
-        let client = redis::Client::open("redis://localhost:6380").unwrap();
+        let client = redis::Client::open("redis://localhost:56379").unwrap();
         let pub_ =
             HeartbeatV2Publisher::new(client, "test-computer".into(), Duration::from_secs(15), 100);
         let beat = pub_.build_beat().await;

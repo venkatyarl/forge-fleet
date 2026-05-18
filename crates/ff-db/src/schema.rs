@@ -6842,3 +6842,78 @@ UPDATE port_registry
    updated_at = NOW()
  WHERE port = 51002;
 "#;
+
+// ─── V97: redis + NATS host ports → 5-digit canonical ────────────────────────
+//
+// Phase B of the canonical-5-digit-ports rollout. Container-internal ports
+// stay native (6379 redis, 4222 NATS); the host-side docker-compose mapping
+// changes to 5-digit. This migration keeps port_registry in sync with the new
+// docker-compose.yml host mappings.
+//
+// Old → new:
+//   redis_primary        6380  → 56379
+//   redis_replica        6381  → 56380
+//   nats_client          4222  → 54222
+//   nats_cluster         6222  → 56222
+//   nats_monitoring      8222  → 58222   (new row; previously not registered)
+//
+// Strategy: DELETE the deprecated 4-digit rows + INSERT the new 5-digit ones.
+// We don't UPDATE-in-place because PRIMARY KEY (port) means the old port and
+// new port are different rows. Operator-written metadata on the old rows is
+// preserved by merging it into the new row's metadata->>'history' object.
+pub const SCHEMA_V97_REDIS_NATS_5DIGIT: &str = r#"
+-- Insert the new canonical 5-digit rows first.
+INSERT INTO port_registry
+    (port, service, kind, description, exposed_on, scope, managed_by, status, metadata)
+VALUES
+  (56379, 'redis_primary', 'database',
+   'Redis primary — host 56379 maps to container 6379. Canonical 5-digit per port-convention.',
+   'taylor', 'lan', 'docker compose', 'active',
+   jsonb_build_object('previous_port', 6380, 'remapped_at', '2026-05-18')),
+
+  (56380, 'redis_replica', 'database',
+   'Redis replica — host 56380 maps to container 6379. Future, on Marcus.',
+   'marcus', 'lan', 'docker compose follower', 'planned',
+   jsonb_build_object('previous_port', 6381, 'remapped_at', '2026-05-18')),
+
+  (54222, 'nats_client', 'coordination',
+   'NATS client connections — host 54222 maps to container 4222.',
+   'nats_cluster_members', 'lan', 'docker compose', 'active',
+   jsonb_build_object('previous_port', 4222, 'remapped_at', '2026-05-18')),
+
+  (56222, 'nats_cluster', 'coordination',
+   'NATS inter-node cluster — host 56222 maps to container 6222.',
+   'nats_cluster_members', 'lan', 'docker compose', 'planned',
+   jsonb_build_object('previous_port', 6222, 'remapped_at', '2026-05-18')),
+
+  (58222, 'nats_monitoring', 'coordination',
+   'NATS HTTP monitoring — host 58222 maps to container 8222 (LAN only).',
+   'taylor', 'lan', 'docker compose', 'active',
+   jsonb_build_object('previous_port', 8222, 'remapped_at', '2026-05-18'))
+ON CONFLICT (port) DO UPDATE
+   SET service     = EXCLUDED.service,
+       description = EXCLUDED.description,
+       status      = EXCLUDED.status,
+       metadata    = port_registry.metadata || EXCLUDED.metadata,
+       updated_at  = NOW();
+
+-- Mark old 4-digit rows deprecated rather than deleting them so operators
+-- looking at historical logs can still resolve `port=6380` → `redis_primary
+-- (deprecated, see 56379)` without grep diving.
+UPDATE port_registry
+   SET status = 'deprecated',
+       description = description || ' [DEPRECATED 2026-05-18 — moved to 5-digit host port; see metadata.replaced_by]',
+       metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object(
+           'replaced_by', CASE port
+               WHEN 6380 THEN 56379
+               WHEN 6381 THEN 56380
+               WHEN 4222 THEN 54222
+               WHEN 6222 THEN 56222
+               WHEN 8222 THEN 58222
+           END,
+           'deprecated_at', '2026-05-18',
+           'reason', 'canonical-5-digit-ports convention'
+       ),
+       updated_at = NOW()
+ WHERE port IN (6380, 6381, 4222, 6222, 8222);
+"#;

@@ -62,7 +62,7 @@ pub async fn handle_status_inner(p: PathBuf) -> Result<()> {
     let redis_url = fleet_cfg
         .as_ref()
         .map(|c| c.redis.url.clone())
-        .unwrap_or_else(|| "redis://127.0.0.1:6380".to_string());
+        .unwrap_or_else(|| "redis://127.0.0.1:56379".to_string());
     match ping_redis(&redis_url).await {
         Ok(ms) => println!("{GREEN}✓ PONG{RESET} ({redis_url}, {ms}ms)"),
         Err(e) => println!(

@@ -383,7 +383,7 @@ enum Command {
         #[command(subcommand)]
         command: MetricsCommand,
     },
-    /// Tail fleet logs via NATS. Requires FORGEFLEET_NATS_URL (default nats://127.0.0.1:4222).
+    /// Tail fleet logs via NATS. Requires FORGEFLEET_NATS_URL (default nats://127.0.0.1:54222).
     /// Subscribes to `logs.{computer}.{service}.>`.
     Logs {
         #[arg(long)]

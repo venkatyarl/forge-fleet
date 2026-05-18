@@ -15,7 +15,7 @@ use uuid::Uuid;
 use crate::handlers::HandlerResult;
 
 const DEFAULT_USER: &str = "venkat";
-const REDIS_URL: &str = "redis://192.168.5.100:6380";
+const REDIS_URL: &str = "redis://192.168.5.100:56379";
 
 /// Get a Postgres pool using the fleet config (same pattern as other handlers).
 async fn get_pool() -> Result<sqlx::PgPool, String> {

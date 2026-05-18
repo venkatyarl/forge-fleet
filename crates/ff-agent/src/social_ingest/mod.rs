@@ -178,7 +178,7 @@ fn post_workdir(post_id: Uuid) -> PathBuf {
 /// order. Returns `(endpoint_base_url, served_model_id)`.
 async fn pick_vision_server() -> Result<(String, String)> {
     let redis_url = std::env::var("FORGEFLEET_REDIS_URL")
-        .unwrap_or_else(|_| "redis://127.0.0.1:6380".to_string());
+        .unwrap_or_else(|_| "redis://127.0.0.1:56379".to_string());
     let reader = ff_pulse::reader::PulseReader::new(&redis_url)
         .map_err(|e| anyhow!("PulseReader::new: {e}"))?;
 
