@@ -69,6 +69,7 @@ impl ToolRegistry {
         self.register(Self::fleet_config());
         self.register(Self::fleet_ssh());
         self.register(Self::fleet_run());
+        self.register(Self::fleet_route());
         self.register(Self::fleet_scan());
         self.register(Self::fleet_install_model());
         self.register(Self::fleet_wait());
@@ -209,6 +210,35 @@ impl ToolRegistry {
                     }
                 },
                 "required": ["prompt"]
+            }),
+        }
+    }
+
+    fn fleet_route() -> ToolDefinition {
+        ToolDefinition {
+            name: "fleet_route".to_string(),
+            description: "Workload-aware routing: given a workload tag (e.g. \
+                \"code\", \"embedding\", \"reranking\", \"reasoning\", \"chat\", \
+                \"tool_calling\", \"vision\"), returns the best healthy deployment \
+                on the fleet to send that kind of request to — plus runner-up \
+                candidates. Use this BEFORE building a request when you don't know \
+                which node serves what; stops callers from hardcoding endpoints. \
+                Read-only — does not actually dispatch the request."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "workload": {
+                        "type": "string",
+                        "description": "The workload tag to route. Common: \"code\", \"chat\", \"embedding\", \"reranking\", \"reasoning\", \"tool_calling\", \"vision\". Matches against fleet_model_catalog.preferred_workloads."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max candidates to return (default 3)",
+                        "default": 3
+                    }
+                },
+                "required": ["workload"]
             }),
         }
     }

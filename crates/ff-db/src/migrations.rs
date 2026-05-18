@@ -602,6 +602,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "bge_quant_fix",
         sql: schema::SCHEMA_V94_BGE_QUANT_FIX,
     },
+    PgMigration {
+        version: 95,
+        name: "bge_embedding_dim_1024",
+        sql: schema::SCHEMA_V95_BGE_EMBEDDING_DIM,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.

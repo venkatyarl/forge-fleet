@@ -834,7 +834,7 @@ impl ResearchSession {
         // Synthesizer produces a long markdown report + cites many
         // sub-agent outputs. Thinking-mode models again can spend ~half
         // their budget on internal reasoning, so the 32k cap leaves room.
-        openai_single_completion(
+        let raw = openai_single_completion(
             &self.config.gateway_url,
             &self.config.planner_model, // reuse planner alias for synthesis
             &prompt,
@@ -842,7 +842,93 @@ impl ResearchSession {
             client,
         )
         .await
-        .context("synthesizer OpenAI call")
+        .context("synthesizer OpenAI call")?;
+        // Strip any `<think>…</think>` blocks the synthesizer emitted (Qwen3-
+        // family and DeepSeek-R1-distill always emit them; llama.cpp's
+        // `enable_thinking=false` flag is non-functional per GH #13189). The
+        // reasoning is useful to the model but noise to the operator reading
+        // the final report. Applied defensively — no-op when no block present.
+        Ok(strip_think_blocks(&raw))
+    }
+}
+
+/// Remove `<think>…</think>` (and `<thinking>…</thinking>`) blocks from a
+/// reasoning model's output. Lazy match, multiline. Leaves the rest intact
+/// and trims leading whitespace left behind after the strip.
+///
+/// Idempotent and safe on output that doesn't contain a think block.
+pub fn strip_think_blocks(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    loop {
+        let lower = rest.to_ascii_lowercase();
+        let open = lower
+            .find("<think>")
+            .map(|i| (i, "<think>", "</think>"))
+            .or_else(|| {
+                lower
+                    .find("<thinking>")
+                    .map(|i| (i, "<thinking>", "</thinking>"))
+            });
+        let Some((start, open_tag, close_tag)) = open else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..start]);
+        let after_open = start + open_tag.len();
+        let close_off = lower[after_open..].find(close_tag);
+        match close_off {
+            Some(rel_end) => {
+                let abs_end = after_open + rel_end + close_tag.len();
+                rest = &rest[abs_end..];
+            }
+            None => {
+                // Unterminated <think> — drop the rest of the string.
+                break;
+            }
+        }
+    }
+    out.trim_start().to_string()
+}
+
+#[cfg(test)]
+mod think_strip_tests {
+    use super::strip_think_blocks;
+
+    #[test]
+    fn strips_single_block() {
+        let s = "<think>internal reasoning</think>final answer";
+        assert_eq!(strip_think_blocks(s), "final answer");
+    }
+
+    #[test]
+    fn strips_thinking_variant() {
+        let s = "<thinking>x</thinking>answer";
+        assert_eq!(strip_think_blocks(s), "answer");
+    }
+
+    #[test]
+    fn handles_no_block() {
+        assert_eq!(strip_think_blocks("clean output"), "clean output");
+    }
+
+    #[test]
+    fn handles_multiple_blocks() {
+        let s = "<think>a</think>mid<think>b</think>end";
+        assert_eq!(strip_think_blocks(s), "midend");
+    }
+
+    #[test]
+    fn handles_unterminated_block() {
+        let s = "<think>never closes\nstill in think";
+        assert_eq!(strip_think_blocks(s), "");
+    }
+
+    #[test]
+    fn handles_uppercase_tags() {
+        // Some models emit <THINK> uppercase.
+        let s = "<THINK>x</THINK>answer";
+        assert_eq!(strip_think_blocks(s), "answer");
     }
 }
 

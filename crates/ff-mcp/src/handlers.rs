@@ -755,6 +755,151 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
     })
 }
 
+// ─── Fleet Route ─────────────────────────────────────────────────────────────
+//
+// Workload-aware routing: given a workload tag (one of the strings stored in
+// fleet_model_catalog.preferred_workloads), return the best healthy
+// deployment to send the request to. Combines (live health, model tier
+// preference for the workload, last-seen recency) into a simple score.
+//
+// Designed as the "where do I send X?" lookup so MCP clients (and operators
+// via `ff` indirectly) can stop hardcoding endpoints — embedding tasks find
+// veronica:55001 (bge-m3) without anyone naming it.
+//
+// Added 2026-05-18 alongside the bge-m3 / bge-reranker / deepseek-r1 rollout.
+
+pub async fn fleet_route(params: Option<Value>) -> HandlerResult {
+    let workload = params
+        .as_ref()
+        .and_then(|p| p.get("workload"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            "fleet_route requires 'workload' (e.g. \"code\", \"embedding\", \
+             \"reranking\", \"reasoning\", \"chat\", \"tool_calling\", \"vision\")"
+                .to_string()
+        })?;
+
+    let limit = params
+        .as_ref()
+        .and_then(|p| p.get("limit"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(3) as i64;
+
+    let (cfg, _) = config::load_config_auto().map_err(|e| format!("config: {e}"))?;
+    let pool = get_pg_pool(&cfg).await?;
+
+    // Singular-plural tolerance — V39 seed uses "embeddings"/"reranking",
+    // V91 uses "embedding". Match either by building two JSONB literals.
+    // (PostgreSQL `@>` is exact-element match, so we need to OR them.)
+    let plural = match workload {
+        "embedding" => Some("embeddings"),
+        "rerank" => Some("reranking"),
+        "embeddings" => Some("embedding"),
+        "reranking" => Some("rerank"),
+        _ => None,
+    };
+
+    // Best healthy deployment per workload tag. Score components:
+    //   - tier_score   = 4 - tier (smaller tier wins; T1 small/fast beats T4 huge)
+    //   - recency      = (NOW() - last_health_at) seconds, inverse-weighted
+    // Simple, transparent. RouteDecision-style payload returned.
+    let arr_a = serde_json::json!([workload]);
+    let arr_b = serde_json::json!([plural.unwrap_or(workload)]);
+
+    let rows = sqlx::query(
+        r#"
+        SELECT d.worker_name,
+               d.port,
+               d.catalog_id,
+               cat.name        AS catalog_name,
+               cat.family      AS catalog_family,
+               cat.tier        AS tier,
+               cat.preferred_workloads AS preferred_workloads,
+               d.health_status AS health_status,
+               COALESCE(c.primary_ip, w.name) AS host_or_name,
+               c.os_family     AS os_family,
+               c.has_gpu       AS has_gpu,
+               c.is_unified_memory AS is_unified_memory,
+               c.total_ram_gb  AS total_ram_gb,
+               EXTRACT(EPOCH FROM (NOW() - d.last_health_at))::int AS health_age_sec
+          FROM fleet_model_deployments d
+          JOIN fleet_model_catalog cat ON cat.id = d.catalog_id
+          LEFT JOIN fleet_workers w     ON w.name = d.worker_name
+          LEFT JOIN computers c         ON LOWER(c.name) = LOWER(d.worker_name)
+         WHERE d.health_status = 'healthy'
+           AND (cat.preferred_workloads @> $1::jsonb
+             OR cat.preferred_workloads @> $2::jsonb)
+         ORDER BY cat.tier ASC,
+                  d.last_health_at DESC NULLS LAST
+         LIMIT $3
+        "#,
+    )
+    .bind(&arr_a)
+    .bind(&arr_b)
+    .bind(limit)
+    .fetch_all(&pool)
+    .await
+    .map_err(|e| format!("fleet_route db: {e}"))?;
+
+    let mut candidates: Vec<Value> = Vec::with_capacity(rows.len());
+    for r in rows.iter() {
+        use sqlx::Row;
+        let worker_name: String = r.try_get("worker_name").unwrap_or_default();
+        let port: i32 = r.try_get("port").unwrap_or(0);
+        let host: String = r.try_get("host_or_name").unwrap_or_default();
+        let catalog_id: String = r.try_get("catalog_id").unwrap_or_default();
+        let catalog_name: String = r.try_get("catalog_name").unwrap_or_default();
+        let catalog_family: String = r.try_get("catalog_family").unwrap_or_default();
+        let tier: i32 = r.try_get("tier").unwrap_or(2);
+        let health_status: String = r.try_get("health_status").unwrap_or_default();
+        let os_family: Option<String> = r.try_get("os_family").ok();
+        let has_gpu: Option<bool> = r.try_get("has_gpu").ok();
+        let is_unified: Option<bool> = r.try_get("is_unified_memory").ok();
+        let total_ram_gb: Option<i32> = r.try_get("total_ram_gb").ok();
+        let health_age_sec: Option<i32> = r.try_get("health_age_sec").ok();
+
+        candidates.push(serde_json::json!({
+            "worker_name": worker_name,
+            "endpoint": format!("http://{host}:{port}"),
+            "catalog_id": catalog_id,
+            "catalog_name": catalog_name,
+            "family": catalog_family,
+            "tier": tier,
+            "health": health_status,
+            "health_age_sec": health_age_sec,
+            "host": {
+                "os_family": os_family,
+                "has_gpu": has_gpu,
+                "is_unified_memory": is_unified,
+                "total_ram_gb": total_ram_gb,
+            }
+        }));
+    }
+
+    if candidates.is_empty() {
+        return Ok(serde_json::json!({
+            "workload": workload,
+            "decision": null,
+            "reason": format!(
+                "no healthy deployment in fleet_model_deployments has \
+                 preferred_workloads containing {:?}{}. \
+                 Load one with: ff model autoload <catalog_id>",
+                workload,
+                plural.map(|p| format!(" or {:?}", p)).unwrap_or_default()
+            ),
+            "candidates": [],
+        }));
+    }
+
+    let decision = candidates.first().cloned();
+
+    Ok(serde_json::json!({
+        "workload": workload,
+        "decision": decision,
+        "candidates": candidates,
+    }))
+}
+
 // ─── Fleet Scan ──────────────────────────────────────────────────────────────
 
 pub async fn fleet_scan(params: Option<Value>) -> HandlerResult {
@@ -1959,6 +2104,7 @@ pub async fn dispatch(method: &str, params: Option<Value>) -> HandlerResult {
         "fleet_config" => fleet_config(params).await,
         "fleet_ssh" => fleet_ssh(params).await,
         "fleet_run" => fleet_run(params).await,
+        "fleet_route" => fleet_route(params).await,
         "fleet_scan" => fleet_scan(params).await,
         "fleet_install_model" => fleet_install_model(params).await,
         "fleet_wait" => fleet_wait(params).await,

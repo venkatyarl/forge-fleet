@@ -6559,6 +6559,32 @@ CREATE INDEX IF NOT EXISTS fleet_model_deployments_desired_state_idx
     ON fleet_model_deployments (desired_state, worker_name);
 "#;
 
+// ─── V95: resize brain_vault_nodes.embedding to vector(1024) for bge-m3 ──────
+//
+// V78 created `brain_vault_nodes.embedding` as `vector(384)` — appropriate for
+// MiniLM-class embedders. bge-m3 (V91) outputs 1024-dim vectors, so any
+// INSERT now fails with `expected 384 dimensions, not 1024`.
+//
+// pgvector requires a fixed dim per column, so we DROP and re-CREATE.
+// Drop preserves no embeddings (there were 0 — V78 was a no-op until the
+// pgvector image swap on 2026-05-18). Re-creates the HNSW index too.
+//
+// If the column was somehow populated with 384-dim vectors, this is destructive
+// to those rows' embedding only — node metadata is untouched, and a backfill
+// loop can repopulate from bge-m3.
+pub const SCHEMA_V95_BGE_EMBEDDING_DIM: &str = r#"
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'vector') THEN
+        ALTER TABLE brain_vault_nodes DROP COLUMN IF EXISTS embedding;
+        ALTER TABLE brain_vault_nodes ADD  COLUMN embedding vector(1024);
+        CREATE INDEX IF NOT EXISTS idx_vault_nodes_embedding_1024
+            ON brain_vault_nodes USING hnsw (embedding vector_cosine_ops)
+            WHERE embedding IS NOT NULL;
+    END IF;
+END $$;
+"#;
+
 // ─── V94: align bge-m3 / bge-reranker-v2-m3 quant to upstream filename ───────
 //
 // V91 seeded the bge-m3 and bge-reranker-v2-m3 variants with quant = "F16".

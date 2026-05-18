@@ -127,6 +127,52 @@ impl AgentRole {
             SubTaskType::ToolUse => Self::Executor,
         }
     }
+
+    // ─── Hardware preferences (added 2026-05-18) ────────────────────────
+    //
+    // The original `min_tier` / `ideal_tier` axis says "how smart should
+    // the model be." These methods say "what kind of computer should host
+    // it." Both feed into the TaskRouter's hardware_score so we can route
+    // a coder agent to a 30B MoE on a 32GB Linux box but route a planner
+    // agent to the 35B-A3B MoE on Taylor's 96GB unified-memory Mac (where
+    // MoE active-params << total-params and unified memory dominates).
+
+    /// Minimum RAM (GB) the host should have to comfortably run this role's
+    /// model at usable per-slot context.
+    pub fn min_ram_gb(&self) -> u32 {
+        match self {
+            // Quick lookups, tool execution — 7B–9B class fits in ~6GB Q4
+            Self::Assistant | Self::Executor => 8,
+            // Code generation, prose, testing — 30B class needs ~22GB Q4
+            Self::Coder | Self::Writer | Self::Tester => 24,
+            // Reasoning-heavy roles — 30B+ with headroom for ctx + KV cache
+            Self::Researcher | Self::Reviewer | Self::Planner => 32,
+        }
+    }
+
+    /// Whether this role benefits meaningfully from GPU acceleration.
+    /// Used to break ties between equal-tier nodes — true → prefer the
+    /// GPU node, false → indifferent.
+    pub fn prefers_gpu(&self) -> bool {
+        match self {
+            // Fast, short outputs — CPU is fine
+            Self::Assistant | Self::Executor => false,
+            // Everything else benefits from GPU when available
+            _ => true,
+        }
+    }
+
+    /// Whether this role benefits from unified memory architecture
+    /// (Apple Silicon, AMD APU). True when the role typically runs a
+    /// large model whose active-params are a small fraction of total
+    /// (MoE) — unified memory bandwidth dominates inference latency.
+    pub fn prefers_unified(&self) -> bool {
+        match self {
+            // MoE-heavy roles win on unified hardware
+            Self::Coder | Self::Planner | Self::Researcher => true,
+            _ => false,
+        }
+    }
 }
 
 impl std::fmt::Display for AgentRole {

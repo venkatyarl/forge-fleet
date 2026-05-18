@@ -19,7 +19,11 @@ name: forgefleet
 services:
   # ─── PostgreSQL 16 ──────────────────────────────────────────────────────
   postgres:
-    image: postgres:16-alpine
+    # pgvector image is just postgres:16 + the `vector` extension pre-built.
+    # Switched 2026-05-18 so brain_vault_nodes.embedding (V78) can actually
+    # exist — the alpine image didn't ship pgvector and V78's ADD COLUMN
+    # was a no-op behind its `IF pg_extension` guard.
+    image: pgvector/pgvector:pg16
     container_name: forgefleet-postgres
     ports:
       - "55432:5432"
