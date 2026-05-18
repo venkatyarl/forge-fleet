@@ -282,8 +282,31 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
             }
 
             // Allow patterns: prefer runtime-specific glob to avoid pulling everything.
+            // For llama.cpp, also narrow by the variant's quant so we don't pull every
+            // quant in the repo (e.g. deepseek-r1-distill-qwen-32b ships 7 quants ≈
+            // 140 GB total when only the catalog's Q4_K_M variant is wanted).
+            //
+            // Tokenizer/config files have no quant suffix, so they stay matched by
+            // separate patterns.
             let allow_patterns: Vec<String> = match target_runtime.as_str() {
-                "llama.cpp" => vec!["*.gguf".into(), "tokenizer*".into(), "*config*".into()],
+                "llama.cpp" => {
+                    let mut pats = vec!["tokenizer*".into(), "*config*".into()];
+                    match quant.as_deref() {
+                        Some(q) if !q.is_empty() => {
+                            // e.g. "*Q4_K_M*.gguf" — matches both upper- and lower-
+                            // case in the glob because we lowercase comparisons in
+                            // the matcher? (No — glob_match is case-sensitive.)
+                            // Add both common casings to be safe across repos.
+                            pats.push(format!("*{q}*.gguf"));
+                            let lower = q.to_lowercase();
+                            if lower != q {
+                                pats.push(format!("*{lower}*.gguf"));
+                            }
+                        }
+                        _ => pats.push("*.gguf".into()),
+                    }
+                    pats
+                }
                 "mlx" | "vllm" => vec![
                     "*.safetensors".into(),
                     "*.json".into(),
@@ -293,7 +316,10 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                 ],
                 other => vec![format!("*.{other}")],
             };
-            let deny_patterns: Vec<String> = vec!["*.f16*".into(), "*.bf16*".into()];
+            // No global deny — the quant-narrowed allow above is precise enough.
+            // (Previously denied *.f16*/*.bf16* as a blunt cost guard; that bit
+            // embedders whose canonical quant *is* F16, like bge-m3-FP16.gguf.)
+            let deny_patterns: Vec<String> = vec![];
 
             let _ = force; // not yet used; resume-by-size is automatic
 
