@@ -20,8 +20,10 @@
 pub mod brain_tools;
 pub mod federation;
 pub mod handlers;
+pub mod llm_exec;
 pub mod protocol;
 pub mod server;
+pub mod strategy_dispatch;
 pub mod tools;
 pub mod transport;
 

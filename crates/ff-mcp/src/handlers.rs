@@ -25,10 +25,6 @@ use ff_discovery::ports::known_llm_ports;
 use ff_discovery::scanner::{
     NodeScanResult, NodeScanStatus, NodeScanner, ScannerConfig, build_scan_targets, scan_subnet,
 };
-use ff_orchestrator::cascade_strategy::{
-    LlmExec, RouteStrategy, ValidatorKind, classify_task, pick_strategy, run_cascade,
-    run_judge_escalate,
-};
 use ff_orchestrator::decomposer::SubTaskType;
 use ff_orchestrator::planner::Planner;
 use ff_orchestrator::task_decomposer::TemplateDecomposer;
@@ -495,6 +491,23 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
         .and_then(|v| v.as_str())
         .ok_or_else(|| "fleet_run requires 'prompt'".to_string())?;
 
+    // strategy: "tier" (default — legacy TierRouter escalation, unchanged
+    // behaviour) | "auto" (classifier picks the cascade shape) | "single"
+    // | "cascade" | "judge_escalate". When != "tier", dispatch through the
+    // same code path fleet_cascade uses — outcome-aware routing with the
+    // GatewayLlmExec dynamic resolver. Project policy approval gates still
+    // apply; allowed_models filtering does NOT (only matters on the legacy
+    // tier path).
+    //
+    // Added 2026-05-18 (Path 3). Default stays "tier" so every existing
+    // caller (Claude Code, ff CLI, scripts) sees zero behaviour change
+    // until they opt in.
+    let strategy_str = params
+        .as_ref()
+        .and_then(|p| p.get("strategy"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("tier");
+
     let mut start_tier = params
         .as_ref()
         .and_then(|p| p.get("start_tier"))
@@ -557,8 +570,50 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
         max_tier,
         model_selector,
         project_id = ?project_id,
+        strategy = strategy_str,
         "fleet_run handler called"
     );
+
+    // ── Path 3: outcome-aware dispatch when strategy != "tier" ──────────
+    //
+    // Branches here, bypassing the legacy BackendRegistry → TierRouter →
+    // adaptive_router pipeline below. Project-policy approval gates already
+    // ran above (so approval_required still blocks). allowed_models filter
+    // does not apply to this path — operators using strategy=auto/cascade
+    // are explicitly trusting the cascade's auto-routing.
+    if strategy_str != "tier" {
+        let (cfg, _) = load_config_auto()?;
+        let exec = match get_pg_pool(&cfg).await {
+            Ok(pool) => crate::llm_exec::GatewayLlmExec::new().with_pool(pool),
+            Err(e) => {
+                tracing::warn!(
+                    "fleet_run strategy='{strategy_str}': pool unavailable, falling back to hardcoded endpoints: {e}"
+                );
+                crate::llm_exec::GatewayLlmExec::new()
+            }
+        };
+
+        let tier_hint = params
+            .as_ref()
+            .and_then(|p| p.get("tier"))
+            .and_then(|v| v.as_u64())
+            .map(|n| n.clamp(1, 4) as u8);
+        let validator_override = crate::strategy_dispatch::parse_validator(
+            params
+                .as_ref()
+                .and_then(|p| p.get("validator"))
+                .and_then(|v| v.as_str()),
+        );
+
+        return crate::strategy_dispatch::dispatch_strategy(
+            &exec,
+            prompt,
+            strategy_str,
+            tier_hint,
+            validator_override,
+        )
+        .await;
+    }
 
     let (config, _config_path) = load_config_auto()?;
 
@@ -761,312 +816,12 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
 
 // ─── Fleet Cascade ───────────────────────────────────────────────────────────
 //
-// Outcome-aware routing: classifier → strategy → cascade/judge-escalate dispatch.
-// Sits next to (not in place of) fleet_run — opt in by calling fleet_cascade
-// explicitly. fleet_run keeps its existing tier-router escalation path so we
-// can A/B safely.
+// Outcome-aware routing: classifier → strategy → cascade/judge-escalate
+// dispatch. Now thin — the heavy lifting (GatewayLlmExec + dispatch_strategy)
+// lives in `llm_exec.rs` and `strategy_dispatch.rs` so `fleet_run` (Path 3)
+// can share the same code path.
 //
 // See `ff_orchestrator::cascade_strategy` for the full rationale.
-
-/// LlmExec impl that hits live fleet endpoints. Resolves the (host, model)
-/// pair per tier dynamically from `fleet_model_deployments` so the cascade
-/// auto-adapts when a node goes down — no hardcoded SHAs anywhere.
-///
-/// Fallback chain:
-///   1. Dynamic resolution: pick the best healthy deployment whose catalog
-///      has the workload tag for this cascade tier.
-///   2. If DB resolution fails (no pool, no rows, no catalog linkage), fall
-///      back to a hardcoded preferred-endpoint map.
-///   3. If even the hardcoded fallback's endpoint is unreachable, the cascade
-///      surfaces the network error and run_cascade reports the failure.
-///
-/// Designed so the existing cascade keeps working through the operator's
-/// expected steady state (cascade goes through marcus/lily/taylor) but
-/// degrades sensibly when something breaks.
-struct GatewayLlmExec {
-    client: reqwest::Client,
-    pool: Option<sqlx::PgPool>,
-}
-
-impl GatewayLlmExec {
-    fn new() -> Self {
-        Self {
-            client: reqwest::Client::builder()
-                // Match the per-tier ceiling in cascade_strategy::run_cascade.
-                .timeout(Duration::from_secs(600))
-                .build()
-                .expect("reqwest client"),
-            pool: None,
-        }
-    }
-
-    /// Attach a Postgres pool so the resolver can query `fleet_model_deployments`.
-    /// Without this, the exec falls back to its hardcoded endpoint map.
-    fn with_pool(mut self, pool: sqlx::PgPool) -> Self {
-        self.pool = Some(pool);
-        self
-    }
-
-    /// Workload tag the cascade tier should resolve against. The mapping
-    /// here is the connecting tissue between the abstract cascade-tier
-    /// idea ("drafter" / "verifier" / "finalizer") and the catalog's
-    /// `preferred_workloads` JSONB.
-    ///
-    /// Multiple tags per tier act as an OR: the resolver tries each in
-    /// order and stops on the first hit. The chosen tags reflect the
-    /// portfolio shipped to date — tier-1 wants code-capable scaffolders,
-    /// tier-2 wants verifier-grade reasoning, tier-3 wants generalist
-    /// synthesizers.
-    fn workload_tags_for_tier(tier: u8) -> &'static [&'static str] {
-        match tier {
-            1 => &["code", "tool_calling", "chat"],
-            2 => &["reasoning", "code"],
-            3 => &["chat", "reasoning", "tool_calling"],
-            _ => &["chat", "tool_calling"],
-        }
-    }
-
-    /// Hardcoded fallback endpoints — last-resort if DB resolution fails.
-    /// Kept identical to the pre-resolver behaviour so a missing pool
-    /// degrades cleanly to "what we had yesterday."
-    fn hardcoded_endpoint_for_tier(tier: u8) -> (String, String) {
-        match tier {
-            1 => (
-                "http://192.168.5.102:55000".into(),
-                "qwen3-coder-30b-a3b".into(),
-            ),
-            2 => (
-                "http://192.168.5.113:55001".into(),
-                "deepseek-r1-distill-qwen-32b".into(),
-            ),
-            3 | _ => (
-                "http://192.168.5.100:55001".into(),
-                "/Users/venkat/models/qwen36-35b-a3b".into(),
-            ),
-        }
-    }
-
-    /// Resolve the best healthy deployment for `tier`. Joins
-    /// `fleet_model_deployments` ↔ `fleet_model_catalog` ↔ `computers` so
-    /// the host's primary_ip + the catalog's preferred_workloads are both
-    /// visible to the scoring SQL.
-    ///
-    /// Scoring proxy:
-    ///   - Only HEALTHY deployments are eligible.
-    ///   - First-matching workload tag wins (tier-1 prefers "code" over
-    ///     "tool_calling" over "chat" — the array is order-sensitive).
-    ///   - Among rows with the same workload, prefer freshest last_health_at
-    ///     (most-recently-confirmed-alive). request_count would be a fairer
-    ///     load proxy but is currently unmaintained (always 0).
-    async fn resolve_dynamic(pool: &sqlx::PgPool, tier: u8) -> Option<(String, String)> {
-        for tag in Self::workload_tags_for_tier(tier) {
-            let arr = serde_json::json!([tag]);
-            // Some catalog rows use plural tags ("embeddings" vs "embedding").
-            // Try the literal then a `*s` variant.
-            let pluralized = format!("{tag}s");
-            let arr_plural = serde_json::json!([pluralized]);
-
-            let row = sqlx::query(
-                r#"
-                SELECT d.port,
-                       COALESCE(c.primary_ip, w.name) AS host,
-                       d.catalog_id
-                  FROM fleet_model_deployments d
-                  JOIN fleet_model_catalog cat ON cat.id = d.catalog_id
-                  LEFT JOIN fleet_workers w     ON w.name = d.worker_name
-                  LEFT JOIN computers c         ON LOWER(c.name) = LOWER(d.worker_name)
-                 WHERE d.health_status = 'healthy'
-                   AND (cat.preferred_workloads @> $1::jsonb
-                     OR cat.preferred_workloads @> $2::jsonb)
-                 ORDER BY d.last_health_at DESC NULLS LAST
-                 LIMIT 1
-                "#,
-            )
-            .bind(&arr)
-            .bind(&arr_plural)
-            .fetch_optional(pool)
-            .await
-            .ok()
-            .flatten();
-
-            if let Some(row) = row {
-                use sqlx::Row;
-                // Decode all three fields together; if ANY fails we want to
-                // try the next workload tag, not abandon the whole resolver.
-                // (Original `.ok()?` on each line was a bug — it would
-                // terminate resolve_dynamic on a single field decode
-                // failure, never falling through to the next tag.)
-                let decoded = (|| -> Option<(i32, String, String)> {
-                    let port: i32 = row.try_get("port").ok()?;
-                    let host: String = row.try_get("host").ok()?;
-                    let catalog_id: String = row.try_get("catalog_id").ok()?;
-                    Some((port, host, catalog_id))
-                })();
-                if let Some((port, host, catalog_id)) = decoded {
-                    return Some((format!("http://{host}:{port}"), catalog_id));
-                }
-                tracing::warn!(
-                    tier,
-                    tag = %tag,
-                    "resolve_dynamic: matched row but failed to decode fields, trying next tag"
-                );
-            }
-        }
-        None
-    }
-
-    /// Tier-aware endpoint resolution: try the live fleet first, fall back
-    /// to the hardcoded map if the pool is absent or no eligible deployment
-    /// exists.
-    async fn endpoint_for_tier(&self, tier: u8) -> (String, String) {
-        if let Some(pool) = &self.pool
-            && let Some(dynamic) = Self::resolve_dynamic(pool, tier).await
-        {
-            tracing::debug!(
-                tier,
-                endpoint = %dynamic.0,
-                model = %dynamic.1,
-                "GatewayLlmExec: dynamic resolution"
-            );
-            return dynamic;
-        }
-        let fallback = Self::hardcoded_endpoint_for_tier(tier);
-        tracing::debug!(
-            tier,
-            endpoint = %fallback.0,
-            model = %fallback.1,
-            "GatewayLlmExec: fallback to hardcoded endpoint (no dynamic match)"
-        );
-        fallback
-    }
-
-    /// Judge endpoint resolver — picks any healthy `family='gemma'`
-    /// deployment, falling back to Taylor's known gemma-4 on :55000.
-    /// Family-based selection is correct here: we explicitly want a
-    /// *third-party-family* judge (independent of Qwen-family generation
-    /// tiers) to avoid same-family bias.
-    async fn judge_endpoint(&self) -> (String, String) {
-        if let Some(pool) = &self.pool {
-            let row = sqlx::query(
-                r#"
-                SELECT d.port,
-                       COALESCE(c.primary_ip, w.name) AS host,
-                       d.catalog_id
-                  FROM fleet_model_deployments d
-                  JOIN fleet_model_catalog cat ON cat.id = d.catalog_id
-                  LEFT JOIN fleet_workers w     ON w.name = d.worker_name
-                  LEFT JOIN computers c         ON LOWER(c.name) = LOWER(d.worker_name)
-                 WHERE d.health_status = 'healthy'
-                   AND cat.family = 'gemma'
-                 ORDER BY d.last_health_at DESC NULLS LAST
-                 LIMIT 1
-                "#,
-            )
-            .fetch_optional(pool)
-            .await
-            .ok()
-            .flatten();
-            if let Some(row) = row {
-                use sqlx::Row;
-                if let (Ok(port), Ok(host), Ok(catalog_id)) = (
-                    row.try_get::<i32, _>("port"),
-                    row.try_get::<String, _>("host"),
-                    row.try_get::<String, _>("catalog_id"),
-                ) {
-                    return (format!("http://{host}:{port}"), catalog_id);
-                }
-            }
-        }
-        // Fallback: Taylor's mlx gemma-4.
-        (
-            "http://192.168.5.100:55000".into(),
-            "/Users/venkat/models/gemma-4-31b-it-4bit".into(),
-        )
-    }
-
-    async fn http_complete(
-        &self,
-        endpoint: &str,
-        model: &str,
-        prompt: &str,
-        max_tokens: u32,
-        timeout: Duration,
-    ) -> Result<String, String> {
-        let url = format!("{}/v1/chat/completions", endpoint.trim_end_matches('/'));
-        let body = json!({
-            "model": model,
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": max_tokens,
-            "temperature": 0.3,
-        });
-        let resp = self
-            .client
-            .post(&url)
-            .json(&body)
-            .timeout(timeout)
-            .send()
-            .await
-            .map_err(|e| format!("POST {url}: {e}"))?;
-        let status = resp.status();
-        let text = resp
-            .text()
-            .await
-            .map_err(|e| format!("read body from {url}: {e}"))?;
-        if !status.is_success() {
-            return Err(format!("{url} returned {status}: {text}"));
-        }
-        let payload: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
-            format!(
-                "parse {url} body: {e}; raw: {}",
-                &text[..text.len().min(200)]
-            )
-        })?;
-        let content = payload
-            .get("choices")
-            .and_then(|c| c.as_array())
-            .and_then(|arr| arr.first())
-            .and_then(|c| c.get("message"))
-            .and_then(|m| m.get("content"))
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| format!("{url}: no choices[0].message.content"))?
-            .to_string();
-        Ok(content)
-    }
-}
-
-#[async_trait::async_trait]
-impl LlmExec for GatewayLlmExec {
-    async fn complete(
-        &self,
-        tier: u8,
-        prompt: &str,
-        max_tokens: u32,
-        timeout: Duration,
-    ) -> Result<String, String> {
-        let (endpoint, model) = self.endpoint_for_tier(tier).await;
-        // Qwen3 family always emits <think> blocks and silently truncates if
-        // max_tokens < 1024 (see llm_routing::QWEN3_MAX_TOKENS_FLOOR). Apply
-        // the same floor here.
-        let effective_max = if model.to_lowercase().contains("qwen3") && max_tokens < 1024 {
-            1024
-        } else {
-            max_tokens
-        };
-        self.http_complete(&endpoint, &model, prompt, effective_max, timeout)
-            .await
-    }
-
-    async fn judge(
-        &self,
-        prompt: &str,
-        max_tokens: u32,
-        timeout: Duration,
-    ) -> Result<String, String> {
-        let (endpoint, model) = self.judge_endpoint().await;
-        self.http_complete(&endpoint, &model, prompt, max_tokens, timeout)
-            .await
-    }
-}
 
 pub async fn fleet_cascade(params: Option<Value>) -> HandlerResult {
     let prompt = params
@@ -1075,11 +830,6 @@ pub async fn fleet_cascade(params: Option<Value>) -> HandlerResult {
         .and_then(|v| v.as_str())
         .ok_or_else(|| "fleet_cascade requires 'prompt'".to_string())?;
 
-    // strategy:
-    //   "auto"          → classifier picks
-    //   "single"        → SingleTier { tier: tier_hint or 2 }
-    //   "cascade"       → Cascade { tiers: [1,2,3], validator, judge=true }
-    //   "judge_escalate"→ JudgeEscalate { start=2, max=3, threshold=7 }
     let strategy_str = params
         .as_ref()
         .and_then(|p| p.get("strategy"))
@@ -1092,131 +842,42 @@ pub async fn fleet_cascade(params: Option<Value>) -> HandlerResult {
         .and_then(|v| v.as_u64())
         .map(|n| n.clamp(1, 4) as u8);
 
-    let validator = params
-        .as_ref()
-        .and_then(|p| p.get("validator"))
-        .and_then(|v| v.as_str())
-        .map(|s| match s.to_lowercase().as_str() {
-            "json" => ValidatorKind::Json,
-            "yaml" => ValidatorKind::Yaml,
-            _ => ValidatorKind::None,
-        })
-        .unwrap_or(ValidatorKind::None);
+    let validator_override = crate::strategy_dispatch::parse_validator(
+        params
+            .as_ref()
+            .and_then(|p| p.get("validator"))
+            .and_then(|v| v.as_str()),
+    );
 
     // Wire a Postgres pool into the exec so endpoint resolution queries
-    // fleet_model_deployments at dispatch time instead of trusting a
-    // hardcoded map. Cascade now auto-adapts when a node goes down: e.g.
-    // if marcus's qwen3-coder dies, tier-1 routes to sophie's
-    // qwen3-coder automatically because both deployments carry the
-    // "code" workload tag.
-    //
-    // Pool failure (config load failure, DB down) degrades to the
-    // hardcoded preferred-endpoint map — same behaviour as before this
-    // patch, so the upgrade is strictly safer.
+    // fleet_model_deployments at dispatch time. Pool failure degrades to
+    // the hardcoded preferred-endpoint map.
     let exec = match config::load_config_auto() {
         Ok((cfg, _)) => match get_pg_pool(&cfg).await {
-            Ok(pool) => GatewayLlmExec::new().with_pool(pool),
+            Ok(pool) => crate::llm_exec::GatewayLlmExec::new().with_pool(pool),
             Err(e) => {
                 tracing::warn!(
                     "fleet_cascade: pool unavailable, falling back to hardcoded endpoints: {e}"
                 );
-                GatewayLlmExec::new()
+                crate::llm_exec::GatewayLlmExec::new()
             }
         },
         Err(e) => {
             tracing::warn!(
                 "fleet_cascade: config load failed, falling back to hardcoded endpoints: {e}"
             );
-            GatewayLlmExec::new()
+            crate::llm_exec::GatewayLlmExec::new()
         }
     };
 
-    let chosen_strategy: RouteStrategy = match strategy_str {
-        "auto" => {
-            // Classifier now returns (complexity, shape, format) — the
-            // validator is auto-selected from format. Operators can still
-            // override via the `validator` param when they know better.
-            let (c, s, f) = classify_task(&exec, prompt).await;
-            info!(
-                complexity = ?c,
-                shape = ?s,
-                format = ?f,
-                "fleet_cascade classifier verdict"
-            );
-            let mut strat = pick_strategy(c, s, f);
-            if let RouteStrategy::Cascade {
-                validator: ref mut v_ref,
-                ..
-            } = strat
-            {
-                if validator != ValidatorKind::None {
-                    *v_ref = validator;
-                }
-            }
-            strat
-        }
-        "single" => RouteStrategy::SingleTier {
-            tier: tier_hint.unwrap_or(2),
-        },
-        "cascade" => RouteStrategy::Cascade {
-            tiers: vec![1, 2, 3],
-            validator,
-            judge_early_exit: true,
-        },
-        "judge_escalate" => RouteStrategy::JudgeEscalate {
-            start_tier: tier_hint.unwrap_or(2),
-            max_tier: 3,
-            threshold: 7,
-        },
-        other => return Err(format!("unknown strategy '{other}'")),
-    };
-
-    info!(strategy = ?chosen_strategy, "fleet_cascade dispatching");
-
-    let result: Value = match chosen_strategy.clone() {
-        RouteStrategy::SingleTier { tier } => {
-            let out = exec
-                .complete(tier, prompt, 4096, Duration::from_secs(120))
-                .await
-                .map_err(|e| format!("single dispatch failed: {e}"))?;
-            json!({
-                "output": out,
-                "strategy": chosen_strategy,
-                "trace": [],
-            })
-        }
-        RouteStrategy::Cascade {
-            tiers,
-            validator,
-            judge_early_exit,
-        } => {
-            let outcome = run_cascade(&exec, prompt, &tiers, validator, judge_early_exit)
-                .await
-                .map_err(|e| format!("cascade failed: {e}"))?;
-            json!({
-                "output": outcome.final_output,
-                "strategy": chosen_strategy,
-                "trace": outcome.steps,
-                "early_exit_at_tier": outcome.early_exit_at_tier,
-            })
-        }
-        RouteStrategy::JudgeEscalate {
-            start_tier,
-            max_tier,
-            threshold,
-        } => {
-            let outcome = run_judge_escalate(&exec, prompt, start_tier, max_tier, threshold)
-                .await
-                .map_err(|e| format!("judge_escalate failed: {e}"))?;
-            json!({
-                "output": outcome.final_output,
-                "strategy": chosen_strategy,
-                "trace": outcome.steps,
-            })
-        }
-    };
-
-    Ok(result)
+    crate::strategy_dispatch::dispatch_strategy(
+        &exec,
+        prompt,
+        strategy_str,
+        tier_hint,
+        validator_override,
+    )
+    .await
 }
 
 // ─── Fleet Route ─────────────────────────────────────────────────────────────
@@ -3697,60 +3358,9 @@ mod tests {
     use axum::{Json, Router, http::StatusCode, routing::post};
     use tokio::net::TcpListener;
 
-    // ─── GatewayLlmExec — resolver mapping tests ────────────────────────────
-    //
-    // These don't hit a DB or fleet; they pin the tier → workload mapping so
-    // future cascade tiers can't silently lose their workload-tag preference
-    // ordering.
-
-    #[test]
-    fn tier_1_prefers_code() {
-        let tags = GatewayLlmExec::workload_tags_for_tier(1);
-        assert_eq!(tags[0], "code", "tier-1 drafter must prefer code");
-    }
-
-    #[test]
-    fn tier_2_prefers_reasoning() {
-        let tags = GatewayLlmExec::workload_tags_for_tier(2);
-        assert_eq!(
-            tags[0], "reasoning",
-            "tier-2 verifier must prefer reasoning"
-        );
-    }
-
-    #[test]
-    fn tier_3_prefers_chat() {
-        let tags = GatewayLlmExec::workload_tags_for_tier(3);
-        assert_eq!(
-            tags[0], "chat",
-            "tier-3 finalizer must prefer chat/synthesis"
-        );
-    }
-
-    #[test]
-    fn unknown_tier_falls_back_safely() {
-        // tier 0 and tier 4+ should still produce a non-empty preference
-        // list — otherwise the cascade would have zero options when the
-        // operator passes a tier outside the canonical 1..=3 range.
-        for tier in [0u8, 4u8, 9u8] {
-            let tags = GatewayLlmExec::workload_tags_for_tier(tier);
-            assert!(!tags.is_empty(), "tier {tier} must have fallback tags");
-        }
-    }
-
-    #[test]
-    fn hardcoded_fallback_returns_valid_url() {
-        // Sanity: the hardcoded fallback should at least produce a parseable
-        // http URL for every tier the cascade actually uses (1..=3 today).
-        for tier in 1u8..=3 {
-            let (endpoint, model) = GatewayLlmExec::hardcoded_endpoint_for_tier(tier);
-            assert!(
-                endpoint.starts_with("http://"),
-                "tier {tier} endpoint must be http"
-            );
-            assert!(!model.is_empty(), "tier {tier} model must be non-empty");
-        }
-    }
+    // GatewayLlmExec resolver tests moved to `llm_exec::tests` as part of
+    // Path 3 (module extraction). The tier→workload mapping and hardcoded
+    // fallback coverage now lives next to the implementation.
 
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();

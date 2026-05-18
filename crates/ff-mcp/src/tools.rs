@@ -186,11 +186,18 @@ impl ToolRegistry {
     fn fleet_run() -> ToolDefinition {
         ToolDefinition {
             name: "fleet_run".to_string(),
-            description: "Single-turn LLM call through the tiered pipeline \
-                (9B→32B→72B→235B). Starts at the fastest model and escalates only if \
-                the cheaper tier can't answer. Best when the task is self-contained and \
-                one prompt is enough — definitions, summaries, classifications, quick \
-                rewrites, JSON extraction. No multi-agent review, no follow-up turns."
+            description: "Single-turn LLM call. \n\n\
+                Two routing modes:\n\
+                - strategy=\"tier\" (default, legacy): tiered escalator \
+                (9B→32B→72B→235B). Starts at the fastest model and escalates \
+                only if the cheaper tier hard-fails.\n\
+                - strategy=\"auto\": outcome-aware — small classifier picks \
+                the right shape (single-tier / cascade / judge-escalate) per \
+                prompt. Stops shallow tier-1 answers from slipping through \
+                on complex prompts. Same engine as fleet_cascade.\n\n\
+                Other strategies (\"single\", \"cascade\", \"judge_escalate\") \
+                are explicit overrides. tier and validator params are honoured \
+                for non-tier strategies."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -199,15 +206,33 @@ impl ToolRegistry {
                         "type": "string",
                         "description": "The prompt/task to execute"
                     },
+                    "strategy": {
+                        "type": "string",
+                        "enum": ["tier", "auto", "single", "cascade", "judge_escalate"],
+                        "default": "tier",
+                        "description": "Routing strategy. tier=legacy escalator (default, unchanged). auto=classifier picks. single/cascade/judge_escalate=explicit override."
+                    },
                     "start_tier": {
                         "type": "integer",
-                        "description": "Start at tier (1=9B fast, 2=32B code, 3=72B review, 4=235B expert)",
+                        "description": "(strategy=tier only) Start at tier (1=9B fast, 2=32B code, 3=72B review, 4=235B expert)",
                         "default": 1
                     },
                     "max_tier": {
                         "type": "integer",
-                        "description": "Maximum tier to escalate to",
+                        "description": "(strategy=tier only) Maximum tier to escalate to",
                         "default": 4
+                    },
+                    "tier": {
+                        "type": "integer",
+                        "description": "(strategy=single|judge_escalate only) Specific tier hint (1-4)",
+                        "minimum": 1,
+                        "maximum": 4
+                    },
+                    "validator": {
+                        "type": "string",
+                        "enum": ["none", "json", "yaml"],
+                        "default": "none",
+                        "description": "(strategy=cascade only) Validator gate between cascade tiers. 'json' parses each tier's output."
                     }
                 },
                 "required": ["prompt"]
@@ -987,6 +1012,8 @@ mod tests {
             "fleet_config",
             "fleet_ssh",
             "fleet_run",
+            "fleet_cascade",
+            "fleet_route",
             "fleet_scan",
             "fleet_install_model",
             "fleet_wait",
