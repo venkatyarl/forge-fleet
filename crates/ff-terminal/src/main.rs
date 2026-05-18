@@ -1765,10 +1765,10 @@ pub enum ModelCommand {
         /// Port to bind the inference server on (default: 51001).
         #[arg(long, default_value_t = 51001)]
         port: u16,
-        /// Context window tokens (default 32768).
+        /// Context window tokens (default 65536; per-slot ctx is ctx/parallel).
         #[arg(long)]
         ctx: Option<u32>,
-        /// Parallel request slots (default 4).
+        /// Parallel request slots (default 2 → 32K per slot at default ctx).
         #[arg(long)]
         parallel: Option<u32>,
     },

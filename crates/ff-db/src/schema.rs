@@ -6558,3 +6558,65 @@ ALTER TABLE fleet_model_deployments
 CREATE INDEX IF NOT EXISTS fleet_model_deployments_desired_state_idx
     ON fleet_model_deployments (desired_state, worker_name);
 "#;
+
+// ─── V91: Seed fleet_model_catalog with embedder / reranker / reasoning ────
+//
+// Operator goal (2026-05-18): turn the fleet from "8 chat models in a trench
+// coat" into a proper retrieve→reason→generate→judge portfolio. The chat /
+// code / vision axes are already covered. The missing three:
+//
+//   * bge-m3                     — multilingual embedder (dense+sparse+ColBERT)
+//   * bge-reranker-v2-m3         — cross-encoder reranker for top-K rescoring
+//   * deepseek-r1-distill-qwen-32b — visible chain-of-thought reasoning
+//
+// `preferred_workloads` carries the new task tags ('embedding', 'reranking',
+// 'reasoning'); `model_runtime::load_model` reads these and switches
+// llama-server flags accordingly (V91 ships paired with that runtime patch).
+pub const SCHEMA_V91_TASK_MODELS: &str = r#"
+INSERT INTO fleet_model_catalog
+    (id, name, family, parameters, tier, description, gated,
+     preferred_workloads, variants, updated_at)
+VALUES
+    ('bge-m3',
+     'BGE-M3 (multilingual embedder)',
+     'bge',
+     '568M',
+     1,
+     'BAAI BGE-M3 — multilingual embedder (100+ languages). Dense, sparse, and ColBERT-style multi-vector retrieval in a single model. Powers brain_search, vault retrieval, pgvector lookups, RAG. Serves /v1/embeddings via llama-server --embeddings.',
+     false,
+     '["embedding"]'::jsonb,
+     '[{"runtime": "llama.cpp", "quant": "F16",    "hf_repo": "gpustack/bge-m3-GGUF",          "size_gb": 2}]'::jsonb,
+     NOW()),
+
+    ('bge-reranker-v2-m3',
+     'BGE Reranker v2 M3 (cross-encoder)',
+     'bge',
+     '568M',
+     1,
+     'BAAI BGE Reranker v2 M3 — cross-encoder reranker for retrieval top-K rescoring. Pairs with bge-m3: embedder finds top-50 candidates, reranker rescores to top-5. Last quality gate before docs are fed to an LLM. Serves /v1/rerank via llama-server --reranking.',
+     false,
+     '["reranking"]'::jsonb,
+     '[{"runtime": "llama.cpp", "quant": "F16",    "hf_repo": "gpustack/bge-reranker-v2-m3-GGUF", "size_gb": 1}]'::jsonb,
+     NOW()),
+
+    ('deepseek-r1-distill-qwen-32b',
+     'DeepSeek-R1-Distill-Qwen-32B',
+     'deepseek',
+     '32B',
+     2,
+     'DeepSeek-R1-Distill-Qwen-32B — visible chain-of-thought reasoning. Distilled from DeepSeek-R1 (671B MoE) into a dense 32B Qwen base. Emits <think>...</think> blocks before the final answer; downstream synthesizers must strip them. Use for fleet planner / consensus arbitration / "this is hard, think first" loops where Qwen3.6 and Gemma-4 plateau.',
+     false,
+     '["reasoning", "math", "planning"]'::jsonb,
+     '[{"runtime": "llama.cpp", "quant": "Q4_K_M", "hf_repo": "unsloth/DeepSeek-R1-Distill-Qwen-32B-GGUF", "size_gb": 20}]'::jsonb,
+     NOW())
+ON CONFLICT (id) DO UPDATE SET
+    name = EXCLUDED.name,
+    family = EXCLUDED.family,
+    parameters = EXCLUDED.parameters,
+    tier = EXCLUDED.tier,
+    description = EXCLUDED.description,
+    gated = EXCLUDED.gated,
+    preferred_workloads = EXCLUDED.preferred_workloads,
+    variants = EXCLUDED.variants,
+    updated_at = NOW();
+"#;

@@ -16,10 +16,50 @@ pub struct LoadOptions {
     pub library_id: String,
     /// Port to bind the inference server on.
     pub port: u16,
-    /// Context window size in tokens. Default 32768.
+    /// Context window size in tokens. Default 65536.
     pub context_size: Option<u32>,
-    /// Concurrent parallel request slots (llama.cpp `--parallel`). Default 4.
+    /// Concurrent parallel request slots (llama.cpp `--parallel`). Default 2.
+    /// llama-server splits ctx across slots → per-slot ctx is ctx/parallel.
+    /// Defaults give 32K per slot — enough headroom for ff agent dispatch
+    /// (system prompt + tools schema + user prompt + reasoning).
     pub parallel: Option<u32>,
+}
+
+/// Serving mode derived from the catalog row's `preferred_workloads`. Drives
+/// which llama-server flags get appended on launch — embedders and rerankers
+/// share the chat binary but speak different endpoints and tune differently.
+///
+/// Added 2026-05-18 alongside V91 to support bge-m3 / bge-reranker-v2-m3 /
+/// DeepSeek-R1-Distill-Qwen-32B.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServingMode {
+    /// Default — chat completions on /v1/chat/completions.
+    Chat,
+    /// /v1/embeddings — requires --embeddings and a pooling strategy on llama.cpp.
+    Embedding,
+    /// /v1/rerank — requires --reranking on llama.cpp ≥ b3500.
+    Reranking,
+}
+
+/// Pick a serving mode from a catalog row's `preferred_workloads` JSONB.
+/// First matching tag wins; defaults to Chat when no embedding/reranking
+/// hint is present (so existing rows behave exactly as before).
+///
+/// Tolerates singular/plural ("embedding"/"embeddings") and rerank/reranking
+/// variants — the V39 seed and V91 use slightly different conventions and we
+/// want both to route correctly.
+fn serving_mode_from_workloads(workloads: &serde_json::Value) -> ServingMode {
+    let Some(arr) = workloads.as_array() else {
+        return ServingMode::Chat;
+    };
+    for v in arr {
+        match v.as_str() {
+            Some("embedding") | Some("embeddings") => return ServingMode::Embedding,
+            Some("rerank") | Some("reranking") => return ServingMode::Reranking,
+            _ => {}
+        }
+    }
+    ServingMode::Chat
 }
 
 /// Result of a successful load.
@@ -61,9 +101,20 @@ pub async fn load_model(pool: &sqlx::PgPool, opts: LoadOptions) -> Result<LoadRe
         ));
     }
 
-    let ctx = opts.context_size.unwrap_or(32_768);
-    let parallel = opts.parallel.unwrap_or(4);
+    let ctx = opts.context_size.unwrap_or(65_536);
+    let parallel = opts.parallel.unwrap_or(2);
     let port = opts.port;
+
+    // Look up the catalog row so we can pick the right serving mode (chat /
+    // embedding / reranking). Falls back to Chat when there's no catalog
+    // row or no recognised workload tag — preserves existing behaviour.
+    let mode = match ff_db::pg_get_catalog(pool, &lib.catalog_id)
+        .await
+        .map_err(|e| format!("pg_get_catalog({}): {e}", lib.catalog_id))?
+    {
+        Some(cat) => serving_mode_from_workloads(&cat.preferred_workloads),
+        None => ServingMode::Chat,
+    };
 
     // Build the launch command per runtime.
     let (program, args, runtime_label) = match lib.runtime.as_str() {
@@ -87,9 +138,30 @@ pub async fn load_model(pool: &sqlx::PgPool, opts: LoadOptions) -> Result<LoadRe
                 port.to_string(),
                 "--ctx-size".into(),
                 ctx.to_string(),
-                "--parallel".into(),
-                parallel.to_string(),
             ];
+            match mode {
+                ServingMode::Chat => {
+                    args.push("--parallel".into());
+                    args.push(parallel.to_string());
+                }
+                ServingMode::Embedding => {
+                    // /v1/embeddings on llama.cpp ≥ b3000. BGE models use
+                    // [CLS] pooling — pick it explicitly so we don't get
+                    // last-token pooling (which is what llama defaults to
+                    // for decoder LMs and produces garbage for BERT
+                    // encoders).
+                    args.push("--embeddings".into());
+                    args.push("--pooling".into());
+                    args.push("cls".into());
+                    // --parallel doesn't apply to embedding mode: each
+                    // request is a single forward pass, no KV slots.
+                }
+                ServingMode::Reranking => {
+                    // /v1/rerank on llama.cpp ≥ b3500. Reranker is a
+                    // cross-encoder — no pooling flag, no parallel slots.
+                    args.push("--reranking".into());
+                }
+            }
             // On macOS Metal builds this enables full-GPU inference.
             if cfg!(target_os = "macos") {
                 args.push("--n-gpu-layers".into());
@@ -98,6 +170,16 @@ pub async fn load_model(pool: &sqlx::PgPool, opts: LoadOptions) -> Result<LoadRe
             (bin, args, "llama.cpp")
         }
         "mlx" => {
+            // mlx_lm.server is chat-only — no /v1/embeddings, no /v1/rerank.
+            // Fail loud rather than silently launching a chat server for an
+            // embedder.
+            if mode != ServingMode::Chat {
+                return Err(format!(
+                    "mlx runtime does not support {:?} mode (chat only); \
+                     use the llama.cpp variant instead",
+                    mode
+                ));
+            }
             // mlx_lm.server expects the MODEL to be either an HF repo id or a local dir
             // with config/weights. We use the local dir.
             let args = vec![
@@ -111,6 +193,13 @@ pub async fn load_model(pool: &sqlx::PgPool, opts: LoadOptions) -> Result<LoadRe
             ("mlx_lm.server".to_string(), args, "mlx")
         }
         "vllm" => {
+            if mode != ServingMode::Chat {
+                return Err(format!(
+                    "vllm runtime via this launcher does not yet support \
+                     {:?} mode; needs --task embedding wiring",
+                    mode
+                ));
+            }
             let args = vec![
                 "serve".into(),
                 lib.file_path.clone(),

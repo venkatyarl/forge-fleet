@@ -582,6 +582,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "deployment_desired_state",
         sql: schema::SCHEMA_V90_DEPLOYMENT_DESIRED_STATE,
     },
+    PgMigration {
+        version: 91,
+        name: "task_models_seed",
+        sql: schema::SCHEMA_V91_TASK_MODELS,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.
