@@ -25,6 +25,10 @@ use ff_discovery::ports::known_llm_ports;
 use ff_discovery::scanner::{
     NodeScanResult, NodeScanStatus, NodeScanner, ScannerConfig, build_scan_targets, scan_subnet,
 };
+use ff_orchestrator::cascade_strategy::{
+    LlmExec, RouteStrategy, ValidatorKind, classify_task, pick_strategy, run_cascade,
+    run_judge_escalate,
+};
 use ff_orchestrator::decomposer::SubTaskType;
 use ff_orchestrator::planner::Planner;
 use ff_orchestrator::task_decomposer::TemplateDecomposer;
@@ -753,6 +757,272 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
     } else {
         last_error
     })
+}
+
+// ─── Fleet Cascade ───────────────────────────────────────────────────────────
+//
+// Outcome-aware routing: classifier → strategy → cascade/judge-escalate dispatch.
+// Sits next to (not in place of) fleet_run — opt in by calling fleet_cascade
+// explicitly. fleet_run keeps its existing tier-router escalation path so we
+// can A/B safely.
+//
+// See `ff_orchestrator::cascade_strategy` for the full rationale.
+
+/// LlmExec impl that hits known fleet endpoints directly. Hardcoded for v1;
+/// next session will resolve dynamically from `fleet_model_deployments`.
+///
+/// Endpoint choice deliberately spreads load across nodes so a single hot
+/// node doesn't dominate the cascade.
+struct GatewayLlmExec {
+    client: reqwest::Client,
+}
+
+impl GatewayLlmExec {
+    fn new() -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(180))
+                .build()
+                .expect("reqwest client"),
+        }
+    }
+
+    fn endpoint_for_tier(tier: u8) -> (&'static str, &'static str) {
+        match tier {
+            // marcus qwen3-coder-30b-a3b — fast drafter, especially good
+            // for code + JSON scaffolding.
+            1 => ("http://192.168.5.102:55000", "qwen3-coder-30b-a3b"),
+            // lily deepseek-r1-distill-qwen-32b — visible chain-of-thought,
+            // strong verifier role.
+            2 => ("http://192.168.5.113:55001", "deepseek-r1-distill-qwen-32b"),
+            // taylor qwen3.6-35b-a3b on MLX — Apple Silicon unified memory,
+            // best generalist + synthesis on the fleet.
+            3 => (
+                "http://192.168.5.100:55001",
+                "/Users/venkat/models/qwen36-35b-a3b",
+            ),
+            // No frontier-class local model today; fall back to tier 3.
+            _ => (
+                "http://192.168.5.100:55001",
+                "/Users/venkat/models/qwen36-35b-a3b",
+            ),
+        }
+    }
+
+    fn judge_endpoint() -> (&'static str, &'static str) {
+        // taylor gemma-4-31b-it (mlx). Kept alive specifically as the
+        // third-party-family judge — see operator notes.
+        (
+            "http://192.168.5.100:55000",
+            "/Users/venkat/models/gemma-4-31b-it-4bit",
+        )
+    }
+
+    async fn http_complete(
+        &self,
+        endpoint: &str,
+        model: &str,
+        prompt: &str,
+        max_tokens: u32,
+        timeout: Duration,
+    ) -> Result<String, String> {
+        let url = format!("{}/v1/chat/completions", endpoint.trim_end_matches('/'));
+        let body = json!({
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_tokens,
+            "temperature": 0.3,
+        });
+        let resp = self
+            .client
+            .post(&url)
+            .json(&body)
+            .timeout(timeout)
+            .send()
+            .await
+            .map_err(|e| format!("POST {url}: {e}"))?;
+        let status = resp.status();
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| format!("read body from {url}: {e}"))?;
+        if !status.is_success() {
+            return Err(format!("{url} returned {status}: {text}"));
+        }
+        let payload: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+            format!(
+                "parse {url} body: {e}; raw: {}",
+                &text[..text.len().min(200)]
+            )
+        })?;
+        let content = payload
+            .get("choices")
+            .and_then(|c| c.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|c| c.get("message"))
+            .and_then(|m| m.get("content"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("{url}: no choices[0].message.content"))?
+            .to_string();
+        Ok(content)
+    }
+}
+
+#[async_trait::async_trait]
+impl LlmExec for GatewayLlmExec {
+    async fn complete(
+        &self,
+        tier: u8,
+        prompt: &str,
+        max_tokens: u32,
+        timeout: Duration,
+    ) -> Result<String, String> {
+        let (endpoint, model) = Self::endpoint_for_tier(tier);
+        // Qwen3 family always emits <think> blocks and silently truncates if
+        // max_tokens < 1024 (see llm_routing::QWEN3_MAX_TOKENS_FLOOR). Apply
+        // the same floor here.
+        let effective_max = if model.to_lowercase().contains("qwen3") && max_tokens < 1024 {
+            1024
+        } else {
+            max_tokens
+        };
+        self.http_complete(endpoint, model, prompt, effective_max, timeout)
+            .await
+    }
+
+    async fn judge(
+        &self,
+        prompt: &str,
+        max_tokens: u32,
+        timeout: Duration,
+    ) -> Result<String, String> {
+        let (endpoint, model) = Self::judge_endpoint();
+        self.http_complete(endpoint, model, prompt, max_tokens, timeout)
+            .await
+    }
+}
+
+pub async fn fleet_cascade(params: Option<Value>) -> HandlerResult {
+    let prompt = params
+        .as_ref()
+        .and_then(|p| p.get("prompt"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "fleet_cascade requires 'prompt'".to_string())?;
+
+    // strategy:
+    //   "auto"          → classifier picks
+    //   "single"        → SingleTier { tier: tier_hint or 2 }
+    //   "cascade"       → Cascade { tiers: [1,2,3], validator, judge=true }
+    //   "judge_escalate"→ JudgeEscalate { start=2, max=3, threshold=7 }
+    let strategy_str = params
+        .as_ref()
+        .and_then(|p| p.get("strategy"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("auto");
+
+    let tier_hint = params
+        .as_ref()
+        .and_then(|p| p.get("tier"))
+        .and_then(|v| v.as_u64())
+        .map(|n| n.clamp(1, 4) as u8);
+
+    let validator = params
+        .as_ref()
+        .and_then(|p| p.get("validator"))
+        .and_then(|v| v.as_str())
+        .map(|s| match s.to_lowercase().as_str() {
+            "json" => ValidatorKind::Json,
+            "yaml" => ValidatorKind::Yaml,
+            _ => ValidatorKind::None,
+        })
+        .unwrap_or(ValidatorKind::None);
+
+    let exec = GatewayLlmExec::new();
+
+    let chosen_strategy: RouteStrategy = match strategy_str {
+        "auto" => {
+            let (c, s) = classify_task(&exec, prompt).await;
+            info!(
+                complexity = ?c,
+                shape = ?s,
+                "fleet_cascade classifier verdict"
+            );
+            let mut strat = pick_strategy(c, s);
+            // Honour an explicit validator hint by stamping it onto any
+            // Cascade strategy the classifier picked.
+            if let RouteStrategy::Cascade {
+                validator: ref mut v_ref,
+                ..
+            } = strat
+            {
+                if validator != ValidatorKind::None {
+                    *v_ref = validator;
+                }
+            }
+            strat
+        }
+        "single" => RouteStrategy::SingleTier {
+            tier: tier_hint.unwrap_or(2),
+        },
+        "cascade" => RouteStrategy::Cascade {
+            tiers: vec![1, 2, 3],
+            validator,
+            judge_early_exit: true,
+        },
+        "judge_escalate" => RouteStrategy::JudgeEscalate {
+            start_tier: tier_hint.unwrap_or(2),
+            max_tier: 3,
+            threshold: 7,
+        },
+        other => return Err(format!("unknown strategy '{other}'")),
+    };
+
+    info!(strategy = ?chosen_strategy, "fleet_cascade dispatching");
+
+    let result: Value = match chosen_strategy.clone() {
+        RouteStrategy::SingleTier { tier } => {
+            let out = exec
+                .complete(tier, prompt, 4096, Duration::from_secs(120))
+                .await
+                .map_err(|e| format!("single dispatch failed: {e}"))?;
+            json!({
+                "output": out,
+                "strategy": chosen_strategy,
+                "trace": [],
+            })
+        }
+        RouteStrategy::Cascade {
+            tiers,
+            validator,
+            judge_early_exit,
+        } => {
+            let outcome = run_cascade(&exec, prompt, &tiers, validator, judge_early_exit)
+                .await
+                .map_err(|e| format!("cascade failed: {e}"))?;
+            json!({
+                "output": outcome.final_output,
+                "strategy": chosen_strategy,
+                "trace": outcome.steps,
+                "early_exit_at_tier": outcome.early_exit_at_tier,
+            })
+        }
+        RouteStrategy::JudgeEscalate {
+            start_tier,
+            max_tier,
+            threshold,
+        } => {
+            let outcome = run_judge_escalate(&exec, prompt, start_tier, max_tier, threshold)
+                .await
+                .map_err(|e| format!("judge_escalate failed: {e}"))?;
+            json!({
+                "output": outcome.final_output,
+                "strategy": chosen_strategy,
+                "trace": outcome.steps,
+            })
+        }
+    };
+
+    Ok(result)
 }
 
 // ─── Fleet Route ─────────────────────────────────────────────────────────────
@@ -2104,6 +2374,7 @@ pub async fn dispatch(method: &str, params: Option<Value>) -> HandlerResult {
         "fleet_config" => fleet_config(params).await,
         "fleet_ssh" => fleet_ssh(params).await,
         "fleet_run" => fleet_run(params).await,
+        "fleet_cascade" => fleet_cascade(params).await,
         "fleet_route" => fleet_route(params).await,
         "fleet_scan" => fleet_scan(params).await,
         "fleet_install_model" => fleet_install_model(params).await,

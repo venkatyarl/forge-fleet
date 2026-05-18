@@ -1401,6 +1401,7 @@ name = "ff-mcp"
 version = "2026.4.7"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "chrono",
  "ff-api",

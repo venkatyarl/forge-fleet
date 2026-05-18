@@ -69,6 +69,7 @@ impl ToolRegistry {
         self.register(Self::fleet_config());
         self.register(Self::fleet_ssh());
         self.register(Self::fleet_run());
+        self.register(Self::fleet_cascade());
         self.register(Self::fleet_route());
         self.register(Self::fleet_scan());
         self.register(Self::fleet_install_model());
@@ -207,6 +208,52 @@ impl ToolRegistry {
                         "type": "integer",
                         "description": "Maximum tier to escalate to",
                         "default": 4
+                    }
+                },
+                "required": ["prompt"]
+            }),
+        }
+    }
+
+    fn fleet_cascade() -> ToolDefinition {
+        ToolDefinition {
+            name: "fleet_cascade".to_string(),
+            description: "Outcome-aware routing. Runs a small classifier on the \
+                prompt to estimate (complexity × shape), then dispatches via the \
+                right strategy: SingleTier for simple tasks, Cascade (drafter → \
+                verifier → finalizer with validator gates and judge early-exit) \
+                for complex+structured tasks (JSON/code/schemas), or \
+                JudgeEscalate for complex+open-ended tasks (single dispatch + \
+                Gemma-4 judge, escalate one tier on low score). \
+                \n\nUse this when you want the fleet to *think before dispatching* \
+                — stops a tier-1 model from confidently shipping a shallow \
+                answer to a hard question, and stops tier-3 from re-doing \
+                boilerplate that tier-1 could have drafted for free."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "The task to run."
+                    },
+                    "strategy": {
+                        "type": "string",
+                        "enum": ["auto", "single", "cascade", "judge_escalate"],
+                        "default": "auto",
+                        "description": "auto = classifier decides. single = one tier (pass tier hint). cascade = drafter→verifier→finalizer. judge_escalate = single dispatch + judge + escalate."
+                    },
+                    "tier": {
+                        "type": "integer",
+                        "description": "Tier hint (1-4) for strategy=single or judge_escalate.",
+                        "minimum": 1,
+                        "maximum": 4
+                    },
+                    "validator": {
+                        "type": "string",
+                        "enum": ["none", "json", "yaml"],
+                        "default": "none",
+                        "description": "Validator gate to run between cascade tiers. 'json' parses each tier's output; tier N+1 sees the parse error if N failed."
                     }
                 },
                 "required": ["prompt"]

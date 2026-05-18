@@ -16,6 +16,7 @@
 //! - [`confidence`] — Confidence-based escalation and trend tracking
 
 pub mod agent_team;
+pub mod cascade_strategy;
 pub mod confidence;
 pub mod crew;
 pub mod decomposer;
