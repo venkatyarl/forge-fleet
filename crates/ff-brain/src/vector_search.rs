@@ -58,8 +58,10 @@ pub async fn vector_search(query: &str, top_k: i64, pg: &PgPool) -> anyhow::Resu
 
     let mut results = Vec::new();
     for row in rows {
-        let distance: f32 = row.get("distance");
-        let score = (1.0f32 / (1.0f32 + distance)).min(1.0f32);
+        // pgvector's `<->` operator returns FLOAT8; sqlx will refuse to
+        // decode that into f32. Read as f64 then narrow.
+        let distance: f64 = row.get("distance");
+        let score = (1.0f32 / (1.0f32 + distance as f32)).min(1.0f32);
         results.push(VaultNode {
             id: row.get("id"),
             path: row.get("path"),
@@ -134,8 +136,9 @@ pub async fn hybrid_search(query: &str, top_k: i64, pg: &PgPool) -> anyhow::Resu
 
     for row in vector_rows {
         let id: uuid::Uuid = row.get("id");
-        let distance: f32 = row.get("distance");
-        let vector_score = (1.0f32 / (1.0f32 + distance)).min(1.0f32);
+        // pgvector returns FLOAT8 — read as f64 and narrow.
+        let distance: f64 = row.get("distance");
+        let vector_score = (1.0f32 / (1.0f32 + distance as f32)).min(1.0f32);
 
         let node = VaultNode {
             id,
