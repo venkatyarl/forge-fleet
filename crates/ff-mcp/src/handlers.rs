@@ -768,13 +768,24 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
 //
 // See `ff_orchestrator::cascade_strategy` for the full rationale.
 
-/// LlmExec impl that hits known fleet endpoints directly. Hardcoded for v1;
-/// next session will resolve dynamically from `fleet_model_deployments`.
+/// LlmExec impl that hits live fleet endpoints. Resolves the (host, model)
+/// pair per tier dynamically from `fleet_model_deployments` so the cascade
+/// auto-adapts when a node goes down — no hardcoded SHAs anywhere.
 ///
-/// Endpoint choice deliberately spreads load across nodes so a single hot
-/// node doesn't dominate the cascade.
+/// Fallback chain:
+///   1. Dynamic resolution: pick the best healthy deployment whose catalog
+///      has the workload tag for this cascade tier.
+///   2. If DB resolution fails (no pool, no rows, no catalog linkage), fall
+///      back to a hardcoded preferred-endpoint map.
+///   3. If even the hardcoded fallback's endpoint is unreachable, the cascade
+///      surfaces the network error and run_cascade reports the failure.
+///
+/// Designed so the existing cascade keeps working through the operator's
+/// expected steady state (cascade goes through marcus/lily/taylor) but
+/// degrades sensibly when something breaks.
 struct GatewayLlmExec {
     client: reqwest::Client,
+    pool: Option<sqlx::PgPool>,
 }
 
 impl GatewayLlmExec {
@@ -785,37 +796,191 @@ impl GatewayLlmExec {
                 .timeout(Duration::from_secs(600))
                 .build()
                 .expect("reqwest client"),
+            pool: None,
         }
     }
 
-    fn endpoint_for_tier(tier: u8) -> (&'static str, &'static str) {
+    /// Attach a Postgres pool so the resolver can query `fleet_model_deployments`.
+    /// Without this, the exec falls back to its hardcoded endpoint map.
+    fn with_pool(mut self, pool: sqlx::PgPool) -> Self {
+        self.pool = Some(pool);
+        self
+    }
+
+    /// Workload tag the cascade tier should resolve against. The mapping
+    /// here is the connecting tissue between the abstract cascade-tier
+    /// idea ("drafter" / "verifier" / "finalizer") and the catalog's
+    /// `preferred_workloads` JSONB.
+    ///
+    /// Multiple tags per tier act as an OR: the resolver tries each in
+    /// order and stops on the first hit. The chosen tags reflect the
+    /// portfolio shipped to date — tier-1 wants code-capable scaffolders,
+    /// tier-2 wants verifier-grade reasoning, tier-3 wants generalist
+    /// synthesizers.
+    fn workload_tags_for_tier(tier: u8) -> &'static [&'static str] {
         match tier {
-            // marcus qwen3-coder-30b-a3b — fast drafter, especially good
-            // for code + JSON scaffolding.
-            1 => ("http://192.168.5.102:55000", "qwen3-coder-30b-a3b"),
-            // lily deepseek-r1-distill-qwen-32b — visible chain-of-thought,
-            // strong verifier role.
-            2 => ("http://192.168.5.113:55001", "deepseek-r1-distill-qwen-32b"),
-            // taylor qwen3.6-35b-a3b on MLX — Apple Silicon unified memory,
-            // best generalist + synthesis on the fleet.
-            3 => (
-                "http://192.168.5.100:55001",
-                "/Users/venkat/models/qwen36-35b-a3b",
+            1 => &["code", "tool_calling", "chat"],
+            2 => &["reasoning", "code"],
+            3 => &["chat", "reasoning", "tool_calling"],
+            _ => &["chat", "tool_calling"],
+        }
+    }
+
+    /// Hardcoded fallback endpoints — last-resort if DB resolution fails.
+    /// Kept identical to the pre-resolver behaviour so a missing pool
+    /// degrades cleanly to "what we had yesterday."
+    fn hardcoded_endpoint_for_tier(tier: u8) -> (String, String) {
+        match tier {
+            1 => (
+                "http://192.168.5.102:55000".into(),
+                "qwen3-coder-30b-a3b".into(),
             ),
-            // No frontier-class local model today; fall back to tier 3.
-            _ => (
-                "http://192.168.5.100:55001",
-                "/Users/venkat/models/qwen36-35b-a3b",
+            2 => (
+                "http://192.168.5.113:55001".into(),
+                "deepseek-r1-distill-qwen-32b".into(),
+            ),
+            3 | _ => (
+                "http://192.168.5.100:55001".into(),
+                "/Users/venkat/models/qwen36-35b-a3b".into(),
             ),
         }
     }
 
-    fn judge_endpoint() -> (&'static str, &'static str) {
-        // taylor gemma-4-31b-it (mlx). Kept alive specifically as the
-        // third-party-family judge — see operator notes.
+    /// Resolve the best healthy deployment for `tier`. Joins
+    /// `fleet_model_deployments` ↔ `fleet_model_catalog` ↔ `computers` so
+    /// the host's primary_ip + the catalog's preferred_workloads are both
+    /// visible to the scoring SQL.
+    ///
+    /// Scoring proxy:
+    ///   - Only HEALTHY deployments are eligible.
+    ///   - First-matching workload tag wins (tier-1 prefers "code" over
+    ///     "tool_calling" over "chat" — the array is order-sensitive).
+    ///   - Among rows with the same workload, prefer freshest last_health_at
+    ///     (most-recently-confirmed-alive). request_count would be a fairer
+    ///     load proxy but is currently unmaintained (always 0).
+    async fn resolve_dynamic(pool: &sqlx::PgPool, tier: u8) -> Option<(String, String)> {
+        for tag in Self::workload_tags_for_tier(tier) {
+            let arr = serde_json::json!([tag]);
+            // Some catalog rows use plural tags ("embeddings" vs "embedding").
+            // Try the literal then a `*s` variant.
+            let pluralized = format!("{tag}s");
+            let arr_plural = serde_json::json!([pluralized]);
+
+            let row = sqlx::query(
+                r#"
+                SELECT d.port,
+                       COALESCE(c.primary_ip, w.name) AS host,
+                       d.catalog_id
+                  FROM fleet_model_deployments d
+                  JOIN fleet_model_catalog cat ON cat.id = d.catalog_id
+                  LEFT JOIN fleet_workers w     ON w.name = d.worker_name
+                  LEFT JOIN computers c         ON LOWER(c.name) = LOWER(d.worker_name)
+                 WHERE d.health_status = 'healthy'
+                   AND (cat.preferred_workloads @> $1::jsonb
+                     OR cat.preferred_workloads @> $2::jsonb)
+                 ORDER BY d.last_health_at DESC NULLS LAST
+                 LIMIT 1
+                "#,
+            )
+            .bind(&arr)
+            .bind(&arr_plural)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten();
+
+            if let Some(row) = row {
+                use sqlx::Row;
+                // Decode all three fields together; if ANY fails we want to
+                // try the next workload tag, not abandon the whole resolver.
+                // (Original `.ok()?` on each line was a bug — it would
+                // terminate resolve_dynamic on a single field decode
+                // failure, never falling through to the next tag.)
+                let decoded = (|| -> Option<(i32, String, String)> {
+                    let port: i32 = row.try_get("port").ok()?;
+                    let host: String = row.try_get("host").ok()?;
+                    let catalog_id: String = row.try_get("catalog_id").ok()?;
+                    Some((port, host, catalog_id))
+                })();
+                if let Some((port, host, catalog_id)) = decoded {
+                    return Some((format!("http://{host}:{port}"), catalog_id));
+                }
+                tracing::warn!(
+                    tier,
+                    tag = %tag,
+                    "resolve_dynamic: matched row but failed to decode fields, trying next tag"
+                );
+            }
+        }
+        None
+    }
+
+    /// Tier-aware endpoint resolution: try the live fleet first, fall back
+    /// to the hardcoded map if the pool is absent or no eligible deployment
+    /// exists.
+    async fn endpoint_for_tier(&self, tier: u8) -> (String, String) {
+        if let Some(pool) = &self.pool
+            && let Some(dynamic) = Self::resolve_dynamic(pool, tier).await
+        {
+            tracing::debug!(
+                tier,
+                endpoint = %dynamic.0,
+                model = %dynamic.1,
+                "GatewayLlmExec: dynamic resolution"
+            );
+            return dynamic;
+        }
+        let fallback = Self::hardcoded_endpoint_for_tier(tier);
+        tracing::debug!(
+            tier,
+            endpoint = %fallback.0,
+            model = %fallback.1,
+            "GatewayLlmExec: fallback to hardcoded endpoint (no dynamic match)"
+        );
+        fallback
+    }
+
+    /// Judge endpoint resolver — picks any healthy `family='gemma'`
+    /// deployment, falling back to Taylor's known gemma-4 on :55000.
+    /// Family-based selection is correct here: we explicitly want a
+    /// *third-party-family* judge (independent of Qwen-family generation
+    /// tiers) to avoid same-family bias.
+    async fn judge_endpoint(&self) -> (String, String) {
+        if let Some(pool) = &self.pool {
+            let row = sqlx::query(
+                r#"
+                SELECT d.port,
+                       COALESCE(c.primary_ip, w.name) AS host,
+                       d.catalog_id
+                  FROM fleet_model_deployments d
+                  JOIN fleet_model_catalog cat ON cat.id = d.catalog_id
+                  LEFT JOIN fleet_workers w     ON w.name = d.worker_name
+                  LEFT JOIN computers c         ON LOWER(c.name) = LOWER(d.worker_name)
+                 WHERE d.health_status = 'healthy'
+                   AND cat.family = 'gemma'
+                 ORDER BY d.last_health_at DESC NULLS LAST
+                 LIMIT 1
+                "#,
+            )
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten();
+            if let Some(row) = row {
+                use sqlx::Row;
+                if let (Ok(port), Ok(host), Ok(catalog_id)) = (
+                    row.try_get::<i32, _>("port"),
+                    row.try_get::<String, _>("host"),
+                    row.try_get::<String, _>("catalog_id"),
+                ) {
+                    return (format!("http://{host}:{port}"), catalog_id);
+                }
+            }
+        }
+        // Fallback: Taylor's mlx gemma-4.
         (
-            "http://192.168.5.100:55000",
-            "/Users/venkat/models/gemma-4-31b-it-4bit",
+            "http://192.168.5.100:55000".into(),
+            "/Users/venkat/models/gemma-4-31b-it-4bit".into(),
         )
     }
 
@@ -878,7 +1043,7 @@ impl LlmExec for GatewayLlmExec {
         max_tokens: u32,
         timeout: Duration,
     ) -> Result<String, String> {
-        let (endpoint, model) = Self::endpoint_for_tier(tier);
+        let (endpoint, model) = self.endpoint_for_tier(tier).await;
         // Qwen3 family always emits <think> blocks and silently truncates if
         // max_tokens < 1024 (see llm_routing::QWEN3_MAX_TOKENS_FLOOR). Apply
         // the same floor here.
@@ -887,7 +1052,7 @@ impl LlmExec for GatewayLlmExec {
         } else {
             max_tokens
         };
-        self.http_complete(endpoint, model, prompt, effective_max, timeout)
+        self.http_complete(&endpoint, &model, prompt, effective_max, timeout)
             .await
     }
 
@@ -897,8 +1062,8 @@ impl LlmExec for GatewayLlmExec {
         max_tokens: u32,
         timeout: Duration,
     ) -> Result<String, String> {
-        let (endpoint, model) = Self::judge_endpoint();
-        self.http_complete(endpoint, model, prompt, max_tokens, timeout)
+        let (endpoint, model) = self.judge_endpoint().await;
+        self.http_complete(&endpoint, &model, prompt, max_tokens, timeout)
             .await
     }
 }
@@ -938,7 +1103,33 @@ pub async fn fleet_cascade(params: Option<Value>) -> HandlerResult {
         })
         .unwrap_or(ValidatorKind::None);
 
-    let exec = GatewayLlmExec::new();
+    // Wire a Postgres pool into the exec so endpoint resolution queries
+    // fleet_model_deployments at dispatch time instead of trusting a
+    // hardcoded map. Cascade now auto-adapts when a node goes down: e.g.
+    // if marcus's qwen3-coder dies, tier-1 routes to sophie's
+    // qwen3-coder automatically because both deployments carry the
+    // "code" workload tag.
+    //
+    // Pool failure (config load failure, DB down) degrades to the
+    // hardcoded preferred-endpoint map — same behaviour as before this
+    // patch, so the upgrade is strictly safer.
+    let exec = match config::load_config_auto() {
+        Ok((cfg, _)) => match get_pg_pool(&cfg).await {
+            Ok(pool) => GatewayLlmExec::new().with_pool(pool),
+            Err(e) => {
+                tracing::warn!(
+                    "fleet_cascade: pool unavailable, falling back to hardcoded endpoints: {e}"
+                );
+                GatewayLlmExec::new()
+            }
+        },
+        Err(e) => {
+            tracing::warn!(
+                "fleet_cascade: config load failed, falling back to hardcoded endpoints: {e}"
+            );
+            GatewayLlmExec::new()
+        }
+    };
 
     let chosen_strategy: RouteStrategy = match strategy_str {
         "auto" => {
@@ -3505,6 +3696,61 @@ mod tests {
 
     use axum::{Json, Router, http::StatusCode, routing::post};
     use tokio::net::TcpListener;
+
+    // ─── GatewayLlmExec — resolver mapping tests ────────────────────────────
+    //
+    // These don't hit a DB or fleet; they pin the tier → workload mapping so
+    // future cascade tiers can't silently lose their workload-tag preference
+    // ordering.
+
+    #[test]
+    fn tier_1_prefers_code() {
+        let tags = GatewayLlmExec::workload_tags_for_tier(1);
+        assert_eq!(tags[0], "code", "tier-1 drafter must prefer code");
+    }
+
+    #[test]
+    fn tier_2_prefers_reasoning() {
+        let tags = GatewayLlmExec::workload_tags_for_tier(2);
+        assert_eq!(
+            tags[0], "reasoning",
+            "tier-2 verifier must prefer reasoning"
+        );
+    }
+
+    #[test]
+    fn tier_3_prefers_chat() {
+        let tags = GatewayLlmExec::workload_tags_for_tier(3);
+        assert_eq!(
+            tags[0], "chat",
+            "tier-3 finalizer must prefer chat/synthesis"
+        );
+    }
+
+    #[test]
+    fn unknown_tier_falls_back_safely() {
+        // tier 0 and tier 4+ should still produce a non-empty preference
+        // list — otherwise the cascade would have zero options when the
+        // operator passes a tier outside the canonical 1..=3 range.
+        for tier in [0u8, 4u8, 9u8] {
+            let tags = GatewayLlmExec::workload_tags_for_tier(tier);
+            assert!(!tags.is_empty(), "tier {tier} must have fallback tags");
+        }
+    }
+
+    #[test]
+    fn hardcoded_fallback_returns_valid_url() {
+        // Sanity: the hardcoded fallback should at least produce a parseable
+        // http URL for every tier the cascade actually uses (1..=3 today).
+        for tier in 1u8..=3 {
+            let (endpoint, model) = GatewayLlmExec::hardcoded_endpoint_for_tier(tier);
+            assert!(
+                endpoint.starts_with("http://"),
+                "tier {tier} endpoint must be http"
+            );
+            assert!(!model.is_empty(), "tier {tier} model must be non-empty");
+        }
+    }
 
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
