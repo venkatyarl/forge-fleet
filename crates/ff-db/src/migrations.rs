@@ -607,6 +607,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "bge_embedding_dim_1024",
         sql: schema::SCHEMA_V95_BGE_EMBEDDING_DIM,
     },
+    PgMigration {
+        version: 96,
+        name: "register_pipeline_llm_alias",
+        sql: schema::SCHEMA_V96_REGISTER_PIPELINE_LLM_ALIAS,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.

@@ -6812,3 +6812,33 @@ ON CONFLICT (id) DO UPDATE SET
     variants = EXCLUDED.variants,
     updated_at = NOW();
 "#;
+
+// ─── V96: register pipeline_llm_default alias on the gateway port ────────────
+//
+// Operator convention: every ForgeFleet-owned port is 5-digit and registered
+// in port_registry. ff-pipeline (LLM dispatch library) previously hardcoded a
+// 4-digit default `http://127.0.0.1:4000` which (a) violated the convention,
+// (b) was unregistered, (c) collided with Obsidian's local REST plugin in
+// 2026-05 — every fleet_crew / pipeline LLM call posted to the note-taking app
+// and got back HTML 404s.
+//
+// The fix is paired with `ff-pipeline::executor.rs` switching its default to
+// `http://127.0.0.1:51002` (the gateway, which actually serves
+// /v1/chat/completions and routes onward). This migration just records the
+// secondary role on the existing 51002 row so the convention is discoverable:
+// grep "pipeline_llm_default" → land in the registry, not in dead code.
+pub const SCHEMA_V96_REGISTER_PIPELINE_LLM_ALIAS: &str = r#"
+UPDATE port_registry
+   SET metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object(
+       'aliases', jsonb_build_array(
+           'pipeline_llm_default',
+           'mcp_chat_completions_proxy'
+       ),
+       'protocols', jsonb_build_array(
+           'openai_chat_completions',
+           'dashboard'
+       )
+   ),
+   updated_at = NOW()
+ WHERE port = 51002;
+"#;

@@ -31,10 +31,14 @@ pub struct ExecutorConfig {
     pub http_client: reqwest::Client,
     /// Base URL for OpenAI-compatible chat completions endpoint.
     ///
+    /// Defaults to the local ForgeFleet gateway at `http://127.0.0.1:51002`
+    /// (canonical 5-digit port, registered in `port_registry`). The gateway
+    /// routes the request to the appropriate fleet backend internally.
+    ///
     /// Examples:
-    /// - `http://127.0.0.1:4000`
-    /// - `http://127.0.0.1:4000/v1`
-    /// - `http://127.0.0.1:4000/v1/chat/completions`
+    /// - `http://127.0.0.1:51002`
+    /// - `http://127.0.0.1:51002/v1`
+    /// - `http://127.0.0.1:51002/v1/chat/completions`
     pub llm_base_url: Option<String>,
     /// Optional bearer token for the LLM endpoint.
     pub llm_api_key: Option<String>,
@@ -99,7 +103,11 @@ impl StepRuntime {
             .llm_base_url
             .clone()
             .or_else(|| std::env::var("FF_PIPELINE_LLM_BASE_URL").ok())
-            .unwrap_or_else(|| "http://127.0.0.1:4000".to_string());
+            // Canonical default = ForgeFleet gateway on the local host. 5-digit
+            // port registered in port_registry to `service='forgefleetd'`. Prior
+            // default `:4000` was LiteLLM's legacy port that nothing on the fleet
+            // serves — it collided with Obsidian's local REST plugin in 2026-05.
+            .unwrap_or_else(|| "http://127.0.0.1:51002".to_string());
 
         let llm_api_key = config
             .llm_api_key
