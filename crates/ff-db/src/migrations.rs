@@ -592,6 +592,16 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "ff_git_linux_parity",
         sql: schema::SCHEMA_V92_FF_GIT_LINUX_PARITY,
     },
+    PgMigration {
+        version: 93,
+        name: "backfill_fleet_worker_runtime",
+        sql: schema::SCHEMA_V93_BACKFILL_FLEET_WORKER_RUNTIME,
+    },
+    PgMigration {
+        version: 94,
+        name: "bge_quant_fix",
+        sql: schema::SCHEMA_V94_BGE_QUANT_FIX,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.

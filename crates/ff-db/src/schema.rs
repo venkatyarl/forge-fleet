@@ -6559,6 +6559,85 @@ CREATE INDEX IF NOT EXISTS fleet_model_deployments_desired_state_idx
     ON fleet_model_deployments (desired_state, worker_name);
 "#;
 
+// ─── V94: align bge-m3 / bge-reranker-v2-m3 quant to upstream filename ───────
+//
+// V91 seeded the bge-m3 and bge-reranker-v2-m3 variants with quant = "F16".
+// The upstream `gpustack/bge-m3-GGUF` and `gpustack/bge-reranker-v2-m3-GGUF`
+// repos name their non-quantized GGUF as `*-FP16.gguf` — so `ff model
+// download` (with the quant-narrowed allow pattern from `136ce94bf`)
+// produced the glob `*F16*.gguf` which doesn't match `bge-m3-FP16.gguf`
+// (the F and 16 aren't contiguous).
+//
+// Caught 2026-05-18 dispatching bge-m3 to veronica — task exited 1 with
+// "no files matched in gpustack/bge-m3-GGUF (after allow/deny filters)".
+pub const SCHEMA_V94_BGE_QUANT_FIX: &str = r#"
+UPDATE fleet_model_catalog
+   SET variants = jsonb_build_array(
+       jsonb_build_object(
+           'runtime', 'llama.cpp',
+           'quant',   'FP16',
+           'hf_repo', 'gpustack/bge-m3-GGUF',
+           'size_gb', 2
+       )
+   ),
+   updated_at = NOW()
+ WHERE id = 'bge-m3';
+
+UPDATE fleet_model_catalog
+   SET variants = jsonb_build_array(
+       jsonb_build_object(
+           'runtime', 'llama.cpp',
+           'quant',   'FP16',
+           'hf_repo', 'gpustack/bge-reranker-v2-m3-GGUF',
+           'size_gb', 1
+       )
+   ),
+   updated_at = NOW()
+ WHERE id = 'bge-reranker-v2-m3';
+"#;
+
+// ─── V93: backfill fleet_workers.runtime from computers.os_family + gpu_kind ───
+//
+// fleet_workers.runtime defaults to 'native' at enrollment (acknowledged
+// bogus in status_cmd.rs:79 — "bogus enrollment default for every host").
+// `native` matches no model_catalog.variants[].runtime value, so
+// `ff model download-batch --node <n>` produces a deferred shell command
+// like `ff model download bge-m3 --runtime native` that fails on the
+// worker with `no variant for runtime 'native' on 'bge-m3'`.
+//
+// Surfaced 2026-05-18 dispatching bge-m3 / bge-reranker-v2-m3 to veronica
+// and deepseek-r1-distill-qwen-32b to lily. All three downloads exited 1
+// on first claim with the runtime-mismatch error.
+//
+// Authoritative mapping per `reference_runtime_choice_policy` memory:
+//
+//   computers.os_family    computers.gpu_kind          → runtime
+//   ──────────────────    ──────────────────          ─────────
+//   macos                  *                            mlx
+//   linux-dgx              *                            vllm
+//   linux-ubuntu           nvidia_cuda                  vllm
+//   linux-ubuntu           apple_silicon                mlx   (won't happen)
+//   linux-ubuntu           other / none / amd_rocm /
+//                          integrated                   llama.cpp
+//   windows*               *                            llama.cpp
+//
+// Only overwrites rows currently set to 'native' or 'unknown' — operator
+// overrides ('llama.cpp' / 'mlx' / 'vllm' chosen by hand) are preserved.
+pub const SCHEMA_V93_BACKFILL_FLEET_WORKER_RUNTIME: &str = r#"
+UPDATE fleet_workers fw
+   SET runtime = CASE
+       WHEN c.os_family = 'macos'                                THEN 'mlx'
+       WHEN c.os_family = 'linux-dgx'                            THEN 'vllm'
+       WHEN c.os_family = 'linux-ubuntu' AND c.gpu_kind = 'nvidia_cuda' THEN 'vllm'
+       WHEN c.os_family LIKE 'linux%'                            THEN 'llama.cpp'
+       WHEN c.os_family LIKE 'windows%'                          THEN 'llama.cpp'
+       ELSE fw.runtime
+       END
+  FROM computers c
+ WHERE LOWER(fw.name) = LOWER(c.name)
+   AND fw.runtime IN ('native', 'unknown', '');
+"#;
+
 // ─── V92: restore `-p ff-terminal` in Linux ff_git/forgefleetd_git playbooks ──
 //
 // V56 added `cargo build --release -p forge-fleet -p ff-terminal` to the Linux
