@@ -781,7 +781,8 @@ impl GatewayLlmExec {
     fn new() -> Self {
         Self {
             client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(180))
+                // Match the per-tier ceiling in cascade_strategy::run_cascade.
+                .timeout(Duration::from_secs(600))
                 .build()
                 .expect("reqwest client"),
         }
@@ -941,15 +942,17 @@ pub async fn fleet_cascade(params: Option<Value>) -> HandlerResult {
 
     let chosen_strategy: RouteStrategy = match strategy_str {
         "auto" => {
-            let (c, s) = classify_task(&exec, prompt).await;
+            // Classifier now returns (complexity, shape, format) — the
+            // validator is auto-selected from format. Operators can still
+            // override via the `validator` param when they know better.
+            let (c, s, f) = classify_task(&exec, prompt).await;
             info!(
                 complexity = ?c,
                 shape = ?s,
+                format = ?f,
                 "fleet_cascade classifier verdict"
             );
-            let mut strat = pick_strategy(c, s);
-            // Honour an explicit validator hint by stamping it onto any
-            // Cascade strategy the classifier picked.
+            let mut strat = pick_strategy(c, s, f);
             if let RouteStrategy::Cascade {
                 validator: ref mut v_ref,
                 ..

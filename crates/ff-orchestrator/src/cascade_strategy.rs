@@ -72,6 +72,48 @@ pub enum TaskShape {
     OpenEnded,
 }
 
+/// Concrete output format. Drives which validator (if any) is wired into
+/// the cascade gates. Inferred by the classifier alongside complexity and
+/// shape — operators no longer need to pass `validator="json"` by hand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputFormat {
+    /// Free-form text — markdown, English prose, summaries.
+    Prose,
+    /// Strict JSON; validator parses each tier's output.
+    Json,
+    /// YAML / Kubernetes manifest / Helm value / docker-compose.
+    Yaml,
+    /// Source code in any language. No built-in syntax validator yet —
+    /// cascade still helps but errors won't surface until runtime.
+    Code,
+    /// SQL DDL/DML/query. No built-in parser yet.
+    Sql,
+}
+
+impl OutputFormat {
+    /// Map this format to the validator the cascade gate should use.
+    /// `Code` and `Sql` fall back to `None` until we add per-language
+    /// validators (would need to know the language for Code).
+    pub fn validator(self) -> ValidatorKind {
+        match self {
+            Self::Json => ValidatorKind::Json,
+            Self::Yaml => ValidatorKind::Yaml,
+            Self::Prose | Self::Code | Self::Sql => ValidatorKind::None,
+        }
+    }
+
+    /// Reasonable default when the classifier emits only 2 words
+    /// (complexity + shape). Preserves backward-compat for callers /
+    /// tests that haven't been updated.
+    pub fn default_for_shape(shape: TaskShape) -> Self {
+        match shape {
+            TaskShape::Structured => Self::Json,
+            TaskShape::OpenEnded => Self::Prose,
+        }
+    }
+}
+
 /// Which built-in validator to use as a gate between cascade tiers.
 /// `None` means we still run the cascade but skip the parse step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -108,24 +150,31 @@ pub enum RouteStrategy {
     },
 }
 
-/// Map a (complexity, shape) classification onto a strategy.
+/// Map a (complexity, shape, format) classification onto a strategy.
 ///
-/// Defaults err on the side of *spending more compute* for safety: when we
-/// can't classify or fail to parse the classifier's response, we treat the
-/// task as `Complex + OpenEnded` (judge-escalation from tier-3) rather than
-/// downgrading to tier-1.
-pub fn pick_strategy(complexity: Complexity, shape: TaskShape) -> RouteStrategy {
+/// Validator is auto-set from `format` — operators no longer need to pass
+/// `validator="json"` by hand for JSON tasks. Defaults err on the side of
+/// *spending more compute* for safety: when the classifier fails or its
+/// output is unparseable, callers should fall back to `(Complex, OpenEnded,
+/// Prose)` → JudgeEscalate from tier-3, never downgrading silently to
+/// tier-1.
+pub fn pick_strategy(
+    complexity: Complexity,
+    shape: TaskShape,
+    format: OutputFormat,
+) -> RouteStrategy {
+    let validator = format.validator();
     match (complexity, shape) {
         (Complexity::Simple, _) => RouteStrategy::SingleTier { tier: 1 },
         (Complexity::Moderate, TaskShape::Structured) => RouteStrategy::Cascade {
             tiers: vec![1, 2],
-            validator: ValidatorKind::None,
+            validator,
             judge_early_exit: true,
         },
         (Complexity::Moderate, TaskShape::OpenEnded) => RouteStrategy::SingleTier { tier: 2 },
         (Complexity::Complex, TaskShape::Structured) => RouteStrategy::Cascade {
             tiers: vec![1, 2, 3],
-            validator: ValidatorKind::None,
+            validator,
             judge_early_exit: true,
         },
         (Complexity::Complex, TaskShape::OpenEnded) => RouteStrategy::JudgeEscalate {
@@ -135,7 +184,7 @@ pub fn pick_strategy(complexity: Complexity, shape: TaskShape) -> RouteStrategy 
         },
         (Complexity::Expert, TaskShape::Structured) => RouteStrategy::Cascade {
             tiers: vec![2, 3, 4],
-            validator: ValidatorKind::None,
+            validator,
             judge_early_exit: true,
         },
         (Complexity::Expert, TaskShape::OpenEnded) => RouteStrategy::JudgeEscalate {
@@ -213,16 +262,18 @@ pub fn validate(kind: ValidatorKind, s: &str) -> ValidationOutcome {
 
 // ─── Prompt templates ───────────────────────────────────────────────────────
 
-/// Classifier prompt — asks the small LLM for two words on one line.
+/// Classifier prompt — asks the small LLM for three words on one line.
 /// Carefully phrased to bias toward "complex" when in doubt (matches the
-/// `pick_strategy` defaults).
+/// `pick_strategy` defaults) and to extract the concrete output format so
+/// the cascade validator is auto-wired.
 pub fn classifier_prompt(user_prompt: &str) -> String {
     format!(
-        "Rate the following user task on two axes. Respond with EXACTLY \
-         two lowercase words separated by one space, nothing else.\n\
+        "Rate the following user task on THREE axes. Respond with EXACTLY \
+         three lowercase words separated by single spaces, nothing else.\n\
          \n\
          Axis 1 (complexity): one of {{simple, moderate, complex, expert}}\n\
          Axis 2 (shape):      one of {{structured, open_ended}}\n\
+         Axis 3 (format):     one of {{prose, json, yaml, code, sql}}\n\
          \n\
          Definitions:\n\
          - simple    = single-step, factual, classification, definition, \
@@ -233,17 +284,34 @@ pub fn classifier_prompt(user_prompt: &str) -> String {
          decisions.\n\
          - expert    = frontier reasoning, safety-critical, novel research \
          framing.\n\
-         - structured  = output is parseable: JSON, YAML, SQL, code, schema, \
+         - structured = output is parseable: JSON, YAML, SQL, code, schema, \
          config file, regex.\n\
-         - open_ended  = free-form prose, analysis, explanation, conversation, \
+         - open_ended = free-form prose, analysis, explanation, conversation, \
          creative writing.\n\
+         - prose     = paragraphs of natural-language text (English/etc).\n\
+         - json      = JSON object/array, JSON Schema, OpenAPI, config file.\n\
+         - yaml      = YAML config, Kubernetes manifest, Helm values, \
+         docker-compose, CI workflow.\n\
+         - code      = source code in any programming language (Rust, Python, \
+         JS, Go, Bash, etc).\n\
+         - sql       = SQL DDL/DML/query/migration.\n\
          \n\
-         When in doubt, prefer the harder label.\n\
+         Rules:\n\
+         - If shape is open_ended, format is usually prose.\n\
+         - If shape is structured, pick the concrete format (json/yaml/code/sql).\n\
+         - When in doubt about complexity, prefer the harder label.\n\
+         \n\
+         Examples:\n\
+         - \"What is 2+2?\"                            → simple open_ended prose\n\
+         - \"Write a JSON schema for a User object\"    → complex structured json\n\
+         - \"K8s CronJob to back up Postgres at 3am\"   → complex structured yaml\n\
+         - \"Rust fn parse_iso8601_duration(s) -> ...\" → complex structured code\n\
+         - \"Explain Byzantine fault tolerance\"        → complex open_ended prose\n\
          \n\
          Task:\n\
          {user_prompt}\n\
          \n\
-         Answer (two words):"
+         Answer (three words):"
     )
 }
 
@@ -318,10 +386,22 @@ pub fn judge_prompt(user_prompt: &str, candidate_output: &str) -> String {
     )
 }
 
-/// Parse the classifier's response into a (Complexity, TaskShape) pair.
-/// Returns `None` if neither word maps cleanly — caller defaults to the
-/// safe option (Complex, OpenEnded).
-pub fn parse_classifier_response(raw: &str) -> Option<(Complexity, TaskShape)> {
+/// Parse the classifier's response into a (Complexity, TaskShape, OutputFormat)
+/// triple. Returns `None` if complexity AND shape can't be resolved — caller
+/// defaults to `(Complex, OpenEnded, Prose)` so hard prompts never silently
+/// downgrade to tier-1.
+///
+/// Tolerant of:
+///   - 2-word responses (defaults format from shape)
+///   - reversed/scrambled word order
+///   - extra prose ("I'd rate it: complex structured json because ...")
+///   - synonyms ("hard json", "medium yaml")
+///   - punctuation, commas, line breaks
+///
+/// Note that some words double as shape AND format hints — "json" implies
+/// `Structured + Json`, "prose" implies `OpenEnded + Prose`. The parser
+/// fills in the redundant axis when only one is given.
+pub fn parse_classifier_response(raw: &str) -> Option<(Complexity, TaskShape, OutputFormat)> {
     let lower = raw.trim().to_lowercase();
     // Tolerate the model outputting newlines, commas, or extra words.
     let tokens: Vec<&str> = lower
@@ -331,26 +411,59 @@ pub fn parse_classifier_response(raw: &str) -> Option<(Complexity, TaskShape)> {
 
     let mut complexity: Option<Complexity> = None;
     let mut shape: Option<TaskShape> = None;
+    let mut format: Option<OutputFormat> = None;
     for t in &tokens {
         match *t {
-            "simple" => complexity = Some(Complexity::Simple),
-            "moderate" | "medium" => complexity = Some(Complexity::Moderate),
-            "complex" | "hard" => complexity = Some(Complexity::Complex),
-            "expert" | "frontier" => complexity = Some(Complexity::Expert),
-            "structured" | "structural" | "json" | "yaml" | "code" | "schema" => {
-                shape = Some(TaskShape::Structured)
+            // ── complexity ──
+            "simple" | "easy" | "trivial" => complexity = complexity.or(Some(Complexity::Simple)),
+            "moderate" | "medium" => complexity = complexity.or(Some(Complexity::Moderate)),
+            "complex" | "hard" | "difficult" => {
+                complexity = complexity.or(Some(Complexity::Complex))
             }
-            "open_ended" | "openended" | "open" | "prose" | "freeform" => {
-                shape = Some(TaskShape::OpenEnded)
+            "expert" | "frontier" | "advanced" => {
+                complexity = complexity.or(Some(Complexity::Expert))
+            }
+
+            // ── format (also implies shape) ──
+            "json" | "schema" | "openapi" => {
+                format = format.or(Some(OutputFormat::Json));
+                shape = shape.or(Some(TaskShape::Structured));
+            }
+            "yaml" | "yml" | "kubernetes" | "k8s" | "helm" | "compose" => {
+                format = format.or(Some(OutputFormat::Yaml));
+                shape = shape.or(Some(TaskShape::Structured));
+            }
+            "code" | "rust" | "python" | "javascript" | "typescript" | "go" | "bash" | "shell"
+            | "java" | "cpp" => {
+                format = format.or(Some(OutputFormat::Code));
+                shape = shape.or(Some(TaskShape::Structured));
+            }
+            "sql" | "ddl" | "dml" | "query" | "migration" => {
+                format = format.or(Some(OutputFormat::Sql));
+                shape = shape.or(Some(TaskShape::Structured));
+            }
+            "prose" | "text" | "english" | "essay" | "paragraph" | "summary" => {
+                format = format.or(Some(OutputFormat::Prose));
+                shape = shape.or(Some(TaskShape::OpenEnded));
+            }
+
+            // ── shape (kept as a fallback for old prompts) ──
+            "structured" | "structural" => shape = shape.or(Some(TaskShape::Structured)),
+            "open_ended" | "openended" | "open" | "freeform" | "free_form" => {
+                shape = shape.or(Some(TaskShape::OpenEnded))
             }
             _ => {}
         }
-        if complexity.is_some() && shape.is_some() {
+        if complexity.is_some() && shape.is_some() && format.is_some() {
             break;
         }
     }
     match (complexity, shape) {
-        (Some(c), Some(s)) => Some((c, s)),
+        (Some(c), Some(s)) => {
+            // If format wasn't explicit, derive a sensible default from shape.
+            let f = format.unwrap_or_else(|| OutputFormat::default_for_shape(s));
+            Some((c, s, f))
+        }
         _ => None,
     }
 }
@@ -461,7 +574,11 @@ pub async fn run_cascade<E: LlmExec>(
             8192
         };
         let output = exec
-            .complete(tier, &prompt, max_tokens, Duration::from_secs(120))
+            // 10-min ceiling per tier — qwen3-coder-30b at ~10-20 tok/s can
+            // need ~70-140s for 1k tokens, and reasoning models (DeepSeek-R1)
+            // spend ~half their budget in <think> and routinely cross 5 min
+            // on cascade refine prompts. 120s and 300s both proved too tight.
+            .complete(tier, &prompt, max_tokens, Duration::from_secs(600))
             .await
             .map_err(|e| format!("cascade tier-{tier} failed: {e}"))?;
         let elapsed_ms = start.elapsed().as_millis() as u64;
@@ -546,7 +663,7 @@ pub async fn run_judge_escalate<E: LlmExec>(
 
         let start = std::time::Instant::now();
         let output = exec
-            .complete(tier, &prompt, 4096, Duration::from_secs(120))
+            .complete(tier, &prompt, 4096, Duration::from_secs(600))
             .await
             .map_err(|e| format!("judge-escalate tier-{tier} failed: {e}"))?;
         let elapsed_ms = start.elapsed().as_millis() as u64;
@@ -592,22 +709,39 @@ pub async fn run_judge_escalate<E: LlmExec>(
 
 // ─── Classifier executor ───────────────────────────────────────────────────
 
-/// One classifier call. Default on parse failure is `(Complex, OpenEnded)` —
-/// safer to spend a bit more compute than to silently downgrade a hard prompt
-/// to tier-1.
-pub async fn classify_task<E: LlmExec>(exec: &E, user_prompt: &str) -> (Complexity, TaskShape) {
+/// One classifier call. Default on parse failure is `(Complex, OpenEnded,
+/// Prose)` → JudgeEscalate from tier-3, never silently downgrading to tier-1.
+///
+/// Returns the triple so callers can pass it straight to `pick_strategy`
+/// without an extra format lookup.
+pub async fn classify_task<E: LlmExec>(
+    exec: &E,
+    user_prompt: &str,
+) -> (Complexity, TaskShape, OutputFormat) {
     let prompt = classifier_prompt(user_prompt);
-    match exec
-        .complete(1, &prompt, 16, Duration::from_secs(10))
-        .await
-    {
+    // 64 tokens — 3 words is ~3-5 tokens but mlx_lm.server can truncate
+    // small budgets to empty. See judge_max_tokens note in run_cascade.
+    match exec.complete(1, &prompt, 64, Duration::from_secs(15)).await {
         Ok(resp) => parse_classifier_response(&resp).unwrap_or_else(|| {
-            tracing::warn!(response = %resp, "classifier output not parseable, defaulting to (complex, open_ended)");
-            (Complexity::Complex, TaskShape::OpenEnded)
+            tracing::warn!(
+                response = %resp,
+                "classifier output not parseable, defaulting to (complex, open_ended, prose)"
+            );
+            (
+                Complexity::Complex,
+                TaskShape::OpenEnded,
+                OutputFormat::Prose,
+            )
         }),
         Err(e) => {
-            tracing::warn!("classifier call failed, defaulting to (complex, open_ended): {e}");
-            (Complexity::Complex, TaskShape::OpenEnded)
+            tracing::warn!(
+                "classifier call failed, defaulting to (complex, open_ended, prose): {e}"
+            );
+            (
+                Complexity::Complex,
+                TaskShape::OpenEnded,
+                OutputFormat::Prose,
+            )
         }
     }
 }
@@ -661,40 +795,109 @@ mod tests {
     // ─── parse_classifier_response ──────────────────────────────────────────
 
     #[test]
-    fn parses_canonical_two_words() {
-        let (c, s) = parse_classifier_response("complex structured").unwrap();
+    fn parses_canonical_three_words() {
+        let (c, s, f) = parse_classifier_response("complex structured json").unwrap();
         assert_eq!(c, Complexity::Complex);
         assert_eq!(s, TaskShape::Structured);
+        assert_eq!(f, OutputFormat::Json);
+    }
+
+    #[test]
+    fn parses_two_words_with_format_default() {
+        // Backward-compat: 2-word responses still parse, format derived
+        // from shape (Structured → Json by default).
+        let (c, s, f) = parse_classifier_response("complex structured").unwrap();
+        assert_eq!(c, Complexity::Complex);
+        assert_eq!(s, TaskShape::Structured);
+        assert_eq!(f, OutputFormat::Json);
     }
 
     #[test]
     fn parses_reversed_order() {
-        let (c, s) = parse_classifier_response("structured complex").unwrap();
+        let (c, s, f) = parse_classifier_response("yaml complex structured").unwrap();
         assert_eq!(c, Complexity::Complex);
         assert_eq!(s, TaskShape::Structured);
+        assert_eq!(f, OutputFormat::Yaml);
     }
 
     #[test]
     fn parses_with_extra_prose() {
         // Some models can't help but explain themselves.
-        let (c, s) = parse_classifier_response(
-            "I'd rate it: complex, structured. The prompt asks for JSON, so structured fits.",
+        let (c, s, f) = parse_classifier_response(
+            "I'd rate it: complex, structured, json. The prompt asks for JSON.",
         )
         .unwrap();
         assert_eq!(c, Complexity::Complex);
         assert_eq!(s, TaskShape::Structured);
+        assert_eq!(f, OutputFormat::Json);
     }
 
     #[test]
     fn parses_synonyms() {
-        let (c, s) = parse_classifier_response("hard json").unwrap();
+        let (c, s, f) = parse_classifier_response("hard json").unwrap();
         assert_eq!(c, Complexity::Complex);
         assert_eq!(s, TaskShape::Structured);
+        assert_eq!(f, OutputFormat::Json);
+    }
+
+    #[test]
+    fn detects_format_from_language_keyword() {
+        let (c, s, f) = parse_classifier_response("complex rust").unwrap();
+        assert_eq!(c, Complexity::Complex);
+        assert_eq!(s, TaskShape::Structured);
+        assert_eq!(f, OutputFormat::Code);
+    }
+
+    #[test]
+    fn detects_yaml_from_k8s_keyword() {
+        let (c, s, f) = parse_classifier_response("complex kubernetes").unwrap();
+        assert_eq!(c, Complexity::Complex);
+        assert_eq!(s, TaskShape::Structured);
+        assert_eq!(f, OutputFormat::Yaml);
+    }
+
+    #[test]
+    fn detects_sql_from_query_keyword() {
+        let (c, s, f) = parse_classifier_response("moderate sql").unwrap();
+        assert_eq!(c, Complexity::Moderate);
+        assert_eq!(s, TaskShape::Structured);
+        assert_eq!(f, OutputFormat::Sql);
+    }
+
+    #[test]
+    fn open_ended_defaults_to_prose() {
+        let (c, s, f) = parse_classifier_response("complex open_ended").unwrap();
+        assert_eq!(c, Complexity::Complex);
+        assert_eq!(s, TaskShape::OpenEnded);
+        assert_eq!(f, OutputFormat::Prose);
     }
 
     #[test]
     fn returns_none_on_garbage() {
         assert!(parse_classifier_response("blah blah blah").is_none());
+    }
+
+    // ─── OutputFormat → ValidatorKind ───────────────────────────────────────
+
+    #[test]
+    fn json_format_picks_json_validator() {
+        assert_eq!(OutputFormat::Json.validator(), ValidatorKind::Json);
+    }
+
+    #[test]
+    fn yaml_format_picks_yaml_validator() {
+        assert_eq!(OutputFormat::Yaml.validator(), ValidatorKind::Yaml);
+    }
+
+    #[test]
+    fn code_and_sql_have_no_validator() {
+        assert_eq!(OutputFormat::Code.validator(), ValidatorKind::None);
+        assert_eq!(OutputFormat::Sql.validator(), ValidatorKind::None);
+    }
+
+    #[test]
+    fn prose_has_no_validator() {
+        assert_eq!(OutputFormat::Prose.validator(), ValidatorKind::None);
     }
 
     // ─── parse_judge_response ───────────────────────────────────────────────
@@ -727,26 +930,77 @@ mod tests {
     #[test]
     fn simple_always_tier_1() {
         assert_eq!(
-            pick_strategy(Complexity::Simple, TaskShape::Structured),
+            pick_strategy(
+                Complexity::Simple,
+                TaskShape::Structured,
+                OutputFormat::Json,
+            ),
             RouteStrategy::SingleTier { tier: 1 }
         );
         assert_eq!(
-            pick_strategy(Complexity::Simple, TaskShape::OpenEnded),
+            pick_strategy(
+                Complexity::Simple,
+                TaskShape::OpenEnded,
+                OutputFormat::Prose,
+            ),
             RouteStrategy::SingleTier { tier: 1 }
         );
     }
 
     #[test]
-    fn complex_structured_cascades() {
-        match pick_strategy(Complexity::Complex, TaskShape::Structured) {
-            RouteStrategy::Cascade { tiers, .. } => assert_eq!(tiers, vec![1, 2, 3]),
+    fn complex_structured_cascades_with_json_validator() {
+        match pick_strategy(
+            Complexity::Complex,
+            TaskShape::Structured,
+            OutputFormat::Json,
+        ) {
+            RouteStrategy::Cascade {
+                tiers, validator, ..
+            } => {
+                assert_eq!(tiers, vec![1, 2, 3]);
+                assert_eq!(validator, ValidatorKind::Json);
+            }
+            other => panic!("expected Cascade, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn complex_structured_yaml_picks_yaml_validator() {
+        match pick_strategy(
+            Complexity::Complex,
+            TaskShape::Structured,
+            OutputFormat::Yaml,
+        ) {
+            RouteStrategy::Cascade { validator, .. } => {
+                assert_eq!(validator, ValidatorKind::Yaml);
+            }
+            other => panic!("expected Cascade, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn complex_structured_code_has_no_validator() {
+        // Code cascade still runs but the gate is a no-op until we add
+        // language-specific syntax validators.
+        match pick_strategy(
+            Complexity::Complex,
+            TaskShape::Structured,
+            OutputFormat::Code,
+        ) {
+            RouteStrategy::Cascade { validator, .. } => {
+                assert_eq!(validator, ValidatorKind::None);
+            }
             other => panic!("expected Cascade, got {:?}", other),
         }
     }
 
     #[test]
     fn complex_open_judge_escalates() {
-        match pick_strategy(Complexity::Complex, TaskShape::OpenEnded) {
+        match pick_strategy(
+            Complexity::Complex,
+            TaskShape::OpenEnded,
+            OutputFormat::Prose,
+        ) {
             RouteStrategy::JudgeEscalate {
                 start_tier,
                 max_tier,
@@ -762,7 +1016,11 @@ mod tests {
 
     #[test]
     fn expert_structured_skips_tier_1() {
-        match pick_strategy(Complexity::Expert, TaskShape::Structured) {
+        match pick_strategy(
+            Complexity::Expert,
+            TaskShape::Structured,
+            OutputFormat::Json,
+        ) {
             RouteStrategy::Cascade { tiers, .. } => {
                 assert!(!tiers.contains(&1), "expert shouldn't start at tier-1");
                 assert_eq!(tiers, vec![2, 3, 4]);
@@ -902,8 +1160,9 @@ mod tests {
                 Ok("0".to_string())
             }
         }
-        let (c, s) = classify_task(&GarbageExec, "anything").await;
+        let (c, s, f) = classify_task(&GarbageExec, "anything").await;
         assert_eq!(c, Complexity::Complex);
         assert_eq!(s, TaskShape::OpenEnded);
+        assert_eq!(f, OutputFormat::Prose);
     }
 }
