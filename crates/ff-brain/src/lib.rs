@@ -25,7 +25,7 @@ pub use chat::{
 };
 pub use communities::{CommunitySummary, detect_communities};
 pub use context::{BrainMessage, ContextBundle, ResolvedNode, select_context};
-pub use embeddings::{EmbeddingClient, generate_embedding};
+pub use embeddings::{EmbeddingClient, generate_embedding, generate_embedding_with_pool};
 pub use facts::{contains_signal_phrases, extract_candidates};
 pub use procedural_memory::{consolidate, spawn_consolidation_loop};
 pub use stack_backlog::{BacklogItem, BrainStateClient, StackItem};

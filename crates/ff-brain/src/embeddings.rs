@@ -6,11 +6,60 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-/// Generate an embedding for `text`.
+use sqlx::{PgPool, Row};
+
+/// Resolution order for picking an embedding endpoint:
 ///
-/// When `FF_EMBEDDING_ENDPOINT` is set, delegates to an OpenAI-compatible
-/// embedding server (ollama, llama.cpp, etc.).  Otherwise falls back to a
-/// deterministic hash-based vector for testing / offline operation.
+///   1. `FF_EMBEDDING_ENDPOINT` + `FF_EMBEDDING_MODEL` env vars (operator override)
+///   2. A healthy `fleet_model_deployments` row whose catalog has
+///      `preferred_workloads` containing "embedding" or "embeddings"
+///   3. Hash stub (deterministic 384-dim noise — only useful for tests)
+///
+/// Step (2) is what makes `ff brain search` actually search semantically
+/// once a `bge-m3` / `qwen3-embedding-8b` / similar is loaded somewhere
+/// on the fleet. Before this resolver existed, the brain was searching
+/// against random hash vectors whenever the env vars weren't set.
+async fn pick_fleet_embedding_endpoint(pool: &PgPool) -> Option<(String, String)> {
+    // Join deployments → catalog → workers; prefer healthy rows; cheapest tier
+    // first so a 568M bge-m3 wins over an 8B qwen3-embedding if both run.
+    //
+    // computers.primary_ip is the source of truth for the worker's LAN IP
+    // (fleet_workers no longer carries an ip column post-V83). We LEFT JOIN
+    // computers as a fallback for pre-V83 deployments still keyed by name.
+    let row = sqlx::query(
+        r#"
+        SELECT d.port,
+               COALESCE(c.primary_ip, w.name) AS host_or_name,
+               cat.id AS catalog_id,
+               cat.tier AS tier
+        FROM fleet_model_deployments d
+        JOIN fleet_model_catalog cat ON cat.id = d.catalog_id
+        LEFT JOIN fleet_workers w     ON w.name = d.worker_name
+        LEFT JOIN computers c         ON LOWER(c.name) = LOWER(d.worker_name)
+        WHERE d.health_status = 'healthy'
+          AND (cat.preferred_workloads @> '["embedding"]'::jsonb
+            OR cat.preferred_workloads @> '["embeddings"]'::jsonb)
+        ORDER BY cat.tier ASC, d.last_health_at DESC NULLS LAST
+        LIMIT 1
+        "#,
+    )
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()?;
+
+    let port: i32 = row.try_get("port").ok()?;
+    let host: String = row.try_get("host_or_name").ok()?;
+    let catalog_id: String = row.try_get("catalog_id").ok()?;
+    let endpoint = format!("http://{host}:{port}");
+    Some((endpoint, catalog_id))
+}
+
+/// Generate an embedding for `text`, using only env vars / hash fallback.
+///
+/// This is the no-pool variant kept for backwards compatibility. Callers
+/// that have a `PgPool` should prefer [`generate_embedding_with_pool`] so
+/// the fleet's actual embedding deployment can be auto-discovered.
 pub async fn generate_embedding(text: &str) -> Vec<f32> {
     if let (Ok(endpoint), Ok(model)) = (
         std::env::var("FF_EMBEDDING_ENDPOINT"),
@@ -24,8 +73,56 @@ pub async fn generate_embedding(text: &str) -> Vec<f32> {
             }
         }
     }
+    hash_fallback(text)
+}
 
-    // Deterministic fallback for testing / infrastructure.
+/// Generate an embedding for `text`, auto-discovering a fleet endpoint
+/// from `fleet_model_deployments` when no env override is set.
+///
+/// Resolution: env vars → fleet auto-discovery → hash fallback.
+pub async fn generate_embedding_with_pool(text: &str, pool: &PgPool) -> Vec<f32> {
+    // (1) env override
+    if let (Ok(endpoint), Ok(model)) = (
+        std::env::var("FF_EMBEDDING_ENDPOINT"),
+        std::env::var("FF_EMBEDDING_MODEL"),
+    ) {
+        let client = EmbeddingClient::new(&endpoint, &model);
+        match client.embed(text).await {
+            Ok(vec) => return vec,
+            Err(e) => {
+                tracing::warn!("env-configured embedding server failed: {e}");
+            }
+        }
+    }
+
+    // (2) fleet auto-discovery
+    if let Some((endpoint, model)) = pick_fleet_embedding_endpoint(pool).await {
+        let client = EmbeddingClient::new(&endpoint, &model);
+        match client.embed(text).await {
+            Ok(vec) => return vec,
+            Err(e) => {
+                tracing::warn!(
+                    endpoint = %endpoint,
+                    model    = %model,
+                    "fleet-discovered embedding endpoint failed; falling back to hash stub: {e}"
+                );
+            }
+        }
+    } else {
+        tracing::warn!(
+            "no healthy embedding deployment in fleet_model_deployments; \
+             vault search is running on hash-stub vectors. Load one with: \
+             ff model autoload bge-m3"
+        );
+    }
+
+    // (3) hash stub — last resort
+    hash_fallback(text)
+}
+
+/// Deterministic 384-dim noise vector — only useful for tests / infra dev
+/// where no real embedder is available.
+fn hash_fallback(text: &str) -> Vec<f32> {
     let mut hasher = DefaultHasher::new();
     text.hash(&mut hasher);
     let seed = hasher.finish();

@@ -4,7 +4,7 @@ use serde::Serialize;
 use sqlx::{PgPool, Row};
 use std::collections::HashMap;
 
-use crate::embeddings::generate_embedding;
+use crate::embeddings::generate_embedding_with_pool;
 
 /// A vault node returned from vector/hybrid search.
 #[derive(Debug, Serialize)]
@@ -27,10 +27,13 @@ fn embedding_to_pgvector(vec: &[f32]) -> String {
 /// Uses pgvector `<->` (Euclidean distance) operator.  Results are
 /// scored as `1 / (1 + distance)` so higher = more similar.
 pub async fn vector_search(query: &str, top_k: i64, pg: &PgPool) -> anyhow::Result<Vec<VaultNode>> {
-    let embedding = generate_embedding(query).await;
+    let embedding = generate_embedding_with_pool(query, pg).await;
     let embedding_str = embedding_to_pgvector(&embedding);
 
-    let rows = sqlx::query(
+    // Same graceful-degrade as hybrid_search: when pgvector isn't installed
+    // or the column dim doesn't match, return an empty result instead of
+    // bubbling a 500 up to /api/brain/vault/search.
+    let rows = match sqlx::query(
         r#"
         SELECT id, path, title, node_type,
                embedding <-> $1::vector AS distance
@@ -44,7 +47,14 @@ pub async fn vector_search(query: &str, top_k: i64, pg: &PgPool) -> anyhow::Resu
     .bind(&embedding_str)
     .bind(top_k)
     .fetch_all(pg)
-    .await?;
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!("vector_search disabled (likely no pgvector or dim mismatch): {e}");
+            return Ok(Vec::new());
+        }
+    };
 
     let mut results = Vec::new();
     for row in rows {
@@ -67,12 +77,17 @@ pub async fn vector_search(query: &str, top_k: i64, pg: &PgPool) -> anyhow::Resu
 /// - Keyword results are fetched with 2× `top_k` and scored by a flat match bonus.
 /// - Combined score = vector_score×0.6 + keyword_score×0.4 (boosted when both match).
 pub async fn hybrid_search(query: &str, top_k: i64, pg: &PgPool) -> anyhow::Result<Vec<VaultNode>> {
-    let embedding = generate_embedding(query).await;
+    let embedding = generate_embedding_with_pool(query, pg).await;
     let embedding_str = embedding_to_pgvector(&embedding);
     let pattern = format!("%{}%", query);
 
     // ── Vector candidates ──────────────────────────────────────────────
-    let vector_rows = sqlx::query(
+    // V78 only adds the `embedding` column when the pgvector extension is
+    // present. If pgvector was never installed (or vector dimensionality
+    // doesn't match the active embedder), the column query errors out.
+    // Degrade to keyword-only rather than 500ing the whole /api/brain/search
+    // request — the search still works, just without semantic boost.
+    let vector_rows: Vec<sqlx::postgres::PgRow> = match sqlx::query(
         r#"
         SELECT id, path, title, node_type,
                embedding <-> $1::vector AS distance
@@ -86,7 +101,17 @@ pub async fn hybrid_search(query: &str, top_k: i64, pg: &PgPool) -> anyhow::Resu
     .bind(&embedding_str)
     .bind(top_k * 2)
     .fetch_all(pg)
-    .await?;
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(
+                "vector search disabled (likely no pgvector or column dim mismatch): {e}. \
+                 Falling back to keyword-only hybrid_search."
+            );
+            Vec::new()
+        }
+    };
 
     // ── Keyword candidates ─────────────────────────────────────────────
     let keyword_rows = sqlx::query(
