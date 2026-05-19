@@ -384,9 +384,13 @@ impl GatewayServer {
             }
         }
 
-        // Build a proper HTTP client for upstream proxying
+        // Build a proper HTTP client for upstream proxying. connect_timeout
+        // mirrors PulseLlmRouter::new — without it, a stale beat to a dead
+        // destination hangs 75s per request before the circuit breaker
+        // gets enough hits to trip (GW.1, 2026-05-19).
         state.http_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(120))
+            .connect_timeout(Duration::from_secs(5))
             .pool_idle_timeout(Duration::from_secs(30))
             .build()
             .unwrap_or_else(|_| {

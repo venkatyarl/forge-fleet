@@ -337,8 +337,18 @@ impl PulseLlmRouter {
     /// should respect that convention.
     pub fn new(redis_url: &str) -> Result<Self, LlmRoutingError> {
         let reader = PulseReader::new(redis_url)?;
+        // connect_timeout(5s): the outer tokio::time::timeout guards total
+        // response time (120s), but without a connect-level cap a TCP SYN
+        // to a dead destination retries for ~75s — combined with the
+        // 3-hit circuit-breaker threshold that meant three full 120s hangs
+        // before a bad endpoint was shed. With connect_timeout(5s) a stale
+        // beat fails the connect phase fast, the breaker trips on the
+        // first request, and subsequent traffic routes around it.
+        // (GW.1 — fixed 2026-05-19 after worker gateways hung on stale
+        // post-gemma-retirement beats from Taylor.)
         let http = Client::builder()
             .pool_idle_timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(5))
             .build()
             .expect("build reqwest client");
         Ok(Self {
