@@ -7043,3 +7043,14 @@ UPDATE software_registry
    )
  WHERE id='forgefleetd_git';
 "#;
+
+// V103: Retire qwen2-vl-* catalog rows (older than the qwen2.5-vl line
+// retired in V100; Qwen3-VL is now the canonical VL family per Q3.1).
+// Operator directive: every qwen2 / qwen2.5 entry replaced by its
+// qwen3 equivalent. Vision-language is now qwen3-vl-8b / qwen3-vl-30b-a3b.
+pub const SCHEMA_V103_RETIRE_QWEN2_VL: &str = r#"
+DELETE FROM fleet_model_catalog
+ WHERE id IN ('qwen2-vl-7b', 'qwen2-vl-7b-instruct');
+DELETE FROM model_catalog
+ WHERE id IN ('qwen2-vl-7b', 'qwen2-vl-7b-instruct');
+"#;
