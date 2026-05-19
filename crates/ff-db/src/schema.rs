@@ -6917,3 +6917,22 @@ UPDATE port_registry
        updated_at = NOW()
  WHERE port IN (6380, 6381, 4222, 6222, 8222);
 "#;
+
+// V98: Correct gemma4-31b-it llama.cpp variant repo (bartowski has never
+// quantized this model; unsloth has the canonical GGUF with 1.1M downloads).
+// V91 shipped with the wrong hf_repo; this migration fixes any DB that
+// already ran V91. New DBs running V91→V98 in order end up correct.
+pub const SCHEMA_V98_GEMMA4_REPO_FIX: &str = r#"
+UPDATE fleet_model_catalog
+   SET variants = jsonb_build_array(
+         jsonb_build_object(
+            'runtime', 'llama.cpp', 'quant', 'Q4_K_M',
+            'hf_repo', 'unsloth/gemma-4-31B-it-GGUF', 'size_gb', 19),
+         jsonb_build_object(
+            'runtime', 'mlx', 'quant', '4bit',
+            'hf_repo', 'mlx-community/gemma-4-31b-it-4bit', 'size_gb', 18)
+       ),
+       updated_at = NOW()
+ WHERE id = 'gemma4-31b-it'
+   AND variants::text LIKE '%bartowski/gemma-4-31b-it-GGUF%';
+"#;

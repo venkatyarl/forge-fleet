@@ -617,6 +617,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "redis_nats_5digit_remap",
         sql: schema::SCHEMA_V97_REDIS_NATS_5DIGIT,
     },
+    PgMigration {
+        version: 98,
+        name: "gemma4_repo_fix",
+        sql: schema::SCHEMA_V98_GEMMA4_REPO_FIX,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.
