@@ -2857,12 +2857,15 @@ pub async fn pg_claim_deferred(
 
     let claimed = if let Some(r) = row {
         let id: sqlx::types::Uuid = r.get("id");
+        // Note: attempts is NOT bumped here. It moved to the failure
+        // finalize path (pg_finish_deferred) so `--max-attempts N`
+        // means "max N failures", not "max N claims" — a worker crash
+        // mid-task no longer burns a retry slot.
         sqlx::query(
             "UPDATE deferred_tasks
                 SET status = 'running',
                     claimed_by = $1,
-                    claimed_at = NOW(),
-                    attempts = attempts + 1
+                    claimed_at = NOW()
               WHERE id = $2",
         )
         .bind(worker_node)
@@ -2920,18 +2923,21 @@ pub async fn pg_finish_deferred(
         .execute(pool)
         .await?;
     } else {
-        // Retry if attempts < max_attempts; else terminal fail.
+        // Bump attempts here (not in pg_claim_deferred) so the counter
+        // tracks actual failures, not claim/restart noise. Retry while
+        // (attempts + 1) < max_attempts; else terminal fail.
         sqlx::query(
             "UPDATE deferred_tasks
-                SET status = CASE
-                        WHEN attempts >= max_attempts THEN 'failed'
+                SET attempts = attempts + 1,
+                    status = CASE
+                        WHEN attempts + 1 >= max_attempts THEN 'failed'
                         ELSE 'pending'
                     END,
                     last_error = $1,
                     claimed_by = NULL,
                     claimed_at = NULL,
                     -- Exponential backoff capped at 4h: 1m, 5m, 30m, 1h, 4h
-                    next_attempt_at = NOW() + (LEAST(240, GREATEST(1, POWER(5, attempts)::int)) * INTERVAL '1 minute')
+                    next_attempt_at = NOW() + (LEAST(240, GREATEST(1, POWER(5, attempts + 1)::int)) * INTERVAL '1 minute')
               WHERE id = $2",
         )
         .bind(error)
