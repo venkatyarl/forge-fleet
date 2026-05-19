@@ -255,8 +255,17 @@ impl PulseReader {
             Some(members) if !members.is_empty() => members,
             _ => vec![requested.to_string()],
         };
+        // Pre-normalize once so the per-beat loop is cheap. Beats report
+        // model.id as filenames, full paths, or HF repo strings, while
+        // pool entries use catalog ids — comparison MUST go through the
+        // same normalizer ff-gateway uses (FA.2 — 2026-05-19, strict
+        // equality silently rejected every pool member otherwise).
+        let candidate_norms: Vec<String> = candidate_ids
+            .iter()
+            .map(|id| normalize_model_id(id))
+            .collect();
 
-        // 2. Collect matches across every beat.
+        // 2. Collect matches across every beat (normalized eq / prefix).
         let beats = self.all_beats().await?;
         let mut candidates: Vec<(String, LlmServer)> = Vec::new();
         for b in beats {
@@ -264,10 +273,17 @@ impl PulseReader {
                 continue;
             }
             for s in &b.llm_servers {
-                if s.status == "active"
-                    && s.is_healthy
-                    && candidate_ids.iter().any(|id| id == &s.model.id)
-                {
+                if !(s.status == "active" && s.is_healthy) {
+                    continue;
+                }
+                let s_norm = normalize_model_id(&s.model.id);
+                let matches = candidate_norms.iter().any(|c| {
+                    c == &s_norm
+                        || (!c.is_empty()
+                            && !s_norm.is_empty()
+                            && (s_norm.starts_with(c.as_str()) || c.starts_with(&s_norm)))
+                });
+                if matches {
                     candidates.push((b.computer_name.clone(), s.clone()));
                 }
             }
@@ -333,4 +349,46 @@ impl PulseReader {
             .map(|b| (b.computer_name.clone(), b))
             .collect())
     }
+}
+
+/// Normalize a model identifier to a comparable form. Duplicated from
+/// ff-gateway's identically-named function (FA.2 — both crates need the
+/// same canonical normalizer; consolidating to ff-core is a follow-up).
+/// Keep the two implementations in sync — see ff_gateway::llm_routing.
+fn normalize_model_id(raw: &str) -> String {
+    let mut s = raw.to_ascii_lowercase();
+    if let Some(idx) = s.rfind('/') {
+        s = s[idx + 1..].to_string();
+    }
+    if let Some(idx) = s.find(':') {
+        s.truncate(idx);
+    }
+    for ext in [".gguf", ".bin", ".safetensors"] {
+        if s.ends_with(ext) {
+            s.truncate(s.len() - ext.len());
+            break;
+        }
+    }
+    s = s.replace('_', "-");
+    while s.contains("--") {
+        s = s.replace("--", "-");
+    }
+    let quant_suffixes: &[&str] = &[
+        "-q2-k", "-q3-k-s", "-q3-k-m", "-q3-k-l", "-q4-0", "-q4-1", "-q4-k-s", "-q4-k-m", "-q5-0",
+        "-q5-1", "-q5-k-s", "-q5-k-m", "-q6-k", "-q8-0", "-bf16", "-fp16", "-fp8", "-f16", "-f32",
+        "-int8", "-int4", "-awq", "-gptq",
+    ];
+    loop {
+        let mut changed = false;
+        for sfx in quant_suffixes {
+            if s.ends_with(sfx) {
+                s.truncate(s.len() - sfx.len());
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    s.trim_matches('-').to_string()
 }
