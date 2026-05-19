@@ -13,7 +13,7 @@ const CHARS_PER_TOKEN: usize = 4;
 /// Configuration for auto-compaction behavior.
 #[derive(Debug, Clone)]
 pub struct CompactionConfig {
-    /// Context window size in tokens (default 32768 for Qwen2.5-Coder-32B).
+    /// Context window size in tokens (default 32768 for Qwen3-Coder-30B-A3B).
     pub context_window_tokens: usize,
     /// Trigger compaction when usage exceeds this fraction (default 0.80).
     pub trigger_threshold: f64,

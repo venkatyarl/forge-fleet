@@ -215,7 +215,7 @@ impl Command for ModelCommand {
         match crate::fleet_info::fetch_snapshot().await {
             Ok(snapshot) => {
                 let target = args.trim();
-                // Match on model.name (display) or model.slug (e.g. "qwen2.5-coder-32b")
+                // Match on model.name (display) or model.slug (e.g. "qwen3-coder-30b")
                 let matches: Vec<_> = snapshot
                     .models
                     .iter()

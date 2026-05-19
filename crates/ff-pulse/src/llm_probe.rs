@@ -456,7 +456,7 @@ mod tests {
                 55000,
                 "{}",
                 "",
-                "mlx-community/Qwen2.5-Coder-32B-4bit",
+                "mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit",
                 None
             ),
             "mlx_lm"
@@ -482,7 +482,7 @@ mod tests {
 
     #[test]
     fn model_id_lowercases_and_dashes() {
-        assert_eq!(model_id_from_name("Qwen 2.5 Coder"), "qwen-2.5-coder");
+        assert_eq!(model_id_from_name("Qwen 3 Coder"), "qwen-3-coder");
     }
 
     #[tokio::test]

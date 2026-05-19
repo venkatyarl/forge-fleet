@@ -77,7 +77,7 @@ pub async fn reconcile_local(pool: &sqlx::PgPool) -> Result<ReconcileSummary, St
         // Canonical-port enforcement. Inference servers are required to bind
         // in 55000-55010 per [[canonical-ports]]. Anything outside is killed
         // here so a stale operator-launched server (e.g. james's
-        // Qwen2.5-72B on 8082 since May 2) gets cleaned up automatically.
+        // Qwen3.6-35B-A3B on 8082 since May 2) gets cleaned up automatically.
         // Excludes rpc-server / mesh helpers because list_local_processes
         // only matches llama-server / mlx_lm.server / vllm serve.
         if !port_is_canonical(port_i32) {

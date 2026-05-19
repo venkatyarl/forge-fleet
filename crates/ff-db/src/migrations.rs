@@ -627,6 +627,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "default_pool_alias",
         sql: schema::SCHEMA_V99_DEFAULT_POOL_ALIAS,
     },
+    PgMigration {
+        version: 100,
+        name: "retire_qwen25",
+        sql: schema::SCHEMA_V100_RETIRE_QWEN25,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.

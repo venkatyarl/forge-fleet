@@ -158,7 +158,7 @@ fn infer_strengths(model: &ff_db::FleetModelRow) -> Vec<Strength> {
     set
 }
 
-/// Parse a model's parameter count from its name (e.g. "Qwen2.5-72B" → 72e9).
+/// Parse a model's parameter count from its name (e.g. "Qwen3.6-35B-A3B" → 72e9).
 fn infer_params_from_name(name: &str) -> u64 {
     let lower = name.to_ascii_lowercase();
     // Look for patterns like "7b", "32b", "405b".

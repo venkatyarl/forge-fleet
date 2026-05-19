@@ -217,7 +217,7 @@ mod tests {
             "id": "chatcmpl-test",
             "object": "chat.completion",
             "created": 1700000000,
-            "model": "qwen2.5-coder-32b",
+            "model": "qwen3-coder-30b",
             "choices": [{
                 "index": 0,
                 "message": {
@@ -248,7 +248,7 @@ mod tests {
     #[test]
     fn serialize_request_with_tools() {
         let req = ToolChatCompletionRequest {
-            model: "qwen2.5-coder-32b".into(),
+            model: "qwen3-coder-30b".into(),
             messages: vec![
                 ToolChatMessage::system("You are a coding agent."),
                 ToolChatMessage::user("List files"),

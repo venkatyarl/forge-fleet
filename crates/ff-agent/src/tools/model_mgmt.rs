@@ -93,7 +93,7 @@ impl AgentTool for ModelBrowserTool {
                     )),
                     _ => {
                         match self.client.get("https://ollama.com/api/tags").send().await {
-                            Ok(resp) if resp.status().is_success() => AgentToolResult::ok("Ollama: Use 'ollama pull <model>' to download. Popular: qwen2.5-coder, llama3.2, gemma2, codestral, deepseek-coder-v2".to_string()),
+                            Ok(resp) if resp.status().is_success() => AgentToolResult::ok("Ollama: Use 'ollama pull <model>' to download. Popular: qwen3-coder, llama3.2, gemma2, codestral, deepseek-coder-v2".to_string()),
                             _ => AgentToolResult::err(
                                 "Ollama not installed or API unreachable".to_string(),
                             ),
@@ -194,7 +194,7 @@ impl AgentTool for ModelBrowserTool {
                 let recommendations = match task {
                     "coding" => vec![
                         (
-                            "Qwen2.5-Coder-32B (Q4_K_M)",
+                            "Qwen3-Coder-30B-A3B (Q4_K_M)",
                             20,
                             "Best coding model for 32GB+ nodes",
                         ),
@@ -203,7 +203,7 @@ impl AgentTool for ModelBrowserTool {
                         ("CodeLlama-34B (Q4_K_M)", 20, "Meta's coding model"),
                     ],
                     "reasoning" => vec![
-                        ("Qwen2.5-72B (Q4_K_M)", 45, "Best open reasoning model"),
+                        ("Qwen3.6-35B-A3B (Q4_K_M)", 45, "Best open reasoning model"),
                         ("Llama-3.1-70B (Q4_K_M)", 45, "Meta's flagship"),
                         ("DeepSeek-R1-32B", 20, "Strong reasoning, smaller"),
                     ],
@@ -216,7 +216,7 @@ impl AgentTool for ModelBrowserTool {
                         ),
                     ],
                     _ => vec![
-                        ("Qwen2.5-Coder-32B (Q4_K_M)", 20, "Best general coding"),
+                        ("Qwen3-Coder-30B-A3B (Q4_K_M)", 20, "Best general coding"),
                         ("Gemma-4-31B", 20, "Strong all-around"),
                     ],
                 };
@@ -249,7 +249,7 @@ impl AgentTool for ModelDownloaderTool {
     }
     fn parameters_schema(&self) -> Value {
         json!({"type":"object","properties":{
-            "model":{"type":"string","description":"Model name (e.g. 'qwen2.5-coder:32b' for Ollama, 'Qwen/Qwen2.5-Coder-32B-Instruct-GGUF' for HuggingFace)"},
+            "model":{"type":"string","description":"Model name (e.g. 'qwen3-coder-30b' for Ollama, 'Qwen/Qwen3-Coder-30B-A3B-Instruct-GGUF' for HuggingFace)"},
             "method":{"type":"string","enum":["ollama","huggingface","url"],"description":"Download method (default: auto-detect)"},
             "destination":{"type":"string","description":"Download directory (default: ~/models)"},
             "quantization":{"type":"string","description":"GGUF quantization (e.g. Q4_K_M, Q5_K_M, Q8_0)"},

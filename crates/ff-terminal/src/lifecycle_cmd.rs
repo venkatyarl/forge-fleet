@@ -90,7 +90,7 @@ pub async fn handle_start(leader: bool, config_path: &Path, working_dir: &Path) 
         println!("  {GREEN}✓ LLM server already running on :51000{RESET}");
     } else {
         println!("  {YELLOW}⚠ No LLM server detected locally{RESET}");
-        println!("  Start one with: ollama serve & ollama run qwen2.5-coder:32b");
+        println!("  Start one with: ollama serve & ollama run qwen3-coder-30b");
         println!(
             "  Or: llama-server -m /path/to/model.gguf --host 0.0.0.0 --port 51000 --ctx-size 32768"
         );

@@ -285,7 +285,7 @@ impl AgentTool for ModelDeployTool {
             "properties": {
                 "host": { "type": "string", "description": "Node IP or hostname" },
                 "user": { "type": "string", "description": "SSH user" },
-                "model": { "type": "string", "description": "Model name or URL (e.g. 'qwen2.5-coder:32b', HuggingFace URL)" },
+                "model": { "type": "string", "description": "Model name or URL (e.g. 'qwen3-coder-30b', HuggingFace URL)" },
                 "method": { "type": "string", "enum": ["ollama", "wget", "huggingface"], "description": "Download method (default: ollama)" },
                 "destination": { "type": "string", "description": "Download directory on the node (default: ~/models)" },
                 "start_server": { "type": "boolean", "description": "Start llama-server after download (default: false)" },

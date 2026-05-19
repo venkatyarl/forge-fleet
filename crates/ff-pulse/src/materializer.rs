@@ -1389,8 +1389,8 @@ mod tests {
             endpoint: "http://10.0.0.1:51001".to_string(),
             openai_compatible: true,
             model: LlmServerModel {
-                id: "qwen2.5-coder-32b".to_string(),
-                display_name: "Qwen2.5 Coder 32B".to_string(),
+                id: "qwen3-coder-30b".to_string(),
+                display_name: "Qwen3 Coder 32B".to_string(),
                 loaded_path: "/models/qwen.gguf".to_string(),
                 context_window: 32768,
                 parallel_slots: 4,

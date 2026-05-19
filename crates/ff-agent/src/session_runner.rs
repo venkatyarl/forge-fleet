@@ -269,8 +269,8 @@ pub async fn tick(pool: &PgPool) -> Result<TickStats> {
                     .collect();
                 (m, cap_strs)
             })
-            .unwrap_or_else(|| ("qwen2.5-coder-32b".into(), Vec::new())),
-            None => ("qwen2.5-coder-32b".into(), Vec::new()),
+            .unwrap_or_else(|| ("qwen3-coder-30b".into(), Vec::new())),
+            None => ("qwen3-coder-30b".into(), Vec::new()),
         };
         if let Some(override_model) = step_memory.get("model_override").and_then(Value::as_str) {
             model = override_model.to_string();
@@ -934,7 +934,7 @@ pub async fn cancel_session(pool: &PgPool, session_id: uuid::Uuid) -> Result<()>
 /// Returns `(voter_ids, tally_id)`.
 ///
 /// Each voter is a model name (`claude-opus-4-7`, `gpt-5`,
-/// `gemini-2.5-pro`, `qwen2.5-coder-32b`, etc.). The orchestrator
+/// `gemini-2.5-pro`, `qwen3-coder-30b`, etc.). The orchestrator
 /// reads `step_memory.model_override` to dispatch with that model
 /// regardless of role.
 pub async fn create_vote(

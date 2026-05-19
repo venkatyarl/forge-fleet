@@ -157,7 +157,7 @@ async fn audit_tool_call(
 /// Configuration for creating an agent session.
 #[derive(Debug, Clone)]
 pub struct AgentSessionConfig {
-    /// LLM model name (e.g. "qwen2.5-coder-32b").
+    /// LLM model name (e.g. "qwen3-coder-32b").
     pub model: String,
     /// Base URL of the OpenAI-compatible LLM endpoint.
     pub llm_base_url: String,

@@ -647,7 +647,7 @@ mod tests {
         assert_eq!(infer_tier("llama-3-70b"), Tier::Tier4);
         assert_eq!(infer_tier("qwen3-32b"), Tier::Tier2);
         assert_eq!(infer_tier("gemma-2b"), Tier::Tier1);
-        assert_eq!(infer_tier("qwen2.5-0.5b"), Tier::Tier2); // 0.5b not explicitly matched
+        assert_eq!(infer_tier("qwen3-0.5b"), Tier::Tier2); // 0.5b not explicitly matched
         assert_eq!(infer_tier("unknown"), Tier::Tier2);
     }
 
@@ -656,7 +656,7 @@ mod tests {
         assert_eq!(infer_params_b("llama-3-70b"), 70.0);
         assert_eq!(infer_params_b("qwen3-32b"), 32.0);
         assert_eq!(infer_params_b("gemma-2b"), 2.0);
-        assert_eq!(infer_params_b("qwen2.5-0.5b"), 7.0); // 0.5b doesn't match any pattern
+        assert_eq!(infer_params_b("qwen3-0.5b"), 7.0); // 0.5b doesn't match any pattern
         assert_eq!(infer_params_b("unknown"), 7.0);
     }
 

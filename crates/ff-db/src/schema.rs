@@ -1470,7 +1470,7 @@ CREATE INDEX IF NOT EXISTS idx_port_registry_scope ON port_registry(scope);
 // ─── V21: Drop computer_model_deployments.model_id FK ───────────────────
 //
 // Pulse beats can report LLM servers whose `model.id` is a Huggingface
-// repo slug, an Ollama tag (`qwen2.5-coder:14b`), or a GGUF filename —
+// repo slug, an Ollama tag (`qwen3-coder-30b`), or a GGUF filename —
 // none of which are guaranteed to exist in `model_catalog`. The FK was
 // blocking the materializer from persisting those deployment rows,
 // which in turn caused `/api/llm/servers` to return an empty list.
@@ -2910,7 +2910,7 @@ VALUES
    '{"parameters": "7B", "tier": 1, "description": "Multimodal Qwen3 handling text, audio, vision, and video inputs.", "gated": false, "preferred_workloads": ["omni", "vision", "chat"], "variants": [{"runtime": "llama.cpp", "quant": "Q4_K_M", "hf_repo": "Qwen/Qwen3-Omni-7B-GGUF", "size_gb": 5.0}, {"runtime": "mlx", "quant": "4bit", "hf_repo": "mlx-community/Qwen3-Omni-7B-4bit", "size_gb": 5.0}]}'::jsonb),
 
   ('qwen25-coder-32b',
-   'Qwen2.5-Coder-32B-Instruct',
+   'Qwen3-Coder-30B-A3B-Instruct',
    'qwen',
    '32B',
    NULL,
@@ -2920,7 +2920,7 @@ VALUES
    '["text"]'::jsonb,
    '["en", "zh"]'::jsonb,
    'huggingface',
-   'Qwen/Qwen2.5-Coder-32B-Instruct',
+   'Qwen/Qwen3-Coder-30B-A3B-Instruct',
    NULL,
    NULL,
    NULL,
@@ -2936,10 +2936,10 @@ VALUES
    NULL,
    NULL,
    NULL,
-   '{"parameters": "32B", "tier": 2, "description": "Battle-tested coder model — current workhorse on Marcus/Sophie/Priya.", "gated": false, "preferred_workloads": ["code", "tool_calling"], "variants": [{"runtime": "llama.cpp", "quant": "Q4_K_M", "hf_repo": "Qwen/Qwen2.5-Coder-32B-Instruct-GGUF", "size_gb": 19.0}, {"runtime": "mlx", "quant": "4bit", "hf_repo": "mlx-community/Qwen2.5-Coder-32B-Instruct-4bit", "size_gb": 19.0}, {"runtime": "vllm", "quant": "fp16", "hf_repo": "Qwen/Qwen2.5-Coder-32B-Instruct", "size_gb": 65.0}]}'::jsonb),
+   '{"parameters": "32B", "tier": 2, "description": "Battle-tested coder model — current workhorse on Marcus/Sophie/Priya.", "gated": false, "preferred_workloads": ["code", "tool_calling"], "variants": [{"runtime": "llama.cpp", "quant": "Q4_K_M", "hf_repo": "Qwen/Qwen3-Coder-30B-A3B-Instruct-GGUF", "size_gb": 19.0}, {"runtime": "mlx", "quant": "4bit", "hf_repo": "mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit", "size_gb": 19.0}, {"runtime": "vllm", "quant": "fp16", "hf_repo": "Qwen/Qwen3-Coder-30B-A3B-Instruct", "size_gb": 65.0}]}'::jsonb),
 
   ('qwen25-72b',
-   'Qwen2.5-72B-Instruct',
+   'Qwen3.6-35B-A3B-Instruct',
    'qwen',
    '72B',
    NULL,
@@ -2949,7 +2949,7 @@ VALUES
    '["text"]'::jsonb,
    '["en", "zh"]'::jsonb,
    'huggingface',
-   'Qwen/Qwen2.5-72B-Instruct',
+   'Qwen/Qwen3-Next-80B-A3B-Instruct',
    NULL,
    NULL,
    NULL,
@@ -2965,10 +2965,10 @@ VALUES
    NULL,
    NULL,
    NULL,
-   '{"parameters": "72B", "tier": 3, "description": "Qwen2.5 flagship — currently running on James for deep reasoning.", "gated": false, "preferred_workloads": ["chat", "reasoning", "tool_calling"], "variants": [{"runtime": "llama.cpp", "quant": "Q4_K_M", "hf_repo": "Qwen/Qwen2.5-72B-Instruct-GGUF", "size_gb": 41.0}, {"runtime": "mlx", "quant": "4bit", "hf_repo": "mlx-community/Qwen2.5-72B-Instruct-4bit", "size_gb": 41.0}, {"runtime": "vllm", "quant": "fp16", "hf_repo": "Qwen/Qwen2.5-72B-Instruct", "size_gb": 145.0}]}'::jsonb),
+   '{"parameters": "72B", "tier": 3, "description": "Qwen3 flagship — currently running on James for deep reasoning.", "gated": false, "preferred_workloads": ["chat", "reasoning", "tool_calling"], "variants": [{"runtime": "llama.cpp", "quant": "Q4_K_M", "hf_repo": "Qwen/Qwen3-Next-80B-A3B-Instruct-GGUF", "size_gb": 41.0}, {"runtime": "mlx", "quant": "4bit", "hf_repo": "mlx-community/Qwen3.6-35B-A3B-Instruct-4bit", "size_gb": 41.0}, {"runtime": "vllm", "quant": "fp16", "hf_repo": "Qwen/Qwen3-Next-80B-A3B-Instruct", "size_gb": 145.0}]}'::jsonb),
 
   ('qwen25-coder-7b',
-   'Qwen2.5-Coder-7B-Instruct',
+   'Qwen3-Coder-7B-Instruct',
    'qwen',
    '7B',
    NULL,
@@ -2978,7 +2978,7 @@ VALUES
    '["text"]'::jsonb,
    '["en", "zh"]'::jsonb,
    'huggingface',
-   'Qwen/Qwen2.5-Coder-7B-Instruct',
+   'Qwen/Qwen3-Coder-7B-Instruct',
    NULL,
    NULL,
    NULL,
@@ -2994,10 +2994,10 @@ VALUES
    NULL,
    NULL,
    NULL,
-   '{"parameters": "7B", "tier": 1, "description": "Small coder model for lightweight autocomplete and fast iterations.", "gated": false, "preferred_workloads": ["code", "tool_calling"], "variants": [{"runtime": "llama.cpp", "quant": "Q4_K_M", "hf_repo": "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF", "size_gb": 4.5}, {"runtime": "mlx", "quant": "4bit", "hf_repo": "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit", "size_gb": 4.5}]}'::jsonb),
+   '{"parameters": "7B", "tier": 1, "description": "Small coder model for lightweight autocomplete and fast iterations.", "gated": false, "preferred_workloads": ["code", "tool_calling"], "variants": [{"runtime": "llama.cpp", "quant": "Q4_K_M", "hf_repo": "Qwen/Qwen3-Coder-7B-Instruct-GGUF", "size_gb": 4.5}, {"runtime": "mlx", "quant": "4bit", "hf_repo": "mlx-community/Qwen3-Coder-7B-Instruct-4bit", "size_gb": 4.5}]}'::jsonb),
 
   ('qwen25-vl-7b',
-   'Qwen2.5-VL-7B-Instruct',
+   'Qwen3-VL-8B-Instruct',
    'qwen',
    '7B',
    NULL,
@@ -3007,7 +3007,7 @@ VALUES
    '["text"]'::jsonb,
    '["en", "zh"]'::jsonb,
    'huggingface',
-   'Qwen/Qwen2.5-VL-7B-Instruct',
+   'Qwen/Qwen3-VL-8B-Instruct',
    NULL,
    NULL,
    NULL,
@@ -3023,10 +3023,10 @@ VALUES
    NULL,
    NULL,
    NULL,
-   '{"parameters": "7B", "tier": 1, "description": "Qwen2.5 vision-language model with strong OCR and chart understanding.", "gated": false, "preferred_workloads": ["vision", "chat"], "variants": [{"runtime": "llama.cpp", "quant": "Q4_K_M", "hf_repo": "bartowski/Qwen2.5-VL-7B-Instruct-GGUF", "size_gb": 5.0}, {"runtime": "mlx", "quant": "4bit", "hf_repo": "mlx-community/Qwen2.5-VL-7B-Instruct-4bit", "size_gb": 5.0}]}'::jsonb),
+   '{"parameters": "7B", "tier": 1, "description": "Qwen3 vision-language model with strong OCR and chart understanding.", "gated": false, "preferred_workloads": ["vision", "chat"], "variants": [{"runtime": "llama.cpp", "quant": "Q4_K_M", "hf_repo": "bartowski/Qwen3-VL-8B-Instruct-GGUF", "size_gb": 5.0}, {"runtime": "mlx", "quant": "4bit", "hf_repo": "mlx-community/Qwen3-VL-8B-Instruct-4bit", "size_gb": 5.0}]}'::jsonb),
 
   ('qwen25-vl-72b',
-   'Qwen2.5-VL-72B-Instruct',
+   'Qwen3-VL-30B-A3B-Instruct',
    'qwen',
    '72B',
    NULL,
@@ -3036,7 +3036,7 @@ VALUES
    '["text"]'::jsonb,
    '["en", "zh"]'::jsonb,
    'huggingface',
-   'Qwen/Qwen2.5-VL-72B-Instruct',
+   'Qwen/Qwen3-VL-30B-A3B-Instruct',
    NULL,
    NULL,
    NULL,
@@ -3052,7 +3052,7 @@ VALUES
    NULL,
    NULL,
    NULL,
-   '{"parameters": "72B", "tier": 3, "description": "Large vision-language model for complex multi-image and video reasoning.", "gated": false, "preferred_workloads": ["vision", "reasoning"], "variants": [{"runtime": "llama.cpp", "quant": "Q4_K_M", "hf_repo": "bartowski/Qwen2.5-VL-72B-Instruct-GGUF", "size_gb": 41.0}, {"runtime": "mlx", "quant": "4bit", "hf_repo": "mlx-community/Qwen2.5-VL-72B-Instruct-4bit", "size_gb": 41.0}]}'::jsonb),
+   '{"parameters": "72B", "tier": 3, "description": "Large vision-language model for complex multi-image and video reasoning.", "gated": false, "preferred_workloads": ["vision", "reasoning"], "variants": [{"runtime": "llama.cpp", "quant": "Q4_K_M", "hf_repo": "bartowski/Qwen3-VL-30B-A3B-Instruct-GGUF", "size_gb": 41.0}, {"runtime": "mlx", "quant": "4bit", "hf_repo": "mlx-community/Qwen3-VL-30B-A3B-Instruct-4bit", "size_gb": 41.0}]}'::jsonb),
 
   ('gemma3-27b',
    'Gemma 3 27B Instruct',
@@ -3519,7 +3519,7 @@ VALUES
    '{"parameters": "8B", "tier": 1, "description": "OpenMOSS audio-input multimodal LLM with chain-of-thought. Speech+text reasoning.", "gated": false, "preferred_workloads": ["audio", "reasoning", "multimodal"], "variants": [{"runtime": "vllm", "quant": "fp16", "hf_repo": "OpenMOSS-Team/MOSS-Audio-8B-Thinking", "size_gb": 16}]}'::jsonb),
 
   ('qwen25-72b-taxonomy',
-   'Qwen2.5-72B (taxonomy alias)',
+   'Qwen3.6-35B-A3B (taxonomy alias)',
    'qwen',
    '72B',
    NULL,
@@ -3529,7 +3529,7 @@ VALUES
    '["text"]'::jsonb,
    '["en", "zh"]'::jsonb,
    'huggingface',
-   'Qwen/Qwen2.5-72B-Instruct',
+   'Qwen/Qwen3-Next-80B-A3B-Instruct',
    NULL,
    NULL,
    NULL,
@@ -3545,7 +3545,7 @@ VALUES
    NULL,
    NULL,
    NULL,
-   '{"parameters": "72B", "tier": 3, "description": "Alias registration of Qwen2.5-72B under taxonomy id per 2026-04-18 spec.", "gated": false, "preferred_workloads": ["chat", "reasoning", "tool_calling"], "variants": [{"runtime": "llama.cpp", "quant": "Q4_K_M", "hf_repo": "Qwen/Qwen2.5-72B-Instruct-GGUF", "size_gb": 41.0, "context_window": 131072}]}'::jsonb),
+   '{"parameters": "72B", "tier": 3, "description": "Alias registration of Qwen3.6-35B-A3B under taxonomy id per 2026-04-18 spec.", "gated": false, "preferred_workloads": ["chat", "reasoning", "tool_calling"], "variants": [{"runtime": "llama.cpp", "quant": "Q4_K_M", "hf_repo": "Qwen/Qwen3-Next-80B-A3B-Instruct-GGUF", "size_gb": 41.0, "context_window": 131072}]}'::jsonb),
 
   ('llama-3.3-70b-instruct',
    'Llama 3.3 70B Instruct',
@@ -3721,8 +3721,8 @@ VALUES
    NULL,
    '{"parameters": "560M", "tier": 1, "description": "BAAI bge-reranker-large — cross-encoder reranker for high-precision retrieval.", "gated": false, "preferred_workloads": ["reranking", "retrieval"], "variants": [{"runtime": "pytorch", "quant": "fp16", "hf_repo": "BAAI/bge-reranker-large", "size_gb": 2.2, "context_window": 512}]}'::jsonb),
 
-  ('qwen2.5-vl-72b',
-   'Qwen2.5-VL-72B-Instruct (taxonomy)',
+  ('qwen3-vl-30b-a3b',
+   'Qwen3-VL-30B-A3B-Instruct (taxonomy)',
    'qwen',
    '72B',
    NULL,
@@ -3732,7 +3732,7 @@ VALUES
    '["text"]'::jsonb,
    '["en", "zh"]'::jsonb,
    'huggingface',
-   'Qwen/Qwen2.5-VL-72B-Instruct',
+   'Qwen/Qwen3-VL-30B-A3B-Instruct',
    NULL,
    NULL,
    NULL,
@@ -3748,7 +3748,7 @@ VALUES
    NULL,
    NULL,
    NULL,
-   '{"parameters": "72B", "tier": 3, "description": "Qwen2.5-VL 72B — flagship open VL for multi-image/video reasoning and document understanding.", "gated": false, "preferred_workloads": ["vision", "reasoning", "documents"], "variants": [{"runtime": "llama.cpp", "quant": "Q4_K_M", "hf_repo": "bartowski/Qwen2.5-VL-72B-Instruct-GGUF", "size_gb": 41.0, "context_window": 131072}, {"runtime": "mlx", "quant": "4bit", "hf_repo": "mlx-community/Qwen2.5-VL-72B-Instruct-4bit", "size_gb": 41.0, "context_window": 131072}, {"runtime": "vllm", "quant": "fp16", "hf_repo": "Qwen/Qwen2.5-VL-72B-Instruct", "size_gb": 145.0, "context_window": 131072}]}'::jsonb),
+   '{"parameters": "72B", "tier": 3, "description": "Qwen3-VL 30B-A3B — flagship open VL for multi-image/video reasoning and document understanding.", "gated": false, "preferred_workloads": ["vision", "reasoning", "documents"], "variants": [{"runtime": "llama.cpp", "quant": "Q4_K_M", "hf_repo": "bartowski/Qwen3-VL-30B-A3B-Instruct-GGUF", "size_gb": 41.0, "context_window": 131072}, {"runtime": "mlx", "quant": "4bit", "hf_repo": "mlx-community/Qwen3-VL-30B-A3B-Instruct-4bit", "size_gb": 41.0, "context_window": 131072}, {"runtime": "vllm", "quant": "fp16", "hf_repo": "Qwen/Qwen3-VL-30B-A3B-Instruct", "size_gb": 145.0, "context_window": 131072}]}'::jsonb),
 
   ('llama-3.2-vision-90b',
    'Llama 3.2 90B Vision Instruct',
@@ -6956,4 +6956,42 @@ SET alias               = EXCLUDED.alias,
     preferred_model_ids = EXCLUDED.preferred_model_ids,
     priority            = EXCLUDED.priority,
     notes               = EXCLUDED.notes;
+"#;
+
+// V100: Retire qwen2.5 catalog entries fleet-wide. Qwen released the
+// Qwen3 family, our text-gen workloads run on qwen3-coder-30b /
+// qwen36-35b-a3b, and the new vision flagship is Qwen3-VL-30B-A3B.
+// The qwen2.5* rows in fleet_model_catalog + model_catalog were
+// referencing repos we no longer download or serve. (Q3.1, 2026-05-19.)
+pub const SCHEMA_V100_RETIRE_QWEN25: &str = r#"
+DELETE FROM fleet_model_catalog
+ WHERE id IN ('qwen25-coder-32b', 'qwen25-72b', 'qwen25-coder-7b',
+              'qwen25-vl-7b', 'qwen25-vl-72b', 'qwen25-72b-taxonomy',
+              'qwen2.5-vl-72b');
+
+DELETE FROM model_catalog
+ WHERE id IN ('qwen25-coder-32b', 'qwen25-72b', 'qwen25-coder-7b',
+              'qwen25-vl-7b', 'qwen25-vl-72b', 'qwen25-72b-taxonomy',
+              'qwen2.5-vl-72b', 'qwen2-5-1-5b-instruct', 'qwen2-5-7b-instruct');
+
+-- Qwen3-VL replacements: 8B (small) and 30B-A3B (flagship MoE).
+INSERT INTO fleet_model_catalog (id, name, family, parameters, tier, gated, preferred_workloads, variants, description)
+VALUES
+  ('qwen3-vl-8b', 'Qwen3-VL-8B-Instruct', 'qwen', '8B', 1, false,
+   '["vision","chat"]'::jsonb,
+   '[{"runtime":"llama.cpp","quant":"Q4_K_M","hf_repo":"Qwen/Qwen3-VL-8B-Instruct-GGUF","size_gb":5.0},
+     {"runtime":"mlx","quant":"4bit","hf_repo":"mlx-community/Qwen3-VL-8B-Instruct-4bit","size_gb":5.0}]'::jsonb,
+   'Qwen3 vision-language — strong OCR + chart understanding.'),
+  ('qwen3-vl-30b-a3b', 'Qwen3-VL-30B-A3B-Instruct', 'qwen', '30B', 3, false,
+   '["vision","reasoning","documents"]'::jsonb,
+   '[{"runtime":"llama.cpp","quant":"Q4_K_M","hf_repo":"Qwen/Qwen3-VL-30B-A3B-Instruct-GGUF","size_gb":18.0},
+     {"runtime":"mlx","quant":"4bit","hf_repo":"mlx-community/Qwen3-VL-30B-A3B-Instruct-4bit","size_gb":18.0},
+     {"runtime":"vllm","quant":"fp16","hf_repo":"Qwen/Qwen3-VL-30B-A3B-Instruct","size_gb":60.0}]'::jsonb,
+   'Qwen3-VL flagship MoE — multi-image, video, document reasoning.')
+ON CONFLICT (id) DO UPDATE SET
+  name = EXCLUDED.name,
+  variants = EXCLUDED.variants,
+  preferred_workloads = EXCLUDED.preferred_workloads,
+  description = EXCLUDED.description,
+  updated_at = NOW();
 "#;

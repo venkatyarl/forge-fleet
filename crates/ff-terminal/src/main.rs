@@ -823,7 +823,7 @@ enum SessionCommand {
         #[arg(long)]
         name: String,
         /// Role tag (planner / coder / reviewer / browser / synthesiser).
-        /// When unset, the step uses the default LLM (qwen2.5-coder-32b).
+        /// When unset, the step uses the default LLM (qwen3-coder-30b).
         #[arg(long)]
         role: Option<String>,
         /// The LLM prompt this step should run.
@@ -1900,7 +1900,7 @@ pub enum ModelCommand {
     /// Benchmark a model against a standard prompt suite. Writes results
     /// into `model_catalog.benchmark_results` keyed by computer + timestamp.
     Benchmark {
-        /// Catalog id of the model to benchmark (e.g. `qwen2.5-coder`).
+        /// Catalog id of the model to benchmark (e.g. `qwen3-coder`).
         model_id: String,
         /// Target computer (default: current host).
         #[arg(long)]

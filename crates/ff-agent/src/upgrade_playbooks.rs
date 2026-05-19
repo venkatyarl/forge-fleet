@@ -85,6 +85,28 @@ pub fn playbook_for(tool: &str, os_family: &str) -> Option<String> {
                     </dev/null >/tmp/forgefleetd.log 2>&1 & disown )"
                 .into(),
         ),
+        // DGX Sparks: aarch64 + 4 cores. Default cargo parallelism uses all
+        // cores which OOMs LLVM passes during ff-gateway codegen (sia +
+        // beyonce both died with exit -1 on 2026-05-19). -j 2 keeps RAM
+        // pressure manageable. Same daemon-restart sequence as plain linux.
+        // (DGX.1, 2026-05-19.)
+        ("forgefleetd_git" | "forgefleetd", "linux-dgx") => Some(
+            ". \"$HOME/.cargo/env\" 2>/dev/null || true; \
+             cd ~/projects/forge-fleet && git reset --hard HEAD && \
+             git clean -fdx graphify-out node-compile-cache && \
+             git pull --ff-only && \
+             cargo build --bin forgefleetd --release -j 2 && \
+             install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && \
+             export XDG_RUNTIME_DIR=\"${XDG_RUNTIME_DIR:-/run/user/$(id -u)}\"; \
+             pkill -f 'forgefleetd --worker-name' 2>/dev/null; \
+             sleep 1; \
+             ( systemctl --user reset-failed forgefleetd.service 2>/dev/null; \
+               systemctl --user restart forgefleetd.service 2>/dev/null ) \
+               || ( pkill -TERM -f \"$HOME/.local/bin/forgefleetd\" 2>/dev/null; sleep 1; \
+                    nohup \"$HOME/.local/bin/forgefleetd\" --worker-name $(hostname -s) start \
+                    </dev/null >/tmp/forgefleetd.log 2>&1 & disown )"
+                .into(),
+        ),
         ("os", "linux") => Some("sudo apt-get update && sudo apt-get -y upgrade".into()),
         ("os", "macos") => Some("softwareupdate -i -a".into()),
         _ => None,

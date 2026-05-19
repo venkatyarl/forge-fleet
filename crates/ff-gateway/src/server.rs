@@ -4172,7 +4172,7 @@ mod fleet_visibility_tests {
                     last_heartbeat: old_heartbeat,
                     resources_json: "{}".to_string(),
                     services_json: "[]".to_string(),
-                    models_json: r#"["qwen2.5"]"#.to_string(),
+                    models_json: r#"["qwen3-coder-30b"]"#.to_string(),
                     capabilities_json: "{}".to_string(),
                     stale_degraded_after_secs: 60,
                     stale_offline_after_secs: 180,
@@ -4198,7 +4198,7 @@ mod fleet_visibility_tests {
         );
         assert_eq!(payload.nodes[0].status, "offline");
         assert_eq!(payload.nodes[0].source_kind, "runtime/db");
-        assert_eq!(payload.nodes[0].models_loaded, vec!["qwen2.5".to_string()]);
+        assert_eq!(payload.nodes[0].models_loaded, vec!["qwen3-coder-30b".to_string()]);
     }
 }
 
@@ -6633,7 +6633,7 @@ async fn create_agent_session(
 ) -> Result<Json<CreateAgentSessionResponse>, (StatusCode, Json<Value>)> {
     let model = req
         .model
-        .unwrap_or_else(|| "Qwen2.5-Coder-32B-Instruct-Q4_K_M.gguf".to_string());
+        .unwrap_or_else(|| "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf".to_string());
     let llm_base_url = req
         .llm_base_url
         .unwrap_or_else(|| "http://192.168.5.102:51000".to_string());

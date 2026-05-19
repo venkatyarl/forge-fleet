@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 pub struct CounselConfig {
     /// Whether counsel mode is enabled for this work item.
     pub enabled: bool,
-    /// Models to consult (e.g., ["qwen2.5-72b", "gemma-4-31b"]).
+    /// Models to consult (e.g., ["qwen36-35b-a3b", "gemma-4-31b"]).
     pub models: Vec<String>,
 }
 

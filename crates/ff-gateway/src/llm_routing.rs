@@ -919,7 +919,7 @@ fn compute_load_score(beat: &PulseBeatV2, server: &LlmServer) -> f64 {
 /// can be matched against user-supplied model names.
 ///
 /// Handles (at least):
-/// - Ollama tags: `qwen2.5-coder:14b` → `qwen2.5-coder`
+/// - Ollama tags: `qwen3-coder-30b` → `qwen3-coder`
 /// - GGUF files: `Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf` →
 ///   `qwen3-coder-30b-a3b-instruct`
 /// - Mixed case + underscore separators → lowercased, dashed
@@ -1044,7 +1044,7 @@ pub fn error_to_response(err: LlmRoutingError) -> (u16, Value) {
 // milliseconds to sub-millisecond.
 //
 // Cache keys are normalized via `normalize_model_id`, so a request for
-// `qwen2.5-coder:7b` and the server-reported id `Qwen2.5-Coder-7B-Instruct`
+// `qwen3-coder:7b` and the server-reported id `Qwen3-Coder-7B-Instruct`
 // both hit the same slot.
 
 /// Redis pub/sub channel that the warmer listens on for immediate
@@ -1468,9 +1468,9 @@ mod tests {
 
     #[test]
     fn normalize_strips_ollama_tag() {
-        assert_eq!(normalize_model_id("qwen2.5-coder:14b"), "qwen2.5-coder");
-        assert_eq!(normalize_model_id("qwen2.5-coder:latest"), "qwen2.5-coder");
-        assert_eq!(normalize_model_id("Qwen2.5-Coder:14B"), "qwen2.5-coder");
+        assert_eq!(normalize_model_id("qwen3-coder-30b"), "qwen3-coder");
+        assert_eq!(normalize_model_id("qwen3-coder:latest"), "qwen3-coder");
+        assert_eq!(normalize_model_id("Qwen3-Coder:14B"), "qwen3-coder");
     }
 
     #[test]
@@ -1480,18 +1480,18 @@ mod tests {
             "qwen3-coder-30b-a3b-instruct"
         );
         assert_eq!(
-            normalize_model_id("Qwen2.5-Coder-32B-Instruct-Q8_0.gguf"),
-            "qwen2.5-coder-32b-instruct"
+            normalize_model_id("Qwen3-Coder-30B-A3B-Instruct-Q8_0.gguf"),
+            "qwen3-coder-30b-instruct"
         );
     }
 
     #[test]
     fn normalize_prefix_match_bare_vs_tagged() {
         // Bare name vs ollama-tagged server: both normalize to the same stem.
-        let bare = normalize_model_id("qwen2.5-coder");
-        let tagged = normalize_model_id("qwen2.5-coder:14b");
+        let bare = normalize_model_id("qwen3-coder");
+        let tagged = normalize_model_id("qwen3-coder-30b");
         assert_eq!(bare, tagged);
-        assert_eq!(bare, "qwen2.5-coder");
+        assert_eq!(bare, "qwen3-coder");
     }
 
     #[test]
@@ -1542,7 +1542,7 @@ mod tests {
     fn qwen3_floor_noop_for_non_qwen3_models() {
         // Non-qwen3 model — even with max_tokens=16, no floor applies.
         let mut body = json!({ "model": "coder", "max_tokens": 16 });
-        apply_qwen3_max_tokens_floor(&mut body, "qwen2.5-coder-32b");
+        apply_qwen3_max_tokens_floor(&mut body, "qwen3-coder-30b");
         assert_eq!(body["max_tokens"].as_u64().unwrap(), 16);
     }
 

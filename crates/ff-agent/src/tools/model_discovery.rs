@@ -133,13 +133,13 @@ impl AgentTool for ModelDiscoveryTool {
                         AgentToolResult::ok(
                             "Ollama Popular Models:\n\n\
   Coding:\n\
-    - qwen2.5-coder:32b (20GB) — best open coding model\n\
-    - qwen2.5-coder:14b (9GB) — balanced coding\n\
+    - qwen3-coder-30b (20GB) — best open coding model\n\
+    - qwen3-coder-30b (9GB) — balanced coding\n\
     - codestral:22b (12GB) — Mistral's coding model\n\
     - deepseek-coder-v2:16b (9GB) — strong code generation\n\
     - starcoder2:15b (9GB) — code completion\n\n\
   General:\n\
-    - qwen2.5:72b (45GB) — best open general model\n\
+    - qwen36-35b-a3b (45GB) — best open general model\n\
     - llama3.2:3b (2GB) — ultra fast, good for simple tasks\n\
     - gemma2:27b (15GB) — Google's model\n\
     - mixtral:8x22b (79GB) — MoE architecture\n\n\
@@ -184,7 +184,7 @@ impl AgentTool for ModelDiscoveryTool {
                                         likes
                                     ));
                                 }
-                                output.push_str("\nFor GGUF versions, search: <model>-GGUF (e.g. 'Qwen/Qwen2.5-Coder-32B-Instruct-GGUF')");
+                                output.push_str("\nFor GGUF versions, search: <model>-GGUF (e.g. 'Qwen/Qwen3-Coder-30B-A3B-Instruct-GGUF')");
                                 AgentToolResult::ok(output)
                             }
                             Err(e) => AgentToolResult::err(format!("Parse error: {e}")),
@@ -395,19 +395,19 @@ fn recommend_engines(hardware: &str, ram_gb: u64) -> String {
     output.push_str(&format!("\n## Model Sizes for {ram_gb}GB RAM:\n"));
     if ram_gb >= 128 {
         output.push_str("  - Can run: 405B (Q4) or multiple 70B models simultaneously\n");
-        output.push_str("  - Recommended: Llama-3.1-405B, Qwen2.5-72B, 2× Qwen2.5-Coder-32B\n");
+        output.push_str("  - Recommended: Llama-3.1-405B, Qwen3.6-35B-A3B, 2× Qwen3-Coder-30B-A3B\n");
     } else if ram_gb >= 64 {
         output.push_str("  - Can run: 72B (Q4) or 2× 32B models\n");
-        output.push_str("  - Recommended: Qwen2.5-72B, Llama-3.1-70B\n");
+        output.push_str("  - Recommended: Qwen3.6-35B-A3B, Llama-3.1-70B\n");
     } else if ram_gb >= 32 {
         output.push_str("  - Can run: 32B (Q4) or 2× 14B models\n");
-        output.push_str("  - Recommended: Qwen2.5-Coder-32B, DeepSeek-R1-32B\n");
+        output.push_str("  - Recommended: Qwen3-Coder-30B-A3B, DeepSeek-R1-32B\n");
     } else if ram_gb >= 16 {
         output.push_str("  - Can run: 14B (Q4) or 7B (Q8)\n");
-        output.push_str("  - Recommended: Qwen2.5-Coder-14B, Llama-3.2-8B\n");
+        output.push_str("  - Recommended: Qwen3-Coder-30B-A3B, Llama-3.2-8B\n");
     } else {
         output.push_str("  - Can run: 3B-7B models\n");
-        output.push_str("  - Recommended: Llama-3.2-3B, Qwen2.5-3B\n");
+        output.push_str("  - Recommended: Llama-3.2-3B, Qwen3.6-35B-A3B\n");
     }
 
     output

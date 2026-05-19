@@ -3733,7 +3733,7 @@ mod tests {
                 last_heartbeat: now,
                 resources_json: r#"{"cpu":"16 cores","ram":"64 GB","gpu":"A100"}"#.to_string(),
                 services_json: r#"["gateway","runner"]"#.to_string(),
-                models_json: r#"["qwen2.5-32b","llama-3.1-8b"]"#.to_string(),
+                models_json: r#"["qwen3-coder-30b","llama-3.1-8b"]"#.to_string(),
                 capabilities_json: r#"{"tool_exec":true,"voice":false}"#.to_string(),
                 stale_degraded_after_secs: 45,
                 stale_offline_after_secs: 120,

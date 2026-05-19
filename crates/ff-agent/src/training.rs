@@ -193,7 +193,7 @@ pub struct LoraConfig {
 impl Default for LoraConfig {
     fn default() -> Self {
         Self {
-            base_model: "Qwen/Qwen2.5-Coder-32B-Instruct".into(),
+            base_model: "Qwen/Qwen3-Coder-30B-A3B-Instruct".into(),
             dataset_path: "~/.forgefleet/training_data/dataset.jsonl".into(),
             output_dir: "~/.forgefleet/lora_adapters/forgefleet-v1".into(),
             epochs: 3,
@@ -306,10 +306,10 @@ impl PromptLibrary {
 
 Fleet nodes:
 - Taylor (192.168.5.100) user:venkat — leader, Mac Studio 96GB
-- Marcus (192.168.5.102) user:marcus — Ubuntu 32GB, Qwen2.5-Coder-32B
-- Sophie (192.168.5.103) user:sophie — Ubuntu 32GB, Qwen2.5-Coder-32B
-- Priya  (192.168.5.104) user:priya  — Ubuntu 32GB, Qwen2.5-Coder-32B
-- James  (192.168.5.108) user:james  — Mac mini 64GB, Qwen2.5-72B
+- Marcus (192.168.5.102) user:marcus — Ubuntu 32GB, Qwen3-Coder-30B-A3B
+- Sophie (192.168.5.103) user:sophie — Ubuntu 32GB, Qwen3-Coder-30B-A3B
+- Priya  (192.168.5.104) user:priya  — Ubuntu 32GB, Qwen3-Coder-30B-A3B
+- James  (192.168.5.108) user:james  — Mac mini 64GB, Qwen3.6-35B-A3B
 
 To SSH: ssh user@ip 'command here'
 Always include a command — never open interactive SSH."#.into(),
