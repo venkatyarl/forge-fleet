@@ -4608,6 +4608,15 @@ async fn proxy_chat_completions(
     headers: HeaderMap,
     Json(mut raw_payload): Json<Value>,
 ) -> Result<Response<Body>, (StatusCode, Json<Value>)> {
+    // GW.2 trace breadcrumbs — each `info!` writes a line so we can see
+    // exactly where the handler stalls on worker-node gateways.
+    let _trace_model = raw_payload
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?")
+        .to_string();
+    info!(model = %_trace_model, "GW.2: chat handler entered");
+
     // ── Session affinity hint from header ────────────────────────────
     // Clients may pass X-ForgeFleet-Session to explicitly pin a
     // conversation to a specific affinity key. This overrides the
@@ -4660,6 +4669,7 @@ async fn proxy_chat_completions(
         return Ok(Json(ticket).into_response());
     }
 
+    info!(model = %_trace_model, "GW.2: pre-cloud_llm");
     // ── Cloud-LLM routing (first pass) ───────────────────────────────
     //
     // If the `model` field matches a row in `cloud_llm_providers`
@@ -4726,6 +4736,7 @@ async fn proxy_chat_completions(
         warn!("chat completion payload is not a JSON object; skipping qwen3 max_tokens floor");
     }
 
+    info!(model = %_trace_model, "GW.2: pre-pulse-router");
     // ── Pulse-first routing ──────────────────────────────────────────
     //
     // We try the Pulse router first. If it successfully picks a server
