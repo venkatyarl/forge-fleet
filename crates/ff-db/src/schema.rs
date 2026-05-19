@@ -7054,3 +7054,26 @@ DELETE FROM fleet_model_catalog
 DELETE FROM model_catalog
  WHERE id IN ('qwen2-vl-7b', 'qwen2-vl-7b-instruct');
 "#;
+
+// V104: Replace `& disown` with `( setsid ... & )` in the upgrade
+// playbook. `disown` is a bash builtin not present in dash (default
+// /bin/sh on Ubuntu/Debian), so V102's nohup-detach wrapper failed
+// with `exit 127: sh: 1: disown: not found` on Linux workers.
+//
+// `( setsid sh -c "..." & )` does the same thing in POSIX sh:
+//   - parens spawn a subshell that exits immediately
+//   - setsid creates a new session, fully detaching from the parent
+//   - the daemon restart proceeds after the wave task already
+//     reported success
+pub const SCHEMA_V104_WAVE_DISOWN_FIX: &str = r#"
+UPDATE software_registry
+   SET upgrade_playbook = jsonb_build_object(
+     'macos',
+       'export PATH="$HOME/.cargo/bin:$PATH" && mkdir -p "$(dirname {{source_tree_path}})" && { [ -d "{{source_tree_path}}/.git" ] || git clone https://github.com/venkatyarl/forge-fleet "{{source_tree_path}}"; } && cd "{{source_tree_path}}" && git fetch origin main && git reset --hard origin/main && cargo build --release -p forge-fleet -p ff-terminal && install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && install -m 755 target/release/ff ~/.local/bin/ff && codesign --force --sign - ~/.local/bin/forgefleetd ~/.local/bin/ff && ( setsid sh -c "sleep 1; launchctl kickstart -k gui/$(id -u)/com.forgefleet.forgefleetd" </dev/null >/dev/null 2>&1 & )',
+     'linux-ubuntu',
+       'export PATH="$HOME/.cargo/bin:$PATH" && export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" && mkdir -p "$(dirname $HOME/.forgefleet/sub-agent-0/forge-fleet)" && { [ -d "$HOME/.forgefleet/sub-agent-0/forge-fleet/.git" ] || git clone https://github.com/venkatyarl/forge-fleet "$HOME/.forgefleet/sub-agent-0/forge-fleet"; } && cd "$HOME/.forgefleet/sub-agent-0/forge-fleet" && git fetch origin main && git reset --hard origin/main && cargo build --release -p forge-fleet -p ff-terminal && install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && install -m 755 target/release/ff ~/.local/bin/ff && ( setsid sh -c "sleep 2; MAIN=$(systemctl --user show -p MainPID forgefleetd.service 2>/dev/null | cut -d= -f2); for p in $(pgrep -f ''forgefleetd --worker-name''); do [ \"$p\" = \"$MAIN\" ] && continue; kill -TERM $p 2>/dev/null || true; done; systemctl --user reset-failed forgefleetd.service 2>/dev/null; systemctl --user restart --no-block forgefleetd.service" </dev/null >/dev/null 2>&1 & )',
+     'linux-dgx',
+       'export PATH="$HOME/.cargo/bin:$PATH" && export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" && mkdir -p "$(dirname $HOME/.forgefleet/sub-agent-0/forge-fleet)" && { [ -d "$HOME/.forgefleet/sub-agent-0/forge-fleet/.git" ] || git clone https://github.com/venkatyarl/forge-fleet "$HOME/.forgefleet/sub-agent-0/forge-fleet"; } && cd "$HOME/.forgefleet/sub-agent-0/forge-fleet" && git fetch origin main && git reset --hard origin/main && cargo build --release -p forge-fleet -p ff-terminal -j 2 && install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && install -m 755 target/release/ff ~/.local/bin/ff && ( setsid sh -c "sleep 2; MAIN=$(systemctl --user show -p MainPID forgefleetd.service 2>/dev/null | cut -d= -f2); for p in $(pgrep -f ''forgefleetd --worker-name''); do [ \"$p\" = \"$MAIN\" ] && continue; kill -TERM $p 2>/dev/null || true; done; systemctl --user reset-failed forgefleetd.service 2>/dev/null; systemctl --user restart --no-block forgefleetd.service" </dev/null >/dev/null 2>&1 & )'
+   )
+ WHERE id='forgefleetd_git';
+"#;

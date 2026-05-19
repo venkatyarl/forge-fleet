@@ -647,6 +647,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "retire_qwen2_vl",
         sql: schema::SCHEMA_V103_RETIRE_QWEN2_VL,
     },
+    PgMigration {
+        version: 104,
+        name: "wave_disown_fix",
+        sql: schema::SCHEMA_V104_WAVE_DISOWN_FIX,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.
