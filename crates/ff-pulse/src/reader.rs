@@ -236,6 +236,7 @@ impl PulseReader {
         pg: &sqlx::PgPool,
         requested: &str,
     ) -> Result<Option<(String, LlmServer)>, PulseError> {
+        tracing::info!(model = %requested, "GW.2 reader: pre-pg-query");
         // 1. Alias lookup. Swallow DB errors so an unreachable Postgres
         //    still lets exact-id routing work.
         let pool_members: Option<Vec<String>> = sqlx::query_scalar::<_, String>(
@@ -250,6 +251,7 @@ impl PulseReader {
         .ok()
         .flatten()
         .and_then(|s| serde_json::from_str(&s).ok());
+        tracing::info!(model = %requested, "GW.2 reader: post-pg-query");
 
         let candidate_ids: Vec<String> = match pool_members {
             Some(members) if !members.is_empty() => members,
@@ -265,8 +267,10 @@ impl PulseReader {
             .map(|id| normalize_model_id(id))
             .collect();
 
+        tracing::info!(model = %requested, "GW.2 reader: pre-all-beats");
         // 2. Collect matches across every beat (normalized eq / prefix).
         let beats = self.all_beats().await?;
+        tracing::info!(model = %requested, count = beats.len(), "GW.2 reader: post-all-beats");
         let mut candidates: Vec<(String, LlmServer)> = Vec::new();
         for b in beats {
             if b.going_offline {
