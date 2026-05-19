@@ -76,6 +76,8 @@ pub fn playbook_for(tool: &str, os_family: &str) -> Option<String> {
              cargo build --bin forgefleetd --release && \
              install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && \
              export XDG_RUNTIME_DIR=\"${XDG_RUNTIME_DIR:-/run/user/$(id -u)}\"; \
+             pkill -f 'forgefleetd --worker-name' 2>/dev/null; \
+             sleep 1; \
              ( systemctl --user reset-failed forgefleetd.service 2>/dev/null; \
                systemctl --user restart forgefleetd.service 2>/dev/null ) \
                || ( pkill -TERM -f \"$HOME/.local/bin/forgefleetd\" 2>/dev/null; sleep 1; \
