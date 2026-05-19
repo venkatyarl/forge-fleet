@@ -1063,17 +1063,25 @@ async fn call_fleet_llm(
     }
 
     // Determine LLM endpoint: try fleet_model_deployments for an active
-    // deployment, otherwise fall back to the default.
+    // deployment, otherwise fall back to the default. Then probe
+    // `/v1/models` on the endpoint to learn what model name to send —
+    // sending "default" works for some servers but fails on llama-server
+    // / mlx_lm.server / vllm, where the model id is path-or-repo-shaped
+    // and the server proxies unknown names to Huggingface and 404s.
     let endpoint = resolve_llm_endpoint(pool).await;
+    let model_id = probe_endpoint_model(client, &endpoint)
+        .await
+        .unwrap_or_else(|| "default".to_string());
 
     debug!(
         endpoint = %endpoint,
+        model = %model_id,
         history_msgs = history.len(),
         "sending brain chat request to fleet LLM"
     );
 
     let request_body = json!({
-        "model": "default",
+        "model": model_id,
         "messages": messages,
         "max_tokens": 1024,
         "temperature": 0.7,
@@ -1111,6 +1119,34 @@ async fn call_fleet_llm(
     Ok(content)
 }
 
+/// Replace the trailing `/v1/chat/completions` with `/v1/models`, fetch
+/// the model list, and return the first model id. Returns None on any
+/// HTTP/JSON failure so the caller can fall back to "default".
+async fn probe_endpoint_model(client: &reqwest::Client, chat_endpoint: &str) -> Option<String> {
+    let models_url = chat_endpoint
+        .strip_suffix("/v1/chat/completions")
+        .map(|base| format!("{base}/v1/models"))
+        .unwrap_or_else(|| chat_endpoint.replace("chat/completions", "models"));
+    let resp = client
+        .get(&models_url)
+        .timeout(std::time::Duration::from_secs(2))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let v: serde_json::Value = resp.json().await.ok()?;
+    let first_id = v
+        .get("data")?
+        .as_array()?
+        .first()?
+        .get("id")?
+        .as_str()?
+        .to_string();
+    Some(first_id)
+}
+
 /// Try to find an active LLM deployment from the fleet DB, otherwise
 /// fall back to the hardcoded default endpoint.
 async fn resolve_llm_endpoint(pool: &PgPool) -> String {
@@ -1120,10 +1156,25 @@ async fn resolve_llm_endpoint(pool: &PgPool) -> String {
         Err(_) => return DEFAULT_LLM_ENDPOINT.to_string(),
     };
 
-    // Find first deployment with healthy status
+    // Find first deployment with healthy status. Prefer Taylor's local
+    // mlx (lowest latency for the leader-bound telegram polling task),
+    // then any other healthy chat-shaped deployment (skip embedding-only
+    // models like bge-m3 that don't speak /v1/chat/completions).
+    let chatty = |d: &&ff_db::ModelDeploymentRow| {
+        let cid = d.catalog_id.as_deref().unwrap_or("");
+        !cid.starts_with("bge-") && !cid.contains("embed")
+    };
     let deployment = deployments
         .iter()
-        .find(|d| d.health_status == "healthy" || d.health_status == "ok");
+        .filter(|d| d.health_status == "healthy" || d.health_status == "ok")
+        .filter(chatty)
+        .find(|d| d.worker_name == "taylor" && d.runtime.contains("mlx"))
+        .or_else(|| {
+            deployments
+                .iter()
+                .filter(|d| d.health_status == "healthy" || d.health_status == "ok")
+                .find(chatty)
+        });
 
     let deployment = match deployment {
         Some(d) => d,

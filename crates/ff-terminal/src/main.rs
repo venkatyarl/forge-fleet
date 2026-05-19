@@ -51,6 +51,7 @@ mod helpers;
 mod lifecycle_cmd;
 mod llm_cmd;
 mod logs_cmd;
+mod mcp_cmd;
 mod metrics_cmd;
 mod model_cmd;
 mod model_serve_cmd;
@@ -63,10 +64,12 @@ mod project_cmd;
 mod research_cmd;
 mod secrets_cmd;
 mod self_heal_cmd;
+mod skills_cmd;
 mod social_cmd;
 mod software_cmd;
 mod status_cmd;
 mod storage_cmd;
+mod swarm_cmd;
 mod task_cmd;
 mod tasks_cmd;
 mod tools_cmd;
@@ -346,6 +349,30 @@ enum Command {
     Github {
         #[command(subcommand)]
         command: GithubCommand,
+    },
+    /// MCP server installer — wire the local forgefleet MCP into each
+    /// coding-agent (Claude Code, Codex, Kimi, Cursor, Windsurf, Goose)
+    /// so they default to `fleet_run` / `fleet_crew` / `brain_search`
+    /// instead of bash / web-fetch. Source of truth: per-tool config
+    /// files under `$HOME`.
+    Mcp {
+        #[command(subcommand)]
+        command: mcp_cmd::McpCommand,
+    },
+    /// Manage the V105 skills catalog: import git repos of SKILL.md
+    /// files, list/show/sync to disk, remove or retire entries. The
+    /// runtime skill_catalog reader picks them up at session start.
+    Skills {
+        #[command(subcommand)]
+        command: skills_cmd::SkillsCommand,
+    },
+    /// Fleet-wide swarm orchestration: plan → fan out N sub-tasks
+    /// across fleet computers via fleet_tasks → synthesize a final
+    /// result. The horizontal alternative to Kimi K2.6's cloud-only
+    /// 300-agent swarm — runs on YOUR hardware at $0/token.
+    Swarm {
+        #[command(subcommand)]
+        command: swarm_cmd::SwarmCommand,
     },
     /// Self-service onboarding helpers (show curl command, list recent, revoke).
     Onboard {
@@ -2239,6 +2266,15 @@ async fn main() -> Result<()> {
         Some(Command::Github { command }) => {
             return github_cmd::handle_github(command.clone()).await;
         }
+        Some(Command::Mcp { command }) => {
+            return mcp_cmd::handle_mcp(command.clone()).await;
+        }
+        Some(Command::Skills { command }) => {
+            return skills_cmd::handle_skills(command.clone()).await;
+        }
+        Some(Command::Swarm { command }) => {
+            return swarm_cmd::handle_swarm(command.clone()).await;
+        }
         Some(Command::Onboard { command }) => {
             return onboard_cmd::handle_onboard(command.clone()).await;
         }
@@ -2443,6 +2479,9 @@ async fn main() -> Result<()> {
         Some(Command::Software { command }) => software_cmd::handle_software(command).await,
         Some(Command::Ext { command }) => ext_cmd::handle_ext(command).await,
         Some(Command::Github { command }) => github_cmd::handle_github(command).await,
+        Some(Command::Mcp { command }) => mcp_cmd::handle_mcp(command).await,
+        Some(Command::Skills { command }) => skills_cmd::handle_skills(command).await,
+        Some(Command::Swarm { command }) => swarm_cmd::handle_swarm(command).await,
         Some(Command::Onboard { command }) => onboard_cmd::handle_onboard(command).await,
         Some(Command::VirtualBrain { command }) => brain_cmd::handle_brain(command).await,
         Some(Command::Openclaw { command }) => openclaw_cmd::handle_openclaw(command).await,

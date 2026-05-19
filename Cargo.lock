@@ -1728,6 +1728,7 @@ dependencies = [
  "sha2 0.10.9",
  "shellexpand",
  "sqlx",
+ "tempfile",
  "tokio",
  "toml 0.8.23",
  "tracing",

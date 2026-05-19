@@ -187,22 +187,17 @@ fn discover_with_sources(working_dir: &Path, sources: &[SkillSource]) -> Vec<Ski
         if !root.is_dir() {
             continue;
         }
-        let entries = match std::fs::read_dir(&root) {
-            Ok(e) => e,
-            Err(e) => {
-                debug!(root = %root.display(), error = %e, "skill_catalog: read_dir failed");
-                continue;
-            }
-        };
-        for entry in entries.flatten() {
-            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                continue;
-            }
-            let skill_dir = entry.path();
-            let manifest = skill_dir.join("SKILL.md");
-            if !manifest.is_file() {
-                continue;
-            }
+        // Walk recursively up to MAX_DEPTH levels — older layouts use
+        // `<root>/<skill>/SKILL.md` (depth=1), our V105 materializer
+        // writes `<root>/<source>/<family>/<skill>/SKILL.md` (depth=3).
+        // Cap depth so we don't accidentally scan giant trees.
+        const MAX_DEPTH: usize = 4;
+        let manifests = collect_skill_manifests(&root, MAX_DEPTH);
+        for manifest in manifests {
+            let skill_dir = match manifest.parent() {
+                Some(p) => p.to_path_buf(),
+                None => continue,
+            };
             let id = skill_dir
                 .file_name()
                 .and_then(|s| s.to_str())
@@ -252,6 +247,43 @@ fn parse_skill(manifest: &Path, id: &str, root_label: &str) -> Option<Skill> {
         source_path: manifest.to_path_buf(),
         source_root: root_label.to_string(),
     })
+}
+
+/// Collect every `SKILL.md` path under `root` up to `max_depth` levels
+/// deep. Depth 1 means `<root>/<name>/SKILL.md`; depth 3 also catches
+/// `<root>/<source>/<family>/<name>/SKILL.md` (our V105 layout).
+/// Returns paths sorted so deterministic priority resolution sees
+/// shallower matches first (rare-case dedupe — `by_id.contains_key`
+/// is the real dedupe).
+fn collect_skill_manifests(root: &std::path::Path, max_depth: usize) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
+    while let Some((dir, depth)) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let ft = match entry.file_type() {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+            if ft.is_file()
+                && path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.eq_ignore_ascii_case("SKILL.md"))
+                    .unwrap_or(false)
+            {
+                out.push(path);
+            } else if ft.is_dir() && depth < max_depth {
+                stack.push((path, depth + 1));
+            }
+        }
+    }
+    out.sort();
+    out
 }
 
 fn truncate_str(s: &str, max_chars: usize) -> String {

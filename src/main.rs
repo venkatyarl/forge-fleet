@@ -486,12 +486,20 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         subsystem_tasks.push(h);
     }
 
-    // 7) telegram polling transport (bidirectional control channel)
-    if config
-        .transport
-        .telegram
-        .as_ref()
-        .is_some_and(|telegram| telegram.enabled)
+    // 7) telegram polling transport (bidirectional control channel).
+    // Gate on worker_name == "taylor": Telegram only allows a single
+    // long-poll holder per bot token. Without this gate, 15 fleet
+    // daemons race for getUpdates() and each gets 409 Conflict every
+    // ~5s; nothing usable comes through. Taylor (leader) holds the
+    // session; other daemons skip the subsystem entirely.
+    let telegram_owner = std::env::var("FORGEFLEET_TELEGRAM_OWNER")
+        .unwrap_or_else(|_| "taylor".to_string());
+    if worker_name == telegram_owner
+        && config
+            .transport
+            .telegram
+            .as_ref()
+            .is_some_and(|telegram| telegram.enabled)
     {
         // Fallback: if the token env var / inline config is empty, pull the
         // bot token from fleet_secrets (`telegram.bot_token`) and export it

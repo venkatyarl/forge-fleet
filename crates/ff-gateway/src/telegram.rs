@@ -34,9 +34,14 @@ pub struct TelegramClient {
 
 impl TelegramClient {
     pub fn new(token: impl Into<String>) -> anyhow::Result<Self> {
+        // Telegram `getUpdates` long-poll holds the connection open up to
+        // `timeout_secs` (default 30s; we pass up to 30s from fleet.toml).
+        // Set client timeout well above that so long-polls don't race the
+        // request deadline. 90s gives 60s of headroom — short enough that
+        // a wedged proxy still fails fast.
         let http_client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .pool_idle_timeout(std::time::Duration::from_secs(30))
+            .timeout(std::time::Duration::from_secs(90))
+            .pool_idle_timeout(std::time::Duration::from_secs(120))
             .build()
             .context("failed to create telegram reqwest client")?;
 
