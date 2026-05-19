@@ -745,6 +745,8 @@ impl PulseLlmRouter {
             .and_then(|v| v.as_str())
             .ok_or(LlmRoutingError::MissingModel)?;
 
+        tracing::info!("GW.2 rcc: pre-resolve_target");
+
         // From here on we mutate (stream downgrade + model rewrite) so clone once.
         let mut body = body.clone();
         if body.get("stream").and_then(|v| v.as_bool()) == Some(true) {
@@ -753,6 +755,7 @@ impl PulseLlmRouter {
 
         let session_key = extract_session_key(&body);
         let (routed, url, body) = self.resolve_target(body, cache, pg).await?;
+        tracing::info!(computer = %routed.computer, "GW.2 rcc: post-resolve_target");
         self.record_affinity(session_key, &routed);
 
         tracing::debug!(

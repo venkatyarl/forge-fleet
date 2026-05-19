@@ -4745,6 +4745,7 @@ async fn proxy_chat_completions(
     // find a matching server OR its upstream call fails outright do we
     // fall through to the legacy tier-router path.
     if let Some(pulse) = state.pulse_router.clone() {
+        info!(model = %_trace_model, "GW.2: pulse-router cloned");
         let cache_ref = state.pulse_cache.as_deref();
         // Hand the Pulse router the PG pool so it can expand pool aliases
         // (`fleet_task_coverage.alias`, schema V27) before doing the
@@ -4754,6 +4755,7 @@ async fn proxy_chat_completions(
             .get("stream")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        info!(model = %_trace_model, has_cache = cache_ref.is_some(), has_pg = pg_ref.is_some(), is_streaming, "GW.2: pre-route-completion-call");
 
         if is_streaming {
             match pulse
