@@ -225,8 +225,16 @@ async fn execute_shell(
         Some(_) => false,
     };
 
+    // Every shell command runs through a wrapper that prepends `~/.local/bin`
+    // and `~/.cargo/bin` to PATH. `sh -c` on Ubuntu invokes dash, which does
+    // not source ~/.bashrc, so `ff`-flavoured commands (`ff model download
+    // ...`, `ff fleet ...`) get "command not found" without this prefix.
+    // Caught 2026-05-18 when the first gemma-4 download dispatch hit
+    // `exit 127: sh: 1: ff: not found` on duncan.
+    let wrapped = format!("export PATH=\"$HOME/.local/bin:$HOME/.cargo/bin:$PATH\" && {command}");
+
     let (program, args): (&str, Vec<String>) = if local {
-        ("sh", vec!["-c".into(), command.to_string()])
+        ("sh", vec!["-c".into(), wrapped])
     } else {
         let node_name = target_node.unwrap();
         let Some(node) = nodes
@@ -248,7 +256,7 @@ async fn execute_shell(
                 "-o".into(),
                 "StrictHostKeyChecking=accept-new".into(),
                 dest,
-                command.to_string(),
+                wrapped,
             ],
         )
     };
