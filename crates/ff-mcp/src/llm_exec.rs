@@ -166,47 +166,46 @@ impl GatewayLlmExec {
     }
 
     /// Judge endpoint resolver — picks any healthy `family='gemma'`
-    /// deployment, falling back to Taylor's known gemma-4 on :55000.
-    /// Family-based selection is correct here: we explicitly want a
-    /// *third-party-family* judge (independent of Qwen-family generation
-    /// tiers) to avoid same-family bias.
-    async fn judge_endpoint(&self) -> (String, String) {
-        if let Some(pool) = &self.pool {
-            let row = sqlx::query(
-                r#"
-                SELECT d.port,
-                       COALESCE(c.primary_ip, w.name) AS host,
-                       d.catalog_id
-                  FROM fleet_model_deployments d
-                  JOIN fleet_model_catalog cat ON cat.id = d.catalog_id
-                  LEFT JOIN fleet_workers w     ON w.name = d.worker_name
-                  LEFT JOIN computers c         ON LOWER(c.name) = LOWER(d.worker_name)
-                 WHERE d.health_status = 'healthy'
-                   AND cat.family = 'gemma'
-                 ORDER BY d.last_health_at DESC NULLS LAST
-                 LIMIT 1
-                "#,
-            )
-            .fetch_optional(pool)
-            .await
-            .ok()
-            .flatten();
-            if let Some(row) = row {
-                use sqlx::Row;
-                if let (Ok(port), Ok(host), Ok(catalog_id)) = (
-                    row.try_get::<i32, _>("port"),
-                    row.try_get::<String, _>("host"),
-                    row.try_get::<String, _>("catalog_id"),
-                ) {
-                    return (format!("http://{host}:{port}"), catalog_id);
-                }
-            }
-        }
-        // Fallback: Taylor's mlx gemma-4.
-        (
-            "http://192.168.5.100:55000".into(),
-            "/Users/venkat/models/gemma-4-31b-it-4bit".into(),
+    /// deployment ordered by most-recent health check (HA: logan first
+    /// then duncan today). Family-based selection is correct here: we
+    /// explicitly want a *third-party-family* judge (independent of
+    /// Qwen-family generation tiers) to avoid same-family bias.
+    ///
+    /// Returns Err when no healthy gemma deployment exists, so callers
+    /// can surface "no judge available" instead of silently routing
+    /// to a dead fallback endpoint.
+    async fn judge_endpoint(&self) -> Result<(String, String), String> {
+        let pool = self.pool.as_ref().ok_or("judge_endpoint: no DB pool")?;
+        let row = sqlx::query(
+            r#"
+            SELECT d.port,
+                   COALESCE(c.primary_ip, w.name) AS host,
+                   d.catalog_id
+              FROM fleet_model_deployments d
+              JOIN fleet_model_catalog cat ON cat.id = d.catalog_id
+              LEFT JOIN fleet_workers w     ON w.name = d.worker_name
+              LEFT JOIN computers c         ON LOWER(c.name) = LOWER(d.worker_name)
+             WHERE d.health_status = 'healthy'
+               AND cat.family = 'gemma'
+             ORDER BY d.last_health_at DESC NULLS LAST
+             LIMIT 1
+            "#,
         )
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| format!("judge_endpoint: query failed: {e}"))?
+        .ok_or("judge_endpoint: no healthy gemma deployment in fleet_model_deployments")?;
+        use sqlx::Row;
+        let port: i32 = row
+            .try_get("port")
+            .map_err(|e| format!("judge_endpoint: decode port: {e}"))?;
+        let host: String = row
+            .try_get("host")
+            .map_err(|e| format!("judge_endpoint: decode host: {e}"))?;
+        let catalog_id: String = row
+            .try_get("catalog_id")
+            .map_err(|e| format!("judge_endpoint: decode catalog_id: {e}"))?;
+        Ok((format!("http://{host}:{port}"), catalog_id))
     }
 
     async fn http_complete(
@@ -292,7 +291,7 @@ impl LlmExec for GatewayLlmExec {
         max_tokens: u32,
         timeout: Duration,
     ) -> Result<String, String> {
-        let (endpoint, model) = self.judge_endpoint().await;
+        let (endpoint, model) = self.judge_endpoint().await?;
         self.http_complete(&endpoint, &model, prompt, max_tokens, timeout)
             .await
     }
