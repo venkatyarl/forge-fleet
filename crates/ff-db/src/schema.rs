@@ -7077,3 +7077,101 @@ UPDATE software_registry
    )
  WHERE id='forgefleetd_git';
 "#;
+
+// V105: Agent Skills standard — main `skills` + `skill_invocations` +
+// `retired_skills` tables. Canonical store for SKILL.md bodies (text
+// in DB so it's queryable + auditable + transactional). On-disk
+// materializer (SKILL.3) writes /writes -from DB to each computer's
+// ~/.forgefleet/skills/<source>/<name>/SKILL.md.
+//
+// source priority for dedup tie-break (higher first):
+//   anthropics > wshobson > forgefleet > microsoft > awesome > clawhub
+//
+// `canonical_skill_id` points duplicates at the canonical row; runtime
+// only loads the canonical. `superseded_by` records the winner when
+// the loser is retired after KPI evidence.
+//
+// `combines` (SKILL.14) is a jsonb array of {source, name, version}
+// for combined skills. Populated only when this row IS the combine
+// (always source='forgefleet'). Enables update-notification when an
+// upstream component bumps.
+//
+// `family` is a free-text grouping like "pdf" / "code-review" — used
+// for the "show me all PDF skills" query without per-source iteration.
+pub const SCHEMA_V105_SKILLS: &str = r#"
+CREATE TABLE IF NOT EXISTS skills (
+    id                  uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    name                text NOT NULL,
+    source              text NOT NULL,
+    source_url          text,
+    version             text NOT NULL,
+    family              text,
+    description         text,
+    when_to_invoke      text,
+    tools               jsonb NOT NULL DEFAULT '[]'::jsonb,
+    body_md             text NOT NULL,
+    body_sha256         text NOT NULL,
+    risk_level          text NOT NULL DEFAULT 'medium',
+    security_scan       jsonb,
+    canonical_skill_id  uuid REFERENCES skills(id) ON DELETE SET NULL,
+    superseded_by       uuid REFERENCES skills(id) ON DELETE SET NULL,
+    combines            jsonb NOT NULL DEFAULT '[]'::jsonb,
+    installed_at        timestamptz NOT NULL DEFAULT now(),
+    updated_at          timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (name, source, version)
+);
+
+CREATE INDEX IF NOT EXISTS skills_name_source_idx       ON skills (name, source);
+CREATE INDEX IF NOT EXISTS skills_family_idx            ON skills (family) WHERE family IS NOT NULL;
+CREATE INDEX IF NOT EXISTS skills_canonical_null_idx    ON skills (id) WHERE canonical_skill_id IS NULL;
+CREATE INDEX IF NOT EXISTS skills_risk_idx              ON skills (risk_level);
+
+-- Append-only invocation log. trace_id joins to Langfuse spans.
+CREATE TABLE IF NOT EXISTS skill_invocations (
+    id              bigserial PRIMARY KEY,
+    skill_id        uuid NOT NULL REFERENCES skills(id) ON DELETE CASCADE,
+    trace_id        text,
+    invoked_at      timestamptz NOT NULL DEFAULT now(),
+    computer        text,
+    task_summary    text,
+    outcome         text NOT NULL DEFAULT 'unknown',  -- success | partial | failed | unknown
+    tokens_used     integer,
+    duration_ms     integer,
+    cost_usd        numeric(10, 6)
+);
+
+CREATE INDEX IF NOT EXISTS skill_invocations_skill_id_idx    ON skill_invocations (skill_id);
+CREATE INDEX IF NOT EXISTS skill_invocations_trace_id_idx    ON skill_invocations (trace_id) WHERE trace_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS skill_invocations_invoked_at_idx  ON skill_invocations (invoked_at DESC);
+
+-- KPI rollup view: queried at agent-turn time to rank skills.
+CREATE OR REPLACE VIEW skill_kpi_view AS
+SELECT
+    s.id                                              AS skill_id,
+    s.name,
+    s.source,
+    s.family,
+    COUNT(si.*) FILTER (WHERE si.invoked_at > NOW() - INTERVAL '30 days') AS invocations_30d,
+    COUNT(si.*) FILTER (WHERE si.outcome = 'success' AND si.invoked_at > NOW() - INTERVAL '30 days')::float
+        / NULLIF(COUNT(si.*) FILTER (WHERE si.invoked_at > NOW() - INTERVAL '30 days'), 0) AS success_rate_30d,
+    percentile_cont(0.5) WITHIN GROUP (ORDER BY si.duration_ms) FILTER (WHERE si.invoked_at > NOW() - INTERVAL '30 days') AS p50_ms,
+    percentile_cont(0.95) WITHIN GROUP (ORDER BY si.duration_ms) FILTER (WHERE si.invoked_at > NOW() - INTERVAL '30 days') AS p95_ms,
+    AVG(si.tokens_used)  FILTER (WHERE si.invoked_at > NOW() - INTERVAL '30 days') AS avg_tokens,
+    AVG(si.cost_usd)     FILTER (WHERE si.invoked_at > NOW() - INTERVAL '30 days') AS avg_cost_usd,
+    MAX(si.invoked_at)                                AS last_used_at
+FROM skills s
+LEFT JOIN skill_invocations si ON si.skill_id = s.id
+WHERE s.canonical_skill_id IS NULL
+GROUP BY s.id, s.name, s.source, s.family;
+
+-- Retired skills — sync skips these so we don't re-import losers.
+-- SKILL.13: KPI-driven retirements + operator-initiated retirements.
+CREATE TABLE IF NOT EXISTS retired_skills (
+    source          text NOT NULL,
+    name            text NOT NULL,
+    retired_at      timestamptz NOT NULL DEFAULT now(),
+    retired_reason  text NOT NULL,
+    superseded_by   uuid REFERENCES skills(id) ON DELETE SET NULL,
+    PRIMARY KEY (source, name)
+);
+"#;
