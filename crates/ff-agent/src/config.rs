@@ -20,7 +20,7 @@ impl AgentConfig {
             leader_url: std::env::var("FF_LEADER_URL")
                 .unwrap_or_else(|_| "http://127.0.0.1:51819".to_string()),
             runtime_url: std::env::var("FF_RUNTIME_URL")
-                .unwrap_or_else(|_| "http://127.0.0.1:8000".to_string()),
+                .unwrap_or_else(|_| "http://127.0.0.1:55000".to_string()),
             http_port: std::env::var("FF_AGENT_HTTP_PORT")
                 .ok()
                 .and_then(|v| v.parse::<u16>().ok())

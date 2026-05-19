@@ -83,7 +83,7 @@ pub struct SyncConfig {
     /// Human-readable node name (used in snapshot metadata).
     pub worker_name: String,
     /// Base URL of the leader node (required for followers).
-    /// Example: `http://192.168.5.100:8787`
+    /// Example: `http://192.168.5.100:51002` (canonical gateway port).
     pub leader_url: Option<String>,
     /// How often to sync (leader: snapshot creation, follower: poll interval).
     pub sync_interval: Duration,
@@ -899,7 +899,7 @@ mod tests {
         let config = SyncConfig {
             role: SyncRole::Follower,
             worker_name: "test-follower".into(),
-            leader_url: Some("http://localhost:8787".into()),
+            leader_url: Some("http://localhost:51002".into()),
             sync_interval: Duration::from_secs(5),
             snapshot_dir: dir.path().join("snapshots"),
         };

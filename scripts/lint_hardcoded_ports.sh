@@ -29,7 +29,7 @@ PATTERN='(https?|redis|nats|postgres)://[A-Za-z0-9.-]+:[0-9]{4}\b'
 
 # Allowlist regex — any line that matches ANY of these is OK to ignore.
 # Keep this list tight; every entry needs a stated reason in this file.
-ALLOWLIST_REGEX='(5173|192\.168\.1\.|172\.[0-9]+\.[0-9]+\.[0-9]+|11434|26380)'
+ALLOWLIST_REGEX='(5173|192\.168\.1\.|172\.[0-9]+\.[0-9]+\.[0-9]+|11434|26380|bad-node:8080|localhost:8080|localhost:3000|localhost:3100|127\.0\.0\.1:5000)'
 # Allowlist entries:
 #   5173          — Vite frontend dev server (external tool)
 #   192.168.1.*   — test/example fixtures on a different subnet
@@ -38,6 +38,14 @@ ALLOWLIST_REGEX='(5173|192\.168\.1\.|172\.[0-9]+\.[0-9]+\.[0-9]+|11434|26380)'
 #                   explicitness in case anything matches the bare number)
 #   26380         — Redis Sentinel deprecated entry (5 digits — kept for
 #                   explicitness)
+#   bad-node:8080  — test fixture in ff-gateway::orchestrate; intentionally
+#                    a fake unreachable host for negative-path tests.
+#   localhost:8080 — example URLs in ff-benchmark + ff-pipeline test templates
+#                    (representative HTTP service in deploy_pipeline examples).
+#   localhost:3000 — ff-skills test default MCP endpoint.
+#   localhost:3100 — example MCP server URL in ff-agent::mcp_tools doc + test
+#                    (third-party MCP convention, not a ForgeFleet port).
+#   127.0.0.1:5000 — ff-mcp federation normalize_endpoint test input.
 
 scan_dir() {
     local dir="$1"
@@ -48,10 +56,11 @@ scan_dir() {
             continue
         fi
         # Filter doc-comment "examples" — `/// - http://...:NNNN` patterns.
-        # Note: this allows the *examples* to keep illustrating
-        # historical/external behaviour. The actual code line with the
-        # `unwrap_or_else` will still be caught because it doesn't have `///`.
-        if echo "$line" | grep -qE '^\s*///'; then
+        # The grep -n line format is `file:lineno:CONTENT`, so the code
+        # portion lives after the second `:`. Strip that prefix before
+        # the doc-comment + module-doc + plain-comment checks.
+        content="${line#*:*:}"
+        if echo "$content" | grep -qE '^\s*(///|//!|//)'; then
             continue
         fi
         echo "$line" >> "$VIOLATIONS_FILE"
