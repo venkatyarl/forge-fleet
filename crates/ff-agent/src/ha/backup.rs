@@ -483,12 +483,26 @@ impl BackupOrchestrator {
         kind: &str,
         file_name: &str,
     ) -> Result<Vec<String>, BackupError> {
-        // Look up my own IP so peers know where to rsync from.
-        let my_ip: String = sqlx::query_scalar("SELECT primary_ip FROM computers WHERE id = $1")
-            .bind(self.my_computer_id)
-            .fetch_optional(&self.pg)
-            .await?
-            .unwrap_or_else(|| "127.0.0.1".to_string());
+        // Look up my own IP + SSH user so peers know where + as whom
+        // to rsync from. REDIS.1 part 2 (2026-05-19): the original code
+        // built the source as `<ip>:/path` with no user prefix, so each
+        // peer's rsync tried `ssh <peer-local-user>@<my_ip>` (e.g.
+        // `adele@taylor`) and Taylor's sshd rejected with exit-255
+        // because there is no `adele` Unix user on Taylor.
+        // Now we always prefix the leader's `ssh_user` from
+        // `computers.ssh_user`, falling back to "root" if unset.
+        let row =
+            sqlx::query("SELECT primary_ip, COALESCE(ssh_user, 'root') AS ssh_user FROM computers WHERE id = $1")
+                .bind(self.my_computer_id)
+                .fetch_optional(&self.pg)
+                .await?;
+        let (my_ip, my_user): (String, String) = match row {
+            Some(r) => {
+                use sqlx::Row;
+                (r.get("primary_ip"), r.get("ssh_user"))
+            }
+            None => ("127.0.0.1".to_string(), "root".to_string()),
+        };
 
         // Target every computer except me that has a live `last_seen_at`
         // within the last 24h. Fresh-on-disk peers are picked up by the
@@ -505,7 +519,8 @@ impl BackupOrchestrator {
 
         let mut enqueued = Vec::new();
         let source_path = format!(
-            "{}:{}/{}/{}",
+            "{}@{}:{}/{}/{}",
+            my_user,
             my_ip,
             self.backup_dir.display(),
             kind,
