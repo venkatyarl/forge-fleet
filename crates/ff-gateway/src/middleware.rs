@@ -166,11 +166,28 @@ pub async fn jwt_auth_middleware(request: Request<Body>, next: Next) -> Response
             | axum::http::Method::DELETE
     );
 
+    // OpenAI-compatible LLM endpoints (chat completions, completions,
+    // embeddings, rerank) are inherently LLM dispatch — they don't mutate
+    // fleet state in the same sense as the admin/control routes the JWT
+    // gate is intended to protect. Without this carve-out, internal fleet
+    // callers (ff-pipeline, fleet_crew, the cascade) get 401'd when
+    // FF_JWT_SECRET is unset (the common dev/lan-only deploy). With the
+    // carve-out: callers can POST to /v1/chat/completions on the loopback
+    // gateway without authenticating. When the operator DOES set
+    // FF_JWT_SECRET (production deploy behind a reverse proxy), the
+    // full JWT check still applies — the carve-out only kicks in when
+    // no secret is configured.
+    let is_llm_endpoint = matches!(
+        path.as_str(),
+        "/v1/chat/completions" | "/v1/completions" | "/v1/embeddings" | "/v1/rerank"
+    );
+
     let secret = match std::env::var("FF_JWT_SECRET") {
         Ok(s) if !s.is_empty() => s,
         _ => {
-            // No JWT secret configured — still block mutating routes.
-            if is_mutating && !is_public_route(&path) {
+            // No JWT secret configured — still block mutating routes,
+            // except for LLM-dispatch endpoints (see comment above).
+            if is_mutating && !is_public_route(&path) && !is_llm_endpoint {
                 return json_error(
                     StatusCode::UNAUTHORIZED,
                     "authentication required for mutating requests",
