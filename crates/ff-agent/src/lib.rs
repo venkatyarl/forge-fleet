@@ -3,6 +3,7 @@ pub mod agent_hint;
 pub mod agent_loop;
 pub mod agent_roles;
 pub mod auto_upgrade;
+pub mod defer_worker;
 pub mod research;
 pub mod review_pipeline;
 pub mod skill_catalog;

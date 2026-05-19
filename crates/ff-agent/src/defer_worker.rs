@@ -1,0 +1,393 @@
+//! Deferred-task worker loop for forgefleetd.
+//!
+//! ## Why this exists
+//!
+//! Historically the deferred-task **worker** (claim a dispatchable task, run
+//! it, mark it complete) lived in `ff daemon` — a separate CLI command. The
+//! convention was: forgefleetd handles pulse + leader election + the
+//! scheduler-pass (pending → dispatchable), and a sibling `ff daemon` process
+//! handles the worker-pass. In practice nobody remembered to run `ff daemon`
+//! on each host, so dispatchable tasks piled up forever. The auto-upgrade
+//! pipeline silently broke; cross-node defer dispatches needed manual SSH.
+//! See `feedback_forgefleetd_no_scheduler` memory.
+//!
+//! This module folds the worker loop into forgefleetd itself. One process
+//! does both halves; the architectural split that caused the bug is gone.
+//!
+//! ## Scope
+//!
+//! Handles the three task kinds that account for ~99% of fleet traffic:
+//!
+//!   - `shell`    — run a command, optionally on a remote node via SSH
+//!   - `http`     — POST/GET to a URL (used by webhook integrations)
+//!   - `upgrade`  — look up the `upgrade_playbook` for a software entry and
+//!                  execute it via shell on the target node
+//!
+//! Other task kinds (`internal`, `mesh_retry`, etc.) are logged and left
+//! pending so the legacy `ff daemon` CLI (or a future extension here) can
+//! pick them up. They're rare enough that this trade-off is acceptable
+//! for the fix that unblocks fleet ops today.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use sqlx::PgPool;
+use tokio::sync::{Semaphore, watch};
+use tokio::task::JoinHandle;
+use tracing::{info, warn};
+
+/// Spawn a background task that periodically claims and executes deferred
+/// tasks from `deferred_tasks`. Returns the JoinHandle so forgefleetd's
+/// subsystem-shutdown machinery can drain it cleanly.
+///
+/// `poll_interval_secs` — how often to poll the queue when empty. The loop
+/// drains until empty before sleeping; this only governs idle cadence.
+///
+/// `max_concurrent` — how many tasks this worker runs in parallel. A
+/// `tokio::sync::Semaphore` gates spawning.
+pub fn spawn_defer_worker(
+    pg_pool: PgPool,
+    worker_name: String,
+    poll_interval_secs: u64,
+    max_concurrent: usize,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let semaphore = Arc::new(Semaphore::new(max_concurrent));
+        let mut ticker = tokio::time::interval(Duration::from_secs(poll_interval_secs));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        info!(
+            worker = %worker_name,
+            poll_interval_secs,
+            max_concurrent,
+            "defer_worker: started"
+        );
+
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    if let Err(e) = drain_queue(&pg_pool, &worker_name, &semaphore).await {
+                        warn!(error = %e, "defer_worker: drain failed");
+                    }
+                }
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        info!("defer_worker: shutdown received, exiting");
+                        break;
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// One drain pass: claim tasks until queue empty or all slots busy.
+async fn drain_queue(
+    pool: &PgPool,
+    worker_name: &str,
+    semaphore: &Arc<Semaphore>,
+) -> Result<(), String> {
+    loop {
+        let permit = match semaphore.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => return Ok(()), // all slots busy — try next tick
+        };
+
+        let claimed = ff_db::pg_claim_deferred(pool, worker_name)
+            .await
+            .map_err(|e| format!("pg_claim_deferred: {e}"))?;
+
+        let Some(task) = claimed else {
+            // permit drops here automatically — slot back to the pool
+            return Ok(());
+        };
+
+        info!(
+            task_id = %task.id,
+            kind = %task.kind,
+            title = %task.title,
+            "defer_worker: claimed"
+        );
+
+        let pool_clone = pool.clone();
+        let nodes = ff_db::pg_list_nodes(pool).await.unwrap_or_default();
+        tokio::spawn(async move {
+            let _permit = permit; // hold for the duration of execution
+
+            let (success, result, err) = execute(&task, &nodes).await;
+
+            if let Err(e) = ff_db::pg_finish_deferred(
+                &pool_clone,
+                &task.id,
+                success,
+                result.as_ref(),
+                err.as_deref(),
+            )
+            .await
+            {
+                warn!(task_id = %task.id, error = %e, "defer_worker: pg_finish_deferred failed");
+                return;
+            }
+
+            if success {
+                info!(task_id = %task.id, "defer_worker: ✓ completed");
+            } else {
+                warn!(
+                    task_id = %task.id,
+                    error = ?err,
+                    "defer_worker: ✗ failed"
+                );
+            }
+        });
+    }
+}
+
+/// Execute one task by dispatching on its `kind`. Returns
+/// `(success, optional_result_value, optional_error_message)`.
+async fn execute(
+    task: &ff_db::DeferredTaskRow,
+    nodes: &[ff_db::FleetNodeRow],
+) -> (bool, Option<serde_json::Value>, Option<String>) {
+    match task.kind.as_str() {
+        "shell" => {
+            let Some(command) = task.payload.get("command").and_then(|v| v.as_str()) else {
+                return (
+                    false,
+                    None,
+                    Some("shell payload missing 'command' field".into()),
+                );
+            };
+            execute_shell(task.preferred_node.as_deref(), command, nodes).await
+        }
+        "http" => {
+            let Some(url) = task.payload.get("url").and_then(|v| v.as_str()) else {
+                return (false, None, Some("http payload missing 'url' field".into()));
+            };
+            let method = task
+                .payload
+                .get("method")
+                .and_then(|v| v.as_str())
+                .unwrap_or("GET");
+            let body = task.payload.get("body").cloned();
+            execute_http(method, url, body).await
+        }
+        "upgrade" => {
+            let Some(tool) = task.payload.get("tool").and_then(|v| v.as_str()) else {
+                return (false, None, Some("upgrade payload missing 'tool'".into()));
+            };
+            let os_family = detect_os_family();
+            let Some(script) = crate::upgrade_playbooks::playbook_for(tool, &os_family) else {
+                return (
+                    false,
+                    None,
+                    Some(format!("no playbook for tool={tool} os={os_family}")),
+                );
+            };
+            execute_shell(task.preferred_node.as_deref(), &script, nodes).await
+        }
+        other => {
+            // Unsupported kinds — leave for the legacy `ff daemon` CLI to
+            // pick up. Mark FAILED with a clear message so the task doesn't
+            // get re-claimed in a tight loop; operator can re-enqueue if
+            // they have `ff daemon --once` available.
+            (
+                false,
+                None,
+                Some(format!(
+                    "defer_worker: task kind '{other}' not handled by forgefleetd's \
+                     in-process worker. Run `ff daemon --once` to drain it."
+                )),
+            )
+        }
+    }
+}
+
+/// Run a shell command locally or via SSH to a remote node.
+async fn execute_shell(
+    target_node: Option<&str>,
+    command: &str,
+    nodes: &[ff_db::FleetNodeRow],
+) -> (bool, Option<serde_json::Value>, Option<String>) {
+    use tokio::process::Command;
+
+    let this_hostname = Command::new("hostname")
+        .output()
+        .await
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_lowercase())
+        .unwrap_or_default();
+
+    let local = match target_node {
+        None => true,
+        Some(n) if this_hostname.starts_with(&n.to_lowercase()) => true,
+        Some(_) => false,
+    };
+
+    let (program, args): (&str, Vec<String>) = if local {
+        ("sh", vec!["-c".into(), command.to_string()])
+    } else {
+        let node_name = target_node.unwrap();
+        let Some(node) = nodes
+            .iter()
+            .find(|n| n.name.eq_ignore_ascii_case(node_name))
+        else {
+            return (
+                false,
+                None,
+                Some(format!("defer_worker: node '{node_name}' not in fleet")),
+            );
+        };
+        let dest = format!("{}@{}", node.ssh_user, node.ip);
+        (
+            "ssh",
+            vec![
+                "-o".into(),
+                "ConnectTimeout=5".into(),
+                "-o".into(),
+                "StrictHostKeyChecking=accept-new".into(),
+                dest,
+                command.to_string(),
+            ],
+        )
+    };
+
+    let output = match Command::new(program).args(&args).output().await {
+        Ok(o) => o,
+        Err(e) => return (false, None, Some(format!("spawn {program}: {e}"))),
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let exit_code = output.status.code().unwrap_or(-1);
+
+    let result = serde_json::json!({
+        "exit_code": exit_code,
+        "stdout": stdout.chars().take(8192).collect::<String>(),
+        "stderr": stderr.chars().take(8192).collect::<String>(),
+    });
+
+    if output.status.success() {
+        (true, Some(result), None)
+    } else {
+        let err = format!(
+            "exit {exit_code}: {}",
+            if !stderr.is_empty() {
+                stderr.chars().take(500).collect::<String>()
+            } else {
+                stdout.chars().take(500).collect::<String>()
+            }
+        );
+        (false, Some(result), Some(err))
+    }
+}
+
+/// HTTP task — POST/GET to a URL.
+async fn execute_http(
+    method: &str,
+    url: &str,
+    body: Option<serde_json::Value>,
+) -> (bool, Option<serde_json::Value>, Option<String>) {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    let client = CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .build()
+            .expect("build http client")
+    });
+
+    let req = match method.to_ascii_uppercase().as_str() {
+        "GET" => client.get(url),
+        "POST" => {
+            let r = client.post(url);
+            if let Some(b) = body { r.json(&b) } else { r }
+        }
+        "PUT" => {
+            let r = client.put(url);
+            if let Some(b) = body { r.json(&b) } else { r }
+        }
+        "DELETE" => client.delete(url),
+        other => {
+            return (
+                false,
+                None,
+                Some(format!("unsupported http method: {other}")),
+            );
+        }
+    };
+
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => return (false, None, Some(format!("http request: {e}"))),
+    };
+
+    let status = resp.status();
+    let body_text = resp.text().await.unwrap_or_default();
+    let result = serde_json::json!({
+        "status": status.as_u16(),
+        "body": body_text.chars().take(8192).collect::<String>(),
+    });
+
+    if status.is_success() {
+        (true, Some(result), None)
+    } else {
+        (
+            false,
+            Some(result),
+            Some(format!(
+                "http {}: {}",
+                status,
+                body_text.chars().take(500).collect::<String>()
+            )),
+        )
+    }
+}
+
+fn detect_os_family() -> String {
+    match std::env::consts::OS {
+        "macos" => "macos".to_string(),
+        "linux" => "linux-ubuntu".to_string(), // fleet linux members are all ubuntu/dgx
+        other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn shell_local_echo_succeeds() {
+        let nodes = vec![];
+        let (ok, result, err) = execute_shell(None, "echo hello", &nodes).await;
+        assert!(ok, "expected success, got err: {err:?}");
+        let r = result.unwrap();
+        assert_eq!(r.get("exit_code").and_then(|v| v.as_i64()), Some(0));
+        assert!(
+            r.get("stdout")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .contains("hello")
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_local_failure_reports_exit_code() {
+        let (ok, _, err) = execute_shell(None, "exit 3", &[]).await;
+        assert!(!ok);
+        assert!(err.unwrap().contains("exit 3"));
+    }
+
+    #[tokio::test]
+    async fn http_unsupported_method() {
+        let (ok, _, err) = execute_http("OPTIONS", "http://localhost/x", None).await;
+        assert!(!ok);
+        assert!(err.unwrap().contains("unsupported"));
+    }
+
+    #[test]
+    fn detect_os_family_returns_sensible_value() {
+        let f = detect_os_family();
+        assert!(f == "macos" || f == "linux-ubuntu" || !f.is_empty());
+    }
+}

@@ -672,6 +672,23 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         ));
     }
 
+    // 17) Deferred-task worker — claim + execute tasks from `deferred_tasks`.
+    // Historically lived in the separate `ff daemon` CLI; the split caused
+    // dispatched tasks to pile up forever when nobody started that process.
+    // Folding the worker into forgefleetd eliminates that gap. See module
+    // doc on ff_agent::defer_worker for scope (handles shell/http/upgrade;
+    // other kinds remain `ff daemon`'s domain).
+    if let Some(pg_pool) = operational_store.pg_pool().cloned() {
+        info!("starting subsystem: deferred-task worker (10s poll, 4 concurrent)");
+        subsystem_tasks.push(ff_agent::defer_worker::spawn_defer_worker(
+            pg_pool,
+            worker_name.clone(),
+            10,
+            4,
+            shutdown_rx.clone(),
+        ));
+    }
+
     info!("all subsystems started; waiting for shutdown signal");
     wait_for_shutdown_signal().await;
 
