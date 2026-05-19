@@ -4608,14 +4608,20 @@ async fn proxy_chat_completions(
     headers: HeaderMap,
     Json(mut raw_payload): Json<Value>,
 ) -> Result<Response<Body>, (StatusCode, Json<Value>)> {
-    // GW.2 trace breadcrumbs — each `info!` writes a line so we can see
-    // exactly where the handler stalls on worker-node gateways.
+    // GW.2 trace breadcrumbs (kept permanently at debug level so they're
+    // available when a future operator runs RUST_LOG=ff_gateway=debug,
+    // but silent by default). Originally diagnosed the worker-gateway
+    // hang where `FORGEFLEET_REDIS_URL` defaulted to localhost on
+    // workers, causing pulse beats reads to block forever on connect.
+    // The fix (env via systemd unit / launchd plist) is in the
+    // operator runbook; the breadcrumbs stay so the same chain can be
+    // re-traced if any future routing-layer change regresses.
     let _trace_model = raw_payload
         .get("model")
         .and_then(|v| v.as_str())
         .unwrap_or("?")
         .to_string();
-    info!(model = %_trace_model, "GW.2: chat handler entered");
+    debug!(model = %_trace_model, "GW.2: chat handler entered");
 
     // ── Session affinity hint from header ────────────────────────────
     // Clients may pass X-ForgeFleet-Session to explicitly pin a
@@ -4669,7 +4675,7 @@ async fn proxy_chat_completions(
         return Ok(Json(ticket).into_response());
     }
 
-    info!(model = %_trace_model, "GW.2: pre-cloud_llm");
+    debug!(model = %_trace_model, "GW.2: pre-cloud_llm");
     // ── Cloud-LLM routing (first pass) ───────────────────────────────
     //
     // If the `model` field matches a row in `cloud_llm_providers`
@@ -4736,7 +4742,7 @@ async fn proxy_chat_completions(
         warn!("chat completion payload is not a JSON object; skipping qwen3 max_tokens floor");
     }
 
-    info!(model = %_trace_model, "GW.2: pre-pulse-router");
+    debug!(model = %_trace_model, "GW.2: pre-pulse-router");
     // ── Pulse-first routing ──────────────────────────────────────────
     //
     // We try the Pulse router first. If it successfully picks a server
@@ -4745,7 +4751,7 @@ async fn proxy_chat_completions(
     // find a matching server OR its upstream call fails outright do we
     // fall through to the legacy tier-router path.
     if let Some(pulse) = state.pulse_router.clone() {
-        info!(model = %_trace_model, "GW.2: pulse-router cloned");
+        debug!(model = %_trace_model, "GW.2: pulse-router cloned");
         let cache_ref = state.pulse_cache.as_deref();
         // Hand the Pulse router the PG pool so it can expand pool aliases
         // (`fleet_task_coverage.alias`, schema V27) before doing the
@@ -4755,7 +4761,7 @@ async fn proxy_chat_completions(
             .get("stream")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        info!(model = %_trace_model, has_cache = cache_ref.is_some(), has_pg = pg_ref.is_some(), is_streaming, "GW.2: pre-route-completion-call");
+        debug!(model = %_trace_model, has_cache = cache_ref.is_some(), has_pg = pg_ref.is_some(), is_streaming, "GW.2: pre-route-completion-call");
 
         if is_streaming {
             match pulse

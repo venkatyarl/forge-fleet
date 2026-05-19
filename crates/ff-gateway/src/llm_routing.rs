@@ -634,7 +634,7 @@ impl PulseLlmRouter {
             }
         }
 
-        tracing::info!(model = %requested_model, "GW.2 rt: pre-pool-pick");
+        tracing::debug!(model = %requested_model, "GW.2 rt: pre-pool-pick");
         // 1. Pool-alias expansion (optional).
         let pool_pick = match pg {
             Some(pool) => self
@@ -643,7 +643,7 @@ impl PulseLlmRouter {
                 .unwrap_or(None),
             None => None,
         };
-        tracing::info!(model = %requested_model, found = pool_pick.is_some(), "GW.2 rt: post-pool-pick");
+        tracing::debug!(model = %requested_model, found = pool_pick.is_some(), "GW.2 rt: post-pool-pick");
 
         // 2. Cache-first pick for the normal path, unless affinity won.
         let picked = if let Some(t) = affinity_pick {
@@ -747,7 +747,7 @@ impl PulseLlmRouter {
             .and_then(|v| v.as_str())
             .ok_or(LlmRoutingError::MissingModel)?;
 
-        tracing::info!("GW.2 rcc: pre-resolve_target");
+        tracing::debug!("GW.2 rcc: pre-resolve_target");
 
         // From here on we mutate (stream downgrade + model rewrite) so clone once.
         let mut body = body.clone();
@@ -757,7 +757,7 @@ impl PulseLlmRouter {
 
         let session_key = extract_session_key(&body);
         let (routed, url, body) = self.resolve_target(body, cache, pg).await?;
-        tracing::info!(computer = %routed.computer, "GW.2 rcc: post-resolve_target");
+        tracing::debug!(computer = %routed.computer, "GW.2 rcc: post-resolve_target");
         self.record_affinity(session_key, &routed);
 
         tracing::debug!(
