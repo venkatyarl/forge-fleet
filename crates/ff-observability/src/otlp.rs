@@ -12,7 +12,6 @@
 use opentelemetry::KeyValue;
 use opentelemetry_otlp::{WithExportConfig, WithHttpConfig};
 use opentelemetry_sdk::Resource;
-use opentelemetry_sdk::runtime::Tokio;
 use opentelemetry_sdk::trace as sdktrace;
 use tracing::Subscriber;
 use tracing_opentelemetry::OpenTelemetryLayer;
@@ -72,8 +71,15 @@ where
 
     let resource = Resource::new(resource_attrs);
 
+    // We use `with_simple_exporter` (sync, in-line) rather than
+    // `with_batch_exporter(_, Tokio)` because the batch+Tokio combo
+    // panics at daemon shutdown ("Cannot drop a runtime in a context
+    // where blocking is not allowed") — the batch processor spawns
+    // a tokio task whose drop runs blocking shutdown inside the
+    // outer runtime's drop. Sync export is fine at our scale
+    // (10²-10³ spans/sec for the daemon).
     let provider = sdktrace::TracerProvider::builder()
-        .with_batch_exporter(exporter, Tokio)
+        .with_simple_exporter(exporter)
         .with_resource(resource)
         .build();
 
