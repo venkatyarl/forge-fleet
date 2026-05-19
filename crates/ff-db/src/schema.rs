@@ -6995,3 +6995,23 @@ ON CONFLICT (id) DO UPDATE SET
   description = EXCLUDED.description,
   updated_at = NOW();
 "#;
+
+// V101: Persist the forgefleetd_git upgrade_playbook update into a
+// migration so fresh DBs get the right behavior (the V63 seed shipped
+// without pkill + without -j 2). Adds:
+// - `pkill -f 'forgefleetd --worker-name'` BEFORE systemctl restart on
+//   Linux entries (UPGRADE.1 — legacy zombie removal).
+// - `-j 2` to the cargo build on linux-dgx so 4-core / RAM-tight DGX
+//   Sparks don't OOM during LLVM codegen (DGX.1).
+pub const SCHEMA_V101_UPGRADE_PLAYBOOK_REFRESH: &str = r#"
+UPDATE software_registry
+   SET upgrade_playbook = jsonb_build_object(
+     'macos',
+       'export PATH="$HOME/.cargo/bin:$PATH" && mkdir -p "$(dirname {{source_tree_path}})" && { [ -d "{{source_tree_path}}/.git" ] || git clone https://github.com/venkatyarl/forge-fleet "{{source_tree_path}}"; } && cd "{{source_tree_path}}" && git fetch origin main && git reset --hard origin/main && cargo build --release -p forge-fleet -p ff-terminal && install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && install -m 755 target/release/ff ~/.local/bin/ff && codesign --force --sign - ~/.local/bin/forgefleetd ~/.local/bin/ff && launchctl kickstart -k gui/$(id -u)/com.forgefleet.forgefleetd',
+     'linux-ubuntu',
+       'export PATH="$HOME/.cargo/bin:$PATH" && export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" && mkdir -p "$(dirname $HOME/.forgefleet/sub-agent-0/forge-fleet)" && { [ -d "$HOME/.forgefleet/sub-agent-0/forge-fleet/.git" ] || git clone https://github.com/venkatyarl/forge-fleet "$HOME/.forgefleet/sub-agent-0/forge-fleet"; } && cd "$HOME/.forgefleet/sub-agent-0/forge-fleet" && git fetch origin main && git reset --hard origin/main && cargo build --release -p forge-fleet -p ff-terminal && install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && install -m 755 target/release/ff ~/.local/bin/ff && pkill -f ''forgefleetd --worker-name'' 2>/dev/null; sleep 1; systemctl --user reset-failed forgefleetd.service forgefleet-node.service forgefleet-daemon.service 2>/dev/null; systemctl --user restart forgefleetd.service || systemctl --user restart forgefleet-node.service || systemctl --user restart forgefleet-daemon.service',
+     'linux-dgx',
+       'export PATH="$HOME/.cargo/bin:$PATH" && export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" && mkdir -p "$(dirname $HOME/.forgefleet/sub-agent-0/forge-fleet)" && { [ -d "$HOME/.forgefleet/sub-agent-0/forge-fleet/.git" ] || git clone https://github.com/venkatyarl/forge-fleet "$HOME/.forgefleet/sub-agent-0/forge-fleet"; } && cd "$HOME/.forgefleet/sub-agent-0/forge-fleet" && git fetch origin main && git reset --hard origin/main && cargo build --release -p forge-fleet -p ff-terminal -j 2 && install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && install -m 755 target/release/ff ~/.local/bin/ff && pkill -f ''forgefleetd --worker-name'' 2>/dev/null; sleep 1; systemctl --user reset-failed forgefleetd.service forgefleet-node.service forgefleet-daemon.service 2>/dev/null; systemctl --user restart forgefleetd.service || systemctl --user restart forgefleet-node.service || systemctl --user restart forgefleet-daemon.service'
+   )
+ WHERE id='forgefleetd_git';
+"#;

@@ -632,6 +632,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "retire_qwen25",
         sql: schema::SCHEMA_V100_RETIRE_QWEN25,
     },
+    PgMigration {
+        version: 101,
+        name: "upgrade_playbook_refresh",
+        sql: schema::SCHEMA_V101_UPGRADE_PLAYBOOK_REFRESH,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.
