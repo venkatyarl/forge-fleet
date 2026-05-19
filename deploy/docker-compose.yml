@@ -162,26 +162,121 @@ services:
     networks:
       - forgefleet
 
-  # ─── Langfuse (LLM observability — OTEL traces, eval, cost) ──────────
+  # ─── Langfuse v3 (LLM observability — OTLP, eval, cost) ──────────────
   #
-  # Self-hosted observability stack for OpenTelemetry GenAI traces from
-  # forgefleetd. UI on :53000 (5-digit canonical). Uses our existing
-  # Postgres (separate `langfuse` DB) — see init script in docker/init-langfuse-db.sh.
+  # v3 stack required for OpenTelemetry ingestion (v2 didn't have it).
+  # Services: clickhouse (trace store) + minio (blob store for payloads)
+  # + langfuse-web (UI + ingestion API) + langfuse-worker (background
+  # eval/embedding jobs). Reuses existing Postgres + Redis.
   #
-  # LANG.1 (2026-05-19): replaces stderr-grep debugging of fleet_run /
-  # fleet_crew / session_runner / swarm. Trace tree per session, replay
-  # any call, cost split local-vs-cloud, eval datasets.
-  #
-  # Secret material (NEXTAUTH_SECRET, SALT, ENCRYPTION_KEY) is generated
-  # once and stored in fleet_secrets — see bootstrap step at first run.
+  # LANG.1+LANG.2 (2026-05-19): replaces stderr-grep debugging of
+  # fleet_run / fleet_crew / cascade. Trace tree per session, OTLP
+  # at /api/public/otel/v1/traces, replay, cost dashboards.
+  langfuse-clickhouse:
+    image: clickhouse/clickhouse-server:24
+    container_name: forgefleet-langfuse-clickhouse
+    user: "101:101"
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: ${LANGFUSE_CLICKHOUSE_PASSWORD:-clickhouse-changeme}
+    volumes:
+      - langfuse_clickhouse_data:/var/lib/clickhouse
+      - langfuse_clickhouse_logs:/var/log/clickhouse-server
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    mem_limit: 2g
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8123/ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+    networks:
+      - forgefleet
+
+  langfuse-minio:
+    image: minio/minio
+    container_name: forgefleet-langfuse-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: ${LANGFUSE_MINIO_PASSWORD:-minio-changeme-min16chars}
+    volumes:
+      - langfuse_minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    mem_limit: 512m
+    restart: unless-stopped
+    networks:
+      - forgefleet
+
+  langfuse-worker:
+    image: langfuse/langfuse-worker:3
+    container_name: forgefleet-langfuse-worker
+    depends_on:
+      postgres:
+        condition: service_healthy
+      langfuse-clickhouse:
+        condition: service_healthy
+      langfuse-minio:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://forgefleet:forgefleet@postgres:5432/langfuse
+      SALT: ${LANGFUSE_SALT:-changeme-via-fleet_secrets-langfuse-salt}
+      ENCRYPTION_KEY: ${LANGFUSE_ENCRYPTION_KEY:-0000000000000000000000000000000000000000000000000000000000000000}
+      TELEMETRY_ENABLED: "false"
+      CLICKHOUSE_MIGRATION_URL: clickhouse://langfuse-clickhouse:9000
+      CLICKHOUSE_URL: http://langfuse-clickhouse:8123
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: ${LANGFUSE_CLICKHOUSE_PASSWORD:-clickhouse-changeme}
+      CLICKHOUSE_CLUSTER_ENABLED: "false"
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: minio
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_MINIO_PASSWORD:-minio-changeme-min16chars}
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://langfuse-minio:9000
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_EVENT_UPLOAD_PREFIX: events/
+      LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_MEDIA_UPLOAD_REGION: auto
+      LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: minio
+      LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_MINIO_PASSWORD:-minio-changeme-min16chars}
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://langfuse-minio:9000
+      LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: media/
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+    mem_limit: 1g
+    restart: unless-stopped
+    networks:
+      - forgefleet
+
   langfuse-web:
-    image: langfuse/langfuse:2
+    image: langfuse/langfuse:3
     container_name: forgefleet-langfuse
     ports:
       - "53000:3000"
     depends_on:
       postgres:
         condition: service_healthy
+      langfuse-clickhouse:
+        condition: service_healthy
+      langfuse-minio:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      langfuse-worker:
+        condition: service_started
     environment:
       DATABASE_URL: postgresql://forgefleet:forgefleet@postgres:5432/langfuse
       NEXTAUTH_URL: http://192.168.5.100:53000
@@ -190,16 +285,42 @@ services:
       ENCRYPTION_KEY: ${LANGFUSE_ENCRYPTION_KEY:-0000000000000000000000000000000000000000000000000000000000000000}
       TELEMETRY_ENABLED: "false"
       LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES: "true"
-      # OTEL receiver — forgefleetd will export here via OTLP-HTTP.
-      LANGFUSE_INIT_PROJECT_NAME: ForgeFleet
-      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-pk-lf-forgefleet-default}
-      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-sk-lf-forgefleet-default}
+      LANGFUSE_INIT_ORG_ID: cm-org-forgefleet
+      LANGFUSE_INIT_ORG_NAME: ForgeFleet
+      LANGFUSE_INIT_PROJECT_ID: cm-proj-forgefleet
+      LANGFUSE_INIT_PROJECT_NAME: forgefleetd
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_SECRET_KEY}
+      LANGFUSE_INIT_USER_EMAIL: venkat@forgefleet.local
+      LANGFUSE_INIT_USER_NAME: venkat
+      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_USER_PASSWORD:-forgefleet-admin-changeme}
+      CLICKHOUSE_MIGRATION_URL: clickhouse://langfuse-clickhouse:9000
+      CLICKHOUSE_URL: http://langfuse-clickhouse:8123
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: ${LANGFUSE_CLICKHOUSE_PASSWORD:-clickhouse-changeme}
+      CLICKHOUSE_CLUSTER_ENABLED: "false"
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: minio
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_MINIO_PASSWORD:-minio-changeme-min16chars}
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://langfuse-minio:9000
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_EVENT_UPLOAD_PREFIX: events/
+      LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_MEDIA_UPLOAD_REGION: auto
+      LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: minio
+      LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_MINIO_PASSWORD:-minio-changeme-min16chars}
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://langfuse-minio:9000
+      LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: media/
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
     healthcheck:
       test: ["CMD-SHELL", "wget --spider -q http://localhost:3000/api/public/health || exit 1"]
       interval: 30s
       timeout: 5s
-      retries: 5
-      start_period: 60s
+      retries: 10
+      start_period: 120s
     mem_limit: 1g
     restart: unless-stopped
     networks:
@@ -213,6 +334,12 @@ volumes:
   # sentinel_data volume removed — see the Sentinel service block above.
   nats_data:
     name: forgefleet-nats-data
+  langfuse_clickhouse_data:
+    name: forgefleet-langfuse-clickhouse-data
+  langfuse_clickhouse_logs:
+    name: forgefleet-langfuse-clickhouse-logs
+  langfuse_minio_data:
+    name: forgefleet-langfuse-minio-data
 
 networks:
   forgefleet:

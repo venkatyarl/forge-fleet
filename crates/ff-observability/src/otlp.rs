@@ -10,7 +10,7 @@
 //! logs only (the LANG.2 default — opt-in tracing).
 
 use opentelemetry::KeyValue;
-use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_otlp::{WithExportConfig, WithHttpConfig};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::runtime::Tokio;
 use opentelemetry_sdk::trace as sdktrace;
@@ -43,10 +43,23 @@ where
         return Ok(None);
     }
 
+    // Optional Basic auth header — Langfuse requires it on /api/public/otel/*.
+    // Caller sets FORGEFLEET_OTEL_AUTH=<user:pass> (Langfuse expects
+    // <public_key:secret_key>). We base64-encode + format as Basic.
+    let mut headers = std::collections::HashMap::new();
+    if let Ok(auth) = std::env::var("FORGEFLEET_OTEL_AUTH")
+        && !auth.is_empty()
+    {
+        use base64::Engine as _;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(auth.as_bytes());
+        headers.insert("Authorization".to_string(), format!("Basic {encoded}"));
+    }
+
     let exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_http()
         .with_endpoint(endpoint)
         .with_protocol(opentelemetry_otlp::Protocol::HttpBinary)
+        .with_headers(headers)
         .build()?;
 
     let mut resource_attrs = vec![KeyValue::new("service.name", service_name.to_string())];

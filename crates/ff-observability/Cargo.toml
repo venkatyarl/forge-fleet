@@ -34,6 +34,7 @@ opentelemetry_sdk = { version = "0.27", features = ["trace", "rt-tokio"] }
 opentelemetry-stdout = { version = "0.27", features = ["trace"] }
 opentelemetry-otlp = { version = "0.27", features = ["http-proto", "reqwest-blocking-client", "trace"] }
 tracing-opentelemetry = "0.28"
+base64 = "0.22"
 
 # Filesystem
 dirs.workspace = true
