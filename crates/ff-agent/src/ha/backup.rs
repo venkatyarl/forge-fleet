@@ -511,17 +511,33 @@ impl BackupOrchestrator {
             kind,
             file_name
         );
-        let dest_dir = format!("~/.forgefleet/backups/{kind}/");
+        // kind is always an internal literal (redis/postgres/nats/...). Filter
+        // anyway so the unquoted interpolation below stays injection-safe.
+        let kind_safe: String = kind
+            .chars()
+            .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+            .collect();
 
         let who = format!("backup_orchestrator@{}", self.my_node_name);
         for row in rows {
             let name: String = row.get("name");
             let title = format!("rsync {kind} backup {file_name} → {name}");
+            // $HOME is expanded by the remote shell. `~` is NOT used here
+            // because shell_quote wraps in single quotes which kill tilde
+            // expansion (REDIS.1: discovered 2026-05-19 — rsync writing to
+            // a literal `~` directory caused exit 23 across 9 members).
+            //
+            // SSH keepalive + timeout: backups can be 100s of MB; the
+            // default ssh idle timeout was closing connections mid-stream
+            // (exit 255, "Connection closed by ... port 22").
             let script = format!(
-                "mkdir -p {} && rsync -az {} {}",
-                shell_quote(&dest_dir),
+                "mkdir -p \"$HOME/.forgefleet/backups/{kind_safe}/\" && \
+                 rsync -az \
+                   -e 'ssh -o ServerAliveInterval=60 -o ServerAliveCountMax=10 -o ConnectTimeout=30' \
+                   --timeout=3600 \
+                   --partial \
+                   {} \"$HOME/.forgefleet/backups/{kind_safe}/\"",
                 shell_quote(&source_path),
-                shell_quote(&dest_dir),
             );
             let payload = serde_json::json!({
                 "command": script,
