@@ -622,6 +622,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "gemma4_repo_fix",
         sql: schema::SCHEMA_V98_GEMMA4_REPO_FIX,
     },
+    PgMigration {
+        version: 99,
+        name: "default_pool_alias",
+        sql: schema::SCHEMA_V99_DEFAULT_POOL_ALIAS,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.

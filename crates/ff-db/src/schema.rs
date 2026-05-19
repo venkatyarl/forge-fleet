@@ -6936,3 +6936,24 @@ UPDATE fleet_model_catalog
  WHERE id = 'gemma4-31b-it'
    AND variants::text LIKE '%bartowski/gemma-4-31b-it-GGUF%';
 "#;
+
+// V99: Register a `default` pool alias in fleet_task_coverage so the
+// gateway can route ff-pipeline's `model="default"` requests to a real
+// pool of healthy chat models. Without this, fleet_crew gets a 503
+// "no healthy backend for model 'default'" because the tier router
+// can't parse "default" as a tier selector. FA.2.
+pub const SCHEMA_V99_DEFAULT_POOL_ALIAS: &str = r#"
+INSERT INTO fleet_task_coverage (task, alias, preferred_model_ids, priority, notes)
+VALUES (
+  'default-chat',
+  'default',
+  '["qwen36-35b-a3b", "qwen3-coder-30b", "gemma4-31b-it"]'::jsonb,
+  'critical',
+  'Pool alias for ff-pipeline / fleet_crew when no explicit model is set. Mix of 3 model families (qwen-MoE chat, qwen coder, gemma judge) across multiple healthy nodes for failover.'
+)
+ON CONFLICT (task) DO UPDATE
+SET alias               = EXCLUDED.alias,
+    preferred_model_ids = EXCLUDED.preferred_model_ids,
+    priority            = EXCLUDED.priority,
+    notes               = EXCLUDED.notes;
+"#;
