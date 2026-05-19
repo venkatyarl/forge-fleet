@@ -634,6 +634,7 @@ impl PulseLlmRouter {
             }
         }
 
+        tracing::info!(model = %requested_model, "GW.2 rt: pre-pool-pick");
         // 1. Pool-alias expansion (optional).
         let pool_pick = match pg {
             Some(pool) => self
@@ -642,6 +643,7 @@ impl PulseLlmRouter {
                 .unwrap_or(None),
             None => None,
         };
+        tracing::info!(model = %requested_model, found = pool_pick.is_some(), "GW.2 rt: post-pool-pick");
 
         // 2. Cache-first pick for the normal path, unless affinity won.
         let picked = if let Some(t) = affinity_pick {
