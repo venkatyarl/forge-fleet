@@ -337,18 +337,21 @@ impl PulseLlmRouter {
     /// should respect that convention.
     pub fn new(redis_url: &str) -> Result<Self, LlmRoutingError> {
         let reader = PulseReader::new(redis_url)?;
-        // connect_timeout(5s): the outer tokio::time::timeout guards total
-        // response time (120s), but without a connect-level cap a TCP SYN
-        // to a dead destination retries for ~75s — combined with the
-        // 3-hit circuit-breaker threshold that meant three full 120s hangs
-        // before a bad endpoint was shed. With connect_timeout(5s) a stale
-        // beat fails the connect phase fast, the breaker trips on the
-        // first request, and subsequent traffic routes around it.
-        // (GW.1 — fixed 2026-05-19 after worker gateways hung on stale
-        // post-gemma-retirement beats from Taylor.)
+        // GW.2 (2026-05-19): the outer tokio::time::timeout in
+        // route_completion_cached only wraps `send()` — it doesn't bound
+        // the subsequent `resp.json().await?` body-read. A stalled
+        // upstream that sends headers but never the body would hang
+        // forever. Set both:
+        //   - connect_timeout(5s): TCP SYN cap, prevents the 75s-RTO
+        //     wait when the destination is gone (GW.1, stale beats).
+        //   - timeout(180s): bounds total request lifecycle including
+        //     header + body read. Just above the inner upstream_timeout
+        //     so the inner timeout fires first with a cleaner error
+        //     message — this is a safety net for the body-read leg.
         let http = Client::builder()
             .pool_idle_timeout(Duration::from_secs(30))
             .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(180))
             .build()
             .expect("build reqwest client");
         Ok(Self {
