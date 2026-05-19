@@ -351,44 +351,4 @@ impl PulseReader {
     }
 }
 
-/// Normalize a model identifier to a comparable form. Duplicated from
-/// ff-gateway's identically-named function (FA.2 — both crates need the
-/// same canonical normalizer; consolidating to ff-core is a follow-up).
-/// Keep the two implementations in sync — see ff_gateway::llm_routing.
-fn normalize_model_id(raw: &str) -> String {
-    let mut s = raw.to_ascii_lowercase();
-    if let Some(idx) = s.rfind('/') {
-        s = s[idx + 1..].to_string();
-    }
-    if let Some(idx) = s.find(':') {
-        s.truncate(idx);
-    }
-    for ext in [".gguf", ".bin", ".safetensors"] {
-        if s.ends_with(ext) {
-            s.truncate(s.len() - ext.len());
-            break;
-        }
-    }
-    s = s.replace('_', "-");
-    while s.contains("--") {
-        s = s.replace("--", "-");
-    }
-    let quant_suffixes: &[&str] = &[
-        "-q2-k", "-q3-k-s", "-q3-k-m", "-q3-k-l", "-q4-0", "-q4-1", "-q4-k-s", "-q4-k-m", "-q5-0",
-        "-q5-1", "-q5-k-s", "-q5-k-m", "-q6-k", "-q8-0", "-bf16", "-fp16", "-fp8", "-f16", "-f32",
-        "-int8", "-int4", "-awq", "-gptq",
-    ];
-    loop {
-        let mut changed = false;
-        for sfx in quant_suffixes {
-            if s.ends_with(sfx) {
-                s.truncate(s.len() - sfx.len());
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-    s.trim_matches('-').to_string()
-}
+use ff_core::model_id::normalize_model_id;

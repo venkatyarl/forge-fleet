@@ -915,59 +915,10 @@ fn compute_load_score(beat: &PulseBeatV2, server: &LlmServer) -> f64 {
 /// - Mixed case + underscore separators → lowercased, dashed
 /// - Common llama.cpp/HF quantization suffixes are stripped so a bare
 ///   family name (`qwen3-coder-30b-a3b`) prefix-matches the richer id.
-pub(crate) fn normalize_model_id(raw: &str) -> String {
-    // Lowercase first.
-    let mut s = raw.to_ascii_lowercase();
-
-    // Path-component: keep only the final segment (for HF repo-style ids
-    // like `Qwen/Qwen3-Coder-30B-A3B`).
-    if let Some(idx) = s.rfind('/') {
-        s = s[idx + 1..].to_string();
-    }
-
-    // Drop anything after a colon (Ollama tag — `:14b`, `:latest`).
-    if let Some(idx) = s.find(':') {
-        s.truncate(idx);
-    }
-
-    // Strip trailing `.gguf` / `.bin` / `.safetensors` extension.
-    for ext in [".gguf", ".bin", ".safetensors"] {
-        if s.ends_with(ext) {
-            s.truncate(s.len() - ext.len());
-            break;
-        }
-    }
-
-    // Normalize separators: underscores → dashes, collapse runs of dashes.
-    s = s.replace('_', "-");
-    while s.contains("--") {
-        s = s.replace("--", "-");
-    }
-
-    // Strip common quantization / precision suffixes if trailing.
-    // Order matters: longer suffixes first so we don't leave a stray dash.
-    let quant_suffixes: &[&str] = &[
-        "-q2-k", "-q3-k-s", "-q3-k-m", "-q3-k-l", "-q4-0", "-q4-1", "-q4-k-s", "-q4-k-m", "-q5-0",
-        "-q5-1", "-q5-k-s", "-q5-k-m", "-q6-k", "-q8-0", "-bf16", "-fp16", "-fp8", "-f16", "-f32",
-        "-int8", "-int4", "-awq", "-gptq",
-    ];
-    // Strip repeatedly — a filename may carry more than one precision tag.
-    loop {
-        let mut changed = false;
-        for sfx in quant_suffixes {
-            if s.ends_with(sfx) {
-                s.truncate(s.len() - sfx.len());
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-
-    // Trim leading/trailing dashes left over from stripping.
-    s.trim_matches('-').to_string()
-}
+// Canonical normalizer lives in ff-core::model_id (PULSE.1 consolidation).
+// Re-exported here so existing crate-internal `normalize_model_id(...)`
+// call sites keep working without a flag-day rename.
+pub(crate) use ff_core::model_id::normalize_model_id;
 
 /// Minimum `max_tokens` for qwen3-family models running in thinking mode
 /// (issue #94). Qwen3 / Qwen3-Coder / Qwen3-Omni / Qwen3-VL / Qwen3.5 /

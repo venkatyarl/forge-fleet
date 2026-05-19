@@ -24,6 +24,7 @@ pub mod fleet_resolver;
 pub mod hardware;
 pub mod leader;
 pub mod maintenance;
+pub mod model_id;
 pub mod monitor;
 pub mod notifications;
 pub mod panic_hook;
