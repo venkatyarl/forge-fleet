@@ -7015,3 +7015,31 @@ UPDATE software_registry
    )
  WHERE id='forgefleetd_git';
 "#;
+
+// V102: Make the forgefleetd_git upgrade playbook RESTART-SAFE.
+// V101 used `systemctl --user restart forgefleetd.service` which is
+// synchronous — the daemon stops, sending SIGTERM to all its children
+// including the defer-worker that's executing this playbook. The wave
+// task then exits with code -1 even though the upgrade succeeded.
+// WAVE.1 (2026-05-19): 10+ wave 4 tasks reported failed because of this.
+//
+// Fix: detach the restart sequence into a backgrounded `nohup` subshell
+// so the parent (the defer-worker shell) returns success BEFORE the
+// daemon cycles. Also use `--no-block` and a targeted zombie-kill
+// that excludes the systemd MainPID, preventing the previous
+// "kill --worker-name → kills systemd daemon" friendly-fire.
+pub const SCHEMA_V102_WAVE_SELF_KILL_FIX: &str = r#"
+-- See V101 for prior playbook. V102 wraps the kill+restart in a
+-- detached nohup subshell so the wave task can return success
+-- BEFORE the daemon cycles.
+UPDATE software_registry
+   SET upgrade_playbook = jsonb_build_object(
+     'macos',
+       'export PATH="$HOME/.cargo/bin:$PATH" && mkdir -p "$(dirname {{source_tree_path}})" && { [ -d "{{source_tree_path}}/.git" ] || git clone https://github.com/venkatyarl/forge-fleet "{{source_tree_path}}"; } && cd "{{source_tree_path}}" && git fetch origin main && git reset --hard origin/main && cargo build --release -p forge-fleet -p ff-terminal && install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && install -m 755 target/release/ff ~/.local/bin/ff && codesign --force --sign - ~/.local/bin/forgefleetd ~/.local/bin/ff && ( nohup sh -c "sleep 1; launchctl kickstart -k gui/$(id -u)/com.forgefleet.forgefleetd" >/dev/null 2>&1 </dev/null & disown )',
+     'linux-ubuntu',
+       'export PATH="$HOME/.cargo/bin:$PATH" && export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" && mkdir -p "$(dirname $HOME/.forgefleet/sub-agent-0/forge-fleet)" && { [ -d "$HOME/.forgefleet/sub-agent-0/forge-fleet/.git" ] || git clone https://github.com/venkatyarl/forge-fleet "$HOME/.forgefleet/sub-agent-0/forge-fleet"; } && cd "$HOME/.forgefleet/sub-agent-0/forge-fleet" && git fetch origin main && git reset --hard origin/main && cargo build --release -p forge-fleet -p ff-terminal && install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && install -m 755 target/release/ff ~/.local/bin/ff && ( nohup sh -c "sleep 2; MAIN=$(systemctl --user show -p MainPID forgefleetd.service 2>/dev/null | cut -d= -f2); for p in $(pgrep -f ''forgefleetd --worker-name''); do [ \"$p\" = \"$MAIN\" ] && continue; kill -TERM $p 2>/dev/null || true; done; systemctl --user reset-failed forgefleetd.service 2>/dev/null; systemctl --user restart --no-block forgefleetd.service" >/dev/null 2>&1 </dev/null & disown )',
+     'linux-dgx',
+       'export PATH="$HOME/.cargo/bin:$PATH" && export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" && mkdir -p "$(dirname $HOME/.forgefleet/sub-agent-0/forge-fleet)" && { [ -d "$HOME/.forgefleet/sub-agent-0/forge-fleet/.git" ] || git clone https://github.com/venkatyarl/forge-fleet "$HOME/.forgefleet/sub-agent-0/forge-fleet"; } && cd "$HOME/.forgefleet/sub-agent-0/forge-fleet" && git fetch origin main && git reset --hard origin/main && cargo build --release -p forge-fleet -p ff-terminal -j 2 && install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && install -m 755 target/release/ff ~/.local/bin/ff && ( nohup sh -c "sleep 2; MAIN=$(systemctl --user show -p MainPID forgefleetd.service 2>/dev/null | cut -d= -f2); for p in $(pgrep -f ''forgefleetd --worker-name''); do [ \"$p\" = \"$MAIN\" ] && continue; kill -TERM $p 2>/dev/null || true; done; systemctl --user reset-failed forgefleetd.service 2>/dev/null; systemctl --user restart --no-block forgefleetd.service" >/dev/null 2>&1 </dev/null & disown )'
+   )
+ WHERE id='forgefleetd_git';
+"#;

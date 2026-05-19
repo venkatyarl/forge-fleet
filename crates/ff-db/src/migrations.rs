@@ -637,6 +637,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "upgrade_playbook_refresh",
         sql: schema::SCHEMA_V101_UPGRADE_PLAYBOOK_REFRESH,
     },
+    PgMigration {
+        version: 102,
+        name: "wave_self_kill_fix",
+        sql: schema::SCHEMA_V102_WAVE_SELF_KILL_FIX,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.
