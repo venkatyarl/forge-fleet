@@ -978,7 +978,40 @@ async fn flip_drift_status(pool: &PgPool) -> Result<u64> {
     .await
     .context("flip drift status — block on dirty leader")?;
 
-    Ok(unblocked.rows_affected() + blocked.rows_affected())
+    // Third clause: once the fleet has CONVERGED (installed == latest) and
+    // the leader is clean, clear any stale `upgrade_blocked_dirty` rows
+    // back to `ok`. Without this, the first two clauses leave nodes stuck
+    // showing `upgrade_blocked_dirty` forever — the unblock clause requires
+    // `installed_version <> latest_version` (drift), and after a successful
+    // wave there is no drift. Observed on 2026-05-20 after two-round
+    // forgefleetd_git upgrade left 14/14 hosts at HEAD but still flagged.
+    let converged = sqlx::query(
+        r#"
+        UPDATE computer_software cs
+           SET status = 'ok'
+          FROM software_registry sr
+         WHERE sr.id = cs.software_id
+           AND sr.latest_version IS NOT NULL
+           AND sr.latest_version <> ''
+           AND cs.installed_version = sr.latest_version
+           AND cs.status = 'upgrade_blocked_dirty'
+           AND (
+             sr.id NOT IN ('ff_git', 'forgefleetd_git')
+             OR NOT EXISTS (
+               SELECT 1 FROM computer_software cs2
+                 JOIN computers c2 ON c2.id = cs2.computer_id
+                 JOIN fleet_leader_state fls ON LOWER(fls.member_name) = LOWER(c2.name)
+                WHERE cs2.software_id = sr.id
+                  AND cs2.metadata->>'git_state' = 'dirty'
+             )
+           )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .context("flip drift status — clear converged stale dirty")?;
+
+    Ok(unblocked.rows_affected() + blocked.rows_affected() + converged.rows_affected())
 }
 
 /// For every `software_registry` row with `version_source.method='npm_registry'`,
