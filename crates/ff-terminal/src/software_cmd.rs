@@ -375,9 +375,33 @@ pub async fn handle_software(cmd: crate::SoftwareCommand) -> Result<()> {
         crate::SoftwareCommand::AutoUpgradeRunOnce { force } => {
             handle_auto_upgrade_run_once(&pool, force).await
         }
+        crate::SoftwareCommand::CheckUpstream => handle_software_check_upstream(&pool).await,
         crate::SoftwareCommand::Unblock {
             computer,
             software_id,
         } => handle_software_unblock(&pool, &computer, &software_id).await,
     }
+}
+
+pub async fn handle_software_check_upstream(pool: &sqlx::PgPool) -> anyhow::Result<()> {
+    let checker = ff_agent::software_upstream::UpstreamChecker::new(pool.clone());
+    println!("probing every software_registry.version_source…");
+    let report = checker
+        .check_all()
+        .await
+        .map_err(|e| anyhow::anyhow!("upstream check failed: {e}"))?;
+    println!();
+    println!("checked:   {}", report.checked);
+    println!("updated:   {}", report.updated);
+    println!("unchanged: {}", report.unchanged);
+    println!("skipped:   {}", report.skipped);
+    println!("errors:    {}", report.errors.len());
+    if !report.errors.is_empty() {
+        println!();
+        println!("errors:");
+        for (i, (id, msg)) in report.errors.iter().enumerate() {
+            println!("  {}. {id}: {msg}", i + 1);
+        }
+    }
+    Ok(())
 }

@@ -1424,6 +1424,11 @@ enum SoftwareCommand {
         #[arg(long, default_value_t = false)]
         force: bool,
     },
+    /// Probe every `software_registry.version_source` for a newer
+    /// upstream version and populate `latest_version` accordingly.
+    /// Normally runs every 6h inside the daemon — use this to trigger
+    /// an immediate check (e.g. after editing a `version_source`).
+    CheckUpstream,
     /// Clear `status='upgrade_blocked'` and reset the failure counter for one row.
     ///
     /// After 3 consecutive auto-upgrade failures, the finalizer flips a

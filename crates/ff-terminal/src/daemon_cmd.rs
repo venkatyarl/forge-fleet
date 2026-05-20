@@ -1279,6 +1279,16 @@ pub async fn handle_daemon(
             ff_agent::external_tools_upstream::ExternalToolsUpstreamChecker::new(pool.clone());
         let _ext_upstream_handle = ext_upstream.spawn(6, portfolio_shutdown_rx.clone());
 
+        // Software upstream drift checker (6h). Scans every
+        // `software_registry` row and probes its `version_source` for
+        // a newer upstream version. Was previously dead code — the
+        // `latest_version` column stayed NULL on every row, so
+        // drift detection across `ff_git`, `forgefleetd_git`,
+        // `mlx_lm`, `rustup`, etc. silently never ran.
+        println!("{CYAN}[software-upstream]{RESET} spawning 6h software upstream checker");
+        let sw_upstream = ff_agent::software_upstream::UpstreamChecker::new(pool.clone());
+        let _sw_upstream_handle = sw_upstream.spawn(6, portfolio_shutdown_rx.clone());
+
         // Stuck-slot reaper: resets sub_agents rows stuck in 'error' or 'busy'
         // with a stale started_at so the dispatch queue can't lock up.
         println!(
