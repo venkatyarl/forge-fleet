@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.forgefleet.taylor-models-mount</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/sbin/mount</string>
+        <string>-t</string>
+        <string>nfs</string>
+        <string>-o</string>
+        <string>resvport,ro,nolocks</string>
+        <string>10.44.0.1:/Users/venkat/models</string>
+        <string>/Volumes/taylor-models</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>/var/log/forgefleet-nfs-mount.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/forgefleet-nfs-mount.err.log</string>
+</dict>
+</plist>
