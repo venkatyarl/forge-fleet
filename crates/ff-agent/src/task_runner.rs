@@ -778,6 +778,41 @@ pub async fn pg_enqueue_shell_task_with_options(
     wait_for_siblings: bool,
     excludes_computer_ids: &[uuid::Uuid],
 ) -> Result<uuid::Uuid, sqlx::Error> {
+    pg_enqueue_shell_task_full(
+        pg,
+        summary,
+        command,
+        capabilities,
+        preferred_computer,
+        parent_task_id,
+        priority,
+        created_by_computer_id,
+        wait_for_siblings,
+        excludes_computer_ids,
+        None,
+    )
+    .await
+}
+
+/// Like [`pg_enqueue_shell_task_with_options`] but with an explicit
+/// `max_duration_secs` override that pierces the per-task payload so
+/// long-running shell commands (cold cargo builds, model downloads)
+/// don't hit the default 10-min `MAX_TASK_DURATION`. Pass `None` to
+/// keep the default.
+#[allow(clippy::too_many_arguments)]
+pub async fn pg_enqueue_shell_task_full(
+    pg: &PgPool,
+    summary: &str,
+    command: &str,
+    capabilities: &[String],
+    preferred_computer: Option<&str>,
+    parent_task_id: Option<uuid::Uuid>,
+    priority: i32,
+    created_by_computer_id: Option<uuid::Uuid>,
+    wait_for_siblings: bool,
+    excludes_computer_ids: &[uuid::Uuid],
+    max_duration_secs: Option<u64>,
+) -> Result<uuid::Uuid, sqlx::Error> {
     let preferred_id: Option<uuid::Uuid> = if let Some(name) = preferred_computer {
         sqlx::query_scalar("SELECT id FROM computers WHERE name = $1")
             .bind(name)
@@ -787,7 +822,10 @@ pub async fn pg_enqueue_shell_task_with_options(
         None
     };
 
-    let payload = json!({ "command": command });
+    let payload = match max_duration_secs {
+        Some(secs) => json!({ "command": command, "max_duration_secs": secs }),
+        None => json!({ "command": command }),
+    };
     let caps = serde_json::Value::Array(
         capabilities
             .iter()
@@ -1343,10 +1381,20 @@ pub async fn compose_fleet_upgrade_wave(
             // remote bash sees the script verbatim. `ssh -T`
             // suppresses pseudo-tty allocation so the heredoc flows
             // cleanly.
+            // SSH keepalive flags are critical here — the playbook runs
+            // `cargo build --release` which compiles silently for tens of
+            // seconds at a stretch. With no client-side keepalive, an idle
+            // SSH session can be killed by an intermediate router / firewall
+            // / sshd's ClientAliveInterval, surfacing as exit=-1 to the
+            // worker. Observed on 2026-05-20: 6 of 14 builds died with
+            // exit=-1 at the 80-200s mark even with the V62 two-phase
+            // barrier already in place. Keepalive at 15s with 120 retries
+            // tolerates up to 30 minutes of pure compile silence.
             let command = format!(
                 "set -e\n\
                  echo \"== upgrading {target} via ssh from $(hostname) ==\"\n\
-                 ssh -T{port_arg} -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+                 ssh -T{port_arg} -o BatchMode=yes -o ServerAliveInterval=15 \
+                     -o ServerAliveCountMax=120 -o StrictHostKeyChecking=accept-new \
                      {ssh_user}@{primary_ip} bash -l <<'FF_PLAYBOOK_EOF'\n\
                  {playbook}\n\
                  FF_PLAYBOOK_EOF\n",
@@ -1361,7 +1409,12 @@ pub async fn compose_fleet_upgrade_wave(
             // upgrade. A peer always does the ssh+build. The exclusion
             // also closes the priya→priya self-ssh failure mode (worker
             // and target both being priya hits a stale known_hosts line).
-            pg_enqueue_shell_task_with_options(
+            //
+            // 25-min build timeout (vs default 10-min): cold cargo on the
+            // slow Ubuntu hosts (beyonce, marcus) genuinely exceeds 10
+            // minutes. Observed on 2026-05-20: 2 builds hit exactly 600s
+            // and got killed by the default MAX_TASK_DURATION mid-compile.
+            pg_enqueue_shell_task_full(
                 pg,
                 &format!(
                     "fleet-upgrade-wave/wave{wave_idx}/build: {software_id} on {}",
@@ -1375,6 +1428,7 @@ pub async fn compose_fleet_upgrade_wave(
                 Some(leader_computer_id),
                 false,
                 &[t.target_id],
+                Some(25 * 60),
             )
             .await?;
         }
@@ -1434,7 +1488,8 @@ pub async fn compose_fleet_upgrade_wave(
         let restart_command = format!(
             "set -e\n\
              echo \"== restarting forgefleetd on {target} ({os}) via ssh from $(hostname) ==\"\n\
-             ssh -T{port_arg} -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+             ssh -T{port_arg} -o BatchMode=yes -o ServerAliveInterval=15 \
+                 -o ServerAliveCountMax=20 -o StrictHostKeyChecking=accept-new \
                  {ssh_user}@{primary_ip} bash -l -c '{inner}'\n",
             target = t.target_name,
             os = t.os_family,
