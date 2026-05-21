@@ -893,6 +893,18 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                 Err(e) => anyhow::bail!("transfer failed: {e}"),
             }
         }
+        crate::ModelCommand::Where { id_or_name } => {
+            handle_model_where(&pool, &id_or_name).await?;
+        }
+        crate::ModelCommand::Distribute {
+            id_or_catalog,
+            to,
+            exclude,
+            dry_run,
+        } => {
+            handle_model_distribute(&pool, &id_or_catalog, to.as_deref(), &exclude, dry_run)
+                .await?;
+        }
         crate::ModelCommand::Convert { library_id, q_bits } => {
             let opts = ff_agent::model_convert::ConvertOptions {
                 library_id: library_id.clone(),
@@ -1406,4 +1418,244 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `ff model where <id-or-name>` — show every location of a model across the fleet.
+///
+/// Accepts:
+///   - exact library UUID
+///   - exact catalog_id (e.g. "qwen3-next-80b-a3b")
+///   - case-insensitive substring (matches catalog_id, name, or partial path)
+async fn handle_model_where(pool: &sqlx::PgPool, query: &str) -> anyhow::Result<()> {
+    use crate::CYAN;
+    use crate::RESET;
+    let rows: Vec<(
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        i64,
+        String,
+        Option<chrono::DateTime<chrono::Utc>>,
+    )> = sqlx::query_as(
+        r#"
+        SELECT
+            lib.id::text,
+            lib.worker_name,
+            lib.catalog_id,
+            lib.runtime,
+            lib.quant,
+            lib.size_bytes,
+            lib.file_path,
+            lib.last_used_at
+        FROM fleet_model_library lib
+        WHERE
+            lib.id::text = $1
+            OR lib.catalog_id = $1
+            OR lib.catalog_id ILIKE '%' || $1 || '%'
+            OR lib.file_path ILIKE '%' || $1 || '%'
+        ORDER BY lib.worker_name, lib.catalog_id
+        "#,
+    )
+    .bind(query)
+    .fetch_all(pool)
+    .await?;
+
+    if rows.is_empty() {
+        println!("(no library rows match '{query}')");
+        return Ok(());
+    }
+    println!(
+        "{CYAN}{:<10} {:<28} {:<10} {:<8} {:>9}  {}{RESET}",
+        "COMPUTER", "MODEL", "RUNTIME", "QUANT", "SIZE", "PATH"
+    );
+    for (lib_id, worker, catalog, runtime, quant, size, path, _last_used) in &rows {
+        let gb = (*size as f64) / 1024.0 / 1024.0 / 1024.0;
+        let size_s = if gb >= 1.0 {
+            format!("{:.1} GB", gb)
+        } else {
+            format!("{} MB", size / 1024 / 1024)
+        };
+        println!(
+            "{:<10} {:<28} {:<10} {:<8} {:>9}  {}",
+            worker,
+            truncate_str(catalog, 28),
+            runtime,
+            quant.as_deref().unwrap_or("-"),
+            size_s,
+            path
+        );
+        // Show library id muted
+        println!("           {}", lib_id);
+    }
+    Ok(())
+}
+
+/// `ff model distribute <id-or-catalog>` — auto-pick destination host based on
+/// runtime fit + free disk, then transfer.
+///
+/// Algorithm:
+///   1. Resolve query to library row(s). If `id_or_catalog` is a UUID, use it
+///      directly. If it's a catalog_id with multiple copies, pick the row whose
+///      worker is the most-loaded (we want to move FROM the most-burdened host).
+///   2. Read latest fleet_disk_usage per host, filter out the excluded set
+///      (defaults: source host + taylor leader).
+///   3. Rank candidates by (free_bytes desc, model_count asc) — prefer hosts
+///      with most free disk that don't already hold many models.
+///   4. Pick top candidate; print plan; transfer (unless --dry-run).
+async fn handle_model_distribute(
+    pool: &sqlx::PgPool,
+    id_or_catalog: &str,
+    pinned_to: Option<&str>,
+    exclude_csv: &str,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    use crate::{CYAN, RESET, YELLOW};
+
+    // Step 1: resolve library row to move (source).
+    let row: Option<(String, String, String, String, Option<String>, i64, String)> =
+        sqlx::query_as(
+            r#"
+            SELECT lib.id::text, lib.worker_name, lib.catalog_id, lib.runtime,
+                   lib.quant, lib.size_bytes, lib.file_path
+              FROM fleet_model_library lib
+             WHERE lib.id::text = $1 OR lib.catalog_id = $1
+             ORDER BY lib.size_bytes DESC
+             LIMIT 1
+            "#,
+        )
+        .bind(id_or_catalog)
+        .fetch_optional(pool)
+        .await?;
+    let Some((lib_id, source_worker, catalog_id, runtime, _quant, size_bytes, source_path)) = row
+    else {
+        anyhow::bail!("no library row found matching '{id_or_catalog}'");
+    };
+
+    let source_gb = (size_bytes as f64) / 1024.0 / 1024.0 / 1024.0;
+    println!(
+        "{CYAN}source{RESET}      {} on {} ({} runtime, {:.1} GB)",
+        catalog_id, source_worker, runtime, source_gb
+    );
+
+    // Step 2: build exclude set.
+    let mut excludes: std::collections::HashSet<String> = exclude_csv
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    excludes.insert(source_worker.clone());
+
+    // Step 3: candidates with free disk.
+    //
+    // Reserved-host policy (skipped by default, can be overridden with --to):
+    //   - Taylor (leader) — daily-use host, never default for cold storage
+    //   - DGX hosts (os_family='linux-dgx') — reserved for training
+    //
+    // Everything else is eligible. Among eligible hosts, just pick by free
+    // disk DESC then model_count ASC. No class-based preference.
+    let candidates: Vec<(String, i64, i64)> = sqlx::query_as(
+        r#"
+        WITH free AS (
+            SELECT DISTINCT ON (worker_name) worker_name, free_bytes
+              FROM fleet_disk_usage
+             WHERE worker_name = ANY (
+               SELECT name FROM fleet_workers WHERE status = 'online'
+             )
+             ORDER BY worker_name, sampled_at DESC
+        ),
+        load AS (
+            SELECT worker_name, count(*) AS model_count
+              FROM fleet_model_library
+             GROUP BY worker_name
+        ),
+        reserved AS (
+            SELECT name AS worker_name
+              FROM computers
+             WHERE os_family = 'linux-dgx'
+                OR name = 'taylor'
+        )
+        SELECT f.worker_name,
+               f.free_bytes,
+               COALESCE(l.model_count, 0) AS model_count
+          FROM free f
+          LEFT JOIN load l ON l.worker_name = f.worker_name
+         WHERE f.free_bytes > $1
+           AND f.worker_name NOT IN (SELECT worker_name FROM reserved)
+         ORDER BY f.free_bytes DESC,
+                  COALESCE(l.model_count, 0) ASC
+        "#,
+    )
+    .bind((size_bytes as f64 * 1.5) as i64)
+    .fetch_all(pool)
+    .await?;
+
+    let mut filtered: Vec<&(String, i64, i64)> = candidates
+        .iter()
+        .filter(|(name, _, _)| !excludes.contains(name))
+        .collect();
+    if filtered.is_empty() {
+        anyhow::bail!(
+            "no candidate host with enough free disk (need {:.1} GB × 1.5; reserved hosts: taylor + DGX; excludes={:?})",
+            source_gb,
+            excludes
+        );
+    }
+
+    let pick = if let Some(pinned) = pinned_to {
+        filtered
+            .iter()
+            .find(|(n, _, _)| n == pinned)
+            .copied()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "pinned host '{pinned}' is not in candidate set (online + enough disk + not reserved + not excluded)"
+                )
+            })?
+    } else {
+        filtered.remove(0)
+    };
+
+    let target_gb = (pick.1 as f64) / 1024.0 / 1024.0 / 1024.0;
+    println!(
+        "{CYAN}target{RESET}      {} ({:.1} GB free, {} models on disk)",
+        pick.0, target_gb, pick.2
+    );
+    println!(
+        "{CYAN}plan{RESET}        rsync {} → {}:~/models/{}/{}",
+        source_path, pick.0, runtime, catalog_id
+    );
+
+    if dry_run {
+        println!("{YELLOW}(dry-run){RESET} no transfer dispatched");
+        return Ok(());
+    }
+
+    // Step 4: dispatch transfer via existing model_transfer module.
+    let opts = ff_agent::model_transfer::TransferOptions {
+        source_node: source_worker.clone(),
+        target_node: pick.0.clone(),
+        library_id: lib_id.clone(),
+    };
+    println!("{CYAN}▶ transferring...{RESET}");
+    match ff_agent::model_transfer::transfer_model(pool, opts).await {
+        Ok(res) => {
+            println!(
+                "{CYAN}✓ done{RESET}      {} bytes  new library_id={}",
+                res.bytes_transferred, res.target_library_id
+            );
+            Ok(())
+        }
+        Err(e) => anyhow::bail!("transfer failed: {e}"),
+    }
+}
+
+fn truncate_str(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(n.saturating_sub(1)).collect();
+        format!("{truncated}…")
+    }
 }

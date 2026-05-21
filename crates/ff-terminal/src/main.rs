@@ -1843,6 +1843,25 @@ pub enum ModelCommand {
         #[arg(long)]
         to: String,
     },
+    /// Show where a model lives on the fleet (catalog_id, partial name, or library UUID).
+    Where { id_or_name: String },
+    /// Auto-distribute a model: pick the best destination host based on free disk +
+    /// runtime fit + current load, then transfer. Default policy: avoid Taylor (leader),
+    /// prefer hosts with most free disk that aren't already holding lots of models.
+    Distribute {
+        /// Library UUID OR catalog_id. If catalog_id and multiple copies exist,
+        /// the most-recently-installed is chosen as source.
+        id_or_catalog: String,
+        /// Pin the destination host (default: auto-pick).
+        #[arg(long)]
+        to: Option<String>,
+        /// Exclude these hosts (comma-separated). Default: taylor.
+        #[arg(long, default_value = "taylor")]
+        exclude: String,
+        /// Dry run — show the plan without rsync'ing.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
     /// Auto-load a catalog model on this node: resolves library row, picks a free
     /// port, calls load_model. No-op if already deployed.
     Autoload {
