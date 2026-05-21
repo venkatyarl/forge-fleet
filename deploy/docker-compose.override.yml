@@ -1,0 +1,14 @@
+# ForgeFleet infrastructure — memory limit overrides.
+#
+# Rightsizes container memory limits based on observed steady-state usage.
+# Langfuse stack was removed 2026-05-21 (88 obs in days of uptime — not
+# critical path; re-deploy when fleet_crew matures and we need LLM tracing).
+
+name: forgefleet
+
+services:
+  redis:
+    mem_limit: 64m
+
+  nats:
+    mem_limit: 64m
