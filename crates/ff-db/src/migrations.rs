@@ -662,6 +662,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "model_library_state",
         sql: schema::SCHEMA_V106_MODEL_LIBRARY_STATE,
     },
+    PgMigration {
+        version: 107,
+        name: "dispatcher_foundation",
+        sql: schema::SCHEMA_V107_DISPATCHER_FOUNDATION,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.

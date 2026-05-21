@@ -7176,6 +7176,144 @@ CREATE TABLE IF NOT EXISTS retired_skills (
 );
 "#;
 
+/// V107 — Dispatcher foundation. Adds:
+///   - task_failures: audit log of every failure with categorized recovery
+///   - task_liveness_probes: per-task multi-signal probes (CPU/GPU/disk/net/log)
+///   - host_circuit_status: per-host quarantine after repeated failures
+///   - fleet_capability_by_host: VIEW joining library + catalog + deployments
+///     so the dispatcher can ask "who can serve workload X right now?"
+///   - workload taxonomy + failure category CHECK-constrained enums
+///
+/// Pure foundation — no behavior change yet. The dispatcher subsystems
+/// that will use these tables ship in subsequent migrations + ticks.
+pub const SCHEMA_V107_DISPATCHER_FOUNDATION: &str = r#"
+-- Workload taxonomy enum (CHECK-constrained text — no PG enum type so
+-- it's easy to extend without ALTER TYPE).
+CREATE TABLE IF NOT EXISTS workload_taxonomy (
+    workload TEXT PRIMARY KEY,
+    description TEXT NOT NULL,
+    default_max_idle_secs INTEGER NOT NULL,
+    default_wall_clock_max_secs INTEGER NOT NULL
+);
+INSERT INTO workload_taxonomy (workload, description, default_max_idle_secs, default_wall_clock_max_secs)
+VALUES
+    ('chat',       'Interactive chat / single-shot completion',     90,    600),
+    ('code-gen',   'Code generation / refactor / edit',            300,   3600),
+    ('vision',     'Multimodal image/video understanding',         300,   1800),
+    ('audio',      'Speech-to-text / text-to-speech',              300,   3600),
+    ('research',   'Long-form synthesis / multi-source aggregation',300,  3600),
+    ('docs',       'Documentation generation',                     300,   1800),
+    ('embedding',  'Vector embedding computation',                  60,    300),
+    ('reranking',  'Reranker scoring',                              60,    300),
+    ('training',   'Model training (loss decay over many steps)',  900,  86400),
+    ('eval',       'Benchmark / evaluation runs',                  600,  21600),
+    ('download',   'Model / dataset download',                     120,   7200),
+    ('general',    'Catch-all for unclassified tasks',             300,   3600)
+ON CONFLICT (workload) DO UPDATE
+    SET description                = EXCLUDED.description,
+        default_max_idle_secs      = EXCLUDED.default_max_idle_secs,
+        default_wall_clock_max_secs = EXCLUDED.default_wall_clock_max_secs;
+
+-- Failure category enum — every failed task gets categorized so recovery
+-- logic can branch (transient retry vs hard fail vs circuit-break).
+CREATE TABLE IF NOT EXISTS failure_taxonomy (
+    category TEXT PRIMARY KEY,
+    description TEXT NOT NULL,
+    transient BOOLEAN NOT NULL,
+    retryable BOOLEAN NOT NULL,
+    notify_threshold INTEGER NOT NULL  -- N occurrences in 10 min before telegram
+);
+INSERT INTO failure_taxonomy (category, description, transient, retryable, notify_threshold)
+VALUES
+    ('offline',              'Worker host went offline (heartbeat stale + tasks STUCK/DEAD)', false, true,  2),
+    ('oom',                  'Out of memory — process killed by OS',                          true,  true,  3),
+    ('network_transient',    'SSH disconnect, curl timeout, brief network blip',              true,  true,  5),
+    ('slow_but_progressing', 'Past expected duration but liveness probes show activity',      false, false, 0),
+    ('genuinely_stuck',      'No progress signals for max_idle window — kill + redispatch',   false, true,  3),
+    ('dead_zombie',          'Process gone, zombie, or stopped (T/Z state) — re-dispatch',    false, true,  2),
+    ('wrong_output',         'Judge LLM scored output below quality threshold',               false, true,  3),
+    ('disk_full',            'Free disk below model_size * 1.5 — refuse new loads',           false, false, 1),
+    ('ram_exhausted',        'Host RAM exhausted — auto-unload required',                     false, false, 1),
+    ('repeated_failure',     'Same category 3x in 10 min on same host — circuit break',       false, false, 1),
+    ('exhausted',            'Retry budget + escalation ladder both exhausted',               false, false, 1)
+ON CONFLICT (category) DO UPDATE
+    SET description      = EXCLUDED.description,
+        transient        = EXCLUDED.transient,
+        retryable        = EXCLUDED.retryable,
+        notify_threshold = EXCLUDED.notify_threshold;
+
+-- Audit log of every failure observed by the dispatcher / watchdog.
+CREATE TABLE IF NOT EXISTS task_failures (
+    id            BIGSERIAL PRIMARY KEY,
+    task_id       UUID NOT NULL,
+    category      TEXT NOT NULL REFERENCES failure_taxonomy(category),
+    attempt       INTEGER NOT NULL DEFAULT 1,
+    action_taken  TEXT NOT NULL,  -- 'retry', 'circuit_break', 'escalate', 'notify_operator', etc
+    occurred_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    details       JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+CREATE INDEX IF NOT EXISTS idx_task_failures_task_id ON task_failures (task_id);
+CREATE INDEX IF NOT EXISTS idx_task_failures_category_at ON task_failures (category, occurred_at DESC);
+
+-- Per-task multi-signal liveness probes. Watchdog writes one row per
+-- running task every ~30s. STUCK only declared when ALL signals are
+-- zero for the workload's max_idle window.
+CREATE TABLE IF NOT EXISTS task_liveness_probes (
+    id                 BIGSERIAL PRIMARY KEY,
+    task_id            UUID NOT NULL,
+    probed_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    cpu_pct            REAL,
+    gpu_pct            REAL,
+    disk_read_bytes    BIGINT,
+    disk_write_bytes   BIGINT,
+    net_rx_bytes       BIGINT,
+    net_tx_bytes       BIGINT,
+    log_mtime          TIMESTAMPTZ,
+    last_stdout_hash   TEXT,
+    pid_state          TEXT,  -- R / S / D / T / Z (Linux process state)
+    runtime_signal     JSONB  -- per-runtime: tokens/sec, loss, step_count, bytes_downloaded, etc
+);
+CREATE INDEX IF NOT EXISTS idx_task_liveness_task_id_at
+    ON task_liveness_probes (task_id, probed_at DESC);
+
+-- Per-host circuit breaker — quarantine a host after repeated failures.
+CREATE TABLE IF NOT EXISTS host_circuit_status (
+    worker_name        TEXT NOT NULL,
+    failure_category   TEXT NOT NULL REFERENCES failure_taxonomy(category),
+    opened_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    opens_until        TIMESTAMPTZ NOT NULL,
+    reason             TEXT,
+    PRIMARY KEY (worker_name, failure_category)
+);
+CREATE INDEX IF NOT EXISTS idx_host_circuit_status_opens_until
+    ON host_circuit_status (opens_until);
+
+-- View: who can serve workload X right now?
+-- Answers: rows where the host has a healthy deployment of a model
+-- tagged with the requested workload.
+DROP VIEW IF EXISTS fleet_capability_by_host;
+CREATE VIEW fleet_capability_by_host AS
+SELECT
+    dep.worker_name                          AS worker_name,
+    dep.catalog_id                           AS catalog_id,
+    dep.port                                 AS port,
+    dep.runtime                              AS runtime,
+    dep.health_status                        AS health_status,
+    cat.parameters                           AS parameters,
+    cat.tier                                 AS tier,
+    cat.preferred_workloads                  AS workloads,
+    lib.state                                AS lib_state,
+    lib.last_used_at                         AS last_used_at,
+    c.os_family                              AS os_family,
+    c.gpu_kind                               AS gpu_kind,
+    c.total_ram_gb                           AS total_ram_gb
+FROM fleet_model_deployments dep
+JOIN fleet_model_catalog cat ON cat.id = dep.catalog_id
+LEFT JOIN fleet_model_library lib ON lib.id = dep.library_id
+JOIN computers c ON c.name = dep.worker_name
+WHERE dep.desired_state = 'active';
+"#;
+
 /// V106 — `state` enum on `fleet_model_library` (hot/cold) for cheap
 /// "is this model actively being served?" queries. Pairs with the
 /// existing `last_used_at` column. Both are written ONLY on state
