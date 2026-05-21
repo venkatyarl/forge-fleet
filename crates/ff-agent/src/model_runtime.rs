@@ -138,6 +138,20 @@ pub async fn load_model(pool: &sqlx::PgPool, opts: LoadOptions) -> Result<LoadRe
                 port.to_string(),
                 "--ctx-size".into(),
                 ctx.to_string(),
+                // --mlock pins all weights in RAM so the OS can't evict
+                // pages and re-read from disk. Two things this buys us:
+                //   1. Steady-state inference latency (no page faults
+                //      mid-decode after the page cache evicts under
+                //      memory pressure from other workloads).
+                //   2. The disk file can be safely deleted after load
+                //      because the mmap'd pages stay resident (the
+                //      eventual move-semantics policy #133 leans on
+                //      this — disk lives on canonical owner only).
+                // Cost: real RAM equal to model size (not pageable).
+                // Acceptable: every serving host has enough RAM for
+                // its loaded models, otherwise --mlock would have
+                // failed anyway.
+                "--mlock".into(),
             ];
             match mode {
                 ServingMode::Chat => {
