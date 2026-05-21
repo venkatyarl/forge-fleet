@@ -1163,6 +1163,11 @@ pub async fn handle_daemon(
     // result. Catches token expiry before the next inference call
     // surfaces it as a 401 to a user.
     let mut oauth_tick = tokio::time::interval(Duration::from_secs(6 * 3600));
+    // Model library scan: every 1h on EVERY node. Without this the
+    // fleet_model_library DB drifts away from on-disk reality. Observed
+    // 2026-05-21 — Taylor had 547 GB of models on disk that the DB
+    // didn't know about because no periodic scan ran.
+    let mut model_scan_tick = tokio::time::interval(Duration::from_secs(3600));
     // First tick fires immediately for each — prime all nine.
     defer_tick.tick().await;
     disk_tick.tick().await;
@@ -1173,6 +1178,7 @@ pub async fn handle_daemon(
     gh_sync_tick.tick().await;
     fabric_tick.tick().await;
     oauth_tick.tick().await;
+    model_scan_tick.tick().await;
 
     // Do an initial pass immediately on startup.
     let _ = defer_pass(&pool, &worker_name, scheduler, &slots).await;
@@ -1337,6 +1343,29 @@ pub async fn handle_daemon(
                     ),
                     Ok(_) => {}
                     Err(e) => eprintln!("{RED}[reconcile] error: {e}{RESET}"),
+                }
+            }
+            _ = model_scan_tick.tick() => {
+                // Periodic scan of this node's ~/models. Reconciles
+                // fleet_model_library against on-disk reality so the
+                // DB never silently drifts (was a real bug — Taylor's
+                // 547 GB of models were invisible to ff model list
+                // for weeks because the scanner never ran).
+                let models_dir = dirs::home_dir()
+                    .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+                    .join("models");
+                if models_dir.exists() {
+                    match ff_agent::model_library_scanner::scan_local_library(
+                        &pool, &worker_name, &models_dir,
+                    ).await {
+                        Ok(s) if s.added + s.updated + s.removed > 0 => println!(
+                            "{CYAN}[model-scan]{RESET} {} added={} updated={} removed={} total={}MB",
+                            worker_name, s.added, s.updated, s.removed,
+                            s.total_bytes / 1_048_576,
+                        ),
+                        Ok(_) => {}
+                        Err(e) => eprintln!("{RED}[model-scan] error: {e}{RESET}"),
+                    }
                 }
             }
             _ = sweep_tick.tick(), if scheduler => {
