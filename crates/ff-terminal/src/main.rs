@@ -521,6 +521,33 @@ enum Command {
         #[command(subcommand)]
         command: ToolsCommand,
     },
+    /// Docker stack placement — rank fleet hosts by free RAM/disk for a workload,
+    /// excluding reserved-class hosts (leader + DGX). Encodes the policy used by
+    /// `ff model distribute`; useful for any docker-compose service the operator
+    /// wants to relocate.
+    Stack {
+        #[command(subcommand)]
+        command: StackCommand,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum StackCommand {
+    /// Rank candidate hosts for a docker workload. Skips Taylor (leader) and
+    /// DGX (training-reserved) by default. Sorts by free RAM desc (RAM is
+    /// usually the binding constraint for docker services).
+    HostRank {
+        /// Minimum RAM required for the workload (GB). Hosts under this
+        /// threshold are excluded. Default: 4 GB.
+        #[arg(long, default_value_t = 4)]
+        min_ram_gb: i64,
+        /// Exclude these hosts (comma-separated).
+        #[arg(long, default_value = "")]
+        exclude: String,
+        /// Show the full ranking instead of just the top pick.
+        #[arg(long, default_value_t = false)]
+        all: bool,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -3103,6 +3130,18 @@ async fn main() -> Result<()> {
                 ToolsCommand::Register { node } => tools_cmd::handle_register(&pool, node).await,
             }
         }
+        Some(Command::Stack { command }) => {
+            let pool = ff_agent::fleet_info::get_fleet_pool()
+                .await
+                .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
+            match command {
+                StackCommand::HostRank {
+                    min_ram_gb,
+                    exclude,
+                    all,
+                } => handle_stack_host_rank(&pool, min_ram_gb, &exclude, all).await,
+            }
+        }
         Some(Command::Alert { command }) => alert_cmd::handle_alert(command).await,
         Some(Command::Metrics { command }) => metrics_cmd::handle_metrics(command).await,
         Some(Command::Logs {
@@ -4595,6 +4634,116 @@ async fn run_headless(
         println!("{final_message}");
     }
     Ok(())
+}
+
+/// `ff stack host-rank` — rank fleet hosts for a docker/long-running workload.
+///
+/// Policy (encoded so we don't have to remember it every time):
+///   - Skip Taylor (leader; used daily for hands-on work)
+///   - Skip DGX hosts (os_family='linux-dgx'; reserved for training)
+///   - Require host has total_ram_gb >= min_ram_gb
+///   - Rank remaining by total_ram_gb DESC then existing-load ASC
+///     (proxy for "free RAM" since we don't capture free_ram_gb yet)
+///
+/// Matches the rule used by `ff model distribute`: same reserved set, same
+/// don't-pile-on heuristic. Use `--all` to see the full ranked list.
+async fn handle_stack_host_rank(
+    pool: &sqlx::PgPool,
+    min_ram_gb: i64,
+    exclude_csv: &str,
+    show_all: bool,
+) -> anyhow::Result<()> {
+    let mut excludes: std::collections::HashSet<String> = exclude_csv
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    excludes.insert("taylor".to_string());
+
+    let rows: Vec<(String, String, Option<String>, Option<i32>, i64)> = sqlx::query_as(
+        r#"
+        SELECT c.name,
+               c.os_family,
+               c.gpu_kind,
+               c.total_ram_gb,
+               COALESCE(d.cnt, 0) AS llm_load
+          FROM computers c
+          LEFT JOIN (
+              SELECT worker_name, count(*)::bigint AS cnt
+                FROM fleet_model_deployments
+               WHERE desired_state = 'active'
+               GROUP BY worker_name
+          ) d ON d.worker_name = c.name
+         WHERE c.os_family <> 'linux-dgx'
+           AND COALESCE(c.total_ram_gb, 0) >= $1
+         ORDER BY c.total_ram_gb DESC NULLS LAST,
+                  COALESCE(d.cnt, 0) ASC
+        "#,
+    )
+    .bind(min_ram_gb as i32)
+    .fetch_all(pool)
+    .await?;
+
+    let filtered: Vec<&(String, String, Option<String>, Option<i32>, i64)> = rows
+        .iter()
+        .filter(|(name, _, _, _, _)| !excludes.contains(name))
+        .collect();
+
+    if filtered.is_empty() {
+        anyhow::bail!(
+            "no eligible host: need {} GB RAM, not Taylor, not DGX, not in excludes={:?}",
+            min_ram_gb,
+            excludes
+        );
+    }
+
+    if !show_all {
+        let pick = filtered[0];
+        println!(
+            "{CYAN}pick{RESET}      {} ({} GB RAM, {} class, {} LLMs)",
+            pick.0,
+            pick.3.unwrap_or(0),
+            class_label(&pick.1, pick.2.as_deref()),
+            pick.4
+        );
+        println!(
+            "Reserved (skipped): {}",
+            excludes.iter().cloned().collect::<Vec<_>>().join(", ")
+        );
+        return Ok(());
+    }
+
+    println!(
+        "{CYAN}{:<10} {:<6} {:<18} {:<6} {}{RESET}",
+        "HOST", "RAM_GB", "CLASS", "LLMS", "STATUS"
+    );
+    for (i, (name, os_family, gpu_kind, ram, load)) in filtered.iter().enumerate() {
+        let marker = if i == 0 { "← pick" } else { "" };
+        println!(
+            "{:<10} {:<6} {:<18} {:<6} {}",
+            name,
+            ram.unwrap_or(0),
+            class_label(os_family, gpu_kind.as_deref()),
+            load,
+            marker
+        );
+    }
+    println!();
+    println!(
+        "Reserved (skipped): {}",
+        excludes.iter().cloned().collect::<Vec<_>>().join(", ")
+    );
+    Ok(())
+}
+
+fn class_label(os_family: &str, gpu_kind: Option<&str>) -> &'static str {
+    match (os_family, gpu_kind) {
+        ("linux-dgx", _) => "DGX (training)",
+        ("macos", _) => "macOS",
+        (_, Some("amd_rocm")) => "AMD GMKtec",
+        (_, Some("nvidia_cuda")) => "NVIDIA non-DGX",
+        _ => "bare linux",
+    }
 }
 
 // ─── Phase 10: alerts / metrics / logs ─────────────────────────────────

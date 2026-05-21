@@ -1441,6 +1441,7 @@ async fn handle_model_where(pool: &sqlx::PgPool, query: &str) -> anyhow::Result<
         i64,
         String,
         Option<chrono::DateTime<chrono::Utc>>,
+        String,
     )> = sqlx::query_as(
         r#"
         SELECT
@@ -1451,7 +1452,8 @@ async fn handle_model_where(pool: &sqlx::PgPool, query: &str) -> anyhow::Result<
             lib.quant,
             lib.size_bytes,
             lib.file_path,
-            lib.last_used_at
+            lib.last_used_at,
+            lib.state
         FROM fleet_model_library lib
         WHERE
             lib.id::text = $1
@@ -1470,27 +1472,31 @@ async fn handle_model_where(pool: &sqlx::PgPool, query: &str) -> anyhow::Result<
         return Ok(());
     }
     println!(
-        "{CYAN}{:<10} {:<28} {:<10} {:<8} {:>9}  {}{RESET}",
-        "COMPUTER", "MODEL", "RUNTIME", "QUANT", "SIZE", "PATH"
+        "{CYAN}{:<10} {:<28} {:<10} {:<8} {:<5} {:>9}  {}{RESET}",
+        "COMPUTER", "MODEL", "RUNTIME", "QUANT", "STATE", "SIZE", "PATH / last_used"
     );
-    for (lib_id, worker, catalog, runtime, quant, size, path, _last_used) in &rows {
+    for (lib_id, worker, catalog, runtime, quant, size, path, last_used, state) in &rows {
         let gb = (*size as f64) / 1024.0 / 1024.0 / 1024.0;
         let size_s = if gb >= 1.0 {
             format!("{:.1} GB", gb)
         } else {
             format!("{} MB", size / 1024 / 1024)
         };
+        let used = last_used
+            .as_ref()
+            .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
+            .unwrap_or_else(|| "-".to_string());
         println!(
-            "{:<10} {:<28} {:<10} {:<8} {:>9}  {}",
+            "{:<10} {:<28} {:<10} {:<8} {:<5} {:>9}  {}",
             worker,
             truncate_str(catalog, 28),
             runtime,
             quant.as_deref().unwrap_or("-"),
+            state,
             size_s,
             path
         );
-        // Show library id muted
-        println!("           {}", lib_id);
+        println!("           id={}  last_used={}", lib_id, used);
     }
     Ok(())
 }
@@ -1516,12 +1522,16 @@ async fn handle_model_distribute(
 ) -> anyhow::Result<()> {
     use crate::{CYAN, RESET, YELLOW};
 
-    // Step 1: resolve library row to move (source).
-    let row: Option<(String, String, String, String, Option<String>, i64, String)> =
+    // Step 1: resolve library row to move (source). Refuse rows that are
+    // currently being served (state='hot') — moving a file out from
+    // under a running mmap is asking for trouble. Operator can drop
+    // the active deployment first (`ff model unload <dep-id>`) or
+    // pass --force (not implemented yet) to override.
+    let row: Option<(String, String, String, String, Option<String>, i64, String, String)> =
         sqlx::query_as(
             r#"
             SELECT lib.id::text, lib.worker_name, lib.catalog_id, lib.runtime,
-                   lib.quant, lib.size_bytes, lib.file_path
+                   lib.quant, lib.size_bytes, lib.file_path, lib.state
               FROM fleet_model_library lib
              WHERE lib.id::text = $1 OR lib.catalog_id = $1
              ORDER BY lib.size_bytes DESC
@@ -1531,10 +1541,16 @@ async fn handle_model_distribute(
         .bind(id_or_catalog)
         .fetch_optional(pool)
         .await?;
-    let Some((lib_id, source_worker, catalog_id, runtime, _quant, size_bytes, source_path)) = row
+    let Some((lib_id, source_worker, catalog_id, runtime, _quant, size_bytes, source_path, state)) =
+        row
     else {
         anyhow::bail!("no library row found matching '{id_or_catalog}'");
     };
+    if state == "hot" {
+        anyhow::bail!(
+            "library row {lib_id} is state='hot' (actively serving); unload the deployment first or wait for it to retire"
+        );
+    }
 
     let source_gb = (size_bytes as f64) / 1024.0 / 1024.0 / 1024.0;
     println!(

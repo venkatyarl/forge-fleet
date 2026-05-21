@@ -7175,3 +7175,32 @@ CREATE TABLE IF NOT EXISTS retired_skills (
     PRIMARY KEY (source, name)
 );
 "#;
+
+/// V106 — `state` enum on `fleet_model_library` (hot/cold) for cheap
+/// "is this model actively being served?" queries. Pairs with the
+/// existing `last_used_at` column. Both are written ONLY on state
+/// transitions (no periodic ticker writes).
+///
+/// Write events:
+///   - load (cold→hot): `SET state='hot', last_used_at=NOW()`
+///   - unload/retire (hot→cold): `SET state='cold'`
+///   - reconciler drift correction: same writes when reality diverges
+///
+/// Backfill: any row referenced by an active deployment → 'hot'; else 'cold'.
+pub const SCHEMA_V106_MODEL_LIBRARY_STATE: &str = r#"
+ALTER TABLE fleet_model_library
+  ADD COLUMN IF NOT EXISTS state text NOT NULL DEFAULT 'cold'
+    CHECK (state IN ('hot', 'cold'));
+
+CREATE INDEX IF NOT EXISTS idx_fleet_model_library_state
+  ON fleet_model_library (state);
+
+-- Backfill: mark hot any row referenced by an active deployment.
+UPDATE fleet_model_library lib
+   SET state = 'hot',
+       last_used_at = COALESCE(lib.last_used_at, NOW())
+  FROM fleet_model_deployments dep
+ WHERE dep.library_id = lib.id
+   AND dep.desired_state = 'active'
+   AND dep.health_status IN ('healthy', 'ok', 'starting');
+"#;

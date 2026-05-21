@@ -1168,6 +1168,12 @@ pub async fn handle_daemon(
     // 2026-05-21 — Taylor had 547 GB of models on disk that the DB
     // didn't know about because no periodic scan ran.
     let mut model_scan_tick = tokio::time::interval(Duration::from_secs(3600));
+    // Model auto-upgrade: every 1h on leader. Re-downloads cold models
+    // whose HF revision changed (ModelUpstreamChecker flagged them as
+    // revision_available). Skips models with an active deployment —
+    // operator manually upgrades those to control timing. Small batch
+    // per tick to avoid hammering HF.
+    let mut model_upgrade_tick = tokio::time::interval(Duration::from_secs(3600));
     // First tick fires immediately for each — prime all nine.
     defer_tick.tick().await;
     disk_tick.tick().await;
@@ -1179,6 +1185,7 @@ pub async fn handle_daemon(
     fabric_tick.tick().await;
     oauth_tick.tick().await;
     model_scan_tick.tick().await;
+    model_upgrade_tick.tick().await;
 
     // Do an initial pass immediately on startup.
     let _ = defer_pass(&pool, &worker_name, scheduler, &slots).await;
@@ -1343,6 +1350,97 @@ pub async fn handle_daemon(
                     ),
                     Ok(_) => {}
                     Err(e) => eprintln!("{RED}[reconcile] error: {e}{RESET}"),
+                }
+            }
+            _ = model_upgrade_tick.tick(), if is_leader => {
+                // Auto-upgrade: cold models with a newer HF revision
+                // get re-downloaded automatically. Hot deployments are
+                // left for the operator (preserve manual control over
+                // when serving models swap).
+                //
+                // The query joins model_catalog (HF rev tracking) with
+                // computer_models (per-host install state). Only rows
+                // marked 'revision_available' by the upstream checker
+                // are eligible. The NOT EXISTS clause filters out any
+                // catalog_id with an active deployment.
+                let rows = sqlx::query(
+                    r#"
+                    SELECT c.name AS host, cm.model_id, mc.upstream_latest_rev
+                      FROM computer_models cm
+                      JOIN computers c       ON c.id = cm.computer_id
+                      JOIN model_catalog mc  ON mc.id = cm.model_id
+                     WHERE cm.status = 'revision_available'
+                       AND NOT EXISTS (
+                         SELECT 1
+                           FROM fleet_model_deployments dep
+                           JOIN fleet_model_library lib ON lib.id = dep.library_id
+                          WHERE lib.catalog_id = cm.model_id
+                            AND dep.desired_state = 'active'
+                       )
+                     LIMIT 3
+                    "#,
+                )
+                .fetch_all(&pool)
+                .await;
+                match rows {
+                    Ok(rows) if !rows.is_empty() => {
+                        for row in rows {
+                            use sqlx::Row;
+                            let host: String = row.get("host");
+                            let mid: String = row.get("model_id");
+                            let rev: Option<String> = row.get("upstream_latest_rev");
+                            let rev_short = rev
+                                .as_deref()
+                                .map(|s| s.chars().take(10).collect::<String>())
+                                .unwrap_or_default();
+                            // Mark upgrading so we don't fire twice for the
+                            // same (host, model) before the download finishes.
+                            let _ = sqlx::query(
+                                "UPDATE computer_models cm
+                                    SET status = 'upgrading'
+                                  FROM computers c
+                                 WHERE cm.computer_id = c.id
+                                   AND c.name = $1
+                                   AND cm.model_id = $2",
+                            )
+                            .bind(&host)
+                            .bind(&mid)
+                            .execute(&pool)
+                            .await;
+                            // Enqueue the re-download via fleet_tasks.
+                            let cmd = format!("ff model download {} --force --node {}", mid, host);
+                            let _ = ff_agent::task_runner::pg_enqueue_shell_task(
+                                &pool,
+                                &format!(
+                                    "model-auto-upgrade: {} on {} → rev {}",
+                                    mid, host, rev_short
+                                ),
+                                &cmd,
+                                &["ff".to_string()],
+                                Some(&host),
+                                None,
+                                65,
+                                None,
+                            )
+                            .await;
+                            println!(
+                                "{CYAN}[model-upgrade]{RESET} auto-dispatched {} on {} → rev {}",
+                                mid, host, rev_short
+                            );
+                            // Best-effort telegram notify.
+                            let _ = ff_agent::telegram::send_telegram_from_secrets(
+                                &pool,
+                                "Model auto-upgrade",
+                                &format!(
+                                    "Re-downloading {} on {} (HF rev {})",
+                                    mid, host, rev_short
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => eprintln!("{RED}[model-upgrade] query error: {e}{RESET}"),
                 }
             }
             _ = model_scan_tick.tick() => {

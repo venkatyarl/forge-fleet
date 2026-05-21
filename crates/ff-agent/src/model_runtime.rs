@@ -357,6 +357,15 @@ pub async fn load_model(pool: &sqlx::PgPool, opts: LoadOptions) -> Result<LoadRe
         );
     }
 
+    // V106: mark this library row as hot + bump last_used_at. Single
+    // UPDATE per load event — no periodic ticker writes.
+    let _ = sqlx::query(
+        "UPDATE fleet_model_library SET state = 'hot', last_used_at = NOW() WHERE id = $1",
+    )
+    .bind(&lib.id)
+    .execute(pool)
+    .await;
+
     Ok(LoadResult {
         deployment_id,
         pid,
@@ -413,9 +422,25 @@ pub async fn unload_model(pool: &sqlx::PgPool, deployment_id: &str) -> Result<()
             .await;
     }
 
+    // V106: flip the library row back to cold. We capture library_id from
+    // the deployment before deleting it so we still know which row to update.
+    let lib_id = dep.library_id.clone();
     ff_db::pg_delete_deployment(pool, deployment_id)
         .await
         .map_err(|e| format!("pg_delete_deployment: {e}"))?;
+    if let Some(lid) = lib_id {
+        let _ = sqlx::query(
+            "UPDATE fleet_model_library SET state = 'cold' WHERE id = $1::uuid \
+             AND NOT EXISTS ( \
+               SELECT 1 FROM fleet_model_deployments dep2 \
+                WHERE dep2.library_id = $1::uuid \
+                  AND dep2.desired_state = 'active' \
+             )",
+        )
+        .bind(&lid)
+        .execute(pool)
+        .await;
+    }
     Ok(())
 }
 
