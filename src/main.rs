@@ -492,8 +492,8 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
     // daemons race for getUpdates() and each gets 409 Conflict every
     // ~5s; nothing usable comes through. Taylor (leader) holds the
     // session; other daemons skip the subsystem entirely.
-    let telegram_owner = std::env::var("FORGEFLEET_TELEGRAM_OWNER")
-        .unwrap_or_else(|_| "taylor".to_string());
+    let telegram_owner =
+        std::env::var("FORGEFLEET_TELEGRAM_OWNER").unwrap_or_else(|_| "taylor".to_string());
     if worker_name == telegram_owner
         && config
             .transport
@@ -1048,9 +1048,7 @@ async fn init_logging(cli: &Cli, worker_name: &str) -> Result<()> {
     });
 
     use tracing_subscriber::Layer;
-    let mut layers: Vec<
-        Box<dyn Layer<tracing_subscriber::Registry> + Send + Sync>,
-    > = Vec::new();
+    let mut layers: Vec<Box<dyn Layer<tracing_subscriber::Registry> + Send + Sync>> = Vec::new();
     if let Some(layer) = nats_layer {
         layers.push(layer.boxed());
     }

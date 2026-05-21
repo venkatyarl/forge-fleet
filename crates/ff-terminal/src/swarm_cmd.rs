@@ -74,7 +74,12 @@ pub enum SwarmCommand {
 
 pub async fn handle_swarm(cmd: SwarmCommand) -> Result<()> {
     match cmd {
-        SwarmCommand::Plan { goal, fanout, llm, model } => {
+        SwarmCommand::Plan {
+            goal,
+            fanout,
+            llm,
+            model,
+        } => {
             let plan = plan_subtasks(&goal, fanout, &llm, &model).await?;
             println!("PLAN ({} sub-tasks):", plan.len());
             for (i, t) in plan.iter().enumerate() {
@@ -155,7 +160,10 @@ async fn run_swarm(
     .await
     .context("insert swarm parent")?;
 
-    eprintln!("executor: enqueuing {} sub-tasks (parent={parent})…", subtasks.len());
+    eprintln!(
+        "executor: enqueuing {} sub-tasks (parent={parent})…",
+        subtasks.len()
+    );
     let mut child_ids = Vec::with_capacity(subtasks.len());
     for (i, sub) in subtasks.iter().enumerate() {
         let shell_safe = sub.replace('\'', "'\\''");
@@ -207,7 +215,9 @@ async fn run_swarm(
     } else {
         eprintln!("aggregator: synthesizing final result…");
         match synthesize(goal, &raw, llm, model).await {
-            Ok(s) => format!("# Swarm synthesis\n\nGoal: {goal}\n\n{s}\n\n## Raw sub-task results\n\n{raw}"),
+            Ok(s) => format!(
+                "# Swarm synthesis\n\nGoal: {goal}\n\n{s}\n\n## Raw sub-task results\n\n{raw}"
+            ),
             Err(e) => {
                 eprintln!("warn: synthesis failed ({e}); falling back to raw");
                 format!("# Swarm raw results (synthesis failed)\n\nGoal: {goal}\n\n---\n\n{raw}")
@@ -302,7 +312,10 @@ async fn plan_subtasks(goal: &str, fanout: usize, llm: &str, model: &str) -> Res
     );
     let resp = call_llm(llm, model, &prompt, 1024, 0.3).await?;
     let arr = parse_json_array(&resp).ok_or_else(|| {
-        anyhow!("planner returned non-JSON-array response: {}", truncate(&resp, 400))
+        anyhow!(
+            "planner returned non-JSON-array response: {}",
+            truncate(&resp, 400)
+        )
     })?;
     Ok(arr.into_iter().take(fanout).collect())
 }
@@ -332,7 +345,9 @@ async fn call_llm(
         .build()?;
 
     let model_id = if model.is_empty() {
-        probe_model_id(&client, endpoint).await.unwrap_or_else(|| "default".to_string())
+        probe_model_id(&client, endpoint)
+            .await
+            .unwrap_or_else(|| "default".to_string())
     } else {
         model.to_string()
     };
@@ -413,7 +428,11 @@ fn parse_json_array(s: &str) -> Option<Vec<String>> {
     let slice = &s[start..=end];
     let v: serde_json::Value = serde_json::from_str(slice).ok()?;
     let arr = v.as_array()?;
-    Some(arr.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+    Some(
+        arr.iter()
+            .filter_map(|x| x.as_str().map(String::from))
+            .collect(),
+    )
 }
 
 fn truncate(s: &str, max: usize) -> String {

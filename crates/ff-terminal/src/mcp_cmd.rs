@@ -81,9 +81,7 @@ pub async fn handle_mcp(cmd: McpCommand) -> Result<()> {
         } => {
             let targets = resolve_targets(&client);
             for target in targets {
-                if let Err(e) =
-                    install_one(target, &server_url, !no_instructions, dry_run).await
-                {
+                if let Err(e) = install_one(target, &server_url, !no_instructions, dry_run).await {
                     eprintln!("  ✗ {target}: {e}");
                 }
             }
@@ -183,7 +181,10 @@ fn install_cursor(home: &std::path::Path, server_url: &str, dry_run: bool) -> Re
 
 // ─── Windsurf ────────────────────────────────────────────────────────────────
 fn install_windsurf(home: &std::path::Path, server_url: &str, dry_run: bool) -> Result<()> {
-    let config = home.join(".codeium").join("windsurf").join("mcp_config.json");
+    let config = home
+        .join(".codeium")
+        .join("windsurf")
+        .join("mcp_config.json");
     upsert_mcp_server_json(&config, "forgefleet", server_url, dry_run)?;
     println!("  ✓ windsurf: {}", config.display());
     Ok(())
@@ -263,9 +264,7 @@ fn upsert_codex_mcp(
         String::new()
     };
 
-    let block = format!(
-        "\n[mcp_servers.{server_name}]\ntype = \"http\"\nurl = \"{server_url}\"\n"
-    );
+    let block = format!("\n[mcp_servers.{server_name}]\ntype = \"http\"\nurl = \"{server_url}\"\n");
 
     // If the marker is already present and points at the same URL, skip.
     let marker = format!("[mcp_servers.{server_name}]");
@@ -337,7 +336,9 @@ fn upsert_goose_mcp(
     let new_content = if existing.contains(&marker) {
         // Leave existing untouched if it points at a different URL — operator
         // should reconcile manually. Print a warning instead of clobbering.
-        eprintln!("    ! goose already has '{server_name}' configured at a different URL; not overwriting");
+        eprintln!(
+            "    ! goose already has '{server_name}' configured at a different URL; not overwriting"
+        );
         return Ok(());
     } else {
         let mut out = existing;
@@ -368,7 +369,10 @@ fn append_instructions_md(path: &PathBuf, dry_run: bool) -> Result<()> {
         return Ok(());
     }
     if dry_run {
-        println!("    (dry-run) would append routing rule to {}", path.display());
+        println!(
+            "    (dry-run) would append routing rule to {}",
+            path.display()
+        );
         return Ok(());
     }
     let mut out = existing;
@@ -389,12 +393,25 @@ fn print_status() {
         }
     };
     let candidates: &[(&str, Vec<PathBuf>)] = &[
-        ("claude-code", vec![home.join(".claude").join("settings.json")]),
+        (
+            "claude-code",
+            vec![home.join(".claude").join("settings.json")],
+        ),
         ("codex", vec![home.join(".codex").join("config.toml")]),
         ("kimi", vec![home.join(".kimi").join("config.json")]),
         ("cursor", vec![home.join(".cursor").join("mcp.json")]),
-        ("windsurf", vec![home.join(".codeium").join("windsurf").join("mcp_config.json")]),
-        ("goose", vec![home.join(".config").join("goose").join("config.yaml")]),
+        (
+            "windsurf",
+            vec![
+                home.join(".codeium")
+                    .join("windsurf")
+                    .join("mcp_config.json"),
+            ],
+        ),
+        (
+            "goose",
+            vec![home.join(".config").join("goose").join("config.yaml")],
+        ),
     ];
     println!("MCP client configs on this computer:");
     for (name, paths) in candidates {

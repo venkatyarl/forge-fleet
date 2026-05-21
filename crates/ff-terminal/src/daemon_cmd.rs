@@ -1189,6 +1189,15 @@ pub async fn handle_daemon(
     // destinations that are actually reachable at a reasonable
     // speed (not just have free disk).
     let mut link_probe_tick = tokio::time::interval(Duration::from_secs(24 * 3600));
+    // Liveness tick: every 30s, probe every running task on THIS host
+    // (ps -o cpu/rss/state) and write a row to task_liveness_probes.
+    // Then evaluate every probed task; if Dead, mark the task failed +
+    // record into task_failures + increment circuit breaker + maybe
+    // notify operator. If Stuck (no progress for max_idle_secs), same.
+    // If Slow but progressing, just leave it alone — multi-signal
+    // liveness means a low-CPU model load that's still writing to disk
+    // counts as alive.
+    let mut liveness_tick = tokio::time::interval(Duration::from_secs(30));
     // First tick fires immediately for each — prime all nine.
     defer_tick.tick().await;
     disk_tick.tick().await;
@@ -1204,6 +1213,7 @@ pub async fn handle_daemon(
     mesh_repair_tick.tick().await;
     placement_rebalance_tick.tick().await;
     link_probe_tick.tick().await;
+    liveness_tick.tick().await;
 
     // Do an initial pass immediately on startup.
     let _ = defer_pass(&pool, &worker_name, scheduler, &slots).await;
@@ -1649,6 +1659,113 @@ pub async fn handle_daemon(
                             None,
                         )
                         .await;
+                    }
+                }
+            }
+            _ = liveness_tick.tick() => {
+                // Probe every running task on THIS host. Writes one
+                // row to task_liveness_probes per task. Cheap (one
+                // `ps` per task, ~10ms each).
+                match ff_agent::task_probe::probe_all_running(&pool, &worker_name).await {
+                    Ok(n) if n > 0 => println!(
+                        "{CYAN}[liveness]{RESET} {} probed {n} tasks",
+                        worker_name
+                    ),
+                    Ok(_) => {}
+                    Err(e) => eprintln!("{RED}[liveness] probe error: {e}{RESET}"),
+                }
+
+                // Evaluate every running task we just probed. Dead →
+                // mark failed, record into task_failures, bump circuit
+                // breaker, maybe Telegram. Stuck → same (multi-signal
+                // liveness already filtered out slow-but-progressing).
+                #[derive(sqlx::FromRow)]
+                struct RunningRow {
+                    id: uuid::Uuid,
+                    kind: String,
+                }
+                let running: Result<Vec<RunningRow>, _> = sqlx::query_as(
+                    "SELECT t.id, t.kind
+                       FROM fleet_tasks t
+                       JOIN computers  c ON c.id = t.claimed_by_computer_id
+                      WHERE c.name = $1
+                        AND t.status = 'running'"
+                )
+                .bind(&worker_name)
+                .fetch_all(&pool)
+                .await;
+
+                if let Ok(rows) = running {
+                    for r in rows {
+                        // Default max_idle is 300s; refined by workload
+                        // taxonomy in the dispatcher. For now use a
+                        // conservative 600s so we don't kill long
+                        // model loads.
+                        let liveness = ff_agent::watchdog::evaluate_task(
+                            &pool, r.id, 600,
+                        ).await;
+                        let Ok(state) = liveness else { continue };
+                        if !matches!(state,
+                            ff_agent::watchdog::TaskLiveness::Dead
+                            | ff_agent::watchdog::TaskLiveness::Stuck)
+                        {
+                            continue;
+                        }
+                        let category = match state {
+                            ff_agent::watchdog::TaskLiveness::Dead => "dead_zombie",
+                            ff_agent::watchdog::TaskLiveness::Stuck => "genuinely_stuck",
+                            _ => continue,
+                        };
+                        println!(
+                            "{RED}[liveness]{RESET} task {} on {}: {} ({})",
+                            r.id, worker_name, category, r.kind
+                        );
+
+                        // Record into task_failures.
+                        let _ = sqlx::query(
+                            "INSERT INTO task_failures (task_id, category, attempt, action_taken)
+                             VALUES ($1, $2, 0, 'liveness_kill')"
+                        )
+                        .bind(r.id)
+                        .bind(category)
+                        .execute(&pool)
+                        .await;
+
+                        // Trip circuit breaker if 3+ failures in 10min.
+                        let tripped = ff_agent::circuit_breaker::record_failure(
+                            &pool, &worker_name, category,
+                        ).await.unwrap_or(false);
+                        if tripped {
+                            println!(
+                                "{RED}[circuit-breaker]{RESET} {} quarantined for {} (15 min)",
+                                worker_name, category
+                            );
+                        }
+
+                        // Notify operator if policy says so.
+                        let should = ff_agent::notification::should_notify(
+                            &pool, &worker_name, category,
+                        ).await.unwrap_or(false);
+                        if should {
+                            let _ = ff_agent::telegram::send_telegram_from_secrets(
+                                &pool,
+                                &format!("ff liveness: {category}"),
+                                &format!(
+                                    "Task {} on {} marked {category}. Circuit breaker {}.",
+                                    r.id, worker_name,
+                                    if tripped { "TRIPPED" } else { "still closed" },
+                                ),
+                            ).await;
+                            let _ = ff_agent::notification::record_notification(
+                                &pool,
+                                Some(r.id),
+                                category,
+                                serde_json::json!({
+                                    "worker": worker_name,
+                                    "circuit_tripped": tripped,
+                                }),
+                            ).await;
+                        }
                     }
                 }
             }

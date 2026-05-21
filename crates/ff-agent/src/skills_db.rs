@@ -70,10 +70,26 @@ impl SkillRow {
 
 /// List all skills currently in the DB, sorted by (source, family, name).
 pub async fn list_all(pool: &PgPool) -> Result<Vec<SkillRow>> {
-    let rows = sqlx::query_as::<_, (
-        Uuid, String, String, Option<String>, String, Option<String>, Option<String>,
-        Option<String>, JsonValue, String, String, String, Option<Uuid>, Option<Uuid>, JsonValue,
-    )>(
+    let rows = sqlx::query_as::<
+        _,
+        (
+            Uuid,
+            String,
+            String,
+            Option<String>,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            JsonValue,
+            String,
+            String,
+            String,
+            Option<Uuid>,
+            Option<Uuid>,
+            JsonValue,
+        ),
+    >(
         r#"
         SELECT id, name, source, source_url, version, family, description,
                when_to_invoke, tools, body_md, body_sha256, risk_level,
@@ -89,34 +105,69 @@ pub async fn list_all(pool: &PgPool) -> Result<Vec<SkillRow>> {
 
     Ok(rows
         .into_iter()
-        .map(|(
-            id, name, source, source_url, version, family, description, when_to_invoke,
-            tools, body_md, body_sha256, risk_level, canonical_skill_id, superseded_by, combines,
-        )| SkillRow {
-            id,
-            name,
-            source,
-            source_url,
-            version,
-            family,
-            description,
-            when_to_invoke,
-            tools,
-            body_md,
-            body_sha256,
-            risk_level,
-            canonical_skill_id,
-            superseded_by,
-            combines,
-        })
+        .map(
+            |(
+                id,
+                name,
+                source,
+                source_url,
+                version,
+                family,
+                description,
+                when_to_invoke,
+                tools,
+                body_md,
+                body_sha256,
+                risk_level,
+                canonical_skill_id,
+                superseded_by,
+                combines,
+            )| SkillRow {
+                id,
+                name,
+                source,
+                source_url,
+                version,
+                family,
+                description,
+                when_to_invoke,
+                tools,
+                body_md,
+                body_sha256,
+                risk_level,
+                canonical_skill_id,
+                superseded_by,
+                combines,
+            },
+        )
         .collect())
 }
 
-pub async fn get_by_name_source(pool: &PgPool, name: &str, source: &str) -> Result<Option<SkillRow>> {
-    let row = sqlx::query_as::<_, (
-        Uuid, String, String, Option<String>, String, Option<String>, Option<String>,
-        Option<String>, JsonValue, String, String, String, Option<Uuid>, Option<Uuid>, JsonValue,
-    )>(
+pub async fn get_by_name_source(
+    pool: &PgPool,
+    name: &str,
+    source: &str,
+) -> Result<Option<SkillRow>> {
+    let row = sqlx::query_as::<
+        _,
+        (
+            Uuid,
+            String,
+            String,
+            Option<String>,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            JsonValue,
+            String,
+            String,
+            String,
+            Option<Uuid>,
+            Option<Uuid>,
+            JsonValue,
+        ),
+    >(
         r#"
         SELECT id, name, source, source_url, version, family, description,
                when_to_invoke, tools, body_md, body_sha256, risk_level,
@@ -133,26 +184,41 @@ pub async fn get_by_name_source(pool: &PgPool, name: &str, source: &str) -> Resu
     .await
     .context("select skill by name+source")?;
 
-    Ok(row.map(|(
-        id, name, source, source_url, version, family, description, when_to_invoke,
-        tools, body_md, body_sha256, risk_level, canonical_skill_id, superseded_by, combines,
-    )| SkillRow {
-        id,
-        name,
-        source,
-        source_url,
-        version,
-        family,
-        description,
-        when_to_invoke,
-        tools,
-        body_md,
-        body_sha256,
-        risk_level,
-        canonical_skill_id,
-        superseded_by,
-        combines,
-    }))
+    Ok(row.map(
+        |(
+            id,
+            name,
+            source,
+            source_url,
+            version,
+            family,
+            description,
+            when_to_invoke,
+            tools,
+            body_md,
+            body_sha256,
+            risk_level,
+            canonical_skill_id,
+            superseded_by,
+            combines,
+        )| SkillRow {
+            id,
+            name,
+            source,
+            source_url,
+            version,
+            family,
+            description,
+            when_to_invoke,
+            tools,
+            body_md,
+            body_sha256,
+            risk_level,
+            canonical_skill_id,
+            superseded_by,
+            combines,
+        },
+    ))
 }
 
 /// Upsert a skill from raw frontmatter+body. If a row with the same
@@ -177,14 +243,13 @@ pub async fn upsert_skill(
     let body_sha = sha256_hex(body_md);
 
     // Block re-import if (source, name) is retired.
-    let retired: Option<(String,)> = sqlx::query_as(
-        "SELECT retired_reason FROM retired_skills WHERE source = $1 AND name = $2",
-    )
-    .bind(source)
-    .bind(name)
-    .fetch_optional(pool)
-    .await
-    .context("check retired_skills")?;
+    let retired: Option<(String,)> =
+        sqlx::query_as("SELECT retired_reason FROM retired_skills WHERE source = $1 AND name = $2")
+            .bind(source)
+            .bind(name)
+            .fetch_optional(pool)
+            .await
+            .context("check retired_skills")?;
     if let Some((reason,)) = retired {
         return Err(anyhow!(
             "skill {source}/{name} is retired — reason: {reason}; remove from retired_skills to re-import"
@@ -392,10 +457,16 @@ fn render_skill_md(s: &SkillRow) -> String {
     out.push_str("---\n");
     out.push_str(&format!("name: {}\n", s.name));
     if let Some(desc) = &s.description {
-        out.push_str(&format!("description: |\n  {}\n", desc.replace('\n', "\n  ")));
+        out.push_str(&format!(
+            "description: |\n  {}\n",
+            desc.replace('\n', "\n  ")
+        ));
     }
     if let Some(when) = &s.when_to_invoke {
-        out.push_str(&format!("when-to-invoke: |\n  {}\n", when.replace('\n', "\n  ")));
+        out.push_str(&format!(
+            "when-to-invoke: |\n  {}\n",
+            when.replace('\n', "\n  ")
+        ));
     }
     if let Some(family) = &s.family {
         out.push_str(&format!("family: {family}\n"));
@@ -528,9 +599,7 @@ pub async fn import_repo_skills(
                         }
                     }
                     Err(e) => {
-                        eprintln!(
-                            "warn: upsert {source}/{name} failed: {e}"
-                        );
+                        eprintln!("warn: upsert {source}/{name} failed: {e}");
                         errors += 1;
                     }
                 }
@@ -562,7 +631,9 @@ fn find_skill_files(root: &Path) -> Result<Vec<PathBuf>> {
                 let p = entry.path();
                 if p.file_name()
                     .and_then(|n| n.to_str())
-                    .map(|n| n.eq_ignore_ascii_case("SKILL.md") || n.eq_ignore_ascii_case("skill.md"))
+                    .map(|n| {
+                        n.eq_ignore_ascii_case("SKILL.md") || n.eq_ignore_ascii_case("skill.md")
+                    })
                     .unwrap_or(false)
                 {
                     out.push(p);

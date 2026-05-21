@@ -4198,7 +4198,10 @@ mod fleet_visibility_tests {
         );
         assert_eq!(payload.nodes[0].status, "offline");
         assert_eq!(payload.nodes[0].source_kind, "runtime/db");
-        assert_eq!(payload.nodes[0].models_loaded, vec!["qwen3-coder-30b".to_string()]);
+        assert_eq!(
+            payload.nodes[0].models_loaded,
+            vec!["qwen3-coder-30b".to_string()]
+        );
     }
 }
 

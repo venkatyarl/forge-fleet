@@ -111,13 +111,31 @@ pub async fn handle_skills(cmd: SkillsCommand) -> Result<()> {
             source,
             source_url,
             family,
-        } => import_cmd(&pool, &path, &source, source_url.as_deref(), family.as_deref()).await,
+        } => {
+            import_cmd(
+                &pool,
+                &path,
+                &source,
+                source_url.as_deref(),
+                family.as_deref(),
+            )
+            .await
+        }
         SkillsCommand::ImportRepo {
             url,
             source,
             family,
             r#ref,
-        } => import_repo_cmd(&pool, &url, source.as_deref(), family.as_deref(), r#ref.as_deref()).await,
+        } => {
+            import_repo_cmd(
+                &pool,
+                &url,
+                source.as_deref(),
+                family.as_deref(),
+                r#ref.as_deref(),
+            )
+            .await
+        }
         SkillsCommand::Stats => stats_cmd(&pool).await,
     }
 }
@@ -140,11 +158,16 @@ async fn list_cmd(
         })
         .collect();
     filtered.sort_by(|a, b| {
-        (a.source.as_str(), a.family.as_deref().unwrap_or(""), a.name.as_str()).cmp(&(
-            b.source.as_str(),
-            b.family.as_deref().unwrap_or(""),
-            b.name.as_str(),
-        ))
+        (
+            a.source.as_str(),
+            a.family.as_deref().unwrap_or(""),
+            a.name.as_str(),
+        )
+            .cmp(&(
+                b.source.as_str(),
+                b.family.as_deref().unwrap_or(""),
+                b.name.as_str(),
+            ))
     });
 
     println!(
@@ -152,7 +175,13 @@ async fn list_cmd(
         "NAME", "SOURCE", "FAMILY", "VERSION", "RISK", "DESCRIPTION"
     );
     for s in &filtered {
-        let desc = s.description.as_deref().unwrap_or("").lines().next().unwrap_or("");
+        let desc = s
+            .description
+            .as_deref()
+            .unwrap_or("")
+            .lines()
+            .next()
+            .unwrap_or("");
         let desc = if desc.len() > 60 {
             format!("{}…", &desc[..60])
         } else {

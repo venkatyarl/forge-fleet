@@ -1546,9 +1546,17 @@ async fn handle_model_distribute(
     // under a running mmap is asking for trouble. Operator can drop
     // the active deployment first (`ff model unload <dep-id>`) or
     // pass --force (not implemented yet) to override.
-    let row: Option<(String, String, String, String, Option<String>, i64, String, String)> =
-        sqlx::query_as(
-            r#"
+    let row: Option<(
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        i64,
+        String,
+        String,
+    )> = sqlx::query_as(
+        r#"
             SELECT lib.id::text, lib.worker_name, lib.catalog_id, lib.runtime,
                    lib.quant, lib.size_bytes, lib.file_path, lib.state
               FROM fleet_model_library lib
@@ -1556,10 +1564,10 @@ async fn handle_model_distribute(
              ORDER BY lib.size_bytes DESC
              LIMIT 1
             "#,
-        )
-        .bind(id_or_catalog)
-        .fetch_optional(pool)
-        .await?;
+    )
+    .bind(id_or_catalog)
+    .fetch_optional(pool)
+    .await?;
     let Some((lib_id, source_worker, catalog_id, runtime, _quant, size_bytes, source_path, state)) =
         row
     else {
@@ -1698,9 +1706,14 @@ async fn handle_model_upgrade_available(pool: &sqlx::PgPool) -> anyhow::Result<(
     use crate::RESET;
     use crate::YELLOW;
 
-    let rows: Vec<(String, String, Option<String>, Option<String>, Option<chrono::DateTime<chrono::Utc>>)> =
-        sqlx::query_as(
-            r#"
+    let rows: Vec<(
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<chrono::DateTime<chrono::Utc>>,
+    )> = sqlx::query_as(
+        r#"
             SELECT mc.id, mc.upstream_id,
                    mc.upstream_latest_rev,
                    string_agg(DISTINCT cm.status, ',') AS install_statuses,
@@ -1718,9 +1731,9 @@ async fn handle_model_upgrade_available(pool: &sqlx::PgPool) -> anyhow::Result<(
              GROUP BY mc.id, mc.upstream_id, mc.upstream_latest_rev
              ORDER BY last_checked DESC NULLS LAST
             "#,
-        )
-        .fetch_all(pool)
-        .await?;
+    )
+    .fetch_all(pool)
+    .await?;
 
     if rows.is_empty() {
         println!("{CYAN}✓ all catalog models match upstream{RESET}");

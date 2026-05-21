@@ -3,12 +3,17 @@ pub mod agent_hint;
 pub mod agent_loop;
 pub mod agent_roles;
 pub mod auto_upgrade;
+pub mod circuit_breaker;
 pub mod deadlines;
 pub mod defer_worker;
 pub mod dispatcher;
+pub mod notification;
 pub mod research;
+pub mod retry_policy;
 pub mod review_pipeline;
 pub mod skill_catalog;
+pub mod task_probe;
+pub mod watchdog;
 
 /// Re-export of the panic-hook module that lives in `ff-core`. Keeps
 /// existing call sites (`ff_agent::panic_hook::install()`) working.

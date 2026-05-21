@@ -395,7 +395,8 @@ fn recommend_engines(hardware: &str, ram_gb: u64) -> String {
     output.push_str(&format!("\n## Model Sizes for {ram_gb}GB RAM:\n"));
     if ram_gb >= 128 {
         output.push_str("  - Can run: 405B (Q4) or multiple 70B models simultaneously\n");
-        output.push_str("  - Recommended: Llama-3.1-405B, Qwen3.6-35B-A3B, 2× Qwen3-Coder-30B-A3B\n");
+        output
+            .push_str("  - Recommended: Llama-3.1-405B, Qwen3.6-35B-A3B, 2× Qwen3-Coder-30B-A3B\n");
     } else if ram_gb >= 64 {
         output.push_str("  - Can run: 72B (Q4) or 2× 32B models\n");
         output.push_str("  - Recommended: Qwen3.6-35B-A3B, Llama-3.1-70B\n");
