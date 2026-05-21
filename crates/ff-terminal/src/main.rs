@@ -1845,6 +1845,9 @@ pub enum ModelCommand {
     },
     /// Show where a model lives on the fleet (catalog_id, partial name, or library UUID).
     Where { id_or_name: String },
+    /// List catalog models with newer HuggingFace revisions available (detected by
+    /// the daily ModelUpstreamChecker tick). Use `ff model upgrade <id>` to act.
+    UpgradeAvailable,
     /// Auto-distribute a model: pick the best destination host based on free disk +
     /// runtime fit + current load, then transfer. Default policy: avoid Taylor (leader),
     /// prefer hosts with most free disk that aren't already holding lots of models.

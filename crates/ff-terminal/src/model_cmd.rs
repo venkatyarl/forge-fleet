@@ -896,6 +896,9 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
         crate::ModelCommand::Where { id_or_name } => {
             handle_model_where(&pool, &id_or_name).await?;
         }
+        crate::ModelCommand::UpgradeAvailable => {
+            handle_model_upgrade_available(&pool).await?;
+        }
         crate::ModelCommand::Distribute {
             id_or_catalog,
             to,
@@ -1649,6 +1652,74 @@ async fn handle_model_distribute(
         }
         Err(e) => anyhow::bail!("transfer failed: {e}"),
     }
+}
+
+/// `ff model upgrade-available` — list catalog rows where upstream HF revision
+/// has moved past what's on disk. Driven by the daily `ModelUpstreamChecker`
+/// tick which writes `model_catalog.upstream_latest_rev` and flips
+/// `computer_models.status = 'revision_available'` for stale rows.
+async fn handle_model_upgrade_available(pool: &sqlx::PgPool) -> anyhow::Result<()> {
+    use crate::CYAN;
+    use crate::RESET;
+    use crate::YELLOW;
+
+    let rows: Vec<(String, String, Option<String>, Option<String>, Option<chrono::DateTime<chrono::Utc>>)> =
+        sqlx::query_as(
+            r#"
+            SELECT mc.id, mc.upstream_id,
+                   mc.upstream_latest_rev,
+                   string_agg(DISTINCT cm.status, ',') AS install_statuses,
+                   max(mc.upstream_checked_at)         AS last_checked
+              FROM model_catalog mc
+              LEFT JOIN computer_models cm
+                ON cm.model_id = mc.id AND cm.present = true
+             WHERE mc.upstream_id IS NOT NULL
+               AND mc.upstream_latest_rev IS NOT NULL
+               AND EXISTS (
+                 SELECT 1 FROM computer_models cm2
+                  WHERE cm2.model_id = mc.id
+                    AND cm2.status = 'revision_available'
+               )
+             GROUP BY mc.id, mc.upstream_id, mc.upstream_latest_rev
+             ORDER BY last_checked DESC NULLS LAST
+            "#,
+        )
+        .fetch_all(pool)
+        .await?;
+
+    if rows.is_empty() {
+        println!("{CYAN}✓ all catalog models match upstream{RESET}");
+        return Ok(());
+    }
+
+    println!(
+        "{CYAN}{:<24} {:<48} {:<14} {}{RESET}",
+        "MODEL", "UPSTREAM_REPO", "LATEST_REV", "LAST_CHECKED"
+    );
+    for (id, upstream_id, rev, _statuses, last_checked) in &rows {
+        let rev_short = rev
+            .as_deref()
+            .map(|s| s.chars().take(10).collect::<String>())
+            .unwrap_or_default();
+        let checked = last_checked
+            .as_ref()
+            .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
+            .unwrap_or_default();
+        println!(
+            "{:<24} {:<48} {:<14} {}",
+            truncate_str(id, 24),
+            truncate_str(upstream_id, 48),
+            rev_short,
+            checked
+        );
+    }
+    println!();
+    println!(
+        "{YELLOW}Tip:{RESET} this only shows DETECTED drift. The auto-upgrade verb is task #140 — \
+         for now, manually `ff model download <id> --force --node <canonical>` on the canonical \
+         owner, then verify + delete old file."
+    );
+    Ok(())
 }
 
 fn truncate_str(s: &str, n: usize) -> String {
