@@ -263,8 +263,21 @@ fn classify_dir(path: &Path, catalog: &[ff_db::ModelCatalogRow]) -> Option<Disco
 
     // --- Safetensors path ---
     if has_index || !safetensor_paths.is_empty() {
+        // Runtime detection:
+        //   - explicit mlx hint in dirname  → "mlx" (operator was deliberate)
+        //   - on macOS                       → "mlx" (only Apple Silicon runtime
+        //                                       that loads safetensors)
+        //   - everywhere else                → "vllm" (Linux+CUDA pattern)
+        //
+        // Before this fix, the scanner picked "vllm" for any safetensors dir
+        // regardless of host OS. That caused Taylor's qwen36-35b-a3b
+        // (HF-format dir served by mlx_lm.server) to show up as runtime=vllm
+        // — which then blocked `ff model delete` with a false "active
+        // deployment" check (deployment was on a different runtime).
         let runtime =
             if lower.ends_with("-mlx") || lower.ends_with("-4bit") || lower.contains("mlx") {
+                "mlx"
+            } else if std::env::consts::OS == "macos" {
                 "mlx"
             } else {
                 "vllm"
