@@ -1410,10 +1410,12 @@ pub async fn compose_fleet_upgrade_wave(
             // also closes the priya→priya self-ssh failure mode (worker
             // and target both being priya hits a stale known_hosts line).
             //
-            // 25-min build timeout (vs default 10-min): cold cargo on the
-            // slow Ubuntu hosts (beyonce, marcus) genuinely exceeds 10
-            // minutes. Observed on 2026-05-20: 2 builds hit exactly 600s
-            // and got killed by the default MAX_TASK_DURATION mid-compile.
+            // 45-min build timeout (vs default 10-min): cold cargo on the
+            // slow Ubuntu hosts (beyonce, marcus) genuinely exceeds 25
+            // minutes now. 2026-05-20 used 25min and 2 builds hit it;
+            // 2026-05-21 wave still saw 4/14 hit the 25-min cap (ace,
+            // lily, rihanna, priya) because ~15 crates landed this
+            // month. 45min absorbs the new normal with headroom.
             pg_enqueue_shell_task_full(
                 pg,
                 &format!(
@@ -1428,7 +1430,7 @@ pub async fn compose_fleet_upgrade_wave(
                 Some(leader_computer_id),
                 false,
                 &[t.target_id],
-                Some(25 * 60),
+                Some(45 * 60),
             )
             .await?;
         }
