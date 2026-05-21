@@ -269,9 +269,28 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
             }
 
             // Compute destination dir under models_dir.
+            //
+            // V139 dir-layout enforcement: new downloads land in
+            // <models_dir>/<runtime>/<catalog_id>/ so the runtime is
+            // obvious from the path. Old downloads stay where they are;
+            // they'll migrate lazily when their deployment restarts and
+            // the (deferred) #136b startup-fetch wrapper drops the new
+            // copy into the canonical path.
             let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
             let models_dir = expand_tilde(&node_row.models_dir, &home);
-            let dest = models_dir.join(&id);
+            let runtime_subdir = match target_runtime.as_str() {
+                "llama.cpp" => "llama-cpp",
+                "mlx" => "mlx",
+                "vllm" => "vllm",
+                "ollama" => "ollama",
+                other => other,
+            };
+            let dest = models_dir.join(runtime_subdir).join(&id);
+            // Ensure runtime parent exists (mkdir -p) before hf_download
+            // tries to create the leaf dir. Cheap if already there.
+            if let Some(parent) = dest.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
 
             // HF token (optional — gated models need it).
             let token = ff_agent::fleet_info::get_hf_token().await;

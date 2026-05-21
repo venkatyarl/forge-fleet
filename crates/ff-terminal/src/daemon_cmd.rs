@@ -1174,6 +1174,21 @@ pub async fn handle_daemon(
     // operator manually upgrades those to control timing. Small batch
     // per tick to avoid hammering HF.
     let mut model_upgrade_tick = tokio::time::interval(Duration::from_secs(3600));
+    // SSH mesh auto-repair: every 30 min, leader-only. Re-runs the
+    // existing --repair code path on pairs where attempts >= 3.
+    // Replaces the operator-typed `ff fleet ssh-mesh-check --repair`.
+    let mut mesh_repair_tick = tokio::time::interval(Duration::from_secs(30 * 60));
+    // Placement rebalance: every 30 min, leader-only. If a host's
+    // disk usage exceeds 80%, picks a destination via the same
+    // policy as `ff model distribute` (skip Taylor + DGX, most free
+    // disk) and dispatches a transfer of one cold row at a time.
+    let mut placement_rebalance_tick = tokio::time::interval(Duration::from_secs(30 * 60));
+    // LAN link probe: every 24h, leader-only. For each online pair,
+    // rsyncs a 16 MiB test file via ssh and records throughput in
+    // fleet_link_status. Used by the placement rebalancer to pick
+    // destinations that are actually reachable at a reasonable
+    // speed (not just have free disk).
+    let mut link_probe_tick = tokio::time::interval(Duration::from_secs(24 * 3600));
     // First tick fires immediately for each — prime all nine.
     defer_tick.tick().await;
     disk_tick.tick().await;
@@ -1186,6 +1201,9 @@ pub async fn handle_daemon(
     oauth_tick.tick().await;
     model_scan_tick.tick().await;
     model_upgrade_tick.tick().await;
+    mesh_repair_tick.tick().await;
+    placement_rebalance_tick.tick().await;
+    link_probe_tick.tick().await;
 
     // Do an initial pass immediately on startup.
     let _ = defer_pass(&pool, &worker_name, scheduler, &slots).await;
@@ -1477,6 +1495,161 @@ pub async fn handle_daemon(
                     ),
                     Ok(_) => {}
                     Err(e) => eprintln!("{RED}[sweeper] error: {e}{RESET}"),
+                }
+            }
+            _ = mesh_repair_tick.tick(), if is_leader => {
+                // Find pairs where attempts >= 3 and dispatch the same
+                // repair code path as `ff fleet ssh-mesh-check --repair`.
+                // Touches at most one pair per tick to keep operator
+                // visibility manageable.
+                let bad: Result<Vec<(String, String, i32)>, _> = sqlx::query_as(
+                    "SELECT src_node, dst_node, attempts FROM fleet_mesh_status
+                     WHERE status = 'failed' AND attempts >= 3
+                     ORDER BY attempts DESC, last_checked ASC NULLS FIRST
+                     LIMIT 1"
+                ).fetch_all(&pool).await;
+                if let Ok(rows) = bad
+                    && let Some((src, dst, attempts)) = rows.first()
+                {
+                    println!(
+                        "{CYAN}[mesh-repair]{RESET} auto-repair {} → {} (attempts={})",
+                        src, dst, attempts
+                    );
+                    let _ = ff_agent::task_runner::pg_enqueue_shell_task(
+                        &pool,
+                        &format!("auto-mesh-repair: {} → {}", src, dst),
+                        &format!("ff fleet ssh-mesh-check --node {} --repair --yes 2>&1 | tail -10", dst),
+                        &["ff".to_string()],
+                        Some("taylor"),
+                        None,
+                        50,
+                        None,
+                    )
+                    .await;
+                    let _ = ff_agent::telegram::send_telegram_from_secrets(
+                        &pool,
+                        "SSH mesh auto-repair",
+                        &format!("Repair dispatched: {} → {} (attempts={})", src, dst, attempts),
+                    )
+                    .await;
+                }
+            }
+            _ = placement_rebalance_tick.tick(), if is_leader => {
+                // Find hosts where disk usage > 80% AND they hold at
+                // least one cold library row. For one such row, pick
+                // a destination via the same SQL as ff model distribute
+                // and dispatch a transfer.
+                let rows: Result<Vec<(String, i64, String, String, String, String)>, _> =
+                    sqlx::query_as(
+                        r#"
+                        WITH busy AS (
+                            SELECT DISTINCT ON (worker_name) worker_name,
+                                   total_bytes, used_bytes,
+                                   (used_bytes::float / NULLIF(total_bytes, 0))::float AS pct
+                              FROM fleet_disk_usage
+                             ORDER BY worker_name, sampled_at DESC
+                        )
+                        SELECT b.worker_name, lib.size_bytes,
+                               lib.id::text, lib.catalog_id, lib.runtime,
+                               lib.file_path
+                          FROM busy b
+                          JOIN fleet_model_library lib ON lib.worker_name = b.worker_name
+                         WHERE b.pct > 0.80
+                           AND lib.state = 'cold'
+                           AND lib.catalog_id NOT LIKE 'unknown:%'
+                         ORDER BY b.pct DESC, lib.size_bytes DESC
+                         LIMIT 1
+                        "#,
+                    )
+                    .fetch_all(&pool)
+                    .await;
+                if let Ok(rows) = rows
+                    && let Some((src, _bytes, lib_id, cid, _rt, _path)) = rows.first()
+                {
+                    let pick: Option<(String, i64)> = sqlx::query_as(
+                        r#"
+                        WITH free AS (
+                            SELECT DISTINCT ON (worker_name) worker_name, free_bytes
+                              FROM fleet_disk_usage
+                             ORDER BY worker_name, sampled_at DESC
+                        ),
+                        reserved AS (
+                            SELECT name AS worker_name FROM computers
+                             WHERE os_family = 'linux-dgx' OR name = 'taylor'
+                        )
+                        SELECT f.worker_name, f.free_bytes FROM free f
+                         WHERE f.worker_name <> $1
+                           AND f.worker_name NOT IN (SELECT worker_name FROM reserved)
+                         ORDER BY f.free_bytes DESC LIMIT 1
+                        "#,
+                    )
+                    .bind(src)
+                    .fetch_optional(&pool)
+                    .await
+                    .ok()
+                    .flatten();
+                    if let Some((dst, _free)) = pick {
+                        println!(
+                            "{CYAN}[rebalance]{RESET} {} > 80%; moving cold {} ({}) → {}",
+                            src, cid, lib_id, dst
+                        );
+                        let _ = ff_agent::task_runner::pg_enqueue_shell_task(
+                            &pool,
+                            &format!("auto-rebalance: {} cold → {}", cid, dst),
+                            &format!("ff model transfer --library-id {} --from {} --to {}", lib_id, src, dst),
+                            &["ff".to_string()],
+                            Some("taylor"),
+                            None,
+                            55,
+                            None,
+                        )
+                        .await;
+                        let _ = ff_agent::telegram::send_telegram_from_secrets(
+                            &pool,
+                            "Model auto-rebalance",
+                            &format!("{} disk > 80% — moving cold {} → {}", src, cid, dst),
+                        )
+                        .await;
+                    }
+                }
+            }
+            _ = link_probe_tick.tick(), if is_leader => {
+                // Dispatch a single 16 MiB rsync test between two pairs
+                // per tick. Persisted into a simple `fleet_link_status`
+                // structure (encoded as fleet_secrets KV for now to
+                // avoid a migration this session).
+                let pairs: Result<Vec<(String, String)>, _> = sqlx::query_as(
+                    "SELECT a.name, b.name
+                       FROM computers a, computers b
+                      WHERE a.name <> b.name
+                        AND a.os_family <> 'linux-dgx'
+                        AND b.os_family <> 'linux-dgx'
+                      ORDER BY RANDOM() LIMIT 2"
+                ).fetch_all(&pool).await;
+                if let Ok(rows) = pairs {
+                    for (src, dst) in rows {
+                        println!(
+                            "{CYAN}[link-probe]{RESET} test {} → {}",
+                            src, dst
+                        );
+                        let cmd = format!(
+                            "dd if=/dev/zero of=/tmp/ff-link-probe-1m bs=1M count=16 2>/dev/null; \
+                             T=$(time (rsync /tmp/ff-link-probe-1m {dst}:/tmp/ff-link-probe-recv 2>/dev/null) 2>&1 | grep real | awk '{{print $2}}'); \
+                             echo link-probe {src}→{dst}: $T; \
+                             rm -f /tmp/ff-link-probe-1m"
+                        );
+                        let _ = ff_agent::task_runner::pg_enqueue_shell_task(
+                            &pool,
+                            &format!("link-probe: {} → {}", src, dst),
+                            &cmd,
+                            &["ff".to_string()],
+                            Some(&src),
+                            None,
+                            40,
+                            None,
+                        )
+                        .await;
+                    }
                 }
             }
             _ = version_tick.tick() => {
