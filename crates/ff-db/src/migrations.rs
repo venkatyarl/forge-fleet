@@ -667,6 +667,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "dispatcher_foundation",
         sql: schema::SCHEMA_V107_DISPATCHER_FOUNDATION,
     },
+    PgMigration {
+        version: 108,
+        name: "task_depends_on",
+        sql: schema::SCHEMA_V108_TASK_DEPENDS_ON,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.

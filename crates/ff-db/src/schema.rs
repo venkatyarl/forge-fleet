@@ -7342,3 +7342,28 @@ UPDATE fleet_model_library lib
    AND dep.desired_state = 'active'
    AND dep.health_status IN ('healthy', 'ok', 'starting');
 "#;
+
+/// V108 — per-task explicit dependency.
+///
+/// Adds `depends_on_task_id uuid` to `fleet_tasks` so a child task can
+/// reference a SPECIFIC sibling it must wait for, instead of the
+/// coarse `wait_for_siblings = true` barrier that holds for EVERY
+/// sibling. The wave dispatcher uses this so a host's restart task
+/// fires as soon as its own build sibling finishes, not after all 14
+/// builds drain. Restart-phase latency drops from "longest build in
+/// the batch" to "first build finishes + leader queue drain".
+///
+/// Backward compatible: the existing `wait_for_siblings` claim clause
+/// is preserved. New restart tasks set `wait_for_siblings = false`
+/// and set `depends_on_task_id = <build_id>`; old in-flight rows
+/// keep their wait_for_siblings semantics. The claim WHERE adds an
+/// additional clause that allows the new path.
+pub const SCHEMA_V108_TASK_DEPENDS_ON: &str = r#"
+ALTER TABLE fleet_tasks
+  ADD COLUMN IF NOT EXISTS depends_on_task_id uuid
+    REFERENCES fleet_tasks(id) ON DELETE SET NULL;
+
+CREATE INDEX IF NOT EXISTS idx_fleet_tasks_depends_on
+    ON fleet_tasks (depends_on_task_id)
+ WHERE depends_on_task_id IS NOT NULL;
+"#;

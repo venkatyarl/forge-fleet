@@ -315,6 +315,18 @@ impl TaskRunner {
                          AND s.status IN ('pending', 'running')
                     )
                   )
+                  -- V108 per-task dependency: if depends_on_task_id is
+                  -- set, the referenced task must be terminal. This is
+                  -- what lets wave-restart fire per-host instead of
+                  -- waiting for every build sibling.
+                  AND (
+                    t.depends_on_task_id IS NULL
+                    OR EXISTS (
+                      SELECT 1 FROM fleet_tasks dep
+                       WHERE dep.id = t.depends_on_task_id
+                         AND dep.status IN ('completed', 'failed', 'cancelled')
+                    )
+                  )
                 -- V74 selfish routing: fleet_first deprioritizes local tasks;
                 -- local_first/balanced prioritizes local tasks.
                 ORDER BY
@@ -790,6 +802,7 @@ pub async fn pg_enqueue_shell_task_with_options(
         wait_for_siblings,
         excludes_computer_ids,
         None,
+        None,
     )
     .await
 }
@@ -812,6 +825,7 @@ pub async fn pg_enqueue_shell_task_full(
     wait_for_siblings: bool,
     excludes_computer_ids: &[uuid::Uuid],
     max_duration_secs: Option<u64>,
+    depends_on_task_id: Option<uuid::Uuid>,
 ) -> Result<uuid::Uuid, sqlx::Error> {
     let preferred_id: Option<uuid::Uuid> = if let Some(name) = preferred_computer {
         sqlx::query_scalar("SELECT id FROM computers WHERE name = $1")
@@ -845,9 +859,9 @@ pub async fn pg_enqueue_shell_task_full(
             parent_task_id, task_type, summary, payload,
             priority, requires_capability, preferred_computer_id,
             created_by_computer_id, wait_for_siblings,
-            excludes_computer_ids
+            excludes_computer_ids, depends_on_task_id
         )
-        VALUES ($1, 'shell', $2, $3, $4, $5, $6, $7, $8, $9)
+        VALUES ($1, 'shell', $2, $3, $4, $5, $6, $7, $8, $9, $10)
         RETURNING id
         "#,
     )
@@ -860,6 +874,7 @@ pub async fn pg_enqueue_shell_task_full(
     .bind(created_by_computer_id)
     .bind(wait_for_siblings)
     .bind(&excludes_json)
+    .bind(depends_on_task_id)
     .fetch_one(pg)
     .await?;
 
@@ -1367,6 +1382,12 @@ pub async fn compose_fleet_upgrade_wave(
     //    so the fleet self-parallelizes as Wave 0 expands the worker
     //    pool. NO daemon restart in this phase — closes the self-kill
     //    race documented in feedback_wave_dispatcher_self_kill_race.md.
+    //
+    // V108 per-host dependency: capture each build's task id so the
+    // corresponding restart task in Phase 2 can wait for THIS host's
+    // build only, not for the slowest build in the whole batch.
+    let mut build_ids_by_target: std::collections::HashMap<uuid::Uuid, uuid::Uuid> =
+        std::collections::HashMap::with_capacity(wave_targets.len());
     for (wave_idx, chunk) in wave_targets.chunks(fanout).enumerate() {
         let priority = 95i32.saturating_sub((wave_idx as i32).saturating_mul(3));
         for t in chunk {
@@ -1416,7 +1437,7 @@ pub async fn compose_fleet_upgrade_wave(
             // 2026-05-21 wave still saw 4/14 hit the 25-min cap (ace,
             // lily, rihanna, priya) because ~15 crates landed this
             // month. 45min absorbs the new normal with headroom.
-            pg_enqueue_shell_task_full(
+            let build_id = pg_enqueue_shell_task_full(
                 pg,
                 &format!(
                     "fleet-upgrade-wave/wave{wave_idx}/build: {software_id} on {}",
@@ -1431,17 +1452,22 @@ pub async fn compose_fleet_upgrade_wave(
                 false,
                 &[t.target_id],
                 Some(45 * 60),
+                None,
             )
             .await?;
+            build_ids_by_target.insert(t.target_id, build_id);
         }
     }
 
-    // 5. Phase 2 — restart tasks. One per target, capability=[leader],
-    //    wait_for_siblings=true so they're only claimable AFTER every
-    //    Phase-1 sibling completes. Leader is excluded as a target so
-    //    it never restarts itself; leader runs one task at a time, so
-    //    the restarts naturally serialize. Lower priority than Phase-1
-    //    so they sit at the end of the leader's queue.
+    // 5. Phase 2 — restart tasks. One per target, capability=[leader].
+    //    V108 per-host dependency: each restart task points at its
+    //    matching build via depends_on_task_id, so the restart is
+    //    claimable as soon as THAT host's build is terminal — instead
+    //    of waiting for every other build to finish. Leader is excluded
+    //    as a target so it never restarts itself; leader runs one task
+    //    at a time, so restarts naturally serialize on the leader's
+    //    queue regardless. Lower priority than Phase-1 so they sit at
+    //    the end of the leader's queue.
     let restart_priority = 30i32;
     for t in &wave_targets {
         let port_arg = if t.ssh_port == 22 {
@@ -1505,7 +1531,13 @@ pub async fn compose_fleet_upgrade_wave(
         // already requires capability=[leader], so today only the
         // leader claims; if a peer ever earns the leader cap (failover),
         // the exclusion still keeps the target itself out of the pool.
-        pg_enqueue_shell_task_with_options(
+        //
+        // V108: depends_on_task_id points at THIS host's build task. The
+        // restart becomes claimable as soon as that single build is
+        // terminal (completed/failed/cancelled) — no longer waits for
+        // every other host's build.
+        let build_dep = build_ids_by_target.get(&t.target_id).copied();
+        pg_enqueue_shell_task_full(
             pg,
             &format!(
                 "fleet-upgrade-wave/restart: {software_id} on {}",
@@ -1517,8 +1549,10 @@ pub async fn compose_fleet_upgrade_wave(
             Some(parent),
             restart_priority,
             Some(leader_computer_id),
-            true, // wait_for_siblings — Phase-2 barrier
+            false, // V108: per-host depends_on replaces global wait_for_siblings barrier
             &[t.target_id],
+            None,
+            build_dep,
         )
         .await?;
     }
