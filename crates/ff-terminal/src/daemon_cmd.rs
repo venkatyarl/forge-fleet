@@ -1198,6 +1198,13 @@ pub async fn handle_daemon(
     // liveness means a low-CPU model load that's still writing to disk
     // counts as alive.
     let mut liveness_tick = tokio::time::interval(Duration::from_secs(30));
+    // Wave reaper: every 10 min, leader-only. Walks pending parent
+    // tasks (e.g. fleet-upgrade-wave orchestrators) and rolls them up
+    // to a terminal state once all their children are done. Without
+    // this, every wave leaves a zombie parent row in 'pending'
+    // forever — 12 had accumulated over 3.8 days before this tick
+    // shipped.
+    let mut wave_reaper_tick = tokio::time::interval(Duration::from_secs(10 * 60));
     // First tick fires immediately for each — prime all nine.
     defer_tick.tick().await;
     disk_tick.tick().await;
@@ -1214,6 +1221,7 @@ pub async fn handle_daemon(
     placement_rebalance_tick.tick().await;
     link_probe_tick.tick().await;
     liveness_tick.tick().await;
+    wave_reaper_tick.tick().await;
 
     // Do an initial pass immediately on startup.
     let _ = defer_pass(&pool, &worker_name, scheduler, &slots).await;
@@ -1660,6 +1668,16 @@ pub async fn handle_daemon(
                         )
                         .await;
                     }
+                }
+            }
+            _ = wave_reaper_tick.tick(), if is_leader => {
+                match ff_agent::wave_reaper::reap_pending_parents(&pool).await {
+                    Ok(r) if r.reaped_completed + r.reaped_failed > 0 => println!(
+                        "{CYAN}[wave-reaper]{RESET} rolled up {} completed + {} failed parents",
+                        r.reaped_completed, r.reaped_failed,
+                    ),
+                    Ok(_) => {}
+                    Err(e) => eprintln!("{RED}[wave-reaper] error: {e}{RESET}"),
                 }
             }
             _ = liveness_tick.tick() => {

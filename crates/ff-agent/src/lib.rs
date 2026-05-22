@@ -14,6 +14,7 @@ pub mod review_pipeline;
 pub mod skill_catalog;
 pub mod task_probe;
 pub mod watchdog;
+pub mod wave_reaper;
 
 /// Re-export of the panic-hook module that lives in `ff-core`. Keeps
 /// existing call sites (`ff_agent::panic_hook::install()`) working.
