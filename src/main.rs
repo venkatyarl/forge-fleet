@@ -2811,6 +2811,22 @@ async fn start_pulse_v2_subsystems(
         shutdown_rx.clone(),
     ));
 
+    // (10d) Wave-reaper — rolls up fleet-upgrade-wave parent rows whose
+    // children have all reached a terminal state. Without this, every
+    // wave leaves a zombie parent row in 'pending' forever. Different
+    // from (10c): (10c) watches `task_type='decomposed'` parents and
+    // their `fleet_work_items` children. (10d) watches any pending
+    // parent whose children sit in `fleet_tasks` linked via
+    // parent_task_id — the actual fan-out pattern used by
+    // `compose_fleet_upgrade_wave`.
+    info!("starting subsystem: wave reaper (every 10min, leader-only)");
+    handles.push(ff_agent::wave_reaper::spawn_reaper(
+        pg_pool.clone(),
+        worker_name.clone(),
+        10 * 60,
+        shutdown_rx.clone(),
+    ));
+
     // (11) Shared workspace cleanup — daily temp/artifact purge for
     // sub-agent workspaces. Leader-gated to avoid N-way races.
     info!("starting subsystem: shared workspace cleanup (daily, leader-gated)");

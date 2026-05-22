@@ -6,7 +6,9 @@
 //! Run from the daemon's wave_reaper_tick every 10 min, leader-only.
 
 use sqlx::PgPool;
-use tracing::info;
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
+use tracing::{debug, info};
 
 pub struct ReaperReport {
     pub reaped_completed: i64,
@@ -70,5 +72,50 @@ pub async fn reap_pending_parents(pool: &PgPool) -> Result<ReaperReport, sqlx::E
     Ok(ReaperReport {
         reaped_completed: completed,
         reaped_failed: failed,
+    })
+}
+
+/// Spawn the wave-reaper as a leader-gated background tick. Mirrors
+/// the shape of `batch_manager::spawn_completion_watcher`. Self-
+/// contained so `src/main.rs` only needs one call.
+pub fn spawn_reaper(
+    pg: PgPool,
+    worker_name: String,
+    interval_secs: u64,
+    mut shutdown: watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let interval = std::time::Duration::from_secs(interval_secs.max(60));
+        let mut ticker = tokio::time::interval(interval);
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {}
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() { break; }
+                }
+            }
+            // Leader-only: skip when this host isn't the elected leader
+            // so we don't have 15 daemons racing on the same parents.
+            let is_leader: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM fleet_leader_state WHERE member_name = $1)",
+            )
+            .bind(&worker_name)
+            .fetch_one(&pg)
+            .await
+            .unwrap_or(false);
+            if !is_leader {
+                debug!("wave-reaper: skipping (not leader)");
+                continue;
+            }
+            match reap_pending_parents(&pg).await {
+                Ok(r) if r.reaped_completed + r.reaped_failed > 0 => info!(
+                    completed = r.reaped_completed,
+                    failed = r.reaped_failed,
+                    "wave-reaper rolled up parents"
+                ),
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "wave-reaper failed"),
+            }
+        }
     })
 }
