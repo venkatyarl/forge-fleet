@@ -1459,15 +1459,22 @@ pub async fn compose_fleet_upgrade_wave(
         }
     }
 
-    // 5. Phase 2 — restart tasks. One per target, capability=[leader].
+    // 5. Phase 2 — restart tasks. One per target, NO capability
+    //    requirement (was `[leader]`; dropped 2026-05-22 to actually
+    //    realize V108's per-host latency win).
+    //
     //    V108 per-host dependency: each restart task points at its
     //    matching build via depends_on_task_id, so the restart is
-    //    claimable as soon as THAT host's build is terminal — instead
-    //    of waiting for every other build to finish. Leader is excluded
-    //    as a target so it never restarts itself; leader runs one task
-    //    at a time, so restarts naturally serialize on the leader's
-    //    queue regardless. Lower priority than Phase-1 so they sit at
-    //    the end of the leader's queue.
+    //    claimable as soon as THAT host's build is terminal.
+    //
+    //    Why no leader gate: leader-only restarts serialized the
+    //    entire restart phase on one worker (Taylor processes one
+    //    task at a time). With V108 making restarts per-host
+    //    eligible the moment their build finishes, any peer can pick
+    //    one up. V61 excludes the target from claiming its own
+    //    restart; V62 quarantines the target while being restarted;
+    //    FOR UPDATE SKIP LOCKED prevents double-claim. The leader
+    //    gate was the last serialization bottleneck.
     let restart_priority = 30i32;
     for t in &wave_targets {
         let port_arg = if t.ssh_port == 22 {
@@ -1527,10 +1534,12 @@ pub async fn compose_fleet_upgrade_wave(
             inner = inner_restart.replace('\'', "'\\''"),
         );
 
-        // V61: target excluded from claiming its own restart. Phase-2
-        // already requires capability=[leader], so today only the
-        // leader claims; if a peer ever earns the leader cap (failover),
-        // the exclusion still keeps the target itself out of the pool.
+        // V61: target excluded from claiming its own restart. With the
+        // leader gate removed (2026-05-22), any peer may claim — V61's
+        // target-exclusion is now the primary guard keeping a host from
+        // restarting itself mid-task. V62 quarantine adds belt-and-
+        // suspenders: while a peer is restarting this host, the host's
+        // own task_runner refuses to claim anything.
         //
         // V108: depends_on_task_id points at THIS host's build task. The
         // restart becomes claimable as soon as that single build is
@@ -1544,7 +1553,7 @@ pub async fn compose_fleet_upgrade_wave(
                 t.target_name
             ),
             &restart_command,
-            &["leader".to_string()],
+            &[],
             None,
             Some(parent),
             restart_priority,
