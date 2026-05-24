@@ -316,15 +316,25 @@ impl TaskRunner {
                     )
                   )
                   -- V108 per-task dependency: if depends_on_task_id is
-                  -- set, the referenced task must be terminal. This is
+                  -- set, the referenced task must have SUCCEEDED. This is
                   -- what lets wave-restart fire per-host instead of
                   -- waiting for every build sibling.
+                  --
+                  -- 2026-05-24 (fix B): the gate used to accept any
+                  -- terminal status (completed/failed/cancelled). That
+                  -- meant a host whose build *died* (e.g. killed mid-
+                  -- compile by a cross-wave restart) still got its restart
+                  -- task claimed — restarting onto stale or half-installed
+                  -- binaries. Require 'completed' so a failed build never
+                  -- triggers a restart. The orphaned restart (whose build
+                  -- failed) is swept to 'cancelled' by the wave-reaper so
+                  -- it doesn't sit pending forever.
                   AND (
                     t.depends_on_task_id IS NULL
                     OR EXISTS (
                       SELECT 1 FROM fleet_tasks dep
                        WHERE dep.id = t.depends_on_task_id
-                         AND dep.status IN ('completed', 'failed', 'cancelled')
+                         AND dep.status = 'completed'
                     )
                   )
                 -- V74 selfish routing: fleet_first deprioritizes local tasks;
@@ -1288,22 +1298,55 @@ pub async fn compose_fleet_upgrade_wave(
     // software is in flight at any time, eliminating the cross-wave
     // race entirely. Operator running back-to-back ticks gets a no-op
     // on the second one until the first wave drains.
-    let wave_inflight: bool = sqlx::query_scalar(
-        r#"
-        SELECT EXISTS (
-            SELECT 1 FROM fleet_tasks
-             WHERE status IN ('pending', 'running')
-               AND summary LIKE $1
+    //
+    // 2026-05-24 (fix A): the per-software singleton is NOT enough for the
+    // daemon-self family. ff_git and forgefleetd_git are distinct
+    // software_ids, so the auto-upgrade tick composes a *separate* wave
+    // for each in the same instant — both targeting all 14 hosts. They're
+    // invisible to each other: forgefleetd_git's Phase-2 restart tears
+    // down host X's task_runner subprocess while ff_git's wave is using
+    // host X as a build worker, so ff_git's build dies with exit=-1 mid-
+    // compile. This is feedback_wave_dispatcher_self_kill_race.md
+    // resurfacing across wave *families*. Fix: for any daemon-self
+    // software, the singleton spans the WHOLE family — refuse if any
+    // ff_git / forgefleetd_git / forgefleet wave is in flight, not just
+    // this exact software_id. The two waves now serialize across ticks.
+    let wave_inflight: bool = if crate::auto_upgrade::is_daemon_self_software(software_id) {
+        let family = crate::auto_upgrade::DAEMON_SELF_SOFTWARE;
+        let patterns: Vec<String> = family
+            .iter()
+            .map(|id| format!("fleet-upgrade-wave/%: {id} on %"))
+            .collect();
+        sqlx::query_scalar(
+            r#"
+            SELECT EXISTS (
+                SELECT 1 FROM fleet_tasks
+                 WHERE status IN ('pending', 'running')
+                   AND summary LIKE ANY($1::text[])
+            )
+            "#,
         )
-        "#,
-    )
-    .bind(format!("fleet-upgrade-wave/%: {software_id} on %"))
-    .fetch_one(pg)
-    .await?;
+        .bind(&patterns)
+        .fetch_one(pg)
+        .await?
+    } else {
+        sqlx::query_scalar(
+            r#"
+            SELECT EXISTS (
+                SELECT 1 FROM fleet_tasks
+                 WHERE status IN ('pending', 'running')
+                   AND summary LIKE $1
+            )
+            "#,
+        )
+        .bind(format!("fleet-upgrade-wave/%: {software_id} on %"))
+        .fetch_one(pg)
+        .await?
+    };
     if wave_inflight {
         tracing::info!(
             software_id = %software_id,
-            "fleet-upgrade-wave: refusing dispatch — existing wave for this software still in flight"
+            "fleet-upgrade-wave: refusing dispatch — existing wave (this software or daemon-self family) still in flight"
         );
         return Err(sqlx::Error::Configuration(
             format!(
@@ -1515,9 +1558,23 @@ pub async fn compose_fleet_upgrade_wave(
                  echo \"respawned via nohup, pid=$!\")"
                 .to_string()
         } else {
+            // 2026-05-24 (fix C): the standalone restart used a plain
+            // blocking `systemctl --user restart ...` with stdout/stderr
+            // still wired to the SSH channel. On 7 Linux hosts it never
+            // returned and was killed at the 600s task cap — `restart`
+            // waits for the unit to come back up, and the live SSH channel
+            // keeps the session attached to the restarted daemon's output.
+            // The build-embedded restart never hit this because it
+            // detached. Match that pattern: `setsid` + `--no-block`
+            // (enqueue the restart job and return immediately) +
+            // </dev/null >/dev/null 2>&1 so nothing holds the SSH channel
+            // open. The command returns as soon as the job is queued.
             "export XDG_RUNTIME_DIR=\"${XDG_RUNTIME_DIR:-/run/user/$(id -u)}\"; \
              systemctl --user reset-failed forgefleetd.service forgefleet-node.service forgefleet-daemon.service 2>/dev/null; \
-             systemctl --user restart forgefleetd.service || systemctl --user restart forgefleet-node.service || systemctl --user restart forgefleet-daemon.service"
+             setsid systemctl --user restart --no-block forgefleetd.service </dev/null >/dev/null 2>&1 \
+               || setsid systemctl --user restart --no-block forgefleet-node.service </dev/null >/dev/null 2>&1 \
+               || setsid systemctl --user restart --no-block forgefleet-daemon.service </dev/null >/dev/null 2>&1; \
+             echo \"restart job dispatched (--no-block, detached) on $(hostname)\""
                 .to_string()
         };
         let restart_command = format!(
