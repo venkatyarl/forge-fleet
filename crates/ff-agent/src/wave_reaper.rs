@@ -16,10 +16,44 @@ pub struct ReaperReport {
 }
 
 pub async fn reap_pending_parents(pool: &PgPool) -> Result<ReaperReport, sqlx::Error> {
+    // 2026-05-24 (fix B cleanup): cancel any wave restart task left
+    // pending behind a build that did NOT succeed. Fix B tightened the
+    // claim gate to require the build dependency be 'completed', so a
+    // restart whose build failed/cancelled would otherwise sit pending
+    // forever — never claimable, never terminal — and keep its parent
+    // wave from ever rolling up. Sweeping it to 'cancelled' makes the
+    // parent's children all-terminal so the rollup below can fire, and
+    // (with fix D) the parent reflects the failure.
+    let orphaned = sqlx::query(
+        r#"
+        UPDATE fleet_tasks r
+           SET status       = 'cancelled',
+               completed_at = NOW(),
+               error        = 'build dependency did not succeed — restart skipped (fix B)'
+         WHERE r.status = 'pending'
+           AND r.summary LIKE 'fleet-upgrade-wave/restart:%'
+           AND r.depends_on_task_id IS NOT NULL
+           AND EXISTS (
+                 SELECT 1 FROM fleet_tasks dep
+                  WHERE dep.id = r.depends_on_task_id
+                    AND dep.status IN ('failed', 'cancelled')
+           )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+    if orphaned.rows_affected() > 0 {
+        info!(
+            cancelled = orphaned.rows_affected(),
+            "wave-reaper cancelled restart tasks orphaned by failed builds"
+        );
+    }
+
     // Find every pending parent that (a) has at least one child and
     // (b) has zero non-terminal children. Roll-up rule:
-    //   any child completed  -> parent = 'completed'
-    //   else                 -> parent = 'failed'
+    //   any child failed     -> parent = 'failed'  (alert; fix D)
+    //   else any completed   -> parent = 'completed'
+    //   else (all cancelled) -> parent = 'failed'
     // Counts go into parent.result jsonb so operators can see the wave
     // outcome at a glance.
     let rows: Vec<(uuid::Uuid, i64, i64, i64)> = sqlx::query_as(
@@ -41,7 +75,19 @@ pub async fn reap_pending_parents(pool: &PgPool) -> Result<ReaperReport, sqlx::E
     let mut completed = 0i64;
     let mut failed = 0i64;
     for (parent_id, ok, fail, cancel) in rows {
-        let new_status = if ok > 0 { "completed" } else { "failed" };
+        // fix D: a wave with ANY failed child rolls up to 'failed' — even
+        // if some children completed. The old rule (`ok > 0 -> completed`)
+        // marked partially-failed waves 'completed', so the pipeline saw a
+        // green parent every hour while 11/14 children were dying and re-
+        // thrashing silently. A wave whose children are all cancelled (no
+        // failures, no completions) is also not a success.
+        let new_status = if fail > 0 {
+            "failed"
+        } else if ok > 0 {
+            "completed"
+        } else {
+            "failed"
+        };
         sqlx::query(
             "UPDATE fleet_tasks
                 SET status = $1,
@@ -63,10 +109,25 @@ pub async fn reap_pending_parents(pool: &PgPool) -> Result<ReaperReport, sqlx::E
         .await?;
         if new_status == "completed" {
             completed += 1;
+            info!(parent = %parent_id, status = new_status, ok, fail, cancel, "wave-reaper rolled up parent");
         } else {
             failed += 1;
+            // fix D: surface failed waves loudly. A warn log plus a NATS
+            // event means the upgrade pipeline alerts instead of failing
+            // identically every hour with nobody noticing (observed 4+h
+            // on 2026-05-24).
+            tracing::warn!(parent = %parent_id, status = new_status, ok, fail, cancel, "wave-reaper rolled up FAILED wave");
+            let payload = serde_json::json!({
+                "parent_task_id": parent_id,
+                "status": new_status,
+                "children_completed": ok,
+                "children_failed": fail,
+                "children_cancelled": cancel,
+                "ts": chrono::Utc::now().to_rfc3339(),
+            });
+            crate::nats_client::publish_json("fleet.events.wave.failed".to_string(), &payload)
+                .await;
         }
-        info!(parent = %parent_id, status = new_status, ok, fail, cancel, "wave-reaper rolled up parent");
     }
 
     Ok(ReaperReport {

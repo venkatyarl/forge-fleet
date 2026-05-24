@@ -387,9 +387,19 @@ pub async fn enqueue_plans(
 /// upgrading it requires restarting the daemon process that is
 /// currently dispatching the upgrade? Used by [`AutoUpgradeTick::run_once`]
 /// to gate the leader out of self-suicide.
-fn is_daemon_self_software(software_id: &str) -> bool {
+pub(crate) fn is_daemon_self_software(software_id: &str) -> bool {
     matches!(software_id, "ff_git" | "forgefleetd_git" | "forgefleet")
 }
+
+/// The full daemon-self software family. Upgrading any of these restarts
+/// `forgefleetd` on the target, which tears down whatever task_runner
+/// subprocess that host is running — including a peer's in-flight build.
+/// Used by the wave dispatcher to serialize the whole family so two
+/// `*_git` waves never run concurrently against the same hosts (the
+/// cross-wave self-kill documented in
+/// feedback_wave_dispatcher_self_kill_race.md, resurfacing across wave
+/// *generations* once V52's same-wave barrier was in place).
+pub(crate) const DAEMON_SELF_SOFTWARE: &[&str] = &["ff_git", "forgefleetd_git", "forgefleet"];
 
 /// V67 install bootstrap: for every `software_registry.auto_install=true`
 /// row, insert a `computer_software` row (status='upgrade_available')
