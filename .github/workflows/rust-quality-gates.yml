@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
       - name: Install Rust 1.88.0
         uses: dtolnay/rust-toolchain@1.88.0
         with:
@@ -28,7 +28,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
       - name: Install Rust 1.88.0
         uses: dtolnay/rust-toolchain@1.88.0
         with:
@@ -50,7 +50,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
       - name: Install Rust 1.88.0
         uses: dtolnay/rust-toolchain@1.88.0
       - name: Compile workspace
@@ -61,7 +61,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
       - name: Install Rust 1.88.0
         uses: dtolnay/rust-toolchain@1.88.0
       - name: Run library tests
@@ -72,7 +72,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
       - name: Install Rust 1.88.0
         uses: dtolnay/rust-toolchain@1.88.0
       - name: Run integration tests
@@ -83,13 +83,13 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
       - name: Install Rust 1.88.0
         uses: dtolnay/rust-toolchain@1.88.0
       - name: Build release binary
         run: cargo build --release --bin forgefleetd
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: forgefleetd-linux-x64
           path: target/release/forgefleetd
