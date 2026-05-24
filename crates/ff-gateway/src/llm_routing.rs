@@ -1474,32 +1474,46 @@ mod tests {
         );
     }
 
+    // NOTE: normalize_model_id is the canonical ff_core::model_id function.
+    // Since CAT.1 (2026-05-19) it inserts a dash at every letter→digit
+    // boundary (`qwen3` → `qwen-3`, `a3b` → `a-3b`) so compact and dashed
+    // catalog ids collapse to one form. The expectations below reflect that
+    // canonical output — the ground-truth coverage lives in
+    // ff-core/src/model_id.rs; these gateway tests just pin the routing-
+    // relevant shapes. (Updated 2026-05-24: were asserting the obsolete
+    // pre-CAT.1 form and had gone red on main.)
     #[test]
     fn normalize_strips_ollama_tag() {
-        assert_eq!(normalize_model_id("qwen3-coder-30b"), "qwen3-coder");
-        assert_eq!(normalize_model_id("qwen3-coder:latest"), "qwen3-coder");
-        assert_eq!(normalize_model_id("Qwen3-Coder:14B"), "qwen3-coder");
+        assert_eq!(normalize_model_id("qwen3-coder-30b"), "qwen-3-coder-30b");
+        assert_eq!(normalize_model_id("qwen3-coder:latest"), "qwen-3-coder");
+        assert_eq!(normalize_model_id("Qwen3-Coder:14B"), "qwen-3-coder");
     }
 
     #[test]
     fn normalize_strips_gguf_and_quant() {
+        // Extension + quant suffix stripped; letter→digit dashes inserted.
+        // The quant level never affects the model stem, so both land on the
+        // same canonical id.
         assert_eq!(
             normalize_model_id("Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf"),
-            "qwen3-coder-30b-a3b-instruct"
+            "qwen-3-coder-30b-a-3b-instruct"
         );
         assert_eq!(
             normalize_model_id("Qwen3-Coder-30B-A3B-Instruct-Q8_0.gguf"),
-            "qwen3-coder-30b-instruct"
+            "qwen-3-coder-30b-a-3b-instruct"
         );
     }
 
     #[test]
     fn normalize_prefix_match_bare_vs_tagged() {
-        // Bare name vs ollama-tagged server: both normalize to the same stem.
+        // Bare name vs ollama-tagged server: the tagged form keeps its size
+        // suffix, but it prefix-matches the bare stem — which is what the
+        // router relies on for fuzzy candidate selection.
         let bare = normalize_model_id("qwen3-coder");
         let tagged = normalize_model_id("qwen3-coder-30b");
-        assert_eq!(bare, tagged);
-        assert_eq!(bare, "qwen3-coder");
+        assert_eq!(bare, "qwen-3-coder");
+        assert_eq!(tagged, "qwen-3-coder-30b");
+        assert!(tagged.starts_with(&bare));
     }
 
     #[test]
@@ -1513,10 +1527,10 @@ mod tests {
 
     #[test]
     fn normalize_handles_hf_repo_path() {
-        // HF-style `Owner/Repo` ids — keep last segment.
+        // HF-style `Owner/Repo` ids — keep last segment, then CAT.1 dashes.
         assert_eq!(
             normalize_model_id("Qwen/Qwen3-Coder-30B-A3B-Instruct"),
-            "qwen3-coder-30b-a3b-instruct"
+            "qwen-3-coder-30b-a-3b-instruct"
         );
     }
 
@@ -1548,9 +1562,11 @@ mod tests {
 
     #[test]
     fn qwen3_floor_noop_for_non_qwen3_models() {
-        // Non-qwen3 model — even with max_tokens=16, no floor applies.
+        // Non-qwen3 model — even with max_tokens=16, no floor applies. (The
+        // resolved id must NOT contain "qwen3"; using a qwen3 id here was the
+        // bug that made this test contradict its own name.)
         let mut body = json!({ "model": "coder", "max_tokens": 16 });
-        apply_qwen3_max_tokens_floor(&mut body, "qwen3-coder-30b");
+        apply_qwen3_max_tokens_floor(&mut body, "qwen2.5-coder-32b");
         assert_eq!(body["max_tokens"].as_u64().unwrap(), 16);
     }
 
