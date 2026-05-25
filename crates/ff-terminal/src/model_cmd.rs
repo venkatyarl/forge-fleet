@@ -83,11 +83,14 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                 );
             }
         }
-        crate::ModelCommand::Library { node } => {
+        crate::ModelCommand::Library { node, show_id } => {
             let rows = ff_db::pg_list_library(&pool, node.as_deref()).await?;
             if rows.is_empty() {
                 println!("(library empty — run `ff model scan` to index your local models dir)");
                 return Ok(());
+            }
+            if show_id {
+                println!("{:<38} ", "LIBRARY_ID");
             }
             println!(
                 "{:<10} {:<28} {:<10} {:<10} {:<10} PATH",
@@ -96,33 +99,72 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
             for r in rows {
                 let sz = human_bytes(r.size_bytes as u64);
                 let quant = r.quant.clone().unwrap_or_else(|| "-".into());
+                if show_id {
+                    print!("{:<38} ", r.id);
+                }
                 println!(
                     "{:<10} {:<28} {:<10} {:<10} {:<10} {}",
                     r.worker_name, r.catalog_id, r.runtime, quant, sz, r.file_path
                 );
             }
         }
-        crate::ModelCommand::Deployments { node } => {
+        crate::ModelCommand::Deployments { node, show_id } => {
             let rows = ff_db::pg_list_deployments(&pool, node.as_deref()).await?;
             if rows.is_empty() {
                 println!("(no deployments recorded)");
                 return Ok(());
             }
-            println!(
-                "{:<10} {:<28} {:<10} {:<6} {:<10} STARTED",
-                "NODE", "CATALOG_ID", "RUNTIME", "PORT", "HEALTH"
-            );
-            for r in rows {
-                let catalog = r.catalog_id.clone().unwrap_or_else(|| "-".into());
+            // With --show-id, surface DEPLOYMENT_ID (for `ff model unload`),
+            // LIBRARY_ID and CTX (for a faithful `ff model load` reload).
+            if show_id {
                 println!(
-                    "{:<10} {:<28} {:<10} {:<6} {:<10} {}",
-                    r.worker_name,
-                    catalog,
-                    r.runtime,
-                    r.port,
-                    r.health_status,
-                    r.started_at.format("%Y-%m-%d %H:%M UTC")
+                    "{:<38} {:<38} {:<10} {:<28} {:<10} {:<6} {:<7} {:<10} STARTED",
+                    "DEPLOYMENT_ID",
+                    "LIBRARY_ID",
+                    "NODE",
+                    "CATALOG_ID",
+                    "RUNTIME",
+                    "PORT",
+                    "CTX",
+                    "HEALTH"
                 );
+                for r in rows {
+                    let catalog = r.catalog_id.clone().unwrap_or_else(|| "-".into());
+                    let lib = r.library_id.clone().unwrap_or_else(|| "-".into());
+                    let ctx = r
+                        .context_window
+                        .map(|c| c.to_string())
+                        .unwrap_or_else(|| "-".into());
+                    println!(
+                        "{:<38} {:<38} {:<10} {:<28} {:<10} {:<6} {:<7} {:<10} {}",
+                        r.id,
+                        lib,
+                        r.worker_name,
+                        catalog,
+                        r.runtime,
+                        r.port,
+                        ctx,
+                        r.health_status,
+                        r.started_at.format("%Y-%m-%d %H:%M UTC")
+                    );
+                }
+            } else {
+                println!(
+                    "{:<10} {:<28} {:<10} {:<6} {:<10} STARTED",
+                    "NODE", "CATALOG_ID", "RUNTIME", "PORT", "HEALTH"
+                );
+                for r in rows {
+                    let catalog = r.catalog_id.clone().unwrap_or_else(|| "-".into());
+                    println!(
+                        "{:<10} {:<28} {:<10} {:<6} {:<10} {}",
+                        r.worker_name,
+                        catalog,
+                        r.runtime,
+                        r.port,
+                        r.health_status,
+                        r.started_at.format("%Y-%m-%d %H:%M UTC")
+                    );
+                }
             }
         }
         crate::ModelCommand::Scan { node, models_dir } => {

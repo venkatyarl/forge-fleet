@@ -1772,11 +1772,18 @@ pub enum ModelCommand {
     Library {
         #[arg(long)]
         node: Option<String>,
+        /// Prepend the library UUID column (needed for `ff model load <id>`).
+        #[arg(long)]
+        show_id: bool,
     },
     /// List current deployments (what's running, per node).
     Deployments {
         #[arg(long)]
         node: Option<String>,
+        /// Prepend the deployment UUID + show library_id/ctx (needed for
+        /// `ff model unload <id>` and a faithful `ff model load` reload).
+        #[arg(long)]
+        show_id: bool,
     },
     /// Scan a node's local models directory and reconcile with fleet_model_library.
     /// Defaults to the current host (taylor) scanning ~/models.
