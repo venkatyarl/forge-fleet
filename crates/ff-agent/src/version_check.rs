@@ -31,15 +31,37 @@ pub async fn collect_current() -> BTreeMap<String, String> {
     if let Some(v) = cmd_capture("cmd", &["/C", "ver"]).await {
         out.insert("kernel".into(), v);
     }
-    // ff binary: embedded version plus git sha of the checked-out repo.
-    if let Some(v) = cmd_capture("ff", &["--version"]).await {
-        out.insert("ff".into(), v);
+    // ff / forgefleetd binaries: embedded version string, e.g.
+    // `ff 2026.5.24_10 (pushed 08227d5966)`.
+    let ff_version = cmd_capture("ff", &["--version"]).await;
+    if let Some(v) = &ff_version {
+        out.insert("ff".into(), v.clone());
     }
-    if let Some(sha) = git_head_sha().await {
-        // Both ff and forgefleetd are built from the same repo, so they
-        // share the HEAD sha. Reporting both keys keeps the registry's
-        // installed_version accurate for both software_registry rows.
-        out.insert("ff_git".into(), sha.clone());
+    let forgefleetd_version = cmd_capture("forgefleetd", &["--version"]).await;
+
+    // ff_git / forgefleetd_git installed_version = the SHA embedded in the
+    // RUNNING BINARY, parsed from its `--version` `(pushed <sha>)` field —
+    // NOT `git rev-parse HEAD` of the source tree. The upgrade playbook runs
+    // `git reset --hard origin/main` BEFORE building, so a host whose build
+    // FAILED keeps the new SHA in its source tree while still running the old
+    // binary. Reading source HEAD therefore reported a host as up-to-date
+    // when it wasn't — lying to `ff fleet versions` and blinding the
+    // auto-upgrade drift detector to failed self-built builds. The embedded
+    // SHA is 10 chars (build_version.rs `--short=10`), matching the 10-char
+    // latest_version from refresh_self_built_latest_versions so the drift
+    // comparison stays exact.
+    if let Some(sha) = ff_version
+        .as_deref()
+        .and_then(ff_core::build_version::BuildVersion::parse)
+        .map(|v| v.sha)
+    {
+        out.insert("ff_git".into(), sha);
+    }
+    if let Some(sha) = forgefleetd_version
+        .as_deref()
+        .and_then(ff_core::build_version::BuildVersion::parse)
+        .map(|v| v.sha)
+    {
         out.insert("forgefleetd_git".into(), sha);
     }
     for (key, bin, args) in [
@@ -309,11 +331,6 @@ async fn read_os_pretty_name() -> Option<String> {
         return Some(v);
     }
     None
-}
-
-async fn git_head_sha() -> Option<String> {
-    let dir = home_repo_dir();
-    cmd_in_dir(&dir, "git", &["rev-parse", "--short=12", "HEAD"]).await
 }
 
 async fn git_ls_remote_main() -> Option<String> {
