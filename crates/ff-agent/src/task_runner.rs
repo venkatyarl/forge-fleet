@@ -337,6 +337,35 @@ impl TaskRunner {
                          AND dep.status = 'completed'
                     )
                   )
+                  -- 2026-05-26 (within-wave executor-kill guard): a wave
+                  -- restart task SSHes into its TARGET host and restarts that
+                  -- host's forgefleetd. V61 makes builds peer-driven, so the
+                  -- target may itself be acting as the EXECUTOR of some other
+                  -- host's build right now (its task_runner holds that build's
+                  -- SSH session). Restarting it mid-flight tears the session
+                  -- down and the peer's build dies exit=-1 mid-compile — the
+                  -- ~8 random failures/pass seen at fanout>1. V62 quarantine
+                  -- only stops the target from claiming NEW work while it's
+                  -- being restarted; it does nothing for the build already
+                  -- in flight ON the target. So hold the restart until its
+                  -- target is no longer the claimer of any running wave build.
+                  -- The restart's target is the single computer in
+                  -- excludes_computer_ids (V61). Builds themselves are never
+                  -- gated, so they always drain and the restart fires shortly
+                  -- after — this is far more targeted than V108's old
+                  -- "wait for every build sibling" global barrier, keeping
+                  -- the per-host latency win.
+                  AND NOT (
+                    t.summary LIKE 'fleet-upgrade-wave/restart:%'
+                    AND EXISTS (
+                      SELECT 1 FROM fleet_tasks b
+                       WHERE b.status = 'running'
+                         AND b.summary LIKE 'fleet-upgrade-wave/%/build:%'
+                         AND b.claimed_by_computer_id IS NOT NULL
+                         AND t.excludes_computer_ids
+                               @> to_jsonb(ARRAY[b.claimed_by_computer_id])
+                    )
+                  )
                 -- V74 selfish routing: fleet_first deprioritizes local tasks;
                 -- local_first/balanced prioritizes local tasks.
                 ORDER BY
@@ -1740,4 +1769,43 @@ fn is_blocked_command(command: &str) -> bool {
         "init 6",
     ];
     blocked.iter().any(|b| lower.contains(b))
+}
+
+#[cfg(test)]
+mod claim_query_tests {
+    /// DB-backed validation that the within-wave executor-kill guard clause
+    /// (2026-05-26) parses and type-checks against the real `fleet_tasks`
+    /// schema — the claim query uses runtime-checked `sqlx::query`, so a
+    /// malformed clause wouldn't surface at compile time. Ignored so CI
+    /// (which has no fleet pool) skips it; run on a host that has the pool:
+    ///
+    ///   cargo test -p ff-agent --lib -- --ignored explain_restart_executor_guard
+    #[tokio::test]
+    #[ignore]
+    async fn explain_restart_executor_guard() {
+        let pool = crate::fleet_info::get_fleet_pool()
+            .await
+            .expect("fleet pool");
+        // EXPLAIN runs the planner = full parse + type-check, no mutation.
+        sqlx::query(
+            r#"
+            EXPLAIN
+            SELECT 1 FROM fleet_tasks t
+             WHERE NOT (
+               t.summary LIKE 'fleet-upgrade-wave/restart:%'
+               AND EXISTS (
+                 SELECT 1 FROM fleet_tasks b
+                  WHERE b.status = 'running'
+                    AND b.summary LIKE 'fleet-upgrade-wave/%/build:%'
+                    AND b.claimed_by_computer_id IS NOT NULL
+                    AND t.excludes_computer_ids
+                          @> to_jsonb(ARRAY[b.claimed_by_computer_id])
+               )
+             )
+            "#,
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("restart executor-guard clause must parse + type-check");
+    }
 }
