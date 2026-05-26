@@ -638,6 +638,11 @@ enum TasksCommand {
         /// Higher = picked first. Default 50.
         #[arg(long, default_value_t = 50)]
         priority: i32,
+        /// Max task duration in seconds before the worker kills it. Without
+        /// this the worker falls back to its built-in default (~600s) — too
+        /// short for agent/research tasks. Sets fleet_tasks.timeout_secs.
+        #[arg(long)]
+        timeout: Option<u64>,
     },
     /// Show detailed status, payload, and result for one task.
     Get { id: String },
@@ -2617,6 +2622,7 @@ async fn main() -> Result<()> {
                     capability,
                     preferred,
                     priority,
+                    timeout,
                 } => {
                     let caps: Vec<String> = capability
                         .split(',')
@@ -2632,7 +2638,10 @@ async fn main() -> Result<()> {
                             .await
                             .ok()
                             .flatten();
-                    let id = ff_agent::task_runner::pg_enqueue_shell_task(
+                    // Use the _full enqueue so `--timeout` can set
+                    // fleet_tasks.timeout_secs (V81), which the worker honors
+                    // over its ~600s default — needed for agent/research tasks.
+                    let id = ff_agent::task_runner::pg_enqueue_shell_task_full(
                         &pool,
                         &summary,
                         &command,
@@ -2641,6 +2650,10 @@ async fn main() -> Result<()> {
                         None,
                         priority,
                         my_id,
+                        false,
+                        &[],
+                        timeout,
+                        None,
                     )
                     .await
                     .map_err(|e| anyhow::anyhow!("enqueue: {e}"))?;
