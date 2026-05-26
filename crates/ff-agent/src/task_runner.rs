@@ -1565,6 +1565,29 @@ pub async fn compose_fleet_upgrade_wave(
             // exit=-1 at the 80-200s mark even with the V62 two-phase
             // barrier already in place. Keepalive at 15s with 120 retries
             // tolerates up to 30 minutes of pure compile silence.
+            // Memory-aware build (2026-05-26): self-built releases
+            // (forgefleetd / ff) are heavy and OOM mid-link on memory-tight
+            // hosts (≤ FREE_FOR_BUILD_RAM_GB) that have an LLM model resident —
+            // sophie (32GB) and ace (16GB) failed the wave every pass and
+            // couldn't self-heal. Wrap the playbook so the TARGET frees RAM
+            // (snapshots + unloads its models) before the build and reloads
+            // them after. `free-for-build` is a no-op on roomy hosts;
+            // `resume-from-build` is on its own line (not in the playbook's
+            // `&&` chain) so a failed build still restores the model. Both are
+            // `|| true` so a missing `ff` on PATH degrades to current
+            // behaviour rather than failing the upgrade. Only for daemon-self
+            // software — package-manager upgrades are light and must not strip
+            // a host's models.
+            let playbook_body = if crate::auto_upgrade::is_daemon_self_software(software_id) {
+                format!(
+                    "ff model free-for-build || true\n\
+                     {pb}\n\
+                     ff model resume-from-build || true",
+                    pb = t.playbook_command
+                )
+            } else {
+                t.playbook_command.clone()
+            };
             let command = format!(
                 "set -e\n\
                  echo \"== upgrading {target} via ssh from $(hostname) ==\"\n\
@@ -1577,7 +1600,7 @@ pub async fn compose_fleet_upgrade_wave(
                 port_arg = port_arg,
                 ssh_user = t.ssh_user,
                 primary_ip = t.primary_ip,
-                playbook = t.playbook_command,
+                playbook = playbook_body,
             );
 
             // V61 worker-exclusion: target NEVER claims its own ff

@@ -458,6 +458,151 @@ pub async fn unload_model(pool: &sqlx::PgPool, deployment_id: &str) -> Result<()
     Ok(())
 }
 
+// ── Memory-aware build support ─────────────────────────────────────────────
+//
+// Releasing forgefleetd/ff is a heavy release build that OOMs mid-link (the
+// `forge-fleet` binary crate) on memory-tight hosts (≤ ~40GB total) when an
+// LLM model is resident — observed on sophie (32GB + qwen3-coder-30b) and ace
+// (16GB). Before this, those hosts failed the auto-upgrade wave every pass and
+// could not self-heal; only a manual unload→build→reload converged them.
+//
+// The self-built wave now calls `pause_local_models_for_build` before the
+// build and `resume_local_models` after, so the pipeline self-heals memory-
+// tight hosts. Roomy hosts (> threshold) are a no-op — their models stay up.
+
+/// Hosts with total RAM at or below this many GB pause their resident models
+/// for a self-built release build. Splits the fleet cleanly: 16/32GB hosts
+/// pause; 64/96/128GB hosts build with models still loaded.
+pub const FREE_FOR_BUILD_RAM_GB: f64 = 40.0;
+
+fn paused_models_state_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    PathBuf::from(home)
+        .join(".forgefleet")
+        .join("paused_build_models.json")
+}
+
+/// Best-effort local total RAM in GB. macOS: `sysctl -n hw.memsize`; Linux:
+/// `/proc/meminfo` MemTotal. Returns `None` if undetectable (caller treats
+/// that as "roomy" so an unknown host is never needlessly stripped of models).
+fn local_total_ram_gb() -> Option<f64> {
+    #[cfg(target_os = "macos")]
+    {
+        let out = std::process::Command::new("sysctl")
+            .args(["-n", "hw.memsize"])
+            .output()
+            .ok()?;
+        let bytes: f64 = String::from_utf8_lossy(&out.stdout).trim().parse().ok()?;
+        Some(bytes / 1e9)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let txt = std::fs::read_to_string("/proc/meminfo").ok()?;
+        for line in txt.lines() {
+            if let Some(rest) = line.strip_prefix("MemTotal:") {
+                let kb: f64 = rest.trim().trim_end_matches("kB").trim().parse().ok()?;
+                return Some(kb / 1e6);
+            }
+        }
+        None
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PausedModel {
+    library_id: String,
+    port: u16,
+    context_size: Option<u32>,
+    /// Not tracked on the deployment row, so always `None` on snapshot →
+    /// resume uses load_model's default. Faithful enough for restore.
+    parallel: Option<u32>,
+}
+
+/// Pause local model deployments to free RAM for a release build — only if
+/// this host is memory-tight (total RAM ≤ [`FREE_FOR_BUILD_RAM_GB`]).
+/// Snapshots each restorable deployment (one with a `library_id`) to a state
+/// file, then unloads ALL local deployments so the build has the RAM. No-op
+/// on roomy hosts, when RAM is undetectable, or when nothing is loaded.
+/// Returns the number snapshotted for resume.
+pub async fn pause_local_models_for_build(pool: &sqlx::PgPool) -> Result<usize, String> {
+    let total = local_total_ram_gb().unwrap_or(f64::INFINITY);
+    if total > FREE_FOR_BUILD_RAM_GB {
+        return Ok(0); // roomy host — build with models loaded
+    }
+    let worker = crate::fleet_info::resolve_this_worker_name().await;
+    let deps = ff_db::pg_list_deployments(pool, Some(&worker))
+        .await
+        .map_err(|e| format!("pg_list_deployments: {e}"))?;
+    if deps.is_empty() {
+        return Ok(0);
+    }
+    let mut snapshot: Vec<PausedModel> = Vec::new();
+    for d in &deps {
+        if let Some(lib) = d.library_id.clone() {
+            snapshot.push(PausedModel {
+                library_id: lib,
+                port: d.port as u16,
+                context_size: d.context_window.map(|c| c as u32),
+                parallel: None,
+            });
+        } else {
+            tracing::warn!(
+                deployment = %d.id,
+                "free-for-build: deployment has no library_id; unloading to free RAM but it won't auto-restore"
+            );
+        }
+        let _ = unload_model(pool, &d.id).await; // best-effort
+    }
+    let path = paused_models_state_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let json = serde_json::to_string_pretty(&snapshot).map_err(|e| format!("serialize: {e}"))?;
+    std::fs::write(&path, json).map_err(|e| format!("write state: {e}"))?;
+    tracing::info!(
+        paused = snapshot.len(),
+        total_ram_gb = total,
+        "free-for-build: paused models to free RAM for release build"
+    );
+    Ok(snapshot.len())
+}
+
+/// Reload models paused by [`pause_local_models_for_build`]: read the state
+/// file, `load_model` each, then remove the file. No-op if no state file
+/// exists (roomy host / nothing was paused). Returns the number restored.
+pub async fn resume_local_models(pool: &sqlx::PgPool) -> Result<usize, String> {
+    let path = paused_models_state_path();
+    let Ok(json) = std::fs::read_to_string(&path) else {
+        return Ok(0);
+    };
+    let snapshot: Vec<PausedModel> =
+        serde_json::from_str(&json).map_err(|e| format!("parse state: {e}"))?;
+    let mut restored = 0usize;
+    for m in &snapshot {
+        match load_model(
+            pool,
+            LoadOptions {
+                library_id: m.library_id.clone(),
+                port: m.port,
+                context_size: m.context_size,
+                parallel: m.parallel,
+            },
+        )
+        .await
+        {
+            Ok(_) => restored += 1,
+            Err(e) => tracing::warn!(
+                library_id = %m.library_id,
+                error = %e,
+                "resume-from-build: reload failed"
+            ),
+        }
+    }
+    let _ = std::fs::remove_file(&path);
+    tracing::info!(restored, "resume-from-build: reloaded paused models");
+    Ok(restored)
+}
+
 /// Scan local processes for running inference servers (llama.cpp/MLX/vLLM).
 pub async fn list_local_processes() -> Vec<RunningProcess> {
     let output = tokio::process::Command::new("ps")
