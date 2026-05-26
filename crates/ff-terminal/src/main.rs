@@ -1785,6 +1785,14 @@ pub enum ModelCommand {
         #[arg(long)]
         show_id: bool,
     },
+    /// Pause local model deployments to free RAM for a release build — only if
+    /// this host is memory-tight. Snapshots restorable models for resume.
+    /// Called by the self-built upgrade wave before `cargo build`; no-op on
+    /// roomy hosts.
+    FreeForBuild,
+    /// Reload models paused by `free-for-build`. Called by the wave after the
+    /// build; no-op if nothing was paused.
+    ResumeFromBuild,
     /// Scan a node's local models directory and reconcile with fleet_model_library.
     /// Defaults to the current host (taylor) scanning ~/models.
     Scan {

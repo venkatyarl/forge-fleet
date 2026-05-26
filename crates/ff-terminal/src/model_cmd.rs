@@ -167,6 +167,18 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                 }
             }
         }
+        crate::ModelCommand::FreeForBuild => {
+            match ff_agent::model_runtime::pause_local_models_for_build(&pool).await {
+                Ok(n) => println!("free-for-build: paused {n} model(s) to free RAM"),
+                Err(e) => anyhow::bail!("free-for-build: {e}"),
+            }
+        }
+        crate::ModelCommand::ResumeFromBuild => {
+            match ff_agent::model_runtime::resume_local_models(&pool).await {
+                Ok(n) => println!("resume-from-build: restored {n} model(s)"),
+                Err(e) => anyhow::bail!("resume-from-build: {e}"),
+            }
+        }
         crate::ModelCommand::Scan { node, models_dir } => {
             // Default: resolve this host's node name from Postgres by IP.
             let worker_name = match node {
