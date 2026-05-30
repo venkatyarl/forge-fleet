@@ -69,6 +69,7 @@ impl ToolRegistry {
         self.register(Self::fleet_config());
         self.register(Self::fleet_ssh());
         self.register(Self::fleet_run());
+        self.register(Self::fleet_offload());
         self.register(Self::fleet_cascade());
         self.register(Self::fleet_route());
         self.register(Self::fleet_scan());
@@ -236,6 +237,52 @@ impl ToolRegistry {
                     }
                 },
                 "required": ["prompt"]
+            }),
+        }
+    }
+
+    fn fleet_offload() -> ToolDefinition {
+        ToolDefinition {
+            name: "fleet_offload".to_string(),
+            description: "Credit-saver: offload heavy, low-architectural-subtlety \
+                work to a WARM tool-capable local LLM on the fleet so you (the \
+                cloud orchestrator) don't burn cloud tokens on the bulk. \
+                \n\nWhen to call: bulk code generation, multi-file mechanical \
+                edits, research, summarization, test/doc generation, data \
+                extraction — anything high-token where the *shape* of the answer \
+                is clear and you'll review the output anyway. Keep \
+                architectural / load-bearing decisions in-cloud. \
+                \n\nBehaviour (v1): picks the best WARM agent-capable deployment \
+                via the V111 capability router (require_tool_calling + min_ctx, \
+                excluding given hosts), dispatches the task to it over the \
+                OpenAI-compatible API, and returns its result for you to \
+                review. If NO warm tool-capable endpoint exists it returns \
+                {offloaded:false, decision:\"do_in_cloud\"} — in that case \
+                proceed and do the work yourself. v1 never cold-loads a model \
+                (that's v2)."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "task": {
+                        "type": "string",
+                        "description": "The self-contained task to offload. Include all context the local model needs — it does not see your conversation."
+                    },
+                    "kind": {
+                        "type": "string",
+                        "description": "Optional task shape hint for logging/triage: codegen | edits | research | summarize | tests | docs | extract | other."
+                    },
+                    "est_output_tokens": {
+                        "type": "integer",
+                        "description": "Optional estimate of output size — caps the local model's max_tokens (clamped 256..=8192, default 4096)."
+                    },
+                    "min_ctx": {
+                        "type": "integer",
+                        "description": "Required usable per-slot context on the local endpoint so the task + tool-schema prompt fits. Default 16384.",
+                        "default": 16384
+                    }
+                },
+                "required": ["task"]
             }),
         }
     }
@@ -1028,6 +1075,7 @@ mod tests {
             "fleet_config",
             "fleet_ssh",
             "fleet_run",
+            "fleet_offload",
             "fleet_cascade",
             "fleet_route",
             "fleet_scan",
