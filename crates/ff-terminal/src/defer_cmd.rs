@@ -130,7 +130,27 @@ pub async fn handle_defer(cmd: crate::DeferCommand) -> Result<()> {
                     println!("Last error:    {err}");
                 }
                 if let Some(res) = &r.result {
-                    println!("Result:        {res}");
+                    // Surface the full captured streams when present (shell
+                    // tasks store {exit_code, stdout, stderr}); fall back to
+                    // pretty JSON for other task kinds.
+                    let stdout = res.get("stdout").and_then(|v| v.as_str());
+                    let stderr = res.get("stderr").and_then(|v| v.as_str());
+                    if stdout.is_some() || stderr.is_some() {
+                        if let Some(code) = res.get("exit_code").and_then(|v| v.as_i64()) {
+                            println!("Exit code:     {code}");
+                        }
+                        if let Some(s) = stdout.filter(|s| !s.is_empty()) {
+                            println!("\n--- stdout ---\n{s}");
+                        }
+                        if let Some(s) = stderr.filter(|s| !s.is_empty()) {
+                            println!("\n--- stderr ---\n{s}");
+                        }
+                    } else {
+                        println!(
+                            "Result:\n{}",
+                            serde_json::to_string_pretty(res).unwrap_or_else(|_| res.to_string())
+                        );
+                    }
                 }
                 println!(
                     "\nPayload:\n{}",

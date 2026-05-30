@@ -2934,6 +2934,10 @@ pub async fn pg_finish_deferred(
                         ELSE 'pending'
                     END,
                     last_error = $1,
+                    -- Keep the full execution output (stdout/stderr) on failure
+                    -- too, so `ff defer get` can surface the complete stderr
+                    -- instead of only the truncated last_error summary.
+                    result = COALESCE($3, result),
                     claimed_by = NULL,
                     claimed_at = NULL,
                     -- Exponential backoff capped at 4h: 1m, 5m, 30m, 1h, 4h
@@ -2942,6 +2946,7 @@ pub async fn pg_finish_deferred(
         )
         .bind(error)
         .bind(uuid)
+        .bind(result)
         .execute(pool)
         .await?;
     }

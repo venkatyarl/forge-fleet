@@ -279,15 +279,23 @@ async fn execute_shell(
     if output.status.success() {
         (true, Some(result), None)
     } else {
-        let err = format!(
-            "exit {exit_code}: {}",
-            if !stderr.is_empty() {
-                stderr.chars().take(500).collect::<String>()
-            } else {
-                stdout.chars().take(500).collect::<String>()
-            }
-        );
+        // Error messages land at the END of output (e.g. corepack's EACCES
+        // line follows pages of progress), so summarize the TAIL, not the head.
+        // The full stream is preserved in `result` (persisted on failure too).
+        let src = if !stderr.is_empty() { &stderr } else { &stdout };
+        let err = format!("exit {exit_code}: {}", tail_chars(src, 800));
         (false, Some(result), Some(err))
+    }
+}
+
+/// Last `n` chars of `s`, prefixed with `…` when truncated. Used for error
+/// summaries where the meaningful message is at the end of the stream.
+fn tail_chars(s: &str, n: usize) -> String {
+    let chars: Vec<char> = s.trim_end().chars().collect();
+    if chars.len() <= n {
+        chars.iter().collect()
+    } else {
+        format!("…{}", chars[chars.len() - n..].iter().collect::<String>())
     }
 }
 
