@@ -155,7 +155,15 @@ enum Command {
     /// Stop ForgeFleet daemon
     Stop,
     Status,
-    Nodes,
+    /// List fleet nodes with hardware/GPU info from Postgres.
+    Nodes {
+        /// Filter by GPU kind substring (e.g. amd, nvidia, apple).
+        #[arg(long)]
+        gpu: Option<String>,
+        /// Output JSON instead of a table.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     Models,
     Health,
     Proxy {
@@ -2327,7 +2335,9 @@ async fn main() -> Result<()> {
             return config_cmd::handle_config(command.clone(), &config_path).await;
         }
         Some(Command::Status) => return status_cmd::handle_status(&config_path).await,
-        Some(Command::Nodes) => return helpers::handle_nodes(&config_path),
+        Some(Command::Nodes { gpu, json }) => {
+            return helpers::handle_nodes(gpu.as_deref(), *json).await;
+        }
         Some(Command::Versions { node }) => {
             return versions_cmd::handle_versions(node.clone()).await;
         }
@@ -2460,7 +2470,7 @@ async fn main() -> Result<()> {
         }
         Some(Command::Stop) => lifecycle_cmd::handle_stop().await,
         Some(Command::Status) => status_cmd::handle_status(&config_path).await,
-        Some(Command::Nodes) => helpers::handle_nodes(&config_path),
+        Some(Command::Nodes { gpu, json }) => helpers::handle_nodes(gpu.as_deref(), json).await,
         Some(Command::Models) => lifecycle_cmd::handle_models(&agent_config).await,
         Some(Command::Health) => health_cmd::handle_health(&agent_config).await,
         Some(Command::Proxy { port }) => {

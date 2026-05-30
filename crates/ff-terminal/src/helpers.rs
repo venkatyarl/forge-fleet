@@ -1,7 +1,6 @@
 //! Misc CLI helpers that don't fit into a specific command domain.
 
 use anyhow::Result;
-use std::path::Path;
 use std::time::Duration;
 
 use crate::{GREEN, RESET};
@@ -147,14 +146,75 @@ pub async fn detect_llm_from_db_or_local(config_path: &std::path::Path) -> Strin
     "http://localhost:55000".into()
 }
 
-/// List fleet nodes from config.
-pub fn handle_nodes(p: &Path) -> Result<()> {
-    let cfg = crate::utils::load_config(p)?;
+/// `ff nodes` — list fleet nodes with hardware/GPU from Postgres.
+///
+/// Reads the worker registry joined to the `computers` hardware table, so GPU
+/// vendor/VRAM and true RAM are visible without SSH-probing. `--gpu <kind>`
+/// filters by GPU kind substring (e.g. `--gpu amd` → amd_rocm boxes).
+pub async fn handle_nodes(gpu: Option<&str>, json: bool) -> Result<()> {
+    let pool = ff_agent::fleet_info::get_fleet_pool()
+        .await
+        .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
+    let mut nodes = ff_db::pg_list_nodes(&pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("pg_list_nodes: {e}"))?;
+
+    if let Some(g) = gpu {
+        let g = g.to_lowercase();
+        nodes.retain(|n| {
+            n.gpu_kind
+                .as_deref()
+                .map(|k| k.to_lowercase().contains(&g))
+                .unwrap_or(false)
+        });
+    }
+
+    // Sort by primary IP, numerically by octet (fleet-table convention).
+    nodes.sort_by_key(|n| ip_sort_key(&n.ip));
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&nodes)?);
+        return Ok(());
+    }
+
+    if nodes.is_empty() {
+        println!(
+            "(no nodes{})",
+            gpu.map(|g| format!(" matching gpu~{g}"))
+                .unwrap_or_default()
+        );
+        return Ok(());
+    }
+
     println!("{GREEN}✓ Fleet Nodes{RESET}");
-    for (n, d) in cfg.nodes {
-        println!("  - {n}: {d}");
+    println!(
+        "{:<10} {:<15} {:<13} {:>4} {:>6} {:<14} {:>7} {:<8}",
+        "NODE", "IP", "OS", "CPU", "RAM", "GPU", "VRAM", "STATUS"
+    );
+    for n in &nodes {
+        let ram = n.computer_ram_gb.unwrap_or(n.ram_gb);
+        let cpu = n.computer_cpu_cores.unwrap_or(n.cpu_cores);
+        let gpu_kind = n.gpu_kind.as_deref().unwrap_or("-");
+        let vram = n
+            .gpu_vram_gb
+            .filter(|v| *v > 0.0)
+            .map(|v| format!("{v:.0}G"))
+            .unwrap_or_else(|| "-".into());
+        println!(
+            "{:<10} {:<15} {:<13} {:>4} {:>5}G {:<14} {:>7} {:<8}",
+            n.name, n.ip, n.os, cpu, ram, gpu_kind, vram, n.status
+        );
     }
     Ok(())
+}
+
+/// Sort key for an IPv4 string: 4 octets packed big-endian. Non-IPv4 sorts last.
+fn ip_sort_key(ip: &str) -> u32 {
+    let mut octets = ip.split('.').filter_map(|o| o.parse::<u8>().ok());
+    match (octets.next(), octets.next(), octets.next(), octets.next()) {
+        (Some(a), Some(b), Some(c), Some(d)) => u32::from_be_bytes([a, b, c, d]),
+        _ => u32::MAX,
+    }
 }
 
 /// Detect the OS family of the current host.
