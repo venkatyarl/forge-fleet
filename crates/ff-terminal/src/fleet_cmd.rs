@@ -2897,7 +2897,8 @@ fn deploy_playbook(os_family: &str, source_tree_path: &str) -> String {
                || launchctl kickstart -k \"user/${{USER_ID}}/com.forgefleet.forgefleetd\" 2>/dev/null \
                || ( for p in $(pgrep -f \"[f]orgefleetd\"); do [ \"$p\" != \"$$\" ] && kill -TERM \"$p\" 2>/dev/null; done; sleep 1; \
                     nohup \"$HOME/.local/bin/forgefleetd\" --worker-name $(hostname -s) start \
-                    </dev/null >/tmp/forgefleetd.log 2>&1 & disown )"
+                    </dev/null >/tmp/forgefleetd.log 2>&1 & disown ); \
+             sleep 4; ~/.local/bin/ff model resume-from-build 2>/dev/null || true"
         ),
         // linux + linux-dgx share the same restart idiom; only -j differs
         // (folded into cargo_build above). Prefer the systemd user unit; the
@@ -2915,7 +2916,8 @@ fn deploy_playbook(os_family: &str, source_tree_path: &str) -> String {
                systemctl --user restart forgefleetd.service 2>/dev/null ) \
                || ( for p in $(pgrep -f \"[f]orgefleetd\"); do [ \"$p\" != \"$$\" ] && kill -TERM \"$p\" 2>/dev/null; done; sleep 1; \
                     nohup \"$HOME/.local/bin/forgefleetd\" --worker-name $(hostname -s) start \
-                    </dev/null >/tmp/forgefleetd.log 2>&1 & disown )"
+                    </dev/null >/tmp/forgefleetd.log 2>&1 & disown ); \
+             sleep 4; ~/.local/bin/ff model resume-from-build 2>/dev/null || true"
         ),
     }
 }
