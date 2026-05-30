@@ -1881,6 +1881,12 @@ pub enum ModelCommand {
         /// Parallel request slots (default 2 → 32K per slot at default ctx).
         #[arg(long)]
         parallel: Option<u32>,
+        /// Agent-capable serving profile: forces --parallel 1 and raises --ctx
+        /// to at least 32768 so a tool-using agent's full context is on a single
+        /// slot (no "prompt exceeds context window" overflow). Overrides
+        /// --parallel; raises --ctx if you asked for less.
+        #[arg(long, default_value_t = false)]
+        agent: bool,
     },
     /// Enqueue downloads of multiple catalog ids onto a node via the deferred queue.
     DownloadBatch {

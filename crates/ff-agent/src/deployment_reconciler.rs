@@ -184,7 +184,10 @@ pub async fn reconcile_local(pool: &sqlx::PgPool) -> Result<ReconcileSummary, St
                 port_i32,
                 Some(proc_info.pid as i32),
                 status,
-                None,
+                // Adopt the real ctx + slot count parsed from the cmdline so an
+                // out-of-band server still gets usable_agent_ctx recorded.
+                proc_info.context_window,
+                proc_info.parallel_slots,
             )
             .await
             {
@@ -270,13 +273,22 @@ async fn respawn_dead_deployment(
     } else {
         32_768
     };
+    // Respawn with the row's recorded slot count so an agent-capable (1-slot)
+    // deployment isn't silently reverted to a 4-slot split. 0 = unknown (older
+    // row) → keep the historical default of 4.
+    let parallel = if row.parallel_slots > 0 {
+        row.parallel_slots as u32
+    } else {
+        4
+    };
     let result = crate::model_runtime::load_model(
         pool,
         crate::model_runtime::LoadOptions {
             library_id: lib.id.clone(),
             port: row.port as u16,
             context_size: Some(ctx),
-            parallel: Some(4),
+            parallel: Some(parallel),
+            agent_profile: false,
         },
     )
     .await
@@ -300,6 +312,9 @@ struct DeploymentRow {
     catalog_id: Option<String>,
     desired_state: String,
     context_window: i32,
+    /// V111 launched `--parallel`; 0 (via COALESCE) means "unknown" → respawn
+    /// falls back to the historical default of 4.
+    parallel_slots: i32,
 }
 
 async fn list_deployments_with_desired_state(
@@ -311,7 +326,8 @@ async fn list_deployments_with_desired_state(
                 library_id::text AS library_id,
                 catalog_id,
                 desired_state,
-                COALESCE(context_window, 0) AS context_window
+                COALESCE(context_window, 0) AS context_window,
+                COALESCE(parallel_slots, 0) AS parallel_slots
          FROM fleet_model_deployments
          WHERE worker_name = $1",
     )

@@ -945,107 +945,100 @@ pub async fn fleet_route(params: Option<Value>) -> HandlerResult {
         .and_then(|v| v.as_u64())
         .unwrap_or(3) as i64;
 
+    // Agent-capability filters (all optional, additive). `tool_calling=true`
+    // requires a tool-calling model; `min_ctx` requires that much usable
+    // per-slot ctx; `exclude_hosts` keeps load off named hosts (e.g. taylor).
+    // Passing workload="tool_calling" also implies require_tool_calling so the
+    // existing tag-based call keeps working AND benefits from the real column.
+    let require_tool_calling = params
+        .as_ref()
+        .and_then(|p| p.get("tool_calling"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        || workload == "tool_calling";
+
+    let min_ctx = params
+        .as_ref()
+        .and_then(|p| p.get("min_ctx"))
+        .and_then(|v| v.as_i64())
+        .map(|v| v as i32);
+
+    let exclude_hosts: Vec<String> = params
+        .as_ref()
+        .and_then(|p| p.get("exclude_hosts"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|h| h.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
     let (cfg, _) = config::load_config_auto().map_err(|e| format!("config: {e}"))?;
     let pool = get_pg_pool(&cfg).await?;
 
-    // Singular-plural tolerance — V39 seed uses "embeddings"/"reranking",
-    // V91 uses "embedding". Match either by building two JSONB literals.
-    // (PostgreSQL `@>` is exact-element match, so we need to OR them.)
-    let plural = match workload {
-        "embedding" => Some("embeddings"),
-        "rerank" => Some("reranking"),
-        "embeddings" => Some("embedding"),
-        "reranking" => Some("rerank"),
-        _ => None,
+    // Single shared scorer (ff_db::pg_route_deployments) — same query the
+    // agent-capable router uses, so there's no parallel scorer to drift.
+    let filter = ff_db::RouteFilter {
+        workload: Some(workload.to_string()),
+        require_tool_calling,
+        min_ctx,
+        exclude_hosts: exclude_hosts.clone(),
+        limit,
     };
+    let rows = ff_db::pg_route_deployments(&pool, &filter)
+        .await
+        .map_err(|e| format!("fleet_route db: {e}"))?;
 
-    // Best healthy deployment per workload tag. Score components:
-    //   - tier_score   = 4 - tier (smaller tier wins; T1 small/fast beats T4 huge)
-    //   - recency      = (NOW() - last_health_at) seconds, inverse-weighted
-    // Simple, transparent. RouteDecision-style payload returned.
-    let arr_a = serde_json::json!([workload]);
-    let arr_b = serde_json::json!([plural.unwrap_or(workload)]);
-
-    let rows = sqlx::query(
-        r#"
-        SELECT d.worker_name,
-               d.port,
-               d.catalog_id,
-               cat.name        AS catalog_name,
-               cat.family      AS catalog_family,
-               cat.tier        AS tier,
-               cat.preferred_workloads AS preferred_workloads,
-               d.health_status AS health_status,
-               COALESCE(c.primary_ip, w.name) AS host_or_name,
-               c.os_family     AS os_family,
-               c.has_gpu       AS has_gpu,
-               c.is_unified_memory AS is_unified_memory,
-               c.total_ram_gb  AS total_ram_gb,
-               EXTRACT(EPOCH FROM (NOW() - d.last_health_at))::int AS health_age_sec
-          FROM fleet_model_deployments d
-          JOIN fleet_model_catalog cat ON cat.id = d.catalog_id
-          LEFT JOIN fleet_workers w     ON w.name = d.worker_name
-          LEFT JOIN computers c         ON LOWER(c.name) = LOWER(d.worker_name)
-         WHERE d.health_status = 'healthy'
-           AND (cat.preferred_workloads @> $1::jsonb
-             OR cat.preferred_workloads @> $2::jsonb)
-         ORDER BY cat.tier ASC,
-                  d.last_health_at DESC NULLS LAST
-         LIMIT $3
-        "#,
-    )
-    .bind(&arr_a)
-    .bind(&arr_b)
-    .bind(limit)
-    .fetch_all(&pool)
-    .await
-    .map_err(|e| format!("fleet_route db: {e}"))?;
-
-    let mut candidates: Vec<Value> = Vec::with_capacity(rows.len());
-    for r in rows.iter() {
-        use sqlx::Row;
-        let worker_name: String = r.try_get("worker_name").unwrap_or_default();
-        let port: i32 = r.try_get("port").unwrap_or(0);
-        let host: String = r.try_get("host_or_name").unwrap_or_default();
-        let catalog_id: String = r.try_get("catalog_id").unwrap_or_default();
-        let catalog_name: String = r.try_get("catalog_name").unwrap_or_default();
-        let catalog_family: String = r.try_get("catalog_family").unwrap_or_default();
-        let tier: i32 = r.try_get("tier").unwrap_or(2);
-        let health_status: String = r.try_get("health_status").unwrap_or_default();
-        let os_family: Option<String> = r.try_get("os_family").ok();
-        let has_gpu: Option<bool> = r.try_get("has_gpu").ok();
-        let is_unified: Option<bool> = r.try_get("is_unified_memory").ok();
-        let total_ram_gb: Option<i32> = r.try_get("total_ram_gb").ok();
-        let health_age_sec: Option<i32> = r.try_get("health_age_sec").ok();
-
-        candidates.push(serde_json::json!({
-            "worker_name": worker_name,
-            "endpoint": format!("http://{host}:{port}"),
-            "catalog_id": catalog_id,
-            "catalog_name": catalog_name,
-            "family": catalog_family,
-            "tier": tier,
-            "health": health_status,
-            "health_age_sec": health_age_sec,
-            "host": {
-                "os_family": os_family,
-                "has_gpu": has_gpu,
-                "is_unified_memory": is_unified,
-                "total_ram_gb": total_ram_gb,
-            }
-        }));
-    }
+    let candidates: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "worker_name": r.worker_name,
+                "endpoint": r.endpoint,
+                "catalog_id": r.catalog_id,
+                "catalog_name": r.catalog_name,
+                "family": r.family,
+                "tier": r.tier,
+                "tool_calling": r.tool_calling,
+                "context_window": r.context_window,
+                "usable_agent_ctx": r.usable_agent_ctx,
+                "parallel_slots": r.parallel_slots,
+                "health": r.health_status,
+                "health_age_sec": r.health_age_sec,
+                "host": {
+                    "os_family": r.os_family,
+                    "has_gpu": r.has_gpu,
+                    "is_unified_memory": r.is_unified_memory,
+                    "total_ram_gb": r.total_ram_gb,
+                }
+            })
+        })
+        .collect();
 
     if candidates.is_empty() {
+        let mut constraints = Vec::new();
+        if require_tool_calling {
+            constraints.push("tool_calling=true".to_string());
+        }
+        if let Some(c) = min_ctx {
+            constraints.push(format!("usable_agent_ctx>={c}"));
+        }
+        if !exclude_hosts.is_empty() {
+            constraints.push(format!("excluding {exclude_hosts:?}"));
+        }
+        let extra = if constraints.is_empty() {
+            String::new()
+        } else {
+            format!(" with {}", constraints.join(", "))
+        };
         return Ok(serde_json::json!({
             "workload": workload,
             "decision": null,
             "reason": format!(
-                "no healthy deployment in fleet_model_deployments has \
-                 preferred_workloads containing {:?}{}. \
-                 Load one with: ff model autoload <catalog_id>",
-                workload,
-                plural.map(|p| format!(" or {:?}", p)).unwrap_or_default()
+                "no healthy deployment matches workload {:?}{}. \
+                 Load an agent-capable model with: ff model load <library_id> --agent",
+                workload, extra
             ),
             "candidates": [],
         }));
@@ -2083,6 +2076,7 @@ fn catalog_row_to_json(row: &ff_db::ModelCatalogRow) -> Value {
         "parameters": row.parameters,
         "tier": row.tier,
         "gated": row.gated,
+        "tool_calling": row.tool_calling,
         "description": row.description,
         "preferred_workloads": row.preferred_workloads,
         "variants": row.variants,
@@ -2193,6 +2187,8 @@ pub async fn fleet_models_deployments(params: Option<Value>) -> HandlerResult {
                 "last_health_at": r.last_health_at,
                 "health_status": r.health_status,
                 "context_window": r.context_window,
+                "parallel_slots": r.parallel_slots,
+                "usable_agent_ctx": r.usable_agent_ctx,
                 "tokens_used": r.tokens_used,
                 "request_count": r.request_count,
             })
