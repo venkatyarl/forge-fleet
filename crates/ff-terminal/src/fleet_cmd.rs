@@ -2895,12 +2895,15 @@ fn deploy_playbook(os_family: &str, source_tree_path: &str) -> String {
              USER_ID=$(stat -f %u \"$HOME\" 2>/dev/null || id -u); \
              launchctl kickstart -k \"gui/${{USER_ID}}/com.forgefleet.forgefleetd\" 2>/dev/null \
                || launchctl kickstart -k \"user/${{USER_ID}}/com.forgefleet.forgefleetd\" 2>/dev/null \
-               || (pkill -TERM -f \"$HOME/.local/bin/forgefleetd\" 2>/dev/null; sleep 1; \
-                   nohup \"$HOME/.local/bin/forgefleetd\" --worker-name $(hostname -s) start \
-                   </dev/null >/tmp/forgefleetd.log 2>&1 & disown)"
+               || ( for p in $(pgrep -f \"[f]orgefleetd\"); do [ \"$p\" != \"$$\" ] && kill -TERM \"$p\" 2>/dev/null; done; sleep 1; \
+                    nohup \"$HOME/.local/bin/forgefleetd\" --worker-name $(hostname -s) start \
+                    </dev/null >/tmp/forgefleetd.log 2>&1 & disown )"
         ),
         // linux + linux-dgx share the same restart idiom; only -j differs
-        // (folded into cargo_build above).
+        // (folded into cargo_build above). Prefer the systemd user unit; the
+        // fallback kills the running daemon by PID *excluding this shell* ($$)
+        // — a `pkill -f forgefleetd...` would also match (and kill) THIS deploy
+        // command's own SSH shell, which exited it 255 before the restart ran.
         _ => format!(
             ". \"$HOME/.cargo/env\" 2>/dev/null || true; \
              {git_sync} && \
@@ -2908,11 +2911,9 @@ fn deploy_playbook(os_family: &str, source_tree_path: &str) -> String {
              install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && \
              install -m 755 target/release/ff ~/.local/bin/ff && \
              export XDG_RUNTIME_DIR=\"${{XDG_RUNTIME_DIR:-/run/user/$(id -u)}}\"; \
-             pkill -f 'forgefleetd --worker-name' 2>/dev/null; \
-             sleep 1; \
              ( systemctl --user reset-failed forgefleetd.service 2>/dev/null; \
                systemctl --user restart forgefleetd.service 2>/dev/null ) \
-               || ( pkill -TERM -f \"$HOME/.local/bin/forgefleetd\" 2>/dev/null; sleep 1; \
+               || ( for p in $(pgrep -f \"[f]orgefleetd\"); do [ \"$p\" != \"$$\" ] && kill -TERM \"$p\" 2>/dev/null; done; sleep 1; \
                     nohup \"$HOME/.local/bin/forgefleetd\" --worker-name $(hostname -s) start \
                     </dev/null >/tmp/forgefleetd.log 2>&1 & disown )"
         ),
