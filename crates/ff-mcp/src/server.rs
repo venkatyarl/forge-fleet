@@ -108,9 +108,13 @@ impl McpServer {
                      • `fleet_run` — single LLM call (tiered 9B→32B→72B→235B). Self-\n\
                        contained prompts: definitions, summaries, classifications, \n\
                        quick rewrites, JSON extraction.\n\
-                     • `fleet_crew` — 3-agent pipeline (Context Engineer → Code Writer\n\
-                       → Code Reviewer). Coding tasks that benefit from a review pass:\n\
-                       refactors, multi-file changes, edge-case-heavy functions.\n\
+                     • `fleet_crew` — catalog-driven coding pipeline (default Code\n\
+                       Writer → Code Reviewer from the fleet_agents catalog, routed via\n\
+                       the agent-swarm capability router). Coding tasks that benefit from\n\
+                       a review pass: refactors, multi-file changes, edge-case-heavy\n\
+                       functions.\n\
+                     • `fleet_agents` — list/show the fleet_agents catalog (the\n\
+                       specialized agents the crew can instantiate).\n\
                      • `fleet_status`, `fleet_pulse`, `fleet_worker_detail` — query\n\
                        live fleet state.\n\
                      • `fleet_models_*` — catalog/library/deployments/disk for the\n\

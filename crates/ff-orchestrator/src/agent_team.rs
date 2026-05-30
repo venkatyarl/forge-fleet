@@ -74,6 +74,17 @@ impl std::fmt::Display for ModelPreference {
 ///
 /// Ties together a role, model preference, optional node preference,
 /// and custom instructions.
+///
+/// When the assignment is instantiated from the V112 `fleet_agents` catalog
+/// (rather than a hardcoded role enum), three extra fields carry the
+/// catalog's identity through to execution:
+///   - `agent_name` — the catalog handle (e.g. "code-writer"),
+///   - `system_prompt_override` — the catalog's full system prompt (used
+///     verbatim instead of the [`AgentRole`] default),
+///   - `endpoint` — the base URL resolved by the agent-swarm capability
+///     router (`ff_db::pg_pick_agent_endpoint`) for this agent's `min_ctx`,
+///     so the crew routes to a tool-calling endpoint with enough per-slot ctx
+///     instead of hardcoding Taylor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentAssignment {
     /// Unique ID for this assignment.
@@ -86,6 +97,15 @@ pub struct AgentAssignment {
     pub node_preference: Option<String>,
     /// Optional custom instructions appended to the role's system prompt.
     pub instructions: Option<String>,
+    /// Catalog handle when this assignment came from `fleet_agents` (V112).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_name: Option<String>,
+    /// Full system prompt from the catalog row (overrides the role default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt_override: Option<String>,
+    /// Capability-router-resolved base URL for this agent's endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
 }
 
 impl AgentAssignment {
@@ -97,6 +117,9 @@ impl AgentAssignment {
             model_preference: ModelPreference::Auto,
             node_preference: None,
             instructions: None,
+            agent_name: None,
+            system_prompt_override: None,
+            endpoint: None,
         }
     }
 
@@ -108,6 +131,9 @@ impl AgentAssignment {
             model_preference: ModelPreference::tier(tier),
             node_preference: None,
             instructions: None,
+            agent_name: None,
+            system_prompt_override: None,
+            endpoint: None,
         }
     }
 
@@ -119,6 +145,33 @@ impl AgentAssignment {
             model_preference: ModelPreference::specific(model_id),
             node_preference: None,
             instructions: None,
+            agent_name: None,
+            system_prompt_override: None,
+            endpoint: None,
+        }
+    }
+
+    /// Create an assignment from a V112 catalog agent. The caller passes the
+    /// catalog `name`, a best-effort mapped [`AgentRole`] (still used by the
+    /// tier/hardware heuristics that key off the enum), the catalog's full
+    /// system prompt, and the endpoint the agent-swarm capability router
+    /// resolved for this agent's `min_ctx` (`None` when no agent-capable
+    /// endpoint was available — the executor then uses its default).
+    pub fn from_catalog(
+        name: impl Into<String>,
+        role: AgentRole,
+        system_prompt: impl Into<String>,
+        endpoint: Option<String>,
+    ) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            role,
+            model_preference: ModelPreference::Auto,
+            node_preference: None,
+            instructions: None,
+            agent_name: Some(name.into()),
+            system_prompt_override: Some(system_prompt.into()),
+            endpoint,
         }
     }
 
@@ -134,12 +187,35 @@ impl AgentAssignment {
         self
     }
 
-    /// Compose the full system prompt (role default + custom instructions).
+    /// Compose the full system prompt. When the assignment came from the
+    /// catalog (`system_prompt_override` set), that prompt is authoritative;
+    /// otherwise fall back to the [`AgentRole`] default. Custom instructions
+    /// are appended in both cases.
     pub fn full_system_prompt(&self) -> String {
-        let base = self.role.system_prompt();
+        let base = self
+            .system_prompt_override
+            .clone()
+            .unwrap_or_else(|| self.role.system_prompt().to_string());
         match &self.instructions {
             Some(extra) => format!("{base}\n\nAdditional instructions: {extra}"),
-            None => base.to_string(),
+            None => base,
+        }
+    }
+
+    /// Map a V112 catalog agent `name` to the closest [`AgentRole`] enum
+    /// variant. The enum still drives the tier/hardware placement heuristics
+    /// in [`crate::crew::AgentRole`], so catalog agents need a best-effort
+    /// mapping. Unknown names fall back to `Coder` (the safe default for a
+    /// tool-using agent).
+    pub fn role_for_agent_name(name: &str) -> AgentRole {
+        match name {
+            "code-writer" | "refactorer" => AgentRole::Coder,
+            "code-reviewer" => AgentRole::Reviewer,
+            "researcher" | "explorer" => AgentRole::Researcher,
+            "test-writer" => AgentRole::Tester,
+            "doc-writer" => AgentRole::Writer,
+            "planner" => AgentRole::Planner,
+            _ => AgentRole::Coder,
         }
     }
 }

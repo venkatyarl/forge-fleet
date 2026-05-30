@@ -19,6 +19,7 @@ pub mod wave_reaper;
 /// Re-export of the panic-hook module that lives in `ff-core`. Keeps
 /// existing call sites (`ff_agent::panic_hook::install()`) working.
 pub use ff_core::panic_hook;
+pub mod agents_db;
 pub mod alert_evaluator;
 pub mod alert_policy_seed;
 pub mod audit_logger;

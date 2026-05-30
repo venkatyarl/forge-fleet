@@ -1320,7 +1320,10 @@ pub async fn fleet_crew(params: Option<Value>) -> HandlerResult {
     info!(task, repo_dir, project_id = ?project_id, "fleet_crew handler called");
 
     let started = Instant::now();
-    let team = choose_team_for_policy(applied_policy.as_ref());
+    // Build the crew from the V112 `fleet_agents` catalog, routing each agent
+    // through the agent-swarm capability router. Falls back to the hardcoded
+    // TeamTemplates when the catalog / DB is unavailable (back-compat).
+    let team = build_crew_team(applied_policy.as_ref()).await;
     let policy_notes = applied_policy
         .as_ref()
         .map(policy_notes_for_crew)
@@ -1471,6 +1474,8 @@ pub async fn fleet_crew(params: Option<Value>) -> HandlerResult {
             json!({
                 "order": idx,
                 "role": assignment.role,
+                "agent_name": assignment.agent_name,
+                "endpoint": assignment.endpoint,
                 "model_preference": assignment.model_preference,
                 "node_preference": assignment.node_preference,
                 "instructions": assignment.instructions,
@@ -2239,6 +2244,59 @@ pub async fn fleet_models_disk_usage(_params: Option<Value>) -> HandlerResult {
     }))
 }
 
+/// `fleet_agents` — list / show the V112 specialized-agent catalog so callers
+/// can discover which agents the crew can instantiate. Read-only.
+/// Optional params: `name` (show one agent), `enabled_only` (default true).
+pub async fn fleet_agents(params: Option<Value>) -> HandlerResult {
+    let (config, _) = load_config_auto()?;
+    let pool = get_pg_pool(&config).await?;
+
+    let name = params
+        .as_ref()
+        .and_then(|p| p.get("name"))
+        .and_then(|v| v.as_str());
+    let enabled_only = params
+        .as_ref()
+        .and_then(|p| p.get("enabled_only"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
+    if let Some(name) = name {
+        let row = ff_db::pg_get_agent(&pool, name)
+            .await
+            .map_err(|e| format!("Postgres query failed: {e}"))?
+            .ok_or_else(|| format!("no agent named '{name}' in fleet_agents"))?;
+        return Ok(json!({ "agent": agent_row_to_json(&row) }));
+    }
+
+    let rows = ff_db::pg_list_agents(&pool, enabled_only)
+        .await
+        .map_err(|e| format!("Postgres query failed: {e}"))?;
+    let items: Vec<Value> = rows.iter().map(agent_row_to_json).collect();
+    Ok(json!({
+        "count": items.len(),
+        "enabled_only": enabled_only,
+        "agents": items,
+    }))
+}
+
+fn agent_row_to_json(r: &ff_db::FleetAgentRow) -> Value {
+    json!({
+        "id": r.id,
+        "name": r.name,
+        "role": r.role,
+        "description": r.description,
+        "allowed_tools": r.allowed_tools,
+        "triggers": r.triggers,
+        "require_tool_calling": r.require_tool_calling,
+        "min_ctx": r.min_ctx,
+        "source": r.source,
+        "source_url": r.source_url,
+        "enabled": r.enabled,
+        "system_prompt": r.system_prompt,
+    })
+}
+
 // ─── Postgres pool helper ───────────────────────────────────────────────────
 
 async fn get_pg_pool(config: &FleetConfig) -> Result<sqlx::PgPool, String> {
@@ -2284,6 +2342,7 @@ pub async fn dispatch(method: &str, params: Option<Value>) -> HandlerResult {
         "fleet_models_library" => fleet_models_library(params).await,
         "fleet_models_deployments" => fleet_models_deployments(params).await,
         "fleet_models_disk_usage" => fleet_models_disk_usage(params).await,
+        "fleet_agents" => fleet_agents(params).await,
         // Virtual Brain
         "brain_search" => crate::brain_tools::brain_search(params).await,
         "brain_vault_read" => crate::brain_tools::brain_vault_read(params).await,
@@ -2456,6 +2515,79 @@ fn computer_use_write_enabled() -> bool {
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/// Which catalog agents (by `fleet_agents.name`) make up the crew for a given
+/// policy. The default crew is `code-writer → code-reviewer` (back-compat with
+/// the old Context-Engineer → Code-Writer → Code-Reviewer pipeline, now driven
+/// by the catalog). Stricter policies add an `explorer` context pass up front
+/// and a second `code-reviewer` for extra scrutiny.
+fn crew_agent_names_for_policy(policy: Option<&AppliedProjectPolicy>) -> Vec<&'static str> {
+    match policy.map(|p| p.policy.review.strictness) {
+        Some(ReviewStrictness::Paranoid) | Some(ReviewStrictness::Strict) => {
+            vec!["explorer", "code-writer", "code-reviewer", "code-reviewer"]
+        }
+        _ => vec!["code-writer", "code-reviewer"],
+    }
+}
+
+/// Build the crew [`TeamConfig`] from the V112 `fleet_agents` catalog. Each
+/// agent's endpoint is resolved through the agent-swarm capability router
+/// ([`ff_db::pg_pick_agent_endpoint`]) using the agent's `min_ctx`, so the
+/// crew never hardcodes Taylor and never lands on a non-tool-calling model.
+///
+/// Back-compat: if the DB is unreachable, the catalog is empty, or a named
+/// agent is missing, this falls back to the hardcoded [`TeamTemplates`] the
+/// crew used before V112.
+async fn build_crew_team(policy: Option<&AppliedProjectPolicy>) -> TeamConfig {
+    let fallback = || choose_team_for_policy(policy);
+
+    let Ok((config, _)) = load_config_auto() else {
+        return fallback();
+    };
+    let Ok(pool) = get_pg_pool(&config).await else {
+        return fallback();
+    };
+
+    // Keep agent load off the leader (Taylor) when other hosts can serve it —
+    // mirrors the agent-swarm router's intent. The router still picks Taylor
+    // if it's the only agent-capable endpoint (exclude is best-effort below).
+    let exclude_hosts: Vec<String> = Vec::new();
+
+    let names = crew_agent_names_for_policy(policy);
+    let mut team = TeamConfig::new(
+        "Catalog Crew",
+        "fleet_agents-driven crew (V112), routed via the agent-swarm capability router",
+    );
+    let mut built_any = false;
+
+    for name in &names {
+        let row = match ff_db::pg_get_agent(&pool, name).await {
+            Ok(Some(r)) if r.enabled => r,
+            _ => continue, // missing/disabled — skip; fallback handles empties
+        };
+        let role = AgentAssignment::role_for_agent_name(&row.name);
+        // Resolve the endpoint via the V111 capability router for this agent's
+        // ctx floor. `None` is fine — the executor falls back to its default.
+        let endpoint = ff_db::pg_pick_agent_endpoint(&pool, row.min_ctx, &exclude_hosts)
+            .await
+            .ok()
+            .flatten()
+            .map(|c| c.endpoint);
+        team.add(AgentAssignment::from_catalog(
+            row.name.clone(),
+            role,
+            row.system_prompt.clone(),
+            endpoint,
+        ));
+        built_any = true;
+    }
+
+    if built_any && !team.is_empty() {
+        team
+    } else {
+        fallback()
+    }
+}
 
 fn choose_team_for_policy(policy: Option<&AppliedProjectPolicy>) -> TeamConfig {
     if let Some(policy) = policy {

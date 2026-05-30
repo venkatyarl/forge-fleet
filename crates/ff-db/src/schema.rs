@@ -7509,3 +7509,122 @@ UPDATE fleet_model_deployments
 CREATE INDEX IF NOT EXISTS idx_model_deployments_agent_ctx
     ON fleet_model_deployments (health_status, usable_agent_ctx);
 "#;
+
+// ─── V112: fleet_agents catalog ─────────────────────────────────────────────
+//
+// "Create agents for ff" — a specialized fleet-agent catalog. Until now there
+// were THREE disconnected role representations (fleet_crew's hardcoded
+// Context-Engineer → Code-Writer → Code-Reviewer pipeline,
+// ff_orchestrator::crew::AgentRole's enum, and ff_agent::agent_roles' builtin
+// Vec) and NO single catalog. This table is the canonical source of truth for
+// the agents ForgeFleet can instantiate, mirroring the V105 `skills` table
+// shape (a Postgres catalog the loader reads at session start) so the two
+// subsystems stay structurally parallel.
+//
+// Each row maps an `id` → a system_prompt + allowed_tools + a
+// preferred_capability (tool_calling + min_ctx) that routes through the V111
+// agent-swarm capability router (`pg_pick_agent_endpoint`) instead of
+// hardcoding Taylor. The crew now reads its members from this catalog by id;
+// the default crew (`code-writer` → `code-reviewer`) is two catalog rows.
+//
+// Mirrors V105 `skills`: uuid pk + gen_random_uuid default, a stable text
+// `name`/id, description, jsonb tool list, a `triggers` jsonb (≈ skills'
+// when_to_invoke + trigger list), `enabled`, installed_at/updated_at, and an
+// optional `source` column so on-disk AGENT.md imports (like SKILL.md imports)
+// can be tracked. The seeded rows use source='forgefleet'.
+pub const SCHEMA_V112_FLEET_AGENTS: &str = r#"
+CREATE TABLE IF NOT EXISTS fleet_agents (
+    id                    uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    -- Stable handle used by the crew + CLI (e.g. 'code-writer'). Unique.
+    name                  text NOT NULL UNIQUE,
+    -- Short human role label (e.g. 'Code Writer').
+    role                  text NOT NULL,
+    description           text,
+    -- The system prompt injected when this agent is instantiated.
+    system_prompt         text NOT NULL,
+    -- Tools the agent may use (jsonb array of tool names). Empty = inherit
+    -- the session default tool set.
+    allowed_tools         jsonb NOT NULL DEFAULT '[]'::jsonb,
+    -- When to use this agent — free-form triggers (jsonb array of strings).
+    triggers              jsonb NOT NULL DEFAULT '[]'::jsonb,
+    -- Capability routing: which V111 capability the agent's endpoint must
+    -- satisfy. require_tool_calling gates onto a tool-calling model; min_ctx
+    -- is the usable per-slot ctx floor so the tool-schema prompt fits. The
+    -- crew feeds these straight into pg_pick_agent_endpoint.
+    require_tool_calling  boolean NOT NULL DEFAULT true,
+    min_ctx               integer NOT NULL DEFAULT 16384,
+    -- Provenance — 'forgefleet' for the seeded set; importers may add others.
+    source                text NOT NULL DEFAULT 'forgefleet',
+    source_url            text,
+    enabled               boolean NOT NULL DEFAULT true,
+    installed_at          timestamptz NOT NULL DEFAULT now(),
+    updated_at            timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS fleet_agents_enabled_idx ON fleet_agents (enabled);
+CREATE INDEX IF NOT EXISTS fleet_agents_source_idx  ON fleet_agents (source);
+
+-- ── Seed: 8 high-value agents ───────────────────────────────────────────────
+-- code-writer / code-reviewer are the default crew (back-compat with the old
+-- Context-Engineer → Code-Writer → Code-Reviewer pipeline, now catalog-driven).
+INSERT INTO fleet_agents
+    (name, role, description, system_prompt, allowed_tools, triggers,
+     require_tool_calling, min_ctx, source)
+VALUES
+  ('code-writer', 'Code Writer',
+   'Implements changes: writes, edits, and runs code to accomplish a coding task.',
+   'You are an expert software engineer. Write clean, well-tested, production-quality code that accomplishes the task. Follow the existing conventions in the repository. Make focused edits, run the build/tests after changes, and fix what you break. Prefer Edit over rewriting whole files. Report concisely what you changed.',
+   '["Read","Write","Edit","Bash","Glob","Grep"]'::jsonb,
+   '["write code","implement","add feature","fix bug","edit file","refactor function"]'::jsonb,
+   true, 16384, 'forgefleet'),
+
+  ('code-reviewer', 'Code Reviewer',
+   'Audits a change for correctness, security, performance, and style — read-only.',
+   'You are a senior code reviewer. Review the change for correctness bugs, security issues, performance problems, and style/convention violations. Be specific: cite file and line, explain the risk, and suggest a concrete fix. Do NOT edit files — your job is to find issues, not fix them. Lead with the highest-severity findings.',
+   '["Read","Glob","Grep","Bash"]'::jsonb,
+   '["review","audit","check this change","code review","find bugs"]'::jsonb,
+   true, 16384, 'forgefleet'),
+
+  ('researcher', 'Researcher',
+   'Gathers and synthesizes information by exploring the codebase and the web.',
+   'You are a research analyst. Gather comprehensive, accurate information to answer the question or inform the task. Explore the codebase (Glob/Grep/Read) and the web (WebSearch/WebFetch) as needed. Cite sources — file paths for code, URLs for the web. Synthesize findings into a clear, well-structured answer. Do not modify files.',
+   '["Read","Glob","Grep","WebSearch","WebFetch","Bash"]'::jsonb,
+   '["research","investigate","gather information","analyze","compare approaches","find out how"]'::jsonb,
+   true, 32768, 'forgefleet'),
+
+  ('refactorer', 'Refactorer',
+   'Improves code structure without changing behavior; verifies with tests.',
+   'You are a refactoring specialist. Improve code structure, readability, and maintainability WITHOUT changing observable behavior. Run the relevant tests before and after. Make small, verifiable, behavior-preserving changes — extract functions, rename for clarity, remove duplication. If a change risks behavior drift, stop and call it out instead of guessing.',
+   '["Read","Write","Edit","Bash","Glob","Grep"]'::jsonb,
+   '["refactor","clean up","restructure","extract function","remove duplication","simplify"]'::jsonb,
+   true, 16384, 'forgefleet'),
+
+  ('test-writer', 'Test Writer',
+   'Writes and runs comprehensive tests covering happy paths and edge cases.',
+   'You are a testing specialist. Write comprehensive tests using the project''s existing test framework and conventions. Cover happy paths, edge cases, and error conditions. Run the tests you write and make sure they pass (or clearly document a real failure they expose). Identify untested code paths. Do not weaken assertions just to make tests pass.',
+   '["Read","Write","Edit","Bash","Glob","Grep"]'::jsonb,
+   '["write tests","add test coverage","unit test","integration test","test this"]'::jsonb,
+   true, 16384, 'forgefleet'),
+
+  ('doc-writer', 'Doc Writer',
+   'Writes clear technical documentation, API docs, and guides.',
+   'You are a technical writer. Produce clear, accurate, well-structured documentation. Match the project''s existing doc style and tone. Include concrete examples. Keep prose tight — prefer specifics over filler. Update docs that the change makes stale rather than only adding new ones.',
+   '["Read","Write","Edit","Glob","Grep"]'::jsonb,
+   '["write docs","document","readme","api docs","guide","explain in docs"]'::jsonb,
+   true, 16384, 'forgefleet'),
+
+  ('planner', 'Planner',
+   'Breaks complex work into an ordered plan with dependencies and trade-offs.',
+   'You are a system architect and planner. Break the problem into a small number of concrete, ordered steps. For each step state what it does, what it depends on, and its main risk or trade-off. Consider alternatives and call out the decision you''d make and why. Do not implement — produce the plan. Keep it actionable, not aspirational.',
+   '["Read","Glob","Grep"]'::jsonb,
+   '["plan","break down","design approach","architecture","how should we","strategy"]'::jsonb,
+   true, 32768, 'forgefleet'),
+
+  ('explorer', 'Explorer',
+   'Maps an unfamiliar codebase: where things live, how they connect.',
+   'You are a codebase explorer. Quickly map the relevant part of the codebase: where a feature lives, which files/functions are involved, how data flows, and what calls what. Start broad (Glob/Grep) then narrow (Read). Report file paths (absolute), the key functions, and the relationships between them. Do not modify anything.',
+   '["Read","Glob","Grep","Bash"]'::jsonb,
+   '["explore","where is","how does","trace","find the code","map the codebase"]'::jsonb,
+   true, 32768, 'forgefleet')
+ON CONFLICT (name) DO NOTHING;
+"#;
