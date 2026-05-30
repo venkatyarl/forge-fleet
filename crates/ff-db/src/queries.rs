@@ -2800,7 +2800,12 @@ pub async fn pg_retry_deferred(pool: &PgPool, id: &str) -> Result<bool> {
                 claimed_by = NULL,
                 claimed_at = NULL,
                 next_attempt_at = NOW(),
-                last_error = NULL
+                last_error = NULL,
+                -- Clear the prior failure's captured output too. Since
+                -- pg_finish_deferred now persists result on failure, a retry
+                -- that only cleared last_error would leave a stale stderr that
+                -- `ff defer get` renders as the (now full) output stream.
+                result = NULL
           WHERE id = $1 AND status IN ('failed', 'cancelled')",
     )
     .bind(uuid)
