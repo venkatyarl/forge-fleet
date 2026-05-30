@@ -240,9 +240,20 @@ impl HeartbeatV2Publisher {
                     all_ips,
                 };
 
+                // ── OS classification (V87+) ─────────────────────────────────
+                // Pre-classified here so the materializer can write
+                // computers.os_family directly without re-deriving from
+                // kernel + /etc/os-release on the leader. Computed before
+                // capabilities because the GPU-VRAM probe consults os_family
+                // to take the GB10/DGX unified-memory fallback path.
+                beat.os = detect_os_info();
+                beat.build_sha = build_sha.clone();
+
                 // ── Capabilities ─────────────────────────────────────────────
                 let gpu_kind = detect_gpu_kind();
                 let gpu_count = if gpu_kind == "none" { 0 } else { 1 };
+                let (gpu_vram_gb, gpu_total_vram_gb) =
+                    detect_gpu_vram_gb(&gpu_kind, &beat.os.family);
                 let can_run_metal = gpu_kind == "apple_silicon";
                 let can_run_cuda = gpu_kind == "nvidia_cuda";
                 let can_run_rocm = gpu_kind == "amd_rocm";
@@ -265,21 +276,14 @@ impl HeartbeatV2Publisher {
                     can_host_redis_replica: ram_total_gb >= 16,
                     gpu_kind: gpu_kind.clone(),
                     gpu_count,
-                    gpu_vram_gb: None,
-                    gpu_total_vram_gb: None,
+                    gpu_vram_gb,
+                    gpu_total_vram_gb,
                     can_run_cuda,
                     can_run_metal,
                     can_run_rocm,
                     recommended_runtimes,
                     max_runnable_model_gb: None,
                 };
-
-                // ── OS classification (V87+) ─────────────────────────────────
-                // Pre-classified here so the materializer can write
-                // computers.os_family directly without re-deriving from
-                // kernel + /etc/os-release on the leader.
-                beat.os = detect_os_info();
-                beat.build_sha = build_sha.clone();
 
                 // ── Installed software inventory ─────────────────────────────
                 beat.installed_software = SoftwareCollector::new().detect();
@@ -658,6 +662,127 @@ fn detect_gpu_kind() -> String {
     }
 
     "none".to_string()
+}
+
+/// Probe the GPU VRAM (in GB) for this host, dispatched by `gpu_kind`.
+///
+/// Returns `(gpu_vram_gb, gpu_total_vram_gb)`:
+///   - `gpu_vram_gb` is the per-device VRAM when a discrete value exists
+///     (single-GPU hosts: same as total; multi-GPU: left `None` here since
+///     we only report one device today and don't want to misattribute).
+///   - `gpu_total_vram_gb` is the addressable pool across all GPUs.
+///
+/// Runs every beat, so each probe is cheap (single short-lived subprocess
+/// or a `sysctl`/`/proc` read) with a hard timeout. If a probe fails or
+/// returns `N/A` with no fallback, both values stay `None` — we never
+/// fabricate a number.
+///
+/// `os_family` is the pre-classified family from [`detect_os_info`] and is
+/// only consulted for the GB10 / DGX-Spark special path (see below).
+fn detect_gpu_vram_gb(gpu_kind: &str, os_family: &str) -> (Option<f64>, Option<f64>) {
+    match gpu_kind {
+        // ── NVIDIA CUDA ──────────────────────────────────────────────────
+        // Query memory.total directly. On Blackwell GB10 (DGX Spark) the GPU
+        // shares the system's unified memory and nvidia-smi reports "N/A" for
+        // memory.total — see memory: dgx-spark-specs. In that case fall back
+        // to total system RAM, which is the GPU-addressable unified pool.
+        "nvidia_cuda" => {
+            let smi = command_output_with_timeout(
+                std::process::Command::new("nvidia-smi")
+                    .args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"]),
+                3,
+            )
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+
+            // First non-empty line: MiB integer, or "[N/A]" / "N/A" on GB10.
+            let first = smi.lines().map(str::trim).find(|l| !l.is_empty());
+            if let Some(mib) = first.and_then(|l| l.parse::<f64>().ok())
+                && mib > 0.0
+            {
+                let gb = mib / 1024.0;
+                return (Some(gb), Some(gb));
+            }
+
+            // memory.total was N/A (or nvidia-smi missing): on DGX/GB10 the
+            // unified system RAM IS the GPU-addressable pool, so use it as the
+            // total. We deliberately leave per-device `gpu_vram_gb` None here
+            // because the unified pool is not a discrete VRAM bank.
+            if os_family == "linux-dgx"
+                && let Some(ram_gb) = local_total_ram_gb()
+            {
+                return (None, Some(ram_gb));
+            }
+            (None, None)
+        }
+
+        // ── AMD ROCm ─────────────────────────────────────────────────────
+        // Best-effort: ask rocm-smi for the VRAM total. Output format varies
+        // across rocm versions, so we scan for the first byte-count we can
+        // parse. If rocm-smi isn't usable, leave None (no /sys fallback that's
+        // reliable across cards).
+        "amd_rocm" => {
+            let out = command_output_with_timeout(
+                std::process::Command::new("rocm-smi").args(["--showmeminfo", "vram", "--csv"]),
+                3,
+            )
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+
+            // CSV rows look like: `card0,<total_bytes>,<used_bytes>`. Grab the
+            // largest plausible byte-count on any data line.
+            let bytes = out
+                .lines()
+                .flat_map(|l| l.split(','))
+                .filter_map(|f| f.trim().parse::<f64>().ok())
+                .filter(|b| *b > 1_000_000.0) // ignore small ints (ids, used==0)
+                .fold(0.0_f64, f64::max);
+            if bytes > 0.0 {
+                let gb = bytes / 1e9;
+                return (Some(gb), Some(gb));
+            }
+            (None, None)
+        }
+
+        // ── Apple Silicon ────────────────────────────────────────────────
+        // No discrete VRAM: the GPU addresses the unified memory pool, so the
+        // addressable total is the system RAM (`sysctl -n hw.memsize`). Report
+        // it as the total only; per-device `gpu_vram_gb` stays None since the
+        // pool is shared with the CPU.
+        "apple_silicon" => match local_total_ram_gb() {
+            Some(ram_gb) => (None, Some(ram_gb)),
+            None => (None, None),
+        },
+
+        // "none" / "integrated" / anything else: no VRAM to report.
+        _ => (None, None),
+    }
+}
+
+/// Best-effort total system RAM in GB. macOS: `sysctl -n hw.memsize` (bytes);
+/// Linux: `/proc/meminfo` MemTotal (kB). Returns `None` if undetectable so
+/// callers never fabricate a value. Used as the GPU-addressable unified pool
+/// for Apple Silicon and the GB10/DGX nvidia-smi-N/A fallback.
+fn local_total_ram_gb() -> Option<f64> {
+    if std::env::consts::OS == "macos" {
+        let out = command_output_with_timeout(
+            std::process::Command::new("sysctl").args(["-n", "hw.memsize"]),
+            3,
+        )
+        .filter(|o| o.status.success())?;
+        let bytes: f64 = String::from_utf8_lossy(&out.stdout).trim().parse().ok()?;
+        return Some(bytes / 1e9);
+    }
+    let txt = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in txt.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            let kb: f64 = rest.trim().trim_end_matches("kB").trim().parse().ok()?;
+            return Some(kb / 1e6);
+        }
+    }
+    None
 }
 
 fn detect_gpu_model() -> Option<String> {
@@ -1064,6 +1189,36 @@ mod tests {
             "unexpected gpu_kind: {}",
             kind
         );
+    }
+
+    #[test]
+    fn gpu_vram_probe_none_kind_yields_no_values() {
+        // "none"/"integrated" must never fabricate a VRAM figure.
+        assert_eq!(detect_gpu_vram_gb("none", "linux-ubuntu"), (None, None));
+        assert_eq!(
+            detect_gpu_vram_gb("integrated", "linux-ubuntu"),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn gpu_vram_probe_returns_consistent_tuple() {
+        // Probe the real host: whatever gpu_kind we detect, the returned tuple
+        // must be self-consistent — a per-device value implies a total, and
+        // we never emit a negative/zero magnitude.
+        let kind = detect_gpu_kind();
+        let os = detect_os_info().family;
+        let (per_device, total) = detect_gpu_vram_gb(&kind, &os);
+        if let Some(v) = per_device {
+            assert!(v > 0.0, "per-device vram must be positive when present");
+            assert!(
+                total.is_some(),
+                "a discrete per-device value must imply a total"
+            );
+        }
+        if let Some(t) = total {
+            assert!(t > 0.0, "total vram must be positive when present");
+        }
     }
 
     #[test]
