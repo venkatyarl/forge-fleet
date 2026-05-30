@@ -2709,7 +2709,7 @@ async fn handle_fleet_exec(
         "SELECT c.name,
                 c.primary_ip,
                 COALESCE(NULLIF(c.ssh_user, ''), fw.ssh_user, 'venkat') AS ssh_user,
-                COALESCE(NULLIF(c.ssh_port, 0), fw.ssh_port, 22)        AS ssh_port
+                COALESCE(NULLIF(c.ssh_port, 0), 22)                     AS ssh_port
            FROM computers c
            LEFT JOIN fleet_workers fw ON fw.name = c.name
           WHERE LOWER(c.name) = LOWER($1) OR c.primary_ip = $1
