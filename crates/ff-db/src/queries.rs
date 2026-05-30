@@ -1380,6 +1380,33 @@ pub struct FleetNodeRow {
     /// Populated every 6h by the daemon's version_check tick. V12.
     #[serde(default = "default_tooling")]
     pub tooling: JsonValue,
+    // ─── Hardware/GPU (joined from the `computers` table) ──────────────────
+    // fleet_workers carries the worker *role*; physical hardware (GPU vendor,
+    // VRAM, true RAM) lives on `computers`. These are LEFT-JOINed in so a
+    // single `ff nodes` / `fleet_nodes_db` call can answer "which boxes are
+    // AMD/NVIDIA/Apple and how much VRAM" without SSH-probing. None when the
+    // worker has no matching computers row.
+    #[serde(default)]
+    pub gpu_kind: Option<String>,
+    #[serde(default)]
+    pub gpu_model: Option<String>,
+    #[serde(default)]
+    pub gpu_vram_gb: Option<f64>,
+    /// Total GPU VRAM (GB). For unified-memory boxes (Apple Silicon, GB10
+    /// Grace+Blackwell) per-GPU `gpu_vram_gb` is NULL by design, so this is
+    /// the correct source for "how much VRAM"; prefer it when present.
+    #[serde(default)]
+    pub gpu_total_vram_gb: Option<f64>,
+    #[serde(default)]
+    pub has_gpu: Option<bool>,
+    /// True RAM (GB) from the `computers` hardware row. `ram_gb` above is the
+    /// often-stale worker-registry value; prefer this when present.
+    #[serde(default)]
+    pub computer_ram_gb: Option<i32>,
+    /// True CPU cores from the `computers` hardware row; prefer over the
+    /// often-stale `cpu_cores` worker-registry value when present.
+    #[serde(default)]
+    pub computer_cpu_cores: Option<i32>,
 }
 
 fn default_runtime() -> String {
@@ -1419,16 +1446,21 @@ pub struct FleetModelRow {
 /// List all fleet nodes from Postgres.
 pub async fn pg_list_nodes(pool: &PgPool) -> Result<Vec<FleetNodeRow>> {
     let rows = sqlx::query(
-        "SELECT name, ip, ssh_user, ram_gb, cpu_cores, os, role,
-                election_priority, hardware, alt_ips, capabilities,
-                preferences, resources, status,
-                COALESCE(runtime, 'unknown') AS runtime,
-                COALESCE(models_dir, '~/models') AS models_dir,
-                COALESCE(disk_quota_pct, 80) AS disk_quota_pct,
-                COALESCE(sub_agent_count, 1) AS sub_agent_count,
-                gh_account,
-                COALESCE(tooling, '{}'::jsonb) AS tooling
-         FROM fleet_workers ORDER BY election_priority, name
+        "SELECT fw.name, fw.ip, fw.ssh_user, fw.ram_gb, fw.cpu_cores, fw.os, fw.role,
+                fw.election_priority, fw.hardware, fw.alt_ips, fw.capabilities,
+                fw.preferences, fw.resources, fw.status,
+                COALESCE(fw.runtime, 'unknown') AS runtime,
+                COALESCE(fw.models_dir, '~/models') AS models_dir,
+                COALESCE(fw.disk_quota_pct, 80) AS disk_quota_pct,
+                COALESCE(fw.sub_agent_count, 1) AS sub_agent_count,
+                fw.gh_account,
+                COALESCE(fw.tooling, '{}'::jsonb) AS tooling,
+                c.gpu_kind, c.gpu_model, c.gpu_vram_gb, c.gpu_total_vram_gb, c.has_gpu,
+                c.total_ram_gb AS computer_ram_gb,
+                c.cpu_cores AS computer_cpu_cores
+         FROM fleet_workers fw
+         LEFT JOIN computers c ON c.name = fw.name
+         ORDER BY fw.election_priority, fw.name
          LIMIT 100",
     )
     .fetch_all(pool)
@@ -1457,6 +1489,13 @@ pub async fn pg_list_nodes(pool: &PgPool) -> Result<Vec<FleetNodeRow>> {
             sub_agent_count: r.get("sub_agent_count"),
             gh_account: r.get("gh_account"),
             tooling: r.get("tooling"),
+            gpu_kind: r.get("gpu_kind"),
+            gpu_model: r.get("gpu_model"),
+            gpu_vram_gb: r.get("gpu_vram_gb"),
+            gpu_total_vram_gb: r.get("gpu_total_vram_gb"),
+            has_gpu: r.get("has_gpu"),
+            computer_ram_gb: r.get("computer_ram_gb"),
+            computer_cpu_cores: r.get("computer_cpu_cores"),
         })
         .collect())
 }
@@ -1464,16 +1503,21 @@ pub async fn pg_list_nodes(pool: &PgPool) -> Result<Vec<FleetNodeRow>> {
 /// Get a single fleet node by name from Postgres.
 pub async fn pg_get_node(pool: &PgPool, name: &str) -> Result<Option<FleetNodeRow>> {
     let row = sqlx::query(
-        "SELECT name, ip, ssh_user, ram_gb, cpu_cores, os, role,
-                election_priority, hardware, alt_ips, capabilities,
-                preferences, resources, status,
-                COALESCE(runtime, 'unknown') AS runtime,
-                COALESCE(models_dir, '~/models') AS models_dir,
-                COALESCE(disk_quota_pct, 80) AS disk_quota_pct,
-                COALESCE(sub_agent_count, 1) AS sub_agent_count,
-                gh_account,
-                COALESCE(tooling, '{}'::jsonb) AS tooling
-         FROM fleet_workers WHERE name = $1",
+        "SELECT fw.name, fw.ip, fw.ssh_user, fw.ram_gb, fw.cpu_cores, fw.os, fw.role,
+                fw.election_priority, fw.hardware, fw.alt_ips, fw.capabilities,
+                fw.preferences, fw.resources, fw.status,
+                COALESCE(fw.runtime, 'unknown') AS runtime,
+                COALESCE(fw.models_dir, '~/models') AS models_dir,
+                COALESCE(fw.disk_quota_pct, 80) AS disk_quota_pct,
+                COALESCE(fw.sub_agent_count, 1) AS sub_agent_count,
+                fw.gh_account,
+                COALESCE(fw.tooling, '{}'::jsonb) AS tooling,
+                c.gpu_kind, c.gpu_model, c.gpu_vram_gb, c.gpu_total_vram_gb, c.has_gpu,
+                c.total_ram_gb AS computer_ram_gb,
+                c.cpu_cores AS computer_cpu_cores
+         FROM fleet_workers fw
+         LEFT JOIN computers c ON c.name = fw.name
+         WHERE fw.name = $1",
     )
     .bind(name)
     .fetch_optional(pool)
@@ -1500,6 +1544,13 @@ pub async fn pg_get_node(pool: &PgPool, name: &str) -> Result<Option<FleetNodeRo
         sub_agent_count: r.get("sub_agent_count"),
         gh_account: r.get("gh_account"),
         tooling: r.get("tooling"),
+        gpu_kind: r.get("gpu_kind"),
+        gpu_model: r.get("gpu_model"),
+        gpu_vram_gb: r.get("gpu_vram_gb"),
+        gpu_total_vram_gb: r.get("gpu_total_vram_gb"),
+        has_gpu: r.get("has_gpu"),
+        computer_ram_gb: r.get("computer_ram_gb"),
+        computer_cpu_cores: r.get("computer_cpu_cores"),
     }))
 }
 
@@ -3076,6 +3127,13 @@ pub async fn seed_from_fleet_toml(
             sub_agent_count: 1,
             gh_account: None,
             tooling: serde_json::json!({}),
+            gpu_kind: None,
+            gpu_model: None,
+            gpu_vram_gb: None,
+            gpu_total_vram_gb: None,
+            has_gpu: None,
+            computer_ram_gb: None,
+            computer_cpu_cores: None,
         };
 
         pg_upsert_node(pool, &node_row).await?;

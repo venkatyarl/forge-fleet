@@ -531,6 +531,15 @@ pub async fn self_enroll(
         sub_agent_count,
         gh_account: payload.gh_account.clone(),
         tooling: json!({}),
+        // Read-only hardware fields (joined from `computers` on read); not
+        // written through the worker upsert.
+        gpu_kind: None,
+        gpu_model: None,
+        gpu_vram_gb: None,
+        gpu_total_vram_gb: None,
+        has_gpu: None,
+        computer_ram_gb: None,
+        computer_cpu_cores: None,
     };
 
     ff_db::pg_upsert_node(pool, &node_row)
