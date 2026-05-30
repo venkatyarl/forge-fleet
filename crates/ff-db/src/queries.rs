@@ -1946,14 +1946,30 @@ pub struct ModelCatalogRow {
     pub gated: bool,
     pub preferred_workloads: JsonValue,
     pub variants: JsonValue,
+    /// V111: first-class tool-calling capability. The agent router filters on
+    /// this. On upsert it's auto-derived from preferred_workloads containing
+    /// "tool_calling" so the TOML→DB sync keeps it correct without a separate
+    /// TOML field.
+    pub tool_calling: bool,
+}
+
+/// True if a `preferred_workloads` JSONB array contains the "tool_calling" tag.
+fn workloads_have_tool_calling(workloads: &JsonValue) -> bool {
+    workloads
+        .as_array()
+        .map(|arr| arr.iter().any(|v| v.as_str() == Some("tool_calling")))
+        .unwrap_or(false)
 }
 
 /// Upsert a catalog entry. Returns the id.
 pub async fn pg_upsert_catalog(pool: &PgPool, row: &ModelCatalogRow) -> Result<String> {
+    // Derive tool_calling from the workloads tag OR an explicitly-set field, so
+    // the TOML→DB sync (which only carries preferred_workloads) stays correct.
+    let tool_calling = row.tool_calling || workloads_have_tool_calling(&row.preferred_workloads);
     sqlx::query(
         "INSERT INTO fleet_model_catalog
-            (id, name, family, parameters, tier, description, gated, preferred_workloads, variants, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+            (id, name, family, parameters, tier, description, gated, preferred_workloads, variants, tool_calling, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
          ON CONFLICT (id) DO UPDATE SET
             name = EXCLUDED.name,
             family = EXCLUDED.family,
@@ -1963,6 +1979,7 @@ pub async fn pg_upsert_catalog(pool: &PgPool, row: &ModelCatalogRow) -> Result<S
             gated = EXCLUDED.gated,
             preferred_workloads = EXCLUDED.preferred_workloads,
             variants = EXCLUDED.variants,
+            tool_calling = EXCLUDED.tool_calling,
             updated_at = NOW()",
     )
     .bind(&row.id)
@@ -1974,6 +1991,7 @@ pub async fn pg_upsert_catalog(pool: &PgPool, row: &ModelCatalogRow) -> Result<S
     .bind(row.gated)
     .bind(&row.preferred_workloads)
     .bind(&row.variants)
+    .bind(tool_calling)
     .execute(pool)
     .await?;
     Ok(row.id.clone())
@@ -1982,7 +2000,7 @@ pub async fn pg_upsert_catalog(pool: &PgPool, row: &ModelCatalogRow) -> Result<S
 /// List catalog entries sorted by tier (desc) then name (asc).
 pub async fn pg_list_catalog(pool: &PgPool) -> Result<Vec<ModelCatalogRow>> {
     let rows = sqlx::query(
-        "SELECT id, name, family, parameters, tier, description, gated, preferred_workloads, variants
+        "SELECT id, name, family, parameters, tier, description, gated, preferred_workloads, variants, tool_calling
            FROM fleet_model_catalog
           ORDER BY tier DESC, name ASC
          LIMIT 100",
@@ -2001,6 +2019,7 @@ pub async fn pg_list_catalog(pool: &PgPool) -> Result<Vec<ModelCatalogRow>> {
             gated: r.get("gated"),
             preferred_workloads: r.get("preferred_workloads"),
             variants: r.get("variants"),
+            tool_calling: r.get("tool_calling"),
         })
         .collect())
 }
@@ -2009,7 +2028,7 @@ pub async fn pg_list_catalog(pool: &PgPool) -> Result<Vec<ModelCatalogRow>> {
 pub async fn pg_search_catalog(pool: &PgPool, query: &str) -> Result<Vec<ModelCatalogRow>> {
     let pattern = format!("%{}%", query.to_lowercase());
     let rows = sqlx::query(
-        "SELECT id, name, family, parameters, tier, description, gated, preferred_workloads, variants
+        "SELECT id, name, family, parameters, tier, description, gated, preferred_workloads, variants, tool_calling
            FROM fleet_model_catalog
           WHERE LOWER(id) LIKE $1 OR LOWER(name) LIKE $1 OR LOWER(family) LIKE $1
           ORDER BY tier DESC, name ASC
@@ -2030,6 +2049,7 @@ pub async fn pg_search_catalog(pool: &PgPool, query: &str) -> Result<Vec<ModelCa
             gated: r.get("gated"),
             preferred_workloads: r.get("preferred_workloads"),
             variants: r.get("variants"),
+            tool_calling: r.get("tool_calling"),
         })
         .collect())
 }
@@ -2037,7 +2057,7 @@ pub async fn pg_search_catalog(pool: &PgPool, query: &str) -> Result<Vec<ModelCa
 /// Fetch one catalog entry by id.
 pub async fn pg_get_catalog(pool: &PgPool, id: &str) -> Result<Option<ModelCatalogRow>> {
     let row = sqlx::query(
-        "SELECT id, name, family, parameters, tier, description, gated, preferred_workloads, variants
+        "SELECT id, name, family, parameters, tier, description, gated, preferred_workloads, variants, tool_calling
            FROM fleet_model_catalog WHERE id = $1",
     )
     .bind(id)
@@ -2053,6 +2073,7 @@ pub async fn pg_get_catalog(pool: &PgPool, id: &str) -> Result<Option<ModelCatal
         gated: r.get("gated"),
         preferred_workloads: r.get("preferred_workloads"),
         variants: r.get("variants"),
+        tool_calling: r.get("tool_calling"),
     }))
 }
 
@@ -2175,6 +2196,15 @@ pub struct ModelDeploymentRow {
     pub last_health_at: Option<chrono::DateTime<chrono::Utc>>,
     pub health_status: String,
     pub context_window: Option<i32>,
+    /// Launched `--parallel` slot count (llama.cpp). `None` for older rows /
+    /// runtimes that don't split context across slots.
+    pub parallel_slots: Option<i32>,
+    /// Effective context per parallel slot (= context_window / parallel_slots,
+    /// == context_window when parallel_slots = 1). This is the ctx an agent
+    /// actually gets; the router filters on it so a tool-schema system prompt
+    /// can't overflow a 4K-per-slot endpoint. `None` until V111 backfill / the
+    /// next load records it.
+    pub usable_agent_ctx: Option<i32>,
     pub tokens_used: i64,
     pub request_count: i64,
 }
@@ -2213,6 +2243,8 @@ pub async fn pg_list_deployments(
                 last_health_at: r.get("last_health_at"),
                 health_status: r.get("health_status"),
                 context_window: r.get("context_window"),
+                parallel_slots: r.get("parallel_slots"),
+                usable_agent_ctx: r.get("usable_agent_ctx"),
                 tokens_used: r.get("tokens_used"),
                 request_count: r.get("request_count"),
             }
@@ -2221,6 +2253,13 @@ pub async fn pg_list_deployments(
 }
 
 /// Upsert a deployment (node + port is unique).
+///
+/// `parallel_slots` is the launched `--parallel` (llama.cpp slot count); pass
+/// `None` for runtimes that don't split ctx across slots. When both
+/// `context_window` and `parallel_slots` are known, `usable_agent_ctx` (the
+/// effective per-slot ctx the router filters on) is derived in SQL as
+/// `context_window / GREATEST(1, parallel_slots)` so the agent router can tell
+/// a 32K-per-slot endpoint from a 4K-per-slot one.
 #[allow(clippy::too_many_arguments)]
 pub async fn pg_upsert_deployment(
     pool: &PgPool,
@@ -2232,6 +2271,7 @@ pub async fn pg_upsert_deployment(
     pid: Option<i32>,
     health_status: &str,
     context_window: Option<i32>,
+    parallel_slots: Option<i32>,
 ) -> Result<String> {
     let lib_uuid = library_id
         .map(|s| {
@@ -2241,8 +2281,12 @@ pub async fn pg_upsert_deployment(
         .transpose()?;
     let row = sqlx::query(
         "INSERT INTO fleet_model_deployments
-            (worker_name, library_id, catalog_id, runtime, port, pid, health_status, context_window, last_health_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+            (worker_name, library_id, catalog_id, runtime, port, pid, health_status,
+             context_window, parallel_slots, usable_agent_ctx, last_health_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9,
+                 CASE WHEN $8 IS NOT NULL AND $9 IS NOT NULL
+                      THEN $8 / GREATEST(1, $9) END,
+                 NOW())
          ON CONFLICT (worker_name, port) DO UPDATE SET
             library_id = EXCLUDED.library_id,
             catalog_id = EXCLUDED.catalog_id,
@@ -2250,6 +2294,8 @@ pub async fn pg_upsert_deployment(
             pid = EXCLUDED.pid,
             health_status = EXCLUDED.health_status,
             context_window = COALESCE(EXCLUDED.context_window, fleet_model_deployments.context_window),
+            parallel_slots = COALESCE(EXCLUDED.parallel_slots, fleet_model_deployments.parallel_slots),
+            usable_agent_ctx = COALESCE(EXCLUDED.usable_agent_ctx, fleet_model_deployments.usable_agent_ctx),
             last_health_at = NOW()
          RETURNING id",
     )
@@ -2261,10 +2307,203 @@ pub async fn pg_upsert_deployment(
     .bind(pid)
     .bind(health_status)
     .bind(context_window)
+    .bind(parallel_slots)
     .fetch_one(pool)
     .await?;
     let id: sqlx::types::Uuid = row.get("id");
     Ok(id.to_string())
+}
+
+/// Filters for [`pg_route_deployments`] — the single scored selector that
+/// backs both the `fleet_route` MCP tool and the agent-capable router.
+///
+/// All filters are AND-ed. Leaving a field at its default disables that
+/// filter, so the historical `fleet_route` behaviour (workload-only) is just
+/// `RouteFilter { workload: Some("code"), ..Default::default() }`.
+#[derive(Debug, Clone, Default)]
+pub struct RouteFilter {
+    /// Match `fleet_model_catalog.preferred_workloads @> [workload]`
+    /// (singular/plural tolerant). `None` = any workload.
+    pub workload: Option<String>,
+    /// Require `fleet_model_catalog.tool_calling = TRUE`. Used by the agent
+    /// router so dispatch never lands on a non-tool model (e.g. gemma).
+    pub require_tool_calling: bool,
+    /// Require `fleet_model_deployments.usable_agent_ctx >= min_ctx` — the
+    /// effective per-slot ctx must fit the agent's tool-schema system prompt.
+    /// `None` = no ctx floor.
+    pub min_ctx: Option<i32>,
+    /// Hosts to exclude by worker_name (case-insensitive), e.g. ["taylor"] to
+    /// keep agent load off the leader.
+    pub exclude_hosts: Vec<String>,
+    /// Max candidates to return (scored best-first). Defaults to 3 if 0.
+    pub limit: i64,
+}
+
+/// One scored routing candidate. Ordering in the returned Vec is best-first
+/// (smaller tier wins, then most-recently-healthy).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteCandidate {
+    pub worker_name: String,
+    /// `http://<host_or_ip>:<port>` ready to use as an OpenAI base URL.
+    pub endpoint: String,
+    pub port: i32,
+    pub catalog_id: Option<String>,
+    pub catalog_name: Option<String>,
+    pub family: Option<String>,
+    pub tier: i32,
+    pub tool_calling: bool,
+    pub context_window: Option<i32>,
+    pub usable_agent_ctx: Option<i32>,
+    pub parallel_slots: Option<i32>,
+    pub health_status: String,
+    pub health_age_sec: Option<i32>,
+    pub os_family: Option<String>,
+    pub has_gpu: Option<bool>,
+    pub is_unified_memory: Option<bool>,
+    pub total_ram_gb: Option<i32>,
+}
+
+/// The shared scored selector over `fleet_model_deployments JOIN
+/// fleet_model_catalog`. This is the one place the routing scorer lives — the
+/// `fleet_route` MCP tool and the agent-capable router both call it so there's
+/// no parallel scorer to drift.
+///
+/// Scoring (unchanged from the original `fleet_route`): only `health_status =
+/// 'healthy'` rows, ordered by `tier ASC` (T1 small/fast beats T4 huge) then
+/// `last_health_at DESC` (freshest first → natural load spreading as health
+/// pings rotate). The new `require_tool_calling` / `min_ctx` / `exclude_hosts`
+/// filters are additive WHERE clauses.
+pub async fn pg_route_deployments(
+    pool: &PgPool,
+    filter: &RouteFilter,
+) -> Result<Vec<RouteCandidate>> {
+    // Singular-plural tolerance — V39 seed uses "embeddings"/"reranking",
+    // V91 uses "embedding". `@>` is exact-element match so we OR both forms.
+    let workload = filter.workload.as_deref();
+    let plural = match workload {
+        Some("embedding") => Some("embeddings"),
+        Some("rerank") => Some("reranking"),
+        Some("embeddings") => Some("embedding"),
+        Some("reranking") => Some("rerank"),
+        _ => None,
+    };
+    // When no workload filter is requested, pass a tag that can't match any
+    // real workload and rely on the `$3` "workload filter disabled" guard.
+    let arr_a = JsonValue::Array(vec![JsonValue::String(
+        workload.unwrap_or("__any__").to_string(),
+    )]);
+    let arr_b = JsonValue::Array(vec![JsonValue::String(
+        plural.unwrap_or(workload.unwrap_or("__any__")).to_string(),
+    )]);
+
+    // Lower-cased exclude list for case-insensitive worker_name match.
+    let excludes: Vec<String> = filter
+        .exclude_hosts
+        .iter()
+        .map(|h| h.to_lowercase())
+        .collect();
+
+    let limit = if filter.limit > 0 { filter.limit } else { 3 };
+
+    let rows = sqlx::query(
+        r#"
+        SELECT d.worker_name,
+               d.port,
+               d.catalog_id,
+               cat.name        AS catalog_name,
+               cat.family      AS catalog_family,
+               cat.tier        AS tier,
+               cat.tool_calling AS tool_calling,
+               d.context_window AS context_window,
+               d.usable_agent_ctx AS usable_agent_ctx,
+               d.parallel_slots AS parallel_slots,
+               d.health_status AS health_status,
+               COALESCE(c.primary_ip, w.name) AS host_or_name,
+               c.os_family     AS os_family,
+               c.has_gpu       AS has_gpu,
+               c.is_unified_memory AS is_unified_memory,
+               c.total_ram_gb  AS total_ram_gb,
+               EXTRACT(EPOCH FROM (NOW() - d.last_health_at))::int AS health_age_sec
+          FROM fleet_model_deployments d
+          JOIN fleet_model_catalog cat ON cat.id = d.catalog_id
+          LEFT JOIN fleet_workers w     ON w.name = d.worker_name
+          LEFT JOIN computers c         ON LOWER(c.name) = LOWER(d.worker_name)
+         WHERE d.health_status = 'healthy'
+           -- workload filter ($3 = true disables it)
+           AND ($3 OR cat.preferred_workloads @> $1::jsonb
+                   OR cat.preferred_workloads @> $2::jsonb)
+           -- tool_calling filter ($4 = false disables it)
+           AND (NOT $4 OR cat.tool_calling = TRUE)
+           -- min usable per-slot ctx ($5 IS NULL disables it). NULL ctx rows
+           -- are excluded when a floor is requested (can't prove they fit).
+           AND ($5::int IS NULL OR d.usable_agent_ctx >= $5)
+           -- exclude hosts (case-insensitive; $6 empty disables it)
+           AND (LOWER(d.worker_name) <> ALL($6))
+         ORDER BY cat.tier ASC,
+                  d.last_health_at DESC NULLS LAST
+         LIMIT $7
+        "#,
+    )
+    .bind(&arr_a)
+    .bind(&arr_b)
+    .bind(workload.is_none())
+    .bind(filter.require_tool_calling)
+    .bind(filter.min_ctx)
+    .bind(&excludes)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .iter()
+        .map(|r| {
+            let worker_name: String = r.try_get("worker_name").unwrap_or_default();
+            let port: i32 = r.try_get("port").unwrap_or(0);
+            let host: String = r.try_get("host_or_name").unwrap_or_default();
+            RouteCandidate {
+                endpoint: format!("http://{host}:{port}"),
+                worker_name,
+                port,
+                catalog_id: r.try_get("catalog_id").ok(),
+                catalog_name: r.try_get("catalog_name").ok(),
+                family: r.try_get("catalog_family").ok(),
+                tier: r.try_get("tier").unwrap_or(2),
+                tool_calling: r.try_get("tool_calling").unwrap_or(false),
+                context_window: r.try_get("context_window").ok(),
+                usable_agent_ctx: r.try_get("usable_agent_ctx").ok(),
+                parallel_slots: r.try_get("parallel_slots").ok(),
+                health_status: r.try_get("health_status").unwrap_or_default(),
+                health_age_sec: r.try_get("health_age_sec").ok(),
+                os_family: r.try_get("os_family").ok(),
+                has_gpu: r.try_get("has_gpu").ok(),
+                is_unified_memory: r.try_get("is_unified_memory").ok(),
+                total_ram_gb: r.try_get("total_ram_gb").ok(),
+            }
+        })
+        .collect())
+}
+
+/// Pick the best agent-capable deployment: tool-calling model + enough per-slot
+/// ctx for the tool-schema system prompt, excluding `exclude_hosts`. Returns the
+/// top-scored candidate, or `None` if nothing in the fleet qualifies (callers
+/// should surface a clear "no agent-capable endpoint" error rather than falling
+/// back to a non-tool model).
+pub async fn pg_pick_agent_endpoint(
+    pool: &PgPool,
+    min_ctx: i32,
+    exclude_hosts: &[String],
+) -> Result<Option<RouteCandidate>> {
+    let filter = RouteFilter {
+        workload: None,
+        require_tool_calling: true,
+        min_ctx: Some(min_ctx),
+        exclude_hosts: exclude_hosts.to_vec(),
+        limit: 1,
+    };
+    Ok(pg_route_deployments(pool, &filter)
+        .await?
+        .into_iter()
+        .next())
 }
 
 /// Remove a deployment (when a model is unloaded).

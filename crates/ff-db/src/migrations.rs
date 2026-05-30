@@ -682,6 +682,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "amcheck_integrity",
         sql: schema::SCHEMA_V110_AMCHECK_INTEGRITY,
     },
+    PgMigration {
+        version: 111,
+        name: "agent_swarm_data_plane",
+        sql: schema::SCHEMA_V111_AGENT_SWARM_DATA_PLANE,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.

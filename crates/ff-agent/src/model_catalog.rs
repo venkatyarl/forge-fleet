@@ -86,6 +86,9 @@ pub fn load_catalog_file(path: &Path) -> Result<Vec<ModelCatalogRow>, String> {
             .map_err(|e| format!("variants->json for {}: {}", m.id, e))?;
         let preferred_workloads = serde_json::to_value(&m.preferred_workloads)
             .map_err(|e| format!("preferred_workloads->json for {}: {}", m.id, e))?;
+        // tool_calling is derived from the workloads tag (pg_upsert_catalog
+        // re-derives it too, so this is belt-and-braces).
+        let tool_calling = m.preferred_workloads.iter().any(|w| w == "tool_calling");
         rows.push(ModelCatalogRow {
             id: m.id,
             name: m.name,
@@ -96,6 +99,7 @@ pub fn load_catalog_file(path: &Path) -> Result<Vec<ModelCatalogRow>, String> {
             gated: m.gated,
             preferred_workloads,
             variants,
+            tool_calling,
         });
     }
     Ok(rows)

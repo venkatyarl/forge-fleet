@@ -7447,3 +7447,65 @@ VALUES
    0, 'warning', 21600, 'telegram', true)
 ON CONFLICT (name) DO NOTHING;
 "#;
+
+// ─── V111: agent-swarm data plane ───────────────────────────────────────────
+//
+// Two problems this unblocks (see project_fleet_agent_swarm_broken):
+//
+//  1. There is no first-class way to ask "can this model tool-call?". The
+//     signal is buried in fleet_model_catalog.preferred_workloads as the JSONB
+//     tag "tool_calling". Add a real boolean column on the *catalog* (it's a
+//     model property, not a per-deployment runtime fact) and backfill it from
+//     the existing tag so the router can filter on it cheaply + transparently.
+//
+//  2. Most fleet endpoints launch with --parallel >= 4, so llama-server splits
+//     the context window across slots and an agent's tool-schema system prompt
+//     overflows the per-slot ctx ("prompt exceeds context window"). The data
+//     plane only stored context_window (the *total* launched ctx), never how
+//     many parallel slots it was split into — so dispatch couldn't tell a
+//     32K-per-slot agent-capable endpoint from a 4K-per-slot one. Add
+//     parallel_slots (the launched --parallel) and usable_agent_ctx (the
+//     effective per-slot ctx = context_window / parallel_slots, == context_window
+//     when parallel_slots = 1) on the *deployment* (it's a launch-time fact).
+//
+//     Backfill: existing rows predate the recorder writing parallel_slots, so
+//     we can't know their true --parallel. The launcher's historical default
+//     was 2 (LoadOptions::parallel.unwrap_or(2)); assume that for the backfill
+//     so usable_agent_ctx is populated for already-running deployments. The
+//     reconciler / next load corrects it with the real value.
+pub const SCHEMA_V111_AGENT_SWARM_DATA_PLANE: &str = r#"
+-- (1) tool_calling capability on the catalog (model property).
+ALTER TABLE fleet_model_catalog
+    ADD COLUMN IF NOT EXISTS tool_calling BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- Backfill from the existing preferred_workloads JSONB tag.
+UPDATE fleet_model_catalog
+   SET tool_calling = TRUE
+ WHERE preferred_workloads @> '["tool_calling"]'::jsonb
+   AND tool_calling = FALSE;
+
+CREATE INDEX IF NOT EXISTS idx_model_catalog_tool_calling
+    ON fleet_model_catalog (tool_calling);
+
+-- (2) parallel_slots + usable_agent_ctx on the deployment (launch-time facts).
+ALTER TABLE fleet_model_deployments
+    ADD COLUMN IF NOT EXISTS parallel_slots   INT;
+ALTER TABLE fleet_model_deployments
+    ADD COLUMN IF NOT EXISTS usable_agent_ctx INT;
+
+-- Backfill: assume the historical launcher default of 2 parallel slots for
+-- rows that never recorded one, and derive the per-slot agent ctx from the
+-- already-stored total context_window. GREATEST(1, slots) guards a stray 0.
+UPDATE fleet_model_deployments
+   SET parallel_slots = COALESCE(parallel_slots, 2)
+ WHERE parallel_slots IS NULL;
+
+UPDATE fleet_model_deployments
+   SET usable_agent_ctx = (context_window / GREATEST(1, parallel_slots))
+ WHERE usable_agent_ctx IS NULL
+   AND context_window IS NOT NULL;
+
+-- Router hot-path filter: healthy + enough per-slot ctx.
+CREATE INDEX IF NOT EXISTS idx_model_deployments_agent_ctx
+    ON fleet_model_deployments (health_status, usable_agent_ctx);
+"#;

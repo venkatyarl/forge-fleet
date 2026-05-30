@@ -23,7 +23,19 @@ pub struct LoadOptions {
     /// Defaults give 32K per slot — enough headroom for ff agent dispatch
     /// (system prompt + tools schema + user prompt + reasoning).
     pub parallel: Option<u32>,
+    /// Agent-capable serving profile. When `true`, launch the model so a
+    /// tool-using agent's full ctx is available on a single slot: forces
+    /// `--parallel 1` and raises `--ctx` to at least [`AGENT_MIN_CTX`] (32768)
+    /// if the caller asked for less / didn't specify. This is the fix for the
+    /// "prompt exceeds context window" overflow that happens when an agent's
+    /// tool-schema system prompt is sent to a `--parallel >= 4` endpoint with
+    /// only 4-8K per slot. Additive: leave `false` for the existing behaviour.
+    pub agent_profile: bool,
 }
+
+/// Minimum per-slot context window for the agent-capable serving profile —
+/// enough for the tool-schema system prompt + user prompt + reasoning.
+pub const AGENT_MIN_CTX: u32 = 32_768;
 
 /// Serving mode derived from the catalog row's `preferred_workloads`. Drives
 /// which llama-server flags get appended on launch — embedders and rerankers
@@ -79,6 +91,14 @@ pub struct RunningProcess {
     pub port: Option<u16>,
     pub model_path: Option<String>,
     pub runtime: String,
+    /// Parsed from the launch cmdline (`--parallel` / `-np`, llama.cpp).
+    /// `None` when not present (e.g. mlx, or older servers) — the adopter
+    /// then leaves parallel_slots NULL rather than guessing.
+    pub parallel_slots: Option<i32>,
+    /// Parsed from the launch cmdline (`--ctx-size` / `-c` for llama.cpp,
+    /// `--max-model-len` for vllm). Lets the reconciler record the real ctx
+    /// (and derive usable_agent_ctx) for an adopted out-of-band server.
+    pub context_window: Option<i32>,
 }
 
 /// Spawn an inference server for the given library row, wait for health, and record
@@ -101,8 +121,22 @@ pub async fn load_model(pool: &sqlx::PgPool, opts: LoadOptions) -> Result<LoadRe
         ));
     }
 
-    let ctx = opts.context_size.unwrap_or(65_536);
-    let parallel = opts.parallel.unwrap_or(2);
+    // Agent-capable profile forces a single slot and a ctx floor so a
+    // tool-schema system prompt can't overflow a split per-slot window. We
+    // apply it BEFORE the defaults so an explicit `--parallel`/`--ctx` is
+    // overridden (the profile is the contract; a too-small ctx would defeat it).
+    let (ctx, parallel) = if opts.agent_profile {
+        let ctx = opts
+            .context_size
+            .unwrap_or(AGENT_MIN_CTX)
+            .max(AGENT_MIN_CTX);
+        (ctx, 1u32)
+    } else {
+        (
+            opts.context_size.unwrap_or(65_536),
+            opts.parallel.unwrap_or(2),
+        )
+    };
     let port = opts.port;
 
     // Look up the catalog row so we can pick the right serving mode (chat /
@@ -348,6 +382,15 @@ pub async fn load_model(pool: &sqlx::PgPool, opts: LoadOptions) -> Result<LoadRe
     )
     .await;
 
+    // Record the parallel slot count so the data plane can compute
+    // usable_agent_ctx (= ctx / slots). Only Chat mode splits ctx across
+    // `--parallel` slots; embedding/reranking are single forward passes per
+    // request (no KV slots) so the full ctx is usable → record 1 slot.
+    let recorded_slots: i32 = match mode {
+        ServingMode::Chat => parallel as i32,
+        ServingMode::Embedding | ServingMode::Reranking => 1,
+    };
+
     // Upsert deployment row.
     let deployment_id = ff_db::pg_upsert_deployment(
         pool,
@@ -359,6 +402,7 @@ pub async fn load_model(pool: &sqlx::PgPool, opts: LoadOptions) -> Result<LoadRe
         Some(pid as i32),
         if health_ok { "healthy" } else { "starting" },
         Some(ctx as i32),
+        Some(recorded_slots),
     )
     .await
     .map_err(|e| format!("pg_upsert_deployment: {e}"))?;
@@ -518,8 +562,10 @@ struct PausedModel {
     library_id: String,
     port: u16,
     context_size: Option<u32>,
-    /// Not tracked on the deployment row, so always `None` on snapshot →
-    /// resume uses load_model's default. Faithful enough for restore.
+    /// Snapshotted from the deployment row's `parallel_slots` (V111) so resume
+    /// restores the exact slot layout — including an agent-capable deployment
+    /// (parallel_slots = 1, ctx >= 32K). Falls back to load_model's default
+    /// when the row predates V111 (`None`).
     parallel: Option<u32>,
 }
 
@@ -562,7 +608,7 @@ pub async fn pause_local_models_for_build(pool: &sqlx::PgPool) -> Result<usize, 
                 library_id: lib,
                 port: d.port as u16,
                 context_size: d.context_window.map(|c| c as u32),
-                parallel: None,
+                parallel: d.parallel_slots.map(|p| p as u32),
             });
         } else {
             tracing::warn!(
@@ -639,6 +685,10 @@ pub async fn resume_local_models(pool: &sqlx::PgPool) -> Result<usize, String> {
                 port: m.port,
                 context_size: m.context_size,
                 parallel: m.parallel,
+                // Exact ctx + parallel are restored from the snapshot above,
+                // which already reproduces an agent layout (1 slot, ctx >= 32K)
+                // if that's how it was loaded — no need to re-derive the profile.
+                agent_profile: false,
             },
         )
         .await
@@ -706,11 +756,32 @@ pub async fn list_local_processes() -> Vec<RunningProcess> {
                 }
             });
 
+        // Parse the slot count + ctx so an adopted out-of-band server still
+        // gets usable_agent_ctx recorded. llama.cpp: --parallel/-np, --ctx-size/-c.
+        // vllm has no slot-splitting (one model len shared) → treat as 1 slot
+        // with --max-model-len. mlx serves the full ctx → 1 slot, ctx unknown.
+        let parallel_slots = match runtime {
+            "llama.cpp" => parse_flag_value(rest, "--parallel")
+                .or_else(|| parse_flag_value(rest, "-np"))
+                .and_then(|v| v.parse::<i32>().ok()),
+            "vllm" | "mlx" => Some(1),
+            _ => None,
+        };
+        let context_window = match runtime {
+            "llama.cpp" => parse_flag_value(rest, "--ctx-size")
+                .or_else(|| parse_flag_value(rest, "-c"))
+                .and_then(|v| v.parse::<i32>().ok()),
+            "vllm" => parse_flag_value(rest, "--max-model-len").and_then(|v| v.parse::<i32>().ok()),
+            _ => None,
+        };
+
         found.push(RunningProcess {
             pid,
             port,
             model_path,
             runtime: runtime.to_string(),
+            parallel_slots,
+            context_window,
         });
     }
     found

@@ -295,7 +295,9 @@ impl ToolRegistry {
                 on the fleet to send that kind of request to — plus runner-up \
                 candidates. Use this BEFORE building a request when you don't know \
                 which node serves what; stops callers from hardcoding endpoints. \
-                Read-only — does not actually dispatch the request."
+                For AGENT dispatch set tool_calling=true and min_ctx (e.g. 32768) \
+                so you only get tool-calling endpoints with enough per-slot context \
+                — never a non-tool model like gemma. Read-only — does not dispatch."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -308,6 +310,20 @@ impl ToolRegistry {
                         "type": "integer",
                         "description": "Max candidates to return (default 3)",
                         "default": 3
+                    },
+                    "tool_calling": {
+                        "type": "boolean",
+                        "description": "Require a tool-calling model (fleet_model_catalog.tool_calling=true). Use for agent dispatch. (workload=\"tool_calling\" implies this.)",
+                        "default": false
+                    },
+                    "min_ctx": {
+                        "type": "integer",
+                        "description": "Require this much usable per-slot context (fleet_model_deployments.usable_agent_ctx). e.g. 32768 for an agent so the tool-schema system prompt fits."
+                    },
+                    "exclude_hosts": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Worker names to exclude (case-insensitive), e.g. [\"taylor\"] to keep agent load off the leader."
                     }
                 },
                 "required": ["workload"]

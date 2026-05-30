@@ -115,10 +115,12 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                 return Ok(());
             }
             // With --show-id, surface DEPLOYMENT_ID (for `ff model unload`),
-            // LIBRARY_ID and CTX (for a faithful `ff model load` reload).
+            // LIBRARY_ID, CTX (for a faithful `ff model load` reload), and
+            // AGENT_CTX = usable per-slot ctx × slot count (so you can spot the
+            // agent-capable endpoints the router will pick).
             if show_id {
                 println!(
-                    "{:<38} {:<38} {:<10} {:<28} {:<10} {:<6} {:<7} {:<10} STARTED",
+                    "{:<38} {:<38} {:<10} {:<28} {:<10} {:<6} {:<7} {:<12} {:<10} STARTED",
                     "DEPLOYMENT_ID",
                     "LIBRARY_ID",
                     "NODE",
@@ -126,6 +128,7 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                     "RUNTIME",
                     "PORT",
                     "CTX",
+                    "AGENT_CTX",
                     "HEALTH"
                 );
                 for r in rows {
@@ -135,8 +138,14 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                         .context_window
                         .map(|c| c.to_string())
                         .unwrap_or_else(|| "-".into());
+                    // e.g. "32768x1" (usable_agent_ctx × parallel_slots).
+                    let agent_ctx = match (r.usable_agent_ctx, r.parallel_slots) {
+                        (Some(u), Some(p)) => format!("{u}x{p}"),
+                        (Some(u), None) => u.to_string(),
+                        _ => "-".into(),
+                    };
                     println!(
-                        "{:<38} {:<38} {:<10} {:<28} {:<10} {:<6} {:<7} {:<10} {}",
+                        "{:<38} {:<38} {:<10} {:<28} {:<10} {:<6} {:<7} {:<12} {:<10} {}",
                         r.id,
                         lib,
                         r.worker_name,
@@ -144,6 +153,7 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                         r.runtime,
                         r.port,
                         ctx,
+                        agent_ctx,
                         r.health_status,
                         r.started_at.format("%Y-%m-%d %H:%M UTC")
                     );
@@ -650,14 +660,24 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
             port,
             ctx,
             parallel,
+            agent,
         } => {
             let opts = ff_agent::model_runtime::LoadOptions {
                 library_id: id.clone(),
                 port,
                 context_size: ctx,
                 parallel,
+                agent_profile: agent,
             };
-            println!("{CYAN}▶ Loading library {} on port {port}...{RESET}", id);
+            if agent {
+                println!(
+                    "{CYAN}▶ Loading library {} on port {port} (agent profile: --parallel 1, ctx >= {})...{RESET}",
+                    id,
+                    ff_agent::model_runtime::AGENT_MIN_CTX
+                );
+            } else {
+                println!("{CYAN}▶ Loading library {} on port {port}...{RESET}", id);
+            }
             match ff_agent::model_runtime::load_model(&pool, opts).await {
                 Ok(res) => {
                     println!(
@@ -713,6 +733,7 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                     port,
                     context_size: ctx,
                     parallel: None,
+                    agent_profile: false,
                 },
             )
             .await
@@ -793,6 +814,10 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                     } else {
                         "no"
                     }
+                );
+                println!(
+                    "Tool calling: {}",
+                    if c.tool_calling { "yes" } else { "no" }
                 );
                 if let Some(d) = &c.description {
                     println!("Description:  {d}");
