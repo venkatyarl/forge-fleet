@@ -2673,6 +2673,14 @@ pub async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
         FleetCommand::Exec { node, json, cmd } => {
             handle_fleet_exec(&pool, &node, json, &cmd).await?;
         }
+        FleetCommand::Deploy {
+            all,
+            node,
+            concurrency,
+            json,
+        } => {
+            handle_fleet_deploy(&pool, all, node, concurrency, json).await?;
+        }
     }
     Ok(())
 }
@@ -2787,6 +2795,483 @@ async fn handle_fleet_exec(
     if exit_code != 0 {
         eprintln!("{YELLOW}(remote exit code {exit_code}){RESET}");
         std::process::exit(exit_code);
+    }
+    Ok(())
+}
+
+/// One deploy target, resolved from Postgres `computers` (+ `fleet_workers`
+/// for ssh_user). Mirrors the field set `handle_fleet_exec` resolves, plus
+/// the bits the deploy playbook + memory-tight gating need.
+#[derive(Clone)]
+struct DeployTarget {
+    name: String,
+    primary_ip: String,
+    ssh_user: String,
+    ssh_port: i32,
+    os_family: String,
+    total_ram_gb: i32,
+    source_tree_path: String,
+}
+
+/// Result of one host's deploy attempt.
+struct DeployResult {
+    name: String,
+    ok: bool,
+    /// Running-binary SHA after restart (short, e.g. `db1a950e`) when we could
+    /// parse `forgefleetd --version`; otherwise a short raw snippet / error.
+    sha: String,
+    secs: f64,
+    detail: String,
+}
+
+/// A host is "memory-tight" when total_ram_gb <= 40 (the 32GB Linux boxes:
+/// marcus/sophie/priya/lily/beyonce). On these we free RAM before building
+/// and allow a longer per-host timeout. See the memory-tight-host rebuild
+/// pattern.
+const MEMORY_TIGHT_RAM_GB: i32 = 40;
+const DEPLOY_TIMEOUT_ROOMY_SECS: u64 = 25 * 60;
+const DEPLOY_TIMEOUT_TIGHT_SECS: u64 = 45 * 60;
+
+/// Expand a leading `~/` to `$HOME/` so the path is safe inside a
+/// double-quoted shell string (tilde does not expand there). Same trick the
+/// auto_upgrade playbook substitution uses.
+fn expand_home(raw: &str) -> String {
+    if let Some(rest) = raw.strip_prefix("~/") {
+        format!("$HOME/{rest}")
+    } else {
+        raw.to_string()
+    }
+}
+
+/// Build the self-built deploy playbook for one host.
+///
+/// This is the canonical `forgefleetd_git` upgrade sequence
+/// (`crates/ff-agent/src/upgrade_playbooks.rs`) widened to build + install
+/// BOTH binaries in a single cargo invocation:
+///   - source `~/.cargo/env` (dash has no interactive PATH),
+///   - git fetch + `reset --hard origin/main` (force-converge, no merge),
+///   - `cargo build --release -p forge-fleet -p ff-terminal` (ff needs the
+///     `-p ff-terminal` package selector or the CLI binary silently stays
+///     stale),
+///   - install both binaries to ~/.local/bin,
+///   - codesign on macOS (cp/install breaks the signature → SIGKILL),
+///   - restart per os_family using the matching idiom (launchctl kickstart on
+///     macOS, systemd --user → pkill+nohup fallback on linux/linux-dgx).
+///
+/// `os_family` is taken from the `computers` row — never hardcoded per host.
+/// DGX (`linux-dgx`) builds with `-j 2` to keep LLVM RAM pressure manageable
+/// on the 4-core GB10 boxes.
+fn deploy_playbook(os_family: &str, source_tree_path: &str) -> String {
+    let src = expand_home(source_tree_path);
+    // -p forge-fleet builds the forgefleetd daemon bin; -p ff-terminal builds
+    // the ff CLI. Both in one cargo invocation → one shared compile.
+    let cargo_build = if os_family == "linux-dgx" {
+        "cargo build --release -p forge-fleet -p ff-terminal -j 2"
+    } else {
+        "cargo build --release -p forge-fleet -p ff-terminal"
+    };
+
+    // git: force-converge to origin/main. Linux trees accumulate build
+    // artifacts that block a clean reset, so clean those two paths first
+    // (mirrors the upgrade playbook).
+    let git_sync = if os_family == "macos" {
+        format!("cd \"{src}\" && git fetch origin && git reset --hard origin/main")
+    } else {
+        format!(
+            "cd \"{src}\" && git fetch origin && git reset --hard origin/main && \
+             git clean -fdx graphify-out node-compile-cache"
+        )
+    };
+
+    match os_family {
+        "macos" => format!(
+            ". \"$HOME/.cargo/env\" 2>/dev/null || true; \
+             {git_sync} && \
+             {cargo_build} && \
+             install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && \
+             install -m 755 target/release/ff ~/.local/bin/ff && \
+             codesign --force --sign - ~/.local/bin/forgefleetd && \
+             codesign --force --sign - ~/.local/bin/ff && \
+             USER_ID=$(stat -f %u \"$HOME\" 2>/dev/null || id -u); \
+             launchctl kickstart -k \"gui/${{USER_ID}}/com.forgefleet.forgefleetd\" 2>/dev/null \
+               || launchctl kickstart -k \"user/${{USER_ID}}/com.forgefleet.forgefleetd\" 2>/dev/null \
+               || (pkill -TERM -f \"$HOME/.local/bin/forgefleetd\" 2>/dev/null; sleep 1; \
+                   nohup \"$HOME/.local/bin/forgefleetd\" --worker-name $(hostname -s) start \
+                   </dev/null >/tmp/forgefleetd.log 2>&1 & disown)"
+        ),
+        // linux + linux-dgx share the same restart idiom; only -j differs
+        // (folded into cargo_build above).
+        _ => format!(
+            ". \"$HOME/.cargo/env\" 2>/dev/null || true; \
+             {git_sync} && \
+             {cargo_build} && \
+             install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && \
+             install -m 755 target/release/ff ~/.local/bin/ff && \
+             export XDG_RUNTIME_DIR=\"${{XDG_RUNTIME_DIR:-/run/user/$(id -u)}}\"; \
+             pkill -f 'forgefleetd --worker-name' 2>/dev/null; \
+             sleep 1; \
+             ( systemctl --user reset-failed forgefleetd.service 2>/dev/null; \
+               systemctl --user restart forgefleetd.service 2>/dev/null ) \
+               || ( pkill -TERM -f \"$HOME/.local/bin/forgefleetd\" 2>/dev/null; sleep 1; \
+                    nohup \"$HOME/.local/bin/forgefleetd\" --worker-name $(hostname -s) start \
+                    </dev/null >/tmp/forgefleetd.log 2>&1 & disown )"
+        ),
+    }
+}
+
+/// Run one shell command on a target over SSH with a deadline, capturing
+/// output. Resolves the best-reachable IP (LAN→Tailscale) the same way
+/// `handle_fleet_exec` does. Returns (exit_code, stdout, stderr); a timeout
+/// surfaces as exit_code = -2.
+async fn deploy_ssh(
+    t: &DeployTarget,
+    remote_cmd: &str,
+    timeout_secs: u64,
+) -> (i32, String, String) {
+    let target_ip = match ff_agent::fleet_info::resolve_best_ip(&t.name).await {
+        Some((ip, _kind)) => ip,
+        None => t.primary_ip.clone(),
+    };
+    let user_at_host = format!("{}@{target_ip}", t.ssh_user);
+
+    let mut ssh = tokio::process::Command::new("ssh");
+    ssh.arg("-T")
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("StrictHostKeyChecking=accept-new")
+        .arg("-o")
+        .arg("ConnectTimeout=10")
+        .arg("-p")
+        .arg(t.ssh_port.to_string())
+        .arg(&user_at_host)
+        .arg(remote_cmd);
+
+    let fut = ssh.output();
+    match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), fut).await {
+        Ok(Ok(out)) => (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout).to_string(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        ),
+        Ok(Err(e)) => (-1, String::new(), format!("ssh spawn error: {e}")),
+        Err(_) => (
+            -2,
+            String::new(),
+            format!("timed out after {timeout_secs}s"),
+        ),
+    }
+}
+
+/// Deploy the full forgefleetd + ff playbook to one target, then verify
+/// convergence by reading the RUNNING binary SHA. Never panics — every
+/// failure mode collapses into a `DeployResult { ok: false, .. }`.
+async fn deploy_one_host(t: DeployTarget) -> DeployResult {
+    use ff_core::build_version::BuildVersion;
+    let start = std::time::Instant::now();
+    let tight = t.total_ram_gb > 0 && t.total_ram_gb <= MEMORY_TIGHT_RAM_GB;
+    let timeout_secs = if tight {
+        DEPLOY_TIMEOUT_TIGHT_SECS
+    } else {
+        DEPLOY_TIMEOUT_ROOMY_SECS
+    };
+
+    // 1) Memory-tight hosts: free RAM (pause local model deployments) before
+    //    the cargo build so the release build doesn't OOM. Best-effort — a
+    //    non-zero exit (e.g. nothing to free) is not fatal.
+    if tight {
+        let (_code, _o, _e) = deploy_ssh(&t, "~/.local/bin/ff model free-for-build", 120).await;
+    }
+
+    // 2) Build + install + restart.
+    let playbook = deploy_playbook(&t.os_family, &t.source_tree_path);
+    let (code, _stdout, stderr) = deploy_ssh(&t, &playbook, timeout_secs).await;
+    if code != 0 {
+        let snippet: String = stderr
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("")
+            .chars()
+            .take(120)
+            .collect();
+        return DeployResult {
+            name: t.name,
+            ok: false,
+            sha: "-".into(),
+            secs: start.elapsed().as_secs_f64(),
+            detail: if code == -2 {
+                snippet
+            } else {
+                format!("playbook exit {code}: {snippet}")
+            },
+        };
+    }
+
+    // 3) Convergence = RUNNING binary. Give the freshly-restarted daemon a
+    //    moment, then read its version SHA. We read forgefleetd (the daemon
+    //    we just bounced) so the SHA reflects the running process, not just
+    //    the on-disk binary.
+    let (vcode, vout, verr) = deploy_ssh(
+        &t,
+        "sleep 3; ~/.local/bin/forgefleetd --version 2>&1 | head -1",
+        60,
+    )
+    .await;
+    let raw = if vcode == 0 {
+        vout.trim().to_string()
+    } else {
+        format!("version-probe exit {vcode}: {}", verr.trim())
+    };
+    match BuildVersion::parse(&raw) {
+        Some(v) => DeployResult {
+            name: t.name,
+            ok: true,
+            sha: v.short_sha().to_string(),
+            secs: start.elapsed().as_secs_f64(),
+            detail: format!("{} ({})", v.date, v.state),
+        },
+        None => {
+            // Built + restarted fine but we couldn't parse a SHA — report the
+            // raw snippet and mark it not-converged so the operator looks.
+            let snippet: String = raw.chars().take(40).collect();
+            DeployResult {
+                name: t.name,
+                ok: false,
+                sha: "?".into(),
+                secs: start.elapsed().as_secs_f64(),
+                detail: format!("restarted but version unparsable: {snippet}"),
+            }
+        }
+    }
+}
+
+/// `ff fleet deploy --all | --node <name>` — fast PARALLEL self-built deploy.
+///
+/// Additive alternative to the `ff tasks compose-fleet-upgrade` wave. Targets
+/// resolve from Postgres (`computers` ⋈ `fleet_workers`); `--all` selects every
+/// ONLINE non-leader computer (the leader is excluded — it restarts itself
+/// badly). Each target runs the deploy playbook over SSH concurrently (bounded
+/// by --concurrency, default 6); memory-tight hosts (total_ram_gb ≤ 40) get a
+/// `ff model free-for-build` first and a 45-min timeout. After restart we read
+/// each host's RUNNING forgefleetd SHA and report per-host ok/fail + SHA +
+/// duration, then a convergence summary.
+async fn handle_fleet_deploy(
+    pool: &sqlx::PgPool,
+    all: bool,
+    node: Option<String>,
+    concurrency: usize,
+    json: bool,
+) -> Result<()> {
+    use futures::stream::{FuturesUnordered, StreamExt};
+
+    if !all && node.is_none() {
+        anyhow::bail!("pass --all or --node <name> to pick targets");
+    }
+    if all && node.is_some() {
+        anyhow::bail!("--all and --node are mutually exclusive");
+    }
+    let concurrency = concurrency.max(1);
+
+    // Resolve targets. Both shapes pull the same columns; --all filters to
+    // online non-leader, --node matches one host by name or IP (leader
+    // allowed — the only way to deploy the leader).
+    let targets: Vec<DeployTarget> = if all {
+        sqlx::query_as::<_, (String, String, String, i32, String, i32, Option<String>)>(
+            "SELECT c.name,
+                    c.primary_ip,
+                    COALESCE(NULLIF(c.ssh_user, ''), fw.ssh_user, 'venkat') AS ssh_user,
+                    COALESCE(NULLIF(c.ssh_port, 0), 22)                     AS ssh_port,
+                    COALESCE(c.os_family, 'linux')                          AS os_family,
+                    COALESCE(c.total_ram_gb, 0)                             AS total_ram_gb,
+                    c.source_tree_path
+               FROM computers c
+               LEFT JOIN fleet_workers fw ON fw.name = c.name
+              WHERE c.status = 'online'
+                AND COALESCE(fw.role, '') <> 'leader'
+              ORDER BY string_to_array(c.primary_ip, '.')::int[]",
+        )
+        .fetch_all(pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("query online non-leader computers: {e}"))?
+        .into_iter()
+        .map(
+            |(name, primary_ip, ssh_user, ssh_port, os_family, total_ram_gb, stp)| DeployTarget {
+                name,
+                primary_ip,
+                ssh_user,
+                ssh_port,
+                os_family,
+                total_ram_gb,
+                source_tree_path: stp.unwrap_or_else(|| "~/projects/forge-fleet".into()),
+            },
+        )
+        .collect()
+    } else {
+        let n = node.unwrap();
+        let row = sqlx::query_as::<_, (String, String, String, i32, String, i32, Option<String>)>(
+            "SELECT c.name,
+                    c.primary_ip,
+                    COALESCE(NULLIF(c.ssh_user, ''), fw.ssh_user, 'venkat') AS ssh_user,
+                    COALESCE(NULLIF(c.ssh_port, 0), 22)                     AS ssh_port,
+                    COALESCE(c.os_family, 'linux')                          AS os_family,
+                    COALESCE(c.total_ram_gb, 0)                             AS total_ram_gb,
+                    c.source_tree_path
+               FROM computers c
+               LEFT JOIN fleet_workers fw ON fw.name = c.name
+              WHERE LOWER(c.name) = LOWER($1) OR c.primary_ip = $1
+              LIMIT 1",
+        )
+        .bind(&n)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("query computers: {e}"))?;
+        match row {
+            Some((name, primary_ip, ssh_user, ssh_port, os_family, total_ram_gb, stp)) => {
+                vec![DeployTarget {
+                    name,
+                    primary_ip,
+                    ssh_user,
+                    ssh_port,
+                    os_family,
+                    total_ram_gb,
+                    source_tree_path: stp.unwrap_or_else(|| "~/projects/forge-fleet".into()),
+                }]
+            }
+            None => anyhow::bail!(
+                "no computer named (or IP) '{n}' in Postgres. \
+                 Run `ff fleet computers` to list known hosts."
+            ),
+        }
+    };
+
+    if targets.is_empty() {
+        if json {
+            println!("[]");
+        } else {
+            println!("{YELLOW}No deploy targets (no online non-leader computers).{RESET}");
+        }
+        return Ok(());
+    }
+
+    if !json {
+        eprintln!(
+            "{CYAN}▶ ff fleet deploy{RESET}: {} target(s), up to {} building in parallel",
+            targets.len(),
+            concurrency.min(targets.len())
+        );
+        for t in &targets {
+            let tight = t.total_ram_gb > 0 && t.total_ram_gb <= MEMORY_TIGHT_RAM_GB;
+            eprintln!(
+                "  {:<12} {:<10} {:>3}GB{}",
+                t.name,
+                t.os_family,
+                t.total_ram_gb,
+                if tight {
+                    " (memory-tight: free-for-build + 45m timeout)"
+                } else {
+                    ""
+                }
+            );
+        }
+    }
+
+    // Drive the deploys with bounded concurrency: keep at most `concurrency`
+    // hosts building at once, refilling as each completes.
+    let mut iter = targets.into_iter();
+    let mut inflight = FuturesUnordered::new();
+    for _ in 0..concurrency {
+        if let Some(t) = iter.next() {
+            inflight.push(deploy_one_host(t));
+        }
+    }
+    let mut results: Vec<DeployResult> = Vec::new();
+    while let Some(res) = inflight.next().await {
+        if !json {
+            let mark = if res.ok {
+                format!("{GREEN}✓{RESET}")
+            } else {
+                format!("{RED}✗{RESET}")
+            };
+            eprintln!(
+                "  {mark} {:<12} {:<10} {:>6.0}s  {}",
+                res.name, res.sha, res.secs, res.detail
+            );
+        }
+        results.push(res);
+        if let Some(t) = iter.next() {
+            inflight.push(deploy_one_host(t));
+        }
+    }
+    results.sort_by(|a, b| a.name.cmp(&b.name));
+
+    // Convergence target = the most-common SHA among successful hosts.
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for r in &results {
+        if r.ok {
+            *counts.entry(r.sha.clone()).or_insert(0) += 1;
+        }
+    }
+    let target_sha = counts
+        .iter()
+        .max_by_key(|(_, n)| *n)
+        .map(|(sha, _)| sha.clone());
+    let converged = results
+        .iter()
+        .filter(|r| r.ok && target_sha.as_deref() == Some(r.sha.as_str()))
+        .count();
+    let total = results.len();
+
+    if json {
+        let arr: Vec<_> = results
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "host": r.name,
+                    "status": if r.ok { "ok" } else { "fail" },
+                    "sha": r.sha,
+                    "secs": (r.secs * 10.0).round() / 10.0,
+                    "detail": r.detail,
+                })
+            })
+            .collect();
+        let payload = serde_json::json!({
+            "results": arr,
+            "target_sha": target_sha,
+            "converged": converged,
+            "total": total,
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+        if converged != total {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    println!(
+        "\n{:<14} {:<8} {:<10} {:>7}",
+        "host", "status", "sha", "secs"
+    );
+    println!("{}", "─".repeat(42));
+    for r in &results {
+        let status = if r.ok {
+            format!("{GREEN}ok{RESET}  ")
+        } else {
+            format!("{RED}fail{RESET}")
+        };
+        println!("{:<14} {:<8} {:<10} {:>7.0}", r.name, status, r.sha, r.secs);
+    }
+    let target_disp = target_sha.as_deref().unwrap_or("-");
+    println!();
+    if converged == total && total > 0 {
+        println!("{GREEN}✓ {converged}/{total} converged on {target_disp}{RESET}");
+    } else {
+        println!(
+            "{YELLOW}⚠ {converged}/{total} converged on {target_disp}{RESET} \
+             ({} not converged)",
+            total - converged
+        );
+        std::process::exit(1);
     }
     Ok(())
 }

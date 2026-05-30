@@ -1318,6 +1318,38 @@ enum FleetCommand {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         cmd: Vec<String>,
     },
+    /// Fast, PARALLEL self-built deploy of forgefleetd + ff to fleet hosts.
+    ///
+    /// A faster, observable alternative to the `ff tasks compose-fleet-upgrade`
+    /// wave (which is fanout-serialized, cold-builds per host, and stalls on
+    /// flaky 32GB Linux boxes). This runs the canonical forgefleetd_git
+    /// upgrade playbook (git fetch + reset --hard origin/main → cargo build
+    /// --release -p forge-fleet -p ff-terminal → install both binaries →
+    /// codesign on macOS → restart per os_family) over SSH on every target at
+    /// once (bounded concurrency), then verifies convergence by reading each
+    /// host's RUNNING binary SHA.
+    ///
+    /// The Postgres-resolved SSH path is identical to `ff fleet exec`
+    /// (user@ip from the `computers` table, never ~/.ssh/config).
+    ///
+    /// NOTE: the leader (Taylor) is EXCLUDED from `--all` — it restarts
+    /// itself badly (kills the daemon mid-deploy). Deploy the leader by hand,
+    /// or target it explicitly with `--node taylor` if you accept the risk.
+    Deploy {
+        /// Deploy to ALL online non-leader computers (leader excluded).
+        #[arg(long, default_value_t = false)]
+        all: bool,
+        /// Deploy to a single named computer (or IP). Mutually exclusive
+        /// with --all. The only way to target the leader.
+        #[arg(long)]
+        node: Option<String>,
+        /// Max hosts building concurrently (default 6).
+        #[arg(long, default_value_t = 6)]
+        concurrency: usize,
+        /// Emit a per-host results JSON array instead of the summary table.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
