@@ -93,6 +93,7 @@ impl ToolRegistry {
         self.register(Self::fleet_models_library());
         self.register(Self::fleet_models_deployments());
         self.register(Self::fleet_models_disk_usage());
+        self.register(Self::fleet_agents());
 
         // ── Virtual Brain tools ─────────────────────────────────────────
         self.register(Self::brain_search());
@@ -419,13 +420,16 @@ impl ToolRegistry {
     fn fleet_crew() -> ToolDefinition {
         ToolDefinition {
             name: "fleet_crew".to_string(),
-            description: "Multi-agent coding pipeline: Context Engineer (9B) gathers \
-                relevant code → Code Writer (32B) drafts the change → Code Reviewer (72B) \
-                audits it. Best when the task benefits from a review pass over the writer's \
-                output: refactors, bug fixes touching multiple files, new functions with \
-                edge cases, anything where 'works but might be wrong' is a real risk. \
-                Slower than `fleet_run` (3 model calls vs 1), so skip it for self-contained \
-                one-shot tasks."
+            description: "Multi-agent coding pipeline driven by the fleet_agents catalog \
+                (V112). The default crew is Code Writer → Code Reviewer (catalog agents); \
+                stricter project policies add a context Explorer pass and a second review. \
+                Each agent's endpoint is chosen by the agent-swarm capability router \
+                (tool-calling model + enough per-slot ctx), not hardcoded to one host. \
+                Best when the task benefits from a review pass over the writer's output: \
+                refactors, bug fixes touching multiple files, new functions with edge \
+                cases, anything where 'works but might be wrong' is a real risk. Slower \
+                than `fleet_run` (multiple model calls vs 1), so skip it for self-contained \
+                one-shot tasks. See `fleet_agents` for the catalog."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -732,6 +736,34 @@ impl ToolRegistry {
             input_schema: json!({
                 "type": "object",
                 "properties": {},
+                "required": []
+            }),
+        }
+    }
+
+    fn fleet_agents() -> ToolDefinition {
+        ToolDefinition {
+            name: "fleet_agents".to_string(),
+            description: "List or show the fleet_agents catalog (V112) — the specialized \
+                agents the crew/orchestrator can instantiate (code-writer, code-reviewer, \
+                researcher, refactorer, test-writer, doc-writer, planner, explorer). Each \
+                agent carries a role, system prompt, allowed tool set, and the routing \
+                capability (tool_calling + min_ctx) used by the agent-swarm router. \
+                Read-only — pass 'name' to show one agent's full definition."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Show a single agent by its catalog name (e.g. \"code-writer\"). Omit to list all."
+                    },
+                    "enabled_only": {
+                        "type": "boolean",
+                        "description": "When listing, return only enabled agents.",
+                        "default": true
+                    }
+                },
                 "required": []
             }),
         }
@@ -1052,6 +1084,7 @@ mod tests {
             "fleet_models_library",
             "fleet_models_deployments",
             "fleet_models_disk_usage",
+            "fleet_agents",
             // Virtual Brain
             "brain_search",
             "brain_vault_read",

@@ -2506,6 +2506,140 @@ pub async fn pg_pick_agent_endpoint(
         .next())
 }
 
+// ─── Fleet agents catalog (V112) ─────────────────────────────────────────────
+//
+// The `fleet_agents` table is the canonical catalog of specialized agents the
+// crew / orchestrator can instantiate by `name`. Mirrors the V105 skills shape:
+// a DB row carries the system_prompt + allowed_tools + the capability the
+// agent's endpoint must satisfy (require_tool_calling + min_ctx), which the
+// crew feeds straight into [`pg_pick_agent_endpoint`].
+
+/// One row from the `fleet_agents` catalog.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FleetAgentRow {
+    pub id: String,
+    /// Stable handle used by the crew + CLI (e.g. "code-writer").
+    pub name: String,
+    pub role: String,
+    pub description: Option<String>,
+    pub system_prompt: String,
+    /// jsonb array of tool names. Empty = inherit the session default tools.
+    pub allowed_tools: JsonValue,
+    /// jsonb array of "when to use" trigger strings.
+    pub triggers: JsonValue,
+    pub require_tool_calling: bool,
+    pub min_ctx: i32,
+    pub source: String,
+    pub source_url: Option<String>,
+    pub enabled: bool,
+}
+
+fn agent_row_from(r: &sqlx::postgres::PgRow) -> FleetAgentRow {
+    let id: sqlx::types::Uuid = r.get("id");
+    FleetAgentRow {
+        id: id.to_string(),
+        name: r.get("name"),
+        role: r.get("role"),
+        description: r.try_get("description").ok(),
+        system_prompt: r.get("system_prompt"),
+        allowed_tools: r.try_get("allowed_tools").unwrap_or(JsonValue::Null),
+        triggers: r.try_get("triggers").unwrap_or(JsonValue::Null),
+        require_tool_calling: r.try_get("require_tool_calling").unwrap_or(true),
+        min_ctx: r.try_get("min_ctx").unwrap_or(16384),
+        source: r.try_get("source").unwrap_or_default(),
+        source_url: r.try_get("source_url").ok(),
+        enabled: r.try_get("enabled").unwrap_or(true),
+    }
+}
+
+const AGENT_COLS: &str = "id, name, role, description, system_prompt, allowed_tools, \
+     triggers, require_tool_calling, min_ctx, source, source_url, enabled";
+
+/// List agents from the catalog, ordered by name. `enabled_only = true`
+/// returns only enabled rows (the set the crew/router should consider).
+pub async fn pg_list_agents(pool: &PgPool, enabled_only: bool) -> Result<Vec<FleetAgentRow>> {
+    let sql = format!(
+        "SELECT {AGENT_COLS} FROM fleet_agents {} ORDER BY name",
+        if enabled_only {
+            "WHERE enabled = true"
+        } else {
+            ""
+        }
+    );
+    let rows = sqlx::query(&sql).fetch_all(pool).await?;
+    Ok(rows.iter().map(agent_row_from).collect())
+}
+
+/// Fetch a single agent by its stable `name` handle. Returns `None` if no row
+/// matches (the caller decides whether that's a hard error or a fallback).
+pub async fn pg_get_agent(pool: &PgPool, name: &str) -> Result<Option<FleetAgentRow>> {
+    let sql = format!("SELECT {AGENT_COLS} FROM fleet_agents WHERE name = $1");
+    let row = sqlx::query(&sql).bind(name).fetch_optional(pool).await?;
+    Ok(row.as_ref().map(agent_row_from))
+}
+
+/// Upsert an agent by `name` (used by the AGENT.md importer / `ff agents add`).
+/// Returns the row id.
+#[allow(clippy::too_many_arguments)]
+pub async fn pg_upsert_agent(
+    pool: &PgPool,
+    name: &str,
+    role: &str,
+    description: Option<&str>,
+    system_prompt: &str,
+    allowed_tools: &JsonValue,
+    triggers: &JsonValue,
+    require_tool_calling: bool,
+    min_ctx: i32,
+    source: &str,
+    source_url: Option<&str>,
+) -> Result<String> {
+    let row = sqlx::query(
+        r#"
+        INSERT INTO fleet_agents
+            (name, role, description, system_prompt, allowed_tools, triggers,
+             require_tool_calling, min_ctx, source, source_url, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now())
+        ON CONFLICT (name) DO UPDATE
+            SET role                 = EXCLUDED.role,
+                description          = EXCLUDED.description,
+                system_prompt        = EXCLUDED.system_prompt,
+                allowed_tools        = EXCLUDED.allowed_tools,
+                triggers             = EXCLUDED.triggers,
+                require_tool_calling = EXCLUDED.require_tool_calling,
+                min_ctx              = EXCLUDED.min_ctx,
+                source               = EXCLUDED.source,
+                source_url           = EXCLUDED.source_url,
+                updated_at           = now()
+        RETURNING id
+        "#,
+    )
+    .bind(name)
+    .bind(role)
+    .bind(description)
+    .bind(system_prompt)
+    .bind(allowed_tools)
+    .bind(triggers)
+    .bind(require_tool_calling)
+    .bind(min_ctx)
+    .bind(source)
+    .bind(source_url)
+    .fetch_one(pool)
+    .await?;
+    let id: sqlx::types::Uuid = row.get("id");
+    Ok(id.to_string())
+}
+
+/// Enable / disable an agent without deleting it. Returns true if a row changed.
+pub async fn pg_set_agent_enabled(pool: &PgPool, name: &str, enabled: bool) -> Result<bool> {
+    let r = sqlx::query("UPDATE fleet_agents SET enabled = $2, updated_at = now() WHERE name = $1")
+        .bind(name)
+        .bind(enabled)
+        .execute(pool)
+        .await?;
+    Ok(r.rows_affected() > 0)
+}
+
 /// Remove a deployment (when a model is unloaded).
 pub async fn pg_delete_deployment(pool: &PgPool, id: &str) -> Result<bool> {
     let uuid = sqlx::types::Uuid::parse_str(id)

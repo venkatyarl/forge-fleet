@@ -35,6 +35,7 @@ use ff_terminal::render;
 // Wired here as mod decls; Command enum integration lives in the separate
 // V131/V132 PRs so this commit only delivers the handlers.
 mod agent_cmd;
+mod agents_cmd;
 mod alert_cmd;
 mod brain_cmd;
 mod cloud_llm_cmd;
@@ -373,6 +374,13 @@ enum Command {
     Skills {
         #[command(subcommand)]
         command: skills_cmd::SkillsCommand,
+    },
+    /// Manage the V112 fleet_agents catalog: list/show the specialized
+    /// agents the crew can instantiate, import AGENT.md files, or
+    /// enable/disable entries. The AGENTS analogue of `ff skills`.
+    Agents {
+        #[command(subcommand)]
+        command: agents_cmd::AgentsCommand,
     },
     /// Fleet-wide swarm orchestration: plan → fan out N sub-tasks
     /// across fleet computers via fleet_tasks → synthesize a final
@@ -2424,6 +2432,9 @@ async fn main() -> Result<()> {
         Some(Command::Skills { command }) => {
             return skills_cmd::handle_skills(command.clone()).await;
         }
+        Some(Command::Agents { command }) => {
+            return agents_cmd::handle_agents(command.clone()).await;
+        }
         Some(Command::Swarm { command }) => {
             return swarm_cmd::handle_swarm(command.clone()).await;
         }
@@ -2633,6 +2644,7 @@ async fn main() -> Result<()> {
         Some(Command::Github { command }) => github_cmd::handle_github(command).await,
         Some(Command::Mcp { command }) => mcp_cmd::handle_mcp(command).await,
         Some(Command::Skills { command }) => skills_cmd::handle_skills(command).await,
+        Some(Command::Agents { command }) => agents_cmd::handle_agents(command).await,
         Some(Command::Swarm { command }) => swarm_cmd::handle_swarm(command).await,
         Some(Command::Onboard { command }) => onboard_cmd::handle_onboard(command).await,
         Some(Command::VirtualBrain { command }) => brain_cmd::handle_brain(command).await,
