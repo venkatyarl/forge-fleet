@@ -672,6 +672,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "task_depends_on",
         sql: schema::SCHEMA_V108_TASK_DEPENDS_ON,
     },
+    PgMigration {
+        version: 109,
+        name: "open_design_corepack_fix",
+        sql: schema::SCHEMA_V109_OPEN_DESIGN_COREPACK_FIX,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.

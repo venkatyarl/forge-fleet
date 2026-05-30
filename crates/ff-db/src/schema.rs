@@ -7367,3 +7367,46 @@ CREATE INDEX IF NOT EXISTS idx_fleet_tasks_depends_on
     ON fleet_tasks (depends_on_task_id)
  WHERE depends_on_task_id IS NOT NULL;
 "#;
+
+/// V109 — fix `open_design_git` upgrade playbook: corepack EACCES on Linux.
+///
+/// The Linux playbooks (linux-ubuntu / linux-dgx) ran `corepack enable`
+/// without `--install-directory`, so corepack tried to symlink pnpm into
+/// /usr/bin (system path) and failed with EACCES on every non-root host.
+/// Auto-upgrade retried 3/3 and gave up on aura / sophie / sia / rihanna /
+/// veronica every hourly tick (Telegram alerts on 2026-05-29).
+///
+/// Fix: write the corepack shims to `$HOME/.local/bin` (user-writable, and
+/// already on the playbook's PATH). macOS playbook left unchanged — it
+/// already succeeded.
+pub const SCHEMA_V109_OPEN_DESIGN_COREPACK_FIX: &str = r#"
+UPDATE software_registry SET upgrade_playbook = jsonb_build_object(
+    'macos',
+        'export PATH=/opt/homebrew/bin:$PATH && '
+     || 'mkdir -p "$(dirname $HOME/.forgefleet/sub-agent-0/open-design)" && '
+     || '{ [ -d "$HOME/.forgefleet/sub-agent-0/open-design/.git" ] || git clone https://github.com/nexu-io/open-design "$HOME/.forgefleet/sub-agent-0/open-design"; } && '
+     || 'cd "$HOME/.forgefleet/sub-agent-0/open-design" && '
+     || 'git fetch origin main && '
+     || 'git reset --hard origin/main && '
+     || 'corepack enable >/dev/null 2>&1 && '
+     || 'corepack pnpm install --frozen-lockfile',
+    'linux-ubuntu',
+        'export PATH="$HOME/.local/bin:$PATH" && '
+     || 'mkdir -p "$(dirname $HOME/.forgefleet/sub-agent-0/open-design)" "$HOME/.local/bin" && '
+     || '{ [ -d "$HOME/.forgefleet/sub-agent-0/open-design/.git" ] || git clone https://github.com/nexu-io/open-design "$HOME/.forgefleet/sub-agent-0/open-design"; } && '
+     || 'cd "$HOME/.forgefleet/sub-agent-0/open-design" && '
+     || 'git fetch origin main && '
+     || 'git reset --hard origin/main && '
+     || 'corepack enable --install-directory "$HOME/.local/bin" >/dev/null 2>&1 && '
+     || 'corepack pnpm install --frozen-lockfile',
+    'linux-dgx',
+        'export PATH="$HOME/.local/bin:$PATH" && '
+     || 'mkdir -p "$(dirname $HOME/.forgefleet/sub-agent-0/open-design)" "$HOME/.local/bin" && '
+     || '{ [ -d "$HOME/.forgefleet/sub-agent-0/open-design/.git" ] || git clone https://github.com/nexu-io/open-design "$HOME/.forgefleet/sub-agent-0/open-design"; } && '
+     || 'cd "$HOME/.forgefleet/sub-agent-0/open-design" && '
+     || 'git fetch origin main && '
+     || 'git reset --hard origin/main && '
+     || 'corepack enable --install-directory "$HOME/.local/bin" >/dev/null 2>&1 && '
+     || 'corepack pnpm install --frozen-lockfile'
+) WHERE id = 'open_design_git';
+"#;
