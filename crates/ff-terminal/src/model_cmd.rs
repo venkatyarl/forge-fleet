@@ -723,7 +723,38 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                 catalog_id, res.port, res.deployment_id
             );
         }
-        crate::ModelCommand::Unload { id } => {
+        crate::ModelCommand::Unload { id, node } => {
+            // Cross-node form: resolve user@ip from Postgres and run
+            // `ff model unload <id>` on the target over SSH. We deliberately
+            // build the destination from the DB (never ~/.ssh/config).
+            if let Some(target) = node {
+                let this_node = ff_agent::fleet_info::resolve_this_worker_name().await;
+                if !target.eq_ignore_ascii_case(&this_node) {
+                    let node_row = ff_db::pg_get_node(&pool, &target)
+                        .await?
+                        .ok_or_else(|| anyhow::anyhow!("node '{target}' not in fleet_workers"))?;
+                    let remote_cmd = format!("ff model unload {}", shell_escape_single(&id));
+                    println!(
+                        "{CYAN}▶ Unloading deployment {id} on {target} ({}@{})...{RESET}",
+                        node_row.ssh_user, node_row.ip
+                    );
+                    let (code, out, err) = ff_agent::model_transfer::ssh_exec(
+                        &node_row.ssh_user,
+                        &node_row.ip,
+                        &remote_cmd,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("ssh to {target}: {e}"))?;
+                    if !out.trim().is_empty() {
+                        print!("{out}");
+                    }
+                    if code != 0 {
+                        anyhow::bail!("remote unload on {target} exited {code}: {}", err.trim());
+                    }
+                    return Ok(());
+                }
+                // node == this host: fall through to the local path.
+            }
             match ff_agent::model_runtime::unload_model(&pool, &id).await {
                 Ok(()) => println!("Unloaded deployment {id}"),
                 Err(e) => anyhow::bail!("unload failed: {e}"),
