@@ -157,7 +157,7 @@ enum Command {
     Status,
     /// List fleet nodes with hardware/GPU info from Postgres.
     Nodes {
-        /// Filter by GPU kind substring (e.g. amd, nvidia, apple).
+        /// Filter by GPU kind substring (e.g. amd, nvidia, apple, none).
         #[arg(long)]
         gpu: Option<String>,
         /// Output JSON instead of a table.

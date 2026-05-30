@@ -1392,6 +1392,11 @@ pub struct FleetNodeRow {
     pub gpu_model: Option<String>,
     #[serde(default)]
     pub gpu_vram_gb: Option<f64>,
+    /// Total GPU VRAM (GB). For unified-memory boxes (Apple Silicon, GB10
+    /// Grace+Blackwell) per-GPU `gpu_vram_gb` is NULL by design, so this is
+    /// the correct source for "how much VRAM"; prefer it when present.
+    #[serde(default)]
+    pub gpu_total_vram_gb: Option<f64>,
     #[serde(default)]
     pub has_gpu: Option<bool>,
     /// True RAM (GB) from the `computers` hardware row. `ram_gb` above is the
@@ -1450,7 +1455,7 @@ pub async fn pg_list_nodes(pool: &PgPool) -> Result<Vec<FleetNodeRow>> {
                 COALESCE(fw.sub_agent_count, 1) AS sub_agent_count,
                 fw.gh_account,
                 COALESCE(fw.tooling, '{}'::jsonb) AS tooling,
-                c.gpu_kind, c.gpu_model, c.gpu_vram_gb, c.has_gpu,
+                c.gpu_kind, c.gpu_model, c.gpu_vram_gb, c.gpu_total_vram_gb, c.has_gpu,
                 c.total_ram_gb AS computer_ram_gb,
                 c.cpu_cores AS computer_cpu_cores
          FROM fleet_workers fw
@@ -1487,6 +1492,7 @@ pub async fn pg_list_nodes(pool: &PgPool) -> Result<Vec<FleetNodeRow>> {
             gpu_kind: r.get("gpu_kind"),
             gpu_model: r.get("gpu_model"),
             gpu_vram_gb: r.get("gpu_vram_gb"),
+            gpu_total_vram_gb: r.get("gpu_total_vram_gb"),
             has_gpu: r.get("has_gpu"),
             computer_ram_gb: r.get("computer_ram_gb"),
             computer_cpu_cores: r.get("computer_cpu_cores"),
@@ -1506,7 +1512,7 @@ pub async fn pg_get_node(pool: &PgPool, name: &str) -> Result<Option<FleetNodeRo
                 COALESCE(fw.sub_agent_count, 1) AS sub_agent_count,
                 fw.gh_account,
                 COALESCE(fw.tooling, '{}'::jsonb) AS tooling,
-                c.gpu_kind, c.gpu_model, c.gpu_vram_gb, c.has_gpu,
+                c.gpu_kind, c.gpu_model, c.gpu_vram_gb, c.gpu_total_vram_gb, c.has_gpu,
                 c.total_ram_gb AS computer_ram_gb,
                 c.cpu_cores AS computer_cpu_cores
          FROM fleet_workers fw
@@ -1541,6 +1547,7 @@ pub async fn pg_get_node(pool: &PgPool, name: &str) -> Result<Option<FleetNodeRo
         gpu_kind: r.get("gpu_kind"),
         gpu_model: r.get("gpu_model"),
         gpu_vram_gb: r.get("gpu_vram_gb"),
+            gpu_total_vram_gb: r.get("gpu_total_vram_gb"),
         has_gpu: r.get("has_gpu"),
         computer_ram_gb: r.get("computer_ram_gb"),
         computer_cpu_cores: r.get("computer_cpu_cores"),
@@ -3123,6 +3130,7 @@ pub async fn seed_from_fleet_toml(
             gpu_kind: None,
             gpu_model: None,
             gpu_vram_gb: None,
+            gpu_total_vram_gb: None,
             has_gpu: None,
             computer_ram_gb: None,
             computer_cpu_cores: None,

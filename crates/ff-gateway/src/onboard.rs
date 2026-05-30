@@ -536,6 +536,7 @@ pub async fn self_enroll(
         gpu_kind: None,
         gpu_model: None,
         gpu_vram_gb: None,
+        gpu_total_vram_gb: None,
         has_gpu: None,
         computer_ram_gb: None,
         computer_cpu_cores: None,
