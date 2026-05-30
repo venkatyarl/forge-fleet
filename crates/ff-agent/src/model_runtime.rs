@@ -390,7 +390,13 @@ pub async fn load_model(pool: &sqlx::PgPool, opts: LoadOptions) -> Result<LoadRe
 }
 
 /// Stop a running inference server tracked under `deployment_id`.
-/// SIGTERM first (up to 10s), then SIGKILL. Deletes the deployment row on success.
+///
+/// Identifies the real serving process by the deployment's PORT (live kernel
+/// lookup via `ss`/`lsof`) rather than the possibly-stale recorded PID, so it
+/// kills the ACTUAL listener even if the server was restarted out-of-band.
+/// SIGTERM first (up to 10s), then SIGKILL — to the PID and its process group.
+/// On Linux, stops the systemd supervisor first so it doesn't respawn the
+/// server. Deletes the deployment row on success.
 pub async fn unload_model(pool: &sqlx::PgPool, deployment_id: &str) -> Result<(), String> {
     let worker_name = crate::fleet_info::resolve_this_worker_name().await;
     let deployments = ff_db::pg_list_deployments(pool, Some(&worker_name))
@@ -412,28 +418,27 @@ pub async fn unload_model(pool: &sqlx::PgPool, deployment_id: &str) -> Result<()
     .await
     .map_err(|e| format!("mark retired: {e}"))?;
 
-    let pid_i32 = dep.pid.ok_or_else(|| "deployment has no pid".to_string())?;
-    let pid = pid_i32 as u32;
+    let port = dep.port as u16;
+    let recorded_pid = dep.pid.map(|p| p as u32);
 
-    // SIGTERM
-    let _ = tokio::process::Command::new("kill")
-        .args(["-TERM", &pid.to_string()])
-        .output()
-        .await;
+    // On Linux, stop+disable the systemd supervisor FIRST. The unit uses
+    // `Restart=on-failure`, and a SIGTERM/SIGKILL counts as a non-clean exit,
+    // so without this systemd would immediately respawn a fresh llama-server
+    // (with a new PID) the moment we kill the listener — defeating the unload.
+    #[cfg(target_os = "linux")]
+    stop_systemd_unit(port).await;
 
-    // Wait up to 10s for process to exit.
-    for _ in 0..20 {
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        if !pid_is_alive(pid) {
-            break;
-        }
-    }
-    if pid_is_alive(pid) {
-        tracing::warn!(pid, "SIGTERM didn't stop process; escalating to SIGKILL");
-        let _ = tokio::process::Command::new("kill")
-            .args(["-KILL", &pid.to_string()])
-            .output()
-            .await;
+    // Kill the process that is ACTUALLY listening on this deployment's port,
+    // resolved live from the kernel — not the (possibly stale) recorded PID.
+    // The recorded PID is passed only as a fallback target. SIGTERM → wait →
+    // SIGKILL, against the PID and its process group. Never `pkill -f`.
+    let killed = stop_listener_on_port(port, recorded_pid).await;
+    if killed.is_empty() {
+        tracing::warn!(
+            deployment = %deployment_id,
+            port,
+            "unload: no live listener found on port (already stopped?); clearing DB row"
+        );
     }
 
     // V106: flip the library row back to cold. We capture library_id from
@@ -520,10 +525,22 @@ struct PausedModel {
 
 /// Pause local model deployments to free RAM for a release build — only if
 /// this host is memory-tight (total RAM ≤ [`FREE_FOR_BUILD_RAM_GB`]).
-/// Snapshots each restorable deployment (one with a `library_id`) to a state
-/// file, then unloads ALL local deployments so the build has the RAM. No-op
-/// on roomy hosts, when RAM is undetectable, or when nothing is loaded.
-/// Returns the number snapshotted for resume.
+///
+/// Two passes, both keyed on the live process, never on a trusted PID:
+///   1. For each DB deployment on this host, snapshot it (if restorable) and
+///      kill the process LISTENING on its port (via [`unload_model`]).
+///   2. Sweep every remaining live inference server detected by `ps`
+///      ([`list_local_processes`]) whose port wasn't already handled, and kill
+///      it by port too. This catches the "paused 0" case observed on sia: a
+///      real llama-server was alive but the DB had no (or a stale) row for it,
+///      so the old DB-only loop freed nothing.
+///
+/// Snapshots restorable deployments (those with a `library_id`) to a state
+/// file for [`resume_local_models`]. No-op on roomy hosts, when RAM is
+/// undetectable, or when nothing is running. Returns the number of processes
+/// stopped (DB-tracked + swept).
+///
+/// Never uses `pkill -f` — every kill goes through the port-resolved path.
 pub async fn pause_local_models_for_build(pool: &sqlx::PgPool) -> Result<usize, String> {
     let total = local_total_ram_gb().unwrap_or(f64::INFINITY);
     if total > FREE_FOR_BUILD_RAM_GB {
@@ -533,10 +550,12 @@ pub async fn pause_local_models_for_build(pool: &sqlx::PgPool) -> Result<usize, 
     let deps = ff_db::pg_list_deployments(pool, Some(&worker))
         .await
         .map_err(|e| format!("pg_list_deployments: {e}"))?;
-    if deps.is_empty() {
-        return Ok(0);
-    }
+
     let mut snapshot: Vec<PausedModel> = Vec::new();
+    let mut handled_ports: std::collections::HashSet<u16> = std::collections::HashSet::new();
+    let mut stopped = 0usize;
+
+    // ── Pass 1: DB-tracked deployments ─────────────────────────────────
     for d in &deps {
         if let Some(lib) = d.library_id.clone() {
             snapshot.push(PausedModel {
@@ -551,8 +570,41 @@ pub async fn pause_local_models_for_build(pool: &sqlx::PgPool) -> Result<usize, 
                 "free-for-build: deployment has no library_id; unloading to free RAM but it won't auto-restore"
             );
         }
-        let _ = unload_model(pool, &d.id).await; // best-effort
+        handled_ports.insert(d.port as u16);
+        let _ = unload_model(pool, &d.id).await; // best-effort; kills by port
+        stopped += 1;
     }
+
+    // ── Pass 2: live servers with no (matching) DB row ─────────────────
+    // The build needs the RAM regardless of whether ForgeFleet tracks the
+    // server. We can't snapshot these for auto-restore (no library_id), but
+    // freeing the RAM is the must-have. resume_local_models is a no-op for
+    // them — they were untracked to begin with.
+    for proc in list_local_processes().await {
+        let Some(port) = proc.port else { continue };
+        if handled_ports.contains(&port) {
+            continue;
+        }
+        handled_ports.insert(port);
+        tracing::warn!(
+            pid = proc.pid,
+            port,
+            runtime = %proc.runtime,
+            model = proc.model_path.as_deref().unwrap_or("-"),
+            "free-for-build: stopping untracked inference server to free RAM (won't auto-restore)"
+        );
+        #[cfg(target_os = "linux")]
+        stop_systemd_unit(port).await;
+        let killed = stop_listener_on_port(port, Some(proc.pid)).await;
+        if !killed.is_empty() {
+            stopped += 1;
+        }
+    }
+
+    if stopped == 0 {
+        return Ok(0);
+    }
+
     let path = paused_models_state_path();
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -560,11 +612,12 @@ pub async fn pause_local_models_for_build(pool: &sqlx::PgPool) -> Result<usize, 
     let json = serde_json::to_string_pretty(&snapshot).map_err(|e| format!("serialize: {e}"))?;
     std::fs::write(&path, json).map_err(|e| format!("write state: {e}"))?;
     tracing::info!(
-        paused = snapshot.len(),
+        stopped,
+        restorable = snapshot.len(),
         total_ram_gb = total,
-        "free-for-build: paused models to free RAM for release build"
+        "free-for-build: stopped inference servers to free RAM for release build"
     );
-    Ok(snapshot.len())
+    Ok(stopped)
 }
 
 /// Reload models paused by [`pause_local_models_for_build`]: read the state
@@ -830,6 +883,199 @@ fn pid_is_alive(pid: u32) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+/// Resolve the PID(s) of the process(es) currently LISTENING on `port`, by
+/// asking the kernel — not by trusting a recorded PID.
+///
+/// Why: the deployment row's `pid` goes stale whenever the server is
+/// restarted out-of-band (systemd `Restart=on-failure` respawns it with a
+/// fresh PID, a manual relaunch, an OOM-kill + supervisor restart, etc.).
+/// Killing the recorded PID then either no-ops (PID gone) or — worse —
+/// kills an unrelated process that has since recycled that PID, while the
+/// real llama-server keeps serving. Observed on sia 2026-05: unload killed
+/// stale PID 1865734 and reported success, but the live llama-server (a
+/// different PID) survived; free-for-build then "paused 0".
+///
+/// Strategy: prefer `ss -ltnp "sport = :PORT"` (Linux iproute2), parse the
+/// `pid=<n>` token. Fall back to `lsof -ti tcp:PORT -sTCP:LISTEN` (macOS and
+/// hosts without ss). Returns deduped PIDs of every listener on that port.
+///
+/// CRITICAL: this is how we avoid `pkill -f <pattern>` self-kills — we only
+/// ever act on numeric PIDs the kernel reports as bound to the port.
+async fn pids_listening_on_port(port: u16) -> Vec<u32> {
+    let mut pids: Vec<u32> = Vec::new();
+
+    // ── Linux: ss ──────────────────────────────────────────────────────
+    // `-l` listening, `-t` tcp, `-n` numeric, `-p` show process. The filter
+    // `sport = :PORT` restricts to our port. Output lines carry a
+    // `users:(("llama-server",pid=12345,fd=7))` field.
+    if let Ok(out) = tokio::process::Command::new("ss")
+        .args(["-ltnp", &format!("sport = :{port}")])
+        .output()
+        .await
+        && out.status.success()
+    {
+        let text = String::from_utf8_lossy(&out.stdout);
+        for cap in text.split("pid=").skip(1) {
+            let digits: String = cap.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(pid) = digits.parse::<u32>()
+                && !pids.contains(&pid)
+            {
+                pids.push(pid);
+            }
+        }
+    }
+
+    // ── Fallback: lsof (macOS, or Linux without iproute2) ───────────────
+    // `-ti` = terse output, PIDs only; restrict to TCP listeners on the port.
+    if pids.is_empty()
+        && let Ok(out) = tokio::process::Command::new("lsof")
+            .args(["-ti", &format!("tcp:{port}"), "-sTCP:LISTEN"])
+            .output()
+            .await
+        && out.status.success()
+    {
+        let text = String::from_utf8_lossy(&out.stdout);
+        for line in text.lines() {
+            if let Ok(pid) = line.trim().parse::<u32>()
+                && !pids.contains(&pid)
+            {
+                pids.push(pid);
+            }
+        }
+    }
+
+    pids
+}
+
+/// Stop whatever is actually LISTENING on `port`: resolve the live PID(s) via
+/// [`pids_listening_on_port`], SIGTERM each (and its process group), wait up
+/// to 10s, then SIGKILL the stragglers. The `fallback_pid` (the recorded
+/// deployment PID) is folded in only as a belt-and-suspenders target so a
+/// process that has already stopped listening but is still winding down still
+/// gets reaped — it is never the SOLE target.
+///
+/// Returns the set of PIDs we signalled (for logging). Empty when nothing was
+/// found on the port and no fallback was supplied.
+///
+/// Never uses `pkill -f` — every signal targets a numeric PID resolved from
+/// the kernel, so this command can never match and kill itself.
+async fn stop_listener_on_port(port: u16, fallback_pid: Option<u32>) -> Vec<u32> {
+    let mut targets = pids_listening_on_port(port).await;
+    if targets.is_empty() {
+        if let Some(fp) = fallback_pid
+            && pid_is_alive(fp)
+        {
+            tracing::warn!(
+                port,
+                fallback_pid = fp,
+                "stop_listener_on_port: nothing listening on port; \
+                 falling back to recorded deployment pid"
+            );
+            targets.push(fp);
+        }
+        if targets.is_empty() {
+            tracing::info!(port, "stop_listener_on_port: no live listener found");
+            return targets;
+        }
+    } else if let Some(fp) = fallback_pid
+        && pid_is_alive(fp)
+        && !targets.contains(&fp)
+    {
+        // Recorded pid differs from the live listener — the row was stale.
+        // Reap it too (it may be a defunct sibling holding RAM), but the
+        // listener PID above is the one that actually matters.
+        tracing::warn!(
+            port,
+            recorded_pid = fp,
+            live_pids = ?targets,
+            "stop_listener_on_port: recorded deployment pid differs from live listener (stale row)"
+        );
+        targets.push(fp);
+    }
+
+    // SIGTERM each target and its process group. We launch each server as a
+    // session leader (setsid in load_model's pre_exec), so its PID == PGID;
+    // `kill -- -<pid>` signals the whole group, catching any helper children.
+    for &pid in &targets {
+        let _ = tokio::process::Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .output()
+            .await;
+        let _ = tokio::process::Command::new("kill")
+            .args(["-TERM", &format!("-{pid}")])
+            .output()
+            .await;
+    }
+
+    // Wait up to 10s for graceful exit.
+    for _ in 0..20 {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        if targets.iter().all(|&p| !pid_is_alive(p)) {
+            break;
+        }
+    }
+
+    // Escalate to SIGKILL on whatever survived.
+    for &pid in &targets {
+        if pid_is_alive(pid) {
+            tracing::warn!(
+                pid,
+                port,
+                "SIGTERM didn't stop process; escalating to SIGKILL"
+            );
+            let _ = tokio::process::Command::new("kill")
+                .args(["-KILL", &pid.to_string()])
+                .output()
+                .await;
+            let _ = tokio::process::Command::new("kill")
+                .args(["-KILL", &format!("-{pid}")])
+                .output()
+                .await;
+        }
+    }
+
+    targets
+}
+
+/// Stop and disable the `llama-<port>.service` systemd user unit (if any)
+/// before we kill the listener on `port`. Without this, the unit's
+/// `Restart=on-failure` would respawn a fresh server the instant our
+/// SIGTERM/SIGKILL lands (a signal counts as a non-clean exit), so the
+/// "unloaded" model would silently come right back with a new PID.
+///
+/// Best-effort: `stop` resolves a respawn race; `disable` keeps it from
+/// coming back on the next daemon-reload/reboot until the next load
+/// rewrites + re-enables the unit. Failures (no systemd, no such unit,
+/// no user session) are logged and ignored.
+#[cfg(target_os = "linux")]
+async fn stop_systemd_unit(port: u16) {
+    use tokio::process::Command as TokCmd;
+    let unit = format!("llama-{port}.service");
+    for verb in ["stop", "disable"] {
+        match TokCmd::new("systemctl")
+            .args(["--user", verb, &unit])
+            .output()
+            .await
+        {
+            Ok(out) if out.status.success() => {
+                tracing::info!(unit = %unit, verb, "model_runtime: systemd unit handled before kill");
+            }
+            Ok(out) => {
+                // Non-fatal: unit may not exist, or there's no user manager.
+                tracing::debug!(
+                    unit = %unit,
+                    verb,
+                    stderr = %String::from_utf8_lossy(&out.stderr),
+                    "model_runtime: systemctl returned non-zero (continuing)"
+                );
+            }
+            Err(e) => {
+                tracing::debug!(unit = %unit, verb, error = %e, "model_runtime: systemctl not available");
+            }
+        }
+    }
 }
 
 /// Write a systemd user unit that mirrors the spawn we're about to run, so
