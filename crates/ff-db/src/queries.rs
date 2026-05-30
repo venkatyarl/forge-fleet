@@ -1547,7 +1547,7 @@ pub async fn pg_get_node(pool: &PgPool, name: &str) -> Result<Option<FleetNodeRo
         gpu_kind: r.get("gpu_kind"),
         gpu_model: r.get("gpu_model"),
         gpu_vram_gb: r.get("gpu_vram_gb"),
-            gpu_total_vram_gb: r.get("gpu_total_vram_gb"),
+        gpu_total_vram_gb: r.get("gpu_total_vram_gb"),
         has_gpu: r.get("has_gpu"),
         computer_ram_gb: r.get("computer_ram_gb"),
         computer_cpu_cores: r.get("computer_cpu_cores"),
