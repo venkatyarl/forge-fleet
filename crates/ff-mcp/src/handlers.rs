@@ -461,7 +461,42 @@ pub async fn fleet_ssh(params: Option<Value>) -> HandlerResult {
     );
 
     let (config, _config_path) = load_config_auto()?;
-    let ssh_node = resolve_ssh_node(&config, params.as_ref(), node_ref)?;
+    let mut ssh_node = resolve_ssh_node(&config, params.as_ref(), node_ref)?;
+
+    // Override the SSH user with the canonical per-node `computers.ssh_user`
+    // from Postgres. fleet.toml frequently omits the username, so the
+    // resolver falls back to `$USER` (venkat on Taylor) — which is wrong for
+    // hosts whose login differs (DGX Sparks, Linux boxes, etc.). The DB is
+    // the source of truth for who to SSH as. An explicit `username` param
+    // still wins; otherwise the DB value is authoritative. Best-effort: if
+    // Postgres is unreachable we keep the resolver's value.
+    let user_override = params
+        .as_ref()
+        .and_then(|p| p.get("username"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    if let Some(u) = user_override {
+        ssh_node.username = u;
+    } else if let Ok(pool) = get_pg_pool(&config).await {
+        let db_user: Option<String> = sqlx::query_scalar(
+            "SELECT COALESCE(NULLIF(c.ssh_user, ''), fw.ssh_user)
+               FROM computers c
+               LEFT JOIN fleet_workers fw ON fw.name = c.name
+              WHERE LOWER(c.name) = LOWER($1) OR c.primary_ip = $1
+              LIMIT 1",
+        )
+        .bind(node_ref)
+        .fetch_optional(&pool)
+        .await
+        .ok()
+        .flatten()
+        .flatten();
+        if let Some(u) = db_user
+            && !u.is_empty()
+        {
+            ssh_node.username = u;
+        }
+    }
 
     let executor = RemoteExecutor::new(timeout_secs, true);
     let result = executor

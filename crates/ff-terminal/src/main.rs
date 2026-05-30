@@ -1295,6 +1295,29 @@ enum FleetCommand {
         #[arg(long)]
         role: Option<String>,
     },
+    /// Run a command synchronously on a fleet computer over SSH.
+    ///
+    /// Resolves the node's ssh_user + best-reachable IP (LAN preferred,
+    /// Tailscale fallback) from Postgres, opens SSH, streams stdout/stderr
+    /// live, and exits with the remote command's exit code. Use `--` to
+    /// pass arbitrary commands (including flags) verbatim:
+    ///
+    ///   ff fleet exec sia -- nvidia-smi --query-gpu=name --format=csv
+    ///
+    /// Unlike `ff fleet upgrade` / the defer queue, this is synchronous —
+    /// you get the output and exit code right now.
+    Exec {
+        /// Computer name (e.g. "sia") or IP.
+        node: String,
+        /// Emit a single JSON object {node, exit_code, stdout, stderr}
+        /// instead of streaming. Captures output rather than streaming it.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+        /// The command (and its arguments) to run on the remote host.
+        /// Everything after `--` is passed through verbatim.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        cmd: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
