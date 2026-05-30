@@ -576,7 +576,11 @@ async fn condition_held_for_duration(
 /// Dispatch an alert via the configured channel and return a status string
 /// for `alert_events.channel_result`. Never returns an error — dispatch
 /// failures are recorded in the status string so they show up in listings.
-async fn dispatch_alert(pg: &PgPool, channel: &str, severity: &str, message: &str) -> String {
+///
+/// `pub` so other leader-gated ticks (e.g. the amcheck integrity guard in
+/// `db_integrity`) can dispatch alerts directly instead of writing
+/// `channel_result='pending'` rows that nothing ever picks up.
+pub async fn dispatch_alert(pg: &PgPool, channel: &str, severity: &str, message: &str) -> String {
     match channel {
         "log" => {
             match severity {

@@ -677,6 +677,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "open_design_corepack_fix",
         sql: schema::SCHEMA_V109_OPEN_DESIGN_COREPACK_FIX,
     },
+    PgMigration {
+        version: 110,
+        name: "amcheck_integrity",
+        sql: schema::SCHEMA_V110_AMCHECK_INTEGRITY,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.

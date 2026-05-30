@@ -2540,6 +2540,20 @@ async fn start_pulse_v2_subsystems(
         Err(e) => warn!(error = %e, "alert evaluator: failed to build PulseReader"),
     }
 
+    // (7b) DB integrity guard — runs `amcheck` over every btree unique index
+    // every 6h on the leader and raises the `db_index_corruption` alert on
+    // corruption. Catches glibc/ICU collation drift (which silently corrupted
+    // indexes on 2026-05-30) automatically. Leader-gated INSIDE the tick on
+    // every fire, so it's safe to start on every daemon. Alert-only — it
+    // never auto-REINDEXes (updates are never auto-applied).
+    info!(
+        node = %worker_name.clone(),
+        "starting subsystem: db integrity guard (amcheck, 6h, leader-gated)"
+    );
+    let amcheck_tick =
+        ff_agent::db_integrity::AmcheckTick::new(pg_pool.clone(), worker_name.clone());
+    handles.push(amcheck_tick.spawn(shutdown_rx.clone()));
+
     // (8) Auto-upgrade hourly tick — runs on every daemon, internally
     // gated on leader + fleet_secrets.auto_upgrade_enabled. Refreshes
     // upstream versions (npm/pypi/github_release/self_built), flips

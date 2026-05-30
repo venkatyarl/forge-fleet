@@ -34,6 +34,7 @@ pub mod commands_extended;
 pub mod compaction;
 pub mod consensus;
 pub mod coverage_guard;
+pub mod db_integrity;
 pub mod deployment_reconciler;
 pub mod disk_sampler;
 pub mod dynamic_loader;
