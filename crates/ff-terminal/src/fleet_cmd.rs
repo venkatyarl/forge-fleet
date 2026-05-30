@@ -2670,6 +2670,123 @@ pub async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
         FleetCommand::Computers { format, os, role } => {
             handle_fleet_computers(format, os, role).await?;
         }
+        FleetCommand::Exec { node, json, cmd } => {
+            handle_fleet_exec(&pool, &node, json, &cmd).await?;
+        }
+    }
+    Ok(())
+}
+
+/// `ff fleet exec <node> [--] <cmd...>` — run a command synchronously over
+/// SSH on a single fleet computer and return its remote exit code.
+///
+/// Node resolution mirrors the revive/task-runner path: the ssh_user,
+/// primary_ip and ssh_port come from the Postgres `computers` table (with a
+/// `fleet_workers` fallback for the ssh_user), and the IP is rewritten to the
+/// best-reachable address via `fleet_info::resolve_best_ip` (LAN preferred,
+/// Tailscale fallback). We never read ~/.ssh/config — user@ip is built from
+/// the DB.
+///
+/// In streaming mode (default) stdout/stderr are inherited so the remote
+/// output appears live in the terminal; the process exits with the remote
+/// exit code. In `--json` mode the output is captured and emitted as a single
+/// `{node, exit_code, stdout, stderr}` object (still exiting with the remote
+/// code so callers can branch on `$?`).
+async fn handle_fleet_exec(
+    pool: &sqlx::PgPool,
+    node: &str,
+    json: bool,
+    cmd: &[String],
+) -> Result<()> {
+    if cmd.is_empty() {
+        anyhow::bail!("no command given — usage: ff fleet exec <node> [--] <cmd...>");
+    }
+
+    // Resolve ssh_user + ip + port from Postgres. Prefer the `computers`
+    // row (canonical hardware identity); fall back to `fleet_workers` for the
+    // ssh_user when computers.ssh_user is null/empty. Match by name or IP.
+    let row: Option<(String, String, String, i32)> = sqlx::query_as(
+        "SELECT c.name,
+                c.primary_ip,
+                COALESCE(NULLIF(c.ssh_user, ''), fw.ssh_user, 'venkat') AS ssh_user,
+                COALESCE(NULLIF(c.ssh_port, 0), fw.ssh_port, 22)        AS ssh_port
+           FROM computers c
+           LEFT JOIN fleet_workers fw ON fw.name = c.name
+          WHERE LOWER(c.name) = LOWER($1) OR c.primary_ip = $1
+          LIMIT 1",
+    )
+    .bind(node)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("query computers: {e}"))?;
+
+    let (name, primary_ip, ssh_user, ssh_port) = match row {
+        Some(r) => r,
+        None => anyhow::bail!(
+            "no computer named (or IP) '{node}' in Postgres. \
+             Run `ff fleet computers` to list known hosts."
+        ),
+    };
+
+    // Rewrite to the best-reachable IP (LAN preferred, Tailscale fallback) —
+    // same helper revive uses so we don't hit a stale LAN address on a
+    // tailscale-only host.
+    let target_ip = match ff_agent::fleet_info::resolve_best_ip(&name).await {
+        Some((ip, _kind)) => ip,
+        None => primary_ip,
+    };
+
+    let user_at_host = format!("{ssh_user}@{target_ip}");
+    let remote_cmd = cmd.join(" ");
+
+    // Build the ssh invocation. BatchMode keeps it non-interactive (no
+    // password prompt hangs); accept-new trusts first-seen host keys the
+    // way the rest of the fleet tooling does.
+    let mut ssh = tokio::process::Command::new("ssh");
+    ssh.arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("StrictHostKeyChecking=accept-new")
+        .arg("-o")
+        .arg("ConnectTimeout=10")
+        .arg("-p")
+        .arg(ssh_port.to_string())
+        .arg(&user_at_host)
+        .arg(&remote_cmd);
+
+    if json {
+        let out = ssh
+            .output()
+            .await
+            .map_err(|e| anyhow::anyhow!("spawn ssh {user_at_host}: {e}"))?;
+        let exit_code = out.status.code().unwrap_or(-1);
+        let payload = serde_json::json!({
+            "node": name,
+            "exit_code": exit_code,
+            "stdout": String::from_utf8_lossy(&out.stdout),
+            "stderr": String::from_utf8_lossy(&out.stderr),
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+        if exit_code != 0 {
+            std::process::exit(exit_code);
+        }
+        return Ok(());
+    }
+
+    eprintln!("{CYAN}▶ ff fleet exec {name} ({user_at_host}):{RESET} {remote_cmd}");
+    // Inherit stdio so stdout/stderr stream live to the terminal.
+    let status = ssh
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status()
+        .await
+        .map_err(|e| anyhow::anyhow!("spawn ssh {user_at_host}: {e}"))?;
+
+    let exit_code = status.code().unwrap_or(-1);
+    if exit_code != 0 {
+        eprintln!("{YELLOW}(remote exit code {exit_code}){RESET}");
+        std::process::exit(exit_code);
     }
     Ok(())
 }
