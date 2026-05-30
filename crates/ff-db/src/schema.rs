@@ -7410,3 +7410,40 @@ UPDATE software_registry SET upgrade_playbook = jsonb_build_object(
      || 'corepack pnpm install --frozen-lockfile'
 ) WHERE id = 'open_design_git';
 "#;
+
+// ─── V110: amcheck integrity guard ──────────────────────────────────────────
+//
+// On 2026-05-30 a glibc/ICU collation upgrade silently corrupted several
+// btree UNIQUE indexes (the on-disk order no longer matched the new
+// collation), which was only discovered by hand. The fix is a leader-gated
+// forgefleetd tick that runs PostgreSQL `amcheck`'s
+// `bt_index_check(..., heapallindexed => true)` over every valid btree
+// UNIQUE index on a 6h schedule and raises a fleet alert on the first sign
+// of corruption.
+//
+// This migration:
+//   1. Installs the `amcheck` contrib extension (ships with
+//      postgresql-contrib; CREATE EXTENSION needs superuser, which our
+//      migration role has on the self-hosted fleet Postgres).
+//   2. Seeds the `db_index_corruption` alert policy (severity=warning,
+//      channel=telegram) the tick fires against. Idempotent via
+//      ON CONFLICT (name) DO NOTHING so operator edits survive re-runs.
+//
+// We deliberately do NOT auto-REINDEX — per the fleet "updates never auto-
+// applied" rule, corruption is alerted on and remediated by a human.
+//
+// The migration runner wraps each migration in ONE transaction;
+// CREATE EXTENSION IF NOT EXISTS is transactional and idempotent.
+pub const SCHEMA_V110_AMCHECK_INTEGRITY: &str = r#"
+CREATE EXTENSION IF NOT EXISTS amcheck;
+
+INSERT INTO alert_policies
+    (name, description, metric, scope, condition,
+     duration_secs, severity, cooldown_secs, channel, enabled)
+VALUES
+  ('db_index_corruption',
+   'PostgreSQL amcheck found >=1 corrupt btree unique index (likely glibc/ICU collation drift)',
+   'db_index_corruption', 'leader_only', '> 0',
+   0, 'warning', 21600, 'telegram', true)
+ON CONFLICT (name) DO NOTHING;
+"#;
