@@ -849,6 +849,176 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
     })
 }
 
+// ─── Fleet Offload ─────────────────────────────────────────────────────────
+//
+// The credit-saver. Lets a cloud orchestrator (Claude Code / Codex / Kimi)
+// hand high-token / low-architectural-subtlety work to a WARM tool-capable
+// local LLM so the cloud model only reviews instead of generating the bulk.
+//
+// v1 = prefer-warm only. It does NOT cold-load or wait for a model (that's
+// v2). The decision is binary:
+//
+//   1. Ask the V111 capability router (`pg_pick_agent_endpoint`) for the best
+//      WARM tool-capable deployment with enough per-slot ctx, excluding no
+//      hosts in v1. This is the SAME scored selector `fleet_route` and the
+//      agent router use — no parallel router.
+//   2. Found → dispatch the task to it over the OpenAI-compatible API, reusing
+//      the same SHARED_HTTP client + `/v1/chat/completions` request shape +
+//      `extract_completion_text` helper that `fleet_run` uses (no parallel LLM
+//      client). Return {offloaded:true, endpoint, model, result, ...}.
+//   3. None warm → {offloaded:false, decision:"do_in_cloud", reason:...} so the
+//      caller proceeds itself.
+
+const OFFLOAD_DEFAULT_MIN_CTX: i32 = 16384;
+const OFFLOAD_DEFAULT_MAX_TOKENS: u32 = 4096;
+const OFFLOAD_MIN_MAX_TOKENS: u32 = 256;
+const OFFLOAD_MAX_MAX_TOKENS: u32 = 8192;
+/// Generous ceiling — local models on memory-tight hosts can be slow on bulk
+/// codegen. Mirrors GatewayLlmExec's per-call timeout.
+const OFFLOAD_TIMEOUT_SECS: u64 = 600;
+
+pub async fn fleet_offload(params: Option<Value>) -> HandlerResult {
+    let task = params
+        .as_ref()
+        .and_then(|p| p.get("task"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "fleet_offload requires 'task'".to_string())?;
+
+    let kind = params
+        .as_ref()
+        .and_then(|p| p.get("kind"))
+        .and_then(|v| v.as_str());
+
+    let min_ctx = params
+        .as_ref()
+        .and_then(|p| p.get("min_ctx"))
+        .and_then(|v| v.as_i64())
+        .map(|v| v as i32)
+        .unwrap_or(OFFLOAD_DEFAULT_MIN_CTX)
+        .max(1);
+
+    // est_output_tokens caps the local model's response budget so a runaway
+    // generation can't stall the call. Clamped to a sane band.
+    let max_tokens = params
+        .as_ref()
+        .and_then(|p| p.get("est_output_tokens"))
+        .and_then(|v| v.as_u64())
+        .map(|v| (v as u32).clamp(OFFLOAD_MIN_MAX_TOKENS, OFFLOAD_MAX_MAX_TOKENS))
+        .unwrap_or(OFFLOAD_DEFAULT_MAX_TOKENS);
+
+    info!(kind = ?kind, min_ctx, max_tokens, "fleet_offload handler called");
+
+    let (config, _config_path) = load_config_auto()?;
+    let pool = get_pg_pool(&config).await?;
+
+    // ── Step 1: find a WARM tool-capable endpoint (V111 capability router).
+    // exclude_hosts is empty in v1 — the orchestrator can keep load off the
+    // leader by loading agent models elsewhere, which the router already
+    // prefers (tier/recency scoring). No parallel router here.
+    let candidate = ff_db::pg_pick_agent_endpoint(&pool, min_ctx, &[])
+        .await
+        .map_err(|e| format!("fleet_offload router query failed: {e}"))?;
+
+    let candidate = match candidate {
+        Some(c) => c,
+        None => {
+            // ── Step 3: nothing warm → tell the caller to do it in cloud.
+            return Ok(json!({
+                "offloaded": false,
+                "decision": "do_in_cloud",
+                "reason": format!(
+                    "no warm tool-capable endpoint (require_tool_calling=true, \
+                     usable_agent_ctx>={min_ctx}). Proceed in cloud; or warm one \
+                     with: ff model load <library_id> --agent"
+                ),
+                "kind": kind,
+                "min_ctx": min_ctx,
+            }));
+        }
+    };
+
+    // ── Step 2: dispatch to the warm local endpoint over the OpenAI-compatible
+    // API — same request shape + parser `fleet_run` uses.
+    let model = candidate
+        .catalog_id
+        .clone()
+        .unwrap_or_else(|| candidate.catalog_name.clone().unwrap_or_default());
+    let url = format!(
+        "{}/v1/chat/completions",
+        candidate.endpoint.trim_end_matches('/')
+    );
+
+    let request = ChatCompletionRequest {
+        model: model.clone(),
+        messages: vec![ChatMessage {
+            role: "user".to_string(),
+            content: Value::String(task.to_string()),
+            name: None,
+            extra: HashMap::new(),
+        }],
+        temperature: None,
+        top_p: None,
+        n: None,
+        stream: Some(false),
+        stop: None,
+        max_tokens: Some(max_tokens),
+        presence_penalty: None,
+        frequency_penalty: None,
+        user: None,
+        extra: HashMap::new(),
+    };
+
+    let started = Instant::now();
+    let client = &*SHARED_HTTP;
+    let response = client
+        .post(&url)
+        .timeout(Duration::from_secs(OFFLOAD_TIMEOUT_SECS))
+        .json(&request)
+        .send()
+        .await
+        .map_err(|e| {
+            format!(
+                "fleet_offload dispatch to {} failed: {e}",
+                candidate.endpoint
+            )
+        })?;
+
+    let latency = started.elapsed();
+    let status = response.status();
+    if !status.is_success() {
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "<failed reading error body>".to_string());
+        return Err(format!(
+            "fleet_offload endpoint {} (model {}) returned HTTP {status}: {body}",
+            candidate.endpoint, model
+        ));
+    }
+
+    let payload: Value = response
+        .json()
+        .await
+        .map_err(|e| format!("fleet_offload: failed parsing endpoint JSON: {e}"))?;
+    let result = extract_completion_text(&payload).unwrap_or_default();
+
+    Ok(json!({
+        "offloaded": true,
+        "decision": "offloaded",
+        "endpoint": candidate.endpoint,
+        "worker_name": candidate.worker_name,
+        "model": model,
+        "tier": candidate.tier,
+        "usable_agent_ctx": candidate.usable_agent_ctx,
+        "kind": kind,
+        "latency_ms": latency.as_millis(),
+        "result": result,
+        "raw_response": payload,
+        "review_hint": "Review this output before using it. If it's wrong or \
+                        the task needed architectural judgment, redo it yourself."
+    }))
+}
+
 // ─── Fleet Cascade ───────────────────────────────────────────────────────────
 //
 // Outcome-aware routing: classifier → strategy → cascade/judge-escalate
@@ -2318,6 +2488,7 @@ pub async fn dispatch(method: &str, params: Option<Value>) -> HandlerResult {
         "fleet_config" => fleet_config(params).await,
         "fleet_ssh" => fleet_ssh(params).await,
         "fleet_run" => fleet_run(params).await,
+        "fleet_offload" => fleet_offload(params).await,
         "fleet_cascade" => fleet_cascade(params).await,
         "fleet_route" => fleet_route(params).await,
         "fleet_scan" => fleet_scan(params).await,

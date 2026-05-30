@@ -56,6 +56,7 @@ mod mcp_cmd;
 mod metrics_cmd;
 mod model_cmd;
 mod model_serve_cmd;
+mod offload_cmd;
 mod onboard_cmd;
 mod openclaw_cmd;
 mod pm_cmd;
@@ -209,6 +210,36 @@ enum Command {
         /// `--backend` != `local`). Repeatable.
         #[arg(long = "backend-args")]
         backend_args: Vec<String>,
+    },
+    /// Credit-saver: offload a heavy, low-architectural-subtlety task to a
+    /// WARM tool-capable local LLM on the fleet (bulk codegen, mechanical
+    /// edits, research, summarization, test/doc gen, data extraction) so
+    /// cloud tokens go to review instead of generation.
+    ///
+    /// Picks the best warm endpoint via the V111 capability router
+    /// (`pg_pick_agent_endpoint` — tool_calling + min_ctx), dispatches over
+    /// the OpenAI-compatible API, and prints which endpoint/model handled it
+    /// plus the result. If no warm tool-capable endpoint exists it prints a
+    /// `do_in_cloud` decision (v1 never cold-loads — that's v2).
+    Offload {
+        /// The self-contained task to offload. Include ALL context the local
+        /// model needs — it does not see your conversation.
+        prompt: String,
+        /// Output format: `text` (default) or `json`.
+        #[arg(long, default_value = "text")]
+        output: String,
+        /// Optional task-shape hint for logging/triage: codegen | edits |
+        /// research | summarize | tests | docs | extract | other.
+        #[arg(long)]
+        kind: Option<String>,
+        /// Estimated output size — caps the local model's max_tokens
+        /// (clamped 256..=8192, default 4096).
+        #[arg(long = "est-output-tokens")]
+        est_output_tokens: Option<u32>,
+        /// Required usable per-slot context on the local endpoint so the task
+        /// + tool-schema prompt fits.
+        #[arg(long = "min-ctx", default_value_t = 16384)]
+        min_ctx: i32,
     },
     /// Run with supervisor — auto-detect failures, fix, and retry
     Supervise {
@@ -2607,6 +2638,22 @@ async fn main() -> Result<()> {
             // needing a per-tool verb.
             cfg.system_prompt = inject_agent_hints(cfg.system_prompt.clone()).await;
             run_headless(&prompt, cfg, &output, oneshot).await
+        }
+        Some(Command::Offload {
+            prompt,
+            output,
+            kind,
+            est_output_tokens,
+            min_ctx,
+        }) => {
+            offload_cmd::handle_offload(
+                &prompt,
+                &output,
+                kind.as_deref(),
+                est_output_tokens,
+                min_ctx,
+            )
+            .await
         }
         Some(Command::Task { command }) => task_cmd::handle_task(command, &config_path).await,
         Some(Command::Secrets { command }) => secrets_cmd::handle_secrets(command).await,
