@@ -14,9 +14,14 @@
 //! - [`wake_word`] — Wake word detection via keyword spotting on transcribed text
 
 pub mod audio;
+/// Native mic capture (cpal) — macOS only; cpal's Linux backend needs ALSA
+/// headers absent on CI/fleet Linux, and voice runs only on the leader (Taylor).
+#[cfg(target_os = "macos")]
+pub mod capture;
 pub mod pipeline;
 pub mod stt;
 pub mod tts;
+pub mod tts_native;
 pub mod twilio;
 pub mod wake_word;
 
@@ -59,6 +64,11 @@ pub type Result<T> = std::result::Result<T, VoiceError>;
 // ─── Re-exports ──────────────────────────────────────────────────────────────
 
 pub use audio::{AudioChunk, AudioFormat, SampleRate};
+#[cfg(target_os = "macos")]
+pub use capture::{
+    CaptureHandle, MicCapture, MicCaptureConfig, TARGET_SAMPLE_RATE, encode_wav_bytes,
+    write_temp_wav,
+};
 pub use pipeline::{
     ConversationTurn, LlmBackend, PipelineEvent, VoicePipeline, VoicePipelineConfig,
 };
@@ -67,6 +77,7 @@ pub use stt::{
     WhisperApiConfig,
 };
 pub use tts::{ElevenLabsClient, ElevenLabsConfig, TtsCache, TtsEngine, VoiceConfig};
+pub use tts_native::SayTts;
 pub use twilio::{TwilioClient, TwilioConfig, TwimlBuilder};
 pub use wake_word::{WakeWordConfig, WakeWordDetector, WakeWordEvent};
 

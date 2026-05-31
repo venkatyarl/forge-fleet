@@ -23,5 +23,14 @@ async-trait.workspace = true
 base64 = "0.22"
 serde_urlencoded = "0.7"
 
+# Native mic capture + WAV writing for the `ff voice` (JARVIS) loop.
+# macOS-only: cpal's Linux backend needs ALSA dev headers (libasound2-dev) that
+# the CI runners / Linux fleet nodes don't have, and the voice loop runs solely
+# on the leader (Taylor, macOS) where the operator sits. The `capture` module is
+# gated to `target_os = "macos"` to match.
+[target.'cfg(target_os = "macos")'.dependencies]
+cpal = "0.16"
+hound = "3.5"
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
