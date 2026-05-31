@@ -286,3 +286,43 @@ pub fn which_on_path(bin: &str) -> Option<String> {
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Backend-name lookup is case-insensitive and resolves to the canonical
+    /// lowercase `name` the conductor's `/backend` handler stores.
+    #[test]
+    fn backend_by_name_is_case_insensitive_and_canonical() {
+        for variant in ["claude", "CLAUDE", "Claude"] {
+            let b = backend_by_name(variant)
+                .unwrap_or_else(|| panic!("{variant:?} should resolve to a backend"));
+            assert_eq!(b.name, "claude", "canonical name for {variant:?}");
+        }
+        // Spot-check the other shipped backends resolve too.
+        assert_eq!(backend_by_name("codex").map(|b| b.name), Some("codex"));
+        assert_eq!(backend_by_name("KIMI").map(|b| b.name), Some("kimi"));
+    }
+
+    /// Unknown names are rejected (`None`) so callers can surface an
+    /// "expected one of …" error.
+    #[test]
+    fn backend_by_name_rejects_unknown() {
+        assert!(backend_by_name("bogus").is_none());
+        assert!(backend_by_name("").is_none());
+    }
+
+    /// `local` is intentionally NOT in `BACKENDS` — it routes through the
+    /// existing agent loop, not this CLI module. The conductor accepts "local"
+    /// via a separate `eq_ignore_ascii_case("local")` branch in its inline
+    /// `/backend` handler (crates/ff-terminal/src/main.rs), so this pure helper
+    /// returns `None` for it. Pinned here so the split-of-responsibility stays
+    /// intentional.
+    #[test]
+    fn local_is_not_a_cli_backend() {
+        assert!(backend_by_name("local").is_none());
+        assert!(backend_by_name("LOCAL").is_none());
+        assert!(!BACKENDS.iter().any(|b| b.name == "local"));
+    }
+}
