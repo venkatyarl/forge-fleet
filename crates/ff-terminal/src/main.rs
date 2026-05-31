@@ -38,6 +38,7 @@ mod agent_cmd;
 mod agents_cmd;
 mod alert_cmd;
 mod brain_cmd;
+mod cli_bridge_cmd;
 mod cloud_llm_cmd;
 mod config_cmd;
 mod daemon_cmd;
@@ -240,6 +241,34 @@ enum Command {
         /// + tool-schema prompt fits.
         #[arg(long = "min-ctx", default_value_t = 16384)]
         min_ctx: i32,
+    },
+    /// Invoke a cloud coding CLI (Claude Code, Codex, Kimi) as a headless
+    /// subprocess so ff / JARVIS can wield the frontier vendor agents
+    /// alongside the local fleet.
+    ///
+    /// Thin one-shot pass-through: resolves the vendor → its binary +
+    /// headless flags, spawns it with the prompt in the chosen directory,
+    /// captures stdout/stderr, and prints the result (text or JSON). The
+    /// vendor CLI handles its own auth (your logged-in Claude Code / Codex /
+    /// Kimi session) — ff never touches secrets here.
+    ///
+    /// Examples:
+    ///   ff cli claude "summarize src/main.rs"
+    ///   ff cli codex "add a unit test for parse_duration" --cwd ~/proj
+    ///   ff cli kimi "explain this repo" --output json --timeout 300
+    Cli {
+        /// Which cloud CLI to invoke: claude | codex | kimi (gemini/grok
+        /// are wired but require their CLI to be installed).
+        vendor: String,
+        /// The prompt to send to the vendor CLI.
+        prompt: String,
+        /// Output format: `text` (default — prints the CLI's stdout) or
+        /// `json` ({vendor, exit_code, output, …}).
+        #[arg(long, default_value = "text")]
+        output: String,
+        /// Kill the CLI after this many seconds (default: 600).
+        #[arg(long)]
+        timeout: Option<u64>,
     },
     /// Run with supervisor — auto-detect failures, fix, and retry
     Supervise {
@@ -2435,6 +2464,24 @@ async fn main() -> Result<()> {
             print_ff_version_long();
             return Ok(());
         }
+        // `ff cli <vendor>` spawns the vendor CLI directly — no fleet LLM
+        // router needed, so handle it here on the fast path. `--cwd` reuses
+        // the global flag; default is the current directory.
+        Some(Command::Cli {
+            vendor,
+            prompt,
+            output,
+            timeout,
+        }) => {
+            return cli_bridge_cmd::handle_cli(
+                vendor.clone(),
+                prompt.clone(),
+                cli.cwd.clone(),
+                output.clone(),
+                *timeout,
+            )
+            .await;
+        }
         Some(Command::Secrets { command }) => {
             return secrets_cmd::handle_secrets(command.clone()).await;
         }
@@ -3528,6 +3575,9 @@ async fn main() -> Result<()> {
             )
             .await
         }
+        // `ff cli` is fully handled on the fast path above (it returns
+        // before reaching here). This arm exists only for exhaustiveness.
+        Some(Command::Cli { .. }) => unreachable!("Command::Cli handled on fast path"),
         None => {
             let prompt_text = cli.prompt.join(" ");
             if !prompt_text.is_empty() {
