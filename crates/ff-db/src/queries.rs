@@ -2764,6 +2764,291 @@ pub async fn pg_latest_demand_snapshot(pool: &PgPool) -> Result<Option<DemandVec
     }))
 }
 
+// ─── Orchestrator P3: adaptive serving-mix autoscaler ───────────────────────
+//
+// The autoscaler compares the P2 demand vector (`pg_latest_demand_snapshot`)
+// against live SUPPLY (healthy agent-capable deployments bucketed code/general)
+// and, on a gap, picks a target host to LOAD a model on (or an idle endpoint to
+// UNLOAD). These helpers are pure consumers of existing tables — no new schema.
+// See `ff_agent::autoscaler` for the control loop + safety gate.
+
+/// How many healthy, agent-capable inference endpoints currently serve each
+/// "kind". A row counts toward `code` when its catalog
+/// `preferred_workloads @> '["code-gen"]'`, else toward `general`. Only
+/// agent-capable rows count: `cat.tool_calling = TRUE` AND the deployment's
+/// `usable_agent_ctx >= min_ctx` (the same floor the agent router enforces, so
+/// the autoscaler's "supply" matches what dispatch can actually use).
+///
+/// `code_endpoints` / `general_endpoints` carry the per-host detail the
+/// placement + unload steps need (worker_name, deployment id, port, idle proxy).
+#[derive(Debug, Clone, Default)]
+pub struct ServingSupply {
+    pub code_count: i64,
+    pub general_count: i64,
+    pub code_endpoints: Vec<ServingEndpoint>,
+    pub general_endpoints: Vec<ServingEndpoint>,
+}
+
+/// One healthy agent-capable endpoint, with the fields the unload step uses to
+/// pick the least-valuable (idle) one to retire.
+#[derive(Debug, Clone)]
+pub struct ServingEndpoint {
+    pub deployment_id: String,
+    pub worker_name: String,
+    pub port: i32,
+    pub catalog_id: Option<String>,
+    pub request_count: i64,
+    /// Seconds since the last health ping (NULL → very old / unknown).
+    pub health_age_sec: Option<i32>,
+}
+
+/// Bucket the healthy agent-capable deployments into code vs general supply.
+pub async fn pg_supplied_slots_by_kind(pool: &PgPool, min_ctx: i32) -> Result<ServingSupply> {
+    let rows = sqlx::query(
+        r#"
+        SELECT d.id              AS id,
+               d.worker_name     AS worker_name,
+               d.port            AS port,
+               d.catalog_id      AS catalog_id,
+               d.request_count   AS request_count,
+               EXTRACT(EPOCH FROM (NOW() - d.last_health_at))::int AS health_age_sec,
+               (cat.preferred_workloads @> '["code-gen"]'::jsonb)  AS is_code
+          FROM fleet_model_deployments d
+          JOIN fleet_model_catalog cat ON cat.id = d.catalog_id
+         WHERE d.health_status = 'healthy'
+           AND d.desired_state = 'active'
+           AND cat.tool_calling = TRUE
+           AND d.usable_agent_ctx IS NOT NULL
+           AND d.usable_agent_ctx >= $1
+        "#,
+    )
+    .bind(min_ctx)
+    .fetch_all(pool)
+    .await?;
+
+    let mut supply = ServingSupply::default();
+    for r in &rows {
+        let id: sqlx::types::Uuid = r.get("id");
+        let ep = ServingEndpoint {
+            deployment_id: id.to_string(),
+            worker_name: r.get("worker_name"),
+            port: r.try_get("port").unwrap_or(0),
+            catalog_id: r.try_get("catalog_id").ok(),
+            request_count: r.try_get("request_count").unwrap_or(0),
+            health_age_sec: r.try_get("health_age_sec").ok(),
+        };
+        if r.try_get::<bool, _>("is_code").unwrap_or(false) {
+            supply.code_count += 1;
+            supply.code_endpoints.push(ep);
+        } else {
+            supply.general_count += 1;
+            supply.general_endpoints.push(ep);
+        }
+    }
+    Ok(supply)
+}
+
+/// A candidate host the autoscaler can place a new model on. One row per online
+/// computer, JOINed with its V114 reservation state, hardware facts, and current
+/// deployment count (the least-loaded tiebreak). `free_ram_gb` is a conservative
+/// estimate: `total_ram_gb` minus the summed size of resident active models on
+/// that host (from `fleet_model_library` via the deployment join) — no reliance
+/// on a possibly-stale metrics row.
+#[derive(Debug, Clone)]
+pub struct PlacementCandidate {
+    pub worker_name: String,
+    pub primary_ip: String,
+    pub os_family: String,
+    pub gpu_kind: Option<String>,
+    pub has_gpu: bool,
+    pub gpu_total_vram_gb: Option<f64>,
+    pub total_ram_gb: Option<i32>,
+    pub reservation_state: String,
+    pub status: String,
+    /// Active deployments currently on this host (load proxy).
+    pub active_deployments: i64,
+    /// GB of resident model weights already loaded on this host.
+    pub resident_model_gb: f64,
+    /// Conservative free RAM after accounting for resident models.
+    pub free_ram_gb: f64,
+}
+
+/// All online computers as placement candidates, with reservation state, current
+/// deployment counts, and resident-model RAM. Caller (the placement scorer in
+/// `ff_agent::autoscaler`) applies hard gates + scoring.
+pub async fn pg_placement_candidates(pool: &PgPool) -> Result<Vec<PlacementCandidate>> {
+    let rows = sqlx::query(
+        r#"
+        WITH resident AS (
+            SELECT d.worker_name,
+                   COUNT(*)                                    AS n_active,
+                   COALESCE(SUM(lib.size_bytes), 0)::float8    AS resident_bytes
+              FROM fleet_model_deployments d
+              LEFT JOIN fleet_model_library lib ON lib.id = d.library_id
+             WHERE d.desired_state = 'active'
+             GROUP BY d.worker_name
+        )
+        SELECT c.name              AS name,
+               c.primary_ip        AS primary_ip,
+               c.os_family         AS os_family,
+               c.gpu_kind          AS gpu_kind,
+               c.has_gpu           AS has_gpu,
+               c.gpu_total_vram_gb AS gpu_total_vram_gb,
+               c.total_ram_gb      AS total_ram_gb,
+               c.reservation_state AS reservation_state,
+               c.status            AS status,
+               COALESCE(r.n_active, 0)        AS active_deployments,
+               COALESCE(r.resident_bytes, 0)  AS resident_bytes
+          FROM computers c
+          LEFT JOIN resident r ON LOWER(r.worker_name) = LOWER(c.name)
+         WHERE c.status = 'online'
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .iter()
+        .map(|r| {
+            let total_ram_gb: Option<i32> = r.try_get("total_ram_gb").ok();
+            let resident_bytes: f64 = r.try_get("resident_bytes").unwrap_or(0.0);
+            let resident_model_gb = resident_bytes / 1e9;
+            let free_ram_gb = (total_ram_gb.unwrap_or(0) as f64) - resident_model_gb;
+            PlacementCandidate {
+                worker_name: r.get("name"),
+                primary_ip: r.try_get("primary_ip").unwrap_or_default(),
+                os_family: r.try_get("os_family").unwrap_or_default(),
+                gpu_kind: r.try_get("gpu_kind").ok(),
+                has_gpu: r.try_get("has_gpu").unwrap_or(false),
+                gpu_total_vram_gb: r.try_get("gpu_total_vram_gb").ok(),
+                total_ram_gb,
+                reservation_state: r
+                    .try_get("reservation_state")
+                    .unwrap_or_else(|_| "available".to_string()),
+                status: r.try_get("status").unwrap_or_default(),
+                active_deployments: r.try_get("active_deployments").unwrap_or(0),
+                resident_model_gb,
+                free_ram_gb,
+            }
+        })
+        .collect())
+}
+
+/// The best library row on a host for a given kind that is NOT already deployed
+/// there — what the autoscaler would `load`. `want_code = true` requires the
+/// catalog `preferred_workloads @> '["code-gen"]'`; either way the model must be
+/// tool-calling. Cheapest tier first (smallest appropriate model), then smallest
+/// on-disk size. Returns `(library_id, catalog_id, runtime, size_gb)`.
+pub async fn pg_loadable_library_for_kind(
+    pool: &PgPool,
+    worker_name: &str,
+    want_code: bool,
+) -> Result<Option<(String, String, String, f64)>> {
+    let row = sqlx::query(
+        r#"
+        SELECT lib.id          AS lib_id,
+               lib.catalog_id  AS catalog_id,
+               lib.runtime     AS runtime,
+               (lib.size_bytes::float8 / 1e9) AS size_gb
+          FROM fleet_model_library lib
+          JOIN fleet_model_catalog cat ON cat.id = lib.catalog_id
+         WHERE lib.worker_name = $1
+           AND cat.tool_calling = TRUE
+           AND ($2 = (cat.preferred_workloads @> '["code-gen"]'::jsonb))
+           AND NOT EXISTS (
+               SELECT 1 FROM fleet_model_deployments d
+                WHERE d.library_id = lib.id
+                  AND d.desired_state = 'active'
+           )
+         ORDER BY cat.tier ASC, lib.size_bytes ASC
+         LIMIT 1
+        "#,
+    )
+    .bind(worker_name)
+    .bind(want_code)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(|r| {
+        let lib_id: sqlx::types::Uuid = r.get("lib_id");
+        (
+            lib_id.to_string(),
+            r.get::<String, _>("catalog_id"),
+            r.get::<String, _>("runtime"),
+            r.try_get::<f64, _>("size_gb").unwrap_or(0.0),
+        )
+    }))
+}
+
+/// Atomically reserve a host for the autoscaler: flip `reservation_state`
+/// `available` → `reserved` via a conditional UPDATE (CAS). Returns `true` only
+/// if THIS call won the reservation. A host already `reserved`/`drained` by
+/// someone else returns `false` and the caller skips it — this is the hard fence
+/// that stops the deploy wave + reconciler from fighting a model swap (V114).
+pub async fn pg_reserve_host(pool: &PgPool, worker_name: &str, reason: &str) -> Result<bool> {
+    let res = sqlx::query(
+        r#"
+        UPDATE computers
+           SET reservation_state = 'reserved',
+               reserved_reason   = $2,
+               reserved_at       = NOW()
+         WHERE LOWER(name) = LOWER($1)
+           AND reservation_state = 'available'
+        "#,
+    )
+    .bind(worker_name)
+    .bind(reason)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+/// Release a host reservation: flip back to `available` (idempotent). Always
+/// safe to call even if the host wasn't reserved by us — used by the
+/// scope-guard unreserve so a crashed pass can't leave a host stuck.
+pub async fn pg_unreserve_host(pool: &PgPool, worker_name: &str) -> Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE computers
+           SET reservation_state = 'available',
+               reserved_reason   = NULL,
+               reserved_at       = NULL
+         WHERE LOWER(name) = LOWER($1)
+        "#,
+    )
+    .bind(worker_name)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Stale-reservation reaper: release any host the autoscaler reserved more than
+/// `ttl_secs` ago and whose `reserved_reason` matches our owner tag. Guards
+/// against a leader crash/failover mid-pass leaving a host stuck `reserved`.
+/// Returns the number of reservations cleared.
+pub async fn pg_reap_stale_reservations(
+    pool: &PgPool,
+    owner_reason: &str,
+    ttl_secs: i64,
+) -> Result<u64> {
+    let res = sqlx::query(
+        r#"
+        UPDATE computers
+           SET reservation_state = 'available',
+               reserved_reason   = NULL,
+               reserved_at       = NULL
+         WHERE reservation_state = 'reserved'
+           AND reserved_reason   = $1
+           AND reserved_at       < NOW() - make_interval(secs => $2)
+        "#,
+    )
+    .bind(owner_reason)
+    .bind(ttl_secs.max(1))
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
 // ─── Fleet agents catalog (V112) ─────────────────────────────────────────────
 //
 // The `fleet_agents` table is the canonical catalog of specialized agents the

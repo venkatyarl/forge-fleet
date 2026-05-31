@@ -1389,6 +1389,25 @@ enum FleetCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// Get or set the adaptive serving-mix autoscaler gate (Orchestrator P3).
+    ///
+    /// The autoscaler tick (in forgefleetd, leader-gated, every 120s) compares
+    /// live demand against the deployed model mix and loads/unloads models to
+    /// match. It is GATED by `fleet_secrets.autoscaler_mode`, default OFF:
+    ///   off      — the tick does nothing (default; safe to deploy).
+    ///   dry-run  — compute + log the plan, but actuate nothing.
+    ///   active   — actuate (reserve → load/unload → unreserve).
+    ///   status   — print the current mode (no change).
+    ///
+    ///   ff fleet autoscaler status
+    ///   ff fleet autoscaler dry-run
+    ///   ff fleet autoscaler active
+    ///   ff fleet autoscaler off
+    Autoscaler {
+        /// One of: off | dry-run | active | status. Omit to print status.
+        #[arg(default_value = "status")]
+        mode: String,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -2037,6 +2056,14 @@ pub enum ModelCommand {
         /// Override context size (default 32768).
         #[arg(long)]
         ctx: Option<u32>,
+        /// Run the autoload on a remote node (resolved from Postgres, dispatched
+        /// via the deferred-task queue). Omit to load on this node.
+        #[arg(long)]
+        node: Option<String>,
+        /// Use the agent-capable serving profile (--parallel 1, ctx >= 32768) so
+        /// a tool-using agent's full context fits on one slot.
+        #[arg(long, default_value_t = false)]
+        agent: bool,
     },
     /// Convert a safetensors library entry to MLX on this Apple Silicon host.
     Convert {

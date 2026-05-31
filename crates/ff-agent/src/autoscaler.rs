@@ -1,0 +1,1000 @@
+//! Orchestrator P3 — adaptive serving-mix autoscaler.
+//!
+//! A leader-gated tick that makes the deployed model mix follow LIVE demand:
+//! when sessions are code-heavy it spins up MORE coder endpoints; when a kind is
+//! oversupplied and its endpoints sit idle it unloads one — using ALL the
+//! computers without OOMing any.
+//!
+//! ## Inputs / outputs (all existing primitives — no new schema)
+//! - DEMAND: `ff_db::pg_latest_demand_snapshot` (the P2 contract) →
+//!   `code_slots_wanted` / `general_slots_wanted`.
+//! - SUPPLY: `ff_db::pg_supplied_slots_by_kind` — healthy, agent-capable
+//!   (`tool_calling` + `usable_agent_ctx >= AGENT_MIN_CTX`) deployments bucketed
+//!   code vs general.
+//! - PLACEMENT: `ff_db::pg_placement_candidates` (RAM/GPU/reservation per host)
+//!   scored by [`score_host`]; the model to load is the cheapest tool-calling
+//!   library row of the wanted kind already ON DISK on the chosen host
+//!   (`ff_db::pg_loadable_library_for_kind`).
+//! - ACTUATE: `model_runtime::load_model`/`unload_model` locally; the
+//!   `ff model autoload --node`/`ff model unload --node` cross-node paths via the
+//!   defer queue / SSH for remote hosts.
+//!
+//! ## SAFETY — three-mode gate (`fleet_secrets.autoscaler_mode`)
+//! Read EVERY tick, exactly like auto-upgrade reads `auto_upgrade_enabled`:
+//! - `off`     (DEFAULT, and the value when the key is missing): the tick does
+//!              NOTHING. Deploying this is harmless.
+//! - `dry-run`: compute the full load/unload plan and `tracing::info!` it, but
+//!              actuate NOTHING.
+//! - `active`:  actuate (reserve → load/unload → unreserve).
+//!
+//! Layered anti-thrash: hysteresis deadband ([`SCALE_MARGIN`]), per-kind min
+//! dwell ([`MIN_DWELL_SECS`]) tracked in-memory across ticks, a fleet-wide cap on
+//! concurrent loads per pass, and a never-unload-the-last-in-use-endpoint
+//! invariant. Conservative by construction: it acts on at most one load and one
+//! unload per pass.
+
+use sqlx::PgPool;
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+use tracing::{debug, info, warn};
+
+use crate::model_runtime::{self, AGENT_MIN_CTX, FREE_FOR_BUILD_RAM_GB, LoadOptions};
+
+/// `fleet_secrets` key holding the three-mode gate. Off / missing = no-op.
+const AUTOSCALER_MODE_KEY: &str = "autoscaler_mode";
+/// Reservation owner tag — distinguishes the autoscaler's reservations from
+/// other actors' so the stale-reservation reaper only clears our own orphans.
+const RESERVE_OWNER: &str = "autoscaler";
+/// Stale-reservation TTL: a host we reserved but never unreserved (crash /
+/// failover mid-pass) is auto-released after this many seconds.
+const RESERVATION_TTL_SECS: i64 = 300;
+
+/// Hysteresis deadband: only act on a kind when |wanted − supplied| ≥ this. A
+/// margin of 1.0 means a fractional fair-share demand of 0.6 never triggers a
+/// load, and we never unload until the surplus is a whole endpoint.
+const SCALE_MARGIN: f64 = 1.0;
+/// Min dwell: don't load AND unload (or repeat the same action on) a given kind
+/// more than once per this many seconds. Tracked in-process across ticks. A
+/// model load takes tens of seconds to minutes, so this comfortably clears.
+const MIN_DWELL_SECS: u64 = 300;
+/// Cap on concurrent LOAD actions emitted per pass (fleet-wide). Conservative:
+/// one stale RAM read can't oversubscribe multiple hosts.
+const MAX_LOADS_PER_PASS: usize = 1;
+/// An endpoint counts as idle (eligible to unload) only if its last health ping
+/// is at least this old OR its request_count is 0 — a weak idle proxy until the
+/// metrics-history signal is wired in.
+const IDLE_HEALTH_AGE_SECS: i32 = 180;
+/// Conservative per-host RAM headroom kept free (OS + ff + build). A load is
+/// rejected if it would push the host past `total_ram_gb − this`.
+const HOST_RAM_RESERVE_GB: f64 = 4.0;
+/// Hosts kept out of autoscale churn (the leader stays free for orchestration —
+/// same convention as the agent router's exclude_hosts).
+const EXCLUDE_HOSTS: &[&str] = &["taylor"];
+
+// Placement scoring weights (see [`score_host`]). Named consts so they're tunable.
+const W_FIT: f64 = 3.0;
+const W_PERF: f64 = 4.0;
+const W_IDLE: f64 = 3.0;
+
+/// The gate's three modes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoscalerMode {
+    Off,
+    DryRun,
+    Active,
+}
+
+impl AutoscalerMode {
+    fn parse(raw: Option<&str>) -> Self {
+        match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+            Some("active") => AutoscalerMode::Active,
+            Some("dry-run") | Some("dry_run") | Some("dryrun") => AutoscalerMode::DryRun,
+            // Off, missing, empty, or any unrecognised value → safe default.
+            _ => AutoscalerMode::Off,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AutoscalerMode::Off => "off",
+            AutoscalerMode::DryRun => "dry-run",
+            AutoscalerMode::Active => "active",
+        }
+    }
+}
+
+/// Read the gate from `fleet_secrets`. DEFAULTS TO OFF when the key is missing or
+/// unparseable — so shipping this subsystem is harmless until an operator opts in.
+async fn read_mode(pg: &PgPool) -> AutoscalerMode {
+    match ff_db::pg_get_secret(pg, AUTOSCALER_MODE_KEY).await {
+        Ok(v) => AutoscalerMode::parse(v.as_deref()),
+        Err(e) => {
+            warn!(error = %e, "autoscaler: failed to read mode secret; treating as off");
+            AutoscalerMode::Off
+        }
+    }
+}
+
+/// A kind we might scale, and which workload tag it maps to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Kind {
+    Code,
+    General,
+}
+
+impl Kind {
+    fn want_code(&self) -> bool {
+        matches!(self, Kind::Code)
+    }
+    fn label(&self) -> &'static str {
+        match self {
+            Kind::Code => "code",
+            Kind::General => "general",
+        }
+    }
+}
+
+/// One planned action — the unit of work emitted per pass.
+#[derive(Debug, Clone)]
+enum Action {
+    Load {
+        kind: Kind,
+        host: String,
+        library_id: String,
+        catalog_id: String,
+        runtime: String,
+        size_gb: f64,
+        score: f64,
+        wanted: f64,
+        supplied: i64,
+    },
+    Unload {
+        kind: Kind,
+        host: String,
+        deployment_id: String,
+        wanted: f64,
+        supplied: i64,
+    },
+}
+
+/// Per-pass summary, for the info! log line.
+#[derive(Debug, Default, Clone)]
+pub struct AutoscaleSummary {
+    pub mode: &'static str,
+    pub code_wanted: f64,
+    pub general_wanted: f64,
+    pub code_supplied: i64,
+    pub general_supplied: i64,
+    pub planned_loads: usize,
+    pub planned_unloads: usize,
+    pub loaded: usize,
+    pub unloaded: usize,
+    pub skipped_dwell: usize,
+    pub no_fit: usize,
+}
+
+/// In-process per-kind dwell tracker. The last time we ACTED on a kind; a kind
+/// can't be acted on again until `MIN_DWELL_SECS` later. Process-local (the
+/// leader owns the tick) — on failover the new leader starts fresh, which is
+/// safe: it just gives the kind one extra dwell window.
+fn dwell_state() -> &'static Mutex<HashMap<&'static str, Instant>> {
+    static STATE: std::sync::OnceLock<Mutex<HashMap<&'static str, Instant>>> =
+        std::sync::OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn dwell_ok(kind: Kind) -> bool {
+    let map = dwell_state().lock().unwrap();
+    match map.get(kind.label()) {
+        Some(last) => last.elapsed() >= Duration::from_secs(MIN_DWELL_SECS),
+        None => true,
+    }
+}
+
+fn dwell_mark(kind: Kind) {
+    dwell_state()
+        .lock()
+        .unwrap()
+        .insert(kind.label(), Instant::now());
+}
+
+/// Whether a host's runtime can serve a model launched with `runtime`. Mirrors
+/// the runtime-choice policy: mlx ⇒ macos only; vllm ⇒ CUDA/GB10 only;
+/// llama.cpp ⇒ anything (CUDA/ROCm/Metal/CPU).
+fn runtime_compatible(host: &ff_db::PlacementCandidate, runtime: &str) -> bool {
+    let gpu = host.gpu_kind.as_deref().unwrap_or("none");
+    match runtime {
+        "mlx" => host.os_family == "macos",
+        "vllm" => matches!(gpu, "nvidia_cuda" | "gb10"),
+        // llama.cpp / ollama / anything else: assume CPU-runnable everywhere.
+        _ => true,
+    }
+}
+
+/// Usable inference RAM pool for a host. Unified-memory (apple_silicon / gb10)
+/// AND AMD ROCm with a tiny discrete VRAM carve-out (GTT-unified, e.g. the
+/// EVO-X2 boxes reporting ~2GB VRAM but 123GB RAM) use the full RAM as the pool.
+/// CPU-only hosts keep more headroom (slower, and other work runs there).
+fn usable_pool_gb(host: &ff_db::PlacementCandidate) -> f64 {
+    let total = host.total_ram_gb.unwrap_or(0) as f64;
+    let gpu = host.gpu_kind.as_deref().unwrap_or("none");
+    let gtt_unified = gpu == "amd_rocm" && host.gpu_total_vram_gb.unwrap_or(0.0) < 8.0;
+    let is_unified = matches!(gpu, "apple_silicon" | "gb10") || gtt_unified;
+    if is_unified {
+        0.75 * total
+    } else if host.has_gpu && matches!(gpu, "nvidia_cuda") {
+        // Discrete dGPU (none in fleet today): bounded by VRAM.
+        host.gpu_total_vram_gb.unwrap_or(total)
+    } else {
+        0.60 * total
+    }
+}
+
+/// Perf tier for the soft score: GPU compute strongly preferred for agent work
+/// (a 30B CPU agent is unusably slow).
+fn perf_tier(host: &ff_db::PlacementCandidate) -> f64 {
+    let gpu = host.gpu_kind.as_deref().unwrap_or("none");
+    match gpu {
+        "gb10" | "nvidia_cuda" => 1.0,
+        "apple_silicon" => 0.9,
+        "amd_rocm" => 0.7,
+        _ => 0.2,
+    }
+}
+
+/// Pure placement scorer: `None` = host ineligible (a HARD GATE failed), else a
+/// soft score where higher is better. The autoscaler picks the max-scoring host.
+///
+/// Hard gates: online; not excluded; reservation_state == 'available'; runtime
+/// compatible; the working set FITS in free RAM (the OOM guard); and a
+/// memory-tight host (≤ FREE_FOR_BUILD_RAM_GB) is never used (kept free for
+/// builds). The soft score prefers healthy remaining headroom (anti-fragmentation),
+/// GPU/unified compute, and least-loaded hosts (multi-session fairness).
+pub fn score_host(
+    host: &ff_db::PlacementCandidate,
+    runtime: &str,
+    working_set_gb: f64,
+) -> Option<f64> {
+    // ---- HARD GATES ----
+    if host.status != "online" {
+        return None;
+    }
+    if EXCLUDE_HOSTS
+        .iter()
+        .any(|h| h.eq_ignore_ascii_case(&host.worker_name))
+    {
+        return None;
+    }
+    if host.reservation_state != "available" {
+        return None; // reserved/drained — someone else owns this host this pass.
+    }
+    if !runtime_compatible(host, runtime) {
+        return None;
+    }
+    let total = host.total_ram_gb.unwrap_or(0) as f64;
+    // Keep memory-tight hosts free for self-built release builds.
+    if total <= FREE_FOR_BUILD_RAM_GB {
+        return None;
+    }
+    let pool = usable_pool_gb(host);
+    // free_after = usable pool minus already-resident models minus the new load.
+    let free_after = pool - host.resident_model_gb - working_set_gb;
+    if free_after < HOST_RAM_RESERVE_GB {
+        return None; // THE OOM GUARD: would not fit with headroom.
+    }
+
+    // ---- SOFT SCORE ----
+    let fit_quality = if pool > 0.0 {
+        (free_after / pool).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    // Least-loaded: normalize active deployment count (cap at 6 for the curve).
+    let load_norm = (host.active_deployments as f64 / 6.0).clamp(0.0, 1.0);
+    let score = W_FIT * fit_quality + W_PERF * perf_tier(host) + W_IDLE * (1.0 - load_norm);
+    Some(score)
+}
+
+/// Estimate the working-set RAM for an agent-profile load: weights × 1.15 (loader
+/// overhead) + a conservative KV-cache term for the single 32K agent slot.
+/// Over-estimation is safe; under-estimation re-introduces the OOM this guards.
+fn agent_working_set_gb(size_gb: f64) -> f64 {
+    // KV ≈ 0.5GB per 8K of single-slot ctx → ~2GB for the 32K agent slot.
+    let kv = (AGENT_MIN_CTX as f64 / 8192.0) * 0.5;
+    size_gb * 1.15 + kv
+}
+
+/// Compute the plan for one pass: at most one LOAD and one UNLOAD action.
+/// Pure decision logic given the demand + supply + candidate snapshot — does NOT
+/// actuate. Returns the actions plus the summary skeleton (numbers filled in).
+async fn plan_pass(pg: &PgPool) -> Result<(Vec<Action>, AutoscaleSummary), String> {
+    let demand = ff_db::pg_latest_demand_snapshot(pg)
+        .await
+        .map_err(|e| format!("pg_latest_demand_snapshot: {e}"))?;
+    let (code_wanted, general_wanted) = match demand {
+        Some(d) => (d.code_slots_wanted, d.general_slots_wanted),
+        // No snapshot yet (P2 not producing) → no demand signal → do nothing.
+        None => (0.0, 0.0),
+    };
+
+    let supply = ff_db::pg_supplied_slots_by_kind(pg, AGENT_MIN_CTX as i32)
+        .await
+        .map_err(|e| format!("pg_supplied_slots_by_kind: {e}"))?;
+
+    let mut summary = AutoscaleSummary {
+        code_wanted,
+        general_wanted,
+        code_supplied: supply.code_count,
+        general_supplied: supply.general_count,
+        ..Default::default()
+    };
+
+    let mut actions: Vec<Action> = Vec::new();
+
+    // Evaluate both kinds; collect deficits (scale-up) and surpluses (scale-down).
+    // Plan at most one load (the most-starved kind) and one unload per pass.
+    let kinds = [
+        (
+            Kind::Code,
+            code_wanted,
+            supply.code_count,
+            &supply.code_endpoints,
+        ),
+        (
+            Kind::General,
+            general_wanted,
+            supply.general_count,
+            &supply.general_endpoints,
+        ),
+    ];
+
+    // ---- SCALE-UP: pick the single most-starved kind past the deadband ----
+    let mut best_up: Option<(Kind, f64, i64, f64)> = None; // (kind, wanted, supplied, deficit)
+    for (kind, wanted, supplied, _eps) in kinds.iter() {
+        let deficit = wanted - (*supplied as f64);
+        if deficit >= SCALE_MARGIN {
+            if !dwell_ok(*kind) {
+                summary.skipped_dwell += 1;
+                continue;
+            }
+            if best_up.map(|(_, _, _, d)| deficit > d).unwrap_or(true) {
+                best_up = Some((*kind, *wanted, *supplied, deficit));
+            }
+        }
+    }
+
+    if let Some((kind, wanted, supplied, _deficit)) = best_up {
+        if actions
+            .iter()
+            .filter(|a| matches!(a, Action::Load { .. }))
+            .count()
+            < MAX_LOADS_PER_PASS
+            && let Some(act) = plan_load(pg, kind, wanted, supplied).await?
+        {
+            actions.push(act);
+        } else {
+            summary.no_fit += 1;
+        }
+    }
+
+    // ---- SCALE-DOWN: oversupplied kind whose surplus endpoints are idle ----
+    // Never unload below max(1, wanted): we keep the last in-use endpoint of any
+    // kind that has demand. Evaluate against the live supply (one unload/pass so
+    // there's no in-pass double-decrement to track here).
+    for (kind, wanted, supplied, eps) in kinds.iter() {
+        let surplus = (*supplied as f64) - wanted;
+        if surplus < SCALE_MARGIN {
+            continue;
+        }
+        // Floor on how many endpoints of this kind must remain.
+        let floor = (wanted.ceil() as i64).max(1);
+        if *supplied <= floor {
+            continue; // never drop the last in-use / wanted endpoint.
+        }
+        if !dwell_ok(*kind) {
+            summary.skipped_dwell += 1;
+            continue;
+        }
+        // Pick an IDLE endpoint to retire (oldest health ping / zero requests),
+        // and never one on an excluded host.
+        let victim = eps
+            .iter()
+            .filter(|e| {
+                !EXCLUDE_HOSTS
+                    .iter()
+                    .any(|h| h.eq_ignore_ascii_case(&e.worker_name))
+            })
+            .filter(|e| {
+                e.request_count == 0 || e.health_age_sec.unwrap_or(i32::MAX) >= IDLE_HEALTH_AGE_SECS
+            })
+            .max_by_key(|e| e.health_age_sec.unwrap_or(i32::MAX));
+        if let Some(v) = victim {
+            actions.push(Action::Unload {
+                kind: *kind,
+                host: v.worker_name.clone(),
+                deployment_id: v.deployment_id.clone(),
+                wanted: *wanted,
+                supplied: *supplied,
+            });
+            break; // one unload per pass.
+        }
+    }
+
+    summary.planned_loads = actions
+        .iter()
+        .filter(|a| matches!(a, Action::Load { .. }))
+        .count();
+    summary.planned_unloads = actions
+        .iter()
+        .filter(|a| matches!(a, Action::Unload { .. }))
+        .count();
+
+    Ok((actions, summary))
+}
+
+/// Build a single LOAD action for `kind`: score every candidate host, pick the
+/// best one that ALSO has a loadable on-disk library row for the kind. Returns
+/// `None` (no-fit) when no host both scores and has the model on disk.
+async fn plan_load(
+    pg: &PgPool,
+    kind: Kind,
+    wanted: f64,
+    supplied: i64,
+) -> Result<Option<Action>, String> {
+    let candidates = ff_db::pg_placement_candidates(pg)
+        .await
+        .map_err(|e| format!("pg_placement_candidates: {e}"))?;
+
+    // Best (score, host, library) over all candidates. We need the model on disk,
+    // so we resolve the library per host and score with its real size.
+    let mut best: Option<Action> = None;
+    let mut best_score = f64::NEG_INFINITY;
+
+    for host in &candidates {
+        // Resolve the cheapest loadable on-disk library row of this kind here.
+        let lib = ff_db::pg_loadable_library_for_kind(pg, &host.worker_name, kind.want_code())
+            .await
+            .map_err(|e| format!("pg_loadable_library_for_kind({}): {e}", host.worker_name))?;
+        let Some((library_id, catalog_id, runtime, size_gb)) = lib else {
+            continue; // model for this kind not on disk here.
+        };
+        let working_set = agent_working_set_gb(size_gb);
+        let Some(score) = score_host(host, &runtime, working_set) else {
+            continue; // a hard gate failed (OOM, runtime, reserved, …).
+        };
+        if score > best_score {
+            best_score = score;
+            best = Some(Action::Load {
+                kind,
+                host: host.worker_name.clone(),
+                library_id,
+                catalog_id,
+                runtime,
+                size_gb,
+                score,
+                wanted,
+                supplied,
+            });
+        }
+    }
+
+    Ok(best)
+}
+
+/// Actuate one action in `active` mode: reserve → act → unreserve. The unreserve
+/// always runs (even on failure) so a host can't be left stuck reserved.
+async fn actuate(pg: &PgPool, action: &Action) -> Result<bool, String> {
+    match action {
+        Action::Load {
+            host,
+            library_id,
+            catalog_id,
+            runtime,
+            ..
+        } => {
+            if !ff_db::pg_reserve_host(pg, host, RESERVE_OWNER)
+                .await
+                .map_err(|e| format!("pg_reserve_host({host}): {e}"))?
+            {
+                debug!(host = %host, "autoscaler: host not available to reserve; skipping load");
+                return Ok(false);
+            }
+            let result = do_load(pg, host, runtime, library_id, catalog_id).await;
+            // Always unreserve.
+            if let Err(e) = ff_db::pg_unreserve_host(pg, host).await {
+                warn!(host = %host, error = %e, "autoscaler: failed to unreserve host after load");
+            }
+            result
+        }
+        Action::Unload {
+            host,
+            deployment_id,
+            ..
+        } => {
+            if !ff_db::pg_reserve_host(pg, host, RESERVE_OWNER)
+                .await
+                .map_err(|e| format!("pg_reserve_host({host}): {e}"))?
+            {
+                debug!(host = %host, "autoscaler: host not available to reserve; skipping unload");
+                return Ok(false);
+            }
+            let result = do_unload(pg, host, deployment_id).await;
+            if let Err(e) = ff_db::pg_unreserve_host(pg, host).await {
+                warn!(host = %host, error = %e, "autoscaler: failed to unreserve host after unload");
+            }
+            result
+        }
+    }
+}
+
+/// Perform a LOAD: locally via `model_runtime::load_model` when the host is this
+/// (leader) node, else dispatch `ff model autoload <catalog_id> --node <host>`
+/// via the defer queue (the same cross-node pattern as download-batch).
+async fn do_load(
+    pg: &PgPool,
+    host: &str,
+    runtime: &str,
+    library_id: &str,
+    catalog_id: &str,
+) -> Result<bool, String> {
+    let this = crate::fleet_info::resolve_this_worker_name().await;
+    if host.eq_ignore_ascii_case(&this) {
+        let port = crate::ports_registry::pick_llm_port(pg, host, runtime)
+            .await
+            .map(|p| p as u16)
+            .unwrap_or(55000);
+        model_runtime::load_model(
+            pg,
+            LoadOptions {
+                library_id: library_id.to_string(),
+                port,
+                context_size: None,
+                parallel: None,
+                agent_profile: true, // agent-capable serving profile.
+            },
+        )
+        .await
+        .map(|res| {
+            info!(host = %host, port = res.port, deployment = %res.deployment_id, "autoscaler: loaded model locally");
+            true
+        })
+    } else {
+        // Cross-node: enqueue an `ff model autoload --node` defer-shell task.
+        let command = format!(
+            "~/.local/bin/ff model autoload {} --node {} --agent",
+            shell_quote(catalog_id),
+            shell_quote(host)
+        );
+        let payload = serde_json::json!({ "command": command });
+        let trigger_spec = serde_json::json!({});
+        let title = format!("autoscaler: autoload {catalog_id} on {host}");
+        ff_db::pg_enqueue_deferred(
+            pg,
+            &title,
+            "shell",
+            &payload,
+            "now",
+            &trigger_spec,
+            Some(host),
+            &serde_json::json!([]),
+            Some(RESERVE_OWNER),
+            Some(3),
+        )
+        .await
+        .map(|defer_id| {
+            info!(host = %host, %catalog_id, %defer_id, "autoscaler: enqueued cross-node load");
+            true
+        })
+        .map_err(|e| format!("pg_enqueue_deferred(load on {host}): {e}"))
+    }
+}
+
+/// Perform an UNLOAD: locally via `model_runtime::unload_model` when the host is
+/// this node, else `ff model unload <deployment_id> --node <host>` over SSH.
+async fn do_unload(pg: &PgPool, host: &str, deployment_id: &str) -> Result<bool, String> {
+    let this = crate::fleet_info::resolve_this_worker_name().await;
+    if host.eq_ignore_ascii_case(&this) {
+        model_runtime::unload_model(pg, deployment_id).await.map(|_| {
+            info!(host = %host, deployment = %deployment_id, "autoscaler: unloaded model locally");
+            true
+        })
+    } else {
+        let node = ff_db::pg_get_node(pg, host)
+            .await
+            .map_err(|e| format!("pg_get_node({host}): {e}"))?
+            .ok_or_else(|| format!("node '{host}' not in fleet_workers"))?;
+        let remote_cmd = format!(
+            "~/.local/bin/ff model unload {}",
+            shell_quote(deployment_id)
+        );
+        let (code, _out, err) =
+            crate::model_transfer::ssh_exec(&node.ssh_user, &node.ip, &remote_cmd)
+                .await
+                .map_err(|e| format!("ssh {host}: {e}"))?;
+        if code != 0 {
+            return Err(format!(
+                "remote unload on {host} exited {code}: {}",
+                err.trim()
+            ));
+        }
+        info!(host = %host, deployment = %deployment_id, "autoscaler: unloaded model cross-node");
+        Ok(true)
+    }
+}
+
+/// Minimal single-quote shell escaping for the defer-shell / SSH command we build.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// One autoscaler pass. Reads the gate; off = no-op. Plans the load/unload, logs
+/// the decision, and (only in `active`) actuates. Returns the pass summary.
+pub async fn autoscale_pass(pg: &PgPool) -> Result<AutoscaleSummary, String> {
+    let mode = read_mode(pg).await;
+    if mode == AutoscalerMode::Off {
+        debug!("autoscaler: mode=off (no-op)");
+        return Ok(AutoscaleSummary {
+            mode: "off",
+            ..Default::default()
+        });
+    }
+
+    // Clear any reservations we orphaned on a prior crash/failover before planning.
+    if let Err(e) = ff_db::pg_reap_stale_reservations(pg, RESERVE_OWNER, RESERVATION_TTL_SECS).await
+    {
+        warn!(error = %e, "autoscaler: stale-reservation reaper failed");
+    }
+
+    let (actions, mut summary) = plan_pass(pg).await?;
+    summary.mode = mode.as_str();
+
+    // Always log the decision with the demand/supply numbers + the plan.
+    for action in &actions {
+        match action {
+            Action::Load {
+                kind,
+                host,
+                catalog_id,
+                size_gb,
+                score,
+                wanted,
+                supplied,
+                ..
+            } => {
+                info!(
+                    kind = kind.label(),
+                    %host,
+                    %catalog_id,
+                    size_gb = format!("{size_gb:.1}"),
+                    score = format!("{score:.2}"),
+                    wanted = format!("{wanted:.2}"),
+                    supplied,
+                    mode = mode.as_str(),
+                    "autoscaler PLAN: would load {} on {} because {} demand={:.2} supply={}",
+                    catalog_id, host, kind.label(), wanted, supplied
+                );
+            }
+            Action::Unload {
+                kind,
+                host,
+                deployment_id,
+                wanted,
+                supplied,
+            } => {
+                info!(
+                    kind = kind.label(),
+                    %host,
+                    %deployment_id,
+                    wanted = format!("{wanted:.2}"),
+                    supplied,
+                    mode = mode.as_str(),
+                    "autoscaler PLAN: would unload {} on {} because {} oversupplied demand={:.2} supply={}",
+                    deployment_id, host, kind.label(), wanted, supplied
+                );
+            }
+        }
+    }
+
+    // dry-run: stop here — actuate nothing.
+    if mode == AutoscalerMode::DryRun {
+        return Ok(summary);
+    }
+
+    // active: actuate.
+    for action in &actions {
+        match actuate(pg, action).await {
+            Ok(true) => match action {
+                Action::Load { kind, .. } => {
+                    summary.loaded += 1;
+                    dwell_mark(*kind);
+                }
+                Action::Unload { kind, .. } => {
+                    summary.unloaded += 1;
+                    dwell_mark(*kind);
+                }
+            },
+            Ok(false) => { /* reservation lost — host owned by someone else this pass */ }
+            Err(e) => warn!(error = %e, "autoscaler: action failed"),
+        }
+    }
+
+    Ok(summary)
+}
+
+/// Spawn the leader-gated autoscaler loop. The leader gate is read from Postgres
+/// `fleet_leader_state` EXACTLY like
+/// [`crate::demand_sensor::spawn_demand_tick`] /
+/// [`crate::scheduler_tick::spawn_scheduler_tick`] — the serving mix is global
+/// state, so only the leader plans/actuates (no N-way races). On failover the
+/// new leader's forgefleetd picks the tick up automatically.
+pub fn spawn_autoscaler_tick(
+    pg: PgPool,
+    worker_name: String,
+    interval_secs: u64,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
+        // Skip the immediate fire so pulse/election settle first.
+        ticker.tick().await;
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    let is_leader: bool = sqlx::query_scalar(
+                        r#"
+                        SELECT EXISTS (
+                            SELECT 1 FROM fleet_leader_state
+                            WHERE leader_name = $1
+                              AND last_heartbeat > NOW() - INTERVAL '60 seconds'
+                        )
+                        "#
+                    )
+                    .bind(&worker_name)
+                    .fetch_one(&pg)
+                    .await
+                    .unwrap_or(false);
+
+                    if !is_leader {
+                        continue;
+                    }
+
+                    match autoscale_pass(&pg).await {
+                        Ok(s) => {
+                            // Always emit a one-line decision summary on the leader.
+                            info!(
+                                mode = s.mode,
+                                code_wanted = format!("{:.2}", s.code_wanted),
+                                code_supplied = s.code_supplied,
+                                general_wanted = format!("{:.2}", s.general_wanted),
+                                general_supplied = s.general_supplied,
+                                planned_loads = s.planned_loads,
+                                planned_unloads = s.planned_unloads,
+                                loaded = s.loaded,
+                                unloaded = s.unloaded,
+                                skipped_dwell = s.skipped_dwell,
+                                no_fit = s.no_fit,
+                                "autoscaler pass"
+                            );
+                        }
+                        Err(e) => warn!(error = %e, "autoscaler tick failed"),
+                    }
+                }
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+            }
+        }
+        info!("autoscaler tick loop stopped");
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn host(
+        name: &str,
+        status: &str,
+        os: &str,
+        gpu: &str,
+        vram: Option<f64>,
+        ram: i32,
+        resident: f64,
+        reservation: &str,
+        active: i64,
+    ) -> ff_db::PlacementCandidate {
+        ff_db::PlacementCandidate {
+            worker_name: name.into(),
+            primary_ip: "10.0.0.1".into(),
+            os_family: os.into(),
+            gpu_kind: Some(gpu.into()),
+            has_gpu: gpu != "none",
+            gpu_total_vram_gb: vram,
+            total_ram_gb: Some(ram),
+            reservation_state: reservation.into(),
+            status: status.into(),
+            active_deployments: active,
+            resident_model_gb: resident,
+            free_ram_gb: ram as f64 - resident,
+        }
+    }
+
+    #[test]
+    fn mode_parsing_defaults_off() {
+        assert_eq!(AutoscalerMode::parse(None), AutoscalerMode::Off);
+        assert_eq!(AutoscalerMode::parse(Some("")), AutoscalerMode::Off);
+        assert_eq!(AutoscalerMode::parse(Some("garbage")), AutoscalerMode::Off);
+        assert_eq!(AutoscalerMode::parse(Some("off")), AutoscalerMode::Off);
+        assert_eq!(
+            AutoscalerMode::parse(Some("dry-run")),
+            AutoscalerMode::DryRun
+        );
+        assert_eq!(
+            AutoscalerMode::parse(Some("DRY_RUN")),
+            AutoscalerMode::DryRun
+        );
+        assert_eq!(
+            AutoscalerMode::parse(Some(" active ")),
+            AutoscalerMode::Active
+        );
+    }
+
+    #[test]
+    fn oom_guard_rejects_when_no_headroom() {
+        // 31GB host already serving a 20GB model; a 20GB working set won't fit.
+        let h = host(
+            "marcus",
+            "online",
+            "linux-ubuntu",
+            "amd_rocm",
+            Some(2.1),
+            31,
+            20.0,
+            "available",
+            1,
+        );
+        assert_eq!(score_host(&h, "llama.cpp", 20.0), None);
+    }
+
+    #[test]
+    fn memory_tight_host_is_never_used() {
+        // 16GB host — at/under the build-free threshold — is gated out entirely.
+        let h = host(
+            "ace",
+            "online",
+            "macos",
+            "apple_silicon",
+            None,
+            16,
+            0.0,
+            "available",
+            0,
+        );
+        assert_eq!(score_host(&h, "mlx", 5.0), None);
+    }
+
+    #[test]
+    fn reserved_or_drained_host_is_ineligible() {
+        let h = host(
+            "sophie",
+            "online",
+            "linux-ubuntu",
+            "amd_rocm",
+            Some(2.1),
+            96,
+            0.0,
+            "reserved",
+            0,
+        );
+        assert_eq!(score_host(&h, "llama.cpp", 20.0), None);
+        let h2 = host(
+            "sophie",
+            "online",
+            "linux-ubuntu",
+            "amd_rocm",
+            Some(2.1),
+            96,
+            0.0,
+            "drained",
+            0,
+        );
+        assert_eq!(score_host(&h2, "llama.cpp", 20.0), None);
+    }
+
+    #[test]
+    fn excluded_leader_is_ineligible() {
+        let h = host(
+            "taylor",
+            "online",
+            "macos",
+            "apple_silicon",
+            None,
+            96,
+            0.0,
+            "available",
+            0,
+        );
+        assert_eq!(score_host(&h, "mlx", 20.0), None);
+    }
+
+    #[test]
+    fn amd_rocm_gtt_unified_uses_full_ram_pool() {
+        // EVO-X2: 123GB RAM but only 2.1GB discrete VRAM → GTT-unified, the whole
+        // RAM is the pool, so a 20GB model fits (would be rejected if scored on
+        // the 2.1GB discrete number).
+        let h = host(
+            "logan",
+            "online",
+            "linux-ubuntu",
+            "amd_rocm",
+            Some(2.1),
+            123,
+            0.0,
+            "available",
+            0,
+        );
+        assert!(score_host(&h, "llama.cpp", 25.0).is_some());
+    }
+
+    #[test]
+    fn runtime_mismatch_is_ineligible() {
+        // mlx model can't run on a Linux host.
+        let linux = host(
+            "sophie",
+            "online",
+            "linux-ubuntu",
+            "amd_rocm",
+            Some(2.1),
+            96,
+            0.0,
+            "available",
+            0,
+        );
+        assert_eq!(score_host(&linux, "mlx", 10.0), None);
+        // vllm needs CUDA/GB10; an apple_silicon host is ineligible.
+        let mac = host(
+            "james",
+            "online",
+            "macos",
+            "apple_silicon",
+            None,
+            63,
+            0.0,
+            "available",
+            0,
+        );
+        assert_eq!(score_host(&mac, "vllm", 10.0), None);
+    }
+
+    #[test]
+    fn least_loaded_host_scores_higher() {
+        let idle = host(
+            "sophie",
+            "online",
+            "linux-ubuntu",
+            "amd_rocm",
+            Some(2.1),
+            96,
+            0.0,
+            "available",
+            0,
+        );
+        let busy = host(
+            "priya",
+            "online",
+            "linux-ubuntu",
+            "amd_rocm",
+            Some(2.1),
+            96,
+            0.0,
+            "available",
+            5,
+        );
+        let s_idle = score_host(&idle, "llama.cpp", 20.0).unwrap();
+        let s_busy = score_host(&busy, "llama.cpp", 20.0).unwrap();
+        assert!(s_idle > s_busy, "idle {s_idle} should beat busy {s_busy}");
+    }
+}

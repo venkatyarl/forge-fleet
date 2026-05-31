@@ -2681,6 +2681,59 @@ pub async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
         } => {
             handle_fleet_deploy(&pool, all, node, concurrency, json).await?;
         }
+        FleetCommand::Autoscaler { mode } => {
+            handle_fleet_autoscaler(&pool, &mode).await?;
+        }
+    }
+    Ok(())
+}
+
+/// `ff fleet autoscaler <off|dry-run|active|status>` — read or set the P3
+/// adaptive serving-mix autoscaler gate stored in `fleet_secrets.autoscaler_mode`.
+/// `status` (the default) just prints the current value; the other three set it.
+/// Default when the key is missing is `off` (the tick is a no-op).
+async fn handle_fleet_autoscaler(pool: &sqlx::PgPool, mode: &str) -> Result<()> {
+    const KEY: &str = "autoscaler_mode";
+    let normalized = mode.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "status" => {
+            let current = ff_db::pg_get_secret(pool, KEY)
+                .await?
+                .unwrap_or_else(|| "off".to_string());
+            println!("autoscaler_mode = {current}");
+            if current == "off" {
+                println!(
+                    "  (the P3 autoscaler tick is a no-op; set 'dry-run' to observe, 'active' to actuate)"
+                );
+            }
+        }
+        "off" | "dry-run" | "active" => {
+            let who = whoami_tag();
+            ff_db::pg_set_secret(
+                pool,
+                KEY,
+                &normalized,
+                Some("Orchestrator P3 adaptive serving-mix autoscaler gate (off|dry-run|active)"),
+                Some(&who),
+            )
+            .await?;
+            println!("{CYAN}▶ autoscaler_mode set to '{normalized}'{RESET}");
+            match normalized.as_str() {
+                "off" => println!("  the autoscaler tick will do nothing."),
+                "dry-run" => {
+                    println!("  the autoscaler will compute + log its plan but actuate nothing.")
+                }
+                "active" => println!(
+                    "  the autoscaler will load/unload models to follow demand. Watch forgefleetd logs."
+                ),
+                _ => {}
+            }
+        }
+        other => {
+            anyhow::bail!(
+                "unknown autoscaler mode '{other}' — expected one of: off | dry-run | active | status"
+            );
+        }
     }
     Ok(())
 }
