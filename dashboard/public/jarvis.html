@@ -204,7 +204,9 @@ let voice=null;function pv(){const vs=speechSynthesis.getVoices();voice=vs.find(
 speechSynthesis.onvoiceschanged=pv;pv();
 function say(txt){transcript.innerHTML='<span class="j">'+txt+'</span>';const u=new SpeechSynthesisUtterance(txt);
   if(voice)u.voice=voice;u.rate=1.0;u.pitch=.9;speechSynthesis.cancel();speechSynthesis.speak(u);}
-function respond(q){const s=q.toLowerCase();
+// Canned/local fallback — used when /api/jarvis/ask is unreachable (e.g. the
+// :8472 prototype server with no gateway). Keeps the HUD demoable offline.
+function respondLocal(q){const s=q.toLowerCase();
   if(/status|systems|report|how are/.test(s)){showSection('systems',15,'NODES ONLINE');return "All systems nominal, sir. Fifteen nodes online, offload warm on Marcus, schema at version one-fourteen.";}
   if(/fleet|computers|nodes|machines/.test(s)){showSection('fleet',15,'NODES');return "The fleet stands at fifteen: Taylor leads, three Macs, four AMD Strix nodes, and four DGX Sparks. All converged.";}
   if(/offload|credit|token|save/.test(s)){showSection('offload',0,'CLOUD TOKENS');return "Offload is warm on Marcus's coder. Code tasks run locally — zero cloud tokens spent today, sir.";}
@@ -212,10 +214,53 @@ function respond(q){const s=q.toLowerCase();
   if(/hello|hi |hey|good (morning|evening|night)|jarvis|you there/.test(s)){return "I'm here, sir. At your service.";}
   if(/thank|cheers|nice|good job|well done/.test(s)){return "A pleasure, sir.";}
   return "Understood, sir. Routing that to the fleet — full voice command execution is being wired in as we speak.";}
+
+// Update the relevant section card from a /api/jarvis/ask `data` payload so the
+// HUD shows the same live numbers JARVIS just spoke.
+function applyAskData(kind,data){
+  if(!data) return;
+  if(kind==='status'||kind==='fleet'){
+    const on=data.online_count??0, tot=data.total_nodes??on;
+    showSection(kind==='fleet'?'fleet':'systems', on, 'NODES ONLINE');
+    const cf=document.getElementById('c-fleet');
+    if(cf)cf.textContent=on+' online · '+(data.leader||'—')+' leads';
+  }
+  if(kind==='status'||kind==='tasks'){
+    if(data.active_tasks!=null||data.active_count!=null){
+      const n=data.active_count??data.active_tasks??0;
+      showSection('tasks', n, 'ACTIVE BUILDS');
+      const ct=document.getElementById('c-tasks');
+      if(ct)ct.textContent=n+' active'+(data.top_name?' · '+String(data.top_name).slice(0,22):'');
+    }
+  }
+  if(kind==='offload'){
+    showSection('offload', 0, 'CLOUD TOKENS');
+    const co=document.getElementById('c-offload');
+    if(co)co.textContent=(data.status||'cold')+' · '+(data.worker_name||'—');
+  }
+}
+
+// Real answers — POST {query} to /api/jarvis/ask (served by the ff gateway),
+// speak the returned answer, and refresh the matching section card. Falls back
+// to respondLocal() (canned) if the endpoint is unreachable, so the :8472
+// prototype still works.
+async function respond(q){
+  try{
+    const r=await fetch('/api/jarvis/ask',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({query:q}),cache:'no-store'});
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    const d=await r.json();
+    if(!d||!d.answer)throw new Error('no answer');
+    applyAskData(d.kind,d.data);
+    return d.answer;
+  }catch(e){
+    return respondLocal(q);
+  }
+}
 const SR=window.SpeechRecognition||window.webkitSpeechRecognition;let rec=null,listening=false;
 if(SR){rec=new SR();rec.lang='en-US';rec.interimResults=true;
   rec.onresult=e=>{let txt='';for(const r of e.results)txt+=r[0].transcript;transcript.textContent='“'+txt+'”';
-    if(e.results[e.results.length-1].isFinal)setTimeout(()=>say(respond(txt)),300);};
+    if(e.results[e.results.length-1].isFinal)setTimeout(()=>{respond(txt).then(say)},300);};
   rec.onend=()=>{listening=false;mic.classList.remove('live');};}
 function listen(){if(!analyser)initAudio();
   if(!rec){say("Browser speech needs Chrome, sir. The native ff voice backend is being wired in.");return;}
