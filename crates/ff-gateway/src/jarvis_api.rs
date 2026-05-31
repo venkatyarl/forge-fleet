@@ -36,6 +36,7 @@ use std::time::Duration;
 use axum::{Json, extract::State, response::IntoResponse};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sqlx::Row;
 
 use crate::server::GatewayState;
 
@@ -83,6 +84,7 @@ pub async fn jarvis_state(State(state): State<Arc<GatewayState>>) -> impl IntoRe
             },
             "nodes": [],
             "deployments": [],
+            "missions": [],
             "offload": Value::Null,
             "tasks": { "active_count": 0, "top_name": Value::Null },
             "brain": { "linked": false },
@@ -211,6 +213,12 @@ pub async fn jarvis_state(State(state): State<Arc<GatewayState>>) -> impl IntoRe
     .ok()
     .flatten();
 
+    // ─── missions ─────────────────────────────────────────────────────
+    // The most-recent active agent sessions JARVIS is driving, so the HUD's
+    // ACTIVE MISSIONS card can show live progress. Best-effort: any failure
+    // leaves an empty array (the HUD guards on `state.missions || []`).
+    let missions = recent_missions(pool).await;
+
     // ─── brain ────────────────────────────────────────────────────────
     // "Linked" = the brain vault has any indexed node. A failed/empty probe
     // simply reports not-linked rather than erroring the whole response.
@@ -253,6 +261,7 @@ pub async fn jarvis_state(State(state): State<Arc<GatewayState>>) -> impl IntoRe
         },
         "nodes": nodes_json,
         "deployments": deployments_json,
+        "missions": missions,
         "offload": offload_json,
         "tasks": {
             "active_count": active_count,
@@ -493,6 +502,42 @@ pub async fn jarvis_ask(
         );
     }
 
+    // ── Intent: ACTION REQUEST — start a fleet mission ────────────────────
+    // An imperative/task-like utterance ("build X", "fix Y", "please add Z")
+    // becomes a real agent session that the production daemon's
+    // session_runner executes across the fleet. Questions stay on the answer
+    // path below; when ambiguous, is_action_request() prefers ANSWER, since
+    // acting is the higher-consequence choice.
+    if is_action_request(&q) {
+        if let Some(pool) = pool {
+            match start_mission(pool, &query).await {
+                Ok(mission_id) => {
+                    return jarvis_action_json(
+                        "On it. I've started a mission across the fleet — I'll work \
+                         on it and report progress on your display."
+                            .to_string(),
+                        mission_id.to_string(),
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "jarvis_ask failed to start mission");
+                    return jarvis_json(
+                        "I'm afraid I couldn't start that mission just now, sir — \
+                         the fleet database refused the request."
+                            .to_string(),
+                        "action",
+                        None,
+                    );
+                }
+            }
+        }
+        return jarvis_json(
+            "I can't reach the fleet to start that just now, sir.".to_string(),
+            "action",
+            None,
+        );
+    }
+
     // ── ELSE: route the question to a warm local model ────────────────────
     let answer = match pool {
         Some(pool) => dispatch_to_fleet(&state.http_client, pool, &query).await,
@@ -501,6 +546,124 @@ pub async fn jarvis_ask(
             .to_string(),
     };
     jarvis_json(answer, "ask", None)
+}
+
+/// Classify a lowercased utterance as an ACTION request (imperative/task-like)
+/// vs a question. Conservative by design — when the signal is ambiguous we
+/// return `false` so the caller takes the lower-consequence ANSWER path.
+///
+/// Rules (checked in order):
+///   1. Clear interrogatives at the start (`what`, `how`, `is`, `show`, …) or a
+///      trailing `?` → NOT an action. Question wins even if a verb appears
+///      ("what should I build?" is a question).
+///   2. Polite/explicit action lead-ins ("please …", "can you build …",
+///      "go ahead and …") → action.
+///   3. A build/do verb appearing as a word anywhere → action.
+///   4. Otherwise → not an action.
+fn is_action_request(q: &str) -> bool {
+    let q = q.trim();
+    if q.is_empty() {
+        return false;
+    }
+
+    // (1) Questions win. A trailing '?' or a leading interrogative keeps us on
+    // the ANSWER path regardless of any verb in the sentence.
+    if q.ends_with('?') {
+        return false;
+    }
+    let first_word = q.split(|c: char| !c.is_alphanumeric()).next().unwrap_or("");
+    const QUESTION_LEADS: &[&str] = &[
+        "what", "why", "how", "who", "when", "where", "which", "whose", "is", "are", "am", "was",
+        "were", "do", "does", "did", "can", "could", "would", "should", "will", "shall", "show",
+        "list", "status", "tell", "explain", "describe", "report",
+    ];
+    // "can/could/would/should/will" lead a question UNLESS followed by "you" +
+    // an action verb ("can you build …"), which (2) below treats as action.
+    let polite_action = matches!(first_word, "can" | "could" | "would" | "will")
+        && q.split_whitespace()
+            .nth(1)
+            .map(str::to_lowercase)
+            .as_deref()
+            == Some("you")
+        && q.split_whitespace()
+            .nth(2)
+            .map(|w| ACTION_VERBS.iter().any(|v| w.to_lowercase().starts_with(v)))
+            .unwrap_or(false);
+    if QUESTION_LEADS.contains(&first_word) && !polite_action {
+        return false;
+    }
+
+    // (2) Explicit action lead-ins (and the two-word "set up …" phrase that
+    // can't be a single verb stem).
+    let ql = q.to_lowercase();
+    if ql.starts_with("please ")
+        || ql.starts_with("go ahead")
+        || ql.contains("set up ")
+        || polite_action
+    {
+        return true;
+    }
+
+    // (3) A build/do verb as a standalone word anywhere in the utterance.
+    q.split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .any(|w| {
+            let w = w.to_lowercase();
+            ACTION_VERBS.contains(&w.as_str())
+        })
+}
+
+/// Imperative build/do verbs that mark an utterance as an ACTION request.
+/// Kept as bare stems; the classifier matches whole words (and `starts_with`
+/// for the "can you <verb>" lead-in so "building"/"creates" also catch).
+const ACTION_VERBS: &[&str] = &[
+    "build",
+    "fix",
+    "add",
+    "implement",
+    "refactor",
+    "create",
+    "write",
+    "test",
+    "deploy",
+    "migrate",
+    "optimize",
+    "optimise",
+    "run",
+    "generate",
+    "setup", // bare "set" is too broad; we accept "setup" and the "set up" phrase below
+    "make",
+    "update",
+    "upgrade",
+    "install",
+];
+
+/// Create a session for `goal` and append a single primary step whose prompt is
+/// the operator's request. Mirrors the `ff session spawn` + `ff session add-step`
+/// call shapes (main.rs:2901 / 2927): same `None`/`Option` argument pattern.
+/// Returns the new session id (the HUD's `mission_id`).
+async fn start_mission(pool: &sqlx::PgPool, goal: &str) -> anyhow::Result<uuid::Uuid> {
+    // create_session(pool, goal, team=None, budget_usd_cap=None, created_by).
+    let session_id =
+        ff_agent::session_runner::create_session(pool, goal, None, None, Some("jarvis")).await?;
+    // add_step(pool, session_id, name, role=None, prompt, depends_on=&[]).
+    // role=None lets the runner fall back to its default coder model; the
+    // single primary step's prompt is the user's request verbatim.
+    ff_agent::session_runner::add_step(pool, session_id, "primary", None, goal, &[]).await?;
+    Ok(session_id)
+}
+
+/// Build the `POST /api/jarvis/ask` response envelope for an ACTION request.
+/// Same base shape as `jarvis_json` (so the HUD's `respond()` still finds
+/// `answer`/`kind`), with an added top-level `mission_id` and `intent`.
+fn jarvis_action_json(answer: String, mission_id: String) -> Json<Value> {
+    Json(json!({
+        "answer": answer,
+        "kind": "action",
+        "intent": "action",
+        "mission_id": mission_id,
+        "data": Value::Null,
+    }))
 }
 
 /// Build the `POST /api/jarvis/ask` response envelope.
@@ -538,6 +701,56 @@ async fn top_task_name(pool: &sqlx::PgPool) -> Option<String> {
     .await
     .ok()
     .flatten()
+}
+
+/// The most-recent active agent sessions (the "missions" JARVIS is driving),
+/// for the HUD's ACTIVE MISSIONS card. We use a direct `sqlx::query` against
+/// `agent_sessions` + `agent_steps` rather than
+/// `session_runner::list_sessions` because the HUD needs status/time
+/// filtering plus a `steps_running` counter and an `updated_at` that
+/// `list_sessions` doesn't expose — and a tailored query is simpler than
+/// post-filtering its richer-but-wrong shape.
+///
+/// Selection: non-terminal status (`pending`/`running`) created in the last
+/// 6 hours, newest first, capped at 6. Best-effort — any query error yields an
+/// empty array so the state response stays null-safe.
+async fn recent_missions(pool: &sqlx::PgPool) -> Vec<Value> {
+    let rows = sqlx::query(
+        "SELECT s.id,
+                s.goal,
+                s.status,
+                COALESCE(s.completed_at, s.started_at, s.created_at) AS updated_at,
+                COUNT(st.id)                                          AS total,
+                COUNT(st.id) FILTER (WHERE st.status = 'completed')   AS done,
+                COUNT(st.id) FILTER (WHERE st.status = 'running')     AS running
+           FROM agent_sessions s
+           LEFT JOIN agent_steps st ON st.session_id = s.id
+          WHERE s.status IN ('pending', 'running')
+            AND s.created_at > NOW() - INTERVAL '6 hours'
+          GROUP BY s.id
+          ORDER BY s.created_at DESC
+          LIMIT 6",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    rows.into_iter()
+        .map(|r| {
+            json!({
+                "id":            r.get::<uuid::Uuid, _>("id").to_string(),
+                "goal":          r.get::<String, _>("goal"),
+                "status":        r.get::<String, _>("status"),
+                "steps_total":   r.get::<i64, _>("total"),
+                "steps_done":    r.get::<i64, _>("done"),
+                "steps_running": r.get::<i64, _>("running"),
+                "updated_at":    r
+                    .try_get::<chrono::DateTime<chrono::Utc>, _>("updated_at")
+                    .ok()
+                    .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+            })
+        })
+        .collect()
 }
 
 /// Current HA leader member name, if recorded.
