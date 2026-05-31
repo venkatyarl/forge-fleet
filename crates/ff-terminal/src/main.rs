@@ -2042,12 +2042,16 @@ pub enum ModelCommand {
         #[arg(long)]
         ctx: Option<u32>,
         /// Parallel request slots (default 2 → 32K per slot at default ctx).
+        /// Passing this on a tool-calling chat model OPTS OUT of the agent
+        /// serving profile (below), trading agent-eligibility for throughput.
         #[arg(long)]
         parallel: Option<u32>,
-        /// Agent-capable serving profile: forces --parallel 1 and raises --ctx
-        /// to at least 32768 so a tool-using agent's full context is on a single
-        /// slot (no "prompt exceeds context window" overflow). Overrides
-        /// --parallel; raises --ctx if you asked for less.
+        /// Force the agent-capable serving profile: --parallel 1 and --ctx
+        /// raised to at least 32768 so a tool-using agent's full context is on a
+        /// single slot (no "prompt exceeds context window" overflow). Tool-calling
+        /// chat models DEFAULT to this profile already, so this flag is only
+        /// needed to force it on a model the catalog doesn't mark tool-calling;
+        /// pass --parallel N instead to opt out for throughput.
         #[arg(long, default_value_t = false)]
         agent: bool,
     },
@@ -2131,8 +2135,10 @@ pub enum ModelCommand {
         /// via the deferred-task queue). Omit to load on this node.
         #[arg(long)]
         node: Option<String>,
-        /// Use the agent-capable serving profile (--parallel 1, ctx >= 32768) so
-        /// a tool-using agent's full context fits on one slot.
+        /// Force the agent-capable serving profile (--parallel 1, ctx >= 32768)
+        /// so a tool-using agent's full context fits on one slot. Tool-calling
+        /// chat models default to this profile already; this only forces it for
+        /// models the catalog doesn't mark tool-calling.
         #[arg(long, default_value_t = false)]
         agent: bool,
     },
