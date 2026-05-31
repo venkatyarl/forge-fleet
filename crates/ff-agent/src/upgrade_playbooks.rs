@@ -9,7 +9,16 @@ pub fn playbook_for(tool: &str, os_family: &str) -> Option<String> {
             "sudo apt-get update && sudo apt-get install --only-upgrade -y 1password-cli".into(),
         ),
         ("op", "macos") => Some("brew upgrade --cask 1password-cli".into()),
-        ("openclaw", _) => Some("curl -fsSL https://openclaw.ai/install.sh | bash".into()),
+        // openclaw ships via npm on this fleet (npm-global on macOS, Linux,
+        // and DGX alike — never brew/apt despite the binary living under a
+        // package-manager bin dir). Homebrew's npm prefix (/opt/homebrew) is
+        // user-owned, so macOS needs no sudo; `sudo npm` would corrupt ~/.npm
+        // with root-owned cache files and silently break later sudo-free
+        // upgrades (cost a 26-day Taylor gateway outage to diagnose).
+        ("openclaw", "macos") => {
+            Some("export PATH=/opt/homebrew/bin:$PATH && npm install -g openclaw@latest".into())
+        }
+        ("openclaw", _) => Some("sudo npm install -g openclaw@latest".into()),
         ("mlx_lm", _) => Some("pip install -U mlx-lm".into()),
         ("vllm", _) => Some("pip install -U vllm".into()),
         ("llama.cpp", _) => {
