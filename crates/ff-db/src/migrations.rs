@@ -697,6 +697,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "coder_tool_calling",
         sql: schema::SCHEMA_V113_CODER_TOOL_CALLING,
     },
+    PgMigration {
+        version: 114,
+        name: "node_reservation",
+        sql: schema::SCHEMA_V114_NODE_RESERVATION,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.

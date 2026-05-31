@@ -18,15 +18,19 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-/// Canonical port range for inference servers per the fleet port registry
-/// ([[canonical-ports]]). LLM slots are 55000-55010; anything outside this
-/// window is treated as a policy violation and the reconciler will mark
-/// the deployment retired so it gets killed on the same pass.
+/// Canonical inference ports per the fleet port registry ([[canonical-ports]]):
+/// llama.cpp / mlx slots are 55000-55010, vllm uses 51001 / 51003, ollama 11434.
+/// A process on any OTHER port is a stray candidate — but it is only reaped when
+/// no `active` deployment row claims that port (see the Pass-A guard). Operator
+/// intent expressed via `ff model load` is authoritative and must survive on any
+/// port; the earlier 55000-55010-only window wrongly reaped vllm/ollama endpoints
+/// and any agent endpoint warmed on the `ff model load` default port (51001).
 pub const CANONICAL_PORT_MIN: i32 = 55000;
 pub const CANONICAL_PORT_MAX: i32 = 55010;
 
 fn port_is_canonical(port: i32) -> bool {
     (CANONICAL_PORT_MIN..=CANONICAL_PORT_MAX).contains(&port)
+        || matches!(port, 51001 | 51003 | 11434)
 }
 
 /// Summary of a reconcile pass.
@@ -74,13 +78,20 @@ pub async fn reconcile_local(pool: &sqlx::PgPool) -> Result<ReconcileSummary, St
         let port_i32 = port as i32;
         seen_ports.insert(port_i32);
 
-        // Canonical-port enforcement. Inference servers are required to bind
-        // in 55000-55010 per [[canonical-ports]]. Anything outside is killed
-        // here so a stale operator-launched server (e.g. james's
-        // Qwen3.6-35B-A3B on 8082 since May 2) gets cleaned up automatically.
-        // Excludes rpc-server / mesh helpers because list_local_processes
-        // only matches llama-server / mlx_lm.server / vllm serve.
-        if !port_is_canonical(port_i32) {
+        // Canonical-port enforcement. A non-canonical inference server is reaped
+        // here so a stale operator-launched server (e.g. james's Qwen3.6-35B-A3B
+        // on 8082 since May 2) gets cleaned up automatically — BUT ONLY when no
+        // `active` deployment row claims this port. A model deliberately loaded
+        // via `ff model load` (any port) is durable and must NEVER be killed or
+        // retired here; doing so deleted warmed offload/agent endpoints (the
+        // `ff model load --agent` the offload hint recommends defaults to 51001).
+        // Excludes rpc-server / mesh helpers because list_local_processes only
+        // matches llama-server / mlx_lm.server / vllm serve.
+        let port_has_active_row = db_by_port
+            .get(&port_i32)
+            .map(|r| r.desired_state == "active")
+            .unwrap_or(false);
+        if !port_is_canonical(port_i32) && !port_has_active_row {
             tracing::warn!(
                 pid = proc_info.pid,
                 port,
@@ -263,11 +274,12 @@ async fn respawn_dead_deployment(
         "respawning dead deployment (desired_state=active)"
     );
 
-    // Delete the stale row first so load_model's upsert creates a fresh one
-    // with the new pid. The row's desired_state was 'active' which carries
-    // through the new row's default.
-    let _ = ff_db::pg_delete_deployment(pool, &row.id).await;
-
+    // NO delete-first. load_model upserts ON CONFLICT(worker_name, port), so it
+    // REPLACES this row in place with the fresh pid. Deleting first was the
+    // durability bug: if load_model then failed (e.g. RAM pressure during a
+    // co-located build), the row was gone forever and the endpoint silently
+    // vanished with no retry. Leaving the row intact (desired_state='active')
+    // means a failed respawn is simply retried on the next 60s tick.
     let ctx = if row.context_window > 0 {
         row.context_window as u32
     } else {

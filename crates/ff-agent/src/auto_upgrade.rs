@@ -135,6 +135,9 @@ pub async fn resolve_upgrade_plans_with_suffix(
                JOIN computers c ON c.id = cs.computer_id
               WHERE cs.software_id = $1
                 AND cs.status = 'upgrade_available'
+                -- V114: never auto-upgrade a reserved/drained host (P3 / operator
+                -- claimed it; the wave must not build there).
+                AND COALESCE(c.reservation_state, 'available') = 'available'
               ORDER BY c.name",
         )
         .bind(software_id)
@@ -151,6 +154,7 @@ pub async fn resolve_upgrade_plans_with_suffix(
                FROM computer_software cs
                JOIN computers c ON c.id = cs.computer_id
               WHERE cs.software_id = $1
+                AND COALESCE(c.reservation_state, 'available') = 'available'
               ORDER BY c.name",
         )
         .bind(software_id)

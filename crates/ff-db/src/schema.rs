@@ -7658,3 +7658,26 @@ UPDATE fleet_model_catalog
      'deepseek-coder-v2'
  );
 "#;
+
+// ─────────────────────────────────────────────────────────────────────────
+// V114 — Node reservation / drain.
+//
+// A SOFT, declarative flag on `computers`, orthogonal to `status` (up/down):
+//   available = normal (default; all existing hosts).
+//   reserved  = excluded from build/deploy waves, but the host KEEPS serving
+//               LLM traffic + leader election (unlike maintenance/quarantine).
+//   drained   = reserved AND its model servers have been unloaded (RAM freed);
+//               parked for a heavy build or for the P3 autoscaler to swap models.
+// This is the "do-not-build-here-while-I'm-juggling-models" lock the adaptive
+// autoscaler (P3) needs, and what would have kept `ff fleet deploy` from ever
+// targeting the serving 30B host that swap-stalled this session.
+pub const SCHEMA_V114_NODE_RESERVATION: &str = r#"
+ALTER TABLE computers
+    ADD COLUMN IF NOT EXISTS reservation_state TEXT NOT NULL DEFAULT 'available'
+        CHECK (reservation_state IN ('available','reserved','drained')),
+    ADD COLUMN IF NOT EXISTS reserved_reason TEXT,
+    ADD COLUMN IF NOT EXISTS reserved_at TIMESTAMPTZ;
+
+CREATE INDEX IF NOT EXISTS idx_computers_reservation
+    ON computers(reservation_state) WHERE reservation_state <> 'available';
+"#;
