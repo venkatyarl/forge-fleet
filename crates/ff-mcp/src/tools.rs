@@ -253,14 +253,17 @@ impl ToolRegistry {
                 extraction — anything high-token where the *shape* of the answer \
                 is clear and you'll review the output anyway. Keep \
                 architectural / load-bearing decisions in-cloud. \
-                \n\nBehaviour (v1): picks the best WARM agent-capable deployment \
-                via the V111 capability router (require_tool_calling + min_ctx, \
-                excluding given hosts), dispatches the task to it over the \
-                OpenAI-compatible API, and returns its result for you to \
+                \n\nBehaviour: picks the best WARM tool-capable deployment via \
+                the capability router, KIND-AWARE — codegen/edits/tests route to \
+                a coder-family model first (falling back to any tool-capable \
+                model), with smaller-tier-first then least-loaded-host ranking. \
+                Pass `kind` so code work lands on a coder. Dispatches over the \
+                OpenAI-compatible API (model 'thinking' disabled so you get the \
+                answer, not chain-of-thought) and returns the result for you to \
                 review. If NO warm tool-capable endpoint exists it returns \
-                {offloaded:false, decision:\"do_in_cloud\"} — in that case \
-                proceed and do the work yourself. v1 never cold-loads a model \
-                (that's v2)."
+                {offloaded:false, decision:\"do_in_cloud\"} — proceed and do the \
+                work yourself. Prefer-warm only; demand-driven autoscaling of \
+                the model mix is orchestrator P3."
                 .to_string(),
             input_schema: json!({
                 "type": "object",

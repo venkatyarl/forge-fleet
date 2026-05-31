@@ -1,14 +1,15 @@
 //! `ff offload` — the credit-saver CLI.
 //!
 //! Direct + measurable counterpart to the `fleet_offload` MCP tool. Picks the
-//! best WARM tool-capable deployment via the V111 capability router
-//! (`ff_db::pg_pick_agent_endpoint` — the SAME scored selector the MCP handler
-//! and `fleet_route` use, so there's no parallel router), dispatches the task
-//! to it over the OpenAI-compatible API, and prints which endpoint/model
-//! handled it plus the result. If no warm tool-capable endpoint exists it
-//! prints a `do_in_cloud` decision so the caller does the work itself.
+//! best WARM endpoint via `ff_db::pg_pick_offload_endpoint` — capability +
+//! kind-aware (a coder for code work), least-loaded-host tiebreak, built on the
+//! SAME `pg_route_deployments` scorer the MCP handler and `fleet_route` use so
+//! there's no parallel router. Dispatches over the OpenAI-compatible API
+//! (thinking disabled so the answer isn't eaten by chain-of-thought) and prints
+//! which endpoint/model handled it plus the result. If no warm tool-capable
+//! endpoint exists it prints a `do_in_cloud` decision so the caller proceeds.
 //!
-//! v1 = prefer-warm only. No cold-load / load-time logic (that's v2).
+//! Prefer-warm only — no cold-load / autoscaling here (that's orchestrator P3).
 
 use crate::{CYAN, GREEN, RED, RESET, YELLOW};
 use anyhow::Result;
@@ -45,8 +46,10 @@ pub async fn handle_offload(
         );
     }
 
-    // ── Step 1: find a WARM tool-capable endpoint (V111 capability router).
-    let candidate = ff_db::pg_pick_agent_endpoint(&pool, min_ctx, &[])
+    // ── Step 1: pick the best WARM endpoint, capability+kind-aware.
+    // Prefer a model whose workload matches the task kind (coder for code),
+    // fall back to any tool-capable model, then break ties by least-loaded host.
+    let candidate = ff_db::pg_pick_offload_endpoint(&pool, min_ctx, kind, &[])
         .await
         .map_err(|e| anyhow::anyhow!("offload router query failed: {e}"))?;
 
@@ -106,6 +109,11 @@ pub async fn handle_offload(
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
         "stream": false,
+        // Offload wants the answer, not chain-of-thought. Qwen3-style "thinking"
+        // models otherwise burn the token budget on <think> reasoning and can
+        // return empty content under a tight cap. Harmless on servers (mlx /
+        // some llama.cpp builds) that don't recognize the field.
+        "chat_template_kwargs": {"enable_thinking": false},
     });
 
     let client = reqwest::Client::new();
@@ -135,7 +143,9 @@ pub async fn handle_offload(
 
     let payload: serde_json::Value = serde_json::from_str(&text)
         .map_err(|e| anyhow::anyhow!("parse offload response JSON: {e}"))?;
-    let result = extract_completion_text(&payload).unwrap_or_default();
+    // Defensively strip any <think>…</think> a thinking model emitted anyway
+    // (belt-and-suspenders with chat_template_kwargs.enable_thinking=false).
+    let result = strip_think(&extract_completion_text(&payload).unwrap_or_default());
 
     if json_out {
         println!(
@@ -181,4 +191,65 @@ fn extract_completion_text(payload: &serde_json::Value) -> Option<String> {
         .get("text")
         .and_then(|v| v.as_str())
         .map(String::from)
+}
+
+/// Strip any `<think>…</think>` blocks a reasoning model emitted, returning the
+/// trimmed remainder.
+// NOTE: keep in sync with `strip_think_block` in ff-mcp/src/handlers.rs — both
+// the CLI and MCP offload paths must scrub reasoning identically.
+fn strip_think(s: &str) -> String {
+    let mut out = s.to_string();
+    // 1) Remove well-formed <think>…</think> pairs, left-to-right.
+    loop {
+        let Some(open) = out.find("<think>") else {
+            break;
+        };
+        match out[open..].find("</think>") {
+            Some(rel) => {
+                let close = open + rel + "</think>".len();
+                out.replace_range(open..close, "");
+            }
+            // 2) Unclosed opener — a thinking model cut off mid-reasoning under a
+            //    token cap. Everything from <think> on is reasoning; drop it.
+            None => {
+                out.truncate(open);
+                break;
+            }
+        }
+    }
+    // 3) A lone trailing </think> with no opener (the open tag was consumed by
+    //    the chat template): the answer is whatever follows the last </think>.
+    if let Some(i) = out.rfind("</think>") {
+        out = out[i + "</think>".len()..].to_string();
+    }
+    out.trim().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_think;
+
+    #[test]
+    fn strip_think_handles_all_shapes() {
+        // well-formed pair
+        assert_eq!(strip_think("<think>reasoning</think>answer"), "answer");
+        // lone trailing </think> (open tag consumed by the chat template)
+        assert_eq!(
+            strip_think("reasoning here</think>the answer"),
+            "the answer"
+        );
+        // unclosed opener — model cut off mid-reasoning under a token cap
+        assert_eq!(strip_think("<think>cut off mid thought"), "");
+        // unclosed opener after real content
+        assert_eq!(
+            strip_think("partial answer<think>then cut"),
+            "partial answer"
+        );
+        // no tags at all — passthrough
+        assert_eq!(strip_think("plain output"), "plain output");
+        // stray leading close before a real block
+        assert_eq!(strip_think("</think><think>real</think>tail"), "tail");
+        // multiple pairs
+        assert_eq!(strip_think("<think>a</think>X<think>b</think>Y"), "XY");
+    }
 }
