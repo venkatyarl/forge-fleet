@@ -560,6 +560,9 @@ pub fn build_router(state: Arc<GatewayState>, mc_db_path: Option<&str>) -> Route
         // ─── Fleet integration routes ────────────────────────────────
         .route("/api/fleet/status", get(fleet_status))
         .route("/api/status", get(fleet_status))
+        .route("/api/jarvis/state", get(crate::jarvis_api::jarvis_state))
+        .route("/jarvis", get(crate::jarvis_api::jarvis_hud))
+        .route("/jarvis.html", get(crate::jarvis_api::jarvis_hud))
         .route("/api/fleet/enroll", post(fleet_enroll))
         .route("/api/fleet/heartbeat", post(fleet_heartbeat))
         .route("/api/fleet/llm-usage", get(fleet_llm_usage))
