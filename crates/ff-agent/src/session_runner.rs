@@ -50,6 +50,9 @@ pub struct TickStats {
     pub steps_completed: usize,
     pub steps_failed: usize,
     pub sessions_finalised: usize,
+    /// Child steps inserted by auto-applying a completed planner's plan
+    /// (Orchestrator P4 autonomous decomposition).
+    pub steps_fanned_out: usize,
 }
 
 /// Insert a new session. `goal` is the user-stated outcome; `team`
@@ -136,6 +139,7 @@ pub async fn tick(pool: &PgPool) -> Result<TickStats> {
     let running_steps = sqlx::query(
         "SELECT s.id          AS step_id,
                 s.session_id  AS session_id,
+                s.role        AS role,
                 s.fleet_task_id AS fleet_task_id,
                 t.status      AS task_status,
                 t.result      AS task_result,
@@ -151,6 +155,8 @@ pub async fn tick(pool: &PgPool) -> Result<TickStats> {
 
     for r in running_steps {
         let step_id: uuid::Uuid = r.get("step_id");
+        let session_id: uuid::Uuid = r.get("session_id");
+        let role: Option<String> = r.try_get("role").ok();
         let task_status: String = r.get("task_status");
         let new_status = if task_status == "completed" {
             "completed"
@@ -176,6 +182,72 @@ pub async fn tick(pool: &PgPool) -> Result<TickStats> {
         .context("update step terminal")?;
         if new_status == "completed" {
             stats.steps_completed += 1;
+
+            // ── Orchestrator P4: autonomous parallel decomposition ──
+            // When a `planner` step just folded to `completed`, expand its
+            // plan into child steps right here. Phase B (below) then
+            // dispatches the runnable children in parallel as deps allow,
+            // with no manual `ff session apply-plan` in the loop.
+            //
+            // Idempotency: this branch is reached only for a step that the
+            // fold SELECT found `running` and that we just flipped to
+            // `completed`. A planner step is `running` exactly once, so it
+            // folds — and `apply_plan` runs — exactly once for it. There is
+            // no broad re-scan that could re-apply.
+            if role.as_deref() == Some("planner") {
+                match apply_plan(pool, session_id, Some(step_id)).await {
+                    Ok(children) => {
+                        info!(
+                            session = %session_id,
+                            planner_step = %step_id,
+                            count = children.len(),
+                            "planner completed — auto-fanned out child steps"
+                        );
+                        stats.steps_fanned_out += children.len();
+                    }
+                    Err(e) => {
+                        // A planner that can't produce a usable plan can't
+                        // advance the session — fail it (rather than hang
+                        // it waiting on children that will never exist).
+                        // Scope the error to apply_plan; never abort the
+                        // whole tick over one bad plan.
+                        warn!(
+                            session = %session_id,
+                            planner_step = %step_id,
+                            error = %e,
+                            "planner produced an unusable plan — failing session"
+                        );
+                        let msg = format!("planner step {step_id} produced an unusable plan: {e}");
+                        // Mirror the existing fail-session path (see
+                        // enforce_session_budget): fail the session and
+                        // cancel its still-pending steps.
+                        let _ = sqlx::query(
+                            "UPDATE agent_sessions
+                                SET status = 'failed',
+                                    error  = $2,
+                                    completed_at = COALESCE(completed_at, NOW())
+                              WHERE id = $1
+                                AND status IN ('pending', 'running')",
+                        )
+                        .bind(session_id)
+                        .bind(&msg)
+                        .execute(pool)
+                        .await;
+                        let _ = sqlx::query(
+                            "UPDATE agent_steps
+                                SET status = 'cancelled',
+                                    error  = $2,
+                                    completed_at = NOW()
+                              WHERE session_id = $1
+                                AND status = 'pending'",
+                        )
+                        .bind(session_id)
+                        .bind(&msg)
+                        .execute(pool)
+                        .await;
+                    }
+                }
+            }
         } else {
             stats.steps_failed += 1;
         }
@@ -1123,6 +1195,27 @@ pub async fn add_planner_step(pool: &PgPool, session_id: uuid::Uuid) -> Result<u
     );
 
     add_step(pool, session_id, "plan", Some("planner"), &prompt, &[]).await
+}
+
+/// Create a plan-first session in one call: insert the session, then
+/// attach a `planner` step. With Orchestrator P4's auto-fan-out, the
+/// planner's completion is folded by `tick()` into child steps
+/// automatically — so a single call here yields a fully autonomous,
+/// self-decomposing, parallelising session with no manual
+/// `ff session apply-plan` in the loop.
+///
+/// Returns the new session id. Callers (CLI, JARVIS) use this when the
+/// goal is non-trivial enough to warrant LLM decomposition rather than
+/// a single primary step.
+pub async fn create_decomposed_session(
+    pool: &PgPool,
+    goal: &str,
+    created_by: Option<&str>,
+) -> Result<uuid::Uuid> {
+    let session_id = create_session(pool, goal, None, None, created_by).await?;
+    add_planner_step(pool, session_id).await?;
+    info!(session = %session_id, %goal, "decomposed (plan-first) session created");
+    Ok(session_id)
 }
 
 /// Read the most recent completed planner step in a session, parse its

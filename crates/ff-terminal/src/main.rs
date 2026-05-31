@@ -1016,13 +1016,24 @@ enum SessionCommand {
     },
     /// List every session_brain entry for a session, newest first.
     BrainList { session: String },
-    /// Add an LLM-driven planner step to a session. The planner role
-    /// is asked to decompose the session's goal into a JSON DAG;
-    /// follow up with `ff session apply-plan` once it completes.
+    /// Create a plan-first session in one shot: spawns the session and
+    /// attaches a planner step. The daemon's session runner auto-fans the
+    /// planner's plan into a parallel child DAG (Orchestrator P4) — no
+    /// manual apply-plan needed. Prints the new session id.
+    PlanRun {
+        /// The user-stated outcome to decompose + parallelise.
+        goal: String,
+    },
+    /// Add an LLM-driven planner step to an existing session. The planner
+    /// role decomposes the session's goal into a JSON DAG. With Orchestrator
+    /// P4 the daemon auto-applies the plan once the planner completes, so no
+    /// manual `ff session apply-plan` is required — that verb remains only
+    /// for re-applying a specific step's output.
     Plan { session: String },
-    /// Read the most recent completed planner step's output and
-    /// insert its planned children as agent_steps. If --from-step is
-    /// passed, uses that specific step's output instead.
+    /// Manually read the most recent completed planner step's output and
+    /// insert its planned children as agent_steps. Normally automatic under
+    /// Orchestrator P4; use this only to re-apply or to apply a specific
+    /// step via --from-step.
     ApplyPlan {
         session: String,
         #[arg(long = "from-step")]
@@ -3096,6 +3107,21 @@ async fn main() -> Result<()> {
                     );
                     Ok(())
                 }
+                SessionCommand::PlanRun { goal } => {
+                    let who = ff_agent::fleet_info::resolve_this_worker_name().await;
+                    let id = ff_agent::session_runner::create_decomposed_session(
+                        &pool,
+                        &goal,
+                        Some(&who),
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("create decomposed session: {e}"))?;
+                    println!("{id}");
+                    println!(
+                        "  planner step attached; the daemon will auto-fan-out the plan once it completes"
+                    );
+                    Ok(())
+                }
                 SessionCommand::Plan { session } => {
                     let sid = uuid::Uuid::parse_str(&session)
                         .map_err(|e| anyhow::anyhow!("invalid uuid: {e}"))?;
@@ -3104,7 +3130,7 @@ async fn main() -> Result<()> {
                         .map_err(|e| anyhow::anyhow!("add planner step: {e}"))?;
                     println!("{GREEN}✓{RESET} planner step created: {id}");
                     println!(
-                        "  next: wait for it to complete, then run `ff session apply-plan {session}`"
+                        "  the daemon will auto-apply the plan once this step completes (Orchestrator P4)"
                     );
                     Ok(())
                 }
