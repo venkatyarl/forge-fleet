@@ -8019,3 +8019,67 @@ CREATE INDEX IF NOT EXISTS idx_brain_corpus_candidates_pending
     ON brain_corpus_candidates(corpus_id, status, created_at)
     WHERE status = 'pending';
 "#;
+
+// ════════════════════════════════════════════════════════════════════════════
+// SCHEMA_V118_DISK_MANAGEMENT
+// Active disk management: a leader-gated disk-reconcile tick that turns the
+// passive over-quota ALERT into MOVE/DELETE actuation (gated OFF by default via
+// fleet_secrets.disk_policy_mode = off|dry-run|active).
+//
+// Two minimal additions:
+//   1. fleet_model_library.pinned BOOLEAN — honors the smart_lru "future:
+//      pinned column" comment. A pinned library row is NEVER eligible for
+//      eviction (delete OR move source-delete), regardless of age/peer-copies.
+//   2. disk_policy_runs — one row per leader disk-reconcile pass for
+//      observability (mode, nodes over quota, planned vs actuated deletes/moves).
+//   3. disk_move_log — one row per MOVE the active tick performs (source/target
+//      node, library, bytes, verified) so a botched transfer is auditable and the
+//      future arbiter (#7) can reason about in-flight relocations.
+//
+// COLLATE "C" on every internal text-ID column (collation-safe; see the
+// 2026-05-30 collation-corruption incident). Idempotent: ADD COLUMN IF NOT
+// EXISTS + CREATE TABLE IF NOT EXISTS so re-running is a no-op.
+// ════════════════════════════════════════════════════════════════════════════
+pub const SCHEMA_V118_DISK_MANAGEMENT: &str = r#"
+-- 1. Pin flag on the library: a pinned model is never auto-evicted (delete or
+--    move-then-delete). Defaults false so existing rows keep current behaviour.
+ALTER TABLE fleet_model_library
+    ADD COLUMN IF NOT EXISTS pinned BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- 2. One row per leader disk-reconcile pass — observability for the active tick.
+CREATE TABLE IF NOT EXISTS disk_policy_runs (
+    id                BIGSERIAL PRIMARY KEY,
+    ran_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    mode              TEXT COLLATE "C" NOT NULL,        -- off | dry-run | active
+    nodes_over_quota  INT NOT NULL DEFAULT 0,
+    planned_deletes   INT NOT NULL DEFAULT 0,
+    planned_moves     INT NOT NULL DEFAULT 0,
+    actuated_deletes  INT NOT NULL DEFAULT 0,
+    actuated_moves    INT NOT NULL DEFAULT 0,
+    bytes_planned     BIGINT NOT NULL DEFAULT 0,
+    bytes_freed       BIGINT NOT NULL DEFAULT 0,
+    detail            JSONB NOT NULL DEFAULT '[]'        -- per-candidate classified plan
+);
+
+CREATE INDEX IF NOT EXISTS idx_disk_policy_runs_recent
+    ON disk_policy_runs (ran_at DESC);
+
+-- 3. One row per MOVE the active tick performs — audit trail for relocations.
+CREATE TABLE IF NOT EXISTS disk_move_log (
+    id                BIGSERIAL PRIMARY KEY,
+    started_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    finished_at       TIMESTAMPTZ,
+    source_node       TEXT COLLATE "C" NOT NULL,
+    target_node       TEXT COLLATE "C" NOT NULL,
+    catalog_id        TEXT COLLATE "C" NOT NULL,
+    runtime           TEXT COLLATE "C" NOT NULL,
+    src_library_id    TEXT COLLATE "C" NOT NULL,
+    dst_library_id    TEXT COLLATE "C",                 -- set once the target row exists
+    size_bytes        BIGINT NOT NULL DEFAULT 0,
+    status            TEXT COLLATE "C" NOT NULL DEFAULT 'started', -- started|verified|source_deleted|failed
+    error             TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_disk_move_log_recent
+    ON disk_move_log (started_at DESC);
+"#;

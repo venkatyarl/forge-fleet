@@ -717,6 +717,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "brain_faceted_graph",
         sql: schema::SCHEMA_V117_BRAIN_FACETED_GRAPH,
     },
+    PgMigration {
+        version: 118,
+        name: "disk_management",
+        sql: schema::SCHEMA_V118_DISK_MANAGEMENT,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.

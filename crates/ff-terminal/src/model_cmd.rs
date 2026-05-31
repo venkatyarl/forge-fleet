@@ -350,6 +350,45 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                 other => other,
             };
             let dest = models_dir.join(runtime_subdir).join(&id);
+
+            // PLACEMENT GUARD (V118): before we stream gigabytes onto this node,
+            // reject placements that (a) this node can't RUN, or (b) won't FIT.
+            // Stops the problem upstream rather than after a long download.
+            if let Err(reason) =
+                ff_agent::model_runtime::check_runtime_placement(&node_row, &target_runtime)
+            {
+                anyhow::bail!(
+                    "placement rejected: cannot place {id} ({target_runtime}) on {worker_name}: {reason}"
+                );
+            }
+            if size_gb > 0.0 {
+                let need_bytes =
+                    (size_gb * 1.1 * (1024.0 * 1024.0 * 1024.0)) as u64 + 5 * (1u64 << 30);
+                let df_out = std::process::Command::new("df")
+                    .arg("-Pk")
+                    .arg(&models_dir)
+                    .output();
+                if let Ok(out) = df_out {
+                    let text = String::from_utf8_lossy(&out.stdout);
+                    let last = text.lines().last().unwrap_or("").trim();
+                    let cols: Vec<&str> = last.split_whitespace().collect();
+                    if let Some(free_bytes) = cols
+                        .get(3)
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .map(|k| k.saturating_mul(1024))
+                    {
+                        if free_bytes < need_bytes {
+                            anyhow::bail!(
+                                "placement rejected: {id} (~{size_gb:.1}GB) won't fit on {worker_name}: need {} but only {} free under {}",
+                                human_bytes(need_bytes),
+                                human_bytes(free_bytes),
+                                models_dir.display(),
+                            );
+                        }
+                    }
+                }
+            }
+
             // Ensure runtime parent exists (mkdir -p) before hf_download
             // tries to create the leaf dir. Cheap if already there.
             if let Some(parent) = dest.parent() {
@@ -992,6 +1031,7 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
         crate::ModelCommand::Prune {
             node,
             min_cold_days,
+            classified,
         } => {
             let worker_name = match node {
                 Some(n) => n,
@@ -1001,6 +1041,42 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                 min_cold_days,
                 ..Default::default()
             };
+            if classified {
+                // V118 MOVE-vs-DELETE classified plan (always dry-run).
+                let plan =
+                    ff_agent::smart_lru::plan_classified_eviction(&pool, &worker_name, &policy)
+                        .await
+                        .map_err(|e| anyhow::anyhow!(e))?;
+                if plan.candidates.is_empty() {
+                    println!(
+                        "Node '{worker_name}' is within quota or has no eligible candidates — no action."
+                    );
+                    return Ok(());
+                }
+                println!(
+                    "Classified disk-reconcile plan for {worker_name} (would free {}):\n",
+                    human_bytes(plan.total_bytes_freed)
+                );
+                println!(
+                    "{:<24} {:<10} {:<8} {:<8} {:<10} REASONS",
+                    "CATALOG", "RUNTIME", "SIZE", "ACTION", "TARGET"
+                );
+                for c in &plan.candidates {
+                    println!(
+                        "{:<24} {:<10} {:<8} {:<8} {:<10} {}",
+                        c.catalog_id,
+                        c.runtime,
+                        human_bytes(c.size_bytes),
+                        c.action.as_str(),
+                        c.target_node.as_deref().unwrap_or("-"),
+                        c.reasons.join(", ")
+                    );
+                }
+                println!(
+                    "\n(dry-run; the leader's disk-reconcile tick actuates this ONLY when fleet_secrets.disk_policy_mode=active)"
+                );
+                return Ok(());
+            }
             let plan = ff_agent::smart_lru::plan_eviction(&pool, &worker_name, &policy)
                 .await
                 .map_err(|e| anyhow::anyhow!(e))?;
