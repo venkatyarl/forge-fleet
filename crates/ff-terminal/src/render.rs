@@ -350,7 +350,17 @@ fn render_tab_bar(frame: &mut Frame, area: Rect, app: &App, _theme: &Theme) {
                 .bg(Color::Rgb(30, 41, 59))
         };
         let indicator = if tab.is_running { "⚡" } else { "" };
-        spans.push(Span::styled(format!(" {}{} ", tab.name, indicator), style));
+        // Subtle backend tag when the tab is routed to a cloud CLI rather than
+        // the local fleet agent (e.g. " Session 1 [claude] ").
+        let backend_tag = if tab.backend != "local" {
+            format!(" [{}]", tab.backend)
+        } else {
+            String::new()
+        };
+        spans.push(Span::styled(
+            format!(" {}{}{} ", tab.name, backend_tag, indicator),
+            style,
+        ));
         spans.push(Span::styled(" ", Style::default()));
     }
     spans.push(Span::styled(
