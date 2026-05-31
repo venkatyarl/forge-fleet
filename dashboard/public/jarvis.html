@@ -16,36 +16,62 @@
   body::before{content:'';position:fixed;inset:0;pointer-events:none;z-index:60;
     background:repeating-linear-gradient(0deg,transparent 0 2px,rgba(0,0,0,.16) 3px,transparent 4px);
     mix-blend-mode:overlay;opacity:.45}
+  /* faint outer vignette for cinematic depth */
+  body::after{content:'';position:fixed;inset:0;pointer-events:none;z-index:59;
+    background:radial-gradient(ellipse at 50% 49%,transparent 55%,rgba(1,4,8,.65) 100%)}
   #bg{position:fixed;inset:0;z-index:0;background:
     radial-gradient(ellipse at 50% 48%,rgba(55,198,255,.07),transparent 62%),
     linear-gradient(var(--grid) 1px,transparent 1px),linear-gradient(90deg,var(--grid) 1px,transparent 1px),var(--bg);
     background-size:auto,40px 40px,40px 40px}
   canvas#scene{position:fixed;inset:0;z-index:1}
-  .corner{position:fixed;width:30px;height:30px;border:2px solid var(--edge);z-index:6;pointer-events:none}
-  .tl{top:14px;left:14px;border-right:0;border-bottom:0}.tr{top:14px;right:14px;border-left:0;border-bottom:0}
-  .bl{bottom:14px;left:14px;border-right:0;border-top:0}.br{bottom:14px;right:14px;border-left:0;border-top:0}
+  /* refined L-shaped corner brackets with double rule + tick */
+  .corner{position:fixed;width:46px;height:46px;border:2px solid var(--edge);z-index:6;pointer-events:none}
+  .corner::before{content:'';position:absolute;width:12px;height:12px;border:1px solid rgba(55,198,255,.5)}
+  .corner::after{content:'';position:absolute;width:5px;height:5px;background:var(--gold);box-shadow:0 0 6px var(--gold)}
+  .tl{top:14px;left:14px;border-right:0;border-bottom:0}
+  .tl::before{top:7px;left:7px;border-right:0;border-bottom:0}.tl::after{top:0;left:0}
+  .tr{top:14px;right:14px;border-left:0;border-bottom:0}
+  .tr::before{top:7px;right:7px;border-left:0;border-bottom:0}.tr::after{top:0;right:0}
+  .bl{bottom:14px;left:14px;border-right:0;border-top:0}
+  .bl::before{bottom:7px;left:7px;border-right:0;border-top:0}.bl::after{bottom:0;left:0}
+  .br{bottom:14px;right:14px;border-left:0;border-top:0}
+  .br::before{bottom:7px;right:7px;border-left:0;border-top:0}.br::after{bottom:0;right:0}
   .hud{position:fixed;z-index:10}
   /* top */
-  #brand{top:22px;left:34px}
+  #brand{top:24px;left:40px}
   .wm{font-family:'Orbitron';font-weight:900;font-size:22px;letter-spacing:8px;color:#dffaff;text-shadow:0 0 16px var(--cyan)}
   .wm small{display:block;font-size:9.5px;letter-spacing:4px;color:var(--dim);margin-top:3px;font-family:'Share Tech Mono'}
   #node{margin-top:8px;font-size:11px;color:var(--cyan2)}
-  #clock{top:18px;left:50%;transform:translateX(-50%);text-align:center}
-  #clock .t{font-family:'Orbitron';font-weight:700;font-size:40px;letter-spacing:6px;color:#eafdff;text-shadow:0 0 22px var(--cyan)}
-  #clock .d{font-size:12px;letter-spacing:5px;color:var(--dim);margin-top:2px}
-  #wx{top:22px;right:34px;text-align:right}
+  #clock{top:14px;left:50%;transform:translateX(-50%);text-align:center}
+  #clock .t{font-family:'Orbitron';font-weight:700;font-size:54px;letter-spacing:8px;color:#eafdff;text-shadow:0 0 26px var(--cyan),0 0 4px var(--cyan2);line-height:1}
+  #clock .d{font-size:12px;letter-spacing:6px;color:var(--dim);margin-top:5px}
+  #clock .rail{margin-top:7px;height:6px;width:340px;position:relative}
+  #clock .rail i{position:absolute;top:0;width:1px;height:6px;background:rgba(55,198,255,.35)}
+  #clock .rail i.mj{height:6px;background:var(--cyan);box-shadow:0 0 5px var(--cyan)}
+  #wx{top:24px;right:40px;text-align:right}
   #wx .big{font-family:'Orbitron';font-size:18px;letter-spacing:3px;color:var(--gold);text-shadow:0 0 12px rgba(255,207,122,.5)}
   #wx .l{font-size:11px;color:var(--cyan2);line-height:1.65}
   /* columns of readouts */
-  .col{position:fixed;z-index:10;width:210px;font-size:11px}
-  #lcol{left:34px;top:150px}#rcol{right:34px;top:150px;text-align:right}
-  .grp{margin-bottom:14px}
-  .grp h3{font-family:'Orbitron';font-size:10px;letter-spacing:3px;color:#bff3ff;border-bottom:1px solid var(--edge);padding-bottom:4px;margin-bottom:6px}
+  .col{position:fixed;z-index:10;width:232px;font-size:11px}
+  #lcol{left:40px;top:128px}#rcol{right:40px;top:128px;text-align:right}
+  .grp{margin-bottom:13px}
+  .grp h3{font-family:'Orbitron';font-size:10px;letter-spacing:3px;color:#bff3ff;border-bottom:1px solid var(--edge);
+    padding-bottom:4px;margin-bottom:6px;display:flex;justify-content:space-between;align-items:center}
+  .grp h3 .tag{font-family:'Share Tech Mono';font-size:8.5px;letter-spacing:1px;color:var(--dim)}
+  #rcol .grp h3{flex-direction:row-reverse}
   .li{display:flex;justify-content:space-between;color:#8fdcf2;padding:2px 0}
   #rcol .li{flex-direction:row-reverse}
   .li .v{color:var(--dim)}
   .dot{width:7px;height:7px;border-radius:50%;display:inline-block;margin:0 6px;box-shadow:0 0 7px currentColor;vertical-align:middle}
   .ok{background:var(--ok);color:var(--ok)}.warn{background:var(--warn);color:var(--warn)}.bad{background:var(--bad);color:var(--bad)}
+  /* mini horizontal bar meters for the metrics group */
+  .mrow{padding:3px 0}
+  .mrow .mh{display:flex;justify-content:space-between;color:#8fdcf2;font-size:10px;margin-bottom:2px}
+  .mrow .mh .v{color:var(--cyan2)}
+  .bar{height:4px;background:rgba(55,198,255,.10);border:1px solid rgba(55,198,255,.18);position:relative;overflow:hidden}
+  .bar i{position:absolute;left:0;top:0;bottom:0;background:linear-gradient(90deg,var(--dim),var(--cyan));
+    box-shadow:0 0 8px var(--cyan);transition:width .8s ease}
+  .bar.g i{background:linear-gradient(90deg,rgba(255,207,122,.4),var(--gold));box-shadow:0 0 8px var(--gold)}
   /* center answer */
   #answer{position:fixed;z-index:11;left:50%;top:50%;transform:translate(-50%,-50%);text-align:center;width:240px;pointer-events:none}
   #answer .big{font-family:'Orbitron';font-size:34px;font-weight:700;color:#eafdff;text-shadow:0 0 20px var(--cyan)}
@@ -53,7 +79,9 @@
   /* section cards (light up on query) */
   #cards{position:fixed;z-index:12;bottom:150px;left:50%;transform:translateX(-50%);display:flex;gap:14px}
   .card{width:150px;background:var(--panel);border:1px solid var(--edge);border-radius:4px;padding:9px 11px;
-    backdrop-filter:blur(5px);transition:all .35s;opacity:.5}
+    backdrop-filter:blur(5px);transition:all .35s;opacity:.5;position:relative}
+  .card::before{content:'';position:absolute;top:-1px;left:-1px;width:9px;height:9px;border-top:1px solid var(--cyan);border-left:1px solid var(--cyan)}
+  .card::after{content:'';position:absolute;bottom:-1px;right:-1px;width:9px;height:9px;border-bottom:1px solid var(--cyan);border-right:1px solid var(--cyan)}
   .card.active{opacity:1;border-color:var(--cyan);box-shadow:0 0 24px rgba(55,198,255,.45);transform:translateY(-6px)}
   .card h4{font-family:'Orbitron';font-size:9px;letter-spacing:2px;color:#bff3ff;margin-bottom:5px}
   .card .b{font-size:11px;color:#9fe9ff;line-height:1.55}
@@ -77,37 +105,52 @@
 <div class="corner tl"></div><div class="corner tr"></div><div class="corner bl"></div><div class="corner br"></div>
 
 <div class="hud" id="brand"><div class="wm">J.A.R.V.I.S.<small>FORGEFLEET OS · MK 0.1</small></div><div id="node">NODE: TAYLOR · LEADER · ONLINE</div></div>
-<div class="hud" id="clock"><div class="t" id="ct">--:--:--</div><div class="d" id="cd">--</div></div>
+<div class="hud" id="clock"><div class="t" id="ct">--:--:--</div><div class="d" id="cd">--</div><div class="rail" id="crail"></div></div>
 <div class="hud" id="wx"><div class="big">15 NODES</div><div class="l">offload: warm · marcus<br>schema V114 · main synced<br>0 cloud tokens today</div></div>
 
 <div class="hud col" id="lcol">
-  <div class="grp"><h3>MACS</h3>
+  <div class="grp"><h3>MACS<span class="tag">DARWIN</span></h3>
     <div class="li"><span><i class="dot ok"></i>taylor</span><span class="v">leader</span></div>
     <div class="li"><span><i class="dot ok"></i>james</span><span class="v">64G</span></div>
     <div class="li"><span><i class="dot ok"></i>ace</span><span class="v">16G</span></div></div>
-  <div class="grp"><h3>AMD STRIX · 123G</h3>
+  <div class="grp"><h3>AMD STRIX<span class="tag">123G</span></h3>
     <div class="li"><span><i class="dot ok"></i>logan</span><span class="v">gfx1151</span></div>
     <div class="li"><span><i class="dot ok"></i>veronica</span><span class="v">gfx1151</span></div>
     <div class="li"><span><i class="dot ok"></i>lily</span><span class="v">gfx1151</span></div>
     <div class="li"><span><i class="dot ok"></i>duncan</span><span class="v">gfx1151</span></div></div>
-  <div class="grp"><h3>LINUX · 32G</h3>
+  <div class="grp"><h3>LINUX<span class="tag">32G</span></h3>
     <div class="li"><span><i class="dot ok"></i>marcus</span><span class="v">coder▸</span></div>
     <div class="li"><span><i class="dot ok"></i>sophie</span><span class="v">idle</span></div>
     <div class="li"><span><i class="dot ok"></i>priya</span><span class="v">idle</span></div>
     <div class="li"><span><i class="dot ok"></i>aura</span><span class="v">idle</span></div></div>
+  <div class="grp"><h3>TELEMETRY<span class="tag">LIVE</span></h3>
+    <div class="mrow"><div class="mh"><span>FLEET LOAD</span><span class="v" id="m-load-v">34%</span></div><div class="bar"><i id="m-load" style="width:34%"></i></div></div>
+    <div class="mrow"><div class="mh"><span>GPU POOL</span><span class="v" id="m-gpu-v">28%</span></div><div class="bar"><i id="m-gpu" style="width:28%"></i></div></div>
+    <div class="mrow"><div class="mh"><span>OFFLOAD</span><span class="v" id="m-off-v">75%</span></div><div class="bar g"><i id="m-off" style="width:75%"></i></div></div>
+  </div>
 </div>
 <div class="hud col" id="rcol">
-  <div class="grp"><h3>DGX GB10 · 122G</h3>
+  <div class="grp"><h3>DGX GB10<span class="tag">122G</span></h3>
     <div class="li"><span><i class="dot ok"></i>sia</span><span class="v">vllm</span></div>
     <div class="li"><span><i class="dot ok"></i>adele</span><span class="v">CX-7</span></div>
     <div class="li"><span><i class="dot ok"></i>rihanna</span><span class="v">CX-7</span></div>
     <div class="li"><span><i class="dot ok"></i>beyonce</span><span class="v">vllm</span></div></div>
-  <div class="grp"><h3>SUBSYSTEMS</h3>
-    <div class="li"><span><i class="dot ok"></i>orchestrator</span><span class="v">P1</span></div>
-    <div class="li"><span><i class="dot ok"></i>offload</span><span class="v">warm</span></div>
-    <div class="li"><span><i class="dot ok"></i>reconciler</span><span class="v">durable</span></div>
-    <div class="li"><span><i class="dot warn"></i>agents</span><span class="v">loading</span></div>
-    <div class="li"><span><i class="dot ok"></i>brain</span><span class="v">linked</span></div></div>
+  <div class="grp"><h3>SUBSYSTEMS<span class="tag">CORE</span></h3>
+    <div class="li"><span><i class="dot ok" id="ss-orchestrator"></i>orchestrator</span><span class="v">P1</span></div>
+    <div class="li"><span><i class="dot ok" id="ss-offload"></i>offload</span><span class="v">warm</span></div>
+    <div class="li"><span><i class="dot ok" id="ss-reconciler"></i>reconciler</span><span class="v">durable</span></div>
+    <div class="li"><span><i class="dot warn" id="ss-agents"></i>agents</span><span class="v">loading</span></div>
+    <div class="li"><span><i class="dot ok" id="ss-brain"></i>brain</span><span class="v">linked</span></div></div>
+  <div class="grp"><h3>PIPELINE<span class="tag">FLOW</span></h3>
+    <div class="li"><span>active tasks</span><span class="v" id="p-tasks">4</span></div>
+    <div class="li"><span>deployments</span><span class="v" id="p-deploys">8</span></div>
+    <div class="li"><span>brain nodes</span><span class="v" id="p-brain">linked</span></div>
+    <div class="li"><span>cloud tokens</span><span class="v" id="p-tokens">0</span></div></div>
+  <div class="grp"><h3>THROUGHPUT<span class="tag">LIVE</span></h3>
+    <div class="mrow"><div class="mh"><span>TASKS</span><span class="v" id="m-task-v">50%</span></div><div class="bar"><i id="m-task" style="width:50%"></i></div></div>
+    <div class="mrow"><div class="mh"><span>NETWORK</span><span class="v" id="m-net-v">15%</span></div><div class="bar"><i id="m-net" style="width:15%"></i></div></div>
+    <div class="mrow"><div class="mh"><span>BRAIN</span><span class="v" id="m-brain-v">95%</span></div><div class="bar"><i id="m-brain" style="width:95%"></i></div></div>
+  </div>
 </div>
 
 <div class="hud" id="answer"><div class="big" id="abig">15</div><div class="lab" id="alab">NODES ONLINE</div></div>
@@ -137,34 +180,71 @@ setTimeout(function(){var b=document.getElementById('boot');if(b)b.remove();},42
 const cv=document.getElementById('scene'),cx=cv.getContext('2d');
 let W,H;function rs(){W=cv.width=innerWidth;H=cv.height=innerHeight}addEventListener('resize',rs);rs();
 let t=0,level=0,target=0;
-// radial gauge
-function gauge(x,y,r,val,col,segs){
+// radial gauge — value 0..1, label drawn by the caller. `big` => larger center text.
+function gauge(x,y,r,val,col,segs,label,unit){
   segs=segs||40;const a0=Math.PI*0.75,a1=Math.PI*2.25,span=a1-a0;
+  cx.lineWidth=2;
+  // faint inner bezel ring for depth
+  cx.beginPath();cx.strokeStyle='rgba(55,198,255,.10)';cx.lineWidth=1;cx.arc(x,y,r+5,0,7);cx.stroke();
   cx.lineWidth=2;
   for(let i=0;i<segs;i++){const f=i/(segs-1),a=a0+f*span;
     cx.strokeStyle=f<=val?col:'rgba(55,198,255,.12)';cx.shadowColor=col;cx.shadowBlur=f<=val?8:0;
     cx.beginPath();cx.arc(x,y,r,a-0.012,a+0.012);cx.stroke();}
-  cx.shadowBlur=0;cx.fillStyle='#dffaff';cx.font='bold 15px Orbitron';cx.textAlign='center';cx.textBaseline='middle';
-  cx.fillText(Math.round(val*100)+'',x,y);
+  cx.shadowBlur=0;cx.fillStyle='#dffaff';
+  cx.font='bold '+(r>26?15:12)+'px Orbitron';cx.textAlign='center';cx.textBaseline='middle';
+  cx.fillText(Math.round(val*100)+(unit||''),x,y);
+  if(label){cx.fillStyle='rgba(127,231,255,.85)';cx.font='9px "Share Tech Mono"';
+    cx.fillText(label,x,y+r+12);}
 }
 function ring(cxp,cyp,r,segs,gap,rot,w,glow,col){cx.lineWidth=w;cx.strokeStyle=col;cx.shadowColor=col;cx.shadowBlur=glow;
   const st=(Math.PI*2)/segs;for(let i=0;i<segs;i++){const a=rot+i*st;cx.beginPath();cx.arc(cxp,cyp,r,a,a+st-gap);cx.stroke();}cx.shadowBlur=0}
-// gauge layout (fractions of viewport)
+// segmented perimeter tick-ring — a "dial" of radial ticks (major every `every`)
+function tickRing(cxp,cyp,r,n,len,rot,col,every){
+  for(let i=0;i<n;i++){const a=rot+(i/n)*Math.PI*2,mj=(i%every===0);
+    const r0=r,r1=r+(mj?len*1.9:len);
+    cx.beginPath();cx.lineWidth=mj?2:1;cx.strokeStyle=mj?col:'rgba(55,198,255,.22)';
+    cx.shadowColor=col;cx.shadowBlur=mj?6:0;
+    cx.moveTo(cxp+Math.cos(a)*r0,cyp+Math.sin(a)*r0);
+    cx.lineTo(cxp+Math.cos(a)*r1,cyp+Math.sin(a)*r1);cx.stroke();}
+  cx.shadowBlur=0;
+}
+// gauge layout (fractions of viewport) — dense ring of gauges framing the reactor.
+// `l` is the key the live-data poller targets via gset(); kept stable for wiring.
+// Positions are POLAR — angle (deg, 0=right, clockwise from screen) + radius as
+// a fraction of min(W,H) — so the gauges form a clean, even ring hugging the
+// reactor regardless of aspect ratio. Resolved to x/y each frame around (Cx,Cy).
 const G=[
-  {x:.30,y:.30,r:34,c:'#37c6ff',v:.34,l:'GPU'},{x:.70,y:.30,r:34,c:'#37c6ff',v:.22,l:'CPU'},
-  {x:.26,y:.62,r:30,c:'#7fe7ff',v:.48,l:'RAM'},{x:.74,y:.62,r:30,c:'#ffcf7a',v:.7,l:'OFFLOAD'},
-  {x:.20,y:.45,r:24,c:'#37c6ff',v:.15,l:'NET'},{x:.80,y:.45,r:24,c:'#37c6ff',v:.9,l:'BRAIN'},
+  // top arc (3)
+  {ang:248,rad:.255,r:30,c:'#37c6ff',v:.34,l:'GPU'},      // deployments load
+  {ang:270,rad:.275,r:36,c:'#7fe7ff',v:.50,l:'FLEET'},    // online/total nodes
+  {ang:292,rad:.255,r:30,c:'#37c6ff',v:.22,l:'CPU'},      // task throughput
+  // upper flanks (2)
+  {ang:212,rad:.275,r:28,c:'#37c6ff',v:.30,l:'MACS'},     // mac-class load
+  {ang:328,rad:.275,r:28,c:'#37c6ff',v:.90,l:'BRAIN'},    // brain/graph activity
+  // mid flanks (2)
+  {ang:180,rad:.285,r:27,c:'#7fe7ff',v:.48,l:'RAM'},      // ram pressure
+  {ang:0,  rad:.285,r:27,c:'#ffcf7a',v:.70,l:'OFFLOAD'},  // offload warmth
+  // lower flanks (2)
+  {ang:148,rad:.275,r:27,c:'#37c6ff',v:.42,l:'AMD'},      // amd-class load
+  {ang:32, rad:.275,r:27,c:'#37c6ff',v:.66,l:'DGX'},      // dgx-class load
+  // bottom arc (2)
+  {ang:110,rad:.255,r:25,c:'#37c6ff',v:.15,l:'NET'},      // network
+  {ang:70, rad:.255,r:25,c:'#ffcf7a',v:.55,l:'AGENTS'},   // agents readiness
 ];
 let gv=G.map(g=>g.v);
 function draw(){try{t+=0.016;level+=(target-level)*0.12;cx.clearRect(0,0,W,H);
-  const Cx=W/2,Cy=H*0.49,base=Math.min(W,H)*0.16,pulse=base*(1+0.04*Math.sin(t*2)+level*0.2);
+  const Cx=W/2,Cy=H*0.475,base=Math.min(W,H)*0.16,pulse=base*(1+0.04*Math.sin(t*2)+level*0.2);
+  const MIN=Math.min(W,H);
   // central reactor
-  ring(Cx,Cy,pulse*2.0,3,0.5,-t*0.15,2,12,'rgba(55,198,255,.25)');
-  ring(Cx,Cy,pulse*1.8,72,0.05,t*0.2,1,5,'rgba(55,198,255,.22)');
+  ring(Cx,Cy,pulse*2.18,3,0.5,-t*0.15,2,12,'rgba(55,198,255,.22)');
+  // segmented perimeter tick-ring (the cinematic dial) — two layers
+  tickRing(Cx,Cy,pulse*2.02,90,8,t*0.05,'rgba(55,198,255,.5)',9);
+  tickRing(Cx,Cy,pulse*1.92,30,5,-t*0.08,'rgba(127,231,255,.4)',5);
+  ring(Cx,Cy,pulse*1.78,72,0.05,t*0.2,1,5,'rgba(55,198,255,.22)');
   ring(Cx,Cy,pulse*1.55,16,0.16,-t*0.4,3,14+level*26,'rgba(55,198,255,'+(0.5+level*0.4)+')');
   ring(Cx,Cy,pulse*1.32,40,0.09,t*0.6,2,9,'rgba(127,231,255,.4)');
   ring(Cx,Cy,pulse*1.10,6,0.3,-t*0.9,5,18+level*36,'rgba(255,207,122,'+(0.32+level*0.5)+')');
-  // spectrum waveform ring
+  // spectrum waveform ring (audio-reactive)
   if(freq){cx.beginPath();const N=110;for(let i=0;i<N;i++){const a=(i/N)*Math.PI*2,m=freq[(i*2)%freq.length]/255;
     const rr=pulse*0.95+m*pulse*0.85,x=Cx+Math.cos(a)*rr,y=Cy+Math.sin(a)*rr;i?cx.lineTo(x,y):cx.moveTo(x,y);}
     cx.closePath();cx.strokeStyle='rgba(55,198,255,.55)';cx.lineWidth=2;cx.shadowBlur=12;cx.shadowColor='#37c6ff';cx.stroke();cx.shadowBlur=0;}
@@ -172,15 +252,24 @@ function draw(){try{t+=0.016;level+=(target-level)*0.12;cx.clearRect(0,0,W,H);
   const cr=pulse*(0.6+level*0.25),g=cx.createRadialGradient(Cx,Cy,0,Cx,Cy,cr);
   g.addColorStop(0,'rgba(223,250,255,.95)');g.addColorStop(.3,'rgba(55,198,255,.9)');g.addColorStop(.7,'rgba(28,111,140,.45)');g.addColorStop(1,'rgba(10,34,48,0)');
   cx.beginPath();cx.fillStyle=g;cx.shadowColor='#37c6ff';cx.shadowBlur=55+level*70;cx.arc(Cx,Cy,cr,0,7);cx.fill();cx.shadowBlur=0;
-  // surrounding gauges
-  G.forEach((gg,i)=>{gv[i]+=((gg.v+(Math.random()-.5)*0.04)-gv[i])*0.05;
-    gauge(gg.x*W,gg.y*H,gg.r,Math.max(0,Math.min(1,gv[i])),gg.c,gg.r>30?44:32);
-    cx.fillStyle='rgba(28,111,140,.9)';cx.font='9px "Share Tech Mono"';cx.fillText(gg.l,gg.x*W,gg.y*H+gg.r+12);});
+  // thin connector spokes from the reactor out to each gauge (subtle, dense feel)
+  G.forEach((gg)=>{const a=gg.ang*Math.PI/180,rr=gg.rad*MIN;
+    const gx=Cx+Math.cos(a)*rr,gy=Cy+Math.sin(a)*rr;
+    cx.beginPath();cx.strokeStyle='rgba(55,198,255,.10)';cx.lineWidth=1;
+    cx.moveTo(Cx+Math.cos(a)*pulse*2.06,Cy+Math.sin(a)*pulse*2.06);
+    cx.lineTo(gx-Math.cos(a)*(gg.r+8),gy-Math.sin(a)*(gg.r+8));cx.stroke();});
+  // surrounding gauges (dense ring, polar-resolved around the reactor)
+  G.forEach((gg,i)=>{gv[i]+=((gg.v+(Math.random()-.5)*0.025)-gv[i])*0.05;
+    const a=gg.ang*Math.PI/180,rr=gg.rad*MIN;
+    const gx=Cx+Math.cos(a)*rr,gy=Cy+Math.sin(a)*rr;
+    gauge(gx,gy,gg.r,Math.max(0,Math.min(1,gv[i])),gg.c,gg.r>30?44:32,gg.l);});
   }catch(e){console.error('draw',e)}
   requestAnimationFrame(draw);}
 requestAnimationFrame(draw);
 
 // clock
+const crail=document.getElementById('crail');
+if(crail){let h='';for(let i=0;i<41;i++){const mj=(i%5===0);h+='<i class="'+(mj?'mj':'')+'" style="left:'+(i*(100/40))+'%"></i>';}crail.innerHTML=h;}
 setInterval(()=>{const d=new Date();document.getElementById('ct').textContent=d.toLocaleTimeString('en-GB');
   document.getElementById('cd').textContent=d.toLocaleDateString('en-GB',{weekday:'long',day:'numeric',month:'short'}).toUpperCase();},250);
 
@@ -271,6 +360,10 @@ mic.onclick=listen;cv.onclick=listen;
 // silently to the static/animated baseline when absent (e.g. the prototype
 // server), so the HUD always renders.
 const gset=(l,v)=>{const g=G.find(x=>x.l===l);if(g)g.v=Math.max(0,Math.min(1,v));};
+// sync a canvas gauge value into its matching DOM bar-meter (if present).
+const meter=(id,v)=>{const b=document.getElementById('m-'+id),bv=document.getElementById('m-'+id+'-v');
+  const p=Math.round(Math.max(0,Math.min(1,v))*100);if(b)b.style.width=p+'%';if(bv)bv.textContent=p+'%';};
+const setDot=(id,st)=>{const e=document.getElementById('ss-'+id);if(e){e.className='dot '+(st==='ok'?'ok':st==='warn'?'warn':st==='unknown'?'warn':'bad');}};
 async function pollState(){
   try{
     const r=await fetch('/api/jarvis/state',{cache:'no-store'});
@@ -281,17 +374,50 @@ async function pollState(){
       document.getElementById('alab').textContent='NODES ONLINE';
       const wb=document.querySelector('#wx .big'); if(wb)wb.textContent=tot+' NODES';
       const cf=document.getElementById('c-fleet'); if(cf)cf.textContent=on+' online · '+(d.fleet.leader||'—')+' leads';
-      gset('BRAIN', d.brain&&d.brain.linked?0.95:0.2);
+      const fleetFrac = tot>0 ? on/tot : 0;
+      gset('FLEET', fleetFrac); meter('load', fleetFrac);
+      gset('BRAIN', d.brain&&d.brain.linked?0.95:0.2); meter('brain', d.brain&&d.brain.linked?0.95:0.2);
+      const pb=document.getElementById('p-brain'); if(pb)pb.textContent=(d.brain&&d.brain.linked)?'linked':'cold';
     }
     if(d.offload!==undefined){
       const o=d.offload, co=document.getElementById('c-offload');
-      if(o){ if(co)co.textContent=(o.status||'cold')+' · '+(o.worker_name||'—'); gset('OFFLOAD', o.status==='warm'?0.75:0.1); }
-      else { if(co)co.textContent='no warm endpoint'; gset('OFFLOAD',0.05); }
+      if(o){ if(co)co.textContent=(o.status||'cold')+' · '+(o.worker_name||'—'); gset('OFFLOAD', o.status==='warm'?0.75:0.1); meter('off', o.status==='warm'?0.75:0.1); }
+      else { if(co)co.textContent='no warm endpoint'; gset('OFFLOAD',0.05); meter('off',0.05); }
     }
     if(d.tasks){const ct=document.getElementById('c-tasks');
-      if(ct)ct.textContent=(d.tasks.active_count||0)+' active'+(d.tasks.top_name?' · '+d.tasks.top_name.slice(0,22):'');
-      gset('CPU', Math.min(1,(d.tasks.active_count||0)/8));}
-    if(Array.isArray(d.deployments)) gset('GPU', Math.min(1,d.deployments.length/12));
+      const ac=d.tasks.active_count||0;
+      if(ct)ct.textContent=ac+' active'+(d.tasks.top_name?' · '+d.tasks.top_name.slice(0,22):'');
+      const taskFrac=Math.min(1,ac/8);
+      gset('CPU', taskFrac); meter('task', taskFrac);
+      const pt=document.getElementById('p-tasks'); if(pt)pt.textContent=ac;
+    }
+    if(Array.isArray(d.deployments)){
+      const dl=Math.min(1,d.deployments.length/12);
+      gset('GPU', dl);
+      const pd=document.getElementById('p-deploys'); if(pd)pd.textContent=d.deployments.length;
+      gset('NET', Math.min(1, d.deployments.length/15)); meter('net', Math.min(1, d.deployments.length/15));
+    }
+    // per-node-class load from the live nodes[] array (online fraction by class).
+    if(Array.isArray(d.nodes)){
+      const cls={mac:['taylor','james','ace'],
+        amd:['logan','veronica','lily','duncan'],
+        dgx:['sia','adele','rihanna','beyonce']};
+      const frac=(names)=>{const set=d.nodes.filter(n=>names.includes((n.name||'').toLowerCase()));
+        if(!set.length)return 0;const up=set.filter(n=>(n.status||'').toLowerCase()==='online').length;
+        // load = online fraction blended with models-loaded pressure
+        const ml=set.reduce((a,n)=>a+(n.models_loaded||0),0);
+        return Math.min(1, (up/set.length)*0.6 + Math.min(1,ml/set.length)*0.4);};
+      gset('MACS', frac(cls.mac)); gset('AMD', frac(cls.amd)); gset('DGX', frac(cls.dgx));
+      // RAM gauge — average models-loaded pressure across all nodes as a proxy.
+      const totMl=d.nodes.reduce((a,n)=>a+(n.models_loaded||0),0);
+      gset('RAM', Math.min(1, totMl/Math.max(1,d.nodes.length)*0.5+0.25));
+    }
+    if(d.subsystems){
+      const s=d.subsystems;
+      setDot('orchestrator',s.orchestrator); setDot('offload',s.offload);
+      setDot('reconciler',s.reconciler); setDot('agents',s.agents); setDot('brain',s.brain);
+      gset('AGENTS', s.agents==='ok'?0.85:s.agents==='warn'?0.45:0.2);
+    }
     window.__live=true;
   }catch(e){/* keep static baseline */}
 }
