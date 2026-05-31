@@ -14,6 +14,9 @@
 //! - [`wake_word`] — Wake word detection via keyword spotting on transcribed text
 
 pub mod audio;
+/// Native mic capture (cpal) — macOS only; cpal's Linux backend needs ALSA
+/// headers absent on CI/fleet Linux, and voice runs only on the leader (Taylor).
+#[cfg(target_os = "macos")]
 pub mod capture;
 pub mod pipeline;
 pub mod stt;
@@ -61,6 +64,7 @@ pub type Result<T> = std::result::Result<T, VoiceError>;
 // ─── Re-exports ──────────────────────────────────────────────────────────────
 
 pub use audio::{AudioChunk, AudioFormat, SampleRate};
+#[cfg(target_os = "macos")]
 pub use capture::{
     CaptureHandle, MicCapture, MicCaptureConfig, TARGET_SAMPLE_RATE, encode_wav_bytes,
     write_temp_wav,

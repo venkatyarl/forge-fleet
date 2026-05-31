@@ -4,26 +4,27 @@
 //! wake-word "jarvis" → strip wake-word → POST the live gateway
 //! `/api/jarvis/ask` → speak the answer with macOS `say -v Daniel`.
 //!
-//! Reuses the existing `ff-voice` crate: [`MicCapture`] for capture+VAD,
-//! [`LocalWhisperEngine`] for STT, [`WakeWordDetector`] for the wake word, and
-//! [`SayTts`] for native output. Nothing in `ff-voice` is modified — this only
-//! wires the pieces together.
+//! Reuses the existing `ff-voice` crate: [`ff_voice::MicCapture`] for capture+VAD,
+//! [`ff_voice::LocalWhisperEngine`] for STT, [`ff_voice::WakeWordDetector`] for the
+//! wake word, and [`ff_voice::SayTts`] for native output. Nothing in `ff-voice` is
+//! modified — this only wires the pieces together.
+//!
+//! **macOS only.** Mic capture goes through cpal's CoreAudio backend, and the loop
+//! runs on the leader (Taylor) where the operator sits. On other platforms the
+//! subcommand exists but returns a clear "macOS only" error (the cpal/ALSA stack
+//! isn't compiled on Linux/CI — see `ff-voice/Cargo.toml`).
 
-use crate::{CYAN, GREEN, RESET, YELLOW};
-use anyhow::{Context, Result};
-
-use ff_voice::{
-    LocalWhisperConfig, LocalWhisperEngine, MicCapture, MicCaptureConfig, SayTts, SttEngine,
-    WakeWordConfig, WakeWordDetector, stt::SttRequest,
-};
+use anyhow::Result;
 
 /// Gateway request body — matches the gateway's `AskReq` struct (field `query`).
+#[cfg(target_os = "macos")]
 #[derive(serde::Serialize)]
 struct AskReq {
     query: String,
 }
 
 /// Gateway response — we only need the `answer` string field.
+#[cfg(target_os = "macos")]
 #[derive(serde::Deserialize)]
 struct AskResp {
     #[serde(default)]
@@ -38,6 +39,7 @@ struct AskResp {
 /// * `voice`       — macOS `say` voice name (default "Daniel").
 /// * `once`        — process a single answered utterance, then return.
 /// * `whisper_cli` — whisper-cli binary path/name (resolved on PATH).
+#[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_voice(
     device: Option<String>,
@@ -47,6 +49,13 @@ pub async fn handle_voice(
     once: bool,
     whisper_cli: String,
 ) -> Result<()> {
+    use crate::{CYAN, GREEN, RESET, YELLOW};
+    use anyhow::Context;
+    use ff_voice::{
+        LocalWhisperConfig, LocalWhisperEngine, MicCapture, MicCaptureConfig, SayTts, SttEngine,
+        WakeWordConfig, WakeWordDetector, stt::SttRequest,
+    };
+
     eprintln!(
         "{CYAN}▶ ff voice{RESET}  \x1b[2mgateway={gateway} model={model} voice={voice} \
          whisper-cli={whisper_cli}{RESET}"
@@ -193,8 +202,27 @@ pub async fn handle_voice(
     Ok(())
 }
 
+/// Non-macOS stub: mic capture (cpal/CoreAudio) is macOS-only, so the loop is
+/// unavailable on Linux/Windows fleet nodes. Run `ff voice` on the leader (Taylor).
+#[cfg(not(target_os = "macos"))]
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_voice(
+    _device: Option<String>,
+    _model: String,
+    _gateway: String,
+    _voice: String,
+    _once: bool,
+    _whisper_cli: String,
+) -> Result<()> {
+    anyhow::bail!(
+        "`ff voice` is supported on macOS only (CoreAudio mic capture). \
+         Run it on the leader (Taylor)."
+    )
+}
+
 /// Strip a leading "jarvis" (with optional trailing comma) from a transcript,
 /// returning the remaining query, trimmed.
+#[cfg(target_os = "macos")]
 fn strip_wake_word(text: &str) -> String {
     let lower = text.to_ascii_lowercase();
     if let Some(idx) = lower.find("jarvis") {
