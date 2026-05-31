@@ -731,6 +731,67 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         ));
     }
 
+    // 20) Disk sampler tick — every 5min, PER-NODE (not leader-gated).
+    //
+    // Historically the disk sampler ran ONLY in the legacy `ff daemon`
+    // (crates/ff-terminal/src/daemon_cmd.rs) — which production hosts running
+    // `forgefleetd` never start. Result: `fleet_disk_usage` was stale on every
+    // forgefleetd-only host (7 of 13 nodes hadn't sampled since 2026-05-13).
+    // Each node samples ITS OWN disk, so this is per-node like the deployment
+    // reconciler — NOT leader-gated. Without fresh samples the quota check, the
+    // over-quota alert, and the V118 disk-reconcile tick all run on stale data.
+    if let Some(pg_pool) = operational_store.pg_pool().cloned() {
+        info!("starting subsystem: disk sampler tick (5min, per-node)");
+        let mut shutdown_rx_disk = shutdown_rx.clone();
+        subsystem_tasks.push(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(300));
+            // Fire once promptly so a freshly-(re)started daemon writes a row
+            // immediately instead of waiting a full 5min — this is what makes a
+            // previously-stale host show a FRESH fleet_disk_usage row right after
+            // deploy.
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = shutdown_rx_disk.changed() => break,
+                    _ = tick.tick() => {
+                        match ff_agent::disk_sampler::sample_local_disk(&pg_pool).await {
+                            Ok(s) => tracing::debug!(
+                                node = %s.worker_name,
+                                used_mb = s.used_bytes / 1_048_576,
+                                free_mb = s.free_bytes / 1_048_576,
+                                over_quota = s.over_quota,
+                                "disk sample written"
+                            ),
+                            Err(e) => warn!(error = %e, "disk sampler failed"),
+                        }
+                    }
+                }
+            }
+        }));
+    }
+
+    // 21) Disk-reconcile tick — every 5min, leader-gated.
+    //
+    // V118 active disk management: reads `fleet_disk_usage`, finds over-quota
+    // nodes, and runs the MOVE-vs-DELETE policy. SAFETY: gated by
+    // `fleet_secrets.disk_policy_mode` (off|dry-run|active), DEFAULT off — the
+    // tick is a pure no-op until an operator opts in, so deploying it is
+    // harmless. `dry-run` logs the classified plan; `active` deletes
+    // wrong-runtime/retired/peer-backed copies and relocates last copies of
+    // still-wanted models (transfer-then-delete-after-verify). Leader-gated like
+    // the autoscaler — disk policy is global state.
+    if let Some(pg_pool) = operational_store.pg_pool().cloned() {
+        info!(
+            "starting subsystem: disk-reconcile tick (5min, leader-gated, gate=fleet_secrets.disk_policy_mode default off)"
+        );
+        subsystem_tasks.push(ff_agent::disk_reconcile::spawn_disk_reconcile_tick(
+            pg_pool,
+            worker_name.clone(),
+            300,
+            shutdown_rx.clone(),
+        ));
+    }
+
     info!("all subsystems started; waiting for shutdown signal");
     wait_for_shutdown_signal().await;
 

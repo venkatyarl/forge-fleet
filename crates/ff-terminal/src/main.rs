@@ -2194,6 +2194,10 @@ pub enum ModelCommand {
         /// Min days since last use before a row can be considered cold.
         #[arg(long, default_value_t = 7)]
         min_cold_days: i64,
+        /// Show the V118 MOVE-vs-DELETE classified plan (per-candidate action +
+        /// move target) instead of the plain eviction order. Always dry-run.
+        #[arg(long)]
+        classified: bool,
     },
     /// Health-check a running deployment by id.
     Ping { id: String },

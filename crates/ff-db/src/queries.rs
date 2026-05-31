@@ -2077,6 +2077,22 @@ pub async fn pg_get_catalog(pool: &PgPool, id: &str) -> Result<Option<ModelCatal
     }))
 }
 
+/// V118: the set of catalog ids that have been RETIRED via the lifecycle table
+/// (`model_catalog.lifecycle_status = 'retired'`). The disk-reconcile classifier
+/// treats a retired model as a DELETE candidate even if it's the only copy —
+/// nobody wants it back. Best-effort: returns an empty set if the lifecycle
+/// table is missing (older DB) rather than erroring.
+pub async fn pg_retired_catalog_ids(pool: &PgPool) -> Result<std::collections::HashSet<String>> {
+    let rows = match sqlx::query("SELECT id FROM model_catalog WHERE lifecycle_status = 'retired'")
+        .fetch_all(pool)
+        .await
+    {
+        Ok(r) => r,
+        Err(_) => return Ok(std::collections::HashSet::new()),
+    };
+    Ok(rows.iter().map(|r| r.get::<String, _>("id")).collect())
+}
+
 /// Library entry — a model file on disk on a specific node.
 #[derive(Debug, Clone)]
 pub struct ModelLibraryRow {
@@ -2091,6 +2107,9 @@ pub struct ModelLibraryRow {
     pub downloaded_at: chrono::DateTime<chrono::Utc>,
     pub last_used_at: Option<chrono::DateTime<chrono::Utc>>,
     pub source_url: Option<String>,
+    /// V118: a pinned library row is never auto-evicted (delete or move-then-
+    /// delete) by the disk-reconcile tick, regardless of age/peer-copies.
+    pub pinned: bool,
 }
 
 /// Upsert a library entry keyed by (worker_name, file_path). Returns library id.
@@ -2166,6 +2185,9 @@ pub async fn pg_list_library(
                 downloaded_at: r.get("downloaded_at"),
                 last_used_at: r.get("last_used_at"),
                 source_url: r.get("source_url"),
+                // V118: present after the disk_management migration; default
+                // false on older rows via the column default.
+                pinned: r.try_get("pinned").unwrap_or(false),
             }
         })
         .collect())
@@ -3214,6 +3236,142 @@ pub async fn pg_insert_disk_usage(
     .bind(used_bytes)
     .bind(free_bytes)
     .bind(models_bytes)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+// ─── V118: disk-management resource + observability helpers ─────────────────
+
+/// Latest free/total bytes for ONE node from `fleet_disk_usage`, plus how stale
+/// the sample is. `(free_bytes, total_bytes, sample_age_secs)`. `None` when the
+/// node has never been sampled.
+///
+/// This is the small "free-disk as a resource" read (#6) the future arbiter and
+/// the transfer/placement pre-checks consume — a single point of truth so we
+/// never re-implement `df` parsing in three places.
+pub async fn pg_node_free_disk(
+    pool: &PgPool,
+    worker_name: &str,
+) -> Result<Option<(i64, i64, i64)>> {
+    let row = sqlx::query(
+        "SELECT free_bytes, total_bytes,
+                EXTRACT(EPOCH FROM (NOW() - sampled_at))::BIGINT AS age_secs
+           FROM fleet_disk_usage
+          WHERE worker_name = $1
+          ORDER BY sampled_at DESC
+          LIMIT 1",
+    )
+    .bind(worker_name)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| {
+        (
+            r.get::<i64, _>("free_bytes"),
+            r.get::<i64, _>("total_bytes"),
+            r.get::<i64, _>("age_secs"),
+        )
+    }))
+}
+
+/// Set the `pinned` flag on a library row. A pinned row is never auto-evicted.
+pub async fn pg_set_library_pinned(pool: &PgPool, id: &str, pinned: bool) -> Result<bool> {
+    let uuid = sqlx::types::Uuid::parse_str(id)
+        .map_err(|e| crate::error::DbError::NotFound(format!("bad uuid {id}: {e}")))?;
+    let r = sqlx::query("UPDATE fleet_model_library SET pinned = $2 WHERE id = $1")
+        .bind(uuid)
+        .bind(pinned)
+        .execute(pool)
+        .await?;
+    Ok(r.rows_affected() > 0)
+}
+
+/// Insert one observability row for a leader disk-reconcile pass. Returns the
+/// run id.
+#[allow(clippy::too_many_arguments)]
+pub async fn pg_insert_disk_policy_run(
+    pool: &PgPool,
+    mode: &str,
+    nodes_over_quota: i32,
+    planned_deletes: i32,
+    planned_moves: i32,
+    actuated_deletes: i32,
+    actuated_moves: i32,
+    bytes_planned: i64,
+    bytes_freed: i64,
+    detail: &serde_json::Value,
+) -> Result<i64> {
+    let row = sqlx::query(
+        "INSERT INTO disk_policy_runs
+            (mode, nodes_over_quota, planned_deletes, planned_moves,
+             actuated_deletes, actuated_moves, bytes_planned, bytes_freed, detail)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+         RETURNING id",
+    )
+    .bind(mode)
+    .bind(nodes_over_quota)
+    .bind(planned_deletes)
+    .bind(planned_moves)
+    .bind(actuated_deletes)
+    .bind(actuated_moves)
+    .bind(bytes_planned)
+    .bind(bytes_freed)
+    .bind(detail)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.get::<i64, _>("id"))
+}
+
+/// Open a move-log row when the active tick starts a relocation. Returns id.
+#[allow(clippy::too_many_arguments)]
+pub async fn pg_open_disk_move(
+    pool: &PgPool,
+    source_node: &str,
+    target_node: &str,
+    catalog_id: &str,
+    runtime: &str,
+    src_library_id: &str,
+    size_bytes: i64,
+) -> Result<i64> {
+    let row = sqlx::query(
+        "INSERT INTO disk_move_log
+            (source_node, target_node, catalog_id, runtime, src_library_id, size_bytes)
+         VALUES ($1,$2,$3,$4,$5,$6) RETURNING id",
+    )
+    .bind(source_node)
+    .bind(target_node)
+    .bind(catalog_id)
+    .bind(runtime)
+    .bind(src_library_id)
+    .bind(size_bytes)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.get::<i64, _>("id"))
+}
+
+/// Advance a move-log row's status (verified / source_deleted / failed) and
+/// optionally record the new target library id and/or an error message.
+pub async fn pg_update_disk_move(
+    pool: &PgPool,
+    id: i64,
+    status: &str,
+    dst_library_id: Option<&str>,
+    error: Option<&str>,
+) -> Result<()> {
+    let finished = matches!(status, "source_deleted" | "failed");
+    sqlx::query(
+        "UPDATE disk_move_log
+            SET status = $2,
+                dst_library_id = COALESCE($3, dst_library_id),
+                error = COALESCE($4, error),
+                finished_at = CASE WHEN $5 THEN NOW() ELSE finished_at END
+          WHERE id = $1",
+    )
+    .bind(id)
+    .bind(status)
+    .bind(dst_library_id)
+    .bind(error)
+    .bind(finished)
     .execute(pool)
     .await?;
     Ok(())

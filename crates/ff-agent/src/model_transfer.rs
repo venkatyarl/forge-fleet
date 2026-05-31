@@ -176,6 +176,49 @@ pub async fn transfer_model(
         ));
     }
 
+    // 5b. TARGET FREE-DISK PRE-CHECK (V118).
+    //
+    // Previously this function had no preflight ("rsync will just fail if there's
+    // no room") — but a half-written multi-GB file plus a confusing rsync error
+    // is a bad failure mode, and the disk-reconcile tick needs a CLEAR refusal so
+    // it doesn't pick a target that can't actually hold the model. We `df` the
+    // target's models_dir filesystem and refuse unless
+    //   free >= size * 1.1 + 5 GiB floor.
+    {
+        const HEADROOM_FACTOR: f64 = 1.1;
+        const HEADROOM_FLOOR_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+        let need =
+            (src_lib.size_bytes.max(0) as f64 * HEADROOM_FACTOR) as u64 + HEADROOM_FLOOR_BYTES;
+
+        // `df -Pk <dir>` → POSIX 1024-byte blocks; column 4 (Available) is free.
+        let df_cmd = format!("df -Pk {}", shell_quote(&dst_models_dir));
+        let (dc, dout, derr) = ssh_exec(&dst_node.ssh_user, &dst_node.ip, &df_cmd).await?;
+        if dc != 0 {
+            return Err(format!(
+                "free-disk pre-check failed: df on {} exited {dc}: {}",
+                dst_node.name,
+                derr.trim()
+            ));
+        }
+        let last = dout.lines().last().unwrap_or("").trim();
+        let cols: Vec<&str> = last.split_whitespace().collect();
+        let free_bytes: u64 = cols
+            .get(3)
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(|k| k.saturating_mul(1024))
+            .ok_or_else(|| format!("could not parse df output on {}: {last:?}", dst_node.name))?;
+        if free_bytes < need {
+            return Err(format!(
+                "refusing transfer to {}: needs {} (size {} + headroom) but only {} free on {}",
+                dst_node.name,
+                human_bytes(need),
+                human_bytes(src_lib.size_bytes.max(0) as u64),
+                human_bytes(free_bytes),
+                dst_models_dir,
+            ));
+        }
+    }
+
     // 6. Run rsync on the target, pulling from the source.
     println!(
         "Transferring {} ({}) from {} to {} …",

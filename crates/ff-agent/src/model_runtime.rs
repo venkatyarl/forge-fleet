@@ -116,6 +116,45 @@ pub struct RunningProcess {
     pub context_window: Option<i32>,
 }
 
+/// PLACEMENT GUARD (V118): can `node` run a model whose runtime is `runtime`?
+///
+/// The rule mirrors the runtime-choice policy and the autoscaler's
+/// `runtime_compatible`, but keyed off the node's own configured `runtime` plus
+/// its OS (the authoritative fields on `FleetNodeRow`):
+///   • mlx   ⇒ macOS only (Metal). An mlx model on a Linux host is rejected.
+///   • vllm  ⇒ the node's runtime must be vllm (CUDA/GB10 box).
+///   • llama.cpp / ollama ⇒ runs anywhere; only rejected on a node explicitly
+///     configured for a different, incompatible runtime would be wrong, so we
+///     allow it broadly (CPU fallback exists everywhere).
+/// Returns `Ok(())` if the placement is allowed, else `Err(reason)`.
+pub fn check_runtime_placement(node: &ff_db::FleetNodeRow, runtime: &str) -> Result<(), String> {
+    let os = node.os.to_ascii_lowercase();
+    let is_macos = os.contains("mac") || os.contains("darwin");
+    match runtime {
+        "mlx" => {
+            if is_macos {
+                Ok(())
+            } else {
+                Err(format!("mlx requires macOS, node os='{}'", node.os))
+            }
+        }
+        "vllm" => {
+            // vllm needs a CUDA/GB10 box; the node must itself be a vllm node.
+            if node.runtime == "vllm" {
+                Ok(())
+            } else {
+                Err(format!(
+                    "vllm requires a CUDA/GB10 node (runtime='vllm'), node runtime='{}'",
+                    node.runtime
+                ))
+            }
+        }
+        // llama.cpp / ollama / unknown: CPU-runnable broadly. The only hard
+        // reject is a non-macOS-capable runtime mismatch already covered above.
+        _ => Ok(()),
+    }
+}
+
 /// Spawn an inference server for the given library row, wait for health, and record
 /// the deployment row in Postgres.
 pub async fn load_model(pool: &sqlx::PgPool, opts: LoadOptions) -> Result<LoadResult, String> {
@@ -134,6 +173,22 @@ pub async fn load_model(pool: &sqlx::PgPool, opts: LoadOptions) -> Result<LoadRe
             "library row is on '{}', but we're running on '{}'; cross-node load not implemented",
             lib.worker_name, worker_name
         ));
+    }
+
+    // PLACEMENT GUARD (V118): reject loading a model this node can't actually
+    // run — e.g. an mlx model on a Linux host or a vllm model without CUDA/GB10.
+    // Stops the problem upstream instead of letting the runtime spawn and fail
+    // cryptically. The library row's own `runtime` is the source of truth.
+    if let Some(node) = ff_db::pg_get_node(pool, &worker_name)
+        .await
+        .map_err(|e| format!("pg_get_node({worker_name}): {e}"))?
+    {
+        if let Err(reason) = check_runtime_placement(&node, &lib.runtime) {
+            return Err(format!(
+                "placement rejected: cannot load {} ({}) on {}: {reason}",
+                lib.catalog_id, lib.runtime, worker_name
+            ));
+        }
     }
 
     let port = opts.port;
