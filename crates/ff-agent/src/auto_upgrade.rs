@@ -1067,10 +1067,20 @@ async fn refresh_pypi_latest_versions(client: &reqwest::Client, pool: &PgPool) -
     .await
 }
 
-/// GitHub release tag refresh.
+/// GitHub release refresh, `ref_kind`-aware.
 /// `version_source = {"method":"github_release","repo":"cli/cli"}`.
-/// Strips a leading 'v' from the tag (v2.91.0 → 2.91.0) so versions match
-/// `--version` outputs.
+///
+/// `ref_kind` (default `tagged`) selects WHAT "latest" means:
+/// - `tagged` (or absent) → `releases/latest`; tag_name with a leading 'v'
+///   stripped (v2.91.0 → 2.91.0) so it matches `--version` output.
+/// - `main` / `master` / `branch:<x>` → that branch's HEAD commit
+///   (`commits/{ref}`), 10-char SHA — matches what `software_collector`
+///   reports for `*_git` rows.
+///
+/// Previously this ALWAYS hit `releases/latest`, ignoring `ref_kind`. For
+/// self-built rows like `forgefleetd_git`/`ff_git` (private repo, `ref_kind=main`,
+/// no releases) that 404s and `refresh_via_http` silently skipped → `latest_version`
+/// froze and the drift→dispatch loop went blind to new `main` commits (#26).
 async fn refresh_github_release_latest_versions(
     client: &reqwest::Client,
     pool: &PgPool,
@@ -1081,14 +1091,36 @@ async fn refresh_github_release_latest_versions(
         "github_release",
         |vs| {
             let repo = vs.get("repo")?.as_str()?;
-            Some(format!(
-                "https://api.github.com/repos/{repo}/releases/latest"
-            ))
+            let ref_kind = vs
+                .get("ref_kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or("tagged");
+            let url = match ref_kind {
+                "tagged" | "release" | "latest" => {
+                    format!("https://api.github.com/repos/{repo}/releases/latest")
+                }
+                "main" | "master" => {
+                    format!("https://api.github.com/repos/{repo}/commits/{ref_kind}")
+                }
+                // "branch:<x>" → commits/<x>; any other literal → commits/<literal>.
+                other => {
+                    let branch = other.strip_prefix("branch:").unwrap_or(other);
+                    format!("https://api.github.com/repos/{repo}/commits/{branch}")
+                }
+            };
+            Some(url)
         },
         |body| {
             let v: serde_json::Value = serde_json::from_str(body).ok()?;
-            let tag = v.get("tag_name")?.as_str()?;
-            Some(tag.strip_prefix('v').unwrap_or(tag).to_string())
+            // releases/latest → {"tag_name": "..."}; commits/{ref} → {"sha": "..."}.
+            // Try both shapes so one parser serves every ref_kind.
+            if let Some(tag) = v.get("tag_name").and_then(|t| t.as_str()) {
+                return Some(tag.strip_prefix('v').unwrap_or(tag).to_string());
+            }
+            if let Some(sha) = v.get("sha").and_then(|s| s.as_str()) {
+                return Some(sha.chars().take(10).collect());
+            }
+            None
         },
     )
     .await
@@ -1177,7 +1209,9 @@ where
                 }
             },
             Ok(r) => {
-                tracing::debug!(software_id = %id, %url, status = %r.status(), "upstream non-2xx");
+                // A persistent non-2xx (e.g. a 404 from a misrouted ref_kind, as
+                // in #26) must be visible, not a silent skip that strands the row.
+                tracing::warn!(software_id = %id, %url, status = %r.status(), "upstream non-2xx — latest_version not refreshed");
                 continue;
             }
             Err(e) => {
