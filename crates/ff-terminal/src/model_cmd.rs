@@ -754,7 +754,10 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                     let node_row = ff_db::pg_get_node(&pool, &target)
                         .await?
                         .ok_or_else(|| anyhow::anyhow!("node '{target}' not in fleet_workers"))?;
-                    let remote_cmd = format!("ff model unload {}", shell_escape_single(&id));
+                    // Use the canonical install path: a non-login SSH session
+                    // doesn't have ~/.local/bin on PATH, so bare `ff` exits 127.
+                    let remote_cmd =
+                        format!("~/.local/bin/ff model unload {}", shell_escape_single(&id));
                     println!(
                         "{CYAN}▶ Unloading deployment {id} on {target} ({}@{})...{RESET}",
                         node_row.ssh_user, node_row.ip
