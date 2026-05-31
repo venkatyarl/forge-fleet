@@ -923,3 +923,72 @@ fn strip_think_block(s: &str) -> String {
 pub async fn jarvis_hud() -> impl IntoResponse {
     axum::response::Html(include_str!("../../../dashboard/public/jarvis.html"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Imperative/task-like utterances must classify as ACTIONS (`true`).
+    #[test]
+    fn classifies_actions_as_action() {
+        for q in [
+            "build a readme",
+            "fix the bug in main.rs",
+            "implement the cache",
+            "refactor this",
+            "deploy to taylor",
+            "run the tests",
+            "please add a test",               // "please " lead-in
+            "go ahead and migrate the schema", // "go ahead" lead-in
+            "set up CI",                       // "set up " two-word phrase
+            "can you build a hello world",     // polite_action: can/you/<verb>
+        ] {
+            assert!(
+                is_action_request(q),
+                "expected ACTION (true) for {q:?}, got false"
+            );
+        }
+    }
+
+    /// Questions (and ambiguous utterances) must classify as NOT-action
+    /// (`false`) so the caller takes the lower-consequence ANSWER path.
+    #[test]
+    fn classifies_questions_as_not_action() {
+        for q in [
+            "what is the fleet status?",
+            "how many nodes are online?",
+            "why did the build fail?",
+            "is marcus online?",
+            "show me the deployments", // "show" is a QUESTION_LEAD
+            "list the tasks",          // "list" is a QUESTION_LEAD
+            "who is the leader?",
+            "can you tell me the status?", // trailing '?' wins; also "tell" is not an ACTION_VERB
+            "could you explain the orchestrator?",
+        ] {
+            assert!(
+                !is_action_request(q),
+                "expected QUESTION (false) for {q:?}, got true"
+            );
+        }
+    }
+
+    /// Edge cases pinned to the IMPLEMENTATION's actual behavior (regression
+    /// fence, not a re-design).
+    #[test]
+    fn edge_cases_match_impl() {
+        // Bare "status" — first word IS a QUESTION_LEAD, so it short-circuits
+        // to a question even though there's no '?'. => false.
+        assert!(!is_action_request("status"));
+
+        // "build status" — first word "build" is NOT a QUESTION_LEAD, so the
+        // question short-circuit (rule 1) does not fire; rule 3 then matches
+        // "build" as an ACTION_VERB anywhere in the utterance. => true.
+        // (Implementation prioritizes verb-presence over the trailing "status"
+        // noun once the leading word isn't interrogative.)
+        assert!(is_action_request("build status"));
+
+        // Empty / whitespace-only input is explicitly handled as not-action.
+        assert!(!is_action_request(""));
+        assert!(!is_action_request("   "));
+    }
+}

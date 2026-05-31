@@ -4803,6 +4803,43 @@ mod tests {
         assert_eq!(rows[0].node_id.as_deref(), Some("node-gamma"));
         assert_eq!(rows[0].hostname.as_deref(), Some("gamma.local"));
     }
+
+    // ── offload_workload_for_kind: pure kind→workload-tag mapping (no DB) ──
+
+    #[test]
+    fn offload_workload_maps_code_kinds_to_code_gen() {
+        // Exactly the four kinds the impl matches (post-lowercase) → "code-gen".
+        for kind in ["codegen", "edits", "tests", "code"] {
+            assert_eq!(
+                offload_workload_for_kind(Some(kind)),
+                Some("code-gen"),
+                "kind {kind:?} should prefer a code-gen coder model"
+            );
+        }
+    }
+
+    #[test]
+    fn offload_workload_is_case_insensitive_for_code_kinds() {
+        // Impl lowercases input before matching, so upper/mixed case still maps.
+        assert_eq!(offload_workload_for_kind(Some("CODEGEN")), Some("code-gen"));
+        assert_eq!(offload_workload_for_kind(Some("Code")), Some("code-gen"));
+        assert_eq!(offload_workload_for_kind(Some("Tests")), Some("code-gen"));
+    }
+
+    #[test]
+    fn offload_workload_unmapped_kinds_are_none() {
+        // Any non-code kind has no workload preference → None (routes to the
+        // cheapest warm tool-capable model).
+        assert_eq!(offload_workload_for_kind(Some("chat")), None);
+        assert_eq!(offload_workload_for_kind(Some("summarize")), None);
+        // Empty string is just another unmapped kind.
+        assert_eq!(offload_workload_for_kind(Some("")), None);
+    }
+
+    #[test]
+    fn offload_workload_none_input_is_none() {
+        assert_eq!(offload_workload_for_kind(None), None);
+    }
 }
 
 // ─── Task Provenance ─────────────────────────────────────────────────────────
