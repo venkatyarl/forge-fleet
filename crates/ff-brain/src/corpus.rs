@@ -17,8 +17,16 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 const SKIP_DIRS: &[&str] = &[
-    "node_modules", ".git", "target", "dist", ".next", "__pycache__", ".venv",
-    "venv", ".cache", "build",
+    "node_modules",
+    ".git",
+    "target",
+    "dist",
+    ".next",
+    "__pycache__",
+    ".venv",
+    "venv",
+    ".cache",
+    "build",
 ];
 
 const SEED_FACETS: &[(&str, &str, &str)] = &[
@@ -117,7 +125,11 @@ pub async fn add_corpus(
     .bind(title)
     .fetch_one(pg)
     .await?;
-    let corpus = Corpus { id: row.get("id"), slug: row.get("slug"), title: row.get("title") };
+    let corpus = Corpus {
+        id: row.get("id"),
+        slug: row.get("slug"),
+        title: row.get("title"),
+    };
 
     for (root, label) in roots {
         add_source(pg, &corpus, root, label.as_deref()).await?;
@@ -128,8 +140,12 @@ pub async fn add_corpus(
                VALUES ($1, $2, $3, $4)
                ON CONFLICT (corpus_id, dimension, value) DO NOTHING"#,
         )
-        .bind(corpus.id).bind(dim).bind(val).bind(disp)
-        .execute(pg).await?;
+        .bind(corpus.id)
+        .bind(dim)
+        .bind(val)
+        .bind(disp)
+        .execute(pg)
+        .await?;
     }
     Ok(corpus)
 }
@@ -160,8 +176,14 @@ pub async fn add_source(
 
 pub async fn get_corpus(pg: &PgPool, slug: &str) -> anyhow::Result<Option<Corpus>> {
     let row = sqlx::query("SELECT id, slug, title FROM brain_corpora WHERE slug = $1")
-        .bind(slug).fetch_optional(pg).await?;
-    Ok(row.map(|r| Corpus { id: r.get("id"), slug: r.get("slug"), title: r.get("title") }))
+        .bind(slug)
+        .fetch_optional(pg)
+        .await?;
+    Ok(row.map(|r| Corpus {
+        id: r.get("id"),
+        slug: r.get("slug"),
+        title: r.get("title"),
+    }))
 }
 
 pub async fn list_sources(pg: &PgPool, corpus: &Corpus) -> anyhow::Result<Vec<Source>> {
@@ -170,14 +192,19 @@ pub async fn list_sources(pg: &PgPool, corpus: &Corpus) -> anyhow::Result<Vec<So
            FROM brain_sources WHERE corpus_id = $1
            ORDER BY root_path COLLATE "C""#,
     )
-    .bind(corpus.id).fetch_all(pg).await?;
-    Ok(rows.into_iter().map(|r| Source {
-        id: r.get("id"),
-        root_path: r.get("root_path"),
-        label: r.get("label"),
-        scan_status: r.get("scan_status"),
-        file_count: r.get("file_count"),
-    }).collect())
+    .bind(corpus.id)
+    .fetch_all(pg)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| Source {
+            id: r.get("id"),
+            root_path: r.get("root_path"),
+            label: r.get("label"),
+            scan_status: r.get("scan_status"),
+            file_count: r.get("file_count"),
+        })
+        .collect())
 }
 
 pub async fn list_corpora(pg: &PgPool) -> anyhow::Result<Vec<CorpusSummary>> {
@@ -192,15 +219,19 @@ pub async fn list_corpora(pg: &PgPool) -> anyhow::Result<Vec<CorpusSummary>> {
            FROM brain_corpora c
            ORDER BY c.slug COLLATE "C""#,
     )
-    .fetch_all(pg).await?;
-    Ok(rows.into_iter().map(|r| CorpusSummary {
-        slug: r.get("slug"),
-        title: r.get("title"),
-        sources: r.get("sources"),
-        entities: r.get("entities"),
-        facets: r.get("facets"),
-        content: r.get("content"),
-    }).collect())
+    .fetch_all(pg)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| CorpusSummary {
+            slug: r.get("slug"),
+            title: r.get("title"),
+            sources: r.get("sources"),
+            entities: r.get("entities"),
+            facets: r.get("facets"),
+            content: r.get("content"),
+        })
+        .collect())
 }
 
 pub async fn scan(
@@ -211,7 +242,12 @@ pub async fn scan(
 ) -> anyhow::Result<ScanReport> {
     let sources = list_sources(pg, corpus).await?;
     let mut report = ScanReport {
-        sources_scanned: 0, dirs: 0, files: 0, nodes_upserted: 0, edges: 0, candidates: 0,
+        sources_scanned: 0,
+        dirs: 0,
+        files: 0,
+        nodes_upserted: 0,
+        edges: 0,
+        candidates: 0,
     };
 
     let mut all_paths: Vec<PathBuf> = Vec::new();
@@ -220,10 +256,14 @@ pub async fn scan(
 
     for source in &sources {
         if let Some(only) = only_source {
-            if expand_path(only) != source.root_path { continue; }
+            if expand_path(only) != source.root_path {
+                continue;
+            }
         }
         let root = PathBuf::from(&source.root_path);
-        if !root.exists() { continue; }
+        if !root.exists() {
+            continue;
+        }
         source_roots.push((root.clone(), source.label.clone()));
 
         let walked = walk(&root, max_depth);
@@ -231,27 +271,46 @@ pub async fn scan(
 
         for entry in &walked {
             let abs = entry.path.to_string_lossy().to_string();
-            let title = entry.path.file_name()
+            let title = entry
+                .path
+                .file_name()
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_else(|| abs.clone());
-            let node_type = if entry.is_dir { "content:dir" } else { "content:file" };
+            let node_type = if entry.is_dir {
+                "content:dir"
+            } else {
+                "content:file"
+            };
             let hash = cheap_hash(&abs, entry.size, entry.mtime);
 
             let id = upsert_content_node(pg, &abs, &title, node_type, &corpus.slug, &hash).await?;
             path_id.insert(entry.path.clone(), id);
             report.nodes_upserted += 1;
-            if entry.is_dir { report.dirs += 1; } else { report.files += 1; }
+            if entry.is_dir {
+                report.dirs += 1;
+            } else {
+                report.files += 1;
+            }
 
-            let rel = entry.path.strip_prefix(&root)
-                .map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+            let rel = entry
+                .path
+                .strip_prefix(&root)
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
             sqlx::query(
                 r#"INSERT INTO brain_node_sources (node_id, source_id, rel_path)
                    VALUES ($1, $2, $3)
                    ON CONFLICT (node_id, source_id) DO UPDATE SET rel_path = EXCLUDED.rel_path"#,
             )
-            .bind(id).bind(source.id).bind(&rel).execute(pg).await?;
+            .bind(id)
+            .bind(source.id)
+            .bind(&rel)
+            .execute(pg)
+            .await?;
 
-            if entry.is_dir { all_dirs.push(entry.path.clone()); }
+            if entry.is_dir {
+                all_dirs.push(entry.path.clone());
+            }
             all_paths.push(entry.path.clone());
         }
 
@@ -263,7 +322,10 @@ pub async fn scan(
                            VALUES ($1, $2, 'contains', 'scan')
                            ON CONFLICT (src_id, dst_id, edge_type) DO NOTHING"#,
                     )
-                    .bind(src).bind(dst).execute(pg).await?;
+                    .bind(src)
+                    .bind(dst)
+                    .execute(pg)
+                    .await?;
                     report.edges += r.rows_affected() as usize;
                 }
             }
@@ -274,29 +336,45 @@ pub async fn scan(
                SET scan_status = 'scanned', last_scanned = NOW(), file_count = $2
                WHERE id = $1"#,
         )
-        .bind(source.id).bind(walked.len() as i32).execute(pg).await?;
+        .bind(source.id)
+        .bind(walked.len() as i32)
+        .execute(pg)
+        .await?;
         report.sources_scanned += 1;
     }
 
     let dir_set: HashSet<PathBuf> = all_dirs.into_iter().collect();
     let candidates = propose(&all_paths, &dir_set, &source_roots);
     sqlx::query("DELETE FROM brain_corpus_candidates WHERE corpus_id = $1 AND status = 'pending'")
-        .bind(corpus.id).execute(pg).await?;
+        .bind(corpus.id)
+        .execute(pg)
+        .await?;
     for c in &candidates {
         sqlx::query(
             r#"INSERT INTO brain_corpus_candidates
                  (corpus_id, kind, title, payload, heuristic, confidence)
                VALUES ($1, $2, $3, $4, $5, $6)"#,
         )
-        .bind(corpus.id).bind(&c.kind).bind(&c.title).bind(&c.payload)
-        .bind(&c.heuristic).bind(c.confidence).execute(pg).await?;
+        .bind(corpus.id)
+        .bind(&c.kind)
+        .bind(&c.title)
+        .bind(&c.payload)
+        .bind(&c.heuristic)
+        .bind(c.confidence)
+        .execute(pg)
+        .await?;
     }
     report.candidates = candidates.len();
     Ok(report)
 }
 
 async fn upsert_content_node(
-    pg: &PgPool, path: &str, title: &str, node_type: &str, project: &str, content_hash: &str,
+    pg: &PgPool,
+    path: &str,
+    title: &str,
+    node_type: &str,
+    project: &str,
+    content_hash: &str,
 ) -> anyhow::Result<Uuid> {
     let id: Uuid = sqlx::query_scalar(
         r#"INSERT INTO brain_vault_nodes (path, title, node_type, project, content_hash)
@@ -307,13 +385,21 @@ async fn upsert_content_node(
                  valid_until = NULL, updated_at = NOW()
            RETURNING id"#,
     )
-    .bind(path).bind(title).bind(node_type).bind(project).bind(content_hash)
-    .fetch_one(pg).await?;
+    .bind(path)
+    .bind(title)
+    .bind(node_type)
+    .bind(project)
+    .bind(content_hash)
+    .fetch_one(pg)
+    .await?;
     Ok(id)
 }
 
 pub async fn list_candidates(
-    pg: &PgPool, corpus: &Corpus, status: Option<&str>, kind: Option<&str>,
+    pg: &PgPool,
+    corpus: &Corpus,
+    status: Option<&str>,
+    kind: Option<&str>,
 ) -> anyhow::Result<Vec<StoredCandidate>> {
     let rows = sqlx::query(
         r#"SELECT id, kind, title, payload, heuristic, confidence, status
@@ -323,20 +409,31 @@ pub async fn list_candidates(
              AND ($3::text IS NULL OR kind = $3)
            ORDER BY kind COLLATE "C", confidence DESC, title COLLATE "C""#,
     )
-    .bind(corpus.id).bind(status).bind(kind).fetch_all(pg).await?;
-    Ok(rows.into_iter().map(|r| StoredCandidate {
-        id: r.get("id"),
-        kind: r.get("kind"),
-        title: r.get::<Option<String>, _>("title").unwrap_or_default(),
-        payload: r.get("payload"),
-        heuristic: r.get("heuristic"),
-        confidence: r.get("confidence"),
-        status: r.get("status"),
-    }).collect())
+    .bind(corpus.id)
+    .bind(status)
+    .bind(kind)
+    .fetch_all(pg)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| StoredCandidate {
+            id: r.get("id"),
+            kind: r.get("kind"),
+            title: r.get::<Option<String>, _>("title").unwrap_or_default(),
+            payload: r.get("payload"),
+            heuristic: r.get("heuristic"),
+            confidence: r.get("confidence"),
+            status: r.get("status"),
+        })
+        .collect())
 }
 
 pub async fn confirm_candidates(
-    pg: &PgPool, corpus: &Corpus, ids: &[Uuid], all: bool, min_conf: f32,
+    pg: &PgPool,
+    corpus: &Corpus,
+    ids: &[Uuid],
+    all: bool,
+    min_conf: f32,
 ) -> anyhow::Result<usize> {
     let pending = list_candidates(pg, corpus, Some("pending"), None).await?;
     let want: HashSet<Uuid> = ids.iter().copied().collect();
@@ -351,7 +448,8 @@ pub async fn confirm_candidates(
         "facet_assign" => 5,
         _ => 6,
     };
-    let mut chosen: Vec<&StoredCandidate> = pending.iter()
+    let mut chosen: Vec<&StoredCandidate> = pending
+        .iter()
         .filter(|c| all || want.contains(&c.id))
         .filter(|c| (all && c.confidence >= min_conf) || !all)
         .collect();
@@ -359,8 +457,12 @@ pub async fn confirm_candidates(
 
     for c in chosen {
         materialize_one(pg, corpus, c).await?;
-        sqlx::query("UPDATE brain_corpus_candidates SET status='confirmed', reviewed_at=NOW() WHERE id=$1")
-            .bind(c.id).execute(pg).await?;
+        sqlx::query(
+            "UPDATE brain_corpus_candidates SET status='confirmed', reviewed_at=NOW() WHERE id=$1",
+        )
+        .bind(c.id)
+        .execute(pg)
+        .await?;
         confirmed += 1;
     }
     Ok(confirmed)
@@ -369,8 +471,12 @@ pub async fn confirm_candidates(
 pub async fn reject_candidates(pg: &PgPool, ids: &[Uuid]) -> anyhow::Result<usize> {
     let mut n = 0;
     for id in ids {
-        let r = sqlx::query("UPDATE brain_corpus_candidates SET status='rejected', reviewed_at=NOW() WHERE id=$1")
-            .bind(id).execute(pg).await?;
+        let r = sqlx::query(
+            "UPDATE brain_corpus_candidates SET status='rejected', reviewed_at=NOW() WHERE id=$1",
+        )
+        .bind(id)
+        .execute(pg)
+        .await?;
         n += r.rows_affected() as usize;
     }
     Ok(n)
@@ -385,7 +491,8 @@ async fn materialize_one(pg: &PgPool, corpus: &Corpus, c: &StoredCandidate) -> a
             let kind = p.get("kind").and_then(|v| v.as_str()).unwrap_or("unit");
             let primary = p.get("primary_path").and_then(|v| v.as_str());
             let parent_key = p.get("parent_entity_key").and_then(|v| v.as_str());
-            let eid = upsert_entity(pg, corpus, key, name, kind, parent_key, primary, "auto").await?;
+            let eid =
+                upsert_entity(pg, corpus, key, name, kind, parent_key, primary, "auto").await?;
             // Tie every content node at-or-under the entity's primary_path to the
             // entity as member_kind='content', so faceted --entity/--product
             // queries (which intersect content<->entity) surface this content.
@@ -415,11 +522,22 @@ async fn materialize_one(pg: &PgPool, corpus: &Corpus, c: &StoredCandidate) -> a
         }
         "membership" => {
             let entity_key = p.get("entity_key").and_then(|v| v.as_str()).unwrap_or("");
-            let relation = p.get("relation").and_then(|v| v.as_str()).unwrap_or("member_of");
-            let member_kind = p.get("member_kind").and_then(|v| v.as_str()).unwrap_or("content");
-            let Some(entity_id) = entity_id_by_key(pg, corpus, entity_key).await? else { return Ok(()); };
+            let relation = p
+                .get("relation")
+                .and_then(|v| v.as_str())
+                .unwrap_or("member_of");
+            let member_kind = p
+                .get("member_kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or("content");
+            let Some(entity_id) = entity_id_by_key(pg, corpus, entity_key).await? else {
+                return Ok(());
+            };
             let member_id = if member_kind == "entity" {
-                let mk = p.get("member_entity_key").and_then(|v| v.as_str()).unwrap_or("");
+                let mk = p
+                    .get("member_entity_key")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 entity_id_by_key(pg, corpus, mk).await?
             } else {
                 let path = p.get("member_path").and_then(|v| v.as_str()).unwrap_or("");
@@ -436,8 +554,14 @@ async fn materialize_one(pg: &PgPool, corpus: &Corpus, c: &StoredCandidate) -> a
 
 #[allow(clippy::too_many_arguments)]
 pub async fn upsert_entity(
-    pg: &PgPool, corpus: &Corpus, key: &str, name: &str, kind: &str,
-    parent_key: Option<&str>, primary_path: Option<&str>, provenance: &str,
+    pg: &PgPool,
+    corpus: &Corpus,
+    key: &str,
+    name: &str,
+    kind: &str,
+    parent_key: Option<&str>,
+    primary_path: Option<&str>,
+    provenance: &str,
 ) -> anyhow::Result<Uuid> {
     let parent_id = match parent_key {
         Some(pk) => entity_id_by_key(pg, corpus, pk).await?,
@@ -460,7 +584,11 @@ pub async fn upsert_entity(
 }
 
 pub async fn upsert_facet(
-    pg: &PgPool, corpus: &Corpus, dimension: &str, value: &str, title: Option<&str>,
+    pg: &PgPool,
+    corpus: &Corpus,
+    dimension: &str,
+    value: &str,
+    title: Option<&str>,
 ) -> anyhow::Result<Uuid> {
     let id: Uuid = sqlx::query_scalar(
         r#"INSERT INTO brain_facets (corpus_id, dimension, value, title)
@@ -469,13 +597,23 @@ pub async fn upsert_facet(
              SET title = COALESCE(EXCLUDED.title, brain_facets.title)
            RETURNING id"#,
     )
-    .bind(corpus.id).bind(dimension).bind(value).bind(title).fetch_one(pg).await?;
+    .bind(corpus.id)
+    .bind(dimension)
+    .bind(value)
+    .bind(title)
+    .fetch_one(pg)
+    .await?;
     Ok(id)
 }
 
 pub async fn add_membership(
-    pg: &PgPool, corpus: &Corpus, member_id: Uuid, member_kind: &str,
-    entity_id: Uuid, relation: &str, provenance: &str,
+    pg: &PgPool,
+    corpus: &Corpus,
+    member_id: Uuid,
+    member_kind: &str,
+    entity_id: Uuid,
+    relation: &str,
+    provenance: &str,
 ) -> anyhow::Result<()> {
     sqlx::query(
         r#"INSERT INTO brain_memberships
@@ -483,8 +621,14 @@ pub async fn add_membership(
            VALUES ($1, $2, $3, $4, $5, $6)
            ON CONFLICT (member_id, entity_id, relation) DO NOTHING"#,
     )
-    .bind(corpus.id).bind(member_id).bind(member_kind).bind(entity_id)
-    .bind(relation).bind(provenance).execute(pg).await?;
+    .bind(corpus.id)
+    .bind(member_id)
+    .bind(member_kind)
+    .bind(entity_id)
+    .bind(relation)
+    .bind(provenance)
+    .execute(pg)
+    .await?;
     Ok(())
 }
 
@@ -545,8 +689,13 @@ pub async fn propagate_facet_under_path(
 }
 
 pub async fn assign_facet(
-    pg: &PgPool, corpus: &Corpus, node_id: Uuid, node_kind: &str,
-    dimension: &str, value: &str, provenance: &str,
+    pg: &PgPool,
+    corpus: &Corpus,
+    node_id: Uuid,
+    node_kind: &str,
+    dimension: &str,
+    value: &str,
+    provenance: &str,
 ) -> anyhow::Result<()> {
     let facet_id = upsert_facet(pg, corpus, dimension, value, None).await?;
     sqlx::query(
@@ -554,19 +703,35 @@ pub async fn assign_facet(
            VALUES ($1, $2, $3, $4, $5)
            ON CONFLICT (node_id, facet_id) DO NOTHING"#,
     )
-    .bind(corpus.id).bind(node_id).bind(node_kind).bind(facet_id).bind(provenance)
-    .execute(pg).await?;
+    .bind(corpus.id)
+    .bind(node_id)
+    .bind(node_kind)
+    .bind(facet_id)
+    .bind(provenance)
+    .execute(pg)
+    .await?;
     Ok(())
 }
 
 async fn entity_id_by_key(pg: &PgPool, corpus: &Corpus, key: &str) -> anyhow::Result<Option<Uuid>> {
-    Ok(sqlx::query_scalar("SELECT id FROM brain_entities WHERE corpus_id = $1 AND entity_key = $2")
-        .bind(corpus.id).bind(key).fetch_optional(pg).await?)
+    Ok(
+        sqlx::query_scalar(
+            "SELECT id FROM brain_entities WHERE corpus_id = $1 AND entity_key = $2",
+        )
+        .bind(corpus.id)
+        .bind(key)
+        .fetch_optional(pg)
+        .await?,
+    )
 }
 
 async fn content_node_id(pg: &PgPool, path: &str) -> anyhow::Result<Option<Uuid>> {
-    Ok(sqlx::query_scalar("SELECT id FROM brain_vault_nodes WHERE path = $1 AND valid_until IS NULL")
-        .bind(path).fetch_optional(pg).await?)
+    Ok(sqlx::query_scalar(
+        "SELECT id FROM brain_vault_nodes WHERE path = $1 AND valid_until IS NULL",
+    )
+    .bind(path)
+    .fetch_optional(pg)
+    .await?)
 }
 
 #[derive(Debug, Default, Clone)]
@@ -593,7 +758,9 @@ pub async fn query(pg: &PgPool, corpus: &Corpus, q: &FacetQuery) -> anyhow::Resu
     let mut entity_id_sets: Vec<Vec<Uuid>> = Vec::new();
     for key in &q.entities {
         let ids = entity_closure(pg, corpus, key).await?;
-        if ids.is_empty() { return Ok(vec![]); }
+        if ids.is_empty() {
+            return Ok(vec![]);
+        }
         entity_id_sets.push(ids);
     }
 
@@ -628,7 +795,8 @@ pub async fn query(pg: &PgPool, corpus: &Corpus, q: &FacetQuery) -> anyhow::Resu
             r#" AND EXISTS (SELECT 1 FROM brain_node_facets nf
                  JOIN brain_facets f ON f.id = nf.facet_id
                  WHERE nf.node_id = n.id AND f.dimension = ${d} AND f.value = ANY(${v}))"#,
-            d = dim_idx, v = val_idx
+            d = dim_idx,
+            v = val_idx
         ));
         binds_dim.push(dim);
         binds_vals.push(vals);
@@ -638,16 +806,23 @@ pub async fn query(pg: &PgPool, corpus: &Corpus, q: &FacetQuery) -> anyhow::Resu
     sql.push_str(r#" ORDER BY n.path COLLATE "C""#);
 
     let mut qb = sqlx::query(&sql).bind(corpus.id);
-    for ids in &binds_uuid_lists { qb = qb.bind(ids); }
-    for (dim, vals) in binds_dim.iter().zip(binds_vals.iter()) { qb = qb.bind(dim).bind(vals); }
+    for ids in &binds_uuid_lists {
+        qb = qb.bind(ids);
+    }
+    for (dim, vals) in binds_dim.iter().zip(binds_vals.iter()) {
+        qb = qb.bind(dim).bind(vals);
+    }
 
     let rows = qb.fetch_all(pg).await?;
-    Ok(rows.into_iter().map(|r| QueryRow {
-        id: r.get("id"),
-        path: r.get("path"),
-        title: r.get("title"),
-        node_type: r.get::<Option<String>, _>("node_type").unwrap_or_default(),
-    }).collect())
+    Ok(rows
+        .into_iter()
+        .map(|r| QueryRow {
+            id: r.get("id"),
+            path: r.get("path"),
+            title: r.get("title"),
+            node_type: r.get::<Option<String>, _>("node_type").unwrap_or_default(),
+        })
+        .collect())
 }
 
 async fn entity_closure(pg: &PgPool, corpus: &Corpus, key: &str) -> anyhow::Result<Vec<Uuid>> {
@@ -672,7 +847,10 @@ async fn entity_closure(pg: &PgPool, corpus: &Corpus, key: &str) -> anyhow::Resu
            )
            SELECT id FROM walk"#,
     )
-    .bind(corpus.id).bind(key).fetch_all(pg).await?;
+    .bind(corpus.id)
+    .bind(key)
+    .fetch_all(pg)
+    .await?;
     Ok(rows.into_iter().map(|r| r.get::<Uuid, _>("id")).collect())
 }
 
@@ -685,24 +863,36 @@ pub fn propose(
 
     // A path is a DIR if it's in the explicit dirs set (from the real scan) OR,
     // as a fallback when dirs is empty (e.g. unit tests), if it parents another path.
-    let parents: HashSet<PathBuf> = paths.iter()
-        .filter_map(|p| p.parent().map(|x| x.to_path_buf())).collect();
+    let parents: HashSet<PathBuf> = paths
+        .iter()
+        .filter_map(|p| p.parent().map(|x| x.to_path_buf()))
+        .collect();
     let is_dir = |p: &PathBuf| dirs.contains(p) || (dirs.is_empty() && parents.contains(p));
     let name_of = |p: &PathBuf| {
-        p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()
+        p.file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default()
     };
 
-    let business_roots: HashSet<&PathBuf> = sources.iter()
+    let business_roots: HashSet<&PathBuf> = sources
+        .iter()
         .filter(|(_, l)| l.as_deref() == Some("business"))
-        .map(|(r, _)| r).collect();
+        .map(|(r, _)| r)
+        .collect();
 
     let mut group_dirs: Vec<PathBuf> = Vec::new();
     for p in paths {
-        if !is_dir(p) { continue; }
+        if !is_dir(p) {
+            continue;
+        }
         let n = name_of(p);
         if n == "apps" || n == "services" {
             group_dirs.push(p.clone());
-            let heur = if n == "apps" { "apps_dir" } else { "services_dir" };
+            let heur = if n == "apps" {
+                "apps_dir"
+            } else {
+                "services_dir"
+            };
             out.push(Candidate {
                 kind: "group_entity".into(),
                 title: n.clone(),
@@ -716,7 +906,9 @@ pub fn propose(
     let group_set: HashSet<&PathBuf> = group_dirs.iter().collect();
     let mut units: Vec<(String, PathBuf)> = Vec::new();
     for p in paths {
-        if !is_dir(p) { continue; }
+        if !is_dir(p) {
+            continue;
+        }
         if let Some(parent) = p.parent() {
             if group_set.contains(&parent.to_path_buf()) {
                 let n = name_of(p);
@@ -749,10 +941,17 @@ pub fn propose(
     }
 
     for stem in ["profilex", "hireflow360"] {
-        let matched: Vec<&String> = units.iter().map(|(n, _)| n)
-            .filter(|n| n.to_lowercase().contains(stem)).collect();
+        let matched: Vec<&String> = units
+            .iter()
+            .map(|(n, _)| n)
+            .filter(|n| n.to_lowercase().contains(stem))
+            .collect();
         if matched.len() >= 2 {
-            let cap = if stem == "profilex" { "ProfileX" } else { "HireFlow360" };
+            let cap = if stem == "profilex" {
+                "ProfileX"
+            } else {
+                "HireFlow360"
+            };
             out.push(Candidate {
                 kind: "product_entity".into(),
                 title: stem.into(),
@@ -780,7 +979,9 @@ pub fn propose(
     }
 
     for p in paths {
-        if !is_dir(p) { continue; }
+        if !is_dir(p) {
+            continue;
+        }
         let n = name_of(p);
         let abs = p.to_string_lossy().to_string();
         let is_business = business_roots.contains(&p) || n == "business";
@@ -820,8 +1021,13 @@ pub fn propose(
     }
 
     for p in paths {
-        if is_dir(p) { continue; }
-        let ext = p.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+        if is_dir(p) {
+            continue;
+        }
+        let ext = p
+            .extension()
+            .map(|e| e.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
         let modality = match ext.as_str() {
             "rs" | "ts" | "py" | "go" | "js" => "code",
             "md" | "pdf" | "docx" => "doc",
@@ -857,11 +1063,20 @@ fn walk(root: &Path, max_depth: usize) -> Vec<Walked> {
 }
 
 fn walk_inner(root: &Path, dir: &Path, depth: usize, max_depth: usize, out: &mut Vec<Walked>) {
-    if depth > max_depth { return; }
-    let Ok(rd) = std::fs::read_dir(dir) else { return; };
+    if depth > max_depth {
+        return;
+    }
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     if depth == 0 {
         if let Ok(md) = std::fs::metadata(root) {
-            out.push(Walked { path: root.to_path_buf(), is_dir: true, size: 0, mtime: mtime_of(&md) });
+            out.push(Walked {
+                path: root.to_path_buf(),
+                is_dir: true,
+                size: 0,
+                mtime: mtime_of(&md),
+            });
         }
     }
     let mut entries: Vec<_> = rd.filter_map(|e| e.ok()).collect();
@@ -869,22 +1084,38 @@ fn walk_inner(root: &Path, dir: &Path, depth: usize, max_depth: usize, out: &mut
     for e in entries {
         let path = e.path();
         let name = e.file_name().to_string_lossy().to_string();
-        if name.starts_with('.') && name != ".github" { continue; }
+        if name.starts_with('.') && name != ".github" {
+            continue;
+        }
         let Ok(md) = e.metadata() else { continue };
         if md.is_dir() {
-            if SKIP_DIRS.contains(&name.as_str()) { continue; }
-            out.push(Walked { path: path.clone(), is_dir: true, size: 0, mtime: mtime_of(&md) });
+            if SKIP_DIRS.contains(&name.as_str()) {
+                continue;
+            }
+            out.push(Walked {
+                path: path.clone(),
+                is_dir: true,
+                size: 0,
+                mtime: mtime_of(&md),
+            });
             walk_inner(root, &path, depth + 1, max_depth, out);
         } else if md.is_file() {
-            out.push(Walked { path, is_dir: false, size: md.len(), mtime: mtime_of(&md) });
+            out.push(Walked {
+                path,
+                is_dir: false,
+                size: md.len(),
+                mtime: mtime_of(&md),
+            });
         }
     }
 }
 
 fn mtime_of(md: &std::fs::Metadata) -> i64 {
-    md.modified().ok()
+    md.modified()
+        .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64).unwrap_or(0)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 fn cheap_hash(path: &str, size: u64, mtime: i64) -> String {
@@ -932,7 +1163,8 @@ mod tests {
             apps.join("app-profilex").join("main.rs"),
         ];
         // Mark every path except files as a directory for the test.
-        let dirs: HashSet<PathBuf> = paths.iter()
+        let dirs: HashSet<PathBuf> = paths
+            .iter()
             .filter(|p| p.extension().is_none())
             .cloned()
             .collect();
@@ -941,7 +1173,8 @@ mod tests {
         assert!(kinds.contains(&"group_entity"));
         assert!(kinds.contains(&"unit_entity"));
         assert!(kinds.contains(&"product_entity"));
-        let mem = cands.iter()
+        let mem = cands
+            .iter()
             .filter(|c| c.kind == "membership")
             .filter(|c| c.payload["entity_key"] == "profilex")
             .count();
