@@ -38,6 +38,7 @@ mod agent_cmd;
 mod agents_cmd;
 mod alert_cmd;
 mod brain_cmd;
+mod corpus_cmd;
 mod cli_bridge_cmd;
 mod cloud_llm_cmd;
 mod config_cmd;
@@ -1802,6 +1803,113 @@ pub enum BrainCommand {
     Communities,
     /// Show vault index stats.
     Stats,
+    /// Faceted, multi-parent, multi-root knowledge graph (Corpus layer).
+    #[command(subcommand)]
+    Corpus(CorpusCommand),
+    /// Faceted SET-INTERSECTION query over a corpus.
+    Query {
+        #[arg(long, alias = "corpus")]
+        org: String,
+        #[arg(long = "entity")]
+        entities: Vec<String>,
+        #[arg(long = "product")]
+        products: Vec<String>,
+        #[arg(long = "role")]
+        roles: Vec<String>,
+        #[arg(long = "status")]
+        statuses: Vec<String>,
+        #[arg(long = "modality")]
+        modalities: Vec<String>,
+        #[arg(long = "facet")]
+        facets: Vec<String>,
+        #[arg(long, default_value = "table")]
+        format: String,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum CorpusCommand {
+    /// Create a corpus and attach one or more physical roots (SOURCED_FROM).
+    Add {
+        slug: String,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long = "root")]
+        roots: Vec<String>,
+        #[arg(long = "label")]
+        labels: Vec<String>,
+    },
+    /// Attach an additional root to an existing corpus.
+    SourceAdd {
+        slug: String,
+        root: String,
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Walk every source root: upsert content nodes + run the auto-proposer.
+    Scan {
+        slug: String,
+        #[arg(long)]
+        source: Option<String>,
+        #[arg(long, default_value_t = 12)]
+        max_depth: usize,
+        #[arg(long, default_value_t = false)]
+        apply: bool,
+    },
+    /// List corpora with source/entity/facet/content counts.
+    #[command(alias = "ls")]
+    List {
+        #[arg(long, default_value = "table")]
+        format: String,
+    },
+    /// List the physical roots feeding a corpus.
+    Sources {
+        slug: String,
+        #[arg(long, default_value = "table")]
+        format: String,
+    },
+    /// List auto-proposer proposals.
+    Candidates {
+        slug: String,
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long, default_value = "table")]
+        format: String,
+    },
+    /// Materialize candidate(s) into entities/facets/memberships.
+    Confirm {
+        slug: String,
+        #[arg(long = "candidate")]
+        candidates: Vec<String>,
+        #[arg(long, default_value_t = false)]
+        all: bool,
+    },
+    /// Reject candidate(s).
+    Reject {
+        slug: String,
+        #[arg(long = "candidate")]
+        candidates: Vec<String>,
+    },
+    /// Faceted SET-INTERSECTION query, scoped to a corpus.
+    Query {
+        slug: String,
+        #[arg(long = "entity")]
+        entities: Vec<String>,
+        #[arg(long = "product")]
+        products: Vec<String>,
+        #[arg(long = "role")]
+        roles: Vec<String>,
+        #[arg(long = "status")]
+        statuses: Vec<String>,
+        #[arg(long = "modality")]
+        modalities: Vec<String>,
+        #[arg(long = "facet")]
+        facets: Vec<String>,
+        #[arg(long, default_value = "table")]
+        format: String,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
