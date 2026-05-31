@@ -81,6 +81,16 @@ pub async fn handle_offload(
         }
     };
 
+    // ── Orchestrator P2: record the per-session work-kind demand signal
+    // (fire-and-forget — a telemetry write must never fail the offload).
+    // No session_id at the CLI offload path → falls back to an 'adhoc:offload'
+    // bucket inside record_session_work_signal.
+    if let Err(e) =
+        ff_db::record_session_work_signal(&pool, None, kind.unwrap_or("general"), "offload").await
+    {
+        tracing::warn!(error = %e, "demand signal write failed (offload)");
+    }
+
     // ── Step 2: dispatch to the warm local endpoint over the OpenAI API.
     let model = candidate
         .catalog_id

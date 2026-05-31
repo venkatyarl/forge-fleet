@@ -2591,6 +2591,179 @@ pub async fn pg_pick_offload_endpoint(
     Ok(cands.into_iter().next())
 }
 
+// ─── Orchestrator P2: per-session demand sensing ─────────────────────────────
+//
+// Captures the work-kind signal that already flows through the offload path
+// and session_runner dispatch into a cheap bucketed table, then rolls the last
+// N minutes into a fair-shared fleet-wide demand vector that P3's adaptive
+// serving-mix autoscaler consumes. See schema V116.
+
+/// The fleet-wide demand vector: how many code-vs-general inference slots the
+/// currently-active sessions want, fair-shared so one loud session can't starve
+/// another. Produced live by [`pg_current_demand_vector`] and persisted (one
+/// row per leader tick) into `fleet_demand_snapshot`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DemandVector {
+    /// Slots of code-capable (`code-gen` workload) model wanted across sessions.
+    pub code_slots_wanted: f64,
+    /// Slots of general-purpose model wanted across sessions.
+    pub general_slots_wanted: f64,
+    /// Distinct sessions that emitted any signal inside the window.
+    pub active_sessions: i32,
+    /// Window the vector was computed over, in seconds.
+    pub window_secs: i64,
+    /// Per-session fairness breakdown `[{session_id, code, general}]`.
+    pub per_session: JsonValue,
+    /// When this vector was computed (UTC).
+    pub captured_at: DateTime<Utc>,
+}
+
+/// Record a single per-session work-kind signal (fire-and-forget telemetry).
+///
+/// `raw_kind` is mapped through the SAME [`offload_workload_for_kind`] taxonomy
+/// used by the router, so "code-shaped" is defined in exactly one place:
+/// `Some("code-gen")` → `work_kind='code'`, `None` → `work_kind='general'`
+/// (research/chat/synthesis all collapse to general for slot-shape purposes —
+/// the raw kind is preserved in the `raw_kind` column for observability).
+///
+/// `session_id` falls back to a synthetic `adhoc:<source>` bucket when absent
+/// (e.g. a session-less `ff offload`). UPSERTs into a per-minute bucket so a
+/// chatty session writes one row per minute, not thousands. Callers should
+/// treat this as best-effort — a failed write must NEVER fail the offload/step.
+pub async fn record_session_work_signal(
+    pool: &PgPool,
+    session_id: Option<&str>,
+    raw_kind: &str,
+    source: &str,
+) -> Result<()> {
+    let work_kind = match offload_workload_for_kind(Some(raw_kind)) {
+        Some("code-gen") => "code",
+        _ => "general",
+    };
+    let session = session_id
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("adhoc:{source}"));
+
+    sqlx::query(
+        r#"
+        INSERT INTO session_work_signal
+            (session_id, work_kind, raw_kind, source, bucket_minute, hits)
+        VALUES ($1, $2, $3, $4, date_trunc('minute', NOW()), 1)
+        ON CONFLICT (session_id, work_kind, source, bucket_minute)
+        DO UPDATE SET hits = session_work_signal.hits + 1,
+                      raw_kind = EXCLUDED.raw_kind
+        "#,
+    )
+    .bind(&session)
+    .bind(work_kind)
+    .bind(raw_kind)
+    .bind(source)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Compute the live fleet-wide demand vector over the last `window_secs`.
+///
+/// FAIR-SHARE aggregate: each active session contributes ONE unit of total
+/// demand, split by that session's own code/general hit ratio. So a session
+/// that fired 1000 code hits and a session that fired 2 chat hits each weigh
+/// exactly 1 — no session starves another regardless of raw call volume.
+/// `code_slots_wanted = Σ_session (1 * session_code_fraction)`, likewise
+/// general. Pure SQL aggregate over the indexed `bucket_minute` time-window
+/// slice — no per-row Rust. NUMERIC sums are cast to float8 (the ff-db sqlx
+/// build has no decimal feature).
+pub async fn pg_current_demand_vector(pool: &PgPool, window_secs: i64) -> Result<DemandVector> {
+    let window = window_secs.max(1);
+    let row = sqlx::query(
+        r#"
+        WITH win AS (
+            SELECT session_id, work_kind, SUM(hits) AS hits
+              FROM session_work_signal
+             WHERE bucket_minute > NOW() - make_interval(secs => $1)
+             GROUP BY session_id, work_kind
+        ),
+        per_session AS (
+            SELECT
+                session_id,
+                COALESCE(SUM(hits) FILTER (WHERE work_kind = 'code'), 0)::float8    AS code_hits,
+                COALESCE(SUM(hits) FILTER (WHERE work_kind = 'general'), 0)::float8 AS general_hits,
+                COALESCE(SUM(hits), 0)::float8                                      AS total_hits
+              FROM win
+             GROUP BY session_id
+        ),
+        shares AS (
+            -- Each session = 1 unit, split by its own code/general fraction.
+            SELECT
+                session_id,
+                CASE WHEN total_hits > 0 THEN code_hits    / total_hits ELSE 0 END AS code_share,
+                CASE WHEN total_hits > 0 THEN general_hits / total_hits ELSE 0 END AS general_share
+              FROM per_session
+        )
+        SELECT
+            COALESCE(SUM(code_share), 0)::float8    AS code_slots_wanted,
+            COALESCE(SUM(general_share), 0)::float8 AS general_slots_wanted,
+            COUNT(*)::int                           AS active_sessions,
+            COALESCE(
+                jsonb_agg(
+                    jsonb_build_object(
+                        'session_id', session_id,
+                        'code', round(code_share::numeric, 4),
+                        'general', round(general_share::numeric, 4)
+                    )
+                    ORDER BY session_id
+                ) FILTER (WHERE session_id IS NOT NULL),
+                '[]'::jsonb
+            ) AS per_session
+          FROM shares
+        "#,
+    )
+    .bind(window)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(DemandVector {
+        code_slots_wanted: row.get::<f64, _>("code_slots_wanted"),
+        general_slots_wanted: row.get::<f64, _>("general_slots_wanted"),
+        active_sessions: row.get::<i32, _>("active_sessions"),
+        window_secs: window,
+        per_session: row.get::<JsonValue, _>("per_session"),
+        captured_at: Utc::now(),
+    })
+}
+
+/// Return the most recent `fleet_demand_snapshot` row as a [`DemandVector`], or
+/// `None` if the sensor tick hasn't snapshotted anything yet. One indexed
+/// lookup — the read side P3 + the dashboard use (vs. the live recompute the
+/// tick itself runs).
+pub async fn pg_latest_demand_snapshot(pool: &PgPool) -> Result<Option<DemandVector>> {
+    let row = sqlx::query(
+        r#"
+        SELECT
+            captured_at,
+            window_secs,
+            active_sessions,
+            code_slots_wanted::float8    AS code_slots_wanted,
+            general_slots_wanted::float8 AS general_slots_wanted,
+            per_session
+          FROM fleet_demand_snapshot
+         ORDER BY captured_at DESC
+         LIMIT 1
+        "#,
+    )
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(|r| DemandVector {
+        code_slots_wanted: r.get::<f64, _>("code_slots_wanted"),
+        general_slots_wanted: r.get::<f64, _>("general_slots_wanted"),
+        active_sessions: r.get::<i32, _>("active_sessions"),
+        window_secs: r.get::<i32, _>("window_secs") as i64,
+        per_session: r.get::<JsonValue, _>("per_session"),
+        captured_at: r.get::<DateTime<Utc>, _>("captured_at"),
+    }))
+}
+
 // ─── Fleet agents catalog (V112) ─────────────────────────────────────────────
 //
 // The `fleet_agents` table is the canonical catalog of specialized agents the

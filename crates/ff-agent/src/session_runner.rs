@@ -363,6 +363,25 @@ pub async fn tick(pool: &PgPool) -> Result<TickStats> {
 
         stats.steps_dispatched += 1;
         info!(session = %session_id, step = %step_id, %name, %model, "dispatched");
+
+        // ── Orchestrator P2: record the per-session work-kind demand signal.
+        // A `coder` step is code-shaped work; every other role collapses to
+        // general for slot-shape purposes. Fire-and-forget — a telemetry write
+        // must never fail step dispatch.
+        let work_kind = match role.as_deref() {
+            Some("coder") => "code",
+            _ => "general",
+        };
+        if let Err(e) = ff_db::record_session_work_signal(
+            pool,
+            Some(&session_id.to_string()),
+            work_kind,
+            "session_step",
+        )
+        .await
+        {
+            warn!(error = %e, "demand signal write failed (session_step)");
+        }
     }
 
     // ── 3. finalise sessions whose every step is terminal ──

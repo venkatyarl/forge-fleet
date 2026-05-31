@@ -937,6 +937,16 @@ pub async fn fleet_offload(params: Option<Value>) -> HandlerResult {
         }
     };
 
+    // ── Orchestrator P2: record the per-session work-kind demand signal
+    // (fire-and-forget — never fail the offload on a telemetry write). No
+    // session_id on the MCP offload path → buckets under 'adhoc:mcp_offload'.
+    if let Err(e) =
+        ff_db::record_session_work_signal(&pool, None, kind.unwrap_or("general"), "mcp_offload")
+            .await
+    {
+        warn!(error = %e, "demand signal write failed (mcp_offload)");
+    }
+
     // ── Step 2: dispatch to the warm local endpoint over the OpenAI-compatible
     // API — same request shape + parser `fleet_run` uses.
     let model = candidate

@@ -697,6 +697,21 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         ));
     }
 
+    // 18) Demand sensor tick — every 30s, leader-gated.
+    // Orchestrator P2: rolls the per-session work-kind signals into a
+    // fleet-wide demand vector and snapshots it into `fleet_demand_snapshot`
+    // (the contract P3's adaptive serving-mix autoscaler consumes). Produces
+    // the demand signal only — never loads/unloads a model.
+    if let Some(pg_pool) = operational_store.pg_pool().cloned() {
+        info!("starting subsystem: demand sensor tick (30s, leader-gated)");
+        subsystem_tasks.push(ff_agent::demand_sensor::spawn_demand_tick(
+            pg_pool,
+            worker_name.clone(),
+            30,
+            shutdown_rx.clone(),
+        ));
+    }
+
     info!("all subsystems started; waiting for shutdown signal");
     wait_for_shutdown_signal().await;
 
