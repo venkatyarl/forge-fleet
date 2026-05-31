@@ -79,6 +79,7 @@ mod tools_cmd;
 mod train_cmd;
 mod utils;
 mod versions_cmd;
+mod voice_cmd;
 
 pub use utils::{
     CYAN, GREEN, RED, RESET, YELLOW, expand_tilde, human_bytes, human_bytes_i64, load_config,
@@ -604,6 +605,30 @@ enum Command {
     Stack {
         #[command(subcommand)]
         command: StackCommand,
+    },
+    /// Phase-1 native JARVIS voice loop: mic → energy-VAD → whisper.cpp STT →
+    /// wake-word "jarvis" → POST gateway `/api/jarvis/ask` → speak with macOS
+    /// `say`. Requires `whisper-cpp` (whisper-cli), a ggml model, and a macOS
+    /// mic-permission grant on first run.
+    Voice {
+        /// Input device name substring (e.g. "C920"); default = system default input.
+        #[arg(long)]
+        device: Option<String>,
+        /// ggml whisper model path (default: ~/models/whisper/ggml-base.en.bin).
+        #[arg(long)]
+        model: Option<String>,
+        /// Gateway base URL (default: http://localhost:51002).
+        #[arg(long, default_value = "http://localhost:51002")]
+        gateway: String,
+        /// macOS `say` voice name.
+        #[arg(long, default_value = "Daniel")]
+        voice: String,
+        /// Process a single answered utterance, then exit (for testing).
+        #[arg(long, default_value_t = false)]
+        once: bool,
+        /// whisper-cli binary path/name (resolved on PATH).
+        #[arg(long = "whisper-cli", default_value = "whisper-cli")]
+        whisper_cli: String,
     },
 }
 
@@ -3574,6 +3599,24 @@ async fn main() -> Result<()> {
                 verbose,
             )
             .await
+        }
+        Some(Command::Voice {
+            device,
+            model,
+            gateway,
+            voice,
+            once,
+            whisper_cli,
+        }) => {
+            let home = dirs::home_dir()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let model_path = model.unwrap_or_else(|| {
+                expand_tilde("~/models/whisper/ggml-base.en.bin", &home)
+                    .to_string_lossy()
+                    .to_string()
+            });
+            voice_cmd::handle_voice(device, model_path, gateway, voice, once, whisper_cli).await
         }
         // `ff cli` is fully handled on the fast path above (it returns
         // before reaching here). This arm exists only for exhaustiveness.

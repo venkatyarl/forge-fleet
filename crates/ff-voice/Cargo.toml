@@ -22,6 +22,9 @@ futures.workspace = true
 async-trait.workspace = true
 base64 = "0.22"
 serde_urlencoded = "0.7"
+# Native mic capture + WAV writing for the `ff voice` (JARVIS) loop.
+cpal = "0.16"
+hound = "3.5"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
