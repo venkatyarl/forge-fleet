@@ -72,6 +72,23 @@
   .bar i{position:absolute;left:0;top:0;bottom:0;background:linear-gradient(90deg,var(--dim),var(--cyan));
     box-shadow:0 0 8px var(--cyan);transition:width .8s ease}
   .bar.g i{background:linear-gradient(90deg,rgba(255,207,122,.4),var(--gold));box-shadow:0 0 8px var(--gold)}
+  /* ACTIVE MISSIONS rows — same cyan section aesthetic as the .grp cards */
+  .mi{padding:4px 0;border-bottom:1px solid rgba(55,198,255,.10)}
+  .mi:last-child{border-bottom:0}
+  .mi .mtop{display:flex;justify-content:space-between;align-items:center;gap:6px;margin-bottom:3px}
+  #rcol .mi .mtop{flex-direction:row-reverse}
+  .mi .mg{color:#9fe9ff;font-size:10.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
+  .mi .pill{font-size:8px;letter-spacing:1px;padding:1px 6px;border-radius:8px;border:1px solid var(--edge);
+    color:var(--cyan2);text-transform:uppercase;flex:none}
+  .mi .pill.running{color:var(--cyan);border-color:var(--cyan);box-shadow:0 0 8px rgba(55,198,255,.4)}
+  .mi .pill.pending{color:var(--gold);border-color:rgba(255,207,122,.5)}
+  .mi .mp{display:flex;align-items:center;gap:6px}
+  #rcol .mi .mp{flex-direction:row-reverse}
+  .mi .mbar{flex:1;height:3px;background:rgba(55,198,255,.10);border:1px solid rgba(55,198,255,.18);position:relative;overflow:hidden}
+  .mi .mbar i{position:absolute;left:0;top:0;bottom:0;background:linear-gradient(90deg,var(--dim),var(--cyan));
+    box-shadow:0 0 6px var(--cyan);transition:width .8s ease}
+  .mi .mc{font-size:9px;color:var(--dim);flex:none}
+  .mi-empty{font-size:10px;color:var(--dim);letter-spacing:1px;padding:3px 0}
   /* center answer */
   #answer{position:fixed;z-index:11;left:50%;top:50%;transform:translate(-50%,-50%);text-align:center;width:240px;pointer-events:none}
   #answer .big{font-family:'Orbitron';font-size:34px;font-weight:700;color:#eafdff;text-shadow:0 0 20px var(--cyan)}
@@ -150,6 +167,9 @@
     <div class="mrow"><div class="mh"><span>TASKS</span><span class="v" id="m-task-v">50%</span></div><div class="bar"><i id="m-task" style="width:50%"></i></div></div>
     <div class="mrow"><div class="mh"><span>NETWORK</span><span class="v" id="m-net-v">15%</span></div><div class="bar"><i id="m-net" style="width:15%"></i></div></div>
     <div class="mrow"><div class="mh"><span>BRAIN</span><span class="v" id="m-brain-v">95%</span></div><div class="bar"><i id="m-brain" style="width:95%"></i></div></div>
+  </div>
+  <div class="grp"><h3>ACTIVE MISSIONS<span class="tag" id="mi-tag">IDLE</span></h3>
+    <div id="missions"><div class="mi-empty">no active missions</div></div>
   </div>
 </div>
 
@@ -364,6 +384,36 @@ const gset=(l,v)=>{const g=G.find(x=>x.l===l);if(g)g.v=Math.max(0,Math.min(1,v))
 const meter=(id,v)=>{const b=document.getElementById('m-'+id),bv=document.getElementById('m-'+id+'-v');
   const p=Math.round(Math.max(0,Math.min(1,v))*100);if(b)b.style.width=p+'%';if(bv)bv.textContent=p+'%';};
 const setDot=(id,st)=>{const e=document.getElementById('ss-'+id);if(e){e.className='dot '+(st==='ok'?'ok':st==='warn'?'warn':st==='unknown'?'warn':'bad');}};
+// Render the ACTIVE MISSIONS card from state.missions. Defensive: a missing or
+// malformed field must never throw (the HUD has had blank-screen regressions
+// from unguarded JS). Builds DOM nodes with textContent so a mission goal can
+// never inject markup.
+function renderMissions(missions){
+  const box=document.getElementById('missions'); if(!box) return;
+  const list=Array.isArray(missions)?missions:[];
+  const tag=document.getElementById('mi-tag'); if(tag)tag.textContent=list.length?(list.length+' LIVE'):'IDLE';
+  box.textContent='';
+  if(!list.length){const e=document.createElement('div');e.className='mi-empty';e.textContent='no active missions';box.appendChild(e);return;}
+  list.forEach(m=>{
+    m=m||{};
+    const total=Number(m.steps_total)||0, done=Number(m.steps_done)||0;
+    const status=String(m.status||'pending').toLowerCase();
+    const pct=total>0?Math.max(0,Math.min(100,Math.round(done/total*100))):0;
+    const goal=String(m.goal||'(untitled mission)');
+    const goalShort=goal.length>40?goal.slice(0,39)+'…':goal;
+    const row=document.createElement('div');row.className='mi';
+    const top=document.createElement('div');top.className='mtop';
+    const g=document.createElement('span');g.className='mg';g.textContent=goalShort;g.title=goal;
+    const pill=document.createElement('span');pill.className='pill '+(status==='running'?'running':'pending');pill.textContent=status;
+    top.appendChild(g);top.appendChild(pill);
+    const mp=document.createElement('div');mp.className='mp';
+    const bar=document.createElement('div');bar.className='mbar';
+    const fill=document.createElement('i');fill.style.width=pct+'%';bar.appendChild(fill);
+    const c=document.createElement('span');c.className='mc';c.textContent=done+'/'+total;
+    mp.appendChild(bar);mp.appendChild(c);
+    row.appendChild(top);row.appendChild(mp);box.appendChild(row);
+  });
+}
 async function pollState(){
   try{
     const r=await fetch('/api/jarvis/state',{cache:'no-store'});
@@ -418,6 +468,7 @@ async function pollState(){
       setDot('reconciler',s.reconciler); setDot('agents',s.agents); setDot('brain',s.brain);
       gset('AGENTS', s.agents==='ok'?0.85:s.agents==='warn'?0.45:0.2);
     }
+    renderMissions(d.missions);
     window.__live=true;
   }catch(e){/* keep static baseline */}
 }
