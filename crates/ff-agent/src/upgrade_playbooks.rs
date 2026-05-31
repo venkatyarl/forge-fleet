@@ -1,5 +1,40 @@
 //! Per-tool upgrade playbook snippets.
+
+/// Resolve a tool's upgrade playbook for a given OS family.
+///
+/// Tries an exact `(tool, os_family)` match first (so specialised arms like
+/// `linux-dgx` win), then falls back to the base family (`linux-ubuntu` →
+/// `linux`, `macos-15` → `macos`). Without the fallback, every host whose
+/// `os_family` is a sub-family (e.g. `linux-ubuntu`) failed with
+/// "no playbook for os=linux-ubuntu" — the defer-worker / `ff daemon`
+/// upgrade path (which uses this fn) couldn't build forgefleetd/ff on any
+/// Linux host, stalling fleet self-upgrade. The DB-driven `auto_upgrade`
+/// path already did this via its own `base_family`; this mirrors it.
+/// (2026-05-31.)
 pub fn playbook_for(tool: &str, os_family: &str) -> Option<String> {
+    if let Some(p) = playbook_exact(tool, os_family) {
+        return Some(p);
+    }
+    match base_family(os_family) {
+        Some(base) if base != os_family => playbook_exact(tool, base),
+        _ => None,
+    }
+}
+
+/// Normalise an `os_family` to its base family, or `None` if unrecognised.
+fn base_family(os_family: &str) -> Option<&'static str> {
+    if os_family.starts_with("linux") {
+        Some("linux")
+    } else if os_family.starts_with("macos") {
+        Some("macos")
+    } else if os_family.starts_with("windows") {
+        Some("windows")
+    } else {
+        None
+    }
+}
+
+fn playbook_exact(tool: &str, os_family: &str) -> Option<String> {
     match (tool, os_family) {
         ("gh", "linux") => {
             Some("sudo apt-get update && sudo apt-get install --only-upgrade -y gh".into())
@@ -119,5 +154,39 @@ pub fn playbook_for(tool: &str, os_family: &str) -> Option<String> {
         ("os", "linux") => Some("sudo apt-get update && sudo apt-get -y upgrade".into()),
         ("os", "macos") => Some("softwareupdate -i -a".into()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sub_family_falls_back_to_base() {
+        // The regression: linux-ubuntu / linux-dgx etc. must resolve the
+        // generic `linux` playbook when no specialised arm exists.
+        for fam in ["linux-ubuntu", "linux", "linux-fedora"] {
+            let p = playbook_for("forgefleetd_git", fam)
+                .unwrap_or_else(|| panic!("no playbook for {fam}"));
+            assert!(p.contains("cargo build --bin forgefleetd"), "fam={fam}");
+        }
+    }
+
+    #[test]
+    fn specialised_arm_wins_over_base() {
+        // linux-dgx has its own `-j 2` arm — exact match must take priority.
+        let dgx = playbook_for("forgefleetd_git", "linux-dgx").unwrap();
+        assert!(dgx.contains("-j 2"), "dgx arm should be the -j 2 variant");
+    }
+
+    #[test]
+    fn macos_sub_family_falls_back() {
+        let p = playbook_for("forgefleetd_git", "macos-15").unwrap();
+        assert!(p.contains("launchctl kickstart"));
+    }
+
+    #[test]
+    fn unknown_os_is_none() {
+        assert!(playbook_for("forgefleetd_git", "plan9").is_none());
     }
 }
