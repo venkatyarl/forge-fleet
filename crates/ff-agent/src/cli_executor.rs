@@ -22,6 +22,7 @@
 //! `oauth_distributor`) ensures every member has the centralized cred
 //! file when ff drives this path.
 
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
@@ -31,21 +32,47 @@ use tracing::{debug, info};
 /// in PR #12 so a wedged CLI is killed before it blocks downstream work.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
+/// How a vendor CLI wants its working directory expressed. Even though we
+/// always set the spawned process's cwd (so relative paths resolve), the
+/// agent CLIs sandbox file access to dirs they were *told* about — so we
+/// also pass the vendor's own flag where it exists.
+#[derive(Debug, Clone, Copy)]
+pub enum CwdMode {
+    /// Process cwd is enough; the CLI inherits it (e.g. `claude` reads the
+    /// process cwd and additionally honours `--add-dir <dir>`).
+    Flag(&'static str),
+    /// No dedicated flag — rely solely on the spawned process's cwd.
+    ProcessOnly,
+}
+
 /// One row in the supported-backend catalog. Keeps the
 /// "what-binary-and-flags-for-each-vendor" mapping in one place.
 #[derive(Debug, Clone, Copy)]
 pub struct CliBackend {
-    /// Public name used by `--backend X`.
+    /// Public name used by `--backend X` / `ff cli <name>`.
     pub name: &'static str,
     /// Binary on PATH. Existence is checked before spawn.
     pub binary: &'static str,
     /// Flags inserted between the binary and the user's prompt. Each
     /// vendor's "non-interactive, print-and-exit" mode lives here.
     pub default_flags: &'static [&'static str],
+    /// How to tell this CLI which directory to operate in. The flag (if
+    /// any) is emitted as `<flag> <dir>` before the prompt.
+    pub cwd_mode: CwdMode,
+    /// `true` if the prompt is passed as a positional trailing arg (the
+    /// common case). `false` if it rides on a value-flag — for those the
+    /// flag lives in `default_flags` and we still append the prompt as the
+    /// last arg, so this stays `true` everywhere today. Kept for clarity.
+    pub prompt_is_positional: bool,
 }
 
 /// Catalog of supported backends. `local` is intentionally absent — that
 /// path stays in the existing agent loop, not this module.
+///
+/// Headless invocations verified on the leader 2026-05-31:
+///   claude -p --output-format text "<prompt>"   (cwd via process + --add-dir)
+///   codex exec --skip-git-repo-check "<prompt>"  (cwd via -C/--cd)
+///   kimi --print --yes --prompt "<prompt>"       (cwd via -w/--work-dir)
 pub const BACKENDS: &[CliBackend] = &[
     CliBackend {
         name: "claude",
@@ -53,32 +80,47 @@ pub const BACKENDS: &[CliBackend] = &[
         // `-p` runs in print-mode (non-interactive); `--output-format
         // text` keeps stdout free of the agent-loop JSON envelope.
         default_flags: &["-p", "--output-format", "text"],
+        // Claude Code reads the process cwd; `--add-dir` widens tool access.
+        cwd_mode: CwdMode::Flag("--add-dir"),
+        prompt_is_positional: true,
     },
     CliBackend {
         name: "codex",
         binary: "codex",
-        // Codex `exec` is the headless equivalent.
-        default_flags: &["exec"],
+        // Codex `exec` is the headless equivalent. `--skip-git-repo-check`
+        // lets it run outside a git repo (matches `ff cli` running anywhere).
+        default_flags: &["exec", "--skip-git-repo-check"],
+        // `-C/--cd <dir>` sets the agent's working root.
+        cwd_mode: CwdMode::Flag("-C"),
+        prompt_is_positional: true,
     },
     CliBackend {
         name: "gemini",
         binary: "gemini",
         // Gemini CLI's print-mode flag.
         default_flags: &["-p"],
+        cwd_mode: CwdMode::ProcessOnly,
+        prompt_is_positional: true,
     },
     CliBackend {
         name: "kimi",
-        // No widely-shipped Moonshot CLI as of 2026-04-27; the row is
-        // here for symmetry. `kimi` would be the binary if/when it
-        // ships. Until then, calls return a clear error.
         binary: "kimi",
-        default_flags: &["-p"],
+        // Kimi CLI (Moonshot) shipped a headless mode: `--print` runs
+        // non-interactively and auto-approves tool calls; `--prompt` (alias
+        // `-p`) carries the prompt; `--yes/--yolo` auto-approves writes.
+        default_flags: &["--print", "--yes", "--prompt"],
+        // `-w/--work-dir <dir>` sets the agent's working directory.
+        cwd_mode: CwdMode::Flag("-w"),
+        prompt_is_positional: true,
     },
     CliBackend {
         name: "grok",
-        // Same caveat as kimi — no official xAI CLI today.
+        // No official xAI CLI today — the row is here for symmetry and
+        // returns a clear "not installed" error until a `grok` binary ships.
         binary: "grok",
         default_flags: &["-p"],
+        cwd_mode: CwdMode::ProcessOnly,
+        prompt_is_positional: true,
     },
 ];
 
@@ -113,6 +155,22 @@ pub async fn execute_cli(
     passthrough_args: &[String],
     timeout: Option<Duration>,
 ) -> Result<CliResult> {
+    execute_cli_in_dir(backend, prompt, passthrough_args, None, timeout).await
+}
+
+/// Like [`execute_cli`], but runs the vendor CLI with its working directory
+/// set to `cwd` (when `Some`). The spawned process's cwd is set *and*, for
+/// vendors with a dedicated working-dir flag (`CwdMode::Flag`), that flag is
+/// emitted so the CLI's tool sandbox is rooted there. `None` keeps the
+/// caller's current directory — preserving the historical behaviour of
+/// [`execute_cli`].
+pub async fn execute_cli_in_dir(
+    backend: &str,
+    prompt: &str,
+    passthrough_args: &[String],
+    cwd: Option<&Path>,
+    timeout: Option<Duration>,
+) -> Result<CliResult> {
     let cfg = backend_by_name(backend).ok_or_else(|| {
         anyhow!(
             "unknown backend '{backend}'; expected one of: {}",
@@ -136,12 +194,28 @@ pub async fn execute_cli(
                 "claude" => "@anthropic-ai/claude-code",
                 "codex" => "@openai/codex",
                 "gemini" => "@google/gemini-cli",
+                "kimi" => "kimi-cli (Moonshot)",
                 _ => "<vendor>",
             }
         )
     })?;
 
     let mut cmd = tokio::process::Command::new(bin_path.as_str());
+    // Tell the CLI which directory to operate in (sets the process cwd and,
+    // where the vendor has one, the dedicated working-dir flag).
+    //
+    // The cwd flag is emitted *before* `default_flags` on purpose: some
+    // vendor flags are variadic (e.g. claude's `--add-dir <dirs...>`), so a
+    // trailing `--add-dir <dir>` would greedily swallow the prompt that we
+    // append last. Placing it first means the next flag (`-p`/`exec`/
+    // `--print`) terminates the variadic list and the prompt survives.
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+        if let CwdMode::Flag(flag) = cfg.cwd_mode {
+            cmd.arg(flag);
+            cmd.arg(dir.as_os_str());
+        }
+    }
     cmd.args(cfg.default_flags);
     cmd.args(passthrough_args);
     cmd.arg(prompt);
@@ -152,6 +226,7 @@ pub async fn execute_cli(
         binary = %bin_path,
         flags = ?cfg.default_flags,
         passthrough = ?passthrough_args,
+        cwd = ?cwd,
         "spawning vendor CLI"
     );
 
@@ -198,7 +273,10 @@ pub async fn execute_cli(
 /// found, `None` otherwise. Mirrors the helper in
 /// `crates/ff-pulse/src/software_collector.rs::which` so we don't pull
 /// in the third-party `which` crate just for this one call.
-fn which_on_path(bin: &str) -> Option<String> {
+///
+/// `pub` so the `ff cli` front-door can probe which vendor CLIs are
+/// installed before dispatching (and list them in the not-installed error).
+pub fn which_on_path(bin: &str) -> Option<String> {
     let path_var = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path_var) {
         let candidate = dir.join(bin);
