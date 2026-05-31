@@ -3638,6 +3638,11 @@ async fn run_tui(config: AgentSessionConfig) -> Result<()> {
     command_list.push(("memory", "Search across all memory layers: /memory <query>"));
     command_list.push(("search", "Search memory: /search <query>"));
     command_list.push(("help", "Show available commands"));
+    command_list.push((
+        "backend",
+        "Switch backend: /backend <local|claude|codex|kimi|gemini|grok>",
+    ));
+    command_list.push(("backends", "List backends and which CLIs are installed"));
     command_list.sort();
 
     // Async fleet health check on startup
@@ -3747,17 +3752,14 @@ async fn run_event_loop(
                 // Show user message
                 app.tab_mut().input.text = queued;
                 app.submit_input();
-                // Start agent with queued message
-                let mut session = app
+                // Start the queued turn on the tab's active backend.
+                let backend = app.tab().backend.clone();
+                let session = app
                     .tab_mut()
                     .session
                     .take()
                     .unwrap_or_else(|| AgentSession::new(config.clone()));
-                let (tx, rx) = tokio::sync::mpsc::channel::<AgentEvent>(256);
-                let handle = tokio::spawn(async move {
-                    let outcome = session.run(&prompt, Some(tx)).await;
-                    (session, outcome)
-                });
+                let (handle, rx) = spawn_session_turn(&backend, session, prompt, &config);
                 agent_handle = Some(handle);
                 event_rx = Some(rx);
             }
@@ -3963,6 +3965,96 @@ async fn run_event_loop(
                             continue;
                         }
 
+                        // /backend [vendor] — switch the active tab's backend
+                        // between the local fleet agent and a vendor CLI
+                        // (claude/codex/kimi/gemini/grok). Pure state mutation:
+                        // never spawns an agent, like /model with no arg.
+                        if trimmed == "/backend" || trimmed.starts_with("/backend ") {
+                            let arg = trimmed
+                                .strip_prefix("/backend")
+                                .map(|s| s.trim())
+                                .unwrap_or("");
+                            if arg.is_empty() {
+                                let current = app.tab().backend.clone();
+                                app.tab_mut().messages.push(
+                                    ff_terminal::messages::render_status(&format!(
+                                        "Active backend: {current}. Use /backend <local|claude|codex|kimi|gemini|grok> to switch; /backends to list."
+                                    )),
+                                );
+                            } else {
+                                let valid = arg.eq_ignore_ascii_case("local")
+                                    || ff_agent::cli_executor::backend_by_name(arg).is_some();
+                                if valid {
+                                    // Normalize to the canonical lowercase name.
+                                    let canonical = if arg.eq_ignore_ascii_case("local") {
+                                        "local".to_string()
+                                    } else {
+                                        ff_agent::cli_executor::backend_by_name(arg)
+                                            .map(|b| b.name.to_string())
+                                            .unwrap_or_else(|| arg.to_lowercase())
+                                    };
+                                    app.tab_mut().backend = canonical.clone();
+                                    let note = if canonical == "local" {
+                                        "Backend set to local — submits run on the fleet agent loop.".to_string()
+                                    } else {
+                                        format!(
+                                            "Backend set to {canonical} — submits route to the {canonical} CLI."
+                                        )
+                                    };
+                                    app.tab_mut()
+                                        .messages
+                                        .push(ff_terminal::messages::render_status(&note));
+                                } else {
+                                    let names: Vec<&str> = std::iter::once("local")
+                                        .chain(
+                                            ff_agent::cli_executor::BACKENDS.iter().map(|b| b.name),
+                                        )
+                                        .collect();
+                                    app.tab_mut().messages.push(
+                                        ff_terminal::messages::render_error(&format!(
+                                            "Unknown backend '{arg}'. Valid: {}",
+                                            names.join(", ")
+                                        )),
+                                    );
+                                }
+                            }
+                            let tab = app.tab_mut();
+                            tab.input.text.clear();
+                            tab.input.cursor = 0;
+                            tab.input.suggestions.clear();
+                            tab.input.suggestion_index = None;
+                            continue;
+                        }
+
+                        // /backends — list vendor CLIs and mark which are
+                        // actually installed on this machine.
+                        if trimmed == "/backends" {
+                            let mut lines = vec!["Available backends:".to_string()];
+                            let active = app.tab().backend.clone();
+                            let local_mark = if active == "local" { "  (active)" } else { "" };
+                            lines.push(format!("  local — fleet agent loop{local_mark}"));
+                            for b in ff_agent::cli_executor::BACKENDS {
+                                let installed =
+                                    ff_agent::cli_executor::which_on_path(b.binary).is_some();
+                                let status = if installed {
+                                    "✓ installed"
+                                } else {
+                                    "✗ not found"
+                                };
+                                let active_mark = if active == b.name { "  (active)" } else { "" };
+                                lines.push(format!("  {} {status}{active_mark}", b.name));
+                            }
+                            app.tab_mut().messages.push(
+                                ff_terminal::messages::render_assistant_message(&lines.join("\n")),
+                            );
+                            let tab = app.tab_mut();
+                            tab.input.text.clear();
+                            tab.input.cursor = 0;
+                            tab.input.suggestions.clear();
+                            tab.input.suggestion_index = None;
+                            continue;
+                        }
+
                         // /model with no args → open interactive picker overlay
                         if trimmed == "/model" {
                             open_model_picker(app);
@@ -4057,20 +4149,15 @@ async fn run_event_loop(
                         // Detect dragged file/folder paths and auto-contextualize
                         let prompt = helpers::detect_dropped_content(&trimmed);
 
-                        // Agent run
+                        // Agent run — route by the tab's active backend.
                         app.submit_input();
-                        let mut session = app
+                        let backend = app.tab().backend.clone();
+                        let session = app
                             .tab_mut()
                             .session
                             .take()
                             .unwrap_or_else(|| AgentSession::new(config.clone()));
-                        let (tx, rx) = tokio::sync::mpsc::channel::<AgentEvent>(256);
-
-                        let handle = tokio::spawn(async move {
-                            let outcome = session.run(&prompt, Some(tx)).await;
-                            (session, outcome)
-                        });
-
+                        let (handle, rx) = spawn_session_turn(&backend, session, prompt, &config);
                         agent_handle = Some(handle);
                         event_rx = Some(rx);
                     }
@@ -4179,6 +4266,109 @@ async fn run_event_loop(
         }
     }
     Ok(())
+}
+
+/// Spawn one agent turn for a tab, routing by `backend`.
+///
+/// Returns the same `(JoinHandle, Receiver)` pair the event loop already
+/// drains, so callers (the Enter-submit and the queued-message auto-send)
+/// stay identical regardless of backend.
+///
+/// - `backend == "local"`: the EXISTING local path — `session.run(&prompt,
+///   Some(tx))` — byte-for-byte unchanged.
+/// - any vendor (`claude`/`codex`/`kimi`/`gemini`/`grok`): spawn the vendor
+///   CLI via `cli_executor` and translate its single result into the SAME
+///   AgentEvent stream the local path emits (Status → AssistantText → Done),
+///   sent over the SAME channel. The `session` is moved through untouched so
+///   the finished-handle block restores it exactly like the local path.
+#[allow(clippy::type_complexity)]
+fn spawn_session_turn(
+    backend: &str,
+    mut session: AgentSession,
+    prompt: String,
+    config: &AgentSessionConfig,
+) -> (
+    tokio::task::JoinHandle<(AgentSession, ff_agent::agent_loop::AgentOutcome)>,
+    tokio::sync::mpsc::Receiver<AgentEvent>,
+) {
+    let (tx, rx) = tokio::sync::mpsc::channel::<AgentEvent>(256);
+
+    if backend == "local" {
+        // ── LOCAL PATH — unchanged behaviour ──
+        let handle = tokio::spawn(async move {
+            let outcome = session.run(&prompt, Some(tx)).await;
+            (session, outcome)
+        });
+        return (handle, rx);
+    }
+
+    // ── CLOUD CLI PATH ──
+    let backend = backend.to_string();
+    let session_id = session.id.to_string();
+    let cwd = config.working_dir.clone();
+    let handle = tokio::spawn(async move {
+        // 1. Immediate status so the footer leaves "Dispatching…" and shows
+        //    which vendor is handling the turn.
+        let _ = tx
+            .send(AgentEvent::Status {
+                session_id: session_id.clone(),
+                message: format!("running via {backend}…"),
+            })
+            .await;
+
+        // 2. Run the vendor CLI rooted at the TUI's working directory.
+        let timeout = Some(std::time::Duration::from_secs(600));
+        match ff_agent::cli_executor::execute_cli_in_dir(
+            &backend,
+            &prompt,
+            &[],
+            Some(cwd.as_path()),
+            timeout,
+        )
+        .await
+        {
+            Ok(result) => {
+                let mut text = result.stdout;
+                if result.exit_code != 0 {
+                    let tail: String = result.stderr.chars().take(800).collect();
+                    text.push_str(&format!("\n[stderr] (exit {}) {}", result.exit_code, tail));
+                }
+                let _ = tx
+                    .send(AgentEvent::AssistantText {
+                        session_id: session_id.clone(),
+                        text,
+                    })
+                    .await;
+            }
+            Err(e) => {
+                let _ = tx
+                    .send(AgentEvent::AssistantText {
+                        session_id: session_id.clone(),
+                        text: format!("backend '{backend}' error: {e}"),
+                    })
+                    .await;
+            }
+        }
+
+        // 3. Terminal event — same variant the local path sends — so the UI
+        //    leaves the "running" state and re-enables input on EVERY path
+        //    (Ok / non-zero exit / Err all fall through to here).
+        let _ = tx
+            .send(AgentEvent::Done {
+                session_id: session_id.clone(),
+                final_text: String::new(),
+            })
+            .await;
+
+        (
+            session,
+            ff_agent::agent_loop::AgentOutcome::EndTurn {
+                final_message: String::new(),
+            },
+        )
+    });
+
+    (handle, rx)
 }
 
 // ─── Headless Mode ─────────────────────────────────────────────────────────

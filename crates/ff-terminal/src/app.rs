@@ -130,6 +130,12 @@ pub struct SessionTab {
     pub auto_scroll: bool,
     pub status: String,
     pub current_model: String,
+    /// Backend that handles submits in this tab. `"local"` (default) runs the
+    /// in-process fleet agent loop; any vendor name from
+    /// `ff_agent::cli_executor::BACKENDS` (claude/codex/kimi/gemini/grok)
+    /// routes submits to that vendor's CLI instead. Persists across turns
+    /// within the tab; switch via the `/backend` slash command.
+    pub backend: String,
     pub tokens_used: usize,
     pub tokens_total: usize,
     pub turn: u32,
@@ -200,6 +206,7 @@ impl SessionTab {
             auto_scroll: true,
             status: "Ready".into(),
             current_model: "auto".into(),
+            backend: "local".into(),
             tokens_used: 0,
             tokens_total: 32_768,
             turn: 0,
