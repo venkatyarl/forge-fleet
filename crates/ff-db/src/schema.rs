@@ -7628,3 +7628,33 @@ VALUES
    true, 32768, 'forgefleet')
 ON CONFLICT (name) DO NOTHING;
 "#;
+
+// ─────────────────────────────────────────────────────────────────────────
+// V113 — Correct tool_calling on the coder family.
+//
+// The V111 backfill set tool_calling from the `preferred_workloads` JSONB tag,
+// but the coder catalog rows shipped with workloads `["code-gen","chat"]`
+// (no "tool_calling" tag) even though every one of these models supports
+// function/tool calling (Qwen3-Coder is purpose-built for agentic coding;
+// DeepSeek-Coder-V2 likewise). That left the V111 capability router unable to
+// select them for `ff offload` / agent dispatch — so heavy code work could not
+// route to the fleet's best coders. Reconcile the declared capability with the
+// truth, and append the tag so the derived value stays consistent on any
+// future re-sync. Idempotent.
+pub const SCHEMA_V113_CODER_TOOL_CALLING: &str = r#"
+UPDATE fleet_model_catalog
+   SET tool_calling = TRUE,
+       preferred_workloads = CASE
+           WHEN preferred_workloads @> '["tool_calling"]'::jsonb
+               THEN preferred_workloads
+           ELSE preferred_workloads || '["tool_calling"]'::jsonb
+       END,
+       updated_at = NOW()
+ WHERE id IN (
+     'qwen3-coder-30b',
+     'qwen3-coder-7b',
+     'qwen3-coder-next',
+     'deepseek-coder-v2-lite',
+     'deepseek-coder-v2'
+ );
+"#;
