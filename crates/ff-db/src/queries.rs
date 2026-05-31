@@ -2421,7 +2421,7 @@ pub async fn pg_route_deployments(
                COALESCE(c.primary_ip, w.name) AS host_or_name,
                c.os_family     AS os_family,
                c.has_gpu       AS has_gpu,
-               c.is_unified_memory AS is_unified_memory,
+               (c.gpu_kind IN ('apple_silicon', 'gb10')) AS is_unified_memory,
                c.total_ram_gb  AS total_ram_gb,
                EXTRACT(EPOCH FROM (NOW() - d.last_health_at))::int AS health_age_sec
           FROM fleet_model_deployments d
