@@ -330,18 +330,26 @@ fn classify_install_source(rule: &DetectionRule, path: &str) -> Option<String> {
         .get("install_source_hint")
         .and_then(|v| v.as_str())?;
     match hint {
-        "auto" => classify_pkg_source(path).or_else(|| {
-            // npm-installed CLIs typically land in /opt/homebrew/lib/node_modules
-            // or /usr/local/lib/node_modules — classify_pkg_source returns
-            // brew for these (which is technically true: brew's npm)
-            // but operators read it as "npm" for the CLI. Surface npm
-            // explicitly when path matches the node_modules pattern.
-            if path.contains("/node_modules/") {
+        "auto" => {
+            // npm-global CLIs symlink from a package-manager bin dir
+            // (/opt/homebrew/bin, /usr/bin, /usr/local/bin) INTO a
+            // node_modules tree, e.g. openclaw:
+            //   /opt/homebrew/bin/openclaw -> ../lib/node_modules/openclaw/openclaw.mjs
+            // The bare symlink path matches classify_pkg_source's brew/apt
+            // prefixes, so it would mislabel npm-global tools brew (macOS) or
+            // apt (Linux). Resolve the symlink first and surface npm when the
+            // real target lives under node_modules; otherwise fall back to
+            // path-prefix classification for genuine brew/apt binaries.
+            let resolved = std::fs::canonicalize(path)
+                .ok()
+                .and_then(|p| p.to_str().map(str::to_string))
+                .unwrap_or_default();
+            if path.contains("/node_modules/") || resolved.contains("/node_modules/") {
                 Some("npm".to_string())
             } else {
-                None
+                classify_pkg_source(path)
             }
-        }),
+        }
         other => Some(other.to_string()),
     }
 }
