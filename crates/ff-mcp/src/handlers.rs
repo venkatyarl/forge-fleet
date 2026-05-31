@@ -911,11 +911,11 @@ pub async fn fleet_offload(params: Option<Value>) -> HandlerResult {
     let (config, _config_path) = load_config_auto()?;
     let pool = get_pg_pool(&config).await?;
 
-    // ── Step 1: find a WARM tool-capable endpoint (V111 capability router).
-    // exclude_hosts is empty in v1 — the orchestrator can keep load off the
-    // leader by loading agent models elsewhere, which the router already
-    // prefers (tier/recency scoring). No parallel router here.
-    let candidate = ff_db::pg_pick_agent_endpoint(&pool, min_ctx, &[])
+    // ── Step 1: pick the best WARM endpoint, capability+kind-aware (same shared
+    // selector `ff offload` uses → no drift between the CLI and MCP paths).
+    // Prefers a model whose workload matches `kind` (coder for code), falls back
+    // to any tool-capable model, then breaks ties by least-loaded host.
+    let candidate = ff_db::pg_pick_offload_endpoint(&pool, min_ctx, kind, &[])
         .await
         .map_err(|e| format!("fleet_offload router query failed: {e}"))?;
 
@@ -965,7 +965,13 @@ pub async fn fleet_offload(params: Option<Value>) -> HandlerResult {
         presence_penalty: None,
         frequency_penalty: None,
         user: None,
-        extra: HashMap::new(),
+        // Disable Qwen3-style "thinking" so offload returns the answer, not
+        // chain-of-thought that eats the token budget (can return empty content
+        // under a tight cap). Harmless on servers that don't recognize it.
+        extra: HashMap::from([(
+            "chat_template_kwargs".to_string(),
+            json!({"enable_thinking": false}),
+        )]),
     };
 
     let started = Instant::now();
@@ -1000,7 +1006,7 @@ pub async fn fleet_offload(params: Option<Value>) -> HandlerResult {
         .json()
         .await
         .map_err(|e| format!("fleet_offload: failed parsing endpoint JSON: {e}"))?;
-    let result = extract_completion_text(&payload).unwrap_or_default();
+    let result = strip_think_block(&extract_completion_text(&payload).unwrap_or_default());
 
     Ok(json!({
         "offloaded": true,
@@ -1017,6 +1023,37 @@ pub async fn fleet_offload(params: Option<Value>) -> HandlerResult {
         "review_hint": "Review this output before using it. If it's wrong or \
                         the task needed architectural judgment, redo it yourself."
     }))
+}
+
+/// Strip any `<think>…</think>` reasoning a model emitted, returning the trimmed
+/// remainder. Belt-and-suspenders with chat_template_kwargs.enable_thinking=false.
+/// NOTE: keep in sync with `strip_think` in ff-terminal/src/offload_cmd.rs.
+fn strip_think_block(s: &str) -> String {
+    let mut out = s.to_string();
+    // 1) Remove well-formed <think>…</think> pairs, left-to-right.
+    loop {
+        let Some(open) = out.find("<think>") else {
+            break;
+        };
+        match out[open..].find("</think>") {
+            Some(rel) => {
+                let close = open + rel + "</think>".len();
+                out.replace_range(open..close, "");
+            }
+            // 2) Unclosed opener — a thinking model cut off mid-reasoning under a
+            //    token cap. Everything from <think> on is reasoning; drop it.
+            None => {
+                out.truncate(open);
+                break;
+            }
+        }
+    }
+    // 3) A lone trailing </think> with no opener (the open tag was consumed by
+    //    the chat template): the answer is whatever follows the last </think>.
+    if let Some(i) = out.rfind("</think>") {
+        out = out[i + "</think>".len()..].to_string();
+    }
+    out.trim().to_string()
 }
 
 // ─── Fleet Cascade ───────────────────────────────────────────────────────────

@@ -2506,6 +2506,91 @@ pub async fn pg_pick_agent_endpoint(
         .next())
 }
 
+/// Active-deployment count per worker — a cheap host-load proxy for offload's
+/// least-loaded tiebreak (a host serving 5 model servers is busier than one
+/// serving 1; this is what stalled an offload on a 5-server host for 8 min).
+/// P3 (the adaptive autoscaler) will replace this with a real demand/load signal.
+pub async fn pg_active_deployment_counts(
+    pool: &PgPool,
+) -> Result<std::collections::HashMap<String, i64>> {
+    let rows = sqlx::query(
+        "SELECT worker_name, COUNT(*)::bigint AS n
+           FROM fleet_model_deployments
+          WHERE desired_state = 'active'
+          GROUP BY worker_name",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .iter()
+        .map(|r| {
+            let w: String = r.get("worker_name");
+            let n: i64 = r.get("n");
+            (w, n)
+        })
+        .collect())
+}
+
+/// Map an offload task `kind` to a preferred catalog workload tag. Code-shaped
+/// work prefers a coder-family model (`code-gen`); every other kind has no
+/// preference and routes to the cheapest warm tool-capable model.
+fn offload_workload_for_kind(kind: Option<&str>) -> Option<&'static str> {
+    match kind.map(|k| k.to_ascii_lowercase()).as_deref() {
+        Some("codegen") | Some("edits") | Some("tests") | Some("code") => Some("code-gen"),
+        _ => None,
+    }
+}
+
+/// Offload-specific endpoint selection: capability + kind-aware, with a
+/// least-loaded-host tiebreak. Kept DISTINCT from [`pg_pick_agent_endpoint`]
+/// (which agents/crew use) so their default ranking is untouched — but built on
+/// the SAME [`pg_route_deployments`] scorer so there's still no parallel router.
+///
+/// Selection order: (1) prefer a warm tool-capable model whose workload matches
+/// the task `kind` (codegen/edits/tests/code -> a `code-gen` coder); (2) fall
+/// back to any warm tool-capable model; (3) rank by smaller tier first (cheapest
+/// appropriate model), then least-loaded host as a tiebreak among equal tiers.
+/// Both `ff offload` and the `fleet_offload` MCP tool call this.
+pub async fn pg_pick_offload_endpoint(
+    pool: &PgPool,
+    min_ctx: i32,
+    kind: Option<&str>,
+    exclude_hosts: &[String],
+) -> Result<Option<RouteCandidate>> {
+    let mk = |workload: Option<&str>| RouteFilter {
+        workload: workload.map(str::to_string),
+        require_tool_calling: true,
+        min_ctx: Some(min_ctx),
+        exclude_hosts: exclude_hosts.to_vec(),
+        limit: 8,
+    };
+
+    // 1) workload-matching candidates (e.g. coders for code kinds).
+    let mut cands = match offload_workload_for_kind(kind) {
+        Some(w) => pg_route_deployments(pool, &mk(Some(w))).await?,
+        None => Vec::new(),
+    };
+    // 2) fall back to any warm tool-capable endpoint.
+    if cands.is_empty() {
+        cands = pg_route_deployments(pool, &mk(None)).await?;
+    }
+    if cands.is_empty() {
+        return Ok(None);
+    }
+    // 3) cheapest appropriate model first (smaller tier), then least-loaded host
+    //    as a tiebreak among equal tiers — so two same-tier endpoints spread load
+    //    instead of always hammering the same one. (Hard saturation avoidance —
+    //    skipping an overloaded host outright — is P3's job, not P1's.)
+    let load = pg_active_deployment_counts(pool).await.unwrap_or_default();
+    cands.sort_by_key(|c| {
+        (
+            c.tier as i64,
+            load.get(&c.worker_name).copied().unwrap_or(0),
+        )
+    });
+    Ok(cands.into_iter().next())
+}
+
 // ─── Fleet agents catalog (V112) ─────────────────────────────────────────────
 //
 // The `fleet_agents` table is the canonical catalog of specialized agents the
