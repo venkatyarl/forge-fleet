@@ -638,11 +638,34 @@ const ACTION_VERBS: &[&str] = &[
     "install",
 ];
 
-/// Create a session for `goal` and append a single primary step whose prompt is
-/// the operator's request. Mirrors the `ff session spawn` + `ff session add-step`
-/// call shapes (main.rs:2901 / 2927): same `None`/`Option` argument pattern.
-/// Returns the new session id (the HUD's `mission_id`).
+/// Number of whitespace-delimited words at/above which a JARVIS mission is
+/// treated as non-trivial enough to warrant LLM decomposition (Orchestrator
+/// P4) rather than a single primary step. Deliberately conservative: a short
+/// spoken command ("restart marcus", "scan the disk") stays single-step;
+/// a real build request ("build a CLI that imports CSVs, validates them, and
+/// writes a Postgres table with a migration") crosses the threshold and
+/// fans out into a parallel team.
+const DECOMPOSE_WORD_THRESHOLD: usize = 8;
+
+/// Create a session for `goal`. For a non-trivial goal (>= the word
+/// threshold) this takes the **plan-first** path: a `planner` step is
+/// attached and `session_runner::tick()` auto-fans it out into a parallel
+/// child DAG (Orchestrator P4) with no manual apply-plan step. Short/trivial
+/// goals keep the original single primary-step behaviour.
+///
+/// Mirrors the `ff session spawn` / `ff session plan` call shapes. Returns the
+/// new session id (the HUD's `mission_id`).
 async fn start_mission(pool: &sqlx::PgPool, goal: &str) -> anyhow::Result<uuid::Uuid> {
+    let word_count = goal.split_whitespace().count();
+    if word_count >= DECOMPOSE_WORD_THRESHOLD {
+        // Plan-first: create_decomposed_session does create_session +
+        // add_planner_step; tick() folds the planner's completion into
+        // child steps automatically and dispatches them in parallel.
+        return ff_agent::session_runner::create_decomposed_session(pool, goal, Some("jarvis"))
+            .await;
+    }
+
+    // Trivial goal — single primary step, unchanged.
     // create_session(pool, goal, team=None, budget_usd_cap=None, created_by).
     let session_id =
         ff_agent::session_runner::create_session(pool, goal, None, None, Some("jarvis")).await?;
