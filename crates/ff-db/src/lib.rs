@@ -40,6 +40,8 @@ pub use queries::{
     BrainVaultNodeRow,
     ComputerScheduleRow,
     DeferredTaskRow,
+    // Orchestrator P2 — per-session demand sensing (V116)
+    DemandVector,
     // Fleet agents catalog (V112)
     FleetAgentRow,
     FleetModelRow,
@@ -75,6 +77,8 @@ pub use queries::{
     pg_create_schedule,
     pg_create_shared_volume,
     pg_create_training_job,
+    // Orchestrator P2 — demand sensing (V116)
+    pg_current_demand_vector,
     pg_delete_deployment,
     pg_delete_library,
     pg_delete_mesh_status_for_node,
@@ -107,6 +111,7 @@ pub use queries::{
     pg_insert_brain_reminder,
     pg_insert_disk_usage,
     pg_insert_node_ssh_key,
+    pg_latest_demand_snapshot,
     pg_latest_disk_usage,
     pg_list_agents,
     pg_list_brain_candidates_pending,
@@ -164,6 +169,8 @@ pub use queries::{
     pg_upsert_model,
     pg_upsert_node,
     pg_upsert_shared_volume_mount,
+    // Orchestrator P2 — demand sensing emission (V116)
+    record_session_work_signal,
     seed_from_fleet_toml,
 };
 pub use runtime_registry::RuntimeRegistryStore;

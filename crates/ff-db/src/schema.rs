@@ -7852,3 +7852,53 @@ ON CONFLICT (name) DO UPDATE
         enabled              = EXCLUDED.enabled,
         updated_at           = now();
 "#;
+
+// ─────────────────────────────────────────────────────────────────────────
+// V116 — Orchestrator P2: per-session demand sensing.
+//
+// Captures the work-kind signal that ALREADY flows through the offload path
+// (`ff offload --kind` / `fleet_offload`) and the session_runner dispatch
+// (step.role), rolling it into a fleet-wide demand vector P3's adaptive
+// serving-mix autoscaler consumes.
+//
+// - `session_work_signal`: cheap per-minute UPSERT buckets of normalized
+//   work-kind (code|general). PK on (session_id,work_kind,source,bucket_minute)
+//   makes each emission a clean ON CONFLICT increment, so a chatty session
+//   writes one row per minute, not thousands. session_id is TEXT (accepts the
+//   agent_sessions UUID, the SQLite/cloud TEXT id, and the 'adhoc:*' synthetic)
+//   with NO FK — avoids the UUID/TEXT join hazard + ON DELETE coupling.
+// - `fleet_demand_snapshot`: one row per 30s leader tick — the demand vector
+//   (code/general slots wanted, fair-shared across active sessions) so P3 +
+//   the dashboard read one indexed row instead of re-aggregating.
+//
+// COLLATE "C" on the text-ID columns per the DB collation-corruption
+// prevention rule (stable byte-ordering for the ON CONFLICT unique index).
+pub const SCHEMA_V116_SESSION_DEMAND: &str = r#"
+-- Per-session work-kind signal, bucketed per minute to stay cheap.
+CREATE TABLE IF NOT EXISTS session_work_signal (
+    session_id     TEXT COLLATE "C" NOT NULL,   -- agent_sessions.id OR 'adhoc:<source>'
+    work_kind      TEXT COLLATE "C" NOT NULL,   -- normalized: 'code' | 'general'
+    raw_kind       TEXT,                          -- observability: codegen/edits/research/role-name
+    source         TEXT COLLATE "C" NOT NULL,   -- 'offload' | 'mcp_offload' | 'session_step'
+    bucket_minute  TIMESTAMPTZ NOT NULL,          -- date_trunc('minute', now())
+    hits           INT NOT NULL DEFAULT 1,
+    PRIMARY KEY (session_id, work_kind, source, bucket_minute)
+);
+
+CREATE INDEX IF NOT EXISTS idx_session_work_signal_window
+    ON session_work_signal (bucket_minute DESC);
+
+-- Fleet-wide demand vector snapshots — one row per leader tick, read by P3 + dashboard.
+CREATE TABLE IF NOT EXISTS fleet_demand_snapshot (
+    id                   BIGSERIAL PRIMARY KEY,
+    captured_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    window_secs          INT NOT NULL DEFAULT 300,
+    active_sessions      INT NOT NULL DEFAULT 0,
+    code_slots_wanted    NUMERIC(8,2) NOT NULL DEFAULT 0,
+    general_slots_wanted NUMERIC(8,2) NOT NULL DEFAULT 0,
+    per_session          JSONB NOT NULL DEFAULT '[]'
+);
+
+CREATE INDEX IF NOT EXISTS idx_fleet_demand_snapshot_recent
+    ON fleet_demand_snapshot (captured_at DESC);
+"#;
