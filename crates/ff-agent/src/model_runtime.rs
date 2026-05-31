@@ -74,6 +74,21 @@ fn serving_mode_from_workloads(workloads: &serde_json::Value) -> ServingMode {
     ServingMode::Chat
 }
 
+/// Decide whether a load should use the agent-capable serving profile
+/// (`--parallel 1`, ctx >= [`AGENT_MIN_CTX`]). Capable **chat** models default
+/// to it so the endpoint is router/autoscaler-eligible (they require
+/// `usable_agent_ctx >= 32768`); an explicit `--parallel` opts out for
+/// throughput, and an explicit `--agent` always forces it on. Embedders and
+/// rerankers are never promoted (single forward pass, no per-slot split).
+fn resolve_agent_profile(
+    explicit_agent: bool,
+    mode: ServingMode,
+    tool_calling: bool,
+    explicit_parallel: Option<u32>,
+) -> bool {
+    explicit_agent || (mode == ServingMode::Chat && tool_calling && explicit_parallel.is_none())
+}
+
 /// Result of a successful load.
 #[derive(Debug, Clone)]
 pub struct LoadResult {
@@ -121,11 +136,39 @@ pub async fn load_model(pool: &sqlx::PgPool, opts: LoadOptions) -> Result<LoadRe
         ));
     }
 
+    let port = opts.port;
+
+    // Look up the catalog row so we can pick the right serving mode (chat /
+    // embedding / reranking) AND whether the model is tool-calling (which drives
+    // the agent-profile default below). Falls back to Chat / non-tool-calling
+    // when there's no catalog row or no recognised workload tag — preserves
+    // existing behaviour for unknown models.
+    let (mode, tool_calling) = match ff_db::pg_get_catalog(pool, &lib.catalog_id)
+        .await
+        .map_err(|e| format!("pg_get_catalog({}): {e}", lib.catalog_id))?
+    {
+        Some(cat) => (
+            serving_mode_from_workloads(&cat.preferred_workloads),
+            cat.tool_calling,
+        ),
+        None => (ServingMode::Chat, false),
+    };
+
+    // Capable chat models default to the agent serving profile so the endpoint
+    // is router/autoscaler-eligible (they require usable_agent_ctx >= 32768).
+    let agent = resolve_agent_profile(opts.agent_profile, mode, tool_calling, opts.parallel);
+    if agent && !opts.agent_profile {
+        tracing::info!(
+            model = %lib.catalog_id,
+            "capable model defaulted to agent serving profile (--parallel 1, ctx >= 32768)"
+        );
+    }
+
     // Agent-capable profile forces a single slot and a ctx floor so a
     // tool-schema system prompt can't overflow a split per-slot window. We
-    // apply it BEFORE the defaults so an explicit `--parallel`/`--ctx` is
-    // overridden (the profile is the contract; a too-small ctx would defeat it).
-    let (ctx, parallel) = if opts.agent_profile {
+    // apply it BEFORE the defaults so a too-small explicit `--ctx` is raised to
+    // the floor (the profile is the contract; a too-small ctx would defeat it).
+    let (ctx, parallel) = if agent {
         let ctx = opts
             .context_size
             .unwrap_or(AGENT_MIN_CTX)
@@ -136,18 +179,6 @@ pub async fn load_model(pool: &sqlx::PgPool, opts: LoadOptions) -> Result<LoadRe
             opts.context_size.unwrap_or(65_536),
             opts.parallel.unwrap_or(2),
         )
-    };
-    let port = opts.port;
-
-    // Look up the catalog row so we can pick the right serving mode (chat /
-    // embedding / reranking). Falls back to Chat when there's no catalog
-    // row or no recognised workload tag — preserves existing behaviour.
-    let mode = match ff_db::pg_get_catalog(pool, &lib.catalog_id)
-        .await
-        .map_err(|e| format!("pg_get_catalog({}): {e}", lib.catalog_id))?
-    {
-        Some(cat) => serving_mode_from_workloads(&cat.preferred_workloads),
-        None => ServingMode::Chat,
     };
 
     // Build the launch command per runtime.
@@ -1270,4 +1301,71 @@ async fn write_systemd_unit(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capable_chat_model_defaults_to_agent_profile() {
+        // tool-calling chat model, no explicit --parallel → promoted.
+        assert!(resolve_agent_profile(false, ServingMode::Chat, true, None));
+    }
+
+    #[test]
+    fn explicit_parallel_opts_out_of_agent_profile() {
+        // Operator pinned --parallel for throughput → not promoted.
+        assert!(!resolve_agent_profile(
+            false,
+            ServingMode::Chat,
+            true,
+            Some(2)
+        ));
+    }
+
+    #[test]
+    fn non_tool_calling_chat_model_is_not_promoted() {
+        // e.g. gemma-4 / a reasoner: chat but not tool-calling → stays default.
+        assert!(!resolve_agent_profile(
+            false,
+            ServingMode::Chat,
+            false,
+            None
+        ));
+    }
+
+    #[test]
+    fn embedders_and_rerankers_are_never_promoted() {
+        // Single forward pass, no per-slot ctx split — even if (wrongly) flagged.
+        assert!(!resolve_agent_profile(
+            false,
+            ServingMode::Embedding,
+            true,
+            None
+        ));
+        assert!(!resolve_agent_profile(
+            false,
+            ServingMode::Reranking,
+            true,
+            None
+        ));
+    }
+
+    #[test]
+    fn explicit_agent_flag_always_forces_profile() {
+        // --agent wins regardless of kind / pinned parallel.
+        assert!(resolve_agent_profile(
+            true,
+            ServingMode::Chat,
+            false,
+            Some(4)
+        ));
+        assert!(resolve_agent_profile(
+            true,
+            ServingMode::Embedding,
+            false,
+            None
+        ));
+    }
 }
