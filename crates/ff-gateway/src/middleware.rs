@@ -177,9 +177,18 @@ pub async fn jwt_auth_middleware(request: Request<Body>, next: Next) -> Response
     // FF_JWT_SECRET (production deploy behind a reverse proxy), the
     // full JWT check still applies — the carve-out only kicks in when
     // no secret is configured.
+    // `/api/jarvis/ask` is JARVIS's query endpoint: it reads fleet state or
+    // dispatches the prompt to a local LLM — same spirit as the /v1 LLM routes,
+    // and the loopback JARVIS HUD calls it unauthenticated. Carve it out so the
+    // LAN deploy (no FF_JWT_SECRET) works; a production deploy that sets the
+    // secret still gates it.
     let is_llm_endpoint = matches!(
         path.as_str(),
-        "/v1/chat/completions" | "/v1/completions" | "/v1/embeddings" | "/v1/rerank"
+        "/v1/chat/completions"
+            | "/v1/completions"
+            | "/v1/embeddings"
+            | "/v1/rerank"
+            | "/api/jarvis/ask"
     );
 
     let secret = match std::env::var("FF_JWT_SECRET") {
