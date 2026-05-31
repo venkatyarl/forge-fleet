@@ -32,6 +32,7 @@ pub mod quarantine;
 pub mod run_limits;
 pub mod synthetic;
 pub mod task;
+pub mod task_error;
 pub mod types;
 pub mod verifier;
 
@@ -62,6 +63,7 @@ pub use synthetic::{
     ProbeCategory, ProbeRegistry, ProbeResult, ProbeStatus, ReplicationLagProbe, SyntheticProbe,
 };
 pub use task::{AgentTask, AgentTaskKind, TaskResult};
+pub use task_error::{TaskErrorClass, classify_task_error};
 pub use types::*;
 pub use verifier::{
     CategoryScore, HealthScorecard, HealthVerifier, ScorecardResponse, ScorecardSnapshot,

@@ -3,8 +3,48 @@
 //! Fleet-wide task view. Queries `fleet_tasks` (V44) and renders a table.
 
 use anyhow::Result;
+use ff_core::task_error::{TaskErrorClass, classify_task_error};
 use serde_json::Value;
 use sqlx::{PgPool, Row};
+
+/// Terminal statuses that represent a failure (worth classifying).
+fn is_failed_status(status: &str) -> bool {
+    matches!(status, "failed" | "cancelled" | "canceled")
+}
+
+/// Derive a [`TaskErrorClass`] on the fly from an already-stored task row.
+///
+/// Reads `stdout`/`stderr`/`exit` out of the result JSON (shape
+/// `{exit, stdout, stderr}`, written by `ff_agent::task_runner`) plus the
+/// free-form `error` column, and runs the pure classifier. Returns `None`
+/// for non-failed tasks. Nothing is persisted — this is computed at display
+/// time only.
+fn classify_failed_task(
+    status: &str,
+    result: Option<&Value>,
+    error: Option<&str>,
+) -> Option<TaskErrorClass> {
+    if !is_failed_status(status) {
+        return None;
+    }
+    let stdout = result
+        .and_then(|r| r.get("stdout"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let stderr = result
+        .and_then(|r| r.get("stderr"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let exit = result.and_then(|r| r.get("exit")).and_then(Value::as_i64);
+    // A cancelled task may carry no result/error text at all; the classifier
+    // falls back to Unknown, but the status itself is the signal, so map
+    // empty-but-cancelled to Cancelled explicitly.
+    let class = classify_task_error(stderr, stdout, exit, error);
+    if class == TaskErrorClass::Unknown && matches!(status, "cancelled" | "canceled") {
+        return Some(TaskErrorClass::Cancelled);
+    }
+    Some(class)
+}
 
 pub async fn handle_tasks_list(
     pg: &PgPool,
@@ -16,7 +56,7 @@ pub async fn handle_tasks_list(
     let mut sql = String::from(
         "SELECT t.id, t.task_type, t.summary, t.status, \
                 c.name as claimer_name, t.progress_pct, t.progress_message, \
-                t.created_at, t.started_at \
+                t.result, t.error, t.created_at, t.started_at \
          FROM fleet_tasks t \
          LEFT JOIN computers c ON t.claimed_by_computer_id = c.id \
          WHERE 1=1",
@@ -56,15 +96,18 @@ pub async fn handle_tasks_list(
     }
     let rows = q.fetch_all(pg).await?;
 
+    // ERR column carries the on-the-fly error class for failed rows only
+    // (blank for everything else). 17 = width of the longest class string
+    // ("permission_denied"). Nothing is persisted; it's derived per row.
     if show_id {
         println!(
-            "{:<36} {:<10} {:<20} {:<12} {:<10} {:>5} SUMMARY",
-            "ID", "COMPUTER", "TYPE", "STATUS", "AGE", "PCT"
+            "{:<36} {:<10} {:<20} {:<12} {:<10} {:>5} {:<17} SUMMARY",
+            "ID", "COMPUTER", "TYPE", "STATUS", "AGE", "PCT", "ERR"
         );
     } else {
         println!(
-            "{:<10} {:<20} {:<12} {:<10} {:>5} SUMMARY",
-            "COMPUTER", "TYPE", "STATUS", "AGE", "PCT"
+            "{:<10} {:<20} {:<12} {:<10} {:>5} {:<17} SUMMARY",
+            "COMPUTER", "TYPE", "STATUS", "AGE", "PCT", "ERR"
         );
     }
     for r in rows {
@@ -91,25 +134,34 @@ pub async fn handle_tasks_list(
         let ty_short: String = ty.chars().take(20).collect();
         let status_short: String = status.chars().take(12).collect();
         let summary_short: String = summary.chars().take(60).collect();
+        // Compact error class — only populated for failed/cancelled rows,
+        // derived on the fly from the stored result/error (no storage change).
+        let result: Option<Value> = r.try_get("result").ok();
+        let error: Option<String> = r.try_get("error").ok();
+        let err_class = classify_failed_task(&status, result.as_ref(), error.as_deref())
+            .map(|c| c.as_str())
+            .unwrap_or("");
         if show_id {
             println!(
-                "{:<36} {:<10} {:<20} {:<12} {:<10} {:>5} {}",
+                "{:<36} {:<10} {:<20} {:<12} {:<10} {:>5} {:<17} {}",
                 id,
                 computer.as_deref().unwrap_or("-"),
                 ty_short,
                 status_short,
                 age_str,
                 pct_str,
+                err_class,
                 summary_short
             );
         } else {
             println!(
-                "{:<10} {:<20} {:<12} {:<10} {:>5} {}",
+                "{:<10} {:<20} {:<12} {:<10} {:>5} {:<17} {}",
                 computer.as_deref().unwrap_or("-"),
                 ty_short,
                 status_short,
                 age_str,
                 pct_str,
+                err_class,
                 summary_short
             );
         }
@@ -118,7 +170,7 @@ pub async fn handle_tasks_list(
 }
 
 /// Show full detail for one task.
-pub async fn handle_tasks_get(pg: &PgPool, id: uuid::Uuid) -> Result<()> {
+pub async fn handle_tasks_get(pg: &PgPool, id: uuid::Uuid, json: bool) -> Result<()> {
     let row = sqlx::query(
         "SELECT t.id, t.parent_task_id, t.task_type, t.summary, t.payload,
                 t.priority, t.requires_capability, t.status, c.name as claimer_name,
@@ -156,6 +208,53 @@ pub async fn handle_tasks_get(pg: &PgPool, id: uuid::Uuid) -> Result<()> {
     let started_at: Option<chrono::DateTime<chrono::Utc>> = r.try_get("started_at").ok();
     let completed_at: Option<chrono::DateTime<chrono::Utc>> = r.try_get("completed_at").ok();
     let heartbeat_at: Option<chrono::DateTime<chrono::Utc>> = r.try_get("last_heartbeat_at").ok();
+
+    // Derive the structured error class once; reused by both output paths.
+    let err_class = classify_failed_task(&status, result.as_ref(), error.as_deref());
+
+    if json {
+        // Preserve all existing fields verbatim; only ADD `error_class`
+        // (and its hint) for failed/cancelled tasks. Computed, not stored.
+        let mut obj = serde_json::Map::new();
+        obj.insert("id".into(), Value::String(id.to_string()));
+        if let Some(p) = parent {
+            obj.insert("parent_task_id".into(), Value::String(p.to_string()));
+        }
+        obj.insert("task_type".into(), Value::String(task_type.clone()));
+        obj.insert("summary".into(), Value::String(summary.clone()));
+        obj.insert("status".into(), Value::String(status.clone()));
+        obj.insert("priority".into(), Value::from(priority));
+        obj.insert("requires_capability".into(), caps.clone());
+        obj.insert(
+            "claimed_by".into(),
+            claimer.clone().map(Value::String).unwrap_or(Value::Null),
+        );
+        obj.insert("payload".into(), payload.clone());
+        obj.insert(
+            "progress_pct".into(),
+            pct.map(|p| Value::from(p as f64)).unwrap_or(Value::Null),
+        );
+        obj.insert("result".into(), result.clone().unwrap_or(Value::Null));
+        obj.insert(
+            "error".into(),
+            error.clone().map(Value::String).unwrap_or(Value::Null),
+        );
+        if let Some(class) = err_class {
+            obj.insert(
+                "error_class".into(),
+                Value::String(class.as_str().to_string()),
+            );
+            obj.insert(
+                "error_class_hint".into(),
+                Value::String(class.hint().to_string()),
+            );
+        }
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&Value::Object(obj)).unwrap_or_default()
+        );
+        return Ok(());
+    }
 
     println!("ID:              {id}");
     if let Some(p) = parent {
@@ -202,6 +301,12 @@ pub async fn handle_tasks_get(pg: &PgPool, id: uuid::Uuid) -> Result<()> {
         "{}",
         serde_json::to_string_pretty(&payload).unwrap_or_default()
     );
+    // Surface the structured error class before the raw blobs so it's the
+    // first thing the operator sees. Computed on the fly above — not stored.
+    if let Some(class) = err_class {
+        println!();
+        println!("ERROR CLASS:     {}  ({})", class.as_str(), class.hint());
+    }
     if let Some(r) = result {
         println!();
         println!("Result:");

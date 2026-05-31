@@ -746,7 +746,13 @@ enum TasksCommand {
         timeout: Option<u64>,
     },
     /// Show detailed status, payload, and result for one task.
-    Get { id: String },
+    Get {
+        id: String,
+        /// Emit the task as JSON. Failed/cancelled tasks gain a computed
+        /// `error_class` field (derived on the fly, not stored).
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Cancel a pending or running task. The row flips to `cancelled`;
     /// the worker's completion UPDATE is gated on status='running' so
     /// a late-completing hung worker won't clobber the cancellation.
@@ -2909,10 +2915,10 @@ async fn main() -> Result<()> {
                     println!("{id}");
                     Ok(())
                 }
-                TasksCommand::Get { id } => {
+                TasksCommand::Get { id, json } => {
                     let task_id = uuid::Uuid::parse_str(&id)
                         .map_err(|e| anyhow::anyhow!("invalid uuid: {e}"))?;
-                    tasks_cmd::handle_tasks_get(&pool, task_id).await
+                    tasks_cmd::handle_tasks_get(&pool, task_id, json).await
                 }
                 TasksCommand::Cancel { id, reason } => {
                     let task_id = uuid::Uuid::parse_str(&id)
