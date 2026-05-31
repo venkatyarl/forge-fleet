@@ -63,6 +63,24 @@ pub async fn handle_brain(cmd: crate::BrainCommand) -> Result<()> {
             println!("  edges:           {total_edges}");
             println!("  communities:     {communities}");
         }
+        crate::BrainCommand::Corpus(cmd) => {
+            crate::corpus_cmd::handle_corpus(&pool, cmd).await?;
+        }
+        crate::BrainCommand::Query {
+            org,
+            entities,
+            products,
+            roles,
+            statuses,
+            modalities,
+            facets,
+            format,
+        } => {
+            crate::corpus_cmd::handle_query(
+                &pool, &org, &entities, &products, &roles, &statuses, &modalities, &facets, &format,
+            )
+            .await?;
+        }
     }
     Ok(())
 }

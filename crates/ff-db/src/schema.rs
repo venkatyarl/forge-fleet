@@ -7902,3 +7902,120 @@ CREATE TABLE IF NOT EXISTS fleet_demand_snapshot (
 CREATE INDEX IF NOT EXISTS idx_fleet_demand_snapshot_recent
     ON fleet_demand_snapshot (captured_at DESC);
 "#;
+
+// SCHEMA_V117_BRAIN_FACETED_GRAPH — faceted, multi-parent, multi-root graph under Brain.
+// INCREMENT 1: structure/faceting only. COLLATE "C" on every internal text-ID column.
+pub const SCHEMA_V117_BRAIN_FACETED_GRAPH: &str = r#"
+CREATE TABLE IF NOT EXISTS brain_corpora (
+    id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    slug         TEXT COLLATE "C" NOT NULL,
+    title        TEXT NOT NULL,
+    description  TEXT,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_corpora_slug UNIQUE (slug)
+);
+
+CREATE TABLE IF NOT EXISTS brain_sources (
+    id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    corpus_id    UUID NOT NULL REFERENCES brain_corpora(id) ON DELETE CASCADE,
+    root_path    TEXT COLLATE "C" NOT NULL,
+    label        TEXT COLLATE "C",
+    host         TEXT COLLATE "C",
+    scan_status  TEXT COLLATE "C" NOT NULL DEFAULT 'pending',
+    last_scanned TIMESTAMPTZ,
+    file_count   INT NOT NULL DEFAULT 0,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_sources_root UNIQUE (root_path)
+);
+CREATE INDEX IF NOT EXISTS idx_brain_sources_corpus ON brain_sources(corpus_id);
+
+CREATE TABLE IF NOT EXISTS brain_entities (
+    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    corpus_id        UUID NOT NULL REFERENCES brain_corpora(id) ON DELETE CASCADE,
+    entity_key       TEXT COLLATE "C" NOT NULL,
+    name             TEXT NOT NULL,
+    entity_kind      TEXT COLLATE "C" NOT NULL,
+    parent_entity_id UUID REFERENCES brain_entities(id) ON DELETE SET NULL,
+    primary_path     TEXT COLLATE "C",
+    description      TEXT,
+    provenance       TEXT COLLATE "C" NOT NULL DEFAULT 'confirmed',
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_entities_corpus_key UNIQUE (corpus_id, entity_key)
+);
+CREATE INDEX IF NOT EXISTS idx_brain_entities_corpus ON brain_entities(corpus_id);
+CREATE INDEX IF NOT EXISTS idx_brain_entities_parent ON brain_entities(parent_entity_id);
+CREATE INDEX IF NOT EXISTS idx_brain_entities_kind   ON brain_entities(corpus_id, entity_kind);
+
+CREATE TABLE IF NOT EXISTS brain_facets (
+    id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    corpus_id    UUID NOT NULL REFERENCES brain_corpora(id) ON DELETE CASCADE,
+    dimension    TEXT COLLATE "C" NOT NULL,
+    value        TEXT COLLATE "C" NOT NULL,
+    title        TEXT,
+    color        TEXT,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_facets_corpus_dim_value UNIQUE (corpus_id, dimension, value)
+);
+CREATE INDEX IF NOT EXISTS idx_brain_facets_corpus_dim ON brain_facets(corpus_id, dimension);
+
+CREATE TABLE IF NOT EXISTS brain_memberships (
+    id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    corpus_id    UUID NOT NULL REFERENCES brain_corpora(id) ON DELETE CASCADE,
+    member_id    UUID NOT NULL,
+    member_kind  TEXT COLLATE "C" NOT NULL,
+    entity_id    UUID NOT NULL REFERENCES brain_entities(id) ON DELETE CASCADE,
+    relation     TEXT COLLATE "C" NOT NULL DEFAULT 'member_of',
+    provenance   TEXT COLLATE "C" NOT NULL DEFAULT 'confirmed',
+    confidence   REAL NOT NULL DEFAULT 1.0,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT brain_membership_kind_chk CHECK (member_kind IN ('content','entity'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_brain_membership
+    ON brain_memberships(member_id, entity_id, relation);
+CREATE INDEX IF NOT EXISTS idx_brain_membership_entity ON brain_memberships(entity_id);
+CREATE INDEX IF NOT EXISTS idx_brain_membership_member ON brain_memberships(member_id);
+CREATE INDEX IF NOT EXISTS idx_brain_membership_corpus ON brain_memberships(corpus_id);
+
+CREATE TABLE IF NOT EXISTS brain_node_facets (
+    id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    corpus_id    UUID NOT NULL REFERENCES brain_corpora(id) ON DELETE CASCADE,
+    node_id      UUID NOT NULL,
+    node_kind    TEXT COLLATE "C" NOT NULL,
+    facet_id     UUID NOT NULL REFERENCES brain_facets(id) ON DELETE CASCADE,
+    provenance   TEXT COLLATE "C" NOT NULL DEFAULT 'confirmed',
+    confidence   REAL NOT NULL DEFAULT 1.0,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT brain_node_facets_kind_chk CHECK (node_kind IN ('content','entity'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_brain_node_facet
+    ON brain_node_facets(node_id, facet_id);
+CREATE INDEX IF NOT EXISTS idx_brain_node_facets_facet  ON brain_node_facets(facet_id);
+CREATE INDEX IF NOT EXISTS idx_brain_node_facets_node   ON brain_node_facets(node_id);
+CREATE INDEX IF NOT EXISTS idx_brain_node_facets_corpus ON brain_node_facets(corpus_id);
+
+CREATE TABLE IF NOT EXISTS brain_node_sources (
+    node_id      UUID NOT NULL REFERENCES brain_vault_nodes(id) ON DELETE CASCADE,
+    source_id    UUID NOT NULL REFERENCES brain_sources(id) ON DELETE CASCADE,
+    rel_path     TEXT COLLATE "C" NOT NULL,
+    PRIMARY KEY (node_id, source_id)
+);
+CREATE INDEX IF NOT EXISTS idx_brain_node_sources_source ON brain_node_sources(source_id);
+
+CREATE TABLE IF NOT EXISTS brain_corpus_candidates (
+    id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    corpus_id    UUID NOT NULL REFERENCES brain_corpora(id) ON DELETE CASCADE,
+    kind         TEXT COLLATE "C" NOT NULL,
+    title        TEXT,
+    payload      JSONB NOT NULL DEFAULT '{}',
+    heuristic    TEXT COLLATE "C",
+    confidence   REAL NOT NULL DEFAULT 0.5,
+    status       TEXT COLLATE "C" NOT NULL DEFAULT 'pending',
+    reviewed_at  TIMESTAMPTZ,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_brain_corpus_candidates_pending
+    ON brain_corpus_candidates(corpus_id, status, created_at)
+    WHERE status = 'pending';
+"#;
