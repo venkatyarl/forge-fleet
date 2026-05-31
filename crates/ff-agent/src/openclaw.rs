@@ -52,8 +52,8 @@
 //!     .with_on_lost_leader(on_lost);
 //! ```
 
-use std::io::Write;
-use std::process::{Command, Stdio};
+use std::path::PathBuf;
+use std::process::Command;
 
 use sqlx::PgPool;
 use thiserror::Error;
@@ -164,77 +164,54 @@ impl OpenClawManager {
         Ok(())
     }
 
-    /// Export paired devices from the local OpenClaw gateway.
+    /// Export the local OpenClaw gateway's paired devices.
     ///
-    /// Runs `openclaw devices export --format json` and returns stdout.
-    /// Called on `on_lost_leader` — the result is written to
+    /// Reads `~/.openclaw/devices/paired.json` directly — OpenClaw has no
+    /// `devices export` CLI; that file IS the canonical pairing store.
+    /// Called on `on_lost_leader`; the result is stashed in
     /// `fleet_secrets.openclaw.device_pairings_export` so the incoming
-    /// leader can re-import it on `on_became_leader`.
+    /// leader re-imports it on `on_became_leader`.
     ///
-    /// Returns an empty string if OpenClaw reports no devices (rather
-    /// than an error) so the caller can uniformly stash-and-clear.
+    /// Returns an empty string when the gateway has no `paired.json` yet
+    /// (rather than an error) so the caller can uniformly stash-and-clear.
     pub async fn export_devices(&self) -> Result<String, OpenClawError> {
-        info!("openclaw: exporting paired devices via openclaw CLI");
-        let output = Command::new("openclaw")
-            .args(["devices", "export", "--format", "json"])
-            .output()?;
-        if !output.status.success() {
-            let err = String::from_utf8_lossy(&output.stderr).to_string();
-            return Err(OpenClawError::Cli(format!("devices export failed: {err}")));
+        let path = paired_devices_path();
+        match std::fs::read_to_string(&path) {
+            Ok(s) => {
+                info!(bytes = s.len(), path = %path.display(), "openclaw: exported paired devices");
+                Ok(s)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                info!(path = %path.display(), "openclaw: no paired.json — nothing to export");
+                Ok(String::new())
+            }
+            Err(e) => Err(OpenClawError::Io(e)),
         }
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        info!(bytes = stdout.len(), "openclaw: exported paired devices");
-        Ok(stdout)
     }
 
     /// Import paired devices into the local OpenClaw gateway.
     ///
-    /// Runs `openclaw devices import --format json` and pipes `json_export`
-    /// to stdin. Returns the number of devices imported per OpenClaw's
-    /// reported output (best-effort — an opaque 0 is returned if the
-    /// output can't be parsed).
+    /// Merges `json_export` into `~/.openclaw/devices/paired.json` (incoming
+    /// device tokens win on conflict) and restarts the gateway so it reloads
+    /// the store. OpenClaw has no `devices import` CLI — writing `paired.json`
+    /// and reloading IS the import.
     ///
     /// Called on `on_became_leader` after reading the export from
-    /// `fleet_secrets`. If `json_export` is empty/whitespace, this is a
-    /// no-op returning `Ok(0)` rather than an error.
+    /// `fleet_secrets`. Empty/whitespace input is a no-op returning `Ok(0)`.
+    /// Returns the device count in the merged store.
     pub async fn import_devices(&self, json_export: &str) -> Result<usize, OpenClawError> {
         if json_export.trim().is_empty() {
             info!("openclaw: device export is empty — nothing to import");
             return Ok(0);
         }
+        let count = merge_paired_devices(json_export)?;
+        // paired.json is read at gateway startup — reload so the merged
+        // devices take effect. Best-effort; DB/file state is authoritative.
+        restart_openclaw_service()?;
         info!(
-            bytes = json_export.len(),
-            "openclaw: importing paired devices via openclaw CLI"
+            count,
+            "openclaw: imported paired devices (merged paired.json + reloaded gateway)"
         );
-        let mut child = Command::new("openclaw")
-            .args(["devices", "import", "--format", "json"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(json_export.as_bytes())?;
-            // Dropping stdin closes it — openclaw will proceed once EOF
-            // arrives.
-        }
-
-        let output = child.wait_with_output()?;
-        if !output.status.success() {
-            let err = String::from_utf8_lossy(&output.stderr).to_string();
-            return Err(OpenClawError::Cli(format!("devices import failed: {err}")));
-        }
-
-        // Best-effort parse: OpenClaw is expected to print a line like
-        // "imported 14 device(s)" or emit JSON {"imported":14}. Pull the
-        // first integer we find.
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let count = stdout
-            .split(|c: char| !c.is_ascii_digit())
-            .find(|s| !s.is_empty())
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(0);
-        info!(count, "openclaw: imported paired devices");
         Ok(count)
     }
 
@@ -392,6 +369,56 @@ fn run_openclaw(args: &[&str]) -> Result<String, OpenClawError> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+/// Absolute path to OpenClaw's per-user state dir (`~/.openclaw`).
+fn openclaw_home() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    PathBuf::from(home).join(".openclaw")
+}
+
+/// Path to OpenClaw's canonical paired-device store. OpenClaw reads this at
+/// gateway startup, so migrating it across a leader change preserves
+/// phone/IoT/browser pairings without re-pairing. There is no
+/// `openclaw devices export/import` CLI — this file IS the interface.
+fn paired_devices_path() -> PathBuf {
+    openclaw_home().join("devices").join("paired.json")
+}
+
+/// Merge an incoming `paired.json` (a JSON object keyed by device token)
+/// into the local store, writing atomically (tmp + rename). Incoming tokens
+/// win on key conflict; the union preserves both the freshly-promoted
+/// gateway's own pairings and the outgoing gateway's. A non-object payload
+/// is ignored (local store left untouched). Returns the post-merge count.
+fn merge_paired_devices(incoming: &str) -> Result<usize, OpenClawError> {
+    use serde_json::{Map, Value};
+    let incoming_val: Value = serde_json::from_str(incoming)
+        .map_err(|e| OpenClawError::Cli(format!("parse incoming paired.json: {e}")))?;
+    let path = paired_devices_path();
+    let mut merged: Map<String, Value> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<Map<String, Value>>(&s).ok())
+        .unwrap_or_default();
+    match incoming_val {
+        Value::Object(m) => {
+            for (k, v) in m {
+                merged.insert(k, v);
+            }
+        }
+        _ => {
+            warn!("openclaw: incoming paired.json is not an object; leaving local store untouched");
+            return Ok(merged.len());
+        }
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let bytes = serde_json::to_vec_pretty(&Value::Object(merged.clone()))
+        .map_err(|e| OpenClawError::Cli(format!("serialize paired.json: {e}")))?;
+    let tmp = path.with_extension("json.ff-tmp");
+    std::fs::write(&tmp, &bytes)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(merged.len())
+}
+
 /// Best-effort service restart: `launchctl kickstart` on macOS, `systemctl
 /// restart` on Linux. Failures are logged as warnings, not errors — the
 /// DB state is already authoritative and the next `openclaw` invocation
@@ -446,8 +473,9 @@ fn current_uid() -> Option<String> {
         .or_else(|| std::env::var("SUDO_UID").ok())
 }
 
-/// Best-effort: rsync the previous gateway's `~/.openclaw/data/devices.json`
-/// across so paired phones/IoT survive a failover without re-pairing.
+/// Best-effort: pull the previous gateway's `~/.openclaw/devices/paired.json`
+/// across and merge it locally so paired phones/IoT survive a failover
+/// without re-pairing.
 ///
 /// Returns the number of devices imported, or `Ok(0)` on any soft failure.
 /// This is sweetener; it must never block a promotion.
@@ -490,7 +518,7 @@ async fn migrate_devices_from(
             "-o",
             "StrictHostKeyChecking=accept-new",
             &dest,
-            "cat ~/.openclaw/data/devices.json 2>/dev/null",
+            "cat ~/.openclaw/devices/paired.json 2>/dev/null",
         ])
         .output();
     let body = match out {
@@ -505,55 +533,23 @@ async fn migrate_devices_from(
         }
     };
     if body.trim().is_empty() {
-        info!(%old_leader, "migrate_devices: remote devices.json empty or missing");
+        info!(%old_leader, "migrate_devices: remote paired.json empty or missing");
         return Ok(0);
     }
 
-    // 3) Stage locally.
-    let ts = chrono::Utc::now().timestamp();
-    let path = format!("/tmp/ff_devices_migration_{ts}.json");
-    if let Err(e) = std::fs::write(&path, &body) {
-        warn!(%path, error=%e, "migrate_devices: write local stage failed");
-        return Ok(0);
-    }
-
-    // 4) Count for logging (best-effort parse).
-    let count = serde_json::from_str::<serde_json::Value>(&body)
-        .ok()
-        .and_then(|v| v.get("devices").and_then(|d| d.as_array()).map(|a| a.len()))
-        .unwrap_or(0);
-    info!(%old_leader, %new_leader, count, %path, "migrate_devices: importing paired devices");
-
-    // 5) Import via local openclaw. Fall back to /usr/local/bin/openclaw
-    //    if the bare name isn't on $PATH.
-    let bin = which_openclaw();
-    let status = Command::new(&bin)
-        .args(["devices", "import", &path])
-        .status();
-    match status {
-        Ok(s) if s.success() => Ok(count.max(1)),
-        Ok(s) => {
-            warn!(code=?s.code(), bin=%bin, "migrate_devices: openclaw devices import failed");
-            Ok(0)
-        }
+    // 3) Merge into the freshly-promoted gateway's own paired.json. OpenClaw
+    //    reads paired.json at startup — there is no `devices import` CLI, so
+    //    we write the file and reload the service.
+    let count = match merge_paired_devices(&body) {
+        Ok(c) => c,
         Err(e) => {
-            warn!(error=%e, bin=%bin, "migrate_devices: openclaw devices import spawn failed");
-            Ok(0)
+            warn!(%old_leader, error=%e, "migrate_devices: merge paired.json failed");
+            return Ok(0);
         }
-    }
-}
-
-/// Resolve the openclaw binary path — prefer `$PATH`, else `/usr/local/bin/openclaw`.
-fn which_openclaw() -> String {
-    if let Ok(o) = Command::new("which").arg("openclaw").output()
-        && o.status.success()
-    {
-        let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-        if !s.is_empty() {
-            return s;
-        }
-    }
-    "/usr/local/bin/openclaw".to_string()
+    };
+    let _ = restart_openclaw_service();
+    info!(%old_leader, %new_leader, count, "migrate_devices: merged paired devices + reloaded gateway");
+    Ok(count)
 }
 
 async fn upsert_secret(pool: &PgPool, key: &str, value: &str) -> Result<(), sqlx::Error> {
