@@ -275,8 +275,8 @@ pub fn spawn_consolidation_loop(
                         r#"
                         SELECT EXISTS (
                             SELECT 1 FROM fleet_leader_state
-                            WHERE leader_name = $1
-                              AND last_heartbeat > NOW() - INTERVAL '60 seconds'
+                            WHERE member_name = $1
+                              AND heartbeat_at > NOW() - INTERVAL '60 seconds'
                         )
                         "#
                     )
