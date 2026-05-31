@@ -77,7 +77,15 @@ pub async fn handle_brain(cmd: crate::BrainCommand) -> Result<()> {
             format,
         } => {
             crate::corpus_cmd::handle_query(
-                &pool, &org, &entities, &products, &roles, &statuses, &modalities, &facets, &format,
+                &pool,
+                &org,
+                &entities,
+                &products,
+                &roles,
+                &statuses,
+                &modalities,
+                &facets,
+                &format,
             )
             .await?;
         }
