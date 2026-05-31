@@ -688,8 +688,53 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                 Err(e) => anyhow::bail!("load failed: {e}"),
             }
         }
-        crate::ModelCommand::Autoload { catalog_id, ctx } => {
+        crate::ModelCommand::Autoload {
+            catalog_id,
+            ctx,
+            node,
+            agent,
+        } => {
             let worker_name = ff_agent::fleet_info::resolve_this_worker_name().await;
+
+            // Cross-node form: resolve user@ip from Postgres and run
+            // `ff model autoload <catalog_id>` on the target over SSH. Built
+            // from the DB (never ~/.ssh/config). Used by the P3 autoscaler's
+            // remote-load dispatch (and operators).
+            if let Some(target) = &node
+                && !target.eq_ignore_ascii_case(&worker_name)
+            {
+                let node_row = ff_db::pg_get_node(&pool, target)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("node '{target}' not in fleet_workers"))?;
+                let mut remote_cmd = format!(
+                    "~/.local/bin/ff model autoload {}",
+                    shell_escape_single(&catalog_id)
+                );
+                if let Some(c) = ctx {
+                    remote_cmd.push_str(&format!(" --ctx {c}"));
+                }
+                if agent {
+                    remote_cmd.push_str(" --agent");
+                }
+                println!(
+                    "{CYAN}▶ Autoloading {catalog_id} on {target} ({}@{})...{RESET}",
+                    node_row.ssh_user, node_row.ip
+                );
+                let (code, out, err) = ff_agent::model_transfer::ssh_exec(
+                    &node_row.ssh_user,
+                    &node_row.ip,
+                    &remote_cmd,
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("ssh to {target}: {e}"))?;
+                if !out.trim().is_empty() {
+                    print!("{out}");
+                }
+                if code != 0 {
+                    anyhow::bail!("remote autoload on {target} exited {code}: {}", err.trim());
+                }
+                return Ok(());
+            }
 
             // 1. Already deployed?
             let deps = ff_db::pg_list_deployments(&pool, Some(&worker_name)).await?;
@@ -733,7 +778,7 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                     port,
                     context_size: ctx,
                     parallel: None,
-                    agent_profile: false,
+                    agent_profile: agent,
                 },
             )
             .await

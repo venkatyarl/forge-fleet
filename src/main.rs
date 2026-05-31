@@ -712,6 +712,25 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         ));
     }
 
+    // 19) Adaptive serving-mix autoscaler — every 120s, leader-gated.
+    // Orchestrator P3: compares the P2 demand vector against live supply and,
+    // when the `fleet_secrets.autoscaler_mode` gate is set to `active`, loads
+    // or unloads models so the deployed mix follows demand (placement-scored
+    // across the fleet, hysteresis-gated). DEFAULTS TO OFF: with the gate at
+    // `off` (or unset) the tick is a pure no-op, so deploying this is harmless.
+    // `dry-run` logs the plan without actuating; `active` actuates.
+    if let Some(pg_pool) = operational_store.pg_pool().cloned() {
+        info!(
+            "starting subsystem: serving-mix autoscaler tick (120s, leader-gated, gate=fleet_secrets.autoscaler_mode default off)"
+        );
+        subsystem_tasks.push(ff_agent::autoscaler::spawn_autoscaler_tick(
+            pg_pool,
+            worker_name.clone(),
+            120,
+            shutdown_rx.clone(),
+        ));
+    }
+
     info!("all subsystems started; waiting for shutdown signal");
     wait_for_shutdown_signal().await;
 

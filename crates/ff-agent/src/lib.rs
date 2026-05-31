@@ -3,6 +3,7 @@ pub mod agent_hint;
 pub mod agent_loop;
 pub mod agent_roles;
 pub mod auto_upgrade;
+pub mod autoscaler;
 pub mod circuit_breaker;
 pub mod deadlines;
 pub mod defer_worker;
