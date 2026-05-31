@@ -254,7 +254,5 @@ pub async fn jarvis_state(State(state): State<Arc<GatewayState>>) -> impl IntoRe
 /// runs `cargo build` only — so dist/ is never present on remote hosts at
 /// compile time, but `public/` always is.
 pub async fn jarvis_hud() -> impl IntoResponse {
-    axum::response::Html(include_str!(
-        "../../../dashboard/public/jarvis.html"
-    ))
+    axum::response::Html(include_str!("../../../dashboard/public/jarvis.html"))
 }
