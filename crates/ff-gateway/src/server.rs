@@ -561,10 +561,7 @@ pub fn build_router(state: Arc<GatewayState>, mc_db_path: Option<&str>) -> Route
         .route("/api/fleet/status", get(fleet_status))
         .route("/api/status", get(fleet_status))
         .route("/api/jarvis/state", get(crate::jarvis_api::jarvis_state))
-        .route(
-            "/api/jarvis/ask",
-            post(crate::jarvis_api::jarvis_ask),
-        )
+        .route("/api/jarvis/ask", post(crate::jarvis_api::jarvis_ask))
         .route("/jarvis", get(crate::jarvis_api::jarvis_hud))
         .route("/jarvis.html", get(crate::jarvis_api::jarvis_hud))
         .route("/api/fleet/enroll", post(fleet_enroll))

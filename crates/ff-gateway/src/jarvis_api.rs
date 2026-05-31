@@ -302,7 +302,17 @@ pub async fn jarvis_ask(
     let pool = state.operational_store.as_ref().and_then(|os| os.pg_pool());
 
     // ── Intent: STATUS / SYSTEMS REPORT ───────────────────────────────────
-    if contains_any(&q, &["status", "systems", "report", "how are", "how's the", "sitrep"]) {
+    if contains_any(
+        &q,
+        &[
+            "status",
+            "systems",
+            "report",
+            "how are",
+            "how's the",
+            "sitrep",
+        ],
+    ) {
         if let Some(pool) = pool {
             let nodes = ff_db::pg_list_nodes(pool).await.unwrap_or_default();
             let total = nodes.len();
@@ -372,9 +382,8 @@ pub async fn jarvis_ask(
                 Some(l) => format!(", led by {l}"),
                 None => String::new(),
             };
-            let answer = format!(
-                "The fleet has {total} computers, {online} online{leader_phrase}, sir."
-            );
+            let answer =
+                format!("The fleet has {total} computers, {online} online{leader_phrase}, sir.");
             return jarvis_json(
                 answer,
                 "fleet",
@@ -399,7 +408,16 @@ pub async fn jarvis_ask(
     }
 
     // ── Intent: OFFLOAD / CREDITS / TOKENS ────────────────────────────────
-    if contains_any(&q, &["offload", "credits", "tokens", "warm model", "warm endpoint"]) {
+    if contains_any(
+        &q,
+        &[
+            "offload",
+            "credits",
+            "tokens",
+            "warm model",
+            "warm endpoint",
+        ],
+    ) {
         if let Some(pool) = pool {
             let offload = ff_db::pg_pick_offload_endpoint(pool, 16384, None, &[])
                 .await
@@ -601,8 +619,7 @@ async fn dispatch_to_fleet(client: &reqwest::Client, pool: &sqlx::PgPool, query:
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(error = %e, endpoint = %candidate.endpoint, "jarvis_ask dispatch failed");
-            return "I couldn't reach the local model just now, sir — do try again."
-                .to_string();
+            return "I couldn't reach the local model just now, sir — do try again.".to_string();
         }
     };
 
