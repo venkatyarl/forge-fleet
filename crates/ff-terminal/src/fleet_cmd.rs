@@ -3102,6 +3102,9 @@ async fn handle_fleet_deploy(
                LEFT JOIN fleet_workers fw ON fw.name = c.name
               WHERE c.status = 'online'
                 AND COALESCE(fw.role, '') <> 'leader'
+                -- Skip reserved/drained hosts (V114): a host the operator (or the
+                -- P3 autoscaler) reserved must not become a build target.
+                AND COALESCE(c.reservation_state, 'available') = 'available'
               ORDER BY string_to_array(c.primary_ip, '.')::int[]",
         )
         .fetch_all(pool)

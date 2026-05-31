@@ -1943,8 +1943,10 @@ pub enum ModelCommand {
     Load {
         /// Library id (UUID from `ff model library`).
         id: String,
-        /// Port to bind the inference server on (default: 51001).
-        #[arg(long, default_value_t = 51001)]
+        /// Port to bind the inference server on (default: 55000, a canonical
+        /// llama.cpp/mlx slot — 51001/51003 are vllm's, so the old 51001 default
+        /// collided on DGX hosts and looked off-window to the reconciler).
+        #[arg(long, default_value_t = 55000)]
         port: u16,
         /// Context window tokens (default 65536; per-slot ctx is ctx/parallel).
         #[arg(long)]
