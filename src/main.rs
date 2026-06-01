@@ -788,6 +788,10 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
             pg_pool,
             worker_name.clone(),
             300,
+            shutdown_rx.clone(),
+        ));
+    }
+
     // 20) Resource arbiter tick — every 60s, leader-gated.
     // Backlog #7 (V119): EXPLICIT-declaration host reservation. Reaps expired
     // leases (runs each owner's restore plan), walks the pending work_intents
