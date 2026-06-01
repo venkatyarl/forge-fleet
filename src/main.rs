@@ -808,6 +808,30 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         ));
     }
 
+    // 22) Fleet conformance tick — every 300s, leader-gated.
+    //
+    // BUILD #9/#10 increment 1: runs the V120 VERIFY GATES (gpu_bind /
+    // amd_arch / kfd_access / pkg_version) against amd-training hosts and
+    // records a MEASURED conformant bool + the SPECIFIC reason — catching what
+    // "version string parsed = ok" misses (a +cu wheel on an AMD box; a daemon
+    // user that can't open /dev/kfd). SAFETY: gated by
+    // `fleet_secrets.conformance_mode` (off|dry-run|active), DEFAULT off — the
+    // tick is a pure no-op until an operator opts in, so deploying it is
+    // harmless. Increment 1 NEVER remediates a host (the apply-reconciler is a
+    // deferred follow-up): dry-run and active are both record-only. Leader-gated
+    // like the autoscaler / disk-policy ticks — conformance is global state.
+    if let Some(pg_pool) = operational_store.pg_pool().cloned() {
+        info!(
+            "starting subsystem: fleet conformance tick (5min, leader-gated, gate=fleet_secrets.conformance_mode default off)"
+        );
+        subsystem_tasks.push(ff_agent::conformance::spawn_conformance_tick(
+            pg_pool,
+            worker_name.clone(),
+            300,
+            shutdown_rx.clone(),
+        ));
+    }
+
     info!("all subsystems started; waiting for shutdown signal");
     wait_for_shutdown_signal().await;
 

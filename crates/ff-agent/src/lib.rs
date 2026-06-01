@@ -35,6 +35,7 @@ pub mod cloud_llm_registry;
 pub mod commands;
 pub mod commands_extended;
 pub mod compaction;
+pub mod conformance;
 pub mod consensus;
 pub mod coverage_guard;
 pub mod db_integrity;

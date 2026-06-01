@@ -727,6 +727,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "resource_arbiter",
         sql: schema::SCHEMA_V119_RESOURCE_ARBITER,
     },
+    PgMigration {
+        version: 120,
+        name: "fleet_conformance",
+        sql: schema::SCHEMA_V120_FLEET_CONFORMANCE,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.
