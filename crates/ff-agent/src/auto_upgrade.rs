@@ -31,6 +31,13 @@ use tokio::task::JoinHandle;
 
 const AUTO_UPGRADE_ENABLED_KEY: &str = "auto_upgrade_enabled";
 
+/// `fleet_secrets` key gating LEADER self-upgrade. Off/missing = the leader
+/// stays excluded from auto-upgrade (the historical safe default — the wave
+/// excludes the leader to avoid self-suicide). When truthy, the leader
+/// self-upgrades its own daemon binary in a DETACHED process that survives the
+/// daemon restart. Permanent default OFF so shipping this is harmless.
+const LEADER_SELF_UPGRADE_KEY: &str = "leader_self_upgrade";
+
 /// One target computer + the resolved playbook command for it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpgradePlan {
@@ -484,6 +491,179 @@ async fn is_enabled(pool: &PgPool) -> bool {
         .unwrap_or(false)
 }
 
+/// Closes the leader-self-upgrade gap. The wave dispatcher excludes the leader
+/// (upgrading the daemon's own binary mid-dispatch is self-suicide), so the
+/// leader's `forgefleetd_git` never auto-upgrades — it drifts until a human
+/// rebuilds it. When `fleet_secrets.leader_self_upgrade` is truthy AND the
+/// leader is in drift on `forgefleetd_git`, this rebuilds + reinstalls the
+/// leader binaries from the configured git ref and restarts the daemon via the
+/// OS supervisor (`launchctl kickstart` / `systemctl --user restart` — graceful,
+/// NOT pkill). The build runs in a DETACHED new session (`setsid`, mirroring
+/// `model_runtime`'s spawn) so the daemon restart can't kill the in-flight
+/// build. `set -e` guarantees a failed build NEVER installs/restarts. A
+/// time-bounded per-target marker stops it re-firing while a build is running.
+/// Gated OFF by default. Returns true if a self-upgrade was launched.
+async fn maybe_self_upgrade_leader(pool: &PgPool, my_name: &str) -> bool {
+    // Gate: permanent-default OFF (no TTL auto-restore — self-restart is risky,
+    // so it stays off unless explicitly enabled).
+    if !ff_db::pg_read_safety_gate(pool, LEADER_SELF_UPGRADE_KEY, false, false)
+        .await
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    if !is_leader(pool, my_name).await {
+        return false;
+    }
+
+    // Is the leader in drift on its own daemon binary? (target = latest SHA)
+    let target_sha: Option<String> = sqlx::query_scalar(
+        r#"
+        SELECT cs.latest_version
+          FROM fleet_leader_state ls
+          JOIN computer_software cs ON cs.computer_id = ls.computer_id
+         WHERE cs.software_id = 'forgefleetd_git'
+           AND cs.status = 'upgrade_available'
+           AND cs.latest_version IS NOT NULL
+         LIMIT 1
+        "#,
+    )
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    let Some(target_sha) = target_sha else {
+        return false; // leader already current (or no row)
+    };
+
+    // Resolve the leader's source tree (same source as refresh_self_built).
+    let source_tree: Option<String> = sqlx::query_scalar(
+        r#"
+        SELECT c.source_tree_path
+          FROM fleet_leader_state ls
+          JOIN computers c ON c.id = ls.computer_id
+         WHERE c.source_tree_path IS NOT NULL AND c.source_tree_path <> ''
+         LIMIT 1
+        "#,
+    )
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    let Some(source_tree) = source_tree else {
+        tracing::warn!("leader self-upgrade: no source_tree_path on leader; skipping");
+        return false;
+    };
+    let source_tree = expand_tilde(&source_tree);
+    let home = std::env::var("HOME").unwrap_or_default();
+
+    // git ref for forgefleetd_git (default origin/main, matching refresh_self_built).
+    let git_ref: String = sqlx::query_scalar::<_, serde_json::Value>(
+        "SELECT version_source FROM software_registry WHERE id = 'forgefleetd_git'",
+    )
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
+    .and_then(|vs| vs.get("git_ref").and_then(|v| v.as_str()).map(String::from))
+    .unwrap_or_else(|| "origin/main".to_string());
+
+    // Time-bounded marker: skip if a build for THIS target launched < 45min ago
+    // (so a failed/hung build retries later instead of wedging forever).
+    let marker = format!("{home}/.forgefleet/leader-self-upgrade.target");
+    if let Ok(meta) = std::fs::metadata(&marker) {
+        let recent = meta
+            .modified()
+            .ok()
+            .and_then(|m| m.elapsed().ok())
+            .map(|e| e.as_secs() < 2700)
+            .unwrap_or(false);
+        if recent && std::fs::read_to_string(&marker).map(|s| s.trim() == target_sha).unwrap_or(false)
+        {
+            tracing::debug!(sha = %target_sha, "leader self-upgrade already in flight; skipping");
+            return false;
+        }
+    }
+
+    // OS-specific graceful restart (NOT pkill) + macOS codesign.
+    let (restart, sign_ffd, sign_ff, sign_cargo) = if cfg!(target_os = "macos") {
+        (
+            "launchctl kickstart -k gui/$(id -u)/com.forgefleet.forgefleetd",
+            "codesign --force --sign - \"$HOME/.local/bin/forgefleetd\"",
+            "codesign --force --sign - \"$HOME/.local/bin/ff\"",
+            "codesign --force --sign - \"$HOME/.cargo/bin/ff\"",
+        )
+    } else {
+        (
+            "systemctl --user restart forgefleetd",
+            "true",
+            "true",
+            "true",
+        )
+    };
+
+    let log = format!("{home}/.forgefleet/logs/leader-self-upgrade.log");
+    let script = format!(
+        "#!/bin/sh\n\
+         set -e\n\
+         exec >>\"{log}\" 2>&1\n\
+         echo \"=== leader self-upgrade target={target_sha} ref={git_ref} ===\"\n\
+         date\n\
+         cd \"{source_tree}\"\n\
+         git fetch origin\n\
+         git reset --hard \"{git_ref}\"\n\
+         cargo build --release --bin forgefleetd\n\
+         cargo build --release -p ff-terminal --bin ff\n\
+         install -m 755 target/release/forgefleetd \"$HOME/.local/bin/forgefleetd\"\n\
+         {sign_ffd}\n\
+         install -m 755 target/release/ff \"$HOME/.local/bin/ff\"\n\
+         {sign_ff}\n\
+         if [ -f \"$HOME/.cargo/bin/ff\" ]; then install -m 755 target/release/ff \"$HOME/.cargo/bin/ff\"; {sign_cargo}; fi\n\
+         echo \"build+install OK; restarting daemon\"\n\
+         {restart}\n"
+    );
+    let script_path = format!("{home}/.forgefleet/leader-self-upgrade.sh");
+    if let Err(e) = std::fs::write(&script_path, &script) {
+        tracing::warn!(error = %e, "leader self-upgrade: failed to write helper script");
+        return false;
+    }
+    let _ = std::fs::write(&marker, &target_sha);
+
+    // Spawn DETACHED in a new session so the daemon restart (which kills
+    // forgefleetd's process group) can't take the in-flight build down with it.
+    use std::os::unix::process::CommandExt;
+    let mut cmd = std::process::Command::new("/bin/sh");
+    cmd.arg(&script_path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    unsafe {
+        cmd.pre_exec(|| {
+            // SAFETY: setsid() is a single async-signal-safe syscall; detaches
+            // the child into its own session so it outlives forgefleetd. Mirrors
+            // model_runtime::load_model's detachment.
+            let _ = libc::setsid();
+            Ok(())
+        });
+    }
+    match cmd.spawn() {
+        Ok(child) => {
+            tracing::warn!(
+                target_sha = %target_sha,
+                git_ref = %git_ref,
+                source_tree = %source_tree,
+                pid = child.id(),
+                "LEADER SELF-UPGRADE launched (detached): rebuilding + restarting forgefleetd"
+            );
+            true
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "leader self-upgrade: spawn failed");
+            false
+        }
+    }
+}
+
 /// Pick every software_id that has at least one computer with
 /// `status='upgrade_available'`.
 async fn software_ids_with_drift(pool: &PgPool) -> Result<Vec<String>> {
@@ -768,6 +948,13 @@ impl AutoUpgradeTick {
                 }
             }
         }
+        // Leader self-upgrade: the wave above excludes the leader to avoid
+        // self-suicide, so the leader's own daemon binary never auto-upgrades.
+        // Gated by fleet_secrets.leader_self_upgrade (OFF by default); when on
+        // and the leader is in drift, rebuilds + restarts it in a detached
+        // process that survives the daemon restart. Closes the leader gap.
+        let _ = maybe_self_upgrade_leader(&self.pool, &self.my_name).await;
+
         Ok(total)
     }
 
