@@ -6465,3 +6465,338 @@ pub async fn pg_get_benchmark_results(
         .await?;
     Ok(row.map(|r| r.get("benchmark_results")))
 }
+
+// ─── V119 Resource arbiter — work_intents registry + set-atomic lease ────────
+//
+// Backlog #7. EXPLICIT-declaration arbiter. These helpers wire the existing
+// per-host CAS (`pg_reserve_host`, queries.rs:2988) into a set-atomic,
+// deadlock-free, TTL-leased grant keyed by a `work_intents` row.
+
+/// One row from the `work_intents` registry (the intent IS the FIFO queue).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkIntentRow {
+    pub id: String,
+    pub requester: String,
+    pub project: Option<String>,
+    pub target_host_set: JsonValue,
+    pub requires_capability: JsonValue,
+    pub exclusive: bool,
+    pub requested_secs: i64,
+    pub priority: i64,
+    pub state: String,
+    pub task_desc: Option<String>,
+    pub prework_plan: JsonValue,
+    pub restore_plan: JsonValue,
+    pub prework_cursor: i64,
+    pub restore_cursor: i64,
+    pub denied_reason: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub granted_at: Option<DateTime<Utc>>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub released_at: Option<DateTime<Utc>>,
+}
+
+fn work_intent_from_row(r: &sqlx::postgres::PgRow) -> WorkIntentRow {
+    let id: uuid::Uuid = r.get("id");
+    WorkIntentRow {
+        id: id.to_string(),
+        requester: r.get("requester"),
+        project: r.get("project"),
+        target_host_set: r.get("target_host_set"),
+        requires_capability: r.get("requires_capability"),
+        exclusive: r.get("exclusive"),
+        requested_secs: r.get::<i32, _>("requested_secs") as i64,
+        priority: r.get::<i32, _>("priority") as i64,
+        state: r.get("state"),
+        task_desc: r.get("task_desc"),
+        prework_plan: r.get("prework_plan"),
+        restore_plan: r.get("restore_plan"),
+        prework_cursor: r.get::<i32, _>("prework_cursor") as i64,
+        restore_cursor: r.get::<i32, _>("restore_cursor") as i64,
+        denied_reason: r.get("denied_reason"),
+        created_at: r.get("created_at"),
+        granted_at: r.get("granted_at"),
+        expires_at: r.get("expires_at"),
+        released_at: r.get("released_at"),
+    }
+}
+
+const WORK_INTENT_COLS: &str = "id, requester, project, target_host_set, \
+    requires_capability, exclusive, requested_secs, priority, state, task_desc, \
+    prework_plan, restore_plan, prework_cursor, restore_cursor, denied_reason, \
+    created_at, granted_at, expires_at, released_at";
+
+/// Insert a new work intent in `pending` state. Returns the new intent id.
+/// This is what `ff reserve` calls — explicit declaration, no inference.
+#[allow(clippy::too_many_arguments)]
+pub async fn pg_insert_work_intent(
+    pool: &PgPool,
+    requester: &str,
+    project: Option<&str>,
+    target_host_set: &JsonValue,
+    requires_capability: &JsonValue,
+    exclusive: bool,
+    requested_secs: i64,
+    priority: i64,
+    task_desc: Option<&str>,
+    prework_plan: &JsonValue,
+    restore_plan: &JsonValue,
+) -> Result<String> {
+    let id: uuid::Uuid = sqlx::query_scalar(
+        r#"
+        INSERT INTO work_intents
+            (requester, project, target_host_set, requires_capability, exclusive,
+             requested_secs, priority, task_desc, prework_plan, restore_plan)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        RETURNING id
+        "#,
+    )
+    .bind(requester)
+    .bind(project)
+    .bind(target_host_set)
+    .bind(requires_capability)
+    .bind(exclusive)
+    .bind(requested_secs.max(1) as i32)
+    .bind(priority as i32)
+    .bind(task_desc)
+    .bind(prework_plan)
+    .bind(restore_plan)
+    .fetch_one(pool)
+    .await?;
+    Ok(id.to_string())
+}
+
+/// Fetch a single intent by id.
+pub async fn pg_get_work_intent(pool: &PgPool, intent_id: &str) -> Result<Option<WorkIntentRow>> {
+    let uid = uuid::Uuid::parse_str(intent_id)
+        .map_err(|e| crate::error::DbError::NotFound(format!("bad intent id {intent_id}: {e}")))?;
+    let row = sqlx::query(&format!(
+        "SELECT {WORK_INTENT_COLS} FROM work_intents WHERE id = $1"
+    ))
+    .bind(uid)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.as_ref().map(work_intent_from_row))
+}
+
+/// List intents in deterministic order (priority DESC, created_at ASC), most
+/// recent terminal ones excluded when `active_only`.
+pub async fn pg_list_work_intents(pool: &PgPool, active_only: bool) -> Result<Vec<WorkIntentRow>> {
+    let sql = if active_only {
+        format!(
+            "SELECT {WORK_INTENT_COLS} FROM work_intents \
+             WHERE state NOT IN ('done','denied') \
+             ORDER BY priority DESC, created_at ASC"
+        )
+    } else {
+        format!(
+            "SELECT {WORK_INTENT_COLS} FROM work_intents \
+             ORDER BY priority DESC, created_at ASC"
+        )
+    };
+    let rows = sqlx::query(&sql).fetch_all(pool).await?;
+    Ok(rows.iter().map(work_intent_from_row).collect())
+}
+
+/// The pending FIFO queue: state='pending', deterministic (priority DESC,
+/// created_at ASC). This IS the grant queue — no separate queue table.
+pub async fn pg_pending_work_intents(pool: &PgPool) -> Result<Vec<WorkIntentRow>> {
+    let rows = sqlx::query(&format!(
+        "SELECT {WORK_INTENT_COLS} FROM work_intents \
+         WHERE state = 'pending' ORDER BY priority DESC, created_at ASC"
+    ))
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.iter().map(work_intent_from_row).collect())
+}
+
+/// Transition an intent's state. `granted` stamps granted_at/expires_at;
+/// `done`/`releasing` stamp released_at. Idempotent on already-terminal states
+/// via the optional `from` guard.
+pub async fn pg_set_work_intent_state(
+    pool: &PgPool,
+    intent_id: &str,
+    new_state: &str,
+    denied_reason: Option<&str>,
+) -> Result<()> {
+    let uid = uuid::Uuid::parse_str(intent_id)
+        .map_err(|e| crate::error::DbError::NotFound(format!("bad intent id {intent_id}: {e}")))?;
+    sqlx::query(
+        r#"
+        UPDATE work_intents
+           SET state         = $2,
+               denied_reason = COALESCE($3, denied_reason),
+               released_at   = CASE WHEN $2 IN ('done','releasing')
+                                    THEN COALESCE(released_at, NOW()) ELSE released_at END
+         WHERE id = $1
+        "#,
+    )
+    .bind(uid)
+    .bind(new_state)
+    .bind(denied_reason)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Advance a crash-resumable executor cursor (prework or restore). The arbiter
+/// persists this AFTER each successful step so a leader crash resumes mid-plan.
+pub async fn pg_advance_intent_cursor(
+    pool: &PgPool,
+    intent_id: &str,
+    restore: bool,
+    new_cursor: i64,
+) -> Result<()> {
+    let uid = uuid::Uuid::parse_str(intent_id)
+        .map_err(|e| crate::error::DbError::NotFound(format!("bad intent id {intent_id}: {e}")))?;
+    let col = if restore {
+        "restore_cursor"
+    } else {
+        "prework_cursor"
+    };
+    sqlx::query(&format!("UPDATE work_intents SET {col} = $2 WHERE id = $1"))
+        .bind(uid)
+        .bind(new_cursor as i32)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Set-atomic, deadlock-free reservation of a host SET for one intent. Built on
+/// the V114 per-host CAS. `hosts` MUST be pre-sorted by the caller (lowercased
+/// name ASC) — the global resource-ordering is what makes overlapping concurrent
+/// grants deadlock-free (Coffman hold-and-wait broken). All-or-nothing: if ANY
+/// host is not `available`, the whole transaction rolls back and NO host is left
+/// stranded. Returns `true` only if the ENTIRE set was won + committed.
+///
+/// On success each host carries `reservation_state='reserved'`,
+/// `reserved_reason='arbiter:<intent_id>'`, `reservation_owner=<intent_id>`,
+/// and `reservation_expires_at=NOW()+requested_secs`.
+pub async fn pg_arbiter_grant_set(
+    pool: &PgPool,
+    intent_id: &str,
+    hosts: &[String],
+    requested_secs: i64,
+) -> Result<bool> {
+    let uid = uuid::Uuid::parse_str(intent_id)
+        .map_err(|e| crate::error::DbError::NotFound(format!("bad intent id {intent_id}: {e}")))?;
+    if hosts.is_empty() {
+        return Ok(false);
+    }
+    let reason = format!("arbiter:{intent_id}");
+    let mut tx = pool.begin().await?;
+    for host in hosts {
+        let res = sqlx::query(
+            r#"
+            UPDATE computers
+               SET reservation_state      = 'reserved',
+                   reserved_reason        = $2,
+                   reserved_at            = NOW(),
+                   reservation_owner      = $3,
+                   reservation_expires_at = NOW() + make_interval(secs => $4)
+             WHERE LOWER(name) = LOWER($1)
+               AND reservation_state = 'available'
+            "#,
+        )
+        .bind(host)
+        .bind(&reason)
+        .bind(uid)
+        .bind(requested_secs.max(1))
+        .execute(&mut *tx)
+        .await?;
+        if res.rows_affected() == 0 {
+            // Partial set unattainable — roll back everything flipped this tx.
+            tx.rollback().await?;
+            return Ok(false);
+        }
+    }
+    tx.commit().await?;
+    Ok(true)
+}
+
+/// Arbiter lease reaper: find hosts whose lease has expired and clear them.
+/// Returns the list of (intent_id) owning the expired leases so the caller can
+/// run each intent's restore_plan BEFORE the host is handed to the next queued
+/// intent. The host's reservation is flipped back to `available` here, but the
+/// arbiter only marks the host truly free after restore completes (it re-checks
+/// the owning intent reaches `done`). Mirrors RESERVATION_TTL_SECS but
+/// per-intent + data-driven.
+pub async fn pg_reap_expired_leases(pool: &PgPool) -> Result<Vec<String>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT DISTINCT reservation_owner AS owner
+          FROM computers
+         WHERE reservation_owner IS NOT NULL
+           AND reservation_expires_at IS NOT NULL
+           AND reservation_expires_at < NOW()
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .iter()
+        .filter_map(|r| r.get::<Option<uuid::Uuid>, _>("owner"))
+        .map(|u| u.to_string())
+        .collect())
+}
+
+/// Free every host held by one intent: flip `reserved` → `available`, NULL the
+/// owner/lease/reason. Idempotent — safe on an already-free set. Called AFTER
+/// the intent's restore_plan finishes (lease expiry, `ff arbiter release`, or
+/// the reaper). Returns the number of hosts freed.
+pub async fn pg_arbiter_free_set(pool: &PgPool, intent_id: &str) -> Result<u64> {
+    let uid = uuid::Uuid::parse_str(intent_id)
+        .map_err(|e| crate::error::DbError::NotFound(format!("bad intent id {intent_id}: {e}")))?;
+    let res = sqlx::query(
+        r#"
+        UPDATE computers
+           SET reservation_state      = 'available',
+               reserved_reason        = NULL,
+               reserved_at            = NULL,
+               reservation_owner      = NULL,
+               reservation_expires_at = NULL
+         WHERE reservation_owner = $1
+        "#,
+    )
+    .bind(uid)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
+/// Snapshot of an arbiter-reserved host for `ff arbiter status`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArbiterReservedHost {
+    pub name: String,
+    pub reservation_state: String,
+    pub reserved_reason: Option<String>,
+    pub reservation_owner: Option<String>,
+    pub reservation_expires_at: Option<DateTime<Utc>>,
+}
+
+/// All hosts currently reserved/drained (deterministic ORDER BY name ASC).
+pub async fn pg_list_reserved_hosts(pool: &PgPool) -> Result<Vec<ArbiterReservedHost>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT name, reservation_state, reserved_reason,
+               reservation_owner, reservation_expires_at
+          FROM computers
+         WHERE reservation_state <> 'available'
+         ORDER BY LOWER(name) ASC
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .iter()
+        .map(|r| ArbiterReservedHost {
+            name: r.get("name"),
+            reservation_state: r.get("reservation_state"),
+            reserved_reason: r.get("reserved_reason"),
+            reservation_owner: r
+                .get::<Option<uuid::Uuid>, _>("reservation_owner")
+                .map(|u| u.to_string()),
+            reservation_expires_at: r.get("reservation_expires_at"),
+        })
+        .collect())
+}

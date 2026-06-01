@@ -2,6 +2,7 @@ pub mod agent_coordinator;
 pub mod agent_hint;
 pub mod agent_loop;
 pub mod agent_roles;
+pub mod arbiter;
 pub mod auto_upgrade;
 pub mod autoscaler;
 pub mod circuit_breaker;

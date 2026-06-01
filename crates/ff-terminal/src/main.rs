@@ -37,6 +37,7 @@ use ff_terminal::render;
 mod agent_cmd;
 mod agents_cmd;
 mod alert_cmd;
+mod arbiter_cmd;
 mod brain_cmd;
 mod cli_bridge_cmd;
 mod cloud_llm_cmd;
@@ -630,6 +631,37 @@ enum Command {
         /// whisper-cli binary path/name (resolved on PATH).
         #[arg(long = "whisper-cli", default_value = "whisper-cli")]
         whisper_cli: String,
+    },
+    /// V119 resource arbiter (backlog #7): declare an EXPLICIT intent to reserve
+    /// a host SET for a span of time. Inserts a pending `work_intents` row and
+    /// prints the planned grant / prework (offload) / queue / restore (reload).
+    /// Gated by `fleet_secrets.arbiter_mode` (DEFAULT OFF ⇒ actuates nothing).
+    Reserve {
+        /// Hosts to reserve: comma/space list (e.g. "marcus,sophie") or a DGX
+        /// TP=2 pair "dgx-pair:<a>-<b>" (e.g. "dgx-pair:sia-adele").
+        #[arg(long)]
+        hosts: String,
+        /// Lease length: 2h | 30m | 45s | bare-seconds.
+        #[arg(long = "for", default_value = "1h")]
+        r#for: String,
+        /// Human description of the work.
+        #[arg(long)]
+        task: String,
+        /// Reserve the whole host (vs shared). Default true; sets a default
+        /// offload→reload prework/restore plan.
+        #[arg(long, default_value_t = true)]
+        exclusive: bool,
+        /// Priority on the fleet_tasks scale (higher wins; default 100).
+        #[arg(long, default_value_t = 100)]
+        priority: i64,
+        /// Optional project tag (priority source).
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// V119 resource arbiter management.
+    Arbiter {
+        #[command(subcommand)]
+        command: arbiter_cmd::ArbiterCommand,
     },
 }
 
@@ -2935,6 +2967,19 @@ async fn main() -> Result<()> {
         Some(Command::Pm { command }) => pm_cmd::handle_pm(command).await,
         Some(Command::Agent { command }) => agent_cmd::handle_agent(command).await,
         Some(Command::Project { command }) => project_cmd::handle_project(command).await,
+        // V119 resource arbiter (backlog #7). Handlers open the pool via
+        // ff_agent::fleet_info::get_fleet_pool() exactly like the Fabric/Tasks arms.
+        Some(Command::Reserve {
+            hosts,
+            r#for,
+            task,
+            exclusive,
+            priority,
+            project,
+        }) => {
+            arbiter_cmd::handle_reserve(&hosts, &r#for, &task, exclusive, priority, project).await
+        }
+        Some(Command::Arbiter { command }) => arbiter_cmd::handle_arbiter(command).await,
         Some(Command::Fabric { command }) => {
             let pool = ff_agent::fleet_info::get_fleet_pool()
                 .await

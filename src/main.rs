@@ -788,6 +788,22 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
             pg_pool,
             worker_name.clone(),
             300,
+    // 20) Resource arbiter tick — every 60s, leader-gated.
+    // Backlog #7 (V119): EXPLICIT-declaration host reservation. Reaps expired
+    // leases (runs each owner's restore plan), walks the pending work_intents
+    // FIFO, runs idempotent prework, and attempts set-atomic grants — applying
+    // the priority-based preemption policy. Gate = `fleet_secrets.arbiter_mode`
+    // DEFAULT OFF: with the gate at `off` (or unset) the tick is a pure no-op,
+    // so deploying this is harmless. `dry-run` logs the full grant/prework/queue/
+    // restore plan without actuating; `active` actuates.
+    if let Some(pg_pool) = operational_store.pg_pool().cloned() {
+        info!(
+            "starting subsystem: resource arbiter tick (60s, leader-gated, gate=fleet_secrets.arbiter_mode default off)"
+        );
+        subsystem_tasks.push(ff_agent::arbiter::spawn_arbiter_tick(
+            pg_pool,
+            worker_name.clone(),
+            60,
             shutdown_rx.clone(),
         ));
     }

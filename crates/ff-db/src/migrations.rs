@@ -722,6 +722,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "disk_management",
         sql: schema::SCHEMA_V118_DISK_MANAGEMENT,
     },
+    PgMigration {
+        version: 119,
+        name: "resource_arbiter",
+        sql: schema::SCHEMA_V119_RESOURCE_ARBITER,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.
