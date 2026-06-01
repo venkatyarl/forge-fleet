@@ -516,15 +516,20 @@ async fn maybe_self_upgrade_leader(pool: &PgPool, my_name: &str) -> bool {
         return false;
     }
 
-    // Is the leader in drift on its own daemon binary? (target = latest SHA)
+    // Is the leader in drift on its own daemon binary? latest_version lives on
+    // software_registry (NOT computer_software); drift = the leader's installed
+    // SHA differs from the registry's latest. We key on installed != latest
+    // rather than status, since the wave can leave the leader's status in
+    // 'upgrading' even though it never actually upgrades the leader.
     let target_sha: Option<String> = sqlx::query_scalar(
         r#"
-        SELECT cs.latest_version
+        SELECT sr.latest_version
           FROM fleet_leader_state ls
           JOIN computer_software cs ON cs.computer_id = ls.computer_id
+          JOIN software_registry sr ON sr.id = cs.software_id
          WHERE cs.software_id = 'forgefleetd_git'
-           AND cs.status = 'upgrade_available'
-           AND cs.latest_version IS NOT NULL
+           AND sr.latest_version IS NOT NULL
+           AND sr.latest_version IS DISTINCT FROM cs.installed_version
          LIMIT 1
         "#,
     )
