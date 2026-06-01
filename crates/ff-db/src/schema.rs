@@ -8145,3 +8145,246 @@ ALTER TABLE computers
 CREATE INDEX IF NOT EXISTS idx_computers_reservation_lease
     ON computers(reservation_expires_at) WHERE reservation_expires_at IS NOT NULL;
 "#;
+//
+// BUILD #9 conformance + #10 AMD ROCm-bind, increment 1.
+//
+// ROOT GAP: detection treats "version string parsed = ok". Two AMD boxes
+// presented the SAME "green pip but GPU never binds" symptom with DIFFERENT
+// real causes (both found live on the fleet):
+//   - logan:    torch 2.10.0+cu128 (a CUDA wheel) on a Strix Halo AMD box
+//               → torch.cuda.is_available()=False forever (wrong backend).
+//   - veronica: user NOT in render/video groups → cannot open /dev/kfd →
+//               rocminfo as the daemon user enumerates ZERO gpus (as root:
+//               gfx1151 fine). DB "2GB VRAM" is misleading — Strix Halo UMA
+//               exposes ~62GB GTT backed by 123GB RAM.
+//
+// V120 (increment 1 — TIGHT scope; full apply-reconciler deferred to a
+// follow-up) lands the DESIRED-STATE + VERIFY substrate so conformance can
+// say "version parsed" is NOT enough:
+//
+//   (a) conformance_profiles            — desired state keyed
+//       (os_family, hardware_class, role) holding required packages/versions.
+//   (b) conformance_profile_packages    — one row per required (software_id,
+//       version_constraint / must_contain / must_not_contain) for a profile.
+//   (c) conformance_checks              — the VERIFY GATES a profile must
+//       pass. check_kind drives which actuator the agent runs:
+//         'gpu_bind'   — run a python assert that +rocm is in torch.__version__
+//                        AND torch.cuda.is_available() AND a real gfx tensor
+//                        op succeeds. Records conformant=bool — NOT a parse.
+//         'amd_arch'   — flag non-conformant any AMD host whose torch lacks
+//                        +rocm OR carries +cu (wrong-backend wheel, the logan
+//                        case).
+//         'kfd_access' — assert the daemon user is in render+video groups AND
+//                        /dev/kfd is readable (the veronica case).
+//         'pkg_version'— the legacy "is this version present" check (kept so
+//                        the gate set is complete, NOT the whole story).
+//   (d) conformance_results             — latest-wins record of per-host
+//       per-check conformant=bool + a SPECIFIC machine-readable reason. The
+//       artifact that proves we caught what a version parse misses.
+//   (e) software_registry ROCm-training-stack rows (rocm 6.4, the correct
+//       +rocm torch for gfx1151, the HSA_OVERRIDE runtime_env entry).
+//
+// Seeds the `amd-training` role profile for the
+// (linux-ubuntu, strix-halo, amd-training) key grounded in the REAL probe:
+// gfx1151, ROCm 6.4.0, python 3.12, HSA_OVERRIDE_GFX_VERSION=11.5.1.
+//
+// SAFETY: the conformance TICK is leader-gated and gated by
+// `fleet_secrets.conformance_mode` (off|dry-run|active, DEFAULT off) exactly
+// like the autoscaler. In off/dry-run it actuates NOTHING — increment 1 only
+// RECORDS conformance, it never remediates a host.
+pub const SCHEMA_V120_FLEET_CONFORMANCE: &str = r#"
+-- (a) Desired-state profile, keyed (os_family, hardware_class, role).
+CREATE TABLE IF NOT EXISTS conformance_profiles (
+    id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    profile_key    TEXT COLLATE "C" NOT NULL,   -- "linux-ubuntu/strix-halo/amd-training"
+    os_family      TEXT COLLATE "C" NOT NULL,   -- macos|linux-ubuntu|linux-dgx|windows
+    hardware_class TEXT COLLATE "C" NOT NULL,   -- strix-halo|apple-silicon|dgx-gb10|generic
+    role           TEXT COLLATE "C" NOT NULL,   -- amd-training|inference|leader|generic
+    title          TEXT NOT NULL,
+    description    TEXT,
+    runtime_env    JSONB NOT NULL DEFAULT '{}'::jsonb,  -- env the role REQUIRES
+    enabled        BOOLEAN NOT NULL DEFAULT true,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_conformance_profile_key UNIQUE (profile_key)
+);
+CREATE INDEX IF NOT EXISTS idx_conformance_profiles_match
+    ON conformance_profiles(os_family, hardware_class, role) WHERE enabled;
+
+-- (b) Required packages/versions for a profile (→ software_registry).
+CREATE TABLE IF NOT EXISTS conformance_profile_packages (
+    id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    profile_id         UUID NOT NULL REFERENCES conformance_profiles(id) ON DELETE CASCADE,
+    software_id        TEXT COLLATE "C" NOT NULL,   -- references software_registry(id)
+    version_constraint TEXT COLLATE "C",            -- ">=6.4.0", NULL = any
+    must_contain       TEXT COLLATE "C",            -- substring version MUST carry, e.g. "+rocm"
+    must_not_contain   TEXT COLLATE "C",            -- substring it MUST NOT carry, e.g. "+cu"
+    required           BOOLEAN NOT NULL DEFAULT true,
+    note               TEXT,
+    CONSTRAINT uq_conformance_pkg UNIQUE (profile_id, software_id)
+);
+CREATE INDEX IF NOT EXISTS idx_conformance_pkg_profile
+    ON conformance_profile_packages(profile_id);
+
+-- (c) The VERIFY GATES a profile must pass. verify_cmd is the literal command
+--     we RUN on the host — the gate is "did this command succeed", NOT "did a
+--     version string parse".
+CREATE TABLE IF NOT EXISTS conformance_checks (
+    id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    profile_id   UUID NOT NULL REFERENCES conformance_profiles(id) ON DELETE CASCADE,
+    check_key    TEXT COLLATE "C" NOT NULL,   -- "gpu_bind"|"amd_arch"|"kfd_access"|"rocm_present"
+    check_kind   TEXT COLLATE "C" NOT NULL,   -- gpu_bind|amd_arch|kfd_access|pkg_version
+    title        TEXT NOT NULL,
+    verify_cmd   TEXT COLLATE "C" NOT NULL,   -- literal host command; exit 0 = conformant
+    severity     TEXT COLLATE "C" NOT NULL DEFAULT 'blocker', -- blocker|warn
+    enabled      BOOLEAN NOT NULL DEFAULT true,
+    CONSTRAINT uq_conformance_check UNIQUE (profile_id, check_key),
+    CONSTRAINT conformance_check_kind_chk
+        CHECK (check_kind IN ('gpu_bind','amd_arch','kfd_access','pkg_version')),
+    CONSTRAINT conformance_check_sev_chk
+        CHECK (severity IN ('blocker','warn'))
+);
+CREATE INDEX IF NOT EXISTS idx_conformance_checks_profile
+    ON conformance_checks(profile_id) WHERE enabled;
+
+-- (d) Per-host per-check result, latest-wins on (computer_id, profile_id,
+--     check_key). conformant is MEASURED; reason carries the SPECIFIC cause.
+CREATE TABLE IF NOT EXISTS conformance_results (
+    id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    computer_id  UUID NOT NULL REFERENCES computers(id) ON DELETE CASCADE,
+    profile_id   UUID NOT NULL REFERENCES conformance_profiles(id) ON DELETE CASCADE,
+    check_key    TEXT COLLATE "C" NOT NULL,
+    check_kind   TEXT COLLATE "C" NOT NULL,
+    conformant   BOOLEAN NOT NULL,
+    severity     TEXT COLLATE "C" NOT NULL DEFAULT 'blocker',
+    reason       TEXT,                         -- machine+human readable cause
+    raw_output   TEXT,                         -- captured stdout/stderr (trimmed)
+    checked_by   TEXT COLLATE "C",             -- worker_name that ran the check
+    checked_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_conformance_result UNIQUE (computer_id, profile_id, check_key)
+);
+CREATE INDEX IF NOT EXISTS idx_conformance_results_computer
+    ON conformance_results(computer_id, checked_at DESC);
+CREATE INDEX IF NOT EXISTS idx_conformance_results_nonconformant
+    ON conformance_results(profile_id) WHERE NOT conformant;
+
+-- (e) software_registry rows for the ROCm training stack.
+INSERT INTO software_registry
+    (id, display_name, kind, applies_to_os_family, version_source,
+     upgrade_playbook, requires_restart, requires_reboot, detection, metadata)
+VALUES
+    ('rocm',
+     'AMD ROCm platform',
+     'runtime',
+     'linux-ubuntu',
+     '{"method":"manual"}'::jsonb,
+     '{}'::jsonb,
+     false, false,
+     '{"method":"binary_version","binary":"hipconfig","args":["--version"],"regex":"HIP version:\\s*(\\S+)"}'::jsonb,
+     '{"required_for":["amd-training"],"target_version":"6.4.0","gfx":"gfx1151"}'::jsonb),
+    ('torch-rocm',
+     'PyTorch (ROCm build) for gfx1151',
+     'runtime',
+     'linux-ubuntu',
+     '{"method":"manual"}'::jsonb,
+     '{}'::jsonb,
+     false, false,
+     '{"method":"binary_version","binary":"python3","args":["-c","import torch;print(torch.__version__)"],"regex":"(\\S+)"}'::jsonb,
+     '{"required_for":["amd-training"],"must_contain":"+rocm","must_not_contain":"+cu","gfx":"gfx1151","index_url":"https://download.pytorch.org/whl/rocm6.4"}'::jsonb),
+    ('hsa-override-gfx',
+     'HSA_OVERRIDE_GFX_VERSION runtime env (Strix Halo gfx1151)',
+     'config',
+     'linux-ubuntu',
+     '{"method":"manual"}'::jsonb,
+     '{}'::jsonb,
+     false, false,
+     '{"method":"env","var":"HSA_OVERRIDE_GFX_VERSION"}'::jsonb,
+     '{"required_for":["amd-training"],"value":"11.5.1","reason":"map gfx1151 onto a ROCm-supported gfx target"}'::jsonb)
+ON CONFLICT (id) DO NOTHING;
+
+-- Seed the amd-training profile for (linux-ubuntu, strix-halo, amd-training),
+-- grounded in the live probe: gfx1151, ROCm 6.4.0, python 3.12,
+-- HSA_OVERRIDE_GFX_VERSION=11.5.1.
+WITH p AS (
+    INSERT INTO conformance_profiles
+        (profile_key, os_family, hardware_class, role, title, description, runtime_env)
+    VALUES
+        ('linux-ubuntu/strix-halo/amd-training',
+         'linux-ubuntu', 'strix-halo', 'amd-training',
+         'AMD Strix Halo ROCm training stack',
+         'gfx1151 UMA (~62GB GTT over 123GB RAM); ROCm 6.4 + a +rocm torch '
+         || 'wheel + HSA_OVERRIDE_GFX_VERSION=11.5.1; daemon user must reach '
+         || '/dev/kfd via render+video groups.',
+         '{"HSA_OVERRIDE_GFX_VERSION":"11.5.1"}'::jsonb)
+    ON CONFLICT (profile_key) DO UPDATE SET updated_at = NOW()
+    RETURNING id
+)
+INSERT INTO conformance_profile_packages
+    (profile_id, software_id, version_constraint, must_contain, must_not_contain, note)
+SELECT p.id, v.software_id, v.version_constraint, v.must_contain, v.must_not_contain, v.note
+FROM p, (VALUES
+    ('rocm',             '>=6.4.0', NULL,    NULL,  'ROCm platform 6.4+ for gfx1151'),
+    ('torch-rocm',       NULL,      '+rocm', '+cu', 'torch MUST be a +rocm wheel, NEVER a +cu wheel'),
+    ('hsa-override-gfx', NULL,      NULL,    NULL,  'HSA_OVERRIDE_GFX_VERSION=11.5.1 in daemon env')
+) AS v(software_id, version_constraint, must_contain, must_not_contain, note)
+ON CONFLICT (profile_id, software_id) DO NOTHING;
+
+-- Seed the four VERIFY GATES for the amd-training profile.
+WITH p AS (
+    SELECT id FROM conformance_profiles
+    WHERE profile_key = 'linux-ubuntu/strix-halo/amd-training'
+)
+INSERT INTO conformance_checks
+    (profile_id, check_key, check_kind, title, verify_cmd, severity)
+SELECT p.id, v.check_key, v.check_kind, v.title, v.verify_cmd, v.severity
+FROM p, (VALUES
+    -- AMD ARCH GATE: catch the logan case (+cu wheel on an AMD box) BEFORE we
+    -- even try to bind. The whole assert lives in ONE python3 -c program (no
+    -- nested shell $(...) — SSH-quote-safe): it prints its own NONCONFORMANT
+    -- line carrying the REAL torch version and exits non-zero.
+    ('amd_arch', 'amd_arch',
+     'torch wheel is +rocm (not +cu) on an AMD host',
+     'python3 -c ''import sys'' && python3 -c ''
+import sys
+try:
+    import torch
+    v = torch.__version__
+except Exception as e:
+    print("NONCONFORMANT: torch not importable: %s" % e); sys.exit(1)
+if "+rocm" not in v or "+cu" in v:
+    print("NONCONFORMANT: torch=%s is not a +rocm wheel (wrong backend on an AMD host)" % v)
+    sys.exit(1)
+print("OK rocm wheel %s" % v)
+''',
+     'blocker'),
+    -- KFD ACCESS GATE: catch the veronica case (user not in render/video →
+    -- /dev/kfd unreadable → zero gpus enumerated as the daemon user).
+    ('kfd_access', 'kfd_access',
+     'daemon user in render+video groups AND /dev/kfd readable',
+     'g=$(id -nG); '
+     || 'for grp in render video; do echo "$g" | tr " " "\n" | grep -qx "$grp" '
+     || '|| { echo "NONCONFORMANT: user not in group $grp (groups: $g)"; exit 1; }; done; '
+     || '[ -r /dev/kfd ] || { echo "NONCONFORMANT: /dev/kfd not readable by $(id -un)"; exit 1; }',
+     'blocker'),
+    -- GPU-BIND VERIFY GATE: the real proof. +rocm AND
+    -- torch.cuda.is_available() AND a real gfx tensor op. What a
+    -- "version parsed = ok" detector can NEVER tell you.
+    ('gpu_bind', 'gpu_bind',
+     'torch binds the GPU: +rocm AND is_available() AND a real gfx tensor op',
+     'HSA_OVERRIDE_GFX_VERSION=${HSA_OVERRIDE_GFX_VERSION:-11.5.1} python3 -c ''import sys,torch; '
+     || 'assert "+rocm" in torch.__version__, "torch is not a +rocm build: "+torch.__version__; '
+     || 'assert torch.cuda.is_available(), "torch.cuda.is_available() is False (GPU never bound)"; '
+     || 'x=torch.ones(1024,1024,device="cuda"); y=(x@x).sum().item(); '
+     || 'assert y==1024.0*1024.0*1024.0, "gfx tensor op produced wrong result: "+str(y); '
+     || 'print("BIND_OK", torch.cuda.get_device_name(0))''',
+     'blocker'),
+    -- ROCm-present pkg_version gate (the legacy "version parsed" check — kept
+    -- so the gate set is complete, explicitly NOT the whole story).
+    ('rocm_present', 'pkg_version',
+     'ROCm platform present (hipconfig reports a version)',
+     'hipconfig --version 2>/dev/null | grep -qE "HIP version:\\s*[0-9]" '
+     || '|| { echo "NONCONFORMANT: hipconfig reports no HIP version"; exit 1; }',
+     'warn')
+) AS v(check_key, check_kind, title, verify_cmd, severity)
+ON CONFLICT (profile_id, check_key) DO NOTHING;
+"#;

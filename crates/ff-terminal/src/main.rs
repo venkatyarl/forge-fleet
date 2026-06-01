@@ -43,6 +43,7 @@ mod cli_bridge_cmd;
 mod cloud_llm_cmd;
 mod config_cmd;
 mod corpus_cmd;
+mod conformance_cmd;
 mod daemon_cmd;
 mod defer_cmd;
 mod events_cmd;
@@ -404,6 +405,14 @@ enum Command {
     Software {
         #[command(subcommand)]
         command: SoftwareCommand,
+    },
+    /// Conformance — desired-state profiles + a VERIFY GATE that actually runs
+    /// (V120). Catches "green pip but GPU never binds" that a version parse
+    /// misses (e.g. a +cu wheel on an AMD box, or a daemon user that can't
+    /// open /dev/kfd).
+    Conformance {
+        #[command(subcommand)]
+        command: conformance_cmd::ConformanceCommand,
     },
     /// External tools — GitHub-hosted CLIs / MCP servers (schema V24).
     ///
@@ -2955,6 +2964,7 @@ async fn main() -> Result<()> {
         Some(Command::Fleet { command }) => fleet_cmd::handle_fleet(command).await,
         Some(Command::Llm { command }) => llm_cmd::handle_llm(command).await,
         Some(Command::Software { command }) => software_cmd::handle_software(command).await,
+        Some(Command::Conformance { command }) => conformance_cmd::run(command).await,
         Some(Command::Ext { command }) => ext_cmd::handle_ext(command).await,
         Some(Command::Github { command }) => github_cmd::handle_github(command).await,
         Some(Command::Mcp { command }) => mcp_cmd::handle_mcp(command).await,
