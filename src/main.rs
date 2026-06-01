@@ -770,6 +770,50 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         }));
     }
 
+    // 20c) Stale-task reaper tick — every 10min, per-node (idempotent).
+    //
+    // Tasks claimed by a worker that then died or restarted mid-run (common
+    // during upgrade waves — workers restart themselves) sit in `running`
+    // forever; nothing reclaims them. 613 such zombies (594 backup-rsync) were
+    // found 2026-06-01, and they block the per-family upgrade singleton. This
+    // reaps any task `running` longer than FORGEFLEET_TASK_REAP_SECS (default
+    // 7200s = 2h, safely above the ~45min cold cargo build and the rsync
+    // --timeout=3600) back to `pending` for retry, or terminal `failed` once
+    // max_attempts is exhausted. The UPDATE is idempotent (row-locked), so
+    // running per-node is harmless — no leader gate needed.
+    if let Some(pg_pool) = operational_store.pg_pool().cloned() {
+        let reap_secs: i64 = std::env::var("FORGEFLEET_TASK_REAP_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|&s| s > 0)
+            .unwrap_or(7200);
+        info!(
+            reap_secs,
+            "starting subsystem: stale-task reaper tick (10min, per-node)"
+        );
+        let mut shutdown_rx_reap = shutdown_rx.clone();
+        subsystem_tasks.push(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(600));
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = shutdown_rx_reap.changed() => break,
+                    _ = tick.tick() => {
+                        match ff_db::pg_reap_stale_running(&pg_pool, reap_secs).await {
+                            Ok(0) => {}
+                            Ok(n) => warn!(
+                                reaped = n,
+                                max_age_secs = reap_secs,
+                                "reaped stale 'running' deferred tasks (orphaned by dead/restarted workers)"
+                            ),
+                            Err(e) => warn!(error = %e, "stale-task reaper failed"),
+                        }
+                    }
+                }
+            }
+        }));
+    }
+
     // 21) Disk-reconcile tick — every 5min, leader-gated.
     //
     // V118 active disk management: reads `fleet_disk_usage`, finds over-quota

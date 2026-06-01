@@ -1006,8 +1006,14 @@ pub enum DeferCommand {
     },
     /// Show details for a single deferred task by id.
     Get { id: String },
-    /// Cancel a pending/dispatchable/failed task.
-    Cancel { id: String },
+    /// Cancel a pending/dispatchable/failed task. With `--force`, also cancels
+    /// a stuck `running` task (orphaned by a dead/restarted worker).
+    Cancel {
+        id: String,
+        /// Also cancel a task stuck in `running` (worker presumed dead).
+        #[arg(long)]
+        force: bool,
+    },
     /// Retry a failed or cancelled task (resets attempts-aware status, runs ASAP).
     Retry { id: String },
 }

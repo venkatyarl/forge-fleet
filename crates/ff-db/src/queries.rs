@@ -3863,6 +3863,57 @@ pub async fn pg_cancel_deferred(pool: &PgPool, id: &str) -> Result<bool> {
     Ok(r.rows_affected() > 0)
 }
 
+/// Force-cancel a deferred task by id, INCLUDING a stuck `running` task.
+/// `pg_cancel_deferred` refuses `running` (a live worker may own it); this is
+/// the operator escape hatch (`ff defer cancel --force`) for tasks orphaned by
+/// a worker that died/restarted mid-run. Returns true if a row was updated.
+pub async fn pg_force_cancel_deferred(pool: &PgPool, id: &str) -> Result<bool> {
+    let uuid = sqlx::types::Uuid::parse_str(id)
+        .map_err(|e| crate::error::DbError::NotFound(format!("bad uuid {id}: {e}")))?;
+    let r = sqlx::query(
+        "UPDATE deferred_tasks
+            SET status = 'cancelled', completed_at = NOW(),
+                last_error = LEFT(COALESCE(last_error, '') || ' [force-cancelled by operator]', 500)
+          WHERE id = $1
+            AND status IN ('pending', 'dispatchable', 'failed', 'running')",
+    )
+    .bind(uuid)
+    .execute(pool)
+    .await?;
+    Ok(r.rows_affected() > 0)
+}
+
+/// Reap deferred tasks stuck in `running` longer than `max_age_secs` — i.e.
+/// orphaned because the worker that claimed them died or restarted mid-run
+/// (common during upgrade waves) with no one to mark them done. Without this
+/// they sit `running` forever, accumulating (613 found 2026-06-01) and
+/// blocking the per-family upgrade singleton.
+///
+/// Reclaim semantics mirror a normal failed attempt: increment `attempts`,
+/// clear the claim, and re-queue as `pending` for another worker — UNLESS
+/// `max_attempts` is now exhausted, in which case the task goes terminal
+/// `failed`. Returns the number of tasks reaped.
+pub async fn pg_reap_stale_running(pool: &PgPool, max_age_secs: i64) -> Result<u64> {
+    let r = sqlx::query(
+        "UPDATE deferred_tasks
+            SET attempts = attempts + 1,
+                status = CASE WHEN attempts + 1 >= max_attempts THEN 'failed' ELSE 'pending' END,
+                claimed_by = NULL,
+                claimed_at = NULL,
+                next_attempt_at = NOW(),
+                completed_at = CASE WHEN attempts + 1 >= max_attempts THEN NOW() ELSE completed_at END,
+                last_error = LEFT(COALESCE(last_error, '') ||
+                    ' [reaped: orphaned in running > ' || $1::text || 's, worker presumed dead]', 500)
+          WHERE status = 'running'
+            AND claimed_at IS NOT NULL
+            AND claimed_at < NOW() - ($1 * INTERVAL '1 second')",
+    )
+    .bind(max_age_secs)
+    .execute(pool)
+    .await?;
+    Ok(r.rows_affected())
+}
+
 /// Mark a failed task for retry: reset to 'pending' and clear the claim.
 /// Returns true if a row was updated.
 pub async fn pg_retry_deferred(pool: &PgPool, id: &str) -> Result<bool> {

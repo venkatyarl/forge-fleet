@@ -162,11 +162,20 @@ pub async fn handle_defer(cmd: crate::DeferCommand) -> Result<()> {
                 std::process::exit(1);
             }
         },
-        crate::DeferCommand::Cancel { id } => {
-            if ff_db::pg_cancel_deferred(&pool, &id).await? {
-                println!("Cancelled task {id}");
+        crate::DeferCommand::Cancel { id, force } => {
+            let cancelled = if force {
+                ff_db::pg_force_cancel_deferred(&pool, &id).await?
             } else {
-                println!("Task {id} is not in a cancellable state (or does not exist)");
+                ff_db::pg_cancel_deferred(&pool, &id).await?
+            };
+            if cancelled {
+                println!("Cancelled task {id}");
+            } else if force {
+                println!("Task {id} not cancellable (already terminal, or does not exist)");
+            } else {
+                println!(
+                    "Task {id} is not in a cancellable state (use --force for a stuck 'running' task)"
+                );
             }
         }
         crate::DeferCommand::Retry { id } => {
