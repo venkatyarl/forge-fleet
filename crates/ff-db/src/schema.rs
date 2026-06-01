@@ -8083,3 +8083,65 @@ CREATE TABLE IF NOT EXISTS disk_move_log (
 CREATE INDEX IF NOT EXISTS idx_disk_move_log_recent
     ON disk_move_log (started_at DESC);
 "#;
+
+// ─────────────────────────────────────────────────────────────────────────
+// V119 — Global resource arbiter.
+//
+// Backlog #7. EXPLICIT-declaration arbiter: a session/operator declares an
+// *intent* to reserve a host SET for a span of time; the leader-gated arbiter
+// tick grants it all-or-nothing, runs an idempotent prework plan (e.g. offload
+// minimax → disk to free GPU), holds a TTL lease, fences general task-claiming
+// off the host, and on release runs an idempotent restore plan (reload). This
+// is MOSTLY WIRING of existing primitives (V114 reservation CAS + fleet_tasks
+// claim queue + ff offload), so the schema only adds the two missing pieces:
+//
+//   PART A — work_intents: the intent registry (which IS the FIFO grant queue).
+//   PART B — owner/lease/expiry columns on the V114 computers reservation.
+//
+// Conventions: COLLATE "C" on every internal text-ID column; gen_random_uuid
+// PK; ADD COLUMN IF NOT EXISTS (idempotent, mirrors V114); partial indexes for
+// cheap deterministic scans; no hardcoded fleet data (host sets are
+// caller-supplied / dgx-pair expanded from the DB at runtime).
+pub const SCHEMA_V119_RESOURCE_ARBITER: &str = r#"
+-- PART A — work_intents: the missing intent registry (EXPLICIT-declaration).
+CREATE TABLE IF NOT EXISTS work_intents (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    requester       TEXT COLLATE "C" NOT NULL,
+    project         TEXT COLLATE "C",
+    target_host_set JSONB NOT NULL DEFAULT '[]',
+    requires_capability JSONB NOT NULL DEFAULT '[]',
+    exclusive       BOOLEAN NOT NULL DEFAULT TRUE,
+    requested_secs  INT NOT NULL DEFAULT 3600,
+    priority        INT NOT NULL DEFAULT 100,
+    state           TEXT COLLATE "C" NOT NULL DEFAULT 'pending'
+                    CHECK (state IN ('pending','granted','active','releasing','done','denied')),
+    task_desc       TEXT,
+    prework_plan    JSONB NOT NULL DEFAULT '[]',
+    restore_plan    JSONB NOT NULL DEFAULT '[]',
+    prework_cursor  INT NOT NULL DEFAULT 0,
+    restore_cursor  INT NOT NULL DEFAULT 0,
+    denied_reason   TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    granted_at      TIMESTAMPTZ,
+    expires_at      TIMESTAMPTZ,
+    released_at     TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_work_intents_state
+    ON work_intents(state) WHERE state <> 'done';
+
+CREATE INDEX IF NOT EXISTS idx_work_intents_fifo
+    ON work_intents(priority DESC, created_at ASC) WHERE state = 'pending';
+
+-- PART B — lease/owner/expiry on the V114 computers reservation. V114 had
+-- reservation_state + reserved_reason + reserved_at only. reserved_reason
+-- continues to carry the owner-tag string 'arbiter:<intent_id>' so the existing
+-- owner-scoped pg_reap_stale_reservations reaper keeps working unchanged; the
+-- new columns add the per-intent lease the arbiter reaper compares to NOW().
+ALTER TABLE computers
+    ADD COLUMN IF NOT EXISTS reservation_owner   UUID,
+    ADD COLUMN IF NOT EXISTS reservation_expires_at TIMESTAMPTZ;
+
+CREATE INDEX IF NOT EXISTS idx_computers_reservation_lease
+    ON computers(reservation_expires_at) WHERE reservation_expires_at IS NOT NULL;
+"#;

@@ -337,6 +337,24 @@ impl TaskRunner {
                          AND dep.status = 'completed'
                     )
                   )
+                  -- V119 arbiter fence: if THIS computer (the claimer, $1) is
+                  -- reserved/drained by the resource arbiter, it is off-limits
+                  -- to general task claiming — EXCEPT for tasks belonging to the
+                  -- reservation's own owning intent, so the reservation holder's
+                  -- own work still runs on its reserved host. The owner-tag is
+                  -- carried on computers.reserved_reason as 'arbiter:<intent_id>'
+                  -- and the owner's tasks use a summary prefix
+                  -- 'arbiter/<intent_id>/...' (same summary-prefix fencing
+                  -- technique as the V62 quarantine conjunct above). Append-only:
+                  -- one AND conjunct; no existing conjunct reordered or removed.
+                  AND (
+                    COALESCE(
+                      (SELECT c.reservation_state FROM computers c WHERE c.id = $1),
+                      'available'
+                    ) NOT IN ('reserved','drained')
+                    OR (SELECT c.reserved_reason FROM computers c WHERE c.id = $1)
+                         = 'arbiter:' || split_part(t.summary, '/', 2)
+                  )
                   -- 2026-05-26 (within-wave executor-kill guard): a wave
                   -- restart task SSHes into its TARGET host and restarts that
                   -- host's forgefleetd. V61 makes builds peer-driven, so the
