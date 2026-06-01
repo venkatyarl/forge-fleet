@@ -24,4 +24,6 @@ futures = "0.3"
 notify = "7"
 regex = "1"
 serde_yaml = "0.9"
+tree-sitter = "0.26"
+tree-sitter-rust = "0.24"
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }

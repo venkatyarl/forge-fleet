@@ -39,10 +39,11 @@ mod agents_cmd;
 mod alert_cmd;
 mod arbiter_cmd;
 mod brain_cmd;
+mod corpus_cmd;
+mod cortex_cmd;
 mod cli_bridge_cmd;
 mod cloud_llm_cmd;
 mod config_cmd;
-mod corpus_cmd;
 mod conformance_cmd;
 mod daemon_cmd;
 mod defer_cmd;
@@ -1847,6 +1848,35 @@ pub enum BrainCommand {
     /// Faceted, multi-parent, multi-root knowledge graph (Corpus layer).
     #[command(subcommand)]
     Corpus(CorpusCommand),
+    /// Cortex code-extraction lobe: parse code into symbol nodes + call edges.
+    #[command(subcommand)]
+    Cortex(CortexCommand),
+    /// Callers of a code symbol (traverses Cortex `calls` edges).
+    Callers {
+        #[arg(long)]
+        corpus: String,
+        symbol: String,
+        #[arg(long, default_value = "table")]
+        format: String,
+    },
+    /// Callees of a code symbol (traverses Cortex `calls` edges).
+    Callees {
+        #[arg(long)]
+        corpus: String,
+        symbol: String,
+        #[arg(long, default_value = "table")]
+        format: String,
+    },
+    /// Transitive caller closure (blast radius) of a code symbol.
+    Impact {
+        #[arg(long)]
+        corpus: String,
+        symbol: String,
+        #[arg(long, default_value_t = 5)]
+        max_depth: usize,
+        #[arg(long, default_value = "table")]
+        format: String,
+    },
     /// Faceted SET-INTERSECTION query over a corpus.
     Query {
         #[arg(long, alias = "corpus")]
@@ -1863,6 +1893,42 @@ pub enum BrainCommand {
         modalities: Vec<String>,
         #[arg(long = "facet")]
         facets: Vec<String>,
+        #[arg(long, default_value = "table")]
+        format: String,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum CortexCommand {
+    /// Parse a corpus's code files into symbol nodes + call/import/contains edges.
+    Index {
+        slug: String,
+        #[arg(long, default_value = "rust")]
+        lang: String,
+    },
+    /// Callers of a code symbol.
+    Callers {
+        #[arg(long)]
+        corpus: String,
+        symbol: String,
+        #[arg(long, default_value = "table")]
+        format: String,
+    },
+    /// Callees of a code symbol.
+    Callees {
+        #[arg(long)]
+        corpus: String,
+        symbol: String,
+        #[arg(long, default_value = "table")]
+        format: String,
+    },
+    /// Transitive caller closure (blast radius) of a code symbol.
+    Impact {
+        #[arg(long)]
+        corpus: String,
+        symbol: String,
+        #[arg(long, default_value_t = 5)]
+        max_depth: usize,
         #[arg(long, default_value = "table")]
         format: String,
     },

@@ -66,6 +66,56 @@ pub async fn handle_brain(cmd: crate::BrainCommand) -> Result<()> {
         crate::BrainCommand::Corpus(cmd) => {
             crate::corpus_cmd::handle_corpus(&pool, cmd).await?;
         }
+        crate::BrainCommand::Cortex(cmd) => {
+            crate::cortex_cmd::handle_cortex(&pool, cmd).await?;
+        }
+        crate::BrainCommand::Callers {
+            corpus,
+            symbol,
+            format,
+        } => {
+            crate::cortex_cmd::handle_cortex(
+                &pool,
+                crate::CortexCommand::Callers {
+                    corpus,
+                    symbol,
+                    format,
+                },
+            )
+            .await?;
+        }
+        crate::BrainCommand::Callees {
+            corpus,
+            symbol,
+            format,
+        } => {
+            crate::cortex_cmd::handle_cortex(
+                &pool,
+                crate::CortexCommand::Callees {
+                    corpus,
+                    symbol,
+                    format,
+                },
+            )
+            .await?;
+        }
+        crate::BrainCommand::Impact {
+            corpus,
+            symbol,
+            max_depth,
+            format,
+        } => {
+            crate::cortex_cmd::handle_cortex(
+                &pool,
+                crate::CortexCommand::Impact {
+                    corpus,
+                    symbol,
+                    max_depth,
+                    format,
+                },
+            )
+            .await?;
+        }
         crate::BrainCommand::Query {
             org,
             entities,

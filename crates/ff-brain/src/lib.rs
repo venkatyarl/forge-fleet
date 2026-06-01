@@ -12,6 +12,7 @@ pub mod chat;
 pub mod communities;
 pub mod context;
 pub mod corpus;
+pub mod cortex;
 pub mod distillation;
 pub mod embeddings;
 pub mod facts;
@@ -25,6 +26,7 @@ pub use chat::{
     receive_message, resolve_user,
 };
 pub use communities::{CommunitySummary, detect_communities};
+pub use cortex::{CortexStats, SymbolRef, callees, callers, impact, index};
 pub use context::{BrainMessage, ContextBundle, ResolvedNode, select_context};
 pub use embeddings::{EmbeddingClient, generate_embedding, generate_embedding_with_pool};
 pub use facts::{contains_signal_phrases, extract_candidates};
