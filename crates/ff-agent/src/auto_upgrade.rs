@@ -756,6 +756,13 @@ impl AutoUpgradeTick {
         // Generic across all methods.
         let _ = flip_drift_status(&self.pool).await;
 
+        // Leader self-upgrade (closes the leader gap). Runs BEFORE the
+        // ids.is_empty() early return below so the leader self-heals on its OWN
+        // forgefleetd_git drift even when no other software is drifted — which
+        // is the common case (the wave already upgraded everyone else). Gated
+        // by fleet_secrets.leader_self_upgrade (OFF by default).
+        let _ = maybe_self_upgrade_leader(&self.pool, &self.my_name).await;
+
         let ids = software_ids_with_drift(&self.pool).await?;
         if ids.is_empty() {
             return Ok(0);
@@ -954,12 +961,6 @@ impl AutoUpgradeTick {
                 }
             }
         }
-        // Leader self-upgrade: the wave above excludes the leader to avoid
-        // self-suicide, so the leader's own daemon binary never auto-upgrades.
-        // Gated by fleet_secrets.leader_self_upgrade (OFF by default); when on
-        // and the leader is in drift, rebuilds + restarts it in a detached
-        // process that survives the daemon restart. Closes the leader gap.
-        let _ = maybe_self_upgrade_leader(&self.pool, &self.my_name).await;
 
         Ok(total)
     }
