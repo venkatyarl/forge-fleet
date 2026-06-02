@@ -503,6 +503,7 @@ async fn is_enabled(pool: &PgPool) -> bool {
 /// build. `set -e` guarantees a failed build NEVER installs/restarts. A
 /// time-bounded per-target marker stops it re-firing while a build is running.
 /// Gated OFF by default. Returns true if a self-upgrade was launched.
+/// Live-verified 2026-06-01: leader self-heals on drift via this path.
 async fn maybe_self_upgrade_leader(pool: &PgPool, my_name: &str) -> bool {
     // Gate: permanent-default OFF (no TTL auto-restore — self-restart is risky,
     // so it stays off unless explicitly enabled).
