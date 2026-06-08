@@ -1005,11 +1005,32 @@ async fn openai_single_completion(
         .json()
         .await
         .with_context(|| format!("parse JSON from {url}"))?;
-    let content = v
-        .pointer("/choices/0/message/content")
-        .and_then(|x| x.as_str())
-        .ok_or_else(|| anyhow::anyhow!("missing choices[0].message.content in {v}"))?;
-    Ok(content.to_string())
+    // Some local reasoning-model servers (mlx_lm.server / vLLM with Qwen3
+    // "thinking" builds) put the visible answer in `reasoning_content` (or
+    // `reasoning`) and leave `content` empty when the response is truncated
+    // by the token cap mid-thought. Try the OpenAI-standard `content` first,
+    // then fall back to the reasoning fields so the planner/synthesizer still
+    // gets usable text instead of erroring on empty content.
+    let msg = v
+        .pointer("/choices/0/message")
+        .ok_or_else(|| anyhow::anyhow!("missing choices[0].message in {v}"))?;
+    let pick = |key: &str| {
+        msg.get(key)
+            .and_then(|x| x.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let content = pick("content")
+        .or_else(|| pick("reasoning_content"))
+        .or_else(|| pick("reasoning"))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "missing/empty choices[0].message.content, .reasoning_content, \
+                 and .reasoning in {v}"
+            )
+        })?;
+    Ok(content)
 }
 
 fn strip_json_fences(s: &str) -> &str {

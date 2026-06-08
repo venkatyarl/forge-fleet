@@ -271,7 +271,7 @@ async fn render_fleet_section(pool: &sqlx::PgPool) {
         has_gpu: bool,
         gpu_kind: String,
         gpu_model: Option<String>,
-        gpu_total_vram_gb: Option<i32>,
+        gpu_total_vram_gb: Option<f64>,
     }
 
     let rows: Vec<Row> = match sqlx::query_as::<_, Row>(
@@ -395,9 +395,9 @@ async fn render_fleet_section(pool: &sqlx::PgPool) {
                 other => (other, false),
             };
             let detail = match (&r.gpu_model, r.gpu_total_vram_gb) {
-                (Some(m), Some(v)) if !m.is_empty() => format!(" {m} {v}GB"),
+                (Some(m), Some(v)) if !m.is_empty() => format!(" {m} {v:.0}GB"),
                 (Some(m), None) if !m.is_empty() => format!(" {m}"),
-                (_, Some(v)) => format!(" {v}GB VRAM"),
+                (_, Some(v)) => format!(" {v:.0}GB VRAM"),
                 _ => String::new(),
             };
             let unified_tag = if unified { " (unified)" } else { "" };

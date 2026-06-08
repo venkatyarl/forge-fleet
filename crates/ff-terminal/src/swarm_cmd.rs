@@ -310,7 +310,7 @@ async fn plan_subtasks(goal: &str, fanout: usize, llm: &str, model: &str) -> Res
          output. Return ONLY a JSON array of strings, no prose, no markdown. \
          Each string is one full sub-task instruction.\n\nGoal: {goal}"
     );
-    let resp = call_llm(llm, model, &prompt, 1024, 0.3).await?;
+    let resp = call_llm(llm, model, &prompt, 4096, 0.3).await?;
     let arr = parse_json_array(&resp).ok_or_else(|| {
         anyhow!(
             "planner returned non-JSON-array response: {}",
@@ -330,7 +330,7 @@ async fn synthesize(goal: &str, raw_results: &str, llm: &str, model: &str) -> Re
          Sub-task results:\n{raw_results}",
         n = raw_results.matches("## sub-task").count()
     );
-    call_llm(llm, model, &prompt, 4096, 0.5).await
+    call_llm(llm, model, &prompt, 8192, 0.5).await
 }
 
 async fn call_llm(
@@ -345,9 +345,12 @@ async fn call_llm(
         .build()?;
 
     let model_id = if model.is_empty() {
-        probe_model_id(&client, endpoint)
-            .await
-            .unwrap_or_else(|| "default".to_string())
+        match resolve_live_model_id(&client, endpoint).await {
+            Some(model_id) => model_id,
+            None => probe_model_id(&client, endpoint).await.ok_or_else(|| {
+                anyhow!("no healthy chat-capable LLM server in fleet; pass --model or --llm")
+            })?,
+        }
     } else {
         model.to_string()
     };
@@ -377,21 +380,97 @@ async fn call_llm(
         .and_then(|c| c.get(0))
         .and_then(|c| c.get("message"))
         .ok_or_else(|| anyhow!("no choices[0].message in {}", truncate(&text, 400)))?;
-    // Some local reasoning-model servers (mlx_lm.server with newer Qwen3
-    // builds) emit `reasoning` rather than `content`. Try content first,
-    // fall back to reasoning so the swarm planner still works.
+    // Some local reasoning-model servers emit the visible answer outside
+    // `content`. Try OpenAI-compatible fields before erroring.
     let content = message
         .get("content")
         .and_then(|s| s.as_str())
         .filter(|s| !s.trim().is_empty())
-        .or_else(|| message.get("reasoning").and_then(|s| s.as_str()))
+        .or_else(|| {
+            message
+                .get("reasoning_content")
+                .and_then(|s| s.as_str())
+                .filter(|s| !s.trim().is_empty())
+        })
+        .or_else(|| {
+            message
+                .get("reasoning")
+                .and_then(|s| s.as_str())
+                .filter(|s| !s.trim().is_empty())
+        })
         .ok_or_else(|| {
             anyhow!(
-                "no choices[0].message.content or .reasoning in {}",
+                "no choices[0].message.content, .reasoning_content, or .reasoning in {}",
                 truncate(&text, 400)
             )
         })?;
     Ok(content.to_string())
+}
+
+async fn resolve_live_model_id(client: &reqwest::Client, chat_endpoint: &str) -> Option<String> {
+    let servers_url = chat_endpoint
+        .strip_suffix("/v1/chat/completions")
+        .map(|base| format!("{base}/api/llm/servers"))
+        .unwrap_or_else(|| chat_endpoint.replace("/v1/chat/completions", "/api/llm/servers"));
+    let resp = client
+        .get(&servers_url)
+        .timeout(Duration::from_secs(3))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let v: serde_json::Value = resp.json().await.ok()?;
+    let servers = v
+        .as_array()
+        .or_else(|| v.get("data").and_then(|data| data.as_array()))
+        .or_else(|| v.get("servers").and_then(|servers| servers.as_array()))?;
+
+    let mut candidates: Vec<(bool, bool, f64, String)> = servers
+        .iter()
+        .filter_map(|server| {
+            if server.get("healthy").and_then(|h| h.as_bool()) != Some(true) {
+                return None;
+            }
+            let status_ok = match server.get("status").and_then(|s| s.as_str()) {
+                Some("active") | None => true,
+                _ => false,
+            };
+            if !status_ok {
+                return None;
+            }
+            let model = server.get("model")?.as_str()?.to_string();
+            let model_lower = model.to_lowercase();
+            let reasoning_only = model_lower.contains("thinking")
+                || model_lower.contains("-r1")
+                || model_lower.contains("reasoning")
+                || model_lower.contains("qwq");
+            let preferred = model_lower.contains("instruct")
+                || model_lower.contains("coder")
+                || model_lower.contains("chat");
+            let queue_depth = server
+                .get("queue_depth")
+                .and_then(|q| q.as_f64())
+                .unwrap_or(0.0);
+            Some((reasoning_only, preferred, queue_depth, model))
+        })
+        .collect();
+
+    if candidates.is_empty() {
+        return None;
+    }
+    let has_non_reasoning = candidates
+        .iter()
+        .any(|(reasoning_only, _, _, _)| !*reasoning_only);
+    if has_non_reasoning {
+        candidates.retain(|(reasoning_only, _, _, _)| !*reasoning_only);
+    }
+    candidates.sort_by(|a, b| {
+        b.1.cmp(&a.1)
+            .then_with(|| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    candidates.into_iter().next().map(|(_, _, _, model)| model)
 }
 
 async fn probe_model_id(client: &reqwest::Client, chat_endpoint: &str) -> Option<String> {
