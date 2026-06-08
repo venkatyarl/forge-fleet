@@ -66,6 +66,33 @@ pub fn detect_dropped_content(input: &str) -> String {
     }
 }
 
+/// Pick a healthy AGENT-CAPABLE endpoint (tool-calling + `usable_agent_ctx >=
+/// min_ctx`) from `fleet_model_deployments`, so `ff run` agent-mode routes to
+/// an endpoint whose per-slot context actually fits the tool-schema system
+/// prompt — instead of the inference router's local-first pick, which can be a
+/// small per-slot-ctx endpoint that overflows on turn 1 (P0.1, surfaced
+/// 2026-06-08). Returns `None` on any error / no DB / no match, so the caller
+/// falls back to its existing routing. Fail-closed — never worse than today.
+pub async fn pick_agent_capable_url(config_path: &std::path::Path, min_ctx: i32) -> Option<String> {
+    let toml_str = tokio::fs::read_to_string(config_path).await.ok()?;
+    let config = toml::from_str::<ff_core::config::FleetConfig>(&toml_str).ok()?;
+    let db_url = config.database.url.trim();
+    if db_url.is_empty() {
+        return None;
+    }
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(Duration::from_secs(3))
+        .connect(db_url)
+        .await
+        .ok()?;
+    ff_db::pg_pick_agent_endpoint(&pool, min_ctx, &[])
+        .await
+        .ok()
+        .flatten()
+        .map(|c| c.endpoint)
+}
+
 /// Detect the best LLM endpoint by querying Postgres for fleet nodes + models,
 /// then probing each for a healthy connection. Falls back to localhost:55000.
 pub async fn detect_llm_from_db_or_local(config_path: &std::path::Path) -> String {
