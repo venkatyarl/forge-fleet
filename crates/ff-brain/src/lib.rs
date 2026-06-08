@@ -26,8 +26,8 @@ pub use chat::{
     receive_message, resolve_user,
 };
 pub use communities::{CommunitySummary, detect_communities};
-pub use cortex::{CortexStats, SymbolRef, callees, callers, impact, index};
 pub use context::{BrainMessage, ContextBundle, ResolvedNode, select_context};
+pub use cortex::{CortexStats, SymbolRef, callees, callers, impact, index};
 pub use embeddings::{EmbeddingClient, generate_embedding, generate_embedding_with_pool};
 pub use facts::{contains_signal_phrases, extract_candidates};
 pub use procedural_memory::{consolidate, spawn_consolidation_loop};

@@ -584,7 +584,10 @@ async fn maybe_self_upgrade_leader(pool: &PgPool, my_name: &str) -> bool {
             .and_then(|m| m.elapsed().ok())
             .map(|e| e.as_secs() < 2700)
             .unwrap_or(false);
-        if recent && std::fs::read_to_string(&marker).map(|s| s.trim() == target_sha).unwrap_or(false)
+        if recent
+            && std::fs::read_to_string(&marker)
+                .map(|s| s.trim() == target_sha)
+                .unwrap_or(false)
         {
             tracing::debug!(sha = %target_sha, "leader self-upgrade already in flight; skipping");
             return false;

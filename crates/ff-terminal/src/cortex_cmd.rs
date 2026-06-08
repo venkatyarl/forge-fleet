@@ -45,7 +45,11 @@ pub async fn handle_cortex(pool: &PgPool, cmd: crate::CortexCommand) -> Result<(
             format,
         } => {
             let rows = cortex::impact(pool, &corpus, &symbol, max_depth).await?;
-            print_symbols(&rows, &format, &format!("impact of {symbol} (depth {max_depth})"));
+            print_symbols(
+                &rows,
+                &format,
+                &format!("impact of {symbol} (depth {max_depth})"),
+            );
         }
     }
     Ok(())
