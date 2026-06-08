@@ -652,9 +652,18 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
 
     let (config, _config_path) = load_config_auto()?;
 
-    let registry = Arc::new(BackendRegistry::new(
-        healthy_backends_from_config(&config).await,
-    ));
+    // DB-first: the static `[nodes.*.models]` config is empty on a DB-driven
+    // fleet, so fall back to live healthy chat deployments from
+    // `fleet_model_deployments`. Without this the tier router has zero backends
+    // and fleet_run / ff run fail with -32603 despite healthy LLMs serving.
+    let mut backends = healthy_backends_from_config(&config).await;
+    if backends.is_empty() {
+        match get_pg_pool(&config).await {
+            Ok(pool) => backends = backends_from_db(&pool).await,
+            Err(e) => tracing::warn!("fleet_run: config has no backends and no DB pool: {e}"),
+        }
+    }
+    let registry = Arc::new(BackendRegistry::new(backends));
 
     let tier_router_cfg = TierRouterConfig {
         timeouts: TierTimeouts {
@@ -3123,6 +3132,70 @@ fn backends_from_config(config: &FleetConfig) -> Vec<BackendEndpoint> {
     }
 
     endpoints
+}
+
+/// Build the tier-router backend list from live `fleet_model_deployments`.
+/// Used when the static `[nodes.*.models]` config is empty — which it is on
+/// every DB-driven fleet (the fleet.toml model map was retired). Without this
+/// the legacy tier path (fleet_run / ff run) finds ZERO backends and fails with
+/// -32603 even though healthy chat LLMs are serving. Mirrors the DB resolver in
+/// llm_exec.rs. Embedding/audio/image families are excluded — not chat backends.
+async fn backends_from_db(pool: &sqlx::PgPool) -> Vec<BackendEndpoint> {
+    use sqlx::Row;
+    let rows = sqlx::query(
+        r#"
+        SELECT d.worker_name,
+               d.catalog_id,
+               d.port,
+               COALESCE(c.primary_ip, w.ip) AS host,
+               cat.tier
+          FROM fleet_model_deployments d
+          JOIN fleet_model_catalog cat ON cat.id = d.catalog_id
+          LEFT JOIN fleet_workers w     ON w.name = d.worker_name
+          LEFT JOIN computers c         ON LOWER(c.name) = LOWER(d.worker_name)
+         WHERE d.health_status = 'healthy'
+           AND cat.family NOT IN ('bge','whisper','kokoro','stable-diffusion','moss')
+         ORDER BY cat.tier ASC, d.last_health_at DESC NULLS LAST
+        "#,
+    )
+    .fetch_all(pool)
+    .await;
+    // Don't swallow query/decode errors as "empty fleet" — that masks a real
+    // schema/query bug behind the same -32603 this fix targets (Codex review).
+    let rows = match rows {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("backends_from_db: deployment query failed: {e}");
+            return Vec::new();
+        }
+    };
+
+    rows.into_iter()
+        .filter_map(|row| {
+            let worker: String = row.try_get("worker_name").ok()?;
+            let catalog_id: String = row.try_get("catalog_id").ok()?;
+            let port: i32 = row.try_get("port").ok()?;
+            // try_from rejects out-of-range ports instead of silently wrapping
+            // (e.g. 70000 -> 4464). DB column is INT with no range check.
+            let port = u16::try_from(port).ok()?;
+            let host: String = row.try_get("host").ok()?;
+            let tier: i32 = row.try_get("tier").ok()?;
+            Some(BackendEndpoint {
+                id: format!("{worker}:{catalog_id}:{port}"),
+                node: worker,
+                host,
+                port,
+                model: catalog_id,
+                tier: tier.clamp(1, 4) as u8,
+                healthy: true,
+                busy: false,
+                scheme: "http".to_string(),
+                is_local: true,
+                cost_per_1k_input: 0.0,
+                cost_per_1k_output: 0.0,
+            })
+        })
+        .collect()
 }
 
 async fn healthy_backends_from_config(config: &FleetConfig) -> Vec<BackendEndpoint> {
