@@ -2866,21 +2866,23 @@ async fn main() -> Result<()> {
     let (llm, router) =
         if let Some(explicit_url) = cli.llm.or_else(|| env::var("FORGEFLEET_LLM_URL").ok()) {
             (explicit_url, None)
+        } else if let Some(url) = helpers::pick_agent_capable_url(&config_path, 16_000).await {
+            // Agent-capable endpoint (tool-calling + usable_agent_ctx >= 16K).
+            // Use it DIRECTLY with NO inference router: the agent loop prefers
+            // router.active_url() (local-first) over llm_base_url, so attaching
+            // the router would override this pick back to a small-per-slot-ctx
+            // endpoint and the agent overflows on turn 1 (P0.1). Failover to a
+            // small-ctx endpoint would just overflow anyway, so direct is right.
+            (url, None)
         } else {
+            // No agent-capable deployment — fall back to the local-first
+            // inference router (with failover), exactly as before. Fail-closed.
             let r = ff_agent::inference_router::InferenceRouter::from_config(&config_path).await;
-            // Prefer a healthy AGENT-CAPABLE endpoint (tool-calling +
-            // usable_agent_ctx >= 16K) so the agent's tool-schema system prompt
-            // fits. The router's local-first ordering otherwise picks a small
-            // per-slot-ctx endpoint and the agent overflows on turn 1 (P0.1).
-            // Fail-closed: None falls back to the router's existing behaviour.
-            let primary =
-                if let Some(url) = helpers::pick_agent_capable_url(&config_path, 16_000).await {
-                    url
-                } else if let Some(url) = r.active_url().await {
-                    url
-                } else {
-                    helpers::detect_llm_from_db_or_local(&config_path).await
-                };
+            let primary = if let Some(url) = r.active_url().await {
+                url
+            } else {
+                helpers::detect_llm_from_db_or_local(&config_path).await
+            };
             (primary, Some(std::sync::Arc::new(r)))
         };
 
