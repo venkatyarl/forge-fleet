@@ -70,7 +70,11 @@ pub async fn handle_auto_upgrade_run_once(pool: &sqlx::PgPool, force: bool) -> R
             ""
         }
     );
-    let tick = ff_agent::auto_upgrade::AutoUpgradeTick::new(pool.clone(), worker);
+    let tick = ff_agent::auto_upgrade::AutoUpgradeTick::new(
+        pool.clone(),
+        worker,
+        env!("FF_GIT_SHA").to_string(),
+    );
     let enqueued = tick
         .run_once(force)
         .await

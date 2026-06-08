@@ -1315,7 +1315,11 @@ pub async fn handle_daemon(
         // Hourly auto-upgrade loop: dispatches drift → playbook → Telegram
         // without operator interaction. Gated by fleet_secrets.auto_upgrade_enabled.
         println!("{CYAN}[auto-upgrade]{RESET} spawning hourly drift→upgrade→telegram loop");
-        let auto = ff_agent::auto_upgrade::AutoUpgradeTick::new(pool.clone(), worker_name.clone());
+        let auto = ff_agent::auto_upgrade::AutoUpgradeTick::new(
+            pool.clone(),
+            worker_name.clone(),
+            env!("FF_GIT_SHA").to_string(),
+        );
         let _auto_handle = auto.spawn(portfolio_shutdown_rx.clone());
 
         // External-tools upstream drift checker (6h). Scans the V24

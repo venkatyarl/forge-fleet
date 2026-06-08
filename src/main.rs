@@ -2747,8 +2747,11 @@ async fn start_pulse_v2_subsystems(
         node = %worker_name.clone(),
         "starting subsystem: auto-upgrade tick (hourly, leader-gated)"
     );
-    let auto_upgrade_tick =
-        ff_agent::auto_upgrade::AutoUpgradeTick::new(pg_pool.clone(), worker_name.clone());
+    let auto_upgrade_tick = ff_agent::auto_upgrade::AutoUpgradeTick::new(
+        pg_pool.clone(),
+        worker_name.clone(),
+        env!("FF_GIT_SHA").to_string(),
+    );
     handles.push(auto_upgrade_tick.spawn(shutdown_rx.clone()));
 
     // (9) fleet_tasks worker — every daemon polls fleet_tasks for shell
