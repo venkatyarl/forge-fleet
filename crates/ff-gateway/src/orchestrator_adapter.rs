@@ -579,6 +579,7 @@ mod tests {
             local_tasks: vec![],
             os: Default::default(),
             build_sha: None,
+            source_tree_path: None,
         }
     }
 

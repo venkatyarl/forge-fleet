@@ -248,6 +248,7 @@ impl HeartbeatV2Publisher {
                 // to take the GB10/DGX unified-memory fallback path.
                 beat.os = detect_os_info();
                 beat.build_sha = build_sha.clone();
+                beat.source_tree_path = detect_source_tree_path();
 
                 // ── Capabilities ─────────────────────────────────────────────
                 let gpu_kind = detect_gpu_kind();
@@ -548,6 +549,39 @@ async fn publish_beat(
 /// The materializer writes this to `computers.os_family` so the
 /// auto-upgrade playbook resolver can pick the right key
 /// (linux-ubuntu vs linux-dgx) without manual classification.
+/// Detect this node's ForgeFleet source tree — the absolute path of the repo
+/// root the daemon builds/self-upgrades from. Returned in the beat so the
+/// materializer can heal `computers.source_tree_path` from ground truth
+/// (the leader's auto-upgrade `cd`s into this column; NULL → self-upgrade
+/// silently skips). Probes the same locations as
+/// `ff_core::db_health::locate_compose_file`, picking the first that exists,
+/// and returns the canonicalized absolute path. `None` when no tree is found
+/// (e.g. binary-only install) — the materializer then leaves the column alone.
+fn detect_source_tree_path() -> Option<String> {
+    use std::path::PathBuf;
+    let home = std::env::var("HOME").ok().map(PathBuf::from);
+    let candidates: Vec<PathBuf> = [
+        std::env::var("FORGEFLEET_REPO").ok().map(PathBuf::from),
+        home.as_ref().map(|h| h.join("projects/forge-fleet")),
+        home.as_ref()
+            .map(|h| h.join(".forgefleet/sub-agent-0/forge-fleet")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    // A real tree has the deploy compose file (and a .git dir); require the
+    // compose file so we don't latch onto an empty placeholder directory.
+    candidates
+        .into_iter()
+        .find(|root| root.join("deploy/docker-compose.yml").exists())
+        .map(|root| {
+            std::fs::canonicalize(&root)
+                .unwrap_or(root)
+                .to_string_lossy()
+                .into_owned()
+        })
+}
+
 fn detect_os_info() -> crate::beat_v2::OsInfo {
     use crate::beat_v2::OsInfo;
     if cfg!(target_os = "macos") {
