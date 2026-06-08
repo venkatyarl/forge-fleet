@@ -504,7 +504,7 @@ async fn is_enabled(pool: &PgPool) -> bool {
 /// time-bounded per-target marker stops it re-firing while a build is running.
 /// Gated OFF by default. Returns true if a self-upgrade was launched.
 /// Live-verified 2026-06-01: leader self-heals on drift via this path.
-async fn maybe_self_upgrade_leader(pool: &PgPool, my_name: &str) -> bool {
+async fn maybe_self_upgrade_leader(pool: &PgPool, my_name: &str, running_sha: &str) -> bool {
     // Gate: permanent-default OFF (no TTL auto-restore — self-restart is risky,
     // so it stays off unless explicitly enabled).
     if !ff_db::pg_read_safety_gate(pool, LEADER_SELF_UPGRADE_KEY, false, false)
@@ -517,30 +517,39 @@ async fn maybe_self_upgrade_leader(pool: &PgPool, my_name: &str) -> bool {
         return false;
     }
 
-    // Is the leader in drift on its own daemon binary? latest_version lives on
-    // software_registry (NOT computer_software); drift = the leader's installed
-    // SHA differs from the registry's latest. We key on installed != latest
-    // rather than status, since the wave can leave the leader's status in
-    // 'upgrading' even though it never actually upgrades the leader.
-    let target_sha: Option<String> = sqlx::query_scalar(
-        r#"
-        SELECT sr.latest_version
-          FROM fleet_leader_state ls
-          JOIN computer_software cs ON cs.computer_id = ls.computer_id
-          JOIN software_registry sr ON sr.id = cs.software_id
-         WHERE cs.software_id = 'forgefleetd_git'
-           AND sr.latest_version IS NOT NULL
-           AND sr.latest_version IS DISTINCT FROM cs.installed_version
-         LIMIT 1
-        "#,
+    // Is the leader in drift on its own daemon binary? Compare the RUNNING
+    // binary's compiled-in SHA (`running_sha`, from env!("FF_GIT_SHA") in the
+    // caller's crate) against the registry's latest for forgefleetd_git.
+    //
+    // We deliberately do NOT key on `computer_software.installed_version`: that
+    // column reflects the leader's SOURCE-TREE HEAD (a git pull / build bumps
+    // it), which is almost always already current. A leader whose tree is built
+    // but whose *process* is stale would then show zero drift and never
+    // restart — the 2026-06-08 bug where taylor ran an 8h-old forgefleetd while
+    // installed_version read latest, so the self-upgrade was a silent no-op and
+    // a manual `launchctl kickstart` was required. The running binary's SHA is
+    // the only signal that catches a stale process.
+    let latest_sha: Option<String> = sqlx::query_scalar(
+        "SELECT latest_version FROM software_registry \
+         WHERE id = 'forgefleetd_git' AND latest_version IS NOT NULL",
     )
     .fetch_optional(pool)
     .await
     .ok()
     .flatten();
-    let Some(target_sha) = target_sha else {
-        return false; // leader already current (or no row)
+    let Some(latest_sha) = latest_sha else {
+        return false; // no known target
     };
+    // SHAs may differ in length (running is 10-char from --short=10; registry
+    // may be 10 or full). Prefix-compare so the shorter is a prefix of the
+    // longer. An empty running_sha (unknown build) means we can't judge drift —
+    // skip rather than churn-restart.
+    let running = running_sha.trim();
+    let latest = latest_sha.trim();
+    if running.is_empty() || running.starts_with(latest) || latest.starts_with(running) {
+        return false; // running binary already at latest (or build unknown)
+    }
+    let target_sha = latest_sha;
 
     // Resolve the leader's source tree (same source as refresh_self_built).
     let source_tree: Option<String> = sqlx::query_scalar(
@@ -697,10 +706,15 @@ pub struct AutoUpgradeTick {
     pool: PgPool,
     my_name: String,
     client: reqwest::Client,
+    /// Compiled-in SHA of the RUNNING binary (`env!("FF_GIT_SHA")` from the
+    /// caller's crate). Used by the leader self-upgrade to detect a stale
+    /// running binary — the DB `installed_version` reflects the source-tree
+    /// HEAD, not the running process, so it can't see this drift.
+    running_sha: String,
 }
 
 impl AutoUpgradeTick {
-    pub fn new(pool: PgPool, my_name: String) -> Self {
+    pub fn new(pool: PgPool, my_name: String, running_sha: String) -> Self {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(5))
             .user_agent("forgefleetd/auto-upgrade")
@@ -710,6 +724,7 @@ impl AutoUpgradeTick {
             pool,
             my_name,
             client,
+            running_sha,
         }
     }
 
@@ -764,7 +779,7 @@ impl AutoUpgradeTick {
         // forgefleetd_git drift even when no other software is drifted — which
         // is the common case (the wave already upgraded everyone else). Gated
         // by fleet_secrets.leader_self_upgrade (OFF by default).
-        let _ = maybe_self_upgrade_leader(&self.pool, &self.my_name).await;
+        let _ = maybe_self_upgrade_leader(&self.pool, &self.my_name, &self.running_sha).await;
 
         let ids = software_ids_with_drift(&self.pool).await?;
         if ids.is_empty() {
