@@ -657,13 +657,51 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                 );
             }
 
-            // Cross-node delete not yet wired — only this host.
+            // Cross-node delete: dispatch to the owning node via the deferred
+            // task queue — same pattern as `ff model download`. A defer-worker
+            // on the target node claims it and runs the delete locally (where
+            // the file actually lives). Bare `ff` is fine in the defer command:
+            // the defer-worker runs with a full PATH, unlike a non-login SSH
+            // shell. The --yes is implied (operator already confirmed here).
             let this_node = ff_agent::fleet_info::resolve_this_worker_name().await;
             if row.worker_name != this_node {
-                anyhow::bail!(
-                    "cross-node delete not yet implemented. run on '{}' instead.",
+                if !yes {
+                    println!(
+                        "This will delete {} ({}) from {} (cross-node). Re-run with --yes to confirm.",
+                        row.file_path,
+                        human_bytes(row.size_bytes as u64),
+                        row.worker_name
+                    );
+                    return Ok(());
+                }
+                let escaped_id = shell_escape_single(&id);
+                let command = format!("ff model delete {escaped_id} --yes");
+                let title = format!("Delete {} on {}", id, row.worker_name);
+                let payload = serde_json::json!({ "command": command });
+                let defer_id = ff_db::pg_enqueue_deferred(
+                    &pool,
+                    &title,
+                    "shell",
+                    &payload,
+                    "now",
+                    &serde_json::json!({}),
+                    Some(&row.worker_name),
+                    &serde_json::json!([]),
+                    Some(&whoami_tag()),
+                    Some(3),
+                )
+                .await?;
+                println!(
+                    "Enqueued cross-node delete of {} ({}) on {} as deferred task {defer_id}.",
+                    row.file_path,
+                    human_bytes(row.size_bytes as u64),
                     row.worker_name
                 );
+                println!(
+                    "It runs when {}'s defer-worker claims it. Check: ff defer list",
+                    row.worker_name
+                );
+                return Ok(());
             }
 
             if !yes {
