@@ -2868,11 +2868,19 @@ async fn main() -> Result<()> {
             (explicit_url, None)
         } else {
             let r = ff_agent::inference_router::InferenceRouter::from_config(&config_path).await;
-            let primary = if let Some(url) = r.active_url().await {
-                url
-            } else {
-                helpers::detect_llm_from_db_or_local(&config_path).await
-            };
+            // Prefer a healthy AGENT-CAPABLE endpoint (tool-calling +
+            // usable_agent_ctx >= 16K) so the agent's tool-schema system prompt
+            // fits. The router's local-first ordering otherwise picks a small
+            // per-slot-ctx endpoint and the agent overflows on turn 1 (P0.1).
+            // Fail-closed: None falls back to the router's existing behaviour.
+            let primary =
+                if let Some(url) = helpers::pick_agent_capable_url(&config_path, 16_000).await {
+                    url
+                } else if let Some(url) = r.active_url().await {
+                    url
+                } else {
+                    helpers::detect_llm_from_db_or_local(&config_path).await
+                };
             (primary, Some(std::sync::Arc::new(r)))
         };
 
