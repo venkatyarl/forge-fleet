@@ -157,13 +157,37 @@ pub async fn reconcile_local(pool: &sqlx::PgPool) -> Result<ReconcileSummary, St
                 .as_deref()
                 .and_then(|s| sqlx::types::Uuid::parse_str(s).ok());
 
+            // Self-heal context columns for adopted/under-probed deployments.
+            // `context_window == 0` means we never recorded a real ctx (server
+            // started out-of-band, or cmdline lacked --ctx-size). Probe the
+            // live server for ground truth so the agent router — which filters
+            // `usable_agent_ctx >= min_ctx` — can see this endpoint. Also
+            // corrects a stale `parallel_slots` (e.g. veronica's DB said 2 but
+            // /props reports 4). Only when healthy (an unhealthy server won't
+            // answer /props anyway).
+            let mut ctx_total: Option<i32> = None;
+            let mut slots: Option<i32> = None;
+            let mut usable: Option<i32> = None;
+            if healthy && existing.context_window == 0 {
+                if let Some((per_slot, total_slots)) =
+                    crate::model_runtime::probe_agent_ctx(&proc_info.runtime, port).await
+                {
+                    ctx_total = Some(per_slot.saturating_mul(total_slots));
+                    slots = Some(total_slots);
+                    usable = Some(per_slot);
+                }
+            }
+
             if let Err(e) = sqlx::query(
                 "UPDATE fleet_model_deployments
                     SET health_status = $1,
                         last_health_at = NOW(),
                         pid = $2,
                         library_id = COALESCE(library_id, $3),
-                        catalog_id = COALESCE(catalog_id, $4)
+                        catalog_id = COALESCE(catalog_id, $4),
+                        context_window = COALESCE($6::int, context_window),
+                        parallel_slots = COALESCE($7::int, parallel_slots),
+                        usable_agent_ctx = COALESCE($8::int, usable_agent_ctx)
                   WHERE id = $5::uuid",
             )
             .bind(status)
@@ -171,12 +195,22 @@ pub async fn reconcile_local(pool: &sqlx::PgPool) -> Result<ReconcileSummary, St
             .bind(lib_uuid)
             .bind(cat_id_str)
             .bind(&existing.id)
+            .bind(ctx_total)
+            .bind(slots)
+            .bind(usable)
             .execute(pool)
             .await
             {
                 tracing::warn!("failed to refresh deployment {}: {e}", existing.id);
             } else {
                 summary.refreshed += 1;
+                if usable.is_some() {
+                    tracing::info!(
+                        port,
+                        usable_agent_ctx = usable,
+                        "backfilled agent ctx for adopted deployment"
+                    );
+                }
             }
         } else {
             // ── Process exists, no DB row → adopt ─────────────────────────

@@ -1020,6 +1020,87 @@ async fn probe_health(
         .unwrap_or(false)
 }
 
+/// Probe a running inference server for its real per-slot context window and
+/// slot count, so the reconciler can backfill `usable_agent_ctx` /
+/// `context_window` / `parallel_slots` on adopted deployments (servers ff
+/// didn't start, whose cmdline lacked explicit `--ctx-size`/`--parallel`).
+/// Without this the capability-aware agent router — which filters
+/// `usable_agent_ctx IS NOT NULL AND >= N` — is blind to them.
+///
+/// Returns `(per_slot_ctx, total_slots)` where `per_slot_ctx` is the context a
+/// single agent request actually gets (the value the router compares against
+/// `min_ctx`). `None` when the runtime doesn't advertise it or the probe fails.
+///
+/// - llama.cpp `/props`: `default_generation_settings.n_ctx` is already the
+///  per-slot context (llama.cpp splits `--ctx-size` across `--parallel`);
+///  `total_slots` is the slot count.
+/// - vllm `/v1/models`: `max_model_len` is the full per-request context
+///  (continuous batching, not slot-split) → `(max_model_len, 1)`.
+/// - mlx: no context introspection endpoint → `None`.
+pub async fn probe_agent_ctx(runtime: &str, port: u16) -> Option<(i32, i32)> {
+    let timeout = std::time::Duration::from_secs(3);
+    match runtime {
+        "llama.cpp" => {
+            let url = format!("http://127.0.0.1:{port}/props");
+            let v: serde_json::Value = SHARED_HTTP
+                .get(&url)
+                .timeout(timeout)
+                .send()
+                .await
+                .ok()?
+                .json()
+                .await
+                .ok()?;
+            parse_llama_props_ctx(&v)
+        }
+        "vllm" => {
+            let url = format!("http://127.0.0.1:{port}/v1/models");
+            let v: serde_json::Value = SHARED_HTTP
+                .get(&url)
+                .timeout(timeout)
+                .send()
+                .await
+                .ok()?
+                .json()
+                .await
+                .ok()?;
+            parse_vllm_models_ctx(&v)
+        }
+        _ => None,
+    }
+}
+
+/// Extract `(per_slot_ctx, total_slots)` from a llama.cpp `/props` body.
+/// `default_generation_settings.n_ctx` is the per-slot context; `total_slots`
+/// is the parallel-slot count (absent on old builds → assume 1).
+fn parse_llama_props_ctx(v: &serde_json::Value) -> Option<(i32, i32)> {
+    let per_slot = v
+        .get("default_generation_settings")
+        .and_then(|s| s.get("n_ctx"))
+        .and_then(|n| n.as_i64())
+        .filter(|&n| n > 0)? as i32;
+    let slots = v
+        .get("total_slots")
+        .and_then(|n| n.as_i64())
+        .filter(|&n| n > 0)
+        .unwrap_or(1) as i32;
+    Some((per_slot, slots))
+}
+
+/// Extract `(max_model_len, 1)` from a vllm `/v1/models` body. vllm uses
+/// continuous batching, so the full `max_model_len` is available per request
+/// (slot count is effectively 1 for the agent-ctx sizing question).
+fn parse_vllm_models_ctx(v: &serde_json::Value) -> Option<(i32, i32)> {
+    let max_len = v
+        .get("data")
+        .and_then(|d| d.as_array())
+        .and_then(|a| a.first())
+        .and_then(|m| m.get("max_model_len"))
+        .and_then(|n| n.as_i64())
+        .filter(|&n| n > 0)? as i32;
+    Some((max_len, 1))
+}
+
 fn parse_flag_value(cmdline: &str, flag: &str) -> Option<String> {
     let mut parts = cmdline.split_whitespace();
     while let Some(p) = parts.next() {
@@ -1361,6 +1442,41 @@ async fn write_systemd_unit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_llama_props_per_slot_ctx_and_slots() {
+        // Shape observed live on veronica's qwen36 llama.cpp /props.
+        let v = serde_json::json!({
+            "default_generation_settings": { "n_ctx": 4096 },
+            "total_slots": 4,
+            "model_path": "/x"
+        });
+        assert_eq!(parse_llama_props_ctx(&v), Some((4096, 4)));
+    }
+
+    #[test]
+    fn llama_props_missing_total_slots_defaults_to_one() {
+        let v = serde_json::json!({ "default_generation_settings": { "n_ctx": 32768 } });
+        assert_eq!(parse_llama_props_ctx(&v), Some((32768, 1)));
+    }
+
+    #[test]
+    fn llama_props_without_n_ctx_is_none() {
+        let v = serde_json::json!({ "total_slots": 4 });
+        assert_eq!(parse_llama_props_ctx(&v), None);
+    }
+
+    #[test]
+    fn parses_vllm_max_model_len() {
+        let v = serde_json::json!({ "data": [{ "id": "m", "max_model_len": 65536 }] });
+        assert_eq!(parse_vllm_models_ctx(&v), Some((65536, 1)));
+    }
+
+    #[test]
+    fn vllm_without_max_model_len_is_none() {
+        let v = serde_json::json!({ "data": [{ "id": "m" }] });
+        assert_eq!(parse_vllm_models_ctx(&v), None);
+    }
 
     #[test]
     fn capable_chat_model_defaults_to_agent_profile() {
