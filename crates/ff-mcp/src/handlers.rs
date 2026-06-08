@@ -3170,7 +3170,8 @@ async fn backends_from_db(pool: &sqlx::PgPool) -> Vec<BackendEndpoint> {
         }
     };
 
-    rows.into_iter()
+    let mut endpoints: Vec<BackendEndpoint> = rows
+        .into_iter()
         .filter_map(|row| {
             let worker: String = row.try_get("worker_name").ok()?;
             let catalog_id: String = row.try_get("catalog_id").ok()?;
@@ -3195,7 +3196,37 @@ async fn backends_from_db(pool: &sqlx::PgPool) -> Vec<BackendEndpoint> {
                 cost_per_1k_output: 0.0,
             })
         })
-        .collect()
+        .collect();
+
+    // Liveness probe: DB health_status is reconciler-maintained (up to ~60s
+    // stale), so a row can read 'healthy' while the server is actually down.
+    // Without a live check the tier router blocks ~30s per dead backend before
+    // failing over — timing out fleet_run even though a fast backend exists
+    // (the 2026-06-08 timeout regression). Mirror healthy_backends_from_config:
+    // one concurrent HTTP sweep, then drop the unreachable backends so only
+    // live ones reach the router.
+    if endpoints.is_empty() {
+        return endpoints;
+    }
+    let monitor = HealthMonitor::default();
+    let targets: Vec<HealthTarget> = endpoints
+        .iter()
+        .map(|e| HealthTarget {
+            name: e.id.clone(),
+            host: e.host.clone(),
+            port: e.port,
+            check_http_health: true,
+        })
+        .collect();
+    let reachable: std::collections::HashSet<String> = monitor
+        .check_all(&targets)
+        .await
+        .into_iter()
+        .filter(|c| matches!(c.status, HealthStatus::Healthy | HealthStatus::Degraded))
+        .map(|c| c.name)
+        .collect();
+    endpoints.retain(|e| reachable.contains(&e.id));
+    endpoints
 }
 
 async fn healthy_backends_from_config(config: &FleetConfig) -> Vec<BackendEndpoint> {
