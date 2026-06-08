@@ -491,6 +491,25 @@ impl Materializer {
             .await;
         }
 
+        // source_tree_path self-heal — must also run BEFORE the fast-path
+        // exit (it changes only on redeploy, so it's absent from the snapshot
+        // and would otherwise never reconcile). The node reports its own tree
+        // location as ground truth; the leader's auto-upgrade `cd`s into this
+        // column, and a NULL value makes the leader self-upgrade silently skip
+        // (surfaced 2026-06-08: only Taylor had it set, so leadership moving
+        // to any other node would break self-upgrade). Same idiom as the
+        // primary_ip heal below — guarded no-op once the row is correct.
+        if let Some(stp) = beat.source_tree_path.as_deref().filter(|s| !s.is_empty()) {
+            let _ = sqlx::query(
+                "UPDATE computers SET source_tree_path = $1 \
+                 WHERE id = $2 AND COALESCE(source_tree_path, '') <> $1",
+            )
+            .bind(stp)
+            .bind(computer_id)
+            .execute(&self.pg)
+            .await;
+        }
+
         // Fast path: if the snapshot matches exactly AND no status transition,
         // only update last_seen_at.
         let snapshots_match = prior_snapshot

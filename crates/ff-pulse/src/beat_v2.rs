@@ -66,6 +66,17 @@ pub struct PulseBeatV2 {
     /// live state without an explicit post-upgrade refresh.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_sha: Option<String>,
+    /// Ground-truth absolute path of this node's ForgeFleet source tree —
+    /// the dir the daemon builds/self-upgrades from (Taylor: `~/projects/
+    /// forge-fleet`; workers: `~/.forgefleet/sub-agent-0/forge-fleet`).
+    /// The leader's auto-upgrade reads `computers.source_tree_path` to know
+    /// what to `cd` into; if it's NULL the leader self-upgrade silently skips
+    /// (surfaced 2026-06-08 — only Taylor had it set, so leadership moving to
+    /// any other node would break self-upgrade). Reported here so the
+    /// materializer heals the column from ground truth, same idiom as
+    /// `primary_ip`. `None` from daemons running pre-this-field code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_tree_path: Option<String>,
     pub hardware: HardwareInfo,
     pub load: LoadInfo,
     pub memory: MemoryInfo,
@@ -435,6 +446,7 @@ impl PulseBeatV2 {
             },
             os: OsInfo::default(),
             build_sha: None,
+            source_tree_path: None,
             hardware: HardwareInfo {
                 cpu_cores: 0,
                 ram_gb: 0,
