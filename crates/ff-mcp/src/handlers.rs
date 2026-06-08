@@ -3159,21 +3159,32 @@ async fn backends_from_db(pool: &sqlx::PgPool) -> Vec<BackendEndpoint> {
         "#,
     )
     .fetch_all(pool)
-    .await
-    .unwrap_or_default();
+    .await;
+    // Don't swallow query/decode errors as "empty fleet" — that masks a real
+    // schema/query bug behind the same -32603 this fix targets (Codex review).
+    let rows = match rows {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("backends_from_db: deployment query failed: {e}");
+            return Vec::new();
+        }
+    };
 
     rows.into_iter()
         .filter_map(|row| {
             let worker: String = row.try_get("worker_name").ok()?;
             let catalog_id: String = row.try_get("catalog_id").ok()?;
             let port: i32 = row.try_get("port").ok()?;
+            // try_from rejects out-of-range ports instead of silently wrapping
+            // (e.g. 70000 -> 4464). DB column is INT with no range check.
+            let port = u16::try_from(port).ok()?;
             let host: String = row.try_get("host").ok()?;
             let tier: i32 = row.try_get("tier").ok()?;
             Some(BackendEndpoint {
                 id: format!("{worker}:{catalog_id}:{port}"),
                 node: worker,
                 host,
-                port: port as u16,
+                port,
                 model: catalog_id,
                 tier: tier.clamp(1, 4) as u8,
                 healthy: true,
