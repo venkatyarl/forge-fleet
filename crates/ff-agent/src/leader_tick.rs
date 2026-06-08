@@ -239,6 +239,18 @@ impl LeaderTick {
                                         );
                                     }
 
+                                    // Keep the open-design SKILL.md catalog in
+                                    // step with the auto-upgrade pipeline's git
+                                    // pulls. No-op unless the leader's checkout
+                                    // SHA advanced since the last sync.
+                                    if let Err(err) = self.sync_open_design_skills().await {
+                                        tracing::warn!(
+                                            node = %self.my_name,
+                                            error = %err,
+                                            "sync_open_design_skills failed"
+                                        );
+                                    }
+
                                     // Phase 6 HA: auto-failover check. Only
                                     // runs on the currently-elected ForgeFleet
                                     // leader. Disabled via env var
@@ -724,6 +736,63 @@ impl LeaderTick {
             }
         }
 
+        Ok(())
+    }
+
+    /// Re-import the open-design SKILL.md catalog when the leader's local
+    /// `open_design_git` checkout has advanced since the last sync. Leader-only
+    /// (skills land in shared Postgres → once per fleet, not once per node).
+    /// Cheap: one version query + a marker-file compare; the directory walk +
+    /// upsert only runs on the tick where the checkout SHA actually changed, so
+    /// `ff skills list` stays in step with the auto-upgrade pipeline's git pulls
+    /// without re-importing 450+ files every 15s.
+    async fn sync_open_design_skills(&self) -> anyhow::Result<()> {
+        // This tick runs on the leader, so query *this* node's installed SHA.
+        let installed: Option<String> = sqlx::query_scalar(
+            "SELECT installed_version FROM computer_software \
+             WHERE computer_id = $1 AND software_id = 'open_design_git'",
+        )
+        .bind(self.my_computer_id)
+        .fetch_optional(&self.pg)
+        .await?;
+        let Some(version) = installed.filter(|v| !v.is_empty()) else {
+            return Ok(()); // open-design not installed on the leader
+        };
+
+        let home = std::env::var("HOME").unwrap_or_default();
+        let checkout = format!("{home}/.forgefleet/sub-agent-0/open-design");
+        // `skills/` presence is the sentinel that the checkout is materialized.
+        if !std::path::Path::new(&checkout).join("skills").exists() {
+            return Ok(());
+        }
+        let marker = format!("{home}/.forgefleet/skills-open-design.last-version");
+        if std::fs::read_to_string(&marker)
+            .ok()
+            .as_deref()
+            .map(str::trim)
+            == Some(version.as_str())
+        {
+            return Ok(()); // already synced at this SHA
+        }
+
+        let (imported, updated, _retired, errors) = crate::skills_db::import_repo_skills(
+            &self.pg,
+            std::path::Path::new(&checkout),
+            "open-design",
+            Some("https://github.com/nexu-io/open-design"),
+            None,
+        )
+        .await?;
+        let _ = crate::skills_db::materialize_all(&self.pg).await;
+        let _ = std::fs::write(&marker, &version);
+        tracing::info!(
+            node = %self.my_name,
+            sha = %version,
+            imported,
+            updated,
+            errors,
+            "synced open-design skills from leader checkout"
+        );
         Ok(())
     }
 

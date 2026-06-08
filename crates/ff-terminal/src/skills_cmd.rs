@@ -175,18 +175,17 @@ async fn list_cmd(
         "NAME", "SOURCE", "FAMILY", "VERSION", "RISK", "DESCRIPTION"
     );
     for s in &filtered {
-        let desc = s
+        let first_line = s
             .description
             .as_deref()
             .unwrap_or("")
             .lines()
             .next()
             .unwrap_or("");
-        let desc = if desc.len() > 60 {
-            format!("{}…", &desc[..60])
-        } else {
-            desc.to_string()
-        };
+        // Char-safe truncation — byte-slicing panics on multi-byte UTF-8
+        // (open-design ships skills with CJK descriptions). truncate() counts
+        // chars and appends the ellipsis itself.
+        let desc = truncate(first_line, 60);
         println!(
             "{:<22} {:<14} {:<14} {:<8} {:<8} {}",
             truncate(&s.name, 22),
