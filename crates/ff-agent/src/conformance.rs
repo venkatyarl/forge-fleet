@@ -515,7 +515,11 @@ pub async fn hosts_in_scope(pg: &PgPool, role: &str) -> anyhow::Result<Vec<Compu
 /// run the verify gates and record results. `mode` decides side effects:
 /// - Off: never called (the tick returns early).
 /// - DryRun / Active: RECORD results; actuate nothing (increment 1).
-async fn conformance_pass(pg: &PgPool, mode: ConformanceMode, checked_by: &str) -> anyhow::Result<usize> {
+async fn conformance_pass(
+    pg: &PgPool,
+    mode: ConformanceMode,
+    checked_by: &str,
+) -> anyhow::Result<usize> {
     let role = "amd-training";
     let hosts = hosts_in_scope(pg, role).await?;
     let record = matches!(mode, ConformanceMode::DryRun | ConformanceMode::Active);
@@ -626,19 +630,43 @@ mod tests {
     fn mode_parses_safely() {
         assert_eq!(ConformanceMode::parse(None), ConformanceMode::Off);
         assert_eq!(ConformanceMode::parse(Some("")), ConformanceMode::Off);
-        assert_eq!(ConformanceMode::parse(Some("nonsense")), ConformanceMode::Off);
-        assert_eq!(ConformanceMode::parse(Some("dry-run")), ConformanceMode::DryRun);
-        assert_eq!(ConformanceMode::parse(Some("dry_run")), ConformanceMode::DryRun);
-        assert_eq!(ConformanceMode::parse(Some("ACTIVE")), ConformanceMode::Active);
+        assert_eq!(
+            ConformanceMode::parse(Some("nonsense")),
+            ConformanceMode::Off
+        );
+        assert_eq!(
+            ConformanceMode::parse(Some("dry-run")),
+            ConformanceMode::DryRun
+        );
+        assert_eq!(
+            ConformanceMode::parse(Some("dry_run")),
+            ConformanceMode::DryRun
+        );
+        assert_eq!(
+            ConformanceMode::parse(Some("ACTIVE")),
+            ConformanceMode::Active
+        );
     }
 
     #[test]
     fn strix_halo_classified_from_gpu_kind_or_model() {
-        assert_eq!(classify_hardware(&comp(Some("amd_rocm"), Some("gfx1151"))), "strix-halo");
-        assert_eq!(classify_hardware(&comp(Some("amd_rocm"), None)), "strix-halo");
-        assert_eq!(classify_hardware(&comp(Some("amd"), Some("Radeon 8060S"))), "strix-halo");
+        assert_eq!(
+            classify_hardware(&comp(Some("amd_rocm"), Some("gfx1151"))),
+            "strix-halo"
+        );
+        assert_eq!(
+            classify_hardware(&comp(Some("amd_rocm"), None)),
+            "strix-halo"
+        );
+        assert_eq!(
+            classify_hardware(&comp(Some("amd"), Some("Radeon 8060S"))),
+            "strix-halo"
+        );
         assert_eq!(classify_hardware(&comp(None, None)), "generic");
-        assert_eq!(classify_hardware(&comp(Some("nvidia_cuda"), Some("RTX 4090"))), "generic");
+        assert_eq!(
+            classify_hardware(&comp(Some("nvidia_cuda"), Some("RTX 4090"))),
+            "generic"
+        );
     }
 
     #[test]

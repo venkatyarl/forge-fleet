@@ -583,8 +583,8 @@ fn walk(
             "impl_item" => {
                 // impl <Type> { ... } — type name becomes the symbol; methods
                 // hang off it via contains; methods' qualified name uses the type.
-                let ty = child_field_text(&child, "type", bytes)
-                    .unwrap_or_else(|| "impl".to_string());
+                let ty =
+                    child_field_text(&child, "type", bytes).unwrap_or_else(|| "impl".to_string());
                 let qn = join(mod_path, &ty);
                 let idx = fp.symbols.len();
                 fp.symbols.push(Symbol {
@@ -866,9 +866,23 @@ fn resolve_call_inner(
 fn looks_external(head: &str) -> bool {
     matches!(
         head,
-        "std" | "core" | "alloc" | "tokio" | "serde" | "serde_json" | "anyhow"
-            | "sqlx" | "uuid" | "chrono" | "tracing" | "reqwest" | "futures"
-            | "regex" | "redis" | "tree_sitter" | "tree_sitter_rust"
+        "std"
+            | "core"
+            | "alloc"
+            | "tokio"
+            | "serde"
+            | "serde_json"
+            | "anyhow"
+            | "sqlx"
+            | "uuid"
+            | "chrono"
+            | "tracing"
+            | "reqwest"
+            | "futures"
+            | "regex"
+            | "redis"
+            | "tree_sitter"
+            | "tree_sitter_rust"
     )
 }
 
@@ -999,7 +1013,11 @@ mod tests {
     fn bare_call_resolves_to_caller_module() {
         // model_runtime.rs:712 `load_model(` inside fn resume_local_models.
         let fp = fp_with("ff_agent::model_runtime", "ff_agent", &[]);
-        let got = resolve_call("load_model", "ff_agent::model_runtime::resume_local_models", &fp);
+        let got = resolve_call(
+            "load_model",
+            "ff_agent::model_runtime::resume_local_models",
+            &fp,
+        );
         assert_eq!(got, "ff_agent::model_runtime::load_model");
     }
 
