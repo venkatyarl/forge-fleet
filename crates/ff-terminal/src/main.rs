@@ -5372,7 +5372,11 @@ async fn run_headless(
                     );
                 }
                 AgentEvent::TokenWarning { usage_pct, .. } => {
-                    let pct = (*usage_pct * 100.0) as u32;
+                    // usage_pct is ALREADY a percentage (agent_loop sets it to
+                    // pct * 100). The extra * 100 here double-counted it, e.g.
+                    // 85.5% rendered as "8550% full". Other displays (app.rs,
+                    // supervisor.rs) use it directly.
+                    let pct = *usage_pct as u32;
                     eprintln!("{YELLOW}  ⚠ context {pct}% full\x1b[0m");
                 }
                 AgentEvent::Error { message, .. } => {
