@@ -444,6 +444,30 @@ async fn run_index(
         }
     }
 
+    // STEP 2 of multi-domain Cortex: also index structured/financial DATA
+    // (.csv/.tsv) for this root. Best-effort — never fails the whole index.
+    match ff_brain::data_index::index_data(pool, slug, root).await {
+        Ok(data_stats) => {
+            total_files += data_stats.files;
+            total_symbols += data_stats.columns;
+            total_edges += data_stats.edges;
+            if verbose {
+                println!(
+                    "  {:<11} files={} columns={} rows={}",
+                    "data", data_stats.files, data_stats.columns, data_stats.rows
+                );
+            } else {
+                println!(
+                    "  data: {} files, {} columns",
+                    data_stats.files, data_stats.columns
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!("  data: skipped ({e})");
+        }
+    }
+
     if verbose {
         println!(
             "{CYAN}\u{2713} corpus '{}' indexed: {} file(s), {} node(s), {} edge(s){RESET}",
