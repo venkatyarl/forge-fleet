@@ -1806,6 +1806,7 @@ dependencies = [
  "ff-pulse",
  "ff-voice",
  "futures",
+ "notify",
  "ratatui",
  "regex",
  "reqwest",
