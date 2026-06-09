@@ -809,6 +809,7 @@ async fn schema_version(pool: &sqlx::PgPool) -> String {
 ///   3. Strip any `<think>…</think>` and return the assistant content.
 /// No warm endpoint → an in-character "no model to think with" line.
 async fn dispatch_to_fleet(client: &reqwest::Client, pool: &sqlx::PgPool, query: &str) -> String {
+    let started = std::time::Instant::now();
     // `kind = None` → any warm tool-capable model (this is a chat question, not
     // a coding dispatch). 16384 matches fleet_offload's OFFLOAD_DEFAULT_MIN_CTX.
     let candidate = match ff_db::pg_pick_offload_endpoint(pool, 16384, None, &[]).await {
@@ -878,11 +879,49 @@ async fn dispatch_to_fleet(client: &reqwest::Client, pool: &sqlx::PgPool, query:
 
     let raw = extract_completion_text(&payload).unwrap_or_default();
     let text = strip_think_block(&raw);
-    if text.is_empty() {
+    let answer = if text.is_empty() {
         "I'm not certain how to answer that, sir.".to_string()
     } else {
         text
+    };
+
+    // Interaction-log capture: channel="gateway-jarvis". Spawned so the DB
+    // write never delays the HTTP response. Mirrors the fleet_run hook.
+    {
+        let pool = pool.clone();
+        let query_owned = query.to_string();
+        let answer_owned = answer.clone();
+        let engine_owned = model.clone();
+        let latency_ms = started.elapsed().as_millis().min(i32::MAX as u128) as i32;
+        let tokens_in = payload
+            .get("usage")
+            .and_then(|u| u.get("prompt_tokens"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0) as i32;
+        let tokens_out = payload
+            .get("usage")
+            .and_then(|u| u.get("completion_tokens"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0) as i32;
+        tokio::spawn(async move {
+            let rec = ff_db::InteractionRecord {
+                channel: "gateway-jarvis".to_string(),
+                request_text: query_owned,
+                engine: Some(engine_owned),
+                response_text: answer_owned,
+                tokens_in,
+                tokens_out,
+                latency_ms: Some(latency_ms),
+                outcome: "ok".to_string(),
+                ..Default::default()
+            };
+            if let Err(e) = ff_db::pg_record_interaction(&pool, &rec).await {
+                tracing::debug!("jarvis dispatch interaction capture failed: {e}");
+            }
+        });
     }
+
+    answer
 }
 
 /// Pull the assistant text out of an OpenAI-compatible chat-completion payload.
