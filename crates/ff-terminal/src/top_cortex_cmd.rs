@@ -3,7 +3,7 @@
 //! same graph logic (ff_brain::corpus + ff_brain::cortex) and the existing
 //! brain cortex handler, so behavior is identical to the long form.
 
-use crate::{CYAN, RESET};
+use crate::{CYAN, GREEN, RESET, YELLOW};
 use anyhow::{Result, anyhow};
 use clap::Subcommand;
 use ff_brain::{corpus, cortex};
@@ -66,6 +66,18 @@ pub enum TopCortexCommand {
         max_depth: usize,
         #[arg(long, default_value = "table")]
         format: String,
+    },
+    /// Semantic-embed the Cortex graph: fill the `embedding` column on every
+    /// code/doc/data/image node via the fleet's bge-m3 endpoint so semantic
+    /// search (`ff brain search`) works over Cortex, then (unless --no-community)
+    /// run community detection. Resumable — only NULL nodes are embedded.
+    Embed {
+        /// Cap nodes processed this run (default: all unembedded).
+        #[arg(long)]
+        max: Option<usize>,
+        /// Skip the community-detection pass after embedding.
+        #[arg(long)]
+        no_community: bool,
     },
     /// Manage the git post-commit hook that re-indexes after every commit.
     Hook {
@@ -210,6 +222,9 @@ pub async fn handle_top_cortex(args: TopCortexArgs) -> Result<()> {
         TopCortexCommand::Index { path, slug, lang } => {
             let (root, slug) = resolve_root_slug(path, slug)?;
             run_index(&pool, &root, &slug, lang, true).await?;
+        }
+        TopCortexCommand::Embed { max, no_community } => {
+            run_embed(&pool, max, no_community).await?;
         }
         TopCortexCommand::Hook { action } => {
             handle_hook(action)?;
@@ -504,6 +519,54 @@ async fn run_index(
             "{CYAN}\u{2713} re-indexed '{}': {} file(s), {} node(s), {} edge(s){RESET}",
             slug, total_files, total_symbols, total_edges
         );
+    }
+    Ok(())
+}
+
+// ----------------------------------------------------------------------------
+// semantic embedding + community detection
+// ----------------------------------------------------------------------------
+
+/// `ff cortex embed`: fill the `embedding` column on every Cortex node via the
+/// fleet's bge-m3 endpoint, then (unless suppressed) run community detection.
+async fn run_embed(pool: &sqlx::PgPool, max: Option<usize>, no_community: bool) -> Result<()> {
+    println!("{CYAN}▶ Embedding Cortex nodes (code/doc/data/image)...{RESET}");
+    let stats = ff_brain::embed_cortex_nodes(pool, max, |embedded, remaining| {
+        // Live counter overwritten in place; remaining < 0 means the count
+        // query failed (non-fatal) — show a dash rather than a bogus number.
+        let rem = if remaining < 0 {
+            "?".to_string()
+        } else {
+            remaining.to_string()
+        };
+        print!("\r  embedded {embedded}  ·  remaining {rem}   ");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+    })
+    .await
+    .map_err(|e| anyhow!("embed Cortex nodes: {e}"))?;
+
+    println!(
+        "\r{GREEN}✓{RESET} embedded {} node(s){}; {} still unembedded   ",
+        stats.embedded,
+        if stats.failed > 0 {
+            format!(" ({} failed)", stats.failed)
+        } else {
+            String::new()
+        },
+        stats.remaining.max(0),
+    );
+
+    if no_community {
+        return Ok(());
+    }
+
+    println!("{CYAN}▶ Detecting communities over the graph...{RESET}");
+    match ff_brain::detect_communities(pool).await {
+        Ok(summary) => println!(
+            "{GREEN}✓{RESET} {} communities (largest: {} nodes)",
+            summary.communities_found, summary.largest_community
+        ),
+        Err(e) => println!("{YELLOW}⚠ community detection failed: {e}{RESET}"),
     }
     Ok(())
 }

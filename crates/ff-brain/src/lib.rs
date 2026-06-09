@@ -13,6 +13,7 @@ pub mod communities;
 pub mod context;
 pub mod corpus;
 pub mod cortex;
+pub mod cortex_embed;
 pub mod data_index;
 pub mod distillation;
 pub mod doc_index;
@@ -31,7 +32,10 @@ pub use chat::{
 pub use communities::{CommunitySummary, detect_communities};
 pub use context::{BrainMessage, ContextBundle, ResolvedNode, select_context};
 pub use cortex::{CortexStats, SymbolRef, callees, callers, impact, index};
-pub use embeddings::{EmbeddingClient, generate_embedding, generate_embedding_with_pool};
+pub use cortex_embed::{EmbedStats, embed_cortex_nodes};
+pub use embeddings::{
+    EmbeddingClient, fleet_embedding_client, generate_embedding, generate_embedding_with_pool,
+};
 pub use facts::{contains_signal_phrases, extract_candidates};
 pub use procedural_memory::{consolidate, spawn_consolidation_loop};
 pub use stack_backlog::{BacklogItem, BrainStateClient, StackItem};

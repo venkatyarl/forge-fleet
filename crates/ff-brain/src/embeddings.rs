@@ -55,6 +55,24 @@ async fn pick_fleet_embedding_endpoint(pool: &PgPool) -> Option<(String, String)
     Some((endpoint, catalog_id))
 }
 
+/// Discover a live fleet embedding endpoint and return a ready
+/// [`EmbeddingClient`]. Honours the same `FF_EMBEDDING_ENDPOINT` /
+/// `FF_EMBEDDING_MODEL` override as the generators, then falls back to a
+/// healthy fleet deployment. Returns `None` when no real endpoint exists —
+/// callers that must avoid the hash stub (e.g. Cortex bulk embedding, which
+/// would otherwise persist garbage vectors) abort on `None` rather than store
+/// noise.
+pub async fn fleet_embedding_client(pool: &PgPool) -> Option<EmbeddingClient> {
+    if let (Ok(endpoint), Ok(model)) = (
+        std::env::var("FF_EMBEDDING_ENDPOINT"),
+        std::env::var("FF_EMBEDDING_MODEL"),
+    ) {
+        return Some(EmbeddingClient::new(&endpoint, &model));
+    }
+    let (endpoint, model) = pick_fleet_embedding_endpoint(pool).await?;
+    Some(EmbeddingClient::new(&endpoint, &model))
+}
+
 /// Generate an embedding for `text`, using only env vars / hash fallback.
 ///
 /// This is the no-pool variant kept for backwards compatibility. Callers
