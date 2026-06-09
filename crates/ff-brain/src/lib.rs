@@ -14,6 +14,7 @@ pub mod context;
 pub mod corpus;
 pub mod cortex;
 pub mod distillation;
+pub mod doc_index;
 pub mod embeddings;
 pub mod facts;
 pub mod procedural_memory;
