@@ -239,6 +239,18 @@ impl LeaderTick {
                                         );
                                     }
 
+                                    // V121+: feed interaction-log errors into the
+                                    // self-heal queue. ~30 min cadence (marker-file
+                                    // gated) so a recurring runtime error becomes a
+                                    // dispatched fix instead of dying in the log.
+                                    if let Err(err) = self.scan_interaction_errors().await {
+                                        tracing::warn!(
+                                            node = %self.my_name,
+                                            error = %err,
+                                            "scan_interaction_errors failed"
+                                        );
+                                    }
+
                                     // Keep the open-design SKILL.md catalog in
                                     // step with the auto-upgrade pipeline's git
                                     // pulls. No-op unless the leader's checkout
@@ -735,6 +747,104 @@ impl LeaderTick {
                 }
             }
         }
+
+        Ok(())
+    }
+
+    /// V121+: self-heal-on-error tick.
+    ///
+    /// Roughly every 30 minutes (gated by the marker file
+    /// `~/.forgefleet/interaction-errors.last`), aggregate recent error rows
+    /// from `ff_interactions` by `error_signature` and enqueue any *novel*
+    /// signature into `fleet_self_heal_queue` (status `detected`). The next
+    /// `self_heal_scan` pass then dispatches the writer task to the
+    /// claude-code/kimi/codex/local self-heal writers.
+    ///
+    /// Single-flight is enforced two ways: the marker file caps the SELECT to
+    /// ~once per 30 min per leader, and `ON CONFLICT (bug_signature) DO NOTHING`
+    /// means a signature already in the queue (in any status) is never reset.
+    /// We classify interaction errors as tier `T2` — runtime/interaction-layer
+    /// failures, distinct from the `T0/T1` build/test bugs that
+    /// `fleet_bug_reports` feeds.
+    pub async fn scan_interaction_errors(&self) -> Result<(), LeaderError> {
+        // ── Marker-file time gate (~30 min) ─────────────────────────────────
+        let home = std::env::var("HOME").unwrap_or_default();
+        let marker = format!("{home}/.forgefleet/interaction-errors.last");
+        const INTERVAL_SECS: u64 = 30 * 60;
+        if let Ok(meta) = std::fs::metadata(&marker) {
+            if let Ok(modified) = meta.modified() {
+                if let Ok(elapsed) = modified.elapsed() {
+                    if elapsed.as_secs() < INTERVAL_SECS {
+                        return Ok(()); // ran recently; skip this tick
+                    }
+                }
+            }
+        }
+
+        // ── Aggregate recent interaction errors by signature ────────────────
+        // 35-minute lookback slightly overlaps the 30-min cadence so we never
+        // drop an error that landed between the gate and the query.
+        let rows = sqlx::query(
+            "SELECT error_signature, MAX(error_text) AS error_text, COUNT(*) AS n \
+             FROM ff_interactions \
+             WHERE outcome = 'error' \
+               AND ts > NOW() - INTERVAL '35 minutes' \
+               AND error_signature IS NOT NULL \
+             GROUP BY error_signature",
+        )
+        .fetch_all(&self.pg)
+        .await?;
+
+        let mut novel = 0u32;
+        for row in &rows {
+            let sig: String = row.try_get("error_signature")?;
+            let report_count: i64 = row.try_get("n").unwrap_or(1);
+            let error_text: Option<String> = row.try_get("error_text").ok().flatten();
+
+            // Insert only if this signature is not already tracked. DO NOTHING
+            // leaves any in-flight/fixed row untouched (no status reset).
+            let inserted = sqlx::query(
+                "INSERT INTO fleet_self_heal_queue \
+                    (bug_signature, tier, status, report_count, created_at) \
+                 VALUES ($1, 'T2', 'detected', $2, NOW()) \
+                 ON CONFLICT (bug_signature) DO NOTHING",
+            )
+            .bind(&sig)
+            .bind(report_count as i32)
+            .execute(&self.pg)
+            .await?;
+
+            if inserted.rows_affected() > 0 {
+                novel += 1;
+                tracing::info!(
+                    node = %self.my_name,
+                    error_signature = %sig,
+                    report_count,
+                    error_text = error_text.as_deref().unwrap_or(""),
+                    "scan_interaction_errors: enqueued novel error signature for self-heal"
+                );
+            } else {
+                tracing::debug!(
+                    error_signature = %sig,
+                    "scan_interaction_errors: signature already in self-heal queue; skipping"
+                );
+            }
+        }
+
+        if novel > 0 {
+            tracing::info!(
+                node = %self.my_name,
+                novel,
+                scanned = rows.len(),
+                "scan_interaction_errors: queued novel interaction errors"
+            );
+        }
+
+        // ── Bump the marker so we don't re-scan for ~30 min ─────────────────
+        if let Some(parent) = std::path::Path::new(&marker).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&marker, Utc::now().to_rfc3339());
 
         Ok(())
     }

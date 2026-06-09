@@ -49,6 +49,8 @@ pub use queries::{
     FleetModelRow,
     FleetNodeRow,
     FleetSecretRow,
+    // Interaction log (V121 ff_interactions)
+    InteractionRecord,
     MeshStatusRow,
     ModelCatalogRow,
     ModelDeploymentRow,
@@ -166,6 +168,8 @@ pub use queries::{
     pg_reap_expired_leases,
     pg_reap_stale_reservations,
     pg_reap_stale_running,
+    // Interaction log (V121 ff_interactions)
+    pg_record_interaction,
     pg_reserve_host,
     pg_resolve_channel_user,
     pg_retired_catalog_ids,

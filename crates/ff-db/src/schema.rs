@@ -8388,3 +8388,41 @@ print("OK rocm wheel %s" % v)
 ) AS v(check_key, check_kind, title, verify_cmd, severity)
 ON CONFLICT (profile_id, check_key) DO NOTHING;
 "#;
+
+// V121 — ff_interactions: the unified interaction log. One row per ff "turn"
+// captured at the response boundary (gateway / session_runner / CLI agent loop
+// / fleet_run). Serves three jobs from one table: (1) SLM training corpus
+// (request_text → response_text with the route+steps in between), (2) the live
+// Agent Session Console the UI is missing, (3) routing telemetry for the
+// cost/capability router. The error_signature + partial index drive the
+// 30-min self-heal tick (novel errors → fleet_self_heal_queue dispatch).
+// error_signature is COLLATE "C" — it's a hash ID used for dedup, so byte
+// ordering must be locale-independent (see [[db-collation-prevention]]).
+pub const SCHEMA_V121_INTERACTION_LOG: &str = r#"
+CREATE TABLE IF NOT EXISTS ff_interactions (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id      UUID,
+    ts              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    channel         TEXT NOT NULL DEFAULT 'unknown',  -- telegram|web|cli|voice|jarvis|mcp
+    user_id         UUID,
+    request_text    TEXT NOT NULL DEFAULT '',          -- SLM input
+    request_meta    JSONB NOT NULL DEFAULT '{}'::jsonb, -- modality(text|voice|image|video), attachments, source
+    route_decision  JSONB NOT NULL DEFAULT '{}'::jsonb, -- engine chosen + why (tier, cost est, local-vs-cloud)
+    engine          TEXT,                              -- claude-code|codex|kimi|grok|local:<model>
+    steps           JSONB NOT NULL DEFAULT '[]'::jsonb, -- [{type:llm|tool, name, args_summary, result_summary, ms, ok}]
+    response_text   TEXT NOT NULL DEFAULT '',          -- SLM target
+    tokens_in       INTEGER NOT NULL DEFAULT 0,
+    tokens_out      INTEGER NOT NULL DEFAULT 0,
+    cost_usd        DOUBLE PRECISION NOT NULL DEFAULT 0,
+    latency_ms      INTEGER,
+    outcome         TEXT NOT NULL DEFAULT 'ok',         -- ok|error|partial
+    error_text      TEXT,
+    error_signature TEXT COLLATE "C",                  -- stable hash for self-heal dedup
+    ff_build_sha    TEXT,
+    model_versions  JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+CREATE INDEX IF NOT EXISTS idx_ff_interactions_ts        ON ff_interactions (ts DESC);
+CREATE INDEX IF NOT EXISTS idx_ff_interactions_session   ON ff_interactions (session_id, ts);
+CREATE INDEX IF NOT EXISTS idx_ff_interactions_error     ON ff_interactions (error_signature) WHERE outcome = 'error';
+CREATE INDEX IF NOT EXISTS idx_ff_interactions_engine    ON ff_interactions (engine, outcome);
+"#;

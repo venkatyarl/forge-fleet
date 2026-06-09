@@ -6851,3 +6851,89 @@ pub async fn pg_list_reserved_hosts(pool: &PgPool) -> Result<Vec<ArbiterReserved
         })
         .collect())
 }
+
+// ─── Interaction Log (V121 ff_interactions) ─────────────────────────────────
+
+/// One row of the unified interaction log — a single ff "turn" across any
+/// channel. Maps 1:1 to the `ff_interactions` table (V121). Columns with DB
+/// defaults (`id`, `ts`) are not part of the record.
+#[derive(Debug, Clone)]
+pub struct InteractionRecord {
+    pub session_id: Option<uuid::Uuid>,
+    pub channel: String,
+    pub user_id: Option<uuid::Uuid>,
+    pub request_text: String,
+    pub request_meta: serde_json::Value,
+    pub route_decision: serde_json::Value,
+    pub engine: Option<String>,
+    pub steps: serde_json::Value,
+    pub response_text: String,
+    pub tokens_in: i32,
+    pub tokens_out: i32,
+    pub cost_usd: f64,
+    pub latency_ms: Option<i32>,
+    pub outcome: String,
+    pub error_text: Option<String>,
+    pub error_signature: Option<String>,
+    pub ff_build_sha: Option<String>,
+    pub model_versions: serde_json::Value,
+}
+
+impl Default for InteractionRecord {
+    fn default() -> Self {
+        Self {
+            session_id: None,
+            channel: "unknown".to_string(),
+            user_id: None,
+            request_text: String::new(),
+            request_meta: serde_json::json!({}),
+            route_decision: serde_json::json!({}),
+            engine: None,
+            steps: serde_json::json!([]),
+            response_text: String::new(),
+            tokens_in: 0,
+            tokens_out: 0,
+            cost_usd: 0.0,
+            latency_ms: None,
+            outcome: "ok".to_string(),
+            error_text: None,
+            error_signature: None,
+            ff_build_sha: None,
+            model_versions: serde_json::json!({}),
+        }
+    }
+}
+
+/// Insert one interaction-log row and return its generated UUID.
+pub async fn pg_record_interaction(pool: &PgPool, r: &InteractionRecord) -> Result<uuid::Uuid> {
+    let row = sqlx::query(
+        "INSERT INTO ff_interactions
+            (session_id, channel, user_id, request_text, request_meta,
+             route_decision, engine, steps, response_text, tokens_in,
+             tokens_out, cost_usd, latency_ms, outcome, error_text,
+             error_signature, ff_build_sha, model_versions)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+         RETURNING id",
+    )
+    .bind(r.session_id)
+    .bind(&r.channel)
+    .bind(r.user_id)
+    .bind(&r.request_text)
+    .bind(&r.request_meta)
+    .bind(&r.route_decision)
+    .bind(&r.engine)
+    .bind(&r.steps)
+    .bind(&r.response_text)
+    .bind(r.tokens_in)
+    .bind(r.tokens_out)
+    .bind(r.cost_usd)
+    .bind(r.latency_ms)
+    .bind(&r.outcome)
+    .bind(&r.error_text)
+    .bind(&r.error_signature)
+    .bind(&r.ff_build_sha)
+    .bind(&r.model_versions)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.get("id"))
+}
