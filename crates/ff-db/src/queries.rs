@@ -5577,6 +5577,42 @@ pub async fn pg_list_brain_vault_nodes_current(
     Ok(rows.iter().map(row_to_brain_vault_node).collect())
 }
 
+/// Count current (non-superseded) brain_vault_nodes. Unlike
+/// `pg_list_brain_vault_nodes_current` (which is capped at LIMIT 100 for display),
+/// this returns the true total so `ff brain stats` can report >100.
+pub async fn pg_count_brain_vault_nodes_current(
+    pool: &PgPool,
+    project: Option<&str>,
+) -> Result<i64> {
+    let count: i64 = if let Some(p) = project {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM brain_vault_nodes WHERE valid_until IS NULL AND project = $1",
+        )
+        .bind(p)
+        .fetch_one(pool)
+        .await?
+    } else {
+        sqlx::query_scalar("SELECT COUNT(*) FROM brain_vault_nodes WHERE valid_until IS NULL")
+            .fetch_one(pool)
+            .await?
+    };
+    Ok(count)
+}
+
+/// Count current Cortex code symbols (node_type LIKE 'code:%') for a corpus slug.
+/// `corpus::list_corpora` only counts `content:%` nodes, so this fills the gap for
+/// `ff cortex status` which needs the code-symbol total.
+pub async fn pg_count_corpus_code_symbols(pool: &PgPool, slug: &str) -> Result<i64> {
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM brain_vault_nodes
+         WHERE project = $1 AND valid_until IS NULL AND node_type LIKE 'code:%'",
+    )
+    .bind(slug)
+    .fetch_one(pool)
+    .await?;
+    Ok(count)
+}
+
 pub async fn pg_search_brain_vault_nodes(
     pool: &PgPool,
     query: &str,

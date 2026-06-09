@@ -47,9 +47,9 @@ pub async fn handle_brain(cmd: crate::BrainCommand) -> Result<()> {
             println!("  largest:     {} nodes", summary.largest_community);
         }
         crate::BrainCommand::Stats => {
-            let nodes = ff_db::pg_list_brain_vault_nodes_current(&pool, None)
+            let node_count = ff_db::pg_count_brain_vault_nodes_current(&pool, None)
                 .await
-                .map_err(|e| anyhow::anyhow!("list nodes: {e}"))?;
+                .map_err(|e| anyhow::anyhow!("count nodes: {e}"))?;
             let total_edges: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM brain_vault_edges")
                 .fetch_one(&pool)
                 .await
@@ -59,7 +59,7 @@ pub async fn handle_brain(cmd: crate::BrainCommand) -> Result<()> {
                 .await
                 .unwrap_or(0);
             println!("Vault graph stats:");
-            println!("  nodes (current): {}", nodes.len());
+            println!("  nodes (current): {node_count}");
             println!("  edges:           {total_edges}");
             println!("  communities:     {communities}");
         }

@@ -83,6 +83,8 @@ pub use queries::{
     pg_bump_vault_node_hits,
     pg_cancel_deferred,
     pg_claim_deferred,
+    pg_count_brain_vault_nodes_current,
+    pg_count_corpus_code_symbols,
     pg_create_brain_thread,
     pg_create_brain_user,
     pg_create_job,
