@@ -335,6 +335,7 @@ async fn respawn_dead_deployment(
             context_size: Some(ctx),
             parallel: Some(parallel),
             agent_profile: false,
+            mmproj_path: None, // auto-detect sibling mmproj on relaunch
         },
     )
     .await

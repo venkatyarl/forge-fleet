@@ -738,6 +738,7 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
             ctx,
             parallel,
             agent,
+            mmproj,
         } => {
             let opts = ff_agent::model_runtime::LoadOptions {
                 library_id: id.clone(),
@@ -745,6 +746,7 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                 context_size: ctx,
                 parallel,
                 agent_profile: agent,
+                mmproj_path: mmproj,
             };
             if agent {
                 println!(
@@ -856,6 +858,7 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                     context_size: ctx,
                     parallel: None,
                     agent_profile: agent,
+                    mmproj_path: None, // auto-detect sibling mmproj
                 },
             )
             .await
