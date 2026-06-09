@@ -20,6 +20,7 @@ reqwest.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 sha2.workspace = true
+base64 = "0.22"
 futures = "0.3"
 notify = "7"
 regex = "1"

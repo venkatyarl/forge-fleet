@@ -18,6 +18,7 @@ pub mod distillation;
 pub mod doc_index;
 pub mod embeddings;
 pub mod facts;
+pub mod image_index;
 pub mod procedural_memory;
 pub mod stack_backlog;
 pub mod vault;

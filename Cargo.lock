@@ -1327,6 +1327,7 @@ name = "ff-brain"
 version = "2026.4.7"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "chrono",
  "ff-agent",
  "ff-db",
