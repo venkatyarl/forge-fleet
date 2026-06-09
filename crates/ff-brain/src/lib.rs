@@ -13,6 +13,7 @@ pub mod communities;
 pub mod context;
 pub mod corpus;
 pub mod cortex;
+pub mod data_index;
 pub mod distillation;
 pub mod doc_index;
 pub mod embeddings;
