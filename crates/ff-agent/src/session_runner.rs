@@ -140,6 +140,7 @@ pub async fn tick(pool: &PgPool) -> Result<TickStats> {
         "SELECT s.id          AS step_id,
                 s.session_id  AS session_id,
                 s.role        AS role,
+                s.step_memory AS step_memory,
                 s.fleet_task_id AS fleet_task_id,
                 t.status      AS task_status,
                 t.result      AS task_result,
@@ -180,6 +181,51 @@ pub async fn tick(pool: &PgPool) -> Result<TickStats> {
         .execute(pool)
         .await
         .context("update step terminal")?;
+
+        // ── Interaction-log capture: channel="session" ──
+        // Records each completed/failed agent step as a request/response pair
+        // (prompt from step_memory, response from the fleet_task result). Best
+        // effort — a capture failure never aborts the reconcile tick.
+        {
+            let step_memory: Value = r.try_get("step_memory").unwrap_or(Value::Null);
+            let request_text = step_memory
+                .get("prompt")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let engine = step_memory
+                .get("model_override")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            // task_result may be a bare string or an object with a text-ish field.
+            let response_text = match &task_result {
+                Some(Value::String(s)) => s.clone(),
+                Some(v) => v
+                    .get("output")
+                    .or_else(|| v.get("text"))
+                    .or_else(|| v.get("response"))
+                    .or_else(|| v.get("final"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| v.to_string()),
+                None => String::new(),
+            };
+            let rec = ff_db::InteractionRecord {
+                session_id: Some(session_id),
+                channel: "session".to_string(),
+                request_text,
+                route_decision: serde_json::json!({ "role": role }),
+                engine,
+                response_text,
+                outcome: new_status.to_string(),
+                error_text: task_error.clone(),
+                ..Default::default()
+            };
+            if let Err(e) = ff_db::pg_record_interaction(pool, &rec).await {
+                debug!(step = %step_id, "session interaction capture failed: {e}");
+            }
+        }
+
         if new_status == "completed" {
             stats.steps_completed += 1;
 
