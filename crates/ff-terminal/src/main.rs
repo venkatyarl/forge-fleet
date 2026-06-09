@@ -5275,6 +5275,27 @@ async fn inject_agent_hints(existing: Option<String>) -> Option<String> {
     ff_agent::agent_hint::prepend_to_system_prompt(&combined, existing)
 }
 
+/// Best-effort Postgres pool for fire-and-forget interaction capture from the
+/// CLI agent loop. Reads `~/.forgefleet/fleet.toml` (same pattern as the model
+/// dashboard); returns None on any failure so capture is silently skipped.
+async fn cli_interaction_pool() -> Option<sqlx::PgPool> {
+    let home = dirs::home_dir()?;
+    let toml_str = tokio::fs::read_to_string(home.join(".forgefleet/fleet.toml"))
+        .await
+        .ok()?;
+    let config: ff_core::config::FleetConfig = toml::from_str(&toml_str).ok()?;
+    let db_url = config.database.url.trim().to_string();
+    if db_url.is_empty() {
+        return None;
+    }
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(std::time::Duration::from_secs(3))
+        .connect(&db_url)
+        .await
+        .ok()
+}
+
 async fn run_headless(
     prompt: &str,
     config: AgentSessionConfig,
@@ -5294,6 +5315,10 @@ async fn run_headless(
         eprintln!();
     }
 
+    // Capture identity before `config` is moved into the session — used by the
+    // fire-and-forget interaction capture (channel="cli") at the end.
+    let capture_model = config.model.clone();
+
     let mut session = AgentSession::new(config);
     if oneshot {
         // Disable tool registration — the LLM will emit a plain text response
@@ -5304,6 +5329,8 @@ async fn run_headless(
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<AgentEvent>(256);
     let prompt = prompt.to_string();
 
+    let capture_prompt = prompt.clone();
+    let capture_started = std::time::Instant::now();
     let handle = tokio::spawn(async move { session.run(&prompt, Some(event_tx)).await });
 
     let mut events = Vec::new();
@@ -5388,6 +5415,39 @@ async fn run_headless(
     }
 
     let outcome = handle.await?;
+
+    // Fire-and-forget interaction capture (Track A). Never blocks the response;
+    // skips silently if no pool is available. channel="cli".
+    {
+        let (response_text, capture_outcome) = match &outcome {
+            ff_agent::agent_loop::AgentOutcome::EndTurn { final_message } => {
+                (final_message.clone(), "ok")
+            }
+            ff_agent::agent_loop::AgentOutcome::MaxTurns { partial_message } => {
+                (partial_message.clone(), "error")
+            }
+            ff_agent::agent_loop::AgentOutcome::Error(e) => (e.clone(), "error"),
+            ff_agent::agent_loop::AgentOutcome::Cancelled => (String::new(), "error"),
+        };
+        let latency_ms = capture_started.elapsed().as_millis().min(i32::MAX as u128) as i32;
+        let request_text = capture_prompt.clone();
+        let engine = capture_model.clone();
+        tokio::spawn(async move {
+            if let Some(pool) = cli_interaction_pool().await {
+                let rec = ff_db::InteractionRecord {
+                    channel: "cli".to_string(),
+                    request_text,
+                    engine: Some(engine),
+                    response_text,
+                    latency_ms: Some(latency_ms),
+                    outcome: capture_outcome.to_string(),
+                    ..Default::default()
+                };
+                let _ = ff_db::pg_record_interaction(&pool, &rec).await;
+            }
+        });
+    }
+
     if is_json {
         let result = serde_json::json!({ "outcome": match &outcome {
             ff_agent::agent_loop::AgentOutcome::EndTurn { final_message } => serde_json::json!({"status":"done","message":final_message}),

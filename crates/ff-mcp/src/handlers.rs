@@ -810,6 +810,45 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
 
                     let text = extract_completion_text(&payload);
 
+                    // Fire-and-forget interaction capture (Track A). Never
+                    // blocks the response; skips silently if no pool is
+                    // available. channel="mcp".
+                    {
+                        let prompt_owned = prompt.to_string();
+                        let response_owned = text.clone().unwrap_or_default();
+                        let engine_owned = backend.model.clone();
+                        let latency_ms = latency.as_millis().min(i32::MAX as u128) as i32;
+                        let tokens_in = payload
+                            .get("usage")
+                            .and_then(|u| u.get("prompt_tokens"))
+                            .and_then(|v| v.as_i64())
+                            .unwrap_or(0) as i32;
+                        let tokens_out = payload
+                            .get("usage")
+                            .and_then(|u| u.get("completion_tokens"))
+                            .and_then(|v| v.as_i64())
+                            .unwrap_or(0) as i32;
+                        let cfg_clone = config.clone();
+                        tokio::spawn(async move {
+                            if let Ok(pool) = get_pg_pool(&cfg_clone).await {
+                                let rec = ff_db::InteractionRecord {
+                                    channel: "mcp".to_string(),
+                                    request_text: prompt_owned,
+                                    engine: Some(engine_owned),
+                                    response_text: response_owned,
+                                    tokens_in,
+                                    tokens_out,
+                                    latency_ms: Some(latency_ms),
+                                    outcome: "ok".to_string(),
+                                    ..Default::default()
+                                };
+                                if let Err(e) = ff_db::pg_record_interaction(&pool, &rec).await {
+                                    tracing::debug!("fleet_run interaction capture failed: {e}");
+                                }
+                            }
+                        });
+                    }
+
                     return Ok(json!({
                         "strategy": decision.strategy,
                         "task_profile": {
