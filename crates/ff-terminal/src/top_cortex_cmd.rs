@@ -409,6 +409,31 @@ async fn run_index(
         total_symbols += stats.symbols;
         total_edges += stats.contains + stats.imports + stats.calls_resolved;
     }
+
+    // STEP 1 of multi-domain Cortex: also index DOCUMENTS (.md/.txt/...) for this
+    // root. Best-effort — a doc-index error must never fail the whole index.
+    match ff_brain::doc_index::index_docs(pool, slug, root).await {
+        Ok(doc_stats) => {
+            total_files += doc_stats.files;
+            total_symbols += doc_stats.sections;
+            total_edges += doc_stats.edges;
+            if verbose {
+                println!(
+                    "  {:<11} files={} sections={}",
+                    "docs", doc_stats.files, doc_stats.sections
+                );
+            } else {
+                println!(
+                    "  docs: {} files, {} sections",
+                    doc_stats.files, doc_stats.sections
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!("  docs: skipped ({e})");
+        }
+    }
+
     if verbose {
         println!(
             "{CYAN}\u{2713} corpus '{}' indexed: {} file(s), {} node(s), {} edge(s){RESET}",
