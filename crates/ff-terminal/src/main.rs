@@ -80,6 +80,7 @@ mod swarm_cmd;
 mod task_cmd;
 mod tasks_cmd;
 mod tools_cmd;
+mod top_cortex_cmd;
 mod train_cmd;
 mod utils;
 mod versions_cmd;
@@ -474,6 +475,12 @@ enum Command {
         #[command(subcommand)]
         command: BrainCommand,
     },
+    /// Cortex code graph — one-shot index + query for the current repo.
+    ///
+    /// Ergonomic top-level wrapper around `ff brain corpus add` + `ff brain
+    /// cortex index`: derives the corpus slug from the directory, auto-detects
+    /// the language(s), and indexes in one shot. `ff brain cortex` still works.
+    Cortex(top_cortex_cmd::TopCortexArgs),
     /// OpenClaw gateway/node visibility across the fleet.
     Openclaw {
         #[command(subcommand)]
@@ -3055,6 +3062,7 @@ async fn main() -> Result<()> {
         Some(Command::Swarm { command }) => swarm_cmd::handle_swarm(command).await,
         Some(Command::Onboard { command }) => onboard_cmd::handle_onboard(command).await,
         Some(Command::VirtualBrain { command }) => brain_cmd::handle_brain(command).await,
+        Some(Command::Cortex(args)) => top_cortex_cmd::handle_top_cortex(args).await,
         Some(Command::Openclaw { command }) => openclaw_cmd::handle_openclaw(command).await,
         Some(Command::Pm { command }) => pm_cmd::handle_pm(command).await,
         Some(Command::Agent { command }) => agent_cmd::handle_agent(command).await,
