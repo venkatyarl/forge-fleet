@@ -2282,6 +2282,11 @@ pub enum ModelCommand {
         /// pass --parallel N instead to opt out for throughput.
         #[arg(long, default_value_t = false)]
         agent: bool,
+        /// Path to a multimodal projector (`mmproj*.gguf`) for vision models
+        /// (llama.cpp `--mmproj`). When omitted, a sibling `mmproj*.gguf` next to
+        /// the model file is auto-detected — pass this only to override.
+        #[arg(long)]
+        mmproj: Option<String>,
     },
     /// Enqueue downloads of multiple catalog ids onto a node via the deferred queue.
     DownloadBatch {

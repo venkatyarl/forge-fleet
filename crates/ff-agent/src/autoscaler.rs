@@ -552,6 +552,7 @@ async fn do_load(
                 context_size: None,
                 parallel: None,
                 agent_profile: true, // agent-capable serving profile.
+                mmproj_path: None,   // auto-detect sibling mmproj
             },
         )
         .await

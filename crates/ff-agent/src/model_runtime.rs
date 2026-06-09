@@ -31,6 +31,11 @@ pub struct LoadOptions {
     /// tool-schema system prompt is sent to a `--parallel >= 4` endpoint with
     /// only 4-8K per slot. Additive: leave `false` for the existing behaviour.
     pub agent_profile: bool,
+    /// Explicit path to a multimodal projector (`mmproj*.gguf`) for vision
+    /// models. When `None`, [`load_model`] auto-detects a sibling `mmproj*.gguf`
+    /// next to the model file (llama.cpp `--mmproj`). Without a projector,
+    /// llama-server rejects image inputs ("image input is not supported").
+    pub mmproj_path: Option<String>,
 }
 
 /// Minimum per-slot context window for the agent-capable serving profile —
@@ -251,7 +256,7 @@ pub async fn load_model(pool: &sqlx::PgPool, opts: LoadOptions) -> Result<LoadRe
                 .map_err(|e| format!("resolve gguf for {}: {e}", lib.file_path))?;
             let mut args = vec![
                 "--model".into(),
-                model_path,
+                model_path.clone(),
                 "--host".into(),
                 "0.0.0.0".into(),
                 "--port".into(),
@@ -273,6 +278,20 @@ pub async fn load_model(pool: &sqlx::PgPool, opts: LoadOptions) -> Result<LoadRe
                 // failed anyway.
                 "--mlock".into(),
             ];
+            // Vision projector: explicit opts.mmproj_path wins; otherwise
+            // auto-detect a sibling `mmproj*.gguf` next to the model file. With
+            // it, llama-server accepts image inputs on /v1/chat/completions;
+            // without it, multimodal requests 500 ("image input is not
+            // supported"). Harmless for text-only models (none present → skip).
+            if let Some(mmproj) = opts
+                .mmproj_path
+                .clone()
+                .or_else(|| find_sibling_mmproj(&model_path))
+            {
+                tracing::info!(model = %lib.catalog_id, %mmproj, "vision projector enabled (--mmproj)");
+                args.push("--mmproj".into());
+                args.push(mmproj);
+            }
             match mode {
                 ServingMode::Chat => {
                     args.push("--parallel".into());
@@ -775,6 +794,7 @@ pub async fn resume_local_models(pool: &sqlx::PgPool) -> Result<usize, String> {
                 // which already reproduces an agent layout (1 slot, ctx >= 32K)
                 // if that's how it was loaded — no need to re-derive the profile.
                 agent_profile: false,
+                mmproj_path: None, // auto-detect sibling mmproj on restore
             },
         )
         .await
@@ -955,6 +975,32 @@ fn resolve_gguf_for_llamacpp(path: &str) -> std::io::Result<String> {
             format!("no .gguf files in {path}"),
         )),
     }
+}
+
+/// Look for a multimodal projector (`mmproj*.gguf`) alongside a resolved model
+/// file. llama.cpp ships the vision projector as a sibling GGUF (e.g.
+/// `mmproj-Qwen3VL-30B-A3B-Instruct-F16.gguf` next to the Q4 model). Matching is
+/// case-insensitive on the `mmproj` prefix. When more than one is present (F16
+/// and Q8 quants both ship), prefer the larger (higher-fidelity F16). Returns
+/// `None` for text-only models — the directory simply has no mmproj sibling.
+fn find_sibling_mmproj(model_path: &str) -> Option<String> {
+    let dir = PathBuf::from(model_path).parent()?.to_path_buf();
+    let mut best: Option<(u64, PathBuf)> = None;
+    for entry in std::fs::read_dir(&dir).ok()?.flatten() {
+        let ep = entry.path();
+        let Some(name) = ep.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let lower = name.to_ascii_lowercase();
+        if !(lower.starts_with("mmproj") && lower.ends_with(".gguf")) {
+            continue;
+        }
+        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        if best.as_ref().is_none_or(|(s, _)| size > *s) {
+            best = Some((size, ep));
+        }
+    }
+    best.map(|(_, ep)| ep.to_string_lossy().to_string())
 }
 
 fn llama_server_binary() -> String {
