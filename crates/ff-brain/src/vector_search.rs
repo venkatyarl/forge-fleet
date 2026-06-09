@@ -17,7 +17,7 @@ pub struct VaultNode {
 }
 
 /// Format a Vec<f32> as a pgvector literal string.
-fn embedding_to_pgvector(vec: &[f32]) -> String {
+pub fn embedding_to_pgvector(vec: &[f32]) -> String {
     let parts: Vec<String> = vec.iter().map(|f| f.to_string()).collect();
     format!("[{}]", parts.join(","))
 }
