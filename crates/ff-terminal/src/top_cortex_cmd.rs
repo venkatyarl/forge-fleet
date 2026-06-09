@@ -235,13 +235,23 @@ pub async fn handle_top_cortex(args: TopCortexArgs) -> Result<()> {
                 .filter(|r| target.as_deref().map(|t| t == r.slug).unwrap_or(true))
                 .collect();
 
+            // list_corpora's `content` count only covers `content:%` nodes and
+            // excludes every `code:%` symbol Cortex inserts, so query those
+            // separately per corpus for an accurate code-symbol total.
+            let mut code_symbols: Vec<i64> = Vec::with_capacity(filtered.len());
+            for r in &filtered {
+                code_symbols.push(ff_db::pg_count_corpus_code_symbols(&pool, &r.slug).await?);
+            }
+
             if format == "json" {
                 let v: Vec<_> = filtered
                     .iter()
-                    .map(|r| {
+                    .zip(code_symbols.iter())
+                    .map(|(r, code)| {
                         serde_json::json!({
                             "slug": r.slug, "title": r.title, "sources": r.sources,
                             "entities": r.entities, "facets": r.facets, "content": r.content,
+                            "code_symbols": code,
                         })
                     })
                     .collect();
@@ -256,13 +266,13 @@ pub async fn handle_top_cortex(args: TopCortexArgs) -> Result<()> {
                 }
             } else {
                 println!(
-                    "{:<22} {:<22} {:>7} {:>8} {:>8}",
-                    "SLUG", "TITLE", "SOURCES", "NODES", "FACETS"
+                    "{:<22} {:<22} {:>7} {:>8} {:>9} {:>8}",
+                    "SLUG", "TITLE", "SOURCES", "CONTENT", "CODE-SYMS", "FACETS"
                 );
-                for r in &filtered {
+                for (r, code) in filtered.iter().zip(code_symbols.iter()) {
                     println!(
-                        "{:<22} {:<22} {:>7} {:>8} {:>8}",
-                        r.slug, r.title, r.sources, r.content, r.facets
+                        "{:<22} {:<22} {:>7} {:>8} {:>9} {:>8}",
+                        r.slug, r.title, r.sources, r.content, code, r.facets
                     );
                 }
             }
