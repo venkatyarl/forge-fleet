@@ -20,11 +20,12 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Subcommand)]
 pub enum McpCommand {
     /// Install the forgefleet MCP server into one or more coding-agent
-    /// configs (Claude Code, Codex, Kimi, Cursor, Windsurf, Goose).
+    /// configs (Claude Code, Claude Desktop, Codex, Kimi, Cursor, Windsurf,
+    /// Goose, Grok).
     Install {
         /// Which client to install for. Pass `all` to install everywhere
         /// we can detect a config file.
-        #[arg(long, value_parser = ["all", "claude-code", "codex", "kimi", "cursor", "windsurf", "goose"])]
+        #[arg(long, value_parser = ["all", "claude-code", "claude-desktop", "codex", "kimi", "cursor", "windsurf", "goose", "grok"])]
         r#for: String,
         /// MCP server URL. Defaults to the per-computer federation endpoint
         /// (`http://localhost:50001/mcp`) which every fleet computer hosts.
@@ -98,19 +99,23 @@ fn resolve_targets(arg: &str) -> Vec<&'static str> {
     match arg {
         "all" => vec![
             "claude-code",
+            "claude-desktop",
             "codex",
             "kimi",
             "cursor",
             "windsurf",
             "goose",
+            "grok",
         ],
         single => vec![match single {
             "claude-code" => "claude-code",
+            "claude-desktop" => "claude-desktop",
             "codex" => "codex",
             "kimi" => "kimi",
             "cursor" => "cursor",
             "windsurf" => "windsurf",
             "goose" => "goose",
+            "grok" => "grok",
             _ => "unknown",
         }],
     }
@@ -126,11 +131,13 @@ async fn install_one(
 
     match target {
         "claude-code" => install_claude_code(&home, server_url, write_instructions, dry_run),
+        "claude-desktop" => install_claude_desktop(&home, server_url, dry_run),
         "codex" => install_codex(&home, server_url, dry_run),
         "kimi" => install_kimi(&home, server_url, dry_run),
         "cursor" => install_cursor(&home, server_url, dry_run),
         "windsurf" => install_windsurf(&home, server_url, dry_run),
         "goose" => install_goose(&home, server_url, dry_run),
+        "grok" => install_grok(&home, server_url, dry_run),
         other => bail!("unknown client: {other}"),
     }
 }
@@ -150,6 +157,30 @@ fn install_claude_code(
         append_instructions_md(&claude_md, dry_run)?;
         println!("    + CLAUDE.md routing rule: {}", claude_md.display());
     }
+    Ok(())
+}
+
+// ─── Claude Desktop ──────────────────────────────────────────────────────────
+/// OS-specific config path for the Claude Desktop app. macOS keeps it under
+/// `~/Library/Application Support/Claude/`; Linux (and the Flatpak/AppImage
+/// builds) use `~/.config/Claude/`. Same `mcpServers` JSON shape as Claude Code.
+fn claude_desktop_config_path(home: &std::path::Path) -> PathBuf {
+    if cfg!(target_os = "macos") {
+        home.join("Library")
+            .join("Application Support")
+            .join("Claude")
+            .join("claude_desktop_config.json")
+    } else {
+        home.join(".config")
+            .join("Claude")
+            .join("claude_desktop_config.json")
+    }
+}
+
+fn install_claude_desktop(home: &std::path::Path, server_url: &str, dry_run: bool) -> Result<()> {
+    let config = claude_desktop_config_path(home);
+    upsert_mcp_server_json(&config, "forgefleet", server_url, dry_run)?;
+    println!("  ✓ claude-desktop: {}", config.display());
     Ok(())
 }
 
@@ -195,6 +226,16 @@ fn install_goose(home: &std::path::Path, server_url: &str, dry_run: bool) -> Res
     let config = home.join(".config").join("goose").join("config.yaml");
     upsert_goose_mcp(&config, "forgefleet", server_url, dry_run)?;
     println!("  ✓ goose: {}", config.display());
+    Ok(())
+}
+
+// ─── Grok CLI (xAI) ──────────────────────────────────────────────────────────
+fn install_grok(home: &std::path::Path, server_url: &str, dry_run: bool) -> Result<()> {
+    // grok-cli reads MCP servers from ~/.grok/mcp-config.json using the same
+    // `mcpServers` shape as Claude Code / Cursor.
+    let config = home.join(".grok").join("mcp-config.json");
+    upsert_mcp_server_json(&config, "forgefleet", server_url, dry_run)?;
+    println!("  ✓ grok: {}", config.display());
     Ok(())
 }
 
@@ -397,6 +438,7 @@ fn print_status() {
             "claude-code",
             vec![home.join(".claude").join("settings.json")],
         ),
+        ("claude-desktop", vec![claude_desktop_config_path(&home)]),
         ("codex", vec![home.join(".codex").join("config.toml")]),
         ("kimi", vec![home.join(".kimi").join("config.json")]),
         ("cursor", vec![home.join(".cursor").join("mcp.json")]),
@@ -412,6 +454,7 @@ fn print_status() {
             "goose",
             vec![home.join(".config").join("goose").join("config.yaml")],
         ),
+        ("grok", vec![home.join(".grok").join("mcp-config.json")]),
     ];
     println!("MCP client configs on this computer:");
     for (name, paths) in candidates {
