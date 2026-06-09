@@ -1248,9 +1248,14 @@ pub async fn compose_node_bootstrap(
     // ── Step 1: probe every known IP. ────────────────────────────────────
     let ip_list = target_ips.join(" ");
     let step1 = format!(
+        // ssh -o ConnectTimeout, NOT `timeout 5 ssh`: this step runs on the
+        // LEADER (capability=["leader"]), which is often macOS (taylor/ace)
+        // where `timeout` is not a default command (it's `gtimeout` via
+        // coreutils) — so `timeout 5 ssh` silently breaks the probe on macOS.
+        // ssh's built-in ConnectTimeout is portable and covers the hang case.
         "set -e; for ip in {ip_list}; do \
            echo \"== $ip ==\"; \
-           timeout 5 ssh{port_arg} -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+           ssh{port_arg} -o ConnectTimeout=5 -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
              {ssh_target_for_iter} 'echo ok && uname -srvmo' || echo 'unreachable'; \
          done"
     );
