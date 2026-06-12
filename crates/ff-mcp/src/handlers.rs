@@ -2709,6 +2709,11 @@ pub async fn dispatch(method: &str, params: Option<Value>) -> HandlerResult {
         "brain_thread_append" => crate::brain_tools::brain_thread_append(params).await,
         "brain_stack_push" => crate::brain_tools::brain_stack_push(params).await,
         "brain_backlog_add" => crate::brain_tools::brain_backlog_add(params).await,
+        // Cortex code graph
+        "cortex_corpora" => crate::cortex_tools::cortex_corpora(params).await,
+        "cortex_callers" => crate::cortex_tools::cortex_callers(params).await,
+        "cortex_callees" => crate::cortex_tools::cortex_callees(params).await,
+        "cortex_impact" => crate::cortex_tools::cortex_impact(params).await,
         // Computer Use (Pillar 1)
         "computer_use" => computer_use(params).await,
         _ => Err(format!("unknown method: {method}")),

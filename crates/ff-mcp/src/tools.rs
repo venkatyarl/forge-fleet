@@ -108,6 +108,12 @@ impl ToolRegistry {
         self.register(Self::brain_stack_push());
         self.register(Self::brain_backlog_add());
 
+        // ── Cortex code-graph tools ─────────────────────────────────────
+        self.register(Self::cortex_corpora());
+        self.register(Self::cortex_callers());
+        self.register(Self::cortex_callees());
+        self.register(Self::cortex_impact());
+
         // ── Computer Use (Pillar 1) ─────────────────────────────────────
         self.register(Self::computer_use());
     }
@@ -821,6 +827,86 @@ impl ToolRegistry {
 
     // ── Virtual Brain tool definitions ───────────────────────────────────
 
+    fn cortex_corpora() -> ToolDefinition {
+        ToolDefinition {
+            name: "cortex_corpora".to_string(),
+            description: "List the Cortex code-graph corpora (indexed repos) and their sizes. Use this first to discover the `corpus` slug to pass to cortex_callers/callees/impact.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            }),
+        }
+    }
+
+    fn cortex_callers() -> ToolDefinition {
+        ToolDefinition {
+            name: "cortex_callers".to_string(),
+            description: "Cortex code graph: list the callers of a code symbol (who calls it). Token-cheaper than grepping for call sites. Symbol may be a bare leaf (e.g. 'load_model') or a fully-qualified name.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "corpus": {
+                        "type": "string",
+                        "description": "Indexed repo slug (see cortex_corpora), e.g. 'forge-fleet'"
+                    },
+                    "symbol": {
+                        "type": "string",
+                        "description": "Code symbol — bare leaf ('load_model') or qualified ('ff_agent::model_runtime::load_model')"
+                    }
+                },
+                "required": ["corpus", "symbol"]
+            }),
+        }
+    }
+
+    fn cortex_callees() -> ToolDefinition {
+        ToolDefinition {
+            name: "cortex_callees".to_string(),
+            description: "Cortex code graph: list the callees of a code symbol (what it calls). Symbol may be a bare leaf or a fully-qualified name.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "corpus": {
+                        "type": "string",
+                        "description": "Indexed repo slug (see cortex_corpora), e.g. 'forge-fleet'"
+                    },
+                    "symbol": {
+                        "type": "string",
+                        "description": "Code symbol — bare leaf or qualified name"
+                    }
+                },
+                "required": ["corpus", "symbol"]
+            }),
+        }
+    }
+
+    fn cortex_impact() -> ToolDefinition {
+        ToolDefinition {
+            name: "cortex_impact".to_string(),
+            description: "Cortex code graph: transitive caller closure (blast radius) of a code symbol — every symbol that could be affected by changing it, up to max_depth hops.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "corpus": {
+                        "type": "string",
+                        "description": "Indexed repo slug (see cortex_corpora), e.g. 'forge-fleet'"
+                    },
+                    "symbol": {
+                        "type": "string",
+                        "description": "Code symbol — bare leaf or qualified name"
+                    },
+                    "max_depth": {
+                        "type": "integer",
+                        "description": "Max transitive hops (1-20, default 5)",
+                        "default": 5
+                    }
+                },
+                "required": ["corpus", "symbol"]
+            }),
+        }
+    }
+
     fn brain_search() -> ToolDefinition {
         ToolDefinition {
             name: "brain_search".to_string(),
@@ -1147,6 +1233,11 @@ mod tests {
             "brain_thread_append",
             "brain_stack_push",
             "brain_backlog_add",
+            // Cortex code graph
+            "cortex_corpora",
+            "cortex_callers",
+            "cortex_callees",
+            "cortex_impact",
             // Pillar 1 — Computer Use (PR-H, #37)
             "computer_use",
         ];
