@@ -8459,3 +8459,25 @@ pub const SCHEMA_V124_CORTEX_SYMBOL_LINES: &str = r#"
 ALTER TABLE brain_vault_nodes ADD COLUMN IF NOT EXISTS start_line INT;
 ALTER TABLE brain_vault_nodes ADD COLUMN IF NOT EXISTS end_line   INT;
 "#;
+
+/// V125: give detected communities a durable registry. `detect_communities`
+/// previously wrote each node's `community_id` but never populated the
+/// `brain_communities` table, so `ff brain stats`, the `brain_stats` MCP tool,
+/// and the gateway brain API all reported 0 communities despite thousands being
+/// found — and there was nowhere to attach a community summary. This adds:
+///   - `member_hash` — a STABLE identity for a community = hash of its sorted
+///     member set. Union-find renumbers `community_id` arbitrarily each run, but
+///     an unchanged connected component hashes the same, so a re-detection maps
+///     back to the same row and its summary survives (the GraphRAG
+///     re-summarize-only-changed lever). UNIQUE so reconciliation can upsert.
+///   - `summary` / `summary_model` / `summary_updated_at` — reserved now so the
+///     fleet-LLM community-summary pass (cortex roadmap #4) is a pure data fill
+///     with no further migration. Nullable until that pass runs.
+pub const SCHEMA_V125_BRAIN_COMMUNITY_REGISTRY: &str = r#"
+ALTER TABLE brain_communities ADD COLUMN IF NOT EXISTS member_hash        TEXT;
+ALTER TABLE brain_communities ADD COLUMN IF NOT EXISTS summary            TEXT;
+ALTER TABLE brain_communities ADD COLUMN IF NOT EXISTS summary_model      TEXT;
+ALTER TABLE brain_communities ADD COLUMN IF NOT EXISTS summary_updated_at TIMESTAMPTZ;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_brain_communities_member_hash
+    ON brain_communities (member_hash);
+"#;

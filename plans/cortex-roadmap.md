@@ -54,9 +54,13 @@
    review map, ranked most-actionable-first. Follow-ups: (i) ✅ **hunk-level**
    (PR #184, V124) — persists 1-based symbol line spans on `code:*` nodes; review
    narrows to only the symbols whose bodies overlap the git-diff line ranges
-   (fail-open on NULL spans / files absent from the diff map). (ii) a
-   `cortex_review` MCP tool (needs a repo-path param + a way to pass the diff —
-   the daemon isn't in the repo, and the git layer lives in the terminal).
+   (fail-open on NULL spans / files absent from the diff map). (ii) ✅
+   **`cortex_review` MCP tool** (PR #186) — takes `corpus` + `repo_dir` (the
+   indexed checkout) + optional `base`/`depth`; the daemon shells `git` in
+   `repo_dir` to derive changed files + hunk line ranges, then scores them
+   against the graph. The pure diff parsing (`ext_lang`,
+   `parse_diff_line_ranges`, `parse_hunk_new_span`) moved from the terminal layer
+   into `ff_brain::cortex` so the CLI and MCP frontends share it.
 4. **Community summaries via fleet LLMs** — GraphRAG-style per-community
    summaries, re-summarize only changed communities (the idle fleet is the lever;
    pairs with the incremental ledger). ← **next cortex build**
