@@ -6,8 +6,9 @@
 //! computers without OOMing any.
 //!
 //! ## Inputs / outputs (all existing primitives — no new schema)
-//! - DEMAND: `ff_db::pg_latest_demand_snapshot` (the P2 contract) →
-//!   `code_slots_wanted` / `general_slots_wanted`.
+//! - DEMAND: `ff_db::pg_recent_demand_snapshots` (the P2 contract) →
+//!   `code_slots_wanted` / `general_slots_wanted`, plus the recent TREND the
+//!   pre-warm anticipator projects forward (see [`anticipate`]).
 //! - SUPPLY: `ff_db::pg_supplied_slots_by_kind` — healthy, agent-capable
 //!   (`tool_calling` + `usable_agent_ctx >= AGENT_MIN_CTX`) deployments bucketed
 //!   code vs general.
@@ -95,6 +96,30 @@ const DEFAULT_GENERAL_FLOOR: f64 = 0.0;
 /// can't make the autoscaler try to flood the fleet with endpoints.
 const MAX_FLOOR: f64 = 8.0;
 
+// ─── Pre-warm anticipation (NEXT#0c — the swarm-burst latency lever) ──────────
+// Loading an agent endpoint takes tens of seconds to minutes. Scaling on the
+// single LATEST demand snapshot is therefore always one load-latency behind a
+// rising burst: the endpoint finishes warming only AFTER the peak. Anticipation
+// fits a slope over the recent demand snapshots and, when demand is RISING,
+// projects it one horizon ahead so the load STARTS a tick early and the endpoint
+// is ready WHEN the burst arrives. It is strictly one-directional: it can only
+// RAISE the scale-up target, never lower it, and is bounded so a noisy spike
+// can't request a flood (and MAX_LOADS_PER_PASS=1 caps actuation regardless).
+/// Recency guard for the trend window: snapshots older than this are ignored, so
+/// a leader-outage gap yields fewer samples (→ fall back to current) rather than
+/// a stale slope. ~30 min comfortably covers several demand-tick intervals.
+const TREND_LOOKBACK_SECS: i64 = 1800;
+/// Max snapshots to fit the slope over — enough to smooth single-tick noise,
+/// few enough to stay responsive to a genuine ramp.
+const TREND_SAMPLES: i64 = 6;
+/// How many snapshot-intervals ahead to project a rising trend. ~1 covers the
+/// typical load latency so the endpoint is warm by the next tick.
+const ANTICIPATION_HORIZON: f64 = 1.0;
+/// Cap on the extra slots the projection may add over current demand. A noisy
+/// spike can't ask for a flood; combined with MAX_LOADS_PER_PASS=1 the worst
+/// case is one extra warm endpoint that scale-down later trims when idle.
+const MAX_ANTICIPATION_SLOTS: f64 = 2.0;
+
 // Placement scoring weights (see [`score_host`]). Named consts so they're tunable.
 const W_FIT: f64 = 3.0;
 const W_PERF: f64 = 4.0;
@@ -181,6 +206,45 @@ fn rank_deficits(items: &[(Kind, f64, i64)]) -> Vec<(Kind, f64, i64, f64)> {
     out
 }
 
+/// Least-squares slope of `ys` over evenly-spaced x = 0,1,…,n−1 (one unit per
+/// snapshot interval). Pure. Returns 0.0 for fewer than two points or a
+/// degenerate (zero-variance) x — i.e. "no detectable trend".
+fn least_squares_slope(ys: &[f64]) -> f64 {
+    let n = ys.len();
+    if n < 2 {
+        return 0.0;
+    }
+    let nf = n as f64;
+    let x_mean = (nf - 1.0) / 2.0;
+    let y_mean = ys.iter().sum::<f64>() / nf;
+    let mut num = 0.0;
+    let mut den = 0.0;
+    for (i, &y) in ys.iter().enumerate() {
+        let dx = i as f64 - x_mean;
+        num += dx * (y - y_mean);
+        den += dx * dx;
+    }
+    if den == 0.0 { 0.0 } else { num / den }
+}
+
+/// Project demand one [`ANTICIPATION_HORIZON`] ahead from a RISING trend. Pure +
+/// unit-tested. `samples` are recent demand values OLDEST→NEWEST (the last is
+/// the current demand). The result is NEVER below the current value and NEVER
+/// more than [`MAX_ANTICIPATION_SLOTS`] above it; a flat or FALLING trend (slope
+/// ≤ 0) returns the current value unchanged — we never pre-warm on a downward
+/// trend, leaving surplus to the scale-down path. Empty input → 0.0.
+fn anticipate(samples: &[f64]) -> f64 {
+    let Some(&current) = samples.last() else {
+        return 0.0;
+    };
+    let slope = least_squares_slope(samples);
+    if slope <= 0.0 {
+        return current; // flat/falling: no pre-warm.
+    }
+    let projected = current + slope * ANTICIPATION_HORIZON;
+    projected.clamp(current, current + MAX_ANTICIPATION_SLOTS)
+}
+
 /// A kind we might scale, and which workload tag it maps to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Kind {
@@ -229,8 +293,14 @@ pub struct AutoscaleSummary {
     pub mode: &'static str,
     pub code_wanted: f64,
     pub general_wanted: f64,
-    /// Effective per-kind target after applying the reliability floor
-    /// (`max(demand, floor)`) — what the planner actually scales toward.
+    /// Per-kind demand AFTER pre-warm anticipation (`max(latest, trend
+    /// projection)`) but BEFORE the floor — surfaces how much the rising-trend
+    /// projection lifted the raw demand. Equals `*_wanted` on a flat/falling
+    /// trend.
+    pub code_anticipated: f64,
+    pub general_anticipated: f64,
+    /// Effective per-kind target the planner scales toward:
+    /// `max(anticipated, floor)`.
     pub code_target: f64,
     pub general_target: f64,
     pub code_supplied: i64,
@@ -378,24 +448,32 @@ fn agent_working_set_gb(size_gb: f64) -> f64 {
 /// Pure decision logic given the demand + supply + candidate snapshot — does NOT
 /// actuate. Returns the actions plus the summary skeleton (numbers filled in).
 async fn plan_pass(pg: &PgPool) -> Result<(Vec<Action>, AutoscaleSummary), String> {
-    let demand = ff_db::pg_latest_demand_snapshot(pg)
+    // Read the recent demand TREND (oldest→newest) once. The last sample is the
+    // current demand; the series feeds the pre-warm anticipator. Empty (P2 not
+    // producing, or a leader-outage gap) → no demand signal; the floor below
+    // still applies so the fleet keeps warm agent capacity even when the sensor
+    // is silent (the worst case for swarm reliability).
+    let trend = ff_db::pg_recent_demand_snapshots(pg, TREND_LOOKBACK_SECS, TREND_SAMPLES)
         .await
-        .map_err(|e| format!("pg_latest_demand_snapshot: {e}"))?;
-    let (code_wanted, general_wanted) = match demand {
-        Some(d) => (d.code_slots_wanted, d.general_slots_wanted),
-        // No snapshot yet (P2 not producing) → no demand signal. The reliability
-        // floor below still applies, so the fleet keeps warm agent capacity even
-        // when the demand sensor is silent (the worst case for swarm reliability).
-        None => (0.0, 0.0),
-    };
+        .map_err(|e| format!("pg_recent_demand_snapshots: {e}"))?;
+    let code_series: Vec<f64> = trend.iter().map(|d| d.code_slots_wanted).collect();
+    let general_series: Vec<f64> = trend.iter().map(|d| d.general_slots_wanted).collect();
+    let code_wanted = code_series.last().copied().unwrap_or(0.0);
+    let general_wanted = general_series.last().copied().unwrap_or(0.0);
+
+    // PRE-WARM ANTICIPATION: when demand is rising, project it one load-latency
+    // ahead so the endpoint is warm BEFORE the burst peaks. One-directional —
+    // only raises the scale-up target, never lowers it (flat/falling → unchanged).
+    let code_anticipated = anticipate(&code_series);
+    let general_anticipated = anticipate(&general_series);
 
     // Apply the per-kind RELIABILITY FLOOR: the planner scales toward
-    // `max(demand, floor)`, never below the floor. This is what keeps a warm pool
-    // of agent endpoints alive at demand=0 instead of collapsing to a SPOF.
+    // `max(anticipated, floor)`, never below the floor. This is what keeps a warm
+    // pool of agent endpoints alive at demand=0 instead of collapsing to a SPOF.
     let code_floor = read_floor(pg, CODE_FLOOR_KEY, DEFAULT_CODE_FLOOR).await;
     let general_floor = read_floor(pg, GENERAL_FLOOR_KEY, DEFAULT_GENERAL_FLOOR).await;
-    let code_target = code_wanted.max(code_floor);
-    let general_target = general_wanted.max(general_floor);
+    let code_target = code_anticipated.max(code_floor);
+    let general_target = general_anticipated.max(general_floor);
 
     let supply = ff_db::pg_supplied_slots_by_kind(pg, AGENT_MIN_CTX as i32)
         .await
@@ -404,6 +482,8 @@ async fn plan_pass(pg: &PgPool) -> Result<(Vec<Action>, AutoscaleSummary), Strin
     let mut summary = AutoscaleSummary {
         code_wanted,
         general_wanted,
+        code_anticipated,
+        general_anticipated,
         code_target,
         general_target,
         code_supplied: supply.code_count,
@@ -856,9 +936,11 @@ pub fn spawn_autoscaler_tick(
                             info!(
                                 mode = s.mode,
                                 code_wanted = format!("{:.2}", s.code_wanted),
+                                code_anticipated = format!("{:.2}", s.code_anticipated),
                                 code_target = format!("{:.2}", s.code_target),
                                 code_supplied = s.code_supplied,
                                 general_wanted = format!("{:.2}", s.general_wanted),
+                                general_anticipated = format!("{:.2}", s.general_anticipated),
                                 general_target = format!("{:.2}", s.general_target),
                                 general_supplied = s.general_supplied,
                                 planned_loads = s.planned_loads,
@@ -950,6 +1032,44 @@ mod tests {
         // Out-of-range clamps into [0, MAX_FLOOR].
         assert_eq!(parse_floor(Some("-5"), 2.0), 0.0);
         assert_eq!(parse_floor(Some("9999"), 2.0), MAX_FLOOR);
+    }
+
+    #[test]
+    fn slope_detects_direction() {
+        // Rising series → positive slope.
+        assert!(least_squares_slope(&[0.0, 1.0, 2.0, 3.0]) > 0.0);
+        // Falling → negative.
+        assert!(least_squares_slope(&[3.0, 2.0, 1.0, 0.0]) < 0.0);
+        // Flat → ~0.
+        assert!(least_squares_slope(&[2.0, 2.0, 2.0]).abs() < 1e-9);
+        // Degenerate inputs → 0 (no trend).
+        assert_eq!(least_squares_slope(&[]), 0.0);
+        assert_eq!(least_squares_slope(&[5.0]), 0.0);
+        // Exact unit slope over evenly spaced points.
+        assert!((least_squares_slope(&[1.0, 2.0, 3.0]) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn anticipate_only_pre_warms_on_rising_trend() {
+        // Empty → 0.
+        assert_eq!(anticipate(&[]), 0.0);
+        // Single sample → that value (no trend to project).
+        assert_eq!(anticipate(&[1.5]), 1.5);
+        // Flat → current unchanged.
+        assert_eq!(anticipate(&[2.0, 2.0, 2.0]), 2.0);
+        // Falling → current unchanged (never pre-warm downward).
+        assert_eq!(anticipate(&[3.0, 2.0, 1.0]), 1.0);
+        // Rising slope=1, horizon=1 → current(2)+1 = 3, within the +2 cap.
+        let a = anticipate(&[0.0, 1.0, 2.0]);
+        assert!((a - 3.0).abs() < 1e-9, "expected ~3.0, got {a}");
+        // Steep ramp is clamped to current + MAX_ANTICIPATION_SLOTS.
+        let steep = anticipate(&[0.0, 5.0, 10.0]);
+        assert!(
+            (steep - (10.0 + MAX_ANTICIPATION_SLOTS)).abs() < 1e-9,
+            "steep ramp should clamp to current+{MAX_ANTICIPATION_SLOTS}, got {steep}"
+        );
+        // Result is never below current on any input.
+        assert!(anticipate(&[1.0, 4.0, 2.0]) >= 2.0);
     }
 
     #[test]
