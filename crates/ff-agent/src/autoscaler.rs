@@ -82,10 +82,15 @@ const EXCLUDE_HOSTS: &[&str] = &["taylor"];
 /// fleet; missing/garbage falls back to the default below.
 const CODE_FLOOR_KEY: &str = "autoscaler_code_floor";
 const GENERAL_FLOOR_KEY: &str = "autoscaler_general_floor";
-/// Default warm floor: TWO code endpoints (no SPOF during swarm bursts) and ONE
-/// general. Set the key to 1 to restore scale-to-one, or 0 to disable the floor.
+/// Default warm floor: TWO code endpoints (no SPOF during swarm bursts). The
+/// GENERAL default is 0 because the portfolio carries no general-kind agent
+/// model on disk on any non-excluded host — a non-zero general floor would just
+/// log `no_fit` every tick (a futile placement attempt) and could even consume
+/// the pass's single load slot away from a feasible code scale-up. Operators
+/// that add a general agent model raise it via `autoscaler_general_floor`.
+/// Set the code key to 1 to restore scale-to-one, or 0 to disable its floor.
 const DEFAULT_CODE_FLOOR: f64 = 2.0;
-const DEFAULT_GENERAL_FLOOR: f64 = 1.0;
+const DEFAULT_GENERAL_FLOOR: f64 = 0.0;
 /// Clamp ceiling for an operator-supplied floor — a typo'd `autoscaler_code_floor`
 /// can't make the autoscaler try to flood the fleet with endpoints.
 const MAX_FLOOR: f64 = 8.0;
@@ -160,6 +165,20 @@ fn parse_floor(raw: Option<&str>, default: f64) -> f64 {
             .unwrap_or(default),
         _ => default,
     }
+}
+
+/// Rank scale-up candidates most-starved-first. Pure (no dwell/feasibility
+/// gating — those stay in `plan_pass`) so the deficit-ordering is unit-testable.
+/// Only kinds whose deficit clears the deadband are returned, sorted by deficit
+/// descending; ties keep input order (stable sort).
+fn rank_deficits(items: &[(Kind, f64, i64)]) -> Vec<(Kind, f64, i64, f64)> {
+    let mut out: Vec<(Kind, f64, i64, f64)> = items
+        .iter()
+        .map(|(k, wanted, supplied)| (*k, *wanted, *supplied, wanted - (*supplied as f64)))
+        .filter(|(_, _, _, deficit)| *deficit >= SCALE_MARGIN)
+        .collect();
+    out.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
+    out
 }
 
 /// A kind we might scale, and which workload tag it maps to.
@@ -412,33 +431,41 @@ async fn plan_pass(pg: &PgPool) -> Result<(Vec<Action>, AutoscaleSummary), Strin
         ),
     ];
 
-    // ---- SCALE-UP: pick the single most-starved kind past the deadband ----
-    let mut best_up: Option<(Kind, f64, i64, f64)> = None; // (kind, wanted, supplied, deficit)
-    for (kind, wanted, supplied, _eps) in kinds.iter() {
-        let deficit = wanted - (*supplied as f64);
-        if deficit >= SCALE_MARGIN {
-            if !dwell_ok(*kind) {
-                summary.skipped_dwell += 1;
-                continue;
-            }
-            if best_up.map(|(_, _, _, d)| deficit > d).unwrap_or(true) {
-                best_up = Some((*kind, *wanted, *supplied, deficit));
-            }
+    // ---- SCALE-UP: most-starved kind first, falling through to the next if a
+    // kind can't be placed (no loadable on-disk library for it). A perpetually
+    // infeasible kind must not consume the pass's single load slot and starve a
+    // kind that genuinely can scale up. ----
+    let ranked = rank_deficits(
+        &kinds
+            .iter()
+            .map(|(k, wanted, supplied, _eps)| (*k, *wanted, *supplied))
+            .collect::<Vec<_>>(),
+    );
+    let mut tried_up = false;
+    let mut placed_up = false;
+    for (kind, wanted, supplied, _deficit) in ranked {
+        if !dwell_ok(kind) {
+            summary.skipped_dwell += 1;
+            continue;
         }
-    }
-
-    if let Some((kind, wanted, supplied, _deficit)) = best_up {
         if actions
             .iter()
             .filter(|a| matches!(a, Action::Load { .. }))
             .count()
-            < MAX_LOADS_PER_PASS
-            && let Some(act) = plan_load(pg, kind, wanted, supplied).await?
+            >= MAX_LOADS_PER_PASS
         {
-            actions.push(act);
-        } else {
-            summary.no_fit += 1;
+            break;
         }
+        tried_up = true;
+        if let Some(act) = plan_load(pg, kind, wanted, supplied).await? {
+            actions.push(act);
+            placed_up = true;
+            break;
+        }
+        // This kind couldn't be placed; try the next-most-starved one.
+    }
+    if tried_up && !placed_up {
+        summary.no_fit += 1;
     }
 
     // ---- SCALE-DOWN: oversupplied kind whose surplus endpoints are idle ----
@@ -923,6 +950,25 @@ mod tests {
         // Out-of-range clamps into [0, MAX_FLOOR].
         assert_eq!(parse_floor(Some("-5"), 2.0), 0.0);
         assert_eq!(parse_floor(Some("9999"), 2.0), MAX_FLOOR);
+    }
+
+    #[test]
+    fn rank_deficits_orders_and_filters() {
+        // Below-deadband kinds are dropped; remaining sorted most-starved first.
+        let ranked = rank_deficits(&[(Kind::Code, 1.2, 1), (Kind::General, 3.0, 0)]);
+        assert_eq!(ranked.len(), 1, "code deficit 0.2 is below the deadband");
+        assert_eq!(ranked[0].0, Kind::General);
+
+        // Two over-deadband kinds: the larger deficit comes first so a feasible
+        // fall-through tries the most-starved kind before the runner-up.
+        let ranked = rank_deficits(&[(Kind::Code, 2.0, 0), (Kind::General, 5.0, 0)]);
+        assert_eq!(ranked.len(), 2);
+        assert_eq!(ranked[0].0, Kind::General); // deficit 5.0 > 2.0
+        assert_eq!(ranked[1].0, Kind::Code);
+
+        // At/under the floor for both → no candidates (no churn at demand=0).
+        let ranked = rank_deficits(&[(Kind::Code, 2.0, 2), (Kind::General, 0.0, 0)]);
+        assert!(ranked.is_empty());
     }
 
     #[test]
