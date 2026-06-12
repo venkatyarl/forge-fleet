@@ -92,6 +92,26 @@ struct Symbol {
     parent: Option<usize>,
 }
 
+/// Byte offsets of every line start in a source file (index 0 = start of file,
+/// then one past each `\n`). Used to convert a symbol's byte span → 1-based line
+/// numbers without re-walking the whole string per symbol.
+fn line_start_offsets(source: &str) -> Vec<usize> {
+    let mut starts = vec![0usize];
+    for (i, b) in source.bytes().enumerate() {
+        if b == b'\n' {
+            starts.push(i + 1);
+        }
+    }
+    starts
+}
+
+/// 1-based line number containing byte offset `byte`, given the file's sorted
+/// line-start offsets. Pure + unit-tested.
+fn byte_to_line(line_starts: &[usize], byte: usize) -> i32 {
+    // The line number is the count of line-starts at or before `byte`.
+    line_starts.partition_point(|&s| s <= byte).max(1) as i32
+}
+
 /// A call site found inside a function body.
 #[derive(Debug, Clone)]
 struct CallSite {
@@ -642,17 +662,26 @@ async fn extract_files(
         };
         stats.files_parsed += 1;
 
+        // Line-start offsets for this file, so each symbol's byte span maps to
+        // 1-based source lines (persisted on the node for hunk-level review).
+        let line_starts = line_start_offsets(&source);
+
         // Write symbol nodes + contains edges.
         let mut sym_ids: HashMap<String, Uuid> = HashMap::new();
         let mut idx_to_id: HashMap<usize, Uuid> = HashMap::new();
         for (i, sym) in parse.symbols.iter().enumerate() {
             let sym_path = format!("code://{corpus_slug}/{}", sym.qualified_name);
+            let start_line = byte_to_line(&line_starts, sym.start);
+            // end byte is exclusive; use the last byte of the span for the line.
+            let end_line = byte_to_line(&line_starts, sym.end.saturating_sub(1));
             let id = upsert_code_node(
                 pool,
                 &sym_path,
                 &sym.qualified_name,
                 sym.node_type,
                 corpus_slug,
+                Some(start_line),
+                Some(end_line.max(start_line)),
             )
             .await?;
             sym_ids.insert(sym.qualified_name.clone(), id);
@@ -679,8 +708,16 @@ async fn extract_files(
         // imports: file -> code:import node (fully-qualified use target).
         for target in &parse.use_targets {
             let imp_path = format!("code://{corpus_slug}/use:{target}");
-            let imp_id =
-                upsert_code_node(pool, &imp_path, target, "code:import", corpus_slug).await?;
+            let imp_id = upsert_code_node(
+                pool,
+                &imp_path,
+                target,
+                "code:import",
+                corpus_slug,
+                None,
+                None,
+            )
+            .await?;
             if add_edge(pool, file_node_id, imp_id, "imports").await? {
                 stats.imports += 1;
             }
@@ -724,8 +761,16 @@ async fn extract_files(
                 None => {
                     // External / unresolved: a code:extern placeholder on the same
                     // code:// path, so callers_of still traverses to it.
-                    upsert_code_node(pool, &callee_path, &resolved, "code:extern", corpus_slug)
-                        .await?
+                    upsert_code_node(
+                        pool,
+                        &callee_path,
+                        &resolved,
+                        "code:extern",
+                        corpus_slug,
+                        None,
+                        None,
+                    )
+                    .await?
                 }
             };
             add_edge(pool, caller_id, callee_id, "calls").await?;
@@ -980,6 +1025,11 @@ pub struct ReviewReport {
     pub unindexed: Vec<String>,
     /// Union blast radius across every changed file (deduped node ids).
     pub total_blast: usize,
+    /// True when at least one file was narrowed to the symbols whose bodies
+    /// overlap the git-diff line ranges (hunk-level), vs listing every symbol the
+    /// file defines (file-level). False if no line ranges were supplied or no
+    /// indexed file had usable symbol spans.
+    pub hunk_level: bool,
 }
 
 /// Look up a `content:file` node id by absolute path within a corpus.
@@ -997,7 +1047,17 @@ async fn file_node_id(pool: &PgPool, corpus_slug: &str, abs_path: &str) -> Resul
 
 /// All `code:*` symbols a file defines — the transitive `contains` subtree from
 /// the file node (file -> impl/mod -> method nests one or two levels).
-async fn symbols_in_file(pool: &PgPool, file_id: Uuid) -> Result<Vec<SymbolRef>> {
+/// A symbol from `symbols_in_file`, carrying its persisted 1-based line span
+/// (V124) so `review` can do hunk-level filtering. Lines are `None` for nodes
+/// indexed before V124 (or re-pointed import/extern placeholders), in which case
+/// review degrades gracefully to file-level (includes the symbol).
+struct FileSymbol {
+    sref: SymbolRef,
+    start_line: Option<i32>,
+    end_line: Option<i32>,
+}
+
+async fn symbols_in_file(pool: &PgPool, file_id: Uuid) -> Result<Vec<FileSymbol>> {
     let rows = sqlx::query(
         r#"WITH RECURSIVE sub AS (
                SELECT dst_id AS id
@@ -1009,7 +1069,7 @@ async fn symbols_in_file(pool: &PgPool, file_id: Uuid) -> Result<Vec<SymbolRef>>
                  JOIN sub ON e.src_id = sub.id
                 WHERE e.edge_type = 'contains'
            )
-           SELECT n.id, n.title, n.node_type
+           SELECT n.id, n.title, n.node_type, n.start_line, n.end_line
              FROM brain_vault_nodes n
              JOIN sub ON n.id = sub.id
             WHERE n.node_type LIKE 'code:%'
@@ -1020,12 +1080,32 @@ async fn symbols_in_file(pool: &PgPool, file_id: Uuid) -> Result<Vec<SymbolRef>>
     .await?;
     Ok(rows
         .into_iter()
-        .map(|r| SymbolRef {
-            id: r.get("id"),
-            qualified_name: r.get("title"),
-            node_type: r.get("node_type"),
+        .map(|r| FileSymbol {
+            sref: SymbolRef {
+                id: r.get("id"),
+                qualified_name: r.get("title"),
+                node_type: r.get("node_type"),
+            },
+            start_line: r.get("start_line"),
+            end_line: r.get("end_line"),
         })
         .collect())
+}
+
+/// Does a symbol's persisted line span overlap any of the changed `hunks`
+/// (1-based inclusive `(start, end)` ranges from the git diff)? A symbol with no
+/// recorded span (`None`) is treated as touched — fail-open so review never
+/// hides a change just because the node predates V124. Pure + unit-tested.
+fn symbol_touched_by_hunks(
+    start_line: Option<i32>,
+    end_line: Option<i32>,
+    hunks: &[(u32, u32)],
+) -> bool {
+    let (Some(s), Some(e)) = (start_line, end_line) else {
+        return true; // unknown span ⇒ can't exclude it
+    };
+    let (s, e) = (s.max(0) as u32, e.max(0) as u32);
+    hunks.iter().any(|&(hs, he)| s <= he && hs <= e)
 }
 
 /// Build a change-aware, risk-scored review report for a set of changed files.
@@ -1033,11 +1113,20 @@ async fn symbols_in_file(pool: &PgPool, file_id: Uuid) -> Result<Vec<SymbolRef>>
 /// `changed_abs_paths` are absolute filesystem paths (the terminal layer derives
 /// them from `git diff` and maps repo-relative → absolute). `depth` bounds the
 /// transitive blast-radius walk. Files not in the graph land in `unindexed`.
+///
+/// `changed_lines`, when supplied, maps an absolute path → the 1-based inclusive
+/// line ranges the diff actually touched in that file. For files present in the
+/// map, review narrows to the symbols whose bodies overlap those ranges
+/// (HUNK-level) instead of every symbol the file defines (file-level). A file
+/// absent from the map — a brand-new file, or one whose nodes predate V124 line
+/// spans — falls back to file-level, so the feature only ever sharpens the
+/// report, never hides a change.
 pub async fn review(
     pool: &PgPool,
     corpus_slug: &str,
     changed_abs_paths: &[String],
     depth: usize,
+    changed_lines: Option<&HashMap<String, Vec<(u32, u32)>>>,
 ) -> Result<ReviewReport> {
     let mut report = ReviewReport::default();
     let mut global_blast: HashSet<Uuid> = HashSet::new();
@@ -1047,13 +1136,39 @@ pub async fn review(
             report.unindexed.push(path.clone());
             continue;
         };
-        let syms = symbols_in_file(pool, fid).await?;
+        let all_syms = symbols_in_file(pool, fid).await?;
+        // Hunk-level narrowing: if the diff gave line ranges for THIS file, keep
+        // only the symbols whose recorded span overlaps a changed range. Symbols
+        // with no recorded span are kept (fail-open). No ranges ⇒ keep all.
+        let hunks = changed_lines.and_then(|m| m.get(path));
+        let syms: Vec<&FileSymbol> = match hunks {
+            Some(ranges) => {
+                let kept: Vec<&FileSymbol> = all_syms
+                    .iter()
+                    .filter(|s| symbol_touched_by_hunks(s.start_line, s.end_line, ranges))
+                    .collect();
+                // Mark hunk-level only when narrowing actually had spans to act on
+                // (some kept symbol carried a real span), so the report flag means
+                // "this is line-precise" rather than merely "ranges were passed".
+                if kept.iter().any(|s| s.start_line.is_some()) {
+                    report.hunk_level = true;
+                }
+                kept
+            }
+            None => all_syms.iter().collect(),
+        };
         // The file's own symbol names — used to split internal vs external fan-in.
-        let own_names: HashSet<&str> = syms.iter().map(|s| s.qualified_name.as_str()).collect();
+        // Use the FULL symbol set (not the hunk subset): a same-file caller of a
+        // changed fn is still internal even if its own body wasn't touched.
+        let own_names: HashSet<&str> = all_syms
+            .iter()
+            .map(|s| s.sref.qualified_name.as_str())
+            .collect();
 
         let mut file_blast: HashSet<Uuid> = HashSet::new();
         let mut changed_syms: Vec<ChangedSymbol> = Vec::new();
-        for s in &syms {
+        for fs in &syms {
+            let s = &fs.sref;
             // Only callable symbols accrue `calls`-edge fan-in; structs/impls
             // are listed with zero metrics so the diff is fully accounted for.
             let (direct, blast) = if s.node_type == "code:function" {
@@ -1131,14 +1246,22 @@ async fn upsert_code_node(
     title: &str,
     node_type: &str,
     project: &str,
+    start_line: Option<i32>,
+    end_line: Option<i32>,
 ) -> Result<Uuid> {
     // content_hash is NOT NULL; use the path (synthetic + unique) as a stable hash.
+    // start_line/end_line are 1-based source spans (V124) — set for real symbol
+    // nodes (so `review` can do hunk-level filtering), NULL for import/extern
+    // placeholders. On conflict we refresh them so an incremental reindex (which
+    // KEEPS the stable node and re-upserts it) tracks the symbol as it moves.
     let id: Uuid = sqlx::query_scalar(
-        r#"INSERT INTO brain_vault_nodes (path, title, node_type, project, content_hash)
-           VALUES ($1, $2, $3, $4, $5)
+        r#"INSERT INTO brain_vault_nodes
+               (path, title, node_type, project, content_hash, start_line, end_line)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)
            ON CONFLICT (path) DO UPDATE
              SET title = EXCLUDED.title, node_type = EXCLUDED.node_type,
-                 project = EXCLUDED.project, valid_until = NULL, updated_at = NOW()
+                 project = EXCLUDED.project, valid_until = NULL, updated_at = NOW(),
+                 start_line = EXCLUDED.start_line, end_line = EXCLUDED.end_line
            RETURNING id"#,
     )
     .bind(path)
@@ -1146,6 +1269,8 @@ async fn upsert_code_node(
     .bind(node_type)
     .bind(project)
     .bind(path)
+    .bind(start_line)
+    .bind(end_line)
     .fetch_one(pool)
     .await?;
     Ok(id)
@@ -2452,6 +2577,44 @@ mod tests {
     fn risk_tier_rank_orders_high_first() {
         assert!(RiskTier::High.rank() > RiskTier::Medium.rank());
         assert!(RiskTier::Medium.rank() > RiskTier::Low.rank());
+    }
+
+    #[test]
+    fn byte_to_line_maps_offsets() {
+        // bytes: a(0) b(1) \n(2) c(3) d(4) \n(5) \n(6) e(7) f(8)
+        // lines: 1=ab[0..2] 2=cd[3..5] 3=blank[6] 4=ef[7..8]
+        let src = "ab\ncd\n\nef";
+        let ls = line_start_offsets(src);
+        assert_eq!(byte_to_line(&ls, 0), 1); // 'a'
+        assert_eq!(byte_to_line(&ls, 1), 1); // 'b'
+        assert_eq!(byte_to_line(&ls, 2), 1); // '\n' belongs to its line
+        assert_eq!(byte_to_line(&ls, 3), 2); // 'c'
+        assert_eq!(byte_to_line(&ls, 6), 3); // the blank line's '\n'
+        assert_eq!(byte_to_line(&ls, 7), 4); // 'e'
+        assert_eq!(byte_to_line(&ls, 8), 4); // 'f'
+    }
+
+    #[test]
+    fn symbol_touched_by_hunks_overlap() {
+        // fn spanning lines 10..=20.
+        let (s, e) = (Some(10), Some(20));
+        assert!(symbol_touched_by_hunks(s, e, &[(15, 15)])); // change inside
+        assert!(symbol_touched_by_hunks(s, e, &[(5, 12)])); // overlaps start
+        assert!(symbol_touched_by_hunks(s, e, &[(18, 30)])); // overlaps end
+        assert!(symbol_touched_by_hunks(s, e, &[(10, 20)])); // exact
+        assert!(!symbol_touched_by_hunks(s, e, &[(1, 9)])); // strictly before
+        assert!(!symbol_touched_by_hunks(s, e, &[(21, 40)])); // strictly after
+        assert!(symbol_touched_by_hunks(s, e, &[(1, 9), (21, 22), (20, 25)])); // any-of
+    }
+
+    #[test]
+    fn symbol_touched_by_hunks_fails_open_on_missing_span() {
+        // No recorded span (pre-V124 node) ⇒ always kept, never hidden.
+        assert!(symbol_touched_by_hunks(None, None, &[(1, 2)]));
+        assert!(symbol_touched_by_hunks(Some(10), None, &[(1, 2)]));
+        assert!(symbol_touched_by_hunks(None, Some(10), &[(1, 2)]));
+        // Empty hunk list with a known span ⇒ not touched.
+        assert!(!symbol_touched_by_hunks(Some(10), Some(20), &[]));
     }
 
     fn fr(path: &str, hash: &str) -> (String, FileRow) {
