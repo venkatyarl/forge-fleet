@@ -74,6 +74,7 @@ mod self_heal_cmd;
 mod skills_cmd;
 mod social_cmd;
 mod software_cmd;
+mod ssh_cmd;
 mod status_cmd;
 mod storage_cmd;
 mod swarm_cmd;
@@ -397,6 +398,29 @@ enum Command {
     Fleet {
         #[command(subcommand)]
         command: FleetCommand,
+    },
+    /// Run a shell command on a fleet computer over SSH.
+    ///
+    /// Resolves the worker's `ssh_user` + IP from Postgres
+    /// (`computers` / `fleet_workers`) — never `~/.ssh/config`. The CLI
+    /// twin of the `fleet_ssh` MCP tool, and the dogfood path for fleet
+    /// debugging: `ff ssh taylor uptime`, `ff ssh ace "ps aux | grep mlx"`.
+    Ssh {
+        /// Worker name (e.g. taylor, ace, sia) or its IP.
+        worker: String,
+        /// Command + args to run remotely. Quote anything with shell
+        /// metacharacters: `ff ssh ace "ps aux | grep mlx"`.
+        #[arg(trailing_var_arg = true, required = true)]
+        command: Vec<String>,
+        /// Run the command under `sudo -n` (passwordless on all but taylor).
+        #[arg(long)]
+        sudo: bool,
+        /// Overall SSH timeout in seconds (connect timeout is min(this, 30)).
+        #[arg(long, default_value = "60")]
+        timeout: u64,
+        /// Emit a JSON object (worker, exit_code, stdout, stderr, duration_ms).
+        #[arg(long)]
+        json: bool,
     },
     /// Manage LLM servers across the fleet.
     Llm {
@@ -2820,6 +2844,16 @@ async fn main() -> Result<()> {
             return versions_cmd::handle_versions(node.clone()).await;
         }
         Some(Command::Fleet { command }) => return fleet_cmd::handle_fleet(command.clone()).await,
+        Some(Command::Ssh {
+            worker,
+            command,
+            sudo,
+            timeout,
+            json,
+        }) => {
+            return ssh_cmd::handle_ssh(worker.clone(), command.clone(), *sudo, *timeout, *json)
+                .await;
+        }
         Some(Command::Llm { command }) => return llm_cmd::handle_llm(command.clone()).await,
         Some(Command::Software { command }) => {
             return software_cmd::handle_software(command.clone()).await;
@@ -3066,6 +3100,13 @@ async fn main() -> Result<()> {
         }
         Some(Command::Versions { node }) => versions_cmd::handle_versions(node).await,
         Some(Command::Fleet { command }) => fleet_cmd::handle_fleet(command).await,
+        Some(Command::Ssh {
+            worker,
+            command,
+            sudo,
+            timeout,
+            json,
+        }) => ssh_cmd::handle_ssh(worker, command, sudo, timeout, json).await,
         Some(Command::Llm { command }) => llm_cmd::handle_llm(command).await,
         Some(Command::Software { command }) => software_cmd::handle_software(command).await,
         Some(Command::Conformance { command }) => conformance_cmd::run(command).await,
