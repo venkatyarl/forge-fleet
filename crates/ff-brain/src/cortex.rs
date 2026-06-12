@@ -1108,6 +1108,71 @@ fn symbol_touched_by_hunks(
     hunks.iter().any(|&(hs, he)| s <= he && hs <= e)
 }
 
+/// Map a file extension to a Cortex language name (`None` = ignored). Pure;
+/// shared by every frontend that needs to decide whether a changed file is a
+/// Cortex source file (the CLI `ff cortex review` and the `cortex_review` MCP
+/// tool both filter with this + [`SUPPORTED_LANGS`]). `py` resolves to
+/// `python` even though it is not yet in `SUPPORTED_LANGS`, so language
+/// detection can count it while review still skips it.
+pub fn ext_lang(ext: &str) -> Option<&'static str> {
+    match ext {
+        "rs" => Some("rust"),
+        "ts" | "tsx" | "mts" | "cts" => Some("typescript"),
+        "js" | "jsx" | "mjs" | "cjs" => Some("javascript"),
+        "java" => Some("java"),
+        "py" => Some("python"),
+        _ => None,
+    }
+}
+
+/// Parse a unified `git diff` (use `--unified=0` for tight hunks) into the
+/// new-file line ranges it touched, keyed by repo-relative path. Reads `+++ b/<p>`
+/// for the path and the `+c,d` side of each `@@ -a,b +c,d @@` header. A pure-text
+/// function so it is unit-testable without a repo and reusable by any frontend
+/// that has a diff (the CLI shells `git diff`, the MCP `cortex_review` tool shells
+/// it in the daemon). Pure additions (`+c,d`), modifications, and deletions
+/// (`+c,0` → records line `c` so a deleted body still flags its enclosing symbol)
+/// are all covered. A `+++ /dev/null` target (whole-file deletion) yields no entry.
+pub fn parse_diff_line_ranges(diff: &str) -> HashMap<String, Vec<(u32, u32)>> {
+    let mut map: HashMap<String, Vec<(u32, u32)>> = HashMap::new();
+    let mut cur: Option<String> = None;
+    for line in diff.lines() {
+        if let Some(rest) = line.strip_prefix("+++ ") {
+            // "+++ b/path" (or "+++ /dev/null" for a deletion).
+            cur = rest
+                .strip_prefix("b/")
+                .filter(|p| *p != "/dev/null")
+                .map(|p| p.to_string());
+        } else if let Some(h) = line.strip_prefix("@@") {
+            // "@@ -a,b +c,d @@ ...": take the +c,d span.
+            if let (Some(path), Some((start, count))) = (cur.as_ref(), parse_hunk_new_span(h)) {
+                // count==0 (pure deletion) still touches the line at `start`.
+                let len = count.max(1);
+                let end = start.saturating_add(len - 1);
+                map.entry(path.clone()).or_default().push((start, end));
+            }
+        }
+    }
+    map
+}
+
+/// Extract the `(start, count)` of the `+c,d` side of a hunk header body (the
+/// text after the leading `@@`). `+c` alone means count 1. Returns `None` if no
+/// `+` field is present. Pure + unit-tested.
+pub fn parse_hunk_new_span(header_body: &str) -> Option<(u32, u32)> {
+    let plus = header_body
+        .split_whitespace()
+        .find(|t| t.starts_with('+'))?;
+    let spec = plus.trim_start_matches('+');
+    let mut parts = spec.split(',');
+    let start: u32 = parts.next()?.parse().ok()?;
+    let count: u32 = match parts.next() {
+        Some(c) => c.parse().ok()?,
+        None => 1,
+    };
+    Some((start, count))
+}
+
 /// Build a change-aware, risk-scored review report for a set of changed files.
 ///
 /// `changed_abs_paths` are absolute filesystem paths (the terminal layer derives
@@ -2571,6 +2636,56 @@ mod tests {
         // Nothing external + tiny closure → low (e.g. a brand-new helper).
         assert_eq!(risk_tier(0, 0), RiskTier::Low);
         assert_eq!(risk_tier(2, 0), RiskTier::Low);
+    }
+
+    #[test]
+    fn hunk_new_span_parses_count_and_default() {
+        assert_eq!(parse_hunk_new_span(" -1,4 +10,3 @@ fn foo"), Some((10, 3)));
+        assert_eq!(parse_hunk_new_span(" -5 +12 @@"), Some((12, 1))); // no count ⇒ 1
+        assert_eq!(parse_hunk_new_span(" -1,2 +0,0 @@"), Some((0, 0))); // pure deletion
+        assert_eq!(parse_hunk_new_span(" -1,2 @@"), None); // no + side
+    }
+
+    #[test]
+    fn diff_line_ranges_extracts_new_side() {
+        let diff = "\
+diff --git a/src/a.rs b/src/a.rs
+index 111..222 100644
+--- a/src/a.rs
++++ b/src/a.rs
+@@ -10,2 +10,3 @@ fn alpha() {
++    let x = 1;
+@@ -40,0 +42,5 @@ fn beta() {
++    more();
+diff --git a/src/b.rs b/src/b.rs
+--- a/src/b.rs
++++ b/src/b.rs
+@@ -7,3 +7,0 @@ fn gone() {
+";
+        let m = parse_diff_line_ranges(diff);
+        // a.rs: +10,3 → 10..=12 ; +42,5 → 42..=46
+        assert_eq!(m.get("src/a.rs").unwrap(), &vec![(10, 12), (42, 46)]);
+        // b.rs: pure deletion +7,0 → still flags line 7 (enclosing symbol).
+        assert_eq!(m.get("src/b.rs").unwrap(), &vec![(7, 7)]);
+    }
+
+    #[test]
+    fn diff_line_ranges_skips_dev_null_target() {
+        // A fully deleted file (+++ /dev/null) yields no entry.
+        let diff = "\
+--- a/src/dead.rs
++++ /dev/null
+@@ -1,3 +0,0 @@
+";
+        assert!(parse_diff_line_ranges(diff).is_empty());
+    }
+
+    #[test]
+    fn ext_lang_maps_known_extensions() {
+        assert_eq!(ext_lang("rs"), Some("rust"));
+        assert_eq!(ext_lang("tsx"), Some("typescript"));
+        assert_eq!(ext_lang("java"), Some("java"));
+        assert_eq!(ext_lang("md"), None);
     }
 
     #[test]

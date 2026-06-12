@@ -125,7 +125,9 @@ impl McpServer {
                      • `cortex_*` — pre-indexed code graph. `cortex_corpora` lists\n\
                        indexed repos; `cortex_callers`/`cortex_callees`/`cortex_impact`\n\
                        answer who-calls / what-it-calls / blast-radius for a symbol —\n\
-                       token-cheaper than grepping for call sites.\n\
+                       token-cheaper than grepping for call sites. `cortex_review`\n\
+                       risk-scores a git diff (fan-in / blast radius per changed\n\
+                       symbol) so you review the riskiest changes first.\n\
                      • `computer_use` — browser/screenshot on a fleet computer.\n\
                      \n\
                      The fleet has idle local capacity (15 computers, mix of macOS / \n\

@@ -6,10 +6,13 @@
 //! `cortex_callees`, and `cortex_impact` (transitive blast radius). The graph is
 //! built by `ff cortex index`; these tools only query it.
 
-use ff_brain::{callees, callers, corpus, impact};
+use ff_brain::{callees, callers, corpus, cortex, impact};
 use ff_core::config;
 use serde_json::{Value, json};
 use sqlx::postgres::PgPoolOptions;
+use std::collections::HashMap;
+use std::path::Path;
+use std::process::Command;
 
 use crate::handlers::HandlerResult;
 
@@ -124,4 +127,181 @@ pub async fn cortex_impact(params: Option<Value>) -> HandlerResult {
         "count": rows.len(),
         "impacted": symbols_json(&rows),
     }))
+}
+
+/// Change-aware, risk-scored review map (the CLI `ff cortex review` over MCP).
+///
+/// The daemon shells `git` in the caller-supplied `repo_dir` to derive the
+/// changed files + touched line ranges, then scores them against the Cortex
+/// graph (`ff_brain::cortex::review`) so an agent knows WHERE TO LOOK FIRST in a
+/// diff — a tweak to a function dozens of callers depend on outranks a new
+/// private helper. `repo_dir` must be the same checkout that was indexed
+/// (`ff cortex index`), since review matches files by absolute path.
+pub async fn cortex_review(params: Option<Value>) -> HandlerResult {
+    let corpus_slug = params
+        .as_ref()
+        .and_then(|p| p.get("corpus"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            "missing required parameter: corpus (the indexed repo slug; \
+             list them with cortex_corpora)"
+                .to_string()
+        })?
+        .to_string();
+    let repo_dir = params
+        .as_ref()
+        .and_then(|p| p.get("repo_dir"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            "missing required parameter: repo_dir (absolute path to the git \
+             checkout that was indexed)"
+                .to_string()
+        })?
+        .to_string();
+    let base = params
+        .as_ref()
+        .and_then(|p| p.get("base"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let depth = params
+        .as_ref()
+        .and_then(|p| p.get("depth"))
+        .and_then(|v| v.as_u64())
+        .map(|d| d.clamp(1, 20) as usize)
+        .unwrap_or(5);
+
+    let root = Path::new(&repo_dir);
+    if !root.is_dir() {
+        return Err(format!(
+            "repo_dir does not exist or is not a directory: {repo_dir}"
+        ));
+    }
+
+    // Changed files (repo-relative) → keep only Cortex-supported source → absolute
+    // (the path form stored on content:file nodes).
+    let changed_rel = git_changed_files(root, base.as_deref())?;
+    let changed_abs: Vec<String> = changed_rel
+        .iter()
+        .filter(|rel| {
+            Path::new(rel)
+                .extension()
+                .and_then(|e| e.to_str())
+                .and_then(cortex::ext_lang)
+                .map(|l| cortex::SUPPORTED_LANGS.contains(&l))
+                .unwrap_or(false)
+        })
+        .map(|rel| root.join(rel).to_string_lossy().to_string())
+        .collect();
+
+    if changed_abs.is_empty() {
+        return Ok(json!({
+            "corpus": corpus_slug,
+            "base": base,
+            "changed_files": 0,
+            "note": "no changed Cortex-supported source files to review",
+        }));
+    }
+
+    // Hunk-level refinement: line ranges the diff touched (working-tree coords =
+    // the revision Cortex parsed). Best-effort — fall back to file-level if unread.
+    let changed_lines = git_changed_line_ranges(root, base.as_deref()).unwrap_or_default();
+
+    let pool = get_pool().await?;
+    let report = cortex::review(
+        &pool,
+        &corpus_slug,
+        &changed_abs,
+        depth,
+        Some(&changed_lines),
+    )
+    .await
+    .map_err(|e| format!("review: {e}"))?;
+
+    let mut value = serde_json::to_value(&report).map_err(|e| format!("serialize report: {e}"))?;
+    if let Value::Object(ref mut map) = value {
+        map.insert("corpus".to_string(), json!(corpus_slug));
+        map.insert("base".to_string(), json!(base));
+        map.insert("depth".to_string(), json!(depth));
+    }
+    Ok(value)
+}
+
+/// Changed files (repo-relative) from `git diff` in `root`. With `base`, the
+/// branch's own commits (`base...HEAD`) plus uncommitted edits; without it, just
+/// uncommitted work (staged + unstaged + untracked) vs HEAD. Deduped + sorted.
+/// (Frontend glue — mirrors the CLI's derivation; the pure diff parsing it feeds
+/// lives in `ff_brain::cortex`.)
+fn git_changed_files(root: &Path, base: Option<&str>) -> Result<Vec<String>, String> {
+    use std::collections::BTreeSet;
+    let run = |args: &[&str]| -> Result<Vec<String>, String> {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .map_err(|e| format!("run git {}: {e}", args.join(" ")))?;
+        if !out.status.success() {
+            return Err(format!(
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect())
+    };
+
+    let mut files: BTreeSet<String> = BTreeSet::new();
+    if let Some(b) = base {
+        for f in run(&["diff", "--name-only", &format!("{b}...HEAD")])? {
+            files.insert(f);
+        }
+    }
+    for f in run(&["diff", "--name-only", "HEAD"])? {
+        files.insert(f);
+    }
+    for f in run(&["ls-files", "--others", "--exclude-standard"])? {
+        files.insert(f);
+    }
+    Ok(files.into_iter().collect())
+}
+
+/// Changed line ranges per file (absolute path → 1-based inclusive `(start,end)`
+/// ranges in the WORKING-TREE revision). Single two-dot diff so every range is in
+/// one coordinate space. Parsing is shared with the CLI via
+/// `ff_brain::cortex::parse_diff_line_ranges`.
+fn git_changed_line_ranges(
+    root: &Path,
+    base: Option<&str>,
+) -> Result<HashMap<String, Vec<(u32, u32)>>, String> {
+    let mut args = vec!["diff", "--unified=0", "--no-color"];
+    let base_spec;
+    if let Some(b) = base {
+        base_spec = b.to_string();
+        args.push(&base_spec);
+    } else {
+        args.push("HEAD");
+    }
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(&args)
+        .output()
+        .map_err(|e| format!("run git {}: {e}", args.join(" ")))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let diff = String::from_utf8_lossy(&out.stdout);
+    let by_rel = cortex::parse_diff_line_ranges(&diff);
+    Ok(by_rel
+        .into_iter()
+        .map(|(rel, ranges)| (root.join(rel).to_string_lossy().to_string(), ranges))
+        .collect())
 }
