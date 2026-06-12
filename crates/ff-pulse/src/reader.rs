@@ -253,6 +253,9 @@ impl PulseReader {
         .and_then(|s| serde_json::from_str(&s).ok());
         tracing::debug!(model = %requested, "GW.2 reader: post-pg-query");
 
+        // Capture before the move below — the stale-alias fallback needs to know
+        // whether `requested` was a recognised pool alias.
+        let is_known_alias = pool_members.as_ref().is_some_and(|m| !m.is_empty());
         let candidate_ids: Vec<String> = match pool_members {
             Some(members) if !members.is_empty() => members,
             _ => vec![requested.to_string()],
@@ -272,7 +275,7 @@ impl PulseReader {
         let beats = self.all_beats().await?;
         tracing::debug!(model = %requested, count = beats.len(), "GW.2 reader: post-all-beats");
         let mut candidates: Vec<(String, LlmServer)> = Vec::new();
-        for b in beats {
+        for b in &beats {
             if b.going_offline {
                 continue;
             }
@@ -290,6 +293,40 @@ impl PulseReader {
                 if matches {
                     candidates.push((b.computer_name.clone(), s.clone()));
                 }
+            }
+        }
+
+        // 2b. STALE-ALIAS FALLBACK. When the requested string is a KNOWN pool
+        // alias (it matched a fleet_task_coverage row) but none of its
+        // `preferred_model_ids` map to a live healthy server — typically because
+        // the catalog entry drifted (e.g. `thinking` still pointed at
+        // qwen3.5-…-mlx long after the fleet moved to qwen3.6) — fall back to any
+        // healthy chat server rather than failing the request outright. This is
+        // gated on `is_known_alias`: a bogus *exact* model id still
+        // returns None (a typo must not silently route to a random model).
+        // Embedders / rerankers are excluded so a chat alias never lands on bge.
+        if candidates.is_empty() && is_known_alias {
+            for b in &beats {
+                if b.going_offline {
+                    continue;
+                }
+                for s in &b.llm_servers {
+                    if s.status == "active"
+                        && s.is_healthy
+                        && s.openai_compatible
+                        && !looks_like_embedder(&s.model.id)
+                    {
+                        candidates.push((b.computer_name.clone(), s.clone()));
+                    }
+                }
+            }
+            if !candidates.is_empty() {
+                tracing::warn!(
+                    alias = %requested,
+                    fallbacks = candidates.len(),
+                    "pool alias had no live preferred model; falling back to a healthy chat server \
+                     (refresh fleet_task_coverage.preferred_model_ids for this alias)"
+                );
             }
         }
 
@@ -356,3 +393,32 @@ impl PulseReader {
 }
 
 use ff_core::model_id::normalize_model_id;
+
+/// Heuristic: does this model id name an embedding / reranking server rather
+/// than a chat model? Used by the stale-alias fallback so a chat pool alias
+/// (general / thinking / coder / …) never lands on bge-m3 or a reranker. Matches
+/// the fleet's embedder naming (`bge-*`, `*-embedding-*`, `*-rerank*`).
+fn looks_like_embedder(model_id: &str) -> bool {
+    let n = normalize_model_id(model_id);
+    n.contains("bge") || n.contains("embed") || n.contains("rerank")
+}
+
+#[cfg(test)]
+mod fallback_tests {
+    use super::looks_like_embedder;
+
+    #[test]
+    fn embedders_and_rerankers_are_excluded() {
+        assert!(looks_like_embedder("bge-m3"));
+        assert!(looks_like_embedder("BAAI/bge-reranker-v2-m3"));
+        assert!(looks_like_embedder("nomic-embed-text-v1.5"));
+        assert!(looks_like_embedder("Qwen3-Embedding-0.6B"));
+    }
+
+    #[test]
+    fn chat_models_are_not_excluded() {
+        assert!(!looks_like_embedder("qwen3.5-35b-instruct-mlx"));
+        assert!(!looks_like_embedder("Qwen/Qwen2.5-Coder-32B-Instruct"));
+        assert!(!looks_like_embedder("gemma-4-27b-it"));
+    }
+}
