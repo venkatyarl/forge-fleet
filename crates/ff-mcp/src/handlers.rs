@@ -640,7 +640,8 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
                 .and_then(|v| v.as_str()),
         );
 
-        return crate::strategy_dispatch::dispatch_strategy(
+        let started = std::time::Instant::now();
+        let result = crate::strategy_dispatch::dispatch_strategy(
             &exec,
             prompt,
             strategy_str,
@@ -648,6 +649,62 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
             validator_override,
         )
         .await;
+
+        // Interaction-log capture for Path 3 (strategy=auto/single/cascade/
+        // judge_escalate). The legacy tier path captures below; this branch
+        // returns early and used to skip it entirely, so the recommended
+        // `strategy=auto` default never reached the SLM corpus.
+        if let Ok(value) = &result {
+            let prompt_owned = prompt.to_string();
+            let response_owned = value
+                .get("output")
+                .or_else(|| value.get("response"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .unwrap_or_default();
+            let route_decision = value.get("strategy").cloned().unwrap_or(json!({}));
+            let engine_owned = value
+                .get("strategy")
+                .and_then(|s| s.get("model").or_else(|| s.get("engine")))
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let tokens_out = value
+                .get("usage")
+                .and_then(|u| u.get("completion_tokens"))
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0) as i32;
+            let tokens_in = value
+                .get("usage")
+                .and_then(|u| u.get("prompt_tokens"))
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0) as i32;
+            let latency_ms = started.elapsed().as_millis().min(i32::MAX as u128) as i32;
+            let strategy_label = strategy_str.to_string();
+            if let Ok((cfg2, _)) = load_config_auto() {
+                tokio::spawn(async move {
+                    if let Ok(pool) = get_pg_pool(&cfg2).await {
+                        let rec = ff_db::InteractionRecord {
+                            channel: "mcp".to_string(),
+                            request_text: prompt_owned,
+                            request_meta: json!({ "strategy": strategy_label }),
+                            route_decision,
+                            engine: engine_owned,
+                            response_text: response_owned,
+                            tokens_in,
+                            tokens_out,
+                            latency_ms: Some(latency_ms),
+                            outcome: "ok".to_string(),
+                            ..Default::default()
+                        };
+                        if let Err(e) = ff_db::pg_record_interaction(&pool, &rec).await {
+                            tracing::debug!("fleet_run Path-3 interaction capture failed: {e}");
+                        }
+                    }
+                });
+            }
+        }
+
+        return result;
     }
 
     let (config, _config_path) = load_config_auto()?;

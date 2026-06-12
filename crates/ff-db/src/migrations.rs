@@ -733,9 +733,16 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         sql: schema::SCHEMA_V120_FLEET_CONFORMANCE,
     },
     PgMigration {
-        version: 121,
+        // NOTE: V121 was already consumed by `cortex_code_graph` (applied to the
+        // live DB during the overnight Cortex session) before this migration
+        // merged. Because the runner only applies `version > current`, keeping
+        // this at 121 meant it NEVER ran — `ff_interactions` was never created
+        // and every interaction-log capture hook silently no-op'd. Renumbered to
+        // 122 (the next free version) so it actually executes. Idempotent
+        // (CREATE TABLE IF NOT EXISTS), so re-running anywhere is safe.
+        version: 122,
         name: "interaction_log",
-        sql: schema::SCHEMA_V121_INTERACTION_LOG,
+        sql: schema::SCHEMA_V122_INTERACTION_LOG,
     },
 ];
 
