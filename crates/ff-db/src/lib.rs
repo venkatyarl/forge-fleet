@@ -166,6 +166,7 @@ pub use queries::{
     pg_open_disk_move,
     pg_pending_work_intents,
     pg_pick_agent_endpoint,
+    pg_pick_agent_endpoint_soft,
     pg_pick_offload_endpoint,
     pg_placement_candidates,
     pg_promote_deferred,

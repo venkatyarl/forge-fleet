@@ -2585,6 +2585,44 @@ pub async fn pg_pick_agent_endpoint(
         .next())
 }
 
+/// Did a soft-exclude pick end up using a soft-excluded host? Given whether the
+/// preference-honoring pass found a candidate (`preferred_hit`) and whether the
+/// no-exclusion fallback pass found one (`fallback_hit`), the answer is "the
+/// preference couldn't be honored but a fallback exists". When the first pass
+/// hits, the fallback never runs and this is `false`; the fallback candidate can
+/// ONLY be a soft-excluded host (the two passes differ solely by the exclusion),
+/// so a fallback hit after a first-pass miss means an excluded host was used.
+fn soft_fallback_used(preferred_hit: bool, fallback_hit: bool) -> bool {
+    !preferred_hit && fallback_hit
+}
+
+/// Like [`pg_pick_agent_endpoint`] but treats `soft_exclude` as a PREFERENCE,
+/// not a hard filter. First try honoring the exclusion (keep agents off, e.g.,
+/// the leader); if nothing qualifies, retry WITHOUT it so availability is never
+/// sacrificed to the preference. Returns the chosen candidate plus a flag that
+/// is `true` exactly when the fallback fired — i.e. a soft-excluded host was the
+/// only agent-capable endpoint and had to be used anyway. Callers surface that
+/// flag so "wanted to keep this off the leader but couldn't" is reported, not
+/// silent. An empty `soft_exclude` is identical to [`pg_pick_agent_endpoint`].
+pub async fn pg_pick_agent_endpoint_soft(
+    pool: &PgPool,
+    min_ctx: i32,
+    soft_exclude: &[String],
+) -> Result<(Option<RouteCandidate>, bool)> {
+    if soft_exclude.is_empty() {
+        return Ok((pg_pick_agent_endpoint(pool, min_ctx, &[]).await?, false));
+    }
+    // Pass 1: honor the preference.
+    let preferred = pg_pick_agent_endpoint(pool, min_ctx, soft_exclude).await?;
+    if preferred.is_some() {
+        return Ok((preferred, false));
+    }
+    // Pass 2: preference unsatisfiable — fall back to the full fleet.
+    let fallback = pg_pick_agent_endpoint(pool, min_ctx, &[]).await?;
+    let used_excluded = soft_fallback_used(false, fallback.is_some());
+    Ok((fallback, used_excluded))
+}
+
 /// Active-deployment count per worker — a cheap host-load proxy for offload's
 /// least-loaded tiebreak (a host serving 5 model servers is busier than one
 /// serving 1; this is what stalled an offload on a 5-server host for 8 min).
@@ -4597,6 +4635,17 @@ mod tests {
         let got = normalize_exclude_hosts(&["Taylor".into(), "JAMES".into(), "sia".into()]);
         assert_eq!(got, vec!["taylor", "james", "sia"]);
         assert!(normalize_exclude_hosts(&[]).is_empty());
+    }
+
+    #[test]
+    fn test_soft_fallback_used() {
+        // Preference honored (pass 1 hit) → never a fallback, regardless of pass 2.
+        assert!(!soft_fallback_used(true, true));
+        assert!(!soft_fallback_used(true, false));
+        // Preference missed but fleet-wide fallback hit → a soft-excluded host was used.
+        assert!(soft_fallback_used(false, true));
+        // Nothing anywhere → no candidate, so no excluded host was used.
+        assert!(!soft_fallback_used(false, false));
     }
 
     #[test]

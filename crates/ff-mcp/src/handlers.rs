@@ -1929,6 +1929,7 @@ pub async fn fleet_crew(params: Option<Value>) -> HandlerResult {
                 "unrouted": crew_routing.unrouted_agents.len(),
                 "unrouted_agents": crew_routing.unrouted_agents,
                 "used_template_fallback": crew_routing.used_template_fallback,
+                "leader_fallbacks": crew_routing.leader_fallbacks,
                 "degraded": crew_routing.degraded()
             }
         },
@@ -2880,6 +2881,11 @@ struct CrewRouting {
     /// (DB unreachable / empty catalog / no enabled matching agents) — itself a
     /// degraded path, since those templates carry no routed endpoints.
     used_template_fallback: bool,
+    /// Agents that were routed to a *soft-excluded* host (the leader) only
+    /// because no non-leader agent-capable endpoint qualified. NOT degraded —
+    /// the agent still got a real fleet endpoint — but worth surfacing so the
+    /// "keep load off the leader" preference is visibly being overridden.
+    leader_fallbacks: Vec<String>,
 }
 
 impl CrewRouting {
@@ -2923,10 +2929,17 @@ async fn build_crew_team(policy: Option<&AppliedProjectPolicy>) -> (TeamConfig, 
         return fallback("pg_pool_unavailable");
     };
 
-    // Keep agent load off the leader (Taylor) when other hosts can serve it —
-    // mirrors the agent-swarm router's intent. The router still picks Taylor
-    // if it's the only agent-capable endpoint (exclude is best-effort below).
-    let exclude_hosts: Vec<String> = Vec::new();
+    // Keep agent load off the leader when other hosts can serve it — a SOFT
+    // preference, not a hard filter. The leader name is resolved from the DB
+    // election state (never hardcoded); `pg_pick_agent_endpoint_soft` honors the
+    // exclusion when a non-leader endpoint qualifies and transparently falls
+    // back to the leader (recorded in `leader_fallbacks`) when it's the only
+    // agent-capable endpoint, so availability is never sacrificed to the
+    // preference. Empty when there's no leader row → identical to the old path.
+    let soft_exclude: Vec<String> = match ff_db::pg_get_current_leader(&pool).await {
+        Ok(Some(leader)) => vec![leader.member_name],
+        _ => Vec::new(),
+    };
 
     let names = crew_agent_names_for_policy(policy);
     let mut team = TeamConfig::new(
@@ -2943,13 +2956,19 @@ async fn build_crew_team(policy: Option<&AppliedProjectPolicy>) -> (TeamConfig, 
         };
         let role = AgentAssignment::role_for_agent_name(&row.name);
         // Resolve the endpoint via the V111 capability router for this agent's
-        // ctx floor. `None` means no agent-capable fleet endpoint — the executor
-        // falls back to its default, so we record + log the degradation.
-        let endpoint = ff_db::pg_pick_agent_endpoint(&pool, row.min_ctx, &exclude_hosts)
-            .await
-            .ok()
-            .flatten()
-            .map(|c| c.endpoint);
+        // ctx floor, soft-preferring non-leader hosts. `None` means no
+        // agent-capable fleet endpoint at all — the executor falls back to its
+        // default, so we record + log the degradation. A `true` fallback flag
+        // means it had to use the leader (preference overridden) — recorded but
+        // not degraded.
+        let (candidate, used_leader) =
+            ff_db::pg_pick_agent_endpoint_soft(&pool, row.min_ctx, &soft_exclude)
+                .await
+                .unwrap_or((None, false));
+        if used_leader {
+            routing.leader_fallbacks.push(row.name.clone());
+        }
+        let endpoint = candidate.map(|c| c.endpoint);
         match &endpoint {
             Some(_) => routing.routed += 1,
             None => {
@@ -2976,6 +2995,12 @@ async fn build_crew_team(policy: Option<&AppliedProjectPolicy>) -> (TeamConfig, 
                 routed = routing.routed,
                 unrouted = routing.unrouted_agents.len(),
                 "fleet_crew: crew built with degraded routing — some agents have no fleet endpoint"
+            );
+        }
+        if !routing.leader_fallbacks.is_empty() {
+            warn!(
+                leader_fallbacks = routing.leader_fallbacks.len(),
+                "fleet_crew: no non-leader agent-capable endpoint for some agents — routed them to the leader (preference overridden)"
             );
         }
         (team, routing)
@@ -4025,8 +4050,7 @@ mod tests {
         // Fully routed crew → not degraded.
         let ok = CrewRouting {
             routed: 2,
-            unrouted_agents: vec![],
-            used_template_fallback: false,
+            ..Default::default()
         };
         assert!(!ok.degraded());
 
@@ -4034,18 +4058,26 @@ mod tests {
         let partial = CrewRouting {
             routed: 1,
             unrouted_agents: vec!["code_writer".to_string()],
-            used_template_fallback: false,
+            ..Default::default()
         };
         assert!(partial.degraded());
 
         // Template fallback (DB/catalog unavailable) → degraded even with no
         // per-agent unrouted entries.
         let fallback = CrewRouting {
-            routed: 0,
-            unrouted_agents: vec![],
             used_template_fallback: true,
+            ..Default::default()
         };
         assert!(fallback.degraded());
+
+        // Leader fallback alone is NOT degraded — the agent still got a real
+        // fleet endpoint, just on the soft-excluded leader.
+        let leader_only = CrewRouting {
+            routed: 2,
+            leader_fallbacks: vec!["code_writer".to_string()],
+            ..Default::default()
+        };
+        assert!(!leader_only.degraded());
     }
 
     fn setup_test_db() -> (String, Option<String>) {
