@@ -58,6 +58,14 @@
 //!   constructor `Foo::Foo`; bare calls resolve alias-first (static imports)
 //!   then to the enclosing class; Upper.m() via alias map or same-package class.
 //!
+//! PYTHON (parse_python_file) — module = the file's package path (ancestor dirs
+//!   carrying `__init__.py`, then the file stem; `__init__.py` collapses to its
+//!   package). `class` bodies nest (module::Class::method); `from m import f`
+//!   binds the leaf in the alias map so bare `f()` resolves to `m::f`, while a
+//!   plain `import a.b` only records the use target (the head package stays an
+//!   extern receiver); `self.m()` -> the enclosing class; unknown receivers are
+//!   kept as written (code:extern, still matched by bare-leaf callers_of queries).
+//!
 //! index() is idempotent: it DELETEs prior code:* nodes for the corpus (edges
 //! cascade via brain_vault_edges ON DELETE CASCADE), then re-extracts.
 
@@ -128,10 +136,11 @@ enum Lang {
     /// TypeScript / TSX / JavaScript (all parsed by the TS/TSX grammars).
     TypeScript,
     Java,
+    Python,
 }
 
 /// Languages `index()` accepts (also drives the terminal's auto-detect filter).
-pub const SUPPORTED_LANGS: &[&str] = &["rust", "typescript", "javascript", "java"];
+pub const SUPPORTED_LANGS: &[&str] = &["rust", "typescript", "javascript", "java", "python"];
 
 /// Per-file parse result.
 struct FileParse {
@@ -157,6 +166,7 @@ fn lang_patterns(lang: &str) -> Result<Vec<String>> {
         "typescript" => &["%.ts", "%.tsx", "%.mts", "%.cts"],
         "javascript" => &["%.js", "%.jsx", "%.mjs", "%.cjs"],
         "java" => &["%.java"],
+        "python" => &["%.py"],
         _ => anyhow::bail!(
             "cortex: --lang must be one of {} (got '{lang}')",
             SUPPORTED_LANGS.join("/")
@@ -654,6 +664,7 @@ async fn extract_files(
             "rust" => parse_rust_file(&file_path, &source),
             "typescript" | "javascript" => parse_typescript_file(&file_path, &source),
             "java" => parse_java_file(&file_path, &source),
+            "python" => parse_python_file(&file_path, &source),
             _ => unreachable!("lang validated by lang_patterns"),
         };
         let parse = match parse {
@@ -2380,6 +2391,253 @@ fn java_type_path(node: &Node, bytes: &[u8]) -> Option<String> {
     }
 }
 
+// ─── Parsing (tree-sitter-python) ────────────────────────────────────────────
+
+/// Parse a Python file. Module = the file's package path (dotted dirs that carry
+/// an `__init__.py`, then the file stem; `__init__.py` collapses to its package).
+/// `class` bodies nest (module::Class), `def`s become code:function under their
+/// enclosing class or the module. Call resolution is the dotty form shared with
+/// TS/Java: imported names (`from m import f` → bare `f()`) bind through the alias
+/// map, `self` plays the role of the enclosing class, unknown receivers are kept
+/// verbatim so the extern node still answers bare-leaf `callers_of` queries.
+fn parse_python_file(file_path: &str, source: &str) -> Option<FileParse> {
+    let (crate_name, module) = python_module_for_file(file_path);
+
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_python::LANGUAGE.into())
+        .ok()?;
+    let tree = parser.parse(source, None)?;
+    let root = tree.root_node();
+    let bytes = source.as_bytes();
+
+    let mut fp = FileParse {
+        lang: Lang::Python,
+        module: module.clone(),
+        crate_name,
+        symbols: Vec::new(),
+        calls: Vec::new(),
+        use_targets: Vec::new(),
+        alias_map: HashMap::new(),
+    };
+    walk_python(&root, bytes, &module, None, &mut fp);
+    // One global call pass (byte-span attribution via innermost_fn).
+    collect_python_calls(&root, bytes, &mut fp);
+    Some(fp)
+}
+
+fn walk_python(
+    node: &Node,
+    bytes: &[u8],
+    mod_path: &str,
+    parent: Option<usize>,
+    fp: &mut FileParse,
+) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "import_statement" | "import_from_statement" => {
+                collect_python_import(&child, bytes, fp)
+            }
+            "class_definition" => {
+                if let Some(name) = child_field_text(&child, "name", bytes) {
+                    let type_path = join(mod_path, &name);
+                    let idx = fp.symbols.len();
+                    fp.symbols.push(Symbol {
+                        qualified_name: type_path.clone(),
+                        node_type: "code:class",
+                        start: child.start_byte(),
+                        end: child.end_byte(),
+                        parent,
+                    });
+                    // Methods qualify under the class: module::Class::method.
+                    walk_python(&child, bytes, &type_path, Some(idx), fp);
+                }
+            }
+            "function_definition" => {
+                if let Some(name) = child_field_text(&child, "name", bytes) {
+                    let idx = fp.symbols.len();
+                    fp.symbols.push(Symbol {
+                        qualified_name: join(mod_path, &name),
+                        node_type: "code:function",
+                        start: child.start_byte(),
+                        end: child.end_byte(),
+                        parent,
+                    });
+                    // Nested defs inside the body keep the same module path.
+                    walk_python(&child, bytes, mod_path, Some(idx), fp);
+                }
+            }
+            // decorated_definition / block / etc.: descend, same scope.
+            _ => walk_python(&child, bytes, mod_path, parent, fp),
+        }
+    }
+}
+
+/// `import a.b.c`, `import a.b as c`, `from a.b import c, d as e`, `from . import x`,
+/// `from a import *`. Imported leaf names bind in the alias map so a later bare
+/// `c()` resolves to `a::b::c`; a plain `import a.b.c` only records the use target
+/// (Python binds the head package `a`, which we leave as an extern receiver).
+fn collect_python_import(node: &Node, bytes: &[u8], fp: &mut FileParse) {
+    let mut cursor = node.walk();
+    if node.kind() == "import_statement" {
+        for c in node.children(&mut cursor) {
+            match c.kind() {
+                "dotted_name" => {
+                    if let Some(t) = node_text(&c, bytes) {
+                        fp.use_targets.push(t.replace('.', "::"));
+                    }
+                }
+                "aliased_import" => {
+                    // `import a.b as c` — bind the alias to the full path.
+                    let full = c
+                        .child_by_field_name("name")
+                        .and_then(|n| node_text(&n, bytes))
+                        .map(|t| t.replace('.', "::"));
+                    let alias = child_field_text(&c, "alias", bytes);
+                    if let (Some(full), Some(alias)) = (full, alias) {
+                        fp.use_targets.push(full.clone());
+                        fp.alias_map.insert(alias, full);
+                    }
+                }
+                _ => {}
+            }
+        }
+        return;
+    }
+
+    // import_from_statement: `from <module_name> import <names>`.
+    let base = node
+        .child_by_field_name("module_name")
+        .and_then(|m| python_module_name(&m, bytes))
+        .unwrap_or_default();
+    for c in node.children(&mut cursor) {
+        // Skip the module_name node itself (it is the source, not an imported name).
+        if Some(c.id()) == node.child_by_field_name("module_name").map(|m| m.id()) {
+            continue;
+        }
+        match c.kind() {
+            "dotted_name" | "identifier" => {
+                if let Some(name) = node_text(&c, bytes) {
+                    let leaf = name.replace('.', "::");
+                    let full = join(&base, &leaf);
+                    register_use(&full, &leaf, fp);
+                }
+            }
+            "aliased_import" => {
+                let name = c
+                    .child_by_field_name("name")
+                    .and_then(|n| node_text(&n, bytes))
+                    .map(|t| t.replace('.', "::"));
+                let alias = child_field_text(&c, "alias", bytes);
+                if let (Some(name), Some(alias)) = (name, alias) {
+                    let full = join(&base, &name);
+                    fp.use_targets.push(full.clone());
+                    fp.alias_map.insert(alias, full);
+                }
+            }
+            "wildcard_import" => {
+                if !base.is_empty() {
+                    fp.use_targets.push(base.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// `module_name` of a from-import: a `dotted_name` (`a.b`) or a `relative_import`
+/// (`.`, `..mod`). Relative dots are dropped — we keep just the named tail so a
+/// relative import still binds the leaf without inventing a package path.
+fn python_module_name(node: &Node, bytes: &[u8]) -> Option<String> {
+    match node.kind() {
+        "dotted_name" => node_text(node, bytes).map(|t| t.replace('.', "::")),
+        "relative_import" => {
+            // `relative_import` = import_prefix (dots) + optional dotted_name.
+            let mut cursor = node.walk();
+            node.children(&mut cursor)
+                .find(|c| c.kind() == "dotted_name")
+                .and_then(|c| node_text(&c, bytes))
+                .map(|t| t.replace('.', "::"))
+        }
+        _ => None,
+    }
+}
+
+/// One global pass over the tree: every `call` node, attributed to its enclosing
+/// function by byte span in the second pass. `f()` → `f`; `self.f()` → `self::f`;
+/// `a.b.c()` → `a::b::c`. Receivers we cannot express as a plain ident/attribute
+/// chain (call results, subscripts) are skipped.
+fn collect_python_calls(node: &Node, bytes: &[u8], fp: &mut FileParse) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "call" {
+            if let Some(func) = child.child_by_field_name("function") {
+                if let Some(raw) = python_callee_path(&func, bytes) {
+                    fp.calls.push(CallSite {
+                        raw_path: raw,
+                        at: child.start_byte(),
+                    });
+                }
+            }
+        }
+        collect_python_calls(&child, bytes, fp);
+    }
+}
+
+/// Turn a call's `function` node into a `::`-joined path. Identifiers and
+/// attribute chains of identifiers (`a.b.c`) resolve; anything else (a call
+/// result `foo().bar`, a subscript `d[k].m`) yields `None`.
+fn python_callee_path(node: &Node, bytes: &[u8]) -> Option<String> {
+    match node.kind() {
+        "identifier" => node_text(node, bytes),
+        "attribute" => {
+            let obj = python_callee_path(&node.child_by_field_name("object")?, bytes)?;
+            let attr = node_text(&node.child_by_field_name("attribute")?, bytes)?;
+            Some(format!("{obj}::{attr}"))
+        }
+        _ => None,
+    }
+}
+
+/// Derive (crate_name, module) for a Python file from its package path: ancestor
+/// directories that carry an `__init__.py` are package segments (top-down), then
+/// the file stem (`__init__.py` collapses to its package). With no package on
+/// disk the module is just the file stem — which is what the unit tests exercise.
+fn python_module_for_file(file_path: &str) -> (String, String) {
+    let path = Path::new(file_path);
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "module".to_string());
+
+    let mut pkgs: Vec<String> = Vec::new();
+    let mut dir = path.parent();
+    while let Some(d) = dir {
+        if d.join("__init__.py").is_file() {
+            if let Some(name) = d.file_name() {
+                pkgs.push(name.to_string_lossy().to_string());
+            }
+            dir = d.parent();
+        } else {
+            break;
+        }
+    }
+    pkgs.reverse(); // top package first
+
+    let mut segs = pkgs;
+    if stem != "__init__" {
+        segs.push(stem.clone());
+    }
+    let module = if segs.is_empty() {
+        stem.clone()
+    } else {
+        segs.join("::")
+    };
+    let crate_name = segs.into_iter().next().unwrap_or(stem);
+    (crate_name, module)
+}
+
 // ─── Call resolution (THE DIFFERENTIATOR) ────────────────────────────────────
 
 /// Resolve a raw call path to a fully-qualified name, given the enclosing fn's
@@ -2387,7 +2645,7 @@ fn java_type_path(node: &Node, bytes: &[u8]) -> Option<String> {
 pub(crate) fn resolve_call(raw: &str, caller_qn: &str, fp: &FileParse) -> String {
     match fp.lang {
         Lang::Rust => resolve_call_inner(raw, caller_qn, &fp.module, &fp.crate_name, &fp.alias_map),
-        Lang::TypeScript | Lang::Java => resolve_call_dotty(raw, caller_qn, fp),
+        Lang::TypeScript | Lang::Java | Lang::Python => resolve_call_dotty(raw, caller_qn, fp),
     }
 }
 
@@ -3109,5 +3367,94 @@ class Session {
         );
         // unknown lower-case receiver stays as written (extern)
         assert_eq!(resolve_call("userRepo::save", login, &fp), "userRepo::save");
+    }
+
+    #[test]
+    fn python_parse_extracts_class_def_import_call() {
+        let src = r#"
+from acme.util import check, Strings as Str
+from .helpers import audit
+import os.path
+
+GREETING = "hi"
+
+
+class AuthService:
+    def login(self, user):
+        check(user)
+        Str.trim(user)
+        self.validate(user)
+        audit(user)
+        s = Session(user)
+        os.path.join("a", "b")
+        return user
+
+    def validate(self, u):
+        pass
+
+
+class Session:
+    def __init__(self, u):
+        pass
+"#;
+        // No __init__.py on disk -> module collapses to the bare file stem
+        // ("auth_service") — deterministic, like the TS/Java fake-path tests.
+        let fp = parse_python_file("/nonexistent/auth_service.py", src).unwrap();
+        assert_eq!(fp.lang, Lang::Python);
+        assert_eq!(fp.module, "auth_service");
+        let names: Vec<(&str, &str)> = fp
+            .symbols
+            .iter()
+            .map(|s| (s.node_type, s.qualified_name.as_str()))
+            .collect();
+        assert!(names.contains(&("code:class", "auth_service::AuthService")));
+        assert!(names.contains(&("code:function", "auth_service::AuthService::login")));
+        assert!(names.contains(&("code:function", "auth_service::AuthService::validate")));
+        assert!(names.contains(&("code:class", "auth_service::Session")));
+        assert!(names.contains(&("code:function", "auth_service::Session::__init__")));
+        // methods hang off the class (contains edge source = parent symbol).
+        let class_idx = fp
+            .symbols
+            .iter()
+            .position(|s| s.qualified_name == "auth_service::AuthService")
+            .unwrap();
+        let login_sym = fp
+            .symbols
+            .iter()
+            .find(|s| s.qualified_name == "auth_service::AuthService::login")
+            .unwrap();
+        assert_eq!(login_sym.parent, Some(class_idx));
+        // imports + aliases: `from m import x`, `x as y`, relative, plain dotted.
+        assert!(fp.use_targets.iter().any(|t| t == "acme::util::check"));
+        assert_eq!(fp.alias_map.get("check").unwrap(), "acme::util::check");
+        assert_eq!(fp.alias_map.get("Str").unwrap(), "acme::util::Strings");
+        assert_eq!(fp.alias_map.get("audit").unwrap(), "helpers::audit");
+        assert!(fp.use_targets.iter().any(|t| t == "os::path"));
+        // raw call shapes
+        let raws: Vec<&str> = fp.calls.iter().map(|c| c.raw_path.as_str()).collect();
+        assert!(raws.contains(&"check"));
+        assert!(raws.contains(&"Str::trim"));
+        assert!(raws.contains(&"self::validate"));
+        assert!(raws.contains(&"audit"));
+        assert!(raws.contains(&"Session"));
+        assert!(raws.contains(&"os::path::join"));
+        // resolution
+        let login = "auth_service::AuthService::login";
+        // imported bare call binds through the alias map (the dominant Python form)
+        assert_eq!(resolve_call("check", login, &fp), "acme::util::check");
+        // aliased import receiver expands
+        assert_eq!(
+            resolve_call("Str::trim", login, &fp),
+            "acme::util::Strings::trim"
+        );
+        // self.m() -> the enclosing class (matches the real code:function node)
+        assert_eq!(
+            resolve_call("self::validate", login, &fp),
+            "auth_service::AuthService::validate"
+        );
+        // relative `from .helpers import audit` binds to its package leaf
+        assert_eq!(resolve_call("audit", login, &fp), "helpers::audit");
+        // plain `import os.path` stays an already-qualified extern receiver
+        assert_eq!(resolve_call("os::path::join", login, &fp), "os::path::join");
     }
 }
