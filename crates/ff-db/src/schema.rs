@@ -8481,3 +8481,16 @@ ALTER TABLE brain_communities ADD COLUMN IF NOT EXISTS summary_updated_at TIMEST
 CREATE UNIQUE INDEX IF NOT EXISTS idx_brain_communities_member_hash
     ON brain_communities (member_hash);
 "#;
+
+/// V126: make `brain_communities.god_node_id` ON DELETE SET NULL. V125 started
+/// populating `god_node_id` (it was always NULL before, so the default NO ACTION
+/// FK never bit). Cortex reindex DELETEs `brain_vault_nodes` rows (image-node
+/// refresh, incremental GC of removed symbols); if a deleted node was some
+/// community's god node, the FK now BLOCKS the delete and the reindex fails
+/// partway. The god node is advisory, so nulling it on delete is correct — the
+/// next `ff brain communities` run repopulates it from the fresh graph.
+pub const SCHEMA_V126_COMMUNITY_GOD_NODE_ONDELETE: &str = r#"
+ALTER TABLE brain_communities DROP CONSTRAINT IF EXISTS brain_communities_god_node_id_fkey;
+ALTER TABLE brain_communities ADD CONSTRAINT brain_communities_god_node_id_fkey
+    FOREIGN KEY (god_node_id) REFERENCES brain_vault_nodes(id) ON DELETE SET NULL;
+"#;
