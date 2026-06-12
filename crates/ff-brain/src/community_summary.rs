@@ -131,6 +131,15 @@ pub async fn summarize_communities<F: Fn(usize, usize)>(
     .map_err(|e| format!("select eligible communities: {e}"))?;
 
     let eligible = rows.len();
+    let client = reqwest::Client::new();
+
+    // mlx_lm.server validates the `model` field as an HF repo id, so a catalog id
+    // ("qwen36-35b-a3b") 401s "Repository Not Found" — it serves the model under
+    // its on-disk path instead. Ask the endpoint what it actually serves and pick
+    // a usable id (llama.cpp ignores the field, so this is a no-op there). Done
+    // ONCE per run since the endpoint is fixed.
+    let model = resolve_served_model_id(&client, &endpoint, &model).await;
+
     let mut stats = CommunitySummaryStats {
         eligible,
         attempted: 0,
@@ -145,7 +154,6 @@ pub async fn summarize_communities<F: Fn(usize, usize)>(
         return Ok(stats);
     }
 
-    let client = reqwest::Client::new();
     let url = format!("{endpoint}/v1/chat/completions");
 
     for (i, (comm_id, cid, member_count, god_title, god_path)) in rows.iter().enumerate() {
@@ -225,7 +233,11 @@ async fn call_summary_llm(
     let body = serde_json::json!({
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 220,
+        // Roomy enough that a cooperative think-then-answer endpoint still emits
+        // the 1-3 sentence summary after a short reasoning preamble (a tight cap
+        // truncates before the answer → empty). The summary itself is ~60 tokens;
+        // clean_summary caps the stored length regardless.
+        "max_tokens": 512,
         "temperature": 0.2,
         "stream": false,
         // We want the summary, not chain-of-thought (Qwen3-style thinking models
@@ -259,6 +271,68 @@ async fn call_summary_llm(
         .or_else(|| choice.get("text").and_then(|v| v.as_str()))
         .unwrap_or_default();
     Ok(content.to_string())
+}
+
+/// Ask the endpoint what models it serves and choose a `model` id that won't be
+/// rejected. Best-effort — on any HTTP/parse failure we keep `fallback` (which is
+/// correct for llama.cpp, which ignores the field). Resolves the mlx 401 case.
+async fn resolve_served_model_id(
+    client: &reqwest::Client,
+    endpoint: &str,
+    fallback: &str,
+) -> String {
+    let url = format!("{endpoint}/v1/models");
+    let served: Vec<String> = match client
+        .get(&url)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>().await {
+            Ok(v) => v
+                .get("data")
+                .and_then(|d| d.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|m| m.get("id").and_then(|i| i.as_str()).map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            Err(_) => Vec::new(),
+        },
+        _ => Vec::new(),
+    };
+    if served.is_empty() {
+        return fallback.to_string();
+    }
+    pick_served_model_id(&served, fallback)
+}
+
+/// Pure: choose which served model id to send. mlx serves the model under its
+/// on-disk path, so an exact catalog-id match is rare; prefer (1) an exact match,
+/// then (2) a served id that CONTAINS the routed id (the local-path entry whose
+/// basename is the catalog id), else (3) keep the routed id. Never blindly picks
+/// an unrelated served id — that could make mlx load the wrong model. Unit-tested.
+pub fn pick_served_model_id(served: &[String], fallback: &str) -> String {
+    // "default"/empty = we don't actually know the model (e.g. --llm with no
+    // --model). Prefer the explicitly-loaded local-path entry: mlx_lm.server also
+    // lists default-registry models, and serving an unrelated one would silently
+    // run the WRONG model — the '/'-prefixed id is the one that was loaded.
+    if fallback.is_empty() || fallback == "default" {
+        return served
+            .iter()
+            .find(|s| s.starts_with('/'))
+            .or_else(|| served.first())
+            .cloned()
+            .unwrap_or_else(|| "default".to_string());
+    }
+    if served.iter().any(|s| s == fallback) {
+        return fallback.to_string();
+    }
+    if let Some(hit) = served.iter().find(|s| s.contains(fallback)) {
+        return hit.clone();
+    }
+    fallback.to_string()
 }
 
 /// Build the summary prompt for one community. Pure (unit-tested).
@@ -418,6 +492,67 @@ mod tests {
     fn clean_passes_plain_summary_through() {
         let raw = "This community manages Postgres connection pooling.";
         assert_eq!(clean_summary(raw), raw);
+    }
+
+    #[test]
+    fn served_id_prefers_local_path_containing_catalog_id() {
+        // the real mlx case: catalog id 401s, the on-disk path is the right id.
+        let served = vec![
+            "mlx-community/Meta-Llama-3.1-8B-Instruct-4bit".to_string(),
+            "Qwen/Qwen3-8B".to_string(),
+            "/Users/venkat/models/qwen36-35b-a3b".to_string(),
+        ];
+        assert_eq!(
+            pick_served_model_id(&served, "qwen36-35b-a3b"),
+            "/Users/venkat/models/qwen36-35b-a3b"
+        );
+    }
+
+    #[test]
+    fn served_id_exact_match_wins() {
+        let served = vec![
+            "qwen36-35b-a3b".to_string(),
+            "/path/qwen36-35b-a3b".to_string(),
+        ];
+        assert_eq!(
+            pick_served_model_id(&served, "qwen36-35b-a3b"),
+            "qwen36-35b-a3b"
+        );
+    }
+
+    #[test]
+    fn served_id_keeps_fallback_when_no_match() {
+        // llama.cpp ignores the field anyway — never pick an unrelated served id.
+        let served = vec!["some-other-model".to_string()];
+        assert_eq!(
+            pick_served_model_id(&served, "qwen36-35b-a3b"),
+            "qwen36-35b-a3b"
+        );
+    }
+
+    #[test]
+    fn served_id_unknown_fallback_prefers_local_path() {
+        // --llm with no --model: "default"/"" must pick the loaded local-path
+        // model, NOT an unrelated default-registry entry mlx happens to list.
+        let served = vec![
+            "mlx-community/Meta-Llama-3.1-8B-Instruct-4bit".to_string(),
+            "/Users/venkat/models/qwen36-35b-a3b".to_string(),
+        ];
+        assert_eq!(
+            pick_served_model_id(&served, "default"),
+            "/Users/venkat/models/qwen36-35b-a3b"
+        );
+        assert_eq!(
+            pick_served_model_id(&served, ""),
+            "/Users/venkat/models/qwen36-35b-a3b"
+        );
+    }
+
+    #[test]
+    fn served_id_unknown_fallback_no_path_takes_first() {
+        let served = vec!["only-served".to_string()];
+        assert_eq!(pick_served_model_id(&served, ""), "only-served");
+        assert_eq!(pick_served_model_id(&served, "default"), "only-served");
     }
 
     #[test]
