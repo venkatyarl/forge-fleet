@@ -245,6 +245,46 @@ fn anticipate(samples: &[f64]) -> f64 {
     projected.clamp(current, current + MAX_ANTICIPATION_SLOTS)
 }
 
+/// Drop endpoints served by the LEADER from the supply used for floor + scale
+/// decisions, returning the filtered supply and how many endpoints were dropped.
+///
+/// The agent-swarm router soft-excludes the leader (PR #179): the leader should
+/// stay free for orchestration, so the swarm runs on non-leader workers. A
+/// leader-hosted agent endpoint therefore must NOT count toward the per-kind
+/// reliability FLOOR — otherwise the floor is silently satisfied by capacity the
+/// swarm won't actually use, collapsing an intended floor of 2 to one usable
+/// worker endpoint. Filtering here makes the floor warm non-leader capacity and
+/// keeps the leader out of scale-down (we never autoscaler-unload the leader's
+/// own serving). Fail-open: `leader == None` → no-op (counts everything, the
+/// pre-leader-aware behavior).
+fn exclude_leader_supply(
+    supply: ff_db::ServingSupply,
+    leader: Option<&str>,
+) -> (ff_db::ServingSupply, i64) {
+    let Some(leader) = leader else {
+        return (supply, 0);
+    };
+    let before = supply.code_count + supply.general_count;
+    let code_endpoints: Vec<_> = supply
+        .code_endpoints
+        .into_iter()
+        .filter(|e| e.worker_name != leader)
+        .collect();
+    let general_endpoints: Vec<_> = supply
+        .general_endpoints
+        .into_iter()
+        .filter(|e| e.worker_name != leader)
+        .collect();
+    let filtered = ff_db::ServingSupply {
+        code_count: code_endpoints.len() as i64,
+        general_count: general_endpoints.len() as i64,
+        code_endpoints,
+        general_endpoints,
+    };
+    let excluded = before - (filtered.code_count + filtered.general_count);
+    (filtered, excluded)
+}
+
 /// A kind we might scale, and which workload tag it maps to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Kind {
@@ -303,8 +343,12 @@ pub struct AutoscaleSummary {
     /// `max(anticipated, floor)`.
     pub code_target: f64,
     pub general_target: f64,
+    /// Non-leader agent endpoints per kind (what the floor + scale logic uses).
     pub code_supplied: i64,
     pub general_supplied: i64,
+    /// How many leader-hosted agent endpoints were dropped from the supply count
+    /// before the floor comparison (they stay free for swarm orchestration).
+    pub leader_excluded: i64,
     pub planned_loads: usize,
     pub planned_unloads: usize,
     pub loaded: usize,
@@ -479,6 +523,19 @@ async fn plan_pass(pg: &PgPool) -> Result<(Vec<Action>, AutoscaleSummary), Strin
         .await
         .map_err(|e| format!("pg_supplied_slots_by_kind: {e}"))?;
 
+    // The reliability floor exists for SWARM redundancy, and the swarm router
+    // soft-excludes the leader. So drop leader-hosted endpoints before measuring
+    // supply against the floor — a leader endpoint must not let the floor read as
+    // satisfied while the swarm has only one usable worker endpoint. Resolve the
+    // leader from DB election state (never hardcoded); on a read failure we
+    // fail-open and count everything (the pre-leader-aware behavior).
+    let leader = ff_db::pg_get_current_leader(pg)
+        .await
+        .ok()
+        .flatten()
+        .map(|l| l.member_name);
+    let (supply, leader_excluded) = exclude_leader_supply(supply, leader.as_deref());
+
     let mut summary = AutoscaleSummary {
         code_wanted,
         general_wanted,
@@ -488,6 +545,7 @@ async fn plan_pass(pg: &PgPool) -> Result<(Vec<Action>, AutoscaleSummary), Strin
         general_target,
         code_supplied: supply.code_count,
         general_supplied: supply.general_count,
+        leader_excluded,
         ..Default::default()
     };
 
@@ -943,6 +1001,7 @@ pub fn spawn_autoscaler_tick(
                                 general_anticipated = format!("{:.2}", s.general_anticipated),
                                 general_target = format!("{:.2}", s.general_target),
                                 general_supplied = s.general_supplied,
+                                leader_excluded = s.leader_excluded,
                                 planned_loads = s.planned_loads,
                                 planned_unloads = s.planned_unloads,
                                 loaded = s.loaded,
@@ -1089,6 +1148,69 @@ mod tests {
         // At/under the floor for both → no candidates (no churn at demand=0).
         let ranked = rank_deficits(&[(Kind::Code, 2.0, 2), (Kind::General, 0.0, 0)]);
         assert!(ranked.is_empty());
+    }
+
+    fn endpoint(worker: &str) -> ff_db::ServingEndpoint {
+        ff_db::ServingEndpoint {
+            deployment_id: format!("dep-{worker}"),
+            worker_name: worker.to_string(),
+            port: 55000,
+            catalog_id: Some("qwen36-35b-a3b".into()),
+            request_count: 0,
+            health_age_sec: Some(1),
+        }
+    }
+
+    #[test]
+    fn exclude_leader_supply_drops_only_leader_endpoints() {
+        // The classic P0 shape: floor=2 is "met" by taylor(leader) + logan, but
+        // the swarm soft-excludes the leader, so only logan is usable. After
+        // excluding the leader, code supply reads 1 → the floor will warm a 2nd
+        // NON-LEADER endpoint.
+        let supply = ff_db::ServingSupply {
+            code_count: 2,
+            general_count: 1,
+            code_endpoints: vec![endpoint("taylor"), endpoint("logan")],
+            general_endpoints: vec![endpoint("taylor")],
+        };
+        let (filtered, excluded) = exclude_leader_supply(supply, Some("taylor"));
+        assert_eq!(excluded, 2, "both taylor-hosted endpoints dropped");
+        assert_eq!(filtered.code_count, 1);
+        assert_eq!(filtered.general_count, 0);
+        assert_eq!(filtered.code_endpoints.len(), 1);
+        assert_eq!(filtered.code_endpoints[0].worker_name, "logan");
+        assert!(filtered.general_endpoints.is_empty());
+    }
+
+    #[test]
+    fn exclude_leader_supply_fails_open_without_leader() {
+        // Leader unknown (DB read failed) → count everything, the pre-leader-aware
+        // behavior. Never zero out supply just because we couldn't resolve a leader.
+        let supply = ff_db::ServingSupply {
+            code_count: 2,
+            general_count: 0,
+            code_endpoints: vec![endpoint("taylor"), endpoint("logan")],
+            general_endpoints: vec![],
+        };
+        let (filtered, excluded) = exclude_leader_supply(supply, None);
+        assert_eq!(excluded, 0);
+        assert_eq!(filtered.code_count, 2);
+    }
+
+    #[test]
+    fn exclude_leader_supply_noop_when_leader_serves_nothing() {
+        // Leader hosts no agent endpoint (the healthy steady state we want) →
+        // nothing is dropped, counts unchanged.
+        let supply = ff_db::ServingSupply {
+            code_count: 2,
+            general_count: 0,
+            code_endpoints: vec![endpoint("logan"), endpoint("lily")],
+            general_endpoints: vec![],
+        };
+        let (filtered, excluded) = exclude_leader_supply(supply, Some("taylor"));
+        assert_eq!(excluded, 0);
+        assert_eq!(filtered.code_count, 2);
+        assert_eq!(filtered.code_endpoints.len(), 2);
     }
 
     #[test]
