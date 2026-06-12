@@ -12,7 +12,7 @@
 | Capability | CRG (code-review-graph MCP) | graphify | Cortex |
 |---|---|---|---|
 | Multi-language code | ✅ tree-sitter, many langs | ✅ | ✅ rust/ts/tsx/js/java (python: extractor design exists in a superseded stash, not landed) |
-| Change-aware review (detect_changes, risk-scored diff) | ✅ | – | ✅ `ff cortex review` (file-level; hunk-level TODO) |
+| Change-aware review (detect_changes, risk-scored diff) | ✅ | – | ✅ `ff cortex review` (hunk-level: narrows to symbols whose bodies the diff touched) |
 | Test-coverage mapping (tests_for) | ✅ | – | ❌ |
 | Execution flows / affected-flows | ✅ | – | ❌ |
 | Provenance + confidence tiers (EXTRACTED/INFERRED) | – | ✅ | ❌ (all edges equal) |
@@ -51,10 +51,12 @@
    fleet MCP tools (the CodeGraph pattern; replaces agents' dependence on CRG).
 3. ✅ **detect_changes vs git diff** (PR #183) — `ff cortex review [--base <ref>]
    [--format json]`: risk-scored (fan-in / external fan-in / transitive blast)
-   review map, ranked most-actionable-first. File-level granularity for now;
-   follow-ups: (i) hunk-level (only the symbols whose bodies changed — needs
-   persisted symbol byte-spans or a re-parse-changed-file pass), (ii) a
-   `cortex_review` MCP tool (needs a repo-path param — the daemon isn't in the repo).
+   review map, ranked most-actionable-first. Follow-ups: (i) ✅ **hunk-level**
+   (PR #184, V124) — persists 1-based symbol line spans on `code:*` nodes; review
+   narrows to only the symbols whose bodies overlap the git-diff line ranges
+   (fail-open on NULL spans / files absent from the diff map). (ii) a
+   `cortex_review` MCP tool (needs a repo-path param + a way to pass the diff —
+   the daemon isn't in the repo, and the git layer lives in the terminal).
 4. **Community summaries via fleet LLMs** — GraphRAG-style per-community
    summaries, re-summarize only changed communities (the idle fleet is the lever;
    pairs with the incremental ledger). ← **next cortex build**
