@@ -45,6 +45,10 @@ pub async fn handle_brain(cmd: crate::BrainCommand) -> Result<()> {
                 .map_err(|e| anyhow::anyhow!(e))?;
             println!("  communities: {}", summary.communities_found);
             println!("  largest:     {} nodes", summary.largest_community);
+            println!(
+                "  persisted:   {} registry rows",
+                summary.communities_persisted
+            );
         }
         crate::BrainCommand::Stats => {
             let node_count = ff_db::pg_count_brain_vault_nodes_current(&pool, None)

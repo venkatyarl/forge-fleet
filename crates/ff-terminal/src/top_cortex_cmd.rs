@@ -860,8 +860,8 @@ async fn run_embed(pool: &sqlx::PgPool, max: Option<usize>, no_community: bool) 
     println!("{CYAN}▶ Detecting communities over the graph...{RESET}");
     match ff_brain::detect_communities(pool).await {
         Ok(summary) => println!(
-            "{GREEN}✓{RESET} {} communities (largest: {} nodes)",
-            summary.communities_found, summary.largest_community
+            "{GREEN}✓{RESET} {} communities (largest: {} nodes), {} persisted to registry",
+            summary.communities_found, summary.largest_community, summary.communities_persisted
         ),
         Err(e) => println!("{YELLOW}⚠ community detection failed: {e}{RESET}"),
     }
