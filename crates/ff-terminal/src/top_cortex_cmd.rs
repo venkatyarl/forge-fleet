@@ -29,6 +29,10 @@ pub enum TopCortexCommand {
         /// Force a specific language instead of auto-detecting (rust/typescript/javascript/java).
         #[arg(long)]
         lang: Option<String>,
+        /// Reindex only files changed since the last index (skip the full rewipe).
+        /// First run on a corpus reindexes everything; later runs touch only diffs.
+        #[arg(long)]
+        incremental: bool,
     },
     /// Show the indexed corpus for the cwd (or --all corpora): node/edge counts.
     Status {
@@ -220,9 +224,14 @@ pub async fn handle_top_cortex(args: TopCortexArgs) -> Result<()> {
         .map_err(|e| anyhow!("run_postgres_migrations: {e}"))?;
 
     match args.command {
-        TopCortexCommand::Index { path, slug, lang } => {
+        TopCortexCommand::Index {
+            path,
+            slug,
+            lang,
+            incremental,
+        } => {
             let (root, slug) = resolve_root_slug(path, slug)?;
-            run_index(&pool, &root, &slug, lang, true).await?;
+            run_index(&pool, &root, &slug, lang, true, incremental).await?;
         }
         TopCortexCommand::Embed { max, no_community } => {
             run_embed(&pool, max, no_community).await?;
@@ -371,6 +380,7 @@ async fn run_index(
     slug: &str,
     lang: Option<String>,
     verbose: bool,
+    incremental: bool,
 ) -> Result<()> {
     let root_str = root.to_string_lossy().to_string();
 
@@ -450,9 +460,22 @@ async fn run_index(
     let mut total_symbols = 0usize;
     let mut total_edges = 0usize;
     let mut total_files = 0usize;
-    // index_langs wipes prior code:* nodes ONCE, then extracts each language —
-    // per-language cortex::index calls would clobber each other's symbols.
-    let per_lang = cortex::index_langs(pool, slug, &langs).await?;
+    // Full: index_langs wipes prior code:* nodes ONCE, then extracts each
+    // language (per-language cortex::index calls would clobber each other).
+    // Incremental: re-extract only files whose content_hash changed since the
+    // last index (and delete symbols of removed files) — no global rewipe.
+    let per_lang = if incremental {
+        let report = cortex::index_langs_incremental(pool, slug, &langs).await?;
+        if verbose {
+            println!(
+                "{CYAN}  incremental: {} changed, {} unchanged, {} deleted{RESET}",
+                report.files_changed, report.files_unchanged, report.files_deleted
+            );
+        }
+        report.per_lang
+    } else {
+        cortex::index_langs(pool, slug, &langs).await?
+    };
     for (l, stats) in &per_lang {
         if verbose {
             println!(
@@ -653,9 +676,10 @@ fn hook_install(root: &Path) -> Result<()> {
     let root_str = root.to_string_lossy();
     // The block re-indexes against the absolute repo path so it works regardless
     // of the cwd the commit was made from. `ff cortex index` is create-or-reuse +
-    // re-extract, i.e. incremental at the corpus level.
+    // re-extract. `--incremental` re-extracts only the files a commit changed
+    // (cheap: the common case is a handful of files vs a full graph rewipe).
     let block = format!(
-        "{HOOK_BEGIN}\n# Auto-installed by `ff cortex hook install` — re-indexes the Cortex graph after each commit.\nff cortex index \"{root_str}\" >/dev/null 2>&1 || true\n{HOOK_END}\n"
+        "{HOOK_BEGIN}\n# Auto-installed by `ff cortex hook install` — re-indexes the Cortex graph after each commit.\nff cortex index --incremental \"{root_str}\" >/dev/null 2>&1 || true\n{HOOK_END}\n"
     );
 
     let new_contents = if existing.trim().is_empty() {
@@ -772,7 +796,9 @@ async fn run_watch(
         slug,
         root.display()
     );
-    run_index(pool, root, slug, lang.clone(), true).await?;
+    // Full index once up front (also populates the incremental ledger), then
+    // every on-change re-index below is incremental.
+    run_index(pool, root, slug, lang.clone(), true, false).await?;
 
     let (tx, rx) = channel::<()>();
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
@@ -816,8 +842,10 @@ async fn run_watch(
                 Err(_) => break,    // quiet for `debounce` — go index
             }
         }
-        println!("{CYAN}\u{25b6} change detected \u{2014} re-indexing\u{2026}{RESET}");
-        if let Err(e) = run_index(pool, root, slug, lang.clone(), false).await {
+        println!(
+            "{CYAN}\u{25b6} change detected \u{2014} re-indexing (incremental)\u{2026}{RESET}"
+        );
+        if let Err(e) = run_index(pool, root, slug, lang.clone(), false, true).await {
             eprintln!("  re-index failed: {e}");
         }
     }

@@ -155,6 +155,7 @@ fn lang_patterns(lang: &str) -> Result<Vec<String>> {
 pub async fn index(pool: &PgPool, corpus_slug: &str, lang: &str) -> Result<CortexStats> {
     lang_patterns(lang)?; // validate before wiping
     wipe_code_nodes(pool, corpus_slug).await?;
+    clear_file_index(pool, corpus_slug).await?; // reset the incremental ledger
     index_one(pool, corpus_slug, lang).await
 }
 
@@ -169,12 +170,196 @@ pub async fn index_langs(
         lang_patterns(l)?;
     }
     wipe_code_nodes(pool, corpus_slug).await?;
+    // A full reindex re-stamps every file's hash from scratch — drop the prior
+    // ledger so removed files don't linger as "already indexed" rows. index_one
+    // records each file's current hash as it extracts.
+    clear_file_index(pool, corpus_slug).await?;
     let mut out = Vec::with_capacity(langs.len());
     for l in langs {
         let stats = index_one(pool, corpus_slug, l).await?;
         out.push((l.clone(), stats));
     }
     Ok(out)
+}
+
+/// Summary of an incremental reindex: which files were touched + per-language
+/// extraction stats for the changed subset.
+#[derive(Debug, Default, Clone)]
+pub struct IncrementalReport {
+    pub files_changed: usize,
+    pub files_unchanged: usize,
+    pub files_deleted: usize,
+    pub per_lang: Vec<(String, CortexStats)>,
+}
+
+/// Classify the corpus's current files against the incremental ledger.
+/// Returns `(changed_or_new, unchanged_count, deleted_paths)`:
+///   - changed/new: file whose current `content_hash` differs from (or is
+///     absent in) the ledger — must be re-extracted.
+///   - unchanged: hash matches the ledger — left untouched.
+///   - deleted: a ledger path no longer present among current files — its
+///     symbols must be removed.
+/// Pure (no I/O) so the partition rule is unit-tested directly.
+fn partition_changes(
+    tracked: &HashMap<String, String>,
+    current: &[(String, FileRow)],
+) -> (Vec<(String, FileRow)>, usize, Vec<String>) {
+    let current_paths: HashSet<&str> = current.iter().map(|(_, fr)| fr.path.as_str()).collect();
+    let mut changed: Vec<(String, FileRow)> = Vec::new();
+    let mut unchanged = 0usize;
+    for (lang, fr) in current {
+        if tracked.get(&fr.path).is_some_and(|h| *h == fr.content_hash) {
+            unchanged += 1;
+        } else {
+            changed.push((lang.clone(), fr.clone()));
+        }
+    }
+    let mut deleted: Vec<String> = tracked
+        .keys()
+        .filter(|p| !current_paths.contains(p.as_str()))
+        .cloned()
+        .collect();
+    deleted.sort(); // deterministic order for callers/tests
+    (changed, unchanged, deleted)
+}
+
+/// Reindex only the files whose content changed since the last index.
+///
+/// Compares each `content:file` node's current `content_hash` (refreshed by the
+/// corpus scan that runs immediately before this) against the hash Cortex last
+/// indexed the file at (`cortex_file_index`). Unchanged files are left exactly
+/// as they are — no DB writes. Changed/new files are re-extracted; removed files
+/// (gone on disk) have their symbols deleted. Node ids are keyed by stable
+/// `code://` path and `add_edge` is idempotent, so cross-file `calls` edges into
+/// unchanged callers stay intact and an extern placeholder that gains a real
+/// definition simply flips node_type in place.
+///
+/// Changed files keep their symbol NODES (so incoming `calls` edges from
+/// unchanged callers survive the stable-uuid upsert); only each changed file's
+/// OUTGOING edges are cleared and re-extracted, and symbols the file no longer
+/// defines are GC'd afterward. Removed files have their symbols deleted outright.
+///
+/// Tradeoff vs a full reindex: `code:extern`/`code:import` nodes that go
+/// unreferenced are not garbage-collected here; a periodic full `index_langs`
+/// cleans them up. First run on a corpus with no ledger treats every file as
+/// changed — equivalent to a full reindex but without the upfront global wipe.
+pub async fn index_langs_incremental(
+    pool: &PgPool,
+    corpus_slug: &str,
+    langs: &[String],
+) -> Result<IncrementalReport> {
+    for l in langs {
+        lang_patterns(l)?;
+    }
+    let corpus_id: Uuid = sqlx::query_scalar("SELECT id FROM brain_corpora WHERE slug = $1")
+        .bind(corpus_slug)
+        .fetch_optional(pool)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("no corpus with slug '{corpus_slug}'"))?;
+
+    // What Cortex last indexed: file_path -> indexed_hash.
+    let tracked: HashMap<String, String> =
+        sqlx::query("SELECT file_path, indexed_hash FROM cortex_file_index WHERE corpus_slug = $1")
+            .bind(corpus_slug)
+            .fetch_all(pool)
+            .await?
+            .into_iter()
+            .map(|r| {
+                (
+                    r.get::<String, _>("file_path"),
+                    r.get::<String, _>("indexed_hash"),
+                )
+            })
+            .collect();
+
+    // Current files (per language, with the scan's fresh content_hash).
+    let mut current: Vec<(String, FileRow)> = Vec::new();
+    for l in langs {
+        for fr in fetch_file_rows(pool, corpus_slug, l).await? {
+            current.push((l.clone(), fr));
+        }
+    }
+    // Deletion signal is the FILESYSTEM, not the content:file node: the corpus
+    // scan leaves a stale node (valid_until NULL, old hash) for an in-root file
+    // that was removed, so it would otherwise read as "unchanged" and its
+    // symbols would never be GC'd. Drop current rows whose file is gone on disk;
+    // they then fall into the `deleted` bucket below (tracked − live).
+    current.retain(|(_, fr)| Path::new(&fr.path).exists());
+    // Partition into changed/new vs unchanged vs deleted (pure; unit-tested).
+    let (changed, unchanged_count, deleted) = partition_changes(&tracked, &current);
+    let mut report = IncrementalReport {
+        files_unchanged: unchanged_count,
+        ..IncrementalReport::default()
+    };
+
+    // Drop symbols of removed files first (so their fns leave internal_fns).
+    for path in &deleted {
+        if let Some(fid) = lookup_file_node(pool, corpus_slug, path).await? {
+            wipe_file_symbols(pool, fid).await?;
+        }
+        sqlx::query("DELETE FROM cortex_file_index WHERE corpus_slug = $1 AND file_path = $2")
+            .bind(corpus_slug)
+            .bind(path)
+            .execute(pool)
+            .await?;
+        report.files_deleted += 1;
+    }
+
+    report.files_changed = changed.len();
+    if changed.is_empty() {
+        return Ok(report);
+    }
+
+    // Changed files: capture their OLD symbol ids, clear their OUTGOING edges
+    // (calls/contains/imports — extraction re-adds them) but KEEP the nodes so
+    // incoming `calls` edges from unchanged callers survive the stable-uuid
+    // upsert. GC removed symbols after re-extraction (below).
+    let changed_file_ids: Vec<Uuid> = changed.iter().map(|(_, fr)| fr.id).collect();
+    let pre_symbol_ids = file_symbol_ids(pool, &changed_file_ids).await?;
+    let changed_old_fns = fn_titles_for_ids(pool, &pre_symbol_ids).await?;
+    let mut outgoing_src = pre_symbol_ids.clone();
+    outgoing_src.extend_from_slice(&changed_file_ids);
+    delete_outgoing_edges(pool, &outgoing_src).await?;
+
+    // internal_fns covers the WHOLE corpus so a changed file's call into an
+    // unchanged file resolves. Start from every corpus function, drop the
+    // changed files' OLD functions (some may have been removed/renamed), then
+    // extract_files re-adds the changed files' CURRENT functions in pass 1.
+    let mut internal_fns = load_internal_fns(pool, corpus_slug).await?;
+    for f in &changed_old_fns {
+        internal_fns.remove(f);
+    }
+
+    // Re-extract changed files, grouped by language.
+    for l in langs {
+        let rows: Vec<FileRow> = changed
+            .iter()
+            .filter(|(lang, _)| lang == l)
+            .map(|(_, fr)| fr.clone())
+            .collect();
+        if rows.is_empty() {
+            continue;
+        }
+        let stats =
+            extract_files(pool, corpus_id, corpus_slug, l, &rows, &mut internal_fns).await?;
+        report.per_lang.push((l.clone(), stats));
+    }
+
+    // GC: symbols that belonged to a changed file before but were not re-created
+    // by extraction (renamed/removed). Their nodes were kept above; delete them
+    // now (incoming edges cascade — the symbol is genuinely gone).
+    let post_set: HashSet<Uuid> = file_symbol_ids(pool, &changed_file_ids)
+        .await?
+        .into_iter()
+        .collect();
+    let removed: Vec<Uuid> = pre_symbol_ids
+        .into_iter()
+        .filter(|id| !post_set.contains(id))
+        .collect();
+    if !removed.is_empty() {
+        delete_nodes_by_id(pool, &removed).await?;
+    }
+    Ok(report)
 }
 
 /// Idempotency: drop all prior code:* nodes for this corpus (edges cascade).
@@ -189,20 +374,177 @@ async fn wipe_code_nodes(pool: &PgPool, corpus_slug: &str) -> Result<()> {
     Ok(())
 }
 
-/// Extract one language's symbols/edges for a corpus (no wipe — see callers).
-async fn index_one(pool: &PgPool, corpus_slug: &str, lang: &str) -> Result<CortexStats> {
-    let patterns = lang_patterns(lang)?;
+// ─── Incremental-reindex ledger helpers ──────────────────────────────────────
 
-    // Resolve corpus id.
-    let corpus_id: Uuid = sqlx::query_scalar("SELECT id FROM brain_corpora WHERE slug = $1")
+/// Drop the whole incremental ledger for a corpus (full reindex re-stamps it).
+async fn clear_file_index(pool: &PgPool, corpus_slug: &str) -> Result<()> {
+    sqlx::query("DELETE FROM cortex_file_index WHERE corpus_slug = $1")
         .bind(corpus_slug)
-        .fetch_optional(pool)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("no corpus with slug '{corpus_slug}'"))?;
+        .execute(pool)
+        .await?;
+    Ok(())
+}
 
-    // Pull every current content:file node for this corpus in this language.
-    let file_rows = sqlx::query(
-        r#"SELECT n.id, n.path
+/// Record (upsert) the hash Cortex indexed a file at.
+async fn record_file_hash(
+    pool: &PgPool,
+    corpus_slug: &str,
+    file_path: &str,
+    hash: &str,
+) -> Result<()> {
+    sqlx::query(
+        r#"INSERT INTO cortex_file_index (corpus_slug, file_path, indexed_hash, indexed_at)
+           VALUES ($1, $2, $3, NOW())
+           ON CONFLICT (corpus_slug, file_path)
+           DO UPDATE SET indexed_hash = EXCLUDED.indexed_hash, indexed_at = NOW()"#,
+    )
+    .bind(corpus_slug)
+    .bind(file_path)
+    .bind(hash)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Resolve a `content:file` node id by path, even if soft-deleted (valid_until
+/// set by the scan when a file disappears), so we can still wipe its symbols.
+async fn lookup_file_node(pool: &PgPool, corpus_slug: &str, path: &str) -> Result<Option<Uuid>> {
+    Ok(sqlx::query_scalar(
+        "SELECT id FROM brain_vault_nodes
+           WHERE project = $1 AND path = $2 AND node_type = 'content:file'
+           ORDER BY valid_until NULLS FIRST
+           LIMIT 1",
+    )
+    .bind(corpus_slug)
+    .bind(path)
+    .fetch_optional(pool)
+    .await?)
+}
+
+/// Delete all `code:*` symbols owned by one file — the `contains` subtree rooted
+/// at the file node (edges cascade), plus the file's own outgoing `imports`
+/// edges. Shared `code:import`/`code:extern` nodes are intentionally left (they
+/// may be referenced by other files); a full reindex GCs any that go orphaned.
+async fn wipe_file_symbols(pool: &PgPool, file_node_id: Uuid) -> Result<()> {
+    sqlx::query(
+        r#"WITH RECURSIVE descend(id) AS (
+               SELECT e.dst_id FROM brain_vault_edges e
+                WHERE e.src_id = $1 AND e.edge_type = 'contains'
+               UNION
+               SELECT e.dst_id FROM brain_vault_edges e
+                 JOIN descend d ON e.src_id = d.id
+                WHERE e.edge_type = 'contains'
+           )
+           DELETE FROM brain_vault_nodes
+            WHERE id IN (SELECT id FROM descend)
+              AND node_type LIKE 'code:%'"#,
+    )
+    .bind(file_node_id)
+    .execute(pool)
+    .await?;
+    sqlx::query("DELETE FROM brain_vault_edges WHERE src_id = $1 AND edge_type = 'imports'")
+        .bind(file_node_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// All `code:*` symbol node ids owned by the given files — the `contains`
+/// subtree rooted at each file node. Used to (a) clear a changed file's old
+/// outgoing edges without deleting the nodes and (b) GC symbols the file no
+/// longer defines after re-extraction.
+async fn file_symbol_ids(pool: &PgPool, file_ids: &[Uuid]) -> Result<Vec<Uuid>> {
+    if file_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids: Vec<Uuid> = sqlx::query_scalar(
+        r#"WITH RECURSIVE descend(id) AS (
+               SELECT e.dst_id FROM brain_vault_edges e
+                WHERE e.src_id = ANY($1) AND e.edge_type = 'contains'
+               UNION
+               SELECT e.dst_id FROM brain_vault_edges e
+                 JOIN descend d ON e.src_id = d.id
+                WHERE e.edge_type = 'contains'
+           )
+           SELECT n.id FROM brain_vault_nodes n
+             JOIN descend dd ON dd.id = n.id
+            WHERE n.node_type LIKE 'code:%'"#,
+    )
+    .bind(file_ids)
+    .fetch_all(pool)
+    .await?;
+    Ok(ids)
+}
+
+/// Of the given node ids, the qualified-names that are `code:function`s.
+async fn fn_titles_for_ids(pool: &PgPool, ids: &[Uuid]) -> Result<Vec<String>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(sqlx::query_scalar(
+        "SELECT title FROM brain_vault_nodes WHERE id = ANY($1) AND node_type = 'code:function'",
+    )
+    .bind(ids)
+    .fetch_all(pool)
+    .await?)
+}
+
+/// Delete the `calls`/`contains`/`imports` edges originating at any of these
+/// nodes (a changed file's stale outgoing edges; extraction re-adds the live
+/// ones). Incoming edges are left untouched, so unchanged callers keep pointing
+/// at the surviving (stable-uuid) symbols.
+async fn delete_outgoing_edges(pool: &PgPool, src_ids: &[Uuid]) -> Result<()> {
+    if src_ids.is_empty() {
+        return Ok(());
+    }
+    sqlx::query(
+        "DELETE FROM brain_vault_edges
+           WHERE src_id = ANY($1) AND edge_type IN ('calls', 'contains', 'imports')",
+    )
+    .bind(src_ids)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Delete nodes by id (their remaining edges cascade).
+async fn delete_nodes_by_id(pool: &PgPool, ids: &[Uuid]) -> Result<()> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    sqlx::query("DELETE FROM brain_vault_nodes WHERE id = ANY($1)")
+        .bind(ids)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Every internal function qualified-name in the corpus (across all languages),
+/// so an incremental reindex of one file resolves calls into unchanged files.
+async fn load_internal_fns(pool: &PgPool, corpus_slug: &str) -> Result<HashSet<String>> {
+    let titles: Vec<String> = sqlx::query_scalar(
+        "SELECT title FROM brain_vault_nodes
+           WHERE project = $1 AND node_type = 'code:function'",
+    )
+    .bind(corpus_slug)
+    .fetch_all(pool)
+    .await?;
+    Ok(titles.into_iter().collect())
+}
+
+/// A `content:file` node Cortex extracts from, with the corpus scan's hash.
+#[derive(Debug, Clone)]
+struct FileRow {
+    id: Uuid,
+    path: String,
+    content_hash: String,
+}
+
+/// Pull every current `content:file` node for this corpus in this language.
+async fn fetch_file_rows(pool: &PgPool, corpus_slug: &str, lang: &str) -> Result<Vec<FileRow>> {
+    let patterns = lang_patterns(lang)?;
+    let rows = sqlx::query(
+        r#"SELECT n.id, n.path, n.content_hash
              FROM brain_vault_nodes n
             WHERE n.project = $1
               AND n.valid_until IS NULL
@@ -213,7 +555,53 @@ async fn index_one(pool: &PgPool, corpus_slug: &str, lang: &str) -> Result<Corte
     .bind(&patterns)
     .fetch_all(pool)
     .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| FileRow {
+            id: r.get("id"),
+            path: r.get("path"),
+            content_hash: r.get("content_hash"),
+        })
+        .collect())
+}
 
+/// Extract one language's symbols/edges for a corpus (no wipe — see callers).
+async fn index_one(pool: &PgPool, corpus_slug: &str, lang: &str) -> Result<CortexStats> {
+    // Resolve corpus id.
+    let corpus_id: Uuid = sqlx::query_scalar("SELECT id FROM brain_corpora WHERE slug = $1")
+        .bind(corpus_slug)
+        .fetch_optional(pool)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("no corpus with slug '{corpus_slug}'"))?;
+
+    let file_rows = fetch_file_rows(pool, corpus_slug, lang).await?;
+    // Full per-language extraction starts with an empty internal-fn set: the
+    // graph was just wiped, so every internal fn comes from these files.
+    let mut internal_fns: HashSet<String> = HashSet::new();
+    extract_files(
+        pool,
+        corpus_id,
+        corpus_slug,
+        lang,
+        &file_rows,
+        &mut internal_fns,
+    )
+    .await
+}
+
+/// Two-pass extraction over a set of files: write symbol nodes + contains +
+/// imports (pass 1, also populating `internal_fns`), then resolve + write
+/// `calls` edges (pass 2). `internal_fns` may be pre-seeded (incremental reindex
+/// seeds it from the whole-corpus DB so calls into unchanged files resolve).
+/// Records each file's current `content_hash` in the incremental ledger.
+async fn extract_files(
+    pool: &PgPool,
+    corpus_id: Uuid,
+    corpus_slug: &str,
+    lang: &str,
+    file_rows: &[FileRow],
+    internal_fns: &mut HashSet<String>,
+) -> Result<CortexStats> {
     let mut stats = CortexStats::default();
 
     // First pass: parse every file, write symbol nodes + contains + imports +
@@ -227,12 +615,14 @@ async fn index_one(pool: &PgPool, corpus_slug: &str, lang: &str) -> Result<Corte
         sym_ids: HashMap<String, Uuid>,
     }
     let mut pending: Vec<Pending> = Vec::new();
-    // Global set of internal function qualified names (across all files).
-    let mut internal_fns: HashSet<String> = HashSet::new();
 
-    for row in &file_rows {
-        let file_node_id: Uuid = row.get("id");
-        let file_path: String = row.get("path");
+    for fr in file_rows {
+        let file_node_id: Uuid = fr.id;
+        let file_path: String = fr.path.clone();
+        // Stamp the ledger up front: once we've considered a file at this hash we
+        // won't reprocess it next run — even if it has no extractable symbols
+        // (.d.ts, unparseable) — which keeps incremental runs from re-churning it.
+        record_file_hash(pool, corpus_slug, &file_path, &fr.content_hash).await?;
         if file_path.ends_with(".d.ts") {
             continue; // ambient declaration files: no bodies, all noise
         }
@@ -1783,6 +2173,62 @@ fn read_package_name(cargo_toml: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fr(path: &str, hash: &str) -> (String, FileRow) {
+        (
+            "rust".to_string(),
+            FileRow {
+                id: Uuid::nil(),
+                path: path.to_string(),
+                content_hash: hash.to_string(),
+            },
+        )
+    }
+
+    #[test]
+    fn partition_empty_ledger_marks_everything_changed() {
+        // First run: nothing tracked → every file is changed/new, none unchanged.
+        let tracked = HashMap::new();
+        let current = vec![fr("a.rs", "h1"), fr("b.rs", "h2")];
+        let (changed, unchanged, deleted) = partition_changes(&tracked, &current);
+        assert_eq!(changed.len(), 2);
+        assert_eq!(unchanged, 0);
+        assert!(deleted.is_empty());
+    }
+
+    #[test]
+    fn partition_detects_changed_unchanged_new() {
+        let tracked = HashMap::from([
+            ("a.rs".to_string(), "h1".to_string()),  // unchanged
+            ("b.rs".to_string(), "OLD".to_string()), // changed
+        ]);
+        let current = vec![
+            fr("a.rs", "h1"), // same hash → unchanged
+            fr("b.rs", "h2"), // hash differs → changed
+            fr("c.rs", "h3"), // not tracked → new (changed)
+        ];
+        let (changed, unchanged, deleted) = partition_changes(&tracked, &current);
+        let changed_paths: HashSet<&str> = changed.iter().map(|(_, f)| f.path.as_str()).collect();
+        assert_eq!(unchanged, 1);
+        assert!(changed_paths.contains("b.rs"));
+        assert!(changed_paths.contains("c.rs"));
+        assert!(!changed_paths.contains("a.rs"));
+        assert!(deleted.is_empty());
+    }
+
+    #[test]
+    fn partition_flags_deleted_files() {
+        // d.rs was tracked but is gone from the current scan → deleted.
+        let tracked = HashMap::from([
+            ("a.rs".to_string(), "h1".to_string()),
+            ("d.rs".to_string(), "hd".to_string()),
+        ]);
+        let current = vec![fr("a.rs", "h1")];
+        let (changed, unchanged, deleted) = partition_changes(&tracked, &current);
+        assert!(changed.is_empty());
+        assert_eq!(unchanged, 1);
+        assert_eq!(deleted, vec!["d.rs".to_string()]);
+    }
 
     fn fp_with(module: &str, crate_name: &str, aliases: &[(&str, &str)]) -> FileParse {
         let mut alias_map = HashMap::new();

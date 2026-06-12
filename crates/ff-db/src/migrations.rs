@@ -744,6 +744,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "interaction_log",
         sql: schema::SCHEMA_V122_INTERACTION_LOG,
     },
+    PgMigration {
+        version: 123,
+        name: "cortex_file_index",
+        sql: schema::SCHEMA_V123_CORTEX_FILE_INDEX,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.
