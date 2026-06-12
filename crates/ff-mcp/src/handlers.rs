@@ -1645,7 +1645,7 @@ pub async fn fleet_crew(params: Option<Value>) -> HandlerResult {
     // Build the crew from the V112 `fleet_agents` catalog, routing each agent
     // through the agent-swarm capability router. Falls back to the hardcoded
     // TeamTemplates when the catalog / DB is unavailable (back-compat).
-    let team = build_crew_team(applied_policy.as_ref()).await;
+    let (team, crew_routing) = build_crew_team(applied_policy.as_ref()).await;
     let policy_notes = applied_policy
         .as_ref()
         .map(policy_notes_for_crew)
@@ -1923,7 +1923,14 @@ pub async fn fleet_crew(params: Option<Value>) -> HandlerResult {
             "name": team.name,
             "description": team.description,
             "size": team.len(),
-            "assignments": assignments
+            "assignments": assignments,
+            "routing": {
+                "routed": crew_routing.routed,
+                "unrouted": crew_routing.unrouted_agents.len(),
+                "unrouted_agents": crew_routing.unrouted_agents,
+                "used_template_fallback": crew_routing.used_template_fallback,
+                "degraded": crew_routing.degraded()
+            }
         },
         "decomposition": {
             "subtasks": subtasks,
@@ -2853,6 +2860,36 @@ fn crew_agent_names_for_policy(policy: Option<&AppliedProjectPolicy>) -> Vec<&'s
     }
 }
 
+/// Observability for how a crew's agents were routed to fleet endpoints.
+///
+/// The fleet's stated P0 is agent-swarm reliability, and the failure mode that
+/// hurts it is *silent*: when the capability router can't place an agent (no
+/// healthy tool-calling endpoint with enough per-slot ctx), the agent is still
+/// added with `endpoint = None` and the executor quietly runs it on its default
+/// (cloud or the leader) — no error, no signal. This struct carries that
+/// degradation back to the caller (and `build_crew_team` logs it) so a loop or
+/// operator can see the crew ran degraded instead of guessing why local models
+/// went idle while cloud tokens burned.
+#[derive(Debug, Default, Clone)]
+struct CrewRouting {
+    /// Agents that received a fleet endpoint from the capability router.
+    routed: usize,
+    /// Agents added with no fleet endpoint (executor uses its default).
+    unrouted_agents: Vec<String>,
+    /// True when the whole crew fell back to the hardcoded [`TeamTemplates`]
+    /// (DB unreachable / empty catalog / no enabled matching agents) — itself a
+    /// degraded path, since those templates carry no routed endpoints.
+    used_template_fallback: bool,
+}
+
+impl CrewRouting {
+    /// The crew ran degraded if it used the template fallback or any agent
+    /// failed to get a fleet endpoint.
+    fn degraded(&self) -> bool {
+        self.used_template_fallback || !self.unrouted_agents.is_empty()
+    }
+}
+
 /// Build the crew [`TeamConfig`] from the V112 `fleet_agents` catalog. Each
 /// agent's endpoint is resolved through the agent-swarm capability router
 /// ([`ff_db::pg_pick_agent_endpoint`]) using the agent's `min_ctx`, so the
@@ -2861,14 +2898,29 @@ fn crew_agent_names_for_policy(policy: Option<&AppliedProjectPolicy>) -> Vec<&'s
 /// Back-compat: if the DB is unreachable, the catalog is empty, or a named
 /// agent is missing, this falls back to the hardcoded [`TeamTemplates`] the
 /// crew used before V112.
-async fn build_crew_team(policy: Option<&AppliedProjectPolicy>) -> TeamConfig {
-    let fallback = || choose_team_for_policy(policy);
+///
+/// Returns the team alongside a [`CrewRouting`] summary so the caller can
+/// surface (and this fn logs) any silent routing degradation.
+async fn build_crew_team(policy: Option<&AppliedProjectPolicy>) -> (TeamConfig, CrewRouting) {
+    let fallback = |reason: &str| {
+        warn!(
+            reason,
+            "fleet_crew: agent catalog unavailable; using hardcoded TeamTemplates — agents run on the executor's default endpoint, not a routed fleet model"
+        );
+        (
+            choose_team_for_policy(policy),
+            CrewRouting {
+                used_template_fallback: true,
+                ..Default::default()
+            },
+        )
+    };
 
     let Ok((config, _)) = load_config_auto() else {
-        return fallback();
+        return fallback("config_unavailable");
     };
     let Ok(pool) = get_pg_pool(&config).await else {
-        return fallback();
+        return fallback("pg_pool_unavailable");
     };
 
     // Keep agent load off the leader (Taylor) when other hosts can serve it —
@@ -2881,6 +2933,7 @@ async fn build_crew_team(policy: Option<&AppliedProjectPolicy>) -> TeamConfig {
         "Catalog Crew",
         "fleet_agents-driven crew (V112), routed via the agent-swarm capability router",
     );
+    let mut routing = CrewRouting::default();
     let mut built_any = false;
 
     for name in &names {
@@ -2890,12 +2943,24 @@ async fn build_crew_team(policy: Option<&AppliedProjectPolicy>) -> TeamConfig {
         };
         let role = AgentAssignment::role_for_agent_name(&row.name);
         // Resolve the endpoint via the V111 capability router for this agent's
-        // ctx floor. `None` is fine — the executor falls back to its default.
+        // ctx floor. `None` means no agent-capable fleet endpoint — the executor
+        // falls back to its default, so we record + log the degradation.
         let endpoint = ff_db::pg_pick_agent_endpoint(&pool, row.min_ctx, &exclude_hosts)
             .await
             .ok()
             .flatten()
             .map(|c| c.endpoint);
+        match &endpoint {
+            Some(_) => routing.routed += 1,
+            None => {
+                warn!(
+                    agent = %row.name,
+                    min_ctx = row.min_ctx,
+                    "fleet_crew: no agent-capable fleet endpoint for agent; executor will use its default (cloud/leader)"
+                );
+                routing.unrouted_agents.push(row.name.clone());
+            }
+        }
         team.add(AgentAssignment::from_catalog(
             row.name.clone(),
             role,
@@ -2906,9 +2971,16 @@ async fn build_crew_team(policy: Option<&AppliedProjectPolicy>) -> TeamConfig {
     }
 
     if built_any && !team.is_empty() {
-        team
+        if !routing.unrouted_agents.is_empty() {
+            warn!(
+                routed = routing.routed,
+                unrouted = routing.unrouted_agents.len(),
+                "fleet_crew: crew built with degraded routing — some agents have no fleet endpoint"
+            );
+        }
+        (team, routing)
     } else {
-        fallback()
+        fallback("empty_catalog")
     }
 }
 
@@ -3946,6 +4018,34 @@ mod tests {
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn crew_routing_degraded_flag() {
+        // Fully routed crew → not degraded.
+        let ok = CrewRouting {
+            routed: 2,
+            unrouted_agents: vec![],
+            used_template_fallback: false,
+        };
+        assert!(!ok.degraded());
+
+        // Any agent without a fleet endpoint → degraded.
+        let partial = CrewRouting {
+            routed: 1,
+            unrouted_agents: vec!["code_writer".to_string()],
+            used_template_fallback: false,
+        };
+        assert!(partial.degraded());
+
+        // Template fallback (DB/catalog unavailable) → degraded even with no
+        // per-agent unrouted entries.
+        let fallback = CrewRouting {
+            routed: 0,
+            unrouted_agents: vec![],
+            used_template_fallback: true,
+        };
+        assert!(fallback.degraded());
     }
 
     fn setup_test_db() -> (String, Option<String>) {
