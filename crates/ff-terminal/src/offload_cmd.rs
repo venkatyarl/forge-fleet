@@ -9,7 +9,9 @@
 //! which endpoint/model handled it plus the result. If no warm tool-capable
 //! endpoint exists it prints a `do_in_cloud` decision so the caller proceeds.
 //!
-//! Prefer-warm only — no cold-load / autoscaling here (that's orchestrator P3).
+//! Prefer-warm only — it never cold-loads or waits for a model synchronously
+//! (that's orchestrator P3). But on a cold miss it DOES record the unmet demand
+//! so the P3 autoscaler warms a matching endpoint for the next call.
 
 use crate::{CYAN, GREEN, RED, RESET, YELLOW};
 use anyhow::Result;
@@ -56,10 +58,27 @@ pub async fn handle_offload(
     let candidate = match candidate {
         Some(c) => c,
         None => {
-            // ── No warm endpoint → do_in_cloud fallback.
+            // ── No warm endpoint → do_in_cloud fallback. First record the UNMET
+            // demand so the P3 autoscaler can warm capacity for next time —
+            // unmet offload demand (cold → cloud) is exactly what it must see to
+            // scale up. Recording only on the warm happy path (below) leaves the
+            // autoscaler blind to demand it didn't serve. Distinct `_unmet`
+            // source keeps satisfied vs unmet offload demand separable in
+            // telemetry; both count toward the demand vector. Fire-and-forget.
+            let signaled = ff_db::record_session_work_signal(
+                &pool,
+                None,
+                kind.unwrap_or("general"),
+                "offload_unmet",
+            )
+            .await
+            .map_err(|e| tracing::warn!(error = %e, "unmet demand signal write failed (offload)"))
+            .is_ok();
             let reason = format!(
                 "no warm tool-capable endpoint (require_tool_calling=true, \
-                 usable_agent_ctx>={min_ctx}). Do it in cloud; or warm one with: \
+                 usable_agent_ctx>={min_ctx}). Do it in cloud — the P3 autoscaler \
+                 has been signaled and will warm a matching endpoint if enabled; \
+                 retry later to run it locally. Or warm one now with: \
                  ff model load <library_id> --agent"
             );
             if json_out {
@@ -69,6 +88,7 @@ pub async fn handle_offload(
                         "offloaded": false,
                         "decision": "do_in_cloud",
                         "reason": reason,
+                        "autoscaler_signaled": signaled,
                         "kind": kind,
                         "min_ctx": min_ctx,
                     }))?
