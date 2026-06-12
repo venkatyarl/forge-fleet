@@ -6973,3 +6973,70 @@ pub async fn pg_record_interaction(pool: &PgPool, r: &InteractionRecord) -> Resu
     .await?;
     Ok(row.get("id"))
 }
+
+/// Recent interaction-log rows for the live web console, newest first. Optional
+/// `channel` filter. request/response text is truncated server-side to keep the
+/// payload light for a polling UI. Returns ready-to-serialize JSON objects.
+pub async fn pg_list_interactions(
+    pool: &PgPool,
+    limit: i64,
+    channel: Option<&str>,
+) -> Result<Vec<JsonValue>> {
+    let rows = sqlx::query(
+        "SELECT id, ts, channel, engine,
+                left(request_text, 4000)  AS request_text,
+                left(response_text, 4000) AS response_text,
+                tokens_in, tokens_out, latency_ms, outcome, error_text, session_id
+           FROM ff_interactions
+          WHERE ($1::text IS NULL OR channel = $1)
+          ORDER BY ts DESC
+          LIMIT $2",
+    )
+    .bind(channel)
+    .bind(limit.clamp(1, 500))
+    .fetch_all(pool)
+    .await?;
+
+    let out = rows
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "id": r.get::<uuid::Uuid, _>("id").to_string(),
+                "ts": r.get::<DateTime<Utc>, _>("ts").to_rfc3339(),
+                "channel": r.get::<String, _>("channel"),
+                "engine": r.try_get::<Option<String>, _>("engine").ok().flatten(),
+                "request_text": r.get::<String, _>("request_text"),
+                "response_text": r.get::<String, _>("response_text"),
+                "tokens_in": r.get::<i32, _>("tokens_in"),
+                "tokens_out": r.get::<i32, _>("tokens_out"),
+                "latency_ms": r.try_get::<Option<i32>, _>("latency_ms").ok().flatten(),
+                "outcome": r.get::<String, _>("outcome"),
+                "error_text": r.try_get::<Option<String>, _>("error_text").ok().flatten(),
+                "session_id": r.try_get::<Option<uuid::Uuid>, _>("session_id").ok().flatten().map(|u| u.to_string()),
+            })
+        })
+        .collect();
+    Ok(out)
+}
+
+/// Per-channel interaction counts + grand total, for the console header.
+pub async fn pg_interaction_channel_counts(pool: &PgPool) -> Result<Vec<JsonValue>> {
+    let rows = sqlx::query(
+        "SELECT channel, count(*) AS n, max(ts) AS latest
+           FROM ff_interactions
+          GROUP BY channel
+          ORDER BY n DESC",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "channel": r.get::<String, _>("channel"),
+                "count": r.get::<i64, _>("n"),
+                "latest": r.try_get::<Option<DateTime<Utc>>, _>("latest").ok().flatten().map(|t| t.to_rfc3339()),
+            })
+        })
+        .collect())
+}

@@ -14,6 +14,7 @@ pub mod cli_bridge;
 pub mod cloud_llm;
 pub mod discord;
 pub mod embed;
+pub mod interactions_api;
 pub mod jarvis_api;
 pub mod llm_routing;
 pub mod message;

@@ -129,6 +129,8 @@ pub use queries::{
     pg_insert_disk_usage,
     pg_insert_node_ssh_key,
     pg_insert_work_intent,
+    // Interaction log (V121 ff_interactions)
+    pg_interaction_channel_counts,
     pg_latest_demand_snapshot,
     pg_latest_disk_usage,
     pg_list_agents,
@@ -142,6 +144,7 @@ pub use queries::{
     pg_list_deferred,
     pg_list_deployments,
     pg_list_due_reminders,
+    pg_list_interactions,
     pg_list_jobs,
     pg_list_library,
     pg_list_mesh_status,
@@ -170,7 +173,6 @@ pub use queries::{
     pg_reap_expired_leases,
     pg_reap_stale_reservations,
     pg_reap_stale_running,
-    // Interaction log (V121 ff_interactions)
     pg_record_interaction,
     pg_reserve_host,
     pg_resolve_channel_user,

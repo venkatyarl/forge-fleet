@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ForgeFleet · Interaction Console</title>
+<style>
+  :root {
+    --bg:#0b0e14; --panel:#121722; --panel2:#0f141d; --line:#1e2633;
+    --fg:#d7e0ee; --dim:#7d8aa0; --accent:#4fd1c5; --accent2:#7aa2f7;
+    --ok:#54d685; --err:#ff6b6b; --warn:#e2b341;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+    font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+  header { display:flex; align-items:center; gap:16px; padding:12px 18px;
+    border-bottom:1px solid var(--line); background:var(--panel); position:sticky; top:0; z-index:5; }
+  header h1 { font-size:15px; margin:0; letter-spacing:.5px; }
+  header h1 .dot { color:var(--accent); }
+  .chips { display:flex; gap:8px; flex-wrap:wrap; margin-left:auto; }
+  .chip { padding:3px 10px; border:1px solid var(--line); border-radius:14px;
+    background:var(--panel2); color:var(--dim); cursor:pointer; user-select:none; white-space:nowrap; }
+  .chip.active { color:var(--bg); background:var(--accent); border-color:var(--accent); font-weight:600; }
+  .chip b { color:var(--fg); }
+  .chip.active b { color:var(--bg); }
+  .meta { padding:6px 18px; color:var(--dim); display:flex; gap:18px; border-bottom:1px solid var(--line); }
+  .meta .live::before { content:"●"; color:var(--ok); margin-right:5px; }
+  main { padding:0 0 60px; }
+  .row { border-bottom:1px solid var(--line); padding:10px 18px; }
+  .row:hover { background:var(--panel2); }
+  .rtop { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+  .tag { font-size:11px; padding:1px 8px; border-radius:10px; border:1px solid var(--line); color:var(--dim); }
+  .tag.ch-mcp { color:var(--accent); border-color:#1f3a3a; }
+  .tag.ch-gateway-jarvis { color:var(--accent2); border-color:#23304f; }
+  .tag.ch-session { color:#c792ea; border-color:#2e2440; }
+  .tag.ch-cli { color:var(--warn); border-color:#3a3320; }
+  .tag.eng { color:var(--fg); }
+  .tag.lat { color:var(--dim); }
+  .tag.out-error { color:var(--err); border-color:#3a1f1f; }
+  .tag.out-ok { color:var(--ok); border-color:#1f3a28; }
+  .ts { color:var(--dim); margin-left:auto; font-size:11px; }
+  .qa { margin-top:7px; display:grid; grid-template-columns:auto 1fr; gap:4px 10px; align-items:start; }
+  .qa .lbl { color:var(--dim); user-select:none; }
+  .qa .q { color:var(--fg); white-space:pre-wrap; word-break:break-word; }
+  .qa .a { color:#a9d6c9; white-space:pre-wrap; word-break:break-word; }
+  .qa .a.err { color:var(--err); }
+  .empty { padding:50px 18px; text-align:center; color:var(--dim); }
+  .clip { display:-webkit-box; -webkit-line-clamp:6; -webkit-box-orient:vertical; overflow:hidden; }
+  .row.open .clip { -webkit-line-clamp:unset; }
+  .more { color:var(--accent2); cursor:pointer; font-size:11px; }
+</style>
+</head>
+<body>
+<header>
+  <h1><span class="dot">◆</span> ForgeFleet · Interaction Console</h1>
+  <div class="chips" id="chips"></div>
+</header>
+<div class="meta">
+  <span class="live" id="status">connecting…</span>
+  <span id="total"></span>
+  <span id="filter"></span>
+</div>
+<main id="rows"><div class="empty">Loading…</div></main>
+
+<script>
+const state = { channel: "all", summary: {channels:[], total:0} };
+const fmtTs = s => { try { return new Date(s).toLocaleString(); } catch(_) { return s; } };
+const esc = s => (s==null?"":String(s)).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+
+function renderChips() {
+  const el = document.getElementById("chips");
+  const chans = [{channel:"all", count: state.summary.total}].concat(state.summary.channels);
+  el.innerHTML = chans.map(c => {
+    const active = c.channel === state.channel ? " active" : "";
+    return `<span class="chip${active}" data-ch="${esc(c.channel)}">${esc(c.channel)} <b>${c.count??0}</b></span>`;
+  }).join("");
+  el.querySelectorAll(".chip").forEach(ch => ch.onclick = () => {
+    state.channel = ch.dataset.ch; renderChips(); load();
+  });
+}
+
+function renderRows(rows) {
+  const main = document.getElementById("rows");
+  if (!rows.length) { main.innerHTML = `<div class="empty">No interactions captured yet for <b>${esc(state.channel)}</b>.</div>`; return; }
+  main.innerHTML = rows.map(r => {
+    const lat = r.latency_ms != null ? `${r.latency_ms} ms` : "";
+    const toks = (r.tokens_in||0) + (r.tokens_out||0);
+    const errClass = r.outcome === "error" ? " out-error" : " out-ok";
+    const ans = r.outcome === "error" && r.error_text ? r.error_text : r.response_text;
+    return `<div class="row" onclick="this.classList.toggle('open')">
+      <div class="rtop">
+        <span class="tag ch-${esc(r.channel)}">${esc(r.channel)}</span>
+        ${r.engine ? `<span class="tag eng">${esc(r.engine)}</span>` : ""}
+        ${lat ? `<span class="tag lat">${esc(lat)}</span>` : ""}
+        ${toks ? `<span class="tag lat">${toks} tok</span>` : ""}
+        <span class="tag${errClass}">${esc(r.outcome)}</span>
+        <span class="ts">${esc(fmtTs(r.ts))}</span>
+      </div>
+      <div class="qa">
+        <span class="lbl">▸</span><span class="q clip">${esc(r.request_text)||"<em>(empty)</em>"}</span>
+        <span class="lbl">◂</span><span class="a clip ${r.outcome==='error'?'err':''}">${esc(ans)||"<em>(empty)</em>"}</span>
+      </div>
+    </div>`;
+  }).join("");
+}
+
+async function load() {
+  document.getElementById("filter").textContent =
+    state.channel === "all" ? "all channels" : `channel: ${state.channel}`;
+  try {
+    const [sumRes, listRes] = await Promise.all([
+      fetch("/api/interactions/summary").then(r=>r.json()),
+      fetch("/api/interactions?limit=150&channel=" + encodeURIComponent(state.channel)).then(r=>r.json()),
+    ]);
+    state.summary = sumRes;
+    document.getElementById("total").textContent = `${sumRes.total ?? 0} total`;
+    document.getElementById("status").textContent = "live · 5s";
+    renderChips();
+    renderRows(listRes.rows || []);
+  } catch (e) {
+    document.getElementById("status").textContent = "offline — retrying";
+  }
+}
+load();
+setInterval(load, 5000);
+</script>
+</body>
+</html>
