@@ -3987,6 +3987,31 @@ async fn main() -> Result<()> {
     }
 }
 
+/// Common English function words (articles, conjunctions, prepositions,
+/// auxiliaries, pronouns, question words). Their presence marks a token run as
+/// prose rather than a `verb noun [noun]` command typo. Deliberately function
+/// words only — NOT imperative verbs like `show`/`list`/`fix`, since a bare
+/// two-word imperative is exactly the ambiguous shape we want to route through
+/// the explicit `ff run "<text>"` escape hatch.
+fn is_prose_function_word(t: &str) -> bool {
+    const WORDS: &[&str] = &[
+        // articles / determiners
+        "a", "an", "the", "this", "that", "these", "those", "all", "any", "each", "every", "no",
+        "some", "my", "our", "your", "its", "their", "his", "her", // conjunctions
+        "and", "or", "but", "nor", "so", "yet", // prepositions
+        "of", "to", "in", "on", "at", "by", "for", "with", "from", "into", "onto", "over", "under",
+        "about", "as", "across", "per", // auxiliaries / copulas
+        "is", "are", "was", "were", "be", "been", "am", "do", "does", "did", "has", "have", "had",
+        "will", "would", "can", "could", "should", "may", "might", "must", // pronouns
+        "i", "me", "we", "us", "you", "it", "they", "them", "he", "she",
+        // question / discourse words
+        "what", "which", "who", "whom", "whose", "when", "where", "why", "how", "then", "than",
+        "please", "not",
+    ];
+    let lower = t.to_ascii_lowercase();
+    WORDS.contains(&lower.as_str())
+}
+
 /// `ff <typo>` and `ff <word> --help` must not silently become an LLM agent
 /// dispatch. The top-level CLI treats any unrecognised trailing words as a
 /// free-text prompt (deliberate UX for `ff "summarize …"`), which meant a
@@ -3994,16 +4019,26 @@ async fn main() -> Result<()> {
 /// with "pulse --help" as its task — slow, costly, and never showing help.
 ///
 /// Returns a refusal message when the prompt looks like a command invocation
-/// rather than natural language. Three shapes are refused:
+/// rather than natural language. Four shapes are refused:
 ///   1. it contains a literal `-h`/`--help` token;
 ///   2. it is a single bare command-shaped word (`ff pulse`);
 ///   3. its first token is command-shaped (a bare lowercase verb) AND a flag
-///      token (`-c`, `--json`, …) appears later — i.e. `ff db psql -c "…"`.
-/// Shape 3 is the dangerous case the single-word guard missed: a typo'd
-/// multi-word subcommand (`ff db …`, `ff model ls --json`) used to fall through
-/// to the free-text agent dispatcher, which once HALLUCINATED a fake psql
-/// result. Genuine multi-word natural-language prompts (no leading verb+flag)
-/// pass through untouched, and `ff run "<text>"` always bypasses the guard.
+///      token (`-c`, `--json`, …) appears later — i.e. `ff db psql -c "…"`;
+///   4. it is a SHORT (2–3 token) sequence of all-command-shaped tokens with no
+///      English function word — i.e. `ff db psql`, `ff modle ls`, `ff cortx indx`.
+/// Shapes 3 & 4 are the dangerous cases the single-word guard missed: a typo'd
+/// multi-word subcommand used to fall through to the free-text agent dispatcher,
+/// which once HALLUCINATED a fake psql result AND once *attempted* `rm -rf` on a
+/// (nonexistent) postgres data dir. Because clap consumes any real first-token
+/// subcommand before this arm runs, the free-prompt path only ever sees inputs
+/// whose first token is NOT a real subcommand — so a short run of bare
+/// command-shaped tokens is almost always a typo. Genuine natural-language
+/// prompts contain a function word (`restart THE daemon`, `what IS running`) or
+/// run ≥4 tokens, so they pass through untouched; `ff run "<text>"` always
+/// bypasses the guard. The trade-off is deliberate: a false refusal is a
+/// harmless one-line message pointing at `ff run`, while a false dispatch arms a
+/// fleet LLM agent with shell access on a mistake — so terse imperative prompts
+/// (`ff fix tests`) are asked to use `ff run`.
 fn free_prompt_command_guard(tokens: &[String]) -> Option<String> {
     let wants_help = tokens.iter().any(|t| t == "--help" || t == "-h");
 
@@ -4031,10 +4066,19 @@ fn free_prompt_command_guard(tokens: &[String]) -> Option<String> {
     let command_word_with_flag = tokens.len() > 1
         && tokens.first().is_some_and(is_command_word)
         && tokens[1..].iter().any(is_flag);
+    // Shape 4: a short run of bare command-shaped tokens with no function word.
+    // A genuine free-text prompt of this length almost always carries an article/
+    // preposition/auxiliary/pronoun ("the", "is", "this", …) or runs longer; a
+    // typo'd subcommand (`db psql`) does not. The 3-token cap keeps longer terse
+    // prompts (`summarize recent fleet activity`) dispatching.
+    let command_word_sequence = (2..=3).contains(&tokens.len())
+        && tokens.iter().all(is_command_word)
+        && !tokens.iter().any(|t| is_prose_function_word(t));
 
-    if !wants_help && !single_command_word && !command_word_with_flag {
+    if !wants_help && !single_command_word && !command_word_with_flag && !command_word_sequence {
         return None;
     }
+    let command_shaped = command_word_with_flag || command_word_sequence;
 
     use clap::CommandFactory;
     let cmd = Cli::command();
@@ -4053,10 +4097,10 @@ fn free_prompt_command_guard(tokens: &[String]) -> Option<String> {
             "error: '{first}' is not an ff subcommand — unrecognised words are sent to a fleet \
              LLM agent as a free-text prompt, which is never what --help wants."
         )
-    } else if command_word_with_flag {
+    } else if command_shaped {
         format!(
             "error: '{first}' is not an ff subcommand — refusing to dispatch a command-shaped \
-             input (verb + flags) to a fleet LLM agent (this is usually a mistyped subcommand)."
+             input to a fleet LLM agent (this is usually a mistyped subcommand)."
         )
     } else {
         format!(
@@ -4113,12 +4157,35 @@ mod free_prompt_guard_tests {
 
     #[test]
     fn natural_language_with_no_flag_still_passes() {
-        // A leading verb alone (no flag) is genuine free-text — keep dispatching.
+        // A prose sentence (carries a function word) is genuine free-text — keep
+        // dispatching even when every other token is command-shaped.
         assert!(free_prompt_command_guard(&toks(&["restart", "the", "daemon"])).is_none());
         // A prose token that merely contains a dash is not a flag.
         assert!(free_prompt_command_guard(&toks(&["explain", "the", "auto-upgrade"])).is_none());
         // Apostrophe/punctuation in the first token => not command-shaped.
         assert!(free_prompt_command_guard(&toks(&["what's", "the", "--status"])).is_none());
+        // A terse question carries function words ("what", "is") => prose.
+        assert!(free_prompt_command_guard(&toks(&["what", "is", "running"])).is_none());
+        // ≥4 tokens with no function word is treated as a real prompt, not a typo.
+        assert!(
+            free_prompt_command_guard(&toks(&["summarize", "recent", "fleet", "activity"]))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn short_command_word_sequence_no_flag_is_refused() {
+        // The iter-18 dogfood finding: `ff db psql` (no flag) fell through to the
+        // agent, which hallucinated a psql session and *attempted* `rm -rf` on a
+        // postgres data dir. A short all-command-shaped run with no function word
+        // is a mistyped subcommand, not prose — refuse it.
+        assert!(free_prompt_command_guard(&toks(&["db", "psql"])).is_some());
+        assert!(free_prompt_command_guard(&toks(&["modle", "ls"])).is_some());
+        assert!(free_prompt_command_guard(&toks(&["cortx", "indx", "now"])).is_some());
+        // Message names the command-shaped refusal and the run escape hatch.
+        let msg = free_prompt_command_guard(&toks(&["db", "psql"])).unwrap();
+        assert!(msg.contains("command-shaped"), "got: {msg}");
+        assert!(msg.contains("ff run"), "got: {msg}");
     }
 
     #[test]
