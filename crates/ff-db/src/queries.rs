@@ -2912,6 +2912,56 @@ pub async fn pg_latest_demand_snapshot(pool: &PgPool) -> Result<Option<DemandVec
     }))
 }
 
+/// Return the most recent demand snapshots within `lookback_secs`, capped at
+/// `limit` rows, ordered OLDEST→NEWEST (so the LAST element is the current
+/// demand). This is the trend window the autoscaler's pre-warm anticipation
+/// reads to project a RISING demand one load-latency ahead and warm an endpoint
+/// before the burst peaks (a single-snapshot read is always a tick behind).
+///
+/// The recency guard means a leader outage that left a gap simply yields fewer
+/// samples (→ the anticipator falls back to the current value), never a stale
+/// trend. One indexed range scan + an in-Rust reverse.
+pub async fn pg_recent_demand_snapshots(
+    pool: &PgPool,
+    lookback_secs: i64,
+    limit: i64,
+) -> Result<Vec<DemandVector>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            captured_at,
+            window_secs,
+            active_sessions,
+            code_slots_wanted::float8    AS code_slots_wanted,
+            general_slots_wanted::float8 AS general_slots_wanted,
+            per_session
+          FROM fleet_demand_snapshot
+         WHERE captured_at > NOW() - make_interval(secs => $1)
+         ORDER BY captured_at DESC
+         LIMIT $2
+        "#,
+    )
+    .bind(lookback_secs.max(1))
+    .bind(limit.max(1))
+    .fetch_all(pool)
+    .await?;
+
+    // Query returns newest→oldest; reverse to oldest→newest for trend fitting.
+    let mut out: Vec<DemandVector> = rows
+        .iter()
+        .map(|r| DemandVector {
+            code_slots_wanted: r.get::<f64, _>("code_slots_wanted"),
+            general_slots_wanted: r.get::<f64, _>("general_slots_wanted"),
+            active_sessions: r.get::<i32, _>("active_sessions"),
+            window_secs: r.get::<i32, _>("window_secs") as i64,
+            per_session: r.get::<JsonValue, _>("per_session"),
+            captured_at: r.get::<DateTime<Utc>, _>("captured_at"),
+        })
+        .collect();
+    out.reverse();
+    Ok(out)
+}
+
 // ─── Orchestrator P3: adaptive serving-mix autoscaler ───────────────────────
 //
 // The autoscaler compares the P2 demand vector (`pg_latest_demand_snapshot`)

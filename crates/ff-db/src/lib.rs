@@ -176,6 +176,7 @@ pub use queries::{
     pg_reap_expired_leases,
     pg_reap_stale_reservations,
     pg_reap_stale_running,
+    pg_recent_demand_snapshots,
     pg_record_interaction,
     pg_reserve_host,
     pg_resolve_channel_user,
