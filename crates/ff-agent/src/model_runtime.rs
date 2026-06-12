@@ -878,6 +878,15 @@ pub async fn list_local_processes() -> Vec<RunningProcess> {
                 .or_else(|| parse_flag_value(rest, "-c"))
                 .and_then(|v| v.parse::<i32>().ok()),
             "vllm" => parse_flag_value(rest, "--max-model-len").and_then(|v| v.parse::<i32>().ok()),
+            // mlx_lm.server takes no ctx flag (serves the model's full window,
+            // RAM-bound). Without a recorded ctx the deployment row keeps
+            // usable_agent_ctx NULL forever and the V111 capability router
+            // (`usable_agent_ctx >= min_ctx`) is blind to mlx endpoints — which
+            // hid taylor's strongest agent server. Honor --max-kv-size when
+            // passed, else read the model dir's config.json.
+            "mlx" => parse_flag_value(rest, "--max-kv-size")
+                .and_then(|v| v.parse::<i32>().ok())
+                .or_else(|| model_path.as_deref().and_then(mlx_config_ctx)),
             _ => None,
         };
 
@@ -1145,6 +1154,25 @@ fn parse_vllm_models_ctx(v: &serde_json::Value) -> Option<(i32, i32)> {
         .and_then(|n| n.as_i64())
         .filter(|&n| n > 0)? as i32;
     Some((max_len, 1))
+}
+
+/// Best-effort context window for an mlx_lm.server with no --max-kv-size:
+/// read `max_position_embeddings` from the model dir's config.json (multimodal
+/// architectures nest it under `text_config`). Capped at 64K — these windows
+/// can claim 256K+ which is RAM-unrealistic for fleet Macs, and the capability
+/// router only needs to know the endpoint clears its 16K/32K agent bars.
+fn mlx_config_ctx(model_path: &str) -> Option<i32> {
+    let raw = std::fs::read_to_string(PathBuf::from(model_path).join("config.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let max = v
+        .get("max_position_embeddings")
+        .or_else(|| {
+            v.get("text_config")
+                .and_then(|t| t.get("max_position_embeddings"))
+        })
+        .and_then(|x| x.as_i64())
+        .filter(|&n| n > 0)?;
+    Some(max.min(65_536) as i32)
 }
 
 fn parse_flag_value(cmdline: &str, flag: &str) -> Option<String> {

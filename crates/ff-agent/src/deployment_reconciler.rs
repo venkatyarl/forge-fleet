@@ -175,6 +175,16 @@ pub async fn reconcile_local(pool: &sqlx::PgPool) -> Result<ReconcileSummary, St
                     ctx_total = Some(per_slot.saturating_mul(total_slots));
                     slots = Some(total_slots);
                     usable = Some(per_slot);
+                } else if let (Some(cw), Some(ps)) =
+                    (proc_info.context_window, proc_info.parallel_slots)
+                {
+                    // No HTTP probe for this runtime (mlx_lm.server exposes no
+                    // ctx endpoint) — fall back to what the cmdline/model-config
+                    // parse found. Without this, mlx rows kept usable_agent_ctx
+                    // NULL forever and the V111 router never saw them.
+                    ctx_total = Some(cw);
+                    slots = Some(ps);
+                    usable = Some(cw / ps.max(1));
                 }
             }
 
