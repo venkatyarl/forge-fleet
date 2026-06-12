@@ -439,6 +439,12 @@ async fn run_index(
             "  scanned: {} file(s), {} dir(s)",
             scan_report.files, scan_report.dirs
         );
+        if scan_report.pruned > 0 {
+            println!(
+                "  pruned: {} stale out-of-root content node(s)",
+                scan_report.pruned
+            );
+        }
     }
 
     let mut total_symbols = 0usize;

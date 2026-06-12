@@ -99,6 +99,9 @@ pub struct ScanReport {
     pub nodes_upserted: usize,
     pub edges: usize,
     pub candidates: usize,
+    /// Current content:% nodes of this corpus whose path lies outside every
+    /// registered source root, invalidated (valid_until) at the end of scan().
+    pub pruned: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -157,14 +160,25 @@ pub async fn add_source(
     label: Option<&str>,
 ) -> anyhow::Result<Source> {
     let abs = expand_path(root_path);
+    // root_path is GLOBALLY unique (uq_sources_root): a directory belongs to
+    // exactly one corpus at a time. Registering it under a new corpus MUST
+    // reassign corpus_id — otherwise the source silently stays owned by the
+    // previous corpus, list_sources() for the new corpus returns nothing, and
+    // scan() walks zero files (the `ff cortex index --slug <new>` files=0 bug
+    // when the same dir was earlier indexed under a different slug).
     let row = sqlx::query(
         r#"INSERT INTO brain_sources (corpus_id, root_path, label)
            VALUES ($1, $2, $3)
-           ON CONFLICT (root_path) DO UPDATE SET label = COALESCE(EXCLUDED.label, brain_sources.label)
+           ON CONFLICT (root_path) DO UPDATE
+             SET corpus_id = EXCLUDED.corpus_id,
+                 label = COALESCE(EXCLUDED.label, brain_sources.label)
            RETURNING id, root_path, label, scan_status, file_count"#,
     )
-    .bind(corpus.id).bind(&abs).bind(label)
-    .fetch_one(pg).await?;
+    .bind(corpus.id)
+    .bind(&abs)
+    .bind(label)
+    .fetch_one(pg)
+    .await?;
     Ok(Source {
         id: row.get("id"),
         root_path: row.get("root_path"),
@@ -269,6 +283,7 @@ pub async fn scan(
         nodes_upserted: 0,
         edges: 0,
         candidates: 0,
+        pruned: 0,
     };
 
     let mut all_paths: Vec<PathBuf> = Vec::new();
@@ -364,6 +379,35 @@ pub async fn scan(
         report.sources_scanned += 1;
     }
 
+    // Corpus-scoping: content nodes are single-owner (brain_vault_nodes.path is
+    // globally UNIQUE and the upsert reassigns `project`), so this corpus can
+    // hold stale content:% rows for paths it no longer covers — e.g. a backup
+    // dir once mis-scanned into this slug, or files that vanished from disk.
+    // Invalidate every CURRENT content:% row of this corpus whose path lies
+    // outside ALL of its registered source roots, so cortex/doc/facet queries
+    // never see foreign files. Skipped when the corpus has no sources at all
+    // (nothing to scope against — better to keep than to wipe).
+    if !sources.is_empty() {
+        let pruned = sqlx::query(
+            r#"UPDATE brain_vault_nodes n
+                  SET valid_until = NOW(), updated_at = NOW()
+                WHERE n.project = $1
+                  AND n.node_type LIKE 'content:%'
+                  AND n.valid_until IS NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM brain_sources s
+                       WHERE s.corpus_id = $2
+                         AND (n.path = s.root_path
+                              OR n.path LIKE s.root_path || '/%')
+                  )"#,
+        )
+        .bind(&corpus.slug)
+        .bind(corpus.id)
+        .execute(pg)
+        .await?;
+        report.pruned = pruned.rows_affected() as usize;
+    }
+
     let dir_set: HashSet<PathBuf> = all_dirs.into_iter().collect();
     let candidates = propose(&all_paths, &dir_set, &source_roots);
     sqlx::query("DELETE FROM brain_corpus_candidates WHERE corpus_id = $1 AND status = 'pending'")
@@ -389,6 +433,12 @@ pub async fn scan(
     Ok(report)
 }
 
+/// Upsert a content node keyed by absolute path. `path` is globally UNIQUE in
+/// brain_vault_nodes, so content is single-owner across corpora: re-scanning a
+/// directory under a different corpus slug intentionally REASSIGNS `project`
+/// to the scanning corpus (last scan wins). The previous corpus drops the rows
+/// from its content queries immediately; scan()'s out-of-root prune clears any
+/// residue the next time that corpus is scanned.
 async fn upsert_content_node(
     pg: &PgPool,
     path: &str,
@@ -1203,5 +1253,105 @@ mod tests {
         assert!(cands.iter().any(|c| c.kind == "facet_assign"
             && c.payload["dimension"] == "modality"
             && c.payload["value"] == "code"));
+    }
+
+    /// DB-backed corpus-scoping regression test. Runs only when
+    /// `FF_BRAIN_TEST_PG` holds a Postgres URL (e.g. the fleet brain DB);
+    /// otherwise it's a silent skip so plain `cargo test` stays green offline.
+    ///
+    /// Covers the `ff cortex index --slug <new>` files=0 bug: a directory
+    /// already registered as a source of corpus A must be re-owned (source
+    /// corpus_id + node project) when scanned into corpus B, and stale
+    /// out-of-root content rows must be invalidated by scan().
+    #[tokio::test]
+    async fn scan_reassigns_dir_to_new_corpus_and_prunes_residue() {
+        let Ok(url) = std::env::var("FF_BRAIN_TEST_PG") else {
+            eprintln!("FF_BRAIN_TEST_PG not set — skipping DB-backed corpus-scoping test");
+            return;
+        };
+        let pg = PgPool::connect(&url)
+            .await
+            .expect("connect FF_BRAIN_TEST_PG");
+
+        let base = std::env::temp_dir().join(format!("ff-corpus-scope-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(base.join("src")).unwrap();
+        std::fs::write(base.join("src").join("main.rs"), "fn main() {}\n").unwrap();
+        let root = base.to_string_lossy().to_string();
+
+        let suffix = &Uuid::new_v4().simple().to_string()[..8];
+        let slug_a = format!("cscope-test-a-{suffix}");
+        let slug_b = format!("cscope-test-b-{suffix}");
+
+        let current_files = |slug: String| {
+            let pg = pg.clone();
+            async move {
+                let n: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM brain_vault_nodes
+                      WHERE project = $1 AND node_type = 'content:file'
+                        AND valid_until IS NULL",
+                )
+                .bind(&slug)
+                .fetch_one(&pg)
+                .await
+                .unwrap();
+                n
+            }
+        };
+
+        // Scan the dir into corpus A.
+        let a = add_corpus(&pg, &slug_a, &slug_a, &[(root.clone(), None)])
+            .await
+            .unwrap();
+        let ra = scan(&pg, &a, None, 4).await.unwrap();
+        assert!(ra.files >= 1, "corpus A should scan at least 1 file");
+        assert!(current_files(slug_a.clone()).await >= 1);
+
+        // Same dir, NEW slug. Before the fix the source row silently stayed
+        // owned by A (uq_sources_root + no corpus_id reassignment), so B's
+        // scan walked zero files.
+        let b = add_corpus(&pg, &slug_b, &slug_b, &[(root.clone(), None)])
+            .await
+            .unwrap();
+        let rb = scan(&pg, &b, None, 4).await.unwrap();
+        assert!(
+            rb.files >= 1,
+            "corpus B must own the dir after re-registration (files=0 regression)"
+        );
+        assert!(current_files(slug_b.clone()).await >= 1);
+        assert_eq!(
+            current_files(slug_a.clone()).await,
+            0,
+            "content is single-owner: A must no longer hold current rows for the path"
+        );
+
+        // Residue prune: plant a stale content:file in B pointing OUTSIDE its
+        // root (simulates a dir mis-scanned into the slug earlier), rescan.
+        let stray = format!("/nonexistent/ff-corpus-scope-stray-{suffix}/x.rs");
+        sqlx::query(
+            "INSERT INTO brain_vault_nodes (path, title, node_type, project, content_hash)
+             VALUES ($1, 'stray', 'content:file', $2, 'x')
+             ON CONFLICT (path) DO UPDATE SET project = EXCLUDED.project, valid_until = NULL",
+        )
+        .bind(&stray)
+        .bind(&slug_b)
+        .execute(&pg)
+        .await
+        .unwrap();
+        let rb2 = scan(&pg, &b, None, 4).await.unwrap();
+        assert!(rb2.pruned >= 1, "scan must invalidate out-of-root residue");
+        let stray_current: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM brain_vault_nodes WHERE path = $1 AND valid_until IS NULL",
+        )
+        .bind(&stray)
+        .fetch_optional(&pg)
+        .await
+        .unwrap();
+        assert!(stray_current.is_none(), "stray row must be invalidated");
+
+        // Cleanup: delete_corpus removes nodes by project (incl. the stray)
+        // and cascades sources/facets/candidates off the corpus row.
+        delete_corpus(&pg, &slug_a).await.unwrap();
+        delete_corpus(&pg, &slug_b).await.unwrap();
+        std::fs::remove_dir_all(&base).ok();
     }
 }

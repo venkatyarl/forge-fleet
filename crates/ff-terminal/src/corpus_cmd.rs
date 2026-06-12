@@ -56,6 +56,9 @@ pub async fn handle_corpus(pool: &PgPool, cmd: crate::CorpusCommand) -> Result<(
             println!("  content nodes:   {}", report.nodes_upserted);
             println!("  contains edges:  {}", report.edges);
             println!("  candidates:      {}", report.candidates);
+            if report.pruned > 0 {
+                println!("  pruned (out-of-root): {}", report.pruned);
+            }
             if apply {
                 let n = corpus::confirm_candidates(pool, &c, &[], true, 0.8).await?;
                 println!("{CYAN}  auto-confirmed:  {n} (confidence >= 0.8){RESET}");
