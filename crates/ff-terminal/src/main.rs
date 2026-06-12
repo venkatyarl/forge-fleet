@@ -2473,6 +2473,53 @@ pub enum ModelCommand {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// Manually add a row to the runtime model catalog (`fleet_model_catalog`).
+    ///
+    /// DB-first replacement for the retired `config/model_catalog.toml`: the
+    /// catalog that TOML used to populate (read by the model loader, the
+    /// router, and `ff model info/catalog/search/download`) has had NO manual
+    /// add path since TOML was dropped — `scout` only fills the separate
+    /// lifecycle/discovery table. Use this for an operator-chosen model scout
+    /// won't surface (a brand-new release, or a TP-pair-only giant). At least
+    /// one `--variant` makes the model downloadable. No download is triggered.
+    CatalogAdd {
+        /// Catalog id / slug (e.g. `kimi-k2.6`). Must be unique.
+        id: String,
+        /// Human-readable display name.
+        #[arg(long)]
+        name: String,
+        /// Model family (e.g. `kimi`, `glm`, `qwen`).
+        #[arg(long)]
+        family: String,
+        /// Parameter count, free-form (e.g. `1T`, `355B-A32B`).
+        #[arg(long)]
+        params: String,
+        /// Quality/cost tier 1..4 (1 = small/cheap, 4 = flagship/giant).
+        #[arg(long, default_value_t = 3)]
+        tier: i32,
+        /// Comma-separated preferred workloads
+        /// (e.g. `code-gen,tool_calling,reasoning`). Drives router matching;
+        /// including `tool_calling` also flags the model agent-capable.
+        #[arg(long)]
+        workloads: Option<String>,
+        /// A downloadable variant, repeatable. Format:
+        /// `runtime:hf_repo[:quant[:size_gb]]`
+        /// (e.g. `vllm:moonshotai/Kimi-K2.6:FP8:600`).
+        #[arg(long = "variant")]
+        variants: Vec<String>,
+        /// One-line description.
+        #[arg(long)]
+        description: Option<String>,
+        /// Mark the model as gated (HF license acceptance required).
+        #[arg(long, default_value_t = false)]
+        gated: bool,
+        /// Force the tool-calling flag on (otherwise auto-derived from
+        /// `--workloads` containing `tool_calling`).
+        #[arg(long, default_value_t = false)]
+        tool_calling: bool,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Model scout — walk fleet_task_coverage, query HF for the top-N
     /// downloaded models per task, filter by license/size/denylist, and
     /// insert survivors as `lifecycle_status='candidate'`.

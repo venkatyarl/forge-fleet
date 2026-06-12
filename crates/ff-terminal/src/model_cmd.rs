@@ -1687,6 +1687,98 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                 }
             }
         }
+        crate::ModelCommand::CatalogAdd {
+            id,
+            name,
+            family,
+            params,
+            tier,
+            workloads,
+            variants,
+            description,
+            gated,
+            tool_calling,
+            json,
+        } => {
+            if !(1..=4).contains(&tier) {
+                anyhow::bail!("--tier must be 1..4 (got {tier})");
+            }
+            // Comma-separated `--workloads` → JSONB array (trimmed, empties dropped).
+            let workloads_vec: Vec<String> = workloads
+                .as_deref()
+                .map(|v| {
+                    v.split(',')
+                        .map(str::trim)
+                        .filter(|t| !t.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            // `tool_calling` is auto-derived from the workloads (mirrors the
+            // TOML→DB upsert convention) unless forced on via the flag.
+            let tool_calling = tool_calling || workloads_vec.iter().any(|w| w == "tool_calling");
+            let workloads_json = serde_json::json!(workloads_vec);
+
+            // Each `--variant runtime:hf_repo[:quant[:size_gb]]` → a variant object.
+            let mut variants_vec = Vec::with_capacity(variants.len());
+            for spec in &variants {
+                variants_vec.push(parse_variant_spec(spec)?);
+            }
+            let variants_json = serde_json::Value::Array(variants_vec);
+
+            let inserted = sqlx::query(
+                "INSERT INTO fleet_model_catalog
+                     (id, name, family, parameters, tier, description,
+                      gated, preferred_workloads, variants, tool_calling)
+                 VALUES ($1, $2, $3, $4, $5, $6,
+                         $7, $8, $9, $10)
+                 ON CONFLICT (id) DO NOTHING",
+            )
+            .bind(&id)
+            .bind(&name)
+            .bind(&family)
+            .bind(&params)
+            .bind(tier)
+            .bind(&description)
+            .bind(gated)
+            .bind(&workloads_json)
+            .bind(&variants_json)
+            .bind(tool_calling)
+            .execute(&pool)
+            .await?;
+
+            let added = inserted.rows_affected() == 1;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "added": added,
+                        "id": id,
+                        "tool_calling": tool_calling,
+                        "variants": variants_json.as_array().map(|a| a.len()).unwrap_or(0),
+                        "reason": if added { "inserted" } else { "id_already_exists" },
+                    }))?
+                );
+            } else if added {
+                println!(
+                    "{GREEN}✓{RESET} Added '{id}' to fleet_model_catalog (tier {tier}, tool_calling={tool_calling}, {} variant(s))",
+                    variants.len()
+                );
+                if variants.is_empty() {
+                    println!(
+                        "  {YELLOW}note:{RESET} no --variant given — add one before \
+                         `ff model download {id}` will work."
+                    );
+                } else {
+                    println!("  Download with {CYAN}ff model download {id}{RESET}.");
+                }
+            } else {
+                anyhow::bail!(
+                    "catalog id '{id}' already exists — pick a different id (or \
+                     `ff model retire {id}` first)"
+                );
+            }
+        }
         crate::ModelCommand::Scout { run_now, json } => {
             if run_now {
                 println!("{CYAN}▶ Running model scout pass...{RESET}");
@@ -2414,6 +2506,45 @@ async fn handle_model_upgrade_available(pool: &sqlx::PgPool) -> anyhow::Result<(
     Ok(())
 }
 
+/// Parse a `--variant` spec `runtime:hf_repo[:quant[:size_gb]]` into the
+/// `fleet_model_catalog.variants` element shape `{runtime, hf_repo, quant,
+/// size_gb}`. `runtime` and `hf_repo` are required; an `hf_repo` containing
+/// `/` is fine (split is bounded to 4 fields so the repo's own slashes are
+/// preserved). `quant` is optional; `size_gb` must parse as a number if given.
+fn parse_variant_spec(spec: &str) -> Result<serde_json::Value> {
+    let parts: Vec<&str> = spec.splitn(4, ':').collect();
+    if parts.len() < 2 || parts[0].trim().is_empty() || parts[1].trim().is_empty() {
+        anyhow::bail!(
+            "invalid --variant '{spec}': expected runtime:hf_repo[:quant[:size_gb]] \
+             (e.g. vllm:moonshotai/Kimi-K2.6:FP8:600)"
+        );
+    }
+    let mut obj = serde_json::Map::new();
+    obj.insert("runtime".into(), parts[0].trim().into());
+    obj.insert("hf_repo".into(), parts[1].trim().into());
+    if let Some(q) = parts.get(2) {
+        let q = q.trim();
+        if !q.is_empty() {
+            obj.insert("quant".into(), q.into());
+        }
+    }
+    if let Some(sz) = parts.get(3) {
+        let sz = sz.trim();
+        if !sz.is_empty() {
+            let n: f64 = sz
+                .parse()
+                .map_err(|_| anyhow::anyhow!("invalid --variant size_gb '{sz}' in '{spec}'"))?;
+            obj.insert(
+                "size_gb".into(),
+                serde_json::Number::from_f64(n)
+                    .map(serde_json::Value::Number)
+                    .unwrap_or(serde_json::Value::Null),
+            );
+        }
+    }
+    Ok(serde_json::Value::Object(obj))
+}
+
 fn truncate_str(s: &str, n: usize) -> String {
     if s.chars().count() <= n {
         s.to_string()
@@ -2427,6 +2558,26 @@ fn truncate_str(s: &str, n: usize) -> String {
 mod tests {
     use super::*;
     use ff_agent::model_runtime::AGENT_MIN_CTX;
+
+    #[test]
+    fn variant_spec_parses_all_fields_and_preserves_repo_slashes() {
+        let v = parse_variant_spec("vllm:moonshotai/Kimi-K2.6:FP8:600").unwrap();
+        assert_eq!(v["runtime"], "vllm");
+        assert_eq!(v["hf_repo"], "moonshotai/Kimi-K2.6");
+        assert_eq!(v["quant"], "FP8");
+        assert_eq!(v["size_gb"], 600.0);
+
+        // runtime + repo only (quant/size omitted)
+        let v = parse_variant_spec("llama.cpp:Qwen/Qwen3.6-35B-GGUF").unwrap();
+        assert_eq!(v["hf_repo"], "Qwen/Qwen3.6-35B-GGUF");
+        assert!(v.get("quant").is_none());
+        assert!(v.get("size_gb").is_none());
+
+        // missing repo, empty fields, and non-numeric size are rejected
+        assert!(parse_variant_spec("vllm").is_err());
+        assert!(parse_variant_spec(":repo").is_err());
+        assert!(parse_variant_spec("vllm:repo:Q4:notanumber").is_err());
+    }
 
     #[test]
     fn agent_ready_at_or_above_floor() {
