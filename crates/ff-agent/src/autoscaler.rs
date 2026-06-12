@@ -325,6 +325,18 @@ enum Action {
         wanted: f64,
         supplied: i64,
     },
+    /// Relaunch an already-resident, too-small, tool-capable deployment into the
+    /// agent serving profile (`ff model reprofile`). The scale-up FALLBACK when no
+    /// fresh load fits: it converts stuck warm capacity into an agent endpoint
+    /// without needing free RAM for a new model.
+    Reprofile {
+        kind: Kind,
+        host: String,
+        deployment_id: String,
+        catalog_id: String,
+        wanted: f64,
+        supplied: i64,
+    },
 }
 
 /// Per-pass summary, for the info! log line.
@@ -351,8 +363,12 @@ pub struct AutoscaleSummary {
     pub leader_excluded: i64,
     pub planned_loads: usize,
     pub planned_unloads: usize,
+    /// Scale-up FALLBACK actions: reprofile an existing too-small tool-capable
+    /// endpoint into the agent profile when no fresh load fit.
+    pub planned_reprofiles: usize,
     pub loaded: usize,
     pub unloaded: usize,
+    pub reprofiled: usize,
     pub skipped_dwell: usize,
     pub no_fit: usize,
 }
@@ -586,12 +602,7 @@ async fn plan_pass(pg: &PgPool) -> Result<(Vec<Action>, AutoscaleSummary), Strin
             summary.skipped_dwell += 1;
             continue;
         }
-        if actions
-            .iter()
-            .filter(|a| matches!(a, Action::Load { .. }))
-            .count()
-            >= MAX_LOADS_PER_PASS
-        {
+        if scaleup_action_count(&actions) >= MAX_LOADS_PER_PASS {
             break;
         }
         tried_up = true;
@@ -600,7 +611,18 @@ async fn plan_pass(pg: &PgPool) -> Result<(Vec<Action>, AutoscaleSummary), Strin
             placed_up = true;
             break;
         }
-        // This kind couldn't be placed; try the next-most-starved one.
+        // No fresh load fit for this kind. FALLBACK: convert an already-resident,
+        // idle, too-small tool-capable endpoint of this kind into the agent
+        // profile (reuses warm RAM — the realistic scale-up path when no host has
+        // room for a new model). Purely additive: it only acts in the case the
+        // autoscaler used to give up on (no_fit), so it never competes with or
+        // thrashes a feasible fresh load.
+        if let Some(act) = plan_reprofile(pg, kind, wanted, supplied, leader.as_deref()).await? {
+            actions.push(act);
+            placed_up = true;
+            break;
+        }
+        // Neither a fresh load nor a reprofile fit; try the next-most-starved kind.
     }
     if tried_up && !placed_up {
         summary.no_fit += 1;
@@ -657,8 +679,74 @@ async fn plan_pass(pg: &PgPool) -> Result<(Vec<Action>, AutoscaleSummary), Strin
         .iter()
         .filter(|a| matches!(a, Action::Unload { .. }))
         .count();
+    summary.planned_reprofiles = actions
+        .iter()
+        .filter(|a| matches!(a, Action::Reprofile { .. }))
+        .count();
 
     Ok((actions, summary))
+}
+
+/// Count the scale-UP actions in a plan (a fresh load OR a reprofile fallback).
+/// Both consume the single per-pass scale-up slot, so the cap counts them
+/// together — we never do more than one scale-up action per pass.
+fn scaleup_action_count(actions: &[Action]) -> usize {
+    actions
+        .iter()
+        .filter(|a| matches!(a, Action::Load { .. } | Action::Reprofile { .. }))
+        .count()
+}
+
+/// Pure selection of the best reprofile candidate for `want_code`: among
+/// tool-capable too-small endpoints (already filtered by the SQL), keep those NOT
+/// on the leader or an excluded host and that are IDLE (no in-flight requests or a
+/// stale health ping — the same idleness test scale-down uses to pick a victim, so
+/// we never disrupt an endpoint that's actively serving), then take the MOST idle
+/// (oldest health ping). Returns `None` when nothing qualifies.
+fn pick_reprofile_candidate<'a>(
+    cands: &'a [ff_db::ReprofileCandidate],
+    want_code: bool,
+    leader: Option<&str>,
+) -> Option<&'a ff_db::ReprofileCandidate> {
+    cands
+        .iter()
+        .filter(|c| c.is_code == want_code)
+        .filter(|c| {
+            !EXCLUDE_HOSTS
+                .iter()
+                .any(|h| h.eq_ignore_ascii_case(&c.worker_name))
+        })
+        .filter(|c| leader.is_none_or(|l| !c.worker_name.eq_ignore_ascii_case(l)))
+        .filter(|c| {
+            c.request_count == 0 || c.health_age_sec.unwrap_or(i32::MAX) >= IDLE_HEALTH_AGE_SECS
+        })
+        .max_by_key(|c| c.health_age_sec.unwrap_or(i32::MAX))
+}
+
+/// Build a single REPROFILE action for `kind`: find an idle, too-small,
+/// tool-capable endpoint of this kind (off the leader / excluded hosts) and
+/// relaunch it in the agent profile. The scale-up FALLBACK when [`plan_load`]
+/// returned `None`. Returns `None` when no such endpoint exists.
+async fn plan_reprofile(
+    pg: &PgPool,
+    kind: Kind,
+    wanted: f64,
+    supplied: i64,
+    leader: Option<&str>,
+) -> Result<Option<Action>, String> {
+    let cands = ff_db::pg_reprofile_candidates(pg, AGENT_MIN_CTX as i32)
+        .await
+        .map_err(|e| format!("pg_reprofile_candidates: {e}"))?;
+    Ok(
+        pick_reprofile_candidate(&cands, kind.want_code(), leader).map(|c| Action::Reprofile {
+            kind,
+            host: c.worker_name.clone(),
+            deployment_id: c.deployment_id.clone(),
+            catalog_id: c.catalog_id.clone().unwrap_or_default(),
+            wanted,
+            supplied,
+        }),
+    )
 }
 
 /// Build a single LOAD action for `kind`: score every candidate host, pick the
@@ -750,6 +838,24 @@ async fn actuate(pg: &PgPool, action: &Action) -> Result<bool, String> {
             let result = do_unload(pg, host, deployment_id).await;
             if let Err(e) = ff_db::pg_unreserve_host(pg, host).await {
                 warn!(host = %host, error = %e, "autoscaler: failed to unreserve host after unload");
+            }
+            result
+        }
+        Action::Reprofile {
+            host,
+            deployment_id,
+            ..
+        } => {
+            if !ff_db::pg_reserve_host(pg, host, RESERVE_OWNER)
+                .await
+                .map_err(|e| format!("pg_reserve_host({host}): {e}"))?
+            {
+                debug!(host = %host, "autoscaler: host not available to reserve; skipping reprofile");
+                return Ok(false);
+            }
+            let result = do_reprofile(pg, host, deployment_id).await;
+            if let Err(e) = ff_db::pg_unreserve_host(pg, host).await {
+                warn!(host = %host, error = %e, "autoscaler: failed to unreserve host after reprofile");
             }
             result
         }
@@ -852,6 +958,41 @@ async fn do_unload(pg: &PgPool, host: &str, deployment_id: &str) -> Result<bool,
     }
 }
 
+/// Perform a REPROFILE: enqueue an `ff model reprofile <deployment_id>` defer-shell
+/// task targeted at the owning host. We dispatch via the defer queue (NOT inline)
+/// because `ff model reprofile` health-waits the relaunch up to 90s — far too long
+/// to block a tick. The `ff model reprofile` primitive carries ALL the safety
+/// (refuses non-tool-calling, no-ops if already agent-ready, RAM-headroom check,
+/// loud failure on a down-window), so the autoscaler only has to pick an idle
+/// candidate and hand it off — mirrors `do_load`'s cross-node pattern.
+async fn do_reprofile(pg: &PgPool, host: &str, deployment_id: &str) -> Result<bool, String> {
+    let command = format!(
+        "~/.local/bin/ff model reprofile {}",
+        shell_quote(deployment_id)
+    );
+    let payload = serde_json::json!({ "command": command });
+    let trigger_spec = serde_json::json!({});
+    let title = format!("autoscaler: reprofile {deployment_id} on {host}");
+    ff_db::pg_enqueue_deferred(
+        pg,
+        &title,
+        "shell",
+        &payload,
+        "now",
+        &trigger_spec,
+        Some(host),
+        &serde_json::json!([]),
+        Some(RESERVE_OWNER),
+        Some(3),
+    )
+    .await
+    .map(|defer_id| {
+        info!(host = %host, %deployment_id, %defer_id, "autoscaler: enqueued reprofile");
+        true
+    })
+    .map_err(|e| format!("pg_enqueue_deferred(reprofile on {host}): {e}"))
+}
+
 /// Minimal single-quote shell escaping for the defer-shell / SSH command we build.
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
@@ -922,6 +1063,26 @@ pub async fn autoscale_pass(pg: &PgPool) -> Result<AutoscaleSummary, String> {
                     deployment_id, host, kind.label(), wanted, supplied
                 );
             }
+            Action::Reprofile {
+                kind,
+                host,
+                deployment_id,
+                catalog_id,
+                wanted,
+                supplied,
+            } => {
+                info!(
+                    kind = kind.label(),
+                    %host,
+                    %deployment_id,
+                    %catalog_id,
+                    wanted = format!("{wanted:.2}"),
+                    supplied,
+                    mode = mode.as_str(),
+                    "autoscaler PLAN: would reprofile {} ({}) on {} into the agent profile because {} undersupplied (no fresh load fit) target={:.2} supply={}",
+                    deployment_id, catalog_id, host, kind.label(), wanted, supplied
+                );
+            }
         }
     }
 
@@ -940,6 +1101,10 @@ pub async fn autoscale_pass(pg: &PgPool) -> Result<AutoscaleSummary, String> {
                 }
                 Action::Unload { kind, .. } => {
                     summary.unloaded += 1;
+                    dwell_mark(*kind);
+                }
+                Action::Reprofile { kind, .. } => {
+                    summary.reprofiled += 1;
                     dwell_mark(*kind);
                 }
             },
@@ -1004,8 +1169,10 @@ pub fn spawn_autoscaler_tick(
                                 leader_excluded = s.leader_excluded,
                                 planned_loads = s.planned_loads,
                                 planned_unloads = s.planned_unloads,
+                                planned_reprofiles = s.planned_reprofiles,
                                 loaded = s.loaded,
                                 unloaded = s.unloaded,
+                                reprofiled = s.reprofiled,
                                 skipped_dwell = s.skipped_dwell,
                                 no_fit = s.no_fit,
                                 "autoscaler pass"
@@ -1054,6 +1221,106 @@ mod tests {
             resident_model_gb: resident,
             free_ram_gb: ram as f64 - resident,
         }
+    }
+
+    fn rcand(
+        id: &str,
+        worker: &str,
+        is_code: bool,
+        request_count: i64,
+        health_age_sec: Option<i32>,
+    ) -> ff_db::ReprofileCandidate {
+        ff_db::ReprofileCandidate {
+            deployment_id: id.into(),
+            worker_name: worker.into(),
+            port: 55000,
+            catalog_id: Some("qwen36-35b-a3b".into()),
+            runtime: "llama.cpp".into(),
+            usable_agent_ctx: Some(8192),
+            parallel_slots: Some(4),
+            request_count,
+            health_age_sec,
+            is_code,
+        }
+    }
+
+    #[test]
+    fn reprofile_pick_matches_kind_and_skips_busy_excluded_leader() {
+        let cands = vec![
+            // leader-hosted: excluded even though idle + right kind.
+            rcand("leader-ep", "logan", true, 0, Some(9999)),
+            // EXCLUDE_HOSTS (taylor): excluded.
+            rcand("excl-ep", "taylor", true, 0, Some(9999)),
+            // busy (in-flight requests + fresh health): not idle → skipped.
+            rcand("busy-ep", "veronica", true, 5, Some(10)),
+            // wrong kind for a code request.
+            rcand("gen-ep", "james", false, 0, Some(9999)),
+            // the valid pick: code, non-leader, non-excluded, idle (stale health).
+            rcand("good-ep", "lily", true, 3, Some(IDLE_HEALTH_AGE_SECS + 1)),
+        ];
+        let pick = pick_reprofile_candidate(&cands, true, Some("logan"));
+        assert_eq!(pick.map(|c| c.deployment_id.as_str()), Some("good-ep"));
+
+        // No code candidate qualifies once the only idle one is the leader's.
+        let only_leader = vec![rcand("leader-ep", "logan", true, 0, Some(9999))];
+        assert!(pick_reprofile_candidate(&only_leader, true, Some("logan")).is_none());
+
+        // request_count==0 also counts as idle even with a fresh health ping.
+        let zero_req = vec![rcand("zero", "duncan", true, 0, Some(1))];
+        assert_eq!(
+            pick_reprofile_candidate(&zero_req, true, Some("logan"))
+                .map(|c| c.deployment_id.as_str()),
+            Some("zero")
+        );
+    }
+
+    #[test]
+    fn reprofile_pick_prefers_most_idle() {
+        let cands = vec![
+            rcand("a", "lily", true, 1, Some(IDLE_HEALTH_AGE_SECS + 10)),
+            rcand("b", "veronica", true, 1, Some(IDLE_HEALTH_AGE_SECS + 500)),
+        ];
+        // Most idle (oldest health ping) wins.
+        assert_eq!(
+            pick_reprofile_candidate(&cands, true, None).map(|c| c.deployment_id.as_str()),
+            Some("b")
+        );
+    }
+
+    #[test]
+    fn scaleup_count_includes_load_and_reprofile() {
+        let load = Action::Load {
+            kind: Kind::Code,
+            host: "lily".into(),
+            library_id: "lib".into(),
+            catalog_id: "m".into(),
+            runtime: "llama.cpp".into(),
+            size_gb: 20.0,
+            score: 1.0,
+            wanted: 2.0,
+            supplied: 1,
+        };
+        let reprofile = Action::Reprofile {
+            kind: Kind::Code,
+            host: "veronica".into(),
+            deployment_id: "dep".into(),
+            catalog_id: "m".into(),
+            wanted: 2.0,
+            supplied: 1,
+        };
+        let unload = Action::Unload {
+            kind: Kind::General,
+            host: "james".into(),
+            deployment_id: "dep2".into(),
+            wanted: 0.0,
+            supplied: 2,
+        };
+        use std::slice::from_ref;
+        assert_eq!(scaleup_action_count(&[]), 0);
+        assert_eq!(scaleup_action_count(from_ref(&unload)), 0);
+        assert_eq!(scaleup_action_count(from_ref(&load)), 1);
+        assert_eq!(scaleup_action_count(from_ref(&reprofile)), 1);
+        assert_eq!(scaleup_action_count(&[load, reprofile, unload]), 2);
     }
 
     #[test]
