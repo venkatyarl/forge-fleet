@@ -446,37 +446,59 @@ pub async fn load_model(pool: &sqlx::PgPool, opts: LoadOptions) -> Result<LoadRe
         }
     }
 
-    // On Linux, before spawning, write a systemd user unit so the OS
-    // restarts this llama-server if it dies (OOM during a sibling cargo
-    // build, panic, manual kill, anything). Marcus has the smallest RAM
-    // headroom (32 GB) and qwen3-coder-30b uses ~28 GB, so cargo's LLVM
-    // linking step routinely OOM-kills the LLM. systemd supervision turns
-    // that from a permanent outage into a 10-second blip.
+    // On Linux, prefer systemd OWNERSHIP over the manual setsid spawn: write
+    // the user unit AND start it, so the inference server lives in a persistent
+    // `user.slice` cgroup. The manual spawn below survives `ff model load`
+    // exiting (setsid breaks the parent linkage), but it does NOT survive the
+    // logind SESSION SCOPE being torn down when a *cross-node* dispatch closes
+    // its SSH channel — `ff model autoload --node X` runs a one-shot `ff` over
+    // ssh, and the moment that ssh command returns, logind kills the session
+    // scope's cgroup and the setsid child with it. The server's own log shows
+    // it reaching "server is listening" then immediately "cleaning up before
+    // exit". The autoscaler's remote-load path uses exactly this, so remote
+    // autoloads were silently dying seconds after reporting success.
     //
-    // The unit file ENCODES the same command we're about to spawn, so on
-    // restart systemd brings up a fresh copy with identical args. Failures
-    // are reported into `model-<port>.log` next to the manual-spawn log.
-    //
-    // Best-effort: if write or daemon-reload fails (no systemd, no user
-    // session, etc.) we still fall through to the manual spawn — the
-    // supervision is additive, not replacement.
-    #[cfg(target_os = "linux")]
-    {
-        if let Err(e) = write_systemd_unit(&program, &args, port, &log_path).await {
-            tracing::warn!(
+    // A systemd-started unit runs in user.slice, independent of any session
+    // scope, so it survives. `cfg!` (runtime, not `#[cfg]`) keeps this path
+    // type-checked on every target while only executing on Linux. Falls back
+    // to the manual spawn if systemd isn't usable (no user manager, etc.).
+    let mut systemd_pid: Option<u32> = None;
+    if cfg!(target_os = "linux") {
+        match write_systemd_unit(&program, &args, port, &log_path).await {
+            Ok(()) => match start_systemd_unit(port).await {
+                Ok(p) => {
+                    tracing::info!(
+                        port,
+                        pid = p,
+                        "model_runtime: started via systemd user unit"
+                    );
+                    systemd_pid = Some(p);
+                }
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    port,
+                    "model_runtime: systemctl start failed (falling back to manual spawn)"
+                ),
+            },
+            Err(e) => tracing::warn!(
                 error = %e,
                 port,
-                "model_runtime: systemd unit write failed (continuing with manual spawn)"
-            );
+                "model_runtime: systemd unit write failed (falling back to manual spawn)"
+            ),
         }
     }
 
-    let mut child = cmd.spawn().map_err(|e| format!("spawn {program}: {e}"))?;
-    let pid = child.id();
-    // Reap in background so the child doesn't become a zombie.
-    tokio::task::spawn_blocking(move || {
-        let _ = child.wait();
-    });
+    let pid = if let Some(p) = systemd_pid {
+        p
+    } else {
+        let mut child = cmd.spawn().map_err(|e| format!("spawn {program}: {e}"))?;
+        let pid = child.id();
+        // Reap in background so the child doesn't become a zombie.
+        tokio::task::spawn_blocking(move || {
+            let _ = child.wait();
+        });
+        pid
+    };
 
     // Wait for health endpoint to come up (up to 90s).
     let health_ok = wait_for_health(
@@ -1390,6 +1412,50 @@ async fn stop_systemd_unit(port: u16) {
     }
 }
 
+/// Start (restart) the `llama-<port>.service` systemd user unit and return its
+/// `MainPID`. Used on Linux so the inference server is owned by systemd
+/// (persistent `user.slice` cgroup) instead of a manual setsid child that
+/// logind kills when a cross-node `ff model autoload` SSH session closes.
+///
+/// `restart` (not `start`) so a stale unit instance is cleanly replaced — the
+/// call is idempotent for reloads. Not `#[cfg]`-gated so the `cfg!`-guarded
+/// call site type-checks on every target; it is only ever reached on Linux.
+async fn start_systemd_unit(port: u16) -> Result<u32, String> {
+    use tokio::process::Command as TokCmd;
+    let unit = format!("llama-{port}.service");
+
+    let st = TokCmd::new("systemctl")
+        .args(["--user", "restart", &unit])
+        .output()
+        .await
+        .map_err(|e| format!("systemctl restart {unit}: {e}"))?;
+    if !st.status.success() {
+        return Err(format!(
+            "systemctl restart {unit} exited {}: {}",
+            st.status,
+            String::from_utf8_lossy(&st.stderr).trim()
+        ));
+    }
+
+    // Resolve the actual serving PID. MainPID is "0" until the unit's
+    // ExecStart has forked — restart returns once the service is started, so
+    // this is populated, but guard against the 0 case anyway.
+    let show = TokCmd::new("systemctl")
+        .args(["--user", "show", "-p", "MainPID", "--value", &unit])
+        .output()
+        .await
+        .map_err(|e| format!("systemctl show {unit}: {e}"))?;
+    let raw = String::from_utf8_lossy(&show.stdout);
+    let pid: u32 = raw
+        .trim()
+        .parse()
+        .map_err(|_| format!("MainPID not numeric: {:?}", raw.trim()))?;
+    if pid == 0 {
+        return Err(format!("{unit} started but MainPID is 0 (not running)"));
+    }
+    Ok(pid)
+}
+
 /// Write a systemd user unit that mirrors the spawn we're about to run, so
 /// the OS restarts this llama-server on failure. Best-effort — failures
 /// log and return Ok-like so the caller falls through to the manual spawn.
@@ -1402,7 +1468,9 @@ async fn stop_systemd_unit(port: u16) {
 /// On every `ff model autoload`, the unit is REWRITTEN with the latest
 /// args and a `systemctl daemon-reload` is issued, so changes to the
 /// catalog (e.g. ctx size, parallel slots) propagate on next load.
-#[cfg(target_os = "linux")]
+///
+/// Not `#[cfg]`-gated so the `cfg!(target_os = "linux")`-guarded call site in
+/// `load_model` type-checks on every target; it is only ever called on Linux.
 async fn write_systemd_unit(
     program: &str,
     args: &[String],
