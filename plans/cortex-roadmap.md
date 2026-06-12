@@ -12,7 +12,7 @@
 | Capability | CRG (code-review-graph MCP) | graphify | Cortex |
 |---|---|---|---|
 | Multi-language code | ✅ tree-sitter, many langs | ✅ | ✅ rust/ts/tsx/js/java (python: extractor design exists in a superseded stash, not landed) |
-| Change-aware review (detect_changes, risk-scored diff) | ✅ | – | ❌ **biggest gap** |
+| Change-aware review (detect_changes, risk-scored diff) | ✅ | – | ✅ `ff cortex review` (file-level; hunk-level TODO) |
 | Test-coverage mapping (tests_for) | ✅ | – | ❌ |
 | Execution flows / affected-flows | ✅ | – | ❌ |
 | Provenance + confidence tiers (EXTRACTED/INFERRED) | – | ✅ | ❌ (all edges equal) |
@@ -20,7 +20,7 @@
 | Budgeted GraphRAG answers (query --budget) | partial | ✅ | partial (semantic search, no answer synthesis) |
 | Cross-repo merge | ✅ | ✅ | partial (multi-corpus, no merged view) |
 | Wiki generation | ✅ | ✅ | ❌ |
-| Incremental (changed-files-only) reindex | ✅ | ✅ --update | ❌ full rewipe each run |
+| Incremental (changed-files-only) reindex | ✅ | ✅ --update | ✅ `ff cortex index --incremental` (V123 ledger) |
 
 ## Research takeaways (2026-06-12 pass)
 
@@ -45,14 +45,19 @@
 
 ## Recommended roadmap (priority order)
 
-1. **Incremental reindex** — changed files only; makes the post-commit hook cheap
-   (today every commit triggers a full rewipe+rescan).
-2. **MCP query surface** — cortex_search / callers / callees / impact as fleet MCP
-   tools (the CodeGraph pattern; replaces agents' dependence on CRG).
-3. **detect_changes vs git diff** — change-aware, risk-scored review context
-   (CRG's killer feature).
+1. ✅ **Incremental reindex** (PR #182, V123 ledger) — changed files only; the
+   post-commit hook + watcher now use `ff cortex index --incremental`.
+2. ✅ **MCP query surface** (PR #181) — cortex_corpora/callers/callees/impact as
+   fleet MCP tools (the CodeGraph pattern; replaces agents' dependence on CRG).
+3. ✅ **detect_changes vs git diff** (PR #183) — `ff cortex review [--base <ref>]
+   [--format json]`: risk-scored (fan-in / external fan-in / transitive blast)
+   review map, ranked most-actionable-first. File-level granularity for now;
+   follow-ups: (i) hunk-level (only the symbols whose bodies changed — needs
+   persisted symbol byte-spans or a re-parse-changed-file pass), (ii) a
+   `cortex_review` MCP tool (needs a repo-path param — the daemon isn't in the repo).
 4. **Community summaries via fleet LLMs** — GraphRAG-style per-community
-   summaries, re-summarize only changed communities.
+   summaries, re-summarize only changed communities (the idle fleet is the lever;
+   pairs with the incremental ledger). ← **next cortex build**
 5. **Provenance/confidence on edges** — EXTRACTED vs INFERRED tiers (graphify's
    one structural advantage), so downstream consumers can filter heuristic call
    edges (e.g. the dotty-resolver's kept-as-written externs).
