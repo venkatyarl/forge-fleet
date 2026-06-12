@@ -11,7 +11,7 @@
 
 | Capability | CRG (code-review-graph MCP) | graphify | Cortex |
 |---|---|---|---|
-| Multi-language code | ✅ tree-sitter, many langs | ✅ | ✅ rust/ts/tsx/js/java (python: extractor design exists in a superseded stash, not landed) |
+| Multi-language code | ✅ tree-sitter, many langs | ✅ | ✅ rust/ts/tsx/js/java/python |
 | Change-aware review (detect_changes, risk-scored diff) | ✅ | – | ✅ `ff cortex review` (hunk-level: narrows to symbols whose bodies the diff touched) |
 | Test-coverage mapping (tests_for) | ✅ | – | ❌ |
 | Execution flows / affected-flows | ✅ | – | ❌ |
@@ -74,7 +74,10 @@
   callers query both worked).
 - Corpora cleanup: `ff brain corpus delete <slug> --yes` added (`0cf184885`);
   9 test/stale corpora removed.
-- Python support: parallel `cortex_lang.rs` design (incl. Python extractor) is
-  parked in `stash@{0}` + its untracked file in `stash@{0}^3` — superseded by the
-  landed in-cortex.rs design; port the Python extractor onto the landed
-  architecture rather than popping the stash.
+- Python support: ✅ SHIPPED (PR #190, `aab18fbfa`). `parse_python_file` (tree-
+  sitter-python) ported onto the landed in-cortex.rs architecture — `code:class`/
+  `code:function` symbols, package-path modules (`__init__.py` packages), import-
+  alias call resolution, `self`→enclosing-class. Verified live: forge-fleet index
+  picks up `.py` (5 files/21 symbols/19 calls resolved); `ff cortex callers` /
+  `callees` query Python symbols correctly. The old parallel `cortex_lang.rs`
+  design parked in `stash@{0}` is now fully obsolete and can be dropped.
