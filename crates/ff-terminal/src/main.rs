@@ -2244,6 +2244,18 @@ pub enum ModelCommand {
         #[arg(long)]
         show_id: bool,
     },
+    /// Agent-readiness report: classify every healthy tool-calling deployment
+    /// as agent-capable (per-slot ctx >= 32768, what the router needs) or a
+    /// "reprofile candidate" (tool-capable but launched with too many parallel
+    /// slots to fit an agent's tool-schema prompt). Surfaces the fleet's real
+    /// agent-serving capacity + which endpoints to relaunch in an agent profile.
+    AgentReady {
+        #[arg(long)]
+        node: Option<String>,
+        /// Emit JSON instead of the human table.
+        #[arg(long)]
+        json: bool,
+    },
     /// Pause local model deployments to free RAM for a release build — only if
     /// this host is memory-tight. Snapshots restorable models for resume.
     /// Called by the self-built upgrade wave before `cargo build`; no-op on

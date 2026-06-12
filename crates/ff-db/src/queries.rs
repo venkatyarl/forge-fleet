@@ -2960,6 +2960,72 @@ pub async fn pg_supplied_slots_by_kind(pool: &PgPool, min_ctx: i32) -> Result<Se
     Ok(supply)
 }
 
+/// One healthy, tool-calling deployment, with the per-slot context the agent
+/// router actually filters on. Used by `ff model agent-ready` to report which
+/// endpoints can serve agent/tool work and which tool-capable models are stuck
+/// in a too-small serving profile (a "reprofile candidate"). Unlike
+/// [`pg_supplied_slots_by_kind`], this does NOT filter on `usable_agent_ctx` —
+/// it returns every tool-capable endpoint so the caller can split agent-ready
+/// from reprofile-candidate by the same `AGENT_MIN_CTX` floor.
+#[derive(Debug, Clone)]
+pub struct AgentReadinessRow {
+    pub worker_name: String,
+    pub catalog_id: Option<String>,
+    pub port: i32,
+    pub runtime: String,
+    pub context_window: Option<i32>,
+    pub parallel_slots: Option<i32>,
+    pub usable_agent_ctx: Option<i32>,
+    /// True when the catalog model is tagged `code-gen` (else it buckets as
+    /// `general`), matching the autoscaler's code/general split.
+    pub is_code: bool,
+}
+
+/// Every healthy, active, tool-calling deployment on the fleet, optionally
+/// filtered to one host. Ordered worker, then port. The caller classifies each
+/// row against `AGENT_MIN_CTX`.
+pub async fn pg_agent_readiness(
+    pool: &PgPool,
+    worker_name: Option<&str>,
+) -> Result<Vec<AgentReadinessRow>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT d.worker_name      AS worker_name,
+               d.catalog_id       AS catalog_id,
+               d.port             AS port,
+               d.runtime          AS runtime,
+               d.context_window   AS context_window,
+               d.parallel_slots   AS parallel_slots,
+               d.usable_agent_ctx AS usable_agent_ctx,
+               (cat.preferred_workloads @> '["code-gen"]'::jsonb) AS is_code
+          FROM fleet_model_deployments d
+          JOIN fleet_model_catalog cat ON cat.id = d.catalog_id
+         WHERE d.health_status = 'healthy'
+           AND d.desired_state = 'active'
+           AND cat.tool_calling = TRUE
+           AND ($1::text IS NULL OR d.worker_name = $1)
+         ORDER BY d.worker_name, d.port
+        "#,
+    )
+    .bind(worker_name)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .iter()
+        .map(|r| AgentReadinessRow {
+            worker_name: r.get("worker_name"),
+            catalog_id: r.try_get("catalog_id").ok(),
+            port: r.try_get("port").unwrap_or(0),
+            runtime: r.get("runtime"),
+            context_window: r.try_get("context_window").ok(),
+            parallel_slots: r.try_get("parallel_slots").ok(),
+            usable_agent_ctx: r.try_get("usable_agent_ctx").ok(),
+            is_code: r.try_get::<bool, _>("is_code").unwrap_or(false),
+        })
+        .collect())
+}
+
 /// A candidate host the autoscaler can place a new model on. One row per online
 /// computer, JOINed with its V114 reservation state, hardware facts, and current
 /// deployment count (the least-loaded tiebreak). `free_ram_gb` is a conservative

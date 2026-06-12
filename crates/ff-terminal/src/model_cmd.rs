@@ -5,6 +5,14 @@ use crate::{
 use anyhow::Result;
 use std::path::PathBuf;
 
+/// True when a deployment's per-slot context (`usable_agent_ctx`) meets the
+/// agent router floor `min_ctx`. A `None` ctx (unknown / pre-backfill) is NOT
+/// agent-ready — the router can't trust an endpoint whose usable slot size it
+/// doesn't know. Mirrors the filter in `ff_db::pg_supplied_slots_by_kind`.
+fn is_agent_ready(usable_agent_ctx: Option<i32>, min_ctx: i32) -> bool {
+    usable_agent_ctx.map(|c| c >= min_ctx).unwrap_or(false)
+}
+
 pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
     let pool = ff_agent::fleet_info::get_fleet_pool()
         .await
@@ -176,6 +184,125 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                     );
                 }
             }
+        }
+        crate::ModelCommand::AgentReady { node, json } => {
+            let rows = ff_db::pg_agent_readiness(&pool, node.as_deref()).await?;
+            let min_ctx = ff_agent::model_runtime::AGENT_MIN_CTX as i32;
+            let leader = ff_db::pg_get_current_leader(&pool)
+                .await
+                .ok()
+                .flatten()
+                .map(|l| l.member_name);
+            let is_leader = |w: &str| leader.as_deref() == Some(w);
+
+            // Split tool-capable endpoints into agent-capable (per-slot ctx meets
+            // the router floor) vs reprofile-candidate (too many slots → too small).
+            let (ready, candidates): (
+                Vec<&ff_db::AgentReadinessRow>,
+                Vec<&ff_db::AgentReadinessRow>,
+            ) = rows
+                .iter()
+                .partition(|r| is_agent_ready(r.usable_agent_ctx, min_ctx));
+
+            let fmt_ctx =
+                |r: &ff_db::AgentReadinessRow| match (r.usable_agent_ctx, r.parallel_slots) {
+                    (Some(u), Some(p)) => format!("{u}x{p}"),
+                    (Some(u), None) => u.to_string(),
+                    _ => "-".into(),
+                };
+
+            if json {
+                let to_obj = |r: &ff_db::AgentReadinessRow| {
+                    serde_json::json!({
+                        "node": r.worker_name,
+                        "catalog_id": r.catalog_id,
+                        "port": r.port,
+                        "runtime": r.runtime,
+                        "context_window": r.context_window,
+                        "parallel_slots": r.parallel_slots,
+                        "usable_agent_ctx": r.usable_agent_ctx,
+                        "kind": if r.is_code { "code" } else { "general" },
+                        "is_leader": is_leader(&r.worker_name),
+                    })
+                };
+                let code_ready = ready.iter().filter(|r| r.is_code).count();
+                let non_leader = ready.iter().filter(|r| !is_leader(&r.worker_name)).count();
+                let out = serde_json::json!({
+                    "min_ctx": min_ctx,
+                    "leader": leader,
+                    "agent_capable": ready.iter().map(|r| to_obj(r)).collect::<Vec<_>>(),
+                    "reprofile_candidates": candidates.iter().map(|r| to_obj(r)).collect::<Vec<_>>(),
+                    "summary": {
+                        "agent_capable": ready.len(),
+                        "agent_capable_non_leader": non_leader,
+                        "reprofile_candidates": candidates.len(),
+                        "code_ready": code_ready,
+                        "general_ready": ready.len() - code_ready,
+                    }
+                });
+                println!("{}", serde_json::to_string_pretty(&out)?);
+                return Ok(());
+            }
+
+            println!(
+                "{GREEN}AGENT-CAPABLE ENDPOINTS{RESET} (tool_calling + usable_agent_ctx >= {min_ctx})"
+            );
+            if ready.is_empty() {
+                println!("  (none — no endpoint can currently serve an agent/tool task)");
+            } else {
+                println!(
+                    "  {:<10} {:<28} {:<6} {:<10} {:<8} LEADER",
+                    "NODE", "CATALOG_ID", "PORT", "AGENT_CTX", "KIND"
+                );
+                for r in &ready {
+                    println!(
+                        "  {:<10} {:<28} {:<6} {:<10} {:<8} {}",
+                        r.worker_name,
+                        r.catalog_id.clone().unwrap_or_else(|| "-".into()),
+                        r.port,
+                        fmt_ctx(r),
+                        if r.is_code { "code" } else { "general" },
+                        if is_leader(&r.worker_name) {
+                            "leader"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+            }
+            println!();
+            println!(
+                "{YELLOW}REPROFILE CANDIDATES{RESET} (tool-capable but per-slot ctx < {min_ctx})"
+            );
+            if candidates.is_empty() {
+                println!("  (none)");
+            } else {
+                println!(
+                    "  {:<10} {:<28} {:<6} {:<10} {:<8} HINT",
+                    "NODE", "CATALOG_ID", "PORT", "AGENT_CTX", "KIND"
+                );
+                for r in &candidates {
+                    println!(
+                        "  {:<10} {:<28} {:<6} {:<10} {:<8} relaunch --parallel 1 --ctx {min_ctx}",
+                        r.worker_name,
+                        r.catalog_id.clone().unwrap_or_else(|| "-".into()),
+                        r.port,
+                        fmt_ctx(r),
+                        if r.is_code { "code" } else { "general" },
+                    );
+                }
+            }
+            println!();
+            let code_ready = ready.iter().filter(|r| r.is_code).count();
+            let non_leader = ready.iter().filter(|r| !is_leader(&r.worker_name)).count();
+            println!(
+                "{CYAN}SUMMARY{RESET}: {} agent-capable ({} non-leader) | {} reprofile candidate(s) | code: {} ready, general: {} ready",
+                ready.len(),
+                non_leader,
+                candidates.len(),
+                code_ready,
+                ready.len() - code_ready,
+            );
         }
         crate::ModelCommand::FreeForBuild => {
             match ff_agent::model_runtime::pause_local_models_for_build(&pool).await {
@@ -2051,5 +2178,35 @@ fn truncate_str(s: &str, n: usize) -> String {
     } else {
         let truncated: String = s.chars().take(n.saturating_sub(1)).collect();
         format!("{truncated}…")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ff_agent::model_runtime::AGENT_MIN_CTX;
+
+    #[test]
+    fn agent_ready_at_or_above_floor() {
+        let floor = AGENT_MIN_CTX as i32;
+        // logan qwen36 32768x1 — exactly the floor → ready.
+        assert!(is_agent_ready(Some(floor), floor));
+        // taylor mlx 65536x1 — above floor → ready.
+        assert!(is_agent_ready(Some(65536), floor));
+    }
+
+    #[test]
+    fn reprofile_candidate_below_floor() {
+        let floor = AGENT_MIN_CTX as i32;
+        // lily/sia 8192x4, veronica 4096x4 — per-slot ctx below floor.
+        assert!(!is_agent_ready(Some(8192), floor));
+        assert!(!is_agent_ready(Some(4096), floor));
+        assert!(!is_agent_ready(Some(floor - 1), floor));
+    }
+
+    #[test]
+    fn unknown_ctx_is_not_ready() {
+        // NULL usable_agent_ctx (pre-backfill / unknown) must not be trusted.
+        assert!(!is_agent_ready(None, AGENT_MIN_CTX as i32));
     }
 }
