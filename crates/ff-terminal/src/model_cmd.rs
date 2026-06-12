@@ -1908,12 +1908,34 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
             skip_benchmark,
             force,
             on_computer,
+            variants,
+            tier,
+            workloads,
+            tool_calling,
+            no_runtime_row,
         } => {
-            // 1. Verify the candidate exists and is still in review.
-            let row = sqlx::query("SELECT lifecycle_status FROM model_catalog WHERE id = $1")
-                .bind(&id)
-                .fetch_optional(&pool)
-                .await?;
+            if let Some(t) = tier {
+                if !(1..=4).contains(&t) {
+                    anyhow::bail!("--tier must be 1..4 (got {t})");
+                }
+            }
+            // Parse any operator-supplied runtime variants up front so a typo
+            // fails BEFORE we flip the lifecycle status.
+            let mut variant_objs = Vec::with_capacity(variants.len());
+            for spec in &variants {
+                variant_objs.push(parse_variant_spec(spec)?);
+            }
+
+            // 1. Verify the candidate exists and is still in review, and grab
+            //    the metadata we'll copy into the runtime catalog row.
+            let row = sqlx::query(
+                "SELECT lifecycle_status, display_name, family, parameter_count,
+                        tasks, quality_tier, notes
+                   FROM model_catalog WHERE id = $1",
+            )
+            .bind(&id)
+            .fetch_optional(&pool)
+            .await?;
             let Some(row) = row else {
                 anyhow::bail!("no catalog row found for id '{id}'");
             };
@@ -1923,6 +1945,12 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                     "model '{id}' is in lifecycle_status='{status}' — only 'candidate' rows can be approved"
                 );
             }
+            let cand_display_name: String = sqlx::Row::get(&row, "display_name");
+            let cand_family: String = sqlx::Row::get(&row, "family");
+            let cand_params: Option<String> = sqlx::Row::get(&row, "parameter_count");
+            let cand_tasks: serde_json::Value = sqlx::Row::get(&row, "tasks");
+            let cand_quality_tier: String = sqlx::Row::get(&row, "quality_tier");
+            let cand_notes: Option<String> = sqlx::Row::get(&row, "notes");
 
             let skip = skip_benchmark || force;
             let mut bench_summary: Option<ff_agent::model_benchmark::BenchmarkReport> = None;
@@ -2013,8 +2041,102 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                 anyhow::bail!("race: candidate '{id}' was changed by someone else during approval");
             }
 
+            // 3b. Materialize the runtime catalog row so the loader/router can
+            //     actually see the approved model. The two catalogs share the
+            //     `id` keyspace but were never kept in sync — without this an
+            //     "approved" model still wasn't servable. ON CONFLICT DO NOTHING
+            //     so an existing operator-tuned runtime row is never clobbered.
+            //     Failure here is non-fatal: the lifecycle flip already
+            //     committed, so we warn loudly with the manual recovery command
+            //     rather than reporting a misleading "approve failed".
+            let mut runtime_row_note: Option<String> = None;
+            if !no_runtime_row {
+                let tier_val = tier.unwrap_or_else(|| quality_tier_to_int(&cand_quality_tier));
+                let params_val = cand_params
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("unknown")
+                    .to_string();
+                // Workloads: explicit override (csv) else the candidate's HF tasks.
+                let workloads_json = match workloads.as_deref() {
+                    Some(csv) => serde_json::json!(
+                        csv.split(',')
+                            .map(str::trim)
+                            .filter(|t| !t.is_empty())
+                            .collect::<Vec<_>>()
+                    ),
+                    None => {
+                        if cand_tasks.is_array() {
+                            cand_tasks.clone()
+                        } else {
+                            serde_json::json!([])
+                        }
+                    }
+                };
+                let tool_calling_val = tool_calling
+                    || workloads_json
+                        .as_array()
+                        .map(|a| a.iter().any(|w| w.as_str() == Some("tool_calling")))
+                        .unwrap_or(false);
+                let variants_json = serde_json::Value::Array(variant_objs.clone());
+
+                let res = sqlx::query(
+                    "INSERT INTO fleet_model_catalog
+                         (id, name, family, parameters, tier, description,
+                          gated, preferred_workloads, variants, tool_calling)
+                     VALUES ($1, $2, $3, $4, $5, $6, FALSE, $7, $8, $9)
+                     ON CONFLICT (id) DO NOTHING",
+                )
+                .bind(&id)
+                .bind(&cand_display_name)
+                .bind(&cand_family)
+                .bind(&params_val)
+                .bind(tier_val)
+                .bind(&cand_notes)
+                .bind(&workloads_json)
+                .bind(&variants_json)
+                .bind(tool_calling_val)
+                .execute(&pool)
+                .await;
+                match res {
+                    Ok(r) if r.rows_affected() == 1 => {
+                        runtime_row_note = Some(if variant_objs.is_empty() {
+                            format!(
+                                "runtime row created (tier {tier_val}, tool_calling={tool_calling_val}); \
+                                 router/loader-visible but NOT yet downloadable — scout candidates carry \
+                                 no runtime info. Tip: pass `--variant runtime:hf_repo[:quant[:size_gb]]` \
+                                 to `ff model approve` to make it servable in one step."
+                            )
+                        } else {
+                            format!(
+                                "runtime row created (tier {tier_val}, tool_calling={tool_calling_val}, \
+                                 {} variant(s)); download with: ff model download {id}",
+                                variant_objs.len()
+                            )
+                        });
+                    }
+                    Ok(_) => {
+                        runtime_row_note =
+                            Some("runtime row already existed (left untouched)".into());
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "{YELLOW}⚠ Promoted, but could NOT materialize the fleet_model_catalog \
+                             runtime row:{RESET} {e}\n  \
+                             The model is active but not yet loader/router-visible. Add it manually:\n  \
+                             ff model catalog-add {id} --name '{cand_display_name}' --family {cand_family} \
+                             --params {params_val} [--variant ...]"
+                        );
+                    }
+                }
+            }
+
             // 4. Report.
             println!("{GREEN}✓{RESET} Promoted '{id}' to lifecycle_status='active'");
+            if let Some(note) = &runtime_row_note {
+                println!("  {CYAN}↳{RESET} {note}");
+            }
             if let Some(r) = bench_summary {
                 println!("  benchmark pass:   yes");
                 println!("  computer:         {}", r.computer);
@@ -2545,6 +2667,29 @@ fn parse_variant_spec(spec: &str) -> Result<serde_json::Value> {
     Ok(serde_json::Value::Object(obj))
 }
 
+/// Map a `model_catalog.quality_tier` (free text) to the integer
+/// `fleet_model_catalog.tier` (1..4). Grounded in the live values
+/// (`experimental`/`standard`/`flagship`/`legacy`) plus a numeric/`tierN`
+/// fallback; anything unknown defaults to the mid tier 2. Used to materialize
+/// a runtime catalog row when a scout candidate is approved.
+fn quality_tier_to_int(quality_tier: &str) -> i32 {
+    let t = quality_tier.trim().to_ascii_lowercase();
+    match t.as_str() {
+        "experimental" | "legacy" => 1,
+        "standard" => 2,
+        "flagship" => 3,
+        // `tier1`..`tier4` or a bare `1`..`4` → that number (clamped 1..4).
+        other => {
+            let digits: String = other.chars().filter(|c| c.is_ascii_digit()).collect();
+            digits
+                .parse::<i32>()
+                .ok()
+                .map(|n| n.clamp(1, 4))
+                .unwrap_or(2)
+        }
+    }
+}
+
 fn truncate_str(s: &str, n: usize) -> String {
     if s.chars().count() <= n {
         s.to_string()
@@ -2577,6 +2722,24 @@ mod tests {
         assert!(parse_variant_spec("vllm").is_err());
         assert!(parse_variant_spec(":repo").is_err());
         assert!(parse_variant_spec("vllm:repo:Q4:notanumber").is_err());
+    }
+
+    #[test]
+    fn quality_tier_maps_to_int() {
+        // Live model_catalog.quality_tier values.
+        assert_eq!(quality_tier_to_int("standard"), 2);
+        assert_eq!(quality_tier_to_int("flagship"), 3);
+        assert_eq!(quality_tier_to_int("experimental"), 1);
+        assert_eq!(quality_tier_to_int("legacy"), 1);
+        // Case-insensitive + whitespace tolerant.
+        assert_eq!(quality_tier_to_int("  Flagship "), 3);
+        // tierN / bare-number forms, clamped 1..4.
+        assert_eq!(quality_tier_to_int("tier4"), 4);
+        assert_eq!(quality_tier_to_int("3"), 3);
+        assert_eq!(quality_tier_to_int("tier9"), 4);
+        // Unknown → mid tier.
+        assert_eq!(quality_tier_to_int("premium"), 2);
+        assert_eq!(quality_tier_to_int(""), 2);
     }
 
     #[test]

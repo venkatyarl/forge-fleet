@@ -2544,6 +2544,13 @@ pub enum ModelCommand {
     /// benchmark passes (tokens_per_sec >= 5 AND non-empty response AND
     /// no errors). Pass `--skip-benchmark` (or `--force`) to bypass and
     /// promote immediately.
+    ///
+    /// On promotion this ALSO materializes a `fleet_model_catalog` runtime row
+    /// (metadata copied from the candidate) so the model becomes visible to the
+    /// model loader/router — the two catalogs were previously disconnected, so
+    /// an "approved" model still couldn't be served. Pass `--variant ...` to
+    /// make it `ff model download`-able in the same step (scout candidates
+    /// carry no runtime info). Existing runtime rows are never overwritten.
     Approve {
         /// Catalog id.
         id: String,
@@ -2557,6 +2564,32 @@ pub enum ModelCommand {
         /// auto-picking. Ignored when `--skip-benchmark` is set.
         #[arg(long)]
         on_computer: Option<String>,
+        /// A downloadable runtime variant for the materialized
+        /// `fleet_model_catalog` row, repeatable. Format:
+        /// `runtime:hf_repo[:quant[:size_gb]]`
+        /// (e.g. `llama.cpp:Qwen/Qwen3-8B-GGUF:Q4_K_M:5`). Without at least
+        /// one variant the approved model is router/loader-visible but not
+        /// yet `ff model download`-able (scout candidates carry no runtime
+        /// info). This is how approve→servable becomes one step.
+        #[arg(long = "variant")]
+        variants: Vec<String>,
+        /// Override the runtime-row tier (1..4). Default: derived from the
+        /// candidate's `quality_tier`.
+        #[arg(long)]
+        tier: Option<i32>,
+        /// Override preferred workloads for the runtime row (comma-separated,
+        /// e.g. `code-gen,tool_calling,reasoning`). Default: the candidate's
+        /// HF `tasks`.
+        #[arg(long)]
+        workloads: Option<String>,
+        /// Force the runtime row's tool-calling flag on (otherwise derived
+        /// from the workloads containing `tool_calling`).
+        #[arg(long, default_value_t = false)]
+        tool_calling: bool,
+        /// Skip materializing the `fleet_model_catalog` runtime row; only flip
+        /// the lifecycle status to active.
+        #[arg(long, default_value_t = false)]
+        no_runtime_row: bool,
     },
     /// Reject a candidate row: drops it from the catalog and appends the
     /// upstream_id (if set) to the scout denylist.
