@@ -774,10 +774,14 @@ async fn resolve_symbol(pool: &PgPool, corpus_slug: &str, sel: &str) -> Result<V
         .collect())
 }
 
-/// Callers of a symbol: nodes with a `calls` edge whose dst is the symbol.
-pub async fn callers(pool: &PgPool, corpus_slug: &str, sel: &str) -> Result<Vec<SymbolRef>> {
-    let targets = resolve_symbol(pool, corpus_slug, sel).await?;
-    let ids: Vec<Uuid> = targets.iter().map(|t| t.id).collect();
+/// Direct callers of a set of symbol node ids: nodes with a `calls` edge whose
+/// dst is one of the ids. Querying by id (not by name selector) is exact — no
+/// bare-leaf ambiguity — which matters for review, where the ids come straight
+/// from a file's `contains` subtree.
+async fn callers_of_ids(pool: &PgPool, ids: &[Uuid]) -> Result<Vec<SymbolRef>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
     let rows = sqlx::query(
         r#"SELECT DISTINCT n.id, n.title, n.node_type
              FROM brain_vault_edges e
@@ -785,7 +789,7 @@ pub async fn callers(pool: &PgPool, corpus_slug: &str, sel: &str) -> Result<Vec<
             WHERE e.edge_type = 'calls' AND e.dst_id = ANY($1)
             ORDER BY n.title"#,
     )
-    .bind(&ids)
+    .bind(ids)
     .fetch_all(pool)
     .await?;
     Ok(rows
@@ -796,6 +800,13 @@ pub async fn callers(pool: &PgPool, corpus_slug: &str, sel: &str) -> Result<Vec<
             node_type: r.get("node_type"),
         })
         .collect())
+}
+
+/// Callers of a symbol: nodes with a `calls` edge whose dst is the symbol.
+pub async fn callers(pool: &PgPool, corpus_slug: &str, sel: &str) -> Result<Vec<SymbolRef>> {
+    let targets = resolve_symbol(pool, corpus_slug, sel).await?;
+    let ids: Vec<Uuid> = targets.iter().map(|t| t.id).collect();
+    callers_of_ids(pool, &ids).await
 }
 
 /// Callees of a symbol: nodes a `calls` edge points to from the symbol.
@@ -830,7 +841,18 @@ pub async fn impact(
     max_depth: usize,
 ) -> Result<Vec<SymbolRef>> {
     let seed = resolve_symbol(pool, corpus_slug, sel).await?;
-    let mut frontier: Vec<Uuid> = seed.iter().map(|s| s.id).collect();
+    let seed_ids: Vec<Uuid> = seed.iter().map(|s| s.id).collect();
+    impact_of_ids(pool, &seed_ids, max_depth).await
+}
+
+/// Transitive caller closure of a set of seed node ids (the seeds themselves are
+/// excluded from the result). Shared by [`impact`] and the review pass.
+async fn impact_of_ids(
+    pool: &PgPool,
+    seed_ids: &[Uuid],
+    max_depth: usize,
+) -> Result<Vec<SymbolRef>> {
+    let mut frontier: Vec<Uuid> = seed_ids.to_vec();
     let mut seen: HashSet<Uuid> = frontier.iter().copied().collect();
     let mut out: Vec<SymbolRef> = Vec::new();
 
@@ -863,6 +885,242 @@ pub async fn impact(
     }
     out.sort_by(|a, b| a.qualified_name.cmp(&b.qualified_name));
     Ok(out)
+}
+
+// ─── Change-aware review (detect_changes vs git diff) ────────────────────────
+//
+// Given the set of changed files (the terminal layer computes them from
+// `git diff`), produce a risk-scored review map: for each changed file, the
+// symbols it defines and — for each callable symbol — how many places call it
+// (fan-in) and the full transitive blast radius. The point is to tell a
+// reviewer (human or agent) WHERE to look first: a one-line tweak to a function
+// 40 callers depend on is far riskier than a new private helper nobody calls
+// yet. Mirrors CRG's detect_changes + get_review_context, but native to Cortex
+// and driven by the graph this loop already keeps fresh.
+
+/// Risk band for a changed symbol or file. Serialized lowercase for JSON.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RiskTier {
+    High,
+    Medium,
+    Low,
+}
+
+impl RiskTier {
+    pub fn label(self) -> &'static str {
+        match self {
+            RiskTier::High => "HIGH",
+            RiskTier::Medium => "MED",
+            RiskTier::Low => "LOW",
+        }
+    }
+    /// Rank for sorting (High first).
+    fn rank(self) -> u8 {
+        match self {
+            RiskTier::High => 2,
+            RiskTier::Medium => 1,
+            RiskTier::Low => 0,
+        }
+    }
+}
+
+/// Classify a changed symbol's risk from its blast metrics. Pure + unit-tested.
+///   - `blast` is the transitive caller-closure size (how far a break ripples).
+///   - `external` is the count of DIRECT callers defined outside the changed
+///     file (cross-file fan-in — the part of the change that's a de-facto API).
+/// A change with wide reach OR many external dependents is high-risk; a change
+/// nothing (or only same-file code) calls is low-risk.
+pub fn risk_tier(blast: usize, external: usize) -> RiskTier {
+    if blast >= 10 || external >= 5 {
+        RiskTier::High
+    } else if blast >= 3 || external >= 1 {
+        RiskTier::Medium
+    } else {
+        RiskTier::Low
+    }
+}
+
+/// One changed symbol with its blast-radius metrics.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ChangedSymbol {
+    pub qualified_name: String,
+    pub node_type: String,
+    /// Direct callers (one `calls` edge away).
+    pub direct_callers: usize,
+    /// Direct callers defined OUTSIDE this file (cross-file fan-in).
+    pub external_callers: usize,
+    /// Transitive caller closure size up to the review depth.
+    pub blast_radius: usize,
+    pub risk: RiskTier,
+    /// A few example impacted callers (qualified names), for the report.
+    pub top_callers: Vec<String>,
+}
+
+/// Review summary for one changed file.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ChangedFile {
+    /// Absolute path (as stored on the `content:file` node).
+    pub path: String,
+    pub symbols: Vec<ChangedSymbol>,
+    /// Max risk across the file's symbols (Low if it defines none).
+    pub risk: RiskTier,
+    /// Union of every symbol's transitive caller closure (deduped) — the file's
+    /// true blast radius (the same caller reached via two symbols counts once).
+    pub blast_radius: usize,
+}
+
+/// The full change-aware review report.
+#[derive(Debug, Clone, serde::Serialize, Default)]
+pub struct ReviewReport {
+    /// Indexed changed files, sorted risk-desc then blast-desc.
+    pub files: Vec<ChangedFile>,
+    /// Changed source files NOT present in the graph (new files, or files the
+    /// corpus hasn't re-scanned yet — reindex to cover them).
+    pub unindexed: Vec<String>,
+    /// Union blast radius across every changed file (deduped node ids).
+    pub total_blast: usize,
+}
+
+/// Look up a `content:file` node id by absolute path within a corpus.
+async fn file_node_id(pool: &PgPool, corpus_slug: &str, abs_path: &str) -> Result<Option<Uuid>> {
+    Ok(sqlx::query_scalar(
+        r#"SELECT id FROM brain_vault_nodes
+            WHERE project = $1 AND node_type = 'content:file' AND path = $2
+              AND valid_until IS NULL"#,
+    )
+    .bind(corpus_slug)
+    .bind(abs_path)
+    .fetch_optional(pool)
+    .await?)
+}
+
+/// All `code:*` symbols a file defines — the transitive `contains` subtree from
+/// the file node (file -> impl/mod -> method nests one or two levels).
+async fn symbols_in_file(pool: &PgPool, file_id: Uuid) -> Result<Vec<SymbolRef>> {
+    let rows = sqlx::query(
+        r#"WITH RECURSIVE sub AS (
+               SELECT dst_id AS id
+                 FROM brain_vault_edges
+                WHERE src_id = $1 AND edge_type = 'contains'
+               UNION
+               SELECT e.dst_id
+                 FROM brain_vault_edges e
+                 JOIN sub ON e.src_id = sub.id
+                WHERE e.edge_type = 'contains'
+           )
+           SELECT n.id, n.title, n.node_type
+             FROM brain_vault_nodes n
+             JOIN sub ON n.id = sub.id
+            WHERE n.node_type LIKE 'code:%'
+            ORDER BY n.title COLLATE "C""#,
+    )
+    .bind(file_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| SymbolRef {
+            id: r.get("id"),
+            qualified_name: r.get("title"),
+            node_type: r.get("node_type"),
+        })
+        .collect())
+}
+
+/// Build a change-aware, risk-scored review report for a set of changed files.
+///
+/// `changed_abs_paths` are absolute filesystem paths (the terminal layer derives
+/// them from `git diff` and maps repo-relative → absolute). `depth` bounds the
+/// transitive blast-radius walk. Files not in the graph land in `unindexed`.
+pub async fn review(
+    pool: &PgPool,
+    corpus_slug: &str,
+    changed_abs_paths: &[String],
+    depth: usize,
+) -> Result<ReviewReport> {
+    let mut report = ReviewReport::default();
+    let mut global_blast: HashSet<Uuid> = HashSet::new();
+
+    for path in changed_abs_paths {
+        let Some(fid) = file_node_id(pool, corpus_slug, path).await? else {
+            report.unindexed.push(path.clone());
+            continue;
+        };
+        let syms = symbols_in_file(pool, fid).await?;
+        // The file's own symbol names — used to split internal vs external fan-in.
+        let own_names: HashSet<&str> = syms.iter().map(|s| s.qualified_name.as_str()).collect();
+
+        let mut file_blast: HashSet<Uuid> = HashSet::new();
+        let mut changed_syms: Vec<ChangedSymbol> = Vec::new();
+        for s in &syms {
+            // Only callable symbols accrue `calls`-edge fan-in; structs/impls
+            // are listed with zero metrics so the diff is fully accounted for.
+            let (direct, blast) = if s.node_type == "code:function" {
+                let direct = callers_of_ids(pool, &[s.id]).await?;
+                let blast = impact_of_ids(pool, &[s.id], depth).await?;
+                (direct, blast)
+            } else {
+                (Vec::new(), Vec::new())
+            };
+            let external = direct
+                .iter()
+                .filter(|c| !own_names.contains(c.qualified_name.as_str()))
+                .count();
+            for b in &blast {
+                file_blast.insert(b.id);
+                global_blast.insert(b.id);
+            }
+            let mut top_callers: Vec<String> = direct
+                .iter()
+                .take(5)
+                .map(|c| c.qualified_name.clone())
+                .collect();
+            top_callers.sort();
+            changed_syms.push(ChangedSymbol {
+                qualified_name: s.qualified_name.clone(),
+                node_type: s.node_type.clone(),
+                direct_callers: direct.len(),
+                external_callers: external,
+                blast_radius: blast.len(),
+                risk: risk_tier(blast.len(), external),
+                top_callers,
+            });
+        }
+
+        // File risk = the worst symbol it touches (Low if it defines none).
+        let file_risk = changed_syms
+            .iter()
+            .map(|s| s.risk)
+            .max_by_key(|r| r.rank())
+            .unwrap_or(RiskTier::Low);
+        // Sort symbols within the file risk-desc then by blast.
+        changed_syms.sort_by(|a, b| {
+            b.risk
+                .rank()
+                .cmp(&a.risk.rank())
+                .then(b.blast_radius.cmp(&a.blast_radius))
+                .then(a.qualified_name.cmp(&b.qualified_name))
+        });
+        report.files.push(ChangedFile {
+            path: path.clone(),
+            symbols: changed_syms,
+            risk: file_risk,
+            blast_radius: file_blast.len(),
+        });
+    }
+
+    // Most-actionable first: highest risk, then widest blast.
+    report.files.sort_by(|a, b| {
+        b.risk
+            .rank()
+            .cmp(&a.risk.rank())
+            .then(b.blast_radius.cmp(&a.blast_radius))
+            .then(a.path.cmp(&b.path))
+    });
+    report.unindexed.sort();
+    report.total_blast = global_blast.len();
+    Ok(report)
 }
 
 // ─── DB helpers ──────────────────────────────────────────────────────────────
@@ -2173,6 +2431,28 @@ fn read_package_name(cargo_toml: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn risk_tier_thresholds() {
+        // Wide transitive reach → high regardless of external count.
+        assert_eq!(risk_tier(10, 0), RiskTier::High);
+        assert_eq!(risk_tier(50, 0), RiskTier::High);
+        // Many cross-file callers → high even with a shallow closure.
+        assert_eq!(risk_tier(0, 5), RiskTier::High);
+        // Moderate reach OR any external dependent → medium.
+        assert_eq!(risk_tier(3, 0), RiskTier::Medium);
+        assert_eq!(risk_tier(0, 1), RiskTier::Medium);
+        assert_eq!(risk_tier(9, 4), RiskTier::Medium);
+        // Nothing external + tiny closure → low (e.g. a brand-new helper).
+        assert_eq!(risk_tier(0, 0), RiskTier::Low);
+        assert_eq!(risk_tier(2, 0), RiskTier::Low);
+    }
+
+    #[test]
+    fn risk_tier_rank_orders_high_first() {
+        assert!(RiskTier::High.rank() > RiskTier::Medium.rank());
+        assert!(RiskTier::Medium.rank() > RiskTier::Low.rank());
+    }
 
     fn fr(path: &str, hash: &str) -> (String, FileRow) {
         (
