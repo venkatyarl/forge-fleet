@@ -3994,17 +3994,45 @@ async fn main() -> Result<()> {
 /// with "pulse --help" as its task — slow, costly, and never showing help.
 ///
 /// Returns a refusal message when the prompt looks like a command invocation
-/// rather than natural language: it contains a literal `-h`/`--help` token,
-/// or it is a single bare command-shaped word. Genuine multi-word prompts
+/// rather than natural language. Three shapes are refused:
+///   1. it contains a literal `-h`/`--help` token;
+///   2. it is a single bare command-shaped word (`ff pulse`);
+///   3. its first token is command-shaped (a bare lowercase verb) AND a flag
+///      token (`-c`, `--json`, …) appears later — i.e. `ff db psql -c "…"`.
+/// Shape 3 is the dangerous case the single-word guard missed: a typo'd
+/// multi-word subcommand (`ff db …`, `ff model ls --json`) used to fall through
+/// to the free-text agent dispatcher, which once HALLUCINATED a fake psql
+/// result. Genuine multi-word natural-language prompts (no leading verb+flag)
 /// pass through untouched, and `ff run "<text>"` always bypasses the guard.
 fn free_prompt_command_guard(tokens: &[String]) -> Option<String> {
     let wants_help = tokens.iter().any(|t| t == "--help" || t == "-h");
-    let single_command_word = tokens.len() == 1
-        && tokens[0].len() <= 24
-        && tokens[0]
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
-    if !wants_help && !single_command_word {
+
+    // A "command-shaped" token is a bare identifier clap could plausibly parse
+    // as a subcommand: only ascii alnum / `-` / `_`, starts with a letter,
+    // reasonable length. This excludes prose tokens like `what's` or `running?`.
+    let is_command_word = |t: &String| {
+        t.len() <= 24
+            && t.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+            && t.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    };
+    // A flag token: `-x` / `--xyz` (a leading dash followed by a letter). A lone
+    // `-`, `--`, or a negative number is not a flag.
+    let is_flag = |t: &String| {
+        let bytes = t.as_bytes();
+        match bytes {
+            [b'-', b'-', rest @ ..] => rest.first().is_some_and(|c| c.is_ascii_alphabetic()),
+            [b'-', rest @ ..] => rest.first().is_some_and(|c| c.is_ascii_alphabetic()),
+            _ => false,
+        }
+    };
+
+    let single_command_word = tokens.len() == 1 && is_command_word(&tokens[0]);
+    let command_word_with_flag = tokens.len() > 1
+        && tokens.first().is_some_and(is_command_word)
+        && tokens[1..].iter().any(is_flag);
+
+    if !wants_help && !single_command_word && !command_word_with_flag {
         return None;
     }
 
@@ -4024,6 +4052,11 @@ fn free_prompt_command_guard(tokens: &[String]) -> Option<String> {
         format!(
             "error: '{first}' is not an ff subcommand — unrecognised words are sent to a fleet \
              LLM agent as a free-text prompt, which is never what --help wants."
+        )
+    } else if command_word_with_flag {
+        format!(
+            "error: '{first}' is not an ff subcommand — refusing to dispatch a command-shaped \
+             input (verb + flags) to a fleet LLM agent (this is usually a mistyped subcommand)."
         )
     } else {
         format!(
@@ -4067,6 +4100,25 @@ mod free_prompt_guard_tests {
             free_prompt_command_guard(&toks(&["summarize", "the", "fleet", "state"])).is_none()
         );
         assert!(free_prompt_command_guard(&toks(&["what's", "running?"])).is_none());
+    }
+
+    #[test]
+    fn command_shaped_input_with_flag_is_refused() {
+        // The iter-13 dogfood finding: `ff db psql -c "select …"` fell through
+        // to the agent and hallucinated a fake result. Verb + flag must refuse.
+        assert!(free_prompt_command_guard(&toks(&["db", "psql", "-c", "select 1"])).is_some());
+        assert!(free_prompt_command_guard(&toks(&["model", "ls", "--json"])).is_some());
+        assert!(free_prompt_command_guard(&toks(&["fleet", "helath", "-v"])).is_some());
+    }
+
+    #[test]
+    fn natural_language_with_no_flag_still_passes() {
+        // A leading verb alone (no flag) is genuine free-text — keep dispatching.
+        assert!(free_prompt_command_guard(&toks(&["restart", "the", "daemon"])).is_none());
+        // A prose token that merely contains a dash is not a flag.
+        assert!(free_prompt_command_guard(&toks(&["explain", "the", "auto-upgrade"])).is_none());
+        // Apostrophe/punctuation in the first token => not command-shaped.
+        assert!(free_prompt_command_guard(&toks(&["what's", "the", "--status"])).is_none());
     }
 
     #[test]
