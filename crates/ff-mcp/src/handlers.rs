@@ -971,8 +971,10 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
 //      the same SHARED_HTTP client + `/v1/chat/completions` request shape +
 //      `extract_completion_text` helper that `fleet_run` uses (no parallel LLM
 //      client). Return {offloaded:true, endpoint, model, result, ...}.
-//   3. None warm → {offloaded:false, decision:"do_in_cloud", reason:...} so the
-//      caller proceeds itself.
+//   3. None warm → record the UNMET demand (so the P3 autoscaler warms a
+//      matching endpoint for next time) and return {offloaded:false,
+//      decision:"do_in_cloud", autoscaler_signaled, reason:...} so the caller
+//      proceeds itself now.
 
 const OFFLOAD_DEFAULT_MIN_CTX: i32 = 16384;
 const OFFLOAD_DEFAULT_MAX_TOKENS: u32 = 4096;
@@ -1027,15 +1029,37 @@ pub async fn fleet_offload(params: Option<Value>) -> HandlerResult {
     let candidate = match candidate {
         Some(c) => c,
         None => {
-            // ── Step 3: nothing warm → tell the caller to do it in cloud.
+            // ── Step 3: nothing warm → do it in cloud, BUT first record the
+            // UNMET demand so the P3 autoscaler can warm capacity for next time.
+            // This is the whole point: the demand signal is what the autoscaler
+            // scales on, and unmet offload demand (cold → cloud) is exactly the
+            // demand it most needs to see. Recording only on the warm happy path
+            // (below) means the autoscaler learns about demand it already served
+            // and stays blind to demand it didn't — so it never warms a coder for
+            // a kind that keeps falling through to cloud. Distinct `_unmet` source
+            // keeps satisfied vs unmet offload demand separable in telemetry; both
+            // count toward the demand vector. Fire-and-forget — never fail on a
+            // telemetry write.
+            let signaled = ff_db::record_session_work_signal(
+                &pool,
+                None,
+                kind.unwrap_or("general"),
+                "mcp_offload_unmet",
+            )
+            .await
+            .map_err(|e| warn!(error = %e, "unmet demand signal write failed (mcp_offload)"))
+            .is_ok();
             return Ok(json!({
                 "offloaded": false,
                 "decision": "do_in_cloud",
                 "reason": format!(
                     "no warm tool-capable endpoint (require_tool_calling=true, \
-                     usable_agent_ctx>={min_ctx}). Proceed in cloud; or warm one \
-                     with: ff model load <library_id> --agent"
+                     usable_agent_ctx>={min_ctx}). Proceed in cloud — the P3 \
+                     autoscaler has been signaled and will warm a matching \
+                     endpoint if enabled; retry later to run it locally. Or warm \
+                     one now with: ff model load <library_id> --agent"
                 ),
+                "autoscaler_signaled": signaled,
                 "kind": kind,
                 "min_ctx": min_ctx,
             }));
