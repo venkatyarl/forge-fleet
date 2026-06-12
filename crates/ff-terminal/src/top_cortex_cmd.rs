@@ -71,6 +71,27 @@ pub enum TopCortexCommand {
         #[arg(long, default_value = "table")]
         format: String,
     },
+    /// Change-aware, risk-scored review map of the current diff: which changed
+    /// symbols have the widest blast radius (fan-in / transitive callers), so a
+    /// reviewer knows where to look first. Reads `git diff` for the changed
+    /// files, then scores them against the Cortex graph.
+    Review {
+        /// Compare against this base ref (e.g. `main`) — reviews the branch's
+        /// own commits PLUS any uncommitted edits. Default: uncommitted changes
+        /// (staged + unstaged + untracked) vs HEAD.
+        #[arg(long)]
+        base: Option<String>,
+        /// Repo directory (default: current directory).
+        path: Option<String>,
+        /// Override the corpus slug (default: derived from the directory).
+        #[arg(long)]
+        corpus: Option<String>,
+        /// Transitive blast-radius depth.
+        #[arg(long, default_value_t = 3)]
+        depth: usize,
+        #[arg(long, default_value = "table")]
+        format: String,
+    },
     /// Semantic-embed the Cortex graph: fill the `embedding` column on every
     /// code/doc/data/image node via the fleet's bge-m3 endpoint so semantic
     /// search (`ff brain search`) works over Cortex, then (unless --no-community)
@@ -352,8 +373,186 @@ pub async fn handle_top_cortex(args: TopCortexArgs) -> Result<()> {
             )
             .await?;
         }
+        TopCortexCommand::Review {
+            base,
+            path,
+            corpus,
+            depth,
+            format,
+        } => {
+            let (root, slug) = resolve_root_slug(path, corpus)?;
+            run_review(&pool, &root, &slug, base.as_deref(), depth, &format).await?;
+        }
     }
     Ok(())
+}
+
+/// `ff cortex review`: derive changed files from `git diff`, score them against
+/// the Cortex graph, and print a risk-ranked review map.
+async fn run_review(
+    pool: &PgPool,
+    root: &Path,
+    slug: &str,
+    base: Option<&str>,
+    depth: usize,
+    format: &str,
+) -> Result<()> {
+    let changed_rel = git_changed_files(root, base)?;
+    // Keep only Cortex-supported source files (skip docs/config/etc) and map
+    // repo-relative → absolute (the path form stored on content:file nodes).
+    let changed_abs: Vec<String> = changed_rel
+        .iter()
+        .filter(|rel| {
+            Path::new(rel)
+                .extension()
+                .and_then(|e| e.to_str())
+                .and_then(ext_lang)
+                .map(|l| cortex::SUPPORTED_LANGS.contains(&l))
+                .unwrap_or(false)
+        })
+        .map(|rel| root.join(rel).to_string_lossy().to_string())
+        .collect();
+
+    if changed_abs.is_empty() {
+        if format == "json" {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&cortex::ReviewReport::default())?
+            );
+        } else {
+            let scope = base.map(|b| format!(" vs {b}")).unwrap_or_default();
+            println!("no changed Cortex-supported source files{scope} — nothing to review");
+        }
+        return Ok(());
+    }
+
+    let report = cortex::review(pool, slug, &changed_abs, depth).await?;
+
+    if format == "json" {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    let root_str = root.to_string_lossy().to_string();
+    let rel = |p: &str| -> String {
+        p.strip_prefix(&root_str)
+            .map(|s| s.trim_start_matches('/').to_string())
+            .unwrap_or_else(|| p.to_string())
+    };
+
+    let scope = base.map(|b| format!(" (vs {b})")).unwrap_or_default();
+    println!(
+        "{CYAN}\u{25b6} cortex review: corpus '{}'{scope} \u{2014} {} changed file(s), blast radius {} symbol(s){RESET}",
+        slug,
+        report.files.len(),
+        report.total_blast
+    );
+    if report.files.is_empty() && report.unindexed.is_empty() {
+        println!("  (no indexed symbols touched)");
+    }
+    for f in &report.files {
+        let color = match f.risk {
+            cortex::RiskTier::High => YELLOW,
+            _ => RESET,
+        };
+        println!(
+            "\n{color}{:<4}{RESET} {}  (blast {})",
+            f.risk.label(),
+            rel(&f.path),
+            f.blast_radius
+        );
+        // Surface the callable, fan-in-bearing symbols (skip zero-impact
+        // type/impl nodes); cap the list so a hub-heavy file's highest-risk
+        // changes stay visible instead of scrolling off. `--format json` keeps
+        // every symbol for tooling.
+        let fns: Vec<&cortex::ChangedSymbol> = f
+            .symbols
+            .iter()
+            .filter(|s| s.node_type == "code:function")
+            .collect();
+        const MAX_SYMS: usize = 12;
+        for s in fns.iter().take(MAX_SYMS) {
+            let callers = if s.top_callers.is_empty() {
+                String::new()
+            } else {
+                format!("  e.g. {}", s.top_callers.join(", "))
+            };
+            println!(
+                "  {:<4} {}  fanin={} (ext={})  blast={}{}",
+                s.risk.label(),
+                s.qualified_name,
+                s.direct_callers,
+                s.external_callers,
+                s.blast_radius,
+                callers
+            );
+        }
+        if fns.len() > MAX_SYMS {
+            println!(
+                "  \u{2026} +{} more changed function(s) (use --format json for all)",
+                fns.len() - MAX_SYMS
+            );
+        }
+    }
+    if !report.unindexed.is_empty() {
+        println!(
+            "\n{YELLOW}unindexed (not in graph yet){RESET}: {}",
+            report
+                .unindexed
+                .iter()
+                .map(|p| rel(p))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        println!("  run `ff cortex index` to cover new files.");
+    }
+    Ok(())
+}
+
+/// Changed files (repo-relative) from `git diff`. With `base`, reviews the
+/// branch's own commits (`base...HEAD`) plus uncommitted edits; without it,
+/// just uncommitted work (staged + unstaged + untracked) vs HEAD. Deduped.
+fn git_changed_files(root: &Path, base: Option<&str>) -> Result<Vec<String>> {
+    use std::collections::BTreeSet;
+    use std::process::Command;
+
+    let run = |args: &[&str]| -> Result<Vec<String>> {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .map_err(|e| anyhow!("run git {}: {e}", args.join(" ")))?;
+        if !out.status.success() {
+            return Err(anyhow!(
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect())
+    };
+
+    let mut files: BTreeSet<String> = BTreeSet::new();
+    if let Some(b) = base {
+        // Branch's own changes since it diverged from base.
+        for f in run(&["diff", "--name-only", &format!("{b}...HEAD")])? {
+            files.insert(f);
+        }
+    }
+    // Uncommitted tracked changes (staged + unstaged) vs HEAD.
+    for f in run(&["diff", "--name-only", "HEAD"])? {
+        files.insert(f);
+    }
+    // Untracked-but-not-ignored files (new source the diff above misses).
+    for f in run(&["ls-files", "--others", "--exclude-standard"])? {
+        files.insert(f);
+    }
+    Ok(files.into_iter().collect())
 }
 
 /// Derive the corpus slug for the current working directory (same rule as
