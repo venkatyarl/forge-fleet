@@ -3924,11 +3924,101 @@ async fn main() -> Result<()> {
         None => {
             let prompt_text = cli.prompt.join(" ");
             if !prompt_text.is_empty() {
+                if let Some(hint) = free_prompt_command_guard(&cli.prompt) {
+                    eprintln!("{hint}");
+                    std::process::exit(2);
+                }
                 run_headless(&prompt_text, agent_config, "text", false).await
             } else {
                 run_tui(agent_config).await
             }
         }
+    }
+}
+
+/// `ff <typo>` and `ff <word> --help` must not silently become an LLM agent
+/// dispatch. The top-level CLI treats any unrecognised trailing words as a
+/// free-text prompt (deliberate UX for `ff "summarize …"`), which meant a
+/// mistyped subcommand like `ff pulse --help` quietly launched a fleet agent
+/// with "pulse --help" as its task — slow, costly, and never showing help.
+///
+/// Returns a refusal message when the prompt looks like a command invocation
+/// rather than natural language: it contains a literal `-h`/`--help` token,
+/// or it is a single bare command-shaped word. Genuine multi-word prompts
+/// pass through untouched, and `ff run "<text>"` always bypasses the guard.
+fn free_prompt_command_guard(tokens: &[String]) -> Option<String> {
+    let wants_help = tokens.iter().any(|t| t == "--help" || t == "-h");
+    let single_command_word = tokens.len() == 1
+        && tokens[0].len() <= 24
+        && tokens[0]
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if !wants_help && !single_command_word {
+        return None;
+    }
+
+    use clap::CommandFactory;
+    let cmd = Cli::command();
+    let first = tokens.first().map(String::as_str).unwrap_or("");
+    let suggestions: Vec<String> = cmd
+        .get_subcommands()
+        .map(|c| c.get_name().to_string())
+        .filter(|n| {
+            (first.len() >= 3 && (n.starts_with(first) || first.starts_with(n.as_str())))
+                || n == first
+        })
+        .collect();
+
+    let mut msg = format!(
+        "error: '{}' is not an ff subcommand — unrecognised words are sent to a fleet LLM \
+         agent as a free-text prompt, which is almost never what a flag like --help wants.",
+        first
+    );
+    if !suggestions.is_empty() {
+        msg.push_str(&format!("\n  did you mean: {}", suggestions.join(", ")));
+    }
+    msg.push_str("\n  command list: ff --help");
+    msg.push_str(&format!(
+        "\n  to really send this text to the agent: ff run \"{}\"",
+        tokens.join(" ")
+    ));
+    Some(msg)
+}
+
+#[cfg(test)]
+mod free_prompt_guard_tests {
+    use super::free_prompt_command_guard;
+
+    fn toks(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn help_flag_after_unknown_word_is_refused() {
+        assert!(free_prompt_command_guard(&toks(&["pulse", "--help"])).is_some());
+        assert!(free_prompt_command_guard(&toks(&["route", "-h"])).is_some());
+    }
+
+    #[test]
+    fn single_bare_word_is_refused() {
+        assert!(free_prompt_command_guard(&toks(&["pulse"])).is_some());
+    }
+
+    #[test]
+    fn natural_language_prompts_pass_through() {
+        assert!(
+            free_prompt_command_guard(&toks(&["summarize", "the", "fleet", "state"])).is_none()
+        );
+        assert!(free_prompt_command_guard(&toks(&["what's", "running?"])).is_none());
+    }
+
+    #[test]
+    fn near_miss_suggests_real_subcommand() {
+        let msg = free_prompt_command_guard(&toks(&["task"])).unwrap();
+        assert!(
+            msg.contains("tasks"),
+            "expected 'tasks' suggestion in: {msg}"
+        );
     }
 }
 
