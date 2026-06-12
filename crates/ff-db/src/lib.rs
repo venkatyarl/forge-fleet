@@ -59,6 +59,7 @@ pub use queries::{
     ModelLibraryRow,
     // Orchestrator P3 — adaptive serving-mix autoscaler
     PlacementCandidate,
+    ReprofileCandidate,
     RouteCandidate,
     RouteFilter,
     RoutingHop,
@@ -178,6 +179,7 @@ pub use queries::{
     pg_reap_stale_running,
     pg_recent_demand_snapshots,
     pg_record_interaction,
+    pg_reprofile_candidates,
     pg_reserve_host,
     pg_resolve_channel_user,
     pg_retired_catalog_ids,

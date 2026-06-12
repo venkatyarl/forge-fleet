@@ -3112,6 +3112,87 @@ pub async fn pg_agent_readiness(
         .collect())
 }
 
+/// A tool-capable deployment that is loaded but stuck in a too-small serving
+/// profile (per-slot agent ctx below the floor, or NULL). It can be relaunched in
+/// the agent profile (`ff model reprofile`) to become agent-router-visible WITHOUT
+/// loading a fresh model — it reuses the already-resident weights, so this is the
+/// realistic scale-up path on a RAM-constrained fleet where no host has room for a
+/// new model. Carries the idle signals (`request_count`, `health_age_sec`) so the
+/// caller only disrupts an endpoint that isn't actively serving.
+#[derive(Debug, Clone)]
+pub struct ReprofileCandidate {
+    pub deployment_id: String,
+    pub worker_name: String,
+    pub port: i32,
+    pub catalog_id: Option<String>,
+    pub runtime: String,
+    pub usable_agent_ctx: Option<i32>,
+    pub parallel_slots: Option<i32>,
+    pub request_count: i64,
+    /// Seconds since the last health ping (NULL → very old / unknown).
+    pub health_age_sec: Option<i32>,
+    /// True when the catalog model is tagged `code-gen` (else `general`), matching
+    /// the autoscaler's code/general split.
+    pub is_code: bool,
+}
+
+/// Healthy, active, tool-calling deployments whose per-slot agent ctx is BELOW
+/// `min_ctx` (or NULL) AND which run with more than one parallel slot — i.e. the
+/// too-small profile is caused by slot-splitting, so reprofiling to `--parallel 1`
+/// can actually lift the per-slot ctx (a known single-slot model that still can't
+/// reach the floor is excluded — reprofiling it would just churn). The autoscaler
+/// uses this as a scale-up FALLBACK when no fresh load fits. NOT filtered by host
+/// or idleness — the caller (which knows the leader / exclusions / idle policy)
+/// does that.
+pub async fn pg_reprofile_candidates(
+    pool: &PgPool,
+    min_ctx: i32,
+) -> Result<Vec<ReprofileCandidate>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT d.id              AS id,
+               d.worker_name     AS worker_name,
+               d.port            AS port,
+               d.catalog_id      AS catalog_id,
+               d.runtime         AS runtime,
+               d.usable_agent_ctx AS usable_agent_ctx,
+               d.parallel_slots  AS parallel_slots,
+               d.request_count   AS request_count,
+               EXTRACT(EPOCH FROM (NOW() - d.last_health_at))::int AS health_age_sec,
+               (cat.preferred_workloads @> '["code-gen"]'::jsonb) AS is_code
+          FROM fleet_model_deployments d
+          JOIN fleet_model_catalog cat ON cat.id = d.catalog_id
+         WHERE d.health_status = 'healthy'
+           AND d.desired_state = 'active'
+           AND cat.tool_calling = TRUE
+           AND (d.usable_agent_ctx IS NULL OR d.usable_agent_ctx < $1)
+           AND COALESCE(d.parallel_slots, 0) > 1
+        "#,
+    )
+    .bind(min_ctx)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .iter()
+        .map(|r| {
+            let id: sqlx::types::Uuid = r.get("id");
+            ReprofileCandidate {
+                deployment_id: id.to_string(),
+                worker_name: r.get("worker_name"),
+                port: r.try_get("port").unwrap_or(0),
+                catalog_id: r.try_get("catalog_id").ok(),
+                runtime: r.get("runtime"),
+                usable_agent_ctx: r.try_get("usable_agent_ctx").ok(),
+                parallel_slots: r.try_get("parallel_slots").ok(),
+                request_count: r.try_get("request_count").unwrap_or(0),
+                health_age_sec: r.try_get("health_age_sec").ok(),
+                is_code: r.try_get::<bool, _>("is_code").unwrap_or(false),
+            }
+        })
+        .collect())
+}
+
 /// A candidate host the autoscaler can place a new model on. One row per online
 /// computer, JOINed with its V114 reservation state, hardware facts, and current
 /// deployment count (the least-loaded tiebreak). `free_ram_gb` is a conservative
