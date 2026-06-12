@@ -2387,27 +2387,49 @@ pub struct RouteCandidate {
 
 /// Equivalent-tag tolerance for workload routing. `@>` is an exact-element
 /// match, but the catalog vocabulary has drifted into synonym pairs, so the
-/// router ORs both spellings of a known tag and a caller hits the same
-/// deployments regardless of which form they pass:
+/// router matches ANY spelling in a known cluster, so a caller hits the same
+/// deployments regardless of which interchangeable tag it passes. Each cluster
+/// is fully connected (passing any member matches deployments tagged with any
+/// other member). The catalog vocabulary fragmented over successive migrations
+/// and seed sources, so without this normalization a request silently matches
+/// ZERO deployments and falls through to cloud/leader — fatal on the P0
+/// agent-swarm path. Live-measured gaps that motivated each cluster:
 ///   - "embedding"/"embeddings" and "rerank"/"reranking" — V39 seed vs V91.
-///   - "code"/"code-gen" — reasoning/general models are tagged `code` while the
-///     coders are tagged `code-gen`; the `fleet_route` MCP tool documents "code"
-///     as the common tag, so without this alias `workload="code"` silently
-///     matches ZERO deployed coders and the P0 agent-swarm path falls through to
-///     cloud/leader.
+///   - "code"/"code-gen" — reasoning/general models tagged `code`, coders tagged
+///     `code-gen`; the `fleet_route` MCP tool documents "code" as the common tag.
+///   - "agent"/"tool_calling" — the agentic-capability concept is split: 3
+///     catalog rows tag `agent`, 16 tag `tool_calling`. Routing `workload="agent"`
+///     (the natural swarm vocabulary) matched only 1 of 2 deployed tool-capable
+///     endpoints live. (Independent of the `require_tool_calling` column filter,
+///     which checks `cat.tool_calling` — this is the *workload tag* path.)
+///   - "multimodal"/"vision" — `vision` is the concrete tag (11 rows); a request
+///     for `multimodal` (1 row) otherwise misses every vision endpoint. `omni`
+///     is deliberately excluded: it adds audio, so a vision-only model is NOT a
+///     safe substitute for an omni request.
 ///
-/// Returns the alternate form for a known tag, else `None` (the caller then
-/// reuses the original).
-fn route_workload_alias(workload: Option<&str>) -> Option<&'static str> {
-    match workload {
-        Some("embedding") => Some("embeddings"),
-        Some("rerank") => Some("reranking"),
-        Some("embeddings") => Some("embedding"),
-        Some("reranking") => Some("rerank"),
-        Some("code") => Some("code-gen"),
-        Some("code-gen") => Some("code"),
-        _ => None,
+/// Clusters must list only TRULY bidirectional synonyms — if A is a safe
+/// substitute for B but not vice-versa, do not cluster them.
+const WORKLOAD_SYNONYM_CLUSTERS: &[&[&str]] = &[
+    &["embedding", "embeddings"],
+    &["rerank", "reranking"],
+    &["code", "code-gen"],
+    &["agent", "tool_calling"],
+    &["multimodal", "vision"],
+];
+
+/// All interchangeable tags for `workload` (including itself), or `[workload]`
+/// when it belongs to no cluster, or `[]` when no workload filter is requested.
+/// The returned set is OR-matched against `preferred_workloads` via `?|`.
+fn route_workload_synonyms(workload: Option<&str>) -> Vec<String> {
+    let Some(w) = workload else {
+        return Vec::new();
+    };
+    for cluster in WORKLOAD_SYNONYM_CLUSTERS {
+        if cluster.contains(&w) {
+            return cluster.iter().map(|s| s.to_string()).collect();
+        }
     }
+    vec![w.to_string()]
 }
 
 /// The router returns at most this many scored candidates. `0` means "unset" and
@@ -2450,18 +2472,14 @@ pub async fn pg_route_deployments(
     pool: &PgPool,
     filter: &RouteFilter,
 ) -> Result<Vec<RouteCandidate>> {
-    // Singular-plural tolerance — V39 seed uses "embeddings"/"reranking",
-    // V91 uses "embedding". `@>` is exact-element match so we OR both forms.
+    // Vocabulary tolerance: match every interchangeable spelling in the tag's
+    // synonym cluster (singular/plural, code/code-gen, agent/tool_calling, …) so
+    // a caller hits the same deployments regardless of which form it passes. The
+    // set is OR-matched with `?|` (any element present). Empty when no workload
+    // filter is requested — the `$2` "workload filter disabled" guard short-
+    // circuits the clause before `?|` ever sees the empty array.
     let workload = filter.workload.as_deref();
-    let plural = route_workload_alias(workload);
-    // When no workload filter is requested, pass a tag that can't match any
-    // real workload and rely on the `$3` "workload filter disabled" guard.
-    let arr_a = JsonValue::Array(vec![JsonValue::String(
-        workload.unwrap_or("__any__").to_string(),
-    )]);
-    let arr_b = JsonValue::Array(vec![JsonValue::String(
-        plural.unwrap_or(workload.unwrap_or("__any__")).to_string(),
-    )]);
+    let synonyms = route_workload_synonyms(workload);
 
     // Lower-cased exclude list for case-insensitive worker_name match.
     let excludes = normalize_exclude_hosts(&filter.exclude_hosts);
@@ -2492,23 +2510,21 @@ pub async fn pg_route_deployments(
           LEFT JOIN fleet_workers w     ON w.name = d.worker_name
           LEFT JOIN computers c         ON LOWER(c.name) = LOWER(d.worker_name)
          WHERE d.health_status = 'healthy'
-           -- workload filter ($3 = true disables it)
-           AND ($3 OR cat.preferred_workloads @> $1::jsonb
-                   OR cat.preferred_workloads @> $2::jsonb)
-           -- tool_calling filter ($4 = false disables it)
-           AND (NOT $4 OR cat.tool_calling = TRUE)
-           -- min usable per-slot ctx ($5 IS NULL disables it). NULL ctx rows
+           -- workload filter ($2 = true disables it). `?|` = any synonym present.
+           AND ($2 OR cat.preferred_workloads ?| $1)
+           -- tool_calling filter ($3 = false disables it)
+           AND (NOT $3 OR cat.tool_calling = TRUE)
+           -- min usable per-slot ctx ($4 IS NULL disables it). NULL ctx rows
            -- are excluded when a floor is requested (can't prove they fit).
-           AND ($5::int IS NULL OR d.usable_agent_ctx >= $5)
-           -- exclude hosts (case-insensitive; $6 empty disables it)
-           AND (LOWER(d.worker_name) <> ALL($6))
+           AND ($4::int IS NULL OR d.usable_agent_ctx >= $4)
+           -- exclude hosts (case-insensitive; $5 empty disables it)
+           AND (LOWER(d.worker_name) <> ALL($5))
          ORDER BY cat.tier ASC,
                   d.last_health_at DESC NULLS LAST
-         LIMIT $7
+         LIMIT $6
         "#,
     )
-    .bind(&arr_a)
-    .bind(&arr_b)
+    .bind(&synonyms)
     .bind(workload.is_none())
     .bind(filter.require_tool_calling)
     .bind(filter.min_ctx)
@@ -4515,20 +4531,56 @@ mod tests {
     }
 
     #[test]
-    fn test_route_workload_alias() {
-        // Known singular↔plural tags map to their alternate spelling.
-        assert_eq!(route_workload_alias(Some("embedding")), Some("embeddings"));
-        assert_eq!(route_workload_alias(Some("embeddings")), Some("embedding"));
-        assert_eq!(route_workload_alias(Some("rerank")), Some("reranking"));
-        assert_eq!(route_workload_alias(Some("reranking")), Some("rerank"));
-        // "code"/"code-gen" are equivalent — routing either ORs both so a caller
-        // using the MCP-documented "code" tag still reaches deployed code-gen coders.
-        assert_eq!(route_workload_alias(Some("code")), Some("code-gen"));
-        assert_eq!(route_workload_alias(Some("code-gen")), Some("code"));
-        // Unknown tags and "no workload" have no alias.
-        assert_eq!(route_workload_alias(Some("chat")), None);
-        assert_eq!(route_workload_alias(Some("general")), None);
-        assert_eq!(route_workload_alias(None), None);
+    fn test_route_workload_synonyms() {
+        // Helper: assert the returned cluster equals an unordered set.
+        fn assert_cluster(got: Vec<String>, want: &[&str]) {
+            let mut g = got;
+            g.sort();
+            let mut w: Vec<String> = want.iter().map(|s| s.to_string()).collect();
+            w.sort();
+            assert_eq!(g, w);
+        }
+        // Every member of a cluster resolves to the WHOLE cluster (fully
+        // connected) regardless of which spelling the caller passes.
+        assert_cluster(
+            route_workload_synonyms(Some("embedding")),
+            &["embedding", "embeddings"],
+        );
+        assert_cluster(
+            route_workload_synonyms(Some("embeddings")),
+            &["embedding", "embeddings"],
+        );
+        assert_cluster(
+            route_workload_synonyms(Some("rerank")),
+            &["rerank", "reranking"],
+        );
+        // "code"/"code-gen": MCP-documented "code" still reaches deployed code-gen coders.
+        assert_cluster(route_workload_synonyms(Some("code")), &["code", "code-gen"]);
+        assert_cluster(
+            route_workload_synonyms(Some("code-gen")),
+            &["code", "code-gen"],
+        );
+        // "agent"/"tool_calling": the agentic-capability concept is one cluster so
+        // the natural swarm vocabulary ("agent") reaches tool_calling-tagged endpoints.
+        assert_cluster(
+            route_workload_synonyms(Some("agent")),
+            &["agent", "tool_calling"],
+        );
+        assert_cluster(
+            route_workload_synonyms(Some("tool_calling")),
+            &["agent", "tool_calling"],
+        );
+        // "multimodal"/"vision" are clustered; "omni" is deliberately NOT (adds audio).
+        assert_cluster(
+            route_workload_synonyms(Some("multimodal")),
+            &["multimodal", "vision"],
+        );
+        assert_cluster(route_workload_synonyms(Some("omni")), &["omni"]);
+        // Unknown tags resolve to just themselves.
+        assert_cluster(route_workload_synonyms(Some("chat")), &["chat"]);
+        assert_cluster(route_workload_synonyms(Some("general")), &["general"]);
+        // No workload filter → empty set (the SQL guard disables the clause).
+        assert!(route_workload_synonyms(None).is_empty());
     }
 
     #[test]
