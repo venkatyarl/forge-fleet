@@ -1519,14 +1519,14 @@ async fn write_systemd_unit(
          Description=ForgeFleet-supervised inference server on port {port}\n\
          After=network-online.target\n\
          Wants=network-online.target\n\
+         StartLimitIntervalSec=3600\n\
+         StartLimitBurst=20\n\
          \n\
          [Service]\n\
          Type=simple\n\
          ExecStart={exec_start}\n\
          Restart=on-failure\n\
          RestartSec=10\n\
-         StartLimitIntervalSec=3600\n\
-         StartLimitBurst=20\n\
          StandardOutput=append:{log}\n\
          StandardError=append:{log}\n\
          {ld_env}\n\
@@ -1547,10 +1547,9 @@ async fn write_systemd_unit(
     tracing::info!(unit = %unit_path.display(), "model_runtime: wrote systemd unit");
 
     // daemon-reload + enable so the unit is known to systemd and survives
-    // reboots. We DON'T `systemctl start` here — the manual cmd.spawn()
-    // right after this brings the process up, and systemd will only kick
-    // in on failure. Doing both would be a race that systemd often loses
-    // (sees an already-running child and won't claim it).
+    // reboots. The caller (`load_model`) starts the unit via
+    // `start_systemd_unit` right after this returns — systemd owns the
+    // process so it survives a cross-node autoload's SSH session closing.
     let dr = TokCmd::new("systemctl")
         .args(["--user", "daemon-reload"])
         .output()
