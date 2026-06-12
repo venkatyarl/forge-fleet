@@ -2369,6 +2369,10 @@ pub struct RouteCandidate {
     /// `http://<host_or_ip>:<port>` ready to use as an OpenAI base URL.
     pub endpoint: String,
     pub port: i32,
+    /// Inference server runtime: `llama.cpp` | `mlx` | `vllm` | `unknown`.
+    /// Used by the offload tiebreak to deprioritize mlx_lm.server endpoints for
+    /// synthesis/general kinds (see [`offload_sort_key`]).
+    pub runtime: Option<String>,
     pub catalog_id: Option<String>,
     pub catalog_name: Option<String>,
     pub family: Option<String>,
@@ -2445,15 +2449,42 @@ fn normalize_exclude_hosts(hosts: &[String]) -> Vec<String> {
     hosts.iter().map(|h| h.to_lowercase()).collect()
 }
 
+/// Is this an mlx_lm.server (Apple-Silicon mlx) deployment? Case-insensitive,
+/// tolerant of the `mlx`/`mlx_lm`/`mlx-lm`/`mlx_lm.server` spellings the runtime
+/// column has carried. Used to deprioritize mlx for synthesis/general kinds.
+fn is_mlx_runtime(runtime: &Option<String>) -> bool {
+    runtime
+        .as_deref()
+        .map(|r| r.to_ascii_lowercase().contains("mlx"))
+        .unwrap_or(false)
+}
+
 /// Offload tiebreak ordering key: cheapest appropriate model first (smaller
-/// `tier`), then least-loaded host (fewest active deployments) so two equal-tier
+/// `tier`); then — for synthesis/general kinds only (`penalize_mlx`) — prefer a
+/// non-mlx endpoint, because mlx_lm.server serving a reasoning/"thinking" model
+/// reasons past any token cap and returns EMPTY content on multi-section
+/// synthesis (live-observed iter-15: taylor:55001 mlx qwen36-a3b returned empty
+/// where the same model on lily/logan llama.cpp succeeded). The penalty is a
+/// soft, last-resort preference — it sits BELOW tier (never makes a pricier
+/// model win) and ABOVE the load tiebreak, so among equal-tier endpoints a
+/// llama.cpp/vllm server beats an mlx one, but a lone mlx endpoint is still
+/// used. For code kinds `penalize_mlx` is false → mlx ranking is untouched
+/// (mlx coders work fine for offload after the served-id fix, PR #191).
+/// Finally, least-loaded host (fewest active deployments) so two otherwise-equal
 /// endpoints spread load instead of always hammering the same one.
 fn offload_sort_key(
     c: &RouteCandidate,
     load: &std::collections::HashMap<String, i64>,
-) -> (i64, i64) {
+    penalize_mlx: bool,
+) -> (i64, i64, i64) {
+    let mlx_penalty = if penalize_mlx && is_mlx_runtime(&c.runtime) {
+        1
+    } else {
+        0
+    };
     (
         c.tier as i64,
+        mlx_penalty,
         load.get(&c.worker_name).copied().unwrap_or(0),
     )
 }
@@ -2490,6 +2521,7 @@ pub async fn pg_route_deployments(
         r#"
         SELECT d.worker_name,
                d.port,
+               d.runtime       AS runtime,
                d.catalog_id,
                cat.name        AS catalog_name,
                cat.family      AS catalog_family,
@@ -2543,6 +2575,7 @@ pub async fn pg_route_deployments(
                 endpoint: format!("http://{host}:{port}"),
                 worker_name,
                 port,
+                runtime: r.try_get("runtime").ok(),
                 catalog_id: r.try_get("catalog_id").ok(),
                 catalog_name: r.try_get("catalog_name").ok(),
                 family: r.try_get("catalog_family").ok(),
@@ -2694,12 +2727,15 @@ pub async fn pg_pick_offload_endpoint(
     if cands.is_empty() {
         return Ok(None);
     }
-    // 3) cheapest appropriate model first (smaller tier), then least-loaded host
-    //    as a tiebreak among equal tiers — so two same-tier endpoints spread load
-    //    instead of always hammering the same one. (Hard saturation avoidance —
-    //    skipping an overloaded host outright — is P3's job, not P1's.)
+    // 3) cheapest appropriate model first (smaller tier); for synthesis/general
+    //    kinds (no code workload), deprioritize mlx endpoints (mlx_lm.server
+    //    returns empty content on multi-section synthesis — iter-15); then
+    //    least-loaded host as a final tiebreak so two same-tier endpoints spread
+    //    load instead of always hammering the same one. (Hard saturation
+    //    avoidance — skipping an overloaded host outright — is P3's job, not P1's.)
+    let penalize_mlx = offload_workload_for_kind(kind).is_none();
     let load = pg_active_deployment_counts(pool).await.unwrap_or_default();
-    cands.sort_by_key(|c| offload_sort_key(c, &load));
+    cands.sort_by_key(|c| offload_sort_key(c, &load, penalize_mlx));
     Ok(cands.into_iter().next())
 }
 
@@ -4613,10 +4649,15 @@ mod tests {
     // logic is pure and covered here.
 
     fn route_candidate(worker: &str, tier: i32) -> RouteCandidate {
+        route_candidate_rt(worker, tier, "llama.cpp")
+    }
+
+    fn route_candidate_rt(worker: &str, tier: i32, runtime: &str) -> RouteCandidate {
         RouteCandidate {
             worker_name: worker.into(),
             endpoint: format!("http://{worker}:55000"),
             port: 55000,
+            runtime: Some(runtime.into()),
             catalog_id: None,
             catalog_name: None,
             family: None,
@@ -4748,13 +4789,67 @@ mod tests {
             route_candidate("sophie", 1), // tier 1, load 1
             route_candidate("marcus", 1), // tier 1, load 0 (absent)
         ];
-        cands.sort_by_key(|c| offload_sort_key(c, &load));
+        cands.sort_by_key(|c| offload_sort_key(c, &load, false));
 
         // Cheapest tier first; within tier 1, least-loaded host wins.
         let order: Vec<&str> = cands.iter().map(|c| c.worker_name.as_str()).collect();
         assert_eq!(order, vec!["marcus", "sophie", "logan", "james"]);
         // Tier-2 james must never outrank any tier-1 host regardless of load.
         assert_eq!(cands.last().unwrap().worker_name, "james");
+    }
+
+    #[test]
+    fn test_is_mlx_runtime() {
+        for r in ["mlx", "MLX", "mlx_lm", "mlx-lm", "mlx_lm.server"] {
+            assert!(is_mlx_runtime(&Some(r.into())), "{r} should be mlx");
+        }
+        for r in ["llama.cpp", "vllm", "unknown", ""] {
+            assert!(!is_mlx_runtime(&Some(r.into())), "{r} should not be mlx");
+        }
+        assert!(!is_mlx_runtime(&None));
+    }
+
+    #[test]
+    fn test_offload_sort_key_deprioritizes_mlx_for_synthesis() {
+        use std::collections::HashMap;
+        let load = HashMap::new(); // all idle → load tiebreak is neutral
+
+        // Same model on the same tier: an mlx endpoint (taylor) and a llama.cpp
+        // one (lily) — the exact iter-15 shape.
+        let mut cands = [
+            route_candidate_rt("taylor", 2, "mlx"),
+            route_candidate_rt("lily", 2, "llama.cpp"),
+        ];
+
+        // Synthesis/general kinds (penalize_mlx=true): llama.cpp wins, mlx last.
+        cands.sort_by_key(|c| offload_sort_key(c, &load, true));
+        assert_eq!(cands[0].worker_name, "lily");
+        assert_eq!(cands[1].worker_name, "taylor");
+
+        // Code kinds (penalize_mlx=false): mlx is NOT penalized; the load
+        // tiebreak is neutral here so order is stable input order (sort is
+        // stable) — assert mlx is no longer forced last.
+        let mut cands2 = [
+            route_candidate_rt("taylor", 2, "mlx"),
+            route_candidate_rt("lily", 2, "llama.cpp"),
+        ];
+        cands2.sort_by_key(|c| offload_sort_key(c, &load, false));
+        assert_eq!(cands2[0].worker_name, "taylor");
+    }
+
+    #[test]
+    fn test_offload_sort_key_mlx_penalty_never_beats_tier() {
+        use std::collections::HashMap;
+        let load = HashMap::new();
+        // A cheap mlx tier-1 vs a pricier llama.cpp tier-2. Even under the mlx
+        // penalty, tier dominates → the cheap mlx endpoint still wins (the
+        // penalty is a within-tier preference, not a cost override).
+        let mut cands = [
+            route_candidate_rt("james", 2, "llama.cpp"),
+            route_candidate_rt("taylor", 1, "mlx"),
+        ];
+        cands.sort_by_key(|c| offload_sort_key(c, &load, true));
+        assert_eq!(cands[0].worker_name, "taylor", "tier 1 mlx beats tier 2");
     }
 
     #[test]
