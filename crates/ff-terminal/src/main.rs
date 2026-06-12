@@ -2030,6 +2030,16 @@ pub enum CorpusCommand {
         #[arg(long, default_value = "table")]
         format: String,
     },
+    /// Delete a corpus and everything scoped to it: its brain_vault_nodes
+    /// (project = slug; edges cascade), sources, entities, facets, and
+    /// candidates (corpus_id FKs cascade). Irreversible — requires --yes.
+    Delete {
+        slug: String,
+        /// Confirm the irreversible delete (required; no interactive prompt
+        /// so cron / autopilot callers fail loudly instead of hanging).
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]

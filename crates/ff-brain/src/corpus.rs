@@ -186,6 +186,27 @@ pub async fn get_corpus(pg: &PgPool, slug: &str) -> anyhow::Result<Option<Corpus
     }))
 }
 
+/// Delete a corpus and everything scoped to it. Returns
+/// `(nodes_deleted, corpora_deleted)` — `corpora_deleted` is 0 when the slug
+/// didn't exist. Nodes are matched by `project = slug` (how scan/cortex tag
+/// them); their edges cascade via brain_vault_edges FKs. Sources, entities,
+/// facets, memberships, and candidates cascade off the brain_corpora row.
+pub async fn delete_corpus(pg: &PgPool, slug: &str) -> anyhow::Result<(u64, u64)> {
+    let mut tx = pg.begin().await?;
+    let nodes = sqlx::query("DELETE FROM brain_vault_nodes WHERE project = $1")
+        .bind(slug)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    let corpora = sqlx::query("DELETE FROM brain_corpora WHERE slug = $1")
+        .bind(slug)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    tx.commit().await?;
+    Ok((nodes, corpora))
+}
+
 pub async fn list_sources(pg: &PgPool, corpus: &Corpus) -> anyhow::Result<Vec<Source>> {
     let rows = sqlx::query(
         r#"SELECT id, root_path, label, scan_status, file_count

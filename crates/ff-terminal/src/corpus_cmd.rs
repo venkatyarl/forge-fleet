@@ -193,6 +193,19 @@ pub async fn handle_corpus(pool: &PgPool, cmd: crate::CorpusCommand) -> Result<(
             )
             .await?;
         }
+        crate::CorpusCommand::Delete { slug, yes } => {
+            let _ = require_corpus(pool, &slug).await?;
+            if !yes {
+                return Err(anyhow!(
+                    "deleting corpus '{slug}' removes its nodes, edges, sources, entities, \
+                     facets, and candidates permanently — re-run with --yes to confirm"
+                ));
+            }
+            let (nodes, _) = corpus::delete_corpus(pool, &slug).await?;
+            println!(
+                "{CYAN}\u{2713} deleted corpus '{slug}' ({nodes} node(s) and their edges){RESET}"
+            );
+        }
     }
     Ok(())
 }
