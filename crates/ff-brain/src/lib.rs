@@ -10,6 +10,7 @@
 
 pub mod chat;
 pub mod communities;
+pub mod community_summary;
 pub mod context;
 pub mod corpus;
 pub mod cortex;
@@ -30,6 +31,10 @@ pub use chat::{
     receive_message, resolve_user,
 };
 pub use communities::{CommunitySummary, detect_communities};
+pub use community_summary::{
+    CommunitySummaryStats, SummarizeOpts, build_summary_prompt, clean_summary,
+    summarize_communities,
+};
 pub use context::{BrainMessage, ContextBundle, ResolvedNode, select_context};
 pub use cortex::{CortexStats, SymbolRef, callees, callers, impact, index};
 pub use cortex_embed::{EmbedStats, embed_cortex_nodes};

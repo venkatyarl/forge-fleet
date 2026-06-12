@@ -104,6 +104,32 @@ pub enum TopCortexCommand {
         #[arg(long)]
         no_community: bool,
     },
+    /// Generate per-community natural-language summaries via a fleet LLM and
+    /// store them on the brain_communities registry (cortex roadmap #4). Run
+    /// after `ff cortex embed` (which detects communities). By default only
+    /// summarizes communities with no summary yet; stable member-hash identity
+    /// means an unchanged community keeps its summary across re-detection.
+    Summarize {
+        /// Re-summarize every eligible community, not just un-summarized ones.
+        #[arg(long)]
+        all: bool,
+        /// Cap communities processed this run (unattended quality is hard —
+        /// start small and inspect the samples).
+        #[arg(long, default_value_t = 20)]
+        max: usize,
+        /// Skip communities with fewer than this many members.
+        #[arg(long, default_value_t = 3)]
+        min_members: usize,
+        /// Override the fleet endpoint, e.g. http://192.168.5.100:55001 (a
+        /// known-good synthesizer). Default: DB-routed warm tool-capable endpoint.
+        #[arg(long)]
+        llm: Option<String>,
+        /// Model id to send with --llm (ignored when DB-routed).
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long, default_value = "table")]
+        format: String,
+    },
     /// Manage the git post-commit hook that re-indexes after every commit.
     Hook {
         #[command(subcommand)]
@@ -244,6 +270,16 @@ pub async fn handle_top_cortex(args: TopCortexArgs) -> Result<()> {
         }
         TopCortexCommand::Embed { max, no_community } => {
             run_embed(&pool, max, no_community).await?;
+        }
+        TopCortexCommand::Summarize {
+            all,
+            max,
+            min_members,
+            llm,
+            model,
+            format,
+        } => {
+            run_summarize(&pool, all, max, min_members, llm, model, &format).await?;
         }
         TopCortexCommand::Hook { action } => {
             handle_hook(action)?;
@@ -864,6 +900,93 @@ async fn run_embed(pool: &sqlx::PgPool, max: Option<usize>, no_community: bool) 
             summary.communities_found, summary.largest_community, summary.communities_persisted
         ),
         Err(e) => println!("{YELLOW}⚠ community detection failed: {e}{RESET}"),
+    }
+    Ok(())
+}
+
+/// `ff cortex summarize`: for each detected community, ask a fleet LLM what the
+/// cluster is responsible for and store the summary on `brain_communities`.
+#[allow(clippy::too_many_arguments)]
+async fn run_summarize(
+    pool: &PgPool,
+    all: bool,
+    max: usize,
+    min_members: usize,
+    llm: Option<String>,
+    model: Option<String>,
+    format: &str,
+) -> Result<()> {
+    let opts = ff_brain::SummarizeOpts {
+        all,
+        max,
+        min_members,
+        endpoint: llm,
+        model,
+    };
+
+    let human = format != "json";
+    if human {
+        println!(
+            "{CYAN}▶ Summarizing communities ({}, min_members={min_members}, max={max})...{RESET}",
+            if all {
+                "all eligible"
+            } else {
+                "un-summarized only"
+            }
+        );
+    }
+
+    let stats = ff_brain::summarize_communities(pool, &opts, |done, total| {
+        if human {
+            print!("\r  summarized {done}/{total}   ");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        }
+    })
+    .await
+    .map_err(|e| anyhow!("summarize communities: {e}"))?;
+
+    if format == "json" {
+        println!("{}", serde_json::to_string_pretty(&stats)?);
+        return Ok(());
+    }
+
+    if stats.eligible == 0 {
+        println!(
+            "\r{GREEN}✓{RESET} no communities need a summary (run `ff cortex embed` first to detect communities, or pass --all to refresh)   "
+        );
+        return Ok(());
+    }
+
+    println!(
+        "\r{GREEN}✓{RESET} {} summarized via {} ({}){}{}   ",
+        stats.summarized,
+        stats.endpoint,
+        stats.model,
+        if stats.failed > 0 {
+            format!(", {} failed", stats.failed)
+        } else {
+            String::new()
+        },
+        if stats.empty > 0 {
+            format!(", {} empty", stats.empty)
+        } else {
+            String::new()
+        },
+    );
+    if stats.eligible > stats.attempted {
+        println!(
+            "  {} more eligible — re-run to continue (or raise --max).",
+            stats.eligible - stats.attempted
+        );
+    }
+    if !stats.samples.is_empty() {
+        println!("\n  samples (inspect quality):");
+        for s in &stats.samples {
+            println!(
+                "  {YELLOW}#{}{RESET} {} ({} members)\n    {}",
+                s.community_id, s.god_title, s.member_count, s.summary
+            );
+        }
     }
     Ok(())
 }
