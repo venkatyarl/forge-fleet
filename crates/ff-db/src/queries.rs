@@ -2385,16 +2385,27 @@ pub struct RouteCandidate {
     pub total_ram_gb: Option<i32>,
 }
 
-/// Singular↔plural tolerance for workload tags. The V39 seed uses
-/// "embeddings"/"reranking" while V91 uses "embedding"/"rerank"; `@>` is an
-/// exact-element match, so the router ORs both spellings. Returns the alternate
-/// form for a known tag, else `None` (the caller then reuses the original).
+/// Equivalent-tag tolerance for workload routing. `@>` is an exact-element
+/// match, but the catalog vocabulary has drifted into synonym pairs, so the
+/// router ORs both spellings of a known tag and a caller hits the same
+/// deployments regardless of which form they pass:
+///   - "embedding"/"embeddings" and "rerank"/"reranking" — V39 seed vs V91.
+///   - "code"/"code-gen" — reasoning/general models are tagged `code` while the
+///     coders are tagged `code-gen`; the `fleet_route` MCP tool documents "code"
+///     as the common tag, so without this alias `workload="code"` silently
+///     matches ZERO deployed coders and the P0 agent-swarm path falls through to
+///     cloud/leader.
+///
+/// Returns the alternate form for a known tag, else `None` (the caller then
+/// reuses the original).
 fn route_workload_alias(workload: Option<&str>) -> Option<&'static str> {
     match workload {
         Some("embedding") => Some("embeddings"),
         Some("rerank") => Some("reranking"),
         Some("embeddings") => Some("embedding"),
         Some("reranking") => Some("rerank"),
+        Some("code") => Some("code-gen"),
+        Some("code-gen") => Some("code"),
         _ => None,
     }
 }
@@ -4510,8 +4521,12 @@ mod tests {
         assert_eq!(route_workload_alias(Some("embeddings")), Some("embedding"));
         assert_eq!(route_workload_alias(Some("rerank")), Some("reranking"));
         assert_eq!(route_workload_alias(Some("reranking")), Some("rerank"));
+        // "code"/"code-gen" are equivalent — routing either ORs both so a caller
+        // using the MCP-documented "code" tag still reaches deployed code-gen coders.
+        assert_eq!(route_workload_alias(Some("code")), Some("code-gen"));
+        assert_eq!(route_workload_alias(Some("code-gen")), Some("code"));
         // Unknown tags and "no workload" have no alias.
-        assert_eq!(route_workload_alias(Some("code-gen")), None);
+        assert_eq!(route_workload_alias(Some("chat")), None);
         assert_eq!(route_workload_alias(Some("general")), None);
         assert_eq!(route_workload_alias(None), None);
     }
