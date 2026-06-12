@@ -2352,6 +2352,33 @@ pub enum ModelCommand {
         #[arg(long)]
         node: Option<String>,
     },
+    /// Reprofile a running deployment into the agent-capable serving profile:
+    /// unload it, then reload the SAME model on the SAME port with `--parallel 1
+    /// --ctx >= 32768` so a tool-using agent's full context fits on one slot and
+    /// the endpoint becomes router-visible (this is the concrete fix for a
+    /// `ff model agent-ready` REPROFILE CANDIDATE). Auto-runs on the host that
+    /// owns the deployment (SSHes there if remote). Safe by design: refuses a
+    /// non-tool-calling model, no-ops an already-agent-ready endpoint, checks the
+    /// host has RAM headroom for the larger single-slot KV cache, and health-waits
+    /// the new profile — the relaunch leaves a brief down-window on that port, so
+    /// a failed reload is reported loudly (the reconciler then recovers it).
+    Reprofile {
+        /// Deployment id (UUID from `ff model deployments --show-id` or
+        /// `ff model agent-ready --json`).
+        id: String,
+        /// Override the single-slot ctx (default: 32768, the router floor; raised
+        /// to at least 32768 regardless). Larger = more KV-cache RAM.
+        #[arg(long)]
+        ctx: Option<u32>,
+        /// Proceed even if the host's conservative free RAM is below the safety
+        /// floor. The larger single-slot ctx grows the KV cache, so by default a
+        /// memory-tight host is refused.
+        #[arg(long, default_value_t = false)]
+        force: bool,
+        /// Emit JSON instead of the human-readable report.
+        #[arg(long)]
+        json: bool,
+    },
     /// List inference-server processes running on this host.
     Ps,
     /// Sample this node's disk usage and write to fleet_disk_usage.
