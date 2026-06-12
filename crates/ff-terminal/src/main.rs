@@ -807,7 +807,7 @@ enum TasksCommand {
     /// the worker's completion UPDATE is gated on status='running' so
     /// a late-completing hung worker won't clobber the cancellation.
     /// The child process keeps running on the worker until it exits
-    /// or hits MAX_TASK_DURATION (30 min default).
+    /// or hits MAX_TASK_DURATION (10 min default; payload.max_duration_secs overrides).
     Cancel {
         id: String,
         /// Reason recorded in the task's `error` field.
@@ -3979,11 +3979,17 @@ fn free_prompt_command_guard(tokens: &[String]) -> Option<String> {
         })
         .collect();
 
-    let mut msg = format!(
-        "error: '{}' is not an ff subcommand — unrecognised words are sent to a fleet LLM \
-         agent as a free-text prompt, which is almost never what a flag like --help wants.",
-        first
-    );
+    let mut msg = if wants_help {
+        format!(
+            "error: '{first}' is not an ff subcommand — unrecognised words are sent to a fleet \
+             LLM agent as a free-text prompt, which is never what --help wants."
+        )
+    } else {
+        format!(
+            "error: '{first}' is not an ff subcommand — refusing to dispatch a bare word to a \
+             fleet LLM agent (this is usually a typo)."
+        )
+    };
     if !suggestions.is_empty() {
         msg.push_str(&format!("\n  did you mean: {}", suggestions.join(", ")));
     }
