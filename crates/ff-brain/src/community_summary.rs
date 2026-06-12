@@ -275,8 +275,12 @@ async fn call_summary_llm(
 
 /// Ask the endpoint what models it serves and choose a `model` id that won't be
 /// rejected. Best-effort — on any HTTP/parse failure we keep `fallback` (which is
-/// correct for llama.cpp, which ignores the field). Resolves the mlx 401 case.
-async fn resolve_served_model_id(
+/// correct for llama.cpp, which ignores the field). Resolves the mlx 401 case
+/// (mlx_lm.server validates the OpenAI `model` field as an HF repo id, so the
+/// catalog id `qwen36-35b-a3b` 401s "Repository Not Found" — it serves the model
+/// under its on-disk path). Shared by `ff cortex summarize`, `ff offload`, and the
+/// `fleet_offload` MCP handler.
+pub async fn resolve_served_model_id(
     client: &reqwest::Client,
     endpoint: &str,
     fallback: &str,

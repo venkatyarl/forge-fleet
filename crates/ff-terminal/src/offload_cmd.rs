@@ -112,7 +112,7 @@ pub async fn handle_offload(
     }
 
     // ── Step 2: dispatch to the warm local endpoint over the OpenAI API.
-    let model = candidate
+    let routed_model = candidate
         .catalog_id
         .clone()
         .unwrap_or_else(|| candidate.catalog_name.clone().unwrap_or_default());
@@ -120,6 +120,15 @@ pub async fn handle_offload(
         "{}/v1/chat/completions",
         candidate.endpoint.trim_end_matches('/')
     );
+
+    let client = reqwest::Client::new();
+    // mlx_lm.server validates the OpenAI `model` field as an HF repo id, so the
+    // catalog id 401s "Repository Not Found" — it serves the model under its
+    // on-disk path. Probe /v1/models once and resolve to a served id. No-op for
+    // llama.cpp/vLLM (they ignore the field or already match). Resolves the mlx
+    // 401 that made `ff offload` unusable on every Mac mlx endpoint.
+    let model =
+        ff_brain::resolve_served_model_id(&client, &candidate.endpoint, &routed_model).await;
 
     if !json_out {
         eprintln!(
@@ -146,7 +155,6 @@ pub async fn handle_offload(
         "chat_template_kwargs": {"enable_thinking": false},
     });
 
-    let client = reqwest::Client::new();
     let started = Instant::now();
     let resp = client
         .post(&url)
