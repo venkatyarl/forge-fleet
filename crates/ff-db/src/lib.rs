@@ -171,6 +171,8 @@ pub use queries::{
     pg_reap_stale_reservations,
     pg_reap_stale_running,
     // Interaction log (V121 ff_interactions)
+    pg_interaction_channel_counts,
+    pg_list_interactions,
     pg_record_interaction,
     pg_reserve_host,
     pg_resolve_channel_user,
