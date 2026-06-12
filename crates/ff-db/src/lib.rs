@@ -29,6 +29,7 @@ pub use connection::{DbPool, DbPoolConfig};
 pub use migrations::{run_migrations, run_postgres_migrations};
 pub use operational_store::OperationalStore;
 pub use queries::{
+    AgentReadinessRow,
     // Resource arbiter (V119)
     ArbiterReservedHost,
     BrainCandidateRow,
@@ -72,6 +73,7 @@ pub use queries::{
     load_fleet_config_from_postgres,
     pg_active_deployment_counts,
     pg_advance_intent_cursor,
+    pg_agent_readiness,
     pg_append_benchmark_result,
     pg_append_routing_log,
     pg_append_training_loss_sample,
