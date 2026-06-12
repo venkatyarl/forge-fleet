@@ -2385,6 +2385,46 @@ pub struct RouteCandidate {
     pub total_ram_gb: Option<i32>,
 }
 
+/// Singular↔plural tolerance for workload tags. The V39 seed uses
+/// "embeddings"/"reranking" while V91 uses "embedding"/"rerank"; `@>` is an
+/// exact-element match, so the router ORs both spellings. Returns the alternate
+/// form for a known tag, else `None` (the caller then reuses the original).
+fn route_workload_alias(workload: Option<&str>) -> Option<&'static str> {
+    match workload {
+        Some("embedding") => Some("embeddings"),
+        Some("rerank") => Some("reranking"),
+        Some("embeddings") => Some("embedding"),
+        Some("reranking") => Some("rerank"),
+        _ => None,
+    }
+}
+
+/// The router returns at most this many scored candidates. `0` means "unset" and
+/// maps to the default of 3, so a zero-valued [`RouteFilter::limit`] never
+/// silently produces an empty result.
+fn route_limit_or_default(limit: i64) -> i64 {
+    if limit > 0 { limit } else { 3 }
+}
+
+/// Lower-case the exclude list so host matching against `LOWER(worker_name)` is
+/// case-insensitive — operators pass "Taylor"/"taylor" interchangeably.
+fn normalize_exclude_hosts(hosts: &[String]) -> Vec<String> {
+    hosts.iter().map(|h| h.to_lowercase()).collect()
+}
+
+/// Offload tiebreak ordering key: cheapest appropriate model first (smaller
+/// `tier`), then least-loaded host (fewest active deployments) so two equal-tier
+/// endpoints spread load instead of always hammering the same one.
+fn offload_sort_key(
+    c: &RouteCandidate,
+    load: &std::collections::HashMap<String, i64>,
+) -> (i64, i64) {
+    (
+        c.tier as i64,
+        load.get(&c.worker_name).copied().unwrap_or(0),
+    )
+}
+
 /// The shared scored selector over `fleet_model_deployments JOIN
 /// fleet_model_catalog`. This is the one place the routing scorer lives — the
 /// `fleet_route` MCP tool and the agent-capable router both call it so there's
@@ -2402,13 +2442,7 @@ pub async fn pg_route_deployments(
     // Singular-plural tolerance — V39 seed uses "embeddings"/"reranking",
     // V91 uses "embedding". `@>` is exact-element match so we OR both forms.
     let workload = filter.workload.as_deref();
-    let plural = match workload {
-        Some("embedding") => Some("embeddings"),
-        Some("rerank") => Some("reranking"),
-        Some("embeddings") => Some("embedding"),
-        Some("reranking") => Some("rerank"),
-        _ => None,
-    };
+    let plural = route_workload_alias(workload);
     // When no workload filter is requested, pass a tag that can't match any
     // real workload and rely on the `$3` "workload filter disabled" guard.
     let arr_a = JsonValue::Array(vec![JsonValue::String(
@@ -2419,13 +2453,9 @@ pub async fn pg_route_deployments(
     )]);
 
     // Lower-cased exclude list for case-insensitive worker_name match.
-    let excludes: Vec<String> = filter
-        .exclude_hosts
-        .iter()
-        .map(|h| h.to_lowercase())
-        .collect();
+    let excludes = normalize_exclude_hosts(&filter.exclude_hosts);
 
-    let limit = if filter.limit > 0 { filter.limit } else { 3 };
+    let limit = route_limit_or_default(filter.limit);
 
     let rows = sqlx::query(
         r#"
@@ -2604,12 +2634,7 @@ pub async fn pg_pick_offload_endpoint(
     //    instead of always hammering the same one. (Hard saturation avoidance —
     //    skipping an overloaded host outright — is P3's job, not P1's.)
     let load = pg_active_deployment_counts(pool).await.unwrap_or_default();
-    cands.sort_by_key(|c| {
-        (
-            c.tier as i64,
-            load.get(&c.worker_name).copied().unwrap_or(0),
-        )
-    });
+    cands.sort_by_key(|c| offload_sort_key(c, &load));
     Ok(cands.into_iter().next())
 }
 
@@ -4448,6 +4473,106 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         run_migrations(&conn).unwrap();
         conn
+    }
+
+    // ── Pure router-decision helpers (no DB) ──────────────────────────────
+    // These back the SQL selector in `pg_route_deployments` /
+    // `pg_pick_offload_endpoint`; the SQL ORDER BY itself needs Postgres, but
+    // the workload-alias / limit / exclude-normalization / offload-tiebreak
+    // logic is pure and covered here.
+
+    fn route_candidate(worker: &str, tier: i32) -> RouteCandidate {
+        RouteCandidate {
+            worker_name: worker.into(),
+            endpoint: format!("http://{worker}:55000"),
+            port: 55000,
+            catalog_id: None,
+            catalog_name: None,
+            family: None,
+            tier,
+            tool_calling: true,
+            context_window: Some(32768),
+            usable_agent_ctx: Some(32768),
+            parallel_slots: Some(4),
+            health_status: "healthy".into(),
+            health_age_sec: Some(1),
+            os_family: None,
+            has_gpu: None,
+            is_unified_memory: None,
+            total_ram_gb: None,
+        }
+    }
+
+    #[test]
+    fn test_route_workload_alias() {
+        // Known singular↔plural tags map to their alternate spelling.
+        assert_eq!(route_workload_alias(Some("embedding")), Some("embeddings"));
+        assert_eq!(route_workload_alias(Some("embeddings")), Some("embedding"));
+        assert_eq!(route_workload_alias(Some("rerank")), Some("reranking"));
+        assert_eq!(route_workload_alias(Some("reranking")), Some("rerank"));
+        // Unknown tags and "no workload" have no alias.
+        assert_eq!(route_workload_alias(Some("code-gen")), None);
+        assert_eq!(route_workload_alias(Some("general")), None);
+        assert_eq!(route_workload_alias(None), None);
+    }
+
+    #[test]
+    fn test_route_limit_or_default() {
+        // 0/negative are "unset" → default 3; positive passes through.
+        assert_eq!(route_limit_or_default(0), 3);
+        assert_eq!(route_limit_or_default(-5), 3);
+        assert_eq!(route_limit_or_default(1), 1);
+        assert_eq!(route_limit_or_default(8), 8);
+    }
+
+    #[test]
+    fn test_normalize_exclude_hosts() {
+        let got = normalize_exclude_hosts(&["Taylor".into(), "JAMES".into(), "sia".into()]);
+        assert_eq!(got, vec!["taylor", "james", "sia"]);
+        assert!(normalize_exclude_hosts(&[]).is_empty());
+    }
+
+    #[test]
+    fn test_offload_workload_for_kind() {
+        for k in ["codegen", "edits", "tests", "code", "CODE", "Edits"] {
+            assert_eq!(
+                offload_workload_for_kind(Some(k)),
+                Some("code-gen"),
+                "{k} should map to code-gen"
+            );
+        }
+        for k in ["research", "chat", "synthesis", "summary"] {
+            assert_eq!(
+                offload_workload_for_kind(Some(k)),
+                None,
+                "{k} has no workload"
+            );
+        }
+        assert_eq!(offload_workload_for_kind(None), None);
+    }
+
+    #[test]
+    fn test_offload_sort_key_orders_tier_then_load() {
+        use std::collections::HashMap;
+        // tierA loaded heavily, tierB idle, two tier-1 hosts with different load.
+        let mut load = HashMap::new();
+        load.insert("logan".to_string(), 5i64);
+        load.insert("sophie".to_string(), 1i64);
+        // marcus absent from the map → treated as load 0.
+
+        let mut cands = [
+            route_candidate("logan", 1),  // tier 1, load 5
+            route_candidate("james", 2),  // tier 2, load 0
+            route_candidate("sophie", 1), // tier 1, load 1
+            route_candidate("marcus", 1), // tier 1, load 0 (absent)
+        ];
+        cands.sort_by_key(|c| offload_sort_key(c, &load));
+
+        // Cheapest tier first; within tier 1, least-loaded host wins.
+        let order: Vec<&str> = cands.iter().map(|c| c.worker_name.as_str()).collect();
+        assert_eq!(order, vec!["marcus", "sophie", "logan", "james"]);
+        // Tier-2 james must never outrank any tier-1 host regardless of load.
+        assert_eq!(cands.last().unwrap().worker_name, "james");
     }
 
     #[test]
