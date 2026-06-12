@@ -26,7 +26,7 @@ pub enum TopCortexCommand {
         /// Override the auto-derived corpus slug.
         #[arg(long)]
         slug: Option<String>,
-        /// Force a specific language instead of auto-detecting (rust/typescript/javascript/python).
+        /// Force a specific language instead of auto-detecting (rust/typescript/javascript/java).
         #[arg(long)]
         lang: Option<String>,
     },
@@ -144,8 +144,9 @@ fn slug_from_path(p: &Path) -> String {
 fn ext_lang(ext: &str) -> Option<&'static str> {
     match ext {
         "rs" => Some("rust"),
-        "ts" | "tsx" => Some("typescript"),
+        "ts" | "tsx" | "mts" | "cts" => Some("typescript"),
         "js" | "jsx" | "mjs" | "cjs" => Some("javascript"),
+        "java" => Some("java"),
         "py" => Some("python"),
         _ => None,
     }
@@ -380,7 +381,7 @@ async fn run_index(
         let detected = detect_languages(root);
         if detected.is_empty() {
             return Err(anyhow!(
-                "no rust/typescript/javascript/python source files found under {root_str}; \
+                "no rust/typescript/javascript/java/python source files found under {root_str}; \
                  pass --lang to force one"
             ));
         }
@@ -393,6 +394,23 @@ async fn run_index(
             .map(|(l, _)| l)
             .collect()
     };
+    // Cortex parses a subset of what detection can see — index what's
+    // supported, note what isn't (e.g. python, for now).
+    let (langs, skipped): (Vec<String>, Vec<String>) = langs
+        .into_iter()
+        .partition(|l| cortex::SUPPORTED_LANGS.contains(&l.as_str()));
+    if !skipped.is_empty() {
+        println!(
+            "{YELLOW}  skipping unsupported language(s): {}{RESET}",
+            skipped.join(", ")
+        );
+    }
+    if langs.is_empty() {
+        return Err(anyhow!(
+            "no Cortex-supported source files ({}) under {root_str}; pass --lang to force one",
+            cortex::SUPPORTED_LANGS.join("/")
+        ));
+    }
 
     // Create-or-reuse the corpus (add_corpus does ON CONFLICT DO UPDATE,
     // identical to `ff brain corpus add <slug> --root <root>`).
@@ -403,22 +421,29 @@ async fn run_index(
         &[(root_str.clone(), Some("code".to_string()))],
     )
     .await?;
+    // Walk the source roots NOW: Cortex reads only what the corpus scan
+    // recorded as content:file nodes, so a fresh (or stale) corpus must be
+    // (re)scanned or indexing sees zero files.
+    let scan_report = corpus::scan(pool, &c, None, 12).await?;
     if verbose {
         println!(
             "{CYAN}\u{25b6} cortex: corpus '{}' \u{2190} {}{RESET}",
             c.slug, root_str
         );
         println!("  language(s): {}", langs.join(", "));
+        println!(
+            "  scanned: {} file(s), {} dir(s)",
+            scan_report.files, scan_report.dirs
+        );
     }
 
     let mut total_symbols = 0usize;
     let mut total_edges = 0usize;
     let mut total_files = 0usize;
-    for l in &langs {
-        if verbose {
-            println!("{CYAN}\u{25b6} indexing {l}\u{2026}{RESET}");
-        }
-        let stats = cortex::index(pool, slug, l).await?;
+    // index_langs wipes prior code:* nodes ONCE, then extracts each language —
+    // per-language cortex::index calls would clobber each other's symbols.
+    let per_lang = cortex::index_langs(pool, slug, &langs).await?;
+    for (l, stats) in &per_lang {
         if verbose {
             println!(
                 "  {l:<11} files={} symbols={} contains={} imports={} calls={}/{}",

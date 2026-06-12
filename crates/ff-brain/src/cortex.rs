@@ -1,7 +1,7 @@
-//! Cortex — native Rust code-extraction lobe for the Brain faceted graph.
+//! Cortex — native code-extraction lobe for the Brain faceted graph.
 //!
-//! Parses code files (Rust first; designed for adding languages) with the native
-//! `tree-sitter` + `tree-sitter-rust` crates — NO Python, NO external tool. For
+//! Parses code files (Rust, TypeScript/TSX, JavaScript, Java) with the native
+//! `tree-sitter` grammar crates — NO Python, NO external tool. For
 //! each file already scanned by `corpus.rs` as a `content:file` brain_vault_nodes
 //! row, Cortex extracts symbol nodes and call/import/contains edges into the V117
 //! Brain tables (reused wholesale — NO new tables, NO new columns).
@@ -9,7 +9,8 @@
 //! NODE MODEL
 //!   Code symbols are `brain_vault_nodes` rows with `node_type` in
 //!   {code:function, code:struct, code:enum, code:trait, code:impl, code:mod,
-//!    code:import, code:extern}. Each symbol's `path` is the synthetic unique key
+//!    code:class, code:interface, code:import, code:extern}.
+//!   Each symbol's `path` is the synthetic unique key
 //!   `code://<corpus_slug>/<qualified_name>` and `title` holds the qualified name,
 //!   so a symbol resolves by qualified name via the existing UNIQUE(path)
 //!   constraint (no new column needed). `project` = corpus slug.
@@ -38,6 +39,24 @@
 //!     alias::foo()        -> <expanded-alias>::foo
 //!     std/external        -> treated as already-qualified
 //!   ERROR-node descent keeps functions after parse errors (else false self-edges).
+//!
+//! TYPESCRIPT / JAVASCRIPT (parse_typescript_file; .tsx/.jsx and plain JS use
+//!   the TSX grammar so JSX parses) — module = <package.json name>::<path under
+//!   pkg root> (leading `src` and a trailing `index` collapse). Imports build
+//!   the same alias map (`import {a as b} from './m'`, `import * as ns`,
+//!   default imports, `const x = require('./m')`), with relative sources
+//!   resolved to the target file's module via the SAME path math so internal
+//!   calls resolve. Calls: bare foo() (alias-first — imported fns are the
+//!   dominant call form), this.m() -> the caller's class, Ns.m()/Class.m() via
+//!   alias map or same-module class; unknown lower-case receivers are kept as
+//!   written (code:extern, still matched by bare-leaf callers_of queries).
+//!
+//! JAVA (parse_java_file) — module = the file's `package` declaration
+//!   (dots -> ::). Imports (`import a.b.C;`, `import static a.b.C.m;`,
+//!   wildcards) feed the alias map; classes/interfaces/enums/records nest
+//!   (module::Outer::Inner::method); `new Foo()` records a call to the
+//!   constructor `Foo::Foo`; bare calls resolve alias-first (static imports)
+//!   then to the enclosing class; Upper.m() via alias map or same-package class.
 //!
 //! index() is idempotent: it DELETEs prior code:* nodes for the corpus (edges
 //! cascade via brain_vault_edges ON DELETE CASCADE), then re-extracts.
@@ -82,11 +101,24 @@ struct CallSite {
     at: usize,
 }
 
+/// Source language of a parsed file — selects the call-resolution rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lang {
+    Rust,
+    /// TypeScript / TSX / JavaScript (all parsed by the TS/TSX grammars).
+    TypeScript,
+    Java,
+}
+
+/// Languages `index()` accepts (also drives the terminal's auto-detect filter).
+pub const SUPPORTED_LANGS: &[&str] = &["rust", "typescript", "javascript", "java"];
+
 /// Per-file parse result.
 struct FileParse {
+    lang: Lang,
     /// Module prefix for this file, e.g. `ff_agent::model_runtime`.
     module: String,
-    /// The crate name, e.g. `ff_agent`.
+    /// The crate name, e.g. `ff_agent` (TS: package ident; Java: package path).
     crate_name: String,
     symbols: Vec<Symbol>,
     calls: Vec<CallSite>,
@@ -98,14 +130,68 @@ struct FileParse {
 
 // ─── Public entrypoint ───────────────────────────────────────────────────────
 
-/// Index a corpus's code files into the Brain faceted graph.
+/// File-extension LIKE patterns per language for the content:file query.
+fn lang_patterns(lang: &str) -> Result<Vec<String>> {
+    let pats: &[&str] = match lang {
+        "rust" => &["%.rs"],
+        "typescript" => &["%.ts", "%.tsx", "%.mts", "%.cts"],
+        "javascript" => &["%.js", "%.jsx", "%.mjs", "%.cjs"],
+        "java" => &["%.java"],
+        _ => anyhow::bail!(
+            "cortex: --lang must be one of {} (got '{lang}')",
+            SUPPORTED_LANGS.join("/")
+        ),
+    };
+    Ok(pats.iter().map(|s| s.to_string()).collect())
+}
+
+/// Index a corpus's code files into the Brain faceted graph (single language).
 ///
 /// Re-uses the cached `PgPool` (passed in). Reads only the file-system files that
 /// the corpus already scanned as `content:file` nodes; writes only graph rows.
+/// Idempotent: wipes all prior code:* nodes for the corpus first. For
+/// multi-language repos use [`index_langs`], which wipes ONCE then indexes each
+/// language (back-to-back `index` calls would clobber each other's nodes).
 pub async fn index(pool: &PgPool, corpus_slug: &str, lang: &str) -> Result<CortexStats> {
-    if lang != "rust" {
-        anyhow::bail!("cortex: only --lang rust is implemented (got '{lang}')");
+    lang_patterns(lang)?; // validate before wiping
+    wipe_code_nodes(pool, corpus_slug).await?;
+    index_one(pool, corpus_slug, lang).await
+}
+
+/// Index several languages into one corpus: wipe once, then extract each.
+pub async fn index_langs(
+    pool: &PgPool,
+    corpus_slug: &str,
+    langs: &[String],
+) -> Result<Vec<(String, CortexStats)>> {
+    // Validate every language up front so a bad one doesn't wipe the graph.
+    for l in langs {
+        lang_patterns(l)?;
     }
+    wipe_code_nodes(pool, corpus_slug).await?;
+    let mut out = Vec::with_capacity(langs.len());
+    for l in langs {
+        let stats = index_one(pool, corpus_slug, l).await?;
+        out.push((l.clone(), stats));
+    }
+    Ok(out)
+}
+
+/// Idempotency: drop all prior code:* nodes for this corpus (edges cascade).
+async fn wipe_code_nodes(pool: &PgPool, corpus_slug: &str) -> Result<()> {
+    sqlx::query(
+        "DELETE FROM brain_vault_nodes
+           WHERE project = $1 AND node_type LIKE 'code:%'",
+    )
+    .bind(corpus_slug)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Extract one language's symbols/edges for a corpus (no wipe — see callers).
+async fn index_one(pool: &PgPool, corpus_slug: &str, lang: &str) -> Result<CortexStats> {
+    let patterns = lang_patterns(lang)?;
 
     // Resolve corpus id.
     let corpus_id: Uuid = sqlx::query_scalar("SELECT id FROM brain_corpora WHERE slug = $1")
@@ -114,25 +200,17 @@ pub async fn index(pool: &PgPool, corpus_slug: &str, lang: &str) -> Result<Corte
         .await?
         .ok_or_else(|| anyhow::anyhow!("no corpus with slug '{corpus_slug}'"))?;
 
-    // Idempotent: drop all prior code:* nodes for this corpus (edges cascade).
-    sqlx::query(
-        "DELETE FROM brain_vault_nodes
-           WHERE project = $1 AND node_type LIKE 'code:%'",
-    )
-    .bind(corpus_slug)
-    .execute(pool)
-    .await?;
-
-    // Pull every current content:file node for this corpus that is a .rs file.
+    // Pull every current content:file node for this corpus in this language.
     let file_rows = sqlx::query(
         r#"SELECT n.id, n.path
              FROM brain_vault_nodes n
             WHERE n.project = $1
               AND n.valid_until IS NULL
               AND n.node_type = 'content:file'
-              AND n.path LIKE '%.rs'"#,
+              AND n.path LIKE ANY($2)"#,
     )
     .bind(corpus_slug)
+    .bind(&patterns)
     .fetch_all(pool)
     .await?;
 
@@ -155,11 +233,20 @@ pub async fn index(pool: &PgPool, corpus_slug: &str, lang: &str) -> Result<Corte
     for row in &file_rows {
         let file_node_id: Uuid = row.get("id");
         let file_path: String = row.get("path");
+        if file_path.ends_with(".d.ts") {
+            continue; // ambient declaration files: no bodies, all noise
+        }
         let source = match std::fs::read_to_string(&file_path) {
             Ok(s) => s,
             Err(_) => continue, // file vanished since scan; skip
         };
-        let parse = match parse_rust_file(&file_path, &source) {
+        let parse = match lang {
+            "rust" => parse_rust_file(&file_path, &source),
+            "typescript" | "javascript" => parse_typescript_file(&file_path, &source),
+            "java" => parse_java_file(&file_path, &source),
+            _ => unreachable!("lang validated by lang_patterns"),
+        };
+        let parse = match parse {
             Some(p) => p,
             None => continue,
         };
@@ -510,6 +597,7 @@ fn parse_rust_file(file_path: &str, source: &str) -> Option<FileParse> {
     let bytes = source.as_bytes();
 
     let mut fp = FileParse {
+        lang: Lang::Rust,
         module: module.clone(),
         crate_name: crate_name.clone(),
         symbols: Vec::new(),
@@ -802,12 +890,714 @@ fn norm_crate(path: &str, crate_name: &str) -> String {
     }
 }
 
+// ─── Parsing (tree-sitter-typescript / tsx) ──────────────────────────────────
+
+/// Known source extensions trimmed off TS/JS module stems.
+const TS_EXTS: &[&str] = &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];
+
+/// Parse a TypeScript / TSX / JavaScript file. `.ts`/`.mts`/`.cts` use the
+/// TYPESCRIPT grammar; `.tsx`/`.jsx` and the plain-JS flavors use the TSX
+/// grammar (JSX parses; the TS-only ambiguities TSX trips on don't occur in JS).
+fn parse_typescript_file(file_path: &str, source: &str) -> Option<FileParse> {
+    let (pkg_ident, module) = ts_module_for_file(file_path);
+    let ext = Path::new(file_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    let grammar = if matches!(ext, "ts" | "mts" | "cts") {
+        tree_sitter_typescript::LANGUAGE_TYPESCRIPT
+    } else {
+        tree_sitter_typescript::LANGUAGE_TSX
+    };
+    let mut parser = Parser::new();
+    parser.set_language(&grammar.into()).ok()?;
+    let tree = parser.parse(source, None)?;
+    let root = tree.root_node();
+    let bytes = source.as_bytes();
+
+    let mut fp = FileParse {
+        lang: Lang::TypeScript,
+        module: module.clone(),
+        crate_name: pkg_ident,
+        symbols: Vec::new(),
+        calls: Vec::new(),
+        use_targets: Vec::new(),
+        alias_map: HashMap::new(),
+    };
+    walk_ts(&root, bytes, &module, file_path, None, &mut fp);
+    // Calls are collected in ONE global pass — attribution is byte-span based
+    // (innermost_fn), so per-function collection would only risk double counts.
+    collect_ts_calls(&root, bytes, &mut fp);
+    Some(fp)
+}
+
+fn walk_ts(
+    node: &Node,
+    bytes: &[u8],
+    mod_path: &str,
+    file_path: &str,
+    parent: Option<usize>,
+    fp: &mut FileParse,
+) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "import_statement" => collect_ts_import(&child, bytes, file_path, fp),
+            "export_statement" => {
+                // Re-export (`export { x } from './m'` / `export * from './m'`):
+                // record the module as an import target, then descend so wrapped
+                // declarations (`export function foo` ...) register normally.
+                if let Some(src) = child.child_by_field_name("source") {
+                    if let Some(t) = string_literal_text(&src, bytes) {
+                        fp.use_targets.push(ts_import_module(&t, file_path));
+                    }
+                }
+                walk_ts(&child, bytes, mod_path, file_path, parent, fp);
+            }
+            "function_declaration" | "generator_function_declaration" => {
+                if let Some(name) = child_field_text(&child, "name", bytes) {
+                    let idx = fp.symbols.len();
+                    fp.symbols.push(Symbol {
+                        qualified_name: join(mod_path, &name),
+                        node_type: "code:function",
+                        start: child.start_byte(),
+                        end: child.end_byte(),
+                        parent,
+                    });
+                    walk_ts(&child, bytes, mod_path, file_path, Some(idx), fp);
+                }
+            }
+            "class_declaration" | "abstract_class_declaration" => {
+                if let Some(name) = child_field_text(&child, "name", bytes) {
+                    let class_path = join(mod_path, &name);
+                    let idx = fp.symbols.len();
+                    fp.symbols.push(Symbol {
+                        qualified_name: class_path.clone(),
+                        node_type: "code:class",
+                        start: child.start_byte(),
+                        end: child.end_byte(),
+                        parent,
+                    });
+                    // Methods qualify under the class: module::Class::method.
+                    walk_ts(&child, bytes, &class_path, file_path, Some(idx), fp);
+                }
+            }
+            "interface_declaration" | "enum_declaration" => {
+                let nt = if child.kind() == "enum_declaration" {
+                    "code:enum"
+                } else {
+                    "code:interface"
+                };
+                if let Some(name) = child_field_text(&child, "name", bytes) {
+                    fp.symbols.push(Symbol {
+                        qualified_name: join(mod_path, &name),
+                        node_type: nt,
+                        start: child.start_byte(),
+                        end: child.end_byte(),
+                        parent,
+                    });
+                }
+            }
+            "method_definition" => {
+                // Inside a class body mod_path is already module::Class.
+                if let Some(name) = child_field_text(&child, "name", bytes) {
+                    let idx = fp.symbols.len();
+                    fp.symbols.push(Symbol {
+                        qualified_name: join(mod_path, &name),
+                        node_type: "code:function",
+                        start: child.start_byte(),
+                        end: child.end_byte(),
+                        parent,
+                    });
+                    walk_ts(&child, bytes, mod_path, file_path, Some(idx), fp);
+                }
+            }
+            "variable_declarator" | "public_field_definition" | "field_definition" => {
+                ts_declarator(&child, bytes, mod_path, file_path, parent, fp);
+            }
+            // ERROR-node descent: keep extracting after parse errors.
+            _ => walk_ts(&child, bytes, mod_path, file_path, parent, fp),
+        }
+    }
+}
+
+/// `const foo = () => {}` / `bar = function () {}` (incl. class fields) become
+/// code:function symbols; `const x = require('./m')` binds a CommonJS alias.
+fn ts_declarator(
+    node: &Node,
+    bytes: &[u8],
+    mod_path: &str,
+    file_path: &str,
+    parent: Option<usize>,
+    fp: &mut FileParse,
+) {
+    let name = node
+        .child_by_field_name("name")
+        .filter(|n| {
+            matches!(
+                n.kind(),
+                "identifier" | "property_identifier" | "private_property_identifier"
+            )
+        })
+        .and_then(|n| node_text(&n, bytes));
+    let Some(value) = node.child_by_field_name("value") else {
+        return;
+    };
+    match value.kind() {
+        "arrow_function" | "function_expression" | "function" | "generator_function" => {
+            if let Some(name) = name {
+                let idx = fp.symbols.len();
+                fp.symbols.push(Symbol {
+                    qualified_name: join(mod_path, &name),
+                    node_type: "code:function",
+                    start: node.start_byte(),
+                    end: node.end_byte(),
+                    parent,
+                });
+                walk_ts(&value, bytes, mod_path, file_path, Some(idx), fp);
+            }
+        }
+        "call_expression" => {
+            // const x = require('./m')
+            let is_require = value
+                .child_by_field_name("function")
+                .and_then(|f| node_text(&f, bytes))
+                .is_some_and(|t| t == "require");
+            if is_require {
+                if let (Some(name), Some(args)) = (name, value.child_by_field_name("arguments")) {
+                    let mut c = args.walk();
+                    for a in args.children(&mut c) {
+                        if a.kind() == "string" {
+                            if let Some(src) = string_literal_text(&a, bytes) {
+                                register_use(&ts_import_module(&src, file_path), &name, fp);
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Collect an `import ... from '...'` statement into use_targets + alias_map.
+fn collect_ts_import(node: &Node, bytes: &[u8], file_path: &str, fp: &mut FileParse) {
+    let Some(target) = node
+        .child_by_field_name("source")
+        .and_then(|s| string_literal_text(&s, bytes))
+        .map(|t| ts_import_module(&t, file_path))
+    else {
+        return;
+    };
+    let mut bound_any = false;
+    let mut cursor = node.walk();
+    for clause in node.children(&mut cursor) {
+        if clause.kind() != "import_clause" {
+            continue;
+        }
+        let mut cc = clause.walk();
+        for c in clause.children(&mut cc) {
+            match c.kind() {
+                "identifier" => {
+                    // default import: `import Foo from './m'` — best-effort bind
+                    // Foo -> <m>::Foo (default exports usually share the name).
+                    if let Some(name) = node_text(&c, bytes) {
+                        register_use(&join(&target, &name), &name, fp);
+                        bound_any = true;
+                    }
+                }
+                "namespace_import" => {
+                    // `* as ns` — ns aliases the whole module.
+                    let mut nc = c.walk();
+                    for n in c.children(&mut nc) {
+                        if n.kind() == "identifier" {
+                            if let Some(name) = node_text(&n, bytes) {
+                                register_use(&target, &name, fp);
+                                bound_any = true;
+                            }
+                        }
+                    }
+                }
+                "named_imports" => {
+                    let mut nc = c.walk();
+                    for spec in c.children(&mut nc) {
+                        if spec.kind() != "import_specifier" {
+                            continue;
+                        }
+                        let Some(name) = child_field_text(&spec, "name", bytes) else {
+                            continue;
+                        };
+                        let local =
+                            child_field_text(&spec, "alias", bytes).unwrap_or_else(|| name.clone());
+                        let full = join(&target, &name);
+                        fp.use_targets.push(full.clone());
+                        fp.alias_map.insert(local, full);
+                        bound_any = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if !bound_any {
+        // side-effect import (`import './polyfill'`) — still an imports edge.
+        fp.use_targets.push(target);
+    }
+}
+
+/// One global pass: record every call / `new` site with a resolvable path shape.
+fn collect_ts_calls(node: &Node, bytes: &[u8], fp: &mut FileParse) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "call_expression" => {
+                if let Some(func) = child.child_by_field_name("function") {
+                    if let Some(raw) = ts_member_path(&func, bytes) {
+                        if raw != "require" && raw != "import" {
+                            fp.calls.push(CallSite {
+                                raw_path: raw,
+                                at: child.start_byte(),
+                            });
+                        }
+                    }
+                }
+            }
+            "new_expression" => {
+                if let Some(ctor) = child.child_by_field_name("constructor") {
+                    if let Some(path) = ts_member_path(&ctor, bytes) {
+                        fp.calls.push(CallSite {
+                            raw_path: format!("{path}::constructor"),
+                            at: child.start_byte(),
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+        collect_ts_calls(&child, bytes, fp);
+    }
+}
+
+/// Dotted member chain -> `::`-joined path. Only simple identifier/this/super
+/// chains; computed members, call results etc. are skipped — type inference is
+/// out of scope, mirroring the Rust extractor's method-call policy.
+fn ts_member_path(node: &Node, bytes: &[u8]) -> Option<String> {
+    match node.kind() {
+        "identifier" | "property_identifier" | "private_property_identifier" | "this" | "super" => {
+            node_text(node, bytes)
+        }
+        "member_expression" => {
+            let obj = ts_member_path(&node.child_by_field_name("object")?, bytes)?;
+            let prop = node_text(&node.child_by_field_name("property")?, bytes)?;
+            Some(format!("{obj}::{prop}"))
+        }
+        // unwrap `foo!()` / `(foo)()`
+        "non_null_expression" | "parenthesized_expression" => {
+            let mut cursor = node.walk();
+            let inner = node.children(&mut cursor).find(|c| c.is_named())?;
+            ts_member_path(&inner, bytes)
+        }
+        _ => None,
+    }
+}
+
+/// Text of a string literal node, without quotes/backticks.
+fn string_literal_text(node: &Node, bytes: &[u8]) -> Option<String> {
+    let t = node_text(node, bytes)?;
+    Some(
+        t.trim_matches(|c| c == '"' || c == '\'' || c == '`')
+            .to_string(),
+    )
+}
+
+/// Derive (package_ident, module) for a TS/JS file: nearest package.json's name
+/// (scope stripped, sanitized) + the `::`-joined path under that package root
+/// (a leading `src` and a trailing `index` collapse, mirroring Node resolution).
+fn ts_module_for_file(file_path: &str) -> (String, String) {
+    let path = Path::new(file_path);
+    let pkg_root = find_pkg_root(path);
+    let pkg_ident = pkg_root
+        .as_deref()
+        .and_then(|r| read_package_json_name(&r.join("package.json")))
+        .map(|n| sanitize_ident(n.rsplit('/').next().unwrap_or(&n)))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "pkg".to_string());
+    let module = ts_module_under_root(pkg_root.as_deref(), path, &pkg_ident);
+    (pkg_ident, module)
+}
+
+fn ts_module_under_root(root: Option<&Path>, path: &Path, pkg_ident: &str) -> String {
+    let mut segs: Vec<String> = Vec::new();
+    match root.and_then(|r| path.strip_prefix(r).ok()) {
+        Some(rel) => {
+            let comps: Vec<_> = rel.components().collect();
+            for (i, comp) in comps.iter().enumerate() {
+                let s = comp.as_os_str().to_string_lossy().to_string();
+                let is_last = i == comps.len() - 1;
+                if is_last {
+                    let stem = trim_ts_ext(&s);
+                    if stem != "index" {
+                        segs.push(sanitize_ident(&stem));
+                    }
+                } else if !(i == 0 && s == "src") {
+                    segs.push(sanitize_ident(&s));
+                }
+            }
+        }
+        None => {
+            // No package root: fall back to the bare file stem.
+            if let Some(stem) = path.file_name().map(|s| s.to_string_lossy().to_string()) {
+                let stem = trim_ts_ext(&stem);
+                if stem != "index" {
+                    segs.push(sanitize_ident(&stem));
+                }
+            }
+        }
+    }
+    let mut module = pkg_ident.to_string();
+    for s in segs {
+        module = join(&module, &s);
+    }
+    module
+}
+
+/// Strip one known TS/JS extension (and a preceding `.d`) off a file name.
+fn trim_ts_ext(name: &str) -> String {
+    for ext in TS_EXTS {
+        if let Some(stem) = name.strip_suffix(&format!(".{ext}")) {
+            let stem = stem.strip_suffix(".d").unwrap_or(stem);
+            return stem.to_string();
+        }
+    }
+    name.to_string()
+}
+
+/// Keep [A-Za-z0-9_], map everything else to `_` (so `Button.test` and
+/// `my-dir` stay single `::` segments).
+fn sanitize_ident(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn find_pkg_root(path: &Path) -> Option<PathBuf> {
+    let mut dir = path.parent();
+    while let Some(d) = dir {
+        if d.join("package.json").is_file() {
+            return Some(d.to_path_buf());
+        }
+        dir = d.parent();
+    }
+    None
+}
+
+fn read_package_json_name(pkg_json: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(pkg_json).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    v.get("name")?.as_str().map(|s| s.to_string())
+}
+
+/// Resolve an import source string to a module path. Relative sources resolve
+/// against the importing file's directory with the SAME path math as
+/// ts_module_for_file (so internal imports land on real symbol modules); bare
+/// package specifiers become `pkg::subpath` externs.
+fn ts_import_module(source: &str, file_path: &str) -> String {
+    if source.starts_with('.') {
+        let dir = Path::new(file_path)
+            .parent()
+            .unwrap_or_else(|| Path::new(""));
+        let mut parts: Vec<std::ffi::OsString> = dir
+            .components()
+            .map(|c| c.as_os_str().to_os_string())
+            .collect();
+        for seg in source.split('/') {
+            match seg {
+                "" | "." => {}
+                ".." => {
+                    parts.pop();
+                }
+                s => parts.push(s.into()),
+            }
+        }
+        let mut target = PathBuf::new();
+        for p in &parts {
+            target.push(p);
+        }
+        let (_, module) = ts_module_for_file(&target.to_string_lossy());
+        module
+    } else {
+        // bare specifier: '@scope/pkg/sub' -> scope::pkg::sub (extern)
+        let mut out = String::new();
+        for seg in source.trim_start_matches('@').split('/') {
+            if seg.is_empty() {
+                continue;
+            }
+            let seg = sanitize_ident(seg);
+            out = join(&out, &seg);
+        }
+        if out.is_empty() {
+            "extern".to_string()
+        } else {
+            out
+        }
+    }
+}
+
+// ─── Parsing (tree-sitter-java) ──────────────────────────────────────────────
+
+/// Parse a Java file. Module = the `package` declaration (dots -> `::`);
+/// classes/interfaces/enums/records nest (module::Outer::Inner) and methods/
+/// constructors are code:function under their type.
+fn parse_java_file(_file_path: &str, source: &str) -> Option<FileParse> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_java::LANGUAGE.into())
+        .ok()?;
+    let tree = parser.parse(source, None)?;
+    let root = tree.root_node();
+    let bytes = source.as_bytes();
+
+    // package a.b.c; -> module a::b::c (no package -> names start at the class).
+    let mut module = String::new();
+    let mut cursor = root.walk();
+    for child in root.children(&mut cursor) {
+        if child.kind() == "package_declaration" {
+            let mut pc = child.walk();
+            for p in child.children(&mut pc) {
+                if matches!(p.kind(), "identifier" | "scoped_identifier") {
+                    if let Some(t) = node_text(&p, bytes) {
+                        module = t.replace('.', "::");
+                    }
+                }
+            }
+            break;
+        }
+    }
+
+    let mut fp = FileParse {
+        lang: Lang::Java,
+        module: module.clone(),
+        crate_name: module.clone(),
+        symbols: Vec::new(),
+        calls: Vec::new(),
+        use_targets: Vec::new(),
+        alias_map: HashMap::new(),
+    };
+    walk_java(&root, bytes, &module, None, &mut fp);
+    // One global call pass (byte-span attribution via innermost_fn).
+    collect_java_calls(&root, bytes, &mut fp);
+    Some(fp)
+}
+
+fn walk_java(node: &Node, bytes: &[u8], mod_path: &str, parent: Option<usize>, fp: &mut FileParse) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "import_declaration" => collect_java_import(&child, bytes, fp),
+            "class_declaration"
+            | "interface_declaration"
+            | "enum_declaration"
+            | "record_declaration"
+            | "annotation_type_declaration" => {
+                let nt = match child.kind() {
+                    "class_declaration" => "code:class",
+                    "interface_declaration" | "annotation_type_declaration" => "code:interface",
+                    "enum_declaration" => "code:enum",
+                    _ => "code:struct", // record: a data carrier
+                };
+                if let Some(name) = child_field_text(&child, "name", bytes) {
+                    let type_path = join(mod_path, &name);
+                    let idx = fp.symbols.len();
+                    fp.symbols.push(Symbol {
+                        qualified_name: type_path.clone(),
+                        node_type: nt,
+                        start: child.start_byte(),
+                        end: child.end_byte(),
+                        parent,
+                    });
+                    // Members qualify under the type: module::Class::method.
+                    walk_java(&child, bytes, &type_path, Some(idx), fp);
+                }
+            }
+            "method_declaration"
+            | "constructor_declaration"
+            | "compact_constructor_declaration" => {
+                if let Some(name) = child_field_text(&child, "name", bytes) {
+                    let idx = fp.symbols.len();
+                    fp.symbols.push(Symbol {
+                        qualified_name: join(mod_path, &name),
+                        node_type: "code:function",
+                        start: child.start_byte(),
+                        end: child.end_byte(),
+                        parent,
+                    });
+                    // local classes inside bodies still register (same module).
+                    walk_java(&child, bytes, mod_path, Some(idx), fp);
+                }
+            }
+            // ERROR-node descent + generic recursion (bodies, modifiers, ...).
+            _ => walk_java(&child, bytes, mod_path, parent, fp),
+        }
+    }
+}
+
+/// `import a.b.C;`, `import static a.b.C.m;`, `import a.b.*;`
+fn collect_java_import(node: &Node, bytes: &[u8], fp: &mut FileParse) {
+    let mut path_text: Option<String> = None;
+    let mut wildcard = false;
+    let mut cursor = node.walk();
+    for c in node.children(&mut cursor) {
+        match c.kind() {
+            "identifier" | "scoped_identifier" => path_text = node_text(&c, bytes),
+            "asterisk" => wildcard = true,
+            _ => {}
+        }
+    }
+    let Some(t) = path_text else { return };
+    let full = t.replace('.', "::");
+    if wildcard {
+        // `import a.b.*;` — record the package, no leaf alias to bind.
+        fp.use_targets.push(full);
+    } else {
+        let leaf = full.rsplit("::").next().unwrap_or(&full).to_string();
+        register_use(&full, &leaf, fp);
+    }
+}
+
+/// One global pass over the tree: method invocations + constructor calls.
+fn collect_java_calls(node: &Node, bytes: &[u8], fp: &mut FileParse) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "method_invocation" => {
+                if let Some(name) = child_field_text(&child, "name", bytes) {
+                    let raw = match child.child_by_field_name("object") {
+                        None => Some(name),
+                        Some(obj) => {
+                            java_receiver_path(&obj, bytes).map(|o| format!("{o}::{name}"))
+                        }
+                    };
+                    if let Some(raw) = raw {
+                        fp.calls.push(CallSite {
+                            raw_path: raw,
+                            at: child.start_byte(),
+                        });
+                    }
+                }
+            }
+            "object_creation_expression" => {
+                // `new Foo(...)` -> a call to the constructor Foo::Foo.
+                if let Some(ty) = child
+                    .child_by_field_name("type")
+                    .and_then(|t| java_type_path(&t, bytes))
+                {
+                    let leaf = ty.rsplit("::").next().unwrap_or(&ty).to_string();
+                    fp.calls.push(CallSite {
+                        raw_path: format!("{ty}::{leaf}"),
+                        at: child.start_byte(),
+                    });
+                }
+            }
+            _ => {}
+        }
+        collect_java_calls(&child, bytes, fp);
+    }
+}
+
+/// Receiver chains we can express without type inference: identifiers, this/
+/// super, and field-access chains of those. Anything else (call results,
+/// casts, array elements) is skipped.
+fn java_receiver_path(node: &Node, bytes: &[u8]) -> Option<String> {
+    match node.kind() {
+        "identifier" | "this" | "super" => node_text(node, bytes),
+        "field_access" => {
+            let obj = java_receiver_path(&node.child_by_field_name("object")?, bytes)?;
+            let field = node_text(&node.child_by_field_name("field")?, bytes)?;
+            Some(format!("{obj}::{field}"))
+        }
+        _ => None,
+    }
+}
+
+/// Type node of a `new` expression -> `::` path (generics stripped).
+fn java_type_path(node: &Node, bytes: &[u8]) -> Option<String> {
+    match node.kind() {
+        "type_identifier" => node_text(node, bytes),
+        "scoped_type_identifier" => node_text(node, bytes).map(|t| t.replace('.', "::")),
+        "generic_type" => {
+            let mut cursor = node.walk();
+            let inner = node
+                .children(&mut cursor)
+                .find(|c| matches!(c.kind(), "type_identifier" | "scoped_type_identifier"))?;
+            java_type_path(&inner, bytes)
+        }
+        _ => None,
+    }
+}
+
 // ─── Call resolution (THE DIFFERENTIATOR) ────────────────────────────────────
 
 /// Resolve a raw call path to a fully-qualified name, given the enclosing fn's
 /// qualified name (`caller_qn`) and the file's parse (module / crate / aliases).
 pub(crate) fn resolve_call(raw: &str, caller_qn: &str, fp: &FileParse) -> String {
-    resolve_call_inner(raw, caller_qn, &fp.module, &fp.crate_name, &fp.alias_map)
+    match fp.lang {
+        Lang::Rust => resolve_call_inner(raw, caller_qn, &fp.module, &fp.crate_name, &fp.alias_map),
+        Lang::TypeScript | Lang::Java => resolve_call_dotty(raw, caller_qn, fp),
+    }
+}
+
+/// TS/Java call resolution. Differences from Rust: bare calls check the alias
+/// map FIRST (imported functions / static imports are THE dominant call form),
+/// `this` plays the role of `self` (the caller's enclosing class), Upper-case
+/// heads fall back to a same-module class, and unknown lower-case receivers
+/// (instance vars, globals, fully-qualified package paths) are kept as written
+/// so the extern node still matches bare-leaf `callers_of` queries.
+fn resolve_call_dotty(raw: &str, caller_qn: &str, fp: &FileParse) -> String {
+    // The caller's own scope = caller_qn minus its leaf (the fn/method name):
+    // for a method that is the enclosing class (module::Class); for a free fn,
+    // the module.
+    let caller_module = caller_qn
+        .rsplit_once("::")
+        .map(|(m, _)| m.to_string())
+        .unwrap_or_else(|| fp.module.clone());
+
+    if !raw.contains("::") {
+        if let Some(full) = fp.alias_map.get(raw) {
+            return full.clone();
+        }
+        return join(&caller_module, raw);
+    }
+
+    let (head, rest) = raw.split_once("::").expect("checked contains above");
+    match head {
+        "this" | "self" => join(&caller_module, rest),
+        "super" => {
+            let parent = caller_module
+                .rsplit_once("::")
+                .map(|(p, _)| p.to_string())
+                .unwrap_or_else(|| fp.crate_name.clone());
+            join(&parent, rest)
+        }
+        _ => {
+            if let Some(full) = fp.alias_map.get(head) {
+                join(full, rest)
+            } else if head.chars().next().is_some_and(|c| c.is_uppercase()) {
+                // Class-ish receiver with no import: same-module type
+                // (static call or constructor).
+                join(&fp.module, raw)
+            } else {
+                // Unknown receiver — keep as written (becomes code:extern).
+                raw.to_string()
+            }
+        }
+    }
 }
 
 fn resolve_call_inner(
@@ -1000,6 +1790,7 @@ mod tests {
             alias_map.insert(k.to_string(), v.to_string());
         }
         FileParse {
+            lang: Lang::Rust,
             module: module.to_string(),
             crate_name: crate_name.to_string(),
             symbols: vec![],
@@ -1125,5 +1916,194 @@ mod tests {
         assert!(fns.iter().any(|q| q.ends_with("::alpha")));
         assert!(fns.iter().any(|q| q.ends_with("::beta")));
         assert!(fp.calls.iter().any(|c| c.raw_path == "beta"));
+    }
+
+    #[test]
+    fn ts_parse_extracts_class_function_import_call() {
+        let src = r#"
+import { helper, fmt as format } from './util';
+import * as svc from './svc';
+
+export function alpha() {
+  helper();
+  svc.run();
+  beta();
+}
+
+function beta() {}
+
+export class Greeter {
+  greet() {
+    this.salute();
+    format();
+    return new Greeter();
+  }
+  salute() {}
+}
+"#;
+        // No package.json on disk -> pkg ident falls back to "pkg" and modules
+        // collapse to the bare file stem (main / util / svc) — deterministic.
+        let fp = parse_typescript_file("/nonexistent/demo/src/main.ts", src).unwrap();
+        assert_eq!(fp.lang, Lang::TypeScript);
+        let names: Vec<(&str, &str)> = fp
+            .symbols
+            .iter()
+            .map(|s| (s.node_type, s.qualified_name.as_str()))
+            .collect();
+        assert!(names.contains(&("code:function", "pkg::main::alpha")));
+        assert!(names.contains(&("code:function", "pkg::main::beta")));
+        assert!(names.contains(&("code:class", "pkg::main::Greeter")));
+        assert!(names.contains(&("code:function", "pkg::main::Greeter::greet")));
+        assert!(names.contains(&("code:function", "pkg::main::Greeter::salute")));
+        // methods hang off the class (contains edge source = parent symbol).
+        let class_idx = fp
+            .symbols
+            .iter()
+            .position(|s| s.qualified_name == "pkg::main::Greeter")
+            .unwrap();
+        let greet = fp
+            .symbols
+            .iter()
+            .find(|s| s.qualified_name == "pkg::main::Greeter::greet")
+            .unwrap();
+        assert_eq!(greet.parent, Some(class_idx));
+        // imports + aliases (relative './util' resolves to the util module).
+        assert!(fp.use_targets.iter().any(|t| t == "pkg::util::helper"));
+        assert_eq!(fp.alias_map.get("format").unwrap(), "pkg::util::fmt");
+        assert_eq!(fp.alias_map.get("svc").unwrap(), "pkg::svc");
+        // raw call shapes
+        let raws: Vec<&str> = fp.calls.iter().map(|c| c.raw_path.as_str()).collect();
+        assert!(raws.contains(&"helper"));
+        assert!(raws.contains(&"svc::run"));
+        assert!(raws.contains(&"this::salute"));
+        assert!(raws.contains(&"beta"));
+        assert!(raws.contains(&"Greeter::constructor"));
+        // resolution: imported bare call -> defining module (alias-first);
+        // namespace member -> alias-expanded; bare local -> caller module;
+        // this.m() -> enclosing class.
+        assert_eq!(
+            resolve_call("helper", "pkg::main::alpha", &fp),
+            "pkg::util::helper"
+        );
+        assert_eq!(
+            resolve_call("svc::run", "pkg::main::alpha", &fp),
+            "pkg::svc::run"
+        );
+        assert_eq!(
+            resolve_call("beta", "pkg::main::alpha", &fp),
+            "pkg::main::beta"
+        );
+        assert_eq!(
+            resolve_call("this::salute", "pkg::main::Greeter::greet", &fp),
+            "pkg::main::Greeter::salute"
+        );
+        assert_eq!(
+            resolve_call("Greeter::constructor", "pkg::main::Greeter::greet", &fp),
+            "pkg::main::Greeter::constructor"
+        );
+    }
+
+    #[test]
+    fn java_parse_extracts_package_class_method_import_call() {
+        let src = r#"
+package com.acme.auth;
+
+import com.acme.util.Strings;
+import static com.acme.util.Asserts.check;
+import java.util.*;
+
+public class AuthService {
+    public String login(String user) {
+        check(user);
+        Strings.trim(user);
+        this.validate(user);
+        audit(user);
+        Session s = new Session(user);
+        return user;
+    }
+
+    void validate(String u) {}
+
+    static class Tokens {
+        void mint() {}
+    }
+}
+
+class Session {
+    Session(String u) {}
+}
+"#;
+        let fp = parse_java_file("/nonexistent/AuthService.java", src).unwrap();
+        assert_eq!(fp.lang, Lang::Java);
+        assert_eq!(fp.module, "com::acme::auth");
+        let names: Vec<(&str, &str)> = fp
+            .symbols
+            .iter()
+            .map(|s| (s.node_type, s.qualified_name.as_str()))
+            .collect();
+        assert!(names.contains(&("code:class", "com::acme::auth::AuthService")));
+        assert!(names.contains(&("code:function", "com::acme::auth::AuthService::login")));
+        assert!(names.contains(&("code:function", "com::acme::auth::AuthService::validate")));
+        // nested type + its method qualify under the outer class
+        assert!(names.contains(&("code:class", "com::acme::auth::AuthService::Tokens")));
+        assert!(names.contains(&(
+            "code:function",
+            "com::acme::auth::AuthService::Tokens::mint"
+        )));
+        // top-level sibling class + constructor
+        assert!(names.contains(&("code:class", "com::acme::auth::Session")));
+        assert!(names.contains(&("code:function", "com::acme::auth::Session::Session")));
+        // imports: plain, static, wildcard
+        assert!(
+            fp.use_targets
+                .iter()
+                .any(|t| t == "com::acme::util::Strings")
+        );
+        assert!(
+            fp.use_targets
+                .iter()
+                .any(|t| t == "com::acme::util::Asserts::check")
+        );
+        assert!(fp.use_targets.iter().any(|t| t == "java::util"));
+        assert_eq!(
+            fp.alias_map.get("Strings").unwrap(),
+            "com::acme::util::Strings"
+        );
+        // raw call shapes
+        let raws: Vec<&str> = fp.calls.iter().map(|c| c.raw_path.as_str()).collect();
+        assert!(raws.contains(&"check"));
+        assert!(raws.contains(&"Strings::trim"));
+        assert!(raws.contains(&"this::validate"));
+        assert!(raws.contains(&"audit"));
+        assert!(raws.contains(&"Session::Session"));
+        // resolution
+        let login = "com::acme::auth::AuthService::login";
+        // static import wins for bare calls
+        assert_eq!(
+            resolve_call("check", login, &fp),
+            "com::acme::util::Asserts::check"
+        );
+        // bare non-imported call -> enclosing class
+        assert_eq!(
+            resolve_call("audit", login, &fp),
+            "com::acme::auth::AuthService::audit"
+        );
+        // imported class static call
+        assert_eq!(
+            resolve_call("Strings::trim", login, &fp),
+            "com::acme::util::Strings::trim"
+        );
+        // this.m() -> enclosing class (matches the real code:function node)
+        assert_eq!(
+            resolve_call("this::validate", login, &fp),
+            "com::acme::auth::AuthService::validate"
+        );
+        // same-package constructor
+        assert_eq!(
+            resolve_call("Session::Session", login, &fp),
+            "com::acme::auth::Session::Session"
+        );
+        // unknown lower-case receiver stays as written (extern)
+        assert_eq!(resolve_call("userRepo::save", login, &fp), "userRepo::save");
     }
 }
