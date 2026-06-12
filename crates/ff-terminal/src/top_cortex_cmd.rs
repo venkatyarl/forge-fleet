@@ -385,12 +385,16 @@ async fn run_index(
                  pass --lang to force one"
             ));
         }
-        // Pick the dominant language, plus any other that has at least
-        // 25% of the dominant's file count (so polyglot repos get both).
+        // Pick the dominant language, plus any other that has at least 25% of
+        // the dominant's file count OR at least 50 files outright. The relative
+        // rule kills stray-file noise (2 .js helpers in a Rust repo); the
+        // absolute floor keeps substantial secondary languages that a huge
+        // dominant one would otherwise mask (HireFlow360: 925 Java files were
+        // silently dropped because 5500+ TS/TSX files made the 25% bar 1385).
         let top = detected[0].1.max(1);
         detected
             .into_iter()
-            .filter(|(_, n)| *n * 4 >= top)
+            .filter(|(_, n)| *n * 4 >= top || *n >= 50)
             .map(|(l, _)| l)
             .collect()
     };
