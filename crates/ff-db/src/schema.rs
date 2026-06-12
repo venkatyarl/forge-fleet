@@ -8389,7 +8389,7 @@ print("OK rocm wheel %s" % v)
 ON CONFLICT (profile_id, check_key) DO NOTHING;
 "#;
 
-// V121 — ff_interactions: the unified interaction log. One row per ff "turn"
+// V122 — ff_interactions: the unified interaction log. One row per ff "turn"
 // captured at the response boundary (gateway / session_runner / CLI agent loop
 // / fleet_run). Serves three jobs from one table: (1) SLM training corpus
 // (request_text → response_text with the route+steps in between), (2) the live
@@ -8398,7 +8398,9 @@ ON CONFLICT (profile_id, check_key) DO NOTHING;
 // 30-min self-heal tick (novel errors → fleet_self_heal_queue dispatch).
 // error_signature is COLLATE "C" — it's a hash ID used for dedup, so byte
 // ordering must be locale-independent (see [[db-collation-prevention]]).
-pub const SCHEMA_V121_INTERACTION_LOG: &str = r#"
+// NB: numbered V122 not V121 — 121 was taken by cortex_code_graph in the live
+// DB, so this migration was silently skipped until renumbered.
+pub const SCHEMA_V122_INTERACTION_LOG: &str = r#"
 CREATE TABLE IF NOT EXISTS ff_interactions (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     session_id      UUID,
