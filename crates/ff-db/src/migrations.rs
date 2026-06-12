@@ -759,6 +759,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "brain_community_registry",
         sql: schema::SCHEMA_V125_BRAIN_COMMUNITY_REGISTRY,
     },
+    PgMigration {
+        version: 126,
+        name: "community_god_node_ondelete",
+        sql: schema::SCHEMA_V126_COMMUNITY_GOD_NODE_ONDELETE,
+    },
 ];
 
 /// Ensure the Postgres `_migrations` tracking table exists.
