@@ -72,6 +72,24 @@ const HOST_RAM_RESERVE_GB: f64 = 4.0;
 /// same convention as the agent router's exclude_hosts).
 const EXCLUDE_HOSTS: &[&str] = &["taylor"];
 
+/// `fleet_secrets` keys for the per-kind RELIABILITY FLOOR — the minimum number
+/// of agent-capable endpoints of each kind to keep WARM regardless of measured
+/// demand. The fleet's stated P0 is agent-swarm reliability: a swarm burst must
+/// always find capacity, so we keep a warm floor of code endpoints rather than
+/// letting scale-down trim to a single point of failure at demand=0 (the floor
+/// is meaningful only because the cross-node `autoload --node` scale-up path now
+/// survives SSH-session teardown — fix ff0e9ce45). Each key is overridable per
+/// fleet; missing/garbage falls back to the default below.
+const CODE_FLOOR_KEY: &str = "autoscaler_code_floor";
+const GENERAL_FLOOR_KEY: &str = "autoscaler_general_floor";
+/// Default warm floor: TWO code endpoints (no SPOF during swarm bursts) and ONE
+/// general. Set the key to 1 to restore scale-to-one, or 0 to disable the floor.
+const DEFAULT_CODE_FLOOR: f64 = 2.0;
+const DEFAULT_GENERAL_FLOOR: f64 = 1.0;
+/// Clamp ceiling for an operator-supplied floor — a typo'd `autoscaler_code_floor`
+/// can't make the autoscaler try to flood the fleet with endpoints.
+const MAX_FLOOR: f64 = 8.0;
+
 // Placement scoring weights (see [`score_host`]). Named consts so they're tunable.
 const W_FIT: f64 = 3.0;
 const W_PERF: f64 = 4.0;
@@ -113,6 +131,34 @@ async fn read_mode(pg: &PgPool) -> AutoscalerMode {
             warn!(error = %e, "autoscaler: failed to read mode secret; treating as off");
             AutoscalerMode::Off
         }
+    }
+}
+
+/// Read a per-kind reliability floor from `fleet_secrets`, clamped to a sane
+/// range. Missing key or unparseable value → the compiled default (so the warm
+/// floor is the product's out-of-the-box behavior); a value is clamped to
+/// `[0, MAX_FLOOR]` so an operator typo can't ask for an absurd endpoint count.
+async fn read_floor(pg: &PgPool, key: &str, default: f64) -> f64 {
+    match ff_db::pg_get_secret(pg, key).await {
+        Ok(raw) => parse_floor(raw.as_deref(), default),
+        Err(e) => {
+            warn!(error = %e, key, "autoscaler: failed to read floor secret; using default");
+            default
+        }
+    }
+}
+
+/// Pure parse+clamp of a reliability-floor secret value. Missing/empty/unparseable
+/// → `default`; a valid number is clamped to `[0, MAX_FLOOR]`.
+fn parse_floor(raw: Option<&str>, default: f64) -> f64 {
+    match raw.map(str::trim) {
+        Some(s) if !s.is_empty() => s
+            .parse::<f64>()
+            .ok()
+            .filter(|f| f.is_finite())
+            .map(|f| f.clamp(0.0, MAX_FLOOR))
+            .unwrap_or(default),
+        _ => default,
     }
 }
 
@@ -164,6 +210,10 @@ pub struct AutoscaleSummary {
     pub mode: &'static str,
     pub code_wanted: f64,
     pub general_wanted: f64,
+    /// Effective per-kind target after applying the reliability floor
+    /// (`max(demand, floor)`) — what the planner actually scales toward.
+    pub code_target: f64,
+    pub general_target: f64,
     pub code_supplied: i64,
     pub general_supplied: i64,
     pub planned_loads: usize,
@@ -314,9 +364,19 @@ async fn plan_pass(pg: &PgPool) -> Result<(Vec<Action>, AutoscaleSummary), Strin
         .map_err(|e| format!("pg_latest_demand_snapshot: {e}"))?;
     let (code_wanted, general_wanted) = match demand {
         Some(d) => (d.code_slots_wanted, d.general_slots_wanted),
-        // No snapshot yet (P2 not producing) → no demand signal → do nothing.
+        // No snapshot yet (P2 not producing) → no demand signal. The reliability
+        // floor below still applies, so the fleet keeps warm agent capacity even
+        // when the demand sensor is silent (the worst case for swarm reliability).
         None => (0.0, 0.0),
     };
+
+    // Apply the per-kind RELIABILITY FLOOR: the planner scales toward
+    // `max(demand, floor)`, never below the floor. This is what keeps a warm pool
+    // of agent endpoints alive at demand=0 instead of collapsing to a SPOF.
+    let code_floor = read_floor(pg, CODE_FLOOR_KEY, DEFAULT_CODE_FLOOR).await;
+    let general_floor = read_floor(pg, GENERAL_FLOOR_KEY, DEFAULT_GENERAL_FLOOR).await;
+    let code_target = code_wanted.max(code_floor);
+    let general_target = general_wanted.max(general_floor);
 
     let supply = ff_db::pg_supplied_slots_by_kind(pg, AGENT_MIN_CTX as i32)
         .await
@@ -325,6 +385,8 @@ async fn plan_pass(pg: &PgPool) -> Result<(Vec<Action>, AutoscaleSummary), Strin
     let mut summary = AutoscaleSummary {
         code_wanted,
         general_wanted,
+        code_target,
+        general_target,
         code_supplied: supply.code_count,
         general_supplied: supply.general_count,
         ..Default::default()
@@ -332,18 +394,19 @@ async fn plan_pass(pg: &PgPool) -> Result<(Vec<Action>, AutoscaleSummary), Strin
 
     let mut actions: Vec<Action> = Vec::new();
 
-    // Evaluate both kinds; collect deficits (scale-up) and surpluses (scale-down).
-    // Plan at most one load (the most-starved kind) and one unload per pass.
+    // Evaluate both kinds against their floor-adjusted TARGET; collect deficits
+    // (scale-up) and surpluses (scale-down). At most one load (the most-starved
+    // kind) and one unload per pass.
     let kinds = [
         (
             Kind::Code,
-            code_wanted,
+            code_target,
             supply.code_count,
             &supply.code_endpoints,
         ),
         (
             Kind::General,
-            general_wanted,
+            general_target,
             supply.general_count,
             &supply.general_endpoints,
         ),
@@ -672,7 +735,7 @@ pub async fn autoscale_pass(pg: &PgPool) -> Result<AutoscaleSummary, String> {
                     wanted = format!("{wanted:.2}"),
                     supplied,
                     mode = mode.as_str(),
-                    "autoscaler PLAN: would load {} on {} because {} demand={:.2} supply={}",
+                    "autoscaler PLAN: would load {} on {} because {} target={:.2} supply={}",
                     catalog_id, host, kind.label(), wanted, supplied
                 );
             }
@@ -690,7 +753,7 @@ pub async fn autoscale_pass(pg: &PgPool) -> Result<AutoscaleSummary, String> {
                     wanted = format!("{wanted:.2}"),
                     supplied,
                     mode = mode.as_str(),
-                    "autoscaler PLAN: would unload {} on {} because {} oversupplied demand={:.2} supply={}",
+                    "autoscaler PLAN: would unload {} on {} because {} oversupplied target={:.2} supply={}",
                     deployment_id, host, kind.label(), wanted, supplied
                 );
             }
@@ -766,8 +829,10 @@ pub fn spawn_autoscaler_tick(
                             info!(
                                 mode = s.mode,
                                 code_wanted = format!("{:.2}", s.code_wanted),
+                                code_target = format!("{:.2}", s.code_target),
                                 code_supplied = s.code_supplied,
                                 general_wanted = format!("{:.2}", s.general_wanted),
+                                general_target = format!("{:.2}", s.general_target),
                                 general_supplied = s.general_supplied,
                                 planned_loads = s.planned_loads,
                                 planned_unloads = s.planned_unloads,
@@ -841,6 +906,23 @@ mod tests {
             AutoscalerMode::parse(Some(" active ")),
             AutoscalerMode::Active
         );
+    }
+
+    #[test]
+    fn floor_parsing_clamps_and_defaults() {
+        // Missing / empty / garbage → default.
+        assert_eq!(parse_floor(None, 2.0), 2.0);
+        assert_eq!(parse_floor(Some("  "), 2.0), 2.0);
+        assert_eq!(parse_floor(Some("nope"), 2.0), 2.0);
+        assert_eq!(parse_floor(Some("NaN"), 2.0), 2.0);
+        assert_eq!(parse_floor(Some("inf"), 2.0), 2.0);
+        // Valid values pass through, trimmed.
+        assert_eq!(parse_floor(Some("1"), 2.0), 1.0);
+        assert_eq!(parse_floor(Some(" 3 "), 2.0), 3.0);
+        assert_eq!(parse_floor(Some("0"), 2.0), 0.0);
+        // Out-of-range clamps into [0, MAX_FLOOR].
+        assert_eq!(parse_floor(Some("-5"), 2.0), 0.0);
+        assert_eq!(parse_floor(Some("9999"), 2.0), MAX_FLOOR);
     }
 
     #[test]
