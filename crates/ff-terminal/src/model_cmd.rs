@@ -13,6 +13,240 @@ fn is_agent_ready(usable_agent_ctx: Option<i32>, min_ctx: i32) -> bool {
     usable_agent_ctx.map(|c| c >= min_ctx).unwrap_or(false)
 }
 
+/// Conservative free-RAM floor (GB) below which `ff model reprofile` refuses to
+/// relaunch without `--force`. Reprofiling reloads the SAME (already-resident)
+/// model, so the only new memory is the larger single-slot KV cache — but a host
+/// already at its limit can still OOM when the agent ctx grows from a few K to
+/// 32K+. `pg_placement_candidates.free_ram_gb` is `total_ram − resident weights`,
+/// so a positive value above this floor leaves headroom for the KV delta.
+const REPROFILE_MIN_FREE_RAM_GB: f64 = 4.0;
+
+/// Whether a host has enough conservative free RAM to safely grow a deployment's
+/// KV cache during a reprofile. Pure for unit testing. `--force` bypasses this.
+fn ram_headroom_ok(free_ram_gb: f64, floor_gb: f64) -> bool {
+    free_ram_gb >= floor_gb
+}
+
+/// Reprofile a running deployment into the agent-capable serving profile
+/// (`--parallel 1 --ctx >= 32768`) so it becomes agent-router-visible. Runs on
+/// the host that owns the deployment, SSHing there if it lives elsewhere.
+async fn handle_reprofile(
+    pool: &sqlx::PgPool,
+    id: &str,
+    ctx: Option<u32>,
+    force: bool,
+    json: bool,
+) -> Result<()> {
+    let min_ctx = ff_agent::model_runtime::AGENT_MIN_CTX as i32;
+
+    // Locate the deployment across the whole fleet so we can route to its owner.
+    let all = ff_db::pg_list_deployments(pool, None).await?;
+    let dep = all
+        .iter()
+        .find(|d| d.id == id)
+        .ok_or_else(|| {
+            anyhow::anyhow!("no deployment with id '{id}' (see `ff model deployments --show-id`)")
+        })?
+        .clone();
+
+    let this_node = ff_agent::fleet_info::resolve_this_worker_name().await;
+    if !dep.worker_name.eq_ignore_ascii_case(&this_node) {
+        // Owner is a different host: SSH `ff model reprofile <id>` over there
+        // (resolved from Postgres, never ~/.ssh/config — same pattern as unload).
+        let node_row = ff_db::pg_get_node(pool, &dep.worker_name)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("node '{}' not in fleet_workers", dep.worker_name))?;
+        let mut remote_cmd = format!(
+            "~/.local/bin/ff model reprofile {}",
+            shell_escape_single(id)
+        );
+        if let Some(c) = ctx {
+            remote_cmd.push_str(&format!(" --ctx {c}"));
+        }
+        if force {
+            remote_cmd.push_str(" --force");
+        }
+        if json {
+            remote_cmd.push_str(" --json");
+        }
+        println!(
+            "{CYAN}▶ Reprofiling deployment {id} on {} ({}@{})...{RESET}",
+            dep.worker_name, node_row.ssh_user, node_row.ip
+        );
+        let (code, out, err) =
+            ff_agent::model_transfer::ssh_exec(&node_row.ssh_user, &node_row.ip, &remote_cmd)
+                .await
+                .map_err(|e| anyhow::anyhow!("ssh to {}: {e}", dep.worker_name))?;
+        if !out.trim().is_empty() {
+            print!("{out}");
+        }
+        if code != 0 {
+            anyhow::bail!(
+                "remote reprofile on {} exited {code}: {}",
+                dep.worker_name,
+                err.trim()
+            );
+        }
+        return Ok(());
+    }
+
+    // Local path — this host owns the deployment.
+    let catalog_id = dep.catalog_id.clone().ok_or_else(|| {
+        anyhow::anyhow!(
+            "deployment {id} has no catalog_id — cannot verify tool-calling; reprofile aborted"
+        )
+    })?;
+
+    // 1. Must be tool-calling, or the agent router will never pick it regardless
+    //    of ctx — reprofiling would just cause a pointless down-window.
+    let cat = ff_db::pg_get_catalog(pool, &catalog_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("catalog row '{catalog_id}' not found"))?;
+    if !cat.tool_calling {
+        anyhow::bail!(
+            "model '{catalog_id}' is not tool-calling — the agent router won't use it even at {min_ctx} ctx; reprofile aborted (nothing changed)"
+        );
+    }
+
+    // 2. Already agent-ready? No-op (don't take an endpoint down for nothing).
+    if is_agent_ready(dep.usable_agent_ctx, min_ctx) {
+        let msg = format!(
+            "deployment {id} ({catalog_id}) on {} is already agent-ready (usable_agent_ctx={} >= {min_ctx}) — nothing to do",
+            dep.worker_name,
+            dep.usable_agent_ctx.unwrap_or(0),
+        );
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({"reprofiled": false, "reason": "already_agent_ready",
+                    "deployment_id": id, "usable_agent_ctx": dep.usable_agent_ctx})
+            );
+        } else {
+            println!("{GREEN}✓{RESET} {msg}");
+        }
+        return Ok(());
+    }
+
+    // 3. RAM safety: the larger single-slot ctx grows the KV cache. Refuse on a
+    //    memory-tight host unless --force.
+    let cands = ff_db::pg_placement_candidates(pool).await?;
+    let free_ram_gb = cands
+        .iter()
+        .find(|c| c.worker_name.eq_ignore_ascii_case(&dep.worker_name))
+        .map(|c| c.free_ram_gb);
+    if let Some(free) = free_ram_gb
+        && !force
+        && !ram_headroom_ok(free, REPROFILE_MIN_FREE_RAM_GB)
+    {
+        anyhow::bail!(
+            "host {} has only ~{:.1} GB conservative free RAM (floor {:.0} GB); reprofiling grows the KV cache and may OOM. Re-run with --force to override.",
+            dep.worker_name,
+            free,
+            REPROFILE_MIN_FREE_RAM_GB
+        );
+    }
+
+    // 4. Need a library row to relaunch the same file. Prefer the deployment's
+    //    library_id; fall back to this host's library by catalog_id.
+    let library_id = match dep.library_id.clone() {
+        Some(l) => l,
+        None => {
+            let libs = ff_db::pg_list_library(pool, Some(&dep.worker_name)).await?;
+            libs.iter()
+                .find(|r| r.catalog_id == catalog_id)
+                .map(|r| r.id.clone())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "no library row for '{catalog_id}' on {} — cannot reload",
+                        dep.worker_name
+                    )
+                })?
+        }
+    };
+
+    let target_ctx = ctx.unwrap_or(ff_agent::model_runtime::AGENT_MIN_CTX);
+    let port = dep.port as u16;
+    let old_ctx = match (dep.usable_agent_ctx, dep.parallel_slots) {
+        (Some(u), Some(p)) => format!("{u}x{p}"),
+        (Some(u), _) => u.to_string(),
+        _ => "?".into(),
+    };
+
+    println!(
+        "{CYAN}▶ Reprofiling {catalog_id} on {} port {port}: {old_ctx} → agent profile (--parallel 1, ctx >= {}){RESET}",
+        dep.worker_name,
+        target_ctx.max(ff_agent::model_runtime::AGENT_MIN_CTX),
+    );
+    println!("  {YELLOW}(brief down-window on port {port} while the server relaunches){RESET}");
+
+    // 5. Unload the current deployment, then reload the SAME model on the SAME
+    //    port in the agent profile. load_model health-waits (90s) and records
+    //    usable_agent_ctx, so a failed relaunch surfaces as an Err here.
+    ff_agent::model_runtime::unload_model(pool, id)
+        .await
+        .map_err(|e| anyhow::anyhow!("unload of {id} failed (nothing reloaded): {e}"))?;
+
+    let res = ff_agent::model_runtime::load_model(
+        pool,
+        ff_agent::model_runtime::LoadOptions {
+            library_id,
+            port,
+            context_size: Some(target_ctx),
+            parallel: None,
+            agent_profile: true,
+            mmproj_path: None,
+        },
+    )
+    .await
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "RELAUNCH FAILED on port {port} after unload — endpoint is DOWN until the reconciler recovers it: {e}"
+        )
+    })?;
+
+    // 6. Confirm the new profile is actually agent-ready.
+    let now = ff_db::pg_list_deployments(pool, Some(&dep.worker_name)).await?;
+    let new = now.iter().find(|d| d.id == res.deployment_id);
+    let new_usable = new.and_then(|d| d.usable_agent_ctx);
+    let agent_ready = is_agent_ready(new_usable, min_ctx);
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "reprofiled": true,
+                "old_deployment_id": id,
+                "new_deployment_id": res.deployment_id,
+                "node": dep.worker_name,
+                "port": port,
+                "catalog_id": catalog_id,
+                "usable_agent_ctx": new_usable,
+                "agent_ready": agent_ready,
+            })
+        );
+    } else if agent_ready {
+        println!(
+            "{GREEN}✓ Reprofiled{RESET} — {catalog_id} on {} port {port} now agent-ready (usable_agent_ctx={}, deployment {})",
+            dep.worker_name,
+            new_usable.unwrap_or(0),
+            res.deployment_id
+        );
+    } else {
+        // Loaded + healthy but the recorded per-slot ctx didn't clear the floor
+        // (e.g. reconciler hasn't backfilled yet). Don't claim success.
+        println!(
+            "{YELLOW}⚠ Relaunched{RESET} {catalog_id} on {} port {port} (deployment {}) but usable_agent_ctx={} is not yet >= {min_ctx}. Re-check with `ff model agent-ready --node {}`.",
+            dep.worker_name,
+            res.deployment_id,
+            new_usable
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "NULL".into()),
+            dep.worker_name,
+        );
+    }
+    Ok(())
+}
+
 pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
     let pool = ff_agent::fleet_info::get_fleet_pool()
         .await
@@ -1035,6 +1269,14 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                 Ok(()) => println!("Unloaded deployment {id}"),
                 Err(e) => anyhow::bail!("unload failed: {e}"),
             }
+        }
+        crate::ModelCommand::Reprofile {
+            id,
+            ctx,
+            force,
+            json,
+        } => {
+            handle_reprofile(&pool, &id, ctx, force, json).await?;
         }
         crate::ModelCommand::Ps => {
             let procs = ff_agent::model_runtime::list_local_processes().await;
@@ -2208,5 +2450,16 @@ mod tests {
     fn unknown_ctx_is_not_ready() {
         // NULL usable_agent_ctx (pre-backfill / unknown) must not be trusted.
         assert!(!is_agent_ready(None, AGENT_MIN_CTX as i32));
+    }
+
+    #[test]
+    fn ram_headroom_gates_on_floor() {
+        let floor = REPROFILE_MIN_FREE_RAM_GB;
+        // Exactly at the floor is OK; below is refused; well above is OK.
+        assert!(ram_headroom_ok(floor, floor));
+        assert!(ram_headroom_ok(64.0, floor));
+        assert!(!ram_headroom_ok(floor - 0.1, floor));
+        // A memory-tight host (negative conservative free RAM) is refused.
+        assert!(!ram_headroom_ok(-2.0, floor));
     }
 }
