@@ -8448,3 +8448,14 @@ CREATE TABLE IF NOT EXISTS cortex_file_index (
 );
 CREATE INDEX IF NOT EXISTS idx_cortex_file_index_corpus ON cortex_file_index (corpus_slug);
 "#;
+
+/// V124: persist 1-based source line spans on Cortex symbol nodes so
+/// `ff cortex review` can refine its file-level change map to HUNK level —
+/// listing only the symbols whose bodies actually overlap the git-diff line
+/// ranges, instead of every symbol a changed file defines. Nullable: only
+/// `code:*` nodes set them; pre-existing nodes (and import/extern placeholders)
+/// stay NULL, in which case review degrades gracefully to file-level.
+pub const SCHEMA_V124_CORTEX_SYMBOL_LINES: &str = r#"
+ALTER TABLE brain_vault_nodes ADD COLUMN IF NOT EXISTS start_line INT;
+ALTER TABLE brain_vault_nodes ADD COLUMN IF NOT EXISTS end_line   INT;
+"#;
