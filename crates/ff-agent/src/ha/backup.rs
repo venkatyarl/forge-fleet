@@ -281,6 +281,15 @@ impl BackupOrchestrator {
         // fresh X25519 keypair and store it.
         let recipient = ensure_backup_keypair(&self.pg).await?;
 
+        // Ensure the `replicator` Postgres role exists before we shell
+        // pg_basebackup -U replicator. On a fresh / post-wipe DB the role is
+        // absent and every tick fails with `role "replicator" does not exist`
+        // (observed spamming the leader's daemon log after the Apr-18 DB
+        // wipe). Self-heal it here, mirroring ensure_backup_keypair, so the HA
+        // backup never depends on an operator hand-running
+        // deploy/sql/setup-replication.sql.
+        ensure_replication_role(&self.pg).await?;
+
         let ts = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
         let file_name = format!("pg-{ts}.tar.gz.age");
         let path = out_dir.join(&file_name);
@@ -294,9 +303,10 @@ impl BackupOrchestrator {
         // Using /bin/sh -c so the pipeline is handled by the shell and
         // we don't need to wire three tokio Commands together.
         let shell_cmd = format!(
-            "docker exec -e PGPASSWORD=replicator-default forgefleet-postgres \
+            "docker exec -e PGPASSWORD={pw} forgefleet-postgres \
                  pg_basebackup -h 127.0.0.1 -U replicator -D - -Ft -z -X fetch \
                  | age -r {recipient} > {out}",
+            pw = REPLICATOR_DEFAULT_PASSWORD,
             recipient = shell_quote(&recipient),
             out = shell_quote(&path.to_string_lossy()),
         );
@@ -689,6 +699,50 @@ fn shell_quote(s: &str) -> String {
     } else {
         format!("'{}'", s.replace('\'', "'\"'\"'"))
     }
+}
+
+/// Password the HA backup uses for the `replicator` role. Must match the
+/// `PGPASSWORD=replicator-default` literal in [`BackupOrchestrator::run_postgres`]
+/// and `deploy/sql/setup-replication.sql` — this is a node-local replication
+/// credential reachable only over the container's loopback (pg_hba scopes it),
+/// not a fleet-wide secret.
+const REPLICATOR_DEFAULT_PASSWORD: &str = "replicator-default";
+
+/// Ensure the `replicator` Postgres role exists so `pg_basebackup -U replicator`
+/// can run.
+///
+/// The HA backup connects as `replicator`; on a fresh or post-wipe primary the
+/// role is absent and every postgres backup tick fails with
+/// `role "replicator" does not exist`. This idempotently provisions it (the
+/// daemon connects as the DB owner/superuser, so it can `CREATE ROLE`), mirroring
+/// the self-provisioning of [`ensure_backup_keypair`]. No-op when the role
+/// already exists, so it's safe to call on every tick. The matching pg_hba
+/// `host replication` rule ships with the Postgres container image / deploy
+/// compose files, so only the role itself needs healing here.
+async fn ensure_replication_role(pool: &PgPool) -> Result<(), BackupError> {
+    let exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname = 'replicator')")
+            .fetch_one(pool)
+            .await?;
+    if exists {
+        return Ok(());
+    }
+
+    info!("provisioning Postgres `replicator` role for HA base-backup (first-run)");
+    // Password is a fixed literal (not user input) so the inline interpolation
+    // is injection-safe; quoted as a SQL string literal.
+    sqlx::query(&format!(
+        "CREATE ROLE replicator WITH REPLICATION LOGIN PASSWORD '{REPLICATOR_DEFAULT_PASSWORD}'"
+    ))
+    .execute(pool)
+    .await?;
+    // pg_basebackup itself uses the replication protocol, but match the
+    // canonical setup script so a `replicator`-authenticated logical read also
+    // works for any tooling that expects it.
+    sqlx::query("GRANT pg_read_all_data TO replicator")
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 /// Ensure the fleet has an `age` keypair available for backup encryption.
