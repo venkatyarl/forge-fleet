@@ -113,6 +113,7 @@ impl ToolRegistry {
         self.register(Self::cortex_callers());
         self.register(Self::cortex_callees());
         self.register(Self::cortex_impact());
+        self.register(Self::cortex_review());
 
         // ── Computer Use (Pillar 1) ─────────────────────────────────────
         self.register(Self::computer_use());
@@ -907,6 +908,36 @@ impl ToolRegistry {
         }
     }
 
+    fn cortex_review() -> ToolDefinition {
+        ToolDefinition {
+            name: "cortex_review".to_string(),
+            description: "Cortex change-aware code review: shell `git diff` in a repo checkout and score every changed file against the code graph so you know WHERE TO LOOK FIRST. Each changed symbol gets its fan-in (direct callers), external fan-in (cross-file callers = de-facto API surface), transitive blast radius, and a High/Med/Low risk tier; files are ranked riskiest-first. Use before reviewing a diff instead of reading whole files.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "corpus": {
+                        "type": "string",
+                        "description": "Indexed repo slug (see cortex_corpora), e.g. 'forge-fleet'"
+                    },
+                    "repo_dir": {
+                        "type": "string",
+                        "description": "Absolute path to the git checkout that was indexed (the daemon shells git here)"
+                    },
+                    "base": {
+                        "type": "string",
+                        "description": "Optional base ref. With it, reviews the branch's own commits (base...HEAD) plus uncommitted edits; without it, just uncommitted work (staged+unstaged+untracked) vs HEAD."
+                    },
+                    "depth": {
+                        "type": "integer",
+                        "description": "Max transitive blast-radius hops (1-20, default 5)",
+                        "default": 5
+                    }
+                },
+                "required": ["corpus", "repo_dir"]
+            }),
+        }
+    }
+
     fn brain_search() -> ToolDefinition {
         ToolDefinition {
             name: "brain_search".to_string(),
@@ -1238,6 +1269,7 @@ mod tests {
             "cortex_callers",
             "cortex_callees",
             "cortex_impact",
+            "cortex_review",
             // Pillar 1 — Computer Use (PR-H, #37)
             "computer_use",
         ];

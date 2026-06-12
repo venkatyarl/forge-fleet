@@ -165,18 +165,6 @@ fn slug_from_path(p: &Path) -> String {
     }
 }
 
-/// Map a file extension to a Cortex language name (None = ignored).
-fn ext_lang(ext: &str) -> Option<&'static str> {
-    match ext {
-        "rs" => Some("rust"),
-        "ts" | "tsx" | "mts" | "cts" => Some("typescript"),
-        "js" | "jsx" | "mjs" | "cjs" => Some("javascript"),
-        "java" => Some("java"),
-        "py" => Some("python"),
-        _ => None,
-    }
-}
-
 /// Walk the tree (bounded) counting source files per language so we can pick the
 /// dominant one(s). Skips the usual heavy / vendored dirs.
 fn detect_languages(root: &Path) -> Vec<(String, usize)> {
@@ -221,7 +209,7 @@ fn detect_languages(root: &Path) -> Vec<(String, usize)> {
                 }
             } else if ft.is_file() {
                 if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                    if let Some(lang) = ext_lang(ext) {
+                    if let Some(lang) = cortex::ext_lang(ext) {
                         *counts.entry(lang).or_insert(0) += 1;
                     }
                 }
@@ -406,7 +394,7 @@ async fn run_review(
             Path::new(rel)
                 .extension()
                 .and_then(|e| e.to_str())
-                .and_then(ext_lang)
+                .and_then(cortex::ext_lang)
                 .map(|l| cortex::SUPPORTED_LANGS.contains(&l))
                 .unwrap_or(false)
         })
@@ -599,59 +587,12 @@ fn git_changed_line_ranges(
         ));
     }
     let diff = String::from_utf8_lossy(&out.stdout);
-    let by_rel = parse_diff_line_ranges(&diff);
+    let by_rel = cortex::parse_diff_line_ranges(&diff);
     // Map repo-relative → absolute (the key form review() matches on).
     Ok(by_rel
         .into_iter()
         .map(|(rel, ranges)| (root.join(rel).to_string_lossy().to_string(), ranges))
         .collect())
-}
-
-/// Parse a unified `git diff` (use `--unified=0` for tight hunks) into the
-/// new-file line ranges it touched, keyed by repo-relative path. Reads `+++ b/<p>`
-/// for the path and the `+c,d` side of each `@@ -a,b +c,d @@` header. A pure-text
-/// function so it's unit-testable without a repo. Pure additions (`+c,d`),
-/// modifications, and deletions (`+c,0` → records line `c` so a deleted body
-/// still flags its enclosing symbol) are all covered.
-fn parse_diff_line_ranges(diff: &str) -> std::collections::HashMap<String, Vec<(u32, u32)>> {
-    let mut map: std::collections::HashMap<String, Vec<(u32, u32)>> =
-        std::collections::HashMap::new();
-    let mut cur: Option<String> = None;
-    for line in diff.lines() {
-        if let Some(rest) = line.strip_prefix("+++ ") {
-            // "+++ b/path" (or "+++ /dev/null" for a deletion).
-            cur = rest
-                .strip_prefix("b/")
-                .filter(|p| *p != "/dev/null")
-                .map(|p| p.to_string());
-        } else if let Some(h) = line.strip_prefix("@@") {
-            // "@@ -a,b +c,d @@ ...": take the +c,d span.
-            if let (Some(path), Some((start, count))) = (cur.as_ref(), parse_hunk_new_span(h)) {
-                // count==0 (pure deletion) still touches the line at `start`.
-                let len = count.max(1);
-                let end = start.saturating_add(len - 1);
-                map.entry(path.clone()).or_default().push((start, end));
-            }
-        }
-    }
-    map
-}
-
-/// Extract the `(start, count)` of the `+c,d` side of a hunk header body (the
-/// text after the leading `@@`). `+c` alone means count 1. Returns None if no
-/// `+` field is present.
-fn parse_hunk_new_span(header_body: &str) -> Option<(u32, u32)> {
-    let plus = header_body
-        .split_whitespace()
-        .find(|t| t.starts_with('+'))?;
-    let spec = plus.trim_start_matches('+');
-    let mut parts = spec.split(',');
-    let start: u32 = parts.next()?.parse().ok()?;
-    let count: u32 = match parts.next() {
-        Some(c) => c.parse().ok()?,
-        None => 1,
-    };
-    Some((start, count))
 }
 
 /// Derive the corpus slug for the current working directory (same rule as
@@ -1175,53 +1116,6 @@ fn is_watchable(p: &Path) -> bool {
     }
     p.extension()
         .and_then(|e| e.to_str())
-        .map(|ext| ext_lang(ext).is_some())
+        .map(|ext| cortex::ext_lang(ext).is_some())
         .unwrap_or(false)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn hunk_new_span_parses_count_and_default() {
-        assert_eq!(parse_hunk_new_span(" -1,4 +10,3 @@ fn foo"), Some((10, 3)));
-        assert_eq!(parse_hunk_new_span(" -5 +12 @@"), Some((12, 1))); // no count ⇒ 1
-        assert_eq!(parse_hunk_new_span(" -1,2 +0,0 @@"), Some((0, 0))); // pure deletion
-        assert_eq!(parse_hunk_new_span(" -1,2 @@"), None); // no + side
-    }
-
-    #[test]
-    fn diff_line_ranges_extracts_new_side() {
-        let diff = "\
-diff --git a/src/a.rs b/src/a.rs
-index 111..222 100644
---- a/src/a.rs
-+++ b/src/a.rs
-@@ -10,2 +10,3 @@ fn alpha() {
-+    let x = 1;
-@@ -40,0 +42,5 @@ fn beta() {
-+    more();
-diff --git a/src/b.rs b/src/b.rs
---- a/src/b.rs
-+++ b/src/b.rs
-@@ -7,3 +7,0 @@ fn gone() {
-";
-        let m = parse_diff_line_ranges(diff);
-        // a.rs: +10,3 → 10..=12 ; +42,5 → 42..=46
-        assert_eq!(m.get("src/a.rs").unwrap(), &vec![(10, 12), (42, 46)]);
-        // b.rs: pure deletion +7,0 → still flags line 7 (enclosing symbol).
-        assert_eq!(m.get("src/b.rs").unwrap(), &vec![(7, 7)]);
-    }
-
-    #[test]
-    fn diff_line_ranges_skips_dev_null_target() {
-        // A fully deleted file (+++ /dev/null) yields no entry.
-        let diff = "\
---- a/src/dead.rs
-+++ /dev/null
-@@ -1,3 +0,0 @@
-";
-        assert!(parse_diff_line_ranges(diff).is_empty());
-    }
 }
