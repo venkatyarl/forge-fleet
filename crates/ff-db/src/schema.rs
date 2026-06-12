@@ -8428,3 +8428,23 @@ CREATE INDEX IF NOT EXISTS idx_ff_interactions_session   ON ff_interactions (ses
 CREATE INDEX IF NOT EXISTS idx_ff_interactions_error     ON ff_interactions (error_signature) WHERE outcome = 'error';
 CREATE INDEX IF NOT EXISTS idx_ff_interactions_engine    ON ff_interactions (engine, outcome);
 "#;
+
+/// Per-file content-hash ledger so Cortex can reindex only changed files.
+///
+/// `ff cortex index` scans the corpus (updating each `content:file` node's
+/// `content_hash`) then re-extracts. The full path rewipes every `code:*` node
+/// each run; with this ledger the `--incremental` path compares the corpus
+/// scan's current `content_hash` against the hash Cortex last indexed the file
+/// at, and only re-extracts files that differ (plus deletes symbols of removed
+/// files). `indexed_hash` mirrors the scan's `cheap_hash` (path+size+mtime).
+/// Internal text-ID columns use COLLATE "C" so ON CONFLICT stays collation-safe.
+pub const SCHEMA_V123_CORTEX_FILE_INDEX: &str = r#"
+CREATE TABLE IF NOT EXISTS cortex_file_index (
+    corpus_slug   TEXT COLLATE "C" NOT NULL,
+    file_path     TEXT COLLATE "C" NOT NULL,
+    indexed_hash  TEXT NOT NULL,
+    indexed_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (corpus_slug, file_path)
+);
+CREATE INDEX IF NOT EXISTS idx_cortex_file_index_corpus ON cortex_file_index (corpus_slug);
+"#;
