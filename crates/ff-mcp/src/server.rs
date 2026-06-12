@@ -122,6 +122,10 @@ impl McpServer {
                      • `fleet_install_model`, `fleet_scan` — manage local models.\n\
                      • `fleet_ssh` — run a shell command on a fleet computer.\n\
                      • `brain_*` — knowledge graph (search, vault read, threads).\n\
+                     • `cortex_*` — pre-indexed code graph. `cortex_corpora` lists\n\
+                       indexed repos; `cortex_callers`/`cortex_callees`/`cortex_impact`\n\
+                       answer who-calls / what-it-calls / blast-radius for a symbol —\n\
+                       token-cheaper than grepping for call sites.\n\
                      • `computer_use` — browser/screenshot on a fleet computer.\n\
                      \n\
                      The fleet has idle local capacity (15 computers, mix of macOS / \n\
