@@ -361,7 +361,20 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
             json,
         } => {
             ensure_known_node(&pool, node.as_deref()).await?;
-            let rows = ff_db::pg_list_library(&pool, node.as_deref()).await?;
+            let mut rows = ff_db::pg_list_library(&pool, node.as_deref()).await?;
+            // Sort by primary IP (subnet order) so this per-computer table reads
+            // like `ff fleet health`/`nodes`. The structs carry only a worker
+            // name, so resolve names→IPs via the computers table. Stable sort →
+            // the SQL `ORDER BY worker_name, catalog_id` holds within an IP.
+            let ip_by_name = crate::helpers::name_to_primary_ip(&pool).await?;
+            rows.sort_by_key(|r| {
+                crate::helpers::ip_sort_key(
+                    ip_by_name
+                        .get(&r.worker_name)
+                        .map(String::as_str)
+                        .unwrap_or(""),
+                )
+            });
             if json {
                 let out: Vec<_> = rows
                     .iter()
@@ -417,7 +430,19 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
             json,
         } => {
             ensure_known_node(&pool, node.as_deref()).await?;
-            let rows = ff_db::pg_list_deployments(&pool, node.as_deref()).await?;
+            let mut rows = ff_db::pg_list_deployments(&pool, node.as_deref()).await?;
+            // Sort by primary IP (subnet order), matching every other
+            // per-computer table. Names→IPs via the computers table; stable sort
+            // keeps the SQL `ORDER BY worker_name, port` order within an IP.
+            let ip_by_name = crate::helpers::name_to_primary_ip(&pool).await?;
+            rows.sort_by_key(|r| {
+                crate::helpers::ip_sort_key(
+                    ip_by_name
+                        .get(&r.worker_name)
+                        .map(String::as_str)
+                        .unwrap_or(""),
+                )
+            });
             if json {
                 let out: Vec<_> = rows
                     .iter()

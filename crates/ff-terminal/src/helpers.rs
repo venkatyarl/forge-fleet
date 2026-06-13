@@ -270,6 +270,29 @@ pub(crate) fn sort_rows_by_primary_ip(rows: &mut [sqlx::postgres::PgRow]) {
     });
 }
 
+/// Build a `worker_name → primary_ip` map from the `computers` table. Used to
+/// IP-sort listings whose rows carry only a worker name (e.g. the model
+/// library/deployments structs returned by `ff_db`), so they read in subnet
+/// order like every other per-computer table. A computer with a NULL
+/// `primary_ip`, or a worker name absent from `computers`, resolves to an empty
+/// string — which `ip_sort_key` sends to the end.
+pub(crate) async fn name_to_primary_ip(
+    pool: &sqlx::PgPool,
+) -> Result<std::collections::HashMap<String, String>> {
+    use sqlx::Row;
+    let rows = sqlx::query("SELECT name, primary_ip FROM computers")
+        .fetch_all(pool)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            let name: String = r.get("name");
+            let ip: Option<String> = r.try_get("primary_ip").ok().flatten();
+            (name, ip.unwrap_or_default())
+        })
+        .collect())
+}
+
 /// Detect the OS family of the current host.
 pub fn detect_os_family() -> String {
     if cfg!(target_os = "macos") {
@@ -317,5 +340,27 @@ mod tests {
         assert_eq!(ip_sort_key(""), u32::MAX);
         assert_eq!(ip_sort_key("::1"), u32::MAX);
         assert!(ip_sort_key("192.168.5.119") < ip_sort_key("not-an-ip"));
+    }
+
+    #[test]
+    fn name_ip_map_sort_orders_by_subnet_then_preserves_secondary() {
+        use std::collections::HashMap;
+        // Mirrors the inline sort in `ff model deployments`/`library`: rows carry
+        // only a worker name, resolved to an IP via a name→primary_ip map. A name
+        // missing from the map (e.g. a deployment whose computer row was pruned)
+        // has no IP → parks last; the stable sort keeps the pre-sort order (the
+        // SQL `ORDER BY worker_name, …`) within an equal IP.
+        let ip_by_name: HashMap<&str, &str> = HashMap::from([
+            ("taylor", "192.168.5.100"),
+            ("james", "192.168.5.108"),
+            ("sia", "192.168.5.116"),
+            ("aura", ""), // present but NULL primary_ip → sorts last
+        ]);
+        // Pre-sorted by name (what the DB returns); ghost has no map entry.
+        let mut rows = vec!["aura", "ghost", "james", "sia", "taylor"];
+        rows.sort_by_key(|name| ip_sort_key(ip_by_name.get(name).copied().unwrap_or("")));
+        // taylor(.100) < james(.108) < sia(.116) < {aura,ghost} both u32::MAX,
+        // and among the ties the original name order (aura before ghost) holds.
+        assert_eq!(rows, vec!["taylor", "james", "sia", "aura", "ghost"]);
     }
 }
