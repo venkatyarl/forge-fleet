@@ -4354,7 +4354,27 @@ fn is_prose_function_word(t: &str) -> bool {
 /// harmless one-line message pointing at `ff run`, while a false dispatch arms a
 /// fleet LLM agent with shell access on a mistake — so terse imperative prompts
 /// (`ff fix tests`) are asked to use `ff run`.
-fn free_prompt_command_guard(tokens: &[String]) -> Option<String> {
+fn free_prompt_command_guard(input: &[String]) -> Option<String> {
+    // Normalize quoting / word-splitting differences before applying the shape
+    // heuristics. A prompt can reach here as separate argv tokens
+    // (`ff model library --json`) OR glued into fewer args with internal
+    // whitespace (`ff "model library" --json`, a script's `ff "$cmd"`, or zsh's
+    // non-splitting `ff $var`). `is_command_word` rejects any token containing a
+    // space, so a command-shaped phrase hidden inside ONE quoted arg used to slip
+    // past every check and silently dispatch a fleet agent — including the
+    // dangerous `ff "db psql -c …"` case the guard was built to stop. Splitting
+    // each token on whitespace makes the guard quoting-invariant: the three forms
+    // above all produce the same words. (For inputs that are already individual
+    // whitespace-free tokens this is the identity, so existing behavior is
+    // unchanged.)
+    let tokens: Vec<String> = input
+        .iter()
+        .flat_map(|t| t.split_whitespace().map(str::to_string))
+        .collect();
+    if tokens.is_empty() {
+        return None;
+    }
+    let tokens = tokens.as_slice();
     let wants_help = tokens.iter().any(|t| t == "--help" || t == "-h");
 
     // A "command-shaped" token is a bare identifier clap could plausibly parse
@@ -4510,6 +4530,35 @@ mod free_prompt_guard_tests {
             msg.contains("tasks"),
             "expected 'tasks' suggestion in: {msg}"
         );
+    }
+
+    #[test]
+    fn command_shaped_input_glued_into_one_arg_is_refused() {
+        // The iter-59 dogfood finding: in zsh `ff $var` does NOT word-split, and a
+        // script's `ff "$cmd"` passes a whole phrase as ONE argv token. A
+        // command-shaped phrase hidden inside one quoted arg used to slip past
+        // `is_command_word` (which rejects spaces) and silently dispatch a fleet
+        // agent — the exact `ff "model library" --json` repro that burned agent
+        // runs, and the dangerous `ff "db psql -c …"` case. The guard must be
+        // quoting-invariant: these must refuse just like their split forms.
+        assert!(free_prompt_command_guard(&toks(&["model library", "--json"])).is_some());
+        assert!(free_prompt_command_guard(&toks(&["model library --json"])).is_some());
+        assert!(free_prompt_command_guard(&toks(&["fleet health"])).is_some());
+        assert!(free_prompt_command_guard(&toks(&["db psql -c select 1"])).is_some());
+        // Suggestion + escape hatch survive the split (first sub-word drives them).
+        let msg = free_prompt_command_guard(&toks(&["model library", "--json"])).unwrap();
+        assert!(msg.contains("model"), "got: {msg}");
+        assert!(msg.contains("ff run"), "got: {msg}");
+    }
+
+    #[test]
+    fn natural_language_glued_into_one_arg_still_passes() {
+        // The flip side: a genuine prose prompt passed as a single quoted arg
+        // (`ff "summarize the fleet"`) must STILL dispatch — splitting on
+        // whitespace reveals its function word ("the"), so it passes exactly as
+        // the multi-arg form does. Quoting must not change the verdict.
+        assert!(free_prompt_command_guard(&toks(&["summarize the fleet state"])).is_none());
+        assert!(free_prompt_command_guard(&toks(&["what is running on the fleet"])).is_none());
     }
 }
 
