@@ -51,8 +51,59 @@ pub async fn handle_cortex(pool: &PgPool, cmd: crate::CortexCommand) -> Result<(
                 &format!("impact of {symbol} (depth {max_depth})"),
             );
         }
+        crate::CortexCommand::Tests {
+            corpus,
+            symbol,
+            max_depth,
+            format,
+        } => {
+            let rows = cortex::tests_for(pool, &corpus, &symbol, max_depth).await?;
+            print_tests(
+                &rows,
+                &format,
+                &format!("tests covering {symbol} (depth {max_depth})"),
+            );
+        }
     }
     Ok(())
+}
+
+/// Render `ff cortex tests` hits. `table` shows depth + location + the test's
+/// qualified name (nearest-first); `json` emits the full records; `names` lists
+/// just the qualified names. An empty result is surfaced as a coverage gap.
+fn print_tests(rows: &[cortex::TestHit], format: &str, label: &str) {
+    match format {
+        "json" => {
+            let v: Vec<_> = rows
+                .iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "id": r.id,
+                        "qualified_name": r.qualified_name,
+                        "file": r.file,
+                        "depth": r.depth,
+                    })
+                })
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+        }
+        "names" => {
+            for r in rows {
+                println!("{}", r.qualified_name);
+            }
+        }
+        _ => {
+            if rows.is_empty() {
+                println!("{CYAN}{label} \u{2014} no covering tests found (coverage gap){RESET}");
+                return;
+            }
+            println!("{CYAN}{} \u{2014} {} test(s):{RESET}", label, rows.len());
+            for r in rows {
+                let loc = r.file.as_deref().unwrap_or("?");
+                println!("  [d{}] {}  ({})", r.depth, r.qualified_name, loc);
+            }
+        }
+    }
 }
 
 fn print_symbols(rows: &[cortex::SymbolRef], format: &str, label: &str) {

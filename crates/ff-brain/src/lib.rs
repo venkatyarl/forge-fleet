@@ -37,8 +37,8 @@ pub use community_summary::{
 };
 pub use context::{BrainMessage, ContextBundle, ResolvedNode, select_context};
 pub use cortex::{
-    CortexStats, SymbolHit, SymbolRef, callees, callers, find_symbols, find_symbols_semantic,
-    impact, index,
+    CortexStats, SymbolHit, SymbolRef, TestHit, callees, callers, find_symbols,
+    find_symbols_semantic, impact, index, tests_for,
 };
 pub use cortex_embed::{EmbedStats, embed_cortex_nodes};
 pub use embeddings::{

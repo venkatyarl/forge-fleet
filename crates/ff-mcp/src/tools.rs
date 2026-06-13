@@ -114,6 +114,7 @@ impl ToolRegistry {
         self.register(Self::cortex_callers());
         self.register(Self::cortex_callees());
         self.register(Self::cortex_impact());
+        self.register(Self::cortex_tests());
         self.register(Self::cortex_review());
 
         // ── Computer Use (Pillar 1) ─────────────────────────────────────
@@ -944,6 +945,32 @@ impl ToolRegistry {
         }
     }
 
+    fn cortex_tests() -> ToolDefinition {
+        ToolDefinition {
+            name: "cortex_tests".to_string(),
+            description: "Cortex code graph: which tests cover a code symbol — the transitive caller closure filtered to callers that are tests (test-file path or test-named symbol), ranked nearest-first (depth 1 = a test calls it directly). An empty result is a coverage gap. Use to check whether a risky change is tested without grepping the test tree.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "corpus": {
+                        "type": "string",
+                        "description": "Indexed repo slug (see cortex_corpora), e.g. 'forge-fleet'"
+                    },
+                    "symbol": {
+                        "type": "string",
+                        "description": "Code symbol — bare leaf or qualified name"
+                    },
+                    "max_depth": {
+                        "type": "integer",
+                        "description": "Max transitive hops to search for a covering test (1-20, default 5)",
+                        "default": 5
+                    }
+                },
+                "required": ["corpus", "symbol"]
+            }),
+        }
+    }
+
     fn cortex_review() -> ToolDefinition {
         ToolDefinition {
             name: "cortex_review".to_string(),
@@ -1306,6 +1333,7 @@ mod tests {
             "cortex_callers",
             "cortex_callees",
             "cortex_impact",
+            "cortex_tests",
             "cortex_review",
             // Pillar 1 — Computer Use (PR-H, #37)
             "computer_use",

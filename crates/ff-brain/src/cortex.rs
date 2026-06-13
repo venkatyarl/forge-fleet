@@ -943,6 +943,175 @@ async fn impact_of_ids(
     Ok(out)
 }
 
+// ─── Test-coverage mapping (ff cortex tests / tests_for) ─────────────────────
+//
+// CRG exposes `tests_for`; Cortex did not. The question an agent (or a reviewer
+// touching a risky symbol) actually asks is "which tests exercise this?" — the
+// answer is the transitive caller closure (same reverse-`calls` BFS as `impact`)
+// filtered to the callers that ARE tests. Cortex stores no test attribute, so a
+// test is detected heuristically from its owning file path and symbol name —
+// robust across rust/ts/js/python/java without an index-time schema change.
+
+/// A test function that (transitively) exercises a target symbol.
+#[derive(Debug, Clone)]
+pub struct TestHit {
+    pub id: Uuid,
+    pub qualified_name: String,
+    /// Absolute path of the owning test file.
+    pub file: Option<String>,
+    /// Call-graph distance from the target: 1 = the test calls it directly, 2 =
+    /// the test calls something that calls it, … Lower = stronger coverage.
+    pub depth: usize,
+}
+
+/// Does this file path look like a test file? Cross-language heuristic over the
+/// (case-insensitive) path: common test directories plus per-language basename
+/// conventions. A discovery aid, not a correctness gate — favours recall, so a
+/// stray non-test file matching e.g. `*Test.java` is acceptable.
+pub fn is_test_file(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    // Directory conventions (any language).
+    if lower.contains("/tests/")
+        || lower.contains("/test/")
+        || lower.contains("/__tests__/")
+        || lower.contains("/spec/")
+    {
+        return true;
+    }
+    let base = lower.rsplit('/').next().unwrap_or(&lower);
+    // Rust integration / unit files.
+    if base.ends_with("_test.rs") || base.ends_with("_tests.rs") {
+        return true;
+    }
+    // JS / TS (.test.* and .spec.*).
+    for ext in [
+        ".test.ts",
+        ".test.tsx",
+        ".test.js",
+        ".test.jsx",
+        ".spec.ts",
+        ".spec.tsx",
+        ".spec.js",
+        ".spec.jsx",
+    ] {
+        if base.ends_with(ext) {
+            return true;
+        }
+    }
+    // Python (pytest / unittest).
+    if (base.starts_with("test_") && base.ends_with(".py")) || base.ends_with("_test.py") {
+        return true;
+    }
+    // Java (JUnit: FooTest.java / FooTests.java / FooSpec.java).
+    if base.ends_with("test.java") || base.ends_with("tests.java") || base.ends_with("spec.java") {
+        return true;
+    }
+    false
+}
+
+/// Does this symbol look like a test? True when its owning file is a test file,
+/// or its qualified name carries an in-source test convention: a Rust
+/// `#[cfg(test)] mod tests`/`mod test` (`::tests::` / `::test::` in the path) or
+/// a `test_`-prefixed leaf (rust/python). Catches inline test modules that live
+/// in an otherwise-non-test file.
+pub fn is_test_symbol(qualified_name: &str, file: Option<&str>) -> bool {
+    if file.map(is_test_file).unwrap_or(false) {
+        return true;
+    }
+    if qualified_name.contains("::tests::") || qualified_name.contains("::test::") {
+        return true;
+    }
+    // Last `::`- or `.`-delimited segment (handles rust paths and dotted langs).
+    let leaf = qualified_name
+        .rsplit("::")
+        .next()
+        .unwrap_or(qualified_name)
+        .rsplit('.')
+        .next()
+        .unwrap_or(qualified_name);
+    leaf.starts_with("test_")
+}
+
+/// Find the test functions that cover `sel`: walk the transitive caller closure
+/// (the same reverse-`calls` BFS as [`impact`], restricted to `code:function`
+/// nodes) and keep the callers that look like tests ([`is_test_symbol`]). Ranked
+/// nearest-first (a direct test caller is stronger coverage than a 5-hop
+/// transitive one), then by name. An empty result means no *resolved* test→symbol
+/// call edge reaches it within `max_depth` hops — usually a coverage gap, but note
+/// it inherits the call graph's resolution limits (e.g. Rust calls made inside a
+/// macro — `assert_eq!(foo(), …)` — are not parsed into call edges, so a
+/// macro-only-tested Rust fn reads as uncovered; Java/TS/Python method calls
+/// resolve directly).
+pub async fn tests_for(
+    pool: &PgPool,
+    corpus_slug: &str,
+    sel: &str,
+    max_depth: usize,
+) -> Result<Vec<TestHit>> {
+    let seed = resolve_symbol(pool, corpus_slug, sel).await?;
+    if seed.is_empty() {
+        anyhow::bail!("no symbol matching '{sel}' in corpus '{corpus_slug}'");
+    }
+    let max_depth = max_depth.clamp(1, 20);
+    let seed_ids: Vec<Uuid> = seed.iter().map(|s| s.id).collect();
+
+    // Reverse BFS over `calls` edges, recording the depth at which each caller is
+    // first reached (its shortest call distance from the seed).
+    let mut frontier: Vec<Uuid> = seed_ids.clone();
+    let mut seen: HashSet<Uuid> = frontier.iter().copied().collect();
+    let mut callers: Vec<(Uuid, String, usize)> = Vec::new();
+    for depth in 1..=max_depth {
+        if frontier.is_empty() {
+            break;
+        }
+        let rows = sqlx::query(
+            r#"SELECT DISTINCT n.id, n.title
+                 FROM brain_vault_edges e
+                 JOIN brain_vault_nodes n ON n.id = e.src_id
+                WHERE e.edge_type = 'calls' AND e.dst_id = ANY($1)
+                  AND n.node_type = 'code:function'"#,
+        )
+        .bind(&frontier)
+        .fetch_all(pool)
+        .await?;
+        let mut next: Vec<Uuid> = Vec::new();
+        for r in rows {
+            let id: Uuid = r.get("id");
+            if seen.insert(id) {
+                callers.push((id, r.get("title"), depth));
+                next.push(id);
+            }
+        }
+        frontier = next;
+    }
+
+    // Resolve owning files once, then keep only the test callers.
+    let ids: Vec<Uuid> = callers.iter().map(|(id, _, _)| *id).collect();
+    let files = owning_files(pool, &ids).await?;
+    let mut out: Vec<TestHit> = callers
+        .into_iter()
+        .filter_map(|(id, qn, depth)| {
+            let file = files.get(&id).cloned();
+            if is_test_symbol(&qn, file.as_deref()) {
+                Some(TestHit {
+                    id,
+                    qualified_name: qn,
+                    file,
+                    depth,
+                })
+            } else {
+                None
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        a.depth
+            .cmp(&b.depth)
+            .then(a.qualified_name.cmp(&b.qualified_name))
+    });
+    Ok(out)
+}
+
 // ─── Symbol discovery (ff cortex find) ───────────────────────────────────────
 //
 // callers/callees/impact all require the caller to already know a symbol's
@@ -1085,8 +1254,21 @@ pub async fn find_symbols(
 /// and semantic `find_symbols*` paths.
 async fn resolve_hit_files(pool: &PgPool, hits: &mut [SymbolHit]) -> Result<()> {
     let ids: Vec<Uuid> = hits.iter().map(|h| h.id).collect();
+    let by_leaf = owning_files(pool, &ids).await?;
+    for h in hits.iter_mut() {
+        h.file = by_leaf.get(&h.id).cloned();
+    }
+    Ok(())
+}
+
+/// For each of `ids`, the absolute path of the `content:file` node that
+/// (transitively, via `contains` edges) owns it — walking UP from the symbol
+/// through any nesting (`file → impl/mod → symbol`). Symbols with no owning file
+/// (extern/import placeholders) are simply absent from the map. Shared by
+/// [`resolve_hit_files`] and [`tests_for`].
+async fn owning_files(pool: &PgPool, ids: &[Uuid]) -> Result<HashMap<Uuid, String>> {
     if ids.is_empty() {
-        return Ok(());
+        return Ok(HashMap::new());
     }
     let file_rows = sqlx::query(
         r#"WITH RECURSIVE up AS (
@@ -1103,17 +1285,14 @@ async fn resolve_hit_files(pool: &PgPool, hits: &mut [SymbolHit]) -> Result<()> 
               FROM up JOIN brain_vault_nodes n ON n.id = up.anc
              WHERE n.node_type = 'content:file'"#,
     )
-    .bind(&ids)
+    .bind(ids)
     .fetch_all(pool)
     .await?;
     let mut by_leaf: HashMap<Uuid, String> = HashMap::new();
     for r in file_rows {
         by_leaf.insert(r.get("leaf"), r.get("path"));
     }
-    for h in hits.iter_mut() {
-        h.file = by_leaf.get(&h.id).cloned();
-    }
-    Ok(())
+    Ok(by_leaf)
 }
 
 /// Map a pgvector `<->` distance to a bounded 0..=1 similarity (higher = closer),
@@ -3218,6 +3397,57 @@ mod tests {
         assert!(far > 0.0 && near <= 1.0);
         // Negative distance can't push the score above 1 (defensive clamp).
         assert_eq!(similarity_from_distance(-0.1), 1.0);
+    }
+
+    #[test]
+    fn is_test_file_matches_cross_language_conventions() {
+        // Directory conventions.
+        assert!(is_test_file("crates/ff-db/tests/migrations.rs"));
+        assert!(is_test_file("src/__tests__/button.ts"));
+        assert!(is_test_file("app/spec/models/user.rb"));
+        // Rust unit/integration basenames.
+        assert!(is_test_file("crates/ff-brain/src/cortex_test.rs"));
+        assert!(is_test_file("src/router_tests.rs"));
+        // JS / TS.
+        assert!(is_test_file("dashboard/src/Login.test.tsx"));
+        assert!(is_test_file("web/auth.spec.js"));
+        // Python.
+        assert!(is_test_file("svc/test_router.py"));
+        assert!(is_test_file("svc/router_test.py"));
+        // Java.
+        assert!(is_test_file("src/test/java/com/x/UserServiceTest.java"));
+        assert!(is_test_file("ConsentSpec.java"));
+        // Non-tests stay out.
+        assert!(!is_test_file("crates/ff-brain/src/cortex.rs"));
+        assert!(!is_test_file("dashboard/src/Login.tsx"));
+        assert!(!is_test_file("svc/router.py"));
+        assert!(!is_test_file("src/main/java/com/x/UserService.java"));
+        // Case-insensitive.
+        assert!(is_test_file("SRC/Tests/Foo.RS".to_string().as_str()));
+    }
+
+    #[test]
+    fn is_test_symbol_uses_file_and_name_conventions() {
+        // Test-file path wins regardless of name.
+        assert!(is_test_symbol(
+            "ff_brain::router::helper",
+            Some("crates/ff-brain/tests/router.rs")
+        ));
+        // Rust inline `#[cfg(test)] mod tests` shows up as `::tests::` in the path,
+        // even when the owning file is ordinary source.
+        assert!(is_test_symbol(
+            "ff_brain::cortex::tests::escape_like_neutralizes_wildcards",
+            Some("crates/ff-brain/src/cortex.rs")
+        ));
+        // `test_`-prefixed leaf (rust/python), non-test file.
+        assert!(is_test_symbol("svc.router.test_route_picks_host", None));
+        // A normal symbol in a normal file is not a test.
+        assert!(!is_test_symbol(
+            "ff_brain::cortex::find_symbols",
+            Some("crates/ff-brain/src/cortex.rs")
+        ));
+        // `testing` is not `test_` — no false positive on the prefix.
+        assert!(!is_test_symbol("ff_core::testing_utils", None));
     }
 
     #[test]
