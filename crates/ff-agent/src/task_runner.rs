@@ -24,6 +24,7 @@
 //! `result.stdout` / `result.stderr`; exit code into `result.exit`.
 
 use std::collections::HashSet;
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -86,6 +87,8 @@ pub enum TaskRunnerError {
     BadPayload(String),
     #[error("unsupported task_type: {0}")]
     UnsupportedType(String),
+    #[error("task exceeded max duration of {0}s")]
+    Timeout(u64),
 }
 
 /// Per-computer worker that polls `fleet_tasks` and runs shell payloads.
@@ -539,18 +542,14 @@ impl TaskRunner {
             .map(Duration::from_secs)
             .or_else(|| timeout_secs.map(|s| Duration::from_secs(s as u64)))
             .unwrap_or(MAX_TASK_DURATION);
-        let outcome = match tokio::time::timeout(
-            max_duration,
-            run_shell_payload(&payload, &self.env),
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => Err(TaskRunnerError::BadPayload(format!(
-                "task exceeded max duration of {}s",
-                max_duration.as_secs()
-            ))),
-        };
+        // The timeout lives INSIDE run_shell_payload now: on elapse it
+        // SIGKILLs the whole process GROUP (shell + every descendant),
+        // not just the direct child. A plain outer `tokio::time::timeout`
+        // here would drop the future → kill_on_drop reaps only the direct
+        // `bash`, orphaning any ssh/git/rsync/cargo grandchildren — the
+        // exact leak that wedged priya/sophie (stuck rsync + days-old
+        // `git fetch` processes) until every subsequent task hit the cap.
+        let outcome = run_shell_payload(&payload, &self.env, max_duration).await;
         let _ = cancel_tx.send(());
         let _ = hb_task.await;
 
@@ -1094,6 +1093,7 @@ pub async fn pg_enqueue_pr_merge_task(
 async fn run_shell_payload(
     payload: &Value,
     env: &[(String, String)],
+    max_duration: Duration,
 ) -> Result<Value, TaskRunnerError> {
     let command = payload
         .get("command")
@@ -1130,34 +1130,111 @@ async fn run_shell_payload(
         )));
     }
 
-    // Use tokio::process so the child can actually be killed if the
-    // outer Future is dropped (e.g. by tokio::time::timeout). The
-    // `kill_on_drop(true)` flag makes the runtime SIGKILL the child
-    // when the Child handle is dropped — closes the
-    // heartbeat-fresh-but-stuck-forever class of bug documented in
-    // feedback_priya_worker_hangs_with_fresh_heartbeat.md.
+    // Use tokio::process so the child can actually be killed when the
+    // task times out. Two hardening measures work together here:
+    //
+    //  1. `process_group(0)` puts the shell into its OWN process group
+    //     (it becomes the group leader, pgid == its pid). Every
+    //     descendant it forks — ssh, git, rsync, cargo, a relaunched
+    //     model server — joins that group unless it deliberately
+    //     re-`setsid`s out (which legitimately-detached daemons do).
+    //
+    //  2. On timeout we SIGKILL the whole group (`kill(-pgid)`), not
+    //     just the direct child. `kill_on_drop(true)` only reaps the
+    //     immediate `bash`; a build playbook's grandchildren would be
+    //     orphaned and run forever. That is the leak that wedged
+    //     priya/sophie — `output()` blocks until the stdout/stderr pipe
+    //     hits EOF, and an orphaned grandchild holding the pipe's
+    //     write-end keeps it open until the full max-duration cap, after
+    //     which the old code reaped only `bash` and left the grandchild
+    //     (stuck rsync / days-old `git fetch`) alive to wedge the NEXT
+    //     task too. Killing the group closes the pipe and clears the
+    //     leak. See feedback_priya_worker_hangs_with_fresh_heartbeat.md.
+    //
+    // stdin is `/dev/null` so nothing the task spawns can block on a
+    // read from the (closed) task channel.
     let mut cmd = tokio::process::Command::new(&shell);
     cmd.arg("-lc").arg(&command);
     for (k, v) in env {
         cmd.env(k, v);
     }
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    cmd.process_group(0);
     cmd.kill_on_drop(true);
 
-    let out = cmd
-        .output()
-        .await
+    let mut child = cmd
+        .spawn()
         .map_err(|e| TaskRunnerError::BadPayload(format!("spawn: {e}")))?;
+    // Captured before any await so it survives even if the child is
+    // later reaped; it is the group id we target with `kill(-pid)`.
+    let pgid = child.id();
 
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-    let exit = out.status.code().unwrap_or(-1) as i64;
+    // Drain stdout and stderr CONCURRENTLY with the wait — reading one
+    // fully before the other can deadlock a task that fills the second
+    // pipe's 64 KiB buffer while blocked waiting for us to drain it.
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let collect = async {
+        let read_out = async {
+            let mut buf = Vec::new();
+            if let Some(mut o) = stdout_pipe {
+                let _ = tokio::io::AsyncReadExt::read_to_end(&mut o, &mut buf).await;
+            }
+            buf
+        };
+        let read_err = async {
+            let mut buf = Vec::new();
+            if let Some(mut e) = stderr_pipe {
+                let _ = tokio::io::AsyncReadExt::read_to_end(&mut e, &mut buf).await;
+            }
+            buf
+        };
+        let (stdout_buf, stderr_buf, status) = tokio::join!(read_out, read_err, child.wait());
+        (status, stdout_buf, stderr_buf)
+    };
 
-    Ok(json!({
-        "exit": exit,
-        "stdout": stdout.chars().take(8192).collect::<String>(),
-        "stderr": stderr.chars().take(8192).collect::<String>(),
-    }))
+    match tokio::time::timeout(max_duration, collect).await {
+        Ok((status, stdout_buf, stderr_buf)) => {
+            let exit = status.ok().and_then(|s| s.code()).unwrap_or(-1) as i64;
+            let stdout = String::from_utf8_lossy(&stdout_buf).to_string();
+            let stderr = String::from_utf8_lossy(&stderr_buf).to_string();
+            Ok(json!({
+                "exit": exit,
+                "stdout": stdout.chars().take(8192).collect::<String>(),
+                "stderr": stderr.chars().take(8192).collect::<String>(),
+            }))
+        }
+        Err(_) => {
+            // Reap the ENTIRE group so no grandchild is left orphaned.
+            if let Some(pid) = pgid {
+                kill_process_group(pid);
+            }
+            Err(TaskRunnerError::Timeout(max_duration.as_secs()))
+        }
+    }
 }
+
+/// SIGKILL an entire process group by its leader pid.
+///
+/// We spawn shell tasks with `process_group(0)`, so the shell's pid IS
+/// the group id and `-pid` reaches the shell plus every descendant that
+/// did not deliberately `setsid` into its own session. Used on timeout
+/// to guarantee no grandchild (ssh / git / rsync / cargo) leaks past the
+/// task it belonged to.
+#[cfg(unix)]
+fn kill_process_group(pid: u32) {
+    // SAFETY: `kill(2)` with a negative pid targets the process group;
+    // SIGKILL cannot be caught or ignored. An already-dead group simply
+    // returns ESRCH, which we ignore.
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGKILL);
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(_pid: u32) {}
 
 /// Compose the multi-step "bring `<target>` online" task graph atomically.
 ///
@@ -1954,5 +2031,75 @@ mod claim_query_tests {
         .fetch_all(&pool)
         .await
         .expect("restart executor-guard clause must parse + type-check");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod shell_payload_tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[tokio::test]
+    async fn normal_command_returns_stdout_and_exit() {
+        let payload = json!({ "command": "echo hello-fleet" });
+        let res = run_shell_payload(&payload, &[], Duration::from_secs(10))
+            .await
+            .expect("ok");
+        assert_eq!(res["exit"], 0);
+        assert!(res["stdout"].as_str().unwrap().contains("hello-fleet"));
+    }
+
+    #[tokio::test]
+    async fn injected_env_is_visible() {
+        let payload = json!({ "command": "echo \"$FF_TEST_VAR\"" });
+        let env = vec![("FF_TEST_VAR".to_string(), "vinny".to_string())];
+        let res = run_shell_payload(&payload, &env, Duration::from_secs(10))
+            .await
+            .expect("ok");
+        assert!(res["stdout"].as_str().unwrap().contains("vinny"));
+    }
+
+    #[tokio::test]
+    async fn slow_command_times_out_promptly() {
+        let payload = json!({ "command": "sleep 30" });
+        let start = Instant::now();
+        let res = run_shell_payload(&payload, &[], Duration::from_millis(300)).await;
+        assert!(matches!(res, Err(TaskRunnerError::Timeout(_))));
+        // Must return at ~max_duration, not run to completion.
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    /// THE regression test for the priya/sophie wedge: the direct shell
+    /// exits immediately, but a backgrounded grandchild inherits the
+    /// stdout pipe and sleeps. The old `output()` path blocked on pipe
+    /// EOF for the FULL max-duration and then reaped only the (already
+    /// dead) direct child, leaking the grandchild. Group-kill on timeout
+    /// must (a) return promptly with Timeout and (b) leave no survivor.
+    #[tokio::test]
+    async fn timeout_reaps_grandchild_holding_pipe() {
+        // The grandchild writes its pid to a temp file so we can probe it.
+        let pidfile = std::env::temp_dir().join(format!("ff_pgkill_test_{}", std::process::id()));
+        let _ = std::fs::remove_file(&pidfile);
+        let cmd = format!(
+            "( sleep 30 & echo $! > {p}; ) ; exit 0",
+            p = pidfile.display()
+        );
+        let payload = json!({ "command": cmd });
+        let start = Instant::now();
+        let res = run_shell_payload(&payload, &[], Duration::from_millis(400)).await;
+        assert!(matches!(res, Err(TaskRunnerError::Timeout(_))));
+        assert!(start.elapsed() < Duration::from_secs(5));
+
+        // The backgrounded grandchild must have been SIGKILLed with the
+        // group. Give the kill a moment to land, then assert it's gone.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        if let Ok(pid_str) = std::fs::read_to_string(&pidfile) {
+            if let Ok(pid) = pid_str.trim().parse::<i32>() {
+                // signal 0 = existence probe; -1/ESRCH means it's gone.
+                let alive = unsafe { libc::kill(pid, 0) } == 0;
+                assert!(!alive, "grandchild pid {pid} survived group-kill");
+            }
+        }
+        let _ = std::fs::remove_file(&pidfile);
     }
 }
