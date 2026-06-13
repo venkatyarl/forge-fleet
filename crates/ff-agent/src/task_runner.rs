@@ -1667,8 +1667,11 @@ pub async fn compose_fleet_upgrade_wave(
             // / sshd's ClientAliveInterval, surfacing as exit=-1 to the
             // worker. Observed on 2026-05-20: 6 of 14 builds died with
             // exit=-1 at the 80-200s mark even with the V62 two-phase
-            // barrier already in place. Keepalive at 15s with 120 retries
-            // tolerates up to 30 minutes of pure compile silence.
+            // barrier already in place. A 15s keepalive INTERVAL keeps an
+            // arbitrarily long silent compile alive (the remote sshd answers
+            // each probe, which resets the unanswered-probe counter); the
+            // CountMax only bounds how fast ssh gives up on an UNRESPONSIVE
+            // peer — see WAVE_BUILD_SSH_ALIVE_COUNT_MAX.
             // Memory-aware build (2026-05-26): self-built releases
             // (forgefleetd / ff) are heavy and OOM mid-link on memory-tight
             // hosts (≤ FREE_FOR_BUILD_RAM_GB) that have an LLM model resident —
@@ -1688,21 +1691,14 @@ pub async fn compose_fleet_upgrade_wave(
             );
             // `-o ConnectTimeout=30`: an unreachable / packet-dropping peer
             // has NO default connect timeout, so the ssh client would hang at
-            // TCP connect until the 2700s task cap. Bound it.
-            let command = format!(
-                "set -e\n\
-                 echo \"== upgrading {target} via ssh from $(hostname) ==\"\n\
-                 ssh -T{port_arg} -o BatchMode=yes -o ServerAliveInterval=15 \
-                     -o ServerAliveCountMax=120 -o ConnectTimeout=30 \
-                     -o StrictHostKeyChecking=accept-new \
-                     {ssh_user}@{primary_ip} bash -l <<'FF_PLAYBOOK_EOF'\n\
-                 {playbook}\n\
-                 FF_PLAYBOOK_EOF\n",
-                target = t.target_name,
-                port_arg = port_arg,
-                ssh_user = t.ssh_user,
-                primary_ip = t.primary_ip,
-                playbook = playbook_body,
+            // TCP connect until the task cap. Bound it. The keepalive bound is
+            // documented on WAVE_BUILD_SSH_ALIVE_COUNT_MAX.
+            let command = wave_build_ssh_command(
+                &t.target_name,
+                &port_arg,
+                &t.ssh_user,
+                &t.primary_ip,
+                &playbook_body,
             );
 
             // V61 worker-exclusion: target NEVER claims its own ff
@@ -1947,6 +1943,61 @@ fn build_wave_playbook_body(playbook_command: &str, daemon_self: bool) -> String
     )
 }
 
+/// SSH `ServerAliveCountMax` for the wave's OUTER build ssh — the long-lived
+/// `ssh … bash -l <<heredoc` a peer runs to drive a target's build.
+///
+/// With `ServerAliveInterval=15`, a *healthy* build stays connected through
+/// arbitrarily long compile silence at ANY CountMax: the build's own output is
+/// redirected off the channel (see [`build_wave_playbook_body`]), but the
+/// remote sshd still ANSWERS every keepalive probe, and any answer resets the
+/// unanswered-probe counter. So CountMax does **not** govern silence tolerance
+/// (the old code set it to 120 ≈ 30 min believing it did); it only bounds how
+/// fast ssh gives up on an **unresponsive / half-open** peer.
+///
+/// The 30-min value was harmful: when a target's build finished and its sshd
+/// session tore down but the peer's TCP FIN never reached the builder (a LAN
+/// blip leaving the connection half-open), the builder's ssh sat blocked for
+/// the full 30 min. The build task stayed `running`, so its dependent restart
+/// task (gated on the build being SUCCESSFUL) never fired within the hourly
+/// wave — so the host kept the old daemon. Observed live 2026-06-13: duncan's
+/// build `Finished in 50.27s`, the remote `bash -l` and sshd session were
+/// gone, yet the builder's ssh was still sleeping 18 min later; duncan + ace
+/// had drifted 3 releases behind for exactly this reason.
+///
+/// 8 × 15 s = 120 s detects a dead peer fast (unblocking the dependent restart
+/// well inside the hourly wave) while never touching a healthy build, since a
+/// live sshd keeps answering probes. The inner git transfer uses 4 (#219) and
+/// the lighter restart ssh uses 20.
+const WAVE_BUILD_SSH_ALIVE_COUNT_MAX: u32 = 8;
+
+/// Build the OUTER ssh command the wave runs on a peer to drive `target`'s
+/// build: `ssh -T … target bash -l <<EOF <playbook> EOF`. Pure (no I/O) so the
+/// keepalive/timeout flags and heredoc framing are unit-testable.
+fn wave_build_ssh_command(
+    target_name: &str,
+    port_arg: &str,
+    ssh_user: &str,
+    primary_ip: &str,
+    playbook_body: &str,
+) -> String {
+    format!(
+        "set -e\n\
+         echo \"== upgrading {target} via ssh from $(hostname) ==\"\n\
+         ssh -T{port_arg} -o BatchMode=yes -o ServerAliveInterval=15 \
+             -o ServerAliveCountMax={count_max} -o ConnectTimeout=30 \
+             -o StrictHostKeyChecking=accept-new \
+             {ssh_user}@{primary_ip} bash -l <<'FF_PLAYBOOK_EOF'\n\
+         {playbook}\n\
+         FF_PLAYBOOK_EOF\n",
+        target = target_name,
+        port_arg = port_arg,
+        count_max = WAVE_BUILD_SSH_ALIVE_COUNT_MAX,
+        ssh_user = ssh_user,
+        primary_ip = primary_ip,
+        playbook = playbook_body,
+    )
+}
+
 /// Block obviously destructive shell commands.
 fn is_blocked_command(command: &str) -> bool {
     let lower = command.to_ascii_lowercase();
@@ -2026,6 +2077,38 @@ mod wave_playbook_tests {
         assert!(!body.contains("resume-from-build"));
         assert!(body.contains("GIT_HTTP_LOW_SPEED_TIME=60; apt-get install -y foo; } > $HOME/.forgefleet/logs/fleet-upgrade-wave-build.log 2>&1 </dev/null"));
         assert!(body.trim_end().ends_with("exit $__build_rc"));
+    }
+
+    #[test]
+    fn outer_ssh_uses_bounded_keepalive_and_frames_heredoc() {
+        let cmd = super::wave_build_ssh_command(
+            "duncan",
+            " -p 2222",
+            "duncan",
+            "192.168.5.114",
+            "mkdir -p x\nexit $__build_rc",
+        );
+        // Keepalive INTERVAL keeps a silent build alive; CountMax bounds
+        // dead-peer detection. It must NOT be the old 30-min (120) value that
+        // hung the build task — and thus the dependent restart — for half an
+        // hour on a half-open channel.
+        assert!(cmd.contains("-o ServerAliveInterval=15"));
+        assert!(cmd.contains(&format!(
+            "-o ServerAliveCountMax={}",
+            super::WAVE_BUILD_SSH_ALIVE_COUNT_MAX
+        )));
+        assert!(!cmd.contains("ServerAliveCountMax=120"));
+        // 15s interval × CountMax frees a half-open peer in ≤ a few minutes —
+        // well inside the hourly wave — but stays > the inner git bound (4).
+        assert!(super::WAVE_BUILD_SSH_ALIVE_COUNT_MAX > 4);
+        assert!(super::WAVE_BUILD_SSH_ALIVE_COUNT_MAX * 15 <= 180);
+        // Bounded TCP connect + non-interactive + the playbook body framed in
+        // the quoted heredoc the remote login shell reads.
+        assert!(cmd.contains("-o ConnectTimeout=30"));
+        assert!(cmd.contains("ssh -T -p 2222 -o BatchMode=yes"));
+        assert!(cmd.contains("duncan@192.168.5.114 bash -l <<'FF_PLAYBOOK_EOF'"));
+        assert!(cmd.contains("\nmkdir -p x\nexit $__build_rc\n"));
+        assert!(cmd.trim_end().ends_with("FF_PLAYBOOK_EOF"));
     }
 }
 
