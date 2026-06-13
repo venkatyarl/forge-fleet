@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 
 use crate::{
-    CYAN, FleetCommand, FleetDbCommand, GREEN, RED, RESET, TaskCoverageCommand, YELLOW,
-    pulse_reader, whoami_tag,
+    CYAN, FleetCommand, FleetDbCommand, GREEN, LeaderAction, RED, RESET, TaskCoverageCommand,
+    YELLOW, pulse_reader, whoami_tag,
 };
 
 /// `ff fleet panic-stop` — emergency halt of every daemon.
@@ -1930,6 +1930,85 @@ pub async fn handle_fleet_leader(pool: &sqlx::PgPool, json: bool) -> Result<()> 
     Ok(())
 }
 
+/// `ff fleet leader step-down` (HA Phase 1). Voluntarily hand fleet leadership
+/// to the next-preferred follower for a bounded window, then auto-fail-back.
+///
+/// Mechanism: write the `leader_yield_request` fleet_secret as
+/// `<member>|<rfc3339_until>`. The target's daemon (leader_tick) reads it each
+/// tick, publishes `is_yielding=true` in its pulse beat, and yields the leader
+/// singleton; every node's election skips a yielding candidate, so the next
+/// follower takes over. When the deadline passes (or `--clear` deletes the
+/// secret) the flag drops and the original leader re-asserts. This does NOT
+/// move the Postgres/Redis primary — fleet leadership and DB primary are
+/// independent (see plans/ha-leader-handoff.md §4), so it is safe only when the
+/// caller accepts a brief leadership move, hence `--yes`.
+pub async fn handle_fleet_leader_step_down(
+    pool: &sqlx::PgPool,
+    minutes: i64,
+    member: Option<String>,
+    clear: bool,
+    yes: bool,
+) -> Result<()> {
+    const KEY: &str = "leader_yield_request";
+
+    if clear {
+        let existed = ff_db::pg_delete_secret(pool, KEY)
+            .await
+            .map_err(|e| anyhow::anyhow!("clear leader_yield_request: {e}"))?;
+        if existed {
+            println!(
+                "{GREEN}✓ step-down cleared{RESET} — the target will re-assert leadership within ~2 ticks."
+            );
+        } else {
+            println!("  no active step-down request (nothing to clear).");
+        }
+        return Ok(());
+    }
+
+    // Resolve the target member: explicit --member, else the current leader.
+    let target = match member {
+        Some(m) if !m.trim().is_empty() => m.trim().to_string(),
+        _ => ff_db::pg_get_current_leader(pool)
+            .await
+            .map_err(|e| anyhow::anyhow!("pg_get_current_leader: {e}"))?
+            .map(|l| l.member_name)
+            .ok_or_else(|| {
+                anyhow::anyhow!("no current leader recorded; pass --member <name> explicitly")
+            })?,
+    };
+
+    if !yes {
+        eprintln!(
+            "{YELLOW}⚠ This hands fleet leadership away from '{target}' for {minutes} min \
+             (auto fail-back after).{RESET}\n  Re-run with {CYAN}--yes{RESET} to confirm, \
+             or {CYAN}--clear{RESET} to cancel an active request."
+        );
+        std::process::exit(1);
+    }
+
+    let minutes = minutes.clamp(1, 24 * 60);
+    let until = chrono::Utc::now() + chrono::Duration::minutes(minutes);
+    let value = format!("{target}|{}", until.to_rfc3339());
+    ff_db::pg_set_secret(
+        pool,
+        KEY,
+        &value,
+        Some("HA Phase 1 voluntary leader step-down (ff fleet leader step-down)"),
+        Some("ff fleet leader step-down"),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("set leader_yield_request: {e}"))?;
+
+    println!(
+        "{GREEN}✓ step-down requested for '{target}'{RESET}\n  \
+         it will yield within ~2 election ticks; automatic fail-back at {} ({minutes} min).\n  \
+         cancel early: {CYAN}ff fleet leader step-down --clear{RESET}\n  \
+         watch: {CYAN}ff fleet leader{RESET}",
+        until.to_rfc3339()
+    );
+    Ok(())
+}
+
 pub async fn handle_fleet_health(pool: &sqlx::PgPool, json: bool) -> Result<()> {
     // Pull computer rows — name, primary_ip, status, last_seen_at.
     let rows = sqlx::query(
@@ -2502,9 +2581,21 @@ pub async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
                 }
             }
         }
-        FleetCommand::Leader { json } => {
-            handle_fleet_leader(&pool, json).await?;
-        }
+        FleetCommand::Leader { json, action } => match action {
+            None | Some(LeaderAction::Status { .. }) => {
+                // `--json` at the `leader` level OR `status --json` both work.
+                let json = json || matches!(action, Some(LeaderAction::Status { json: true }));
+                handle_fleet_leader(&pool, json).await?;
+            }
+            Some(LeaderAction::StepDown {
+                minutes,
+                member,
+                clear,
+                yes,
+            }) => {
+                handle_fleet_leader_step_down(&pool, minutes, member, clear, yes).await?;
+            }
+        },
         FleetCommand::Health { json } => {
             handle_fleet_health(&pool, json).await?;
         }

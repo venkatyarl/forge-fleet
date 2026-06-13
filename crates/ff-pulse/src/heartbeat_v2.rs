@@ -10,7 +10,7 @@
 //! result in DB writes. See materializer.rs.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use chrono::Utc;
@@ -38,6 +38,12 @@ pub struct HeartbeatV2Publisher {
     epoch: Arc<AtomicU64>,
     /// Current role_claimed — shared with leader_tick.
     role: Arc<parking_lot_compat::RwLock<String>>,
+    /// Voluntary step-down flag (HA Phase 1) — shared with leader_tick, which
+    /// sets it from the `leader_yield_request` fleet_secret. When true, this
+    /// node publishes `is_yielding=true` so every peer's election skips it and
+    /// the next-preferred follower takes over (a clean, operator-driven handoff
+    /// without waiting 45s for a stale-heartbeat takeover).
+    is_yielding: Arc<AtomicBool>,
     /// Cached election priority from fleet_workers (set at startup).
     election_priority: i32,
     /// 10-char git SHA of the binary, captured at compile time and
@@ -64,6 +70,7 @@ impl HeartbeatV2Publisher {
             interval,
             epoch: Arc::new(AtomicU64::new(0)),
             role: Arc::new(parking_lot_compat::RwLock::new("member".to_string())),
+            is_yielding: Arc::new(AtomicBool::new(false)),
             election_priority,
             build_sha: None,
         }
@@ -102,6 +109,12 @@ impl HeartbeatV2Publisher {
         self.role.clone()
     }
 
+    /// Share the voluntary step-down flag with leader_tick, which drives it
+    /// from the `leader_yield_request` fleet_secret (HA Phase 1).
+    pub fn yielding_handle(&self) -> Arc<AtomicBool> {
+        self.is_yielding.clone()
+    }
+
     /// Build a single beat from local system state.
     ///
     /// **Blocking safety**: all synchronous blocking work (sysinfo, subprocess
@@ -113,6 +126,7 @@ impl HeartbeatV2Publisher {
         let computer_name = self.computer_name.clone();
         let epoch = self.epoch.clone();
         let role = self.role.clone();
+        let is_yielding = self.is_yielding.clone();
         let election_priority = self.election_priority;
         let build_sha = self.build_sha.clone();
 
@@ -132,6 +146,7 @@ impl HeartbeatV2Publisher {
                     .map(|r| r.clone())
                     .unwrap_or_else(|_| "member".to_string());
                 beat.election_priority = election_priority;
+                beat.is_yielding = is_yielding.load(Ordering::Relaxed);
                 beat.timestamp = Utc::now();
 
                 // V43: drain any queued panics from the local panic_hook into the
@@ -310,6 +325,7 @@ impl HeartbeatV2Publisher {
                     .map(|r| r.clone())
                     .unwrap_or_else(|_| "member".to_string());
                 skeleton.election_priority = self.election_priority;
+                skeleton.is_yielding = self.is_yielding.load(Ordering::Relaxed);
                 skeleton.timestamp = Utc::now();
                 (skeleton, false)
             }
@@ -327,6 +343,7 @@ impl HeartbeatV2Publisher {
                     .map(|r| r.clone())
                     .unwrap_or_else(|_| "member".to_string());
                 skeleton.election_priority = self.election_priority;
+                skeleton.is_yielding = self.is_yielding.load(Ordering::Relaxed);
                 skeleton.timestamp = Utc::now();
                 (skeleton, false)
             }
