@@ -45,6 +45,13 @@ pub enum TopCortexCommand {
         #[arg(long, default_value = "table")]
         format: String,
     },
+    /// List every indexed corpus (slug, sources, content, code-symbols) — the
+    /// CLI form of the `cortex_corpora` MCP tool. Equivalent to `status --all`,
+    /// so an agent that knows the MCP surface finds the same verb on the CLI.
+    Corpora {
+        #[arg(long, default_value = "table")]
+        format: String,
+    },
     /// Callers of a code symbol (corpus defaults to the cwd's slug).
     Callers {
         symbol: String,
@@ -336,6 +343,58 @@ fn detect_languages(root: &Path) -> Vec<(String, usize)> {
     v
 }
 
+/// Render the indexed-corpus listing. `target = Some(slug)` shows just that one
+/// corpus (the cwd's `status` view); `target = None` lists them all (`status
+/// --all` / `corpora`). Shared by both verbs so their output stays byte-identical.
+async fn print_corpora(pool: &PgPool, target: Option<String>, format: &str) -> Result<()> {
+    let rows = corpus::list_corpora(pool).await?;
+    let filtered: Vec<_> = rows
+        .into_iter()
+        .filter(|r| target.as_deref().map(|t| t == r.slug).unwrap_or(true))
+        .collect();
+
+    // list_corpora's `content` count only covers `content:%` nodes and
+    // excludes every `code:%` symbol Cortex inserts, so query those
+    // separately per corpus for an accurate code-symbol total.
+    let mut code_symbols: Vec<i64> = Vec::with_capacity(filtered.len());
+    for r in &filtered {
+        code_symbols.push(ff_db::pg_count_corpus_code_symbols(pool, &r.slug).await?);
+    }
+
+    if format == "json" {
+        let v: Vec<_> = filtered
+            .iter()
+            .zip(code_symbols.iter())
+            .map(|(r, code)| {
+                serde_json::json!({
+                    "slug": r.slug, "title": r.title, "sources": r.sources,
+                    "entities": r.entities, "facets": r.facets, "content": r.content,
+                    "code_symbols": code,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&v)?);
+    } else if filtered.is_empty() {
+        if let Some(t) = target {
+            println!("no corpus '{t}' for this directory yet \u{2014} run `ff cortex index`");
+        } else {
+            println!("no corpora indexed yet \u{2014} run `ff cortex index`");
+        }
+    } else {
+        println!(
+            "{:<22} {:<22} {:>7} {:>8} {:>9} {:>8}",
+            "SLUG", "TITLE", "SOURCES", "CONTENT", "CODE-SYMS", "FACETS"
+        );
+        for (r, code) in filtered.iter().zip(code_symbols.iter()) {
+            println!(
+                "{:<22} {:<22} {:>7} {:>8} {:>9} {:>8}",
+                r.slug, r.title, r.sources, r.content, code, r.facets
+            );
+        }
+    }
+    Ok(())
+}
+
 pub async fn handle_top_cortex(args: TopCortexArgs) -> Result<()> {
     let pool = ff_agent::fleet_info::get_fleet_pool()
         .await
@@ -384,58 +443,17 @@ pub async fn handle_top_cortex(args: TopCortexArgs) -> Result<()> {
             run_watch(&pool, &root, &slug, lang, debounce).await?;
         }
         TopCortexCommand::Status { all, slug, format } => {
-            let rows = corpus::list_corpora(&pool).await?;
             let target = if all {
                 None
             } else {
                 Some(slug.unwrap_or_else(cwd_slug))
             };
-            let filtered: Vec<_> = rows
-                .into_iter()
-                .filter(|r| target.as_deref().map(|t| t == r.slug).unwrap_or(true))
-                .collect();
-
-            // list_corpora's `content` count only covers `content:%` nodes and
-            // excludes every `code:%` symbol Cortex inserts, so query those
-            // separately per corpus for an accurate code-symbol total.
-            let mut code_symbols: Vec<i64> = Vec::with_capacity(filtered.len());
-            for r in &filtered {
-                code_symbols.push(ff_db::pg_count_corpus_code_symbols(&pool, &r.slug).await?);
-            }
-
-            if format == "json" {
-                let v: Vec<_> = filtered
-                    .iter()
-                    .zip(code_symbols.iter())
-                    .map(|(r, code)| {
-                        serde_json::json!({
-                            "slug": r.slug, "title": r.title, "sources": r.sources,
-                            "entities": r.entities, "facets": r.facets, "content": r.content,
-                            "code_symbols": code,
-                        })
-                    })
-                    .collect();
-                println!("{}", serde_json::to_string_pretty(&v)?);
-            } else if filtered.is_empty() {
-                if let Some(t) = target {
-                    println!(
-                        "no corpus '{t}' for this directory yet \u{2014} run `ff cortex index`"
-                    );
-                } else {
-                    println!("no corpora indexed yet \u{2014} run `ff cortex index`");
-                }
-            } else {
-                println!(
-                    "{:<22} {:<22} {:>7} {:>8} {:>9} {:>8}",
-                    "SLUG", "TITLE", "SOURCES", "CONTENT", "CODE-SYMS", "FACETS"
-                );
-                for (r, code) in filtered.iter().zip(code_symbols.iter()) {
-                    println!(
-                        "{:<22} {:<22} {:>7} {:>8} {:>9} {:>8}",
-                        r.slug, r.title, r.sources, r.content, code, r.facets
-                    );
-                }
-            }
+            print_corpora(&pool, target, &format).await?;
+        }
+        TopCortexCommand::Corpora { format } => {
+            // The CLI mirror of the `cortex_corpora` MCP tool: always lists every
+            // corpus (the `status --all` view), independent of the cwd.
+            print_corpora(&pool, None, &format).await?;
         }
         TopCortexCommand::Callers {
             symbol,
