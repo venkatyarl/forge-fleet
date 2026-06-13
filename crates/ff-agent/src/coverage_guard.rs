@@ -94,8 +94,27 @@ impl CoverageGuard {
         Self::new(pg, None)
     }
 
-    /// Run one coverage pass. See the module docs for the algorithm.
+    /// Run one coverage pass **with remediation**: gaps that have a viable
+    /// candidate host are auto-loaded via an enqueued deferred task. This is
+    /// the behavior the background tick wants. See the module docs.
     pub async fn check_once(&self) -> Result<CoverageReport, CoverageError> {
+        self.run_once(true).await
+    }
+
+    /// Run one coverage pass **read-only**: analyze coverage and report gaps
+    /// without enqueuing any auto-load tasks. Used by the `ff model coverage`
+    /// CLI so a status check has no side effects (no fleet-wide model loads,
+    /// no defer-queue writes). A gap that *could* be auto-loaded is still
+    /// reported as a gap (with its candidate list) instead of being silently
+    /// remediated.
+    pub async fn report_once(&self) -> Result<CoverageReport, CoverageError> {
+        self.run_once(false).await
+    }
+
+    /// Run one coverage pass. When `remediate` is true, viable gaps are
+    /// auto-loaded (enqueued); when false the pass is purely observational.
+    /// See the module docs for the algorithm.
+    async fn run_once(&self, remediate: bool) -> Result<CoverageReport, CoverageError> {
         let required = sqlx::query(
             "SELECT task, min_models_loaded, preferred_model_ids, priority
              FROM fleet_task_coverage
@@ -152,29 +171,35 @@ impl CoverageGuard {
             let candidates = self.rank_candidates(&task, &preferred_ids).await?;
 
             // Try to auto-load the best candidate on any suitable computer.
+            // Skipped entirely in read-only mode (`report_once`), so a status
+            // check never enqueues a fleet-wide model load.
             let mut enqueued = None;
-            for cand in &candidates {
-                match self.pick_host_for(&cand.id, cand.min_vram_gb).await? {
-                    Some(host) => {
-                        let defer_id = self.enqueue_load(&cand.id, &host).await?;
-                        info!(
-                            task = %task,
-                            model = %cand.id,
-                            host = %host,
-                            defer_id = %defer_id,
-                            "coverage guard enqueued auto-load"
-                        );
-                        report.auto_loaded.push(cand.id.clone());
-                        enqueued = Some(cand.id.clone());
-                        break;
+            if remediate {
+                for cand in &candidates {
+                    match self.pick_host_for(&cand.id, cand.min_vram_gb).await? {
+                        Some(host) => {
+                            let defer_id = self.enqueue_load(&cand.id, &host).await?;
+                            info!(
+                                task = %task,
+                                model = %cand.id,
+                                host = %host,
+                                defer_id = %defer_id,
+                                "coverage guard enqueued auto-load"
+                            );
+                            report.auto_loaded.push(cand.id.clone());
+                            enqueued = Some(cand.id.clone());
+                            break;
+                        }
+                        None => continue,
                     }
-                    None => continue,
                 }
             }
 
             if enqueued.is_none() {
-                // Dedup: only surface the same gap once per hour.
-                if self.should_alert(&task).await {
+                // Dedup: only surface the same gap once per hour. The alert
+                // only makes sense when we tried (and failed) to remediate;
+                // a read-only pass just reports the gap silently.
+                if remediate && self.should_alert(&task).await {
                     warn!(
                         task = %task,
                         min_required,
@@ -407,6 +432,13 @@ struct Candidate {
     min_vram_gb: Option<f64>,
 }
 
+/// Count gaps that have at least one catalog candidate — i.e. gaps that
+/// `--remediate` could enqueue an auto-load for. Used by the CLI to print a
+/// discoverable hint after a read-only pass. Pure so it can be unit-tested.
+pub fn loadable_gap_count(gaps: &[CoverageGap]) -> usize {
+    gaps.iter().filter(|g| !g.candidates.is_empty()).count()
+}
+
 fn tier_rank(tier: Option<&str>) -> u8 {
     match tier {
         Some("flagship") => 0,
@@ -433,6 +465,32 @@ mod tests {
         assert!(tier_rank(Some("flagship")) < tier_rank(Some("standard")));
         assert!(tier_rank(Some("standard")) < tier_rank(Some("experimental")));
         assert!(tier_rank(None) > tier_rank(Some("experimental")));
+    }
+
+    #[test]
+    fn loadable_gap_count_counts_only_gaps_with_candidates() {
+        let gaps = vec![
+            CoverageGap {
+                task: "code-generation".into(),
+                min_required: 1,
+                currently_loaded: 0,
+                candidates: vec!["qwen3-coder-30b".into()],
+            },
+            CoverageGap {
+                task: "default-chat".into(),
+                min_required: 1,
+                currently_loaded: 0,
+                candidates: vec![],
+            },
+            CoverageGap {
+                task: "image-text-to-text".into(),
+                min_required: 1,
+                currently_loaded: 0,
+                candidates: vec!["qwen3-omni-7b".into(), "gemma3-9b".into()],
+            },
+        ];
+        assert_eq!(loadable_gap_count(&gaps), 2);
+        assert_eq!(loadable_gap_count(&[]), 0);
     }
 
     #[test]
