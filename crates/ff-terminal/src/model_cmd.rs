@@ -2463,6 +2463,70 @@ async fn handle_model_where(pool: &sqlx::PgPool, query: &str) -> anyhow::Result<
 ///   3. Rank candidates by (free_bytes desc, model_count asc) — prefer hosts
 ///      with most free disk that don't already hold many models.
 ///   4. Pick top candidate; print plan; transfer (unless --dry-run).
+/// A disk-eligible distribution candidate host: online, enough free disk,
+/// not reserved. The slice handed to [`select_distribute_target`] is
+/// pre-sorted by free disk DESC then model_count ASC.
+#[derive(Debug, Clone, PartialEq)]
+struct DistributeCandidate {
+    name: String,
+    free_bytes: i64,
+    model_count: i64,
+}
+
+/// Why no distribution target could be auto-picked or the pin honored.
+#[derive(Debug, PartialEq)]
+enum DistributeSelectError {
+    /// No disk-eligible candidate at all (after excludes).
+    NoCandidate,
+    /// Every disk-eligible candidate already holds a copy of this model.
+    AllAlreadyHold,
+    /// Operator pinned a host that already holds a copy.
+    PinnedAlreadyHolds(String),
+    /// Operator pinned a host that isn't disk-eligible.
+    PinnedNotEligible(String),
+}
+
+/// Pure target selection for `ff model distribute`.
+///
+/// `candidates` are disk-eligible hosts pre-sorted (free disk DESC, model
+/// count ASC). `excludes` is the explicit + source exclude set. `holders`
+/// is the set of hosts that already hold a copy of this `(catalog_id,
+/// runtime)` — distributing to one of them is a redundant rsync that just
+/// overwrites the existing copy, so they're never auto-picked. A pinned
+/// host is honored only when it's eligible and not already a holder.
+fn select_distribute_target<'a>(
+    candidates: &'a [DistributeCandidate],
+    excludes: &std::collections::HashSet<String>,
+    holders: &std::collections::HashSet<String>,
+    pinned: Option<&str>,
+) -> Result<&'a DistributeCandidate, DistributeSelectError> {
+    let eligible: Vec<&DistributeCandidate> = candidates
+        .iter()
+        .filter(|c| !excludes.contains(&c.name))
+        .collect();
+
+    if let Some(pin) = pinned {
+        if holders.contains(pin) {
+            return Err(DistributeSelectError::PinnedAlreadyHolds(pin.to_string()));
+        }
+        return eligible
+            .iter()
+            .find(|c| c.name == pin)
+            .copied()
+            .ok_or_else(|| DistributeSelectError::PinnedNotEligible(pin.to_string()));
+    }
+
+    // Auto-pick: first non-holder in disk-priority order.
+    if let Some(pick) = eligible.iter().find(|c| !holders.contains(&c.name)) {
+        return Ok(pick);
+    }
+    if eligible.is_empty() {
+        Err(DistributeSelectError::NoCandidate)
+    } else {
+        Err(DistributeSelectError::AllAlreadyHold)
+    }
+}
+
 async fn handle_model_distribute(
     pool: &sqlx::PgPool,
     id_or_catalog: &str,
@@ -2532,7 +2596,7 @@ async fn handle_model_distribute(
     //
     // Everything else is eligible. Among eligible hosts, just pick by free
     // disk DESC then model_count ASC. No class-based preference.
-    let candidates: Vec<(String, i64, i64)> = sqlx::query_as(
+    let candidate_rows: Vec<(String, i64, i64)> = sqlx::query_as(
         r#"
         WITH free AS (
             SELECT DISTINCT ON (worker_name) worker_name, free_bytes
@@ -2567,41 +2631,58 @@ async fn handle_model_distribute(
     .bind((size_bytes as f64 * 1.5) as i64)
     .fetch_all(pool)
     .await?;
-
-    let mut filtered: Vec<&(String, i64, i64)> = candidates
-        .iter()
-        .filter(|(name, _, _)| !excludes.contains(name))
+    let candidates: Vec<DistributeCandidate> = candidate_rows
+        .into_iter()
+        .map(|(name, free_bytes, model_count)| DistributeCandidate {
+            name,
+            free_bytes,
+            model_count,
+        })
         .collect();
-    if filtered.is_empty() {
-        anyhow::bail!(
+
+    // Hosts already holding a copy of this exact (catalog_id, runtime) —
+    // distributing there is a redundant rsync that overwrites the existing
+    // file, so they're excluded from auto-pick and refused when pinned.
+    let holders: std::collections::HashSet<String> = sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT DISTINCT worker_name
+          FROM fleet_model_library
+         WHERE catalog_id = $1 AND runtime = $2
+        "#,
+    )
+    .bind(&catalog_id)
+    .bind(&runtime)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .collect();
+
+    let pick = match select_distribute_target(&candidates, &excludes, &holders, pinned_to) {
+        Ok(p) => p,
+        Err(DistributeSelectError::NoCandidate) => anyhow::bail!(
             "no candidate host with enough free disk (need {:.1} GB × 1.5; reserved hosts: taylor + DGX; excludes={:?})",
             source_gb,
             excludes
-        );
-    }
-
-    let pick = if let Some(pinned) = pinned_to {
-        filtered
-            .iter()
-            .find(|(n, _, _)| n == pinned)
-            .copied()
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "pinned host '{pinned}' is not in candidate set (online + enough disk + not reserved + not excluded)"
-                )
-            })?
-    } else {
-        filtered.remove(0)
+        ),
+        Err(DistributeSelectError::AllAlreadyHold) => anyhow::bail!(
+            "every disk-eligible host already holds a copy of '{catalog_id}' ({runtime} runtime) — nothing to distribute"
+        ),
+        Err(DistributeSelectError::PinnedAlreadyHolds(h)) => anyhow::bail!(
+            "pinned host '{h}' already holds a copy of '{catalog_id}' ({runtime} runtime) — transfer would overwrite the existing copy; delete it there first if intentional"
+        ),
+        Err(DistributeSelectError::PinnedNotEligible(h)) => anyhow::bail!(
+            "pinned host '{h}' is not in the candidate set (must be online, have enough free disk, not reserved, and not excluded)"
+        ),
     };
 
-    let target_gb = (pick.1 as f64) / 1024.0 / 1024.0 / 1024.0;
+    let target_gb = (pick.free_bytes as f64) / 1024.0 / 1024.0 / 1024.0;
     println!(
         "{CYAN}target{RESET}      {} ({:.1} GB free, {} models on disk)",
-        pick.0, target_gb, pick.2
+        pick.name, target_gb, pick.model_count
     );
     println!(
         "{CYAN}plan{RESET}        rsync {} → {}:~/models/{}/{}",
-        source_path, pick.0, runtime, catalog_id
+        source_path, pick.name, runtime, catalog_id
     );
 
     if dry_run {
@@ -2612,7 +2693,7 @@ async fn handle_model_distribute(
     // Step 4: dispatch transfer via existing model_transfer module.
     let opts = ff_agent::model_transfer::TransferOptions {
         source_node: source_worker.clone(),
-        target_node: pick.0.clone(),
+        target_node: pick.name.clone(),
         library_id: lib_id.clone(),
     };
     println!("{CYAN}▶ transferring...{RESET}");
@@ -2837,6 +2918,85 @@ mod tests {
     fn unknown_ctx_is_not_ready() {
         // NULL usable_agent_ctx (pre-backfill / unknown) must not be trusted.
         assert!(!is_agent_ready(None, AGENT_MIN_CTX as i32));
+    }
+
+    fn cand(name: &str, free_gb: i64, models: i64) -> DistributeCandidate {
+        DistributeCandidate {
+            name: name.to_string(),
+            free_bytes: free_gb * 1024 * 1024 * 1024,
+            model_count: models,
+        }
+    }
+
+    fn set(names: &[&str]) -> std::collections::HashSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn distribute_skips_hosts_already_holding_the_model() {
+        // Disk-priority order: marcus (most free) then logan. marcus already
+        // holds the model → auto-pick must fall through to logan, NOT pick the
+        // redundant target (the live bug: distribute chose a host that already
+        // had qwen3-coder-30b).
+        let candidates = vec![cand("marcus", 3000, 1), cand("logan", 500, 2)];
+        let excludes = set(&["sophie"]); // source
+        let holders = set(&["marcus", "sophie", "veronica"]);
+        let pick = select_distribute_target(&candidates, &excludes, &holders, None).unwrap();
+        assert_eq!(pick.name, "logan");
+    }
+
+    #[test]
+    fn distribute_auto_picks_best_disk_when_no_holder() {
+        let candidates = vec![cand("marcus", 3000, 1), cand("logan", 500, 2)];
+        let pick =
+            select_distribute_target(&candidates, &set(&["sophie"]), &set(&[]), None).unwrap();
+        assert_eq!(pick.name, "marcus");
+    }
+
+    #[test]
+    fn distribute_errors_when_every_candidate_holds_it() {
+        let candidates = vec![cand("marcus", 3000, 1), cand("logan", 500, 2)];
+        let holders = set(&["marcus", "logan"]);
+        let err = select_distribute_target(&candidates, &set(&[]), &holders, None).unwrap_err();
+        assert_eq!(err, DistributeSelectError::AllAlreadyHold);
+    }
+
+    #[test]
+    fn distribute_errors_when_no_candidate() {
+        let err = select_distribute_target(&[], &set(&[]), &set(&[]), None).unwrap_err();
+        assert_eq!(err, DistributeSelectError::NoCandidate);
+    }
+
+    #[test]
+    fn distribute_pin_refused_when_pinned_host_holds_it() {
+        let candidates = vec![cand("marcus", 3000, 1), cand("logan", 500, 2)];
+        let holders = set(&["marcus"]);
+        let err =
+            select_distribute_target(&candidates, &set(&[]), &holders, Some("marcus")).unwrap_err();
+        assert_eq!(
+            err,
+            DistributeSelectError::PinnedAlreadyHolds("marcus".to_string())
+        );
+    }
+
+    #[test]
+    fn distribute_pin_honored_when_eligible_non_holder() {
+        let candidates = vec![cand("marcus", 3000, 1), cand("logan", 500, 2)];
+        let pick =
+            select_distribute_target(&candidates, &set(&[]), &set(&["marcus"]), Some("logan"))
+                .unwrap();
+        assert_eq!(pick.name, "logan");
+    }
+
+    #[test]
+    fn distribute_pin_refused_when_not_eligible() {
+        let candidates = vec![cand("marcus", 3000, 1)];
+        let err =
+            select_distribute_target(&candidates, &set(&[]), &set(&[]), Some("aura")).unwrap_err();
+        assert_eq!(
+            err,
+            DistributeSelectError::PinnedNotEligible("aura".to_string())
+        );
     }
 
     #[test]
