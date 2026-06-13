@@ -2361,7 +2361,13 @@ pub enum ModelCommand {
     /// Search the catalog (fuzzy on id/name/family).
     Search { query: String },
     /// List catalog entries (what can be downloaded).
-    Catalog,
+    Catalog {
+        /// Emit JSON (every field incl. description, gated, tool_calling, and
+        /// the raw preferred_workloads/variants) — for agent / scripted
+        /// consumption instead of scraping the human table.
+        #[arg(long)]
+        json: bool,
+    },
     /// List library entries (what's on disk, per node).
     Library {
         #[arg(long)]
@@ -2417,13 +2423,23 @@ pub enum ModelCommand {
         models_dir: Option<PathBuf>,
     },
     /// Show latest disk usage per node (from fleet_disk_usage snapshots).
-    Disk,
+    Disk {
+        /// Emit JSON (every field incl. total_bytes + RFC3339 sampled_at) — for
+        /// agent / scripted quota monitoring instead of scraping the table.
+        #[arg(long)]
+        json: bool,
+    },
     /// List lifecycle jobs (downloads, deletes, loads, swaps).
     Jobs {
         #[arg(long)]
         status: Option<String>,
         #[arg(long, default_value_t = 30)]
         limit: i64,
+        /// Emit JSON (every field incl. the job UUID, bytes_done/total, eta,
+        /// raw params, error_message, RFC3339 timestamps) — for agent /
+        /// scripted progress polling instead of scraping the table.
+        #[arg(long)]
+        json: bool,
     },
     /// Download a model from HuggingFace to this node's models dir.
     /// Picks the variant matching this node's runtime (llama.cpp / mlx / vllm).
