@@ -109,7 +109,32 @@ impl InferenceRouter {
     /// Always favours local over remote, and tool-capable over non-tool.
     /// Call `report_failure` when a request to the returned URL fails.
     pub async fn active_url(&self) -> Option<String> {
+        self.active_url_filtered(false).await
+    }
+
+    /// Like [`active_url`], but when `require_tools` is set, prefer endpoints
+    /// whose model supports OpenAI-compatible tool calling. Only falls back to
+    /// a non-tool endpoint when no tool-capable one is reachable, so the caller
+    /// still gets liveness rather than `None`.
+    ///
+    /// The agent loop uses `require_tools = true` so a local non-tool model
+    /// (e.g. gemma-4) never shadows a remote tool-capable one — the documented
+    /// "agent dispatched to gemma-4 hangs silently" foot-gun. Local-first
+    /// ordering is preserved *within* the tool-capable tier.
+    pub async fn active_url_filtered(&self, require_tools: bool) -> Option<String> {
         let state = self.failures.lock().await;
+        // First pass: when tools are required, only a healthy tool-capable
+        // endpoint qualifies (still local-first within that tier).
+        if require_tools {
+            for ep in &self.endpoints {
+                if ep.supports_tools && !state.is_cooling_down(&ep.url, self.cooldown) {
+                    debug!(label = %ep.label, url = %ep.url, "InferenceRouter selected tool-capable endpoint");
+                    return Some(ep.url.clone());
+                }
+            }
+        }
+        // Second pass: any healthy endpoint (or the only pass when tools aren't
+        // required). Keeps liveness when no tool-capable node is reachable.
         for ep in &self.endpoints {
             if !state.is_cooling_down(&ep.url, self.cooldown) {
                 debug!(label = %ep.label, url = %ep.url, "InferenceRouter selected endpoint");
@@ -118,14 +143,26 @@ impl InferenceRouter {
         }
         // All endpoints are in cooldown — return the least-recently-failed one
         // so the caller can attempt a recovery request rather than giving up.
+        // Prefer a tool-capable endpoint here too when tools are required.
         self.endpoints
             .iter()
+            .filter(|ep| !require_tools || ep.supports_tools)
             .min_by_key(|ep| {
                 state
                     .failed_at
                     .get(&ep.url)
                     .map(|t| t.elapsed())
                     .unwrap_or(Duration::MAX)
+            })
+            .or_else(|| {
+                // No tool-capable endpoint at all — fall back to any.
+                self.endpoints.iter().min_by_key(|ep| {
+                    state
+                        .failed_at
+                        .get(&ep.url)
+                        .map(|t| t.elapsed())
+                        .unwrap_or(Duration::MAX)
+                })
             })
             .map(|ep| {
                 warn!(label = %ep.label, "all endpoints in cooldown — returning least-recently-failed");
@@ -242,15 +279,14 @@ async fn build_endpoint_list(config_path: &Path, client: &reqwest::Client) -> Ve
                     ));
                 } else {
                     for m in node_models {
-                        let fam = m.family.to_lowercase();
-                        let id_lower = m.id.to_lowercase();
-                        let name_lower = m.name.to_lowercase();
-                        let is_gemma4 = fam.contains("gemma")
-                            && (id_lower.contains("gemma-4")
-                                || id_lower.contains("gemma4")
-                                || name_lower.contains("gemma-4")
-                                || name_lower.contains("gemma4"));
-                        let supports_tools = fam.contains("qwen") || is_gemma4;
+                        // DB-first: trust the `preferred_workloads` tags
+                        // (synced from the catalog's `tool_calling` flag). Only
+                        // fall back to the model-name heuristic when the DB is
+                        // silent, so unsynced rows still route. This is what
+                        // keeps gemma-4 — tagged non-tool in the catalog — out
+                        // of the tool-capable tier.
+                        let supports_tools = workloads_tool_capable(&m.preferred_workloads)
+                            || model_supports_tools(&m.id);
                         candidates.push((
                             node.ip.clone(),
                             m.port as u16,
@@ -342,13 +378,106 @@ async fn fetch_first_model_id(base_url: &str, client: &reqwest::Client) -> Strin
     "auto".into()
 }
 
-/// Heuristic: does this model ID suggest tool-calling support?
+/// True if a model's `preferred_workloads` JSONB array tags it as agent /
+/// tool-calling capable. This is the DB-first source of truth (the tags are
+/// synced from the catalog's `tool_calling` flag); see the `agent` /
+/// `tool_calling` synonym cluster in `ff_db`.
+fn workloads_tool_capable(workloads: &serde_json::Value) -> bool {
+    workloads
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .any(|v| matches!(v.as_str(), Some("tool_calling") | Some("agent")))
+        })
+        .unwrap_or(false)
+}
+
+/// Name-based fallback heuristic for when the DB has no workload tags (e.g. a
+/// local server we only know by `/v1/models` id). Deliberately excludes
+/// gemma-4: per `feedback_gemma4_no_tools`, gemma-4 MLX does not reliably
+/// tool-call, and routing an agent there hangs it silently.
 fn model_supports_tools(model_id: &str) -> bool {
     let id = model_id.to_lowercase();
-    id.contains("qwen")
-        || id.contains("gemma-4")
-        || id.contains("gemma4")
-        || id.contains("mistral")
-        || id.contains("llama-3")
-        || id == "auto"
+    id.contains("qwen") || id.contains("mistral") || id.contains("llama-3") || id == "auto"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn ep(label: &str, supports_tools: bool, is_local: bool) -> RouterEndpoint {
+        RouterEndpoint {
+            url: format!("http://{label}"),
+            model_id: label.into(),
+            label: label.into(),
+            supports_tools,
+            is_local,
+        }
+    }
+
+    #[test]
+    fn gemma4_is_not_tool_capable_by_name() {
+        // The documented foot-gun: gemma-4 must NOT be flagged tool-capable.
+        assert!(!model_supports_tools("gemma-4-27b"));
+        assert!(!model_supports_tools("gemma4"));
+        // While genuinely tool-capable families still pass.
+        assert!(model_supports_tools("qwen3-coder-30b"));
+        assert!(model_supports_tools("mistral-large"));
+        assert!(model_supports_tools("llama-3.1-70b"));
+        assert!(model_supports_tools("auto"));
+    }
+
+    #[test]
+    fn workloads_drive_tool_capability() {
+        assert!(workloads_tool_capable(&json!(["chat", "tool_calling"])));
+        assert!(workloads_tool_capable(&json!(["agent"])));
+        assert!(!workloads_tool_capable(&json!(["chat", "summarize"])));
+        assert!(!workloads_tool_capable(&json!([])));
+        assert!(!workloads_tool_capable(&json!(null)));
+    }
+
+    #[tokio::test]
+    async fn require_tools_skips_local_non_tool_endpoint() {
+        // Local gemma-4 (non-tool) listed first, remote qwen (tool) second —
+        // exactly the live taylor layout that used to hang the agent.
+        let router = InferenceRouter::new(vec![
+            ep("local-gemma", false, true),
+            ep("remote-qwen", true, false),
+        ]);
+        // Tool-requiring caller must reach the remote tool-capable node.
+        assert_eq!(
+            router.active_url_filtered(true).await.as_deref(),
+            Some("http://remote-qwen")
+        );
+        // Non-tool caller keeps the old local-first behavior.
+        assert_eq!(
+            router.active_url_filtered(false).await.as_deref(),
+            Some("http://local-gemma")
+        );
+    }
+
+    #[tokio::test]
+    async fn require_tools_falls_back_when_none_tool_capable() {
+        // No tool-capable endpoint anywhere — liveness wins; return something.
+        let router = InferenceRouter::new(vec![ep("local-gemma", false, true)]);
+        assert_eq!(
+            router.active_url_filtered(true).await.as_deref(),
+            Some("http://local-gemma")
+        );
+    }
+
+    #[tokio::test]
+    async fn require_tools_prefers_local_tool_capable() {
+        // A local tool-capable node still beats a remote one (local-first
+        // within the tool-capable tier).
+        let router = InferenceRouter::new(vec![
+            ep("local-qwen", true, true),
+            ep("remote-qwen", true, false),
+        ]);
+        assert_eq!(
+            router.active_url_filtered(true).await.as_deref(),
+            Some("http://local-qwen")
+        );
+    }
 }

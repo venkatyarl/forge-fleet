@@ -790,8 +790,11 @@ async fn run_agent_loop(
         // Resolve the active LLM endpoint: use InferenceRouter (local-first +
         // fleet failover) when available, otherwise fall back to llm_base_url.
         let active_base = if let Some(router) = &session.config.inference_router {
+            // The agent loop drives tools every turn — require a tool-capable
+            // endpoint so a local non-tool model (gemma-4) never shadows a
+            // remote tool-capable one and hangs the agent.
             router
-                .active_url()
+                .active_url_filtered(true)
                 .await
                 .unwrap_or_else(|| session.config.llm_base_url.clone())
         } else {
@@ -902,7 +905,7 @@ async fn run_agent_loop(
                 // next available fleet node (rather than waiting with backoff).
                 if let Some(router) = &session.config.inference_router {
                     router.report_failure(&active_base).await;
-                    let next = router.active_url().await;
+                    let next = router.active_url_filtered(true).await;
                     if next.as_deref() != Some(active_base.as_str()) {
                         emit(
                             &event_tx,
