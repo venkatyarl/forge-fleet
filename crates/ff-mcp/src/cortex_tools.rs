@@ -107,13 +107,17 @@ pub async fn cortex_find(params: Option<Value>) -> HandlerResult {
         .and_then(|p| p.get("semantic"))
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let kind = params
+        .as_ref()
+        .and_then(|p| p.get("kind"))
+        .and_then(|v| v.as_str());
     let pool = get_pool().await?;
     let hits = if semantic {
-        find_symbols_semantic(&pool, &corpus_slug, &query, limit)
+        find_symbols_semantic(&pool, &corpus_slug, &query, limit, kind)
             .await
             .map_err(|e| format!("find (semantic): {e}"))?
     } else {
-        find_symbols(&pool, &corpus_slug, &query, limit)
+        find_symbols(&pool, &corpus_slug, &query, limit, kind)
             .await
             .map_err(|e| format!("find: {e}"))?
     };

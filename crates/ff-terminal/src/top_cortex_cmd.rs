@@ -78,6 +78,11 @@ pub enum TopCortexCommand {
         /// Max hits to return (1-500).
         #[arg(long, default_value_t = 20)]
         limit: i64,
+        /// Narrow to one node-type class: function, struct, enum, trait, impl,
+        /// mod, class, interface, or `type` (the type-defining symbols across
+        /// languages: struct/enum/trait/class/interface). Default: all code:*.
+        #[arg(long)]
+        kind: Option<String>,
         #[arg(long, default_value = "table")]
         format: String,
     },
@@ -413,13 +418,15 @@ pub async fn handle_top_cortex(args: TopCortexArgs) -> Result<()> {
             corpus,
             semantic,
             limit,
+            kind,
             format,
         } => {
             let corpus = corpus.unwrap_or_else(cwd_slug);
             let hits = if semantic {
-                cortex::find_symbols_semantic(&pool, &corpus, &query, limit).await?
+                cortex::find_symbols_semantic(&pool, &corpus, &query, limit, kind.as_deref())
+                    .await?
             } else {
-                cortex::find_symbols(&pool, &corpus, &query, limit).await?
+                cortex::find_symbols(&pool, &corpus, &query, limit, kind.as_deref()).await?
             };
             print_hits(&hits, &format, &query, &corpus);
         }
