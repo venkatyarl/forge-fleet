@@ -918,6 +918,12 @@ enum ToolsCommand {
         /// Show only unhealthy tools (stale >5 min).
         #[arg(long)]
         unhealthy: bool,
+        /// Emit JSON (every field incl. the tool UUID, description,
+        /// capabilities_required, parameters_schema, call_count,
+        /// avg_latency_ms, and RFC3339 timestamps the table elides) — for
+        /// agent / scripted consumption instead of scraping the human table.
+        #[arg(long)]
+        json: bool,
     },
     /// Show tool health status across all nodes.
     Health,
@@ -4049,7 +4055,8 @@ async fn main() -> Result<()> {
                     node,
                     name,
                     unhealthy,
-                } => tools_cmd::handle_list(&pool, node, name, unhealthy).await,
+                    json,
+                } => tools_cmd::handle_list(&pool, node, name, unhealthy, json).await,
                 ToolsCommand::Health => tools_cmd::handle_health(&pool).await,
                 ToolsCommand::Register { node } => tools_cmd::handle_register(&pool, node).await,
             }
