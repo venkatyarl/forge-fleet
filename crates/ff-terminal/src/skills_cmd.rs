@@ -38,6 +38,9 @@ pub enum SkillsCommand {
         /// longer have a matching DB row.
         #[arg(long, default_value_t = false)]
         prune: bool,
+        /// Show what sync would write/prune without touching disk.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
     },
     /// Remove a skill from the DB and disk. Does NOT add it to
     /// retired_skills — use `retire` for that.
@@ -99,7 +102,7 @@ pub async fn handle_skills(cmd: SkillsCommand) -> Result<()> {
     match cmd {
         SkillsCommand::List { source, family } => list_cmd(&pool, source, family).await,
         SkillsCommand::Show { name, source } => show_cmd(&pool, &name, &source).await,
-        SkillsCommand::Sync { prune } => sync_cmd(&pool, prune).await,
+        SkillsCommand::Sync { prune, dry_run } => sync_cmd(&pool, prune, dry_run).await,
         SkillsCommand::Remove { name, source } => remove_cmd(&pool, &source, &name).await,
         SkillsCommand::Retire {
             name,
@@ -220,11 +223,41 @@ async fn show_cmd(pool: &sqlx::PgPool, name: &str, source: &str) -> Result<()> {
     Ok(())
 }
 
-async fn sync_cmd(pool: &sqlx::PgPool, prune: bool) -> Result<()> {
+async fn sync_cmd(pool: &sqlx::PgPool, prune: bool, dry_run: bool) -> Result<()> {
+    let root = skills_db::skills_root();
+    if dry_run {
+        // Preview only — touch nothing on disk. `materialize_all` would
+        // (over)write one SKILL.md per DB row; `--prune` would delete
+        // on-disk dirs with no matching row (the destructive part).
+        let known = skills_db::list_all(pool).await?;
+        println!(
+            "[dry-run] would materialize {} skill(s) under {}",
+            known.len(),
+            root.display()
+        );
+        if prune {
+            let orphans = skills_db::prune_orphans_plan(&known)?;
+            if orphans.is_empty() {
+                println!("[dry-run] would prune 0 orphaned on-disk skill dir(s)");
+            } else {
+                println!(
+                    "[dry-run] would prune {} orphaned on-disk skill dir(s):",
+                    orphans.len()
+                );
+                for dir in &orphans {
+                    println!("  - {}", dir.display());
+                }
+            }
+        } else {
+            println!("[dry-run] prune not requested (pass --prune to preview GC)");
+        }
+        return Ok(());
+    }
+
     let (written, skipped) = skills_db::materialize_all(pool).await?;
     println!(
         "materialized: {written} skill(s); skipped: {skipped}; root={}",
-        skills_db::skills_root().display()
+        root.display()
     );
     if prune {
         let known = skills_db::list_all(pool).await?;
