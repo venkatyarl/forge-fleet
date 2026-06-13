@@ -311,8 +311,14 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
         crate::ModelCommand::Search { query } => {
             let rows = ff_db::pg_search_catalog(&pool, &query).await?;
             if rows.is_empty() {
+                // No match is a non-zero exit, mirroring `ff model where` (#237)
+                // and the cortex `find` convention — so a script/agent can test
+                // "does the catalog hold a model matching X?" by exit code
+                // (`if ff model search X >/dev/null; then ...`) instead of parsing
+                // stdout. `search` takes a required query and answers a lookup,
+                // unlike the browse verb `ff model catalog` (empty → exit 0).
                 println!("(no catalog matches for \"{query}\")");
-                return Ok(());
+                std::process::exit(1);
             }
             println!(
                 "{:<28} {:<10} {:<6} {:<7} NAME",
