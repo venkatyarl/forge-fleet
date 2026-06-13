@@ -243,7 +243,10 @@ pub async fn handle_nodes(gpu: Option<&str>, json: bool) -> Result<()> {
 /// Sort key for an IPv4 string: the address as a big-endian u32. Anything that
 /// isn't a valid IPv4 (IPv6, hostname, out-of-range octet) sorts last. Parsing
 /// the whole string atomically avoids silently shifting octets on bad input.
-fn ip_sort_key(ip: &str) -> u32 {
+///
+/// Shared by every per-computer table (`ff fleet nodes`, `ff fleet health`, …)
+/// so they all read in subnet order — the fleet-table convention.
+pub(crate) fn ip_sort_key(ip: &str) -> u32 {
     ip.parse::<std::net::Ipv4Addr>()
         .map(u32::from)
         .unwrap_or(u32::MAX)
@@ -257,5 +260,44 @@ pub fn detect_os_family() -> String {
         "linux".into()
     } else {
         "unknown".into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ip_sort_key;
+
+    #[test]
+    fn sorts_numerically_by_octet_not_lexically() {
+        // The fleet lives on 192.168.5.x; lexical order would wrongly put
+        // ".100" before ".99" and ".116" before ".9". Octet order must not.
+        let mut ips = vec![
+            "192.168.5.119",
+            "192.168.5.9",
+            "192.168.5.100",
+            "192.168.5.102",
+            "192.168.5.99",
+        ];
+        ips.sort_by_key(|s| ip_sort_key(s));
+        assert_eq!(
+            ips,
+            vec![
+                "192.168.5.9",
+                "192.168.5.99",
+                "192.168.5.100",
+                "192.168.5.102",
+                "192.168.5.119",
+            ]
+        );
+    }
+
+    #[test]
+    fn non_ipv4_sorts_last() {
+        // Hostnames / IPv6 / malformed addresses park at the end instead of
+        // silently colliding with a real low address.
+        assert_eq!(ip_sort_key("not-an-ip"), u32::MAX);
+        assert_eq!(ip_sort_key(""), u32::MAX);
+        assert_eq!(ip_sort_key("::1"), u32::MAX);
+        assert!(ip_sort_key("192.168.5.119") < ip_sort_key("not-an-ip"));
     }
 }
