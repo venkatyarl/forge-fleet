@@ -170,8 +170,14 @@ pub async fn cortex_show(params: Option<Value>) -> HandlerResult {
         .and_then(|v| v.as_u64())
         .map(|n| n.clamp(1, 2000) as usize)
         .unwrap_or(200);
+    let context = params
+        .as_ref()
+        .and_then(|p| p.get("context"))
+        .and_then(|v| v.as_u64())
+        .map(|n| n.min(500) as usize)
+        .unwrap_or(0);
     let pool = get_pool().await?;
-    let found = ff_brain::show_symbol(&pool, &corpus_slug, &symbol, kind, max_lines)
+    let found = ff_brain::show_symbol(&pool, &corpus_slug, &symbol, kind, max_lines, context)
         .await
         .map_err(|e| format!("show: {e}"))?;
     match found {
@@ -188,6 +194,7 @@ pub async fn cortex_show(params: Option<Value>) -> HandlerResult {
             "file": s.file,
             "start_line": s.start_line,
             "end_line": s.end_line,
+            "display_start": s.display_start,
             "fan_in": s.fan_in,
             "truncated": s.truncated,
             "source": s.source,

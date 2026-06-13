@@ -103,6 +103,10 @@ pub enum TopCortexCommand {
         /// Cap the printed source at this many lines (truncation is flagged).
         #[arg(long, default_value_t = 200)]
         max_lines: usize,
+        /// Show N lines of surrounding context above and below the symbol (like
+        /// `grep -C`); context lines are marked with a dotted gutter. Default 0.
+        #[arg(long, short = 'C', default_value_t = 0)]
+        context: usize,
         #[arg(long, default_value = "table")]
         format: String,
     },
@@ -487,11 +491,13 @@ pub async fn handle_top_cortex(args: TopCortexArgs) -> Result<()> {
             corpus,
             kind,
             max_lines,
+            context,
             format,
         } => {
             let corpus = corpus.unwrap_or_else(cwd_slug);
             let found =
-                cortex::show_symbol(&pool, &corpus, &symbol, kind.as_deref(), max_lines).await?;
+                cortex::show_symbol(&pool, &corpus, &symbol, kind.as_deref(), max_lines, context)
+                    .await?;
             print_symbol_source(found.as_ref(), &format, &symbol, &corpus);
             if found.is_none() {
                 std::process::exit(1);
@@ -638,6 +644,7 @@ fn print_symbol_source(
                 "file": s.file,
                 "start_line": s.start_line,
                 "end_line": s.end_line,
+                "display_start": s.display_start,
                 "fan_in": s.fan_in,
                 "truncated": s.truncated,
                 "source": s.source,
@@ -670,9 +677,15 @@ fn print_symbol_source(
                     s.other_matches.join(", ")
                 );
             }
-            // Source with the symbol's real 1-based line numbers down the left.
+            // Source with the file's real 1-based line numbers down the left,
+            // numbered from `display_start` (= start_line when --context 0). Lines
+            // outside the symbol's own span (context, with --context N) get a
+            // dotted gutter so the definition stands out from its surroundings.
             for (i, line) in s.source.lines().enumerate() {
-                println!("  {:>5} \u{2502} {}", s.start_line as usize + i, line);
+                let lineno = s.display_start as usize + i;
+                let in_span = lineno >= s.start_line as usize && lineno <= s.end_line as usize;
+                let gutter = if in_span { '\u{2502}' } else { '\u{250a}' };
+                println!("  {:>5} {} {}", lineno, gutter, line);
             }
             if s.truncated {
                 println!("{YELLOW}  \u{2026} (truncated; raise --max-lines to see more){RESET}");
