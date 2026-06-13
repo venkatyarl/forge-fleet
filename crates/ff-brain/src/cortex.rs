@@ -984,17 +984,65 @@ pub fn escape_like(q: &str) -> String {
     out
 }
 
+/// Map a `--kind` keyword to the set of `code:*` node_types it selects, or
+/// `None` if the keyword is unrecognized (the caller errors). Single leaf kinds
+/// (`function`, `struct`, …) select that exact `code:<kind>`; `type` is an
+/// ergonomic cross-language alias for the type-defining symbols (struct/enum/
+/// trait — Rust — plus class/interface — TS/Java/Python) so an agent can ask
+/// for "the type called Foo" without knowing which language declared it.
+pub fn kind_filter_types(kind: &str) -> Option<Vec<&'static str>> {
+    let v = match kind {
+        "function" | "fn" => vec!["code:function"],
+        "struct" => vec!["code:struct"],
+        "enum" => vec!["code:enum"],
+        "trait" => vec!["code:trait"],
+        "impl" => vec!["code:impl"],
+        "mod" | "module" => vec!["code:mod"],
+        "class" => vec!["code:class"],
+        "interface" => vec!["code:interface"],
+        "type" => vec![
+            "code:struct",
+            "code:enum",
+            "code:trait",
+            "code:class",
+            "code:interface",
+        ],
+        _ => return None,
+    };
+    Some(v)
+}
+
+/// Resolve an optional `--kind` keyword into the bind value for the `node_type =
+/// ANY($k)` filter: `None` (no filter) stays `None`; an unknown keyword is a
+/// loud error (rather than silently matching nothing). Owned `String`s so the
+/// vector binds directly as a Postgres `text[]`.
+fn resolve_kind_filter(kind: Option<&str>) -> Result<Option<Vec<String>>> {
+    match kind {
+        None => Ok(None),
+        Some(k) => match kind_filter_types(k) {
+            Some(types) => Ok(Some(types.iter().map(|s| s.to_string()).collect())),
+            None => anyhow::bail!(
+                "unknown --kind '{k}' (expected one of: function, struct, enum, trait, \
+                 impl, mod, class, interface, type)"
+            ),
+        },
+    }
+}
+
 /// Find code symbols whose qualified name contains `query` (case-insensitive),
 /// ranked by fan-in desc then name, capped at `limit` (clamped to 1..=500).
+/// `kind` optionally narrows to a node-type class (see [`kind_filter_types`]).
 /// The discovery entrypoint for the relationship queries.
 pub async fn find_symbols(
     pool: &PgPool,
     corpus_slug: &str,
     query: &str,
     limit: i64,
+    kind: Option<&str>,
 ) -> Result<Vec<SymbolHit>> {
     let pattern = format!("%{}%", escape_like(query));
     let limit = limit.clamp(1, 500);
+    let kind_types = resolve_kind_filter(kind)?;
     let rows = sqlx::query(
         r#"SELECT n.id, n.title, n.node_type, n.start_line,
                   (SELECT count(*) FROM brain_vault_edges e
@@ -1003,12 +1051,14 @@ pub async fn find_symbols(
             WHERE n.project = $1
               AND n.node_type LIKE 'code:%'
               AND n.title ILIKE $2 ESCAPE '\'
+              AND ($4::text[] IS NULL OR n.node_type = ANY($4))
             ORDER BY fan_in DESC, n.title COLLATE "C"
             LIMIT $3"#,
     )
     .bind(corpus_slug)
     .bind(&pattern)
     .bind(limit)
+    .bind(kind_types.as_deref())
     .fetch_all(pool)
     .await?;
 
@@ -1088,8 +1138,10 @@ pub async fn find_symbols_semantic(
     corpus_slug: &str,
     query: &str,
     limit: i64,
+    kind: Option<&str>,
 ) -> Result<Vec<SymbolHit>> {
     let limit = limit.clamp(1, 500);
+    let kind_types = resolve_kind_filter(kind)?;
     let client = crate::embeddings::fleet_embedding_client(pool)
         .await
         .ok_or_else(|| {
@@ -1117,12 +1169,14 @@ pub async fn find_symbols_semantic(
             WHERE n.project = $1
               AND n.node_type LIKE 'code:%'
               AND n.embedding IS NOT NULL
+              AND ($4::text[] IS NULL OR n.node_type = ANY($4))
             ORDER BY n.embedding <-> $2::vector
             LIMIT $3"#,
     )
     .bind(corpus_slug)
     .bind(&qlit)
     .bind(limit)
+    .bind(kind_types.as_deref())
     .fetch_all(pool)
     .await?;
 
@@ -3110,6 +3164,47 @@ mod tests {
         assert_eq!(escape_like("a%b_c\\d"), r"a\%b\_c\\d");
         assert_eq!(escape_like("plainName"), "plainName");
         assert_eq!(escape_like(""), "");
+    }
+
+    #[test]
+    fn kind_filter_maps_leaves_and_type_alias() {
+        // A single leaf kind selects exactly that code:<kind>.
+        assert_eq!(kind_filter_types("function"), Some(vec!["code:function"]));
+        assert_eq!(kind_filter_types("class"), Some(vec!["code:class"]));
+        // Friendly synonyms resolve to the same leaf.
+        assert_eq!(kind_filter_types("fn"), kind_filter_types("function"));
+        assert_eq!(kind_filter_types("module"), kind_filter_types("mod"));
+        // `type` is the cross-language alias for the type-defining symbols.
+        assert_eq!(
+            kind_filter_types("type"),
+            Some(vec![
+                "code:struct",
+                "code:enum",
+                "code:trait",
+                "code:class",
+                "code:interface",
+            ])
+        );
+        // Every returned node_type is a real code:* leaf.
+        for t in kind_filter_types("type").unwrap() {
+            assert!(t.starts_with("code:"));
+        }
+        // Unknown keyword → None (the caller turns this into a loud error).
+        assert_eq!(kind_filter_types("widget"), None);
+        assert_eq!(kind_filter_types(""), None);
+    }
+
+    #[test]
+    fn resolve_kind_filter_validates() {
+        // No filter stays None (matches everything).
+        assert!(resolve_kind_filter(None).unwrap().is_none());
+        // A known kind yields owned node_type strings for the text[] bind.
+        assert_eq!(
+            resolve_kind_filter(Some("function")).unwrap(),
+            Some(vec!["code:function".to_string()])
+        );
+        // An unknown kind errors rather than silently matching nothing.
+        assert!(resolve_kind_filter(Some("nope")).is_err());
     }
 
     #[test]

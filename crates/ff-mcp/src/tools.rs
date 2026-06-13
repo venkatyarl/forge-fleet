@@ -865,6 +865,10 @@ impl ToolRegistry {
                         "type": "integer",
                         "description": "Max hits to return (1-500, default 20)",
                         "default": 20
+                    },
+                    "kind": {
+                        "type": "string",
+                        "description": "Narrow to one node-type class: function, struct, enum, trait, impl, mod, class, interface, or 'type' (the type-defining symbols across languages: struct/enum/trait/class/interface). Default: all code symbols."
                     }
                 },
                 "required": ["corpus", "query"]
