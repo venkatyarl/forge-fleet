@@ -21,6 +21,10 @@ pub enum SkillsCommand {
         /// Filter by family (e.g. design, code, docs).
         #[arg(long)]
         family: Option<String>,
+        /// Emit a JSON array (one lean metadata object per skill) for
+        /// scripts/agents instead of the table. Omits the SKILL.md body.
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
     /// Print the SKILL.md for one skill.
     Show {
@@ -91,7 +95,12 @@ pub enum SkillsCommand {
         r#ref: Option<String>,
     },
     /// Show count / source breakdown / risk distribution.
-    Stats,
+    Stats {
+        /// Emit the counts as a JSON object (total + by_source / by_family
+        /// / by_risk maps) for scripts/agents instead of the text report.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }
 
 pub async fn handle_skills(cmd: SkillsCommand) -> Result<()> {
@@ -100,7 +109,11 @@ pub async fn handle_skills(cmd: SkillsCommand) -> Result<()> {
         .map_err(|e| anyhow!("connect Postgres: {e}"))?;
 
     match cmd {
-        SkillsCommand::List { source, family } => list_cmd(&pool, source, family).await,
+        SkillsCommand::List {
+            source,
+            family,
+            json,
+        } => list_cmd(&pool, source, family, json).await,
         SkillsCommand::Show { name, source } => show_cmd(&pool, &name, &source).await,
         SkillsCommand::Sync { prune, dry_run } => sync_cmd(&pool, prune, dry_run).await,
         SkillsCommand::Remove { name, source } => remove_cmd(&pool, &source, &name).await,
@@ -139,7 +152,7 @@ pub async fn handle_skills(cmd: SkillsCommand) -> Result<()> {
             )
             .await
         }
-        SkillsCommand::Stats => stats_cmd(&pool).await,
+        SkillsCommand::Stats { json } => stats_cmd(&pool, json).await,
     }
 }
 
@@ -147,6 +160,7 @@ async fn list_cmd(
     pool: &sqlx::PgPool,
     source: Option<String>,
     family: Option<String>,
+    json: bool,
 ) -> Result<()> {
     let all = skills_db::list_all(pool).await?;
     let mut filtered: Vec<_> = all
@@ -172,6 +186,15 @@ async fn list_cmd(
                 b.name.as_str(),
             ))
     });
+
+    if json {
+        // Lean per-skill metadata — deliberately omits the full SKILL.md
+        // body (use `ff skills show` for that). description is the full
+        // first line, not the table's truncated form.
+        let arr: Vec<serde_json::Value> = filtered.iter().map(skill_to_json).collect();
+        println!("{}", serde_json::to_string_pretty(&arr)?);
+        return Ok(());
+    }
 
     println!(
         "{:<22} {:<14} {:<14} {:<8} {:<8} {}",
@@ -343,7 +366,7 @@ async fn import_repo_cmd(
     Ok(())
 }
 
-async fn stats_cmd(pool: &sqlx::PgPool) -> Result<()> {
+async fn stats_cmd(pool: &sqlx::PgPool, json: bool) -> Result<()> {
     let rows = skills_db::list_all(pool).await?;
     let total = rows.len();
     let mut by_source: std::collections::BTreeMap<String, usize> = Default::default();
@@ -356,6 +379,18 @@ async fn stats_cmd(pool: &sqlx::PgPool) -> Result<()> {
             .or_default() += 1;
         *by_risk.entry(r.risk_level.clone()).or_default() += 1;
     }
+
+    if json {
+        let out = serde_json::json!({
+            "total": total,
+            "by_source": by_source,
+            "by_family": by_family,
+            "by_risk": by_risk,
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+
     println!("total skills: {total}");
     println!();
     println!("by source:");
@@ -373,6 +408,23 @@ async fn stats_cmd(pool: &sqlx::PgPool) -> Result<()> {
         println!("  {:<20} {}", k, v);
     }
     Ok(())
+}
+
+/// Lean per-skill JSON metadata for `ff skills list --json`. Deliberately
+/// omits the full SKILL.md body (`body_md`) — agents use `ff skills show`
+/// for that — and emits the FULL first line of the description (not the
+/// table's truncated form) so the structured output is lossless.
+fn skill_to_json(s: &skills_db::SkillRow) -> serde_json::Value {
+    serde_json::json!({
+        "id": s.id,
+        "name": s.name,
+        "source": s.source,
+        "family": s.family,
+        "version": s.version,
+        "risk_level": s.risk_level,
+        "description": s.description.as_deref().unwrap_or("").lines().next().unwrap_or(""),
+        "source_url": s.source_url,
+    })
 }
 
 fn truncate(s: &str, n: usize) -> String {
@@ -400,4 +452,62 @@ fn derive_source_from_url(url: &str) -> String {
         .next()
         .unwrap_or("unknown")
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ff_agent::skills_db::SkillRow;
+
+    fn row(name: &str, desc: Option<&str>, family: Option<&str>) -> SkillRow {
+        SkillRow {
+            id: uuid::Uuid::nil(),
+            name: name.to_string(),
+            source: "anthropic".to_string(),
+            source_url: Some("https://example/skill".to_string()),
+            version: "1.0.0".to_string(),
+            family: family.map(|f| f.to_string()),
+            description: desc.map(|d| d.to_string()),
+            when_to_invoke: None,
+            tools: serde_json::Value::Null,
+            body_md: "# huge SKILL.md body that must NOT appear in --json".to_string(),
+            body_sha256: "deadbeef".to_string(),
+            risk_level: "low".to_string(),
+            canonical_skill_id: None,
+            superseded_by: None,
+            combines: serde_json::Value::Null,
+        }
+    }
+
+    #[test]
+    fn skill_json_is_lean_and_omits_body() {
+        let v = skill_to_json(&row("docx", Some("Edit Word docs"), Some("docs")));
+        let obj = v.as_object().unwrap();
+        // Exactly the lean metadata keys — no body_md / body_sha256 / tools.
+        assert_eq!(obj.get("name").unwrap(), "docx");
+        assert_eq!(obj.get("source").unwrap(), "anthropic");
+        assert_eq!(obj.get("family").unwrap(), "docs");
+        assert_eq!(obj.get("version").unwrap(), "1.0.0");
+        assert_eq!(obj.get("risk_level").unwrap(), "low");
+        assert_eq!(obj.get("description").unwrap(), "Edit Word docs");
+        assert!(obj.get("body_md").is_none());
+        assert!(obj.get("body_sha256").is_none());
+        assert!(obj.get("tools").is_none());
+    }
+
+    #[test]
+    fn skill_json_uses_full_first_line_and_handles_nulls() {
+        // description: full first line only (newline-stripped, NOT truncated).
+        let long = "This is a long first line that the table would clip with an ellipsis but JSON keeps whole\nsecond line dropped";
+        let v = skill_to_json(&row("x", Some(long), None));
+        let obj = v.as_object().unwrap();
+        assert_eq!(
+            obj.get("description").unwrap(),
+            "This is a long first line that the table would clip with an ellipsis but JSON keeps whole"
+        );
+        // null family / missing description serialize as JSON null / "".
+        assert!(obj.get("family").unwrap().is_null());
+        let v2 = skill_to_json(&row("y", None, None));
+        assert_eq!(v2.as_object().unwrap().get("description").unwrap(), "");
+    }
 }

@@ -29,18 +29,47 @@ struct AliasRow {
 pub async fn handle_github(cmd: GithubCommand) -> Result<()> {
     let pool = open_pool().await?;
     match cmd {
-        GithubCommand::List => handle_list(&pool).await,
+        GithubCommand::List { json } => handle_list(&pool, json).await,
         GithubCommand::Sync { dry_run } => handle_sync(&pool, dry_run).await,
     }
 }
 
-async fn handle_list(pool: &sqlx::PgPool) -> Result<()> {
+async fn handle_list(pool: &sqlx::PgPool, json: bool) -> Result<()> {
     let aliases: Vec<AliasRow> = sqlx::query_as(
         "SELECT alias_name, hostname, ssh_user, identity_file, identities_only, description
          FROM github_ssh_aliases ORDER BY alias_name",
     )
     .fetch_all(pool)
     .await?;
+
+    if json {
+        let mut arr: Vec<serde_json::Value> = Vec::with_capacity(aliases.len());
+        for a in &aliases {
+            let secret_base = secret_base_for(&a.identity_file);
+            let priv_key = format!("{secret_base}_priv");
+            let pub_key = format!("{secret_base}_pub");
+            let priv_present = secret_present(pool, &priv_key).await?;
+            let pub_present = secret_present(pool, &pub_key).await?;
+            let fp = if pub_present {
+                fingerprint_from_db(pool, &pub_key).await.ok()
+            } else {
+                None
+            };
+            arr.push(serde_json::json!({
+                "alias_name": a.alias_name,
+                "hostname": a.hostname,
+                "ssh_user": a.ssh_user,
+                "identity_file": a.identity_file,
+                "identities_only": a.identities_only,
+                "description": a.description,
+                "priv_present": priv_present,
+                "pub_present": pub_present,
+                "fingerprint": fp,
+            }));
+        }
+        println!("{}", serde_json::to_string_pretty(&arr)?);
+        return Ok(());
+    }
 
     println!(
         "{GREEN}✓ GitHub SSH aliases{RESET} ({} from Postgres)",
