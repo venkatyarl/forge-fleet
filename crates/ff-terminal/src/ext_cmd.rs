@@ -55,6 +55,7 @@ pub async fn handle_ext_installed(
 ) -> Result<()> {
     let mut sql = String::from(
         "SELECT c.name              AS computer,
+                c.primary_ip         AS primary_ip,
                 et.id                AS tool_id,
                 et.display_name      AS display_name,
                 et.kind              AS kind,
@@ -90,10 +91,13 @@ pub async fn handle_ext_installed(
         query = query.bind(t);
     }
 
-    let rows = query
+    let mut rows = query
         .fetch_all(pool)
         .await
         .map_err(|e| anyhow::anyhow!("list computer_external_tools: {e}"))?;
+    // Subnet order (per-computer table convention) — numeric octets, not the
+    // lexical `c.name`. SQL ORDER BY name,id stays the stable secondary key.
+    crate::helpers::sort_rows_by_primary_ip(&mut rows);
 
     if json {
         let arr: Vec<_> = rows.iter().map(|r| serde_json::json!({
@@ -144,8 +148,9 @@ pub async fn handle_ext_installed(
 }
 
 pub async fn handle_ext_drift(pool: &sqlx::PgPool, json: bool) -> Result<()> {
-    let rows = sqlx::query(
+    let mut rows = sqlx::query(
         "SELECT c.name              AS computer,
+                c.primary_ip         AS primary_ip,
                 et.id                AS tool_id,
                 et.display_name      AS display_name,
                 cet.installed_version AS installed_version,
@@ -164,6 +169,7 @@ pub async fn handle_ext_drift(pool: &sqlx::PgPool, json: bool) -> Result<()> {
     .fetch_all(pool)
     .await
     .map_err(|e| anyhow::anyhow!("list ext drift: {e}"))?;
+    crate::helpers::sort_rows_by_primary_ip(&mut rows);
 
     if json {
         let arr: Vec<_> = rows.iter().map(|r| serde_json::json!({

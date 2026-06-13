@@ -252,6 +252,24 @@ pub(crate) fn ip_sort_key(ip: &str) -> u32 {
         .unwrap_or(u32::MAX)
 }
 
+/// Sort raw query rows by their `primary_ip` column in numeric-octet order
+/// (the per-computer-table convention), so a `JOIN computers` listing reads in
+/// subnet order rather than lexically by name. Callers keep `ORDER BY c.name …`
+/// in SQL as a stable secondary key; this stable sort preserves it within an IP.
+/// The column must be selected as `primary_ip` (nullable → sorts last).
+pub(crate) fn sort_rows_by_primary_ip(rows: &mut [sqlx::postgres::PgRow]) {
+    use sqlx::Row;
+    rows.sort_by_key(|r| {
+        ip_sort_key(
+            r.try_get::<Option<String>, _>("primary_ip")
+                .ok()
+                .flatten()
+                .as_deref()
+                .unwrap_or(""),
+        )
+    });
+}
+
 /// Detect the OS family of the current host.
 pub fn detect_os_family() -> String {
     if cfg!(target_os = "macos") {

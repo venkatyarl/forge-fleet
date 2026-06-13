@@ -123,6 +123,7 @@ pub async fn handle_software_list(
 
     let mut sql = String::from(
         "SELECT c.name            AS computer,
+                c.primary_ip       AS primary_ip,
                 sr.id              AS software_id,
                 sr.display_name    AS display_name,
                 sr.kind            AS kind,
@@ -156,10 +157,13 @@ pub async fn handle_software_list(
         query = query.bind(s);
     }
 
-    let rows = query
+    let mut rows = query
         .fetch_all(pool)
         .await
         .map_err(|e| anyhow::anyhow!("list software: {e}"))?;
+    // Subnet order (per-computer table convention); SQL name,id is the stable
+    // secondary key within an IP.
+    crate::helpers::sort_rows_by_primary_ip(&mut rows);
 
     if json {
         let arr: Vec<_> = rows.iter().map(|r| serde_json::json!({
@@ -208,8 +212,9 @@ pub async fn handle_software_list(
 }
 
 pub async fn handle_software_drift(pool: &sqlx::PgPool, json: bool) -> Result<()> {
-    let rows = sqlx::query(
+    let mut rows = sqlx::query(
         "SELECT c.name              AS computer,
+                c.primary_ip         AS primary_ip,
                 sr.id                AS software_id,
                 sr.display_name      AS display_name,
                 cs.installed_version AS installed_version,
@@ -228,6 +233,7 @@ pub async fn handle_software_drift(pool: &sqlx::PgPool, json: bool) -> Result<()
     .fetch_all(pool)
     .await
     .map_err(|e| anyhow::anyhow!("list drift: {e}"))?;
+    crate::helpers::sort_rows_by_primary_ip(&mut rows);
 
     if json {
         let arr: Vec<_> = rows.iter().map(|r| serde_json::json!({
