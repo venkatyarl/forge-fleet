@@ -463,23 +463,36 @@ pub async fn fleet_ssh(params: Option<Value>) -> HandlerResult {
     let (config, _config_path) = load_config_auto()?;
     let mut ssh_node = resolve_ssh_node(&config, params.as_ref(), node_ref)?;
 
-    // Override the SSH user with the canonical per-node `computers.ssh_user`
-    // from Postgres. fleet.toml frequently omits the username, so the
-    // resolver falls back to `$USER` (venkat on Taylor) — which is wrong for
-    // hosts whose login differs (DGX Sparks, Linux boxes, etc.). The DB is
-    // the source of truth for who to SSH as. An explicit `username` param
-    // still wins; otherwise the DB value is authoritative. Best-effort: if
-    // Postgres is unreachable we keep the resolver's value.
+    // Resolve the host and SSH user from Postgres (the source of truth) when
+    // the in-memory fleet config didn't already map this node. In
+    // `postgres_full` mode fleet.toml is frequently sparse, so a bare node
+    // NAME like "ace" falls through `resolve_ssh_node` as a literal DNS
+    // hostname and ssh fails with "Could not resolve hostname ace". The
+    // documented resolver chain is Postgres → fleet.toml → fleet.json; this
+    // restores the Postgres tier for the MCP ssh path so a name works
+    // wherever an IP does. An explicit `username` param still wins for the
+    // user; the host always prefers the DB `primary_ip` when the config
+    // missed. Best-effort: if Postgres is unreachable we keep whatever the
+    // config resolver produced.
     let user_override = params
         .as_ref()
         .and_then(|p| p.get("username"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    if let Some(u) = user_override {
-        ssh_node.username = u;
-    } else if let Ok(pool) = get_pg_pool(&config).await {
-        let db_user: Option<String> = sqlx::query_scalar(
-            "SELECT COALESCE(NULLIF(c.ssh_user, ''), fw.ssh_user)
+
+    let in_config = config.nodes.contains_key(node_ref)
+        || config
+            .nodes
+            .values()
+            .any(|n| n.ip == node_ref || n.alt_ips.iter().any(|ip| ip == node_ref));
+    let needs_host = needs_db_host_resolution(in_config, &ssh_node.host, node_ref);
+
+    if (needs_host || user_override.is_none())
+        && let Ok(pool) = get_pg_pool(&config).await
+    {
+        let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT c.primary_ip,
+                    COALESCE(NULLIF(c.ssh_user, ''), fw.ssh_user)
                FROM computers c
                LEFT JOIN fleet_workers fw ON fw.name = c.name
               WHERE LOWER(c.name) = LOWER($1) OR c.primary_ip = $1
@@ -489,13 +502,20 @@ pub async fn fleet_ssh(params: Option<Value>) -> HandlerResult {
         .fetch_optional(&pool)
         .await
         .ok()
-        .flatten()
         .flatten();
-        if let Some(u) = db_user
-            && !u.is_empty()
-        {
-            ssh_node.username = u;
+        if let Some((primary_ip, db_user)) = row {
+            if needs_host && let Some(ip) = primary_ip.filter(|s| !s.is_empty()) {
+                ssh_node.host = ip;
+            }
+            if user_override.is_none()
+                && let Some(u) = db_user.filter(|s| !s.is_empty())
+            {
+                ssh_node.username = u;
+            }
         }
+    }
+    if let Some(u) = user_override {
+        ssh_node.username = u;
     }
 
     let executor = RemoteExecutor::new(timeout_secs, true);
@@ -3285,6 +3305,16 @@ fn scan_status_to_str(status: NodeScanStatus) -> &'static str {
     }
 }
 
+/// True when `node_ref` resolved to a literal (non-IP) hostname only because
+/// the in-memory fleet config didn't know it — meaning we should consult
+/// Postgres for its `primary_ip` rather than hand a bare name like "ace" to
+/// ssh (which would fail DNS resolution). False when the config already
+/// resolved the node (host differs from the bare ref, or the ref is itself an
+/// IP), so we never override a real config/IP host.
+fn needs_db_host_resolution(in_config: bool, resolved_host: &str, node_ref: &str) -> bool {
+    !in_config && resolved_host == node_ref && node_ref.parse::<std::net::IpAddr>().is_err()
+}
+
 fn resolve_ssh_node(
     config: &FleetConfig,
     params: Option<&Value>,
@@ -4214,6 +4244,23 @@ mod tests {
         let mut root = json!({});
         set_json_dot_path(&mut root, "services.ff_api.port", json!(4000)).unwrap();
         assert_eq!(root["services"]["ff_api"]["port"], 4000);
+    }
+
+    #[test]
+    fn needs_db_host_resolution_only_for_unknown_names() {
+        // Bare name not in config, resolver fell through to the literal name
+        // → must consult Postgres for the IP.
+        assert!(needs_db_host_resolution(false, "ace", "ace"));
+        // Found in config (host was rewritten to its IP) → never override.
+        assert!(!needs_db_host_resolution(true, "192.168.5.105", "ace"));
+        // Node ref is itself an IP → usable directly, no DB lookup.
+        assert!(!needs_db_host_resolution(
+            false,
+            "192.168.5.105",
+            "192.168.5.105"
+        ));
+        // Config resolved a name to a different host string → leave it.
+        assert!(!needs_db_host_resolution(false, "192.168.5.105", "ace"));
     }
 
     #[test]
