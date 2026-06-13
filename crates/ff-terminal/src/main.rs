@@ -394,6 +394,10 @@ enum Command {
     Versions {
         #[arg(long)]
         node: Option<String>,
+        /// Emit lossless JSON (one object per node, per-tool current/latest/status)
+        /// instead of the human drift matrix.
+        #[arg(long)]
+        json: bool,
     },
     /// Fleet-wide operations (mesh check, verify node, etc.)
     Fleet {
@@ -3109,8 +3113,8 @@ async fn main() -> Result<()> {
         Some(Command::Nodes { gpu, json }) => {
             return helpers::handle_nodes(gpu.as_deref(), *json).await;
         }
-        Some(Command::Versions { node }) => {
-            return versions_cmd::handle_versions(node.clone()).await;
+        Some(Command::Versions { node, json }) => {
+            return versions_cmd::handle_versions(node.clone(), *json).await;
         }
         Some(Command::Fleet { command }) => return fleet_cmd::handle_fleet(command.clone()).await,
         Some(Command::Ssh {
@@ -3368,7 +3372,7 @@ async fn main() -> Result<()> {
             )
             .await
         }
-        Some(Command::Versions { node }) => versions_cmd::handle_versions(node).await,
+        Some(Command::Versions { node, json }) => versions_cmd::handle_versions(node, json).await,
         Some(Command::Fleet { command }) => fleet_cmd::handle_fleet(command).await,
         Some(Command::Ssh {
             worker,
