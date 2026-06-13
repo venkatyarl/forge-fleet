@@ -1037,6 +1037,9 @@ pub enum DeferCommand {
         status: Option<String>,
         #[arg(long, default_value_t = 50)]
         limit: i64,
+        /// Emit lossless JSON (one object per task) instead of the human table.
+        #[arg(long)]
+        json: bool,
     },
     /// Enqueue a shell command to run when a target node comes online.
     /// Example: ff defer add-shell --when-node-online ace --run "rm -rf ~/.ollama" --title "Ollama cleanup on ace"
