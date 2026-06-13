@@ -1398,6 +1398,163 @@ pub async fn find_symbols_semantic(
     Ok(hits)
 }
 
+// ─── Symbol source retrieval (`ff cortex show`) ──────────────────────────────
+//
+// Collapse the agent's two-step "find a symbol → open its file and read the
+// span" into one token-efficient call: resolve a name to its owning file +
+// 1-based line span (V124 `start_line`/`end_line`), then return JUST that
+// symbol's source slice. The Cortex-native equivalent of CRG's
+// `get_review_context` — an agent gets the definition without scanning the file.
+
+/// One resolved symbol plus its source slice, from [`show_symbol`].
+#[derive(Debug, Clone)]
+pub struct SymbolSource {
+    pub qualified_name: String,
+    pub node_type: String,
+    /// Absolute path of the owning `content:file` node.
+    pub file: String,
+    /// 1-based inclusive line span of the symbol in `file`.
+    pub start_line: i32,
+    pub end_line: i32,
+    pub fan_in: i64,
+    /// The extracted source (lines `start_line..=end_line`, possibly truncated
+    /// to `max_lines` — see `truncated`).
+    pub source: String,
+    /// True when the span exceeded `max_lines` and `source` was cut short.
+    pub truncated: bool,
+    /// Other qualified names that also matched the query (so the caller can hint
+    /// "did you mean …" when the pick was ambiguous). Excludes the chosen symbol.
+    pub other_matches: Vec<String>,
+}
+
+/// The last `::`- or `.`-separated segment of a qualified name (its leaf), used
+/// for "exact leaf match" disambiguation in [`pick_show_match`]. Pure.
+fn leaf_name(qualified: &str) -> &str {
+    qualified
+        .rsplit_once("::")
+        .map(|(_, leaf)| leaf)
+        .or_else(|| qualified.rsplit_once('.').map(|(_, leaf)| leaf))
+        .unwrap_or(qualified)
+}
+
+/// Choose which hit `show` should display, given the fan-in-ranked `hits` and
+/// the user's `query`. Preference order, most-specific first:
+///   1. an exact (case-insensitive) qualified-name match,
+///   2. an exact (case-insensitive) leaf-name match (highest fan-in wins, since
+///      `hits` is already fan-in-desc so the first such hit is the highest),
+///   3. the top hit (highest fan-in substring/semantic match).
+/// Returns the index into `hits`. Pure + unit-tested. `hits` must be non-empty.
+fn pick_show_match(hits: &[SymbolHit], query: &str) -> usize {
+    if let Some(i) = hits
+        .iter()
+        .position(|h| h.qualified_name.eq_ignore_ascii_case(query))
+    {
+        return i;
+    }
+    if let Some(i) = hits
+        .iter()
+        .position(|h| leaf_name(&h.qualified_name).eq_ignore_ascii_case(query))
+    {
+        return i;
+    }
+    0
+}
+
+/// Extract the 1-based inclusive line range `[start, end]` from `source`,
+/// capped at `max_lines` lines. Returns `(slice, truncated)`. Pure +
+/// unit-tested — IO is the caller's (reads the file, then slices).
+fn slice_source_lines(source: &str, start: i32, end: i32, max_lines: usize) -> (String, bool) {
+    let start = start.max(1) as usize;
+    let end = end.max(start as i32) as usize;
+    let want = end - start + 1;
+    let take = want.min(max_lines.max(1));
+    let truncated = want > take;
+    let slice: String = source
+        .lines()
+        .skip(start - 1)
+        .take(take)
+        .collect::<Vec<_>>()
+        .join("\n");
+    (slice, truncated)
+}
+
+/// Resolve `query` to a single symbol in `corpus_slug` and return its source
+/// slice. Reuses [`find_symbols`] for resolution (so `--kind` + escaping +
+/// fan-in ranking all apply), picks the best match via [`pick_show_match`],
+/// then reads the owning file and slices the symbol's line span.
+///
+/// Returns `Ok(None)` when nothing matched. Errors (loudly) when the matched
+/// symbol has no source span (an extern/import placeholder or a pre-V124 node —
+/// re-`ff cortex index`) or when its owning file can't be read on this host
+/// (the corpus was indexed on a different checkout — same constraint as
+/// `ff cortex review`).
+pub async fn show_symbol(
+    pool: &PgPool,
+    corpus_slug: &str,
+    query: &str,
+    kind: Option<&str>,
+    max_lines: usize,
+) -> Result<Option<SymbolSource>> {
+    // Resolve against a generous candidate set so leaf/exact disambiguation has
+    // material to work with, then narrow to one.
+    let hits = find_symbols(pool, corpus_slug, query, 50, kind).await?;
+    if hits.is_empty() {
+        return Ok(None);
+    }
+    let idx = pick_show_match(&hits, query);
+    let chosen = &hits[idx];
+
+    let Some(file) = chosen.file.clone() else {
+        anyhow::bail!(
+            "symbol '{}' matched but has no owning file (extern/import placeholder) — \
+             nothing to show",
+            chosen.qualified_name
+        );
+    };
+    let Some(start_line) = chosen.start_line else {
+        anyhow::bail!(
+            "symbol '{}' has no source span (pre-V124 index) — re-run `ff cortex index`",
+            chosen.qualified_name
+        );
+    };
+    // start_line lives on the hit; end_line isn't on SymbolHit, so fetch it.
+    let end_line: Option<i32> =
+        sqlx::query_scalar("SELECT end_line FROM brain_vault_nodes WHERE id = $1")
+            .bind(chosen.id)
+            .fetch_optional(pool)
+            .await?
+            .flatten();
+    let end_line = end_line.unwrap_or(start_line).max(start_line);
+
+    let source_text = std::fs::read_to_string(&file).map_err(|e| {
+        anyhow::anyhow!(
+            "read {file}: {e} — the file isn't on this host (corpus indexed elsewhere?); \
+             `ff cortex show` needs the indexed checkout present, like `ff cortex review`"
+        )
+    })?;
+    let (source, truncated) = slice_source_lines(&source_text, start_line, end_line, max_lines);
+
+    let other_matches: Vec<String> = hits
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != idx)
+        .map(|(_, h)| h.qualified_name.clone())
+        .take(10)
+        .collect();
+
+    Ok(Some(SymbolSource {
+        qualified_name: chosen.qualified_name.clone(),
+        node_type: chosen.node_type.clone(),
+        file,
+        start_line,
+        end_line,
+        fan_in: chosen.fan_in,
+        source,
+        truncated,
+        other_matches,
+    }))
+}
+
 // ─── Change-aware review (detect_changes vs git diff) ────────────────────────
 //
 // Given the set of changed files (the terminal layer computes them from
@@ -3343,6 +3500,66 @@ mod tests {
         assert_eq!(escape_like("a%b_c\\d"), r"a\%b\_c\\d");
         assert_eq!(escape_like("plainName"), "plainName");
         assert_eq!(escape_like(""), "");
+    }
+
+    fn hit(name: &str, fan_in: i64) -> SymbolHit {
+        SymbolHit {
+            id: Uuid::nil(),
+            qualified_name: name.to_string(),
+            node_type: "code:function".to_string(),
+            file: Some("/x.rs".to_string()),
+            start_line: Some(1),
+            fan_in,
+            score: None,
+        }
+    }
+
+    #[test]
+    fn leaf_name_takes_last_segment() {
+        assert_eq!(leaf_name("a::b::load_model"), "load_model");
+        assert_eq!(leaf_name("pkg.module.LoginPage"), "LoginPage");
+        assert_eq!(leaf_name("bare"), "bare");
+        // `::` wins over `.` when both appear (Rust-style path with a dotted leaf
+        // is unusual, but the `::` split is checked first by design).
+        assert_eq!(leaf_name("a::b.c"), "b.c");
+    }
+
+    #[test]
+    fn pick_show_match_prefers_exact_then_leaf_then_top() {
+        // hits arrive fan-in-desc (highest first), as find_symbols returns them.
+        let hits = vec![
+            hit("ff_x::loader::load_model_async", 9),
+            hit("ff_y::load_model", 5),
+            hit("ff_z::other::load_model", 3),
+        ];
+        // 1. exact qualified-name match wins regardless of fan-in order.
+        assert_eq!(pick_show_match(&hits, "ff_y::load_model"), 1);
+        // 2. no exact qualified match → exact leaf match, highest fan-in (first such).
+        assert_eq!(pick_show_match(&hits, "load_model"), 1);
+        // 3. neither → top hit (index 0, highest fan-in).
+        assert_eq!(pick_show_match(&hits, "load"), 0);
+        // case-insensitive on both qualified and leaf.
+        assert_eq!(pick_show_match(&hits, "LOAD_MODEL"), 1);
+    }
+
+    #[test]
+    fn slice_source_lines_extracts_inclusive_range_and_caps() {
+        let src = "l1\nl2\nl3\nl4\nl5";
+        // Inclusive 1-based [2,4] → l2,l3,l4, not truncated.
+        let (s, trunc) = slice_source_lines(src, 2, 4, 100);
+        assert_eq!(s, "l2\nl3\nl4");
+        assert!(!trunc);
+        // max_lines caps the span and flags truncation.
+        let (s, trunc) = slice_source_lines(src, 1, 5, 2);
+        assert_eq!(s, "l1\nl2");
+        assert!(trunc);
+        // Single-line span.
+        let (s, trunc) = slice_source_lines(src, 3, 3, 100);
+        assert_eq!(s, "l3");
+        assert!(!trunc);
+        // Defensive: start clamps to 1, end clamps up to start, max_lines floors at 1.
+        let (s, _) = slice_source_lines(src, 0, -5, 0);
+        assert_eq!(s, "l1");
     }
 
     #[test]
