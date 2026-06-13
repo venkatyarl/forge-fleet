@@ -1,6 +1,26 @@
 use crate::{RESET, YELLOW, whoami_tag};
 use anyhow::Result;
 
+/// Lossless JSON projection of one `fleet_secrets` metadata row for
+/// `ff secrets list --json`. Pure (no DB/clock). The secret VALUE is
+/// deliberately absent — `pg_list_secrets` never fetches it, and `ff secrets
+/// get <key>` remains the only path that prints a value. RFC3339 `updated_at`
+/// (the table renders a coarser `%Y-%m-%d %H:%M`); nullable description /
+/// updated_by are JSON null, not omitted, so the shape is stable.
+fn secret_list_json_row(
+    key: &str,
+    description: Option<&str>,
+    updated_by: Option<&str>,
+    updated_at: &chrono::DateTime<chrono::Utc>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "key": key,
+        "description": description,
+        "updated_by": updated_by,
+        "updated_at": updated_at.to_rfc3339(),
+    })
+}
+
 pub async fn handle_secrets(cmd: crate::SecretsCommand) -> Result<()> {
     let pool = ff_agent::fleet_info::get_fleet_pool()
         .await
@@ -9,8 +29,26 @@ pub async fn handle_secrets(cmd: crate::SecretsCommand) -> Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
     match cmd {
-        crate::SecretsCommand::List => {
+        crate::SecretsCommand::List { json } => {
             let rows = ff_db::pg_list_secrets(&pool).await?;
+            if json {
+                // Metadata only — the secret VALUE is never fetched by
+                // pg_list_secrets, so it can't leak here. RFC3339 timestamp
+                // (the table uses a coarser %Y-%m-%d %H:%M; JSON is lossless).
+                let arr: Vec<serde_json::Value> = rows
+                    .iter()
+                    .map(|(key, desc, updated_by, updated_at)| {
+                        secret_list_json_row(
+                            key,
+                            desc.as_deref(),
+                            updated_by.as_deref(),
+                            updated_at,
+                        )
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&arr)?);
+                return Ok(());
+            }
             if rows.is_empty() {
                 println!("(no secrets stored)");
                 return Ok(());
@@ -124,4 +162,41 @@ pub async fn handle_secrets(cmd: crate::SecretsCommand) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secret_list_json_row_omits_value_and_is_lossless() {
+        let ts = chrono::DateTime::parse_from_rfc3339("2026-06-13T10:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let v = secret_list_json_row(
+            "huggingface.token",
+            Some("HuggingFace API token"),
+            Some("venkat@Taylor-5.local"),
+            &ts,
+        );
+        assert_eq!(v["key"], "huggingface.token");
+        assert_eq!(v["description"], "HuggingFace API token");
+        assert_eq!(v["updated_by"], "venkat@Taylor-5.local");
+        // RFC3339, lossless vs the table's coarser minute-granularity render.
+        assert_eq!(v["updated_at"], "2026-06-13T10:00:00+00:00");
+        // The secret VALUE must never appear in the list projection.
+        assert!(v.get("value").is_none());
+    }
+
+    #[test]
+    fn secret_list_json_row_nulls_missing_optionals() {
+        let ts = chrono::DateTime::parse_from_rfc3339("2026-06-13T10:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        // A row with no description and no updated_by → JSON null, not omitted.
+        let v = secret_list_json_row("orphan_key", None, None, &ts);
+        assert!(v["description"].is_null());
+        assert!(v["updated_by"].is_null());
+        assert_eq!(v["key"], "orphan_key");
+    }
 }
