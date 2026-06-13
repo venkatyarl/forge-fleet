@@ -716,6 +716,30 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         ));
     }
 
+    // 16c) Cortex community-summary refresh — every hour, leader-gated.
+    // The embed tick (16b) keeps embeddings fresh but never re-detects
+    // communities or fills their summaries; once it removed the reason to run
+    // `ff cortex embed` by hand, community detection lost its only trigger, so
+    // clusters + their natural-language summaries silently went stale (5,406 of
+    // 5,414 communities had no summary). This tick re-detects communities at
+    // HEAD (cheap, idempotent w.r.t. summaries via the stable member_hash) and
+    // drains the un-summarized backlog via a warm fleet LLM (bounded per pass,
+    // biggest-first, bails when no tool-capable endpoint is live). Pure
+    // maintenance over the brain_communities / community_id graph metadata — no
+    // serving state is mutated — so it runs by DEFAULT; opt out with
+    // `fleet_secrets.cortex_summary_mode=off`.
+    if let Some(pg_pool) = operational_store.pg_pool().cloned() {
+        info!(
+            "starting subsystem: cortex community-summary refresh tick (hourly, leader-gated, gate=fleet_secrets.cortex_summary_mode default on)"
+        );
+        subsystem_tasks.push(ff_brain::spawn_summary_refresh_loop(
+            pg_pool,
+            worker_name.clone(),
+            3600,
+            shutdown_rx.clone(),
+        ));
+    }
+
     // 17) Deferred-task worker — claim + execute tasks from `deferred_tasks`.
     // Historically lived in the separate `ff daemon` CLI; the split caused
     // dispatched tasks to pile up forever when nobody started that process.

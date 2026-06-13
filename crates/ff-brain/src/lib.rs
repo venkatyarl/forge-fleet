@@ -33,7 +33,8 @@ pub use chat::{
 pub use communities::{CommunitySummary, detect_communities};
 pub use community_summary::{
     CommunitySummaryStats, SummarizeOpts, build_summary_prompt, clean_summary,
-    pick_served_model_id, resolve_served_model_id, summarize_communities,
+    pick_served_model_id, resolve_served_model_id, spawn_summary_refresh_loop,
+    summarize_communities,
 };
 pub use context::{BrainMessage, ContextBundle, ResolvedNode, select_context};
 pub use cortex::{

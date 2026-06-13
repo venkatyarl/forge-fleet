@@ -438,6 +438,210 @@ fn strip_code_fence(s: &str) -> &str {
     without_open.trim().trim_end_matches("```").trim()
 }
 
+// ── Automated community-summary refresh tick ───────────────────────────────
+//
+// `ff cortex index` keeps the STRUCTURAL graph current (the git hook re-indexes
+// on every commit) and the embed-refresh tick keeps node embeddings fresh — but
+// neither re-detects communities or fills their summaries. Community detection
+// + summarization only ran on a manual `ff cortex embed` / `ff cortex
+// summarize`; once the embed tick removed the reason to run `ff cortex embed` by
+// hand, community detection lost its trigger entirely, so clusters (and their
+// natural-language summaries) silently go stale.
+//
+// This leader-gated tick closes that gap: each pass (1) re-detects communities
+// at the current graph state — cheap, and idempotent w.r.t. summaries because
+// `member_hash` is stable, so an unchanged cluster keeps its row + summary — then
+// (2) drains up to `summary_max_per_tick()` un-summarized communities via a warm
+// fleet LLM (biggest-first). Pure maintenance over the `brain_communities` /
+// `community_id` graph metadata (no fleet serving state is mutated), so it
+// defaults ON like the embed-refresh / orphan-reaper ticks; opt out with
+// `fleet_secrets.cortex_summary_mode=off`.
+
+/// `fleet_secrets` key holding the kill-switch for the summary-refresh tick.
+const SUMMARY_REFRESH_MODE_KEY: &str = "cortex_summary_mode";
+
+/// Default cap on communities summarized per tick. An LLM call per community is
+/// far heavier than a batch embed, so keep each pass small and let the backlog
+/// drain over successive ticks (biggest communities first = best ROI). Matches
+/// the conservative `ff cortex summarize` CLI default. Override with
+/// `FORGEFLEET_CORTEX_SUMMARY_MAX_PER_TICK`.
+const DEFAULT_SUMMARY_MAX_PER_TICK: usize = 20;
+
+/// Communities smaller than this aren't worth an LLM summary in the tick
+/// (matches the `ff cortex summarize` CLI default of `--min-members 3`).
+const TICK_MIN_MEMBERS: usize = 3;
+
+/// The tick's two-state gate. Pure maintenance, so it runs by DEFAULT — an
+/// operator opts OUT by setting `fleet_secrets.cortex_summary_mode=off`. Mirrors
+/// [`crate::cortex_embed`]'s `EmbedRefreshMode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SummaryRefreshMode {
+    /// Detect + drain the un-summarized backlog each tick (default).
+    On,
+    /// Disabled — the tick is a pure no-op.
+    Off,
+}
+
+impl SummaryRefreshMode {
+    /// Parse the gate value. Missing / empty / unrecognised → `On` (the default);
+    /// only an explicit off-like value disables it.
+    fn parse(raw: Option<&str>) -> Self {
+        match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+            Some("off") | Some("false") | Some("0") | Some("disabled") | Some("no") => {
+                SummaryRefreshMode::Off
+            }
+            // On, missing, empty, "auto", or any other value → run by default.
+            _ => SummaryRefreshMode::On,
+        }
+    }
+}
+
+/// Read the per-tick cap from `FORGEFLEET_CORTEX_SUMMARY_MAX_PER_TICK`, falling
+/// back to [`DEFAULT_SUMMARY_MAX_PER_TICK`]. A non-positive / unparseable value
+/// uses the default; `0` is treated as "use the default" (never an unbounded run
+/// that could hammer the LLM endpoint).
+fn summary_max_per_tick() -> usize {
+    std::env::var("FORGEFLEET_CORTEX_SUMMARY_MAX_PER_TICK")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_SUMMARY_MAX_PER_TICK)
+}
+
+/// Read the kill-switch from `fleet_secrets`. Defaults to `On` when the key is
+/// missing or unreadable — shipping the tick keeps community summaries fresh.
+async fn read_summary_refresh_mode(pool: &PgPool) -> SummaryRefreshMode {
+    match ff_db::pg_get_secret(pool, SUMMARY_REFRESH_MODE_KEY).await {
+        Ok(v) => SummaryRefreshMode::parse(v.as_deref()),
+        Err(e) => {
+            tracing::warn!(error = %e, "cortex summary-refresh: failed to read mode secret; defaulting on");
+            SummaryRefreshMode::On
+        }
+    }
+}
+
+/// Count communities still missing a summary (member_count ≥ `min_members`).
+/// Mirrors the eligibility predicate in [`summarize_communities`] (the
+/// `all = false` branch) so the tick can skip the endpoint route + log noise
+/// when there's nothing to do.
+async fn communities_needing_summary(pool: &PgPool, min_members: usize) -> Result<i64, String> {
+    let n: i64 = sqlx::query_scalar(
+        "SELECT count(*)
+           FROM brain_communities c
+           JOIN brain_vault_nodes g ON g.id = c.god_node_id
+          WHERE c.member_count >= $1
+            AND c.summary IS NULL
+            AND g.community_id IS NOT NULL
+            AND g.valid_until IS NULL",
+    )
+    .bind(min_members as i32)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| format!("count communities needing summary: {e}"))?;
+    Ok(n)
+}
+
+/// Spawn the leader-gated cortex community-summary refresh loop. Mirrors
+/// [`crate::cortex_embed::spawn_embed_refresh_loop`]: fire on the interval, skip
+/// unless this node is the live leader and the gate is on, then re-detect
+/// communities and summarize up to `summary_max_per_tick()` un-summarized ones.
+/// `detect_communities` is cheap and only sets `community_id` (never
+/// `updated_at`), so it doesn't disturb the embed tick's queue; `summarize_communities`
+/// bails gracefully when no warm fleet endpoint is live (so a fleet with no
+/// tool-capable model loaded just logs and waits) and only writes NULL-summary
+/// rows — so a tick overlapping a manual `ff cortex summarize` is harmless.
+pub fn spawn_summary_refresh_loop(
+    pg: PgPool,
+    worker_name: String,
+    interval_secs: u64,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    let is_leader: bool = sqlx::query_scalar(
+                        r#"
+                        SELECT EXISTS (
+                            SELECT 1 FROM fleet_leader_state
+                            WHERE member_name = $1
+                              AND heartbeat_at > NOW() - INTERVAL '60 seconds'
+                        )
+                        "#,
+                    )
+                    .bind(&worker_name)
+                    .fetch_one(&pg)
+                    .await
+                    .unwrap_or(false);
+
+                    if !is_leader {
+                        continue;
+                    }
+
+                    if read_summary_refresh_mode(&pg).await == SummaryRefreshMode::Off {
+                        continue;
+                    }
+
+                    // Re-detect communities at the current graph state so the
+                    // cluster set tracks HEAD (post-#223 nothing else triggers
+                    // this). Stable member_hash means unchanged clusters keep
+                    // their summary; only new/moved ones land summary=NULL.
+                    if let Err(e) = crate::detect_communities(&pg).await {
+                        tracing::warn!(error = %e, "cortex summary-refresh: community detection failed; skipping tick");
+                        continue;
+                    }
+
+                    // Nothing un-summarized? Skip the endpoint route + log noise.
+                    match communities_needing_summary(&pg, TICK_MIN_MEMBERS).await {
+                        Ok(0) => continue,
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!(error = %e, "cortex summary-refresh: count failed; skipping tick");
+                            continue;
+                        }
+                    }
+
+                    let opts = SummarizeOpts {
+                        all: false,
+                        max: summary_max_per_tick(),
+                        min_members: TICK_MIN_MEMBERS,
+                        endpoint: None,
+                        model: None,
+                    };
+                    match summarize_communities(&pg, &opts, |_, _| {}).await {
+                        Ok(stats) => {
+                            if stats.summarized > 0 || stats.failed > 0 || stats.empty > 0 {
+                                tracing::info!(
+                                    summarized = stats.summarized,
+                                    failed = stats.failed,
+                                    empty = stats.empty,
+                                    eligible = stats.eligible,
+                                    endpoint = %stats.endpoint,
+                                    model = %stats.model,
+                                    "cortex summary-refresh: drained un-summarized communities"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            // No warm tool-capable endpoint / route failure —
+                            // expected when no agent-capable model is loaded.
+                            // Resumes next tick once one comes up.
+                            tracing::warn!(error = %e, "cortex summary-refresh: pass did not complete");
+                        }
+                    }
+                }
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+            }
+        }
+        tracing::info!("cortex summary-refresh loop stopped");
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -564,5 +768,47 @@ mod tests {
         let raw = "x".repeat(5000);
         let out = clean_summary(&raw);
         assert_eq!(out.chars().count(), 800);
+    }
+
+    #[test]
+    fn summary_refresh_mode_defaults_on_when_missing_or_unknown() {
+        assert_eq!(SummaryRefreshMode::parse(None), SummaryRefreshMode::On);
+        assert_eq!(SummaryRefreshMode::parse(Some("")), SummaryRefreshMode::On);
+        assert_eq!(
+            SummaryRefreshMode::parse(Some("  ")),
+            SummaryRefreshMode::On
+        );
+        assert_eq!(
+            SummaryRefreshMode::parse(Some("on")),
+            SummaryRefreshMode::On
+        );
+        assert_eq!(
+            SummaryRefreshMode::parse(Some("auto")),
+            SummaryRefreshMode::On
+        );
+        assert_eq!(
+            SummaryRefreshMode::parse(Some("whatever")),
+            SummaryRefreshMode::On
+        );
+    }
+
+    #[test]
+    fn summary_refresh_mode_off_only_for_explicit_off_values() {
+        for v in ["off", "OFF", " Off ", "false", "0", "disabled", "no"] {
+            assert_eq!(
+                SummaryRefreshMode::parse(Some(v)),
+                SummaryRefreshMode::Off,
+                "{v:?} should disable"
+            );
+        }
+    }
+
+    #[test]
+    fn summary_max_per_tick_defaults_when_unset() {
+        // The env var is process-global; only assert the default when it isn't
+        // set in this environment (don't mutate shared process state in a test).
+        if std::env::var("FORGEFLEET_CORTEX_SUMMARY_MAX_PER_TICK").is_err() {
+            assert_eq!(summary_max_per_tick(), DEFAULT_SUMMARY_MAX_PER_TICK);
+        }
     }
 }
