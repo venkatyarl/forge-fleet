@@ -1,6 +1,33 @@
 use crate::whoami_tag;
 use anyhow::Result;
 
+/// Documented `deferred_tasks.status` values (see schema.rs `deferred_tasks`).
+/// Used to WARN on a likely-typo'd `--status` filter. Deliberately a soft
+/// warning, not a hard error — same rationale as `tasks_cmd::KNOWN_TASK_STATUSES`:
+/// a future status added to the schema should only cost a spurious warning,
+/// never a wrongful rejection.
+const KNOWN_DEFER_STATUSES: &[&str] = &[
+    "pending",
+    "dispatchable",
+    "running",
+    "completed",
+    "failed",
+    "cancelled",
+];
+
+/// Returns the comma-separated `--status` parts that aren't a documented
+/// deferred-task status (likely typos). Pure — empty filter / all-known →
+/// empty vec. Match is case-insensitive so `Running` doesn't warn.
+fn unknown_defer_status_parts(filter: &str) -> Vec<String> {
+    filter
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter(|s| !KNOWN_DEFER_STATUSES.contains(&s.to_ascii_lowercase().as_str()))
+        .map(|s| s.to_string())
+        .collect()
+}
+
 pub async fn handle_defer(cmd: crate::DeferCommand) -> Result<()> {
     let pool = ff_agent::fleet_info::get_fleet_pool()
         .await
@@ -10,6 +37,16 @@ pub async fn handle_defer(cmd: crate::DeferCommand) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
     match cmd {
         crate::DeferCommand::List { status, limit } => {
+            // Warn (don't reject — see KNOWN_DEFER_STATUSES) on a likely typo so an
+            // empty result isn't mistaken for "no matching tasks".
+            if let Some(sf) = status.as_deref() {
+                for bad in unknown_defer_status_parts(sf) {
+                    eprintln!(
+                        "warning: unknown status '{bad}' — known: {}",
+                        KNOWN_DEFER_STATUSES.join(", ")
+                    );
+                }
+            }
             let rows = ff_db::pg_list_deferred(&pool, status.as_deref(), limit).await?;
             if rows.is_empty() {
                 println!("(no deferred tasks)");
@@ -197,4 +234,33 @@ pub async fn handle_defer(cmd: crate::DeferCommand) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_defer_status_parts_flags_typos_only() {
+        // Empty / whitespace → nothing to warn about.
+        assert!(unknown_defer_status_parts("").is_empty());
+        assert!(unknown_defer_status_parts("  ").is_empty());
+        // All-known (with surrounding whitespace) → empty.
+        assert!(unknown_defer_status_parts("pending, running ,completed").is_empty());
+        // Case-insensitive: a capitalized known status doesn't warn.
+        assert!(unknown_defer_status_parts("Running,FAILED").is_empty());
+        // A typo is surfaced, valid siblings are not.
+        assert_eq!(
+            unknown_defer_status_parts("running,runing,pending"),
+            vec!["runing".to_string()]
+        );
+        // Every documented status is recognized (guards against drift between
+        // KNOWN_DEFER_STATUSES and the schema comment at deferred_tasks.status).
+        for s in KNOWN_DEFER_STATUSES {
+            assert!(
+                unknown_defer_status_parts(s).is_empty(),
+                "status {s} should be known"
+            );
+        }
+    }
 }
