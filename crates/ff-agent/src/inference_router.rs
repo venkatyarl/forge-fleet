@@ -26,6 +26,12 @@ pub struct RouterEndpoint {
     pub label: String,
     /// Whether this endpoint supports OpenAI-compatible tool calling
     pub supports_tools: bool,
+    /// Model strength tier (1–4, higher = stronger: T1≈9B, T2≈30B, T3≈70B,
+    /// T4≈235B+). Used as the secondary sort key for agent dispatch so a weak
+    /// model (a T1 9B that stalls the tool loop) never shadows a genuinely
+    /// agent-viable one. 0 means unknown (no DB row). See
+    /// `project_fleet_agent_swarm_broken`.
+    pub tier: i32,
     /// True for the node's own LLM (localhost)
     pub is_local: bool,
 }
@@ -61,7 +67,9 @@ impl FailureState {
 /// Ordering contract:
 ///   1. Local endpoints (is_local=true) always come first.
 ///   2. Within each group, tool-calling capable models rank above non-tool ones.
-///   3. Within the same capability tier, higher-capacity nodes come first.
+///   3. Within the same capability tier, stronger models (higher `tier`) rank
+///      first, then higher-capacity nodes — so agent dispatch never falls back
+///      to a weak T1 model that stalls the tool loop.
 pub struct InferenceRouter {
     /// Ordered list of endpoints (local first, then fleet by priority).
     endpoints: Vec<RouterEndpoint>,
@@ -232,13 +240,15 @@ async fn build_endpoint_list(config_path: &Path, client: &reqwest::Client) -> Ve
                 model_id,
                 label: format!("local:{port}"),
                 supports_tools,
+                tier: 0, // unknown until the DB override below fills it in
                 is_local: true,
             });
         }
     }
 
-    // Sort local: tool-capable first
-    local.sort_by(|a, b| b.supports_tools.cmp(&a.supports_tools));
+    // Sort local: tool-capable first (tier is still unknown here — the DB
+    // override re-sorts by strength once the catalog loads).
+    sort_endpoints(&mut local);
 
     // --- Remote endpoints from Postgres ---
     if let Ok(toml_str) = tokio::fs::read_to_string(config_path).await
@@ -263,7 +273,7 @@ async fn build_endpoint_list(config_path: &Path, client: &reqwest::Client) -> Ve
             // non-tool local model (e.g. gemma-4 on taylor) out of the
             // tool-capable tier even if the name heuristic is ever loosened.
             // See feedback_ff_supervise_llm_routing / feedback_gemma4_no_tools.
-            let local_tool_by_port: HashMap<u16, bool> = models
+            let local_db: HashMap<u16, (bool, i32)> = models
                 .iter()
                 .filter(|m| {
                     nodes
@@ -273,13 +283,13 @@ async fn build_endpoint_list(config_path: &Path, client: &reqwest::Client) -> Ve
                 .map(|m| {
                     let st = workloads_tool_capable(&m.preferred_workloads)
                         || model_supports_tools(&m.id);
-                    (m.port as u16, st)
+                    (m.port as u16, (st, m.tier))
                 })
                 .collect();
-            apply_local_db_tool_support(&mut local, &local_tool_by_port);
+            apply_local_db_metadata(&mut local, &local_db);
 
-            // Collect (ip, port, cores, supports_tools, label, model_id)
-            let mut candidates: Vec<(String, u16, i32, bool, String, String)> = Vec::new();
+            // Collect (ip, port, cores, supports_tools, tier, label, model_id)
+            let mut candidates: Vec<(String, u16, i32, bool, i32, String, String)> = Vec::new();
 
             for node in &nodes {
                 // Skip if this is the local node (already covered above)
@@ -296,7 +306,8 @@ async fn build_endpoint_list(config_path: &Path, client: &reqwest::Client) -> Ve
                         node.ip.clone(),
                         55000,
                         node.cpu_cores,
-                        true, // assume capable if we don't know
+                        true,         // assume capable if we don't know
+                        ASSUMED_TIER, // assume a mid (agent-viable) tier too
                         node.name.clone(),
                         "auto".into(),
                     ));
@@ -315,6 +326,7 @@ async fn build_endpoint_list(config_path: &Path, client: &reqwest::Client) -> Ve
                             m.port as u16,
                             node.cpu_cores,
                             supports_tools,
+                            m.tier,
                             format!("{}:{}", node.name, m.port),
                             m.id.clone(),
                         ));
@@ -322,17 +334,21 @@ async fn build_endpoint_list(config_path: &Path, client: &reqwest::Client) -> Ve
                 }
             }
 
-            // Sort: tool-capable first, then by cpu_cores desc
-            candidates.sort_by(|a, b| b.3.cmp(&a.3).then(b.2.cmp(&a.2)));
+            // Sort: tool-capable first, then strongest model (tier desc), then
+            // by cpu_cores desc. The tier key is what stops a weak T1 9B on a
+            // high-core node from out-ranking a T2/T3 coder — the documented
+            // agent-swarm stall (project_fleet_agent_swarm_broken).
+            candidates.sort_by(|a, b| b.3.cmp(&a.3).then(b.4.cmp(&a.4)).then(b.2.cmp(&a.2)));
 
             // Probe reachability (parallel, short timeout)
             let probe_futs: Vec<_> = candidates
                 .iter()
-                .map(|(ip, port, _, supports_tools, label, model_id)| {
+                .map(|(ip, port, _, supports_tools, tier, label, model_id)| {
                     let ip = ip.clone();
                     let label = label.clone();
                     let model_id = model_id.clone();
                     let st = *supports_tools;
+                    let tier = *tier;
                     let port = *port;
                     async move {
                         if tcp_reachable(&ip, port).await {
@@ -341,6 +357,7 @@ async fn build_endpoint_list(config_path: &Path, client: &reqwest::Client) -> Ve
                                 model_id,
                                 label,
                                 supports_tools: st,
+                                tier,
                                 is_local: false,
                             })
                         } else {
@@ -363,24 +380,45 @@ async fn build_endpoint_list(config_path: &Path, client: &reqwest::Client) -> Ve
     all
 }
 
-/// Override the local endpoints' tool-capability from a DB-derived
-/// port→supports_tools map (DB-first). Endpoints whose port isn't in the map
-/// keep their probe-time (name-heuristic) value, so unsynced local servers
-/// still route. Re-sorts tool-capable first after any flag flip. See
+/// Tier assumed for a reachable node we have no catalog row for ("assume
+/// capable if we don't know"). A mid (agent-viable) value so an unknown node
+/// competes fairly with known T2 coders instead of being buried or favoured.
+const ASSUMED_TIER: i32 = 2;
+
+/// Order a group of endpoints for selection: tool-capable first, then strongest
+/// model (`tier` desc). This is the shared comparator for the local and remote
+/// groups so agent dispatch (`active_url_filtered(true)`) picks the strongest
+/// tool-capable endpoint in the group rather than the first one probed. A weak
+/// T1 9B therefore never shadows a T2/T3 coder. See
+/// `project_fleet_agent_swarm_broken`.
+fn sort_endpoints(eps: &mut [RouterEndpoint]) {
+    eps.sort_by(|a, b| {
+        b.supports_tools
+            .cmp(&a.supports_tools)
+            .then(b.tier.cmp(&a.tier))
+    });
+}
+
+/// Override the local endpoints' tool-capability and strength tier from a
+/// DB-derived port→(supports_tools, tier) map (DB-first). Endpoints whose port
+/// isn't in the map keep their probe-time (name-heuristic) tool value and
+/// unknown tier (0), so unsynced local servers still route. Re-sorts the group
+/// (tool-capable first, then strongest) after applying. See
 /// `feedback_ff_supervise_llm_routing.md`.
-fn apply_local_db_tool_support(local: &mut [RouterEndpoint], tool_by_port: &HashMap<u16, bool>) {
+fn apply_local_db_metadata(local: &mut [RouterEndpoint], db_by_port: &HashMap<u16, (bool, i32)>) {
     for ep in local.iter_mut() {
         if let Some(port) = ep
             .url
             .rsplit(':')
             .next()
             .and_then(|p| p.parse::<u16>().ok())
-            && let Some(&st) = tool_by_port.get(&port)
+            && let Some(&(st, tier)) = db_by_port.get(&port)
         {
             ep.supports_tools = st;
+            ep.tier = tier;
         }
     }
-    local.sort_by(|a, b| b.supports_tools.cmp(&a.supports_tools));
+    sort_endpoints(local);
 }
 
 /// True if an IP address refers to the local machine.
@@ -450,11 +488,16 @@ mod tests {
     use serde_json::json;
 
     fn ep(label: &str, supports_tools: bool, is_local: bool) -> RouterEndpoint {
+        ep_t(label, supports_tools, is_local, ASSUMED_TIER)
+    }
+
+    fn ep_t(label: &str, supports_tools: bool, is_local: bool, tier: i32) -> RouterEndpoint {
         RouterEndpoint {
             url: format!("http://{label}"),
             model_id: label.into(),
             label: label.into(),
             supports_tools,
+            tier,
             is_local,
         }
     }
@@ -531,8 +574,8 @@ mod tests {
         // (e.g. gemma-4 tagged chat-only). The DB override must demote it.
         let mut local = vec![ep("127.0.0.1:55000", true, true)];
         let mut by_port = HashMap::new();
-        by_port.insert(55000u16, false);
-        apply_local_db_tool_support(&mut local, &by_port);
+        by_port.insert(55000u16, (false, 2));
+        apply_local_db_metadata(&mut local, &by_port);
         assert!(!local[0].supports_tools);
     }
 
@@ -545,8 +588,8 @@ mod tests {
             ep("127.0.0.1:55001", false, true),
         ];
         let mut by_port = HashMap::new();
-        by_port.insert(55001u16, true);
-        apply_local_db_tool_support(&mut local, &by_port);
+        by_port.insert(55001u16, (true, 2));
+        apply_local_db_metadata(&mut local, &by_port);
         assert_eq!(local[0].label, "127.0.0.1:55001");
         assert!(local[0].supports_tools);
     }
@@ -557,7 +600,56 @@ mod tests {
         // so unsynced local servers still route.
         let mut local = vec![ep("127.0.0.1:55002", true, true)];
         let by_port = HashMap::new(); // empty → no override
-        apply_local_db_tool_support(&mut local, &by_port);
+        apply_local_db_metadata(&mut local, &by_port);
         assert!(local[0].supports_tools);
+    }
+
+    #[test]
+    fn local_db_override_applies_tier_and_sorts_strongest_first() {
+        // Both local servers are tool-capable; the DB tags 55001 as a stronger
+        // T3 model and 55000 as a weak T1. After the override the strongest
+        // tool-capable endpoint must sort ahead.
+        let mut local = vec![
+            ep_t("127.0.0.1:55000", true, true, 0),
+            ep_t("127.0.0.1:55001", true, true, 0),
+        ];
+        let mut by_port = HashMap::new();
+        by_port.insert(55000u16, (true, 1));
+        by_port.insert(55001u16, (true, 3));
+        apply_local_db_metadata(&mut local, &by_port);
+        assert_eq!(local[0].label, "127.0.0.1:55001");
+        assert_eq!(local[0].tier, 3);
+    }
+
+    #[test]
+    fn sort_endpoints_prefers_stronger_tier_within_tool_tier() {
+        // The documented agent-swarm stall: a weak T1 9B must NOT out-rank a
+        // T2 coder. Both are tool-capable, so tier breaks the tie.
+        let mut eps = vec![
+            ep_t("james-9b", true, false, 1),
+            ep_t("sophie-32b", true, false, 2),
+            ep_t("taylor-gemma", false, false, 2), // non-tool, ranks last
+        ];
+        sort_endpoints(&mut eps);
+        assert_eq!(eps[0].label, "sophie-32b");
+        assert_eq!(eps[1].label, "james-9b");
+        assert_eq!(eps[2].label, "taylor-gemma");
+    }
+
+    #[tokio::test]
+    async fn agent_dispatch_picks_strongest_tool_capable_endpoint() {
+        // End-to-end of the fix: given a sorted endpoint list (strongest
+        // tool-capable first, as build_endpoint_list now produces), a
+        // tool-requiring caller reaches the T2 coder, not the weak T1 9B.
+        let mut eps = vec![
+            ep_t("james-9b", true, false, 1),
+            ep_t("sophie-32b", true, false, 2),
+        ];
+        sort_endpoints(&mut eps);
+        let router = InferenceRouter::new(eps);
+        assert_eq!(
+            router.active_url_filtered(true).await.as_deref(),
+            Some("http://sophie-32b")
+        );
     }
 }
