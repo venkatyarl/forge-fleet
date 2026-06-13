@@ -15,6 +15,25 @@ pub async fn handle_list(
     name: Option<String>,
     unhealthy: bool,
 ) -> Result<()> {
+    // Validate --node against the (drift-free) computers table BEFORE running the
+    // query, so a typo errors loudly instead of silently returning an empty list
+    // that's indistinguishable from "this node has no tools registered". Uses the
+    // same `worker_name = $N` exact match the query below applies (every
+    // fleet_tools.worker_name is a computers.name). Same foot-gun class as
+    // `ff software list --computer` (#241) and `ff tasks list --computer` (#239).
+    // --name is a substring search (ILIKE '%..%'), so an empty result there is a
+    // genuine no-match, not a typo, and is left untouched.
+    if let Some(n) = &node {
+        let known: i64 = sqlx::query_scalar("SELECT count(*) FROM computers WHERE name = $1")
+            .bind(n)
+            .fetch_one(pg)
+            .await
+            .map_err(|e| anyhow::anyhow!("validate --node: {e}"))?;
+        if known == 0 {
+            anyhow::bail!("unknown node '{n}' — run 'ff fleet health' to list computers");
+        }
+    }
+
     let mut sql = String::from(
         "SELECT tool_name, worker_name, description, health_checked_at, \
          call_count, avg_latency_ms, \
