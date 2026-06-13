@@ -943,6 +943,118 @@ async fn impact_of_ids(
     Ok(out)
 }
 
+// ─── Symbol discovery (ff cortex find) ───────────────────────────────────────
+//
+// callers/callees/impact all require the caller to already know a symbol's
+// (qualified or leaf) name. `find_symbols` is the missing discovery entrypoint:
+// given a name fragment, return matching code symbols ranked by fan-in (most
+// depended-on first) with the file:line to jump to — so an agent locates the
+// symbol, then drills in with the relationship queries.
+
+/// One hit from [`find_symbols`]: a matched code symbol plus the signals an
+/// agent needs — `fan_in` (how many direct callers depend on it, the importance
+/// proxy) and `file`/`start_line` (where to jump).
+#[derive(Debug, Clone)]
+pub struct SymbolHit {
+    pub id: Uuid,
+    pub qualified_name: String,
+    pub node_type: String,
+    /// Absolute path of the owning `content:file` node (None for extern/import
+    /// placeholders that no file contains).
+    pub file: Option<String>,
+    /// 1-based start line (None for pre-V124 nodes or non-spanning placeholders).
+    pub start_line: Option<i32>,
+    pub fan_in: i64,
+}
+
+/// Escape SQL `LIKE`/`ILIKE` wildcards (`%`, `_`) and the escape char (`\`) in a
+/// user query so a search for `load_model` matches the literal underscore rather
+/// than "any single char". Paired with `ESCAPE '\'` in the query below.
+pub fn escape_like(q: &str) -> String {
+    let mut out = String::with_capacity(q.len());
+    for ch in q.chars() {
+        if matches!(ch, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Find code symbols whose qualified name contains `query` (case-insensitive),
+/// ranked by fan-in desc then name, capped at `limit` (clamped to 1..=500).
+/// The discovery entrypoint for the relationship queries.
+pub async fn find_symbols(
+    pool: &PgPool,
+    corpus_slug: &str,
+    query: &str,
+    limit: i64,
+) -> Result<Vec<SymbolHit>> {
+    let pattern = format!("%{}%", escape_like(query));
+    let limit = limit.clamp(1, 500);
+    let rows = sqlx::query(
+        r#"SELECT n.id, n.title, n.node_type, n.start_line,
+                  (SELECT count(*) FROM brain_vault_edges e
+                    WHERE e.edge_type = 'calls' AND e.dst_id = n.id) AS fan_in
+             FROM brain_vault_nodes n
+            WHERE n.project = $1
+              AND n.node_type LIKE 'code:%'
+              AND n.title ILIKE $2 ESCAPE '\'
+            ORDER BY fan_in DESC, n.title COLLATE "C"
+            LIMIT $3"#,
+    )
+    .bind(corpus_slug)
+    .bind(&pattern)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    let mut hits: Vec<SymbolHit> = rows
+        .into_iter()
+        .map(|r| SymbolHit {
+            id: r.get("id"),
+            qualified_name: r.get("title"),
+            node_type: r.get("node_type"),
+            file: None,
+            start_line: r.get("start_line"),
+            fan_in: r.get("fan_in"),
+        })
+        .collect();
+
+    // Resolve each hit's owning file by walking `contains` edges UP to the
+    // ancestor content:file node (file -> impl/mod -> symbol can nest, so a
+    // recursive walk, not a single hop).
+    let ids: Vec<Uuid> = hits.iter().map(|h| h.id).collect();
+    if !ids.is_empty() {
+        let file_rows = sqlx::query(
+            r#"WITH RECURSIVE up AS (
+                    SELECT e.src_id AS anc, e.dst_id AS leaf
+                      FROM brain_vault_edges e
+                     WHERE e.edge_type = 'contains' AND e.dst_id = ANY($1)
+                    UNION
+                    SELECT e.src_id, up.leaf
+                      FROM brain_vault_edges e
+                      JOIN up ON e.dst_id = up.anc
+                     WHERE e.edge_type = 'contains'
+                )
+                SELECT up.leaf AS leaf, n.path AS path
+                  FROM up JOIN brain_vault_nodes n ON n.id = up.anc
+                 WHERE n.node_type = 'content:file'"#,
+        )
+        .bind(&ids)
+        .fetch_all(pool)
+        .await?;
+        let mut by_leaf: HashMap<Uuid, String> = HashMap::new();
+        for r in file_rows {
+            by_leaf.insert(r.get("leaf"), r.get("path"));
+        }
+        for h in &mut hits {
+            h.file = by_leaf.get(&h.id).cloned();
+        }
+    }
+    Ok(hits)
+}
+
 // ─── Change-aware review (detect_changes vs git diff) ────────────────────────
 //
 // Given the set of changed files (the terminal layer computes them from
@@ -2879,6 +2991,16 @@ fn read_package_name(cargo_toml: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn escape_like_neutralizes_wildcards() {
+        // A literal underscore in a Rust name must stay literal, not match-any.
+        assert_eq!(escape_like("load_model"), r"load\_model");
+        // % and the escape char itself are escaped too; plain names pass through.
+        assert_eq!(escape_like("a%b_c\\d"), r"a\%b\_c\\d");
+        assert_eq!(escape_like("plainName"), "plainName");
+        assert_eq!(escape_like(""), "");
+    }
 
     #[test]
     fn risk_tier_thresholds() {

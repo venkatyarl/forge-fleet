@@ -110,6 +110,7 @@ impl ToolRegistry {
 
         // ── Cortex code-graph tools ─────────────────────────────────────
         self.register(Self::cortex_corpora());
+        self.register(Self::cortex_find());
         self.register(Self::cortex_callers());
         self.register(Self::cortex_callees());
         self.register(Self::cortex_impact());
@@ -840,6 +841,32 @@ impl ToolRegistry {
         }
     }
 
+    fn cortex_find() -> ToolDefinition {
+        ToolDefinition {
+            name: "cortex_find".to_string(),
+            description: "Cortex code graph: find code symbols by name fragment (case-insensitive substring), ranked by fan-in (most depended-on first) with file:line. The discovery entrypoint — use it to resolve a partial name into exact qualified names, then pass those to cortex_callers/callees/impact. Cheaper than grepping the tree.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "corpus": {
+                        "type": "string",
+                        "description": "Indexed repo slug (see cortex_corpora), e.g. 'forge-fleet'"
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Name fragment to match against symbol qualified names, e.g. 'load_model' or 'reprofile'"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max hits to return (1-500, default 20)",
+                        "default": 20
+                    }
+                },
+                "required": ["corpus", "query"]
+            }),
+        }
+    }
+
     fn cortex_callers() -> ToolDefinition {
         ToolDefinition {
             name: "cortex_callers".to_string(),
@@ -1266,6 +1293,7 @@ mod tests {
             "brain_backlog_add",
             // Cortex code graph
             "cortex_corpora",
+            "cortex_find",
             "cortex_callers",
             "cortex_callees",
             "cortex_impact",
