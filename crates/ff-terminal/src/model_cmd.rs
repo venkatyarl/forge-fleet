@@ -5,6 +5,25 @@ use crate::{
 use anyhow::Result;
 use std::path::PathBuf;
 
+/// Validate a `--node` filter against the (drift-free) `computers` table so a
+/// typo errors loudly instead of silently returning an empty list that reads
+/// like "nothing on disk" / "nothing running". No-op when no filter is given.
+/// Mirrors the `--computer` validation in `tasks_cmd::handle_tasks_list`
+/// (`fleet_model_library`/`fleet_model_deployments` key on `worker_name`, which
+/// is always a `computers.name`).
+async fn ensure_known_node(pool: &sqlx::PgPool, node: Option<&str>) -> Result<()> {
+    if let Some(n) = node {
+        let known: i64 = sqlx::query_scalar("SELECT count(*) FROM computers WHERE name = $1")
+            .bind(n)
+            .fetch_one(pool)
+            .await?;
+        if known == 0 {
+            anyhow::bail!("unknown node '{n}' — run 'ff fleet health' to list computers");
+        }
+    }
+    Ok(())
+}
+
 /// True when a deployment's per-slot context (`usable_agent_ctx`) meets the
 /// agent router floor `min_ctx`. A `None` ctx (unknown / pre-backfill) is NOT
 /// agent-ready — the router can't trust an endpoint whose usable slot size it
@@ -330,6 +349,7 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
             show_id,
             json,
         } => {
+            ensure_known_node(&pool, node.as_deref()).await?;
             let rows = ff_db::pg_list_library(&pool, node.as_deref()).await?;
             if json {
                 let out: Vec<_> = rows
@@ -385,6 +405,7 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
             show_id,
             json,
         } => {
+            ensure_known_node(&pool, node.as_deref()).await?;
             let rows = ff_db::pg_list_deployments(&pool, node.as_deref()).await?;
             if json {
                 let out: Vec<_> = rows
