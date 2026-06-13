@@ -503,6 +503,12 @@ pub async fn handle_top_cortex(args: TopCortexArgs) -> Result<()> {
                 cortex::find_symbols(&pool, &corpus, &query, limit, kind.as_deref()).await?
             };
             print_hits(&hits, &format, &query, &corpus);
+            if hits.is_empty() {
+                // No symbol matched the query — exit non-zero so a script/agent
+                // can test "does anything match?" by exit code (grep-style, and
+                // consistent with `cortex show`/`outline` and `ff model where`).
+                std::process::exit(1);
+            }
         }
         TopCortexCommand::Show {
             symbol,

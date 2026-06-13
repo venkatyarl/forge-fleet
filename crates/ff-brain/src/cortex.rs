@@ -847,6 +847,18 @@ pub struct SymbolRef {
     pub node_type: String,
 }
 
+/// Uniform "the symbol you asked about does not exist in this corpus" message,
+/// shared by every symbol-keyed query (`callers`/`callees`/`impact`/`tests_for`).
+/// These verbs resolve `sel` to a node first; an empty resolution means the
+/// selector matched NOTHING (a typo or a stale index) — distinct from a symbol
+/// that resolves fine but happens to have zero callers/callees/etc. The former
+/// is an error (so the CLI exits non-zero and an agent can branch on it, like
+/// `cortex show`/`outline` and `ff model where`); the latter is a legitimate
+/// empty result (exit 0).
+fn no_symbol_error(sel: &str, corpus_slug: &str) -> anyhow::Error {
+    anyhow::anyhow!("no symbol matching '{sel}' in corpus '{corpus_slug}'")
+}
+
 /// Resolve a user-supplied symbol selector to its node id within a corpus.
 /// Accepts a full qualified name (`ff_agent::model_runtime::load_model`) or a
 /// bare leaf (`load_model`) — the bare form matches any code:function whose
@@ -907,6 +919,9 @@ async fn callers_of_ids(pool: &PgPool, ids: &[Uuid]) -> Result<Vec<SymbolRef>> {
 /// Callers of a symbol: nodes with a `calls` edge whose dst is the symbol.
 pub async fn callers(pool: &PgPool, corpus_slug: &str, sel: &str) -> Result<Vec<SymbolRef>> {
     let targets = resolve_symbol(pool, corpus_slug, sel).await?;
+    if targets.is_empty() {
+        return Err(no_symbol_error(sel, corpus_slug));
+    }
     let ids: Vec<Uuid> = targets.iter().map(|t| t.id).collect();
     callers_of_ids(pool, &ids).await
 }
@@ -914,6 +929,9 @@ pub async fn callers(pool: &PgPool, corpus_slug: &str, sel: &str) -> Result<Vec<
 /// Callees of a symbol: nodes a `calls` edge points to from the symbol.
 pub async fn callees(pool: &PgPool, corpus_slug: &str, sel: &str) -> Result<Vec<SymbolRef>> {
     let srcs = resolve_symbol(pool, corpus_slug, sel).await?;
+    if srcs.is_empty() {
+        return Err(no_symbol_error(sel, corpus_slug));
+    }
     let ids: Vec<Uuid> = srcs.iter().map(|t| t.id).collect();
     let rows = sqlx::query(
         r#"SELECT DISTINCT n.id, n.title, n.node_type
@@ -943,6 +961,9 @@ pub async fn impact(
     max_depth: usize,
 ) -> Result<Vec<SymbolRef>> {
     let seed = resolve_symbol(pool, corpus_slug, sel).await?;
+    if seed.is_empty() {
+        return Err(no_symbol_error(sel, corpus_slug));
+    }
     let seed_ids: Vec<Uuid> = seed.iter().map(|s| s.id).collect();
     impact_of_ids(pool, &seed_ids, max_depth).await
 }
@@ -1096,7 +1117,7 @@ pub async fn tests_for(
 ) -> Result<Vec<TestHit>> {
     let seed = resolve_symbol(pool, corpus_slug, sel).await?;
     if seed.is_empty() {
-        anyhow::bail!("no symbol matching '{sel}' in corpus '{corpus_slug}'");
+        return Err(no_symbol_error(sel, corpus_slug));
     }
     let max_depth = max_depth.clamp(1, 20);
     let seed_ids: Vec<Uuid> = seed.iter().map(|s| s.id).collect();
@@ -3738,6 +3759,18 @@ fn read_package_name(cargo_toml: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_symbol_error_names_selector_and_corpus() {
+        // The symbol-keyed query verbs (callers/callees/impact/tests_for) share
+        // this message when resolution finds nothing — keep it uniform so the
+        // wording (and a downstream test/grep on it) stays stable.
+        let e = no_symbol_error("load_model", "forge-fleet");
+        assert_eq!(
+            e.to_string(),
+            "no symbol matching 'load_model' in corpus 'forge-fleet'"
+        );
+    }
 
     #[test]
     fn escape_like_neutralizes_wildcards() {
