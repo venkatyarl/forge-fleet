@@ -46,6 +46,7 @@ mod conformance_cmd;
 mod corpus_cmd;
 mod cortex_cmd;
 mod daemon_cmd;
+mod db_cmd;
 mod defer_cmd;
 mod events_cmd;
 mod ext_cmd;
@@ -567,6 +568,14 @@ enum Command {
     Ports {
         #[command(subcommand)]
         command: PortsCommand,
+    },
+    /// Read-only SQL against the ForgeFleet Postgres. Runs inside a READ ONLY
+    /// transaction (the server rejects writes) — a safe inspection escape
+    /// hatch so a typed `ff db query …` no longer falls through to the LLM
+    /// agent (which would hallucinate against a non-existent database).
+    Db {
+        #[command(subcommand)]
+        command: DbCommand,
     },
     /// Cloud LLM providers (OpenAI/Anthropic/Moonshot/Google). Gateway
     /// routes `/v1/chat/completions` to these when the requested model
@@ -1802,6 +1811,25 @@ enum PortsCommand {
     /// with port_registry. Reports unexpected listeners and missing
     /// expected services.
     Scan { computer: String },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum DbCommand {
+    /// Run a read-only SELECT against the fleet Postgres and print the rows.
+    /// Executes in a `READ ONLY` transaction, so any write (INSERT/UPDATE/
+    /// DELETE/DDL) is rejected by the server. Table output by default;
+    /// `--json` emits a JSON array. Example:
+    /// `ff db query "SELECT name,status FROM fleet_workers ORDER BY name"`
+    Query {
+        /// The SQL SELECT to run (a single statement; a trailing ';' is ok).
+        sql: String,
+        /// Emit a JSON array instead of an aligned table.
+        #[arg(long)]
+        json: bool,
+        /// Cap rows returned (default 200); extra rows are noted as truncated.
+        #[arg(long, default_value_t = 200)]
+        max_rows: usize,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -3046,6 +3074,7 @@ async fn main() -> Result<()> {
         Some(Command::Power { command }) => return power_cmd::handle_power(command.clone()).await,
         Some(Command::Train { command }) => return train_cmd::handle_train(command.clone()).await,
         Some(Command::Ports { command }) => return ports_cmd::handle_ports(command.clone()).await,
+        Some(Command::Db { command }) => return db_cmd::handle_db(command.clone()).await,
         Some(Command::CloudLlm { command }) => {
             return cloud_llm_cmd::handle_cloud_llm(command.clone()).await;
         }
@@ -3909,6 +3938,7 @@ async fn main() -> Result<()> {
         Some(Command::Power { command }) => power_cmd::handle_power(command).await,
         Some(Command::Train { command }) => train_cmd::handle_train(command).await,
         Some(Command::Ports { command }) => ports_cmd::handle_ports(command).await,
+        Some(Command::Db { command }) => db_cmd::handle_db(command).await,
         Some(Command::CloudLlm { command }) => cloud_llm_cmd::handle_cloud_llm(command).await,
         Some(Command::Social { command }) => social_cmd::handle_social(command).await,
         Some(Command::Supervise {
