@@ -2533,7 +2533,12 @@ pub enum ModelCommand {
         to: String,
     },
     /// Show where a model lives on the fleet (catalog_id, partial name, or library UUID).
-    Where { id_or_name: String },
+    Where {
+        id_or_name: String,
+        /// Emit a JSON array (one object per library row) instead of the table.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// List catalog models with newer HuggingFace revisions available (detected by
     /// the daily ModelUpstreamChecker tick). Use `ff model upgrade <id>` to act.
     UpgradeAvailable,
