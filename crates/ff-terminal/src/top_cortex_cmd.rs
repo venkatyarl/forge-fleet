@@ -1092,8 +1092,11 @@ async fn run_index(
         let report = cortex::index_langs_incremental(pool, slug, &langs).await?;
         if verbose {
             println!(
-                "{CYAN}  incremental: {} changed, {} unchanged, {} deleted{RESET}",
-                report.files_changed, report.files_unchanged, report.files_deleted
+                "{CYAN}  incremental: {} changed, {} unchanged, {} deleted, {} stale placeholders GC'd{RESET}",
+                report.files_changed,
+                report.files_unchanged,
+                report.files_deleted,
+                report.placeholders_gced
             );
         }
         report.per_lang

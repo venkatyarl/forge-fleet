@@ -219,6 +219,9 @@ pub struct IncrementalReport {
     pub files_changed: usize,
     pub files_unchanged: usize,
     pub files_deleted: usize,
+    /// Unreferenced `code:extern`/`code:import` placeholder nodes garbage-collected
+    /// this run (the dead-placeholder accrual that previously needed a full reindex).
+    pub placeholders_gced: usize,
     pub per_lang: Vec<(String, CortexStats)>,
 }
 
@@ -269,10 +272,12 @@ fn partition_changes(
 /// OUTGOING edges are cleared and re-extracted, and symbols the file no longer
 /// defines are GC'd afterward. Removed files have their symbols deleted outright.
 ///
-/// Tradeoff vs a full reindex: `code:extern`/`code:import` nodes that go
-/// unreferenced are not garbage-collected here; a periodic full `index_langs`
-/// cleans them up. First run on a corpus with no ledger treats every file as
-/// changed — equivalent to a full reindex but without the upfront global wipe.
+/// `code:extern`/`code:import` placeholder nodes that this run's edge churn
+/// leaves unreferenced are garbage-collected at the end (`gc_orphan_placeholders`),
+/// so incremental is self-sufficient — no periodic full reindex is needed to keep
+/// the graph clean (the commit hook only ever runs `--incremental`). First run on a
+/// corpus with no ledger treats every file as changed — equivalent to a full
+/// reindex but without the upfront global wipe.
 pub async fn index_langs_incremental(
     pool: &PgPool,
     corpus_slug: &str,
@@ -337,6 +342,12 @@ pub async fn index_langs_incremental(
 
     report.files_changed = changed.len();
     if changed.is_empty() {
+        // No re-extraction, but deletions can orphan a removed file's import/
+        // extern placeholders — sweep them. (A run that touched nothing at all
+        // can't have orphaned anything, so skip the query then.)
+        if report.files_deleted > 0 {
+            report.placeholders_gced = gc_orphan_placeholders(pool, corpus_slug).await?;
+        }
         return Ok(report);
     }
 
@@ -389,7 +400,41 @@ pub async fn index_langs_incremental(
     if !removed.is_empty() {
         delete_nodes_by_id(pool, &removed).await?;
     }
+
+    // Re-extraction may have dropped the last `imports`/`calls` edge into an
+    // extern/import placeholder (a removed import, a renamed/deleted callee).
+    // GC those zero-in-degree placeholders so incremental matches a full reindex.
+    report.placeholders_gced = gc_orphan_placeholders(pool, corpus_slug).await?;
     Ok(report)
+}
+
+/// Garbage-collect unreferenced placeholder nodes (`code:extern`/`code:import`)
+/// in a corpus. A placeholder exists only because some file imports or calls the
+/// external/unresolved symbol it names; the incoming `imports`/`calls` edge IS its
+/// reason to exist. Incremental reindex (unlike a full reindex, which wipes and
+/// rebuilds) keeps shared placeholders across file churn, so when the last
+/// referencing file changes or is removed a placeholder can be left with zero
+/// incoming edges — dead weight that pollutes `find`/`outline` and bloats the
+/// graph. This deletes exactly those zero-in-degree placeholders, which is what a
+/// full reindex would (a full reindex re-creates a placeholder only when a file
+/// references it, i.e. only with an incoming edge). Scoped strictly to the two
+/// placeholder node_types, so real `code:function`/`code:struct`/… symbols — which
+/// can legitimately have no incoming `calls` edge (entrypoints, dead-but-defined) —
+/// are never touched. Returns the number of nodes deleted.
+async fn gc_orphan_placeholders(pool: &PgPool, corpus_slug: &str) -> Result<usize> {
+    let res = sqlx::query(
+        r#"DELETE FROM brain_vault_nodes
+            WHERE project = $1
+              AND node_type IN ('code:extern', 'code:import')
+              AND NOT EXISTS (
+                  SELECT 1 FROM brain_vault_edges e
+                   WHERE e.dst_id = brain_vault_nodes.id
+              )"#,
+    )
+    .bind(corpus_slug)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() as usize)
 }
 
 /// Idempotency: drop all prior code:* nodes for this corpus (edges cascade).
@@ -454,7 +499,8 @@ async fn lookup_file_node(pool: &PgPool, corpus_slug: &str, path: &str) -> Resul
 /// Delete all `code:*` symbols owned by one file — the `contains` subtree rooted
 /// at the file node (edges cascade), plus the file's own outgoing `imports`
 /// edges. Shared `code:import`/`code:extern` nodes are intentionally left (they
-/// may be referenced by other files); a full reindex GCs any that go orphaned.
+/// may be referenced by other files); `gc_orphan_placeholders`, run at the end of
+/// the incremental pass, sweeps any that end up unreferenced.
 async fn wipe_file_symbols(pool: &PgPool, file_node_id: Uuid) -> Result<()> {
     sqlx::query(
         r#"WITH RECURSIVE descend(id) AS (
