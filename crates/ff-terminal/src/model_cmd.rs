@@ -332,8 +332,13 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                 );
             }
         }
-        crate::ModelCommand::Catalog => {
+        crate::ModelCommand::Catalog { json } => {
             let rows = ff_db::pg_list_catalog(&pool).await?;
+            if json {
+                let out: Vec<serde_json::Value> = rows.iter().map(catalog_json_row).collect();
+                println!("{}", serde_json::to_string_pretty(&out)?);
+                return Ok(());
+            }
             if rows.is_empty() {
                 println!("(catalog empty — run `ff model sync-catalog` first)");
                 return Ok(());
@@ -661,8 +666,13 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                 human_bytes(summary.total_bytes)
             );
         }
-        crate::ModelCommand::Disk => {
+        crate::ModelCommand::Disk { json } => {
             let rows = ff_db::pg_latest_disk_usage(&pool).await?;
+            if json {
+                let out: Vec<serde_json::Value> = rows.iter().map(disk_json_row).collect();
+                println!("{}", serde_json::to_string_pretty(&out)?);
+                return Ok(());
+            }
             if rows.is_empty() {
                 println!("(no disk usage samples yet — the daemon records these periodically)");
                 return Ok(());
@@ -1675,8 +1685,17 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                 Err(e) => anyhow::bail!("convert failed: {e}"),
             }
         }
-        crate::ModelCommand::Jobs { status, limit } => {
+        crate::ModelCommand::Jobs {
+            status,
+            limit,
+            json,
+        } => {
             let rows = ff_db::pg_list_jobs(&pool, status.as_deref(), limit).await?;
+            if json {
+                let out: Vec<serde_json::Value> = rows.iter().map(job_json_row).collect();
+                println!("{}", serde_json::to_string_pretty(&out)?);
+                return Ok(());
+            }
             if rows.is_empty() {
                 println!("(no jobs)");
                 return Ok(());
@@ -2401,6 +2420,77 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
 }
 
 /// Human-readable size: GiB with one decimal at >= 1 GiB, else whole MiB.
+/// Build one lossless JSON object for an `ff model catalog --json` row.
+/// Pure (no DB/clock) so it can be unit-tested; emits every catalog field
+/// including the raw preferred_workloads/variants arrays the table elides.
+fn catalog_json_row(r: &ff_db::ModelCatalogRow) -> serde_json::Value {
+    serde_json::json!({
+        "id": r.id,
+        "name": r.name,
+        "family": r.family,
+        "parameters": r.parameters,
+        "tier": r.tier,
+        "description": r.description,
+        "gated": r.gated,
+        "tool_calling": r.tool_calling,
+        "preferred_workloads": r.preferred_workloads,
+        "variants": r.variants,
+    })
+}
+
+/// Build one JSON object for an `ff model disk --json` row from the
+/// `pg_latest_disk_usage` tuple `(node, dir, total, used, free, models, ts)`.
+/// Pure so it can be unit-tested; emits raw byte counts (lossless) plus
+/// human-readable mirrors of the three the table shows.
+fn disk_json_row(
+    row: &(
+        String,
+        String,
+        i64,
+        i64,
+        i64,
+        i64,
+        chrono::DateTime<chrono::Utc>,
+    ),
+) -> serde_json::Value {
+    let (node, dir, total, used, free, models, ts) = row;
+    serde_json::json!({
+        "node": node,
+        "models_dir": dir,
+        "total_bytes": total,
+        "used_bytes": used,
+        "free_bytes": free,
+        "models_bytes": models,
+        "free_human": human_bytes(*free as u64),
+        "used_human": human_bytes(*used as u64),
+        "models_human": human_bytes(*models as u64),
+        "sampled_at": ts.to_rfc3339(),
+    })
+}
+
+/// Build one lossless JSON object for an `ff model jobs --json` row.
+/// Pure (no DB/clock) so it can be unit-tested; emits the job UUID and the
+/// progress/byte/eta/error fields the fixed-width table cannot show.
+fn job_json_row(r: &ff_db::ModelJobRow) -> serde_json::Value {
+    serde_json::json!({
+        "id": r.id,
+        "node": r.worker_name,
+        "kind": r.kind,
+        "target_catalog_id": r.target_catalog_id,
+        "target_library_id": r.target_library_id,
+        "status": r.status,
+        "progress_pct": r.progress_pct,
+        "bytes_done": r.bytes_done,
+        "bytes_total": r.bytes_total,
+        "eta_seconds": r.eta_seconds,
+        "params": r.params,
+        "error_message": r.error_message,
+        "started_at": r.started_at.map(|t| t.to_rfc3339()),
+        "completed_at": r.completed_at.map(|t| t.to_rfc3339()),
+        "created_at": r.created_at.to_rfc3339(),
+    })
+}
+
 /// Pure so the table and `--json` paths render identical strings.
 fn human_size(size_bytes: i64) -> String {
     let gb = (size_bytes as f64) / 1024.0 / 1024.0 / 1024.0;
@@ -3083,5 +3173,94 @@ mod tests {
         assert!(!ram_headroom_ok(floor - 0.1, floor));
         // A memory-tight host (negative conservative free RAM) is refused.
         assert!(!ram_headroom_ok(-2.0, floor));
+    }
+
+    #[test]
+    fn catalog_json_row_is_lossless_incl_raw_arrays() {
+        let row = ff_db::ModelCatalogRow {
+            id: "qwen3-coder-30b".into(),
+            name: "Qwen3 Coder 30B".into(),
+            family: "qwen".into(),
+            parameters: "30B".into(),
+            tier: 2,
+            description: Some("code model".into()),
+            gated: false,
+            preferred_workloads: serde_json::json!(["tool_calling", "code"]),
+            variants: serde_json::json!([{"runtime": "llama.cpp", "quant": "Q4"}]),
+            tool_calling: true,
+        };
+        let v = catalog_json_row(&row);
+        assert_eq!(v["id"], "qwen3-coder-30b");
+        assert_eq!(v["tier"], 2);
+        assert_eq!(v["gated"], false);
+        assert_eq!(v["tool_calling"], true);
+        // Raw arrays the table elides are carried through verbatim.
+        assert_eq!(v["preferred_workloads"][0], "tool_calling");
+        assert_eq!(v["variants"][0]["runtime"], "llama.cpp");
+
+        // A NULL description serializes to JSON null (stable shape), not omitted.
+        let mut bare = row.clone();
+        bare.description = None;
+        assert!(catalog_json_row(&bare)["description"].is_null());
+    }
+
+    #[test]
+    fn disk_json_row_carries_raw_bytes_and_rfc3339() {
+        let ts = chrono::DateTime::parse_from_rfc3339("2026-06-13T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let row = (
+            "marcus".to_string(),
+            "/home/m/models".to_string(),
+            1_000_000_000_000_i64, // total
+            400_000_000_000_i64,   // used
+            600_000_000_000_i64,   // free
+            250_000_000_000_i64,   // models
+            ts,
+        );
+        let v = disk_json_row(&row);
+        assert_eq!(v["node"], "marcus");
+        assert_eq!(v["models_dir"], "/home/m/models");
+        // Raw byte counts are lossless (incl. total, which the table drops).
+        assert_eq!(v["total_bytes"], 1_000_000_000_000_i64);
+        assert_eq!(v["free_bytes"], 600_000_000_000_i64);
+        assert_eq!(v["sampled_at"], "2026-06-13T12:00:00+00:00");
+        // human mirrors match the shared formatter.
+        assert_eq!(v["free_human"], human_bytes(600_000_000_000));
+    }
+
+    #[test]
+    fn job_json_row_lossless_with_null_optionals() {
+        let ts = chrono::DateTime::parse_from_rfc3339("2026-06-13T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let row = ff_db::ModelJobRow {
+            id: "11111111-1111-1111-1111-111111111111".into(),
+            worker_name: "sia".into(),
+            kind: "download".into(),
+            target_catalog_id: Some("qwen3-coder-30b".into()),
+            target_library_id: None,
+            params: serde_json::json!({"runtime": "vllm"}),
+            status: "running".into(),
+            progress_pct: 42.5,
+            bytes_done: Some(500),
+            bytes_total: Some(1000),
+            eta_seconds: Some(30),
+            started_at: Some(ts),
+            completed_at: None,
+            created_at: ts,
+            error_message: None,
+        };
+        let v = job_json_row(&row);
+        assert_eq!(v["id"], "11111111-1111-1111-1111-111111111111");
+        assert_eq!(v["node"], "sia");
+        assert_eq!(v["status"], "running");
+        assert_eq!(v["bytes_done"], 500);
+        assert_eq!(v["params"]["runtime"], "vllm");
+        assert_eq!(v["created_at"], "2026-06-13T12:00:00+00:00");
+        // Unset optionals are JSON null, not omitted (stable shape for agents).
+        assert!(v["target_library_id"].is_null());
+        assert!(v["completed_at"].is_null());
+        assert!(v["error_message"].is_null());
     }
 }
