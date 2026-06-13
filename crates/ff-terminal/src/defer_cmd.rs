@@ -218,18 +218,29 @@ pub async fn handle_defer(cmd: crate::DeferCommand) -> Result<()> {
             if cancelled {
                 println!("Cancelled task {id}");
             } else if force {
-                println!("Task {id} not cancellable (already terminal, or does not exist)");
+                // The requested mutation did NOT happen (task already terminal
+                // or does not exist). Report on stderr + exit non-zero so a
+                // script's `&&` chain / `$?` check sees the failure instead of a
+                // false success — mirrors `ff defer get` on a missing id.
+                eprintln!("Task {id} not cancellable (already terminal, or does not exist)");
+                std::process::exit(1);
             } else {
-                println!(
+                eprintln!(
                     "Task {id} is not in a cancellable state (use --force for a stuck 'running' task)"
                 );
+                std::process::exit(1);
             }
         }
         crate::DeferCommand::Retry { id } => {
             if ff_db::pg_retry_deferred(&pool, &id).await? {
                 println!("Task {id} requeued for retry (status=pending)");
             } else {
-                println!("Task {id} is not in a retryable state (must be failed or cancelled)");
+                // No row updated — the task is missing or not in a
+                // failed/cancelled state, so the retry didn't happen. Signal it
+                // with a non-zero exit (consistent with `ff defer get` and the
+                // cortex/model no-match verbs) instead of a silent success.
+                eprintln!("Task {id} is not in a retryable state (must be failed or cancelled)");
+                std::process::exit(1);
             }
         }
     }
