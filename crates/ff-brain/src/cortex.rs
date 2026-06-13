@@ -965,6 +965,9 @@ pub struct SymbolHit {
     /// 1-based start line (None for pre-V124 nodes or non-spanning placeholders).
     pub start_line: Option<i32>,
     pub fan_in: i64,
+    /// Cosine similarity (0..=1) when this hit came from `--semantic` ranking;
+    /// `None` for substring matches (which rank by `fan_in`, not relevance).
+    pub score: Option<f32>,
 }
 
 /// Escape SQL `LIKE`/`ILIKE` wildcards (`%`, `_`) and the escape char (`\`) in a
@@ -1018,40 +1021,147 @@ pub async fn find_symbols(
             file: None,
             start_line: r.get("start_line"),
             fan_in: r.get("fan_in"),
+            score: None,
         })
         .collect();
 
-    // Resolve each hit's owning file by walking `contains` edges UP to the
-    // ancestor content:file node (file -> impl/mod -> symbol can nest, so a
-    // recursive walk, not a single hop).
+    resolve_hit_files(pool, &mut hits).await?;
+    Ok(hits)
+}
+
+/// Resolve each hit's owning file by walking `contains` edges UP to the ancestor
+/// `content:file` node (file -> impl/mod -> symbol can nest, so a recursive walk,
+/// not a single hop). Fills `SymbolHit::file` in place. Shared by the substring
+/// and semantic `find_symbols*` paths.
+async fn resolve_hit_files(pool: &PgPool, hits: &mut [SymbolHit]) -> Result<()> {
     let ids: Vec<Uuid> = hits.iter().map(|h| h.id).collect();
-    if !ids.is_empty() {
-        let file_rows = sqlx::query(
-            r#"WITH RECURSIVE up AS (
-                    SELECT e.src_id AS anc, e.dst_id AS leaf
-                      FROM brain_vault_edges e
-                     WHERE e.edge_type = 'contains' AND e.dst_id = ANY($1)
-                    UNION
-                    SELECT e.src_id, up.leaf
-                      FROM brain_vault_edges e
-                      JOIN up ON e.dst_id = up.anc
-                     WHERE e.edge_type = 'contains'
-                )
-                SELECT up.leaf AS leaf, n.path AS path
-                  FROM up JOIN brain_vault_nodes n ON n.id = up.anc
-                 WHERE n.node_type = 'content:file'"#,
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let file_rows = sqlx::query(
+        r#"WITH RECURSIVE up AS (
+                SELECT e.src_id AS anc, e.dst_id AS leaf
+                  FROM brain_vault_edges e
+                 WHERE e.edge_type = 'contains' AND e.dst_id = ANY($1)
+                UNION
+                SELECT e.src_id, up.leaf
+                  FROM brain_vault_edges e
+                  JOIN up ON e.dst_id = up.anc
+                 WHERE e.edge_type = 'contains'
+            )
+            SELECT up.leaf AS leaf, n.path AS path
+              FROM up JOIN brain_vault_nodes n ON n.id = up.anc
+             WHERE n.node_type = 'content:file'"#,
+    )
+    .bind(&ids)
+    .fetch_all(pool)
+    .await?;
+    let mut by_leaf: HashMap<Uuid, String> = HashMap::new();
+    for r in file_rows {
+        by_leaf.insert(r.get("leaf"), r.get("path"));
+    }
+    for h in hits.iter_mut() {
+        h.file = by_leaf.get(&h.id).cloned();
+    }
+    Ok(())
+}
+
+/// Map a pgvector `<->` distance to a bounded 0..=1 similarity (higher = closer),
+/// matching `vector_search`'s scoring so the printed number is comparable across
+/// queries. Distance 0 → 1.0; grows monotonically less as distance increases.
+pub fn similarity_from_distance(distance: f64) -> f32 {
+    (1.0f32 / (1.0f32 + distance as f32)).min(1.0f32)
+}
+
+/// Semantic variant of [`find_symbols`]: embed `query` via the fleet's bge-m3
+/// endpoint and rank `code:*` symbols in the corpus by embedding distance
+/// (pgvector `<->`), instead of by name substring. Use when the caller knows the
+/// *intent* ("where do we publish heartbeats") but not the exact name — substring
+/// search misses those. Returns the same [`SymbolHit`] shape (now with `score`
+/// set) so a hit drills into callers/callees/impact identically.
+///
+/// Errors — rather than silently degrading — when no fleet embedding endpoint is
+/// live (the query would otherwise embed to hash-stub noise and rank garbage) or
+/// when the corpus has no embedded nodes yet (run `ff cortex embed` first).
+pub async fn find_symbols_semantic(
+    pool: &PgPool,
+    corpus_slug: &str,
+    query: &str,
+    limit: i64,
+) -> Result<Vec<SymbolHit>> {
+    let limit = limit.clamp(1, 500);
+    let client = crate::embeddings::fleet_embedding_client(pool)
+        .await
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no healthy fleet embedding endpoint for --semantic search — load one with \
+                 `ff model load <bge-m3-lib-id>` (needs preferred_workloads=embedding), or omit \
+                 --semantic for substring search"
+            )
+        })?;
+    let qvec = client
+        .embed(query)
+        .await
+        .map_err(|e| anyhow::anyhow!("embed query: {e}"))?;
+    let qlit = crate::vector_search::embedding_to_pgvector(&qvec);
+
+    // `<->` is pgvector's distance operator (L2 for the default opclass); smaller
+    // = closer. We surface a bounded 0..=1 similarity via 1/(1+distance), matching
+    // how vector_search scores, so the printed number is comparable across queries.
+    let rows = sqlx::query(
+        r#"SELECT n.id, n.title, n.node_type, n.start_line,
+                  (SELECT count(*) FROM brain_vault_edges e
+                    WHERE e.edge_type = 'calls' AND e.dst_id = n.id) AS fan_in,
+                  (n.embedding <-> $2::vector) AS distance
+             FROM brain_vault_nodes n
+            WHERE n.project = $1
+              AND n.node_type LIKE 'code:%'
+              AND n.embedding IS NOT NULL
+            ORDER BY n.embedding <-> $2::vector
+            LIMIT $3"#,
+    )
+    .bind(corpus_slug)
+    .bind(&qlit)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    if rows.is_empty() {
+        // Distinguish "nothing similar" from "nothing embedded": the latter is an
+        // operator action (run `ff cortex embed`), so say so instead of an empty list.
+        let embedded: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM brain_vault_nodes
+              WHERE project = $1 AND node_type LIKE 'code:%' AND embedding IS NOT NULL",
         )
-        .bind(&ids)
-        .fetch_all(pool)
+        .bind(corpus_slug)
+        .fetch_one(pool)
         .await?;
-        let mut by_leaf: HashMap<Uuid, String> = HashMap::new();
-        for r in file_rows {
-            by_leaf.insert(r.get("leaf"), r.get("path"));
-        }
-        for h in &mut hits {
-            h.file = by_leaf.get(&h.id).cloned();
+        if embedded == 0 {
+            anyhow::bail!(
+                "corpus '{corpus_slug}' has no embedded code symbols — run `ff cortex embed` \
+                 first, then retry --semantic (or use substring search without --semantic)"
+            );
         }
     }
+
+    let mut hits: Vec<SymbolHit> = rows
+        .into_iter()
+        .map(|r| {
+            // pgvector returns FLOAT8 for the distance expression; read as f64.
+            let distance: f64 = r.get("distance");
+            SymbolHit {
+                id: r.get("id"),
+                qualified_name: r.get("title"),
+                node_type: r.get("node_type"),
+                file: None,
+                start_line: r.get("start_line"),
+                fan_in: r.get("fan_in"),
+                score: Some(similarity_from_distance(distance)),
+            }
+        })
+        .collect();
+
+    resolve_hit_files(pool, &mut hits).await?;
     Ok(hits)
 }
 
@@ -3000,6 +3110,19 @@ mod tests {
         assert_eq!(escape_like("a%b_c\\d"), r"a\%b\_c\\d");
         assert_eq!(escape_like("plainName"), "plainName");
         assert_eq!(escape_like(""), "");
+    }
+
+    #[test]
+    fn similarity_is_bounded_and_monotonic() {
+        // Exact hit (distance 0) → max similarity.
+        assert_eq!(similarity_from_distance(0.0), 1.0);
+        // Monotonically decreasing as distance grows; always in (0, 1].
+        let near = similarity_from_distance(0.5);
+        let far = similarity_from_distance(5.0);
+        assert!(near > far, "closer must score higher: {near} vs {far}");
+        assert!(far > 0.0 && near <= 1.0);
+        // Negative distance can't push the score above 1 (defensive clamp).
+        assert_eq!(similarity_from_distance(-0.1), 1.0);
     }
 
     #[test]

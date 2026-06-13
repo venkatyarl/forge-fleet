@@ -65,10 +65,16 @@ pub enum TopCortexCommand {
     /// — the discovery entrypoint: locate a symbol, then drill in with
     /// callers/callees/impact. Corpus defaults to the cwd's slug.
     Find {
-        /// Substring to match against symbol qualified names (case-insensitive).
+        /// Substring to match against symbol qualified names (case-insensitive),
+        /// or — with --semantic — a natural-language intent ("where we publish heartbeats").
         query: String,
         #[arg(long)]
         corpus: Option<String>,
+        /// Rank by embedding similarity (bge-m3) instead of name substring — finds
+        /// symbols by INTENT when you don't know the name. Requires `ff cortex embed`
+        /// to have run and a live fleet embedding endpoint.
+        #[arg(long)]
+        semantic: bool,
         /// Max hits to return (1-500).
         #[arg(long, default_value_t = 20)]
         limit: i64,
@@ -396,11 +402,16 @@ pub async fn handle_top_cortex(args: TopCortexArgs) -> Result<()> {
         TopCortexCommand::Find {
             query,
             corpus,
+            semantic,
             limit,
             format,
         } => {
             let corpus = corpus.unwrap_or_else(cwd_slug);
-            let hits = cortex::find_symbols(&pool, &corpus, &query, limit).await?;
+            let hits = if semantic {
+                cortex::find_symbols_semantic(&pool, &corpus, &query, limit).await?
+            } else {
+                cortex::find_symbols(&pool, &corpus, &query, limit).await?
+            };
             print_hits(&hits, &format, &query, &corpus);
         }
         TopCortexCommand::Impact {
@@ -451,6 +462,7 @@ fn print_hits(hits: &[cortex::SymbolHit], format: &str, query: &str, corpus: &st
                         "file": h.file,
                         "start_line": h.start_line,
                         "fan_in": h.fan_in,
+                        "score": h.score,
                     })
                 })
                 .collect();
@@ -478,10 +490,18 @@ fn print_hits(hits: &[cortex::SymbolHit], format: &str, query: &str, corpus: &st
                     (Some(f), None) => f.clone(),
                     _ => "-".to_string(),
                 };
-                println!(
-                    "  {:<9} fanin={:<4} {}  ({loc})",
-                    kind, h.fan_in, h.qualified_name
-                );
+                // Semantic hits carry a similarity score (the ranking key); show it
+                // so the order is legible. Substring hits rank by fan-in alone.
+                match h.score {
+                    Some(s) => println!(
+                        "  {:<9} sim={:.2} fanin={:<4} {}  ({loc})",
+                        kind, s, h.fan_in, h.qualified_name
+                    ),
+                    None => println!(
+                        "  {:<9} fanin={:<4} {}  ({loc})",
+                        kind, h.fan_in, h.qualified_name
+                    ),
+                }
             }
         }
     }

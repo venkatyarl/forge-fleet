@@ -6,7 +6,7 @@
 //! `cortex_callees`, and `cortex_impact` (transitive blast radius). The graph is
 //! built by `ff cortex index`; these tools only query it.
 
-use ff_brain::{callees, callers, corpus, cortex, find_symbols, impact};
+use ff_brain::{callees, callers, corpus, cortex, find_symbols, find_symbols_semantic, impact};
 use ff_core::config;
 use serde_json::{Value, json};
 use sqlx::postgres::PgPoolOptions;
@@ -102,13 +102,25 @@ pub async fn cortex_find(params: Option<Value>) -> HandlerResult {
         .and_then(|p| p.get("limit"))
         .and_then(|v| v.as_i64())
         .unwrap_or(20);
+    let semantic = params
+        .as_ref()
+        .and_then(|p| p.get("semantic"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let pool = get_pool().await?;
-    let hits = find_symbols(&pool, &corpus_slug, &query, limit)
-        .await
-        .map_err(|e| format!("find: {e}"))?;
+    let hits = if semantic {
+        find_symbols_semantic(&pool, &corpus_slug, &query, limit)
+            .await
+            .map_err(|e| format!("find (semantic): {e}"))?
+    } else {
+        find_symbols(&pool, &corpus_slug, &query, limit)
+            .await
+            .map_err(|e| format!("find: {e}"))?
+    };
     Ok(json!({
         "corpus": corpus_slug,
         "query": query,
+        "semantic": semantic,
         "count": hits.len(),
         "hits": hits.iter().map(|h| json!({
             "qualified_name": h.qualified_name,
@@ -116,6 +128,7 @@ pub async fn cortex_find(params: Option<Value>) -> HandlerResult {
             "file": h.file,
             "start_line": h.start_line,
             "fan_in": h.fan_in,
+            "score": h.score,
             "id": h.id.to_string(),
         })).collect::<Vec<_>>(),
     }))
