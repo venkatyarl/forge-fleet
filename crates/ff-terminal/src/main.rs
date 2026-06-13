@@ -3510,9 +3510,15 @@ async fn main() -> Result<()> {
                             println!("{GREEN}✓{RESET} cancelled {task_id} (was {prev_status})");
                         }
                         None => {
-                            println!(
-                                "{YELLOW}—{RESET} {task_id} already terminal (completed/failed/cancelled); nothing to cancel"
+                            // No row transitioned — the task is already terminal
+                            // OR does not exist. Either way the requested cancel
+                            // did NOT happen, so report on stderr + exit non-zero
+                            // (a script's `&&` chain / `$?` check should see the
+                            // failure). Mirrors `ff defer cancel` / `ff tasks get`.
+                            eprintln!(
+                                "{YELLOW}—{RESET} {task_id} not cancellable (already terminal, or does not exist)"
                             );
+                            std::process::exit(1);
                         }
                     }
                     Ok(())
