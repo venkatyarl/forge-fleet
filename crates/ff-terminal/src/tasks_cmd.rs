@@ -7,6 +7,34 @@ use ff_core::task_error::{TaskErrorClass, classify_task_error};
 use serde_json::Value;
 use sqlx::{PgPool, Row};
 
+/// Documented `fleet_tasks.status` values (see schema.rs `fleet_tasks`).
+/// Used to WARN on a likely-typo'd `--status` filter. Deliberately a soft
+/// warning, not a hard error: a future status added to the schema would
+/// otherwise be wrongly rejected, so drift here only costs a spurious warning.
+const KNOWN_TASK_STATUSES: &[&str] = &[
+    "pending",
+    "claimed",
+    "running",
+    "completed",
+    "failed",
+    "handed_off",
+    "cancelled",
+    "paused",
+];
+
+/// Returns the comma-separated `--status` parts that aren't a documented task
+/// status (likely typos). Pure — empty filter / all-known → empty vec. Match is
+/// case-insensitive so `Running` doesn't warn.
+fn unknown_status_parts(filter: &str) -> Vec<String> {
+    filter
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter(|s| !KNOWN_TASK_STATUSES.contains(&s.to_ascii_lowercase().as_str()))
+        .map(|s| s.to_string())
+        .collect()
+}
+
 /// Terminal statuses that represent a failure (worth classifying).
 fn is_failed_status(status: &str) -> bool {
     matches!(status, "failed" | "cancelled" | "canceled")
@@ -63,11 +91,29 @@ pub async fn handle_tasks_list(
     );
     let mut args: Vec<String> = Vec::new();
     if let Some(cf) = computer_filter {
+        // Validate against the (drift-free) computers table so a typo errors
+        // loudly instead of silently returning an empty list that reads like
+        // "no such tasks".
+        let known: i64 = sqlx::query_scalar("SELECT count(*) FROM computers WHERE name = $1")
+            .bind(cf)
+            .fetch_one(pg)
+            .await?;
+        if known == 0 {
+            anyhow::bail!("unknown computer '{cf}' — run 'ff fleet health' to list computers");
+        }
         args.push(cf.to_string());
         sql.push_str(&format!(" AND c.name = ${}", args.len()));
     }
     // Allow comma-separated list of statuses, e.g. "pending,running".
     if let Some(sf) = status_filter {
+        // Warn (don't reject — see KNOWN_TASK_STATUSES) on a likely typo so an
+        // empty result isn't mistaken for "no matching tasks".
+        for bad in unknown_status_parts(sf) {
+            eprintln!(
+                "warning: unknown status '{bad}' — known: {}",
+                KNOWN_TASK_STATUSES.join(", ")
+            );
+        }
         let parts: Vec<&str> = sf
             .split(',')
             .map(str::trim)
@@ -317,4 +363,33 @@ pub async fn handle_tasks_get(pg: &PgPool, id: uuid::Uuid, json: bool) -> Result
         println!("Error: {e}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_status_parts_flags_typos_only() {
+        // Empty / whitespace → nothing to warn about.
+        assert!(unknown_status_parts("").is_empty());
+        assert!(unknown_status_parts("  ").is_empty());
+        // All-known (with surrounding whitespace) → empty.
+        assert!(unknown_status_parts("pending, running ,completed").is_empty());
+        // Case-insensitive: a capitalized known status doesn't warn.
+        assert!(unknown_status_parts("Running,FAILED").is_empty());
+        // A typo is surfaced, valid siblings are not.
+        assert_eq!(
+            unknown_status_parts("running,runing,pending"),
+            vec!["runing".to_string()]
+        );
+        // Every documented status is recognized (guards against drift between
+        // KNOWN_TASK_STATUSES and the schema comment).
+        for s in KNOWN_TASK_STATUSES {
+            assert!(
+                unknown_status_parts(s).is_empty(),
+                "status {s} should be known"
+            );
+        }
+    }
 }
