@@ -42,7 +42,13 @@ pub enum McpCommand {
     },
     /// Print which clients ff would target (based on what configs exist)
     /// without making any change.
-    Status,
+    Status {
+        /// Emit one JSON object per client config
+        /// (client/config_path/exists/forgefleet_installed/state) instead of
+        /// the human table, so an agent can consume the install map structurally.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }
 
 const INSTRUCTION_MARKER: &str = "<!-- ff-mcp-install -->";
@@ -88,8 +94,8 @@ pub async fn handle_mcp(cmd: McpCommand) -> Result<()> {
             }
             Ok(())
         }
-        McpCommand::Status => {
-            print_status();
+        McpCommand::Status { json } => {
+            print_status(json);
             Ok(())
         }
     }
@@ -425,7 +431,31 @@ fn append_instructions_md(path: &PathBuf, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
-fn print_status() {
+/// Classify a single client config into a stable machine-readable state string,
+/// derived purely from whether the config file exists and whether it already
+/// names the forgefleet server. Pure so it's unit-testable without a real FS.
+fn classify_state(exists: bool, has_ff: bool) -> &'static str {
+    if !exists {
+        "absent"
+    } else if has_ff {
+        "installed"
+    } else {
+        "not_installed"
+    }
+}
+
+/// Human marker for the text table, derived from the same state. Kept separate
+/// so the JSON path carries the stable `state` token and the text path keeps
+/// its existing glyphs byte-for-byte.
+fn text_mark(state: &str) -> &'static str {
+    match state {
+        "absent" => "—",
+        "installed" => "✓ forgefleet installed",
+        _ => "× forgefleet missing",
+    }
+}
+
+fn print_status(as_json: bool) {
     let home = match dirs::home_dir() {
         Some(h) => h,
         None => {
@@ -456,7 +486,11 @@ fn print_status() {
         ),
         ("grok", vec![home.join(".grok").join("mcp-config.json")]),
     ];
-    println!("MCP client configs on this computer:");
+
+    let mut rows: Vec<Value> = Vec::new();
+    if !as_json {
+        println!("MCP client configs on this computer:");
+    }
     for (name, paths) in candidates {
         for path in paths {
             let exists = path.exists();
@@ -468,14 +502,48 @@ fn print_status() {
             } else {
                 false
             };
-            let mark = if !exists {
-                "—"
-            } else if has_ff {
-                "✓ forgefleet installed"
+            let state = classify_state(exists, has_ff);
+            if as_json {
+                rows.push(json!({
+                    "client": name,
+                    "config_path": path.display().to_string(),
+                    "exists": exists,
+                    "forgefleet_installed": has_ff,
+                    "state": state,
+                }));
             } else {
-                "× forgefleet missing"
-            };
-            println!("  {:<12} {} {}", name, mark, path.display());
+                println!("  {:<12} {} {}", name, text_mark(state), path.display());
+            }
         }
+    }
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&rows).unwrap_or_else(|_| "[]".to_string())
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_state_covers_all_three() {
+        // config file absent → absent regardless of has_ff
+        assert_eq!(classify_state(false, false), "absent");
+        assert_eq!(classify_state(false, true), "absent");
+        // exists + names forgefleet → installed
+        assert_eq!(classify_state(true, true), "installed");
+        // exists but no forgefleet entry → not_installed
+        assert_eq!(classify_state(true, false), "not_installed");
+    }
+
+    #[test]
+    fn text_mark_matches_state_glyphs() {
+        // pins the exact table glyphs so the text path stays byte-for-byte
+        assert_eq!(text_mark("absent"), "—");
+        assert_eq!(text_mark("installed"), "✓ forgefleet installed");
+        assert_eq!(text_mark("not_installed"), "× forgefleet missing");
     }
 }
