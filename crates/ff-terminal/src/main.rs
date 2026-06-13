@@ -1654,7 +1654,12 @@ enum FleetCommand {
 pub enum GithubCommand {
     /// List the aliases (and key fingerprints) currently registered in
     /// the DB. Does not print private key material.
-    List,
+    List {
+        /// Emit a JSON array (one object per alias, incl. key presence +
+        /// fingerprint) for scripts/agents instead of the text view.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Pull aliases + keys from the DB and apply them to *this*
     /// computer's `~/.ssh/`. Idempotent: skips aliases already present
     /// in `~/.ssh/config` and skips key files that already match.
