@@ -30,14 +30,20 @@
 //!   (brain_node_facets), creating the facet row if missing (matching how
 //!   corpus.rs / data_index.rs seed facets via upsert semantics).
 //!
-//! IDEMPOTENT: like cortex::index() and data_index::index_data(), index_images()
-//! DELETEs all prior `image:%` nodes for the corpus first (edges cascade via
-//! ON DELETE CASCADE), then rebuilds.
+//! FULL vs INCREMENTAL: a full reindex DELETEs all prior `image:%` nodes for the
+//! corpus first (edges cascade via ON DELETE CASCADE), then rebuilds — re-running
+//! the vision caption pass on every image. An incremental run keeps the existing
+//! nodes and re-captions ONLY images whose bytes changed since the last index
+//! (matched by `content_hash`), GCs nodes for images removed on disk, and sweeps
+//! orphaned `image:tag` nodes. Since the vision pass (one LLM call per image) is
+//! the dominant cost of `ff cortex index`, skipping unchanged images takes a
+//! no-op `--incremental` run from minutes to ~instant.
 
 use anyhow::Result;
 use base64::Engine;
 use sha2::{Digest, Sha256};
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use uuid::Uuid;
@@ -93,7 +99,19 @@ fn mime_for_ext(ext: &str) -> &'static str {
 /// Re-uses the cached `PgPool` (passed in). Walks `root` for image files and
 /// writes `image:file` nodes + (best-effort) `image:tag` nodes + `tagged` edges
 /// + the modality=image facet.
-pub async fn index_images(pool: &PgPool, corpus_slug: &str, root: &Path) -> Result<ImageStats> {
+///
+/// `incremental`: when false (full reindex) every prior `image:%` node is wiped
+/// and every image is re-captioned. When true, existing nodes are kept and only
+/// images whose `content_hash` changed since the last index are re-captioned;
+/// nodes for images removed on disk are GC'd, as are orphaned `image:tag` nodes.
+/// The vision pass is the dominant cost of an index run (one LLM call per image),
+/// so the incremental path makes a no-op run effectively free.
+pub async fn index_images(
+    pool: &PgPool,
+    corpus_slug: &str,
+    root: &Path,
+    incremental: bool,
+) -> Result<ImageStats> {
     // Resolve corpus id (also serves as a guard that the corpus exists).
     let corpus_id: Uuid = sqlx::query_scalar("SELECT id FROM brain_corpora WHERE slug = $1")
         .bind(corpus_slug)
@@ -101,14 +119,34 @@ pub async fn index_images(pool: &PgPool, corpus_slug: &str, root: &Path) -> Resu
         .await?
         .ok_or_else(|| anyhow::anyhow!("no corpus with slug '{corpus_slug}'"))?;
 
-    // Idempotent: drop all prior image:* nodes for this corpus (edges cascade).
-    sqlx::query(
-        "DELETE FROM brain_vault_nodes
-           WHERE project = $1 AND node_type LIKE 'image:%'",
-    )
-    .bind(corpus_slug)
-    .execute(pool)
-    .await?;
+    // Full: drop all prior image:* nodes (edges cascade), rebuild from scratch.
+    // Incremental: keep them and load each image:file's last-indexed content_hash
+    // so an unchanged image can skip the expensive vision caption call below.
+    let prior_hashes: HashMap<String, String> = if incremental {
+        sqlx::query(
+            "SELECT path, content_hash FROM brain_vault_nodes
+               WHERE project = $1 AND node_type = 'image:file'",
+        )
+        .bind(corpus_slug)
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .filter_map(|r| {
+            let path: String = r.get("path");
+            r.get::<Option<String>, _>("content_hash")
+                .map(|h| (path, h))
+        })
+        .collect()
+    } else {
+        sqlx::query(
+            "DELETE FROM brain_vault_nodes
+               WHERE project = $1 AND node_type LIKE 'image:%'",
+        )
+        .bind(corpus_slug)
+        .execute(pool)
+        .await?;
+        HashMap::new()
+    };
 
     // Ensure the modality=image facet exists; remember its id for tagging.
     let image_facet_id = upsert_modality_image_facet(pool, corpus_id).await?;
@@ -131,6 +169,9 @@ pub async fn index_images(pool: &PgPool, corpus_slug: &str, root: &Path) -> Resu
         .build()
         .ok();
 
+    // File-node paths present on disk this run — used to GC removed images.
+    let mut live_paths: Vec<String> = Vec::with_capacity(files.len());
+
     for file_path in files {
         let bytes = match std::fs::read(&file_path) {
             Ok(b) => b,
@@ -145,6 +186,22 @@ pub async fn index_images(pool: &PgPool, corpus_slug: &str, root: &Path) -> Resu
             .strip_prefix(root)
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| file_path.to_string_lossy().to_string());
+
+        let file_node_path = format!("image://{corpus_slug}/{rel}");
+        let content_hash = sha256_hex_bytes(&bytes);
+        live_paths.push(file_node_path.clone());
+
+        // Incremental: an unchanged image keeps its existing node, caption and
+        // tags — skip the expensive vision call (the dominant cost) entirely.
+        if incremental
+            && image_unchanged(
+                prior_hashes.get(&file_node_path).map(String::as_str),
+                &content_hash,
+            )
+        {
+            stats.files += 1;
+            continue;
+        }
 
         // ── best-effort vision caption ──────────────────────────────────────
         // Default title is the relpath; if captioning succeeds we use the
@@ -171,8 +228,6 @@ pub async fn index_images(pool: &PgPool, corpus_slug: &str, root: &Path) -> Resu
         }
 
         // ── file node ───────────────────────────────────────────────────────
-        let file_node_path = format!("image://{corpus_slug}/{rel}");
-        let content_hash = sha256_hex_bytes(&bytes);
         let file_id = upsert_image_node(
             pool,
             &file_node_path,
@@ -187,6 +242,18 @@ pub async fn index_images(pool: &PgPool, corpus_slug: &str, root: &Path) -> Resu
             stats.captioned += 1;
         }
         tag_facet(pool, corpus_id, file_id, image_facet_id).await?;
+
+        // A changed image keeps its node id (stable path) but its prior caption's
+        // `tagged` edges are now stale — clear them before re-tagging so the new
+        // caption's tags fully replace the old set (orphaned tag nodes are GC'd
+        // after the loop). A full run already wiped everything, so this is a
+        // no-op there.
+        if incremental {
+            sqlx::query("DELETE FROM brain_vault_edges WHERE src_id = $1 AND edge_type = 'tagged'")
+                .bind(file_id)
+                .execute(pool)
+                .await?;
+        }
 
         // ── tag nodes + tagged edges ────────────────────────────────────────
         for tag in caption_tags {
@@ -206,6 +273,33 @@ pub async fn index_images(pool: &PgPool, corpus_slug: &str, root: &Path) -> Resu
                 stats.edges += 1;
             }
         }
+    }
+
+    // Incremental GC: drop image:file nodes whose image vanished on disk (their
+    // `tagged` edges cascade), then any image:tag now left with no incoming edge
+    // (tag nodes are shared, so they're deleted only when nothing references
+    // them — mirrors cortex's gc_orphan_placeholders). `path <> ALL('{}')` is
+    // vacuously true, so an empty corpus correctly drops every image:file node.
+    if incremental {
+        sqlx::query(
+            "DELETE FROM brain_vault_nodes
+               WHERE project = $1 AND node_type = 'image:file'
+                 AND path <> ALL($2)",
+        )
+        .bind(corpus_slug)
+        .bind(&live_paths)
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            "DELETE FROM brain_vault_nodes
+               WHERE project = $1 AND node_type = 'image:tag'
+                 AND NOT EXISTS (
+                     SELECT 1 FROM brain_vault_edges e WHERE e.dst_id = brain_vault_nodes.id
+                 )",
+        )
+        .bind(corpus_slug)
+        .execute(pool)
+        .await?;
     }
 
     Ok(stats)
@@ -431,6 +525,13 @@ fn sha256_hex_bytes(b: &[u8]) -> String {
     format!("{:x}", h.finalize())
 }
 
+/// On an incremental run, an image can skip the vision pass only when we've
+/// indexed this exact path before with the identical content hash. A new image
+/// (no prior node) or one whose bytes changed must be re-captioned.
+fn image_unchanged(prior_hash: Option<&str>, current_hash: &str) -> bool {
+    prior_hash == Some(current_hash)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -466,5 +567,15 @@ mod tests {
         assert!(!is_image_ext("svg"));
         assert!(!is_image_ext("md"));
         assert!(!is_image_ext("csv"));
+    }
+
+    #[test]
+    fn image_unchanged_only_when_hash_matches() {
+        // Same path, identical bytes → skip the vision pass.
+        assert!(image_unchanged(Some("abc"), "abc"));
+        // Same path, bytes changed → must re-caption.
+        assert!(!image_unchanged(Some("abc"), "def"));
+        // New image (no prior node) → must caption.
+        assert!(!image_unchanged(None, "abc"));
     }
 }

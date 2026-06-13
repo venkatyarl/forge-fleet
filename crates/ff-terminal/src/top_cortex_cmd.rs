@@ -1171,7 +1171,7 @@ async fn run_index(
     // STEP 3 of multi-domain Cortex: also index IMAGES (.png/.jpg/...) for this
     // root, with a bounded best-effort vision caption/tag pass. Best-effort —
     // an image-index error must never fail the whole index.
-    match ff_brain::image_index::index_images(pool, slug, root).await {
+    match ff_brain::image_index::index_images(pool, slug, root, incremental).await {
         Ok(image_stats) => {
             total_files += image_stats.files;
             total_symbols += image_stats.tags;
