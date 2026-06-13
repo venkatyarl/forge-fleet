@@ -4,7 +4,7 @@
 
 use anyhow::Result;
 use ff_core::task_error::{TaskErrorClass, classify_task_error};
-use serde_json::Value;
+use serde_json::{Value, json};
 use sqlx::{PgPool, Row};
 
 /// Documented `fleet_tasks.status` values (see schema.rs `fleet_tasks`).
@@ -74,12 +74,47 @@ fn classify_failed_task(
     Some(class)
 }
 
+/// Build the lossless per-task JSON object emitted by `ff tasks list --json`.
+/// Pure (no DB / no clock) so the field set + null-handling is unit-testable.
+/// `age_secs` is computed by the caller (depends on the wall clock).
+#[allow(clippy::too_many_arguments)]
+fn task_list_json_row(
+    id: &str,
+    computer: Option<&str>,
+    task_type: &str,
+    status: &str,
+    summary: &str,
+    progress_pct: Option<f32>,
+    progress_message: Option<&str>,
+    err_class: Option<&str>,
+    error: Option<&str>,
+    created_at_rfc3339: &str,
+    started_at_rfc3339: Option<&str>,
+    age_secs: i64,
+) -> Value {
+    json!({
+        "id": id,
+        "computer": computer,
+        "task_type": task_type,
+        "status": status,
+        "summary": summary,
+        "progress_pct": progress_pct,
+        "progress_message": progress_message,
+        "err_class": err_class,
+        "error": error,
+        "created_at": created_at_rfc3339,
+        "started_at": started_at_rfc3339,
+        "age_secs": age_secs,
+    })
+}
+
 pub async fn handle_tasks_list(
     pg: &PgPool,
     computer_filter: Option<&str>,
     status_filter: Option<&str>,
     type_filter: Option<&str>,
     show_id: bool,
+    as_json: bool,
 ) -> Result<()> {
     let mut sql = String::from(
         "SELECT t.id, t.task_type, t.summary, t.status, \
@@ -141,6 +176,50 @@ pub async fn handle_tasks_list(
         q = q.bind(a);
     }
     let rows = q.fetch_all(pg).await?;
+
+    // JSON path: one lossless object per task (full, untruncated fields +
+    // always the id), so an agent can consume the queue structurally without
+    // scraping the truncated table. The full result/payload stays on
+    // `ff tasks get --json` (mirrors `ff skills list --json` omitting body_md).
+    // Filter validation above already ran, so a bad --computer still bails here.
+    if as_json {
+        let mut out: Vec<Value> = Vec::with_capacity(rows.len());
+        for r in &rows {
+            let id: uuid::Uuid = r.try_get("id")?;
+            let computer: Option<String> = r.try_get("claimer_name").ok();
+            let ty: String = r.try_get("task_type")?;
+            let status: String = r.try_get("status")?;
+            let summary: String = r.try_get("summary")?;
+            let pct: Option<f32> = r.try_get("progress_pct").ok();
+            let progress_message: Option<String> = r.try_get("progress_message").ok();
+            let created_at: chrono::DateTime<chrono::Utc> = r.try_get("created_at")?;
+            let started_at: Option<chrono::DateTime<chrono::Utc>> = r.try_get("started_at").ok();
+            let age_secs = (chrono::Utc::now() - created_at).num_seconds().max(0);
+            let result: Option<Value> = r.try_get("result").ok();
+            let error: Option<String> = r.try_get("error").ok();
+            let err_class = classify_failed_task(&status, result.as_ref(), error.as_deref())
+                .map(|c| c.as_str().to_string());
+            out.push(task_list_json_row(
+                &id.to_string(),
+                computer.as_deref(),
+                &ty,
+                &status,
+                &summary,
+                pct,
+                progress_message.as_deref(),
+                err_class.as_deref(),
+                error.as_deref(),
+                &created_at.to_rfc3339(),
+                started_at.map(|t| t.to_rfc3339()).as_deref(),
+                age_secs,
+            ));
+        }
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&out).unwrap_or_else(|_| "[]".to_string())
+        );
+        return Ok(());
+    }
 
     // ERR column carries the on-the-fly error class for failed rows only
     // (blank for everything else). 17 = width of the longest class string
@@ -460,6 +539,78 @@ mod tests {
                 "status {s} should be known"
             );
         }
+    }
+
+    #[test]
+    fn task_list_json_row_carries_full_fields_and_nulls() {
+        // A claimed, in-progress row: every Some(..) flows through verbatim.
+        let v = task_list_json_row(
+            "11111111-2222-3333-4444-555555555555",
+            Some("marcus"),
+            "agent",
+            "running",
+            "do the full untruncated thing that is way longer than sixty characters for sure",
+            Some(42.0),
+            Some("step 2/5"),
+            None,
+            None,
+            "2026-06-13T12:00:00+00:00",
+            Some("2026-06-13T12:01:00+00:00"),
+            90,
+        );
+        assert_eq!(v["id"], "11111111-2222-3333-4444-555555555555");
+        assert_eq!(v["computer"], "marcus");
+        assert_eq!(v["task_type"], "agent");
+        assert_eq!(v["status"], "running");
+        // Summary is NOT truncated to the table's 60 chars.
+        assert_eq!(
+            v["summary"],
+            "do the full untruncated thing that is way longer than sixty characters for sure"
+        );
+        assert_eq!(v["progress_pct"], 42.0);
+        assert_eq!(v["progress_message"], "step 2/5");
+        assert!(v["err_class"].is_null());
+        assert!(v["error"].is_null());
+        assert_eq!(v["started_at"], "2026-06-13T12:01:00+00:00");
+        assert_eq!(v["age_secs"], 90);
+
+        // An unclaimed, pending row: optionals serialize as JSON null, not "".
+        let p = task_list_json_row(
+            "abc",
+            None,
+            "shell",
+            "pending",
+            "x",
+            None,
+            None,
+            None,
+            None,
+            "2026-06-13T12:00:00+00:00",
+            None,
+            5,
+        );
+        assert!(p["computer"].is_null());
+        assert!(p["progress_pct"].is_null());
+        assert!(p["progress_message"].is_null());
+        assert!(p["started_at"].is_null());
+
+        // A failed row carries the derived err_class plus the raw error.
+        let f = task_list_json_row(
+            "def",
+            Some("priya"),
+            "shell",
+            "failed",
+            "y",
+            None,
+            None,
+            Some("timeout"),
+            Some("killed after 600s"),
+            "2026-06-13T12:00:00+00:00",
+            Some("2026-06-13T12:00:01+00:00"),
+            700,
+        );
+        assert_eq!(f["err_class"], "timeout");
+        assert_eq!(f["error"], "killed after 600s");
     }
 
     #[test]

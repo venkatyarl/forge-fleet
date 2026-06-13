@@ -803,6 +803,11 @@ enum TasksCommand {
         /// Prefix every row with the task UUID.
         #[arg(long, default_value_t = false)]
         show_id: bool,
+        /// Emit one JSON object per task (full, untruncated fields incl. id,
+        /// summary, derived err_class) instead of the human table, so an agent
+        /// can consume the queue structurally.
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
     /// Enqueue a shell task. Workers on members whose capability set
     /// covers `--capability` will compete for it.
@@ -3445,6 +3450,7 @@ async fn main() -> Result<()> {
                     status,
                     task_type,
                     show_id,
+                    json,
                 } => {
                     tasks_cmd::handle_tasks_list(
                         &pool,
@@ -3452,6 +3458,7 @@ async fn main() -> Result<()> {
                         status.as_deref(),
                         task_type.as_deref(),
                         show_id,
+                        json,
                     )
                     .await
                 }
