@@ -830,6 +830,42 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         }));
     }
 
+    // 20d) Daemon-log rotation tick — every 10min, per-node (idempotent).
+    //
+    // forgefleetd does NOT own its log file — systemd `StandardOutput=append:`
+    // (or launchd `StandardOutPath`) redirects our stdout/stderr into it, so
+    // there's no tracing rolling-appender bounding its size. Left alone it grows
+    // without limit (1.87 GiB observed on rihanna 2026-06-13 — a recurring
+    // disk-pressure root cause; #212 stopped the openclaw restart-spam SOURCE
+    // but the file still grows from normal logging and never shrinks). The
+    // redirect opens the file in append mode, so truncating it in place reclaims
+    // space and the next write lands at the fresh EOF. This copytruncates any
+    // `forgefleetd*.log` over FORGEFLEET_LOG_MAX_MB (default 256 MiB), keeping a
+    // bounded tail in `<name>.1`. Filesystem-only + per-node, like the disk
+    // sampler — no DB, no leader gate.
+    {
+        let max_bytes = ff_agent::log_rotate::max_bytes();
+        info!(
+            cap_mb = max_bytes / 1_048_576,
+            "starting subsystem: daemon-log rotation tick (10min, per-node)"
+        );
+        let mut shutdown_rx_logrot = shutdown_rx.clone();
+        subsystem_tasks.push(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(600));
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = shutdown_rx_logrot.changed() => break,
+                    _ = tick.tick() => {
+                        if let Some(dir) = ff_agent::log_rotate::default_log_dir() {
+                            ff_agent::log_rotate::rotate_dir(&dir, max_bytes);
+                        }
+                    }
+                }
+            }
+        }));
+    }
+
     // 21) Disk-reconcile tick — every 5min, leader-gated.
     //
     // V118 active disk management: reads `fleet_disk_usage`, finds over-quota
