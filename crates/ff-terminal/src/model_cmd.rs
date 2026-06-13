@@ -1700,12 +1700,16 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                 }
             }
         }
-        crate::ModelCommand::Coverage { json } => {
+        crate::ModelCommand::Coverage { json, remediate } => {
             let guard = ff_agent::coverage_guard::CoverageGuard::new_dbonly(pool.clone());
-            let report = guard
-                .check_once()
-                .await
-                .map_err(|e| anyhow::anyhow!("coverage check: {e}"))?;
+            // Read-only by default so a status check has no side effects;
+            // `--remediate` opts into enqueuing auto-loads.
+            let report = if remediate {
+                guard.check_once().await
+            } else {
+                guard.report_once().await
+            }
+            .map_err(|e| anyhow::anyhow!("coverage check: {e}"))?;
             if json {
                 println!(
                     "{}",
@@ -1742,6 +1746,17 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                         "{GREEN}Enqueued auto-load for:{RESET} {}",
                         report.auto_loaded.join(", ")
                     );
+                }
+                // Read-only pass with loadable gaps: tell the operator how to act.
+                if !remediate {
+                    let loadable = ff_agent::coverage_guard::loadable_gap_count(&report.gaps);
+                    if loadable > 0 {
+                        println!();
+                        println!(
+                            "{loadable} gap(s) have loadable candidates — run \
+                             `ff model coverage --remediate` to enqueue auto-loads."
+                        );
+                    }
                 }
             }
         }

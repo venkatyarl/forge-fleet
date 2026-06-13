@@ -2590,9 +2590,17 @@ pub enum ModelCommand {
     },
     /// Show fleet task-coverage status: per required task, how many
     /// active deployments serve it and any gaps.
+    ///
+    /// Read-only by default — it never enqueues model loads. Pass
+    /// `--remediate` to also auto-load the best candidate for each
+    /// loadable gap (what the background coverage-guard tick does).
     Coverage {
         #[arg(long, default_value_t = false)]
         json: bool,
+        /// Enqueue an auto-load deferred task for each gap that has a
+        /// viable candidate host (mutates the defer queue). Off by default.
+        #[arg(long, default_value_t = false)]
+        remediate: bool,
     },
     /// Manually add a row to the runtime model catalog (`fleet_model_catalog`).
     ///
