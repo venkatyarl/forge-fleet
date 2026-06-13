@@ -13,7 +13,10 @@
 //!   2. INSERT into the `backups` table (schema V14) with
 //!      `retention_tier='recent'`.
 //!   3. Enqueue one `rsync` deferred task per member computer (trigger
-//!      `node_online`) so they pick it up whenever they're next awake.
+//!      `node_online`) so they pick it up whenever they're next awake —
+//!      EXCEPT peers that still have a pending/running backup-rsync of this
+//!      kind, which are skipped so a slow peer can't accumulate a herd of
+//!      concurrent transfers (coalesced to ≤1 in-flight per peer per kind).
 //!   4. Run retention compaction: keep at most 2 `recent`, promote
 //!      oldest to `daily`, collapse `daily` → `weekly`.
 //!
@@ -580,6 +583,44 @@ impl BackupOrchestrator {
         let who = format!("backup_orchestrator@{}", self.my_node_name);
         for row in rows {
             let name: String = row.get("name");
+
+            // Coalesce the fan-out: skip a peer that still has a non-terminal
+            // (pending/dispatchable/running) backup-rsync of this kind. Without this, every
+            // snapshot enqueues a fresh ~1 GiB rsync to EVERY peer regardless of
+            // whether the last one finished. A slow peer (priya/sophie, observed
+            // 2026-06-13 with 7-9 concurrent stuck transfers) then piles up
+            // simultaneous 1 GiB pulls that mutually thrash and turn the leader
+            // into a thundering-herd rsync sender, so none complete before the 2h
+            // stale-task reaper kills them — they retry and the cycle repeats.
+            // Capping each peer's in-flight backlog to 1/kind keeps DR current
+            // (a draining peer still gets a recent snapshot next cycle) while
+            // eliminating the herd. Fail-open: a count error still enqueues so a
+            // transient DB hiccup never silently skips a backup.
+            let inflight: i64 = match sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM deferred_tasks \
+                  WHERE preferred_node = $1 \
+                    AND kind = 'shell' \
+                    AND status IN ('pending', 'dispatchable', 'running') \
+                    AND title LIKE $2",
+            )
+            .bind(&name)
+            .bind(backup_rsync_title_like(kind))
+            .fetch_one(&self.pg)
+            .await
+            {
+                Ok(n) => n,
+                Err(e) => {
+                    warn!(target_node = %name, error = %e,
+                          "backup coalesce check failed; enqueueing anyway");
+                    0
+                }
+            };
+            if inflight > 0 {
+                debug!(target_node = %name, kind, inflight,
+                       "skipping backup-rsync fan-out — peer still draining a prior transfer of this kind");
+                continue;
+            }
+
             let title = format!("rsync {kind} backup {file_name} → {name}");
             // $HOME is expanded by the remote shell. `~` is NOT used here
             // because shell_quote wraps in single quotes which kill tilde
@@ -823,6 +864,17 @@ fn kind_prefix(kind: &str) -> &'static str {
     }
 }
 
+/// SQL `LIKE` pattern matching every backup-rsync task title for `kind`
+/// (the titles look like `rsync postgres backup <file> → <peer>`). Used to
+/// coalesce the fan-out: a peer that still has a pending/running rsync of
+/// this kind is skipped, so a slow peer never accumulates a herd of
+/// concurrent ~1 GiB transfers that mutually thrash and overload the
+/// leader's rsync sender. Pure so it's unit-testable against the real title
+/// format produced in `enqueue_distribution`.
+fn backup_rsync_title_like(kind: &str) -> String {
+    format!("rsync {kind} backup %")
+}
+
 /// Given `(path, mtime, size)` tuples, return the `(path, size)` of files
 /// to delete: everything except the `keep` most-recent by mtime. The
 /// newest files (largest mtime) are retained. Pure — no IO — so the
@@ -1006,6 +1058,29 @@ mod tests {
         assert!(!r.produced);
         assert_eq!(r.kind, "postgres");
         assert!(r.file_name.is_empty());
+    }
+
+    #[test]
+    fn backup_rsync_title_like_matches_real_titles() {
+        // The LIKE pattern's literal prefix must align with the real title
+        // format built in enqueue_distribution, or the coalesce check silently
+        // matches nothing and the herd returns.
+        for kind in ["postgres", "redis"] {
+            let pat = backup_rsync_title_like(kind);
+            assert_eq!(pat, format!("rsync {kind} backup %"));
+            let prefix = pat.trim_end_matches('%');
+            let real = format!("rsync {kind} backup pg-20260613T082645Z.tar.gz.age → priya");
+            assert!(
+                real.starts_with(prefix),
+                "pattern {pat:?} must prefix real title {real:?}"
+            );
+        }
+        // A different kind's title must NOT match (so postgres fan-out is never
+        // wrongly suppressed by an in-flight redis rsync, and vice versa).
+        let pg_prefix = backup_rsync_title_like("postgres");
+        let pg_prefix = pg_prefix.trim_end_matches('%');
+        let redis_title = "rsync redis backup redis-20260613T094023Z.rdb.zst.age → priya";
+        assert!(!redis_title.starts_with(pg_prefix));
     }
 
     #[test]
