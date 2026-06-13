@@ -270,9 +270,181 @@ where
     Ok(stats)
 }
 
+// ── Automated embed-refresh tick ───────────────────────────────────────────
+//
+// `ff cortex index` keeps the STRUCTURAL graph current (the git hook re-indexes
+// on every commit), but a freshly-(re)indexed code symbol lands with a NULL
+// `embedding`, so `find --semantic` goes stale on just-changed code until
+// someone manually runs `ff cortex embed`. This leader-gated daemon tick drains
+// the unembedded backlog automatically — pure maintenance over the `embedding`
+// column (no fleet serving state is mutated), so it defaults ON like the other
+// maintenance ticks (log rotation, orphan reaper, disk sampler) rather than the
+// state-mutating ticks (autoscaler, disk-reconcile) that default OFF.
+
+/// `fleet_secrets` key holding the kill-switch for the embed-refresh tick.
+const EMBED_REFRESH_MODE_KEY: &str = "cortex_embed_mode";
+
+/// Default cap on nodes embedded per tick. Keeps each hourly pass a small, bounded
+/// load on the fleet bge-m3 endpoint while still draining the backlog over time;
+/// the real-time case (a handful of code symbols a commit just changed) clears in
+/// the first tick. Override with `FORGEFLEET_CORTEX_EMBED_MAX_PER_TICK`.
+const DEFAULT_EMBED_MAX_PER_TICK: usize = 5000;
+
+/// The tick's two-state gate. Pure maintenance, so it runs by DEFAULT — an
+/// operator opts OUT by setting `fleet_secrets.cortex_embed_mode=off`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbedRefreshMode {
+    /// Drain the unembedded backlog each tick (default).
+    On,
+    /// Disabled — the tick is a pure no-op.
+    Off,
+}
+
+impl EmbedRefreshMode {
+    /// Parse the gate value. Missing / empty / unrecognised → `On` (the default);
+    /// only an explicit off-like value disables it.
+    fn parse(raw: Option<&str>) -> Self {
+        match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+            Some("off") | Some("false") | Some("0") | Some("disabled") | Some("no") => {
+                EmbedRefreshMode::Off
+            }
+            // On, missing, empty, "auto", or any other value → run by default.
+            _ => EmbedRefreshMode::On,
+        }
+    }
+}
+
+/// Read the per-tick cap from `FORGEFLEET_CORTEX_EMBED_MAX_PER_TICK`, falling back
+/// to [`DEFAULT_EMBED_MAX_PER_TICK`]. A non-positive / unparseable value uses the
+/// default; `0` is treated as "use the default" (never an unbounded pass).
+fn embed_max_per_tick() -> usize {
+    std::env::var("FORGEFLEET_CORTEX_EMBED_MAX_PER_TICK")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_EMBED_MAX_PER_TICK)
+}
+
+/// Read the kill-switch from `fleet_secrets`. Defaults to `On` when the key is
+/// missing or unreadable — shipping the tick keeps `find --semantic` fresh.
+async fn read_refresh_mode(pool: &PgPool) -> EmbedRefreshMode {
+    match ff_db::pg_get_secret(pool, EMBED_REFRESH_MODE_KEY).await {
+        Ok(v) => EmbedRefreshMode::parse(v.as_deref()),
+        Err(e) => {
+            tracing::warn!(error = %e, "cortex embed-refresh: failed to read mode secret; defaulting on");
+            EmbedRefreshMode::On
+        }
+    }
+}
+
+/// Spawn the leader-gated cortex embed-refresh loop. Mirrors the procedural-memory
+/// consolidation loop: fire on the interval, skip unless this node is the live
+/// leader, then drain up to `embed_max_per_tick()` unembedded Cortex nodes. The
+/// embed pass itself bails gracefully when no fleet embedding endpoint is live
+/// (so a fleet with no bge-m3 loaded just logs and waits), is fully resumable,
+/// and only touches NULL rows — so a tick that overlaps a manual `ff cortex embed`
+/// is harmless.
+pub fn spawn_embed_refresh_loop(
+    pg: PgPool,
+    worker_name: String,
+    interval_secs: u64,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    let is_leader: bool = sqlx::query_scalar(
+                        r#"
+                        SELECT EXISTS (
+                            SELECT 1 FROM fleet_leader_state
+                            WHERE member_name = $1
+                              AND heartbeat_at > NOW() - INTERVAL '60 seconds'
+                        )
+                        "#,
+                    )
+                    .bind(&worker_name)
+                    .fetch_one(&pg)
+                    .await
+                    .unwrap_or(false);
+
+                    if !is_leader {
+                        continue;
+                    }
+
+                    if read_refresh_mode(&pg).await == EmbedRefreshMode::Off {
+                        continue;
+                    }
+
+                    // Nothing to do? Skip the endpoint discovery + log noise.
+                    match remaining_unembedded(&pg, None).await {
+                        Ok(0) => continue,
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!(error = %e, "cortex embed-refresh: count failed; skipping tick");
+                            continue;
+                        }
+                    }
+
+                    let cap = embed_max_per_tick();
+                    match embed_cortex_nodes(&pg, Some(cap), None, |_, _| {}).await {
+                        Ok(stats) => {
+                            if stats.embedded > 0 || stats.failed > 0 {
+                                tracing::info!(
+                                    embedded = stats.embedded,
+                                    failed = stats.failed,
+                                    remaining = stats.remaining,
+                                    cap,
+                                    "cortex embed-refresh: drained unembedded nodes"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            // No live endpoint / persistent outage — expected when no
+                            // bge-m3 is loaded. Resumes next tick once one comes up.
+                            tracing::warn!(error = %e, "cortex embed-refresh: pass did not complete");
+                        }
+                    }
+                }
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+            }
+        }
+        tracing::info!("cortex embed-refresh loop stopped");
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::embed_text;
+    use super::{EmbedRefreshMode, embed_text};
+
+    #[test]
+    fn refresh_mode_defaults_on_when_missing_or_unknown() {
+        assert_eq!(EmbedRefreshMode::parse(None), EmbedRefreshMode::On);
+        assert_eq!(EmbedRefreshMode::parse(Some("")), EmbedRefreshMode::On);
+        assert_eq!(EmbedRefreshMode::parse(Some("  ")), EmbedRefreshMode::On);
+        assert_eq!(EmbedRefreshMode::parse(Some("on")), EmbedRefreshMode::On);
+        assert_eq!(EmbedRefreshMode::parse(Some("auto")), EmbedRefreshMode::On);
+        assert_eq!(
+            EmbedRefreshMode::parse(Some("whatever")),
+            EmbedRefreshMode::On
+        );
+    }
+
+    #[test]
+    fn refresh_mode_off_only_for_explicit_off_values() {
+        for v in ["off", "OFF", " Off ", "false", "0", "disabled", "no"] {
+            assert_eq!(
+                EmbedRefreshMode::parse(Some(v)),
+                EmbedRefreshMode::Off,
+                "{v:?} should disable"
+            );
+        }
+    }
 
     #[test]
     fn embed_text_without_tags_is_kind_plus_title() {

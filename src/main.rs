@@ -696,6 +696,26 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         ));
     }
 
+    // 16b) Cortex embed-refresh — every hour, leader-gated.
+    // A freshly-(re)indexed code symbol lands with a NULL `embedding`, so
+    // `ff cortex find --semantic` goes stale on just-changed code until someone
+    // manually runs `ff cortex embed`. This tick drains the unembedded backlog
+    // automatically (bounded per pass, resumable, bails when no bge-m3 endpoint
+    // is live). Pure maintenance over the `embedding` column — no serving state
+    // is mutated — so it runs by DEFAULT; opt out with
+    // `fleet_secrets.cortex_embed_mode=off`.
+    if let Some(pg_pool) = operational_store.pg_pool().cloned() {
+        info!(
+            "starting subsystem: cortex embed-refresh tick (hourly, leader-gated, gate=fleet_secrets.cortex_embed_mode default on)"
+        );
+        subsystem_tasks.push(ff_brain::spawn_embed_refresh_loop(
+            pg_pool,
+            worker_name.clone(),
+            3600,
+            shutdown_rx.clone(),
+        ));
+    }
+
     // 17) Deferred-task worker — claim + execute tasks from `deferred_tasks`.
     // Historically lived in the separate `ff daemon` CLI; the split caused
     // dispatched tasks to pile up forever when nobody started that process.
