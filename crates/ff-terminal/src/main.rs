@@ -853,6 +853,9 @@ enum TasksCommand {
     ComposeNodeBootstrap {
         /// Computer name (must already have a row in `computers`).
         target: String,
+        /// Preview the composed task graph without enqueuing anything.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Compose a wave-based fleet upgrade for `<software_id>`.
     /// Each task is "executor SSHs into target and runs the playbook";
@@ -864,6 +867,9 @@ enum TasksCommand {
         /// Targets per wave; subsequent waves run after earlier ones.
         #[arg(long, default_value_t = 4)]
         fanout: usize,
+        /// Preview the composed wave graph without enqueuing anything.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -3511,24 +3517,25 @@ async fn main() -> Result<()> {
                     }
                     Ok(())
                 }
-                TasksCommand::ComposeNodeBootstrap { target } => {
+                TasksCommand::ComposeNodeBootstrap { target, dry_run } => {
                     let me = ff_agent::fleet_info::resolve_this_worker_name().await;
                     let my_id: uuid::Uuid =
                         sqlx::query_scalar("SELECT id FROM computers WHERE name = $1")
                             .bind(&me)
                             .fetch_one(&pool)
                             .await?;
-                    let parent =
-                        ff_agent::task_runner::compose_node_bootstrap(&pool, &target, my_id)
-                            .await
-                            .map_err(|e| anyhow::anyhow!("compose: {e}"))?;
-                    println!("composed parent task: {parent}");
-                    println!("watch progress with: ff tasks list --status pending,running");
+                    let plan = ff_agent::task_runner::compose_node_bootstrap(
+                        &pool, &target, my_id, dry_run,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("compose: {e}"))?;
+                    tasks_cmd::print_compose_plan(&plan, dry_run);
                     Ok(())
                 }
                 TasksCommand::ComposeFleetUpgrade {
                     software_id,
                     fanout,
+                    dry_run,
                 } => {
                     let me = ff_agent::fleet_info::resolve_this_worker_name().await;
                     let my_id: uuid::Uuid =
@@ -3536,16 +3543,16 @@ async fn main() -> Result<()> {
                             .bind(&me)
                             .fetch_one(&pool)
                             .await?;
-                    let parent = ff_agent::task_runner::compose_fleet_upgrade_wave(
+                    let plan = ff_agent::task_runner::compose_fleet_upgrade_wave(
                         &pool,
                         &software_id,
                         fanout,
                         my_id,
+                        dry_run,
                     )
                     .await
                     .map_err(|e| anyhow::anyhow!("compose: {e}"))?;
-                    println!("composed parent task: {parent}");
-                    println!("watch progress with: ff tasks list --status pending,running");
+                    tasks_cmd::print_compose_plan(&plan, dry_run);
                     Ok(())
                 }
             }

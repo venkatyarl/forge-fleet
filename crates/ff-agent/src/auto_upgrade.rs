@@ -907,13 +907,14 @@ impl AutoUpgradeTick {
                     software_id,
                     4,
                     leader_id,
+                    false,
                 )
                 .await
                 {
-                    Ok(parent) => {
+                    Ok(plan) => {
                         tracing::info!(
                             software_id = %software_id,
-                            parent_task_id = %parent,
+                            parent_task_id = ?plan.parent,
                             "auto-upgrade dispatched via two-phase wave"
                         );
                         total += plans.len().max(1);

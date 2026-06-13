@@ -1249,15 +1249,52 @@ pub(crate) fn kill_process_group(_pid: u32) {}
 /// so an operator can change one row to change a port fleet-wide
 /// without a recompile.
 ///
+/// One task in a composed-but-not-yet-enqueued graph, returned by the
+/// `compose_*` functions when `dry_run` is set. Mirrors the arguments
+/// that would otherwise be passed to [`pg_enqueue_shell_task`] /
+/// [`pg_enqueue_shell_task_full`] so the preview can't drift from what
+/// the real path enqueues.
+#[derive(Debug, Clone)]
+pub struct PlannedTask {
+    pub summary: String,
+    pub command: String,
+    pub capabilities: Vec<String>,
+    pub priority: i32,
+    pub timeout_secs: Option<i64>,
+    /// Human-readable label of the in-graph task this one waits for
+    /// (e.g. the matching wave build), or `None` when it only depends
+    /// on the parent. Not a real task id — the deps aren't enqueued in
+    /// dry-run, so this is for display only.
+    pub depends_on: Option<String>,
+}
+
+/// Result of a `compose_*` call. In the real path `parent` is the
+/// enqueued compound-task id and `tasks` is empty; in `dry_run` mode
+/// `parent` is `None` and `tasks` holds the full graph for preview.
+#[derive(Debug, Clone)]
+pub struct ComposePlan {
+    pub parent: Option<uuid::Uuid>,
+    pub parent_summary: String,
+    pub tasks: Vec<PlannedTask>,
+}
+
 /// One parent (compound, no shell) plus N children, one per
 /// cooperative step. Children are sequenced by descending priority so
 /// the leader picks them in order; for a true DAG with edges we'd add
 /// a `depends_on` column to V44.
+///
+/// When `dry_run` is true NOTHING is written to the DB: the function
+/// reads the same fleet data, composes the identical task graph, and
+/// returns it in [`ComposePlan::tasks`] for preview (the parent is
+/// `None`). When false the real path is byte-for-byte unchanged —
+/// every task is enqueued and `tasks` is empty.
 pub async fn compose_node_bootstrap(
     pg: &PgPool,
     target_name: &str,
     leader_computer_id: uuid::Uuid,
-) -> Result<uuid::Uuid, sqlx::Error> {
+    dry_run: bool,
+) -> Result<ComposePlan, sqlx::Error> {
+    let mut planned: Vec<PlannedTask> = Vec::new();
     // ── 1. Pull everything we need from the DB. ──────────────────────────
     let target_row = sqlx::query(
         "SELECT name, primary_ip, all_ips, ssh_user, ssh_port, os_family
@@ -1304,19 +1341,23 @@ pub async fn compose_node_bootstrap(
 
     // ── 2. Parent task. ──────────────────────────────────────────────────
     let parent_summary = format!("{target_name}: bring online via fleet cooperation");
-    let parent: uuid::Uuid = sqlx::query_scalar(
-        r#"
+    let parent: uuid::Uuid = if dry_run {
+        uuid::Uuid::nil()
+    } else {
+        sqlx::query_scalar(
+            r#"
         INSERT INTO fleet_tasks (
             task_type, summary, payload, priority, created_by_computer_id
         )
         VALUES ('compound', $1, '{}'::jsonb, 80, $2)
         RETURNING id
         "#,
-    )
-    .bind(&parent_summary)
-    .bind(leader_computer_id)
-    .fetch_one(pg)
-    .await?;
+        )
+        .bind(&parent_summary)
+        .bind(leader_computer_id)
+        .fetch_one(pg)
+        .await?
+    };
 
     let port_arg = if target_ssh_port == 22 {
         String::new()
@@ -1340,17 +1381,29 @@ pub async fn compose_node_bootstrap(
              {ssh_target_for_iter} 'echo ok && uname -srvmo' || echo 'unreachable'; \
          done"
     );
-    pg_enqueue_shell_task(
-        pg,
-        &format!("{target_name}/1: ssh-probe all known IPs"),
-        &step1,
-        &["leader".to_string()],
-        None,
-        Some(parent),
-        90,
-        Some(leader_computer_id),
-    )
-    .await?;
+    let summary1 = format!("{target_name}/1: ssh-probe all known IPs");
+    if dry_run {
+        planned.push(PlannedTask {
+            summary: summary1,
+            command: step1,
+            capabilities: vec!["leader".to_string()],
+            priority: 90,
+            timeout_secs: None,
+            depends_on: None,
+        });
+    } else {
+        pg_enqueue_shell_task(
+            pg,
+            &summary1,
+            &step1,
+            &["leader".to_string()],
+            None,
+            Some(parent),
+            90,
+            Some(leader_computer_id),
+        )
+        .await?;
+    }
 
     // ── Step 2: leader runs the bootstrap script. ────────────────────────
     let step2 = format!(
@@ -1359,17 +1412,29 @@ pub async fn compose_node_bootstrap(
 ?name={target_name}&ip={target_primary_ip}&ssh_user={target_ssh_user}&role=builder&runtime=auto' \
          | sudo bash\""
     );
-    pg_enqueue_shell_task(
-        pg,
-        &format!("{target_name}/2: install forgefleetd via gateway bootstrap"),
-        &step2,
-        &["leader".to_string()],
-        None,
-        Some(parent),
-        85,
-        Some(leader_computer_id),
-    )
-    .await?;
+    let summary2 = format!("{target_name}/2: install forgefleetd via gateway bootstrap");
+    if dry_run {
+        planned.push(PlannedTask {
+            summary: summary2,
+            command: step2,
+            capabilities: vec!["leader".to_string()],
+            priority: 85,
+            timeout_secs: None,
+            depends_on: None,
+        });
+    } else {
+        pg_enqueue_shell_task(
+            pg,
+            &summary2,
+            &step2,
+            &["leader".to_string()],
+            None,
+            Some(parent),
+            85,
+            Some(leader_computer_id),
+        )
+        .await?;
+    }
 
     // ── Step 3: verify forgefleetd active. ───────────────────────────────
     // Unit names are project-fixed deploy artifacts (see deploy/linux/
@@ -1392,17 +1457,29 @@ pub async fn compose_node_bootstrap(
              | grep -qx active"
         )
     };
-    pg_enqueue_shell_task(
-        pg,
-        &format!("{target_name}/3: verify forgefleetd running on {target_name}"),
-        &step3,
-        &["leader".to_string()],
-        None,
-        Some(parent),
-        80,
-        Some(leader_computer_id),
-    )
-    .await?;
+    let summary3 = format!("{target_name}/3: verify forgefleetd running on {target_name}");
+    if dry_run {
+        planned.push(PlannedTask {
+            summary: summary3,
+            command: step3,
+            capabilities: vec!["leader".to_string()],
+            priority: 80,
+            timeout_secs: None,
+            depends_on: None,
+        });
+    } else {
+        pg_enqueue_shell_task(
+            pg,
+            &summary3,
+            &step3,
+            &["leader".to_string()],
+            None,
+            Some(parent),
+            80,
+            Some(leader_computer_id),
+        )
+        .await?;
+    }
 
     // ── Step 4: confirm online via ff (any peer with ff). ────────────────
     let step4 = format!(
@@ -1413,19 +1490,36 @@ pub async fn compose_node_bootstrap(
            fi; sleep 2; \
          done; echo 'timeout: {target_name} still not online after 60s'; exit 1"
     );
-    pg_enqueue_shell_task(
-        pg,
-        &format!("{target_name}/4: confirm {target_name} shows online in ff fleet health"),
-        &step4,
-        &["ff".to_string()],
-        None,
-        Some(parent),
-        75,
-        Some(leader_computer_id),
-    )
-    .await?;
+    let summary4 =
+        format!("{target_name}/4: confirm {target_name} shows online in ff fleet health");
+    if dry_run {
+        planned.push(PlannedTask {
+            summary: summary4,
+            command: step4,
+            capabilities: vec!["ff".to_string()],
+            priority: 75,
+            timeout_secs: None,
+            depends_on: None,
+        });
+    } else {
+        pg_enqueue_shell_task(
+            pg,
+            &summary4,
+            &step4,
+            &["ff".to_string()],
+            None,
+            Some(parent),
+            75,
+            Some(leader_computer_id),
+        )
+        .await?;
+    }
 
-    Ok(parent)
+    Ok(ComposePlan {
+        parent: if dry_run { None } else { Some(parent) },
+        parent_summary,
+        tasks: planned,
+    })
 }
 
 /// Compose a wave-based fleet-upgrade graph for `software_id`.
@@ -1465,9 +1559,11 @@ pub async fn compose_fleet_upgrade_wave(
     software_id: &str,
     fanout: usize,
     leader_computer_id: uuid::Uuid,
-) -> Result<uuid::Uuid, sqlx::Error> {
+    dry_run: bool,
+) -> Result<ComposePlan, sqlx::Error> {
     use crate::auto_upgrade::resolve_upgrade_plans_with_suffix;
 
+    let mut planned: Vec<PlannedTask> = Vec::new();
     let fanout = fanout.max(1);
 
     // 1. Resolve playbook for every member that has this software.
@@ -1615,25 +1711,29 @@ pub async fn compose_fleet_upgrade_wave(
         "fleet-upgrade-wave: {software_id} ({n} target(s), fanout {fanout}, {wave_count} wave(s))",
         n = wave_targets.len()
     );
-    let parent: uuid::Uuid = sqlx::query_scalar(
-        r#"
+    let parent: uuid::Uuid = if dry_run {
+        uuid::Uuid::nil()
+    } else {
+        sqlx::query_scalar(
+            r#"
         INSERT INTO fleet_tasks (
             task_type, summary, payload, priority, created_by_computer_id
         )
         VALUES ('compound', $1, $2, 90, $3)
         RETURNING id
         "#,
-    )
-    .bind(&parent_summary)
-    .bind(serde_json::json!({
-        "software_id": software_id,
-        "fanout": fanout,
-        "wave_count": wave_count,
-        "target_count": wave_targets.len(),
-    }))
-    .bind(leader_computer_id)
-    .fetch_one(pg)
-    .await?;
+        )
+        .bind(&parent_summary)
+        .bind(serde_json::json!({
+            "software_id": software_id,
+            "fanout": fanout,
+            "wave_count": wave_count,
+            "target_count": wave_targets.len(),
+        }))
+        .bind(leader_computer_id)
+        .fetch_one(pg)
+        .await?
+    };
 
     // 4. Phase 1 — chunk targets into waves; one build/install shell task
     //    per (wave, target). Empty capability set = any worker may claim,
@@ -1712,12 +1812,24 @@ pub async fn compose_fleet_upgrade_wave(
             // 2026-05-21 wave still saw 4/14 hit the 25-min cap (ace,
             // lily, rihanna, priya) because ~15 crates landed this
             // month. 45min absorbs the new normal with headroom.
+            let build_summary = format!(
+                "fleet-upgrade-wave/wave{wave_idx}/build: {software_id} on {}",
+                t.target_name
+            );
+            if dry_run {
+                planned.push(PlannedTask {
+                    summary: build_summary,
+                    command,
+                    capabilities: vec![],
+                    priority,
+                    timeout_secs: Some(45 * 60),
+                    depends_on: None,
+                });
+                continue;
+            }
             let build_id = pg_enqueue_shell_task_full(
                 pg,
-                &format!(
-                    "fleet-upgrade-wave/wave{wave_idx}/build: {software_id} on {}",
-                    t.target_name
-                ),
+                &build_summary,
                 &command,
                 &[],
                 None,
@@ -1834,13 +1946,25 @@ pub async fn compose_fleet_upgrade_wave(
         // restart becomes claimable as soon as that single build is
         // terminal (completed/failed/cancelled) — no longer waits for
         // every other host's build.
+        let restart_summary = format!(
+            "fleet-upgrade-wave/restart: {software_id} on {}",
+            t.target_name
+        );
+        if dry_run {
+            planned.push(PlannedTask {
+                summary: restart_summary,
+                command: restart_command,
+                capabilities: vec![],
+                priority: restart_priority,
+                timeout_secs: None,
+                depends_on: Some(format!("build: {software_id} on {}", t.target_name)),
+            });
+            continue;
+        }
         let build_dep = build_ids_by_target.get(&t.target_id).copied();
         pg_enqueue_shell_task_full(
             pg,
-            &format!(
-                "fleet-upgrade-wave/restart: {software_id} on {}",
-                t.target_name
-            ),
+            &restart_summary,
             &restart_command,
             &[],
             None,
@@ -1855,7 +1979,11 @@ pub async fn compose_fleet_upgrade_wave(
         .await?;
     }
 
-    Ok(parent)
+    Ok(ComposePlan {
+        parent: if dry_run { None } else { Some(parent) },
+        parent_summary,
+        tasks: planned,
+    })
 }
 
 /// One row in [`compose_fleet_upgrade_wave`]'s working set.

@@ -365,6 +365,75 @@ pub async fn handle_tasks_get(pg: &PgPool, id: uuid::Uuid, json: bool) -> Result
     Ok(())
 }
 
+/// Render a composed task graph. In `dry_run` mode prints the full plan
+/// (one block per task — summary, capabilities, priority, timeout, deps,
+/// and the shell command) and a footer reminding nothing was enqueued. In
+/// the real path the plan carries no tasks, so it just confirms the parent
+/// id and how to watch progress.
+pub fn print_compose_plan(plan: &ff_agent::task_runner::ComposePlan, dry_run: bool) {
+    print!("{}", format_compose_plan(plan, dry_run));
+}
+
+/// Pure formatter behind [`print_compose_plan`] — returns the text so it can
+/// be unit-tested without capturing stdout.
+fn format_compose_plan(plan: &ff_agent::task_runner::ComposePlan, dry_run: bool) -> String {
+    use crate::utils::{CYAN, GREEN, RESET, YELLOW};
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+
+    if !dry_run {
+        // Real path: ComposePlan::tasks is empty; parent is the enqueued id.
+        match plan.parent {
+            Some(parent) => writeln!(out, "composed parent task: {parent}").ok(),
+            // Defensive — the real path always returns Some(parent).
+            None => writeln!(out, "composed parent task (no id returned)").ok(),
+        };
+        writeln!(
+            out,
+            "watch progress with: ff tasks list --status pending,running"
+        )
+        .ok();
+        return out;
+    }
+
+    writeln!(
+        out,
+        "{CYAN}DRY RUN{RESET} — nothing was enqueued. Would compose {GREEN}{}{RESET} task(s):",
+        plan.tasks.len()
+    )
+    .ok();
+    writeln!(out, "  parent (compound): {}", plan.parent_summary).ok();
+    for (i, t) in plan.tasks.iter().enumerate() {
+        writeln!(out).ok();
+        writeln!(out, "  {GREEN}[{}]{RESET} {}", i + 1, t.summary).ok();
+        let caps = if t.capabilities.is_empty() {
+            "(any worker)".to_string()
+        } else {
+            t.capabilities.join(",")
+        };
+        write!(out, "      priority {} · capability {caps}", t.priority).ok();
+        if let Some(secs) = t.timeout_secs {
+            write!(out, " · timeout {secs}s").ok();
+        }
+        if let Some(dep) = &t.depends_on {
+            write!(out, " · after [{dep}]").ok();
+        }
+        writeln!(out).ok();
+        // Indent each command line so multi-line shell bodies stay readable.
+        for line in t.command.lines() {
+            writeln!(out, "      {line}").ok();
+        }
+    }
+    writeln!(out).ok();
+    writeln!(
+        out,
+        "{YELLOW}re-run without --dry-run to enqueue.{RESET} watch progress with: ff tasks list --status pending,running"
+    )
+    .ok();
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -391,5 +460,61 @@ mod tests {
                 "status {s} should be known"
             );
         }
+    }
+
+    #[test]
+    fn dry_run_plan_lists_every_task_with_command_and_deps() {
+        let plan = ff_agent::task_runner::ComposePlan {
+            parent: None,
+            parent_summary: "marcus: bring online".to_string(),
+            tasks: vec![
+                ff_agent::task_runner::PlannedTask {
+                    summary: "marcus/1: ssh-probe".to_string(),
+                    command: "set -e\necho probe".to_string(),
+                    capabilities: vec!["leader".to_string()],
+                    priority: 90,
+                    timeout_secs: None,
+                    depends_on: None,
+                },
+                ff_agent::task_runner::PlannedTask {
+                    summary: "restart: marcus".to_string(),
+                    command: "ssh marcus restart".to_string(),
+                    capabilities: vec![],
+                    priority: 30,
+                    timeout_secs: Some(2700),
+                    depends_on: Some("build: marcus".to_string()),
+                },
+            ],
+        };
+        let out = format_compose_plan(&plan, true);
+        // Every task summary appears.
+        assert!(out.contains("marcus/1: ssh-probe"));
+        assert!(out.contains("restart: marcus"));
+        // Multi-line command bodies are rendered, indented.
+        assert!(out.contains("      echo probe"));
+        // Capability rendering: explicit vs any-worker.
+        assert!(out.contains("capability leader"));
+        assert!(out.contains("capability (any worker)"));
+        // Timeout + dependency annotations show up.
+        assert!(out.contains("timeout 2700s"));
+        assert!(out.contains("after [build: marcus]"));
+        // Loud, unambiguous no-write banner.
+        assert!(out.contains("DRY RUN"));
+        assert!(out.contains("nothing was enqueued"));
+    }
+
+    #[test]
+    fn real_plan_prints_parent_id_only() {
+        let parent = uuid::Uuid::nil();
+        let plan = ff_agent::task_runner::ComposePlan {
+            parent: Some(parent),
+            parent_summary: "ignored in real path".to_string(),
+            tasks: vec![],
+        };
+        let out = format_compose_plan(&plan, false);
+        assert!(out.contains(&format!("composed parent task: {parent}")));
+        assert!(out.contains("ff tasks list --status pending,running"));
+        // No dry-run banner leaks into the real path.
+        assert!(!out.contains("DRY RUN"));
     }
 }
