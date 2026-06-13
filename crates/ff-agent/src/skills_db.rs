@@ -401,24 +401,42 @@ pub async fn materialize_all(pool: &PgPool) -> Result<(usize, usize)> {
     Ok((written, skipped))
 }
 
+/// Compute the on-disk skill directories that no longer have a matching
+/// DB row — i.e. exactly what `prune_orphans` would remove — WITHOUT
+/// deleting anything. Lets callers preview a `--prune` (dry-run).
+pub fn prune_orphans_plan(known: &[SkillRow]) -> Result<Vec<PathBuf>> {
+    let wanted: std::collections::HashSet<PathBuf> = known.iter().map(|s| s.disk_path()).collect();
+    compute_orphans(&skills_root(), &wanted)
+}
+
+/// Pure walk: under `root`, return the `<source>/<family>/<name>` dirs whose
+/// `SKILL.md` isn't in `wanted`. Root + wanted are injected so this is unit
+/// testable without touching the real skills home.
+fn compute_orphans(
+    root: &Path,
+    wanted: &std::collections::HashSet<PathBuf>,
+) -> Result<Vec<PathBuf>> {
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut orphans = Vec::new();
+    for source_dir in walk_dirs(root)? {
+        let skill_md = source_dir.join("SKILL.md");
+        if skill_md.exists() && !wanted.contains(&skill_md) {
+            orphans.push(source_dir);
+        }
+    }
+    Ok(orphans)
+}
+
 /// Remove on-disk files that don't have a matching DB row anymore. Run
 /// after `materialize_all` to garbage-collect retired or renamed skills.
 pub fn prune_orphans(known: &[SkillRow]) -> Result<usize> {
-    let root = skills_root();
-    if !root.exists() {
-        return Ok(0);
-    }
-    let mut wanted = std::collections::HashSet::new();
-    for s in known {
-        wanted.insert(s.disk_path());
-    }
+    let orphans = prune_orphans_plan(known)?;
     let mut removed = 0;
-    for source_dir in walk_dirs(&root)? {
-        let skill_md = source_dir.join("SKILL.md");
-        if skill_md.exists() && !wanted.contains(&skill_md) {
-            let _ = std::fs::remove_dir_all(&source_dir);
-            removed += 1;
-        }
+    for source_dir in &orphans {
+        let _ = std::fs::remove_dir_all(source_dir);
+        removed += 1;
     }
     Ok(removed)
 }
@@ -809,5 +827,57 @@ fn classify_risk(body: &str, tools: &[String]) -> String {
         0..=1 => "low".into(),
         2..=4 => "medium".into(),
         _ => "high".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn write_skill(root: &Path, source: &str, family: &str, name: &str) -> PathBuf {
+        let dir = root.join(source).join(family).join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let md = dir.join("SKILL.md");
+        std::fs::write(&md, "---\nname: x\n---\nbody").unwrap();
+        md
+    }
+
+    #[test]
+    fn compute_orphans_flags_only_unwanted_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // Two on-disk skills; only the first is still wanted (has a DB row).
+        let kept = write_skill(root, "anthropic", "code", "keep");
+        let orphan_md = write_skill(root, "anthropic", "code", "gone");
+        // A dir with no SKILL.md must be ignored (not an orphan).
+        std::fs::create_dir_all(root.join("anthropic").join("code").join("empty")).unwrap();
+
+        let mut wanted: HashSet<PathBuf> = HashSet::new();
+        wanted.insert(kept);
+
+        let orphans = compute_orphans(root, &wanted).unwrap();
+        assert_eq!(orphans.len(), 1, "exactly one orphan expected");
+        // The orphan is the dir containing the unwanted SKILL.md.
+        assert_eq!(orphans[0], orphan_md.parent().unwrap());
+    }
+
+    #[test]
+    fn compute_orphans_empty_when_all_wanted_or_root_missing() {
+        // Missing root → no orphans, no error.
+        let missing = Path::new("/tmp/forgefleet-skills-test-does-not-exist-xyz");
+        assert!(
+            compute_orphans(missing, &HashSet::new())
+                .unwrap()
+                .is_empty()
+        );
+
+        // All on-disk skills present in `wanted` → nothing pruned.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let a = write_skill(root, "src", "fam", "a");
+        let b = write_skill(root, "src", "fam", "b");
+        let wanted: HashSet<PathBuf> = [a, b].into_iter().collect();
+        assert!(compute_orphans(root, &wanted).unwrap().is_empty());
     }
 }
