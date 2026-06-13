@@ -2172,6 +2172,36 @@ pub async fn handle_fleet_health(pool: &sqlx::PgPool, json: bool) -> Result<()> 
 /// --version` directly, so the view is accurate right after an upgrade.
 /// `live=false` reads the DB-cached `computer_software.installed_version`
 /// (refreshed every 6h) — fast but stale.
+/// Pick the convergence target for `ff fleet versions`, as already-normalized
+/// short code identities (see `display_version_short`).
+///
+/// Prefer the upstream **LATEST** (the SHA the auto-upgrade wave is rolling
+/// toward) so a host actually on LATEST reads as converged and stale hosts read
+/// as drift. Fall back to the fleet's modal installed SHA only when LATEST is
+/// unknown — e.g. the 6h upstream-check tick hasn't populated `latest_version`
+/// yet — in which case STATE just reports fleet homogeneity.
+///
+/// Returns `(target_short, using_latest)`, or `None` if neither a LATEST nor a
+/// mode is available.
+///
+/// The old code compared each host's installed SHA against the *mode* and
+/// ignored LATEST entirely, so the one host on LATEST (e.g. a freshly
+/// hand-deployed leader) was flagged `drift` while the majority a release
+/// behind read `✓` — backwards from what the LATEST column shows.
+fn pick_version_target(
+    latest_short: Option<&str>,
+    mode_short: Option<&str>,
+) -> Option<(String, bool)> {
+    if let Some(l) = latest_short {
+        if !l.is_empty() && l != "-" {
+            return Some((l.to_string(), true));
+        }
+    }
+    mode_short
+        .filter(|m| !m.is_empty() && *m != "-")
+        .map(|m| (m.to_string(), false))
+}
+
 pub async fn handle_fleet_versions(pool: &sqlx::PgPool, verbose: bool, live: bool) -> Result<()> {
     use ff_core::build_version::{BuildVersion, display_version_short};
 
@@ -2205,9 +2235,8 @@ pub async fn handle_fleet_versions(pool: &sqlx::PgPool, verbose: bool, live: boo
         return Ok(());
     }
 
-    // Pick the most-common installed SHA as the "fleet target". A host
-    // matches when its installed SHA equals that — regardless of build
-    // counter, build date, or local-tree state.
+    // Tally installed SHAs so the fleet's modal SHA can serve as a fallback
+    // drift target when the upstream LATEST is unknown (see pick_version_target).
     let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut hosts: Vec<(String, String, String)> = Vec::with_capacity(rows.len());
     for r in &rows {
@@ -2221,7 +2250,7 @@ pub async fn handle_fleet_versions(pool: &sqlx::PgPool, verbose: bool, live: boo
         }
         hosts.push((name, installed, latest));
     }
-    let target_sha: Option<String> = counts
+    let mode_sha: Option<String> = counts
         .iter()
         .max_by_key(|(_, n)| *n)
         .map(|(sha, _)| sha.clone());
@@ -2236,6 +2265,22 @@ pub async fn handle_fleet_versions(pool: &sqlx::PgPool, verbose: bool, live: boo
             display_version_short(raw)
         }
     };
+
+    // Drift target: prefer the upstream LATEST that the auto-upgrade wave is
+    // rolling toward, so a host ON latest reads ✓ and stale hosts read drift.
+    // `latest` is sr.latest_version (identical for every ff_git row) — take the
+    // first non-empty one. Compare on the normalized short code identity (what
+    // the table prints), so a 40-char installed SHA and an 8-char LATEST that
+    // are the same commit compare equal.
+    let latest_short: Option<String> = hosts
+        .iter()
+        .map(|(_, _, latest)| latest)
+        .find(|l| !l.is_empty())
+        .map(|l| short(l));
+    let mode_short: Option<String> = mode_sha.as_deref().map(short);
+    let target = pick_version_target(latest_short.as_deref(), mode_short.as_deref());
+    let target_short: Option<String> = target.as_ref().map(|(t, _)| t.clone());
+    let using_latest = target.as_ref().map(|(_, l)| *l).unwrap_or(false);
 
     if verbose {
         println!(
@@ -2252,8 +2297,8 @@ pub async fn handle_fleet_versions(pool: &sqlx::PgPool, verbose: bool, live: boo
     for (name, installed, latest) in &hosts {
         let inst_short = short(installed);
         let lat_short = short(latest);
-        let state = match target_sha.as_deref() {
-            Some(t) if installed == t => {
+        let state = match target_short.as_deref() {
+            Some(t) if !inst_short.is_empty() && inst_short != "-" && inst_short == t => {
                 converged += 1;
                 "✓"
             }
@@ -2282,16 +2327,20 @@ pub async fn handle_fleet_versions(pool: &sqlx::PgPool, verbose: bool, live: boo
     }
 
     let total = hosts.len();
-    let target_disp = target_sha
-        .as_deref()
-        .map(|s| s.chars().take(8).collect::<String>())
-        .unwrap_or_else(|| "-".into());
+    let target_disp = target_short.as_deref().unwrap_or("-");
+    // Name the target so the summary is unambiguous: LATEST = upstream the wave
+    // rolls toward; "fleet" = modal fallback when LATEST is unknown.
+    let target_kind = if using_latest { "LATEST" } else { "fleet" };
     println!();
-    if converged == total {
-        println!("{GREEN}✓ converged{RESET}: all {total} host(s) at {target_disp}");
+    if target_short.is_none() {
+        println!(
+            "{YELLOW}⚠ no target{RESET}: no LATEST or installed SHA known across {total} host(s)"
+        );
+    } else if converged == total {
+        println!("{GREEN}✓ converged{RESET}: all {total} host(s) on {target_kind} {target_disp}");
     } else {
         println!(
-            "{YELLOW}⚠ drift{RESET}: {}/{total} on {target_disp}; {} drifted",
+            "{YELLOW}⚠ drift{RESET}: {}/{total} on {target_kind} {target_disp}; {} drifted",
             converged,
             total - converged,
         );
@@ -3626,5 +3675,45 @@ fn parse_duration(spec: &str) -> Option<chrono::Duration> {
         "m" | "min" => Some(chrono::Duration::minutes(n)),
         "d" | "day" => Some(chrono::Duration::days(n)),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod version_target_tests {
+    use super::pick_version_target;
+
+    #[test]
+    fn prefers_latest_over_mode() {
+        // The bug fix: when LATEST is known, it is the target even if most
+        // hosts sit on an older modal SHA. Otherwise the one host on LATEST
+        // reads `drift` while the stale majority reads `✓`.
+        let t = pick_version_target(Some("17a5c3c4"), Some("fb60060c"));
+        assert_eq!(t, Some(("17a5c3c4".to_string(), true)));
+    }
+
+    #[test]
+    fn falls_back_to_mode_when_latest_unknown() {
+        // 6h upstream-check tick hasn't populated latest_version yet → report
+        // fleet homogeneity against the modal installed SHA.
+        let t = pick_version_target(None, Some("fb60060c"));
+        assert_eq!(t, Some(("fb60060c".to_string(), false)));
+    }
+
+    #[test]
+    fn treats_empty_and_dash_latest_as_unknown() {
+        assert_eq!(
+            pick_version_target(Some(""), Some("fb60060c")),
+            Some(("fb60060c".to_string(), false))
+        );
+        assert_eq!(
+            pick_version_target(Some("-"), Some("fb60060c")),
+            Some(("fb60060c".to_string(), false))
+        );
+    }
+
+    #[test]
+    fn none_when_neither_known() {
+        assert_eq!(pick_version_target(None, None), None);
+        assert_eq!(pick_version_target(Some(""), Some("-")), None);
     }
 }
