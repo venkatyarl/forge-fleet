@@ -171,8 +171,12 @@ impl PulseReader {
         Ok(self.scan_keys().await?.len())
     }
 
-    /// Returns `(name, is_healthy, going_offline)` triples for every beat
+    /// Returns `(name, is_healthy, is_yielding)` triples for every beat
     /// currently in Redis. Used by election code to see who is eligible.
+    /// `is_healthy` already folds in `going_offline` (a node publishing its
+    /// LWT beat reads as unhealthy); `is_yielding` is the voluntary
+    /// step-down flag (HA Phase 1) — a yielding node is alive but must not
+    /// be elected, so the election treats it as not-a-candidate.
     pub async fn computer_health_for_election(
         &self,
     ) -> Result<Vec<(String, bool, bool)>, PulseError> {
@@ -181,7 +185,7 @@ impl PulseReader {
             .into_iter()
             .map(|b| {
                 let healthy = !b.going_offline;
-                (b.computer_name, healthy, b.going_offline)
+                (b.computer_name, healthy, b.is_yielding)
             })
             .collect())
     }

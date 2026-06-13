@@ -26,7 +26,7 @@
 //! the rationale.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use chrono::Utc;
@@ -125,6 +125,31 @@ pub struct LeaderTick {
     /// the leader name changes. Used to gate [`pg_claim_leader_pulse_silent`]
     /// via [`MIN_PULSE_SILENT_SECS`] — closes #91.
     leader_pulse_silent_since: tokio::sync::Mutex<Option<(String, std::time::Instant)>>,
+
+    /// HA Phase 1 voluntary step-down. Shared with the HeartbeatV2 publisher
+    /// (via [`with_yield_flag`](Self::with_yield_flag)); each tick we read the
+    /// `leader_yield_request` fleet_secret and, when it names us and hasn't
+    /// expired, set this flag so our beat publishes `is_yielding=true`. That
+    /// makes every peer's election skip us so the next-preferred follower takes
+    /// over cleanly. `None` when no publisher handle was attached (the node
+    /// still functions; it just can't be told to step down).
+    yield_flag: Option<Arc<AtomicBool>>,
+}
+
+/// Parse a `leader_yield_request` fleet_secret value of the form
+/// `<member_name>|<rfc3339_until>`. Returns `(member, until)` on success.
+/// Anything malformed yields `None` → treated as "no active request" so a
+/// garbled secret can never wedge the election.
+fn parse_yield_request(raw: &str) -> Option<(String, chrono::DateTime<Utc>)> {
+    let (member, until) = raw.split_once('|')?;
+    let member = member.trim();
+    if member.is_empty() {
+        return None;
+    }
+    let until = chrono::DateTime::parse_from_rfc3339(until.trim())
+        .ok()?
+        .with_timezone(&Utc);
+    Some((member.to_string(), until))
 }
 
 impl LeaderTick {
@@ -147,6 +172,33 @@ impl LeaderTick {
             on_lost_leader: Arc::new(|_| {}),
             pg_failover_manager: None,
             leader_pulse_silent_since: tokio::sync::Mutex::new(None),
+            yield_flag: None,
+        }
+    }
+
+    /// Attach the HeartbeatV2 publisher's `is_yielding` flag so this tick can
+    /// drive voluntary step-down (HA Phase 1). Without it, `leader_yield_request`
+    /// is still honoured for *this node's own* election decision, but the flag
+    /// is never published to peers.
+    pub fn with_yield_flag(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.yield_flag = Some(flag);
+        self
+    }
+
+    /// Read the `leader_yield_request` fleet_secret and decide whether THIS node
+    /// should currently yield leadership. True only when the request names us
+    /// and its deadline hasn't passed (auto fail-back on expiry). A missing /
+    /// malformed / unreadable secret is "not yielding".
+    async fn self_should_yield(&self) -> bool {
+        match ff_db::pg_get_secret(&self.pg, "leader_yield_request").await {
+            Ok(Some(raw)) => parse_yield_request(&raw)
+                .map(|(member, until)| member == self.my_name && Utc::now() < until)
+                .unwrap_or(false),
+            Ok(None) => false,
+            Err(e) => {
+                tracing::warn!(error = %e, "leader_yield_request read failed; not yielding");
+                false
+            }
         }
     }
 
@@ -335,27 +387,42 @@ impl LeaderTick {
     /// machine deterministically.
     pub async fn tick(&self) -> Result<TickOutcome, LeaderError> {
         // 1) Live health from Pulse. Absent peers are implicitly "not alive".
+        //    The third tuple element is each node's `is_yielding` flag (HA
+        //    Phase 1 voluntary step-down): a yielding node is alive but must
+        //    not be elected, so it is excluded from the candidate pool exactly
+        //    like an unhealthy one.
         let health = self.pulse.computer_health_for_election().await?;
-        let alive: std::collections::HashMap<String, bool> = health
-            .into_iter()
-            .map(|(name, healthy, _going_offline)| (name, healthy))
-            .collect();
+        let mut alive: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+        let mut yielding: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (name, healthy, is_yielding) in health {
+            if is_yielding {
+                yielding.insert(name.clone());
+            }
+            alive.insert(name, healthy);
+        }
+
+        // 1b) HA Phase 1: drive our own step-down from the `leader_yield_request`
+        //     fleet_secret. Publish the flag for peers (via the shared handle)
+        //     AND fold ourselves into the local `yielding` set immediately so we
+        //     act on our own request this very tick (no beat round-trip lag).
+        let self_yield = self.self_should_yield().await;
+        if let Some(flag) = &self.yield_flag {
+            flag.store(self_yield, Ordering::Relaxed);
+        }
+        if self_yield {
+            yielding.insert(self.my_name.clone());
+        }
 
         // 2) Registered candidates from Postgres. `election_priority`
         //    lower number = more preferred.
         let candidates = load_candidates(&self.pg).await?;
 
         // 3) Pick the best alive candidate (lowest priority, alphabetical
-        //    tie-break). If no candidate is alive, `best_alive` is None
-        //    and we refuse to claim.
-        let best_alive: Option<&Candidate> = candidates
-            .iter()
-            .filter(|c| alive.get(&c.member_name).copied().unwrap_or(false))
-            .min_by(|a, b| {
-                a.election_priority
-                    .cmp(&b.election_priority)
-                    .then_with(|| a.member_name.cmp(&b.member_name))
-            });
+        //    tie-break), skipping any node that is voluntarily yielding. If no
+        //    candidate is alive (or all are yielding), `best_alive` is None and
+        //    we refuse to claim — a yield with no eligible successor leaves the
+        //    current leader in place rather than going leaderless.
+        let best_alive = pick_best_candidate(&candidates, &alive, &yielding);
 
         let current = pg_get_current_leader(&self.pg).await?;
 
@@ -989,6 +1056,32 @@ fn leader_is_stale(cur: &LeaderState) -> bool {
     age.num_seconds() > STALE_THRESHOLD_SECS
 }
 
+/// Pure election rule: pick the most-preferred candidate (lowest
+/// `election_priority`, alphabetical tie-break) that is **alive** and **not
+/// voluntarily yielding**. `None` when every candidate is dead or yielding —
+/// the caller then refuses to claim rather than going leaderless.
+///
+/// HA Phase 1 invariant: with an empty `yielding` set this is byte-identical to
+/// the pre-Phase-1 behaviour (alive filter only), so the feature is fully
+/// dormant unless an operator issues `ff fleet leader step-down`.
+fn pick_best_candidate<'a>(
+    candidates: &'a [Candidate],
+    alive: &std::collections::HashMap<String, bool>,
+    yielding: &std::collections::HashSet<String>,
+) -> Option<&'a Candidate> {
+    candidates
+        .iter()
+        .filter(|c| {
+            alive.get(&c.member_name).copied().unwrap_or(false)
+                && !yielding.contains(&c.member_name)
+        })
+        .min_by(|a, b| {
+            a.election_priority
+                .cmp(&b.election_priority)
+                .then_with(|| a.member_name.cmp(&b.member_name))
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1011,5 +1104,97 @@ mod tests {
         let stale = fake_leader("taylor", STALE_THRESHOLD_SECS + 1, 1);
         assert!(!leader_is_stale(&fresh));
         assert!(leader_is_stale(&stale));
+    }
+
+    #[test]
+    fn parse_yield_request_extracts_member_and_deadline() {
+        let until = Utc::now() + ChronoDuration::minutes(10);
+        let raw = format!("taylor|{}", until.to_rfc3339());
+        let (member, parsed) = parse_yield_request(&raw).expect("valid request parses");
+        assert_eq!(member, "taylor");
+        // Round-trips to within a second (rfc3339 sub-second precision varies).
+        assert!((parsed - until).num_seconds().abs() <= 1);
+    }
+
+    #[test]
+    fn parse_yield_request_trims_whitespace() {
+        let until = Utc::now() + ChronoDuration::minutes(5);
+        let raw = format!("  james  |  {}  ", until.to_rfc3339());
+        let (member, _) = parse_yield_request(&raw).expect("trims and parses");
+        assert_eq!(member, "james");
+    }
+
+    #[test]
+    fn parse_yield_request_rejects_malformed() {
+        // No separator, empty member, and a non-timestamp all yield None so a
+        // garbled secret can never wedge the election.
+        assert!(parse_yield_request("taylor").is_none());
+        assert!(parse_yield_request("|2026-06-13T00:00:00Z").is_none());
+        assert!(parse_yield_request("taylor|not-a-date").is_none());
+        assert!(parse_yield_request("").is_none());
+    }
+
+    fn cand(name: &str, prio: i32) -> Candidate {
+        Candidate {
+            member_name: name.to_string(),
+            computer_id: Uuid::nil(),
+            election_priority: prio,
+        }
+    }
+
+    fn alive_all(names: &[&str]) -> std::collections::HashMap<String, bool> {
+        names.iter().map(|n| (n.to_string(), true)).collect()
+    }
+
+    #[test]
+    fn pick_best_no_yield_is_pre_phase1_behaviour() {
+        // Empty yielding set → lowest priority wins, exactly as before.
+        let cands = vec![cand("taylor", 0), cand("james", 10), cand("sophie", 20)];
+        let alive = alive_all(&["taylor", "james", "sophie"]);
+        let yielding = std::collections::HashSet::new();
+        let best = pick_best_candidate(&cands, &alive, &yielding).unwrap();
+        assert_eq!(best.member_name, "taylor");
+    }
+
+    #[test]
+    fn pick_best_skips_yielding_leader() {
+        // taylor (priority 0) is yielding → next-preferred alive node wins.
+        let cands = vec![cand("taylor", 0), cand("james", 10), cand("sophie", 20)];
+        let alive = alive_all(&["taylor", "james", "sophie"]);
+        let yielding = ["taylor".to_string()].into_iter().collect();
+        let best = pick_best_candidate(&cands, &alive, &yielding).unwrap();
+        assert_eq!(best.member_name, "james");
+    }
+
+    #[test]
+    fn pick_best_none_when_all_yield_or_dead() {
+        // A yield with no eligible successor → None → caller keeps current
+        // leader rather than going leaderless.
+        let cands = vec![cand("taylor", 0), cand("james", 10)];
+        let mut alive = alive_all(&["taylor"]);
+        alive.insert("james".to_string(), false); // james dead
+        let yielding = ["taylor".to_string()].into_iter().collect();
+        assert!(pick_best_candidate(&cands, &alive, &yielding).is_none());
+    }
+
+    #[test]
+    fn pick_best_priority_tie_breaks_alphabetically() {
+        let cands = vec![cand("zeta", 5), cand("alpha", 5)];
+        let alive = alive_all(&["zeta", "alpha"]);
+        let yielding = std::collections::HashSet::new();
+        let best = pick_best_candidate(&cands, &alive, &yielding).unwrap();
+        assert_eq!(best.member_name, "alpha");
+    }
+
+    #[test]
+    fn parse_yield_request_expiry_is_caller_checked() {
+        // parse_yield_request itself does NOT enforce the deadline — it only
+        // decodes. The expiry comparison (`Utc::now() < until`) lives in
+        // self_should_yield, so a past deadline still parses cleanly here.
+        let past = Utc::now() - ChronoDuration::minutes(1);
+        let raw = format!("taylor|{}", past.to_rfc3339());
+        let (member, until) = parse_yield_request(&raw).expect("past deadline still parses");
+        assert_eq!(member, "taylor");
+        assert!(until < Utc::now());
     }
 }

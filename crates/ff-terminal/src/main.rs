@@ -1233,6 +1233,34 @@ enum OauthCommand {
     },
 }
 
+/// `ff fleet leader <action>` — HA leadership management (Phase 1).
+#[derive(Debug, Clone, Subcommand)]
+enum LeaderAction {
+    /// Show the current leader + election candidates (default).
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Voluntarily hand fleet leadership to the next-preferred follower for a
+    /// bounded window (operator-driven maintenance), then automatically fail
+    /// back. Writes the `leader_yield_request` fleet_secret; the target's
+    /// daemon publishes `is_yielding` so peers elect the next candidate.
+    StepDown {
+        /// Minutes to stay yielded before automatic fail-back (1..=1440).
+        #[arg(long, default_value_t = 10)]
+        minutes: i64,
+        /// Leader to step down. Defaults to the current elected leader.
+        #[arg(long)]
+        member: Option<String>,
+        /// Cancel an active step-down and fail back immediately.
+        #[arg(long)]
+        clear: bool,
+        /// Confirm — this moves fleet leadership away from the target.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
 #[derive(Debug, Clone, Subcommand)]
 enum FleetCommand {
     /// Pairwise SSH reachability check across the fleet (N×(N-1) probes).
@@ -1258,10 +1286,13 @@ enum FleetCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Show the current fleet leader + election state.
+    /// Show the current fleet leader, or manage voluntary step-down (HA).
     Leader {
+        /// Output the leader status as JSON (status view only).
         #[arg(long)]
         json: bool,
+        #[command(subcommand)]
+        action: Option<LeaderAction>,
     },
     /// Show computer health table (SDOWN/ODOWN flags).
     Health {

@@ -2401,6 +2401,10 @@ async fn start_pulse_v2_subsystems(
     // available; for now we just spawn the publisher.
     let _epoch_handle = v2_pub.epoch_handle();
     let _role_handle = v2_pub.role_handle();
+    // HA Phase 1: the publisher's voluntary step-down flag, driven by
+    // leader_tick from the `leader_yield_request` fleet_secret (`ff fleet
+    // leader step-down`). Captured before `spawn` consumes the publisher.
+    let yield_handle = v2_pub.yielding_handle();
     handles.push(v2_pub.spawn(shutdown_rx.clone()));
 
     // HMAC key refresher — publishers sign beats with this key, materializer
@@ -2774,7 +2778,8 @@ async fn start_pulse_v2_subsystems(
         )
         .with_on_became_leader(on_became)
         .with_on_lost_leader(on_lost)
-        .with_pg_failover(pg_failover_manager);
+        .with_pg_failover(pg_failover_manager)
+        .with_yield_flag(yield_handle);
         handles.push(leader_tick.spawn(15, shutdown_rx.clone()));
     } else {
         info!(
