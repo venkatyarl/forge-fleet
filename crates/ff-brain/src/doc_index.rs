@@ -21,12 +21,19 @@
 //!   (brain_node_facets), creating the facet row if missing (matching how
 //!   corpus.rs seeds facets via upsert_facet semantics).
 //!
-//! IDEMPOTENT: like cortex::index(), index_docs() DELETEs all prior `doc:%` nodes
-//! for the corpus first (edges cascade via ON DELETE CASCADE), then rebuilds.
+//! FULL vs INCREMENTAL: a full reindex DELETEs all prior `doc:%` nodes for the
+//! corpus first (edges cascade via ON DELETE CASCADE), then rebuilds — re-parsing
+//! every file. An incremental run keeps existing nodes and re-parses ONLY files
+//! whose content changed since the last index (matched by `content_hash`),
+//! rebuilding just the changed file's sections; it then GCs the `doc:file` +
+//! `doc:section` nodes of files removed on disk. On a large doc tree (forge-fleet:
+//! 2833 files / 36k sections) skipping unchanged files takes a no-op
+//! `--incremental` run from ~100s of DB churn to a single hash diff.
 
 use anyhow::Result;
 use sha2::{Digest, Sha256};
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
@@ -63,7 +70,12 @@ struct Heading {
 ///
 /// Re-uses the cached `PgPool` (passed in). Walks `root` for doc files and writes
 /// `doc:file` / `doc:section` nodes + `contains` edges + the modality=doc facet.
-pub async fn index_docs(pool: &PgPool, corpus_slug: &str, root: &Path) -> Result<DocStats> {
+pub async fn index_docs(
+    pool: &PgPool,
+    corpus_slug: &str,
+    root: &Path,
+    incremental: bool,
+) -> Result<DocStats> {
     // Resolve corpus id (also serves as a guard that the corpus exists).
     let corpus_id: Uuid = sqlx::query_scalar("SELECT id FROM brain_corpora WHERE slug = $1")
         .bind(corpus_slug)
@@ -71,21 +83,43 @@ pub async fn index_docs(pool: &PgPool, corpus_slug: &str, root: &Path) -> Result
         .await?
         .ok_or_else(|| anyhow::anyhow!("no corpus with slug '{corpus_slug}'"))?;
 
-    // Idempotent: drop all prior doc:* nodes for this corpus (edges cascade).
-    sqlx::query(
-        "DELETE FROM brain_vault_nodes
-           WHERE project = $1 AND node_type LIKE 'doc:%'",
-    )
-    .bind(corpus_slug)
-    .execute(pool)
-    .await?;
+    // Full: drop all prior doc:* nodes (edges cascade), rebuild from scratch.
+    // Incremental: keep them and load each doc:file's last-indexed content_hash
+    // so an unchanged file can skip the re-parse below.
+    let prior_hashes: HashMap<String, String> = if incremental {
+        sqlx::query(
+            "SELECT path, content_hash FROM brain_vault_nodes
+               WHERE project = $1 AND node_type = 'doc:file'",
+        )
+        .bind(corpus_slug)
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .filter_map(|r| {
+            let path: String = r.get("path");
+            r.get::<Option<String>, _>("content_hash")
+                .map(|h| (path, h))
+        })
+        .collect()
+    } else {
+        sqlx::query(
+            "DELETE FROM brain_vault_nodes
+               WHERE project = $1 AND node_type LIKE 'doc:%'",
+        )
+        .bind(corpus_slug)
+        .execute(pool)
+        .await?;
+        HashMap::new()
+    };
 
     // Ensure the modality=doc facet exists; remember its id for tagging.
     let doc_facet_id = upsert_modality_doc_facet(pool, corpus_id).await?;
 
     let mut stats = DocStats::default();
 
+    // File-node paths present on disk this run — used to GC removed docs.
     let files = collect_doc_files(root);
+    let mut live_paths: Vec<String> = Vec::with_capacity(files.len());
     for file_path in files {
         let source = match std::fs::read_to_string(&file_path) {
             Ok(s) => s,
@@ -99,6 +133,20 @@ pub async fn index_docs(pool: &PgPool, corpus_slug: &str, root: &Path) -> Result
         // ── file node ───────────────────────────────────────────────────────
         let file_node_path = format!("doc://{corpus_slug}/{rel}");
         let content_hash = sha256_hex(&source);
+        live_paths.push(file_node_path.clone());
+
+        // Incremental: an unchanged file keeps its node + sections + edges —
+        // skip the re-parse entirely.
+        if incremental
+            && doc_unchanged(
+                prior_hashes.get(&file_node_path).map(String::as_str),
+                &content_hash,
+            )
+        {
+            stats.files += 1;
+            continue;
+        }
+
         let file_id = upsert_doc_node(
             pool,
             &file_node_path,
@@ -110,6 +158,23 @@ pub async fn index_docs(pool: &PgPool, corpus_slug: &str, root: &Path) -> Result
         .await?;
         stats.files += 1;
         tag_facet(pool, corpus_id, file_id, doc_facet_id).await?;
+
+        // A changed file keeps its node id (stable path) but its prior sections
+        // are now stale (a heading may have been renamed/removed). Drop them by
+        // their `<file>#` path prefix before rebuilding — the `#` makes the
+        // prefix unambiguous (it can't match another file's sections). A full
+        // run already wiped everything, so this is a no-op there.
+        if incremental {
+            sqlx::query(
+                "DELETE FROM brain_vault_nodes
+                   WHERE project = $1 AND node_type = 'doc:section'
+                     AND starts_with(path, $2)",
+            )
+            .bind(corpus_slug)
+            .bind(format!("{file_node_path}#"))
+            .execute(pool)
+            .await?;
+        }
 
         // ── section nodes + contains edges ──────────────────────────────────
         // Parse headings; build the depth-nesting (a level-N section's parent is
@@ -146,6 +211,32 @@ pub async fn index_docs(pool: &PgPool, corpus_slug: &str, root: &Path) -> Result
             }
             stack.push((h.level, sec_id));
         }
+    }
+
+    // Incremental GC: drop doc:file nodes whose file vanished on disk, plus every
+    // doc:section whose owning file (the path before the first `#`) is no longer
+    // live. `split_part(path,'#',1)` recovers a section's file path regardless of
+    // heading nesting, so this catches sub-sections too. `x <> ALL('{}')` is
+    // vacuously true, so an empty corpus correctly drops every doc node.
+    if incremental {
+        sqlx::query(
+            "DELETE FROM brain_vault_nodes
+               WHERE project = $1 AND node_type = 'doc:file'
+                 AND path <> ALL($2)",
+        )
+        .bind(corpus_slug)
+        .bind(&live_paths)
+        .execute(pool)
+        .await?;
+        sqlx::query(
+            "DELETE FROM brain_vault_nodes
+               WHERE project = $1 AND node_type = 'doc:section'
+                 AND split_part(path, '#', 1) <> ALL($2)",
+        )
+        .bind(corpus_slug)
+        .bind(&live_paths)
+        .execute(pool)
+        .await?;
     }
 
     Ok(stats)
@@ -359,9 +450,26 @@ fn sha256_hex(s: &str) -> String {
     format!("{:x}", h.finalize())
 }
 
+/// On an incremental run, a doc file can skip the re-parse only when we've
+/// indexed this exact path before with the identical content hash. A new file
+/// (no prior node) or one whose content changed must be re-parsed.
+fn doc_unchanged(prior_hash: Option<&str>, current_hash: &str) -> bool {
+    prior_hash == Some(current_hash)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn doc_unchanged_only_when_hash_matches() {
+        // Same path, identical content → skip the re-parse.
+        assert!(doc_unchanged(Some("abc"), "abc"));
+        // Same path, content changed → must re-parse.
+        assert!(!doc_unchanged(Some("abc"), "def"));
+        // New file (no prior node) → must parse.
+        assert!(!doc_unchanged(None, "abc"));
+    }
 
     #[test]
     fn parses_atx_headings_with_depth() {

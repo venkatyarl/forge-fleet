@@ -1122,7 +1122,7 @@ async fn run_index(
 
     // STEP 1 of multi-domain Cortex: also index DOCUMENTS (.md/.txt/...) for this
     // root. Best-effort — a doc-index error must never fail the whole index.
-    match ff_brain::doc_index::index_docs(pool, slug, root).await {
+    match ff_brain::doc_index::index_docs(pool, slug, root, incremental).await {
         Ok(doc_stats) => {
             total_files += doc_stats.files;
             total_symbols += doc_stats.sections;
