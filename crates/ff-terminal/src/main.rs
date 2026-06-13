@@ -1043,6 +1043,11 @@ pub enum DeferCommand {
         on_node: Option<String>,
         #[arg(long, default_value_t = 5)]
         max_attempts: i32,
+        /// Wall-clock cap (seconds) for the shell command. On elapse the whole
+        /// process group is SIGKILLed so a stuck rsync/git-fetch can't leak.
+        /// Defaults to the worker's 7200s cap when unset; 0 also means default.
+        #[arg(long = "max-duration-secs")]
+        max_duration_secs: Option<u64>,
     },
     /// Show details for a single deferred task by id.
     Get { id: String },

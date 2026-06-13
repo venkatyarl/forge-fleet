@@ -55,6 +55,7 @@ pub async fn handle_defer(cmd: crate::DeferCommand) -> Result<()> {
             when_at,
             on_node,
             max_attempts,
+            max_duration_secs,
         } => {
             let (trigger_type, trigger_spec, preferred_node) =
                 if let Some(node) = when_node_online.clone() {
@@ -73,9 +74,14 @@ pub async fn handle_defer(cmd: crate::DeferCommand) -> Result<()> {
                     anyhow::bail!("must specify --when-node-online <node> or --when-at <rfc3339>");
                 };
 
-            let payload = serde_json::json!({
+            let mut payload = serde_json::json!({
                 "command": run,
             });
+            // Only set max_duration_secs when a positive cap is given; the
+            // worker treats absent/0 as its DEFAULT_DEFER_MAX_DURATION (7200s).
+            if let Some(secs) = max_duration_secs.filter(|s| *s > 0) {
+                payload["max_duration_secs"] = serde_json::json!(secs);
+            }
             let id = ff_db::pg_enqueue_deferred(
                 &pool,
                 &title,
@@ -97,11 +103,15 @@ pub async fn handle_defer(cmd: crate::DeferCommand) -> Result<()> {
                 println!("  runs on node:  {n}");
             }
             println!("  max attempts:  {max_attempts}");
+            match max_duration_secs.filter(|s| *s > 0) {
+                Some(secs) => println!("  max duration:  {secs}s"),
+                None => println!("  max duration:  7200s (worker default)"),
+            }
             println!();
             println!(
-                "NOTE: executor loop is not yet running. Task is captured durably in Postgres"
+                "Captured durably in Postgres. forgefleetd's defer-worker picks it up when the"
             );
-            println!("      and will begin processing once `forgefleetd defer-worker` is live.");
+            println!("      trigger fires; follow it with `ff defer get {id}`.");
         }
         crate::DeferCommand::Get { id } => match ff_db::pg_get_deferred(&pool, &id).await? {
             Some(r) => {
