@@ -111,6 +111,7 @@ impl ToolRegistry {
         // ── Cortex code-graph tools ─────────────────────────────────────
         self.register(Self::cortex_corpora());
         self.register(Self::cortex_find());
+        self.register(Self::cortex_show());
         self.register(Self::cortex_callers());
         self.register(Self::cortex_callees());
         self.register(Self::cortex_impact());
@@ -877,6 +878,36 @@ impl ToolRegistry {
         }
     }
 
+    fn cortex_show() -> ToolDefinition {
+        ToolDefinition {
+            name: "cortex_show".to_string(),
+            description: "Cortex code graph: show a code symbol's SOURCE — resolve a name to its file + line span and return just that symbol's definition. One call instead of cortex_find → read the file → slice the span (the Cortex get_review_context). An exact qualified-name match wins, else an exact leaf match (highest fan-in), else the top fan-in hit; other matches are returned so you can disambiguate. Needs the indexed checkout present on the host (like cortex_review).".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "corpus": {
+                        "type": "string",
+                        "description": "Indexed repo slug (see cortex_corpora), e.g. 'forge-fleet'"
+                    },
+                    "symbol": {
+                        "type": "string",
+                        "description": "Code symbol — bare leaf ('load_model') or qualified ('ff_agent::model_runtime::load_model'), case-insensitive"
+                    },
+                    "kind": {
+                        "type": "string",
+                        "description": "Narrow to one node-type class: function, struct, enum, trait, impl, mod, class, interface, or 'type'. Default: all code symbols."
+                    },
+                    "max_lines": {
+                        "type": "integer",
+                        "description": "Cap the returned source at this many lines (1-2000, default 200); truncated=true when cut.",
+                        "default": 200
+                    }
+                },
+                "required": ["corpus", "symbol"]
+            }),
+        }
+    }
+
     fn cortex_callers() -> ToolDefinition {
         ToolDefinition {
             name: "cortex_callers".to_string(),
@@ -1330,6 +1361,7 @@ mod tests {
             // Cortex code graph
             "cortex_corpora",
             "cortex_find",
+            "cortex_show",
             "cortex_callers",
             "cortex_callees",
             "cortex_impact",

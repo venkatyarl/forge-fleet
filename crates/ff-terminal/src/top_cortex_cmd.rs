@@ -86,6 +86,26 @@ pub enum TopCortexCommand {
         #[arg(long, default_value = "table")]
         format: String,
     },
+    /// Show a code symbol's source — resolve a name to its file + line span and
+    /// print just that symbol's definition. Token-efficient: collapses
+    /// find→open-file→read into one call (the Cortex `get_review_context`).
+    /// Corpus defaults to the cwd's slug; needs the indexed checkout present.
+    Show {
+        /// Symbol name (qualified or leaf, case-insensitive). An exact qualified
+        /// match wins, else an exact leaf match (highest fan-in), else the top hit.
+        symbol: String,
+        #[arg(long)]
+        corpus: Option<String>,
+        /// Narrow to one node-type class (see `find --kind`): function, struct,
+        /// enum, trait, impl, mod, class, interface, or `type`.
+        #[arg(long)]
+        kind: Option<String>,
+        /// Cap the printed source at this many lines (truncation is flagged).
+        #[arg(long, default_value_t = 200)]
+        max_lines: usize,
+        #[arg(long, default_value = "table")]
+        format: String,
+    },
     /// Transitive caller closure / blast radius (corpus defaults to the cwd's slug).
     Impact {
         symbol: String,
@@ -443,6 +463,21 @@ pub async fn handle_top_cortex(args: TopCortexArgs) -> Result<()> {
             };
             print_hits(&hits, &format, &query, &corpus);
         }
+        TopCortexCommand::Show {
+            symbol,
+            corpus,
+            kind,
+            max_lines,
+            format,
+        } => {
+            let corpus = corpus.unwrap_or_else(cwd_slug);
+            let found =
+                cortex::show_symbol(&pool, &corpus, &symbol, kind.as_deref(), max_lines).await?;
+            print_symbol_source(found.as_ref(), &format, &symbol, &corpus);
+            if found.is_none() {
+                std::process::exit(1);
+            }
+        }
         TopCortexCommand::Impact {
             symbol,
             corpus,
@@ -549,6 +584,66 @@ fn print_hits(hits: &[cortex::SymbolHit], format: &str, query: &str, corpus: &st
                         kind, h.fan_in, h.qualified_name
                     ),
                 }
+            }
+        }
+    }
+}
+
+/// Render `ff cortex show`. `table` (default) prints a header (symbol, kind,
+/// fan-in, location) then the source slice; `json` emits the full record (for
+/// agents/tooling). `None` = no match.
+fn print_symbol_source(
+    found: Option<&cortex::SymbolSource>,
+    format: &str,
+    query: &str,
+    corpus: &str,
+) {
+    match (format, found) {
+        ("json", Some(s)) => {
+            let v = serde_json::json!({
+                "qualified_name": s.qualified_name,
+                "node_type": s.node_type,
+                "file": s.file,
+                "start_line": s.start_line,
+                "end_line": s.end_line,
+                "fan_in": s.fan_in,
+                "truncated": s.truncated,
+                "source": s.source,
+                "other_matches": s.other_matches,
+            });
+            println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+        }
+        ("json", None) => {
+            let v = serde_json::json!({ "corpus": corpus, "query": query, "found": false });
+            println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+        }
+        (_, None) => {
+            println!(
+                "{YELLOW}\u{25b6} cortex show '{query}' in '{corpus}' \u{2014} no match{RESET}"
+            );
+            println!(
+                "  (try `ff cortex find {query}` for candidates, or `ff cortex index` if stale)"
+            );
+        }
+        (_, Some(s)) => {
+            let kind = s.node_type.strip_prefix("code:").unwrap_or(&s.node_type);
+            println!(
+                "{CYAN}\u{25b6} {} {GREEN}{}{RESET}  fanin={}  {}:{}-{}{RESET}",
+                kind, s.qualified_name, s.fan_in, s.file, s.start_line, s.end_line
+            );
+            if !s.other_matches.is_empty() {
+                println!(
+                    "{YELLOW}  ({} other match(es): {}){RESET}",
+                    s.other_matches.len(),
+                    s.other_matches.join(", ")
+                );
+            }
+            // Source with the symbol's real 1-based line numbers down the left.
+            for (i, line) in s.source.lines().enumerate() {
+                println!("  {:>5} \u{2502} {}", s.start_line as usize + i, line);
+            }
+            if s.truncated {
+                println!("{YELLOW}  \u{2026} (truncated; raise --max-lines to see more){RESET}");
             }
         }
     }
