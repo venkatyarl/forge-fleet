@@ -1223,8 +1223,12 @@ async fn run_shell_payload(
 /// did not deliberately `setsid` into its own session. Used on timeout
 /// to guarantee no grandchild (ssh / git / rsync / cargo) leaks past the
 /// task it belonged to.
+///
+/// `pub(crate)` so the deferred-task executor (`defer_worker`) reuses the
+/// exact same group-kill semantics — both executors spawn with
+/// `process_group(0)` and must reap the whole group on timeout.
 #[cfg(unix)]
-fn kill_process_group(pid: u32) {
+pub(crate) fn kill_process_group(pid: u32) {
     // SAFETY: `kill(2)` with a negative pid targets the process group;
     // SIGKILL cannot be caught or ignored. An already-dead group simply
     // returns ESRCH, which we ignore.
@@ -1234,7 +1238,7 @@ fn kill_process_group(pid: u32) {
 }
 
 #[cfg(not(unix))]
-fn kill_process_group(_pid: u32) {}
+pub(crate) fn kill_process_group(_pid: u32) {}
 
 /// Compose the multi-step "bring `<target>` online" task graph atomically.
 ///

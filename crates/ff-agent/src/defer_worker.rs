@@ -28,6 +28,7 @@
 //! pick them up. They're rare enough that this trade-off is acceptable
 //! for the fix that unblocks fleet ops today.
 
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -35,6 +36,29 @@ use sqlx::PgPool;
 use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
+
+/// Wall-clock cap for a single deferred shell task when the payload does not
+/// override it. Deliberately generous: the deferred queue runs legitimate
+/// multi-GB cross-node model downloads and the HA-backup rsync fan-out, all of
+/// which can run for many minutes. 2h is well above any healthy such task yet
+/// finite, so a *stuck* one (a slow-trickle `rsync --timeout=3600` that keeps
+/// resetting its I/O-inactivity timer, a hung `git fetch`) can no longer run
+/// forever. Matches the leaked-orphan reaper's default age threshold so the two
+/// safety layers line up: a task is group-killed here at 2h, and anything that
+/// still escapes (a `setsid`'d grandchild) is reaped by the orphan-reaper tick.
+/// Per-task override via `payload.max_duration_secs`.
+const DEFAULT_DEFER_MAX_DURATION: Duration = Duration::from_secs(7200);
+
+/// Resolve a deferred task's wall-clock cap from its payload, falling back to
+/// [`DEFAULT_DEFER_MAX_DURATION`]. A `max_duration_secs` of 0 (or absent /
+/// non-numeric) yields the default — there is no "unlimited" escape hatch,
+/// because an uncapped shell exec is exactly the leak this closes.
+fn resolve_max_duration(payload: &serde_json::Value) -> Duration {
+    match payload.get("max_duration_secs").and_then(|v| v.as_u64()) {
+        Some(secs) if secs > 0 => Duration::from_secs(secs),
+        _ => DEFAULT_DEFER_MAX_DURATION,
+    }
+}
 
 /// Spawn a background task that periodically claims and executes deferred
 /// tasks from `deferred_tasks`. Returns the JoinHandle so forgefleetd's
@@ -149,6 +173,7 @@ async fn execute(
     task: &ff_db::DeferredTaskRow,
     nodes: &[ff_db::FleetNodeRow],
 ) -> (bool, Option<serde_json::Value>, Option<String>) {
+    let max_duration = resolve_max_duration(&task.payload);
     match task.kind.as_str() {
         "shell" => {
             let Some(command) = task.payload.get("command").and_then(|v| v.as_str()) else {
@@ -158,7 +183,7 @@ async fn execute(
                     Some("shell payload missing 'command' field".into()),
                 );
             };
-            execute_shell(task.preferred_node.as_deref(), command, nodes).await
+            execute_shell(task.preferred_node.as_deref(), command, nodes, max_duration).await
         }
         "http" => {
             let Some(url) = task.payload.get("url").and_then(|v| v.as_str()) else {
@@ -184,7 +209,7 @@ async fn execute(
                     Some(format!("no playbook for tool={tool} os={os_family}")),
                 );
             };
-            execute_shell(task.preferred_node.as_deref(), &script, nodes).await
+            execute_shell(task.preferred_node.as_deref(), &script, nodes, max_duration).await
         }
         other => {
             // Unsupported kinds — leave for the legacy `ff daemon` CLI to
@@ -208,6 +233,7 @@ async fn execute_shell(
     target_node: Option<&str>,
     command: &str,
     nodes: &[ff_db::FleetNodeRow],
+    max_duration: Duration,
 ) -> (bool, Option<serde_json::Value>, Option<String>) {
     use tokio::process::Command;
 
@@ -261,14 +287,91 @@ async fn execute_shell(
         )
     };
 
-    let output = match Command::new(program).args(&args).output().await {
-        Ok(o) => o,
+    // Spawn with the SAME hardening the `fleet_tasks` runner uses (PR #215):
+    //  1. `process_group(0)` — the child (`sh`/`ssh`) becomes its own group
+    //     leader; every grandchild it forks (rsync, git, the ssh tunnel,
+    //     `ff model download`'s HF fetch) joins the group unless it
+    //     deliberately `setsid`s out.
+    //  2. On timeout we SIGKILL the WHOLE group (`kill(-pgid)`), not just the
+    //     direct child. `kill_on_drop` alone reaps only the leader, orphaning
+    //     grandchildren to pid 1 — exactly how the HA-backup `rsync
+    //     --timeout=3600` (an I/O-inactivity timer, NOT a wall-clock cap) ran
+    //     5h on priya and became a leaked orphan when the daemon restarted.
+    //     `.output()` also blocks until the stdout/stderr pipe hits EOF, so an
+    //     orphaned grandchild holding the write-end kept this executor's future
+    //     pending forever. The deferred path never had #215's fix — this closes
+    //     that gap for the other executor.
+    //  3. stdin `/dev/null` so nothing spawned blocks on a read.
+    let mut cmd = Command::new(program);
+    cmd.args(&args);
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    cmd.process_group(0);
+    cmd.kill_on_drop(true);
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
         Err(e) => return (false, None, Some(format!("spawn {program}: {e}"))),
     };
+    // Captured before any await so it survives even if the child is reaped;
+    // it is the group id we target with `kill(-pgid)` on timeout.
+    let pgid = child.id();
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    let exit_code = output.status.code().unwrap_or(-1);
+    // Drain stdout and stderr CONCURRENTLY with the wait — reading one fully
+    // before the other can deadlock a task that fills the second pipe's
+    // 64 KiB buffer while we block waiting on the first.
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let collect = async {
+        let read_out = async {
+            let mut buf = Vec::new();
+            if let Some(mut o) = stdout_pipe {
+                let _ = tokio::io::AsyncReadExt::read_to_end(&mut o, &mut buf).await;
+            }
+            buf
+        };
+        let read_err = async {
+            let mut buf = Vec::new();
+            if let Some(mut e) = stderr_pipe {
+                let _ = tokio::io::AsyncReadExt::read_to_end(&mut e, &mut buf).await;
+            }
+            buf
+        };
+        let (stdout_buf, stderr_buf, status) = tokio::join!(read_out, read_err, child.wait());
+        (status, stdout_buf, stderr_buf)
+    };
+
+    let (status, stdout_buf, stderr_buf) = match tokio::time::timeout(max_duration, collect).await {
+        Ok(triple) => triple,
+        Err(_) => {
+            // Reap the ENTIRE group so no grandchild is left orphaned.
+            if let Some(pid) = pgid {
+                crate::task_runner::kill_process_group(pid);
+            }
+            let secs = max_duration.as_secs();
+            warn!(
+                program,
+                max_duration_secs = secs,
+                "defer_worker: shell task exceeded max duration; killed process group"
+            );
+            return (
+                false,
+                None,
+                Some(format!(
+                    "defer_worker: shell task exceeded max duration of {secs}s (process group killed)"
+                )),
+            );
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&stdout_buf).to_string();
+    let stderr = String::from_utf8_lossy(&stderr_buf).to_string();
+    let status = match status {
+        Ok(s) => s,
+        Err(e) => return (false, None, Some(format!("wait {program}: {e}"))),
+    };
+    let exit_code = status.code().unwrap_or(-1);
 
     let result = serde_json::json!({
         "exit_code": exit_code,
@@ -276,7 +379,7 @@ async fn execute_shell(
         "stderr": stderr.chars().take(8192).collect::<String>(),
     });
 
-    if output.status.success() {
+    if status.success() {
         (true, Some(result), None)
     } else {
         // Error messages land at the END of output (e.g. corepack's EACCES
@@ -375,7 +478,8 @@ mod tests {
     #[tokio::test]
     async fn shell_local_echo_succeeds() {
         let nodes = vec![];
-        let (ok, result, err) = execute_shell(None, "echo hello", &nodes).await;
+        let (ok, result, err) =
+            execute_shell(None, "echo hello", &nodes, Duration::from_secs(10)).await;
         assert!(ok, "expected success, got err: {err:?}");
         let r = result.unwrap();
         assert_eq!(r.get("exit_code").and_then(|v| v.as_i64()), Some(0));
@@ -389,9 +493,52 @@ mod tests {
 
     #[tokio::test]
     async fn shell_local_failure_reports_exit_code() {
-        let (ok, _, err) = execute_shell(None, "exit 3", &[]).await;
+        let (ok, _, err) = execute_shell(None, "exit 3", &[], Duration::from_secs(10)).await;
         assert!(!ok);
         assert!(err.unwrap().contains("exit 3"));
+    }
+
+    #[tokio::test]
+    async fn shell_times_out_and_reaps_backgrounded_grandchild() {
+        // A command that backgrounds a long-lived grandchild (`sleep`) and
+        // then idles. Under the old `.output()` path the grandchild held the
+        // stdout pipe open, so the future never resolved; with the
+        // process-group kill it is reaped and we return a timeout error fast.
+        // Record the grandchild's pid so we can assert it was actually killed.
+        let pidfile =
+            std::env::temp_dir().join(format!("ff_defer_test_{}.pid", std::process::id()));
+        let pidfile_str = pidfile.to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&pidfile);
+        let cmd = format!("sleep 300 & echo $! > {pidfile_str}; wait");
+
+        let start = std::time::Instant::now();
+        let (ok, _, err) = execute_shell(None, &cmd, &[], Duration::from_millis(400)).await;
+        assert!(!ok, "expected timeout failure");
+        let msg = err.unwrap();
+        assert!(
+            msg.contains("exceeded max duration"),
+            "unexpected error: {msg}"
+        );
+        // Must return promptly after the cap, not block on the 300s sleep.
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "execute_shell blocked past the timeout"
+        );
+
+        // The backgrounded grandchild must have been reaped by the group kill.
+        // Give the kernel a moment to deliver SIGKILL, then probe with `kill -0`.
+        if let Ok(pid_str) = std::fs::read_to_string(&pidfile) {
+            if let Ok(pid) = pid_str.trim().parse::<i32>() {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                // kill(-0) returns Err(ESRCH) when the process is gone.
+                let alive = unsafe { libc::kill(pid, 0) } == 0;
+                assert!(
+                    !alive,
+                    "grandchild pid {pid} survived the process-group kill"
+                );
+            }
+        }
+        let _ = std::fs::remove_file(&pidfile);
     }
 
     #[tokio::test]
