@@ -1417,8 +1417,12 @@ pub struct SymbolSource {
     pub start_line: i32,
     pub end_line: i32,
     pub fan_in: i64,
-    /// The extracted source (lines `start_line..=end_line`, possibly truncated
-    /// to `max_lines` — see `truncated`).
+    /// 1-based line number of the FIRST line in `source`. Equals `start_line`
+    /// when `context == 0`; with `--context N` the slice starts up to N lines
+    /// earlier (clamped to 1), so the renderer numbers the gutter from here.
+    pub display_start: i32,
+    /// The extracted source: lines `display_start ..= end_line + context`,
+    /// possibly truncated to `max_lines` — see `truncated`.
     pub source: String,
     /// True when the span exceeded `max_lines` and `source` was cut short.
     pub truncated: bool,
@@ -1460,6 +1464,18 @@ fn pick_show_match(hits: &[SymbolHit], query: &str) -> usize {
     0
 }
 
+/// Widen a symbol's `[start, end]` span by `context` lines on each side for
+/// `--context N` display: the leading edge clamps to line 1, the trailing edge
+/// is left for the slicer to bound by file length. Returns `(display_start,
+/// display_end)`; with `context == 0` it's exactly the symbol span. Pure +
+/// unit-tested.
+fn context_display_range(start: i32, end: i32, context: usize) -> (i32, i32) {
+    let ctx = context as i32;
+    let display_start = (start - ctx).max(1);
+    let display_end = end.saturating_add(ctx);
+    (display_start, display_end)
+}
+
 /// Extract the 1-based inclusive line range `[start, end]` from `source`,
 /// capped at `max_lines` lines. Returns `(slice, truncated)`. Pure +
 /// unit-tested — IO is the caller's (reads the file, then slices).
@@ -1494,6 +1510,7 @@ pub async fn show_symbol(
     query: &str,
     kind: Option<&str>,
     max_lines: usize,
+    context: usize,
 ) -> Result<Option<SymbolSource>> {
     // Resolve against a generous candidate set so leaf/exact disambiguation has
     // material to work with, then narrow to one.
@@ -1532,7 +1549,13 @@ pub async fn show_symbol(
              `ff cortex show` needs the indexed checkout present, like `ff cortex review`"
         )
     })?;
-    let (source, truncated) = slice_source_lines(&source_text, start_line, end_line, max_lines);
+    // With `--context N`, widen the slice by N lines on each side (the leading
+    // edge clamps to line 1; the trailing edge is bounded by the file length via
+    // `slice_source_lines`' `take`). `display_start` is what the renderer numbers
+    // the gutter from; the symbol's own span (start_line..=end_line) is unchanged.
+    let (display_start, display_end) = context_display_range(start_line, end_line, context);
+    let (source, truncated) =
+        slice_source_lines(&source_text, display_start, display_end, max_lines);
 
     let other_matches: Vec<String> = hits
         .iter()
@@ -1549,6 +1572,7 @@ pub async fn show_symbol(
         start_line,
         end_line,
         fan_in: chosen.fan_in,
+        display_start,
         source,
         truncated,
         other_matches,
@@ -3737,6 +3761,16 @@ mod tests {
         // Defensive: start clamps to 1, end clamps up to start, max_lines floors at 1.
         let (s, _) = slice_source_lines(src, 0, -5, 0);
         assert_eq!(s, "l1");
+    }
+
+    #[test]
+    fn context_display_range_widens_and_clamps() {
+        // context 0 → exactly the symbol span.
+        assert_eq!(context_display_range(10, 20, 0), (10, 20));
+        // context N widens both edges by N.
+        assert_eq!(context_display_range(10, 20, 3), (7, 23));
+        // leading edge clamps to line 1 (never 0 or negative).
+        assert_eq!(context_display_range(2, 5, 10), (1, 15));
     }
 
     #[test]

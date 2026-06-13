@@ -902,6 +902,11 @@ impl ToolRegistry {
                         "type": "integer",
                         "description": "Cap the returned source at this many lines (1-2000, default 200); truncated=true when cut.",
                         "default": 200
+                    },
+                    "context": {
+                        "type": "integer",
+                        "description": "Include N lines of surrounding context above and below the symbol (like grep -C, 0-500, default 0). The source then starts at display_start (= start_line when 0).",
+                        "default": 0
                     }
                 },
                 "required": ["corpus", "symbol"]
