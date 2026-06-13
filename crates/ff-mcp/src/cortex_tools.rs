@@ -196,6 +196,56 @@ pub async fn cortex_show(params: Option<Value>) -> HandlerResult {
     }
 }
 
+/// Outline a file — every code symbol it defines (kind / line span / fan-in) in
+/// source order. A file-level table of contents so an agent can orient in an
+/// unknown file from the graph instead of reading the whole file.
+pub async fn cortex_outline(params: Option<Value>) -> HandlerResult {
+    let corpus_slug = params
+        .as_ref()
+        .and_then(|p| p.get("corpus"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            "missing required parameter: corpus (the indexed repo slug; \
+             list them with cortex_corpora)"
+                .to_string()
+        })?
+        .to_string();
+    let file = params
+        .as_ref()
+        .and_then(|p| p.get("file"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required parameter: file".to_string())?
+        .to_string();
+    let kind = params
+        .as_ref()
+        .and_then(|p| p.get("kind"))
+        .and_then(|v| v.as_str());
+    let pool = get_pool().await?;
+    let found = ff_brain::outline_file(&pool, &corpus_slug, &file, kind)
+        .await
+        .map_err(|e| format!("outline: {e}"))?;
+    match found {
+        None => Ok(json!({
+            "corpus": corpus_slug,
+            "file": file,
+            "found": false,
+        })),
+        Some(o) => Ok(json!({
+            "corpus": corpus_slug,
+            "found": true,
+            "file": o.file,
+            "count": o.symbols.len(),
+            "symbols": o.symbols.iter().map(|s| json!({
+                "qualified_name": s.qualified_name,
+                "node_type": s.node_type,
+                "start_line": s.start_line,
+                "end_line": s.end_line,
+                "fan_in": s.fan_in,
+            })).collect::<Vec<_>>(),
+        })),
+    }
+}
+
 /// Callers of a code symbol (who calls it).
 pub async fn cortex_callers(params: Option<Value>) -> HandlerResult {
     let (corpus_slug, symbol) = corpus_and_symbol(&params)?;
