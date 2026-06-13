@@ -1614,8 +1614,8 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                 Err(e) => anyhow::bail!("transfer failed: {e}"),
             }
         }
-        crate::ModelCommand::Where { id_or_name } => {
-            handle_model_where(&pool, &id_or_name).await?;
+        crate::ModelCommand::Where { id_or_name, json } => {
+            handle_model_where(&pool, &id_or_name, json).await?;
         }
         crate::ModelCommand::UpgradeAvailable => {
             handle_model_upgrade_available(&pool).await?;
@@ -2373,13 +2373,24 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
     Ok(())
 }
 
+/// Human-readable size: GiB with one decimal at >= 1 GiB, else whole MiB.
+/// Pure so the table and `--json` paths render identical strings.
+fn human_size(size_bytes: i64) -> String {
+    let gb = (size_bytes as f64) / 1024.0 / 1024.0 / 1024.0;
+    if gb >= 1.0 {
+        format!("{:.1} GB", gb)
+    } else {
+        format!("{} MB", size_bytes / 1024 / 1024)
+    }
+}
+
 /// `ff model where <id-or-name>` — show every location of a model across the fleet.
 ///
 /// Accepts:
 ///   - exact library UUID
 ///   - exact catalog_id (e.g. "qwen3-next-80b-a3b")
 ///   - case-insensitive substring (matches catalog_id, name, or partial path)
-async fn handle_model_where(pool: &sqlx::PgPool, query: &str) -> anyhow::Result<()> {
+async fn handle_model_where(pool: &sqlx::PgPool, query: &str, json: bool) -> anyhow::Result<()> {
     use crate::CYAN;
     use crate::RESET;
     let rows: Vec<(
@@ -2417,21 +2428,48 @@ async fn handle_model_where(pool: &sqlx::PgPool, query: &str) -> anyhow::Result<
     .fetch_all(pool)
     .await?;
 
-    if rows.is_empty() {
-        println!("(no library rows match '{query}')");
+    if json {
+        // Empty array is valid JSON the agent can consume; the exit code below
+        // still distinguishes "found" from "not found".
+        let out: Vec<serde_json::Value> = rows
+            .iter()
+            .map(
+                |(lib_id, worker, catalog, runtime, quant, size, path, last_used, state)| {
+                    serde_json::json!({
+                        "id": lib_id,
+                        "worker": worker,
+                        "catalog_id": catalog,
+                        "runtime": runtime,
+                        "quant": quant,
+                        "state": state,
+                        "size_bytes": size,
+                        "size_human": human_size(*size),
+                        "file_path": path,
+                        "last_used_at": last_used.map(|t| t.to_rfc3339()),
+                    })
+                },
+            )
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        if rows.is_empty() {
+            std::process::exit(1);
+        }
         return Ok(());
+    }
+    if rows.is_empty() {
+        // No match is a non-zero exit, mirroring `ff model info` (errors on an
+        // unknown id) and the cortex `find`/`show`/`outline` convention — so a
+        // script/agent can test "does the fleet hold this model?" by exit code
+        // (`if ff model where X >/dev/null; then ...`) instead of parsing stdout.
+        println!("(no library rows match '{query}')");
+        std::process::exit(1);
     }
     println!(
         "{CYAN}{:<10} {:<28} {:<10} {:<8} {:<5} {:>9}  {}{RESET}",
         "COMPUTER", "MODEL", "RUNTIME", "QUANT", "STATE", "SIZE", "PATH / last_used"
     );
     for (lib_id, worker, catalog, runtime, quant, size, path, last_used, state) in &rows {
-        let gb = (*size as f64) / 1024.0 / 1024.0 / 1024.0;
-        let size_s = if gb >= 1.0 {
-            format!("{:.1} GB", gb)
-        } else {
-            format!("{} MB", size / 1024 / 1024)
-        };
+        let size_s = human_size(*size);
         let used = last_used
             .as_ref()
             .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
@@ -2857,6 +2895,16 @@ fn truncate_str(s: &str, n: usize) -> String {
 mod tests {
     use super::*;
     use ff_agent::model_runtime::AGENT_MIN_CTX;
+
+    #[test]
+    fn human_size_renders_gb_above_1_and_mb_below() {
+        // >= 1 GiB → one-decimal GB
+        assert_eq!(human_size(17_300_000_000), "16.1 GB");
+        assert_eq!(human_size(1024 * 1024 * 1024), "1.0 GB");
+        // < 1 GiB → whole MB
+        assert_eq!(human_size(500 * 1024 * 1024), "500 MB");
+        assert_eq!(human_size(0), "0 MB");
+    }
 
     #[test]
     fn variant_spec_parses_all_fields_and_preserves_repo_slashes() {
