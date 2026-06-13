@@ -844,7 +844,7 @@ impl ToolRegistry {
     fn cortex_find() -> ToolDefinition {
         ToolDefinition {
             name: "cortex_find".to_string(),
-            description: "Cortex code graph: find code symbols by name fragment (case-insensitive substring), ranked by fan-in (most depended-on first) with file:line. The discovery entrypoint — use it to resolve a partial name into exact qualified names, then pass those to cortex_callers/callees/impact. Cheaper than grepping the tree.".to_string(),
+            description: "Cortex code graph: find code symbols, ranked with file:line. Default: by name fragment (case-insensitive substring), ranked by fan-in (most depended-on first). With semantic=true: rank by embedding similarity (bge-m3) so you can search by INTENT ('where we publish heartbeats') when you don't know the name — requires the corpus to have been embedded (ff cortex embed). The discovery entrypoint — resolve a partial name or intent into exact qualified names, then pass those to cortex_callers/callees/impact. Cheaper than grepping the tree.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -854,7 +854,12 @@ impl ToolRegistry {
                     },
                     "query": {
                         "type": "string",
-                        "description": "Name fragment to match against symbol qualified names, e.g. 'load_model' or 'reprofile'"
+                        "description": "Name fragment (substring mode) or natural-language intent (semantic mode), e.g. 'load_model' or 'where models are launched'"
+                    },
+                    "semantic": {
+                        "type": "boolean",
+                        "description": "Rank by embedding similarity instead of name substring — search by intent. Default false.",
+                        "default": false
                     },
                     "limit": {
                         "type": "integer",
