@@ -863,9 +863,10 @@ async fn execute_claimed_task(
 
     let mut exec_config = ExecutorConfig::default();
 
-    // Prefer the inference router's active endpoint; fall back to static llm_base_url.
+    // Prefer the inference router's active endpoint; fall back to static
+    // llm_base_url. Task execution drives tools, so require a tool-capable node.
     let effective_llm_base_url = if let Some(router) = config.inference_router.as_ref() {
-        router.active_url().await
+        router.active_url_filtered(true).await
     } else {
         None
     }
