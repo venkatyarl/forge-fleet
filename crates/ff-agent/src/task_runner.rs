@@ -1601,21 +1601,19 @@ pub async fn compose_fleet_upgrade_wave(
             // behaviour rather than failing the upgrade. Only for daemon-self
             // software — package-manager upgrades are light and must not strip
             // a host's models.
-            let playbook_body = if crate::auto_upgrade::is_daemon_self_software(software_id) {
-                format!(
-                    "ff model free-for-build || true\n\
-                     {pb}\n\
-                     ff model resume-from-build || true",
-                    pb = t.playbook_command
-                )
-            } else {
-                t.playbook_command.clone()
-            };
+            let playbook_body = build_wave_playbook_body(
+                &t.playbook_command,
+                crate::auto_upgrade::is_daemon_self_software(software_id),
+            );
+            // `-o ConnectTimeout=30`: an unreachable / packet-dropping peer
+            // has NO default connect timeout, so the ssh client would hang at
+            // TCP connect until the 2700s task cap. Bound it.
             let command = format!(
                 "set -e\n\
                  echo \"== upgrading {target} via ssh from $(hostname) ==\"\n\
                  ssh -T{port_arg} -o BatchMode=yes -o ServerAliveInterval=15 \
-                     -o ServerAliveCountMax=120 -o StrictHostKeyChecking=accept-new \
+                     -o ServerAliveCountMax=120 -o ConnectTimeout=30 \
+                     -o StrictHostKeyChecking=accept-new \
                      {ssh_user}@{primary_ip} bash -l <<'FF_PLAYBOOK_EOF'\n\
                  {playbook}\n\
                  FF_PLAYBOOK_EOF\n",
@@ -1796,6 +1794,59 @@ struct WaveTarget {
     playbook_command: String,
 }
 
+/// Build the remote script the wave SSHes into each target to run
+/// (`ssh ... target bash -l <<EOF <body> EOF`).
+///
+/// CRITICAL FD HYGIENE (2026-06-12): the body's stdout/stderr ARE the ssh
+/// channel. Any process the body spawns that outlives the shell — notably a
+/// model server relaunched by `resume-from-build` — inherits and HOLDS that
+/// channel open, so the remote work completes (the new binary installs) but
+/// `ssh` never sees EOF and the build task hangs to its 2700s cap. Its
+/// dependent restart task (which keys off the build being SUCCESSFUL) then
+/// never fires, so the host keeps running the old daemon. Observed live:
+/// adele + lily drifted for 2+ weeks — the executor's ssh sat blocked at
+/// 2287s while the remote `bash -l` was already gone and the binary already
+/// installed at HEAD, with ~4 leaked `sshd@notty` sessions piled up over 14
+/// days. The build itself is only ~40s; slowness was never the issue.
+///
+/// Fix: run the real work inside a brace group whose stdout/stderr go to a
+/// remote LOG FILE and whose stdin is `/dev/null`, so nothing it spawns
+/// inherits the ssh channel. The redirect is BLOCK-SCOPED (not `exec`), so
+/// the parent `bash -l` keeps reading the rest of this heredoc from its own
+/// stdin. The channel then carries only one trailing status line and closes
+/// cleanly the instant the remote bash exits. We capture the BUILD block's
+/// own exit code (not `resume-from-build`'s `|| true`, which previously
+/// masked real build failures as success) and propagate it as the ssh exit
+/// status so a genuine build failure fails the task instead of silently
+/// "succeeding".
+fn build_wave_playbook_body(playbook_command: &str, daemon_self: bool) -> String {
+    let log_dir = "$HOME/.forgefleet/logs";
+    let build_log = format!("{log_dir}/fleet-upgrade-wave-build.log");
+    // For daemon-self upgrades, free RAM before the build and restore models
+    // after — but each step is FD-isolated so a relaunched server can't hold
+    // the channel. `free-for-build` runs inside the build block; `resume`
+    // runs in its own redirected block AFTER we capture the build rc.
+    let (free, resume) = if daemon_self {
+        (
+            "ff model free-for-build || true; ",
+            format!(
+                "{{ ff model resume-from-build || true; }} \
+                 > {log_dir}/fleet-upgrade-wave-resume.log 2>&1 </dev/null\n"
+            ),
+        )
+    } else {
+        ("", String::new())
+    };
+    format!(
+        "mkdir -p {log_dir}\n\
+         {{ {free}{playbook_command}; }} > {build_log} 2>&1 </dev/null\n\
+         __build_rc=$?\n\
+         {resume}\
+         echo \"fleet-upgrade-wave: remote build rc=$__build_rc (log: {build_log})\"\n\
+         exit $__build_rc"
+    )
+}
+
 /// Block obviously destructive shell commands.
 fn is_blocked_command(command: &str) -> bool {
     let lower = command.to_ascii_lowercase();
@@ -1815,6 +1866,56 @@ fn is_blocked_command(command: &str) -> bool {
         "init 6",
     ];
     blocked.iter().any(|b| lower.contains(b))
+}
+
+#[cfg(test)]
+mod wave_playbook_tests {
+    use super::build_wave_playbook_body;
+
+    #[test]
+    fn build_block_isolates_fds_and_propagates_real_rc() {
+        let body = build_wave_playbook_body("git pull && cargo build && install x", true);
+        // The build work runs inside a brace group whose stdout/stderr go to
+        // a log file and whose stdin is /dev/null — so no spawned process can
+        // hold the ssh channel open.
+        assert!(body.contains(
+            "{ ff model free-for-build || true; git pull && cargo build && install x; }"
+        ));
+        assert!(
+            body.contains("> $HOME/.forgefleet/logs/fleet-upgrade-wave-build.log 2>&1 </dev/null")
+        );
+        // The redirect is block-scoped, NOT an `exec </dev/null` that would
+        // truncate the heredoc the parent bash is still reading.
+        assert!(!body.contains("exec </dev/null"));
+        // The ssh exit status is the BUILD rc, captured BEFORE resume runs, so
+        // a failed build fails the task (resume's `|| true` can't mask it).
+        let rc_at = body.find("__build_rc=$?").expect("captures rc");
+        let resume_at = body.find("resume-from-build").expect("has resume");
+        assert!(rc_at < resume_at, "rc must be captured before resume runs");
+        assert!(body.trim_end().ends_with("exit $__build_rc"));
+    }
+
+    #[test]
+    fn resume_is_also_fd_isolated_for_daemon_self() {
+        let body = build_wave_playbook_body("true", true);
+        // A model server relaunched by resume must inherit the resume log, not
+        // the ssh channel.
+        assert!(body.contains(
+            "{ ff model resume-from-build || true; } \
+                 > $HOME/.forgefleet/logs/fleet-upgrade-wave-resume.log 2>&1 </dev/null"
+        ));
+    }
+
+    #[test]
+    fn non_daemon_self_skips_model_pause_resume() {
+        let body = build_wave_playbook_body("apt-get install -y foo", false);
+        // Package upgrades are light: no model free/resume, but still
+        // FD-isolated and rc-propagating.
+        assert!(!body.contains("free-for-build"));
+        assert!(!body.contains("resume-from-build"));
+        assert!(body.contains("{ apt-get install -y foo; } > $HOME/.forgefleet/logs/fleet-upgrade-wave-build.log 2>&1 </dev/null"));
+        assert!(body.trim_end().ends_with("exit $__build_rc"));
+    }
 }
 
 #[cfg(test)]
