@@ -2244,6 +2244,10 @@ pub enum ModelCommand {
         /// Prepend the library UUID column (needed for `ff model load <id>`).
         #[arg(long)]
         show_id: bool,
+        /// Emit JSON (every field incl. the library UUID) — for agent / scripted
+        /// consumption (e.g. CLI-driven RAM remediation). Wins over --show-id.
+        #[arg(long)]
+        json: bool,
     },
     /// List current deployments (what's running, per node).
     Deployments {
@@ -2253,6 +2257,11 @@ pub enum ModelCommand {
         /// `ff model unload <id>` and a faithful `ff model load` reload).
         #[arg(long)]
         show_id: bool,
+        /// Emit JSON (every field incl. the deployment UUID + library_id + ctx)
+        /// — for agent / scripted consumption: `ff model deployments --json |
+        /// jq` → pick an id → `ff model unload <id>`. Wins over --show-id.
+        #[arg(long)]
+        json: bool,
     },
     /// Agent-readiness report: classify every healthy tool-calling deployment
     /// as agent-capable (per-slot ctx >= 32768, what the router needs) or a

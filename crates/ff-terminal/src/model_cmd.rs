@@ -325,19 +325,49 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                 );
             }
         }
-        crate::ModelCommand::Library { node, show_id } => {
+        crate::ModelCommand::Library {
+            node,
+            show_id,
+            json,
+        } => {
             let rows = ff_db::pg_list_library(&pool, node.as_deref()).await?;
+            if json {
+                let out: Vec<_> = rows
+                    .iter()
+                    .map(|r| {
+                        serde_json::json!({
+                            "id": r.id,
+                            "node": r.worker_name,
+                            "catalog_id": r.catalog_id,
+                            "runtime": r.runtime,
+                            "quant": r.quant,
+                            "size_bytes": r.size_bytes,
+                            "path": r.file_path,
+                            "pinned": r.pinned,
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&out)?);
+                return Ok(());
+            }
             if rows.is_empty() {
                 println!("(library empty — run `ff model scan` to index your local models dir)");
                 return Ok(());
             }
+            // With --show-id, prepend the LIBRARY_ID column (for `ff model load
+            // <id>`) — single combined header line so it stays aligned over the
+            // id values printed below.
             if show_id {
-                println!("{:<38} ", "LIBRARY_ID");
+                println!(
+                    "{:<38} {:<10} {:<28} {:<10} {:<10} {:<10} PATH",
+                    "LIBRARY_ID", "NODE", "CATALOG_ID", "RUNTIME", "QUANT", "SIZE"
+                );
+            } else {
+                println!(
+                    "{:<10} {:<28} {:<10} {:<10} {:<10} PATH",
+                    "NODE", "CATALOG_ID", "RUNTIME", "QUANT", "SIZE"
+                );
             }
-            println!(
-                "{:<10} {:<28} {:<10} {:<10} {:<10} PATH",
-                "NODE", "CATALOG_ID", "RUNTIME", "QUANT", "SIZE"
-            );
             for r in rows {
                 let sz = human_bytes(r.size_bytes as u64);
                 let quant = r.quant.clone().unwrap_or_else(|| "-".into());
@@ -350,8 +380,36 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                 );
             }
         }
-        crate::ModelCommand::Deployments { node, show_id } => {
+        crate::ModelCommand::Deployments {
+            node,
+            show_id,
+            json,
+        } => {
             let rows = ff_db::pg_list_deployments(&pool, node.as_deref()).await?;
+            if json {
+                let out: Vec<_> = rows
+                    .iter()
+                    .map(|r| {
+                        serde_json::json!({
+                            "id": r.id,
+                            "library_id": r.library_id,
+                            "node": r.worker_name,
+                            "catalog_id": r.catalog_id,
+                            "runtime": r.runtime,
+                            "port": r.port,
+                            "health": r.health_status,
+                            "context_window": r.context_window,
+                            "parallel_slots": r.parallel_slots,
+                            "usable_agent_ctx": r.usable_agent_ctx,
+                            "request_count": r.request_count,
+                            "tokens_used": r.tokens_used,
+                            "started_at": r.started_at.to_rfc3339(),
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&out)?);
+                return Ok(());
+            }
             if rows.is_empty() {
                 println!("(no deployments recorded)");
                 return Ok(());
