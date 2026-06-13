@@ -1555,6 +1555,183 @@ pub async fn show_symbol(
     }))
 }
 
+// ─── File outline (`ff cortex outline`) ──────────────────────────────────────
+//
+// A file-level table of contents: every code symbol a file defines, in source
+// order, with its kind / line span / fan-in. Lets an agent orient in an unknown
+// file from the graph (one call) instead of reading the whole file and eyeballing
+// its structure. Reuses the V124 spans + the `contains`-edge walk (the inverse of
+// `owning_files`: descend from the file node to its symbols).
+
+/// One symbol in a [`FileOutline`] — the inverse of a [`SymbolHit`] (we already
+/// know the file; here we list what it defines).
+#[derive(Debug, Clone)]
+pub struct OutlineEntry {
+    pub qualified_name: String,
+    pub node_type: String,
+    /// 1-based span (None for placeholders / pre-V124 nodes).
+    pub start_line: Option<i32>,
+    pub end_line: Option<i32>,
+    pub fan_in: i64,
+}
+
+/// The symbols a single file defines, from [`outline_file`].
+#[derive(Debug, Clone)]
+pub struct FileOutline {
+    /// The resolved absolute path of the matched `content:file` node.
+    pub file: String,
+    /// Symbols defined in the file, in source order (start_line asc).
+    pub symbols: Vec<OutlineEntry>,
+}
+
+/// Outcome of matching a file argument against the corpus's `content:file` paths.
+/// Pure (no Uuids) so it can be unit-tested against the candidate path list.
+#[derive(Debug, PartialEq)]
+pub enum FileChoice {
+    /// No `content:file` node matched.
+    None,
+    /// Exactly one match (its index into the candidate list).
+    Unique(usize),
+    /// Multiple suffix matches and no exact one — the caller must disambiguate.
+    Ambiguous,
+}
+
+/// The `ILIKE`-suffix pattern for resolving a file argument: `%/<escaped arg>` so
+/// `cortex.rs` matches `.../src/cortex.rs` but NOT `mycortex.rs` (the `/` forces a
+/// path-component boundary). Wildcards in the arg are escaped (paired with
+/// `ESCAPE '\'`). Pure + unit-tested.
+pub fn file_match_pattern(file_arg: &str) -> String {
+    format!("%/{}", escape_like(file_arg))
+}
+
+/// Choose which `content:file` path the argument resolves to, given the candidate
+/// `paths` (exact match OR suffix match, as fetched by [`outline_file`]). An exact
+/// full-path match always wins; otherwise a single candidate is taken; more than
+/// one suffix match with no exact hit is [`FileChoice::Ambiguous`]. Pure +
+/// unit-tested.
+pub fn choose_file_match(paths: &[&str], file_arg: &str) -> FileChoice {
+    if paths.is_empty() {
+        return FileChoice::None;
+    }
+    if let Some(i) = paths.iter().position(|p| *p == file_arg) {
+        return FileChoice::Unique(i);
+    }
+    if paths.len() == 1 {
+        return FileChoice::Unique(0);
+    }
+    FileChoice::Ambiguous
+}
+
+/// Resolve `file_arg` to a single `content:file` node (its id + absolute path) in
+/// `corpus_slug`. Matches an exact path or a `%/<arg>` suffix; an exact match wins,
+/// a lone suffix match is taken, and multiple suffix matches with no exact hit
+/// bail loudly with the candidate list (so the caller passes more of the path).
+async fn resolve_file_node(
+    pool: &PgPool,
+    corpus_slug: &str,
+    file_arg: &str,
+) -> Result<Option<(Uuid, String)>> {
+    let suffix = file_match_pattern(file_arg);
+    let rows = sqlx::query(
+        r#"SELECT id, path FROM brain_vault_nodes
+            WHERE project = $1 AND node_type = 'content:file'
+              AND (path = $2 OR path LIKE $3 ESCAPE '\')
+            ORDER BY length(path) ASC, path COLLATE "C""#,
+    )
+    .bind(corpus_slug)
+    .bind(file_arg)
+    .bind(&suffix)
+    .fetch_all(pool)
+    .await?;
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    let paths: Vec<String> = rows.iter().map(|r| r.get::<String, _>("path")).collect();
+    let path_refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
+    match choose_file_match(&path_refs, file_arg) {
+        FileChoice::None => Ok(None),
+        FileChoice::Unique(i) => Ok(Some((rows[i].get("id"), paths[i].clone()))),
+        FileChoice::Ambiguous => {
+            let shown = paths
+                .iter()
+                .take(10)
+                .map(|p| format!("  {p}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let more = if paths.len() > 10 {
+                format!("\n  … and {} more", paths.len() - 10)
+            } else {
+                String::new()
+            };
+            anyhow::bail!(
+                "'{file_arg}' matches {} files in corpus '{corpus_slug}' — pass more of the \
+                 path to disambiguate:\n{shown}{more}",
+                paths.len()
+            )
+        }
+    }
+}
+
+/// List every `code:*` symbol a file defines, in source order — a file-level
+/// table of contents. Resolves `file_arg` to a `content:file` node (exact path or
+/// `%/<arg>` suffix), then descends `contains` edges to collect its symbols
+/// (including nested ones: `file → impl/mod → fn`), each with kind / span / fan-in.
+/// `kind` optionally narrows to a node-type class (see [`kind_filter_types`]).
+///
+/// Returns `Ok(None)` when no file matched. Errors loudly on an ambiguous match
+/// (multiple suffix hits) so the caller disambiguates. No file IO — purely a graph
+/// query (unlike `show`, which reads the source), so it works even when the
+/// indexed checkout isn't present on this host.
+pub async fn outline_file(
+    pool: &PgPool,
+    corpus_slug: &str,
+    file_arg: &str,
+    kind: Option<&str>,
+) -> Result<Option<FileOutline>> {
+    let Some((file_id, path)) = resolve_file_node(pool, corpus_slug, file_arg).await? else {
+        return Ok(None);
+    };
+    let kind_types = resolve_kind_filter(kind)?;
+    let rows = sqlx::query(
+        r#"WITH RECURSIVE down AS (
+                SELECT e.dst_id AS node
+                  FROM brain_vault_edges e
+                 WHERE e.edge_type = 'contains' AND e.src_id = $1
+                UNION
+                SELECT e.dst_id
+                  FROM brain_vault_edges e
+                  JOIN down ON e.src_id = down.node
+                 WHERE e.edge_type = 'contains'
+            )
+            SELECT n.id, n.title, n.node_type, n.start_line, n.end_line,
+                   (SELECT count(*) FROM brain_vault_edges ce
+                     WHERE ce.edge_type = 'calls' AND ce.dst_id = n.id) AS fan_in
+              FROM down JOIN brain_vault_nodes n ON n.id = down.node
+             WHERE n.node_type LIKE 'code:%'
+               AND ($2::text[] IS NULL OR n.node_type = ANY($2))
+             ORDER BY n.start_line ASC NULLS LAST, n.title COLLATE "C""#,
+    )
+    .bind(file_id)
+    .bind(kind_types.as_deref())
+    .fetch_all(pool)
+    .await?;
+
+    let symbols = rows
+        .into_iter()
+        .map(|r| OutlineEntry {
+            qualified_name: r.get("title"),
+            node_type: r.get("node_type"),
+            start_line: r.get("start_line"),
+            end_line: r.get("end_line"),
+            fan_in: r.get("fan_in"),
+        })
+        .collect();
+    Ok(Some(FileOutline {
+        file: path,
+        symbols,
+    }))
+}
+
 // ─── Change-aware review (detect_changes vs git diff) ────────────────────────
 //
 // Given the set of changed files (the terminal layer computes them from
@@ -3560,6 +3737,34 @@ mod tests {
         // Defensive: start clamps to 1, end clamps up to start, max_lines floors at 1.
         let (s, _) = slice_source_lines(src, 0, -5, 0);
         assert_eq!(s, "l1");
+    }
+
+    #[test]
+    fn file_match_pattern_escapes_and_anchors_on_separator() {
+        // A bare basename anchors on a path separator so `cortex.rs` can't match
+        // `mycortex.rs`, and LIKE wildcards in the arg are escaped.
+        assert_eq!(file_match_pattern("cortex.rs"), "%/cortex.rs");
+        assert_eq!(file_match_pattern("a_b.rs"), "%/a\\_b.rs");
+        assert_eq!(file_match_pattern("src/cortex.rs"), "%/src/cortex.rs");
+    }
+
+    #[test]
+    fn choose_file_match_prefers_exact_then_unique_then_ambiguous() {
+        // No candidates.
+        assert_eq!(choose_file_match(&[], "x.rs"), FileChoice::None);
+        // Exact full-path match wins even when other suffix matches exist.
+        let paths = ["/a/mod.rs", "/b/c/mod.rs"];
+        assert_eq!(
+            choose_file_match(&paths, "/b/c/mod.rs"),
+            FileChoice::Unique(1)
+        );
+        // A single candidate is taken (suffix match, no exact).
+        assert_eq!(
+            choose_file_match(&["/x/y/cortex.rs"], "cortex.rs"),
+            FileChoice::Unique(0)
+        );
+        // Multiple suffix matches, no exact → ambiguous (caller disambiguates).
+        assert_eq!(choose_file_match(&paths, "mod.rs"), FileChoice::Ambiguous);
     }
 
     #[test]

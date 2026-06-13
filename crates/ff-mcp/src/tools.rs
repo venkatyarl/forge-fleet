@@ -112,6 +112,7 @@ impl ToolRegistry {
         self.register(Self::cortex_corpora());
         self.register(Self::cortex_find());
         self.register(Self::cortex_show());
+        self.register(Self::cortex_outline());
         self.register(Self::cortex_callers());
         self.register(Self::cortex_callees());
         self.register(Self::cortex_impact());
@@ -908,6 +909,31 @@ impl ToolRegistry {
         }
     }
 
+    fn cortex_outline() -> ToolDefinition {
+        ToolDefinition {
+            name: "cortex_outline".to_string(),
+            description: "Cortex code graph: outline a FILE — every code symbol it defines (kind, line span, fan-in) in source order, a file-level table of contents. Orient in an unknown file from the graph in one call instead of reading the whole file. Resolve the file by exact path or a path suffix ('cortex.rs' or 'src/cortex.rs'); multiple matches error with the candidates. Pure graph query (no source read), so it works even if the indexed checkout isn't on this host. Pair with cortex_show to then pull one symbol's source.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "corpus": {
+                        "type": "string",
+                        "description": "Indexed repo slug (see cortex_corpora), e.g. 'forge-fleet'"
+                    },
+                    "file": {
+                        "type": "string",
+                        "description": "File path or path suffix, e.g. 'cortex.rs' or 'crates/ff-brain/src/cortex.rs'. An exact path wins; a unique suffix is taken; multiple matches error with candidates."
+                    },
+                    "kind": {
+                        "type": "string",
+                        "description": "Narrow to one node-type class: function, struct, enum, trait, impl, mod, class, interface, or 'type'. Default: all code symbols."
+                    }
+                },
+                "required": ["corpus", "file"]
+            }),
+        }
+    }
+
     fn cortex_callers() -> ToolDefinition {
         ToolDefinition {
             name: "cortex_callers".to_string(),
@@ -1362,6 +1388,7 @@ mod tests {
             "cortex_corpora",
             "cortex_find",
             "cortex_show",
+            "cortex_outline",
             "cortex_callers",
             "cortex_callees",
             "cortex_impact",

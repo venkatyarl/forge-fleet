@@ -106,6 +106,25 @@ pub enum TopCortexCommand {
         #[arg(long, default_value = "table")]
         format: String,
     },
+    /// Outline a file: every code symbol it defines (kind, line span, fan-in) in
+    /// source order — a file-level table of contents to orient in an unknown file
+    /// without reading the whole thing. A pure graph query (no source read), so it
+    /// works even if the indexed checkout isn't on this host. Corpus defaults to
+    /// the cwd's slug.
+    Outline {
+        /// File path or path suffix, e.g. `cortex.rs` or `ff-brain/src/cortex.rs`.
+        /// An exact path wins; a unique suffix is taken; multiple matches error
+        /// with the candidates so you can pass more of the path.
+        file: String,
+        #[arg(long)]
+        corpus: Option<String>,
+        /// Narrow to one node-type class (see `find --kind`): function, struct,
+        /// enum, trait, impl, mod, class, interface, or `type`.
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long, default_value = "table")]
+        format: String,
+    },
     /// Transitive caller closure / blast radius (corpus defaults to the cwd's slug).
     Impact {
         symbol: String,
@@ -478,6 +497,19 @@ pub async fn handle_top_cortex(args: TopCortexArgs) -> Result<()> {
                 std::process::exit(1);
             }
         }
+        TopCortexCommand::Outline {
+            file,
+            corpus,
+            kind,
+            format,
+        } => {
+            let corpus = corpus.unwrap_or_else(cwd_slug);
+            let found = cortex::outline_file(&pool, &corpus, &file, kind.as_deref()).await?;
+            print_outline(found.as_ref(), &format, &file, &corpus);
+            if found.is_none() {
+                std::process::exit(1);
+            }
+        }
         TopCortexCommand::Impact {
             symbol,
             corpus,
@@ -644,6 +676,72 @@ fn print_symbol_source(
             }
             if s.truncated {
                 println!("{YELLOW}  \u{2026} (truncated; raise --max-lines to see more){RESET}");
+            }
+        }
+    }
+}
+
+/// Render `ff cortex outline`. `table` (default) prints the resolved file then
+/// one line per symbol (kind / line span / fan-in / qualified name) in source
+/// order; `json` emits the full record; `names` lists just the qualified names
+/// (pipe into show/callers/callees). `None` = no file matched.
+fn print_outline(found: Option<&cortex::FileOutline>, format: &str, file_arg: &str, corpus: &str) {
+    match (format, found) {
+        ("json", Some(o)) => {
+            let v = serde_json::json!({
+                "corpus": corpus,
+                "file": o.file,
+                "found": true,
+                "count": o.symbols.len(),
+                "symbols": o.symbols.iter().map(|s| serde_json::json!({
+                    "qualified_name": s.qualified_name,
+                    "node_type": s.node_type,
+                    "start_line": s.start_line,
+                    "end_line": s.end_line,
+                    "fan_in": s.fan_in,
+                })).collect::<Vec<_>>(),
+            });
+            println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+        }
+        ("json", None) => {
+            let v = serde_json::json!({ "corpus": corpus, "file": file_arg, "found": false });
+            println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+        }
+        ("names", Some(o)) => {
+            for s in &o.symbols {
+                println!("{}", s.qualified_name);
+            }
+        }
+        ("names", None) => {}
+        (_, None) => {
+            println!(
+                "{YELLOW}\u{25b6} cortex outline '{file_arg}' in '{corpus}' \u{2014} no such file{RESET}"
+            );
+            println!(
+                "  (give a path or suffix like 'src/foo.rs'; run `ff cortex index` if the repo is stale)"
+            );
+        }
+        (_, Some(o)) => {
+            println!(
+                "{CYAN}\u{25b6} cortex outline {GREEN}{}{RESET}  \u{2014} {} symbol(s):{RESET}",
+                o.file,
+                o.symbols.len()
+            );
+            if o.symbols.is_empty() {
+                println!("  (no code symbols \u{2014} a non-code file, or re-`ff cortex index`)");
+                return;
+            }
+            for s in &o.symbols {
+                let kind = s.node_type.strip_prefix("code:").unwrap_or(&s.node_type);
+                let span = match (s.start_line, s.end_line) {
+                    (Some(a), Some(b)) => format!("{a}-{b}"),
+                    (Some(a), None) => format!("{a}"),
+                    _ => "-".to_string(),
+                };
+                println!(
+                    "  {:<9} {:>11}  fanin={:<4} {}",
+                    kind, span, s.fan_in, s.qualified_name
+                );
             }
         }
     }
