@@ -628,6 +628,7 @@ async fn maybe_self_upgrade_leader(pool: &PgPool, my_name: &str, running_sha: &s
          echo \"=== leader self-upgrade target={target_sha} ref={git_ref} ===\"\n\
          date\n\
          cd \"{source_tree}\"\n\
+         export GIT_SSH_COMMAND='ssh -o BatchMode=yes -o ConnectTimeout=30 -o ServerAliveInterval=15 -o ServerAliveCountMax=4' GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME=60\n\
          git fetch origin\n\
          git reset --hard \"{git_ref}\"\n\
          cargo build --release --bin forgefleetd\n\

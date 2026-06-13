@@ -1903,6 +1903,25 @@ struct WaveTarget {
 fn build_wave_playbook_body(playbook_command: &str, daemon_self: bool) -> String {
     let log_dir = "$HOME/.forgefleet/logs";
     let build_log = format!("{log_dir}/fleet-upgrade-wave-build.log");
+    // Bound the playbook's git network transfer so a hung GitHub fetch fails
+    // fast instead of leaking a stuck process — sophie accumulated 26-day-old
+    // `git fetch`/`git-upload-pack` orphans from exactly this path pre-#215.
+    // Covers BOTH transports the fleet uses, as plain env-var assignments so
+    // it stays portable to macOS + Linux/dash with no `timeout(1)` dependency
+    // (macOS ships no coreutils `timeout`):
+    //   - SSH remotes (git@github.com-venkat:…): GIT_SSH_COMMAND adds a connect
+    //     timeout + TCP keepalives so a silent peer is dropped in ~60s
+    //     (ServerAliveInterval 15 × CountMax 4), not held forever. The added
+    //     `-o` flags layer on top of the host's ssh-config alias (IdentityFile
+    //     etc. still apply); BatchMode=yes turns a would-be auth prompt into a
+    //     fast failure rather than a hang.
+    //   - HTTPS remotes: GIT_HTTP_LOW_SPEED_LIMIT/TIME abort a transfer that
+    //     trickles under 1 KB/s for 60s.
+    // Build/compile steps that follow are unaffected (these only touch git).
+    let git_net_env = "export \
+         GIT_SSH_COMMAND='ssh -o BatchMode=yes -o ConnectTimeout=30 \
+         -o ServerAliveInterval=15 -o ServerAliveCountMax=4' \
+         GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME=60; ";
     // For daemon-self upgrades, free RAM before the build and restore models
     // after — but each step is FD-isolated so a relaunched server can't hold
     // the channel. `free-for-build` runs inside the build block; `resume`
@@ -1920,7 +1939,7 @@ fn build_wave_playbook_body(playbook_command: &str, daemon_self: bool) -> String
     };
     format!(
         "mkdir -p {log_dir}\n\
-         {{ {free}{playbook_command}; }} > {build_log} 2>&1 </dev/null\n\
+         {{ {git_net_env}{free}{playbook_command}; }} > {build_log} 2>&1 </dev/null\n\
          __build_rc=$?\n\
          {resume}\
          echo \"fleet-upgrade-wave: remote build rc=$__build_rc (log: {build_log})\"\n\
@@ -1960,11 +1979,22 @@ mod wave_playbook_tests {
         // a log file and whose stdin is /dev/null — so no spawned process can
         // hold the ssh channel open.
         assert!(body.contains(
-            "{ ff model free-for-build || true; git pull && cargo build && install x; }"
+            "GIT_HTTP_LOW_SPEED_TIME=60; ff model free-for-build || true; \
+             git pull && cargo build && install x; }"
         ));
         assert!(
             body.contains("> $HOME/.forgefleet/logs/fleet-upgrade-wave-build.log 2>&1 </dev/null")
         );
+        // The git network step is bounded so a hung fetch fails fast (no leak).
+        assert!(body.contains("GIT_SSH_COMMAND='ssh -o BatchMode=yes -o ConnectTimeout=30"));
+        assert!(body.contains("GIT_HTTP_LOW_SPEED_LIMIT=1000"));
+        // It's inside the FD-isolated build block (before the playbook), so it
+        // only affects this command group, not the trailing status line.
+        let env_at = body.find("GIT_SSH_COMMAND=").expect("has git-net env");
+        let log_at = body
+            .find("fleet-upgrade-wave-build.log")
+            .expect("has build log");
+        assert!(env_at < log_at, "git-net env is inside the build block");
         // The redirect is block-scoped, NOT an `exec </dev/null` that would
         // truncate the heredoc the parent bash is still reading.
         assert!(!body.contains("exec </dev/null"));
@@ -1994,7 +2024,7 @@ mod wave_playbook_tests {
         // FD-isolated and rc-propagating.
         assert!(!body.contains("free-for-build"));
         assert!(!body.contains("resume-from-build"));
-        assert!(body.contains("{ apt-get install -y foo; } > $HOME/.forgefleet/logs/fleet-upgrade-wave-build.log 2>&1 </dev/null"));
+        assert!(body.contains("GIT_HTTP_LOW_SPEED_TIME=60; apt-get install -y foo; } > $HOME/.forgefleet/logs/fleet-upgrade-wave-build.log 2>&1 </dev/null"));
         assert!(body.trim_end().ends_with("exit $__build_rc"));
     }
 }
