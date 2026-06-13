@@ -96,6 +96,19 @@ pub enum TopCortexCommand {
         #[arg(long, default_value = "table")]
         format: String,
     },
+    /// Tests covering a code symbol: the transitive caller closure filtered to
+    /// the callers that are tests (test-file path or test-named), ranked
+    /// nearest-first. An empty result is a coverage gap. Corpus defaults to the
+    /// cwd's slug.
+    Tests {
+        symbol: String,
+        #[arg(long)]
+        corpus: Option<String>,
+        #[arg(long, default_value_t = 5)]
+        max_depth: usize,
+        #[arg(long, default_value = "table")]
+        format: String,
+    },
     /// Change-aware, risk-scored review map of the current diff: which changed
     /// symbols have the widest blast radius (fan-in / transitive callers), so a
     /// reviewer knows where to look first. Reads `git diff` for the changed
@@ -440,6 +453,24 @@ pub async fn handle_top_cortex(args: TopCortexArgs) -> Result<()> {
             crate::cortex_cmd::handle_cortex(
                 &pool,
                 crate::CortexCommand::Impact {
+                    corpus,
+                    symbol,
+                    max_depth,
+                    format,
+                },
+            )
+            .await?;
+        }
+        TopCortexCommand::Tests {
+            symbol,
+            corpus,
+            max_depth,
+            format,
+        } => {
+            let corpus = corpus.unwrap_or_else(cwd_slug);
+            crate::cortex_cmd::handle_cortex(
+                &pool,
+                crate::CortexCommand::Tests {
                     corpus,
                     symbol,
                     max_depth,

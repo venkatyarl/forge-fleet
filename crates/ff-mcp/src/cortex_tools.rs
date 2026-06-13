@@ -6,7 +6,9 @@
 //! `cortex_callees`, and `cortex_impact` (transitive blast radius). The graph is
 //! built by `ff cortex index`; these tools only query it.
 
-use ff_brain::{callees, callers, corpus, cortex, find_symbols, find_symbols_semantic, impact};
+use ff_brain::{
+    callees, callers, corpus, cortex, find_symbols, find_symbols_semantic, impact, tests_for,
+};
 use ff_core::config;
 use serde_json::{Value, json};
 use sqlx::postgres::PgPoolOptions;
@@ -187,6 +189,39 @@ pub async fn cortex_impact(params: Option<Value>) -> HandlerResult {
         "max_depth": max_depth,
         "count": rows.len(),
         "impacted": symbols_json(&rows),
+    }))
+}
+
+/// Tests covering a code symbol: the transitive caller closure filtered to the
+/// callers that are tests, ranked nearest-first. Empty = coverage gap.
+pub async fn cortex_tests(params: Option<Value>) -> HandlerResult {
+    let (corpus_slug, symbol) = corpus_and_symbol(&params)?;
+    let max_depth = params
+        .as_ref()
+        .and_then(|p| p.get("max_depth"))
+        .and_then(|v| v.as_u64())
+        .map(|d| d.clamp(1, 20) as usize)
+        .unwrap_or(5);
+    let pool = get_pool().await?;
+    let rows = tests_for(&pool, &corpus_slug, &symbol, max_depth)
+        .await
+        .map_err(|e| format!("tests: {e}"))?;
+    let tests: Vec<Value> = rows
+        .iter()
+        .map(|t| {
+            json!({
+                "qualified_name": t.qualified_name,
+                "file": t.file,
+                "depth": t.depth,
+            })
+        })
+        .collect();
+    Ok(json!({
+        "corpus": corpus_slug,
+        "symbol": symbol,
+        "max_depth": max_depth,
+        "count": tests.len(),
+        "tests": tests,
     }))
 }
 

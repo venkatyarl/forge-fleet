@@ -2722,6 +2722,7 @@ pub async fn dispatch(method: &str, params: Option<Value>) -> HandlerResult {
         "cortex_callers" => crate::cortex_tools::cortex_callers(params).await,
         "cortex_callees" => crate::cortex_tools::cortex_callees(params).await,
         "cortex_impact" => crate::cortex_tools::cortex_impact(params).await,
+        "cortex_tests" => crate::cortex_tools::cortex_tests(params).await,
         "cortex_review" => crate::cortex_tools::cortex_review(params).await,
         // Computer Use (Pillar 1)
         "computer_use" => computer_use(params).await,

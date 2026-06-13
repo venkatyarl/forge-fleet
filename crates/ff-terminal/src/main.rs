@@ -1969,6 +1969,16 @@ pub enum CortexCommand {
         #[arg(long, default_value = "table")]
         format: String,
     },
+    /// Tests covering a code symbol (transitive test callers).
+    Tests {
+        #[arg(long)]
+        corpus: String,
+        symbol: String,
+        #[arg(long, default_value_t = 5)]
+        max_depth: usize,
+        #[arg(long, default_value = "table")]
+        format: String,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
