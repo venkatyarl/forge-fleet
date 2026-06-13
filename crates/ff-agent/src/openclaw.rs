@@ -218,8 +218,31 @@ impl OpenClawManager {
     /// Demote this machine's OpenClaw to node mode pointing at `leader_url`.
     ///
     /// Called on `on_lost_leader` or when first observing someone else as
-    /// leader. Idempotent — always writes the latest URL to disk + DB.
+    /// leader. Idempotent — mirrors `promote_to_gateway`'s DB-mode guard.
+    ///
+    /// Why the guard matters: `reconcile_role` calls this on a 60s timer for
+    /// every non-leader, so without it we'd re-run `openclaw config set`,
+    /// **restart the gateway service**, and log two INFO lines every minute
+    /// on all 14 non-leaders — and on hosts where OpenClaw isn't a systemd
+    /// unit (the DGX Sparks) also spam `Failed to restart openclaw-gateway
+    /// .service: Unit ... not found` into `forgefleetd.log` (observed at
+    /// 1.8 GiB on rihanna). We act only when the mode OR the leader URL
+    /// actually changed — checking BOTH so a leader failover (new URL) still
+    /// reconfigures.
     pub async fn demote_to_node(&self, leader_url: &str) -> Result<(), OpenClawError> {
+        let row: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT mode, gateway_url FROM openclaw_installations WHERE computer_id = $1",
+        )
+        .bind(self.my_computer_id)
+        .fetch_optional(&self.pg)
+        .await?;
+        if let Some((mode, url)) = row.as_ref()
+            && demote_is_noop(mode, url.as_deref(), leader_url)
+        {
+            tracing::debug!(leader_url, "openclaw: already node at this leader, no-op");
+            return Ok(());
+        }
+
         info!(leader_url, "openclaw: demoting to node");
 
         run_openclaw(&["config", "set", "gateway.mode", "remote"])?;
@@ -359,6 +382,15 @@ pub async fn clear_device_pairings_export(pool: &PgPool) -> Result<(), sqlx::Err
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
+
+/// True when a demote to `leader_url` would be a no-op because the DB
+/// already records this machine as a `node` pointing at the same leader.
+/// A leader failover changes `leader_url`, so the URL must match too —
+/// otherwise the reconfigure (and gateway restart) is wrongly skipped on a
+/// real leader change.
+fn demote_is_noop(current_mode: &str, current_url: Option<&str>, leader_url: &str) -> bool {
+    current_mode == "node" && current_url == Some(leader_url)
+}
 
 fn run_openclaw(args: &[&str]) -> Result<String, OpenClawError> {
     let output = Command::new("openclaw").args(args).output()?;
@@ -563,4 +595,33 @@ async fn upsert_secret(pool: &PgPool, key: &str, value: &str) -> Result<(), sqlx
     .execute(pool)
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn demote_is_noop_only_when_mode_and_url_match() {
+        // Already a node at the same leader → skip the reconfigure+restart.
+        assert!(demote_is_noop(
+            "node",
+            Some("ws://192.168.5.100:50000"),
+            "ws://192.168.5.100:50000"
+        ));
+        // Currently a gateway → must demote.
+        assert!(!demote_is_noop(
+            "gateway",
+            Some("ws://192.168.5.100:50000"),
+            "ws://192.168.5.100:50000"
+        ));
+        // Node, but the leader changed (failover) → must reconfigure.
+        assert!(!demote_is_noop(
+            "node",
+            Some("ws://192.168.5.100:50000"),
+            "ws://192.168.5.116:50000"
+        ));
+        // Node with no recorded URL → not a confirmed match, reconfigure.
+        assert!(!demote_is_noop("node", None, "ws://192.168.5.100:50000"));
+    }
 }
