@@ -61,6 +61,20 @@ pub enum TopCortexCommand {
         #[arg(long, default_value = "table")]
         format: String,
     },
+    /// Find code symbols by name (case-insensitive substring), ranked by fan-in
+    /// — the discovery entrypoint: locate a symbol, then drill in with
+    /// callers/callees/impact. Corpus defaults to the cwd's slug.
+    Find {
+        /// Substring to match against symbol qualified names (case-insensitive).
+        query: String,
+        #[arg(long)]
+        corpus: Option<String>,
+        /// Max hits to return (1-500).
+        #[arg(long, default_value_t = 20)]
+        limit: i64,
+        #[arg(long, default_value = "table")]
+        format: String,
+    },
     /// Transitive caller closure / blast radius (corpus defaults to the cwd's slug).
     Impact {
         symbol: String,
@@ -379,6 +393,16 @@ pub async fn handle_top_cortex(args: TopCortexArgs) -> Result<()> {
             )
             .await?;
         }
+        TopCortexCommand::Find {
+            query,
+            corpus,
+            limit,
+            format,
+        } => {
+            let corpus = corpus.unwrap_or_else(cwd_slug);
+            let hits = cortex::find_symbols(&pool, &corpus, &query, limit).await?;
+            print_hits(&hits, &format, &query, &corpus);
+        }
         TopCortexCommand::Impact {
             symbol,
             corpus,
@@ -409,6 +433,58 @@ pub async fn handle_top_cortex(args: TopCortexArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Render `ff cortex find` hits. `table` (default) shows kind/fan-in/location/
+/// symbol; `json` emits the full records (for agents/tooling); `names` lists
+/// just the qualified names (pipe straight into callers/callees/impact).
+fn print_hits(hits: &[cortex::SymbolHit], format: &str, query: &str, corpus: &str) {
+    match format {
+        "json" => {
+            let v: Vec<_> = hits
+                .iter()
+                .map(|h| {
+                    serde_json::json!({
+                        "id": h.id,
+                        "qualified_name": h.qualified_name,
+                        "node_type": h.node_type,
+                        "file": h.file,
+                        "start_line": h.start_line,
+                        "fan_in": h.fan_in,
+                    })
+                })
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+        }
+        "names" => {
+            for h in hits {
+                println!("{}", h.qualified_name);
+            }
+        }
+        _ => {
+            println!(
+                "{CYAN}\u{25b6} cortex find '{query}' in '{corpus}' \u{2014} {} hit(s):{RESET}",
+                hits.len()
+            );
+            if hits.is_empty() {
+                println!("  (none \u{2014} try a shorter fragment, or `ff cortex index` if stale)");
+                return;
+            }
+            for h in hits {
+                // Strip the `code:` prefix for a compact kind tag (function/class/...).
+                let kind = h.node_type.strip_prefix("code:").unwrap_or(&h.node_type);
+                let loc = match (&h.file, h.start_line) {
+                    (Some(f), Some(l)) => format!("{f}:{l}"),
+                    (Some(f), None) => f.clone(),
+                    _ => "-".to_string(),
+                };
+                println!(
+                    "  {:<9} fanin={:<4} {}  ({loc})",
+                    kind, h.fan_in, h.qualified_name
+                );
+            }
+        }
+    }
 }
 
 /// `ff cortex review`: derive changed files from `git diff`, score them against

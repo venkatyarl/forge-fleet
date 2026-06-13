@@ -2718,6 +2718,7 @@ pub async fn dispatch(method: &str, params: Option<Value>) -> HandlerResult {
         "brain_backlog_add" => crate::brain_tools::brain_backlog_add(params).await,
         // Cortex code graph
         "cortex_corpora" => crate::cortex_tools::cortex_corpora(params).await,
+        "cortex_find" => crate::cortex_tools::cortex_find(params).await,
         "cortex_callers" => crate::cortex_tools::cortex_callers(params).await,
         "cortex_callees" => crate::cortex_tools::cortex_callees(params).await,
         "cortex_impact" => crate::cortex_tools::cortex_impact(params).await,

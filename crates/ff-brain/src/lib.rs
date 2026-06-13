@@ -36,7 +36,9 @@ pub use community_summary::{
     pick_served_model_id, resolve_served_model_id, summarize_communities,
 };
 pub use context::{BrainMessage, ContextBundle, ResolvedNode, select_context};
-pub use cortex::{CortexStats, SymbolRef, callees, callers, impact, index};
+pub use cortex::{
+    CortexStats, SymbolHit, SymbolRef, callees, callers, find_symbols, impact, index,
+};
 pub use cortex_embed::{EmbedStats, embed_cortex_nodes};
 pub use embeddings::{
     EmbeddingClient, fleet_embedding_client, generate_embedding, generate_embedding_with_pool,
