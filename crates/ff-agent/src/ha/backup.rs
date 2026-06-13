@@ -61,6 +61,27 @@ const DAILY_RETENTION: usize = 7;
 /// Retention: keep this many `weekly` rows before deleting.
 const WEEKLY_RETENTION: usize = 4;
 
+/// Local on-disk file retention, applied per node to its OWN
+/// `~/.forgefleet/backups/<kind>/` directory — independent of the DB
+/// `backups` catalog (which only tracks the leader's rows).
+///
+/// The rsync fan-out drops a copy of every snapshot on every peer, but
+/// nothing ever pruned those copies, so a small-disk host accumulated
+/// hundreds of generations until its disk filled (ace: 226 postgres
+/// snapshots ≈ 40 GiB). These caps bound that growth.
+///
+/// The LEADER keeps at least the DB-catalog depth
+/// (`RECENT + DAILY + WEEKLY` = 13) so a count-based prune never orphans
+/// a `backups` row (the catalog only ever references the most-recent ≤13
+/// generations). PEERS hold only a few most-recent generations as
+/// disaster-recovery replicas.
+const LOCAL_KEEP_POSTGRES_LEADER: usize = 14;
+const LOCAL_KEEP_POSTGRES_PEER: usize = 4;
+const LOCAL_KEEP_REDIS_LEADER: usize = 60;
+const LOCAL_KEEP_REDIS_PEER: usize = 24;
+/// How often each node prunes its own backup directory.
+const PRUNE_INTERVAL_SECS: u64 = 3600;
+
 /// Errors emitted by [`BackupOrchestrator`].
 #[derive(Debug, thiserror::Error)]
 pub enum BackupError {
@@ -185,6 +206,10 @@ impl BackupOrchestrator {
             }
             reports.push(report);
         }
+        // Prune our own on-disk copies after producing/cataloguing. Runs
+        // on the leader here; peers prune via the spawn-loop ticker (they
+        // short-circuit above and never reach this point).
+        self.prune_all_local().await;
         Ok(reports)
     }
 
@@ -216,10 +241,16 @@ impl BackupOrchestrator {
             let redis_period = Duration::from_secs(self.redis_interval_hours * 3600);
             let mut pg_ticker = tokio::time::interval(pg_period);
             let mut redis_ticker = tokio::time::interval(redis_period);
+            // Prune our OWN backup dir on a cadence regardless of leader
+            // status — peers never produce backups but DO receive rsync'd
+            // copies that would otherwise accumulate forever. First tick
+            // fires immediately after the startup delay.
+            let mut prune_ticker = tokio::time::interval(Duration::from_secs(PRUNE_INTERVAL_SECS));
             // Both start "due now" — fire once immediately after the
             // startup delay, then on cadence.
             pg_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             redis_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            prune_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
             loop {
                 tokio::select! {
@@ -258,6 +289,9 @@ impl BackupOrchestrator {
                             }
                             Err(e) => error!(error = %e, "redis backup tick failed"),
                         }
+                    }
+                    _ = prune_ticker.tick() => {
+                        self.prune_all_local().await;
                     }
                     changed = shutdown.changed() => {
                         if changed.is_err() || *shutdown.borrow() {
@@ -660,6 +694,90 @@ impl BackupOrchestrator {
         .await?;
         Ok(())
     }
+
+    /// Prune local backup files for every kind, choosing retention depth
+    /// by our current leader/peer role. Never fails the caller — this is
+    /// best-effort disk hygiene that must not perturb the backup cadence.
+    pub async fn prune_all_local(&self) {
+        // Fail-open to the LEADER (larger) depth on a lookup error so a
+        // transient DB blip can never cause over-deletion of replicas.
+        let leader = self.i_am_leader().await.unwrap_or(true);
+        let (pg_keep, redis_keep) = if leader {
+            (LOCAL_KEEP_POSTGRES_LEADER, LOCAL_KEEP_REDIS_LEADER)
+        } else {
+            (LOCAL_KEEP_POSTGRES_PEER, LOCAL_KEEP_REDIS_PEER)
+        };
+        if let Err(e) = self.prune_local_backups("postgres", pg_keep).await {
+            warn!(error = %e, "postgres local backup prune failed");
+        }
+        if let Err(e) = self.prune_local_backups("redis", redis_keep).await {
+            warn!(error = %e, "redis local backup prune failed");
+        }
+    }
+
+    /// Prune this node's OWN `<backup_dir>/<kind>/` directory, keeping the
+    /// `keep` most-recent files (by mtime) and unlinking the rest. Only
+    /// touches files whose name carries the kind's backup prefix
+    /// (`pg-` / `redis-`), so an operator file dropped in the directory is
+    /// never deleted. Best-effort: logs and continues past individual
+    /// unlink errors. Returns `(files_removed, bytes_freed)`.
+    async fn prune_local_backups(
+        &self,
+        kind: &str,
+        keep: usize,
+    ) -> Result<(u64, u64), BackupError> {
+        let keep = keep.max(1);
+        let prefix = kind_prefix(kind);
+        if prefix.is_empty() {
+            return Ok((0, 0));
+        }
+        let dir = self.backup_dir.join(kind);
+        let mut rd = match tokio::fs::read_dir(&dir).await {
+            Ok(rd) => rd,
+            // No directory yet (node never received a backup) → nothing to do.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((0, 0)),
+            Err(e) => return Err(e.into()),
+        };
+        let mut files: Vec<(PathBuf, std::time::SystemTime, u64)> = Vec::new();
+        while let Some(entry) = rd.next_entry().await? {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !name.starts_with(prefix) {
+                continue; // never touch non-backup files
+            }
+            let meta = match entry.metadata().await {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if !meta.is_file() {
+                continue;
+            }
+            let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+            files.push((entry.path(), mtime, meta.len()));
+        }
+        let targets = prune_targets(files, keep);
+        let mut removed = 0u64;
+        let mut freed = 0u64;
+        for (path, size) in targets {
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => {
+                    removed += 1;
+                    freed += size;
+                }
+                Err(e) => warn!(file = %path.display(), error = %e, "backup prune: unlink failed"),
+            }
+        }
+        if removed > 0 {
+            info!(
+                kind,
+                removed,
+                freed_bytes = freed,
+                kept = keep,
+                "pruned old local backups"
+            );
+        }
+        Ok((removed, freed))
+    }
 }
 
 // ─── Free helpers ─────────────────────────────────────────────────────
@@ -691,6 +809,35 @@ async fn redis_lastsave() -> Option<u64> {
         return None;
     }
     String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
+/// Filename prefix the backup writer uses for a kind's artifacts
+/// (`pg-<ts>.tar.gz.age`, `redis-<ts>.rdb.zst.age`). Empty for an
+/// unknown kind so the prune becomes a no-op rather than matching
+/// everything.
+fn kind_prefix(kind: &str) -> &'static str {
+    match kind {
+        "postgres" => "pg-",
+        "redis" => "redis-",
+        _ => "",
+    }
+}
+
+/// Given `(path, mtime, size)` tuples, return the `(path, size)` of files
+/// to delete: everything except the `keep` most-recent by mtime. The
+/// newest files (largest mtime) are retained. Pure — no IO — so the
+/// retention policy is unit-testable.
+fn prune_targets(
+    mut files: Vec<(PathBuf, std::time::SystemTime, u64)>,
+    keep: usize,
+) -> Vec<(PathBuf, u64)> {
+    // Most-recent first; ties broken by path so the result is deterministic.
+    files.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    files
+        .into_iter()
+        .skip(keep)
+        .map(|(p, _, s)| (p, s))
+        .collect()
 }
 
 fn shell_quote(s: &str) -> String {
@@ -859,5 +1006,68 @@ mod tests {
         assert!(!r.produced);
         assert_eq!(r.kind, "postgres");
         assert!(r.file_name.is_empty());
+    }
+
+    #[test]
+    fn kind_prefix_maps_known_kinds() {
+        assert_eq!(kind_prefix("postgres"), "pg-");
+        assert_eq!(kind_prefix("redis"), "redis-");
+        // Unknown kind → empty so the prune is a no-op, never a match-all.
+        assert_eq!(kind_prefix("nats"), "");
+    }
+
+    /// Build a `(path, mtime, size)` tuple `secs` seconds after the epoch.
+    fn f(name: &str, secs: u64) -> (PathBuf, std::time::SystemTime, u64) {
+        (
+            PathBuf::from(name),
+            std::time::UNIX_EPOCH + Duration::from_secs(secs),
+            100,
+        )
+    }
+
+    #[test]
+    fn prune_targets_keeps_most_recent() {
+        // newest → oldest: c(30), b(20), a(10)
+        let files = vec![f("a", 10), f("b", 20), f("c", 30)];
+        let del = prune_targets(files, 2);
+        // Keep the 2 newest (c, b); delete the oldest (a).
+        assert_eq!(del.len(), 1);
+        assert_eq!(del[0].0, PathBuf::from("a"));
+    }
+
+    #[test]
+    fn prune_targets_noop_when_under_keep() {
+        let files = vec![f("a", 10), f("b", 20)];
+        assert!(prune_targets(files, 5).is_empty());
+        // Exactly `keep` files → nothing deleted.
+        let files = vec![f("a", 10), f("b", 20)];
+        assert!(prune_targets(files, 2).is_empty());
+    }
+
+    #[test]
+    fn prune_targets_deletes_all_oldest_in_order() {
+        let files = vec![f("a", 10), f("b", 20), f("c", 30), f("d", 40)];
+        let del = prune_targets(files, 1);
+        // Keep only d(40); delete c, b, a.
+        let names: Vec<_> = del.iter().map(|(p, _)| p.clone()).collect();
+        assert_eq!(names.len(), 3);
+        assert!(names.contains(&PathBuf::from("a")));
+        assert!(names.contains(&PathBuf::from("b")));
+        assert!(names.contains(&PathBuf::from("c")));
+        assert!(!names.contains(&PathBuf::from("d")));
+    }
+
+    #[test]
+    fn leader_local_keep_covers_db_catalog_depth() {
+        // The leader's count-based prune must never orphan a `backups`
+        // row: the DB catalog references at most RECENT+DAILY+WEEKLY rows,
+        // which are always the most-recent generations, so keeping at
+        // least that many files retains every catalogued snapshot.
+        assert!(
+            LOCAL_KEEP_POSTGRES_LEADER >= RECENT_RETENTION + DAILY_RETENTION + WEEKLY_RETENTION
+        );
+        // Peers hold strictly fewer (thin DR replicas).
+        assert!(LOCAL_KEEP_POSTGRES_PEER < LOCAL_KEEP_POSTGRES_LEADER);
+        assert!(LOCAL_KEEP_POSTGRES_PEER >= 1);
     }
 }
