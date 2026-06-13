@@ -28,6 +28,52 @@ fn unknown_defer_status_parts(filter: &str) -> Vec<String> {
         .collect()
 }
 
+/// Human-readable trigger label for the table's TRIGGER column. Pure — derives
+/// from `trigger_type` + `trigger_spec` exactly as the text path did, extracted
+/// so the JSON row and the table stay in lockstep.
+fn trigger_label(trigger_type: &str, trigger_spec: &serde_json::Value) -> String {
+    match trigger_type {
+        "node_online" => trigger_spec
+            .get("node")
+            .and_then(|v| v.as_str())
+            .map(|n| format!("node={n}"))
+            .unwrap_or_else(|| "node_online".into()),
+        "at_time" => trigger_spec
+            .get("at")
+            .and_then(|v| v.as_str())
+            .unwrap_or("at_time")
+            .to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Lossless JSON projection of one deferred-task row. Full untruncated `title`
+/// (the table elides nothing but is fixed-width), the raw `trigger_type` +
+/// `trigger_spec` AND the derived `trigger` label, RFC3339 timestamps, and the
+/// nullable claim/error fields. Pure (no DB/clock). The full `payload`/`result`
+/// stay on `ff defer get` (mirrors tasks list omitting result — #250).
+fn defer_list_json_row(r: &ff_db::DeferredTaskRow) -> serde_json::Value {
+    serde_json::json!({
+        "id": r.id,
+        "title": r.title,
+        "kind": r.kind,
+        "status": r.status,
+        "trigger_type": r.trigger_type,
+        "trigger_spec": r.trigger_spec,
+        "trigger": trigger_label(&r.trigger_type, &r.trigger_spec),
+        "preferred_node": r.preferred_node,
+        "attempts": r.attempts,
+        "max_attempts": r.max_attempts,
+        "created_by": r.created_by,
+        "claimed_by": r.claimed_by,
+        "last_error": r.last_error,
+        "created_at": r.created_at.to_rfc3339(),
+        "next_attempt_at": r.next_attempt_at.map(|t| t.to_rfc3339()),
+        "claimed_at": r.claimed_at.map(|t| t.to_rfc3339()),
+        "completed_at": r.completed_at.map(|t| t.to_rfc3339()),
+    })
+}
+
 pub async fn handle_defer(cmd: crate::DeferCommand) -> Result<()> {
     let pool = ff_agent::fleet_info::get_fleet_pool()
         .await
@@ -36,9 +82,15 @@ pub async fn handle_defer(cmd: crate::DeferCommand) -> Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
     match cmd {
-        crate::DeferCommand::List { status, limit } => {
+        crate::DeferCommand::List {
+            status,
+            limit,
+            json,
+        } => {
             // Warn (don't reject — see KNOWN_DEFER_STATUSES) on a likely typo so an
-            // empty result isn't mistaken for "no matching tasks".
+            // empty result isn't mistaken for "no matching tasks". Runs BEFORE the
+            // json branch so a typo'd filter is surfaced in both modes (consistent
+            // with tasks_cmd / #250).
             if let Some(sf) = status.as_deref() {
                 for bad in unknown_defer_status_parts(sf) {
                     eprintln!(
@@ -48,6 +100,11 @@ pub async fn handle_defer(cmd: crate::DeferCommand) -> Result<()> {
                 }
             }
             let rows = ff_db::pg_list_deferred(&pool, status.as_deref(), limit).await?;
+            if json {
+                let arr: Vec<serde_json::Value> = rows.iter().map(defer_list_json_row).collect();
+                println!("{}", serde_json::to_string_pretty(&arr)?);
+                return Ok(());
+            }
             if rows.is_empty() {
                 println!("(no deferred tasks)");
                 return Ok(());
@@ -57,22 +114,7 @@ pub async fn handle_defer(cmd: crate::DeferCommand) -> Result<()> {
                 "ID", "STATUS", "TRIGGER", "TARGET", "TRY"
             );
             for r in rows {
-                let trigger = (match r.trigger_type.as_str() {
-                    "node_online" => r
-                        .trigger_spec
-                        .get("node")
-                        .and_then(|v| v.as_str())
-                        .map(|n| format!("node={n}"))
-                        .unwrap_or_else(|| "node_online".into()),
-                    "at_time" => r
-                        .trigger_spec
-                        .get("at")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("at_time")
-                        .to_string(),
-                    other => other.to_string(),
-                })
-                .to_string();
+                let trigger = trigger_label(&r.trigger_type, &r.trigger_spec);
                 let target = r.preferred_node.clone().unwrap_or_else(|| "-".into());
                 println!(
                     "{:<38} {:<10} {:<12} {:<16} {:<6} {}",
@@ -250,6 +292,74 @@ pub async fn handle_defer(cmd: crate::DeferCommand) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trigger_label_derives_from_spec() {
+        assert_eq!(
+            trigger_label("node_online", &serde_json::json!({"node": "ace"})),
+            "node=ace"
+        );
+        // node_online with no node key falls back to the bare type.
+        assert_eq!(
+            trigger_label("node_online", &serde_json::json!({})),
+            "node_online"
+        );
+        assert_eq!(
+            trigger_label(
+                "at_time",
+                &serde_json::json!({"at": "2026-06-13T00:00:00Z"})
+            ),
+            "2026-06-13T00:00:00Z"
+        );
+        // Unknown trigger types pass through verbatim.
+        assert_eq!(trigger_label("manual", &serde_json::json!({})), "manual");
+    }
+
+    #[test]
+    fn defer_list_json_row_is_lossless() {
+        let created = chrono::DateTime::parse_from_rfc3339("2026-06-13T10:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        // A pending node_online task: claim/error/next-attempt all null.
+        let row = ff_db::DeferredTaskRow {
+            id: "11111111-1111-1111-1111-111111111111".to_string(),
+            created_at: created,
+            created_by: Some("operator".to_string()),
+            title: "Ollama cleanup on ace".to_string(),
+            kind: "shell".to_string(),
+            payload: serde_json::json!({"run": "rm -rf ~/.ollama"}),
+            trigger_type: "node_online".to_string(),
+            trigger_spec: serde_json::json!({"node": "ace"}),
+            preferred_node: Some("ace".to_string()),
+            required_caps: serde_json::json!([]),
+            status: "pending".to_string(),
+            attempts: 0,
+            max_attempts: 5,
+            next_attempt_at: None,
+            claimed_by: None,
+            claimed_at: None,
+            last_error: None,
+            result: None,
+            completed_at: None,
+        };
+        let v = defer_list_json_row(&row);
+        assert_eq!(v["id"], "11111111-1111-1111-1111-111111111111");
+        assert_eq!(v["title"], "Ollama cleanup on ace");
+        assert_eq!(v["status"], "pending");
+        assert_eq!(v["trigger_type"], "node_online");
+        assert_eq!(v["trigger"], "node=ace"); // derived label preserved
+        assert_eq!(v["trigger_spec"]["node"], "ace"); // raw spec preserved
+        assert_eq!(v["preferred_node"], "ace");
+        assert_eq!(v["attempts"], 0);
+        assert_eq!(v["max_attempts"], 5);
+        assert_eq!(v["created_at"], "2026-06-13T10:00:00+00:00");
+        // Nullable fields are JSON null, not omitted, so the shape is stable.
+        assert!(v["next_attempt_at"].is_null());
+        assert!(v["claimed_by"].is_null());
+        assert!(v["last_error"].is_null());
+        // Full payload is intentionally NOT in the list projection.
+        assert!(v.get("payload").is_none());
+    }
 
     #[test]
     fn unknown_defer_status_parts_flags_typos_only() {
