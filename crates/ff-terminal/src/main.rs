@@ -2959,7 +2959,12 @@ pub enum MetricsCommand {
 pub enum SecretsCommand {
     /// List secret keys (values are not printed).
     #[command(alias = "ls")]
-    List,
+    List {
+        /// Emit JSON (one object per secret: key/description/updated_by/
+        /// updated_at) instead of the human table. Values are never included.
+        #[arg(long)]
+        json: bool,
+    },
     /// Print a secret value by key (careful — goes to stdout).
     Get { key: String },
     /// Set (or update) a secret.
