@@ -89,6 +89,38 @@ pub async fn handle_software_list(
     software: Option<String>,
     json: bool,
 ) -> Result<()> {
+    // Validate each filter against its (drift-free) source table BEFORE running
+    // the join, so a typo errors loudly instead of silently returning an empty
+    // list that's indistinguishable from "nothing installed". Both filters use
+    // case-sensitive exact match here, mirroring the `c.name = $1` / `sr.id = $1`
+    // predicates in the list query below (so a passing check always matches the
+    // same rows the query would). Same foot-gun class as `ff tasks list
+    // --computer` (#239) and `ff model library --node` (#240). A valid software
+    // id that simply isn't installed anywhere still returns an empty list at
+    // exit 0 — that's a real empty result, not a typo, and is left untouched.
+    if let Some(c) = &computer {
+        let known: i64 = sqlx::query_scalar("SELECT count(*) FROM computers WHERE name = $1")
+            .bind(c)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| anyhow::anyhow!("validate --computer: {e}"))?;
+        if known == 0 {
+            anyhow::bail!("unknown computer '{c}' — run 'ff fleet health' to list computers");
+        }
+    }
+    if let Some(s) = &software {
+        let known: i64 = sqlx::query_scalar("SELECT count(*) FROM software_registry WHERE id = $1")
+            .bind(s)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| anyhow::anyhow!("validate --software: {e}"))?;
+        if known == 0 {
+            anyhow::bail!(
+                "unknown software '{s}' — run 'ff software list' (no --software) to see tracked software ids"
+            );
+        }
+    }
+
     let mut sql = String::from(
         "SELECT c.name            AS computer,
                 sr.id              AS software_id,
