@@ -41,7 +41,7 @@ pub use cortex::{
     callers, find_symbols, find_symbols_semantic, impact, index, outline_file, show_symbol,
     tests_for,
 };
-pub use cortex_embed::{EmbedStats, embed_cortex_nodes};
+pub use cortex_embed::{EmbedStats, embed_cortex_nodes, spawn_embed_refresh_loop};
 pub use embeddings::{
     EmbeddingClient, fleet_embedding_client, generate_embedding, generate_embedding_with_pool,
 };
