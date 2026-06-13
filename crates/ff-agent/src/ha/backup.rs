@@ -585,7 +585,7 @@ impl BackupOrchestrator {
             let name: String = row.get("name");
 
             // Coalesce the fan-out: skip a peer that still has a non-terminal
-            // (pending/running) backup-rsync of this kind. Without this, every
+            // (pending/dispatchable/running) backup-rsync of this kind. Without this, every
             // snapshot enqueues a fresh ~1 GiB rsync to EVERY peer regardless of
             // whether the last one finished. A slow peer (priya/sophie, observed
             // 2026-06-13 with 7-9 concurrent stuck transfers) then piles up
@@ -600,7 +600,7 @@ impl BackupOrchestrator {
                 "SELECT COUNT(*) FROM deferred_tasks \
                   WHERE preferred_node = $1 \
                     AND kind = 'shell' \
-                    AND status IN ('pending', 'running') \
+                    AND status IN ('pending', 'dispatchable', 'running') \
                     AND title LIKE $2",
             )
             .bind(&name)
