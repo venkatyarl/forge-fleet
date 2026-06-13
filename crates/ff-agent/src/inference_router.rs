@@ -255,6 +255,29 @@ async fn build_endpoint_list(config_path: &Path, client: &reqwest::Client) -> Ve
             let nodes = ff_db::pg_list_nodes(&pool).await.unwrap_or_default();
             let models = ff_db::pg_list_models(&pool).await.unwrap_or_default();
 
+            // DB-first parity for LOCAL endpoints. The local probe above only
+            // had the model-name heuristic to go on (it has no DB row in hand
+            // at probe time). Now that we have the catalog, override each local
+            // endpoint's tool-capability from its `preferred_workloads` tags —
+            // the same source of truth the remote tier uses below. This keeps a
+            // non-tool local model (e.g. gemma-4 on taylor) out of the
+            // tool-capable tier even if the name heuristic is ever loosened.
+            // See feedback_ff_supervise_llm_routing / feedback_gemma4_no_tools.
+            let local_tool_by_port: HashMap<u16, bool> = models
+                .iter()
+                .filter(|m| {
+                    nodes
+                        .iter()
+                        .any(|n| n.name == m.worker_name && is_local_node(&n.ip))
+                })
+                .map(|m| {
+                    let st = workloads_tool_capable(&m.preferred_workloads)
+                        || model_supports_tools(&m.id);
+                    (m.port as u16, st)
+                })
+                .collect();
+            apply_local_db_tool_support(&mut local, &local_tool_by_port);
+
             // Collect (ip, port, cores, supports_tools, label, model_id)
             let mut candidates: Vec<(String, u16, i32, bool, String, String)> = Vec::new();
 
@@ -338,6 +361,26 @@ async fn build_endpoint_list(config_path: &Path, client: &reqwest::Client) -> Ve
     let mut all = local;
     all.extend(remote);
     all
+}
+
+/// Override the local endpoints' tool-capability from a DB-derived
+/// port→supports_tools map (DB-first). Endpoints whose port isn't in the map
+/// keep their probe-time (name-heuristic) value, so unsynced local servers
+/// still route. Re-sorts tool-capable first after any flag flip. See
+/// `feedback_ff_supervise_llm_routing.md`.
+fn apply_local_db_tool_support(local: &mut [RouterEndpoint], tool_by_port: &HashMap<u16, bool>) {
+    for ep in local.iter_mut() {
+        if let Some(port) = ep
+            .url
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.parse::<u16>().ok())
+            && let Some(&st) = tool_by_port.get(&port)
+        {
+            ep.supports_tools = st;
+        }
+    }
+    local.sort_by(|a, b| b.supports_tools.cmp(&a.supports_tools));
 }
 
 /// True if an IP address refers to the local machine.
@@ -479,5 +522,42 @@ mod tests {
             router.active_url_filtered(true).await.as_deref(),
             Some("http://local-qwen")
         );
+    }
+
+    #[test]
+    fn local_db_override_demotes_name_heuristic_false_positive() {
+        // Probe-time: local server on 55000 looked tool-capable by name
+        // (the name heuristic's fallback), but the DB knows it's non-tool
+        // (e.g. gemma-4 tagged chat-only). The DB override must demote it.
+        let mut local = vec![ep("127.0.0.1:55000", true, true)];
+        let mut by_port = HashMap::new();
+        by_port.insert(55000u16, false);
+        apply_local_db_tool_support(&mut local, &by_port);
+        assert!(!local[0].supports_tools);
+    }
+
+    #[test]
+    fn local_db_override_resorts_tool_capable_first() {
+        // Two local servers; the DB promotes 55001 to tool-capable. After the
+        // override the tool-capable endpoint must sort ahead.
+        let mut local = vec![
+            ep("127.0.0.1:55000", false, true),
+            ep("127.0.0.1:55001", false, true),
+        ];
+        let mut by_port = HashMap::new();
+        by_port.insert(55001u16, true);
+        apply_local_db_tool_support(&mut local, &by_port);
+        assert_eq!(local[0].label, "127.0.0.1:55001");
+        assert!(local[0].supports_tools);
+    }
+
+    #[test]
+    fn local_db_override_keeps_heuristic_when_port_absent() {
+        // A local server with no matching DB row keeps its probe-time value,
+        // so unsynced local servers still route.
+        let mut local = vec![ep("127.0.0.1:55002", true, true)];
+        let by_port = HashMap::new(); // empty → no override
+        apply_local_db_tool_support(&mut local, &by_port);
+        assert!(local[0].supports_tools);
     }
 }
