@@ -2938,6 +2938,14 @@ fn normalize_route_limit(limit: i64) -> i64 {
     if limit <= 0 { 3 } else { limit }
 }
 
+/// Whether the text view should warn that the winning candidate can't fit a
+/// tool-using agent. Fires only when the operator hasn't already pinned an
+/// agent-grade floor (`--min-ctx >= floor`) AND the best candidate's per-slot
+/// ctx is known and below the floor. Unknown ctx never warns (can't tell).
+fn route_warns_below_agent_floor(min_ctx: Option<i32>, best_ctx: Option<i32>, floor: i32) -> bool {
+    min_ctx.unwrap_or(0) < floor && best_ctx.is_some_and(|c| c < floor)
+}
+
 /// `ff fleet route <workload> [--tool-calling] [--min-ctx N] [--exclude-host H]...`
 /// — CLI mirror of the `fleet_route` MCP tool. Read-only workload-aware routing:
 /// returns the best healthy deployment to send a `<workload>` request to, plus
@@ -3070,6 +3078,22 @@ async fn handle_fleet_route(
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| "-".into()),
             health,
+        );
+    }
+
+    // Agent-dispatch foot-gun guard: the default ranking can put a high-slot,
+    // low-per-slot-ctx endpoint on top — fine for one-shot `fleet_run` calls,
+    // but a tool-using agent's prompt won't fit. Warn only when the operator
+    // hasn't already pinned an agent-grade floor (`--min-ctx >= AGENT_MIN_CTX`),
+    // and only when the winner is actually below it. Read-only hint — the
+    // scorer and JSON output (the MCP-mirror contract) are untouched.
+    let agent_floor = ff_agent::model_runtime::AGENT_MIN_CTX as i32;
+    if route_warns_below_agent_floor(min_ctx, best.usable_agent_ctx, agent_floor) {
+        println!(
+            "{YELLOW}⚠ best candidate's per-slot ctx ({}) is below the agent floor ({agent_floor}) \
+             — ok for one-shot calls, but a tool-using agent may overflow. For agent dispatch: \
+             ff fleet route {workload} --tool-calling --min-ctx {agent_floor}{RESET}",
+            best.usable_agent_ctx.unwrap_or(0),
         );
     }
     Ok(())
@@ -3917,7 +3941,32 @@ mod version_target_tests {
 
 #[cfg(test)]
 mod route_tests {
-    use super::{normalize_route_limit, route_require_tool_calling};
+    use super::{normalize_route_limit, route_require_tool_calling, route_warns_below_agent_floor};
+
+    #[test]
+    fn warns_when_best_below_floor_and_no_pinned_min() {
+        // Default call, winner is an 8192-per-slot endpoint → warn.
+        assert!(route_warns_below_agent_floor(None, Some(8192), 32768));
+    }
+
+    #[test]
+    fn no_warn_when_operator_pinned_agent_floor() {
+        // `--min-ctx 32768` means the operator already controls the floor;
+        // anything returned satisfies it, so the hint is redundant noise.
+        assert!(!route_warns_below_agent_floor(
+            Some(32768),
+            Some(8192),
+            32768
+        ));
+    }
+
+    #[test]
+    fn no_warn_when_best_meets_floor_or_unknown() {
+        assert!(!route_warns_below_agent_floor(None, Some(32768), 32768));
+        assert!(!route_warns_below_agent_floor(None, Some(65536), 32768));
+        // Unknown per-slot ctx can't be judged → never warn.
+        assert!(!route_warns_below_agent_floor(None, None, 32768));
+    }
 
     #[test]
     fn explicit_flag_requires_tool_calling() {
