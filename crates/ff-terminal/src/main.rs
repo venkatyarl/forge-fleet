@@ -1314,6 +1314,44 @@ enum FleetCommand {
         #[arg(long, default_value_t = false)]
         live: bool,
     },
+    /// Workload-aware routing: given a workload tag (e.g. "code",
+    /// "embedding", "reranking", "reasoning", "chat", "tool_calling",
+    /// "vision"), show the best healthy deployment on the fleet to send
+    /// that kind of request to — plus runner-up candidates. CLI mirror of
+    /// the `fleet_route` MCP tool; uses the SAME scorer
+    /// (`ff_db::pg_route_deployments`) the agent-swarm router uses, so
+    /// there's no parallel scorer to drift. Read-only — does not dispatch.
+    ///
+    /// For AGENT dispatch pass `--tool-calling --min-ctx 32768` so you only
+    /// get tool-calling endpoints with enough per-slot context (never a
+    /// non-tool model like gemma).
+    ///
+    ///   ff fleet route code --tool-calling --min-ctx 32768 --exclude-host taylor
+    Route {
+        /// The workload tag to route. Common: "code", "chat", "embedding",
+        /// "reranking", "reasoning", "tool_calling", "vision". Matched
+        /// against fleet_model_catalog.preferred_workloads (synonym-tolerant).
+        workload: String,
+        /// Require a tool-calling model (fleet_model_catalog.tool_calling=true).
+        /// Use for agent dispatch. (workload="tool_calling" implies this.)
+        #[arg(long, default_value_t = false)]
+        tool_calling: bool,
+        /// Require this much usable per-slot context
+        /// (fleet_model_deployments.usable_agent_ctx), e.g. 32768 for an agent
+        /// so the tool-schema system prompt fits.
+        #[arg(long)]
+        min_ctx: Option<i32>,
+        /// Worker name(s) to exclude (case-insensitive, repeatable), e.g.
+        /// `--exclude-host taylor` to keep agent load off the leader.
+        #[arg(long = "exclude-host")]
+        exclude_host: Vec<String>,
+        /// Max candidates to show (default 3).
+        #[arg(long, default_value_t = 3)]
+        limit: i64,
+        /// Output format: text or json.
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
     /// Debug: dump local peer_map + what each member sees.
     Gossip,
     /// Migrate every fleet node to a new GitHub owner + move the repo from

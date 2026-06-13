@@ -2654,6 +2654,25 @@ pub async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
         FleetCommand::Gossip => {
             handle_fleet_gossip().await?;
         }
+        FleetCommand::Route {
+            workload,
+            tool_calling,
+            min_ctx,
+            exclude_host,
+            limit,
+            format,
+        } => {
+            handle_fleet_route(
+                &pool,
+                &workload,
+                tool_calling,
+                min_ctx,
+                exclude_host,
+                limit,
+                &format,
+            )
+            .await?;
+        }
         FleetCommand::MigrateGithub {
             new_owner,
             skip_local,
@@ -2874,6 +2893,184 @@ async fn handle_fleet_autoscaler(pool: &sqlx::PgPool, mode: &str) -> Result<()> 
                 "unknown autoscaler mode '{other}' — expected one of: off | dry-run | active | status"
             );
         }
+    }
+    Ok(())
+}
+
+/// Build the per-candidate JSON object — byte-identical to the shape the
+/// `fleet_route` MCP handler emits, so an agent gets the same structure from
+/// the CLI as from MCP (the whole point of a mirror verb).
+fn route_candidate_json(r: &ff_db::RouteCandidate) -> serde_json::Value {
+    serde_json::json!({
+        "worker_name": r.worker_name,
+        "endpoint": r.endpoint,
+        "catalog_id": r.catalog_id,
+        "catalog_name": r.catalog_name,
+        "family": r.family,
+        "tier": r.tier,
+        "tool_calling": r.tool_calling,
+        "context_window": r.context_window,
+        "usable_agent_ctx": r.usable_agent_ctx,
+        "parallel_slots": r.parallel_slots,
+        "health": r.health_status,
+        "health_age_sec": r.health_age_sec,
+        "host": {
+            "os_family": r.os_family,
+            "has_gpu": r.has_gpu,
+            "is_unified_memory": r.is_unified_memory,
+            "total_ram_gb": r.total_ram_gb,
+        }
+    })
+}
+
+/// Whether routing should require a tool-calling model. The explicit
+/// `--tool-calling` flag forces it; `workload="tool_calling"` ALSO implies it,
+/// so the tag-based call keeps working AND benefits from the real
+/// `fleet_model_catalog.tool_calling` column — identical rule to the
+/// `fleet_route` MCP handler (the mirror must not diverge here).
+fn route_require_tool_calling(workload: &str, flag: bool) -> bool {
+    flag || workload == "tool_calling"
+}
+
+/// Normalize the candidate limit to the scorer's contract: a non-positive
+/// value means "use the default" (3), matching the MCP handler.
+fn normalize_route_limit(limit: i64) -> i64 {
+    if limit <= 0 { 3 } else { limit }
+}
+
+/// `ff fleet route <workload> [--tool-calling] [--min-ctx N] [--exclude-host H]...`
+/// — CLI mirror of the `fleet_route` MCP tool. Read-only workload-aware routing:
+/// returns the best healthy deployment to send a `<workload>` request to, plus
+/// runner-ups, via the SAME scorer (`ff_db::pg_route_deployments`) the
+/// agent-swarm router uses — no parallel scorer to drift.
+async fn handle_fleet_route(
+    pool: &sqlx::PgPool,
+    workload: &str,
+    tool_calling: bool,
+    min_ctx: Option<i32>,
+    exclude_host: Vec<String>,
+    limit: i64,
+    format: &str,
+) -> Result<()> {
+    let require_tool_calling = route_require_tool_calling(workload, tool_calling);
+    let limit = normalize_route_limit(limit);
+
+    let filter = ff_db::RouteFilter {
+        workload: Some(workload.to_string()),
+        require_tool_calling,
+        min_ctx,
+        exclude_hosts: exclude_host.clone(),
+        limit,
+    };
+    let rows = ff_db::pg_route_deployments(pool, &filter)
+        .await
+        .map_err(|e| anyhow::anyhow!("fleet_route db: {e}"))?;
+
+    // Human-readable constraint summary, reused in the header and the
+    // no-match reason.
+    let mut constraints = Vec::new();
+    if require_tool_calling {
+        constraints.push("tool_calling=true".to_string());
+    }
+    if let Some(c) = min_ctx {
+        constraints.push(format!("usable_agent_ctx>={c}"));
+    }
+    if !exclude_host.is_empty() {
+        constraints.push(format!("excluding {exclude_host:?}"));
+    }
+
+    if rows.is_empty() {
+        let extra = if constraints.is_empty() {
+            String::new()
+        } else {
+            format!(" with {}", constraints.join(", "))
+        };
+        let reason = format!(
+            "no healthy deployment matches workload {workload:?}{extra}. \
+             Load an agent-capable model with: ff model load <library_id> --agent"
+        );
+        if format == "json" {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "workload": workload,
+                    "decision": null,
+                    "reason": reason,
+                    "candidates": [],
+                }))?
+            );
+        } else {
+            println!("{YELLOW}⚠ {reason}{RESET}");
+        }
+        return Ok(());
+    }
+
+    if format == "json" {
+        let candidates: Vec<serde_json::Value> = rows.iter().map(route_candidate_json).collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "workload": workload,
+                "decision": route_candidate_json(&rows[0]),
+                "candidates": candidates,
+            }))?
+        );
+        return Ok(());
+    }
+
+    // Text view: a one-line winner banner + a candidate table.
+    let constraint_tag = if constraints.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}]", constraints.join(", "))
+    };
+    println!(
+        "{GREEN}✓ fleet route{RESET} — workload {CYAN}{workload}{RESET}{constraint_tag} \
+         ({} candidate{})",
+        rows.len(),
+        if rows.len() == 1 { "" } else { "s" }
+    );
+
+    let best = &rows[0];
+    println!(
+        "{GREEN}→ best:{RESET} {CYAN}{}{RESET}  {}  {}  tier{}",
+        best.worker_name,
+        best.endpoint,
+        best.catalog_id.as_deref().unwrap_or("-"),
+        best.tier,
+    );
+
+    println!(
+        "  {:<10} {:<30} {:<22} {:<4} {:<5} {:<14} {:<6} {}",
+        "WORKER", "ENDPOINT", "MODEL", "TIER", "TOOLS", "CTX(use/win)", "SLOTS", "HEALTH"
+    );
+    for r in &rows {
+        let ctx = format!(
+            "{}/{}",
+            r.usable_agent_ctx
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "-".into()),
+            r.context_window
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "-".into()),
+        );
+        let health = match r.health_age_sec {
+            Some(age) => format!("{} {age}s ago", r.health_status),
+            None => r.health_status.clone(),
+        };
+        println!(
+            "  {:<10} {:<30} {:<22} {:<4} {:<5} {:<14} {:<6} {}",
+            r.worker_name,
+            r.endpoint,
+            r.catalog_id.as_deref().unwrap_or("-"),
+            r.tier,
+            if r.tool_calling { "yes" } else { "no" },
+            ctx,
+            r.parallel_slots
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "-".into()),
+            health,
+        );
     }
     Ok(())
 }
@@ -3715,5 +3912,32 @@ mod version_target_tests {
     fn none_when_neither_known() {
         assert_eq!(pick_version_target(None, None), None);
         assert_eq!(pick_version_target(Some(""), Some("-")), None);
+    }
+}
+
+#[cfg(test)]
+mod route_tests {
+    use super::{normalize_route_limit, route_require_tool_calling};
+
+    #[test]
+    fn explicit_flag_requires_tool_calling() {
+        assert!(route_require_tool_calling("code", true));
+        assert!(!route_require_tool_calling("code", false));
+    }
+
+    #[test]
+    fn tool_calling_workload_implies_requirement() {
+        // The subtle mirror rule: routing workload="tool_calling" must require
+        // a tool-calling model even without the flag, exactly like the MCP tool.
+        assert!(route_require_tool_calling("tool_calling", false));
+        assert!(route_require_tool_calling("tool_calling", true));
+    }
+
+    #[test]
+    fn limit_normalizes_nonpositive_to_default() {
+        assert_eq!(normalize_route_limit(0), 3);
+        assert_eq!(normalize_route_limit(-5), 3);
+        assert_eq!(normalize_route_limit(1), 1);
+        assert_eq!(normalize_route_limit(10), 10);
     }
 }
