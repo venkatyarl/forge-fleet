@@ -866,6 +866,50 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         }));
     }
 
+    // 20e) Leaked-orphan reaper tick — every 1h, per-node (idempotent).
+    //
+    // Before PR #215, the task runner SIGKILLed only the direct child shell on
+    // timeout; every grandchild (ssh / git / rsync) it had spawned reparented
+    // to pid 1 and ran forever (sophie carried 430 such orphans 2026-06-13,
+    // saturating the host so every task it claimed wedged). #215 stops NEW
+    // local leaks via a process-group kill, but cannot retroactively reap the
+    // orphans already accumulated fleet-wide, nor orphans still produced by
+    // hosts not yet on #215, nor a grandchild that `setsid`s out of the group.
+    // This SIGKILLs any process that is (1) PPID==1, (2) an allow-listed
+    // task-runner spawn (rsync / git-fetch), AND (3) older than
+    // FORGEFLEET_ORPHAN_REAP_SECS (default 7200s). The triple gate makes a
+    // false positive essentially impossible — a live tool has a live parent
+    // (PPID≠1) and the allow-list excludes every daemon/model server that
+    // legitimately reparents to init. Filesystem/`ps`-only, no DB, no leader
+    // gate — like the disk sampler. Set FORGEFLEET_ORPHAN_REAP_SECS=0 to
+    // disable.
+    if let Some(min_age) = ff_agent::orphan_reaper::min_age_secs() {
+        info!(
+            min_age_secs = min_age,
+            "starting subsystem: leaked-orphan reaper tick (1h, per-node)"
+        );
+        let mut shutdown_rx_orphan = shutdown_rx.clone();
+        subsystem_tasks.push(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = shutdown_rx_orphan.changed() => break,
+                    _ = tick.tick() => {
+                        match ff_agent::orphan_reaper::reap_once(min_age) {
+                            0 => {}
+                            n => warn!(
+                                reaped = n,
+                                min_age_secs = min_age,
+                                "reaped leaked orphan processes (pre-#215 task-runner grandchildren)"
+                            ),
+                        }
+                    }
+                }
+            }
+        }));
+    }
+
     // 21) Disk-reconcile tick — every 5min, leader-gated.
     //
     // V118 active disk management: reads `fleet_disk_usage`, finds over-quota
