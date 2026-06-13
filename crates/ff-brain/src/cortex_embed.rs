@@ -56,14 +56,17 @@ fn embed_text(node_type: &str, title: &str, tags: &[String]) -> String {
     }
 }
 
-/// Count Cortex nodes still missing an embedding.
-async fn remaining_unembedded(pool: &PgPool) -> Result<i64, String> {
+/// Count Cortex nodes still missing an embedding. When `corpus` is `Some`, only
+/// nodes whose `project` matches that corpus slug are counted (NULL = fleet-wide).
+async fn remaining_unembedded(pool: &PgPool, corpus: Option<&str>) -> Result<i64, String> {
     let n: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM brain_vault_nodes
           WHERE valid_until IS NULL AND embedding IS NULL
             AND (node_type LIKE 'code:%' OR node_type LIKE 'doc:%'
-              OR node_type LIKE 'data:%' OR node_type LIKE 'image:%')",
+              OR node_type LIKE 'data:%' OR node_type LIKE 'image:%')
+            AND ($1::text IS NULL OR project = $1)",
     )
+    .bind(corpus)
     .fetch_one(pool)
     .await
     .map_err(|e| format!("count unembedded: {e}"))?;
@@ -77,9 +80,15 @@ async fn remaining_unembedded(pool: &PgPool) -> Result<i64, String> {
 /// so the CLI can render a live counter. Returns once no unembedded Cortex
 /// nodes remain (or the cap is hit). Aborts immediately if the fleet has no
 /// healthy embedding endpoint — by design, to avoid persisting hash-stub noise.
+///
+/// `corpus` scopes the pass to a single corpus slug (the `project` column). The
+/// fleet-wide pass embeds by `updated_at` order, so a freshly-reindexed corpus
+/// (newest rows) is embedded LAST — passing its slug here lets an agent embed
+/// the repo it's working in first, instead of waiting behind every other corpus.
 pub async fn embed_cortex_nodes<F>(
     pool: &PgPool,
     max: Option<usize>,
+    corpus: Option<&str>,
     mut progress: F,
 ) -> Result<EmbedStats, String>
 where
@@ -108,10 +117,12 @@ where
               WHERE valid_until IS NULL AND embedding IS NULL
                 AND (node_type LIKE 'code:%' OR node_type LIKE 'doc:%'
                   OR node_type LIKE 'data:%' OR node_type LIKE 'image:%')
+                AND ($2::text IS NULL OR project = $2)
               ORDER BY updated_at
               LIMIT $1",
         )
         .bind(EMBED_BATCH as i64)
+        .bind(corpus)
         .fetch_all(pool)
         .await
         .map_err(|e| format!("fetch unembedded batch: {e}"))?;
@@ -177,10 +188,42 @@ where
             }
         }
 
-        let remaining = remaining_unembedded(pool).await.unwrap_or(-1);
+        let remaining = remaining_unembedded(pool, corpus).await.unwrap_or(-1);
         progress(stats.embedded, remaining);
     }
 
-    stats.remaining = remaining_unembedded(pool).await.unwrap_or(-1);
+    stats.remaining = remaining_unembedded(pool, corpus).await.unwrap_or(-1);
     Ok(stats)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::embed_text;
+
+    #[test]
+    fn embed_text_without_tags_is_kind_plus_title() {
+        // Leaf kind only (after the last ':'), then the fully-qualified title.
+        let t = embed_text("code:function", "ff_pulse::heartbeat::start", &[]);
+        assert_eq!(t, "function ff_pulse::heartbeat::start");
+    }
+
+    #[test]
+    fn embed_text_with_tags_appends_bracketed_list() {
+        let t = embed_text(
+            "code:function",
+            "ff_db::pg_reprofile_candidates",
+            &["agent".to_string(), "tool_calling".to_string()],
+        );
+        assert_eq!(
+            t,
+            "function ff_db::pg_reprofile_candidates [agent, tool_calling]"
+        );
+    }
+
+    #[test]
+    fn embed_text_unprefixed_node_type_kept_whole() {
+        // A node_type with no ':' falls back to itself as the kind.
+        let t = embed_text("doc", "Cortex roadmap", &[]);
+        assert_eq!(t, "doc Cortex roadmap");
+    }
 }

@@ -120,6 +120,11 @@ pub enum TopCortexCommand {
         /// Cap nodes processed this run (default: all unembedded).
         #[arg(long)]
         max: Option<usize>,
+        /// Embed only this corpus slug first. The fleet-wide pass embeds by
+        /// `updated_at`, so a freshly-reindexed repo is embedded LAST — scope to
+        /// its slug to make `ff cortex find --semantic` work on it immediately.
+        #[arg(long)]
+        corpus: Option<String>,
         /// Skip the community-detection pass after embedding.
         #[arg(long)]
         no_community: bool,
@@ -288,8 +293,12 @@ pub async fn handle_top_cortex(args: TopCortexArgs) -> Result<()> {
             let (root, slug) = resolve_root_slug(path, slug)?;
             run_index(&pool, &root, &slug, lang, true, incremental).await?;
         }
-        TopCortexCommand::Embed { max, no_community } => {
-            run_embed(&pool, max, no_community).await?;
+        TopCortexCommand::Embed {
+            max,
+            corpus,
+            no_community,
+        } => {
+            run_embed(&pool, max, corpus, no_community).await?;
         }
         TopCortexCommand::Summarize {
             all,
@@ -958,21 +967,30 @@ async fn run_index(
 
 /// `ff cortex embed`: fill the `embedding` column on every Cortex node via the
 /// fleet's bge-m3 endpoint, then (unless suppressed) run community detection.
-async fn run_embed(pool: &sqlx::PgPool, max: Option<usize>, no_community: bool) -> Result<()> {
-    println!("{CYAN}▶ Embedding Cortex nodes (code/doc/data/image)...{RESET}");
-    let stats = ff_brain::embed_cortex_nodes(pool, max, |embedded, remaining| {
-        // Live counter overwritten in place; remaining < 0 means the count
-        // query failed (non-fatal) — show a dash rather than a bogus number.
-        let rem = if remaining < 0 {
-            "?".to_string()
-        } else {
-            remaining.to_string()
-        };
-        print!("\r  embedded {embedded}  ·  remaining {rem}   ");
-        let _ = std::io::Write::flush(&mut std::io::stdout());
-    })
-    .await
-    .map_err(|e| anyhow!("embed Cortex nodes: {e}"))?;
+async fn run_embed(
+    pool: &sqlx::PgPool,
+    max: Option<usize>,
+    corpus: Option<String>,
+    no_community: bool,
+) -> Result<()> {
+    match &corpus {
+        Some(c) => println!("{CYAN}▶ Embedding Cortex nodes for corpus '{c}'...{RESET}"),
+        None => println!("{CYAN}▶ Embedding Cortex nodes (code/doc/data/image)...{RESET}"),
+    }
+    let stats =
+        ff_brain::embed_cortex_nodes(pool, max, corpus.as_deref(), |embedded, remaining| {
+            // Live counter overwritten in place; remaining < 0 means the count
+            // query failed (non-fatal) — show a dash rather than a bogus number.
+            let rem = if remaining < 0 {
+                "?".to_string()
+            } else {
+                remaining.to_string()
+            };
+            print!("\r  embedded {embedded}  ·  remaining {rem}   ");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        })
+        .await
+        .map_err(|e| anyhow!("embed Cortex nodes: {e}"))?;
 
     println!(
         "\r{GREEN}✓{RESET} embedded {} node(s){}; {} still unembedded   ",
@@ -986,6 +1004,17 @@ async fn run_embed(pool: &sqlx::PgPool, max: Option<usize>, no_community: bool) 
     );
 
     if no_community {
+        return Ok(());
+    }
+    // Community detection is a fleet-wide graph pass, not corpus-scoped — running
+    // it after a single-corpus embed would do global work the caller didn't ask
+    // for (and the graph is only partly embedded). Skip it; the fleet-wide
+    // `ff cortex embed` (or `ff cortex summarize`) refreshes communities.
+    if corpus.is_some() {
+        println!(
+            "{YELLOW}⏭  skipping community detection (corpus-scoped embed) — \
+             run `ff cortex embed` fleet-wide to refresh communities{RESET}"
+        );
         return Ok(());
     }
 
