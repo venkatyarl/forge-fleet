@@ -31,6 +31,31 @@ const EMBED_BATCH: usize = 64;
 /// embedded by their own ingestion path and are left alone here.
 const CORTEX_PREFIXES: &[&str] = &["code:", "doc:", "data:", "image:"];
 
+/// Bail on the embedding pass after this many CONSECUTIVE batch failures —
+/// enough to ride out a transient blip (a re-routed endpoint, a brief model
+/// eviction) but not so many that a genuinely-down endpoint spins for long.
+const MAX_CONSECUTIVE_BATCH_FAILURES: u32 = 5;
+
+/// Seconds to wait before retrying after the Nth consecutive batch failure:
+/// linear `2·n` so a one-off blip pauses briefly while a persistent outage
+/// still trips the bail threshold quickly (2+4+6+8 = 20s across 4 retries).
+/// Pure for unit testing.
+fn batch_retry_backoff_secs(consecutive_failures: u32) -> u64 {
+    2 * consecutive_failures as u64
+}
+
+/// Push a node that failed to embed to the back of the `ORDER BY updated_at`
+/// queue (without setting an embedding) so the batch scan advances past it
+/// instead of re-fetching the same failing row at the front forever. The node
+/// stays NULL, so a later `ff cortex embed` re-run still retries it. Best-effort
+/// — a failure to bump is non-fatal (worst case the row is retried this run).
+async fn defer_failed_node(pool: &PgPool, id: &uuid::Uuid) {
+    let _ = sqlx::query("UPDATE brain_vault_nodes SET updated_at = NOW() WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await;
+}
+
 /// Outcome of an embedding pass.
 #[derive(Debug, Default, Clone)]
 pub struct EmbedStats {
@@ -101,8 +126,26 @@ where
     })?;
 
     let mut stats = EmbedStats::default();
+    // A transient endpoint blip (network hiccup, a brief model eviction, one
+    // 500 on an oversized batch) used to abort the WHOLE pass on the first
+    // error — on a 50k-node run that abandoned every node after the blip. We
+    // now retry the same batch with backoff and only bail once the endpoint is
+    // persistently down (this many consecutive failures).
+    let mut consecutive_failures: u32 = 0;
+
+    // Upper bound on nodes we'll attempt this run. Each NULL node is either
+    // embedded (drops out of the fetch) or counted failed + deferred to the
+    // back of the queue — but a node the endpoint permanently rejects (e.g.
+    // text too long) stays NULL forever, so without this cap the deferred set
+    // would be re-fetched endlessly once it's all that remains. Attempting at
+    // most `initial_remaining` nodes guarantees termination; a re-run retries
+    // the deferred failures.
+    let initial_remaining = remaining_unembedded(pool, corpus).await.unwrap_or(i64::MAX);
 
     loop {
+        if stats.embedded + stats.failed >= initial_remaining as usize {
+            break;
+        }
         if let Some(cap) = max {
             if stats.embedded + stats.failed >= cap {
                 break;
@@ -147,28 +190,58 @@ where
         let vectors = match client.embed_batch(&text_refs).await {
             Ok(v) if v.len() == ids.len() => v,
             Ok(v) => {
-                // Length mismatch — count the batch as failed and continue so a
-                // single bad batch can't wedge the whole pass.
+                // Length mismatch — a malformed response, treated like a batch
+                // failure: retry with backoff (don't advance), bail if it
+                // persists. The earlier `continue` here re-fetched the SAME rows
+                // forever on a persistently-bad batch (latent wedge).
                 tracing::warn!(
                     expected = ids.len(),
                     got = v.len(),
-                    "embedding batch length mismatch; skipping batch"
+                    "embedding batch length mismatch"
                 );
-                stats.failed += ids.len();
+                consecutive_failures += 1;
+                if consecutive_failures >= MAX_CONSECUTIVE_BATCH_FAILURES {
+                    stats.failed += ids.len();
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(batch_retry_backoff_secs(
+                    consecutive_failures,
+                )))
+                .await;
                 continue;
             }
             Err(e) => {
-                tracing::warn!("embedding batch failed: {e}");
-                stats.failed += ids.len();
-                // A persistent endpoint failure would loop forever re-fetching
-                // the same rows; bail out so the caller sees partial progress.
-                break;
+                tracing::warn!(
+                    attempt = consecutive_failures + 1,
+                    "embedding batch failed: {e}"
+                );
+                consecutive_failures += 1;
+                if consecutive_failures >= MAX_CONSECUTIVE_BATCH_FAILURES {
+                    // Persistently down — bail so the caller sees partial
+                    // progress (re-run resumes; only NULL nodes are touched).
+                    stats.failed += ids.len();
+                    break;
+                }
+                // Transient: back off and retry the SAME rows rather than
+                // abandoning the rest of the pass.
+                tokio::time::sleep(std::time::Duration::from_secs(batch_retry_backoff_secs(
+                    consecutive_failures,
+                )))
+                .await;
+                continue;
             }
         };
+        // The endpoint answered a full batch — reset the transient-failure run.
+        consecutive_failures = 0;
 
         for (id, vec) in ids.iter().zip(vectors.iter()) {
             if vec.is_empty() {
                 stats.failed += 1;
+                // The endpoint returned no vector for this node (e.g. text too
+                // long). Push it to the back of the queue so the `ORDER BY
+                // updated_at` scan advances instead of re-fetching it at the
+                // front forever; it stays NULL, so a later re-run still retries.
+                defer_failed_node(pool, id).await;
                 continue;
             }
             let pgvec = embedding_to_pgvector(vec);
@@ -184,6 +257,7 @@ where
                 Err(e) => {
                     tracing::warn!(node = %id, "store embedding failed: {e}");
                     stats.failed += 1;
+                    defer_failed_node(pool, id).await;
                 }
             }
         }
@@ -225,5 +299,18 @@ mod tests {
         // A node_type with no ':' falls back to itself as the kind.
         let t = embed_text("doc", "Cortex roadmap", &[]);
         assert_eq!(t, "doc Cortex roadmap");
+    }
+
+    #[test]
+    fn batch_retry_backoff_grows_then_caps_at_bail() {
+        use super::{MAX_CONSECUTIVE_BATCH_FAILURES, batch_retry_backoff_secs};
+        // Linear growth across retries, no wait before the first attempt.
+        assert_eq!(batch_retry_backoff_secs(0), 0);
+        assert_eq!(batch_retry_backoff_secs(1), 2);
+        assert_eq!(batch_retry_backoff_secs(4), 8);
+        // We only ever sleep for failures 1..MAX-1 (MAX bails), so the longest
+        // backoff actually used is for the (MAX-1)th failure — bounded + small.
+        let last_used = batch_retry_backoff_secs(MAX_CONSECUTIVE_BATCH_FAILURES - 1);
+        assert!(last_used <= 30, "backoff must stay small: {last_used}s");
     }
 }
