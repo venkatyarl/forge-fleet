@@ -2097,6 +2097,11 @@ pub async fn handle_fleet_health(pool: &sqlx::PgPool, json: bool) -> Result<()> 
         });
     }
 
+    // Sort by primary IP, numerically by octet (fleet-table convention — the
+    // operator reads the fleet by subnet layout, not alphabet). Applies to both
+    // the JSON and text paths so they share one stable order.
+    out.sort_by_key(|h| crate::helpers::ip_sort_key(&h.ip));
+
     if json {
         let arr: Vec<_> = out
             .iter()
