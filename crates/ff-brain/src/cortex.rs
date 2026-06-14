@@ -3707,7 +3707,7 @@ fn resolve_call_inner(
     // item in the same scope (Rust rejects it), so alias-first is unambiguous.
     if !raw.contains("::") {
         if let Some(full) = alias_map.get(raw) {
-            return full.clone();
+            return resolve_alias_target(full, &caller_module);
         }
         return join(&caller_module, raw);
     }
@@ -3729,7 +3729,7 @@ fn resolve_call_inner(
         // alias::rest -> expand the alias to its full module path.
         other => {
             if let Some(full) = alias_map.get(other) {
-                join(full, &rest)
+                join(&resolve_alias_target(full, &caller_module), &rest)
             } else {
                 // Could be a sibling submodule of the caller's module, or an
                 // already-qualified external/std path. Heuristic: if the head
@@ -3781,6 +3781,24 @@ fn resolve_glob_call(
         }
     }
     None
+}
+
+/// Resolve a `use`-alias target that may carry an unresolved relative prefix
+/// (`use super::truncate_output;` → alias `truncate_output` → stored target
+/// `super::truncate_output`). Only `crate::` is rewritten to an absolute path at
+/// collection time (`norm_crate`); `super::`/`self::` are kept verbatim because
+/// their meaning depends on the scope of the `use`, which we don't track at parse
+/// time. We resolve them HERE, relative to the caller's module — correct for both
+/// a top-of-file `use super::X` (the caller fn lives in the same module as the
+/// `use`) and a `mod tests { use super::X; }` (the test fn's module's `super` is
+/// the file module), because in Rust the call and its governing `use` always share
+/// a module scope. Without this, every symbol imported via `use super::`/`use
+/// self::` resolved to a literal `super::X` `code:extern` instead of its real
+/// module path — 23 such phantoms on forge-fleet (`super::truncate_output`
+/// fanin=30, `super::AgentToolResult::ok/err` fanin=57/52). Falls back to the
+/// target unchanged if it isn't relative or if `super` walks above the crate root.
+fn resolve_alias_target(target: &str, caller_module: &str) -> String {
+    resolve_glob_prefix(target, caller_module).unwrap_or_else(|| target.to_string())
 }
 
 /// Resolve a glob-import module prefix to an absolute module path. `super`/`self`
@@ -4380,6 +4398,60 @@ diff --git a/src/b.rs b/src/b.rs
             &fp,
         );
         assert_eq!(got, "ff_agent::compaction::should_compact");
+    }
+
+    #[test]
+    fn use_super_alias_resolves_relative_to_caller_module() {
+        // `crates/ff-agent/src/tools/bash.rs` (module ff_agent::tools::bash) does
+        // `use super::{AgentToolResult, truncate_output};`. `super` is the parent
+        // module (ff_agent::tools). The alias map stores the targets verbatim
+        // (`super::truncate_output`) because only `crate::` is normalized at parse
+        // time, so without relative resolution the bare call landed on a literal
+        // `super::truncate_output` extern. It must resolve to ff_agent::tools::*.
+        let fp = fp_with(
+            "ff_agent::tools::bash",
+            "ff_agent",
+            &[
+                ("truncate_output", "super::truncate_output"),
+                ("AgentToolResult", "super::AgentToolResult"),
+            ],
+        );
+        // Bare imported fn.
+        assert_eq!(
+            resolve_call("truncate_output", "ff_agent::tools::bash::execute", &fp),
+            "ff_agent::tools::truncate_output"
+        );
+        // Scoped associated call through the imported type alias.
+        assert_eq!(
+            resolve_call(
+                "AgentToolResult::err",
+                "ff_agent::tools::bash::execute",
+                &fp
+            ),
+            "ff_agent::tools::AgentToolResult::err"
+        );
+    }
+
+    #[test]
+    fn use_super_alias_in_test_mod_resolves_to_file_module() {
+        // `mod think_strip_tests { use super::strip_think_blocks; }` in research.rs
+        // (file module ff_agent::research). The test fn's module is
+        // ff_agent::research::think_strip_tests, whose `super` is ff_agent::research
+        // — resolving the alias relative to the CALLER module gets this right even
+        // though the same alias text (`super::…`) means a different parent here.
+        let fp = fp_with(
+            "ff_agent::research::think_strip_tests",
+            "ff_agent",
+            &[("strip_think_blocks", "super::strip_think_blocks")],
+        );
+        assert_eq!(
+            resolve_call(
+                "strip_think_blocks",
+                "ff_agent::research::think_strip_tests::strips_single_block",
+                &fp
+            ),
+            "ff_agent::research::strip_think_blocks"
+        );
     }
 
     #[test]
