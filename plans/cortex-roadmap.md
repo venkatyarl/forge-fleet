@@ -91,16 +91,40 @@ Live forge-fleet baseline: 30.6% of `calls` edges resolve internally
    `<P>::<leaf>` a known internal fn (gated by a new `internal_types` set). Never
    fabricates. Verified live: internal call recall **30.7% → 36.2%**, the
    `AgentToolResult::ok`/`err` phantoms (fan-in 58 + 53) absorbed into the real
-   methods. **Follow-up (lever #2b):** the residual `X::new` misses are now all in
-   `mod tests` blocks that pull the type in via `use super::*` — the type segment
-   gets the test module glued on (`…::tests::NodeRegistry::new`), so it isn't a
-   known type and the redirect can't fire. Fix = resolve the type segment through
-   the file's glob imports (same mechanism as `resolve_glob_call`) before the
-   method redirect. Small, contained, next-iteration sized.
+   methods.
+2b. **Glob-imported type segment in test modules** ✅ FIXED (PR #280,
+   `resolve_glob_impl_method_call`) — the residual `X::new` misses were all in
+   `mod tests { use super::*; }` blocks: the type segment got the test module glued
+   on (`…::tests::NodeRegistry::new`), so #278's direct redirect couldn't fire.
+   Re-anchor the type segment through the file's glob imports (same mechanism as
+   `resolve_glob_call`) before the method redirect, gated to the
+   `<caller_module>::Type::leaf` shape the resolver itself fabricated. Verified live
+   (full reindex): internal call recall **36.2% → 40.6%**.
+2c. **Std-prelude TRAIT heads** ✅ FIXED (PR #281, `is_std_prelude_trait`) — sibling
+   to lever #1 but for traits used in associated-call position
+   (`Default::default`, `From::from`, `FromStr::from_str`). The uppercase trait head
+   was fabricating `<caller_module>::Default::default`, whose leaf collided with
+   every internal `default`/`from`. Denylist them at the same fallback site as the
+   std types. Verified live: `…::tests::Default::default` phantoms gone, extern
+   placeholders **2798 → 2718**.
 3. **Re-export / facade paths** (`ff_db::run_migrations` →
    `ff_db::migrations::run_migrations`). `pub use` re-exports aren't modeled, so
    calls via the facade path become externs. Hardest (cross-crate pub-use
    resolution); medium payoff.
+4. **3rd-party crate heads written bare** (`toml::from_str` →
+   `<caller_module>::toml::from_str`, fan-in 13+9). Same caller-module fabrication
+   as levers #1/#2c, but the head is an arbitrary lowercase 3rd-party crate (`toml`,
+   `serde_yaml`, …), not enumerable like std types/traits. `looks_external` only
+   lists a fixed set. Better fix than growing that list by hand: treat a bare head
+   that is NEITHER a known internal module root NOR `crate`/`self`/`super` as
+   already-qualified external (the inverse of the current "assume same-module"
+   default) — needs the corpus's own module-root set threaded into `resolve_call`.
+   Low payoff (pure noise, these are genuinely external), but removes the last big
+   `tests::` cluster. Surfaced by the iter-70 doctor run.
+5. **Bare `new`/method in test-local structs** (`ff_pipeline::executor::tests::new`,
+   fan-in 6). A `Foo::new()` where `Foo` is defined *inside* the test module itself
+   (not imported via `use super::*`) — the type segment is dropped/mis-attributed.
+   Lowest priority (small, test-only).
 
 ## Related state
 
