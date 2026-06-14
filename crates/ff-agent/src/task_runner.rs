@@ -1924,12 +1924,13 @@ pub async fn compose_fleet_upgrade_wave(
         let restart_command = format!(
             "set -e\n\
              echo \"== restarting forgefleetd on {target} ({os}) via ssh from $(hostname) ==\"\n\
-             ssh -T{port_arg} -o BatchMode=yes -o ServerAliveInterval=15 \
+             ssh -T{port_arg} {ssh_bypass} -o ServerAliveInterval=15 \
                  -o ServerAliveCountMax=20 -o StrictHostKeyChecking=accept-new \
                  {ssh_user}@{primary_ip} bash -l -c '{inner}'\n",
             target = t.target_name,
             os = t.os_family,
             port_arg = port_arg,
+            ssh_bypass = SSH_AGENT_BYPASS,
             ssh_user = t.ssh_user,
             primary_ip = t.primary_ip,
             inner = inner_restart.replace('\'', "'\\''"),
@@ -2098,6 +2099,19 @@ fn build_wave_playbook_body(playbook_command: &str, daemon_self: bool) -> String
 /// the lighter restart ssh uses 20.
 const WAVE_BUILD_SSH_ALIVE_COUNT_MAX: u32 = 8;
 
+/// HA.2 (2026-06-14): the wave SSH runs from a daemon-spawned worker, so it
+/// inherits forgefleetd's `SSH_AUTH_SOCK`. On headless Ubuntu peers (sophie,
+/// priya) that points at a *locked* gnome-keyring ssh agent whose socket
+/// accepts the connection but blocks forever on the sign request — ssh hangs
+/// at auth, `ConnectTimeout` only covers the TCP connect, and the task sits
+/// `running` until the 10-min cap. Observed live: priya's `restart on sophie`
+/// wave task hung 53 min, jamming the auto-upgrade singleton so NO host could
+/// upgrade — the same wedged agent #304 fixed for backup rsync, here strangling
+/// the very pipeline that ships fixes. `IdentityAgent=none` makes ssh ignore
+/// the inherited socket and use the on-disk key; `BatchMode=yes` keeps it
+/// non-interactive. Mirrors `backup_rsync_script`'s fix.
+const SSH_AGENT_BYPASS: &str = "-o IdentityAgent=none -o BatchMode=yes";
+
 /// Build the OUTER ssh command the wave runs on a peer to drive `target`'s
 /// build: `ssh -T … target bash -l <<EOF <playbook> EOF`. Pure (no I/O) so the
 /// keepalive/timeout flags and heredoc framing are unit-testable.
@@ -2111,7 +2125,7 @@ fn wave_build_ssh_command(
     format!(
         "set -e\n\
          echo \"== upgrading {target} via ssh from $(hostname) ==\"\n\
-         ssh -T{port_arg} -o BatchMode=yes -o ServerAliveInterval=15 \
+         ssh -T{port_arg} {ssh_bypass} -o ServerAliveInterval=15 \
              -o ServerAliveCountMax={count_max} -o ConnectTimeout=30 \
              -o StrictHostKeyChecking=accept-new \
              {ssh_user}@{primary_ip} bash -l <<'FF_PLAYBOOK_EOF'\n\
@@ -2119,6 +2133,7 @@ fn wave_build_ssh_command(
          FF_PLAYBOOK_EOF\n",
         target = target_name,
         port_arg = port_arg,
+        ssh_bypass = SSH_AGENT_BYPASS,
         count_max = WAVE_BUILD_SSH_ALIVE_COUNT_MAX,
         ssh_user = ssh_user,
         primary_ip = primary_ip,
@@ -2233,7 +2248,12 @@ mod wave_playbook_tests {
         // Bounded TCP connect + non-interactive + the playbook body framed in
         // the quoted heredoc the remote login shell reads.
         assert!(cmd.contains("-o ConnectTimeout=30"));
-        assert!(cmd.contains("ssh -T -p 2222 -o BatchMode=yes"));
+        assert!(cmd.contains("ssh -T -p 2222 -o IdentityAgent=none -o BatchMode=yes"));
+        // HA.2: ignore the inherited (possibly wedged) keyring agent + stay
+        // non-interactive, else the wave hangs at auth on sophie/priya and
+        // jams the whole upgrade singleton.
+        assert!(cmd.contains("-o IdentityAgent=none"));
+        assert!(cmd.contains("-o BatchMode=yes"));
         assert!(cmd.contains("duncan@192.168.5.114 bash -l <<'FF_PLAYBOOK_EOF'"));
         assert!(cmd.contains("\nmkdir -p x\nexit $__build_rc\n"));
         assert!(cmd.trim_end().ends_with("FF_PLAYBOOK_EOF"));
