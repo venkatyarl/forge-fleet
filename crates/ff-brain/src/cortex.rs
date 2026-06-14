@@ -2501,6 +2501,21 @@ fn walk(
     }
 }
 
+/// Bare Rust prelude variant constructors that are NOT useful call-graph edges.
+/// `Ok(x)`, `Err(e)`, `Some(v)`, `None` parse as `call_expression`s whose function
+/// is a bare `identifier`, so the resolver fabricates a `<caller_module>::Ok`
+/// `code:extern` and hangs a `calls` edge on it. These prelude constructors appear
+/// in essentially every Rust fn (every `Result`/`Option` return), so they tell you
+/// nothing structural while polluting the extern set (~19% of forge-fleet's externs
+/// were one of these) and inflating fan-in noise — `ff cortex find Ok` returned a
+/// phantom `ff_db::queries::Ok` as its top hit. They can never resolve to an
+/// internal symbol, so dropping them at collection is lossless for the real graph.
+/// Scoped forms (`Result::Ok`, `Option::Some`) are left alone — they're rare and
+/// already resolve as externs under their real type path, not the caller's module.
+fn is_rust_prelude_ctor(raw: &str) -> bool {
+    matches!(raw, "Ok" | "Err" | "Some" | "None")
+}
+
 /// Collect call sites in a function body (call_expression with a path/identifier
 /// function). We record the raw path text + byte offset for later attribution.
 fn collect_calls(node: &Node, bytes: &[u8], fp: &mut FileParse) {
@@ -2509,10 +2524,12 @@ fn collect_calls(node: &Node, bytes: &[u8], fp: &mut FileParse) {
         if child.kind() == "call_expression" {
             if let Some(func) = child.child_by_field_name("function") {
                 if let Some(raw) = call_target_path(&func, bytes) {
-                    fp.calls.push(CallSite {
-                        raw_path: raw,
-                        at: child.start_byte(),
-                    });
+                    if !is_rust_prelude_ctor(&raw) {
+                        fp.calls.push(CallSite {
+                            raw_path: raw,
+                            at: child.start_byte(),
+                        });
+                    }
                 }
             }
         }
@@ -2533,10 +2550,12 @@ fn collect_calls(node: &Node, bytes: &[u8], fp: &mut FileParse) {
                 let is_method = child.prev_sibling().map(|p| p.kind()) == Some(".");
                 if is_paren_tt && !is_method {
                     if let Some(raw) = call_target_path(&child, bytes) {
-                        fp.calls.push(CallSite {
-                            raw_path: raw,
-                            at: child.start_byte(),
-                        });
+                        if !is_rust_prelude_ctor(&raw) {
+                            fp.calls.push(CallSite {
+                                raw_path: raw,
+                                at: child.start_byte(),
+                            });
+                        }
                     }
                 }
             }
@@ -4616,6 +4635,41 @@ fn covers_target() {
         assert!(
             !raws.contains(&"meth"),
             "method call wrongly recorded: {raws:?}"
+        );
+    }
+
+    #[test]
+    fn parse_drops_prelude_variant_constructors() {
+        // `Ok`/`Err`/`Some`/`None` parse as bare-identifier call_expressions and
+        // used to be fabricated into a phantom `<caller_module>::Ok` extern with a
+        // `calls` edge — ~19% of forge-fleet's externs and the top hit of
+        // `ff cortex find Ok`. They appear in nearly every fn and never resolve to
+        // an internal symbol, so they are dropped at collection. Real calls in the
+        // same body (including inside macro bodies) must still be recorded.
+        let src = r#"
+fn helper(x: u32) -> u32 { x }
+fn run() -> Result<u32, String> {
+    let v = helper(1);
+    if v == 0 {
+        return Err("zero".into());
+    }
+    let _ = Some(v);
+    assert_eq!(helper(2), 2);
+    Ok(v)
+}
+"#;
+        let fp = parse_rust_file("/x/crates/demo/src/lib.rs", src).unwrap();
+        let raws: Vec<&str> = fp.calls.iter().map(|c| c.raw_path.as_str()).collect();
+        for ctor in ["Ok", "Err", "Some", "None"] {
+            assert!(
+                !raws.contains(&ctor),
+                "prelude constructor {ctor} leaked as a call: {raws:?}"
+            );
+        }
+        // Real calls — bare and macro-body — are still captured.
+        assert!(
+            raws.iter().filter(|r| **r == "helper").count() >= 2,
+            "real call to helper missing (bare + macro-body): {raws:?}"
         );
     }
 
