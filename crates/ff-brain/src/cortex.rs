@@ -2935,9 +2935,18 @@ fn collect_calls(node: &Node, bytes: &[u8], fp: &mut FileParse) {
                 }
             }
         }
-        // Recurse — calls can be nested arbitrarily, but NOT into nested
-        // function_items (those are separate symbols handled by walk()).
-        if child.kind() != "function_item" {
+        // Recurse — calls can be nested arbitrarily, but NOT into:
+        //  - nested function_items (separate symbols handled by walk()), or
+        //  - attribute items. Attribute arguments parse as `identifier (token_tree)`
+        //    — the same shape the macro-body recovery above keys on — so
+        //    `#[derive(Debug)]`, `#[cfg(test)]`, `#[serde(rename = "x")]`,
+        //    `#[arg(long)]` etc. would be recorded as phantom calls
+        //    (`<caller_module>::derive`, `::cfg`, `::serde`…). Attributes are
+        //    metadata, never call-graph edges, so descending into them is pure noise.
+        if !matches!(
+            child.kind(),
+            "function_item" | "attribute_item" | "inner_attribute_item"
+        ) {
             collect_calls(&child, bytes, fp);
         }
     }
@@ -6071,6 +6080,43 @@ fn run() -> Result<u32, String> {
         assert!(
             raws.iter().filter(|r| **r == "helper").count() >= 2,
             "real call to helper missing (bare + macro-body): {raws:?}"
+        );
+    }
+
+    #[test]
+    fn parse_does_not_record_attribute_args_as_calls() {
+        // Attribute arguments parse as `identifier (token_tree)` — the exact shape
+        // the macro-body call recovery keys on — so `#[derive(Debug)]`,
+        // `#[cfg(test)]`, `#[serde(rename = "x")]`, `#[arg(long)]` etc. inside a fn
+        // body used to be recorded as phantom calls (`<caller_module>::derive`,
+        // `::cfg`, `::serde`…), polluting the extern set (see `ff cortex doctor`'s
+        // `<module>::derive` cluster). Attributes are metadata, never call edges.
+        let src = r#"
+fn helper(x: u32) -> u32 { x }
+fn run() -> u32 {
+    #[derive(Debug, Clone, serde::Serialize)]
+    #[serde(rename_all = "snake_case")]
+    struct Local {
+        #[serde(default)]
+        a: u32,
+    }
+    #[cfg(test)]
+    fn only_in_test() {}
+    helper(1)
+}
+"#;
+        let fp = parse_rust_file("/x/crates/demo/src/lib.rs", src).unwrap();
+        let raws: Vec<&str> = fp.calls.iter().map(|c| c.raw_path.as_str()).collect();
+        for attr in ["derive", "cfg", "serde", "serde::Serialize"] {
+            assert!(
+                !raws.contains(&attr),
+                "attribute arg {attr} leaked as a call: {raws:?}"
+            );
+        }
+        // The genuine call in the same body is still captured.
+        assert!(
+            raws.contains(&"helper"),
+            "real call to helper missing: {raws:?}"
         );
     }
 
