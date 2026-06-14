@@ -68,6 +68,30 @@
    one structural advantage), so downstream consumers can filter heuristic call
    edges (e.g. the dotty-resolver's kept-as-written externs).
 
+## Recall (internal call-resolution) — gaps surfaced by `ff cortex doctor`
+
+`ff cortex doctor` (read-only resolution/health probe) reports the internal-
+resolution rate plus *internally-rooted suspicious externs* (a `code:extern`
+whose head is one of the corpus's own module roots AND whose leaf collides with a
+real internal symbol — the genuine mis-resolution signal, stdlib noise filtered).
+Live forge-fleet baseline: 30.6% of `calls` edges resolve internally
+(5127/16730). The internally-rooted suspicious list named three concrete gaps:
+
+1. **Std-prelude types written bare** (`Vec::new`, `Arc::new`) — was fabricating
+   `<caller_module>::Vec::new`. ✅ FIXED (`is_std_prelude_type` guard) — kept as a
+   shared std extern. Lowest-risk, removes the bulk of internally-rooted noise.
+2. **Inherent-impl methods** (top hit: `AgentToolResult::ok`/`err`) — Rust
+   `impl Foo { fn bar() }` methods are registered as `module::bar`, NOT
+   `module::Foo::bar` (a deliberate tradeoff at the `impl_item` arm so bare calls
+   *inside* a method body resolve to sibling free fns). So `Foo::bar()` call sites
+   become externs. Biggest internal-recall lever, but the fix is delicate: index
+   methods under `module::Foo::bar` AND make in-body bare-call resolution walk up
+   `module::Foo::*` → `module::*`. Needs careful tests before landing.
+3. **Re-export / facade paths** (`ff_db::run_migrations` →
+   `ff_db::migrations::run_migrations`). `pub use` re-exports aren't modeled, so
+   calls via the facade path become externs. Hardest (cross-crate pub-use
+   resolution); medium payoff.
+
 ## Related state
 
 - Hook-fires-on-commit: verified 2026-06-12 (scratch repo, post-commit reindex +
