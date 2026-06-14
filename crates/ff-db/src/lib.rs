@@ -111,6 +111,7 @@ pub use queries::{
     pg_delete_shared_volume_mount,
     pg_disable_safety_gate,
     pg_enqueue_deferred,
+    pg_enqueue_deferred_delayed,
     pg_finish_deferred,
     pg_fire_brain_reminder,
     pg_force_cancel_deferred,
