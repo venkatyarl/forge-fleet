@@ -3627,8 +3627,19 @@ fn resolve_call_inner(
         .map(|(m, _)| m.to_string())
         .unwrap_or_else(|| module.to_string());
 
-    // bare identifier (no ::) -> caller's module.
+    // bare identifier (no ::) -> an imported free function (alias map) FIRST,
+    // else the caller's own module. `use crate::m::foo; ... foo()` is the
+    // dominant Rust call form, exactly as imported fns dominate in TS/Java
+    // (resolve_call_dotty already checks the alias map first here). Without this,
+    // a bare call to an imported fn was misattributed to caller_module::foo —
+    // fabricating a code:extern in the WRONG module and leaving the real
+    // function with fan-in 0, so callers/impact/tests under-counted across every
+    // cross-module Rust call. A name can't be both `use`-imported and a local
+    // item in the same scope (Rust rejects it), so alias-first is unambiguous.
     if !raw.contains("::") {
+        if let Some(full) = alias_map.get(raw) {
+            return full.clone();
+        }
         return join(&caller_module, raw);
     }
 
@@ -4218,6 +4229,25 @@ diff --git a/src/b.rs b/src/b.rs
     }
 
     #[test]
+    fn bare_imported_fn_resolves_via_alias_not_caller_module() {
+        // agent_loop.rs:709 `should_compact(` inside fn run_agent_loop, with
+        // `use crate::compaction::should_compact;` (alias should_compact ->
+        // ff_agent::compaction::should_compact). The bare call must resolve to
+        // the IMPORTED function, not a fabricated ff_agent::agent_loop::should_compact.
+        let fp = fp_with(
+            "ff_agent::agent_loop",
+            "ff_agent",
+            &[("should_compact", "ff_agent::compaction::should_compact")],
+        );
+        let got = resolve_call(
+            "should_compact",
+            "ff_agent::agent_loop::run_agent_loop",
+            &fp,
+        );
+        assert_eq!(got, "ff_agent::compaction::should_compact");
+    }
+
+    #[test]
     fn crate_prefixed_call_normalizes_crate() {
         // deployment_reconciler.rs:296 `crate::model_runtime::load_model(`.
         let fp = fp_with("ff_agent::deployment_reconciler", "ff_agent", &[]);
@@ -4303,9 +4333,11 @@ diff --git a/src/b.rs b/src/b.rs
             "ff_agent::model_runtime"
         );
         let got = resolve_call("load_model", "ff_agent::autoscaler::do_load", &fp);
-        // bare load_model resolves to the caller module (NOT the alias) — both are
-        // valid call forms; this asserts the bare path is module-relative.
-        assert_eq!(got, "ff_agent::autoscaler::load_model");
+        // bare load_model resolves to the IMPORTED fn via the alias map, not a
+        // fabricated ff_agent::autoscaler::load_model. With `use ...::load_model`
+        // in scope, a local `load_model` would be a name conflict in real Rust,
+        // so the import is the unambiguous callee.
+        assert_eq!(got, "ff_agent::model_runtime::load_model");
     }
 
     #[test]
