@@ -355,10 +355,21 @@ pub async fn index_langs_incremental(
         ..IncrementalReport::default()
     };
 
-    // Drop symbols of removed files first (so their fns leave internal_fns).
+    // Drop symbols of removed files first (so their fns leave internal_fns). Gather
+    // every deleted file's symbols, then remove them in one pass (below) so a call
+    // BETWEEN two deleted files is treated as removed at both ends rather than
+    // spuriously demoting one to an extern.
+    let mut deleted_syms: Vec<Uuid> = Vec::new();
     for path in &deleted {
         if let Some(fid) = lookup_file_node(pool, corpus_slug, path).await? {
-            wipe_file_symbols(pool, fid).await?;
+            deleted_syms.extend(file_symbol_ids(pool, &[fid]).await?);
+            // The file node's own outgoing import edges go with the file.
+            sqlx::query(
+                "DELETE FROM brain_vault_edges WHERE src_id = $1 AND edge_type = 'imports'",
+            )
+            .bind(fid)
+            .execute(pool)
+            .await?;
         }
         sqlx::query("DELETE FROM cortex_file_index WHERE corpus_slug = $1 AND file_path = $2")
             .bind(corpus_slug)
@@ -372,6 +383,10 @@ pub async fn index_langs_incremental(
             .await?;
         report.files_deleted += 1;
     }
+    // Demote-or-delete: a deleted file's symbol still called by a SURVIVING file
+    // must become a `code:extern` placeholder, not vanish — a full reindex would
+    // re-create exactly that placeholder for the caller's now-unresolved call.
+    remove_code_symbols(pool, &deleted_syms).await?;
 
     report.files_changed = changed.len();
     if changed.is_empty() {
@@ -443,9 +458,10 @@ pub async fn index_langs_incremental(
         .into_iter()
         .filter(|id| !post_set.contains(id))
         .collect();
-    if !removed.is_empty() {
-        delete_nodes_by_id(pool, &removed).await?;
-    }
+    // A removed symbol still called by an UNCHANGED file must demote to an extern,
+    // not vanish (see remove_code_symbols) — else hard-deleting it cascade-drops
+    // the unchanged caller's `calls` edge and the call silently disappears.
+    remove_code_symbols(pool, &removed).await?;
 
     // Re-extraction may have dropped the last `imports`/`calls` edge into an
     // extern/import placeholder (a removed import, a renamed/deleted callee).
@@ -624,32 +640,75 @@ async fn lookup_file_node(pool: &PgPool, corpus_slug: &str, path: &str) -> Resul
     .await?)
 }
 
-/// Delete all `code:*` symbols owned by one file — the `contains` subtree rooted
-/// at the file node (edges cascade), plus the file's own outgoing `imports`
-/// edges. Shared `code:import`/`code:extern` nodes are intentionally left (they
-/// may be referenced by other files); `gc_orphan_placeholders`, run at the end of
-/// the incremental pass, sweeps any that end up unreferenced.
-async fn wipe_file_symbols(pool: &PgPool, file_node_id: Uuid) -> Result<()> {
-    sqlx::query(
-        r#"WITH RECURSIVE descend(id) AS (
-               SELECT e.dst_id FROM brain_vault_edges e
-                WHERE e.src_id = $1 AND e.edge_type = 'contains'
-               UNION
-               SELECT e.dst_id FROM brain_vault_edges e
-                 JOIN descend d ON e.src_id = d.id
-                WHERE e.edge_type = 'contains'
-           )
-           DELETE FROM brain_vault_nodes
-            WHERE id IN (SELECT id FROM descend)
-              AND node_type LIKE 'code:%'"#,
+/// Split a removed-symbol set into (demote, delete) given the subset that still
+/// has a surviving incoming caller. `still_called` is the distinct list of removed
+/// nodes that a surviving (non-removed) node still `calls` into; those are demoted
+/// to externs, the rest are deleted outright. Pure set logic — DB work lives in
+/// `remove_code_symbols`. Defensive: a `still_called` entry not in `removed` is
+/// ignored (only nodes we were asked to remove can be demoted).
+fn partition_demote_delete(removed: &[Uuid], still_called: &[Uuid]) -> (Vec<Uuid>, Vec<Uuid>) {
+    let removed_set: HashSet<Uuid> = removed.iter().copied().collect();
+    let demote: Vec<Uuid> = still_called
+        .iter()
+        .copied()
+        .filter(|id| removed_set.contains(id))
+        .collect();
+    let demote_set: HashSet<Uuid> = demote.iter().copied().collect();
+    let delete: Vec<Uuid> = removed
+        .iter()
+        .copied()
+        .filter(|id| !demote_set.contains(id))
+        .collect();
+    (demote, delete)
+}
+
+/// Remove code-symbol nodes that no longer exist in source — a changed file's
+/// dropped functions, or a deleted file's whole symbol subtree. A node that still
+/// has an incoming `calls` edge from a SURVIVING caller (one not itself in `ids`)
+/// is DEMOTED in place to a `code:extern` placeholder instead of deleted: a full
+/// reindex re-creates exactly that placeholder for the caller's now-unresolved
+/// call, so hard-deleting the node (which cascade-drops the caller's edge) would
+/// silently lose the call and drift the incremental graph from a full reindex
+/// (`callees`/`doctor` would under-report). Nodes are path-keyed, so the in-place
+/// type flip keeps the same id and carries the surviving incoming edge with it.
+/// Nodes with no surviving caller are deleted (their edges cascade — genuinely
+/// gone); a demoted extern that later loses its last caller is swept by
+/// `gc_orphan_placeholders`. Shared `code:import`/`code:extern` placeholders are
+/// untouched here (they are reference-counted by that GC).
+async fn remove_code_symbols(pool: &PgPool, ids: &[Uuid]) -> Result<()> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    // Removed nodes a surviving (non-removed) node still `calls` into.
+    let still_called: Vec<Uuid> = sqlx::query_scalar(
+        r#"SELECT DISTINCT e.dst_id
+             FROM brain_vault_edges e
+            WHERE e.edge_type = 'calls'
+              AND e.dst_id = ANY($1)
+              AND e.src_id <> ALL($1)"#,
     )
-    .bind(file_node_id)
-    .execute(pool)
+    .bind(ids)
+    .fetch_all(pool)
     .await?;
-    sqlx::query("DELETE FROM brain_vault_edges WHERE src_id = $1 AND edge_type = 'imports'")
-        .bind(file_node_id)
+    let (demote, delete) = partition_demote_delete(ids, &still_called);
+    if !demote.is_empty() {
+        // In-place flip to an unresolved extern (same path → same node id → the
+        // surviving incoming `calls` edge is preserved). Externs carry no source
+        // span / embedding / community, so clear those to match a fresh extern.
+        sqlx::query(
+            r#"UPDATE brain_vault_nodes
+                  SET node_type = 'code:extern', start_line = NULL, end_line = NULL,
+                      embedding = NULL, code_community_id = NULL, updated_at = NOW()
+                WHERE id = ANY($1)"#,
+        )
+        .bind(&demote)
         .execute(pool)
         .await?;
+        // An extern never calls out — drop any outgoing edges the old symbol had
+        // (a deleted file's symbols still carry theirs at this point).
+        delete_outgoing_edges(pool, &demote).await?;
+    }
+    delete_nodes_by_id(pool, &delete).await?;
     Ok(())
 }
 
@@ -5503,6 +5562,35 @@ diff --git a/src/b.rs b/src/b.rs
         assert_eq!(changed.len(), 2);
         assert_eq!(unchanged, 0);
         assert!(deleted.is_empty());
+    }
+
+    #[test]
+    fn demote_delete_splits_on_surviving_caller() {
+        let a = Uuid::from_u128(1); // removed, still called by a survivor → demote
+        let b = Uuid::from_u128(2); // removed, no surviving caller → delete
+        let c = Uuid::from_u128(3); // removed, called only by another removed node → delete
+        let removed = [a, b, c];
+        // `still_called` is the SQL result: removed nodes a survivor calls into.
+        // `c` is excluded by the `src_id <> ALL(removed)` guard, so it is NOT here.
+        let still_called = [a];
+        let (demote, delete) = partition_demote_delete(&removed, &still_called);
+        assert_eq!(demote, vec![a]);
+        let del: HashSet<Uuid> = delete.into_iter().collect();
+        assert_eq!(del, HashSet::from([b, c]));
+    }
+
+    #[test]
+    fn demote_delete_ignores_unknown_and_empty() {
+        // A `still_called` id not in `removed` is ignored (can't demote what we
+        // weren't asked to remove); empty in → empty out.
+        let a = Uuid::from_u128(1);
+        let stray = Uuid::from_u128(9);
+        let (demote, delete) = partition_demote_delete(&[a], &[stray]);
+        assert!(demote.is_empty());
+        assert_eq!(delete, vec![a]);
+        let (d2, del2) = partition_demote_delete(&[], &[]);
+        assert!(d2.is_empty());
+        assert!(del2.is_empty());
     }
 
     #[test]
