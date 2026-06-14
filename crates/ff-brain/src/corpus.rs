@@ -486,20 +486,27 @@ pub async fn scan(
         .bind(corpus.id)
         .execute(pg)
         .await?;
-    for c in &candidates {
-        sqlx::query(
-            r#"INSERT INTO brain_corpus_candidates
-                 (corpus_id, kind, title, payload, heuristic, confidence)
-               VALUES ($1, $2, $3, $4, $5, $6)"#,
-        )
-        .bind(corpus.id)
-        .bind(&c.kind)
-        .bind(&c.title)
-        .bind(&c.payload)
-        .bind(&c.heuristic)
-        .bind(c.confidence)
-        .execute(pg)
-        .await?;
+    // Re-insert the freshly proposed candidates in BATCHES. `propose` is pure, so
+    // a no-op rescan regenerates the SAME set every time — a per-candidate INSERT
+    // loop was the dominant cost of the hook-driven `ff cortex index --incremental`
+    // (e.g. forge-fleet re-inserts ~1.3k candidates each scan; the hireflow corpora
+    // ~7k). One multi-row INSERT per chunk collapses N sequential round-trips into
+    // a handful, end-state byte-identical to the loop. Chunk size keeps the bound
+    // parameter count (6 per row) well under Postgres's 65535 limit for big corpora.
+    const CANDIDATE_CHUNK: usize = 1000;
+    for chunk in candidates.chunks(CANDIDATE_CHUNK) {
+        let mut qb = sqlx::QueryBuilder::new(
+            "INSERT INTO brain_corpus_candidates (corpus_id, kind, title, payload, heuristic, confidence) ",
+        );
+        qb.push_values(chunk, |mut b, c| {
+            b.push_bind(corpus.id)
+                .push_bind(&c.kind)
+                .push_bind(&c.title)
+                .push_bind(&c.payload)
+                .push_bind(&c.heuristic)
+                .push_bind(c.confidence);
+        });
+        qb.build().execute(pg).await?;
     }
     report.candidates = candidates.len();
     Ok(report)
