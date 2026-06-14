@@ -2663,7 +2663,7 @@ fn collect_calls(node: &Node, bytes: &[u8], fp: &mut FileParse) {
                     next.kind() == "token_tree" && bytes.get(next.start_byte()) == Some(&b'(');
                 let is_method = child.prev_sibling().map(|p| p.kind()) == Some(".");
                 if is_paren_tt && !is_method {
-                    if let Some(raw) = call_target_path(&child, bytes) {
+                    if let Some(raw) = macro_call_path(&child, bytes) {
                         if !is_rust_prelude_ctor(&raw) {
                             fp.calls.push(CallSite {
                                 raw_path: raw,
@@ -2695,6 +2695,42 @@ fn call_target_path(func: &Node, bytes: &[u8]) -> Option<String> {
             .and_then(|f| call_target_path(&f, bytes)),
         _ => None,
     }
+}
+
+/// Reconstruct a call path from inside a macro `token_tree`. A macro body is an
+/// opaque token sequence — not parsed as Rust grammar — so a scoped associated
+/// call `Type::method(args)` is lexed as the flat tokens `Type`, `::`, `method`,
+/// `(...)` rather than a single `scoped_identifier`. The macro-recovery heuristic
+/// matches the trailing `method` identifier (its next sibling is the `(`-delimited
+/// token_tree), so without this it would record a bare `method` and fabricate
+/// `<caller_module>::method` — splitting the real method's fan-in onto a per-test
+/// phantom (`ff cortex doctor` flagged `compaction::tests::{system,user,…}` for the
+/// `ToolChatMessage::system(…)` calls in `vec![…]`). Walk back over leading
+/// `:: <ident>` pairs from `tail` to rebuild the full `Type::method` path; the
+/// later impl-method redirect then flattens it onto the real method. Returns the
+/// tail's own text when it has no `::` prefix (a genuine bare call).
+fn macro_call_path(tail: &Node, bytes: &[u8]) -> Option<String> {
+    let mut segs = vec![node_text(tail, bytes)?];
+    let mut cur = tail.prev_sibling();
+    while let Some(sep) = cur {
+        if sep.kind() != "::" {
+            break;
+        }
+        let Some(ident) = sep.prev_sibling() else {
+            break;
+        };
+        if !matches!(ident.kind(), "identifier" | "scoped_identifier") {
+            break;
+        }
+        segs.push(node_text(&ident, bytes)?);
+        // A `scoped_identifier` already carries the whole prefix path text.
+        if ident.kind() == "scoped_identifier" {
+            break;
+        }
+        cur = ident.prev_sibling();
+    }
+    segs.reverse();
+    Some(segs.join("::"))
 }
 
 /// Collect a `use` declaration into use_targets + alias_map. Handles
@@ -5563,6 +5599,57 @@ fn covers_target() {
         assert!(
             !raws.contains(&"meth"),
             "method call wrongly recorded: {raws:?}"
+        );
+    }
+
+    #[test]
+    fn parse_rebuilds_scoped_call_inside_macro_body() {
+        // A scoped associated call `Type::method(args)` inside a macro body
+        // (`vec![…]`, `assert_eq!`, …) is lexed as the flat tokens
+        // `Type :: method ( … )`, so the trailing `method` identifier alone used
+        // to be recorded as a bare call — fabricating `<caller_module>::method`
+        // instead of `Type::method` (the real, flattened impl method). Mirrors the
+        // `ToolChatMessage::system(…)` calls in compaction.rs's test `vec![…]`.
+        let src = r#"
+struct Msg;
+impl Msg {
+    fn system(s: &str) -> Msg { Msg }
+    fn user(s: &str) -> Msg { Msg }
+}
+fn free(x: u32) -> u32 { x }
+mod inner { pub mod deep { pub fn f() -> u32 { 1 } } }
+#[test]
+fn covers() {
+    let msgs = vec![Msg::system("a"), Msg::user("b")];
+    assert_eq!(inner::deep::f(), 1);
+    assert!(free(2) > 0);
+}
+"#;
+        let fp = parse_rust_file("/x/crates/demo/src/lib.rs", src).unwrap();
+        let raws: Vec<&str> = fp.calls.iter().map(|c| c.raw_path.as_str()).collect();
+        // Scoped associated calls keep their type/path segment.
+        assert!(
+            raws.contains(&"Msg::system"),
+            "scoped macro-body call lost its type segment: {raws:?}"
+        );
+        assert!(
+            raws.contains(&"Msg::user"),
+            "scoped macro-body call lost its type segment: {raws:?}"
+        );
+        // Multi-segment module path is rebuilt whole.
+        assert!(
+            raws.contains(&"inner::deep::f"),
+            "multi-segment macro-body call not rebuilt: {raws:?}"
+        );
+        // A genuine bare call is unchanged.
+        assert!(
+            raws.contains(&"free"),
+            "bare macro-body call missing: {raws:?}"
+        );
+        // The bare-leaf fabrications must NOT appear.
+        assert!(
+            !raws.contains(&"system") && !raws.contains(&"user"),
+            "bare-leaf phantom still recorded: {raws:?}"
         );
     }
 
