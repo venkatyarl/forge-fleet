@@ -634,23 +634,7 @@ impl BackupOrchestrator {
             }
 
             let title = format!("rsync {kind} backup {file_name} → {name}");
-            // $HOME is expanded by the remote shell. `~` is NOT used here
-            // because shell_quote wraps in single quotes which kill tilde
-            // expansion (REDIS.1: discovered 2026-05-19 — rsync writing to
-            // a literal `~` directory caused exit 23 across 9 members).
-            //
-            // SSH keepalive + timeout: backups can be 100s of MB; the
-            // default ssh idle timeout was closing connections mid-stream
-            // (exit 255, "Connection closed by ... port 22").
-            let script = format!(
-                "mkdir -p \"$HOME/.forgefleet/backups/{kind_safe}/\" && \
-                 rsync -az \
-                   -e 'ssh -o ServerAliveInterval=60 -o ServerAliveCountMax=10 -o ConnectTimeout=30' \
-                   --timeout=3600 \
-                   --partial \
-                   {} \"$HOME/.forgefleet/backups/{kind_safe}/\"",
-                shell_quote(&source_path),
-            );
+            let script = backup_rsync_script(&kind_safe, &shell_quote(&source_path));
             let payload = serde_json::json!({
                 "command": script,
                 "summary": title,
@@ -983,6 +967,47 @@ fn backup_rsync_title_like(kind: &str) -> String {
     format!("rsync {kind} backup %")
 }
 
+/// The remote shell command a peer runs to pull one backup snapshot from the
+/// leader. `kind_safe` is the backup kind (`postgres`/`redis`); `source_quoted`
+/// is the already-`shell_quote`d `user@ip:/path` source. Pure so the rsync flag
+/// invariants below are unit-tested against regression.
+///
+/// `$HOME` is expanded by the remote shell. `~` is NOT used — `shell_quote`
+/// wraps the source in single quotes, which kill tilde expansion (REDIS.1,
+/// 2026-05-19: rsync writing to a literal `~` dir caused exit 23 across 9
+/// members).
+///
+/// SSH keepalive: backups can be 100s of MB; the default ssh idle timeout was
+/// closing connections mid-stream (exit 255, "Connection closed by ... port 22").
+///
+/// NO `-z` (HA.1, 2026-06-14): every backup file is already compressed and/or
+/// encrypted (`.tar.gz`, `.rdb.zst`, `.age`), so rsync's zlib pass is pure
+/// overhead — it cannot shrink incompressible bytes and instead becomes the
+/// throughput ceiling. Measured on the LAN: a 1.4 GiB postgres transfer took
+/// 16s without `-z` vs 26s with it, burning a full CPU core on zlib (24s user
+/// time vs 4s). On a contended 32 GiB Linux peer that CPU bottleneck is what
+/// stalled large transfers, while ~47 KiB redis snapshots sailed through —
+/// exactly the observed pattern (redis replicated fine, postgres replicas went
+/// >24h stale).
+///
+/// SHORT `--timeout` (HA.1): an I/O-*inactivity* timer, not a wall-clock cap. A
+/// healthy single-file LAN transfer never has 300s of silence, so 300s fails a
+/// genuinely stalled stream 12x faster than the old 3600s. That matters because
+/// `enqueue_distribution` coalesces — a peer with a pending/running rsync of
+/// this kind is skipped — so one wedged transfer holding `running` for an hour
+/// starves that peer of every fresh snapshot until it clears. `--partial` lets
+/// the next attempt resume rather than restart.
+fn backup_rsync_script(kind_safe: &str, source_quoted: &str) -> String {
+    format!(
+        "mkdir -p \"$HOME/.forgefleet/backups/{kind_safe}/\" && \
+         rsync -a \
+           -e 'ssh -o ServerAliveInterval=60 -o ServerAliveCountMax=10 -o ConnectTimeout=30' \
+           --timeout=300 \
+           --partial \
+           {source_quoted} \"$HOME/.forgefleet/backups/{kind_safe}/\""
+    )
+}
+
 /// SQL `LIKE` pattern matching every over-quota backup-reap task title for
 /// `kind` (titles look like `reap <kind> backups on <peer> (...)`). Used by
 /// [`BackupOrchestrator::reap_over_quota_peers`] to coalesce — a peer with an
@@ -1228,6 +1253,37 @@ mod tests {
         let pg_prefix = pg_prefix.trim_end_matches('%');
         let redis_title = "rsync redis backup redis-20260613T094023Z.rdb.zst.age → priya";
         assert!(!redis_title.starts_with(pg_prefix));
+    }
+
+    #[test]
+    fn backup_rsync_script_omits_compression_and_uses_short_timeout() {
+        // HA.1 (2026-06-14): backup files are already compressed/encrypted, so
+        // `-z` is a CPU-bound throughput ceiling that stalled large transfers.
+        // Lock the flag invariants so a future edit can't silently reintroduce
+        // `-z` or balloon the inactivity timeout back to an hour.
+        let src = "'venkat@192.168.5.100:/Users/venkat/.forgefleet/backups/postgres/pg.tar.gz.age'";
+        let script = backup_rsync_script("postgres", src);
+
+        // Must invoke rsync WITHOUT zlib compression.
+        assert!(script.contains("rsync -a "), "script: {script}");
+        assert!(
+            !script.contains("rsync -az") && !script.contains(" -z "),
+            "rsync -z must not be reintroduced — it caps throughput on already-compressed backups: {script}"
+        );
+        // Short I/O-inactivity timeout so a stalled stream recovers fast.
+        assert!(script.contains("--timeout=300"), "script: {script}");
+        assert!(!script.contains("--timeout=3600"), "script: {script}");
+        // Resume-on-retry + keepalive preserved; source + dest dir wired in.
+        assert!(script.contains("--partial"), "script: {script}");
+        assert!(
+            script.contains("ServerAliveInterval=60"),
+            "script: {script}"
+        );
+        assert!(script.contains(src), "source must be embedded: {script}");
+        assert!(
+            script.contains("\"$HOME/.forgefleet/backups/postgres/\""),
+            "dest dir must be the kind-scoped backups path: {script}"
+        );
     }
 
     #[test]
