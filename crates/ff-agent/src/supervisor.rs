@@ -566,10 +566,199 @@ fn diagnose_and_fix(
     }
 }
 
+/// File extensions that mark a token as a concrete deliverable path. Kept as a
+/// conservative allowlist so that version strings (`2026.6.14`), domains
+/// (`github.com`), and IPs never get mistaken for files. Extend deliberately.
+const DELIVERABLE_EXTS: &[&str] = &[
+    // code
+    "rs",
+    "py",
+    "ts",
+    "tsx",
+    "js",
+    "jsx",
+    "mjs",
+    "cjs",
+    "java",
+    "kt",
+    "go",
+    "rb",
+    "c",
+    "h",
+    "cc",
+    "cpp",
+    "hpp",
+    "cs",
+    "swift",
+    "scala",
+    "php",
+    "lua",
+    "sh",
+    "bash",
+    "zsh",
+    "sql",
+    "proto",
+    "r",
+    "jl",
+    // markup / config / docs
+    "md",
+    "mdx",
+    "txt",
+    "rst",
+    "json",
+    "jsonl",
+    "toml",
+    "yaml",
+    "yml",
+    "ini",
+    "cfg",
+    "conf",
+    "env",
+    "xml",
+    "html",
+    "htm",
+    "css",
+    "scss",
+    "csv",
+    "tsv",
+    "lock",
+    "gradle",
+    "properties",
+];
+
+/// Best-effort extraction of file-path deliverables named in a supervise
+/// prompt. Used to auto-populate `verify_files` when the caller passed none, so
+/// "write `foo.rs`" tasks fail+retry instead of silently accepting "done"
+/// without the artifact. See `feedback_ff_supervise_verify_deliverable.md`.
+///
+/// Conservative by design — a false positive turns a real success into a
+/// retry-until-fail, which is worse than the gap. A token is accepted only if,
+/// after stripping surrounding punctuation/quotes/backticks, it:
+///
+/// * is not a URL (no `://`) and not a bare dotted-quad IP,
+/// * has a final path segment ending in one of `DELIVERABLE_EXTS`,
+/// * looks like a path (a leading `/`, a `./`/`../` prefix, an embedded `/`,
+///   or a simple `name.ext` with no spaces).
+///
+/// Results are de-duplicated, order-preserving, and capped at 12.
+pub fn extract_prompt_paths(prompt: &str) -> Vec<std::path::PathBuf> {
+    let mut out: Vec<std::path::PathBuf> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for raw in prompt.split(|c: char| c.is_whitespace() || c == '`' || c == '"' || c == '\'') {
+        // Strip wrapping/trailing punctuation that commonly hugs a path in prose.
+        let tok = raw.trim_matches(|c: char| {
+            matches!(
+                c,
+                '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | ':' | '!' | '?'
+            )
+        });
+        // A trailing '.' is sentence punctuation, not part of the path.
+        let tok = tok.trim_end_matches('.');
+        if tok.len() < 3 || tok.contains("://") {
+            continue;
+        }
+        let last_seg = tok.rsplit('/').next().unwrap_or(tok);
+        let (stem, ext) = match last_seg.rsplit_once('.') {
+            Some(p) => p,
+            None => continue,
+        };
+        if stem.is_empty() {
+            continue;
+        }
+        let ext_l = ext.to_ascii_lowercase();
+        if !DELIVERABLE_EXTS.iter().any(|e| *e == ext_l) {
+            continue;
+        }
+        // Reject dotted-quad IPs (e.g. 192.168.5.100) — last_seg would be "100"
+        // with stem "192.168.5"; guard explicitly in case "100" ever joins the
+        // allowlist.
+        if tok.split('.').all(|s| s.parse::<u32>().is_ok()) {
+            continue;
+        }
+        let looks_like_path = tok.starts_with('/')
+            || tok.starts_with("./")
+            || tok.starts_with("../")
+            || tok.contains('/')
+            || !tok.contains(char::is_whitespace);
+        if !looks_like_path {
+            continue;
+        }
+        if seen.insert(tok.to_string()) {
+            out.push(std::path::PathBuf::from(tok));
+            if out.len() >= 12 {
+                break;
+            }
+        }
+    }
+    out
+}
+
 fn inject_system_addendum(config: &mut AgentSessionConfig, instruction: &str) {
     let current = config.system_prompt.clone().unwrap_or_default();
     config.system_prompt = Some(format!(
         "{}\n\n## IMPORTANT (Supervisor Recovery)\n{}",
         current, instruction
     ));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_simple_named_files() {
+        let p = extract_prompt_paths("Write a function to foo.rs and update bar.py");
+        assert_eq!(
+            p,
+            vec![
+                std::path::PathBuf::from("foo.rs"),
+                std::path::PathBuf::from("bar.py"),
+            ]
+        );
+    }
+
+    #[test]
+    fn extracts_relative_and_absolute_paths() {
+        let p = extract_prompt_paths(
+            "Create ./src/main.rs and /tmp/out.json, edit crates/ff-agent/src/lib.rs",
+        );
+        assert!(p.contains(&std::path::PathBuf::from("./src/main.rs")));
+        assert!(p.contains(&std::path::PathBuf::from("/tmp/out.json")));
+        assert!(p.contains(&std::path::PathBuf::from("crates/ff-agent/src/lib.rs")));
+    }
+
+    #[test]
+    fn strips_backticks_quotes_and_trailing_punctuation() {
+        let p = extract_prompt_paths("Put the result in `report.md`, then commit \"notes.txt\".");
+        assert!(p.contains(&std::path::PathBuf::from("report.md")));
+        assert!(p.contains(&std::path::PathBuf::from("notes.txt")));
+    }
+
+    #[test]
+    fn rejects_urls_ips_versions_and_domains() {
+        // None of these should be treated as deliverable files.
+        let p = extract_prompt_paths(
+            "Hit https://example.com/api on 192.168.5.100, version 2026.6.14, repo github.com mirror",
+        );
+        assert!(p.is_empty(), "unexpected paths extracted: {:?}", p);
+    }
+
+    #[test]
+    fn rejects_unknown_extensions() {
+        let p = extract_prompt_paths("the value is 3.14159 and the ratio a.b are fine");
+        assert!(p.is_empty(), "unexpected paths extracted: {:?}", p);
+    }
+
+    #[test]
+    fn dedups_repeated_mentions() {
+        let p = extract_prompt_paths("edit foo.rs, then re-check foo.rs and foo.rs again");
+        assert_eq!(p, vec![std::path::PathBuf::from("foo.rs")]);
+    }
+
+    #[test]
+    fn caps_at_twelve() {
+        let prompt: String = (0..20).map(|i| format!("file{i}.rs ")).collect();
+        let p = extract_prompt_paths(&prompt);
+        assert_eq!(p.len(), 12);
+    }
 }
