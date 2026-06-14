@@ -63,9 +63,10 @@ pub async fn handle_cortex(pool: &PgPool, cmd: crate::CortexCommand) -> Result<(
             corpus,
             symbol,
             max_depth,
+            min_confidence,
             format,
         } => {
-            let rows = cortex::tests_for(pool, &corpus, &symbol, max_depth).await?;
+            let rows = cortex::tests_for(pool, &corpus, &symbol, max_depth, min_confidence).await?;
             print_tests(
                 &rows,
                 &format,

@@ -395,8 +395,9 @@ pub async fn cortex_tests(params: Option<Value>) -> HandlerResult {
         .and_then(|v| v.as_u64())
         .map(|d| d.clamp(1, 20) as usize)
         .unwrap_or(5);
+    let min_confidence = min_confidence_param(&params);
     let pool = get_pool().await?;
-    let rows = tests_for(&pool, &corpus_slug, &symbol, max_depth)
+    let rows = tests_for(&pool, &corpus_slug, &symbol, max_depth, min_confidence)
         .await
         .map_err(|e| format!("tests: {e}"))?;
     let tests: Vec<Value> = rows
@@ -414,6 +415,7 @@ pub async fn cortex_tests(params: Option<Value>) -> HandlerResult {
         "corpus": corpus_slug,
         "symbol": symbol,
         "max_depth": max_depth,
+        "min_confidence": min_confidence,
         "count": tests.len(),
         "tests": tests,
     }))

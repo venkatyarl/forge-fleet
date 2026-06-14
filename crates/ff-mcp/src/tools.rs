@@ -1072,6 +1072,11 @@ impl ToolRegistry {
                         "type": "integer",
                         "description": "Max transitive hops to search for a covering test (1-20, default 5)",
                         "default": 5
+                    },
+                    "min_confidence": {
+                        "type": "number",
+                        "description": "Only traverse `calls` edges at/above this resolution-confidence tier: 1.0 = EXTRACTED only (tests that provably reach the symbol via directly-resolved calls), 0.6 = +INFERRED (heuristic redirect), 0.0 = all (default). Use 1.0 for a strict coverage claim.",
+                        "default": 0.0
                     }
                 },
                 "required": ["corpus", "symbol"]

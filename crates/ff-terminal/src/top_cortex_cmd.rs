@@ -175,6 +175,10 @@ pub enum TopCortexCommand {
         corpus: Option<String>,
         #[arg(long, default_value_t = 5)]
         max_depth: usize,
+        /// Only traverse `calls` edges at/above this resolution-confidence tier:
+        /// 1.0 = EXTRACTED only (provably-reaching tests), 0.6 = +INFERRED, 0.0 = all (default).
+        #[arg(long, default_value_t = 0.0)]
+        min_confidence: f32,
         #[arg(long, default_value = "table")]
         format: String,
     },
@@ -631,6 +635,7 @@ pub async fn handle_top_cortex(args: TopCortexArgs) -> Result<()> {
             symbol,
             corpus,
             max_depth,
+            min_confidence,
             format,
         } => {
             let corpus = corpus.unwrap_or_else(cwd_slug);
@@ -640,6 +645,7 @@ pub async fn handle_top_cortex(args: TopCortexArgs) -> Result<()> {
                     corpus,
                     symbol,
                     max_depth,
+                    min_confidence,
                     format,
                 },
             )
