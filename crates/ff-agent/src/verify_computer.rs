@@ -337,9 +337,8 @@ async fn ssh_capture(dest: &str, cmd: &str) -> Result<String, String> {
     let out = timeout(
         Duration::from_secs(10),
         Command::new("ssh")
+            .args(crate::ssh_opts::ssh_bypass_args())
             .args([
-                "-o",
-                "BatchMode=yes",
                 "-o",
                 "ConnectTimeout=5",
                 "-o",

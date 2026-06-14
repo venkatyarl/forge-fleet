@@ -73,12 +73,11 @@ async fn fetch_library(pool: &PgPool, id: &str) -> Result<LibraryRow, String> {
 pub async fn ssh_exec(user: &str, host: &str, cmd: &str) -> Result<(i32, String, String), String> {
     let target = format!("{user}@{host}");
     let output = Command::new("ssh")
+        .args(crate::ssh_opts::ssh_bypass_args())
         .arg("-o")
         .arg("ConnectTimeout=10")
         .arg("-o")
         .arg("StrictHostKeyChecking=accept-new")
-        .arg("-o")
-        .arg("BatchMode=yes")
         .arg(&target)
         .arg(cmd)
         .output()
@@ -234,7 +233,8 @@ pub async fn transfer_model(
         shell_quote(&src_lib.file_path),
     );
     let rsync_cmd = format!(
-        "rsync -av --partial -e 'ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes' {} {}",
+        "rsync -av --partial -e 'ssh -o StrictHostKeyChecking=accept-new {}' {} {}",
+        crate::ssh_opts::SSH_AGENT_BYPASS,
         remote_src,
         shell_quote(&dst_path),
     );

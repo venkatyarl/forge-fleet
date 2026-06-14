@@ -109,16 +109,21 @@ async fn load_all_computers(pg: &PgPool) -> Result<Vec<RemoteTarget>, sqlx::Erro
 }
 
 fn ssh_base_args(port: i32) -> Vec<String> {
-    vec![
+    // Bypass a wedged inherited ssh-agent (HA.2, `crate::ssh_opts`): panic_stop
+    // runs from the daemon and SSHes to headless Linux peers.
+    let mut args: Vec<String> = crate::ssh_opts::ssh_bypass_args()
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    args.extend([
         "-o".into(),
         "ConnectTimeout=5".into(),
-        "-o".into(),
-        "BatchMode=yes".into(),
         "-o".into(),
         "StrictHostKeyChecking=accept-new".into(),
         "-p".into(),
         port.to_string(),
-    ]
+    ]);
+    args
 }
 
 /// Run an SSH command under a timeout; returns (success, combined_output).

@@ -1295,6 +1295,10 @@ pub async fn compose_node_bootstrap(
     dry_run: bool,
 ) -> Result<ComposePlan, sqlx::Error> {
     let mut planned: Vec<PlannedTask> = Vec::new();
+    // These onboarding steps run on the leader, which after an HA failover can
+    // be a headless Linux follower whose inherited ssh-agent may be wedged —
+    // bypass it the same way the wave SSH does (see `crate::ssh_opts`).
+    let ssh_bypass = SSH_AGENT_BYPASS;
     // ── 1. Pull everything we need from the DB. ──────────────────────────
     let target_row = sqlx::query(
         "SELECT name, primary_ip, all_ips, ssh_user, ssh_port, os_family
@@ -1377,7 +1381,7 @@ pub async fn compose_node_bootstrap(
         // ssh's built-in ConnectTimeout is portable and covers the hang case.
         "set -e; for ip in {ip_list}; do \
            echo \"== $ip ==\"; \
-           ssh{port_arg} -o ConnectTimeout=5 -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+           ssh{port_arg} -o ConnectTimeout=5 {ssh_bypass} -o StrictHostKeyChecking=accept-new \
              {ssh_target_for_iter} 'echo ok && uname -srvmo' || echo 'unreachable'; \
          done"
     );
@@ -1407,7 +1411,7 @@ pub async fn compose_node_bootstrap(
 
     // ── Step 2: leader runs the bootstrap script. ────────────────────────
     let step2 = format!(
-        "ssh{port_arg} -o BatchMode=yes {ssh_target_primary} \
+        "ssh{port_arg} {ssh_bypass} {ssh_target_primary} \
          \"curl -fsSL '{gateway_url}/onboard/bootstrap.sh\
 ?name={target_name}&ip={target_primary_ip}&ssh_user={target_ssh_user}&role=builder&runtime=auto' \
          | sudo bash\""
@@ -1444,12 +1448,12 @@ pub async fn compose_node_bootstrap(
     // macOS uses launchctl rather than systemctl; gate the check.
     let step3 = if target_os_family == "macos" {
         format!(
-            "ssh{port_arg} -o BatchMode=yes {ssh_target_primary} \
+            "ssh{port_arg} {ssh_bypass} {ssh_target_primary} \
              'launchctl list | grep -E \"com\\.forgefleet\\.(forgefleetd|daemon)\" >/dev/null'"
         )
     } else {
         format!(
-            "ssh{port_arg} -o BatchMode=yes {ssh_target_primary} \
+            "ssh{port_arg} {ssh_bypass} {ssh_target_primary} \
              'systemctl --user is-active forgefleetd.service \
                 || systemctl --user is-active forgefleet-node.service \
                 || systemctl --user is-active forgefleet-daemon.service \
@@ -2043,8 +2047,11 @@ fn build_wave_playbook_body(playbook_command: &str, daemon_self: bool) -> String
     //   - HTTPS remotes: GIT_HTTP_LOW_SPEED_LIMIT/TIME abort a transfer that
     //     trickles under 1 KB/s for 60s.
     // Build/compile steps that follow are unaffected (these only touch git).
+    // `IdentityAgent=none` mirrors `crate::ssh_opts::SSH_AGENT_BYPASS`: a
+    // daemon-self upgrade on a headless Linux peer inherits the wedged
+    // gnome-keyring agent, which would hang `git fetch` over ssh at auth.
     let git_net_env = "export \
-         GIT_SSH_COMMAND='ssh -o BatchMode=yes -o ConnectTimeout=30 \
+         GIT_SSH_COMMAND='ssh -o IdentityAgent=none -o BatchMode=yes -o ConnectTimeout=30 \
          -o ServerAliveInterval=15 -o ServerAliveCountMax=4' \
          GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME=60; ";
     // For daemon-self upgrades, free RAM before the build and restore models
@@ -2100,17 +2107,11 @@ fn build_wave_playbook_body(playbook_command: &str, daemon_self: bool) -> String
 const WAVE_BUILD_SSH_ALIVE_COUNT_MAX: u32 = 8;
 
 /// HA.2 (2026-06-14): the wave SSH runs from a daemon-spawned worker, so it
-/// inherits forgefleetd's `SSH_AUTH_SOCK`. On headless Ubuntu peers (sophie,
-/// priya) that points at a *locked* gnome-keyring ssh agent whose socket
-/// accepts the connection but blocks forever on the sign request — ssh hangs
-/// at auth, `ConnectTimeout` only covers the TCP connect, and the task sits
-/// `running` until the 10-min cap. Observed live: priya's `restart on sophie`
-/// wave task hung 53 min, jamming the auto-upgrade singleton so NO host could
-/// upgrade — the same wedged agent #304 fixed for backup rsync, here strangling
-/// the very pipeline that ships fixes. `IdentityAgent=none` makes ssh ignore
-/// the inherited socket and use the on-disk key; `BatchMode=yes` keeps it
-/// non-interactive. Mirrors `backup_rsync_script`'s fix.
-const SSH_AGENT_BYPASS: &str = "-o IdentityAgent=none -o BatchMode=yes";
+/// inherits forgefleetd's `SSH_AUTH_SOCK` — on headless Ubuntu peers that can
+/// point at a wedged gnome-keyring agent that hangs ssh at auth. The bypass is
+/// the canonical [`crate::ssh_opts::SSH_AGENT_BYPASS`] (see that module for the
+/// full rationale and the other daemon SSH sites it covers).
+use crate::ssh_opts::SSH_AGENT_BYPASS;
 
 /// Build the OUTER ssh command the wave runs on a peer to drive `target`'s
 /// build: `ssh -T … target bash -l <<EOF <playbook> EOF`. Pure (no I/O) so the
@@ -2179,8 +2180,11 @@ mod wave_playbook_tests {
         assert!(
             body.contains("> $HOME/.forgefleet/logs/fleet-upgrade-wave-build.log 2>&1 </dev/null")
         );
-        // The git network step is bounded so a hung fetch fails fast (no leak).
-        assert!(body.contains("GIT_SSH_COMMAND='ssh -o BatchMode=yes -o ConnectTimeout=30"));
+        // The git network step is bounded so a hung fetch fails fast (no leak),
+        // and bypasses a wedged inherited ssh-agent on headless Linux peers.
+        assert!(body.contains(
+            "GIT_SSH_COMMAND='ssh -o IdentityAgent=none -o BatchMode=yes -o ConnectTimeout=30"
+        ));
         assert!(body.contains("GIT_HTTP_LOW_SPEED_LIMIT=1000"));
         // It's inside the FD-isolated build block (before the playbook), so it
         // only affects this command group, not the trailing status line.

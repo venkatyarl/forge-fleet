@@ -542,11 +542,10 @@ async fn migrate_devices_from(
     // 2) Cat the file over SSH. Missing/empty → nothing to do.
     let dest = format!("{ssh_user}@{ip}");
     let out = Command::new("ssh")
+        .args(crate::ssh_opts::ssh_bypass_args())
         .args([
             "-o",
             "ConnectTimeout=8",
-            "-o",
-            "BatchMode=yes",
             "-o",
             "StrictHostKeyChecking=accept-new",
             &dest,
