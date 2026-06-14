@@ -213,6 +213,18 @@ impl BackupOrchestrator {
         // on the leader here; peers prune via the spawn-loop ticker (they
         // short-circuit above and never reach this point).
         self.prune_all_local().await;
+        // Leader-driven backup-replica reaper: prune OVER-QUOTA peers' excess
+        // backup copies via an embedded shell script. The per-node prune above
+        // (and the peer-side prune ticker) only works on hosts running a binary
+        // that HAS the prune code (#210); a host stuck on an older binary
+        // accumulates backups forever, fills its disk, and can no longer build
+        // the very upgrade that ships the prune — a deadlock (observed: ace
+        // stuck on #116/May-31 with 42 GiB of un-pruned postgres replicas).
+        // disk_reconcile actuates disk pressure but only evicts MODELS, so it's
+        // blind to backup replicas. This reaper closes that gap: the prune
+        // script is generated on the leader and SSH-executed on the peer, so it
+        // works regardless of the peer's binary version.
+        self.reap_over_quota_peers().await;
         Ok(reports)
     }
 
@@ -819,6 +831,102 @@ impl BackupOrchestrator {
         }
         Ok((removed, freed))
     }
+
+    /// Leader-driven over-quota backup-replica reaper.
+    ///
+    /// For every peer currently OVER its disk quota (same definition as
+    /// `disk_reconcile::over_quota_nodes`), enqueue a self-contained shell task
+    /// that prunes that peer's `~/.forgefleet/backups/<kind>/` directory down to
+    /// the peer retention floor. The script carries no `ff`/`forgefleetd`
+    /// dependency, so it heals a peer whose binary predates the in-process prune
+    /// (#210) — exactly the host that would otherwise deadlock (disk full → can't
+    /// build the upgrade that ships the prune).
+    ///
+    /// Skips the leader itself (it prunes locally via `prune_all_local`) and
+    /// coalesces: a peer that already has a non-terminal reap of this kind queued
+    /// is left alone, so repeated backup ticks never pile up duplicate reaps.
+    /// Best-effort — never propagates an error (disk hygiene must not perturb the
+    /// backup cadence).
+    async fn reap_over_quota_peers(&self) {
+        let over = match crate::disk_reconcile::over_quota_nodes(&self.pg).await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, "backup reaper: over-quota lookup failed");
+                return;
+            }
+        };
+        if over.is_empty() {
+            return;
+        }
+        let who = format!("backup_reaper@{}", self.my_node_name);
+        for name in over {
+            // The leader prunes its OWN dir locally; never SSH-reap ourselves.
+            if name.eq_ignore_ascii_case(&self.my_node_name) {
+                continue;
+            }
+            for (kind, keep) in [
+                ("postgres", LOCAL_KEEP_POSTGRES_PEER),
+                ("redis", LOCAL_KEEP_REDIS_PEER),
+            ] {
+                // Coalesce: skip a peer that still has a pending/running reap of
+                // this kind. Fail-open (a count error still enqueues).
+                let inflight: i64 = match sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM deferred_tasks \
+                      WHERE preferred_node = $1 \
+                        AND kind = 'shell' \
+                        AND status IN ('pending', 'dispatchable', 'running') \
+                        AND title LIKE $2",
+                )
+                .bind(&name)
+                .bind(reap_title_like(kind))
+                .fetch_one(&self.pg)
+                .await
+                {
+                    Ok(n) => n,
+                    Err(e) => {
+                        warn!(target_node = %name, error = %e,
+                              "backup reaper coalesce check failed; enqueueing anyway");
+                        0
+                    }
+                };
+                if inflight > 0 {
+                    continue;
+                }
+
+                let script = peer_backup_reap_script(kind, keep);
+                if script.is_empty() {
+                    continue;
+                }
+                let title = format!("reap {kind} backups on {name} (over-quota self-heal)");
+                let payload = serde_json::json!({ "command": script, "summary": title });
+                // "now" trigger + preferred_node: any worker (including the
+                // leader's, which is guaranteed to run the new binary) can claim
+                // it and SSH the reap to the peer — so a wedged peer worker can't
+                // block its own disk rescue.
+                match pg_enqueue_deferred(
+                    &self.pg,
+                    &title,
+                    "shell",
+                    &payload,
+                    "now",
+                    &serde_json::json!({}),
+                    Some(&name),
+                    &serde_json::json!([]),
+                    Some(&who),
+                    Some(2),
+                )
+                .await
+                {
+                    Ok(_id) => info!(
+                        target_node = %name, kind, keep,
+                        "backup reaper: enqueued over-quota replica prune"
+                    ),
+                    Err(e) => warn!(target_node = %name, kind, error = %e,
+                                    "backup reaper: failed to enqueue reap task"),
+                }
+            }
+        }
+    }
 }
 
 // ─── Free helpers ─────────────────────────────────────────────────────
@@ -873,6 +981,45 @@ fn kind_prefix(kind: &str) -> &'static str {
 /// format produced in `enqueue_distribution`.
 fn backup_rsync_title_like(kind: &str) -> String {
     format!("rsync {kind} backup %")
+}
+
+/// SQL `LIKE` pattern matching every over-quota backup-reap task title for
+/// `kind` (titles look like `reap <kind> backups on <peer> (...)`). Used by
+/// [`BackupOrchestrator::reap_over_quota_peers`] to coalesce — a peer with an
+/// in-flight reap of this kind is skipped so repeated backup ticks never pile up
+/// duplicate reaps. Pure so it's unit-testable against the real title format.
+fn reap_title_like(kind: &str) -> String {
+    format!("reap {kind} backups %")
+}
+
+/// Build the self-contained POSIX-sh script that prunes a peer's
+/// `~/.forgefleet/backups/<kind>/` directory to the newest `keep` generations.
+///
+/// Carries NO `ff`/`forgefleetd` dependency (plain `ls`/`tail`/`rm`), so it
+/// heals a peer whose binary predates the in-process prune (#210). Only touches
+/// files matching the kind's backup prefix (`pg-`/`redis-`), so an operator file
+/// dropped in the directory is never deleted; an unknown kind yields an empty
+/// string (caller skips it) rather than a match-all. Pure — no IO — so the
+/// generated command is unit-testable.
+fn peer_backup_reap_script(kind: &str, keep: usize) -> String {
+    let prefix = kind_prefix(kind);
+    if prefix.is_empty() {
+        return String::new();
+    }
+    let keep = keep.max(1);
+    // `ls -1t` lists newest-first (full paths, because the glob is anchored to
+    // "$d"); `tail -n +<keep+1>` selects everything past the kept window. Glob
+    // expansion + ls errors are swallowed so an empty/absent dir is a clean
+    // no-op. `rm -f "$f"` operates on the full path ls emitted.
+    let start = keep + 1;
+    format!(
+        "d=\"$HOME/.forgefleet/backups/{kind}\"; \
+         if [ -d \"$d\" ]; then \
+           ls -1t \"$d\"/{prefix}* 2>/dev/null | tail -n +{start} \
+             | while IFS= read -r f; do rm -f \"$f\"; done; \
+         fi; \
+         echo \"backup-reap {kind} keep={keep} done\""
+    )
 }
 
 /// Given `(path, mtime, size)` tuples, return the `(path, size)` of files
@@ -1081,6 +1228,49 @@ mod tests {
         let pg_prefix = pg_prefix.trim_end_matches('%');
         let redis_title = "rsync redis backup redis-20260613T094023Z.rdb.zst.age → priya";
         assert!(!redis_title.starts_with(pg_prefix));
+    }
+
+    #[test]
+    fn reap_title_like_matches_real_reap_titles() {
+        // The coalesce LIKE pattern's literal prefix must align with the title
+        // built in reap_over_quota_peers, or the in-flight check silently matches
+        // nothing and duplicate reaps pile up.
+        for kind in ["postgres", "redis"] {
+            let pat = reap_title_like(kind);
+            let prefix = pat.trim_end_matches('%');
+            let real = format!("reap {kind} backups on ace (over-quota self-heal)");
+            assert!(
+                real.starts_with(prefix),
+                "pattern {pat:?} must prefix real title {real:?}"
+            );
+        }
+        // A postgres reap must NOT match a redis reap (so one kind's in-flight
+        // reap never wrongly suppresses the other's).
+        let pg_prefix = reap_title_like("postgres");
+        let pg_prefix = pg_prefix.trim_end_matches('%');
+        let redis_title = "reap redis backups on ace (over-quota self-heal)";
+        assert!(!redis_title.starts_with(pg_prefix));
+    }
+
+    #[test]
+    fn peer_backup_reap_script_keeps_newest_per_kind() {
+        // postgres: prefix pg-, keep 4 → delete from the 5th newest onward.
+        let pg = peer_backup_reap_script("postgres", 4);
+        assert!(pg.contains("backups/postgres"));
+        assert!(
+            pg.contains("\"$d\"/pg-*"),
+            "must restrict to the pg- prefix"
+        );
+        assert!(pg.contains("tail -n +5"), "keep=4 → delete from line 5");
+        assert!(pg.contains("rm -f \"$f\""));
+        // redis: prefix redis-, keep 24 → delete from the 25th onward.
+        let redis = peer_backup_reap_script("redis", 24);
+        assert!(redis.contains("\"$d\"/redis-*"));
+        assert!(redis.contains("tail -n +25"));
+        // Unknown kind → empty (caller skips), never a match-all `rm`.
+        assert!(peer_backup_reap_script("nats", 4).is_empty());
+        // keep is floored at 1 so a 0 can never delete every generation.
+        assert!(peer_backup_reap_script("postgres", 0).contains("tail -n +2"));
     }
 
     #[test]
