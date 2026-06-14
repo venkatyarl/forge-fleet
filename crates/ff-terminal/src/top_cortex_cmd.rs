@@ -29,10 +29,17 @@ pub enum TopCortexCommand {
         /// Force a specific language instead of auto-detecting (rust/typescript/javascript/java).
         #[arg(long)]
         lang: Option<String>,
-        /// Reindex only files changed since the last index (skip the full rewipe).
-        /// First run on a corpus reindexes everything; later runs touch only diffs.
+        /// (Now the default — kept for back-compat.) Reindex only files changed
+        /// since the last index. Existing hooks/scripts that pass `--incremental`
+        /// keep working; new callers don't need it.
         #[arg(long)]
         incremental: bool,
+        /// Force a full rewipe + reparse of every file, ignoring the incremental
+        /// ledger. Use after a Cortex parser/ingest change (incremental won't
+        /// re-apply a new parser to files whose content is unchanged) or for a
+        /// guaranteed-clean rebuild. Default is incremental.
+        #[arg(long)]
+        full: bool,
     },
     /// Show the indexed corpus for the cwd (or --all corpora): node/edge counts.
     Status {
@@ -409,9 +416,16 @@ pub async fn handle_top_cortex(args: TopCortexArgs) -> Result<()> {
             slug,
             lang,
             incremental,
+            full,
         } => {
             let (root, slug) = resolve_root_slug(path, slug)?;
-            run_index(&pool, &root, &slug, lang, true, incremental).await?;
+            // Incremental is the default now (the #263-#265 perf lane): a no-op
+            // reindex skips unchanged code/docs/data/images — and crucially does
+            // NOT re-caption images via the vision LLM — instead of rewiping.
+            // `--full` forces the old rewipe; `--incremental` is accepted for
+            // back-compat but redundant since it's the default.
+            let _ = incremental;
+            run_index(&pool, &root, &slug, lang, true, !full).await?;
         }
         TopCortexCommand::Embed {
             max,
