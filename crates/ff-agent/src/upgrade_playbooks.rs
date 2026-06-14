@@ -21,6 +21,42 @@ pub fn playbook_for(tool: &str, os_family: &str) -> Option<String> {
     }
 }
 
+/// Build a shell snippet that installs a freshly-built `target/release/{bin}`
+/// to `{dest}` **atomically** and only after proving the result runs.
+///
+/// Why this exists: a plain `install -m 755 target/release/ff $DEST` writes
+/// straight into PATH, so a disk-full / interrupted copy leaves a truncated,
+/// unrunnable binary *there*. Observed on ace 2026-06-14: a 304-byte garbage
+/// `~/.local/bin/ff` from an ENOSPC `install` (the disk was at 100%). Every
+/// `ff` invocation then died with a shell syntax error, the host could not run
+/// any `ff` verb, and — because forgefleetd kept heartbeating on its stale
+/// binary — nothing detected the CLI was dead. The `&&` chain that followed
+/// (`codesign`, restart) aborted, so the upgrade task "failed" yet still left
+/// the poisoned binary in PATH.
+///
+/// This installs to `{dest}.new`, code-signs it (macOS, so the temp itself is
+/// validatable), proves it executes via `--version`, then atomically renames
+/// it over `{dest}`. `mv` within one filesystem is a single rename(2), so PATH
+/// only ever sees the old (working) binary or the new (validated) one — never a
+/// half-written one. On ANY failure the temp is removed and the snippet
+/// `exit 1`s, so the upgrade is recorded as FAILED (loud + retryable by the
+/// version-drift machinery) instead of silently bricking the host's CLI.
+pub fn atomic_install_cmd(bin: &str, dest: &str, codesign: bool) -> String {
+    let sign = if codesign {
+        format!("codesign --force --sign - \"{dest}.new\" && ")
+    } else {
+        String::new()
+    };
+    format!(
+        "{{ install -m 755 target/release/{bin} \"{dest}.new\" && \
+         {sign}\"{dest}.new\" --version >/dev/null 2>&1 && \
+         mv -f \"{dest}.new\" \"{dest}\"; }} || \
+         {{ rm -f \"{dest}.new\"; \
+         echo \"upgrade: install/validate of {dest} failed; kept existing binary\" >&2; \
+         exit 1; }}"
+    )
+}
+
 /// Normalise an `os_family` to its base family, or `None` if unrecognised.
 fn base_family(os_family: &str) -> Option<&'static str> {
     if os_family.starts_with("linux") {
@@ -66,23 +102,20 @@ fn playbook_exact(tool: &str, os_family: &str) -> Option<String> {
         // fail with `cargo: not found`. Tracking down that one-line error
         // cost a fleet-wide upgrade attempt 2026-05-16. Use `. <file>`
         // (POSIX `source`) so dash + bash both load it.
-        ("ff_git" | "ff", "macos") => Some(
+        ("ff_git" | "ff", "macos") => Some(format!(
             ". \"$HOME/.cargo/env\" 2>/dev/null || true; \
              cd ~/projects/forge-fleet && git pull --ff-only && \
-             cargo build -p ff-terminal --release && \
-             install -m 755 target/release/ff ~/.local/bin/ff && \
-             codesign --force --sign - ~/.local/bin/ff"
-                .into(),
-        ),
-        ("ff_git" | "ff", "linux") => Some(
+             cargo build -p ff-terminal --release && {install}",
+            install = atomic_install_cmd("ff", "$HOME/.local/bin/ff", true),
+        )),
+        ("ff_git" | "ff", "linux") => Some(format!(
             ". \"$HOME/.cargo/env\" 2>/dev/null || true; \
              cd ~/projects/forge-fleet && git reset --hard HEAD && \
              git clean -fdx graphify-out node-compile-cache && \
              git pull --ff-only && \
-             cargo build -p ff-terminal --release && \
-             install -m 755 target/release/ff ~/.local/bin/ff"
-                .into(),
-        ),
+             cargo build -p ff-terminal --release && {install}",
+            install = atomic_install_cmd("ff", "$HOME/.local/bin/ff", false),
+        )),
         // forgefleetd build + install + RESTART. Without the restart step
         // the upgrade only refreshes the binary on disk; the running daemon
         // keeps executing old code in memory. Discovered 2026-05-16: after
@@ -116,28 +149,25 @@ fn playbook_exact(tool: &str, os_family: &str) -> Option<String> {
         // restart via `systemctl --no-block` (or a detached pkill+nohup
         // respawn). The leading 2s sleep guarantees the success write lands
         // before the daemon is bounced.
-        ("forgefleetd_git" | "forgefleetd", "macos") => Some(
+        ("forgefleetd_git" | "forgefleetd", "macos") => Some(format!(
             ". \"$HOME/.cargo/env\" 2>/dev/null || true; \
              cd ~/projects/forge-fleet && git pull --ff-only && \
-             cargo build --bin forgefleetd --release && \
-             install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && \
-             codesign --force --sign - ~/.local/bin/forgefleetd && \
+             cargo build --bin forgefleetd --release && {install} && \
              USER_ID=$(stat -f %u \"$HOME\" 2>/dev/null || id -u); \
-             launchctl kickstart -k \"gui/${USER_ID}/com.forgefleet.forgefleetd\" 2>/dev/null \
-               || launchctl kickstart -k \"user/${USER_ID}/com.forgefleet.forgefleetd\" 2>/dev/null \
+             launchctl kickstart -k \"gui/${{USER_ID}}/com.forgefleet.forgefleetd\" 2>/dev/null \
+               || launchctl kickstart -k \"user/${{USER_ID}}/com.forgefleet.forgefleetd\" 2>/dev/null \
                || (pkill -TERM -f \"$HOME/.local/bin/forgefleetd\" 2>/dev/null; sleep 1; \
                    nohup \"$HOME/.local/bin/forgefleetd\" --worker-name $(hostname -s) start \
-                   </dev/null >/tmp/forgefleetd.log 2>&1 & disown)"
-                .into(),
-        ),
-        ("forgefleetd_git" | "forgefleetd", "linux") => Some(
+                   </dev/null >/tmp/forgefleetd.log 2>&1 & disown)",
+            install = atomic_install_cmd("forgefleetd", "$HOME/.local/bin/forgefleetd", true),
+        )),
+        ("forgefleetd_git" | "forgefleetd", "linux") => Some(format!(
             ". \"$HOME/.cargo/env\" 2>/dev/null || true; \
              cd ~/projects/forge-fleet && git reset --hard HEAD && \
              git clean -fdx graphify-out node-compile-cache && \
              git pull --ff-only && \
-             cargo build --bin forgefleetd --release && \
-             install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && \
-             export XDG_RUNTIME_DIR=\"${XDG_RUNTIME_DIR:-/run/user/$(id -u)}\"; \
+             cargo build --bin forgefleetd --release && {install} && \
+             export XDG_RUNTIME_DIR=\"${{XDG_RUNTIME_DIR:-/run/user/$(id -u)}}\"; \
              setsid bash -c 'sleep 2; \
                systemctl --user reset-failed forgefleetd.service 2>/dev/null; \
                systemctl --user restart --no-block forgefleetd.service </dev/null >/dev/null 2>&1 \
@@ -146,22 +176,21 @@ fn playbook_exact(tool: &str, os_family: &str) -> Option<String> {
                       </dev/null >/tmp/forgefleetd.log 2>&1 & disown )' \
                </dev/null >/tmp/forgefleetd-restart.log 2>&1 & \
              disown; \
-             echo \"build+install OK; restart dispatched detached (setsid + --no-block; survives worker self-kill)\""
-                .into(),
-        ),
+             echo \"build+install OK; restart dispatched detached (setsid + --no-block; survives worker self-kill)\"",
+            install = atomic_install_cmd("forgefleetd", "$HOME/.local/bin/forgefleetd", false),
+        )),
         // DGX Sparks: aarch64 + 4 cores. Default cargo parallelism uses all
         // cores which OOMs LLVM passes during ff-gateway codegen (sia +
         // beyonce both died with exit -1 on 2026-05-19). -j 2 keeps RAM
         // pressure manageable. Same daemon-restart sequence as plain linux.
         // (DGX.1, 2026-05-19.)
-        ("forgefleetd_git" | "forgefleetd", "linux-dgx") => Some(
+        ("forgefleetd_git" | "forgefleetd", "linux-dgx") => Some(format!(
             ". \"$HOME/.cargo/env\" 2>/dev/null || true; \
              cd ~/projects/forge-fleet && git reset --hard HEAD && \
              git clean -fdx graphify-out node-compile-cache && \
              git pull --ff-only && \
-             cargo build --bin forgefleetd --release -j 2 && \
-             install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && \
-             export XDG_RUNTIME_DIR=\"${XDG_RUNTIME_DIR:-/run/user/$(id -u)}\"; \
+             cargo build --bin forgefleetd --release -j 2 && {install} && \
+             export XDG_RUNTIME_DIR=\"${{XDG_RUNTIME_DIR:-/run/user/$(id -u)}}\"; \
              setsid bash -c 'sleep 2; \
                systemctl --user reset-failed forgefleetd.service 2>/dev/null; \
                systemctl --user restart --no-block forgefleetd.service </dev/null >/dev/null 2>&1 \
@@ -170,9 +199,9 @@ fn playbook_exact(tool: &str, os_family: &str) -> Option<String> {
                       </dev/null >/tmp/forgefleetd.log 2>&1 & disown )' \
                </dev/null >/tmp/forgefleetd-restart.log 2>&1 & \
              disown; \
-             echo \"build+install OK; restart dispatched detached (setsid + --no-block; survives worker self-kill)\""
-                .into(),
-        ),
+             echo \"build+install OK; restart dispatched detached (setsid + --no-block; survives worker self-kill)\"",
+            install = atomic_install_cmd("forgefleetd", "$HOME/.local/bin/forgefleetd", false),
+        )),
         ("os", "linux") => Some("sudo apt-get update && sudo apt-get -y upgrade".into()),
         ("os", "macos") => Some("softwareupdate -i -a".into()),
         _ => None,
@@ -210,6 +239,60 @@ mod tests {
     #[test]
     fn unknown_os_is_none() {
         assert!(playbook_for("forgefleetd_git", "plan9").is_none());
+    }
+
+    #[test]
+    fn atomic_install_uses_temp_validate_then_rename() {
+        // The ace 2026-06-14 brick: a disk-full `install` straight into
+        // ~/.local/bin/ff left a 304-byte garbage binary in PATH. The install
+        // must go to a temp, prove it runs, then atomically rename — and on
+        // failure remove the temp + exit non-zero so PATH keeps the old binary.
+        let mac = atomic_install_cmd("ff", "$HOME/.local/bin/ff", true);
+        assert!(mac.contains("install -m 755 target/release/ff \"$HOME/.local/bin/ff.new\""));
+        assert!(mac.contains("codesign --force --sign - \"$HOME/.local/bin/ff.new\""));
+        assert!(mac.contains("\"$HOME/.local/bin/ff.new\" --version"));
+        assert!(mac.contains("mv -f \"$HOME/.local/bin/ff.new\" \"$HOME/.local/bin/ff\""));
+        assert!(mac.contains("rm -f \"$HOME/.local/bin/ff.new\""));
+        assert!(mac.contains("exit 1"));
+
+        // Linux build has no code-signing step.
+        let lin = atomic_install_cmd("forgefleetd", "$HOME/.local/bin/forgefleetd", false);
+        assert!(!lin.contains("codesign"));
+        assert!(lin.contains("\"$HOME/.local/bin/forgefleetd.new\" --version"));
+        assert!(lin.contains("mv -f \"$HOME/.local/bin/forgefleetd.new\""));
+    }
+
+    #[test]
+    fn cargo_binary_playbooks_install_atomically() {
+        // Every cargo-binary upgrade arm must validate-then-rename (never write
+        // straight into PATH) so an interrupted/disk-full copy can't brick the
+        // host's CLI or daemon binary.
+        for (tool, fam) in [
+            ("ff_git", "macos"),
+            ("ff_git", "linux"),
+            ("forgefleetd_git", "macos"),
+            ("forgefleetd_git", "linux"),
+            ("forgefleetd_git", "linux-dgx"),
+        ] {
+            let p = playbook_for(tool, fam).unwrap_or_else(|| panic!("no playbook {tool}/{fam}"));
+            assert!(
+                p.contains(".new\""),
+                "{tool}/{fam}: not installing to a temp"
+            );
+            assert!(
+                p.contains(".new\" --version"),
+                "{tool}/{fam}: not validated"
+            );
+            assert!(p.contains("mv -f"), "{tool}/{fam}: not atomically renamed");
+            // Must NOT write the final binary directly (the old poisoning path).
+            assert!(
+                !p.contains("install -m 755 target/release/ff \"$HOME/.local/bin/ff\"")
+                    && !p.contains(
+                        "install -m 755 target/release/forgefleetd \"$HOME/.local/bin/forgefleetd\""
+                    ),
+                "{tool}/{fam}: still installs directly into PATH"
+            );
+        }
     }
 
     #[test]

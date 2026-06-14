@@ -603,22 +603,28 @@ async fn maybe_self_upgrade_leader(pool: &PgPool, my_name: &str, running_sha: &s
         }
     }
 
-    // OS-specific graceful restart (NOT pkill) + macOS codesign.
-    let (restart, sign_ffd, sign_ff, sign_cargo) = if cfg!(target_os = "macos") {
-        (
-            "launchctl kickstart -k gui/$(id -u)/com.forgefleet.forgefleetd",
-            "codesign --force --sign - \"$HOME/.local/bin/forgefleetd\"",
-            "codesign --force --sign - \"$HOME/.local/bin/ff\"",
-            "codesign --force --sign - \"$HOME/.cargo/bin/ff\"",
-        )
+    // OS-specific graceful restart (NOT pkill). Code-signing is folded into the
+    // atomic_install_cmd snippets below (macOS signs the `.new` temp before it
+    // is validated + renamed into place).
+    let codesign = cfg!(target_os = "macos");
+    let restart = if codesign {
+        "launchctl kickstart -k gui/$(id -u)/com.forgefleet.forgefleetd"
     } else {
-        (
-            "systemctl --user restart forgefleetd",
-            "true",
-            "true",
-            "true",
-        )
+        "systemctl --user restart forgefleetd"
     };
+    // Atomic, validated installs: write to `.new`, prove `--version` runs, then
+    // rename over the live binary. A disk-full / interrupted copy can never
+    // leave a truncated binary in PATH (bricked ace's `ff` 2026-06-14). See
+    // upgrade_playbooks::atomic_install_cmd.
+    let install_ffd = crate::upgrade_playbooks::atomic_install_cmd(
+        "forgefleetd",
+        "$HOME/.local/bin/forgefleetd",
+        codesign,
+    );
+    let install_ff =
+        crate::upgrade_playbooks::atomic_install_cmd("ff", "$HOME/.local/bin/ff", codesign);
+    let install_ff_cargo =
+        crate::upgrade_playbooks::atomic_install_cmd("ff", "$HOME/.cargo/bin/ff", codesign);
 
     let log = format!("{home}/.forgefleet/logs/leader-self-upgrade.log");
     let script = format!(
@@ -633,11 +639,9 @@ async fn maybe_self_upgrade_leader(pool: &PgPool, my_name: &str, running_sha: &s
          git reset --hard \"{git_ref}\"\n\
          cargo build --release --bin forgefleetd\n\
          cargo build --release -p ff-terminal --bin ff\n\
-         install -m 755 target/release/forgefleetd \"$HOME/.local/bin/forgefleetd\"\n\
-         {sign_ffd}\n\
-         install -m 755 target/release/ff \"$HOME/.local/bin/ff\"\n\
-         {sign_ff}\n\
-         if [ -f \"$HOME/.cargo/bin/ff\" ]; then install -m 755 target/release/ff \"$HOME/.cargo/bin/ff\"; {sign_cargo}; fi\n\
+         {install_ffd}\n\
+         {install_ff}\n\
+         if [ -f \"$HOME/.cargo/bin/ff\" ]; then {install_ff_cargo}; fi\n\
          echo \"build+install OK; restarting daemon\"\n\
          {restart}\n"
     );
