@@ -2926,6 +2926,23 @@ async fn start_pulse_v2_subsystems(
         ff_agent::db_integrity::AmcheckTick::new(pg_pool.clone(), worker_name.clone());
     handles.push(amcheck_tick.spawn(shutdown_rx.clone()));
 
+    // (7c) Stale-job sweeper — every 5min on the leader. Recovers
+    // `fleet_model_jobs` + `deferred_tasks` rows stuck in `running` (crashed
+    // process, stalled download, or a worker restarted mid-task by the upgrade
+    // wave leaving its own claimed rows orphaned). This used to run ONLY inside
+    // the legacy `ff daemon`; PR #298's legacy-daemon reaper disabled every
+    // legacy `ff daemon` fleet-wide, which silently killed the sweep and let
+    // orphaned deferred tasks leak. Relocated here (forgefleetd is production)
+    // with the SAME SweepPolicy thresholds — a pure relocation. Leader-gated
+    // inside the tick on every fire, so it's safe to start on every daemon.
+    info!(
+        node = %worker_name.clone(),
+        "starting subsystem: stale-job sweeper (5min, leader-gated)"
+    );
+    let stale_job_sweeper =
+        ff_agent::job_sweeper::StaleJobSweeperTick::new(pg_pool.clone(), worker_name.clone());
+    handles.push(stale_job_sweeper.spawn(shutdown_rx.clone()));
+
     // (8) Auto-upgrade hourly tick — runs on every daemon, internally
     // gated on leader + fleet_secrets.auto_upgrade_enabled. Refreshes
     // upstream versions (npm/pypi/github_release/self_built), flips
