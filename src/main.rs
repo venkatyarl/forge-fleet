@@ -954,6 +954,50 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         }));
     }
 
+    // 20f) Legacy `ff daemon` reaper tick — every 1h, per-node (idempotent).
+    //
+    // The worker loops (defer-worker, disk sampler, deployment reconciler) that
+    // once lived in the sibling `ff daemon` CLI are now folded into forgefleetd
+    // itself, so `ff daemon` is pure legacy (feedback_two_daemons). But the old
+    // `ff daemon` processes were never stopped when hosts migrated: on
+    // 2026-06-14, 12 of 15 hosts still ran a multi-week-old `ff daemon` (james
+    // carried two, 15 days old). These stale supervisors race forgefleetd's
+    // worker (a 15-day-old `ff` binary that wins a deferred-task claim runs the
+    // task with pre-fix logic) and duplicate its reconciler/disk ticks. This
+    // SIGTERMs any process whose command is `<…>/ff daemon …` (basename exactly
+    // `ff`, first arg `daemon`, not `--once`) older than
+    // FORGEFLEET_LEGACY_DAEMON_REAP_SECS (default 300s). `forgefleetd` is a
+    // different basename so it can never match. The interval's first tick fires
+    // immediately, so a freshly-(re)started forgefleetd reaps the legacy daemon
+    // on this host at startup. Set FORGEFLEET_LEGACY_DAEMON_REAP_SECS=0 to
+    // disable.
+    if let Some(min_age) = ff_agent::legacy_daemon_reaper::min_age_secs() {
+        info!(
+            min_age_secs = min_age,
+            "starting subsystem: legacy `ff daemon` reaper tick (1h, per-node)"
+        );
+        let mut shutdown_rx_legacy = shutdown_rx.clone();
+        subsystem_tasks.push(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = shutdown_rx_legacy.changed() => break,
+                    _ = tick.tick() => {
+                        match ff_agent::legacy_daemon_reaper::reap_once(min_age) {
+                            0 => {}
+                            n => warn!(
+                                reaped = n,
+                                min_age_secs = min_age,
+                                "reaped legacy `ff daemon` supervisor process(es) superseded by forgefleetd"
+                            ),
+                        }
+                    }
+                }
+            }
+        }));
+    }
+
     // 21) Disk-reconcile tick — every 5min, leader-gated.
     //
     // V118 active disk management: reads `fleet_disk_usage`, finds over-quota
