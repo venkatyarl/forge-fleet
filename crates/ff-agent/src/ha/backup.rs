@@ -1070,11 +1070,25 @@ async fn validate_backup_size(kind: &str, path: &Path, size_bytes: i64) -> Resul
 /// this kind is skipped — so one wedged transfer holding `running` for an hour
 /// starves that peer of every fresh snapshot until it clears. `--partial` lets
 /// the next attempt resume rather than restart.
+///
+/// `IdentityAgent=none` + `BatchMode=yes` (HA.2, 2026-06-14): the rsync runs as a
+/// child of `forgefleetd`, which on headless Ubuntu members (sophie, priya)
+/// inherits `SSH_AUTH_SOCK=/run/user/<uid>/keyring/ssh` — the gnome-keyring ssh
+/// agent. With no graphical login that keyring is *locked*: its agent socket
+/// accepts the connection but blocks forever on the sign request, so ssh hangs at
+/// auth. `ConnectTimeout` only covers the TCP connect, not auth, so rsync sees no
+/// data and dies at `--timeout` (300s) every cycle — both followers went stale
+/// while an interactive rsync (which doesn't inherit the wedged agent) finished in
+/// 0.3s, perfectly masking the cause. `IdentityAgent=none` makes ssh ignore
+/// `SSH_AUTH_SOCK` entirely and use the on-disk key; `BatchMode=yes` keeps it
+/// non-interactive (never blocks on a prompt). Proven live on sophie: with the
+/// inherited agent the transfer hangs to the timeout; with these two options it
+/// completes in 0.3s.
 fn backup_rsync_script(kind_safe: &str, source_quoted: &str) -> String {
     format!(
         "mkdir -p \"$HOME/.forgefleet/backups/{kind_safe}/\" && \
          rsync -a \
-           -e 'ssh -o ServerAliveInterval=60 -o ServerAliveCountMax=10 -o ConnectTimeout=30' \
+           -e 'ssh -o IdentityAgent=none -o BatchMode=yes -o ServerAliveInterval=60 -o ServerAliveCountMax=10 -o ConnectTimeout=30' \
            --timeout=300 \
            --partial \
            {source_quoted} \"$HOME/.forgefleet/backups/{kind_safe}/\""
@@ -1429,6 +1443,16 @@ mod tests {
         assert!(
             script.contains("ServerAliveInterval=60"),
             "script: {script}"
+        );
+        // HA.2 (2026-06-14): bypass the inherited (wedged) gnome-keyring ssh agent
+        // so daemon-spawned backup rsync doesn't hang at auth on headless members.
+        assert!(
+            script.contains("IdentityAgent=none"),
+            "ssh must ignore SSH_AUTH_SOCK so a locked keyring agent can't wedge auth: {script}"
+        );
+        assert!(
+            script.contains("BatchMode=yes"),
+            "ssh must stay non-interactive so it never blocks on a prompt: {script}"
         );
         assert!(script.contains(src), "source must be embedded: {script}");
         assert!(
