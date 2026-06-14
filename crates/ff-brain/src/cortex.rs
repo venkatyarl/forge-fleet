@@ -161,6 +161,13 @@ struct FileParse {
     /// bare call brought into scope by a glob (the `mod tests { use super::*; }`
     /// pattern) to the real symbol instead of fabricating a `code:extern`.
     glob_imports: Vec<String>,
+    /// `pub use` re-exports: (facade_qn, real_target_qn). A facade crate root
+    /// (`pub use crate::migrations::run_migrations;` in `ff_db`'s lib.rs) makes
+    /// `ff_db::run_migrations` an alias for `ff_db::migrations::run_migrations`.
+    /// Calls through the facade path otherwise resolve to a `code:extern`. Both
+    /// halves are stored absolute; the corpus-wide map (built in pass 1) drives a
+    /// redirect-only pass at resolve time. Rust only.
+    reexports: Vec<(String, String)>,
 }
 
 // ─── Public entrypoint ───────────────────────────────────────────────────────
@@ -827,6 +834,25 @@ async fn extract_files(
         });
     }
 
+    // Corpus-wide `pub use` facade map + crate-root set for the facade redirect.
+    // The map is built from this batch's re-exports (complete on a full reindex;
+    // best-effort on an incremental run — a periodic full reindex closes the gap).
+    // Crate roots come from every known internal fn, so they're complete even on
+    // an incremental run (internal_fns is seeded whole-corpus there).
+    let mut reexports: HashMap<String, String> = HashMap::new();
+    for p in &pending {
+        for (facade, target) in &p.parse.reexports {
+            reexports
+                .entry(facade.clone())
+                .or_insert_with(|| target.clone());
+        }
+    }
+    let crate_roots: HashSet<String> = internal_fns
+        .iter()
+        .filter_map(|f| f.split("::").next())
+        .map(|s| s.to_string())
+        .collect();
+
     // Second pass: resolve calls and write calls edges.
     for p in &pending {
         // Build enclosing-fn lookup for this file: for each call, find the
@@ -869,6 +895,25 @@ async fn extract_files(
                 ) {
                     // lever #2b: `Type::method()` in a `use super::*` test module.
                     resolved = m;
+                }
+            }
+
+            // Facade redirect (levers #3/#4): a call through a `pub use` re-export
+            // path (`ff_db::run_migrations` for `ff_db::migrations::run_migrations`)
+            // — or one the resolver caller-prefixed onto a crate-rooted path
+            // (`ff_gateway::brain_api::ff_db::pg_get_brain_user`) — lands on a
+            // `code:extern`. Re-anchor at the crate root and chase the re-export
+            // map to the real symbol. Redirect-only: fires only when the final
+            // target is a known internal fn.
+            if p.parse.lang == Lang::Rust && !internal_fns.contains(&resolved) {
+                if let Some(t) = resolve_facade_call(
+                    &resolved,
+                    &reexports,
+                    &crate_roots,
+                    internal_fns,
+                    internal_types,
+                ) {
+                    resolved = t;
                 }
             }
 
@@ -2442,6 +2487,7 @@ fn parse_rust_file(file_path: &str, source: &str) -> Option<FileParse> {
         use_targets: Vec::new(),
         alias_map: HashMap::new(),
         glob_imports: Vec::new(),
+        reexports: Vec::new(),
     };
 
     // Walk the tree, tracking the current module path (mod blocks) and the
@@ -2468,7 +2514,13 @@ fn walk(
     for child in node.children(&mut cursor) {
         match child.kind() {
             "use_declaration" => {
-                collect_use(&child, bytes, crate_name, fp);
+                // A `pub`/`pub(crate)` re-export aliases the imported items under
+                // the current module path; record them for the facade redirect.
+                let mut vc = child.walk();
+                let is_pub = child
+                    .children(&mut vc)
+                    .any(|c| c.kind() == "visibility_modifier");
+                collect_use(&child, bytes, mod_path, crate_name, is_pub, fp);
             }
             "function_item" => {
                 if let Some(name) = child_field_text(&child, "name", bytes) {
@@ -2637,10 +2689,20 @@ fn call_target_path(func: &Node, bytes: &[u8]) -> Option<String> {
 
 /// Collect a `use` declaration into use_targets + alias_map. Handles
 /// `a::b::c`, `a::b as c`, `a::{b, c}`, and `a::{self, b}`.
-fn collect_use(node: &Node, bytes: &[u8], crate_name: &str, fp: &mut FileParse) {
+fn collect_use(
+    node: &Node,
+    bytes: &[u8],
+    mod_path: &str,
+    crate_name: &str,
+    is_pub: bool,
+    fp: &mut FileParse,
+) {
+    // `pub use` re-exports the items under the current module path (the facade);
+    // a private `use` is not visible to other modules, so it never re-exports.
+    let reexport_base = is_pub.then_some(mod_path);
     // The argument child holds the tree (scoped_identifier / use_list / use_as_clause).
     if let Some(arg) = node.child_by_field_name("argument") {
-        expand_use(&arg, bytes, "", crate_name, fp);
+        expand_use(&arg, bytes, "", crate_name, reexport_base, fp);
     } else {
         // Fallback: some grammars expose children directly.
         let mut cursor = node.walk();
@@ -2648,7 +2710,7 @@ fn collect_use(node: &Node, bytes: &[u8], crate_name: &str, fp: &mut FileParse) 
             match child.kind() {
                 "scoped_identifier" | "use_list" | "use_as_clause" | "identifier"
                 | "scoped_use_list" | "use_wildcard" => {
-                    expand_use(&child, bytes, "", crate_name, fp);
+                    expand_use(&child, bytes, "", crate_name, reexport_base, fp);
                 }
                 _ => {}
             }
@@ -2657,12 +2719,22 @@ fn collect_use(node: &Node, bytes: &[u8], crate_name: &str, fp: &mut FileParse) 
 }
 
 /// Recursively expand a use-tree node under prefix `pfx` (already normalized).
-fn expand_use(node: &Node, bytes: &[u8], pfx: &str, crate_name: &str, fp: &mut FileParse) {
+/// `reexport_base` is `Some(module)` for a `pub use` (the facade module each
+/// imported leaf becomes visible under), `None` for a private `use`.
+fn expand_use(
+    node: &Node,
+    bytes: &[u8],
+    pfx: &str,
+    crate_name: &str,
+    reexport_base: Option<&str>,
+    fp: &mut FileParse,
+) {
     match node.kind() {
         "identifier" => {
             if let Some(name) = node_text(node, bytes) {
                 let full = norm_crate(&join(pfx, &name), crate_name);
                 register_use(&full, &name, fp);
+                record_reexport(reexport_base, &name, &full, crate_name, fp);
             }
         }
         "scoped_identifier" => {
@@ -2671,6 +2743,7 @@ fn expand_use(node: &Node, bytes: &[u8], pfx: &str, crate_name: &str, fp: &mut F
                 let full = norm_crate(&prefixed(pfx, &full_raw), crate_name);
                 let leaf = full.rsplit("::").next().unwrap_or(&full).to_string();
                 register_use(&full, &leaf, fp);
+                record_reexport(reexport_base, &leaf, &full, crate_name, fp);
             }
         }
         "use_as_clause" => {
@@ -2684,6 +2757,7 @@ fn expand_use(node: &Node, bytes: &[u8], pfx: &str, crate_name: &str, fp: &mut F
             if let (Some(path), Some(alias)) = (path, alias) {
                 let full = norm_crate(&prefixed(pfx, &path), crate_name);
                 fp.use_targets.push(full.clone());
+                record_reexport(reexport_base, &alias, &full, crate_name, fp);
                 fp.alias_map.insert(alias, full);
             }
         }
@@ -2696,12 +2770,12 @@ fn expand_use(node: &Node, bytes: &[u8], pfx: &str, crate_name: &str, fp: &mut F
                 .unwrap_or_else(|| pfx.to_string());
             let new_pfx = norm_crate(&new_pfx, crate_name);
             if let Some(list) = node.child_by_field_name("list") {
-                expand_use(&list, bytes, &new_pfx, crate_name, fp);
+                expand_use(&list, bytes, &new_pfx, crate_name, reexport_base, fp);
             } else {
                 let mut cursor = node.walk();
                 for child in node.children(&mut cursor) {
                     if child.kind() == "use_list" {
-                        expand_use(&child, bytes, &new_pfx, crate_name, fp);
+                        expand_use(&child, bytes, &new_pfx, crate_name, reexport_base, fp);
                     }
                 }
             }
@@ -2716,9 +2790,10 @@ fn expand_use(node: &Node, bytes: &[u8], pfx: &str, crate_name: &str, fp: &mut F
                         if !pfx.is_empty() {
                             let leaf = pfx.rsplit("::").next().unwrap_or(pfx).to_string();
                             register_use(pfx, &leaf, fp);
+                            record_reexport(reexport_base, &leaf, pfx, crate_name, fp);
                         }
                     }
-                    _ => expand_use(&child, bytes, pfx, crate_name, fp),
+                    _ => expand_use(&child, bytes, pfx, crate_name, reexport_base, fp),
                 }
             }
         }
@@ -2726,6 +2801,7 @@ fn expand_use(node: &Node, bytes: &[u8], pfx: &str, crate_name: &str, fp: &mut F
             if !pfx.is_empty() {
                 let leaf = pfx.rsplit("::").next().unwrap_or(pfx).to_string();
                 register_use(pfx, &leaf, fp);
+                record_reexport(reexport_base, &leaf, pfx, crate_name, fp);
             }
         }
         "use_wildcard" => {
@@ -2743,7 +2819,7 @@ fn expand_use(node: &Node, bytes: &[u8], pfx: &str, crate_name: &str, fp: &mut F
             // Unknown wrapper: descend.
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
-                expand_use(&child, bytes, pfx, crate_name, fp);
+                expand_use(&child, bytes, pfx, crate_name, reexport_base, fp);
             }
         }
     }
@@ -2752,6 +2828,41 @@ fn expand_use(node: &Node, bytes: &[u8], pfx: &str, crate_name: &str, fp: &mut F
 fn register_use(full: &str, leaf: &str, fp: &mut FileParse) {
     fp.use_targets.push(full.to_string());
     fp.alias_map.insert(leaf.to_string(), full.to_string());
+}
+
+/// Record a `pub use` re-export: the imported `leaf` becomes visible at
+/// `<base>::<leaf>` (the facade) aliasing the real target. No-op for private
+/// `use` (`base` is `None`) and for re-exports of a same-module name (facade ==
+/// target, nothing to redirect). `target` is resolved absolute so the redirect
+/// can match against the corpus's internal symbol set.
+fn record_reexport(
+    base: Option<&str>,
+    leaf: &str,
+    target: &str,
+    crate_name: &str,
+    fp: &mut FileParse,
+) {
+    let Some(base) = base else { return };
+    let facade = join(base, leaf);
+    let abs = abs_reexport_target(target, base, crate_name);
+    if facade != abs {
+        fp.reexports.push((facade, abs));
+    }
+}
+
+/// Resolve a `pub use` target to an absolute path. `crate::` is already rewritten
+/// (`norm_crate`); `super::`/`self::` are relative to the re-exporting module; a
+/// path already headed by this crate or a known external crate is absolute; any
+/// other bare path names a submodule of the current module.
+fn abs_reexport_target(target: &str, mod_path: &str, crate_name: &str) -> String {
+    let first = target.split("::").next().unwrap_or(target);
+    if first == "super" || first == "self" {
+        resolve_glob_prefix(target, mod_path).unwrap_or_else(|| target.to_string())
+    } else if first == crate_name || looks_external(first) {
+        target.to_string()
+    } else {
+        join(mod_path, target)
+    }
 }
 
 /// Combine a prefix with a path fragment, avoiding double `::` and handling the
@@ -2809,6 +2920,7 @@ fn parse_typescript_file(file_path: &str, source: &str) -> Option<FileParse> {
         use_targets: Vec::new(),
         alias_map: HashMap::new(),
         glob_imports: Vec::new(),
+        reexports: Vec::new(),
     };
     walk_ts(&root, bytes, &module, file_path, None, &mut fp);
     // Calls are collected in ONE global pass — attribution is byte-span based
@@ -3276,6 +3388,7 @@ fn parse_java_file(_file_path: &str, source: &str) -> Option<FileParse> {
         use_targets: Vec::new(),
         alias_map: HashMap::new(),
         glob_imports: Vec::new(),
+        reexports: Vec::new(),
     };
     walk_java(&root, bytes, &module, None, &mut fp);
     // One global call pass (byte-span attribution via innermost_fn).
@@ -3458,6 +3571,7 @@ fn parse_python_file(file_path: &str, source: &str) -> Option<FileParse> {
         use_targets: Vec::new(),
         alias_map: HashMap::new(),
         glob_imports: Vec::new(),
+        reexports: Vec::new(),
     };
     walk_python(&root, bytes, &module, None, &mut fp);
     // One global call pass (byte-span attribution via innermost_fn).
@@ -3916,6 +4030,93 @@ fn resolve_glob_impl_method_call(
                     return Some(target);
                 }
             }
+        }
+    }
+    None
+}
+
+/// Facade redirect (levers #3 + #4). Two failure modes leave a real internal
+/// call resolved to a `code:extern`:
+///
+/// - #3 `pub use` re-exports — a facade crate (`ff_db`) re-exports a submodule
+///   item, so `ff_db::run_migrations` is an alias for the real
+///   `ff_db::migrations::run_migrations`; the call lands on the facade path.
+/// - #4 crate-root caller-prefixing — `resolve_call` can't tell a crate-rooted
+///   path (`ff_db::pg_get_brain_user`) from a same-module submodule, so it
+///   fabricates `<caller_module>::ff_db::pg_get_brain_user`.
+///
+/// Combine both: re-anchor at a known crate root (#4), then chase the re-export
+/// map to the real symbol (#3). Also handles a type-facade method receiver
+/// (`ff_db::DbPool::open` → real type `ff_db::connection::DbPool` → flattened
+/// method `ff_db::connection::open`). Redirect-only — every branch returns a name
+/// that is already a known internal fn, so it never fabricates an edge.
+fn resolve_facade_call(
+    resolved: &str,
+    reexports: &HashMap<String, String>,
+    crate_roots: &HashSet<String>,
+    internal_fns: &HashSet<String>,
+    internal_types: &HashSet<String>,
+) -> Option<String> {
+    // Candidate paths: the resolved name as-is, plus a crate-root-anchored suffix
+    // if the resolver caller-prefixed a crate-qualified path.
+    let mut cands = vec![resolved.to_string()];
+    if let Some(anchored) = anchor_at_crate_root(resolved, crate_roots) {
+        cands.push(anchored);
+    }
+    for cand in &cands {
+        // (a) the anchored path is itself the real fn (#4 with no facade hop).
+        if cand != resolved && internal_fns.contains(cand) {
+            return Some(cand.clone());
+        }
+        // (b) function facade: chase `facade -> … -> real fn`.
+        if let Some(t) = chase_reexport(cand, reexports, internal_fns) {
+            return Some(t);
+        }
+        // (c) type-facade method receiver: rewrite the type segment through the
+        //     re-export map, then flatten via the inherent-impl convention.
+        if let Some((parent_type, leaf)) = cand.rsplit_once("::") {
+            if let Some(real_type) = chase_reexport(parent_type, reexports, internal_types) {
+                if let Some((module, _)) = real_type.rsplit_once("::") {
+                    let target = join(module, leaf);
+                    if internal_fns.contains(&target) {
+                        return Some(target);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Follow a `pub use` re-export chain from `start` until it lands on a name in
+/// `target_set` (the internal fn or type set). Bounded to a few hops to tolerate
+/// re-export chains without looping. Returns `None` if no hop lands internal.
+fn chase_reexport(
+    start: &str,
+    reexports: &HashMap<String, String>,
+    target_set: &HashSet<String>,
+) -> Option<String> {
+    let mut cur = start;
+    for _ in 0..4 {
+        let next = reexports.get(cur)?;
+        if target_set.contains(next) {
+            return Some(next.clone());
+        }
+        cur = next;
+    }
+    None
+}
+
+/// If `resolved` carries a known crate root in a non-head position (the shape
+/// `resolve_call` fabricates when it caller-prefixes a crate-qualified path,
+/// `ff_gateway::brain_api::ff_db::foo`), return the suffix from that crate root
+/// (`ff_db::foo`). Uses the LAST such root so the most specific (closest to the
+/// leaf) anchor wins.
+fn anchor_at_crate_root(resolved: &str, crate_roots: &HashSet<String>) -> Option<String> {
+    let segs: Vec<&str> = resolved.split("::").collect();
+    for i in (1..segs.len()).rev() {
+        if crate_roots.contains(segs[i]) {
+            return Some(segs[i..].join("::"));
         }
     }
     None
@@ -4578,6 +4779,7 @@ diff --git a/src/b.rs b/src/b.rs
             use_targets: vec![],
             alias_map,
             glob_imports: vec![],
+            reexports: vec![],
         }
     }
 
@@ -4931,6 +5133,182 @@ diff --git a/src/b.rs b/src/b.rs
     }
 
     #[test]
+    fn anchor_at_crate_root_strips_caller_prefix() {
+        let roots: HashSet<String> = ["ff_db".to_string(), "ff_gateway".to_string()].into();
+        // caller-prefixed crate-qualified path -> re-anchored at the crate root.
+        assert_eq!(
+            anchor_at_crate_root("ff_gateway::brain_api::ff_db::pg_get_brain_user", &roots),
+            Some("ff_db::pg_get_brain_user".to_string())
+        );
+        // head is already a crate root (position 0) -> nothing to strip.
+        assert_eq!(anchor_at_crate_root("ff_db::run_migrations", &roots), None);
+        // no crate root anywhere -> None.
+        assert_eq!(anchor_at_crate_root("some::ext::thing", &roots), None);
+    }
+
+    #[test]
+    fn chase_reexport_follows_chain_to_internal() {
+        let map: HashMap<String, String> = [
+            (
+                "ff_db::run_migrations".to_string(),
+                "ff_db::a::run".to_string(),
+            ),
+            (
+                "ff_db::a::run".to_string(),
+                "ff_db::migrations::run_migrations".to_string(),
+            ),
+        ]
+        .into();
+        let fns: HashSet<String> = ["ff_db::migrations::run_migrations".to_string()].into();
+        assert_eq!(
+            chase_reexport("ff_db::run_migrations", &map, &fns),
+            Some("ff_db::migrations::run_migrations".to_string())
+        );
+        // a facade that never lands internal -> None.
+        let empty: HashSet<String> = HashSet::new();
+        assert_eq!(chase_reexport("ff_db::run_migrations", &map, &empty), None);
+    }
+
+    #[test]
+    fn facade_redirect_resolves_function_reexport() {
+        // ff_db re-exports `run_migrations` at the crate root; the real fn lives in
+        // ff_db::migrations. Doctor hit: `ff_db::run_migrations` fan-in 14.
+        let reexports: HashMap<String, String> = [(
+            "ff_db::run_migrations".to_string(),
+            "ff_db::migrations::run_migrations".to_string(),
+        )]
+        .into();
+        let roots: HashSet<String> = ["ff_db".to_string()].into();
+        let fns: HashSet<String> = ["ff_db::migrations::run_migrations".to_string()].into();
+        let types: HashSet<String> = HashSet::new();
+        assert_eq!(
+            resolve_facade_call("ff_db::run_migrations", &reexports, &roots, &fns, &types),
+            Some("ff_db::migrations::run_migrations".to_string())
+        );
+    }
+
+    #[test]
+    fn facade_redirect_resolves_caller_prefixed_reexport() {
+        // Doctor hit: `ff_gateway::brain_api::ff_db::pg_get_brain_user` fan-in 13.
+        // Caller-prefixed (#4) AND a facade re-export (#3) — both must compose.
+        let reexports: HashMap<String, String> = [(
+            "ff_db::pg_get_brain_user".to_string(),
+            "ff_db::queries::pg_get_brain_user".to_string(),
+        )]
+        .into();
+        let roots: HashSet<String> = ["ff_db".to_string(), "ff_gateway".to_string()].into();
+        let fns: HashSet<String> = ["ff_db::queries::pg_get_brain_user".to_string()].into();
+        let types: HashSet<String> = HashSet::new();
+        assert_eq!(
+            resolve_facade_call(
+                "ff_gateway::brain_api::ff_db::pg_get_brain_user",
+                &reexports,
+                &roots,
+                &fns,
+                &types
+            ),
+            Some("ff_db::queries::pg_get_brain_user".to_string())
+        );
+    }
+
+    #[test]
+    fn facade_redirect_resolves_crate_root_anchor_without_facade() {
+        // #4 alone: caller-prefixed onto a crate-rooted path whose target is the
+        // real fn directly (no `pub use` facade needed).
+        let reexports: HashMap<String, String> = HashMap::new();
+        let roots: HashSet<String> = ["ff_db".to_string(), "ff_gateway".to_string()].into();
+        let fns: HashSet<String> = ["ff_db::queries::pg_list_nodes".to_string()].into();
+        let types: HashSet<String> = HashSet::new();
+        assert_eq!(
+            resolve_facade_call(
+                "ff_gateway::server::ff_db::queries::pg_list_nodes",
+                &reexports,
+                &roots,
+                &fns,
+                &types
+            ),
+            Some("ff_db::queries::pg_list_nodes".to_string())
+        );
+    }
+
+    #[test]
+    fn facade_redirect_resolves_type_facade_method() {
+        // Doctor hit: `ff_db::DbPool::open` fan-in 14. The TYPE is re-exported
+        // (`ff_db::DbPool` -> `ff_db::connection::DbPool`); the method is indexed
+        // flattened at the type's real module (`ff_db::connection::open`).
+        let reexports: HashMap<String, String> = [(
+            "ff_db::DbPool".to_string(),
+            "ff_db::connection::DbPool".to_string(),
+        )]
+        .into();
+        let roots: HashSet<String> = ["ff_db".to_string()].into();
+        let fns: HashSet<String> = ["ff_db::connection::open".to_string()].into();
+        let types: HashSet<String> = ["ff_db::connection::DbPool".to_string()].into();
+        assert_eq!(
+            resolve_facade_call("ff_db::DbPool::open", &reexports, &roots, &fns, &types),
+            Some("ff_db::connection::open".to_string())
+        );
+    }
+
+    #[test]
+    fn facade_redirect_never_fabricates() {
+        // A genuine external call must stay extern: no facade, no internal target.
+        let reexports: HashMap<String, String> = HashMap::new();
+        let roots: HashSet<String> = ["ff_db".to_string()].into();
+        let fns: HashSet<String> = HashSet::new();
+        let types: HashSet<String> = HashSet::new();
+        assert_eq!(
+            resolve_facade_call("toml::from_str", &reexports, &roots, &fns, &types),
+            None
+        );
+    }
+
+    #[test]
+    fn abs_reexport_target_resolves_relative_forms() {
+        // bare submodule path is relative to the re-exporting module.
+        assert_eq!(
+            abs_reexport_target("connection::DbPool", "ff_db", "ff_db"),
+            "ff_db::connection::DbPool"
+        );
+        // crate-rooted path (norm_crate already rewrote `crate::`) is absolute.
+        assert_eq!(
+            abs_reexport_target("ff_db::queries::pg_get_brain_user", "ff_db", "ff_db"),
+            "ff_db::queries::pg_get_brain_user"
+        );
+        // super:: is relative to the re-exporting module.
+        assert_eq!(
+            abs_reexport_target("super::inner::X", "ff_db::facade", "ff_db"),
+            "ff_db::inner::X"
+        );
+    }
+
+    #[test]
+    fn record_reexport_skips_private_and_self_alias() {
+        let mut fp = fp_with("ff_db", "ff_db", &[]);
+        // private use (base None) records nothing.
+        record_reexport(None, "X", "ff_db::a::X", "ff_db", &mut fp);
+        assert!(fp.reexports.is_empty());
+        // re-export of a same-name same-module item (facade == target) is a no-op.
+        record_reexport(Some("ff_db"), "X", "ff_db::X", "ff_db", &mut fp);
+        assert!(fp.reexports.is_empty());
+        // genuine re-export is recorded with an absolute target.
+        record_reexport(
+            Some("ff_db"),
+            "run_migrations",
+            "migrations::run_migrations",
+            "ff_db",
+            &mut fp,
+        );
+        assert_eq!(
+            fp.reexports,
+            vec![(
+                "ff_db::run_migrations".to_string(),
+                "ff_db::migrations::run_migrations".to_string()
+            )]
+        );
+    }
+
+    #[test]
     fn use_self_alias_resolves_cross_module() {
         // autoscaler.rs:547 `model_runtime::load_model(` with
         // `use crate::model_runtime;` (alias model_runtime -> ff_agent::model_runtime).
@@ -5024,6 +5402,31 @@ diff --git a/src/b.rs b/src/b.rs
         assert!(fns.iter().any(|q| q.ends_with("::alpha")));
         assert!(fns.iter().any(|q| q.ends_with("::beta")));
         assert!(fp.calls.iter().any(|c| c.raw_path == "beta"));
+    }
+
+    #[test]
+    fn parse_records_pub_use_reexport() {
+        // A facade crate root: `pub use` makes the submodule item visible at the
+        // crate root (recorded as a re-export); a private `use` does not.
+        let src = "pub use crate::migrations::run_migrations;\n\
+                   use crate::other::helper;\n\
+                   pub fn a() {}\n";
+        let fp = parse_rust_file("/x/crates/ff_db/src/lib.rs", src).unwrap();
+        assert!(
+            fp.reexports
+                .iter()
+                .any(|(facade, target)| facade.ends_with("::run_migrations")
+                    && target.ends_with("::migrations::run_migrations")),
+            "pub use not recorded: {:?}",
+            fp.reexports
+        );
+        assert!(
+            !fp.reexports
+                .iter()
+                .any(|(_, t)| t.ends_with("::other::helper")),
+            "private use must not re-export: {:?}",
+            fp.reexports
+        );
     }
 
     #[test]
