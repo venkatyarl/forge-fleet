@@ -4189,6 +4189,18 @@ fn looks_external(head: &str) -> bool {
             | "redis"
             | "tree_sitter"
             | "tree_sitter_rust"
+            // 3rd-party crates the `ff cortex doctor` diagnostic surfaced as
+            // caller-prefixed phantoms (`<mod>::toml::from_str`,
+            // `<mod>::dirs::home_dir`): treat the bare crate head as already
+            // qualified so it becomes a shared extern, not a per-module phantom.
+            | "toml"
+            | "dirs"
+            | "base64"
+            | "bincode"
+            | "rand"
+            | "tempfile"
+            | "walkdir"
+            | "url"
     )
 }
 
@@ -5357,6 +5369,21 @@ diff --git a/src/b.rs b/src/b.rs
         assert_eq!(
             resolve_call("std::cmp::max", "ff_agent::x::f", &fp),
             "std::cmp::max"
+        );
+    }
+
+    #[test]
+    fn third_party_crate_call_not_caller_prefixed() {
+        // `toml::from_str(...)` / `dirs::home_dir()` written bare must stay a
+        // shared extern, not a `<caller_module>::toml::from_str` phantom.
+        let fp = fp_with("ff_core::hot_reload::tests", "ff_core", &[]);
+        assert_eq!(
+            resolve_call("toml::from_str", "ff_core::hot_reload::tests::t", &fp),
+            "toml::from_str"
+        );
+        assert_eq!(
+            resolve_call("dirs::home_dir", "ff_agent::shared_workspace::f", &fp),
+            "dirs::home_dir"
         );
     }
 
