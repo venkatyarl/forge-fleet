@@ -113,12 +113,12 @@ pub async fn summarize_communities<F: Fn(usize, usize)>(
     // to get both the anchor symbol and the id used to fetch members. Biggest
     // communities first = best ROI under the `max` cap.
     let rows: Vec<(i32, i32, i32, String, String)> = sqlx::query_as(
-        "SELECT c.id, g.community_id, c.member_count, g.title, g.path
-         FROM brain_communities c
+        "SELECT c.id, g.code_community_id, c.member_count, g.title, g.path
+         FROM brain_code_communities c
          JOIN brain_vault_nodes g ON g.id = c.god_node_id
          WHERE c.member_count >= $1
            AND ($2 OR c.summary IS NULL)
-           AND g.community_id IS NOT NULL
+           AND g.code_community_id IS NOT NULL
            AND g.valid_until IS NULL
          ORDER BY c.member_count DESC
          LIMIT $3",
@@ -163,7 +163,7 @@ pub async fn summarize_communities<F: Fn(usize, usize)>(
         let members: Vec<(String, String)> = sqlx::query_as(
             "SELECT title, COALESCE(node_type, '')
              FROM brain_vault_nodes
-             WHERE community_id = $1 AND valid_until IS NULL
+             WHERE code_community_id = $1 AND valid_until IS NULL
              ORDER BY references_ DESC, hits DESC, title ASC
              LIMIT $2",
         )
@@ -209,7 +209,7 @@ pub async fn summarize_communities<F: Fn(usize, usize)>(
 /// Persist a summary on the registry row (stamps model + time).
 async fn store_summary(pool: &PgPool, id: i32, summary: &str, model: &str) -> Result<(), String> {
     sqlx::query(
-        "UPDATE brain_communities
+        "UPDATE brain_code_communities
          SET summary = $1, summary_model = $2, summary_updated_at = NOW()
          WHERE id = $3",
     )
@@ -527,11 +527,11 @@ async fn read_summary_refresh_mode(pool: &PgPool) -> SummaryRefreshMode {
 async fn communities_needing_summary(pool: &PgPool, min_members: usize) -> Result<i64, String> {
     let n: i64 = sqlx::query_scalar(
         "SELECT count(*)
-           FROM brain_communities c
+           FROM brain_code_communities c
            JOIN brain_vault_nodes g ON g.id = c.god_node_id
           WHERE c.member_count >= $1
             AND c.summary IS NULL
-            AND g.community_id IS NOT NULL
+            AND g.code_community_id IS NOT NULL
             AND g.valid_until IS NULL",
     )
     .bind(min_members as i32)
@@ -583,12 +583,14 @@ pub fn spawn_summary_refresh_loop(
                         continue;
                     }
 
-                    // Re-detect communities at the current graph state so the
+                    // Re-detect CODE communities at the current graph state so the
                     // cluster set tracks HEAD (post-#223 nothing else triggers
-                    // this). Stable member_hash means unchanged clusters keep
-                    // their summary; only new/moved ones land summary=NULL.
-                    if let Err(e) = crate::detect_communities(&pg).await {
-                        tracing::warn!(error = %e, "cortex summary-refresh: community detection failed; skipping tick");
+                    // this). Label propagation over the `calls` subgraph (not the
+                    // brain-KG connected-components view). Stable member_hash means
+                    // unchanged clusters keep their summary; only new/moved ones
+                    // land summary=NULL.
+                    if let Err(e) = crate::detect_code_communities(&pg).await {
+                        tracing::warn!(error = %e, "cortex summary-refresh: code-community detection failed; skipping tick");
                         continue;
                     }
 

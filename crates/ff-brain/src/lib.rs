@@ -30,7 +30,7 @@ pub use chat::{
     ThreadSummary, attach_thread, create_thread, get_attached_thread, list_threads,
     receive_message, resolve_user,
 };
-pub use communities::{CommunitySummary, detect_communities};
+pub use communities::{CommunitySummary, detect_code_communities, detect_communities};
 pub use community_summary::{
     CommunitySummaryStats, SummarizeOpts, build_summary_prompt, clean_summary,
     pick_served_model_id, resolve_served_model_id, spawn_summary_refresh_loop,

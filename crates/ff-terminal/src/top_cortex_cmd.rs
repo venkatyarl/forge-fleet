@@ -1661,16 +1661,26 @@ async fn run_embed(
     println!("{CYAN}▶ Detecting communities over the graph...{RESET}");
     match ff_brain::detect_communities(pool).await {
         Ok(summary) => println!(
-            "{GREEN}✓{RESET} {} communities (largest: {} nodes), {} persisted to registry",
+            "{GREEN}✓{RESET} brain KG: {} communities (largest: {} nodes), {} persisted",
             summary.communities_found, summary.largest_community, summary.communities_persisted
         ),
         Err(e) => println!("{YELLOW}⚠ community detection failed: {e}{RESET}"),
     }
+    // Cortex code communities: label propagation over the `calls` subgraph among
+    // non-extern code symbols (what `ff cortex explain`/`summarize` consume —
+    // distinct from the brain-KG connected-components view above).
+    match ff_brain::detect_code_communities(pool).await {
+        Ok(summary) => println!(
+            "{GREEN}✓{RESET} cortex code: {} communities (largest: {} symbols), {} persisted",
+            summary.communities_found, summary.largest_community, summary.communities_persisted
+        ),
+        Err(e) => println!("{YELLOW}⚠ code-community detection failed: {e}{RESET}"),
+    }
     Ok(())
 }
 
-/// `ff cortex summarize`: for each detected community, ask a fleet LLM what the
-/// cluster is responsible for and store the summary on `brain_communities`.
+/// `ff cortex summarize`: for each detected code community, ask a fleet LLM what
+/// the cluster is responsible for and store the summary on `brain_code_communities`.
 #[allow(clippy::too_many_arguments)]
 async fn run_summarize(
     pool: &PgPool,
