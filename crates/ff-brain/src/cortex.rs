@@ -4324,6 +4324,18 @@ fn resolve_call_dotty(raw: &str, caller_qn: &str, fp: &FileParse) -> String {
         _ => {
             if let Some(full) = fp.alias_map.get(head) {
                 join(full, rest)
+            } else if fp.lang == Lang::Java {
+                if let Some(pkg) = java_prelude_package(head) {
+                    // Bare JDK type (java.lang/util) with no import — keep it as a
+                    // stable external path instead of fabricating
+                    // `<caller_pkg>::Type::…`, whose leaf collides with internal
+                    // symbols and pollutes `ff cortex doctor`.
+                    join(pkg, raw)
+                } else if head.chars().next().is_some_and(|c| c.is_uppercase()) {
+                    join(&fp.module, raw)
+                } else {
+                    raw.to_string()
+                }
             } else if head.chars().next().is_some_and(|c| c.is_uppercase()) {
                 // Class-ish receiver with no import: same-module type
                 // (static call or constructor).
@@ -4876,6 +4888,36 @@ fn is_std_prelude_trait(head: &str) -> bool {
             | "Iterator"
             | "IntoIterator"
     )
+}
+
+/// Bare JDK prelude TYPES used as a static-call / constant receiver with no
+/// import (`Boolean.TRUE.equals(x)`, `Integer.parseInt(s)`, `Math.max(a,b)`,
+/// `Objects.requireNonNull(x)`). `java.lang` is auto-imported and `java.util`
+/// statics are pervasive, so these heads appear bare and uppercase — the Java
+/// analog of [`is_std_prelude_type`]. Without this, `resolve_call_dotty`'s
+/// uppercase fallback fabricates `<caller_pkg>::Boolean::TRUE::equals`, an
+/// internally-rooted extern whose leaf (`equals`/`parseInt`/…) then collides with
+/// real internal methods — the #1 `ff cortex doctor` noise source on the Java
+/// corpora. Returns the canonical JDK package so the call becomes a single shared
+/// `java::lang::Boolean::…` extern (head not a corpus module root, so the
+/// diagnostic stops flagging it). Restricted to final/effectively-final JDK
+/// classes that are essentially never shadowed by a user type; a project that DID
+/// define its own merely leaves the call an extern, never mis-attributed — same
+/// conservative failure mode as the Rust prelude levers. Collection *interfaces*
+/// (List/Map/Set/Optional) are deliberately omitted: they're more plausibly
+/// user-shadowed and rarely the receiver of a bare static call.
+fn java_prelude_package(head: &str) -> Option<&'static str> {
+    match head {
+        // java.lang (auto-imported, final boxed primitives + core utilities)
+        "Boolean" | "Byte" | "Short" | "Integer" | "Long" | "Float" | "Double" | "Character"
+        | "String" | "Math" | "System" | "Class" | "Thread" | "Runtime" | "StringBuilder"
+        | "StringBuffer" => Some("java::lang"),
+        // java.util (ubiquitous static-method holders)
+        "Objects" | "Arrays" | "Collections" => Some("java::util"),
+        // java.util.stream
+        "Collectors" => Some("java::util::stream"),
+        _ => None,
+    }
 }
 
 // ─── path / module derivation ────────────────────────────────────────────────
@@ -5779,6 +5821,43 @@ diff --git a/src/b.rs b/src/b.rs
         assert_eq!(
             resolve_java_ctor_call("com::hireflow360::api::ai::AiClient::send", &types),
             None
+        );
+    }
+
+    #[test]
+    fn java_lang_prelude_call_not_caller_pkg_rooted() {
+        // `Boolean.TRUE.equals(x)` in a Java file: head `Boolean` is java.lang,
+        // not imported. Must resolve to a shared `java::lang::…` extern, NOT to
+        // `<caller_pkg>::Boolean::TRUE::equals` (whose `equals` leaf collides with
+        // internal methods — the top `ff cortex doctor` Java noise source).
+        let mut fp = fp_with("com::hireflow360::api::vetting", "com", &[]);
+        fp.lang = Lang::Java;
+        assert_eq!(
+            resolve_call(
+                "Boolean::TRUE::equals",
+                "com::hireflow360::api::vetting::run",
+                &fp
+            ),
+            "java::lang::Boolean::TRUE::equals"
+        );
+        // java.util static holder too.
+        assert_eq!(
+            resolve_call(
+                "Objects::requireNonNull",
+                "com::hireflow360::api::vetting::run",
+                &fp
+            ),
+            "java::util::Objects::requireNonNull"
+        );
+        // A non-prelude uppercase head with no import keeps the same-package
+        // behavior (could be a constructor / static call on a local type).
+        assert_eq!(
+            resolve_call(
+                "MyService::create",
+                "com::hireflow360::api::vetting::run",
+                &fp
+            ),
+            "com::hireflow360::api::vetting::MyService::create"
         );
     }
 
