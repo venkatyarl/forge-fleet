@@ -521,7 +521,78 @@ pub async fn handle_fleet_db(pool: &sqlx::PgPool, cmd: FleetDbCommand) -> Result
         } => {
             handle_fleet_db_verify_backups(pool, limit, test_restore).await?;
         }
+        FleetDbCommand::Backup { kind, now } => {
+            handle_fleet_db_backup_now(pool, &kind, now).await?;
+        }
     }
+    Ok(())
+}
+
+/// `ff fleet db backup --kind <all|postgres|redis> [--now]` — force an
+/// immediate backup cycle through the real HA orchestrator.
+pub async fn handle_fleet_db_backup_now(
+    pool: &sqlx::PgPool,
+    kind: &str,
+    force: bool,
+) -> Result<()> {
+    let kind = kind.to_lowercase();
+    if !matches!(kind.as_str(), "all" | "postgres" | "redis") {
+        anyhow::bail!("--kind must be one of: all | postgres | redis (got '{kind}')");
+    }
+
+    // Resolve THIS host's identity the same way the daemon does.
+    let my_name = ff_agent::fleet_info::resolve_this_worker_name().await;
+    let computer_id: Option<uuid::Uuid> =
+        sqlx::query_scalar("SELECT id FROM computers WHERE name = $1")
+            .bind(&my_name)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| anyhow::anyhow!("query computers by name: {e}"))?;
+    let Some(computer_id) = computer_id else {
+        anyhow::bail!(
+            "no `computers` row for this host ('{my_name}') — run `ff onboard` first. \
+             Backups must originate on an enrolled host (normally the leader)."
+        );
+    };
+
+    println!("{CYAN}▶ Forcing {kind} backup on '{my_name}' (force={force})...{RESET}");
+    let orchestrator = ff_agent::ha::backup::BackupOrchestrator::new(
+        pool.clone(),
+        computer_id,
+        my_name.clone(),
+        None,
+    );
+    let reports = orchestrator
+        .run_once(&kind, force)
+        .await
+        .map_err(|e| anyhow::anyhow!("backup run_once: {e}"))?;
+
+    let mut any_skipped = false;
+    for r in &reports {
+        if !r.produced {
+            any_skipped = true;
+            println!(
+                "{YELLOW}⚠ {kind} skipped — '{my_name}' is not the leader. \
+                 Re-run with --now (the default) or on the leader.{RESET}",
+                kind = r.kind
+            );
+        } else {
+            println!(
+                "{GREEN}✓{RESET} {kind} backup produced: {file} ({bytes} bytes) → distributing to \
+                 {n} peer(s)",
+                kind = r.kind,
+                file = r.file_name,
+                bytes = r.size_bytes,
+                n = r.distributed_to.len(),
+            );
+        }
+    }
+    if any_skipped {
+        std::process::exit(2);
+    }
+    println!(
+        "{GREEN}✓{RESET} backup cycle complete; HA distribution enqueued (watch `ff defer list`)."
+    );
     Ok(())
 }
 
