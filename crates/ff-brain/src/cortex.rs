@@ -2884,10 +2884,14 @@ fn expand_use(
                 // where the `use` appears (the facade base) — record it so a call
                 // through the facade path (`ff_db::pg_get_current_leader` for
                 // `ff_db::leader_state::pg_get_current_leader`) can be redirected at
-                // resolve time. Private globs (`reexport_base` None) only bring
-                // names into local scope — already handled by `glob_imports`.
+                // resolve time. The glob target is made absolute relative to the
+                // re-exporting module (`pub use leader_state::*;` in `ff_db` →
+                // `ff_db::leader_state`), the same way named re-exports are. Private
+                // globs (`reexport_base` None) only bring names into local scope —
+                // already handled by `glob_imports`.
                 if let Some(base) = reexport_base {
-                    fp.glob_reexports.push((base.to_string(), full.clone()));
+                    let abs_target = abs_reexport_target(&full, base, crate_name);
+                    fp.glob_reexports.push((base.to_string(), abs_target));
                 }
                 fp.glob_imports.push(full);
             }
@@ -5668,19 +5672,21 @@ diff --git a/src/b.rs b/src/b.rs
         // A glob `pub use m::*;` re-exports every item of `m` at the crate root,
         // recorded as a (facade_base, target_module) glob re-export; a private
         // glob `use m::*;` only brings names into local scope, not re-exported.
-        let src = "pub use crate::leader_state::*;\n\
-                   use crate::internal::*;\n\
+        // Use the real-world RELATIVE form (`pub use leader_state::*;`, no
+        // `crate::`) — the target must be made absolute relative to the
+        // re-exporting module (base), else the redirect probes the wrong module.
+        let src = "pub use leader_state::*;\n\
+                   use internal::*;\n\
                    pub fn a() {}\n";
         // No Cargo.toml on disk, so the crate root falls back to `crate` (same as
         // the named-reexport test); real indexing resolves it to `ff_db`. Assert on
-        // shape: base is the target's crate-root segment, target is the submodule.
+        // shape: target == base::leader_state (absolute, base-relative).
         let fp = parse_rust_file("/x/crates/ff_db/src/lib.rs", src).unwrap();
         assert!(
             fp.glob_reexports
                 .iter()
-                .any(|(base, target)| target.ends_with("::leader_state")
-                    && Some(base.as_str()) == target.split("::").next()),
-            "pub use glob not recorded: {:?}",
+                .any(|(base, target)| *target == format!("{base}::leader_state")),
+            "pub use glob not recorded absolute: {:?}",
             fp.glob_reexports
         );
         assert!(
