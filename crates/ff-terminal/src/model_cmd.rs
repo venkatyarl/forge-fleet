@@ -1350,7 +1350,38 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                 catalog_id, res.port, res.deployment_id
             );
         }
-        crate::ModelCommand::Unload { id, node } => {
+        crate::ModelCommand::Unload { id, node, port } => {
+            // Resolve the deployment id. Either a positional UUID was given, or
+            // the operator passed `--port` (optionally `--node`) and we look the
+            // id up from Postgres — the deployments table is fleet-global on the
+            // leader, so (worker_name, port) is unique and resolves any host's
+            // deployment without an SSH round-trip. This is the ergonomic free-RAM
+            // path: `ff model unload --node sia --port 55001` needs no UUID.
+            let id = match id {
+                Some(i) => i,
+                None => {
+                    let p = port.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "provide a deployment id, or --port <port> (with optional --node <host>)"
+                        )
+                    })?;
+                    let target_node = match &node {
+                        Some(n) => n.clone(),
+                        None => ff_agent::fleet_info::resolve_this_worker_name().await,
+                    };
+                    let deps = ff_db::pg_list_deployments(&pool, Some(&target_node)).await?;
+                    let dep = deps.into_iter().find(|d| d.port == p).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "no deployment found on {target_node}:{p} (check `ff model deployments`)"
+                        )
+                    })?;
+                    println!(
+                        "{CYAN}▶ Resolved {target_node}:{p} → deployment {}{RESET}",
+                        dep.id
+                    );
+                    dep.id
+                }
+            };
             // Cross-node form: resolve user@ip from Postgres and run
             // `ff model unload <id>` on the target over SSH. We deliberately
             // build the destination from the DB (never ~/.ssh/config).
