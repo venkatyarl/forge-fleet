@@ -313,7 +313,7 @@ pub async fn distribute_token(pool: &PgPool, provider: &OauthProvider) -> Result
         let cmd = format!(
             "set -e\n\
              echo \"== distributing {provider} cred file to {target} ==\"\n\
-             ssh -T -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+             ssh -T {ssh_bypass} -o StrictHostKeyChecking=accept-new \
                  {ssh_user}@{primary_ip} bash -l <<'FF_OAUTH_EOF'\n\
              mkdir -p \"$(dirname {cred_path})\"\n\
              umask 077\n\
@@ -327,6 +327,7 @@ pub async fn distribute_token(pool: &PgPool, provider: &OauthProvider) -> Result
             primary_ip = primary_ip,
             cred_path = provider.cred_path,
             b64 = b64,
+            ssh_bypass = crate::ssh_opts::SSH_AGENT_BYPASS,
         );
 
         pg_enqueue_shell_task(

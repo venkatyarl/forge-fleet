@@ -421,9 +421,8 @@ async fn probe_tcp(host: &str, port: u16, timeout_secs: u64) -> bool {
 async fn fence_old_primary(ssh_user: &str, host: &str) -> bool {
     let target = format!("{ssh_user}@{host}");
     let out = Command::new("ssh")
+        .args(crate::ssh_opts::ssh_bypass_args())
         .args([
-            "-o",
-            "BatchMode=yes",
             "-o",
             "StrictHostKeyChecking=accept-new",
             "-o",

@@ -392,16 +392,22 @@ impl ReviveManager {
 // ─── Module helpers ────────────────────────────────────────────────────────
 
 fn ssh_base_args(port: i32) -> Vec<String> {
-    vec![
+    // `IdentityAgent=none` + `BatchMode=yes` (`crate::ssh_opts::ssh_bypass_args`)
+    // defeats a wedged inherited ssh-agent on headless Linux peers — revive runs
+    // from the daemon, so it inherits the same socket the wave/backup SSH did.
+    let mut args: Vec<String> = crate::ssh_opts::ssh_bypass_args()
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    args.extend([
         "-o".into(),
         "ConnectTimeout=5".into(),
-        "-o".into(),
-        "BatchMode=yes".into(),
         "-o".into(),
         "StrictHostKeyChecking=accept-new".into(),
         "-p".into(),
         port.to_string(),
-    ]
+    ]);
+    args
 }
 
 /// Run an SSH command under a timeout; true iff exit 0.
@@ -537,5 +543,7 @@ mod tests {
         assert!(args.iter().any(|a| a == "2222"));
         assert!(args.iter().any(|a| a == "ConnectTimeout=5"));
         assert!(args.iter().any(|a| a == "BatchMode=yes"));
+        // Wedged-agent bypass must be present (HA.2).
+        assert!(args.iter().any(|a| a == "IdentityAgent=none"));
     }
 }

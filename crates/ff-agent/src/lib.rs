@@ -113,6 +113,7 @@ pub mod social_ingest;
 pub mod software_registry;
 pub mod software_upstream;
 pub mod ssh_key_manager;
+pub mod ssh_opts;
 pub mod streaming;
 pub mod sub_agent_reaper;
 pub mod sub_agents;

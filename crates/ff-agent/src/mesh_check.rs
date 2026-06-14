@@ -124,16 +124,19 @@ async fn probe_pair(
     dst_user: String,
     dst_ip: String,
 ) -> MeshCell {
+    // Bypass the (possibly wedged) inherited ssh-agent on both hops — the outer
+    // hop is daemon-spawned, the inner runs in the src host's shell. See
+    // `crate::ssh_opts`.
+    let ssh_bypass = crate::ssh_opts::SSH_AGENT_BYPASS;
     let inner = format!(
-        "ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \
+        "ssh {ssh_bypass} -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \
          {dst_user}@{dst_ip} true"
     );
     let result = timeout(
         Duration::from_secs(12),
         Command::new("ssh")
+            .args(crate::ssh_opts::ssh_bypass_args())
             .args([
-                "-o",
-                "BatchMode=yes",
                 "-o",
                 "ConnectTimeout=5",
                 "-o",
@@ -272,8 +275,9 @@ async fn propagate_to_peer(
         ssh_exec(&peer_dest, &cmd).await?;
     }
     let probe = format!(
-        "ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \
-         {new_user}@{new_ip} true"
+        "ssh {} -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \
+         {new_user}@{new_ip} true",
+        crate::ssh_opts::SSH_AGENT_BYPASS,
     );
     ssh_exec(&peer_dest, &probe).await
 }
@@ -282,9 +286,8 @@ async fn ssh_exec(dest: &str, cmd: &str) -> Result<(), String> {
     let out = timeout(
         Duration::from_secs(15),
         Command::new("ssh")
+            .args(crate::ssh_opts::ssh_bypass_args())
             .args([
-                "-o",
-                "BatchMode=yes",
                 "-o",
                 "ConnectTimeout=8",
                 "-o",

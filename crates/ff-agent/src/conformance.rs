@@ -299,9 +299,8 @@ async fn run_check(c: &ComputerRow, check: &CheckRow, me: &str) -> CheckOutcome 
                 Command::new("sh").args(["-c", &cmd]).output()
             } else {
                 Command::new("ssh")
+                    .args(crate::ssh_opts::ssh_bypass_args())
                     .args([
-                        "-o",
-                        "BatchMode=yes",
                         "-o",
                         &format!("ConnectTimeout={SSH_CONNECT_TIMEOUT_SECS}"),
                         "-p",
