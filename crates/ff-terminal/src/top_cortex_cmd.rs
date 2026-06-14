@@ -1170,7 +1170,7 @@ async fn run_index(
 
     // STEP 2 of multi-domain Cortex: also index structured/financial DATA
     // (.csv/.tsv) for this root. Best-effort — never fails the whole index.
-    match ff_brain::data_index::index_data(pool, slug, root).await {
+    match ff_brain::data_index::index_data(pool, slug, root, incremental).await {
         Ok(data_stats) => {
             total_files += data_stats.files;
             total_symbols += data_stats.columns;
