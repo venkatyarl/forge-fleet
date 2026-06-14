@@ -2511,12 +2511,19 @@ pub enum ModelCommand {
     /// kernel lookup), not the recorded PID — so it works even after an
     /// out-of-band restart.
     Unload {
-        /// Deployment id (UUID from `ff model deployments`).
-        id: String,
+        /// Deployment id (UUID from `ff model deployments`). Optional when
+        /// `--port` is given — the id is then resolved from Postgres by
+        /// (node, port), so you can free RAM without first looking up the UUID.
+        id: Option<String>,
         /// Run the unload on this node instead of the local host (resolves
         /// user@ip from Postgres and SSHes `ff model unload <id>` there).
         #[arg(long)]
         node: Option<String>,
+        /// Resolve the deployment by the port it serves on (combine with
+        /// `--node` to target a remote host; defaults to the local host).
+        /// Use instead of a positional id: `ff model unload --node sia --port 55001`.
+        #[arg(long)]
+        port: Option<i32>,
     },
     /// Reprofile a running deployment into the agent-capable serving profile:
     /// unload it, then reload the SAME model on the SAME port with `--parallel 1
