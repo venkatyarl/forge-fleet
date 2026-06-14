@@ -898,6 +898,16 @@ async fn extract_files(
                 }
             }
 
+            // `Self::method()` redirect (lever #5): an associated call on the
+            // impl's own type lands on the fabricated extern
+            // `<caller_module>::Self::method`; redirect onto the real flattened
+            // method `<caller_module>::method`.
+            if p.parse.lang == Lang::Rust && !internal_fns.contains(&resolved) {
+                if let Some(m) = resolve_self_method_call(&resolved, internal_fns) {
+                    resolved = m;
+                }
+            }
+
             // Facade redirect (levers #3/#4): a call through a `pub use` re-export
             // path (`ff_db::run_migrations` for `ff_db::migrations::run_migrations`)
             // — or one the resolver caller-prefixed onto a crate-rooted path
@@ -4035,6 +4045,25 @@ fn resolve_glob_impl_method_call(
     None
 }
 
+/// `Self::method()` redirect (lever #5). Inside an `impl` block, `Self::method()`
+/// is an associated call on the type being implemented. `resolve_call` doesn't
+/// special-case the `Self` keyword, so it treats the head as a same-module path
+/// segment and fabricates `<caller_module>::Self::method`. But methods are indexed
+/// flattened as `module::method` (the same convention [`resolve_impl_method_call`]
+/// relies on), so the real target is `<caller_module>::method`. Redirect when that
+/// names a known internal fn.
+///
+/// `Self` is a reserved Rust keyword and can never be a real module/item segment,
+/// so a `::Self::` infix only ever appears via this fabrication — there's no
+/// genuine path to confuse it with. Redirect-only: an external `Self::` trait
+/// method (e.g. `Self::deserialize` from a derive) whose flattened target isn't in
+/// the corpus keeps its extern resolution, so no edge is invented.
+fn resolve_self_method_call(resolved: &str, internal_fns: &HashSet<String>) -> Option<String> {
+    let (module, rest) = resolved.split_once("::Self::")?;
+    let target = join(module, rest);
+    internal_fns.contains(&target).then_some(target)
+}
+
 /// Facade redirect (levers #3 + #4). Two failure modes leave a real internal
 /// call resolved to a `code:extern`:
 ///
@@ -5031,6 +5060,36 @@ diff --git a/src/b.rs b/src/b.rs
                 &fns,
                 &types,
             ),
+            None
+        );
+    }
+
+    #[test]
+    fn self_method_call_redirects_to_flattened_method() {
+        // `Self::is_fresh()` inside `impl PeerMap` resolves to the fabricated
+        // extern `ff_pulse::peer_map::Self::is_fresh`; the method is indexed
+        // flattened as `ff_pulse::peer_map::is_fresh`. Redirect onto it (the top
+        // `ff cortex doctor` Self:: noise source).
+        let fns: HashSet<String> = ["ff_pulse::peer_map::is_fresh".to_string()].into();
+        assert_eq!(
+            resolve_self_method_call("ff_pulse::peer_map::Self::is_fresh", &fns),
+            Some("ff_pulse::peer_map::is_fresh".to_string())
+        );
+    }
+
+    #[test]
+    fn self_method_redirect_never_fabricates() {
+        // Target method not internal (e.g. an external `Self::deserialize` derive)
+        // → keep the extern resolution, invent nothing.
+        let empty: HashSet<String> = HashSet::new();
+        assert_eq!(
+            resolve_self_method_call("ff_pulse::peer_map::Self::deserialize", &empty),
+            None
+        );
+        // No `::Self::` infix → not a Self-call fabrication, left alone.
+        let fns: HashSet<String> = ["ff_pulse::peer_map::is_fresh".to_string()].into();
+        assert_eq!(
+            resolve_self_method_call("ff_pulse::peer_map::is_fresh", &fns),
             None
         );
     }
