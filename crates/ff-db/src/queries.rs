@@ -6146,6 +6146,156 @@ pub async fn pg_count_corpus_code_symbols(pool: &PgPool, slug: &str) -> Result<i
     Ok(count)
 }
 
+/// Call-graph resolution breakdown for a Cortex corpus: how many `calls` edges
+/// land on a real internal symbol vs an unresolved `code:extern`/`code:import`
+/// placeholder. The internal-resolution rate is the headline recall number
+/// (`ff cortex doctor`). `external` counts std/3rd-party/unresolved targets —
+/// expected to dominate (most calls in any codebase are to the stdlib), so a low
+/// rate is not itself a bug; the suspicious-externs list below is what surfaces
+/// genuinely mis-resolved internal calls.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CortexResolutionStats {
+    pub call_edges: i64,
+    pub internal: i64,
+    pub external: i64,
+    pub code_symbols: i64,
+    pub externs: i64,
+}
+
+pub async fn pg_cortex_resolution_stats(
+    pool: &PgPool,
+    slug: &str,
+) -> Result<CortexResolutionStats> {
+    // One pass over the corpus's `calls` edges, bucketed by callee node_type.
+    let row = sqlx::query(
+        r#"
+        SELECT
+          COUNT(*) AS call_edges,
+          COUNT(*) FILTER (
+            WHERE dst.node_type NOT IN ('code:extern', 'code:import')
+          ) AS internal
+        FROM brain_vault_edges e
+        JOIN brain_vault_nodes src ON src.id = e.src_id
+        JOIN brain_vault_nodes dst ON dst.id = e.dst_id
+        WHERE e.edge_type = 'calls'
+          AND src.project = $1
+          AND src.valid_until IS NULL
+          AND dst.valid_until IS NULL
+        "#,
+    )
+    .bind(slug)
+    .fetch_one(pool)
+    .await?;
+    let call_edges: i64 = row.get("call_edges");
+    let internal: i64 = row.get("internal");
+
+    let code_symbols: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM brain_vault_nodes
+         WHERE project = $1 AND valid_until IS NULL
+           AND node_type IN ('code:function', 'code:class', 'code:interface')",
+    )
+    .bind(slug)
+    .fetch_one(pool)
+    .await?;
+
+    let externs: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM brain_vault_nodes
+         WHERE project = $1 AND valid_until IS NULL AND node_type = 'code:extern'",
+    )
+    .bind(slug)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(CortexResolutionStats {
+        call_edges,
+        internal,
+        external: call_edges - internal,
+        code_symbols,
+        externs,
+    })
+}
+
+/// A `code:extern` placeholder that is *internally rooted* — its first path
+/// segment is one of this corpus's own module/crate roots — AND whose leaf name
+/// collides with a real internal symbol. That double condition is the genuine
+/// mis-resolution signal: the resolver placed a call into our OWN namespace
+/// (`ff_agent::tools::AgentToolResult::ok`) yet left it as an extern even though
+/// a same-leaf internal symbol exists. Filtering on an internal root cuts the
+/// stdlib/3rd-party noise (`std::…::new`, `tokio::spawn`, `sqlx::query`) that a
+/// raw leaf-collision drowns in — those roots are never internal. The extern
+/// path + internal candidate(s) are both surfaced so a human/agent can judge
+/// (inherent-impl methods and enum-variant ctors are common benign hits),
+/// ranked by extern fan-in (most-called first = highest payoff to fix).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CortexSuspiciousExtern {
+    pub extern_qn: String,
+    pub fan_in: i64,
+    pub internal_candidates: Vec<String>,
+}
+
+pub async fn pg_cortex_suspicious_externs(
+    pool: &PgPool,
+    slug: &str,
+    limit: i64,
+) -> Result<Vec<CortexSuspiciousExtern>> {
+    // Leaf = text after the last ':' (works for the '::' separator and for bare
+    // single-segment names, which have no ':' and so match whole). `internal_roots`
+    // is the set of first-segments of real internal symbols — an extern whose head
+    // is in that set is claiming to live in our code, so an unresolved one is
+    // suspicious; combined with a leaf collision it's a strong mis-resolution lead.
+    let rows = sqlx::query(
+        r#"
+        WITH internal_roots AS (
+          SELECT DISTINCT split_part(title, '::', 1) AS root
+            FROM brain_vault_nodes
+           WHERE project = $1 AND valid_until IS NULL
+             AND node_type IN ('code:function', 'code:class', 'code:interface')
+        )
+        SELECT
+          x.title AS extern_qn,
+          (SELECT COUNT(*) FROM brain_vault_edges e
+             WHERE e.dst_id = x.id AND e.edge_type = 'calls') AS fan_in,
+          ARRAY(
+            SELECT DISTINCT i.title
+              FROM brain_vault_nodes i
+             WHERE i.project = x.project
+               AND i.valid_until IS NULL
+               AND i.node_type IN ('code:function', 'code:class', 'code:interface')
+               AND substring(i.title from '[^:]*$') = substring(x.title from '[^:]*$')
+             ORDER BY i.title
+             LIMIT 5
+          ) AS internal_candidates
+        FROM brain_vault_nodes x
+        WHERE x.project = $1
+          AND x.valid_until IS NULL
+          AND x.node_type = 'code:extern'
+          AND split_part(x.title, '::', 1) IN (SELECT root FROM internal_roots)
+          AND EXISTS (
+            SELECT 1 FROM brain_vault_nodes i
+             WHERE i.project = x.project
+               AND i.valid_until IS NULL
+               AND i.node_type IN ('code:function', 'code:class', 'code:interface')
+               AND substring(i.title from '[^:]*$') = substring(x.title from '[^:]*$')
+          )
+        ORDER BY fan_in DESC, extern_qn ASC
+        LIMIT $2
+        "#,
+    )
+    .bind(slug)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .iter()
+        .map(|r| CortexSuspiciousExtern {
+            extern_qn: r.get("extern_qn"),
+            fan_in: r.get("fan_in"),
+            internal_candidates: r.get("internal_candidates"),
+        })
+        .collect())
+}
+
 pub async fn pg_search_brain_vault_nodes(
     pool: &PgPool,
     query: &str,

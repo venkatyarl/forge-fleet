@@ -166,6 +166,21 @@ pub enum TopCortexCommand {
         #[arg(long, default_value = "table")]
         format: String,
     },
+    /// Recall/health diagnostic for the code graph: what fraction of `calls`
+    /// edges resolve to a real internal symbol vs an unresolved extern, plus a
+    /// ranked list of suspicious externs — `code:extern` placeholders whose leaf
+    /// name collides with an internal symbol, i.e. candidate mis-resolutions to
+    /// eyeball. A pure read-only graph query (no source read, no reindex).
+    Doctor {
+        /// Override the corpus slug (default: derived from the cwd).
+        #[arg(long)]
+        corpus: Option<String>,
+        /// How many suspicious externs to list (ranked by fan-in).
+        #[arg(long, default_value_t = 20)]
+        limit: i64,
+        #[arg(long, default_value = "table")]
+        format: String,
+    },
     /// Change-aware, risk-scored review map of the current diff: which changed
     /// symbols have the widest blast radius (fan-in / transitive callers), so a
     /// reviewer knows where to look first. Reads `git diff` for the changed
@@ -599,6 +614,87 @@ pub async fn handle_top_cortex(args: TopCortexArgs) -> Result<()> {
         } => {
             let (root, slug) = resolve_root_slug(path, corpus)?;
             run_review(&pool, &root, &slug, base.as_deref(), depth, &format).await?;
+        }
+        TopCortexCommand::Doctor {
+            corpus,
+            limit,
+            format,
+        } => {
+            let corpus = corpus.unwrap_or_else(cwd_slug);
+            run_doctor(&pool, &corpus, limit, &format).await?;
+        }
+    }
+    Ok(())
+}
+
+/// `ff cortex doctor` — print the call-graph resolution rate plus the ranked
+/// suspicious-extern list. Read-only.
+async fn run_doctor(pool: &PgPool, corpus: &str, limit: i64, format: &str) -> Result<()> {
+    let stats = ff_db::pg_cortex_resolution_stats(pool, corpus).await?;
+    let suspicious = ff_db::pg_cortex_suspicious_externs(pool, corpus, limit).await?;
+    let rate = if stats.call_edges > 0 {
+        100.0 * stats.internal as f64 / stats.call_edges as f64
+    } else {
+        0.0
+    };
+
+    if format == "json" {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "corpus": corpus,
+                "call_edges": stats.call_edges,
+                "internal_resolved": stats.internal,
+                "external_unresolved": stats.external,
+                "internal_resolution_pct": (rate * 10.0).round() / 10.0,
+                "code_symbols": stats.code_symbols,
+                "extern_placeholders": stats.externs,
+                "suspicious_externs": suspicious,
+            }))?
+        );
+        return Ok(());
+    }
+
+    if stats.call_edges == 0 {
+        println!("no code graph for corpus '{corpus}' yet \u{2014} run `ff cortex index` first");
+        return Ok(());
+    }
+
+    println!("Cortex resolution \u{2014} corpus '{corpus}'");
+    println!("  call edges          {:>8}", stats.call_edges);
+    println!(
+        "  internal-resolved   {:>8}  ({rate:.1}% of call edges)",
+        stats.internal
+    );
+    println!("  external/unresolved {:>8}", stats.external);
+    println!("  code symbols        {:>8}", stats.code_symbols);
+    println!("  extern placeholders {:>8}", stats.externs);
+    println!(
+        "\nNote: most calls in any codebase target the stdlib/3rd-party, so a low rate is\n\
+         expected, not a bug. The list below is what flags real internal mis-resolutions."
+    );
+
+    if suspicious.is_empty() {
+        println!(
+            "\nNo suspicious externs: every extern's leaf name is distinct from all internal\n\
+             symbols \u{2014} no candidate internal calls were kept as externs."
+        );
+    } else {
+        println!(
+            "\nSuspicious externs (leaf collides with an internal symbol \u{2014} candidate\n\
+             mis-resolutions, ranked by fan-in; judge each against its internal candidate):"
+        );
+        println!(
+            "  {:>6}  {:<40}  {}",
+            "FAN-IN", "EXTERN (resolved-to)", "INTERNAL CANDIDATE(S)"
+        );
+        for s in &suspicious {
+            println!(
+                "  {:>6}  {:<40}  {}",
+                s.fan_in,
+                s.extern_qn,
+                s.internal_candidates.join(", ")
+            );
         }
     }
     Ok(())
