@@ -4,7 +4,7 @@
 //! with version tracking via a `_migrations` meta-table.
 
 use rusqlite::Connection;
-use sqlx::PgPool;
+use sqlx::{Acquire, PgPool};
 use tracing::{debug, info, warn};
 
 use crate::error::{DbError, Result};
@@ -771,8 +771,27 @@ static PG_MIGRATIONS: &[PgMigration] = &[
     },
 ];
 
+/// Postgres advisory-lock key guarding the migration runner.
+///
+/// Multiple processes call [`run_postgres_migrations`] concurrently —
+/// forgefleetd's startup runner races any `ff` subcommand that opens the
+/// pool at the same moment. Without serialization both read the same current
+/// version, both compute the same `pending` list, both apply the next
+/// migration's (idempotent) DDL, and then the second runner's
+/// `INSERT INTO _migrations` violates `_migrations_pkey` and the process
+/// aborts. On hosts under launchd/systemd KeepAlive the retry papers over it;
+/// a host without auto-restart (or a bad-timing window) does NOT self-heal.
+///
+/// A session-level [`pg_advisory_lock`] serializes runners: the first holds
+/// the lock for the whole run; the rest block, then wake to find the version
+/// already advanced and nothing pending. The key is an arbitrary fixed
+/// `i64` ("FFMIGRT8" in ASCII) — it only needs to be identical across every
+/// binary that might run migrations against the same database, so it must
+/// never change.
+const MIGRATION_ADVISORY_LOCK_KEY: i64 = 0x46464D4947525438;
+
 /// Ensure the Postgres `_migrations` tracking table exists.
-async fn ensure_pg_migrations_table(pool: &PgPool) -> Result<()> {
+async fn ensure_pg_migrations_table(conn: &mut sqlx::PgConnection) -> Result<()> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS _migrations (
             version     INTEGER PRIMARY KEY,
@@ -780,25 +799,57 @@ async fn ensure_pg_migrations_table(pool: &PgPool) -> Result<()> {
             applied_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )",
     )
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     Ok(())
 }
 
 /// Get the current Postgres schema version (0 if no migrations applied).
-async fn pg_current_version(pool: &PgPool) -> Result<u32> {
+async fn pg_current_version(conn: &mut sqlx::PgConnection) -> Result<u32> {
     let row: (i32,) = sqlx::query_as("SELECT COALESCE(MAX(version), 0) FROM _migrations")
-        .fetch_one(pool)
+        .fetch_one(&mut *conn)
         .await?;
     Ok(row.0 as u32)
 }
 
 /// Run all pending Postgres migrations.
 ///
-/// Idempotent — re-running on an up-to-date database is a no-op.
+/// Idempotent — re-running on an up-to-date database is a no-op. Concurrent
+/// callers are serialized via a session-level advisory lock
+/// (see [`MIGRATION_ADVISORY_LOCK_KEY`]) so they can never collide on the
+/// `_migrations` primary key.
 pub async fn run_postgres_migrations(pool: &PgPool) -> Result<u32> {
-    ensure_pg_migrations_table(pool).await?;
-    let current = pg_current_version(pool).await?;
+    // Hold one connection for the whole run: the advisory lock is
+    // session-scoped, so the lock and every migration query must share it.
+    let mut conn = pool.acquire().await?;
+
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(MIGRATION_ADVISORY_LOCK_KEY)
+        .execute(&mut *conn)
+        .await?;
+
+    let result = run_postgres_migrations_locked(&mut conn).await;
+
+    // Always release before this connection returns to the pool — a pooled
+    // connection handed back still holding the lock would leak it to the next
+    // borrower and wedge every future migration run.
+    if let Err(e) = sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(MIGRATION_ADVISORY_LOCK_KEY)
+        .execute(&mut *conn)
+        .await
+    {
+        warn!(error = %e, "failed to release migration advisory lock");
+    }
+
+    result
+}
+
+/// Apply pending Postgres migrations on a connection that already holds the
+/// migration advisory lock. Split out so the lock is acquired/released around
+/// it exactly once in [`run_postgres_migrations`].
+async fn run_postgres_migrations_locked(conn: &mut sqlx::PgConnection) -> Result<u32> {
+    ensure_pg_migrations_table(&mut *conn).await?;
+    let current = pg_current_version(&mut *conn).await?;
 
     let pending: Vec<&PgMigration> = PG_MIGRATIONS
         .iter()
@@ -825,7 +876,7 @@ pub async fn run_postgres_migrations(pool: &PgPool) -> Result<u32> {
         );
 
         // Run DDL via raw_sql (supports multi-statement), then record version.
-        let mut tx = pool.begin().await?;
+        let mut tx = conn.begin().await?;
 
         match sqlx::raw_sql(migration.sql).execute(&mut *tx).await {
             Ok(_) => {
@@ -852,7 +903,7 @@ pub async fn run_postgres_migrations(pool: &PgPool) -> Result<u32> {
         }
     }
 
-    let final_version = pg_current_version(pool).await?;
+    let final_version = pg_current_version(&mut *conn).await?;
     info!(version = final_version, "all postgres migrations applied");
     Ok(final_version)
 }
@@ -872,6 +923,16 @@ mod tests {
         // Second run is a no-op.
         let v2 = run_migrations(&conn).unwrap();
         assert_eq!(v1, v2);
+    }
+
+    #[test]
+    fn migration_advisory_lock_key_is_stable() {
+        // The key must be identical across every binary version that runs
+        // migrations against the same database, or concurrent runners on
+        // mismatched binaries would not serialize. Pin it so a refactor can't
+        // silently change it. (positive i64, fits pg's bigint advisory key.)
+        assert_eq!(MIGRATION_ADVISORY_LOCK_KEY, 0x46464D4947525438);
+        assert!(MIGRATION_ADVISORY_LOCK_KEY > 0);
     }
 
     #[test]
