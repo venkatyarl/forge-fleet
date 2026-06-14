@@ -6216,6 +6216,14 @@ pub struct CortexResolutionStats {
     pub call_edges: i64,
     pub internal: i64,
     pub external: i64,
+    /// Subset of `internal` resolved by the primary resolver (edge confidence
+    /// >= 1.0) — the EXTRACTED tier (roadmap #5). The call explicitly named a
+    /// real internal symbol; highest-trust edges.
+    pub extracted: i64,
+    /// Subset of `internal` resolved only via a heuristic redirect (confidence
+    /// < 1.0) — the INFERRED tier. Real target, but guessed among same-leaf
+    /// candidates. `extracted + inferred == internal`.
+    pub inferred: i64,
     pub code_symbols: i64,
     pub externs: i64,
 }
@@ -6231,7 +6239,15 @@ pub async fn pg_cortex_resolution_stats(
           COUNT(*) AS call_edges,
           COUNT(*) FILTER (
             WHERE dst.node_type NOT IN ('code:extern', 'code:import')
-          ) AS internal
+          ) AS internal,
+          COUNT(*) FILTER (
+            WHERE dst.node_type NOT IN ('code:extern', 'code:import')
+              AND e.confidence >= 1.0
+          ) AS extracted,
+          COUNT(*) FILTER (
+            WHERE dst.node_type NOT IN ('code:extern', 'code:import')
+              AND e.confidence < 1.0
+          ) AS inferred
         FROM brain_vault_edges e
         JOIN brain_vault_nodes src ON src.id = e.src_id
         JOIN brain_vault_nodes dst ON dst.id = e.dst_id
@@ -6246,6 +6262,8 @@ pub async fn pg_cortex_resolution_stats(
     .await?;
     let call_edges: i64 = row.get("call_edges");
     let internal: i64 = row.get("internal");
+    let extracted: i64 = row.get("extracted");
+    let inferred: i64 = row.get("inferred");
 
     let code_symbols: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM brain_vault_nodes
@@ -6268,6 +6286,8 @@ pub async fn pg_cortex_resolution_stats(
         call_edges,
         internal,
         external: call_edges - internal,
+        extracted,
+        inferred,
         code_symbols,
         externs,
     })

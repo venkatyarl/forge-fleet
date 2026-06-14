@@ -83,6 +83,11 @@ pub struct CortexStats {
     pub symbols: usize,
     pub calls_total: usize,
     pub calls_resolved: usize,
+    /// Subset of `calls_resolved` that resolved to a real internal symbol ONLY via
+    /// a heuristic redirect (glob / impl-method / `Self::` / facade), not the
+    /// primary resolver — the INFERRED tier (confidence 0.6). EXTRACTED =
+    /// `calls_resolved - calls_inferred`.
+    pub calls_inferred: usize,
     pub imports: usize,
     pub contains: usize,
     pub inherited_memberships: usize,
@@ -962,6 +967,11 @@ async fn extract_files(
             };
             let mut resolved = resolve_call(&call.raw_path, &caller_qn, &p.parse);
             stats.calls_total += 1;
+            // Provenance tier (roadmap #5): did the PRIMARY resolver already land
+            // on a known internal fn? If so the edge is EXTRACTED (conf 1.0); if
+            // only a heuristic redirect below lands it, it's INFERRED (0.6); if it
+            // stays an extern, UNRESOLVED (0.3). Captured here, before any redirect.
+            let extracted_internal = internal_fns.contains(&resolved);
 
             // Glob-import fallback: if the bare call didn't land on a known
             // internal fn, a `use <prefix>::*;` in scope may bring it in (the
@@ -1034,15 +1044,20 @@ async fn extract_files(
             } else {
                 None
             };
-            let callee_id = match callee_id {
+            let (callee_id, confidence) = match callee_id {
                 Some(id) => {
                     stats.calls_resolved += 1;
-                    id
+                    // EXTRACTED if the primary resolver named it; otherwise a
+                    // redirect heuristic landed it → INFERRED.
+                    if !extracted_internal {
+                        stats.calls_inferred += 1;
+                    }
+                    (id, call_confidence(extracted_internal, true))
                 }
                 None => {
                     // External / unresolved: a code:extern placeholder on the same
                     // code:// path, so callers_of still traverses to it.
-                    upsert_code_node(
+                    let id = upsert_code_node(
                         pool,
                         &callee_path,
                         &resolved,
@@ -1051,10 +1066,11 @@ async fn extract_files(
                         None,
                         None,
                     )
-                    .await?
+                    .await?;
+                    (id, call_confidence(extracted_internal, false))
                 }
             };
-            add_edge(pool, caller_id, callee_id, "calls").await?;
+            add_call_edge(pool, caller_id, callee_id, confidence).await?;
         }
         let _ = &p.file_path; // (kept for future per-file diagnostics)
     }
@@ -2682,6 +2698,55 @@ async fn add_edge(pool: &PgPool, src: Uuid, dst: Uuid, edge_type: &str) -> Resul
     .execute(pool)
     .await?;
     Ok(r.rows_affected() > 0)
+}
+
+/// Write a `calls` edge with a resolution-confidence tier (roadmap #5 — provenance
+/// tiers, graphify's one structural advantage). `confidence` encodes how much to
+/// trust that this edge points at the *correct* callee symbol:
+///   - `1.0` EXTRACTED  — the primary resolver landed the call on a real internal
+///     symbol it explicitly named (alias/import/crate/self/super or a direct
+///     internal match). High confidence.
+///   - `0.6` INFERRED   — only a heuristic redirect (glob / impl-method / Self::
+///     method / facade `pub use`) chose this internal symbol among same-leaf
+///     candidates. Real target, but guessed.
+///   - `0.3` UNRESOLVED — the callee is a `code:extern` placeholder (genuine
+///     std/3rd-party OR a mis-resolution the resolver kept as written).
+/// Distinct from `add_edge` only in the `ON CONFLICT` clause: two call sites from
+/// the same caller to the same callee may resolve at different tiers, so we keep
+/// the MAX (the highest-trust resolution wins) rather than first-write-wins. The
+/// dst node_type already separates internal vs extern; `confidence` adds the
+/// EXTRACTED-vs-INFERRED split *within* the internal tier that downstream
+/// consumers can filter on.
+async fn add_call_edge(pool: &PgPool, src: Uuid, dst: Uuid, confidence: f32) -> Result<()> {
+    sqlx::query(
+        r#"INSERT INTO brain_vault_edges (src_id, dst_id, edge_type, provenance, confidence)
+           VALUES ($1, $2, 'calls', 'cortex', $3)
+           ON CONFLICT (src_id, dst_id, edge_type)
+           DO UPDATE SET confidence = GREATEST(brain_vault_edges.confidence, EXCLUDED.confidence)"#,
+    )
+    .bind(src)
+    .bind(dst)
+    .bind(confidence)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Map a call-resolution outcome to its confidence tier (roadmap #5 — provenance
+/// tiers). `primary_hit` = the primary resolver (`resolve_call`) already named a
+/// known internal fn; `resolved_internal` = the final callee is a real internal
+/// symbol (not a `code:extern` placeholder).
+///   - `1.0` EXTRACTED  — primary resolver landed on a real internal symbol.
+///   - `0.6` INFERRED   — only a heuristic redirect landed it on an internal symbol.
+///   - `0.3` UNRESOLVED — callee is an extern placeholder.
+/// `(true, false)` is unreachable in practice (a primary hit is always internal),
+/// but is treated as UNRESOLVED for totality — the written edge is what matters.
+fn call_confidence(primary_hit: bool, resolved_internal: bool) -> f32 {
+    match (primary_hit, resolved_internal) {
+        (_, false) => 0.3,
+        (true, true) => 1.0,
+        (false, true) => 0.6,
+    }
 }
 
 /// Copy the file node's memberships + facets onto the symbol node, so faceted
@@ -4761,6 +4826,21 @@ mod tests {
             e.to_string(),
             "no symbol matching 'load_model' in corpus 'forge-fleet'"
         );
+    }
+
+    #[test]
+    fn call_confidence_tiers() {
+        // EXTRACTED: primary resolver named a real internal symbol.
+        assert_eq!(call_confidence(true, true), 1.0);
+        // INFERRED: a heuristic redirect landed it on an internal symbol.
+        assert_eq!(call_confidence(false, true), 0.6);
+        // UNRESOLVED: callee is an extern placeholder — regardless of primary hit.
+        assert_eq!(call_confidence(false, false), 0.3);
+        assert_eq!(call_confidence(true, false), 0.3);
+        // The three internal/extern tiers are strictly ordered (consumers filter
+        // on `>= 1.0` for high-trust, `>= 0.6` to include heuristics).
+        assert!(call_confidence(true, true) > call_confidence(false, true));
+        assert!(call_confidence(false, true) > call_confidence(false, false));
     }
 
     #[test]
