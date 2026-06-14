@@ -376,6 +376,11 @@ pub async fn index_langs_incremental(
     for f in &changed_old_fns {
         internal_fns.remove(f);
     }
+    // internal_types gates the inherent-impl method redirect. It only needs to be
+    // permissive-but-correct: a stale type entry merely lets a redirect fire whose
+    // target must STILL be a real internal fn, so we load the whole corpus and let
+    // pass 1 re-add changed files' current types — no need to prune old ones.
+    let mut internal_types = load_internal_types(pool, corpus_slug).await?;
 
     // Re-extract changed files, grouped by language.
     for l in langs {
@@ -387,8 +392,16 @@ pub async fn index_langs_incremental(
         if rows.is_empty() {
             continue;
         }
-        let stats =
-            extract_files(pool, corpus_id, corpus_slug, l, &rows, &mut internal_fns).await?;
+        let stats = extract_files(
+            pool,
+            corpus_id,
+            corpus_slug,
+            l,
+            &rows,
+            &mut internal_fns,
+            &mut internal_types,
+        )
+        .await?;
         report.per_lang.push((l.clone(), stats));
     }
 
@@ -614,6 +627,21 @@ async fn load_internal_fns(pool: &PgPool, corpus_slug: &str) -> Result<HashSet<S
     Ok(titles.into_iter().collect())
 }
 
+/// Every internal TYPE qualified-name (struct / enum / impl) in the corpus, so
+/// the inherent-impl method redirect ([`resolve_impl_method_call`]) can tell a
+/// real `module::Type` apart from a genuine module path. Same role for types as
+/// [`load_internal_fns`] plays for functions on an incremental reindex.
+async fn load_internal_types(pool: &PgPool, corpus_slug: &str) -> Result<HashSet<String>> {
+    let titles: Vec<String> = sqlx::query_scalar(
+        "SELECT title FROM brain_vault_nodes
+           WHERE project = $1 AND node_type IN ('code:struct', 'code:enum', 'code:impl')",
+    )
+    .bind(corpus_slug)
+    .fetch_all(pool)
+    .await?;
+    Ok(titles.into_iter().collect())
+}
+
 /// A `content:file` node Cortex extracts from, with the corpus scan's hash.
 #[derive(Debug, Clone)]
 struct FileRow {
@@ -657,9 +685,10 @@ async fn index_one(pool: &PgPool, corpus_slug: &str, lang: &str) -> Result<Corte
         .ok_or_else(|| anyhow::anyhow!("no corpus with slug '{corpus_slug}'"))?;
 
     let file_rows = fetch_file_rows(pool, corpus_slug, lang).await?;
-    // Full per-language extraction starts with an empty internal-fn set: the
-    // graph was just wiped, so every internal fn comes from these files.
+    // Full per-language extraction starts with empty internal sets: the graph was
+    // just wiped, so every internal fn/type comes from these files.
     let mut internal_fns: HashSet<String> = HashSet::new();
+    let mut internal_types: HashSet<String> = HashSet::new();
     extract_files(
         pool,
         corpus_id,
@@ -667,15 +696,16 @@ async fn index_one(pool: &PgPool, corpus_slug: &str, lang: &str) -> Result<Corte
         lang,
         &file_rows,
         &mut internal_fns,
+        &mut internal_types,
     )
     .await
 }
 
 /// Two-pass extraction over a set of files: write symbol nodes + contains +
-/// imports (pass 1, also populating `internal_fns`), then resolve + write
-/// `calls` edges (pass 2). `internal_fns` may be pre-seeded (incremental reindex
-/// seeds it from the whole-corpus DB so calls into unchanged files resolve).
-/// Records each file's current `content_hash` in the incremental ledger.
+/// imports (pass 1, also populating `internal_fns` + `internal_types`), then
+/// resolve + write `calls` edges (pass 2). Both sets may be pre-seeded (an
+/// incremental reindex seeds them from the whole-corpus DB so calls into
+/// unchanged files resolve). Records each file's `content_hash` in the ledger.
 async fn extract_files(
     pool: &PgPool,
     corpus_id: Uuid,
@@ -683,6 +713,7 @@ async fn extract_files(
     lang: &str,
     file_rows: &[FileRow],
     internal_fns: &mut HashSet<String>,
+    internal_types: &mut HashSet<String>,
 ) -> Result<CortexStats> {
     let mut stats = CortexStats::default();
 
@@ -752,6 +783,8 @@ async fn extract_files(
             stats.symbols += 1;
             if sym.node_type == "code:function" {
                 internal_fns.insert(sym.qualified_name.clone());
+            } else if matches!(sym.node_type, "code:struct" | "code:enum" | "code:impl") {
+                internal_types.insert(sym.qualified_name.clone());
             }
 
             // contains: parent (impl/mod) -> symbol, else file -> symbol.
@@ -817,6 +850,16 @@ async fn extract_files(
                     resolve_glob_call(&call.raw_path, &caller_qn, &p.parse, internal_fns)
                 {
                     resolved = g;
+                }
+            }
+
+            // Inherent-impl method redirect (Rust): an associated call
+            // `Type::method()` resolves to the extern `module::Type::method`, but
+            // the method is indexed flattened as `module::method` — redirect onto
+            // the real method node instead of fabricating a per-type phantom.
+            if p.parse.lang == Lang::Rust && !internal_fns.contains(&resolved) {
+                if let Some(m) = resolve_impl_method_call(&resolved, internal_fns, internal_types) {
+                    resolved = m;
                 }
             }
 
@@ -3787,6 +3830,38 @@ fn resolve_glob_call(
     None
 }
 
+/// Inherent-impl method redirect. A Rust method `fn bar()` inside `impl Foo` is
+/// indexed flattened as `module::bar` (NOT `module::Foo::bar`) — a deliberate
+/// tradeoff so a bare in-body call resolves to a sibling free fn. So an
+/// associated-call site `Foo::bar()` resolves to the extern `module::Foo::bar`
+/// while the real method sits at `module::bar`, splitting the method's fan-in
+/// onto a per-type phantom. `ff cortex doctor` flagged this as the top internal
+/// mis-resolution source (`AgentToolResult::ok`/`err`, the `X::new` collisions).
+///
+/// When the resolved name has the shape `<P>::<Type>::<leaf>` where `<P>::<Type>`
+/// is a known internal type AND `<P>::<leaf>` is a known internal fn, redirect to
+/// `<P>::<leaf>`. Redirect-only — it never fabricates: both the type and the
+/// target method must already exist, so it's a no-op unless the method really
+/// lives in that type's own module. The narrow risk (a free fn coincidentally
+/// sharing the leaf name in the same module) is the same flattening collision the
+/// indexer already accepts, never a fabricated edge.
+fn resolve_impl_method_call(
+    resolved: &str,
+    internal_fns: &HashSet<String>,
+    internal_types: &HashSet<String>,
+) -> Option<String> {
+    // Split `<P>::<Type>::<leaf>` → parent_type=`<P>::<Type>`, leaf=`<leaf>`.
+    let (parent_type, leaf) = resolved.rsplit_once("::")?;
+    // The type must itself carry a module prefix (`<P>::<Type>`), so a bare
+    // two-segment `Type::leaf` (no owning module) can't accidentally redirect.
+    let (module, _type_seg) = parent_type.rsplit_once("::")?;
+    if !internal_types.contains(parent_type) {
+        return None;
+    }
+    let target = join(module, leaf);
+    internal_fns.contains(&target).then_some(target)
+}
+
 /// Resolve a `use`-alias target that may carry an unresolved relative prefix
 /// (`use super::truncate_output;` → alias `truncate_output` → stored target
 /// `super::truncate_output`). Only `crate::` is rewritten to an absolute path at
@@ -4522,6 +4597,48 @@ diff --git a/src/b.rs b/src/b.rs
         assert_eq!(
             resolve_call("MyLocalType::new", caller, &fp),
             "ff_brain::cortex::MyLocalType::new"
+        );
+    }
+
+    #[test]
+    fn impl_method_call_redirects_to_flattened_method() {
+        // `AgentToolResult::ok()` resolves to the extern `ff_agent::tools::
+        // AgentToolResult::ok`, but the method is indexed flattened as
+        // `ff_agent::tools::ok`. With both the type and the method known internal,
+        // the redirect points the call at the real method node (the `ff cortex
+        // doctor` top noise source).
+        let types: HashSet<String> = ["ff_agent::tools::AgentToolResult".to_string()].into();
+        let fns: HashSet<String> = ["ff_agent::tools::ok".to_string()].into();
+        assert_eq!(
+            resolve_impl_method_call("ff_agent::tools::AgentToolResult::ok", &fns, &types),
+            Some("ff_agent::tools::ok".to_string())
+        );
+    }
+
+    #[test]
+    fn impl_method_redirect_never_fabricates() {
+        // No redirect unless BOTH the owning type AND the target method exist.
+        let types: HashSet<String> = ["ff_agent::tools::AgentToolResult".to_string()].into();
+        let fns: HashSet<String> = HashSet::new();
+        // Type known, method absent → no edge invented.
+        assert_eq!(
+            resolve_impl_method_call("ff_agent::tools::AgentToolResult::ok", &fns, &types),
+            None
+        );
+        // Method present but the parent segment isn't a known type (a genuine
+        // module path `a::b::c`) → left alone, not collapsed to `a::c`.
+        let fns2: HashSet<String> = ["ff_agent::tools::ok".to_string()].into();
+        let no_types: HashSet<String> = HashSet::new();
+        assert_eq!(
+            resolve_impl_method_call("ff_agent::tools::AgentToolResult::ok", &fns2, &no_types),
+            None
+        );
+        // A bare two-segment `Type::leaf` (no owning module) can't redirect.
+        let t2: HashSet<String> = ["AgentToolResult".to_string()].into();
+        let f2: HashSet<String> = ["ok".to_string()].into();
+        assert_eq!(
+            resolve_impl_method_call("AgentToolResult::ok", &f2, &t2),
+            None
         );
     }
 
