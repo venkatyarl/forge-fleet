@@ -305,6 +305,53 @@ pub async fn scan(
         let walked = walk(&root, max_depth);
         let mut path_id: HashMap<PathBuf, Uuid> = HashMap::new();
 
+        // Pre-load this corpus's CURRENT (valid) content nodes + this source's
+        // node→rel_path mappings so an UNCHANGED file/dir can skip its per-row
+        // writes. `cheap_hash` already folds size+mtime, so a matching
+        // content_hash (with identical title/node_type, still valid, owned by
+        // this corpus) means the upsert below would be a pure no-op. A no-op
+        // rescan thus collapses from ~3 sequential DB round-trips per entry
+        // (content upsert + node_sources upsert + contains-edge insert) to a
+        // single batch read — the dominant cost of the hook-driven
+        // `ff cortex index --incremental`, which rescans the whole corpus on
+        // every commit. End-state is identical: we only skip writes the upsert
+        // would have made no-ops (content_hash is the change signal cortex/doc/
+        // image indexing and the out-of-root prune all key on).
+        let existing: HashMap<String, (Uuid, String, String, String)> = sqlx::query(
+            r#"SELECT path, id, content_hash, title, node_type
+                 FROM brain_vault_nodes
+                WHERE project = $1 AND node_type LIKE 'content:%'
+                  AND valid_until IS NULL"#,
+        )
+        .bind(&corpus.slug)
+        .fetch_all(pg)
+        .await?
+        .into_iter()
+        .map(|r| {
+            (
+                r.get::<String, _>("path"),
+                (
+                    r.get::<Uuid, _>("id"),
+                    r.get::<String, _>("content_hash"),
+                    r.get::<String, _>("title"),
+                    r.get::<String, _>("node_type"),
+                ),
+            )
+        })
+        .collect();
+        let existing_src: HashMap<Uuid, String> =
+            sqlx::query("SELECT node_id, rel_path FROM brain_node_sources WHERE source_id = $1")
+                .bind(source.id)
+                .fetch_all(pg)
+                .await?
+                .into_iter()
+                .map(|r| (r.get::<Uuid, _>("node_id"), r.get::<String, _>("rel_path")))
+                .collect();
+        // Entries whose node AND source-mapping were both already present and
+        // unchanged this scan — their `contains` edge was created by the prior
+        // scan that inserted them, so the edge insert can be skipped too.
+        let mut reused: HashSet<PathBuf> = HashSet::new();
+
         for entry in &walked {
             let abs = entry.path.to_string_lossy().to_string();
             let title = entry
@@ -319,7 +366,24 @@ pub async fn scan(
             };
             let hash = cheap_hash(&abs, entry.size, entry.mtime);
 
-            let id = upsert_content_node(pg, &abs, &title, node_type, &corpus.slug, &hash).await?;
+            let rel = entry
+                .path
+                .strip_prefix(&root)
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+
+            // Reuse the stored row when it is byte-identical (same hash, title,
+            // node_type — and already valid + owned by this corpus, which the
+            // `existing` query guarantees); otherwise upsert.
+            let (id, node_unchanged) = match existing.get(&abs) {
+                Some((eid, h, t, nt)) if *h == hash && *t == title && nt == node_type => {
+                    (*eid, true)
+                }
+                _ => (
+                    upsert_content_node(pg, &abs, &title, node_type, &corpus.slug, &hash).await?,
+                    false,
+                ),
+            };
             path_id.insert(entry.path.clone(), id);
             report.nodes_upserted += 1;
             if entry.is_dir {
@@ -328,21 +392,24 @@ pub async fn scan(
                 report.files += 1;
             }
 
-            let rel = entry
-                .path
-                .strip_prefix(&root)
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_default();
-            sqlx::query(
-                r#"INSERT INTO brain_node_sources (node_id, source_id, rel_path)
-                   VALUES ($1, $2, $3)
-                   ON CONFLICT (node_id, source_id) DO UPDATE SET rel_path = EXCLUDED.rel_path"#,
-            )
-            .bind(id)
-            .bind(source.id)
-            .bind(&rel)
-            .execute(pg)
-            .await?;
+            // node→source mapping: skip when it already maps this exact rel_path.
+            let src_unchanged = existing_src.get(&id).is_some_and(|r| *r == rel);
+            if !src_unchanged {
+                sqlx::query(
+                    r#"INSERT INTO brain_node_sources (node_id, source_id, rel_path)
+                       VALUES ($1, $2, $3)
+                       ON CONFLICT (node_id, source_id) DO UPDATE SET rel_path = EXCLUDED.rel_path"#,
+                )
+                .bind(id)
+                .bind(source.id)
+                .bind(&rel)
+                .execute(pg)
+                .await?;
+            }
+
+            if node_unchanged && src_unchanged {
+                reused.insert(entry.path.clone());
+            }
 
             if entry.is_dir {
                 all_dirs.push(entry.path.clone());
@@ -352,6 +419,11 @@ pub async fn scan(
 
         for entry in &walked {
             if let Some(parent) = entry.path.parent() {
+                // Both endpoints reused unchanged ⇒ the `contains` edge already
+                // exists from the prior scan that inserted them — skip the write.
+                if reused.contains(&entry.path) && reused.contains(parent) {
+                    continue;
+                }
                 if let (Some(&src), Some(&dst)) = (path_id.get(parent), path_id.get(&entry.path)) {
                     let r = sqlx::query(
                         r#"INSERT INTO brain_vault_edges (src_id, dst_id, edge_type, provenance)
