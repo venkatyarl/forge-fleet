@@ -289,6 +289,29 @@ mod tests {
     }
 
     #[test]
+    fn oversized_single_message_trips_should_compact_but_cant_shrink() {
+        // A short history (system + one huge user prompt) can exceed the
+        // compaction threshold yet have nothing compact_messages can drop —
+        // it always preserves system + keep_recent. The agent loop relies on
+        // `after < before` to avoid firing a misleading "2 → 2 messages" event
+        // and bumping the counter on every turn. Pin that invariant here.
+        let huge = "word ".repeat(40_000); // ~50k tokens, well over the 70% trigger
+        let msgs = vec![ToolChatMessage::system("sys"), ToolChatMessage::user(huge)];
+        let config = CompactionConfig::default();
+
+        assert!(
+            should_compact(&msgs, &config),
+            "an oversized single message must trip should_compact"
+        );
+        let compacted = compact_messages(&msgs, &config);
+        assert_eq!(
+            compacted.len(),
+            msgs.len(),
+            "compaction cannot shrink a history of len <= keep_recent + 1"
+        );
+    }
+
+    #[test]
     fn compact_preserves_system_and_recent() {
         let mut msgs = vec![ToolChatMessage::system("system prompt")];
         for i in 0..20 {

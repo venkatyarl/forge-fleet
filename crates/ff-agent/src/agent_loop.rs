@@ -708,26 +708,40 @@ async fn run_agent_loop(
         // --- Auto-compaction check ---
         if should_compact(&session.messages, &session.compaction_config) {
             let before = session.messages.len();
-            session.messages = compact_messages(&session.messages, &session.compaction_config);
-            let after = session.messages.len();
-            session.usage.compaction_count += 1;
+            let compacted = compact_messages(&session.messages, &session.compaction_config);
+            let after = compacted.len();
 
-            info!(
-                session = %session_id,
-                before,
-                after,
-                compaction = session.usage.compaction_count,
-                "auto-compacted conversation history"
-            );
+            // Only treat it as a real compaction if the message count actually
+            // shrank. A single oversized message (one huge prompt) trips
+            // should_compact every turn, but compact_messages can't reduce it —
+            // it always preserves the system prompt + keep_recent messages, so a
+            // short-but-fat history returns unchanged (after == before). Emitting
+            // the event + bumping compaction_count + redoing build_summary on
+            // every turn produced a misleading "context compacted: 2 → 2 messages"
+            // log storm and wasted work. The reactive overflow path below handles
+            // the genuine can't-shrink case with a proper error if the server
+            // actually rejects the request.
+            if after < before {
+                session.messages = compacted;
+                session.usage.compaction_count += 1;
 
-            emit(
-                &event_tx,
-                AgentEvent::Compaction {
-                    session_id: session_id.clone(),
-                    messages_before: before,
-                    messages_after: after,
-                },
-            );
+                info!(
+                    session = %session_id,
+                    before,
+                    after,
+                    compaction = session.usage.compaction_count,
+                    "auto-compacted conversation history"
+                );
+
+                emit(
+                    &event_tx,
+                    AgentEvent::Compaction {
+                        session_id: session_id.clone(),
+                        messages_before: before,
+                        messages_after: after,
+                    },
+                );
+            }
         }
 
         // --- Tool-result budgeting ---
