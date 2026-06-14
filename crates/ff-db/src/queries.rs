@@ -4773,6 +4773,18 @@ mod tests {
         conn
     }
 
+    #[test]
+    fn test_classify_collision_buckets() {
+        // 0 same-language candidates ⇒ collides only across a language boundary.
+        assert_eq!(classify_collision(0), SuspiciousBucket::CrossLanguage);
+        // 1–2 ⇒ a genuine, specific mis-resolution lead.
+        assert_eq!(classify_collision(1), SuspiciousBucket::Lead);
+        assert_eq!(classify_collision(2), SuspiciousBucket::Lead);
+        // 3+ (SQL caps the array at 3) ⇒ a generic leaf, not a real call.
+        assert_eq!(classify_collision(3), SuspiciousBucket::GenericLeaf);
+        assert_eq!(classify_collision(9), SuspiciousBucket::GenericLeaf);
+    }
+
     // ── Pure router-decision helpers (no DB) ──────────────────────────────
     // These back the SQL selector in `pg_route_deployments` /
     // `pg_pick_offload_endpoint`; the SQL ORDER BY itself needs Postgres, but
@@ -6233,67 +6245,149 @@ pub struct CortexSuspiciousExtern {
     pub internal_candidates: Vec<String>,
 }
 
+/// Result of [`pg_cortex_suspicious_externs`]: the actionable mis-resolution
+/// leads (`shown`) plus a count of leaf-collisions deliberately filtered as
+/// noise, so the doctor can stay transparent about what it hid.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct CortexSuspiciousReport {
+    pub shown: Vec<CortexSuspiciousExtern>,
+    /// Leaf collides only with internal symbols in a DIFFERENT language (e.g. a
+    /// Rust `DbError::NotFound` extern vs a TSX React `NotFound` component) —
+    /// can never be the same symbol, so it is not a real mis-resolution.
+    pub cross_language_suppressed: i64,
+    /// Leaf collides with 3+ same-language internal symbols (e.g. `new`/`from`/
+    /// `len` written bare on a std type) — a generic name, not a specific call.
+    pub generic_leaf_suppressed: i64,
+    /// Total actionable leads (1–2 same-language candidates) before the display
+    /// `limit` is applied — so the doctor can say "showing top N of M".
+    pub total_leads: i64,
+}
+
+/// Which bucket a leaf-collision extern falls into, given how many SAME-language
+/// internal symbols its leaf collides with (the array is capped at 3 in SQL, so
+/// `n >= 3` means "3 or more"). Pure so the doctor's filtering is unit-testable.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SuspiciousBucket {
+    /// 1–2 same-language candidates: a genuine mis-resolution lead worth eyeballing.
+    Lead,
+    /// 0 same-language candidates (collides only across a language boundary).
+    CrossLanguage,
+    /// 3+ same-language candidates: a generic leaf (`new`/`from`/`len`/…), not a call.
+    GenericLeaf,
+}
+
+pub(crate) fn classify_collision(same_lang_candidates: i32) -> SuspiciousBucket {
+    match same_lang_candidates {
+        0 => SuspiciousBucket::CrossLanguage,
+        1 | 2 => SuspiciousBucket::Lead,
+        _ => SuspiciousBucket::GenericLeaf,
+    }
+}
+
 pub async fn pg_cortex_suspicious_externs(
     pool: &PgPool,
     slug: &str,
     limit: i64,
-) -> Result<Vec<CortexSuspiciousExtern>> {
-    // Leaf = text after the last ':' (works for the '::' separator and for bare
-    // single-segment names, which have no ':' and so match whole). `internal_roots`
-    // is the set of first-segments of real internal symbols — an extern whose head
-    // is in that set is claiming to live in our code, so an unresolved one is
-    // suspicious; combined with a leaf collision it's a strong mis-resolution lead.
+) -> Result<CortexSuspiciousReport> {
+    // A suspicious extern is a `code:extern` placeholder whose HEAD (first `::`
+    // segment) is one of our own module roots AND whose LEAF (text after the last
+    // `:`) collides with a real internal symbol — i.e. a call that *looks* like it
+    // should have resolved internally but was kept as an extern.
+    //
+    // Most leaf collisions are NOISE, not real mis-resolutions, in two classes we
+    // filter here so the list stays actionable:
+    //   1. cross-language — the only same-leaf internal symbols live in a different
+    //      language than the extern's root (Rust extern vs a TSX component). The
+    //      language of a root is derived (DB-first, no hardcoded names) from the
+    //      file extensions of the symbols under it, via the `contains` edge from a
+    //      `content:file` node.
+    //   2. generic-leaf — the leaf collides with 3+ SAME-language internal symbols
+    //      (`new`, `from`, `len`, …); a common method name, not a specific call.
+    // What survives (1–2 same-language candidates) is a genuine lead to eyeball.
     let rows = sqlx::query(
         r#"
-        WITH internal_roots AS (
-          SELECT DISTINCT split_part(title, '::', 1) AS root
-            FROM brain_vault_nodes
-           WHERE project = $1 AND valid_until IS NULL
-             AND node_type IN ('code:function', 'code:class', 'code:interface')
+        WITH internal AS (
+          SELECT i.id, i.title,
+                 split_part(i.title, '::', 1)        AS root,
+                 substring(i.title from '[^:]*$')    AS leaf,
+                 CASE
+                   WHEN lower(f.path) ~ '\.(tsx?|jsx?|mjs|cjs)$' THEN 'ts'
+                   WHEN lower(f.path) ~ '\.rs$'                  THEN 'rust'
+                   WHEN lower(f.path) ~ '\.py$'                  THEN 'python'
+                   WHEN lower(f.path) ~ '\.java$'                THEN 'java'
+                   ELSE NULL
+                 END AS lang
+            FROM brain_vault_nodes i
+            LEFT JOIN brain_vault_edges ce
+                   ON ce.dst_id = i.id AND ce.edge_type = 'contains'
+            LEFT JOIN brain_vault_nodes f
+                   ON f.id = ce.src_id AND f.node_type = 'content:file'
+           WHERE i.project = $1 AND i.valid_until IS NULL
+             AND i.node_type IN ('code:function', 'code:class', 'code:interface')
+        ),
+        root_lang AS (
+          -- dominant language per root, ignoring symbols with no file link
+          -- (flattened impl methods carry no `contains` edge) so they don't
+          -- dilute the mode toward NULL.
+          SELECT root, mode() WITHIN GROUP (ORDER BY lang) AS lang
+            FROM internal WHERE lang IS NOT NULL GROUP BY root
+        ),
+        isym AS (SELECT DISTINCT title, leaf, root FROM internal),
+        ext AS (
+          SELECT x.id, x.title AS extern_qn,
+                 split_part(x.title, '::', 1)     AS root,
+                 substring(x.title from '[^:]*$') AS leaf,
+                 (SELECT COUNT(*) FROM brain_vault_edges e
+                    WHERE e.dst_id = x.id AND e.edge_type = 'calls') AS fan_in
+            FROM brain_vault_nodes x
+           WHERE x.project = $1 AND x.valid_until IS NULL
+             AND x.node_type = 'code:extern'
+             AND split_part(x.title, '::', 1) IN (SELECT root FROM root_lang)
+        ),
+        collide AS (
+          SELECT ext.extern_qn, ext.fan_in,
+                 EXISTS (SELECT 1 FROM isym i WHERE i.leaf = ext.leaf) AS any_collision,
+                 ARRAY(
+                   SELECT DISTINCT i.title
+                     FROM isym i JOIN root_lang r2 ON r2.root = i.root
+                    WHERE i.leaf = ext.leaf AND r2.lang = rl.lang
+                    ORDER BY i.title LIMIT 3
+                 ) AS same_lang_candidates
+            FROM ext JOIN root_lang rl ON rl.root = ext.root
         )
-        SELECT
-          x.title AS extern_qn,
-          (SELECT COUNT(*) FROM brain_vault_edges e
-             WHERE e.dst_id = x.id AND e.edge_type = 'calls') AS fan_in,
-          ARRAY(
-            SELECT DISTINCT i.title
-              FROM brain_vault_nodes i
-             WHERE i.project = x.project
-               AND i.valid_until IS NULL
-               AND i.node_type IN ('code:function', 'code:class', 'code:interface')
-               AND substring(i.title from '[^:]*$') = substring(x.title from '[^:]*$')
-             ORDER BY i.title
-             LIMIT 5
-          ) AS internal_candidates
-        FROM brain_vault_nodes x
-        WHERE x.project = $1
-          AND x.valid_until IS NULL
-          AND x.node_type = 'code:extern'
-          AND split_part(x.title, '::', 1) IN (SELECT root FROM internal_roots)
-          AND EXISTS (
-            SELECT 1 FROM brain_vault_nodes i
-             WHERE i.project = x.project
-               AND i.valid_until IS NULL
-               AND i.node_type IN ('code:function', 'code:class', 'code:interface')
-               AND substring(i.title from '[^:]*$') = substring(x.title from '[^:]*$')
-          )
-        ORDER BY fan_in DESC, extern_qn ASC
-        LIMIT $2
+        SELECT extern_qn, fan_in, same_lang_candidates,
+               cardinality(same_lang_candidates) AS n_cand,
+               any_collision
+          FROM collide
+         WHERE any_collision
+         ORDER BY fan_in DESC, extern_qn ASC
+         LIMIT 5000
         "#,
     )
     .bind(slug)
-    .bind(limit)
     .fetch_all(pool)
     .await?;
 
-    Ok(rows
-        .iter()
-        .map(|r| CortexSuspiciousExtern {
-            extern_qn: r.get("extern_qn"),
-            fan_in: r.get("fan_in"),
-            internal_candidates: r.get("internal_candidates"),
-        })
-        .collect())
+    let mut report = CortexSuspiciousReport::default();
+    let lim = limit.max(0) as usize;
+    for r in &rows {
+        let n_cand: i32 = r.get("n_cand");
+        match classify_collision(n_cand) {
+            SuspiciousBucket::CrossLanguage => report.cross_language_suppressed += 1,
+            SuspiciousBucket::GenericLeaf => report.generic_leaf_suppressed += 1,
+            SuspiciousBucket::Lead => {
+                report.total_leads += 1;
+                if report.shown.len() < lim {
+                    report.shown.push(CortexSuspiciousExtern {
+                        extern_qn: r.get("extern_qn"),
+                        fan_in: r.get("fan_in"),
+                        internal_candidates: r.get("same_lang_candidates"),
+                    });
+                }
+            }
+        }
+    }
+    Ok(report)
 }
 
 pub async fn pg_search_brain_vault_nodes(
