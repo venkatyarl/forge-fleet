@@ -8,7 +8,10 @@
 //!
 //! Dispatch is driven by the `version_source` JSONB column's `method` field,
 //! which comes from `config/software.toml`:
-//!   - `"github_release"` with `repo = "owner/name"`
+//!   - `"github_release"` with `repo = "owner/name"` (optional `ref_kind`:
+//!     `tagged` (default, `/releases/latest`) | `latest_tag` (`/tags`, for repos
+//!     that tag but never cut Releases, e.g. docker/cli) | `main`/`master` |
+//!     `branch:<name>` | `commit`)
 //!   - `"brew"`            with `formula = "name"`
 //!   - `"pip"`             with `package = "name"`
 //!   - `"sw_vers"` / `"apt_dist"` / `"cmd"` — SKIPPED (local-only or complex)
@@ -342,6 +345,11 @@ async fn query_upstream(
                 .unwrap_or("tagged");
             let result = match ref_kind {
                 "tagged" => fetch_github_latest(http, repo, github_token).await,
+                // Some repos publish git TAGS but never cut GitHub "Releases"
+                // (e.g. docker/cli) — `/releases/latest` 404s permanently for
+                // them. `latest_tag` lists `/tags` and picks the newest release
+                // semver tag instead.
+                "latest_tag" => fetch_github_latest_tag(http, repo, github_token).await,
                 "main" | "master" => {
                     fetch_github_branch_head(http, repo, ref_kind, github_token).await
                 }
@@ -365,7 +373,7 @@ async fn query_upstream(
                 }
                 other => {
                     return UpstreamResult::Error(format!(
-                        "unknown github_release ref_kind '{other}' (expected tagged|main|branch:X|commit)"
+                        "unknown github_release ref_kind '{other}' (expected tagged|latest_tag|main|branch:X|commit)"
                     ));
                 }
             };
@@ -485,6 +493,61 @@ async fn fetch_github_latest(
     Ok(strip_v_prefix(tag).to_string())
 }
 
+/// Fetch the newest release tag for a GitHub repo via `/tags` (not
+/// `/releases/latest`). For repos that publish git tags but never cut GitHub
+/// "Releases" (docker/cli is the canonical case), the releases endpoint 404s
+/// forever — this lists the tags and selects the highest *release* semver.
+///
+/// GitHub's `/tags` ordering is not contractually semver-sorted, so we don't
+/// trust the first element: [`select_latest_release_tag`] parses the numeric
+/// components and picks the max, ignoring pre-release tags (`-rc`, `-beta`, …).
+async fn fetch_github_latest_tag(
+    http: &reqwest::Client,
+    repo: &str,
+    token: Option<&str>,
+) -> Result<String, String> {
+    let url = format!("https://api.github.com/repos/{repo}/tags?per_page=100");
+    let body = github_get_json(http, &url, token).await?;
+    let arr = body
+        .as_array()
+        .ok_or_else(|| format!("expected a JSON array from {url}"))?;
+    let names: Vec<&str> = arr
+        .iter()
+        .filter_map(|t| t.get("name").and_then(|v| v.as_str()))
+        .collect();
+    select_latest_release_tag(&names)
+        .map(|t| t.to_string())
+        .ok_or_else(|| format!("no usable tags in {url} ({} returned)", names.len()))
+}
+
+/// Parse a tag's numeric release components (`v28.1.1` → `[28, 1, 1]`),
+/// returning `None` for pre-releases or non-numeric tags. The leading `v` is
+/// stripped; the remainder must be purely dot-separated integers — anything
+/// with a `-` suffix (`28.2.0-rc.1`), build metadata (`+…`), or alpha segment
+/// is rejected so it can never outrank a real release.
+fn parse_release_tag(tag: &str) -> Option<Vec<u64>> {
+    let core = strip_v_prefix(tag);
+    if core.is_empty() {
+        return None;
+    }
+    core.split('.')
+        .map(|seg| seg.parse::<u64>().ok())
+        .collect::<Option<Vec<u64>>>()
+        .filter(|parts| !parts.is_empty())
+}
+
+/// Pick the highest release tag from a `/tags` list. Compares the parsed
+/// numeric component vectors (so `28.10.0 > 28.9.0`, unlike string sort).
+/// Pre-release / non-numeric tags are skipped. Returns the original tag string
+/// (callers want the upstream's own form minus the `v`).
+fn select_latest_release_tag<'a>(names: &[&'a str]) -> Option<&'a str> {
+    names
+        .iter()
+        .filter_map(|&name| parse_release_tag(name).map(|parts| (parts, name)))
+        .max_by(|(a, _), (b, _)| a.cmp(b))
+        .map(|(_, name)| strip_v_prefix(name))
+}
+
 /// Fetch the head commit SHA of a branch (shortened to 10 chars to match
 /// the format of self_built / git_sha versioning).
 async fn fetch_github_branch_head(
@@ -599,5 +662,33 @@ mod tests {
         assert!(!github_status_is_transient(404));
         assert!(!github_status_is_transient(401));
         assert!(!github_status_is_transient(422));
+    }
+
+    #[test]
+    fn parse_release_tag_rejects_prereleases_and_junk() {
+        assert_eq!(parse_release_tag("v28.1.1"), Some(vec![28, 1, 1]));
+        assert_eq!(parse_release_tag("2.0"), Some(vec![2, 0]));
+        assert_eq!(parse_release_tag("v3"), Some(vec![3]));
+        // Pre-release / build-metadata / named tags are not releases.
+        assert_eq!(parse_release_tag("v28.2.0-rc.1"), None);
+        assert_eq!(parse_release_tag("28.1.0+build5"), None);
+        assert_eq!(parse_release_tag("nightly"), None);
+        assert_eq!(parse_release_tag("v"), None);
+        assert_eq!(parse_release_tag(""), None);
+    }
+
+    #[test]
+    fn select_latest_release_tag_picks_numeric_max() {
+        // Numeric (not string) compare: 28.10.0 must beat 28.9.0, and the
+        // newest stable must win over an rc that sorts later as a string.
+        let tags = ["v28.9.0", "v28.10.0", "v28.2.0-rc.3", "v27.5.1", "latest"];
+        assert_eq!(select_latest_release_tag(&tags), Some("28.10.0"));
+    }
+
+    #[test]
+    fn select_latest_release_tag_none_when_no_release_tags() {
+        let tags = ["nightly", "edge", "v2.0-rc.1"];
+        assert_eq!(select_latest_release_tag(&tags), None);
+        assert_eq!(select_latest_release_tag(&[]), None);
     }
 }

@@ -8565,3 +8565,28 @@ CREATE TABLE IF NOT EXISTS cortex_reexports (
 );
 CREATE INDEX IF NOT EXISTS idx_cortex_reexports_corpus ON cortex_reexports (corpus_slug);
 "#;
+
+// ─── V129: docker upstream tracks tags, not releases ────────────────────────
+//
+// V47 set docker's version_source to {method:github_release, repo:docker/cli}
+// with the default ref_kind=tagged, which probes `/repos/docker/cli/releases/
+// latest`. docker/cli publishes git TAGS but never cuts GitHub "Releases", so
+// that endpoint 404s on EVERY 6h upstream pass — `ff software check-upstream`
+// has reported `errors: 1` (docker) indefinitely. Repoint it to the new
+// `latest_tag` ref_kind (lists `/tags`, picks the newest release semver) in
+// both catalogs. Idempotent: only rewrites the rows still on the releases form.
+pub const SCHEMA_V129_DOCKER_LATEST_TAG: &str = r#"
+UPDATE software_registry SET
+    version_source = '{"method":"github_release","repo":"docker/cli","ref_kind":"latest_tag"}'::jsonb
+ WHERE id = 'docker'
+   AND version_source->>'method' = 'github_release'
+   AND version_source->>'repo'   = 'docker/cli'
+   AND (version_source->>'ref_kind') IS DISTINCT FROM 'latest_tag';
+
+UPDATE external_tools SET
+    version_source = '{"method":"github_release","repo":"docker/cli","ref_kind":"latest_tag"}'::jsonb
+ WHERE id = 'docker'
+   AND version_source->>'method' = 'github_release'
+   AND version_source->>'repo'   = 'docker/cli'
+   AND (version_source->>'ref_kind') IS DISTINCT FROM 'latest_tag';
+"#;
