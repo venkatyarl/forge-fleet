@@ -98,6 +98,24 @@ fn playbook_exact(tool: &str, os_family: &str) -> Option<String> {
         // fall back to pkill + nohup + disown. The fallback is the only
         // safe path for hosts whose bootstrap never installed a systemd
         // unit ([[bootstrap-missing-systemd]]).
+        //
+        // SELF-KILL FIX (2026-06-14): the restart MUST be detached. The
+        // deferred worker runs this playbook as a child of the very
+        // forgefleetd it's about to restart, spawned with `process_group(0)`
+        // (task_runner.rs). The old playbook ran a FOREGROUND
+        // `pkill -f 'forgefleetd --worker-name'` before the restart, which
+        // tore down the daemon → the worker's process group → the playbook
+        // shell itself (exit -1) before `systemctl restart` / the nohup
+        // respawn ever ran. Result: every Linux forgefleetd_git upgrade
+        // reported failure (14/15 stuck drifted) and no-systemd hosts could
+        // be left with the daemon down. Fix mirrors the wave restart
+        // (task_runner.rs "fix C"): wrap the whole kill+restart in a
+        // `setsid` session (escapes the worker's process-group reap — see the
+        // task_runner.rs:process_group(0) comment), background+disown it so
+        // the orchestrator returns and the worker records SUCCESS first, then
+        // restart via `systemctl --no-block` (or a detached pkill+nohup
+        // respawn). The leading 2s sleep guarantees the success write lands
+        // before the daemon is bounced.
         ("forgefleetd_git" | "forgefleetd", "macos") => Some(
             ". \"$HOME/.cargo/env\" 2>/dev/null || true; \
              cd ~/projects/forge-fleet && git pull --ff-only && \
@@ -120,13 +138,15 @@ fn playbook_exact(tool: &str, os_family: &str) -> Option<String> {
              cargo build --bin forgefleetd --release && \
              install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && \
              export XDG_RUNTIME_DIR=\"${XDG_RUNTIME_DIR:-/run/user/$(id -u)}\"; \
-             pkill -f 'forgefleetd --worker-name' 2>/dev/null; \
-             sleep 1; \
-             ( systemctl --user reset-failed forgefleetd.service 2>/dev/null; \
-               systemctl --user restart forgefleetd.service 2>/dev/null ) \
-               || ( pkill -TERM -f \"$HOME/.local/bin/forgefleetd\" 2>/dev/null; sleep 1; \
-                    nohup \"$HOME/.local/bin/forgefleetd\" --worker-name $(hostname -s) start \
-                    </dev/null >/tmp/forgefleetd.log 2>&1 & disown )"
+             setsid bash -c 'sleep 2; \
+               systemctl --user reset-failed forgefleetd.service 2>/dev/null; \
+               systemctl --user restart --no-block forgefleetd.service </dev/null >/dev/null 2>&1 \
+                 || ( pkill -TERM -f \"$HOME/.local/bin/forgefleetd\" 2>/dev/null; sleep 1; \
+                      nohup \"$HOME/.local/bin/forgefleetd\" --worker-name $(hostname -s) start \
+                      </dev/null >/tmp/forgefleetd.log 2>&1 & disown )' \
+               </dev/null >/tmp/forgefleetd-restart.log 2>&1 & \
+             disown; \
+             echo \"build+install OK; restart dispatched detached (setsid + --no-block; survives worker self-kill)\""
                 .into(),
         ),
         // DGX Sparks: aarch64 + 4 cores. Default cargo parallelism uses all
@@ -142,13 +162,15 @@ fn playbook_exact(tool: &str, os_family: &str) -> Option<String> {
              cargo build --bin forgefleetd --release -j 2 && \
              install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && \
              export XDG_RUNTIME_DIR=\"${XDG_RUNTIME_DIR:-/run/user/$(id -u)}\"; \
-             pkill -f 'forgefleetd --worker-name' 2>/dev/null; \
-             sleep 1; \
-             ( systemctl --user reset-failed forgefleetd.service 2>/dev/null; \
-               systemctl --user restart forgefleetd.service 2>/dev/null ) \
-               || ( pkill -TERM -f \"$HOME/.local/bin/forgefleetd\" 2>/dev/null; sleep 1; \
-                    nohup \"$HOME/.local/bin/forgefleetd\" --worker-name $(hostname -s) start \
-                    </dev/null >/tmp/forgefleetd.log 2>&1 & disown )"
+             setsid bash -c 'sleep 2; \
+               systemctl --user reset-failed forgefleetd.service 2>/dev/null; \
+               systemctl --user restart --no-block forgefleetd.service </dev/null >/dev/null 2>&1 \
+                 || ( pkill -TERM -f \"$HOME/.local/bin/forgefleetd\" 2>/dev/null; sleep 1; \
+                      nohup \"$HOME/.local/bin/forgefleetd\" --worker-name $(hostname -s) start \
+                      </dev/null >/tmp/forgefleetd.log 2>&1 & disown )' \
+               </dev/null >/tmp/forgefleetd-restart.log 2>&1 & \
+             disown; \
+             echo \"build+install OK; restart dispatched detached (setsid + --no-block; survives worker self-kill)\""
                 .into(),
         ),
         ("os", "linux") => Some("sudo apt-get update && sudo apt-get -y upgrade".into()),
@@ -188,5 +210,32 @@ mod tests {
     #[test]
     fn unknown_os_is_none() {
         assert!(playbook_for("forgefleetd_git", "plan9").is_none());
+    }
+
+    #[test]
+    fn linux_restart_is_detached_and_not_self_killing() {
+        // SELF-KILL FIX (2026-06-14): the deferred worker runs this playbook as
+        // a child of the forgefleetd it restarts. The restart MUST be `setsid`
+        // detached (escapes the worker's process-group reap) and MUST NOT run a
+        // foreground `pkill -f 'forgefleetd --worker-name'` — that killed the
+        // orchestrating shell before the restart ran (exit -1, fleet stuck
+        // drifted). `--no-block` returns immediately so the worker records
+        // success first.
+        for fam in ["linux", "linux-dgx"] {
+            let p = playbook_for("forgefleetd_git", fam)
+                .unwrap_or_else(|| panic!("no playbook for {fam}"));
+            assert!(
+                p.contains("setsid bash -c"),
+                "fam={fam}: restart not detached"
+            );
+            assert!(
+                p.contains("systemctl --user restart --no-block forgefleetd.service"),
+                "fam={fam}: restart must be --no-block"
+            );
+            assert!(
+                !p.contains("pkill -f 'forgefleetd --worker-name'"),
+                "fam={fam}: foreground daemon-pkill self-kills the worker"
+            );
+        }
     }
 }
