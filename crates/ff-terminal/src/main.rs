@@ -1765,6 +1765,25 @@ pub enum FleetDbCommand {
         #[arg(long, default_value_t = false)]
         test_restore: bool,
     },
+    /// Force a backup cycle RIGHT NOW, bypassing the 4h/6h cadence, then
+    /// catalogue + distribute it via the normal HA path.
+    ///
+    /// Runs the exact same `BackupOrchestrator::run_once` the daemon ticks,
+    /// so it exercises the real backup → encrypt → catalogue → fan-out
+    /// pipeline. Intended to be run ON the leader (taylor); `--now` passes
+    /// `force=true` so it doesn't silently no-op if leadership detection is
+    /// momentarily flaky. Use it to verify the HA backup path on demand
+    /// instead of waiting for the next scheduled tick.
+    Backup {
+        /// Which datastore to back up: `postgres`, `redis`, or `all`.
+        #[arg(long, default_value = "all")]
+        kind: String,
+        /// Force the run even if this host isn't detected as leader. On by
+        /// default for this verb (the whole point is an on-demand backup);
+        /// pass `--now=false` to respect the leader gate.
+        #[arg(long = "now", default_value_t = true)]
+        now: bool,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
