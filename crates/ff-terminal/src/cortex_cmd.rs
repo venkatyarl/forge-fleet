@@ -81,6 +81,7 @@ fn print_tests(rows: &[cortex::TestHit], format: &str, label: &str) {
                         "id": r.id,
                         "qualified_name": r.qualified_name,
                         "file": r.file,
+                        "start_line": r.start_line,
                         "depth": r.depth,
                     })
                 })
@@ -99,8 +100,12 @@ fn print_tests(rows: &[cortex::TestHit], format: &str, label: &str) {
             }
             println!("{CYAN}{} \u{2014} {} test(s):{RESET}", label, rows.len());
             for r in rows {
-                let loc = r.file.as_deref().unwrap_or("?");
-                println!("  [d{}] {}  ({})", r.depth, r.qualified_name, loc);
+                println!(
+                    "  [d{}] {}  ({})",
+                    r.depth,
+                    r.qualified_name,
+                    fmt_loc(r.file.as_deref(), r.start_line)
+                );
             }
         }
     }
@@ -116,6 +121,8 @@ fn print_symbols(rows: &[cortex::SymbolRef], format: &str, label: &str) {
                         "id": r.id,
                         "qualified_name": r.qualified_name,
                         "node_type": r.node_type,
+                        "file": r.file,
+                        "start_line": r.start_line,
                     })
                 })
                 .collect();
@@ -129,8 +136,25 @@ fn print_symbols(rows: &[cortex::SymbolRef], format: &str, label: &str) {
         _ => {
             println!("{CYAN}{} \u{2014} {} result(s):{RESET}", label, rows.len());
             for r in rows {
-                println!("  [{}] {}", r.node_type, r.qualified_name);
+                println!(
+                    "  [{}] {}  ({})",
+                    r.node_type,
+                    r.qualified_name,
+                    fmt_loc(r.file.as_deref(), r.start_line)
+                );
             }
         }
+    }
+}
+
+/// Format a symbol's location as `file:line` (or `file`, or `?`) for the table
+/// views of the relationship verbs — the actionable `path:line` form an agent or
+/// editor can jump to, so `callers`/`callees`/`impact`/`tests` no longer need a
+/// second `find`/`show` round-trip to locate each result.
+fn fmt_loc(file: Option<&str>, line: Option<i32>) -> String {
+    match (file, line) {
+        (Some(f), Some(l)) => format!("{f}:{l}"),
+        (Some(f), None) => f.to_string(),
+        _ => "?".to_string(),
     }
 }
