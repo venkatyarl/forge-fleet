@@ -18,7 +18,12 @@ pub async fn handle_cortex(pool: &PgPool, cmd: crate::CortexCommand) -> Result<(
             println!("  contains edges:      {}", stats.contains);
             println!("  import edges:        {}", stats.imports);
             println!("  calls (total):       {}", stats.calls_total);
-            println!("  calls (resolved):    {}", stats.calls_resolved);
+            println!(
+                "  calls (resolved):    {}  (extracted {} / inferred {})",
+                stats.calls_resolved,
+                stats.calls_resolved.saturating_sub(stats.calls_inferred),
+                stats.calls_inferred,
+            );
             println!("  inherited members:   {}", stats.inherited_memberships);
             println!("{CYAN}\u{2713} Done{RESET}");
         }

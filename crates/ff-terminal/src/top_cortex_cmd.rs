@@ -788,6 +788,8 @@ async fn run_doctor(pool: &PgPool, corpus: &str, limit: i64, format: &str) -> Re
                 "corpus": corpus,
                 "call_edges": stats.call_edges,
                 "internal_resolved": stats.internal,
+                "internal_extracted": stats.extracted,
+                "internal_inferred": stats.inferred,
                 "external_unresolved": stats.external,
                 "internal_resolution_pct": (rate * 10.0).round() / 10.0,
                 "code_symbols": stats.code_symbols,
@@ -811,6 +813,14 @@ async fn run_doctor(pool: &PgPool, corpus: &str, limit: i64, format: &str) -> Re
     println!(
         "  internal-resolved   {:>8}  ({rate:.1}% of call edges)",
         stats.internal
+    );
+    println!(
+        "    \u{2514} extracted       {:>8}  (primary resolver, conf 1.0 \u{2014} high trust)",
+        stats.extracted
+    );
+    println!(
+        "    \u{2514} inferred        {:>8}  (heuristic redirect, conf 0.6 \u{2014} guessed)",
+        stats.inferred
     );
     println!("  external/unresolved {:>8}", stats.external);
     println!("  code symbols        {:>8}", stats.code_symbols);
