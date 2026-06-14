@@ -984,6 +984,11 @@ impl ToolRegistry {
                     "symbol": {
                         "type": "string",
                         "description": "Code symbol — bare leaf ('load_model') or qualified ('ff_agent::model_runtime::load_model')"
+                    },
+                    "min_confidence": {
+                        "type": "number",
+                        "description": "Only traverse `calls` edges at/above this resolution-confidence tier: 1.0 = EXTRACTED only (high-trust, primary resolver named a real internal symbol), 0.6 = +INFERRED (heuristic redirect), 0.0 = all (default). Pass 1.0 for high-precision traversal that drops the ~40% of edges from heuristic redirects.",
+                        "default": 0.0
                     }
                 },
                 "required": ["corpus", "symbol"]
@@ -1005,6 +1010,11 @@ impl ToolRegistry {
                     "symbol": {
                         "type": "string",
                         "description": "Code symbol — bare leaf or qualified name"
+                    },
+                    "min_confidence": {
+                        "type": "number",
+                        "description": "Only traverse `calls` edges at/above this resolution-confidence tier: 1.0 = EXTRACTED only (high-trust), 0.6 = +INFERRED (heuristic redirect), 0.0 = all (default).",
+                        "default": 0.0
                     }
                 },
                 "required": ["corpus", "symbol"]
@@ -1031,6 +1041,11 @@ impl ToolRegistry {
                         "type": "integer",
                         "description": "Max transitive hops (1-20, default 5)",
                         "default": 5
+                    },
+                    "min_confidence": {
+                        "type": "number",
+                        "description": "Only traverse `calls` edges at/above this resolution-confidence tier: 1.0 = EXTRACTED only (high-trust), 0.6 = +INFERRED (heuristic redirect), 0.0 = all (default). Use 1.0 for a high-precision blast radius that excludes heuristic-redirect edges.",
+                        "default": 0.0
                     }
                 },
                 "required": ["corpus", "symbol"]

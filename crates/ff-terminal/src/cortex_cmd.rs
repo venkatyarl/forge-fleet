@@ -30,26 +30,29 @@ pub async fn handle_cortex(pool: &PgPool, cmd: crate::CortexCommand) -> Result<(
         crate::CortexCommand::Callers {
             corpus,
             symbol,
+            min_confidence,
             format,
         } => {
-            let rows = cortex::callers(pool, &corpus, &symbol).await?;
+            let rows = cortex::callers(pool, &corpus, &symbol, min_confidence).await?;
             print_symbols(&rows, &format, &format!("callers of {symbol}"));
         }
         crate::CortexCommand::Callees {
             corpus,
             symbol,
+            min_confidence,
             format,
         } => {
-            let rows = cortex::callees(pool, &corpus, &symbol).await?;
+            let rows = cortex::callees(pool, &corpus, &symbol, min_confidence).await?;
             print_symbols(&rows, &format, &format!("callees of {symbol}"));
         }
         crate::CortexCommand::Impact {
             corpus,
             symbol,
             max_depth,
+            min_confidence,
             format,
         } => {
-            let rows = cortex::impact(pool, &corpus, &symbol, max_depth).await?;
+            let rows = cortex::impact(pool, &corpus, &symbol, max_depth, min_confidence).await?;
             print_symbols(
                 &rows,
                 &format,

@@ -64,6 +64,10 @@ pub enum TopCortexCommand {
         symbol: String,
         #[arg(long)]
         corpus: Option<String>,
+        /// Only traverse `calls` edges at/above this resolution-confidence tier:
+        /// 1.0 = EXTRACTED only (high-trust), 0.6 = +INFERRED, 0.0 = all (default).
+        #[arg(long, default_value_t = 0.0)]
+        min_confidence: f32,
         #[arg(long, default_value = "table")]
         format: String,
     },
@@ -72,6 +76,10 @@ pub enum TopCortexCommand {
         symbol: String,
         #[arg(long)]
         corpus: Option<String>,
+        /// Only traverse `calls` edges at/above this resolution-confidence tier:
+        /// 1.0 = EXTRACTED only (high-trust), 0.6 = +INFERRED, 0.0 = all (default).
+        #[arg(long, default_value_t = 0.0)]
+        min_confidence: f32,
         #[arg(long, default_value = "table")]
         format: String,
     },
@@ -150,6 +158,10 @@ pub enum TopCortexCommand {
         corpus: Option<String>,
         #[arg(long, default_value_t = 5)]
         max_depth: usize,
+        /// Only traverse `calls` edges at/above this resolution-confidence tier:
+        /// 1.0 = EXTRACTED only (high-trust), 0.6 = +INFERRED, 0.0 = all (default).
+        #[arg(long, default_value_t = 0.0)]
+        min_confidence: f32,
         #[arg(long, default_value = "table")]
         format: String,
     },
@@ -509,6 +521,7 @@ pub async fn handle_top_cortex(args: TopCortexArgs) -> Result<()> {
         TopCortexCommand::Callers {
             symbol,
             corpus,
+            min_confidence,
             format,
         } => {
             let corpus = corpus.unwrap_or_else(cwd_slug);
@@ -517,6 +530,7 @@ pub async fn handle_top_cortex(args: TopCortexArgs) -> Result<()> {
                 crate::CortexCommand::Callers {
                     corpus,
                     symbol,
+                    min_confidence,
                     format,
                 },
             )
@@ -525,6 +539,7 @@ pub async fn handle_top_cortex(args: TopCortexArgs) -> Result<()> {
         TopCortexCommand::Callees {
             symbol,
             corpus,
+            min_confidence,
             format,
         } => {
             let corpus = corpus.unwrap_or_else(cwd_slug);
@@ -533,6 +548,7 @@ pub async fn handle_top_cortex(args: TopCortexArgs) -> Result<()> {
                 crate::CortexCommand::Callees {
                     corpus,
                     symbol,
+                    min_confidence,
                     format,
                 },
             )
@@ -595,6 +611,7 @@ pub async fn handle_top_cortex(args: TopCortexArgs) -> Result<()> {
             symbol,
             corpus,
             max_depth,
+            min_confidence,
             format,
         } => {
             let corpus = corpus.unwrap_or_else(cwd_slug);
@@ -604,6 +621,7 @@ pub async fn handle_top_cortex(args: TopCortexArgs) -> Result<()> {
                     corpus,
                     symbol,
                     max_depth,
+                    min_confidence,
                     format,
                 },
             )

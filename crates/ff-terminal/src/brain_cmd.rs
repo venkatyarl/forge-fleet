@@ -76,6 +76,7 @@ pub async fn handle_brain(cmd: crate::BrainCommand) -> Result<()> {
         crate::BrainCommand::Callers {
             corpus,
             symbol,
+            min_confidence,
             format,
         } => {
             crate::cortex_cmd::handle_cortex(
@@ -83,6 +84,7 @@ pub async fn handle_brain(cmd: crate::BrainCommand) -> Result<()> {
                 crate::CortexCommand::Callers {
                     corpus,
                     symbol,
+                    min_confidence,
                     format,
                 },
             )
@@ -91,6 +93,7 @@ pub async fn handle_brain(cmd: crate::BrainCommand) -> Result<()> {
         crate::BrainCommand::Callees {
             corpus,
             symbol,
+            min_confidence,
             format,
         } => {
             crate::cortex_cmd::handle_cortex(
@@ -98,6 +101,7 @@ pub async fn handle_brain(cmd: crate::BrainCommand) -> Result<()> {
                 crate::CortexCommand::Callees {
                     corpus,
                     symbol,
+                    min_confidence,
                     format,
                 },
             )
@@ -107,6 +111,7 @@ pub async fn handle_brain(cmd: crate::BrainCommand) -> Result<()> {
             corpus,
             symbol,
             max_depth,
+            min_confidence,
             format,
         } => {
             crate::cortex_cmd::handle_cortex(
@@ -115,6 +120,7 @@ pub async fn handle_brain(cmd: crate::BrainCommand) -> Result<()> {
                     corpus,
                     symbol,
                     max_depth,
+                    min_confidence,
                     format,
                 },
             )
