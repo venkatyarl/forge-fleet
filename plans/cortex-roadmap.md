@@ -84,9 +84,19 @@ Live forge-fleet baseline: 30.6% of `calls` edges resolve internally
    `impl Foo { fn bar() }` methods are registered as `module::bar`, NOT
    `module::Foo::bar` (a deliberate tradeoff at the `impl_item` arm so bare calls
    *inside* a method body resolve to sibling free fns). So `Foo::bar()` call sites
-   become externs. Biggest internal-recall lever, but the fix is delicate: index
-   methods under `module::Foo::bar` AND make in-body bare-call resolution walk up
-   `module::Foo::*` → `module::*`. Needs careful tests before landing.
+   became externs. ✅ FIXED (PR #278, `resolve_impl_method_call`) — rather than
+   re-index methods (which would break in-body bare-call resolution), a
+   **redirect-only** pass collapses an extern `<P>::<Type>::<leaf>` onto the real
+   `<P>::<leaf>` method whenever `<P>::<Type>` is a known internal type AND
+   `<P>::<leaf>` a known internal fn (gated by a new `internal_types` set). Never
+   fabricates. Verified live: internal call recall **30.7% → 36.2%**, the
+   `AgentToolResult::ok`/`err` phantoms (fan-in 58 + 53) absorbed into the real
+   methods. **Follow-up (lever #2b):** the residual `X::new` misses are now all in
+   `mod tests` blocks that pull the type in via `use super::*` — the type segment
+   gets the test module glued on (`…::tests::NodeRegistry::new`), so it isn't a
+   known type and the redirect can't fire. Fix = resolve the type segment through
+   the file's glob imports (same mechanism as `resolve_glob_call`) before the
+   method redirect. Small, contained, next-iteration sized.
 3. **Re-export / facade paths** (`ff_db::run_migrations` →
    `ff_db::migrations::run_migrations`). `pub use` re-exports aren't modeled, so
    calls via the facade path become externs. Hardest (cross-crate pub-use
