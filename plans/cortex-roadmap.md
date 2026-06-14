@@ -72,26 +72,30 @@
      community's summary + top non-extern members. The summaries were write-only
      until this; now an agent gets "what is this subsystem responsible for?" in
      one call.
-   - ⛔ **BLOCKER — communities are not yet meaningful (next cortex build).**
-     `detect_communities` (`communities.rs`) is union-find **connected components
-     over ALL `brain_vault_edges`** (live forge-fleet: contains 110k, calls 90k,
-     imports 47k, link 26k). The `contains` tree (corpus→file→symbol) + `imports`
-     structurally bridge nearly the entire code graph into **one mega-component**
-     (largest community = **44,993** nodes; its god node is a non-code
-     software-version vault node, its summary garbage). So `explain` currently
-     returns a correct lookup over a useless cluster. Excluding `code:extern`
-     universal call-sinks from detection helps only marginally (44,993 → 32,897 —
-     measured live) because the dominant bridge is the containment tree, not
-     externs. **Real fix:** a cortex-specific detection over the **`calls`
-     subgraph among non-extern `code:*` nodes**, using an algorithm that
-     *subdivides* a connected graph — label propagation or Leiden — since
-     connected-components fundamentally cannot split one. Keep the shared
-     `detect_communities` for the brain KG (where `contains`/`link` edges ARE the
-     real structure); store code communities in a parallel registry or a
-     code-scoped column. This is a deliberate redesign of a function shared by
-     `ff brain` and cortex — own iteration, careful verification — not a
-     one-liner. Until it lands, community summaries (and `explain`'s summary
-     field) stay coarse.
+   - ✅ **Meaningful clusters — BLOCKER RESOLVED** (PR #297, `3c9ee3379`, V127).
+     Was: `detect_communities` is union-find **connected components over ALL
+     `brain_vault_edges`**; the `contains` tree (corpus→file→symbol) + `imports`
+     bridged the whole code graph into **one mega-component** (largest community =
+     **44,993** nodes; god node a non-code software-version vault node, summary
+     garbage). Excluding externs barely helped (→32,897) — the dominant bridge is
+     the containment tree. **Fix shipped:** a cortex-specific clustering —
+     **single-level Louvain (modularity local-moving)** over the **`calls`
+     subgraph among non-extern `code:*` nodes** (`cluster_calls_graph` in
+     `communities.rs`, pure + unit-tested — splits two cliques joined by one
+     bridge, which connected-components merges; deterministic across visit orders
+     so `member_hash` is stable). Output lands in a **parallel** `code_community_id`
+     column + `brain_code_communities` registry, leaving the brain KG's
+     `community_id`/`brain_communities` untouched for `ff brain communities/stats`.
+     `ff cortex explain`/`summarize` + the summary-refresh tick repoint to the code
+     variant; `ff cortex embed` runs both clusterers. **Measured live after deploy:**
+     largest code community **44,993 → 249 symbols**, 36,418 communities (4,054
+     multi-member persisted); `ff cortex explain summarize_communities` → a coherent
+     4-member cluster; summaries are now specific ("execution layer for a suite of
+     specialized agent tools…", "agency portal API endpoints…") instead of
+     "V8 JavaScript engine file system". **Possible follow-ups:** multi-level
+     Louvain (hierarchical communities) if 249-symbol clusters prove too coarse;
+     weight `calls` edges by call multiplicity in the modularity gain (currently
+     adjacency multiplicity already approximates this).
 5. **Provenance/confidence on edges** — EXTRACTED vs INFERRED tiers (graphify's
    one structural advantage), so downstream consumers can filter heuristic call
    edges (e.g. the dotty-resolver's kept-as-written externs).
