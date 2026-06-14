@@ -155,6 +155,12 @@ struct FileParse {
     use_targets: Vec<String>,
     /// alias -> fully-qualified module path (e.g. model_runtime -> ff_agent::model_runtime).
     alias_map: HashMap<String, String>,
+    /// Glob-import prefixes from `use <prefix>::*` (Rust). `super`/`self` are kept
+    /// relative and resolved against the call site; everything else is already a
+    /// fully-qualified module path. Used by [`resolve_glob_call`] to redirect a
+    /// bare call brought into scope by a glob (the `mod tests { use super::*; }`
+    /// pattern) to the real symbol instead of fabricating a `code:extern`.
+    glob_imports: Vec<String>,
 }
 
 // ─── Public entrypoint ───────────────────────────────────────────────────────
@@ -799,8 +805,20 @@ async fn extract_files(
             let Some(&caller_id) = p.sym_ids.get(&caller_qn) else {
                 continue;
             };
-            let resolved = resolve_call(&call.raw_path, &caller_qn, &p.parse);
+            let mut resolved = resolve_call(&call.raw_path, &caller_qn, &p.parse);
             stats.calls_total += 1;
+
+            // Glob-import fallback: if the bare call didn't land on a known
+            // internal fn, a `use <prefix>::*;` in scope may bring it in (the
+            // `mod tests { use super::*; }` pattern). Redirect to the real symbol
+            // instead of fabricating a code:extern in the caller's own module.
+            if !internal_fns.contains(&resolved) {
+                if let Some(g) =
+                    resolve_glob_call(&call.raw_path, &caller_qn, &p.parse, internal_fns)
+                {
+                    resolved = g;
+                }
+            }
 
             // Find the callee node: internal real fn if known, else code:extern.
             let callee_path = format!("code://{corpus_slug}/{resolved}");
@@ -2371,6 +2389,7 @@ fn parse_rust_file(file_path: &str, source: &str) -> Option<FileParse> {
         calls: Vec::new(),
         use_targets: Vec::new(),
         alias_map: HashMap::new(),
+        glob_imports: Vec::new(),
     };
 
     // Walk the tree, tracking the current module path (mod blocks) and the
@@ -2615,10 +2634,13 @@ fn expand_use(node: &Node, bytes: &[u8], pfx: &str, crate_name: &str, fp: &mut F
         }
         "use_wildcard" => {
             // `use a::b::*` — register the prefix as a glob source (no alias leaf).
+            // Record it in `glob_imports` so a bare call brought into scope by the
+            // glob can be redirected to the real symbol at resolve time.
             if let Some(t) = node_text(node, bytes) {
                 let t = t.trim_end_matches("::*").to_string();
                 let full = norm_crate(&prefixed(pfx, &t), crate_name);
-                fp.use_targets.push(full);
+                fp.use_targets.push(full.clone());
+                fp.glob_imports.push(full);
             }
         }
         _ => {
@@ -2690,6 +2712,7 @@ fn parse_typescript_file(file_path: &str, source: &str) -> Option<FileParse> {
         calls: Vec::new(),
         use_targets: Vec::new(),
         alias_map: HashMap::new(),
+        glob_imports: Vec::new(),
     };
     walk_ts(&root, bytes, &module, file_path, None, &mut fp);
     // Calls are collected in ONE global pass — attribution is byte-span based
@@ -3156,6 +3179,7 @@ fn parse_java_file(_file_path: &str, source: &str) -> Option<FileParse> {
         calls: Vec::new(),
         use_targets: Vec::new(),
         alias_map: HashMap::new(),
+        glob_imports: Vec::new(),
     };
     walk_java(&root, bytes, &module, None, &mut fp);
     // One global call pass (byte-span attribution via innermost_fn).
@@ -3337,6 +3361,7 @@ fn parse_python_file(file_path: &str, source: &str) -> Option<FileParse> {
         calls: Vec::new(),
         use_targets: Vec::new(),
         alias_map: HashMap::new(),
+        glob_imports: Vec::new(),
     };
     walk_python(&root, bytes, &module, None, &mut fp);
     // One global call pass (byte-span attribution via innermost_fn).
@@ -3675,6 +3700,71 @@ fn resolve_call_inner(
             }
         }
     }
+}
+
+/// Rust glob-import fallback for a bare call that `resolve_call` could not point
+/// at a known internal fn. A `use <prefix>::*;` in scope (most commonly
+/// `mod tests { use super::*; }`) brings sibling/parent items into scope, so a
+/// bare `foo()` may name `<prefix>::foo`. For each glob prefix — resolved
+/// relative to the call site for `super`/`self` — return the first
+/// `<prefix>::<name>` that names a REAL internal fn. No fabrication: this only
+/// redirects to a symbol that already exists in the corpus, otherwise the call
+/// keeps its original (extern) resolution.
+fn resolve_glob_call(
+    raw: &str,
+    caller_qn: &str,
+    fp: &FileParse,
+    internal: &HashSet<String>,
+) -> Option<String> {
+    // Only Rust bare idents that weren't already bound by an explicit `use`.
+    if fp.lang != Lang::Rust
+        || raw.contains("::")
+        || fp.glob_imports.is_empty()
+        || fp.alias_map.contains_key(raw)
+    {
+        return None;
+    }
+    let caller_module = caller_qn
+        .rsplit_once("::")
+        .map(|(m, _)| m.to_string())
+        .unwrap_or_else(|| fp.module.clone());
+    for prefix in &fp.glob_imports {
+        if let Some(base) = resolve_glob_prefix(prefix, &caller_module) {
+            let cand = join(&base, raw);
+            if internal.contains(&cand) {
+                return Some(cand);
+            }
+        }
+    }
+    None
+}
+
+/// Resolve a glob-import module prefix to an absolute module path. `super`/`self`
+/// are relative to `caller_module` (each `super` pops one trailing segment);
+/// anything else is already fully qualified (`norm_crate` rewrote `crate::` at
+/// collection time). Returns `None` if `super` walks above the crate root.
+fn resolve_glob_prefix(prefix: &str, caller_module: &str) -> Option<String> {
+    let mut segs = prefix.split("::");
+    let first = segs.clone().next()?;
+    if first != "super" && first != "self" {
+        return Some(prefix.to_string()); // already absolute
+    }
+    let mut base: Vec<&str> = caller_module.split("::").collect();
+    let mut rest: Vec<&str> = Vec::new();
+    for seg in segs.by_ref() {
+        match seg {
+            "self" => {}
+            "super" => {
+                base.pop()?;
+            }
+            other => rest.push(other),
+        }
+    }
+    base.extend(rest);
+    if base.is_empty() {
+        return None;
+    }
+    Some(base.join("::"))
 }
 
 /// External / std crates are treated as already-qualified.
@@ -4213,6 +4303,7 @@ diff --git a/src/b.rs b/src/b.rs
             calls: vec![],
             use_targets: vec![],
             alias_map,
+            glob_imports: vec![],
         }
     }
 
@@ -4245,6 +4336,103 @@ diff --git a/src/b.rs b/src/b.rs
             &fp,
         );
         assert_eq!(got, "ff_agent::compaction::should_compact");
+    }
+
+    #[test]
+    fn glob_super_redirects_bare_call_to_parent_module() {
+        // The documented dogfood bug: `mod tests { use super::*; }` then a bare
+        // `should_compact(` inside a test. resolve_call alone attributes it to the
+        // tests submodule (no local def, not aliased); the glob fallback must
+        // redirect it to the parent module's real fn.
+        let mut fp = fp_with("ff_agent::compaction", "ff_agent", &[]);
+        fp.glob_imports = vec!["super".to_string()];
+        let caller = "ff_agent::compaction::tests::compacts_when_oversized";
+        // Plain resolution points at the (phantom) tests-submodule fn.
+        assert_eq!(
+            resolve_call("should_compact", caller, &fp),
+            "ff_agent::compaction::tests::should_compact"
+        );
+        // With the parent fn known internal, the glob fallback corrects it.
+        let internal: HashSet<String> = ["ff_agent::compaction::should_compact".to_string()].into();
+        assert_eq!(
+            resolve_glob_call("should_compact", caller, &fp, &internal),
+            Some("ff_agent::compaction::should_compact".to_string())
+        );
+    }
+
+    #[test]
+    fn glob_fallback_does_not_fabricate_when_no_real_symbol() {
+        // No internal symbol matches → no redirect (the call keeps its extern
+        // resolution). Prevents glob imports from inventing edges.
+        let mut fp = fp_with("ff_agent::compaction", "ff_agent", &[]);
+        fp.glob_imports = vec!["super".to_string()];
+        let internal: HashSet<String> = HashSet::new();
+        assert_eq!(
+            resolve_glob_call(
+                "should_compact",
+                "ff_agent::compaction::tests::t",
+                &fp,
+                &internal
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn glob_absolute_prefix_resolves_bare_call() {
+        // `use crate::util::*;` (stored absolute as ff_agent::util) brings `helper`
+        // into scope at the file's top module.
+        let mut fp = fp_with("ff_agent::worker", "ff_agent", &[]);
+        fp.glob_imports = vec!["ff_agent::util".to_string()];
+        let internal: HashSet<String> = ["ff_agent::util::helper".to_string()].into();
+        assert_eq!(
+            resolve_glob_call("helper", "ff_agent::worker::run", &fp, &internal),
+            Some("ff_agent::util::helper".to_string())
+        );
+    }
+
+    #[test]
+    fn glob_fallback_skips_aliased_and_qualified_calls() {
+        // An explicit `use` (alias) wins over the glob; a `::`-qualified call is
+        // never a glob candidate.
+        let mut fp = fp_with(
+            "ff_agent::worker",
+            "ff_agent",
+            &[("helper", "ff_agent::explicit::helper")],
+        );
+        fp.glob_imports = vec!["super".to_string()];
+        let internal: HashSet<String> = ["ff_agent::worker::helper".to_string()].into();
+        // aliased bare ident: fallback declines (alias already resolved it).
+        assert_eq!(
+            resolve_glob_call("helper", "ff_agent::worker::tests::t", &fp, &internal),
+            None
+        );
+        // qualified call: not a glob candidate.
+        assert_eq!(
+            resolve_glob_call("a::b", "ff_agent::worker::tests::t", &fp, &internal),
+            None
+        );
+    }
+
+    #[test]
+    fn glob_prefix_super_super_pops_two() {
+        assert_eq!(
+            resolve_glob_prefix("super", "a::b::tests"),
+            Some("a::b".to_string())
+        );
+        assert_eq!(
+            resolve_glob_prefix("super::super", "a::b::c::tests"),
+            Some("a::b".to_string())
+        );
+        assert_eq!(
+            resolve_glob_prefix("self::inner", "a::b"),
+            Some("a::b::inner".to_string())
+        );
+        // already-absolute prefix is returned unchanged.
+        assert_eq!(
+            resolve_glob_prefix("x::y", "a::b"),
+            Some("x::y".to_string())
+        );
     }
 
     #[test]
