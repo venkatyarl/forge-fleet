@@ -976,6 +976,24 @@ async fn extract_files(
             .push(f.clone());
     }
 
+    // Leaf index over internal TYPES for the Java nested-class constructor
+    // redirect (J2): `<leaf>` -> every internal type whose last segment is that
+    // leaf. A `new Inner()` call on a nested class is recorded as the caller-pkg
+    // path `<caller_pkg>::Inner::Inner`, but the real class lives at
+    // `<owner_pkg>::Outer::Inner` — the type segment lost its OUTER class. Suffix-
+    // matching the leaf finds the real nested type. Whole-corpus (internal_types
+    // is seeded whole-corpus on incremental too).
+    let mut type_by_leaf: HashMap<String, Vec<String>> = HashMap::new();
+    for t in internal_types.iter() {
+        let Some(leaf) = t.rsplit("::").next() else {
+            continue;
+        };
+        type_by_leaf
+            .entry(leaf.to_string())
+            .or_default()
+            .push(t.clone());
+    }
+
     // Second pass: resolve calls and write calls edges.
     for p in &pending {
         // Build enclosing-fn lookup for this file: for each call, find the
@@ -1075,7 +1093,7 @@ async fn extract_files(
             // this flag — internal_fns membership stays the fn-only test.
             let mut ctor_type_target = false;
             if p.parse.lang == Lang::Java && !internal_fns.contains(&resolved) {
-                if let Some(t) = resolve_java_ctor_call(&resolved, internal_types) {
+                if let Some(t) = resolve_java_ctor_call(&resolved, internal_types, &type_by_leaf) {
                     resolved = t;
                     ctor_type_target = true;
                 }
@@ -4574,7 +4592,22 @@ fn resolve_self_method_call(resolved: &str, internal_fns: &HashSet<String>) -> O
 /// site), so a real constructor symbol always wins. A method named identically to
 /// its own class is illegal Java, so the `::Type::Type` shape is unambiguously a
 /// constructor.
-fn resolve_java_ctor_call(resolved: &str, internal_types: &HashSet<String>) -> Option<String> {
+///
+/// J2 — nested classes. `new Inner()` where `Inner` is nested in `Outer` is
+/// recorded as the caller-package path `<caller_pkg>::Inner::Inner`, but the real
+/// class node lives at `<owner_pkg>::Outer::Inner` — the type segment dropped its
+/// OUTER class (and the package may differ from the caller's), so the direct
+/// `internal_types.contains(parent_type)` test misses it. Fall back to suffix-
+/// matching `<type_seg>` across internal types: a candidate `…::<Outer>::<Inner>`
+/// qualifies only when its own prefix (`…::<Outer>`) is itself a known internal
+/// type — i.e. the leaf really is a nested class, not a top-level type that merely
+/// shares a name. Gated to a SINGLE candidate, so an ambiguous nested name stays
+/// extern. Still redirect-only (the target is a known internal type).
+fn resolve_java_ctor_call(
+    resolved: &str,
+    internal_types: &HashSet<String>,
+    type_by_leaf: &HashMap<String, Vec<String>>,
+) -> Option<String> {
     let (parent_type, leaf) = resolved.rsplit_once("::")?;
     let type_seg = parent_type
         .rsplit_once("::")
@@ -4583,9 +4616,22 @@ fn resolve_java_ctor_call(resolved: &str, internal_types: &HashSet<String>) -> O
     if leaf != type_seg {
         return None;
     }
-    internal_types
-        .contains(parent_type)
-        .then(|| parent_type.to_string())
+    // Direct case: the parent path is itself a known internal type (top-level, or
+    // an already-correctly-qualified nested class).
+    if internal_types.contains(parent_type) {
+        return Some(parent_type.to_string());
+    }
+    // J2 nested-class case: find the real `…::<Outer>::<type_seg>` by suffix-
+    // matching the leaf, keeping only candidates whose outer prefix is also an
+    // internal type. Exactly one survivor → redirect; zero/ambiguous → extern.
+    let mut nested = type_by_leaf.get(type_seg)?.iter().filter(|cand| {
+        cand.rsplit_once("::")
+            .is_some_and(|(outer, _)| internal_types.contains(outer))
+    });
+    match (nested.next(), nested.next()) {
+        (Some(only), None) => Some(only.clone()),
+        _ => None,
+    }
 }
 
 /// Crate-root single-candidate redirect (lever #7). A bare call to a fn in a
@@ -5434,6 +5480,17 @@ diff --git a/src/b.rs b/src/b.rs
         assert_eq!(deleted, vec!["d.rs".to_string()]);
     }
 
+    /// Build the leaf->types index the way `extract_files` does, for ctor tests.
+    fn type_leaf_index(types: &HashSet<String>) -> HashMap<String, Vec<String>> {
+        let mut by_leaf: HashMap<String, Vec<String>> = HashMap::new();
+        for t in types {
+            if let Some(leaf) = t.rsplit("::").next() {
+                by_leaf.entry(leaf.to_string()).or_default().push(t.clone());
+            }
+        }
+        by_leaf
+    }
+
     fn fp_with(module: &str, crate_name: &str, aliases: &[(&str, &str)]) -> FileParse {
         let mut alias_map = HashMap::new();
         for (k, v) in aliases {
@@ -5800,8 +5857,13 @@ diff --git a/src/b.rs b/src/b.rs
         // constructor symbol). Redirect onto the class node so instantiation sites
         // show up under `cortex callers AiClient`.
         let types: HashSet<String> = ["com::hireflow360::api::ai::AiClient".to_string()].into();
+        let by_leaf = type_leaf_index(&types);
         assert_eq!(
-            resolve_java_ctor_call("com::hireflow360::api::ai::AiClient::AiClient", &types),
+            resolve_java_ctor_call(
+                "com::hireflow360::api::ai::AiClient::AiClient",
+                &types,
+                &by_leaf
+            ),
             Some("com::hireflow360::api::ai::AiClient".to_string())
         );
     }
@@ -5811,15 +5873,71 @@ diff --git a/src/b.rs b/src/b.rs
         // Class not internal (a JDK/3rd-party type, e.g. `new ArrayList()`) → keep
         // the extern, invent nothing.
         let empty: HashSet<String> = HashSet::new();
+        let empty_leaf = type_leaf_index(&empty);
         assert_eq!(
-            resolve_java_ctor_call("java::util::ArrayList::ArrayList", &empty),
+            resolve_java_ctor_call("java::util::ArrayList::ArrayList", &empty, &empty_leaf),
             None
         );
         // Not the `::Type::Type` constructor shape (a normal method call) → ignored
         // even when the type is internal.
         let types: HashSet<String> = ["com::hireflow360::api::ai::AiClient".to_string()].into();
+        let by_leaf = type_leaf_index(&types);
         assert_eq!(
-            resolve_java_ctor_call("com::hireflow360::api::ai::AiClient::send", &types),
+            resolve_java_ctor_call(
+                "com::hireflow360::api::ai::AiClient::send",
+                &types,
+                &by_leaf
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn java_ctor_redirects_nested_class_to_real_outer() {
+        // `new Ai()` where Ai is nested in ApiProperties: recorded as the caller's
+        // own package path `…config::Ai::Ai`, but the real class lives at
+        // `…config::ApiProperties::Ai`. Suffix-match the leaf onto the nested type
+        // whose outer prefix (ApiProperties) is itself internal.
+        let types: HashSet<String> = [
+            "com::hireflow360::api::config::ApiProperties".to_string(),
+            "com::hireflow360::api::config::ApiProperties::Ai".to_string(),
+        ]
+        .into();
+        let by_leaf = type_leaf_index(&types);
+        assert_eq!(
+            resolve_java_ctor_call("com::hireflow360::api::config::Ai::Ai", &types, &by_leaf),
+            Some("com::hireflow360::api::config::ApiProperties::Ai".to_string())
+        );
+    }
+
+    #[test]
+    fn java_nested_ctor_ambiguous_stays_extern() {
+        // Two distinct nested classes both named `Ai`, each under an internal outer
+        // class → ambiguous, must NOT pick one. Leave it extern.
+        let types: HashSet<String> = [
+            "com::hireflow360::api::config::ApiProperties".to_string(),
+            "com::hireflow360::api::config::ApiProperties::Ai".to_string(),
+            "com::hireflow360::api::other::OtherProps".to_string(),
+            "com::hireflow360::api::other::OtherProps::Ai".to_string(),
+        ]
+        .into();
+        let by_leaf = type_leaf_index(&types);
+        assert_eq!(
+            resolve_java_ctor_call("com::hireflow360::api::config::Ai::Ai", &types, &by_leaf),
+            None
+        );
+    }
+
+    #[test]
+    fn java_nested_ctor_requires_internal_outer() {
+        // A nested-named type whose outer prefix is NOT an internal type is not a
+        // confirmed nested class (could be a top-level type that merely shares the
+        // leaf via a coincidental path) → no redirect.
+        let types: HashSet<String> =
+            ["com::hireflow360::api::config::Widgets::Ai".to_string()].into();
+        let by_leaf = type_leaf_index(&types);
+        assert_eq!(
+            resolve_java_ctor_call("com::hireflow360::api::config::Ai::Ai", &types, &by_leaf),
             None
         );
     }
