@@ -168,6 +168,14 @@ struct FileParse {
     /// halves are stored absolute; the corpus-wide map (built in pass 1) drives a
     /// redirect-only pass at resolve time. Rust only.
     reexports: Vec<(String, String)>,
+    /// Glob `pub use` re-exports: (facade_base_module, real_target_module). A
+    /// `pub use leader_state::*;` in `ff_db`'s lib.rs re-exports EVERY item of
+    /// `ff_db::leader_state` at the crate root, so `ff_db::pg_get_current_leader`
+    /// is an alias for `ff_db::leader_state::pg_get_current_leader`. Unlike a named
+    /// `pub use`, the leaf set isn't known at parse time, so it can't go in
+    /// `reexports`; the resolve-time pass checks `<target>::<leaf>` against the
+    /// internal fn set. Rust only.
+    glob_reexports: Vec<(String, String)>,
 }
 
 // ─── Public entrypoint ───────────────────────────────────────────────────────
@@ -840,11 +848,21 @@ async fn extract_files(
     // Crate roots come from every known internal fn, so they're complete even on
     // an incremental run (internal_fns is seeded whole-corpus there).
     let mut reexports: HashMap<String, String> = HashMap::new();
+    // Glob `pub use` facades: facade_base_module -> [target_module, …]. A call
+    // through `<base>::<leaf>` redirects to `<target>::<leaf>` when that names a
+    // real internal fn (the leaf set isn't known at parse time for a glob).
+    let mut glob_reexports: HashMap<String, Vec<String>> = HashMap::new();
     for p in &pending {
         for (facade, target) in &p.parse.reexports {
             reexports
                 .entry(facade.clone())
                 .or_insert_with(|| target.clone());
+        }
+        for (base, target) in &p.parse.glob_reexports {
+            glob_reexports
+                .entry(base.clone())
+                .or_default()
+                .push(target.clone());
         }
     }
     let crate_roots: HashSet<String> = internal_fns
@@ -908,10 +926,12 @@ async fn extract_files(
                 }
             }
 
-            // Facade redirect (levers #3/#4): a call through a `pub use` re-export
-            // path (`ff_db::run_migrations` for `ff_db::migrations::run_migrations`)
-            // — or one the resolver caller-prefixed onto a crate-rooted path
-            // (`ff_gateway::brain_api::ff_db::pg_get_brain_user`) — lands on a
+            // Facade redirect (levers #3/#4/#6): a call through a `pub use`
+            // re-export path — named (`ff_db::run_migrations` for
+            // `ff_db::migrations::run_migrations`) or glob (`ff_db::pg_get_current_leader`
+            // re-exported by `pub use leader_state::*;`) — or one the resolver
+            // caller-prefixed onto a crate-rooted path
+            // (`ff_gateway::brain_api::ff_db::pg_get_brain_user`) lands on a
             // `code:extern`. Re-anchor at the crate root and chase the re-export
             // map to the real symbol. Redirect-only: fires only when the final
             // target is a known internal fn.
@@ -919,6 +939,7 @@ async fn extract_files(
                 if let Some(t) = resolve_facade_call(
                     &resolved,
                     &reexports,
+                    &glob_reexports,
                     &crate_roots,
                     internal_fns,
                     internal_types,
@@ -2498,6 +2519,7 @@ fn parse_rust_file(file_path: &str, source: &str) -> Option<FileParse> {
         alias_map: HashMap::new(),
         glob_imports: Vec::new(),
         reexports: Vec::new(),
+        glob_reexports: Vec::new(),
     };
 
     // Walk the tree, tracking the current module path (mod blocks) and the
@@ -2858,6 +2880,15 @@ fn expand_use(
                 let t = t.trim_end_matches("::*").to_string();
                 let full = norm_crate(&prefixed(pfx, &t), crate_name);
                 fp.use_targets.push(full.clone());
+                // A `pub use m::*;` re-exports every item of `m` at the module
+                // where the `use` appears (the facade base) — record it so a call
+                // through the facade path (`ff_db::pg_get_current_leader` for
+                // `ff_db::leader_state::pg_get_current_leader`) can be redirected at
+                // resolve time. Private globs (`reexport_base` None) only bring
+                // names into local scope — already handled by `glob_imports`.
+                if let Some(base) = reexport_base {
+                    fp.glob_reexports.push((base.to_string(), full.clone()));
+                }
                 fp.glob_imports.push(full);
             }
         }
@@ -2967,6 +2998,7 @@ fn parse_typescript_file(file_path: &str, source: &str) -> Option<FileParse> {
         alias_map: HashMap::new(),
         glob_imports: Vec::new(),
         reexports: Vec::new(),
+        glob_reexports: Vec::new(),
     };
     walk_ts(&root, bytes, &module, file_path, None, &mut fp);
     // Calls are collected in ONE global pass — attribution is byte-span based
@@ -3435,6 +3467,7 @@ fn parse_java_file(_file_path: &str, source: &str) -> Option<FileParse> {
         alias_map: HashMap::new(),
         glob_imports: Vec::new(),
         reexports: Vec::new(),
+        glob_reexports: Vec::new(),
     };
     walk_java(&root, bytes, &module, None, &mut fp);
     // One global call pass (byte-span attribution via innermost_fn).
@@ -3618,6 +3651,7 @@ fn parse_python_file(file_path: &str, source: &str) -> Option<FileParse> {
         alias_map: HashMap::new(),
         glob_imports: Vec::new(),
         reexports: Vec::new(),
+        glob_reexports: Vec::new(),
     };
     walk_python(&root, bytes, &module, None, &mut fp);
     // One global call pass (byte-span attribution via innermost_fn).
@@ -4118,6 +4152,7 @@ fn resolve_self_method_call(resolved: &str, internal_fns: &HashSet<String>) -> O
 fn resolve_facade_call(
     resolved: &str,
     reexports: &HashMap<String, String>,
+    glob_reexports: &HashMap<String, Vec<String>>,
     crate_roots: &HashSet<String>,
     internal_fns: &HashSet<String>,
     internal_types: &HashSet<String>,
@@ -4136,6 +4171,19 @@ fn resolve_facade_call(
         // (b) function facade: chase `facade -> … -> real fn`.
         if let Some(t) = chase_reexport(cand, reexports, internal_fns) {
             return Some(t);
+        }
+        // (b') glob facade (#6): `<base>::<leaf>` re-exported by `pub use m::*;`.
+        // The named-reexport map can't carry a glob (the leaf set is unknown at
+        // parse time), so probe each glob target module of `<base>` for the leaf.
+        if let Some((base, leaf)) = cand.rsplit_once("::") {
+            if let Some(targets) = glob_reexports.get(base) {
+                for target in targets {
+                    let real = join(target, leaf);
+                    if internal_fns.contains(&real) {
+                        return Some(real);
+                    }
+                }
+            }
         }
         // (c) type-facade method receiver: rewrite the type segment through the
         //     re-export map, then flatten via the inherent-impl convention.
@@ -4857,6 +4905,7 @@ diff --git a/src/b.rs b/src/b.rs
             alias_map,
             glob_imports: vec![],
             reexports: vec![],
+            glob_reexports: vec![],
         }
     }
 
@@ -5289,8 +5338,55 @@ diff --git a/src/b.rs b/src/b.rs
         let fns: HashSet<String> = ["ff_db::migrations::run_migrations".to_string()].into();
         let types: HashSet<String> = HashSet::new();
         assert_eq!(
-            resolve_facade_call("ff_db::run_migrations", &reexports, &roots, &fns, &types),
+            resolve_facade_call(
+                "ff_db::run_migrations",
+                &reexports,
+                &HashMap::new(),
+                &roots,
+                &fns,
+                &types
+            ),
             Some("ff_db::migrations::run_migrations".to_string())
+        );
+    }
+
+    #[test]
+    fn facade_redirect_resolves_glob_reexport() {
+        // ff_db re-exports via a GLOB `pub use leader_state::*;`, so
+        // `ff_db::pg_get_current_leader` aliases `ff_db::leader_state::pg_get_current_leader`.
+        // The leaf set is unknown at parse time, so this can't go in the named
+        // reexport map — the glob map probes the target module for the leaf.
+        // Doctor hit: `ff_terminal::fleet_cmd::ff_db::pg_get_current_leader` (#6).
+        let reexports: HashMap<String, String> = HashMap::new();
+        let globs: HashMap<String, Vec<String>> =
+            [("ff_db".to_string(), vec!["ff_db::leader_state".to_string()])].into();
+        let roots: HashSet<String> = ["ff_db".to_string(), "ff_terminal".to_string()].into();
+        let fns: HashSet<String> =
+            ["ff_db::leader_state::pg_get_current_leader".to_string()].into();
+        let types: HashSet<String> = HashSet::new();
+        // Caller-prefixed onto the crate-rooted glob-facade path: #4 anchor + #6 glob.
+        assert_eq!(
+            resolve_facade_call(
+                "ff_terminal::fleet_cmd::ff_db::pg_get_current_leader",
+                &reexports,
+                &globs,
+                &roots,
+                &fns,
+                &types
+            ),
+            Some("ff_db::leader_state::pg_get_current_leader".to_string())
+        );
+        // A glob facade for a leaf that ISN'T in the target module stays extern.
+        assert_eq!(
+            resolve_facade_call(
+                "ff_db::not_a_real_fn",
+                &reexports,
+                &globs,
+                &roots,
+                &fns,
+                &types
+            ),
+            None
         );
     }
 
@@ -5310,6 +5406,7 @@ diff --git a/src/b.rs b/src/b.rs
             resolve_facade_call(
                 "ff_gateway::brain_api::ff_db::pg_get_brain_user",
                 &reexports,
+                &HashMap::new(),
                 &roots,
                 &fns,
                 &types
@@ -5330,6 +5427,7 @@ diff --git a/src/b.rs b/src/b.rs
             resolve_facade_call(
                 "ff_gateway::server::ff_db::queries::pg_list_nodes",
                 &reexports,
+                &HashMap::new(),
                 &roots,
                 &fns,
                 &types
@@ -5352,7 +5450,14 @@ diff --git a/src/b.rs b/src/b.rs
         let fns: HashSet<String> = ["ff_db::connection::open".to_string()].into();
         let types: HashSet<String> = ["ff_db::connection::DbPool".to_string()].into();
         assert_eq!(
-            resolve_facade_call("ff_db::DbPool::open", &reexports, &roots, &fns, &types),
+            resolve_facade_call(
+                "ff_db::DbPool::open",
+                &reexports,
+                &HashMap::new(),
+                &roots,
+                &fns,
+                &types
+            ),
             Some("ff_db::connection::open".to_string())
         );
     }
@@ -5365,7 +5470,14 @@ diff --git a/src/b.rs b/src/b.rs
         let fns: HashSet<String> = HashSet::new();
         let types: HashSet<String> = HashSet::new();
         assert_eq!(
-            resolve_facade_call("toml::from_str", &reexports, &roots, &fns, &types),
+            resolve_facade_call(
+                "toml::from_str",
+                &reexports,
+                &HashMap::new(),
+                &roots,
+                &fns,
+                &types
+            ),
             None
         );
     }
@@ -5548,6 +5660,35 @@ diff --git a/src/b.rs b/src/b.rs
                 .any(|(_, t)| t.ends_with("::other::helper")),
             "private use must not re-export: {:?}",
             fp.reexports
+        );
+    }
+
+    #[test]
+    fn parse_records_pub_use_glob_reexport() {
+        // A glob `pub use m::*;` re-exports every item of `m` at the crate root,
+        // recorded as a (facade_base, target_module) glob re-export; a private
+        // glob `use m::*;` only brings names into local scope, not re-exported.
+        let src = "pub use crate::leader_state::*;\n\
+                   use crate::internal::*;\n\
+                   pub fn a() {}\n";
+        // No Cargo.toml on disk, so the crate root falls back to `crate` (same as
+        // the named-reexport test); real indexing resolves it to `ff_db`. Assert on
+        // shape: base is the target's crate-root segment, target is the submodule.
+        let fp = parse_rust_file("/x/crates/ff_db/src/lib.rs", src).unwrap();
+        assert!(
+            fp.glob_reexports
+                .iter()
+                .any(|(base, target)| target.ends_with("::leader_state")
+                    && Some(base.as_str()) == target.split("::").next()),
+            "pub use glob not recorded: {:?}",
+            fp.glob_reexports
+        );
+        assert!(
+            !fp.glob_reexports
+                .iter()
+                .any(|(_, t)| t.ends_with("::internal")),
+            "private use glob must not re-export: {:?}",
+            fp.glob_reexports
         );
     }
 
