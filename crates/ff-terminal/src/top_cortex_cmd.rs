@@ -49,15 +49,15 @@ pub enum TopCortexCommand {
         /// Override which corpus slug to look up.
         #[arg(long)]
         slug: Option<String>,
-        #[arg(long, default_value = "table")]
-        format: String,
+        #[arg(long, value_enum, default_value = "table")]
+        format: crate::CortexFormat,
     },
     /// List every indexed corpus (slug, sources, content, code-symbols) — the
     /// CLI form of the `cortex_corpora` MCP tool. Equivalent to `status --all`,
     /// so an agent that knows the MCP surface finds the same verb on the CLI.
     Corpora {
-        #[arg(long, default_value = "table")]
-        format: String,
+        #[arg(long, value_enum, default_value = "table")]
+        format: crate::CortexFormat,
     },
     /// Callers of a code symbol (corpus defaults to the cwd's slug).
     Callers {
@@ -68,8 +68,8 @@ pub enum TopCortexCommand {
         /// 1.0 = EXTRACTED only (high-trust), 0.6 = +INFERRED, 0.0 = all (default).
         #[arg(long, default_value_t = 0.0)]
         min_confidence: f32,
-        #[arg(long, default_value = "table")]
-        format: String,
+        #[arg(long, value_enum, default_value = "table")]
+        format: crate::CortexFormat,
     },
     /// Callees of a code symbol (corpus defaults to the cwd's slug).
     Callees {
@@ -80,8 +80,8 @@ pub enum TopCortexCommand {
         /// 1.0 = EXTRACTED only (high-trust), 0.6 = +INFERRED, 0.0 = all (default).
         #[arg(long, default_value_t = 0.0)]
         min_confidence: f32,
-        #[arg(long, default_value = "table")]
-        format: String,
+        #[arg(long, value_enum, default_value = "table")]
+        format: crate::CortexFormat,
     },
     /// Find code symbols by name (case-insensitive substring), ranked by fan-in
     /// — the discovery entrypoint: locate a symbol, then drill in with
@@ -105,8 +105,8 @@ pub enum TopCortexCommand {
         /// languages: struct/enum/trait/class/interface). Default: all code:*.
         #[arg(long)]
         kind: Option<String>,
-        #[arg(long, default_value = "table")]
-        format: String,
+        #[arg(long, value_enum, default_value = "table")]
+        format: crate::CortexFormat,
     },
     /// Show a code symbol's source — resolve a name to its file + line span and
     /// print just that symbol's definition. Token-efficient: collapses
@@ -129,8 +129,8 @@ pub enum TopCortexCommand {
         /// `grep -C`); context lines are marked with a dotted gutter. Default 0.
         #[arg(long, short = 'C', default_value_t = 0)]
         context: usize,
-        #[arg(long, default_value = "table")]
-        format: String,
+        #[arg(long, value_enum, default_value = "table")]
+        format: crate::CortexFormat,
     },
     /// Outline a file: every code symbol it defines (kind, line span, fan-in) in
     /// source order — a file-level table of contents to orient in an unknown file
@@ -148,8 +148,8 @@ pub enum TopCortexCommand {
         /// enum, trait, impl, mod, class, interface, or `type`.
         #[arg(long)]
         kind: Option<String>,
-        #[arg(long, default_value = "table")]
-        format: String,
+        #[arg(long, value_enum, default_value = "table")]
+        format: crate::CortexFormat,
     },
     /// Transitive caller closure / blast radius (corpus defaults to the cwd's slug).
     Impact {
@@ -162,8 +162,8 @@ pub enum TopCortexCommand {
         /// 1.0 = EXTRACTED only (high-trust), 0.6 = +INFERRED, 0.0 = all (default).
         #[arg(long, default_value_t = 0.0)]
         min_confidence: f32,
-        #[arg(long, default_value = "table")]
-        format: String,
+        #[arg(long, value_enum, default_value = "table")]
+        format: crate::CortexFormat,
     },
     /// Tests covering a code symbol: the transitive caller closure filtered to
     /// the callers that are tests (test-file path or test-named), ranked
@@ -179,8 +179,8 @@ pub enum TopCortexCommand {
         /// 1.0 = EXTRACTED only (provably-reaching tests), 0.6 = +INFERRED, 0.0 = all (default).
         #[arg(long, default_value_t = 0.0)]
         min_confidence: f32,
-        #[arg(long, default_value = "table")]
-        format: String,
+        #[arg(long, value_enum, default_value = "table")]
+        format: crate::CortexFormat,
     },
     /// Recall/health diagnostic for the code graph: what fraction of `calls`
     /// edges resolve to a real internal symbol vs an unresolved extern, plus a
@@ -194,8 +194,8 @@ pub enum TopCortexCommand {
         /// How many suspicious externs to list (ranked by fan-in).
         #[arg(long, default_value_t = 20)]
         limit: i64,
-        #[arg(long, default_value = "table")]
-        format: String,
+        #[arg(long, value_enum, default_value = "table")]
+        format: crate::CortexFormat,
     },
     /// Change-aware, risk-scored review map of the current diff: which changed
     /// symbols have the widest blast radius (fan-in / transitive callers), so a
@@ -215,8 +215,8 @@ pub enum TopCortexCommand {
         /// Transitive blast-radius depth.
         #[arg(long, default_value_t = 3)]
         depth: usize,
-        #[arg(long, default_value = "table")]
-        format: String,
+        #[arg(long, value_enum, default_value = "table")]
+        format: crate::CortexFormat,
     },
     /// Semantic-embed the Cortex graph: fill the `embedding` column on every
     /// code/doc/data/image node via the fleet's bge-m3 endpoint so semantic
@@ -258,8 +258,8 @@ pub enum TopCortexCommand {
         /// Model id to send with --llm (ignored when DB-routed).
         #[arg(long)]
         model: Option<String>,
-        #[arg(long, default_value = "table")]
-        format: String,
+        #[arg(long, value_enum, default_value = "table")]
+        format: crate::CortexFormat,
     },
     /// Explain the subsystem a symbol belongs to: resolve a symbol (or any name)
     /// to its code-graph community and print that community's natural-language
@@ -280,8 +280,8 @@ pub enum TopCortexCommand {
         /// How many of the community's top members (by fan-in) to list.
         #[arg(long, default_value_t = 15)]
         members: i64,
-        #[arg(long, default_value = "table")]
-        format: String,
+        #[arg(long, value_enum, default_value = "table")]
+        format: crate::CortexFormat,
     },
     /// Manage the git post-commit hook that re-indexes after every commit.
     Hook {
@@ -495,7 +495,7 @@ pub async fn handle_top_cortex(args: TopCortexArgs) -> Result<()> {
             model,
             format,
         } => {
-            run_summarize(&pool, all, max, min_members, llm, model, &format).await?;
+            run_summarize(&pool, all, max, min_members, llm, model, format.as_str()).await?;
         }
         TopCortexCommand::Hook { action } => {
             handle_hook(action)?;
@@ -515,12 +515,12 @@ pub async fn handle_top_cortex(args: TopCortexArgs) -> Result<()> {
             } else {
                 Some(slug.unwrap_or_else(cwd_slug))
             };
-            print_corpora(&pool, target, &format).await?;
+            print_corpora(&pool, target, format.as_str()).await?;
         }
         TopCortexCommand::Corpora { format } => {
             // The CLI mirror of the `cortex_corpora` MCP tool: always lists every
             // corpus (the `status --all` view), independent of the cwd.
-            print_corpora(&pool, None, &format).await?;
+            print_corpora(&pool, None, format.as_str()).await?;
         }
         TopCortexCommand::Callers {
             symbol,
@@ -573,7 +573,7 @@ pub async fn handle_top_cortex(args: TopCortexArgs) -> Result<()> {
             } else {
                 cortex::find_symbols(&pool, &corpus, &query, limit, kind.as_deref()).await?
             };
-            print_hits(&hits, &format, &query, &corpus);
+            print_hits(&hits, format.as_str(), &query, &corpus);
             if hits.is_empty() {
                 // No symbol matched the query — exit non-zero so a script/agent
                 // can test "does anything match?" by exit code (grep-style, and
@@ -593,7 +593,7 @@ pub async fn handle_top_cortex(args: TopCortexArgs) -> Result<()> {
             let found =
                 cortex::show_symbol(&pool, &corpus, &symbol, kind.as_deref(), max_lines, context)
                     .await?;
-            print_symbol_source(found.as_ref(), &format, &symbol, &corpus);
+            print_symbol_source(found.as_ref(), format.as_str(), &symbol, &corpus);
             if found.is_none() {
                 std::process::exit(1);
             }
@@ -606,7 +606,7 @@ pub async fn handle_top_cortex(args: TopCortexArgs) -> Result<()> {
         } => {
             let corpus = corpus.unwrap_or_else(cwd_slug);
             let found = cortex::outline_file(&pool, &corpus, &file, kind.as_deref()).await?;
-            print_outline(found.as_ref(), &format, &file, &corpus);
+            print_outline(found.as_ref(), format.as_str(), &file, &corpus);
             if found.is_none() {
                 std::process::exit(1);
             }
@@ -659,7 +659,7 @@ pub async fn handle_top_cortex(args: TopCortexArgs) -> Result<()> {
             format,
         } => {
             let (root, slug) = resolve_root_slug(path, corpus)?;
-            run_review(&pool, &root, &slug, base.as_deref(), depth, &format).await?;
+            run_review(&pool, &root, &slug, base.as_deref(), depth, format.as_str()).await?;
         }
         TopCortexCommand::Doctor {
             corpus,
@@ -667,7 +667,7 @@ pub async fn handle_top_cortex(args: TopCortexArgs) -> Result<()> {
             format,
         } => {
             let corpus = corpus.unwrap_or_else(cwd_slug);
-            run_doctor(&pool, &corpus, limit, &format).await?;
+            run_doctor(&pool, &corpus, limit, format.as_str()).await?;
         }
         TopCortexCommand::Explain {
             symbol,
@@ -680,7 +680,7 @@ pub async fn handle_top_cortex(args: TopCortexArgs) -> Result<()> {
             let found =
                 cortex::explain_community(&pool, &corpus, &symbol, kind.as_deref(), members)
                     .await?;
-            print_explanation(found.as_ref(), &format, &symbol, &corpus);
+            print_explanation(found.as_ref(), format.as_str(), &symbol, &corpus);
             if found.is_none() {
                 // No symbol matched at all — exit non-zero like show/find/outline.
                 std::process::exit(1);
