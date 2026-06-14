@@ -953,6 +953,21 @@ async fn extract_files(
         .filter_map(|f| f.split("::").next())
         .map(|s| s.to_string())
         .collect();
+    // Per-crate leaf index for the crate-root single-candidate redirect (lever
+    // #7): `(crate, leaf)` -> every internal fn in that crate with that leaf, so
+    // a missed sibling-module call `<crate>::<leaf>` can redirect when exactly one
+    // candidate exists. Built whole-corpus (internal_fns is seeded whole-corpus on
+    // incremental too), matching the other redirect maps.
+    let mut crate_leaf_fns: HashMap<(String, String), Vec<String>> = HashMap::new();
+    for f in internal_fns.iter() {
+        let (Some(krate), Some(leaf)) = (f.split("::").next(), f.rsplit("::").next()) else {
+            continue;
+        };
+        crate_leaf_fns
+            .entry((krate.to_string(), leaf.to_string()))
+            .or_default()
+            .push(f.clone());
+    }
 
     // Second pass: resolve calls and write calls edges.
     for p in &pending {
@@ -1032,6 +1047,16 @@ async fn extract_files(
                     internal_fns,
                     internal_types,
                 ) {
+                    resolved = t;
+                }
+            }
+
+            // Crate-root single-candidate redirect (lever #7): a missed
+            // sibling-module call `<crate>::<leaf>` (alias map missed the `use`)
+            // where exactly one internal fn in the crate has that leaf. Runs last
+            // — after facade, since a modeled re-export is the more specific match.
+            if p.parse.lang == Lang::Rust && !internal_fns.contains(&resolved) {
+                if let Some(t) = resolve_crate_root_call(&resolved, &crate_roots, &crate_leaf_fns) {
                     resolved = t;
                 }
             }
@@ -4482,6 +4507,43 @@ fn resolve_self_method_call(resolved: &str, internal_fns: &HashSet<String>) -> O
     internal_fns.contains(&target).then_some(target)
 }
 
+/// Crate-root single-candidate redirect (lever #7). A bare call to a fn in a
+/// sibling submodule that the alias map missed (`use crate::communities::*;`, an
+/// inline `mod`, a re-export not modeled as `pub use`) falls through
+/// `resolve_call_inner`'s bare-call path to `<caller_module>::<leaf>`; when the
+/// caller is a free fn in the crate root, that is just `<crate>::<leaf>` (no
+/// module segment). The real fn lives at `<crate>::<mod>::<leaf>`. If EXACTLY ONE
+/// internal fn in that crate has the leaf, redirect to it.
+///
+/// Restricted to the 2-segment `<crate>::<leaf>` shape: a path that already
+/// carries a module segment (`<crate>::<mod>::<leaf>`) is left alone, because a
+/// genuine external-crate path (`libc::kill`, `serde_yaml::from_str`) has that
+/// same 3+-segment shape and its leaf often collides with an unrelated internal
+/// fn — only the no-module crate-rooted shape is reliably a missed sibling call.
+/// Same-crate + single-candidate keeps it conservative; an ambiguous leaf (more
+/// than one internal fn) stays extern. Redirect-only: fires only when the single
+/// candidate is a known internal fn, so it never fabricates an edge.
+fn resolve_crate_root_call(
+    resolved: &str,
+    crate_roots: &HashSet<String>,
+    crate_leaf_fns: &HashMap<(String, String), Vec<String>>,
+) -> Option<String> {
+    let (krate, leaf) = resolved.split_once("::")?;
+    if leaf.contains("::") {
+        return None; // already module-qualified — not the missed-sibling shape.
+    }
+    if !crate_roots.contains(krate) {
+        return None; // head isn't one of our crates — a genuine extern.
+    }
+    match crate_leaf_fns
+        .get(&(krate.to_string(), leaf.to_string()))?
+        .as_slice()
+    {
+        [only] => Some(only.clone()),
+        _ => None, // zero or ambiguous → leave as extern.
+    }
+}
+
 /// Facade redirect (levers #3 + #4). Two failure modes leave a real internal
 /// call resolved to a `code:extern`:
 ///
@@ -4662,6 +4724,14 @@ fn looks_external(head: &str) -> bool {
             | "tempfile"
             | "walkdir"
             | "url"
+            // More 3rd-party crates `ff cortex doctor` surfaced as caller-prefixed
+            // phantoms whose leaf then collides with an internal fn: `libc::kill`
+            // (vs internal `kill`), `serde_yaml::from_str` (vs `from_str`),
+            // `tracing_subscriber::registry` (vs `registry`). Keep the crate head
+            // already-qualified so the call becomes a single shared extern.
+            | "libc"
+            | "serde_yaml"
+            | "tracing_subscriber"
     )
 }
 
@@ -5397,6 +5467,76 @@ diff --git a/src/b.rs b/src/b.rs
         assert_eq!(
             resolve_call("FromStr::from_str", caller, &fp),
             "FromStr::from_str"
+        );
+    }
+
+    #[test]
+    fn external_crate_heads_are_not_caller_module_rooted() {
+        // `libc::kill`, `serde_yaml::from_str`, `tracing_subscriber::registry`:
+        // 2-segment external-crate paths whose head isn't aliased. Without the
+        // looks_external entry the resolver glued the caller module on
+        // (`ff_agent::task_runner::libc::kill`), fragmenting the extern and
+        // colliding its leaf with internal fns (the ff cortex doctor noise).
+        let fp = fp_with("ff_agent::task_runner", "ff_agent", &[]);
+        let caller = "ff_agent::task_runner::run_wave";
+        assert_eq!(resolve_call("libc::kill", caller, &fp), "libc::kill");
+        assert_eq!(
+            resolve_call("serde_yaml::from_str", caller, &fp),
+            "serde_yaml::from_str"
+        );
+        assert_eq!(
+            resolve_call("tracing_subscriber::registry", caller, &fp),
+            "tracing_subscriber::registry"
+        );
+    }
+
+    #[test]
+    fn crate_root_single_candidate_redirects_to_sibling_module() {
+        // `community_member_hash()` called bare from a fn in ff_brain's crate root
+        // (the `use` was missed) lands on `ff_brain::community_member_hash`; the
+        // real fn is `ff_brain::communities::community_member_hash`. Exactly one
+        // internal fn in the crate has that leaf, so redirect (ff cortex doctor
+        // top 2-segment suspicious externs).
+        let roots: HashSet<String> = ["ff_brain".to_string(), "ff_agent".to_string()].into();
+        let mut leaf_fns: HashMap<(String, String), Vec<String>> = HashMap::new();
+        leaf_fns.insert(
+            ("ff_brain".to_string(), "community_member_hash".to_string()),
+            vec!["ff_brain::communities::community_member_hash".to_string()],
+        );
+        assert_eq!(
+            resolve_crate_root_call("ff_brain::community_member_hash", &roots, &leaf_fns),
+            Some("ff_brain::communities::community_member_hash".to_string())
+        );
+
+        // Already module-qualified (external-crate shape) → left alone, so a real
+        // `libc::kill` extern is never misredirected onto an internal `kill`.
+        leaf_fns.insert(
+            ("ff_agent".to_string(), "kill".to_string()),
+            vec!["ff_agent::reaper::kill".to_string()],
+        );
+        assert_eq!(
+            resolve_crate_root_call("ff_agent::task_runner::libc::kill", &roots, &leaf_fns),
+            None
+        );
+
+        // Ambiguous (>1 internal fn in the crate with that leaf) → stays extern.
+        let mut amb: HashMap<(String, String), Vec<String>> = HashMap::new();
+        amb.insert(
+            ("ff_agent".to_string(), "install".to_string()),
+            vec![
+                "ff_agent::template_registry::install".to_string(),
+                "ff_agent::other::install".to_string(),
+            ],
+        );
+        assert_eq!(
+            resolve_crate_root_call("ff_agent::install", &roots, &amb),
+            None
+        );
+
+        // Head isn't one of our crate roots → a genuine extern, untouched.
+        assert_eq!(
+            resolve_crate_root_call("libc::kill", &roots, &leaf_fns),
+            None
         );
     }
 
