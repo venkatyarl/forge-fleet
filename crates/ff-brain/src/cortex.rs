@@ -3792,6 +3792,7 @@ fn resolve_call_inner(
                     || segs.len() >= 3
                     || looks_external(head)
                     || is_std_prelude_type(head)
+                    || is_std_prelude_trait(head)
                 {
                     norm_crate(raw, crate_name)
                 } else {
@@ -4031,6 +4032,36 @@ fn is_std_prelude_type(head: &str) -> bool {
             | "Duration"
             | "Instant"
             | "SystemTime"
+    )
+}
+
+/// Bare std-prelude TRAITS used as an associated-call receiver: `Default::default`,
+/// `From::from`, `Into::into`, `FromStr::from_str`, etc. Same failure mode as
+/// [`is_std_prelude_type`] — the uppercase head isn't aliased, so the fallback
+/// fabricates a `<caller_module>::Default::default` phantom whose `default`/`from`
+/// leaf then collides with every internal `default`/`from` fn (`ff cortex doctor`
+/// surfaced `…::tests::Default::default` etc. as residual internally-rooted noise).
+/// These are std prelude traits, effectively never shadowed by a local type, so
+/// keep the call as a shared extern instead of a per-module phantom. Conservative:
+/// a project that genuinely defined its own `From` merely leaves the call an extern
+/// rather than mis-attributing it — never worse.
+fn is_std_prelude_trait(head: &str) -> bool {
+    matches!(
+        head,
+        "Default"
+            | "From"
+            | "Into"
+            | "TryFrom"
+            | "TryInto"
+            | "FromStr"
+            | "FromIterator"
+            | "ToString"
+            | "ToOwned"
+            | "Clone"
+            | "AsRef"
+            | "AsMut"
+            | "Iterator"
+            | "IntoIterator"
     )
 }
 
@@ -4655,6 +4686,26 @@ diff --git a/src/b.rs b/src/b.rs
         assert_eq!(
             resolve_call("MyLocalType::new", caller, &fp),
             "ff_brain::cortex::MyLocalType::new"
+        );
+    }
+
+    #[test]
+    fn std_prelude_traits_are_not_caller_module_rooted() {
+        // `Default::default()` / `From::from()` written bare in associated-call
+        // position: same fabrication as the std types — the uppercase trait head
+        // was getting the caller module glued on (`<mod>::Default::default`), whose
+        // leaf collides with every internal `default`/`from`. Keep them as shared
+        // std externs. Regression for the `ff cortex doctor` residual noise.
+        let fp = fp_with("ff_core::chaos", "ff_core", &[]);
+        let caller = "ff_core::chaos::tests::injects_fault";
+        assert_eq!(
+            resolve_call("Default::default", caller, &fp),
+            "Default::default"
+        );
+        assert_eq!(resolve_call("From::from", caller, &fp), "From::from");
+        assert_eq!(
+            resolve_call("FromStr::from_str", caller, &fp),
+            "FromStr::from_str"
         );
     }
 
