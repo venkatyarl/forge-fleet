@@ -2056,8 +2056,8 @@ pub enum BrainCommand {
         /// 1.0 = EXTRACTED only (high-trust), 0.6 = +INFERRED, 0.0 = all (default).
         #[arg(long, default_value_t = 0.0)]
         min_confidence: f32,
-        #[arg(long, default_value = "table")]
-        format: String,
+        #[arg(long, value_enum, default_value = "table")]
+        format: crate::CortexFormat,
     },
     /// Callees of a code symbol (traverses Cortex `calls` edges).
     Callees {
@@ -2068,8 +2068,8 @@ pub enum BrainCommand {
         /// 1.0 = EXTRACTED only (high-trust), 0.6 = +INFERRED, 0.0 = all (default).
         #[arg(long, default_value_t = 0.0)]
         min_confidence: f32,
-        #[arg(long, default_value = "table")]
-        format: String,
+        #[arg(long, value_enum, default_value = "table")]
+        format: crate::CortexFormat,
     },
     /// Transitive caller closure (blast radius) of a code symbol.
     Impact {
@@ -2082,8 +2082,8 @@ pub enum BrainCommand {
         /// 1.0 = EXTRACTED only (high-trust), 0.6 = +INFERRED, 0.0 = all (default).
         #[arg(long, default_value_t = 0.0)]
         min_confidence: f32,
-        #[arg(long, default_value = "table")]
-        format: String,
+        #[arg(long, value_enum, default_value = "table")]
+        format: crate::CortexFormat,
     },
     /// Faceted SET-INTERSECTION query over a corpus.
     Query {
@@ -2106,6 +2106,37 @@ pub enum BrainCommand {
     },
 }
 
+/// Output format for the cortex query verbs (callers/callees/impact/tests/find/
+/// outline/doctor/status/...). A strict enum rather than a free `String`, so a
+/// typo'd `--format` (`--format jsn`, `--format csv`) errors at parse time with
+/// the valid values listed, instead of silently falling back to the table view —
+/// which an agent or script that passed `--format json` and then parses the
+/// output as JSON would mis-read. Same class of "don't silently misinterpret bad
+/// input" hardening as the bare-token-dispatch guard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum CortexFormat {
+    /// Human-readable table (default).
+    Table,
+    /// Machine-readable JSON (array or object, depending on the verb).
+    Json,
+    /// Bare qualified names, one per line. Only the symbol-list verbs
+    /// (callers/callees/impact/tests/find) render this distinctly; the others
+    /// treat it as the table view.
+    Names,
+}
+
+impl CortexFormat {
+    /// The wire string the downstream `print_*` renderers match on. Keeps those
+    /// renderers `&str`-based (unchanged) while the CLI surface is type-checked.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CortexFormat::Table => "table",
+            CortexFormat::Json => "json",
+            CortexFormat::Names => "names",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Subcommand)]
 pub enum CortexCommand {
     /// Parse a corpus's code files into symbol nodes + call/import/contains edges.
@@ -2123,8 +2154,8 @@ pub enum CortexCommand {
         /// 1.0 = EXTRACTED only (high-trust), 0.6 = +INFERRED, 0.0 = all (default).
         #[arg(long, default_value_t = 0.0)]
         min_confidence: f32,
-        #[arg(long, default_value = "table")]
-        format: String,
+        #[arg(long, value_enum, default_value = "table")]
+        format: crate::CortexFormat,
     },
     /// Callees of a code symbol.
     Callees {
@@ -2135,8 +2166,8 @@ pub enum CortexCommand {
         /// 1.0 = EXTRACTED only (high-trust), 0.6 = +INFERRED, 0.0 = all (default).
         #[arg(long, default_value_t = 0.0)]
         min_confidence: f32,
-        #[arg(long, default_value = "table")]
-        format: String,
+        #[arg(long, value_enum, default_value = "table")]
+        format: crate::CortexFormat,
     },
     /// Transitive caller closure (blast radius) of a code symbol.
     Impact {
@@ -2149,8 +2180,8 @@ pub enum CortexCommand {
         /// 1.0 = EXTRACTED only (high-trust), 0.6 = +INFERRED, 0.0 = all (default).
         #[arg(long, default_value_t = 0.0)]
         min_confidence: f32,
-        #[arg(long, default_value = "table")]
-        format: String,
+        #[arg(long, value_enum, default_value = "table")]
+        format: crate::CortexFormat,
     },
     /// Tests covering a code symbol (transitive test callers).
     Tests {
@@ -2163,8 +2194,8 @@ pub enum CortexCommand {
         /// 1.0 = EXTRACTED only (provably-reaching tests), 0.6 = +INFERRED, 0.0 = all (default).
         #[arg(long, default_value_t = 0.0)]
         min_confidence: f32,
-        #[arg(long, default_value = "table")]
-        format: String,
+        #[arg(long, value_enum, default_value = "table")]
+        format: crate::CortexFormat,
     },
 }
 
@@ -6304,3 +6335,52 @@ fn class_label(os_family: &str, gpu_kind: Option<&str>) -> &'static str {
 }
 
 // ─── Phase 10: alerts / metrics / logs ─────────────────────────────────
+
+#[cfg(test)]
+mod cortex_format_tests {
+    use super::CortexFormat;
+    use clap::ValueEnum;
+
+    /// The renderers (`print_symbols`/`print_tests`/`print_corpora`/…) match on
+    /// the `&str` produced by `as_str`; clap accepts whatever string `ValueEnum`
+    /// exposes as the variant's value. If those two drift, a user types a value
+    /// clap accepts (e.g. `json`) but the renderer falls through to the table
+    /// arm — exactly the silent mis-render this enum exists to prevent. Lock the
+    /// invariant: every variant's `as_str()` equals its clap value name.
+    #[test]
+    fn as_str_matches_clap_value_name() {
+        for &fmt in &[CortexFormat::Table, CortexFormat::Json, CortexFormat::Names] {
+            let clap_value = fmt
+                .to_possible_value()
+                .expect("no variant is skipped")
+                .get_name()
+                .to_string();
+            assert_eq!(fmt.as_str(), clap_value, "as_str/clap drift for {fmt:?}");
+        }
+    }
+
+    /// `--format table` is the documented default; keep the renderers' fallback
+    /// arm (`_ => table`) reachable by the canonical value, not just by typos.
+    #[test]
+    fn known_values_parse() {
+        assert_eq!(
+            CortexFormat::from_str("table", true).unwrap(),
+            CortexFormat::Table
+        );
+        assert_eq!(
+            CortexFormat::from_str("json", true).unwrap(),
+            CortexFormat::Json
+        );
+        assert_eq!(
+            CortexFormat::from_str("names", true).unwrap(),
+            CortexFormat::Names
+        );
+    }
+
+    /// The whole point: an unknown format is rejected, not silently coerced.
+    #[test]
+    fn unknown_value_is_rejected() {
+        assert!(CortexFormat::from_str("csv", true).is_err());
+        assert!(CortexFormat::from_str("jsn", true).is_err());
+    }
+}

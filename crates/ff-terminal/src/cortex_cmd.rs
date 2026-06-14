@@ -34,7 +34,7 @@ pub async fn handle_cortex(pool: &PgPool, cmd: crate::CortexCommand) -> Result<(
             format,
         } => {
             let rows = cortex::callers(pool, &corpus, &symbol, min_confidence).await?;
-            print_symbols(&rows, &format, &format!("callers of {symbol}"));
+            print_symbols(&rows, format.as_str(), &format!("callers of {symbol}"));
         }
         crate::CortexCommand::Callees {
             corpus,
@@ -43,7 +43,7 @@ pub async fn handle_cortex(pool: &PgPool, cmd: crate::CortexCommand) -> Result<(
             format,
         } => {
             let rows = cortex::callees(pool, &corpus, &symbol, min_confidence).await?;
-            print_symbols(&rows, &format, &format!("callees of {symbol}"));
+            print_symbols(&rows, format.as_str(), &format!("callees of {symbol}"));
         }
         crate::CortexCommand::Impact {
             corpus,
@@ -55,7 +55,7 @@ pub async fn handle_cortex(pool: &PgPool, cmd: crate::CortexCommand) -> Result<(
             let rows = cortex::impact(pool, &corpus, &symbol, max_depth, min_confidence).await?;
             print_symbols(
                 &rows,
-                &format,
+                format.as_str(),
                 &format!("impact of {symbol} (depth {max_depth})"),
             );
         }
@@ -69,7 +69,7 @@ pub async fn handle_cortex(pool: &PgPool, cmd: crate::CortexCommand) -> Result<(
             let rows = cortex::tests_for(pool, &corpus, &symbol, max_depth, min_confidence).await?;
             print_tests(
                 &rows,
-                &format,
+                format.as_str(),
                 &format!("tests covering {symbol} (depth {max_depth})"),
             );
         }
