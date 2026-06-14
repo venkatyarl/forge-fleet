@@ -267,6 +267,28 @@ pub async fn reconcile_local(pool: &sqlx::PgPool) -> Result<ReconcileSummary, St
                 }
             }
             "active" => {
+                // A dead `active` row with no library_id can NEVER be respawned
+                // (respawn_dead_deployment needs a library to load), so retrying
+                // it every 60s only spams the log and leaves a phantom 'unhealthy'
+                // endpoint in `ff model deployments` (and the router's candidate
+                // set) forever. Such rows come from adopting an out-of-band
+                // process whose model path matched no library row; once that
+                // process is gone the row is an unrecoverable zombie. Reap it.
+                // An operator-loaded deployment always carries a library_id, so
+                // this never discards real `ff model load` intent.
+                if dead_active_is_unrespawnable(&row.library_id) {
+                    tracing::info!(
+                        port = row.port,
+                        deployment = %row.id,
+                        "reaping dead un-respawnable deployment (active, no library_id)"
+                    );
+                    if let Err(e) = ff_db::pg_delete_deployment(pool, &row.id).await {
+                        tracing::warn!("delete un-respawnable deployment {}: {e}", row.id);
+                    } else {
+                        summary.removed += 1;
+                    }
+                    continue;
+                }
                 // Process died unexpectedly. Try to bring it back.
                 match respawn_dead_deployment(pool, row, &libs).await {
                     Ok(true) => summary.respawned += 1,
@@ -286,6 +308,15 @@ pub async fn reconcile_local(pool: &sqlx::PgPool) -> Result<ReconcileSummary, St
     }
 
     Ok(summary)
+}
+
+/// Whether a dead `active` deployment row should be reaped instead of having a
+/// respawn attempted. A respawn loads `row.library_id`, so a row with no
+/// library_id can never come back — it's a zombie left by adopting an
+/// out-of-band process whose model path matched no library. Pure predicate so
+/// the Pass-B decision is unit-testable without a DB.
+fn dead_active_is_unrespawnable(library_id: &Option<String>) -> bool {
+    library_id.is_none()
 }
 
 /// Resurrect a dead deployment row whose desired_state='active'. Returns
@@ -414,4 +445,35 @@ fn match_library_to_path(
         );
     }
     (None, None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unrespawnable_only_when_library_id_missing() {
+        // No library to load → permanently un-respawnable → reap.
+        assert!(dead_active_is_unrespawnable(&None));
+        // Has a library_id → respawn should be attempted (may still fail if the
+        // library row is gone, but that path is allowed to retry).
+        assert!(!dead_active_is_unrespawnable(&Some(
+            "9d8d3fb8-e413-434d-af95-99a92bf55dba".to_string()
+        )));
+    }
+
+    #[test]
+    fn canonical_ports_cover_inference_slots_and_specials() {
+        // llama.cpp / mlx slot window.
+        assert!(port_is_canonical(CANONICAL_PORT_MIN));
+        assert!(port_is_canonical(CANONICAL_PORT_MAX));
+        assert!(port_is_canonical(55005));
+        // vllm + ollama specials.
+        assert!(port_is_canonical(51001));
+        assert!(port_is_canonical(51003));
+        assert!(port_is_canonical(11434));
+        // Stray operator-launched ports are non-canonical.
+        assert!(!port_is_canonical(8082));
+        assert!(!port_is_canonical(CANONICAL_PORT_MAX + 1));
+    }
 }
