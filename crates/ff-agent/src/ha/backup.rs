@@ -361,11 +361,7 @@ impl BackupOrchestrator {
         );
 
         info!(path = %path.display(), "running pg_basebackup | age");
-        let status = Command::new("sh")
-            .arg("-c")
-            .arg(&shell_cmd)
-            .status()
-            .await?;
+        let status = run_pipeline(&shell_cmd).await?;
         if !status.success() {
             return Err(BackupError::Cmd(format!(
                 "pg_basebackup|age pipeline exited with status {status}; \
@@ -374,6 +370,7 @@ impl BackupOrchestrator {
         }
 
         let (size_bytes, sha256) = file_metadata(&path).await?;
+        validate_backup_size("postgres", &path, size_bytes).await?;
         let backup_id = self
             .insert_backup_row("postgres", &file_name, size_bytes, &sha256)
             .await?;
@@ -438,11 +435,7 @@ impl BackupOrchestrator {
             recipient = shell_quote(&recipient),
             out = shell_quote(&path.to_string_lossy()),
         );
-        let status = Command::new("sh")
-            .arg("-c")
-            .arg(&shell_cmd)
-            .status()
-            .await?;
+        let status = run_pipeline(&shell_cmd).await?;
         if !status.success() {
             // Fallback: try plain gzip if zstd isn't on PATH. Still
             // encrypt-at-rest via age.
@@ -456,17 +449,14 @@ impl BackupOrchestrator {
                 recipient = shell_quote(&recipient),
                 out = shell_quote(&path_gz.to_string_lossy()),
             );
-            let status_gz = Command::new("sh")
-                .arg("-c")
-                .arg(&shell_cmd_gz)
-                .status()
-                .await?;
+            let status_gz = run_pipeline(&shell_cmd_gz).await?;
             if !status_gz.success() {
                 return Err(BackupError::Cmd(format!(
                     "redis dump export failed: {status_gz}"
                 )));
             }
             let (size_bytes, sha256) = file_metadata(&path_gz).await?;
+            validate_backup_size("redis", &path_gz, size_bytes).await?;
             let backup_id = self
                 .insert_backup_row("redis", &file_name_gz, size_bytes, &sha256)
                 .await?;
@@ -484,6 +474,7 @@ impl BackupOrchestrator {
         }
 
         let (size_bytes, sha256) = file_metadata(&path).await?;
+        validate_backup_size("redis", &path, size_bytes).await?;
         let backup_id = self
             .insert_backup_row("redis", &file_name, size_bytes, &sha256)
             .await?;
@@ -967,6 +958,60 @@ fn backup_rsync_title_like(kind: &str) -> String {
     format!("rsync {kind} backup %")
 }
 
+/// Run a shell pipeline with `pipefail` so a failure in ANY stage propagates,
+/// not just the last one.
+///
+/// HA.1 (2026-06-14): the backup pipelines are `pg_basebackup | age > f` and
+/// `cat dump.rdb | zstd | age > f`. Under the default `sh -c "a | b > c"` the
+/// exit status is `c`'s alone, so a failed `pg_basebackup`/`cat` whose (empty)
+/// stdout still encrypts cleanly through `age` looks like success — and a
+/// ~184-byte ciphertext-of-nothing gets recorded as a valid backup with a real
+/// SHA (observed live: `pg-20260614T132656Z.tar.gz.age`, 184 bytes). `bash` is
+/// used explicitly because `pipefail` is not in POSIX `sh` (dash); the leader
+/// may be macOS today or, after an HA failover, a Linux peer — both ship bash.
+async fn run_pipeline(cmd: &str) -> std::io::Result<std::process::ExitStatus> {
+    Command::new("bash")
+        .arg("-c")
+        .arg(format!("set -o pipefail\n{cmd}"))
+        .status()
+        .await
+}
+
+/// Smallest plausible size (bytes) of a real encrypted backup artifact, by
+/// kind. Belt-and-suspenders alongside [`run_pipeline`]'s `pipefail`: even if a
+/// source command exits 0 but writes a truncated stream, the artifact is far
+/// below these floors and we refuse to record it. Real artifacts dwarf them — a
+/// postgres base backup is MB–GB even for a tiny DB (system catalogs alone),
+/// and a live-fleet redis snapshot is tens of KB; a failed pipeline yields the
+/// ~180–250 byte age-header-plus-nothing file.
+fn min_backup_bytes(kind: &str) -> i64 {
+    match kind {
+        "postgres" => 4096,
+        // redis (and anything else): conservative — our real snapshots are
+        // ~45 KiB, a failed stream is ~200 bytes.
+        _ => 512,
+    }
+}
+
+/// Reject + unlink an implausibly small backup artifact so it never reaches the
+/// catalog or the rsync fan-out. Returns `Ok` when the artifact clears the
+/// [`min_backup_bytes`] floor for its kind. The truncated file is removed on
+/// the spot (best effort) so it can't masquerade as a restore candidate or be
+/// replicated fleet-wide.
+async fn validate_backup_size(kind: &str, path: &Path, size_bytes: i64) -> Result<(), BackupError> {
+    let floor = min_backup_bytes(kind);
+    if size_bytes >= floor {
+        return Ok(());
+    }
+    let _ = tokio::fs::remove_file(path).await;
+    Err(BackupError::Cmd(format!(
+        "{kind} backup artifact is implausibly small ({size_bytes} bytes < {floor} \
+         floor) — the source command almost certainly failed mid-pipeline; \
+         refusing to record a corrupt backup and removed {}",
+        path.display()
+    )))
+}
+
 /// The remote shell command a peer runs to pull one backup snapshot from the
 /// leader. `kind_safe` is the backup kind (`postgres`/`redis`); `source_quoted`
 /// is the already-`shell_quote`d `user@ip:/path` source. Pure so the rsync flag
@@ -1253,6 +1298,53 @@ mod tests {
         let pg_prefix = pg_prefix.trim_end_matches('%');
         let redis_title = "rsync redis backup redis-20260613T094023Z.rdb.zst.age → priya";
         assert!(!redis_title.starts_with(pg_prefix));
+    }
+
+    #[test]
+    fn min_backup_bytes_floors_reject_failed_pipeline_artifacts() {
+        // A failed `pg_basebackup`/`cat` whose empty stdout still flows through
+        // `age` yields a ~184-byte file (observed live). Both floors must sit
+        // above that and far below any real artifact.
+        assert!(min_backup_bytes("postgres") > 184);
+        assert!(min_backup_bytes("redis") > 184);
+        // postgres backups are MB-GB; redis is tens of KB — neither floor can
+        // false-reject a real artifact.
+        assert!(min_backup_bytes("postgres") < 100_000);
+        assert!(min_backup_bytes("redis") < 45_000);
+        // Unknown kinds fall back to the conservative redis floor.
+        assert_eq!(
+            min_backup_bytes("something-else"),
+            min_backup_bytes("redis")
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_backup_size_rejects_and_unlinks_tiny_artifacts() {
+        let dir = std::env::temp_dir().join(format!("ff-bk-test-{}", std::process::id()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let tiny = dir.join("pg-tiny.tar.gz.age");
+        tokio::fs::write(&tiny, vec![0u8; 184]).await.unwrap();
+
+        // Below the postgres floor → error AND the file is removed so it can't
+        // be replicated or recorded.
+        let err = validate_backup_size("postgres", &tiny, 184).await;
+        assert!(err.is_err(), "184-byte postgres artifact must be rejected");
+        assert!(
+            !tiny.exists(),
+            "rejected artifact must be unlinked, not left for the rsync fan-out"
+        );
+
+        // A plausibly-sized artifact passes and is left in place.
+        let ok_path = dir.join("pg-ok.tar.gz.age");
+        tokio::fs::write(&ok_path, vec![0u8; 8192]).await.unwrap();
+        assert!(
+            validate_backup_size("postgres", &ok_path, 8192)
+                .await
+                .is_ok()
+        );
+        assert!(ok_path.exists());
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[test]
