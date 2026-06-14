@@ -2516,6 +2516,31 @@ fn collect_calls(node: &Node, bytes: &[u8], fp: &mut FileParse) {
                 }
             }
         }
+        // Macro-body calls: tree-sitter parses a macro invocation's arguments as
+        // an opaque `token_tree`, so `assert_eq!(foo(), …)` yields NO
+        // call_expression — the single biggest Rust call-graph blind spot, since
+        // unit tests assert through macros (`ff cortex tests` read those fns as
+        // uncovered). Recover them by spotting the `ident( … )` shape inside a
+        // token_tree: an `identifier`/`scoped_identifier` whose immediate next
+        // sibling is a `(`-delimited token_tree. The macro's own name is excluded
+        // for free — the `!` token sits between it and its token_tree — and method
+        // calls (`x.bar()`, a preceding `.`) are skipped to match the
+        // call_expression path, which also drops field-expression methods.
+        else if matches!(child.kind(), "identifier" | "scoped_identifier") {
+            if let Some(next) = child.next_sibling() {
+                let is_paren_tt =
+                    next.kind() == "token_tree" && bytes.get(next.start_byte()) == Some(&b'(');
+                let is_method = child.prev_sibling().map(|p| p.kind()) == Some(".");
+                if is_paren_tt && !is_method {
+                    if let Some(raw) = call_target_path(&child, bytes) {
+                        fp.calls.push(CallSite {
+                            raw_path: raw,
+                            at: child.start_byte(),
+                        });
+                    }
+                }
+            }
+        }
         // Recurse — calls can be nested arbitrarily, but NOT into nested
         // function_items (those are separate symbols handled by walk()).
         if child.kind() != "function_item" {
@@ -4541,6 +4566,57 @@ diff --git a/src/b.rs b/src/b.rs
         assert!(fns.iter().any(|q| q.ends_with("::alpha")));
         assert!(fns.iter().any(|q| q.ends_with("::beta")));
         assert!(fp.calls.iter().any(|c| c.raw_path == "beta"));
+    }
+
+    #[test]
+    fn parse_extracts_calls_inside_macro_bodies() {
+        // The Rust call-graph blind spot: calls inside macro invocations
+        // (`assert_eq!`, `assert!`, …) live in an opaque token_tree and used to
+        // yield NO call edge — so macro-asserted unit tests read as covering
+        // nothing and `ff cortex tests` under-reported Rust coverage. The macro
+        // name itself must NOT be recorded, nor method calls.
+        let src = r#"
+fn target(x: u32) -> u32 { x + 1 }
+fn other() -> u32 { 7 }
+struct S;
+impl S { fn meth(&self) -> u32 { 1 } }
+#[test]
+fn covers_target() {
+    let s = S;
+    assert_eq!(target(2), 3);
+    assert!(other() > 0);
+    println!("{}", s.meth());
+}
+"#;
+        let fp = parse_rust_file("/x/crates/demo/src/lib.rs", src).unwrap();
+        let raws: Vec<&str> = fp.calls.iter().map(|c| c.raw_path.as_str()).collect();
+        // The fns invoked from inside the macros are now captured as calls.
+        assert!(
+            raws.contains(&"target"),
+            "macro-body call to target missing: {raws:?}"
+        );
+        assert!(
+            raws.contains(&"other"),
+            "macro-body call to other missing: {raws:?}"
+        );
+        // The macro names are NOT calls (the `!` separates name from token_tree).
+        assert!(
+            !raws.contains(&"assert_eq"),
+            "macro name leaked as call: {raws:?}"
+        );
+        assert!(
+            !raws.contains(&"assert"),
+            "macro name leaked as call: {raws:?}"
+        );
+        assert!(
+            !raws.contains(&"println"),
+            "macro name leaked as call: {raws:?}"
+        );
+        // Method call inside the macro is skipped (matches call_expression path).
+        assert!(
+            !raws.contains(&"meth"),
+            "method call wrongly recorded: {raws:?}"
+        );
     }
 
     #[test]
