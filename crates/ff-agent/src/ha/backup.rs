@@ -41,7 +41,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use ff_db::leader_state::pg_get_current_leader;
-use ff_db::pg_enqueue_deferred;
+use ff_db::{pg_enqueue_deferred, pg_enqueue_deferred_delayed};
 use ff_db::{pg_get_secret, pg_set_secret};
 
 /// fleet_secrets key that stores the age X25519 recipient (public key).
@@ -84,6 +84,27 @@ const LOCAL_KEEP_REDIS_LEADER: usize = 60;
 const LOCAL_KEEP_REDIS_PEER: usize = 24;
 /// How often each node prunes its own backup directory.
 const PRUNE_INTERVAL_SECS: u64 = 3600;
+
+/// Backup-distribution fan-out staggering. A single snapshot is replicated to
+/// every peer; promoting all of those rsync pulls at once turns the leader into
+/// a thundering-herd sender, and contended followers (e.g. sophie/priya, which
+/// are also streaming-replication followers under apply load) starve below
+/// rsync's progress floor and hit the I/O timeout — while standalone they pull
+/// the same 1.4 GiB file in ~15s. Instead we release peers in waves:
+/// [`DISTRIBUTION_WAVE_SIZE`] peers may pull concurrently (the LAN comfortably
+/// handles that many), and each subsequent wave is delayed another
+/// [`DISTRIBUTION_WAVE_STAGGER_SECS`] via a seeded `next_attempt_at`. The
+/// `node_online` trigger is preserved, so each task still only runs on its
+/// intended target when that target is online.
+const DISTRIBUTION_WAVE_SIZE: usize = 4;
+const DISTRIBUTION_WAVE_STAGGER_SECS: i64 = 45;
+
+/// Delay (seconds) before peer at position `idx` in the fan-out may be claimed.
+/// Peers are released in waves of [`DISTRIBUTION_WAVE_SIZE`]; wave `w` starts at
+/// `w * DISTRIBUTION_WAVE_STAGGER_SECS`. Pure so the wave schedule is unit-testable.
+fn distribution_stagger_secs(idx: usize) -> i64 {
+    (idx / DISTRIBUTION_WAVE_SIZE) as i64 * DISTRIBUTION_WAVE_STAGGER_SECS
+}
 
 /// Errors emitted by [`BackupOrchestrator`].
 #[derive(Debug, thiserror::Error)]
@@ -632,7 +653,13 @@ impl BackupOrchestrator {
             });
             let trigger_spec = serde_json::json!({ "node": name });
             let required_caps = serde_json::json!([]);
-            match pg_enqueue_deferred(
+            // Stagger the fan-out in waves so contended followers don't starve
+            // under a simultaneous herd of rsync pulls (see
+            // DISTRIBUTION_WAVE_SIZE). The index is over peers actually enqueued
+            // this cycle, so coalesce-skipped peers don't leave gaps in the wave
+            // schedule.
+            let delay_secs = distribution_stagger_secs(enqueued.len());
+            match pg_enqueue_deferred_delayed(
                 &self.pg,
                 &title,
                 "shell",
@@ -643,6 +670,7 @@ impl BackupOrchestrator {
                 &required_caps,
                 Some(&who),
                 Some(3),
+                delay_secs,
             )
             .await
             {
@@ -1275,6 +1303,37 @@ mod tests {
         assert!(!r.produced);
         assert_eq!(r.kind, "postgres");
         assert!(r.file_name.is_empty());
+    }
+
+    #[test]
+    fn distribution_stagger_releases_peers_in_waves() {
+        // Wave 0 (the first DISTRIBUTION_WAVE_SIZE peers) goes immediately.
+        for idx in 0..DISTRIBUTION_WAVE_SIZE {
+            assert_eq!(
+                distribution_stagger_secs(idx),
+                0,
+                "wave-0 peer {idx} must not be delayed"
+            );
+        }
+        // Each subsequent wave is delayed another DISTRIBUTION_WAVE_STAGGER_SECS.
+        assert_eq!(
+            distribution_stagger_secs(DISTRIBUTION_WAVE_SIZE),
+            DISTRIBUTION_WAVE_STAGGER_SECS
+        );
+        assert_eq!(
+            distribution_stagger_secs(DISTRIBUTION_WAVE_SIZE * 2),
+            DISTRIBUTION_WAVE_STAGGER_SECS * 2
+        );
+        // Monotonic non-decreasing across a realistic fleet size.
+        let mut prev = -1;
+        for idx in 0..15 {
+            let d = distribution_stagger_secs(idx);
+            assert!(
+                d >= prev,
+                "stagger must be monotonic; idx {idx} gave {d} < {prev}"
+            );
+            prev = d;
+        }
     }
 
     #[test]

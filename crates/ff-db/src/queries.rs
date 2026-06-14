@@ -4113,11 +4113,51 @@ pub async fn pg_enqueue_deferred(
     created_by: Option<&str>,
     max_attempts: Option<i32>,
 ) -> Result<String> {
+    pg_enqueue_deferred_delayed(
+        pool,
+        title,
+        kind,
+        payload,
+        trigger_type,
+        trigger_spec,
+        preferred_node,
+        required_caps,
+        created_by,
+        max_attempts,
+        0,
+    )
+    .await
+}
+
+/// Like [`pg_enqueue_deferred`] but seeds `next_attempt_at = NOW() + delay_secs`
+/// so the task cannot be *claimed* until that time — even once its trigger has
+/// promoted it to `dispatchable`. The trigger still fires normally (e.g. a
+/// `node_online` task is promoted as soon as the target is online), but
+/// [`pg_claim_deferred`] gates on `next_attempt_at`, and [`pg_scheduler_pass`]
+/// preserves a future value via `GREATEST(NOW(), next_attempt_at)` instead of
+/// stomping it to `NOW()`. Used to stagger a one-snapshot backup fan-out across
+/// peers so contended followers don't starve under a simultaneous thundering
+/// herd of rsync pulls. `delay_secs <= 0` behaves exactly like the plain enqueue.
+#[allow(clippy::too_many_arguments)]
+pub async fn pg_enqueue_deferred_delayed(
+    pool: &PgPool,
+    title: &str,
+    kind: &str,
+    payload: &JsonValue,
+    trigger_type: &str,
+    trigger_spec: &JsonValue,
+    preferred_node: Option<&str>,
+    required_caps: &JsonValue,
+    created_by: Option<&str>,
+    max_attempts: Option<i32>,
+    delay_secs: i64,
+) -> Result<String> {
     let row = sqlx::query(
         "INSERT INTO deferred_tasks
             (title, kind, payload, trigger_type, trigger_spec, preferred_node,
-             required_caps, created_by, max_attempts)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, COALESCE($9, 5))
+             required_caps, created_by, max_attempts, next_attempt_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, COALESCE($9, 5),
+                 CASE WHEN $10 > 0 THEN NOW() + make_interval(secs => $10) ELSE NULL END)
          RETURNING id",
     )
     .bind(title)
@@ -4129,6 +4169,7 @@ pub async fn pg_enqueue_deferred(
     .bind(required_caps)
     .bind(created_by)
     .bind(max_attempts)
+    .bind(delay_secs as f64)
     .fetch_one(pool)
     .await?;
     let id: sqlx::types::Uuid = row.get("id");
@@ -4277,9 +4318,14 @@ pub async fn pg_scheduler_pass(
         0
     } else {
         sqlx::query(
+            // Preserve a future `next_attempt_at` (seeded by
+            // `pg_enqueue_deferred_delayed` to stagger a fan-out) instead of
+            // stomping it to NOW(): GREATEST(NOW(), NULL) = NOW(), so the
+            // common case (no scheduled delay) is unchanged, while a
+            // deliberately-delayed task stays gated by `pg_claim_deferred`.
             "UPDATE deferred_tasks
                 SET status = 'dispatchable',
-                    next_attempt_at = NOW()
+                    next_attempt_at = GREATEST(NOW(), next_attempt_at)
               WHERE status = 'pending'
                 AND trigger_type = 'node_online'
                 AND (trigger_spec->>'node') = ANY($1)",
