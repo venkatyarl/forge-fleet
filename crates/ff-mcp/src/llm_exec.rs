@@ -216,7 +216,7 @@ impl GatewayLlmExec {
         max_tokens: u32,
         timeout: Duration,
     ) -> Result<String, String> {
-        let url = format!("{}/v1/chat/completions", endpoint.trim_end_matches('/'));
+        let url = ff_core::url::normalize_chat_completions_url(endpoint);
         let body = json!({
             "model": model,
             "messages": [{"role": "user", "content": prompt}],

@@ -982,7 +982,7 @@ async fn openai_single_completion(
     max_tokens: u32,
     client: &reqwest::Client,
 ) -> Result<String> {
-    let url = format!("{}/v1/chat/completions", gateway_url.trim_end_matches('/'));
+    let url = ff_core::url::normalize_chat_completions_url(gateway_url);
     let body = json!({
         "model": model,
         "messages": [{"role": "user", "content": prompt}],

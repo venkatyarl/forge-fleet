@@ -94,7 +94,7 @@ async fn call_llm(
     data_uri: &str,
     prompt: &str,
 ) -> Result<FrameAnalysis> {
-    let url = format!("{}/v1/chat/completions", endpoint.trim_end_matches('/'));
+    let url = ff_core::url::normalize_chat_completions_url(endpoint);
     let body = json!({
         "model": model_id,
         "temperature": 0.0,

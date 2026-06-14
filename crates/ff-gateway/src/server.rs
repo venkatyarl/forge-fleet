@@ -4963,7 +4963,7 @@ async fn proxy_chat_completions(
             let timeout = tier_router.timeout_for_tier(*tier);
 
             for backend in backends {
-                let url = format!("{}/v1/chat/completions", backend.base_url());
+                let url = ff_core::url::normalize_chat_completions_url(&backend.base_url());
                 debug!(
                     backend = %backend.id,
                     tier = %tier,
@@ -5124,7 +5124,7 @@ async fn proxy_chat_completions(
     let mut last_error = None::<String>;
 
     for backend in &route_chain {
-        let url = format!("{}/v1/chat/completions", backend.base_url());
+        let url = ff_core::url::normalize_chat_completions_url(&backend.base_url());
         debug!(backend = %backend.id, %url, "proxying chat completion request (legacy)");
 
         match state.http_client.post(&url).json(&payload).send().await {

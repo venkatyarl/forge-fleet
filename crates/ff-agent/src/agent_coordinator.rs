@@ -255,11 +255,7 @@ impl AgentCoordinator {
         let (endpoint, model_id) = self.pick_llm_server_for(&slot.computer_name).await?;
 
         // POST /v1/chat/completions with a minimal OpenAI-shape request.
-        let url = if endpoint.contains("/chat/completions") {
-            endpoint.clone()
-        } else {
-            format!("{}/v1/chat/completions", endpoint.trim_end_matches('/'))
-        };
+        let url = ff_core::url::normalize_chat_completions_url(&endpoint);
 
         let body = json!({
             "model": model_id,

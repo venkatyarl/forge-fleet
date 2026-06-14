@@ -838,7 +838,7 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
             };
 
             let started = Instant::now();
-            let endpoint = format!("{}/v1/chat/completions", backend.base_url());
+            let endpoint = ff_core::url::normalize_chat_completions_url(&backend.base_url());
 
             match client
                 .post(&endpoint)
@@ -1102,10 +1102,7 @@ pub async fn fleet_offload(params: Option<Value>) -> HandlerResult {
         .catalog_id
         .clone()
         .unwrap_or_else(|| candidate.catalog_name.clone().unwrap_or_default());
-    let url = format!(
-        "{}/v1/chat/completions",
-        candidate.endpoint.trim_end_matches('/')
-    );
+    let url = ff_core::url::normalize_chat_completions_url(&candidate.endpoint);
 
     let client = &*SHARED_HTTP;
     // mlx_lm.server validates the OpenAI `model` field as an HF repo id, so the

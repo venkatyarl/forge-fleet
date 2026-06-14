@@ -43,7 +43,7 @@ pub async fn classify_workload(
         ]
     });
     let resp = http
-        .post(format!("{}/v1/chat/completions", llm_endpoint))
+        .post(ff_core::url::normalize_chat_completions_url(llm_endpoint))
         .json(&body)
         .send()
         .await

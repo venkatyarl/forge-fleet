@@ -426,7 +426,7 @@ async fn generate_brain_reply(
             let mut last_error = None::<String>;
             for (_tier, backends) in &chain {
                 for backend in backends {
-                    let url = format!("{}/v1/chat/completions", backend.base_url());
+                    let url = ff_core::url::normalize_chat_completions_url(&backend.base_url());
                     let start = std::time::Instant::now();
                     match tokio::time::timeout(
                         std::time::Duration::from_secs(60),
@@ -491,7 +491,7 @@ async fn generate_brain_reply(
     if let Some(model_router) = state.model_router.as_ref() {
         let target_model = payload["model"].as_str().unwrap_or(&model);
         if let Some(backend) = model_router.route(target_model).await {
-            let url = format!("{}/v1/chat/completions", backend.base_url());
+            let url = ff_core::url::normalize_chat_completions_url(&backend.base_url());
             let resp = state
                 .http_client
                 .post(&url)
