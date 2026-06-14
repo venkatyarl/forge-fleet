@@ -6,7 +6,11 @@
 //!
 //! NODE MODEL (brain_vault_nodes)
 //!   - `doc:file`    — one per document. path `doc://<slug>/<relpath>`,
-//!                     title=relpath, project=slug, content_hash=sha256(content).
+//!                     title=relpath, project=slug. content_hash is a metadata
+//!                     (size+mtime) cheap_hash — the change signal mirrors the
+//!                     cortex corpus scan, so an unchanged doc is skipped WITHOUT
+//!                     reading the file (images stay content-hashed — see
+//!                     image_index.rs for why).
 //!   - `doc:section` — one per markdown heading (`#`..`######`). path
 //!                     `doc://<slug>/<relpath>#<anchor>`, title=heading text.
 //!                     (`.txt` files have no headings → file node only.)
@@ -24,11 +28,12 @@
 //! FULL vs INCREMENTAL: a full reindex DELETEs all prior `doc:%` nodes for the
 //! corpus first (edges cascade via ON DELETE CASCADE), then rebuilds — re-parsing
 //! every file. An incremental run keeps existing nodes and re-parses ONLY files
-//! whose content changed since the last index (matched by `content_hash`),
-//! rebuilding just the changed file's sections; it then GCs the `doc:file` +
-//! `doc:section` nodes of files removed on disk. On a large doc tree (forge-fleet:
-//! 2833 files / 36k sections) skipping unchanged files takes a no-op
-//! `--incremental` run from ~100s of DB churn to a single hash diff.
+//! whose size+mtime changed since the last index (matched by the metadata
+//! `content_hash`), rebuilding just the changed file's sections; it then GCs the
+//! `doc:file` + `doc:section` nodes of files removed on disk. On a large doc tree
+//! (forge-fleet: 2833 files / 36k sections) skipping unchanged files takes a no-op
+//! `--incremental` run from ~100s of DB churn to a metadata-only stat per file —
+//! no content read, no sha256.
 
 use anyhow::Result;
 use sha2::{Digest, Sha256};
@@ -121,10 +126,6 @@ pub async fn index_docs(
     let files = collect_doc_files(root);
     let mut live_paths: Vec<String> = Vec::with_capacity(files.len());
     for file_path in files {
-        let source = match std::fs::read_to_string(&file_path) {
-            Ok(s) => s,
-            Err(_) => continue, // unreadable / vanished — skip
-        };
         let rel = file_path
             .strip_prefix(root)
             .map(|p| p.to_string_lossy().to_string())
@@ -132,11 +133,20 @@ pub async fn index_docs(
 
         // ── file node ───────────────────────────────────────────────────────
         let file_node_path = format!("doc://{corpus_slug}/{rel}");
-        let content_hash = sha256_hex(&source);
+
+        // Change signal is a metadata-only hash (size+mtime), mirroring the
+        // cortex corpus scan — an unchanged doc is detected WITHOUT reading the
+        // file, so a no-op incremental run skips the read + re-parse entirely
+        // (the read+sha256 of every doc was the residual no-op cost).
+        let Ok(md) = std::fs::metadata(&file_path) else {
+            continue; // vanished — the GC below drops its now-absent node
+        };
         live_paths.push(file_node_path.clone());
+        let content_hash =
+            crate::corpus::cheap_hash(&file_node_path, md.len(), crate::corpus::mtime_of(&md));
 
         // Incremental: an unchanged file keeps its node + sections + edges —
-        // skip the re-parse entirely.
+        // skip the read + re-parse entirely.
         if incremental
             && doc_unchanged(
                 prior_hashes.get(&file_node_path).map(String::as_str),
@@ -146,6 +156,12 @@ pub async fn index_docs(
             stats.files += 1;
             continue;
         }
+
+        // Changed (or full run): read the content to parse headings/sections.
+        let source = match std::fs::read_to_string(&file_path) {
+            Ok(s) => s,
+            Err(_) => continue, // unreadable / vanished — skip
+        };
 
         let file_id = upsert_doc_node(
             pool,

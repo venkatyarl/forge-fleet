@@ -1253,7 +1253,7 @@ fn walk_inner(root: &Path, dir: &Path, depth: usize, max_depth: usize, out: &mut
     }
 }
 
-fn mtime_of(md: &std::fs::Metadata) -> i64 {
+pub(crate) fn mtime_of(md: &std::fs::Metadata) -> i64 {
     md.modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
@@ -1261,7 +1261,7 @@ fn mtime_of(md: &std::fs::Metadata) -> i64 {
         .unwrap_or(0)
 }
 
-fn cheap_hash(path: &str, size: u64, mtime: i64) -> String {
+pub(crate) fn cheap_hash(path: &str, size: u64, mtime: i64) -> String {
     let mut h = Sha256::new();
     h.update(path.as_bytes());
     h.update(size.to_le_bytes());

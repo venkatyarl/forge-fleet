@@ -173,6 +173,12 @@ pub async fn index_images(
     let mut live_paths: Vec<String> = Vec::with_capacity(files.len());
 
     for file_path in files {
+        // Images are read in full to hash by CONTENT (sha256), not by metadata:
+        // there are few of them (the read is negligible) and a content hash
+        // avoids a one-time re-caption storm — switching the change signal to a
+        // size+mtime hash would invalidate every image:file node once and force
+        // a fresh vision call per image fleet-wide. (Docs, which number in the
+        // thousands, DO use the cheap metadata hash — see doc_index.rs.)
         let bytes = match std::fs::read(&file_path) {
             Ok(b) => b,
             Err(_) => continue, // unreadable / vanished — skip
