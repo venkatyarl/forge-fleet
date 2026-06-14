@@ -63,7 +63,35 @@
    into `ff_brain::cortex` so the CLI and MCP frontends share it.
 4. **Community summaries via fleet LLMs** — GraphRAG-style per-community
    summaries, re-summarize only changed communities (the idle fleet is the lever;
-   pairs with the incremental ledger). ← **next cortex build**
+   pairs with the incremental ledger).
+   - ✅ **Generation** (`ff cortex summarize`, `community_summary.rs`) — DB-routed
+     fleet LLM per community, `--all`/`--max`/`--min-members`, stable member-hash
+     so unchanged communities keep their summary across re-detection.
+   - ✅ **Consumer surface** (PR #295) — `ff cortex explain <symbol>` + the
+     `cortex_explain` MCP tool: resolve a symbol → its community → that
+     community's summary + top non-extern members. The summaries were write-only
+     until this; now an agent gets "what is this subsystem responsible for?" in
+     one call.
+   - ⛔ **BLOCKER — communities are not yet meaningful (next cortex build).**
+     `detect_communities` (`communities.rs`) is union-find **connected components
+     over ALL `brain_vault_edges`** (live forge-fleet: contains 110k, calls 90k,
+     imports 47k, link 26k). The `contains` tree (corpus→file→symbol) + `imports`
+     structurally bridge nearly the entire code graph into **one mega-component**
+     (largest community = **44,993** nodes; its god node is a non-code
+     software-version vault node, its summary garbage). So `explain` currently
+     returns a correct lookup over a useless cluster. Excluding `code:extern`
+     universal call-sinks from detection helps only marginally (44,993 → 32,897 —
+     measured live) because the dominant bridge is the containment tree, not
+     externs. **Real fix:** a cortex-specific detection over the **`calls`
+     subgraph among non-extern `code:*` nodes**, using an algorithm that
+     *subdivides* a connected graph — label propagation or Leiden — since
+     connected-components fundamentally cannot split one. Keep the shared
+     `detect_communities` for the brain KG (where `contains`/`link` edges ARE the
+     real structure); store code communities in a parallel registry or a
+     code-scoped column. This is a deliberate redesign of a function shared by
+     `ff brain` and cortex — own iteration, careful verification — not a
+     one-liner. Until it lands, community summaries (and `explain`'s summary
+     field) stay coarse.
 5. **Provenance/confidence on edges** — EXTRACTED vs INFERRED tiers (graphify's
    one structural advantage), so downstream consumers can filter heuristic call
    edges (e.g. the dotty-resolver's kept-as-written externs).
