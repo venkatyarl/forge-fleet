@@ -1099,6 +1099,19 @@ async fn extract_files(
                 }
             }
 
+            // Java nested-class method redirect (J2b): `Message.system(...)` on a
+            // class nested in `AiClient` lands on the extern
+            // `<caller_pkg>::Message::system`; the receiver type dropped its OUTER
+            // class. Re-anchor onto the real `<owner_pkg>::AiClient::Message::system`
+            // method node. Targets a fn (not a type), so no ctor_type_target.
+            if p.parse.lang == Lang::Java && !internal_fns.contains(&resolved) {
+                if let Some(t) =
+                    resolve_java_method_call(&resolved, internal_fns, internal_types, &type_by_leaf)
+                {
+                    resolved = t;
+                }
+            }
+
             // Find the callee node: internal real fn if known, else code:extern.
             // A Java constructor redirect resolves to an internal class/interface
             // node (a type, not a fn), so accept it via ctor_type_target.
@@ -4634,6 +4647,52 @@ fn resolve_java_ctor_call(
     }
 }
 
+/// J2b: nested-class static-method call recall. `Message.system(...)` where
+/// `Message` is a class nested in `AiClient` is recorded by `resolve_call_dotty`
+/// as the caller's own package path `<caller_pkg>::Message::system`, but the real
+/// method node lives at `<owner_pkg>::AiClient::Message::system` (Java methods
+/// nest under their class, `module::Outer::Inner::method`). The receiver TYPE
+/// segment dropped its OUTER class — exactly the J2 constructor pattern, except
+/// the trailing segment is a METHOD (`leaf != type_seg`) rather than a ctor.
+///
+/// Suffix-match the receiver type leaf across internal types via `type_by_leaf`,
+/// keeping only candidates whose own outer prefix is itself an internal type
+/// (i.e. genuine nested classes — a top-level type's prefix is a package, so it's
+/// excluded, which is correct: a missed cross-package call is the alias map's job,
+/// not this redirect's). Take the single survivor, reattach the method leaf, and
+/// fire only when `<real_type>::<leaf>` is a known internal fn — triple-gated
+/// (single nested candidate + internal-outer filter + final internal-fn check),
+/// so it never fabricates an edge. Lowercase receivers (instance-variable calls
+/// like `msg.system()`) are left alone — only `Type.method(...)` receivers redirect.
+fn resolve_java_method_call(
+    resolved: &str,
+    internal_fns: &HashSet<String>,
+    internal_types: &HashSet<String>,
+    type_by_leaf: &HashMap<String, Vec<String>>,
+) -> Option<String> {
+    let (receiver, leaf) = resolved.rsplit_once("::")?;
+    let type_seg = receiver
+        .rsplit_once("::")
+        .map(|(_, t)| t)
+        .unwrap_or(receiver);
+    if leaf == type_seg {
+        return None; // constructor shape — handled by resolve_java_ctor_call.
+    }
+    if !type_seg.chars().next().is_some_and(|c| c.is_uppercase()) {
+        return None; // lowercase receiver = an instance variable, not a type.
+    }
+    let mut nested = type_by_leaf.get(type_seg)?.iter().filter(|cand| {
+        cand.rsplit_once("::")
+            .is_some_and(|(outer, _)| internal_types.contains(outer))
+    });
+    let real_type = match (nested.next(), nested.next()) {
+        (Some(only), None) => only,
+        _ => return None, // zero or ambiguous → leave as extern.
+    };
+    let candidate = format!("{real_type}::{leaf}");
+    internal_fns.contains(&candidate).then_some(candidate)
+}
+
 /// Crate-root single-candidate redirect (lever #7). A bare call to a fn in a
 /// sibling submodule that the alias map missed (`use crate::communities::*;`, an
 /// inline `mod`, a re-export not modeled as `pub use`) falls through
@@ -5938,6 +5997,118 @@ diff --git a/src/b.rs b/src/b.rs
         let by_leaf = type_leaf_index(&types);
         assert_eq!(
             resolve_java_ctor_call("com::hireflow360::api::config::Ai::Ai", &types, &by_leaf),
+            None
+        );
+    }
+
+    #[test]
+    fn java_nested_method_redirects_to_real_outer() {
+        // `Message.system(...)` where Message is nested in AiClient: recorded as the
+        // caller's own package path `…ai::Message::system`, but the real method node
+        // is `…ai::AiClient::Message::system`. Suffix-match the receiver leaf onto the
+        // nested type whose outer (AiClient) is internal, then reattach `system`.
+        let types: HashSet<String> = [
+            "com::hireflow360::api::ai::AiClient".to_string(),
+            "com::hireflow360::api::ai::AiClient::Message".to_string(),
+        ]
+        .into();
+        let fns: HashSet<String> =
+            ["com::hireflow360::api::ai::AiClient::Message::system".to_string()].into();
+        let by_leaf = type_leaf_index(&types);
+        assert_eq!(
+            resolve_java_method_call(
+                "com::hireflow360::api::ai::Message::system",
+                &fns,
+                &types,
+                &by_leaf
+            ),
+            Some("com::hireflow360::api::ai::AiClient::Message::system".to_string())
+        );
+    }
+
+    #[test]
+    fn java_nested_method_redirect_never_fabricates() {
+        let types: HashSet<String> = [
+            "com::hireflow360::api::ai::AiClient".to_string(),
+            "com::hireflow360::api::ai::AiClient::Message".to_string(),
+        ]
+        .into();
+        let by_leaf = type_leaf_index(&types);
+        // Constructor shape (leaf == type_seg) is the ctor resolver's job, not ours.
+        assert_eq!(
+            resolve_java_method_call(
+                "com::hireflow360::api::ai::Message::Message",
+                &HashSet::new(),
+                &types,
+                &by_leaf
+            ),
+            None
+        );
+        // Lowercase receiver = an instance variable (`msg.system()`), not a type.
+        assert_eq!(
+            resolve_java_method_call(
+                "com::hireflow360::api::ai::msg::system",
+                &HashSet::new(),
+                &types,
+                &by_leaf
+            ),
+            None
+        );
+        // Resolved nested type, but the method isn't a known internal fn → no edge.
+        assert_eq!(
+            resolve_java_method_call(
+                "com::hireflow360::api::ai::Message::nope",
+                &HashSet::new(),
+                &types,
+                &by_leaf
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn java_nested_method_ambiguous_stays_extern() {
+        // Two nested classes both named `Message`, each under an internal outer →
+        // ambiguous receiver, must not guess. Leave it extern.
+        let types: HashSet<String> = [
+            "com::hireflow360::api::ai::AiClient".to_string(),
+            "com::hireflow360::api::ai::AiClient::Message".to_string(),
+            "com::hireflow360::api::chat::ChatClient".to_string(),
+            "com::hireflow360::api::chat::ChatClient::Message".to_string(),
+        ]
+        .into();
+        let fns: HashSet<String> = [
+            "com::hireflow360::api::ai::AiClient::Message::system".to_string(),
+            "com::hireflow360::api::chat::ChatClient::Message::system".to_string(),
+        ]
+        .into();
+        let by_leaf = type_leaf_index(&types);
+        assert_eq!(
+            resolve_java_method_call(
+                "com::hireflow360::api::ai::Message::system",
+                &fns,
+                &types,
+                &by_leaf
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn java_top_level_type_method_not_redirected() {
+        // A top-level class `Foo` (outer prefix is a package, not an internal type)
+        // is excluded from the nested filter — a missed cross-package static call is
+        // the alias map's job, not this redirect's.
+        let types: HashSet<String> = ["com::hireflow360::api::util::Foo".to_string()].into();
+        let fns: HashSet<String> = ["com::hireflow360::api::util::Foo::bar".to_string()].into();
+        let by_leaf = type_leaf_index(&types);
+        assert_eq!(
+            resolve_java_method_call(
+                "com::hireflow360::api::other::Foo::bar",
+                &fns,
+                &types,
+                &by_leaf
+            ),
             None
         );
     }
