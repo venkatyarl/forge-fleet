@@ -1439,11 +1439,18 @@ pub fn is_test_symbol(qualified_name: &str, file: Option<&str>) -> bool {
 /// macro — `assert_eq!(foo(), …)` — are not parsed into call edges, so a
 /// macro-only-tested Rust fn reads as uncovered; Java/TS/Python method calls
 /// resolve directly).
+///
+/// `min_confidence` filters the traversed `calls` edges by their resolution-
+/// confidence tier (roadmap #5; see [`callers`]): `0.0` keeps every edge (full
+/// recall — the default), `1.0` keeps only EXTRACTED edges so the result is the
+/// stricter "tests that *provably* reach this symbol via a directly-resolved call
+/// chain", dropping coverage that only exists through a heuristic redirect.
 pub async fn tests_for(
     pool: &PgPool,
     corpus_slug: &str,
     sel: &str,
     max_depth: usize,
+    min_confidence: f32,
 ) -> Result<Vec<TestHit>> {
     let seed = resolve_symbol(pool, corpus_slug, sel).await?;
     if seed.is_empty() {
@@ -1466,9 +1473,11 @@ pub async fn tests_for(
                  FROM brain_vault_edges e
                  JOIN brain_vault_nodes n ON n.id = e.src_id
                 WHERE e.edge_type = 'calls' AND e.dst_id = ANY($1)
+                  AND e.confidence >= $2
                   AND n.node_type = 'code:function'"#,
         )
         .bind(&frontier)
+        .bind(min_confidence)
         .fetch_all(pool)
         .await?;
         let mut next: Vec<Uuid> = Vec::new();
