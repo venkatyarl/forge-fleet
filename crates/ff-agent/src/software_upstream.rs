@@ -142,7 +142,7 @@ impl UpstreamChecker {
             let query_result = if method == "self_built" {
                 query_self_built(&self.pg, &id).await
             } else {
-                query_upstream(&http, &method, &version_source, github_token.as_deref()).await
+                query_upstream(http, &method, &version_source, github_token.as_deref()).await
             };
 
             match query_result {
@@ -406,6 +406,68 @@ async fn query_upstream(
     }
 }
 
+/// How many times to attempt a GitHub API GET before giving up.
+const GITHUB_GET_ATTEMPTS: usize = 3;
+
+/// Whether a GitHub API HTTP status is worth retrying. `403` is how GitHub
+/// signals primary/secondary rate limits, `429` is too-many-requests, and any
+/// `5xx` is server-side — all transient. Other `4xx` (e.g. `404` for a missing
+/// repo/branch) are permanent and must not be retried.
+fn github_status_is_transient(code: u16) -> bool {
+    code == 403 || code == 429 || (500..=599).contains(&code)
+}
+
+/// GET a GitHub API URL (with auth header + bounded retry) and return the
+/// parsed JSON body. Retries only *transient* failures — a network/timeout
+/// error or a [`github_status_is_transient`] status — with a short exponential
+/// backoff; permanent errors (404, malformed JSON) fail immediately.
+///
+/// Without this, a single flaky response left the row's `latest_version` stale
+/// until the next 6h pass. Because the fleet self-builds and rolls to a new SHA
+/// far faster than that, the converged fleet then read as `drift` against an
+/// older recorded LATEST in `ff fleet versions` — observed live when `ff_git`
+/// errored one pass and stuck a release behind while `forgefleetd_git` advanced.
+async fn github_get_json(
+    http: &reqwest::Client,
+    url: &str,
+    token: Option<&str>,
+) -> Result<JsonValue, String> {
+    let mut last_err = String::new();
+    for attempt in 0..GITHUB_GET_ATTEMPTS {
+        if attempt > 0 {
+            // 400ms, 800ms, … — bounded so a pass never stalls for long.
+            let backoff = Duration::from_millis(400u64 << (attempt - 1));
+            tokio::time::sleep(backoff).await;
+        }
+        let mut req = http
+            .get(url)
+            .header("Accept", "application/vnd.github+json");
+        if let Some(t) = token
+            && !t.is_empty()
+        {
+            req = req.header("Authorization", format!("Bearer {t}"));
+        }
+        match req.send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_success() {
+                    return resp
+                        .json()
+                        .await
+                        .map_err(|e| format!("parse JSON from {url}: {e}"));
+                }
+                last_err = format!("GET {url}: HTTP {status}");
+                if !github_status_is_transient(status.as_u16()) {
+                    return Err(last_err);
+                }
+            }
+            // Network / timeout — always transient.
+            Err(e) => last_err = format!("GET {url}: {e}"),
+        }
+    }
+    Err(format!("{last_err} (after {GITHUB_GET_ATTEMPTS} attempts)"))
+}
+
 /// Fetch the latest release tag for a GitHub repo (`owner/name`).
 /// Strips a leading `v` from the tag so `"v2.64.0"` → `"2.64.0"`.
 async fn fetch_github_latest(
@@ -414,25 +476,7 @@ async fn fetch_github_latest(
     token: Option<&str>,
 ) -> Result<String, String> {
     let url = format!("https://api.github.com/repos/{repo}/releases/latest");
-    let mut req = http
-        .get(&url)
-        .header("Accept", "application/vnd.github+json");
-    if let Some(t) = token
-        && !t.is_empty()
-    {
-        req = req.header("Authorization", format!("Bearer {t}"));
-    }
-    let resp = req.send().await.map_err(|e| format!("GET {url}: {e}"))?;
-
-    if !resp.status().is_success() {
-        return Err(format!("GET {url}: HTTP {}", resp.status()));
-    }
-
-    let body: JsonValue = resp
-        .json()
-        .await
-        .map_err(|e| format!("parse JSON from {url}: {e}"))?;
-
+    let body = github_get_json(http, &url, token).await?;
     let tag = body
         .get("tag_name")
         .and_then(|v| v.as_str())
@@ -450,22 +494,7 @@ async fn fetch_github_branch_head(
     token: Option<&str>,
 ) -> Result<String, String> {
     let url = format!("https://api.github.com/repos/{repo}/branches/{branch}");
-    let mut req = http
-        .get(&url)
-        .header("Accept", "application/vnd.github+json");
-    if let Some(t) = token
-        && !t.is_empty()
-    {
-        req = req.header("Authorization", format!("Bearer {t}"));
-    }
-    let resp = req.send().await.map_err(|e| format!("GET {url}: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("GET {url}: HTTP {}", resp.status()));
-    }
-    let body: JsonValue = resp
-        .json()
-        .await
-        .map_err(|e| format!("parse JSON from {url}: {e}"))?;
+    let body = github_get_json(http, &url, token).await?;
     let sha = body
         .pointer("/commit/sha")
         .and_then(|v| v.as_str())
@@ -555,5 +584,20 @@ mod tests {
         // Do not strip "v" when the rest looks like a name.
         assert_eq!(strip_v_prefix("vintage-release"), "vintage-release");
         assert_eq!(strip_v_prefix(""), "");
+    }
+
+    #[test]
+    fn github_transient_status_classification() {
+        // Rate limit (403), too-many-requests (429), and any 5xx are retryable.
+        assert!(github_status_is_transient(403));
+        assert!(github_status_is_transient(429));
+        assert!(github_status_is_transient(500));
+        assert!(github_status_is_transient(502));
+        assert!(github_status_is_transient(599));
+        // Success + permanent client errors must NOT be retried.
+        assert!(!github_status_is_transient(200));
+        assert!(!github_status_is_transient(404));
+        assert!(!github_status_is_transient(401));
+        assert!(!github_status_is_transient(422));
     }
 }

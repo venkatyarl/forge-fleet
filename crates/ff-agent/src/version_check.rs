@@ -92,6 +92,15 @@ pub async fn collect_current() -> BTreeMap<String, String> {
 pub async fn fetch_latest(client: &reqwest::Client, keys: &[&str]) -> BTreeMap<String, String> {
     use futures::stream::{FuturesUnordered, StreamExt};
 
+    // Collect into `out` up front so results drained mid-loop to honour the
+    // concurrency cap are KEPT, not discarded. The old code drained the oldest
+    // future into a `return_also` no-op once >4 were in flight, silently
+    // dropping that key's `latest` for any pass with >4 keys (always — there are
+    // ~13). Which key got dropped was nondeterministic (whichever completed as
+    // the buffer filled), so the per-node `fleet_workers.tooling` drift map this
+    // feeds would intermittently miss a tool's upstream `latest`, blinding the
+    // tooling-drift view to a real update.
+    let mut out = BTreeMap::new();
     let mut futs: FuturesUnordered<_> = FuturesUnordered::new();
     for key in keys {
         let client = client.clone();
@@ -111,23 +120,20 @@ pub async fn fetch_latest(client: &reqwest::Client, keys: &[&str]) -> BTreeMap<S
             };
             (key, val)
         });
+        // Cap in-flight requests at 4: once a 5th is queued, await the oldest.
         if futs.len() >= 4
             && let Some((k, v)) = futs.next().await
             && let Some(v) = v
         {
-            return_also(&k, &v);
+            out.insert(k, v);
         }
     }
-    let mut out = BTreeMap::new();
     while let Some((k, v)) = futs.next().await {
         if let Some(v) = v {
             out.insert(k, v);
         }
     }
     out
-}
-
-fn return_also(_k: &str, _v: &str) { /* helper hook for tracing; noop */
 }
 
 /// Full roundtrip: merge current + latest, write to fleet_workers.tooling.
