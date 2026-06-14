@@ -845,6 +845,12 @@ pub struct SymbolRef {
     pub id: Uuid,
     pub qualified_name: String,
     pub node_type: String,
+    /// Absolute path of the owning `content:file` node (None for extern/import
+    /// placeholders that no file contains, or seed-resolution refs that aren't
+    /// rendered). Resolved by [`resolve_ref_files`] at the public-query boundary.
+    pub file: Option<String>,
+    /// 1-based start line (None for pre-V124 nodes or non-spanning placeholders).
+    pub start_line: Option<i32>,
 }
 
 /// Uniform "the symbol you asked about does not exist in this corpus" message,
@@ -884,8 +890,23 @@ async fn resolve_symbol(pool: &PgPool, corpus_slug: &str, sel: &str) -> Result<V
             id: r.get("id"),
             qualified_name: r.get("title"),
             node_type: r.get("node_type"),
+            file: None,
+            start_line: None,
         })
         .collect())
+}
+
+/// Fill each ref's owning `content:file` path (the same `contains`-walk as
+/// [`resolve_hit_files`], for the relationship verbs). `start_line` is already
+/// populated from the node row; this adds `file` so `callers`/`callees`/`impact`
+/// output is directly actionable (`file:line`) without a second `find`/`show`.
+async fn resolve_ref_files(pool: &PgPool, refs: &mut [SymbolRef]) -> Result<()> {
+    let ids: Vec<Uuid> = refs.iter().map(|r| r.id).collect();
+    let by_leaf = owning_files(pool, &ids).await?;
+    for r in refs.iter_mut() {
+        r.file = by_leaf.get(&r.id).cloned();
+    }
+    Ok(())
 }
 
 /// Direct callers of a set of symbol node ids: nodes with a `calls` edge whose
@@ -897,7 +918,7 @@ async fn callers_of_ids(pool: &PgPool, ids: &[Uuid]) -> Result<Vec<SymbolRef>> {
         return Ok(Vec::new());
     }
     let rows = sqlx::query(
-        r#"SELECT DISTINCT n.id, n.title, n.node_type
+        r#"SELECT DISTINCT n.id, n.title, n.node_type, n.start_line
              FROM brain_vault_edges e
              JOIN brain_vault_nodes n ON n.id = e.src_id
             WHERE e.edge_type = 'calls' AND e.dst_id = ANY($1)
@@ -912,6 +933,8 @@ async fn callers_of_ids(pool: &PgPool, ids: &[Uuid]) -> Result<Vec<SymbolRef>> {
             id: r.get("id"),
             qualified_name: r.get("title"),
             node_type: r.get("node_type"),
+            file: None,
+            start_line: r.get("start_line"),
         })
         .collect())
 }
@@ -923,7 +946,9 @@ pub async fn callers(pool: &PgPool, corpus_slug: &str, sel: &str) -> Result<Vec<
         return Err(no_symbol_error(sel, corpus_slug));
     }
     let ids: Vec<Uuid> = targets.iter().map(|t| t.id).collect();
-    callers_of_ids(pool, &ids).await
+    let mut out = callers_of_ids(pool, &ids).await?;
+    resolve_ref_files(pool, &mut out).await?;
+    Ok(out)
 }
 
 /// Callees of a symbol: nodes a `calls` edge points to from the symbol.
@@ -934,7 +959,7 @@ pub async fn callees(pool: &PgPool, corpus_slug: &str, sel: &str) -> Result<Vec<
     }
     let ids: Vec<Uuid> = srcs.iter().map(|t| t.id).collect();
     let rows = sqlx::query(
-        r#"SELECT DISTINCT n.id, n.title, n.node_type
+        r#"SELECT DISTINCT n.id, n.title, n.node_type, n.start_line
              FROM brain_vault_edges e
              JOIN brain_vault_nodes n ON n.id = e.dst_id
             WHERE e.edge_type = 'calls' AND e.src_id = ANY($1)
@@ -943,14 +968,18 @@ pub async fn callees(pool: &PgPool, corpus_slug: &str, sel: &str) -> Result<Vec<
     .bind(&ids)
     .fetch_all(pool)
     .await?;
-    Ok(rows
+    let mut out: Vec<SymbolRef> = rows
         .into_iter()
         .map(|r| SymbolRef {
             id: r.get("id"),
             qualified_name: r.get("title"),
             node_type: r.get("node_type"),
+            file: None,
+            start_line: r.get("start_line"),
         })
-        .collect())
+        .collect();
+    resolve_ref_files(pool, &mut out).await?;
+    Ok(out)
 }
 
 /// Transitive caller closure up to `max_depth` (impact / blast radius).
@@ -965,7 +994,9 @@ pub async fn impact(
         return Err(no_symbol_error(sel, corpus_slug));
     }
     let seed_ids: Vec<Uuid> = seed.iter().map(|s| s.id).collect();
-    impact_of_ids(pool, &seed_ids, max_depth).await
+    let mut out = impact_of_ids(pool, &seed_ids, max_depth).await?;
+    resolve_ref_files(pool, &mut out).await?;
+    Ok(out)
 }
 
 /// Transitive caller closure of a set of seed node ids (the seeds themselves are
@@ -984,7 +1015,7 @@ async fn impact_of_ids(
             break;
         }
         let rows = sqlx::query(
-            r#"SELECT DISTINCT n.id, n.title, n.node_type
+            r#"SELECT DISTINCT n.id, n.title, n.node_type, n.start_line
                  FROM brain_vault_edges e
                  JOIN brain_vault_nodes n ON n.id = e.src_id
                 WHERE e.edge_type = 'calls' AND e.dst_id = ANY($1)"#,
@@ -1000,6 +1031,8 @@ async fn impact_of_ids(
                     id,
                     qualified_name: r.get("title"),
                     node_type: r.get("node_type"),
+                    file: None,
+                    start_line: r.get("start_line"),
                 });
                 next.push(id);
             }
@@ -1026,6 +1059,8 @@ pub struct TestHit {
     pub qualified_name: String,
     /// Absolute path of the owning test file.
     pub file: Option<String>,
+    /// 1-based start line of the test (None for pre-V124 nodes).
+    pub start_line: Option<i32>,
     /// Call-graph distance from the target: 1 = the test calls it directly, 2 =
     /// the test calls something that calls it, … Lower = stronger coverage.
     pub depth: usize,
@@ -1126,13 +1161,13 @@ pub async fn tests_for(
     // first reached (its shortest call distance from the seed).
     let mut frontier: Vec<Uuid> = seed_ids.clone();
     let mut seen: HashSet<Uuid> = frontier.iter().copied().collect();
-    let mut callers: Vec<(Uuid, String, usize)> = Vec::new();
+    let mut callers: Vec<(Uuid, String, Option<i32>, usize)> = Vec::new();
     for depth in 1..=max_depth {
         if frontier.is_empty() {
             break;
         }
         let rows = sqlx::query(
-            r#"SELECT DISTINCT n.id, n.title
+            r#"SELECT DISTINCT n.id, n.title, n.start_line
                  FROM brain_vault_edges e
                  JOIN brain_vault_nodes n ON n.id = e.src_id
                 WHERE e.edge_type = 'calls' AND e.dst_id = ANY($1)
@@ -1145,7 +1180,7 @@ pub async fn tests_for(
         for r in rows {
             let id: Uuid = r.get("id");
             if seen.insert(id) {
-                callers.push((id, r.get("title"), depth));
+                callers.push((id, r.get("title"), r.get("start_line"), depth));
                 next.push(id);
             }
         }
@@ -1153,17 +1188,18 @@ pub async fn tests_for(
     }
 
     // Resolve owning files once, then keep only the test callers.
-    let ids: Vec<Uuid> = callers.iter().map(|(id, _, _)| *id).collect();
+    let ids: Vec<Uuid> = callers.iter().map(|(id, _, _, _)| *id).collect();
     let files = owning_files(pool, &ids).await?;
     let mut out: Vec<TestHit> = callers
         .into_iter()
-        .filter_map(|(id, qn, depth)| {
+        .filter_map(|(id, qn, start_line, depth)| {
             let file = files.get(&id).cloned();
             if is_test_symbol(&qn, file.as_deref()) {
                 Some(TestHit {
                     id,
                     qualified_name: qn,
                     file,
+                    start_line,
                     depth,
                 })
             } else {
@@ -1976,6 +2012,8 @@ async fn symbols_in_file(pool: &PgPool, file_id: Uuid) -> Result<Vec<FileSymbol>
                 id: r.get("id"),
                 qualified_name: r.get("title"),
                 node_type: r.get("node_type"),
+                file: None,
+                start_line: r.get("start_line"),
             },
             start_line: r.get("start_line"),
             end_line: r.get("end_line"),

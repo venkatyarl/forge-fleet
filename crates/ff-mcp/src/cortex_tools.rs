@@ -56,6 +56,8 @@ fn symbols_json(symbols: &[ff_brain::SymbolRef]) -> Vec<Value> {
             json!({
                 "qualified_name": s.qualified_name,
                 "node_type": s.node_type,
+                "file": s.file,
+                "start_line": s.start_line,
                 "id": s.id.to_string(),
             })
         })
@@ -325,6 +327,7 @@ pub async fn cortex_tests(params: Option<Value>) -> HandlerResult {
             json!({
                 "qualified_name": t.qualified_name,
                 "file": t.file,
+                "start_line": t.start_line,
                 "depth": t.depth,
             })
         })
