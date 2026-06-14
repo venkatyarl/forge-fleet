@@ -736,14 +736,18 @@ async fn load_internal_fns(pool: &PgPool, corpus_slug: &str) -> Result<HashSet<S
     Ok(titles.into_iter().collect())
 }
 
-/// Every internal TYPE qualified-name (struct / enum / impl) in the corpus, so
-/// the inherent-impl method redirect ([`resolve_impl_method_call`]) can tell a
-/// real `module::Type` apart from a genuine module path. Same role for types as
-/// [`load_internal_fns`] plays for functions on an incremental reindex.
+/// Every internal TYPE qualified-name (struct / enum / impl + Java/TS
+/// class / interface) in the corpus, so the inherent-impl method redirect
+/// ([`resolve_impl_method_call`]) and the Java constructor redirect
+/// ([`resolve_java_ctor_call`]) can tell a real `module::Type` apart from a
+/// genuine module path. Same role for types as [`load_internal_fns`] plays for
+/// functions on an incremental reindex.
 async fn load_internal_types(pool: &PgPool, corpus_slug: &str) -> Result<HashSet<String>> {
     let titles: Vec<String> = sqlx::query_scalar(
         "SELECT title FROM brain_vault_nodes
-           WHERE project = $1 AND node_type IN ('code:struct', 'code:enum', 'code:impl')",
+           WHERE project = $1
+             AND node_type IN ('code:struct', 'code:enum', 'code:impl',
+                               'code:class', 'code:interface')",
     )
     .bind(corpus_slug)
     .fetch_all(pool)
@@ -892,7 +896,10 @@ async fn extract_files(
             stats.symbols += 1;
             if sym.node_type == "code:function" {
                 internal_fns.insert(sym.qualified_name.clone());
-            } else if matches!(sym.node_type, "code:struct" | "code:enum" | "code:impl") {
+            } else if matches!(
+                sym.node_type,
+                "code:struct" | "code:enum" | "code:impl" | "code:class" | "code:interface"
+            ) {
                 internal_types.insert(sym.qualified_name.clone());
             }
 
@@ -1061,10 +1068,28 @@ async fn extract_files(
                 }
             }
 
+            // Java constructor redirect: `new Foo()` lands on the extern
+            // `<module>::Foo::Foo` when Foo has no explicit constructor symbol.
+            // Point the instantiation edge at the class node instead. The target
+            // is a TYPE (not a fn), so it's accepted by the callee lookup only via
+            // this flag — internal_fns membership stays the fn-only test.
+            let mut ctor_type_target = false;
+            if p.parse.lang == Lang::Java && !internal_fns.contains(&resolved) {
+                if let Some(t) = resolve_java_ctor_call(&resolved, internal_types) {
+                    resolved = t;
+                    ctor_type_target = true;
+                }
+            }
+
             // Find the callee node: internal real fn if known, else code:extern.
+            // A Java constructor redirect resolves to an internal class/interface
+            // node (a type, not a fn), so accept it via ctor_type_target.
             let callee_path = format!("code://{corpus_slug}/{resolved}");
-            let callee_id = if internal_fns.contains(&resolved) {
-                // Internal fn: it has a real code:function node somewhere.
+            let callee_id = if internal_fns.contains(&resolved)
+                || (ctor_type_target && internal_types.contains(&resolved))
+            {
+                // Internal fn (or a redirected constructor's class node): it has a
+                // real code:* node somewhere.
                 lookup_code_node(pool, &callee_path).await?
             } else {
                 None
@@ -4516,6 +4541,41 @@ fn resolve_self_method_call(resolved: &str, internal_fns: &HashSet<String>) -> O
     internal_fns.contains(&target).then_some(target)
 }
 
+/// Java constructor redirect. `collect_java_calls` records `new Foo(...)` as a
+/// call to `Foo::Foo` (the constructor leaf duplicates the type), which
+/// `resolve_call_dotty` then prefixes to `<module>::Foo::Foo`. When the class has
+/// an explicit constructor that whole path is a real `code:function` and resolves
+/// directly; but the common case is a class with only the implicit/default
+/// constructor — there is no `<module>::Foo::Foo` symbol, so the call fragments
+/// onto a per-class extern (`AiClient::AiClient`, `SecurityConfig::SecurityConfig`
+/// — flagged by `ff cortex doctor`) and the class node gets no instantiation
+/// edge. All the other recall levers are Rust-only, so Java internal-resolution
+/// sits far lower (≈18%) with zero heuristic redirects.
+///
+/// When the resolved path has the constructor shape `<P>::<Type>::<Type>` (the
+/// trailing two segments identical) and `<P>::<Type>` is a known internal type,
+/// redirect the edge onto the class node `<P>::<Type>`. Semantically the edge
+/// then reads "this code instantiates `<Type>`", so `cortex callers <Type>`
+/// surfaces instantiation sites. Redirect-only: the target type must already
+/// exist in the corpus, so it never fabricates an edge; and it fires only when no
+/// explicit-constructor fn matched (gated by `!internal_fns.contains` at the call
+/// site), so a real constructor symbol always wins. A method named identically to
+/// its own class is illegal Java, so the `::Type::Type` shape is unambiguously a
+/// constructor.
+fn resolve_java_ctor_call(resolved: &str, internal_types: &HashSet<String>) -> Option<String> {
+    let (parent_type, leaf) = resolved.rsplit_once("::")?;
+    let type_seg = parent_type
+        .rsplit_once("::")
+        .map(|(_, t)| t)
+        .unwrap_or(parent_type);
+    if leaf != type_seg {
+        return None;
+    }
+    internal_types
+        .contains(parent_type)
+        .then(|| parent_type.to_string())
+}
+
 /// Crate-root single-candidate redirect (lever #7). A bare call to a fn in a
 /// sibling submodule that the alias map missed (`use crate::communities::*;`, an
 /// inline `mod`, a re-export not modeled as `pub use`) falls through
@@ -5687,6 +5747,37 @@ diff --git a/src/b.rs b/src/b.rs
         let fns: HashSet<String> = ["ff_pulse::peer_map::is_fresh".to_string()].into();
         assert_eq!(
             resolve_self_method_call("ff_pulse::peer_map::is_fresh", &fns),
+            None
+        );
+    }
+
+    #[test]
+    fn java_ctor_redirects_to_class_node() {
+        // `new AiClient(...)` is recorded as `AiClient::AiClient` and resolved to
+        // the extern `com::hireflow360::api::ai::AiClient::AiClient` (no explicit
+        // constructor symbol). Redirect onto the class node so instantiation sites
+        // show up under `cortex callers AiClient`.
+        let types: HashSet<String> = ["com::hireflow360::api::ai::AiClient".to_string()].into();
+        assert_eq!(
+            resolve_java_ctor_call("com::hireflow360::api::ai::AiClient::AiClient", &types),
+            Some("com::hireflow360::api::ai::AiClient".to_string())
+        );
+    }
+
+    #[test]
+    fn java_ctor_redirect_never_fabricates() {
+        // Class not internal (a JDK/3rd-party type, e.g. `new ArrayList()`) → keep
+        // the extern, invent nothing.
+        let empty: HashSet<String> = HashSet::new();
+        assert_eq!(
+            resolve_java_ctor_call("java::util::ArrayList::ArrayList", &empty),
+            None
+        );
+        // Not the `::Type::Type` constructor shape (a normal method call) → ignored
+        // even when the type is internal.
+        let types: HashSet<String> = ["com::hireflow360::api::ai::AiClient".to_string()].into();
+        assert_eq!(
+            resolve_java_ctor_call("com::hireflow360::api::ai::AiClient::send", &types),
             None
         );
     }
