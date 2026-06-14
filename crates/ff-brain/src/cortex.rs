@@ -1153,7 +1153,11 @@ async fn resolve_ref_files(pool: &PgPool, refs: &mut [SymbolRef]) -> Result<()> 
 /// dst is one of the ids. Querying by id (not by name selector) is exact — no
 /// bare-leaf ambiguity — which matters for review, where the ids come straight
 /// from a file's `contains` subtree.
-async fn callers_of_ids(pool: &PgPool, ids: &[Uuid]) -> Result<Vec<SymbolRef>> {
+async fn callers_of_ids(
+    pool: &PgPool,
+    ids: &[Uuid],
+    min_confidence: f32,
+) -> Result<Vec<SymbolRef>> {
     if ids.is_empty() {
         return Ok(Vec::new());
     }
@@ -1162,9 +1166,11 @@ async fn callers_of_ids(pool: &PgPool, ids: &[Uuid]) -> Result<Vec<SymbolRef>> {
              FROM brain_vault_edges e
              JOIN brain_vault_nodes n ON n.id = e.src_id
             WHERE e.edge_type = 'calls' AND e.dst_id = ANY($1)
+              AND e.confidence >= $2
             ORDER BY n.title"#,
     )
     .bind(ids)
+    .bind(min_confidence)
     .fetch_all(pool)
     .await?;
     Ok(rows
@@ -1180,19 +1186,36 @@ async fn callers_of_ids(pool: &PgPool, ids: &[Uuid]) -> Result<Vec<SymbolRef>> {
 }
 
 /// Callers of a symbol: nodes with a `calls` edge whose dst is the symbol.
-pub async fn callers(pool: &PgPool, corpus_slug: &str, sel: &str) -> Result<Vec<SymbolRef>> {
+///
+/// `min_confidence` filters the traversed `calls` edges by their resolution-
+/// confidence tier (roadmap #5): `0.0` keeps every edge, `1.0` keeps only
+/// EXTRACTED edges (primary resolver named a real internal symbol), `0.6` adds
+/// INFERRED (heuristic redirect). A high-precision consumer passes `1.0` to drop
+/// the ~40% of edges that come from heuristic redirects.
+pub async fn callers(
+    pool: &PgPool,
+    corpus_slug: &str,
+    sel: &str,
+    min_confidence: f32,
+) -> Result<Vec<SymbolRef>> {
     let targets = resolve_symbol(pool, corpus_slug, sel).await?;
     if targets.is_empty() {
         return Err(no_symbol_error(sel, corpus_slug));
     }
     let ids: Vec<Uuid> = targets.iter().map(|t| t.id).collect();
-    let mut out = callers_of_ids(pool, &ids).await?;
+    let mut out = callers_of_ids(pool, &ids, min_confidence).await?;
     resolve_ref_files(pool, &mut out).await?;
     Ok(out)
 }
 
 /// Callees of a symbol: nodes a `calls` edge points to from the symbol.
-pub async fn callees(pool: &PgPool, corpus_slug: &str, sel: &str) -> Result<Vec<SymbolRef>> {
+/// `min_confidence` filters edges by tier — see [`callers`].
+pub async fn callees(
+    pool: &PgPool,
+    corpus_slug: &str,
+    sel: &str,
+    min_confidence: f32,
+) -> Result<Vec<SymbolRef>> {
     let srcs = resolve_symbol(pool, corpus_slug, sel).await?;
     if srcs.is_empty() {
         return Err(no_symbol_error(sel, corpus_slug));
@@ -1203,9 +1226,11 @@ pub async fn callees(pool: &PgPool, corpus_slug: &str, sel: &str) -> Result<Vec<
              FROM brain_vault_edges e
              JOIN brain_vault_nodes n ON n.id = e.dst_id
             WHERE e.edge_type = 'calls' AND e.src_id = ANY($1)
+              AND e.confidence >= $2
             ORDER BY n.title"#,
     )
     .bind(&ids)
+    .bind(min_confidence)
     .fetch_all(pool)
     .await?;
     let mut out: Vec<SymbolRef> = rows
@@ -1228,23 +1253,26 @@ pub async fn impact(
     corpus_slug: &str,
     sel: &str,
     max_depth: usize,
+    min_confidence: f32,
 ) -> Result<Vec<SymbolRef>> {
     let seed = resolve_symbol(pool, corpus_slug, sel).await?;
     if seed.is_empty() {
         return Err(no_symbol_error(sel, corpus_slug));
     }
     let seed_ids: Vec<Uuid> = seed.iter().map(|s| s.id).collect();
-    let mut out = impact_of_ids(pool, &seed_ids, max_depth).await?;
+    let mut out = impact_of_ids(pool, &seed_ids, max_depth, min_confidence).await?;
     resolve_ref_files(pool, &mut out).await?;
     Ok(out)
 }
 
 /// Transitive caller closure of a set of seed node ids (the seeds themselves are
 /// excluded from the result). Shared by [`impact`] and the review pass.
+/// `min_confidence` filters traversed `calls` edges by tier — see [`callers`].
 async fn impact_of_ids(
     pool: &PgPool,
     seed_ids: &[Uuid],
     max_depth: usize,
+    min_confidence: f32,
 ) -> Result<Vec<SymbolRef>> {
     let mut frontier: Vec<Uuid> = seed_ids.to_vec();
     let mut seen: HashSet<Uuid> = frontier.iter().copied().collect();
@@ -1258,9 +1286,11 @@ async fn impact_of_ids(
             r#"SELECT DISTINCT n.id, n.title, n.node_type, n.start_line
                  FROM brain_vault_edges e
                  JOIN brain_vault_nodes n ON n.id = e.src_id
-                WHERE e.edge_type = 'calls' AND e.dst_id = ANY($1)"#,
+                WHERE e.edge_type = 'calls' AND e.dst_id = ANY($1)
+                  AND e.confidence >= $2"#,
         )
         .bind(&frontier)
+        .bind(min_confidence)
         .fetch_all(pool)
         .await?;
         let mut next: Vec<Uuid> = Vec::new();
@@ -2567,8 +2597,9 @@ pub async fn review(
             // Only callable symbols accrue `calls`-edge fan-in; structs/impls
             // are listed with zero metrics so the diff is fully accounted for.
             let (direct, blast) = if s.node_type == "code:function" {
-                let direct = callers_of_ids(pool, &[s.id]).await?;
-                let blast = impact_of_ids(pool, &[s.id], depth).await?;
+                // Review wants the FULL blast radius — no confidence filter (0.0).
+                let direct = callers_of_ids(pool, &[s.id], 0.0).await?;
+                let blast = impact_of_ids(pool, &[s.id], depth, 0.0).await?;
                 (direct, blast)
             } else {
                 (Vec::new(), Vec::new())

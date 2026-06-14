@@ -315,16 +315,30 @@ pub async fn cortex_outline(params: Option<Value>) -> HandlerResult {
     }
 }
 
+/// Extract the optional `min_confidence` edge-tier filter (roadmap #5): clamps to
+/// [0.0, 1.0], default 0.0 (traverse every `calls` edge). 1.0 = EXTRACTED only
+/// (high-trust), 0.6 = +INFERRED.
+fn min_confidence_param(params: &Option<Value>) -> f32 {
+    params
+        .as_ref()
+        .and_then(|p| p.get("min_confidence"))
+        .and_then(|v| v.as_f64())
+        .map(|c| c.clamp(0.0, 1.0) as f32)
+        .unwrap_or(0.0)
+}
+
 /// Callers of a code symbol (who calls it).
 pub async fn cortex_callers(params: Option<Value>) -> HandlerResult {
     let (corpus_slug, symbol) = corpus_and_symbol(&params)?;
+    let min_confidence = min_confidence_param(&params);
     let pool = get_pool().await?;
-    let rows = callers(&pool, &corpus_slug, &symbol)
+    let rows = callers(&pool, &corpus_slug, &symbol, min_confidence)
         .await
         .map_err(|e| format!("callers: {e}"))?;
     Ok(json!({
         "corpus": corpus_slug,
         "symbol": symbol,
+        "min_confidence": min_confidence,
         "count": rows.len(),
         "callers": symbols_json(&rows),
     }))
@@ -333,13 +347,15 @@ pub async fn cortex_callers(params: Option<Value>) -> HandlerResult {
 /// Callees of a code symbol (what it calls).
 pub async fn cortex_callees(params: Option<Value>) -> HandlerResult {
     let (corpus_slug, symbol) = corpus_and_symbol(&params)?;
+    let min_confidence = min_confidence_param(&params);
     let pool = get_pool().await?;
-    let rows = callees(&pool, &corpus_slug, &symbol)
+    let rows = callees(&pool, &corpus_slug, &symbol, min_confidence)
         .await
         .map_err(|e| format!("callees: {e}"))?;
     Ok(json!({
         "corpus": corpus_slug,
         "symbol": symbol,
+        "min_confidence": min_confidence,
         "count": rows.len(),
         "callees": symbols_json(&rows),
     }))
@@ -348,6 +364,7 @@ pub async fn cortex_callees(params: Option<Value>) -> HandlerResult {
 /// Transitive caller closure / blast radius of a code symbol.
 pub async fn cortex_impact(params: Option<Value>) -> HandlerResult {
     let (corpus_slug, symbol) = corpus_and_symbol(&params)?;
+    let min_confidence = min_confidence_param(&params);
     let max_depth = params
         .as_ref()
         .and_then(|p| p.get("max_depth"))
@@ -355,13 +372,14 @@ pub async fn cortex_impact(params: Option<Value>) -> HandlerResult {
         .map(|d| d.clamp(1, 20) as usize)
         .unwrap_or(5);
     let pool = get_pool().await?;
-    let rows = impact(&pool, &corpus_slug, &symbol, max_depth)
+    let rows = impact(&pool, &corpus_slug, &symbol, max_depth, min_confidence)
         .await
         .map_err(|e| format!("impact: {e}"))?;
     Ok(json!({
         "corpus": corpus_slug,
         "symbol": symbol,
         "max_depth": max_depth,
+        "min_confidence": min_confidence,
         "count": rows.len(),
         "impacted": symbols_json(&rows),
     }))
