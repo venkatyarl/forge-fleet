@@ -1891,9 +1891,11 @@ pub async fn explain_community(
     }
     let chosen = &hits[pick_show_match(&hits, query)];
 
-    // The chosen symbol's community (assigned by `detect_communities`).
+    // The chosen symbol's CODE community (assigned by `detect_code_communities`
+    // — label propagation over the `calls` subgraph, not the brain-KG
+    // connected-components `community_id`).
     let community_id: Option<i32> =
-        sqlx::query_scalar("SELECT community_id FROM brain_vault_nodes WHERE id = $1")
+        sqlx::query_scalar("SELECT code_community_id FROM brain_vault_nodes WHERE id = $1")
             .bind(chosen.id)
             .fetch_optional(pool)
             .await?
@@ -1913,13 +1915,13 @@ pub async fn explain_community(
     };
 
     // The registry row, located via the god node (which carries the same
-    // community_id). Community detection is global, so we match on community_id,
+    // code_community_id). Detection is global, so we match on code_community_id,
     // not corpus.
     let reg = sqlx::query(
         r#"SELECT bc.summary, bc.summary_model, bc.member_count, gn.title AS god_title
-             FROM brain_communities bc
+             FROM brain_code_communities bc
              JOIN brain_vault_nodes gn ON gn.id = bc.god_node_id
-            WHERE gn.community_id = $1 AND gn.valid_until IS NULL
+            WHERE gn.code_community_id = $1 AND gn.valid_until IS NULL
             LIMIT 1"#,
     )
     .bind(cid)
@@ -1944,7 +1946,7 @@ pub async fn explain_community(
                   (SELECT count(*) FROM brain_vault_edges e
                     WHERE e.edge_type = 'calls' AND e.dst_id = n.id) AS fan_in
              FROM brain_vault_nodes n
-            WHERE n.community_id = $1
+            WHERE n.code_community_id = $1
               AND n.valid_until IS NULL
               AND n.node_type LIKE 'code:%'
               AND n.node_type <> 'code:extern'

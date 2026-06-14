@@ -8494,3 +8494,44 @@ ALTER TABLE brain_communities DROP CONSTRAINT IF EXISTS brain_communities_god_no
 ALTER TABLE brain_communities ADD CONSTRAINT brain_communities_god_node_id_fkey
     FOREIGN KEY (god_node_id) REFERENCES brain_vault_nodes(id) ON DELETE SET NULL;
 "#;
+
+/// V127: a CODE-SCOPED community registry, parallel to `brain_communities`.
+///
+/// `detect_communities` (the brain-KG clusterer) is union-find connected
+/// components over ALL `brain_vault_edges` — `contains` (corpus→file→symbol) and
+/// `imports` structurally bridge nearly the entire code graph into ONE
+/// mega-component (measured live: 44,993 nodes), whose summary is garbage. That's
+/// correct for the brain KG (where `contains`/`link` ARE the structure) but
+/// useless for Cortex's "explain this subsystem" answers.
+///
+/// The fix (cortex roadmap #4 blocker) is a SEPARATE clustering — label
+/// propagation over the `calls` subgraph among non-extern `code:*` nodes — which
+/// *subdivides* the connected graph instead of merging it. Its output can't share
+/// `community_id`/`brain_communities` (the brain KG still wants the
+/// connected-components view for `ff brain communities`/`stats`), so this adds a
+/// parallel column + registry:
+///   - `brain_vault_nodes.code_community_id` — the code cluster a symbol belongs
+///     to (NULL for non-code / extern / never-called-internally nodes).
+///   - `brain_code_communities` — mirror of `brain_communities` (stable
+///     `member_hash`, advisory `god_node_id`, reserved `summary*` columns) so the
+///     existing summarize pass + `ff cortex explain` repoint here with no further
+///     migration. `god_node_id` is ON DELETE SET NULL for the same reindex-GC
+///     reason as V126.
+pub const SCHEMA_V127_CORTEX_CODE_COMMUNITIES: &str = r#"
+ALTER TABLE brain_vault_nodes ADD COLUMN IF NOT EXISTS code_community_id INT;
+CREATE INDEX IF NOT EXISTS idx_vault_nodes_code_community
+    ON brain_vault_nodes(code_community_id) WHERE code_community_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS brain_code_communities (
+    id                 SERIAL PRIMARY KEY,
+    member_hash        TEXT,
+    god_node_id        UUID REFERENCES brain_vault_nodes(id) ON DELETE SET NULL,
+    member_count       INT NOT NULL DEFAULT 0,
+    summary            TEXT,
+    summary_model      TEXT,
+    summary_updated_at TIMESTAMPTZ,
+    updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_brain_code_communities_member_hash
+    ON brain_code_communities (member_hash);
+"#;
