@@ -860,6 +860,15 @@ async fn extract_files(
             if p.parse.lang == Lang::Rust && !internal_fns.contains(&resolved) {
                 if let Some(m) = resolve_impl_method_call(&resolved, internal_fns, internal_types) {
                     resolved = m;
+                } else if let Some(m) = resolve_glob_impl_method_call(
+                    &resolved,
+                    &p.parse,
+                    &caller_qn,
+                    internal_fns,
+                    internal_types,
+                ) {
+                    // lever #2b: `Type::method()` in a `use super::*` test module.
+                    resolved = m;
                 }
             }
 
@@ -3862,6 +3871,55 @@ fn resolve_impl_method_call(
     internal_fns.contains(&target).then_some(target)
 }
 
+/// Glob-imported inherent-impl method redirect (lever #2b). When a `Type::method()`
+/// associated call appears inside a `mod tests { use super::*; }` block,
+/// `resolve_call` fabricates `<tests_module>::Type::method` (uppercase head →
+/// same-module type), so the owning type segment carries the *test* submodule
+/// instead of the type's real module. [`resolve_impl_method_call`] then can't fire
+/// because `<tests_module>::Type` isn't a known internal type. Re-anchor the type
+/// segment through the file's glob imports (the same mechanism as
+/// [`resolve_glob_call`]): for each `use <prefix>::*`, resolve `<prefix>` relative
+/// to the caller's module; if `<base>::Type` is a known internal type AND
+/// `<base>::method` a known internal fn, redirect there. Redirect-only — both must
+/// already exist, so it never fabricates. Conservatively gated to the
+/// `<caller_module>::Type::leaf` shape the resolver itself fabricated; a genuine
+/// cross-module path is left to the direct redirect.
+fn resolve_glob_impl_method_call(
+    resolved: &str,
+    fp: &FileParse,
+    caller_qn: &str,
+    internal_fns: &HashSet<String>,
+    internal_types: &HashSet<String>,
+) -> Option<String> {
+    if fp.lang != Lang::Rust || fp.glob_imports.is_empty() {
+        return None;
+    }
+    // Split `<P>::<Type>::<leaf>`.
+    let (parent_type, leaf) = resolved.rsplit_once("::")?;
+    let (module, type_seg) = parent_type.rsplit_once("::")?;
+    // Only re-anchor a type the resolver fabricated into the caller's own module
+    // (`<caller_module>::<Type>::<leaf>`).
+    let caller_module = caller_qn
+        .rsplit_once("::")
+        .map(|(m, _)| m)
+        .unwrap_or(fp.module.as_str());
+    if module != caller_module {
+        return None;
+    }
+    for prefix in &fp.glob_imports {
+        if let Some(base) = resolve_glob_prefix(prefix, caller_module) {
+            let cand_type = join(&base, type_seg);
+            if internal_types.contains(&cand_type) {
+                let target = join(&base, leaf);
+                if internal_fns.contains(&target) {
+                    return Some(target);
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Resolve a `use`-alias target that may carry an unresolved relative prefix
 /// (`use super::truncate_output;` → alias `truncate_output` → stored target
 /// `super::truncate_output`). Only `crate::` is rewritten to an absolute path at
@@ -4638,6 +4696,76 @@ diff --git a/src/b.rs b/src/b.rs
         let f2: HashSet<String> = ["ok".to_string()].into();
         assert_eq!(
             resolve_impl_method_call("AgentToolResult::ok", &f2, &t2),
+            None
+        );
+    }
+
+    #[test]
+    fn glob_impl_method_redirects_type_via_super_import() {
+        // lever #2b: `mod tests { use super::*; }` then `NodeRegistry::new()` in a
+        // test. resolve_call fabricates `<tests_module>::NodeRegistry::new`
+        // (uppercase head → same-module type), so the direct redirect can't see the
+        // real type. The glob-aware redirect re-anchors the type segment through
+        // `use super::*` onto the parent module, then collapses to the flattened
+        // method.
+        let mut fp = fp_with("ff_agent::registry", "ff_agent", &[]);
+        fp.glob_imports = vec!["super".to_string()];
+        let caller = "ff_agent::registry::tests::builds_registry";
+        let types: HashSet<String> = ["ff_agent::registry::NodeRegistry".to_string()].into();
+        let fns: HashSet<String> = ["ff_agent::registry::new".to_string()].into();
+        assert_eq!(
+            resolve_glob_impl_method_call(
+                "ff_agent::registry::tests::NodeRegistry::new",
+                &fp,
+                caller,
+                &fns,
+                &types,
+            ),
+            Some("ff_agent::registry::new".to_string())
+        );
+    }
+
+    #[test]
+    fn glob_impl_method_redirect_never_fabricates() {
+        let mut fp = fp_with("ff_agent::registry", "ff_agent", &[]);
+        fp.glob_imports = vec!["super".to_string()];
+        let caller = "ff_agent::registry::tests::builds_registry";
+        // Type re-anchors but the method doesn't exist in the parent module → no edge.
+        let types: HashSet<String> = ["ff_agent::registry::NodeRegistry".to_string()].into();
+        let no_fns: HashSet<String> = HashSet::new();
+        assert_eq!(
+            resolve_glob_impl_method_call(
+                "ff_agent::registry::tests::NodeRegistry::new",
+                &fp,
+                caller,
+                &no_fns,
+                &types,
+            ),
+            None
+        );
+        // No glob imports → nothing to re-anchor.
+        let plain = fp_with("ff_agent::registry", "ff_agent", &[]);
+        let fns: HashSet<String> = ["ff_agent::registry::new".to_string()].into();
+        assert_eq!(
+            resolve_glob_impl_method_call(
+                "ff_agent::registry::tests::NodeRegistry::new",
+                &plain,
+                caller,
+                &fns,
+                &types,
+            ),
+            None
+        );
+        // The fabricated module must match the caller's module (only re-anchor what
+        // resolve_call fabricated into the caller's own namespace).
+        assert_eq!(
+            resolve_glob_impl_method_call(
+                "other::module::NodeRegistry::new",
+                &fp,
+                caller,
+                &fns,
+                &types,
+            ),
             None
         );
     }
