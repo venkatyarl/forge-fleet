@@ -38,9 +38,9 @@ pub use community_summary::{
 };
 pub use context::{BrainMessage, ContextBundle, ResolvedNode, select_context};
 pub use cortex::{
-    CortexStats, FileOutline, OutlineEntry, SymbolHit, SymbolRef, SymbolSource, TestHit, callees,
-    callers, find_symbols, find_symbols_semantic, impact, index, outline_file, show_symbol,
-    tests_for,
+    CommunityExplanation, CommunityMember, CortexStats, FileOutline, OutlineEntry, SymbolHit,
+    SymbolRef, SymbolSource, TestHit, callees, callers, explain_community, find_symbols,
+    find_symbols_semantic, impact, index, outline_file, show_symbol, tests_for,
 };
 pub use cortex_embed::{EmbedStats, embed_cortex_nodes, spawn_embed_refresh_loop};
 pub use embeddings::{

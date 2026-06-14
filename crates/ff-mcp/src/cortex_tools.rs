@@ -205,6 +205,66 @@ pub async fn cortex_show(params: Option<Value>) -> HandlerResult {
     }
 }
 
+/// Explain the subsystem a symbol belongs to — resolve it to its code-graph
+/// community and return that community's natural-language summary (from
+/// `ff cortex summarize`) plus its highest-fan-in members. The GraphRAG
+/// "what is this cluster responsible for?" answer in one call, so an agent can
+/// orient on a subsystem without reading every file in it.
+pub async fn cortex_explain(params: Option<Value>) -> HandlerResult {
+    let corpus_slug = params
+        .as_ref()
+        .and_then(|p| p.get("corpus"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            "missing required parameter: corpus (the indexed repo slug; \
+             list them with cortex_corpora)"
+                .to_string()
+        })?
+        .to_string();
+    let symbol = params
+        .as_ref()
+        .and_then(|p| p.get("symbol"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required parameter: symbol".to_string())?
+        .to_string();
+    let kind = params
+        .as_ref()
+        .and_then(|p| p.get("kind"))
+        .and_then(|v| v.as_str());
+    let members = params
+        .as_ref()
+        .and_then(|p| p.get("members"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(15);
+    let pool = get_pool().await?;
+    let found = ff_brain::explain_community(&pool, &corpus_slug, &symbol, kind, members)
+        .await
+        .map_err(|e| format!("explain: {e}"))?;
+    match found {
+        None => Ok(json!({
+            "corpus": corpus_slug,
+            "symbol": symbol,
+            "found": false,
+        })),
+        Some(e) => Ok(json!({
+            "corpus": corpus_slug,
+            "found": true,
+            "resolved_symbol": e.resolved_symbol,
+            "resolved_node_type": e.resolved_node_type,
+            "community_id": e.community_id,
+            "member_count": e.member_count,
+            "summary": e.summary,
+            "summary_model": e.summary_model,
+            "god_symbol": e.god_symbol,
+            "members": e.members.iter().map(|m| json!({
+                "symbol": m.qualified_name,
+                "node_type": m.node_type,
+                "fan_in": m.fan_in,
+            })).collect::<Vec<_>>(),
+        })),
+    }
+}
+
 /// Outline a file — every code symbol it defines (kind / line span / fan-in) in
 /// source order. A file-level table of contents so an agent can orient in an
 /// unknown file from the graph instead of reading the whole file.

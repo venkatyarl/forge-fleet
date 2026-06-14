@@ -112,6 +112,7 @@ impl ToolRegistry {
         self.register(Self::cortex_corpora());
         self.register(Self::cortex_find());
         self.register(Self::cortex_show());
+        self.register(Self::cortex_explain());
         self.register(Self::cortex_outline());
         self.register(Self::cortex_callers());
         self.register(Self::cortex_callees());
@@ -914,6 +915,36 @@ impl ToolRegistry {
         }
     }
 
+    fn cortex_explain() -> ToolDefinition {
+        ToolDefinition {
+            name: "cortex_explain".to_string(),
+            description: "Cortex code graph: EXPLAIN the subsystem a symbol belongs to — resolve a symbol to its code-graph community (the cluster of densely-connected symbols it lives in) and return that community's natural-language summary plus its highest-fan-in members. The GraphRAG 'what is this cluster responsible for?' answer in one call, so you can orient on a subsystem without reading every file in it. Symbol resolves like cortex_show (exact qualified → exact leaf → top fan-in). summary is null until `ff cortex summarize` has covered the community; community_id is null until the graph is community-detected (`ff cortex embed`).".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "corpus": {
+                        "type": "string",
+                        "description": "Indexed repo slug (see cortex_corpora), e.g. 'forge-fleet'"
+                    },
+                    "symbol": {
+                        "type": "string",
+                        "description": "Code symbol — bare leaf ('load_model') or qualified ('ff_agent::model_runtime::load_model'), case-insensitive. The community is whichever cluster owns it."
+                    },
+                    "kind": {
+                        "type": "string",
+                        "description": "Narrow symbol resolution to one node-type class: function, struct, enum, trait, impl, mod, class, interface, or 'type'. Default: all code symbols."
+                    },
+                    "members": {
+                        "type": "integer",
+                        "description": "How many of the community's top members (by fan-in) to return (1-200, default 15).",
+                        "default": 15
+                    }
+                },
+                "required": ["corpus", "symbol"]
+            }),
+        }
+    }
+
     fn cortex_outline() -> ToolDefinition {
         ToolDefinition {
             name: "cortex_outline".to_string(),
@@ -1393,6 +1424,7 @@ mod tests {
             "cortex_corpora",
             "cortex_find",
             "cortex_show",
+            "cortex_explain",
             "cortex_outline",
             "cortex_callers",
             "cortex_callees",

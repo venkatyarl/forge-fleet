@@ -1828,6 +1828,165 @@ pub async fn show_symbol(
     }))
 }
 
+// ─── Community explanation (`ff cortex explain`) ─────────────────────────────
+//
+// The consumer side of cortex roadmap #4. `ff cortex summarize` writes one
+// natural-language summary per code-graph community (the Leiden / connected-
+// component cluster a symbol lives in) onto `brain_communities`, but nothing
+// read those summaries back — they were write-only. `explain_community` resolves
+// a symbol (or any name) to the community it belongs to and returns that
+// community's stored summary plus its highest-fan-in members: the GraphRAG
+// "what is this subsystem responsible for?" answer, in one token-cheap call,
+// so an agent can orient on a cluster without reading every file in it.
+
+/// One member symbol of a community, for [`CommunityExplanation`].
+#[derive(Debug, Clone)]
+pub struct CommunityMember {
+    pub qualified_name: String,
+    pub node_type: String,
+    pub fan_in: i64,
+}
+
+/// The community a symbol belongs to + its stored summary, from
+/// [`explain_community`].
+#[derive(Debug, Clone)]
+pub struct CommunityExplanation {
+    /// The symbol the query actually resolved to (so the caller can confirm the
+    /// match before trusting the rest).
+    pub resolved_symbol: String,
+    pub resolved_node_type: String,
+    /// The global community id, or `None` when the graph hasn't been community-
+    /// detected yet (the fix is `ff cortex embed`).
+    pub community_id: Option<i32>,
+    /// Whole-community member count from the registry (spans corpora); falls back
+    /// to the in-corpus members actually pulled when no registry row exists.
+    pub member_count: i64,
+    /// The fleet-LLM summary, present once `ff cortex summarize` has covered this
+    /// community. `None` means the cluster exists but hasn't been summarized.
+    pub summary: Option<String>,
+    pub summary_model: Option<String>,
+    /// The representative (highest-degree) member — the community's "god node".
+    pub god_symbol: Option<String>,
+    /// Highest-fan-in members in this corpus (the cluster's call-graph surface),
+    /// capped by `member_limit`.
+    pub members: Vec<CommunityMember>,
+}
+
+/// Resolve `query` to a code symbol, then return the community it belongs to plus
+/// that community's stored summary and top members. Resolution mirrors
+/// [`show_symbol`] (exact qualified → exact leaf, highest fan-in → top hit).
+/// Returns `Ok(None)` only when nothing matched the query at all; a matched
+/// symbol with no community / no summary yet returns `Ok(Some(..))` with the
+/// relevant field `None` so the caller can guide the user to the right command.
+pub async fn explain_community(
+    pool: &PgPool,
+    corpus_slug: &str,
+    query: &str,
+    kind: Option<&str>,
+    member_limit: i64,
+) -> Result<Option<CommunityExplanation>> {
+    let hits = find_symbols(pool, corpus_slug, query, 50, kind).await?;
+    if hits.is_empty() {
+        return Ok(None);
+    }
+    let chosen = &hits[pick_show_match(&hits, query)];
+
+    // The chosen symbol's community (assigned by `detect_communities`).
+    let community_id: Option<i32> =
+        sqlx::query_scalar("SELECT community_id FROM brain_vault_nodes WHERE id = $1")
+            .bind(chosen.id)
+            .fetch_optional(pool)
+            .await?
+            .flatten();
+
+    let Some(cid) = community_id else {
+        return Ok(Some(CommunityExplanation {
+            resolved_symbol: chosen.qualified_name.clone(),
+            resolved_node_type: chosen.node_type.clone(),
+            community_id: None,
+            member_count: 0,
+            summary: None,
+            summary_model: None,
+            god_symbol: None,
+            members: Vec::new(),
+        }));
+    };
+
+    // The registry row, located via the god node (which carries the same
+    // community_id). Community detection is global, so we match on community_id,
+    // not corpus.
+    let reg = sqlx::query(
+        r#"SELECT bc.summary, bc.summary_model, bc.member_count, gn.title AS god_title
+             FROM brain_communities bc
+             JOIN brain_vault_nodes gn ON gn.id = bc.god_node_id
+            WHERE gn.community_id = $1 AND gn.valid_until IS NULL
+            LIMIT 1"#,
+    )
+    .bind(cid)
+    .fetch_optional(pool)
+    .await?;
+
+    let (summary, summary_model, reg_member_count, god_symbol) = match reg {
+        Some(r) => (
+            r.get::<Option<String>, _>("summary"),
+            r.get::<Option<String>, _>("summary_model"),
+            r.get::<i32, _>("member_count") as i64,
+            Some(r.get::<String, _>("god_title")),
+        ),
+        None => (None, None, 0i64, None),
+    };
+
+    // Top members of this community within the queried corpus, by call-graph
+    // fan-in (the same fan_in subquery `find_symbols` uses).
+    let member_limit = member_limit.clamp(1, 200);
+    let member_rows = sqlx::query(
+        r#"SELECT n.title, n.node_type,
+                  (SELECT count(*) FROM brain_vault_edges e
+                    WHERE e.edge_type = 'calls' AND e.dst_id = n.id) AS fan_in
+             FROM brain_vault_nodes n
+            WHERE n.community_id = $1
+              AND n.valid_until IS NULL
+              AND n.node_type LIKE 'code:%'
+              AND n.node_type <> 'code:extern'
+              AND n.project = $2
+            ORDER BY fan_in DESC, n.title COLLATE "C"
+            LIMIT $3"#,
+    )
+    .bind(cid)
+    .bind(corpus_slug)
+    .bind(member_limit)
+    .fetch_all(pool)
+    .await?;
+
+    let members: Vec<CommunityMember> = member_rows
+        .into_iter()
+        .map(|r| CommunityMember {
+            qualified_name: r.get("title"),
+            node_type: r.get("node_type"),
+            fan_in: r.get("fan_in"),
+        })
+        .collect();
+
+    // Registry count covers the whole (possibly cross-corpus) community; fall
+    // back to what we pulled when the registry has no row yet.
+    let member_count = if reg_member_count > 0 {
+        reg_member_count
+    } else {
+        members.len() as i64
+    };
+
+    Ok(Some(CommunityExplanation {
+        resolved_symbol: chosen.qualified_name.clone(),
+        resolved_node_type: chosen.node_type.clone(),
+        community_id: Some(cid),
+        member_count,
+        summary,
+        summary_model,
+        god_symbol,
+        members,
+    }))
+}
+
 // ─── File outline (`ff cortex outline`) ──────────────────────────────────────
 //
 // A file-level table of contents: every code symbol a file defines, in source

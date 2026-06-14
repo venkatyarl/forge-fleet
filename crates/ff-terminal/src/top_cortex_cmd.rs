@@ -245,6 +245,28 @@ pub enum TopCortexCommand {
         #[arg(long, default_value = "table")]
         format: String,
     },
+    /// Explain the subsystem a symbol belongs to: resolve a symbol (or any name)
+    /// to its code-graph community and print that community's natural-language
+    /// summary (from `ff cortex summarize`) plus its highest-fan-in members. The
+    /// consumer side of the community summaries (roadmap #4) — the GraphRAG
+    /// "what is this cluster responsible for?" answer in one token-cheap call,
+    /// so an agent can orient on a subsystem without reading every file in it.
+    /// Corpus defaults to the cwd's slug.
+    Explain {
+        /// Symbol name (qualified or leaf, case-insensitive) — resolved the same
+        /// way as `cortex show`. The community is whichever cluster owns it.
+        symbol: String,
+        #[arg(long)]
+        corpus: Option<String>,
+        /// Narrow symbol resolution to one node-type class (see `find --kind`).
+        #[arg(long)]
+        kind: Option<String>,
+        /// How many of the community's top members (by fan-in) to list.
+        #[arg(long, default_value_t = 15)]
+        members: i64,
+        #[arg(long, default_value = "table")]
+        format: String,
+    },
     /// Manage the git post-commit hook that re-indexes after every commit.
     Hook {
         #[command(subcommand)]
@@ -623,8 +645,128 @@ pub async fn handle_top_cortex(args: TopCortexArgs) -> Result<()> {
             let corpus = corpus.unwrap_or_else(cwd_slug);
             run_doctor(&pool, &corpus, limit, &format).await?;
         }
+        TopCortexCommand::Explain {
+            symbol,
+            corpus,
+            kind,
+            members,
+            format,
+        } => {
+            let corpus = corpus.unwrap_or_else(cwd_slug);
+            let found =
+                cortex::explain_community(&pool, &corpus, &symbol, kind.as_deref(), members)
+                    .await?;
+            print_explanation(found.as_ref(), &format, &symbol, &corpus);
+            if found.is_none() {
+                // No symbol matched at all — exit non-zero like show/find/outline.
+                std::process::exit(1);
+            }
+        }
     }
     Ok(())
+}
+
+/// `ff cortex explain` renderer. `table` is the human view (resolved symbol →
+/// community summary → top members); `json` is the machine view for agents.
+fn print_explanation(
+    found: Option<&cortex::CommunityExplanation>,
+    format: &str,
+    query: &str,
+    corpus: &str,
+) {
+    let Some(e) = found else {
+        if format == "json" {
+            println!(
+                "{}",
+                serde_json::json!({"query": query, "corpus": corpus, "found": false})
+            );
+        } else {
+            println!(
+                "{YELLOW}no symbol matching '{query}' in corpus '{corpus}'{RESET} — \
+                 try `ff cortex find {query}` or index this repo with `ff cortex index`"
+            );
+        }
+        return;
+    };
+
+    if format == "json" {
+        let members: Vec<_> = e
+            .members
+            .iter()
+            .map(|m| {
+                serde_json::json!({
+                    "symbol": m.qualified_name,
+                    "node_type": m.node_type,
+                    "fan_in": m.fan_in,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({
+                "query": query,
+                "corpus": corpus,
+                "found": true,
+                "resolved_symbol": e.resolved_symbol,
+                "resolved_node_type": e.resolved_node_type,
+                "community_id": e.community_id,
+                "member_count": e.member_count,
+                "summary": e.summary,
+                "summary_model": e.summary_model,
+                "god_symbol": e.god_symbol,
+                "members": members,
+            })
+        );
+        return;
+    }
+
+    println!(
+        "{CYAN}{}{RESET}  {}",
+        e.resolved_symbol,
+        e.resolved_node_type.strip_prefix("code:").unwrap_or("")
+    );
+    let Some(cid) = e.community_id else {
+        println!(
+            "{YELLOW}this symbol has no community yet{RESET} — run `ff cortex embed` to \
+             detect communities, then `ff cortex summarize`"
+        );
+        return;
+    };
+    print!(
+        "{GREEN}community #{cid}{RESET}  ({} members",
+        e.member_count
+    );
+    if let Some(g) = &e.god_symbol {
+        print!(", core: {g}");
+    }
+    println!(")");
+
+    match &e.summary {
+        Some(s) => {
+            if let Some(m) = &e.summary_model {
+                println!("{CYAN}summary{RESET} ({m}):");
+            } else {
+                println!("{CYAN}summary{RESET}:");
+            }
+            println!("  {}", s.replace('\n', "\n  "));
+        }
+        None => println!(
+            "{YELLOW}no summary yet{RESET} — run `ff cortex summarize` to generate one for \
+             this community"
+        ),
+    }
+
+    if !e.members.is_empty() {
+        println!("{CYAN}top members{RESET} (by fan-in):");
+        for m in &e.members {
+            println!(
+                "  {:>5}  {}  {}",
+                m.fan_in,
+                m.node_type.strip_prefix("code:").unwrap_or(&m.node_type),
+                m.qualified_name
+            );
+        }
+    }
 }
 
 /// `ff cortex doctor` — print the call-graph resolution rate plus the ranked
