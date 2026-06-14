@@ -1033,6 +1033,60 @@ fn resolve_root_slug(path: Option<String>, slug: Option<String>) -> Result<(Path
     Ok((root, slug))
 }
 
+/// Heuristic: is this error a transient DB/pool blip worth retrying, vs. a
+/// real content/logic error? The non-code lobes wrap `sqlx::Error` in
+/// `anyhow` (often with `.context()`), so try a downcast first, then fall
+/// back to string-matching the rendered chain. Conservative by design —
+/// an unrecognized error is NOT retried (we only want to paper over the
+/// `pool timed out` / `got 0 bytes at EOF` connection hiccups that #274
+/// surfaced, never a genuinely bad document).
+fn is_transient_db_err(e: &anyhow::Error) -> bool {
+    if let Some(sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed | sqlx::Error::Io(_)) =
+        e.downcast_ref::<sqlx::Error>()
+    {
+        return true;
+    }
+    let s = format!("{e:#}").to_lowercase();
+    s.contains("pool timed out")
+        || s.contains("pooltimedout")
+        || s.contains("got 0 bytes")
+        || s.contains("connection reset")
+        || s.contains("connection closed")
+        || s.contains("connection refused")
+        || s.contains("broken pipe")
+        || s.contains("error returned from the pool")
+}
+
+/// Run a best-effort lobe, retrying on a transient DB blip with short
+/// exponential backoff. The non-code lobes (docs/data/images) are idempotent
+/// on re-run — incremental skip + upsert — so re-running one that died on a
+/// pool timeout is safe and self-heals instead of leaving that slice of the
+/// graph stale. A non-transient error (bad content, missing corpus) fails fast
+/// on the first attempt, unchanged.
+async fn lobe_with_db_retry<T, F, Fut>(label: &str, mut op: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        match op().await {
+            Ok(v) => return Ok(v),
+            Err(e) if attempt < MAX_ATTEMPTS && is_transient_db_err(&e) => {
+                let backoff_ms = 250u64 * 2u64.pow(attempt - 1); // 250ms, 500ms
+                eprintln!(
+                    "  {label}: transient DB error (attempt {attempt}/{MAX_ATTEMPTS}), \
+                     retrying in {backoff_ms}ms: {e}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// Core index routine shared by `ff cortex index` and `ff cortex watch`.
 /// Create-or-reuse the corpus, auto-detect language(s), index each.
 /// `verbose` controls the human-readable banner output.
@@ -1169,7 +1223,11 @@ async fn run_index(
 
     // STEP 1 of multi-domain Cortex: also index DOCUMENTS (.md/.txt/...) for this
     // root. Best-effort — a doc-index error must never fail the whole index.
-    match ff_brain::doc_index::index_docs(pool, slug, root, incremental).await {
+    match lobe_with_db_retry("docs", || {
+        ff_brain::doc_index::index_docs(pool, slug, root, incremental)
+    })
+    .await
+    {
         Ok(doc_stats) => {
             total_files += doc_stats.files;
             total_symbols += doc_stats.sections;
@@ -1194,7 +1252,11 @@ async fn run_index(
 
     // STEP 2 of multi-domain Cortex: also index structured/financial DATA
     // (.csv/.tsv) for this root. Best-effort — never fails the whole index.
-    match ff_brain::data_index::index_data(pool, slug, root, incremental).await {
+    match lobe_with_db_retry("data", || {
+        ff_brain::data_index::index_data(pool, slug, root, incremental)
+    })
+    .await
+    {
         Ok(data_stats) => {
             total_files += data_stats.files;
             total_symbols += data_stats.columns;
@@ -1220,7 +1282,11 @@ async fn run_index(
     // STEP 3 of multi-domain Cortex: also index IMAGES (.png/.jpg/...) for this
     // root, with a bounded best-effort vision caption/tag pass. Best-effort —
     // an image-index error must never fail the whole index.
-    match ff_brain::image_index::index_images(pool, slug, root, incremental).await {
+    match lobe_with_db_retry("images", || {
+        ff_brain::image_index::index_images(pool, slug, root, incremental)
+    })
+    .await
+    {
         Ok(image_stats) => {
             total_files += image_stats.files;
             total_symbols += image_stats.tags;
@@ -1681,4 +1747,84 @@ fn is_watchable(p: &Path) -> bool {
         .and_then(|e| e.to_str())
         .map(|ext| cortex::ext_lang(ext).is_some())
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[test]
+    fn transient_db_errors_are_retryable() {
+        // sqlx pool-timeout (downcast path).
+        assert!(is_transient_db_err(&anyhow::Error::new(
+            sqlx::Error::PoolTimedOut
+        )));
+        assert!(is_transient_db_err(&anyhow::Error::new(
+            sqlx::Error::PoolClosed
+        )));
+        // The exact wire-EOF shape #274 saw, wrapped in context (string path).
+        let wrapped = anyhow::anyhow!("expected to read 5 bytes, got 0 bytes at EOF")
+            .context("indexing docs lobe");
+        assert!(is_transient_db_err(&wrapped));
+        assert!(is_transient_db_err(&anyhow::anyhow!(
+            "pool timed out while waiting"
+        )));
+        assert!(is_transient_db_err(&anyhow::anyhow!(
+            "connection reset by peer"
+        )));
+    }
+
+    #[test]
+    fn content_errors_are_not_retryable() {
+        // A real logic/content error must fail fast, not loop the lobe.
+        assert!(!is_transient_db_err(&anyhow::anyhow!(
+            "no corpus with slug 'whatever'"
+        )));
+        assert!(!is_transient_db_err(&anyhow::anyhow!(
+            "failed to parse markdown heading"
+        )));
+    }
+
+    #[tokio::test]
+    async fn retry_recovers_after_transient_then_succeeds() {
+        let calls = AtomicU32::new(0);
+        let out: Result<u32> = lobe_with_db_retry("docs", || {
+            let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
+            async move {
+                if n < 2 {
+                    Err(anyhow::anyhow!("pool timed out"))
+                } else {
+                    Ok(n)
+                }
+            }
+        })
+        .await;
+        assert_eq!(out.unwrap(), 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn retry_gives_up_after_max_attempts() {
+        let calls = AtomicU32::new(0);
+        let out: Result<u32> = lobe_with_db_retry("docs", || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async move { Err::<u32, _>(anyhow::anyhow!("pool timed out")) }
+        })
+        .await;
+        assert!(out.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 3); // MAX_ATTEMPTS
+    }
+
+    #[tokio::test]
+    async fn non_transient_error_fails_without_retry() {
+        let calls = AtomicU32::new(0);
+        let out: Result<u32> = lobe_with_db_retry("docs", || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async move { Err::<u32, _>(anyhow::anyhow!("no corpus with slug 'x'")) }
+        })
+        .await;
+        assert!(out.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1); // failed fast, no retry
+    }
 }
