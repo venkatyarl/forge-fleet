@@ -2180,8 +2180,11 @@ mod wave_playbook_tests {
         assert!(
             body.contains("> $HOME/.forgefleet/logs/fleet-upgrade-wave-build.log 2>&1 </dev/null")
         );
-        // The git network step is bounded so a hung fetch fails fast (no leak).
-        assert!(body.contains("GIT_SSH_COMMAND='ssh -o BatchMode=yes -o ConnectTimeout=30"));
+        // The git network step is bounded so a hung fetch fails fast (no leak),
+        // and bypasses a wedged inherited ssh-agent on headless Linux peers.
+        assert!(body.contains(
+            "GIT_SSH_COMMAND='ssh -o IdentityAgent=none -o BatchMode=yes -o ConnectTimeout=30"
+        ));
         assert!(body.contains("GIT_HTTP_LOW_SPEED_LIMIT=1000"));
         // It's inside the FD-isolated build block (before the playbook), so it
         // only affects this command group, not the trailing status line.
