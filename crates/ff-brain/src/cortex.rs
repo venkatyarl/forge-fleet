@@ -3736,7 +3736,11 @@ fn resolve_call_inner(
                 // looks like a crate (matches our crate name) keep as-is; if it
                 // matches a known top-level (has more than one segment AND looks
                 // external) keep as-is; otherwise treat as caller-module-relative.
-                if head == crate_name || segs.len() >= 3 || looks_external(head) {
+                if head == crate_name
+                    || segs.len() >= 3
+                    || looks_external(head)
+                    || is_std_prelude_type(head)
+                {
                     norm_crate(raw, crate_name)
                 } else {
                     join(&caller_module, raw)
@@ -3850,6 +3854,50 @@ fn looks_external(head: &str) -> bool {
             | "redis"
             | "tree_sitter"
             | "tree_sitter_rust"
+    )
+}
+
+/// Bare std-prelude TYPES used as an associated-call receiver: `Vec::new`,
+/// `Arc::new`, `HashMap::with_capacity`, etc. The `other` head here is uppercase
+/// and not in the alias map, so resolve_call_inner's fallback would treat it as a
+/// same-module type and fabricate `<caller_module>::Vec::new` — a wrong,
+/// internally-rooted extern that pollutes the caller's namespace and inflates its
+/// extern fan-in (the `ff cortex doctor` diagnostic surfaced this as a top noise
+/// source). These names are part of the Rust prelude / std and are essentially
+/// never shadowed by a local type, so keep the call as-written (it becomes a
+/// shared `Vec::new` extern, not a per-module phantom). If a project DID define
+/// its own `Vec`, the call merely stays an extern instead of mis-attributing to
+/// an internal symbol — same conservative failure mode, never worse.
+fn is_std_prelude_type(head: &str) -> bool {
+    matches!(
+        head,
+        // collections
+        "Vec" | "HashMap"
+            | "HashSet"
+            | "BTreeMap"
+            | "BTreeSet"
+            | "VecDeque"
+            | "BinaryHeap"
+            | "LinkedList"
+            // smart pointers / cells
+            | "Box"
+            | "Rc"
+            | "Arc"
+            | "Cow"
+            | "Cell"
+            | "RefCell"
+            | "Mutex"
+            | "RwLock"
+            // strings / paths
+            | "String"
+            | "PathBuf"
+            | "Path"
+            | "OsString"
+            | "CString"
+            // time / misc std
+            | "Duration"
+            | "Instant"
+            | "SystemTime"
     )
 }
 
@@ -4451,6 +4499,29 @@ diff --git a/src/b.rs b/src/b.rs
                 &fp
             ),
             "ff_agent::research::strip_think_blocks"
+        );
+    }
+
+    #[test]
+    fn std_prelude_types_are_not_caller_module_rooted() {
+        // `Vec::new()` / `Arc::new()` etc. written bare: the head is uppercase and
+        // unaliased, so the old fallback fabricated `<caller_module>::Vec::new`.
+        // They must stay as written (a shared std extern), not get our module glued
+        // on. Regression for the `ff cortex doctor` internally-rooted-extern noise.
+        let fp = fp_with("ff_brain::cortex", "ff_brain", &[]);
+        let caller = "ff_brain::cortex::run_index";
+        assert_eq!(resolve_call("Vec::new", caller, &fp), "Vec::new");
+        assert_eq!(resolve_call("Arc::new", caller, &fp), "Arc::new");
+        assert_eq!(
+            resolve_call("HashMap::with_capacity", caller, &fp),
+            "HashMap::with_capacity"
+        );
+        assert_eq!(resolve_call("PathBuf::from", caller, &fp), "PathBuf::from");
+        // A genuine same-module type (not a std prelude name) still resolves
+        // caller-module-relative — the guard is narrow, not a blanket uppercase rule.
+        assert_eq!(
+            resolve_call("MyLocalType::new", caller, &fp),
+            "ff_brain::cortex::MyLocalType::new"
         );
     }
 
