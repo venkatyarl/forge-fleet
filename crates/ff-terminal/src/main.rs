@@ -314,6 +314,15 @@ enum Command {
         backend: String,
         #[arg(long = "backend-args")]
         backend_args: Vec<String>,
+        /// Disable auto-detection of deliverable paths from the prompt. By
+        /// default, when no explicit `--verify-files` are given, ff scans the
+        /// prompt for file paths (e.g. `write foo.rs`) and verifies they exist
+        /// + are non-empty before declaring success — closing the silent
+        /// false-positive gap. Pass this for tasks whose output isn't a file
+        /// (analysis, fleet commands) so auto-detected paths don't cause
+        /// spurious retries.
+        #[arg(long = "no-auto-verify")]
+        no_auto_verify: bool,
     },
     /// Fleet-parallel research — decomposes a query into N sub-questions,
     /// dispatches each to a different fleet LLM in parallel, and synthesizes
@@ -4122,7 +4131,30 @@ async fn main() -> Result<()> {
             allowed_tools,
             backend,
             backend_args,
+            no_auto_verify,
         }) => {
+            // Auto-detect deliverable paths from the prompt when the caller
+            // passed no explicit --verify-files. Closes the silent
+            // false-positive gap (feedback_ff_supervise_verify_deliverable.md):
+            // neither the autopilot loop nor humans reliably pass --verify-files,
+            // so "write foo.rs" tasks accepted "done" without the artifact.
+            let mut verify_files = verify_files;
+            if verify_files.is_empty() && !no_auto_verify {
+                let detected = ff_agent::supervisor::extract_prompt_paths(&prompt);
+                if !detected.is_empty() {
+                    eprintln!(
+                        "\x1b[2m  Auto-verifying {} deliverable(s) detected in prompt \
+                         (--no-auto-verify to disable): {}{RESET}",
+                        detected.len(),
+                        detected
+                            .iter()
+                            .map(|p| p.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                    verify_files = detected;
+                }
+            }
             // Layer-2 supervised: vendor CLI per attempt, ff still owns
             // failure-detect-and-retry. Implementation delegates to
             // cli_executor.rs and stat-checks verify_files between
