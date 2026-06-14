@@ -1122,6 +1122,15 @@ async fn run_index(
     let mut total_symbols = 0usize;
     let mut total_edges = 0usize;
     let mut total_files = 0usize;
+    // Non-code lobes (docs/data/images) are best-effort — a single bad doc or
+    // image must never abort the whole index. But a WHOLESALE lobe failure (DB
+    // pool timeout, dropped connection, IO error walking the root) means that
+    // lobe never ran, so its slice of the graph is now stale/incomplete. We must
+    // not print "✓ indexed" + exit 0 in that case, or a transient DB hiccup
+    // silently leaves the docs/data graph stale while every caller (CI, the
+    // autopilot loop, a human) reads success. Collect skips here and fail at the
+    // end — every lobe is still attempted first.
+    let mut skipped_lobes: Vec<(&str, String)> = Vec::new();
     // Full: index_langs wipes prior code:* nodes ONCE, then extracts each
     // language (per-language cortex::index calls would clobber each other).
     // Incremental: re-extract only files whose content_hash changed since the
@@ -1179,6 +1188,7 @@ async fn run_index(
         }
         Err(e) => {
             eprintln!("  docs: skipped ({e})");
+            skipped_lobes.push(("docs", e.to_string()));
         }
     }
 
@@ -1203,6 +1213,7 @@ async fn run_index(
         }
         Err(e) => {
             eprintln!("  data: skipped ({e})");
+            skipped_lobes.push(("data", e.to_string()));
         }
     }
 
@@ -1228,6 +1239,7 @@ async fn run_index(
         }
         Err(e) => {
             eprintln!("  images: skipped ({e})");
+            skipped_lobes.push(("images", e.to_string()));
         }
     }
 
@@ -1242,6 +1254,24 @@ async fn run_index(
             "{CYAN}\u{2713} re-indexed '{}': {} file(s), {} node(s), {} edge(s){RESET}",
             slug, total_files, total_symbols, total_edges
         );
+    }
+    // Surface wholesale lobe failures so a transient DB hiccup can't masquerade
+    // as a clean index. Code lobes already abort on error (the `?` above); the
+    // best-effort non-code lobes are reported here. Non-zero exit lets CI / the
+    // autopilot loop / a human know to rerun rather than trust a stale graph.
+    if !skipped_lobes.is_empty() {
+        let names: Vec<&str> = skipped_lobes.iter().map(|(n, _)| *n).collect();
+        eprintln!(
+            "\u{26a0} {} lobe(s) skipped due to errors ({}) — graph may be stale, rerun `ff cortex index`",
+            skipped_lobes.len(),
+            names.join(", ")
+        );
+        let detail = skipped_lobes
+            .iter()
+            .map(|(n, e)| format!("{n}: {e}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(anyhow!("cortex index incomplete — {detail}"));
     }
     Ok(())
 }
