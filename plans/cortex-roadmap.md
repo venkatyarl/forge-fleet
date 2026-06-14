@@ -96,9 +96,24 @@
      Louvain (hierarchical communities) if 249-symbol clusters prove too coarse;
      weight `calls` edges by call multiplicity in the modularity gain (currently
      adjacency multiplicity already approximates this).
-5. **Provenance/confidence on edges** — EXTRACTED vs INFERRED tiers (graphify's
-   one structural advantage), so downstream consumers can filter heuristic call
-   edges (e.g. the dotty-resolver's kept-as-written externs).
+5. ✅ **Provenance/confidence on edges** (PR #311, `273686510`) — EXTRACTED vs
+   INFERRED tiers (graphify's one structural advantage), so downstream consumers
+   can filter heuristic call edges. Every `calls` edge now carries a confidence
+   tier in the existing `brain_vault_edges.confidence` column (was write-only at
+   the `1.0` default): **1.0 EXTRACTED** (primary `resolve_call` named a real
+   internal symbol), **0.6 INFERRED** (only a heuristic redirect — glob /
+   impl-method / `Self::` / facade `pub use` — landed it on an internal symbol),
+   **0.3 UNRESOLVED** (callee is a `code:extern`). `add_call_edge` keeps the MAX on
+   conflict (`add_edge`/contains/imports untouched); pure `call_confidence()`
+   helper + unit test. No migration (column pre-existed). Surfaced in `ff cortex
+   index` (`resolved N (extracted A / inferred B)`) and `ff cortex doctor`
+   (internal-resolved split into extracted/inferred sub-lines + JSON fields).
+   **Live after full reindex:** forge-fleet internal-resolved 7804 = **4428
+   extracted + 3376 inferred** — 43% of internal resolutions come from heuristic
+   redirects, exactly the edges a high-precision consumer wants to filter
+   (`confidence >= 1.0`). **Follow-up:** thread a `--min-confidence` filter into
+   `ff cortex callers`/`impact` and the `cortex_*` MCP tools so agents can request
+   high-trust-only traversal (data layer is now in place; consumer-filter slice).
 
 ## Recall (internal call-resolution) — gaps surfaced by `ff cortex doctor`
 
