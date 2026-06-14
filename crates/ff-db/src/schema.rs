@@ -8535,3 +8535,33 @@ CREATE TABLE IF NOT EXISTS brain_code_communities (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_brain_code_communities_member_hash
     ON brain_code_communities (member_hash);
 "#;
+
+/// V128: per-file `pub use` re-export ledger so an incremental Cortex reindex can
+/// rebuild the corpus-wide facade map.
+///
+/// `resolve_facade_call` redirects a call through a `pub use` facade
+/// (`ff_db::pg_get_brain_user` → real `ff_db::queries::pg_get_brain_user`, or the
+/// caller-prefixed `ff_gateway::brain_api::ff_db::pg_get_brain_user`) onto the real
+/// internal fn. That redirect needs the corpus-wide re-export map. Before this
+/// table the map was rebuilt only from the files being extracted THIS run — fine
+/// for a full reindex (every file is in the batch) but on an INCREMENTAL reindex
+/// the changed files rarely include the `lib.rs`/`mod.rs` that owns the `pub use`,
+/// so every facade call in a changed file silently degraded to a `code:extern`
+/// until the next full reindex (the `pg_*` query facade was the single biggest
+/// internal mis-resolution source `ff cortex doctor` reported). This ledger
+/// persists each file's re-exports (named + glob) so the map is loaded
+/// whole-corpus on incremental, exactly like `internal_fns`/`internal_types`.
+/// Per-file rows ride the existing incremental lifecycle: cleared on a full
+/// reindex, re-recorded per changed file (so a removed `pub use` drops out).
+/// Internal text-ID columns use COLLATE "C" so ON CONFLICT stays collation-safe.
+pub const SCHEMA_V128_CORTEX_REEXPORTS: &str = r#"
+CREATE TABLE IF NOT EXISTS cortex_reexports (
+    corpus_slug   TEXT COLLATE "C" NOT NULL,
+    file_path     TEXT COLLATE "C" NOT NULL,
+    kind          TEXT COLLATE "C" NOT NULL,   -- 'named' | 'glob'
+    facade        TEXT COLLATE "C" NOT NULL,   -- named: facade path; glob: base module
+    target        TEXT COLLATE "C" NOT NULL,   -- named: real target; glob: target module
+    PRIMARY KEY (corpus_slug, file_path, kind, facade, target)
+);
+CREATE INDEX IF NOT EXISTS idx_cortex_reexports_corpus ON cortex_reexports (corpus_slug);
+"#;

@@ -207,6 +207,7 @@ pub async fn index(pool: &PgPool, corpus_slug: &str, lang: &str) -> Result<Corte
     lang_patterns(lang)?; // validate before wiping
     wipe_code_nodes(pool, corpus_slug).await?;
     clear_file_index(pool, corpus_slug).await?; // reset the incremental ledger
+    clear_reexports(pool, corpus_slug).await?; // reset the facade ledger
     index_one(pool, corpus_slug, lang).await
 }
 
@@ -225,6 +226,7 @@ pub async fn index_langs(
     // ledger so removed files don't linger as "already indexed" rows. index_one
     // records each file's current hash as it extracts.
     clear_file_index(pool, corpus_slug).await?;
+    clear_reexports(pool, corpus_slug).await?;
     let mut out = Vec::with_capacity(langs.len());
     for l in langs {
         let stats = index_one(pool, corpus_slug, l).await?;
@@ -354,6 +356,11 @@ pub async fn index_langs_incremental(
             wipe_file_symbols(pool, fid).await?;
         }
         sqlx::query("DELETE FROM cortex_file_index WHERE corpus_slug = $1 AND file_path = $2")
+            .bind(corpus_slug)
+            .bind(path)
+            .execute(pool)
+            .await?;
+        sqlx::query("DELETE FROM cortex_reexports WHERE corpus_slug = $1 AND file_path = $2")
             .bind(corpus_slug)
             .bind(path)
             .execute(pool)
@@ -513,6 +520,88 @@ async fn record_file_hash(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Drop the whole re-export ledger for a corpus (full reindex re-records it).
+async fn clear_reexports(pool: &PgPool, corpus_slug: &str) -> Result<()> {
+    sqlx::query("DELETE FROM cortex_reexports WHERE corpus_slug = $1")
+        .bind(corpus_slug)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Replace one file's re-export rows with its current `pub use` set. Called in
+/// pass 1 so the corpus-wide facade map ([`load_reexports`]) reflects the changed
+/// file's CURRENT re-exports — a removed `pub use` drops out (delete-then-insert),
+/// an added one appears. No-op-cheap for the common file with no `pub use`.
+async fn record_file_reexports(
+    pool: &PgPool,
+    corpus_slug: &str,
+    file_path: &str,
+    parse: &FileParse,
+) -> Result<()> {
+    sqlx::query("DELETE FROM cortex_reexports WHERE corpus_slug = $1 AND file_path = $2")
+        .bind(corpus_slug)
+        .bind(file_path)
+        .execute(pool)
+        .await?;
+    for (facade, target) in &parse.reexports {
+        sqlx::query(
+            r#"INSERT INTO cortex_reexports (corpus_slug, file_path, kind, facade, target)
+               VALUES ($1, $2, 'named', $3, $4)
+               ON CONFLICT DO NOTHING"#,
+        )
+        .bind(corpus_slug)
+        .bind(file_path)
+        .bind(facade)
+        .bind(target)
+        .execute(pool)
+        .await?;
+    }
+    for (base, target) in &parse.glob_reexports {
+        sqlx::query(
+            r#"INSERT INTO cortex_reexports (corpus_slug, file_path, kind, facade, target)
+               VALUES ($1, $2, 'glob', $3, $4)
+               ON CONFLICT DO NOTHING"#,
+        )
+        .bind(corpus_slug)
+        .bind(file_path)
+        .bind(base)
+        .bind(target)
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
+/// Load the corpus-wide `pub use` facade map from the ledger: named re-exports
+/// (`facade -> target`) and glob re-exports (`base_module -> [target_module, …]`).
+/// Whole-corpus, so an incremental reindex resolves a facade call in a changed
+/// file even when the owning `lib.rs` wasn't touched this run — the same role
+/// [`load_internal_fns`] plays for functions.
+async fn load_reexports(
+    pool: &PgPool,
+    corpus_slug: &str,
+) -> Result<(HashMap<String, String>, HashMap<String, Vec<String>>)> {
+    let rows =
+        sqlx::query("SELECT kind, facade, target FROM cortex_reexports WHERE corpus_slug = $1")
+            .bind(corpus_slug)
+            .fetch_all(pool)
+            .await?;
+    let mut named: HashMap<String, String> = HashMap::new();
+    let mut glob: HashMap<String, Vec<String>> = HashMap::new();
+    for r in rows {
+        let kind: String = r.get("kind");
+        let facade: String = r.get("facade");
+        let target: String = r.get("target");
+        if kind == "glob" {
+            glob.entry(facade).or_default().push(target);
+        } else {
+            named.entry(facade).or_insert(target);
+        }
+    }
+    Ok((named, glob))
 }
 
 /// Resolve a `content:file` node id by path, even if soft-deleted (valid_until
@@ -834,6 +923,11 @@ async fn extract_files(
             }
         }
 
+        // Persist this file's `pub use` re-exports so the corpus-wide facade map
+        // (built below from the ledger) survives an incremental reindex that
+        // didn't touch the owning lib.rs/mod.rs.
+        record_file_reexports(pool, corpus_slug, &file_path, &parse).await?;
+
         pending.push(Pending {
             file_node_id,
             file_path,
@@ -843,28 +937,12 @@ async fn extract_files(
     }
 
     // Corpus-wide `pub use` facade map + crate-root set for the facade redirect.
-    // The map is built from this batch's re-exports (complete on a full reindex;
-    // best-effort on an incremental run — a periodic full reindex closes the gap).
-    // Crate roots come from every known internal fn, so they're complete even on
-    // an incremental run (internal_fns is seeded whole-corpus there).
-    let mut reexports: HashMap<String, String> = HashMap::new();
-    // Glob `pub use` facades: facade_base_module -> [target_module, …]. A call
-    // through `<base>::<leaf>` redirects to `<target>::<leaf>` when that names a
-    // real internal fn (the leaf set isn't known at parse time for a glob).
-    let mut glob_reexports: HashMap<String, Vec<String>> = HashMap::new();
-    for p in &pending {
-        for (facade, target) in &p.parse.reexports {
-            reexports
-                .entry(facade.clone())
-                .or_insert_with(|| target.clone());
-        }
-        for (base, target) in &p.parse.glob_reexports {
-            glob_reexports
-                .entry(base.clone())
-                .or_default()
-                .push(target.clone());
-        }
-    }
+    // Loaded from the ledger, which pass 1 above just refreshed for every file in
+    // this batch — so the map is whole-corpus and complete on BOTH a full reindex
+    // and an incremental run (a changed file's facade call resolves even when the
+    // owning lib.rs/mod.rs wasn't touched). Crate roots come from every known
+    // internal fn (internal_fns is seeded whole-corpus on incremental too).
+    let (reexports, glob_reexports) = load_reexports(pool, corpus_slug).await?;
     let crate_roots: HashSet<String> = internal_fns
         .iter()
         .filter_map(|f| f.split("::").next())

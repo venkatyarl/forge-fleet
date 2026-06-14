@@ -769,6 +769,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "cortex_code_communities",
         sql: schema::SCHEMA_V127_CORTEX_CODE_COMMUNITIES,
     },
+    PgMigration {
+        version: 128,
+        name: "cortex_reexports",
+        sql: schema::SCHEMA_V128_CORTEX_REEXPORTS,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
