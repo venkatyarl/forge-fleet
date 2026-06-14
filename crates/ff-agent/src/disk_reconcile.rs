@@ -96,7 +96,12 @@ pub struct DiskReconcileSummary {
 /// The set of nodes currently over quota, newest-sample-first deterministic
 /// ordering (by worker_name so output is stable). Uses the SAME quota math as
 /// `disk_sampler`: used% of total > the node's `disk_quota_pct`.
-async fn over_quota_nodes(pg: &PgPool) -> Result<Vec<String>, String> {
+///
+/// `pub(crate)` so the backup orchestrator's over-quota backup-replica reaper
+/// ([`crate::ha::backup::BackupOrchestrator::reap_over_quota_peers`]) shares the
+/// exact same "is this node over quota?" definition — disk pressure has one
+/// source of truth.
+pub(crate) async fn over_quota_nodes(pg: &PgPool) -> Result<Vec<String>, String> {
     let usage = ff_db::pg_latest_disk_usage(pg)
         .await
         .map_err(|e| format!("pg_latest_disk_usage: {e}"))?;
