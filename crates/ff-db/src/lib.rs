@@ -42,6 +42,9 @@ pub use queries::{
     BrainVaultEdgeRow,
     BrainVaultNodeRow,
     ComputerScheduleRow,
+    // Cortex recall diagnostic (`ff cortex doctor`)
+    CortexResolutionStats,
+    CortexSuspiciousExtern,
     DeferredTaskRow,
     // Orchestrator P2 — per-session demand sensing (V116)
     DemandVector,
@@ -86,6 +89,8 @@ pub use queries::{
     pg_bump_vault_node_hits,
     pg_cancel_deferred,
     pg_claim_deferred,
+    pg_cortex_resolution_stats,
+    pg_cortex_suspicious_externs,
     pg_count_brain_vault_nodes_current,
     pg_count_corpus_code_symbols,
     pg_create_brain_thread,
