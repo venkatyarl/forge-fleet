@@ -45,6 +45,7 @@ pub use queries::{
     // Cortex recall diagnostic (`ff cortex doctor`)
     CortexResolutionStats,
     CortexSuspiciousExtern,
+    CortexSuspiciousReport,
     DeferredTaskRow,
     // Orchestrator P2 — per-session demand sensing (V116)
     DemandVector,

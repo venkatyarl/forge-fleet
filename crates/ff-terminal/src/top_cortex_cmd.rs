@@ -631,7 +631,8 @@ pub async fn handle_top_cortex(args: TopCortexArgs) -> Result<()> {
 /// suspicious-extern list. Read-only.
 async fn run_doctor(pool: &PgPool, corpus: &str, limit: i64, format: &str) -> Result<()> {
     let stats = ff_db::pg_cortex_resolution_stats(pool, corpus).await?;
-    let suspicious = ff_db::pg_cortex_suspicious_externs(pool, corpus, limit).await?;
+    let report = ff_db::pg_cortex_suspicious_externs(pool, corpus, limit).await?;
+    let suspicious = &report.shown;
     let rate = if stats.call_edges > 0 {
         100.0 * stats.internal as f64 / stats.call_edges as f64
     } else {
@@ -649,7 +650,10 @@ async fn run_doctor(pool: &PgPool, corpus: &str, limit: i64, format: &str) -> Re
                 "internal_resolution_pct": (rate * 10.0).round() / 10.0,
                 "code_symbols": stats.code_symbols,
                 "extern_placeholders": stats.externs,
-                "suspicious_externs": suspicious,
+                "suspicious_externs": report.shown,
+                "total_leads": report.total_leads,
+                "cross_language_suppressed": report.cross_language_suppressed,
+                "generic_leaf_suppressed": report.generic_leaf_suppressed,
             }))?
         );
         return Ok(());
@@ -676,19 +680,21 @@ async fn run_doctor(pool: &PgPool, corpus: &str, limit: i64, format: &str) -> Re
 
     if suspicious.is_empty() {
         println!(
-            "\nNo suspicious externs: every extern's leaf name is distinct from all internal\n\
-             symbols \u{2014} no candidate internal calls were kept as externs."
+            "\nNo actionable suspicious externs: no extern's leaf collides with 1\u{2013}2\n\
+             same-language internal symbols \u{2014} the call graph has no obvious internal\n\
+             mis-resolutions left."
         );
     } else {
         println!(
-            "\nSuspicious externs (leaf collides with an internal symbol \u{2014} candidate\n\
-             mis-resolutions, ranked by fan-in; judge each against its internal candidate):"
+            "\nSuspicious externs (leaf collides with 1\u{2013}2 same-language internal symbols\n\
+             \u{2014} candidate mis-resolutions, ranked by fan-in; judge each against its\n\
+             internal candidate):"
         );
         println!(
             "  {:>6}  {:<40}  {}",
             "FAN-IN", "EXTERN (resolved-to)", "INTERNAL CANDIDATE(S)"
         );
-        for s in &suspicious {
+        for s in suspicious {
             println!(
                 "  {:>6}  {:<40}  {}",
                 s.fan_in,
@@ -696,6 +702,21 @@ async fn run_doctor(pool: &PgPool, corpus: &str, limit: i64, format: &str) -> Re
                 s.internal_candidates.join(", ")
             );
         }
+        if report.total_leads > suspicious.len() as i64 {
+            println!(
+                "  \u{2026} and {} more (pass --limit to see)",
+                report.total_leads - suspicious.len() as i64
+            );
+        }
+    }
+    let noise = report.cross_language_suppressed + report.generic_leaf_suppressed;
+    if noise > 0 {
+        println!(
+            "\nSuppressed {noise} noise collisions ({} cross-language, {} generic-leaf) \u{2014}\n\
+             leaf-name matches that can't be real internal calls (a Rust extern vs a TSX\n\
+             component, or a common name like `new`/`from`/`len` on a std type).",
+            report.cross_language_suppressed, report.generic_leaf_suppressed
+        );
     }
     Ok(())
 }
