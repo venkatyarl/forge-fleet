@@ -774,6 +774,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "cortex_reexports",
         sql: schema::SCHEMA_V128_CORTEX_REEXPORTS,
     },
+    PgMigration {
+        version: 129,
+        name: "docker_latest_tag",
+        sql: schema::SCHEMA_V129_DOCKER_LATEST_TAG,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
