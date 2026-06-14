@@ -213,7 +213,7 @@ impl ModelBenchmarker {
         model_id: &str,
         prompt: &str,
     ) -> Result<OneRun, BenchError> {
-        let url = format!("{}/v1/chat/completions", endpoint.trim_end_matches('/'));
+        let url = ff_core::url::normalize_chat_completions_url(endpoint);
         let body = json!({
             "model": model_id,
             "messages": [

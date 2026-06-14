@@ -439,11 +439,7 @@ async fn handle_task_inner(
 
         crate::llm_routing::apply_qwen3_max_tokens_floor(&mut body, model_id);
 
-        let url = if endpoint.contains("/chat/completions") {
-            endpoint.clone()
-        } else {
-            format!("{}/v1/chat/completions", endpoint.trim_end_matches('/'))
-        };
+        let url = ff_core::url::normalize_chat_completions_url(endpoint);
 
         info!(
             task = %task_type,

@@ -34,6 +34,7 @@ pub mod synthetic;
 pub mod task;
 pub mod task_error;
 pub mod types;
+pub mod url;
 pub mod verifier;
 
 // Re-export the most commonly used items at crate root.

@@ -815,7 +815,7 @@ async fn run_agent_loop(
             session.config.llm_base_url.clone()
         };
 
-        let url = format!("{}/v1/chat/completions", active_base.trim_end_matches('/'));
+        let url = ff_core::url::normalize_chat_completions_url(&active_base);
 
         debug!(turn, url = %url, model = %session.config.model, "sending agent request");
 

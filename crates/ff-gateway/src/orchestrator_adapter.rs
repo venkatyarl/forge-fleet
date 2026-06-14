@@ -298,11 +298,7 @@ pub fn build_dispatch_fn(
                     .cloned()
                     .unwrap_or_else(|| format!("http://{}", decision.endpoint));
 
-                let url = if endpoint.contains("/chat/completions") {
-                    endpoint
-                } else {
-                    format!("{}/v1/chat/completions", endpoint.trim_end_matches('/'))
-                };
+                let url = ff_core::url::normalize_chat_completions_url(&endpoint);
 
                 let resp = match state.http_client.post(&url).json(&body).send().await {
                     Ok(r) => r,
