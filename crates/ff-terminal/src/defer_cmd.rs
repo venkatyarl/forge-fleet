@@ -28,6 +28,63 @@ fn unknown_defer_status_parts(filter: &str) -> Vec<String> {
         .collect()
 }
 
+/// Terminal `deferred_tasks.status` values — a `--watch` poll stops here. A
+/// deferred task starts pending/dispatchable, runs, and ends completed/failed/
+/// cancelled. Mirrors `tasks_cmd::is_terminal_task_status`.
+fn is_terminal_defer_status(status: &str) -> bool {
+    matches!(
+        status.to_ascii_lowercase().as_str(),
+        "completed" | "failed" | "cancelled"
+    )
+}
+
+/// Poll a deferred task's status until it reaches a terminal state, printing a
+/// progress line to stderr only when something changes (status / attempts /
+/// last_error) so a long watch doesn't spam identical lines. Bounded by a hard
+/// cap so a never-fired trigger can't hang the CLI forever. Mirrors
+/// `ff tasks get --watch` (3s poll, 3600s cap, dedup'd stderr).
+async fn watch_deferred_until_terminal(pool: &sqlx::PgPool, id: &str) -> Result<()> {
+    use crate::{CYAN, RESET};
+    const POLL_SECS: u64 = 3;
+    const MAX_WAIT_SECS: u64 = 3600;
+    let mut waited = 0u64;
+    let mut last_line = String::new();
+    loop {
+        let Some(r) = ff_db::pg_get_deferred(pool, id).await? else {
+            anyhow::bail!("No deferred task with id '{id}'");
+        };
+        if is_terminal_defer_status(&r.status) {
+            break;
+        }
+        let line = format!(
+            "● {}  (attempt {}/{}){}",
+            r.status,
+            r.attempts,
+            r.max_attempts,
+            r.last_error
+                .as_deref()
+                .filter(|e| !e.is_empty())
+                .map(|e| format!("  — {e}"))
+                .unwrap_or_default(),
+        );
+        if line != last_line {
+            eprintln!("{CYAN}{line}{RESET}  \x1b[2m(waited {waited}s){RESET}");
+            last_line = line;
+        }
+        if waited >= MAX_WAIT_SECS {
+            eprintln!(
+                "\x1b[2m  watch timeout after {waited}s — task still {}; \
+                 re-run --watch to keep polling{RESET}",
+                r.status
+            );
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(POLL_SECS)).await;
+        waited += POLL_SECS;
+    }
+    Ok(())
+}
+
 /// Human-readable trigger label for the table's TRIGGER column. Pure — derives
 /// from `trigger_type` + `trigger_spec` exactly as the text path did, extracted
 /// so the JSON row and the table stay in lockstep.
@@ -192,65 +249,73 @@ pub async fn handle_defer(cmd: crate::DeferCommand) -> Result<()> {
             );
             println!("      trigger fires; follow it with `ff defer get {id}`.");
         }
-        crate::DeferCommand::Get { id } => match ff_db::pg_get_deferred(&pool, &id).await? {
-            Some(r) => {
-                println!("ID:            {}", r.id);
-                println!("Title:         {}", r.title);
-                println!("Status:        {}", r.status);
-                println!("Kind:          {}", r.kind);
-                println!("Trigger:       {} ({})", r.trigger_type, r.trigger_spec);
-                println!(
-                    "Preferred node:{}",
-                    r.preferred_node.clone().unwrap_or_else(|| "-".into())
-                );
-                println!("Attempts:      {}/{}", r.attempts, r.max_attempts);
-                println!(
-                    "Created:       {}  by {}",
-                    r.created_at.format("%Y-%m-%d %H:%M UTC"),
-                    r.created_by.clone().unwrap_or_else(|| "-".into())
-                );
-                if let Some(ts) = r.next_attempt_at {
-                    println!("Next attempt:  {}", ts.format("%Y-%m-%d %H:%M UTC"));
-                }
-                if let Some(n) = &r.claimed_by {
-                    println!("Claimed by:    {n}");
-                }
-                if let Some(err) = &r.last_error {
-                    println!("Last error:    {err}");
-                }
-                if let Some(res) = &r.result {
-                    // Surface the full captured streams when present (shell
-                    // tasks store {exit_code, stdout, stderr}); fall back to
-                    // pretty JSON for other task kinds.
-                    let stdout = res.get("stdout").and_then(|v| v.as_str());
-                    let stderr = res.get("stderr").and_then(|v| v.as_str());
-                    if stdout.is_some() || stderr.is_some() {
-                        if let Some(code) = res.get("exit_code").and_then(|v| v.as_i64()) {
-                            println!("Exit code:     {code}");
-                        }
-                        if let Some(s) = stdout.filter(|s| !s.is_empty()) {
-                            println!("\n--- stdout ---\n{s}");
-                        }
-                        if let Some(s) = stderr.filter(|s| !s.is_empty()) {
-                            println!("\n--- stderr ---\n{s}");
-                        }
-                    } else {
-                        println!(
-                            "Result:\n{}",
-                            serde_json::to_string_pretty(res).unwrap_or_else(|_| res.to_string())
-                        );
+        crate::DeferCommand::Get { id, watch } => {
+            // --watch: block until the task is terminal (streaming status
+            // changes to stderr), then fall through to the one-shot detail print.
+            if watch {
+                watch_deferred_until_terminal(&pool, &id).await?;
+            }
+            match ff_db::pg_get_deferred(&pool, &id).await? {
+                Some(r) => {
+                    println!("ID:            {}", r.id);
+                    println!("Title:         {}", r.title);
+                    println!("Status:        {}", r.status);
+                    println!("Kind:          {}", r.kind);
+                    println!("Trigger:       {} ({})", r.trigger_type, r.trigger_spec);
+                    println!(
+                        "Preferred node:{}",
+                        r.preferred_node.clone().unwrap_or_else(|| "-".into())
+                    );
+                    println!("Attempts:      {}/{}", r.attempts, r.max_attempts);
+                    println!(
+                        "Created:       {}  by {}",
+                        r.created_at.format("%Y-%m-%d %H:%M UTC"),
+                        r.created_by.clone().unwrap_or_else(|| "-".into())
+                    );
+                    if let Some(ts) = r.next_attempt_at {
+                        println!("Next attempt:  {}", ts.format("%Y-%m-%d %H:%M UTC"));
                     }
+                    if let Some(n) = &r.claimed_by {
+                        println!("Claimed by:    {n}");
+                    }
+                    if let Some(err) = &r.last_error {
+                        println!("Last error:    {err}");
+                    }
+                    if let Some(res) = &r.result {
+                        // Surface the full captured streams when present (shell
+                        // tasks store {exit_code, stdout, stderr}); fall back to
+                        // pretty JSON for other task kinds.
+                        let stdout = res.get("stdout").and_then(|v| v.as_str());
+                        let stderr = res.get("stderr").and_then(|v| v.as_str());
+                        if stdout.is_some() || stderr.is_some() {
+                            if let Some(code) = res.get("exit_code").and_then(|v| v.as_i64()) {
+                                println!("Exit code:     {code}");
+                            }
+                            if let Some(s) = stdout.filter(|s| !s.is_empty()) {
+                                println!("\n--- stdout ---\n{s}");
+                            }
+                            if let Some(s) = stderr.filter(|s| !s.is_empty()) {
+                                println!("\n--- stderr ---\n{s}");
+                            }
+                        } else {
+                            println!(
+                                "Result:\n{}",
+                                serde_json::to_string_pretty(res)
+                                    .unwrap_or_else(|_| res.to_string())
+                            );
+                        }
+                    }
+                    println!(
+                        "\nPayload:\n{}",
+                        serde_json::to_string_pretty(&r.payload).unwrap_or_default()
+                    );
                 }
-                println!(
-                    "\nPayload:\n{}",
-                    serde_json::to_string_pretty(&r.payload).unwrap_or_default()
-                );
+                None => {
+                    eprintln!("No deferred task with id '{id}'");
+                    std::process::exit(1);
+                }
             }
-            None => {
-                eprintln!("No deferred task with id '{id}'");
-                std::process::exit(1);
-            }
-        },
+        }
         crate::DeferCommand::Cancel { id, force } => {
             let cancelled = if force {
                 ff_db::pg_force_cancel_deferred(&pool, &id).await?
@@ -292,6 +357,18 @@ pub async fn handle_defer(cmd: crate::DeferCommand) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_defer_status_matches_only_terminal_states() {
+        // Terminal — a --watch poll stops here.
+        for s in ["completed", "failed", "cancelled", "COMPLETED", "Failed"] {
+            assert!(is_terminal_defer_status(s), "{s} should be terminal");
+        }
+        // Non-terminal — the task is still progressing; watch keeps polling.
+        for s in ["pending", "dispatchable", "running", "Pending"] {
+            assert!(!is_terminal_defer_status(s), "{s} should NOT be terminal");
+        }
+    }
 
     #[test]
     fn trigger_label_derives_from_spec() {

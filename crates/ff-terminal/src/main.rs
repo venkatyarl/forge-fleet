@@ -1131,7 +1131,14 @@ pub enum DeferCommand {
         max_duration_secs: Option<u64>,
     },
     /// Show details for a single deferred task by id.
-    Get { id: String },
+    Get {
+        id: String,
+        /// Block until the task reaches a terminal state (completed/failed/
+        /// cancelled), streaming status changes to stderr, then print detail.
+        /// Bounded by a hard cap so a never-fired trigger can't hang the CLI.
+        #[arg(long)]
+        watch: bool,
+    },
     /// Cancel a pending/dispatchable/failed task. With `--force`, also cancels
     /// a stuck `running` task (orphaned by a dead/restarted worker).
     Cancel {
