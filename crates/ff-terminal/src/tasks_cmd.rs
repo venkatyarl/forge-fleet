@@ -300,57 +300,65 @@ pub async fn handle_tasks_list(
     Ok(())
 }
 
+/// Poll a task's status column until it reaches a terminal state
+/// (completed/failed/cancelled), printing a progress line to stderr only when
+/// something changes (status / pct / message) so a long watch doesn't spam
+/// identical lines. Bounded by a hard cap so a stuck or never-claimed task
+/// can't hang the CLI forever. Shared by `ff tasks get --watch` and
+/// `ff tasks add --watch`; mirrors `ff research --show --watch`.
+async fn watch_task_until_terminal(pg: &PgPool, id: uuid::Uuid) -> Result<()> {
+    use crate::{CYAN, RESET};
+    const POLL_SECS: u64 = 3;
+    const MAX_WAIT_SECS: u64 = 3600;
+    let mut waited = 0u64;
+    let mut last_line = String::new();
+    loop {
+        let r = sqlx::query(
+            "SELECT status, progress_pct, progress_message FROM fleet_tasks WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(pg)
+        .await?;
+        let Some(r) = r else {
+            anyhow::bail!("task {id} not found");
+        };
+        let status: String = r.try_get("status")?;
+        if is_terminal_task_status(&status) {
+            break;
+        }
+        let pct: Option<f32> = r.try_get("progress_pct").ok();
+        let msg: Option<String> = r.try_get("progress_message").ok();
+        let line = format!(
+            "● {status}{}{}",
+            pct.map(|p| format!("  {p:.0}%")).unwrap_or_default(),
+            msg.as_deref()
+                .filter(|m| !m.is_empty())
+                .map(|m| format!("  — {m}"))
+                .unwrap_or_default(),
+        );
+        if line != last_line {
+            eprintln!("{CYAN}{line}{RESET}  \x1b[2m(waited {waited}s){RESET}");
+            last_line = line;
+        }
+        if waited >= MAX_WAIT_SECS {
+            eprintln!(
+                "\x1b[2m  watch timeout after {waited}s — task still {status}; \
+                 re-run --watch to keep polling{RESET}"
+            );
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(POLL_SECS)).await;
+        waited += POLL_SECS;
+    }
+    Ok(())
+}
+
 /// Show full detail for one task.
 pub async fn handle_tasks_get(pg: &PgPool, id: uuid::Uuid, json: bool, watch: bool) -> Result<()> {
-    // --watch: poll the status column until the task is terminal, printing a
-    // progress line to stderr only when it changes (status / pct / message), then
-    // fall through to the normal one-shot fetch+print below. Bounded by a hard cap
-    // so a stuck/never-claimed task can't hang the CLI forever. Mirrors
-    // `ff research --show --watch`.
+    // --watch: block until the task is terminal (streaming progress to stderr),
+    // then fall through to the normal one-shot fetch+print below.
     if watch {
-        use crate::{CYAN, RESET};
-        const POLL_SECS: u64 = 3;
-        const MAX_WAIT_SECS: u64 = 3600;
-        let mut waited = 0u64;
-        let mut last_line = String::new();
-        loop {
-            let r = sqlx::query(
-                "SELECT status, progress_pct, progress_message FROM fleet_tasks WHERE id = $1",
-            )
-            .bind(id)
-            .fetch_optional(pg)
-            .await?;
-            let Some(r) = r else {
-                anyhow::bail!("task {id} not found");
-            };
-            let status: String = r.try_get("status")?;
-            if is_terminal_task_status(&status) {
-                break;
-            }
-            let pct: Option<f32> = r.try_get("progress_pct").ok();
-            let msg: Option<String> = r.try_get("progress_message").ok();
-            let line = format!(
-                "● {status}{}{}",
-                pct.map(|p| format!("  {p:.0}%")).unwrap_or_default(),
-                msg.as_deref()
-                    .filter(|m| !m.is_empty())
-                    .map(|m| format!("  — {m}"))
-                    .unwrap_or_default(),
-            );
-            if line != last_line {
-                eprintln!("{CYAN}{line}{RESET}  \x1b[2m(waited {waited}s){RESET}");
-                last_line = line;
-            }
-            if waited >= MAX_WAIT_SECS {
-                eprintln!(
-                    "\x1b[2m  watch timeout after {waited}s — task still {status}; \
-                     re-run --watch to keep polling{RESET}"
-                );
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(POLL_SECS)).await;
-            waited += POLL_SECS;
-        }
+        watch_task_until_terminal(pg, id).await?;
     }
 
     let row = sqlx::query(

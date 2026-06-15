@@ -880,6 +880,12 @@ enum TasksCommand {
         /// short for agent/research tasks. Sets fleet_tasks.timeout_secs.
         #[arg(long)]
         timeout: Option<u64>,
+        /// After enqueuing, follow the task to a terminal state instead of
+        /// just printing its id — streams a status line to stderr whenever
+        /// status/progress changes, then prints the full detail (incl. result).
+        /// Equivalent to `ff tasks add ... && ff tasks get <id> --watch`.
+        #[arg(long, default_value_t = false)]
+        watch: bool,
     },
     /// Show detailed status, payload, and result for one task.
     Get {
@@ -3669,6 +3675,7 @@ async fn main() -> Result<()> {
                     exclude,
                     priority,
                     timeout,
+                    watch,
                 } => {
                     let caps: Vec<String> = capability
                         .split(',')
@@ -3731,6 +3738,11 @@ async fn main() -> Result<()> {
                     .await
                     .map_err(|e| anyhow::anyhow!("enqueue: {e}"))?;
                     println!("{id}");
+                    if watch {
+                        // Follow the just-enqueued task to a terminal state, then
+                        // print its full detail (reuses the get --watch path).
+                        tasks_cmd::handle_tasks_get(&pool, id, false, true).await?;
+                    }
                     Ok(())
                 }
                 TasksCommand::Get { id, json, watch } => {
