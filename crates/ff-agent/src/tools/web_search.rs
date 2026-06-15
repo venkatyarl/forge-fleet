@@ -144,18 +144,37 @@ pub fn format_results(results: &[SearchResult]) -> String {
 /// formatted results block, or `None` if every backend fails or finds nothing.
 /// Callers fall back to ungrounded behavior on `None` — never an error path.
 ///
+/// Backends are tried in order of reliability:
+///   1. **SearXNG** (`searxng_base`, if configured) — a self-hosted metasearch
+///      instance on a fleet node, queried via its key-free JSON API. This is the
+///      durable fix for the DuckDuckGo block (below): a fleet-native backend with
+///      no external scraping dependency. Off by default; the caller passes the
+///      base URL from the `searxng.url` fleet secret.
+///   2. **DuckDuckGo** HTML scrape — works when DDG isn't throttling.
+///   3. **Wikipedia** `list=search` — narrow coverage, but never IP-blocked.
+///
 /// DuckDuckGo intermittently hard-blocks a scraping IP with an HTTP-202 CAPTCHA
 /// challenge ("select all squares containing a duck") that no retry can clear —
 /// when the leader has been searching heavily, *every* DDG request comes back
 /// 202 with zero results. Rather than silently drop the whole research run to
-/// ungrounded model memory, fall back to the key-free Wikipedia search API
-/// (reliable 200s, real citable URLs) so factual sub-questions stay grounded.
+/// ungrounded model memory, the SearXNG primary (when configured) and the
+/// Wikipedia fallback (reliable 200s, real citable URLs) keep factual
+/// sub-questions grounded.
 pub async fn fetch_web_context(
     client: &reqwest::Client,
+    searxng_base: Option<&str>,
     query: &str,
     max_results: usize,
 ) -> Option<String> {
-    // Primary: general-web results via DuckDuckGo.
+    // Primary (when configured): self-hosted SearXNG metasearch on the fleet.
+    if let Some(base) = searxng_base.map(str::trim).filter(|b| !b.is_empty()) {
+        if let Ok(results) = fetch_searxng_results(client, base, query, max_results).await {
+            if !results.is_empty() {
+                return Some(format_results(&results));
+            }
+        }
+    }
+    // Secondary: general-web results via DuckDuckGo.
     if let Ok(results) = fetch_search_results(client, query, max_results).await {
         if !results.is_empty() {
             return Some(format_results(&results));
@@ -167,6 +186,72 @@ pub async fn fetch_web_context(
         Ok(results) if !results.is_empty() => Some(format_results(&results)),
         _ => None,
     }
+}
+
+/// Query a self-hosted [SearXNG](https://docs.searxng.org/) metasearch instance
+/// via its JSON API (`{base}/search?q=…&format=json`) and parse the results.
+///
+/// SearXNG aggregates many upstream engines behind one key-free endpoint we run
+/// on a fleet node, so it sidesteps the per-IP scraping blocks that wall direct
+/// DuckDuckGo access — fitting the "fleet replaces cloud subscriptions" model.
+/// The instance must enable the `json` output format in its `settings.yml`
+/// (`search.formats: [html, json]`), otherwise it returns HTTP 403 for
+/// `format=json` and this backend yields no results (caller falls back).
+pub async fn fetch_searxng_results(
+    client: &reqwest::Client,
+    base_url: &str,
+    query: &str,
+    max_results: usize,
+) -> Result<Vec<SearchResult>, String> {
+    let base = base_url.trim_end_matches('/');
+    let url = format!("{base}/search?q={}&format=json", urlencoding(query));
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("SearXNG request failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("SearXNG returned HTTP {}", resp.status()));
+    }
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read SearXNG results: {e}"))?;
+    Ok(parse_searxng_results(&body, max_results))
+}
+
+/// Parse a SearXNG `format=json` response into [`SearchResult`]s. The JSON shape
+/// is `{ "results": [ { "url", "title", "content" }, … ] }`; SearXNG returns
+/// plain text (no HTML) in `content`, so no tag-stripping is needed. Non-http
+/// and title-less entries are skipped.
+fn parse_searxng_results(body: &str, max: usize) -> Vec<SearchResult> {
+    let Ok(json) = serde_json::from_str::<Value>(body) else {
+        return Vec::new();
+    };
+    let Some(hits) = json.get("results").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    hits.iter()
+        .filter_map(|hit| {
+            let url = hit.get("url").and_then(Value::as_str)?;
+            let title = hit.get("title").and_then(Value::as_str).unwrap_or_default();
+            if title.is_empty() || !url.starts_with("http") {
+                return None;
+            }
+            let snippet = hit
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            Some(SearchResult {
+                title: title.to_string(),
+                url: url.to_string(),
+                snippet,
+            })
+        })
+        .take(max)
+        .collect()
 }
 
 /// Key-free fallback search via the Wikipedia `list=search` API. Returns real
@@ -612,6 +697,39 @@ mod tests {
         assert!(parse_wikipedia_results(r#"{"query":{}}"#, 8).is_empty());
         // A hit missing its title is skipped, not panicked on.
         assert!(parse_wikipedia_results(r#"{"query":{"search":[{"snippet":"x"}]}}"#, 8).is_empty());
+    }
+
+    #[test]
+    fn parse_searxng_extracts_url_title_content_and_honors_max() {
+        let body = r#"{"results":[
+            {"url":"https://docs.vllm.ai/page","title":"vLLM docs","content":"PagedAttention engine."},
+            {"url":"https://ml-explore.github.io/mlx","title":"MLX","content":"Array framework for Apple silicon."},
+            {"url":"https://example.com/three","title":"Third","content":"x"}
+        ]}"#;
+        let all = parse_searxng_results(body, 8);
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].url, "https://docs.vllm.ai/page");
+        assert_eq!(all[0].title, "vLLM docs");
+        assert_eq!(all[0].snippet, "PagedAttention engine.");
+        // max caps the result count.
+        assert_eq!(parse_searxng_results(body, 2).len(), 2);
+    }
+
+    #[test]
+    fn parse_searxng_handles_garbage_missing_fields_and_non_http() {
+        // Not JSON / no results array → empty, no panic.
+        assert!(parse_searxng_results("not json", 8).is_empty());
+        assert!(parse_searxng_results(r#"{"foo":1}"#, 8).is_empty());
+        // A hit missing its url is skipped; a non-http url (ftp/relative) too.
+        let body = r#"{"results":[
+            {"title":"no url","content":"x"},
+            {"url":"ftp://nope","title":"bad scheme","content":"x"},
+            {"url":"https://ok.test","title":"","content":"empty title dropped"},
+            {"url":"https://keep.test","title":"Keep","content":"kept"}
+        ]}"#;
+        let all = parse_searxng_results(body, 8);
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].url, "https://keep.test");
     }
 
     #[test]
