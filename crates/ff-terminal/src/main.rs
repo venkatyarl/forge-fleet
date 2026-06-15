@@ -1869,7 +1869,17 @@ pub enum FleetDbCommand {
     /// This is the exact path the daily leader tick runs — use it to verify
     /// restorability on demand (run it ON the leader, where the `.age` files
     /// and the decryption key live). Exits non-zero if the drill fails.
-    Drill {},
+    ///
+    /// `--on <node>` runs the drill on a REMOTE fleet computer via the
+    /// deferred-task queue instead of locally: it proves the backup fanned out
+    /// to `<node>` AND is restorable there (the leader-loss recovery story).
+    /// The remote node drills the newest copy it actually holds; the result
+    /// lands in `backup_drills` with `drill_node=<node>`. Exits non-zero if the
+    /// remote drill fails or doesn't report back in time.
+    Drill {
+        #[arg(long)]
+        on: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]

@@ -524,8 +524,8 @@ pub async fn handle_fleet_db(pool: &sqlx::PgPool, cmd: FleetDbCommand) -> Result
         FleetDbCommand::Backup { kind, now } => {
             handle_fleet_db_backup_now(pool, &kind, now).await?;
         }
-        FleetDbCommand::Drill {} => {
-            handle_fleet_db_drill(pool).await?;
+        FleetDbCommand::Drill { on } => {
+            handle_fleet_db_drill(pool, on.as_deref()).await?;
         }
     }
     Ok(())
@@ -535,8 +535,16 @@ pub async fn handle_fleet_db(pool: &sqlx::PgPool, cmd: FleetDbCommand) -> Result
 /// exact path (`RestoreDrillTick::run_record_and_alert`) the daily leader tick
 /// uses: decrypt → extract → validate the newest Postgres backup, record to
 /// `backup_drills`, alert on failure. Exits non-zero on a failed drill.
-pub async fn handle_fleet_db_drill(pool: &sqlx::PgPool) -> Result<()> {
+pub async fn handle_fleet_db_drill(pool: &sqlx::PgPool, on: Option<&str>) -> Result<()> {
     let my_name = ff_agent::fleet_info::resolve_this_worker_name().await;
+    // Cross-node: dispatch the drill to a remote computer via the deferred-task
+    // queue and report back its result. Proves DR-readiness on the node that
+    // would actually take over (the backup fanned out there AND restores).
+    if let Some(node) = on {
+        if !node.eq_ignore_ascii_case(&my_name) {
+            return enqueue_remote_drill(pool, node, &my_name).await;
+        }
+    }
     println!("{CYAN}▶ ff fleet db drill{RESET}  (node={my_name})");
     let tick = ff_agent::ha::restore_drill::RestoreDrillTick::new(pool.clone(), my_name);
     let o = tick.run_record_and_alert().await;
@@ -559,6 +567,113 @@ pub async fn handle_fleet_db_drill(pool: &sqlx::PgPool) -> Result<()> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// Enqueue a restore-drill on a remote fleet computer via the deferred-task
+/// queue, then poll `backup_drills` for that node's result. Backing
+/// `ff fleet db drill --on <node>`: proves the backup fanned out to `<node>`
+/// AND is restorable there — the leader-loss recovery story, on the node that
+/// would actually take over.
+async fn enqueue_remote_drill(pool: &sqlx::PgPool, node: &str, me: &str) -> Result<()> {
+    println!(
+        "{CYAN}▶ ff fleet db drill --on {node}{RESET}  (dispatched from {me} via the defer queue)"
+    );
+    let baseline = chrono::Utc::now();
+    // The remote defer-worker runs this shell command; `ff` lives at the
+    // canonical install path. The drill records into the shared `backup_drills`
+    // table with `drill_node=<node>`, which is how we recover its result.
+    let payload = serde_json::json!({
+        "command": "\"$HOME/.local/bin/ff\" fleet db drill",
+        "summary": format!("backup restore-drill on {node}"),
+    });
+    let trigger_spec = serde_json::json!({ "node": node });
+    let id = ff_db::pg_enqueue_deferred(
+        pool,
+        &format!("backup restore-drill → {node}"),
+        "shell",
+        &payload,
+        "node_online",
+        &trigger_spec,
+        Some(node),
+        &serde_json::json!([]),
+        Some("ff fleet db drill --on"),
+        Some(3),
+    )
+    .await?;
+    println!(
+        "{GREEN}✓{RESET} enqueued drill task {id} (preferred_node={node}, trigger=node_online)"
+    );
+    println!(
+        "  waiting up to 200s for {node} to run it (the defer-worker claims pending tasks ~every 15s)…"
+    );
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(200);
+    loop {
+        #[allow(clippy::type_complexity)]
+        let row: Option<(
+            bool,
+            String,
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+            Option<bool>,
+            String,
+            Option<i64>,
+        )> = sqlx::query_as(
+            "SELECT success, stage, detail, file_count, extracted_bytes, pg_version, \
+                    verifybackup, backup_file, duration_ms \
+               FROM backup_drills \
+              WHERE drill_node = $1 AND started_at > $2 \
+              ORDER BY started_at DESC LIMIT 1",
+        )
+        .bind(node)
+        .bind(baseline)
+        .fetch_optional(pool)
+        .await?;
+
+        if let Some((
+            success,
+            stage,
+            detail,
+            file_count,
+            extracted_bytes,
+            pg_version,
+            verifybackup,
+            backup_file,
+            duration_ms,
+        )) = row
+        {
+            let detail = detail.unwrap_or_default();
+            if success {
+                println!(
+                    "{GREEN}✓ remote restore drill PASSED on {node}{RESET}  backup={} files={} bytes={} pg_version={} verifybackup={:?} ({}ms)",
+                    backup_file,
+                    file_count.unwrap_or(0),
+                    extracted_bytes.unwrap_or(0),
+                    pg_version.as_deref().unwrap_or("?"),
+                    verifybackup,
+                    duration_ms.unwrap_or(0),
+                );
+                println!("    {detail}");
+                return Ok(());
+            }
+            eprintln!(
+                "{RED}✗ remote restore drill FAILED on {node}{RESET}  backup={backup_file} stage={stage}\n    {detail}"
+            );
+            std::process::exit(1);
+        }
+
+        if std::time::Instant::now() >= deadline {
+            eprintln!(
+                "{YELLOW}⏱ no result from {node} within 200s.{RESET} The task may still be \
+                 queued/running — check `ff defer get {id}`. A worker that is offline or has \
+                 no backup copy won't report."
+            );
+            std::process::exit(2);
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+    }
 }
 
 /// `ff fleet db backup --kind <all|postgres|redis> [--now]` — force an
