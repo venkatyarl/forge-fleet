@@ -341,6 +341,16 @@ enum Command {
         /// killed after its sub-agents finished but before synthesis completed.
         #[arg(long, conflicts_with = "prompt")]
         recover: Option<String>,
+        /// Show a session's status + report (read-only; no re-synthesis). Use to
+        /// poll a `--detach` run. Pass the research_sessions UUID.
+        #[arg(long, conflicts_with_all = ["prompt", "recover"])]
+        show: Option<String>,
+        /// Detached run: queue the session and exit immediately. The fleet leader
+        /// (forgefleetd) runs the full pipeline in the background, so it survives
+        /// this CLI being killed. Prints the session id to stdout; poll it with
+        /// `ff research --show <id>`.
+        #[arg(long, default_value_t = false)]
+        detach: bool,
         /// Number of parallel sub-agents (= sub-questions decomposed by planner).
         #[arg(long, default_value_t = 5)]
         parallel: u32,
@@ -4440,6 +4450,8 @@ async fn main() -> Result<()> {
         Some(Command::Research {
             prompt,
             recover,
+            show,
+            detach,
             parallel,
             depth,
             output,
@@ -4449,7 +4461,9 @@ async fn main() -> Result<()> {
             no_web,
             verbose,
         }) => {
-            if let Some(session_id) = recover {
+            if let Some(session_id) = show {
+                research_cmd::handle_research_show(&session_id, output).await
+            } else if let Some(session_id) = recover {
                 research_cmd::handle_research_recover(&session_id, output).await
             } else {
                 match prompt {
@@ -4463,13 +4477,14 @@ async fn main() -> Result<()> {
                             planner_model,
                             subagent_model,
                             !no_web,
+                            detach,
                             verbose,
                         )
                         .await
                     }
                     None => Err(anyhow::anyhow!(
                         "ff research needs a question, or --recover <session-id> to \
-                         re-synthesize a killed run"
+                         re-synthesize a killed run, or --show <session-id> to view a run"
                     )),
                 }
             }

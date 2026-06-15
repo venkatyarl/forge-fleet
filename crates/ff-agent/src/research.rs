@@ -69,6 +69,13 @@ pub struct ResearchConfig {
     /// instruction is a lie. Default ON; `--no-web` disables it. Degrades
     /// gracefully: a failed/empty search just falls back to ungrounded.
     pub web_grounding: bool,
+    /// Detached mode. When true, [`ResearchSession::new`] inserts the row with
+    /// status `queued` and returns WITHOUT running it — the leader's
+    /// `forgefleetd` [`ResearchRunnerTick`] claims it and drives the run inside
+    /// the daemon, so it survives the originating CLI being killed. The report
+    /// lands in `research_sessions.report_markdown` (read it with
+    /// `ff research --show <id>`). Default false = run in the foreground.
+    pub detached: bool,
 }
 
 impl Default for ResearchConfig {
@@ -89,6 +96,7 @@ impl Default for ResearchConfig {
             subagent_model: String::new(),
             gateway_url: String::new(),
             web_grounding: true,
+            detached: false,
         }
     }
 }
@@ -271,13 +279,21 @@ impl ResearchSession {
             config.subagent_model = resolve_default_research_model(&pool, "code").await;
         }
         let id = Uuid::new_v4();
+        // Detached runs are inserted `queued` (started_at NULL until claimed) so
+        // the leader's ResearchRunnerTick picks them up and drives the run inside
+        // forgefleetd; foreground runs start `planning` immediately. `web_grounding`
+        // is persisted so a daemon-claimed run can faithfully reconstruct the
+        // config — see [`ResearchSession::claim_next_queued`].
+        let initial_status = research_initial_status(config.detached);
         sqlx::query(
             "INSERT INTO research_sessions
                 (id, query, status, depth, parallel, output_path, initiated_by,
                  planner_model, synth_model, started_at, metadata)
-             VALUES ($1, $2, 'planning', $3, $4, $5, $6, $7, $7, NOW(),
+             VALUES ($1, $2, $10, $3, $4, $5, $6, $7, $7,
+                     CASE WHEN $10 = 'queued' THEN NULL ELSE NOW() END,
                      jsonb_build_object('gateway_url', $8::text,
-                                        'subagent_model', $9::text))",
+                                        'subagent_model', $9::text,
+                                        'web_grounding', $11::bool))",
         )
         .bind(id)
         .bind(&config.query)
@@ -293,6 +309,8 @@ impl ResearchSession {
         .bind(&config.planner_model)
         .bind(&config.gateway_url)
         .bind(&config.subagent_model)
+        .bind(initial_status)
+        .bind(config.web_grounding)
         .execute(&pool)
         .await
         .context("insert research_session")?;
@@ -305,6 +323,83 @@ impl ResearchSession {
 
     pub fn id(&self) -> Uuid {
         self.session_id
+    }
+
+    /// Atomically claim the oldest `queued` (detached) research session and
+    /// rebuild a runnable [`ResearchSession`] from its persisted row, flipping
+    /// it to `planning` (and stamping `started_at`). Returns `Ok(None)` when no
+    /// session is queued.
+    ///
+    /// `FOR UPDATE SKIP LOCKED` makes the claim safe even if more than one
+    /// daemon ever runs this (only the live leader does today). The config is
+    /// reconstructed entirely from the row + `metadata` so the run is faithful
+    /// to what the originating `ff research --detach` requested.
+    pub async fn claim_next_queued(pool: PgPool) -> Result<Option<Self>> {
+        let row = sqlx::query(
+            "UPDATE research_sessions
+                SET status = 'planning', started_at = NOW()
+              WHERE id = (
+                  SELECT id FROM research_sessions
+                   WHERE status = 'queued'
+                   ORDER BY created_at ASC
+                   LIMIT 1
+                   FOR UPDATE SKIP LOCKED
+              )
+            RETURNING id, query, depth, parallel, output_path,
+                      planner_model, initiated_by, metadata",
+        )
+        .fetch_optional(&pool)
+        .await
+        .context("claim queued research session")?;
+
+        let Some(r) = row else {
+            return Ok(None);
+        };
+
+        let id: Uuid = r.get("id");
+        let query: String = r.get("query");
+        let depth: i32 = r.try_get("depth").unwrap_or(6);
+        let parallel: i32 = r.try_get("parallel").unwrap_or(5);
+        let output_path: Option<String> = r.try_get("output_path").unwrap_or(None);
+        let planner_model: Option<String> = r.try_get("planner_model").unwrap_or(None);
+        let initiated_by: Option<String> = r.try_get("initiated_by").unwrap_or(None);
+        let metadata: Value = r.try_get("metadata").unwrap_or(Value::Null);
+
+        let gateway_url = metadata
+            .get("gateway_url")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let subagent_model = metadata
+            .get("subagent_model")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        // Default ON to match ResearchConfig::default for any pre-detach rows
+        // that lack the key (none exist today, but be defensive).
+        let web_grounding = metadata
+            .get("web_grounding")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+
+        let config = ResearchConfig {
+            query,
+            depth: depth.max(0) as u32,
+            parallel: parallel.max(0) as u32,
+            output_path: output_path.map(PathBuf::from),
+            initiated_by: initiated_by.unwrap_or_else(whoami_tag),
+            planner_model: planner_model.unwrap_or_default(),
+            subagent_model,
+            gateway_url,
+            web_grounding,
+            detached: true,
+        };
+
+        Ok(Some(Self {
+            pool,
+            config,
+            session_id: id,
+        }))
     }
 
     pub async fn run(
@@ -1164,6 +1259,178 @@ pub async fn auto_recover_stale(
     Ok(summary)
 }
 
+/// Initial `research_sessions.status` for a new session. Detached runs MUST be
+/// `queued` so the leader's [`ResearchRunnerTick`] is the only thing that runs
+/// them; a foreground run starts `planning` immediately. Getting this wrong is a
+/// silent black hole — a detached row inserted as `planning` would never be
+/// claimed by the runner (it only claims `queued`) and never run by a CLI.
+pub fn research_initial_status(detached: bool) -> &'static str {
+    if detached { "queued" } else { "planning" }
+}
+
+/// A persisted research session's current state, for read-only display
+/// (`ff research --show <id>`). `report` is `Some` once synthesis finished.
+#[derive(Debug, Clone)]
+pub struct ResearchStatus {
+    pub id: Uuid,
+    pub query: String,
+    pub status: String,
+    pub report: Option<String>,
+    pub error: Option<String>,
+    pub subtask_total: i64,
+    pub subtask_done: i64,
+}
+
+/// Fetch a research session's status + (if finished) report for read-only
+/// display. Returns `Ok(None)` for an unknown id. Unlike `recover()` this never
+/// re-dispatches or re-synthesizes — it just reads what's in the DB, which is
+/// what you want for polling a detached (`--detach`) run.
+pub async fn fetch_status(pool: &PgPool, id: Uuid) -> Result<Option<ResearchStatus>> {
+    let row = sqlx::query(
+        "SELECT query, status, report_markdown, error,
+                (SELECT COUNT(*) FROM research_subtasks st WHERE st.session_id = s.id) AS sub_total,
+                (SELECT COUNT(*) FROM research_subtasks st
+                  WHERE st.session_id = s.id
+                    -- usable outputs: store_subtask_result maps Completed→'done',
+                    -- MaxTurns→'max_turns' (see the status match in run()).
+                    AND st.status IN ('done', 'max_turns')) AS sub_done
+           FROM research_sessions s
+          WHERE s.id = $1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+    .context("fetch research session status")?;
+
+    let Some(r) = row else {
+        return Ok(None);
+    };
+    Ok(Some(ResearchStatus {
+        id,
+        query: r.try_get("query").unwrap_or_default(),
+        status: r.try_get("status").unwrap_or_default(),
+        report: r.try_get("report_markdown").unwrap_or(None),
+        error: r.try_get("error").unwrap_or(None),
+        subtask_total: r.try_get("sub_total").unwrap_or(0),
+        subtask_done: r.try_get("sub_done").unwrap_or(0),
+    }))
+}
+
+/// How often `forgefleetd` checks for `queued` (detached) research sessions.
+const RESEARCH_RUNNER_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Max detached sessions to launch per tick. Each launched run gets its own
+/// detached task and proceeds to completion independently; this only bounds how
+/// many we *start* per 30s so a sudden burst of `--detach` submissions doesn't
+/// spike the leader. A backlog drains across successive ticks.
+const RESEARCH_RUNNER_MAX_PER_TICK: usize = 2;
+
+/// Leader heartbeat freshness window — matches the other leader-gated
+/// forgefleetd ticks (sweeper, amcheck, summary-refresh).
+const RESEARCH_RUNNER_LEADER_FRESH_SECS: i64 = 60;
+
+/// Production tick that drives detached (`ff research --detach`) runs to
+/// completion inside `forgefleetd` on the leader.
+///
+/// `ff research --detach` inserts a `queued` session and exits, so the run no
+/// longer dies with the originating CLI. This tick claims those sessions
+/// ([`ResearchSession::claim_next_queued`]) and spawns each [`ResearchSession::run`]
+/// as a detached task. If the *leader itself* dies mid-run, the stale-job
+/// sweeper + [`auto_recover_stale`] still salvage any completed sub-agent work —
+/// detach closes the remaining gap where a killed CLI lost the whole run.
+///
+/// Leader-gated on every fire (NOT at spawn): claiming + driving runs is a
+/// single-owner operation, so only the live leader does it. Safe to start on
+/// every daemon; followers no-op. New ticks live in `src/main.rs` (forgefleetd)
+/// per [`feedback_two_daemons`].
+pub struct ResearchRunnerTick {
+    pg: PgPool,
+    my_name: String,
+}
+
+impl ResearchRunnerTick {
+    pub fn new(pg: PgPool, my_name: String) -> Self {
+        Self { pg, my_name }
+    }
+
+    /// True iff `fleet_leader_state` names us AND its heartbeat is fresh.
+    async fn is_live_leader(&self) -> bool {
+        match ff_db::leader_state::pg_get_current_leader(&self.pg).await {
+            Ok(Some(leader)) => {
+                let fresh = chrono::Utc::now()
+                    .signed_duration_since(leader.heartbeat_at)
+                    .num_seconds()
+                    < RESEARCH_RUNNER_LEADER_FRESH_SECS;
+                leader.member_name == self.my_name && fresh
+            }
+            Ok(None) => false,
+            Err(e) => {
+                warn!(error = %e, "research runner: failed to read leader state");
+                false
+            }
+        }
+    }
+
+    /// Spawn the 30s detached-run loop. Leadership is gated inside the loop on
+    /// every fire, so this is safe to start on every daemon.
+    pub fn spawn(
+        self,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(RESEARCH_RUNNER_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        if !self.is_live_leader().await {
+                            continue;
+                        }
+                        for _ in 0..RESEARCH_RUNNER_MAX_PER_TICK {
+                            match ResearchSession::claim_next_queued(self.pg.clone()).await {
+                                Ok(Some(session)) => {
+                                    let id = session.id();
+                                    info!(session = %id, "research runner: launching detached session");
+                                    // Detached: the run drives itself to completion
+                                    // (writing report_markdown + terminal status)
+                                    // independent of this tick's cadence.
+                                    tokio::spawn(async move {
+                                        match session.run(None).await {
+                                            Ok(rep) => info!(
+                                                session = %id,
+                                                subtasks = rep.subtask_count,
+                                                succeeded = rep.subtasks_succeeded,
+                                                "research runner: detached session complete"
+                                            ),
+                                            Err(e) => warn!(
+                                                session = %id, error = %e,
+                                                "research runner: detached session failed \
+                                                 (sweeper/auto-recover will salvage partial work)"
+                                            ),
+                                        }
+                                    });
+                                }
+                                Ok(None) => break,
+                                Err(e) => {
+                                    warn!(error = %e, "research runner: claim failed");
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() {
+                            info!("research runner shutting down");
+                            break;
+                        }
+                    }
+                }
+            }
+        })
+    }
+}
+
 /// Remove `<think>…</think>` (and `<thinking>…</thinking>`) blocks from a
 /// reasoning model's output. Lazy match, multiline. Leaves the rest intact
 /// and trims leading whitespace left behind after the strip.
@@ -1260,6 +1527,26 @@ mod auto_recover_tests {
     fn summary_defaults_to_zero() {
         let s = AutoRecoverSummary::default();
         assert_eq!((s.attempted, s.recovered, s.failed), (0, 0, 0));
+    }
+}
+
+#[cfg(test)]
+mod detach_tests {
+    use super::{ResearchConfig, research_initial_status};
+
+    #[test]
+    fn detached_inserts_queued_foreground_planning() {
+        // The runner ONLY claims `queued`; a foreground run starts `planning`.
+        // If these ever diverge, detached sessions silently never run.
+        assert_eq!(research_initial_status(true), "queued");
+        assert_eq!(research_initial_status(false), "planning");
+    }
+
+    #[test]
+    fn default_config_is_foreground() {
+        // `--detach` is opt-in: every existing caller (and the default) must keep
+        // running in the foreground so behavior is unchanged unless asked.
+        assert!(!ResearchConfig::default().detached);
     }
 }
 
