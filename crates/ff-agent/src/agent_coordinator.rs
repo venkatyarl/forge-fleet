@@ -159,13 +159,16 @@ impl AgentCoordinator {
             }))
         } else {
             // Any idle slot, preferring (GAP-F) computers that actually have a
-            // healthy tool-capable LLM, then online, then lowest slot. Without
-            // the first key the picker landed on idle slots of LLM-less hosts
-            // (~half the fleet) and `dispatch_task` then failed with "no active
-            // LLM" — observed 6/8 in a concurrent smoke test. This is a
+            // healthy tool-capable LLM, then online; WITHIN that tier pick a
+            // RANDOM idle slot (GAP-H), not the lowest. Without the LLM key the
+            // picker landed on LLM-less hosts ("no active LLM"); with a
+            // DETERMINISTIC final key (slot ASC) every concurrent dispatcher
+            // picked the SAME top slot and marched in lockstep, exhausting the
+            // claim-CAS retry budget ("pool contended" — 2/10 in a smoke test).
+            // `random()` spreads N concurrent callers across the idle slots of
+            // the preferred computers, collapsing CAS contention. Still a
             // PREFERENCE, not a filter: if only LLM-less hosts have idle slots
-            // we still return one (no regression vs. the old behaviour), and
-            // `run_and_persist` surfaces the real "no LLM" error in that case.
+            // one is still returned (no regression).
             let row: Option<(Uuid, Uuid, String, i32)> = sqlx::query_as(
                 "SELECT sa.id, sa.computer_id, c.name, sa.slot \
                  FROM sub_agents sa \
@@ -181,7 +184,7 @@ impl AgentCoordinator {
                        AND d.desired_state = 'active' \
                        AND cat.tool_calling = true \
                    ) DESC, \
-                   (c.status = 'online') DESC, sa.slot ASC \
+                   (c.status = 'online') DESC, random() \
                  LIMIT 1",
             )
             .bind(exclude)
