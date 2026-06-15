@@ -40,6 +40,12 @@ fn is_failed_status(status: &str) -> bool {
     matches!(status, "failed" | "cancelled" | "canceled")
 }
 
+/// Terminal task statuses — a watch poll stops here. `handed_off` and `paused`
+/// are NOT terminal: the task keeps progressing toward completed/failed.
+fn is_terminal_task_status(status: &str) -> bool {
+    matches!(status, "completed" | "failed" | "cancelled" | "canceled")
+}
+
 /// Derive a [`TaskErrorClass`] on the fly from an already-stored task row.
 ///
 /// Reads `stdout`/`stderr`/`exit` out of the result JSON (shape
@@ -295,7 +301,58 @@ pub async fn handle_tasks_list(
 }
 
 /// Show full detail for one task.
-pub async fn handle_tasks_get(pg: &PgPool, id: uuid::Uuid, json: bool) -> Result<()> {
+pub async fn handle_tasks_get(pg: &PgPool, id: uuid::Uuid, json: bool, watch: bool) -> Result<()> {
+    // --watch: poll the status column until the task is terminal, printing a
+    // progress line to stderr only when it changes (status / pct / message), then
+    // fall through to the normal one-shot fetch+print below. Bounded by a hard cap
+    // so a stuck/never-claimed task can't hang the CLI forever. Mirrors
+    // `ff research --show --watch`.
+    if watch {
+        use crate::{CYAN, RESET};
+        const POLL_SECS: u64 = 3;
+        const MAX_WAIT_SECS: u64 = 3600;
+        let mut waited = 0u64;
+        let mut last_line = String::new();
+        loop {
+            let r = sqlx::query(
+                "SELECT status, progress_pct, progress_message FROM fleet_tasks WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_optional(pg)
+            .await?;
+            let Some(r) = r else {
+                anyhow::bail!("task {id} not found");
+            };
+            let status: String = r.try_get("status")?;
+            if is_terminal_task_status(&status) {
+                break;
+            }
+            let pct: Option<f32> = r.try_get("progress_pct").ok();
+            let msg: Option<String> = r.try_get("progress_message").ok();
+            let line = format!(
+                "● {status}{}{}",
+                pct.map(|p| format!("  {p:.0}%")).unwrap_or_default(),
+                msg.as_deref()
+                    .filter(|m| !m.is_empty())
+                    .map(|m| format!("  — {m}"))
+                    .unwrap_or_default(),
+            );
+            if line != last_line {
+                eprintln!("{CYAN}{line}{RESET}  \x1b[2m(waited {waited}s){RESET}");
+                last_line = line;
+            }
+            if waited >= MAX_WAIT_SECS {
+                eprintln!(
+                    "\x1b[2m  watch timeout after {waited}s — task still {status}; \
+                     re-run --watch to keep polling{RESET}"
+                );
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(POLL_SECS)).await;
+            waited += POLL_SECS;
+        }
+    }
+
     let row = sqlx::query(
         "SELECT t.id, t.parent_task_id, t.task_type, t.summary, t.payload,
                 t.priority, t.requires_capability, t.status, c.name as claimer_name,
@@ -538,6 +595,19 @@ mod tests {
                 unknown_status_parts(s).is_empty(),
                 "status {s} should be known"
             );
+        }
+    }
+
+    #[test]
+    fn terminal_task_status_matches_only_terminal_states() {
+        // Terminal — a --watch poll stops here.
+        for s in ["completed", "failed", "cancelled", "canceled"] {
+            assert!(is_terminal_task_status(s), "{s} should be terminal");
+        }
+        // Non-terminal — the task is still progressing; watch keeps polling.
+        // handed_off and paused are explicitly NOT terminal.
+        for s in ["pending", "claimed", "running", "handed_off", "paused"] {
+            assert!(!is_terminal_task_status(s), "{s} should NOT be terminal");
         }
     }
 
