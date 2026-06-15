@@ -1,6 +1,50 @@
 use crate::{CYAN, GREEN, RESET, truncate_str};
 use anyhow::Result;
+use sqlx::PgPool;
 use std::path::PathBuf;
+
+/// Parse a comma-separated `--exclude` worker-name list (e.g. `"sia,adele"`)
+/// into trimmed, de-duplicated, non-empty names. Pure — split out from the DB
+/// validation so the parsing is unit-testable without a Postgres pool.
+fn parse_exclude_names(exclude: &str) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for raw in exclude.split(',') {
+        let name = raw.trim();
+        if !name.is_empty() && !names.iter().any(|n| n == name) {
+            names.push(name.to_string());
+        }
+    }
+    names
+}
+
+/// Validate a `--exclude` worker-name list against the `computers` table.
+/// Unknown names are warned about and dropped (never silently passed through as
+/// a no-op exclusion), matching `ff swarm run --exclude` / `ff tasks add
+/// --exclude`. Returns the validated names; the routing scorer matches them
+/// case-insensitively against `worker_name`.
+async fn resolve_exclude_hosts(pool: &PgPool, exclude: &str) -> Vec<String> {
+    let names = parse_exclude_names(exclude);
+    let mut resolved: Vec<String> = Vec::new();
+    for name in &names {
+        match sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM computers WHERE name = $1")
+            .bind(name)
+            .fetch_one(pool)
+            .await
+        {
+            Ok(n) if n > 0 => resolved.push(name.clone()),
+            Ok(_) => eprintln!("warning: --exclude '{name}' matches no computer; skipping"),
+            Err(e) => eprintln!("warning: resolving --exclude '{name}': {e}; skipping"),
+        }
+    }
+    if !resolved.is_empty() {
+        eprintln!(
+            "{CYAN}[exclude]{RESET} keeping sub-agents off {} host(s): {}",
+            resolved.len(),
+            resolved.join(", ")
+        );
+    }
+    resolved
+}
 
 pub async fn handle_research(
     prompt: &str,
@@ -12,6 +56,7 @@ pub async fn handle_research(
     subagent_model: Option<String>,
     web_grounding: bool,
     detached: bool,
+    exclude: &str,
     verbose: bool,
 ) -> Result<()> {
     let pool = ff_agent::fleet_info::get_fleet_pool()
@@ -20,6 +65,14 @@ pub async fn handle_research(
     ff_db::run_postgres_migrations(&pool)
         .await
         .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
+
+    // Resolve --exclude worker names → validated list. Unknown names are
+    // surfaced as a warning and dropped (never silently kept as a no-op), so a
+    // typo can't quietly fail to exclude the host you meant — same contract as
+    // `ff swarm run --exclude` / `ff tasks add --exclude`. The router matches
+    // names case-insensitively against worker_name, so we pass the names through
+    // as-is once validated.
+    let exclude_hosts = resolve_exclude_hosts(&pool, exclude).await;
 
     let config = ff_agent::research::ResearchConfig {
         query: prompt.to_string(),
@@ -31,6 +84,7 @@ pub async fn handle_research(
         subagent_model: subagent_model.unwrap_or_default(),
         web_grounding,
         detached,
+        exclude_hosts,
         ..Default::default()
     };
 
@@ -114,6 +168,23 @@ pub async fn handle_research(
     eprintln!();
     println!("{}", report.markdown);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_exclude_names;
+
+    #[test]
+    fn parse_exclude_names_trims_dedups_and_drops_empties() {
+        assert_eq!(parse_exclude_names(""), Vec::<String>::new());
+        assert_eq!(parse_exclude_names("  "), Vec::<String>::new());
+        assert_eq!(
+            parse_exclude_names("sia, adele ,rihanna"),
+            vec!["sia", "adele", "rihanna"]
+        );
+        assert_eq!(parse_exclude_names(",taylor,,"), vec!["taylor"]);
+        assert_eq!(parse_exclude_names("sia,sia,adele"), vec!["sia", "adele"]);
+    }
 }
 
 /// `ff research --show <session-id>` — read-only status + report for a session.
