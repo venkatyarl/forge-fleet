@@ -59,7 +59,10 @@ pub async fn handle_ports_list(
     }
 
     if rows.is_empty() {
-        println!("{YELLOW}No rows in port_registry. Run `ff ports seed` first.{RESET}");
+        println!(
+            "{YELLOW}No rows in port_registry. Migrations seed the canonical ports; \
+             add a new one with `ff ports add <port> <service> ...`.{RESET}"
+        );
         return Ok(());
     }
 
@@ -268,6 +271,76 @@ pub async fn handle_ports_scan(pool: &sqlx::PgPool, computer: &str) -> Result<()
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_ports_add(
+    pool: &sqlx::PgPool,
+    port: i32,
+    service: String,
+    kind: String,
+    description: String,
+    exposed_on: String,
+    scope: String,
+    managed_by: Option<String>,
+    status: String,
+) -> Result<()> {
+    // ForgeFleet-owned services use 5-digit ports (registered + lint-enforced).
+    // External daemons (NATS 4222, Redis 6380, ollama 11434) are exceptions, so
+    // this is a warning, not a hard reject.
+    if !(10000..=65535).contains(&port) {
+        println!(
+            "{YELLOW}⚠ {port} is not a 5-digit port. ForgeFleet-owned services should use \
+             a 5-digit port; only register a smaller port for an external daemon.{RESET}"
+        );
+    }
+    const VALID_STATUS: [&str; 3] = ["active", "planned", "deprecated"];
+    if !VALID_STATUS.contains(&status.as_str()) {
+        println!(
+            "{YELLOW}⚠ status '{status}' is non-standard (expected one of {}). Stored as-is.{RESET}",
+            VALID_STATUS.join(" | ")
+        );
+    }
+
+    // Detect insert-vs-update so the confirmation message is accurate.
+    let existed: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM port_registry WHERE port = $1)")
+            .bind(port)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| anyhow::anyhow!("probe port_registry: {e}"))?;
+
+    sqlx::query(
+        "INSERT INTO port_registry
+             (port, service, kind, description, exposed_on, scope, managed_by, status, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+         ON CONFLICT (port) DO UPDATE SET
+             service     = EXCLUDED.service,
+             kind        = EXCLUDED.kind,
+             description = EXCLUDED.description,
+             exposed_on  = EXCLUDED.exposed_on,
+             scope       = EXCLUDED.scope,
+             managed_by  = EXCLUDED.managed_by,
+             status      = EXCLUDED.status,
+             updated_at  = NOW()",
+    )
+    .bind(port)
+    .bind(&service)
+    .bind(&kind)
+    .bind(&description)
+    .bind(&exposed_on)
+    .bind(&scope)
+    .bind(&managed_by)
+    .bind(&status)
+    .execute(pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("upsert port_registry: {e}"))?;
+
+    let verb = if existed { "Updated" } else { "Registered" };
+    println!(
+        "{GREEN}✓ {verb} port {port}{RESET} — {service} ({kind}, {status}) exposed on {exposed_on} [{scope}]"
+    );
+    Ok(())
+}
+
 pub async fn handle_ports(cmd: crate::PortsCommand) -> Result<()> {
     let pool = ff_agent::fleet_info::get_fleet_pool()
         .await
@@ -281,5 +354,28 @@ pub async fn handle_ports(cmd: crate::PortsCommand) -> Result<()> {
             handle_ports_list(&pool, kind, scope, json).await
         }
         crate::PortsCommand::Scan { computer } => handle_ports_scan(&pool, &computer).await,
+        crate::PortsCommand::Add {
+            port,
+            service,
+            kind,
+            description,
+            exposed_on,
+            scope,
+            managed_by,
+            status,
+        } => {
+            handle_ports_add(
+                &pool,
+                port,
+                service,
+                kind,
+                description,
+                exposed_on,
+                scope,
+                managed_by,
+                status,
+            )
+            .await
+        }
     }
 }
