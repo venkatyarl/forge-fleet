@@ -281,6 +281,11 @@ mod tests {
 /// legacy `ff daemon` used so orphaned `running` rows are recovered promptly.
 const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// Max research sessions to auto-recover per sweep pass. Each recovery is one
+/// gateway synthesis call, so this caps the LLM work a single tick can drive;
+/// a backlog drains across successive 5-minute passes.
+const RESEARCH_AUTO_RECOVER_LIMIT: i64 = 3;
+
 /// The leader's Postgres `heartbeat_at` must be fresher than this for us to
 /// consider ourselves the live leader. Matches the 60s window the other
 /// leader-gated forgefleetd ticks (amcheck, summary-refresh) use.
@@ -368,6 +373,28 @@ impl StaleJobSweeperTick {
                             ),
                             Ok(_) => {}
                             Err(e) => tracing::warn!(error = %e, "stale-job sweeper: pass failed"),
+                        }
+
+                        // Autonomously finish research runs the sweep just (or
+                        // previously) reaped to `failed`: their sub-agent work
+                        // survives in `research_subtasks`, so synthesize the
+                        // report without waiting for an operator to run
+                        // `ff research --recover`. Bounded per session.
+                        match crate::research::auto_recover_stale(
+                            &self.pg,
+                            crate::research::MAX_AUTO_RECOVER_ATTEMPTS,
+                            RESEARCH_AUTO_RECOVER_LIMIT,
+                        )
+                        .await
+                        {
+                            Ok(r) if r.attempted > 0 => tracing::info!(
+                                attempted = r.attempted,
+                                recovered = r.recovered,
+                                failed = r.failed,
+                                "stale-job sweeper: auto-recovered reaped research sessions"
+                            ),
+                            Ok(_) => {}
+                            Err(e) => tracing::warn!(error = %e, "auto-recover research: pass failed"),
                         }
                     }
                     changed = shutdown.changed() => {

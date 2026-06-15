@@ -1068,6 +1068,102 @@ impl ResearchSession {
     }
 }
 
+/// Outcome of one [`auto_recover_stale`] pass.
+#[derive(Debug, Clone, Default)]
+pub struct AutoRecoverSummary {
+    /// Sessions a recovery synthesis was attempted on this pass.
+    pub attempted: usize,
+    /// Sessions that produced a report (status flipped to `done`/`failed`
+    /// with `report_markdown` set).
+    pub recovered: usize,
+    /// Sessions whose recovery synthesis errored (gateway down, etc.) — they
+    /// stay `failed` and are retried on a later pass until `max_attempts`.
+    pub failed: usize,
+}
+
+/// Default cap on autonomous recovery attempts per session. Manual
+/// `ff research --recover <id>` always works regardless of this cap.
+pub const MAX_AUTO_RECOVER_ATTEMPTS: i64 = 2;
+
+/// Autonomous counterpart to `ff research --recover`: find `failed` research
+/// sessions that have persisted sub-task output but never got a synthesized
+/// report, and run the synthesizer-only recovery on each — no operator needed.
+///
+/// A run whose foreground CLI was killed (or whose synthesis timed out) is
+/// reaped to `failed` by the stale-job sweeper, but its expensive sub-agent
+/// work survives in `research_subtasks`. `recover()` turns that latent work
+/// into a finished report; this fn finds every such session and drives it.
+///
+/// Bounded so a permanently-unsynthesizable session can't burn LLM calls
+/// forever: each attempt bumps `metadata.auto_recover_attempts` BEFORE the
+/// synthesis runs (so a hang/panic still counts), and sessions at or above
+/// `max_attempts` are skipped. A successful recovery sets `report_markdown`,
+/// which removes the session from the candidate set on its own.
+///
+/// Leader-gate this at the call site — it is a fleet-wide DB scan plus N
+/// gateway calls; only one daemon should drive it.
+pub async fn auto_recover_stale(
+    pool: &PgPool,
+    max_attempts: i64,
+    limit: i64,
+) -> Result<AutoRecoverSummary> {
+    let candidates = sqlx::query_scalar::<_, Uuid>(
+        "SELECT s.id
+           FROM research_sessions s
+          WHERE s.status = 'failed'
+            AND s.report_markdown IS NULL
+            AND s.planner_output IS NOT NULL
+            AND COALESCE((s.metadata->>'auto_recover_attempts')::int, 0) < $1
+            AND EXISTS (
+                SELECT 1 FROM research_subtasks st
+                 WHERE st.session_id = s.id
+                   AND COALESCE(st.output_markdown, '') <> ''
+            )
+          ORDER BY s.created_at
+          LIMIT $2",
+    )
+    .bind(max_attempts)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .context("auto_recover: select candidates")?;
+
+    let mut summary = AutoRecoverSummary::default();
+    for id in candidates {
+        // Record the attempt FIRST — if recovery hangs or the process dies
+        // mid-synthesis, this session is still counted toward max_attempts and
+        // can't be retried forever.
+        if let Err(e) = sqlx::query(
+            "UPDATE research_sessions
+                SET metadata = jsonb_set(
+                        metadata,
+                        '{auto_recover_attempts}',
+                        to_jsonb(COALESCE((metadata->>'auto_recover_attempts')::int, 0) + 1),
+                        true)
+              WHERE id = $1",
+        )
+        .bind(id)
+        .execute(pool)
+        .await
+        {
+            warn!(session = %id, error = %e, "auto_recover: bump attempt counter failed; skipping");
+            continue;
+        }
+        summary.attempted += 1;
+        match ResearchSession::recover(pool.clone(), id).await {
+            Ok(_) => {
+                summary.recovered += 1;
+                info!(session = %id, "auto_recover: synthesized report for reaped research session");
+            }
+            Err(e) => {
+                summary.failed += 1;
+                warn!(session = %id, error = %e, "auto_recover: synthesis failed (retried up to max_attempts)");
+            }
+        }
+    }
+    Ok(summary)
+}
+
 /// Remove `<think>…</think>` (and `<thinking>…</thinking>`) blocks from a
 /// reasoning model's output. Lazy match, multiline. Leaves the rest intact
 /// and trims leading whitespace left behind after the strip.
@@ -1145,6 +1241,25 @@ mod think_strip_tests {
         // Some models emit <THINK> uppercase.
         let s = "<THINK>x</THINK>answer";
         assert_eq!(strip_think_blocks(s), "answer");
+    }
+}
+
+#[cfg(test)]
+mod auto_recover_tests {
+    use super::{AutoRecoverSummary, MAX_AUTO_RECOVER_ATTEMPTS};
+
+    #[test]
+    fn attempt_cap_is_bounded_and_positive() {
+        // Must allow at least one retry (gateway blips) but never be unbounded —
+        // a permanently-unsynthesizable session must stop burning LLM calls.
+        assert!(MAX_AUTO_RECOVER_ATTEMPTS >= 1);
+        assert!(MAX_AUTO_RECOVER_ATTEMPTS <= 5);
+    }
+
+    #[test]
+    fn summary_defaults_to_zero() {
+        let s = AutoRecoverSummary::default();
+        assert_eq!((s.attempted, s.recovered, s.failed), (0, 0, 0));
     }
 }
 
