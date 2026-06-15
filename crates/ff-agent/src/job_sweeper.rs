@@ -12,6 +12,10 @@ use chrono::{DateTime, Duration, Utc};
 pub struct SweepSummary {
     pub jobs_failed: usize,
     pub deferred_failed: usize,
+    /// `research_sessions` rows recovered (stuck in a non-terminal status).
+    pub research_sessions_failed: usize,
+    /// `research_subtasks` rows recovered (stuck in `running`).
+    pub research_subtasks_failed: usize,
 }
 
 /// Configuration for what counts as "stale".
@@ -21,6 +25,12 @@ pub struct SweepPolicy {
     pub job_stale_after: Duration,
     /// A deferred task is stale if `claimed_at` is older than this with status=running.
     pub deferred_stale_after: Duration,
+    /// A research session is stale if `created_at` is older than this while its
+    /// status is still non-terminal (`planning`/`dispatching`). Unlike
+    /// `deferred_tasks`, research sub-agents run *inside* the foreground
+    /// `ff research` process — there is no worker to re-claim them — so if that
+    /// process dies the session and its `running` subtasks are orphaned forever.
+    pub research_stale_after: Duration,
 }
 
 impl Default for SweepPolicy {
@@ -30,6 +40,13 @@ impl Default for SweepPolicy {
             job_stale_after: Duration::hours(2),
             // Shell deferred tasks should finish in minutes; if they don't, something's wrong.
             deferred_stale_after: Duration::minutes(30),
+            // A live `ff research` run (planner + N parallel sub-agents at the
+            // default depth on slow local models) can take a while; 1h is well
+            // past any legitimate run, so only genuinely orphaned sessions
+            // (process killed/crashed) qualify. Aged off `created_at`, so a
+            // session stuck in `planning` because the planner itself died is
+            // recovered too.
+            research_stale_after: Duration::hours(1),
         }
     }
 }
@@ -121,6 +138,54 @@ pub async fn sweep_stale(
         }
     }
 
+    // ── research_sessions / research_subtasks ────────────────────────────
+    // `ff research` decomposes + dispatches + synthesizes all inside ONE
+    // foreground process: the sub-agent loops are not daemon-managed, so if that
+    // process is killed/crashes, the session is left in a non-terminal status
+    // (`planning` if the planner died, `dispatching` after) and its sub-agents'
+    // rows stay `running` forever — no worker ever re-claims them. (Observed:
+    // 25-day-old `planning` sessions accumulating.) Recover both, gated on the
+    // SESSION's `created_at` so never-started `pending` subtasks are covered too.
+    let research_cutoff = now - policy.research_stale_after;
+
+    // 1) Fail the orphaned sub-agent rows of stale sessions first, so a
+    //    re-run/inspection sees consistent terminal state.
+    let subtasks = sqlx::query(
+        "UPDATE research_subtasks st
+            SET status = 'failed',
+                completed_at = NOW(),
+                error = COALESCE(st.error, 'reaped by sweeper — research orchestrator process died (stuck running)')
+           FROM research_sessions s
+          WHERE st.session_id = s.id
+            AND st.status = 'running'
+            AND s.status NOT IN ('done', 'failed')
+            AND s.created_at < $1",
+    )
+    .bind(research_cutoff)
+    .execute(pool)
+    .await;
+    match subtasks {
+        Ok(r) => summary.research_subtasks_failed = r.rows_affected() as usize,
+        Err(e) => tracing::warn!("pg sweep research_subtasks: {e}"),
+    }
+
+    // 2) Fail the stale sessions themselves.
+    let sessions = sqlx::query(
+        "UPDATE research_sessions
+            SET status = 'failed',
+                completed_at = NOW(),
+                error = COALESCE(error, 'reaped by sweeper — orchestrator process died before synthesis (stuck in non-terminal status)')
+          WHERE status NOT IN ('done', 'failed')
+            AND created_at < $1",
+    )
+    .bind(research_cutoff)
+    .execute(pool)
+    .await;
+    match sessions {
+        Ok(r) => summary.research_sessions_failed = r.rows_affected() as usize,
+        Err(e) => tracing::warn!("pg sweep research_sessions: {e}"),
+    }
+
     Ok(summary)
 }
 
@@ -142,6 +207,9 @@ mod tests {
         let p = SweepPolicy::default();
         assert_eq!(p.job_stale_after, Duration::hours(2));
         assert_eq!(p.deferred_stale_after, Duration::minutes(30));
+        // Research sessions: generous enough not to reap a live `ff research`
+        // run, short enough that orphans (process killed) clear within the hour.
+        assert_eq!(p.research_stale_after, Duration::hours(1));
     }
 
     #[test]
@@ -228,9 +296,14 @@ impl StaleJobSweeperTick {
                             continue;
                         }
                         match sweep_stale(&self.pg, &self.policy).await {
-                            Ok(s) if s.jobs_failed + s.deferred_failed > 0 => tracing::info!(
+                            Ok(s) if s.jobs_failed
+                                + s.deferred_failed
+                                + s.research_sessions_failed
+                                + s.research_subtasks_failed > 0 => tracing::info!(
                                 jobs_failed = s.jobs_failed,
                                 deferred_failed = s.deferred_failed,
+                                research_sessions_failed = s.research_sessions_failed,
+                                research_subtasks_failed = s.research_subtasks_failed,
                                 "stale-job sweeper: recovered stuck running rows"
                             ),
                             Ok(_) => {}
