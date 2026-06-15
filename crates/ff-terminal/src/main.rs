@@ -2858,6 +2858,14 @@ pub enum ModelCommand {
         /// viable candidate host (mutates the defer queue). Off by default.
         #[arg(long, default_value_t = false)]
         remediate: bool,
+        /// Print, per task, WHICH deployed model credits it and via which
+        /// path (catalog tag, operator `preferred_model_ids`, or task alias).
+        /// Read-only — makes the fuzzy deployment↔catalog matching observable
+        /// so a "why is this task a gap / covered?" question is answerable
+        /// without re-deriving `normalize_model_id` by hand. Implies no
+        /// remediation.
+        #[arg(long, default_value_t = false)]
+        explain: bool,
     },
     /// Reconcile live deployments into `model_catalog` (coverage self-heal).
     ///
