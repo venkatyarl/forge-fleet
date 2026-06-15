@@ -41,6 +41,26 @@ pub enum ConformanceCommand {
         #[arg(long, default_value = "amd-training")]
         role: String,
     },
+    /// Plan remediation for non-conformant hosts. DEFAULT = dry-run (prints the
+    /// plan, changes nothing). `--apply` runs ONLY the auto-safe actions (the
+    /// kfd_access group fix); host-mutating recipes (torch wheel / ROCm install)
+    /// are always operator-reviewed and never auto-run.
+    Remediate {
+        /// Limit to a single host (by name); default = all in-scope hosts.
+        #[arg(long)]
+        host: Option<String>,
+        /// Conformance role to remediate.
+        #[arg(long, default_value = "amd-training")]
+        role: String,
+        /// Actuate the AUTO-SAFE actions (skips Manual ones). Without this flag
+        /// nothing runs. Intended for an operator at a terminal — autopilot
+        /// loops must never pass it.
+        #[arg(long)]
+        apply: bool,
+        /// Emit JSON instead of the human plan.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Dispatch `ff conformance <sub>`. Opens a short-lived PgPool from
@@ -56,6 +76,12 @@ pub async fn run(command: ConformanceCommand) -> Result<()> {
         } => handle_check(&pg, host.as_deref(), &role, record, json).await,
         ConformanceCommand::Profiles => handle_profiles(&pg).await,
         ConformanceCommand::Report { role } => handle_report(&pg, &role).await,
+        ConformanceCommand::Remediate {
+            host,
+            role,
+            apply,
+            json,
+        } => handle_remediate(&pg, host.as_deref(), &role, apply, json).await,
     }
 }
 
@@ -281,6 +307,153 @@ pub async fn handle_profiles(pg: &PgPool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `ff conformance remediate [--host H] [--role R] [--apply] [--json]`.
+///
+/// Runs a fresh (read-only) conformance check, then maps each non-conformant
+/// gate to a remediation action. DEFAULT is a dry-run plan; `--apply` actuates
+/// ONLY the auto-safe actions. Manual recipes are always printed, never run.
+pub async fn handle_remediate(
+    pg: &PgPool,
+    host: Option<&str>,
+    role: &str,
+    apply: bool,
+    json: bool,
+) -> Result<()> {
+    let checked_by = ff_agent::fleet_info::resolve_this_worker_name().await;
+    let me = ff_agent::fleet_info::resolve_this_worker_name().await;
+
+    let hosts = match host {
+        Some(name) => {
+            let c = conformance::get_computer(pg, name)
+                .await?
+                .with_context(|| format!("computer '{name}' not found"))?;
+            vec![c]
+        }
+        None => conformance::hosts_in_scope(pg, role).await?,
+    };
+
+    if hosts.is_empty() {
+        println!("No in-scope hosts for role '{role}'.");
+        return Ok(());
+    }
+
+    // Build a plan per host from a LIVE check (record=false — planning never
+    // mutates the recorded conformance state).
+    let mut plans = Vec::new();
+    for c in &hosts {
+        if let Some(report) = conformance::check_host(pg, c, role, &checked_by, false).await? {
+            let plan = conformance::plan_remediation(&report, &c.ssh_user);
+            plans.push((c.clone(), plan));
+        }
+    }
+
+    if json {
+        print_remediation_json(&plans);
+        // JSON mode is report-only; never actuate (autopilot-safe).
+        return Ok(());
+    }
+
+    let mut total_auto = 0usize;
+    let mut total_manual = 0usize;
+    for (_c, plan) in &plans {
+        if plan.actions.is_empty() {
+            println!(
+                "\n{}  [CONFORMANT]  profile={}  — nothing to remediate.",
+                plan.computer, plan.profile_key
+            );
+            continue;
+        }
+        println!(
+            "\n{}  [NON-CONFORMANT]  profile={}",
+            plan.computer, plan.profile_key
+        );
+        for a in &plan.actions {
+            total_auto += usize::from(a.class == conformance::RemediationClass::AutoSafe);
+            total_manual += usize::from(a.class == conformance::RemediationClass::Manual);
+            println!(
+                "  [{}] {:<12} ({:<8}) {}",
+                a.class.as_str(),
+                a.check_key,
+                a.severity,
+                a.reason
+            );
+            if let Some(cmd) = &a.command {
+                println!("        cmd: {cmd}");
+            }
+            println!("        → {}", a.guidance);
+        }
+    }
+
+    println!(
+        "\nPlan: {total_auto} auto-safe action(s), {total_manual} manual (operator-reviewed) action(s)."
+    );
+
+    if !apply {
+        if total_auto > 0 {
+            println!(
+                "Dry-run. Re-run with --apply to actuate the auto-safe action(s); manual ones are never auto-run."
+            );
+        }
+        return Ok(());
+    }
+
+    // --apply: actuate ONLY auto-safe actions.
+    if total_auto == 0 {
+        println!("--apply: no auto-safe actions to run.");
+        return Ok(());
+    }
+    println!("\n--apply: actuating {total_auto} auto-safe action(s)...");
+    let mut applied_ok = 0usize;
+    for (c, plan) in &plans {
+        for a in plan.auto_safe() {
+            let Some(cmd) = &a.command else { continue };
+            print!("  {} :: {cmd} ... ", c.name);
+            let (ok, out) = conformance::apply_remote_command(c, cmd, &me).await;
+            if ok {
+                applied_ok += 1;
+                println!("OK");
+            } else {
+                println!("FAILED");
+                if !out.trim().is_empty() {
+                    println!("      {}", out.trim());
+                }
+            }
+        }
+    }
+    println!(
+        "\nApplied {applied_ok}/{total_auto} auto-safe action(s). Restart forgefleetd on changed \
+         hosts (new groups apply on process re-exec), then `ff conformance check` to confirm."
+    );
+    Ok(())
+}
+
+fn print_remediation_json(plans: &[(conformance::ComputerRow, conformance::RemediationPlan)]) {
+    let arr: Vec<serde_json::Value> = plans
+        .iter()
+        .map(|(_c, p)| {
+            serde_json::json!({
+                "computer": p.computer,
+                "ssh_user": p.ssh_user,
+                "profile_key": p.profile_key,
+                "conformant": p.actions.is_empty(),
+                "actions": p.actions.iter().map(|a| serde_json::json!({
+                    "check_key": a.check_key,
+                    "check_kind": a.check_kind,
+                    "severity": a.severity,
+                    "reason": a.reason,
+                    "class": a.class.as_str(),
+                    "command": a.command,
+                    "guidance": a.guidance,
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!(arr)).unwrap_or_default()
+    );
 }
 
 /// `ff conformance report [--role R]` — latest recorded results per host.

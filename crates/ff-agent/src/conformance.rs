@@ -30,12 +30,19 @@
 //! `fleet_secrets.conformance_mode` ∈ {off, dry-run, active}, read EVERY tick:
 //! - `off`     (DEFAULT / missing): the tick does NOTHING.
 //! - `dry-run`: RECORD per-host conformance, actuate NOTHING.
-//! - `active`:  RECORD per-host conformance, actuate NOTHING (increment 1 has
-//!              no remediation — the apply-reconciler is a deferred follow-up).
+//! - `active`:  RECORD per-host conformance, actuate NOTHING (the TICK never
+//!              mutates a host — remediation is operator-driven, see below).
 //!
-//! So in increment 1 dry-run and active behave identically (record-only). The
-//! distinction exists so the follow-up can light up remediation under `active`
-//! without re-plumbing the gate.
+//! So dry-run and active behave identically in the tick (record-only). The
+//! distinction is retained for a future auto-remediation reconciler.
+//!
+//! ## Remediation (operator-driven, NOT the tick)
+//! `ff conformance remediate` maps each non-conformant gate to a remediation
+//! ACTION (see `plan_remediation`). It is a DRY-RUN planner by default. Only an
+//! idempotent, reversible fix (`kfd_access` → `usermod -aG render,video`) is
+//! classified `AutoSafe` and eligible to run under an explicit `--apply`;
+//! host-mutating recipes (torch-wheel swap, ROCm install) are `Manual` —
+//! printed for operator review, never auto-run. The tick stays record-only.
 
 use sqlx::{PgPool, Row};
 use std::time::Duration;
@@ -607,6 +614,223 @@ pub fn spawn_conformance_tick(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Remediation PLANNER (dry-run by default; --apply runs only AutoSafe actions)
+// ---------------------------------------------------------------------------
+//
+// This closes the "designed-but-deferred" remediation follow-up noted at the
+// top of this module. It is deliberately CONSERVATIVE:
+//   - It maps each *blocker* (and warn) failure to a remediation ACTION.
+//   - Only an idempotent, reversible, low-risk action is classified `AutoSafe`
+//     and is eligible to run under `--apply` (today: the kfd_access group fix —
+//     `usermod -aG render,video <user>`, the veronica case).
+//   - Anything host-mutating / heavy / fragile (re-installing a torch wheel,
+//     installing ROCm) is classified `Manual`: we emit an operator-reviewed
+//     RECIPE but NEVER run it. No fragile guessing of pip/apt incantations.
+//
+// The default `ff conformance remediate` prints the plan and changes nothing.
+
+/// How a remediation action may be actuated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemediationClass {
+    /// Idempotent, reversible, low-risk — eligible to run under `--apply`.
+    AutoSafe,
+    /// Host-mutating / heavy / fragile — emit a recipe, NEVER auto-run.
+    Manual,
+}
+
+impl RemediationClass {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RemediationClass::AutoSafe => "auto-safe",
+            RemediationClass::Manual => "manual",
+        }
+    }
+}
+
+/// One planned remediation for one failed check on one host.
+#[derive(Debug, Clone)]
+pub struct RemediationAction {
+    pub check_key: String,
+    pub check_kind: String,
+    pub severity: String,
+    pub reason: String,
+    pub class: RemediationClass,
+    /// The exact command we WOULD run for an AutoSafe action (over SSH+sudo).
+    /// None for Manual actions.
+    pub command: Option<String>,
+    /// Operator-facing guidance / recipe (always present).
+    pub guidance: String,
+}
+
+/// A host's full remediation plan (one action per non-conformant check).
+#[derive(Debug, Clone)]
+pub struct RemediationPlan {
+    pub computer: String,
+    pub ssh_user: String,
+    pub profile_key: String,
+    pub actions: Vec<RemediationAction>,
+}
+
+impl RemediationPlan {
+    /// Actions we could actuate under `--apply`.
+    pub fn auto_safe(&self) -> impl Iterator<Item = &RemediationAction> {
+        self.actions
+            .iter()
+            .filter(|a| a.class == RemediationClass::AutoSafe)
+    }
+
+    /// Actions requiring operator review (never auto-run).
+    pub fn manual(&self) -> impl Iterator<Item = &RemediationAction> {
+        self.actions
+            .iter()
+            .filter(|a| a.class == RemediationClass::Manual)
+    }
+}
+
+/// Map ONE failed check to a remediation action. Pure + testable: the same
+/// (check_kind, ssh_user) always yields the same plan. Only `kfd_access` is
+/// AutoSafe — everything else emits an operator-reviewed recipe.
+pub fn plan_action(
+    check_key: &str,
+    check_kind: &str,
+    severity: &str,
+    reason: &str,
+    ssh_user: &str,
+) -> RemediationAction {
+    let (class, command, guidance) = match check_kind {
+        // veronica case: daemon user not in render/video → /dev/kfd unreadable.
+        // The fix is idempotent (usermod -aG is additive) and reversible.
+        "kfd_access" => (
+            RemediationClass::AutoSafe,
+            Some(format!("sudo usermod -aG render,video {ssh_user}")),
+            format!(
+                "Add '{ssh_user}' to the render+video groups so it can open /dev/kfd. \
+                 Idempotent (additive). New supplementary groups apply only after the \
+                 daemon PROCESS restarts (re-exec) — restart forgefleetd afterward, then \
+                 re-run `ff conformance check` to confirm."
+            ),
+        ),
+        // logan case: a +cu torch wheel on an AMD box. Re-installing a wheel is
+        // heavy + venv-specific + can break the box → operator-reviewed only.
+        "amd_arch" => (
+            RemediationClass::Manual,
+            None,
+            "Replace the CUDA torch wheel with a ROCm wheel (operator-reviewed — the venv, \
+             ROCm version, and download index are host-specific). Recommended recipe: in the \
+             daemon's Python env, `pip uninstall -y torch` then \
+             `pip install torch --index-url https://download.pytorch.org/whl/rocm6.4`. \
+             Verify with `ff conformance check --host <h>` (gpu_bind) before trusting it."
+                .to_string(),
+        ),
+        // Downstream symptom — fix arch + kfd + HSA env first.
+        "gpu_bind" => (
+            RemediationClass::Manual,
+            None,
+            "GPU never bound. This is downstream of amd_arch / kfd_access — remediate those \
+             first. If both pass and bind still fails, ensure HSA_OVERRIDE_GFX_VERSION=11.5.1 \
+             is exported in the daemon's environment (the hsa-override-gfx config), then re-check."
+                .to_string(),
+        ),
+        // ROCm platform absent (warn-level legacy gate).
+        "pkg_version" => (
+            RemediationClass::Manual,
+            None,
+            "Required package/version missing (e.g. ROCm platform). Install is host-mutating and \
+             distro-specific → operator-reviewed. See `ff conformance profiles` for the required \
+             package + version constraint, then install per the vendor's ROCm 6.4 guide."
+                .to_string(),
+        ),
+        _ => (
+            RemediationClass::Manual,
+            None,
+            format!(
+                "No automated recipe for check_kind '{check_kind}'. Operator review required: \
+                 inspect the failure reason and remediate by hand."
+            ),
+        ),
+    };
+
+    RemediationAction {
+        check_key: check_key.to_string(),
+        check_kind: check_kind.to_string(),
+        severity: severity.to_string(),
+        reason: reason.to_string(),
+        class,
+        command,
+        guidance,
+    }
+}
+
+/// Build a host's full remediation plan from a measured `HostReport`. One
+/// action per non-conformant check (blocker first, then warn). A fully
+/// conformant host yields an empty `actions` vec.
+pub fn plan_remediation(report: &HostReport, ssh_user: &str) -> RemediationPlan {
+    let mut actions: Vec<RemediationAction> = report
+        .outcomes
+        .iter()
+        .filter(|o| !o.conformant)
+        .map(|o| {
+            plan_action(
+                &o.check_key,
+                &o.check_kind,
+                &o.severity,
+                &o.reason,
+                ssh_user,
+            )
+        })
+        .collect();
+    // Blockers before warns so the operator sees what actually gates the role.
+    actions.sort_by_key(|a| if a.severity == "blocker" { 0 } else { 1 });
+    RemediationPlan {
+        computer: report.computer.clone(),
+        ssh_user: ssh_user.to_string(),
+        profile_key: report.profile_key.clone(),
+        actions,
+    }
+}
+
+/// Run ONE AutoSafe remediation command against a host (over SSH, or locally
+/// when the target is this node). Used only by `--apply`; Manual actions are
+/// never passed here. Returns (succeeded, combined_output).
+pub async fn apply_remote_command(c: &ComputerRow, cmd: &str, me: &str) -> (bool, String) {
+    let is_me = me.eq_ignore_ascii_case(&c.name);
+    let cmd = cmd.to_string();
+    let output = tokio::task::spawn_blocking({
+        let target = format!("{}@{}", c.ssh_user, c.primary_ip);
+        let port = c.ssh_port.to_string();
+        move || -> std::io::Result<std::process::Output> {
+            use std::process::Command;
+            if is_me {
+                Command::new("sh").args(["-c", &cmd]).output()
+            } else {
+                Command::new("ssh")
+                    .args(crate::ssh_opts::ssh_bypass_args())
+                    .args([
+                        "-o",
+                        &format!("ConnectTimeout={SSH_CONNECT_TIMEOUT_SECS}"),
+                        "-p",
+                        &port,
+                        &target,
+                        &cmd,
+                    ])
+                    .output()
+            }
+        }
+    })
+    .await;
+
+    match output {
+        Ok(Ok(out)) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            (out.status.success(), trim_raw(&format!("{stdout}{stderr}")))
+        }
+        Ok(Err(e)) => (false, format!("command could not be executed: {e}")),
+        Err(e) => (false, format!("apply task join failed: {e}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -728,5 +952,78 @@ mod tests {
         assert!(!report.conformant());
         assert_eq!(report.blocker_reasons().len(), 1);
         assert!(report.blocker_reasons()[0].contains("+cu128"));
+    }
+
+    fn outcome(check_key: &str, kind: &str, sev: &str, conformant: bool) -> CheckOutcome {
+        CheckOutcome {
+            check_key: check_key.into(),
+            check_kind: kind.into(),
+            severity: sev.into(),
+            conformant,
+            reason: format!("{check_key} reason"),
+            raw_output: String::new(),
+        }
+    }
+
+    #[test]
+    fn kfd_access_is_auto_safe_with_idempotent_usermod() {
+        let a = plan_action(
+            "kfd_access",
+            "kfd_access",
+            "blocker",
+            "user not in render",
+            "ff",
+        );
+        assert_eq!(a.class, RemediationClass::AutoSafe);
+        assert_eq!(
+            a.command.as_deref(),
+            Some("sudo usermod -aG render,video ff")
+        );
+    }
+
+    #[test]
+    fn wheel_and_bind_and_pkg_are_manual_with_no_command() {
+        for kind in ["amd_arch", "gpu_bind", "pkg_version", "something_unknown"] {
+            let a = plan_action("k", kind, "blocker", "r", "ff");
+            assert_eq!(a.class, RemediationClass::Manual, "kind={kind}");
+            assert!(a.command.is_none(), "kind={kind} must NOT auto-run");
+            assert!(!a.guidance.is_empty());
+        }
+    }
+
+    #[test]
+    fn plan_skips_conformant_and_orders_blockers_first() {
+        let report = HostReport {
+            computer: "veronica".into(),
+            profile_key: "linux-ubuntu/strix-halo/amd-training".into(),
+            role: "amd-training".into(),
+            outcomes: vec![
+                outcome("rocm_present", "pkg_version", "warn", false), // warn fail
+                outcome("amd_arch", "amd_arch", "blocker", true),      // passing → skipped
+                outcome("kfd_access", "kfd_access", "blocker", false), // blocker fail
+            ],
+        };
+        let plan = plan_remediation(&report, "ff");
+        // Only the two non-conformant checks produce actions.
+        assert_eq!(plan.actions.len(), 2);
+        // Blocker (kfd_access) is sorted ahead of the warn (rocm_present).
+        assert_eq!(plan.actions[0].check_key, "kfd_access");
+        assert_eq!(plan.actions[1].check_key, "rocm_present");
+        // Exactly one auto-safe action (the kfd group fix).
+        assert_eq!(plan.auto_safe().count(), 1);
+        assert_eq!(plan.manual().count(), 1);
+    }
+
+    #[test]
+    fn conformant_host_yields_empty_plan() {
+        let report = HostReport {
+            computer: "sia".into(),
+            profile_key: "p".into(),
+            role: "amd-training".into(),
+            outcomes: vec![outcome("kfd_access", "kfd_access", "blocker", true)],
+        };
+        let plan = plan_remediation(&report, "ff");
+        assert!(plan.actions.is_empty());
+        assert_eq!(plan.auto_safe().count(), 0);
     }
 }
