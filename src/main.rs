@@ -772,6 +772,28 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         ));
     }
 
+    // 18b) Deployment-staleness tick — every 60s, leader-gated.
+    // Write-side companion to #369: that fix RENDERS `stale` in `ff model
+    // deployments` for offline-owned rows, but the stored health_status stays
+    // `healthy` because only the owning node's reconciler writes it and a dead
+    // node never runs it. This leader tick marks `health_status='stale'` in the
+    // DB for active deployments whose owning computer has been silent > 5min, so
+    // the router/MCP/coverage (which read the column directly) stop seeing a
+    // dead endpoint as serving. Self-correcting: the node's reconciler reclaims
+    // the row on return. Never masks on a global signal loss (skips if the
+    // materializer looks dead).
+    if let Some(pg_pool) = operational_store.pg_pool().cloned() {
+        info!("starting subsystem: deployment-staleness tick (60s, leader-gated)");
+        subsystem_tasks.push(
+            ff_agent::deployment_staleness::spawn_deployment_staleness_tick(
+                pg_pool,
+                worker_name.clone(),
+                60,
+                shutdown_rx.clone(),
+            ),
+        );
+    }
+
     // 19) Adaptive serving-mix autoscaler — every 120s, leader-gated.
     // Orchestrator P3: compares the P2 demand vector against live supply and,
     // when the `fleet_secrets.autoscaler_mode` gate is set to `active`, loads

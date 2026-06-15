@@ -42,6 +42,7 @@ pub mod db_integrity;
 pub mod demand_sensor;
 pub mod deployment_catalog_reconciler;
 pub mod deployment_reconciler;
+pub mod deployment_staleness;
 pub mod disk_reconcile;
 pub mod disk_sampler;
 pub mod dynamic_loader;
