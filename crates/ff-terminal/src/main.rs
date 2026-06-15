@@ -2859,6 +2859,21 @@ pub enum ModelCommand {
         #[arg(long, default_value_t = false)]
         remediate: bool,
     },
+    /// Reconcile live deployments into `model_catalog` (coverage self-heal).
+    ///
+    /// For each active deployment whose model has no catalog row, auto-creates
+    /// an `active` row IFF the family is structurally unambiguous (embedding →
+    /// feature-extraction, vision → image-text-to-text, whisper → ASR, reranker
+    /// → text-ranking). Ambiguous chat/code models are left for the operator.
+    /// Closes false coverage gaps for tasks the fleet is already serving. Runs
+    /// leader-gated in the daemon every 30m; this is the manual/dogfood path.
+    ReconcileCatalog {
+        #[arg(long, default_value_t = false)]
+        json: bool,
+        /// Classify + report what would be created without writing to the DB.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
     /// Manually add a row to the runtime model catalog (`fleet_model_catalog`).
     ///
     /// DB-first replacement for the retired `config/model_catalog.toml`: the

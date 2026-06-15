@@ -1862,6 +1862,59 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                 }
             }
         }
+        crate::ModelCommand::ReconcileCatalog { json, dry_run } => {
+            let reconciler =
+                ff_agent::deployment_catalog_reconciler::DeploymentCatalogReconciler::new(
+                    pool.clone(),
+                );
+            let report = reconciler
+                .reconcile_once(dry_run)
+                .await
+                .map_err(|e| anyhow::anyhow!("reconcile-catalog: {e}"))?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).unwrap_or_default()
+                );
+            } else {
+                if report.dry_run {
+                    println!("{YELLOW}(dry-run — no DB writes){RESET}");
+                }
+                println!("Already cataloged:  {}", report.already_cataloged);
+                println!("Skipped (ambiguous): {}", report.skipped_ambiguous.len());
+                println!(
+                    "{} {}",
+                    if report.dry_run {
+                        "Would create:      "
+                    } else {
+                        "Created:           "
+                    },
+                    report.created.len()
+                );
+                if !report.created.is_empty() {
+                    println!();
+                    println!("{:<28} {:<28} TASKS", "CATALOG_ID", "FROM_DEPLOYMENT");
+                    for r in &report.created {
+                        println!(
+                            "{:<28} {:<28} {}",
+                            r.catalog_id,
+                            r.from_deployment,
+                            r.tasks.join(", ")
+                        );
+                    }
+                }
+                if !report.skipped_ambiguous.is_empty() {
+                    println!();
+                    println!(
+                        "Left for operator (ambiguous family — declare via \
+                         `ff model catalog-add` or coverage preferred_model_ids):"
+                    );
+                    for d in &report.skipped_ambiguous {
+                        println!("  {d}");
+                    }
+                }
+            }
+        }
         crate::ModelCommand::CatalogAdd {
             id,
             name,
