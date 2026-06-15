@@ -358,6 +358,16 @@ impl ResearchSession {
         // sub-agents can actually call WebSearch / Grep / etc.
         update_session_status(&self.pool, self.session_id, "dispatching").await?;
 
+        // Resolve the optional self-hosted SearXNG grounding backend once (DB
+        // `fleet_secrets[searxng.url]` → `SEARXNG_URL` env → None). When unset,
+        // grounding falls back to the existing DuckDuckGo → Wikipedia chain, so
+        // this is a zero-regression opt-in.
+        let searxng_url: Option<String> = if self.config.web_grounding {
+            crate::fleet_info::fetch_secret("searxng.url").await
+        } else {
+            None
+        };
+
         #[allow(clippy::type_complexity)]
         let mut handles: Vec<tokio::task::JoinHandle<(Uuid, Result<(String, u64)>)>> =
             Vec::with_capacity(plan.sub_questions.len());
@@ -374,6 +384,7 @@ impl ResearchSession {
             let row_id = row.id;
             let web_grounding = self.config.web_grounding;
             let sub_question = q.clone();
+            let searxng_url = searxng_url.clone();
             handles.push(tokio::spawn({
                 let client = client.clone();
                 async move {
@@ -389,9 +400,13 @@ impl ResearchSession {
                         // inside fetch_search_results this keeps sub-agents
                         // grounded instead of falling back to model memory.
                         tokio::time::sleep(search_stagger(i)).await;
-                        let ctx =
-                            crate::tools::web_search::fetch_web_context(&client, &sub_question, 8)
-                                .await;
+                        let ctx = crate::tools::web_search::fetch_web_context(
+                            &client,
+                            searxng_url.as_deref(),
+                            &sub_question,
+                            8,
+                        )
+                        .await;
                         info!(
                             sub = i,
                             grounded = ctx.is_some(),
