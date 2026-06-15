@@ -172,7 +172,29 @@ pub async fn fetch_web_context(
 /// Key-free fallback search via the Wikipedia `list=search` API. Returns real
 /// article titles, URLs, and snippets — used by [`fetch_web_context`] when the
 /// primary (DuckDuckGo) backend is blocked or empty.
+///
+/// Research grounding passes a verbose natural-language sub-question (DuckDuckGo
+/// handles those fine). Wikipedia's search is keyword-based, though, and a full
+/// sentence routinely matches zero articles — so if the verbatim query comes up
+/// empty, retry once with a stop-word-stripped keyword query before giving up.
 pub async fn fetch_wikipedia_results(
+    client: &reqwest::Client,
+    query: &str,
+    max_results: usize,
+) -> Result<Vec<SearchResult>, String> {
+    let first = wikipedia_search(client, query, max_results).await?;
+    if !first.is_empty() {
+        return Ok(first);
+    }
+    let keywords = wikipedia_keywords(query);
+    if keywords.is_empty() || keywords == query {
+        return Ok(first);
+    }
+    wikipedia_search(client, &keywords, max_results).await
+}
+
+/// One Wikipedia `list=search` request for `query`.
+async fn wikipedia_search(
     client: &reqwest::Client,
     query: &str,
     max_results: usize,
@@ -195,6 +217,92 @@ pub async fn fetch_wikipedia_results(
         .await
         .map_err(|e| format!("Failed to read Wikipedia results: {e}"))?;
     Ok(parse_wikipedia_results(&body, max_results))
+}
+
+/// Reduce a verbose sub-question to keyword search terms for Wikipedia: drop
+/// question/stop words, keep proper nouns and content words (≥4 chars, or any
+/// token with an interior capital/digit like `PagedAttention`/`GPT4`), cap to 6
+/// terms in original order. Returns an empty string if nothing survives.
+fn wikipedia_keywords(query: &str) -> String {
+    const STOP: &[&str] = &[
+        "what",
+        "which",
+        "who",
+        "whom",
+        "whose",
+        "when",
+        "where",
+        "why",
+        "how",
+        "is",
+        "are",
+        "was",
+        "were",
+        "the",
+        "a",
+        "an",
+        "and",
+        "or",
+        "of",
+        "to",
+        "in",
+        "for",
+        "on",
+        "with",
+        "that",
+        "this",
+        "it",
+        "its",
+        "their",
+        "by",
+        "from",
+        "as",
+        "at",
+        "be",
+        "can",
+        "will",
+        "does",
+        "do",
+        "did",
+        "into",
+        "about",
+        "explain",
+        "describe",
+        "detail",
+        "list",
+        "give",
+        "tell",
+        "between",
+        "recent",
+        "recently",
+        "latest",
+        "current",
+        "currently",
+    ];
+    let mut out: Vec<&str> = Vec::new();
+    for raw in query.split(|c: char| !c.is_alphanumeric() && c != '-') {
+        if out.len() >= 6 {
+            break;
+        }
+        let word = raw.trim_matches('-');
+        if word.is_empty() {
+            continue;
+        }
+        let lower = word.to_ascii_lowercase();
+        if STOP.contains(&lower.as_str()) {
+            continue;
+        }
+        // Keep distinctive tokens: long-ish words, or anything with an interior
+        // capital/digit (proper nouns, product names, version strings).
+        let has_interior_signal = word
+            .chars()
+            .skip(1)
+            .any(|c| c.is_ascii_uppercase() || c.is_ascii_digit());
+        if word.chars().count() >= 4 || has_interior_signal {
+            out.push(word);
+        }
+    }
+    out.join(" ")
 }
 
 /// Parse a Wikipedia `list=search` JSON response into [`SearchResult`]s. The
@@ -274,10 +382,10 @@ fn parse_ddg_results(html: &str, max: usize) -> Vec<SearchResult> {
                 String::new()
             };
 
-            if !title.is_empty() && !url.is_empty() && url.starts_with("http") {
+            if let (false, Some(clean)) = (title.is_empty(), clean_ddg_url(url)) {
                 results.push(SearchResult {
                     title,
-                    url: url.to_string(),
+                    url: clean,
                     snippet,
                 });
             }
@@ -285,6 +393,76 @@ fn parse_ddg_results(html: &str, max: usize) -> Vec<SearchResult> {
     }
 
     results
+}
+
+/// Resolve a raw DuckDuckGo result href into a real external URL, or `None` if
+/// it is a DuckDuckGo self/ad/navigation link. When DDG is throttling it serves
+/// a degraded page whose only links point back to `duckduckgo.com`; counting
+/// those as results would mask the failure and skip the Wikipedia fallback. DDG
+/// also sometimes wraps real results in a `/l/?uddg=<percent-encoded>` redirect
+/// — unwrap those so genuine results survive.
+fn clean_ddg_url(raw: &str) -> Option<String> {
+    if raw.is_empty() {
+        return None;
+    }
+    // Protocol-relative `//host/…` → assume https so host checks work.
+    let normalized = match raw.strip_prefix("//") {
+        Some(rest) => format!("https://{rest}"),
+        None => raw.to_string(),
+    };
+    // Redirect wrapper: pull the real target out of the `uddg=` parameter.
+    if normalized.contains("duckduckgo.com/l/") {
+        let target = normalized
+            .find("uddg=")
+            .map(|i| &normalized[i + "uddg=".len()..])
+            .map(|v| v.split('&').next().unwrap_or(v))
+            .map(percent_decode);
+        return target.filter(|t| t.starts_with("http"));
+    }
+    // Any other duckduckgo.com link is navigation/ads, never a result.
+    if normalized.contains("duckduckgo.com") {
+        return None;
+    }
+    normalized.starts_with("http").then_some(normalized)
+}
+
+/// Minimal `%XX`/`+` percent-decoder for unwrapping DDG redirect targets.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => match (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                (Some(h), Some(l)) => {
+                    out.push(h * 16 + l);
+                    i += 3;
+                }
+                _ => {
+                    out.push(b'%');
+                    i += 1;
+                }
+            },
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn extract_between<'a>(text: &'a str, start: &str, end: &str) -> Option<&'a str> {
@@ -410,6 +588,25 @@ mod tests {
     }
 
     #[test]
+    fn wikipedia_keywords_strips_stopwords_keeps_proper_nouns_and_caps() {
+        // Question/stop words dropped; PagedAttention kept (interior capital),
+        // short stop words like "is/the/and/for" gone.
+        assert_eq!(
+            wikipedia_keywords(
+                "What is the vLLM inference engine and what is PagedAttention used for"
+            ),
+            "vLLM inference engine PagedAttention used"
+        );
+        // Caps at 6 terms.
+        let many = wikipedia_keywords("alpha bravo charlie delta echo foxtrot golf hotel");
+        assert_eq!(many.split(' ').count(), 6);
+        // A token with an interior digit survives even if short (GB10, GPT4).
+        assert_eq!(wikipedia_keywords("the GB10 GPU"), "GB10 GPU");
+        // All-stopword input reduces to empty.
+        assert_eq!(wikipedia_keywords("what is the"), "");
+    }
+
+    #[test]
     fn parse_wikipedia_handles_garbage_and_missing_fields() {
         assert!(parse_wikipedia_results("not json", 8).is_empty());
         assert!(parse_wikipedia_results(r#"{"query":{}}"#, 8).is_empty());
@@ -421,6 +618,34 @@ mod tests {
     fn parse_ddg_skips_non_http_and_empty() {
         // A relative/`javascript:` href must not pollute results.
         let html = r#"<a class="result__a" href="/ddg-internal">Ad</a>"#;
+        assert!(parse_ddg_results(html, 8).is_empty());
+    }
+
+    #[test]
+    fn clean_ddg_url_drops_self_links_unwraps_redirects_keeps_external() {
+        // Real external link passes through.
+        assert_eq!(
+            clean_ddg_url("https://docs.ray.io/en/latest/"),
+            Some("https://docs.ray.io/en/latest/".to_string())
+        );
+        // DDG `/l/?uddg=` redirect is unwrapped + percent-decoded.
+        assert_eq!(
+            clean_ddg_url("//duckduckgo.com/l/?uddg=https%3A%2F%2Fdocs.vllm.ai%2Fpage&rut=x"),
+            Some("https://docs.vllm.ai/page".to_string())
+        );
+        // A bare duckduckgo.com nav/homepage link (degraded-page junk) is dropped.
+        assert_eq!(clean_ddg_url("https://duckduckgo.com/about"), None);
+        assert_eq!(clean_ddg_url("//duckduckgo.com/settings"), None);
+        // Relative / empty hrefs are dropped.
+        assert_eq!(clean_ddg_url("/ddg-internal"), None);
+        assert_eq!(clean_ddg_url(""), None);
+    }
+
+    #[test]
+    fn parse_ddg_drops_degraded_page_with_only_self_links() {
+        // A throttled DDG page whose only result link is duckduckgo.com must
+        // parse to EMPTY so the caller falls back to another backend.
+        let html = r#"<a class="result__a" href="https://duckduckgo.com/?q=x">DuckDuckGo</a>"#;
         assert!(parse_ddg_results(html, 8).is_empty());
     }
 }
