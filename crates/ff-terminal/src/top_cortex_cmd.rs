@@ -182,6 +182,25 @@ pub enum TopCortexCommand {
         #[arg(long, value_enum, default_value = "table")]
         format: crate::CortexFormat,
     },
+    /// Shortest call path between two code symbols: the fewest-hop chain of
+    /// `calls` edges from FROM to TO (forward, src→dst). `callers`/`callees`
+    /// answer one hop and `impact` the whole closure; this answers "HOW does A
+    /// reach B". No path within --max-depth is a legitimate empty result (exit
+    /// 0). Corpus defaults to the cwd's slug.
+    Path {
+        from: String,
+        to: String,
+        #[arg(long)]
+        corpus: Option<String>,
+        #[arg(long, default_value_t = 12)]
+        max_depth: usize,
+        /// Only traverse `calls` edges at/above this resolution-confidence tier:
+        /// 1.0 = EXTRACTED only (high-trust), 0.6 = +INFERRED, 0.0 = all (default).
+        #[arg(long, default_value_t = 0.0)]
+        min_confidence: f32,
+        #[arg(long, value_enum, default_value = "table")]
+        format: crate::CortexFormat,
+    },
     /// Recall/health diagnostic for the code graph: what fraction of `calls`
     /// edges resolve to a real internal symbol vs an unresolved extern, plus a
     /// ranked list of suspicious externs — `code:extern` placeholders whose leaf
@@ -644,6 +663,28 @@ pub async fn handle_top_cortex(args: TopCortexArgs) -> Result<()> {
                 crate::CortexCommand::Tests {
                     corpus,
                     symbol,
+                    max_depth,
+                    min_confidence,
+                    format,
+                },
+            )
+            .await?;
+        }
+        TopCortexCommand::Path {
+            from,
+            to,
+            corpus,
+            max_depth,
+            min_confidence,
+            format,
+        } => {
+            let corpus = corpus.unwrap_or_else(cwd_slug);
+            crate::cortex_cmd::handle_cortex(
+                &pool,
+                crate::CortexCommand::Path {
+                    corpus,
+                    from,
+                    to,
                     max_depth,
                     min_confidence,
                     format,

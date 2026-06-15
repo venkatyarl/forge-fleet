@@ -2281,6 +2281,21 @@ pub enum CortexCommand {
         #[arg(long, value_enum, default_value = "table")]
         format: crate::CortexFormat,
     },
+    /// Shortest call path between two code symbols.
+    Path {
+        #[arg(long)]
+        corpus: String,
+        from: String,
+        to: String,
+        #[arg(long, default_value_t = 12)]
+        max_depth: usize,
+        /// Only traverse `calls` edges at/above this resolution-confidence tier:
+        /// 1.0 = EXTRACTED only (high-trust), 0.6 = +INFERRED, 0.0 = all (default).
+        #[arg(long, default_value_t = 0.0)]
+        min_confidence: f32,
+        #[arg(long, value_enum, default_value = "table")]
+        format: crate::CortexFormat,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
