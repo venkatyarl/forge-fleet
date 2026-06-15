@@ -57,8 +57,12 @@ pub fn atomic_install_cmd(bin: &str, dest: &str, codesign: bool) -> String {
     )
 }
 
-/// Normalise an `os_family` to its base family, or `None` if unrecognised.
-fn base_family(os_family: &str) -> Option<&'static str> {
+/// Normalise an `os_family` (e.g. `linux-ubuntu`, `linux-dgx`, `macos-26`) to its
+/// base family (`linux`/`macos`/`windows`), or `None` if unrecognised. Shared with
+/// `auto_upgrade` (single source of truth) so the playbook resolver and the wave
+/// dispatcher can never disagree on what counts as "the linux key" — a divergence
+/// there once skipped every Linux target with `no playbook key for os='linux-ubuntu'`.
+pub(crate) fn base_family(os_family: &str) -> Option<&'static str> {
     if os_family.starts_with("linux") {
         Some("linux")
     } else if os_family.starts_with("macos") {
@@ -320,5 +324,22 @@ mod tests {
                 "fam={fam}: foreground daemon-pkill self-kills the worker"
             );
         }
+    }
+
+    #[test]
+    fn base_family_maps_sub_families_to_their_base() {
+        // Shared with auto_upgrade's playbook-key fallback. A regression here
+        // (e.g. dropping the `starts_with` so `linux-ubuntu` no longer maps to
+        // `linux`) silently skips every Linux target — the 2026-04-30 outage.
+        assert_eq!(base_family("linux"), Some("linux"));
+        assert_eq!(base_family("linux-ubuntu"), Some("linux"));
+        assert_eq!(base_family("linux-dgx"), Some("linux"));
+        assert_eq!(base_family("linux-fedora"), Some("linux"));
+        assert_eq!(base_family("macos"), Some("macos"));
+        assert_eq!(base_family("macos-26"), Some("macos"));
+        assert_eq!(base_family("windows"), Some("windows"));
+        assert_eq!(base_family("windows-11"), Some("windows"));
+        assert_eq!(base_family("plan9"), None);
+        assert_eq!(base_family(""), None);
     }
 }
