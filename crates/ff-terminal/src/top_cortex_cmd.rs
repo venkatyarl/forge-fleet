@@ -1460,7 +1460,7 @@ async fn run_index(
         );
         if scan_report.pruned > 0 {
             println!(
-                "  pruned: {} stale out-of-root content node(s)",
+                "  pruned: {} stale content node(s) (deleted / out-of-root)",
                 scan_report.pruned
             );
         }
