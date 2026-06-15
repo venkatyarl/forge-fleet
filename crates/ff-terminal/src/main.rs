@@ -381,6 +381,13 @@ enum Command {
         /// to skip the searches and rely on the models' training knowledge only.
         #[arg(long = "no-web", default_value_t = false)]
         no_web: bool,
+        /// Worker names that must NOT receive any sub-agent, comma-separated
+        /// (e.g. "sia,adele,rihanna,beyonce" to keep research off the DGX pairs,
+        /// or "taylor" to spare the leader). Excluded hosts are dropped from the
+        /// routing candidate pool before the round-robin spread; unknown names
+        /// are warned about and skipped. Persisted for --detach runs.
+        #[arg(long, default_value = "")]
+        exclude: String,
         /// Print intermediate progress events to stderr.
         #[arg(long, default_value_t = false)]
         verbose: bool,
@@ -4507,6 +4514,7 @@ async fn main() -> Result<()> {
             planner_model,
             subagent_model,
             no_web,
+            exclude,
             verbose,
         }) => {
             if let Some(session_id) = show {
@@ -4526,6 +4534,7 @@ async fn main() -> Result<()> {
                             subagent_model,
                             !no_web,
                             detach,
+                            &exclude,
                             verbose,
                         )
                         .await

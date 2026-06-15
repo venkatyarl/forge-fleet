@@ -76,6 +76,15 @@ pub struct ResearchConfig {
     /// lands in `research_sessions.report_markdown` (read it with
     /// `ff research --show <id>`). Default false = run in the foreground.
     pub detached: bool,
+    /// Worker names that must NOT receive any sub-agent, e.g.
+    /// `["sia", "adele"]` to keep research off the DGX pairs or `["taylor"]`
+    /// to spare the leader. Passed straight to the routing scorer's
+    /// `exclude_hosts` (matched case-insensitively against `worker_name`), so
+    /// excluded hosts are dropped from the candidate pool before the
+    /// round-robin spread. Persisted into the session metadata so a detached
+    /// run honors it inside the daemon too. Default empty = use every healthy
+    /// deployment.
+    pub exclude_hosts: Vec<String>,
 }
 
 impl Default for ResearchConfig {
@@ -97,6 +106,7 @@ impl Default for ResearchConfig {
             gateway_url: String::new(),
             web_grounding: true,
             detached: false,
+            exclude_hosts: Vec::new(),
         }
     }
 }
@@ -293,7 +303,8 @@ impl ResearchSession {
                      CASE WHEN $10 = 'queued' THEN NULL ELSE NOW() END,
                      jsonb_build_object('gateway_url', $8::text,
                                         'subagent_model', $9::text,
-                                        'web_grounding', $11::bool))",
+                                        'web_grounding', $11::bool,
+                                        'exclude_hosts', $12::jsonb))",
         )
         .bind(id)
         .bind(&config.query)
@@ -311,6 +322,7 @@ impl ResearchSession {
         .bind(&config.subagent_model)
         .bind(initial_status)
         .bind(config.web_grounding)
+        .bind(serde_json::to_value(&config.exclude_hosts).unwrap_or(Value::Null))
         .execute(&pool)
         .await
         .context("insert research_session")?;
@@ -381,6 +393,18 @@ impl ResearchSession {
             .get("web_grounding")
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
+        // Rebuild the exclusion set the originating `--exclude` requested so a
+        // daemon-claimed detached run keeps sub-agents off the same hosts.
+        // Absent/old rows → empty (no exclusion), matching the default.
+        let exclude_hosts = metadata
+            .get("exclude_hosts")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
 
         let config = ResearchConfig {
             query,
@@ -393,6 +417,7 @@ impl ResearchSession {
             gateway_url,
             web_grounding,
             detached: true,
+            exclude_hosts,
         };
 
         Ok(Some(Self {
@@ -910,7 +935,7 @@ impl ResearchSession {
             workload: None,
             require_tool_calling: true,
             min_ctx: None,
-            exclude_hosts: Vec::new(),
+            exclude_hosts: self.config.exclude_hosts.clone(),
             max_health_age_sec: Some(ff_db::queries::DISPATCH_HEALTH_MAX_AGE_SEC),
             // Generous cap: we want every healthy deployment so the round-robin
             // can spread across as many distinct computers as the fleet has.
