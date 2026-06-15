@@ -1354,6 +1354,9 @@ pub async fn fleet_route(params: Option<Value>) -> HandlerResult {
         require_tool_calling,
         min_ctx,
         exclude_hosts: exclude_hosts.clone(),
+        // Observability path: report whatever is marked healthy (historical
+        // behaviour). The agent/offload pickers apply the freshness floor.
+        max_health_age_sec: None,
         limit,
     };
     let rows = ff_db::pg_route_deployments(&pool, &filter)

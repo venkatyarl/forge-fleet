@@ -3044,6 +3044,9 @@ async fn handle_fleet_route(
         require_tool_calling,
         min_ctx,
         exclude_hosts: exclude_host.clone(),
+        // `ff fleet route` is an observability view: show whatever is marked
+        // healthy. The freshness floor is applied only on live dispatch.
+        max_health_age_sec: None,
         limit,
     };
     let rows = ff_db::pg_route_deployments(pool, &filter)

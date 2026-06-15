@@ -2357,9 +2357,41 @@ pub struct RouteFilter {
     /// Hosts to exclude by worker_name (case-insensitive), e.g. ["taylor"] to
     /// keep agent load off the leader.
     pub exclude_hosts: Vec<String>,
+    /// Drop deployments whose `last_health_at` is older than this many seconds —
+    /// a freshness floor on top of the `health_status = 'healthy'` filter. The
+    /// per-node reconciler refreshes `last_health_at` every ~60s; a host that
+    /// goes offline/wedges can NEVER flip its own deployments to unhealthy, so a
+    /// dead endpoint lingers as `healthy` with a stale `last_health_at` and the
+    /// router keeps dispatching to it (the classic priya-wedge failure). `None`
+    /// = no freshness filter (observability callers keep the historical
+    /// "whatever is marked healthy" behaviour); the agent + offload pickers set
+    /// it so live dispatch never lands on a wedged host. NULL `last_health_at`
+    /// (undatable) passes — only a provably-stale timestamp is excluded.
+    pub max_health_age_sec: Option<i32>,
     /// Max candidates to return (scored best-first). Defaults to 3 if 0.
     pub limit: i64,
 }
+
+/// Freshness predicate mirrored by the staleness clause in [`pg_route_deployments`]
+/// (kept here as the testable spec — the SQL is the runtime path). A deployment is
+/// fresh enough to route to when the filter is disabled (`max_age_sec` is `None`),
+/// or its health timestamp is undatable (`age_sec` is `None` → conservatively kept),
+/// or its health was refreshed within the window (`age_sec <= max`).
+#[cfg(test)]
+fn deployment_health_fresh(age_sec: Option<i64>, max_age_sec: Option<i32>) -> bool {
+    match (max_age_sec, age_sec) {
+        (None, _) => true,
+        (Some(_), None) => true,
+        (Some(max), Some(age)) => age <= max as i64,
+    }
+}
+
+/// Default freshness window for live dispatch (agent + offload pickers): a
+/// deployment whose health hasn't been refreshed within this many seconds is
+/// treated as wedged/offline and skipped. ~5 reconciler ticks (the loop runs
+/// every ~60s), so a live host is never excluded across a couple of missed
+/// ticks, but a genuinely dead endpoint drops out within minutes.
+pub const DISPATCH_HEALTH_MAX_AGE_SEC: i32 = 300;
 
 /// One scored routing candidate. Ordering in the returned Vec is best-first
 /// (smaller tier wins, then most-recently-healthy).
@@ -2551,6 +2583,13 @@ pub async fn pg_route_deployments(
            AND ($4::int IS NULL OR d.usable_agent_ctx >= $4)
            -- exclude hosts (case-insensitive; $5 empty disables it)
            AND (LOWER(d.worker_name) <> ALL($5))
+           -- health freshness floor ($7 IS NULL disables it). A wedged/offline
+           -- host can't flip its own deployments to unhealthy, so drop rows
+           -- whose last_health_at is provably older than the window. NULL
+           -- last_health_at (undatable) passes — mirrors deployment_health_fresh.
+           AND ($7::int IS NULL
+                OR d.last_health_at IS NULL
+                OR EXTRACT(EPOCH FROM (NOW() - d.last_health_at)) <= $7)
          ORDER BY cat.tier ASC,
                   d.last_health_at DESC NULLS LAST
          LIMIT $6
@@ -2562,6 +2601,7 @@ pub async fn pg_route_deployments(
     .bind(filter.min_ctx)
     .bind(&excludes)
     .bind(limit)
+    .bind(filter.max_health_age_sec)
     .fetch_all(pool)
     .await?;
 
@@ -2610,6 +2650,7 @@ pub async fn pg_pick_agent_endpoint(
         require_tool_calling: true,
         min_ctx: Some(min_ctx),
         exclude_hosts: exclude_hosts.to_vec(),
+        max_health_age_sec: Some(DISPATCH_HEALTH_MAX_AGE_SEC),
         limit: 1,
     };
     Ok(pg_route_deployments(pool, &filter)
@@ -2712,6 +2753,7 @@ pub async fn pg_pick_offload_endpoint(
         require_tool_calling: true,
         min_ctx: Some(min_ctx),
         exclude_hosts: exclude_hosts.to_vec(),
+        max_health_age_sec: Some(DISPATCH_HEALTH_MAX_AGE_SEC),
         limit: 8,
     };
 
@@ -4862,6 +4904,26 @@ mod tests {
             is_unified_memory: None,
             total_ram_gb: None,
         }
+    }
+
+    #[test]
+    fn test_deployment_health_fresh() {
+        // Filter disabled (no window) → always fresh, regardless of age.
+        assert!(deployment_health_fresh(Some(99_999), None));
+        assert!(deployment_health_fresh(None, None));
+        // Undatable health (NULL last_health_at) → conservatively kept even with
+        // a window set (mirrors the `d.last_health_at IS NULL` SQL branch).
+        assert!(deployment_health_fresh(
+            None,
+            Some(DISPATCH_HEALTH_MAX_AGE_SEC)
+        ));
+        // Within the window → fresh; at the boundary → still fresh (<=).
+        assert!(deployment_health_fresh(Some(10), Some(300)));
+        assert!(deployment_health_fresh(Some(300), Some(300)));
+        // Provably stale (older than the window) → excluded. This is the
+        // wedged/offline host whose reconciler stopped refreshing last_health_at.
+        assert!(!deployment_health_fresh(Some(301), Some(300)));
+        assert!(!deployment_health_fresh(Some(86_400), Some(300)));
     }
 
     #[test]
