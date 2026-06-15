@@ -117,6 +117,7 @@ impl ToolRegistry {
         self.register(Self::cortex_callers());
         self.register(Self::cortex_callees());
         self.register(Self::cortex_impact());
+        self.register(Self::cortex_path());
         self.register(Self::cortex_tests());
         self.register(Self::cortex_review());
 
@@ -1053,6 +1054,41 @@ impl ToolRegistry {
         }
     }
 
+    fn cortex_path() -> ToolDefinition {
+        ToolDefinition {
+            name: "cortex_path".to_string(),
+            description: "Cortex code graph: shortest call chain between two symbols — HOW does `from` reach `to`. cortex_callers/callees answer one hop and cortex_impact the whole closure; this returns the ordered FROM → … → TO path (each hop a real `calls` edge). `found=false` with an empty path means the symbols exist but don't connect within max_depth (not an error); an unresolved from/to symbol errors.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "corpus": {
+                        "type": "string",
+                        "description": "Indexed repo slug (see cortex_corpora), e.g. 'forge-fleet'"
+                    },
+                    "from": {
+                        "type": "string",
+                        "description": "Start symbol — bare leaf ('handle_cortex') or qualified name"
+                    },
+                    "to": {
+                        "type": "string",
+                        "description": "Target symbol — bare leaf or qualified name"
+                    },
+                    "max_depth": {
+                        "type": "integer",
+                        "description": "Max chain length in hops (1-30, default 12)",
+                        "default": 12
+                    },
+                    "min_confidence": {
+                        "type": "number",
+                        "description": "Only traverse `calls` edges at/above this resolution-confidence tier: 1.0 = EXTRACTED only (high-trust), 0.6 = +INFERRED (heuristic redirect), 0.0 = all (default).",
+                        "default": 0.0
+                    }
+                },
+                "required": ["corpus", "from", "to"]
+            }),
+        }
+    }
+
     fn cortex_tests() -> ToolDefinition {
         ToolDefinition {
             name: "cortex_tests".to_string(),
@@ -1449,6 +1485,7 @@ mod tests {
             "cortex_callers",
             "cortex_callees",
             "cortex_impact",
+            "cortex_path",
             "cortex_tests",
             "cortex_review",
             // Pillar 1 — Computer Use (PR-H, #37)
