@@ -2948,6 +2948,22 @@ async fn start_pulse_v2_subsystems(
         ff_agent::db_integrity::AmcheckTick::new(pg_pool.clone(), worker_name.clone());
     handles.push(amcheck_tick.spawn(shutdown_rx.clone()));
 
+    // (7b') Backup restore-drill — daily on the leader. Takes the newest
+    // Postgres backup all the way through decrypt → extract → PGDATA-structure
+    // validation, records the outcome in `backup_drills`, and fires the
+    // `backup_restore_drill_failed` alert on failure or "no successful drill in
+    // N days". A backup that has never been test-restored is the silent
+    // 2026-04-18-wipe risk; this proves restorability automatically. Leader-
+    // gated inside the tick on every fire (safe to start on every daemon) and
+    // self-cleaning (temp extract dir removed on every path).
+    info!(
+        node = %worker_name.clone(),
+        "starting subsystem: backup restore-drill (24h, leader-gated)"
+    );
+    let restore_drill =
+        ff_agent::ha::restore_drill::RestoreDrillTick::new(pg_pool.clone(), worker_name.clone());
+    handles.push(restore_drill.spawn(shutdown_rx.clone()));
+
     // (7c) Stale-job sweeper — every 5min on the leader. Recovers
     // `fleet_model_jobs` + `deferred_tasks` rows stuck in `running` (crashed
     // process, stalled download, or a worker restarted mid-task by the upgrade

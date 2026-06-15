@@ -779,6 +779,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "docker_latest_tag",
         sql: schema::SCHEMA_V129_DOCKER_LATEST_TAG,
     },
+    PgMigration {
+        version: 130,
+        name: "backup_restore_drill",
+        sql: schema::SCHEMA_V130_BACKUP_RESTORE_DRILL,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.

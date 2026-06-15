@@ -8590,3 +8590,50 @@ UPDATE external_tools SET
    AND version_source->>'repo'   = 'docker/cli'
    AND (version_source->>'ref_kind') IS DISTINCT FROM 'latest_tag';
 "#;
+
+// ─── V130: scheduled backup restore-drill ───────────────────────────────────
+//
+// Backups (`pg_basebackup -Ft -z`, 4h) were never automatically *test-restored*
+// — a backup that has never been proven restorable is the silent 2026-04-18-wipe
+// risk. This adds:
+//   1. `backup_drills` — one row per automated restore-drill outcome (the
+//      leader tick in `ff_agent::ha::restore_drill` decrypts → extracts →
+//      validates the newest backup is a structurally complete PGDATA, and
+//      records pass/fail + metrics here).
+//   2. the `backup_restore_drill_failed` alert policy — fires (critical,
+//      telegram, 12h cooldown) when a drill fails OR no successful drill has
+//      run inside the staleness window.
+// `backup_id` is ON DELETE SET NULL so drill history survives backup pruning.
+pub const SCHEMA_V130_BACKUP_RESTORE_DRILL: &str = r#"
+CREATE TABLE IF NOT EXISTS backup_drills (
+    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    backup_id        UUID REFERENCES backups(id) ON DELETE SET NULL,
+    backup_file      TEXT NOT NULL,
+    database_kind    TEXT NOT NULL DEFAULT 'postgres',
+    started_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    finished_at      TIMESTAMPTZ,
+    success          BOOLEAN NOT NULL DEFAULT false,
+    stage            TEXT NOT NULL,
+    detail           TEXT,
+    extracted_bytes  BIGINT,
+    file_count       BIGINT,
+    pg_version       TEXT,
+    verifybackup     BOOLEAN,
+    duration_ms      BIGINT,
+    drill_node       TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_backup_drills_started
+    ON backup_drills (started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_backup_drills_success_started
+    ON backup_drills (success, started_at DESC);
+
+INSERT INTO alert_policies
+    (name, description, metric, scope, condition,
+     duration_secs, severity, cooldown_secs, channel, enabled)
+VALUES
+  ('backup_restore_drill_failed',
+   'Automated backup restore-drill failed, or no successful drill within the staleness window (silent data-loss risk, cf. 2026-04-18 wipe)',
+   'backup_restore_drill_failed', 'leader_only', '> 0',
+   0, 'critical', 43200, 'telegram', true)
+ON CONFLICT (name) DO NOTHING;
+"#;

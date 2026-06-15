@@ -934,7 +934,7 @@ impl BackupOrchestrator {
 
 // ─── Free helpers ─────────────────────────────────────────────────────
 
-async fn file_metadata(path: &Path) -> Result<(i64, String), BackupError> {
+pub(crate) async fn file_metadata(path: &Path) -> Result<(i64, String), BackupError> {
     let meta = tokio::fs::metadata(path).await?;
     let size_bytes = meta.len() as i64;
     let mut file = tokio::fs::File::open(path).await?;
