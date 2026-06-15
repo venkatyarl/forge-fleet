@@ -888,6 +888,13 @@ enum TasksCommand {
         /// `error_class` field (derived on the fly, not stored).
         #[arg(long, default_value_t = false)]
         json: bool,
+        /// Poll until the task reaches a terminal state (completed/failed/
+        /// cancelled) instead of printing a one-shot snapshot. Prints a status
+        /// line to stderr whenever status/progress changes, then the full
+        /// detail. Bounded by an internal timeout. Mirrors
+        /// `ff research --show --watch`.
+        #[arg(long, default_value_t = false)]
+        watch: bool,
     },
     /// Cancel a pending or running task. The row flips to `cancelled`;
     /// the worker's completion UPDATE is gated on status='running' so
@@ -3726,10 +3733,10 @@ async fn main() -> Result<()> {
                     println!("{id}");
                     Ok(())
                 }
-                TasksCommand::Get { id, json } => {
+                TasksCommand::Get { id, json, watch } => {
                     let task_id = uuid::Uuid::parse_str(&id)
                         .map_err(|e| anyhow::anyhow!("invalid uuid: {e}"))?;
-                    tasks_cmd::handle_tasks_get(&pool, task_id, json).await
+                    tasks_cmd::handle_tasks_get(&pool, task_id, json, watch).await
                 }
                 TasksCommand::Cancel { id, reason } => {
                     let task_id = uuid::Uuid::parse_str(&id)
