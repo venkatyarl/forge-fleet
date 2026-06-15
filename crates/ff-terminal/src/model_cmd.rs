@@ -1802,8 +1802,29 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                 }
             }
         }
-        crate::ModelCommand::Coverage { json, remediate } => {
+        crate::ModelCommand::Coverage {
+            json,
+            remediate,
+            explain,
+        } => {
             let guard = ff_agent::coverage_guard::CoverageGuard::new_dbonly(pool.clone());
+            // `--explain` is a read-only per-task breakdown — short-circuit
+            // before the normal coverage pass (it implies no remediation).
+            if explain {
+                let rows = guard
+                    .explain()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("coverage explain: {e}"))?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&rows).unwrap_or_default()
+                    );
+                } else {
+                    print_coverage_explain(&rows);
+                }
+                return Ok(());
+            }
             // Read-only by default so a status check has no side effects;
             // `--remediate` opts into enqueuing auto-loads.
             let report = if remediate {
@@ -3114,6 +3135,49 @@ fn truncate_str(s: &str, n: usize) -> String {
     } else {
         let truncated: String = s.chars().take(n.saturating_sub(1)).collect();
         format!("{truncated}…")
+    }
+}
+
+/// Render the `ff model coverage --explain` per-task breakdown: for each
+/// required task, whether it is covered and the deployed model(s) that credit
+/// it (with the match path), or — for a gap — the catalog candidates that
+/// could close it. Makes the fuzzy deployment↔catalog matching observable.
+fn print_coverage_explain(rows: &[ff_agent::coverage_guard::TaskExplanation]) {
+    let covered = rows.iter().filter(|r| r.covered).count();
+    println!(
+        "Task coverage — {covered}/{} covered (deployment id shown is the \
+         normalized match key)\n",
+        rows.len()
+    );
+    for r in rows {
+        let (mark, color) = if r.covered {
+            ("✓", GREEN)
+        } else {
+            ("✗", RED)
+        };
+        println!(
+            "{color}{mark}{RESET} {} {CYAN}(min {}, have {}){RESET}",
+            r.task,
+            r.min_required,
+            r.credits.len()
+        );
+        if r.credits.is_empty() {
+            let cands = if r.candidates.is_empty() {
+                "(none loadable)".to_string()
+            } else {
+                r.candidates
+                    .iter()
+                    .take(3)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            println!("    {YELLOW}gap{RESET} — candidates: {cands}");
+        } else {
+            for c in &r.credits {
+                println!("    {} {CYAN}via {}{RESET}", c.deployment, c.via);
+            }
+        }
     }
 }
 

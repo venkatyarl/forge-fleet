@@ -67,6 +67,37 @@ pub struct CoverageReport {
     pub auto_loaded: Vec<String>,
 }
 
+/// One reason a deployment credits a task. The `deployment` is the
+/// [`normalize_model_id`]-canonical id actually compared during matching (the
+/// same form the gateway router and pulse reader use) — i.e. exactly what the
+/// fuzzy match sees, so a "why didn't this match?" question is answerable from
+/// the output alone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoverageCredit {
+    /// Normalized deployment id that credits the task.
+    pub deployment: String,
+    /// How it was credited: `catalog:<id>` (the deployment matched an active
+    /// catalog row tagged with the task), `preferred:<id>` (it matched an id
+    /// the operator named in the task's `preferred_model_ids`), or
+    /// `alias of <task>` (credited transitively via [`TASK_ALIAS_GROUPS`]).
+    pub via: String,
+}
+
+/// Per-task coverage explanation: why a task is covered or a gap. Built by
+/// [`CoverageGuard::explain`] for the `ff model coverage --explain` view.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskExplanation {
+    pub task: String,
+    pub min_required: i32,
+    /// True iff `credits.len() >= min_required`.
+    pub covered: bool,
+    /// Every deployment that credits this task, with the match path. Empty for
+    /// an uncovered task. Length is the task's coverage count.
+    pub credits: Vec<CoverageCredit>,
+    /// Catalog ids that could close the gap (only populated when uncovered).
+    pub candidates: Vec<String>,
+}
+
 /// Fleet task-coverage guard.
 ///
 /// Clone-on-spawn friendly — holds an `Arc<Mutex<_>>` for the alert
@@ -247,6 +278,26 @@ impl CoverageGuard {
     /// model the operator named in that task's `preferred_model_ids` — see
     /// [`tally_task_coverage`] for the full rule.
     async fn deployed_task_counts(&self) -> Result<HashMap<String, i32>, sqlx::Error> {
+        let (deploy_norm, catalog, preferred) = self.load_coverage_inputs().await?;
+        Ok(tally_task_coverage(&deploy_norm, &catalog, &preferred))
+    }
+
+    /// Load and normalize the three inputs the coverage match consumes:
+    /// active deployment ids, active catalog (id, tasks), and the operator's
+    /// per-task `preferred_model_ids`. Shared by [`Self::deployed_task_counts`]
+    /// and [`Self::explain`] so the count and the `--explain` reasons read the
+    /// exact same rows. See [`tally_task_coverage`] for the matching rules.
+    #[allow(clippy::type_complexity)]
+    async fn load_coverage_inputs(
+        &self,
+    ) -> Result<
+        (
+            Vec<String>,
+            Vec<(String, Vec<String>)>,
+            Vec<(String, Vec<String>)>,
+        ),
+        sqlx::Error,
+    > {
         let dep_rows =
             sqlx::query("SELECT model_id FROM computer_model_deployments WHERE status = 'active'")
                 .fetch_all(&self.pg)
@@ -296,7 +347,61 @@ impl CoverageGuard {
             })
             .collect();
 
-        Ok(tally_task_coverage(&deploy_norm, &catalog, &preferred))
+        Ok((deploy_norm, catalog, preferred))
+    }
+
+    /// Build a per-task [`TaskExplanation`] list answering "why is this task
+    /// covered / a gap, and by which deployed model?". Read-only — never
+    /// remediates. Tasks are returned in the same priority order as the
+    /// coverage report (`critical` → `normal` → `nice-to-have`, then by name).
+    pub async fn explain(&self) -> Result<Vec<TaskExplanation>, CoverageError> {
+        let required = sqlx::query(
+            "SELECT task, min_models_loaded, preferred_model_ids, priority
+             FROM fleet_task_coverage
+             ORDER BY
+               CASE priority
+                 WHEN 'critical' THEN 0
+                 WHEN 'normal' THEN 1
+                 WHEN 'nice-to-have' THEN 2
+                 ELSE 3
+               END,
+               task",
+        )
+        .fetch_all(&self.pg)
+        .await?;
+
+        let (deploy_norm, catalog, preferred) = self.load_coverage_inputs().await?;
+        let credits_by_task = explain_task_coverage(&deploy_norm, &catalog, &preferred);
+
+        let mut out = Vec::with_capacity(required.len());
+        for row in required {
+            let task: String = row.get("task");
+            let min_required: i32 = row.get("min_models_loaded");
+            let credits = credits_by_task.get(&task).cloned().unwrap_or_default();
+            let covered = credits.len() as i32 >= min_required;
+
+            // Only spend a query ranking candidates for genuine gaps.
+            let candidates = if covered {
+                Vec::new()
+            } else {
+                let preferred_json: serde_json::Value = row.get("preferred_model_ids");
+                let preferred_ids = json_str_array(preferred_json);
+                self.rank_candidates(&task, &preferred_ids)
+                    .await?
+                    .into_iter()
+                    .map(|c| c.id)
+                    .collect()
+            };
+
+            out.push(TaskExplanation {
+                task,
+                min_required,
+                covered,
+                credits,
+                candidates,
+            });
+        }
+        Ok(out)
     }
 
     /// Spawn a background tick that runs [`Self::check_once`] every
@@ -580,38 +685,86 @@ pub fn tally_task_coverage(
     catalog: &[(String, Vec<String>)],
     preferred: &[(String, Vec<String>)],
 ) -> HashMap<String, i32> {
-    let mut counts: HashMap<String, i32> = HashMap::new();
+    // Counts are exactly the per-task credit list length — derive them from the
+    // explanation so the two views can never drift (e.g. a future match-rule
+    // change can't make the count and the `--explain` reasons disagree).
+    explain_task_coverage(deploy_norm, catalog, preferred)
+        .into_iter()
+        .map(|(task, credits)| (task, credits.len() as i32))
+        .collect()
+}
+
+/// Like [`tally_task_coverage`] but records, per task, *which* deployment
+/// credits it and *why* (catalog tag / preferred id / alias). The counting
+/// rules are identical — each deployment contributes at most one credit per
+/// task (the union of catalog + preferred + alias paths) — so
+/// `explain_task_coverage(..)[task].len() == tally_task_coverage(..)[task]`.
+/// Pure → unit-tested. Powers `ff model coverage --explain`.
+pub fn explain_task_coverage(
+    deploy_norm: &[String],
+    catalog: &[(String, Vec<String>)],
+    preferred: &[(String, Vec<String>)],
+) -> HashMap<String, Vec<CoverageCredit>> {
+    let mut out: HashMap<String, Vec<CoverageCredit>> = HashMap::new();
     for dep in deploy_norm {
-        let mut tasks: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        // task -> first/most-specific reason for THIS deployment. BTreeMap so
+        // a deployment's credits are emitted in a stable (task-sorted) order.
+        let mut reasons: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
 
         // Catalog path: the most specific matching active row contributes its
         // tasks (longest id wins so a short prefix can't shadow a precise one).
-        if let Some((_, ts)) = catalog
+        if let Some((cid, ts)) = catalog
             .iter()
             .filter(|(cid, _)| catalog_matches(dep, cid))
             .max_by_key(|(cid, _)| cid.len())
         {
-            tasks.extend(ts.iter().cloned());
+            for t in ts {
+                reasons
+                    .entry(t.clone())
+                    .or_insert_with(|| format!("catalog:{cid}"));
+            }
         }
 
         // Preferred path: any task whose operator-declared preferred list names
-        // a model this deployment matches.
+        // a model this deployment matches. Doesn't override a catalog reason
+        // already recorded for the same task (union, credited once).
         for (task, pref_ids) in preferred {
-            if pref_ids.iter().any(|p| catalog_matches(dep, p)) {
-                tasks.insert(task.clone());
+            if let Some(p) = pref_ids.iter().find(|p| catalog_matches(dep, p)) {
+                reasons
+                    .entry(task.clone())
+                    .or_insert_with(|| format!("preferred:{p}"));
             }
         }
 
         // Synonymous-task credit: e.g. a model serving `code-generation` also
-        // covers `code`. Applied per deployment so the union (and the at-most-
-        // once-per-task count) still holds.
-        expand_task_aliases(&mut tasks);
+        // covers `code`. Expand via the canonical [`expand_task_aliases`] rule
+        // (single source of truth), then label each newly-added task with the
+        // already-credited sibling that supplied the credit. Applied per
+        // deployment so the at-most-once-per-task rule still holds.
+        let mut task_set: std::collections::BTreeSet<String> = reasons.keys().cloned().collect();
+        expand_task_aliases(&mut task_set);
+        for t in &task_set {
+            if reasons.contains_key(t) {
+                continue;
+            }
+            let src = TASK_ALIAS_GROUPS
+                .iter()
+                .find(|g| g.contains(&t.as_str()))
+                .and_then(|g| g.iter().find(|s| reasons.contains_key(**s)))
+                .copied()
+                .unwrap_or("?");
+            reasons.insert(t.clone(), format!("alias of {src}"));
+        }
 
-        for t in tasks {
-            *counts.entry(t).or_insert(0) += 1;
+        for (task, via) in reasons {
+            out.entry(task).or_default().push(CoverageCredit {
+                deployment: dep.clone(),
+                via,
+            });
         }
     }
-    counts
+    out
 }
 
 /// True iff a normalized deployment id corresponds to a normalized catalog id.
@@ -807,6 +960,71 @@ mod tests {
         // Both synonyms credited exactly once by the single deployment.
         assert_eq!(counts.get("code-generation"), Some(&1));
         assert_eq!(counts.get("code"), Some(&1));
+    }
+
+    #[test]
+    fn explain_matches_tally_counts_exactly() {
+        // The same fixtures as the big tally test: explain's per-task credit
+        // count MUST equal tally's count for every task (they share the rule).
+        let n = normalize_model_id;
+        let deploy = vec![
+            n("Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"),
+            n("Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"),
+            n("gemma-4-31B-it-Q4_K_M.gguf"),
+        ];
+        let catalog = vec![(n("gemma4-31b-it"), vec!["text-generation".to_string()])];
+        let preferred = vec![
+            (
+                "default-chat".to_string(),
+                vec![n("qwen3.6-35b-a3b"), n("gemma4-31b-it")],
+            ),
+            ("chain-of-thought".to_string(), vec![n("qwen3.6-35b-a3b")]),
+            ("code-generation".to_string(), vec![n("qwen3.6-35b-a3b")]),
+            ("code".to_string(), vec![n("qwen3-coder-30b")]),
+        ];
+
+        let counts = tally_task_coverage(&deploy, &catalog, &preferred);
+        let explained = explain_task_coverage(&deploy, &catalog, &preferred);
+
+        // Same set of tasks, same per-task multiplicities.
+        assert_eq!(counts.len(), explained.len());
+        for (task, c) in &counts {
+            assert_eq!(
+                explained.get(task).map(|v| v.len() as i32),
+                Some(*c),
+                "task {task}: explain credit count must equal tally count"
+            );
+        }
+    }
+
+    #[test]
+    fn explain_records_each_match_path() {
+        let n = normalize_model_id;
+        let deploy = vec![n("Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"), n("bge-m3-FP16.gguf")];
+        // bge-m3 credited via CATALOG tag; flagship via PREFERRED; code via ALIAS.
+        let catalog = vec![(n("bge-m3"), vec!["feature-extraction".to_string()])];
+        let preferred = vec![
+            ("code-generation".to_string(), vec![n("qwen3.6-35b-a3b")]),
+            ("code".to_string(), vec![]),
+        ];
+        let ex = explain_task_coverage(&deploy, &catalog, &preferred);
+
+        // catalog path
+        let fe = &ex["feature-extraction"];
+        assert_eq!(fe.len(), 1);
+        assert!(fe[0].via.starts_with("catalog:"), "got {}", fe[0].via);
+
+        // preferred path
+        let cg = &ex["code-generation"];
+        assert_eq!(cg.len(), 1);
+        assert!(cg[0].via.starts_with("preferred:"), "got {}", cg[0].via);
+
+        // alias path — `code` credited transitively from `code-generation`.
+        let code = &ex["code"];
+        assert_eq!(code.len(), 1);
+        assert_eq!(code[0].via, "alias of code-generation");
+        // The crediting deployment is the same flagship that covers code-generation.
+        assert_eq!(code[0].deployment, cg[0].deployment);
     }
 
     #[test]
