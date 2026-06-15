@@ -16,6 +16,10 @@ pub struct SweepSummary {
     pub research_sessions_failed: usize,
     /// `research_subtasks` rows recovered (stuck in `running`).
     pub research_subtasks_failed: usize,
+    /// `fleet_model_deployments` rows flipped `healthy` → `unhealthy` because
+    /// their `last_health_at` went stale (the node wedged/went offline and its
+    /// per-node reconciler stopped refreshing them).
+    pub deployments_marked_unhealthy: usize,
 }
 
 /// Configuration for what counts as "stale".
@@ -31,6 +35,19 @@ pub struct SweepPolicy {
     /// `ff research` process — there is no worker to re-claim them — so if that
     /// process dies the session and its `running` subtasks are orphaned forever.
     pub research_stale_after: Duration,
+    /// A `healthy` deployment is stale if its `last_health_at` is older than
+    /// this. The per-node `deployment_reconciler` refreshes `last_health_at`
+    /// every ~60s; a host that wedges/goes offline can NEVER flip its own
+    /// deployments to unhealthy, so the row lingers as `healthy` with a frozen
+    /// `last_health_at` and every observability surface (pulse, dashboards,
+    /// `ff fleet route`) keeps reporting a dead endpoint as live. The live
+    /// dispatch pickers already refuse such rows past
+    /// `DISPATCH_HEALTH_MAX_AGE_SEC` (300s, PR #332) — this is the slower,
+    /// persistent data-correctness flip, deliberately 2× the dispatch floor so
+    /// a brief reconciler blip never flaps the stored state. A recovered node's
+    /// own reconciler re-flips it `healthy` with a fresh `last_health_at`, so
+    /// the flip is self-correcting.
+    pub deployment_health_stale_after: Duration,
 }
 
 impl Default for SweepPolicy {
@@ -47,6 +64,12 @@ impl Default for SweepPolicy {
             // session stuck in `planning` because the planner itself died is
             // recovered too.
             research_stale_after: Duration::hours(1),
+            // 2× the live-dispatch freshness floor (DISPATCH_HEALTH_MAX_AGE_SEC
+            // = 300s, PR #332): dispatch stops routing to a stale endpoint
+            // first (cheap, reversible, no stored change), and only if it stays
+            // stale this long does the persistent healthy→unhealthy flip fire —
+            // so a transient one-tick reconciler miss never flaps the data.
+            deployment_health_stale_after: Duration::minutes(10),
         }
     }
 }
@@ -186,6 +209,31 @@ pub async fn sweep_stale(
         Err(e) => tracing::warn!("pg sweep research_sessions: {e}"),
     }
 
+    // ── fleet_model_deployments (stale-healthy → unhealthy) ──────────────
+    // A wedged/offline node's per-node reconciler stops refreshing
+    // `last_health_at`, so the deployment is stuck reporting `healthy` to every
+    // observability surface even though nothing answers there. Flip the
+    // provably-stale ones to `unhealthy` so the stored state matches reality;
+    // the node's own reconciler re-flips it back with a fresh timestamp on
+    // recovery, so this is self-correcting (and only ever touches rows the live
+    // dispatch pickers were already skipping). Rows with a NULL `last_health_at`
+    // were never datable — leave them for the dispatch NULL-passes / reconciler.
+    let deploy_cutoff = now - policy.deployment_health_stale_after;
+    let deployments = sqlx::query(
+        "UPDATE fleet_model_deployments
+            SET health_status = 'unhealthy'
+          WHERE health_status = 'healthy'
+            AND last_health_at IS NOT NULL
+            AND last_health_at < $1",
+    )
+    .bind(deploy_cutoff)
+    .execute(pool)
+    .await;
+    match deployments {
+        Ok(r) => summary.deployments_marked_unhealthy = r.rows_affected() as usize,
+        Err(e) => tracing::warn!("pg sweep fleet_model_deployments: {e}"),
+    }
+
     Ok(summary)
 }
 
@@ -210,6 +258,16 @@ mod tests {
         // Research sessions: generous enough not to reap a live `ff research`
         // run, short enough that orphans (process killed) clear within the hour.
         assert_eq!(p.research_stale_after, Duration::hours(1));
+        // Deployment health flip: must stay strictly LONGER than the live
+        // dispatch freshness floor (DISPATCH_HEALTH_MAX_AGE_SEC = 300s) so the
+        // cheap reversible router skip always fires before the persistent
+        // healthy→unhealthy write — otherwise a transient reconciler blip
+        // flaps the stored state.
+        assert_eq!(p.deployment_health_stale_after, Duration::minutes(10));
+        assert!(
+            p.deployment_health_stale_after.num_seconds()
+                > ff_db::queries::DISPATCH_HEALTH_MAX_AGE_SEC as i64
+        );
     }
 
     #[test]
@@ -299,11 +357,13 @@ impl StaleJobSweeperTick {
                             Ok(s) if s.jobs_failed
                                 + s.deferred_failed
                                 + s.research_sessions_failed
-                                + s.research_subtasks_failed > 0 => tracing::info!(
+                                + s.research_subtasks_failed
+                                + s.deployments_marked_unhealthy > 0 => tracing::info!(
                                 jobs_failed = s.jobs_failed,
                                 deferred_failed = s.deferred_failed,
                                 research_sessions_failed = s.research_sessions_failed,
                                 research_subtasks_failed = s.research_subtasks_failed,
+                                deployments_marked_unhealthy = s.deployments_marked_unhealthy,
                                 "stale-job sweeper: recovered stuck running rows"
                             ),
                             Ok(_) => {}
