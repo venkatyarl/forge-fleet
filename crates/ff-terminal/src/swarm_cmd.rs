@@ -38,6 +38,14 @@ pub enum SwarmCommand {
         /// this capability won't claim the row.
         #[arg(long, default_value = "ff")]
         capability: String,
+        /// Computer names that must NOT claim any sub-task,
+        /// comma-separated (e.g. "sia,adele,rihanna,beyonce" to keep the
+        /// swarm off the DGX pairs, or "taylor" to spare the leader).
+        /// Sets fleet_tasks.excludes_computer_ids on every fanned-out
+        /// sub-task; unknown names are warned about and skipped, never
+        /// silently dropped.
+        #[arg(long, default_value = "")]
+        exclude: String,
         /// LLM endpoint to use for planning + synthesis. Defaults to
         /// the gateway's local route which picks the cheapest tier.
         #[arg(long, default_value = "http://127.0.0.1:51002/v1/chat/completions")]
@@ -91,6 +99,7 @@ pub async fn handle_swarm(cmd: SwarmCommand) -> Result<()> {
             goal,
             fanout,
             capability,
+            exclude,
             llm,
             model,
             timeout_secs,
@@ -102,6 +111,7 @@ pub async fn handle_swarm(cmd: SwarmCommand) -> Result<()> {
                 &goal,
                 fanout,
                 &capability,
+                &exclude,
                 &llm,
                 &model,
                 timeout_secs,
@@ -113,10 +123,12 @@ pub async fn handle_swarm(cmd: SwarmCommand) -> Result<()> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_swarm(
     goal: &str,
     fanout: usize,
     capability: &str,
+    exclude: &str,
     llm: &str,
     model: &str,
     timeout_secs: u64,
@@ -126,6 +138,11 @@ async fn run_swarm(
     let pool = ff_agent::fleet_info::get_fleet_pool()
         .await
         .map_err(|e| anyhow!("connect Postgres: {e}"))?;
+
+    // Resolve --exclude names → computer_ids once; every sub-task carries
+    // the same exclusion set. Unknown names are surfaced as a warning and
+    // skipped (no silent drop), mirroring `ff tasks add --exclude`.
+    let exclude_ids = resolve_exclude_ids(&pool, exclude).await;
 
     eprintln!("planner: decomposing goal into {fanout} sub-tasks…");
     let subtasks = plan_subtasks(goal, fanout, llm, model).await?;
@@ -168,7 +185,7 @@ async fn run_swarm(
     for (i, sub) in subtasks.iter().enumerate() {
         let shell_safe = sub.replace('\'', "'\\''");
         let cmd = format!("ff run '{shell_safe}'");
-        let id = ff_agent::task_runner::pg_enqueue_shell_task(
+        let id = ff_agent::task_runner::pg_enqueue_shell_task_with_options(
             &pool,
             &format!("swarm[{}/{}]: {}", i + 1, subtasks.len(), truncate(sub, 80)),
             &cmd,
@@ -177,6 +194,8 @@ async fn run_swarm(
             Some(parent),
             70,
             leader,
+            false,
+            &exclude_ids,
         )
         .await
         .map_err(|e| anyhow!("enqueue sub-task {i}: {e}"))?;
@@ -520,5 +539,76 @@ fn truncate(s: &str, max: usize) -> String {
     } else {
         let truncated: String = s.chars().take(max.saturating_sub(1)).collect();
         format!("{truncated}…")
+    }
+}
+
+/// Parse a comma-separated `--exclude` worker-name list (e.g.
+/// `"sia,adele"`) into the parsed, de-duplicated names, ignoring empty
+/// segments and surrounding whitespace. Pure — the DB lookup that turns
+/// names into `computer_id`s lives in [`resolve_exclude_ids`]; this is
+/// split out so the parsing is unit-testable without a Postgres pool.
+fn parse_exclude_names(exclude: &str) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for raw in exclude.split(',') {
+        let name = raw.trim();
+        if !name.is_empty() && !names.iter().any(|n| n == name) {
+            names.push(name.to_string());
+        }
+    }
+    names
+}
+
+/// Resolve a `--exclude` worker-name list into `computer_id`s. Unknown
+/// names are surfaced as a warning and skipped (never silently dropped),
+/// so a typo can't quietly fail to exclude the host you meant — same
+/// contract as `ff tasks add --exclude`.
+async fn resolve_exclude_ids(pool: &PgPool, exclude: &str) -> Vec<Uuid> {
+    let names = parse_exclude_names(exclude);
+    let mut ids: Vec<Uuid> = Vec::new();
+    let mut resolved: Vec<String> = Vec::new();
+    for name in &names {
+        match sqlx::query_scalar::<_, Uuid>("SELECT id FROM computers WHERE name = $1")
+            .bind(name)
+            .fetch_optional(pool)
+            .await
+        {
+            Ok(Some(id)) => {
+                ids.push(id);
+                resolved.push(name.clone());
+            }
+            Ok(None) => {
+                eprintln!("warning: --exclude '{name}' matches no computer; skipping")
+            }
+            Err(e) => {
+                eprintln!("warning: resolving --exclude '{name}': {e}; skipping")
+            }
+        }
+    }
+    if !ids.is_empty() {
+        eprintln!(
+            "executor: excluding {} computer(s) from sub-task claims: {}",
+            ids.len(),
+            resolved.join(", ")
+        );
+    }
+    ids
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_exclude_names;
+
+    #[test]
+    fn parse_exclude_names_trims_dedups_and_drops_empties() {
+        assert_eq!(parse_exclude_names(""), Vec::<String>::new());
+        assert_eq!(parse_exclude_names("  "), Vec::<String>::new());
+        assert_eq!(
+            parse_exclude_names("sia, adele ,rihanna"),
+            vec!["sia", "adele", "rihanna"]
+        );
+        // empty segments from leading/trailing/double commas are ignored
+        assert_eq!(parse_exclude_names(",taylor,,"), vec!["taylor"]);
+        // duplicates collapse
+        assert_eq!(parse_exclude_names("sia,sia,adele"), vec!["sia", "adele"]);
     }
 }
