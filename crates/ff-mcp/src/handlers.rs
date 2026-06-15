@@ -1387,6 +1387,13 @@ pub async fn fleet_route(params: Option<Value>) -> HandlerResult {
                     "has_gpu": r.has_gpu,
                     "is_unified_memory": r.is_unified_memory,
                     "total_ram_gb": r.total_ram_gb,
+                },
+                // Latest sampled host load (most recent metrics row; null when
+                // never sampled) — the signal the dispatch pickers' least-loaded
+                // tiebreak orders equal-tier candidates by.
+                "load": {
+                    "cpu_pct": r.cpu_pct,
+                    "llm_active_requests": r.llm_active_requests,
                 }
             })
         })

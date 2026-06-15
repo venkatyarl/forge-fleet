@@ -2382,28 +2382,36 @@ pub struct RouteFilter {
     pub limit: i64,
 }
 
-/// SQL fragments injected into [`pg_route_deployments`] for the optional live-load
-/// tiebreaker. Returns `(join, order_prefix)`: the `LEFT JOIN LATERAL` that pulls
-/// each host's latest metrics row, and the ORDER BY columns inserted between
-/// `cat.tier ASC` and the `last_health_at` freshness tiebreak. Both empty when
-/// the tiebreaker is off, so the query is byte-identical to the historical one.
-/// The fragments are compile-time constants (no caller input) — never a SQL
-/// injection vector. Pure — unit-tested.
-fn load_tiebreak_fragments(prefer_least_loaded: bool) -> (&'static str, &'static str) {
-    if prefer_least_loaded {
-        (
-            "LEFT JOIN LATERAL (
+/// `LEFT JOIN LATERAL` that pulls each host's latest `computer_metrics_history`
+/// row (written once/minute/host by the leader downsampler), aliased `load`.
+/// Always injected into [`pg_route_deployments`] so `cpu_pct` /
+/// `llm_active_requests` are available for DISPLAY on every candidate (the
+/// observability views surface them as a LOAD column), independent of whether
+/// the live-load tiebreak is active. The lookup is an index scan on the
+/// `computer_metrics_history` PK (`computer_id, recorded_at`) → one indexed row
+/// per candidate, negligible cost. Compile-time constant — never a SQL injection
+/// vector.
+const LOAD_METRICS_JOIN: &str = "LEFT JOIN LATERAL (
                  SELECT m.cpu_pct, m.llm_active_requests
                    FROM computer_metrics_history m
                   WHERE m.computer_id = c.id
                   ORDER BY m.recorded_at DESC
                   LIMIT 1
-             ) load ON TRUE",
-            "COALESCE(load.llm_active_requests, 0) ASC,
-                  COALESCE(load.cpu_pct, 0) ASC,",
-        )
+             ) load ON TRUE";
+
+/// ORDER BY columns injected into [`pg_route_deployments`] between `cat.tier ASC`
+/// and the `last_health_at` freshness tiebreak when the optional live-load
+/// tiebreaker is on. Empty when off, so equal-tier candidates keep the historical
+/// freshness-only ordering. The metrics JOIN it reads ([`LOAD_METRICS_JOIN`]) is
+/// always present, so toggling this only changes the sort, not the row set.
+/// Compile-time constant (no caller input) — never a SQL injection vector. Pure
+/// — unit-tested.
+fn load_tiebreak_order(prefer_least_loaded: bool) -> &'static str {
+    if prefer_least_loaded {
+        "COALESCE(load.llm_active_requests, 0) ASC,
+                  COALESCE(load.cpu_pct, 0) ASC,"
     } else {
-        ("", "")
+        ""
     }
 }
 
@@ -2454,6 +2462,15 @@ pub struct RouteCandidate {
     pub has_gpu: Option<bool>,
     pub is_unified_memory: Option<bool>,
     pub total_ram_gb: Option<i32>,
+    /// Latest sampled host CPU utilization (%), from the most recent
+    /// `computer_metrics_history` row. `None` when the host has never been
+    /// sampled (e.g. just enrolled). This is the signal the live-load tiebreak
+    /// orders by; surfaced here so observability views can show it.
+    pub cpu_pct: Option<f64>,
+    /// Latest sampled count of in-flight LLM requests on the host's inference
+    /// servers, from the most recent `computer_metrics_history` row. `None` when
+    /// never sampled. Primary key of the live-load tiebreak ordering.
+    pub llm_active_requests: Option<i32>,
 }
 
 /// Equivalent-tag tolerance for workload routing. `@>` is an exact-element
@@ -2584,7 +2601,8 @@ pub async fn pg_route_deployments(
 
     let limit = route_limit_or_default(filter.limit);
 
-    let (load_join, load_order) = load_tiebreak_fragments(filter.prefer_least_loaded);
+    let load_join = LOAD_METRICS_JOIN;
+    let load_order = load_tiebreak_order(filter.prefer_least_loaded);
 
     let sql = format!(
         r#"
@@ -2605,6 +2623,8 @@ pub async fn pg_route_deployments(
                c.has_gpu       AS has_gpu,
                (c.gpu_kind IN ('apple_silicon', 'gb10')) AS is_unified_memory,
                c.total_ram_gb  AS total_ram_gb,
+               load.cpu_pct            AS load_cpu_pct,
+               load.llm_active_requests AS load_active_requests,
                EXTRACT(EPOCH FROM (NOW() - d.last_health_at))::int AS health_age_sec
           FROM fleet_model_deployments d
           JOIN fleet_model_catalog cat ON cat.id = d.catalog_id
@@ -2671,6 +2691,8 @@ pub async fn pg_route_deployments(
                 has_gpu: r.try_get("has_gpu").ok(),
                 is_unified_memory: r.try_get("is_unified_memory").ok(),
                 total_ram_gb: r.try_get("total_ram_gb").ok(),
+                cpu_pct: r.try_get("load_cpu_pct").ok(),
+                llm_active_requests: r.try_get("load_active_requests").ok(),
             }
         })
         .collect())
@@ -4930,23 +4952,30 @@ mod tests {
     }
 
     #[test]
-    fn load_tiebreak_fragments_off_is_empty() {
-        // Tiebreaker off → both fragments empty so the routing query is
-        // byte-identical to the historical tier→freshness ordering.
-        let (join, order) = load_tiebreak_fragments(false);
-        assert_eq!(join, "");
-        assert_eq!(order, "");
+    fn load_metrics_join_always_pulls_latest_row() {
+        // The metrics LATERAL is always present (so cpu_pct / llm_active_requests
+        // are available for display on every candidate) and pulls exactly the
+        // latest sample per host.
+        assert!(LOAD_METRICS_JOIN.contains("computer_metrics_history"));
+        assert!(LOAD_METRICS_JOIN.contains("ORDER BY m.recorded_at DESC"));
+        assert!(LOAD_METRICS_JOIN.contains("LIMIT 1"));
+        // Aliased `load` so the SELECT/ORDER fragments can reference it.
+        assert!(LOAD_METRICS_JOIN.contains(") load ON TRUE"));
     }
 
     #[test]
-    fn load_tiebreak_fragments_on_injects_lateral_and_load_order() {
-        let (join, order) = load_tiebreak_fragments(true);
-        // The join pulls the latest metrics row per host…
-        assert!(join.contains("computer_metrics_history"));
-        assert!(join.contains("ORDER BY m.recorded_at DESC"));
-        assert!(join.contains("LIMIT 1"));
-        // …and the order prefix ranks fewest in-flight requests, then CPU,
-        // ahead of the freshness tiebreak. Treats a missing sample as idle.
+    fn load_tiebreak_order_off_is_empty() {
+        // Tiebreaker off → empty order fragment so equal-tier candidates keep the
+        // historical freshness-only ordering (the JOIN still runs, only for
+        // display — it doesn't change the row set).
+        assert_eq!(load_tiebreak_order(false), "");
+    }
+
+    #[test]
+    fn load_tiebreak_order_on_ranks_requests_then_cpu() {
+        let order = load_tiebreak_order(true);
+        // Ranks fewest in-flight requests, then CPU, ahead of the freshness
+        // tiebreak. Treats a missing sample as idle (COALESCE 0).
         assert!(order.contains("llm_active_requests"));
         assert!(order.contains("cpu_pct"));
         assert!(order.contains("COALESCE"));
@@ -4975,6 +5004,8 @@ mod tests {
             has_gpu: None,
             is_unified_memory: None,
             total_ram_gb: None,
+            cpu_pct: None,
+            llm_active_requests: None,
         }
     }
 

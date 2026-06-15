@@ -2997,8 +2997,32 @@ fn route_candidate_json(r: &ff_db::RouteCandidate) -> serde_json::Value {
             "has_gpu": r.has_gpu,
             "is_unified_memory": r.is_unified_memory,
             "total_ram_gb": r.total_ram_gb,
+        },
+        // Latest sampled host load (most recent computer_metrics_history row;
+        // null when the host has never been sampled). This is the signal the
+        // `--least-loaded` tiebreak orders equal-tier candidates by.
+        "load": {
+            "cpu_pct": r.cpu_pct,
+            "llm_active_requests": r.llm_active_requests,
         }
     })
+}
+
+/// Render a candidate's latest sampled load as `"<cpu>%/<reqs>"` (e.g.
+/// `"3.9%/0"`) for the `LOAD` column. An unsampled host (never written a
+/// `computer_metrics_history` row) shows `"-"` rather than a fake `0%/0`, so the
+/// operator can tell "idle" from "no data". Either half falls back to `?` if
+/// only one of the two metrics is present. Pure — unit-tested.
+fn fmt_route_load(cpu_pct: Option<f64>, active_requests: Option<i32>) -> String {
+    match (cpu_pct, active_requests) {
+        (None, None) => "-".to_string(),
+        (cpu, reqs) => format!(
+            "{}/{}",
+            cpu.map(|c| format!("{c:.1}%"))
+                .unwrap_or_else(|| "?".into()),
+            reqs.map(|r| r.to_string()).unwrap_or_else(|| "?".into()),
+        ),
+    }
 }
 
 /// Whether routing should require a tool-calling model. The explicit
@@ -3136,8 +3160,16 @@ async fn handle_fleet_route(
     );
 
     println!(
-        "  {:<10} {:<30} {:<22} {:<4} {:<5} {:<14} {:<6} {}",
-        "WORKER", "ENDPOINT", "MODEL", "TIER", "TOOLS", "CTX(use/win)", "SLOTS", "HEALTH"
+        "  {:<10} {:<30} {:<22} {:<4} {:<5} {:<14} {:<6} {:<11} {}",
+        "WORKER",
+        "ENDPOINT",
+        "MODEL",
+        "TIER",
+        "TOOLS",
+        "CTX(use/win)",
+        "SLOTS",
+        "LOAD(cpu/rq)",
+        "HEALTH"
     );
     for r in &rows {
         let ctx = format!(
@@ -3154,7 +3186,7 @@ async fn handle_fleet_route(
             None => r.health_status.clone(),
         };
         println!(
-            "  {:<10} {:<30} {:<22} {:<4} {:<5} {:<14} {:<6} {}",
+            "  {:<10} {:<30} {:<22} {:<4} {:<5} {:<14} {:<6} {:<11} {}",
             r.worker_name,
             r.endpoint,
             r.catalog_id.as_deref().unwrap_or("-"),
@@ -3164,6 +3196,7 @@ async fn handle_fleet_route(
             r.parallel_slots
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| "-".into()),
+            fmt_route_load(r.cpu_pct, r.llm_active_requests),
             health,
         );
     }
@@ -4028,7 +4061,31 @@ mod version_target_tests {
 
 #[cfg(test)]
 mod route_tests {
-    use super::{normalize_route_limit, route_require_tool_calling, route_warns_below_agent_floor};
+    use super::{
+        fmt_route_load, normalize_route_limit, route_require_tool_calling,
+        route_warns_below_agent_floor,
+    };
+
+    #[test]
+    fn route_load_unsampled_host_shows_dash() {
+        // Never-sampled host (no metrics row) must read "-", not a fake idle
+        // "0%/0" — so the operator can tell "no data" from "genuinely idle".
+        assert_eq!(fmt_route_load(None, None), "-");
+    }
+
+    #[test]
+    fn route_load_formats_cpu_and_requests() {
+        assert_eq!(fmt_route_load(Some(3.94), Some(0)), "3.9%/0");
+        assert_eq!(fmt_route_load(Some(16.0), Some(2)), "16.0%/2");
+    }
+
+    #[test]
+    fn route_load_partial_sample_marks_missing_half() {
+        // One metric present, the other null → "?" for the missing half rather
+        // than dropping to "-" (the host HAS been sampled).
+        assert_eq!(fmt_route_load(Some(5.0), None), "5.0%/?");
+        assert_eq!(fmt_route_load(None, Some(3)), "?/3");
+    }
 
     #[test]
     fn warns_when_best_below_floor_and_no_pinned_min() {
