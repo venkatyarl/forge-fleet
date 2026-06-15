@@ -73,8 +73,82 @@ pub async fn handle_cortex(pool: &PgPool, cmd: crate::CortexCommand) -> Result<(
                 &format!("tests covering {symbol} (depth {max_depth})"),
             );
         }
+        crate::CortexCommand::Path {
+            corpus,
+            from,
+            to,
+            max_depth,
+            min_confidence,
+            format,
+        } => {
+            let path =
+                cortex::call_path(pool, &corpus, &from, &to, max_depth, min_confidence).await?;
+            print_path(path.as_deref(), format.as_str(), &from, &to, max_depth);
+        }
     }
     Ok(())
+}
+
+/// Render `ff cortex path`. `table` shows the chain `from → … → to` with each
+/// hop's location; `json` emits `{found, from, to, hops, path:[…]}`; `names`
+/// lists the qualified names one per line (source first). No path is a
+/// legitimate empty result (exit 0), not an error.
+fn print_path(
+    path: Option<&[cortex::SymbolRef]>,
+    format: &str,
+    from: &str,
+    to: &str,
+    depth: usize,
+) {
+    match format {
+        "json" => {
+            let nodes: Vec<_> = path
+                .unwrap_or_default()
+                .iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "id": r.id,
+                        "qualified_name": r.qualified_name,
+                        "node_type": r.node_type,
+                        "file": r.file,
+                        "start_line": r.start_line,
+                    })
+                })
+                .collect();
+            let v = serde_json::json!({
+                "from": from,
+                "to": to,
+                "found": path.is_some(),
+                // hop count = edges traversed = nodes - 1 (0 for a same-node path).
+                "hops": path.map(|p| p.len().saturating_sub(1)),
+                "path": nodes,
+            });
+            println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+        }
+        "names" => {
+            for r in path.unwrap_or_default() {
+                println!("{}", r.qualified_name);
+            }
+        }
+        _ => {
+            let Some(p) = path else {
+                println!("{CYAN}no call path from {from} to {to} within depth {depth}{RESET}");
+                return;
+            };
+            println!(
+                "{CYAN}call path {from} \u{2192} {to} \u{2014} {} hop(s):{RESET}",
+                p.len().saturating_sub(1)
+            );
+            for (i, r) in p.iter().enumerate() {
+                let arrow = if i == 0 { " " } else { "\u{2192}" };
+                println!(
+                    "  {arrow} {}  ({})",
+                    r.qualified_name,
+                    fmt_loc(r.file.as_deref(), r.start_line)
+                );
+            }
+        }
+    }
 }
 
 /// Render `ff cortex tests` hits. `table` shows depth + location + the test's

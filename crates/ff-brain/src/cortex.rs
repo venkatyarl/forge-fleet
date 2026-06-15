@@ -1521,6 +1521,141 @@ async fn impact_of_ids(
     Ok(out)
 }
 
+// ─── Call-path search (ff cortex path FROM TO) ───────────────────────────────
+//
+// `callers`/`callees` answer one hop; `impact` answers "everything that reaches
+// X". Neither answers "HOW does A reach B" — the call chain connecting two
+// symbols. That's a shortest path over the directed `calls` subgraph (forward
+// edges src→dst). A breadth-first search from FROM yields the *fewest-hop* chain,
+// which is the most useful single answer ("the shortest way control flows from A
+// to B"). Read-only, additive — same `min_confidence` tier filter as the other
+// traversal verbs.
+
+/// Reconstruct the ordered id chain FROM → … → TO by walking `parent` pointers
+/// back from `target` until a source (a node with no parent entry). Pure so the
+/// path-stitching logic is unit-testable without a database. Returns the chain in
+/// forward order (source first, `target` last).
+fn reconstruct_path(parent: &HashMap<Uuid, Uuid>, target: Uuid) -> Vec<Uuid> {
+    let mut chain = vec![target];
+    let mut cur = target;
+    // `parent` is built by BFS, which never revisits a node, so the walk is
+    // acyclic and bounded by the number of discovered nodes.
+    while let Some(&p) = parent.get(&cur) {
+        chain.push(p);
+        cur = p;
+    }
+    chain.reverse();
+    chain
+}
+
+/// Fetch `SymbolRef`s for a list of node ids, preserving the input order (so a
+/// reconstructed path renders FROM → … → TO). Ids with no surviving node are
+/// dropped.
+async fn fetch_refs_ordered(pool: &PgPool, ids: &[Uuid]) -> Result<Vec<SymbolRef>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = sqlx::query(
+        r#"SELECT id, title, node_type, start_line
+             FROM brain_vault_nodes WHERE id = ANY($1)"#,
+    )
+    .bind(ids)
+    .fetch_all(pool)
+    .await?;
+    let by_id: HashMap<Uuid, SymbolRef> = rows
+        .into_iter()
+        .map(|r| {
+            let id: Uuid = r.get("id");
+            (
+                id,
+                SymbolRef {
+                    id,
+                    qualified_name: r.get("title"),
+                    node_type: r.get("node_type"),
+                    file: None,
+                    start_line: r.get("start_line"),
+                },
+            )
+        })
+        .collect();
+    Ok(ids.iter().filter_map(|id| by_id.get(id).cloned()).collect())
+}
+
+/// Shortest call path from any symbol matching `from_sel` to any symbol matching
+/// `to_sel`, over the directed `calls` subgraph (forward, src→dst). Returns the
+/// ordered chain FROM → … → TO (each hop a real `calls` edge), or `Ok(None)` when
+/// no path exists within `max_depth` hops. Errors only if `from_sel`/`to_sel`
+/// resolve to nothing (typo / stale index) — distinct from "they exist but don't
+/// connect", which is the legitimate `None`.
+///
+/// `min_confidence` filters traversed edges by resolution tier — see [`callers`].
+pub async fn call_path(
+    pool: &PgPool,
+    corpus_slug: &str,
+    from_sel: &str,
+    to_sel: &str,
+    max_depth: usize,
+    min_confidence: f32,
+) -> Result<Option<Vec<SymbolRef>>> {
+    let from = resolve_symbol(pool, corpus_slug, from_sel).await?;
+    if from.is_empty() {
+        return Err(no_symbol_error(from_sel, corpus_slug));
+    }
+    let to = resolve_symbol(pool, corpus_slug, to_sel).await?;
+    if to.is_empty() {
+        return Err(no_symbol_error(to_sel, corpus_slug));
+    }
+    let from_ids: Vec<Uuid> = from.iter().map(|s| s.id).collect();
+    let to_set: HashSet<Uuid> = to.iter().map(|s| s.id).collect();
+
+    // FROM and TO overlap (e.g. a bare leaf matched the same node): the chain is
+    // that single node — a zero-hop path.
+    if let Some(hit) = from_ids.iter().find(|id| to_set.contains(id)) {
+        let mut refs = fetch_refs_ordered(pool, &[*hit]).await?;
+        resolve_ref_files(pool, &mut refs).await?;
+        return Ok(Some(refs));
+    }
+
+    // BFS forward from every FROM node simultaneously, recording the first parent
+    // that discovers each node (first discovery = shortest, by BFS layering).
+    let mut parent: HashMap<Uuid, Uuid> = HashMap::new();
+    let mut seen: HashSet<Uuid> = from_ids.iter().copied().collect();
+    let mut frontier: Vec<Uuid> = from_ids.clone();
+
+    for _ in 0..max_depth {
+        if frontier.is_empty() {
+            break;
+        }
+        let rows = sqlx::query(
+            r#"SELECT e.src_id, e.dst_id
+                 FROM brain_vault_edges e
+                WHERE e.edge_type = 'calls' AND e.src_id = ANY($1)
+                  AND e.confidence >= $2"#,
+        )
+        .bind(&frontier)
+        .bind(min_confidence)
+        .fetch_all(pool)
+        .await?;
+        let mut next: Vec<Uuid> = Vec::new();
+        for r in rows {
+            let src: Uuid = r.get("src_id");
+            let dst: Uuid = r.get("dst_id");
+            if seen.insert(dst) {
+                parent.insert(dst, src);
+                if to_set.contains(&dst) {
+                    let chain = reconstruct_path(&parent, dst);
+                    let mut refs = fetch_refs_ordered(pool, &chain).await?;
+                    resolve_ref_files(pool, &mut refs).await?;
+                    return Ok(Some(refs));
+                }
+                next.push(dst);
+            }
+        }
+        frontier = next;
+    }
+    Ok(None)
+}
+
 // ─── Test-coverage mapping (ff cortex tests / tests_for) ─────────────────────
 //
 // CRG exposes `tests_for`; Cortex did not. The question an agent (or a reviewer
@@ -5327,6 +5462,28 @@ mod tests {
             e.to_string(),
             "no symbol matching 'load_model' in corpus 'forge-fleet'"
         );
+    }
+
+    #[test]
+    fn reconstruct_path_walks_parents_in_forward_order() {
+        // Simulate a BFS parent map for a chain a → b → c → d (a = source, no
+        // entry). reconstruct_path(.., d) must stitch the full forward chain.
+        let a = Uuid::from_u128(1);
+        let b = Uuid::from_u128(2);
+        let c = Uuid::from_u128(3);
+        let d = Uuid::from_u128(4);
+        let mut parent = HashMap::new();
+        parent.insert(b, a);
+        parent.insert(c, b);
+        parent.insert(d, c);
+        // A second branch off `a` (a → e) must not contaminate the d-chain.
+        let e = Uuid::from_u128(5);
+        parent.insert(e, a);
+        assert_eq!(reconstruct_path(&parent, d), vec![a, b, c, d]);
+        // A node reached directly from a source is a single-hop chain.
+        assert_eq!(reconstruct_path(&parent, e), vec![a, e]);
+        // A source itself (no parent entry) reconstructs to just itself.
+        assert_eq!(reconstruct_path(&parent, a), vec![a]);
     }
 
     #[test]
