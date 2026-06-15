@@ -1239,6 +1239,21 @@ async fn extract_files(
                 }
             }
 
+            // Java enum-constant / nested-member method redirect (J2c):
+            // `ErrorCode.INTERNAL_ERROR.status()` and an `@Nested` inner test
+            // class calling an OUTER-class helper both record an extra qualifier
+            // segment between the owning type and the method
+            // (`<owner>::<Mid>::<leaf>`). Drop the middle segment to land on the
+            // real method `<owner>::<leaf>`. Inverse of J2b (which adds the outer
+            // class), so it runs after it.
+            if p.parse.lang == Lang::Java && !internal_fns.contains(&resolved) {
+                if let Some(t) =
+                    resolve_java_member_method_call(&resolved, internal_fns, internal_types)
+                {
+                    resolved = t;
+                }
+            }
+
             // Find the callee node: internal real fn if known, else code:extern.
             // A Java constructor redirect resolves to an internal class/interface
             // node (a type, not a fn), so accept it via ctor_type_target.
@@ -4968,6 +4983,61 @@ fn resolve_java_method_call(
     internal_fns.contains(&candidate).then_some(candidate)
 }
 
+/// J2c: enum-constant / nested-member method redirect. Two Java idioms record a
+/// call with one EXTRA qualifier segment between the owning type and the method,
+/// so the primary resolver fabricates a per-member extern instead of hitting the
+/// real method node:
+///
+///   - Enum-constant instance methods: `ErrorCode.INTERNAL_ERROR.status()` is
+///     recorded as `<pkg>::ErrorCode::INTERNAL_ERROR::status`, but the method is
+///     indexed under its declaring type as `<pkg>::ErrorCode::status` (the enum
+///     CONSTANT `INTERNAL_ERROR` is a value, not a scope).
+///   - Outer-class helpers from a `@Nested` inner class: a JUnit
+///     `ConnectorFrameworkUnitTests.DisabledByDefaultContract` test calling the
+///     OUTER class helper `apiEx()` records
+///     `<pkg>::ConnectorFrameworkUnitTests::DisabledByDefaultContract::apiEx`,
+///     but the helper lives on the outer class: `…::ConnectorFrameworkUnitTests::apiEx`.
+///
+/// Both reduce to the same shape — `<owner>::<Mid>::<leaf>` where dropping the
+/// single middle segment `<Mid>` lands on the real method `<owner>::<leaf>`. This
+/// is the inverse of J2b ([`resolve_java_method_call`], which ADDS the dropped
+/// OUTER class), so it runs after it (J2b fails on these because the real method
+/// is on the outer/declaring type, not the inner/constant segment).
+///
+/// Triple-gated, redirect-only: `<owner>` must be module-qualified AND a known
+/// internal TYPE (the enum / outer class), and `<owner>::<leaf>` a known internal
+/// fn — so it never fabricates. `<Mid>` must start uppercase: Java enum constants
+/// are UPPER_SNAKE and nested classes UpperCamel (both capitalized), while an
+/// instance method is lowerCamel — this excludes a fluent method chain
+/// (`builder.build().toString()` recorded `Builder::build::toString`) from
+/// redirecting `build`'s result onto `Builder::toString`.
+fn resolve_java_member_method_call(
+    resolved: &str,
+    internal_fns: &HashSet<String>,
+    internal_types: &HashSet<String>,
+) -> Option<String> {
+    // Split `<owner>::<Mid>::<leaf>` → head=`<owner>::<Mid>`, leaf.
+    let (head, leaf) = resolved.rsplit_once("::")?;
+    // Drop the middle segment: head=`<owner>::<Mid>` → owner, mid.
+    let (owner, mid) = head.rsplit_once("::")?;
+    // The owner must itself be module-qualified (`<pkg>::<Type>`), so a bare
+    // two-segment owner can't accidentally redirect.
+    if !owner.contains("::") {
+        return None;
+    }
+    // The dropped segment is an enum constant or nested class — both capitalized
+    // in Java. A lowercase segment is an instance-method receiver in a call chain,
+    // not a value/type qualifier; leave those alone.
+    if !mid.chars().next().is_some_and(|c| c.is_uppercase()) {
+        return None;
+    }
+    if !internal_types.contains(owner) {
+        return None;
+    }
+    let target = format!("{owner}::{leaf}");
+    internal_fns.contains(&target).then_some(target)
+}
+
 /// Crate-root single-candidate redirect (lever #7). A bare call to a fn in a
 /// sibling submodule that the alias map missed (`use crate::communities::*;`, an
 /// inline `mod`, a re-export not modeled as `pub use`) falls through
@@ -6567,6 +6637,102 @@ diff --git a/src/b.rs b/src/b.rs
                 &types,
                 &by_leaf
             ),
+            None
+        );
+    }
+
+    #[test]
+    fn java_enum_constant_method_redirects_to_declaring_type() {
+        // `ErrorCode.INTERNAL_ERROR.status()`: the enum CONSTANT is a value, not a
+        // scope, so the real method node is `ErrorCode::status`, not
+        // `ErrorCode::INTERNAL_ERROR::status`.
+        let types: HashSet<String> =
+            ["com::hireflow360::shared::error::ErrorCode".to_string()].into();
+        let fns: HashSet<String> =
+            ["com::hireflow360::shared::error::ErrorCode::status".to_string()].into();
+        assert_eq!(
+            resolve_java_member_method_call(
+                "com::hireflow360::shared::error::ErrorCode::INTERNAL_ERROR::status",
+                &fns,
+                &types
+            ),
+            Some("com::hireflow360::shared::error::ErrorCode::status".to_string())
+        );
+    }
+
+    #[test]
+    fn java_nested_test_class_outer_helper_redirects() {
+        // A JUnit `@Nested` inner class calling an OUTER-class helper: the helper
+        // lives on the outer test class, not the inner one.
+        let types: HashSet<String> =
+            ["com::hireflow360::api::connectors::ConnectorFrameworkUnitTests".to_string()].into();
+        let fns: HashSet<String> =
+            ["com::hireflow360::api::connectors::ConnectorFrameworkUnitTests::apiEx".to_string()]
+                .into();
+        assert_eq!(
+            resolve_java_member_method_call(
+                "com::hireflow360::api::connectors::ConnectorFrameworkUnitTests::DisabledByDefaultContract::apiEx",
+                &fns,
+                &types
+            ),
+            Some(
+                "com::hireflow360::api::connectors::ConnectorFrameworkUnitTests::apiEx".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn java_member_method_redirect_never_fabricates() {
+        let types: HashSet<String> =
+            ["com::hireflow360::shared::error::ErrorCode".to_string()].into();
+        // Owner is a known type but the dropped-middle target isn't a known fn.
+        assert_eq!(
+            resolve_java_member_method_call(
+                "com::hireflow360::shared::error::ErrorCode::INTERNAL_ERROR::nope",
+                &HashSet::new(),
+                &types
+            ),
+            None
+        );
+        // Owner isn't a known internal type → no redirect (e.g. a String constant
+        // calling Object.equals: `…admin::DEMO_ORGANIZATION_ID::equals`).
+        let fns: HashSet<String> = ["com::hireflow360::api::admin::equals".to_string()].into();
+        assert_eq!(
+            resolve_java_member_method_call(
+                "com::hireflow360::api::admin::DEMO_ORGANIZATION_ID::equals",
+                &fns,
+                &HashSet::new()
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn java_member_method_lowercase_mid_not_redirected() {
+        // A fluent method chain `builder.build().toString()` records
+        // `Builder::build::toString`; `build` is lowerCamel (a method), so the
+        // result of `build()` must NOT redirect onto `Builder::toString`.
+        let types: HashSet<String> = ["com::hireflow360::api::util::Builder".to_string()].into();
+        let fns: HashSet<String> =
+            ["com::hireflow360::api::util::Builder::toString".to_string()].into();
+        assert_eq!(
+            resolve_java_member_method_call(
+                "com::hireflow360::api::util::Builder::build::toString",
+                &fns,
+                &types
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn java_member_method_requires_module_qualified_owner() {
+        // A bare two-segment owner (`Type::CONST::leaf`) can't redirect — the owner
+        // must carry a package so an accidental match is impossible.
+        let types: HashSet<String> = ["ErrorCode".to_string()].into();
+        let fns: HashSet<String> = ["ErrorCode::status".to_string()].into();
+        assert_eq!(
+            resolve_java_member_method_call("ErrorCode::INTERNAL_ERROR::status", &fns, &types),
             None
         );
     }
