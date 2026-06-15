@@ -1961,6 +1961,35 @@ enum PortsCommand {
     /// with port_registry. Reports unexpected listeners and missing
     /// expected services.
     Scan { computer: String },
+    /// Register (or update) a port in port_registry — upsert keyed on the
+    /// port number. Use this when standing up a new service instead of
+    /// hand-writing INSERT SQL. Example:
+    /// `ff ports add 58080 searxng --kind system --description "SearXNG metasearch" --exposed-on sophie`
+    Add {
+        /// The port number. ForgeFleet-owned services use 5-digit ports;
+        /// a warning (not an error) is printed for anything else.
+        port: i32,
+        /// Short service name, e.g. "searxng".
+        service: String,
+        /// Category: control_plane | database | coordination | llm_inference | system.
+        #[arg(long)]
+        kind: String,
+        /// Human description of what the port serves.
+        #[arg(long)]
+        description: String,
+        /// Where it's exposed: "all_members" | "leader_only" | a computer name | ...
+        #[arg(long)]
+        exposed_on: String,
+        /// Reachability scope.
+        #[arg(long, default_value = "lan")]
+        scope: String,
+        /// Optional owner/manager note (process, daemon, operator).
+        #[arg(long)]
+        managed_by: Option<String>,
+        /// Lifecycle status.
+        #[arg(long, default_value = "active")]
+        status: String,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
