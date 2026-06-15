@@ -191,7 +191,7 @@ pub async fn resolve_upgrade_plans_with_suffix(
                     v.push(format!("{os_family}-{src}-{suffix}"));
                 }
                 v.push(format!("{os_family}-{suffix}"));
-                if let Some(base) = base_family(&os_family) {
+                if let Some(base) = crate::upgrade_playbooks::base_family(&os_family) {
                     v.push(format!("{base}-{suffix}"));
                 }
                 v.push(format!("all-{suffix}"));
@@ -206,7 +206,7 @@ pub async fn resolve_upgrade_plans_with_suffix(
             // `all`. Surfaced 2026-04-30 — drift was stuck on every
             // Linux host because the dispatcher only tried `linux-ubuntu`
             // and `all`, both missing from openclaw's playbook.
-            if let Some(base) = base_family(&os_family) {
+            if let Some(base) = crate::upgrade_playbooks::base_family(&os_family) {
                 v.push(base.to_string());
             }
             v.push("all".to_string());
@@ -399,7 +399,11 @@ pub async fn enqueue_plans(
 /// currently dispatching the upgrade? Used by [`AutoUpgradeTick::run_once`]
 /// to gate the leader out of self-suicide.
 pub(crate) fn is_daemon_self_software(software_id: &str) -> bool {
-    matches!(software_id, "ff_git" | "forgefleetd_git" | "forgefleet")
+    // Single source of truth: derive membership from DAEMON_SELF_SOFTWARE so the
+    // self-suicide gate and the wave-singleton serializer can never disagree on
+    // which software ids restart forgefleetd (a divergence resurfaces the
+    // cross-wave self-kill). See the const's doc comment.
+    DAEMON_SELF_SOFTWARE.contains(&software_id)
 }
 
 /// The full daemon-self software family. Upgrading any of these restarts
@@ -441,26 +445,6 @@ async fn seed_auto_install_rows(pool: &PgPool) -> Result<u64> {
         tracing::info!(rows = n, "auto-upgrade: seeded auto_install rows");
     }
     Ok(n)
-}
-
-/// Map a fleet `os_family` (e.g. `linux-ubuntu`, `linux-dgx`,
-/// `macos-26`) to a base family (`linux`, `macos`, `windows`) so the
-/// playbook resolver can fall back when a software entry only ships
-/// the broader key. openclaw / claude-code / codex still use `linux`
-/// as their playbook key (pre-dating the linux-ubuntu / linux-dgx
-/// split); without this fallback the dispatcher fails to find any
-/// matching key and skips every Linux target with `no playbook key
-/// for os='linux-ubuntu' source='-'`.
-fn base_family(os_family: &str) -> Option<&'static str> {
-    if os_family.starts_with("linux") {
-        Some("linux")
-    } else if os_family.starts_with("macos") {
-        Some("macos")
-    } else if os_family.starts_with("windows") {
-        Some("windows")
-    } else {
-        None
-    }
 }
 
 /// Is this pool's leader the computer whose name matches `my_name`?
@@ -1496,4 +1480,69 @@ where
         .await;
     }
     Ok(updated)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn daemon_self_software_matches_the_family_const() {
+        // is_daemon_self_software MUST agree with DAEMON_SELF_SOFTWARE for every
+        // id — they are the two halves of the cross-wave self-kill guard (the
+        // self-suicide gate vs. the wave singleton). If they drift, two `*_git`
+        // waves can run concurrently against the same hosts and tear down each
+        // other's in-flight build (feedback_wave_dispatcher_self_kill_race.md /
+        // feedback_cross_family_wave_self_kill.md). This locks them together.
+        for id in DAEMON_SELF_SOFTWARE {
+            assert!(
+                is_daemon_self_software(id),
+                "{id} is in DAEMON_SELF_SOFTWARE but is_daemon_self_software says no"
+            );
+        }
+        // The full known family is exactly these three — a new daemon-restarting
+        // software id must be added to the const (and this list) deliberately.
+        assert_eq!(
+            DAEMON_SELF_SOFTWARE.to_vec(),
+            vec!["ff_git", "forgefleetd_git", "forgefleet"]
+        );
+    }
+
+    #[test]
+    fn non_daemon_software_is_not_self() {
+        // Tool upgrades (openclaw/claude/codex/gh) do NOT restart forgefleetd, so
+        // they must NOT be serialized as daemon-self or gated out of the leader.
+        for id in [
+            "openclaw",
+            "claude-code",
+            "codex_git",
+            "gh",
+            "ff",
+            "forgefleetd",
+            "",
+        ] {
+            assert!(
+                !is_daemon_self_software(id),
+                "{id} wrongly flagged daemon-self"
+            );
+        }
+    }
+
+    #[test]
+    fn expand_tilde_only_rewrites_leading_tilde_slash() {
+        // Used to build the per-host repo path for the upgrade playbook. A bug
+        // here (expanding a bare `~` or a mid-string `~`) would corrupt the build
+        // command's cwd. Only a leading `~/` is a home reference.
+        let home = std::env::var("HOME").unwrap_or_default();
+        assert_eq!(
+            expand_tilde("~/projects/forge-fleet"),
+            format!("{home}/projects/forge-fleet")
+        );
+        // Absolute and relative paths pass through untouched.
+        assert_eq!(expand_tilde("/abs/path"), "/abs/path");
+        assert_eq!(expand_tilde("relative/path"), "relative/path");
+        // A bare tilde or a non-leading tilde is NOT a home reference.
+        assert_eq!(expand_tilde("~"), "~");
+        assert_eq!(expand_tilde("/x/~/y"), "/x/~/y");
+    }
 }
