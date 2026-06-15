@@ -119,7 +119,19 @@ pub async fn handle_research(
 /// `ff research --show <session-id>` — read-only status + report for a session.
 /// Unlike `--recover`, this never re-dispatches or re-synthesizes; it just
 /// prints what's persisted. Primary way to poll a detached (`--detach`) run.
-pub async fn handle_research_show(session_id: &str, output: Option<PathBuf>) -> Result<()> {
+///
+/// With `watch = true`, polls until the session reaches a terminal state
+/// (`done`/`failed`) — printing a status line to stderr each time it changes —
+/// then prints the report. Bounded by `WATCH_MAX_WAIT_SECS` so a never-claimed
+/// detached run can't hang the CLI forever.
+pub async fn handle_research_show(
+    session_id: &str,
+    output: Option<PathBuf>,
+    watch: bool,
+) -> Result<()> {
+    const WATCH_POLL_SECS: u64 = 3;
+    const WATCH_MAX_WAIT_SECS: u64 = 3600;
+
     let id = uuid::Uuid::parse_str(session_id.trim())
         .map_err(|_| anyhow::anyhow!("invalid session id {session_id:?} — expected a UUID"))?;
 
@@ -127,10 +139,41 @@ pub async fn handle_research_show(session_id: &str, output: Option<PathBuf>) -> 
         .await
         .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
 
-    let st = ff_agent::research::fetch_status(&pool, id)
-        .await
-        .map_err(|e| anyhow::anyhow!("fetch research status: {e}"))?
-        .ok_or_else(|| anyhow::anyhow!("no research session with id {id}"))?;
+    let mut waited = 0u64;
+    let mut last_line = String::new();
+    let st = loop {
+        let st = ff_agent::research::fetch_status(&pool, id)
+            .await
+            .map_err(|e| anyhow::anyhow!("fetch research status: {e}"))?
+            .ok_or_else(|| anyhow::anyhow!("no research session with id {id}"))?;
+
+        let terminal = matches!(st.status.as_str(), "done" | "failed");
+        if !watch || terminal {
+            break st;
+        }
+
+        // Print a progress line only when something changed, so a long watch
+        // doesn't spam identical lines every poll.
+        let line = format!(
+            "● {}  {}/{} sub-agents done",
+            st.status, st.subtask_done, st.subtask_total
+        );
+        if line != last_line {
+            eprintln!("{CYAN}{line}{RESET}  \x1b[2m(waited {waited}s){RESET}");
+            last_line = line;
+        }
+
+        if waited >= WATCH_MAX_WAIT_SECS {
+            eprintln!(
+                "\x1b[2m  watch timeout after {waited}s — session still {}; \
+                 re-run --show to keep polling{RESET}",
+                st.status
+            );
+            break st;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(WATCH_POLL_SECS)).await;
+        waited += WATCH_POLL_SECS;
+    };
 
     let dot = match st.status.as_str() {
         "done" => GREEN,

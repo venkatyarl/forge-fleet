@@ -345,6 +345,12 @@ enum Command {
         /// poll a `--detach` run. Pass the research_sessions UUID.
         #[arg(long, conflicts_with_all = ["prompt", "recover"])]
         show: Option<String>,
+        /// With --show: poll until the session finishes (done/failed) instead of
+        /// printing a one-shot snapshot. Prints a status line whenever it changes,
+        /// then the report. Bounded by an internal timeout so a never-claimed
+        /// detached run can't hang forever.
+        #[arg(long, default_value_t = false, requires = "show")]
+        watch: bool,
         /// Detached run: queue the session and exit immediately. The fleet leader
         /// (forgefleetd) runs the full pipeline in the background, so it survives
         /// this CLI being killed. Prints the session id to stdout; poll it with
@@ -4451,6 +4457,7 @@ async fn main() -> Result<()> {
             prompt,
             recover,
             show,
+            watch,
             detach,
             parallel,
             depth,
@@ -4462,7 +4469,7 @@ async fn main() -> Result<()> {
             verbose,
         }) => {
             if let Some(session_id) = show {
-                research_cmd::handle_research_show(&session_id, output).await
+                research_cmd::handle_research_show(&session_id, output, watch).await
             } else if let Some(session_id) = recover {
                 research_cmd::handle_research_recover(&session_id, output).await
             } else {
