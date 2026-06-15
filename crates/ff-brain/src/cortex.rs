@@ -3278,12 +3278,25 @@ fn macro_call_path(tail: &Node, bytes: &[u8]) -> Option<String> {
         let Some(ident) = sep.prev_sibling() else {
             break;
         };
-        if !matches!(ident.kind(), "identifier" | "scoped_identifier") {
+        // `crate`/`self`/`super` are path ROOTS, lexed as their own keyword nodes
+        // inside a macro token_tree (not `identifier`). Without them a macro-body
+        // `crate::foo(…)` / `super::foo(…)` call lost its head and collapsed to a
+        // bare `foo`, fabricating `<caller_module>::foo` — `ff cortex doctor`
+        // flagged `ff_brain::community_summary::detect_code_communities` for the
+        // `crate::detect_code_communities(…)` call inside a `tokio::select!` arm.
+        if !matches!(
+            ident.kind(),
+            "identifier" | "scoped_identifier" | "crate" | "self" | "super"
+        ) {
             break;
         }
         segs.push(node_text(&ident, bytes)?);
-        // A `scoped_identifier` already carries the whole prefix path text.
-        if ident.kind() == "scoped_identifier" {
+        // A `scoped_identifier` already carries the whole prefix path text; a
+        // `crate`/`self`/`super` keyword is the path root, so stop walking back.
+        if matches!(
+            ident.kind(),
+            "scoped_identifier" | "crate" | "self" | "super"
+        ) {
             break;
         }
         cur = ident.prev_sibling();
@@ -7027,6 +7040,51 @@ fn covers() {
         // The bare-leaf fabrications must NOT appear.
         assert!(
             !raws.contains(&"system") && !raws.contains(&"user"),
+            "bare-leaf phantom still recorded: {raws:?}"
+        );
+    }
+
+    #[test]
+    fn parse_rebuilds_crate_self_super_call_head_inside_macro_body() {
+        // `crate::`/`self::`/`super::` are path ROOTS lexed as their own keyword
+        // nodes inside a macro token_tree — NOT `identifier`. The macro-recovery
+        // walk-back used to stop at them, collapsing `crate::foo(…)` to a bare
+        // `foo` and fabricating `<caller_module>::foo`. Real-world hit:
+        // `crate::detect_code_communities(&pg)` inside a `tokio::select!` arm
+        // resolved to the phantom `ff_brain::community_summary::detect_code_communities`.
+        let src = r#"
+mod a { pub fn foo() -> u32 { 1 } }
+mod b {
+    pub fn bar() -> u32 { 2 }
+    pub mod c {
+        pub fn baz() -> u32 { 3 }
+        pub fn run() -> u32 {
+            assert!(crate::a::foo() > 0);
+            assert!(self::baz() > 0);
+            assert!(super::bar() > 0);
+            0
+        }
+    }
+}
+"#;
+        let fp = parse_rust_file("/x/crates/demo/src/lib.rs", src).unwrap();
+        let raws: Vec<&str> = fp.calls.iter().map(|c| c.raw_path.as_str()).collect();
+        // Each path-rooted call keeps its full head inside the macro body.
+        assert!(
+            raws.contains(&"crate::a::foo"),
+            "crate:: head lost inside macro body: {raws:?}"
+        );
+        assert!(
+            raws.contains(&"self::baz"),
+            "self:: head lost inside macro body: {raws:?}"
+        );
+        assert!(
+            raws.contains(&"super::bar"),
+            "super:: head lost inside macro body: {raws:?}"
+        );
+        // The bare-leaf fabrications must NOT appear.
+        assert!(
+            !raws.contains(&"foo") && !raws.contains(&"baz") && !raws.contains(&"bar"),
             "bare-leaf phantom still recorded: {raws:?}"
         );
     }
