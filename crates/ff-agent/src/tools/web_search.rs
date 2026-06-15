@@ -141,17 +141,106 @@ pub fn format_results(results: &[SearchResult]) -> String {
 }
 
 /// Best-effort web grounding for a non-tool caller: search and return a
-/// formatted results block, or `None` if the search fails or finds nothing.
+/// formatted results block, or `None` if every backend fails or finds nothing.
 /// Callers fall back to ungrounded behavior on `None` — never an error path.
+///
+/// DuckDuckGo intermittently hard-blocks a scraping IP with an HTTP-202 CAPTCHA
+/// challenge ("select all squares containing a duck") that no retry can clear —
+/// when the leader has been searching heavily, *every* DDG request comes back
+/// 202 with zero results. Rather than silently drop the whole research run to
+/// ungrounded model memory, fall back to the key-free Wikipedia search API
+/// (reliable 200s, real citable URLs) so factual sub-questions stay grounded.
 pub async fn fetch_web_context(
     client: &reqwest::Client,
     query: &str,
     max_results: usize,
 ) -> Option<String> {
-    match fetch_search_results(client, query, max_results).await {
+    // Primary: general-web results via DuckDuckGo.
+    if let Ok(results) = fetch_search_results(client, query, max_results).await {
+        if !results.is_empty() {
+            return Some(format_results(&results));
+        }
+    }
+    // Fallback: Wikipedia (no API key, not IP-blocked). Narrower coverage than a
+    // general web search, but real sources beat hallucinated ones.
+    match fetch_wikipedia_results(client, query, max_results).await {
         Ok(results) if !results.is_empty() => Some(format_results(&results)),
         _ => None,
     }
+}
+
+/// Key-free fallback search via the Wikipedia `list=search` API. Returns real
+/// article titles, URLs, and snippets — used by [`fetch_web_context`] when the
+/// primary (DuckDuckGo) backend is blocked or empty.
+pub async fn fetch_wikipedia_results(
+    client: &reqwest::Client,
+    query: &str,
+    max_results: usize,
+) -> Result<Vec<SearchResult>, String> {
+    let url = format!(
+        "https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch={}&srlimit={}&format=json",
+        urlencoding(query),
+        max_results.clamp(1, 20),
+    );
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("Wikipedia request failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("Wikipedia returned HTTP {}", resp.status()));
+    }
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read Wikipedia results: {e}"))?;
+    Ok(parse_wikipedia_results(&body, max_results))
+}
+
+/// Parse a Wikipedia `list=search` JSON response into [`SearchResult`]s. The
+/// API's `snippet` field is HTML (`<span class="searchmatch">…` plus entities),
+/// so strip tags and decode the handful of entities Wikipedia emits.
+fn parse_wikipedia_results(body: &str, max: usize) -> Vec<SearchResult> {
+    let Ok(json) = serde_json::from_str::<Value>(body) else {
+        return Vec::new();
+    };
+    let Some(hits) = json
+        .get("query")
+        .and_then(|q| q.get("search"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    hits.iter()
+        .take(max)
+        .filter_map(|hit| {
+            let title = hit.get("title").and_then(Value::as_str)?;
+            if title.is_empty() {
+                return None;
+            }
+            let snippet = hit
+                .get("snippet")
+                .and_then(Value::as_str)
+                .map(|s| decode_entities(&strip_tags(s)))
+                .unwrap_or_default();
+            Some(SearchResult {
+                url: format!("https://en.wikipedia.org/wiki/{}", title.replace(' ', "_")),
+                title: title.to_string(),
+                snippet,
+            })
+        })
+        .collect()
+}
+
+/// Decode the small set of HTML entities Wikipedia snippets contain. Not a
+/// general-purpose decoder — just enough to render snippets as plain text.
+fn decode_entities(text: &str) -> String {
+    text.replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
 }
 
 pub struct SearchResult {
@@ -296,6 +385,36 @@ mod tests {
         );
         assert_eq!(retry_backoff(3), None);
         assert_eq!(retry_backoff(99), None);
+    }
+
+    #[test]
+    fn parse_wikipedia_extracts_title_url_snippet_strips_html_and_honors_max() {
+        let body = r#"{"query":{"search":[
+            {"title":"VLLM","snippet":"&quot;<span class=\"searchmatch\">vLLM</span>&quot; is an engine &amp; library."},
+            {"title":"Large language model","snippet":"open-source <span class=\"searchmatch\">LLM</span> serving"},
+            {"title":"Third","snippet":"x"}
+        ]}}"#;
+        let all = parse_wikipedia_results(body, 8);
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].title, "VLLM");
+        assert_eq!(all[0].url, "https://en.wikipedia.org/wiki/VLLM");
+        // tags stripped, entities decoded.
+        assert_eq!(all[0].snippet, "\"vLLM\" is an engine & library.");
+        // spaces in titles become underscores in the URL.
+        assert_eq!(
+            all[1].url,
+            "https://en.wikipedia.org/wiki/Large_language_model"
+        );
+        // max caps the result count.
+        assert_eq!(parse_wikipedia_results(body, 2).len(), 2);
+    }
+
+    #[test]
+    fn parse_wikipedia_handles_garbage_and_missing_fields() {
+        assert!(parse_wikipedia_results("not json", 8).is_empty());
+        assert!(parse_wikipedia_results(r#"{"query":{}}"#, 8).is_empty());
+        // A hit missing its title is skipped, not panicked on.
+        assert!(parse_wikipedia_results(r#"{"query":{"search":[{"snippet":"x"}]}}"#, 8).is_empty());
     }
 
     #[test]
