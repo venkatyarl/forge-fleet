@@ -209,20 +209,36 @@ impl AgentCoordinator {
         prompt: String,
         target_computer: Option<String>,
     ) -> Result<DispatchReceipt, CoordError> {
-        // 1. Pick a worker slot.
-        let slot = self
-            .pick_worker(target_computer.clone())
-            .await?
-            .ok_or_else(|| CoordError::NoSlot(target_computer.clone()))?;
-
-        // 2. Claim it transactionally.
-        let claimed = self.claim_slot(slot.sub_agent_id, work_item_id).await?;
-        if !claimed {
-            return Err(CoordError::NoSlot(Some(format!(
-                "slot {} on {} lost to another dispatcher",
-                slot.slot, slot.computer_name
-            ))));
+        // 1-2. Pick + claim an idle slot, retrying on CAS contention. Under
+        // concurrent multi-caller dispatch (HireFlow + ff building itself, many
+        // callers at once) several dispatchers race for the same idle slot;
+        // `claim_slot`'s compare-and-swap lets exactly one win. The losers must
+        // RE-PICK another free slot instead of spuriously failing while idle
+        // slots remain — the old code returned `NoSlot` on the first lost race.
+        // Bounded so a genuinely saturated pool still returns promptly.
+        const MAX_CLAIM_ATTEMPTS: usize = 8;
+        let mut claimed_slot: Option<WorkerSlot> = None;
+        for _ in 0..MAX_CLAIM_ATTEMPTS {
+            let Some(candidate) = self.pick_worker(target_computer.clone()).await? else {
+                // No idle slot exists at all — genuine saturation, not contention.
+                return Err(CoordError::NoSlot(target_computer.clone()));
+            };
+            if self
+                .claim_slot(candidate.sub_agent_id, work_item_id)
+                .await?
+            {
+                claimed_slot = Some(candidate);
+                break;
+            }
+            // Lost the CAS to a concurrent dispatcher; loop to re-pick a fresh slot.
         }
+        let slot = claimed_slot.ok_or_else(|| {
+            CoordError::NoSlot(Some(format!(
+                "all idle {} slot(s) lost to concurrent dispatchers after \
+                 {MAX_CLAIM_ATTEMPTS} attempts (pool contended — retry shortly)",
+                target_computer.as_deref().unwrap_or("fleet"),
+            )))
+        })?;
 
         // 3. Run the LLM call, persist output, release slot. Catch any
         //    error below so the slot always gets released.
