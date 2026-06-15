@@ -1440,6 +1440,13 @@ enum FleetCommand {
         /// `--exclude-host taylor` to keep agent load off the leader.
         #[arg(long = "exclude-host")]
         exclude_host: Vec<String>,
+        /// Preview the live-dispatch ordering: among equal-tier hosts, rank the
+        /// least-loaded first (fewest in-flight LLM requests, then lowest CPU%,
+        /// from the latest computer_metrics_history sample). This is the order
+        /// the agent/offload/research pickers use; without the flag the view
+        /// shows the stable tier→freshness order.
+        #[arg(long = "least-loaded", default_value_t = false)]
+        least_loaded: bool,
         /// Max candidates to show (default 3).
         #[arg(long, default_value_t = 3)]
         limit: i64,

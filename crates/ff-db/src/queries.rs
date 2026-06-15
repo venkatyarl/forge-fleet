@@ -2368,8 +2368,43 @@ pub struct RouteFilter {
     /// it so live dispatch never lands on a wedged host. NULL `last_health_at`
     /// (undatable) passes — only a provably-stale timestamp is excluded.
     pub max_health_age_sec: Option<i32>,
+    /// Live-load tiebreaker: within the same `cat.tier`, prefer the host with
+    /// the fewest in-flight LLM requests, then the lowest CPU%, using the most
+    /// recent `computer_metrics_history` row (written once/minute per host by
+    /// the leader downsampler). `false` (default) keeps the historical
+    /// tier→freshness ordering — used by the pure observability views so their
+    /// output is stable. The live-dispatch pickers (agent endpoint, offload,
+    /// research fan-out) set it `true` so equal-tier candidates spread by real
+    /// load instead of piling onto whichever capable host last heartbeated.
+    /// A host with no recent metrics row sorts as idle (COALESCE 0).
+    pub prefer_least_loaded: bool,
     /// Max candidates to return (scored best-first). Defaults to 3 if 0.
     pub limit: i64,
+}
+
+/// SQL fragments injected into [`pg_route_deployments`] for the optional live-load
+/// tiebreaker. Returns `(join, order_prefix)`: the `LEFT JOIN LATERAL` that pulls
+/// each host's latest metrics row, and the ORDER BY columns inserted between
+/// `cat.tier ASC` and the `last_health_at` freshness tiebreak. Both empty when
+/// the tiebreaker is off, so the query is byte-identical to the historical one.
+/// The fragments are compile-time constants (no caller input) — never a SQL
+/// injection vector. Pure — unit-tested.
+fn load_tiebreak_fragments(prefer_least_loaded: bool) -> (&'static str, &'static str) {
+    if prefer_least_loaded {
+        (
+            "LEFT JOIN LATERAL (
+                 SELECT m.cpu_pct, m.llm_active_requests
+                   FROM computer_metrics_history m
+                  WHERE m.computer_id = c.id
+                  ORDER BY m.recorded_at DESC
+                  LIMIT 1
+             ) load ON TRUE",
+            "COALESCE(load.llm_active_requests, 0) ASC,
+                  COALESCE(load.cpu_pct, 0) ASC,",
+        )
+    } else {
+        ("", "")
+    }
 }
 
 /// Freshness predicate mirrored by the staleness clause in [`pg_route_deployments`]
@@ -2549,7 +2584,9 @@ pub async fn pg_route_deployments(
 
     let limit = route_limit_or_default(filter.limit);
 
-    let rows = sqlx::query(
+    let (load_join, load_order) = load_tiebreak_fragments(filter.prefer_least_loaded);
+
+    let sql = format!(
         r#"
         SELECT d.worker_name,
                d.port,
@@ -2573,6 +2610,7 @@ pub async fn pg_route_deployments(
           JOIN fleet_model_catalog cat ON cat.id = d.catalog_id
           LEFT JOIN fleet_workers w     ON w.name = d.worker_name
           LEFT JOIN computers c         ON LOWER(c.name) = LOWER(d.worker_name)
+          {load_join}
          WHERE d.health_status = 'healthy'
            -- workload filter ($2 = true disables it). `?|` = any synonym present.
            AND ($2 OR cat.preferred_workloads ?| $1)
@@ -2591,19 +2629,22 @@ pub async fn pg_route_deployments(
                 OR d.last_health_at IS NULL
                 OR EXTRACT(EPOCH FROM (NOW() - d.last_health_at)) <= $7)
          ORDER BY cat.tier ASC,
+                  {load_order}
                   d.last_health_at DESC NULLS LAST
          LIMIT $6
-        "#,
-    )
-    .bind(&synonyms)
-    .bind(workload.is_none())
-    .bind(filter.require_tool_calling)
-    .bind(filter.min_ctx)
-    .bind(&excludes)
-    .bind(limit)
-    .bind(filter.max_health_age_sec)
-    .fetch_all(pool)
-    .await?;
+        "#
+    );
+
+    let rows = sqlx::query(&sql)
+        .bind(&synonyms)
+        .bind(workload.is_none())
+        .bind(filter.require_tool_calling)
+        .bind(filter.min_ctx)
+        .bind(&excludes)
+        .bind(limit)
+        .bind(filter.max_health_age_sec)
+        .fetch_all(pool)
+        .await?;
 
     Ok(rows
         .iter()
@@ -2651,6 +2692,9 @@ pub async fn pg_pick_agent_endpoint(
         min_ctx: Some(min_ctx),
         exclude_hosts: exclude_hosts.to_vec(),
         max_health_age_sec: Some(DISPATCH_HEALTH_MAX_AGE_SEC),
+        // Live agent dispatch: among equal-tier capable hosts, land on the
+        // least-loaded one instead of whichever last heartbeated.
+        prefer_least_loaded: true,
         limit: 1,
     };
     Ok(pg_route_deployments(pool, &filter)
@@ -2754,6 +2798,8 @@ pub async fn pg_pick_offload_endpoint(
         min_ctx: Some(min_ctx),
         exclude_hosts: exclude_hosts.to_vec(),
         max_health_age_sec: Some(DISPATCH_HEALTH_MAX_AGE_SEC),
+        // Live offload dispatch: spread equal-tier candidates by real load.
+        prefer_least_loaded: true,
         limit: 8,
     };
 
@@ -4881,6 +4927,32 @@ mod tests {
 
     fn route_candidate(worker: &str, tier: i32) -> RouteCandidate {
         route_candidate_rt(worker, tier, "llama.cpp")
+    }
+
+    #[test]
+    fn load_tiebreak_fragments_off_is_empty() {
+        // Tiebreaker off → both fragments empty so the routing query is
+        // byte-identical to the historical tier→freshness ordering.
+        let (join, order) = load_tiebreak_fragments(false);
+        assert_eq!(join, "");
+        assert_eq!(order, "");
+    }
+
+    #[test]
+    fn load_tiebreak_fragments_on_injects_lateral_and_load_order() {
+        let (join, order) = load_tiebreak_fragments(true);
+        // The join pulls the latest metrics row per host…
+        assert!(join.contains("computer_metrics_history"));
+        assert!(join.contains("ORDER BY m.recorded_at DESC"));
+        assert!(join.contains("LIMIT 1"));
+        // …and the order prefix ranks fewest in-flight requests, then CPU,
+        // ahead of the freshness tiebreak. Treats a missing sample as idle.
+        assert!(order.contains("llm_active_requests"));
+        assert!(order.contains("cpu_pct"));
+        assert!(order.contains("COALESCE"));
+        // Must end with a comma so it slots before `d.last_health_at` in the
+        // assembled ORDER BY (else the SQL is malformed).
+        assert!(order.trim_end().ends_with(','));
     }
 
     fn route_candidate_rt(worker: &str, tier: i32, runtime: &str) -> RouteCandidate {

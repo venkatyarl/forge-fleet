@@ -1357,6 +1357,9 @@ pub async fn fleet_route(params: Option<Value>) -> HandlerResult {
         // Observability path: report whatever is marked healthy (historical
         // behaviour). The agent/offload pickers apply the freshness floor.
         max_health_age_sec: None,
+        // Stable tier→freshness ordering for the read-only view (live-load
+        // tiebreak is reserved for the dispatch pickers).
+        prefer_least_loaded: false,
         limit,
     };
     let rows = ff_db::pg_route_deployments(&pool, &filter)
