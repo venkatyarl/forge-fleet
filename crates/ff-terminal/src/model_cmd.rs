@@ -32,6 +32,19 @@ fn is_agent_ready(usable_agent_ctx: Option<i32>, min_ctx: i32) -> bool {
     usable_agent_ctx.map(|c| c >= min_ctx).unwrap_or(false)
 }
 
+/// A deployment row's `health_status` is frozen at the last update by the node
+/// that owns it; an offline node never refreshes it, so a long-dead host keeps
+/// reporting its last value (typically `healthy`). When the owning node has no
+/// live pulse beat we surface `stale` instead, so `ff model deployments` (and
+/// both autopilot loops that parse it) never read a dead endpoint as serving.
+fn effective_deployment_health(node_online: bool, stored: &str) -> String {
+    if node_online {
+        stored.to_string()
+    } else {
+        "stale".to_string()
+    }
+}
+
 /// Conservative free-RAM floor (GB) below which `ff model reprofile` refuses to
 /// relaunch without `--force`. Reprofiling reloads the SAME (already-resident)
 /// model, so the only new memory is the larger single-slot KV cache — but a host
@@ -443,6 +456,25 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                         .unwrap_or(""),
                 )
             });
+            // A deployment row's `health_status` is frozen at the last update by
+            // the node that owns it. When that node goes offline, nobody refreshes
+            // the row, so a long-dead host keeps reporting `healthy` — an
+            // observability lie the router and both autopilot loops could act on.
+            // Cross-reference the live pulse beat set: a node with no current beat
+            // is offline, so its deployments are `stale` regardless of the stored
+            // value. If the pulse reader is unavailable we can't tell, so we never
+            // mask (treat every node as online) — only override on a positive
+            // "node is offline" signal.
+            let online: std::collections::HashSet<String> = match crate::utils::pulse_reader() {
+                Ok(r) => r
+                    .beats_by_name()
+                    .await
+                    .map(|m| m.into_keys().collect())
+                    .unwrap_or_default(),
+                Err(_) => std::collections::HashSet::new(),
+            };
+            let node_online = |n: &str| online.is_empty() || online.contains(n);
+            let eff_health = |n: &str, h: &str| effective_deployment_health(node_online(n), h);
             if json {
                 let out: Vec<_> = rows
                     .iter()
@@ -451,10 +483,12 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                             "id": r.id,
                             "library_id": r.library_id,
                             "node": r.worker_name,
+                            "node_online": node_online(&r.worker_name),
                             "catalog_id": r.catalog_id,
                             "runtime": r.runtime,
                             "port": r.port,
                             "health": r.health_status,
+                            "effective_health": eff_health(&r.worker_name, &r.health_status),
                             "context_window": r.context_window,
                             "parallel_slots": r.parallel_slots,
                             "usable_agent_ctx": r.usable_agent_ctx,
@@ -511,7 +545,7 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                         r.port,
                         ctx,
                         agent_ctx,
-                        r.health_status,
+                        eff_health(&r.worker_name, &r.health_status),
                         r.started_at.format("%Y-%m-%d %H:%M UTC")
                     );
                 }
@@ -528,7 +562,7 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                         catalog,
                         r.runtime,
                         r.port,
-                        r.health_status,
+                        eff_health(&r.worker_name, &r.health_status),
                         r.started_at.format("%Y-%m-%d %H:%M UTC")
                     );
                 }
@@ -3185,6 +3219,17 @@ fn print_coverage_explain(rows: &[ff_agent::coverage_guard::TaskExplanation]) {
 mod tests {
     use super::*;
     use ff_agent::model_runtime::AGENT_MIN_CTX;
+
+    #[test]
+    fn deployment_health_goes_stale_only_when_node_offline() {
+        // Node online → stored value passes through unchanged.
+        assert_eq!(effective_deployment_health(true, "healthy"), "healthy");
+        assert_eq!(effective_deployment_health(true, "unhealthy"), "unhealthy");
+        // Node offline → frozen value is masked as `stale` regardless of what
+        // the dead host last wrote (the ace-shows-healthy-while-down bug).
+        assert_eq!(effective_deployment_health(false, "healthy"), "stale");
+        assert_eq!(effective_deployment_health(false, "unhealthy"), "stale");
+    }
 
     #[test]
     fn human_size_renders_gb_above_1_and_mb_below() {
