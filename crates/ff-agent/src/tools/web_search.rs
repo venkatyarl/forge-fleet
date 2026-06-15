@@ -76,25 +76,57 @@ impl AgentTool for WebSearchTool {
 /// Used both by the [`WebSearchTool`] agent tool and by callers that want web
 /// grounding WITHOUT a full agent loop (e.g. research sub-agents that run as
 /// plain chat completions — see `research.rs`).
+///
+/// DuckDuckGo answers a burst of concurrent requests with HTTP 202 (no body) —
+/// its anomaly/rate-limit throttle. `ff research --parallel N` fires N searches
+/// at once and routinely trips it, dropping those sub-agents to ungrounded
+/// model-memory. Retry a 202 (and 429) a few times with growing backoff before
+/// giving up; other non-success statuses fail fast.
 pub async fn fetch_search_results(
     client: &reqwest::Client,
     query: &str,
     max_results: usize,
 ) -> Result<Vec<SearchResult>, String> {
     let url = format!("https://html.duckduckgo.com/html/?q={}", urlencoding(query));
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| format!("Search request failed: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("Search returned HTTP {}", resp.status()));
+    let mut attempt = 0u32;
+    loop {
+        let resp = client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| format!("Search request failed: {e}"))?;
+        let status = resp.status();
+        if status.is_success() {
+            let html = resp
+                .text()
+                .await
+                .map_err(|e| format!("Failed to read search results: {e}"))?;
+            return Ok(parse_ddg_results(&html, max_results));
+        }
+        // 202 (anomaly throttle) / 429 (rate limit) are transient — back off and
+        // retry. Anything else (4xx/5xx) is unlikely to fix itself; fail fast.
+        let retriable = matches!(status.as_u16(), 202 | 429);
+        match retry_backoff(attempt).filter(|_| retriable) {
+            Some(delay) => {
+                tokio::time::sleep(delay).await;
+                attempt += 1;
+            }
+            None => return Err(format!("Search returned HTTP {status}")),
+        }
     }
-    let html = resp
-        .text()
-        .await
-        .map_err(|e| format!("Failed to read search results: {e}"))?;
-    Ok(parse_ddg_results(&html, max_results))
+}
+
+/// Backoff before retry `attempt` (0-indexed) of a throttled DuckDuckGo search,
+/// or `None` once the retry budget is exhausted. Three retries with growing
+/// delay (≈400ms / 900ms / 1600ms) — enough to outlast a brief concurrent burst
+/// without blowing past the client's 15s timeout.
+fn retry_backoff(attempt: u32) -> Option<std::time::Duration> {
+    match attempt {
+        0 => Some(std::time::Duration::from_millis(400)),
+        1 => Some(std::time::Duration::from_millis(900)),
+        2 => Some(std::time::Duration::from_millis(1600)),
+        _ => None,
+    }
 }
 
 /// Format parsed results as a numbered `N. title\n   url\n   snippet` block —
@@ -245,6 +277,25 @@ mod tests {
         assert_eq!(all[1].url, "https://b.test/two");
         // max caps the result count.
         assert_eq!(parse_ddg_results(html, 2).len(), 2);
+    }
+
+    #[test]
+    fn retry_backoff_grows_then_exhausts() {
+        // Three retries with growing delay, then None (budget exhausted).
+        assert_eq!(
+            retry_backoff(0),
+            Some(std::time::Duration::from_millis(400))
+        );
+        assert_eq!(
+            retry_backoff(1),
+            Some(std::time::Duration::from_millis(900))
+        );
+        assert_eq!(
+            retry_backoff(2),
+            Some(std::time::Duration::from_millis(1600))
+        );
+        assert_eq!(retry_backoff(3), None);
+        assert_eq!(retry_backoff(99), None);
     }
 
     #[test]

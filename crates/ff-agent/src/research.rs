@@ -383,6 +383,12 @@ impl ResearchSession {
                     // sub-agent's search runs concurrently with the others (one
                     // per spawned task). Falls back to ungrounded on failure.
                     let prompt = if web_grounding {
+                        // Stagger the searches so a `--parallel N` run doesn't
+                        // fire N DuckDuckGo requests in the same instant (which
+                        // trips DDG's 202 throttle); combined with retry-on-202
+                        // inside fetch_search_results this keeps sub-agents
+                        // grounded instead of falling back to model memory.
+                        tokio::time::sleep(search_stagger(i)).await;
                         let ctx =
                             crate::tools::web_search::fetch_web_context(&client, &sub_question, 8)
                                 .await;
@@ -1216,6 +1222,17 @@ mod backend_pick_tests {
         let computers: Vec<&str> = got.iter().map(|x| x.computer_name.as_str()).collect();
         assert_eq!(computers, vec!["c1", "c2"]);
     }
+
+    #[test]
+    fn search_stagger_grows_per_index_and_caps() {
+        use super::search_stagger;
+        // First sub-agent searches immediately; each later one waits 350ms more.
+        assert_eq!(search_stagger(0), std::time::Duration::from_millis(0));
+        assert_eq!(search_stagger(1), std::time::Duration::from_millis(350));
+        assert_eq!(search_stagger(3), std::time::Duration::from_millis(1050));
+        // Cap so a large fan-out doesn't stall the whole run.
+        assert_eq!(search_stagger(100), std::time::Duration::from_millis(4000));
+    }
 }
 
 // ─── Progress events for callers ────────────────────────────────────────────
@@ -1242,6 +1259,15 @@ struct FleetBackend {
 /// full list when more sub-agents than distinct computers were requested. The
 /// input order (tier-ASC, freshest-first from `pg_route_deployments`) is
 /// preserved within each pass. Pure — unit-tested.
+/// Per-sub-agent delay before its web-grounding search, so a `--parallel N`
+/// research run spreads its DuckDuckGo requests over time instead of firing
+/// them all in the same instant (which trips DDG's 202 anomaly throttle and
+/// drops sub-agents to ungrounded model memory). Sub-agent `i` waits `i*350ms`,
+/// capped at 4s so a large fan-out doesn't stall the whole run.
+fn search_stagger(index: usize) -> std::time::Duration {
+    std::time::Duration::from_millis((index as u64 * 350).min(4000))
+}
+
 fn select_distinct_round_robin(backends: Vec<FleetBackend>, n: usize) -> Vec<FleetBackend> {
     if backends.is_empty() || n == 0 {
         return Vec::new();
