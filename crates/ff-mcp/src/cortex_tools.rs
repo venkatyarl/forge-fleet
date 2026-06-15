@@ -3,11 +3,13 @@
 //! a local graph served over MCP, fewer tokens / tool-calls than file scanning).
 //!
 //! All read-only: `cortex_corpora` (discover indexed repos), `cortex_callers`,
-//! `cortex_callees`, and `cortex_impact` (transitive blast radius). The graph is
-//! built by `ff cortex index`; these tools only query it.
+//! `cortex_callees`, `cortex_impact` (transitive blast radius), and `cortex_path`
+//! (shortest call chain between two symbols). The graph is built by
+//! `ff cortex index`; these tools only query it.
 
 use ff_brain::{
-    callees, callers, corpus, cortex, find_symbols, find_symbols_semantic, impact, tests_for,
+    call_path, callees, callers, corpus, cortex, find_symbols, find_symbols_semantic, impact,
+    tests_for,
 };
 use ff_core::config;
 use serde_json::{Value, json};
@@ -382,6 +384,56 @@ pub async fn cortex_impact(params: Option<Value>) -> HandlerResult {
         "min_confidence": min_confidence,
         "count": rows.len(),
         "impacted": symbols_json(&rows),
+    }))
+}
+
+/// Shortest call chain from one symbol to another (HOW does `from` reach `to`).
+/// `callers`/`callees` answer one hop and `impact` the whole closure; this returns
+/// the ordered FROM → … → TO path (each hop a real `calls` edge). An empty `path`
+/// with `found=false` means the two symbols exist but don't connect within
+/// `max_depth` (legitimate, not an error); an unresolved from/to symbol errors.
+pub async fn cortex_path(params: Option<Value>) -> HandlerResult {
+    let corpus_slug = params
+        .as_ref()
+        .and_then(|p| p.get("corpus"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            "missing required parameter: corpus (the indexed repo slug; \
+             list them with cortex_corpora)"
+                .to_string()
+        })?;
+    let from = params
+        .as_ref()
+        .and_then(|p| p.get("from"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required parameter: from (the start symbol)".to_string())?;
+    let to = params
+        .as_ref()
+        .and_then(|p| p.get("to"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required parameter: to (the target symbol)".to_string())?;
+    let max_depth = params
+        .as_ref()
+        .and_then(|p| p.get("max_depth"))
+        .and_then(|v| v.as_u64())
+        .map(|d| d.clamp(1, 30) as usize)
+        .unwrap_or(12);
+    let min_confidence = min_confidence_param(&params);
+    let pool = get_pool().await?;
+    let path = call_path(&pool, corpus_slug, from, to, max_depth, min_confidence)
+        .await
+        .map_err(|e| format!("path: {e}"))?;
+    let rows = path.unwrap_or_default();
+    Ok(json!({
+        "corpus": corpus_slug,
+        "from": from,
+        "to": to,
+        "max_depth": max_depth,
+        "min_confidence": min_confidence,
+        "found": !rows.is_empty(),
+        // hops = edges traversed (one less than nodes); 0 = from and to are the same node
+        "hops": rows.len().saturating_sub(1),
+        "path": symbols_json(&rows),
     }))
 }
 

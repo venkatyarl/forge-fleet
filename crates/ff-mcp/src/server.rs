@@ -124,7 +124,9 @@ impl McpServer {
                      • `brain_*` — knowledge graph (search, vault read, threads).\n\
                      • `cortex_*` — pre-indexed code graph. `cortex_corpora` lists\n\
                        indexed repos; `cortex_callers`/`cortex_callees`/`cortex_impact`\n\
-                       answer who-calls / what-it-calls / blast-radius for a symbol —\n\
+                       answer who-calls / what-it-calls / blast-radius for a symbol;\n\
+                       `cortex_path` returns the shortest call chain between two\n\
+                       symbols (HOW one reaches the other) —\n\
                        token-cheaper than grepping for call sites. `cortex_review`\n\
                        risk-scores a git diff (fan-in / blast radius per changed\n\
                        symbol) so you review the riskiest changes first.\n\
