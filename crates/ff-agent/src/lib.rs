@@ -40,6 +40,7 @@ pub mod consensus;
 pub mod coverage_guard;
 pub mod db_integrity;
 pub mod demand_sensor;
+pub mod deployment_catalog_reconciler;
 pub mod deployment_reconciler;
 pub mod disk_reconcile;
 pub mod disk_sampler;

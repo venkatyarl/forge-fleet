@@ -34,6 +34,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use crate::coverage_guard::CoverageGuard;
+use crate::deployment_catalog_reconciler::DeploymentCatalogReconciler;
 use crate::external_tools_upstream::ExternalToolsUpstreamChecker;
 use crate::model_scout::ModelScout;
 use crate::model_upstream::ModelUpstreamChecker;
@@ -165,6 +166,36 @@ pub fn spawn_portfolio_maintenance(
                     "external-tools upstream tick"
                 ),
                 Err(e) => warn!(error = %e, "external-tools upstream tick failed"),
+            }
+        },
+    ));
+
+    // Deployment → catalog reconciler — auto-declares an `active` catalog row
+    // for any live deployment of a structurally-unambiguous family (embedding,
+    // vision, ASR, reranker) that has no catalog row, so coverage stops
+    // reporting false gaps for tasks the fleet is demonstrably serving. Runs
+    // BEFORE the coverage tick (shorter kickoff) so coverage sees the reconciled
+    // state. Ambiguous chat/code models are left for the operator; writes use
+    // ON CONFLICT DO NOTHING so curated rows win. See the module docs.
+    handles.push(spawn_leader_gated(
+        pool.clone(),
+        worker_name.clone(),
+        "deployment-catalog-reconciler",
+        Duration::from_secs(60),
+        Duration::from_secs(30 * MIN),
+        shutdown.clone(),
+        |pool| async move {
+            match DeploymentCatalogReconciler::new(pool)
+                .reconcile_once(false)
+                .await
+            {
+                Ok(r) => debug!(
+                    created = r.created.len(),
+                    skipped_ambiguous = r.skipped_ambiguous.len(),
+                    already_cataloged = r.already_cataloged,
+                    "deployment-catalog reconcile tick"
+                ),
+                Err(e) => warn!(error = %e, "deployment-catalog reconcile tick failed"),
             }
         },
     ));
