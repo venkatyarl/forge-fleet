@@ -84,3 +84,47 @@ pub async fn handle_research(
     println!("{}", report.markdown);
     Ok(())
 }
+
+/// `ff research --recover <session-id>` — re-synthesize a killed run's report
+/// from its already-persisted sub-agent outputs. No sub-agents are
+/// re-dispatched; this only runs the synthesizer turn and flips the orphaned
+/// session back to `done`. Recovers the work a crashed/killed `ff research`
+/// CLI would otherwise lose (the reaper marks such sessions `failed`).
+pub async fn handle_research_recover(session_id: &str, output: Option<PathBuf>) -> Result<()> {
+    let id = uuid::Uuid::parse_str(session_id.trim())
+        .map_err(|_| anyhow::anyhow!("invalid session id {session_id:?} — expected a UUID"))?;
+
+    let pool = ff_agent::fleet_info::get_fleet_pool()
+        .await
+        .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
+    ff_db::run_postgres_migrations(&pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
+
+    eprintln!("{CYAN}▶ ff research --recover{RESET}  \x1b[2msession {id}{RESET}");
+    eprintln!(
+        "\x1b[2m  Re-synthesizing from persisted sub-agent outputs (no re-dispatch){RESET}\n"
+    );
+
+    let report = ff_agent::research::ResearchSession::recover(pool, id)
+        .await
+        .map_err(|e| anyhow::anyhow!("recover research session: {e}"))?;
+
+    // Honor --output like the live run does.
+    if let Some(path) = &output {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::write(path, &report.markdown)
+            .map_err(|e| anyhow::anyhow!("write report to {}: {e}", path.display()))?;
+    }
+
+    eprintln!(
+        "{GREEN}✓ research recovered{RESET}  \x1b[2m{}/{} sub-agents had usable output · \
+         session {}{RESET}",
+        report.subtasks_succeeded, report.subtask_count, report.session_id,
+    );
+    eprintln!();
+    println!("{}", report.markdown);
+    Ok(())
+}

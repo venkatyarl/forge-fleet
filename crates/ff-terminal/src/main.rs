@@ -333,8 +333,14 @@ enum Command {
     /// using the "thinking" pool alias (Qwen3.5-35B-A3B thinking reserve);
     /// sub-agents round-robin across distinct active fleet LLM deployments.
     Research {
-        /// The research question.
-        prompt: String,
+        /// The research question. Omit when using --recover.
+        prompt: Option<String>,
+        /// Recover a killed run: re-synthesize the final report from a session's
+        /// already-persisted sub-agent outputs (no sub-agents are re-dispatched).
+        /// Pass the research_sessions UUID. Use when a `ff research` CLI was
+        /// killed after its sub-agents finished but before synthesis completed.
+        #[arg(long, conflicts_with = "prompt")]
+        recover: Option<String>,
         /// Number of parallel sub-agents (= sub-questions decomposed by planner).
         #[arg(long, default_value_t = 5)]
         parallel: u32,
@@ -4398,6 +4404,7 @@ async fn main() -> Result<()> {
         }
         Some(Command::Research {
             prompt,
+            recover,
             parallel,
             depth,
             output,
@@ -4406,17 +4413,29 @@ async fn main() -> Result<()> {
             subagent_model,
             verbose,
         }) => {
-            research_cmd::handle_research(
-                &prompt,
-                parallel,
-                depth,
-                output,
-                gateway,
-                planner_model,
-                subagent_model,
-                verbose,
-            )
-            .await
+            if let Some(session_id) = recover {
+                research_cmd::handle_research_recover(&session_id, output).await
+            } else {
+                match prompt {
+                    Some(p) => {
+                        research_cmd::handle_research(
+                            &p,
+                            parallel,
+                            depth,
+                            output,
+                            gateway,
+                            planner_model,
+                            subagent_model,
+                            verbose,
+                        )
+                        .await
+                    }
+                    None => Err(anyhow::anyhow!(
+                        "ff research needs a question, or --recover <session-id> to \
+                         re-synthesize a killed run"
+                    )),
+                }
+            }
         }
         Some(Command::Voice {
             device,
