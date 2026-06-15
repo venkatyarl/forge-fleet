@@ -2943,6 +2943,21 @@ async fn start_pulse_v2_subsystems(
         ff_agent::job_sweeper::StaleJobSweeperTick::new(pg_pool.clone(), worker_name.clone());
     handles.push(stale_job_sweeper.spawn(shutdown_rx.clone()));
 
+    // (7d) Research runner — every 30s on the leader. Drives detached
+    // (`ff research --detach`) sessions to completion inside forgefleetd: the
+    // CLI inserts a `queued` session and exits, this tick claims it and runs the
+    // planner→dispatch→synthesis pipeline in the daemon so the run survives the
+    // originating CLI being killed. Complements the sweeper + auto-recover, which
+    // only salvage *completed* sub-agent work after a crash. Leader-gated inside
+    // the tick on every fire, so safe to start on every daemon.
+    info!(
+        node = %worker_name.clone(),
+        "starting subsystem: research runner (detached --detach runs, 30s, leader-gated)"
+    );
+    let research_runner =
+        ff_agent::research::ResearchRunnerTick::new(pg_pool.clone(), worker_name.clone());
+    handles.push(research_runner.spawn(shutdown_rx.clone()));
+
     // (8) Auto-upgrade hourly tick — runs on every daemon, internally
     // gated on leader + fleet_secrets.auto_upgrade_enabled. Refreshes
     // upstream versions (npm/pypi/github_release/self_built), flips
