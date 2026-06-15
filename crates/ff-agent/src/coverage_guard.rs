@@ -24,6 +24,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use ff_core::model_id::normalize_model_id;
 use ff_pulse::reader::PulseReader;
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
@@ -135,6 +136,17 @@ impl CoverageGuard {
             ..CoverageReport::default()
         };
 
+        // Resolve how many active deployments serve each task ONCE, up front.
+        // `computer_model_deployments.model_id` stores the deployment's
+        // free-text identifier — a GGUF filename (`gemma-4-31B-it-Q4_K_M.gguf`)
+        // or a runtime model name (`qwen3.6-35b-a3b`) — NOT the `model_catalog`
+        // id (`gemma4-31b-it`). The previous per-task `mc.id = d.model_id`
+        // join therefore never matched and coverage always reported
+        // `covered=0`. We instead normalize both sides through the canonical
+        // `normalize_model_id` (shared with gateway routing + pulse) and match
+        // on a separator boundary. See `deployed_task_counts`.
+        let deployed_counts = self.deployed_task_counts().await?;
+
         for row in required {
             let task: String = row.get("task");
             let min_required: i32 = row.get("min_models_loaded");
@@ -149,18 +161,9 @@ impl CoverageGuard {
                 .unwrap_or_default();
 
             // How many active deployments cover this task right now?
-            let count_row = sqlx::query(
-                "SELECT COUNT(*)::INT AS n
-                 FROM computer_model_deployments d
-                 JOIN model_catalog mc ON mc.id = d.model_id
-                 WHERE d.status = 'active'
-                   AND mc.tasks @> to_jsonb(ARRAY[$1]::text[])
-                   AND mc.lifecycle_status <> 'retired'",
-            )
-            .bind(&task)
-            .fetch_one(&self.pg)
-            .await?;
-            let currently_loaded: i32 = count_row.get("n");
+            // (Resolved up front in `deployed_task_counts` via canonical
+            // model-id normalization — see the comment above the loop.)
+            let currently_loaded: i32 = deployed_counts.get(&task).copied().unwrap_or(0);
 
             if currently_loaded >= min_required {
                 report.tasks_covered += 1;
@@ -228,6 +231,62 @@ impl CoverageGuard {
         );
 
         Ok(report)
+    }
+
+    /// Count, per HF task, how many currently-active deployments serve it.
+    ///
+    /// Deployments record a free-text `model_id` (GGUF filename or runtime
+    /// model name), so they cannot be joined to `model_catalog.id` directly.
+    /// We normalize every active deployment id and every non-retired catalog
+    /// id through [`normalize_model_id`] (the same canonical form the gateway
+    /// router and pulse reader use) and match on a separator boundary, then
+    /// credit each matched deployment to all of its catalog row's tasks.
+    async fn deployed_task_counts(&self) -> Result<HashMap<String, i32>, sqlx::Error> {
+        let dep_rows =
+            sqlx::query("SELECT model_id FROM computer_model_deployments WHERE status = 'active'")
+                .fetch_all(&self.pg)
+                .await?;
+
+        let cat_rows =
+            sqlx::query("SELECT id, tasks FROM model_catalog WHERE lifecycle_status <> 'retired'")
+                .fetch_all(&self.pg)
+                .await?;
+
+        // (normalized catalog id, tasks) for each non-retired catalog row.
+        let catalog: Vec<(String, Vec<String>)> = cat_rows
+            .iter()
+            .map(|r| {
+                let id: String = r.get("id");
+                let tasks_json: serde_json::Value = r.get("tasks");
+                let tasks: Vec<String> = tasks_json
+                    .as_array()
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                (normalize_model_id(&id), tasks)
+            })
+            .collect();
+
+        let mut counts: HashMap<String, i32> = HashMap::new();
+        for dr in &dep_rows {
+            let raw: String = dr.get("model_id");
+            let dep = normalize_model_id(&raw);
+            // Pick the most specific (longest) matching catalog id so a short
+            // prefix (`qwen-3-7b`) can't shadow a more specific one.
+            if let Some((_, tasks)) = catalog
+                .iter()
+                .filter(|(cid, _)| catalog_matches(&dep, cid))
+                .max_by_key(|(cid, _)| cid.len())
+            {
+                for t in tasks {
+                    *counts.entry(t.clone()).or_insert(0) += 1;
+                }
+            }
+        }
+        Ok(counts)
     }
 
     /// Spawn a background tick that runs [`Self::check_once`] every
@@ -439,6 +498,18 @@ pub fn loadable_gap_count(gaps: &[CoverageGap]) -> usize {
     gaps.iter().filter(|g| !g.candidates.is_empty()).count()
 }
 
+/// True iff a normalized deployment id corresponds to a normalized catalog id.
+/// Exact match, or the deployment id extends the catalog id at a separator
+/// boundary (so `qwen-3-coder-30b-a-3b-instruct` matches catalog
+/// `qwen-3-coder-30b`, but `qwen-3-72b` does NOT match `qwen-3-7b`). Both
+/// inputs must already be `normalize_model_id`-canonical. Pure → unit-tested.
+pub fn catalog_matches(dep_norm: &str, cat_norm: &str) -> bool {
+    if cat_norm.is_empty() {
+        return false;
+    }
+    dep_norm == cat_norm || dep_norm.starts_with(&format!("{cat_norm}-"))
+}
+
 fn tier_rank(tier: Option<&str>) -> u8 {
     match tier {
         Some("flagship") => 0,
@@ -491,6 +562,36 @@ mod tests {
         ];
         assert_eq!(loadable_gap_count(&gaps), 2);
         assert_eq!(loadable_gap_count(&[]), 0);
+    }
+
+    #[test]
+    fn catalog_matches_via_normalized_forms() {
+        // Real fleet case that previously returned covered=0: deployment is a
+        // GGUF filename, catalog id is the compact form. Both normalize equal.
+        let dep = normalize_model_id("gemma-4-31B-it-Q4_K_M.gguf");
+        let cat = normalize_model_id("gemma4-31b-it");
+        assert_eq!(dep, cat);
+        assert!(catalog_matches(&dep, &cat));
+
+        // Coder deployment extends the catalog id at a boundary → matches.
+        let coder_dep = normalize_model_id("Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf");
+        let coder_cat = normalize_model_id("qwen3-coder-30b");
+        assert!(catalog_matches(&coder_dep, &coder_cat));
+
+        // Near-miss must NOT match: 72b deployment vs 7b catalog id share a
+        // textual prefix but differ at the digit, with no separator boundary.
+        let d72 = normalize_model_id("qwen3-72b");
+        let c7 = normalize_model_id("qwen3-7b");
+        assert!(!catalog_matches(&d72, &c7));
+
+        // A genuinely-different model (newer minor version not in catalog)
+        // does not get credited.
+        let newer = normalize_model_id("qwen3.6-35b-a3b");
+        let older_cat = normalize_model_id("qwen35-35b-a3b");
+        assert!(!catalog_matches(&newer, &older_cat));
+
+        // Empty catalog id never matches.
+        assert!(!catalog_matches("anything", ""));
     }
 
     #[test]
