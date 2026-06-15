@@ -520,6 +520,41 @@ fn json_str_array(v: serde_json::Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Groups of task labels that name the SAME underlying capability. A
+/// deployment credited for any member of a group is credited for every member
+/// (see [`expand_task_aliases`]). This closes a false-gap class: the operator's
+/// `fleet_task_coverage` carried both `code` (critical, empty preferred) and
+/// `code-generation` (normal, flagship preferred) as separate rows. The fleet
+/// demonstrably serves code via the deployed flagship, yet `code` reported as
+/// an uncovered CRITICAL task — and `--remediate` would have wastefully loaded
+/// a SECOND code model to "fix" a task already served.
+///
+/// These are taxonomy synonyms (ForgeFleet's own labels — HF has no `code`/
+/// `code-generation` split; both map to `text-generation`), not fleet
+/// inventory, so they live in source alongside the family→task classification
+/// in `deployment_catalog_reconciler`. Keep the list conservative: only add a
+/// pair when the two labels are genuinely interchangeable, never to paper over
+/// a real distinct capability. Aliasing can only ever HELP — if every synonym
+/// is genuinely unserved, none is credited and the gap still surfaces.
+const TASK_ALIAS_GROUPS: &[&[&str]] = &[&["code", "code-generation"]];
+
+/// Given the tasks a single deployment serves, add every alias-group sibling of
+/// each task so synonymous task labels share coverage credit. Pure →
+/// unit-tested.
+fn expand_task_aliases(tasks: &mut std::collections::BTreeSet<String>) {
+    let mut to_add: Vec<String> = Vec::new();
+    for group in TASK_ALIAS_GROUPS {
+        if group.iter().any(|t| tasks.contains(*t)) {
+            for t in *group {
+                if !tasks.contains(*t) {
+                    to_add.push((*t).to_string());
+                }
+            }
+        }
+    }
+    tasks.extend(to_add);
+}
+
 /// Credit each active deployment to the tasks it serves and return per-task
 /// counts. A deployment serves a task if EITHER:
 ///   - its id matches ([`catalog_matches`]) an active catalog row that lists
@@ -531,10 +566,14 @@ fn json_str_array(v: serde_json::Value) -> Vec<String> {
 ///     `qwen3.6-35b-a3b`) gets credited for `default-chat`/`chain-of-thought`/
 ///     `code-generation` even before the catalog row's `tasks` are updated.
 ///
+/// After both paths, the per-deployment task set is expanded across
+/// [`TASK_ALIAS_GROUPS`] so synonymous task labels (e.g. `code` ≡
+/// `code-generation`) share credit and don't false-gap independently.
+///
 /// All ids must already be [`normalize_model_id`]-canonical. The catalog path
 /// picks the single most-specific (longest) matching row. Each deployment is
-/// credited at most once per task (the union of both paths), so a model that
-/// matches via both catalog and preferred isn't double-counted. Pure →
+/// credited at most once per task (the union of both paths + aliases), so a
+/// model that matches via several routes isn't double-counted. Pure →
 /// unit-tested.
 pub fn tally_task_coverage(
     deploy_norm: &[String],
@@ -562,6 +601,11 @@ pub fn tally_task_coverage(
                 tasks.insert(task.clone());
             }
         }
+
+        // Synonymous-task credit: e.g. a model serving `code-generation` also
+        // covers `code`. Applied per deployment so the union (and the at-most-
+        // once-per-task count) still holds.
+        expand_task_aliases(&mut tasks);
 
         for t in tasks {
             *counts.entry(t).or_insert(0) += 1;
@@ -708,8 +752,61 @@ mod tests {
         // text-generation: only gemma4 — via catalog AND preferred — credits
         // once, not twice (union per deployment).
         assert_eq!(counts.get("text-generation"), Some(&1));
-        // No deployed model matches qwen3-coder-30b → `code` stays uncovered.
-        assert_eq!(counts.get("code"), None);
+        // No deployed model matches qwen3-coder-30b (the `code` preferred id),
+        // BUT `code` is an alias of `code-generation`, which the 2 flagship
+        // deployments cover — so `code` is credited via alias expansion (the
+        // false-critical-gap fix). Counts match code-generation (2), not the
+        // empty `code` preferred path.
+        assert_eq!(counts.get("code"), Some(&2));
+    }
+
+    #[test]
+    fn expand_task_aliases_credits_synonyms_both_ways() {
+        let mk = |items: &[&str]| {
+            items
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<std::collections::BTreeSet<String>>()
+        };
+
+        // code-generation present → code added.
+        let mut a = mk(&["code-generation", "default-chat"]);
+        expand_task_aliases(&mut a);
+        assert!(a.contains("code"));
+        assert!(a.contains("code-generation"));
+        assert!(a.contains("default-chat")); // untouched
+
+        // code present → code-generation added (bidirectional).
+        let mut b = mk(&["code"]);
+        expand_task_aliases(&mut b);
+        assert!(b.contains("code-generation"));
+
+        // Neither synonym present → no spurious additions.
+        let mut c = mk(&["chain-of-thought"]);
+        expand_task_aliases(&mut c);
+        assert_eq!(c, mk(&["chain-of-thought"]));
+
+        // Empty set stays empty (no aliasing can manufacture credit).
+        let mut d = std::collections::BTreeSet::<String>::new();
+        expand_task_aliases(&mut d);
+        assert!(d.is_empty());
+    }
+
+    #[test]
+    fn tally_aliases_code_generation_to_code_no_double_count() {
+        let n = normalize_model_id;
+        // Flagship deployed; operator declares it preferred ONLY for
+        // code-generation (the real fleet state: `code` preferred is empty).
+        let deploy = vec![n("qwen3.6-35b-a3b")];
+        let catalog: Vec<(String, Vec<String>)> = vec![];
+        let preferred = vec![
+            ("code-generation".to_string(), vec![n("qwen3.6-35b-a3b")]),
+            ("code".to_string(), vec![]), // empty — would gap without aliasing
+        ];
+        let counts = tally_task_coverage(&deploy, &catalog, &preferred);
+        // Both synonyms credited exactly once by the single deployment.
+        assert_eq!(counts.get("code-generation"), Some(&1));
+        assert_eq!(counts.get("code"), Some(&1));
     }
 
     #[test]
