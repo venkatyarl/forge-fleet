@@ -3,9 +3,11 @@
 //! Keeps the fleet "always-on" for the set of tasks the operator declared
 //! required in `fleet_task_coverage`. For each row the guard:
 //!
-//!   1. Counts how many currently-active deployments serve the task
-//!      (`computer_model_deployments.status = 'active'` joined to a
-//!      non-retired `model_catalog` row with `tasks @> [task]`).
+//!   1. Counts how many currently-active deployments serve the task. A
+//!      deployment serves a task if its (normalized) id matches an `active`
+//!      `model_catalog` row tagged with the task, OR matches a model the
+//!      operator named in the task's `preferred_model_ids` — the latter
+//!      overrides stale/missing catalog tags. See `tally_task_coverage`.
 //!   2. If the count is below `min_models_loaded`, picks the best catalog
 //!      candidate (flagship → standard, preferring smaller/Q4 quants so
 //!      a 32GB box can run it) and enqueues a deferred `ff model load`
@@ -237,56 +239,64 @@ impl CoverageGuard {
     ///
     /// Deployments record a free-text `model_id` (GGUF filename or runtime
     /// model name), so they cannot be joined to `model_catalog.id` directly.
-    /// We normalize every active deployment id and every non-retired catalog
-    /// id through [`normalize_model_id`] (the same canonical form the gateway
-    /// router and pulse reader use) and match on a separator boundary, then
-    /// credit each matched deployment to all of its catalog row's tasks.
+    /// We normalize every active deployment id, every **active** catalog id,
+    /// and every operator-declared preferred id through [`normalize_model_id`]
+    /// (the same canonical form the gateway router and pulse reader use) and
+    /// match on a separator boundary. A deployment serves a task if EITHER its
+    /// id matches an active catalog row that lists the task, OR it matches a
+    /// model the operator named in that task's `preferred_model_ids` — see
+    /// [`tally_task_coverage`] for the full rule.
     async fn deployed_task_counts(&self) -> Result<HashMap<String, i32>, sqlx::Error> {
         let dep_rows =
             sqlx::query("SELECT model_id FROM computer_model_deployments WHERE status = 'active'")
                 .fetch_all(&self.pg)
                 .await?;
 
+        // Only `active` catalog rows count toward coverage. `candidate` rows
+        // are unreviewed model-scout discoveries whose `tasks` come straight
+        // from the HF `pipeline_tag` and are frequently mislabeled (e.g. the
+        // text/code MoE `qwen3-6-35b-a3b` was scouted as `image-text-to-text`),
+        // so crediting them produces false coverage. `deprecated` rows are on
+        // the way out. Operator-blessed `active` rows are the source of truth.
         let cat_rows =
-            sqlx::query("SELECT id, tasks FROM model_catalog WHERE lifecycle_status <> 'retired'")
+            sqlx::query("SELECT id, tasks FROM model_catalog WHERE lifecycle_status = 'active'")
                 .fetch_all(&self.pg)
                 .await?;
 
-        // (normalized catalog id, tasks) for each non-retired catalog row.
+        let pref_rows = sqlx::query("SELECT task, preferred_model_ids FROM fleet_task_coverage")
+            .fetch_all(&self.pg)
+            .await?;
+
+        let deploy_norm: Vec<String> = dep_rows
+            .iter()
+            .map(|r| normalize_model_id(&r.get::<String, _>("model_id")))
+            .collect();
+
+        // (normalized catalog id, tasks) for each active catalog row.
         let catalog: Vec<(String, Vec<String>)> = cat_rows
             .iter()
             .map(|r| {
                 let id: String = r.get("id");
-                let tasks_json: serde_json::Value = r.get("tasks");
-                let tasks: Vec<String> = tasks_json
-                    .as_array()
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.as_str().map(String::from))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                (normalize_model_id(&id), tasks)
+                (normalize_model_id(&id), json_str_array(r.get("tasks")))
             })
             .collect();
 
-        let mut counts: HashMap<String, i32> = HashMap::new();
-        for dr in &dep_rows {
-            let raw: String = dr.get("model_id");
-            let dep = normalize_model_id(&raw);
-            // Pick the most specific (longest) matching catalog id so a short
-            // prefix (`qwen-3-7b`) can't shadow a more specific one.
-            if let Some((_, tasks)) = catalog
-                .iter()
-                .filter(|(cid, _)| catalog_matches(&dep, cid))
-                .max_by_key(|(cid, _)| cid.len())
-            {
-                for t in tasks {
-                    *counts.entry(t.clone()).or_insert(0) += 1;
-                }
-            }
-        }
-        Ok(counts)
+        // (task, [normalized preferred model ids]) from the operator-curated
+        // coverage table. These are an explicit "this model serves this task"
+        // declaration that overrides stale/missing catalog `tasks` tags.
+        let preferred: Vec<(String, Vec<String>)> = pref_rows
+            .iter()
+            .map(|r| {
+                let task: String = r.get("task");
+                let ids: Vec<String> = json_str_array(r.get("preferred_model_ids"))
+                    .iter()
+                    .map(|id| normalize_model_id(id))
+                    .collect();
+                (task, ids)
+            })
+            .collect();
+
+        Ok(tally_task_coverage(&deploy_norm, &catalog, &preferred))
     }
 
     /// Spawn a background tick that runs [`Self::check_once`] every
@@ -498,6 +508,68 @@ pub fn loadable_gap_count(gaps: &[CoverageGap]) -> usize {
     gaps.iter().filter(|g| !g.candidates.is_empty()).count()
 }
 
+/// Extract a `Vec<String>` from a JSONB string-array column, dropping any
+/// non-string elements. Returns empty for `null`/non-array values.
+fn json_str_array(v: serde_json::Value) -> Vec<String> {
+    v.as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Credit each active deployment to the tasks it serves and return per-task
+/// counts. A deployment serves a task if EITHER:
+///   - its id matches ([`catalog_matches`]) an active catalog row that lists
+///     the task in its `tasks`, OR
+///   - its id matches a model the operator named in that task's
+///     `preferred_model_ids` (`fleet_task_coverage`) — an explicit "this model
+///     serves this task" declaration that overrides stale or missing catalog
+///     task tags. This is how the fleet's current flagship (e.g. a deployed
+///     `qwen3.6-35b-a3b`) gets credited for `default-chat`/`chain-of-thought`/
+///     `code-generation` even before the catalog row's `tasks` are updated.
+///
+/// All ids must already be [`normalize_model_id`]-canonical. The catalog path
+/// picks the single most-specific (longest) matching row. Each deployment is
+/// credited at most once per task (the union of both paths), so a model that
+/// matches via both catalog and preferred isn't double-counted. Pure →
+/// unit-tested.
+pub fn tally_task_coverage(
+    deploy_norm: &[String],
+    catalog: &[(String, Vec<String>)],
+    preferred: &[(String, Vec<String>)],
+) -> HashMap<String, i32> {
+    let mut counts: HashMap<String, i32> = HashMap::new();
+    for dep in deploy_norm {
+        let mut tasks: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+        // Catalog path: the most specific matching active row contributes its
+        // tasks (longest id wins so a short prefix can't shadow a precise one).
+        if let Some((_, ts)) = catalog
+            .iter()
+            .filter(|(cid, _)| catalog_matches(dep, cid))
+            .max_by_key(|(cid, _)| cid.len())
+        {
+            tasks.extend(ts.iter().cloned());
+        }
+
+        // Preferred path: any task whose operator-declared preferred list names
+        // a model this deployment matches.
+        for (task, pref_ids) in preferred {
+            if pref_ids.iter().any(|p| catalog_matches(dep, p)) {
+                tasks.insert(task.clone());
+            }
+        }
+
+        for t in tasks {
+            *counts.entry(t).or_insert(0) += 1;
+        }
+    }
+    counts
+}
+
 /// True iff a normalized deployment id corresponds to a normalized catalog id.
 /// Exact match, or the deployment id extends the catalog id at a separator
 /// boundary (so `qwen-3-coder-30b-a-3b-instruct` matches catalog
@@ -592,6 +664,73 @@ mod tests {
 
         // Empty catalog id never matches.
         assert!(!catalog_matches("anything", ""));
+    }
+
+    #[test]
+    fn tally_credits_preferred_when_catalog_tag_is_stale() {
+        // The real fleet case, with the exact raw deployment ids the workers
+        // record: the flagship is deployed as a dotted runtime name and as a
+        // dotted GGUF filename (both fold to `qwen-3-6-35b-a-3b`). Its only
+        // catalog row is a mislabeled scout candidate (image-text-to-text) —
+        // filtered out here because we only pass ACTIVE catalog rows. The
+        // operator declared it preferred for default-chat / chain-of-thought /
+        // code-generation, so those tasks are credited via the preferred path
+        // even though no active catalog row tags the model with them.
+        let n = normalize_model_id;
+        let deploy = vec![
+            n("qwen3.6-35b-a3b"),
+            n("Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"),
+            n("gemma-4-31B-it-Q4_K_M.gguf"),
+        ];
+        // Active catalog: only gemma4 carries text-generation.
+        let catalog = vec![(n("gemma4-31b-it"), vec!["text-generation".to_string()])];
+        let preferred = vec![
+            (
+                "default-chat".to_string(),
+                vec![n("qwen3.6-35b-a3b"), n("gemma4-31b-it")],
+            ),
+            ("chain-of-thought".to_string(), vec![n("qwen3.6-35b-a3b")]),
+            ("code-generation".to_string(), vec![n("qwen3.6-35b-a3b")]),
+            // No deployment matches this preferred id → not credited.
+            ("code".to_string(), vec![n("qwen3-coder-30b")]),
+        ];
+
+        let counts = tally_task_coverage(&deploy, &catalog, &preferred);
+
+        // default-chat names BOTH the flagship and gemma4 → all three
+        // deployments credit it (2 flagship + 1 gemma4).
+        assert_eq!(counts.get("default-chat"), Some(&3));
+        // chain-of-thought / code-generation name only the flagship → its 2
+        // deployments. The dotted-GGUF id prefix-matches the dotted runtime id
+        // at a separator boundary, so both count.
+        assert_eq!(counts.get("chain-of-thought"), Some(&2));
+        assert_eq!(counts.get("code-generation"), Some(&2));
+        // text-generation: only gemma4 — via catalog AND preferred — credits
+        // once, not twice (union per deployment).
+        assert_eq!(counts.get("text-generation"), Some(&1));
+        // No deployed model matches qwen3-coder-30b → `code` stays uncovered.
+        assert_eq!(counts.get("code"), None);
+    }
+
+    #[test]
+    fn tally_unions_catalog_and_preferred_without_double_count() {
+        let n = normalize_model_id;
+        let deploy = vec![n("qwen3-coder-30b")];
+        // Same model credited for `code` via BOTH catalog tag and preferred.
+        let catalog = vec![(n("qwen3-coder-30b"), vec!["code".to_string()])];
+        let preferred = vec![("code".to_string(), vec![n("qwen3-coder-30b")])];
+        let counts = tally_task_coverage(&deploy, &catalog, &preferred);
+        assert_eq!(counts.get("code"), Some(&1)); // not 2
+    }
+
+    #[test]
+    fn json_str_array_filters_non_strings() {
+        assert_eq!(
+            json_str_array(serde_json::json!(["a", 1, "b", null])),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert!(json_str_array(serde_json::json!(null)).is_empty());
+        assert!(json_str_array(serde_json::json!("notarray")).is_empty());
     }
 
     #[test]
