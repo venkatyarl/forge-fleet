@@ -59,6 +59,19 @@ pub enum CoordError {
     Internal(String),
 }
 
+impl CoordError {
+    /// A *transient* failure of the LLM CALL — the chosen endpoint was busy,
+    /// unreachable, or returned nothing. Re-dispatching the same prompt to a
+    /// DIFFERENT LLM-capable slot may succeed (GAP-G). Slot/DB/validation
+    /// errors are NOT transient (retrying the same way won't help).
+    fn is_transient(&self) -> bool {
+        matches!(
+            self,
+            CoordError::Http(_) | CoordError::NoLlmServer(_) | CoordError::EmptyResponse
+        )
+    }
+}
+
 /// Result of a successful dispatch.
 #[derive(Debug, Clone)]
 pub struct DispatchReceipt {
@@ -113,8 +126,14 @@ impl AgentCoordinator {
     pub async fn pick_worker(
         &self,
         target: Option<String>,
+        exclude: &[String],
     ) -> Result<Option<WorkerSlot>, CoordError> {
         if let Some(name) = target {
+            // An explicitly-excluded target (a GAP-G retry already failed there)
+            // has no usable slot — don't re-pick the same dead endpoint.
+            if exclude.iter().any(|e| e.eq_ignore_ascii_case(&name)) {
+                return Ok(None);
+            }
             // Validate computer exists, then look for an idle slot on it.
             let computer: Option<(Uuid, String, String)> =
                 sqlx::query_as("SELECT id, name, status FROM computers WHERE name = $1")
@@ -152,6 +171,7 @@ impl AgentCoordinator {
                  FROM sub_agents sa \
                  JOIN computers c ON c.id = sa.computer_id \
                  WHERE sa.status = 'idle' \
+                   AND c.name <> ALL($1) \
                  ORDER BY \
                    EXISTS ( \
                      SELECT 1 FROM fleet_model_deployments d \
@@ -164,6 +184,7 @@ impl AgentCoordinator {
                    (c.status = 'online') DESC, sa.slot ASC \
                  LIMIT 1",
             )
+            .bind(exclude)
             .fetch_optional(&self.pg)
             .await?;
             Ok(row.map(
@@ -225,54 +246,88 @@ impl AgentCoordinator {
         prompt: String,
         target_computer: Option<String>,
     ) -> Result<DispatchReceipt, CoordError> {
-        // 1-2. Pick + claim an idle slot, retrying on CAS contention. Under
-        // concurrent multi-caller dispatch (HireFlow + ff building itself, many
-        // callers at once) several dispatchers race for the same idle slot;
-        // `claim_slot`'s compare-and-swap lets exactly one win. The losers must
-        // RE-PICK another free slot instead of spuriously failing while idle
-        // slots remain — the old code returned `NoSlot` on the first lost race.
-        // Bounded so a genuinely saturated pool still returns promptly.
-        const MAX_CLAIM_ATTEMPTS: usize = 8;
-        let mut claimed_slot: Option<WorkerSlot> = None;
-        for _ in 0..MAX_CLAIM_ATTEMPTS {
-            let Some(candidate) = self.pick_worker(target_computer.clone()).await? else {
-                // No idle slot exists at all — genuine saturation, not contention.
-                return Err(CoordError::NoSlot(target_computer.clone()));
-            };
-            if self
-                .claim_slot(candidate.sub_agent_id, work_item_id)
-                .await?
-            {
-                claimed_slot = Some(candidate);
-                break;
+        // GAP-G: retry the whole dispatch on a TRANSIENT LLM-call failure (a
+        // busy/unreachable endpoint or empty response) by re-dispatching to
+        // ANOTHER LLM-capable slot, excluding the computer that just failed. One
+        // slow/overloaded endpoint under concurrent load no longer fails the
+        // caller while other capable hosts are idle (observed 2/8 in a smoke
+        // test). Bounded; non-transient errors (DB/validation) return at once.
+        const MAX_LLM_ATTEMPTS: usize = 3;
+        let mut excluded: Vec<String> = Vec::new();
+        let mut last_transient: Option<CoordError> = None;
+
+        for _ in 0..MAX_LLM_ATTEMPTS {
+            // 1-2. Pick + claim an idle slot, retrying on CAS contention. Under
+            // concurrent multi-caller dispatch several dispatchers race for the
+            // same idle slot; `claim_slot`'s compare-and-swap lets exactly one
+            // win, and the losers RE-PICK rather than spuriously failing (GAP-A).
+            // The pick honours `excluded` so a GAP-G retry skips the dead host.
+            const MAX_CLAIM_ATTEMPTS: usize = 8;
+            let mut claimed_slot: Option<WorkerSlot> = None;
+            for _ in 0..MAX_CLAIM_ATTEMPTS {
+                let Some(candidate) = self.pick_worker(target_computer.clone(), &excluded).await?
+                else {
+                    // No idle slot (saturation, or all candidates excluded).
+                    // Prefer surfacing the real LLM error over a bare NoSlot.
+                    return Err(last_transient
+                        .unwrap_or_else(|| CoordError::NoSlot(target_computer.clone())));
+                };
+                if self
+                    .claim_slot(candidate.sub_agent_id, work_item_id)
+                    .await?
+                {
+                    claimed_slot = Some(candidate);
+                    break;
+                }
+                // Lost the CAS to a concurrent dispatcher; re-pick a fresh slot.
             }
-            // Lost the CAS to a concurrent dispatcher; loop to re-pick a fresh slot.
+            let Some(slot) = claimed_slot else {
+                return Err(CoordError::NoSlot(Some(format!(
+                    "all idle {} slot(s) lost to concurrent dispatchers after \
+                     {MAX_CLAIM_ATTEMPTS} attempts (pool contended — retry shortly)",
+                    target_computer.as_deref().unwrap_or("fleet"),
+                ))));
+            };
+
+            // 3. Run the LLM call; always release the slot afterwards.
+            let started = std::time::Instant::now();
+            let result = self.run_and_persist(&slot, work_item_id, &prompt).await;
+            match result {
+                Ok(mut receipt) => {
+                    if let Err(rel_err) = self.release_slot(slot.sub_agent_id, "ok").await {
+                        tracing::warn!(sub_agent = %slot.sub_agent_id, error = %rel_err, "release_slot failed");
+                    }
+                    receipt.duration_ms =
+                        started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                    return Ok(receipt);
+                }
+                Err(e) if e.is_transient() => {
+                    // The SLOT is fine — the LLM endpoint was busy/unreachable.
+                    // Free it (idle, not error) and try another capable host.
+                    if let Err(rel_err) = self.release_slot(slot.sub_agent_id, "ok").await {
+                        tracing::warn!(sub_agent = %slot.sub_agent_id, error = %rel_err, "release_slot failed");
+                    }
+                    tracing::warn!(
+                        computer = %slot.computer_name, error = %e,
+                        "dispatch: transient LLM-call failure — retrying on another LLM-capable slot"
+                    );
+                    excluded.push(slot.computer_name.clone());
+                    last_transient = Some(e);
+                    continue;
+                }
+                Err(e) => {
+                    // Non-transient (DB/validation/internal): mark the slot
+                    // `error` and surface immediately — a retry won't help.
+                    if let Err(rel_err) = self.release_slot(slot.sub_agent_id, "error").await {
+                        tracing::warn!(sub_agent = %slot.sub_agent_id, error = %rel_err, "release_slot failed");
+                    }
+                    return Err(e);
+                }
+            }
         }
-        let slot = claimed_slot.ok_or_else(|| {
-            CoordError::NoSlot(Some(format!(
-                "all idle {} slot(s) lost to concurrent dispatchers after \
-                 {MAX_CLAIM_ATTEMPTS} attempts (pool contended — retry shortly)",
-                target_computer.as_deref().unwrap_or("fleet"),
-            )))
-        })?;
 
-        // 3. Run the LLM call, persist output, release slot. Catch any
-        //    error below so the slot always gets released.
-        let started = std::time::Instant::now();
-        let result = self.run_and_persist(&slot, work_item_id, &prompt).await;
-
-        let (outcome_tag, receipt_or_err) = match result {
-            Ok(r) => ("ok", Ok(r)),
-            Err(e) => ("error", Err(e)),
-        };
-
-        if let Err(rel_err) = self.release_slot(slot.sub_agent_id, outcome_tag).await {
-            tracing::warn!(sub_agent = %slot.sub_agent_id, error = %rel_err, "release_slot failed");
-        }
-
-        let mut receipt = receipt_or_err?;
-        receipt.duration_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
-        Ok(receipt)
+        // Exhausted MAX_LLM_ATTEMPTS, every one a transient LLM failure.
+        Err(last_transient.unwrap_or_else(|| CoordError::NoSlot(target_computer.clone())))
     }
 
     /// Internal: do the actual LLM call + `work_outputs` insert.
@@ -576,4 +631,26 @@ pub async fn list_sub_agents(pool: &PgPool) -> Result<Vec<SubAgentListRow>, Coor
             },
         )
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CoordError;
+
+    #[test]
+    fn transient_errors_are_retryable() {
+        // LLM-call failures: a re-dispatch to another capable host may succeed.
+        assert!(CoordError::NoLlmServer("priya".into()).is_transient());
+        assert!(CoordError::EmptyResponse.is_transient());
+    }
+
+    #[test]
+    fn structural_errors_are_not_transient() {
+        // Slot/validation/internal errors: retrying the same way won't help.
+        assert!(!CoordError::NoSlot(None).is_transient());
+        assert!(!CoordError::NoSlot(Some("contended".into())).is_transient());
+        assert!(!CoordError::UnknownComputer("nope".into()).is_transient());
+        assert!(!CoordError::Pulse("redis down".into()).is_transient());
+        assert!(!CoordError::Internal("bug".into()).is_transient());
+    }
 }
