@@ -166,12 +166,12 @@ impl RestoreDrillTick {
 
     async fn drill_inner(&self) -> DrillOutcome {
         // 1) select — newest postgres backup row.
-        let row: Option<(uuid::Uuid, String, i64, String)> = match sqlx::query_as(
+        let rows: Vec<(uuid::Uuid, String, i64, String)> = match sqlx::query_as(
             "SELECT id, file_name, size_bytes, checksum_sha256 \
                FROM backups WHERE database_kind = 'postgres' \
-              ORDER BY created_at DESC LIMIT 1",
+              ORDER BY created_at DESC LIMIT 20",
         )
-        .fetch_optional(&self.pg)
+        .fetch_all(&self.pg)
         .await
         {
             Ok(r) => r,
@@ -184,7 +184,7 @@ impl RestoreDrillTick {
                 );
             }
         };
-        let Some((id, file_name, _recorded_bytes, checksum)) = row else {
+        if rows.is_empty() {
             return DrillOutcome::failed(
                 None,
                 "",
@@ -193,24 +193,40 @@ impl RestoreDrillTick {
                  produced a backup, or every row was pruned (data-loss risk)"
                     .into(),
             );
-        };
+        }
 
-        // 2) locate — file present + non-zero + within size cap.
-        let path = self.backup_dir.join("postgres").join(&file_name);
-        let disk_bytes = match tokio::fs::metadata(&path).await {
-            Ok(m) => m.len() as i64,
-            Err(_) => {
-                return DrillOutcome::failed(
-                    Some(id),
-                    &file_name,
-                    "locate",
-                    format!(
-                        "backup file not on this node: {} (rsync may not have \
-                         landed, or it lives only on a peer)",
-                        path.display()
-                    ),
-                );
+        // 2) locate — pick the NEWEST backup whose ciphertext is present on THIS
+        //    node. The leader holds every snapshot so it always drills the
+        //    globally-newest; a peer (a cross-node `--on` drill) may lag the very
+        //    newest by an rsync cycle, so it drills the newest copy it actually
+        //    holds rather than false-failing — rsync lag is not un-restorability.
+        let newest_name = rows[0].1.clone();
+        let mut found: Option<(uuid::Uuid, String, String, std::path::PathBuf, i64)> = None;
+        for (id, file_name, _recorded_bytes, checksum) in &rows {
+            let path = self.backup_dir.join("postgres").join(file_name);
+            if let Ok(m) = tokio::fs::metadata(&path).await {
+                found = Some((
+                    *id,
+                    file_name.clone(),
+                    checksum.clone(),
+                    path,
+                    m.len() as i64,
+                ));
+                break;
             }
+        }
+        let Some((id, file_name, checksum, path, disk_bytes)) = found else {
+            return DrillOutcome::failed(
+                Some(rows[0].0),
+                &newest_name,
+                "locate",
+                format!(
+                    "none of the {} newest postgres backups are on this node \
+                     (newest={newest_name}) — rsync may not have landed, or \
+                     backups live only on a peer",
+                    rows.len()
+                ),
+            );
         };
         if disk_bytes == 0 {
             return DrillOutcome::failed(
