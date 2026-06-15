@@ -37,6 +37,15 @@ pub async fn handle_llm_status(json: bool) -> Result<()> {
     // BEFORE both the JSON and text branches so they share one stable order.
     servers.sort_by(|(a, _), (b, _)| ip_rank(a).cmp(&ip_rank(b)).then_with(|| a.cmp(b)));
 
+    // Each node reports its endpoint as the loopback host it sees locally; rewrite
+    // to the node's primary IP so the printed endpoint is reachable from here.
+    let reachable = |name: &str, endpoint: &str| -> String {
+        crate::helpers::reachable_endpoint(
+            endpoint,
+            ip_by_name.get(name).map(String::as_str).unwrap_or(""),
+        )
+    };
+
     if json {
         let arr: Vec<_> = servers
             .iter()
@@ -45,7 +54,7 @@ pub async fn handle_llm_status(json: bool) -> Result<()> {
                     "computer":  computer,
                     "model":     s.model.id,
                     "runtime":   s.runtime,
-                    "endpoint":  s.endpoint,
+                    "endpoint":  reachable(computer, &s.endpoint),
                     "queue_depth": s.queue_depth,
                     "active_requests": s.active_requests,
                     "tokens_per_sec_last_min": s.tokens_per_sec_last_min,
@@ -77,7 +86,7 @@ pub async fn handle_llm_status(json: bool) -> Result<()> {
             truncate_for_col(computer, 10),
             truncate_for_col(&s.model.id, 20),
             truncate_for_col(&s.runtime, 10),
-            truncate_for_col(&s.endpoint, 32),
+            truncate_for_col(&reachable(computer, &s.endpoint), 32),
             s.queue_depth,
             s.active_requests,
             s.tokens_per_sec_last_min,
