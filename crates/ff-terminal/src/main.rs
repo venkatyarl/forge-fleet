@@ -359,6 +359,12 @@ enum Command {
         /// Model for sub-agents (default: "coder").
         #[arg(long = "subagent-model")]
         subagent_model: Option<String>,
+        /// Disable live web grounding. Sub-agents run as plain completions with
+        /// no tools, so by default each is given DuckDuckGo results for its
+        /// sub-question to ground its answer in current sources. Pass --no-web
+        /// to skip the searches and rely on the models' training knowledge only.
+        #[arg(long = "no-web", default_value_t = false)]
+        no_web: bool,
         /// Print intermediate progress events to stderr.
         #[arg(long, default_value_t = false)]
         verbose: bool,
@@ -4411,6 +4417,7 @@ async fn main() -> Result<()> {
             gateway,
             planner_model,
             subagent_model,
+            no_web,
             verbose,
         }) => {
             if let Some(session_id) = recover {
@@ -4426,6 +4433,7 @@ async fn main() -> Result<()> {
                             gateway,
                             planner_model,
                             subagent_model,
+                            !no_web,
                             verbose,
                         )
                         .await

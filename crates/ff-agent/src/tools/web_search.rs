@@ -59,49 +59,73 @@ impl AgentTool for WebSearchTool {
             .and_then(Value::as_u64)
             .unwrap_or(8) as usize;
 
-        let url = format!("https://html.duckduckgo.com/html/?q={}", urlencoding(query));
-
-        match self.client.get(&url).send().await {
-            Ok(resp) => {
-                if !resp.status().is_success() {
-                    return AgentToolResult::err(format!("Search returned HTTP {}", resp.status()));
-                }
-
-                match resp.text().await {
-                    Ok(html) => {
-                        let results = parse_ddg_results(&html, max_results);
-                        if results.is_empty() {
-                            AgentToolResult::ok(format!("No results found for: {query}"))
-                        } else {
-                            let output = results
-                                .iter()
-                                .enumerate()
-                                .map(|(i, r)| {
-                                    format!(
-                                        "{}. {}\n   {}\n   {}",
-                                        i + 1,
-                                        r.title,
-                                        r.url,
-                                        r.snippet
-                                    )
-                                })
-                                .collect::<Vec<_>>()
-                                .join("\n\n");
-                            AgentToolResult::ok(truncate_output(&output, MAX_TOOL_RESULT_CHARS))
-                        }
-                    }
-                    Err(e) => AgentToolResult::err(format!("Failed to read search results: {e}")),
-                }
+        match fetch_search_results(&self.client, query, max_results).await {
+            Ok(results) if results.is_empty() => {
+                AgentToolResult::ok(format!("No results found for: {query}"))
             }
-            Err(e) => AgentToolResult::err(format!("Search request failed: {e}")),
+            Ok(results) => AgentToolResult::ok(truncate_output(
+                &format_results(&results),
+                MAX_TOOL_RESULT_CHARS,
+            )),
+            Err(e) => AgentToolResult::err(e),
         }
     }
 }
 
-struct SearchResult {
-    title: String,
-    url: String,
-    snippet: String,
+/// Run a DuckDuckGo HTML search and return parsed results (title/url/snippet).
+/// Used both by the [`WebSearchTool`] agent tool and by callers that want web
+/// grounding WITHOUT a full agent loop (e.g. research sub-agents that run as
+/// plain chat completions — see `research.rs`).
+pub async fn fetch_search_results(
+    client: &reqwest::Client,
+    query: &str,
+    max_results: usize,
+) -> Result<Vec<SearchResult>, String> {
+    let url = format!("https://html.duckduckgo.com/html/?q={}", urlencoding(query));
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("Search request failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("Search returned HTTP {}", resp.status()));
+    }
+    let html = resp
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read search results: {e}"))?;
+    Ok(parse_ddg_results(&html, max_results))
+}
+
+/// Format parsed results as a numbered `N. title\n   url\n   snippet` block —
+/// the same shape the agent tool returns to the model.
+pub fn format_results(results: &[SearchResult]) -> String {
+    results
+        .iter()
+        .enumerate()
+        .map(|(i, r)| format!("{}. {}\n   {}\n   {}", i + 1, r.title, r.url, r.snippet))
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// Best-effort web grounding for a non-tool caller: search and return a
+/// formatted results block, or `None` if the search fails or finds nothing.
+/// Callers fall back to ungrounded behavior on `None` — never an error path.
+pub async fn fetch_web_context(
+    client: &reqwest::Client,
+    query: &str,
+    max_results: usize,
+) -> Option<String> {
+    match fetch_search_results(client, query, max_results).await {
+        Ok(results) if !results.is_empty() => Some(format_results(&results)),
+        _ => None,
+    }
+}
+
+pub struct SearchResult {
+    pub title: String,
+    pub url: String,
+    pub snippet: String,
 }
 
 fn parse_ddg_results(html: &str, max: usize) -> Vec<SearchResult> {
@@ -172,4 +196,61 @@ fn urlencoding(input: &str) -> String {
             _ => format!("%{:02X}", c as u8),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_results_numbers_and_lays_out_each_hit() {
+        let results = vec![
+            SearchResult {
+                title: "MLX 0.30 release".into(),
+                url: "https://example.com/mlx".into(),
+                snippet: "Adds FP8 kernels.".into(),
+            },
+            SearchResult {
+                title: "vLLM on GB10".into(),
+                url: "https://example.com/vllm".into(),
+                snippet: "Blackwell support.".into(),
+            },
+        ];
+        let out = format_results(&results);
+        assert_eq!(
+            out,
+            "1. MLX 0.30 release\n   https://example.com/mlx\n   Adds FP8 kernels.\n\n\
+             2. vLLM on GB10\n   https://example.com/vllm\n   Blackwell support."
+        );
+    }
+
+    #[test]
+    fn format_results_empty_is_empty() {
+        assert_eq!(format_results(&[]), "");
+    }
+
+    #[test]
+    fn parse_ddg_extracts_title_url_snippet_and_honors_max() {
+        let html = r#"
+            <a class="result__a" href="https://a.test/one">First &amp; Best</a>
+            <a class="result__snippet">Snippet one.</a>
+            <a class="result__a" href="https://b.test/two">Second</a>
+            <a class="result__snippet">Snippet two.</a>
+            <a class="result__a" href="https://c.test/three">Third</a>
+        "#;
+        let all = parse_ddg_results(html, 8);
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].url, "https://a.test/one");
+        assert_eq!(all[0].snippet, "Snippet one.");
+        assert_eq!(all[1].url, "https://b.test/two");
+        // max caps the result count.
+        assert_eq!(parse_ddg_results(html, 2).len(), 2);
+    }
+
+    #[test]
+    fn parse_ddg_skips_non_http_and_empty() {
+        // A relative/`javascript:` href must not pollute results.
+        let html = r#"<a class="result__a" href="/ddg-internal">Ad</a>"#;
+        assert!(parse_ddg_results(html, 8).is_empty());
+    }
 }

@@ -10,6 +10,7 @@ pub async fn handle_research(
     gateway: Option<String>,
     planner_model: Option<String>,
     subagent_model: Option<String>,
+    web_grounding: bool,
     verbose: bool,
 ) -> Result<()> {
     let pool = ff_agent::fleet_info::get_fleet_pool()
@@ -27,13 +28,16 @@ pub async fn handle_research(
         gateway_url: gateway.unwrap_or_default(),
         planner_model: planner_model.unwrap_or_default(),
         subagent_model: subagent_model.unwrap_or_default(),
+        web_grounding,
         ..Default::default()
     };
 
     eprintln!(
         "{CYAN}▶ ff research{RESET}  \x1b[2mparallel={parallel} depth={depth} \
-         planner={} subagent={}{RESET}",
-        config.planner_model, config.subagent_model
+         web={} planner={} subagent={}{RESET}",
+        if web_grounding { "on" } else { "off" },
+        config.planner_model,
+        config.subagent_model
     );
     eprintln!("\x1b[2m  Query: {}{RESET}\n", prompt);
 

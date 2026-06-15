@@ -62,6 +62,13 @@ pub struct ResearchConfig {
     pub subagent_model: String,
     /// Gateway base URL for all LLM calls. Defaults to http://192.168.5.100:51002.
     pub gateway_url: String,
+    /// Ground each sub-agent with a live DuckDuckGo web search for its
+    /// sub-question, injecting the results into its prompt. Sub-agents run as
+    /// plain chat completions (no live tools — see Phase 3), so without this
+    /// they can only answer from training data and the prompt's "Use WebSearch"
+    /// instruction is a lie. Default ON; `--no-web` disables it. Degrades
+    /// gracefully: a failed/empty search just falls back to ungrounded.
+    pub web_grounding: bool,
 }
 
 impl Default for ResearchConfig {
@@ -81,6 +88,7 @@ impl Default for ResearchConfig {
             planner_model: String::new(),
             subagent_model: String::new(),
             gateway_url: String::new(),
+            web_grounding: true,
         }
     }
 }
@@ -354,14 +362,36 @@ impl ResearchSession {
             .zip(backends.iter())
             .enumerate()
         {
-            let prompt = self.build_subagent_prompt(i, q, &plan.sub_questions);
+            let base_prompt = self.build_subagent_prompt(i, q, &plan.sub_questions);
             let endpoint = backend.endpoint.clone();
             let model = backend.model_id.clone();
             let row_id = row.id;
+            let web_grounding = self.config.web_grounding;
+            let sub_question = q.clone();
             handles.push(tokio::spawn({
                 let client = client.clone();
                 async move {
                     let t0 = Instant::now();
+                    // Sub-agents run as plain completions (no live tools), so we
+                    // search the web FOR them here and inject the results. Each
+                    // sub-agent's search runs concurrently with the others (one
+                    // per spawned task). Falls back to ungrounded on failure.
+                    let prompt = if web_grounding {
+                        match crate::tools::web_search::fetch_web_context(&client, &sub_question, 8)
+                            .await
+                        {
+                            Some(ctx) => format!(
+                                "{base_prompt}\n\n\
+                                 ── Live web search results for your sub-question \
+                                 ──\nThese were fetched for you (you cannot run \
+                                 more searches). Treat them as your primary \
+                                 sources and cite the URLs:\n\n{ctx}"
+                            ),
+                            None => base_prompt,
+                        }
+                    } else {
+                        base_prompt
+                    };
                     let out = openai_single_completion(&endpoint, &model, &prompt, 8192, &client)
                         .await
                         .map(|s| (s, t0.elapsed().as_millis() as u64));
@@ -840,10 +870,13 @@ impl ResearchSession {
              Your specific sub-question:\n{sub}\n\n\
              Other sub-agents are handling:\n{peers}\n\n\
              Guidelines:\n\
-             1. Use WebSearch and WebFetch liberally. Bias toward primary sources \
-                (papers, repos, vendor docs) over blog posts.\n\
-             2. Use Grep/Glob on the current workspace ({cwd}) when the \
-                question touches code.\n\
+             1. Live web search results for your sub-question are provided below \
+                (when available). Treat them as your PRIMARY sources and cite \
+                their URLs. You cannot run additional searches or open files, so \
+                reason from the provided results plus your own knowledge; bias \
+                toward primary sources (papers, repos, vendor docs).\n\
+             2. If the provided results don't cover something, reason from your \
+                training knowledge but mark it \"unverified\" — never invent a URL.\n\
              3. Quote specific snippets with URLs. A claim without a source is \
                 worth less than no claim.\n\
              4. If you're uncertain on something, say so — mark it \
@@ -865,9 +898,6 @@ impl ResearchSession {
             } else {
                 peers
             },
-            cwd = std::env::current_dir()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_default(),
         )
     }
 
