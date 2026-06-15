@@ -739,13 +739,18 @@ impl ResearchSession {
     /// carried NO health/freshness signal and routinely dispatched to dead
     /// endpoints — the likely reason research runs so often died mid-dispatch.
     ///
-    /// Sub-agents do plain chat completions (no tools), so tool-calling is not
-    /// required. Candidates come back ordered tier-ASC then freshest-first; we
-    /// then round-robin across DISTINCT computers to maximize real parallelism.
+    /// `require_tool_calling = true` is the fleet's reliable "this is a
+    /// chat-completion model, not an embedding/reranking server" filter (the
+    /// offload picker relies on the same flag): without it a healthy `bge-m3`
+    /// embedding deployment would be a candidate and a sub-agent POSTing a chat
+    /// completion to it would 4xx. Every agent-grade chat model on the fleet is
+    /// tool-calling, so this loses no usable research backend. Candidates come
+    /// back ordered tier-ASC then freshest-first; we then round-robin across
+    /// DISTINCT computers to maximize real parallelism.
     async fn pick_distinct_backends(&self, n: usize) -> Result<Vec<FleetBackend>> {
         let filter = ff_db::RouteFilter {
             workload: None,
-            require_tool_calling: false,
+            require_tool_calling: true,
             min_ctx: None,
             exclude_hosts: Vec::new(),
             max_health_age_sec: Some(ff_db::queries::DISPATCH_HEALTH_MAX_AGE_SEC),
