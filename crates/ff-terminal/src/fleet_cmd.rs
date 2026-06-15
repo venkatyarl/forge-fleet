@@ -538,8 +538,7 @@ pub async fn handle_fleet_db(pool: &sqlx::PgPool, cmd: FleetDbCommand) -> Result
 pub async fn handle_fleet_db_drill(pool: &sqlx::PgPool) -> Result<()> {
     let my_name = ff_agent::fleet_info::resolve_this_worker_name().await;
     println!("{CYAN}▶ ff fleet db drill{RESET}  (node={my_name})");
-    let tick =
-        ff_agent::ha::restore_drill::RestoreDrillTick::new(pool.clone(), my_name);
+    let tick = ff_agent::ha::restore_drill::RestoreDrillTick::new(pool.clone(), my_name);
     let o = tick.run_record_and_alert().await;
     if o.success {
         println!(
