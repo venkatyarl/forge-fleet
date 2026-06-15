@@ -524,6 +524,40 @@ pub async fn handle_fleet_db(pool: &sqlx::PgPool, cmd: FleetDbCommand) -> Result
         FleetDbCommand::Backup { kind, now } => {
             handle_fleet_db_backup_now(pool, &kind, now).await?;
         }
+        FleetDbCommand::Drill {} => {
+            handle_fleet_db_drill(pool).await?;
+        }
+    }
+    Ok(())
+}
+
+/// `ff fleet db drill` — run the backup restore-drill on demand. Shares the
+/// exact path (`RestoreDrillTick::run_record_and_alert`) the daily leader tick
+/// uses: decrypt → extract → validate the newest Postgres backup, record to
+/// `backup_drills`, alert on failure. Exits non-zero on a failed drill.
+pub async fn handle_fleet_db_drill(pool: &sqlx::PgPool) -> Result<()> {
+    let my_name = ff_agent::fleet_info::resolve_this_worker_name().await;
+    println!("{CYAN}▶ ff fleet db drill{RESET}  (node={my_name})");
+    let tick =
+        ff_agent::ha::restore_drill::RestoreDrillTick::new(pool.clone(), my_name);
+    let o = tick.run_record_and_alert().await;
+    if o.success {
+        println!(
+            "{GREEN}✓ restore drill PASSED{RESET}  backup={} files={} bytes={} pg_version={} verifybackup={:?} ({}ms)",
+            o.backup_file,
+            o.file_count.unwrap_or(0),
+            o.extracted_bytes.unwrap_or(0),
+            o.pg_version.as_deref().unwrap_or("?"),
+            o.verifybackup,
+            o.duration_ms,
+        );
+        println!("    {}", o.detail);
+    } else {
+        eprintln!(
+            "{RED}✗ restore drill FAILED{RESET}  backup={} stage={}\n    {}",
+            o.backup_file, o.stage, o.detail
+        );
+        std::process::exit(1);
     }
     Ok(())
 }

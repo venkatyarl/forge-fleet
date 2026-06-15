@@ -7,3 +7,4 @@
 
 pub mod backup;
 pub mod pg_failover;
+pub mod restore_drill;
