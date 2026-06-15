@@ -139,13 +139,29 @@ impl AgentCoordinator {
                 slot,
             }))
         } else {
-            // Any idle slot, preferring online computers.
+            // Any idle slot, preferring (GAP-F) computers that actually have a
+            // healthy tool-capable LLM, then online, then lowest slot. Without
+            // the first key the picker landed on idle slots of LLM-less hosts
+            // (~half the fleet) and `dispatch_task` then failed with "no active
+            // LLM" — observed 6/8 in a concurrent smoke test. This is a
+            // PREFERENCE, not a filter: if only LLM-less hosts have idle slots
+            // we still return one (no regression vs. the old behaviour), and
+            // `run_and_persist` surfaces the real "no LLM" error in that case.
             let row: Option<(Uuid, Uuid, String, i32)> = sqlx::query_as(
                 "SELECT sa.id, sa.computer_id, c.name, sa.slot \
                  FROM sub_agents sa \
                  JOIN computers c ON c.id = sa.computer_id \
                  WHERE sa.status = 'idle' \
-                 ORDER BY (c.status = 'online') DESC, sa.slot ASC \
+                 ORDER BY \
+                   EXISTS ( \
+                     SELECT 1 FROM fleet_model_deployments d \
+                     JOIN fleet_model_catalog cat ON cat.id = d.catalog_id \
+                     WHERE d.worker_name = c.name \
+                       AND d.health_status = 'healthy' \
+                       AND d.desired_state = 'active' \
+                       AND cat.tool_calling = true \
+                   ) DESC, \
+                   (c.status = 'online') DESC, sa.slot ASC \
                  LIMIT 1",
             )
             .fetch_optional(&self.pg)
