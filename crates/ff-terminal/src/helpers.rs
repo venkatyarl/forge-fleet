@@ -252,6 +252,52 @@ pub(crate) fn ip_sort_key(ip: &str) -> u32 {
         .unwrap_or(u32::MAX)
 }
 
+/// Rewrite a node-local LLM endpoint so it is reachable from the leader.
+///
+/// Each node's pulse beat reports its server endpoints as it sees them locally
+/// — `http://127.0.0.1:<port>` (also `localhost` / `0.0.0.0` / `[::1]`). That
+/// host is meaningless in a fleet-wide listing: `ff llm status` on taylor would
+/// print `james … http://127.0.0.1:55000`, which resolves to taylor, not james.
+/// Swap a loopback/unspecified host for the node's `primary_ip` (port + path
+/// preserved) so the printed endpoint can actually be called. When `primary_ip`
+/// is empty (node absent from the beats) the original string is returned
+/// unchanged — never fabricate a host.
+pub(crate) fn reachable_endpoint(endpoint: &str, primary_ip: &str) -> String {
+    if primary_ip.is_empty() {
+        return endpoint.to_string();
+    }
+    // Split `scheme://host[:port][/path]` into (scheme://, rest). Only the
+    // authority's host is rewritten; the port and any path ride along in `rest`.
+    let Some((scheme, rest)) = endpoint.split_once("://") else {
+        return endpoint.to_string();
+    };
+    // Authority ends at the first '/' (path) — keep the remainder verbatim.
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, ""),
+    };
+    // Strip the port from the authority's host. IPv6 hosts are bracketed
+    // (`[::1]:80`); split on the LAST colon only when it's outside brackets.
+    let (host, port) = if let Some(stripped) = authority.strip_prefix('[') {
+        // `[host]:port` or `[host]`
+        match stripped.split_once(']') {
+            Some((h, after)) => (h, after.strip_prefix(':').map(|p| format!(":{p}"))),
+            None => (authority, None),
+        }
+    } else {
+        match authority.rsplit_once(':') {
+            Some((h, p)) => (h, Some(format!(":{p}"))),
+            None => (authority, None),
+        }
+    };
+    let is_loopback = matches!(host, "127.0.0.1" | "localhost" | "0.0.0.0" | "::1");
+    if !is_loopback {
+        return endpoint.to_string();
+    }
+    let port = port.unwrap_or_default();
+    format!("{scheme}://{primary_ip}{port}{path}")
+}
+
 /// Sort raw query rows by their `primary_ip` column in numeric-octet order
 /// (the per-computer-table convention), so a `JOIN computers` listing reads in
 /// subnet order rather than lexically by name. Callers keep `ORDER BY c.name …`
@@ -306,7 +352,48 @@ pub fn detect_os_family() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::ip_sort_key;
+    use super::{ip_sort_key, reachable_endpoint};
+
+    #[test]
+    fn reachable_endpoint_rewrites_loopback_host_keeping_port_and_path() {
+        let ip = "192.168.5.108";
+        assert_eq!(
+            reachable_endpoint("http://127.0.0.1:55000", ip),
+            "http://192.168.5.108:55000"
+        );
+        assert_eq!(
+            reachable_endpoint("http://localhost:55003/v1", ip),
+            "http://192.168.5.108:55003/v1"
+        );
+        assert_eq!(
+            reachable_endpoint("http://0.0.0.0:8080", ip),
+            "http://192.168.5.108:8080"
+        );
+        // IPv6 loopback authority is bracketed: only the host is swapped.
+        assert_eq!(
+            reachable_endpoint("http://[::1]:55000/x", ip),
+            "http://192.168.5.108:55000/x"
+        );
+    }
+
+    #[test]
+    fn reachable_endpoint_leaves_non_loopback_and_unknown_ip_untouched() {
+        // A host that is already a real address must not be rewritten.
+        assert_eq!(
+            reachable_endpoint("http://10.0.0.5:55000", "192.168.5.108"),
+            "http://10.0.0.5:55000"
+        );
+        // No known primary_ip → never fabricate a host, return verbatim.
+        assert_eq!(
+            reachable_endpoint("http://127.0.0.1:55000", ""),
+            "http://127.0.0.1:55000"
+        );
+        // Garbage without a scheme is passed through unchanged.
+        assert_eq!(
+            reachable_endpoint("not-a-url", "192.168.5.108"),
+            "not-a-url"
+        );
+    }
 
     #[test]
     fn sorts_numerically_by_octet_not_lexically() {
