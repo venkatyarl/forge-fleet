@@ -837,6 +837,13 @@ enum TasksCommand {
         /// Pin to a specific computer name. If absent, any eligible worker may claim.
         #[arg(long)]
         preferred: Option<String>,
+        /// Computer names that must NOT claim this task, comma-separated
+        /// (e.g. "sia,adele,rihanna,beyonce" to keep work off the DGX pairs,
+        /// or "taylor" to spare the leader). Sets fleet_tasks.excludes_computer_ids;
+        /// the claim query refuses any worker whose computer_id is listed.
+        /// Unknown names are warned about and skipped, never silently dropped.
+        #[arg(long, default_value = "")]
+        exclude: String,
         /// Higher = picked first. Default 50.
         #[arg(long, default_value_t = 50)]
         priority: i32,
@@ -3595,6 +3602,7 @@ async fn main() -> Result<()> {
                     command,
                     capability,
                     preferred,
+                    exclude,
                     priority,
                     timeout,
                 } => {
@@ -3612,6 +3620,33 @@ async fn main() -> Result<()> {
                             .await
                             .ok()
                             .flatten();
+                    // Resolve --exclude names → computer_ids. Unknown names are
+                    // surfaced as a warning and skipped (no silent drop), so a
+                    // typo can't quietly fail to exclude the host you meant.
+                    let exclude_names: Vec<String> = exclude
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(String::from)
+                        .collect();
+                    let mut exclude_ids: Vec<uuid::Uuid> = Vec::new();
+                    for name in &exclude_names {
+                        match sqlx::query_scalar::<_, uuid::Uuid>(
+                            "SELECT id FROM computers WHERE name = $1",
+                        )
+                        .bind(name)
+                        .fetch_optional(&pool)
+                        .await
+                        {
+                            Ok(Some(id)) => exclude_ids.push(id),
+                            Ok(None) => eprintln!(
+                                "{YELLOW}warning:{RESET} --exclude '{name}' matches no computer; skipping"
+                            ),
+                            Err(e) => eprintln!(
+                                "{YELLOW}warning:{RESET} resolving --exclude '{name}': {e}; skipping"
+                            ),
+                        }
+                    }
                     // Use the _full enqueue so `--timeout` can set
                     // fleet_tasks.timeout_secs (V81), which the worker honors
                     // over its ~600s default — needed for agent/research tasks.
@@ -3625,7 +3660,7 @@ async fn main() -> Result<()> {
                         priority,
                         my_id,
                         false,
-                        &[],
+                        &exclude_ids,
                         timeout,
                         None,
                     )
