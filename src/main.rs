@@ -2975,6 +2975,26 @@ async fn start_pulse_v2_subsystems(
     );
     handles.push(auto_upgrade_tick.spawn(shutdown_rx.clone()));
 
+    // (8b) Portfolio + drift maintenance ticks — model-upstream (24h),
+    // model-scout (168h), external-tools upstream (6h), coverage gap detection
+    // (15min, read-only), and the stuck agent-slot reaper (10min). Each is
+    // leader-gated (re-checked per tick). These ran ONLY in the legacy
+    // `ff daemon` before, so in production new models were never discovered and
+    // model/tool drift was never detected. `software_upstream` is intentionally
+    // excluded (AutoUpgradeTick already refreshes software_registry.latest_version
+    // inline). See ff_agent::portfolio_maintenance for the full rationale.
+    info!(
+        node = %worker_name.clone(),
+        "starting subsystem: portfolio + drift maintenance (leader-gated)"
+    );
+    handles.extend(
+        ff_agent::portfolio_maintenance::spawn_portfolio_maintenance(
+            pg_pool.clone(),
+            worker_name.clone(),
+            shutdown_rx.clone(),
+        ),
+    );
+
     // (9) fleet_tasks worker — every daemon polls fleet_tasks for shell
     // payloads whose `requires_capability` ⊆ this computer's set, claims
     // via SKIP LOCKED, and runs them. Cooperative work-stealing across
