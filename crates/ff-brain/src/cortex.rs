@@ -1013,12 +1013,36 @@ async fn extract_files(
     // and an incremental run (a changed file's facade call resolves even when the
     // owning lib.rs/mod.rs wasn't touched). Crate roots come from every known
     // internal fn (internal_fns is seeded whole-corpus on incremental too).
-    let (reexports, glob_reexports) = load_reexports(pool, corpus_slug).await?;
+    let (mut reexports, mut glob_reexports) = load_reexports(pool, corpus_slug).await?;
     let crate_roots: HashSet<String> = internal_fns
         .iter()
         .filter_map(|f| f.split("::").next())
         .map(|s| s.to_string())
         .collect();
+    // Recover re-export targets that `abs_reexport_target` mis-prefixed at parse
+    // time. A cross-crate `pub use other_crate::path::item;` (or `::*;`) in module
+    // `M` is stored as `M::other_crate::path::item` because the per-file parser
+    // can't tell a workspace-crate head from a child submodule without the
+    // whole-corpus crate set — which only exists HERE. Re-anchor any target that
+    // carries a crate root in a non-head position back to the absolute crate path
+    // (`ff_gateway::llm_routing::ff_core::model_id::normalize_model_id` ->
+    // `ff_core::model_id::normalize_model_id`). No-op for correctly-stored rows: a
+    // genuine cross-crate target already has its crate at position 0, and a pure
+    // submodule re-export (`ff_db::leader_state`) carries no inner crate root.
+    // Recall-neutral — same primitive lever #4 uses; a bad anchor just fails the
+    // internal-fn check in `chase_reexport` and never fabricates an edge.
+    for target in reexports.values_mut() {
+        if let Some(anchored) = anchor_at_crate_root(target, &crate_roots) {
+            *target = anchored;
+        }
+    }
+    for targets in glob_reexports.values_mut() {
+        for target in targets.iter_mut() {
+            if let Some(anchored) = anchor_at_crate_root(target, &crate_roots) {
+                *target = anchored;
+            }
+        }
+    }
     // Every internal module path — a symbol's owning module plus all its
     // ancestors — for the external-head redirect (lever #4 denoise). It tells a
     // genuine child module of the caller (whose fabricated relative path is
@@ -6548,6 +6572,40 @@ diff --git a/src/b.rs b/src/b.rs
         assert_eq!(anchor_at_crate_root("ff_db::run_migrations", &roots), None);
         // no crate root anywhere -> None.
         assert_eq!(anchor_at_crate_root("some::ext::thing", &roots), None);
+    }
+
+    #[test]
+    fn reexport_target_recovers_cross_crate_misprefix() {
+        // The load-time recovery (anchor_at_crate_root over every re-export target)
+        // unbreaks a cross-crate `pub use` the per-file parser mis-prefixed.
+        let roots: HashSet<String> = [
+            "ff_core".to_string(),
+            "ff_db".to_string(),
+            "ff_gateway".to_string(),
+        ]
+        .into();
+        // `pub(crate) use ff_core::model_id::normalize_model_id;` in
+        // `ff_gateway::llm_routing` is stored as a submodule path; recover it.
+        assert_eq!(
+            anchor_at_crate_root(
+                "ff_gateway::llm_routing::ff_core::model_id::normalize_model_id",
+                &roots,
+            ),
+            Some("ff_core::model_id::normalize_model_id".to_string())
+        );
+        // glob form `pub use ff_core::model_id::*;` -> the target MODULE recovers.
+        assert_eq!(
+            anchor_at_crate_root("ff_gateway::llm_routing::ff_core::model_id", &roots),
+            Some("ff_core::model_id".to_string())
+        );
+        // a GENUINE submodule re-export (`pub use leader_state::*;` in ff_db) has no
+        // inner crate root -> left untouched, so `ff_db::leader_state` survives.
+        assert_eq!(anchor_at_crate_root("ff_db::leader_state", &roots), None);
+        // a correctly-stored cross-crate target (crate at head) is already absolute.
+        assert_eq!(
+            anchor_at_crate_root("ff_core::model_id::normalize_model_id", &roots),
+            None
+        );
     }
 
     #[test]
