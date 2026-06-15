@@ -1019,6 +1019,28 @@ async fn extract_files(
         .filter_map(|f| f.split("::").next())
         .map(|s| s.to_string())
         .collect();
+    // Every internal module path — a symbol's owning module plus all its
+    // ancestors — for the external-head redirect (lever #4 denoise). It tells a
+    // genuine child module of the caller (whose fabricated relative path is
+    // CORRECT) apart from a bare 3rd-party crate / std primitive head the
+    // resolver caller-prefixed onto the wrong module. Whole-corpus, same as the
+    // other redirect maps (internal_fns/internal_types are seeded whole-corpus on
+    // incremental too). For a symbol `a::b::c::leaf` this inserts `a`, `a::b`,
+    // `a::b::c`.
+    let mut internal_modules: HashSet<String> = HashSet::new();
+    for qn in internal_fns.iter().chain(internal_types.iter()) {
+        let Some((module, _leaf)) = qn.rsplit_once("::") else {
+            continue;
+        };
+        let mut acc = String::new();
+        for seg in module.split("::") {
+            if !acc.is_empty() {
+                acc.push_str("::");
+            }
+            acc.push_str(seg);
+            internal_modules.insert(acc.clone());
+        }
+    }
     // Per-crate leaf index for the crate-root single-candidate redirect (lever
     // #7): `(crate, leaf)` -> every internal fn in that crate with that leaf, so
     // a missed sibling-module call `<crate>::<leaf>` can redirect when exactly one
@@ -1141,6 +1163,28 @@ async fn extract_files(
             // — after facade, since a modeled re-export is the more specific match.
             if p.parse.lang == Lang::Rust && !internal_fns.contains(&resolved) {
                 if let Some(t) = resolve_crate_root_call(&resolved, &crate_roots, &crate_leaf_fns) {
+                    resolved = t;
+                }
+            }
+
+            // External-crate / std-primitive head redirect (lever #4 denoise):
+            // a bare 3rd-party crate or primitive in associated-call position
+            // (`hex::decode`, `jsonwebtoken::decode`, `f64::deserialize`) that
+            // isn't in the alias map / crate-name / hand-kept `looks_external`
+            // denylist gets caller-prefixed by `resolve_call_inner` into
+            // `<caller_module>::<head>::<leaf>` — an internally-rooted phantom
+            // whose leaf collides with real fns and pollutes `ff cortex doctor`.
+            // Collapse it back to the already-qualified `<head>::<leaf>` extern
+            // (one shared node, not a per-caller-module phantom) when the head
+            // isn't a real child module of the caller. Runs LAST — after
+            // facade/crate-root, which try to find an INTERNAL target; this
+            // handles the residual genuinely-external heads. Recall-neutral: it
+            // fires only on a current extern and never rewrites an internally-
+            // resolved edge (the leaf collision is removed, not re-pointed).
+            if p.parse.lang == Lang::Rust && !internal_fns.contains(&resolved) {
+                if let Some(t) =
+                    resolve_external_head_call(&resolved, &caller_qn, &internal_modules)
+                {
                     resolved = t;
                 }
             }
@@ -4789,6 +4833,50 @@ fn resolve_crate_root_call(
     }
 }
 
+/// External-crate / std-primitive head redirect (lever #4 denoise). A bare
+/// 3rd-party crate or std primitive used in associated-call position
+/// (`hex::decode`, `jsonwebtoken::decode`, `f64::deserialize`) has a lowercase
+/// head that isn't in the alias map, the caller's crate name, or the hand-kept
+/// `looks_external` / std-prelude denylists, so `resolve_call_inner`'s fallback
+/// fabricates `<caller_module>::<head>::<leaf>` — an internally-rooted extern
+/// whose leaf then collides with real internal fns (`decode`, `deserialize`,
+/// `from_path`) and pollutes the `ff cortex doctor` suspicious-extern list. When
+/// the fabricated head is NOT a real child module of the caller (no internal
+/// symbol lives under `<caller_module>::<head>`), strip the caller prefix back to
+/// the already-qualified `<head>::<leaf>`: a single shared extern instead of a
+/// per-caller-module phantom (the same idea as Java's `java_prelude_package`,
+/// generalized off the corpus's own module set instead of a hand-maintained
+/// crate list — so it doesn't need every 3rd-party crate enumerated).
+///
+/// Recall-neutral and never fabricates: it fires only on a CURRENT extern (the
+/// caller guards `!internal_fns.contains`), and the child-module guard means a
+/// genuine relative call (`<caller_module>::submod::foo`, where `submod` owns
+/// internal symbols) is left untouched — only heads with no internal module
+/// under them are collapsed. Uppercase heads (`Type::method`, `Trait::assoc`)
+/// are owned by the std-prelude-type / impl-method / Self levers and skipped.
+fn resolve_external_head_call(
+    resolved: &str,
+    caller_qn: &str,
+    internal_modules: &HashSet<String>,
+) -> Option<String> {
+    // The caller's own module = caller_qn minus its leaf.
+    let caller_module = caller_qn.rsplit_once("::").map(|(m, _)| m)?;
+    let tail = resolved.strip_prefix(&format!("{caller_module}::"))?;
+    // Must be the `<head>::<rest>` fabrication shape (an inner `::`), not a bare
+    // leaf the caller-module default produced for an imported free fn.
+    let (head, _rest) = tail.split_once("::")?;
+    // Uppercase heads are types/traits — handled by the dedicated levers.
+    if head.chars().next().is_some_and(|c| c.is_uppercase()) {
+        return None;
+    }
+    // A real child module of the caller owns internal symbols under it — the
+    // fabricated relative path was CORRECT, so leave it alone.
+    if internal_modules.contains(&format!("{caller_module}::{head}")) {
+        return None;
+    }
+    Some(tail.to_string())
+}
+
 /// Facade redirect (levers #3 + #4). Two failure modes leave a real internal
 /// call resolved to a `code:extern`:
 ///
@@ -5851,6 +5939,94 @@ diff --git a/src/b.rs b/src/b.rs
         // Head isn't one of our crate roots → a genuine extern, untouched.
         assert_eq!(
             resolve_crate_root_call("libc::kill", &roots, &leaf_fns),
+            None
+        );
+    }
+
+    #[test]
+    fn external_head_call_collapses_3rd_party_and_primitive_phantoms() {
+        // A real child module of the caller owns symbols under it.
+        let mods: HashSet<String> = [
+            "ff_gateway".to_string(),
+            "ff_gateway::middleware".to_string(),
+            "ff_gateway::server".to_string(),
+            "ff_orchestrator::scheduler".to_string(),
+            // `ff_db::migrations` is a genuine child module (owns symbols).
+            "ff_db".to_string(),
+            "ff_db::migrations".to_string(),
+        ]
+        .into();
+
+        // 3rd-party crate head `jsonwebtoken` fabricated onto the caller module →
+        // collapse to the shared `jsonwebtoken::decode` extern.
+        assert_eq!(
+            resolve_external_head_call(
+                "ff_gateway::middleware::jsonwebtoken::decode",
+                "ff_gateway::middleware::auth",
+                &mods,
+            ),
+            Some("jsonwebtoken::decode".to_string())
+        );
+        // Same crate-head from a DIFFERENT caller module collapses to the SAME
+        // extern (fan-in consolidation, not a per-module phantom).
+        assert_eq!(
+            resolve_external_head_call(
+                "ff_gateway::server::hex::decode",
+                "ff_gateway::server::handler",
+                &mods,
+            ),
+            Some("hex::decode".to_string())
+        );
+        // Std primitive head `f64` in associated-call position.
+        assert_eq!(
+            resolve_external_head_call(
+                "ff_orchestrator::scheduler::f64::deserialize",
+                "ff_orchestrator::scheduler::parse",
+                &mods,
+            ),
+            Some("f64::deserialize".to_string())
+        );
+    }
+
+    #[test]
+    fn external_head_call_preserves_real_child_modules_and_types() {
+        let mods: HashSet<String> = [
+            "ff_db".to_string(),
+            "ff_db::migrations".to_string(),
+            "ff_gateway".to_string(),
+            "ff_gateway::middleware".to_string(),
+        ]
+        .into();
+
+        // `migrations` IS a real child module of ff_db → the relative path was
+        // correct; do NOT strip it (would mis-name the extern / lose context).
+        assert_eq!(
+            resolve_external_head_call("ff_db::migrations::run_migrations", "ff_db::boot", &mods,),
+            None
+        );
+        // Uppercase head (`Type::method`) is owned by the std-prelude-type /
+        // impl-method levers — never touched here.
+        assert_eq!(
+            resolve_external_head_call(
+                "ff_gateway::middleware::Foo::bar",
+                "ff_gateway::middleware::auth",
+                &mods,
+            ),
+            None
+        );
+        // Bare leaf (no inner `::`) is an imported free fn, not the head
+        // fabrication shape — left alone.
+        assert_eq!(
+            resolve_external_head_call(
+                "ff_gateway::middleware::helper",
+                "ff_gateway::middleware::auth",
+                &mods
+            ),
+            None
+        );
+        // Caller at crate root with no module segment → no caller prefix to strip.
+        assert_eq!(
+            resolve_external_head_call("hex::decode", "hex", &mods),
             None
         );
     }
