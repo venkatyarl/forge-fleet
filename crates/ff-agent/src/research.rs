@@ -475,6 +475,194 @@ impl ResearchSession {
         })
     }
 
+    /// Re-synthesize a research report from already-persisted sub-agent
+    /// outputs — recovery for a run that died after its sub-agents finished.
+    ///
+    /// The live [`run`](Self::run) flow persists every sub-agent's output to
+    /// `research_subtasks` (Phase 4) BEFORE the synthesizer turn (Phase 5).
+    /// The orchestrator + synthesizer live in ONE foreground CLI process (they
+    /// are NOT daemon-managed), so killing/crashing the CLI mid-run loses the
+    /// synthesis even though the EXPENSIVE sub-agent work already landed in
+    /// Postgres; the job sweeper (#330) then reaps the orphaned session to
+    /// `failed`. This recovers that work: reload the stored plan + the
+    /// per-subtask outputs and run ONLY the synthesizer turn — no sub-agents
+    /// are re-dispatched — then write the report and flip the session to
+    /// `done`.
+    ///
+    /// Idempotent: safe to re-run on an already-`done` session (re-synthesizes
+    /// from the same inputs). Bails with a clear message when the session never
+    /// got past planning (no `planner_output`) or produced zero usable
+    /// sub-agent outputs, since there is nothing to synthesize in those cases.
+    pub async fn recover(pool: PgPool, session_id: Uuid) -> Result<ResearchReport> {
+        let start = Instant::now();
+
+        // 1. Load the session: query + planner config + stored plan + gateway.
+        let srow = sqlx::query(
+            "SELECT query, planner_model, planner_output, metadata
+               FROM research_sessions WHERE id = $1",
+        )
+        .bind(session_id)
+        .fetch_optional(&pool)
+        .await
+        .context("load research_session")?
+        .ok_or_else(|| anyhow::anyhow!("no research_session with id {session_id}"))?;
+
+        let query: String = srow.get("query");
+        let planner_model: Option<String> = srow.try_get("planner_model").unwrap_or(None);
+        let planner_output: Option<Value> = srow.try_get("planner_output").unwrap_or(None);
+        let metadata: Value = srow.try_get("metadata").unwrap_or(Value::Null);
+
+        let Some(plan_json) = planner_output else {
+            anyhow::bail!(
+                "session {session_id} has no planner_output — it never got past \
+                 planning; nothing to synthesize"
+            );
+        };
+        let plan: PlanDecomposition =
+            serde_json::from_value(plan_json).context("parse stored planner_output")?;
+
+        // Rebuild the config from what was persisted; fall back to live
+        // resolution for anything the row didn't carry (older rows, NULLs).
+        let gateway_from_meta = metadata
+            .get("gateway_url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let mut config = ResearchConfig {
+            query: query.clone(),
+            gateway_url: gateway_from_meta,
+            planner_model: planner_model.unwrap_or_default(),
+            ..Default::default()
+        };
+        if config.gateway_url.is_empty() {
+            config.gateway_url = resolve_gateway_url(&pool).await;
+        }
+        if config.planner_model.is_empty() {
+            config.planner_model = resolve_default_research_model(&pool, "chain-of-thought").await;
+        }
+
+        // 2. Load the persisted sub-task outputs in order.
+        let subrows = sqlx::query(
+            "SELECT id, ordinal, sub_question, assigned_computer,
+                    assigned_endpoint, assigned_model, status, output_markdown
+               FROM research_subtasks
+              WHERE session_id = $1
+              ORDER BY ordinal",
+        )
+        .bind(session_id)
+        .fetch_all(&pool)
+        .await
+        .context("load research_subtasks")?;
+        if subrows.is_empty() {
+            anyhow::bail!("session {session_id} has no sub-tasks — nothing to synthesize");
+        }
+
+        // 3. Reconstruct the SubtaskRow + AgentTaskResult shapes the synthesizer
+        //    consumes, inverting store_subtask_result's status mapping.
+        let mut subtask_rows: Vec<SubtaskRow> = Vec::with_capacity(subrows.len());
+        let mut results: Vec<AgentTaskResult> = Vec::with_capacity(subrows.len());
+        let mut succeeded = 0usize;
+        let mut failed = 0usize;
+        let mut usable_outputs = 0usize;
+        for r in &subrows {
+            let id: Uuid = r.get("id");
+            let ordinal: i32 = r.get("ordinal");
+            let sub_question: String = r.get("sub_question");
+            let assigned_computer: Option<String> = r.try_get("assigned_computer").unwrap_or(None);
+            let assigned_endpoint: Option<String> = r.try_get("assigned_endpoint").unwrap_or(None);
+            let assigned_model: Option<String> = r.try_get("assigned_model").unwrap_or(None);
+            let status_str: String = r.get("status");
+            let output: String = r
+                .try_get::<Option<String>, _>("output_markdown")
+                .unwrap_or(None)
+                .unwrap_or_default();
+
+            let status = subtask_status_from_db(&status_str);
+            if !output.trim().is_empty() {
+                usable_outputs += 1;
+            }
+            if matches!(status, TaskStatus::Completed | TaskStatus::MaxTurns) {
+                succeeded += 1;
+            } else {
+                failed += 1;
+            }
+
+            subtask_rows.push(SubtaskRow {
+                id,
+                ordinal: ordinal as u32,
+                sub_question,
+                assigned_computer: assigned_computer.unwrap_or_else(|| "-".into()),
+                _assigned_endpoint: assigned_endpoint.unwrap_or_default(),
+                assigned_model: assigned_model.unwrap_or_else(|| "-".into()),
+            });
+            results.push(AgentTaskResult {
+                task_id: id.to_string(),
+                status,
+                output,
+                events: Vec::new(),
+                duration_ms: 0,
+                turn_count: 1,
+            });
+        }
+        if usable_outputs == 0 {
+            anyhow::bail!(
+                "session {session_id}: all {} sub-task(s) have empty output — \
+                 nothing to synthesize (re-run the query instead)",
+                subrows.len()
+            );
+        }
+
+        // 4. Synthesize ONLY — no sub-agents re-dispatched.
+        let session = ResearchSession {
+            pool,
+            config,
+            session_id,
+        };
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .expect("build reqwest client");
+        let markdown = session
+            .synthesize(&plan, &subtask_rows, &results, &client)
+            .await
+            .context("recover: synthesizer phase")?;
+        let duration_ms = start.elapsed().as_millis() as u64;
+
+        // 5. Persist the recovered report. Mirror run()'s done/failed rule:
+        //    'failed' only when every sub-task failed. Preserve the original
+        //    duration_ms (the recovery synth time is not the run time) and
+        //    clear any reaper error now that we have a real report.
+        sqlx::query(
+            "UPDATE research_sessions
+                SET status          = CASE WHEN $3 > 0 AND $4 = 0 THEN 'failed' ELSE 'done' END,
+                    report_markdown = $1,
+                    completed_at    = NOW(),
+                    duration_ms     = COALESCE(duration_ms, $2),
+                    error           = NULL
+              WHERE id = $5",
+        )
+        .bind(&markdown)
+        .bind(duration_ms as i64)
+        .bind(failed as i64)
+        .bind(succeeded as i64)
+        .bind(session.session_id)
+        .execute(&session.pool)
+        .await
+        .context("recover: mark session done")?;
+
+        Ok(ResearchReport {
+            session_id: session.session_id,
+            query,
+            markdown,
+            subtask_count: subtask_rows.len(),
+            subtasks_succeeded: succeeded,
+            subtasks_failed: failed,
+            duration_ms,
+            total_tokens_in: 0,
+            total_tokens_out: 0,
+        })
+    }
+
     // ─── Planner turn ────────────────────────────────────────────────────
 
     async fn plan(&self, client: &reqwest::Client) -> Result<PlanDecomposition> {
@@ -932,6 +1120,47 @@ mod think_strip_tests {
     }
 }
 
+#[cfg(test)]
+mod recover_status_tests {
+    use super::subtask_status_from_db;
+    use crate::multi_agent::TaskStatus;
+
+    #[test]
+    fn maps_terminal_statuses_back_from_db() {
+        // Must invert store_subtask_result's TaskStatus -> &str mapping so a
+        // recovered run scores its sub-tasks the same way the live run did.
+        assert!(matches!(
+            subtask_status_from_db("done"),
+            TaskStatus::Completed
+        ));
+        assert!(matches!(
+            subtask_status_from_db("max_turns"),
+            TaskStatus::MaxTurns
+        ));
+        assert!(matches!(
+            subtask_status_from_db("cancelled"),
+            TaskStatus::Cancelled
+        ));
+        assert!(matches!(
+            subtask_status_from_db("failed"),
+            TaskStatus::Failed
+        ));
+    }
+
+    #[test]
+    fn non_terminal_or_unknown_collapses_to_failed() {
+        // A sub-task the reaper left mid-flight (or any future status string)
+        // has no trustworthy output — treat it as failed, never as success,
+        // so it can't inflate the done/failed rollup on recovery.
+        for s in ["running", "pending", "dispatching", "", "weird"] {
+            assert!(
+                matches!(subtask_status_from_db(s), TaskStatus::Failed),
+                "status {s:?} should map to Failed"
+            );
+        }
+    }
+}
+
 // ─── Progress events for callers ────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -960,6 +1189,21 @@ struct SubtaskRow {
     assigned_computer: String,
     _assigned_endpoint: String,
     assigned_model: String,
+}
+
+/// Inverse of [`ResearchSession::store_subtask_result`]'s status mapping:
+/// turn a persisted `research_subtasks.status` string back into a
+/// [`TaskStatus`] so `recover` can re-feed the synthesizer. Any non-terminal
+/// or unknown status (`running`, `pending`, …) collapses to `Failed` — a
+/// subtask that never reached a terminal state has no trustworthy output, and
+/// `Failed` is exactly how the synthesizer flags "didn't run" output.
+fn subtask_status_from_db(s: &str) -> TaskStatus {
+    match s {
+        "done" => TaskStatus::Completed,
+        "max_turns" => TaskStatus::MaxTurns,
+        "cancelled" => TaskStatus::Cancelled,
+        _ => TaskStatus::Failed,
+    }
 }
 
 async fn update_session_status(pool: &PgPool, session_id: Uuid, status: &str) -> Result<()> {
