@@ -111,9 +111,14 @@
    **Live after full reindex:** forge-fleet internal-resolved 7804 = **4428
    extracted + 3376 inferred** — 43% of internal resolutions come from heuristic
    redirects, exactly the edges a high-precision consumer wants to filter
-   (`confidence >= 1.0`). **Follow-up:** thread a `--min-confidence` filter into
-   `ff cortex callers`/`impact` and the `cortex_*` MCP tools so agents can request
-   high-trust-only traversal (data layer is now in place; consumer-filter slice).
+   (`confidence >= 1.0`). ✅ **Follow-up shipped:** `--min-confidence` is threaded
+   end-to-end — `ff_brain::cortex::{callers,callees,impact,tests_for}` take a
+   `min_confidence: f32` (clamped, `e.confidence >= $n` in the traversal SQL); the
+   `ff cortex callers/callees/impact/tests` CLI expose `--min-confidence`; and all
+   four `cortex_*` MCP tools advertise + extract the `min_confidence` param
+   (`min_confidence_param`, default `0.0` = keep every edge, `1.0` = EXTRACTED-only).
+   Agents can now request high-trust-only traversal. Verified live: `ff cortex
+   callers handle_ports --min-confidence 1.0` returns the EXTRACTED caller.
 
 ## Recall (internal call-resolution) — gaps surfaced by `ff cortex doctor`
 
