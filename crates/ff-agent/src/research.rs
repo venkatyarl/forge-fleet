@@ -322,6 +322,12 @@ impl ResearchSession {
 
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
+            // DuckDuckGo's HTML endpoint 202-blocks the default reqwest UA
+            // (no User-Agent header), returning an empty bot page — which
+            // silently disabled web grounding. A non-curl UA gets 200 + real
+            // results. Matches WebSearchTool's client. This same client also
+            // makes the LLM gateway calls; a UA header is harmless there.
+            .user_agent("ForgeFleet-Agent/0.1")
             .build()
             .expect("build reqwest client");
 
@@ -377,9 +383,15 @@ impl ResearchSession {
                     // sub-agent's search runs concurrently with the others (one
                     // per spawned task). Falls back to ungrounded on failure.
                     let prompt = if web_grounding {
-                        match crate::tools::web_search::fetch_web_context(&client, &sub_question, 8)
-                            .await
-                        {
+                        let ctx =
+                            crate::tools::web_search::fetch_web_context(&client, &sub_question, 8)
+                                .await;
+                        info!(
+                            sub = i,
+                            grounded = ctx.is_some(),
+                            "research sub-agent web grounding"
+                        );
+                        match ctx {
                             Some(ctx) => format!(
                                 "{base_prompt}\n\n\
                                  ── Live web search results for your sub-question \
