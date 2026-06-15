@@ -937,6 +937,11 @@ impl ResearchSession {
             min_ctx: None,
             exclude_hosts: self.config.exclude_hosts.clone(),
             max_health_age_sec: Some(ff_db::queries::DISPATCH_HEALTH_MAX_AGE_SEC),
+            // Among equal-tier hosts, order least-loaded first so the distinct-
+            // computer round-robin below picks the idlest boxes first (and the
+            // cycle phase, when fan-out > distinct hosts, doubles up on the
+            // least-busy rather than whichever last heartbeated).
+            prefer_least_loaded: true,
             // Generous cap: we want every healthy deployment so the round-robin
             // can spread across as many distinct computers as the fleet has.
             limit: 256,

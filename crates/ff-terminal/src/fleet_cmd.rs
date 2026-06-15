@@ -2735,6 +2735,7 @@ pub async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
             tool_calling,
             min_ctx,
             exclude_host,
+            least_loaded,
             limit,
             format,
         } => {
@@ -2744,6 +2745,7 @@ pub async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
                 tool_calling,
                 min_ctx,
                 exclude_host,
+                least_loaded,
                 limit,
                 &format,
             )
@@ -3033,6 +3035,7 @@ async fn handle_fleet_route(
     tool_calling: bool,
     min_ctx: Option<i32>,
     exclude_host: Vec<String>,
+    least_loaded: bool,
     limit: i64,
     format: &str,
 ) -> Result<()> {
@@ -3047,6 +3050,8 @@ async fn handle_fleet_route(
         // `ff fleet route` is an observability view: show whatever is marked
         // healthy. The freshness floor is applied only on live dispatch.
         max_health_age_sec: None,
+        // Opt-in via `--least-loaded` to preview the dispatch ordering.
+        prefer_least_loaded: least_loaded,
         limit,
     };
     let rows = ff_db::pg_route_deployments(pool, &filter)
@@ -3064,6 +3069,9 @@ async fn handle_fleet_route(
     }
     if !exclude_host.is_empty() {
         constraints.push(format!("excluding {exclude_host:?}"));
+    }
+    if least_loaded {
+        constraints.push("least-loaded-first".to_string());
     }
 
     if rows.is_empty() {
