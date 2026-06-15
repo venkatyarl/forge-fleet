@@ -6241,6 +6241,43 @@ async fn cli_interaction_pool() -> Option<sqlx::PgPool> {
         .ok()
 }
 
+/// Decide what a non-JSON `ff run` writes to **stdout** and its process exit
+/// code, given the agent's terminal outcome.
+///
+/// Contract (so a piped `ff run > file` is reliable for automation):
+///   - stdout carries ONLY the authoritative final answer, printed exactly
+///     once. Streamed `AssistantText` previews go to stderr, so stdout is never
+///     double-written and is clean to capture.
+///   - A non-empty result is always emitted to stdout when one exists — even
+///     when the loop stops at max-turns (partial answer) — instead of the old
+///     behaviour where only `EndTurn` printed and `MaxTurns`/`Error` left an
+///     empty file.
+///   - The exit code reflects success: `Error`/`Cancelled` exit non-zero so a
+///     caller's `$?` check detects failure (the old path returned Ok → exit 0
+///     for every outcome). `MaxTurns` exits 0 — it produced a (partial) result;
+///     the caller is warned on stderr.
+///
+/// Returns `(stdout_text, exit_code)`; stderr notes are emitted by the caller.
+fn headless_text_result(outcome: &ff_agent::agent_loop::AgentOutcome) -> (Option<String>, i32) {
+    use ff_agent::agent_loop::AgentOutcome;
+    match outcome {
+        AgentOutcome::EndTurn { final_message } => (non_empty(final_message), 0),
+        AgentOutcome::MaxTurns { partial_message } => (non_empty(partial_message), 0),
+        AgentOutcome::Error(_) => (None, 1),
+        AgentOutcome::Cancelled => (None, 1),
+    }
+}
+
+/// `Some(s.to_string())` when `s` is non-empty, else `None`. Content is copied
+/// verbatim (no trimming) so the printed answer is byte-identical to the model's.
+fn non_empty(s: &str) -> Option<String> {
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.to_string())
+    }
+}
+
 async fn run_headless(
     prompt: &str,
     config: AgentSessionConfig,
@@ -6332,7 +6369,11 @@ async fn run_headless(
                     }
                 }
                 AgentEvent::AssistantText { text, .. } => {
-                    print!("{text}");
+                    // Streamed assistant text is a progress preview → stderr
+                    // (dim). stdout is reserved for the single authoritative
+                    // final answer (printed once at the end), so a piped
+                    // `ff run > file` captures a clean, un-doubled result.
+                    eprint!("\x1b[2m{text}\x1b[0m");
                 }
                 AgentEvent::Compaction {
                     messages_before,
@@ -6401,10 +6442,32 @@ async fn run_headless(
             ff_agent::agent_loop::AgentOutcome::Cancelled => serde_json::json!({"status":"cancelled"}),
         }, "events": events });
         println!("{}", serde_json::to_string_pretty(&result)?);
-    } else if let ff_agent::agent_loop::AgentOutcome::EndTurn { final_message } = &outcome
-        && !final_message.is_empty()
-    {
-        println!("{final_message}");
+    } else {
+        // Non-JSON: stdout carries ONLY the authoritative final answer (streamed
+        // AssistantText went to stderr), printed exactly once for every terminal
+        // outcome so a piped `ff run > file` always captures a result instead of
+        // an empty file. Exit code reflects success.
+        use std::io::Write as _;
+        let (stdout_text, exit_code) = headless_text_result(&outcome);
+        if let Some(text) = &stdout_text {
+            println!("{text}");
+        }
+        match &outcome {
+            ff_agent::agent_loop::AgentOutcome::MaxTurns { .. } => {
+                eprintln!("{YELLOW}⚠ stopped: max turns reached before completion{RESET}");
+            }
+            ff_agent::agent_loop::AgentOutcome::Error(e) => {
+                eprintln!("{RED}✗ agent error: {e}{RESET}");
+            }
+            ff_agent::agent_loop::AgentOutcome::Cancelled => {
+                eprintln!("{YELLOW}⚠ cancelled{RESET}");
+            }
+            ff_agent::agent_loop::AgentOutcome::EndTurn { .. } => {}
+        }
+        let _ = std::io::stdout().flush();
+        if exit_code != 0 {
+            std::process::exit(exit_code);
+        }
     }
     Ok(())
 }
@@ -6567,5 +6630,58 @@ mod cortex_format_tests {
     fn unknown_value_is_rejected() {
         assert!(CortexFormat::from_str("csv", true).is_err());
         assert!(CortexFormat::from_str("jsn", true).is_err());
+    }
+}
+
+#[cfg(test)]
+mod headless_result_tests {
+    use super::headless_text_result;
+    use ff_agent::agent_loop::AgentOutcome;
+
+    /// A completed run prints its final message and exits 0.
+    #[test]
+    fn end_turn_prints_and_succeeds() {
+        let (out, code) = headless_text_result(&AgentOutcome::EndTurn {
+            final_message: "the answer".to_string(),
+        });
+        assert_eq!(out.as_deref(), Some("the answer"));
+        assert_eq!(code, 0);
+    }
+
+    /// An empty final message yields nothing on stdout (degenerate model
+    /// output) but is still a success — no spurious blank line, exit 0.
+    #[test]
+    fn empty_end_turn_prints_nothing() {
+        let (out, code) = headless_text_result(&AgentOutcome::EndTurn {
+            final_message: String::new(),
+        });
+        assert_eq!(out, None);
+        assert_eq!(code, 0);
+    }
+
+    /// The regression this fix targets: a max-turns stop must still surface its
+    /// partial answer to stdout (old code left a piped file empty). Exit 0 —
+    /// it produced a result; the caller is warned on stderr.
+    #[test]
+    fn max_turns_prints_partial() {
+        let (out, code) = headless_text_result(&AgentOutcome::MaxTurns {
+            partial_message: "partial so far".to_string(),
+        });
+        assert_eq!(out.as_deref(), Some("partial so far"));
+        assert_eq!(code, 0);
+    }
+
+    /// Errors and cancellation exit non-zero so `$?` detects failure (the old
+    /// path returned Ok → exit 0 for every outcome). Nothing on stdout — the
+    /// detail is on stderr.
+    #[test]
+    fn error_and_cancel_exit_nonzero() {
+        let (out, code) = headless_text_result(&AgentOutcome::Error("boom".to_string()));
+        assert_eq!(out, None);
+        assert_eq!(code, 1);
+
+        let (out, code) = headless_text_result(&AgentOutcome::Cancelled);
+        assert_eq!(out, None);
+        assert_eq!(code, 1);
     }
 }
