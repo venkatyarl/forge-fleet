@@ -1033,7 +1033,9 @@ async fn run_agent_loop(
         // Check for tool calls — message itself is primary signal
         let mut tool_calls = openai_bridge::extract_tool_calls(&assistant_msg);
 
-        // Text-mode fallback parsing
+        // Text-mode fallback parsing: recover tool calls a (typically small,
+        // local) model emitted as plain text instead of the structured field.
+        let mut tool_calls_from_text = false;
         if tool_calls.is_empty()
             && let Some(text) = assistant_msg.text_content()
         {
@@ -1044,6 +1046,7 @@ async fn run_agent_loop(
                     "parsed tool calls from text fallback"
                 );
                 tool_calls = text_calls;
+                tool_calls_from_text = true;
             }
         }
 
@@ -1091,12 +1094,11 @@ async fn run_agent_loop(
         );
 
         // Emit text content before tool calls if present — but NOT if the
-        // text was actually a raw JSON tool call that we parsed via fallback
-        // (that would leak the JSON to the user as "assistant text").
+        // tool calls were parsed out of that very text (the content IS the
+        // tool-call payload; emitting it would leak JSON as "assistant text").
         if let Some(text) = assistant_msg.text_content() {
             let text = text.trim();
-            let is_raw_tool_json = text.starts_with('{') && text.contains("\"name\"");
-            if !text.is_empty() && !is_raw_tool_json {
+            if !text.is_empty() && !tool_calls_from_text {
                 emit(
                     &event_tx,
                     AgentEvent::AssistantText {
