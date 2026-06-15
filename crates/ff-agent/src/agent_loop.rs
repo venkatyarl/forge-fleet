@@ -1041,9 +1041,15 @@ async fn run_agent_loop(
         {
             let text_calls = openai_bridge::parse_text_tool_calls(text);
             if !text_calls.is_empty() {
-                debug!(
+                // Recovery fired — the model emitted tool calls as free-form
+                // text instead of the structured field. Log at info with the
+                // model so the residual rate is visible after server-side
+                // prevention (--jinja for tool-capable chat models): a model
+                // that still shows up here is not honouring its chat template.
+                info!(
+                    model = %session.config.model,
                     count = text_calls.len(),
-                    "parsed tool calls from text fallback"
+                    "recovered tool call(s) from malformed text output — model is not emitting structured tool_calls"
                 );
                 tool_calls = text_calls;
                 tool_calls_from_text = true;

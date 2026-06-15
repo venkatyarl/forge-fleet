@@ -79,6 +79,27 @@ fn serving_mode_from_workloads(workloads: &serde_json::Value) -> ServingMode {
     ServingMode::Chat
 }
 
+/// Extra llama-server flags for a chat-mode launch.
+///
+/// Tool-capable models get `--jinja`, which makes llama-server apply the GGUF's
+/// own chat template and parse tool calls into the structured `tool_calls`
+/// field instead of leaving them as free-form text the agent loop has to
+/// recover heuristically (`openai_bridge::parse_text_tool_calls`, #364).
+///
+/// Current fleet builds already default `--jinja` to enabled, so today this is
+/// mostly *pinning*: it makes tool-call parsing deterministic regardless of the
+/// per-build/per-version default (which upstream llama.cpp has flipped before)
+/// and is a real fix on any older binary that defaults it off. Idempotent where
+/// it's already on. Non-tool models get no extra flags — template substitution
+/// buys them nothing and a malformed embedded template could refuse to launch.
+fn llamacpp_chat_flags(tool_calling: bool) -> Vec<String> {
+    let mut flags = Vec::new();
+    if tool_calling {
+        flags.push("--jinja".to_string());
+    }
+    flags
+}
+
 /// Decide whether a load should use the agent-capable serving profile
 /// (`--parallel 1`, ctx >= [`AGENT_MIN_CTX`]). Capable **chat** models default
 /// to it so the endpoint is router/autoscaler-eligible (they require
@@ -296,6 +317,11 @@ pub async fn load_model(pool: &sqlx::PgPool, opts: LoadOptions) -> Result<LoadRe
                 ServingMode::Chat => {
                     args.push("--parallel".into());
                     args.push(parallel.to_string());
+                    // Pin --jinja for tool-capable models so structured
+                    // tool-call parsing doesn't depend on the llama.cpp build
+                    // default (see llamacpp_chat_flags). Additive: only future
+                    // loads pick it up; running deployments are untouched.
+                    args.extend(llamacpp_chat_flags(tool_calling));
                 }
                 ServingMode::Embedding => {
                     // /v1/embeddings on llama.cpp ≥ b3000. BGE models use
@@ -1583,6 +1609,20 @@ async fn write_systemd_unit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_calling_chat_gets_jinja() {
+        // Tool-capable chat models must launch with --jinja so the server
+        // parses structured tool_calls instead of leaking free-form text.
+        assert_eq!(llamacpp_chat_flags(true), vec!["--jinja".to_string()]);
+    }
+
+    #[test]
+    fn non_tool_chat_gets_no_extra_flags() {
+        // Non-tool models get nothing — --jinja buys them nothing and a bad
+        // embedded template could refuse to launch.
+        assert!(llamacpp_chat_flags(false).is_empty());
+    }
 
     #[test]
     fn parses_llama_props_per_slot_ctx_and_slots() {
