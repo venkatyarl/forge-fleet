@@ -480,6 +480,57 @@ pub async fn scan(
         report.pruned = pruned.rows_affected() as usize;
     }
 
+    // In-root deletions: a file removed from disk still satisfies a source-root
+    // path prefix, so the out-of-root prune above keeps its content node alive
+    // forever. Cortex's deleted-file path only drops the file's SYMBOLS, not the
+    // `content:file` node itself (it defers content-node lifecycle to this scan —
+    // see cortex.rs "Deletion signal is the FILESYSTEM" comment). Without this,
+    // deleted files linger as stale content:file/content:dir nodes in BOTH
+    // incremental and full reindex. Invalidate every CURRENT in-root content node
+    // that this scan did NOT walk *and* no longer exists on disk.
+    //
+    // The walked set is the fast path: a no-op rescan walks every live file, so
+    // the candidate set (current nodes ∉ walked) is empty and we stat nothing —
+    // keeping the hook-driven per-commit scan cheap. Only the few nodes a walk
+    // missed get a stat, and the `exists()` guard means a file merely deeper than
+    // `max_depth`, or under a source skipped by `only_source`, is preserved — only
+    // genuine disk deletions are pruned. Skipped with no sources (out-of-root
+    // prune is too, and an empty walk would flag everything as a candidate).
+    if !sources.is_empty() {
+        let walked: HashSet<String> = all_paths
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+        let current: Vec<(Uuid, String)> = sqlx::query(
+            r#"SELECT id, path FROM brain_vault_nodes
+                WHERE project = $1
+                  AND node_type LIKE 'content:%'
+                  AND valid_until IS NULL"#,
+        )
+        .bind(&corpus.slug)
+        .fetch_all(pg)
+        .await?
+        .into_iter()
+        .map(|r| (r.get::<Uuid, _>("id"), r.get::<String, _>("path")))
+        .collect();
+        let gone: Vec<Uuid> = current
+            .into_iter()
+            .filter(|(_, p)| !walked.contains(p) && !Path::new(p).exists())
+            .map(|(id, _)| id)
+            .collect();
+        if !gone.is_empty() {
+            let n = sqlx::query(
+                "UPDATE brain_vault_nodes
+                    SET valid_until = NOW(), updated_at = NOW()
+                  WHERE id = ANY($1)",
+            )
+            .bind(&gone)
+            .execute(pg)
+            .await?;
+            report.pruned += n.rows_affected() as usize;
+        }
+    }
+
     let dir_set: HashSet<PathBuf> = all_dirs.into_iter().collect();
     let candidates = propose(&all_paths, &dir_set, &source_roots);
     sqlx::query("DELETE FROM brain_corpus_candidates WHERE corpus_id = $1 AND status = 'pending'")
@@ -1426,6 +1477,54 @@ mod tests {
         .await
         .unwrap();
         assert!(stray_current.is_none(), "stray row must be invalidated");
+
+        // In-root deletion: a real file under the source root that is removed from
+        // disk must be invalidated too (it still matches the root prefix, so the
+        // out-of-root prune above keeps it — this is the deleted-file staleness
+        // bug). Add a file, scan, delete it on disk, rescan.
+        let extra = base.join("src").join("gone.rs");
+        std::fs::write(&extra, "fn gone() {}\n").unwrap();
+        let extra_path = extra.to_string_lossy().to_string();
+        scan(&pg, &b, None, 4).await.unwrap();
+        let extra_current = |path: String| {
+            let pg = pg.clone();
+            async move {
+                sqlx::query_scalar::<_, Uuid>(
+                    "SELECT id FROM brain_vault_nodes
+                      WHERE path = $1 AND valid_until IS NULL",
+                )
+                .bind(&path)
+                .fetch_optional(&pg)
+                .await
+                .unwrap()
+            }
+        };
+        assert!(
+            extra_current(extra_path.clone()).await.is_some(),
+            "in-root file must be a current node after scan"
+        );
+        std::fs::remove_file(&extra).unwrap();
+        let rb3 = scan(&pg, &b, None, 4).await.unwrap();
+        assert!(
+            rb3.pruned >= 1,
+            "scan must invalidate an in-root file deleted from disk"
+        );
+        assert!(
+            extra_current(extra_path.clone()).await.is_none(),
+            "deleted in-root file must be invalidated"
+        );
+        // A surviving in-root file must NOT be pruned.
+        assert!(
+            extra_current(
+                base.join("src")
+                    .join("main.rs")
+                    .to_string_lossy()
+                    .to_string()
+            )
+            .await
+            .is_some(),
+            "surviving in-root file must remain current"
+        );
 
         // Cleanup: delete_corpus removes nodes by project (incl. the stray)
         // and cascades sources/facets/candidates off the corpus row.
