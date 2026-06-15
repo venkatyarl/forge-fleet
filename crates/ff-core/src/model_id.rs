@@ -32,7 +32,17 @@ pub fn normalize_model_id(raw: &str) -> String {
             break;
         }
     }
-    s = s.replace('_', "-");
+    // Fold `_` AND `.` to `-`: both are separators that drift between the
+    // shapes a model id arrives in. The dot matters for the newest families
+    // whose deployments report a dotted version (`qwen3.6-35b-a3b`,
+    // `Qwen3.5-9B-...`) while the catalog id is dashed (`qwen3-6-35b-a3b`).
+    // Without folding, `qwen-3.6-...` never equals `qwen-3-6-...` and the
+    // dotted deployment silently fails to match its catalog row (gateway
+    // routing, pulse pool-alias, and coverage all dropped it). Runs AFTER
+    // the file-extension strip so `.gguf`/`.safetensors` are already gone
+    // and a literal dot here is always an in-id separator. The compact
+    // form (`qwen36`) stays distinct — only explicit separators unify.
+    s = s.replace(['_', '.'], "-");
     while s.contains("--") {
         s = s.replace("--", "-");
     }
@@ -147,6 +157,36 @@ mod tests {
         let beat = normalize_model_id("gemma-4-31B-it-Q4_K_M.gguf");
         assert_eq!(catalog, beat);
         assert_eq!(catalog, "gemma-4-31b-it");
+    }
+
+    #[test]
+    fn dotted_version_folds_to_dashed() {
+        // The live failure: deployments report the newest families with a
+        // dotted version (`qwen3.6-35b-a3b`), while the catalog id is dashed
+        // (`qwen3-6-35b-a3b`). Before dot-folding these never compared equal,
+        // so the dotted deployment matched no catalog row (coverage=0, and
+        // gateway/pulse routing dropped it). Now both land on the same form.
+        let dotted = normalize_model_id("qwen3.6-35b-a3b");
+        let dashed = normalize_model_id("qwen3-6-35b-a3b");
+        assert_eq!(dotted, dashed);
+        assert_eq!(dotted, "qwen-3-6-35b-a-3b");
+
+        // GGUF deployment with a dotted version + `-UD` tag + quant suffix
+        // still prefix-matches the dashed catalog id (what coverage uses).
+        let gguf = normalize_model_id("Qwen3.6-35B-A3B-UD-Q4_K_M.gguf");
+        assert!(gguf.starts_with(&dashed));
+
+        // The 9B text model: dotted deployment folds to the dashed catalog id.
+        assert_eq!(
+            normalize_model_id("Qwen3.5-9B-Q4_K_M.gguf"),
+            normalize_model_id("qwen3-5-9b")
+        );
+
+        // A version dot in an embedding id folds the same way, symmetrically.
+        assert_eq!(
+            normalize_model_id("bge-large-en-v1.5"),
+            "bge-large-en-v-1-5"
+        );
     }
 
     #[test]
