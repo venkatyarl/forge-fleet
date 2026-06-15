@@ -93,6 +93,7 @@ pub mod orphan_reaper;
 pub mod panic_stop;
 pub mod permissions;
 pub mod plugins;
+pub mod portfolio_maintenance;
 pub mod ports_registry;
 pub mod power_scheduler;
 pub mod project_github_sync;
