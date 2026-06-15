@@ -727,101 +727,66 @@ impl ResearchSession {
 
     // ─── Sub-agent dispatch ──────────────────────────────────────────────
 
+    /// Pick `n` fleet backends for the sub-agents, one per sub-question.
+    ///
+    /// Routes through the SAME health-floored scorer the agent + offload
+    /// pickers use (`ff_db::pg_route_deployments` with
+    /// `max_health_age_sec = DISPATCH_HEALTH_MAX_AGE_SEC`), so a wedged/offline
+    /// host whose deployment still reads `healthy` with a stale `last_health_at`
+    /// is skipped instead of hanging a sub-agent for the full request timeout
+    /// (the priya-wedge failure mode — PR #332/#333). The previous query hit
+    /// `computer_model_deployments` filtered only on `status = 'active'`, which
+    /// carried NO health/freshness signal and routinely dispatched to dead
+    /// endpoints — the likely reason research runs so often died mid-dispatch.
+    ///
+    /// `require_tool_calling = true` is the fleet's reliable "this is a
+    /// chat-completion model, not an embedding/reranking server" filter (the
+    /// offload picker relies on the same flag): without it a healthy `bge-m3`
+    /// embedding deployment would be a candidate and a sub-agent POSTing a chat
+    /// completion to it would 4xx. Every agent-grade chat model on the fleet is
+    /// tool-calling, so this loses no usable research backend. Candidates come
+    /// back ordered tier-ASC then freshest-first; we then round-robin across
+    /// DISTINCT computers to maximize real parallelism.
     async fn pick_distinct_backends(&self, n: usize) -> Result<Vec<FleetBackend>> {
-        // Query active OpenAI-compatible deployments. Normalize endpoints —
-        // the materializer records `http://127.0.0.1:<port>` (the loopback
-        // view from each node's own forgefleetd) but we're dispatching
-        // FROM Taylor so we need the LAN IP. We also join against
-        // port_registry so the port in the endpoint string is always
-        // authoritative (parses the raw endpoint's port, not hardcoded).
-        let rows = sqlx::query(
-            "SELECT DISTINCT ON (c.name, d.endpoint)
-                    c.name, c.primary_ip, d.endpoint, d.model_id,
-                    c.gpu_model
-               FROM computer_model_deployments d
-               JOIN computers c ON c.id = d.computer_id
-              WHERE d.status = 'active'
-                AND d.openai_compatible = true
-              ORDER BY c.name, d.endpoint, d.started_at DESC NULLS LAST",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .context("query active LLM deployments")?;
+        let filter = ff_db::RouteFilter {
+            workload: None,
+            require_tool_calling: true,
+            min_ctx: None,
+            exclude_hosts: Vec::new(),
+            max_health_age_sec: Some(ff_db::queries::DISPATCH_HEALTH_MAX_AGE_SEC),
+            // Generous cap: we want every healthy deployment so the round-robin
+            // can spread across as many distinct computers as the fleet has.
+            limit: 256,
+        };
+        let candidates = ff_db::pg_route_deployments(&self.pool, &filter)
+            .await
+            .context("route healthy LLM deployments for research sub-agents")?;
 
-        // Fallback port if the deployment's endpoint string is malformed —
-        // prefer the registry's `vllm` primary-slot port over a literal.
-        let fallback_port = resolve_port(&self.pool, "vllm", 55000).await;
-
-        if rows.is_empty() {
+        if candidates.is_empty() {
             anyhow::bail!(
-                "no active OpenAI-compatible LLM deployments in the fleet — \
-                 start at least one with `ff model load` or via vLLM docker"
+                "no healthy OpenAI-compatible LLM deployments within the {}s \
+                 health-freshness window — start one with `ff model load`, or \
+                 check `ff fleet route chat` for wedged hosts",
+                ff_db::queries::DISPATCH_HEALTH_MAX_AGE_SEC,
             );
         }
 
-        // Build normalized list: one entry per (computer, model) with the
-        // LAN-reachable endpoint. Prefer GB10 boxes first.
-        let mut seen: std::collections::HashSet<(String, String)> = Default::default();
-        let mut backends: Vec<FleetBackend> = Vec::new();
-        for r in &rows {
-            let name: String = r.get("name");
-            let primary_ip: String = r.get("primary_ip");
-            let raw_endpoint: String = r.get("endpoint");
-            let model_id: String = r.get("model_id");
+        // `pg_route_deployments` already builds `http://{host}:{port}` from the
+        // LAN primary_ip and resolves the port from the deployment row, so no
+        // loopback rewrite is needed here.
+        let backends: Vec<FleetBackend> = candidates
+            .into_iter()
+            .map(|c| FleetBackend {
+                computer_name: c.worker_name,
+                endpoint: c.endpoint,
+                // Same identifier offload/MCP dispatch sends as the OpenAI
+                // `model` field (catalog id, name fallback). llama.cpp ignores
+                // it; vLLM matches it.
+                model_id: c.catalog_id.or(c.catalog_name).unwrap_or_default(),
+            })
+            .collect();
 
-            let endpoint =
-                if raw_endpoint.contains("127.0.0.1") || raw_endpoint.contains("localhost") {
-                    // Pull the port from the raw endpoint, rebuild with primary_ip.
-                    // Fall back to the port registry's `vllm` entry if the
-                    // endpoint string doesn't parse — never hardcode a literal.
-                    let port = raw_endpoint
-                        .rsplit(':')
-                        .next()
-                        .and_then(|p| p.trim_end_matches('/').parse::<u16>().ok())
-                        .unwrap_or(fallback_port);
-                    format!("http://{primary_ip}:{port}")
-                } else {
-                    raw_endpoint
-                };
-
-            if seen.insert((name.clone(), model_id.clone())) {
-                backends.push(FleetBackend {
-                    computer_name: name,
-                    endpoint,
-                    model_id,
-                    is_gb10: r
-                        .get::<Option<String>, _>("gpu_model")
-                        .map(|g| g.contains("GB10"))
-                        .unwrap_or(false),
-                });
-            }
-        }
-
-        // Sort: GB10 first, then alphabetical by computer name.
-        backends.sort_by(|a, b| {
-            b.is_gb10
-                .cmp(&a.is_gb10)
-                .then_with(|| a.computer_name.cmp(&b.computer_name))
-        });
-
-        // Round-robin across DISTINCT COMPUTERS first to maximize parallelism.
-        let mut out: Vec<FleetBackend> = Vec::with_capacity(n);
-        let mut seen_computer: std::collections::HashSet<String> = Default::default();
-        for b in &backends {
-            if out.len() >= n {
-                break;
-            }
-            if seen_computer.insert(b.computer_name.clone()) {
-                out.push(b.clone());
-            }
-        }
-        // If n > distinct computers, cycle the full list.
-        let mut i = 0;
-        while out.len() < n {
-            out.push(backends[i % backends.len()].clone());
-            i += 1;
-        }
-        Ok(out)
+        Ok(select_distinct_round_robin(backends, n))
     }
 
     async fn insert_subtasks(
@@ -1161,6 +1126,56 @@ mod recover_status_tests {
     }
 }
 
+#[cfg(test)]
+mod backend_pick_tests {
+    use super::{FleetBackend, select_distinct_round_robin};
+
+    fn b(computer: &str, model: &str) -> FleetBackend {
+        FleetBackend {
+            computer_name: computer.into(),
+            endpoint: format!("http://{computer}:55000"),
+            model_id: model.into(),
+        }
+    }
+
+    #[test]
+    fn empty_or_zero_yields_nothing() {
+        assert!(select_distinct_round_robin(vec![], 3).is_empty());
+        assert!(select_distinct_round_robin(vec![b("a", "m")], 0).is_empty());
+    }
+
+    #[test]
+    fn prefers_distinct_computers_first() {
+        // Two deployments on `a` (first in best-first order) but `b`/`c` exist —
+        // a 3-way fan-out must spread across all three boxes, not stack on `a`.
+        let backends = vec![b("a", "m1"), b("a", "m2"), b("bb", "m1"), b("cc", "m1")];
+        let got = select_distinct_round_robin(backends, 3);
+        let computers: Vec<&str> = got.iter().map(|x| x.computer_name.as_str()).collect();
+        assert_eq!(computers, vec!["a", "bb", "cc"]);
+    }
+
+    #[test]
+    fn cycles_when_more_subagents_than_computers() {
+        // 4 sub-agents, 2 distinct computers: take each distinct once, then
+        // cycle the full list — every backend stays usable.
+        let backends = vec![b("a", "m1"), b("bb", "m1")];
+        let got = select_distinct_round_robin(backends, 4);
+        assert_eq!(got.len(), 4);
+        let computers: Vec<&str> = got.iter().map(|x| x.computer_name.as_str()).collect();
+        assert_eq!(computers, vec!["a", "bb", "a", "bb"]);
+    }
+
+    #[test]
+    fn preserves_best_first_order_within_distinct_pass() {
+        // Input order is the router's tier-ASC/freshest-first ranking; the
+        // distinct pass must not reorder it.
+        let backends = vec![b("c1", "m"), b("c2", "m"), b("c3", "m")];
+        let got = select_distinct_round_robin(backends, 2);
+        let computers: Vec<&str> = got.iter().map(|x| x.computer_name.as_str()).collect();
+        assert_eq!(computers, vec!["c1", "c2"]);
+    }
+}
+
 // ─── Progress events for callers ────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -1178,7 +1193,34 @@ struct FleetBackend {
     computer_name: String,
     endpoint: String,
     model_id: String,
-    is_gb10: bool,
+}
+
+/// Select `n` backends from a best-first-ordered list, preferring DISTINCT
+/// computers first (one sub-agent per box → real parallelism), then cycling the
+/// full list when more sub-agents than distinct computers were requested. The
+/// input order (tier-ASC, freshest-first from `pg_route_deployments`) is
+/// preserved within each pass. Pure — unit-tested.
+fn select_distinct_round_robin(backends: Vec<FleetBackend>, n: usize) -> Vec<FleetBackend> {
+    if backends.is_empty() || n == 0 {
+        return Vec::new();
+    }
+    let mut out: Vec<FleetBackend> = Vec::with_capacity(n);
+    let mut seen_computer: std::collections::HashSet<String> = Default::default();
+    for b in &backends {
+        if out.len() >= n {
+            break;
+        }
+        if seen_computer.insert(b.computer_name.clone()) {
+            out.push(b.clone());
+        }
+    }
+    // n > distinct computers: cycle the full list (a backend can host >1 sub-agent).
+    let mut i = 0;
+    while out.len() < n {
+        out.push(backends[i % backends.len()].clone());
+        i += 1;
+    }
+    out
 }
 
 #[derive(Debug, Clone)]
