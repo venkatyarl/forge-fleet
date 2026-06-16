@@ -8763,3 +8763,31 @@ VALUES
    0, 'warning', 3600, 'telegram', true)
 ON CONFLICT (name) DO NOTHING;
 "#;
+
+// ─── V135: fleet-integrity active-mode repair audit ─────────────────────────
+//
+// `fleet_integrity` gains an `active` mode (prod-readiness item 23 follow-up):
+// after the read-only sweep, the leader may enqueue a SAFE per-gap repair via
+// the existing deferred-task queue (today only `revive_member` for a node that
+// fails the daemon-health/liveness check). This table is the audit log of every
+// such auto-repair the leader enqueued — one row per (node, gap) the active tick
+// acted on, with the resulting `deferred_tasks` id when an enqueue happened. It
+// is purely observational: nothing reads it back to drive behaviour, so it can
+// never widen blast radius. Other (non-liveness) gaps are recorded with
+// action='alert_only' and a NULL deferred_task_id — they are detected + alerted
+// but not yet auto-mutated.
+//
+// (V134 is reserved by a sibling branch; this feature uses V135 as assigned.)
+pub const SCHEMA_V135_INTEGRITY_ACTIVE_REPAIRS: &str = r#"
+CREATE TABLE IF NOT EXISTS integrity_active_repairs (
+    id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    node              TEXT NOT NULL,
+    gap               TEXT NOT NULL,
+    action            TEXT NOT NULL,
+    deferred_task_id  UUID,
+    leader            TEXT NOT NULL,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_integrity_active_repairs_node_created
+    ON integrity_active_repairs (node, created_at DESC);
+"#;
