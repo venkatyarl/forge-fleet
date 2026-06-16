@@ -3538,6 +3538,11 @@ async fn main() -> Result<()> {
         max_turns: 30,
         image_path: cli.image,
         inference_router: router,
+        // Attach the fleet pool (best-effort) so the agent loop can record a
+        // commit-back-able work_output for runs that edit files (GAP-D0), and
+        // so DB-backed tools work. None when Postgres is unreachable — the run
+        // still proceeds, just without provenance recording.
+        pg_pool: ff_agent::fleet_info::get_fleet_pool().await.ok(),
         ..Default::default()
     };
 
