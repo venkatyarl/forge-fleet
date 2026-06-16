@@ -181,6 +181,18 @@ struct FileParse {
     /// `reexports`; the resolve-time pass checks `<target>::<leaf>` against the
     /// internal fn set. Rust only.
     glob_reexports: Vec<(String, String)>,
+    /// Wildcard import bases for the dotty languages (Java/TS/Python), the
+    /// non-Rust analogue of [`glob_imports`]. A Java `import static a.b.C.*;`
+    /// static wildcard or `import a.b.*;` package wildcard brings members into
+    /// scope WITHOUT binding an alias leaf, so a bare call to one of those
+    /// members otherwise fabricates `<caller_module>::<leaf>` — an extern under
+    /// the CALLER's path instead of the real definition. Each entry is the
+    /// fully-qualified base the wildcard expands under (`a::b::C` for the static
+    /// wildcard, `a::b` for the package wildcard). Used by
+    /// [`resolve_wildcard_call`] to redirect a bare leaf to `<base>::<leaf>` when
+    /// exactly one base names a known internal fn (redirect-only, never
+    /// fabricates). Rust globs use [`glob_imports`] instead.
+    wildcard_imports: Vec<String>,
 }
 
 // ─── Public entrypoint ───────────────────────────────────────────────────────
@@ -1127,6 +1139,18 @@ async fn extract_files(
                     resolve_glob_call(&call.raw_path, &caller_qn, &p.parse, internal_fns)
                 {
                     resolved = g;
+                }
+            }
+
+            // Wildcard-import fallback (Java/TS/Python): a bare call to a member
+            // brought in by a `import static a.b.C.*;` / `import a.b.*;` /
+            // `from m import *` resolved to `<caller_module>::<leaf>` (an extern
+            // under the caller's path); redirect to the real `<base>::<leaf>` when
+            // exactly one wildcard base names a known internal fn. The non-Rust
+            // analogue of the glob-import fallback above.
+            if !internal_fns.contains(&resolved) {
+                if let Some(w) = resolve_wildcard_call(&call.raw_path, &p.parse, internal_fns) {
+                    resolved = w;
                 }
             }
 
@@ -3222,6 +3246,7 @@ fn parse_rust_file(file_path: &str, source: &str) -> Option<FileParse> {
         glob_imports: Vec::new(),
         reexports: Vec::new(),
         glob_reexports: Vec::new(),
+        wildcard_imports: Vec::new(),
     };
 
     // Walk the tree, tracking the current module path (mod blocks) and the
@@ -3727,6 +3752,7 @@ fn parse_typescript_file(file_path: &str, source: &str) -> Option<FileParse> {
         glob_imports: Vec::new(),
         reexports: Vec::new(),
         glob_reexports: Vec::new(),
+        wildcard_imports: Vec::new(),
     };
     walk_ts(&root, bytes, &module, file_path, None, &mut fp);
     // Calls are collected in ONE global pass — attribution is byte-span based
@@ -4196,6 +4222,7 @@ fn parse_java_file(_file_path: &str, source: &str) -> Option<FileParse> {
         glob_imports: Vec::new(),
         reexports: Vec::new(),
         glob_reexports: Vec::new(),
+        wildcard_imports: Vec::new(),
     };
     walk_java(&root, bytes, &module, None, &mut fp);
     // One global call pass (byte-span attribution via innermost_fn).
@@ -4270,8 +4297,13 @@ fn collect_java_import(node: &Node, bytes: &[u8], fp: &mut FileParse) {
     let Some(t) = path_text else { return };
     let full = t.replace('.', "::");
     if wildcard {
-        // `import a.b.*;` — record the package, no leaf alias to bind.
-        fp.use_targets.push(full);
+        // `import a.b.*;` (package) / `import static a.b.C.*;` (static members) —
+        // record the base, no leaf alias to bind. Also stash the base in
+        // `wildcard_imports` so a bare call to a wildcard-imported internal member
+        // can be redirected at resolve time (the non-Rust analogue of a glob `use`)
+        // instead of fabricating an extern under the caller's own path.
+        fp.use_targets.push(full.clone());
+        fp.wildcard_imports.push(full);
     } else {
         let leaf = full.rsplit("::").next().unwrap_or(&full).to_string();
         register_use(&full, &leaf, fp);
@@ -4380,6 +4412,7 @@ fn parse_python_file(file_path: &str, source: &str) -> Option<FileParse> {
         glob_imports: Vec::new(),
         reexports: Vec::new(),
         glob_reexports: Vec::new(),
+        wildcard_imports: Vec::new(),
     };
     walk_python(&root, bytes, &module, None, &mut fp);
     // One global call pass (byte-span attribution via innermost_fn).
@@ -4498,8 +4531,13 @@ fn collect_python_import(node: &Node, bytes: &[u8], fp: &mut FileParse) {
                 }
             }
             "wildcard_import" => {
+                // `from m import *` — record the base module and stash it as a
+                // wildcard import so a bare call to one of its internal members can
+                // be redirected to `m::<leaf>` at resolve time, the same as Java
+                // wildcards, instead of fabricating `<caller_module>::<leaf>`.
                 if !base.is_empty() {
                     fp.use_targets.push(base.clone());
+                    fp.wildcard_imports.push(base.clone());
                 }
             }
             _ => {}
@@ -4772,6 +4810,49 @@ fn resolve_glob_call(
         }
     }
     None
+}
+
+/// Wildcard-import fallback for the dotty languages (Java/TS/Python), the
+/// non-Rust analogue of [`resolve_glob_call`]. A Java `import static a.b.C.*;`
+/// (static members) or `import a.b.*;` (package), or a Python `from m import *`,
+/// brings members into scope WITHOUT binding an alias leaf. So a bare call
+/// `check()` to such a member falls through `resolve_call_dotty`'s alias-map miss
+/// to `<caller_module>::check` — a `code:extern` fabricated under the CALLER's own
+/// path, leaving the real `a::b::C::check` with no fan-in. (Rust globs are handled
+/// separately by [`resolve_glob_call`]; this covers the languages that have no
+/// `super::*`-relative form, so the wildcard base is already absolute.)
+///
+/// Only fires for a bare leaf the alias map didn't already bind, and only when
+/// EXACTLY ONE wildcard base yields a `<base>::<leaf>` that names a known internal
+/// fn — if two wildcard imports both expose the leaf the binding is genuinely
+/// ambiguous, so we leave the original (extern) resolution rather than guess.
+/// Redirect-only: the target must already exist in the corpus, so it never
+/// fabricates an edge.
+fn resolve_wildcard_call(raw: &str, fp: &FileParse, internal: &HashSet<String>) -> Option<String> {
+    // Dotty languages only; bare leaf only; must not already be alias-bound (a
+    // named import is the more specific match and already resolved).
+    if fp.lang == Lang::Rust
+        || raw.contains("::")
+        || fp.wildcard_imports.is_empty()
+        || fp.alias_map.contains_key(raw)
+    {
+        return None;
+    }
+    let mut hit: Option<String> = None;
+    for base in &fp.wildcard_imports {
+        let cand = join(base, raw);
+        if internal.contains(&cand) {
+            if let Some(prev) = &hit {
+                // A second distinct internal candidate → ambiguous, bail out.
+                if prev != &cand {
+                    return None;
+                }
+            } else {
+                hit = Some(cand);
+            }
+        }
+    }
+    hit
 }
 
 /// Inherent-impl method redirect. A Rust method `fn bar()` inside `impl Foo` is
@@ -6006,6 +6087,7 @@ diff --git a/src/b.rs b/src/b.rs
             glob_imports: vec![],
             reexports: vec![],
             glob_reexports: vec![],
+            wildcard_imports: vec![],
         }
     }
 
@@ -6038,6 +6120,112 @@ diff --git a/src/b.rs b/src/b.rs
             &fp,
         );
         assert_eq!(got, "ff_agent::compaction::should_compact");
+    }
+
+    /// Build a dotty (Java/TS/Python) FileParse with a synthetic import map for the
+    /// wildcard-resolution tests: `aliases` are named imports (bind a leaf),
+    /// `wildcards` are the absolute bases of `import a.b.C.*;` / `from m import *`.
+    fn fp_dotty(
+        lang: Lang,
+        module: &str,
+        crate_name: &str,
+        aliases: &[(&str, &str)],
+        wildcards: &[&str],
+    ) -> FileParse {
+        let mut fp = fp_with(module, crate_name, aliases);
+        fp.lang = lang;
+        fp.wildcard_imports = wildcards.iter().map(|s| s.to_string()).collect();
+        fp
+    }
+
+    #[test]
+    fn java_static_wildcard_bare_call_resolves_to_imported_def() {
+        // `import static com.acme.util.Asserts.*;` then a bare `check(user)` inside
+        // com::acme::auth::AuthService::login. Without the wildcard lever the bare
+        // call falls through the alias-map miss to the caller's own class
+        // (com::acme::auth::AuthService::check) — a code:extern under the CALLER's
+        // path. It must redirect to the real imported def.
+        let fp = fp_dotty(
+            Lang::Java,
+            "com::acme::auth",
+            "com::acme::auth",
+            &[],
+            &["com::acme::util::Asserts"],
+        );
+        let internal: HashSet<String> = ["com::acme::util::Asserts::check".to_string()].into();
+        // Primary resolver fabricates the caller-prefixed extern...
+        let primary = resolve_call("check", "com::acme::auth::AuthService::login", &fp);
+        assert_eq!(primary, "com::acme::auth::AuthService::check");
+        assert!(!internal.contains(&primary));
+        // ...and the wildcard lever redirects it to the imported definition.
+        assert_eq!(
+            resolve_wildcard_call("check", &fp, &internal).as_deref(),
+            Some("com::acme::util::Asserts::check")
+        );
+    }
+
+    #[test]
+    fn python_star_import_bare_call_resolves_to_imported_def() {
+        // `from acme.helpers import *` then a bare `audit(user)`.
+        let fp = fp_dotty(Lang::Python, "acme::api", "acme", &[], &["acme::helpers"]);
+        let internal: HashSet<String> = ["acme::helpers::audit".to_string()].into();
+        assert_eq!(
+            resolve_wildcard_call("audit", &fp, &internal).as_deref(),
+            Some("acme::helpers::audit")
+        );
+    }
+
+    #[test]
+    fn wildcard_call_no_redirect_when_target_not_internal() {
+        // The wildcard base exposes the leaf, but no such internal fn exists — never
+        // fabricate, leave the extern resolution untouched.
+        let fp = fp_dotty(Lang::Java, "a::b", "a::b", &[], &["x::y::Z"]);
+        let internal: HashSet<String> = ["x::y::Z::other".to_string()].into();
+        assert_eq!(resolve_wildcard_call("check", &fp, &internal), None);
+    }
+
+    #[test]
+    fn wildcard_call_ambiguous_two_bases_bails_out() {
+        // Two static wildcards both expose `check` as a real internal fn — the
+        // binding is genuinely ambiguous, so resolve to neither (no guessed edge).
+        let fp = fp_dotty(Lang::Java, "a::b", "a::b", &[], &["x::A", "y::B"]);
+        let internal: HashSet<String> =
+            ["x::A::check".to_string(), "y::B::check".to_string()].into();
+        assert_eq!(resolve_wildcard_call("check", &fp, &internal), None);
+    }
+
+    #[test]
+    fn wildcard_call_named_import_wins_over_wildcard() {
+        // A named static import (`import static x.A.check;`) binds the leaf in the
+        // alias map; the wildcard lever must defer to it (it's the more specific
+        // match) and not fire even though a wildcard base also exposes the leaf.
+        let fp = fp_dotty(
+            Lang::Java,
+            "a::b",
+            "a::b",
+            &[("check", "x::A::check")],
+            &["y::B"],
+        );
+        let internal: HashSet<String> =
+            ["x::A::check".to_string(), "y::B::check".to_string()].into();
+        // alias map already resolves it directly...
+        assert_eq!(resolve_call("check", "a::b::Svc::m", &fp), "x::A::check");
+        // ...so the wildcard lever is a no-op (alias-bound leaf is skipped).
+        assert_eq!(resolve_wildcard_call("check", &fp, &internal), None);
+    }
+
+    #[test]
+    fn wildcard_call_ignores_rust_and_dotted_and_empty() {
+        let internal: HashSet<String> = ["a::b::check".to_string()].into();
+        // Rust uses glob_imports, not this lever.
+        let rust = fp_dotty(Lang::Rust, "a", "a", &[], &["a::b"]);
+        assert_eq!(resolve_wildcard_call("check", &rust, &internal), None);
+        // A dotted receiver call is not a bare leaf.
+        let java = fp_dotty(Lang::Java, "a", "a", &[], &["a::b"]);
+        assert_eq!(resolve_wildcard_call("C::check", &java, &internal), None);
+        // No wildcard imports → nothing to do.
+        let none = fp_dotty(Lang::Java, "a", "a", &[], &[]);
+        assert_eq!(resolve_wildcard_call("check", &none, &internal), None);
     }
 
     #[test]
@@ -7689,6 +7877,9 @@ class Session {
                 .any(|t| t == "com::acme::util::Asserts::check")
         );
         assert!(fp.use_targets.iter().any(|t| t == "java::util"));
+        // the `import java.util.*;` package wildcard is stashed as a redirect base
+        // (no alias leaf), so a bare wildcard-imported call can resolve later.
+        assert!(fp.wildcard_imports.iter().any(|t| t == "java::util"));
         assert_eq!(
             fp.alias_map.get("Strings").unwrap(),
             "com::acme::util::Strings"
