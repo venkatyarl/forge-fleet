@@ -11,6 +11,11 @@ use crate::error::Result;
 use crate::metrics::{FleetSnapshot, NodeMetrics, PulseEvent};
 
 /// Core Redis client for Fleet Pulse operations.
+///
+/// `Clone` is cheap: `ConnectionManager` is `Arc`-backed and auto-reconnecting,
+/// so clones share one underlying connection. This lets callers cache a single
+/// `PulseClient` (see `ff_mcp::pool`) instead of reconnecting per call.
+#[derive(Clone)]
 pub struct PulseClient {
     conn: redis::aio::ConnectionManager,
     prefix: String,

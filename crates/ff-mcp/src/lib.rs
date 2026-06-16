@@ -22,6 +22,7 @@ pub mod cortex_tools;
 pub mod federation;
 pub mod handlers;
 pub mod llm_exec;
+pub mod pool;
 pub mod protocol;
 pub mod server;
 pub mod strategy_dispatch;

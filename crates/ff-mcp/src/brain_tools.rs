@@ -6,9 +6,7 @@
 
 use chrono::Utc;
 use ff_brain::BrainStateClient;
-use ff_core::config;
 use serde_json::{Value, json};
-use sqlx::postgres::PgPoolOptions;
 use tracing::info;
 use uuid::Uuid;
 
@@ -17,15 +15,10 @@ use crate::handlers::HandlerResult;
 const DEFAULT_USER: &str = "venkat";
 const REDIS_URL: &str = "redis://192.168.5.100:56379";
 
-/// Get a Postgres pool using the fleet config (same pattern as other handlers).
+/// Get the process-shared Postgres pool (cached once — never per call; see
+/// [`crate::pool`]).
 async fn get_pool() -> Result<sqlx::PgPool, String> {
-    let (cfg, _) =
-        config::load_config_auto().map_err(|e| format!("failed to load fleet config: {e}"))?;
-    PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&cfg.database.url)
-        .await
-        .map_err(|e| format!("Postgres connection failed: {e}"))
+    crate::pool::shared_pg_pool().await
 }
 
 /// Resolve the default user, creating if needed.

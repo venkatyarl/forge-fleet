@@ -36,14 +36,12 @@ use ff_orchestrator::{
 use ff_pipeline::executor::ExecutorConfig;
 use ff_pipeline::graph::PipelineGraph;
 use ff_pipeline::step::{Step, StepId, StepKind, StepStatus};
-use ff_pulse::PulseClient;
 use ff_runtime::engine::EngineConfig;
 use ff_runtime::model_manager::ModelManager;
 use ff_runtime::process_manager::ProcessManager;
 use ff_ssh::{RemoteExecutor, SshNodeConfig};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use sqlx::postgres::PgPoolOptions;
 use tracing::{info, warn};
 
 use crate::federation;
@@ -152,7 +150,7 @@ pub async fn fleet_status(params: Option<Value>) -> HandlerResult {
     // Best-effort: fetch live metrics from Redis (Fleet Pulse).
     // If Redis is unavailable, we fall back to scan-only data.
     let pulse_metrics: HashMap<String, ff_pulse::NodeMetrics> =
-        match PulseClient::connect(&config.redis.url).await {
+        match crate::pool::shared_pulse().await {
             Ok(mut pulse) => match pulse.get_all_metrics().await {
                 Ok(snapshot) => snapshot
                     .nodes
@@ -2332,11 +2330,7 @@ pub async fn project_policy_resolve(params: Option<Value>) -> HandlerResult {
 // ─── Fleet Pulse (Redis real-time metrics) ──────────────────────────────────
 
 pub async fn fleet_pulse(params: Option<Value>) -> HandlerResult {
-    let (config, _) = load_config_auto()?;
-
-    let mut pulse = PulseClient::connect(&config.redis.url)
-        .await
-        .map_err(|e| format!("Redis connection failed: {e}"))?;
+    let mut pulse = crate::pool::shared_pulse().await?;
 
     let node_filter = params
         .as_ref()
@@ -2395,7 +2389,7 @@ pub async fn fleet_worker_detail(params: Option<Value>) -> HandlerResult {
         .map_err(|e| format!("Postgres models query failed: {e}"))?;
 
     // Best-effort Redis metrics
-    let live_metrics = match PulseClient::connect(&config.redis.url).await {
+    let live_metrics = match crate::pool::shared_pulse().await {
         Ok(mut pulse) => match pulse.get_metrics(node).await {
             Ok(metrics) => metrics,
             Err(e) => {
@@ -2690,12 +2684,13 @@ fn agent_row_to_json(r: &ff_db::FleetAgentRow) -> Value {
 
 // ─── Postgres pool helper ───────────────────────────────────────────────────
 
-async fn get_pg_pool(config: &FleetConfig) -> Result<sqlx::PgPool, String> {
-    PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&config.database.url)
-        .await
-        .map_err(|e| format!("Postgres connection failed: {e}"))
+/// Thin wrapper over the process-shared pool ([`crate::pool::shared_pg_pool`]).
+/// The pool is built ONCE and cached; this no longer opens a fresh pool per
+/// call (the pool-per-call anti-pattern that caused two Taylor outages). The
+/// `_config` arg is retained so the ~22 call sites stay untouched; the shared
+/// pool resolves its own config on first init.
+async fn get_pg_pool(_config: &FleetConfig) -> Result<sqlx::PgPool, String> {
+    crate::pool::shared_pg_pool().await
 }
 
 // ─── Handler dispatch ────────────────────────────────────────────────────────
