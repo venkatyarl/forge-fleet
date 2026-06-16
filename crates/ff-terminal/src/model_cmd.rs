@@ -441,133 +441,7 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
             node,
             show_id,
             json,
-        } => {
-            ensure_known_node(&pool, node.as_deref()).await?;
-            let mut rows = ff_db::pg_list_deployments(&pool, node.as_deref()).await?;
-            // Sort by primary IP (subnet order), matching every other
-            // per-computer table. Names→IPs via the computers table; stable sort
-            // keeps the SQL `ORDER BY worker_name, port` order within an IP.
-            let ip_by_name = crate::helpers::name_to_primary_ip(&pool).await?;
-            rows.sort_by_key(|r| {
-                crate::helpers::ip_sort_key(
-                    ip_by_name
-                        .get(&r.worker_name)
-                        .map(String::as_str)
-                        .unwrap_or(""),
-                )
-            });
-            // A deployment row's `health_status` is frozen at the last update by
-            // the node that owns it. When that node goes offline, nobody refreshes
-            // the row, so a long-dead host keeps reporting `healthy` — an
-            // observability lie the router and both autopilot loops could act on.
-            // Cross-reference the live pulse beat set: a node with no current beat
-            // is offline, so its deployments are `stale` regardless of the stored
-            // value. If the pulse reader is unavailable we can't tell, so we never
-            // mask (treat every node as online) — only override on a positive
-            // "node is offline" signal.
-            let online: std::collections::HashSet<String> = match crate::utils::pulse_reader() {
-                Ok(r) => r
-                    .beats_by_name()
-                    .await
-                    .map(|m| m.into_keys().collect())
-                    .unwrap_or_default(),
-                Err(_) => std::collections::HashSet::new(),
-            };
-            let node_online = |n: &str| online.is_empty() || online.contains(n);
-            let eff_health = |n: &str, h: &str| effective_deployment_health(node_online(n), h);
-            if json {
-                let out: Vec<_> = rows
-                    .iter()
-                    .map(|r| {
-                        serde_json::json!({
-                            "id": r.id,
-                            "library_id": r.library_id,
-                            "node": r.worker_name,
-                            "node_online": node_online(&r.worker_name),
-                            "catalog_id": r.catalog_id,
-                            "runtime": r.runtime,
-                            "port": r.port,
-                            "health": r.health_status,
-                            "effective_health": eff_health(&r.worker_name, &r.health_status),
-                            "context_window": r.context_window,
-                            "parallel_slots": r.parallel_slots,
-                            "usable_agent_ctx": r.usable_agent_ctx,
-                            "request_count": r.request_count,
-                            "tokens_used": r.tokens_used,
-                            "started_at": r.started_at.to_rfc3339(),
-                        })
-                    })
-                    .collect();
-                println!("{}", serde_json::to_string_pretty(&out)?);
-                return Ok(());
-            }
-            if rows.is_empty() {
-                println!("(no deployments recorded)");
-                return Ok(());
-            }
-            // With --show-id, surface DEPLOYMENT_ID (for `ff model unload`),
-            // LIBRARY_ID, CTX (for a faithful `ff model load` reload), and
-            // AGENT_CTX = usable per-slot ctx × slot count (so you can spot the
-            // agent-capable endpoints the router will pick).
-            if show_id {
-                println!(
-                    "{:<38} {:<38} {:<10} {:<28} {:<10} {:<6} {:<7} {:<12} {:<10} STARTED",
-                    "DEPLOYMENT_ID",
-                    "LIBRARY_ID",
-                    "NODE",
-                    "CATALOG_ID",
-                    "RUNTIME",
-                    "PORT",
-                    "CTX",
-                    "AGENT_CTX",
-                    "HEALTH"
-                );
-                for r in rows {
-                    let catalog = r.catalog_id.clone().unwrap_or_else(|| "-".into());
-                    let lib = r.library_id.clone().unwrap_or_else(|| "-".into());
-                    let ctx = r
-                        .context_window
-                        .map(|c| c.to_string())
-                        .unwrap_or_else(|| "-".into());
-                    // e.g. "32768x1" (usable_agent_ctx × parallel_slots).
-                    let agent_ctx = match (r.usable_agent_ctx, r.parallel_slots) {
-                        (Some(u), Some(p)) => format!("{u}x{p}"),
-                        (Some(u), None) => u.to_string(),
-                        _ => "-".into(),
-                    };
-                    println!(
-                        "{:<38} {:<38} {:<10} {:<28} {:<10} {:<6} {:<7} {:<12} {:<10} {}",
-                        r.id,
-                        lib,
-                        r.worker_name,
-                        catalog,
-                        r.runtime,
-                        r.port,
-                        ctx,
-                        agent_ctx,
-                        eff_health(&r.worker_name, &r.health_status),
-                        r.started_at.format("%Y-%m-%d %H:%M UTC")
-                    );
-                }
-            } else {
-                println!(
-                    "{:<10} {:<28} {:<10} {:<6} {:<10} STARTED",
-                    "NODE", "CATALOG_ID", "RUNTIME", "PORT", "HEALTH"
-                );
-                for r in rows {
-                    let catalog = r.catalog_id.clone().unwrap_or_else(|| "-".into());
-                    println!(
-                        "{:<10} {:<28} {:<10} {:<6} {:<10} {}",
-                        r.worker_name,
-                        catalog,
-                        r.runtime,
-                        r.port,
-                        eff_health(&r.worker_name, &r.health_status),
-                        r.started_at.format("%Y-%m-%d %H:%M UTC")
-                    );
-                }
-            }
-        }
+        } => handle_model_deployments(pool.clone(), node, show_id, json).await?,
         crate::ModelCommand::AgentReady { node, json } => {
             let rows = ff_db::pg_agent_readiness(&pool, node.as_deref()).await?;
             let min_ctx = ff_agent::model_runtime::AGENT_MIN_CTX as i32;
@@ -1147,149 +1021,7 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                 );
             }
         }
-        crate::ModelCommand::Info { id } => {
-            // Try as catalog id first.
-            if let Some(c) = ff_db::pg_get_catalog(&pool, &id).await? {
-                println!("{CYAN}━ Catalog entry ━{RESET}");
-                println!("ID:           {}", c.id);
-                println!("Name:         {}", c.name);
-                println!("Family:       {}", c.family);
-                println!("Parameters:   {}", c.parameters);
-                println!("Tier:         T{}", c.tier);
-                println!(
-                    "Gated:        {}",
-                    if c.gated {
-                        "yes (HF license required)"
-                    } else {
-                        "no"
-                    }
-                );
-                println!(
-                    "Tool calling: {}",
-                    if c.tool_calling { "yes" } else { "no" }
-                );
-                if let Some(d) = &c.description {
-                    println!("Description:  {d}");
-                }
-                if let Some(arr) = c.preferred_workloads.as_array() {
-                    let wl: Vec<String> = arr
-                        .iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect();
-                    if !wl.is_empty() {
-                        println!("Workloads:    {}", wl.join(", "));
-                    }
-                }
-                if let Some(variants) = c.variants.as_array() {
-                    println!("\nVariants:");
-                    for v in variants {
-                        let runtime = v.get("runtime").and_then(|x| x.as_str()).unwrap_or("?");
-                        let quant = v.get("quant").and_then(|x| x.as_str()).unwrap_or("-");
-                        let repo = v.get("hf_repo").and_then(|x| x.as_str()).unwrap_or("?");
-                        let size = v.get("size_gb").and_then(|x| x.as_f64()).unwrap_or(0.0);
-                        println!("  - {runtime:<10} quant={quant:<8} {size:>6.1} GB  {repo}");
-                    }
-                }
-                // Where is it on the fleet?
-                let lib = ff_db::pg_list_library(&pool, None).await?;
-                let copies: Vec<&ff_db::ModelLibraryRow> =
-                    lib.iter().filter(|r| r.catalog_id == c.id).collect();
-                if !copies.is_empty() {
-                    println!("\nOn disk:");
-                    for r in &copies {
-                        let q = r.quant.clone().unwrap_or_else(|| "-".into());
-                        println!(
-                            "  - {:<10} ({:<10} {:<6}) {}  [{}]",
-                            r.worker_name,
-                            r.runtime,
-                            q,
-                            human_bytes(r.size_bytes as u64),
-                            &r.id[..8]
-                        );
-                    }
-                }
-                let deps = ff_db::pg_list_deployments(&pool, None).await?;
-                let live: Vec<&ff_db::ModelDeploymentRow> = deps
-                    .iter()
-                    .filter(|d| d.catalog_id.as_deref() == Some(&c.id))
-                    .collect();
-                if !live.is_empty() {
-                    println!("\nDeployments:");
-                    for d in &live {
-                        println!(
-                            "  - {:<10} port {:<5} {:<10} health={}  [{}]",
-                            d.worker_name,
-                            d.port,
-                            d.runtime,
-                            d.health_status,
-                            &d.id[..8]
-                        );
-                    }
-                }
-                return Ok(());
-            }
-            // Try as library row UUID.
-            let all_lib = ff_db::pg_list_library(&pool, None).await?;
-            if let Some(r) = all_lib.iter().find(|r| r.id == id) {
-                println!("{CYAN}━ Library row ━{RESET}");
-                println!("ID:           {}", r.id);
-                println!("Node:         {}", r.worker_name);
-                println!("Catalog ID:   {}", r.catalog_id);
-                println!("Runtime:      {}", r.runtime);
-                println!(
-                    "Quant:        {}",
-                    r.quant.clone().unwrap_or_else(|| "-".into())
-                );
-                println!("File path:    {}", r.file_path);
-                println!("Size:         {}", human_bytes(r.size_bytes as u64));
-                if let Some(s) = &r.sha256 {
-                    println!("SHA256:       {s}");
-                }
-                println!(
-                    "Downloaded:   {}",
-                    r.downloaded_at.format("%Y-%m-%d %H:%M UTC")
-                );
-                if let Some(t) = r.last_used_at {
-                    println!("Last used:    {}", t.format("%Y-%m-%d %H:%M UTC"));
-                }
-                if let Some(s) = &r.source_url {
-                    println!("Source:       {s}");
-                }
-                return Ok(());
-            }
-            // Try as deployment UUID.
-            let all_dep = ff_db::pg_list_deployments(&pool, None).await?;
-            if let Some(d) = all_dep.iter().find(|d| d.id == id) {
-                println!("{CYAN}━ Deployment ━{RESET}");
-                println!("ID:           {}", d.id);
-                println!("Node:         {}", d.worker_name);
-                println!(
-                    "Catalog ID:   {}",
-                    d.catalog_id.clone().unwrap_or_else(|| "-".into())
-                );
-                println!("Runtime:      {}", d.runtime);
-                println!("Port:         {}", d.port);
-                println!(
-                    "PID:          {}",
-                    d.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into())
-                );
-                println!("Health:       {}", d.health_status);
-                println!(
-                    "Started:      {}",
-                    d.started_at.format("%Y-%m-%d %H:%M UTC")
-                );
-                if let Some(t) = d.last_health_at {
-                    println!("Last health:  {}", t.format("%Y-%m-%d %H:%M UTC"));
-                }
-                if let Some(c) = d.context_window {
-                    println!("Ctx window:   {c}");
-                }
-                println!("Tokens used:  {}", d.tokens_used);
-                println!("Requests:     {}", d.request_count);
-                return Ok(());
-            }
-            anyhow::bail!("'{id}' is not a known catalog id, library UUID, or deployment UUID");
-        }
+        crate::ModelCommand::Info { id } => handle_model_info(pool.clone(), id).await?,
         crate::ModelCommand::Prune {
             node,
             min_cold_days,
@@ -1864,239 +1596,19 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
             tool_calling,
             no_runtime_row,
         } => {
-            if let Some(t) = tier {
-                if !(1..=4).contains(&t) {
-                    anyhow::bail!("--tier must be 1..4 (got {t})");
-                }
-            }
-            // Parse any operator-supplied runtime variants up front so a typo
-            // fails BEFORE we flip the lifecycle status.
-            let mut variant_objs = Vec::with_capacity(variants.len());
-            for spec in &variants {
-                variant_objs.push(parse_variant_spec(spec)?);
-            }
-
-            // 1. Verify the candidate exists and is still in review, and grab
-            //    the metadata we'll copy into the runtime catalog row.
-            let row = sqlx::query(
-                "SELECT lifecycle_status, display_name, family, parameter_count,
-                        tasks, quality_tier, notes
-                   FROM model_catalog WHERE id = $1",
+            handle_model_approve(
+                pool.clone(),
+                id,
+                skip_benchmark,
+                force,
+                on_computer,
+                variants,
+                tier,
+                workloads,
+                tool_calling,
+                no_runtime_row,
             )
-            .bind(&id)
-            .fetch_optional(&pool)
-            .await?;
-            let Some(row) = row else {
-                anyhow::bail!("no catalog row found for id '{id}'");
-            };
-            let status: String = sqlx::Row::get(&row, "lifecycle_status");
-            if status != "candidate" {
-                anyhow::bail!(
-                    "model '{id}' is in lifecycle_status='{status}' — only 'candidate' rows can be approved"
-                );
-            }
-            let cand_display_name: String = sqlx::Row::get(&row, "display_name");
-            let cand_family: String = sqlx::Row::get(&row, "family");
-            let cand_params: Option<String> = sqlx::Row::get(&row, "parameter_count");
-            let cand_tasks: serde_json::Value = sqlx::Row::get(&row, "tasks");
-            let cand_quality_tier: String = sqlx::Row::get(&row, "quality_tier");
-            let cand_notes: Option<String> = sqlx::Row::get(&row, "notes");
-
-            let skip = skip_benchmark || force;
-            let mut bench_summary: Option<ff_agent::model_benchmark::BenchmarkReport> = None;
-
-            // 2. Benchmark gate (unless skipped).
-            if !skip {
-                // Open a Pulse reader so we can pick a target and find
-                // any healthy loaded endpoint.
-                let redis_url = std::env::var("FORGEFLEET_REDIS_URL")
-                    .unwrap_or_else(|_| "redis://127.0.0.1:56379".into());
-                let pulse = match ff_pulse::reader::PulseReader::new(&redis_url) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        anyhow::bail!(
-                            "can't open Pulse at {redis_url}: {e}\n\
-                             Either fix Redis connectivity, or re-run with --skip-benchmark."
-                        );
-                    }
-                };
-
-                // Pick the target computer.
-                let target = if let Some(c) = on_computer.clone() {
-                    c
-                } else {
-                    match ff_agent::model_benchmark::pick_benchmark_target(&pool, &pulse, &id).await
-                    {
-                        Ok(Some(n)) => n,
-                        Ok(None) => {
-                            anyhow::bail!(
-                                "no compatible node found to benchmark '{id}' \
-                                 (check required_gpu_kind / min_vram_gb / file_size_gb \
-                                 vs live Pulse beats). \
-                                 Use --on-computer <name> to force one, or \
-                                 --skip-benchmark to approve without benchmarking."
-                            );
-                        }
-                        Err(e) => anyhow::bail!("pick_benchmark_target failed: {e}"),
-                    }
-                };
-
-                println!("{CYAN}→{RESET} Benchmarking '{id}' on '{target}' before promotion…");
-
-                let bencher = ff_agent::model_benchmark::ModelBenchmarker::new(pool.clone(), pulse);
-                match bencher.benchmark(&id, &target).await {
-                    Ok(report) => {
-                        if !report.bench_pass {
-                            eprintln!(
-                                "{RED}✗ Benchmark failed:{RESET} {}\n  \
-                                 tokens/sec: {:.2}\n  \
-                                 ttft (ms):  {}\n  \
-                                 endpoint:   {}\n\n\
-                                 Inspect results with: ff model benchmarks --model {id}\n\
-                                 Force anyway with:     ff model approve {id} --skip-benchmark",
-                                report.bench_pass_reason,
-                                report.tokens_per_sec,
-                                report.ttft_ms,
-                                report.endpoint,
-                            );
-                            std::process::exit(1);
-                        }
-                        bench_summary = Some(report);
-                    }
-                    Err(ff_agent::model_benchmark::BenchError::NotLoaded(m, c)) => {
-                        eprintln!(
-                            "{RED}✗ Cannot benchmark:{RESET} model '{m}' is not loaded \
-                             on '{c}' (no active+healthy LLM server found in Pulse).\n\n\
-                             Either:\n  \
-                               • load it first:   ff model load <library_id> --port 51001\n  \
-                               • pick a node that has it loaded: --on-computer <name>\n  \
-                               • skip the benchmark: --skip-benchmark"
-                        );
-                        std::process::exit(1);
-                    }
-                    Err(e) => anyhow::bail!("benchmark error: {e}"),
-                }
-            }
-
-            // 3. Promote to active (idempotent-safe: we re-check the gate).
-            let result = sqlx::query(
-                "UPDATE model_catalog
-                    SET lifecycle_status = 'active'
-                  WHERE id = $1 AND lifecycle_status = 'candidate'",
-            )
-            .bind(&id)
-            .execute(&pool)
-            .await?;
-            if result.rows_affected() == 0 {
-                anyhow::bail!("race: candidate '{id}' was changed by someone else during approval");
-            }
-
-            // 3b. Materialize the runtime catalog row so the loader/router can
-            //     actually see the approved model. The two catalogs share the
-            //     `id` keyspace but were never kept in sync — without this an
-            //     "approved" model still wasn't servable. ON CONFLICT DO NOTHING
-            //     so an existing operator-tuned runtime row is never clobbered.
-            //     Failure here is non-fatal: the lifecycle flip already
-            //     committed, so we warn loudly with the manual recovery command
-            //     rather than reporting a misleading "approve failed".
-            let mut runtime_row_note: Option<String> = None;
-            if !no_runtime_row {
-                let tier_val = tier.unwrap_or_else(|| quality_tier_to_int(&cand_quality_tier));
-                let params_val = cand_params
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or("unknown")
-                    .to_string();
-                // Workloads: explicit override (csv) else the candidate's HF tasks.
-                let workloads_json = match workloads.as_deref() {
-                    Some(csv) => serde_json::json!(
-                        csv.split(',')
-                            .map(str::trim)
-                            .filter(|t| !t.is_empty())
-                            .collect::<Vec<_>>()
-                    ),
-                    None => {
-                        if cand_tasks.is_array() {
-                            cand_tasks.clone()
-                        } else {
-                            serde_json::json!([])
-                        }
-                    }
-                };
-                let tool_calling_val = tool_calling
-                    || workloads_json
-                        .as_array()
-                        .map(|a| a.iter().any(|w| w.as_str() == Some("tool_calling")))
-                        .unwrap_or(false);
-                let variants_json = serde_json::Value::Array(variant_objs.clone());
-
-                let res = sqlx::query(
-                    "INSERT INTO fleet_model_catalog
-                         (id, name, family, parameters, tier, description,
-                          gated, preferred_workloads, variants, tool_calling)
-                     VALUES ($1, $2, $3, $4, $5, $6, FALSE, $7, $8, $9)
-                     ON CONFLICT (id) DO NOTHING",
-                )
-                .bind(&id)
-                .bind(&cand_display_name)
-                .bind(&cand_family)
-                .bind(&params_val)
-                .bind(tier_val)
-                .bind(&cand_notes)
-                .bind(&workloads_json)
-                .bind(&variants_json)
-                .bind(tool_calling_val)
-                .execute(&pool)
-                .await;
-                match res {
-                    Ok(r) if r.rows_affected() == 1 => {
-                        runtime_row_note = Some(if variant_objs.is_empty() {
-                            format!(
-                                "runtime row created (tier {tier_val}, tool_calling={tool_calling_val}); \
-                                 router/loader-visible but NOT yet downloadable — scout candidates carry \
-                                 no runtime info. Tip: pass `--variant runtime:hf_repo[:quant[:size_gb]]` \
-                                 to `ff model approve` to make it servable in one step."
-                            )
-                        } else {
-                            format!(
-                                "runtime row created (tier {tier_val}, tool_calling={tool_calling_val}, \
-                                 {} variant(s)); download with: ff model download {id}",
-                                variant_objs.len()
-                            )
-                        });
-                    }
-                    Ok(_) => {
-                        runtime_row_note =
-                            Some("runtime row already existed (left untouched)".into());
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "{YELLOW}⚠ Promoted, but could NOT materialize the fleet_model_catalog \
-                             runtime row:{RESET} {e}\n  \
-                             The model is active but not yet loader/router-visible. Add it manually:\n  \
-                             ff model catalog-add {id} --name '{cand_display_name}' --family {cand_family} \
-                             --params {params_val} [--variant ...]"
-                        );
-                    }
-                }
-            }
-
-            // 4. Report.
-            println!("{GREEN}✓{RESET} Promoted '{id}' to lifecycle_status='active'");
-            if let Some(note) = &runtime_row_note {
-                println!("  {CYAN}↳{RESET} {note}");
-            }
-            if let Some(r) = bench_summary {
-                println!("  benchmark pass:   yes");
-                println!("  computer:         {}", r.computer);
-                println!("  endpoint:         {}", r.endpoint);
-                println!("  tokens/sec:       {:.2}", r.tokens_per_sec);
-                println!("  ttft (ms):        {}", r.ttft_ms);
-                println!("  prompts:          {}", r.prompt_count);
-            } else {
-                println!("  benchmark pass:   (skipped)");
-            }
+            .await?
         }
         crate::ModelCommand::Reject { id } => {
             let row = sqlx::query(
@@ -2246,6 +1758,540 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                 }
             }
         }
+    }
+    Ok(())
+}
+
+/// `ff model deployments` handler — extracted verbatim from the
+/// `handle_model` dispatch arm. `pool` by value (cheap Arc clone) so the body's
+/// `&pool` / `pool.clone()` uses are unchanged.
+async fn handle_model_deployments(
+    pool: sqlx::PgPool,
+    node: Option<String>,
+    show_id: bool,
+    json: bool,
+) -> anyhow::Result<()> {
+    ensure_known_node(&pool, node.as_deref()).await?;
+    let mut rows = ff_db::pg_list_deployments(&pool, node.as_deref()).await?;
+    // Sort by primary IP (subnet order), matching every other
+    // per-computer table. Names→IPs via the computers table; stable sort
+    // keeps the SQL `ORDER BY worker_name, port` order within an IP.
+    let ip_by_name = crate::helpers::name_to_primary_ip(&pool).await?;
+    rows.sort_by_key(|r| {
+        crate::helpers::ip_sort_key(
+            ip_by_name
+                .get(&r.worker_name)
+                .map(String::as_str)
+                .unwrap_or(""),
+        )
+    });
+    // A deployment row's `health_status` is frozen at the last update by
+    // the node that owns it. When that node goes offline, nobody refreshes
+    // the row, so a long-dead host keeps reporting `healthy` — an
+    // observability lie the router and both autopilot loops could act on.
+    // Cross-reference the live pulse beat set: a node with no current beat
+    // is offline, so its deployments are `stale` regardless of the stored
+    // value. If the pulse reader is unavailable we can't tell, so we never
+    // mask (treat every node as online) — only override on a positive
+    // "node is offline" signal.
+    let online: std::collections::HashSet<String> = match crate::utils::pulse_reader() {
+        Ok(r) => r
+            .beats_by_name()
+            .await
+            .map(|m| m.into_keys().collect())
+            .unwrap_or_default(),
+        Err(_) => std::collections::HashSet::new(),
+    };
+    let node_online = |n: &str| online.is_empty() || online.contains(n);
+    let eff_health = |n: &str, h: &str| effective_deployment_health(node_online(n), h);
+    if json {
+        let out: Vec<_> = rows
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.id,
+                    "library_id": r.library_id,
+                    "node": r.worker_name,
+                    "node_online": node_online(&r.worker_name),
+                    "catalog_id": r.catalog_id,
+                    "runtime": r.runtime,
+                    "port": r.port,
+                    "health": r.health_status,
+                    "effective_health": eff_health(&r.worker_name, &r.health_status),
+                    "context_window": r.context_window,
+                    "parallel_slots": r.parallel_slots,
+                    "usable_agent_ctx": r.usable_agent_ctx,
+                    "request_count": r.request_count,
+                    "tokens_used": r.tokens_used,
+                    "started_at": r.started_at.to_rfc3339(),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+    if rows.is_empty() {
+        println!("(no deployments recorded)");
+        return Ok(());
+    }
+    // With --show-id, surface DEPLOYMENT_ID (for `ff model unload`),
+    // LIBRARY_ID, CTX (for a faithful `ff model load` reload), and
+    // AGENT_CTX = usable per-slot ctx × slot count (so you can spot the
+    // agent-capable endpoints the router will pick).
+    if show_id {
+        println!(
+            "{:<38} {:<38} {:<10} {:<28} {:<10} {:<6} {:<7} {:<12} {:<10} STARTED",
+            "DEPLOYMENT_ID",
+            "LIBRARY_ID",
+            "NODE",
+            "CATALOG_ID",
+            "RUNTIME",
+            "PORT",
+            "CTX",
+            "AGENT_CTX",
+            "HEALTH"
+        );
+        for r in rows {
+            let catalog = r.catalog_id.clone().unwrap_or_else(|| "-".into());
+            let lib = r.library_id.clone().unwrap_or_else(|| "-".into());
+            let ctx = r
+                .context_window
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "-".into());
+            // e.g. "32768x1" (usable_agent_ctx × parallel_slots).
+            let agent_ctx = match (r.usable_agent_ctx, r.parallel_slots) {
+                (Some(u), Some(p)) => format!("{u}x{p}"),
+                (Some(u), None) => u.to_string(),
+                _ => "-".into(),
+            };
+            println!(
+                "{:<38} {:<38} {:<10} {:<28} {:<10} {:<6} {:<7} {:<12} {:<10} {}",
+                r.id,
+                lib,
+                r.worker_name,
+                catalog,
+                r.runtime,
+                r.port,
+                ctx,
+                agent_ctx,
+                eff_health(&r.worker_name, &r.health_status),
+                r.started_at.format("%Y-%m-%d %H:%M UTC")
+            );
+        }
+    } else {
+        println!(
+            "{:<10} {:<28} {:<10} {:<6} {:<10} STARTED",
+            "NODE", "CATALOG_ID", "RUNTIME", "PORT", "HEALTH"
+        );
+        for r in rows {
+            let catalog = r.catalog_id.clone().unwrap_or_else(|| "-".into());
+            println!(
+                "{:<10} {:<28} {:<10} {:<6} {:<10} {}",
+                r.worker_name,
+                catalog,
+                r.runtime,
+                r.port,
+                eff_health(&r.worker_name, &r.health_status),
+                r.started_at.format("%Y-%m-%d %H:%M UTC")
+            );
+        }
+    }
+    Ok(())
+}
+
+/// `ff model info` handler — extracted verbatim from the
+/// `handle_model` dispatch arm. `pool` by value (cheap Arc clone) so the body's
+/// `&pool` / `pool.clone()` uses are unchanged.
+async fn handle_model_info(pool: sqlx::PgPool, id: String) -> anyhow::Result<()> {
+    // Try as catalog id first.
+    if let Some(c) = ff_db::pg_get_catalog(&pool, &id).await? {
+        println!("{CYAN}━ Catalog entry ━{RESET}");
+        println!("ID:           {}", c.id);
+        println!("Name:         {}", c.name);
+        println!("Family:       {}", c.family);
+        println!("Parameters:   {}", c.parameters);
+        println!("Tier:         T{}", c.tier);
+        println!(
+            "Gated:        {}",
+            if c.gated {
+                "yes (HF license required)"
+            } else {
+                "no"
+            }
+        );
+        println!(
+            "Tool calling: {}",
+            if c.tool_calling { "yes" } else { "no" }
+        );
+        if let Some(d) = &c.description {
+            println!("Description:  {d}");
+        }
+        if let Some(arr) = c.preferred_workloads.as_array() {
+            let wl: Vec<String> = arr
+                .iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect();
+            if !wl.is_empty() {
+                println!("Workloads:    {}", wl.join(", "));
+            }
+        }
+        if let Some(variants) = c.variants.as_array() {
+            println!("\nVariants:");
+            for v in variants {
+                let runtime = v.get("runtime").and_then(|x| x.as_str()).unwrap_or("?");
+                let quant = v.get("quant").and_then(|x| x.as_str()).unwrap_or("-");
+                let repo = v.get("hf_repo").and_then(|x| x.as_str()).unwrap_or("?");
+                let size = v.get("size_gb").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                println!("  - {runtime:<10} quant={quant:<8} {size:>6.1} GB  {repo}");
+            }
+        }
+        // Where is it on the fleet?
+        let lib = ff_db::pg_list_library(&pool, None).await?;
+        let copies: Vec<&ff_db::ModelLibraryRow> =
+            lib.iter().filter(|r| r.catalog_id == c.id).collect();
+        if !copies.is_empty() {
+            println!("\nOn disk:");
+            for r in &copies {
+                let q = r.quant.clone().unwrap_or_else(|| "-".into());
+                println!(
+                    "  - {:<10} ({:<10} {:<6}) {}  [{}]",
+                    r.worker_name,
+                    r.runtime,
+                    q,
+                    human_bytes(r.size_bytes as u64),
+                    &r.id[..8]
+                );
+            }
+        }
+        let deps = ff_db::pg_list_deployments(&pool, None).await?;
+        let live: Vec<&ff_db::ModelDeploymentRow> = deps
+            .iter()
+            .filter(|d| d.catalog_id.as_deref() == Some(&c.id))
+            .collect();
+        if !live.is_empty() {
+            println!("\nDeployments:");
+            for d in &live {
+                println!(
+                    "  - {:<10} port {:<5} {:<10} health={}  [{}]",
+                    d.worker_name,
+                    d.port,
+                    d.runtime,
+                    d.health_status,
+                    &d.id[..8]
+                );
+            }
+        }
+        return Ok(());
+    }
+    // Try as library row UUID.
+    let all_lib = ff_db::pg_list_library(&pool, None).await?;
+    if let Some(r) = all_lib.iter().find(|r| r.id == id) {
+        println!("{CYAN}━ Library row ━{RESET}");
+        println!("ID:           {}", r.id);
+        println!("Node:         {}", r.worker_name);
+        println!("Catalog ID:   {}", r.catalog_id);
+        println!("Runtime:      {}", r.runtime);
+        println!(
+            "Quant:        {}",
+            r.quant.clone().unwrap_or_else(|| "-".into())
+        );
+        println!("File path:    {}", r.file_path);
+        println!("Size:         {}", human_bytes(r.size_bytes as u64));
+        if let Some(s) = &r.sha256 {
+            println!("SHA256:       {s}");
+        }
+        println!(
+            "Downloaded:   {}",
+            r.downloaded_at.format("%Y-%m-%d %H:%M UTC")
+        );
+        if let Some(t) = r.last_used_at {
+            println!("Last used:    {}", t.format("%Y-%m-%d %H:%M UTC"));
+        }
+        if let Some(s) = &r.source_url {
+            println!("Source:       {s}");
+        }
+        return Ok(());
+    }
+    // Try as deployment UUID.
+    let all_dep = ff_db::pg_list_deployments(&pool, None).await?;
+    if let Some(d) = all_dep.iter().find(|d| d.id == id) {
+        println!("{CYAN}━ Deployment ━{RESET}");
+        println!("ID:           {}", d.id);
+        println!("Node:         {}", d.worker_name);
+        println!(
+            "Catalog ID:   {}",
+            d.catalog_id.clone().unwrap_or_else(|| "-".into())
+        );
+        println!("Runtime:      {}", d.runtime);
+        println!("Port:         {}", d.port);
+        println!(
+            "PID:          {}",
+            d.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into())
+        );
+        println!("Health:       {}", d.health_status);
+        println!(
+            "Started:      {}",
+            d.started_at.format("%Y-%m-%d %H:%M UTC")
+        );
+        if let Some(t) = d.last_health_at {
+            println!("Last health:  {}", t.format("%Y-%m-%d %H:%M UTC"));
+        }
+        if let Some(c) = d.context_window {
+            println!("Ctx window:   {c}");
+        }
+        println!("Tokens used:  {}", d.tokens_used);
+        println!("Requests:     {}", d.request_count);
+        return Ok(());
+    }
+    anyhow::bail!("'{id}' is not a known catalog id, library UUID, or deployment UUID");
+    Ok(())
+}
+
+/// `ff model approve` handler — extracted verbatim from the
+/// `handle_model` dispatch arm. `pool` by value (cheap Arc clone) so the body's
+/// `&pool` / `pool.clone()` uses are unchanged.
+async fn handle_model_approve(
+    pool: sqlx::PgPool,
+    id: String,
+    skip_benchmark: bool,
+    force: bool,
+    on_computer: Option<String>,
+    variants: Vec<String>,
+    tier: Option<i32>,
+    workloads: Option<String>,
+    tool_calling: bool,
+    no_runtime_row: bool,
+) -> anyhow::Result<()> {
+    if let Some(t) = tier {
+        if !(1..=4).contains(&t) {
+            anyhow::bail!("--tier must be 1..4 (got {t})");
+        }
+    }
+    // Parse any operator-supplied runtime variants up front so a typo
+    // fails BEFORE we flip the lifecycle status.
+    let mut variant_objs = Vec::with_capacity(variants.len());
+    for spec in &variants {
+        variant_objs.push(parse_variant_spec(spec)?);
+    }
+
+    // 1. Verify the candidate exists and is still in review, and grab
+    //    the metadata we'll copy into the runtime catalog row.
+    let row = sqlx::query(
+        "SELECT lifecycle_status, display_name, family, parameter_count,
+                        tasks, quality_tier, notes
+                   FROM model_catalog WHERE id = $1",
+    )
+    .bind(&id)
+    .fetch_optional(&pool)
+    .await?;
+    let Some(row) = row else {
+        anyhow::bail!("no catalog row found for id '{id}'");
+    };
+    let status: String = sqlx::Row::get(&row, "lifecycle_status");
+    if status != "candidate" {
+        anyhow::bail!(
+            "model '{id}' is in lifecycle_status='{status}' — only 'candidate' rows can be approved"
+        );
+    }
+    let cand_display_name: String = sqlx::Row::get(&row, "display_name");
+    let cand_family: String = sqlx::Row::get(&row, "family");
+    let cand_params: Option<String> = sqlx::Row::get(&row, "parameter_count");
+    let cand_tasks: serde_json::Value = sqlx::Row::get(&row, "tasks");
+    let cand_quality_tier: String = sqlx::Row::get(&row, "quality_tier");
+    let cand_notes: Option<String> = sqlx::Row::get(&row, "notes");
+
+    let skip = skip_benchmark || force;
+    let mut bench_summary: Option<ff_agent::model_benchmark::BenchmarkReport> = None;
+
+    // 2. Benchmark gate (unless skipped).
+    if !skip {
+        // Open a Pulse reader so we can pick a target and find
+        // any healthy loaded endpoint.
+        let redis_url = std::env::var("FORGEFLEET_REDIS_URL")
+            .unwrap_or_else(|_| "redis://127.0.0.1:56379".into());
+        let pulse = match ff_pulse::reader::PulseReader::new(&redis_url) {
+            Ok(p) => p,
+            Err(e) => {
+                anyhow::bail!(
+                    "can't open Pulse at {redis_url}: {e}\n\
+                             Either fix Redis connectivity, or re-run with --skip-benchmark."
+                );
+            }
+        };
+
+        // Pick the target computer.
+        let target = if let Some(c) = on_computer.clone() {
+            c
+        } else {
+            match ff_agent::model_benchmark::pick_benchmark_target(&pool, &pulse, &id).await {
+                Ok(Some(n)) => n,
+                Ok(None) => {
+                    anyhow::bail!(
+                        "no compatible node found to benchmark '{id}' \
+                                 (check required_gpu_kind / min_vram_gb / file_size_gb \
+                                 vs live Pulse beats). \
+                                 Use --on-computer <name> to force one, or \
+                                 --skip-benchmark to approve without benchmarking."
+                    );
+                }
+                Err(e) => anyhow::bail!("pick_benchmark_target failed: {e}"),
+            }
+        };
+
+        println!("{CYAN}→{RESET} Benchmarking '{id}' on '{target}' before promotion…");
+
+        let bencher = ff_agent::model_benchmark::ModelBenchmarker::new(pool.clone(), pulse);
+        match bencher.benchmark(&id, &target).await {
+            Ok(report) => {
+                if !report.bench_pass {
+                    eprintln!(
+                        "{RED}✗ Benchmark failed:{RESET} {}\n  \
+                                 tokens/sec: {:.2}\n  \
+                                 ttft (ms):  {}\n  \
+                                 endpoint:   {}\n\n\
+                                 Inspect results with: ff model benchmarks --model {id}\n\
+                                 Force anyway with:     ff model approve {id} --skip-benchmark",
+                        report.bench_pass_reason,
+                        report.tokens_per_sec,
+                        report.ttft_ms,
+                        report.endpoint,
+                    );
+                    std::process::exit(1);
+                }
+                bench_summary = Some(report);
+            }
+            Err(ff_agent::model_benchmark::BenchError::NotLoaded(m, c)) => {
+                eprintln!(
+                    "{RED}✗ Cannot benchmark:{RESET} model '{m}' is not loaded \
+                             on '{c}' (no active+healthy LLM server found in Pulse).\n\n\
+                             Either:\n  \
+                               • load it first:   ff model load <library_id> --port 51001\n  \
+                               • pick a node that has it loaded: --on-computer <name>\n  \
+                               • skip the benchmark: --skip-benchmark"
+                );
+                std::process::exit(1);
+            }
+            Err(e) => anyhow::bail!("benchmark error: {e}"),
+        }
+    }
+
+    // 3. Promote to active (idempotent-safe: we re-check the gate).
+    let result = sqlx::query(
+        "UPDATE model_catalog
+                    SET lifecycle_status = 'active'
+                  WHERE id = $1 AND lifecycle_status = 'candidate'",
+    )
+    .bind(&id)
+    .execute(&pool)
+    .await?;
+    if result.rows_affected() == 0 {
+        anyhow::bail!("race: candidate '{id}' was changed by someone else during approval");
+    }
+
+    // 3b. Materialize the runtime catalog row so the loader/router can
+    //     actually see the approved model. The two catalogs share the
+    //     `id` keyspace but were never kept in sync — without this an
+    //     "approved" model still wasn't servable. ON CONFLICT DO NOTHING
+    //     so an existing operator-tuned runtime row is never clobbered.
+    //     Failure here is non-fatal: the lifecycle flip already
+    //     committed, so we warn loudly with the manual recovery command
+    //     rather than reporting a misleading "approve failed".
+    let mut runtime_row_note: Option<String> = None;
+    if !no_runtime_row {
+        let tier_val = tier.unwrap_or_else(|| quality_tier_to_int(&cand_quality_tier));
+        let params_val = cand_params
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("unknown")
+            .to_string();
+        // Workloads: explicit override (csv) else the candidate's HF tasks.
+        let workloads_json = match workloads.as_deref() {
+            Some(csv) => serde_json::json!(
+                csv.split(',')
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                    .collect::<Vec<_>>()
+            ),
+            None => {
+                if cand_tasks.is_array() {
+                    cand_tasks.clone()
+                } else {
+                    serde_json::json!([])
+                }
+            }
+        };
+        let tool_calling_val = tool_calling
+            || workloads_json
+                .as_array()
+                .map(|a| a.iter().any(|w| w.as_str() == Some("tool_calling")))
+                .unwrap_or(false);
+        let variants_json = serde_json::Value::Array(variant_objs.clone());
+
+        let res = sqlx::query(
+            "INSERT INTO fleet_model_catalog
+                         (id, name, family, parameters, tier, description,
+                          gated, preferred_workloads, variants, tool_calling)
+                     VALUES ($1, $2, $3, $4, $5, $6, FALSE, $7, $8, $9)
+                     ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(&id)
+        .bind(&cand_display_name)
+        .bind(&cand_family)
+        .bind(&params_val)
+        .bind(tier_val)
+        .bind(&cand_notes)
+        .bind(&workloads_json)
+        .bind(&variants_json)
+        .bind(tool_calling_val)
+        .execute(&pool)
+        .await;
+        match res {
+            Ok(r) if r.rows_affected() == 1 => {
+                runtime_row_note = Some(if variant_objs.is_empty() {
+                    format!(
+                        "runtime row created (tier {tier_val}, tool_calling={tool_calling_val}); \
+                                 router/loader-visible but NOT yet downloadable — scout candidates carry \
+                                 no runtime info. Tip: pass `--variant runtime:hf_repo[:quant[:size_gb]]` \
+                                 to `ff model approve` to make it servable in one step."
+                    )
+                } else {
+                    format!(
+                        "runtime row created (tier {tier_val}, tool_calling={tool_calling_val}, \
+                                 {} variant(s)); download with: ff model download {id}",
+                        variant_objs.len()
+                    )
+                });
+            }
+            Ok(_) => {
+                runtime_row_note = Some("runtime row already existed (left untouched)".into());
+            }
+            Err(e) => {
+                eprintln!(
+                    "{YELLOW}⚠ Promoted, but could NOT materialize the fleet_model_catalog \
+                             runtime row:{RESET} {e}\n  \
+                             The model is active but not yet loader/router-visible. Add it manually:\n  \
+                             ff model catalog-add {id} --name '{cand_display_name}' --family {cand_family} \
+                             --params {params_val} [--variant ...]"
+                );
+            }
+        }
+    }
+
+    // 4. Report.
+    println!("{GREEN}✓{RESET} Promoted '{id}' to lifecycle_status='active'");
+    if let Some(note) = &runtime_row_note {
+        println!("  {CYAN}↳{RESET} {note}");
+    }
+    if let Some(r) = bench_summary {
+        println!("  benchmark pass:   yes");
+        println!("  computer:         {}", r.computer);
+        println!("  endpoint:         {}", r.endpoint);
+        println!("  tokens/sec:       {:.2}", r.tokens_per_sec);
+        println!("  ttft (ms):        {}", r.ttft_ms);
+        println!("  prompts:          {}", r.prompt_count);
+    } else {
+        println!("  benchmark pass:   (skipped)");
     }
     Ok(())
 }
