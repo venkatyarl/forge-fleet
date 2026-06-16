@@ -106,6 +106,60 @@ impl BacklogService {
         self.items.is_empty()
     }
 
+    /// Hydrate the in-memory map from Postgres. Call once on startup so
+    /// recurrence counters survive daemon restarts (without this, every restart
+    /// resets occurrences to zero and recurring issues never reach promotion).
+    /// Returns the number of items loaded. A row that fails to deserialize
+    /// (e.g. a stale schema) is skipped, not fatal.
+    pub async fn load_from_pg(&self, pool: &sqlx::PgPool) -> Result<usize, sqlx::Error> {
+        let rows: Vec<(String, serde_json::Value)> =
+            sqlx::query_as("SELECT fingerprint, item FROM evolution_backlog")
+                .fetch_all(pool)
+                .await?;
+        let mut loaded = 0;
+        for (fingerprint, json) in rows {
+            match serde_json::from_value::<BacklogItem>(json) {
+                Ok(item) => {
+                    self.items.insert(fingerprint, item);
+                    loaded += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(%fingerprint, error = %e, "evolution backlog: skipping unreadable row");
+                }
+            }
+        }
+        Ok(loaded)
+    }
+
+    /// Write-through one item (UPSERT by fingerprint). The item is stored whole
+    /// as JSONB; `durable` is mirrored into a column for cheap querying.
+    pub async fn persist_item(pool: &sqlx::PgPool, item: &BacklogItem) -> Result<(), sqlx::Error> {
+        let json = serde_json::to_value(item).map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+        sqlx::query(
+            "INSERT INTO evolution_backlog (fingerprint, item, durable, updated_at) \
+             VALUES ($1, $2, $3, NOW()) \
+             ON CONFLICT (fingerprint) DO UPDATE \
+                SET item = EXCLUDED.item, durable = EXCLUDED.durable, updated_at = NOW()",
+        )
+        .bind(&item.fingerprint)
+        .bind(json)
+        .bind(item.durable)
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Flush every in-memory item to Postgres. Called after an ingest cycle; the
+    /// backlog is small (one row per distinct root-cause fingerprint), so a full
+    /// flush is cheap and keeps the write path simple. Returns rows persisted.
+    pub async fn persist_all(&self, pool: &sqlx::PgPool) -> Result<usize, sqlx::Error> {
+        let items: Vec<BacklogItem> = self.items.iter().map(|entry| entry.clone()).collect();
+        for item in &items {
+            Self::persist_item(pool, item).await?;
+        }
+        Ok(items.len())
+    }
+
     fn upsert_cause(&self, cause: &RootCause) -> Option<BacklogItem> {
         let now = Utc::now();
         let mut promoted: Option<BacklogItem> = None;
@@ -241,5 +295,30 @@ mod tests {
         assert_eq!(promoted2.len(), 1);
         assert!(promoted2[0].durable);
         assert_eq!(promoted2[0].status, BacklogStatus::Open);
+    }
+
+    #[test]
+    fn backlog_item_survives_jsonb_round_trip() {
+        // The persistence layer stores each BacklogItem whole as JSONB; verify a
+        // round-trip is lossless so a hydrated item is byte-identical to what was
+        // written (all enums included).
+        let backlog = BacklogService::new(1);
+        let items = backlog.ingest_report(&report_from(cause(
+            "res:oom",
+            RootCauseCategory::ResourceExhaustion,
+        )));
+        assert_eq!(items.len(), 1);
+        let original = &items[0];
+
+        let json = serde_json::to_value(original).expect("serialize");
+        let restored: BacklogItem = serde_json::from_value(json).expect("deserialize");
+
+        assert_eq!(restored.fingerprint, original.fingerprint);
+        assert_eq!(restored.cause_category, original.cause_category);
+        assert_eq!(restored.priority, original.priority);
+        assert_eq!(restored.status, original.status);
+        assert_eq!(restored.occurrences, original.occurrences);
+        assert_eq!(restored.durable, original.durable);
+        assert_eq!(restored.id, original.id);
     }
 }

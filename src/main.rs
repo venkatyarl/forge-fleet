@@ -558,6 +558,7 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         subsystem_tasks.push(start_evolution_subsystem(
             config.clone(),
             registry.clone(),
+            operational_store.pg_pool().cloned(),
             shutdown_rx.clone(),
         ));
     } else {
@@ -1971,12 +1972,25 @@ fn start_telegram_transport_subsystem(
 fn start_evolution_subsystem(
     config: FleetConfig,
     registry: Arc<NodeRegistry>,
+    pg_pool: Option<sqlx::PgPool>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let loop_cfg = config.loops.evolution.clone();
         let mut engine = EvolutionEngine::default();
         engine.verifier = VerificationModel::new(loop_cfg.minimum_improvement_ratio);
+
+        // Hydrate the recurrence backlog from Postgres so occurrence counters
+        // survive restarts (without this, every restart resets them to zero and
+        // a recurring issue never reaches promotion). Best-effort: a DB hiccup
+        // must not stop the loop from running in-memory.
+        if let Some(pool) = &pg_pool {
+            match engine.backlog.load_from_pg(pool).await {
+                Ok(n) if n > 0 => info!(loaded = n, "evolution backlog hydrated from Postgres"),
+                Ok(_) => {}
+                Err(e) => warn!(error = %e, "evolution backlog hydrate failed (continuing in-memory)"),
+            }
+        }
 
         let mut ticker = tokio::time::interval(Duration::from_secs(loop_cfg.interval_secs.max(10)));
         let mut previous_error_rate = 0.0f32;
@@ -2060,6 +2074,13 @@ fn start_evolution_subsystem(
                                 unhealthy_nodes = unhealthy_count,
                                 "evolution loop cycle complete"
                             );
+                            // Write-through the (possibly updated) backlog so the
+                            // recurrence state is durable across restarts.
+                            if let Some(pool) = &pg_pool
+                                && let Err(e) = engine.backlog.persist_all(pool).await
+                            {
+                                warn!(error = %e, "evolution backlog persist failed");
+                            }
                         }
                         Err(err) => {
                             warn!(error = %err, "evolution loop cycle failed");
