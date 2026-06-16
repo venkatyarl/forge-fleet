@@ -466,9 +466,10 @@ pub async fn ping_redis(url: &str) -> std::result::Result<u128, String> {
     // Strip userinfo if present.
     let host_port = host_port.rsplit('@').next().unwrap_or(host_port);
     let (host, port) = match host_port.rsplit_once(':') {
-        // Host-facing default: docker-compose publishes Redis on 6380.
-        Some((h, p)) => (h.to_string(), p.parse::<u16>().unwrap_or(6380)),
-        None => (host_port.to_string(), 6380),
+        // Host-facing default: docker-compose publishes Redis on 56379
+        // (5-digit canonical port; old 6380 remapped 2026-05-18).
+        Some((h, p)) => (h.to_string(), p.parse::<u16>().unwrap_or(56379)),
+        None => (host_port.to_string(), 56379),
     };
 
     let start = std::time::Instant::now();
