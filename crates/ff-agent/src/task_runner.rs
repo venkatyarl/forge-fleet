@@ -1672,6 +1672,25 @@ pub async fn compose_fleet_upgrade_wave(
         ));
     }
 
+    // HA Phase 2 drain: refuse a daemon-self upgrade wave while a leadership
+    // maintenance lease is active. Restarting daemons mid-handoff is the wave
+    // self-kill race the V62 singleton guards against, now spanning a leader
+    // change — defer until the lease ends (it auto-fails-back), then re-compose.
+    if crate::auto_upgrade::is_daemon_self_software(software_id)
+        && ff_db::pg_get_active_maintenance_lease(pg)
+            .await
+            .unwrap_or(None)
+            .is_some()
+    {
+        tracing::info!(
+            software_id = %software_id,
+            "fleet-upgrade-wave: refusing dispatch — leadership maintenance lease active (HA Phase 2 drain)"
+        );
+        return Err(sqlx::Error::Configuration(
+            "leadership handoff in progress (maintenance lease) — daemon-self wave deferred".into(),
+        ));
+    }
+
     let mut wave_targets: Vec<WaveTarget> = Vec::with_capacity(plans.len());
     for plan in plans {
         if plan.computer_name.eq_ignore_ascii_case(&leader_lower) {

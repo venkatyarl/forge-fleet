@@ -8693,3 +8693,21 @@ CREATE TABLE IF NOT EXISTS evolution_backlog (
 CREATE INDEX IF NOT EXISTS idx_evolution_backlog_durable
     ON evolution_backlog (durable) WHERE durable;
 "#;
+
+// ─── V133: HA leader-handoff Phase 2 — maintenance lease ────────────────────
+//
+// Phase 1 (#224) gave a graceful operator step-down via the `leader_yield_request`
+// fleet_secret (`<member>|<until>`): the named leader yields and election picks
+// the next-best-priority follower, auto-failing-back when the deadline passes.
+// Phase 2 adds a DESIGNATED successor + visibility: two nullable columns on the
+// singleton `fleet_leader_state` row record an active maintenance lease — who
+// should hold leadership (`standby_member`) and until when (`relinquishing_until`).
+// While the lease is live, election PREFERS `standby_member` outright (not merely
+// the lowest priority), and it auto-reverts when `relinquishing_until` passes.
+// Columns are nullable + inert by default, so the row's existing semantics are
+// unchanged when no lease is set. No PG-primary move (that's Phase 3).
+pub const SCHEMA_V133_LEADER_MAINTENANCE_LEASE: &str = r#"
+ALTER TABLE fleet_leader_state
+    ADD COLUMN IF NOT EXISTS standby_member      TEXT,
+    ADD COLUMN IF NOT EXISTS relinquishing_until TIMESTAMPTZ;
+"#;

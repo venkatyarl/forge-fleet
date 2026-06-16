@@ -1372,6 +1372,10 @@ enum LeaderAction {
         /// Leader to step down. Defaults to the current elected leader.
         #[arg(long)]
         member: Option<String>,
+        /// HA Phase 2: designate WHICH follower takes leadership (a maintenance
+        /// lease). Without it, election picks the next-best by priority.
+        #[arg(long)]
+        to: Option<String>,
         /// Cancel an active step-down and fail back immediately.
         #[arg(long)]
         clear: bool,

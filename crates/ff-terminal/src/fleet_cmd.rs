@@ -2128,6 +2128,17 @@ pub async fn handle_fleet_leader(pool: &sqlx::PgPool, json: bool) -> Result<()> 
         }
     }
 
+    // HA Phase 2: surface an active maintenance lease (designated standby).
+    if let Some((standby, until)) = ff_db::pg_get_active_maintenance_lease(&pool)
+        .await
+        .unwrap_or(None)
+    {
+        println!(
+            "  {CYAN}maintenance lease:{RESET} → {standby} until {} (auto fail-back)",
+            until.format("%Y-%m-%d %H:%M:%S UTC")
+        );
+    }
+
     if !candidates.is_empty() {
         println!("\n  Candidates (by election_priority):");
         for (name, prio) in &candidates {
@@ -2165,6 +2176,7 @@ pub async fn handle_fleet_leader_step_down(
     pool: &sqlx::PgPool,
     minutes: i64,
     member: Option<String>,
+    to: Option<String>,
     clear: bool,
     yes: bool,
 ) -> Result<()> {
@@ -2174,6 +2186,10 @@ pub async fn handle_fleet_leader_step_down(
         let existed = ff_db::pg_delete_secret(pool, KEY)
             .await
             .map_err(|e| anyhow::anyhow!("clear leader_yield_request: {e}"))?;
+        // Also clear any HA Phase 2 maintenance lease (designated standby).
+        ff_db::pg_clear_maintenance_lease(pool)
+            .await
+            .map_err(|e| anyhow::anyhow!("clear maintenance lease: {e}"))?;
         if existed {
             println!(
                 "{GREEN}✓ step-down cleared{RESET} — the target will re-assert leadership within ~2 ticks."
@@ -2218,13 +2234,29 @@ pub async fn handle_fleet_leader_step_down(
     .await
     .map_err(|e| anyhow::anyhow!("set leader_yield_request: {e}"))?;
 
-    println!(
-        "{GREEN}✓ step-down requested for '{target}'{RESET}\n  \
-         it will yield within ~2 election ticks; automatic fail-back at {} ({minutes} min).\n  \
-         cancel early: {CYAN}ff fleet leader step-down --clear{RESET}\n  \
-         watch: {CYAN}ff fleet leader{RESET}",
-        until.to_rfc3339()
-    );
+    // HA Phase 2: if a standby was designated, record a maintenance lease so
+    // election prefers it OUTRIGHT (not just next-by-priority) until fail-back.
+    if let Some(standby) = to.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        ff_db::pg_set_maintenance_lease(pool, standby, until)
+            .await
+            .map_err(|e| anyhow::anyhow!("set maintenance lease: {e}"))?;
+        println!(
+            "{GREEN}✓ maintenance handoff: '{target}' → '{standby}'{RESET}\n  \
+             '{standby}' takes leadership within ~2 ticks; automatic fail-back at {} ({minutes} min).\n  \
+             cancel early: {CYAN}ff fleet leader step-down --clear{RESET}\n  \
+             watch: {CYAN}ff fleet leader{RESET}",
+            until.to_rfc3339()
+        );
+    } else {
+        println!(
+            "{GREEN}✓ step-down requested for '{target}'{RESET}\n  \
+             it will yield within ~2 election ticks; automatic fail-back at {} ({minutes} min).\n  \
+             designate a successor with {CYAN}--to <node>{RESET}\n  \
+             cancel early: {CYAN}ff fleet leader step-down --clear{RESET}\n  \
+             watch: {CYAN}ff fleet leader{RESET}",
+            until.to_rfc3339()
+        );
+    }
     Ok(())
 }
 
@@ -2919,10 +2951,11 @@ pub async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
             Some(LeaderAction::StepDown {
                 minutes,
                 member,
+                to,
                 clear,
                 yes,
             }) => {
-                handle_fleet_leader_step_down(&pool, minutes, member, clear, yes).await?;
+                handle_fleet_leader_step_down(&pool, minutes, member, to, clear, yes).await?;
             }
         },
         FleetCommand::Health { json } => {

@@ -417,12 +417,25 @@ impl LeaderTick {
         //    lower number = more preferred.
         let candidates = load_candidates(&self.pg).await?;
 
+        // 2b) HA Phase 2 maintenance lease: an active lease designates a standby
+        //     that election must prefer OUTRIGHT (over election_priority) until
+        //     its deadline, then auto-fails-back. Reading it here makes every
+        //     node's tick agree on the preferred successor: the old leader yields
+        //     to the standby (best != me), the standby holds it (best == me), and
+        //     on expiry the standby yields back to the priority winner — all via
+        //     the existing decision branches below. An expired/missing lease is
+        //     `None` → normal priority election.
+        let lease = ff_db::pg_get_active_maintenance_lease(&self.pg)
+            .await
+            .unwrap_or(None);
+        let prefer = lease.as_ref().map(|(s, _)| s.as_str());
+
         // 3) Pick the best alive candidate (lowest priority, alphabetical
         //    tie-break), skipping any node that is voluntarily yielding. If no
         //    candidate is alive (or all are yielding), `best_alive` is None and
         //    we refuse to claim — a yield with no eligible successor leaves the
         //    current leader in place rather than going leaderless.
-        let best_alive = pick_best_candidate(&candidates, &alive, &yielding);
+        let best_alive = pick_best_candidate(&candidates, &alive, &yielding, prefer);
 
         let current = pg_get_current_leader(&self.pg).await?;
 
@@ -1068,18 +1081,27 @@ fn pick_best_candidate<'a>(
     candidates: &'a [Candidate],
     alive: &std::collections::HashMap<String, bool>,
     yielding: &std::collections::HashSet<String>,
+    prefer: Option<&str>,
 ) -> Option<&'a Candidate> {
-    candidates
-        .iter()
-        .filter(|c| {
-            alive.get(&c.member_name).copied().unwrap_or(false)
-                && !yielding.contains(&c.member_name)
-        })
-        .min_by(|a, b| {
-            a.election_priority
-                .cmp(&b.election_priority)
-                .then_with(|| a.member_name.cmp(&b.member_name))
-        })
+    let eligible = |c: &Candidate| {
+        alive.get(&c.member_name).copied().unwrap_or(false) && !yielding.contains(&c.member_name)
+    };
+    // HA Phase 2 maintenance lease: a designated standby wins outright (ignoring
+    // election_priority) as long as it is alive and not itself yielding. Falls
+    // through to normal priority selection if the standby is unavailable, so a
+    // dead/missing standby never strands the fleet leaderless.
+    if let Some(p) = prefer
+        && let Some(c) = candidates
+            .iter()
+            .find(|c| c.member_name == p && eligible(c))
+    {
+        return Some(c);
+    }
+    candidates.iter().filter(|c| eligible(c)).min_by(|a, b| {
+        a.election_priority
+            .cmp(&b.election_priority)
+            .then_with(|| a.member_name.cmp(&b.member_name))
+    })
 }
 
 #[cfg(test)]
@@ -1152,7 +1174,7 @@ mod tests {
         let cands = vec![cand("taylor", 0), cand("james", 10), cand("sophie", 20)];
         let alive = alive_all(&["taylor", "james", "sophie"]);
         let yielding = std::collections::HashSet::new();
-        let best = pick_best_candidate(&cands, &alive, &yielding).unwrap();
+        let best = pick_best_candidate(&cands, &alive, &yielding, None).unwrap();
         assert_eq!(best.member_name, "taylor");
     }
 
@@ -1162,7 +1184,7 @@ mod tests {
         let cands = vec![cand("taylor", 0), cand("james", 10), cand("sophie", 20)];
         let alive = alive_all(&["taylor", "james", "sophie"]);
         let yielding = ["taylor".to_string()].into_iter().collect();
-        let best = pick_best_candidate(&cands, &alive, &yielding).unwrap();
+        let best = pick_best_candidate(&cands, &alive, &yielding, None).unwrap();
         assert_eq!(best.member_name, "james");
     }
 
@@ -1174,7 +1196,7 @@ mod tests {
         let mut alive = alive_all(&["taylor"]);
         alive.insert("james".to_string(), false); // james dead
         let yielding = ["taylor".to_string()].into_iter().collect();
-        assert!(pick_best_candidate(&cands, &alive, &yielding).is_none());
+        assert!(pick_best_candidate(&cands, &alive, &yielding, None).is_none());
     }
 
     #[test]
@@ -1182,8 +1204,43 @@ mod tests {
         let cands = vec![cand("zeta", 5), cand("alpha", 5)];
         let alive = alive_all(&["zeta", "alpha"]);
         let yielding = std::collections::HashSet::new();
-        let best = pick_best_candidate(&cands, &alive, &yielding).unwrap();
+        let best = pick_best_candidate(&cands, &alive, &yielding, None).unwrap();
         assert_eq!(best.member_name, "alpha");
+    }
+
+    #[test]
+    fn pick_best_maintenance_lease_prefers_standby_over_priority() {
+        // HA Phase 2: an active lease names `james` standby. Even though taylor
+        // has lower (more-preferred) election_priority, the designated standby
+        // wins outright while the lease is live.
+        let cands = vec![cand("taylor", 0), cand("james", 10), cand("sophie", 20)];
+        let alive = alive_all(&["taylor", "james", "sophie"]);
+        let yielding = std::collections::HashSet::new();
+        let best = pick_best_candidate(&cands, &alive, &yielding, Some("james")).unwrap();
+        assert_eq!(best.member_name, "james");
+    }
+
+    #[test]
+    fn pick_best_lease_falls_through_when_standby_unavailable() {
+        // A dead/missing standby must NOT strand the fleet — fall through to the
+        // normal priority winner (this is the auto-fail-back safety net).
+        let cands = vec![cand("taylor", 0), cand("james", 10)];
+        let mut alive = alive_all(&["taylor"]);
+        alive.insert("james".to_string(), false); // designated standby is dead
+        let yielding = std::collections::HashSet::new();
+        let best = pick_best_candidate(&cands, &alive, &yielding, Some("james")).unwrap();
+        assert_eq!(best.member_name, "taylor");
+    }
+
+    #[test]
+    fn pick_best_expired_lease_is_none_so_priority_wins() {
+        // The election reads `prefer = None` for an expired lease (the DB helper
+        // returns None past the deadline) → normal priority election → fail-back.
+        let cands = vec![cand("taylor", 0), cand("james", 10)];
+        let alive = alive_all(&["taylor", "james"]);
+        let yielding = std::collections::HashSet::new();
+        let best = pick_best_candidate(&cands, &alive, &yielding, None).unwrap();
+        assert_eq!(best.member_name, "taylor");
     }
 
     #[test]

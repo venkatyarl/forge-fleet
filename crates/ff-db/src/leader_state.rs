@@ -188,3 +188,56 @@ pub async fn pg_yield_leader(pool: &PgPool, my_name: &str) -> Result<bool, sqlx:
 
     Ok(result.rows_affected() == 1)
 }
+
+/// HA Phase 2 — record a maintenance lease on the singleton leader row: while
+/// the lease is live, election prefers `standby_member` outright. `until` is the
+/// auto-fail-back deadline. Updates the existing row in place (the row may name a
+/// different current leader — that's fine; the lease just biases the next pick).
+pub async fn pg_set_maintenance_lease(
+    pool: &PgPool,
+    standby_member: &str,
+    until: chrono::DateTime<chrono::Utc>,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE fleet_leader_state
+            SET standby_member = $1, relinquishing_until = $2
+          WHERE singleton_key = 'current'",
+    )
+    .bind(standby_member)
+    .bind(until)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Clear any maintenance lease (immediate fail-back to normal election).
+pub async fn pg_clear_maintenance_lease(pool: &PgPool) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE fleet_leader_state
+            SET standby_member = NULL, relinquishing_until = NULL
+          WHERE singleton_key = 'current'",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// The currently-active maintenance lease, if any: returns `(standby_member,
+/// relinquishing_until)` only when a standby is set AND the deadline is still in
+/// the future. An expired lease reads as `None` (auto-fail-back) without needing
+/// a write — the next step-down or a status read can lazily clear the columns.
+pub async fn pg_get_active_maintenance_lease(
+    pool: &PgPool,
+) -> Result<Option<(String, chrono::DateTime<chrono::Utc>)>, sqlx::Error> {
+    let row: Option<(Option<String>, Option<chrono::DateTime<chrono::Utc>>)> = sqlx::query_as(
+        "SELECT standby_member, relinquishing_until
+           FROM fleet_leader_state
+          WHERE singleton_key = 'current'",
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(match row {
+        Some((Some(standby), Some(until))) if until > chrono::Utc::now() => Some((standby, until)),
+        _ => None,
+    })
+}
