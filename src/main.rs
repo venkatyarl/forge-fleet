@@ -794,6 +794,26 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         );
     }
 
+    // 18c) Fleet-integrity verify tick — every 15min, leader-gated, gate
+    // `fleet_secrets.fleet_integrity_mode` (off|report, DEFAULT off).
+    // `revive_scan` already repairs DEAD nodes; this covers the blind spot of an
+    // ALIVE-but-misconfigured member (half-configured enrollment / config drift)
+    // by running the `verify_computer` battery across all online members on a
+    // schedule and firing `fleet_integrity_degraded` on drift. Detection-only
+    // (never mutates a target); per-gap auto-repair is a tracked follow-up.
+    // Closes PROD_READINESS item 23 (enrollment self-heal — detection half).
+    if let Some(pg_pool) = operational_store.pg_pool().cloned() {
+        info!(
+            "starting subsystem: fleet-integrity tick (15min, leader-gated, gate=fleet_secrets.fleet_integrity_mode default off)"
+        );
+        subsystem_tasks.push(ff_agent::fleet_integrity::spawn_fleet_integrity_tick(
+            pg_pool,
+            worker_name.clone(),
+            900,
+            shutdown_rx.clone(),
+        ));
+    }
+
     // 19) Adaptive serving-mix autoscaler — every 120s, leader-gated.
     // Orchestrator P3: compares the P2 demand vector against live supply and,
     // when the `fleet_secrets.autoscaler_mode` gate is set to `active`, loads

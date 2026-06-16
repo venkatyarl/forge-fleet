@@ -1406,6 +1406,13 @@ enum FleetCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Run the verify battery across ALL online members (the fleet-integrity
+    /// sweep the leader tick runs on a schedule), printing degraded members.
+    /// Read-only — never mutates a target.
+    Integrity {
+        #[arg(long)]
+        json: bool,
+    },
     /// Show the current fleet leader, or manage voluntary step-down (HA).
     Leader {
         /// Output the leader status as JSON (status view only).

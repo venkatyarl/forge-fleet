@@ -2854,6 +2854,62 @@ pub async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
                 }
             }
         }
+        FleetCommand::Integrity { json } => {
+            let my_name = ff_agent::fleet_info::resolve_this_worker_name().await;
+            if !json {
+                println!(
+                    "{CYAN}▶ Running fleet-integrity sweep (verify battery across all online members)...{RESET}"
+                );
+            }
+            let summary = ff_agent::fleet_integrity::run_integrity_sweep(&pool, &my_name)
+                .await
+                .map_err(|e| anyhow::anyhow!("integrity sweep: {e}"))?;
+            if json {
+                let degraded: Vec<serde_json::Value> = summary
+                    .degraded
+                    .iter()
+                    .map(|g| {
+                        serde_json::json!({
+                            "node": g.node,
+                            "failed": g.failed,
+                            "failing_checks": g.failing_checks,
+                        })
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "checked": summary.checked,
+                        "degraded": degraded,
+                        "reports": summary.reports,
+                    }))
+                    .unwrap_or_default()
+                );
+            } else if summary.degraded.is_empty() {
+                println!(
+                    "{GREEN}✓ all {} online member(s) passed the verify battery{RESET}",
+                    summary.checked
+                );
+            } else {
+                println!(
+                    "{YELLOW}⚠ {} of {} online member(s) degraded:{RESET}",
+                    summary.degraded.len(),
+                    summary.checked
+                );
+                for g in &summary.degraded {
+                    println!(
+                        "  {RED}✗{RESET} {:<10} {} failing: {}",
+                        g.node,
+                        g.failed,
+                        g.failing_checks.join(", ")
+                    );
+                }
+                println!(
+                    "\n  Inspect a node: {CYAN}ff fleet verify-node <name>{RESET}\n  \
+                     Enable the scheduled sweep+alert: {CYAN}ff secrets set fleet_integrity_mode report{RESET}"
+                );
+            }
+        }
         FleetCommand::Leader { json, action } => match action {
             None | Some(LeaderAction::Status { .. }) => {
                 // `--json` at the `leader` level OR `status --json` both work.
