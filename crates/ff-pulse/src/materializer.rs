@@ -568,7 +568,7 @@ impl Materializer {
             prev_primary_ip.as_deref() != Some(beat.network.primary_ip.as_str());
 
         // Q4: UPDATE_COMPUTER_PERSISTENT_FIELDS
-        if ips_differ || hw_differ || cap_differ || primary_ip_differ {
+        if persistent_fields_changed(ips_differ, hw_differ, cap_differ, primary_ip_differ) {
             sqlx::query(
                 "UPDATE computers SET \
                     last_seen_at = NOW(), \
@@ -615,14 +615,32 @@ impl Materializer {
         // `computers.primary_ip` had drifted, which is a different signal
         // from `fleet_workers.ip` drift. Always-run with row-level guard
         // is correct.
-        let _ = sqlx::query(
+        // Capture the result: this is a self-heal path for a column that drifted
+        // undetected for weeks (9/15 computers wrong). Silently swallowing a
+        // failure here would re-hide exactly that class of bug, so log it.
+        match sqlx::query(
             "UPDATE fleet_workers SET ip = $1, updated_at = NOW() \
              WHERE name = $2 AND ip <> $1",
         )
         .bind(&beat.network.primary_ip)
         .bind(&beat.computer_name)
         .execute(&self.pg)
-        .await;
+        .await
+        {
+            Ok(r) if r.rows_affected() > 0 => {
+                tracing::info!(
+                    computer = %beat.computer_name,
+                    ip = %beat.network.primary_ip,
+                    "materializer: reconciled drifted fleet_workers.ip"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(
+                computer = %beat.computer_name,
+                error = %e,
+                "materializer: fleet_workers.ip self-heal UPDATE failed"
+            ),
+        }
 
         // V87: keep computers.os_family / os_distribution / os_version in sync
         // with the beat's pre-classified OsInfo. Daemons detect their own
@@ -1195,6 +1213,23 @@ fn normalize_json(s: &str) -> String {
     }
 }
 
+/// Whether the persistent `computers` row must be rewritten (vs a cheap
+/// `last_seen_at`-only touch). Extracted as a pure function so the drift
+/// invariants are unit-testable — in particular that a changed `primary_ip`
+/// ALONE forces a rewrite. That branch matters: `computers.primary_ip` once
+/// froze to a node's dead wifi address (aura, 2026-04-28) and `fleet_workers.ip`
+/// drifted on 9/15 computers undetected for weeks, because the drift signal was
+/// missing from the write condition. This guard keeps `primary_ip` in the OR so
+/// the regression can't return silently.
+fn persistent_fields_changed(
+    ips_differ: bool,
+    hw_differ: bool,
+    cap_differ: bool,
+    primary_ip_differ: bool,
+) -> bool {
+    ips_differ || hw_differ || cap_differ || primary_ip_differ
+}
+
 // -----------------------------------------------------------------------------
 // Unit tests — decision logic only; no real DB.
 // -----------------------------------------------------------------------------
@@ -1466,6 +1501,28 @@ mod tests {
         let a = "[{\"iface\":\"en0\",\"ip\":\"10.0.0.1\",\"kind\":\"v4\"}]";
         let b = "[ { \"iface\" : \"en0\" , \"ip\" : \"10.0.0.1\" , \"kind\" : \"v4\" } ]";
         assert_eq!(normalize_json(a), normalize_json(b));
+    }
+
+    #[test]
+    fn primary_ip_drift_alone_forces_a_row_rewrite() {
+        // The item-21 invariant: a changed primary_ip must trigger a persistent
+        // write even when IPs/hardware/capabilities are otherwise identical.
+        // Regression guard for the aura wifi→ethernet freeze + the 9/15
+        // fleet_workers.ip drift.
+        assert!(persistent_fields_changed(false, false, false, true));
+    }
+
+    #[test]
+    fn no_rewrite_when_nothing_changed() {
+        assert!(!persistent_fields_changed(false, false, false, false));
+    }
+
+    #[test]
+    fn any_single_drift_signal_forces_a_rewrite() {
+        assert!(persistent_fields_changed(true, false, false, false)); // ips
+        assert!(persistent_fields_changed(false, true, false, false)); // hardware
+        assert!(persistent_fields_changed(false, false, true, false)); // capabilities
+        assert!(persistent_fields_changed(false, false, false, true)); // primary_ip
     }
 
     #[test]
