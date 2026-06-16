@@ -175,14 +175,18 @@ struct ProjectMemoryResult {
 async fn load_project_memory(project_root: &Path) -> ProjectMemoryResult {
     let ff_dir = project_root.join(".forgefleet");
 
-    // Auto-create .forgefleet/ if it doesn't exist
+    // Auto-create .forgefleet/ if it doesn't exist. FIX #3: this dir is ff's
+    // own scratch (context.md, sessions/, …) created in the TARGET repo's cwd —
+    // it must not dirty that repo. Make `.forgefleet/` self-ignoring: a
+    // `.gitignore` of `*` hides the whole dir from the host repo's `git status`
+    // (the old `sessions/\n*.tmp` left context.md + the dir itself untracked).
+    // `!FORGEFLEET.md` keeps the one user-authored project-memory file
+    // committable. Always (re)write it so older repos with the stale rule heal.
     if !ff_dir.exists() {
         let _ = fs::create_dir_all(&ff_dir).await;
-        // Create .gitignore for sessions
-        let gitignore = ff_dir.join(".gitignore");
-        if !gitignore.exists() {
-            let _ = fs::write(&gitignore, "sessions/\n*.tmp\n").await;
-        }
+    }
+    if ff_dir.exists() {
+        let _ = fs::write(ff_dir.join(".gitignore"), "*\n!FORGEFLEET.md\n").await;
     }
 
     let forgefleet_md = read_optional(&ff_dir.join("FORGEFLEET.md")).await;
