@@ -284,7 +284,7 @@ pub async fn handle_ports_add(
     status: String,
 ) -> Result<()> {
     // ForgeFleet-owned services use 5-digit ports (registered + lint-enforced).
-    // External daemons (NATS 4222, Redis 6380, ollama 11434) are exceptions, so
+    // External daemons (NATS 4222, ollama 11434) are exceptions, so
     // this is a warning, not a hard reject.
     if !(10000..=65535).contains(&port) {
         println!(

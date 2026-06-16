@@ -1047,7 +1047,7 @@ async fn publish_redis(channel: &str, payload: &str) -> Result<(), String> {
     let url = std::env::var("FORGEFLEET_REDIS_URL")
         .unwrap_or_else(|_| "redis://192.168.5.100:56379".into());
     // Parse host:port from URL (redis://host:port or redis://host:port/db).
-    let (host, port) = parse_redis_hostport(&url).unwrap_or(("192.168.5.100".into(), 6380));
+    let (host, port) = parse_redis_hostport(&url).unwrap_or(("192.168.5.100".into(), 56379));
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
     let mut sock = TcpStream::connect((host.as_str(), port))

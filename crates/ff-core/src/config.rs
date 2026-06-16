@@ -1221,7 +1221,8 @@ impl Default for RedisConfig {
 }
 
 fn default_redis_url() -> String {
-    // Host-facing default: docker-compose maps container 6379 → host 6380.
+    // Host-facing default: docker-compose maps container 6379 → host 56379
+    // (5-digit canonical port; old 6380 remapped 2026-05-18).
     "redis://127.0.0.1:56379".into()
 }
 fn default_redis_prefix() -> String {

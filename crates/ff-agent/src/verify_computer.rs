@@ -41,10 +41,15 @@ pub async fn verify_computer(pool: &PgPool, worker_name: &str) -> Result<VerifyR
     };
     details.push(check_ssh_cmd(&ssh_dest, "db_reachable_from_node", db_cmd).await);
     // 3. redis_reachable_from_node
+    // Canonical fleet Redis is host-port 56379 (5-digit convention; container
+    // 6379 → host 56379). The old 6380 was remapped 2026-05-18 — probing it
+    // here made every node fail this check forever (surfaced by the
+    // fleet-integrity sweep, #388). Keep in sync with
+    // `ff_core::config::default_redis_url`.
     let redis_cmd = if is_windows {
-        r#"powershell -NoProfile -Command "Test-NetConnection -ComputerName 192.168.5.100 -Port 6380 -InformationLevel Quiet | Out-String | Select-String True | ForEach-Object { exit 0 }; exit 1""#
+        r#"powershell -NoProfile -Command "Test-NetConnection -ComputerName 192.168.5.100 -Port 56379 -InformationLevel Quiet | Out-String | Select-String True | ForEach-Object { exit 0 }; exit 1""#
     } else {
-        "nc -z -w 3 192.168.5.100 6380"
+        "nc -z -w 3 192.168.5.100 56379"
     };
     details.push(check_ssh_cmd(&ssh_dest, "redis_reachable_from_node", redis_cmd).await);
     // 4. sub_agent_dirs_exist
