@@ -185,9 +185,10 @@ pub async fn handle_agent_commit_back(
         Option<String>,    // llm_model_id
         Option<i32>,       // llm_tokens_input
         Option<i32>,       // llm_tokens_output
+        serde_json::Value, // metadata
     )> = sqlx::query_as(
         "SELECT id, work_item_id, title, produced_on_computer, modified_files, \
-                llm_model_id, llm_tokens_input, llm_tokens_output \
+                llm_model_id, llm_tokens_input, llm_tokens_output, metadata \
          FROM work_outputs \
          WHERE agent_session_id = $1 \
          ORDER BY produced_at DESC \
@@ -198,13 +199,22 @@ pub async fn handle_agent_commit_back(
     .await
     .map_err(|e| anyhow::anyhow!("query work_outputs: {e}"))?;
 
-    let (wo_id, work_item_id, title, worker, modified_files_json, model_id, tok_in, tok_out) = row
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "no work_outputs row with agent_session_id={session_id} — \
+    let (
+        wo_id,
+        work_item_id,
+        title,
+        worker,
+        modified_files_json,
+        model_id,
+        tok_in,
+        tok_out,
+        metadata,
+    ) = row.ok_or_else(|| {
+        anyhow::anyhow!(
+            "no work_outputs row with agent_session_id={session_id} — \
              was the session persisted, and did it produce a work_output?"
-            )
-        })?;
+        )
+    })?;
 
     let worker = worker.ok_or_else(|| {
         anyhow::anyhow!("work_output {wo_id} has no produced_on_computer — cannot locate worker")
@@ -227,13 +237,22 @@ pub async fn handle_agent_commit_back(
             .map_err(|e| anyhow::anyhow!("lookup fleet_workers: {e}"))?
             .ok_or_else(|| anyhow::anyhow!("no fleet_workers row for computer={worker}"))?;
 
-    // Per reference_source_tree_locations.md: non-Taylor members use
-    // ~/.forgefleet/sub-agent-0/forge-fleet. Taylor itself uses ~/projects/forge-fleet.
-    let workspace = if worker.eq_ignore_ascii_case("taylor") {
-        "~/projects/forge-fleet"
-    } else {
-        "~/.forgefleet/sub-agent-0/forge-fleet"
-    };
+    // GAP-D1: prefer the actual run working_dir the producer recorded
+    // (`metadata.working_dir`), so commit-back lifts from wherever the run
+    // edited files instead of a hardcoded path. Fall back to the canonical
+    // per-worker checkout (reference_source_tree_locations.md) for older rows.
+    let workspace: String = metadata
+        .get("working_dir")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .unwrap_or_else(|| {
+            if worker.eq_ignore_ascii_case("taylor") {
+                "~/projects/forge-fleet".to_string()
+            } else {
+                "~/.forgefleet/sub-agent-0/forge-fleet".to_string()
+            }
+        });
 
     // 3. Build branch name: fleet/<worker>/<yyyymmdd-HHMMSS>-<slug>-<wi8>.
     //    The work_item_id suffix (GAP-B) guarantees uniqueness even when two

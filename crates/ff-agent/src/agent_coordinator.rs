@@ -583,6 +583,46 @@ pub async fn create_transient_work_item(
     Ok(row.0)
 }
 
+/// Record a commit-back-able `work_output` for an agent run that edited files
+/// (GAP-D0). Creates a transient work_item, then inserts a `work_output`
+/// carrying `agent_session_id` + `modified_files` so
+/// `ff agent commit-back <session>` can find and lift the changes — the
+/// producer half the V40 provenance columns were added for but nothing wrote.
+/// Returns the new work_output id.
+pub async fn record_agent_run_output(
+    pool: &PgPool,
+    session_id: &str,
+    prompt: &str,
+    modified_files: &[String],
+    node: &str,
+    model_id: &str,
+    working_dir: &str,
+) -> Result<Uuid, CoordError> {
+    let work_item_id = create_transient_work_item(pool, prompt, "ff run").await?;
+    let row: (Uuid,) = sqlx::query_as(
+        "INSERT INTO work_outputs (\
+            work_item_id, kind, title, produced_by_agent, produced_on_computer, \
+            agent_session_id, modified_files, metadata\
+         ) VALUES ($1, 'agent_run', $2, 'ff run', $3, $4, $5, $6) \
+         RETURNING id",
+    )
+    .bind(work_item_id)
+    .bind(truncate(prompt, 120))
+    .bind(node)
+    .bind(session_id)
+    .bind(json!(modified_files))
+    .bind(json!({
+        "model_id": model_id,
+        "modified_file_count": modified_files.len(),
+        // GAP-D1: record WHERE the run edited files so `commit-back` lifts from
+        // the actual workspace, not a hardcoded per-worker path.
+        "working_dir": working_dir,
+    }))
+    .fetch_one(pool)
+    .await?;
+    Ok(row.0)
+}
+
 /// Snapshot row returned by [`list_sub_agents`].
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SubAgentListRow {

@@ -513,6 +513,36 @@ impl AgentSession {
         let client = self.client.clone();
         let outcome = run_agent_loop(self, &client, event_tx).await;
 
+        // GAP-D0: record a commit-back-able work_output for any run that edited
+        // files, so `ff agent commit-back <session>` can lift them. Before this,
+        // NOTHING populated work_outputs.modified_files / agent_session_id, so
+        // commit-back always found nothing. Best-effort + guarded on a pool.
+        if let Some(pool) = &self.config.pg_pool {
+            let modified = collect_modified_files(&self.messages);
+            if !modified.is_empty() {
+                let node = crate::fleet_info::resolve_this_worker_name().await;
+                match crate::agent_coordinator::record_agent_run_output(
+                    pool,
+                    &self.id.to_string(),
+                    prompt,
+                    &modified,
+                    &node,
+                    &self.config.model,
+                    &self.config.working_dir.to_string_lossy(),
+                )
+                .await
+                {
+                    Ok(wo) => info!(
+                        work_output = %wo, files = modified.len(), session = %self.id,
+                        "recorded commit-back-able work_output for agent run"
+                    ),
+                    Err(e) => {
+                        warn!(error = %e, "failed to record agent-run work_output (commit-back)")
+                    }
+                }
+            }
+        }
+
         // Auto-save session
         if self.config.auto_save
             && let Err(e) = session_store::save_session(
@@ -1799,6 +1829,29 @@ pub(crate) fn is_rust_file(path: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Collect the file paths a session's mutating tool-calls targeted, for
+/// commit-back provenance (GAP-D0). Scans every assistant `tool_calls` entry
+/// for a file-editing tool ([`RUST_MUTATING_TOOLS`]) and pulls its
+/// `file_path`/`notebook_path`. Order-stable + deduped. Success is NOT tracked:
+/// git's own diff is the source of truth for what actually commits, so a
+/// superset is correct and harmless (`git add` of an unchanged file is a no-op).
+pub fn collect_modified_files(messages: &[ToolChatMessage]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for m in messages {
+        let Some(calls) = &m.tool_calls else { continue };
+        for tc in calls {
+            if RUST_MUTATING_TOOLS.contains(&tc.function.name.as_str())
+                && let Some(p) = tool_call_file_path(&tc.function.arguments)
+                && seen.insert(p.clone())
+            {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
 /// Walk up from `start` looking for a `Cargo.toml`. Returns the directory
 /// containing it — where `cargo check --workspace` should run.
 pub(crate) fn find_cargo_manifest_dir(start: &std::path::Path) -> Option<PathBuf> {
@@ -1930,4 +1983,49 @@ This makes your thought process visible and improves tool selection accuracy.
         working_dir = working_dir.display(),
         fleet_section = fleet_section,
     )
+}
+
+#[cfg(test)]
+mod commit_back_provenance_tests {
+    use super::collect_modified_files;
+    use ff_api::tool_calling::{FunctionCall, ToolCall, ToolChatMessage};
+
+    fn call(name: &str, args: &str) -> ToolCall {
+        ToolCall {
+            id: "x".into(),
+            call_type: "function".into(),
+            function: FunctionCall {
+                name: name.into(),
+                arguments: args.into(),
+            },
+        }
+    }
+
+    #[test]
+    fn collects_edits_writes_dedup_and_skips_non_mutating() {
+        let msgs = vec![
+            ToolChatMessage::assistant_tool_calls(vec![
+                call("Read", r#"{"file_path":"only_read.rs"}"#),
+                call("Edit", r#"{"file_path":"src/a.rs"}"#),
+                call("Write", r#"{"file_path":"src/b.rs"}"#),
+            ]),
+            ToolChatMessage::assistant_tool_calls(vec![
+                call("Edit", r#"{"file_path":"src/a.rs"}"#), // dup
+                call("NotebookEdit", r#"{"notebook_path":"nb.ipynb"}"#),
+                call("Bash", r#"{"command":"ls"}"#),
+            ]),
+        ];
+        let files = collect_modified_files(&msgs);
+        assert_eq!(files, vec!["src/a.rs", "src/b.rs", "nb.ipynb"]);
+        assert!(!files.contains(&"only_read.rs".to_string()));
+    }
+
+    #[test]
+    fn empty_when_no_mutating_calls() {
+        let msgs = vec![ToolChatMessage::assistant_tool_calls(vec![call(
+            "Read",
+            r#"{"file_path":"x.rs"}"#,
+        )])];
+        assert!(collect_modified_files(&msgs).is_empty());
+    }
 }
