@@ -913,6 +913,24 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         }));
     }
 
+    // 20b2) Mesh-refresh tick — every 6h, leader-gated. Re-probes SSH-mesh pairs
+    // whose stored status is stale so `fleet_ssh_mesh` reflects reality and the
+    // integrity `mesh_ssh_complete` check stops reporting a FALSE failure forever
+    // after a node was briefly unreachable mid-deploy. Same legacy-only gap as
+    // the version-check tick above (#396): mesh probing ran only on-demand / in
+    // `ff daemon`, never in forgefleetd, so a stale "failed" pair (sia↔adele,
+    // while SSH worked by IP) persisted indefinitely.
+    if let Some(pg_pool) = operational_store.pg_pool().cloned() {
+        info!("starting subsystem: mesh-refresh tick (6h, leader-gated)");
+        subsystem_tasks.push(ff_agent::mesh_check::spawn_mesh_refresh_tick(
+            pg_pool,
+            worker_name.clone(),
+            6 * 3600,
+            12,
+            shutdown_rx.clone(),
+        ));
+    }
+
     // 20c) Stale-task reaper tick — every 10min, per-node (idempotent).
     //
     // Tasks claimed by a worker that then died or restarted mid-run (common
