@@ -71,11 +71,55 @@ on ff's OWN code.
    branch + PR; CI gates; review (cloud) merges.
 4. **Observe** — `ff tasks list` result tables; partial failures visible/retryable.
 
+## Status — concurrent-DISPATCH path hardened (iters 116-119)
+
+`ff agent dispatch` is now robust under concurrent multi-caller load:
+- **GAP-A (#374)** claim-retry on CAS contention — no spurious "lost to another dispatcher".
+- **GAP-F (#375)** prefer computers with a healthy tool-capable LLM — no "no active LLM".
+- **GAP-G (#376)** retry transient LLM-call failures on another LLM-capable slot.
+- **GAP-H (#377)** randomize the idle-slot pick — no lockstep CAS contention ("pool
+  contended"). LIVE: 12 concurrent dispatches → 12/12 clean (was 2/10 failing).
+
+All four were found by dogfooding ff on its own dispatch path.
+
+## Code-WRITING flow — deeper gaps (iter-120 audit) — DESIGN NEEDED
+
+The concurrency work above hardens *dispatch* (a chat call → `work_outputs`). The
+"drive an entire BUILD through ff" flow (write code in a workspace → commit-back →
+PR) is **incompletely wired** and needs design before HireFlow can drive its whole
+build through ff. Concrete gaps, traced this iteration:
+
+- **GAP-D1 — fanout/dispatch-each don't target the sub-agent workspace.** Both build
+  the member command as `ff run --backend <cli> '<prompt>'` (`agent_cmd.rs:54,134`)
+  with **no `--cwd`**. `ff run` then executes in the defer-worker's cwd, NOT the
+  per-slot workspace (`~/.forgefleet/sub-agent-{slot}/…`) that `commit-back` later
+  reads — so produced code can land where commit-back never looks. Fix: pass
+  `--cwd <slot-workspace>/<target-repo>` (and surface which slot/workspace a fanout
+  task used, so commit-back can find it).
+- **GAP-D2 — no clean-sync before a run.** Nothing resets the workspace to a clean
+  `origin/main` (`git fetch && git reset --hard origin/main && git clean -fd`) before
+  the LLM edits it. A prior run's leftover changes / stale HEAD contaminate the next
+  run on that slot. Fix: a guarded clean-sync step at run start (the slot is claimed
+  exclusively, so this is safe; respect the no-`git stash` rule — use reset/clean).
+- **GAP-D3 — commit-back branches off the workspace's current HEAD, not fresh main.**
+  `commit-back` does `git fetch origin main >/dev/null || true && git checkout -b
+  <branch>` (`agent_cmd.rs:265`) — the fetch result is unused; the branch is cut from
+  whatever HEAD the workspace is on. If the workspace is stale, the PR diff is huge /
+  conflicting. Fix: branch from the freshly-fetched `origin/main` while preserving the
+  run's working-tree changes (pairs with GAP-D2's clean base).
+- **GAP-B (carried) — commit-back branch uniqueness.** `fleet/<worker>/<ts>-<slug>`
+  is second-granular; add a `work_item_id` suffix for full safety.
+- **GAP-C (carried) — swarm/fanout partial-failure reporting + per-caller fair-share.**
+
+**Risk note:** GAP-D1-3 touch the build path; design + a real ff→commit-back dogfood
+(small forge-fleet change end-to-end) should validate before wiring, rather than
+rushing a half-fix into a data/build-critical path unattended.
+
 ## Prioritized work items
 
-1. **GAP-A: slot-claim retry in `dispatch_task`** (this iteration). The
-   highest-leverage concurrency fix.
+1. ✅ Concurrent-dispatch hardening (GAP-A/F/G/H) — DONE, iters 116-119.
 2. Service `ff-feature-requests.md` as HireFlow files failures (standing #1).
-3. GAP-D workspace clean-sync verification + fix.
+3. **GAP-D1-3 code-writing flow** — design + dogfood-validate, then wire (workspace
+   targeting + clean-sync + commit-back-from-main).
 4. GAP-C fair-share cap + partial-failure reporting in swarm/fanout.
 5. GAP-B commit-back branch uniqueness suffix.

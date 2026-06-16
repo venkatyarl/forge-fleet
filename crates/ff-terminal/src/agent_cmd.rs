@@ -235,11 +235,19 @@ pub async fn handle_agent_commit_back(
         "~/.forgefleet/sub-agent-0/forge-fleet"
     };
 
-    // 3. Build branch name: fleet/<worker>/<yyyymmdd>-<slug>.
+    // 3. Build branch name: fleet/<worker>/<yyyymmdd-HHMMSS>-<slug>-<wi8>.
+    //    The work_item_id suffix (GAP-B) guarantees uniqueness even when two
+    //    commit-backs land in the same second on the same worker with the same
+    //    title — otherwise `git checkout -b` collides under concurrent dispatch.
     let now = chrono::Utc::now();
     let stamp = now.format("%Y%m%d-%H%M%S").to_string();
     let title_slug = slugify_for_branch(title.as_deref().unwrap_or("agent-session"));
-    let branch_name = format!("fleet/{}/{stamp}-{title_slug}", worker);
+    let wi_short = work_item_id.simple().to_string();
+    let branch_name = format!(
+        "fleet/{}/{stamp}-{title_slug}-{}",
+        worker,
+        &wi_short[..8.min(wi_short.len())]
+    );
 
     let commit_msg = format!(
         "{}\n\nProduced by ff agent on {worker} in session {session_id}.\n\n\
