@@ -1881,6 +1881,31 @@ pub enum FleetDbCommand {
         #[arg(long, default_value_t = false)]
         yes: bool,
     },
+    /// HA leader-handoff Phase 3 — PLAN (and optionally execute) a
+    /// DB-primary-aware leadership handoff to `--to <node>`.
+    ///
+    /// DRY-RUN BY DEFAULT: prints the §4-ordered plan (replica-lag gate →
+    /// promote replica → repoint DSN of record → move fleet leadership) plus the
+    /// live lag check, and does NOTHING. Only `--execute --yes` actuates, and
+    /// even then the `ha_handoff_mode` fleet_secret must read `active`. The
+    /// Postgres promote reuses the existing `ff fleet db failover` path (never
+    /// raw SQL). There is NO automatic/tick-driven handoff.
+    Handoff {
+        /// Target computer name (the new primary + leader). Must host a
+        /// caught-up Postgres replica.
+        #[arg(long = "to")]
+        to: String,
+        /// Actuate the plan instead of printing it. Requires `--yes` AND
+        /// `ha_handoff_mode=active`.
+        #[arg(long, default_value_t = false)]
+        execute: bool,
+        /// Confirm an `--execute` run (required; ignored in dry-run).
+        #[arg(long, default_value_t = false)]
+        yes: bool,
+        /// Maintenance-lease window in minutes for the leadership move.
+        #[arg(long, default_value_t = 30)]
+        lease_minutes: i64,
+    },
     /// Restore an age-encrypted backup into a *scratch* Postgres database.
     ///
     /// Looks up the row in `backups` by id, decrypts using

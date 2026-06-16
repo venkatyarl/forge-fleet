@@ -1149,6 +1149,19 @@ pub struct DatabaseConfig {
     /// backup + validation proof. Required when `mode = "postgres_full"`.
     #[serde(default)]
     pub cutover_evidence: Option<String>,
+
+    /// HA Phase 3 — opt-in "DSN of record" failover for the worker pool.
+    ///
+    /// When `true` AND the static [`url`] fails to connect, the pool builder
+    /// reads the last-known DSN of record (node-local cache, refreshed from the
+    /// `db_dsn_of_record` fleet_secret) and retries against it. Lets a worker
+    /// recover after an operator-driven primary MOVE without an env change.
+    ///
+    /// DEFAULTS TO FALSE — absent the flag the static DSN is used verbatim, so
+    /// behaviour is unchanged. Fail-safe by construction: if no DSN of record is
+    /// cached, the original static-DSN error is returned untouched.
+    #[serde(default)]
+    pub dsn_failover: bool,
 }
 
 impl DatabaseConfig {
@@ -1184,6 +1197,7 @@ impl Default for DatabaseConfig {
             url: default_database_url(),
             max_connections: default_max_connections(),
             cutover_evidence: None,
+            dsn_failover: false,
         }
     }
 }
