@@ -8668,3 +8668,28 @@ VALUES
    0, 'warning', 21600, 'telegram', true)
 ON CONFLICT (name) DO NOTHING;
 "#;
+
+// ─── V132: persist the evolution backlog ────────────────────────────────────
+//
+// `ff_evolution::BacklogService` promotes a recurring root-cause to a durable
+// backlog item once it has been seen `recurrence_threshold` (default 3) times.
+// But it held that state in a pure in-memory `DashMap`, so EVERY daemon restart
+// reset all occurrence counters to zero — a root cause at 2/3 occurrences lost
+// its history and could never accumulate to promotion. The "durable backlog
+// from recurring failures" was, ironically, not durable.
+//
+// This table persists one row per fingerprint. The `BacklogItem` is stored
+// whole as JSONB (it already derives Serialize/Deserialize), so the schema is
+// migration-stable as the struct evolves; `durable` is lifted into a column for
+// cheap querying. The service hydrates from here on startup and writes through
+// after each ingest cycle.
+pub const SCHEMA_V132_EVOLUTION_BACKLOG: &str = r#"
+CREATE TABLE IF NOT EXISTS evolution_backlog (
+    fingerprint  TEXT PRIMARY KEY,
+    item         JSONB NOT NULL,
+    durable      BOOLEAN NOT NULL DEFAULT false,
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_evolution_backlog_durable
+    ON evolution_backlog (durable) WHERE durable;
+"#;
