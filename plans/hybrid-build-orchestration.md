@@ -82,6 +82,31 @@ on ff's OWN code.
 
 All four were found by dogfooding ff on its own dispatch path.
 
+## ⚠️ GAP-D0 — commit-back is UNIMPLEMENTED producer-side (iter-121 empirical root-cause)
+
+A real ff dogfood probe settled it: **`ff agent commit-back` can never lift anything.**
+- DB: of 28 `work_outputs` rows, **0** have `agent_session_id`, **0** have non-empty
+  `modified_files` (all `[]`). commit-back queries `WHERE agent_session_id=$1` and requires
+  non-empty `modified_files` → it always errors "nothing to commit".
+- Code: the ONLY `work_outputs` INSERT is the CHAT dispatch path
+  (`agent_coordinator.rs:408`, `kind='llm_response'`) — it sets neither column (a chat call
+  edits no files). The file-EDITING run path (`ff run`'s agent loop) writes **no**
+  `work_outputs` at all. The V40 provenance columns (issue #118) were added but nothing
+  ever populates them.
+- The agent loop already *can* name edited files: `RUST_MUTATING_TOOLS =
+  [Edit,Write,MultiEdit,NotebookEdit]` + the `file_path` extractor at `agent_loop.rs:1782`.
+
+**Fix (the real "lift results back" feature — next focused effort):**
+1. In the agent loop, accumulate a `HashSet<String>` of `file_path`s from each *successful*
+   mutating tool call onto the session.
+2. At `ff run` completion, record a `work_output` with `agent_session_id=<session>`,
+   `modified_files=<accumulated>`, `produced_on_computer=<node>`, `work_item_id` (transient
+   if none) — so `ff agent commit-back <session>` can find + lift it.
+3. Pair with GAP-D1 (run in the slot workspace) + GAP-D2 (clean-sync) so the file paths are
+   repo-relative and the diff is against fresh main.
+This is the blocker for "drive the ENTIRE build through ff": until it lands, the local-LLM
+output can be generated but never lifted into a PR by ff itself.
+
 ## Code-WRITING flow — deeper gaps (iter-120 audit) — DESIGN NEEDED
 
 The concurrency work above hardens *dispatch* (a chat call → `work_outputs`). The
