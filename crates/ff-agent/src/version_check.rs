@@ -32,12 +32,17 @@ pub async fn collect_current() -> BTreeMap<String, String> {
         out.insert("kernel".into(), v);
     }
     // ff / forgefleetd binaries: embedded version string, e.g.
-    // `ff 2026.5.24_10 (pushed 08227d5966)`.
-    let ff_version = cmd_capture("ff", &["--version"]).await;
+    // `ff 2026.5.24_10 (pushed 08227d5966)`. Resolve by KNOWN install location
+    // rather than bare PATH: the daemon's non-interactive PATH can omit
+    // ~/.local/bin (observed on beyonce/rihanna, where bare `ff`/`forgefleetd`
+    // were "command not found" so `fleet_workers.tooling` stayed empty forever
+    // and the integrity verify flagged tool_versions_reported). These are OUR
+    // binaries with a known home — never rely on PATH to find ourselves.
+    let ff_version = cmd_capture(&resolve_own_bin("ff"), &["--version"]).await;
     if let Some(v) = &ff_version {
         out.insert("ff".into(), v.clone());
     }
-    let forgefleetd_version = cmd_capture("forgefleetd", &["--version"]).await;
+    let forgefleetd_version = cmd_capture(&resolve_own_bin("forgefleetd"), &["--version"]).await;
 
     // ff_git / forgefleetd_git installed_version = the SHA embedded in the
     // RUNNING BINARY, parsed from its `--version` `(pushed <sha>)` field —
@@ -300,6 +305,33 @@ fn extract_semver(s: &str) -> Option<String> {
 
 // ── helpers ──────────────────────────────────────────────────────
 
+/// Resolve one of OUR OWN binaries (`ff`/`forgefleetd`) to an invocable path,
+/// robust to a daemon `PATH` that lacks `~/.local/bin`. Without this, a node
+/// whose non-interactive PATH omits the install dir reports NO tool versions
+/// (beyonce/rihanna: bare `ff` was "command not found" → empty
+/// `fleet_workers.tooling`). Search order: a sibling of the running executable
+/// (the daemon's own install dir) → `~/.local/bin` → `~/.cargo/bin` → the bare
+/// name (ambient-PATH fallback, preserving prior behaviour when found there).
+fn resolve_own_bin(name: &str) -> String {
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let cand = dir.join(name);
+        if cand.is_file() {
+            return cand.to_string_lossy().into_owned();
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        for sub in [".local/bin", ".cargo/bin"] {
+            let cand = std::path::Path::new(&home).join(sub).join(name);
+            if cand.is_file() {
+                return cand.to_string_lossy().into_owned();
+            }
+        }
+    }
+    name.to_string()
+}
+
 async fn cmd_capture(bin: &str, args: &[&str]) -> Option<String> {
     let out = tokio::time::timeout(
         Duration::from_secs(5),
@@ -444,6 +476,33 @@ async fn pypi_version(client: &reqwest::Client, pkg: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_own_bin_falls_back_to_bare_name_when_not_installed() {
+        // A binary that exists in no known install dir resolves to its bare
+        // name, preserving the ambient-PATH lookup (and never panicking).
+        let n = "ff-nonexistent-binary-xyz-987";
+        assert_eq!(resolve_own_bin(n), n);
+    }
+
+    #[test]
+    fn resolve_own_bin_prefers_a_sibling_of_the_running_exe() {
+        // The test binary itself is a real file; resolving "its own name" by the
+        // current_exe sibling path must return an absolute, existing path — the
+        // mechanism that lets the daemon find `ff`/`forgefleetd` in its own
+        // install dir regardless of PATH.
+        let exe = std::env::current_exe().unwrap();
+        let name = exe.file_name().unwrap().to_string_lossy().into_owned();
+        let resolved = resolve_own_bin(&name);
+        assert!(
+            std::path::Path::new(&resolved).is_file(),
+            "expected an existing path, got {resolved}"
+        );
+        assert_ne!(
+            resolved, name,
+            "should resolve to a full path, not bare name"
+        );
+    }
 
     #[test]
     fn versions_equivalent_same_sha_different_build_counter() {
