@@ -130,6 +130,43 @@ pub struct JwtClaims {
     pub sub: String,
     pub exp: Option<usize>,
     pub iat: Option<usize>,
+    /// Fleet RBAC role: `admin` | `operator` | `viewer`. Absent ⇒ `viewer`
+    /// (a valid token can always READ; mutating/control routes require an
+    /// explicit `operator`/`admin` role). Only enforced when `FF_JWT_SECRET`
+    /// is set (the production / cloud-exposed deploy).
+    #[serde(default)]
+    pub role: Option<String>,
+}
+
+/// Privilege rank of a fleet role; higher = more privileged. An unknown or
+/// absent role is treated as `viewer` (rank 1) so existing read-only tokens
+/// keep working — RBAC only *adds* a requirement for mutating/control routes.
+fn role_rank(role: Option<&str>) -> u8 {
+    match role.map(|r| r.trim().to_ascii_lowercase()).as_deref() {
+        Some("admin") => 3,
+        Some("operator") => 2,
+        Some("viewer") | None | Some("") => 1,
+        _ => 1, // unknown role → least privilege (viewer)
+    }
+}
+
+/// Minimum role rank a route requires. Pure + isolated so the policy is
+/// unit-testable. Read requests need `viewer` (any valid token). Mutating
+/// requests need `operator`. The most sensitive surfaces (secrets, OAuth
+/// material, RBAC/leadership control) need `admin` regardless of method.
+fn required_rank(path: &str, is_mutating: bool) -> u8 {
+    let admin_sensitive = path.starts_with("/api/secrets")
+        || path.starts_with("/api/oauth")
+        || path.starts_with("/api/fleet/leader")
+        || path.contains("/secrets")
+        || path.contains("/rbac");
+    if admin_sensitive {
+        3 // admin
+    } else if is_mutating {
+        2 // operator
+    } else {
+        1 // viewer (read)
+    }
 }
 
 /// Public routes that do NOT require authentication.
@@ -238,7 +275,27 @@ pub async fn jwt_auth_middleware(request: Request<Body>, next: Next) -> Response
         &jsonwebtoken::DecodingKey::from_secret(secret.as_bytes()),
         &validation,
     ) {
-        Ok(_decoded) => next.run(request).await,
+        Ok(decoded) => {
+            // RBAC: a valid token is necessary but not sufficient — the holder's
+            // role must meet the route's requirement (item 11). Reads pass for
+            // any role; mutations need operator+; sensitive surfaces need admin.
+            let have = role_rank(decoded.claims.role.as_deref());
+            let need = required_rank(&path, is_mutating);
+            if have < need {
+                warn!(
+                    sub = %decoded.claims.sub,
+                    role = decoded.claims.role.as_deref().unwrap_or("viewer"),
+                    %path,
+                    "rbac: insufficient role for route"
+                );
+                return json_error(
+                    StatusCode::FORBIDDEN,
+                    "insufficient role for this operation",
+                )
+                .into_response();
+            }
+            next.run(request).await
+        }
         Err(_e) => {
             warn!("jwt validation failed");
             // Generic error — do not leak internal validation details.
@@ -256,5 +313,65 @@ fn error_type_for_status(status: StatusCode) -> &'static str {
         StatusCode::TOO_MANY_REQUESTS => "rate_limited",
         StatusCode::INTERNAL_SERVER_ERROR => "internal_error",
         _ => "unknown_error",
+    }
+}
+
+#[cfg(test)]
+mod rbac_tests {
+    use super::{required_rank, role_rank};
+
+    #[test]
+    fn role_rank_orders_admin_operator_viewer() {
+        assert_eq!(role_rank(Some("admin")), 3);
+        assert_eq!(role_rank(Some("operator")), 2);
+        assert_eq!(role_rank(Some("viewer")), 1);
+        assert_eq!(role_rank(Some("ADMIN")), 3); // case-insensitive
+        assert_eq!(role_rank(Some(" operator ")), 2); // trimmed
+    }
+
+    #[test]
+    fn absent_or_unknown_role_is_viewer() {
+        // A valid token without a role can still READ — RBAC only adds a
+        // requirement for elevated routes; it never breaks read access.
+        assert_eq!(role_rank(None), 1);
+        assert_eq!(role_rank(Some("")), 1);
+        assert_eq!(role_rank(Some("superuser")), 1);
+    }
+
+    #[test]
+    fn read_routes_need_only_viewer() {
+        assert_eq!(required_rank("/api/fleet/status", false), 1);
+        assert_eq!(required_rank("/api/models", false), 1);
+    }
+
+    #[test]
+    fn mutations_need_operator() {
+        assert_eq!(required_rank("/api/models", true), 2);
+        assert_eq!(required_rank("/api/tasks", true), 2);
+    }
+
+    #[test]
+    fn sensitive_surfaces_need_admin_regardless_of_method() {
+        assert_eq!(required_rank("/api/secrets/foo", false), 3);
+        assert_eq!(required_rank("/api/oauth/import", true), 3);
+        assert_eq!(required_rank("/api/fleet/leader/step-down", true), 3);
+    }
+
+    #[test]
+    fn enforcement_matrix() {
+        // (role, path, mutating) -> allowed?
+        let allowed =
+            |role: Option<&str>, path: &str, m: bool| role_rank(role) >= required_rank(path, m);
+        // viewer can read but not mutate
+        assert!(allowed(Some("viewer"), "/api/models", false));
+        assert!(!allowed(Some("viewer"), "/api/models", true));
+        // operator can mutate but not touch secrets
+        assert!(allowed(Some("operator"), "/api/models", true));
+        assert!(!allowed(Some("operator"), "/api/secrets/x", false));
+        // admin can do everything
+        assert!(allowed(Some("admin"), "/api/secrets/x", true));
+        // no-role token: reads ok, mutations denied
+        assert!(allowed(None, "/api/fleet/status", false));
+        assert!(!allowed(None, "/api/tasks", true));
     }
 }
