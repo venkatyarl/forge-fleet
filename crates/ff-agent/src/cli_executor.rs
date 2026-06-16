@@ -28,9 +28,15 @@ use std::time::Duration;
 use anyhow::{Result, anyhow};
 use tracing::{debug, info};
 
-/// Default per-CLI invocation timeout. Mirrors the worker timeout shipped
-/// in PR #12 so a wedged CLI is killed before it blocks downstream work.
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// Default per-CLI invocation timeout. The old 10-min value killed real
+/// multi-minute build/codegen runs mid-flight (a verified codex task completing
+/// in ~2min is fine, but a larger refactor legitimately exceeds 10min) — the
+/// "wedges at ~600s" symptom was THIS cap, NOT any cred refresh (the codex
+/// token is a 10-day TTL and never refreshes mid-run; verified by reproduction).
+/// 30min gives real build tasks room; callers cap it lower with `--timeout`.
+/// NOTE: a DISPATCHED `ff run` is also bounded by the fleet task worker's
+/// `MAX_TASK_DURATION`, which the build verbs raise in tandem.
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// How a vendor CLI wants its working directory expressed. Even though we
 /// always set the spawned process's cwd (so relative paths resolve), the

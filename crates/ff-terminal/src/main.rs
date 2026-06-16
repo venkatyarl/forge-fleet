@@ -1076,6 +1076,12 @@ enum AgentCommand {
         /// the global `--cwd`.)
         #[arg(long = "run-cwd")]
         run_cwd: Option<String>,
+        /// Per-run wall-clock budget in seconds for each dispatched build task.
+        /// Raises BOTH 600s caps that otherwise kill a multi-minute codex/kimi
+        /// run at ~10min: the dispatched `ff run --timeout` (CLI subprocess) and
+        /// the fleet-task worker's `max_duration_secs`. Default 1800 (30min).
+        #[arg(long, default_value_t = 1800)]
+        timeout: u64,
     },
     /// Run the same prompt on every fleet member that has `<backend>`'s
     /// CLI installed. One task per capable member; observable via
@@ -1087,6 +1093,9 @@ enum AgentCommand {
         /// Working dir for the dispatched `ff run` (see `fanout --run-cwd`).
         #[arg(long = "run-cwd")]
         run_cwd: Option<String>,
+        /// Per-run wall-clock budget in seconds (see `fanout --timeout`).
+        #[arg(long, default_value_t = 1800)]
+        timeout: u64,
     },
     /// Seed slot 0 for every computer in the `computers` table.
     /// Idempotent — existing rows are left alone.

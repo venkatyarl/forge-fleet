@@ -10,6 +10,7 @@ pub async fn handle_agent_fanout(
     backend: String,
     fanout: u32,
     cwd: Option<String>,
+    timeout: u64,
 ) -> Result<()> {
     use ff_agent::cli_executor::backend_by_name;
     let cfg = backend_by_name(&backend).ok_or_else(|| {
@@ -58,12 +59,18 @@ pub async fn handle_agent_fanout(
     let run_cwd = cwd
         .clone()
         .unwrap_or_else(|| "~/.forgefleet/sub-agent-0/forge-fleet".to_string());
+    // Pass --timeout to the dispatched run (bounds the CLI subprocess) AND give
+    // the fleet task a matching max_duration_secs (worker cap) with a small
+    // buffer, so a multi-minute codex/kimi build isn't killed at the 600s
+    // default by EITHER cap. The CLI --timeout fires first (checkpoint), the
+    // worker is the backstop.
     let cmd = format!(
-        "ff run --backend {} --cwd {} '{shell_safe_prompt}'",
+        "ff run --backend {} --cwd {} --timeout {timeout} '{shell_safe_prompt}'",
         cfg.name, run_cwd
     );
+    let task_max_secs = timeout + 120;
     for i in 0..fanout {
-        ff_agent::task_runner::pg_enqueue_shell_task(
+        ff_agent::task_runner::pg_enqueue_shell_task_full(
             pool,
             &format!("agent-fanout/{i}: {} backend={}", cfg.name, cfg.name),
             &cmd,
@@ -72,6 +79,10 @@ pub async fn handle_agent_fanout(
             Some(parent),
             70,
             leader_computer_id,
+            false,
+            &[],
+            Some(task_max_secs),
+            None,
         )
         .await
         .map_err(|e| anyhow::anyhow!("enqueue child {i}: {e}"))?;
@@ -90,6 +101,7 @@ pub async fn handle_agent_dispatch_each(
     prompt: String,
     backend: String,
     cwd: Option<String>,
+    timeout: u64,
 ) -> Result<()> {
     use ff_agent::cli_executor::backend_by_name;
     let cfg = backend_by_name(&backend).ok_or_else(|| {
@@ -145,12 +157,15 @@ pub async fn handle_agent_dispatch_each(
     let run_cwd = cwd
         .clone()
         .unwrap_or_else(|| "~/.forgefleet/sub-agent-0/forge-fleet".to_string());
+    // See handle_agent_fanout: --timeout bounds the CLI, task max_duration_secs
+    // bounds the worker; both raised above the 600s default for build runs.
     let cmd = format!(
-        "ff run --backend {} --cwd {} '{shell_safe_prompt}'",
+        "ff run --backend {} --cwd {} --timeout {timeout} '{shell_safe_prompt}'",
         cfg.name, run_cwd
     );
+    let task_max_secs = timeout + 120;
     for (_id, name) in &members {
-        ff_agent::task_runner::pg_enqueue_shell_task(
+        ff_agent::task_runner::pg_enqueue_shell_task_full(
             pool,
             &format!("agent-dispatch-each: {} on {}", cfg.name, name),
             &cmd,
@@ -159,6 +174,10 @@ pub async fn handle_agent_dispatch_each(
             Some(parent),
             70,
             leader_computer_id,
+            false,
+            &[],
+            Some(task_max_secs),
+            None,
         )
         .await
         .map_err(|e| anyhow::anyhow!("enqueue task on {name}: {e}"))?;
@@ -650,11 +669,13 @@ pub async fn handle_agent(cmd: crate::AgentCommand) -> Result<()> {
             backend,
             fanout,
             run_cwd,
-        } => handle_agent_fanout(&pool, prompt, backend, fanout, run_cwd).await,
+            timeout,
+        } => handle_agent_fanout(&pool, prompt, backend, fanout, run_cwd, timeout).await,
         crate::AgentCommand::DispatchEach {
             prompt,
             backend,
             run_cwd,
-        } => handle_agent_dispatch_each(&pool, prompt, backend, run_cwd).await,
+            timeout,
+        } => handle_agent_dispatch_each(&pool, prompt, backend, run_cwd, timeout).await,
     }
 }
