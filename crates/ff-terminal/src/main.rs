@@ -3499,8 +3499,15 @@ async fn main() -> Result<()> {
     let (llm, router) =
         if let Some(explicit_url) = cli.llm.or_else(|| env::var("FORGEFLEET_LLM_URL").ok()) {
             (explicit_url, None)
-        } else if let Some(url) = helpers::pick_agent_capable_url(&config_path, 16_000).await {
-            // Agent-capable endpoint (tool-calling + usable_agent_ctx >= 16K).
+        } else if let Some(url) = helpers::pick_agent_capable_url(&config_path, 32_768).await {
+            // Agent-capable endpoint (tool-calling + usable_agent_ctx >= 32K).
+            // 32K (not 16K) MATCHES the agent loop's default
+            // `context_window_tokens` (32768): a 16K endpoint overflowed even a
+            // 1-file task because the system prompt + tool schemas + file easily
+            // exceed 16K, and the loop won't auto-compact until its 32K
+            // threshold. The fleet has ample 32K+ endpoints (taylor 64K,
+            // james/logan/duncan 32K), so this routes to a model that can
+            // actually hold the context instead of overflowing on turn 1.
             // Use it DIRECTLY with NO inference router: the agent loop prefers
             // router.active_url() (local-first) over llm_base_url, so attaching
             // the router would override this pick back to a small-per-slot-ctx
