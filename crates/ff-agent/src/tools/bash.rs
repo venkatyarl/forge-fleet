@@ -52,11 +52,38 @@ impl AgentTool for BashTool {
             .unwrap_or(120_000)
             .min(600_000);
 
-        // Block obviously destructive commands
+        // Block obviously destructive commands (cheap denylist first pass).
         if is_blocked_command(command) {
             return AgentToolResult::err(format!(
                 "Command blocked for safety: {command}\nThis command is potentially destructive. Use a more targeted approach."
             ));
+        }
+
+        // Strong validator — the hardened bash_security scanner. Hard-blocks the
+        // never-legitimate catastrophic classes (IFS poisoning, LD_PRELOAD/DYLD
+        // injection, destructive disk/root ops, shutdown-as-command, eval/exec,
+        // pipe-to-shell). High-but-routine signals (command substitution, sudo,
+        // backticks, nc) are detected and logged, not blocked — blocking them
+        // would break legitimate autonomous shell work on the fleet.
+        let scan = crate::bash_security::scan_command(command);
+        if let Some(reason) = crate::bash_security::hard_block_reason(&scan) {
+            tracing::warn!(
+                target: "bash_security",
+                risk = scan.risk_score,
+                "bash tool BLOCKED a command: {command}"
+            );
+            return AgentToolResult::err(format!(
+                "Command blocked by security validator (risk {}): {command}\nDangerous pattern(s): {reason}\nUse a more targeted, non-destructive approach.",
+                scan.risk_score
+            ));
+        }
+        if scan.action != crate::bash_security::SecurityAction::Allow {
+            tracing::warn!(
+                target: "bash_security",
+                risk = scan.risk_score,
+                threats = scan.threats.len(),
+                "bash tool: command flagged but allowed: {command}"
+            );
         }
 
         // Intercept bare SSH commands to fleet nodes and make them non-interactive
