@@ -8711,3 +8711,55 @@ ALTER TABLE fleet_leader_state
     ADD COLUMN IF NOT EXISTS standby_member      TEXT,
     ADD COLUMN IF NOT EXISTS relinquishing_until TIMESTAMPTZ;
 "#;
+
+// ─── V134: staged upgrade rollouts + auto-halt (PROD_READINESS item 26) ─────
+//
+// Today a fleet upgrade composes EVERY target into priority-ordered waves and
+// inserts them all at once — priority gates ORDER, not SUCCESS, so a bad build
+// rolls all 14 non-leader hosts before failures surface (the wave self-kill
+// history). This table drives a GATED progression: one row per rollout holds an
+// ordered `stages` JSONB list ({stage_idx, target_names[]}); the leader-gated
+// `upgrade_rollout` tick advances `current_stage` only when the current stage's
+// fleet_tasks all reached a terminal state AND its failure rate is under
+// `failure_threshold_pct` (a canary stage halts on the FIRST failure). On a
+// breach it sets status='halted' + halted_reason and fires the
+// `upgrade_rollout_halted` alert; otherwise it composes ONLY the next stage's
+// targets (preserving the V62 one-wave-per-family-in-flight invariant) or marks
+// the rollout 'completed' when no stages remain.
+//
+// `fleet_tasks` gains nullable rollout_id/rollout_stage so the gate can count a
+// stage's outcomes; the columns are inert for non-rollout tasks. The whole
+// subsystem is gated OFF by default behind `fleet_secrets.staged_rollout_mode`
+// (off|dry-run|active) — deploying it is harmless until an operator opts in.
+pub const SCHEMA_V134_UPGRADE_ROLLOUTS: &str = r#"
+CREATE TABLE IF NOT EXISTS upgrade_rollouts (
+    id                    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    software_id           TEXT,
+    started_by            TEXT,
+    stages                JSONB,
+    current_stage         INT  NOT NULL DEFAULT 0,
+    status                TEXT NOT NULL DEFAULT 'in_progress',
+    failure_threshold_pct INT  NOT NULL DEFAULT 25,
+    halted_reason         TEXT,
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at            TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_upgrade_rollouts_in_progress
+    ON upgrade_rollouts (status) WHERE status = 'in_progress';
+
+ALTER TABLE fleet_tasks
+    ADD COLUMN IF NOT EXISTS rollout_id    UUID,
+    ADD COLUMN IF NOT EXISTS rollout_stage INT;
+CREATE INDEX IF NOT EXISTS idx_fleet_tasks_rollout
+    ON fleet_tasks (rollout_id, rollout_stage) WHERE rollout_id IS NOT NULL;
+
+INSERT INTO alert_policies
+    (name, description, metric, scope, condition,
+     duration_secs, severity, cooldown_secs, channel, enabled)
+VALUES
+  ('upgrade_rollout_halted',
+   'A staged upgrade rollout auto-halted because a stage''s task-failure rate crossed its threshold (a bad build was caught before it reached every host)',
+   'upgrade_rollout_halted', 'leader_only', '> 0',
+   0, 'warning', 3600, 'telegram', true)
+ON CONFLICT (name) DO NOTHING;
+"#;

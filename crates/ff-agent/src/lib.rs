@@ -132,6 +132,7 @@ pub mod tools;
 pub mod training;
 pub mod training_orchestrator;
 pub mod upgrade_playbooks;
+pub mod upgrade_rollout;
 pub mod vault_sync;
 pub mod verify_computer;
 pub mod version_check;
