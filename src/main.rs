@@ -1988,7 +1988,9 @@ fn start_evolution_subsystem(
             match engine.backlog.load_from_pg(pool).await {
                 Ok(n) if n > 0 => info!(loaded = n, "evolution backlog hydrated from Postgres"),
                 Ok(_) => {}
-                Err(e) => warn!(error = %e, "evolution backlog hydrate failed (continuing in-memory)"),
+                Err(e) => {
+                    warn!(error = %e, "evolution backlog hydrate failed (continuing in-memory)")
+                }
             }
         }
 
