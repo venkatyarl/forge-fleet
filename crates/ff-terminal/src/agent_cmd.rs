@@ -286,8 +286,16 @@ pub async fn handle_agent_commit_back(
 
     // Build the remote shell script. Do NOT stage via `git add .` — use the
     // recorded list, so concurrent unrelated edits on the worker don't leak in.
+    //
+    // GAP-D-collision: capture the workspace's current branch first and restore
+    // it after committing, so commit-back NEVER leaves a shared/live checkout
+    // (e.g. taylor's `~/projects/forge-fleet` dev tree) switched onto the fleet
+    // branch — observed switching the operator's working tree mid-session. The
+    // commit lives on the new branch ref; the push/PR steps below operate on it
+    // by name without it being checked out.
     let mut script = String::new();
     script.push_str(&format!("cd {workspace} && "));
+    script.push_str("_ff_orig=$(git symbolic-ref --quiet --short HEAD || git rev-parse HEAD) && ");
     script.push_str(&format!(
         "git fetch origin main >/dev/null 2>&1 || true && \
          git checkout -b {shell_branch} 2>&1 && ",
@@ -297,9 +305,14 @@ pub async fn handle_agent_commit_back(
         script.push_str(&format!("git add -- {} && ", shell_quote(f)));
     }
     script.push_str(&format!(
-        "git commit -m {msg} 2>&1",
+        "git commit -m {msg} 2>&1 && ",
         msg = shell_quote(&commit_msg)
     ));
+    // Restore the original branch (best-effort; the commit is safe on the new
+    // branch regardless). A clean working tree after commit makes this succeed.
+    script.push_str(
+        "{ git checkout \"$_ff_orig\" 2>&1 || echo \"warn: could not restore $_ff_orig\"; }",
+    );
 
     let target = format!("{ssh_user}@{primary_ip}");
     let out = Command::new("ssh")
