@@ -836,9 +836,12 @@ async fn run_agent_loop(
         let active_base = if let Some(router) = &session.config.inference_router {
             // The agent loop drives tools every turn — require a tool-capable
             // endpoint so a local non-tool model (gemma-4) never shadows a
-            // remote tool-capable one and hangs the agent.
+            // remote tool-capable one and hangs the agent. Also require a
+            // per-slot ctx that matches this session's window, so a code task
+            // never lands on a 4K/8K slot of an otherwise-capable model and
+            // overflows reading one file (the n_ctx-blind-router bug).
             router
-                .active_url_filtered(true)
+                .active_url_min_ctx(true, session.config.context_window_tokens as i32)
                 .await
                 .unwrap_or_else(|| session.config.llm_base_url.clone())
         } else {
@@ -949,7 +952,9 @@ async fn run_agent_loop(
                 // next available fleet node (rather than waiting with backoff).
                 if let Some(router) = &session.config.inference_router {
                     router.report_failure(&active_base).await;
-                    let next = router.active_url_filtered(true).await;
+                    let next = router
+                        .active_url_min_ctx(true, session.config.context_window_tokens as i32)
+                        .await;
                     if next.as_deref() != Some(active_base.as_str()) {
                         emit(
                             &event_tx,
