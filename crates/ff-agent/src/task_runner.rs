@@ -1565,7 +1565,34 @@ pub async fn compose_fleet_upgrade_wave(
     leader_computer_id: uuid::Uuid,
     dry_run: bool,
 ) -> Result<ComposePlan, sqlx::Error> {
+    compose_fleet_upgrade_wave_filtered(pg, software_id, fanout, leader_computer_id, dry_run, None)
+        .await
+}
+
+/// Stage-scoped variant of [`compose_fleet_upgrade_wave`]. When
+/// `target_filter` is `Some(names)`, only those (case-insensitive) member names
+/// are composed into the wave — every other resolvable target is dropped. This
+/// is how the staged-rollout tick composes ONE stage at a time (canary → the
+/// rest) while preserving the V62 one-wave-per-family-in-flight invariant: the
+/// tick never composes the next stage until the current one is terminal, so the
+/// singleton always sees a single wave. `None` is the all-targets behaviour the
+/// public wrapper passes through unchanged.
+pub async fn compose_fleet_upgrade_wave_filtered(
+    pg: &PgPool,
+    software_id: &str,
+    fanout: usize,
+    leader_computer_id: uuid::Uuid,
+    dry_run: bool,
+    target_filter: Option<&[String]>,
+) -> Result<ComposePlan, sqlx::Error> {
     use crate::auto_upgrade::resolve_upgrade_plans_with_suffix;
+
+    let filter_lower: Option<std::collections::HashSet<String>> = target_filter.map(|names| {
+        names
+            .iter()
+            .map(|n| n.trim().to_ascii_lowercase())
+            .collect()
+    });
 
     let mut planned: Vec<PlannedTask> = Vec::new();
     let fanout = fanout.max(1);
@@ -1695,6 +1722,14 @@ pub async fn compose_fleet_upgrade_wave(
     for plan in plans {
         if plan.computer_name.eq_ignore_ascii_case(&leader_lower) {
             continue;
+        }
+        // Stage scoping: when a filter is set, only the named members are
+        // composed into this wave (the rest of the stage list is held back for
+        // a later tick to compose).
+        if let Some(allow) = filter_lower.as_ref() {
+            if !allow.contains(&plan.computer_name.to_ascii_lowercase()) {
+                continue;
+            }
         }
         let row: Option<(uuid::Uuid, String, String, i32, String)> = sqlx::query_as(
             "SELECT id, ssh_user, primary_ip, ssh_port, COALESCE(os_family, 'unknown') \

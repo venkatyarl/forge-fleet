@@ -1780,6 +1780,46 @@ enum FleetCommand {
         #[arg(default_value = "status")]
         mode: String,
     },
+    /// Staged upgrade rollout + auto-halt (PROD_READINESS item 26). Drives a
+    /// gated canary→rest progression that halts on a bad build instead of
+    /// rolling every host. The leader-gated `staged_rollout_mode` tick advances
+    /// stages; this command starts a rollout and lists existing ones.
+    Rollout {
+        #[command(subcommand)]
+        command: RolloutCommand,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum RolloutCommand {
+    /// Start a staged rollout: create the `upgrade_rollouts` row and compose
+    /// ONLY stage 0 (the canary). The leader-gated tick advances the rest as
+    /// each stage passes, and halts (+ alerts) if a stage's failure rate
+    /// crosses its threshold. Requires `--staged` (the unstaged path is the
+    /// existing `ff fleet upgrade`). The tick must be enabled
+    /// (`fleet_secrets.staged_rollout_mode` = active) to progress past stage 0.
+    Start {
+        /// software_id from `software_registry` (e.g. `forgefleetd_git`).
+        software: String,
+        /// Required acknowledgement that this is the staged path.
+        #[arg(long, default_value_t = false)]
+        staged: bool,
+        /// Number of canary hosts in stage 0 (the rest become stage 1).
+        #[arg(long, default_value_t = 1)]
+        canary: usize,
+        /// Percentage failure threshold for non-canary stages (the canary
+        /// always halts on the first failure).
+        #[arg(long, default_value_t = 25)]
+        failure_threshold_pct: i32,
+        /// Plan the stages and print them without writing any rows/tasks.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
+    /// List rollouts (most recent first) with status + current stage.
+    Status {
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]

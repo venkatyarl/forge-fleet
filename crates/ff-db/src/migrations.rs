@@ -799,6 +799,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "leader_maintenance_lease",
         sql: schema::SCHEMA_V133_LEADER_MAINTENANCE_LEASE,
     },
+    PgMigration {
+        version: 134,
+        name: "upgrade_rollouts",
+        sql: schema::SCHEMA_V134_UPGRADE_ROLLOUTS,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.

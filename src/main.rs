@@ -815,6 +815,28 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         ));
     }
 
+    // 18b) Staged upgrade rollout + auto-halt — every 60s, leader-gated.
+    // PROD_READINESS item 26: a bad build must be caught on a canary host
+    // instead of rolling all 14 non-leader hosts. For each in_progress
+    // `upgrade_rollouts` row the tick gates stage progression on the current
+    // stage's fleet_tasks all reaching a terminal state, halts (+ alerts) when a
+    // stage's failure rate crosses its threshold (canary halts on the first
+    // failure), and otherwise composes ONLY the next stage's targets — never
+    // more than one stage in flight (preserves the V62 wave singleton). DEFAULTS
+    // TO OFF: with `fleet_secrets.staged_rollout_mode` at `off`/unset the tick is
+    // a pure no-op; `dry-run` logs the decision; `active` actuates.
+    if let Some(pg_pool) = operational_store.pg_pool().cloned() {
+        info!(
+            "starting subsystem: staged-rollout tick (60s, leader-gated, gate=fleet_secrets.staged_rollout_mode default off)"
+        );
+        subsystem_tasks.push(ff_agent::upgrade_rollout::spawn_upgrade_rollout_tick(
+            pg_pool,
+            worker_name.clone(),
+            60,
+            shutdown_rx.clone(),
+        ));
+    }
+
     // 19) Adaptive serving-mix autoscaler — every 120s, leader-gated.
     // Orchestrator P3: compares the P2 demand vector against live supply and,
     // when the `fleet_secrets.autoscaler_mode` gate is set to `active`, loads

@@ -3158,6 +3158,163 @@ pub async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
         FleetCommand::Autoscaler { mode } => {
             handle_fleet_autoscaler(&pool, &mode).await?;
         }
+        FleetCommand::Rollout { command } => {
+            handle_fleet_rollout(&pool, command).await?;
+        }
+    }
+    Ok(())
+}
+
+/// `ff fleet rollout <start|status>` — staged upgrade rollouts (item 26).
+async fn handle_fleet_rollout(pool: &sqlx::PgPool, cmd: crate::RolloutCommand) -> Result<()> {
+    use crate::RolloutCommand;
+    match cmd {
+        RolloutCommand::Start {
+            software,
+            staged,
+            canary,
+            failure_threshold_pct,
+            dry_run,
+        } => {
+            if !staged {
+                anyhow::bail!(
+                    "pass --staged to use the gated rollout path (unstaged all-at-once is `ff fleet upgrade`)"
+                );
+            }
+            let me = ff_agent::fleet_info::resolve_this_worker_name().await;
+
+            // Resolvable non-leader targets, in the wave's resolution order.
+            let (plans, skipped) = ff_agent::auto_upgrade::resolve_upgrade_plans_with_suffix(
+                pool, &software, None, false, None,
+            )
+            .await?;
+            let leader_lower = me.to_ascii_lowercase();
+            let targets: Vec<String> = plans
+                .into_iter()
+                .map(|p| p.computer_name)
+                .filter(|n| !n.eq_ignore_ascii_case(&leader_lower))
+                .collect();
+
+            if targets.is_empty() {
+                anyhow::bail!(
+                    "no resolvable non-leader targets for software_id='{software}' \
+                     ({} skipped)",
+                    skipped.len()
+                );
+            }
+
+            let stages = ff_agent::upgrade_rollout::plan_stages(&targets, canary);
+            println!("{CYAN}▶ ff fleet rollout start {software} --staged{RESET}");
+            println!("  software:          {software}");
+            println!("  targets (non-leader): {}", targets.len());
+            println!("  failure threshold:  {failure_threshold_pct}% (canary halts on first fail)");
+            for s in &stages {
+                let label = if s.stage_idx == 0 { "canary" } else { "stage" };
+                println!(
+                    "  {label} {}: {} host(s) — {}",
+                    s.stage_idx,
+                    s.target_names.len(),
+                    s.target_names.join(", ")
+                );
+            }
+
+            if dry_run {
+                println!(
+                    "\n{YELLOW}Dry run — no rollout row created, no canary composed. \
+                     Drop --dry-run to start.{RESET}"
+                );
+                return Ok(());
+            }
+
+            let id = ff_agent::upgrade_rollout::create_staged_rollout(
+                pool,
+                &software,
+                &targets,
+                canary,
+                failure_threshold_pct,
+                &me,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("create rollout: {e}"))?;
+
+            println!("\n{GREEN}✓ Started staged rollout {id}{RESET}");
+            println!("  Composed canary stage 0 only; the leader tick advances the rest.");
+            println!(
+                "  NOTE: set `ff secrets set staged_rollout_mode active` so the tick progresses \
+                 stages (default off = canary composed but never advanced)."
+            );
+            println!("  Track with: ff fleet rollout status");
+            Ok(())
+        }
+        RolloutCommand::Status { json } => handle_fleet_rollout_status(pool, json).await,
+    }
+}
+
+/// `ff fleet rollout status` — list rollouts, most recent first.
+async fn handle_fleet_rollout_status(pool: &sqlx::PgPool, json: bool) -> Result<()> {
+    use sqlx::Row;
+    let rows = sqlx::query(
+        r#"
+        SELECT id, COALESCE(software_id, '') AS software_id,
+               COALESCE(started_by, '') AS started_by,
+               current_stage, status, failure_threshold_pct,
+               COALESCE(halted_reason, '') AS halted_reason,
+               jsonb_array_length(COALESCE(stages, '[]'::jsonb)) AS stage_count,
+               created_at
+          FROM upgrade_rollouts
+         ORDER BY created_at DESC
+         LIMIT 50
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    if json {
+        let mut arr: Vec<serde_json::Value> = Vec::with_capacity(rows.len());
+        for r in &rows {
+            arr.push(serde_json::json!({
+                "id": r.get::<uuid::Uuid, _>("id").to_string(),
+                "software_id": r.get::<String, _>("software_id"),
+                "started_by": r.get::<String, _>("started_by"),
+                "current_stage": r.get::<i32, _>("current_stage"),
+                "stage_count": r.get::<i32, _>("stage_count"),
+                "status": r.get::<String, _>("status"),
+                "failure_threshold_pct": r.get::<i32, _>("failure_threshold_pct"),
+                "halted_reason": r.get::<String, _>("halted_reason"),
+                "created_at": r.get::<chrono::DateTime<chrono::Utc>, _>("created_at").to_rfc3339(),
+            }));
+        }
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::Value::Array(arr))?
+        );
+        return Ok(());
+    }
+
+    if rows.is_empty() {
+        println!("{YELLOW}No rollouts.{RESET}");
+        return Ok(());
+    }
+
+    println!(
+        "{:<38} {:<16} {:<12} {:<8} {:<6} reason",
+        "id", "software", "status", "stage", "thr%"
+    );
+    for r in &rows {
+        let id: uuid::Uuid = r.get("id");
+        let status: String = r.get("status");
+        let stage: i32 = r.get("current_stage");
+        let stage_count: i32 = r.get("stage_count");
+        let reason: String = r.get("halted_reason");
+        println!(
+            "{:<38} {:<16} {:<12} {:<8} {:<6} {}",
+            id.to_string(),
+            r.get::<String, _>("software_id"),
+            status,
+            format!("{stage}/{}", stage_count.saturating_sub(1).max(0)),
+            r.get::<i32, _>("failure_threshold_pct"),
+            reason
+        );
     }
     Ok(())
 }
