@@ -1063,6 +1063,13 @@ enum AgentCommand {
         /// compete via SKIP LOCKED.
         #[arg(long, default_value_t = 5)]
         fanout: u32,
+        /// Working dir for the dispatched `ff run` on each member — the repo
+        /// checkout it edits, so the run records it and `ff agent commit-back`
+        /// lifts from there. Default: the member's fleet checkout
+        /// `~/.forgefleet/sub-agent-0/forge-fleet`. (Named `--run-cwd` to avoid
+        /// the global `--cwd`.)
+        #[arg(long = "run-cwd")]
+        run_cwd: Option<String>,
     },
     /// Run the same prompt on every fleet member that has `<backend>`'s
     /// CLI installed. One task per capable member; observable via
@@ -1071,6 +1078,9 @@ enum AgentCommand {
         prompt: String,
         #[arg(long, default_value = "claude")]
         backend: String,
+        /// Working dir for the dispatched `ff run` (see `fanout --run-cwd`).
+        #[arg(long = "run-cwd")]
+        run_cwd: Option<String>,
     },
     /// Seed slot 0 for every computer in the `computers` table.
     /// Idempotent — existing rows are left alone.

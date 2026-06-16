@@ -9,6 +9,7 @@ pub async fn handle_agent_fanout(
     prompt: String,
     backend: String,
     fanout: u32,
+    cwd: Option<String>,
 ) -> Result<()> {
     use ff_agent::cli_executor::backend_by_name;
     let cfg = backend_by_name(&backend).ok_or_else(|| {
@@ -51,7 +52,16 @@ pub async fn handle_agent_fanout(
     // Encode the prompt as a single-quoted shell argument. Replace any
     // single-quote with `'\''` so embedded quotes survive.
     let shell_safe_prompt = prompt.replace('\'', "'\\''");
-    let cmd = format!("ff run --backend {} '{shell_safe_prompt}'", cfg.name);
+    // GAP-D1-fanout: target a controlled checkout so the dispatched run records
+    // its working_dir there and `ff agent commit-back` can lift it. Default to
+    // the member's fleet forge-fleet checkout.
+    let run_cwd = cwd
+        .clone()
+        .unwrap_or_else(|| "~/.forgefleet/sub-agent-0/forge-fleet".to_string());
+    let cmd = format!(
+        "ff run --backend {} --cwd {} '{shell_safe_prompt}'",
+        cfg.name, run_cwd
+    );
     for i in 0..fanout {
         ff_agent::task_runner::pg_enqueue_shell_task(
             pool,
@@ -79,6 +89,7 @@ pub async fn handle_agent_dispatch_each(
     pool: &sqlx::PgPool,
     prompt: String,
     backend: String,
+    cwd: Option<String>,
 ) -> Result<()> {
     use ff_agent::cli_executor::backend_by_name;
     let cfg = backend_by_name(&backend).ok_or_else(|| {
@@ -131,7 +142,13 @@ pub async fn handle_agent_dispatch_each(
     .map_err(|e| anyhow::anyhow!("insert parent: {e}"))?;
 
     let shell_safe_prompt = prompt.replace('\'', "'\\''");
-    let cmd = format!("ff run --backend {} '{shell_safe_prompt}'", cfg.name);
+    let run_cwd = cwd
+        .clone()
+        .unwrap_or_else(|| "~/.forgefleet/sub-agent-0/forge-fleet".to_string());
+    let cmd = format!(
+        "ff run --backend {} --cwd {} '{shell_safe_prompt}'",
+        cfg.name, run_cwd
+    );
     for (_id, name) in &members {
         ff_agent::task_runner::pg_enqueue_shell_task(
             pool,
@@ -632,9 +649,12 @@ pub async fn handle_agent(cmd: crate::AgentCommand) -> Result<()> {
             prompt,
             backend,
             fanout,
-        } => handle_agent_fanout(&pool, prompt, backend, fanout).await,
-        crate::AgentCommand::DispatchEach { prompt, backend } => {
-            handle_agent_dispatch_each(&pool, prompt, backend).await
-        }
+            run_cwd,
+        } => handle_agent_fanout(&pool, prompt, backend, fanout, run_cwd).await,
+        crate::AgentCommand::DispatchEach {
+            prompt,
+            backend,
+            run_cwd,
+        } => handle_agent_dispatch_each(&pool, prompt, backend, run_cwd).await,
     }
 }
