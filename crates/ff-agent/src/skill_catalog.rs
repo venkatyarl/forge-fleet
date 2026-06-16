@@ -310,6 +310,15 @@ pub fn render_catalog(skills: &[Skill]) -> String {
          file (path in parentheses) FIRST, then follow its instructions. \
          If no skill applies, continue with your default behavior.\n\n",
     );
+    // BUDGET CAP: the fleet has ~700 materialized skills; listing every one
+    // injected ~170K chars (~28K tokens) into EVERY system prompt and filled
+    // the whole context window on turn 1, so even a one-file `ff run` overflowed.
+    // List the highest-priority skills (input is already priority-ordered) up to
+    // a budget; the agent reads a full SKILL.md on demand and the trailing note
+    // tells it more exist. This is THE fix for the local-backend ctx-overflow.
+    const CATALOG_BUDGET_CHARS: usize = 8000;
+    let header_len = out.len();
+    let mut listed = 0usize;
     for sk in skills {
         let triggers = if sk.triggers.is_empty() {
             String::new()
@@ -324,7 +333,7 @@ pub fn render_catalog(skills: &[Skill]) -> String {
                     .join(", ")
             )
         };
-        out.push_str(&format!(
+        let entry = format!(
             "- **`{id}`** — {name}{triggers}\n  {desc}\n  ({path}, source: {root})\n",
             id = sk.id,
             name = sk.name,
@@ -332,6 +341,19 @@ pub fn render_catalog(skills: &[Skill]) -> String {
             desc = sk.description,
             path = sk.source_path.display(),
             root = sk.source_root,
+        );
+        // Always list at least one; stop once the budget is exceeded.
+        if listed > 0 && out.len() + entry.len() > header_len + CATALOG_BUDGET_CHARS {
+            break;
+        }
+        out.push_str(&entry);
+        listed += 1;
+    }
+    let remaining = skills.len().saturating_sub(listed);
+    if remaining > 0 {
+        out.push_str(&format!(
+            "- … and {remaining} more skill(s) not listed (kept out of the prompt to \
+             preserve context). Search the skill roots above or ask if you need one.\n"
         ));
     }
     out.push_str("\n---\n\n");
@@ -363,6 +385,35 @@ mod tests {
         let long = "a ".repeat(300);
         let out = truncate_str(&long, 50);
         assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn render_catalog_caps_huge_skill_lists() {
+        // ~700 skills must NOT inject ~170K chars into the system prompt.
+        let skills: Vec<Skill> = (0..700)
+            .map(|i| Skill {
+                id: format!("skill-{i}"),
+                name: format!("Skill number {i}"),
+                description:
+                    "A reasonably long description of what this skill does, repeated to take space."
+                        .into(),
+                triggers: vec![format!("trig-{i}")],
+                source_path: PathBuf::from(format!("/root/skill-{i}/SKILL.md")),
+                source_root: "test".into(),
+            })
+            .collect();
+        let out = render_catalog(&skills);
+        // Capped well under the old ~170K; budget is 8K + header/footer.
+        assert!(
+            out.len() < 12_000,
+            "catalog not capped: {} chars",
+            out.len()
+        );
+        // The "+N more" note is present, and the first skill is listed.
+        assert!(out.contains("more skill(s) not listed"));
+        assert!(out.contains("skill-0"));
+        // Empty list still yields nothing.
+        assert!(render_catalog(&[]).is_empty());
     }
 
     #[test]
