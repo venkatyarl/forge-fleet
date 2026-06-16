@@ -24,13 +24,20 @@
 //! ## Safety — gate `fleet_secrets.fleet_integrity_mode`
 //! - `off` (DEFAULT): the tick is a no-op.
 //! - `report` (alias `on`): run the sweep + alert on drift. **Never mutates.**
+//! - `active`: run the sweep + alert, AND for each degraded node enqueue a SAFE
+//!   per-gap auto-repair through the EXISTING deferred-task queue. The only gap
+//!   that is auto-repairable today is the daemon-health/liveness check
+//!   (`daemon_healthy`), which re-uses the existing `revive_member` task kind +
+//!   handler — exactly what `leader_tick::revive_scan` enqueues for a dead node.
+//!   Every other gap is recorded + alerted only (no mutation yet). The enqueue
+//!   is leader-gated AND idempotent (it de-dupes against an in-flight
+//!   `revive_member` task and against a recent audit row), so a flapping check
+//!   cannot spam the queue.
 //!
-//! `active` (per-gap auto-repair) is a deliberate follow-up: there is no per-gap
-//! repair-handler framework yet, and re-running a destructive bootstrap on a
-//! drifted-but-serving node is worse than alerting a human. Closing the
-//! *detection* half first means drift is never silent again, with zero blast
-//! radius. The parser accepts only `off`/`report` today; an unknown value is
-//! treated as `off` (fail-safe).
+//! An unknown/missing value is treated as `off` (fail-safe), so deploying this
+//! is harmless until an operator sets the secret to `active`. `active` does NOT
+//! introduce a new repair executor: it only enqueues the already-shipped revive
+//! task; non-liveness repairs deliberately remain alert-only.
 
 use sqlx::{PgPool, Row};
 use tracing::{info, warn};
@@ -48,6 +55,12 @@ const ONLINE_WINDOW: &str = "5 minutes";
 /// Alert policy seeded by migration V131.
 const POLICY_NAME: &str = "fleet_integrity_degraded";
 
+/// The check name that, when failed, maps to a SAFE auto-repair (re-using the
+/// existing `revive_member` deferred task). This is the daemon-health/liveness
+/// probe in `verify_computer`. Kept as a single source of truth shared by the
+/// pure [`repair_for_gap`] decision and its test.
+const LIVENESS_CHECK: &str = "daemon_healthy";
+
 /// The operating mode read from `fleet_secrets.fleet_integrity_mode` each tick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IntegrityMode {
@@ -55,6 +68,9 @@ pub enum IntegrityMode {
     Off,
     /// Run the sweep and alert on drift; never mutate a target.
     Report,
+    /// Run the sweep, alert on drift, AND enqueue SAFE per-gap auto-repairs
+    /// (today: `revive_member` for a failed liveness check). Still leader-gated.
+    Active,
 }
 
 impl IntegrityMode {
@@ -63,6 +79,7 @@ impl IntegrityMode {
     /// doing work because a gate was mistyped.
     pub fn parse(raw: Option<&str>) -> Self {
         match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+            Some("active") => IntegrityMode::Active,
             Some("report") | Some("on") => IntegrityMode::Report,
             _ => IntegrityMode::Off,
         }
@@ -72,8 +89,50 @@ impl IntegrityMode {
         match self {
             IntegrityMode::Off => "off",
             IntegrityMode::Report => "report",
+            IntegrityMode::Active => "active",
         }
     }
+}
+
+/// The repair an active-mode tick will enqueue for a single failing check.
+/// Pure + exhaustive so the "which gaps are auto-repairable" policy is
+/// unit-testable without a database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GapRepair {
+    /// Re-use the existing `revive_member` deferred task + handler.
+    ReviveMember,
+    /// Detected + alerted, but no safe auto-repair exists yet → record only.
+    AlertOnly,
+}
+
+impl GapRepair {
+    /// The `action` string recorded in `integrity_active_repairs`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GapRepair::ReviveMember => "revive_member",
+            GapRepair::AlertOnly => "alert_only",
+        }
+    }
+}
+
+/// Pure decision: map a single failing check name to the SAFE repair (if any)
+/// the active tick should take. Only the daemon-health/liveness check is
+/// auto-repairable today — everything else is alert-only (recorded, not
+/// mutated). Isolated so the auto-repair policy is unit-testable.
+pub fn repair_for_gap(failing_check: &str) -> GapRepair {
+    if failing_check == LIVENESS_CHECK {
+        GapRepair::ReviveMember
+    } else {
+        GapRepair::AlertOnly
+    }
+}
+
+/// Pure: does this degraded node have a liveness gap the active tick can
+/// auto-repair? True iff any of its failing checks maps to a real repair.
+pub fn node_is_auto_repairable(gaps: &NodeGaps) -> bool {
+    gaps.failing_checks
+        .iter()
+        .any(|c| repair_for_gap(c) == GapRepair::ReviveMember)
 }
 
 /// The failing-check summary for a single degraded member.
@@ -253,8 +312,160 @@ async fn fire_degraded_alert(pg: &PgPool, my_name: &str, degraded: &[NodeGaps]) 
     );
 }
 
-/// One full tick body: gate → sweep → alert. Returns the summary (or `None`
-/// when gated off) so callers/tests can assert on it.
+/// Is a `revive_member` deferred task for `node` already pending/running? Mirrors
+/// the de-dupe in [`crate::leader_tick`]'s `revive_scan` so the integrity tick and
+/// the revive tick never double-enqueue the same revive.
+async fn revive_inflight(pg: &PgPool, node: &str) -> bool {
+    sqlx::query(
+        "SELECT 1 FROM deferred_tasks
+           WHERE kind = 'shell'
+             AND status IN ('pending', 'dispatchable', 'running')
+             AND title = $1",
+    )
+    .bind(format!("revive_member: {node}"))
+    .fetch_optional(pg)
+    .await
+    .map(|r| r.is_some())
+    .unwrap_or(false)
+}
+
+/// Did the active tick already enqueue a revive for `node` in the last 10 min?
+/// Second idempotency guard (in case the deferred task already completed) so a
+/// node that keeps flapping the liveness check is not revived every tick.
+async fn repair_recently_audited(pg: &PgPool, node: &str) -> bool {
+    sqlx::query(
+        "SELECT 1 FROM integrity_active_repairs
+           WHERE node = $1
+             AND action = 'revive_member'
+             AND created_at > NOW() - INTERVAL '10 minutes'",
+    )
+    .bind(node)
+    .fetch_optional(pg)
+    .await
+    .map(|r| r.is_some())
+    .unwrap_or(false)
+}
+
+/// Record one audit row in `integrity_active_repairs` (best-effort).
+async fn record_repair(
+    pg: &PgPool,
+    node: &str,
+    gap: &str,
+    action: GapRepair,
+    task_id: Option<&str>,
+    leader: &str,
+) {
+    let task_uuid = task_id.and_then(|t| uuid::Uuid::parse_str(t).ok());
+    if let Err(e) = sqlx::query(
+        "INSERT INTO integrity_active_repairs (node, gap, action, deferred_task_id, leader)
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(node)
+    .bind(gap)
+    .bind(action.as_str())
+    .bind(task_uuid)
+    .bind(leader)
+    .execute(pg)
+    .await
+    {
+        warn!(error = %e, node, "fleet-integrity: failed to record integrity_active_repairs row");
+    }
+}
+
+/// Active mode: for every degraded node, enqueue the SAFE per-gap repair and
+/// audit it. Today the ONLY auto-repair is `revive_member` for a failed liveness
+/// check — it re-uses the existing revive task kind + handler (the exact enqueue
+/// `leader_tick::revive_scan` performs), so no new repair executor is added here.
+/// All other gaps are recorded as `alert_only`: detected + alerted, never
+/// mutated. Returns the number of revive tasks actually enqueued.
+async fn enqueue_active_repairs(pg: &PgPool, my_name: &str, degraded: &[NodeGaps]) -> usize {
+    let mut enqueued = 0usize;
+    for node_gaps in degraded {
+        // Never act on ourselves (the leader does not revive itself).
+        if node_gaps.node == my_name {
+            continue;
+        }
+        for check in &node_gaps.failing_checks {
+            match repair_for_gap(check) {
+                GapRepair::ReviveMember => {
+                    // Idempotency: skip if a revive is already in flight OR was
+                    // enqueued for this node very recently.
+                    if revive_inflight(pg, &node_gaps.node).await
+                        || repair_recently_audited(pg, &node_gaps.node).await
+                    {
+                        tracing::debug!(
+                            node = %node_gaps.node,
+                            "fleet-integrity active: revive already in-flight/recent — skipping"
+                        );
+                        continue;
+                    }
+
+                    // Re-use the EXISTING revive_member task shape verbatim.
+                    let title = format!("revive_member: {}", node_gaps.node);
+                    let script = format!("ff fleet revive {} --internal", node_gaps.node);
+                    let payload = serde_json::json!({ "command": script });
+                    let trigger_spec = serde_json::json!({});
+                    let required_caps = serde_json::json!([]);
+
+                    match ff_db::queries::pg_enqueue_deferred(
+                        pg,
+                        &title,
+                        "shell",
+                        &payload,
+                        "now",
+                        &trigger_spec,
+                        Some(my_name),
+                        &required_caps,
+                        Some(&format!("fleet-integrity:{my_name}")),
+                        Some(2),
+                    )
+                    .await
+                    {
+                        Ok(id) => {
+                            info!(
+                                node = %node_gaps.node,
+                                task_id = %id,
+                                gap = %check,
+                                "fleet-integrity active: enqueued revive_member repair"
+                            );
+                            record_repair(
+                                pg,
+                                &node_gaps.node,
+                                check,
+                                GapRepair::ReviveMember,
+                                Some(&id),
+                                my_name,
+                            )
+                            .await;
+                            enqueued += 1;
+                        }
+                        Err(e) => warn!(
+                            node = %node_gaps.node,
+                            error = %e,
+                            "fleet-integrity active: failed to enqueue revive_member repair"
+                        ),
+                    }
+                }
+                GapRepair::AlertOnly => {
+                    // No safe auto-repair yet — record that we saw it and moved on.
+                    record_repair(
+                        pg,
+                        &node_gaps.node,
+                        check,
+                        GapRepair::AlertOnly,
+                        None,
+                        my_name,
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+    enqueued
+}
+
+/// One full tick body: gate → sweep → alert (→ active repair). Returns the
+/// summary (or `None` when gated off) so callers/tests can assert on it.
 pub async fn run_once(pg: &PgPool, my_name: &str) -> Option<IntegritySummary> {
     let mode = read_mode(pg).await;
     if mode == IntegrityMode::Off {
@@ -275,6 +486,16 @@ pub async fn run_once(pg: &PgPool, my_name: &str) -> Option<IntegritySummary> {
         );
     } else {
         fire_degraded_alert(pg, my_name, &summary.degraded).await;
+        // Only `active` mutates — and only via the existing revive task.
+        if mode == IntegrityMode::Active {
+            let enqueued = enqueue_active_repairs(pg, my_name, &summary.degraded).await;
+            info!(
+                mode = mode.as_str(),
+                degraded = summary.degraded.len(),
+                revives_enqueued = enqueued,
+                "fleet-integrity active: per-gap repair pass complete"
+            );
+        }
     }
     Some(summary)
 }
@@ -358,8 +579,13 @@ mod tests {
         assert_eq!(IntegrityMode::parse(None), IntegrityMode::Off);
         assert_eq!(IntegrityMode::parse(Some("")), IntegrityMode::Off);
         assert_eq!(IntegrityMode::parse(Some("garbage")), IntegrityMode::Off);
-        // `active` is reserved for the follow-up; until then it must NOT enable.
-        assert_eq!(IntegrityMode::parse(Some("active")), IntegrityMode::Off);
+        assert_eq!(IntegrityMode::parse(Some("off")), IntegrityMode::Off);
+        // A near-miss must NOT silently enable active mutation.
+        assert_eq!(IntegrityMode::parse(Some("activ")), IntegrityMode::Off);
+        assert_eq!(
+            IntegrityMode::parse(Some("active-repair")),
+            IntegrityMode::Off
+        );
     }
 
     #[test]
@@ -367,6 +593,69 @@ mod tests {
         assert_eq!(IntegrityMode::parse(Some("report")), IntegrityMode::Report);
         assert_eq!(IntegrityMode::parse(Some("REPORT")), IntegrityMode::Report);
         assert_eq!(IntegrityMode::parse(Some(" on ")), IntegrityMode::Report);
+    }
+
+    #[test]
+    fn mode_parses_active_case_insensitively_and_roundtrips() {
+        assert_eq!(IntegrityMode::parse(Some("active")), IntegrityMode::Active);
+        assert_eq!(IntegrityMode::parse(Some("ACTIVE")), IntegrityMode::Active);
+        assert_eq!(
+            IntegrityMode::parse(Some(" Active ")),
+            IntegrityMode::Active
+        );
+        assert_eq!(IntegrityMode::Off.as_str(), "off");
+        assert_eq!(IntegrityMode::Report.as_str(), "report");
+        assert_eq!(IntegrityMode::Active.as_str(), "active");
+    }
+
+    #[test]
+    fn only_liveness_gap_is_auto_repairable() {
+        // The daemon-health/liveness check maps to the existing revive task.
+        assert_eq!(repair_for_gap("daemon_healthy"), GapRepair::ReviveMember);
+        // Every other known gap is alert-only (no safe auto-repair yet).
+        for other in [
+            "db_reachable",
+            "tool_versions_reported",
+            "mesh_ssh_complete",
+            "sudo_passwordless",
+            "openclaw_registered",
+            "defer_end_to_end",
+            "library_health",
+            "verify_battery_ran",
+            "",
+        ] {
+            assert_eq!(
+                repair_for_gap(other),
+                GapRepair::AlertOnly,
+                "{other} must NOT be auto-repaired"
+            );
+        }
+        assert_eq!(GapRepair::ReviveMember.as_str(), "revive_member");
+        assert_eq!(GapRepair::AlertOnly.as_str(), "alert_only");
+    }
+
+    #[test]
+    fn node_auto_repairable_iff_it_has_a_liveness_gap() {
+        let live = NodeGaps {
+            node: "dead".into(),
+            failed: 2,
+            failing_checks: vec!["db_reachable".into(), "daemon_healthy".into()],
+        };
+        assert!(node_is_auto_repairable(&live));
+
+        let drift_only = NodeGaps {
+            node: "drifted".into(),
+            failed: 2,
+            failing_checks: vec!["db_reachable".into(), "mesh_ssh_complete".into()],
+        };
+        assert!(!node_is_auto_repairable(&drift_only));
+
+        let no_gaps = NodeGaps {
+            node: "clean".into(),
+            failed: 0,
+            failing_checks: vec![],
+        };
+        assert!(!node_is_auto_repairable(&no_gaps));
     }
 
     #[test]
