@@ -507,6 +507,14 @@ pub async fn handle_fleet_db(pool: &sqlx::PgPool, cmd: FleetDbCommand) -> Result
         FleetDbCommand::Failover { to, force, yes } => {
             handle_fleet_db_failover(pool, &to, force, yes).await?;
         }
+        FleetDbCommand::Handoff {
+            to,
+            execute,
+            yes,
+            lease_minutes,
+        } => {
+            handle_fleet_db_handoff(pool, &to, execute, yes, lease_minutes).await?;
+        }
         FleetDbCommand::Restore {
             backup_id,
             to,
@@ -790,6 +798,151 @@ pub async fn handle_fleet_db_failover(
         .await
         .map_err(|e| anyhow::anyhow!("promote: {e}"))?;
     println!("{GREEN}✓{RESET} '{target_name}' is now the Postgres primary.");
+    Ok(())
+}
+
+/// `ff fleet db handoff --to <node>` — HA leader-handoff Phase 3.
+///
+/// DRY-RUN BY DEFAULT: resolves the target, runs the §4 replica-lag gate, builds
+/// the ordered plan, and PRINTS it. `--execute --yes` actuates only when the
+/// `ha_handoff_mode` fleet_secret reads `active` (fail-safe to disabled), and the
+/// Postgres promote reuses [`handle_fleet_db_failover`] — never raw SQL. There is
+/// no automatic/tick-driven entry point.
+pub async fn handle_fleet_db_handoff(
+    pool: &sqlx::PgPool,
+    to: &str,
+    execute: bool,
+    yes: bool,
+    lease_minutes: i64,
+) -> Result<()> {
+    use ff_agent::ha::handoff;
+
+    // 1) Resolve the target computer.
+    let (target_id, target_name, target_ip) = handoff::resolve_member(pool, to)
+        .await
+        .map_err(|e| anyhow::anyhow!("query computers: {e}"))?
+        .ok_or_else(|| anyhow::anyhow!("no computer named '{to}' registered"))?;
+
+    // 2) Live replica-lag gate (§4 step 1).
+    let replica = handoff::fetch_replica_state(pool, target_id, &target_name)
+        .await
+        .map_err(|e| anyhow::anyhow!("query database_replicas: {e}"))?;
+    let gate = handoff::evaluate_lag_gate(replica.as_ref(), handoff::MAX_SAFE_LAG_BYTES);
+
+    // 3) Resolve current primary + leader for display.
+    let current_primary = handoff::current_primary_member(pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("lookup primary: {e}"))?;
+    let current_leader = handoff::current_leader_member(pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("lookup leader: {e}"))?;
+
+    // The DSN the rest of the fleet will repoint to (target's Postgres).
+    let new_dsn = format!("postgres://forgefleet:forgefleet@{target_ip}:55432/forgefleet");
+
+    // 4) Build the §4-ordered plan (pure).
+    let plan = handoff::build_plan(&handoff::PlanInputs {
+        target_member: target_name.clone(),
+        target_ip: target_ip.clone(),
+        current_primary_member: current_primary.clone(),
+        current_leader_member: current_leader.clone(),
+        new_dsn: new_dsn.clone(),
+        lease_minutes,
+        lag_gate: gate.clone(),
+    });
+
+    // 5) Render the plan (always).
+    let mode = handoff::read_handoff_mode(pool).await;
+    println!("{CYAN}━━ HA leader-handoff plan → '{target_name}' ━━{RESET}");
+    println!(
+        "  current primary: {}    current leader: {}",
+        current_primary.as_deref().unwrap_or("<unknown>"),
+        current_leader.as_deref().unwrap_or("<unknown>")
+    );
+    println!("  gate (ha_handoff_mode): {}", mode.as_str());
+    println!();
+    for step in &plan.steps {
+        let tag = if step.mutates { "⚙" } else { "✓" };
+        println!("  {}. {tag} {}", step.order, step.title);
+        println!("       {}", step.detail);
+    }
+    println!();
+    if plan.safe {
+        println!("  lag gate: {GREEN}PASS{RESET} — {}", gate.explain());
+    } else {
+        println!(
+            "  lag gate: {RED}BLOCK{RESET} — {}",
+            plan.blocking_reason.as_deref().unwrap_or("unsafe")
+        );
+    }
+
+    // 6) Dry-run stops here.
+    if !execute {
+        println!();
+        println!(
+            "{YELLOW}DRY RUN{RESET} — nothing was changed. Re-run with \
+             {CYAN}--execute --yes{RESET} (and set ha_handoff_mode=active) to actuate."
+        );
+        return Ok(());
+    }
+
+    // ── Execution path (still heavily gated) ──────────────────────────────
+    if !plan.safe {
+        anyhow::bail!(
+            "refusing to execute: replica-lag gate BLOCKED ({})",
+            plan.blocking_reason.as_deref().unwrap_or("unsafe")
+        );
+    }
+    if mode != handoff::HandoffMode::Active {
+        anyhow::bail!(
+            "refusing to execute: ha_handoff_mode is '{}' (must be 'active'). \
+             Set it with: ff secrets set {} active",
+            mode.as_str(),
+            handoff::HANDOFF_MODE_KEY
+        );
+    }
+    if !yes {
+        eprintln!("{YELLOW}About to hand DB-primary + fleet leadership to '{target_name}'.{RESET}");
+        eprintln!("  This promotes its Postgres replica, repoints the DSN of record,");
+        eprintln!("  and leases fleet leadership to it for {lease_minutes} min.");
+        eprintln!("Re-run with --execute --yes to confirm.");
+        std::process::exit(2);
+    }
+
+    // Step 2 — promote via the EXISTING failover path (never raw SQL here).
+    // force=true so it can run from the operator's node, not only on-target.
+    println!("{CYAN}▶ [2/4] promoting '{target_name}' replica → primary…{RESET}");
+    handle_fleet_db_failover(pool, &target_name, true, true).await?;
+
+    // Step 3 — repoint the DSN of record (table + fleet_secret).
+    println!("{CYAN}▶ [3/4] repointing DSN of record → {target_ip}…{RESET}");
+    ff_db::dsn_of_record::repoint_dsn_of_record(
+        pool,
+        &new_dsn,
+        Some(&target_name),
+        Some("ff fleet db handoff"),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("repoint dsn_of_record: {e}"))?;
+
+    // Step 4 — move fleet leadership via the Phase 2 maintenance lease.
+    println!(
+        "{CYAN}▶ [4/4] leasing fleet leadership → '{target_name}' ({lease_minutes} min)…{RESET}"
+    );
+    let until = chrono::Utc::now() + chrono::Duration::minutes(lease_minutes);
+    ff_db::pg_set_maintenance_lease(pool, &target_name, until)
+        .await
+        .map_err(|e| anyhow::anyhow!("set maintenance lease: {e}"))?;
+
+    println!(
+        "{GREEN}✓{RESET} handoff complete — '{target_name}' is primary + leader \
+         (lease until {}).",
+        until.to_rfc3339()
+    );
+    println!(
+        "  Fail back with: {CYAN}ff fleet db handoff --to {} --execute --yes{RESET}",
+        current_leader.as_deref().unwrap_or("<old-leader>")
+    );
     Ok(())
 }
 

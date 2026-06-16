@@ -168,12 +168,11 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
             if url.is_empty() {
                 None
             } else {
-                let pool = sqlx::postgres::PgPoolOptions::new()
-                    .max_connections(config.database.max_connections.max(2))
-                    .min_connections(0)
-                    .idle_timeout(Some(std::time::Duration::from_secs(60)))
-                    .max_lifetime(Some(std::time::Duration::from_secs(30 * 60)))
-                    .connect(url)
+                // create_pool_with_dsn_failover is fail-safe to the static DSN
+                // when config.database.dsn_failover == false (the default), so
+                // the connect behaviour here is unchanged unless an operator has
+                // opted into HA Phase 3 DSN-of-record failover.
+                let pool = ff_core::db::create_pool_with_dsn_failover(&config.database)
                     .await
                     .with_context(|| {
                         format!(

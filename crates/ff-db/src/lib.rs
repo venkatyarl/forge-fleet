@@ -14,6 +14,7 @@
 
 pub mod backup;
 pub mod connection;
+pub mod dsn_of_record;
 pub mod leader_state;
 pub mod migrations;
 pub mod operational_store;

@@ -6,5 +6,6 @@
 //! coordinator, failover state machine.
 
 pub mod backup;
+pub mod handoff;
 pub mod pg_failover;
 pub mod restore_drill;

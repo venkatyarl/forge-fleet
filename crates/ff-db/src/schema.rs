@@ -8791,3 +8791,28 @@ CREATE TABLE IF NOT EXISTS integrity_active_repairs (
 CREATE INDEX IF NOT EXISTS idx_integrity_active_repairs_node_created
     ON integrity_active_repairs (node, created_at DESC);
 "#;
+
+// ─── V136: HA leader-handoff Phase 3 — DSN of record ────────────────────────
+//
+// Phase 3 (DB-primary-aware handoff) needs to solve the design's open question
+// Q2: after a Postgres primary MOVE, workers hold a STATIC DSN and cannot learn
+// the new primary. The "DSN of record" is the single source of truth for the
+// current primary connection string. It is ALSO mirrored into the
+// `db_dsn_of_record` fleet_secret (the primary mechanism workers read on
+// connect-failure); this tiny singleton table is the durable, auditable home of
+// record (who repointed it, when, and the prior value for rollback).
+//
+// Singleton-enforced like fleet_leader_state: one row, `singleton_key='current'`.
+// INERT by default — no row exists until an operator runs a Phase-3 handoff with
+// `--execute`, so deploying this migration changes nothing on a running fleet.
+pub const SCHEMA_V136_DSN_OF_RECORD: &str = r#"
+CREATE TABLE IF NOT EXISTS dsn_of_record (
+    singleton_key   TEXT PRIMARY KEY DEFAULT 'current'
+                        CHECK (singleton_key = 'current'),
+    dsn             TEXT NOT NULL,
+    primary_member  TEXT,
+    previous_dsn    TEXT,
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_by      TEXT
+);
+"#;

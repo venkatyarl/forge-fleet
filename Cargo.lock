@@ -1390,6 +1390,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "dashmap",
+ "dirs 6.0.0",
  "libc",
  "notify",
  "reqwest",

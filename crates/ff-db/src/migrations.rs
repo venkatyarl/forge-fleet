@@ -809,6 +809,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "integrity_active_repairs",
         sql: schema::SCHEMA_V135_INTEGRITY_ACTIVE_REPAIRS,
     },
+    PgMigration {
+        version: 136,
+        name: "dsn_of_record",
+        sql: schema::SCHEMA_V136_DSN_OF_RECORD,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
