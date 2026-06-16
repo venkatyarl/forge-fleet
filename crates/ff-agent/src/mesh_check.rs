@@ -433,3 +433,61 @@ pub async fn refresh_stale(pool: &PgPool, max_age: chrono::Duration) -> Result<u
     let _ = pairwise_ssh_check(pool).await?;
     Ok(stale.len())
 }
+
+/// Spawn the leader-gated mesh-refresh loop: every `interval_secs`, re-probe SSH
+/// mesh pairs whose stored status is older than `max_age_hours` so
+/// `fleet_ssh_mesh` reflects reality. Without this, a pair recorded as `failed`
+/// while a node was briefly unreachable (e.g. mid-deploy) stays `failed`
+/// FOREVER — the integrity `mesh_ssh_complete` check then reports a node
+/// degraded long after SSH recovered (observed: sia↔adele stale-failed though
+/// both directions worked by IP). Same legacy-only gap as the version-check tick
+/// (#396): mesh probing ran only on-demand / in the legacy `ff daemon`, never in
+/// forgefleetd. Leader-gated — it's a fleet-wide probe orchestrated from one
+/// node, not per-node.
+pub fn spawn_mesh_refresh_tick(
+    pg: PgPool,
+    worker_name: String,
+    interval_secs: u64,
+    max_age_hours: i64,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    let is_leader: bool = sqlx::query_scalar(
+                        r#"
+                        SELECT EXISTS (
+                            SELECT 1 FROM fleet_leader_state
+                            WHERE member_name = $1
+                              AND heartbeat_at > NOW() - INTERVAL '60 seconds'
+                        )
+                        "#,
+                    )
+                    .bind(&worker_name)
+                    .fetch_one(&pg)
+                    .await
+                    .unwrap_or(false);
+                    if !is_leader {
+                        continue;
+                    }
+                    match refresh_stale(&pg, chrono::Duration::hours(max_age_hours)).await {
+                        Ok(n) if n > 0 => {
+                            tracing::info!(stale = n, "mesh-refresh: re-probed stale mesh pairs")
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!(error = %e, "mesh-refresh tick failed"),
+                    }
+                }
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+            }
+        }
+        tracing::info!("mesh-refresh tick loop stopped");
+    })
+}
