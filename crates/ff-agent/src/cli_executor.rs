@@ -105,10 +105,13 @@ pub const BACKENDS: &[CliBackend] = &[
     CliBackend {
         name: "kimi",
         binary: "kimi",
-        // Kimi CLI (Moonshot) shipped a headless mode: `--print` runs
-        // non-interactively and auto-approves tool calls; `--prompt` (alias
-        // `-p`) carries the prompt; `--yes/--yolo` auto-approves writes.
-        default_flags: &["--print", "--yes", "--prompt"],
+        // Kimi CLI (Moonshot) headless build form (verified against `kimi
+        // --help` 2026-06-16): `--afk` runs the autonomous away-from-keyboard
+        // mode (the old `--print` was NOT a full agent run), `--yolo`
+        // auto-approves writes, and `-p` (alias `--prompt`) carries the prompt.
+        // The previous `--print --yes --prompt` form did not actually execute
+        // multi-step build tasks.
+        default_flags: &["--afk", "--yolo", "-p"],
         // `-w/--work-dir <dir>` sets the agent's working directory.
         cwd_mode: CwdMode::Flag("-w"),
         prompt_is_positional: true,
