@@ -11,24 +11,17 @@ use ff_brain::{
     call_path, callees, callers, corpus, cortex, find_symbols, find_symbols_semantic, impact,
     tests_for,
 };
-use ff_core::config;
 use serde_json::{Value, json};
-use sqlx::postgres::PgPoolOptions;
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
 
 use crate::handlers::HandlerResult;
 
-/// Get a Postgres pool using the fleet config (same pattern as brain_tools).
+/// Get the process-shared Postgres pool (cached once — never per call; see
+/// [`crate::pool`]).
 async fn get_pool() -> Result<sqlx::PgPool, String> {
-    let (cfg, _) =
-        config::load_config_auto().map_err(|e| format!("failed to load fleet config: {e}"))?;
-    PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&cfg.database.url)
-        .await
-        .map_err(|e| format!("Postgres connection failed: {e}"))
+    crate::pool::shared_pg_pool().await
 }
 
 /// Pull the required `corpus` slug + `symbol` selector out of the params.
