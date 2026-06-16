@@ -8637,3 +8637,34 @@ VALUES
    0, 'critical', 43200, 'telegram', true)
 ON CONFLICT (name) DO NOTHING;
 "#;
+
+// ─── V131: fleet-integrity verify tick ──────────────────────────────────────
+//
+// `verify_computer` (the full post-onboarding check battery: daemon health,
+// DB reachability, tool-version reporting, defer-worker, etc.) only ran
+// on-demand (`ff fleet verify-node <node>` / the onboard gateway endpoint). So a
+// host that enrolled half-configured, OR drifted into a broken state while
+// alive, stayed INVISIBLE until an operator manually re-verified it — exactly
+// the "9th identical half-configured box" the enrollment self-heal directive
+// calls out (PROD_READINESS item 23, GAP).
+//
+// `revive_scan` already auto-repairs *dead* nodes (ODOWN → restart daemon),
+// but an ALIVE-but-misconfigured node fails none of revive's liveness gates.
+// This adds the detection layer: a leader-gated tick
+// (`ff_agent::fleet_integrity`) runs the verify battery across all *online*
+// members on a schedule and fires `fleet_integrity_degraded` when any member
+// has failing checks. Gated by `fleet_secrets.fleet_integrity_mode`
+// (off|report, default off) — report = detect+alert, never mutates. Per-gap
+// auto-repair (active mode) is a tracked follow-up; this closes the detection
+// half so drift is never silent again.
+pub const SCHEMA_V131_FLEET_INTEGRITY: &str = r#"
+INSERT INTO alert_policies
+    (name, description, metric, scope, condition,
+     duration_secs, severity, cooldown_secs, channel, enabled)
+VALUES
+  ('fleet_integrity_degraded',
+   'One or more ONLINE fleet members failed the verify_computer battery (half-configured enrollment or config drift while alive)',
+   'fleet_integrity_degraded', 'leader_only', '> 0',
+   0, 'warning', 21600, 'telegram', true)
+ON CONFLICT (name) DO NOTHING;
+"#;
