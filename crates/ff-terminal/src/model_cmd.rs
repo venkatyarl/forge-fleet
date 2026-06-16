@@ -758,340 +758,7 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
             runtime,
             node,
             force,
-        } => {
-            // Resolve target node + node runtime + models_dir.
-            let worker_name = match node {
-                Some(n) => n,
-                None => ff_agent::fleet_info::resolve_this_worker_name().await,
-            };
-            let node_row = ff_db::pg_get_node(&pool, &worker_name)
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("node '{worker_name}' not in fleet_workers"))?;
-            let target_runtime = runtime.unwrap_or_else(|| node_row.runtime.clone());
-            if target_runtime == "unknown" {
-                anyhow::bail!(
-                    "node '{worker_name}' has unknown runtime; set with: ff config set fleet.{worker_name}.runtime mlx|llama.cpp|vllm"
-                );
-            }
-
-            // Lookup catalog entry; pick variant for runtime.
-            let catalog = ff_db::pg_get_catalog(&pool, &id).await?.ok_or_else(|| {
-                anyhow::anyhow!("no catalog entry with id '{id}' (try `ff model search`)")
-            })?;
-            let variants = catalog
-                .variants
-                .as_array()
-                .ok_or_else(|| anyhow::anyhow!("catalog variants for '{id}' is not an array"))?;
-            let variant = variants
-                .iter()
-                .find(|v| {
-                    v.get("runtime").and_then(|x| x.as_str()) == Some(target_runtime.as_str())
-                })
-                .ok_or_else(|| {
-                    let available: Vec<String> = variants
-                        .iter()
-                        .filter_map(|v| v.get("runtime").and_then(|x| x.as_str()).map(String::from))
-                        .collect();
-                    anyhow::anyhow!(
-                        "no variant for runtime '{target_runtime}' on '{id}'. available: {}",
-                        available.join(", ")
-                    )
-                })?;
-
-            let hf_repo = variant
-                .get("hf_repo")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("variant missing hf_repo"))?;
-            let quant = variant
-                .get("quant")
-                .and_then(|v| v.as_str())
-                .map(String::from);
-            let size_gb = variant
-                .get("size_gb")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(0.0);
-
-            // Cross-node downloads are dispatched via the deferred task queue: a
-            // defer-worker running on the target node will claim it and run
-            // `ff model download <id> --runtime <rt>` locally there.
-            let this_node = ff_agent::fleet_info::resolve_this_worker_name().await;
-            if worker_name != this_node {
-                let escaped_id = shell_escape_single(&id);
-                let command = format!(
-                    "ff model download {} --runtime {}",
-                    escaped_id, target_runtime
-                );
-                let title = format!(
-                    "Download {} ({} variant) on {}",
-                    id, target_runtime, worker_name
-                );
-                let payload = serde_json::json!({ "command": command });
-                let trigger_spec = serde_json::json!({});
-                let defer_id = ff_db::pg_enqueue_deferred(
-                    &pool,
-                    &title,
-                    "shell",
-                    &payload,
-                    "now",
-                    &trigger_spec,
-                    Some(&worker_name),
-                    &serde_json::json!([]),
-                    Some(&whoami_tag()),
-                    Some(3),
-                )
-                .await?;
-                println!(
-                    "Enqueued cross-node download as deferred task {defer_id}. It will run on {worker_name} when a defer-worker there claims it."
-                );
-                println!("Check status with: ff defer list");
-                return Ok(());
-            }
-
-            // Compute destination dir under models_dir.
-            //
-            // V139 dir-layout enforcement: new downloads land in
-            // <models_dir>/<runtime>/<catalog_id>/ so the runtime is
-            // obvious from the path. Old downloads stay where they are;
-            // they'll migrate lazily when their deployment restarts and
-            // the (deferred) #136b startup-fetch wrapper drops the new
-            // copy into the canonical path.
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
-            let models_dir = expand_tilde(&node_row.models_dir, &home);
-            let runtime_subdir = match target_runtime.as_str() {
-                "llama.cpp" => "llama-cpp",
-                "mlx" => "mlx",
-                "vllm" => "vllm",
-                "ollama" => "ollama",
-                other => other,
-            };
-            let dest = models_dir.join(runtime_subdir).join(&id);
-
-            // PLACEMENT GUARD (V118): before we stream gigabytes onto this node,
-            // reject placements that (a) this node can't RUN, or (b) won't FIT.
-            // Stops the problem upstream rather than after a long download.
-            if let Err(reason) =
-                ff_agent::model_runtime::check_runtime_placement(&node_row, &target_runtime)
-            {
-                anyhow::bail!(
-                    "placement rejected: cannot place {id} ({target_runtime}) on {worker_name}: {reason}"
-                );
-            }
-            if size_gb > 0.0 {
-                let need_bytes =
-                    (size_gb * 1.1 * (1024.0 * 1024.0 * 1024.0)) as u64 + 5 * (1u64 << 30);
-                let df_out = std::process::Command::new("df")
-                    .arg("-Pk")
-                    .arg(&models_dir)
-                    .output();
-                if let Ok(out) = df_out {
-                    let text = String::from_utf8_lossy(&out.stdout);
-                    let last = text.lines().last().unwrap_or("").trim();
-                    let cols: Vec<&str> = last.split_whitespace().collect();
-                    if let Some(free_bytes) = cols
-                        .get(3)
-                        .and_then(|s| s.parse::<u64>().ok())
-                        .map(|k| k.saturating_mul(1024))
-                    {
-                        if free_bytes < need_bytes {
-                            anyhow::bail!(
-                                "placement rejected: {id} (~{size_gb:.1}GB) won't fit on {worker_name}: need {} but only {} free under {}",
-                                human_bytes(need_bytes),
-                                human_bytes(free_bytes),
-                                models_dir.display(),
-                            );
-                        }
-                    }
-                }
-            }
-
-            // Ensure runtime parent exists (mkdir -p) before hf_download
-            // tries to create the leaf dir. Cheap if already there.
-            if let Some(parent) = dest.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-
-            // HF token (optional — gated models need it).
-            let token = ff_agent::fleet_info::get_hf_token().await;
-            if catalog.gated && token.is_none() {
-                anyhow::bail!(
-                    "model '{id}' is gated on HF; set token first with: ff secrets set huggingface.token <hf_xxx>"
-                );
-            }
-
-            // Allow patterns: prefer runtime-specific glob to avoid pulling everything.
-            // For llama.cpp, also narrow by the variant's quant so we don't pull every
-            // quant in the repo (e.g. deepseek-r1-distill-qwen-32b ships 7 quants ≈
-            // 140 GB total when only the catalog's Q4_K_M variant is wanted).
-            //
-            // Tokenizer/config files have no quant suffix, so they stay matched by
-            // separate patterns.
-            let allow_patterns: Vec<String> = match target_runtime.as_str() {
-                "llama.cpp" => {
-                    let mut pats = vec!["tokenizer*".into(), "*config*".into()];
-                    match quant.as_deref() {
-                        Some(q) if !q.is_empty() => {
-                            // e.g. "*Q4_K_M*.gguf" — matches both upper- and lower-
-                            // case in the glob because we lowercase comparisons in
-                            // the matcher? (No — glob_match is case-sensitive.)
-                            // Add both common casings to be safe across repos.
-                            pats.push(format!("*{q}*.gguf"));
-                            let lower = q.to_lowercase();
-                            if lower != q {
-                                pats.push(format!("*{lower}*.gguf"));
-                            }
-                        }
-                        _ => pats.push("*.gguf".into()),
-                    }
-                    pats
-                }
-                "mlx" | "vllm" => vec![
-                    "*.safetensors".into(),
-                    "*.json".into(),
-                    "tokenizer*".into(),
-                    "*config*".into(),
-                    "README*".into(),
-                ],
-                other => vec![format!("*.{other}")],
-            };
-            // No global deny — the quant-narrowed allow above is precise enough.
-            // (Previously denied *.f16*/*.bf16* as a blunt cost guard; that bit
-            // embedders whose canonical quant *is* F16, like bge-m3-FP16.gguf.)
-            let deny_patterns: Vec<String> = vec![];
-
-            let _ = force; // not yet used; resume-by-size is automatic
-
-            // Create job row for tracking.
-            let params = serde_json::json!({
-                "hf_repo": hf_repo,
-                "runtime": target_runtime,
-                "quant": quant,
-                "dest": dest.to_string_lossy(),
-            });
-            let job_id =
-                ff_db::pg_create_job(&pool, &worker_name, "download", Some(&id), None, &params)
-                    .await?;
-            ff_db::pg_update_job_progress(
-                &pool,
-                &job_id,
-                Some("running"),
-                Some(0.0),
-                None,
-                None,
-                None,
-                None,
-            )
-            .await?;
-
-            println!(
-                "{CYAN}▶ Downloading {} ({})\n  source: {}\n  dest:   {}\n  job:    {}{RESET}",
-                catalog.name,
-                target_runtime,
-                hf_repo,
-                dest.display(),
-                job_id
-            );
-            if size_gb > 0.0 {
-                println!("  estimated size: {size_gb:.1} GB");
-            }
-
-            // Run download with progress callback.
-            let pool_for_progress = pool.clone();
-            let job_id_for_progress = job_id.clone();
-            let mut last_pct = -1i32;
-            let opts = ff_agent::hf_download::DownloadOptions {
-                repo: hf_repo.to_string(),
-                revision: None,
-                dest_dir: dest.clone(),
-                token: token.clone(),
-                allow_patterns,
-                deny_patterns,
-                skip_verify: false,
-            };
-
-            let client = reqwest::Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(30))
-                .build()
-                .map_err(|e| anyhow::anyhow!("build http client: {e}"))?;
-            let result = ff_agent::hf_download::download_repo(&client, opts, move |p| {
-                let pct = p.percent as i32;
-                if pct != last_pct {
-                    last_pct = pct;
-                    let bar_w = 30;
-                    let filled = (bar_w as f32 * p.percent / 100.0) as usize;
-                    let bar = format!("{}{}", "█".repeat(filled), "░".repeat(bar_w - filled));
-                    let done_mb = p.bytes_done / (1u64 << 20);
-                    let total_mb = p.bytes_total / (1u64 << 20);
-                    eprint!(
-                        "\r  [{bar}] {pct:>3}%  {done_mb}/{total_mb} MiB  {}",
-                        trunc_for_status(&p.file, 40)
-                    );
-                    use std::io::Write as _;
-                    let _ = std::io::stderr().flush();
-                    // Update DB job (fire and forget — best effort)
-                    let pool2 = pool_for_progress.clone();
-                    let jid = job_id_for_progress.clone();
-                    let bd = p.bytes_done as i64;
-                    let bt = p.bytes_total as i64;
-                    let pp = p.percent;
-                    tokio::spawn(async move {
-                        let _ = ff_db::pg_update_job_progress(
-                            &pool2,
-                            &jid,
-                            None,
-                            Some(pp),
-                            Some(bd),
-                            Some(bt),
-                            None,
-                            None,
-                        )
-                        .await;
-                    });
-                }
-            })
-            .await;
-            eprintln!(); // newline after progress bar
-
-            match result {
-                Ok(files) => {
-                    println!("{CYAN}✓ Downloaded {} file(s){RESET}", files.len());
-                    let _ = ff_db::pg_update_job_progress(
-                        &pool,
-                        &job_id,
-                        Some("completed"),
-                        Some(100.0),
-                        None,
-                        None,
-                        None,
-                        None,
-                    )
-                    .await;
-                    // Re-scan node so library reflects the new model.
-                    println!("Re-scanning library...");
-                    let summary = ff_agent::model_library_scanner::scan_local_library(
-                        &pool,
-                        &worker_name,
-                        &models_dir,
-                    )
-                    .await
-                    .map_err(|e| anyhow::anyhow!(e))?;
-                    println!("  added: {}, updated: {}", summary.added, summary.updated);
-                }
-                Err(e) => {
-                    let _ = ff_db::pg_update_job_progress(
-                        &pool,
-                        &job_id,
-                        Some("failed"),
-                        None,
-                        None,
-                        None,
-                        None,
-                        Some(&e),
-                    )
-                    .await;
-                    anyhow::bail!("download failed: {e}");
-                }
-            }
-        }
+        } => handle_model_download(pool.clone(), id, runtime, node, force).await?,
         crate::ModelCommand::DownloadBatch { node, ids } => {
             if ids.is_empty() {
                 anyhow::bail!(
@@ -2578,6 +2245,347 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                     std::process::exit(1);
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+/// Handler for `ff model download` — extracted verbatim from the `handle_model`
+/// dispatch arm to shrink that 2300-line function. `pool` is passed by value
+/// (cheap Arc clone) so the body's `&pool` / `pool.clone()` uses are unchanged.
+async fn handle_model_download(
+    pool: sqlx::PgPool,
+    id: String,
+    runtime: Option<String>,
+    node: Option<String>,
+    force: bool,
+) -> anyhow::Result<()> {
+    // Resolve target node + node runtime + models_dir.
+    let worker_name = match node {
+        Some(n) => n,
+        None => ff_agent::fleet_info::resolve_this_worker_name().await,
+    };
+    let node_row = ff_db::pg_get_node(&pool, &worker_name)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("node '{worker_name}' not in fleet_workers"))?;
+    let target_runtime = runtime.unwrap_or_else(|| node_row.runtime.clone());
+    if target_runtime == "unknown" {
+        anyhow::bail!(
+            "node '{worker_name}' has unknown runtime; set with: ff config set fleet.{worker_name}.runtime mlx|llama.cpp|vllm"
+        );
+    }
+
+    // Lookup catalog entry; pick variant for runtime.
+    let catalog = ff_db::pg_get_catalog(&pool, &id).await?.ok_or_else(|| {
+        anyhow::anyhow!("no catalog entry with id '{id}' (try `ff model search`)")
+    })?;
+    let variants = catalog
+        .variants
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("catalog variants for '{id}' is not an array"))?;
+    let variant = variants
+        .iter()
+        .find(|v| v.get("runtime").and_then(|x| x.as_str()) == Some(target_runtime.as_str()))
+        .ok_or_else(|| {
+            let available: Vec<String> = variants
+                .iter()
+                .filter_map(|v| v.get("runtime").and_then(|x| x.as_str()).map(String::from))
+                .collect();
+            anyhow::anyhow!(
+                "no variant for runtime '{target_runtime}' on '{id}'. available: {}",
+                available.join(", ")
+            )
+        })?;
+
+    let hf_repo = variant
+        .get("hf_repo")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("variant missing hf_repo"))?;
+    let quant = variant
+        .get("quant")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let size_gb = variant
+        .get("size_gb")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+
+    // Cross-node downloads are dispatched via the deferred task queue: a
+    // defer-worker running on the target node will claim it and run
+    // `ff model download <id> --runtime <rt>` locally there.
+    let this_node = ff_agent::fleet_info::resolve_this_worker_name().await;
+    if worker_name != this_node {
+        let escaped_id = shell_escape_single(&id);
+        let command = format!(
+            "ff model download {} --runtime {}",
+            escaped_id, target_runtime
+        );
+        let title = format!(
+            "Download {} ({} variant) on {}",
+            id, target_runtime, worker_name
+        );
+        let payload = serde_json::json!({ "command": command });
+        let trigger_spec = serde_json::json!({});
+        let defer_id = ff_db::pg_enqueue_deferred(
+            &pool,
+            &title,
+            "shell",
+            &payload,
+            "now",
+            &trigger_spec,
+            Some(&worker_name),
+            &serde_json::json!([]),
+            Some(&whoami_tag()),
+            Some(3),
+        )
+        .await?;
+        println!(
+            "Enqueued cross-node download as deferred task {defer_id}. It will run on {worker_name} when a defer-worker there claims it."
+        );
+        println!("Check status with: ff defer list");
+        return Ok(());
+    }
+
+    // Compute destination dir under models_dir.
+    //
+    // V139 dir-layout enforcement: new downloads land in
+    // <models_dir>/<runtime>/<catalog_id>/ so the runtime is
+    // obvious from the path. Old downloads stay where they are;
+    // they'll migrate lazily when their deployment restarts and
+    // the (deferred) #136b startup-fetch wrapper drops the new
+    // copy into the canonical path.
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
+    let models_dir = expand_tilde(&node_row.models_dir, &home);
+    let runtime_subdir = match target_runtime.as_str() {
+        "llama.cpp" => "llama-cpp",
+        "mlx" => "mlx",
+        "vllm" => "vllm",
+        "ollama" => "ollama",
+        other => other,
+    };
+    let dest = models_dir.join(runtime_subdir).join(&id);
+
+    // PLACEMENT GUARD (V118): before we stream gigabytes onto this node,
+    // reject placements that (a) this node can't RUN, or (b) won't FIT.
+    // Stops the problem upstream rather than after a long download.
+    if let Err(reason) =
+        ff_agent::model_runtime::check_runtime_placement(&node_row, &target_runtime)
+    {
+        anyhow::bail!(
+            "placement rejected: cannot place {id} ({target_runtime}) on {worker_name}: {reason}"
+        );
+    }
+    if size_gb > 0.0 {
+        let need_bytes = (size_gb * 1.1 * (1024.0 * 1024.0 * 1024.0)) as u64 + 5 * (1u64 << 30);
+        let df_out = std::process::Command::new("df")
+            .arg("-Pk")
+            .arg(&models_dir)
+            .output();
+        if let Ok(out) = df_out {
+            let text = String::from_utf8_lossy(&out.stdout);
+            let last = text.lines().last().unwrap_or("").trim();
+            let cols: Vec<&str> = last.split_whitespace().collect();
+            if let Some(free_bytes) = cols
+                .get(3)
+                .and_then(|s| s.parse::<u64>().ok())
+                .map(|k| k.saturating_mul(1024))
+            {
+                if free_bytes < need_bytes {
+                    anyhow::bail!(
+                        "placement rejected: {id} (~{size_gb:.1}GB) won't fit on {worker_name}: need {} but only {} free under {}",
+                        human_bytes(need_bytes),
+                        human_bytes(free_bytes),
+                        models_dir.display(),
+                    );
+                }
+            }
+        }
+    }
+
+    // Ensure runtime parent exists (mkdir -p) before hf_download
+    // tries to create the leaf dir. Cheap if already there.
+    if let Some(parent) = dest.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    // HF token (optional — gated models need it).
+    let token = ff_agent::fleet_info::get_hf_token().await;
+    if catalog.gated && token.is_none() {
+        anyhow::bail!(
+            "model '{id}' is gated on HF; set token first with: ff secrets set huggingface.token <hf_xxx>"
+        );
+    }
+
+    // Allow patterns: prefer runtime-specific glob to avoid pulling everything.
+    // For llama.cpp, also narrow by the variant's quant so we don't pull every
+    // quant in the repo (e.g. deepseek-r1-distill-qwen-32b ships 7 quants ≈
+    // 140 GB total when only the catalog's Q4_K_M variant is wanted).
+    //
+    // Tokenizer/config files have no quant suffix, so they stay matched by
+    // separate patterns.
+    let allow_patterns: Vec<String> = match target_runtime.as_str() {
+        "llama.cpp" => {
+            let mut pats = vec!["tokenizer*".into(), "*config*".into()];
+            match quant.as_deref() {
+                Some(q) if !q.is_empty() => {
+                    // e.g. "*Q4_K_M*.gguf" — matches both upper- and lower-
+                    // case in the glob because we lowercase comparisons in
+                    // the matcher? (No — glob_match is case-sensitive.)
+                    // Add both common casings to be safe across repos.
+                    pats.push(format!("*{q}*.gguf"));
+                    let lower = q.to_lowercase();
+                    if lower != q {
+                        pats.push(format!("*{lower}*.gguf"));
+                    }
+                }
+                _ => pats.push("*.gguf".into()),
+            }
+            pats
+        }
+        "mlx" | "vllm" => vec![
+            "*.safetensors".into(),
+            "*.json".into(),
+            "tokenizer*".into(),
+            "*config*".into(),
+            "README*".into(),
+        ],
+        other => vec![format!("*.{other}")],
+    };
+    // No global deny — the quant-narrowed allow above is precise enough.
+    // (Previously denied *.f16*/*.bf16* as a blunt cost guard; that bit
+    // embedders whose canonical quant *is* F16, like bge-m3-FP16.gguf.)
+    let deny_patterns: Vec<String> = vec![];
+
+    let _ = force; // not yet used; resume-by-size is automatic
+
+    // Create job row for tracking.
+    let params = serde_json::json!({
+        "hf_repo": hf_repo,
+        "runtime": target_runtime,
+        "quant": quant,
+        "dest": dest.to_string_lossy(),
+    });
+    let job_id =
+        ff_db::pg_create_job(&pool, &worker_name, "download", Some(&id), None, &params).await?;
+    ff_db::pg_update_job_progress(
+        &pool,
+        &job_id,
+        Some("running"),
+        Some(0.0),
+        None,
+        None,
+        None,
+        None,
+    )
+    .await?;
+
+    println!(
+        "{CYAN}▶ Downloading {} ({})\n  source: {}\n  dest:   {}\n  job:    {}{RESET}",
+        catalog.name,
+        target_runtime,
+        hf_repo,
+        dest.display(),
+        job_id
+    );
+    if size_gb > 0.0 {
+        println!("  estimated size: {size_gb:.1} GB");
+    }
+
+    // Run download with progress callback.
+    let pool_for_progress = pool.clone();
+    let job_id_for_progress = job_id.clone();
+    let mut last_pct = -1i32;
+    let opts = ff_agent::hf_download::DownloadOptions {
+        repo: hf_repo.to_string(),
+        revision: None,
+        dest_dir: dest.clone(),
+        token: token.clone(),
+        allow_patterns,
+        deny_patterns,
+        skip_verify: false,
+    };
+
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| anyhow::anyhow!("build http client: {e}"))?;
+    let result = ff_agent::hf_download::download_repo(&client, opts, move |p| {
+        let pct = p.percent as i32;
+        if pct != last_pct {
+            last_pct = pct;
+            let bar_w = 30;
+            let filled = (bar_w as f32 * p.percent / 100.0) as usize;
+            let bar = format!("{}{}", "█".repeat(filled), "░".repeat(bar_w - filled));
+            let done_mb = p.bytes_done / (1u64 << 20);
+            let total_mb = p.bytes_total / (1u64 << 20);
+            eprint!(
+                "\r  [{bar}] {pct:>3}%  {done_mb}/{total_mb} MiB  {}",
+                trunc_for_status(&p.file, 40)
+            );
+            use std::io::Write as _;
+            let _ = std::io::stderr().flush();
+            // Update DB job (fire and forget — best effort)
+            let pool2 = pool_for_progress.clone();
+            let jid = job_id_for_progress.clone();
+            let bd = p.bytes_done as i64;
+            let bt = p.bytes_total as i64;
+            let pp = p.percent;
+            tokio::spawn(async move {
+                let _ = ff_db::pg_update_job_progress(
+                    &pool2,
+                    &jid,
+                    None,
+                    Some(pp),
+                    Some(bd),
+                    Some(bt),
+                    None,
+                    None,
+                )
+                .await;
+            });
+        }
+    })
+    .await;
+    eprintln!(); // newline after progress bar
+
+    match result {
+        Ok(files) => {
+            println!("{CYAN}✓ Downloaded {} file(s){RESET}", files.len());
+            let _ = ff_db::pg_update_job_progress(
+                &pool,
+                &job_id,
+                Some("completed"),
+                Some(100.0),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+            // Re-scan node so library reflects the new model.
+            println!("Re-scanning library...");
+            let summary = ff_agent::model_library_scanner::scan_local_library(
+                &pool,
+                &worker_name,
+                &models_dir,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+            println!("  added: {}, updated: {}", summary.added, summary.updated);
+        }
+        Err(e) => {
+            let _ = ff_db::pg_update_job_progress(
+                &pool,
+                &job_id,
+                Some("failed"),
+                None,
+                None,
+                None,
+                None,
+                Some(&e),
+            )
+            .await;
+            anyhow::bail!("download failed: {e}");
         }
     }
     Ok(())
