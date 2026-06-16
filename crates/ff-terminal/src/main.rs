@@ -219,6 +219,12 @@ enum Command {
         /// `--backend` != `local`). Repeatable.
         #[arg(long = "backend-args")]
         backend_args: Vec<String>,
+        /// Wall-clock timeout in seconds for the whole run. For vendor backends
+        /// it bounds the CLI subprocess (default 600s); for `--backend local`
+        /// it aborts the agent loop and the auto-saved session is the
+        /// checkpoint. Prevents a wedged backend from hanging forever.
+        #[arg(long)]
+        timeout: Option<u64>,
     },
     /// Credit-saver: offload a heavy, low-architectural-subtlety task to a
     /// WARM tool-capable local LLM on the fleet (bulk codegen, mechanical
@@ -3585,14 +3591,26 @@ async fn main() -> Result<()> {
             max_turns,
             backend,
             backend_args,
+            timeout,
         }) => {
+            let run_timeout = timeout.map(std::time::Duration::from_secs);
             // Layer-2 backend: spawn a vendor CLI directly (claude /
             // codex / gemini / kimi / grok) instead of the local agent
             // loop. `local` keeps existing behaviour.
             if !backend.eq_ignore_ascii_case("local") {
-                let r = ff_agent::cli_executor::execute_cli(&backend, &prompt, &backend_args, None)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("backend `{backend}`: {e}"))?;
+                // Run the vendor CLI IN the requested working dir (`--cwd`), so
+                // `ff agent fanout --run-cwd <ws>` actually edits that checkout
+                // — the old code dropped the cwd (used execute_cli, not
+                // _in_dir). Honor --timeout (else the cli_executor default).
+                let r = ff_agent::cli_executor::execute_cli_in_dir(
+                    &backend,
+                    &prompt,
+                    &backend_args,
+                    Some(agent_config.working_dir.as_path()),
+                    run_timeout,
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("backend `{backend}`: {e}"))?;
                 if !r.stderr.is_empty() {
                     eprintln!("{}", r.stderr);
                 }
@@ -3619,7 +3637,27 @@ async fn main() -> Result<()> {
             // pre-installed software (open-design, etc.) without ff
             // needing a per-tool verb.
             cfg.system_prompt = inject_agent_hints(cfg.system_prompt.clone()).await;
-            run_headless(&prompt, cfg, &output, oneshot).await
+            // --timeout: bound the local agent loop so a wedged/overflowing run
+            // can't hang forever. Any files the loop already wrote via
+            // Edit/Write are on disk (the checkpoint); commit-back lifts those.
+            match run_timeout {
+                Some(dur) => {
+                    match tokio::time::timeout(dur, run_headless(&prompt, cfg, &output, oneshot))
+                        .await
+                    {
+                        Ok(res) => res,
+                        Err(_) => {
+                            eprintln!(
+                                "{RED}✗ run timed out after {}s — any files already written are \
+                             preserved on disk (commit-back can lift them).{RESET}",
+                                dur.as_secs()
+                            );
+                            std::process::exit(124);
+                        }
+                    }
+                }
+                None => run_headless(&prompt, cfg, &output, oneshot).await,
+            }
         }
         Some(Command::Offload {
             prompt,
