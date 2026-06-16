@@ -34,6 +34,34 @@ pub struct RouterEndpoint {
     pub tier: i32,
     /// True for the node's own LLM (localhost)
     pub is_local: bool,
+    /// Per-slot context window (`/props` `n_ctx`) when known. The SAME model is
+    /// served at wildly different ctx across the fleet (qwen36: 4096 on one node,
+    /// 32768 on another), so routing a code/agent task without considering this
+    /// can land it on a 4K slot that overflows reading one file. `None` = not
+    /// probed (treated as "unknown", not excluded). See
+    /// `active_url_filtered`'s `min_ctx` preference.
+    pub n_ctx: Option<i32>,
+}
+
+/// Probe a llama.cpp-style endpoint's `/props` for its per-slot `n_ctx`.
+/// Returns `None` for non-llama servers (no `/props`) or any failure — callers
+/// treat unknown ctx as "don't exclude" so liveness is never sacrificed.
+async fn fetch_n_ctx(base_url: &str, client: &reqwest::Client) -> Option<i32> {
+    let v: serde_json::Value = client
+        .get(format!("{}/props", base_url.trim_end_matches('/')))
+        .timeout(Duration::from_secs(3))
+        .send()
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    v.get("default_generation_settings")
+        .and_then(|s| s.get("n_ctx"))
+        .or_else(|| v.get("n_ctx"))
+        .and_then(|n| n.as_i64())
+        .filter(|&n| n > 0)
+        .map(|n| n as i32)
 }
 
 /// Thread-safe state for tracking failed endpoints.
@@ -117,22 +145,45 @@ impl InferenceRouter {
     /// Always favours local over remote, and tool-capable over non-tool.
     /// Call `report_failure` when a request to the returned URL fails.
     pub async fn active_url(&self) -> Option<String> {
-        self.active_url_filtered(false).await
+        self.active_url_min_ctx(false, 0).await
     }
 
-    /// Like [`active_url`], but when `require_tools` is set, prefer endpoints
-    /// whose model supports OpenAI-compatible tool calling. Only falls back to
-    /// a non-tool endpoint when no tool-capable one is reachable, so the caller
-    /// still gets liveness rather than `None`.
-    ///
-    /// The agent loop uses `require_tools = true` so a local non-tool model
-    /// (e.g. gemma-4) never shadows a remote tool-capable one — the documented
-    /// "agent dispatched to gemma-4 hangs silently" foot-gun. Local-first
-    /// ordering is preserved *within* the tool-capable tier.
+    /// Back-compat: tool-preference selection with no context floor.
     pub async fn active_url_filtered(&self, require_tools: bool) -> Option<String> {
+        self.active_url_min_ctx(require_tools, 0).await
+    }
+
+    /// Select a healthy endpoint, preferring (in order): tool-capable **and**
+    /// adequate context → tool-capable → adequate context → any — always
+    /// falling back to liveness rather than `None`.
+    ///
+    /// `min_ctx > 0` makes a code/agent run avoid a small per-slot ctx (e.g. a
+    /// 4096 qwen36 slot) that overflows reading one file, even though the model
+    /// is otherwise capable. Endpoints with UNKNOWN `n_ctx` are NOT excluded —
+    /// only a positive under-min signal de-prioritises them — so a fleet that
+    /// never answered `/props` still routes.
+    ///
+    /// `require_tools = true` keeps a local non-tool model (e.g. gemma-4) from
+    /// shadowing a remote tool-capable one. Local-first within each tier.
+    pub async fn active_url_min_ctx(&self, require_tools: bool, min_ctx: i32) -> Option<String> {
         let state = self.failures.lock().await;
-        // First pass: when tools are required, only a healthy tool-capable
-        // endpoint qualifies (still local-first within that tier).
+        let meets_ctx =
+            |ep: &RouterEndpoint| min_ctx <= 0 || ep.n_ctx.map(|c| c >= min_ctx).unwrap_or(false);
+
+        // Pass 1 (best): tool-capable AND adequate ctx.
+        if require_tools && min_ctx > 0 {
+            for ep in &self.endpoints {
+                if ep.supports_tools
+                    && meets_ctx(ep)
+                    && !state.is_cooling_down(&ep.url, self.cooldown)
+                {
+                    debug!(label = %ep.label, url = %ep.url, n_ctx = ?ep.n_ctx, "InferenceRouter selected tool+ctx endpoint");
+                    return Some(ep.url.clone());
+                }
+            }
+        }
+        // Pass 2: when tools are required, any healthy tool-capable endpoint
+        // (still local-first within that tier).
         if require_tools {
             for ep in &self.endpoints {
                 if ep.supports_tools && !state.is_cooling_down(&ep.url, self.cooldown) {
@@ -141,7 +192,16 @@ impl InferenceRouter {
                 }
             }
         }
-        // Second pass: any healthy endpoint (or the only pass when tools aren't
+        // Pass 3: adequate ctx (any), when a ctx floor was requested.
+        if min_ctx > 0 {
+            for ep in &self.endpoints {
+                if meets_ctx(ep) && !state.is_cooling_down(&ep.url, self.cooldown) {
+                    debug!(label = %ep.label, url = %ep.url, n_ctx = ?ep.n_ctx, "InferenceRouter selected adequate-ctx endpoint");
+                    return Some(ep.url.clone());
+                }
+            }
+        }
+        // Final pass: any healthy endpoint (or the only pass when tools aren't
         // required). Keeps liveness when no tool-capable node is reachable.
         for ep in &self.endpoints {
             if !state.is_cooling_down(&ep.url, self.cooldown) {
@@ -233,15 +293,18 @@ async fn build_endpoint_list(config_path: &Path, client: &reqwest::Client) -> Ve
     for port in 55000u16..=55003 {
         if tcp_reachable("127.0.0.1", port).await {
             // Ask the server which model it's running so we can detect tool support.
-            let model_id = fetch_first_model_id(&format!("http://127.0.0.1:{port}"), client).await;
+            let base = format!("http://127.0.0.1:{port}");
+            let model_id = fetch_first_model_id(&base, client).await;
             let supports_tools = model_supports_tools(&model_id);
+            let n_ctx = fetch_n_ctx(&base, client).await;
             local.push(RouterEndpoint {
-                url: format!("http://127.0.0.1:{port}"),
+                url: base,
                 model_id,
                 label: format!("local:{port}"),
                 supports_tools,
                 tier: 0, // unknown until the DB override below fills it in
                 is_local: true,
+                n_ctx,
             });
         }
     }
@@ -350,15 +413,22 @@ async fn build_endpoint_list(config_path: &Path, client: &reqwest::Client) -> Ve
                     let st = *supports_tools;
                     let tier = *tier;
                     let port = *port;
+                    let client = client.clone();
                     async move {
                         if tcp_reachable(&ip, port).await {
+                            let base = format!("http://{ip}:{port}");
+                            // Probe /props for the per-slot n_ctx so routing can
+                            // avoid landing a code task on a 4K slot of an
+                            // otherwise-capable model.
+                            let n_ctx = fetch_n_ctx(&base, &client).await;
                             Some(RouterEndpoint {
-                                url: format!("http://{ip}:{port}"),
+                                url: base,
                                 model_id,
                                 label,
                                 supports_tools: st,
                                 tier,
                                 is_local: false,
+                                n_ctx,
                             })
                         } else {
                             None
@@ -499,7 +569,60 @@ mod tests {
             supports_tools,
             tier,
             is_local,
+            n_ctx: None,
         }
+    }
+
+    fn ep_ctx(label: &str, supports_tools: bool, n_ctx: i32) -> RouterEndpoint {
+        RouterEndpoint {
+            n_ctx: Some(n_ctx),
+            ..ep_t(label, supports_tools, false, ASSUMED_TIER)
+        }
+    }
+
+    #[tokio::test]
+    async fn min_ctx_skips_small_slots_for_code_runs() {
+        // Same model served at different per-slot ctx: a code run (min_ctx=32K)
+        // must NOT land on the 4K slot even though it's first / tool-capable.
+        let router = InferenceRouter::new(vec![
+            ep_ctx("veronica-4k", true, 4096),
+            ep_ctx("lily-8k", true, 8192),
+            ep_ctx("logan-32k", true, 32768),
+        ]);
+        // ctx-aware: picks the 32K endpoint (skips 4K/8K).
+        assert_eq!(
+            router.active_url_min_ctx(true, 32768).await.as_deref(),
+            Some("http://logan-32k"),
+        );
+        // ctx-blind (min_ctx=0): old behaviour — first tool-capable wins (4K).
+        assert_eq!(
+            router.active_url_min_ctx(true, 0).await.as_deref(),
+            Some("http://veronica-4k"),
+        );
+    }
+
+    #[tokio::test]
+    async fn min_ctx_keeps_liveness_when_none_meet_floor() {
+        // No tool-capable endpoint meets the 32K floor → the ctx passes find
+        // nothing, but the tool-capable liveness pass still returns one (better
+        // a small slot than failing the run with None).
+        let router = InferenceRouter::new(vec![
+            ep_ctx("small-8k", true, 8192),
+            ep_t("unknown-ctx", true, false, ASSUMED_TIER), // n_ctx None
+        ]);
+        let got = router.active_url_min_ctx(true, 32768).await;
+        assert!(got.is_some(), "must keep liveness, got None");
+        assert!(matches!(
+            got.as_deref(),
+            Some("http://small-8k") | Some("http://unknown-ctx")
+        ));
+
+        // Only a small slot exists → still liveness, not None.
+        let only_small = InferenceRouter::new(vec![ep_ctx("small-8k", true, 8192)]);
+        assert_eq!(
+            only_small.active_url_min_ctx(true, 32768).await.as_deref(),
+            Some("http://small-8k"),
+        );
     }
 
     #[test]
