@@ -873,6 +873,46 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         }));
     }
 
+    // 20b) Version-check tick — every 6h, PER-NODE (not leader-gated).
+    //
+    // Same legacy-daemon gap as the disk sampler above: `version_check_pass`
+    // (which writes THIS host's `fleet_workers.tooling` = installed-vs-latest
+    // tool versions) ran ONLY in `ff daemon`, so every forgefleetd-only host had
+    // stale or empty tooling — beyonce/rihanna (never ran the legacy daemon)
+    // persistently failed the `tool_versions_reported` integrity check. Each
+    // node reports its OWN tooling, so this is per-node. The first tick fires
+    // promptly so a freshly-(re)started daemon populates tooling within ~a
+    // minute instead of waiting 6h. (Pairs with the resolve_own_bin fix so the
+    // collector finds ff/forgefleetd even when PATH omits ~/.local/bin.)
+    if let Some(pg_pool) = operational_store.pg_pool().cloned() {
+        info!("starting subsystem: version-check tick (6h, per-node)");
+        let mut shutdown_rx_ver = shutdown_rx.clone();
+        let ver_worker = worker_name.clone();
+        subsystem_tasks.push(tokio::spawn(async move {
+            // Settle briefly after startup, then run an initial pass + every 6h.
+            tokio::time::sleep(std::time::Duration::from_secs(45)).await;
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = shutdown_rx_ver.changed() => break,
+                    _ = tick.tick() => {
+                        match ff_agent::version_check::version_check_pass(&pg_pool).await {
+                            Ok(s) => info!(
+                                node = %ver_worker,
+                                tools = s.total_keys,
+                                drift = s.drifted_keys.len(),
+                                "version-check pass complete"
+                            ),
+                            Err(e) => warn!(node = %ver_worker, error = %e, "version-check pass failed"),
+                        }
+                    }
+                }
+            }
+        }));
+    }
+
     // 20c) Stale-task reaper tick — every 10min, per-node (idempotent).
     //
     // Tasks claimed by a worker that then died or restarted mid-run (common
