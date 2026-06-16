@@ -443,123 +443,7 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
             json,
         } => handle_model_deployments(pool.clone(), node, show_id, json).await?,
         crate::ModelCommand::AgentReady { node, json } => {
-            let rows = ff_db::pg_agent_readiness(&pool, node.as_deref()).await?;
-            let min_ctx = ff_agent::model_runtime::AGENT_MIN_CTX as i32;
-            let leader = ff_db::pg_get_current_leader(&pool)
-                .await
-                .ok()
-                .flatten()
-                .map(|l| l.member_name);
-            let is_leader = |w: &str| leader.as_deref() == Some(w);
-
-            // Split tool-capable endpoints into agent-capable (per-slot ctx meets
-            // the router floor) vs reprofile-candidate (too many slots → too small).
-            let (ready, candidates): (
-                Vec<&ff_db::AgentReadinessRow>,
-                Vec<&ff_db::AgentReadinessRow>,
-            ) = rows
-                .iter()
-                .partition(|r| is_agent_ready(r.usable_agent_ctx, min_ctx));
-
-            let fmt_ctx =
-                |r: &ff_db::AgentReadinessRow| match (r.usable_agent_ctx, r.parallel_slots) {
-                    (Some(u), Some(p)) => format!("{u}x{p}"),
-                    (Some(u), None) => u.to_string(),
-                    _ => "-".into(),
-                };
-
-            if json {
-                let to_obj = |r: &ff_db::AgentReadinessRow| {
-                    serde_json::json!({
-                        "node": r.worker_name,
-                        "catalog_id": r.catalog_id,
-                        "port": r.port,
-                        "runtime": r.runtime,
-                        "context_window": r.context_window,
-                        "parallel_slots": r.parallel_slots,
-                        "usable_agent_ctx": r.usable_agent_ctx,
-                        "kind": if r.is_code { "code" } else { "general" },
-                        "is_leader": is_leader(&r.worker_name),
-                    })
-                };
-                let code_ready = ready.iter().filter(|r| r.is_code).count();
-                let non_leader = ready.iter().filter(|r| !is_leader(&r.worker_name)).count();
-                let out = serde_json::json!({
-                    "min_ctx": min_ctx,
-                    "leader": leader,
-                    "agent_capable": ready.iter().map(|r| to_obj(r)).collect::<Vec<_>>(),
-                    "reprofile_candidates": candidates.iter().map(|r| to_obj(r)).collect::<Vec<_>>(),
-                    "summary": {
-                        "agent_capable": ready.len(),
-                        "agent_capable_non_leader": non_leader,
-                        "reprofile_candidates": candidates.len(),
-                        "code_ready": code_ready,
-                        "general_ready": ready.len() - code_ready,
-                    }
-                });
-                println!("{}", serde_json::to_string_pretty(&out)?);
-                return Ok(());
-            }
-
-            println!(
-                "{GREEN}AGENT-CAPABLE ENDPOINTS{RESET} (tool_calling + usable_agent_ctx >= {min_ctx})"
-            );
-            if ready.is_empty() {
-                println!("  (none — no endpoint can currently serve an agent/tool task)");
-            } else {
-                println!(
-                    "  {:<10} {:<28} {:<6} {:<10} {:<8} LEADER",
-                    "NODE", "CATALOG_ID", "PORT", "AGENT_CTX", "KIND"
-                );
-                for r in &ready {
-                    println!(
-                        "  {:<10} {:<28} {:<6} {:<10} {:<8} {}",
-                        r.worker_name,
-                        r.catalog_id.clone().unwrap_or_else(|| "-".into()),
-                        r.port,
-                        fmt_ctx(r),
-                        if r.is_code { "code" } else { "general" },
-                        if is_leader(&r.worker_name) {
-                            "leader"
-                        } else {
-                            ""
-                        }
-                    );
-                }
-            }
-            println!();
-            println!(
-                "{YELLOW}REPROFILE CANDIDATES{RESET} (tool-capable but per-slot ctx < {min_ctx})"
-            );
-            if candidates.is_empty() {
-                println!("  (none)");
-            } else {
-                println!(
-                    "  {:<10} {:<28} {:<6} {:<10} {:<8} HINT",
-                    "NODE", "CATALOG_ID", "PORT", "AGENT_CTX", "KIND"
-                );
-                for r in &candidates {
-                    println!(
-                        "  {:<10} {:<28} {:<6} {:<10} {:<8} relaunch --parallel 1 --ctx {min_ctx}",
-                        r.worker_name,
-                        r.catalog_id.clone().unwrap_or_else(|| "-".into()),
-                        r.port,
-                        fmt_ctx(r),
-                        if r.is_code { "code" } else { "general" },
-                    );
-                }
-            }
-            println!();
-            let code_ready = ready.iter().filter(|r| r.is_code).count();
-            let non_leader = ready.iter().filter(|r| !is_leader(&r.worker_name)).count();
-            println!(
-                "{CYAN}SUMMARY{RESET}: {} agent-capable ({} non-leader) | {} reprofile candidate(s) | code: {} ready, general: {} ready",
-                ready.len(),
-                non_leader,
-                candidates.len(),
-                code_ready,
-                ready.len() - code_ready,
-            );
+            handle_model_agent_ready(pool.clone(), node, json).await?
         }
         crate::ModelCommand::FreeForBuild => {
             match ff_agent::model_runtime::pause_local_models_for_build(&pool).await {
@@ -695,98 +579,7 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
             println!("Check status with: ff defer list");
         }
         crate::ModelCommand::Delete { id, yes } => {
-            // Look up library row.
-            let all = ff_db::pg_list_library(&pool, None).await?;
-            let row = all.iter().find(|r| r.id == id).ok_or_else(|| {
-                anyhow::anyhow!("no library entry with id '{id}' (try `ff model library`)")
-            })?;
-
-            // Safety: refuse if a deployment references this library row.
-            let deployments = ff_db::pg_list_deployments(&pool, Some(&row.worker_name)).await?;
-            let in_use = deployments
-                .iter()
-                .any(|d| d.library_id.as_deref() == Some(&id));
-            if in_use {
-                anyhow::bail!(
-                    "model is currently deployed on {} — unload it first (`ff model unload <deployment_id>`)",
-                    row.worker_name
-                );
-            }
-
-            // Cross-node delete: dispatch to the owning node via the deferred
-            // task queue — same pattern as `ff model download`. A defer-worker
-            // on the target node claims it and runs the delete locally (where
-            // the file actually lives). Bare `ff` is fine in the defer command:
-            // the defer-worker runs with a full PATH, unlike a non-login SSH
-            // shell. The --yes is implied (operator already confirmed here).
-            let this_node = ff_agent::fleet_info::resolve_this_worker_name().await;
-            if row.worker_name != this_node {
-                if !yes {
-                    println!(
-                        "This will delete {} ({}) from {} (cross-node). Re-run with --yes to confirm.",
-                        row.file_path,
-                        human_bytes(row.size_bytes as u64),
-                        row.worker_name
-                    );
-                    return Ok(());
-                }
-                let escaped_id = shell_escape_single(&id);
-                let command = format!("ff model delete {escaped_id} --yes");
-                let title = format!("Delete {} on {}", id, row.worker_name);
-                let payload = serde_json::json!({ "command": command });
-                let defer_id = ff_db::pg_enqueue_deferred(
-                    &pool,
-                    &title,
-                    "shell",
-                    &payload,
-                    "now",
-                    &serde_json::json!({}),
-                    Some(&row.worker_name),
-                    &serde_json::json!([]),
-                    Some(&whoami_tag()),
-                    Some(3),
-                )
-                .await?;
-                println!(
-                    "Enqueued cross-node delete of {} ({}) on {} as deferred task {defer_id}.",
-                    row.file_path,
-                    human_bytes(row.size_bytes as u64),
-                    row.worker_name
-                );
-                println!(
-                    "It runs when {}'s defer-worker claims it. Check: ff defer list",
-                    row.worker_name
-                );
-                return Ok(());
-            }
-
-            if !yes {
-                println!(
-                    "This will delete {} ({}) from disk. Re-run with --yes to confirm.",
-                    row.file_path,
-                    human_bytes(row.size_bytes as u64)
-                );
-                return Ok(());
-            }
-
-            let path = std::path::Path::new(&row.file_path);
-            let result = if path.is_dir() {
-                tokio::fs::remove_dir_all(path).await
-            } else {
-                tokio::fs::remove_file(path).await
-            };
-            match result {
-                Ok(()) => {
-                    let _ = ff_db::pg_delete_library(&pool, &id).await?;
-                    println!(
-                        "Deleted {} ({}) from {}",
-                        row.file_path,
-                        human_bytes(row.size_bytes as u64),
-                        row.worker_name
-                    );
-                }
-                Err(e) => anyhow::bail!("filesystem remove failed: {e}"),
-            }
+            handle_model_delete(pool.clone(), id, yes).await?
         }
         crate::ModelCommand::Load {
             id,
@@ -828,103 +621,7 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
             ctx,
             node,
             agent,
-        } => {
-            let worker_name = ff_agent::fleet_info::resolve_this_worker_name().await;
-
-            // Cross-node form: resolve user@ip from Postgres and run
-            // `ff model autoload <catalog_id>` on the target over SSH. Built
-            // from the DB (never ~/.ssh/config). Used by the P3 autoscaler's
-            // remote-load dispatch (and operators).
-            if let Some(target) = &node
-                && !target.eq_ignore_ascii_case(&worker_name)
-            {
-                let node_row = ff_db::pg_get_node(&pool, target)
-                    .await?
-                    .ok_or_else(|| anyhow::anyhow!("node '{target}' not in fleet_workers"))?;
-                let mut remote_cmd = format!(
-                    "~/.local/bin/ff model autoload {}",
-                    shell_escape_single(&catalog_id)
-                );
-                if let Some(c) = ctx {
-                    remote_cmd.push_str(&format!(" --ctx {c}"));
-                }
-                if agent {
-                    remote_cmd.push_str(" --agent");
-                }
-                println!(
-                    "{CYAN}▶ Autoloading {catalog_id} on {target} ({}@{})...{RESET}",
-                    node_row.ssh_user, node_row.ip
-                );
-                let (code, out, err) = ff_agent::model_transfer::ssh_exec(
-                    &node_row.ssh_user,
-                    &node_row.ip,
-                    &remote_cmd,
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("ssh to {target}: {e}"))?;
-                if !out.trim().is_empty() {
-                    print!("{out}");
-                }
-                if code != 0 {
-                    anyhow::bail!("remote autoload on {target} exited {code}: {}", err.trim());
-                }
-                return Ok(());
-            }
-
-            // 1. Already deployed?
-            let deps = ff_db::pg_list_deployments(&pool, Some(&worker_name)).await?;
-            if let Some(d) = deps.iter().find(|d| {
-                d.catalog_id.as_deref() == Some(&catalog_id) && d.health_status == "healthy"
-            }) {
-                println!("Already deployed on port {} (deployment {})", d.port, d.id);
-                return Ok(());
-            }
-
-            // 2. Find library row on this node for this catalog_id.
-            let libs = ff_db::pg_list_library(&pool, Some(&worker_name)).await?;
-            let lib = libs.iter().find(|r| r.catalog_id == catalog_id)
-                .ok_or_else(|| anyhow::anyhow!("model '{catalog_id}' not in library on '{worker_name}'. Download it first: ff model download {catalog_id}"))?;
-
-            // 3. Pick a free port via port_registry — canonical mapping
-            //    (55000-55002 llama.cpp/mlx, 51001/51003 vllm, 11434 ollama).
-            //    Fall back to legacy 51001..=51020 scan only if the registry
-            //    lookup fails (e.g. fresh install where it hasn't seeded yet).
-            let port: u16 =
-                match ff_agent::ports_registry::pick_llm_port(&pool, &worker_name, &lib.runtime)
-                    .await
-                {
-                    Ok(p) => p as u16,
-                    Err(_) => {
-                        let used_ports: std::collections::HashSet<i32> =
-                            deps.iter().map(|d| d.port).collect();
-                        (51001u16..=51020)
-                            .find(|p| !used_ports.contains(&(*p as i32)))
-                            .ok_or_else(|| {
-                                anyhow::anyhow!("no free port in registry or 51001-51020")
-                            })?
-                    }
-                };
-
-            // 4. Load.
-            let res = ff_agent::model_runtime::load_model(
-                &pool,
-                ff_agent::model_runtime::LoadOptions {
-                    library_id: lib.id.clone(),
-                    port,
-                    context_size: ctx,
-                    parallel: None,
-                    agent_profile: agent,
-                    mmproj_path: None, // auto-detect sibling mmproj
-                },
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!(e))?;
-
-            println!(
-                "Autoloaded {} on port {} (deployment {})",
-                catalog_id, res.port, res.deployment_id
-            );
-        }
+        } => handle_model_autoload(pool.clone(), catalog_id, ctx, node, agent).await?,
         crate::ModelCommand::Unload { id, node, port } => {
             // Resolve the deployment id. Either a positional UUID was given, or
             // the operator passed `--port` (optionally `--node`) and we look the
@@ -1239,83 +936,7 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
             json,
             remediate,
             explain,
-        } => {
-            let guard = ff_agent::coverage_guard::CoverageGuard::new_dbonly(pool.clone());
-            // `--explain` is a read-only per-task breakdown — short-circuit
-            // before the normal coverage pass (it implies no remediation).
-            if explain {
-                let rows = guard
-                    .explain()
-                    .await
-                    .map_err(|e| anyhow::anyhow!("coverage explain: {e}"))?;
-                if json {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&rows).unwrap_or_default()
-                    );
-                } else {
-                    print_coverage_explain(&rows);
-                }
-                return Ok(());
-            }
-            // Read-only by default so a status check has no side effects;
-            // `--remediate` opts into enqueuing auto-loads.
-            let report = if remediate {
-                guard.check_once().await
-            } else {
-                guard.report_once().await
-            }
-            .map_err(|e| anyhow::anyhow!("coverage check: {e}"))?;
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&report).unwrap_or_default()
-                );
-            } else {
-                println!("Tasks required:   {}", report.tasks_required);
-                println!("Tasks covered:    {}", report.tasks_covered);
-                println!("Gaps:             {}", report.gaps.len());
-                println!("Auto-loaded:      {}", report.auto_loaded.len());
-                if !report.gaps.is_empty() {
-                    println!();
-                    println!("{:<32} {:<6} {:<6}  CANDIDATES", "TASK", "MIN", "LOAD");
-                    for g in &report.gaps {
-                        let cands = if g.candidates.is_empty() {
-                            "(none)".to_string()
-                        } else {
-                            g.candidates
-                                .iter()
-                                .take(3)
-                                .cloned()
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        };
-                        println!(
-                            "{:<32} {:<6} {:<6}  {}",
-                            g.task, g.min_required, g.currently_loaded, cands
-                        );
-                    }
-                }
-                if !report.auto_loaded.is_empty() {
-                    println!();
-                    println!(
-                        "{GREEN}Enqueued auto-load for:{RESET} {}",
-                        report.auto_loaded.join(", ")
-                    );
-                }
-                // Read-only pass with loadable gaps: tell the operator how to act.
-                if !remediate {
-                    let loadable = ff_agent::coverage_guard::loadable_gap_count(&report.gaps);
-                    if loadable > 0 {
-                        println!();
-                        println!(
-                            "{loadable} gap(s) have loadable candidates — run \
-                             `ff model coverage --remediate` to enqueue auto-loads."
-                        );
-                    }
-                }
-            }
-        }
+        } => handle_model_coverage(pool.clone(), json, remediate, explain).await?,
         crate::ModelCommand::ReconcileCatalog { json, dry_run } => {
             let reconciler =
                 ff_agent::deployment_catalog_reconciler::DeploymentCatalogReconciler::new(
@@ -1382,84 +1003,21 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
             tool_calling,
             json,
         } => {
-            if !(1..=4).contains(&tier) {
-                anyhow::bail!("--tier must be 1..4 (got {tier})");
-            }
-            // Comma-separated `--workloads` → JSONB array (trimmed, empties dropped).
-            let workloads_vec: Vec<String> = workloads
-                .as_deref()
-                .map(|v| {
-                    v.split(',')
-                        .map(str::trim)
-                        .filter(|t| !t.is_empty())
-                        .map(str::to_string)
-                        .collect()
-                })
-                .unwrap_or_default();
-            // `tool_calling` is auto-derived from the workloads (mirrors the
-            // TOML→DB upsert convention) unless forced on via the flag.
-            let tool_calling = tool_calling || workloads_vec.iter().any(|w| w == "tool_calling");
-            let workloads_json = serde_json::json!(workloads_vec);
-
-            // Each `--variant runtime:hf_repo[:quant[:size_gb]]` → a variant object.
-            let mut variants_vec = Vec::with_capacity(variants.len());
-            for spec in &variants {
-                variants_vec.push(parse_variant_spec(spec)?);
-            }
-            let variants_json = serde_json::Value::Array(variants_vec);
-
-            let inserted = sqlx::query(
-                "INSERT INTO fleet_model_catalog
-                     (id, name, family, parameters, tier, description,
-                      gated, preferred_workloads, variants, tool_calling)
-                 VALUES ($1, $2, $3, $4, $5, $6,
-                         $7, $8, $9, $10)
-                 ON CONFLICT (id) DO NOTHING",
+            handle_model_catalog_add(
+                pool.clone(),
+                id,
+                name,
+                family,
+                params,
+                tier,
+                workloads,
+                variants,
+                description,
+                gated,
+                tool_calling,
+                json,
             )
-            .bind(&id)
-            .bind(&name)
-            .bind(&family)
-            .bind(&params)
-            .bind(tier)
-            .bind(&description)
-            .bind(gated)
-            .bind(&workloads_json)
-            .bind(&variants_json)
-            .bind(tool_calling)
-            .execute(&pool)
-            .await?;
-
-            let added = inserted.rows_affected() == 1;
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "added": added,
-                        "id": id,
-                        "tool_calling": tool_calling,
-                        "variants": variants_json.as_array().map(|a| a.len()).unwrap_or(0),
-                        "reason": if added { "inserted" } else { "id_already_exists" },
-                    }))?
-                );
-            } else if added {
-                println!(
-                    "{GREEN}✓{RESET} Added '{id}' to fleet_model_catalog (tier {tier}, tool_calling={tool_calling}, {} variant(s))",
-                    variants.len()
-                );
-                if variants.is_empty() {
-                    println!(
-                        "  {YELLOW}note:{RESET} no --variant given — add one before \
-                         `ff model download {id}` will work."
-                    );
-                } else {
-                    println!("  Download with {CYAN}ff model download {id}{RESET}.");
-                }
-            } else {
-                anyhow::bail!(
-                    "catalog id '{id}' already exists — pick a different id (or \
-                     `ff model retire {id}` first)"
-                );
-            }
+            .await?
         }
         crate::ModelCommand::Scout { run_now, json } => {
             if run_now {
@@ -1758,6 +1316,512 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                 }
             }
         }
+    }
+    Ok(())
+}
+
+/// `ff model agent-ready` handler — extracted verbatim from
+/// the `handle_model` dispatch arm. `pool` by value (cheap Arc clone).
+async fn handle_model_agent_ready(
+    pool: sqlx::PgPool,
+    node: Option<String>,
+    json: bool,
+) -> anyhow::Result<()> {
+    let rows = ff_db::pg_agent_readiness(&pool, node.as_deref()).await?;
+    let min_ctx = ff_agent::model_runtime::AGENT_MIN_CTX as i32;
+    let leader = ff_db::pg_get_current_leader(&pool)
+        .await
+        .ok()
+        .flatten()
+        .map(|l| l.member_name);
+    let is_leader = |w: &str| leader.as_deref() == Some(w);
+
+    // Split tool-capable endpoints into agent-capable (per-slot ctx meets
+    // the router floor) vs reprofile-candidate (too many slots → too small).
+    let (ready, candidates): (
+        Vec<&ff_db::AgentReadinessRow>,
+        Vec<&ff_db::AgentReadinessRow>,
+    ) = rows
+        .iter()
+        .partition(|r| is_agent_ready(r.usable_agent_ctx, min_ctx));
+
+    let fmt_ctx = |r: &ff_db::AgentReadinessRow| match (r.usable_agent_ctx, r.parallel_slots) {
+        (Some(u), Some(p)) => format!("{u}x{p}"),
+        (Some(u), None) => u.to_string(),
+        _ => "-".into(),
+    };
+
+    if json {
+        let to_obj = |r: &ff_db::AgentReadinessRow| {
+            serde_json::json!({
+                "node": r.worker_name,
+                "catalog_id": r.catalog_id,
+                "port": r.port,
+                "runtime": r.runtime,
+                "context_window": r.context_window,
+                "parallel_slots": r.parallel_slots,
+                "usable_agent_ctx": r.usable_agent_ctx,
+                "kind": if r.is_code { "code" } else { "general" },
+                "is_leader": is_leader(&r.worker_name),
+            })
+        };
+        let code_ready = ready.iter().filter(|r| r.is_code).count();
+        let non_leader = ready.iter().filter(|r| !is_leader(&r.worker_name)).count();
+        let out = serde_json::json!({
+            "min_ctx": min_ctx,
+            "leader": leader,
+            "agent_capable": ready.iter().map(|r| to_obj(r)).collect::<Vec<_>>(),
+            "reprofile_candidates": candidates.iter().map(|r| to_obj(r)).collect::<Vec<_>>(),
+            "summary": {
+                "agent_capable": ready.len(),
+                "agent_capable_non_leader": non_leader,
+                "reprofile_candidates": candidates.len(),
+                "code_ready": code_ready,
+                "general_ready": ready.len() - code_ready,
+            }
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+
+    println!(
+        "{GREEN}AGENT-CAPABLE ENDPOINTS{RESET} (tool_calling + usable_agent_ctx >= {min_ctx})"
+    );
+    if ready.is_empty() {
+        println!("  (none — no endpoint can currently serve an agent/tool task)");
+    } else {
+        println!(
+            "  {:<10} {:<28} {:<6} {:<10} {:<8} LEADER",
+            "NODE", "CATALOG_ID", "PORT", "AGENT_CTX", "KIND"
+        );
+        for r in &ready {
+            println!(
+                "  {:<10} {:<28} {:<6} {:<10} {:<8} {}",
+                r.worker_name,
+                r.catalog_id.clone().unwrap_or_else(|| "-".into()),
+                r.port,
+                fmt_ctx(r),
+                if r.is_code { "code" } else { "general" },
+                if is_leader(&r.worker_name) {
+                    "leader"
+                } else {
+                    ""
+                }
+            );
+        }
+    }
+    println!();
+    println!("{YELLOW}REPROFILE CANDIDATES{RESET} (tool-capable but per-slot ctx < {min_ctx})");
+    if candidates.is_empty() {
+        println!("  (none)");
+    } else {
+        println!(
+            "  {:<10} {:<28} {:<6} {:<10} {:<8} HINT",
+            "NODE", "CATALOG_ID", "PORT", "AGENT_CTX", "KIND"
+        );
+        for r in &candidates {
+            println!(
+                "  {:<10} {:<28} {:<6} {:<10} {:<8} relaunch --parallel 1 --ctx {min_ctx}",
+                r.worker_name,
+                r.catalog_id.clone().unwrap_or_else(|| "-".into()),
+                r.port,
+                fmt_ctx(r),
+                if r.is_code { "code" } else { "general" },
+            );
+        }
+    }
+    println!();
+    let code_ready = ready.iter().filter(|r| r.is_code).count();
+    let non_leader = ready.iter().filter(|r| !is_leader(&r.worker_name)).count();
+    println!(
+        "{CYAN}SUMMARY{RESET}: {} agent-capable ({} non-leader) | {} reprofile candidate(s) | code: {} ready, general: {} ready",
+        ready.len(),
+        non_leader,
+        candidates.len(),
+        code_ready,
+        ready.len() - code_ready,
+    );
+    Ok(())
+}
+
+/// `ff model delete` handler — extracted verbatim from
+/// the `handle_model` dispatch arm. `pool` by value (cheap Arc clone).
+async fn handle_model_delete(pool: sqlx::PgPool, id: String, yes: bool) -> anyhow::Result<()> {
+    // Look up library row.
+    let all = ff_db::pg_list_library(&pool, None).await?;
+    let row = all.iter().find(|r| r.id == id).ok_or_else(|| {
+        anyhow::anyhow!("no library entry with id '{id}' (try `ff model library`)")
+    })?;
+
+    // Safety: refuse if a deployment references this library row.
+    let deployments = ff_db::pg_list_deployments(&pool, Some(&row.worker_name)).await?;
+    let in_use = deployments
+        .iter()
+        .any(|d| d.library_id.as_deref() == Some(&id));
+    if in_use {
+        anyhow::bail!(
+            "model is currently deployed on {} — unload it first (`ff model unload <deployment_id>`)",
+            row.worker_name
+        );
+    }
+
+    // Cross-node delete: dispatch to the owning node via the deferred
+    // task queue — same pattern as `ff model download`. A defer-worker
+    // on the target node claims it and runs the delete locally (where
+    // the file actually lives). Bare `ff` is fine in the defer command:
+    // the defer-worker runs with a full PATH, unlike a non-login SSH
+    // shell. The --yes is implied (operator already confirmed here).
+    let this_node = ff_agent::fleet_info::resolve_this_worker_name().await;
+    if row.worker_name != this_node {
+        if !yes {
+            println!(
+                "This will delete {} ({}) from {} (cross-node). Re-run with --yes to confirm.",
+                row.file_path,
+                human_bytes(row.size_bytes as u64),
+                row.worker_name
+            );
+            return Ok(());
+        }
+        let escaped_id = shell_escape_single(&id);
+        let command = format!("ff model delete {escaped_id} --yes");
+        let title = format!("Delete {} on {}", id, row.worker_name);
+        let payload = serde_json::json!({ "command": command });
+        let defer_id = ff_db::pg_enqueue_deferred(
+            &pool,
+            &title,
+            "shell",
+            &payload,
+            "now",
+            &serde_json::json!({}),
+            Some(&row.worker_name),
+            &serde_json::json!([]),
+            Some(&whoami_tag()),
+            Some(3),
+        )
+        .await?;
+        println!(
+            "Enqueued cross-node delete of {} ({}) on {} as deferred task {defer_id}.",
+            row.file_path,
+            human_bytes(row.size_bytes as u64),
+            row.worker_name
+        );
+        println!(
+            "It runs when {}'s defer-worker claims it. Check: ff defer list",
+            row.worker_name
+        );
+        return Ok(());
+    }
+
+    if !yes {
+        println!(
+            "This will delete {} ({}) from disk. Re-run with --yes to confirm.",
+            row.file_path,
+            human_bytes(row.size_bytes as u64)
+        );
+        return Ok(());
+    }
+
+    let path = std::path::Path::new(&row.file_path);
+    let result = if path.is_dir() {
+        tokio::fs::remove_dir_all(path).await
+    } else {
+        tokio::fs::remove_file(path).await
+    };
+    match result {
+        Ok(()) => {
+            let _ = ff_db::pg_delete_library(&pool, &id).await?;
+            println!(
+                "Deleted {} ({}) from {}",
+                row.file_path,
+                human_bytes(row.size_bytes as u64),
+                row.worker_name
+            );
+        }
+        Err(e) => anyhow::bail!("filesystem remove failed: {e}"),
+    }
+    Ok(())
+}
+
+/// `ff model autoload` handler — extracted verbatim from
+/// the `handle_model` dispatch arm. `pool` by value (cheap Arc clone).
+async fn handle_model_autoload(
+    pool: sqlx::PgPool,
+    catalog_id: String,
+    ctx: Option<u32>,
+    node: Option<String>,
+    agent: bool,
+) -> anyhow::Result<()> {
+    let worker_name = ff_agent::fleet_info::resolve_this_worker_name().await;
+
+    // Cross-node form: resolve user@ip from Postgres and run
+    // `ff model autoload <catalog_id>` on the target over SSH. Built
+    // from the DB (never ~/.ssh/config). Used by the P3 autoscaler's
+    // remote-load dispatch (and operators).
+    if let Some(target) = &node
+        && !target.eq_ignore_ascii_case(&worker_name)
+    {
+        let node_row = ff_db::pg_get_node(&pool, target)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("node '{target}' not in fleet_workers"))?;
+        let mut remote_cmd = format!(
+            "~/.local/bin/ff model autoload {}",
+            shell_escape_single(&catalog_id)
+        );
+        if let Some(c) = ctx {
+            remote_cmd.push_str(&format!(" --ctx {c}"));
+        }
+        if agent {
+            remote_cmd.push_str(" --agent");
+        }
+        println!(
+            "{CYAN}▶ Autoloading {catalog_id} on {target} ({}@{})...{RESET}",
+            node_row.ssh_user, node_row.ip
+        );
+        let (code, out, err) =
+            ff_agent::model_transfer::ssh_exec(&node_row.ssh_user, &node_row.ip, &remote_cmd)
+                .await
+                .map_err(|e| anyhow::anyhow!("ssh to {target}: {e}"))?;
+        if !out.trim().is_empty() {
+            print!("{out}");
+        }
+        if code != 0 {
+            anyhow::bail!("remote autoload on {target} exited {code}: {}", err.trim());
+        }
+        return Ok(());
+    }
+
+    // 1. Already deployed?
+    let deps = ff_db::pg_list_deployments(&pool, Some(&worker_name)).await?;
+    if let Some(d) = deps
+        .iter()
+        .find(|d| d.catalog_id.as_deref() == Some(&catalog_id) && d.health_status == "healthy")
+    {
+        println!("Already deployed on port {} (deployment {})", d.port, d.id);
+        return Ok(());
+    }
+
+    // 2. Find library row on this node for this catalog_id.
+    let libs = ff_db::pg_list_library(&pool, Some(&worker_name)).await?;
+    let lib = libs.iter().find(|r| r.catalog_id == catalog_id)
+                .ok_or_else(|| anyhow::anyhow!("model '{catalog_id}' not in library on '{worker_name}'. Download it first: ff model download {catalog_id}"))?;
+
+    // 3. Pick a free port via port_registry — canonical mapping
+    //    (55000-55002 llama.cpp/mlx, 51001/51003 vllm, 11434 ollama).
+    //    Fall back to legacy 51001..=51020 scan only if the registry
+    //    lookup fails (e.g. fresh install where it hasn't seeded yet).
+    let port: u16 = match ff_agent::ports_registry::pick_llm_port(&pool, &worker_name, &lib.runtime)
+        .await
+    {
+        Ok(p) => p as u16,
+        Err(_) => {
+            let used_ports: std::collections::HashSet<i32> = deps.iter().map(|d| d.port).collect();
+            (51001u16..=51020)
+                .find(|p| !used_ports.contains(&(*p as i32)))
+                .ok_or_else(|| anyhow::anyhow!("no free port in registry or 51001-51020"))?
+        }
+    };
+
+    // 4. Load.
+    let res = ff_agent::model_runtime::load_model(
+        &pool,
+        ff_agent::model_runtime::LoadOptions {
+            library_id: lib.id.clone(),
+            port,
+            context_size: ctx,
+            parallel: None,
+            agent_profile: agent,
+            mmproj_path: None, // auto-detect sibling mmproj
+        },
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!(e))?;
+
+    println!(
+        "Autoloaded {} on port {} (deployment {})",
+        catalog_id, res.port, res.deployment_id
+    );
+    Ok(())
+}
+
+/// `ff model coverage` handler — extracted verbatim from
+/// the `handle_model` dispatch arm. `pool` by value (cheap Arc clone).
+async fn handle_model_coverage(
+    pool: sqlx::PgPool,
+    json: bool,
+    remediate: bool,
+    explain: bool,
+) -> anyhow::Result<()> {
+    let guard = ff_agent::coverage_guard::CoverageGuard::new_dbonly(pool.clone());
+    // `--explain` is a read-only per-task breakdown — short-circuit
+    // before the normal coverage pass (it implies no remediation).
+    if explain {
+        let rows = guard
+            .explain()
+            .await
+            .map_err(|e| anyhow::anyhow!("coverage explain: {e}"))?;
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&rows).unwrap_or_default()
+            );
+        } else {
+            print_coverage_explain(&rows);
+        }
+        return Ok(());
+    }
+    // Read-only by default so a status check has no side effects;
+    // `--remediate` opts into enqueuing auto-loads.
+    let report = if remediate {
+        guard.check_once().await
+    } else {
+        guard.report_once().await
+    }
+    .map_err(|e| anyhow::anyhow!("coverage check: {e}"))?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).unwrap_or_default()
+        );
+    } else {
+        println!("Tasks required:   {}", report.tasks_required);
+        println!("Tasks covered:    {}", report.tasks_covered);
+        println!("Gaps:             {}", report.gaps.len());
+        println!("Auto-loaded:      {}", report.auto_loaded.len());
+        if !report.gaps.is_empty() {
+            println!();
+            println!("{:<32} {:<6} {:<6}  CANDIDATES", "TASK", "MIN", "LOAD");
+            for g in &report.gaps {
+                let cands = if g.candidates.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    g.candidates
+                        .iter()
+                        .take(3)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                println!(
+                    "{:<32} {:<6} {:<6}  {}",
+                    g.task, g.min_required, g.currently_loaded, cands
+                );
+            }
+        }
+        if !report.auto_loaded.is_empty() {
+            println!();
+            println!(
+                "{GREEN}Enqueued auto-load for:{RESET} {}",
+                report.auto_loaded.join(", ")
+            );
+        }
+        // Read-only pass with loadable gaps: tell the operator how to act.
+        if !remediate {
+            let loadable = ff_agent::coverage_guard::loadable_gap_count(&report.gaps);
+            if loadable > 0 {
+                println!();
+                println!(
+                    "{loadable} gap(s) have loadable candidates — run \
+                             `ff model coverage --remediate` to enqueue auto-loads."
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `ff model catalog-add` handler — extracted verbatim from
+/// the `handle_model` dispatch arm. `pool` by value (cheap Arc clone).
+async fn handle_model_catalog_add(
+    pool: sqlx::PgPool,
+    id: String,
+    name: String,
+    family: String,
+    params: String,
+    tier: i32,
+    workloads: Option<String>,
+    variants: Vec<String>,
+    description: Option<String>,
+    gated: bool,
+    tool_calling: bool,
+    json: bool,
+) -> anyhow::Result<()> {
+    if !(1..=4).contains(&tier) {
+        anyhow::bail!("--tier must be 1..4 (got {tier})");
+    }
+    // Comma-separated `--workloads` → JSONB array (trimmed, empties dropped).
+    let workloads_vec: Vec<String> = workloads
+        .as_deref()
+        .map(|v| {
+            v.split(',')
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    // `tool_calling` is auto-derived from the workloads (mirrors the
+    // TOML→DB upsert convention) unless forced on via the flag.
+    let tool_calling = tool_calling || workloads_vec.iter().any(|w| w == "tool_calling");
+    let workloads_json = serde_json::json!(workloads_vec);
+
+    // Each `--variant runtime:hf_repo[:quant[:size_gb]]` → a variant object.
+    let mut variants_vec = Vec::with_capacity(variants.len());
+    for spec in &variants {
+        variants_vec.push(parse_variant_spec(spec)?);
+    }
+    let variants_json = serde_json::Value::Array(variants_vec);
+
+    let inserted = sqlx::query(
+        "INSERT INTO fleet_model_catalog
+                     (id, name, family, parameters, tier, description,
+                      gated, preferred_workloads, variants, tool_calling)
+                 VALUES ($1, $2, $3, $4, $5, $6,
+                         $7, $8, $9, $10)
+                 ON CONFLICT (id) DO NOTHING",
+    )
+    .bind(&id)
+    .bind(&name)
+    .bind(&family)
+    .bind(&params)
+    .bind(tier)
+    .bind(&description)
+    .bind(gated)
+    .bind(&workloads_json)
+    .bind(&variants_json)
+    .bind(tool_calling)
+    .execute(&pool)
+    .await?;
+
+    let added = inserted.rows_affected() == 1;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "added": added,
+                "id": id,
+                "tool_calling": tool_calling,
+                "variants": variants_json.as_array().map(|a| a.len()).unwrap_or(0),
+                "reason": if added { "inserted" } else { "id_already_exists" },
+            }))?
+        );
+    } else if added {
+        println!(
+            "{GREEN}✓{RESET} Added '{id}' to fleet_model_catalog (tier {tier}, tool_calling={tool_calling}, {} variant(s))",
+            variants.len()
+        );
+        if variants.is_empty() {
+            println!(
+                "  {YELLOW}note:{RESET} no --variant given — add one before \
+                         `ff model download {id}` will work."
+            );
+        } else {
+            println!("  Download with {CYAN}ff model download {id}{RESET}.");
+        }
+    } else {
+        anyhow::bail!(
+            "catalog id '{id}' already exists — pick a different id (or \
+                     `ff model retire {id}` first)"
+        );
     }
     Ok(())
 }
