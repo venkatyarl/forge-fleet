@@ -1807,6 +1807,11 @@ pub enum RolloutCommand {
         /// Number of canary hosts in stage 0 (the rest become stage 1).
         #[arg(long, default_value_t = 1)]
         canary: usize,
+        /// Phase 2: cumulative percentage stages after the canary, e.g.
+        /// `--stages 10,50,100` → canary, then up-to-10%, 50%, 100% of targets.
+        /// Omitted → canary + the rest (one post-canary stage).
+        #[arg(long)]
+        stages: Option<String>,
         /// Percentage failure threshold for non-canary stages (the canary
         /// always halts on the first failure).
         #[arg(long, default_value_t = 25)]

@@ -398,6 +398,57 @@ pub fn plan_stages(available_targets: &[String], canary: usize) -> Vec<RolloutSt
     stages
 }
 
+/// Phase 2: percentage-staged plan. Stage 0 is the canary; subsequent stages
+/// each grow coverage to the next cumulative percentage of ALL targets
+/// (e.g. `--stages 10,50,100` → canary, then up-to-10%, up-to-50%, up-to-100%).
+/// Percentages are clamped to 1..=100, sorted ascending, deduped to non-empty
+/// slices, and a final 100% slice is always appended so every host is covered.
+/// Empty `pcts` falls back to [`plan_stages`] (canary + the rest). Pure +
+/// unit-tested; the tick advances `current_stage` through whatever this returns.
+pub fn plan_stages_pct(
+    available_targets: &[String],
+    canary: usize,
+    pcts: &[u8],
+) -> Vec<RolloutStage> {
+    if available_targets.is_empty() {
+        return Vec::new();
+    }
+    if pcts.is_empty() {
+        return plan_stages(available_targets, canary);
+    }
+    let n = available_targets.len();
+    let canary = canary.clamp(1, n);
+    let mut stages = vec![RolloutStage {
+        stage_idx: 0,
+        target_names: available_targets[..canary].to_vec(),
+    }];
+
+    // Cumulative cut points (host counts) from the percentages, always ending at n.
+    let mut cuts: Vec<usize> = pcts
+        .iter()
+        .map(|p| {
+            let p = (*p).clamp(1, 100) as usize;
+            // ceil(p% of n), never before the canary so a stage is non-empty.
+            ((p * n).div_ceil(100)).clamp(canary, n)
+        })
+        .collect();
+    cuts.push(n);
+    cuts.sort_unstable();
+    cuts.dedup();
+
+    let mut prev = canary;
+    for cut in cuts {
+        if cut > prev {
+            stages.push(RolloutStage {
+                stage_idx: stages.len(),
+                target_names: available_targets[prev..cut].to_vec(),
+            });
+            prev = cut;
+        }
+    }
+    stages
+}
+
 /// Fire the `upgrade_rollout_halted` alert through the seeded policy's channel,
 /// then record the `alert_events` row — same shape as
 /// [`crate::fleet_integrity`] / `db_integrity`. No-op if the policy is
@@ -813,5 +864,44 @@ mod tests {
     #[test]
     fn plan_stages_empty_targets_yields_nothing() {
         assert!(plan_stages(&[], 1).is_empty());
+    }
+
+    fn names(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("h{i}")).collect()
+    }
+
+    #[test]
+    fn plan_stages_pct_builds_cumulative_percentage_stages() {
+        // 10 hosts, canary 1, stages 10/50/100 → canary(1) + up-to-10%(1) +
+        // up-to-50%(5) + up-to-100%(10). Cumulative cuts at host counts 1,5,10.
+        let t = names(10);
+        let stages = plan_stages_pct(&t, 1, &[10, 50, 100]);
+        let sizes: Vec<usize> = stages.iter().map(|s| s.target_names.len()).collect();
+        // canary(1) IS the 10% cut (1 host) so that stage collapses; then +4 to
+        // 50% (5 hosts) and +5 to 100% (10 hosts).
+        assert_eq!(sizes, vec![1, 4, 5]);
+        // every host covered exactly once, idx contiguous
+        let total: usize = sizes.iter().sum();
+        assert_eq!(total, 10);
+        for (i, s) in stages.iter().enumerate() {
+            assert_eq!(s.stage_idx, i);
+        }
+    }
+
+    #[test]
+    fn plan_stages_pct_empty_pcts_falls_back_to_canary_then_rest() {
+        let t = names(6);
+        assert_eq!(plan_stages_pct(&t, 2, &[]), plan_stages(&t, 2));
+    }
+
+    #[test]
+    fn plan_stages_pct_dedups_and_always_covers_all() {
+        // Duplicate/garbage percentages collapse; a final 100% slice is always
+        // present so no host is ever stranded un-upgraded.
+        let t = names(4);
+        let stages = plan_stages_pct(&t, 1, &[50, 50, 200]); // 200 clamps to 100
+        let total: usize = stages.iter().map(|s| s.target_names.len()).sum();
+        assert_eq!(total, 4);
+        assert_eq!(stages.last().unwrap().target_names.last().unwrap(), "h3");
     }
 }
