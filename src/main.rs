@@ -2719,6 +2719,8 @@ async fn start_pulse_v2_subsystems(
                         match ff_agent::deployment_reconciler::reconcile_local(&pool).await {
                             Ok(s) => {
                                 if s.respawned > 0
+                                    || s.recovered > 0
+                                    || s.reaped > 0
                                     || s.killed > 0
                                     || s.adopted > 0
                                     || s.removed > 0
@@ -2727,6 +2729,8 @@ async fn start_pulse_v2_subsystems(
                                     info!(
                                         adopted = s.adopted,
                                         respawned = s.respawned,
+                                        recovered = s.recovered,
+                                        reaped = s.reaped,
                                         killed = s.killed,
                                         removed = s.removed,
                                         port_violations = s.port_violations,
