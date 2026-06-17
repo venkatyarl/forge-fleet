@@ -125,17 +125,21 @@ pub async fn detect_llm_from_db_or_local(config_path: &std::path::Path) -> Strin
                         endpoints.push((node.ip.clone(), 55000, node.cpu_cores, true));
                     } else {
                         for m in node_models {
-                            // Qwen and Gemma-4 (via MLX) both support OpenAI tool calling.
-                            // Check id/slug/name for "gemma-4" or "gemma4" to distinguish from older Gemma variants.
+                            // Tool-capability heuristic for endpoint preference.
+                            // EXCLUDE gemma: gemma-4 (MLX) does not reliably tool-call,
+                            // and routing an agent there hangs it silently
+                            // (feedback_gemma4_no_tools); inference_router's
+                            // `model_supports_tools` agrees. Qwen / MiniMax / Mistral /
+                            // Llama-3 are the tool-capable local families. This was the
+                            // source-of-truth split flagged in the 2026-06-17 deep review
+                            // (helpers said gemma-4 tool-capable; the router said no).
                             let fam = m.family.to_lowercase();
-                            let id_lower = m.id.to_lowercase();
-                            let name_lower = m.name.to_lowercase();
-                            let is_gemma4 = (id_lower.contains("gemma-4")
-                                || id_lower.contains("gemma4")
-                                || name_lower.contains("gemma-4")
-                                || name_lower.contains("gemma4"))
-                                && fam.contains("gemma");
-                            let supports_tools = fam.contains("qwen") || is_gemma4;
+                            let supports_tools = !fam.contains("gemma")
+                                && (fam.contains("qwen")
+                                    || fam.contains("minimax")
+                                    || fam.contains("mistral")
+                                    || fam.contains("llama-3")
+                                    || fam.contains("llama3"));
                             endpoints.push((
                                 node.ip.clone(),
                                 m.port as u16,
