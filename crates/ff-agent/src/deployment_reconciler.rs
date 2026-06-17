@@ -44,6 +44,15 @@ pub struct ReconcileSummary {
     pub refreshed: usize,
     /// Dead 'active' deployments that were respawned this tick.
     pub respawned: usize,
+    /// Dead 'active' deployments whose missing library_id was recovered from
+    /// catalog_id, then respawned (a row that would otherwise have been reaped).
+    pub recovered: usize,
+    /// Dead 'active' deployments permanently reaped because no library link
+    /// could be established (truly un-respawnable). Distinct from `removed`
+    /// (retired rows) — a reap here means an endpoint the operator wanted up was
+    /// removed and CANNOT come back without a fresh `ff model load`. Logged at
+    /// WARN so a vanished agent endpoint never disappears silently again.
+    pub reaped: usize,
     /// Stray processes for 'retired' deployments that were killed.
     pub killed: usize,
     /// Non-canonical port violations flipped to desired_state='retired' for
@@ -267,30 +276,60 @@ pub async fn reconcile_local(pool: &sqlx::PgPool) -> Result<ReconcileSummary, St
                 }
             }
             "active" => {
-                // A dead `active` row with no library_id can NEVER be respawned
-                // (respawn_dead_deployment needs a library to load), so retrying
-                // it every 60s only spams the log and leaves a phantom 'unhealthy'
-                // endpoint in `ff model deployments` (and the router's candidate
-                // set) forever. Such rows come from adopting an out-of-band
-                // process whose model path matched no library row; once that
-                // process is gone the row is an unrecoverable zombie. Reap it.
-                // An operator-loaded deployment always carries a library_id, so
-                // this never discards real `ff model load` intent.
-                if dead_active_is_unrespawnable(&row.library_id) {
-                    tracing::info!(
-                        port = row.port,
-                        deployment = %row.id,
-                        "reaping dead un-respawnable deployment (active, no library_id)"
-                    );
-                    if let Err(e) = ff_db::pg_delete_deployment(pool, &row.id).await {
-                        tracing::warn!("delete un-respawnable deployment {}: {e}", row.id);
+                // A dead `active` row with no library_id can't be respawned as-is
+                // (respawn_dead_deployment needs a library to load). Before giving
+                // up, try to RECOVER the library link from the row's catalog_id:
+                // a row can lose its library_id (e.g. adopted from an out-of-band
+                // process before the library scan completed) while still naming a
+                // catalog model, and the worker's library may now hold a matching
+                // row. Recovering it turns a would-be permanent reap back into a
+                // respawn — this is exactly the gap that silently lost the DGX
+                // agent endpoints after a `forgefleetd` restart (2026-06-17).
+                let mut row_for_respawn = row.clone();
+                if dead_active_is_unrespawnable(&row_for_respawn.library_id) {
+                    if let Some(lib_id) = recover_library_id(&row_for_respawn, &libs) {
+                        tracing::info!(
+                            port = row.port,
+                            deployment = %row.id,
+                            library_id = %lib_id,
+                            "recovered missing library_id from catalog_id for dead active deployment — will respawn instead of reap"
+                        );
+                        // Persist so future ticks (and the respawn upsert) see the
+                        // link even if this respawn attempt fails and retries.
+                        if let Ok(uuid) = sqlx::types::Uuid::parse_str(&lib_id) {
+                            let _ = sqlx::query(
+                                "UPDATE fleet_model_deployments SET library_id = $1 WHERE id = $2::uuid",
+                            )
+                            .bind(uuid)
+                            .bind(&row.id)
+                            .execute(pool)
+                            .await;
+                        }
+                        row_for_respawn.library_id = Some(lib_id);
+                        summary.recovered += 1;
                     } else {
-                        summary.removed += 1;
+                        // Truly un-respawnable: no library_id and no catalog match.
+                        // Reap it (a phantom 'unhealthy' row would otherwise sit in
+                        // the router's candidate set forever), but at WARN with full
+                        // context — a vanished agent endpoint must never disappear
+                        // silently. Operator must `ff model load` to restore it.
+                        tracing::warn!(
+                            port = row.port,
+                            deployment = %row.id,
+                            catalog_id = ?row.catalog_id,
+                            "reaping dead active deployment — no library_id and no catalog match; \
+                             agent endpoint permanently removed (restore with `ff model load <library_id>`)"
+                        );
+                        if let Err(e) = ff_db::pg_delete_deployment(pool, &row.id).await {
+                            tracing::warn!("delete un-respawnable deployment {}: {e}", row.id);
+                        } else {
+                            summary.reaped += 1;
+                        }
+                        continue;
                     }
-                    continue;
                 }
                 // Process died unexpectedly. Try to bring it back.
-                match respawn_dead_deployment(pool, row, &libs).await {
+                match respawn_dead_deployment(pool, &row_for_respawn, &libs).await {
                     Ok(true) => summary.respawned += 1,
                     Ok(false) => {} // unable, already logged
                     Err(e) => {
@@ -310,13 +349,27 @@ pub async fn reconcile_local(pool: &sqlx::PgPool) -> Result<ReconcileSummary, St
     Ok(summary)
 }
 
-/// Whether a dead `active` deployment row should be reaped instead of having a
-/// respawn attempted. A respawn loads `row.library_id`, so a row with no
-/// library_id can never come back — it's a zombie left by adopting an
-/// out-of-band process whose model path matched no library. Pure predicate so
+/// Whether a dead `active` deployment row needs library recovery before a
+/// respawn can be attempted. A respawn loads `row.library_id`, so a row with no
+/// library_id can't come back as-is — but it may be recoverable from its
+/// catalog_id (see [`recover_library_id`]) before it's reaped. Pure predicate so
 /// the Pass-B decision is unit-testable without a DB.
 fn dead_active_is_unrespawnable(library_id: &Option<String>) -> bool {
     library_id.is_none()
+}
+
+/// Best-effort recovery of a dead deployment's missing library_id from its
+/// catalog_id: find a library row on this worker that serves the same catalog
+/// model. Returns the recovered library_id, or `None` when the row names no
+/// catalog model or the worker has no library row for it (truly un-respawnable).
+/// Pure (no DB) so the recovery decision is unit-testable. When several library
+/// rows share a catalog_id, the first is taken — `load_model` resolves the
+/// concrete model file under the row's path.
+fn recover_library_id(row: &DeploymentRow, libs: &[ff_db::ModelLibraryRow]) -> Option<String> {
+    let catalog_id = row.catalog_id.as_deref()?;
+    libs.iter()
+        .find(|l| l.catalog_id.as_str() == catalog_id)
+        .map(|l| l.id.clone())
 }
 
 /// Resurrect a dead deployment row whose desired_state='active'. Returns
@@ -392,7 +445,7 @@ async fn respawn_dead_deployment(
 
 /// Minimal deployment row for the reconciler — pulls just what we need plus
 /// the new V90 `desired_state` column.
-#[derive(Debug, sqlx::FromRow)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 struct DeploymentRow {
     id: String,
     port: i32,
@@ -450,6 +503,56 @@ fn match_library_to_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn lib(id: &str, catalog_id: &str) -> ff_db::ModelLibraryRow {
+        ff_db::ModelLibraryRow {
+            id: id.to_string(),
+            worker_name: "duncan".to_string(),
+            catalog_id: catalog_id.to_string(),
+            runtime: "llama.cpp".to_string(),
+            quant: None,
+            file_path: format!("/home/duncan/models/{catalog_id}"),
+            size_bytes: 0,
+            sha256: None,
+            downloaded_at: chrono::Utc::now(),
+            last_used_at: None,
+            source_url: None,
+            pinned: false,
+        }
+    }
+
+    fn dead_row(catalog_id: Option<&str>) -> DeploymentRow {
+        DeploymentRow {
+            id: "11111111-1111-1111-1111-111111111111".to_string(),
+            port: 55000,
+            library_id: None,
+            catalog_id: catalog_id.map(str::to_string),
+            desired_state: "active".to_string(),
+            context_window: 32768,
+            parallel_slots: 1,
+        }
+    }
+
+    #[test]
+    fn recover_library_id_matches_by_catalog() {
+        let libs = vec![lib("aaaa", "gemma4-31b-it"), lib("bbbb", "qwen36-35b-a3b")];
+        // A dead row that still names its catalog model recovers the library_id
+        // of the worker's matching library row — respawn instead of reap.
+        let row = dead_row(Some("qwen36-35b-a3b"));
+        assert_eq!(recover_library_id(&row, &libs), Some("bbbb".to_string()));
+    }
+
+    #[test]
+    fn recover_library_id_none_without_catalog_or_match() {
+        let libs = vec![lib("aaaa", "gemma4-31b-it")];
+        // No catalog_id on the row → nothing to match on → reap.
+        assert_eq!(recover_library_id(&dead_row(None), &libs), None);
+        // catalog_id present but the worker has no library for it → reap.
+        assert_eq!(
+            recover_library_id(&dead_row(Some("qwen3-coder-30b")), &libs),
+            None
+        );
+    }
 
     #[test]
     fn unrespawnable_only_when_library_id_missing() {
