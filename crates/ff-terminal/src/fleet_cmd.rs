@@ -3326,6 +3326,7 @@ async fn handle_fleet_rollout(pool: &sqlx::PgPool, cmd: crate::RolloutCommand) -
             software,
             staged,
             canary,
+            stages: stage_pcts,
             failure_threshold_pct,
             dry_run,
         } => {
@@ -3356,7 +3357,17 @@ async fn handle_fleet_rollout(pool: &sqlx::PgPool, cmd: crate::RolloutCommand) -
                 );
             }
 
-            let stages = ff_agent::upgrade_rollout::plan_stages(&targets, canary);
+            // Phase 2: optional cumulative percentage stages (e.g. --stages 10,50,100).
+            // Empty/absent → canary + the rest (Phase 1 behaviour).
+            let pcts: Vec<u8> = stage_pcts
+                .as_deref()
+                .map(|s| {
+                    s.split(',')
+                        .filter_map(|p| p.trim().parse::<u8>().ok())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let stages = ff_agent::upgrade_rollout::plan_stages_pct(&targets, canary, &pcts);
             println!("{CYAN}▶ ff fleet rollout start {software} --staged{RESET}");
             println!("  software:          {software}");
             println!("  targets (non-leader): {}", targets.len());
