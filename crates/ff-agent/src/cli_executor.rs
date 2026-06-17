@@ -59,6 +59,13 @@ pub struct CliBackend {
     pub name: &'static str,
     /// Binary on PATH. Existence is checked before spawn.
     pub binary: &'static str,
+    /// Canonical local HTTP-bridge port (must match the `cli_backends` DB seed
+    /// in schema.rs). EXPLICIT — never derived from array position. The bridge
+    /// (`ff-gateway::cli_bridge`) used to assign `51100 + array_index`, which
+    /// silently cross-wired kimi/gemini when the array order diverged from the
+    /// DB seed (deep review 2026-06-17, conflict #8). Binding the port to the
+    /// backend makes array order irrelevant.
+    pub port: u16,
     /// Flags inserted between the binary and the user's prompt. Each
     /// vendor's "non-interactive, print-and-exit" mode lives here.
     pub default_flags: &'static [&'static str],
@@ -83,6 +90,7 @@ pub const BACKENDS: &[CliBackend] = &[
     CliBackend {
         name: "claude",
         binary: "claude",
+        port: 51100,
         // `-p` runs in print-mode (non-interactive); `--output-format
         // text` keeps stdout free of the agent-loop JSON envelope.
         default_flags: &["-p", "--output-format", "text"],
@@ -93,6 +101,7 @@ pub const BACKENDS: &[CliBackend] = &[
     CliBackend {
         name: "codex",
         binary: "codex",
+        port: 51101,
         // Codex `exec` is the headless equivalent. `--skip-git-repo-check`
         // lets it run outside a git repo (matches `ff cli` running anywhere).
         default_flags: &["exec", "--skip-git-repo-check"],
@@ -103,6 +112,7 @@ pub const BACKENDS: &[CliBackend] = &[
     CliBackend {
         name: "gemini",
         binary: "gemini",
+        port: 51103,
         // Gemini CLI's print-mode flag.
         default_flags: &["-p"],
         cwd_mode: CwdMode::ProcessOnly,
@@ -111,6 +121,7 @@ pub const BACKENDS: &[CliBackend] = &[
     CliBackend {
         name: "kimi",
         binary: "kimi",
+        port: 51102,
         // Kimi CLI (Moonshot) headless build form (verified against `kimi
         // --help` 2026-06-16): `--afk` runs the autonomous away-from-keyboard
         // mode (the old `--print` was NOT a full agent run), `--yolo`
@@ -127,6 +138,7 @@ pub const BACKENDS: &[CliBackend] = &[
         // No official xAI CLI today — the row is here for symmetry and
         // returns a clear "not installed" error until a `grok` binary ships.
         binary: "grok",
+        port: 51104,
         default_flags: &["-p"],
         cwd_mode: CwdMode::ProcessOnly,
         prompt_is_positional: true,
