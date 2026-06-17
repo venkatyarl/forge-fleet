@@ -934,6 +934,40 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         }));
     }
 
+    // 20b1) DSN-of-record cache-mirror tick — per-node, ONLY when the operator
+    // opted into HA Phase 3 DSN failover (`config.database.dsn_failover`). While
+    // Postgres is reachable, mirror the current DSN of record into this node's
+    // local cache (`~/.forgefleet/db_dsn_of_record`) so that — when the primary
+    // later MOVES and the static DSN goes dead — `create_pool_with_dsn_failover`
+    // (already wired at startup) has a last-known-good address to reconnect to.
+    // Not spawned at all by default (dsn_failover=false), so it is fully inert
+    // until an operator enables Phase 3. The connect-path read is itself fail-safe.
+    if config.database.dsn_failover
+        && let Some(pg_pool) = operational_store.pg_pool().cloned()
+    {
+        info!(
+            "starting subsystem: dsn-of-record cache-mirror tick (5min, per-node, dsn_failover opted in)"
+        );
+        let mut shutdown_rx_dsn = shutdown_rx.clone();
+        subsystem_tasks.push(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(300));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = shutdown_rx_dsn.changed() => break,
+                    _ = tick.tick() => {
+                        match ff_db::dsn_of_record::read_dsn_of_record(&pg_pool).await {
+                            Ok(Some(dsn)) => ff_core::db::write_dsn_cache(&dsn),
+                            Ok(None) => {}
+                            Err(e) => warn!(error = %e, "dsn-of-record cache-mirror read failed"),
+                        }
+                    }
+                }
+            }
+        }));
+    }
+
     // 20b2) Mesh-refresh tick — every 6h, leader-gated. Re-probes SSH-mesh pairs
     // whose stored status is stale so `fleet_ssh_mesh` reflects reality and the
     // integrity `mesh_ssh_complete` check stops reporting a FALSE failure forever
