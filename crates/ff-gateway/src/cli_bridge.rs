@@ -36,8 +36,11 @@ use tracing::{info, warn};
 /// binary isn't on PATH (no error, just a debug log).
 pub fn spawn_all_bridges() -> Vec<JoinHandle<()>> {
     let mut handles = Vec::new();
-    for (idx, backend) in BACKENDS.iter().enumerate() {
-        let port = 51100 + idx as u16;
+    for backend in BACKENDS.iter() {
+        // Explicit per-backend port (matches the cli_backends DB seed); never
+        // array-position-derived — that silently cross-wired kimi/gemini when
+        // the array order drifted from the seed (deep review conflict #8).
+        let port = backend.port;
         if !is_binary_on_path(backend.binary) {
             tracing::debug!(
                 backend = backend.name,
