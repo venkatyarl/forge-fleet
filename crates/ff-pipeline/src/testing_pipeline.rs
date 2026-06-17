@@ -116,7 +116,7 @@ async fn run_t1_fast_checks(repo_path: &str) -> TierResult {
 async fn run_t2_llm_judge(_repo_path: &str, _commit_sha: &str) -> TierResult {
     let start = std::time::Instant::now();
     // Placeholder: in production this would call the fleet LLM via
-    // ff_api::router or ff_agent::fleet_inference to score the diff.
+    // ff_api::router (the canonical DB-backed scorer) to score the diff.
     info!("T2 LLM-as-judge placeholder — would score diff here");
 
     TierResult {
