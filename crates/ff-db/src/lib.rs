@@ -181,6 +181,7 @@ pub use queries::{
     pg_pick_offload_endpoint,
     pg_placement_candidates,
     pg_promote_deferred,
+    pg_read_gate_value,
     pg_read_safety_gate,
     pg_reap_expired_leases,
     pg_reap_stale_reservations,

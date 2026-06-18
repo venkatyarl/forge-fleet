@@ -814,6 +814,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "dsn_of_record",
         sql: schema::SCHEMA_V136_DSN_OF_RECORD,
     },
+    PgMigration {
+        version: 137,
+        name: "gate_previous_value",
+        sql: schema::SCHEMA_V137_GATE_PREVIOUS_VALUE,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.

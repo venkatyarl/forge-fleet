@@ -1820,6 +1820,10 @@ pub async fn pg_set_secret(
          ON CONFLICT (key) DO UPDATE SET
             value = EXCLUDED.value,
             description = COALESCE(EXCLUDED.description, fleet_secrets.description),
+            -- an explicit operator set clears any temporary disable-gate state
+            -- so a stale TTL/snapshot can never auto-restore over it (V137).
+            expires_at = NULL,
+            previous_value = NULL,
             updated_at = NOW(),
             updated_by = EXCLUDED.updated_by",
     )
@@ -1912,11 +1916,20 @@ pub async fn pg_disable_safety_gate(
     expires_at: chrono::DateTime<chrono::Utc>,
     updated_by: Option<&str>,
 ) -> Result<()> {
+    // Snapshot the value the gate held BEFORE disabling into `previous_value`,
+    // so TTL-expiry can restore the exact prior value — a boolean `on` OR a
+    // 3-state mode `active`/`dry-run` (V137; 3-way consensus). Only snapshot a
+    // real prior value (not the disabled sentinel itself) so a double-disable
+    // doesn't clobber the original with 'false'.
     sqlx::query(
         "INSERT INTO fleet_secrets
             (key, value, expires_at, disabled_reason, updated_at, updated_by)
          VALUES ($1, 'false', $2, $3, NOW(), $4)
          ON CONFLICT (key) DO UPDATE SET
+            previous_value = COALESCE(
+                NULLIF(fleet_secrets.value, 'false'),
+                fleet_secrets.previous_value
+            ),
             value = 'false',
             expires_at = EXCLUDED.expires_at,
             disabled_reason = EXCLUDED.disabled_reason,
@@ -1930,6 +1943,62 @@ pub async fn pg_disable_safety_gate(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// TTL-aware gate reader returning the raw string value (works for boolean
+/// kill-switches AND 3-state mode gates). Resolution:
+///   - missing row                                  → `default_when_missing`
+///   - value is not the disabled sentinel `false`   → the value as-is
+///   - value `false` + `expires_at` in the past     → restore `previous_value`
+///       (or `restore_when_expired` if none), best-effort writing it back so the
+///       restore is durable and not recomputed on every read
+///   - value `false`, no/future `expires_at`        → `false` (still disabled)
+///
+/// This is the string-typed sibling of [`pg_read_safety_gate`]; mode gates call
+/// it so a temporary `ff secrets disable-gate` on e.g. `autoscaler_mode=active`
+/// auto-restores to `active` at expiry instead of being stuck off.
+pub async fn pg_read_gate_value(
+    pool: &PgPool,
+    key: &str,
+    default_when_missing: &str,
+    restore_when_expired: &str,
+) -> Result<String> {
+    let row =
+        sqlx::query("SELECT value, expires_at, previous_value FROM fleet_secrets WHERE key = $1")
+            .bind(key)
+            .fetch_optional(pool)
+            .await?;
+
+    let Some(row) = row else {
+        return Ok(default_when_missing.to_string());
+    };
+    let value: String = row.get("value");
+    let expires_at: Option<chrono::DateTime<chrono::Utc>> = row.try_get("expires_at").ok();
+    let previous_value: Option<String> = row.try_get("previous_value").unwrap_or(None);
+
+    let is_disabled_sentinel = value.trim().eq_ignore_ascii_case("false");
+    if is_disabled_sentinel
+        && let Some(exp) = expires_at
+        && exp < chrono::Utc::now()
+    {
+        let restored = previous_value
+            .clone()
+            .unwrap_or_else(|| restore_when_expired.to_string());
+        // Best-effort: write the restored value back and clear the TTL so the
+        // restore is durable (and not re-applied on every read).
+        let _ = sqlx::query(
+            "UPDATE fleet_secrets
+                SET value = $2, expires_at = NULL, previous_value = NULL, updated_at = NOW()
+              WHERE key = $1",
+        )
+        .bind(key)
+        .bind(&restored)
+        .execute(pool)
+        .await;
+        tracing::warn!(key = %key, restored = %restored, "gate TTL expired — restored prior value");
+        return Ok(restored);
+    }
+    Ok(value)
 }
 
 // ─── Model Lifecycle ───────────────────────────────────────────────────────

@@ -155,8 +155,8 @@ impl AutoscalerMode {
 /// Read the gate from `fleet_secrets`. DEFAULTS TO OFF when the key is missing or
 /// unparseable — so shipping this subsystem is harmless until an operator opts in.
 async fn read_mode(pg: &PgPool) -> AutoscalerMode {
-    match ff_db::pg_get_secret(pg, AUTOSCALER_MODE_KEY).await {
-        Ok(v) => AutoscalerMode::parse(v.as_deref()),
+    match ff_db::pg_read_gate_value(pg, AUTOSCALER_MODE_KEY, "off", "off").await {
+        Ok(v) => AutoscalerMode::parse(Some(v.as_str())),
         Err(e) => {
             warn!(error = %e, "autoscaler: failed to read mode secret; treating as off");
             AutoscalerMode::Off

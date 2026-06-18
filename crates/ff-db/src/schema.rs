@@ -8816,3 +8816,13 @@ CREATE TABLE IF NOT EXISTS dsn_of_record (
     updated_by      TEXT
 );
 "#;
+
+/// V137: gate-TTL restore. `previous_value` snapshots the value a gate held
+/// before a temporary `ff secrets disable-gate`, so TTL-expiry can restore the
+/// EXACT prior value — a boolean `on` OR a 3-state mode `active`/`dry-run` —
+/// instead of the old boolean-only restore that clobbered mode gates
+/// (3-way consensus 2026-06-18; deep review conflict #9). Cleared on a normal
+/// non-TTL `ff secrets set` so a stale snapshot is never restored.
+pub const SCHEMA_V137_GATE_PREVIOUS_VALUE: &str = r#"
+ALTER TABLE fleet_secrets ADD COLUMN IF NOT EXISTS previous_value TEXT;
+"#;

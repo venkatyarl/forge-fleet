@@ -183,8 +183,8 @@ pub fn decide_stage(
 
 /// Read the gate. Unreadable secret → `Off` (fail-safe), logged once.
 async fn read_mode(pg: &PgPool) -> RolloutMode {
-    match ff_db::pg_get_secret(pg, STAGED_ROLLOUT_MODE_KEY).await {
-        Ok(v) => RolloutMode::parse(v.as_deref()),
+    match ff_db::pg_read_gate_value(pg, STAGED_ROLLOUT_MODE_KEY, "off", "off").await {
+        Ok(v) => RolloutMode::parse(Some(v.as_str())),
         Err(e) => {
             warn!(error = %e, "staged-rollout: gate read failed; treating as off");
             RolloutMode::Off

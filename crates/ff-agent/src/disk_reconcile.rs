@@ -70,8 +70,8 @@ impl DiskPolicyMode {
 /// Read the gate from `fleet_secrets`. DEFAULTS TO OFF when missing/unparseable —
 /// shipping this subsystem is harmless until an operator opts in.
 async fn read_mode(pg: &PgPool) -> DiskPolicyMode {
-    match ff_db::pg_get_secret(pg, DISK_POLICY_MODE_KEY).await {
-        Ok(v) => DiskPolicyMode::parse(v.as_deref()),
+    match ff_db::pg_read_gate_value(pg, DISK_POLICY_MODE_KEY, "off", "off").await {
+        Ok(v) => DiskPolicyMode::parse(Some(v.as_str())),
         Err(e) => {
             warn!(error = %e, "disk-reconcile: failed to read mode secret; treating as off");
             DiskPolicyMode::Off

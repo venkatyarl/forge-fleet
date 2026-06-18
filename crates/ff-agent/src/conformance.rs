@@ -87,8 +87,8 @@ impl ConformanceMode {
 /// or unparseable — so shipping this subsystem is harmless until an operator
 /// opts in.
 async fn read_mode(pg: &PgPool) -> ConformanceMode {
-    match ff_db::pg_get_secret(pg, CONFORMANCE_MODE_KEY).await {
-        Ok(v) => ConformanceMode::parse(v.as_deref()),
+    match ff_db::pg_read_gate_value(pg, CONFORMANCE_MODE_KEY, "off", "off").await {
+        Ok(v) => ConformanceMode::parse(Some(v.as_str())),
         Err(e) => {
             warn!(error = %e, "conformance: failed to read mode secret; treating as off");
             ConformanceMode::Off
