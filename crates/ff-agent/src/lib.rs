@@ -53,7 +53,6 @@ pub mod features;
 pub mod file_history;
 pub mod fleet_events;
 pub mod fleet_events_nats;
-pub mod fleet_inference;
 pub mod fleet_info;
 pub mod fleet_integrity;
 pub mod focus_stack;
