@@ -87,8 +87,11 @@ impl ModelUpstreamChecker {
     pub async fn check_all(&self) -> Result<UpstreamReport, ModelUpstreamError> {
         let http = &self.client;
 
-        // Optional HF token for gated repos / higher rate limit.
-        let hf_token = ff_db::pg_get_secret(&self.pg, "huggingface_api_token")
+        // Optional HF token for gated repos / higher rate limit. Canonical key
+        // is `huggingface.token` (what `ff secrets set` writes); the old
+        // `huggingface_api_token` key was never set by operators → ran
+        // unauthenticated (deep review gap #9).
+        let hf_token = ff_db::pg_get_secret(&self.pg, "huggingface.token")
             .await
             .unwrap_or(None);
 

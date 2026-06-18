@@ -104,7 +104,11 @@ impl ModelScout {
     pub async fn scout_once(&self) -> Result<ScoutReport, ScoutError> {
         let http = &self.client;
 
-        let hf_token = ff_db::pg_get_secret(&self.pg, "huggingface_api_token")
+        // Canonical key is `huggingface.token` (what `ff secrets set` writes and
+        // get_hf_token reads). Scout previously read `huggingface_api_token`, a
+        // different key operators never set → scout ran UNauthenticated against
+        // HF (deep review gap #9).
+        let hf_token = ff_db::pg_get_secret(&self.pg, "huggingface.token")
             .await
             .unwrap_or(None);
 
