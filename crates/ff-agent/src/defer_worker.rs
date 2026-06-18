@@ -16,17 +16,20 @@
 //!
 //! ## Scope
 //!
-//! Handles the three task kinds that account for ~99% of fleet traffic:
+//! Handles the task kinds that account for ~99% of fleet traffic:
 //!
-//!   - `shell`    — run a command, optionally on a remote node via SSH
-//!   - `http`     — POST/GET to a URL (used by webhook integrations)
-//!   - `upgrade`  — look up the `upgrade_playbook` for a software entry and
-//!                  execute it via shell on the target node
+//!   - `shell`      — run a command, optionally on a remote node via SSH
+//!   - `http`       — POST/GET to a URL (used by webhook integrations)
+//!   - `upgrade`    — look up the `upgrade_playbook` for a software entry and
+//!                    execute it via shell on the target node
+//!   - `internal`   — ForgeFleet-internal tasks dispatched by title (today: SSH
+//!                    mesh propagation)
+//!   - `mesh_retry` — re-probe a single (src,dst) mesh pair, refresh status
 //!
-//! Other task kinds (`internal`, `mesh_retry`, etc.) are logged and left
-//! pending so the legacy `ff daemon` CLI (or a future extension here) can
-//! pick them up. They're rare enough that this trade-off is acceptable
-//! for the fix that unblocks fleet ops today.
+//! `internal` + `mesh_retry` were ported from the legacy `ff daemon` (decision-2
+//! Phase A1 of retiring it) so forgefleetd no longer strands them. The
+//! auto_upgrade/external_tool post-completion finalizers remain a follow-up —
+//! they hook the task-finish path rather than the kind dispatch.
 
 use std::process::Stdio;
 use std::sync::Arc;
@@ -210,6 +213,65 @@ async fn execute(
                 );
             };
             execute_shell(task.preferred_node.as_deref(), &script, nodes, max_duration).await
+        }
+        "internal" => {
+            // ForgeFleet-internal tasks dispatched by title. Ported from the
+            // legacy `ff daemon` (decision-2 Phase A1) so forgefleetd no longer
+            // strands `internal` deferred work. Today: SSH mesh propagation.
+            if task.title.starts_with("Mesh propagate SSH for ") {
+                match crate::fleet_info::get_fleet_pool().await {
+                    Ok(pool) => match crate::mesh_check::mesh_propagate(&pool, &task.payload).await
+                    {
+                        Ok((ok, fail)) => {
+                            let result = serde_json::json!({"ok_peers": ok, "failed_peers": fail});
+                            let success = fail == 0;
+                            let err = if success {
+                                None
+                            } else {
+                                Some(format!("{fail} peer(s) failed"))
+                            };
+                            (success, Some(result), err)
+                        }
+                        Err(e) => (false, None, Some(format!("mesh_propagate: {e}"))),
+                    },
+                    Err(e) => (false, None, Some(format!("pool: {e}"))),
+                }
+            } else {
+                (
+                    false,
+                    None,
+                    Some(format!("unknown internal task title: {}", task.title)),
+                )
+            }
+        }
+        "mesh_retry" => {
+            // Re-probe a specific (src,dst) pair and refresh fleet_mesh_status.
+            // Ported from the legacy `ff daemon` (decision-2 Phase A1).
+            let src = task
+                .payload
+                .get("src")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let dst = task
+                .payload
+                .get("dst")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if src.is_empty() || dst.is_empty() {
+                return (false, None, Some("mesh_retry payload needs src+dst".into()));
+            }
+            match crate::fleet_info::get_fleet_pool().await {
+                Ok(pool) => match crate::mesh_check::probe_single_pair(&pool, src, dst).await {
+                    Ok(cell) => {
+                        let ok = cell.status == "ok";
+                        let result =
+                            serde_json::json!({"status": cell.status, "error": cell.last_error});
+                        (ok, Some(result), if ok { None } else { cell.last_error })
+                    }
+                    Err(e) => (false, None, Some(format!("probe: {e}"))),
+                },
+                Err(e) => (false, None, Some(format!("pool: {e}"))),
+            }
         }
         other => {
             // Unsupported kinds — leave for the legacy `ff daemon` CLI to
