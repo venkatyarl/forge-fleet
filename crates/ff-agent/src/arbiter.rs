@@ -68,8 +68,8 @@ impl ArbiterMode {
 /// or unparseable — so shipping this subsystem is harmless until an operator
 /// opts in. Mirrors `autoscaler::read_mode`.
 pub async fn read_mode(pg: &PgPool) -> ArbiterMode {
-    match ff_db::pg_get_secret(pg, ARBITER_MODE_KEY).await {
-        Ok(v) => ArbiterMode::parse(v.as_deref()),
+    match ff_db::pg_read_gate_value(pg, ARBITER_MODE_KEY, "off", "off").await {
+        Ok(v) => ArbiterMode::parse(Some(v.as_str())),
         Err(e) => {
             warn!(error = %e, "arbiter: failed to read mode secret; treating as off");
             ArbiterMode::Off
