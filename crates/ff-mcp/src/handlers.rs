@@ -1460,6 +1460,20 @@ pub async fn fleet_scan(params: Option<Value>) -> HandlerResult {
         }
         "full" => {
             let (config, config_path) = load_config_auto()?;
+            // Gate the heavy subnet sweep behind the SAME flag the daemon uses
+            // (discovery.subnet_scan_enabled, default off). Ungated, any MCP
+            // client could trigger the full scan that caused the 130% CPU
+            // incident (deep review gap #10; subnet_scan_disabled memory).
+            // mode=known (config-targeted) stays open.
+            if !config.discovery.subnet_scan_enabled {
+                return Err(
+                    "fleet_scan(mode=full) is disabled: discovery.subnet_scan_enabled=false. \
+                     The full subnet sweep is heavy (it caused a 130% CPU incident) and is gated \
+                     like the daemon's scan. Use mode=known, or enable \
+                     discovery.subnet_scan_enabled to allow the full scan."
+                        .to_string(),
+                );
+            }
             let mut scanner_cfg = ScannerConfig::default();
             if let Some(subnet) = params
                 .as_ref()
