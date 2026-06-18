@@ -1963,12 +1963,11 @@ pub async fn pg_read_gate_value(
     default_when_missing: &str,
     restore_when_expired: &str,
 ) -> Result<String> {
-    let row = sqlx::query(
-        "SELECT value, expires_at, previous_value FROM fleet_secrets WHERE key = $1",
-    )
-    .bind(key)
-    .fetch_optional(pool)
-    .await?;
+    let row =
+        sqlx::query("SELECT value, expires_at, previous_value FROM fleet_secrets WHERE key = $1")
+            .bind(key)
+            .fetch_optional(pool)
+            .await?;
 
     let Some(row) = row else {
         return Ok(default_when_missing.to_string());
