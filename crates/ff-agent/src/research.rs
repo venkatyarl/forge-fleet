@@ -636,6 +636,32 @@ impl ResearchSession {
         .await
         .context("mark session done")?;
 
+        // Log the research turn to ff_interactions (the ff-LLM training corpus).
+        // The headline signal — query → web-grounded multi-step synthesis —
+        // otherwise lived ONLY in research_findings/sessions, invisible to ff's
+        // own training data (the same gap closed for council #442 / dispatch
+        // #430). Best-effort: a log failure never fails the research run.
+        let outcome = if failed > 0 && succeeded == 0 {
+            "error"
+        } else {
+            "success"
+        };
+        let rec = ff_db::InteractionRecord {
+            channel: "research".to_string(),
+            request_text: self.config.query.chars().take(16000).collect(),
+            engine: Some(self.config.planner_model.clone()),
+            response_text: markdown.chars().take(16000).collect(),
+            tokens_in: i32::try_from(total_tokens_in).unwrap_or(0),
+            tokens_out: i32::try_from(total_tokens_out).unwrap_or(0),
+            latency_ms: i32::try_from(duration_ms).ok(),
+            outcome: outcome.to_string(),
+            endpoint: Some(self.config.gateway_url.clone()),
+            ..Default::default()
+        };
+        if let Err(e) = ff_db::pg_record_interaction(&self.pool, &rec).await {
+            tracing::warn!(error = %e, "research: failed to log interaction (non-fatal)");
+        }
+
         // Write the report to disk if an output path was provided.
         if let Some(path) = &self.config.output_path {
             if let Some(parent) = path.parent() {
