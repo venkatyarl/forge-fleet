@@ -53,7 +53,10 @@ pub async fn fleet_oneshot(
         // lingering as 'healthy' with a stale heartbeat (the priya-wedge class).
         max_health_age_sec: Some(180),
         prefer_least_loaded: true,
-        limit: 8,
+        // With a model hint, widen the candidate set so the match isn't truncated:
+        // the best-scored top-8 may not include the requested model (e.g. a lower-
+        // tier coder deployment), and we'd silently fall back. No hint → top-8.
+        limit: if model_hint.is_some() { 64 } else { 8 },
     };
     let candidates = pg_route_deployments(pool, &filter)
         .await
@@ -115,8 +118,11 @@ pub async fn fleet_oneshot(
     })
 }
 
-/// Choose a candidate: the first whose catalog name contains `model_hint`
+/// Choose a candidate: the first whose catalog id OR name contains `model_hint`
 /// (case-insensitive), else the best-scored one (candidates are pre-sorted).
+/// Matching both fields means `local:qwen3-coder` hits a deployment whose
+/// catalog_id is `qwen3-coder-30b` even when the display name is spelled
+/// differently.
 fn pick_candidate<'a>(
     candidates: &'a [RouteCandidate],
     model_hint: Option<&str>,
@@ -125,10 +131,12 @@ fn pick_candidate<'a>(
         .map(|h| h.to_lowercase())
         .filter(|h| !h.is_empty())
         && let Some(c) = candidates.iter().find(|c| {
-            c.catalog_name
-                .as_deref()
-                .map(|n| n.to_lowercase().contains(&hint))
-                .unwrap_or(false)
+            let hay = |s: &Option<String>| {
+                s.as_deref()
+                    .map(|v| v.to_lowercase().contains(&hint))
+                    .unwrap_or(false)
+            };
+            hay(&c.catalog_id) || hay(&c.catalog_name)
         })
     {
         return c;
