@@ -25,6 +25,7 @@ pub async fn handle_cli(
     cwd: Option<PathBuf>,
     output: String,
     timeout_secs: Option<u64>,
+    require_change: bool,
 ) -> Result<()> {
     let output = output.to_lowercase();
     if output != "text" && output != "json" {
@@ -39,6 +40,9 @@ pub async fn handle_cli(
     if !work_dir.is_dir() {
         anyhow::bail!("--cwd `{}` is not a directory", work_dir.display());
     }
+    // Fingerprint the working tree so we can tell whether the vendor actually
+    // changed anything (catches the silent "exit 0, wrote nothing" failure).
+    let fingerprint_before = git_dirty_fingerprint(&work_dir);
 
     // Validate the vendor up front so we can print a helpful, vendor-aware
     // error listing which CLIs ARE installed on this machine.
@@ -93,6 +97,16 @@ pub async fn handle_cli(
     let result =
         execute_cli_in_dir(&vendor, &prompt, &[], Some(work_dir.as_path()), timeout).await?;
 
+    // Did the vendor actually change any files? `None` = not a git repo (can't
+    // tell → assume it did, to avoid false alarms). `Some(false)` = exit 0 but
+    // the working tree is byte-for-byte unchanged.
+    let fingerprint_after = git_dirty_fingerprint(&work_dir);
+    let made_changes: Option<bool> = match (&fingerprint_before, &fingerprint_after) {
+        (Some(b), Some(a)) => Some(b != a),
+        _ => None,
+    };
+    let silent_noop = result.exit_code == 0 && made_changes == Some(false);
+
     if output == "json" {
         // Compact, machine-readable envelope for JARVIS / scripted callers.
         let json = serde_json::json!({
@@ -102,6 +116,8 @@ pub async fn handle_cli(
             "output": result.stdout,
             "stderr": result.stderr,
             "duration_ms": result.duration_ms,
+            // null when cwd isn't a git repo (undeterminable).
+            "made_file_changes": made_changes,
         });
         println!("{}", serde_json::to_string_pretty(&json)?);
     } else {
@@ -121,9 +137,52 @@ pub async fn handle_cli(
         }
     }
 
-    // Mirror the vendor CLI's exit status so scripts/JARVIS can branch on it.
+    // Warn loudly on the silent no-op (exit 0 but wrote nothing) — the classic
+    // "codex stdin consumed by a pipe" / no-op-prompt failure. Visible in both
+    // modes so a human or a scripted caller notices.
+    if silent_noop {
+        eprintln!(
+            "{YELLOW}⚠ {vendor} exited 0 but made NO file change in {}{RESET} — the prompt may \
+             have been a no-op, or the vendor's stdin was consumed by a downstream pipe \
+             (do not pipe `ff cli {vendor}` stdout into a reader). Use `--require-change` to \
+             treat this as a failure.",
+            work_dir.display()
+        );
+    }
+
+    // Mirror the vendor CLI's exit status so scripts/JARVIS can branch on it;
+    // with --require-change, a silent no-op also fails (exit 3).
     if result.exit_code != 0 {
         std::process::exit(result.exit_code as i32);
     }
+    if require_change && silent_noop {
+        std::process::exit(3);
+    }
     Ok(())
+}
+
+/// `git status --porcelain` (+ HEAD sha) of `dir`, or `None` when `dir` isn't a
+/// git work tree. Used to detect whether a vendor CLI changed any files.
+fn git_dirty_fingerprint(dir: &std::path::Path) -> Option<String> {
+    let porcelain = std::process::Command::new("git")
+        .args(["-C"])
+        .arg(dir)
+        .args(["status", "--porcelain"])
+        .output()
+        .ok()?;
+    if !porcelain.status.success() {
+        return None; // not a git repo
+    }
+    let head = std::process::Command::new("git")
+        .args(["-C"])
+        .arg(dir)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    Some(format!(
+        "{head}\n{}",
+        String::from_utf8_lossy(&porcelain.stdout)
+    ))
 }
