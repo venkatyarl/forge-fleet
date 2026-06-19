@@ -108,10 +108,19 @@ impl UpstreamChecker {
     pub async fn check_all(&self) -> Result<CheckReport, UpstreamError> {
         let http = &self.client;
 
-        // Pick up the optional GitHub PAT for higher rate limits.
-        let github_token = ff_db::pg_get_secret(&self.pg, "github.venkat_pat")
+        // GitHub token for the API calls. The forge-fleet repo is PRIVATE, so
+        // reading its `main` HEAD (ref_kind=main) REQUIRES auth — without it the
+        // call 403s and latest_version never advances (perpetual false "drift").
+        // Prefer the `github.venkat_pat` secret; fall back to the locally
+        // authenticated `gh` CLI's token (the same auth the fleet uses for
+        // `gh pr` operations), so no PAT secret needs to be provisioned.
+        let github_token = match ff_db::pg_get_secret(&self.pg, "github.venkat_pat")
             .await
-            .unwrap_or(None);
+            .unwrap_or(None)
+        {
+            Some(t) if !t.trim().is_empty() => Some(t),
+            _ => gh_cli_auth_token(),
+        };
 
         // Pull every software_registry row. We deliberately do not filter
         // here — `skipped` rows are fine; the report reflects that.
@@ -320,6 +329,21 @@ async fn query_self_built(pool: &PgPool, id: &str) -> UpstreamResult {
         Some(v) if !v.is_empty() => UpstreamResult::Version(v),
         _ => UpstreamResult::Skipped("no leader install recorded yet".into()),
     }
+}
+
+/// The locally-authenticated `gh` CLI's token, if available. Lets check-upstream
+/// read the PRIVATE forge-fleet repo without a provisioned `github.venkat_pat`
+/// secret — reusing the auth the fleet already has for `gh pr` operations.
+fn gh_cli_auth_token() -> Option<String> {
+    let out = std::process::Command::new("gh")
+        .args(["auth", "token"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let t = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if t.is_empty() { None } else { Some(t) }
 }
 
 /// Dispatch one row based on its `version_source.method`.
