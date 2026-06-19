@@ -241,6 +241,20 @@ pub async fn execute_cli_in_dir(
     cmd.args(passthrough_args);
     cmd.arg(prompt);
     cmd.kill_on_drop(true);
+    // Detach stdin. The prompt is passed as an ARG (never stdin), so a vendor CLI
+    // has no reason to read stdin — but if it inherits the parent's stdin it can
+    // BLOCK on a read (or contend for it when several CLIs run in parallel under
+    // one `ff` process, e.g. `ff council`). That presents as a "wedge" that only
+    // ends at the timeout. Null stdin → any read returns EOF and the CLI proceeds.
+    // (Four other ff-agent spawn sites already do this; this one was the outlier.)
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    // Put the child in its own process group so a timeout can kill the WHOLE tree
+    // (the vendor CLI plus any model-call / auth subprocesses it forks). Killing
+    // just the direct child via kill_on_drop leaves grandchildren orphaned.
+    #[cfg(unix)]
+    cmd.process_group(0);
 
     debug!(
         backend = cfg.name,
@@ -253,14 +267,34 @@ pub async fn execute_cli_in_dir(
 
     let start = std::time::Instant::now();
     let timeout = timeout.unwrap_or(DEFAULT_TIMEOUT);
-    let out = match tokio::time::timeout(timeout, cmd.output()).await {
+    let child = cmd
+        .spawn()
+        .map_err(|e| anyhow!("spawn `{}` failed: {e}", bin_path))?;
+    // Capture the pid before the wait future takes ownership — we need it to kill
+    // the process group if the call times out.
+    let child_pid = child.id();
+    let out = match tokio::time::timeout(timeout, child.wait_with_output()).await {
         Ok(Ok(o)) => o,
         Ok(Err(e)) => {
-            return Err(anyhow!("spawn `{}` failed: {e}", bin_path));
+            return Err(anyhow!("wait `{}` failed: {e}", bin_path));
         }
         Err(_) => {
+            // Timed out. kill_on_drop reaps the direct child when the future
+            // drops; additionally SIGKILL the whole process group so any
+            // subprocess the CLI forked dies too (no orphans holding the GPU/cred
+            // file). pgid == child pid because we spawned it as a group leader.
+            #[cfg(unix)]
+            if let Some(pid) = child_pid {
+                // Safety: killpg is async-signal-safe and we only pass a pid we own.
+                unsafe {
+                    libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+                }
+            }
+            let _ = child_pid; // used only on unix
             return Err(anyhow!(
-                "backend '{}' exceeded {}s timeout — wedged CLI; consider raising timeout or killing the cred file refresh loop",
+                "backend '{}' exceeded {}s timeout — killed the CLI process group. \
+                 The prompt may be too large for the model, the endpoint may be down, \
+                 or the run legitimately needs more time (raise --timeout).",
                 cfg.name,
                 timeout.as_secs()
             ));
