@@ -710,6 +710,21 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         ));
     }
 
+    // 15d) Pillar 4 merge-queue drain — every 30s, leader-gated.
+    // Closes the loop: drains work_item_merge_queue one PR/project at a time,
+    // waits its CI green, `gh pr merge --squash --delete-branch`, marks merged.
+    if let Some(pg_pool) = operational_store.pg_pool().cloned() {
+        info!("starting subsystem: work_item merge drain (30s, leader-gated)");
+        subsystem_tasks.push(
+            ff_agent::work_item_merge_drain::spawn_work_item_merge_drain(
+                pg_pool,
+                worker_name.clone(),
+                30,
+                shutdown_rx.clone(),
+            ),
+        );
+    }
+
     // 16) Procedural memory consolidation — every 6h, leader-gated.
     // Phase 14: scans completed sessions, extracts successful patterns into agent_procedures.
     if let Some(pg_pool) = operational_store.pg_pool().cloned() {
