@@ -855,6 +855,154 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         ));
     }
 
+    // 19b) Fleet task liveness watchdog — every 60s, PER-NODE.
+    //
+    // Restores the legacy-only actuating liveness loop from `ff daemon`: each
+    // node probes and evaluates only the tasks currently running on itself.
+    // Dead/stuck tasks are audited, fed into the host circuit breaker, and may
+    // notify the operator according to the failure taxonomy policy.
+    if let Some(pg_pool) = operational_store.pg_pool().cloned() {
+        info!("starting subsystem: fleet task liveness watchdog (60s, per-node)");
+        let name = worker_name.clone();
+        let mut shutdown_rx_liveness = shutdown_rx.clone();
+        subsystem_tasks.push(tokio::spawn(async move {
+            #[derive(sqlx::FromRow)]
+            struct RunningTaskRow {
+                id: uuid::Uuid,
+                kind: String,
+            }
+
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = shutdown_rx_liveness.changed() => break,
+                    _ = tick.tick() => {
+                        match ff_agent::task_probe::probe_all_running(&pg_pool, &name).await {
+                            Ok(n) if n > 0 => tracing::debug!(
+                                node = %name,
+                                probed = n,
+                                "fleet task liveness probes written"
+                            ),
+                            Ok(_) => {}
+                            Err(e) => warn!(node = %name, error = %e, "fleet task liveness probe failed"),
+                        }
+
+                        let running: std::result::Result<Vec<RunningTaskRow>, _> = sqlx::query_as(
+                            "SELECT t.id, t.kind
+                               FROM fleet_tasks t
+                               JOIN computers c ON c.id = t.claimed_by_computer_id
+                              WHERE c.name = $1
+                                AND t.status = 'running'",
+                        )
+                        .bind(&name)
+                        .fetch_all(&pg_pool)
+                        .await;
+
+                        let rows = match running {
+                            Ok(rows) => rows,
+                            Err(e) => {
+                                warn!(node = %name, error = %e, "fleet task liveness query failed");
+                                continue;
+                            }
+                        };
+
+                        for row in rows {
+                            let state = match ff_agent::watchdog::evaluate_task(&pg_pool, row.id, 600).await {
+                                Ok(state) => state,
+                                Err(e) => {
+                                    warn!(
+                                        task_id = %row.id,
+                                        node = %name,
+                                        error = %e,
+                                        "fleet task liveness evaluation failed"
+                                    );
+                                    continue;
+                                }
+                            };
+
+                            let category = match state {
+                                ff_agent::watchdog::TaskLiveness::Dead => "dead_zombie",
+                                ff_agent::watchdog::TaskLiveness::Stuck => "genuinely_stuck",
+                                _ => continue,
+                            };
+
+                            warn!(
+                                task_id = %row.id,
+                                node = %name,
+                                kind = %row.kind,
+                                category,
+                                "fleet task liveness watchdog classified task as unhealthy"
+                            );
+
+                            if let Err(e) = sqlx::query(
+                                "INSERT INTO task_failures (task_id, category, attempt, action_taken)
+                                 VALUES ($1, $2, 0, 'liveness_kill')",
+                            )
+                            .bind(row.id)
+                            .bind(category)
+                            .execute(&pg_pool)
+                            .await
+                            {
+                                warn!(
+                                    task_id = %row.id,
+                                    node = %name,
+                                    category,
+                                    error = %e,
+                                    "fleet task liveness watchdog failed to record task failure"
+                                );
+                            }
+
+                            let tripped = ff_agent::circuit_breaker::record_failure(
+                                &pg_pool,
+                                &name,
+                                category,
+                            )
+                            .await
+                            .unwrap_or(false);
+                            if tripped {
+                                warn!(
+                                    node = %name,
+                                    category,
+                                    "fleet task liveness watchdog tripped host circuit breaker"
+                                );
+                            }
+
+                            let should_notify =
+                                ff_agent::notification::should_notify(&pg_pool, &name, category)
+                                    .await
+                                    .unwrap_or(false);
+                            if should_notify {
+                                let _ = ff_agent::telegram::send_telegram_from_secrets(
+                                    &pg_pool,
+                                    &format!("ff liveness: {category}"),
+                                    &format!(
+                                        "Task {} on {} marked {category}. Circuit breaker {}.",
+                                        row.id,
+                                        name,
+                                        if tripped { "TRIPPED" } else { "still closed" },
+                                    ),
+                                )
+                                .await;
+                                let _ = ff_agent::notification::record_notification(
+                                    &pg_pool,
+                                    Some(row.id),
+                                    category,
+                                    serde_json::json!({
+                                        "worker": &name,
+                                        "circuit_tripped": tripped,
+                                    }),
+                                )
+                                .await;
+                            }
+                        }
+                    }
+                }
+            }
+        }));
+    }
+
     // 20) Disk sampler tick — every 5min, PER-NODE (not leader-gated).
     //
     // Historically the disk sampler ran ONLY in the legacy `ff daemon`
@@ -984,6 +1132,274 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
             12,
             shutdown_rx.clone(),
         ));
+    }
+
+    // 20b3) SSH mesh auto-repair tick — every 10min, leader-gated.
+    //
+    // Restores the legacy-only repair dispatcher. The leader finds failed mesh
+    // pairs with repeated failures and enqueues the same repair command an
+    // operator would run by hand.
+    if let Some(pg_pool) = operational_store.pg_pool().cloned() {
+        info!("starting subsystem: ssh mesh auto-repair tick (10min, leader-gated)");
+        let name = worker_name.clone();
+        let mut shutdown_rx_mesh_repair = shutdown_rx.clone();
+        subsystem_tasks.push(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(10 * 60));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = shutdown_rx_mesh_repair.changed() => break,
+                    _ = tick.tick() => {
+                        let is_leader: bool = sqlx::query_scalar(
+                            r#"
+                            SELECT EXISTS (
+                                SELECT 1 FROM fleet_leader_state
+                                WHERE member_name = $1
+                                  AND heartbeat_at > NOW() - INTERVAL '60 seconds'
+                            )
+                            "#,
+                        )
+                        .bind(&name)
+                        .fetch_one(&pg_pool)
+                        .await
+                        .unwrap_or(false);
+                        if !is_leader {
+                            continue;
+                        }
+
+                        let bad: std::result::Result<Option<(String, String, i32)>, _> = sqlx::query_as(
+                            "SELECT src_node, dst_node, attempts
+                               FROM fleet_mesh_status
+                              WHERE status = 'failed'
+                                AND attempts >= 3
+                              ORDER BY attempts DESC, last_checked ASC NULLS FIRST
+                              LIMIT 1",
+                        )
+                        .fetch_optional(&pg_pool)
+                        .await;
+
+                        match bad {
+                            Ok(Some((src, dst, attempts))) => {
+                                info!(
+                                    src = %src,
+                                    dst = %dst,
+                                    attempts,
+                                    "dispatching ssh mesh auto-repair"
+                                );
+                                let command = format!(
+                                    "ff fleet ssh-mesh-check --node {} --repair --yes 2>&1 | tail -10",
+                                    dst
+                                );
+                                if let Err(e) = ff_agent::task_runner::pg_enqueue_shell_task(
+                                    &pg_pool,
+                                    &format!("auto-mesh-repair: {} -> {}", src, dst),
+                                    &command,
+                                    &["ff".to_string()],
+                                    Some(&name),
+                                    None,
+                                    50,
+                                    None,
+                                )
+                                .await
+                                {
+                                    warn!(
+                                        src = %src,
+                                        dst = %dst,
+                                        error = %e,
+                                        "failed to enqueue ssh mesh auto-repair task"
+                                    );
+                                }
+                                let _ = ff_agent::telegram::send_telegram_from_secrets(
+                                    &pg_pool,
+                                    "SSH mesh auto-repair",
+                                    &format!("Repair dispatched: {} -> {} (attempts={})", src, dst, attempts),
+                                )
+                                .await;
+                            }
+                            Ok(None) => {}
+                            Err(e) => warn!(error = %e, "ssh mesh auto-repair query failed"),
+                        }
+                    }
+                }
+            }
+        }));
+    }
+
+    // 20b4) Model library scan tick — every 10min, PER-NODE.
+    //
+    // Restores the legacy-only scan of this node's ~/models directory so
+    // fleet_model_library follows local disk reality without operator action.
+    if let Some(pg_pool) = operational_store.pg_pool().cloned() {
+        info!("starting subsystem: model library scan tick (10min, per-node)");
+        let name = worker_name.clone();
+        let mut shutdown_rx_model_scan = shutdown_rx.clone();
+        subsystem_tasks.push(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(10 * 60));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = shutdown_rx_model_scan.changed() => break,
+                    _ = tick.tick() => {
+                        let Some(home) = std::env::var_os("HOME") else {
+                            warn!(node = %name, "model library scan skipped: HOME is not set");
+                            continue;
+                        };
+                        let models_dir = std::path::PathBuf::from(home).join("models");
+                        if !models_dir.exists() {
+                            continue;
+                        }
+
+                        match ff_agent::model_library_scanner::scan_local_library(
+                            &pg_pool,
+                            &name,
+                            &models_dir,
+                        )
+                        .await
+                        {
+                            Ok(summary) if summary.added + summary.updated + summary.removed > 0 => {
+                                info!(
+                                    node = %name,
+                                    added = summary.added,
+                                    updated = summary.updated,
+                                    removed = summary.removed,
+                                    total_mb = summary.total_bytes / 1_048_576,
+                                    "model library scan reconciled local models"
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(e) => warn!(node = %name, error = %e, "model library scan failed"),
+                        }
+                    }
+                }
+            }
+        }));
+    }
+
+    // 20b5) Model auto-upgrade download tick — every 6h, leader-gated.
+    //
+    // Restores the legacy-only download dispatcher for cold models whose
+    // upstream revision is available. Active deployments are left alone; the
+    // leader enqueues bounded force-download tasks for eligible hosts.
+    if let Some(pg_pool) = operational_store.pg_pool().cloned() {
+        info!("starting subsystem: model auto-upgrade download tick (6h, leader-gated)");
+        let name = worker_name.clone();
+        let mut shutdown_rx_model_upgrade = shutdown_rx.clone();
+        subsystem_tasks.push(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = shutdown_rx_model_upgrade.changed() => break,
+                    _ = tick.tick() => {
+                        let is_leader: bool = sqlx::query_scalar(
+                            r#"
+                            SELECT EXISTS (
+                                SELECT 1 FROM fleet_leader_state
+                                WHERE member_name = $1
+                                  AND heartbeat_at > NOW() - INTERVAL '60 seconds'
+                            )
+                            "#,
+                        )
+                        .bind(&name)
+                        .fetch_one(&pg_pool)
+                        .await
+                        .unwrap_or(false);
+                        if !is_leader {
+                            continue;
+                        }
+
+                        let rows = sqlx::query(
+                            r#"
+                            SELECT c.name AS host, cm.model_id, mc.upstream_latest_rev
+                              FROM computer_models cm
+                              JOIN computers c      ON c.id = cm.computer_id
+                              JOIN model_catalog mc ON mc.id = cm.model_id
+                             WHERE cm.status = 'revision_available'
+                               AND NOT EXISTS (
+                                 SELECT 1
+                                   FROM fleet_model_deployments dep
+                                   JOIN fleet_model_library lib ON lib.id = dep.library_id
+                                  WHERE lib.catalog_id = cm.model_id
+                                    AND dep.desired_state = 'active'
+                               )
+                             LIMIT 3
+                            "#,
+                        )
+                        .fetch_all(&pg_pool)
+                        .await;
+
+                        match rows {
+                            Ok(rows) => {
+                                for row in rows {
+                                    use sqlx::Row;
+
+                                    let host: String = row.get("host");
+                                    let model_id: String = row.get("model_id");
+                                    let revision: Option<String> = row.get("upstream_latest_rev");
+                                    let revision_short = revision
+                                        .as_deref()
+                                        .map(|s| s.chars().take(10).collect::<String>())
+                                        .unwrap_or_default();
+
+                                    let _ = sqlx::query(
+                                        "UPDATE computer_models cm
+                                            SET status = 'upgrading'
+                                          FROM computers c
+                                         WHERE cm.computer_id = c.id
+                                           AND c.name = $1
+                                           AND cm.model_id = $2",
+                                    )
+                                    .bind(&host)
+                                    .bind(&model_id)
+                                    .execute(&pg_pool)
+                                    .await;
+
+                                    let command = format!(
+                                        "ff model download {} --force --node {}",
+                                        model_id, host
+                                    );
+                                    if let Err(e) = ff_agent::task_runner::pg_enqueue_shell_task(
+                                        &pg_pool,
+                                        &format!(
+                                            "model-auto-upgrade: {} on {} -> rev {}",
+                                            model_id, host, revision_short
+                                        ),
+                                        &command,
+                                        &["ff".to_string()],
+                                        Some(&host),
+                                        None,
+                                        65,
+                                        None,
+                                    )
+                                    .await
+                                    {
+                                        warn!(
+                                            model_id = %model_id,
+                                            host = %host,
+                                            error = %e,
+                                            "failed to enqueue model auto-upgrade download task"
+                                        );
+                                    }
+                                    let _ = ff_agent::telegram::send_telegram_from_secrets(
+                                        &pg_pool,
+                                        "Model auto-upgrade",
+                                        &format!(
+                                            "Re-downloading {} on {} (HF rev {})",
+                                            model_id, host, revision_short
+                                        ),
+                                    )
+                                    .await;
+                                }
+                            }
+                            Err(e) => warn!(error = %e, "model auto-upgrade download query failed"),
+                        }
+                    }
+                }
+            }
+        }));
     }
 
     // 20c) Stale-task reaper tick — every 10min, per-node (idempotent).
