@@ -17,6 +17,29 @@ scanning cannot.
 
 Fall back to Grep/Glob/Read **only** when the graph doesn't cover what you need.
 
+### ⛔ Discovery-first — search before you build (hard rule)
+The #1 waste here is rebuilding a capability the fleet already has. Before writing any
+new table/module/feature, inventory what exists, in this order:
+1. **Cortex / code graph** — `cortex_find` / `semantic_search_nodes` ("what handles X?")
+   to find the owning crate. Faster + cheaper than grep.
+2. **`ff db query "<read-only SQL>"`** — confirm the LIVE Postgres schema. Source
+   `CREATE TABLE` strings can DRIFT from the live DB; never extend a table you haven't
+   confirmed live. (Note: `ff-mc` bootstraps its OWN schema in `crates/ff-mc/src/db.rs` —
+   e.g. PM `work_items`/`projects`/`milestones` — separately from ff-db migrations.)
+3. **`brain_search`** for prior decisions; grep/read files LAST.
+Then reuse/extend what exists instead of forking.
+
+### Working through ff (dogfood + key verbs)
+Prefer routing work through ff over raw cloud calls — it surfaces ff bugs and every call
+is logged to `ff_interactions` (the training corpus for ff's own LLM):
+- `fleet_run` (single-turn LLM), `fleet_crew` (writer→reviewer), `ff offload` / `ff research`.
+- `memory_*` — the Scratchpad: bounded self-curating working memory (blocks
+  task/decisions/findings/state/scratch; scopes session/agent/project). Read at start, record as you go.
+- `ff db query "<sql>"` — read-only live schema. `ff mcp install --for all` — wire ff into all CLIs.
+- Build the CLI: `cargo build --release -p ff-terminal --bin ff`; on macOS `codesign --force --sign -`
+  after copying the binary (cp breaks the signature → SIGKILL). New ff-db migrations go at the END
+  of `PG_MIGRATIONS`, forward-only.
+
 ### Key Tools
 
 | Tool | Use when |

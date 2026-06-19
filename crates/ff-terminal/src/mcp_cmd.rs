@@ -53,28 +53,41 @@ pub enum McpCommand {
 
 const INSTRUCTION_MARKER: &str = "<!-- ff-mcp-install -->";
 const INSTRUCTION_TEXT: &str = r#"<!-- ff-mcp-install -->
-## ForgeFleet MCP routing rule
+## ForgeFleet (ff) — how to work with the fleet
 
-For any task that involves the fleet, the LLM backbone, or the operator's
-computers, USE the `forgefleet` MCP tools before reaching for generic
-shell / grep / web-fetch primitives:
+You have the `forgefleet` MCP tools wired in. ForgeFleet is a distributed
+multi-LLM platform (many computers, local + cloud models). Use these tools and
+the `ff` CLI before generic shell / grep / web primitives.
 
-- **`fleet_run`** — single-turn LLM dispatch through the tiered cascade
-  (local 9B → 30B → 70B → cloud). Use for definitions, classifications,
-  one-shot rewrites, JSON extraction.
-- **`fleet_crew`** — 3-agent pipeline (Context Engineer → Code Writer →
-  Code Reviewer). Use for multi-file refactors and edge-case-heavy
-  functions.
-- **`fleet_status` / `fleet_pulse` / `fleet_worker_detail`** — query live
-  fleet state instead of guessing.
-- **`brain_search` / `brain_vault_read`** — pull operator memory, notes,
-  and architecture decisions before researching elsewhere.
-- **`computer_use`** — browser + screenshot operations on a fleet
-  computer rather than hosted alternatives.
+### Discovery-FIRST — search before you build (hard rule)
+Before writing any new table/module/feature, inventory what ALREADY exists — the
+#1 waste is rebuilding a capability the fleet already has. Order:
+1. **Cortex / code graph** — `cortex_find` / `semantic_search_nodes` ("what
+   handles X?") to find the owning crate/module. Faster + cheaper than grep.
+2. **`ff db query "<read-only SQL>"`** — confirm the LIVE Postgres schema; source
+   `CREATE TABLE` strings can drift from the live DB. Never extend a table you
+   haven't confirmed live.
+3. **`brain_search`** for prior decisions; grep/read files LAST.
+Then reuse/extend what exists instead of forking.
 
-When the task is well-scoped, dispatching to the local fleet is cheaper
-and faster than a cloud call. Only fall back to direct shell or web
-when no fleet tool fits.
+### Dogfood ff (and it logs training data)
+Prefer routing work THROUGH ff over raw cloud calls — it surfaces ff's bugs and
+every call is logged to `ff_interactions` (the training corpus for ff's own LLM):
+- **`fleet_run`** — single-turn LLM dispatch (tiered local → cloud): definitions,
+  classifications, one-shot rewrites, JSON extraction.
+- **`fleet_crew`** — Code Writer → Reviewer pipeline for multi-file refactors.
+- **`ff offload` / `ff research`** — dispatch coding/research to fleet models.
+
+### Memory + state — don't keep it only in your head
+- **`memory_*`** (the Scratchpad): bounded, self-curating working memory with
+  fixed blocks (task/decisions/findings/state/scratch) and layered scope. Read it
+  at the start of work; record decisions/findings as you go.
+- **`brain_search` / `brain_vault_read`** — operator memory, notes, architecture.
+- **`fleet_status` / `fleet_pulse` / `fleet_worker_detail`** — live fleet state.
+- **`computer_use`** — browser/screenshot on a fleet computer.
+
+When a task is well-scoped, dispatching to the local fleet is cheaper than a cloud
+call. Only fall back to direct shell/web when no fleet tool fits.
 <!-- /ff-mcp-install -->
 "#;
 
@@ -138,8 +151,8 @@ async fn install_one(
     match target {
         "claude-code" => install_claude_code(&home, server_url, write_instructions, dry_run),
         "claude-desktop" => install_claude_desktop(&home, server_url, dry_run),
-        "codex" => install_codex(&home, server_url, dry_run),
-        "kimi" => install_kimi(&home, server_url, dry_run),
+        "codex" => install_codex(&home, server_url, write_instructions, dry_run),
+        "kimi" => install_kimi(&home, server_url, write_instructions, dry_run),
         "cursor" => install_cursor(&home, server_url, dry_run),
         "windsurf" => install_windsurf(&home, server_url, dry_run),
         "goose" => install_goose(&home, server_url, dry_run),
@@ -191,20 +204,43 @@ fn install_claude_desktop(home: &std::path::Path, server_url: &str, dry_run: boo
 }
 
 // ─── Codex CLI ───────────────────────────────────────────────────────────────
-fn install_codex(home: &std::path::Path, server_url: &str, dry_run: bool) -> Result<()> {
+fn install_codex(
+    home: &std::path::Path,
+    server_url: &str,
+    write_instructions: bool,
+    dry_run: bool,
+) -> Result<()> {
     let config = home.join(".codex").join("config.toml");
     upsert_codex_mcp(&config, "forgefleet", server_url, dry_run)?;
     println!("  ✓ codex: {}", config.display());
+    if write_instructions {
+        // Codex reads global instructions from ~/.codex/AGENTS.md.
+        let agents_md = home.join(".codex").join("AGENTS.md");
+        append_instructions_md(&agents_md, dry_run)?;
+        println!("    + ff routing rule: {}", agents_md.display());
+    }
     Ok(())
 }
 
 // ─── Kimi (Moonshot CLI) ─────────────────────────────────────────────────────
-fn install_kimi(home: &std::path::Path, server_url: &str, dry_run: bool) -> Result<()> {
+fn install_kimi(
+    home: &std::path::Path,
+    server_url: &str,
+    write_instructions: bool,
+    dry_run: bool,
+) -> Result<()> {
     // Kimi Code CLI uses ~/.kimi/config.json with the same mcpServers shape
     // as Claude Code.
     let config = home.join(".kimi").join("config.json");
     upsert_mcp_server_json(&config, "forgefleet", server_url, dry_run)?;
     println!("  ✓ kimi: {}", config.display());
+    if write_instructions {
+        // Kimi reads agent instructions from ~/.kimi/AGENTS.md (the cross-tool
+        // AGENTS.md convention).
+        let agents_md = home.join(".kimi").join("AGENTS.md");
+        append_instructions_md(&agents_md, dry_run)?;
+        println!("    + ff routing rule: {}", agents_md.display());
+    }
     Ok(())
 }
 
