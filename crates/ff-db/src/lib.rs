@@ -58,6 +58,7 @@ pub use queries::{
     FreeSlot,
     // Interaction log (V121 ff_interactions)
     InteractionRecord,
+    MergeQueueItem,
     MeshStatusRow,
     ModelCatalogRow,
     ModelDeploymentRow,
@@ -177,7 +178,11 @@ pub use queries::{
     pg_list_work_intents,
     // Orchestrator P3 — adaptive serving-mix autoscaler
     pg_loadable_library_for_kind,
+    pg_mark_merge_ci_running,
+    pg_mark_merge_failed,
+    pg_mark_merge_merged,
     pg_mark_schedule_fired,
+    pg_next_merge_queue_item,
     pg_node_free_disk,
     pg_open_disk_move,
     pg_pending_work_intents,

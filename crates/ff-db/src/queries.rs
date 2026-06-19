@@ -8515,3 +8515,111 @@ pub async fn pg_heartbeat_work_item_lease(pool: &PgPool, work_item_id: uuid::Uui
     .await?;
     Ok(())
 }
+
+/// A merge-queue entry ready to be processed by the drain.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MergeQueueItem {
+    pub id: uuid::Uuid,
+    pub work_item_id: uuid::Uuid,
+    pub project_id: String,
+    pub pr_url: Option<String>,
+    pub branch_name: String,
+}
+
+/// Next merge-queue item to act on: lowest-position 'queued' OR 'ci_running'
+/// entry whose project has nothing else already in flight ahead of it —
+/// serializes merges to ONE per project. (A 'ci_running' row is one we're
+/// already watching; re-returning it lets the drain re-check its PR CI.)
+pub async fn pg_next_merge_queue_item(pool: &PgPool) -> Result<Option<MergeQueueItem>> {
+    let row = sqlx::query(
+        "SELECT id, work_item_id, project_id, pr_url, branch_name
+           FROM work_item_merge_queue q
+          WHERE q.status IN ('queued', 'ci_running')
+            AND NOT EXISTS (
+                SELECT 1 FROM work_item_merge_queue q2
+                 WHERE q2.project_id = q.project_id
+                   AND q2.status IN ('queued', 'ci_running')
+                   AND q2.position < q.position)
+          ORDER BY q.position ASC
+          LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| MergeQueueItem {
+        id: r.get("id"),
+        work_item_id: r.get("work_item_id"),
+        project_id: r.get("project_id"),
+        pr_url: r.try_get("pr_url").ok().flatten(),
+        branch_name: r.get("branch_name"),
+    }))
+}
+
+/// Mark a merge-queue entry as ci_running (we're watching its PR CI).
+pub async fn pg_mark_merge_ci_running(pool: &PgPool, id: uuid::Uuid) -> Result<()> {
+    sqlx::query(
+        "UPDATE work_item_merge_queue \
+            SET status = 'ci_running', started_at = COALESCE(started_at, NOW()) \
+          WHERE id = $1",
+    )
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Mark a merge as landed: queue→merged, the work_item→merged, its worktree→cleaned.
+pub async fn pg_mark_merge_merged(
+    pool: &PgPool,
+    id: uuid::Uuid,
+    work_item_id: uuid::Uuid,
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "UPDATE work_item_merge_queue SET status = 'merged', merged_at = NOW() WHERE id = $1",
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE work_items SET status = 'merged', completed_at = NOW(), last_error = NULL WHERE id = $1",
+    )
+    .bind(work_item_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE work_item_worktrees SET status = 'cleaned', cleaned_at = NOW() \
+          WHERE work_item_id = $1 AND status <> 'cleaned'",
+    )
+    .bind(work_item_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Mark a merge as failed: queue→failed (+reason, bump attempts), work_item→failed.
+pub async fn pg_mark_merge_failed(
+    pool: &PgPool,
+    id: uuid::Uuid,
+    work_item_id: uuid::Uuid,
+    reason: &str,
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "UPDATE work_item_merge_queue \
+            SET status = 'failed', failed_at = NOW(), failure_reason = $2, \
+                merge_attempts = merge_attempts + 1 \
+          WHERE id = $1",
+    )
+    .bind(id)
+    .bind(reason)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("UPDATE work_items SET status = 'failed', last_error = $2 WHERE id = $1")
+        .bind(work_item_id)
+        .bind(reason)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
