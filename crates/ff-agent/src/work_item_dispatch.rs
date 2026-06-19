@@ -57,7 +57,7 @@ pub async fn evaluate_work_item_dispatch(pg: &PgPool, worker_name: &str) -> Resu
 
     let mut started = 0usize;
     for item in assigned {
-        match dispatch_one(pg.clone(), item.clone()).await {
+        match dispatch_one(pg.clone(), item.clone(), worker_name.to_string()).await {
             Ok(()) => started += 1,
             Err(e) => {
                 warn!(
@@ -187,16 +187,28 @@ async fn assigned_work_items(
         .collect()
 }
 
-async fn dispatch_one(pg: PgPool, item: AssignedWorkItem) -> Result<()> {
+async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -> Result<()> {
     let worktree = create_worktree_for_item(&pg, &item).await?;
     mark_building(&pg, &item).await?;
 
     let (stop_heartbeat_tx, stop_heartbeat_rx) = watch::channel(false);
     let heartbeat = spawn_heartbeat(pg.clone(), item.work_item_id, stop_heartbeat_rx);
 
+    let started = std::time::Instant::now();
     let dispatch_result = run_ff_dispatch(&item, &worktree).await;
     let _ = stop_heartbeat_tx.send(true);
     let _ = heartbeat.await;
+
+    // Capture the dispatch I/O in ff_interactions (training data) — `ff cli` is a
+    // pass-through that doesn't log itself, so the dispatch records its own turn.
+    record_dispatch_interaction(
+        &pg,
+        &item,
+        &worker_name,
+        &dispatch_result,
+        started.elapsed(),
+    )
+    .await;
 
     match dispatch_result {
         Ok(output) => {
@@ -559,11 +571,58 @@ async fn mark_worktree_cleaned(pg: &PgPool, work_item_id: Uuid) -> Result<()> {
     Ok(())
 }
 
-async fn run_ff_dispatch(item: &AssignedWorkItem, worktree: &WorktreeRecord) -> Result<Output> {
-    let prompt = match item.description.as_deref() {
+/// The prompt the dispatch sends to the agent for a work_item.
+fn dispatch_prompt(item: &AssignedWorkItem) -> String {
+    match item.description.as_deref() {
         Some(desc) if !desc.trim().is_empty() => format!("{}\n\n{}", item.title, desc.trim()),
         _ => item.title.clone(),
+    }
+}
+
+/// Record a dispatch turn in `ff_interactions` (training data). Best-effort —
+/// never fails the dispatch. `ff cli` is a thin pass-through that doesn't log,
+/// so the dispatch logs its own request/response here.
+async fn record_dispatch_interaction(
+    pg: &PgPool,
+    item: &AssignedWorkItem,
+    worker_name: &str,
+    result: &Result<Output>,
+    elapsed: Duration,
+) {
+    let (response_text, outcome, error_text) = match result {
+        Ok(out) => (
+            String::from_utf8_lossy(&out.stdout)
+                .chars()
+                .take(16000)
+                .collect::<String>(),
+            "success".to_string(),
+            None,
+        ),
+        Err(e) => (
+            String::new(),
+            "error".to_string(),
+            Some(e.to_string().chars().take(2000).collect::<String>()),
+        ),
     };
+    let rec = ff_db::InteractionRecord {
+        channel: "work_item_dispatch".to_string(),
+        request_text: dispatch_prompt(item),
+        engine: Some("codex".to_string()),
+        response_text,
+        latency_ms: i32::try_from(elapsed.as_millis()).ok(),
+        outcome,
+        error_text,
+        worker_name: Some(worker_name.to_string()),
+        endpoint: Some("ff cli codex".to_string()),
+        ..Default::default()
+    };
+    if let Err(e) = ff_db::pg_record_interaction(pg, &rec).await {
+        warn!(error = %e, "work_item_dispatch: failed to log interaction (non-fatal)");
+    }
+}
+
+async fn run_ff_dispatch(item: &AssignedWorkItem, worktree: &WorktreeRecord) -> Result<Output> {
+    let prompt = dispatch_prompt(item);
     let cwd = worktree.worktree_path.clone();
 
     tokio::task::spawn_blocking(move || {
