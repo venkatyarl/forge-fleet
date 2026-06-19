@@ -725,6 +725,19 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         );
     }
 
+    // 15e) Pillar 4 worktree reaper — every 5min, PER-HOST.
+    // Removes on-disk git worktrees whose work_item is terminal (cancelled/
+    // merged/failed/done) and marks them cleaned. Each host reaps its own.
+    if let Some(pg_pool) = operational_store.pg_pool().cloned() {
+        info!("starting subsystem: work_item worktree reaper (5min, per-host)");
+        subsystem_tasks.push(ff_agent::work_item_dispatch::spawn_worktree_reaper(
+            pg_pool,
+            worker_name.clone(),
+            300,
+            shutdown_rx.clone(),
+        ));
+    }
+
     // 16) Procedural memory consolidation — every 6h, leader-gated.
     // Phase 14: scans completed sessions, extracts successful patterns into agent_procedures.
     if let Some(pg_pool) = operational_store.pg_pool().cloned() {

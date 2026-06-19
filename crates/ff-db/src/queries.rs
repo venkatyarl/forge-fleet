@@ -8634,3 +8634,44 @@ pub async fn pg_mark_merge_failed(
     tx.commit().await?;
     Ok(())
 }
+
+/// A worktree on this host that can be reaped (its work_item is terminal but the
+/// worktree row isn't yet 'cleaned'). Pillar 4 worktree-reaper input.
+#[derive(Debug, Clone)]
+pub struct ReapableWorktree {
+    pub work_item_id: uuid::Uuid,
+    pub repo_path: String,
+    pub worktree_path: String,
+    pub task_branch: String,
+}
+
+/// Worktrees on `worker_name`'s host whose work_item reached a terminal state
+/// (cancelled/merged/failed/done) but whose worktree row is not yet 'cleaned'.
+/// NOTE: excludes 'in_review' items — their PR is still open / awaiting merge.
+pub async fn pg_reapable_worktrees(
+    pool: &PgPool,
+    worker_name: &str,
+) -> Result<Vec<ReapableWorktree>> {
+    let rows = sqlx::query(
+        "SELECT wt.work_item_id, wt.repo_path, wt.worktree_path, wt.task_branch \
+           FROM work_item_worktrees wt \
+           JOIN work_items w ON w.id = wt.work_item_id \
+           JOIN computers c ON c.id = wt.computer_id \
+          WHERE c.name = $1 \
+            AND wt.status <> 'cleaned' \
+            AND w.status IN ('cancelled', 'merged', 'failed', 'done') \
+          LIMIT 32",
+    )
+    .bind(worker_name)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .iter()
+        .map(|r| ReapableWorktree {
+            work_item_id: r.get("work_item_id"),
+            repo_path: r.get("repo_path"),
+            worktree_path: r.get("worktree_path"),
+            task_branch: r.get("task_branch"),
+        })
+        .collect())
+}

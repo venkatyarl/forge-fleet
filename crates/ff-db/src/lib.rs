@@ -67,6 +67,7 @@ pub use queries::{
     // Orchestrator P3 — adaptive serving-mix autoscaler
     PlacementCandidate,
     ReadyWorkItem,
+    ReapableWorktree,
     ReprofileCandidate,
     RouteCandidate,
     RouteFilter,
@@ -199,6 +200,7 @@ pub use queries::{
     pg_reap_stale_reservations,
     pg_reap_stale_running,
     pg_reap_stale_work_item_leases,
+    pg_reapable_worktrees,
     pg_recent_demand_snapshots,
     pg_record_interaction,
     pg_reprofile_candidates,

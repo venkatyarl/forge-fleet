@@ -904,3 +904,71 @@ fn truncate_for_log(s: &str) -> String {
     }
     format!("{}...", &trimmed[..end])
 }
+
+// ── Pillar 4 worktree reaper (per-host) ──────────────────────────────────
+// Removes on-disk git worktrees whose work_item reached a terminal state
+// (cancelled/merged/failed/done) but whose worktree row isn't 'cleaned' yet.
+// Host-agnostic by design: each host reaps only its OWN worktrees (a remote
+// worktree can't be removed from another host, which is why `ff pm cancel`
+// can't do it — this tick can). Never touches 'in_review' items (PR open).
+
+/// One reaper pass. Returns the number of worktrees cleaned.
+pub async fn evaluate_worktree_reaper(pg: &PgPool, worker_name: &str) -> Result<usize> {
+    let reapable = ff_db::pg_reapable_worktrees(pg, worker_name).await?;
+    let mut reaped = 0usize;
+    for wt in reapable {
+        let repo = PathBuf::from(&wt.repo_path);
+        let tree = PathBuf::from(&wt.worktree_path);
+        // Best-effort filesystem cleanup; the DB mark below is the source of truth.
+        let _ = remove_worktree(&repo, &tree);
+        let _ = run_git(
+            &repo,
+            [
+                OsStr::new("branch"),
+                OsStr::new("-D"),
+                OsStr::new(&wt.task_branch),
+            ],
+            Duration::from_secs(30),
+        );
+        sqlx::query(
+            "UPDATE work_item_worktrees SET status = 'cleaned', cleaned_at = NOW() \
+              WHERE work_item_id = $1",
+        )
+        .bind(wt.work_item_id)
+        .execute(pg)
+        .await?;
+        reaped += 1;
+    }
+    if reaped > 0 {
+        info!(reaped, "worktree_reaper: cleaned terminal worktrees");
+    }
+    Ok(reaped)
+}
+
+/// Spawn the per-host worktree-reaper loop (not leader-gated — each host cleans
+/// its own worktrees).
+pub fn spawn_worktree_reaper(
+    pg: PgPool,
+    worker_name: String,
+    interval_secs: u64,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    if let Err(e) = evaluate_worktree_reaper(&pg, &worker_name).await {
+                        warn!(error = %e, "worktree_reaper tick failed");
+                    }
+                }
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+            }
+        }
+        info!("worktree_reaper loop stopped");
+    })
+}
