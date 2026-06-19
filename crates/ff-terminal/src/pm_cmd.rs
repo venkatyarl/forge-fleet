@@ -148,6 +148,59 @@ pub async fn handle_pm(cmd: crate::PmCommand) -> Result<()> {
                 }
             }
         }
+        crate::PmCommand::Board { limit } => {
+            // The autonomous build pipeline at a glance: work_items joined with
+            // their live lease (host), worktree status, and merge-queue/PR state.
+            let rows: Vec<(
+                String,
+                String,
+                String,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+            )> = sqlx::query_as(
+                "SELECT w.kind, w.title, w.status, w.assigned_computer, \
+                        wt.status AS worktree, mq.status AS merge_q, w.pr_url \
+                   FROM work_items w \
+                   LEFT JOIN work_item_worktrees wt \
+                          ON wt.work_item_id = w.id AND wt.status <> 'cleaned' \
+                   LEFT JOIN work_item_merge_queue mq ON mq.work_item_id = w.id \
+                  WHERE w.status NOT IN ('idea', 'cancelled') OR w.pr_url IS NOT NULL \
+                  ORDER BY w.created_at DESC \
+                  LIMIT $1",
+            )
+            .bind(limit)
+            .fetch_all(&pool)
+            .await
+            .map_err(|e| anyhow::anyhow!("query board: {e}"))?;
+
+            if rows.is_empty() {
+                println!("(no active work items — flag one with `ff pm ready <id>`)");
+                return Ok(());
+            }
+            println!(
+                "{CYAN}{:<8} {:<34} {:<11} {:<8} {:<11} {}{RESET}",
+                "KIND", "TITLE", "STATUS", "HOST", "MERGE-Q", "PR"
+            );
+            for (kind, title, status, host, _worktree, merge_q, pr) in rows {
+                let t: String = title.chars().take(33).collect();
+                let pr_short = pr
+                    .as_deref()
+                    .and_then(|u| u.rsplit('/').next())
+                    .map(|n| format!("#{n}"))
+                    .unwrap_or_default();
+                println!(
+                    "{:<8} {:<34} {:<11} {:<8} {:<11} {}",
+                    kind,
+                    t,
+                    status,
+                    host.unwrap_or_default(),
+                    merge_q.unwrap_or_default(),
+                    pr_short
+                );
+            }
+        }
         crate::PmCommand::Cancel { id } => {
             let uid = uuid::Uuid::parse_str(&id)
                 .map_err(|e| anyhow::anyhow!("invalid work item id '{id}': {e}"))?;

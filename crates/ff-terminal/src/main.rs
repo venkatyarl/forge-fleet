@@ -2695,6 +2695,15 @@ pub enum PmCommand {
     /// Cancel a work item (terminal status='cancelled'): releases any active
     /// lease and frees its slot so the scheduler stops touching it.
     Cancel { id: String },
+    /// Live Pillar-4 pipeline board: active/recent work_items with their host,
+    /// lease/worktree state, merge-queue status, and PR — the autonomous build
+    /// pipeline at a glance.
+    #[command(alias = "status")]
+    Board {
+        /// How many rows to show (default 20).
+        #[arg(long, default_value_t = 20)]
+        limit: i64,
+    },
     /// Import Claude Code session tasks into projects.work_items.
     ///
     /// Claude Code's TaskCreate/TaskList/TaskUpdate tools keep their state
