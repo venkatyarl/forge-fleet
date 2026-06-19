@@ -819,6 +819,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "gate_previous_value",
         sql: schema::SCHEMA_V137_GATE_PREVIOUS_VALUE,
     },
+    PgMigration {
+        version: 138,
+        name: "interaction_worker_attribution",
+        sql: schema::SCHEMA_V138_INTERACTION_WORKER_ATTRIBUTION,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.

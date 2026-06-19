@@ -8826,3 +8826,14 @@ CREATE TABLE IF NOT EXISTS dsn_of_record (
 pub const SCHEMA_V137_GATE_PREVIOUS_VALUE: &str = r#"
 ALTER TABLE fleet_secrets ADD COLUMN IF NOT EXISTS previous_value TEXT;
 "#;
+
+/// V138: hybrid-LLM attribution on the interaction log. `worker_name` + `endpoint`
+/// record WHICH fleet computer / LLM endpoint actually served a given ff turn, so
+/// "how much work did each computer/model do" is answerable from `ff_interactions`
+/// (deep review Q1 telemetry gap). Both nullable — channels populate them when the
+/// route decision is known.
+pub const SCHEMA_V138_INTERACTION_WORKER_ATTRIBUTION: &str = r#"
+ALTER TABLE ff_interactions ADD COLUMN IF NOT EXISTS worker_name TEXT;
+ALTER TABLE ff_interactions ADD COLUMN IF NOT EXISTS endpoint    TEXT;
+CREATE INDEX IF NOT EXISTS idx_ff_interactions_worker ON ff_interactions (worker_name, ts DESC);
+"#;
