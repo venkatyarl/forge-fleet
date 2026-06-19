@@ -633,6 +633,9 @@ async fn run_ff_dispatch(item: &AssignedWorkItem, worktree: &WorktreeRecord) -> 
             .arg(&cwd)
             .arg("--timeout")
             .arg(FF_TIMEOUT_SECS.to_string())
+            // Fail (exit 3) if codex exits 0 but changes nothing — a no-op run is
+            // a failed work_item, not a silent 'done' (catches stdin-pipe no-ops).
+            .arg("--require-change")
             .arg(prompt);
         run_command_timeout(cmd, Duration::from_secs(FF_TIMEOUT_SECS + 30))
     })
