@@ -8881,3 +8881,132 @@ CREATE TABLE IF NOT EXISTS agent_memory_evictions (
 CREATE INDEX IF NOT EXISTS idx_agent_memory_evictions_scope
     ON agent_memory_evictions (scope_type, scope_key, created_at DESC);
 "#;
+
+// V140 — Pillar 4: distributed concurrent development, on the CANONICAL Postgres
+// `work_items` table (LLM council verdict 2026-06-19, codex+kimi+Claude — see
+// .forgefleet/plans/DECISION-pillar4-canonical-home.md). Two parts:
+//  (a) MATERIALIZE work_items in the migration chain. It exists live (V15 columns)
+//      but has no CREATE here (source/live name drift: V15 const says
+//      `fleet_work_items`, live name is `work_items`; live `fleet_work_items` is the
+//      V75 work-stealing table). `CREATE TABLE IF NOT EXISTS` is a no-op on the live
+//      DB and materializes it on a fresh rebuild — fixing the FK/DR gap both council
+//      members flagged. Column set verified against live via `ff db query`.
+//  (b) Extend work_items with orchestration columns + add leases / worktrees /
+//      merge-queue + a work_items→fleet_tasks bridge, all keyed on work_items.id as
+//      the single canonical task identity. The DAG uses the existing work_item_relations.
+pub const SCHEMA_V140_DISTRIBUTED_DEV: &str = r#"
+-- (a) Canonical work_items (no-op on live; materializes on fresh rebuilds).
+CREATE TABLE IF NOT EXISTS work_items (
+    id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id        TEXT NOT NULL REFERENCES projects(id),
+    milestone_id      UUID REFERENCES milestones(id),
+    parent_id         UUID REFERENCES work_items(id),
+    kind              TEXT NOT NULL,
+    title             TEXT NOT NULL,
+    description       TEXT,
+    labels            JSONB NOT NULL DEFAULT '[]',
+    status            TEXT NOT NULL DEFAULT 'idea',
+    priority          TEXT NOT NULL DEFAULT 'normal',
+    assigned_to       TEXT,
+    assigned_computer TEXT,
+    branch_name       TEXT,
+    pr_url            TEXT,
+    brain_node_ids    JSONB NOT NULL DEFAULT '[]',
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_by        TEXT NOT NULL DEFAULT 'system',
+    started_at        TIMESTAMPTZ,
+    completed_at      TIMESTAMPTZ,
+    due_date          DATE,
+    estimated_hours   DOUBLE PRECISION,
+    metadata          JSONB NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_work_items_status ON work_items (status);
+CREATE INDEX IF NOT EXISTS idx_work_items_parent ON work_items (parent_id);
+
+-- (b) Orchestration columns for fleet-wide concurrent execution.
+ALTER TABLE work_items
+    ADD COLUMN IF NOT EXISTS required_capabilities JSONB   NOT NULL DEFAULT '[]',
+    ADD COLUMN IF NOT EXISTS complexity            TEXT    NOT NULL DEFAULT 'mechanical',
+    ADD COLUMN IF NOT EXISTS predicted_paths       JSONB   NOT NULL DEFAULT '[]',
+    ADD COLUMN IF NOT EXISTS touched_paths         JSONB   NOT NULL DEFAULT '[]',
+    ADD COLUMN IF NOT EXISTS base_branch           TEXT,
+    ADD COLUMN IF NOT EXISTS base_sha              TEXT,
+    ADD COLUMN IF NOT EXISTS integration_branch    TEXT,
+    ADD COLUMN IF NOT EXISTS merge_rank            INT,
+    ADD COLUMN IF NOT EXISTS risk_score            REAL    NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS reviewer_required     BOOLEAN NOT NULL DEFAULT TRUE,
+    ADD COLUMN IF NOT EXISTS attempts              INT     NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS last_error            TEXT;
+
+-- one fleet slot leased to a work_item; partial-unique = at most one ACTIVE lease.
+CREATE TABLE IF NOT EXISTS work_item_leases (
+    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    work_item_id     UUID NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+    sub_agent_id     UUID REFERENCES sub_agents(id),
+    computer_id      UUID NOT NULL REFERENCES computers(id),
+    session_id       UUID REFERENCES agent_sessions(id),
+    endpoint         TEXT,
+    lease_state      TEXT NOT NULL DEFAULT 'claimed'
+        CHECK (lease_state IN ('claimed','building','reviewing','stale','released','failed')),
+    lease_expires_at TIMESTAMPTZ NOT NULL,
+    heartbeat_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    attempt          INT NOT NULL DEFAULT 1,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    released_at      TIMESTAMPTZ,
+    release_reason   TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_work_item_leases_active
+    ON work_item_leases (work_item_id) WHERE released_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_work_item_leases_heartbeat
+    ON work_item_leases (lease_state, heartbeat_at) WHERE released_at IS NULL;
+
+-- a git worktree on a host where a slot does isolated work for a work_item.
+CREATE TABLE IF NOT EXISTS work_item_worktrees (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    work_item_id  UUID NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+    computer_id   UUID NOT NULL REFERENCES computers(id),
+    sub_agent_id  UUID REFERENCES sub_agents(id),
+    repo_path     TEXT NOT NULL,
+    worktree_path TEXT NOT NULL,
+    base_branch   TEXT NOT NULL,
+    task_branch   TEXT NOT NULL,
+    head_sha      TEXT,
+    status        TEXT NOT NULL DEFAULT 'creating'
+        CHECK (status IN ('creating','active','ready_for_review','merged','failed','cleaned')),
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    cleaned_at    TIMESTAMPTZ,
+    UNIQUE (computer_id, worktree_path),
+    UNIQUE (task_branch)
+);
+CREATE INDEX IF NOT EXISTS idx_work_item_worktrees_item ON work_item_worktrees (work_item_id);
+
+-- serialized, CI-gated merge queue (builds run in parallel; merges land one-by-one).
+CREATE TABLE IF NOT EXISTS work_item_merge_queue (
+    id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    work_item_id   UUID NOT NULL UNIQUE REFERENCES work_items(id) ON DELETE CASCADE,
+    project_id     TEXT NOT NULL REFERENCES projects(id),
+    position       BIGSERIAL,
+    status         TEXT NOT NULL DEFAULT 'queued'
+        CHECK (status IN ('queued','rebasing','ci_running','mergeable','merged','conflict','failed')),
+    ci_run_id      UUID REFERENCES project_ci_runs(id),
+    branch_name    TEXT NOT NULL,
+    pr_url         TEXT,
+    head_sha       TEXT,
+    merge_attempts INT NOT NULL DEFAULT 0,
+    enqueued_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    started_at     TIMESTAMPTZ,
+    merged_at      TIMESTAMPTZ,
+    failed_at      TIMESTAMPTZ,
+    failure_reason TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_work_item_merge_queue_ready
+    ON work_item_merge_queue (project_id, position)
+    WHERE status IN ('queued','rebasing','ci_running');
+
+-- bridge: a work_item (PM decomposition) → the fleet_tasks (dispatch queue) it spawned.
+CREATE TABLE IF NOT EXISTS work_item_fleet_tasks (
+    work_item_id  UUID NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+    fleet_task_id UUID NOT NULL REFERENCES fleet_tasks(id) ON DELETE CASCADE,
+    PRIMARY KEY (work_item_id, fleet_task_id)
+);
+"#;
