@@ -1,14 +1,15 @@
-//! `ff-core` — ForgeFleet core primitives.
+//! ForgeFleet core primitives.
 //!
-//! This crate is the foundation of ForgeFleet, providing:
-//! - **types** — Node, Model, Hardware, Tier, Runtime, Role, etc.
-//! - **config** — Load/parse fleet.toml with hot-reload and env overrides
-//! - **error** — Unified error type (`ForgeFleetError`)
-//! - **db** — Postgres connection pool setup
-//! - **hardware** — Detect OS, CPU, GPU, memory, interconnect at runtime
-//! - **leader** — Leader election types and failover logic
-//! - **activity** — Taylor yield modes and activity level tracking
-//! - **task** — Agent task and result types
+//! This crate provides the shared building blocks used across ForgeFleet:
+//!
+//! - Core types for nodes, models, hardware, tiers, runtimes, and roles.
+//! - Fleet configuration loading, hot reload, and environment overrides.
+//! - The unified [`ForgeFleetError`] error type.
+//! - Postgres connection pool setup.
+//! - Runtime hardware detection for OS, CPU, GPU, memory, and interconnects.
+//! - Leader election types and failover logic.
+//! - Activity level tracking and yield modes.
+//! - Agent task and result types.
 
 pub mod activity;
 pub mod audit;
