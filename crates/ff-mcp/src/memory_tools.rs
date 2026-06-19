@@ -19,19 +19,35 @@ fn str_param<'a>(p: &'a Value, key: &str) -> Result<&'a str, String> {
         .ok_or_else(|| format!("missing required parameter: {key}"))
 }
 
-/// Default scope when the caller omits one: a session-scoped pad keyed `default`.
+// Resolve the scope for a call. Precedence (council verdict 2026-06-19):
+// (1) explicit scope_type/scope_key (anything other than the session/default
+// fallback) always wins; (2) else if the caller passes its working dir as `cwd`,
+// derive a stable project id from it (project:github.com/org/repo) so Claude
+// Code's project memory is shared with Codex/Kimi working in the SAME repo;
+// (3) else the session-scoped pad keyed `default` (back-compat).
+//
+// NB: we resolve ONLY from the explicit `cwd` param — never the server's own
+// process cwd. The forgefleet MCP server is a shared HTTP daemon, so its cwd is
+// the daemon's dir, not the caller's project; resolving from it would mis-scope
+// every caller to whatever repo the daemon happens to run in.
 fn scope_of(p: &Value) -> (String, String) {
-    let st = p
-        .get("scope_type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("session")
-        .to_string();
-    let sk = p
-        .get("scope_key")
-        .and_then(|v| v.as_str())
-        .unwrap_or("default")
-        .to_string();
-    (st, sk)
+    let st = p.get("scope_type").and_then(|v| v.as_str());
+    let sk = p.get("scope_key").and_then(|v| v.as_str());
+    // An explicit scope (caller passed scope_type and/or a non-default key) wins.
+    let explicit = st.is_some_and(|s| s != "session") || sk.is_some_and(|s| s != "default");
+    if !explicit
+        && let Some(cwd) = p
+            .get("cwd")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        && let Some(id) = ff_agent::project_scope::resolve_from_dir(Some(std::path::Path::new(cwd)))
+    {
+        return ("project".to_string(), id);
+    }
+    (
+        st.unwrap_or("session").to_string(),
+        sk.unwrap_or("default").to_string(),
+    )
 }
 
 fn write_json(r: scratchpad::WriteResult) -> Value {

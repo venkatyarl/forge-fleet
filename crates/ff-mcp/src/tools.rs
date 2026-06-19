@@ -1445,6 +1445,10 @@ impl ToolRegistry {
                 "type": "string",
                 "enum": ["task", "decisions", "findings", "state", "scratch"],
                 "description": "Which fixed working-memory block to operate on."
+            },
+            "cwd": {
+                "type": "string",
+                "description": "Your absolute working directory. When scope is left at the default, the server derives a stable project id from it (project:github.com/org/repo) so this repo's memory is SHARED with other CLIs (Claude Code/Codex/Kimi) working in the SAME repo. Pass it on every call; omit only for ephemeral session memory."
             }
         })
     }
@@ -1469,6 +1473,7 @@ impl ToolRegistry {
                 "properties": {
                     "scope_type": Self::memory_scope_props()["scope_type"],
                     "scope_key": Self::memory_scope_props()["scope_key"],
+                    "cwd": Self::memory_scope_props()["cwd"],
                     "block": Self::memory_scope_props()["block"],
                     "text": { "type": "string", "description": "Text to append (newline-separated)." }
                 },
@@ -1486,6 +1491,7 @@ impl ToolRegistry {
                 "properties": {
                     "scope_type": Self::memory_scope_props()["scope_type"],
                     "scope_key": Self::memory_scope_props()["scope_key"],
+                    "cwd": Self::memory_scope_props()["cwd"],
                     "block": Self::memory_scope_props()["block"],
                     "old": { "type": "string", "description": "Existing substring to replace (must be unique in the block)." },
                     "new": { "type": "string", "description": "Replacement text." }
@@ -1504,6 +1510,7 @@ impl ToolRegistry {
                 "properties": {
                     "scope_type": Self::memory_scope_props()["scope_type"],
                     "scope_key": Self::memory_scope_props()["scope_key"],
+                    "cwd": Self::memory_scope_props()["cwd"],
                     "block": Self::memory_scope_props()["block"],
                     "text": { "type": "string", "description": "Substring to remove. Omit to clear the entire block." }
                 },

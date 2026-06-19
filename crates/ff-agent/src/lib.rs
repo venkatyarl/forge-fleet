@@ -100,6 +100,7 @@ pub mod ports_registry;
 pub mod power_scheduler;
 pub mod project_github_sync;
 pub mod project_registry;
+pub mod project_scope;
 pub mod revive;
 pub mod rpc_inference;
 pub mod scheduler_tick;

@@ -81,7 +81,11 @@ every call is logged to `ff_interactions` (the training corpus for ff's own LLM)
 ### Memory + state — don't keep it only in your head
 - **`memory_*`** (the Scratchpad): bounded, self-curating working memory with
   fixed blocks (task/decisions/findings/state/scratch) and layered scope. Read it
-  at the start of work; record decisions/findings as you go.
+  at the start of work; record decisions/findings as you go. **Pass `cwd` (your
+  absolute working directory) on every `memory_*` call** — the server derives a
+  stable project id from it so this repo's memory is SHARED with the other CLIs
+  (Claude Code / Codex / Kimi) working in the same repo. Omit `cwd` only for
+  throwaway session-local notes.
 - **`brain_search` / `brain_vault_read`** — operator memory, notes, architecture.
 - **`fleet_status` / `fleet_pulse` / `fleet_worker_detail`** — live fleet state.
 - **`computer_use`** — browser/screenshot on a fleet computer.

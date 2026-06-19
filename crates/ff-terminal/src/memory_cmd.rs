@@ -106,95 +106,18 @@ fn print_write(r: &scratchpad::WriteResult) {
     );
 }
 
-// Project-scoping (council verdict 2026-06-19, .forgefleet/plans/project-scoping.md).
-// When the caller leaves scope at the defaults (session/default), derive a stable
-// project id from the current directory so memory is SHARED per-project across CLIs
-// (Claude Code's project memory recalled by Codex on the same repo). An explicit
-// --scope-type / --scope-key always wins.
+// Project-scoping (council verdict 2026-06-19, decision → Brain). When the caller
+// leaves scope at the defaults (session/default), derive a stable project id from
+// the process cwd so memory is SHARED per-project across CLIs (Claude Code's
+// project memory recalled by Codex on the same repo). An explicit --scope-type /
+// --scope-key always wins. The resolver is shared with the memory_* MCP tools via
+// `ff_agent::project_scope` (single canonicalization, no drift).
 fn auto_scope(scope_type: String, scope_key: String) -> (String, String) {
     if scope_type == "session"
         && scope_key == "default"
-        && let Some(id) = resolve_project_scope()
+        && let Some(id) = ff_agent::project_scope::resolve_from_dir(None)
     {
         return ("project".to_string(), id);
     }
     (scope_type, scope_key)
-}
-
-// Derive a project id from cwd. Prefers the git origin remote (canonicalized to
-// project:github.com/org/repo, stable across clone paths); else the git toplevel
-// basename (project:local:<basename>); else None. v1 uses git; the
-// .forgefleet-project marker file is a follow-up (it ranks above git).
-fn resolve_project_scope() -> Option<String> {
-    let git = |args: &[&str]| -> Option<String> {
-        let out = std::process::Command::new("git").args(args).output().ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if s.is_empty() { None } else { Some(s) }
-    };
-    // Prefer the origin remote (github.com/org/repo, stable across clone paths).
-    // Returns the bare id — the caller sets scope_type='project' as the namespace.
-    if let Some(url) = git(&["remote", "get-url", "origin"])
-        && let Some(canon) = canonical_remote(&url)
-    {
-        return Some(canon);
-    }
-    // Fallback: git toplevel basename.
-    if let Some(top) = git(&["rev-parse", "--show-toplevel"])
-        && let Some(base) = std::path::Path::new(&top)
-            .file_name()
-            .and_then(|s| s.to_str())
-    {
-        return Some(format!("local:{}", base.to_lowercase()));
-    }
-    None
-}
-
-// Normalize a git remote URL to a stable host/org/repo (lowercase, no .git suffix).
-// Both git@github.com:Org/Repo.git and https://github.com/Org/Repo.git become
-// github.com/org/repo.
-fn canonical_remote(url: &str) -> Option<String> {
-    let u = url.trim();
-    // scp-style: git@host:org/repo(.git)
-    let body = if let Some(rest) = u.strip_prefix("git@") {
-        rest.replacen(':', "/", 1)
-    } else if let Some(rest) = u
-        .strip_prefix("https://")
-        .or_else(|| u.strip_prefix("http://"))
-        .or_else(|| u.strip_prefix("ssh://git@"))
-    {
-        // strip any user@ and a trailing /
-        rest.split_once('@')
-            .map(|(_, h)| h.to_string())
-            .unwrap_or_else(|| rest.to_string())
-    } else {
-        return None;
-    };
-    let body = body
-        .trim_end_matches('/')
-        .trim_end_matches(".git")
-        .to_lowercase();
-    // Split host/path and normalize the host: strip an SSH-config alias suffix on
-    // the last domain label (github.com-venkat -> github.com) so the SAME repo
-    // resolves to the SAME project id regardless of which SSH alias a CLI uses.
-    let (host, path) = body.split_once('/')?;
-    if path.is_empty() {
-        return None;
-    }
-    Some(format!("{}/{}", normalize_host(host), path))
-}
-
-/// Strip an SSH-config alias suffix from a git host's last label
-/// (`github.com-venkat` → `github.com`); leaves a plain host unchanged.
-fn normalize_host(host: &str) -> String {
-    let parts: Vec<&str> = host.split('.').collect();
-    if let Some((last, rest)) = parts.split_last() {
-        let base = last.split_once('-').map(|(b, _)| b).unwrap_or(last);
-        let mut out: Vec<&str> = rest.to_vec();
-        out.push(base);
-        return out.join(".");
-    }
-    host.to_string()
 }
