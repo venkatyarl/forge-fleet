@@ -8325,3 +8325,180 @@ pub async fn pg_memory_record_eviction(
     .await?;
     Ok(row.get("id"))
 }
+
+// ── Pillar 4: distributed-dev work_item scheduler ────────────────────────
+// Leader-only, serial tick. The partial-unique active-lease index guards
+// double-assignment; single-leader serial execution means no FOR UPDATE
+// gymnastics needed. IMPORTANT: only schedules work_items explicitly set to
+// status='ready' (execution-flagged) — never touches operator PM items in
+// their PM statuses ('idea' etc.), avoiding the split-brain the council flagged.
+// Design: .forgefleet/plans/DECISION-pillar4-canonical-home.md
+
+/// A schedulable work_item + the computer it should target (if pinned).
+#[derive(Debug, Clone)]
+pub struct ReadyWorkItem {
+    pub id: uuid::Uuid,
+    pub assigned_computer: Option<String>,
+}
+
+/// A free fleet slot (no active lease / not running a work_item).
+#[derive(Debug, Clone)]
+pub struct FreeSlot {
+    pub sub_agent_id: uuid::Uuid,
+    pub computer_id: uuid::Uuid,
+}
+
+/// Reap leases whose heartbeat is older than `stale_secs`: release the lease,
+/// free its slot, and return the work_item to 'ready' (bumping attempts).
+/// Returns the number of leases reaped.
+pub async fn pg_reap_stale_work_item_leases(pool: &PgPool, stale_secs: i64) -> Result<u64> {
+    let rows = sqlx::query(
+        "UPDATE work_item_leases
+            SET lease_state = 'stale', released_at = NOW(), release_reason = 'heartbeat timeout'
+          WHERE released_at IS NULL
+            AND heartbeat_at < NOW() - make_interval(secs => $1)
+          RETURNING work_item_id, sub_agent_id",
+    )
+    .bind(stale_secs as f64)
+    .fetch_all(pool)
+    .await?;
+
+    for r in &rows {
+        let wi: uuid::Uuid = r.get("work_item_id");
+        let sa: Option<uuid::Uuid> = r.try_get("sub_agent_id").ok().flatten();
+        if let Some(sa) = sa {
+            let _ = sqlx::query(
+                "UPDATE sub_agents SET current_work_item_id = NULL, status = 'idle' WHERE id = $1",
+            )
+            .bind(sa)
+            .execute(pool)
+            .await;
+        }
+        let _ = sqlx::query(
+            "UPDATE work_items
+                SET status = 'ready', attempts = attempts + 1,
+                    assigned_computer = NULL, last_error = 'lease heartbeat timeout'
+              WHERE id = $1",
+        )
+        .bind(wi)
+        .execute(pool)
+        .await;
+    }
+    Ok(rows.len() as u64)
+}
+
+/// Work_items ready to schedule: explicitly status='ready', leaf kind='task',
+/// no active lease, and every blocking dependency (work_item_relations
+/// relation_type='blocks', from_id blocks to_id) is 'merged'. The dep clause is
+/// vacuously satisfied while work_item_relations is empty.
+pub async fn pg_ready_work_items(pool: &PgPool, limit: i64) -> Result<Vec<ReadyWorkItem>> {
+    let rows = sqlx::query(
+        "SELECT w.id, w.assigned_computer
+           FROM work_items w
+          WHERE w.status = 'ready'
+            AND w.kind = 'task'
+            AND NOT EXISTS (
+                SELECT 1 FROM work_item_leases l
+                 WHERE l.work_item_id = w.id AND l.released_at IS NULL)
+            AND NOT EXISTS (
+                SELECT 1 FROM work_item_relations r
+                  JOIN work_items dep ON dep.id = r.from_id
+                 WHERE r.to_id = w.id AND r.relation_type = 'blocks'
+                   AND dep.status <> 'merged')
+          ORDER BY w.risk_score DESC, w.created_at ASC
+          LIMIT $1",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .iter()
+        .map(|r| ReadyWorkItem {
+            id: r.get("id"),
+            assigned_computer: r.try_get("assigned_computer").ok().flatten(),
+        })
+        .collect())
+}
+
+/// Free fleet slots: sub_agents not currently running a work_item and with no
+/// active lease. `computer_filter` (computer name) optionally pins to one host.
+pub async fn pg_free_slots(
+    pool: &PgPool,
+    computer_filter: Option<&str>,
+    limit: i64,
+) -> Result<Vec<FreeSlot>> {
+    let rows = sqlx::query(
+        "SELECT sa.id AS sub_agent_id, sa.computer_id
+           FROM sub_agents sa
+           JOIN computers c ON c.id = sa.computer_id
+          WHERE sa.current_work_item_id IS NULL
+            AND NOT EXISTS (
+                SELECT 1 FROM work_item_leases l
+                 WHERE l.sub_agent_id = sa.id AND l.released_at IS NULL)
+            AND ($1::text IS NULL OR c.name = $1)
+          ORDER BY sa.last_heartbeat_at DESC NULLS LAST
+          LIMIT $2",
+    )
+    .bind(computer_filter)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .iter()
+        .map(|r| FreeSlot {
+            sub_agent_id: r.get("sub_agent_id"),
+            computer_id: r.get("computer_id"),
+        })
+        .collect())
+}
+
+/// Atomically assign a ready work_item to a free slot: write the lease, mark the
+/// slot busy, and flip the work_item to 'claimed'. The partial-unique active
+/// lease index makes a duplicate claim a no-op (returns false). Returns true if
+/// the assignment landed.
+pub async fn pg_assign_work_item(
+    pool: &PgPool,
+    work_item_id: uuid::Uuid,
+    sub_agent_id: uuid::Uuid,
+    computer_id: uuid::Uuid,
+    lease_secs: i64,
+) -> Result<bool> {
+    let mut tx = pool.begin().await?;
+    let inserted = sqlx::query(
+        "INSERT INTO work_item_leases
+            (work_item_id, sub_agent_id, computer_id, lease_state, lease_expires_at)
+         VALUES ($1, $2, $3, 'claimed', NOW() + make_interval(secs => $4))
+         ON CONFLICT DO NOTHING
+         RETURNING id",
+    )
+    .bind(work_item_id)
+    .bind(sub_agent_id)
+    .bind(computer_id)
+    .bind(lease_secs as f64)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    if inserted.is_none() {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+
+    sqlx::query("UPDATE sub_agents SET current_work_item_id = $1, status = 'busy' WHERE id = $2")
+        .bind(work_item_id)
+        .bind(sub_agent_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "UPDATE work_items
+            SET status = 'claimed',
+                assigned_computer = (SELECT name FROM computers WHERE id = $2),
+                started_at = COALESCE(started_at, NOW())
+          WHERE id = $1",
+    )
+    .bind(work_item_id)
+    .bind(computer_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(true)
+}
