@@ -214,6 +214,15 @@ async fn dispatch_one(pg: PgPool, item: AssignedWorkItem) -> Result<()> {
         }
     }
 
+    // codex (and most CLI agents) EDIT files but don't `git commit`. Commit any
+    // changes it made in the worktree so they can become a PR. A clean worktree
+    // (agent made no change) commits nothing → handled as "no commits" below.
+    let dirty = commit_worktree_changes(&worktree.worktree_path, &item.title)?;
+    info!(
+        work_item_id = %item.work_item_id, dirty,
+        "work_item_dispatch: committed agent changes (dirty={dirty})"
+    );
+
     let has_commits = branch_has_commits(
         &item.repo_path,
         &worktree.base_branch,
@@ -629,6 +638,39 @@ fn remove_worktree(repo_path: &Path, worktree_path: &Path) -> Result<()> {
     }
     let _ = run_git(repo_path, ["worktree", "prune"], Duration::from_secs(60));
     Ok(())
+}
+
+/// Stage + commit any agent-made changes in the worktree. Returns true if a
+/// commit was created, false if the worktree was clean (agent made no change).
+/// Provides a deterministic author so the daemon's git env needn't be configured.
+fn commit_worktree_changes(worktree_path: &Path, title: &str) -> Result<bool> {
+    run_git(worktree_path, ["add", "-A"], Duration::from_secs(60))?;
+    let status = run_git(
+        worktree_path,
+        ["status", "--porcelain"],
+        Duration::from_secs(30),
+    )?;
+    if String::from_utf8_lossy(&status.stdout).trim().is_empty() {
+        return Ok(false); // nothing to commit
+    }
+    let msg = format!(
+        "{}\n\nAutomated work_item dispatch (ForgeFleet Pillar 4).",
+        title
+    );
+    run_git(
+        worktree_path,
+        [
+            OsStr::new("-c"),
+            OsStr::new("user.name=ForgeFleet"),
+            OsStr::new("-c"),
+            OsStr::new("user.email=fleet@forgefleet.local"),
+            OsStr::new("commit"),
+            OsStr::new("-m"),
+            OsStr::new(&msg),
+        ],
+        Duration::from_secs(60),
+    )?;
+    Ok(true)
 }
 
 fn branch_has_commits(repo_path: &Path, base_branch: &str, task_branch: &str) -> Result<bool> {
