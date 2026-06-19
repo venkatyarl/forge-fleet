@@ -1,24 +1,51 @@
 //! `ff council` — multi-model deliberation (karpathy/llm-council pattern).
 //!
 //! Dispatch one question to N council members in PARALLEL, collect their
-//! independent answers, print them side-by-side, then (v2) have a CHAIRMAN model
-//! synthesize them into a single consensus — so `ff council` returns a real
-//! answer standalone (when a fleet agent / codex / kimi runs it, not just when a
-//! strong model like Claude is driving and can synthesize itself).
+//! independent answers, print them side-by-side, then a CHAIRMAN model
+//! synthesizes them into a single consensus. Every dispatch is logged to
+//! `ff_interactions` (audit + training data).
 //!
-//! `--no-synthesis` preserves v1 (print + let the caller synthesize).
-//! `--local` fleet members + persisted council_sessions are future increments.
-//! Design: `.forgefleet/plans/llm-council.md`.
+//! A member is either a VENDOR CLI (codex/kimi/claude — via cli_executor) or a
+//! LOCAL FLEET model (`local` / `local:<model>` — via fleet_oneshot), so one
+//! roster can mix cloud + local tiers: `--members codex,local:qwen36-35b,kimi`.
+//! `--no-synthesis` preserves the v1 print-only behavior. Design:
+//! `.forgefleet/plans/llm-council.md`.
 
 use crate::{CYAN, GREEN, RESET, YELLOW};
 use anyhow::Result;
-use ff_agent::cli_executor::CliResult;
 use sqlx::PgPool;
 use std::time::Duration;
 
 const MEMBER_PROMPT_PREAMBLE: &str = "You are a COUNCIL MEMBER. Give your own INDEPENDENT, \
     decisive answer to the question below — your honest best judgment, not a hedge. Be concise \
     and specific; lead with the recommendation, then the key reasoning. Question:\n\n";
+
+/// Normalized result of one member dispatch (vendor CLI or local fleet model),
+/// holding everything the council needs to print AND to log to `ff_interactions`.
+struct MemberRaw {
+    /// `Some(text)` when the member produced a usable answer.
+    answer: Option<String>,
+    /// Human-facing failure reason when `answer` is `None`.
+    error: Option<String>,
+    latency_ms: Option<i32>,
+    /// What served the call: `ff council/<member>` for a vendor CLI, or the real
+    /// `http://host:port (model)` for a local fleet member.
+    endpoint: Option<String>,
+    /// The fleet computer that answered (local members only).
+    worker_name: Option<String>,
+}
+
+impl MemberRaw {
+    fn fail(msg: impl Into<String>) -> Self {
+        Self {
+            answer: None,
+            error: Some(msg.into()),
+            latency_ms: None,
+            endpoint: None,
+            worker_name: None,
+        }
+    }
+}
 
 pub async fn handle_council(
     question: String,
@@ -33,15 +60,14 @@ pub async fn handle_council(
         .filter(|s| !s.is_empty())
         .collect();
     if members.is_empty() {
-        anyhow::bail!("no council members (pass --members codex,kimi)");
+        anyhow::bail!("no council members (pass --members codex,kimi,local:<model>)");
     }
     let timeout = timeout_secs.map(Duration::from_secs);
     let prompt = format!("{MEMBER_PROMPT_PREAMBLE}{question}");
 
-    // Best-effort: log every member + chairman dispatch to ff_interactions so a
-    // council is auditable AND becomes training data for ff's own LLM. The CLI
-    // path (cli_executor) doesn't self-log, so the council records its own I/O —
-    // same precedent as work_item_dispatch. A missing pool never blocks a council.
+    // Best-effort pool: logs every dispatch to ff_interactions AND lets `local:`
+    // members route to a fleet deployment. A missing pool never blocks a council
+    // (vendor members still run; local members fail gracefully with a clear msg).
     let pool: Option<PgPool> = ff_agent::fleet_info::get_fleet_pool().await.ok();
 
     eprintln!(
@@ -50,51 +76,39 @@ pub async fn handle_council(
         members.join(", ")
     );
 
-    // Dispatch to every member in parallel. Each member is a vendor CLI
-    // (codex/kimi/claude) wielded headlessly via the shared cli_executor — the
-    // same path `ff cli` uses, so the I/O is consistent and logged-capable.
+    // Dispatch every member in parallel (vendor CLI or local fleet model).
     let mut handles = Vec::with_capacity(members.len());
     for member in &members {
         let member = member.clone();
         let prompt = prompt.clone();
+        let pool = pool.clone();
         handles.push(tokio::spawn(async move {
-            let res =
-                ff_agent::cli_executor::execute_cli_in_dir(&member, &prompt, &[], None, timeout)
-                    .await;
-            (member, res)
+            let raw = dispatch_member(&member, &prompt, pool.as_ref(), timeout).await;
+            (member, raw)
         }));
     }
 
-    // Collect answers (member, answer) for the chairman; print each as it lands.
+    // Collect answers (member, answer) for the chairman; print + log each.
     let mut answers: Vec<(String, String)> = Vec::with_capacity(members.len());
     for handle in handles {
-        let (member, res) = match handle.await {
+        let (member, raw) = match handle.await {
             Ok(pair) => pair,
             Err(e) => {
                 eprintln!("{YELLOW}⚠ a council member task panicked: {e}{RESET}");
                 continue;
             }
         };
-        log_council(pool.as_ref(), &member, "council_member", &prompt, &res).await;
+        log_council(pool.as_ref(), &member, "council_member", &prompt, &raw).await;
         println!("\n{CYAN}═══════════ {member} ═══════════{RESET}");
-        match res {
-            Ok(r) if r.exit_code == 0 && !r.stdout.trim().is_empty() => {
-                let answer = r.stdout.trim().to_string();
+        match raw.answer {
+            Some(answer) => {
                 println!("{answer}");
                 answers.push((member, answer));
             }
-            Ok(r) => {
-                eprintln!(
-                    "{YELLOW}⚠ {member} returned no usable answer (exit {}){RESET}{}",
-                    r.exit_code,
-                    if r.stderr.trim().is_empty() {
-                        String::new()
-                    } else {
-                        format!("\n{}", r.stderr.trim())
-                    }
-                );
-            }
-            Err(e) => eprintln!("{YELLOW}⚠ {member} failed: {e}{RESET}"),
+            None => eprintln!(
+                "{YELLOW}⚠ {member} returned no usable answer{RESET}{}",
+                raw.error.map(|e| format!("\n{e}")).unwrap_or_default()
+            ),
         }
     }
 
@@ -113,8 +127,8 @@ pub async fn handle_council(
         return Ok(());
     }
 
-    // v2: automated chairman synthesis. Nothing to synthesize from 0 answers, and
-    // a lone answer IS the consensus — skip a redundant dispatch.
+    // Automated chairman synthesis. Nothing to synthesize from 0 answers, and a
+    // lone answer IS the consensus — skip a redundant dispatch.
     if ok == 0 {
         anyhow::bail!("no member answered — nothing to synthesize");
     }
@@ -126,8 +140,9 @@ pub async fn handle_council(
         return Ok(());
     }
 
-    // Pick the chairman: the requested one, else the first member. The chairman
-    // sees the question + every member's answer (labeled) and returns one verdict.
+    // Pick the chairman: the requested one, else the first member (vendor or
+    // local — dispatch_member handles both). It sees the question + every
+    // labeled answer and returns one verdict.
     let chair = chairman.unwrap_or_else(|| members[0].clone());
     let mut synth = format!(
         "You are the CHAIRMAN of an LLM council. {ok} members answered the question below \
@@ -140,35 +155,76 @@ pub async fn handle_council(
     }
 
     eprintln!("\n{CYAN}▶ Chairman ({chair}) synthesizing {ok} answers…{RESET}");
-    let res = ff_agent::cli_executor::execute_cli_in_dir(&chair, &synth, &[], None, timeout).await;
-    log_council(pool.as_ref(), &chair, "council_chairman", &synth, &res).await;
-    match res {
-        Ok(r) if r.exit_code == 0 && !r.stdout.trim().is_empty() => {
-            println!(
-                "\n{GREEN}═══════════ CONSENSUS (chairman: {chair}) ═══════════{RESET}\n{}",
-                r.stdout.trim()
+    let raw = dispatch_member(&chair, &synth, pool.as_ref(), timeout).await;
+    log_council(pool.as_ref(), &chair, "council_chairman", &synth, &raw).await;
+    match raw.answer {
+        Some(consensus) => println!(
+            "\n{GREEN}═══════════ CONSENSUS (chairman: {chair}) ═══════════{RESET}\n{consensus}"
+        ),
+        None => eprintln!(
+            "{YELLOW}⚠ chairman {chair} produced no synthesis — falling back to the raw answers \
+             above.{RESET}{}",
+            raw.error.map(|e| format!("\n{e}")).unwrap_or_default()
+        ),
+    }
+    Ok(())
+}
+
+/// Dispatch one member: a `local`/`local:<model>` fleet model via fleet_oneshot,
+/// or a vendor CLI via cli_executor. Normalizes both into a [`MemberRaw`].
+async fn dispatch_member(
+    member: &str,
+    prompt: &str,
+    pool: Option<&PgPool>,
+    timeout: Option<Duration>,
+) -> MemberRaw {
+    // Local fleet member: `local` (any healthy model) or `local:<model>` (biased).
+    if member == "local" || member.starts_with("local:") {
+        let model_hint = member.strip_prefix("local:").filter(|s| !s.is_empty());
+        let Some(pool) = pool else {
+            return MemberRaw::fail(
+                "local council member needs the fleet DB (pool unavailable) — skipping",
             );
-        }
-        Ok(r) => {
-            eprintln!(
-                "{YELLOW}⚠ chairman {chair} produced no synthesis (exit {}) — falling back to the \
-                 raw answers above.{RESET}{}",
+        };
+        return match ff_agent::fleet_oneshot::fleet_oneshot(pool, prompt, model_hint, timeout).await
+        {
+            Ok(o) => MemberRaw {
+                answer: Some(o.text),
+                error: None,
+                latency_ms: i32::try_from(o.latency_ms).ok(),
+                endpoint: Some(format!("{} ({})", o.endpoint, o.model)),
+                worker_name: Some(o.worker_name),
+            },
+            Err(e) => MemberRaw::fail(e.to_string()),
+        };
+    }
+
+    // Vendor CLI member.
+    match ff_agent::cli_executor::execute_cli_in_dir(member, prompt, &[], None, timeout).await {
+        Ok(r) if r.exit_code == 0 && !r.stdout.trim().is_empty() => MemberRaw {
+            answer: Some(r.stdout.trim().to_string()),
+            error: None,
+            latency_ms: i32::try_from(r.duration_ms).ok(),
+            endpoint: Some(format!("ff council/{member}")),
+            worker_name: None,
+        },
+        Ok(r) => MemberRaw {
+            answer: None,
+            error: Some(format!(
+                "exit {}{}",
                 r.exit_code,
                 if r.stderr.trim().is_empty() {
                     String::new()
                 } else {
-                    format!("\n{}", r.stderr.trim())
+                    format!(": {}", r.stderr.trim())
                 }
-            );
-        }
-        Err(e) => {
-            eprintln!(
-                "{YELLOW}⚠ chairman {chair} dispatch failed: {e} — falling back to the raw \
-                 answers above.{RESET}"
-            );
-        }
+            )),
+            latency_ms: i32::try_from(r.duration_ms).ok(),
+            endpoint: Some(format!("ff council/{member}")),
+            worker_name: None,
+        },
+        Err(e) => MemberRaw::fail(e.to_string()),
     }
-    Ok(())
 }
 
 /// Record one council dispatch (a member answer or the chairman synthesis) in
@@ -179,31 +235,21 @@ async fn log_council(
     member: &str,
     channel: &str,
     request: &str,
-    res: &Result<CliResult>,
+    raw: &MemberRaw,
 ) {
     let Some(pool) = pool else { return };
-    let (response_text, outcome, error_text, latency_ms) = match res {
-        Ok(r) if r.exit_code == 0 && !r.stdout.trim().is_empty() => (
-            r.stdout.trim().chars().take(16000).collect::<String>(),
+    let (response_text, outcome, error_text) = match &raw.answer {
+        Some(a) => (
+            a.chars().take(16000).collect::<String>(),
             "success".to_string(),
             None,
-            i32::try_from(r.duration_ms).ok(),
         ),
-        Ok(r) => (
+        None => (
             String::new(),
             "error".to_string(),
-            Some(format!(
-                "exit {}: {}",
-                r.exit_code,
-                r.stderr.trim().chars().take(2000).collect::<String>()
-            )),
-            i32::try_from(r.duration_ms).ok(),
-        ),
-        Err(e) => (
-            String::new(),
-            "error".to_string(),
-            Some(e.to_string().chars().take(2000).collect::<String>()),
-            None,
+            raw.error
+                .as_ref()
+                .map(|e| e.chars().take(2000).collect::<String>()),
         ),
     };
     let rec = ff_db::InteractionRecord {
@@ -211,10 +257,14 @@ async fn log_council(
         request_text: request.chars().take(16000).collect(),
         engine: Some(member.to_string()),
         response_text,
-        latency_ms,
+        latency_ms: raw.latency_ms,
         outcome,
         error_text,
-        endpoint: Some(format!("ff council/{member}")),
+        endpoint: raw
+            .endpoint
+            .clone()
+            .or_else(|| Some(format!("ff council/{member}"))),
+        worker_name: raw.worker_name.clone(),
         ..Default::default()
     };
     if let Err(e) = ff_db::pg_record_interaction(pool, &rec).await {
