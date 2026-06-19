@@ -1,11 +1,13 @@
 //! `ff council` — multi-model deliberation (karpathy/llm-council pattern).
 //!
-//! Formalizes the consensus mechanism run by hand all session: dispatch one
-//! question to N council members in PARALLEL, collect their independent answers,
-//! and print them side-by-side so a strong "chairman" model can synthesize.
+//! Dispatch one question to N council members in PARALLEL, collect their
+//! independent answers, print them side-by-side, then (v2) have a CHAIRMAN model
+//! synthesize them into a single consensus — so `ff council` returns a real
+//! answer standalone (when a fleet agent / codex / kimi runs it, not just when a
+//! strong model like Claude is driving and can synthesize itself).
 //!
-//! v1 = dispatch + collect + side-by-side print (the caller synthesizes).
-//! Cross-review/ranking + automated chairman synthesis are v2.
+//! `--no-synthesis` preserves v1 (print + let the caller synthesize).
+//! `--local` fleet members + persisted council_sessions are future increments.
 //! Design: `.forgefleet/plans/llm-council.md`.
 
 use crate::{CYAN, GREEN, RESET, YELLOW};
@@ -20,6 +22,8 @@ pub async fn handle_council(
     question: String,
     members_csv: String,
     timeout_secs: Option<u64>,
+    chairman: Option<String>,
+    no_synthesis: bool,
 ) -> Result<()> {
     let members: Vec<String> = members_csv
         .split(',')
@@ -53,7 +57,8 @@ pub async fn handle_council(
         }));
     }
 
-    let mut ok = 0usize;
+    // Collect answers (member, answer) for the chairman; print each as it lands.
+    let mut answers: Vec<(String, String)> = Vec::with_capacity(members.len());
     for handle in handles {
         let (member, res) = match handle.await {
             Ok(pair) => pair,
@@ -65,8 +70,9 @@ pub async fn handle_council(
         println!("\n{CYAN}═══════════ {member} ═══════════{RESET}");
         match res {
             Ok(r) if r.exit_code == 0 && !r.stdout.trim().is_empty() => {
-                println!("{}", r.stdout.trim());
-                ok += 1;
+                let answer = r.stdout.trim().to_string();
+                println!("{answer}");
+                answers.push((member, answer));
             }
             Ok(r) => {
                 eprintln!(
@@ -83,11 +89,74 @@ pub async fn handle_council(
         }
     }
 
-    println!(
-        "\n{GREEN}✓ {ok}/{} member(s) answered.{RESET} {CYAN}Synthesize the answers above into a \
-         single consensus (note agreements, surface dissent) — the chairman is the strong model \
-         that convened this council.{RESET}",
+    let ok = answers.len();
+    eprintln!(
+        "\n{GREEN}✓ {ok}/{} member(s) answered.{RESET}",
         members.len()
     );
+
+    // v1 behavior: print + let the caller synthesize.
+    if no_synthesis {
+        println!(
+            "\n{CYAN}Synthesize the answers above into a single consensus (note agreements, \
+             surface dissent) — the chairman is the strong model that convened this council.{RESET}"
+        );
+        return Ok(());
+    }
+
+    // v2: automated chairman synthesis. Nothing to synthesize from 0 answers, and
+    // a lone answer IS the consensus — skip a redundant dispatch.
+    if ok == 0 {
+        anyhow::bail!("no member answered — nothing to synthesize");
+    }
+    if ok == 1 {
+        println!(
+            "\n{GREEN}═══════════ CONSENSUS (sole answer) ═══════════{RESET}\n{}",
+            answers[0].1
+        );
+        return Ok(());
+    }
+
+    // Pick the chairman: the requested one, else the first member. The chairman
+    // sees the question + every member's answer (labeled) and returns one verdict.
+    let chair = chairman.unwrap_or_else(|| members[0].clone());
+    let mut synth = format!(
+        "You are the CHAIRMAN of an LLM council. {ok} members answered the question below \
+         independently. Synthesize their answers into ONE decisive consensus: state the \
+         recommendation first, note where members AGREE, and explicitly surface any DISSENT \
+         (don't average it away). Be concise.\n\n=== QUESTION ===\n{question}\n"
+    );
+    for (member, answer) in &answers {
+        synth.push_str(&format!("\n=== MEMBER {member} ===\n{answer}\n"));
+    }
+
+    eprintln!("\n{CYAN}▶ Chairman ({chair}) synthesizing {ok} answers…{RESET}");
+    let res = ff_agent::cli_executor::execute_cli_in_dir(&chair, &synth, &[], None, timeout).await;
+    match res {
+        Ok(r) if r.exit_code == 0 && !r.stdout.trim().is_empty() => {
+            println!(
+                "\n{GREEN}═══════════ CONSENSUS (chairman: {chair}) ═══════════{RESET}\n{}",
+                r.stdout.trim()
+            );
+        }
+        Ok(r) => {
+            eprintln!(
+                "{YELLOW}⚠ chairman {chair} produced no synthesis (exit {}) — falling back to the \
+                 raw answers above.{RESET}{}",
+                r.exit_code,
+                if r.stderr.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!("\n{}", r.stderr.trim())
+                }
+            );
+        }
+        Err(e) => {
+            eprintln!(
+                "{YELLOW}⚠ chairman {chair} dispatch failed: {e} — falling back to the raw \
+                 answers above.{RESET}"
+            );
+        }
+    }
     Ok(())
 }
