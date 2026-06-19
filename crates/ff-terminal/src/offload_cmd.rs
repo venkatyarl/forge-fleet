@@ -185,6 +185,35 @@ pub async fn handle_offload(
     // (belt-and-suspenders with chat_template_kwargs.enable_thinking=false).
     let result = strip_think(&extract_completion_text(&payload).unwrap_or_default());
 
+    // Log the offload turn to ff_interactions (the ff-LLM training corpus). `ff
+    // offload` is a core dogfood verb (route code work to a warm fleet coder) and
+    // was the last hot dispatch verb not logging its req/resp — after council
+    // (#442) and research (#447). Best-effort; never fails the offload.
+    let usage = payload.get("usage");
+    let usage_tok = |k: &str| -> i32 {
+        usage
+            .and_then(|u| u.get(k))
+            .and_then(|v| v.as_i64())
+            .and_then(|n| i32::try_from(n).ok())
+            .unwrap_or(0)
+    };
+    let rec = ff_db::InteractionRecord {
+        channel: "offload".to_string(),
+        request_text: prompt.chars().take(16000).collect(),
+        engine: Some(model.clone()),
+        response_text: result.chars().take(16000).collect(),
+        tokens_in: usage_tok("prompt_tokens"),
+        tokens_out: usage_tok("completion_tokens"),
+        latency_ms: i32::try_from(latency.as_millis()).ok(),
+        outcome: "success".to_string(),
+        worker_name: Some(candidate.worker_name.clone()),
+        endpoint: Some(candidate.endpoint.clone()),
+        ..Default::default()
+    };
+    if let Err(e) = ff_db::pg_record_interaction(&pool, &rec).await {
+        tracing::warn!(error = %e, "offload: failed to log interaction (non-fatal)");
+    }
+
     if json_out {
         println!(
             "{}",
