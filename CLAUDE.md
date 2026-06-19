@@ -17,6 +17,19 @@ scanning cannot.
 
 Fall back to Grep/Glob/Read **only** when the graph doesn't cover what you need.
 
+### ⛔ Discovery-first — search before you build (hard rule)
+Before writing ANY new table/module/feature, inventory what ALREADY exists — the #1 waste here
+is rebuilding a capability the fleet already has (e.g. a whole PM system already lives in `ff-mc`;
+a separate work-stealing system lives in `ff-agent`). Order is non-negotiable:
+1. **Cortex / CRG first** — `cortex_find` / `semantic_search_nodes` ("what handles work_items?"
+   → instantly points to the owning crate). Cheaper + faster than grep.
+2. **`ff db query "<read-only SQL>"`** — confirm the LIVE schema. Source `CREATE TABLE` strings
+   can DRIFT from the live DB (see schema caveat below); never `ALTER` a table you haven't
+   confirmed live.
+3. **`brain_search`** for prior decisions; **grep/Read last**.
+Then reuse/extend what exists instead of forking. If Cortex can't answer "do we already have
+this?", that's a Cortex gap to fix — improve it, don't route around it.
+
 ### Key Tools
 
 | Tool | Use when |
@@ -38,6 +51,34 @@ Fall back to Grep/Glob/Read **only** when the graph doesn't cover what you need.
 4. Use `query_graph` pattern="tests_for" to check coverage.
 
 ---
+
+## Working through ff (dogfood + key verbs)
+
+**Dogfood ff for real work.** Route work through ff (`ff run`, `ff supervise`, `ff offload`,
+`ff research`, `fleet_crew` MCP) rather than raw `codex`/`kimi`/`claude -p`. Two reasons: (1) it
+surfaces ff's own bugs — fix them in source, don't work around them; (2) every call routed through
+ff is logged to `ff_interactions` (req + resp + worker + endpoint + tokens) — the training corpus
+for ForgeFleet's own LLM. A raw `codex exec` does the work but the data is LOST. Prefer the ff
+wrapper even when the underlying model is a cloud CLI.
+
+**Verbs worth reaching for:**
+| Verb | Use |
+|------|-----|
+| `ff db query "<sql>"` | Read-only SQL against live Postgres (READ ONLY txn) — the source-of-truth for what tables/columns actually exist. Use during discovery-first. |
+| `ff memory get/add/replace/remove` | Agent **Scratchpad** — bounded (6 KB/scope) self-curating working memory with fixed blocks (task/decisions/findings/state/scratch), layered scope (session/agent/project), consolidate-and-forget. Also exposed as MCP `memory_*` tools. |
+| `ff mcp install --for all` | Wire the forgefleet MCP server into Claude Code / Codex / Kimi / Cursor / etc. Every MCP tool ff adds (memory_*, brain_*, cortex_*, fleet_*) reaches those CLIs automatically on any project. |
+| `ff cortex index / query` | Build/query the code graph for this (or any) repo. |
+| `ff fleet versions` / `ff fleet deploy --all` | Drift matrix (installed_version = source HEAD, not the running binary) / propagate binaries fleet-wide. |
+| `ff run`/`supervise`/`offload`/`research` | Dispatch work to fleet LLMs (local) or wrapped cloud CLIs — logged as training data. |
+
+**⚠️ Two schema systems — source can drift from live.** `ff-db` owns the main `PG_MIGRATIONS`
+(`crates/ff-db/src/{schema.rs,migrations.rs}`), but **`ff-mc` (mission control) bootstraps its
+OWN schema in `crates/ff-mc/src/db.rs`** (e.g. the PM `work_items` / `projects` / `milestones`
+tables live there, NOT in ff-db migrations). So a `CREATE TABLE` in ff-db source may not match the
+live DB, and a fresh ff-db-only rebuild won't create ff-mc's tables. **Always `ff db query` to
+confirm a table's real name + columns before extending it.** New ff-db migrations go at the end of
+`PG_MIGRATIONS` (forward-only, never edit existing entries); check the highest version across all
+branches first to avoid a version collision.
 
 ## Key subsystems (added 2026-04-14)
 
