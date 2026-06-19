@@ -123,6 +123,12 @@ impl ToolRegistry {
 
         // ── Computer Use (Pillar 1) ─────────────────────────────────────
         self.register(Self::computer_use());
+
+        // ── Scratchpad (agent working memory) ───────────────────────────
+        self.register(Self::memory_get());
+        self.register(Self::memory_add());
+        self.register(Self::memory_replace());
+        self.register(Self::memory_remove());
     }
 
     // ── Tool definitions ─────────────────────────────────────────────────
@@ -1419,6 +1425,92 @@ impl ToolRegistry {
             }),
         }
     }
+
+    // ── Scratchpad (agent working memory) ────────────────────────────────
+    // A small, byte-capped (6KB/scope), agent-self-editable text memory with
+    // fixed blocks and consolidate-and-forget. Sits beside session memory.
+
+    fn memory_scope_props() -> Value {
+        json!({
+            "scope_type": {
+                "type": "string",
+                "enum": ["session", "agent", "project"],
+                "description": "Memory scope. 'agent'/'project' persist across sessions; 'session' is ephemeral. Default: session."
+            },
+            "scope_key": {
+                "type": "string",
+                "description": "Identifier within the scope (agent id / project id / session id). Default: 'default'."
+            },
+            "block": {
+                "type": "string",
+                "enum": ["task", "decisions", "findings", "state", "scratch"],
+                "description": "Which fixed working-memory block to operate on."
+            }
+        })
+    }
+
+    fn memory_get() -> ToolDefinition {
+        ToolDefinition {
+            name: "memory_get".to_string(),
+            description: "Read your curated working memory (the Scratchpad). Returns all blocks for a scope, or one block if 'block' is given. Use at the start of work to recall task/decisions/findings/state.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": Self::memory_scope_props(),
+            }),
+        }
+    }
+
+    fn memory_add() -> ToolDefinition {
+        ToolDefinition {
+            name: "memory_add".to_string(),
+            description: "Append a line to a working-memory block. Use to record a decision, a finding, current task state. When the scope exceeds its byte cap, the lowest-priority block is auto-summarized (consolidate-and-forget) and the full text is preserved in Brain.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "scope_type": Self::memory_scope_props()["scope_type"],
+                    "scope_key": Self::memory_scope_props()["scope_key"],
+                    "block": Self::memory_scope_props()["block"],
+                    "text": { "type": "string", "description": "Text to append (newline-separated)." }
+                },
+                "required": ["block", "text"]
+            }),
+        }
+    }
+
+    fn memory_replace() -> ToolDefinition {
+        ToolDefinition {
+            name: "memory_replace".to_string(),
+            description: "Replace the single occurrence of 'old' with 'new' in a working-memory block. Errors unless 'old' matches exactly once. Use to update a decision/state in place.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "scope_type": Self::memory_scope_props()["scope_type"],
+                    "scope_key": Self::memory_scope_props()["scope_key"],
+                    "block": Self::memory_scope_props()["block"],
+                    "old": { "type": "string", "description": "Existing substring to replace (must be unique in the block)." },
+                    "new": { "type": "string", "description": "Replacement text." }
+                },
+                "required": ["block", "old", "new"]
+            }),
+        }
+    }
+
+    fn memory_remove() -> ToolDefinition {
+        ToolDefinition {
+            name: "memory_remove".to_string(),
+            description: "Remove one occurrence of 'text' from a working-memory block, or clear the whole block when 'text' is omitted.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "scope_type": Self::memory_scope_props()["scope_type"],
+                    "scope_key": Self::memory_scope_props()["scope_key"],
+                    "block": Self::memory_scope_props()["block"],
+                    "text": { "type": "string", "description": "Substring to remove. Omit to clear the entire block." }
+                },
+                "required": ["block"]
+            }),
+        }
+    }
 }
 
 impl Default for ToolRegistry {
@@ -1490,6 +1582,11 @@ mod tests {
             "cortex_review",
             // Pillar 1 — Computer Use (PR-H, #37)
             "computer_use",
+            // Pillar 2 — Scratchpad (agent working memory)
+            "memory_get",
+            "memory_add",
+            "memory_replace",
+            "memory_remove",
         ];
         for name in &expected {
             assert!(registry.contains(name), "missing tool: {name}");

@@ -8126,3 +8126,202 @@ pub async fn pg_interaction_channel_counts(pool: &PgPool) -> Result<Vec<JsonValu
         })
         .collect())
 }
+
+// ── agent_memory ("Scratchpad") ──────────────────────────────────────────
+// Small, byte-capped, agent-self-editable working memory. ff-db owns the
+// transactional SQL primitives; the consolidate-and-forget driver (which
+// calls a summarizer LLM) lives in ff-agent::scratchpad.
+// Design: plans/agent-working-memory.md (LLM council 2026-06-19).
+
+/// The five fixed working-memory blocks, in eviction priority order
+/// (`scratch` evicted first, `decisions` last — only ever summarized).
+pub const MEMORY_BLOCKS: [&str; 5] = ["task", "decisions", "findings", "state", "scratch"];
+
+/// Default per-scope byte cap when no override row exists.
+pub const MEMORY_DEFAULT_CAP_BYTES: i32 = 6144;
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MemoryBlock {
+    pub scope_type: String,
+    pub scope_key: String,
+    pub block: String,
+    pub content: String,
+    pub bytes: i32,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Resolve the byte cap for a scope: a `(scope_type, scope_key)` override,
+/// else the `(scope_type, '')` default, else [`MEMORY_DEFAULT_CAP_BYTES`].
+pub async fn pg_memory_cap(pool: &PgPool, scope_type: &str, scope_key: &str) -> Result<i32> {
+    let row = sqlx::query(
+        "SELECT cap_bytes FROM agent_memory_caps
+          WHERE scope_type = $1 AND scope_key IN ($2, '')
+          ORDER BY (scope_key = $2) DESC
+          LIMIT 1",
+    )
+    .bind(scope_type)
+    .bind(scope_key)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row
+        .map(|r| r.get::<i32, _>("cap_bytes"))
+        .unwrap_or(MEMORY_DEFAULT_CAP_BYTES))
+}
+
+/// Set (upsert) the byte cap for a scope. `scope_key = ""` sets the default
+/// for the whole `scope_type`.
+pub async fn pg_memory_set_cap(
+    pool: &PgPool,
+    scope_type: &str,
+    scope_key: &str,
+    cap_bytes: i32,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO agent_memory_caps (scope_type, scope_key, cap_bytes)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (scope_type, scope_key) DO UPDATE SET cap_bytes = EXCLUDED.cap_bytes",
+    )
+    .bind(scope_type)
+    .bind(scope_key)
+    .bind(cap_bytes.max(0))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Read all non-empty blocks for a scope (ordered by the fixed block order).
+pub async fn pg_memory_get_all(
+    pool: &PgPool,
+    scope_type: &str,
+    scope_key: &str,
+) -> Result<Vec<MemoryBlock>> {
+    let rows = sqlx::query(
+        "SELECT scope_type, scope_key, block, content, bytes, updated_at
+           FROM agent_memory
+          WHERE scope_type = $1 AND scope_key = $2
+          ORDER BY array_position(ARRAY['task','decisions','findings','state','scratch'], block)",
+    )
+    .bind(scope_type)
+    .bind(scope_key)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .iter()
+        .map(|r| MemoryBlock {
+            scope_type: r.get("scope_type"),
+            scope_key: r.get("scope_key"),
+            block: r.get("block"),
+            content: r.get("content"),
+            bytes: r.get("bytes"),
+            updated_at: r.get("updated_at"),
+        })
+        .collect())
+}
+
+/// Read a single block's content (empty string if the block does not exist).
+pub async fn pg_memory_get_block(
+    pool: &PgPool,
+    scope_type: &str,
+    scope_key: &str,
+    block: &str,
+) -> Result<String> {
+    let row = sqlx::query(
+        "SELECT content FROM agent_memory
+          WHERE scope_type = $1 AND scope_key = $2 AND block = $3",
+    )
+    .bind(scope_type)
+    .bind(scope_key)
+    .bind(block)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row
+        .map(|r| r.get::<String, _>("content"))
+        .unwrap_or_default())
+}
+
+/// Upsert a block's full content, recomputing `bytes` from the new content.
+/// Deletes the row when `content` is empty (keeps the scope tidy).
+pub async fn pg_memory_set_block(
+    pool: &PgPool,
+    scope_type: &str,
+    scope_key: &str,
+    block: &str,
+    content: &str,
+) -> Result<()> {
+    if content.is_empty() {
+        sqlx::query(
+            "DELETE FROM agent_memory
+              WHERE scope_type = $1 AND scope_key = $2 AND block = $3",
+        )
+        .bind(scope_type)
+        .bind(scope_key)
+        .bind(block)
+        .execute(pool)
+        .await?;
+        return Ok(());
+    }
+    sqlx::query(
+        "INSERT INTO agent_memory (scope_type, scope_key, block, content, bytes, updated_at)
+         VALUES ($1, $2, $3, $4, octet_length($4), NOW())
+         ON CONFLICT (scope_type, scope_key, block)
+         DO UPDATE SET content = EXCLUDED.content,
+                       bytes   = EXCLUDED.bytes,
+                       updated_at = NOW()",
+    )
+    .bind(scope_type)
+    .bind(scope_key)
+    .bind(block)
+    .bind(content)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Total bytes used across all blocks in a scope.
+pub async fn pg_memory_total_bytes(
+    pool: &PgPool,
+    scope_type: &str,
+    scope_key: &str,
+) -> Result<i64> {
+    let row = sqlx::query(
+        "SELECT COALESCE(SUM(bytes), 0)::BIGINT AS total
+           FROM agent_memory WHERE scope_type = $1 AND scope_key = $2",
+    )
+    .bind(scope_type)
+    .bind(scope_key)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.get::<i64, _>("total"))
+}
+
+/// Record one consolidate-and-forget eviction in the audit trail.
+#[allow(clippy::too_many_arguments)]
+pub async fn pg_memory_record_eviction(
+    pool: &PgPool,
+    scope_type: &str,
+    scope_key: &str,
+    block: &str,
+    prev_hash: &str,
+    prev_bytes: i32,
+    summary: &str,
+    summarizer: &str,
+    brain_ref: Option<&str>,
+) -> Result<uuid::Uuid> {
+    let row = sqlx::query(
+        "INSERT INTO agent_memory_evictions
+            (scope_type, scope_key, block, prev_hash, prev_bytes, summary, summarizer, brain_ref)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         RETURNING id",
+    )
+    .bind(scope_type)
+    .bind(scope_key)
+    .bind(block)
+    .bind(prev_hash)
+    .bind(prev_bytes)
+    .bind(summary)
+    .bind(summarizer)
+    .bind(brain_ref)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.get("id"))
+}

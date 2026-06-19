@@ -104,6 +104,7 @@ pub mod revive;
 pub mod rpc_inference;
 pub mod scheduler_tick;
 pub mod scoped_memory;
+pub mod scratchpad;
 pub mod secrets_rotation;
 pub mod self_improvement;
 pub mod session_runner;

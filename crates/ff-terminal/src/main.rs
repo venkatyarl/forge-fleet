@@ -59,6 +59,7 @@ mod lifecycle_cmd;
 mod llm_cmd;
 mod logs_cmd;
 mod mcp_cmd;
+mod memory_cmd;
 mod metrics_cmd;
 mod model_cmd;
 mod model_serve_cmd;
@@ -553,6 +554,11 @@ enum Command {
     VirtualBrain {
         #[command(subcommand)]
         command: BrainCommand,
+    },
+    /// Agent working memory (Scratchpad) — bounded, self-curating per-scope memory.
+    Memory {
+        #[command(subcommand)]
+        command: MemoryCommand,
     },
     /// Cortex code graph — one-shot index + query for the current repo.
     ///
@@ -2249,6 +2255,56 @@ pub enum SocialCommand {
 }
 
 #[derive(Debug, Clone, Subcommand)]
+pub enum MemoryCommand {
+    /// Show the working set for a scope (all blocks, or one with --block).
+    Get {
+        #[arg(long, default_value = "session")]
+        scope_type: String,
+        #[arg(long, default_value = "default")]
+        scope_key: String,
+        #[arg(long)]
+        block: Option<String>,
+    },
+    /// Append a line to a block (task|decisions|findings|state|scratch).
+    Add {
+        block: String,
+        text: String,
+        #[arg(long, default_value = "session")]
+        scope_type: String,
+        #[arg(long, default_value = "default")]
+        scope_key: String,
+    },
+    /// Replace the unique occurrence of OLD with NEW in a block.
+    Replace {
+        block: String,
+        old: String,
+        new: String,
+        #[arg(long, default_value = "session")]
+        scope_type: String,
+        #[arg(long, default_value = "default")]
+        scope_key: String,
+    },
+    /// Remove a substring from a block, or clear it entirely (omit --text).
+    Remove {
+        block: String,
+        #[arg(long)]
+        text: Option<String>,
+        #[arg(long, default_value = "session")]
+        scope_type: String,
+        #[arg(long, default_value = "default")]
+        scope_key: String,
+    },
+    /// Set the byte cap for a scope (scope_key "" sets the scope_type default).
+    Cap {
+        cap_bytes: i32,
+        #[arg(long, default_value = "session")]
+        scope_type: String,
+        #[arg(long, default_value = "")]
+        scope_key: String,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
 pub enum BrainCommand {
     /// Run a full vault index (parse all .md files, upsert nodes + edges).
     Index {
@@ -3820,6 +3876,7 @@ async fn main() -> Result<()> {
         Some(Command::Swarm { command }) => swarm_cmd::handle_swarm(command).await,
         Some(Command::Onboard { command }) => onboard_cmd::handle_onboard(command).await,
         Some(Command::VirtualBrain { command }) => brain_cmd::handle_brain(command).await,
+        Some(Command::Memory { command }) => memory_cmd::handle_memory(command).await,
         Some(Command::Cortex(args)) => top_cortex_cmd::handle_top_cortex(args).await,
         Some(Command::Openclaw { command }) => openclaw_cmd::handle_openclaw(command).await,
         Some(Command::Pm { command }) => pm_cmd::handle_pm(command).await,

@@ -1776,7 +1776,7 @@ async fn update_session_status(pool: &PgPool, session_id: Uuid, status: &str) ->
 /// One-shot OpenAI-compatible completion call via the fleet gateway.
 /// Uses the chat-completions endpoint with a single user message. Returns
 /// the assistant's text content.
-async fn openai_single_completion(
+pub async fn openai_single_completion(
     gateway_url: &str,
     model: &str,
     prompt: &str,
