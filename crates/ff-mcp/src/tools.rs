@@ -1582,6 +1582,11 @@ mod tests {
             "cortex_review",
             // Pillar 1 — Computer Use (PR-H, #37)
             "computer_use",
+            // Pillar 2 — Scratchpad (agent working memory)
+            "memory_get",
+            "memory_add",
+            "memory_replace",
+            "memory_remove",
         ];
         for name in &expected {
             assert!(registry.contains(name), "missing tool: {name}");
