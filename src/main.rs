@@ -697,6 +697,19 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         ));
     }
 
+    // 15c) Pillar 4 work_item dispatch — every 15s, PER-HOST (not leader-gated).
+    // Each host executes ITS OWN assigned slots: detect current_work_item_id →
+    // git worktree → ff cli dispatch → heartbeat lease → PR + merge-queue on done.
+    if let Some(pg_pool) = operational_store.pg_pool().cloned() {
+        info!("starting subsystem: work_item dispatch (15s, per-host)");
+        subsystem_tasks.push(ff_agent::work_item_dispatch::spawn_work_item_dispatch(
+            pg_pool,
+            worker_name.clone(),
+            15,
+            shutdown_rx.clone(),
+        ));
+    }
+
     // 16) Procedural memory consolidation — every 6h, leader-gated.
     // Phase 14: scans completed sessions, extracts successful patterns into agent_procedures.
     if let Some(pg_pool) = operational_store.pg_pool().cloned() {

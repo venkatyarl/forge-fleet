@@ -137,6 +137,7 @@ pub use queries::{
     pg_get_task_lineage,
     pg_get_training_job,
     pg_get_work_intent,
+    pg_heartbeat_work_item_lease,
     pg_insert_brain_candidate,
     pg_insert_brain_message,
     pg_insert_brain_reminder,
