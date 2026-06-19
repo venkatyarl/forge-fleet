@@ -113,6 +113,73 @@ pub async fn handle_pm(cmd: crate::PmCommand) -> Result<()> {
             println!("  priority: {prio}");
             println!("  created_by: {created_by}");
         }
+        crate::PmCommand::Ready { id, on } => {
+            let uid = uuid::Uuid::parse_str(&id)
+                .map_err(|e| anyhow::anyhow!("invalid work item id '{id}': {e}"))?;
+            let row: Option<(String,)> = sqlx::query_as(
+                "UPDATE work_items \
+                    SET status = 'ready', \
+                        assigned_computer = COALESCE($2, assigned_computer) \
+                  WHERE id = $1 \
+                 RETURNING kind",
+            )
+            .bind(uid)
+            .bind(on.as_deref())
+            .fetch_optional(&pool)
+            .await
+            .map_err(|e| anyhow::anyhow!("flag ready: {e}"))?;
+            match row {
+                None => return Err(anyhow::anyhow!("no work item with id {id}")),
+                Some((kind,)) => {
+                    println!("{GREEN}✓ work item {id} flagged ready{RESET}");
+                    if let Some(host) = &on {
+                        println!("  pinned to: {host}");
+                    }
+                    if kind == "task" {
+                        println!(
+                            "  the Pillar 4 scheduler (10s tick) will assign it to a free slot."
+                        );
+                    } else {
+                        println!(
+                            "  note: kind='{kind}' — only kind='task' (leaf) items are scheduled; \
+                             decompose into tasks first."
+                        );
+                    }
+                }
+            }
+        }
+        crate::PmCommand::Cancel { id } => {
+            let uid = uuid::Uuid::parse_str(&id)
+                .map_err(|e| anyhow::anyhow!("invalid work item id '{id}': {e}"))?;
+            // Release any active lease + free the slot, then mark terminal.
+            sqlx::query(
+                "UPDATE sub_agents SET current_work_item_id = NULL, status = 'idle' \
+                  WHERE current_work_item_id = $1",
+            )
+            .bind(uid)
+            .execute(&pool)
+            .await
+            .map_err(|e| anyhow::anyhow!("free slot: {e}"))?;
+            sqlx::query(
+                "UPDATE work_item_leases \
+                    SET released_at = NOW(), lease_state = 'released', release_reason = 'cancelled' \
+                  WHERE work_item_id = $1 AND released_at IS NULL",
+            )
+            .bind(uid)
+            .execute(&pool)
+            .await
+            .map_err(|e| anyhow::anyhow!("release lease: {e}"))?;
+            let n = sqlx::query("UPDATE work_items SET status = 'cancelled' WHERE id = $1")
+                .bind(uid)
+                .execute(&pool)
+                .await
+                .map_err(|e| anyhow::anyhow!("cancel work item: {e}"))?
+                .rows_affected();
+            if n == 0 {
+                return Err(anyhow::anyhow!("no work item with id {id}"));
+            }
+            println!("{GREEN}✓ work item {id} cancelled{RESET} (lease released, slot freed)");
+        }
         crate::PmCommand::Show { id } => {
             let uid = uuid::Uuid::parse_str(&id)
                 .map_err(|e| anyhow::anyhow!("invalid UUID '{id}': {e}"))?;
