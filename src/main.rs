@@ -750,6 +750,28 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         ));
     }
 
+    // 16a) Cortex reindex — every hour, leader-gated.
+    // The embed (16b) + summary (16c) ticks maintain metadata over already-
+    // indexed nodes but NEVER re-parse changed source, so the graph structure
+    // silently drifts from HEAD once nobody runs `ff cortex index` by hand
+    // (observed 2026-06-19: the forge-fleet corpus was 4 days stale and
+    // `cortex_find fleet_oneshot` returned 0 hits). This tick re-scans +
+    // incrementally re-indexes the self corpus (hash-diffed — unchanged files
+    // skipped, cheap); 16b then embeds the freshly-indexed nodes. Pure graph
+    // maintenance — runs by DEFAULT; opt out with
+    // `fleet_secrets.cortex_index_mode=off`.
+    if let Some(pg_pool) = operational_store.pg_pool().cloned() {
+        info!(
+            "starting subsystem: cortex reindex tick (hourly, leader-gated, gate=fleet_secrets.cortex_index_mode default on)"
+        );
+        subsystem_tasks.push(ff_brain::spawn_reindex_loop(
+            pg_pool,
+            worker_name.clone(),
+            3600,
+            shutdown_rx.clone(),
+        ));
+    }
+
     // 16b) Cortex embed-refresh — every hour, leader-gated.
     // A freshly-(re)indexed code symbol lands with a NULL `embedding`, so
     // `ff cortex find --semantic` goes stale on just-changed code until someone
