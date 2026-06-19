@@ -2683,6 +2683,18 @@ pub enum PmCommand {
     },
     /// Show details of a work item (by UUID).
     Show { id: String },
+    /// Flag a work item ready for fleet scheduling (status='ready'). The Pillar 4
+    /// scheduler tick then assigns it to a free fleet slot via a lease.
+    Ready {
+        /// Work item UUID.
+        id: String,
+        /// Optionally pin execution to one computer (sets assigned_computer).
+        #[arg(long)]
+        on: Option<String>,
+    },
+    /// Cancel a work item (terminal status='cancelled'): releases any active
+    /// lease and frees its slot so the scheduler stops touching it.
+    Cancel { id: String },
     /// Import Claude Code session tasks into projects.work_items.
     ///
     /// Claude Code's TaskCreate/TaskList/TaskUpdate tools keep their state
