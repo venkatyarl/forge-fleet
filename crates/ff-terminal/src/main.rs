@@ -284,6 +284,12 @@ enum Command {
         /// Kill the CLI after this many seconds (default: 600).
         #[arg(long)]
         timeout: Option<u64>,
+        /// Exit non-zero (3) if the vendor exits 0 but makes NO file change in
+        /// the working dir. Catches the silent "exit 0, wrote nothing" failure
+        /// (e.g. a stdin pipe consuming codex's input). Off by default so
+        /// read-only prompts (explain/summarize) still succeed.
+        #[arg(long, default_value_t = false)]
+        require_change: bool,
     },
     /// Run with supervisor — auto-detect failures, fix, and retry
     Supervise {
@@ -3525,6 +3531,7 @@ async fn main() -> Result<()> {
             prompt,
             output,
             timeout,
+            require_change,
         }) => {
             return cli_bridge_cmd::handle_cli(
                 vendor.clone(),
@@ -3532,6 +3539,7 @@ async fn main() -> Result<()> {
                 cli.cwd.clone(),
                 output.clone(),
                 *timeout,
+                *require_change,
             )
             .await;
         }
