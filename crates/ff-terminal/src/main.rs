@@ -45,6 +45,7 @@ mod config_cmd;
 mod conformance_cmd;
 mod corpus_cmd;
 mod cortex_cmd;
+mod council_cmd;
 mod daemon_cmd;
 mod db_cmd;
 mod defer_cmd;
@@ -290,6 +291,19 @@ enum Command {
         /// read-only prompts (explain/summarize) still succeed.
         #[arg(long, default_value_t = false)]
         require_change: bool,
+    },
+    /// LLM council — dispatch one question to N members in parallel, collect
+    /// their independent answers side-by-side for synthesis (karpathy/llm-council
+    /// pattern). Formalizes the multi-model consensus mechanism.
+    Council {
+        /// The question to put to the council.
+        question: String,
+        /// Comma-separated council members (vendor CLIs): codex,kimi,claude.
+        #[arg(long, default_value = "codex,kimi")]
+        members: String,
+        /// Kill each member after this many seconds.
+        #[arg(long)]
+        timeout: Option<u64>,
     },
     /// Run with supervisor — auto-detect failures, fix, and retry
     Supervise {
@@ -3543,6 +3557,13 @@ async fn main() -> Result<()> {
             )
             .await;
         }
+        Some(Command::Council {
+            question,
+            members,
+            timeout,
+        }) => {
+            return council_cmd::handle_council(question.clone(), members.clone(), *timeout).await;
+        }
         Some(Command::Secrets { command }) => {
             return secrets_cmd::handle_secrets(command.clone()).await;
         }
@@ -4851,6 +4872,7 @@ async fn main() -> Result<()> {
         // `ff cli` is fully handled on the fast path above (it returns
         // before reaching here). This arm exists only for exhaustiveness.
         Some(Command::Cli { .. }) => unreachable!("Command::Cli handled on fast path"),
+        Some(Command::Council { .. }) => unreachable!("Command::Council handled on fast path"),
         None => {
             let prompt_text = cli.prompt.join(" ");
             if !prompt_text.is_empty() {
