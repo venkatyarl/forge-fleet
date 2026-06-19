@@ -40,20 +40,46 @@ pub async fn evaluate_merge_queue(pg: &PgPool) -> Result<usize> {
             ff_db::pg_mark_merge_failed(pg, item.id, item.work_item_id, &reason).await?;
             Ok(0)
         }
-        CiState::Success => match gh_merge_squash(&pr_url).await {
-            Ok(()) => {
-                ff_db::pg_mark_merge_merged(pg, item.id, item.work_item_id).await?;
-                info!(pr = %pr_url, work_item = %item.work_item_id, "merge_drain: merged");
-                Ok(1)
+        CiState::Success => {
+            // SAFETY GATE: never auto-merge LLM-authored code to main unless the
+            // operator has explicitly opted in. Default OFF → the PR is left
+            // 'mergeable' (CI-green, awaiting approval); flip
+            // `work_item_automerge_mode` on (or merge the PR by hand) to land it.
+            if !automerge_enabled(pg).await {
+                ff_db::pg_mark_merge_mergeable(pg, item.id).await?;
+                info!(
+                    pr = %pr_url,
+                    "merge_drain: PR CI green — MERGEABLE, awaiting operator approval \
+                     (work_item_automerge_mode off)"
+                );
+                return Ok(0);
             }
-            Err(e) => {
-                let reason = format!("gh pr merge failed: {e}");
-                warn!(pr = %pr_url, %reason, "merge_drain: merge failed");
-                ff_db::pg_mark_merge_failed(pg, item.id, item.work_item_id, &reason).await?;
-                Ok(0)
+            match gh_merge_squash(&pr_url).await {
+                Ok(()) => {
+                    ff_db::pg_mark_merge_merged(pg, item.id, item.work_item_id).await?;
+                    info!(pr = %pr_url, work_item = %item.work_item_id, "merge_drain: merged");
+                    Ok(1)
+                }
+                Err(e) => {
+                    let reason = format!("gh pr merge failed: {e}");
+                    warn!(pr = %pr_url, %reason, "merge_drain: merge failed");
+                    ff_db::pg_mark_merge_failed(pg, item.id, item.work_item_id, &reason).await?;
+                    Ok(0)
+                }
             }
-        },
+        }
     }
+}
+
+/// Whether the operator has opted into auto-merging work_item PRs to main.
+/// Default OFF — the loop opens + queues PRs but a human approves the merge.
+async fn automerge_enabled(pg: &PgPool) -> bool {
+    matches!(
+        ff_db::pg_read_gate_value(pg, "work_item_automerge_mode", "off", "off")
+            .await
+            .as_deref(),
+        Ok("on") | Ok("true") | Ok("1")
+    )
 }
 
 enum CiState {

@@ -180,6 +180,7 @@ pub use queries::{
     pg_loadable_library_for_kind,
     pg_mark_merge_ci_running,
     pg_mark_merge_failed,
+    pg_mark_merge_mergeable,
     pg_mark_merge_merged,
     pg_mark_schedule_fired,
     pg_next_merge_queue_item,

@@ -113,6 +113,17 @@ pub fn spawn_work_item_dispatch(
     })
 }
 
+/// Expand a leading `~` to $HOME (computers.source_tree_path is stored as
+/// `~/projects/forge-fleet` etc.). Leaves absolute paths untouched.
+fn expand_tilde(p: &str) -> String {
+    if let Some(rest) = p.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest).to_string_lossy().to_string();
+        }
+    }
+    p.to_string()
+}
+
 async fn assigned_work_items(
     pg: &PgPool,
     worker_name: &str,
@@ -128,7 +139,7 @@ async fn assigned_work_items(
             w.title,
             w.description,
             w.base_branch,
-            COALESCE(NULLIF(w.metadata->>'repo_path', ''), $2) AS repo_path,
+            COALESCE(NULLIF(w.metadata->>'repo_path', ''), NULLIF(c.source_tree_path, ''), $2) AS repo_path,
             sa.id AS sub_agent_id,
             sa.computer_id,
             sa.slot
@@ -167,7 +178,7 @@ async fn assigned_work_items(
                 title: r.get("title"),
                 description: r.try_get("description").ok().flatten(),
                 base_branch: r.try_get("base_branch").ok().flatten(),
-                repo_path: PathBuf::from(r.get::<String, _>("repo_path")),
+                repo_path: PathBuf::from(expand_tilde(&r.get::<String, _>("repo_path"))),
                 sub_agent_id: r.get("sub_agent_id"),
                 computer_id: r.get("computer_id"),
                 slot: r.get("slot"),

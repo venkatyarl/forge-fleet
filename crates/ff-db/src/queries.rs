@@ -8534,11 +8534,11 @@ pub async fn pg_next_merge_queue_item(pool: &PgPool) -> Result<Option<MergeQueue
     let row = sqlx::query(
         "SELECT id, work_item_id, project_id, pr_url, branch_name
            FROM work_item_merge_queue q
-          WHERE q.status IN ('queued', 'ci_running')
+          WHERE q.status IN ('queued', 'ci_running', 'mergeable')
             AND NOT EXISTS (
                 SELECT 1 FROM work_item_merge_queue q2
                  WHERE q2.project_id = q.project_id
-                   AND q2.status IN ('queued', 'ci_running')
+                   AND q2.status IN ('queued', 'ci_running', 'mergeable')
                    AND q2.position < q.position)
           ORDER BY q.position ASC
           LIMIT 1",
@@ -8564,6 +8564,17 @@ pub async fn pg_mark_merge_ci_running(pool: &PgPool, id: uuid::Uuid) -> Result<(
     .bind(id)
     .execute(pool)
     .await?;
+    Ok(())
+}
+
+/// Mark a merge-queue entry 'mergeable': CI green but auto-merge is gated OFF, so
+/// the PR awaits operator approval (flip work_item_automerge_mode on, or merge by
+/// hand). Idempotent.
+pub async fn pg_mark_merge_mergeable(pool: &PgPool, id: uuid::Uuid) -> Result<()> {
+    sqlx::query("UPDATE work_item_merge_queue SET status = 'mergeable' WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
