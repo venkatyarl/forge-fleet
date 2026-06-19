@@ -7990,6 +7990,11 @@ pub struct InteractionRecord {
     pub error_signature: Option<String>,
     pub ff_build_sha: Option<String>,
     pub model_versions: serde_json::Value,
+    /// Hybrid-LLM attribution (V138): which fleet computer + LLM endpoint actually
+    /// served this turn, so "how much did each computer/model do" is answerable
+    /// from `ff_interactions`. Both nullable — populated when the route is known.
+    pub worker_name: Option<String>,
+    pub endpoint: Option<String>,
 }
 
 impl Default for InteractionRecord {
@@ -8013,6 +8018,8 @@ impl Default for InteractionRecord {
             error_signature: None,
             ff_build_sha: None,
             model_versions: serde_json::json!({}),
+            worker_name: None,
+            endpoint: None,
         }
     }
 }
@@ -8024,8 +8031,8 @@ pub async fn pg_record_interaction(pool: &PgPool, r: &InteractionRecord) -> Resu
             (session_id, channel, user_id, request_text, request_meta,
              route_decision, engine, steps, response_text, tokens_in,
              tokens_out, cost_usd, latency_ms, outcome, error_text,
-             error_signature, ff_build_sha, model_versions)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+             error_signature, ff_build_sha, model_versions, worker_name, endpoint)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
          RETURNING id",
     )
     .bind(r.session_id)
@@ -8046,6 +8053,8 @@ pub async fn pg_record_interaction(pool: &PgPool, r: &InteractionRecord) -> Resu
     .bind(&r.error_signature)
     .bind(&r.ff_build_sha)
     .bind(&r.model_versions)
+    .bind(&r.worker_name)
+    .bind(&r.endpoint)
     .fetch_one(pool)
     .await?;
     Ok(row.get("id"))
