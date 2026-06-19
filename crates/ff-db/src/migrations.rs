@@ -829,6 +829,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "agent_scratchpad",
         sql: schema::SCHEMA_V139_AGENT_SCRATCHPAD,
     },
+    PgMigration {
+        version: 140,
+        name: "distributed_dev_workitems",
+        sql: schema::SCHEMA_V140_DISTRIBUTED_DEV,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
