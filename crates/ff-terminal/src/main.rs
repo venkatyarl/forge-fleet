@@ -304,6 +304,15 @@ enum Command {
         /// Kill each member after this many seconds.
         #[arg(long)]
         timeout: Option<u64>,
+        /// Chairman that synthesizes the members' answers into one consensus
+        /// (a vendor CLI: codex/kimi/claude). Defaults to the first member.
+        #[arg(long)]
+        chairman: Option<String>,
+        /// Skip automated synthesis — just print the side-by-side answers and let
+        /// the caller synthesize (the v1 behavior; use when a strong model already
+        /// drives this council, e.g. Claude).
+        #[arg(long)]
+        no_synthesis: bool,
     },
     /// Run with supervisor — auto-detect failures, fix, and retry
     Supervise {
@@ -3561,8 +3570,17 @@ async fn main() -> Result<()> {
             question,
             members,
             timeout,
+            chairman,
+            no_synthesis,
         }) => {
-            return council_cmd::handle_council(question.clone(), members.clone(), *timeout).await;
+            return council_cmd::handle_council(
+                question.clone(),
+                members.clone(),
+                *timeout,
+                chairman.clone(),
+                *no_synthesis,
+            )
+            .await;
         }
         Some(Command::Secrets { command }) => {
             return secrets_cmd::handle_secrets(command.clone()).await;
