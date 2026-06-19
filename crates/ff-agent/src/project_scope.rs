@@ -15,11 +15,21 @@ use std::process::Command;
 
 /// Resolve a stable project id from `dir` (or the process cwd when `None`).
 ///
-/// Prefers the git origin remote canonicalized to `github.com/org/repo` (stable
-/// across clone paths); else the git toplevel basename as `local:<basename>`;
-/// else `None`. The returned value is the bare id — callers set
-/// `scope_type = "project"` as the namespace.
+/// Precedence:
+///   1. a `.forgefleet-project` marker file (walking up from `dir`) — explicit
+///      operator intent, ranks ABOVE git. Its first non-comment line IS the id;
+///      use it to scope a non-git directory, a monorepo subtree, or to pin a
+///      stable id independent of the remote.
+///   2. the git origin remote canonicalized to `github.com/org/repo` (stable
+///      across clone paths);
+///   3. the git toplevel basename as `local:<basename>`;
+///   4. `None`.
+///
+/// The returned value is the bare id — callers set `scope_type = "project"`.
 pub fn resolve_from_dir(dir: Option<&Path>) -> Option<String> {
+    if let Some(id) = marker_project_id(dir) {
+        return Some(id);
+    }
     let git = |args: &[&str]| -> Option<String> {
         let mut cmd = Command::new("git");
         if let Some(d) = dir {
@@ -43,6 +53,39 @@ pub fn resolve_from_dir(dir: Option<&Path>) -> Option<String> {
         return Some(format!("local:{}", base.to_lowercase()));
     }
     None
+}
+
+/// Walk up from `dir` (or cwd) looking for a `.forgefleet-project` marker. Its
+/// first non-empty, non-`#`-comment line is the project id (trimmed). A subtree
+/// inherits the nearest ancestor's marker (like `.gitignore` discovery). The
+/// walk is bounded so a pathological path can't loop forever.
+fn marker_project_id(dir: Option<&Path>) -> Option<String> {
+    let start = match dir {
+        Some(d) => d.to_path_buf(),
+        None => std::env::current_dir().ok()?,
+    };
+    let mut cur: &Path = start.as_path();
+    for _ in 0..64 {
+        if let Ok(content) = std::fs::read_to_string(cur.join(".forgefleet-project"))
+            && let Some(id) = marker_id_from_contents(&content)
+        {
+            return Some(id);
+        }
+        match cur.parent() {
+            Some(p) => cur = p,
+            None => break,
+        }
+    }
+    None
+}
+
+/// Parse a `.forgefleet-project` body: the first non-empty, non-comment line.
+fn marker_id_from_contents(content: &str) -> Option<String> {
+    content
+        .lines()
+        .map(|l| l.trim())
+        .find(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|l| l.to_string())
 }
 
 /// Normalize a git remote URL to a stable `host/org/repo` (lowercase, no `.git`).
@@ -132,5 +175,34 @@ mod tests {
     fn rejects_non_git_urls() {
         assert_eq!(canonical_remote("not a url"), None);
         assert_eq!(canonical_remote("git@github.com:"), None);
+    }
+
+    #[test]
+    fn marker_takes_first_non_comment_line() {
+        assert_eq!(
+            marker_id_from_contents("# my project\n\n  acme/api  \nignored\n").as_deref(),
+            Some("acme/api")
+        );
+        assert_eq!(
+            marker_id_from_contents("github.com/org/repo").as_deref(),
+            Some("github.com/org/repo")
+        );
+        assert_eq!(marker_id_from_contents("# only comments\n\n  \n"), None);
+        assert_eq!(marker_id_from_contents(""), None);
+    }
+
+    #[test]
+    fn marker_walks_up_and_ranks_above_git() {
+        // A marker in an ancestor dir scopes a subtree, and resolve_from_dir
+        // returns it verbatim even inside this git repo (marker > git origin).
+        let tmp = std::env::temp_dir().join(format!("ffmarker_{}", std::process::id()));
+        let sub = tmp.join("a/b/c");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(tmp.join(".forgefleet-project"), "acme/monorepo\n").unwrap();
+        assert_eq!(
+            resolve_from_dir(Some(&sub)).as_deref(),
+            Some("acme/monorepo")
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
