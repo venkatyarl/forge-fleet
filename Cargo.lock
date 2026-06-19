@@ -1564,6 +1564,7 @@ dependencies = [
  "async-trait",
  "axum 0.8.8",
  "chrono",
+ "ff-agent",
  "ff-api",
  "ff-brain",
  "ff-core",

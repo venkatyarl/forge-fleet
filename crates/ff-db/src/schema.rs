@@ -8837,3 +8837,47 @@ ALTER TABLE ff_interactions ADD COLUMN IF NOT EXISTS worker_name TEXT;
 ALTER TABLE ff_interactions ADD COLUMN IF NOT EXISTS endpoint    TEXT;
 CREATE INDEX IF NOT EXISTS idx_ff_interactions_worker ON ff_interactions (worker_name, ts DESC);
 "#;
+
+// V139 — Agent working memory ("Scratchpad"): a small, byte-capped, agent-
+// self-editable text surface with fixed blocks, layered scope, and
+// consolidate-and-forget on overflow. Sits beside session_brain; evicted
+// content flows down into Brain candidates. Design: plans/agent-working-memory.md
+// (frozen by LLM council 2026-06-19 — codex + kimi + Claude).
+pub const SCHEMA_V139_AGENT_SCRATCHPAD: &str = r#"
+-- the working set: one row per (scope, block)
+CREATE TABLE IF NOT EXISTS agent_memory (
+    scope_type   TEXT NOT NULL CHECK (scope_type IN ('session','agent','project')),
+    scope_key    TEXT NOT NULL,
+    block        TEXT NOT NULL,
+    content      TEXT NOT NULL DEFAULT '',
+    bytes        INT  NOT NULL DEFAULT 0,
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (scope_type, scope_key, block)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_memory_scope
+    ON agent_memory (scope_type, scope_key);
+
+-- per-scope cap overrides ('' scope_key = default for the scope_type)
+CREATE TABLE IF NOT EXISTS agent_memory_caps (
+    scope_type TEXT NOT NULL,
+    scope_key  TEXT NOT NULL DEFAULT '',
+    cap_bytes  INT  NOT NULL DEFAULT 6144,
+    PRIMARY KEY (scope_type, scope_key)
+);
+
+-- audit trail of every consolidate-and-forget eviction
+CREATE TABLE IF NOT EXISTS agent_memory_evictions (
+    id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    scope_type   TEXT NOT NULL,
+    scope_key    TEXT NOT NULL,
+    block        TEXT NOT NULL,
+    prev_hash    TEXT NOT NULL,
+    prev_bytes   INT  NOT NULL,
+    summary      TEXT NOT NULL,
+    summarizer   TEXT NOT NULL,
+    brain_ref    TEXT,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_agent_memory_evictions_scope
+    ON agent_memory_evictions (scope_type, scope_key, created_at DESC);
+"#;

@@ -2745,6 +2745,11 @@ pub async fn dispatch(method: &str, params: Option<Value>) -> HandlerResult {
         "fleet_models_disk_usage" => fleet_models_disk_usage(params).await,
         "fleet_agents" => fleet_agents(params).await,
         // Virtual Brain
+        // Scratchpad (agent working memory)
+        "memory_get" => crate::memory_tools::memory_get(params).await,
+        "memory_add" => crate::memory_tools::memory_add(params).await,
+        "memory_replace" => crate::memory_tools::memory_replace(params).await,
+        "memory_remove" => crate::memory_tools::memory_remove(params).await,
         "brain_search" => crate::brain_tools::brain_search(params).await,
         "brain_vault_read" => crate::brain_tools::brain_vault_read(params).await,
         "brain_graph_neighbors" => crate::brain_tools::brain_graph_neighbors(params).await,

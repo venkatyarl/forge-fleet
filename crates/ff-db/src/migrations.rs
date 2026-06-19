@@ -824,6 +824,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "interaction_worker_attribution",
         sql: schema::SCHEMA_V138_INTERACTION_WORKER_ATTRIBUTION,
     },
+    PgMigration {
+        version: 139,
+        name: "agent_scratchpad",
+        sql: schema::SCHEMA_V139_AGENT_SCRATCHPAD,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
