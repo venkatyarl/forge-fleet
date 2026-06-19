@@ -136,6 +136,7 @@ pub mod upgrade_rollout;
 pub mod vault_sync;
 pub mod verify_computer;
 pub mod version_check;
+pub mod work_item_dispatch;
 pub mod work_item_scheduler;
 pub mod work_stealer;
 

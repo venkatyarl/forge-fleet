@@ -8502,3 +8502,16 @@ pub async fn pg_assign_work_item(
     tx.commit().await?;
     Ok(true)
 }
+
+/// Refresh a work_item lease heartbeat so the stale-lease reaper doesn't reclaim
+/// it mid-execution. Called periodically by the dispatch loop while the slot runs.
+pub async fn pg_heartbeat_work_item_lease(pool: &PgPool, work_item_id: uuid::Uuid) -> Result<()> {
+    sqlx::query(
+        "UPDATE work_item_leases SET heartbeat_at = NOW() \
+          WHERE work_item_id = $1 AND released_at IS NULL",
+    )
+    .bind(work_item_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
