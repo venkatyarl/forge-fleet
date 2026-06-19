@@ -684,6 +684,19 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         ));
     }
 
+    // 15b) Pillar 4 work_item scheduler — every 10s, leader-gated.
+    // Assigns status='ready' work_items to free fleet slots via work_item_leases
+    // (reaps stale leases first). Only touches execution-flagged items.
+    if let Some(pg_pool) = operational_store.pg_pool().cloned() {
+        info!("starting subsystem: work_item scheduler (10s, leader-gated)");
+        subsystem_tasks.push(ff_agent::work_item_scheduler::spawn_work_item_scheduler(
+            pg_pool,
+            worker_name.clone(),
+            10,
+            shutdown_rx.clone(),
+        ));
+    }
+
     // 16) Procedural memory consolidation — every 6h, leader-gated.
     // Phase 14: scans completed sessions, extracts successful patterns into agent_procedures.
     if let Some(pg_pool) = operational_store.pg_pool().cloned() {

@@ -136,6 +136,7 @@ pub mod upgrade_rollout;
 pub mod vault_sync;
 pub mod verify_computer;
 pub mod version_check;
+pub mod work_item_scheduler;
 pub mod work_stealer;
 
 pub use alert_policy_seed::{AlertSeedReport, seed_from_toml as seed_alert_policies_from_toml};
