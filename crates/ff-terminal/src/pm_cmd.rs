@@ -222,6 +222,16 @@ pub async fn handle_pm(cmd: crate::PmCommand) -> Result<()> {
             .execute(&pool)
             .await
             .map_err(|e| anyhow::anyhow!("release lease: {e}"))?;
+            // Drop it out of the merge queue so the drain stops considering it
+            // (the per-host worktree reaper cleans the on-disk worktree).
+            let _ = sqlx::query(
+                "UPDATE work_item_merge_queue \
+                    SET status = 'failed', failed_at = NOW(), failure_reason = 'work item cancelled' \
+                  WHERE work_item_id = $1 AND status NOT IN ('merged')",
+            )
+            .bind(uid)
+            .execute(&pool)
+            .await;
             let n = sqlx::query("UPDATE work_items SET status = 'cancelled' WHERE id = $1")
                 .bind(uid)
                 .execute(&pool)
