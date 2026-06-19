@@ -59,6 +59,18 @@ pub enum TopCortexCommand {
         #[arg(long, value_enum, default_value = "table")]
         format: crate::CortexFormat,
     },
+    /// Prune junk corpora — empty ones (0 sources AND 0 content nodes, e.g.
+    /// abandoned `cortex index` probes) plus any whose slug matches `--slug`.
+    /// Dry-run by default: prints what WOULD be deleted; pass `--yes` to delete.
+    Prune {
+        /// Also prune every corpus whose slug CONTAINS this substring
+        /// (case-insensitive), e.g. `--slug cxprobe` or `--slug cv-`.
+        #[arg(long)]
+        slug: Option<String>,
+        /// Actually delete (default is a dry-run preview).
+        #[arg(long)]
+        yes: bool,
+    },
     /// Callers of a code symbol (corpus defaults to the cwd's slug).
     Callers {
         symbol: String,
@@ -424,6 +436,68 @@ fn detect_languages(root: &Path) -> Vec<(String, usize)> {
 
 /// Render the indexed-corpus listing. `target = Some(slug)` shows just that one
 /// corpus (the cwd's `status` view); `target = None` lists them all (`status
+/// Prune junk corpora: empty ones (0 sources AND 0 content AND 0 code symbols —
+/// abandoned `cortex index` probes) plus any whose slug contains `slug_substr`.
+/// Dry-run unless `yes`. Reuses `corpus::delete_corpus`. A real corpus can only be
+/// removed via an explicit `--slug` match the operator typed (and reviews in the
+/// dry-run) — the empty rule never touches a corpus that has content.
+async fn run_prune(pool: &PgPool, slug_substr: Option<String>, yes: bool) -> Result<()> {
+    let rows = corpus::list_corpora(pool).await?;
+    let needle = slug_substr.as_deref().map(|s| s.to_lowercase());
+
+    // (slug, reason, sources, content, code_symbols) for everything we'd remove.
+    let mut prunable: Vec<(String, &'static str, i64, i64, i64)> = Vec::new();
+    for r in &rows {
+        let code = ff_db::pg_count_corpus_code_symbols(pool, &r.slug).await?;
+        let is_empty = r.sources == 0 && r.content == 0 && code == 0;
+        let name_match = needle
+            .as_deref()
+            .map(|n| r.slug.to_lowercase().contains(n))
+            .unwrap_or(false);
+        // Empty wins as the reason (it's the safe, content-free case).
+        if is_empty {
+            prunable.push((r.slug.clone(), "empty", r.sources, r.content, code));
+        } else if name_match {
+            prunable.push((r.slug.clone(), "slug-match", r.sources, r.content, code));
+        }
+    }
+
+    if prunable.is_empty() {
+        let extra = needle
+            .map(|n| format!(" or slug containing '{n}'"))
+            .unwrap_or_default();
+        println!("nothing to prune (no empty corpora{extra}).");
+        return Ok(());
+    }
+
+    println!(
+        "{CYAN}{:<26} {:>10} {:>7} {:>8} {:>9}{RESET}",
+        "SLUG", "REASON", "SOURCES", "CONTENT", "CODE-SYMS"
+    );
+    for (slug, reason, sources, content, code) in &prunable {
+        println!("{slug:<26} {reason:>10} {sources:>7} {content:>8} {code:>9}");
+    }
+
+    if !yes {
+        println!(
+            "\n{YELLOW}dry-run: {} corpus(es) would be pruned — re-run with --yes to delete.{RESET}",
+            prunable.len()
+        );
+        return Ok(());
+    }
+
+    let (mut nodes_total, mut corpora_total) = (0u64, 0u64);
+    for (slug, ..) in &prunable {
+        let (nodes, corpora) = corpus::delete_corpus(pool, slug).await?;
+        nodes_total += nodes;
+        corpora_total += corpora;
+    }
+    println!(
+        "\n{GREEN}✓ pruned {corpora_total} corpus(es) ({nodes_total} node(s) removed).{RESET}"
+    );
+    Ok(())
+}
+
 /// --all` / `corpora`). Shared by both verbs so their output stays byte-identical.
 async fn print_corpora(pool: &PgPool, target: Option<String>, format: &str) -> Result<()> {
     let rows = corpus::list_corpora(pool).await?;
@@ -540,6 +614,9 @@ pub async fn handle_top_cortex(args: TopCortexArgs) -> Result<()> {
             // The CLI mirror of the `cortex_corpora` MCP tool: always lists every
             // corpus (the `status --all` view), independent of the cwd.
             print_corpora(&pool, None, format.as_str()).await?;
+        }
+        TopCortexCommand::Prune { slug, yes } => {
+            run_prune(&pool, slug, yes).await?;
         }
         TopCortexCommand::Callers {
             symbol,
