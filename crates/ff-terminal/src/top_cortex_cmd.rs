@@ -466,7 +466,20 @@ async fn run_prune(pool: &PgPool, slug_substr: Option<String>, yes: bool) -> Res
         let extra = needle
             .map(|n| format!(" or slug containing '{n}'"))
             .unwrap_or_default();
-        println!("nothing to prune (no empty corpora{extra}).");
+        // No corpora to remove, but orphaned cortex-index rows (from older deletes
+        // that predated the explicit ledger cleanup in delete_corpus) may linger —
+        // offer the sweep so `ff cortex prune` is the one verb that fully cleans up.
+        if yes {
+            let swept = corpus::sweep_orphan_cortex_index(pool).await?;
+            println!(
+                "{GREEN}✓ no corpora to prune; swept {swept} orphaned cortex-index row(s).{RESET}"
+            );
+        } else {
+            println!(
+                "nothing to prune (no empty corpora{extra}). Re-run with --yes to also sweep \
+                 orphaned cortex-index rows."
+            );
+        }
         return Ok(());
     }
 
@@ -480,7 +493,8 @@ async fn run_prune(pool: &PgPool, slug_substr: Option<String>, yes: bool) -> Res
 
     if !yes {
         println!(
-            "\n{YELLOW}dry-run: {} corpus(es) would be pruned — re-run with --yes to delete.{RESET}",
+            "\n{YELLOW}dry-run: {} corpus(es) would be pruned (+ orphaned cortex-index rows swept) \
+             — re-run with --yes to delete.{RESET}",
             prunable.len()
         );
         return Ok(());
@@ -492,8 +506,12 @@ async fn run_prune(pool: &PgPool, slug_substr: Option<String>, yes: bool) -> Res
         nodes_total += nodes;
         corpora_total += corpora;
     }
+    // Belt-and-suspenders: also sweep any pre-existing orphans (deletes before
+    // this fix left cortex_file_index rows behind).
+    let swept = corpus::sweep_orphan_cortex_index(pool).await?;
     println!(
-        "\n{GREEN}✓ pruned {corpora_total} corpus(es) ({nodes_total} node(s) removed).{RESET}"
+        "\n{GREEN}✓ pruned {corpora_total} corpus(es) ({nodes_total} node(s) removed); swept \
+         {swept} orphaned cortex-index row(s).{RESET}"
     );
     Ok(())
 }

@@ -212,6 +212,17 @@ pub async fn delete_corpus(pg: &PgPool, slug: &str) -> anyhow::Result<(u64, u64)
         .execute(&mut *tx)
         .await?
         .rows_affected();
+    // The Cortex incremental ledger is keyed by corpus_SLUG (text), not the
+    // brain_corpora id, so it does NOT cascade off the row delete below. Drop it
+    // explicitly — otherwise stale `indexed_hash` entries linger and a corpus
+    // later re-created under the same slug would treat unchanged-looking files as
+    // already-indexed and never re-extract them.
+    for table in ["cortex_file_index", "cortex_reexports"] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE corpus_slug = $1"))
+            .bind(slug)
+            .execute(&mut *tx)
+            .await?;
+    }
     let corpora = sqlx::query("DELETE FROM brain_corpora WHERE slug = $1")
         .bind(slug)
         .execute(&mut *tx)
@@ -219,6 +230,23 @@ pub async fn delete_corpus(pg: &PgPool, slug: &str) -> anyhow::Result<(u64, u64)
         .rows_affected();
     tx.commit().await?;
     Ok((nodes, corpora))
+}
+
+/// Sweep Cortex ledger rows whose corpus no longer exists in `brain_corpora`
+/// (orphans left by older deletes that predated the explicit cleanup in
+/// [`delete_corpus`]). Returns the number of `cortex_file_index` +
+/// `cortex_reexports` rows removed. Idempotent.
+pub async fn sweep_orphan_cortex_index(pg: &PgPool) -> anyhow::Result<u64> {
+    let mut total = 0u64;
+    for table in ["cortex_file_index", "cortex_reexports"] {
+        total += sqlx::query(&format!(
+            "DELETE FROM {table} WHERE corpus_slug NOT IN (SELECT slug FROM brain_corpora)"
+        ))
+        .execute(pg)
+        .await?
+        .rows_affected();
+    }
+    Ok(total)
 }
 
 pub async fn list_sources(pg: &PgPool, corpus: &Corpus) -> anyhow::Result<Vec<Source>> {
