@@ -12,6 +12,8 @@
 
 use crate::{CYAN, GREEN, RESET, YELLOW};
 use anyhow::Result;
+use ff_agent::cli_executor::CliResult;
+use sqlx::PgPool;
 use std::time::Duration;
 
 const MEMBER_PROMPT_PREAMBLE: &str = "You are a COUNCIL MEMBER. Give your own INDEPENDENT, \
@@ -35,6 +37,12 @@ pub async fn handle_council(
     }
     let timeout = timeout_secs.map(Duration::from_secs);
     let prompt = format!("{MEMBER_PROMPT_PREAMBLE}{question}");
+
+    // Best-effort: log every member + chairman dispatch to ff_interactions so a
+    // council is auditable AND becomes training data for ff's own LLM. The CLI
+    // path (cli_executor) doesn't self-log, so the council records its own I/O —
+    // same precedent as work_item_dispatch. A missing pool never blocks a council.
+    let pool: Option<PgPool> = ff_agent::fleet_info::get_fleet_pool().await.ok();
 
     eprintln!(
         "{CYAN}▶ Convening council: {} member(s) [{}]{RESET}",
@@ -67,6 +75,7 @@ pub async fn handle_council(
                 continue;
             }
         };
+        log_council(pool.as_ref(), &member, "council_member", &prompt, &res).await;
         println!("\n{CYAN}═══════════ {member} ═══════════{RESET}");
         match res {
             Ok(r) if r.exit_code == 0 && !r.stdout.trim().is_empty() => {
@@ -132,6 +141,7 @@ pub async fn handle_council(
 
     eprintln!("\n{CYAN}▶ Chairman ({chair}) synthesizing {ok} answers…{RESET}");
     let res = ff_agent::cli_executor::execute_cli_in_dir(&chair, &synth, &[], None, timeout).await;
+    log_council(pool.as_ref(), &chair, "council_chairman", &synth, &res).await;
     match res {
         Ok(r) if r.exit_code == 0 && !r.stdout.trim().is_empty() => {
             println!(
@@ -159,4 +169,55 @@ pub async fn handle_council(
         }
     }
     Ok(())
+}
+
+/// Record one council dispatch (a member answer or the chairman synthesis) in
+/// `ff_interactions`. Best-effort: a log failure never affects the council.
+/// `channel` distinguishes `council_member` from `council_chairman`.
+async fn log_council(
+    pool: Option<&PgPool>,
+    member: &str,
+    channel: &str,
+    request: &str,
+    res: &Result<CliResult>,
+) {
+    let Some(pool) = pool else { return };
+    let (response_text, outcome, error_text, latency_ms) = match res {
+        Ok(r) if r.exit_code == 0 && !r.stdout.trim().is_empty() => (
+            r.stdout.trim().chars().take(16000).collect::<String>(),
+            "success".to_string(),
+            None,
+            i32::try_from(r.duration_ms).ok(),
+        ),
+        Ok(r) => (
+            String::new(),
+            "error".to_string(),
+            Some(format!(
+                "exit {}: {}",
+                r.exit_code,
+                r.stderr.trim().chars().take(2000).collect::<String>()
+            )),
+            i32::try_from(r.duration_ms).ok(),
+        ),
+        Err(e) => (
+            String::new(),
+            "error".to_string(),
+            Some(e.to_string().chars().take(2000).collect::<String>()),
+            None,
+        ),
+    };
+    let rec = ff_db::InteractionRecord {
+        channel: channel.to_string(),
+        request_text: request.chars().take(16000).collect(),
+        engine: Some(member.to_string()),
+        response_text,
+        latency_ms,
+        outcome,
+        error_text,
+        endpoint: Some(format!("ff council/{member}")),
+        ..Default::default()
+    };
+    if let Err(e) = ff_db::pg_record_interaction(pool, &rec).await {
+        eprintln!("{YELLOW}⚠ council: failed to log interaction (non-fatal): {e}{RESET}");
+    }
 }
