@@ -9010,3 +9010,60 @@ CREATE TABLE IF NOT EXISTS work_item_fleet_tasks (
     PRIMARY KEY (work_item_id, fleet_task_id)
 );
 "#;
+
+/// V141 — Projects-first PM: a project can attach MANY GitHub locations and MANY
+/// local folders. The legacy `projects.repo_url` is a single repo and there was
+/// no local-folder concept; this is the first stage of the PM consolidation
+/// (one Postgres PM model, SQLite removed — see .forgefleet/plans/pm-consolidation.md).
+/// Additive only: no existing table/column is dropped, so a rollback is just
+/// "ignore the new tables".
+pub const SCHEMA_V141_PROJECT_REPOS_FOLDERS: &str = r#"
+-- One GitHub location attached to a project. A project may have several
+-- (e.g. app repo + infra repo + docs repo). `is_primary` marks the main one.
+CREATE TABLE IF NOT EXISTS project_repos (
+    id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id     TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    github_url     TEXT NOT NULL,
+    name           TEXT,                                   -- short label (e.g. "forge-fleet")
+    default_branch TEXT NOT NULL DEFAULT 'main',
+    role           TEXT,                                   -- code | infra | docs | ...
+    is_primary     BOOLEAN NOT NULL DEFAULT FALSE,
+    metadata       JSONB NOT NULL DEFAULT '{}',
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (project_id, github_url)
+);
+CREATE INDEX IF NOT EXISTS idx_project_repos_project ON project_repos (project_id);
+-- at most one primary repo per project
+CREATE UNIQUE INDEX IF NOT EXISTS idx_project_repos_primary
+    ON project_repos (project_id) WHERE is_primary;
+
+-- One local folder attached to a project. `computer_id` NULL = a canonical path
+-- that applies to every host; non-NULL = that specific host's checkout (mirrors
+-- per-host source_tree_path, so the same project can live at different paths on
+-- Taylor vs a Linux node).
+CREATE TABLE IF NOT EXISTS project_folders (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    project_id  TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    computer_id UUID REFERENCES computers(id) ON DELETE CASCADE,
+    path        TEXT NOT NULL,
+    role        TEXT,                                      -- source | data | scratch | ...
+    is_primary  BOOLEAN NOT NULL DEFAULT FALSE,
+    metadata    JSONB NOT NULL DEFAULT '{}',
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_project_folders_project ON project_folders (project_id);
+-- idempotent sync: a (project, host, path) triple is unique. NULL computer_id
+-- rows dedupe on (project, path) via the partial index below.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_project_folders_host_path
+    ON project_folders (project_id, computer_id, path) WHERE computer_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_project_folders_canonical_path
+    ON project_folders (project_id, path) WHERE computer_id IS NULL;
+
+-- Backfill: promote the legacy single projects.repo_url into project_repos as
+-- the primary repo, so existing projects show their repo in the new model.
+INSERT INTO project_repos (project_id, github_url, default_branch, is_primary, role)
+SELECT p.id, p.repo_url, COALESCE(p.default_branch, 'main'), TRUE, 'code'
+  FROM projects p
+ WHERE p.repo_url IS NOT NULL AND p.repo_url <> ''
+ON CONFLICT (project_id, github_url) DO NOTHING;
+"#;

@@ -834,6 +834,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "distributed_dev_workitems",
         sql: schema::SCHEMA_V140_DISTRIBUTED_DEV,
     },
+    PgMigration {
+        version: 141,
+        name: "project_repos_folders",
+        sql: schema::SCHEMA_V141_PROJECT_REPOS_FOLDERS,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
