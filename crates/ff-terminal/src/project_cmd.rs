@@ -379,13 +379,13 @@ async fn resolve_computer_id(pool: &sqlx::PgPool, name: &str) -> Result<String> 
         .ok_or_else(|| anyhow::anyhow!("no computer named '{name}'"))
 }
 
-/// Auto-discover a project's repos + local folders: scan `path` (and its
-/// immediate subdirs, for a polyrepo layout) for git repos, read each one's
+/// Auto-discover a project's repos + local folders: recursively scan `path`
+/// for git repos, read each one's
 /// `origin` remote, and register a project_repos row (the remote) + a
 /// project_folders row (the local clone on THIS host). Section I of the PM
 /// platform plan — replaces the manual "re-point the project at the repos" step.
 async fn handle_discover(pool: &sqlx::PgPool, path: &str, project: Option<String>) -> Result<()> {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     let root = expand_tilde(path);
     let root = Path::new(&root);
     if !root.is_dir() {
@@ -421,14 +421,35 @@ async fn handle_discover(pool: &sqlx::PgPool, path: &str, project: Option<String
     let this_host = ff_agent::fleet_info::resolve_this_worker_name().await;
     let computer_id = resolve_computer_id(pool, &this_host).await.ok();
 
-    // Candidate dirs: the root itself + immediate subdirs (polyrepo layout).
-    let mut candidates = vec![root.to_path_buf()];
-    if let Ok(rd) = std::fs::read_dir(root) {
-        for e in rd.flatten() {
-            if e.path().is_dir() {
-                candidates.push(e.path());
-            }
+    // Candidate dirs: any git repo under the root. When a repo is found, prune
+    // its subtree so nested dependency checkouts or worktrees do not get added.
+    let mut candidates = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if dir.join(".git").exists() {
+            candidates.push(dir);
+            continue;
         }
+
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut children: Vec<PathBuf> = rd
+            .flatten()
+            .filter_map(|e| {
+                let path = e.path();
+                if !path.is_dir() {
+                    return None;
+                }
+                let name = path.file_name().and_then(|n| n.to_str())?;
+                if matches!(name, ".git" | "node_modules" | "target" | ".venv") {
+                    return None;
+                }
+                Some(path)
+            })
+            .collect();
+        children.sort();
+        stack.extend(children.into_iter().rev());
     }
 
     println!(
