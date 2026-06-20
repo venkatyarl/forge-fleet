@@ -601,6 +601,26 @@ impl ResearchSession {
             total_tokens_in += tin;
             total_tokens_out += tout;
             self.store_subtask_result(row.id, result, tin, tout).await?;
+
+            // Log each sub-agent turn to ff_interactions (training corpus): a
+            // sub-question -> web-grounded answer pair from a specific fleet
+            // model + computer — the granular signal the session-level research
+            // log (#447) can't capture. Best-effort; never fails the run.
+            let rec = ff_db::InteractionRecord {
+                channel: "research_subtask".to_string(),
+                request_text: row.sub_question.chars().take(16000).collect(),
+                engine: Some(row.assigned_model.clone()),
+                response_text: result.output.chars().take(16000).collect(),
+                tokens_in: i32::try_from(tin).unwrap_or(0),
+                tokens_out: i32::try_from(tout).unwrap_or(0),
+                latency_ms: i32::try_from(result.duration_ms).ok(),
+                outcome: if useful { "success" } else { "error" }.to_string(),
+                worker_name: Some(row.assigned_computer.clone()),
+                ..Default::default()
+            };
+            if let Err(e) = ff_db::pg_record_interaction(&self.pool, &rec).await {
+                tracing::warn!(error = %e, "research: subtask interaction log failed (non-fatal)");
+            }
         }
 
         // Phase 5 — synthesizer merges sub-agent outputs into a report.
