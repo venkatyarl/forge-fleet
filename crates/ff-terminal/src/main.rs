@@ -2736,6 +2736,8 @@ pub enum PmCommand {
         #[arg(long, default_value_t = 20)]
         limit: i64,
     },
+    /// Check the Pillar-4 work_item pipeline health from live Postgres.
+    Doctor,
     /// Import Claude Code session tasks into projects.work_items.
     ///
     /// Claude Code's TaskCreate/TaskList/TaskUpdate tools keep their state

@@ -1,4 +1,4 @@
-use crate::{CYAN, GREEN, RESET, YELLOW};
+use crate::{CYAN, GREEN, RED, RESET, YELLOW};
 use anyhow::Result;
 use std::path::PathBuf;
 
@@ -219,6 +219,9 @@ pub async fn handle_pm(cmd: crate::PmCommand) -> Result<()> {
                 );
             }
         }
+        crate::PmCommand::Doctor => {
+            print_pm_doctor(&pool).await?;
+        }
         crate::PmCommand::Cancel { id } => {
             let uid = uuid::Uuid::parse_str(&id)
                 .map_err(|e| anyhow::anyhow!("invalid work item id '{id}': {e}"))?;
@@ -358,6 +361,99 @@ pub async fn handle_pm(cmd: crate::PmCommand) -> Result<()> {
             handle_pm_import_claude_tasks(&pool, session, &project, dry_run).await?;
         }
     }
+    Ok(())
+}
+
+async fn print_pm_doctor(pool: &sqlx::PgPool) -> Result<()> {
+    println!("{CYAN}▶ Pillar-4 work_item pipeline doctor{RESET}");
+
+    let fresh_leaders: Vec<String> = sqlx::query_scalar(
+        "SELECT member_name FROM fleet_leader_state \
+          WHERE heartbeat_at > NOW() - INTERVAL '60 seconds'",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("doctor leader check: {e}"))?;
+
+    let status_counts: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT status, COUNT(*) \
+           FROM work_items \
+          GROUP BY status \
+          ORDER BY status",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("doctor work_items status counts: {e}"))?;
+
+    let active_leases: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) \
+           FROM work_item_leases \
+          WHERE released_at IS NULL",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("doctor active leases: {e}"))?;
+
+    let stale_leases: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) \
+           FROM work_item_leases \
+          WHERE released_at IS NULL \
+            AND lease_expires_at < NOW()",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("doctor stale leases: {e}"))?;
+
+    let free_slots: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) \
+           FROM sub_agents \
+          WHERE status = 'idle'",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("doctor free slots: {e}"))?;
+
+    let leader_ok = !fresh_leaders.is_empty();
+    if leader_ok {
+        println!("{GREEN}✓ leader fresh{RESET}: {}", fresh_leaders.join(", "));
+    } else {
+        println!("{YELLOW}⚠ leader fresh{RESET}: no heartbeat in the last 60s");
+    }
+
+    let status_detail = if status_counts.is_empty() {
+        "no work_items".to_string()
+    } else {
+        status_counts
+            .iter()
+            .map(|(status, count)| format!("{status} {count}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    println!("{GREEN}✓ work_items by status{RESET}: {status_detail}");
+
+    println!("{GREEN}✓ active leases{RESET}: {active_leases}");
+
+    let stale_ok = stale_leases == 0;
+    if stale_ok {
+        println!("{GREEN}✓ stale leases{RESET}: 0");
+    } else {
+        println!("{YELLOW}⚠ stale leases{RESET}: {stale_leases}");
+    }
+
+    let slots_ok = free_slots > 0;
+    if slots_ok {
+        println!("{GREEN}✓ free slots{RESET}: {free_slots}");
+    } else {
+        println!("{YELLOW}⚠ free slots{RESET}: 0 idle sub_agents");
+    }
+
+    println!();
+    if leader_ok && stale_ok && slots_ok {
+        println!("{GREEN}✓ Summary:{RESET} Pillar-4 work_item pipeline is healthy");
+    } else {
+        println!("{RED}⚠ Summary:{RESET} Pillar-4 work_item pipeline needs attention");
+    }
+
     Ok(())
 }
 
