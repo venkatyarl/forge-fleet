@@ -139,7 +139,31 @@ async fn assigned_work_items(
             w.title,
             w.description,
             w.base_branch,
-            COALESCE(NULLIF(w.metadata->>'repo_path', ''), NULLIF(c.source_tree_path, ''), $2) AS repo_path,
+            -- Build path resolution (per-project, V141 project_folders): an
+            -- explicit metadata override wins; else this project's local folder
+            -- on THIS host (host-specific row preferred, then a canonical
+            -- computer_id-NULL row); else the host's source_tree_path (correct
+            -- only for forge-fleet itself); else the daemon's cwd. Without the
+            -- project_folders lookup a non-forge-fleet work_item (e.g. a
+            -- hireflow360 port) worktree'd against the host's forge-fleet tree —
+            -- the wrong repo (operator-reported 2026-06-20). forge-fleet has no
+            -- project_folders rows, so it still falls through to source_tree_path
+            -- exactly as before (backward-compatible).
+            COALESCE(
+                NULLIF(w.metadata->>'repo_path', ''),
+                (SELECT pf.path
+                   FROM project_folders pf
+                  WHERE pf.project_id = w.project_id
+                    AND (pf.computer_id = c.id OR pf.computer_id IS NULL)
+                  ORDER BY CASE WHEN pf.computer_id = c.id THEN 0
+                                WHEN pf.computer_id IS NULL THEN 1
+                                ELSE 2 END,
+                           pf.is_primary DESC,
+                           pf.created_at ASC
+                  LIMIT 1),
+                NULLIF(c.source_tree_path, ''),
+                $2
+            ) AS repo_path,
             sa.id AS sub_agent_id,
             sa.computer_id,
             sa.slot
