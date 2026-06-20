@@ -1039,8 +1039,7 @@ pub async fn evaluate_worktree_reaper(pg: &PgPool, worker_name: &str) -> Result<
     if reaped > 0 {
         info!(
             reaped,
-            reclaimed_bytes,
-            "worktree_reaper: cleaned terminal worktrees"
+            reclaimed_bytes, "worktree_reaper: cleaned terminal worktrees"
         );
     }
     Ok(reaped)
