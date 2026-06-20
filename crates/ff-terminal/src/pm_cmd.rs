@@ -149,6 +149,9 @@ pub async fn handle_pm(cmd: crate::PmCommand) -> Result<()> {
             }
         }
         crate::PmCommand::Board { limit } => {
+            // Fleet-wide rollup first — the at-a-glance state of distributed
+            // concurrent dev (Pillar 4) across all computers, before the detail.
+            print_board_summary(&pool).await?;
             // The autonomous build pipeline at a glance: work_items joined with
             // their live lease (host), worktree status, and merge-queue/PR state.
             let rows: Vec<(
@@ -342,6 +345,60 @@ pub async fn handle_pm(cmd: crate::PmCommand) -> Result<()> {
     }
     Ok(())
 }
+
+/// One-line fleet-wide rollup for `ff pm board`: work_items by status, live
+/// (un-released, un-expired) lease count, and merge-queue depth. The
+/// distributed-concurrent-dev picture before the per-item detail.
+async fn print_board_summary(pool: &sqlx::PgPool) -> Result<()> {
+    let status_counts: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT status, count(*) FROM work_items GROUP BY status ORDER BY count(*) DESC",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("board summary (statuses): {e}"))?;
+    let total: i64 = status_counts.iter().map(|(_, n)| n).sum();
+    let active_leases: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM work_item_leases \
+          WHERE released_at IS NULL AND lease_expires_at > NOW()",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("board summary (leases): {e}"))?;
+    let mq: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT status, count(*) FROM work_item_merge_queue GROUP BY status ORDER BY status",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("board summary (merge-queue): {e}"))?;
+    let mq_total: i64 = mq.iter().map(|(_, n)| n).sum();
+
+    let mq_detail = if mq.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " ({})",
+            mq.iter()
+                .map(|(s, n)| format!("{s} {n}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    println!(
+        "{CYAN}▶ Fleet PM board — {total} work_items · {GREEN}{active_leases} building{RESET}{CYAN} \
+         · merge-queue: {mq_total}{mq_detail}{RESET}"
+    );
+    if !status_counts.is_empty() {
+        let statuses = status_counts
+            .iter()
+            .map(|(s, n)| format!("{s} {n}"))
+            .collect::<Vec<_>>()
+            .join(" · ");
+        println!("\x1b[2m  status: {statuses}{RESET}");
+    }
+    println!();
+    Ok(())
+}
+
 pub async fn handle_pm_import_claude_tasks(
     pool: &sqlx::PgPool,
     session: Option<PathBuf>,
