@@ -122,13 +122,18 @@ pub const BACKENDS: &[CliBackend] = &[
         name: "kimi",
         binary: "kimi",
         port: 51102,
-        // Kimi CLI (Moonshot) headless build form (verified against `kimi
-        // --help` 2026-06-16): `--afk` runs the autonomous away-from-keyboard
-        // mode (the old `--print` was NOT a full agent run), `--yolo`
-        // auto-approves writes, and `-p` (alias `--prompt`) carries the prompt.
-        // The previous `--print --yes --prompt` form did not actually execute
-        // multi-step build tasks.
-        default_flags: &["--afk", "--yolo", "-p"],
+        // Kimi CLI (Moonshot) headless form. `--quiet` is the documented alias
+        // for `--print --output-format text --final-message-only`: it runs the
+        // full non-interactive agent (auto-DISMISSES AskUserQuestion + auto-
+        // APPROVES tool calls for the invocation — same headless behavior `--afk`
+        // gave) AND prints only the final assistant message (cleanest to capture).
+        // `-p`/`--prompt` carries the prompt. We deliberately DROPPED `--afk`:
+        // it's a newer flag absent on many installed kimi builds, which rejected
+        // it with "No such option: --afk" and broke every kimi dispatch on those
+        // hosts (operator-reported 2026-06-20). `--print`/`--quiet` are the
+        // fundamental headless flags present across kimi versions, so this is the
+        // version-robust form. `--yolo` was redundant with --print's auto-approve.
+        default_flags: &["--quiet", "-p"],
         // `-w/--work-dir <dir>` sets the agent's working directory.
         cwd_mode: CwdMode::Flag("-w"),
         prompt_is_positional: true,
