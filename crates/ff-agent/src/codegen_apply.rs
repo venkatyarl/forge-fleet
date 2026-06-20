@@ -1,5 +1,6 @@
+use std::collections::HashSet;
 use std::fs;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
@@ -22,17 +23,21 @@ pub async fn codegen_apply(
     model_hint: Option<&str>,
     max_rounds: u32,
 ) -> Result<CodegenOutcome> {
-    let patch_path = repo_path.join(".ff-codegen.patch");
-    let mut last_diff: Option<String> = None;
+    let mut last_edits: Option<String> = None;
     let mut last_error: Option<String> = None;
     let mut rounds = 0;
 
     for round in 1..=max_rounds {
         rounds = round;
-        let prompt = build_prompt(task, last_diff.as_deref(), last_error.as_deref());
+        let prompt = build_prompt(
+            repo_path,
+            task,
+            last_edits.as_deref(),
+            last_error.as_deref(),
+        )?;
         info!(
             round,
-            max_rounds, "requesting codegen diff from fleet model"
+            max_rounds, "requesting codegen edits from fleet model"
         );
 
         let response = crate::fleet_oneshot::fleet_oneshot(
@@ -44,38 +49,36 @@ pub async fn codegen_apply(
         .await
         .with_context(|| format!("fleet_oneshot round {round}"))?;
 
-        let diff = match extract_diff_block(&response.text) {
-            Some(diff) if !diff.trim().is_empty() => diff,
-            _ => {
-                let err =
-                    "model response did not contain a non-empty fenced ```diff block".to_string();
+        let edits = match parse_edit_blocks(&response.text) {
+            Ok(edits) if !edits.is_empty() => edits,
+            Ok(_) => {
+                let err = "model response did not contain any edit blocks".to_string();
                 warn!(round, error = %err, "codegen response rejected");
-                last_diff = None;
+                last_edits = None;
+                last_error = Some(err);
+                continue;
+            }
+            Err(e) => {
+                let err = e.to_string();
+                warn!(round, error = %err, "codegen response rejected");
+                last_edits = Some(response.text);
                 last_error = Some(err);
                 continue;
             }
         };
+        let edit_summary = format_edit_summary(&edits);
 
-        fs::write(&patch_path, &diff)
-            .with_context(|| format!("write patch {}", patch_path.display()))?;
-
-        let apply = Command::new("git")
-            .arg("-C")
-            .arg(repo_path)
-            .arg("apply")
-            .arg("--3way")
-            .arg(&patch_path)
-            .output()
-            .with_context(|| format!("run git apply in {}", repo_path.display()))?;
-
-        if !apply.status.success() {
-            let err = command_error("git apply", &apply);
-            warn!(round, error = %err, "codegen patch failed to apply");
-            remove_patch_file(&patch_path);
-            last_diff = Some(diff);
-            last_error = Some(err);
-            continue;
-        }
+        let snapshots = match apply_edits(repo_path, &edits) {
+            Ok(snapshots) => snapshots,
+            Err(e) => {
+                let err = e.to_string();
+                warn!(round, error = %err, "codegen edits failed to apply");
+                clean_worktree(repo_path)?;
+                last_edits = Some(edit_summary);
+                last_error = Some(err);
+                continue;
+            }
+        };
 
         let check = Command::new("cargo")
             .arg("check")
@@ -85,36 +88,22 @@ pub async fn codegen_apply(
 
         if !check.status.success() {
             let err = command_error("cargo check", &check);
-            warn!(round, error = %err, "codegen patch failed cargo check");
-            let revert = Command::new("git")
-                .arg("-C")
-                .arg(repo_path)
-                .arg("checkout")
-                .arg("--")
-                .arg(".")
-                .output()
-                .with_context(|| {
-                    format!("revert failed codegen patch in {}", repo_path.display())
-                })?;
-            if !revert.status.success() {
-                return Err(anyhow!("{}", command_error("git checkout -- .", &revert)));
-            }
-            remove_patch_file(&patch_path);
-            last_diff = Some(diff);
+            warn!(round, error = %err, "codegen edits failed cargo check");
+            restore_snapshots(&snapshots)?;
+            clean_worktree(repo_path)?;
+            last_edits = Some(edit_summary);
             last_error = Some(err);
             continue;
         }
 
-        remove_patch_file(&patch_path);
         return Ok(CodegenOutcome {
             applied: true,
             rounds,
-            final_diff: Some(diff),
+            final_diff: Some(edit_summary),
             error: None,
         });
     }
 
-    remove_patch_file(&patch_path);
     Ok(CodegenOutcome {
         applied: false,
         rounds,
@@ -123,51 +112,325 @@ pub async fn codegen_apply(
     })
 }
 
-fn build_prompt(task: &str, previous_diff: Option<&str>, previous_error: Option<&str>) -> String {
-    let mut prompt = format!(
-        "Task:\n{task}\n\n\
-         Output ONLY a unified diff inside a single fenced code block tagged diff.\n\
-         The diff must be in git-apply format, with paths relative to the repo root.\n\
-         Do not include prose, explanations, markdown outside the single diff fence, or multiple code blocks.\n\
-         Format exactly like:\n\
-         ```diff\n\
-         diff --git a/path b/path\n\
-         --- a/path\n\
-         +++ b/path\n\
-         @@ ...\n\
-         ```"
-    );
-
-    if let Some(diff) = previous_diff {
-        prompt.push_str("\n\nPrevious diff that failed:\n```diff\n");
-        prompt.push_str(diff.trim());
-        prompt.push_str("\n```");
-    }
-    if let Some(error) = previous_error {
-        prompt.push_str("\n\nExact failure to fix:\n```text\n");
-        prompt.push_str(error.trim());
-        prompt.push_str("\n```");
-    }
-
-    prompt
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Edit {
+    path: String,
+    search: String,
+    replace: String,
 }
 
-fn extract_diff_block(response: &str) -> Option<String> {
-    let fence = "```";
-    let mut offset = 0;
-    while let Some(pos) = response[offset..].find(fence) {
-        let open = offset + pos;
-        let after_ticks = open + fence.len();
-        let line_end_rel = response[after_ticks..].find('\n')?;
-        let tag = response[after_ticks..after_ticks + line_end_rel].trim();
-        let content_start = after_ticks + line_end_rel + 1;
-        if tag.eq_ignore_ascii_case("diff") {
-            let close_rel = response[content_start..].find(fence)?;
-            return Some(response[content_start..content_start + close_rel].to_string());
+#[derive(Debug)]
+struct FileSnapshot {
+    path: PathBuf,
+    previous: Option<String>,
+}
+
+fn build_prompt(
+    repo_path: &Path,
+    task: &str,
+    previous_edits: Option<&str>,
+    previous_error: Option<&str>,
+) -> Result<String> {
+    let mut prompt = format!(
+        "Task:\n{task}\n\n\
+         Output ONLY one or more SEARCH/REPLACE edit blocks. Do not include prose, explanations, markdown fences, or any text outside edit blocks.\n\
+         Each edit block must be EXACTLY in this format:\n\
+         *** FILE: <path relative to repo root>\n\
+         <<<<<<< SEARCH\n\
+         <the exact existing lines to find, copied verbatim from the current file>\n\
+         =======\n\
+         <the replacement lines>\n\
+         >>>>>>> REPLACE\n\n\
+         Rules:\n\
+         - The SEARCH text must match the current file content EXACTLY, including whitespace.\n\
+         - To create a NEW file, leave the SEARCH section empty.\n\
+         - To append, SEARCH a unique existing snippet and include it in REPLACE plus the new code.\n\
+         - Paths must be relative to the repo root."
+    );
+
+    for path in task_context_paths(repo_path, task)? {
+        let abs = repo_path.join(&path);
+        let mut content =
+            fs::read_to_string(&abs).with_context(|| format!("read {}", abs.display()))?;
+        if content.len() > 12_000 {
+            content.truncate(12_000);
+            content.push_str("\n... [truncated at 12000 chars]\n");
         }
-        offset = content_start;
+        prompt.push_str("\n\nCurrent content of ");
+        prompt.push_str(&path.to_string_lossy());
+        prompt.push_str(":\n");
+        prompt.push_str(&content);
+    }
+
+    if let Some(edits) = previous_edits {
+        prompt.push_str("\n\nPrevious edit blocks that failed:\n");
+        prompt.push_str(edits.trim());
+    }
+    if let Some(error) = previous_error {
+        prompt.push_str("\n\nExact failure to fix:\n");
+        prompt.push_str(error.trim());
+    }
+
+    Ok(prompt)
+}
+
+fn task_context_paths(repo_path: &Path, task: &str) -> Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+
+    for raw in task.split_whitespace() {
+        let token = raw.trim_matches(|c: char| {
+            matches!(
+                c,
+                '`' | '"'
+                    | '\''
+                    | '('
+                    | ')'
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+                    | '<'
+                    | '>'
+                    | ','
+                    | ';'
+                    | ':'
+                    | '!'
+                    | '?'
+            )
+        });
+        let token = token.trim_end_matches('.');
+        if !token.contains('/') || token.contains("://") {
+            continue;
+        }
+        let Some(last_segment) = token.rsplit('/').next() else {
+            continue;
+        };
+        if !last_segment.contains('.') {
+            continue;
+        }
+
+        let rel = match normalize_relative_path(token) {
+            Some(path) => path,
+            None => continue,
+        };
+        let abs = repo_path.join(&rel);
+        if abs.is_file() && seen.insert(rel.clone()) {
+            out.push(rel);
+        }
+    }
+
+    Ok(out)
+}
+
+fn parse_edit_blocks(response: &str) -> Result<Vec<Edit>> {
+    let mut edits = Vec::new();
+    for raw_block in response.split("*** FILE:").skip(1) {
+        let (path, body) = raw_block
+            .split_once('\n')
+            .ok_or_else(|| anyhow!("edit block missing body after FILE line"))?;
+        let path = path.trim().to_string();
+        if path.is_empty() {
+            return Err(anyhow!("edit block has empty FILE path"));
+        }
+
+        let body = strip_one_leading_newline(
+            body.strip_prefix("<<<<<<< SEARCH")
+                .ok_or_else(|| anyhow!("edit block for {path} missing <<<<<<< SEARCH marker"))?,
+        );
+        let (search, rest) = split_marker_line(body, "=======")
+            .ok_or_else(|| anyhow!("edit block for {path} missing ======= marker"))?;
+        let rest = strip_one_leading_newline(rest);
+        let (replace, tail) = split_marker_line(rest, ">>>>>>> REPLACE")
+            .ok_or_else(|| anyhow!("edit block for {path} missing >>>>>>> REPLACE marker"))?;
+        if !tail.trim().is_empty() {
+            return Err(anyhow!(
+                "edit block for {path} has trailing text after REPLACE marker"
+            ));
+        }
+
+        edits.push(Edit {
+            path,
+            search: search.to_string(),
+            replace: replace.to_string(),
+        });
+    }
+
+    Ok(edits)
+}
+
+fn split_marker_line<'a>(input: &'a str, marker: &str) -> Option<(&'a str, &'a str)> {
+    if let Some(rest) = input.strip_prefix(marker) {
+        return Some(("", rest));
+    }
+    if let Some(pos) = input.find(&format!("\n{marker}")) {
+        return Some((&input[..pos + 1], &input[pos + 1 + marker.len()..]));
+    }
+    if let Some(pos) = input.find(&format!("\r\n{marker}")) {
+        return Some((&input[..pos + 2], &input[pos + 2 + marker.len()..]));
     }
     None
+}
+
+fn strip_one_leading_newline(input: &str) -> &str {
+    input
+        .strip_prefix("\r\n")
+        .or_else(|| input.strip_prefix('\n'))
+        .unwrap_or(input)
+}
+
+fn apply_edits(repo_path: &Path, edits: &[Edit]) -> Result<Vec<FileSnapshot>> {
+    let mut snapshots = Vec::new();
+    let mut snapshotted = HashSet::new();
+
+    for edit in edits {
+        let result = apply_one_edit(repo_path, edit, &mut snapshots, &mut snapshotted);
+        if let Err(e) = result {
+            if let Err(restore_err) = restore_snapshots(&snapshots) {
+                warn!(error = %restore_err, "failed to restore codegen edit snapshots");
+            }
+            return Err(e);
+        }
+    }
+
+    Ok(snapshots)
+}
+
+fn apply_one_edit(
+    repo_path: &Path,
+    edit: &Edit,
+    snapshots: &mut Vec<FileSnapshot>,
+    snapshotted: &mut HashSet<PathBuf>,
+) -> Result<()> {
+    let path = resolve_repo_path(repo_path, &edit.path)?;
+    snapshot_file(&path, snapshots, snapshotted)?;
+
+    if edit.search.is_empty() {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("create parent dirs for {}", path.display()))?;
+        }
+        fs::write(&path, &edit.replace).with_context(|| format!("write {}", path.display()))?;
+        return Ok(());
+    }
+
+    let content = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    let Some(pos) = content.find(&edit.search) else {
+        return Err(anyhow!("SEARCH block not found in {}", edit.path));
+    };
+    let mut updated = String::with_capacity(content.len() - edit.search.len() + edit.replace.len());
+    updated.push_str(&content[..pos]);
+    updated.push_str(&edit.replace);
+    updated.push_str(&content[pos + edit.search.len()..]);
+    fs::write(&path, updated).with_context(|| format!("write {}", path.display()))?;
+
+    Ok(())
+}
+
+fn snapshot_file(
+    path: &Path,
+    snapshots: &mut Vec<FileSnapshot>,
+    snapshotted: &mut HashSet<PathBuf>,
+) -> Result<()> {
+    if !snapshotted.insert(path.to_path_buf()) {
+        return Ok(());
+    }
+
+    let previous = match fs::read_to_string(path) {
+        Ok(content) => Some(content),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+    };
+    snapshots.push(FileSnapshot {
+        path: path.to_path_buf(),
+        previous,
+    });
+    Ok(())
+}
+
+fn restore_snapshots(snapshots: &[FileSnapshot]) -> Result<()> {
+    for snapshot in snapshots.iter().rev() {
+        match &snapshot.previous {
+            Some(content) => {
+                fs::write(&snapshot.path, content)
+                    .with_context(|| format!("restore {}", snapshot.path.display()))?;
+            }
+            None => match fs::remove_file(&snapshot.path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(e).with_context(|| format!("remove {}", snapshot.path.display()));
+                }
+            },
+        }
+    }
+    Ok(())
+}
+
+fn resolve_repo_path(repo_path: &Path, path: &str) -> Result<PathBuf> {
+    let rel = normalize_relative_path(path)
+        .ok_or_else(|| anyhow!("edit path escapes repo root or is not relative: {path}"))?;
+    Ok(repo_path.join(rel))
+}
+
+fn normalize_relative_path(path: &str) -> Option<PathBuf> {
+    let candidate = Path::new(path);
+    if candidate.is_absolute() {
+        return None;
+    }
+
+    let mut rel = PathBuf::new();
+    for component in candidate.components() {
+        match component {
+            Component::Normal(part) => rel.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+
+    if rel.as_os_str().is_empty() {
+        None
+    } else {
+        Some(rel)
+    }
+}
+
+fn format_edit_summary(edits: &[Edit]) -> String {
+    edits
+        .iter()
+        .map(|edit| {
+            format!(
+                "*** FILE: {}\n<<<<<<< SEARCH\n{}=======\n{}>>>>>>> REPLACE",
+                edit.path,
+                marker_section(&edit.search),
+                marker_section(&edit.replace)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn marker_section(text: &str) -> String {
+    if text.is_empty() || text.ends_with('\n') {
+        text.to_string()
+    } else {
+        format!("{text}\n")
+    }
+}
+
+fn clean_worktree(repo_path: &Path) -> Result<()> {
+    let revert = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .arg("checkout")
+        .arg("--")
+        .arg(".")
+        .output()
+        .with_context(|| format!("revert failed codegen edits in {}", repo_path.display()))?;
+    if !revert.status.success() {
+        return Err(anyhow!("{}", command_error("git checkout -- .", &revert)));
+    }
+    Ok(())
 }
 
 fn command_error(name: &str, output: &std::process::Output) -> String {
@@ -188,10 +451,85 @@ fn command_error(name: &str, output: &std::process::Output) -> String {
     }
 }
 
-fn remove_patch_file(path: &Path) {
-    if let Err(e) = fs::remove_file(path)
-        && e.kind() != std::io::ErrorKind::NotFound
-    {
-        warn!(path = %path.display(), error = %e, "failed to remove codegen patch file");
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_multiple_edit_blocks() {
+        let response = "*** FILE: src/lib.rs\n<<<<<<< SEARCH\nold\n=======\nnew\n>>>>>>> REPLACE\n*** FILE: src/main.rs\n<<<<<<< SEARCH\n=======\ncreated\n>>>>>>> REPLACE";
+
+        let edits = parse_edit_blocks(response).unwrap();
+
+        assert_eq!(
+            edits,
+            vec![
+                Edit {
+                    path: "src/lib.rs".to_string(),
+                    search: "old\n".to_string(),
+                    replace: "new\n".to_string(),
+                },
+                Edit {
+                    path: "src/main.rs".to_string(),
+                    search: String::new(),
+                    replace: "created\n".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_escaping_paths() {
+        assert!(normalize_relative_path("../outside.rs").is_none());
+        assert!(normalize_relative_path("/tmp/outside.rs").is_none());
+        assert_eq!(
+            normalize_relative_path("./src/lib.rs").unwrap(),
+            PathBuf::from("src/lib.rs")
+        );
+    }
+
+    #[test]
+    fn applies_first_matching_search_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("src/lib.rs");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "old\nold\n").unwrap();
+
+        apply_edits(
+            dir.path(),
+            &[Edit {
+                path: "src/lib.rs".to_string(),
+                search: "old\n".to_string(),
+                replace: "new\n".to_string(),
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(fs::read_to_string(path).unwrap(), "new\nold\n");
+    }
+
+    #[test]
+    fn restores_created_file_after_failed_later_edit() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let err = apply_edits(
+            dir.path(),
+            &[
+                Edit {
+                    path: "src/new.rs".to_string(),
+                    search: String::new(),
+                    replace: "new\n".to_string(),
+                },
+                Edit {
+                    path: "src/missing.rs".to_string(),
+                    search: "missing\n".to_string(),
+                    replace: "still missing\n".to_string(),
+                },
+            ],
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("src/missing.rs"));
+        assert!(!dir.path().join("src/new.rs").exists());
     }
 }
