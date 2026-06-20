@@ -602,34 +602,43 @@ pub async fn list_projects(
     .await
     .map_err(|e| db_err("list_projects", e))?;
 
-    let projects: Vec<Value> = rows
-        .iter()
-        .map(|r| {
-            let envs: serde_json::Value = r
-                .try_get::<serde_json::Value, _>("environments")
-                .unwrap_or(json!([]));
-            let targets: serde_json::Value = r
-                .try_get::<serde_json::Value, _>("target_computers")
-                .unwrap_or(json!([]));
-            json!({
-                "id": r.get::<String, _>("id"),
-                "display_name": r.get::<String, _>("display_name"),
-                "compose_file": r.try_get::<Option<String>, _>("compose_file").ok().flatten(),
-                "repo_url": r.try_get::<Option<String>, _>("repo_url").ok().flatten(),
-                "default_branch": r.get::<String, _>("default_branch"),
-                "main_commit_sha": r.try_get::<Option<String>, _>("main_commit_sha").ok().flatten(),
-                "main_commit_message": r.try_get::<Option<String>, _>("main_commit_message").ok().flatten(),
-                "main_committed_at": iso(r.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("main_committed_at").ok().flatten()),
-                "main_committed_by": r.try_get::<Option<String>, _>("main_committed_by").ok().flatten(),
-                "main_last_synced_at": iso(r.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("main_last_synced_at").ok().flatten()),
-                "target_computers": targets,
-                "health_endpoint": r.try_get::<Option<String>, _>("health_endpoint").ok().flatten(),
-                "status": r.get::<String, _>("status"),
-                "active_branch_count": r.try_get::<Option<i64>, _>("active_branch_count").ok().flatten().unwrap_or(0),
-                "environments": envs,
-            })
-        })
-        .collect();
+    let mut projects: Vec<Value> = Vec::with_capacity(rows.len());
+    for r in &rows {
+        let envs: serde_json::Value = r
+            .try_get::<serde_json::Value, _>("environments")
+            .unwrap_or(json!([]));
+        let targets: serde_json::Value = r
+            .try_get::<serde_json::Value, _>("target_computers")
+            .unwrap_or(json!([]));
+        let id: String = r.get("id");
+        // Projects-first (V141): embed attached GitHub repos + local folders so
+        // the index renders without an extra round-trip per project.
+        let repos = ff_db::pm::pg_list_project_repos(pool, &id)
+            .await
+            .map_err(|e| db_err("list_projects.repos", e))?;
+        let folders = ff_db::pm::pg_list_project_folders(pool, &id)
+            .await
+            .map_err(|e| db_err("list_projects.folders", e))?;
+        projects.push(json!({
+            "id": id,
+            "display_name": r.get::<String, _>("display_name"),
+            "compose_file": r.try_get::<Option<String>, _>("compose_file").ok().flatten(),
+            "repo_url": r.try_get::<Option<String>, _>("repo_url").ok().flatten(),
+            "default_branch": r.get::<String, _>("default_branch"),
+            "main_commit_sha": r.try_get::<Option<String>, _>("main_commit_sha").ok().flatten(),
+            "main_commit_message": r.try_get::<Option<String>, _>("main_commit_message").ok().flatten(),
+            "main_committed_at": iso(r.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("main_committed_at").ok().flatten()),
+            "main_committed_by": r.try_get::<Option<String>, _>("main_committed_by").ok().flatten(),
+            "main_last_synced_at": iso(r.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("main_last_synced_at").ok().flatten()),
+            "target_computers": targets,
+            "health_endpoint": r.try_get::<Option<String>, _>("health_endpoint").ok().flatten(),
+            "status": r.get::<String, _>("status"),
+            "active_branch_count": r.try_get::<Option<i64>, _>("active_branch_count").ok().flatten().unwrap_or(0),
+            "environments": envs,
+            "repos": repos,
+            "folders": folders,
+        }));
+    }
 
     Ok(Json(json!({ "projects": projects })))
 }
@@ -686,6 +695,134 @@ pub async fn project_branches(
         .collect();
 
     Ok(Json(json!({ "branches": branches })))
+}
+
+// ─── /api/projects/{id}/repos + /folders ─────────────────────────────────
+//
+// Projects-first PM (V141): a project attaches MANY GitHub locations and MANY
+// local folders. Backed by the typed `ff_db::pm` layer so the gateway and the
+// `ff pm` CLI share one Postgres model.
+
+/// GET /api/projects/{id}/repos — all GitHub locations for a project.
+pub async fn list_project_repos(
+    Path(project_id): Path<String>,
+    State(state): State<Arc<GatewayState>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let pool = pool_from_state(&state)?;
+    let repos = ff_db::pm::pg_list_project_repos(pool, &project_id)
+        .await
+        .map_err(|e| db_err("list_project_repos", e))?;
+    Ok(Json(json!({ "repos": repos })))
+}
+
+#[derive(Deserialize)]
+pub struct AddRepoBody {
+    pub github_url: String,
+    pub name: Option<String>,
+    #[serde(default)]
+    pub default_branch: Option<String>,
+    pub role: Option<String>,
+    #[serde(default)]
+    pub is_primary: bool,
+}
+
+/// POST /api/projects/{id}/repos — attach a GitHub location.
+pub async fn add_project_repo(
+    Path(project_id): Path<String>,
+    State(state): State<Arc<GatewayState>>,
+    Json(body): Json<AddRepoBody>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let pool = pool_from_state(&state)?;
+    if body.github_url.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "github_url is required"})),
+        ));
+    }
+    let repo = ff_db::pm::pg_add_project_repo(
+        pool,
+        &project_id,
+        body.github_url.trim(),
+        body.name.as_deref(),
+        body.default_branch.as_deref().unwrap_or("main"),
+        body.role.as_deref(),
+        body.is_primary,
+    )
+    .await
+    .map_err(|e| db_err("add_project_repo", e))?;
+    Ok(Json(json!({ "repo": repo })))
+}
+
+/// DELETE /api/projects/repos/{repo_id} — detach a GitHub location.
+pub async fn delete_project_repo(
+    Path(repo_id): Path<String>,
+    State(state): State<Arc<GatewayState>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let pool = pool_from_state(&state)?;
+    let removed = ff_db::pm::pg_delete_project_repo(pool, &repo_id)
+        .await
+        .map_err(|e| db_err("delete_project_repo", e))?;
+    Ok(Json(json!({ "removed": removed })))
+}
+
+/// GET /api/projects/{id}/folders — all local folders for a project.
+pub async fn list_project_folders(
+    Path(project_id): Path<String>,
+    State(state): State<Arc<GatewayState>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let pool = pool_from_state(&state)?;
+    let folders = ff_db::pm::pg_list_project_folders(pool, &project_id)
+        .await
+        .map_err(|e| db_err("list_project_folders", e))?;
+    Ok(Json(json!({ "folders": folders })))
+}
+
+#[derive(Deserialize)]
+pub struct AddFolderBody {
+    pub path: String,
+    /// Host UUID this folder lives on; omit for a canonical/all-hosts path.
+    pub computer_id: Option<String>,
+    pub role: Option<String>,
+    #[serde(default)]
+    pub is_primary: bool,
+}
+
+/// POST /api/projects/{id}/folders — attach a local folder.
+pub async fn add_project_folder(
+    Path(project_id): Path<String>,
+    State(state): State<Arc<GatewayState>>,
+    Json(body): Json<AddFolderBody>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let pool = pool_from_state(&state)?;
+    if body.path.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "path is required"})),
+        ));
+    }
+    let folder = ff_db::pm::pg_add_project_folder(
+        pool,
+        &project_id,
+        body.computer_id.as_deref(),
+        body.path.trim(),
+        body.role.as_deref(),
+        body.is_primary,
+    )
+    .await
+    .map_err(|e| db_err("add_project_folder", e))?;
+    Ok(Json(json!({ "folder": folder })))
+}
+
+/// DELETE /api/projects/folders/{folder_id} — detach a local folder.
+pub async fn delete_project_folder(
+    Path(folder_id): Path<String>,
+    State(state): State<Arc<GatewayState>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let pool = pool_from_state(&state)?;
+    let removed = ff_db::pm::pg_delete_project_folder(pool, &folder_id)
+        .await
+        .map_err(|e| db_err("delete_project_folder", e))?;
+    Ok(Json(json!({ "removed": removed })))
 }
 
 // ─── /api/pm/work-items ─────────────────────────────────────────────────

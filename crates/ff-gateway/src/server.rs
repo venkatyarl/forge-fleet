@@ -10,7 +10,7 @@ use axum::{
     extract::{Path, Query, State, WebSocketUpgrade, ws::Message as WsMessage},
     http::{HeaderMap, Response, StatusCode, header},
     response::{Html, IntoResponse},
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -792,6 +792,23 @@ pub fn build_router(state: Arc<GatewayState>, mc_db_path: Option<&str>) -> Route
         .route(
             "/api/projects/{id}/branches",
             get(crate::pulse_api::project_branches),
+        )
+        // Projects-first PM (V141): attach many GitHub repos + many local folders.
+        .route(
+            "/api/projects/{id}/repos",
+            get(crate::pulse_api::list_project_repos).post(crate::pulse_api::add_project_repo),
+        )
+        .route(
+            "/api/projects/repos/{repo_id}",
+            delete(crate::pulse_api::delete_project_repo),
+        )
+        .route(
+            "/api/projects/{id}/folders",
+            get(crate::pulse_api::list_project_folders).post(crate::pulse_api::add_project_folder),
+        )
+        .route(
+            "/api/projects/folders/{folder_id}",
+            delete(crate::pulse_api::delete_project_folder),
         )
         .route("/api/pm/work-items", get(crate::pulse_api::list_work_items))
         .route(

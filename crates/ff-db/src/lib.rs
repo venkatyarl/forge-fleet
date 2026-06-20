@@ -18,6 +18,7 @@ pub mod dsn_of_record;
 pub mod leader_state;
 pub mod migrations;
 pub mod operational_store;
+pub mod pm;
 pub mod queries;
 pub mod replication;
 pub mod runtime_registry;
