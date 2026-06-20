@@ -19,7 +19,7 @@ use ff_api::registry::{BackendEndpoint, BackendRegistry};
 use ff_api::router::{TierRouter, TierRouterConfig, TierTimeouts};
 use ff_api::types::{ChatCompletionRequest, ChatMessage};
 use ff_core::config::{self, DatabaseMode, FleetConfig};
-use ff_db::{DbPool, DbPoolConfig, FleetModelRow, OperationalStore, run_migrations};
+use ff_db::{DbPool, DbPoolConfig, ModelDeploymentRow, OperationalStore, run_migrations};
 use ff_discovery::health::{HealthMonitor, HealthStatus, HealthTarget};
 use ff_discovery::ports::known_llm_ports;
 use ff_discovery::scanner::{
@@ -82,20 +82,26 @@ pub async fn fleet_status(params: Option<Value>) -> HandlerResult {
     let (config, config_path) = load_config_auto()?;
 
     // ─── Primary source: Postgres. Fallback: fleet.toml ─────────────────────
-    let (pg_nodes, pg_models) = match get_pg_pool(&config).await {
+    let (pg_nodes, pg_deployments) = match get_pg_pool(&config).await {
         Ok(pool) => {
             let nodes = ff_db::pg_list_nodes(&pool).await.unwrap_or_default();
-            let models = ff_db::pg_list_models(&pool).await.unwrap_or_default();
+            // Models LOADED = what's actually RUNNING (fleet_model_deployments),
+            // NOT the legacy fleet_models "desired" table (pg_list_models), which
+            // is empty under the V11 model-lifecycle schema and made models_loaded
+            // report 0 while ~16 deployments were live (operator-reported 2026-06-20).
+            let deployments = ff_db::pg_list_deployments(&pool, None)
+                .await
+                .unwrap_or_default();
             if nodes.is_empty() {
                 info!("fleet_status: Postgres fleet_workers empty, falling back to fleet.toml");
                 (None, None)
             } else {
                 info!(
                     nodes = nodes.len(),
-                    models = models.len(),
+                    deployments = deployments.len(),
                     "fleet_status: using Postgres as primary source"
                 );
-                (Some(nodes), Some(models))
+                (Some(nodes), Some(deployments))
             }
         }
         Err(e) => {
@@ -174,12 +180,13 @@ pub async fn fleet_status(params: Option<Value>) -> HandlerResult {
     let mut offline_nodes = 0usize;
     let mut models_loaded = 0usize;
 
-    // Group Postgres models by worker_name for easy lookup
-    let models_by_node: HashMap<String, Vec<&FleetModelRow>> =
-        if let Some(ref db_models) = pg_models {
-            let mut map: HashMap<String, Vec<&FleetModelRow>> = HashMap::new();
-            for m in db_models {
-                map.entry(m.worker_name.clone()).or_default().push(m);
+    // Group LIVE deployments (fleet_model_deployments) by worker_name. This is
+    // what's actually running — the source of truth for "models loaded".
+    let deployments_by_node: HashMap<String, Vec<&ModelDeploymentRow>> =
+        if let Some(ref db_deps) = pg_deployments {
+            let mut map: HashMap<String, Vec<&ModelDeploymentRow>> = HashMap::new();
+            for d in db_deps {
+                map.entry(d.worker_name.clone()).or_default().push(d);
             }
             map
         } else {
@@ -202,18 +209,21 @@ pub async fn fleet_status(params: Option<Value>) -> HandlerResult {
             }
 
             let mut models = Vec::new();
-            if let Some(node_models) = models_by_node.get(&node.name) {
-                for m in node_models {
-                    let loaded = status == "healthy" || status == "degraded";
+            if let Some(node_deps) = deployments_by_node.get(&node.name) {
+                for d in node_deps {
+                    // "loaded" reflects the DEPLOYMENT's own health, not the node
+                    // scan — a running, healthy inference server is loaded.
+                    let loaded = d.health_status == "healthy";
                     if loaded {
                         models_loaded += 1;
                     }
+                    let model_id = d.catalog_id.clone().unwrap_or_else(|| "unknown".into());
                     models.push(json!({
-                        "id": m.slug,
-                        "name": m.name,
-                        "tier": m.tier,
-                        "port": m.port,
-                        "status": if loaded { "loaded" } else { "unreachable" }
+                        "id": model_id.clone(),
+                        "name": model_id,
+                        "runtime": d.runtime,
+                        "port": d.port,
+                        "status": if loaded { "loaded" } else { d.health_status.as_str() }
                     }));
                 }
             }
