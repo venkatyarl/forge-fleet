@@ -726,6 +726,74 @@ fn remove_worktree(repo_path: &Path, worktree_path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn reclaim_build_artifacts(path: &Path) -> u64 {
+    fn is_reclaimable_dir_name(name: &OsStr) -> bool {
+        name == OsStr::new("target")
+            || name == OsStr::new("node_modules")
+            || name == OsStr::new(".venv")
+    }
+
+    fn approximate_size(path: &Path) -> u64 {
+        let Ok(metadata) = std::fs::symlink_metadata(path) else {
+            return 0;
+        };
+        if metadata.file_type().is_symlink() {
+            return 0;
+        }
+        if metadata.is_file() {
+            return metadata.len();
+        }
+        if !metadata.is_dir() {
+            return 0;
+        }
+
+        let mut total = metadata.len();
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return total;
+        };
+        for entry in entries.flatten() {
+            total = total.saturating_add(approximate_size(&entry.path()));
+        }
+        total
+    }
+
+    fn walk(path: &Path) -> u64 {
+        let Ok(metadata) = std::fs::symlink_metadata(path) else {
+            return 0;
+        };
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return 0;
+        }
+
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return 0;
+        };
+
+        let mut reclaimed = 0u64;
+        for entry in entries.flatten() {
+            let entry_path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() || file_type.is_symlink() {
+                continue;
+            }
+
+            if is_reclaimable_dir_name(&entry.file_name()) {
+                let bytes = approximate_size(&entry_path);
+                if std::fs::remove_dir_all(&entry_path).is_ok() {
+                    reclaimed = reclaimed.saturating_add(bytes);
+                }
+            } else {
+                reclaimed = reclaimed.saturating_add(walk(&entry_path));
+            }
+        }
+        reclaimed
+    }
+
+    walk(path)
+}
+
 /// Stage + commit any agent-made changes in the worktree. Returns true if a
 /// commit was created, false if the worktree was clean (agent made no change).
 /// Provides a deterministic author so the daemon's git env needn't be configured.
@@ -943,11 +1011,13 @@ fn truncate_for_log(s: &str) -> String {
 pub async fn evaluate_worktree_reaper(pg: &PgPool, worker_name: &str) -> Result<usize> {
     let reapable = ff_db::pg_reapable_worktrees(pg, worker_name).await?;
     let mut reaped = 0usize;
+    let mut reclaimed_bytes = 0u64;
     for wt in reapable {
         let repo = PathBuf::from(&wt.repo_path);
         let tree = PathBuf::from(&wt.worktree_path);
         // Best-effort filesystem cleanup; the DB mark below is the source of truth.
         let _ = remove_worktree(&repo, &tree);
+        reclaimed_bytes = reclaimed_bytes.saturating_add(reclaim_build_artifacts(&tree));
         let _ = run_git(
             &repo,
             [
@@ -967,7 +1037,11 @@ pub async fn evaluate_worktree_reaper(pg: &PgPool, worker_name: &str) -> Result<
         reaped += 1;
     }
     if reaped > 0 {
-        info!(reaped, "worktree_reaper: cleaned terminal worktrees");
+        info!(
+            reaped,
+            reclaimed_bytes,
+            "worktree_reaper: cleaned terminal worktrees"
+        );
     }
     Ok(reaped)
 }
