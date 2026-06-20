@@ -240,6 +240,320 @@ pub async fn handle_project(cmd: crate::ProjectCommand) -> Result<()> {
                 println!("{GREEN}✓ Done{RESET}");
             }
         }
+        crate::ProjectCommand::Repo { command } => handle_repo(&pool, command).await?,
+        crate::ProjectCommand::Folder { command } => handle_folder(&pool, command).await?,
+        crate::ProjectCommand::Discover { path, project } => {
+            handle_discover(&pool, &path, project).await?
+        }
     }
     Ok(())
+}
+
+async fn handle_repo(pool: &sqlx::PgPool, cmd: crate::ProjectRepoCommand) -> Result<()> {
+    match cmd {
+        crate::ProjectRepoCommand::List { project } => {
+            let repos = ff_db::pm::pg_list_project_repos(pool, &project)
+                .await
+                .map_err(|e| anyhow::anyhow!("list repos: {e}"))?;
+            if repos.is_empty() {
+                println!("(no repos for project '{project}')");
+                return Ok(());
+            }
+            println!("{:<38} {:<7} {:<8} REPO", "ID", "PRIMARY", "ROLE");
+            for r in &repos {
+                println!(
+                    "{:<38} {:<7} {:<8} {}",
+                    r.id,
+                    if r.is_primary { "✓" } else { "" },
+                    r.role.as_deref().unwrap_or("-"),
+                    r.github_url
+                );
+            }
+        }
+        crate::ProjectRepoCommand::Add {
+            project,
+            url,
+            name,
+            branch,
+            role,
+            primary,
+        } => {
+            let r = ff_db::pm::pg_add_project_repo(
+                pool,
+                &project,
+                &url,
+                name.as_deref(),
+                &branch,
+                role.as_deref(),
+                primary,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("add repo: {e}"))?;
+            println!("{GREEN}✓ repo attached{RESET}  {} → {}", r.id, r.github_url);
+        }
+        crate::ProjectRepoCommand::Rm { id } => {
+            let removed = ff_db::pm::pg_delete_project_repo(pool, &id)
+                .await
+                .map_err(|e| anyhow::anyhow!("rm repo: {e}"))?;
+            if removed {
+                println!("{GREEN}✓ removed{RESET} {id}");
+            } else {
+                println!("{YELLOW}no repo with id {id}{RESET}");
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn handle_folder(pool: &sqlx::PgPool, cmd: crate::ProjectFolderCommand) -> Result<()> {
+    match cmd {
+        crate::ProjectFolderCommand::List { project } => {
+            let folders = ff_db::pm::pg_list_project_folders(pool, &project)
+                .await
+                .map_err(|e| anyhow::anyhow!("list folders: {e}"))?;
+            if folders.is_empty() {
+                println!("(no folders for project '{project}')");
+                return Ok(());
+            }
+            println!(
+                "{:<38} {:<10} {:<7} {:<8} PATH",
+                "ID", "HOST", "PRIMARY", "ROLE"
+            );
+            for f in &folders {
+                println!(
+                    "{:<38} {:<10} {:<7} {:<8} {}",
+                    f.id,
+                    f.computer_name.as_deref().unwrap_or("(all)"),
+                    if f.is_primary { "✓" } else { "" },
+                    f.role.as_deref().unwrap_or("-"),
+                    f.path
+                );
+            }
+        }
+        crate::ProjectFolderCommand::Add {
+            project,
+            path,
+            host,
+            role,
+            primary,
+        } => {
+            let computer_id = match host.as_deref() {
+                Some(h) => Some(resolve_computer_id(pool, h).await?),
+                None => None,
+            };
+            let f = ff_db::pm::pg_add_project_folder(
+                pool,
+                &project,
+                computer_id.as_deref(),
+                &path,
+                role.as_deref(),
+                primary,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("add folder: {e}"))?;
+            println!("{GREEN}✓ folder attached{RESET}  {} → {}", f.id, f.path);
+        }
+        crate::ProjectFolderCommand::Rm { id } => {
+            let removed = ff_db::pm::pg_delete_project_folder(pool, &id)
+                .await
+                .map_err(|e| anyhow::anyhow!("rm folder: {e}"))?;
+            if removed {
+                println!("{GREEN}✓ removed{RESET} {id}");
+            } else {
+                println!("{YELLOW}no folder with id {id}{RESET}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Resolve a computer name → its UUID (case-insensitive).
+async fn resolve_computer_id(pool: &sqlx::PgPool, name: &str) -> Result<String> {
+    let row: Option<(uuid::Uuid,)> =
+        sqlx::query_as("SELECT id FROM computers WHERE LOWER(name) = LOWER($1)")
+            .bind(name)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| anyhow::anyhow!("resolve computer '{name}': {e}"))?;
+    row.map(|r| r.0.to_string())
+        .ok_or_else(|| anyhow::anyhow!("no computer named '{name}'"))
+}
+
+/// Auto-discover a project's repos + local folders: scan `path` (and its
+/// immediate subdirs, for a polyrepo layout) for git repos, read each one's
+/// `origin` remote, and register a project_repos row (the remote) + a
+/// project_folders row (the local clone on THIS host). Section I of the PM
+/// platform plan — replaces the manual "re-point the project at the repos" step.
+async fn handle_discover(pool: &sqlx::PgPool, path: &str, project: Option<String>) -> Result<()> {
+    use std::path::Path;
+    let root = expand_tilde(path);
+    let root = Path::new(&root);
+    if !root.is_dir() {
+        return Err(anyhow::anyhow!("not a directory: {}", root.display()));
+    }
+
+    // Resolve project id: explicit arg → .forgefleet/project.toml marker →
+    // directory name lowercased.
+    let project_id = match project {
+        Some(p) => p,
+        None => read_project_marker(root).unwrap_or_else(|| {
+            root.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("project")
+                .to_lowercase()
+        }),
+    };
+
+    // Ensure the project row exists (minimal) so the repo/folder FKs resolve.
+    let display = root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(&project_id);
+    sqlx::query(
+        "INSERT INTO projects (id, display_name) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING",
+    )
+    .bind(&project_id)
+    .bind(display)
+    .execute(pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("ensure project '{project_id}': {e}"))?;
+
+    let this_host = ff_agent::fleet_info::resolve_this_worker_name().await;
+    let computer_id = resolve_computer_id(pool, &this_host).await.ok();
+
+    // Candidate dirs: the root itself + immediate subdirs (polyrepo layout).
+    let mut candidates = vec![root.to_path_buf()];
+    if let Ok(rd) = std::fs::read_dir(root) {
+        for e in rd.flatten() {
+            if e.path().is_dir() {
+                candidates.push(e.path());
+            }
+        }
+    }
+
+    println!(
+        "{CYAN}▶ discovering git repos under {} → project '{project_id}' (host {this_host}){RESET}",
+        root.display()
+    );
+    let mut found = 0;
+    for dir in candidates {
+        if !dir.join(".git").exists() {
+            continue;
+        }
+        let remote = git_origin(&dir);
+        let name = dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|s| s.to_string());
+        let role = name.as_deref().and_then(infer_role);
+        // primary = the dir whose name matches the project id (best guess).
+        let primary = name
+            .as_deref()
+            .map(|n| n.eq_ignore_ascii_case(&project_id))
+            .unwrap_or(false);
+
+        // Register the local folder (always — we know the path on this host).
+        if let Err(e) = ff_db::pm::pg_add_project_folder(
+            pool,
+            &project_id,
+            computer_id.as_deref(),
+            &dir.to_string_lossy(),
+            Some("source"),
+            primary,
+        )
+        .await
+        {
+            println!("  {YELLOW}folder {} skipped: {e}{RESET}", dir.display());
+        }
+
+        // Register the GitHub repo if it has an origin remote.
+        match remote {
+            Some(url) => {
+                match ff_db::pm::pg_add_project_repo(
+                    pool,
+                    &project_id,
+                    &url,
+                    name.as_deref(),
+                    "main",
+                    role.as_deref(),
+                    primary,
+                )
+                .await
+                {
+                    Ok(_) => {
+                        found += 1;
+                        println!("  {GREEN}✓{RESET} {} → {url}", dir.display());
+                    }
+                    Err(e) => println!("  {YELLOW}repo {} skipped: {e}{RESET}", dir.display()),
+                }
+            }
+            None => println!(
+                "  {YELLOW}• {} (folder only — no git origin){RESET}",
+                dir.display()
+            ),
+        }
+    }
+    println!("{GREEN}✓ discovered {found} repo(s) for '{project_id}'{RESET}");
+    Ok(())
+}
+
+/// Read `.forgefleet/project.toml`'s `project_id` if present (the thin
+/// folder→project pointer; section K).
+fn read_project_marker(dir: &std::path::Path) -> Option<String> {
+    let marker = dir.join(".forgefleet").join("project.toml");
+    let body = std::fs::read_to_string(marker).ok()?;
+    for line in body.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("project_id") {
+            return rest
+                .trim_start_matches([' ', '=', '"'])
+                .trim_end_matches('"')
+                .split('"')
+                .next()
+                .map(|s| s.trim().trim_matches('"').to_string())
+                .filter(|s| !s.is_empty());
+        }
+    }
+    None
+}
+
+/// `git -C <dir> remote get-url origin`, trimmed; `None` if no origin.
+fn git_origin(dir: &std::path::Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if url.is_empty() { None } else { Some(url) }
+}
+
+/// Best-effort role inference from a repo/folder name.
+fn infer_role(name: &str) -> Option<String> {
+    let n = name.to_ascii_lowercase();
+    if n.contains("api") || n.contains("backend") || n.contains("server") {
+        Some("api".into())
+    } else if n.contains("web") || n.contains("app") || n.contains("frontend") || n.contains("ui") {
+        Some("web".into())
+    } else if n.contains("infra") || n.contains("deploy") || n.contains("ops") {
+        Some("infra".into())
+    } else if n.contains("doc") {
+        Some("docs".into())
+    } else {
+        Some("code".into())
+    }
+}
+
+/// Expand a leading `~` to $HOME.
+fn expand_tilde(p: &str) -> String {
+    if let Some(rest) = p.strip_prefix("~/")
+        && let Some(home) = dirs::home_dir()
+    {
+        return home.join(rest).to_string_lossy().to_string();
+    }
+    p.to_string()
 }

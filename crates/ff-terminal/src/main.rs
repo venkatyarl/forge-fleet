@@ -2769,6 +2769,78 @@ pub enum ProjectCommand {
         #[arg(long, default_value_t = false)]
         all: bool,
     },
+    /// Manage a project's GitHub repos (a project can have many — V141).
+    Repo {
+        #[command(subcommand)]
+        command: ProjectRepoCommand,
+    },
+    /// Manage a project's local folders (many, per-host — V141).
+    Folder {
+        #[command(subcommand)]
+        command: ProjectFolderCommand,
+    },
+    /// Auto-discover a project's repos + local folders by scanning a path
+    /// (the path itself + immediate subdirs for a polyrepo) for git repos and
+    /// reading each one's `origin` remote. No manual registration needed.
+    Discover {
+        /// Path to scan (e.g. ~/projects/HireFlow360). Defaults to cwd.
+        #[arg(default_value = ".")]
+        path: String,
+        /// Project id to attach to (defaults to the folder's .forgefleet
+        /// marker, else the directory name lowercased).
+        #[arg(long)]
+        project: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum ProjectRepoCommand {
+    /// List a project's GitHub repos.
+    #[command(alias = "ls")]
+    List { project: String },
+    /// Attach a GitHub repo to a project.
+    Add {
+        project: String,
+        /// GitHub URL (https or git@).
+        url: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long, default_value = "main")]
+        branch: String,
+        /// Role tag: code | infra | docs | ...
+        #[arg(long)]
+        role: Option<String>,
+        /// Mark as the project's primary repo.
+        #[arg(long, default_value_t = false)]
+        primary: bool,
+    },
+    /// Detach a repo by id.
+    Rm { id: String },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum ProjectFolderCommand {
+    /// List a project's local folders.
+    #[command(alias = "ls")]
+    List { project: String },
+    /// Attach a local folder to a project.
+    Add {
+        project: String,
+        /// Local path (absolute or ~-prefixed).
+        path: String,
+        /// Host (computer) this folder lives on. Omit for a canonical
+        /// path that applies to every host.
+        #[arg(long)]
+        host: Option<String>,
+        /// Role tag: source | data | scratch | ...
+        #[arg(long)]
+        role: Option<String>,
+        /// Mark as the project's primary folder.
+        #[arg(long, default_value_t = false)]
+        primary: bool,
+    },
+    /// Detach a folder by id.
+    Rm { id: String },
 }
 
 #[derive(Debug, Clone, Subcommand)]
