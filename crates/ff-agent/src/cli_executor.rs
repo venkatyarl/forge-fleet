@@ -104,7 +104,19 @@ pub const BACKENDS: &[CliBackend] = &[
         port: 51101,
         // Codex `exec` is the headless equivalent. `--skip-git-repo-check`
         // lets it run outside a git repo (matches `ff cli` running anywhere).
-        default_flags: &["exec", "--skip-git-repo-check"],
+        // `--sandbox workspace-write` lets codex actually WRITE files in its
+        // working dir — `codex exec` defaults to a read-only sandbox, so without
+        // this every build dispatch returned made_file_changes=false and codex
+        // (our best backend lane) couldn't be used to build anything (operator-
+        // reported 2026-06-20 from the HireFlow port loop). `workspace-write` is
+        // scoped to the cwd (set via `-C` below) — NOT the full-FS / approvals
+        // bypass — so it's the minimal grant that unblocks autonomous builds.
+        default_flags: &[
+            "exec",
+            "--skip-git-repo-check",
+            "--sandbox",
+            "workspace-write",
+        ],
         // `-C/--cd <dir>` sets the agent's working root.
         cwd_mode: CwdMode::Flag("-C"),
         prompt_is_positional: true,
