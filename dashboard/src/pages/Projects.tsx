@@ -33,6 +33,22 @@ type Project = {
   compliance_sensitivity: string
   revenue_model_tags: string[]
   updated_at: string
+  repos: ProjectRepoSummary[]
+  folders: ProjectFolderSummary[]
+}
+
+type ProjectRepoSummary = {
+  github_url: string
+  name: string
+  role: string
+  is_primary: boolean
+}
+
+type ProjectFolderSummary = {
+  path: string
+  computer_name: string
+  role: string
+  is_primary: boolean
 }
 
 type ProjectRepo = {
@@ -524,9 +540,9 @@ export function Projects() {
         </form>
       </div>
 
-      <div className="grid gap-4 lg:grid-cols-[280px_minmax(0,1fr)]">
-        <aside className="rounded-xl border border-slate-800 bg-slate-900/60 p-3">
-          <h2 className="mb-2 text-sm font-semibold uppercase tracking-wide text-slate-300">
+      <div className="grid gap-4 lg:grid-cols-[320px_minmax(0,1fr)]">
+        <aside className="rounded-xl border border-slate-800 bg-slate-900/60 p-4">
+          <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-slate-300">
             Project Inventory ({projects.length})
           </h2>
           {loading && projects.length === 0 ? (
@@ -541,19 +557,66 @@ export function Projects() {
                   <button
                     key={project.id}
                     onClick={() => setSelectedProjectId(project.id)}
-                    className={`w-full rounded-md border px-3 py-2 text-left transition ${
+                    className={`w-full rounded-xl border p-4 text-left transition ${
                       selected
                         ? 'border-sky-500/40 bg-sky-500/10'
                         : 'border-slate-800 bg-slate-950/60 hover:border-slate-700'
                     }`}
                     type="button"
                   >
-                    <p className="text-sm font-medium text-slate-100">{project.name}</p>
-                    <div className="mt-1 flex items-center gap-1.5 text-xs text-slate-400">
-                      <span className={`rounded-md border px-1.5 py-0.5 ${statusClass(String(project.status))}`}>
+                    <div className="flex items-start justify-between gap-2">
+                      <p className="text-sm font-semibold text-slate-100">{project.name}</p>
+                      <span
+                        className={`shrink-0 rounded-md border px-1.5 py-0.5 text-xs ${statusClass(
+                          String(project.status),
+                        )}`}
+                      >
                         {humanize(String(project.status))}
                       </span>
-                      <span>{project.owner || 'unassigned'}</span>
+                    </div>
+
+                    <div className="mt-3">
+                      <h4 className="text-xs font-semibold uppercase tracking-wide text-slate-500">Repos</h4>
+                      {project.repos.length === 0 ? (
+                        <p className="mt-1 text-xs text-slate-500">No repos.</p>
+                      ) : (
+                        <ul className="mt-1 space-y-1.5">
+                          {project.repos.map((repo, index) => (
+                            <li key={index} className="flex flex-wrap items-center gap-2 text-sm text-slate-300">
+                              <span className="truncate">{repo.name}</span>
+                              {repo.is_primary ? (
+                                <span className="text-amber-300" aria-label="Primary" title="Primary">
+                                  ★
+                                </span>
+                              ) : null}
+                              <span className="rounded-md border border-slate-700 bg-slate-900 px-1.5 py-0.5 text-xs text-slate-400">
+                                {repo.role}
+                              </span>
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                    </div>
+
+                    <div className="mt-3">
+                      <h4 className="text-xs font-semibold uppercase tracking-wide text-slate-500">Folders</h4>
+                      {project.folders.length === 0 ? (
+                        <p className="mt-1 text-xs text-slate-500">No folders.</p>
+                      ) : (
+                        <ul className="mt-1 space-y-1.5">
+                          {project.folders.map((folder, index) => (
+                            <li key={index} className="flex flex-wrap items-center gap-2 text-sm text-slate-300">
+                              <span className="truncate">{folder.path}</span>
+                              <span className="rounded-md border border-slate-700 bg-slate-900 px-1.5 py-0.5 text-xs text-slate-400">
+                                {folder.computer_name}
+                              </span>
+                              <span className="rounded-md border border-slate-700 bg-slate-900 px-1.5 py-0.5 text-xs text-slate-400">
+                                {folder.role}
+                              </span>
+                            </li>
+                          ))}
+                        </ul>
+                      )}
                     </div>
                   </button>
                 )
