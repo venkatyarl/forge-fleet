@@ -32,6 +32,7 @@ pub mod brain_mirror;
 pub mod chat_manager;
 pub mod cli_executor;
 pub mod cloud_llm_registry;
+pub mod codegen_apply;
 pub mod commands;
 pub mod commands_extended;
 pub mod compaction;
