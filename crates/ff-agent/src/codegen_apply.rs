@@ -3,7 +3,7 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use sqlx::PgPool;
 use tracing::{info, warn};
 
@@ -59,22 +59,22 @@ pub async fn codegen_apply(
         fs::write(&patch_path, &diff)
             .with_context(|| format!("write patch {}", patch_path.display()))?;
 
-        let apply = Command::new("git")
-            .arg("-C")
-            .arg(repo_path)
-            .arg("apply")
-            .arg("--3way")
-            .arg(&patch_path)
-            .output()
-            .with_context(|| format!("run git apply in {}", repo_path.display()))?;
-
-        if !apply.status.success() {
-            let err = command_error("git apply", &apply);
-            warn!(round, error = %err, "codegen patch failed to apply");
-            remove_patch_file(&patch_path);
-            last_diff = Some(diff);
-            last_error = Some(err);
-            continue;
+        // Apply the diff with escalating tolerance — weak local coders produce
+        // diffs with drifted @@ line numbers / context, which strict `git apply`
+        // rejects. Try in order: plain git apply (atomic, no markers) → git apply
+        // --recount (recomputes line numbers from context) → `patch --fuzz=3`
+        // (ignores line numbers, fuzzy-matches context). None use --3way (which
+        // would leave conflict markers on failure).
+        match try_apply_patch(repo_path, &patch_path) {
+            Ok(()) => {}
+            Err(err) => {
+                warn!(round, error = %err, "codegen patch failed to apply (all strategies)");
+                clean_worktree(repo_path);
+                remove_patch_file(&patch_path);
+                last_diff = Some(diff);
+                last_error = Some(err);
+                continue;
+            }
         }
 
         let check = Command::new("cargo")
@@ -86,19 +86,8 @@ pub async fn codegen_apply(
         if !check.status.success() {
             let err = command_error("cargo check", &check);
             warn!(round, error = %err, "codegen patch failed cargo check");
-            let revert = Command::new("git")
-                .arg("-C")
-                .arg(repo_path)
-                .arg("checkout")
-                .arg("--")
-                .arg(".")
-                .output()
-                .with_context(|| {
-                    format!("revert failed codegen patch in {}", repo_path.display())
-                })?;
-            if !revert.status.success() {
-                return Err(anyhow!("{}", command_error("git checkout -- .", &revert)));
-            }
+            // Revert the applied-but-broken patch (tracked edits + any new files).
+            clean_worktree(repo_path);
             remove_patch_file(&patch_path);
             last_diff = Some(diff);
             last_error = Some(err);
@@ -128,6 +117,9 @@ fn build_prompt(task: &str, previous_diff: Option<&str>, previous_error: Option<
         "Task:\n{task}\n\n\
          Output ONLY a unified diff inside a single fenced code block tagged diff.\n\
          The diff must be in git-apply format, with paths relative to the repo root.\n\
+         The target files ALREADY EXIST — produce a MODIFICATION diff against the existing\n\
+         content (correct a/ and b/ paths, real @@ hunk headers with context lines). Do NOT\n\
+         use /dev/null or new-file mode unless the file genuinely does not exist yet.\n\
          Do not include prose, explanations, markdown outside the single diff fence, or multiple code blocks.\n\
          Format exactly like:\n\
          ```diff\n\
@@ -194,4 +186,62 @@ fn remove_patch_file(path: &Path) {
     {
         warn!(path = %path.display(), error = %e, "failed to remove codegen patch file");
     }
+}
+
+/// Apply `patch_path` to `repo_path` with escalating tolerance. Returns Ok on
+/// the first strategy that applies cleanly, else the combined error. Strategies,
+/// least→most lenient: `git apply`, `git apply --recount`, `patch -p1 --fuzz=3`.
+/// Never uses `--3way` (leaves conflict markers on failure).
+fn try_apply_patch(repo_path: &Path, patch_path: &Path) -> std::result::Result<(), String> {
+    let git_apply = |extra: &[&str]| -> std::result::Result<(), String> {
+        let mut cmd = Command::new("git");
+        cmd.arg("-C").arg(repo_path).arg("apply");
+        cmd.args(extra);
+        cmd.arg(patch_path);
+        match cmd.output() {
+            Ok(o) if o.status.success() => Ok(()),
+            Ok(o) => Err(command_error("git apply", &o)),
+            Err(e) => Err(format!("git apply spawn failed: {e}")),
+        }
+    };
+
+    let mut errs = Vec::new();
+    match git_apply(&[]) {
+        Ok(()) => return Ok(()),
+        Err(e) => errs.push(e),
+    }
+    match git_apply(&["--recount"]) {
+        Ok(()) => return Ok(()),
+        Err(e) => errs.push(e),
+    }
+    // `patch` (BSD/GNU) fuzzy-matches context and ignores line numbers — the most
+    // forgiving of weak-model diffs. -p1 strips the a/ b/ prefix.
+    match Command::new("patch")
+        .current_dir(repo_path)
+        .args(["-p1", "--fuzz=3", "--no-backup-if-mismatch", "-i"])
+        .arg(patch_path)
+        .output()
+    {
+        Ok(o) if o.status.success() => return Ok(()),
+        Ok(o) => errs.push(command_error("patch --fuzz", &o)),
+        Err(e) => errs.push(format!("patch spawn failed: {e}")),
+    }
+    Err(errs.join(" | "))
+}
+
+/// Reset the worktree to HEAD so a failed or broken patch leaves NO residue for
+/// the next round: `git checkout -- .` reverts tracked edits (incl. any conflict
+/// markers a bad apply produced), `git clean -fd` removes new untracked files the
+/// patch created. Best-effort — never aborts the loop.
+fn clean_worktree(repo_path: &Path) {
+    let _ = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["checkout", "--", "."])
+        .output();
+    let _ = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["clean", "-fd"])
+        .output();
 }
