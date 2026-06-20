@@ -41,6 +41,7 @@ mod arbiter_cmd;
 mod brain_cmd;
 mod cli_bridge_cmd;
 mod cloud_llm_cmd;
+mod codegen_cmd;
 mod config_cmd;
 mod conformance_cmd;
 mod corpus_cmd;
@@ -237,6 +238,16 @@ enum Command {
         /// checkpoint. Prevents a wedged backend from hanging forever.
         #[arg(long)]
         timeout: Option<u64>,
+    },
+    /// Ask a local coder model for a unified diff, apply it, and retry on build errors.
+    Codegen {
+        task: String,
+        #[arg(long)]
+        repo: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long, default_value_t = 4)]
+        rounds: u32,
     },
     /// Credit-saver: offload a heavy, low-architectural-subtlety task to a
     /// WARM tool-capable local LLM on the fleet (bulk codegen, mechanical
@@ -3970,6 +3981,12 @@ async fn main() -> Result<()> {
                 None => run_headless(&prompt, cfg, &output, oneshot).await,
             }
         }
+        Some(Command::Codegen {
+            task,
+            repo,
+            model,
+            rounds,
+        }) => codegen_cmd::handle_codegen(task, repo, model, rounds).await,
         Some(Command::Offload {
             prompt,
             output,
