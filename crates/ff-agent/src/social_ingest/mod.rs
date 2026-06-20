@@ -122,7 +122,7 @@ async fn run_pipeline(pool: PgPool, post_id: Uuid, url: String) -> Result<()> {
 
     // ── analyzing ────────────────────────────────────────────────────
     update_status(&pool, post_id, "analyzing", None).await?;
-    let (endpoint, model_id) = pick_vision_server().await?;
+    let (endpoint, model_id) = pick_vision_server(&pool).await?;
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(300))
         .build()
@@ -201,50 +201,85 @@ fn post_workdir(post_id: Uuid) -> PathBuf {
         .join(post_id.to_string())
 }
 
-/// Pick a healthy vision LLM via Pulse. Tries each model ID in preference
-/// order. Returns `(endpoint_base_url, served_model_id)`.
-async fn pick_vision_server() -> Result<(String, String)> {
-    let redis_url = std::env::var("FORGEFLEET_REDIS_URL")
-        .unwrap_or_else(|_| "redis://127.0.0.1:56379".to_string());
-    let reader = ff_pulse::reader::PulseReader::new(&redis_url)
-        .map_err(|e| anyhow!("PulseReader::new: {e}"))?;
-
-    for model_id in VISION_MODEL_PREFS {
-        match reader.pick_llm_server_for(model_id).await {
-            Ok(Some((_name, server))) => {
-                // `LlmServer` carries the endpoint URL — fall back to
-                // constructing one from host+port if needed.
-                // TODO: once Pulse beats expose a canonical `base_url`
-                // field, use it directly instead of scanning fields.
-                let endpoint = extract_endpoint(&server)
-                    .ok_or_else(|| anyhow!("LLM server has no resolvable endpoint"))?;
-                return Ok((endpoint, (*model_id).to_string()));
-            }
-            Ok(None) => continue,
-            Err(e) => {
-                tracing::warn!(model = %model_id, error = %e, "pick_llm_server_for failed");
-                continue;
-            }
-        }
+/// Pick a healthy vision LLM via the shared DB router ([`ff_db::pg_route_deployments`]).
+///
+/// This replaces the old Pulse/Redis scan. `pg_route_deployments` is the single
+/// scored selector every other live-dispatch path uses (agent endpoint, offload,
+/// research fan-out, the `fleet_route` MCP tool), so vision routing now inherits
+/// the same `healthy`-only filter, health-freshness floor (a wedged host can't
+/// flip its own deployments unhealthy), least-loaded tiebreak, and workload
+/// synonym tolerance (`vision`/`multimodal`) instead of a parallel scanner that
+/// could drift. Returns `(endpoint_base_url, served_model_id)`.
+///
+/// The router already orders candidates tier→load→freshness; we still honor
+/// [`VISION_MODEL_PREFS`] as a *soft* preference so the fleet's best-known vision
+/// model wins when several are healthy, falling back to the top-scored candidate.
+async fn pick_vision_server(pool: &PgPool) -> Result<(String, String)> {
+    let filter = ff_db::RouteFilter {
+        workload: Some("vision".to_string()),
+        // Vision analysis is a single-shot completion, not a tool-agent loop, so
+        // tool_calling is not required and no per-slot ctx floor is imposed.
+        max_health_age_sec: Some(ff_db::queries::DISPATCH_HEALTH_MAX_AGE_SEC),
+        prefer_least_loaded: true,
+        limit: 8,
+        ..Default::default()
+    };
+    let candidates = ff_db::pg_route_deployments(pool, &filter)
+        .await
+        .map_err(|e| anyhow!("pg_route_deployments(vision): {e}"))?;
+    if candidates.is_empty() {
+        return Err(anyhow!("no healthy vision model deployed anywhere"));
     }
-    Err(anyhow!("no vision model loaded anywhere"))
+
+    // Soft preference over the already-scored set: first candidate whose catalog
+    // id/name matches our preference order, else the top-scored one.
+    let pick = VISION_MODEL_PREFS
+        .iter()
+        .find_map(|pref| {
+            candidates.iter().find(|c| {
+                model_matches(c.catalog_id.as_deref(), pref)
+                    || model_matches(c.catalog_name.as_deref(), pref)
+            })
+        })
+        .unwrap_or(&candidates[0]);
+
+    let model_id = pick
+        .catalog_id
+        .clone()
+        .or_else(|| pick.catalog_name.clone())
+        .ok_or_else(|| anyhow!("vision candidate has no catalog id/name"))?;
+    Ok((pick.endpoint.clone(), model_id))
 }
 
-/// Best-effort endpoint extractor. `LlmServer` is defined in
-/// `ff_pulse::beat_v2` with an `endpoint` or `base_url` field across
-/// schema revisions — we probe both via `serde_json` to stay forward-
-/// compatible.
-fn extract_endpoint(server: &ff_pulse::beat_v2::LlmServer) -> Option<String> {
-    let v = serde_json::to_value(server).ok()?;
-    for key in ["base_url", "endpoint", "url"] {
-        if let Some(s) = v.get(key).and_then(|x| x.as_str())
-            && !s.is_empty()
-        {
-            return Some(s.to_string());
-        }
+/// Loose case-insensitive match of a candidate's catalog id/name against a
+/// preference key — exact or substring either direction, so `qwen3-vl-30b-a3b`
+/// matches a served id like `qwen3-vl-30b-a3b-instruct` and vice-versa.
+fn model_matches(candidate: Option<&str>, pref: &str) -> bool {
+    let Some(c) = candidate else { return false };
+    let (c, p) = (c.to_ascii_lowercase(), pref.to_ascii_lowercase());
+    c == p || c.contains(&p) || p.contains(&c)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn model_matches_is_case_insensitive_and_bidirectional() {
+        // exact
+        assert!(model_matches(Some("qwen3-vl-30b-a3b"), "qwen3-vl-30b-a3b"));
+        // case-insensitive
+        assert!(model_matches(Some("Qwen3-VL-30B-A3B"), "qwen3-vl-30b-a3b"));
+        // served id is a superset of the preference key
+        assert!(model_matches(
+            Some("qwen3-vl-30b-a3b-instruct"),
+            "qwen3-vl-30b-a3b"
+        ));
+        // preference key is a superset of the served id
+        assert!(model_matches(Some("qwen2-vl-7b"), "qwen2-vl-7b-instruct"));
+        // no false positives across distinct families
+        assert!(!model_matches(Some("llama32-vision-11b"), "qwen2-vl-7b"));
+        // None never matches
+        assert!(!model_matches(None, "qwen3-vl-30b-a3b"));
     }
-    // Fall back to host + port if present.
-    let host = v.get("host").and_then(|x| x.as_str())?;
-    let port = v.get("port").and_then(|x| x.as_u64())?;
-    Some(format!("http://{host}:{port}"))
 }
