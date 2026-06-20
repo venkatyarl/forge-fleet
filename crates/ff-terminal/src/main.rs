@@ -6704,9 +6704,11 @@ async fn run_headless(
 
     let outcome = handle.await?;
 
-    // Fire-and-forget interaction capture (Track A). Never blocks the response;
-    // skips silently if no pool is available. channel="cli".
-    {
+    // Interaction capture (Track A). Spawned so it adds no latency to the printed
+    // response, but the handle is AWAITED before the process exits — a bare
+    // fire-and-forget here raced `main()` returning and silently dropped `ff run`
+    // rows from the training corpus (the #455 detached-spawn-then-exit footgun).
+    let log_handle = {
         let (response_text, capture_outcome) = match &outcome {
             ff_agent::agent_loop::AgentOutcome::EndTurn { final_message } => {
                 (final_message.clone(), "ok")
@@ -6733,9 +6735,10 @@ async fn run_headless(
                 };
                 let _ = ff_db::pg_record_interaction(&pool, &rec).await;
             }
-        });
-    }
+        })
+    };
 
+    let mut pending_exit = 0i32;
     if is_json {
         let result = serde_json::json!({ "outcome": match &outcome {
             ff_agent::agent_loop::AgentOutcome::EndTurn { final_message } => serde_json::json!({"status":"done","message":final_message}),
@@ -6768,8 +6771,14 @@ async fn run_headless(
         }
         let _ = std::io::stdout().flush();
         if exit_code != 0 {
-            std::process::exit(exit_code);
+            pending_exit = exit_code;
         }
+    }
+    // Block on the interaction capture so a fast `ff run` doesn't exit before its
+    // channel="cli" row is written (training data); then honor the exit code.
+    let _ = log_handle.await;
+    if pending_exit != 0 {
+        std::process::exit(pending_exit);
     }
     Ok(())
 }
