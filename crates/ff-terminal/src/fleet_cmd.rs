@@ -4024,6 +4024,131 @@ fn deploy_playbook(os_family: &str, source_tree_path: &str) -> String {
     }
 }
 
+/// Build + install + restart forgefleetd/ff for the LEADER, run LOCALLY on the
+/// host executing `ff fleet deploy --all`. Deliberately OMITS the
+/// `git reset --hard origin/main` that `deploy_playbook` runs on remote worker
+/// trees: the leader's tree is the operator's DEV checkout, so a hard reset could
+/// wipe uncommitted work. The caller guards this to run only when the tree is
+/// clean AND already at origin/main HEAD, so a plain build of the current tree is
+/// exactly the merged state. OS-aware restart idiom mirrors `deploy_playbook`.
+fn leader_refresh_playbook(os_family: &str, source_tree_path: &str) -> String {
+    let src = expand_home(source_tree_path);
+    let cargo_build = if os_family == "linux-dgx" {
+        "cargo build --release -p forge-fleet -p ff-terminal -j 2"
+    } else {
+        "cargo build --release -p forge-fleet -p ff-terminal"
+    };
+    match os_family {
+        "macos" => format!(
+            ". \"$HOME/.cargo/env\" 2>/dev/null || true; cd \"{src}\" && {cargo_build} && \
+             install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && \
+             install -m 755 target/release/ff ~/.local/bin/ff && \
+             install -m 755 target/release/ff ~/.cargo/bin/ff 2>/dev/null || true; \
+             codesign --force --sign - ~/.local/bin/forgefleetd && \
+             codesign --force --sign - ~/.local/bin/ff && \
+             codesign --force --sign - ~/.cargo/bin/ff 2>/dev/null || true; \
+             USER_ID=$(stat -f %u \"$HOME\" 2>/dev/null || id -u); \
+             launchctl kickstart -k \"gui/${{USER_ID}}/com.forgefleet.forgefleetd\" 2>/dev/null \
+               || launchctl kickstart -k \"user/${{USER_ID}}/com.forgefleet.forgefleetd\" 2>/dev/null; \
+             sleep 4; RN=$(pgrep -xc forgefleetd 2>/dev/null || echo 0); \
+             echo \"LEADER_REFRESH count=$RN\"; [ \"$RN\" -ge 1 ]"
+        ),
+        _ => format!(
+            ". \"$HOME/.cargo/env\" 2>/dev/null || true; cd \"{src}\" && {cargo_build} && \
+             install -m 755 target/release/forgefleetd ~/.local/bin/forgefleetd && \
+             install -m 755 target/release/ff ~/.local/bin/ff && \
+             export XDG_RUNTIME_DIR=\"${{XDG_RUNTIME_DIR:-/run/user/$(id -u)}}\"; \
+             ( systemctl --user restart --no-block forgefleetd.service 2>/dev/null ) \
+               || ( for p in $(pgrep -x forgefleetd); do kill -TERM \"$p\" 2>/dev/null; done; sleep 2; \
+                    nohup \"$HOME/.local/bin/forgefleetd\" --worker-name $(hostname -s) start \
+                    </dev/null >/tmp/forgefleetd.log 2>&1 & disown ); \
+             sleep 4; RN=$(pgrep -xc forgefleetd 2>/dev/null || echo 0); \
+             echo \"LEADER_REFRESH count=$RN\"; [ \"$RN\" -ge 1 ]"
+        ),
+    }
+}
+
+/// Run a shell command LOCALLY (`sh -c`) with a deadline. Returns
+/// (exit_code, stdout, stderr); a timeout surfaces as exit_code = -2.
+async fn run_local_shell(cmd: &str, timeout_secs: u64) -> (i32, String, String) {
+    let mut sh = tokio::process::Command::new("sh");
+    sh.arg("-c").arg(cmd);
+    match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), sh.output()).await {
+        Ok(Ok(out)) => (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout).to_string(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        ),
+        Ok(Err(e)) => (-1, String::new(), format!("local spawn error: {e}")),
+        Err(_) => (
+            -2,
+            String::new(),
+            format!("timed out after {timeout_secs}s"),
+        ),
+    }
+}
+
+/// Refresh the leader's OWN forgefleetd/ff after an `--all` deploy. `--all`
+/// excludes the leader (the host running this command can't SSH-restart itself),
+/// which silently left the leader's daemon lagging source after every deploy —
+/// the recurring "leader drift" (2026-06-20). Now closes that gap: if THIS host
+/// is the leader AND its tree is clean + already at origin/main HEAD, rebuild +
+/// reinstall + restart locally. Returns `Some((ok, detail))` when this host is
+/// the leader (so the caller can report), `None` when it isn't this host's job.
+/// Best-effort: a failure never fails the overall deploy.
+async fn refresh_local_leader_if_self(pool: &sqlx::PgPool) -> Option<(bool, String)> {
+    let me = ff_agent::fleet_info::resolve_this_worker_name().await;
+    let (leader_name, os_family, stp) = sqlx::query_as::<_, (String, String, Option<String>)>(
+        "SELECT c.name, COALESCE(c.os_family, 'macos'), c.source_tree_path
+           FROM computers c
+           LEFT JOIN fleet_workers fw ON fw.name = c.name
+          WHERE COALESCE(fw.role, '') = 'leader'
+          LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+    .ok()??;
+    if !leader_name.eq_ignore_ascii_case(&me) {
+        // Leader is a different host — --all can't restart a remote leader safely.
+        return None;
+    }
+    let src = expand_home(&stp.unwrap_or_else(|| "~/projects/forge-fleet".into()));
+    // Guard: only act on a CLEAN tree already at origin/main HEAD. A plain build
+    // then equals the merged/deployed state; we never touch a dirty dev tree.
+    let clean = run_local_shell(
+        &format!("cd \"{src}\" && [ -z \"$(git status --porcelain)\" ] && \
+                  git fetch origin -q && [ \"$(git rev-parse HEAD)\" = \"$(git rev-parse origin/main)\" ]"),
+        120,
+    )
+    .await;
+    if clean.0 != 0 {
+        return Some((
+            false,
+            "skipped — leader tree dirty or not at origin/main HEAD (won't touch dev tree)".into(),
+        ));
+    }
+    eprintln!(
+        "{CYAN}▶ refreshing leader '{leader_name}' forgefleetd locally (tree clean @ HEAD)…{RESET}"
+    );
+    let (code, _out, err) = run_local_shell(&leader_refresh_playbook(&os_family, &src), 2700).await;
+    if code == 0 {
+        Some((true, "leader daemon rebuilt + restarted".into()))
+    } else {
+        Some((
+            false,
+            format!(
+                "leader refresh exit {code}: {}",
+                err.lines()
+                    .last()
+                    .unwrap_or("")
+                    .chars()
+                    .take(140)
+                    .collect::<String>()
+            ),
+        ))
+    }
+}
+
 /// Run one shell command on a target over SSH with a deadline, capturing
 /// output. Resolves the best-reachable IP (LAN→Tailscale) the same way
 /// `handle_fleet_exec` does. Returns (exit_code, stdout, stderr); a timeout
@@ -4330,6 +4455,16 @@ async fn handle_fleet_deploy(
         .count();
     let total = results.len();
 
+    // Leader self-refresh (closes the recurring leader-drift): --all excludes the
+    // leader, so its own daemon lagged source after every deploy. When the fleet
+    // converged, refresh THIS host's forgefleetd too — if it's the leader and its
+    // tree is clean @ HEAD. Best-effort; never fails the deploy.
+    let leader_refresh: Option<(bool, String)> = if all && total > 0 && converged == total {
+        refresh_local_leader_if_self(pool).await
+    } else {
+        None
+    };
+
     if json {
         let arr: Vec<_> = results
             .iter()
@@ -4348,6 +4483,9 @@ async fn handle_fleet_deploy(
             "target_sha": target_sha,
             "converged": converged,
             "total": total,
+            "leader_refresh": leader_refresh.as_ref().map(|(ok, detail)| serde_json::json!({
+                "ok": ok, "detail": detail,
+            })),
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
         if converged != total {
@@ -4371,6 +4509,13 @@ async fn handle_fleet_deploy(
     }
     let target_disp = target_sha.as_deref().unwrap_or("-");
     println!();
+    if let Some((ok, detail)) = &leader_refresh {
+        if *ok {
+            println!("{GREEN}✓ leader refreshed{RESET} \x1b[2m({detail}){RESET}");
+        } else {
+            eprintln!("{YELLOW}⚠ leader refresh: {detail}{RESET}");
+        }
+    }
     if converged == total && total > 0 {
         println!("{GREEN}✓ {converged}/{total} converged on {target_disp}{RESET}");
     } else {
