@@ -31,8 +31,12 @@ use self::fetcher::FetchedPost;
 use self::platform::detect_platform;
 
 /// Vision model preference (matches IDs in `config/model_catalog.toml`).
-/// First hit on a healthy Pulse-advertised LLM server wins.
+/// First hit on a healthy Pulse-advertised LLM server wins. qwen3-vl-30b leads
+/// because it's what the fleet actually serves today — the older qwen2-vl/llava
+/// IDs were all undeployed, so social_ingest had no vision server to pick and
+/// silently failed every ingest at the analyze step.
 const VISION_MODEL_PREFS: &[&str] = &[
+    "qwen3-vl-30b-a3b",
     "qwen2-vl-7b-instruct",
     "qwen2-vl-7b",
     "llava-onevision-qwen2-7b-si",
@@ -142,6 +146,29 @@ async fn run_pipeline(pool: PgPool, post_id: Uuid, url: String) -> Result<()> {
     .execute(&pool)
     .await
     .context("update post done")?;
+
+    // Log the vision-analysis turn to ff_interactions (training corpus) — the
+    // last LLM-dispatch path not feeding it (after council #442, research
+    // #447/#451/#454, offload #448). The image(s) -> structured analysis pair is
+    // vision-model training signal. Best-effort; never fails the ingest.
+    let rec = ff_db::InteractionRecord {
+        channel: "social_ingest".to_string(),
+        request_text: format!(
+            "analyze {} media item(s) from {url}",
+            fetched.media_items.len()
+        )
+        .chars()
+        .take(16000)
+        .collect(),
+        engine: Some(model_id.clone()),
+        response_text: analysis_json.to_string().chars().take(16000).collect(),
+        outcome: "success".to_string(),
+        endpoint: Some(endpoint.clone()),
+        ..Default::default()
+    };
+    if let Err(e) = ff_db::pg_record_interaction(&pool, &rec).await {
+        tracing::warn!(error = %e, "social_ingest: failed to log interaction (non-fatal)");
+    }
     Ok(())
 }
 

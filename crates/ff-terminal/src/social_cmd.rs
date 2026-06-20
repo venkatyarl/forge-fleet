@@ -13,7 +13,46 @@ pub async fn handle_social(cmd: crate::SocialCommand) -> Result<()> {
         crate::SocialCommand::Ingest { url, by } => {
             let id = ff_agent::social_ingest::ingest(pool.clone(), url, by).await?;
             println!("{GREEN}✓ ingest queued{RESET}  post_id = {id}");
-            println!("  \x1b[2mUse `ff social show {id}` to check status.{RESET}");
+            // The pipeline runs as a DETACHED task in THIS process. The CLI used
+            // to print + exit immediately, which killed that task before it ran —
+            // and nothing else drives `queued` posts, so the ingest never
+            // completed. Poll until a terminal state (keeping the runtime alive so
+            // the task finishes), bounded so a wedged fetch/vision call can't hang.
+            let mut last = String::new();
+            for _ in 0..200 {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                let row: Option<(String, Option<String>)> = sqlx::query_as(
+                    "SELECT status, last_error FROM social_media_posts WHERE id = $1",
+                )
+                .bind(id)
+                .fetch_optional(&pool)
+                .await
+                .map_err(|e| anyhow::anyhow!("poll ingest status: {e}"))?;
+                let Some((status, err)) = row else { break };
+                if status != last {
+                    println!("  {CYAN}{status}{RESET}");
+                    last = status.clone();
+                }
+                match status.as_str() {
+                    "done" => {
+                        println!(
+                            "{GREEN}✓ analysis done{RESET}  \x1b[2mff social show {id}{RESET}"
+                        );
+                        return Ok(());
+                    }
+                    "failed" => {
+                        eprintln!(
+                            "{RED}✗ ingest failed{RESET}: {}",
+                            err.as_deref().unwrap_or("(no error recorded)")
+                        );
+                        std::process::exit(1);
+                    }
+                    _ => {}
+                }
+            }
+            println!(
+                "  \x1b[2mstill running after the wait window — check `ff social show {id}`.{RESET}"
+            );
             Ok(())
         }
         crate::SocialCommand::List {
