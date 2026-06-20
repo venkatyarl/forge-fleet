@@ -2,7 +2,7 @@
 //!
 //! Each daemon host gets N concurrent worker slots (N =
 //! `fleet_workers.sub_agent_count`), each with its own workspace directory
-//! at `~/.forgefleet/sub-agent-{i}/` containing `scratch/`,
+//! at `~/.forgefleet/sub-agents/sub-agent-{i}/` containing `scratch/`,
 //! `checkpoints/`, and `cache/` subdirs.
 //!
 //! The defer-worker calls [`Slots::try_reserve`] before claiming a task.
@@ -45,17 +45,18 @@ fn home_dir_xplat() -> Option<PathBuf> {
     None
 }
 
-/// Ensure `~/.forgefleet/sub-agent-0 .. sub-agent-{count-1}/` exist with
+/// Ensure `~/.forgefleet/sub-agents/sub-agent-0 .. sub-agent-{count-1}/` exist with
 /// `scratch/`, `checkpoints/`, and `cache/` subdirs. Idempotent — no
 /// error if they already exist. Returns the workspace paths in index
 /// order.
 pub fn ensure_workspaces(count: u32) -> Result<Vec<PathBuf>, String> {
     let root = workspaces_root();
-    std::fs::create_dir_all(&root).map_err(|e| format!("create {}: {e}", root.display()))?;
+    let parent = root.join("sub-agents");
+    std::fs::create_dir_all(&parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
 
     let mut out = Vec::with_capacity(count as usize);
     for i in 0..count {
-        let ws = root.join(format!("sub-agent-{i}"));
+        let ws = parent.join(format!("sub-agent-{i}"));
         for sub in ["scratch", "checkpoints", "cache"] {
             let p = ws.join(sub);
             std::fs::create_dir_all(&p).map_err(|e| format!("create {}: {e}", p.display()))?;
@@ -85,8 +86,9 @@ impl Slots {
     pub fn new(count: u32) -> Self {
         let workspaces = ensure_workspaces(count).unwrap_or_else(|e| {
             eprintln!("sub_agents: ensure_workspaces({count}) failed: {e}");
+            let parent = workspaces_root().join("sub-agents");
             (0..count)
-                .map(|i| workspaces_root().join(format!("sub-agent-{i}")))
+                .map(|i| parent.join(format!("sub-agent-{i}")))
                 .collect()
         });
         Self {
@@ -113,10 +115,10 @@ impl Slots {
             if let Err(e) = ensure_workspaces(count) {
                 eprintln!("sub_agents: ensure_workspaces({count}) failed: {e}");
             }
-            let root = workspaces_root();
+            let parent = workspaces_root().join("sub-agents");
             for i in cur..count {
                 inner.in_use.push(false);
-                inner.workspaces.push(root.join(format!("sub-agent-{i}")));
+                inner.workspaces.push(parent.join(format!("sub-agent-{i}")));
             }
         } else {
             // Shrink: drop trailing idle slots. In-use slots stay until
