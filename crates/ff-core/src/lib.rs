@@ -1,4 +1,4 @@
-//! `ff-core` — ForgeFleet core primitives.
+//! Core primitives shared across ForgeFleet crates.
 //!
 //! This crate is the foundation of ForgeFleet, providing:
 //! - **types** — Node, Model, Hardware, Tier, Runtime, Role, etc.
