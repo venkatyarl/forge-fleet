@@ -185,13 +185,13 @@ pub async fn pg_add_project_folder(
     role: Option<&str>,
     is_primary: bool,
 ) -> Result<ProjectFolder> {
-    let computer_uuid = match computer_id {
-        Some(c) => Some(
-            uuid::Uuid::parse_str(c)
-                .map_err(|e| crate::error::DbError::NotFound(format!("bad computer id {c}: {e}")))?,
-        ),
-        None => None,
-    };
+    let computer_uuid =
+        match computer_id {
+            Some(c) => Some(uuid::Uuid::parse_str(c).map_err(|e| {
+                crate::error::DbError::NotFound(format!("bad computer id {c}: {e}"))
+            })?),
+            None => None,
+        };
     let mut tx = pool.begin().await?;
     if is_primary {
         sqlx::query("UPDATE project_folders SET is_primary = FALSE WHERE project_id = $1")
@@ -236,11 +236,10 @@ pub async fn pg_delete_project_folder(pool: &PgPool, id: &str) -> Result<bool> {
 pub async fn pg_list_projects_with_attachments(
     pool: &PgPool,
 ) -> Result<Vec<ProjectWithAttachments>> {
-    let project_rows = sqlx::query(
-        "SELECT id, display_name, status FROM projects ORDER BY display_name ASC",
-    )
-    .fetch_all(pool)
-    .await?;
+    let project_rows =
+        sqlx::query("SELECT id, display_name, status FROM projects ORDER BY display_name ASC")
+            .fetch_all(pool)
+            .await?;
 
     let mut out = Vec::with_capacity(project_rows.len());
     for p in &project_rows {
