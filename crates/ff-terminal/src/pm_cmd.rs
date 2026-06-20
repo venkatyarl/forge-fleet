@@ -154,6 +154,10 @@ pub async fn handle_pm(cmd: crate::PmCommand) -> Result<()> {
             print_board_summary(&pool).await?;
             // The autonomous build pipeline at a glance: work_items joined with
             // their live lease (host), worktree status, and merge-queue/PR state.
+            // HOST resolves to the LIVE lease's computer (who's actually building
+            // right now) when there's an un-released, un-expired lease, falling
+            // back to the planned w.assigned_computer otherwise. live_host being
+            // non-NULL is how the print loop flags an actively-building row.
             let rows: Vec<(
                 String,
                 String,
@@ -162,13 +166,18 @@ pub async fn handle_pm(cmd: crate::PmCommand) -> Result<()> {
                 Option<String>,
                 Option<String>,
                 Option<String>,
+                Option<String>,
             )> = sqlx::query_as(
-                "SELECT w.kind, w.title, w.status, w.assigned_computer, \
+                "SELECT w.kind, w.title, w.status, w.assigned_computer, lc.name AS live_host, \
                         wt.status AS worktree, mq.status AS merge_q, w.pr_url \
                    FROM work_items w \
                    LEFT JOIN work_item_worktrees wt \
                           ON wt.work_item_id = w.id AND wt.status <> 'cleaned' \
                    LEFT JOIN work_item_merge_queue mq ON mq.work_item_id = w.id \
+                   LEFT JOIN work_item_leases l \
+                          ON l.work_item_id = w.id \
+                         AND l.released_at IS NULL AND l.lease_expires_at > NOW() \
+                   LEFT JOIN computers lc ON lc.id = l.computer_id \
                   WHERE w.status NOT IN ('idea', 'cancelled') OR w.pr_url IS NOT NULL \
                   ORDER BY w.created_at DESC \
                   LIMIT $1",
@@ -186,19 +195,25 @@ pub async fn handle_pm(cmd: crate::PmCommand) -> Result<()> {
                 "{CYAN}{:<8} {:<34} {:<11} {:<8} {:<11} {}{RESET}",
                 "KIND", "TITLE", "STATUS", "HOST", "MERGE-Q", "PR"
             );
-            for (kind, title, status, host, _worktree, merge_q, pr) in rows {
+            for (kind, title, status, assigned_host, live_host, _worktree, merge_q, pr) in rows {
                 let t: String = title.chars().take(33).collect();
                 let pr_short = pr
                     .as_deref()
                     .and_then(|u| u.rsplit('/').next())
                     .map(|n| format!("#{n}"))
                     .unwrap_or_default();
+                // Prefer the live lease's computer (●  = building right now); else
+                // the planned assignment.
+                let host = match live_host {
+                    Some(h) => format!("{h}\u{25cf}"),
+                    None => assigned_host.unwrap_or_default(),
+                };
                 println!(
                     "{:<8} {:<34} {:<11} {:<8} {:<11} {}",
                     kind,
                     t,
                     status,
-                    host.unwrap_or_default(),
+                    host,
                     merge_q.unwrap_or_default(),
                     pr_short
                 );
