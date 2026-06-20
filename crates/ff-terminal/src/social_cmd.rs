@@ -1,4 +1,4 @@
-use crate::{CYAN, GREEN, RED, RESET};
+use crate::{CYAN, GREEN, RED, RESET, YELLOW};
 use anyhow::Result;
 
 pub async fn handle_social(cmd: crate::SocialCommand) -> Result<()> {
@@ -196,6 +196,37 @@ pub async fn handle_social(cmd: crate::SocialCommand) -> Result<()> {
             }
             if let Some(e) = last_error {
                 println!("\n{RED}last_error{RESET} {e}");
+            }
+            Ok(())
+        }
+        crate::SocialCommand::Check => {
+            let host = ff_agent::fleet_info::resolve_this_worker_name().await;
+            println!("{CYAN}▶ social-ingest deps on {host}{RESET}");
+            let deps = ff_agent::social_ingest::fetcher::preflight().await;
+            let mut all_ok = true;
+            for d in &deps {
+                if d.ok {
+                    println!("  {GREEN}✓{RESET} {:<8} {}", d.name, d.note);
+                } else {
+                    all_ok = false;
+                    println!("  {RED}✗{RESET} {:<8} {}", d.name, d.note);
+                }
+            }
+            // yt-dlp gates everything; ffmpeg only video frames.
+            let ytdlp_ok = deps
+                .iter()
+                .find(|d| d.name == "yt-dlp")
+                .is_some_and(|d| d.ok);
+            if all_ok {
+                println!("{GREEN}✓ ready — this host can ingest images and video.{RESET}");
+            } else if ytdlp_ok {
+                println!(
+                    "{YELLOW}⚠ images-only — yt-dlp present but ffmpeg missing; video posts \
+                     will fail at frame extraction.{RESET}"
+                );
+            } else {
+                eprintln!("{RED}✗ not ready — yt-dlp is required for any ingest.{RESET}");
+                std::process::exit(1);
             }
             Ok(())
         }

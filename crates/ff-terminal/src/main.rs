@@ -2281,6 +2281,9 @@ pub enum SocialCommand {
         /// Post UUID as printed by `ff social ingest`.
         id: String,
     },
+    /// Pre-flight this host's ingest dependencies (yt-dlp + ffmpeg) — reports
+    /// what's installed before you ingest, instead of failing mid-pipeline.
+    Check,
 }
 
 #[derive(Debug, Clone, Subcommand)]
