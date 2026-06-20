@@ -56,6 +56,7 @@ mod fleet_cmd;
 mod github_cmd;
 mod health_cmd;
 mod helpers;
+mod init_cmd;
 mod lifecycle_cmd;
 mod llm_cmd;
 mod logs_cmd;
@@ -192,6 +193,15 @@ enum Command {
         command: ConfigCommand,
     },
     Version,
+    /// Inject the ForgeFleet operating contract into AI CLI memory files.
+    Init {
+        /// Install into global AI CLI memory files instead of the current project.
+        #[arg(long, default_value_t = false)]
+        global: bool,
+        /// Optional ForgeFleet project id to include in the managed block.
+        #[arg(long)]
+        project: Option<String>,
+    },
     /// Run a one-shot task against the agent.
     ///
     /// `--mode agent` (default) runs the full think→tool→observe loop with all
@@ -3623,6 +3633,9 @@ async fn main() -> Result<()> {
             print_ff_version_long();
             return Ok(());
         }
+        Some(Command::Init { global, project }) => {
+            return init_cmd::handle_init(*global, project.clone()).await;
+        }
         // `ff cli <vendor>` spawns the vendor CLI directly — no fleet LLM
         // router needed, so handle it here on the fast path. `--cwd` reuses
         // the global flag; default is the current directory.
@@ -3974,6 +3987,7 @@ async fn main() -> Result<()> {
             .await
         }
         Some(Command::Task { command }) => task_cmd::handle_task(command, &config_path).await,
+        Some(Command::Init { global, project }) => init_cmd::handle_init(global, project).await,
         Some(Command::Secrets { command }) => secrets_cmd::handle_secrets(command).await,
         Some(Command::Defer { command }) => defer_cmd::handle_defer(command).await,
         Some(Command::Model { command }) => model_cmd::handle_model(command).await,
