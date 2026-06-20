@@ -879,6 +879,28 @@ impl ResearchSession {
         .await
         .context("recover: mark session done")?;
 
+        // Log the recovered turn to ff_interactions (training corpus) — recover()
+        // re-synthesizes a killed run's report and was the one research path not
+        // logged (run() does so at #447). Best-effort; never fails the recovery.
+        let outcome = if failed > 0 && succeeded == 0 {
+            "error"
+        } else {
+            "success"
+        };
+        let rec = ff_db::InteractionRecord {
+            channel: "research".to_string(),
+            request_text: query.chars().take(16000).collect(),
+            engine: Some(session.config.planner_model.clone()),
+            response_text: markdown.chars().take(16000).collect(),
+            latency_ms: i32::try_from(duration_ms).ok(),
+            outcome: outcome.to_string(),
+            endpoint: Some(session.config.gateway_url.clone()),
+            ..Default::default()
+        };
+        if let Err(e) = ff_db::pg_record_interaction(&session.pool, &rec).await {
+            tracing::warn!(error = %e, "research recover: failed to log interaction (non-fatal)");
+        }
+
         Ok(ResearchReport {
             session_id: session.session_id,
             query,
