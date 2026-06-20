@@ -133,6 +133,41 @@ pub async fn fetch(url: &str, out_dir: &Path) -> Result<FetchedPost> {
     })
 }
 
+/// Status of one external dependency the social-ingest fetcher shells out to.
+#[derive(Debug, Clone)]
+pub struct DepStatus {
+    pub name: &'static str,
+    pub ok: bool,
+    /// What it's needed for + the install hint (shown when missing).
+    pub note: String,
+}
+
+/// Pre-flight the fetcher's external deps (`yt-dlp` + `ffmpeg`) WITHOUT touching
+/// the network — so `ff social check` can tell an operator up front whether THIS
+/// host can ingest, instead of discovering a missing binary mid-pipeline (yt-dlp
+/// is needed for every fetch; ffmpeg only for video frame extraction, so an
+/// images-only post still works without it).
+pub async fn preflight() -> Vec<DepStatus> {
+    let mut out = Vec::new();
+    for (name, need) in [
+        ("yt-dlp", "fetch media+metadata (required for ALL ingests)"),
+        ("ffmpeg", "sample video frames (only video posts need it)"),
+    ] {
+        let ok = ensure_binary(name).await.is_ok();
+        let note = if ok {
+            need.to_string()
+        } else {
+            let hint = match name {
+                "yt-dlp" => "pip install yt-dlp (or brew install yt-dlp)",
+                _ => "brew install ffmpeg (macOS) / apt install ffmpeg (Linux)",
+            };
+            format!("{need} — MISSING: {hint}")
+        };
+        out.push(DepStatus { name, ok, note });
+    }
+    out
+}
+
 /// Ensure a binary is on `PATH`, or return a descriptive error.
 async fn ensure_binary(name: &str) -> Result<()> {
     let status = Command::new(name)
