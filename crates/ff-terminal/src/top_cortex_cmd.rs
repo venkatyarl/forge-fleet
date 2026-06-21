@@ -6,7 +6,7 @@
 use crate::{CYAN, GREEN, RESET, YELLOW};
 use anyhow::{Result, anyhow};
 use clap::Subcommand;
-use ff_brain::{corpus, cortex};
+use ff_brain::{corpus, cortex, mirror};
 use sqlx::PgPool;
 use std::path::{Path, PathBuf};
 
@@ -442,6 +442,20 @@ pub enum TopCortexCommand {
         members: i64,
         #[arg(long, value_enum, default_value = "table")]
         format: crate::CortexFormat,
+    },
+    /// Export one corpus's published Cortex graph to a local SQLite snapshot.
+    Export {
+        corpus: String,
+        /// Output SQLite file (default: ~/.forgefleet/cortex-cache/<corpus>.db).
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Import a Cortex SQLite snapshot back into Postgres.
+    Import {
+        file: PathBuf,
+        /// Override the corpus/project slug while restoring nodes.
+        #[arg(long)]
+        corpus: Option<String>,
     },
     /// Manage the git post-commit hook that re-indexes after every commit.
     Hook {
@@ -1146,6 +1160,21 @@ pub async fn handle_top_cortex(args: TopCortexArgs) -> Result<()> {
                 // No symbol matched at all — exit non-zero like show/find/outline.
                 std::process::exit(1);
             }
+        }
+        TopCortexCommand::Export { corpus, out } => {
+            let path = mirror::export(&pool, &corpus, out).await?;
+            let (nodes, edges) = mirror::counts(&path)?;
+            println!(
+                "{GREEN}wrote{RESET} {} ({nodes} node(s), {edges} edge(s))",
+                path.display()
+            );
+        }
+        TopCortexCommand::Import { file, corpus } => {
+            let (nodes, edges) = mirror::import(&pool, &file, corpus.as_deref()).await?;
+            println!(
+                "{GREEN}restored{RESET} {nodes} node(s), {edges} edge(s) from {}",
+                file.display()
+            );
         }
     }
     Ok(())
