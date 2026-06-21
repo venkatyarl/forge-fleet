@@ -192,9 +192,11 @@ fn extract_config_reads(
             let Some(key_arg) = key_arg else {
                 continue;
             };
-            let (key, confidence, method) = match spec.fixed_key {
-                Some(key) => (key.to_string(), 0.9, "EXTRACTED".to_string()),
+            let Some((key, confidence, method)) = (match spec.fixed_key {
+                Some(key) => Some((key.to_string(), 0.9, "EXTRACTED".to_string())),
                 None => resolve_key(key_arg, consts),
+            }) else {
+                continue;
             };
             let line = byte_to_line(&line_starts, mat.start());
             let Some(function_path) = enclosing_function(functions, line) else {
@@ -340,31 +342,21 @@ fn extract_fleet_secret_sql_reads(
     out
 }
 
-fn resolve_key(arg: &str, consts: &HashMap<String, String>) -> (String, f32, String) {
+fn resolve_key(arg: &str, consts: &HashMap<String, String>) -> Option<(String, f32, String)> {
     if let Some(lit) = rust_string_literal_value(arg.trim()) {
-        return (lit, 0.9, "EXTRACTED".to_string());
+        return Some((lit, 0.9, "EXTRACTED".to_string()));
     }
 
     let trimmed = arg.trim();
     if let Some(value) = consts.get(trimmed) {
-        return (value.clone(), 0.9, "EXTRACTED".to_string());
+        return Some((value.clone(), 0.9, "EXTRACTED".to_string()));
     }
     if let Some(leaf) = trimmed.rsplit("::").next()
         && let Some(value) = consts.get(leaf)
     {
-        return (value.clone(), 0.9, "EXTRACTED".to_string());
+        return Some((value.clone(), 0.9, "EXTRACTED".to_string()));
     }
-    if looks_like_const_path(trimmed) {
-        return (trimmed.to_string(), 0.6, "CONST_PATH".to_string());
-    }
-    (trimmed.to_string(), 0.5, "DYNAMIC".to_string())
-}
-
-fn looks_like_const_path(s: &str) -> bool {
-    !s.is_empty()
-        && s.chars()
-            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || matches!(c, '_' | ':'))
-        && s.chars().any(|c| c.is_ascii_uppercase())
+    None
 }
 
 fn enclosing_function(functions: &[SourceFunction], line: i32) -> Option<String> {
@@ -577,4 +569,74 @@ fn line_start_offsets(source: &str) -> Vec<usize> {
 
 fn byte_to_line(line_starts: &[usize], byte: usize) -> i32 {
     line_starts.partition_point(|&s| s <= byte).max(1) as i32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn skips_non_literal_config_keys_but_keeps_literals_and_resolved_consts() {
+        let source = r#"
+const CONST_ENV: &str = "CONST_ENV_VALUE";
+
+fn sample() {
+    let env_key = "DYNAMIC_ENV";
+    let secret_key = "DYNAMIC_SECRET";
+    let flag_key = "DYNAMIC_FLAG";
+
+    std::env::var(env_key);
+    std::env::var(&env_key);
+    std::env::var("LITERAL_ENV");
+    env::var(CONST_ENV);
+    env::var(crate::settings::CONST_ENV);
+    env::var(UNRESOLVED_ENV);
+    env::var(crate::settings::UNRESOLVED_ENV);
+
+    get_secret(secret_key);
+    get_secret("LITERAL_SECRET");
+    is_enabled(flag_key);
+    is_enabled("LITERAL_FLAG");
+    pg_get_secret(pool, &secret_key);
+    pg_get_secret(pool, "PG_SECRET");
+    pg_read_safety_gate(pool, flag_key);
+    pg_read_safety_gate(pool, "PG_FLAG");
+}
+"#;
+        let consts = extract_string_consts(source);
+        let functions = vec![SourceFunction {
+            path: "sample".to_string(),
+            start_line: 4,
+            end_line: 25,
+        }];
+
+        let reads = extract_config_reads(source, &consts, &functions);
+        let keys = reads
+            .iter()
+            .map(|read| (read.kind.clone(), read.key.as_str()))
+            .collect::<BTreeSet<_>>();
+
+        assert!(keys.contains(&(ConfigKind::Env, "LITERAL_ENV")));
+        assert!(keys.contains(&(ConfigKind::Env, "CONST_ENV_VALUE")));
+        assert!(keys.contains(&(ConfigKind::Secret, "LITERAL_SECRET")));
+        assert!(keys.contains(&(ConfigKind::Secret, "PG_SECRET")));
+        assert!(keys.contains(&(ConfigKind::Flag, "LITERAL_FLAG")));
+        assert!(keys.contains(&(ConfigKind::Flag, "PG_FLAG")));
+
+        for skipped in [
+            "env_key",
+            "&env_key",
+            "secret_key",
+            "&secret_key",
+            "flag_key",
+            "UNRESOLVED_ENV",
+            "crate::settings::UNRESOLVED_ENV",
+        ] {
+            assert!(
+                reads.iter().all(|read| read.key != skipped),
+                "unexpected config key emitted: {skipped}"
+            );
+        }
+    }
 }
