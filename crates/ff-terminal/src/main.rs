@@ -248,6 +248,8 @@ enum Command {
         model: Option<String>,
         #[arg(long, default_value_t = 4)]
         rounds: u32,
+        #[arg(long)]
+        no_backstop: bool,
     },
     /// Credit-saver: offload a heavy, low-architectural-subtlety task to a
     /// WARM tool-capable local LLM on the fleet (bulk codegen, mechanical
@@ -3986,7 +3988,8 @@ async fn main() -> Result<()> {
             repo,
             model,
             rounds,
-        }) => codegen_cmd::handle_codegen(task, repo, model, rounds).await,
+            no_backstop,
+        }) => codegen_cmd::handle_codegen(task, repo, model, rounds, no_backstop).await,
         Some(Command::Offload {
             prompt,
             output,
