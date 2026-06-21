@@ -2607,6 +2607,15 @@ pub enum CortexCommand {
         #[arg(long, value_enum, default_value = "table")]
         format: crate::CortexFormat,
     },
+    /// List HTTP endpoints, or inspect one endpoint path.
+    #[command(visible_alias = "endpoint")]
+    Endpoints {
+        path: Option<String>,
+        #[arg(long)]
+        corpus: Option<String>,
+        #[arg(long, value_enum, default_value = "table")]
+        format: crate::CortexFormat,
+    },
     /// List Rust error types extracted from Cortex observability signals.
     Errors {
         #[arg(long)]

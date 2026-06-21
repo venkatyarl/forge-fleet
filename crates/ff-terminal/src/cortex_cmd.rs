@@ -129,6 +129,19 @@ pub async fn handle_cortex(pool: &PgPool, cmd: crate::CortexCommand) -> Result<(
             let rows = cortex::security::guards(pool, &corpus, &symbol).await?;
             print_security_guards(&rows, format.as_str(), &symbol);
         }
+        crate::CortexCommand::Endpoints {
+            path,
+            corpus,
+            format,
+        } => {
+            cortex::routes::print_endpoints_command(
+                pool,
+                corpus.as_deref(),
+                path.as_deref(),
+                format.as_str(),
+            )
+            .await?;
+        }
         crate::CortexCommand::Errors { corpus, format } => {
             let rows = cortex::observ::errors(pool, corpus.as_deref()).await?;
             print_errors(&rows, format.as_str());
