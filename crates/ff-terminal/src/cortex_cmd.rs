@@ -41,6 +41,15 @@ pub async fn handle_cortex(pool: &PgPool, cmd: crate::CortexCommand) -> Result<(
             println!("    serves_model:      {}", counts.serves_model_edges);
             println!("{CYAN}\u{2713} Done{RESET}");
         }
+        crate::CortexCommand::IngestPeople => {
+            println!("{CYAN}\u{25b6} Cortex canonicalizing people\u{2026}{RESET}");
+            let counts = cortex::ingest_people::ingest_people(pool).await?;
+            println!("  upsert attempts:     {}", counts.upsert_attempts);
+            println!("  canonical people:    {}", counts.canonical_people);
+            println!("  authored edges:      {}", counts.authored_edges);
+            println!("  alias_of edges:      {}", counts.alias_of_edges);
+            println!("{CYAN}\u{2713} Done{RESET}");
+        }
         crate::CortexCommand::Entities { corpus } => {
             println!("{CYAN}\u{25b6} Cortex deriving business entities\u{2026}{RESET}");
             let counts = cortex::ingest_biz::ingest_biz(pool, corpus.as_deref()).await?;
@@ -205,6 +214,10 @@ pub async fn handle_cortex(pool: &PgPool, cmd: crate::CortexCommand) -> Result<(
                 print_owners(&rows, format.as_str());
             }
         }
+        crate::CortexCommand::People { format } => {
+            let rows = cortex::ingest_people::list_people(pool).await?;
+            print_people(&rows, format.as_str());
+        }
         crate::CortexCommand::Features { corpus, format } => {
             let rows = cortex::product::features(pool, corpus.as_deref()).await?;
             print_features(&rows, format.as_str());
@@ -311,6 +324,44 @@ fn print_owner_files(rows: &[cortex::owners::OwnedFile], format: &str, name: &st
                 println!(
                     "  {}  ({}, confidence {:.2})",
                     row.path, row.corpus, row.confidence
+                );
+            }
+        }
+    }
+}
+
+fn print_people(rows: &[cortex::ingest_people::PersonSummary], format: &str) {
+    match format {
+        "json" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(rows).unwrap_or_else(|_| "[]".to_string())
+            );
+        }
+        "names" => {
+            for row in rows {
+                println!("{}", row.name);
+            }
+        }
+        _ => {
+            if rows.is_empty() {
+                println!(
+                    "no canonical person:dev nodes in cortex (run `ff cortex ingest-people`?)"
+                );
+                return;
+            }
+            println!(
+                "{CYAN}\u{25b6} cortex people — {} canonical person(s):{RESET}",
+                rows.len()
+            );
+            println!("  {:<36} {:>7} {:>7}  path", "person", "files", "corpora");
+            for row in rows {
+                println!(
+                    "  {:<36} {:>7} {:>7}  {}",
+                    truncate(&row.name, 36),
+                    row.file_count,
+                    row.corpus_count,
+                    row.path
                 );
             }
         }

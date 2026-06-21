@@ -2489,6 +2489,8 @@ pub enum CortexCommand {
     },
     /// Ingest fleet topology tables into Cortex graph nodes + edges.
     IngestFleet,
+    /// Canonicalize per-corpus people into fleet-wide person nodes.
+    IngestPeople,
     /// Derive and list business/domain entities from indexed DB schema nodes.
     Entities {
         #[arg(long)]
@@ -2643,6 +2645,11 @@ pub enum CortexCommand {
         name: Option<String>,
         #[arg(long)]
         corpus: Option<String>,
+        #[arg(long, value_enum, default_value = "table")]
+        format: crate::CortexFormat,
+    },
+    /// List canonical people across all indexed corpora.
+    People {
         #[arg(long, value_enum, default_value = "table")]
         format: crate::CortexFormat,
     },

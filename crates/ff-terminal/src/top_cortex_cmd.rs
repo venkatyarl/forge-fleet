@@ -43,6 +43,8 @@ pub enum TopCortexCommand {
     },
     /// Ingest fleet topology tables into Cortex graph nodes + edges.
     IngestFleet,
+    /// Canonicalize per-corpus people into fleet-wide person nodes.
+    IngestPeople,
     /// Derive and list business/domain entities from indexed DB schema nodes.
     Entities {
         #[arg(long)]
@@ -344,6 +346,11 @@ pub enum TopCortexCommand {
         name: Option<String>,
         #[arg(long)]
         corpus: Option<String>,
+        #[arg(long, value_enum, default_value = "table")]
+        format: crate::CortexFormat,
+    },
+    /// List canonical people across all indexed corpora.
+    People {
         #[arg(long, value_enum, default_value = "table")]
         format: crate::CortexFormat,
     },
@@ -816,6 +823,9 @@ async fn handle_top_cortex_online(args: TopCortexArgs) -> Result<()> {
         TopCortexCommand::IngestFleet => {
             crate::cortex_cmd::handle_cortex(&pool, crate::CortexCommand::IngestFleet).await?;
         }
+        TopCortexCommand::IngestPeople => {
+            crate::cortex_cmd::handle_cortex(&pool, crate::CortexCommand::IngestPeople).await?;
+        }
         TopCortexCommand::Entities { corpus } => {
             crate::cortex_cmd::handle_cortex(&pool, crate::CortexCommand::Entities { corpus })
                 .await?;
@@ -1154,6 +1164,10 @@ async fn handle_top_cortex_online(args: TopCortexArgs) -> Result<()> {
                 },
             )
             .await?;
+        }
+        TopCortexCommand::People { format } => {
+            crate::cortex_cmd::handle_cortex(&pool, crate::CortexCommand::People { format })
+                .await?;
         }
         TopCortexCommand::Features { corpus, format } => {
             let corpus = corpus.unwrap_or_else(cwd_slug);
