@@ -117,6 +117,18 @@ pub async fn handle_cortex(pool: &PgPool, cmd: crate::CortexCommand) -> Result<(
             let rows = cortex::topic(pool, corpus.as_deref(), &subject).await?;
             print_topic(&rows, format.as_str(), &subject);
         }
+        crate::CortexCommand::Gates { corpus, format } => {
+            let report = cortex::security::gates(pool, corpus.as_deref()).await?;
+            print_security_gates(&report, format.as_str());
+        }
+        crate::CortexCommand::Guards {
+            corpus,
+            symbol,
+            format,
+        } => {
+            let rows = cortex::security::guards(pool, &corpus, &symbol).await?;
+            print_security_guards(&rows, format.as_str(), &symbol);
+        }
         crate::CortexCommand::Errors { corpus, format } => {
             let rows = cortex::observ::errors(pool, corpus.as_deref()).await?;
             print_errors(&rows, format.as_str());
@@ -375,6 +387,100 @@ fn print_endpoint(endpoint: &cortex::EventEndpoint) {
         "    {}  ({method}, confidence {:.2})",
         endpoint.qualified_name, endpoint.confidence
     );
+}
+
+fn print_security_gates(report: &cortex::security::SecurityGatesReport, format: &str) {
+    match format {
+        "json" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(report).unwrap_or_else(|_| "{}".to_string())
+            );
+        }
+        "names" => {
+            for row in &report.gates {
+                println!("{}", row.gate);
+            }
+            for handler in &report.unguarded_handlers {
+                println!("unguarded:{}", handler.qualified_name);
+            }
+        }
+        _ => {
+            if report.gates.is_empty() {
+                println!("no security:gate nodes in cortex (run `ff cortex index`?)");
+            } else {
+                println!(
+                    "{CYAN}\u{25b6} cortex gates — {} gate(s):{RESET}",
+                    report.gates.len()
+                );
+                println!("  {:<28} {:>5}  corpus", "gate", "fns");
+                for row in &report.gates {
+                    println!(
+                        "  {:<28} {:>5}  {}",
+                        truncate(&row.gate, 28),
+                        row.protected_functions,
+                        row.corpus
+                    );
+                }
+            }
+
+            if !report.unguarded_handlers.is_empty() {
+                println!("  candidate unauthenticated handlers:");
+                for handler in &report.unguarded_handlers {
+                    let line = handler
+                        .start_line
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| "-".to_string());
+                    println!("    {}  ({}:{line})", handler.qualified_name, handler.path);
+                }
+            }
+        }
+    }
+}
+
+fn print_security_guards(
+    rows: &[cortex::security::SecurityGuardDetail],
+    format: &str,
+    symbol: &str,
+) {
+    match format {
+        "json" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(rows).unwrap_or_else(|_| "[]".to_string())
+            );
+        }
+        "names" => {
+            for row in rows {
+                for gate in &row.gates {
+                    println!("{}", gate.gate);
+                }
+            }
+        }
+        _ => {
+            if rows.is_empty() {
+                println!("no guards for '{symbol}' in cortex (run `ff cortex index`?)");
+                return;
+            }
+            for row in rows {
+                println!(
+                    "{CYAN}\u{25b6} cortex guards for '{}' ({}){RESET}",
+                    row.symbol, row.corpus
+                );
+                if row.gates.is_empty() {
+                    println!("  -");
+                } else {
+                    for gate in &row.gates {
+                        let method = gate.method.as_deref().unwrap_or("-");
+                        println!(
+                            "  {}  ({method}, confidence {:.2})",
+                            gate.gate, gate.confidence
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn truncate(s: &str, max: usize) -> String {
