@@ -6,7 +6,7 @@
 use crate::{CYAN, GREEN, RESET, YELLOW};
 use anyhow::{Result, anyhow};
 use clap::Subcommand;
-use ff_brain::{corpus, cortex, ingest_pm, mirror};
+use ff_brain::{corpus, cortex, ingest_decisions, ingest_pm, mirror};
 use sqlx::PgPool;
 use std::path::{Path, PathBuf};
 
@@ -461,6 +461,8 @@ pub enum TopCortexCommand {
     },
     /// Ingest PM work_items as Cortex nodes and tracked_by edges to code/data nodes.
     IngestPm,
+    /// Link vault notes/docs to the code and source files they describe.
+    IngestDecisions,
     /// Manage the git post-commit hook that re-indexes after every commit.
     Hook {
         #[command(subcommand)]
@@ -1188,6 +1190,10 @@ pub async fn handle_top_cortex(args: TopCortexArgs) -> Result<()> {
             println!(
                 "{GREEN}ingested{RESET} {nodes} pm:work_item node(s), {edges} tracked_by edge(s)"
             );
+        }
+        TopCortexCommand::IngestDecisions => {
+            let edges = ingest_decisions::ingest_decisions(&pool).await?;
+            println!("{GREEN}ingested{RESET} {edges} documented_by edge(s)");
         }
     }
     Ok(())
