@@ -330,7 +330,7 @@ async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -
 
     let head_sha = git_head_sha(&worktree.worktree_path)?;
     push_branch(&item.repo_path, &worktree.task_branch)?;
-    let pr_url = create_pr(&worktree.worktree_path, &item, &worktree)?;
+    let pr_url = create_pr(&worktree.worktree_path, &item, &worktree).await?;
 
     mark_ready_for_review(&pg, &item, &worktree, &head_sha, &pr_url).await?;
     Ok(())
@@ -986,7 +986,7 @@ fn push_branch(repo_path: &Path, task_branch: &str) -> Result<()> {
     Ok(())
 }
 
-fn create_pr(
+async fn create_pr(
     worktree_path: &Path,
     item: &AssignedWorkItem,
     worktree: &WorktreeRecord,
@@ -1008,6 +1008,14 @@ fn create_pr(
         .arg(&worktree.task_branch)
         .arg("--base")
         .arg(&worktree.base_branch);
+    if let Some(token) = crate::fleet_info::fetch_secret("github_gh_token").await {
+        cmd.env("GH_TOKEN", token);
+    } else {
+        warn!(
+            work_item_id = %item.work_item_id,
+            "work_item_dispatch: github_gh_token secret missing; falling back to ambient gh auth"
+        );
+    }
     let out = run_command_timeout(cmd, Duration::from_secs(120))?;
     let pr_url = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if pr_url.is_empty() {
