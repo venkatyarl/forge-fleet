@@ -565,11 +565,7 @@ async fn wipe_code_nodes(pool: &PgPool, corpus_slug: &str) -> Result<()> {
 /// stamped with the in-progress `generation`. Code symbols are written by the
 /// in-tree per-language pass; this is the single plug point new dimensions append
 /// to via [`spi::registry`], so a fan-out PR is one new module + one registry line.
-async fn run_pluggable_extractors(
-    pool: &PgPool,
-    corpus_slug: &str,
-    generation: i64,
-) -> Result<()> {
+async fn run_pluggable_extractors(pool: &PgPool, corpus_slug: &str, generation: i64) -> Result<()> {
     let roots = corpus_root_paths(pool, corpus_slug).await?;
     let ctx = spi::ExtractCtx {
         pool,
