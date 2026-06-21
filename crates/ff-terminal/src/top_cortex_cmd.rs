@@ -414,6 +414,8 @@ pub enum TopCortexCommand {
         #[arg(long, default_value_t = 3)]
         debounce: u64,
     },
+    #[command(external_subcommand)]
+    Types(Vec<String>),
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -1006,6 +1008,9 @@ pub async fn handle_top_cortex(args: TopCortexArgs) -> Result<()> {
                 },
             )
             .await?;
+        }
+        TopCortexCommand::Types(args) => {
+            cortex::types::handle_cli(&pool, args, cwd_slug()).await?;
         }
         TopCortexCommand::Review {
             base,
