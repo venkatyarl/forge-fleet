@@ -4,7 +4,7 @@
 //! derived, portable snapshot for outage/wipe recovery and offline transport.
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OpenFlags, params};
 use sqlx::{FromRow, PgPool};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -65,6 +65,14 @@ pub fn cache_path(corpus: &str) -> PathBuf {
     home.join(".forgefleet")
         .join("cortex-cache")
         .join(format!("{corpus}.db"))
+}
+
+pub async fn open_fallback(corpus: &str) -> Option<Connection> {
+    let path = cache_path(corpus);
+    if !path.exists() {
+        return None;
+    }
+    Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).ok()
 }
 
 pub fn counts(file: &Path) -> Result<(usize, usize)> {
