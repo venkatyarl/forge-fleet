@@ -86,6 +86,8 @@ pub mod db_schema;
 pub mod deps;
 #[path = "cortex/extractors/events.rs"]
 pub mod events;
+#[path = "cortex/extractors/observ.rs"]
+pub mod observ;
 #[path = "cortex/spi.rs"]
 pub mod spi;
 
