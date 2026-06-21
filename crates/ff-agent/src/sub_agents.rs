@@ -23,8 +23,7 @@ pub fn compute_default_count(cores: u32, ram_gb: u32, has_nvidia_gpu: bool) -> u
     candidate.max(1)
 }
 
-/// Return the root directory for sub-agent workspaces (`~/.forgefleet` on
-/// Unix, `%USERPROFILE%\.forgefleet` on Windows).
+/// Returns the root directory (~/.forgefleet) for sub-agent workspaces.
 fn workspaces_root() -> PathBuf {
     if let Some(h) = home_dir_xplat() {
         h.join(".forgefleet")
