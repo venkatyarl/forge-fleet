@@ -61,6 +61,15 @@ pub enum TopCortexCommand {
         #[arg(long, value_enum, default_value = "table")]
         format: crate::CortexFormat,
     },
+    /// Match Cortex nodes between two corpora and emit `maps_to` lineage edges.
+    Lineage {
+        #[arg(long = "from")]
+        from_slug: String,
+        #[arg(long = "to")]
+        to_slug: String,
+        #[arg(long, value_enum, default_value = "table")]
+        format: crate::CortexFormat,
+    },
     /// Prune junk corpora — empty ones (0 sources AND 0 content nodes, e.g.
     /// abandoned `cortex index` probes) plus any whose slug matches `--slug`.
     /// Dry-run by default: prints what WOULD be deleted; pass `--yes` to delete.
@@ -717,6 +726,56 @@ async fn print_corpora(pool: &PgPool, target: Option<String>, format: &str) -> R
     Ok(())
 }
 
+fn print_lineage_report(
+    report: &cortex::maps_to::LineageReport,
+    edges_written: usize,
+    format: &str,
+) -> Result<()> {
+    if format == "json" {
+        let v = serde_json::json!({
+            "from": report.from,
+            "to": report.to,
+            "mapped": report.mapped,
+            "unmapped": report.unmapped,
+            "total": report.total,
+            "edges_written": edges_written,
+            "sample_gaps": report.sample_gaps,
+        });
+        println!("{}", serde_json::to_string_pretty(&v)?);
+        return Ok(());
+    }
+
+    if format == "names" {
+        for gap in &report.sample_gaps {
+            println!("{}", gap.title);
+        }
+        return Ok(());
+    }
+
+    println!(
+        "{CYAN}▶ cortex lineage {} -> {}{RESET}",
+        report.from, report.to
+    );
+    println!("  mapped:        {}", report.mapped);
+    println!("  unmapped:      {}", report.unmapped);
+    println!("  total checked: {}", report.total);
+    println!("  edges written: {}", edges_written);
+
+    if report.sample_gaps.is_empty() {
+        println!("{GREEN}✓ no sample gaps{RESET}");
+    } else {
+        println!("\n{YELLOW}sample gaps:{RESET}");
+        for gap in &report.sample_gaps {
+            println!(
+                "  {:<14} {}",
+                truncate_deps_cell(&gap.node_type, 14),
+                truncate_deps_cell(&gap.title, 90)
+            );
+        }
+    }
+    Ok(())
+}
+
 pub async fn handle_top_cortex(args: TopCortexArgs) -> Result<()> {
     let pool = ff_agent::fleet_info::get_fleet_pool()
         .await
@@ -786,6 +845,15 @@ pub async fn handle_top_cortex(args: TopCortexArgs) -> Result<()> {
             // The CLI mirror of the `cortex_corpora` MCP tool: always lists every
             // corpus (the `status --all` view), independent of the cwd.
             print_corpora(&pool, None, format.as_str()).await?;
+        }
+        TopCortexCommand::Lineage {
+            from_slug,
+            to_slug,
+            format,
+        } => {
+            let written = cortex::maps_to::map_corpora(&pool, &from_slug, &to_slug).await?;
+            let report = cortex::maps_to::lineage_report(&pool, &from_slug, &to_slug, 10).await?;
+            print_lineage_report(&report, written, format.as_str())?;
         }
         TopCortexCommand::Prune { slug, yes } => {
             run_prune(&pool, slug, yes).await?;
