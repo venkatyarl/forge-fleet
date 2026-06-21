@@ -29,6 +29,7 @@ pub mod bash_security;
 pub mod batch_manager;
 pub mod brain;
 pub mod brain_mirror;
+pub mod capability_synthesis;
 pub mod chat_manager;
 pub mod cli_executor;
 pub mod cloud_llm_registry;
