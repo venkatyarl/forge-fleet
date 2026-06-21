@@ -12,9 +12,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-/// Compute the default sub-agent slot count for a host based on its
-/// hardware. Formula: `max(1, min(cores/2, ram_gb/16, cap))` where `cap`
-/// = 8 if the host has an NVIDIA GPU AND ram_gb >= 64, else 4.
+/// Computes the default sub-agent slot count from cores, ram, and gpu.
 pub fn compute_default_count(cores: u32, ram_gb: u32, has_nvidia_gpu: bool) -> u32 {
     let cap: u32 = if has_nvidia_gpu && ram_gb >= 64 { 8 } else { 4 };
     let by_cores = cores / 2;
