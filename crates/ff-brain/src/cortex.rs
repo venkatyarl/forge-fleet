@@ -634,6 +634,12 @@ async fn corpus_root_paths(pool: &PgPool, corpus_slug: &str) -> Result<Vec<std::
 
 struct CortexGenerationLock {
     generation: i64,
+    /// Dedicated connection that holds the session-level advisory lock for the
+    /// WHOLE reindex. Kept checked out of the pool so it is NOT idle-reaped
+    /// mid-pass — the pool's `idle_timeout` (60s) would otherwise drop the
+    /// lock-holding connection partway through a large (multi-minute) reindex,
+    /// surfacing as "connection closed / got 0 bytes at EOF" and a truncated graph.
+    conn: sqlx::pool::PoolConnection<sqlx::Postgres>,
 }
 
 async fn try_begin_cortex_generation(
@@ -641,9 +647,14 @@ async fn try_begin_cortex_generation(
     corpus_slug: &str,
 ) -> Result<Option<CortexGenerationLock>> {
     let lock_key = format!("cortex:{corpus_slug}");
+    // Hold the advisory lock on a DEDICATED connection (checked out of the pool)
+    // for the whole reindex — pg_try_advisory_lock is session-scoped, so the lock
+    // lives exactly as long as this connection stays checked out. See the
+    // CortexGenerationLock doc for why this matters (idle-reaping mid-reindex).
+    let mut conn = pool.acquire().await?;
     let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtext($1))")
         .bind(&lock_key)
-        .fetch_one(pool)
+        .fetch_one(&mut *conn)
         .await?;
     if !acquired {
         return Ok(None);
@@ -662,18 +673,22 @@ async fn try_begin_cortex_generation(
     )
     .bind(corpus_slug)
     .bind(node)
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await?;
 
-    Ok(Some(CortexGenerationLock { generation }))
+    Ok(Some(CortexGenerationLock { generation, conn }))
 }
 
 async fn finish_cortex_generation<T>(
-    pool: &PgPool,
+    _pool: &PgPool,
     corpus_slug: &str,
-    lock: CortexGenerationLock,
+    mut lock: CortexGenerationLock,
     result: Result<T>,
 ) -> Result<T> {
+    // Run the swap + unlock on the SAME dedicated connection that took the lock —
+    // pg_advisory_unlock must run in the locking session, and this connection is
+    // guaranteed alive (it was held checked-out for the whole reindex). The reindex
+    // work itself used the pool.
     let lock_key = format!("cortex:{corpus_slug}");
     match result {
         Ok(value) => {
@@ -687,11 +702,11 @@ async fn finish_cortex_generation<T>(
             )
             .bind(corpus_slug)
             .bind(lock.generation)
-            .execute(pool)
+            .execute(&mut *lock.conn)
             .await?;
             let _: bool = sqlx::query_scalar("SELECT pg_advisory_unlock(hashtext($1))")
                 .bind(&lock_key)
-                .fetch_one(pool)
+                .fetch_one(&mut *lock.conn)
                 .await?;
             Ok(value)
         }
@@ -703,11 +718,11 @@ async fn finish_cortex_generation<T>(
                     WHERE project = $1"#,
             )
             .bind(corpus_slug)
-            .execute(pool)
+            .execute(&mut *lock.conn)
             .await;
             let _ = sqlx::query_scalar::<_, bool>("SELECT pg_advisory_unlock(hashtext($1))")
                 .bind(&lock_key)
-                .fetch_one(pool)
+                .fetch_one(&mut *lock.conn)
                 .await;
             Err(err)
         }
