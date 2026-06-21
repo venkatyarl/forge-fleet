@@ -41,6 +41,8 @@ pub enum TopCortexCommand {
         #[arg(long)]
         full: bool,
     },
+    /// Ingest fleet topology tables into Cortex graph nodes + edges.
+    IngestFleet,
     /// Show the indexed corpus for the cwd (or --all corpora): node/edge counts.
     Status {
         /// Show all corpora, not just the one matching the cwd.
@@ -737,6 +739,9 @@ pub async fn handle_top_cortex(args: TopCortexArgs) -> Result<()> {
             // back-compat but redundant since it's the default.
             let _ = incremental;
             run_index(&pool, &root, &slug, lang, true, !full).await?;
+        }
+        TopCortexCommand::IngestFleet => {
+            crate::cortex_cmd::handle_cortex(&pool, crate::CortexCommand::IngestFleet).await?;
         }
         TopCortexCommand::Embed {
             max,
