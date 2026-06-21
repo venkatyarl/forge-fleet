@@ -93,8 +93,94 @@ pub async fn handle_cortex(pool: &PgPool, cmd: crate::CortexCommand) -> Result<(
             let rows = cortex::field(pool, corpus.as_deref(), &field).await?;
             print_fields(&rows, format.as_str(), &field);
         }
+        crate::CortexCommand::Config { corpus, format } => {
+            let rows = cortex::config(pool, corpus.as_deref()).await?;
+            print_config(&rows, format.as_str(), corpus.as_deref());
+        }
+        crate::CortexCommand::ConfigKey {
+            name,
+            corpus,
+            format,
+        } => {
+            let rows = cortex::config_key(pool, corpus.as_deref(), &name).await?;
+            print_config_key(&rows, format.as_str(), &name);
+        }
     }
     Ok(())
+}
+
+fn print_config(rows: &[cortex::ConfigNode], format: &str, corpus: Option<&str>) {
+    match format {
+        "json" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(rows).unwrap_or_else(|_| "[]".to_string())
+            );
+        }
+        "names" => {
+            for row in rows {
+                println!("{}", row.key);
+            }
+        }
+        _ => {
+            if rows.is_empty() {
+                println!("no config:* nodes in cortex (run `ff cortex index`?)");
+                return;
+            }
+            let label = corpus.unwrap_or("all corpora");
+            println!(
+                "{CYAN}\u{25b6} cortex config — {} key(s) in {label}:{RESET}",
+                rows.len()
+            );
+            println!(
+                "  {:<14} {:<36} {:>7}  {}",
+                "TYPE", "KEY", "READERS", "CORPUS"
+            );
+            for row in rows {
+                println!(
+                    "  {:<14} {:<36} {:>7}  {}",
+                    row.node_type, row.key, row.reader_count, row.corpus
+                );
+            }
+        }
+    }
+}
+
+fn print_config_key(rows: &[cortex::ConfigReader], format: &str, key: &str) {
+    match format {
+        "json" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(rows).unwrap_or_else(|_| "[]".to_string())
+            );
+        }
+        "names" => {
+            for row in rows {
+                println!("{}", row.function);
+            }
+        }
+        _ => {
+            if rows.is_empty() {
+                println!("no readers for config key '{key}' in cortex (run `ff cortex index`?)");
+                return;
+            }
+            println!(
+                "{CYAN}\u{25b6} cortex config-key '{key}' — {} reader(s):{RESET}",
+                rows.len()
+            );
+            for row in rows {
+                println!("  {}", row.function);
+                println!("    corpus:     {}", row.corpus);
+                println!("    type:       {}", row.node_type);
+                println!(
+                    "    location:   {}",
+                    fmt_loc(row.file.as_deref(), row.start_line)
+                );
+                println!("    confidence: {:.2}", row.confidence);
+                println!("    method:     {}", row.method.as_deref().unwrap_or("-"));
+            }
+        }
+    }
 }
 
 fn print_fields(rows: &[cortex::DbField], format: &str, field: &str) {

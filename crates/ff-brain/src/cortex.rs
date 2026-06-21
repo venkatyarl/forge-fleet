@@ -78,6 +78,8 @@ use uuid::Uuid;
 
 #[path = "cortex/extractors/code_symbols.rs"]
 pub mod code_symbols;
+#[path = "cortex/extractors/config.rs"]
+pub mod config;
 #[path = "cortex/extractors/db_schema.rs"]
 pub mod db_schema;
 #[path = "cortex/spi.rs"]
@@ -1577,6 +1579,26 @@ pub struct DbField {
     pub migrations: Vec<DbMigrationRef>,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ConfigNode {
+    pub key: String,
+    pub corpus: String,
+    pub node_type: String,
+    pub reader_count: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ConfigReader {
+    pub key: String,
+    pub corpus: String,
+    pub node_type: String,
+    pub function: String,
+    pub file: Option<String>,
+    pub start_line: Option<i32>,
+    pub confidence: f32,
+    pub method: Option<String>,
+}
+
 /// Uniform "the symbol you asked about does not exist in this corpus" message,
 /// shared by every symbol-keyed query (`callers`/`callees`/`impact`/`tests_for`).
 /// These verbs resolve `sel` to a node first; an empty resolution means the
@@ -1657,6 +1679,113 @@ pub async fn field(pool: &PgPool, corpus_slug: Option<&str>, column: &str) -> Re
         });
     }
     Ok(out)
+}
+
+/// List config/env/secret/flag keys extracted by the Cortex config dimension.
+pub async fn config(pool: &PgPool, corpus_slug: Option<&str>) -> Result<Vec<ConfigNode>> {
+    let rows = sqlx::query(
+        r#"SELECT n.title, n.project, n.node_type,
+                  COUNT(DISTINCT e.src_id) FILTER (WHERE e.edge_type = 'reads_config') AS reader_count
+             FROM brain_vault_nodes n
+             LEFT JOIN brain_vault_edges e ON e.dst_id = n.id
+              AND COALESCE(e.generation, 0) IN (
+                  0,
+                  COALESCE((SELECT current_generation
+                              FROM cortex_generations
+                             WHERE project = n.project), 0)
+              )
+            WHERE n.node_type LIKE 'config:%'
+              AND ($1::text IS NULL OR n.project = $1)
+              AND COALESCE(n.generation, 0) IN (
+                  0,
+                  COALESCE((SELECT current_generation
+                              FROM cortex_generations
+                             WHERE project = n.project), 0)
+              )
+            GROUP BY n.title, n.project, n.node_type
+            ORDER BY n.project, n.node_type, n.title"#,
+    )
+    .bind(corpus_slug)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| ConfigNode {
+            key: row.get("title"),
+            corpus: row.get("project"),
+            node_type: row.get("node_type"),
+            reader_count: row.get("reader_count"),
+        })
+        .collect())
+}
+
+/// Show functions that read a specific config/env/secret/flag key.
+pub async fn config_key(
+    pool: &PgPool,
+    corpus_slug: Option<&str>,
+    key: &str,
+) -> Result<Vec<ConfigReader>> {
+    let rows = sqlx::query(
+        r#"SELECT cfg.title AS key, cfg.project, cfg.node_type,
+                  fn_node.title AS function, fn_node.start_line,
+                  e.confidence, e.method,
+                  owner.file_path
+             FROM brain_vault_nodes cfg
+             JOIN brain_vault_edges e ON e.dst_id = cfg.id AND e.edge_type = 'reads_config'
+             JOIN brain_vault_nodes fn_node ON fn_node.id = e.src_id
+             LEFT JOIN LATERAL (
+                 WITH RECURSIVE parents(id) AS (
+                     SELECT pe.src_id
+                       FROM brain_vault_edges pe
+                      WHERE pe.dst_id = fn_node.id AND pe.edge_type = 'contains'
+                     UNION
+                     SELECT pe.src_id
+                       FROM brain_vault_edges pe
+                       JOIN parents p ON pe.dst_id = p.id
+                      WHERE pe.edge_type = 'contains'
+                 )
+                 SELECT file_node.path AS file_path
+                   FROM parents p
+                   JOIN brain_vault_nodes file_node ON file_node.id = p.id
+                  WHERE file_node.node_type = 'content:file'
+                  LIMIT 1
+             ) owner ON TRUE
+            WHERE cfg.node_type LIKE 'config:%'
+              AND cfg.title = $1
+              AND ($2::text IS NULL OR cfg.project = $2)
+              AND COALESCE(cfg.generation, 0) IN (
+                  0,
+                  COALESCE((SELECT current_generation
+                              FROM cortex_generations
+                             WHERE project = cfg.project), 0)
+              )
+              AND COALESCE(e.generation, 0) IN (
+                  0,
+                  COALESCE((SELECT current_generation
+                              FROM cortex_generations
+                             WHERE project = cfg.project), 0)
+              )
+            ORDER BY cfg.project, cfg.node_type, cfg.title, fn_node.title"#,
+    )
+    .bind(key)
+    .bind(corpus_slug)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| ConfigReader {
+            key: row.get("key"),
+            corpus: row.get("project"),
+            node_type: row.get("node_type"),
+            function: row.get("function"),
+            file: row.try_get("file_path").ok(),
+            start_line: row.try_get("start_line").ok(),
+            confidence: row.get("confidence"),
+            method: row.try_get("method").ok(),
+        })
+        .collect())
 }
 
 /// Resolve a user-supplied symbol selector to its node id within a corpus.
