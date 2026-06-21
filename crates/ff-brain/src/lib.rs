@@ -38,6 +38,7 @@ pub use community_summary::{
     summarize_communities,
 };
 pub use context::{BrainMessage, ContextBundle, ResolvedNode, select_context};
+pub use cortex::ingest_pm;
 pub use cortex::mirror;
 pub use cortex::{
     CommunityExplanation, CommunityMember, CortexStats, FileOutline, OutlineEntry, SymbolHit,
