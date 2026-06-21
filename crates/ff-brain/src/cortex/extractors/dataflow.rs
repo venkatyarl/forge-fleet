@@ -785,7 +785,13 @@ fn contains_word(haystack: &str, needle: &str) -> bool {
 fn truncate_sql(sql: &str) -> String {
     let compact = sql.split_whitespace().collect::<Vec<_>>().join(" ");
     if compact.len() > 300 {
-        format!("{}...", &compact[..300])
+        // Snap to a char boundary — &compact[..300] panics when byte 300 lands
+        // inside a multi-byte char (e.g. '✓' in a sqlx string literal).
+        let mut end = 300;
+        while end > 0 && !compact.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}...", &compact[..end])
     } else {
         compact
     }
