@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
@@ -104,14 +104,31 @@ pub async fn codegen_apply(
             continue;
         }
 
-        let check = Command::new("cargo")
-            .arg("check")
+        let changed_packages = changed_crate_packages(repo_path, &edits);
+        let mut check_cmd = Command::new("cargo");
+        check_cmd.arg("check");
+        let check_name = if changed_packages.is_empty() {
+            "cargo check".to_string()
+        } else {
+            for package in &changed_packages {
+                check_cmd.arg("-p").arg(package);
+            }
+            format!(
+                "cargo check {}",
+                changed_packages
+                    .iter()
+                    .map(|package| format!("-p {package}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )
+        };
+        let check = check_cmd
             .current_dir(repo_path)
             .output()
-            .with_context(|| format!("run cargo check in {}", repo_path.display()))?;
+            .with_context(|| format!("run {check_name} in {}", repo_path.display()))?;
 
         if !check.status.success() {
-            let err = command_error("cargo check", &check);
+            let err = command_error(&check_name, &check);
             warn!(round, error = %err, "codegen edits failed cargo check");
             restore_snapshots(&snapshots)?;
             clean_worktree(repo_path)?;
@@ -662,6 +679,76 @@ fn normalize_relative_path(path: &str) -> Option<PathBuf> {
     }
 }
 
+fn changed_crate_packages(repo_path: &Path, edits: &[Edit]) -> BTreeSet<String> {
+    let mut package_cache: HashMap<PathBuf, Option<String>> = HashMap::new();
+    let mut packages = BTreeSet::new();
+
+    for edit in edits {
+        let Some(rel) = normalize_relative_path(&edit.path) else {
+            continue;
+        };
+        let Some(crate_dir) = crate_dir_for_rel_path(&rel) else {
+            continue;
+        };
+        let package = package_cache
+            .entry(crate_dir.clone())
+            .or_insert_with(|| crate_package_for_path(repo_path, &rel));
+        if let Some(package) = package {
+            packages.insert(package.clone());
+        }
+    }
+
+    packages
+}
+
+fn crate_package_for_path(repo_path: &Path, rel_path: &Path) -> Option<String> {
+    let crate_dir = crate_dir_for_rel_path(rel_path)?;
+    let manifest = repo_path.join(crate_dir).join("Cargo.toml");
+    let content = fs::read_to_string(manifest).ok()?;
+    package_name_from_manifest(&content)
+}
+
+fn crate_dir_for_rel_path(rel_path: &Path) -> Option<PathBuf> {
+    let mut components = rel_path.components();
+    match components.next()? {
+        Component::Normal(part) if part == "crates" => {}
+        _ => return None,
+    }
+    let Component::Normal(crate_name) = components.next()? else {
+        return None;
+    };
+
+    Some(PathBuf::from("crates").join(crate_name))
+}
+
+fn package_name_from_manifest(content: &str) -> Option<String> {
+    let mut in_package = false;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_package = trimmed == "[package]";
+            continue;
+        }
+        if !in_package {
+            continue;
+        }
+        let Some((key, value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "name" {
+            continue;
+        }
+        return value
+            .trim()
+            .strip_prefix('"')?
+            .split_once('"')
+            .map(|(name, _)| name.to_string());
+    }
+
+    None
+}
+
 fn format_edit_summary(edits: &[Edit]) -> String {
     edits
         .iter()
@@ -752,6 +839,23 @@ mod tests {
         assert_eq!(
             normalize_relative_path("./src/lib.rs").unwrap(),
             PathBuf::from("src/lib.rs")
+        );
+    }
+
+    #[test]
+    fn codegen_resolves_crate_package_for_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join("crates/ff-agent/Cargo.toml");
+        fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        fs::write(
+            &manifest,
+            "[package]\nversion = \"0.1.0\"\nname = \"ff-agent\"\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            crate_package_for_path(dir.path(), Path::new("crates/ff-agent/src/foo.rs")),
+            Some("ff-agent".to_string())
         );
     }
 
