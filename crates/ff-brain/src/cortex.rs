@@ -98,6 +98,8 @@ pub mod ingest_decisions;
 pub mod ingest_fleet;
 #[path = "cortex/ingest_pm.rs"]
 pub mod ingest_pm;
+#[path = "cortex/maps_to.rs"]
+pub mod maps_to;
 #[path = "cortex/mirror.rs"]
 pub mod mirror;
 #[path = "cortex/extractors/observ.rs"]

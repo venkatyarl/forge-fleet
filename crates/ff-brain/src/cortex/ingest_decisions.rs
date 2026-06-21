@@ -296,7 +296,9 @@ fn symbol_patterns(title: &str) -> Vec<String> {
         return Vec::new();
     }
 
-    if is_specific_symbol(normalized, true) {
+    // The full qualified name is always the most-specific pattern — keep it even if
+    // is_specific_symbol's heuristics would reject the (often long) whole path.
+    if normalized.contains("::") || is_specific_symbol(normalized, true) {
         out.insert(normalized.to_string());
     }
 
@@ -338,6 +340,11 @@ fn file_patterns(file: &CodeNode) -> Vec<String> {
 }
 
 fn is_specific_symbol(symbol: &str, qualified_suffix: bool) -> bool {
+    // A qualified symbol (e.g. `Config::new`) is specific via its prefix — keep it
+    // even when the bare leaf would be filtered as common/short.
+    if symbol.contains("::") {
+        return true;
+    }
     let leaf = symbol.rsplit("::").next().unwrap_or(symbol);
     let leaf_len = leaf.chars().filter(|ch| ch.is_ascii_alphanumeric()).count();
     if leaf_len < 3 || is_common_token(leaf) {
