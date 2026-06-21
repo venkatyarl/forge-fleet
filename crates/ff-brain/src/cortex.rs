@@ -76,6 +76,8 @@ use std::path::{Path, PathBuf};
 use tree_sitter::{Node, Parser};
 use uuid::Uuid;
 
+#[path = "cortex/extractors/api.rs"]
+pub mod api;
 #[path = "cortex/extractors/code_symbols.rs"]
 pub mod code_symbols;
 #[path = "cortex/extractors/config.rs"]
