@@ -8419,42 +8419,105 @@ pub async fn pg_rank_computers_by_capacity(pool: &PgPool) -> Result<Vec<HostCapa
 }
 
 /// Reap leases whose heartbeat is older than `stale_secs`: release the lease,
-/// free its slot, and return the work_item to 'ready' (bumping attempts).
-/// Returns the number of leases reaped.
+/// free its slot, mark any in-flight worktree stale/failed, and return the
+/// work_item to 'ready' (bumping attempts).
+/// Returns the number of leases successfully reaped.
 pub async fn pg_reap_stale_work_item_leases(pool: &PgPool, stale_secs: i64) -> Result<u64> {
     let rows = sqlx::query(
-        "UPDATE work_item_leases
-            SET lease_state = 'stale', released_at = NOW(), release_reason = 'heartbeat timeout'
+        "SELECT id, work_item_id, sub_agent_id
+           FROM work_item_leases
           WHERE released_at IS NULL
             AND heartbeat_at < NOW() - make_interval(secs => $1)
-          RETURNING work_item_id, sub_agent_id",
+          ORDER BY heartbeat_at ASC",
     )
     .bind(stale_secs as f64)
     .fetch_all(pool)
     .await?;
 
+    let mut reaped = 0u64;
     for r in &rows {
+        let lease_id: uuid::Uuid = r.get("id");
         let wi: uuid::Uuid = r.get("work_item_id");
         let sa: Option<uuid::Uuid> = r.try_get("sub_agent_id").ok().flatten();
-        if let Some(sa) = sa {
-            let _ = sqlx::query(
-                "UPDATE sub_agents SET current_work_item_id = NULL, status = 'idle' WHERE id = $1",
+
+        let outcome = async {
+            let mut tx = pool.begin().await?;
+            let released = sqlx::query(
+                "UPDATE work_item_leases
+                    SET lease_state = 'stale',
+                        released_at = NOW(),
+                        release_reason = 'stale-heartbeat takeover'
+                  WHERE id = $1
+                    AND released_at IS NULL
+                    AND heartbeat_at < NOW() - make_interval(secs => $2)",
             )
-            .bind(sa)
-            .execute(pool)
-            .await;
+            .bind(lease_id)
+            .bind(stale_secs as f64)
+            .execute(&mut *tx)
+            .await?;
+
+            if released.rows_affected() == 0 {
+                tx.rollback().await?;
+                return Ok::<bool, sqlx::Error>(false);
+            }
+
+            if let Some(sa) = sa {
+                sqlx::query(
+                    "UPDATE sub_agents
+                        SET current_work_item_id = NULL,
+                            status = 'idle',
+                            started_at = NULL,
+                            last_heartbeat_at = NOW()
+                      WHERE id = $1
+                        AND (current_work_item_id = $2 OR current_work_item_id IS NULL)",
+                )
+                .bind(sa)
+                .bind(wi)
+                .execute(&mut *tx)
+                .await?;
+            }
+
+            sqlx::query(
+                "UPDATE work_item_worktrees
+                    SET status = 'failed'
+                  WHERE work_item_id = $1
+                    AND status IN ('creating', 'active')",
+            )
+            .bind(wi)
+            .execute(&mut *tx)
+            .await?;
+
+            sqlx::query(
+                "UPDATE work_items
+                    SET status = 'ready',
+                        attempts = attempts + 1,
+                        assigned_computer = NULL,
+                        last_error = 'stale-heartbeat takeover'
+                  WHERE id = $1",
+            )
+            .bind(wi)
+            .execute(&mut *tx)
+            .await?;
+
+            tx.commit().await?;
+            Ok(true)
         }
-        let _ = sqlx::query(
-            "UPDATE work_items
-                SET status = 'ready', attempts = attempts + 1,
-                    assigned_computer = NULL, last_error = 'lease heartbeat timeout'
-              WHERE id = $1",
-        )
-        .bind(wi)
-        .execute(pool)
         .await;
+
+        match outcome {
+            Ok(true) => reaped += 1,
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(
+                    lease_id = %lease_id,
+                    work_item_id = %wi,
+                    error = %e,
+                    "failed to reap stale work_item lease"
+                );
+            }
+        }
     }
-    Ok(rows.len() as u64)
+    Ok(reaped)
 }
 
 /// Work_items ready to schedule: explicitly status='ready', leaf kind='task',
