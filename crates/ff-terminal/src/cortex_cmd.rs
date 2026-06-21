@@ -27,6 +27,20 @@ pub async fn handle_cortex(pool: &PgPool, cmd: crate::CortexCommand) -> Result<(
             println!("  inherited members:   {}", stats.inherited_memberships);
             println!("{CYAN}\u{2713} Done{RESET}");
         }
+        crate::CortexCommand::IngestFleet => {
+            println!("{CYAN}\u{25b6} Cortex ingesting fleet topology\u{2026}{RESET}");
+            let touched = cortex::ingest_fleet::ingest_fleet(pool).await?;
+            let counts = cortex::ingest_fleet::fleet_counts(pool).await?;
+            println!("  upsert attempts:     {touched}");
+            println!("  fleet nodes:         {}", counts.nodes());
+            println!("    computers:         {}", counts.computers);
+            println!("    models:            {}", counts.models);
+            println!("    deployments:       {}", counts.deployments);
+            println!("  fleet edges:         {}", counts.edges());
+            println!("    runs_on:           {}", counts.runs_on_edges);
+            println!("    serves_model:      {}", counts.serves_model_edges);
+            println!("{CYAN}\u{2713} Done{RESET}");
+        }
         crate::CortexCommand::Callers {
             corpus,
             symbol,

@@ -92,6 +92,8 @@ pub mod db_schema;
 pub mod deps;
 #[path = "cortex/extractors/events.rs"]
 pub mod events;
+#[path = "cortex/ingest_fleet.rs"]
+pub mod ingest_fleet;
 #[path = "cortex/ingest_pm.rs"]
 pub mod ingest_pm;
 #[path = "cortex/mirror.rs"]

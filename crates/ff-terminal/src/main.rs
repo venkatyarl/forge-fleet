@@ -2487,6 +2487,8 @@ pub enum CortexCommand {
         #[arg(long, default_value = "rust")]
         lang: String,
     },
+    /// Ingest fleet topology tables into Cortex graph nodes + edges.
+    IngestFleet,
     /// Callers of a code symbol.
     Callers {
         #[arg(long)]
