@@ -243,6 +243,11 @@ pub enum TopCortexCommand {
         #[arg(long, value_enum, default_value = "table")]
         format: crate::CortexFormat,
     },
+    /// List dependency packages and how many crates depend on each.
+    Deps {
+        #[arg(long)]
+        corpus: Option<String>,
+    },
     /// Inspect publishers and subscribers for one event topic.
     Topic {
         subject: String,
@@ -879,6 +884,10 @@ pub async fn handle_top_cortex(args: TopCortexArgs) -> Result<()> {
             )
             .await?;
         }
+        TopCortexCommand::Deps { corpus } => {
+            let rows = cortex::deps::deps(&pool, corpus.as_deref()).await?;
+            print_deps(&rows);
+        }
         TopCortexCommand::Topic {
             subject,
             corpus,
@@ -932,6 +941,35 @@ pub async fn handle_top_cortex(args: TopCortexArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn print_deps(rows: &[cortex::deps::DepPackageSummary]) {
+    if rows.is_empty() {
+        println!("no dep:package nodes in cortex (run `ff cortex index`?)");
+        return;
+    }
+    println!(
+        "{CYAN}\u{25b6} cortex deps — {} package(s):{RESET}",
+        rows.len()
+    );
+    println!("  {:<42} {:>10}  corpus", "package", "dependents");
+    for row in rows {
+        println!(
+            "  {:<42} {:>10}  {}",
+            truncate_deps_cell(&row.package, 42),
+            row.dependent_count,
+            row.corpus
+        );
+    }
+}
+
+fn truncate_deps_cell(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out = s.chars().take(max.saturating_sub(1)).collect::<String>();
+    out.push('…');
+    out
 }
 
 /// `ff cortex explain` renderer. `table` is the human view (resolved symbol →
