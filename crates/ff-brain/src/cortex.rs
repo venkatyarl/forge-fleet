@@ -108,6 +108,8 @@ pub mod observ;
 pub mod offline;
 #[path = "cortex/extractors/owners.rs"]
 pub mod owners;
+#[path = "cortex/extractors/product.rs"]
+pub mod product;
 #[path = "cortex/extractors/routes.rs"]
 pub mod routes;
 #[path = "cortex/extractors/security.rs"]

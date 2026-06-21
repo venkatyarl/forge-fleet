@@ -342,6 +342,13 @@ pub enum TopCortexCommand {
         #[arg(long, value_enum, default_value = "table")]
         format: crate::CortexFormat,
     },
+    /// List product features extracted from clap subcommand enums.
+    Features {
+        #[arg(long)]
+        corpus: Option<String>,
+        #[arg(long, value_enum, default_value = "table")]
+        format: crate::CortexFormat,
+    },
     /// Run canned cross-domain Cortex graph audit rules.
     Audit {
         #[arg(long)]
@@ -1133,6 +1140,17 @@ async fn handle_top_cortex_online(args: TopCortexArgs) -> Result<()> {
                 &pool,
                 crate::CortexCommand::Owners {
                     name,
+                    corpus: Some(corpus),
+                    format,
+                },
+            )
+            .await?;
+        }
+        TopCortexCommand::Features { corpus, format } => {
+            let corpus = corpus.unwrap_or_else(cwd_slug);
+            crate::cortex_cmd::handle_cortex(
+                &pool,
+                crate::CortexCommand::Features {
                     corpus: Some(corpus),
                     format,
                 },
