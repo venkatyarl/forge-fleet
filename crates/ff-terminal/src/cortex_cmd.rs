@@ -41,6 +41,34 @@ pub async fn handle_cortex(pool: &PgPool, cmd: crate::CortexCommand) -> Result<(
             println!("    serves_model:      {}", counts.serves_model_edges);
             println!("{CYAN}\u{2713} Done{RESET}");
         }
+        crate::CortexCommand::Entities { corpus } => {
+            println!("{CYAN}\u{25b6} Cortex deriving business entities\u{2026}{RESET}");
+            let counts = cortex::ingest_biz::ingest_biz(pool, corpus.as_deref()).await?;
+            let rows = cortex::ingest_biz::list_entities(pool, corpus.as_deref()).await?;
+            println!("  upsert attempts:     {}", counts.upsert_attempts);
+            println!("  biz entities:        {}", counts.entities);
+            println!("  relates_to edges:    {}", counts.relates_to_edges);
+            if rows.is_empty() {
+                println!(
+                    "no biz:entity nodes found (run `ff cortex index` for a corpus with DB schema?)"
+                );
+            } else {
+                println!(
+                    "  {:<28} {:<36} {:>10}  path",
+                    "corpus", "entity", "relates_to"
+                );
+                for row in rows {
+                    println!(
+                        "  {:<28} {:<36} {:>10}  {}",
+                        truncate(&row.corpus, 28),
+                        truncate(&row.title, 36),
+                        row.relates_to_count,
+                        row.path
+                    );
+                }
+            }
+            println!("{CYAN}\u{2713} Done{RESET}");
+        }
         crate::CortexCommand::Callers {
             corpus,
             symbol,

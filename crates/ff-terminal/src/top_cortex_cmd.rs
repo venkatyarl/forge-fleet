@@ -43,6 +43,11 @@ pub enum TopCortexCommand {
     },
     /// Ingest fleet topology tables into Cortex graph nodes + edges.
     IngestFleet,
+    /// Derive and list business/domain entities from indexed DB schema nodes.
+    Entities {
+        #[arg(long)]
+        corpus: Option<String>,
+    },
     /// Show the indexed corpus for the cwd (or --all corpora): node/edge counts.
     Status {
         /// Show all corpora, not just the one matching the cwd.
@@ -803,6 +808,10 @@ async fn handle_top_cortex_online(args: TopCortexArgs) -> Result<()> {
         }
         TopCortexCommand::IngestFleet => {
             crate::cortex_cmd::handle_cortex(&pool, crate::CortexCommand::IngestFleet).await?;
+        }
+        TopCortexCommand::Entities { corpus } => {
+            crate::cortex_cmd::handle_cortex(&pool, crate::CortexCommand::Entities { corpus })
+                .await?;
         }
         TopCortexCommand::Embed {
             max,
