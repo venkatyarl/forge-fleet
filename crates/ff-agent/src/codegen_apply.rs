@@ -104,37 +104,32 @@ pub async fn codegen_apply(
             continue;
         }
 
-        let changed_packages = changed_crate_packages(repo_path, &edits);
-        let mut check_cmd = Command::new("cargo");
-        check_cmd.arg("check");
-        let check_name = if changed_packages.is_empty() {
-            "cargo check".to_string()
-        } else {
-            for package in &changed_packages {
-                check_cmd.arg("-p").arg(package);
-            }
-            format!(
-                "cargo check {}",
-                changed_packages
-                    .iter()
-                    .map(|package| format!("-p {package}"))
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            )
-        };
-        let check = check_cmd
-            .current_dir(repo_path)
-            .output()
-            .with_context(|| format!("run {check_name} in {}", repo_path.display()))?;
+        let changed_packages = changed_crate_packages(repo_path, &edits)
+            .into_iter()
+            .collect::<Vec<_>>();
+        if let Some((program, args)) = verify_command(repo_path, &changed_packages) {
+            let check_name = format_command(&program, &args);
+            let check = Command::new(&program)
+                .args(&args)
+                .current_dir(repo_path)
+                .output()
+                .with_context(|| format!("run {check_name} in {}", repo_path.display()))?;
 
-        if !check.status.success() {
-            let err = command_error(&check_name, &check);
-            warn!(round, error = %err, "codegen edits failed cargo check");
-            restore_snapshots(&snapshots)?;
-            clean_worktree(repo_path)?;
-            last_edits = Some(edit_summary);
-            last_error = Some(err);
-            continue;
+            if !check.status.success() {
+                let err = command_error(&check_name, &check);
+                warn!(round, error = %err, "codegen edits failed verification");
+                restore_snapshots(&snapshots)?;
+                clean_worktree(repo_path)?;
+                last_edits = Some(edit_summary);
+                last_error = Some(err);
+                continue;
+            }
+        } else {
+            info!(
+                round,
+                repo = %repo_path.display(),
+                "codegen post-apply verification skipped: no recognized verify command"
+            );
         }
 
         return Ok(CodegenOutcome {
@@ -701,6 +696,53 @@ fn changed_crate_packages(repo_path: &Path, edits: &[Edit]) -> BTreeSet<String> 
     packages
 }
 
+fn verify_command(repo_path: &Path, changed_crates: &[String]) -> Option<(String, Vec<String>)> {
+    if repo_path.join("Cargo.toml").exists() {
+        let mut args = vec!["check".to_string()];
+        for package in changed_crates {
+            args.push("-p".to_string());
+            args.push(package.clone());
+        }
+        return Some(("cargo".to_string(), args));
+    }
+
+    let package_json = repo_path.join("package.json");
+    if package_json.exists() {
+        if package_json_has_script(&package_json, "typecheck") {
+            return Some((
+                "npm".to_string(),
+                vec!["run".to_string(), "-s".to_string(), "typecheck".to_string()],
+            ));
+        }
+        if repo_path.join("tsconfig.json").exists() {
+            return Some((
+                "npx".to_string(),
+                vec!["-y".to_string(), "tsc".to_string(), "--noEmit".to_string()],
+            ));
+        }
+        if package_json_has_script(&package_json, "build") {
+            return Some((
+                "npm".to_string(),
+                vec!["run".to_string(), "-s".to_string(), "build".to_string()],
+            ));
+        }
+    }
+
+    None
+}
+
+fn package_json_has_script(package_json: &Path, script: &str) -> bool {
+    let Ok(content) = fs::read_to_string(package_json) else {
+        return false;
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return false;
+    };
+    json.get("scripts")
+        .and_then(|scripts| scripts.get(script))
+        .is_some()
+}
+
 fn crate_package_for_path(repo_path: &Path, rel_path: &Path) -> Option<String> {
     let crate_dir = crate_dir_for_rel_path(rel_path)?;
     let manifest = repo_path.join(crate_dir).join("Cargo.toml");
@@ -805,6 +847,14 @@ fn command_error(name: &str, output: &std::process::Output) -> String {
     }
 }
 
+fn format_command(program: &str, args: &[String]) -> String {
+    if args.is_empty() {
+        program.to_string()
+    } else {
+        format!("{} {}", program, args.join(" "))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -857,6 +907,37 @@ mod tests {
             crate_package_for_path(dir.path(), Path::new("crates/ff-agent/src/foo.rs")),
             Some("ff-agent".to_string())
         );
+    }
+
+    #[test]
+    fn codegen_verify_command_detects_project_type() {
+        let rust_dir = tempfile::tempdir().unwrap();
+        fs::write(rust_dir.path().join("Cargo.toml"), "[package]\n").unwrap();
+        assert_eq!(
+            verify_command(rust_dir.path(), &["ff-agent".to_string()]),
+            Some((
+                "cargo".to_string(),
+                vec![
+                    "check".to_string(),
+                    "-p".to_string(),
+                    "ff-agent".to_string()
+                ]
+            ))
+        );
+
+        let ts_dir = tempfile::tempdir().unwrap();
+        fs::write(ts_dir.path().join("package.json"), "{\"scripts\":{}}\n").unwrap();
+        fs::write(ts_dir.path().join("tsconfig.json"), "{}\n").unwrap();
+        assert_eq!(
+            verify_command(ts_dir.path(), &[]),
+            Some((
+                "npx".to_string(),
+                vec!["-y".to_string(), "tsc".to_string(), "--noEmit".to_string()]
+            ))
+        );
+
+        let empty_dir = tempfile::tempdir().unwrap();
+        assert_eq!(verify_command(empty_dir.path(), &[]), None);
     }
 
     #[test]
