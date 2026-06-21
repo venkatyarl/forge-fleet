@@ -211,7 +211,64 @@ async fn assigned_work_items(
         .collect()
 }
 
+async fn ensure_repo_checked_out(pg: &PgPool, item: &AssignedWorkItem) -> Result<()> {
+    if item.repo_path.exists() && item.repo_path.join(".git").exists() {
+        return Ok(());
+    }
+
+    let github_url: Option<String> = sqlx::query_scalar(
+        "SELECT github_url
+           FROM project_repos
+          WHERE project_id = $1
+            AND is_primary = TRUE
+            AND NULLIF(github_url, '') IS NOT NULL
+          LIMIT 1",
+    )
+    .bind(&item.project_id)
+    .fetch_optional(pg)
+    .await
+    .with_context(|| format!("lookup primary repo for project {}", item.project_id))?;
+
+    let github_url = github_url.ok_or_else(|| {
+        anyhow!(
+            "repo path {} is not a git repo and project {} has no primary project_repos github_url",
+            item.repo_path.display(),
+            item.project_id
+        )
+    })?;
+
+    if let Some(parent) = item
+        .repo_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create repo parent {}", parent.display()))?;
+    }
+
+    info!(
+        work_item_id = %item.work_item_id,
+        project_id = %item.project_id,
+        repo_path = %item.repo_path.display(),
+        github_url = %github_url,
+        "work_item_dispatch: cloning project repo"
+    );
+
+    let repo_path = item.repo_path.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut cmd = Command::new("git");
+        cmd.arg("clone").arg(&github_url).arg(&repo_path);
+        run_command_timeout(cmd, Duration::from_secs(600))
+    })
+    .await
+    .context("join git clone task")?
+    .with_context(|| format!("clone project repo into {}", item.repo_path.display()))?;
+
+    Ok(())
+}
+
 async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -> Result<()> {
+    ensure_repo_checked_out(&pg, &item).await?;
     let worktree = create_worktree_for_item(&pg, &item).await?;
     mark_building(&pg, &item).await?;
 
