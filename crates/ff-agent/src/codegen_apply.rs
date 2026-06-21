@@ -97,8 +97,7 @@ pub async fn codegen_apply(
             .map(|o| o.stdout.is_empty())
             .unwrap_or(false);
         if unchanged {
-            let err =
-                "edits applied but produced NO change (no-op SEARCH/REPLACE)".to_string();
+            let err = "edits applied but produced NO change (no-op SEARCH/REPLACE)".to_string();
             warn!(round, "{}", err);
             last_edits = Some(edit_summary);
             last_error = Some(err);
