@@ -67,6 +67,7 @@ pub mod inference_router;
 pub mod job_sweeper;
 pub mod leader_tick;
 pub mod learning;
+pub mod lease_takeover;
 pub mod legacy_daemon_reaper;
 pub mod local_healer;
 pub mod log_rotate;

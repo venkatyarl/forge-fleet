@@ -697,6 +697,19 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         ));
     }
 
+    // 15b.1) Pillar 4 lease takeover — every 60s, leader-gated.
+    // Reclaims active work_item leases whose builder host stopped heartbeating,
+    // freeing the slot and returning the item to ready for another fleet slot.
+    if let Some(pg_pool) = operational_store.pg_pool().cloned() {
+        info!("starting subsystem: work_item lease takeover (60s, leader-gated)");
+        subsystem_tasks.push(ff_agent::lease_takeover::spawn_lease_takeover(
+            pg_pool,
+            worker_name.clone(),
+            60,
+            shutdown_rx.clone(),
+        ));
+    }
+
     // 15c) Pillar 4 work_item dispatch — every 15s, PER-HOST (not leader-gated).
     // Each host executes ITS OWN assigned slots: detect current_work_item_id →
     // git worktree → ff cli dispatch → heartbeat lease → PR + merge-queue on done.
