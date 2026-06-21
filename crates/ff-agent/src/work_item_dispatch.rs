@@ -276,7 +276,7 @@ async fn dispatch_one(pg: PgPool, item: AssignedWorkItem, worker_name: String) -
     let heartbeat = spawn_heartbeat(pg.clone(), item.work_item_id, stop_heartbeat_rx);
 
     let started = std::time::Instant::now();
-    let dispatch_result = run_ff_dispatch(&item, &worktree).await;
+    let dispatch_result = run_ff_dispatch(&pg, &item, &worktree).await;
     let _ = stop_heartbeat_tx.send(true);
     let _ = heartbeat.await;
 
@@ -702,10 +702,48 @@ async fn record_dispatch_interaction(
     }
 }
 
-async fn run_ff_dispatch(item: &AssignedWorkItem, worktree: &WorktreeRecord) -> Result<Output> {
+/// Edit the worktree to satisfy the work_item. Two lanes, self-healing:
+///   Lane 1 (cheap, LOCAL): the `codegen_apply` harness — a local fleet coder
+///     emits SEARCH/REPLACE edits, applied + `cargo check`ed + verified-non-empty
+///     (region-context handles big files). $0, spreads across the fleet.
+///   Lane 2 (BACKSTOP): the prior `ff cli codex --require-change` path, if the
+///     local lane can't land it (no-op/malformed/giant file).
+/// Returns a synthetic Output on the local-lane win so the caller's commit→PR
+/// flow is unchanged. This is what makes the Pillar-4 daemon code unattended on
+/// the local fleet instead of always burning the codex lane.
+async fn run_ff_dispatch(
+    pg: &PgPool,
+    item: &AssignedWorkItem,
+    worktree: &WorktreeRecord,
+) -> Result<Output> {
     let prompt = dispatch_prompt(item);
-    let cwd = worktree.worktree_path.clone();
 
+    // Lane 1: local codegen harness.
+    match crate::codegen_apply::codegen_apply(pg, &worktree.worktree_path, &prompt, None, 4).await {
+        Ok(outcome) if outcome.applied => {
+            info!(
+                work_item_id = %item.work_item_id,
+                rounds = outcome.rounds,
+                "work_item_dispatch: local codegen harness landed the change"
+            );
+            return Ok(synthetic_output(
+                &outcome.final_diff.unwrap_or_else(|| "applied".into()),
+            ));
+        }
+        Ok(outcome) => info!(
+            work_item_id = %item.work_item_id,
+            error = ?outcome.error,
+            "work_item_dispatch: local codegen didn't land; backstop to codex"
+        ),
+        Err(e) => warn!(
+            work_item_id = %item.work_item_id,
+            error = %e,
+            "work_item_dispatch: local codegen errored; backstop to codex"
+        ),
+    }
+
+    // Lane 2: codex backstop (the prior behavior).
+    let cwd = worktree.worktree_path.clone();
     tokio::task::spawn_blocking(move || {
         let mut cmd = Command::new("ff");
         cmd.arg("cli")
@@ -722,6 +760,17 @@ async fn run_ff_dispatch(item: &AssignedWorkItem, worktree: &WorktreeRecord) -> 
     })
     .await
     .context("join ff dispatch task")?
+}
+
+/// Build a success `Output` for the local-codegen lane so `dispatch_one`'s
+/// existing interaction-logging + commit→PR flow needs no special-casing.
+fn synthetic_output(summary: &str) -> Output {
+    use std::os::unix::process::ExitStatusExt;
+    Output {
+        status: std::process::ExitStatus::from_raw(0),
+        stdout: summary.as_bytes().to_vec(),
+        stderr: Vec::new(),
+    }
 }
 
 fn git_worktree_add(
