@@ -2915,7 +2915,14 @@ pub async fn pg_pick_offload_endpoint(
     let penalize_mlx = offload_workload_for_kind(kind).is_none();
     let load = pg_active_deployment_counts(pool).await.unwrap_or_default();
     cands.sort_by_key(|c| offload_sort_key(c, &load, penalize_mlx));
-    Ok(cands.into_iter().next())
+
+    let best_key = offload_sort_key(&cands[0], &load, penalize_mlx);
+    let tied_best = cands
+        .iter()
+        .take_while(|c| offload_sort_key(c, &load, penalize_mlx) == best_key)
+        .count();
+    let pick = rand::Rng::gen_range(&mut rand::thread_rng(), 0..tied_best);
+    Ok(cands.into_iter().nth(pick))
 }
 
 // ─── Orchestrator P2: per-session demand sensing ─────────────────────────────
