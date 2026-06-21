@@ -2606,6 +2606,15 @@ pub enum CortexCommand {
         #[arg(long, value_enum, default_value = "table")]
         format: crate::CortexFormat,
     },
+    /// List code owners, or files owned by one person.
+    #[command(visible_alias = "owner")]
+    Owners {
+        name: Option<String>,
+        #[arg(long)]
+        corpus: Option<String>,
+        #[arg(long, value_enum, default_value = "table")]
+        format: crate::CortexFormat,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]

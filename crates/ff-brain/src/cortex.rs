@@ -88,6 +88,8 @@ pub mod deps;
 pub mod events;
 #[path = "cortex/extractors/observ.rs"]
 pub mod observ;
+#[path = "cortex/extractors/owners.rs"]
+pub mod owners;
 #[path = "cortex/spi.rs"]
 pub mod spi;
 
