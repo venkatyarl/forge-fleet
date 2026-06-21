@@ -2554,6 +2554,14 @@ pub enum CortexCommand {
         #[arg(long, value_enum, default_value = "table")]
         format: crate::CortexFormat,
     },
+    /// Inspect a database column extracted into Cortex.
+    Field {
+        field: String,
+        #[arg(long)]
+        corpus: Option<String>,
+        #[arg(long, value_enum, default_value = "table")]
+        format: crate::CortexFormat,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
