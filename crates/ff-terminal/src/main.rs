@@ -2489,6 +2489,11 @@ pub enum CortexCommand {
     },
     /// Ingest fleet topology tables into Cortex graph nodes + edges.
     IngestFleet,
+    /// Derive and list business/domain entities from indexed DB schema nodes.
+    Entities {
+        #[arg(long)]
+        corpus: Option<String>,
+    },
     /// Callers of a code symbol.
     Callers {
         #[arg(long)]
