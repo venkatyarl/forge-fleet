@@ -39,6 +39,7 @@ mod agents_cmd;
 mod alert_cmd;
 mod arbiter_cmd;
 mod brain_cmd;
+mod build_cmd;
 mod cli_bridge_cmd;
 mod cloud_llm_cmd;
 mod codegen_cmd;
@@ -250,6 +251,14 @@ enum Command {
         rounds: u32,
         #[arg(long)]
         no_backstop: bool,
+    },
+    /// Decompose a goal into ready work_items for the Pillar-4 build pipeline.
+    Build {
+        /// Goal to decompose into concrete, independently-buildable tasks.
+        goal: String,
+        /// Project id to attach the generated work_items to.
+        #[arg(long)]
+        project: Option<String>,
     },
     /// Credit-saver: offload a heavy, low-architectural-subtlety task to a
     /// WARM tool-capable local LLM on the fleet (bulk codegen, mechanical
@@ -3768,6 +3777,9 @@ async fn main() -> Result<()> {
             return openclaw_cmd::handle_openclaw(command.clone()).await;
         }
         Some(Command::Pm { command }) => return pm_cmd::handle_pm(command.clone()).await,
+        Some(Command::Build { goal, project }) => {
+            return build_cmd::handle_build(goal.clone(), project.clone()).await;
+        }
         Some(Command::Agent { command }) => return agent_cmd::handle_agent(command.clone()).await,
         Some(Command::Project { command }) => {
             return project_cmd::handle_project(command.clone()).await;
@@ -3990,6 +4002,7 @@ async fn main() -> Result<()> {
             rounds,
             no_backstop,
         }) => codegen_cmd::handle_codegen(task, repo, model, rounds, no_backstop).await,
+        Some(Command::Build { goal, project }) => build_cmd::handle_build(goal, project).await,
         Some(Command::Offload {
             prompt,
             output,
