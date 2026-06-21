@@ -771,7 +771,7 @@ fn print_tests(rows: &[cortex::TestHit], format: &str, label: &str) {
     }
 }
 
-fn print_symbols(rows: &[cortex::SymbolRef], format: &str, label: &str) {
+pub(crate) fn print_symbols(rows: &[cortex::SymbolRef], format: &str, label: &str) {
     match format {
         "json" => {
             let v: Vec<_> = rows
