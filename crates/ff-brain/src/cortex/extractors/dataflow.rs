@@ -563,7 +563,11 @@ fn sql_literals(body: &str) -> Vec<(String, usize, bool)> {
     while i < bytes.len() {
         if bytes[i] == b'"' {
             if let Some((value, end)) = cooked_string(body, i) {
-                let prefix = &body[i.saturating_sub(48)..i];
+                let mut pstart = i.saturating_sub(48);
+                while pstart < i && !body.is_char_boundary(pstart) {
+                    pstart += 1;
+                }
+                let prefix = &body[pstart..i];
                 out.push((value, i, is_sqlx_macro_prefix(prefix)));
                 i = end;
                 continue;
@@ -571,7 +575,11 @@ fn sql_literals(body: &str) -> Vec<(String, usize, bool)> {
         }
         if bytes[i] == b'r' {
             if let Some((value, end)) = raw_string(body, i) {
-                let prefix = &body[i.saturating_sub(48)..i];
+                let mut pstart = i.saturating_sub(48);
+                while pstart < i && !body.is_char_boundary(pstart) {
+                    pstart += 1;
+                }
+                let prefix = &body[pstart..i];
                 out.push((value, i, is_sqlx_macro_prefix(prefix)));
                 i = end;
                 continue;
@@ -653,7 +661,14 @@ fn dynamic_sql_snippets(body: &str) -> Vec<(String, usize)> {
         let mut offset = 0usize;
         while let Some(pos) = body[offset..].find(needle) {
             let at = offset + pos;
-            let snippet = body[at..body.len().min(at + 500)].to_string();
+            // Snap the 500-byte window end DOWN to a char boundary — a raw
+            // byte-slice panics when at+500 lands inside a multi-byte char
+            // (e.g. '→' in a source comment).
+            let mut end = body.len().min(at + 500);
+            while end > at && !body.is_char_boundary(end) {
+                end -= 1;
+            }
+            let snippet = body[at..end].to_string();
             if snippet.contains("SELECT")
                 || snippet.contains("select")
                 || snippet.contains("INSERT")
