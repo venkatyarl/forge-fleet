@@ -270,6 +270,15 @@ pub enum TopCortexCommand {
         #[arg(long, value_enum, default_value = "table")]
         format: crate::CortexFormat,
     },
+    /// List code owners, or files owned by one person.
+    #[command(visible_alias = "owner")]
+    Owners {
+        name: Option<String>,
+        #[arg(long)]
+        corpus: Option<String>,
+        #[arg(long, value_enum, default_value = "table")]
+        format: crate::CortexFormat,
+    },
     /// Recall/health diagnostic for the code graph: what fraction of `calls`
     /// edges resolve to a real internal symbol vs an unresolved extern, plus a
     /// ranked list of suspicious externs — `code:extern` placeholders whose leaf
@@ -934,6 +943,22 @@ pub async fn handle_top_cortex(args: TopCortexArgs) -> Result<()> {
             crate::cortex_cmd::handle_cortex(
                 &pool,
                 crate::CortexCommand::Logs {
+                    corpus: Some(corpus),
+                    format,
+                },
+            )
+            .await?;
+        }
+        TopCortexCommand::Owners {
+            name,
+            corpus,
+            format,
+        } => {
+            let corpus = corpus.unwrap_or_else(cwd_slug);
+            crate::cortex_cmd::handle_cortex(
+                &pool,
+                crate::CortexCommand::Owners {
+                    name,
                     corpus: Some(corpus),
                     format,
                 },

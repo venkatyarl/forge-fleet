@@ -125,8 +125,88 @@ pub async fn handle_cortex(pool: &PgPool, cmd: crate::CortexCommand) -> Result<(
             let rows = cortex::observ::logs(pool, corpus.as_deref()).await?;
             print_logs(&rows, format.as_str());
         }
+        crate::CortexCommand::Owners {
+            name,
+            corpus,
+            format,
+        } => {
+            if let Some(name) = name {
+                let rows = cortex::owners::owner_files(pool, corpus.as_deref(), &name).await?;
+                print_owner_files(&rows, format.as_str(), &name);
+            } else {
+                let rows = cortex::owners::owners(pool, corpus.as_deref()).await?;
+                print_owners(&rows, format.as_str());
+            }
+        }
     }
     Ok(())
+}
+
+fn print_owners(rows: &[cortex::owners::OwnerSummary], format: &str) {
+    match format {
+        "json" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(rows).unwrap_or_else(|_| "[]".to_string())
+            );
+        }
+        "names" => {
+            for row in rows {
+                println!("{}", row.name);
+            }
+        }
+        _ => {
+            if rows.is_empty() {
+                println!("no person:dev ownership nodes in cortex (run `ff cortex index`?)");
+                return;
+            }
+            println!(
+                "{CYAN}\u{25b6} cortex owners — {} owner(s):{RESET}",
+                rows.len()
+            );
+            println!("  {:<36} {:>7}  corpus", "owner", "files");
+            for row in rows {
+                println!(
+                    "  {:<36} {:>7}  {}",
+                    truncate(&row.name, 36),
+                    row.file_count,
+                    row.corpus
+                );
+            }
+        }
+    }
+}
+
+fn print_owner_files(rows: &[cortex::owners::OwnedFile], format: &str, name: &str) {
+    match format {
+        "json" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(rows).unwrap_or_else(|_| "[]".to_string())
+            );
+        }
+        "names" => {
+            for row in rows {
+                println!("{}", row.path);
+            }
+        }
+        _ => {
+            if rows.is_empty() {
+                println!("no owned files for '{name}' in cortex (run `ff cortex index`?)");
+                return;
+            }
+            println!(
+                "{CYAN}\u{25b6} cortex owner '{name}' — {} file(s):{RESET}",
+                rows.len()
+            );
+            for row in rows {
+                println!(
+                    "  {}  ({}, confidence {:.2})",
+                    row.path, row.corpus, row.confidence
+                );
+            }
+        }
+    }
 }
 
 fn print_errors(rows: &[cortex::observ::ErrorType], format: &str) {
