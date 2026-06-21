@@ -213,6 +213,14 @@ pub enum TopCortexCommand {
         #[arg(long, value_enum, default_value = "table")]
         format: crate::CortexFormat,
     },
+    /// Inspect a database column extracted into Cortex.
+    Field {
+        field: String,
+        #[arg(long)]
+        corpus: Option<String>,
+        #[arg(long, value_enum, default_value = "table")]
+        format: crate::CortexFormat,
+    },
     /// Recall/health diagnostic for the code graph: what fraction of `calls`
     /// edges resolve to a real internal symbol vs an unresolved extern, plus a
     /// ranked list of suspicious externs — `code:extern` placeholders whose leaf
@@ -782,6 +790,22 @@ pub async fn handle_top_cortex(args: TopCortexArgs) -> Result<()> {
                     to,
                     max_depth,
                     min_confidence,
+                    format,
+                },
+            )
+            .await?;
+        }
+        TopCortexCommand::Field {
+            field,
+            corpus,
+            format,
+        } => {
+            let corpus = corpus.unwrap_or_else(cwd_slug);
+            crate::cortex_cmd::handle_cortex(
+                &pool,
+                crate::CortexCommand::Field {
+                    field,
+                    corpus: Some(corpus),
                     format,
                 },
             )

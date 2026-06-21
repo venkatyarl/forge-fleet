@@ -85,8 +85,85 @@ pub async fn handle_cortex(pool: &PgPool, cmd: crate::CortexCommand) -> Result<(
                 cortex::call_path(pool, &corpus, &from, &to, max_depth, min_confidence).await?;
             print_path(path.as_deref(), format.as_str(), &from, &to, max_depth);
         }
+        crate::CortexCommand::Field {
+            field,
+            corpus,
+            format,
+        } => {
+            let rows = cortex::field(pool, corpus.as_deref(), &field).await?;
+            print_fields(&rows, format.as_str(), &field);
+        }
     }
     Ok(())
+}
+
+fn print_fields(rows: &[cortex::DbField], format: &str, field: &str) {
+    match format {
+        "json" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(rows).unwrap_or_else(|_| "[]".to_string())
+            );
+        }
+        "names" => {
+            for row in rows {
+                println!("{}", row.column);
+            }
+        }
+        _ => {
+            if rows.is_empty() {
+                println!("no db:column '{field}' in cortex (run `ff cortex index`?)");
+                return;
+            }
+            println!(
+                "{CYAN}\u{25b6} cortex field '{field}' — {} hit(s):{RESET}",
+                rows.len()
+            );
+            for row in rows {
+                let typ = row
+                    .descriptor
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let nullable = row
+                    .descriptor
+                    .get("nullable")
+                    .and_then(|v| v.as_bool())
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "?".to_string());
+                let default = row
+                    .descriptor
+                    .get("default")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("-");
+                let check = row
+                    .descriptor
+                    .get("check")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("-");
+                println!("  {}", row.column);
+                println!("    corpus:   {}", row.corpus);
+                println!("    table:    {}", row.table);
+                println!("    type:     {}", if typ.is_empty() { "-" } else { typ });
+                println!("    nullable: {nullable}");
+                println!("    default:  {default}");
+                println!("    check:    {check}");
+                if row.migrations.is_empty() {
+                    println!("    migrations: -");
+                } else {
+                    let migrations = row
+                        .migrations
+                        .iter()
+                        .map(|m| format!("{} {}", m.edge_type, m.title))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    println!("    migrations: {migrations}");
+                }
+            }
+        }
+    }
 }
 
 /// Render `ff cortex path`. `table` shows the chain `from → … → to` with each

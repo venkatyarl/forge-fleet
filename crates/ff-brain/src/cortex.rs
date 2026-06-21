@@ -78,6 +78,8 @@ use uuid::Uuid;
 
 #[path = "cortex/extractors/code_symbols.rs"]
 pub mod code_symbols;
+#[path = "cortex/extractors/db_schema.rs"]
+pub mod db_schema;
 #[path = "cortex/spi.rs"]
 pub mod spi;
 
@@ -513,6 +515,11 @@ pub async fn index_langs_incremental(
         // extern/import placeholder (a removed import, a renamed/deleted callee).
         // GC those zero-in-degree placeholders so incremental matches a full reindex.
         report.placeholders_gced = gc_orphan_placeholders(pool, corpus_slug).await?;
+        // Run the pluggable dimension extractors (db/events/config/…) too — they
+        // re-derive from the corpus roots, so they run on incremental reindex just
+        // like the full path. Without this the registry only fires on a full
+        // reindex, and `ff cortex index` (incremental) would never write db:* etc.
+        run_pluggable_extractors(pool, corpus_slug, generation).await?;
         Ok(report)
     }
     .await;
@@ -1555,6 +1562,21 @@ pub struct SymbolRef {
     pub start_line: Option<i32>,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DbMigrationRef {
+    pub title: String,
+    pub edge_type: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DbField {
+    pub column: String,
+    pub corpus: String,
+    pub table: String,
+    pub descriptor: serde_json::Value,
+    pub migrations: Vec<DbMigrationRef>,
+}
+
 /// Uniform "the symbol you asked about does not exist in this corpus" message,
 /// shared by every symbol-keyed query (`callers`/`callees`/`impact`/`tests_for`).
 /// These verbs resolve `sel` to a node first; an empty resolution means the
@@ -1565,6 +1587,76 @@ pub struct SymbolRef {
 /// empty result (exit 0).
 fn no_symbol_error(sel: &str, corpus_slug: &str) -> anyhow::Error {
     anyhow::anyhow!("no symbol matching '{sel}' in corpus '{corpus_slug}'")
+}
+
+/// Resolve a database column extracted by the `db_schema` Cortex dimension.
+pub async fn field(pool: &PgPool, corpus_slug: Option<&str>, column: &str) -> Result<Vec<DbField>> {
+    let rows = sqlx::query(
+        r#"SELECT c.id, c.title, c.project, t.title AS table_title,
+                  COALESCE(e.evidence, '{}'::jsonb) AS descriptor
+             FROM brain_vault_nodes c
+             JOIN brain_vault_edges e ON e.dst_id = c.id AND e.edge_type = 'has_column'
+             JOIN brain_vault_nodes t ON t.id = e.src_id AND t.node_type = 'db:table'
+            WHERE c.node_type = 'db:column'
+              AND c.title = $1
+              AND ($2::text IS NULL OR c.project = $2)
+              AND COALESCE(c.generation, 0) IN (
+                  0,
+                  COALESCE((SELECT current_generation
+                              FROM cortex_generations
+                             WHERE project = c.project), 0)
+              )
+              AND COALESCE(e.generation, 0) IN (
+                  0,
+                  COALESCE((SELECT current_generation
+                              FROM cortex_generations
+                             WHERE project = c.project), 0)
+              )
+            ORDER BY c.project, c.title"#,
+    )
+    .bind(column)
+    .bind(corpus_slug)
+    .fetch_all(pool)
+    .await?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let id: Uuid = row.get("id");
+        let corpus: String = row.get("project");
+        let migrations = sqlx::query(
+            r#"SELECT DISTINCT m.title, e.edge_type
+                 FROM brain_vault_edges e
+                 JOIN brain_vault_nodes m ON m.id = e.src_id
+                WHERE e.dst_id = $1
+                  AND m.node_type = 'db:migration'
+                  AND e.edge_type IN ('creates', 'alters', 'drops')
+                  AND COALESCE(e.generation, 0) IN (
+                      0,
+                      COALESCE((SELECT current_generation
+                                  FROM cortex_generations
+                                 WHERE project = m.project), 0)
+                  )
+                ORDER BY m.title, e.edge_type"#,
+        )
+        .bind(id)
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .map(|r| DbMigrationRef {
+            title: r.get("title"),
+            edge_type: r.get("edge_type"),
+        })
+        .collect();
+
+        out.push(DbField {
+            column: row.get("title"),
+            corpus,
+            table: row.get("table_title"),
+            descriptor: row.get("descriptor"),
+            migrations,
+        });
+    }
+    Ok(out)
 }
 
 /// Resolve a user-supplied symbol selector to its node id within a corpus.

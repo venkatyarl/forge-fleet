@@ -1,4 +1,7 @@
-use super::{code_symbols::CodeSymbolsExtractor, lookup_code_node, upsert_code_node};
+use super::{
+    code_symbols::CodeSymbolsExtractor, db_schema::DbSchemaExtractor, lookup_code_node,
+    upsert_code_node,
+};
 use anyhow::Result;
 use serde_json::Value;
 use sqlx::PgPool;
@@ -46,7 +49,7 @@ pub trait Extractor: Send + Sync {
 }
 
 pub fn registry() -> Vec<Box<dyn Extractor>> {
-    vec![Box::new(CodeSymbolsExtractor)]
+    vec![Box::new(CodeSymbolsExtractor), Box::new(DbSchemaExtractor)]
 }
 
 pub async fn write_facts(
