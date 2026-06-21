@@ -8348,6 +8348,69 @@ pub struct FreeSlot {
     pub computer_id: uuid::Uuid,
 }
 
+#[derive(Debug, Clone)]
+pub struct HostCapacity {
+    pub worker_name: String,
+    pub idle_slots: i64,
+    pub active_leases: i64,
+    pub cpu_pct: Option<f64>,
+    pub score: f64,
+}
+
+/// Fleet-global capacity ranking for work dispatch. Active leases are counted
+/// across all work_items/projects so dispatch spreads away from busy computers.
+pub async fn pg_rank_computers_by_capacity(pool: &PgPool) -> Result<Vec<HostCapacity>> {
+    let rows = sqlx::query(
+        r#"
+        WITH idle AS (
+            SELECT computer_id, COUNT(*)::bigint AS idle_slots
+              FROM sub_agents
+             WHERE status = 'idle'
+             GROUP BY computer_id
+        ),
+        active AS (
+            SELECT computer_id, COUNT(*)::bigint AS active_leases
+              FROM work_item_leases
+             WHERE released_at IS NULL
+             GROUP BY computer_id
+        )
+        SELECT c.name AS worker_name,
+               COALESCE(i.idle_slots, 0) AS idle_slots,
+               COALESCE(a.active_leases, 0) AS active_leases,
+               m.cpu_pct AS cpu_pct,
+               (
+                   COALESCE(i.idle_slots, 0)::float8 * 10.0
+                   - COALESCE(a.active_leases, 0)::float8 * 5.0
+                   - COALESCE(m.cpu_pct, 0.0) / 10.0
+               ) AS score
+          FROM computers c
+          LEFT JOIN idle i ON i.computer_id = c.id
+          LEFT JOIN active a ON a.computer_id = c.id
+          LEFT JOIN LATERAL (
+              SELECT cpu_pct
+                FROM computer_metrics_history
+               WHERE computer_id = c.id
+               ORDER BY recorded_at DESC
+               LIMIT 1
+          ) m ON TRUE
+         ORDER BY score DESC, c.name ASC
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .iter()
+        .map(|r| HostCapacity {
+            worker_name: r.get("worker_name"),
+            idle_slots: r.get("idle_slots"),
+            active_leases: r.get("active_leases"),
+            cpu_pct: r.try_get("cpu_pct").ok().flatten(),
+            score: r.get("score"),
+        })
+        .collect())
+}
+
 /// Reap leases whose heartbeat is older than `stale_secs`: release the lease,
 /// free its slot, and return the work_item to 'ready' (bumping attempts).
 /// Returns the number of leases reaped.
