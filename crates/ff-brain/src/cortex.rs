@@ -94,6 +94,8 @@ pub mod owners;
 pub mod security;
 #[path = "cortex/spi.rs"]
 pub mod spi;
+#[path = "cortex/extractors/types.rs"]
+pub mod types;
 
 /// Summary of a Cortex indexing run.
 #[derive(Debug, Default, Clone)]
