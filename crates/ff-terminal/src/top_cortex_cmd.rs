@@ -280,6 +280,20 @@ pub enum TopCortexCommand {
         #[arg(long, value_enum, default_value = "table")]
         format: crate::CortexFormat,
     },
+    /// List API handlers with request and response DTO contracts.
+    Api {
+        #[arg(long)]
+        corpus: Option<String>,
+        #[arg(long, value_enum, default_value = "table")]
+        format: crate::CortexFormat,
+    },
+    /// List outbound HTTP services and their callers.
+    External {
+        #[arg(long)]
+        corpus: Option<String>,
+        #[arg(long, value_enum, default_value = "table")]
+        format: crate::CortexFormat,
+    },
     /// List Rust error types extracted from Cortex observability signals.
     Errors {
         #[arg(long)]
@@ -996,6 +1010,16 @@ pub async fn handle_top_cortex(args: TopCortexArgs) -> Result<()> {
             )
             .await?;
         }
+        TopCortexCommand::Api { corpus, format } => {
+            let corpus = corpus.unwrap_or_else(cwd_slug);
+            let rows = cortex::api::api(&pool, Some(&corpus)).await?;
+            print_api_handlers(&rows, format.as_str());
+        }
+        TopCortexCommand::External { corpus, format } => {
+            let corpus = corpus.unwrap_or_else(cwd_slug);
+            let rows = cortex::api::external(&pool, Some(&corpus)).await?;
+            print_external_services(&rows, format.as_str());
+        }
         TopCortexCommand::Errors { corpus, format } => {
             let corpus = corpus.unwrap_or_else(cwd_slug);
             crate::cortex_cmd::handle_cortex(
@@ -1074,6 +1098,76 @@ pub async fn handle_top_cortex(args: TopCortexArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn print_api_handlers(rows: &[cortex::api::ApiHandlerSummary], format: &str) {
+    match format {
+        "json" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(rows).unwrap_or_else(|_| "[]".to_string())
+            );
+        }
+        "names" => {
+            for row in rows {
+                println!("{}", row.handler);
+            }
+        }
+        _ => {
+            if rows.is_empty() {
+                println!("no API contract edges in cortex (run `ff cortex index`?)");
+                return;
+            }
+            println!(
+                "{CYAN}\u{25b6} cortex api — {} handler(s):{RESET}",
+                rows.len()
+            );
+            println!("  {:<48}  {:<36}  returns", "handler", "accepts");
+            for row in rows {
+                println!(
+                    "  {:<48}  {:<36}  {}",
+                    truncate_deps_cell(&row.handler, 48),
+                    truncate_deps_cell(&row.accepts.join(", "), 36),
+                    truncate_deps_cell(&row.returns.join(", "), 36)
+                );
+            }
+        }
+    }
+}
+
+fn print_external_services(rows: &[cortex::api::ExternalServiceSummary], format: &str) {
+    match format {
+        "json" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(rows).unwrap_or_else(|_| "[]".to_string())
+            );
+        }
+        "names" => {
+            for row in rows {
+                println!("{}", row.service);
+            }
+        }
+        _ => {
+            if rows.is_empty() {
+                println!("no ext:service nodes in cortex (run `ff cortex index`?)");
+                return;
+            }
+            println!(
+                "{CYAN}\u{25b6} cortex external — {} service(s):{RESET}",
+                rows.len()
+            );
+            println!("  {:<36} {:>7}  callers", "service", "callers");
+            for row in rows {
+                println!(
+                    "  {:<36} {:>7}  {}",
+                    truncate_deps_cell(&row.service, 36),
+                    row.callers.len(),
+                    truncate_deps_cell(&row.callers.join(", "), 64)
+                );
+            }
+        }
+    }
 }
 
 fn print_deps(rows: &[cortex::deps::DepPackageSummary]) {
