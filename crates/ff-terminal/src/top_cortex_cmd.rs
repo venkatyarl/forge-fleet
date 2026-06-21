@@ -61,6 +61,13 @@ pub enum TopCortexCommand {
         #[arg(long, value_enum, default_value = "table")]
         format: crate::CortexFormat,
     },
+    /// Match Cortex nodes between two corpora and emit `maps_to` lineage edges.
+    Lineage {
+        #[arg(long = "from")]
+        from: String,
+        #[arg(long = "to")]
+        to: String,
+    },
     /// Prune junk corpora — empty ones (0 sources AND 0 content nodes, e.g.
     /// abandoned `cortex index` probes) plus any whose slug matches `--slug`.
     /// Dry-run by default: prints what WOULD be deleted; pass `--yes` to delete.
@@ -838,6 +845,21 @@ async fn handle_top_cortex_online(args: TopCortexArgs) -> Result<()> {
             // The CLI mirror of the `cortex_corpora` MCP tool: always lists every
             // corpus (the `status --all` view), independent of the cwd.
             print_corpora(&pool, None, format.as_str()).await?;
+        }
+        TopCortexCommand::Lineage { from, to } => {
+            let processed = cortex::maps_to::map_corpora(&pool, &from, &to).await?;
+            let summary = cortex::maps_to::lineage_summary(&pool, &from, &to).await?;
+            let gaps = cortex::maps_to::sample_gaps(&pool, &from, &to, 10).await?;
+            println!("{GREEN}mapped lineage{RESET} {from} -> {to}");
+            println!("  processed:          {processed}");
+            println!("  mapped:             {}", summary.mapped);
+            println!("  unmapped:           {}", summary.unmapped);
+            if !gaps.is_empty() {
+                println!("  sample gaps:");
+                for gap in gaps {
+                    println!("    {:<14} {}", gap.node_type, gap.title);
+                }
+            }
         }
         TopCortexCommand::Prune { slug, yes } => {
             run_prune(&pool, slug, yes).await?;
