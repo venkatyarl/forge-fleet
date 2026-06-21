@@ -85,6 +85,25 @@ pub async fn codegen_apply(
             }
         };
 
+        // Guard against no-op edits: a SEARCH/REPLACE where REPLACE == the matched
+        // text (or edits that otherwise change nothing) would pass apply + cargo
+        // check and be reported applied:true while the working tree is UNCHANGED
+        // (live-observed false-success on a 183K file). Require a real diff.
+        let unchanged = Command::new("git")
+            .arg("-C")
+            .arg(repo_path)
+            .args(["status", "--porcelain"])
+            .output()
+            .map(|o| o.stdout.is_empty())
+            .unwrap_or(false);
+        if unchanged {
+            let err = "edits applied but produced NO change (no-op SEARCH/REPLACE)".to_string();
+            warn!(round, "{}", err);
+            last_edits = Some(edit_summary);
+            last_error = Some(err);
+            continue;
+        }
+
         let check = Command::new("cargo")
             .arg("check")
             .current_dir(repo_path)
