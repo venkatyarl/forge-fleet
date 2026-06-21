@@ -2592,6 +2592,21 @@ pub enum CortexCommand {
         #[arg(long, value_enum, default_value = "table")]
         format: crate::CortexFormat,
     },
+    /// List security/auth gates and candidate unauthenticated handlers.
+    Gates {
+        #[arg(long)]
+        corpus: Option<String>,
+        #[arg(long, value_enum, default_value = "table")]
+        format: crate::CortexFormat,
+    },
+    /// Show security/auth gates protecting a code function.
+    Guards {
+        #[arg(long)]
+        corpus: String,
+        symbol: String,
+        #[arg(long, value_enum, default_value = "table")]
+        format: crate::CortexFormat,
+    },
     /// List Rust error types extracted from Cortex observability signals.
     Errors {
         #[arg(long)]

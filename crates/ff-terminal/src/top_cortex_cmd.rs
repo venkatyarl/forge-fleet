@@ -256,6 +256,21 @@ pub enum TopCortexCommand {
         #[arg(long, value_enum, default_value = "table")]
         format: crate::CortexFormat,
     },
+    /// List security/auth gates and candidate unauthenticated handlers.
+    Gates {
+        #[arg(long)]
+        corpus: Option<String>,
+        #[arg(long, value_enum, default_value = "table")]
+        format: crate::CortexFormat,
+    },
+    /// Show security/auth gates protecting a code function.
+    Guards {
+        symbol: String,
+        #[arg(long)]
+        corpus: Option<String>,
+        #[arg(long, value_enum, default_value = "table")]
+        format: crate::CortexFormat,
+    },
     /// List Rust error types extracted from Cortex observability signals.
     Errors {
         #[arg(long)]
@@ -922,6 +937,33 @@ pub async fn handle_top_cortex(args: TopCortexArgs) -> Result<()> {
                 crate::CortexCommand::Topic {
                     subject,
                     corpus: Some(corpus),
+                    format,
+                },
+            )
+            .await?;
+        }
+        TopCortexCommand::Gates { corpus, format } => {
+            let corpus = corpus.unwrap_or_else(cwd_slug);
+            crate::cortex_cmd::handle_cortex(
+                &pool,
+                crate::CortexCommand::Gates {
+                    corpus: Some(corpus),
+                    format,
+                },
+            )
+            .await?;
+        }
+        TopCortexCommand::Guards {
+            symbol,
+            corpus,
+            format,
+        } => {
+            let corpus = corpus.unwrap_or_else(cwd_slug);
+            crate::cortex_cmd::handle_cortex(
+                &pool,
+                crate::CortexCommand::Guards {
+                    corpus,
+                    symbol,
                     format,
                 },
             )
