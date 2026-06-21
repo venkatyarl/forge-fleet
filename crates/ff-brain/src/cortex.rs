@@ -78,6 +78,8 @@ use uuid::Uuid;
 
 #[path = "cortex/extractors/code_symbols.rs"]
 pub mod code_symbols;
+#[path = "cortex/extractors/config.rs"]
+pub mod config;
 #[path = "cortex/extractors/db_schema.rs"]
 pub mod db_schema;
 #[path = "cortex/extractors/events.rs"]
@@ -1580,6 +1582,30 @@ pub struct DbField {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
+pub struct ConfigSummary {
+    pub key: String,
+    pub corpus: String,
+    pub node_type: String,
+    pub readers: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ConfigReader {
+    pub qualified_name: String,
+    pub path: String,
+    pub confidence: f32,
+    pub method: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ConfigKeyDetail {
+    pub key: String,
+    pub corpus: String,
+    pub node_type: String,
+    pub readers: Vec<ConfigReader>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct EventTopicSummary {
     pub subject: String,
     pub corpus: String,
@@ -1682,6 +1708,120 @@ pub async fn field(pool: &PgPool, corpus_slug: Option<&str>, column: &str) -> Re
             table: row.get("table_title"),
             descriptor: row.get("descriptor"),
             migrations,
+        });
+    }
+    Ok(out)
+}
+
+/// List configuration keys extracted from env/secret/feature-flag access sites.
+pub async fn config(pool: &PgPool, corpus_slug: Option<&str>) -> Result<Vec<ConfigSummary>> {
+    let rows = sqlx::query(
+        r#"SELECT c.title AS key,
+                  c.project AS corpus,
+                  c.node_type,
+                  COUNT(DISTINCT r.src_id) AS readers
+             FROM brain_vault_nodes c
+             LEFT JOIN brain_vault_edges r
+                    ON r.dst_id = c.id
+                   AND r.edge_type = 'reads_config'
+                   AND COALESCE(r.generation, 0) IN (
+                       0,
+                       COALESCE((SELECT current_generation
+                                   FROM cortex_generations
+                                  WHERE project = c.project), 0)
+                   )
+            WHERE c.node_type LIKE 'config:%'
+              AND ($1::text IS NULL OR c.project = $1)
+              AND COALESCE(c.generation, 0) IN (
+                  0,
+                  COALESCE((SELECT current_generation
+                              FROM cortex_generations
+                             WHERE project = c.project), 0)
+              )
+            GROUP BY c.title, c.project, c.node_type
+            ORDER BY c.project, c.node_type, c.title"#,
+    )
+    .bind(corpus_slug)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| ConfigSummary {
+            key: row.get("key"),
+            corpus: row.get("corpus"),
+            node_type: row.get("node_type"),
+            readers: row.get("readers"),
+        })
+        .collect())
+}
+
+/// Show which functions read one extracted config key.
+pub async fn config_key(
+    pool: &PgPool,
+    corpus_slug: Option<&str>,
+    key: &str,
+) -> Result<Vec<ConfigKeyDetail>> {
+    let config_rows = sqlx::query(
+        r#"SELECT c.id, c.title AS key, c.project AS corpus, c.node_type
+             FROM brain_vault_nodes c
+            WHERE c.node_type LIKE 'config:%'
+              AND c.title = $1
+              AND ($2::text IS NULL OR c.project = $2)
+              AND COALESCE(c.generation, 0) IN (
+                  0,
+                  COALESCE((SELECT current_generation
+                              FROM cortex_generations
+                             WHERE project = c.project), 0)
+              )
+            ORDER BY c.project, c.node_type, c.title"#,
+    )
+    .bind(key)
+    .bind(corpus_slug)
+    .fetch_all(pool)
+    .await?;
+
+    let mut out = Vec::with_capacity(config_rows.len());
+    for row in config_rows {
+        let id: Uuid = row.get("id");
+        let corpus: String = row.get("corpus");
+        let readers = sqlx::query(
+            r#"SELECT f.title AS qualified_name,
+                      f.path,
+                      r.confidence,
+                      r.method
+                 FROM brain_vault_edges r
+                 JOIN brain_vault_nodes f ON f.id = r.src_id
+                WHERE r.dst_id = $1
+                  AND r.edge_type = 'reads_config'
+                  AND f.node_type = 'code:function'
+                  AND COALESCE(r.generation, 0) IN (
+                      0,
+                      COALESCE((SELECT current_generation
+                                  FROM cortex_generations
+                                 WHERE project = $2), 0)
+                  )
+                  AND f.valid_until IS NULL
+                ORDER BY f.title"#,
+        )
+        .bind(id)
+        .bind(&corpus)
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .map(|r| ConfigReader {
+            qualified_name: r.get("qualified_name"),
+            path: r.get("path"),
+            confidence: r.get("confidence"),
+            method: r.get("method"),
+        })
+        .collect();
+
+        out.push(ConfigKeyDetail {
+            key: row.get("key"),
+            corpus,
+            node_type: row.get("node_type"),
+            readers,
         });
     }
     Ok(out)

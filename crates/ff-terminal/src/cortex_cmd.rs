@@ -93,6 +93,18 @@ pub async fn handle_cortex(pool: &PgPool, cmd: crate::CortexCommand) -> Result<(
             let rows = cortex::field(pool, corpus.as_deref(), &field).await?;
             print_fields(&rows, format.as_str(), &field);
         }
+        crate::CortexCommand::Config { corpus, format } => {
+            let rows = cortex::config(pool, corpus.as_deref()).await?;
+            print_config(&rows, format.as_str());
+        }
+        crate::CortexCommand::ConfigKey {
+            name,
+            corpus,
+            format,
+        } => {
+            let rows = cortex::config_key(pool, corpus.as_deref(), &name).await?;
+            print_config_key(&rows, format.as_str(), &name);
+        }
         crate::CortexCommand::Topics { corpus, format } => {
             let rows = cortex::topics(pool, corpus.as_deref()).await?;
             print_topics(&rows, format.as_str());
@@ -282,6 +294,84 @@ fn print_fields(rows: &[cortex::DbField], format: &str, field: &str) {
                         .collect::<Vec<_>>()
                         .join(", ");
                     println!("    migrations: {migrations}");
+                }
+            }
+        }
+    }
+}
+
+fn print_config(rows: &[cortex::ConfigSummary], format: &str) {
+    match format {
+        "json" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(rows).unwrap_or_else(|_| "[]".to_string())
+            );
+        }
+        "names" => {
+            for row in rows {
+                println!("{}", row.key);
+            }
+        }
+        _ => {
+            if rows.is_empty() {
+                println!("no config:* nodes in cortex (run `ff cortex index`?)");
+                return;
+            }
+            println!(
+                "{CYAN}\u{25b6} cortex config — {} key(s):{RESET}",
+                rows.len()
+            );
+            println!("  {:<14} {:<56} {:>7}  corpus", "type", "key", "readers");
+            for row in rows {
+                println!(
+                    "  {:<14} {:<56} {:>7}  {}",
+                    row.node_type,
+                    truncate(&row.key, 56),
+                    row.readers,
+                    row.corpus
+                );
+            }
+        }
+    }
+}
+
+fn print_config_key(rows: &[cortex::ConfigKeyDetail], format: &str, name: &str) {
+    match format {
+        "json" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(rows).unwrap_or_else(|_| "[]".to_string())
+            );
+        }
+        "names" => {
+            for row in rows {
+                for reader in &row.readers {
+                    println!("{}", reader.qualified_name);
+                }
+            }
+        }
+        _ => {
+            if rows.is_empty() {
+                println!("no config key '{name}' in cortex (run `ff cortex index`?)");
+                return;
+            }
+            for row in rows {
+                println!(
+                    "{CYAN}\u{25b6} cortex config-key '{}' ({}, {}){RESET}",
+                    row.key, row.node_type, row.corpus
+                );
+                if row.readers.is_empty() {
+                    println!("  readers: -");
+                    continue;
+                }
+                println!("  readers:");
+                for reader in &row.readers {
+                    let method = reader.method.as_deref().unwrap_or("-");
+                    println!(
+                        "    {}  ({method}, confidence {:.2})",
+                        reader.qualified_name, reader.confidence
+                    );
                 }
             }
         }

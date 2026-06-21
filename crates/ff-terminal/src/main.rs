@@ -2562,6 +2562,21 @@ pub enum CortexCommand {
         #[arg(long, value_enum, default_value = "table")]
         format: crate::CortexFormat,
     },
+    /// List config/env/secret/feature-flag keys extracted into Cortex.
+    Config {
+        #[arg(long)]
+        corpus: Option<String>,
+        #[arg(long, value_enum, default_value = "table")]
+        format: crate::CortexFormat,
+    },
+    /// Inspect functions that read one config/env/secret/feature-flag key.
+    ConfigKey {
+        name: String,
+        #[arg(long)]
+        corpus: Option<String>,
+        #[arg(long, value_enum, default_value = "table")]
+        format: crate::CortexFormat,
+    },
     /// List event topics extracted from NATS / message-bus pub-sub sites.
     Topics {
         #[arg(long)]

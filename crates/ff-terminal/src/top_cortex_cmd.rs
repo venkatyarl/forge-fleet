@@ -221,6 +221,21 @@ pub enum TopCortexCommand {
         #[arg(long, value_enum, default_value = "table")]
         format: crate::CortexFormat,
     },
+    /// List config/env/secret/feature-flag keys extracted into Cortex.
+    Config {
+        #[arg(long)]
+        corpus: Option<String>,
+        #[arg(long, value_enum, default_value = "table")]
+        format: crate::CortexFormat,
+    },
+    /// Inspect functions that read one config/env/secret/feature-flag key.
+    ConfigKey {
+        name: String,
+        #[arg(long)]
+        corpus: Option<String>,
+        #[arg(long, value_enum, default_value = "table")]
+        format: crate::CortexFormat,
+    },
     /// List event topics extracted from NATS / message-bus pub-sub sites.
     Topics {
         #[arg(long)]
@@ -820,6 +835,33 @@ pub async fn handle_top_cortex(args: TopCortexArgs) -> Result<()> {
                 &pool,
                 crate::CortexCommand::Field {
                     field,
+                    corpus: Some(corpus),
+                    format,
+                },
+            )
+            .await?;
+        }
+        TopCortexCommand::Config { corpus, format } => {
+            let corpus = corpus.unwrap_or_else(cwd_slug);
+            crate::cortex_cmd::handle_cortex(
+                &pool,
+                crate::CortexCommand::Config {
+                    corpus: Some(corpus),
+                    format,
+                },
+            )
+            .await?;
+        }
+        TopCortexCommand::ConfigKey {
+            name,
+            corpus,
+            format,
+        } => {
+            let corpus = corpus.unwrap_or_else(cwd_slug);
+            crate::cortex_cmd::handle_cortex(
+                &pool,
+                crate::CortexCommand::ConfigKey {
+                    name,
                     corpus: Some(corpus),
                     format,
                 },
