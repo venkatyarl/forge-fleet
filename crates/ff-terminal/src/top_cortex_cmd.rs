@@ -256,6 +256,20 @@ pub enum TopCortexCommand {
         #[arg(long, value_enum, default_value = "table")]
         format: crate::CortexFormat,
     },
+    /// List Rust error types extracted from Cortex observability signals.
+    Errors {
+        #[arg(long)]
+        corpus: Option<String>,
+        #[arg(long, value_enum, default_value = "table")]
+        format: crate::CortexFormat,
+    },
+    /// Show log emission counts by level and error-level emitting functions.
+    Logs {
+        #[arg(long)]
+        corpus: Option<String>,
+        #[arg(long, value_enum, default_value = "table")]
+        format: crate::CortexFormat,
+    },
     /// Recall/health diagnostic for the code graph: what fraction of `calls`
     /// edges resolve to a real internal symbol vs an unresolved extern, plus a
     /// ranked list of suspicious externs — `code:extern` placeholders whose leaf
@@ -898,6 +912,28 @@ pub async fn handle_top_cortex(args: TopCortexArgs) -> Result<()> {
                 &pool,
                 crate::CortexCommand::Topic {
                     subject,
+                    corpus: Some(corpus),
+                    format,
+                },
+            )
+            .await?;
+        }
+        TopCortexCommand::Errors { corpus, format } => {
+            let corpus = corpus.unwrap_or_else(cwd_slug);
+            crate::cortex_cmd::handle_cortex(
+                &pool,
+                crate::CortexCommand::Errors {
+                    corpus: Some(corpus),
+                    format,
+                },
+            )
+            .await?;
+        }
+        TopCortexCommand::Logs { corpus, format } => {
+            let corpus = corpus.unwrap_or_else(cwd_slug);
+            crate::cortex_cmd::handle_cortex(
+                &pool,
+                crate::CortexCommand::Logs {
                     corpus: Some(corpus),
                     format,
                 },

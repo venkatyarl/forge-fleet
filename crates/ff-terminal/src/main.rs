@@ -2592,6 +2592,20 @@ pub enum CortexCommand {
         #[arg(long, value_enum, default_value = "table")]
         format: crate::CortexFormat,
     },
+    /// List Rust error types extracted from Cortex observability signals.
+    Errors {
+        #[arg(long)]
+        corpus: Option<String>,
+        #[arg(long, value_enum, default_value = "table")]
+        format: crate::CortexFormat,
+    },
+    /// Show log emission counts by level and error-level emitting functions.
+    Logs {
+        #[arg(long)]
+        corpus: Option<String>,
+        #[arg(long, value_enum, default_value = "table")]
+        format: crate::CortexFormat,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]

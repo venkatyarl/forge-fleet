@@ -117,8 +117,83 @@ pub async fn handle_cortex(pool: &PgPool, cmd: crate::CortexCommand) -> Result<(
             let rows = cortex::topic(pool, corpus.as_deref(), &subject).await?;
             print_topic(&rows, format.as_str(), &subject);
         }
+        crate::CortexCommand::Errors { corpus, format } => {
+            let rows = cortex::observ::errors(pool, corpus.as_deref()).await?;
+            print_errors(&rows, format.as_str());
+        }
+        crate::CortexCommand::Logs { corpus, format } => {
+            let rows = cortex::observ::logs(pool, corpus.as_deref()).await?;
+            print_logs(&rows, format.as_str());
+        }
     }
     Ok(())
+}
+
+fn print_errors(rows: &[cortex::observ::ErrorType], format: &str) {
+    match format {
+        "json" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(rows).unwrap_or_else(|_| "[]".to_string())
+            );
+        }
+        "names" => {
+            for row in rows {
+                println!("{}", row.name);
+            }
+        }
+        _ => {
+            if rows.is_empty() {
+                println!("no error:type nodes in cortex (run `ff cortex index`?)");
+                return;
+            }
+            println!(
+                "{CYAN}\u{25b6} cortex errors — {} error type(s):{RESET}",
+                rows.len()
+            );
+            println!("  {:<48} corpus", "type");
+            for row in rows {
+                println!("  {:<48} {}", truncate(&row.name, 48), row.corpus);
+            }
+        }
+    }
+}
+
+fn print_logs(rows: &[cortex::observ::LogLevelSummary], format: &str) {
+    match format {
+        "json" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(rows).unwrap_or_else(|_| "[]".to_string())
+            );
+        }
+        "names" => {
+            for row in rows {
+                println!("{}", row.level);
+            }
+        }
+        _ => {
+            if rows.is_empty() {
+                println!("no obs:level nodes in cortex (run `ff cortex index`?)");
+                return;
+            }
+            println!("{CYAN}\u{25b6} cortex logs:{RESET}");
+            println!("  {:<8} {:>5}  corpus", "level", "emits");
+            for row in rows {
+                println!("  {:<8} {:>5}  {}", row.level, row.emits, row.corpus);
+            }
+            let error_functions = rows
+                .iter()
+                .flat_map(|row| row.error_functions.iter())
+                .collect::<Vec<_>>();
+            if !error_functions.is_empty() {
+                println!("  error-level emitters:");
+                for function in error_functions {
+                    println!("    {function}");
+                }
+            }
+        }
+    }
 }
 
 fn print_topics(rows: &[cortex::EventTopicSummary], format: &str) {
