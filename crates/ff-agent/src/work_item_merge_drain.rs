@@ -13,6 +13,7 @@
 
 use anyhow::{Context, Result};
 use sqlx::PgPool;
+use std::process::Command;
 use std::time::Duration;
 use tracing::{info, warn};
 
@@ -54,6 +55,42 @@ pub async fn evaluate_merge_queue(pg: &PgPool) -> Result<usize> {
                 );
                 return Ok(0);
             }
+            match run_pr_review(pg, &pr_url, item.work_item_id).await {
+                Ok((true, reason)) => {
+                    info!(
+                        pr = %pr_url,
+                        work_item = %item.work_item_id,
+                        %reason,
+                        "merge_drain: autonomous review approved"
+                    );
+                }
+                Ok((false, reason)) => {
+                    let failure = format!("review rejected: {reason}");
+                    warn!(
+                        pr = %pr_url,
+                        work_item = %item.work_item_id,
+                        reason = %failure,
+                        "merge_drain: autonomous review rejected PR"
+                    );
+                    ff_db::pg_mark_merge_failed(pg, item.id, item.work_item_id, &failure).await?;
+                    if let Err(e) =
+                        gh_pr_comment(&pr_url, &format!("Autonomous review REJECTED: {reason}"))
+                            .await
+                    {
+                        warn!(pr = %pr_url, error = %e, "merge_drain: failed to comment review rejection");
+                    }
+                    return Ok(0);
+                }
+                Err(e) => {
+                    warn!(
+                        pr = %pr_url,
+                        work_item = %item.work_item_id,
+                        error = %e,
+                        "merge_drain: review unavailable, deferring PR for manual review"
+                    );
+                    return Ok(0);
+                }
+            }
             match gh_merge_squash(&pr_url).await {
                 Ok(()) => {
                     ff_db::pg_mark_merge_merged(pg, item.id, item.work_item_id).await?;
@@ -69,6 +106,103 @@ pub async fn evaluate_merge_queue(pg: &PgPool) -> Result<usize> {
             }
         }
     }
+}
+
+async fn run_pr_review(
+    pg: &PgPool,
+    pr_url: &str,
+    work_item_id: uuid::Uuid,
+) -> anyhow::Result<(bool, String)> {
+    let diff_out = Command::new("gh")
+        .args(["pr", "diff", pr_url])
+        .output()
+        .context("spawn gh pr diff")?;
+    if !diff_out.status.success() {
+        anyhow::bail!(
+            "gh pr diff failed: {}",
+            String::from_utf8_lossy(&diff_out.stderr)
+                .trim()
+                .chars()
+                .take(500)
+                .collect::<String>()
+        );
+    }
+    let diff = truncate_chars(&String::from_utf8_lossy(&diff_out.stdout), 40_000);
+
+    let (title, description): (String, Option<String>) =
+        sqlx::query_as("SELECT title, description FROM work_items WHERE id = $1")
+            .bind(work_item_id)
+            .fetch_one(pg)
+            .await
+            .context("fetch work_item intent for PR review")?;
+
+    let prompt = format!(
+        "You are reviewing a pull request opened by an autonomous coding fleet.\n\
+         Judge whether the change correctly and cleanly implements the requested work item.\n\n\
+         Work item title:\n{title}\n\n\
+         Work item description:\n{description}\n\n\
+         Requirements for approval:\n\
+         - The diff matches the stated intent.\n\
+         - The diff introduces no regressions.\n\
+         - The diff does NOT DEGRADE existing code, documentation, comments, tests, or behavior; \
+           for example, replacing a good detailed doc comment or working logic with something \
+           worse, shorter, less clear, or less complete is a rejection.\n\
+         - The diff is a real, complete change rather than a placeholder, superficial edit, or \
+           partial implementation.\n\n\
+         Answer with exactly APPROVE or REJECT on the first line. Put a one-line reason on the \
+         next line.\n\n\
+         Pull request diff (truncated to 40000 chars if needed):\n```diff\n{diff}\n```",
+        description = description.unwrap_or_default(),
+    );
+
+    let response =
+        crate::fleet_oneshot::fleet_oneshot(pg, &prompt, None, Some(Duration::from_secs(180)))
+            .await
+            .context("fleet PR review")?;
+    Ok(parse_review_response(&response.text))
+}
+
+fn parse_review_response(response: &str) -> (bool, String) {
+    let mut first_idx = None;
+    let mut first_line = "";
+    for (idx, line) in response.lines().enumerate() {
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            first_idx = Some(idx);
+            first_line = trimmed;
+            break;
+        }
+    }
+
+    let Some(idx) = first_idx else {
+        return (false, "empty review response".to_string());
+    };
+
+    let approved = first_line.to_uppercase().starts_with("APPROVE");
+    let reason = response
+        .lines()
+        .skip(idx + 1)
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let reason = if reason.is_empty() {
+        first_line.to_string()
+    } else {
+        reason
+    };
+    (approved, reason)
+}
+
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
 }
 
 /// Whether the operator has opted into auto-merging work_item PRs to main.
@@ -139,6 +273,25 @@ async fn gh_merge_squash(pr_url: &str) -> Result<()> {
         .output()
         .await
         .context("spawn gh pr merge")?;
+    if out.status.success() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+            .trim()
+            .chars()
+            .take(500)
+            .collect::<String>()
+    );
+}
+
+async fn gh_pr_comment(pr_url: &str, body: &str) -> Result<()> {
+    let out = tokio::process::Command::new("gh")
+        .args(["pr", "comment", pr_url, "--body", body])
+        .output()
+        .await
+        .context("spawn gh pr comment")?;
     if out.status.success() {
         return Ok(());
     }
