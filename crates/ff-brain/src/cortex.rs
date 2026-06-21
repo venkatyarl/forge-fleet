@@ -90,6 +90,8 @@ pub mod events;
 pub mod observ;
 #[path = "cortex/extractors/owners.rs"]
 pub mod owners;
+#[path = "cortex/extractors/routes.rs"]
+pub mod routes;
 #[path = "cortex/extractors/security.rs"]
 pub mod security;
 #[path = "cortex/spi.rs"]
