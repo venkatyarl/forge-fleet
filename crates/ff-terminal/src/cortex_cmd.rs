@@ -177,8 +177,49 @@ pub async fn handle_cortex(pool: &PgPool, cmd: crate::CortexCommand) -> Result<(
                 print_owners(&rows, format.as_str());
             }
         }
+        crate::CortexCommand::Features { corpus, format } => {
+            let rows = cortex::product::features(pool, corpus.as_deref()).await?;
+            print_features(&rows, format.as_str());
+        }
     }
     Ok(())
+}
+
+fn print_features(rows: &[cortex::product::FeatureRow], format: &str) {
+    match format {
+        "json" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(rows).unwrap_or_else(|_| "[]".to_string())
+            );
+        }
+        "names" => {
+            for row in rows {
+                println!("{}", row.feature);
+            }
+        }
+        _ => {
+            if rows.is_empty() {
+                println!("no product:feature nodes in cortex (run `ff cortex index`?)");
+                return;
+            }
+            let implemented = rows.iter().filter(|row| row.has_implements()).count();
+            println!(
+                "{CYAN}\u{25b6} cortex features — {} feature(s), {} implemented:{RESET}",
+                rows.len(),
+                implemented
+            );
+            println!("  {:<32}  {:<11}  implements", "feature", "corpus");
+            for row in rows {
+                println!(
+                    "  {:<32}  {:<11}  {}",
+                    truncate(&row.feature, 32),
+                    truncate(&row.corpus, 11),
+                    row.implements.as_deref().unwrap_or("-")
+                );
+            }
+        }
+    }
 }
 
 fn print_owners(rows: &[cortex::owners::OwnerSummary], format: &str) {
