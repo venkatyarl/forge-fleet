@@ -47,6 +47,12 @@ pub enum TopCortexCommand {
     Entities {
         #[arg(long)]
         corpus: Option<String>,
+    /// Ingest canonical people across all Cortex corpora.
+    IngestPeople,
+    /// List canonical people and authored file counts across the fleet.
+    People {
+        #[arg(long, value_enum, default_value = "table")]
+        format: crate::CortexFormat,
     },
     /// Show the indexed corpus for the cwd (or --all corpora): node/edge counts.
     Status {
@@ -818,6 +824,11 @@ async fn handle_top_cortex_online(args: TopCortexArgs) -> Result<()> {
         }
         TopCortexCommand::Entities { corpus } => {
             crate::cortex_cmd::handle_cortex(&pool, crate::CortexCommand::Entities { corpus })
+        TopCortexCommand::IngestPeople => {
+            crate::cortex_cmd::handle_cortex(&pool, crate::CortexCommand::IngestPeople).await?;
+        }
+        TopCortexCommand::People { format } => {
+            crate::cortex_cmd::handle_cortex(&pool, crate::CortexCommand::People { format })
                 .await?;
         }
         TopCortexCommand::Embed {

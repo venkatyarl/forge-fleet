@@ -2493,6 +2493,12 @@ pub enum CortexCommand {
     Entities {
         #[arg(long)]
         corpus: Option<String>,
+    /// Ingest canonical people across all Cortex corpora.
+    IngestPeople,
+    /// List canonical people and authored file counts across the fleet.
+    People {
+        #[arg(long, value_enum, default_value = "table")]
+        format: crate::CortexFormat,
     },
     /// Callers of a code symbol.
     Callers {

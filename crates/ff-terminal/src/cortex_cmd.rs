@@ -69,6 +69,22 @@ pub async fn handle_cortex(pool: &PgPool, cmd: crate::CortexCommand) -> Result<(
             }
             println!("{CYAN}\u{2713} Done{RESET}");
         }
+        crate::CortexCommand::IngestPeople => {
+            println!("{CYAN}\u{25b6} Cortex ingesting canonical people\u{2026}{RESET}");
+            let touched = cortex::ingest_people::ingest_people(pool).await?;
+            let counts = cortex::ingest_people::people_counts(pool).await?;
+            println!("  upsert attempts:     {touched}");
+            println!("  canonical people:    {}", counts.canonical_people);
+            println!("  per-corpus aliases:  {}", counts.aliases);
+            println!("  people edges:        {}", counts.edges());
+            println!("    authored:          {}", counts.authored_edges);
+            println!("    alias_of:          {}", counts.alias_of_edges);
+            println!("{CYAN}\u{2713} Done{RESET}");
+        }
+        crate::CortexCommand::People { format } => {
+            let rows = cortex::ingest_people::people(pool).await?;
+            print_people(&rows, format.as_str());
+        }
         crate::CortexCommand::Callers {
             corpus,
             symbol,
@@ -214,6 +230,7 @@ pub async fn handle_cortex(pool: &PgPool, cmd: crate::CortexCommand) -> Result<(
 }
 
 fn print_features(rows: &[cortex::product::FeatureRow], format: &str) {
+fn print_people(rows: &[cortex::ingest_people::PersonSummary], format: &str) {
     match format {
         "json" => {
             println!(
@@ -224,6 +241,7 @@ fn print_features(rows: &[cortex::product::FeatureRow], format: &str) {
         "names" => {
             for row in rows {
                 println!("{}", row.feature);
+                println!("{}", row.name);
             }
         }
         _ => {
@@ -244,6 +262,21 @@ fn print_features(rows: &[cortex::product::FeatureRow], format: &str) {
                     truncate(&row.feature, 32),
                     truncate(&row.corpus, 11),
                     row.implements.as_deref().unwrap_or("-")
+                println!("no canonical person nodes in cortex (run `ff cortex ingest-people`?)");
+                return;
+            }
+            println!(
+                "{CYAN}\u{25b6} cortex people — {} canonical person(s):{RESET}",
+                rows.len()
+            );
+            println!("  {:<36} {:>7} {:>7}  path", "person", "files", "repos");
+            for row in rows {
+                println!(
+                    "  {:<36} {:>7} {:>7}  {}",
+                    truncate(&row.name, 36),
+                    row.file_count,
+                    row.repo_count,
+                    row.path
                 );
             }
         }

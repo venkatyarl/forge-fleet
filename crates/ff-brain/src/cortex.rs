@@ -98,6 +98,8 @@ pub mod ingest_biz;
 pub mod ingest_decisions;
 #[path = "cortex/ingest_fleet.rs"]
 pub mod ingest_fleet;
+#[path = "cortex/ingest_people.rs"]
+pub mod ingest_people;
 #[path = "cortex/ingest_pm.rs"]
 pub mod ingest_pm;
 #[path = "cortex/maps_to.rs"]
