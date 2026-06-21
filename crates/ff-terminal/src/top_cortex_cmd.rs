@@ -716,6 +716,18 @@ async fn print_corpora(pool: &PgPool, target: Option<String>, format: &str) -> R
 }
 
 pub async fn handle_top_cortex(args: TopCortexArgs) -> Result<()> {
+    if matches!(
+        &args.command,
+        TopCortexCommand::Callers { .. }
+            | TopCortexCommand::Callees { .. }
+            | TopCortexCommand::Find {
+                semantic: false,
+                ..
+            }
+    ) {
+        return crate::cortex_read_fallback::handle_top_command(args.command).await;
+    }
+
     let pool = ff_agent::fleet_info::get_fleet_pool()
         .await
         .map_err(|e| anyhow!("connect Postgres: {e}"))?;
@@ -1950,7 +1962,7 @@ fn git_changed_line_ranges(
 
 /// Derive the corpus slug for the current working directory (same rule as
 /// `ff cortex index` uses), so callers/callees/impact/status need no slug arg.
-fn cwd_slug() -> String {
+pub(crate) fn cwd_slug() -> String {
     let cwd = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
     slug_from_path(&cwd)
 }

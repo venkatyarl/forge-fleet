@@ -75,6 +75,14 @@ pub fn counts(file: &Path) -> Result<(usize, usize)> {
     Ok((nodes as usize, edges as usize))
 }
 
+pub async fn open_fallback(corpus: &str) -> Option<Connection> {
+    let path = cache_path(corpus);
+    if !path.exists() {
+        return None;
+    }
+    Connection::open(path).ok()
+}
+
 pub async fn export(pool: &PgPool, corpus: &str, out: Option<PathBuf>) -> Result<PathBuf> {
     let path = out.unwrap_or_else(|| cache_path(corpus));
     let nodes = sqlx::query_as::<_, PgNode>(

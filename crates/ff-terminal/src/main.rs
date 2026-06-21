@@ -47,6 +47,7 @@ mod config_cmd;
 mod conformance_cmd;
 mod corpus_cmd;
 mod cortex_cmd;
+mod cortex_read_fallback;
 mod council_cmd;
 mod daemon_cmd;
 mod db_cmd;
