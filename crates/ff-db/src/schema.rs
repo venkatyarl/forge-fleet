@@ -9067,3 +9067,56 @@ SELECT p.id, p.repo_url, COALESCE(p.default_branch, 'main'), TRUE, 'code'
  WHERE p.repo_url IS NOT NULL AND p.repo_url <> ''
 ON CONFLICT (project_id, github_url) DO NOTHING;
 "#;
+
+/// V142 — Cortex universal-graph FOUNDATION (P0). The graph (`brain_vault_nodes`
+/// + `brain_vault_edges`) is one domain-agnostic knowledge graph: code is one
+/// domain (`code:*`, `db:*`, `http:*`, …) alongside non-code (`doc:*`,
+/// `project:*`, `person:*`, `decision:*`, …). Two councils converged on this
+/// being the ONE thing to land + deploy fleet-wide BEFORE fanning out the
+/// per-dimension extractors, so the shared contract never churns under a
+/// parallel build. See plans/cortex-feature-knowledge-graph.md.
+///
+/// Additive only — every column/table is `IF NOT EXISTS`; nothing is dropped, so
+/// an older binary keeps working (forward-compatible reads). `brain_vault_edges`
+/// already had `confidence`/`provenance`; this adds the rest of the
+/// confidence-carrying schema plus the generation/atomic-swap reindex contract:
+///   - `method`   — EXTRACTED | INFERRED | HEURISTIC | DYNAMIC | MANUAL
+///   - `evidence` — {file, span, snippet_hash, model, prompt_hash} for audit
+///   - `generation` — the reindex pass that wrote the row (orphan-sweep + the
+///     "in-progress pass is invisible to readers" filter — MVCC alone can't do
+///     this across a multi-statement pass)
+///   - `cortex_generations` — per-corpus current_generation pointer + the
+///     single-writer advisory-lock bookkeeping (one indexer per corpus
+///     fleet-wide; commit = one tiny UPDATE that flips the pointer atomically).
+pub const SCHEMA_V142_CORTEX_FOUNDATION: &str = r#"
+-- Confidence-carrying edges (confidence + provenance already exist from earlier).
+ALTER TABLE brain_vault_edges ADD COLUMN IF NOT EXISTS method     TEXT;
+ALTER TABLE brain_vault_edges ADD COLUMN IF NOT EXISTS evidence   JSONB;
+ALTER TABLE brain_vault_edges ADD COLUMN IF NOT EXISTS generation BIGINT;
+
+-- Nodes get the same generation stamp + provenance (confidence already exists).
+ALTER TABLE brain_vault_nodes ADD COLUMN IF NOT EXISTS generation BIGINT;
+ALTER TABLE brain_vault_nodes ADD COLUMN IF NOT EXISTS provenance TEXT;
+
+-- Per-corpus reindex bookkeeping: the atomic-swap pointer + single-writer lock.
+-- A writer takes pg_try_advisory_lock(hashtext('cortex:'||project)), writes its
+-- rows stamped generation = current_generation+1, then flips current_generation
+-- in ONE update (the atomic publish). Readers always filter to current_generation
+-- so a half-written pass is never visible. A crashed writer never flips the
+-- pointer, so its rows are simply swept later — no torn state.
+CREATE TABLE IF NOT EXISTS cortex_generations (
+    project            TEXT PRIMARY KEY,
+    current_generation BIGINT      NOT NULL DEFAULT 0,
+    indexing_node      TEXT,                              -- who currently holds the writer lock
+    indexing_started   TIMESTAMPTZ,                       -- when (stale-lock detection)
+    last_swapped        TIMESTAMPTZ,
+    updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Read-path indexes (council perf rec): impact/lineage queries filter by
+-- (project, node_type) and walk edges by (edge_type, src); generation gates reads.
+CREATE INDEX IF NOT EXISTS idx_bvn_project_type   ON brain_vault_nodes (project, node_type);
+CREATE INDEX IF NOT EXISTS idx_bve_type_src       ON brain_vault_edges (edge_type, src_id);
+CREATE INDEX IF NOT EXISTS idx_bvn_generation     ON brain_vault_nodes (project, generation);
+CREATE INDEX IF NOT EXISTS idx_bve_generation     ON brain_vault_edges (generation);
+"#;

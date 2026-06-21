@@ -76,6 +76,11 @@ use std::path::{Path, PathBuf};
 use tree_sitter::{Node, Parser};
 use uuid::Uuid;
 
+#[path = "cortex/extractors/code_symbols.rs"]
+pub mod code_symbols;
+#[path = "cortex/spi.rs"]
+pub mod spi;
+
 /// Summary of a Cortex indexing run.
 #[derive(Debug, Default, Clone)]
 pub struct CortexStats {
@@ -222,10 +227,21 @@ fn lang_patterns(lang: &str) -> Result<Vec<String>> {
 /// language (back-to-back `index` calls would clobber each other's nodes).
 pub async fn index(pool: &PgPool, corpus_slug: &str, lang: &str) -> Result<CortexStats> {
     lang_patterns(lang)?; // validate before wiping
-    wipe_code_nodes(pool, corpus_slug).await?;
-    clear_file_index(pool, corpus_slug).await?; // reset the incremental ledger
-    clear_reexports(pool, corpus_slug).await?; // reset the facade ledger
-    index_one(pool, corpus_slug, lang).await
+    let Some(lock) = try_begin_cortex_generation(pool, corpus_slug).await? else {
+        tracing::info!("another node is indexing {corpus_slug}, skipping");
+        return Ok(CortexStats::default());
+    };
+    let generation = lock.generation;
+    let result = async {
+        wipe_code_nodes(pool, corpus_slug).await?;
+        clear_file_index(pool, corpus_slug).await?; // reset the incremental ledger
+        clear_reexports(pool, corpus_slug).await?; // reset the facade ledger
+        let stats = index_one_generation(pool, corpus_slug, lang, generation).await?;
+        run_pluggable_extractors(pool, corpus_slug, generation).await?;
+        Ok(stats)
+    }
+    .await;
+    finish_cortex_generation(pool, corpus_slug, lock, result).await
 }
 
 /// Index several languages into one corpus: wipe once, then extract each.
@@ -238,18 +254,28 @@ pub async fn index_langs(
     for l in langs {
         lang_patterns(l)?;
     }
-    wipe_code_nodes(pool, corpus_slug).await?;
-    // A full reindex re-stamps every file's hash from scratch — drop the prior
-    // ledger so removed files don't linger as "already indexed" rows. index_one
-    // records each file's current hash as it extracts.
-    clear_file_index(pool, corpus_slug).await?;
-    clear_reexports(pool, corpus_slug).await?;
-    let mut out = Vec::with_capacity(langs.len());
-    for l in langs {
-        let stats = index_one(pool, corpus_slug, l).await?;
-        out.push((l.clone(), stats));
+    let Some(lock) = try_begin_cortex_generation(pool, corpus_slug).await? else {
+        tracing::info!("another node is indexing {corpus_slug}, skipping");
+        return Ok(Vec::new());
+    };
+    let generation = lock.generation;
+    let result = async {
+        wipe_code_nodes(pool, corpus_slug).await?;
+        // A full reindex re-stamps every file's hash from scratch — drop the prior
+        // ledger so removed files don't linger as "already indexed" rows. index_one
+        // records each file's current hash as it extracts.
+        clear_file_index(pool, corpus_slug).await?;
+        clear_reexports(pool, corpus_slug).await?;
+        let mut out = Vec::with_capacity(langs.len());
+        for l in langs {
+            let stats = index_one_generation(pool, corpus_slug, l, generation).await?;
+            out.push((l.clone(), stats));
+        }
+        run_pluggable_extractors(pool, corpus_slug, generation).await?;
+        Ok(out)
     }
-    Ok(out)
+    .await;
+    finish_cortex_generation(pool, corpus_slug, lock, result).await
 }
 
 /// Summary of an incremental reindex: which files were touched + per-language
@@ -326,160 +352,171 @@ pub async fn index_langs_incremental(
     for l in langs {
         lang_patterns(l)?;
     }
-    let corpus_id: Uuid = sqlx::query_scalar("SELECT id FROM brain_corpora WHERE slug = $1")
-        .bind(corpus_slug)
-        .fetch_optional(pool)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("no corpus with slug '{corpus_slug}'"))?;
-
-    // What Cortex last indexed: file_path -> indexed_hash.
-    let tracked: HashMap<String, String> =
-        sqlx::query("SELECT file_path, indexed_hash FROM cortex_file_index WHERE corpus_slug = $1")
+    let Some(lock) = try_begin_cortex_generation(pool, corpus_slug).await? else {
+        tracing::info!("another node is indexing {corpus_slug}, skipping");
+        return Ok(IncrementalReport::default());
+    };
+    let generation = lock.generation;
+    let result = async {
+        let corpus_id: Uuid = sqlx::query_scalar("SELECT id FROM brain_corpora WHERE slug = $1")
             .bind(corpus_slug)
-            .fetch_all(pool)
+            .fetch_optional(pool)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("no corpus with slug '{corpus_slug}'"))?;
+
+        // What Cortex last indexed: file_path -> indexed_hash.
+        let tracked: HashMap<String, String> = sqlx::query(
+            "SELECT file_path, indexed_hash FROM cortex_file_index WHERE corpus_slug = $1",
+        )
+        .bind(corpus_slug)
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .map(|r| {
+            (
+                r.get::<String, _>("file_path"),
+                r.get::<String, _>("indexed_hash"),
+            )
+        })
+        .collect();
+
+        // Current files (per language, with the scan's fresh content_hash).
+        let mut current: Vec<(String, FileRow)> = Vec::new();
+        for l in langs {
+            for fr in fetch_file_rows(pool, corpus_slug, l).await? {
+                current.push((l.clone(), fr));
+            }
+        }
+        // Deletion signal is the FILESYSTEM, not the content:file node: the corpus
+        // scan leaves a stale node (valid_until NULL, old hash) for an in-root file
+        // that was removed, so it would otherwise read as "unchanged" and its
+        // symbols would never be GC'd. Drop current rows whose file is gone on disk;
+        // they then fall into the `deleted` bucket below (tracked − live).
+        current.retain(|(_, fr)| Path::new(&fr.path).exists());
+        // Partition into changed/new vs unchanged vs deleted (pure; unit-tested).
+        let (changed, unchanged_count, deleted) = partition_changes(&tracked, &current);
+        let mut report = IncrementalReport {
+            files_unchanged: unchanged_count,
+            ..IncrementalReport::default()
+        };
+
+        // Drop symbols of removed files first (so their fns leave internal_fns). Gather
+        // every deleted file's symbols, then remove them in one pass (below) so a call
+        // BETWEEN two deleted files is treated as removed at both ends rather than
+        // spuriously demoting one to an extern.
+        let mut deleted_syms: Vec<Uuid> = Vec::new();
+        for path in &deleted {
+            if let Some(fid) = lookup_file_node(pool, corpus_slug, path).await? {
+                deleted_syms.extend(file_symbol_ids(pool, &[fid]).await?);
+                // The file node's own outgoing import edges go with the file.
+                sqlx::query(
+                    "DELETE FROM brain_vault_edges WHERE src_id = $1 AND edge_type = 'imports'",
+                )
+                .bind(fid)
+                .execute(pool)
+                .await?;
+            }
+            sqlx::query("DELETE FROM cortex_file_index WHERE corpus_slug = $1 AND file_path = $2")
+                .bind(corpus_slug)
+                .bind(path)
+                .execute(pool)
+                .await?;
+            sqlx::query("DELETE FROM cortex_reexports WHERE corpus_slug = $1 AND file_path = $2")
+                .bind(corpus_slug)
+                .bind(path)
+                .execute(pool)
+                .await?;
+            report.files_deleted += 1;
+        }
+        // Demote-or-delete: a deleted file's symbol still called by a SURVIVING file
+        // must become a `code:extern` placeholder, not vanish — a full reindex would
+        // re-create exactly that placeholder for the caller's now-unresolved call.
+        remove_code_symbols(pool, &deleted_syms).await?;
+
+        report.files_changed = changed.len();
+        if changed.is_empty() {
+            // No re-extraction, but deletions can orphan a removed file's import/
+            // extern placeholders — sweep them. (A run that touched nothing at all
+            // can't have orphaned anything, so skip the query then.)
+            if report.files_deleted > 0 {
+                report.placeholders_gced = gc_orphan_placeholders(pool, corpus_slug).await?;
+            }
+            return Ok(report);
+        }
+
+        // Changed files: capture their OLD symbol ids, clear their OUTGOING edges
+        // (calls/contains/imports — extraction re-adds them) but KEEP the nodes so
+        // incoming `calls` edges from unchanged callers survive the stable-uuid
+        // upsert. GC removed symbols after re-extraction (below).
+        let changed_file_ids: Vec<Uuid> = changed.iter().map(|(_, fr)| fr.id).collect();
+        let pre_symbol_ids = file_symbol_ids(pool, &changed_file_ids).await?;
+        let changed_old_fns = fn_titles_for_ids(pool, &pre_symbol_ids).await?;
+        let mut outgoing_src = pre_symbol_ids.clone();
+        outgoing_src.extend_from_slice(&changed_file_ids);
+        delete_outgoing_edges(pool, &outgoing_src).await?;
+
+        // internal_fns covers the WHOLE corpus so a changed file's call into an
+        // unchanged file resolves. Start from every corpus function, drop the
+        // changed files' OLD functions (some may have been removed/renamed), then
+        // extract_files re-adds the changed files' CURRENT functions in pass 1.
+        let mut internal_fns = load_internal_fns(pool, corpus_slug).await?;
+        for f in &changed_old_fns {
+            internal_fns.remove(f);
+        }
+        // internal_types gates the inherent-impl method redirect. It only needs to be
+        // permissive-but-correct: a stale type entry merely lets a redirect fire whose
+        // target must STILL be a real internal fn, so we load the whole corpus and let
+        // pass 1 re-add changed files' current types — no need to prune old ones.
+        let mut internal_types = load_internal_types(pool, corpus_slug).await?;
+
+        // Re-extract changed files, grouped by language.
+        for l in langs {
+            let rows: Vec<FileRow> = changed
+                .iter()
+                .filter(|(lang, _)| lang == l)
+                .map(|(_, fr)| fr.clone())
+                .collect();
+            if rows.is_empty() {
+                continue;
+            }
+            let stats = extract_files(
+                pool,
+                corpus_id,
+                corpus_slug,
+                l,
+                &rows,
+                &mut internal_fns,
+                &mut internal_types,
+                generation,
+            )
+            .await?;
+            report.per_lang.push((l.clone(), stats));
+        }
+
+        // GC: symbols that belonged to a changed file before but were not re-created
+        // by extraction (renamed/removed). Their nodes were kept above; delete them
+        // now (incoming edges cascade — the symbol is genuinely gone).
+        let post_set: HashSet<Uuid> = file_symbol_ids(pool, &changed_file_ids)
             .await?
             .into_iter()
-            .map(|r| {
-                (
-                    r.get::<String, _>("file_path"),
-                    r.get::<String, _>("indexed_hash"),
-                )
-            })
             .collect();
-
-    // Current files (per language, with the scan's fresh content_hash).
-    let mut current: Vec<(String, FileRow)> = Vec::new();
-    for l in langs {
-        for fr in fetch_file_rows(pool, corpus_slug, l).await? {
-            current.push((l.clone(), fr));
-        }
-    }
-    // Deletion signal is the FILESYSTEM, not the content:file node: the corpus
-    // scan leaves a stale node (valid_until NULL, old hash) for an in-root file
-    // that was removed, so it would otherwise read as "unchanged" and its
-    // symbols would never be GC'd. Drop current rows whose file is gone on disk;
-    // they then fall into the `deleted` bucket below (tracked − live).
-    current.retain(|(_, fr)| Path::new(&fr.path).exists());
-    // Partition into changed/new vs unchanged vs deleted (pure; unit-tested).
-    let (changed, unchanged_count, deleted) = partition_changes(&tracked, &current);
-    let mut report = IncrementalReport {
-        files_unchanged: unchanged_count,
-        ..IncrementalReport::default()
-    };
-
-    // Drop symbols of removed files first (so their fns leave internal_fns). Gather
-    // every deleted file's symbols, then remove them in one pass (below) so a call
-    // BETWEEN two deleted files is treated as removed at both ends rather than
-    // spuriously demoting one to an extern.
-    let mut deleted_syms: Vec<Uuid> = Vec::new();
-    for path in &deleted {
-        if let Some(fid) = lookup_file_node(pool, corpus_slug, path).await? {
-            deleted_syms.extend(file_symbol_ids(pool, &[fid]).await?);
-            // The file node's own outgoing import edges go with the file.
-            sqlx::query(
-                "DELETE FROM brain_vault_edges WHERE src_id = $1 AND edge_type = 'imports'",
-            )
-            .bind(fid)
-            .execute(pool)
-            .await?;
-        }
-        sqlx::query("DELETE FROM cortex_file_index WHERE corpus_slug = $1 AND file_path = $2")
-            .bind(corpus_slug)
-            .bind(path)
-            .execute(pool)
-            .await?;
-        sqlx::query("DELETE FROM cortex_reexports WHERE corpus_slug = $1 AND file_path = $2")
-            .bind(corpus_slug)
-            .bind(path)
-            .execute(pool)
-            .await?;
-        report.files_deleted += 1;
-    }
-    // Demote-or-delete: a deleted file's symbol still called by a SURVIVING file
-    // must become a `code:extern` placeholder, not vanish — a full reindex would
-    // re-create exactly that placeholder for the caller's now-unresolved call.
-    remove_code_symbols(pool, &deleted_syms).await?;
-
-    report.files_changed = changed.len();
-    if changed.is_empty() {
-        // No re-extraction, but deletions can orphan a removed file's import/
-        // extern placeholders — sweep them. (A run that touched nothing at all
-        // can't have orphaned anything, so skip the query then.)
-        if report.files_deleted > 0 {
-            report.placeholders_gced = gc_orphan_placeholders(pool, corpus_slug).await?;
-        }
-        return Ok(report);
-    }
-
-    // Changed files: capture their OLD symbol ids, clear their OUTGOING edges
-    // (calls/contains/imports — extraction re-adds them) but KEEP the nodes so
-    // incoming `calls` edges from unchanged callers survive the stable-uuid
-    // upsert. GC removed symbols after re-extraction (below).
-    let changed_file_ids: Vec<Uuid> = changed.iter().map(|(_, fr)| fr.id).collect();
-    let pre_symbol_ids = file_symbol_ids(pool, &changed_file_ids).await?;
-    let changed_old_fns = fn_titles_for_ids(pool, &pre_symbol_ids).await?;
-    let mut outgoing_src = pre_symbol_ids.clone();
-    outgoing_src.extend_from_slice(&changed_file_ids);
-    delete_outgoing_edges(pool, &outgoing_src).await?;
-
-    // internal_fns covers the WHOLE corpus so a changed file's call into an
-    // unchanged file resolves. Start from every corpus function, drop the
-    // changed files' OLD functions (some may have been removed/renamed), then
-    // extract_files re-adds the changed files' CURRENT functions in pass 1.
-    let mut internal_fns = load_internal_fns(pool, corpus_slug).await?;
-    for f in &changed_old_fns {
-        internal_fns.remove(f);
-    }
-    // internal_types gates the inherent-impl method redirect. It only needs to be
-    // permissive-but-correct: a stale type entry merely lets a redirect fire whose
-    // target must STILL be a real internal fn, so we load the whole corpus and let
-    // pass 1 re-add changed files' current types — no need to prune old ones.
-    let mut internal_types = load_internal_types(pool, corpus_slug).await?;
-
-    // Re-extract changed files, grouped by language.
-    for l in langs {
-        let rows: Vec<FileRow> = changed
-            .iter()
-            .filter(|(lang, _)| lang == l)
-            .map(|(_, fr)| fr.clone())
+        let removed: Vec<Uuid> = pre_symbol_ids
+            .into_iter()
+            .filter(|id| !post_set.contains(id))
             .collect();
-        if rows.is_empty() {
-            continue;
-        }
-        let stats = extract_files(
-            pool,
-            corpus_id,
-            corpus_slug,
-            l,
-            &rows,
-            &mut internal_fns,
-            &mut internal_types,
-        )
-        .await?;
-        report.per_lang.push((l.clone(), stats));
+        // A removed symbol still called by an UNCHANGED file must demote to an extern,
+        // not vanish (see remove_code_symbols) — else hard-deleting it cascade-drops
+        // the unchanged caller's `calls` edge and the call silently disappears.
+        remove_code_symbols(pool, &removed).await?;
+
+        // Re-extraction may have dropped the last `imports`/`calls` edge into an
+        // extern/import placeholder (a removed import, a renamed/deleted callee).
+        // GC those zero-in-degree placeholders so incremental matches a full reindex.
+        report.placeholders_gced = gc_orphan_placeholders(pool, corpus_slug).await?;
+        Ok(report)
     }
-
-    // GC: symbols that belonged to a changed file before but were not re-created
-    // by extraction (renamed/removed). Their nodes were kept above; delete them
-    // now (incoming edges cascade — the symbol is genuinely gone).
-    let post_set: HashSet<Uuid> = file_symbol_ids(pool, &changed_file_ids)
-        .await?
-        .into_iter()
-        .collect();
-    let removed: Vec<Uuid> = pre_symbol_ids
-        .into_iter()
-        .filter(|id| !post_set.contains(id))
-        .collect();
-    // A removed symbol still called by an UNCHANGED file must demote to an extern,
-    // not vanish (see remove_code_symbols) — else hard-deleting it cascade-drops
-    // the unchanged caller's `calls` edge and the call silently disappears.
-    remove_code_symbols(pool, &removed).await?;
-
-    // Re-extraction may have dropped the last `imports`/`calls` edge into an
-    // extern/import placeholder (a removed import, a renamed/deleted callee).
-    // GC those zero-in-degree placeholders so incremental matches a full reindex.
-    report.placeholders_gced = gc_orphan_placeholders(pool, corpus_slug).await?;
-    Ok(report)
+    .await;
+    finish_cortex_generation(pool, corpus_slug, lock, result).await
 }
 
 /// Garbage-collect unreferenced placeholder nodes (`code:extern`/`code:import`)
@@ -518,6 +555,171 @@ async fn wipe_code_nodes(pool: &PgPool, corpus_slug: &str) -> Result<()> {
            WHERE project = $1 AND node_type LIKE 'code:%'",
     )
     .bind(corpus_slug)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Run every registered pluggable extractor (the universal-graph dimensions:
+/// db, events, config, security, …) for this corpus, persisting their Facts
+/// stamped with the in-progress `generation`. Code symbols are written by the
+/// in-tree per-language pass; this is the single plug point new dimensions append
+/// to via [`spi::registry`], so a fan-out PR is one new module + one registry line.
+async fn run_pluggable_extractors(
+    pool: &PgPool,
+    corpus_slug: &str,
+    generation: i64,
+) -> Result<()> {
+    let roots = corpus_root_paths(pool, corpus_slug).await?;
+    let ctx = spi::ExtractCtx {
+        pool,
+        corpus_slug,
+        roots,
+        generation,
+        incremental: false,
+    };
+    for extractor in spi::registry() {
+        if !extractor.applies(&ctx) {
+            continue;
+        }
+        let facts = extractor.extract(&ctx).await?;
+        if !facts.is_empty() {
+            spi::write_facts(pool, corpus_slug, generation, &facts).await?;
+        }
+    }
+    Ok(())
+}
+
+/// On-disk source roots for a corpus (its `brain_sources.root_path` rows) — what
+/// non-code extractors walk for `.sql`/config/etc. files.
+async fn corpus_root_paths(pool: &PgPool, corpus_slug: &str) -> Result<Vec<std::path::PathBuf>> {
+    let rows: Vec<String> = sqlx::query_scalar(
+        r#"SELECT bs.root_path
+             FROM brain_sources bs
+             JOIN brain_corpora bc ON bc.id = bs.corpus_id
+            WHERE bc.slug = $1"#,
+    )
+    .bind(corpus_slug)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(std::path::PathBuf::from).collect())
+}
+
+struct CortexGenerationLock {
+    generation: i64,
+}
+
+async fn try_begin_cortex_generation(
+    pool: &PgPool,
+    corpus_slug: &str,
+) -> Result<Option<CortexGenerationLock>> {
+    let lock_key = format!("cortex:{corpus_slug}");
+    let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtext($1))")
+        .bind(&lock_key)
+        .fetch_one(pool)
+        .await?;
+    if !acquired {
+        return Ok(None);
+    }
+
+    let node = std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string());
+    let generation: i64 = sqlx::query_scalar(
+        r#"INSERT INTO cortex_generations
+               (project, current_generation, indexing_node, indexing_started, updated_at)
+           VALUES ($1, 0, $2, NOW(), NOW())
+           ON CONFLICT (project) DO UPDATE
+             SET indexing_node = EXCLUDED.indexing_node,
+                 indexing_started = EXCLUDED.indexing_started,
+                 updated_at = NOW()
+           RETURNING current_generation + 1"#,
+    )
+    .bind(corpus_slug)
+    .bind(node)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(Some(CortexGenerationLock { generation }))
+}
+
+async fn finish_cortex_generation<T>(
+    pool: &PgPool,
+    corpus_slug: &str,
+    lock: CortexGenerationLock,
+    result: Result<T>,
+) -> Result<T> {
+    let lock_key = format!("cortex:{corpus_slug}");
+    match result {
+        Ok(value) => {
+            sqlx::query(
+                r#"UPDATE cortex_generations
+                      SET current_generation = $2,
+                          last_swapped = NOW(),
+                          indexing_node = NULL,
+                          updated_at = NOW()
+                    WHERE project = $1"#,
+            )
+            .bind(corpus_slug)
+            .bind(lock.generation)
+            .execute(pool)
+            .await?;
+            let _: bool = sqlx::query_scalar("SELECT pg_advisory_unlock(hashtext($1))")
+                .bind(&lock_key)
+                .fetch_one(pool)
+                .await?;
+            Ok(value)
+        }
+        Err(err) => {
+            let _ = sqlx::query(
+                r#"UPDATE cortex_generations
+                      SET indexing_node = NULL,
+                          updated_at = NOW()
+                    WHERE project = $1"#,
+            )
+            .bind(corpus_slug)
+            .execute(pool)
+            .await;
+            let _ = sqlx::query_scalar::<_, bool>("SELECT pg_advisory_unlock(hashtext($1))")
+                .bind(&lock_key)
+                .fetch_one(pool)
+                .await;
+            Err(err)
+        }
+    }
+}
+
+async fn current_generation(pool: &PgPool, corpus_slug: &str) -> Result<i64> {
+    Ok(
+        sqlx::query_scalar("SELECT current_generation FROM cortex_generations WHERE project = $1")
+            .bind(corpus_slug)
+            .fetch_optional(pool)
+            .await?
+            .unwrap_or(0),
+    )
+}
+
+#[allow(dead_code)]
+async fn sweep_old_generations(pool: &PgPool, corpus_slug: &str) -> Result<()> {
+    let generation = current_generation(pool, corpus_slug).await?;
+    sqlx::query(
+        r#"DELETE FROM brain_vault_edges e
+            USING brain_vault_nodes s
+           WHERE e.src_id = s.id
+             AND s.project = $1
+             AND e.generation IS NOT NULL
+             AND e.generation < $2"#,
+    )
+    .bind(corpus_slug)
+    .bind(generation - 1)
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        r#"DELETE FROM brain_vault_nodes
+            WHERE project = $1
+              AND generation IS NOT NULL
+              AND generation < $2"#,
+    )
+    .bind(corpus_slug)
+    .bind(generation - 1)
     .execute(pool)
     .await?;
     Ok(())
@@ -860,7 +1062,12 @@ async fn fetch_file_rows(pool: &PgPool, corpus_slug: &str, lang: &str) -> Result
 }
 
 /// Extract one language's symbols/edges for a corpus (no wipe — see callers).
-async fn index_one(pool: &PgPool, corpus_slug: &str, lang: &str) -> Result<CortexStats> {
+async fn index_one_generation(
+    pool: &PgPool,
+    corpus_slug: &str,
+    lang: &str,
+    generation: i64,
+) -> Result<CortexStats> {
     // Resolve corpus id.
     let corpus_id: Uuid = sqlx::query_scalar("SELECT id FROM brain_corpora WHERE slug = $1")
         .bind(corpus_slug)
@@ -881,6 +1088,7 @@ async fn index_one(pool: &PgPool, corpus_slug: &str, lang: &str) -> Result<Corte
         &file_rows,
         &mut internal_fns,
         &mut internal_types,
+        generation,
     )
     .await
 }
@@ -898,6 +1106,7 @@ async fn extract_files(
     file_rows: &[FileRow],
     internal_fns: &mut HashSet<String>,
     internal_types: &mut HashSet<String>,
+    generation: i64,
 ) -> Result<CortexStats> {
     let mut stats = CortexStats::default();
 
@@ -960,6 +1169,9 @@ async fn extract_files(
                 corpus_slug,
                 Some(start_line),
                 Some(end_line.max(start_line)),
+                generation,
+                1.0,
+                "ast",
             )
             .await?;
             sym_ids.insert(sym.qualified_name.clone(), id);
@@ -979,7 +1191,7 @@ async fn extract_files(
                 Some(parent_id) => *parent_id,
                 None => file_node_id,
             };
-            if add_edge(pool, src, id, "contains").await? {
+            if add_edge(pool, src, id, "contains", generation).await? {
                 stats.contains += 1;
             }
 
@@ -999,9 +1211,12 @@ async fn extract_files(
                 corpus_slug,
                 None,
                 None,
+                generation,
+                1.0,
+                "ast",
             )
             .await?;
-            if add_edge(pool, file_node_id, imp_id, "imports").await? {
+            if add_edge(pool, file_node_id, imp_id, "imports", generation).await? {
                 stats.imports += 1;
             }
         }
@@ -1304,6 +1519,7 @@ async fn extract_files(
                 None => {
                     // External / unresolved: a code:extern placeholder on the same
                     // code:// path, so callers_of still traverses to it.
+                    let confidence = call_confidence(extracted_internal, false);
                     let id = upsert_code_node(
                         pool,
                         &callee_path,
@@ -1312,12 +1528,15 @@ async fn extract_files(
                         corpus_slug,
                         None,
                         None,
+                        generation,
+                        confidence,
+                        "ast",
                     )
                     .await?;
-                    (id, call_confidence(extracted_internal, false))
+                    (id, confidence)
                 }
             };
-            add_call_edge(pool, caller_id, callee_id, confidence).await?;
+            add_call_edge(pool, caller_id, callee_id, confidence, generation).await?;
         }
         let _ = &p.file_path; // (kept for future per-file diagnostics)
     }
@@ -1363,6 +1582,12 @@ async fn resolve_symbol(pool: &PgPool, corpus_slug: &str, sel: &str) -> Result<V
         r#"SELECT id, title, node_type FROM brain_vault_nodes
             WHERE project = $1 AND node_type LIKE 'code:%'
               AND (path = $2 OR title = $3 OR title LIKE $4)
+              AND COALESCE(generation, 0) IN (
+                  0,
+                  COALESCE((SELECT current_generation
+                              FROM cortex_generations
+                             WHERE project = brain_vault_nodes.project), 0)
+              )
             ORDER BY title COLLATE "C""#,
     )
     .bind(corpus_slug)
@@ -1414,6 +1639,12 @@ async fn callers_of_ids(
              JOIN brain_vault_nodes n ON n.id = e.src_id
             WHERE e.edge_type = 'calls' AND e.dst_id = ANY($1)
               AND e.confidence >= $2
+              AND COALESCE(e.generation, 0) IN (
+                  0,
+                  COALESCE((SELECT current_generation
+                              FROM cortex_generations
+                             WHERE project = n.project), 0)
+              )
             ORDER BY n.title"#,
     )
     .bind(ids)
@@ -1474,6 +1705,12 @@ pub async fn callees(
              JOIN brain_vault_nodes n ON n.id = e.dst_id
             WHERE e.edge_type = 'calls' AND e.src_id = ANY($1)
               AND e.confidence >= $2
+              AND COALESCE(e.generation, 0) IN (
+                  0,
+                  COALESCE((SELECT current_generation
+                              FROM cortex_generations
+                             WHERE project = n.project), 0)
+              )
             ORDER BY n.title"#,
     )
     .bind(&ids)
@@ -1831,6 +2068,12 @@ pub async fn tests_for(
                  JOIN brain_vault_nodes n ON n.id = e.src_id
                 WHERE e.edge_type = 'calls' AND e.dst_id = ANY($1)
                   AND e.confidence >= $2
+                  AND COALESCE(e.generation, 0) IN (
+                      0,
+                      COALESCE((SELECT current_generation
+                                  FROM cortex_generations
+                                 WHERE project = n.project), 0)
+                  )
                   AND n.node_type = 'code:function'"#,
         )
         .bind(&frontier)
@@ -1985,6 +2228,12 @@ pub async fn find_symbols(
               AND n.node_type LIKE 'code:%'
               AND n.title ILIKE $2 ESCAPE '\'
               AND ($4::text[] IS NULL OR n.node_type = ANY($4))
+              AND COALESCE(n.generation, 0) IN (
+                  0,
+                  COALESCE((SELECT current_generation
+                              FROM cortex_generations
+                             WHERE project = n.project), 0)
+              )
             ORDER BY fan_in DESC, n.title COLLATE "C"
             LIMIT $3"#,
     )
@@ -3065,6 +3314,9 @@ async fn upsert_code_node(
     project: &str,
     start_line: Option<i32>,
     end_line: Option<i32>,
+    generation: i64,
+    confidence: f32,
+    provenance: &str,
 ) -> Result<Uuid> {
     // content_hash is NOT NULL; use the path (synthetic + unique) as a stable hash.
     // start_line/end_line are 1-based source spans (V124) — set for real symbol
@@ -3073,12 +3325,16 @@ async fn upsert_code_node(
     // KEEPS the stable node and re-upserts it) tracks the symbol as it moves.
     let id: Uuid = sqlx::query_scalar(
         r#"INSERT INTO brain_vault_nodes
-               (path, title, node_type, project, content_hash, start_line, end_line)
-           VALUES ($1, $2, $3, $4, $5, $6, $7)
+               (path, title, node_type, project, content_hash, start_line, end_line,
+                generation, confidence, provenance)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
            ON CONFLICT (path) DO UPDATE
              SET title = EXCLUDED.title, node_type = EXCLUDED.node_type,
                  project = EXCLUDED.project, valid_until = NULL, updated_at = NOW(),
-                 start_line = EXCLUDED.start_line, end_line = EXCLUDED.end_line
+                 start_line = EXCLUDED.start_line, end_line = EXCLUDED.end_line,
+                 generation = EXCLUDED.generation,
+                 confidence = GREATEST(brain_vault_nodes.confidence, EXCLUDED.confidence),
+                 provenance = EXCLUDED.provenance
            RETURNING id"#,
     )
     .bind(path)
@@ -3088,6 +3344,9 @@ async fn upsert_code_node(
     .bind(path)
     .bind(start_line)
     .bind(end_line)
+    .bind(generation)
+    .bind(confidence)
+    .bind(provenance)
     .fetch_one(pool)
     .await?;
     Ok(id)
@@ -3103,23 +3362,66 @@ async fn lookup_code_node(pool: &PgPool, path: &str) -> Result<Option<Uuid>> {
 }
 
 /// Returns true if a new edge row was inserted (false if it already existed).
-async fn add_edge(pool: &PgPool, src: Uuid, dst: Uuid, edge_type: &str) -> Result<bool> {
+async fn add_edge(
+    pool: &PgPool,
+    src: Uuid,
+    dst: Uuid,
+    edge_type: &str,
+    generation: i64,
+) -> Result<bool> {
+    add_edge_with_metadata(
+        pool,
+        src,
+        dst,
+        edge_type,
+        1.0,
+        "ast",
+        Some("EXTRACTED"),
+        None,
+        generation,
+    )
+    .await
+}
+
+async fn add_edge_with_metadata(
+    pool: &PgPool,
+    src: Uuid,
+    dst: Uuid,
+    edge_type: &str,
+    confidence: f32,
+    provenance: &str,
+    method: Option<&str>,
+    evidence: Option<&serde_json::Value>,
+    generation: i64,
+) -> Result<bool> {
     if src == dst && edge_type == "calls" {
         // skip trivial self-loops produced by recursion noise? keep recursion
         // edges — they are real. Only the parse-error false-self case is avoided
         // upstream via ERROR-node descent, so allow self here.
     }
-    let r = sqlx::query(
-        r#"INSERT INTO brain_vault_edges (src_id, dst_id, edge_type, provenance)
-           VALUES ($1, $2, $3, 'cortex')
-           ON CONFLICT (src_id, dst_id, edge_type) DO NOTHING"#,
+    let inserted: bool = sqlx::query_scalar(
+        r#"INSERT INTO brain_vault_edges
+               (src_id, dst_id, edge_type, provenance, confidence, method, evidence, generation)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+           ON CONFLICT (src_id, dst_id, edge_type) DO UPDATE
+             SET confidence = GREATEST(brain_vault_edges.confidence, EXCLUDED.confidence),
+                 provenance = EXCLUDED.provenance,
+                 method = COALESCE(EXCLUDED.method, brain_vault_edges.method),
+                 evidence = COALESCE(EXCLUDED.evidence, brain_vault_edges.evidence),
+                 generation = EXCLUDED.generation
+           RETURNING (xmax = 0) AS inserted"#,
     )
     .bind(src)
     .bind(dst)
     .bind(edge_type)
-    .execute(pool)
+    .bind(provenance)
+    .bind(confidence)
+    .bind(method)
+    .bind(evidence)
+    .bind(generation)
+    .fetch_one(pool)
     .await?;
-    Ok(r.rows_affected() > 0)
+    Ok(inserted)
 }
 
 /// Write a `calls` edge with a resolution-confidence tier (roadmap #5 — provenance
@@ -3139,16 +3441,39 @@ async fn add_edge(pool: &PgPool, src: Uuid, dst: Uuid, edge_type: &str) -> Resul
 /// dst node_type already separates internal vs extern; `confidence` adds the
 /// EXTRACTED-vs-INFERRED split *within* the internal tier that downstream
 /// consumers can filter on.
-async fn add_call_edge(pool: &PgPool, src: Uuid, dst: Uuid, confidence: f32) -> Result<()> {
+async fn add_call_edge(
+    pool: &PgPool,
+    src: Uuid,
+    dst: Uuid,
+    confidence: f32,
+    generation: i64,
+) -> Result<()> {
+    let method = if confidence >= 1.0 {
+        "EXTRACTED"
+    } else if confidence >= 0.6 {
+        "INFERRED"
+    } else {
+        "HEURISTIC"
+    };
     sqlx::query(
-        r#"INSERT INTO brain_vault_edges (src_id, dst_id, edge_type, provenance, confidence)
-           VALUES ($1, $2, 'calls', 'cortex', $3)
+        r#"INSERT INTO brain_vault_edges
+               (src_id, dst_id, edge_type, provenance, confidence, method, generation)
+           VALUES ($1, $2, 'calls', 'cortex', $3, $4, $5)
            ON CONFLICT (src_id, dst_id, edge_type)
-           DO UPDATE SET confidence = GREATEST(brain_vault_edges.confidence, EXCLUDED.confidence)"#,
+           DO UPDATE SET confidence = GREATEST(brain_vault_edges.confidence, EXCLUDED.confidence),
+                         provenance = EXCLUDED.provenance,
+                         method = CASE
+                             WHEN EXCLUDED.confidence >= brain_vault_edges.confidence
+                             THEN EXCLUDED.method
+                             ELSE brain_vault_edges.method
+                         END,
+                         generation = EXCLUDED.generation"#,
     )
     .bind(src)
     .bind(dst)
     .bind(confidence)
+    .bind(method)
+    .bind(generation)
     .execute(pool)
     .await?;
     Ok(())
