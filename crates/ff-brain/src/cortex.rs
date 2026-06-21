@@ -82,6 +82,8 @@ pub mod code_symbols;
 pub mod config;
 #[path = "cortex/extractors/db_schema.rs"]
 pub mod db_schema;
+#[path = "cortex/extractors/deps.rs"]
+pub mod deps;
 #[path = "cortex/extractors/events.rs"]
 pub mod events;
 #[path = "cortex/spi.rs"]
