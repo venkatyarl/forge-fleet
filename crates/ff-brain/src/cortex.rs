@@ -78,6 +78,8 @@ use uuid::Uuid;
 
 #[path = "cortex/extractors/api.rs"]
 pub mod api;
+#[path = "cortex/audit.rs"]
+pub mod audit;
 #[path = "cortex/extractors/code_symbols.rs"]
 pub mod code_symbols;
 #[path = "cortex/extractors/config.rs"]

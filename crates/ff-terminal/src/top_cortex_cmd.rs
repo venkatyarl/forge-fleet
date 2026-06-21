@@ -333,6 +333,15 @@ pub enum TopCortexCommand {
         #[arg(long, value_enum, default_value = "table")]
         format: crate::CortexFormat,
     },
+    /// Run canned cross-domain Cortex graph audit rules.
+    Audit {
+        #[arg(long)]
+        corpus: Option<String>,
+        #[arg(long)]
+        emit_work_items: bool,
+        #[arg(long, value_enum, default_value = "table")]
+        format: crate::CortexFormat,
+    },
     /// Recall/health diagnostic for the code graph: what fraction of `calls`
     /// edges resolve to a real internal symbol vs an unresolved extern, plus a
     /// ranked list of suspicious externs — `code:extern` placeholders whose leaf
@@ -1091,6 +1100,14 @@ pub async fn handle_top_cortex(args: TopCortexArgs) -> Result<()> {
                 },
             )
             .await?;
+        }
+        TopCortexCommand::Audit {
+            corpus,
+            emit_work_items,
+            format,
+        } => {
+            cortex::audit::handle_cli(&pool, corpus.as_deref(), emit_work_items, format.as_str())
+                .await?;
         }
         TopCortexCommand::Types(args) => {
             cortex::types::handle_cli(&pool, args, cwd_slug()).await?;
