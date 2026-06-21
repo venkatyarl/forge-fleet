@@ -8,6 +8,11 @@ use anyhow::{Context, Result, anyhow};
 use sqlx::PgPool;
 use tracing::{info, warn};
 
+const SMALL_CONTEXT_FILE_BYTES: usize = 12_000;
+const LARGE_CONTEXT_FILE_CHARS: usize = 16_000;
+const REGION_CONTEXT_LINES: usize = 25;
+const FALLBACK_LINES: usize = 60;
+
 #[derive(Debug, Clone)]
 pub struct CodegenOutcome {
     pub applied: bool,
@@ -143,23 +148,32 @@ fn build_prompt(
          >>>>>>> REPLACE\n\n\
          Rules:\n\
          - The SEARCH text must match the current file content EXACTLY, including whitespace.\n\
+         - For large files, you are shown only RELEVANT REGIONS with line numbers; SEARCH blocks must match lines shown in those regions EXACTLY.\n\
          - To create a NEW file, leave the SEARCH section empty.\n\
          - To append, SEARCH a unique existing snippet and include it in REPLACE plus the new code.\n\
          - Paths must be relative to the repo root."
     );
 
+    let identifiers = task_identifiers(task);
     for path in task_context_paths(repo_path, task)? {
         let abs = repo_path.join(&path);
-        let mut content =
+        let content =
             fs::read_to_string(&abs).with_context(|| format!("read {}", abs.display()))?;
-        if content.len() > 12_000 {
-            content.truncate(12_000);
-            content.push_str("\n... [truncated at 12000 chars]\n");
+
+        if content.len() <= SMALL_CONTEXT_FILE_BYTES {
+            prompt.push_str("\n\nCurrent content of ");
+            prompt.push_str(&path.to_string_lossy());
+            prompt.push_str(":\n");
+            prompt.push_str(&content);
+        } else {
+            prompt.push_str("\n\nRelevant regions of ");
+            prompt.push_str(&path.to_string_lossy());
+            prompt.push_str(" (large file; not full content):\n");
+            prompt.push_str(&regions_with_path_headers(
+                &path.to_string_lossy(),
+                &extract_relevant_regions(&content, &identifiers),
+            ));
         }
-        prompt.push_str("\n\nCurrent content of ");
-        prompt.push_str(&path.to_string_lossy());
-        prompt.push_str(":\n");
-        prompt.push_str(&content);
     }
 
     if let Some(edits) = previous_edits {
@@ -172,6 +186,240 @@ fn build_prompt(
     }
 
     Ok(prompt)
+}
+
+fn task_identifiers(task: &str) -> Vec<String> {
+    let stoplist: HashSet<&'static str> = [
+        "the",
+        "and",
+        "for",
+        "you",
+        "are",
+        "but",
+        "not",
+        "with",
+        "this",
+        "that",
+        "from",
+        "into",
+        "file",
+        "files",
+        "function",
+        "functions",
+        "add",
+        "return",
+        "value",
+        "values",
+        "line",
+        "lines",
+        "task",
+        "code",
+        "make",
+        "must",
+        "should",
+        "would",
+        "could",
+        "when",
+        "then",
+        "than",
+        "have",
+        "has",
+        "had",
+        "was",
+        "were",
+        "will",
+        "can",
+        "its",
+        "your",
+        "our",
+        "their",
+        "there",
+        "here",
+        "only",
+        "also",
+        "each",
+        "any",
+        "all",
+        "new",
+        "old",
+        "use",
+        "using",
+        "used",
+        "set",
+        "get",
+        "put",
+        "let",
+        "fn",
+        "mod",
+        "pub",
+        "str",
+        "string",
+        "true",
+        "false",
+        "none",
+        "some",
+        "result",
+        "error",
+        "path",
+        "token",
+        "tokens",
+        "content",
+        "current",
+        "existing",
+        "large",
+        "small",
+    ]
+    .into_iter()
+    .collect();
+
+    let mut identifiers = Vec::new();
+    let mut seen = HashSet::new();
+    let mut start = None;
+
+    for (idx, ch) in task.char_indices() {
+        match start {
+            Some(s) if ch.is_ascii_alphanumeric() || ch == '_' => {
+                if idx + ch.len_utf8() == task.len() {
+                    push_identifier(&task[s..], &stoplist, &mut seen, &mut identifiers);
+                }
+            }
+            Some(s) => {
+                push_identifier(&task[s..idx], &stoplist, &mut seen, &mut identifiers);
+                start = if ch.is_ascii_alphabetic() || ch == '_' {
+                    Some(idx)
+                } else {
+                    None
+                };
+            }
+            None if ch.is_ascii_alphabetic() || ch == '_' => {
+                start = Some(idx);
+                if idx + ch.len_utf8() == task.len() {
+                    push_identifier(&task[idx..], &stoplist, &mut seen, &mut identifiers);
+                }
+            }
+            None => {}
+        }
+    }
+
+    identifiers
+}
+
+fn push_identifier(
+    token: &str,
+    stoplist: &HashSet<&'static str>,
+    seen: &mut HashSet<String>,
+    identifiers: &mut Vec<String>,
+) {
+    if token.len() < 3 {
+        return;
+    }
+    let ident = token.to_ascii_lowercase();
+    if stoplist.contains(ident.as_str()) {
+        return;
+    }
+    if seen.insert(ident.clone()) {
+        identifiers.push(ident);
+    }
+}
+
+fn regions_with_path_headers(path: &str, regions: &str) -> String {
+    let mut out = String::with_capacity(regions.len() + path.len());
+    for line in regions.split_inclusive('\n') {
+        if let Some(rest) = line.strip_prefix("Region ") {
+            out.push_str("Region of ");
+            out.push_str(path);
+            out.push(' ');
+            out.push_str(rest);
+        } else {
+            out.push_str(line);
+        }
+    }
+    out
+}
+
+fn extract_relevant_regions(content: &str, identifiers: &[String]) -> String {
+    let lines: Vec<&str> = content.split_inclusive('\n').collect();
+    if lines.is_empty() {
+        return "No content.\n".to_string();
+    }
+
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    if !identifiers.is_empty() {
+        for (idx, line) in lines.iter().enumerate() {
+            let lower = line.to_ascii_lowercase();
+            if identifiers
+                .iter()
+                .any(|identifier| lower.contains(identifier))
+            {
+                let start = idx.saturating_sub(REGION_CONTEXT_LINES);
+                let end = (idx + REGION_CONTEXT_LINES).min(lines.len() - 1);
+                if let Some((_, last_end)) = ranges.last_mut()
+                    && start <= *last_end + 1
+                {
+                    *last_end = (*last_end).max(end);
+                    continue;
+                }
+                ranges.push((start, end));
+            }
+        }
+    }
+
+    if ranges.is_empty() {
+        return fallback_head_tail_regions(&lines);
+    }
+
+    render_ranges(&lines, &ranges)
+}
+
+fn fallback_head_tail_regions(lines: &[&str]) -> String {
+    let mut ranges = vec![(0, FALLBACK_LINES.min(lines.len()) - 1)];
+    if lines.len() > FALLBACK_LINES {
+        let tail_start = lines.len().saturating_sub(FALLBACK_LINES);
+        if tail_start <= ranges[0].1 + 1 {
+            ranges[0].1 = lines.len() - 1;
+        } else {
+            ranges.push((tail_start, lines.len() - 1));
+        }
+    }
+
+    let mut out = String::from(
+        "No task identifiers matched this large file; showing first and last 60 lines.\n",
+    );
+    out.push_str(&render_ranges(lines, &ranges));
+    out
+}
+
+fn render_ranges(lines: &[&str], ranges: &[(usize, usize)]) -> String {
+    let mut out = String::new();
+    let mut omitted = 0usize;
+
+    for (idx, (start, end)) in ranges.iter().enumerate() {
+        let mut block = String::new();
+        if idx > 0 {
+            block.push('\n');
+        }
+        block.push_str(&format!("Region (lines {}-{}):\n", start + 1, end + 1));
+        for line in &lines[*start..=*end] {
+            block.push_str(line);
+        }
+        if !block.ends_with('\n') {
+            block.push('\n');
+        }
+
+        if out.len() + block.len() > LARGE_CONTEXT_FILE_CHARS {
+            omitted = ranges.len() - idx;
+            break;
+        }
+        out.push_str(&block);
+    }
+
+    if omitted > 0 {
+        out.push_str(&format!(
+            "\n... omitted {omitted} later region(s) after ~{LARGE_CONTEXT_FILE_CHARS} chars for this file.\n"
+        ));
+    }
+
+    out
 }
 
 fn task_context_paths(repo_path: &Path, task: &str) -> Result<Vec<PathBuf>> {
@@ -506,6 +754,40 @@ mod tests {
         .unwrap();
 
         assert_eq!(fs::read_to_string(path).unwrap(), "new\nold\n");
+    }
+
+    #[test]
+    fn codegen_extract_relevant_regions_includes_matching_identifier_line() {
+        let content = (1..=80)
+            .map(|line| {
+                if line == 40 {
+                    "fn special_handler() {}\n".to_string()
+                } else {
+                    format!("let line_{line} = {line};\n")
+                }
+            })
+            .collect::<String>();
+
+        let regions = extract_relevant_regions(&content, &["special_handler".to_string()]);
+
+        assert!(regions.contains("Region (lines 15-65):"));
+        assert!(regions.contains("fn special_handler() {}\n"));
+        assert!(!regions.contains("No task identifiers matched"));
+    }
+
+    #[test]
+    fn codegen_extract_relevant_regions_falls_back_to_head_and_tail() {
+        let content = (1..=140)
+            .map(|line| format!("let unrelated_{line} = {line};\n"))
+            .collect::<String>();
+
+        let regions = extract_relevant_regions(&content, &["missing_identifier".to_string()]);
+
+        assert!(regions.contains("No task identifiers matched this large file"));
+        assert!(regions.contains("Region (lines 1-60):"));
+        assert!(regions.contains("let unrelated_1 = 1;\n"));
+        assert!(regions.contains("Region (lines 81-140):"));
+        assert!(regions.contains("let unrelated_140 = 140;\n"));
     }
 
     #[test]
