@@ -80,6 +80,8 @@ use uuid::Uuid;
 pub mod code_symbols;
 #[path = "cortex/extractors/db_schema.rs"]
 pub mod db_schema;
+#[path = "cortex/extractors/events.rs"]
+pub mod events;
 #[path = "cortex/spi.rs"]
 pub mod spi;
 
@@ -1577,6 +1579,32 @@ pub struct DbField {
     pub migrations: Vec<DbMigrationRef>,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EventTopicSummary {
+    pub subject: String,
+    pub corpus: String,
+    pub publishers: i64,
+    pub subscribers: i64,
+    pub one_sided: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EventEndpoint {
+    pub qualified_name: String,
+    pub path: String,
+    pub confidence: f32,
+    pub method: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EventTopicDetail {
+    pub subject: String,
+    pub corpus: String,
+    pub publishers: Vec<EventEndpoint>,
+    pub subscribers: Vec<EventEndpoint>,
+    pub one_sided: bool,
+}
+
 /// Uniform "the symbol you asked about does not exist in this corpus" message,
 /// shared by every symbol-keyed query (`callers`/`callees`/`impact`/`tests_for`).
 /// These verbs resolve `sel` to a node first; an empty resolution means the
@@ -1657,6 +1685,140 @@ pub async fn field(pool: &PgPool, corpus_slug: Option<&str>, column: &str) -> Re
         });
     }
     Ok(out)
+}
+
+/// List event topics extracted from NATS / message-bus publish-subscribe sites.
+pub async fn topics(pool: &PgPool, corpus_slug: Option<&str>) -> Result<Vec<EventTopicSummary>> {
+    let rows = sqlx::query(
+        r#"SELECT t.title AS subject,
+                  t.project AS corpus,
+                  COUNT(DISTINCT p.src_id) FILTER (WHERE p.edge_type = 'publishes') AS publishers,
+                  COUNT(DISTINCT s.src_id) FILTER (WHERE s.edge_type = 'subscribes') AS subscribers
+             FROM brain_vault_nodes t
+             LEFT JOIN brain_vault_edges p
+                    ON p.dst_id = t.id
+                   AND p.edge_type = 'publishes'
+                   AND COALESCE(p.generation, 0) IN (
+                       0,
+                       COALESCE((SELECT current_generation
+                                   FROM cortex_generations
+                                  WHERE project = t.project), 0)
+                   )
+             LEFT JOIN brain_vault_edges s
+                    ON s.dst_id = t.id
+                   AND s.edge_type = 'subscribes'
+                   AND COALESCE(s.generation, 0) IN (
+                       0,
+                       COALESCE((SELECT current_generation
+                                   FROM cortex_generations
+                                  WHERE project = t.project), 0)
+                   )
+            WHERE t.node_type = 'event:topic'
+              AND ($1::text IS NULL OR t.project = $1)
+              AND COALESCE(t.generation, 0) IN (
+                  0,
+                  COALESCE((SELECT current_generation
+                              FROM cortex_generations
+                             WHERE project = t.project), 0)
+              )
+            GROUP BY t.title, t.project
+            ORDER BY t.project, t.title"#,
+    )
+    .bind(corpus_slug)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            let publishers: i64 = r.get("publishers");
+            let subscribers: i64 = r.get("subscribers");
+            EventTopicSummary {
+                subject: r.get("subject"),
+                corpus: r.get("corpus"),
+                publishers,
+                subscribers,
+                one_sided: (publishers == 0) != (subscribers == 0),
+            }
+        })
+        .collect())
+}
+
+/// Inspect publishers/subscribers for one extracted event subject.
+pub async fn topic(
+    pool: &PgPool,
+    corpus_slug: Option<&str>,
+    subject: &str,
+) -> Result<Vec<EventTopicDetail>> {
+    let topics = sqlx::query(
+        r#"SELECT id, title, project
+             FROM brain_vault_nodes
+            WHERE node_type = 'event:topic'
+              AND title = $1
+              AND ($2::text IS NULL OR project = $2)
+              AND COALESCE(generation, 0) IN (
+                  0,
+                  COALESCE((SELECT current_generation
+                              FROM cortex_generations
+                             WHERE project = brain_vault_nodes.project), 0)
+              )
+            ORDER BY project, title"#,
+    )
+    .bind(subject)
+    .bind(corpus_slug)
+    .fetch_all(pool)
+    .await?;
+
+    let mut out = Vec::with_capacity(topics.len());
+    for topic_row in topics {
+        let id: Uuid = topic_row.get("id");
+        let corpus: String = topic_row.get("project");
+        let publishers = event_endpoints(pool, id, "publishes").await?;
+        let subscribers = event_endpoints(pool, id, "subscribes").await?;
+        out.push(EventTopicDetail {
+            subject: topic_row.get("title"),
+            corpus,
+            one_sided: publishers.is_empty() != subscribers.is_empty(),
+            publishers,
+            subscribers,
+        });
+    }
+    Ok(out)
+}
+
+async fn event_endpoints(
+    pool: &PgPool,
+    topic_id: Uuid,
+    edge_type: &str,
+) -> Result<Vec<EventEndpoint>> {
+    let rows = sqlx::query(
+        r#"SELECT DISTINCT n.title, n.path, e.confidence, e.method
+             FROM brain_vault_edges e
+             JOIN brain_vault_nodes n ON n.id = e.src_id
+            WHERE e.dst_id = $1
+              AND e.edge_type = $2
+              AND n.node_type = 'code:function'
+              AND COALESCE(e.generation, 0) IN (
+                  0,
+                  COALESCE((SELECT current_generation
+                              FROM cortex_generations
+                             WHERE project = n.project), 0)
+              )
+            ORDER BY n.title"#,
+    )
+    .bind(topic_id)
+    .bind(edge_type)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| EventEndpoint {
+            qualified_name: r.get("title"),
+            path: r.get("path"),
+            confidence: r.get("confidence"),
+            method: r.get("method"),
+        })
+        .collect())
 }
 
 /// Resolve a user-supplied symbol selector to its node id within a corpus.

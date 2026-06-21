@@ -93,8 +93,130 @@ pub async fn handle_cortex(pool: &PgPool, cmd: crate::CortexCommand) -> Result<(
             let rows = cortex::field(pool, corpus.as_deref(), &field).await?;
             print_fields(&rows, format.as_str(), &field);
         }
+        crate::CortexCommand::Topics { corpus, format } => {
+            let rows = cortex::topics(pool, corpus.as_deref()).await?;
+            print_topics(&rows, format.as_str());
+        }
+        crate::CortexCommand::Topic {
+            subject,
+            corpus,
+            format,
+        } => {
+            let rows = cortex::topic(pool, corpus.as_deref(), &subject).await?;
+            print_topic(&rows, format.as_str(), &subject);
+        }
     }
     Ok(())
+}
+
+fn print_topics(rows: &[cortex::EventTopicSummary], format: &str) {
+    match format {
+        "json" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(rows).unwrap_or_else(|_| "[]".to_string())
+            );
+        }
+        "names" => {
+            for row in rows {
+                println!("{}", row.subject);
+            }
+        }
+        _ => {
+            if rows.is_empty() {
+                println!("no event:topic nodes in cortex (run `ff cortex index`?)");
+                return;
+            }
+            println!(
+                "{CYAN}\u{25b6} cortex topics — {} topic(s):{RESET}",
+                rows.len()
+            );
+            println!("  {:<56} {:>4} {:>4}  corpus", "subject", "pub", "sub");
+            for row in rows {
+                let marker = if row.one_sided { " !" } else { "  " };
+                println!(
+                    "{marker}{:<56} {:>4} {:>4}  {}",
+                    truncate(&row.subject, 56),
+                    row.publishers,
+                    row.subscribers,
+                    row.corpus
+                );
+            }
+            if rows.iter().any(|r| r.one_sided) {
+                println!(
+                    "  ! one-sided topic: publishers without subscribers or subscribers without publishers"
+                );
+            }
+        }
+    }
+}
+
+fn print_topic(rows: &[cortex::EventTopicDetail], format: &str, subject: &str) {
+    match format {
+        "json" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(rows).unwrap_or_else(|_| "[]".to_string())
+            );
+        }
+        "names" => {
+            for row in rows {
+                for endpoint in row.publishers.iter().chain(row.subscribers.iter()) {
+                    println!("{}", endpoint.qualified_name);
+                }
+            }
+        }
+        _ => {
+            if rows.is_empty() {
+                println!("no event:topic '{subject}' in cortex (run `ff cortex index`?)");
+                return;
+            }
+            for row in rows {
+                println!(
+                    "{CYAN}\u{25b6} cortex topic '{}' ({}){RESET}",
+                    row.subject, row.corpus
+                );
+                if row.one_sided {
+                    println!(
+                        "  ! one-sided topic: publishers without subscribers or subscribers without publishers"
+                    );
+                }
+                println!("  publishers:");
+                if row.publishers.is_empty() {
+                    println!("    -");
+                } else {
+                    for endpoint in &row.publishers {
+                        print_endpoint(endpoint);
+                    }
+                }
+                println!("  subscribers:");
+                if row.subscribers.is_empty() {
+                    println!("    -");
+                } else {
+                    for endpoint in &row.subscribers {
+                        print_endpoint(endpoint);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn print_endpoint(endpoint: &cortex::EventEndpoint) {
+    let method = endpoint.method.as_deref().unwrap_or("-");
+    println!(
+        "    {}  ({method}, confidence {:.2})",
+        endpoint.qualified_name, endpoint.confidence
+    );
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out = s.chars().take(max.saturating_sub(1)).collect::<String>();
+    out.push('…');
+    out
 }
 
 fn print_fields(rows: &[cortex::DbField], format: &str, field: &str) {
