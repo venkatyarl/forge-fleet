@@ -221,6 +221,22 @@ pub enum TopCortexCommand {
         #[arg(long, value_enum, default_value = "table")]
         format: crate::CortexFormat,
     },
+    /// Functions that read one database column.
+    Readers {
+        field: String,
+        #[arg(long)]
+        corpus: Option<String>,
+        #[arg(long, value_enum, default_value = "table")]
+        format: crate::CortexFormat,
+    },
+    /// Functions that write one database column.
+    Writers {
+        field: String,
+        #[arg(long)]
+        corpus: Option<String>,
+        #[arg(long, value_enum, default_value = "table")]
+        format: crate::CortexFormat,
+    },
     /// List config/env/secret/feature-flag keys extracted into Cortex.
     Config {
         #[arg(long)]
@@ -1015,6 +1031,24 @@ pub async fn handle_top_cortex(args: TopCortexArgs) -> Result<()> {
             let rows = cortex::api::api(&pool, Some(&corpus)).await?;
             print_api_handlers(&rows, format.as_str());
         }
+        TopCortexCommand::Readers {
+            field,
+            corpus,
+            format,
+        } => {
+            let corpus = corpus.unwrap_or_else(cwd_slug);
+            let rows = cortex::dataflow::readers(&pool, Some(&corpus), &field).await?;
+            print_dataflow_access(&rows, format.as_str(), &format!("readers of {field}"));
+        }
+        TopCortexCommand::Writers {
+            field,
+            corpus,
+            format,
+        } => {
+            let corpus = corpus.unwrap_or_else(cwd_slug);
+            let rows = cortex::dataflow::writers(&pool, Some(&corpus), &field).await?;
+            print_dataflow_access(&rows, format.as_str(), &format!("writers of {field}"));
+        }
         TopCortexCommand::External { corpus, format } => {
             let corpus = corpus.unwrap_or_else(cwd_slug);
             let rows = cortex::api::external(&pool, Some(&corpus)).await?;
@@ -1164,6 +1198,41 @@ fn print_external_services(rows: &[cortex::api::ExternalServiceSummary], format:
                     truncate_deps_cell(&row.service, 36),
                     row.callers.len(),
                     truncate_deps_cell(&row.callers.join(", "), 64)
+                );
+            }
+        }
+    }
+}
+
+fn print_dataflow_access(rows: &[cortex::dataflow::DataflowAccess], format: &str, title: &str) {
+    match format {
+        "json" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(rows).unwrap_or_else(|_| "[]".to_string())
+            );
+        }
+        "names" => {
+            for row in rows {
+                println!("{}", row.function);
+            }
+        }
+        _ => {
+            if rows.is_empty() {
+                println!("no {title} in cortex (run `ff cortex index`?)");
+                return;
+            }
+            println!(
+                "{CYAN}\u{25b6} cortex {title} — {} function(s):{RESET}",
+                rows.len()
+            );
+            println!("  {:<56}  {:<10}  method", "function", "confidence");
+            for row in rows {
+                println!(
+                    "  {:<56}  {:<10.2}  {}",
+                    truncate_deps_cell(&row.function, 56),
+                    row.confidence,
+                    row.method.as_deref().unwrap_or("-")
                 );
             }
         }
