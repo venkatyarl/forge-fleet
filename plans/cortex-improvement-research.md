@@ -34,3 +34,32 @@ Source: kimi analysis + online SOTA research (2026-06-17). Full transcript: `/tm
 3. Hierarchical GraphRAG (P0.3) — "explain this subsystem" at scale.
 4. SCIP/LSP (P1.5) — close the precision gap.
 5. Visualization + cross-repo (P1.7–8) — usability + scaling.
+
+## Operational findings (2026-06-22 session)
+
+### OPS.1 — the SQLite offline mirror is never refreshed automatically
+**Finding (verified live):** the local SQLite snapshot (`~/.forgefleet/cortex-cache/<corpus>.db`,
+the read-fallback used when Postgres is unreachable) is written **only** by the manual
+`ff cortex export` CLI command. `cortex/mirror.rs::export` has exactly one caller —
+`top_cortex_cmd.rs` (`TopCortexCommand::Export`). There is **no daemon tick, no post-reindex
+hook, nothing automated** that refreshes it. (The `forgefleetd` "mirror" ticks are unrelated:
+`brain_mirror` = per-CLI memory dirs; the dsn-of-record cache-mirror = DB-failover DSN.)
+
+Evidence: the live file on Taylor was last written `Jun 21 10:54` — 16 h stale at the time of
+this finding — i.e. it predates the day's reindexing. So today, the offline fallback would serve
+**yesterday's graph** (and with no semantic search, which the fallback doesn't support).
+
+**Why it matters:** the resilience parachute is only as fresh as the last time someone remembered
+to export. During the exact window the offline copy is most useful (Postgres down — e.g. the
+2026-06-22 768m→4g OOM incident), it's quietly stale.
+
+**Fix options (revisit later):**
+1. **(preferred) Export at the end of each successful reindex** — add one `mirror::export(...)`
+   call after the generation swap in `spawn_reindex_loop`. Snapshot then always ≤1 h stale, for
+   free, where the data is already hot. Leader-gated (matches the reindex tick).
+2. **Dedicated low-frequency export tick** (e.g. 6 h, leader-gated) if decoupling from reindex is
+   preferred. Same spawn-tick pattern as the daemon-retire ports.
+
+Either also wants a freshness signal: stamp the snapshot's export time and have the offline path
+print "(snapshot is N h old)" so a stale fallback is never mistaken for live data.
+5. Visualization + cross-repo (P1.7–8) — usability + scaling.
