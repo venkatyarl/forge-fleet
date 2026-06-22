@@ -1491,45 +1491,40 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         }));
     }
 
-    let is_leader = config
-        .nodes
-        .get(&worker_name)
-        .map(|node| node.role.is_leader_like())
-        .unwrap_or(false);
-
-    // 20b6) Vault re-index tick — every 30min, leader-gated.
-    if is_leader {
-        if let Some(pg_pool) = operational_store.pg_pool().cloned() {
-            info!("starting subsystem: vault re-index tick (30min, leader-gated)");
-            subsystem_tasks.push(ff_brain::spawn_vault_index_tick(
-                pg_pool,
-                30 * 60,
-                shutdown_rx.clone(),
-            ));
-        }
+    // 20b6) Vault re-index tick — every 30min. Leader-gating happens inside
+    // the tick (live `fleet_leader_state` check), so spawn unconditionally —
+    // every node runs the loop but only the live leader does the work.
+    if let Some(pg_pool) = operational_store.pg_pool().cloned() {
+        info!("starting subsystem: vault re-index tick (30min, leader-gated)");
+        subsystem_tasks.push(ff_brain::spawn_vault_index_tick(
+            pg_pool,
+            worker_name.clone(),
+            30 * 60,
+            shutdown_rx.clone(),
+        ));
     }
 
-    // 20b7) GitHub project sync tick — every 5min, leader-gated.
-    if is_leader {
-        if let Some(pg_pool) = operational_store.pg_pool().cloned() {
-            info!("starting subsystem: github project sync tick (5min, leader-gated)");
-            subsystem_tasks.push(
-                ff_agent::project_github_sync::GitHubSync::new(pg_pool)
-                    .spawn(5, shutdown_rx.clone()),
-            );
-        }
+    // 20b7) GitHub project sync tick — every 5min, leader-gated inside the tick.
+    if let Some(pg_pool) = operational_store.pg_pool().cloned() {
+        info!("starting subsystem: github project sync tick (5min, leader-gated)");
+        subsystem_tasks.push(
+            ff_agent::project_github_sync::GitHubSync::new(pg_pool).spawn(
+                worker_name.clone(),
+                5,
+                shutdown_rx.clone(),
+            ),
+        );
     }
 
-    // 20b8) OAuth probe tick — every 6h, leader-gated.
-    if is_leader {
-        if let Some(pg_pool) = operational_store.pg_pool().cloned() {
-            info!("starting subsystem: oauth probe tick (6h, leader-gated)");
-            subsystem_tasks.push(ff_agent::oauth_distributor::spawn_oauth_probe_tick(
-                pg_pool,
-                6 * 3600,
-                shutdown_rx.clone(),
-            ));
-        }
+    // 20b8) OAuth probe tick — every 6h, leader-gated inside the tick.
+    if let Some(pg_pool) = operational_store.pg_pool().cloned() {
+        info!("starting subsystem: oauth probe tick (6h, leader-gated)");
+        subsystem_tasks.push(ff_agent::oauth_distributor::spawn_oauth_probe_tick(
+            pg_pool,
+            worker_name.clone(),
+            6 * 3600,
+            shutdown_rx.clone(),
+        ));
     }
 
     // 20c) Stale-task reaper tick — every 10min, per-node (idempotent).

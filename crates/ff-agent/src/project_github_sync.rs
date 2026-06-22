@@ -195,7 +195,16 @@ impl GitHubSync {
 
     /// Spawn a background tick that runs [`Self::sync_all_projects`] every
     /// `interval_mins`. Exits cleanly when `shutdown` flips to `true`.
-    pub fn spawn(self, interval_mins: u64, mut shutdown: watch::Receiver<bool>) -> JoinHandle<()> {
+    ///
+    /// Leader-gated: spawned unconditionally on every node, but each tick checks
+    /// the live `fleet_leader_state` and skips unless this node is the current
+    /// leader (only the leader drives the canonical project/GitHub sync).
+    pub fn spawn(
+        self,
+        worker_name: String,
+        interval_mins: u64,
+        mut shutdown: watch::Receiver<bool>,
+    ) -> JoinHandle<()> {
         let interval = Duration::from_secs(interval_mins.max(1) * 60);
         let kickoff = Duration::from_secs(30);
 
@@ -208,14 +217,30 @@ impl GitHubSync {
             }
 
             loop {
-                match self.sync_all_projects().await {
-                    Ok(report) => debug!(
-                        total = report.total,
-                        updated = report.updated_main,
-                        errors = report.errors.len(),
-                        "project github sync tick"
-                    ),
-                    Err(err) => warn!(error = %err, "project github sync tick failed"),
+                let is_leader: bool = sqlx::query_scalar(
+                    r#"
+                    SELECT EXISTS (
+                        SELECT 1 FROM fleet_leader_state
+                        WHERE member_name = $1
+                          AND heartbeat_at > NOW() - INTERVAL '60 seconds'
+                    )
+                    "#,
+                )
+                .bind(&worker_name)
+                .fetch_one(&self.pg)
+                .await
+                .unwrap_or(false);
+
+                if is_leader {
+                    match self.sync_all_projects().await {
+                        Ok(report) => debug!(
+                            total = report.total,
+                            updated = report.updated_main,
+                            errors = report.errors.len(),
+                            "project github sync tick"
+                        ),
+                        Err(err) => warn!(error = %err, "project github sync tick failed"),
+                    }
                 }
 
                 tokio::select! {
