@@ -36,3 +36,13 @@ scheduler · defer-worker (shell/http/upgrade) · disk sampler · deployment rec
 3. **Operator triage** the 6 judgment-call ticks (port vs drop).
 4. **Phase B (separate PR):** gate legacy actuation off by default (`FF_DAEMON_ACTUATING` env), default = deprecation warning + `--once` dry-run. The existing legacy-daemon reaper (src/main.rs:1113) already SIGTERMs stale procs.
 5. **Phase C:** after a clean rollout window, delete the actuating code.
+
+---
+
+## Status — COMPLETE (2026-06-22)
+
+- **Phase A1/A2 (PORT/KEEP):** all 6 ticks live in forgefleetd — defer `internal`/`mesh_retry`+finalizers (`defer_worker.rs`), `node_online` wake (`publish_node_online`), model-scan, ssh-mesh-repair, task-liveness, model-auto-upgrade. Verified in the live subsystem log.
+- **SUBSUMED:** software_upstream folded into `AutoUpgradeTick`; local_healer redundant (launchd `KeepAlive`+`Crashed` / systemd `Restart=on-failure` confirmed); coverage-guard stays read-only (`report_once`).
+- **JUDGMENT CALLS:** vault re-index / project GitHub sync / OAuth probe **ported** (#522); the leader-gate bug in that port fixed in #523. placement-rebalance / LAN link-probe / fabric-benchmark **dropped** (vestigial / subsumed by the gated disk-policy reconciler).
+- **Phase B (#522):** legacy `ff daemon` actuation gated off by default.
+- **Phase C (this PR):** the ~836-line legacy actuating select-loop in `daemon_cmd.rs::handle_daemon` deleted; `ff daemon` is now a no-op stub (prints a retirement notice, exits 0). The defer execution engine (`handle_defer_worker` / `defer_pass` / `execute_*`) is retained — it's the live `ff defer-worker` command.
