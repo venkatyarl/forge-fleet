@@ -72,11 +72,6 @@ pub struct TelemetryConfig {
     /// If omitted, file logging is disabled.
     #[serde(default)]
     pub file_log: Option<FileLogConfig>,
-
-    /// Enable OpenTelemetry trace exporter (stdout-based).
-    /// When true, an OTel tracing layer is added to the subscriber stack.
-    #[serde(default)]
-    pub enable_opentelemetry: bool,
 }
 
 fn default_level() -> String {
@@ -102,7 +97,6 @@ impl Default for TelemetryConfig {
             service_name: default_service_name(),
             worker_name: None,
             file_log: None,
-            enable_opentelemetry: false,
         }
     }
 }
@@ -243,18 +237,11 @@ pub fn init_telemetry(config: &TelemetryConfig) -> anyhow::Result<()> {
         }
     }
 
-    // ─── Optional OpenTelemetry tracing exporter ─────────────────────────
-    // NOTE: OTel is wired at the application level. When `enable_opentelemetry`
-    // is true the user should install an OTel tracing layer *before*
-    // `init_telemetry` (since only one global subscriber is allowed).
-    // We log the config flag here for observability.
-
     tracing::info!(
         service = %config.service_name,
         node = ?config.worker_name,
         json = config.json,
         file_logging = file_logging_enabled,
-        otel = config.enable_opentelemetry,
         "telemetry initialized"
     );
 
@@ -411,7 +398,6 @@ where
         node = ?config.worker_name,
         json = config.json,
         file_logging = file_logging_enabled,
-        otel = config.enable_opentelemetry,
         extra_layer = true,
         "telemetry initialized (with extra layer)"
     );
