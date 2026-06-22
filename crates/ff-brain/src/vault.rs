@@ -58,8 +58,13 @@ pub struct IndexReport {
 }
 
 /// Spawn the vault re-index loop for the production daemon.
+///
+/// Leader-gated: spawned unconditionally on every node, but each tick checks
+/// the live `fleet_leader_state` and skips unless this node is the current
+/// leader (so only the leader's checkout drives the canonical vault corpus).
 pub fn spawn_vault_index_tick(
     pg: PgPool,
+    worker_name: String,
     interval_secs: u64,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
@@ -69,6 +74,23 @@ pub fn spawn_vault_index_tick(
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
+                    let is_leader: bool = sqlx::query_scalar(
+                        r#"
+                        SELECT EXISTS (
+                            SELECT 1 FROM fleet_leader_state
+                            WHERE member_name = $1
+                              AND heartbeat_at > NOW() - INTERVAL '60 seconds'
+                        )
+                        "#,
+                    )
+                    .bind(&worker_name)
+                    .fetch_one(&pg)
+                    .await
+                    .unwrap_or(false);
+                    if !is_leader {
+                        continue;
+                    }
+
                     let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/venkat".to_string());
                     let vault_path = PathBuf::from(home).join("projects").join("Yarli_KnowledgeBase");
                     if !vault_path.exists() {
