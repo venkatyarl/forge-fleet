@@ -4,6 +4,22 @@ use anyhow::Result;
 
 use crate::{CYAN, GREEN, RESET, YELLOW, resolve_pulse_redis_url};
 
+/// GAP-D2: best-effort clean-sync of a dispatch slot workspace to a fresh
+/// `origin/main` before the dispatched run edits it. Makes the build base
+/// deterministic so concurrent callers on the same slot never cross-contaminate
+/// and `commit-back` diffs against fresh main (the slot is claimed exclusively,
+/// so a hard reset is safe). Guarded — skips a non-git `cwd` — and non-fatal: a
+/// repo that doesn't track `origin/main` simply runs on its existing state. No
+/// `git stash` (per the no-stash rule); reset + clean only.
+fn clean_sync_prefix(cwd: &str) -> String {
+    format!(
+        "{{ git -C {cwd} rev-parse --git-dir >/dev/null 2>&1 && \
+            git -C {cwd} fetch origin --quiet && \
+            git -C {cwd} reset --hard origin/main --quiet && \
+            git -C {cwd} clean -fd >/dev/null 2>&1; }} ; "
+    )
+}
+
 pub async fn handle_agent_fanout(
     pool: &sqlx::PgPool,
     prompt: String,
@@ -65,8 +81,10 @@ pub async fn handle_agent_fanout(
     // default by EITHER cap. The CLI --timeout fires first (checkpoint), the
     // worker is the backstop.
     let cmd = format!(
-        "ff run --backend {} --cwd {} --timeout {timeout} '{shell_safe_prompt}'",
-        cfg.name, run_cwd
+        "{prefix}ff run --backend {} --cwd {} --timeout {timeout} '{shell_safe_prompt}'",
+        cfg.name,
+        run_cwd,
+        prefix = clean_sync_prefix(&run_cwd),
     );
     let task_max_secs = timeout + 120;
     for i in 0..fanout {
@@ -160,8 +178,10 @@ pub async fn handle_agent_dispatch_each(
     // See handle_agent_fanout: --timeout bounds the CLI, task max_duration_secs
     // bounds the worker; both raised above the 600s default for build runs.
     let cmd = format!(
-        "ff run --backend {} --cwd {} --timeout {timeout} '{shell_safe_prompt}'",
-        cfg.name, run_cwd
+        "{prefix}ff run --backend {} --cwd {} --timeout {timeout} '{shell_safe_prompt}'",
+        cfg.name,
+        run_cwd,
+        prefix = clean_sync_prefix(&run_cwd),
     );
     let task_max_secs = timeout + 120;
     for (_id, name) in &members {
