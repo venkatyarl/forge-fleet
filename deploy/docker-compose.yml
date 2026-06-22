@@ -74,7 +74,12 @@ services:
       - "hot_standby=on"
       - "-c"
       - "synchronous_commit=off"
-    mem_limit: 768m
+    # 4 GB ceiling on the 96 GB Mac Studio. The old 768m cap sat at ~88% even
+    # idle (shared_buffers=256MB + maintenance_work_mem=128MB + per-conn
+    # work_mem), so a full Cortex reindex (batch inserts + pgvector HNSW index
+    # builds across ~66k nodes) blew past it → Docker OOM-killed the container
+    # mid-query → "got 0 bytes at EOF". 4g leaves ample headroom for index builds.
+    mem_limit: 4g
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U forgefleet -d forgefleet"]
       interval: 10s
