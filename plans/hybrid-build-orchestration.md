@@ -148,3 +148,30 @@ rushing a half-fix into a data/build-critical path unattended.
    targeting + clean-sync + commit-back-from-main).
 4. GAP-C fair-share cap + partial-failure reporting in swarm/fanout.
 5. GAP-B commit-back branch uniqueness suffix.
+
+## Status re-audit (2026-06-22) — most of GAP-D already shipped
+
+Verified against current code; items above were stale:
+- ✅ **GAP-D0** (record `modified_files`) — DONE. `agent_loop.rs:521-524` calls
+  `collect_modified_files` + `record_agent_run_output`; live DB has work_outputs
+  rows carrying `agent_session_id` + non-empty `modified_files`.
+- ✅ **GAP-D1** (`--cwd <slot-workspace>`) — DONE. fanout + dispatch-each both pass
+  `--cwd {run_cwd}`.
+- ✅ **GAP-B** (commit-back branch uniqueness) — DONE. branch is now
+  `fleet/<worker>/<ts>-<slug>-<wi8>`.
+- ✅ **GAP-D2** (clean-sync before run) — DONE (this change). `clean_sync_prefix()`
+  prepends a guarded, non-fatal `git fetch + reset --hard origin/main + clean -fd`
+  to the dispatched `ff run`, so the slot workspace is a deterministic fresh
+  `origin/main` before the LLM edits it. This also makes commit-back's
+  branch-from-HEAD correct for the dispatch path (HEAD == fresh main).
+
+**Still open:**
+- **GAP-D3** — commit-back (`agent_cmd.rs:336-337`) fetches `origin/main` then
+  `git checkout -b` from *current HEAD*, not the fetched ref. With GAP-D2 the
+  dispatched workspace HEAD already is fresh main, so this is now correct for
+  dispatched runs; only wrong for a commit-back over a manually-staled workspace.
+  Lower priority post-D2; fix = branch from the fetched `origin/main` preserving
+  the recorded edits (careful git sequence + a dogfood).
+- **GAP-C** — swarm/fanout fair-share cap + partial-failure reporting (unverified).
+- **Validation owed:** a real end-to-end ff→commit-back dogfood (small forge-fleet
+  change) to confirm D0+D1+D2 compose into a clean PR.
