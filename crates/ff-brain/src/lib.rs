@@ -56,6 +56,6 @@ pub use procedural_memory::{consolidate, spawn_consolidation_loop};
 pub use stack_backlog::{BacklogItem, BrainStateClient, StackItem};
 pub use vault::{
     IndexReport, ParsedNode, VaultChunk, VaultConfig, chunk_markdown, extract_wikilinks,
-    index_changed_files, index_vault, parse_frontmatter, parse_vault_file,
+    index_changed_files, index_vault, parse_frontmatter, parse_vault_file, spawn_vault_index_tick,
 };
 pub use vector_search::{VaultNode, hybrid_search, vector_search};

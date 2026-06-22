@@ -1057,6 +1057,17 @@ pub async fn handle_daemon(
     reconcile_interval: u64,
     once: bool,
 ) -> Result<()> {
+    if !matches!(
+        std::env::var("FF_DAEMON_ACTUATING").ok().as_deref(),
+        Some("1") | Some("true")
+    ) {
+        eprintln!(
+            "legacy `ff daemon` is retired — forgefleetd now owns all background ticks. \
+             Set FF_DAEMON_ACTUATING=1 to force-run the legacy loop (not recommended)."
+        );
+        return Ok(());
+    }
+
     let worker_name = match as_node {
         Some(n) => n,
         None => ff_agent::fleet_info::resolve_this_worker_name().await,
