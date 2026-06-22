@@ -28,14 +28,6 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 tracing-appender.workspace = true
 
-# OpenTelemetry (distributed tracing export)
-opentelemetry = "0.27"
-opentelemetry_sdk = { version = "0.27", features = ["trace"] }
-opentelemetry-stdout = { version = "0.27", features = ["trace"] }
-opentelemetry-otlp = { version = "0.27", features = ["http-proto", "reqwest-blocking-client", "trace"] }
-tracing-opentelemetry = "0.28"
-base64 = "0.22"
-
 # Filesystem
 dirs.workspace = true
 

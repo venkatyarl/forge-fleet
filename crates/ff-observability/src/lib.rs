@@ -15,7 +15,6 @@ pub mod events;
 pub mod file_logger;
 pub mod log_ingest;
 pub mod metrics;
-pub mod otlp;
 pub mod telemetry;
 pub mod tracing_ext;
 
@@ -54,7 +53,6 @@ pub use metrics::{
     normalize_path,
     prometheus_metrics_middleware,
 };
-pub use otlp::build_otlp_layer;
 pub use telemetry::{TelemetryConfig, init_telemetry, init_telemetry_with_extra_layer};
 pub use tracing_ext::{
     SpanExt, TraceStore, TraceSummary, extract_or_generate_trace_id, extract_trace_header,

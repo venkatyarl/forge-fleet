@@ -2075,33 +2075,10 @@ async fn init_logging(cli: &Cli, worker_name: &str) -> Result<()> {
         ..Default::default()
     };
 
-    // Optional OpenTelemetry OTLP export (LANG.2 — forgefleetd → Langfuse).
-    // Toggle via FORGEFLEET_OTEL_ENDPOINT env. When unset, OTLP is off and
-    // we run with only file + stdout (and optionally NATS) layers.
-    let otlp_endpoint = std::env::var("FORGEFLEET_OTEL_ENDPOINT")
-        .ok()
-        .filter(|s| !s.is_empty());
-    let otlp_layer = if let Some(endpoint) = otlp_endpoint.as_deref() {
-        match ff_observability::build_otlp_layer(
-            endpoint,
-            "forgefleetd",
-            Some(worker_name),
-            &[("ff.role".into(), "daemon".into())],
-        ) {
-            Ok(layer) => layer,
-            Err(e) => {
-                eprintln!("warn: OTLP layer build failed ({e}); continuing without remote tracing");
-                None
-            }
-        }
-    } else {
-        None
-    };
-
     // If the process-global NATS client is available, attach a
     // NatsLogLayer so every tracing event is mirrored onto
     // `logs.<node>.forgefleetd.<level>`. Otherwise fall back to the
-    // plain file + stdout subscriber. OTLP layer composes alongside.
+    // plain file + stdout subscriber.
     let nats_client = ff_agent::nats_client::get_nats().await;
     let nats_layer = nats_client.map(|c| {
         ff_agent::nats_log_layer::NatsLogLayer::with_client(
@@ -2114,9 +2091,6 @@ async fn init_logging(cli: &Cli, worker_name: &str) -> Result<()> {
     use tracing_subscriber::Layer;
     let mut layers: Vec<Box<dyn Layer<tracing_subscriber::Registry> + Send + Sync>> = Vec::new();
     if let Some(layer) = nats_layer {
-        layers.push(layer.boxed());
-    }
-    if let Some(layer) = otlp_layer {
         layers.push(layer.boxed());
     }
 
