@@ -413,6 +413,13 @@ async fn print_pm_doctor(pool: &sqlx::PgPool) -> Result<()> {
     .await
     .map_err(|e| anyhow::anyhow!("doctor free slots: {e}"))?;
 
+    // Orphaned `in_progress` work_items with NO active lease — invisible to the
+    // lease-based reaper, so they sit forever. The scheduler's orphan sweep
+    // cancels them after an hour; surface any here so "healthy" isn't a lie.
+    let orphaned_in_progress = ff_db::pg_count_orphaned_work_items(pool, 3600)
+        .await
+        .map_err(|e| anyhow::anyhow!("doctor orphaned work_items: {e}"))?;
+
     let leader_ok = !fresh_leaders.is_empty();
     if leader_ok {
         println!("{GREEN}✓ leader fresh{RESET}: {}", fresh_leaders.join(", "));
@@ -447,8 +454,17 @@ async fn print_pm_doctor(pool: &sqlx::PgPool) -> Result<()> {
         println!("{YELLOW}⚠ free slots{RESET}: 0 idle sub_agents");
     }
 
+    let orphans_ok = orphaned_in_progress == 0;
+    if orphans_ok {
+        println!("{GREEN}✓ orphaned in_progress{RESET}: 0");
+    } else {
+        println!(
+            "{YELLOW}⚠ orphaned in_progress{RESET}: {orphaned_in_progress} (no active lease — the scheduler sweep cancels these hourly)"
+        );
+    }
+
     println!();
-    if leader_ok && stale_ok && slots_ok {
+    if leader_ok && stale_ok && slots_ok && orphans_ok {
         println!("{GREEN}✓ Summary:{RESET} Pillar-4 work_item pipeline is healthy");
     } else {
         println!("{RED}⚠ Summary:{RESET} Pillar-4 work_item pipeline needs attention");

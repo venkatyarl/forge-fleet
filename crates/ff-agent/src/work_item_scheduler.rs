@@ -24,6 +24,10 @@ const LEASE_STALE_SECS: i64 = 180;
 const LEASE_GRANT_SECS: i64 = 600;
 /// Max assignments per tick (back-pressure; the rest wait for the next tick).
 const MAX_ASSIGN_PER_TICK: i64 = 64;
+/// Minimum age before an `in_progress` work_item with NO active lease is
+/// considered orphaned and cancelled. Far above the lease/heartbeat windows so
+/// a legitimately-leased item is never swept mid-assignment.
+const ORPHAN_MIN_AGE_SECS: i64 = 3600;
 
 /// One scheduler pass. Returns the number of work_items assigned this tick.
 pub async fn evaluate_work_items(pg: &PgPool) -> Result<usize> {
@@ -32,6 +36,17 @@ pub async fn evaluate_work_items(pg: &PgPool) -> Result<usize> {
         warn!(
             reaped,
             "work_item_scheduler: reaped stale leases (slots freed, items re-queued)"
+        );
+    }
+
+    // Companion sweep: `in_progress` work_items with no active lease can't be
+    // reaped by the lease sweep above (they have no lease row). Cancel the ones
+    // older than ORPHAN_MIN_AGE_SECS so they stop polluting `in_progress`.
+    let orphans = ff_db::pg_reap_orphaned_work_items(pg, ORPHAN_MIN_AGE_SECS).await?;
+    if orphans > 0 {
+        warn!(
+            orphans,
+            "work_item_scheduler: cancelled orphaned in_progress work_items (no active lease)"
         );
     }
 

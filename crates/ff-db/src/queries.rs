@@ -8520,6 +8520,52 @@ pub async fn pg_reap_stale_work_item_leases(pool: &PgPool, stale_secs: i64) -> R
     Ok(reaped)
 }
 
+/// Count work_items orphaned in `in_progress` with NO active (unreleased) lease.
+/// These never went through — or fell out of — the lease lifecycle, so the
+/// lease-based reaper [`pg_reap_stale_work_item_leases`] can't see them; they
+/// sit `in_progress` forever. `min_age_secs` guards against a just-assigned
+/// item whose lease row is created a moment after the status flips.
+pub async fn pg_count_orphaned_work_items(pool: &PgPool, min_age_secs: i64) -> Result<i64> {
+    let n = sqlx::query_scalar(
+        "SELECT COUNT(*)
+           FROM work_items w
+          WHERE w.status = 'in_progress'
+            AND w.created_at < NOW() - make_interval(secs => $1)
+            AND NOT EXISTS (
+                SELECT 1 FROM work_item_leases l
+                 WHERE l.work_item_id = w.id AND l.released_at IS NULL)",
+    )
+    .bind(min_age_secs as f64)
+    .fetch_one(pool)
+    .await?;
+    Ok(n)
+}
+
+/// Reap orphaned `in_progress` work_items that have no active lease (see
+/// [`pg_count_orphaned_work_items`]) by marking them terminal `cancelled`.
+/// Distinct from [`pg_reap_stale_work_item_leases`], which re-queues items whose
+/// lease heartbeat went stale — these have no lease to go stale, so they need a
+/// separate sweep. `cancelled` (not `ready`) is correct: a never-leased
+/// in_progress row is an abandoned/botched dispatch, and re-queueing it would
+/// re-dispatch junk forever.
+pub async fn pg_reap_orphaned_work_items(pool: &PgPool, min_age_secs: i64) -> Result<u64> {
+    let res = sqlx::query(
+        "UPDATE work_items
+            SET status = 'cancelled',
+                completed_at = NOW(),
+                last_error = 'auto-reaped: in_progress with no active lease'
+          WHERE status = 'in_progress'
+            AND created_at < NOW() - make_interval(secs => $1)
+            AND NOT EXISTS (
+                SELECT 1 FROM work_item_leases l
+                 WHERE l.work_item_id = work_items.id AND l.released_at IS NULL)",
+    )
+    .bind(min_age_secs as f64)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
 /// Work_items ready to schedule: explicitly status='ready', leaf kind='task',
 /// no active lease, and every blocking dependency (work_item_relations
 /// relation_type='blocks', from_id blocks to_id) is 'merged'. The dep clause is
