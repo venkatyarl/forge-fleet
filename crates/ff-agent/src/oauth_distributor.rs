@@ -421,6 +421,33 @@ pub async fn probe_all(pool: &PgPool) -> Vec<ProbeResult> {
     out
 }
 
+pub fn spawn_oauth_probe_tick(
+    pg: PgPool,
+    interval_secs: u64,
+    mut shutdown: watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    let results = probe_all(&pg).await;
+                    info!(
+                        result_count = results.len(),
+                        "oauth probe tick complete"
+                    );
+                }
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        break;
+                    }
+                }
+            }
+        }
+    })
+}
+
 /// Probe one OAuth provider's token by hitting its `/v1/models`-style
 /// endpoint. Returns shape suitable for CLI rendering or alert dispatch.
 pub async fn probe_one(pool: &PgPool, provider: &OauthProvider) -> ProbeResult {

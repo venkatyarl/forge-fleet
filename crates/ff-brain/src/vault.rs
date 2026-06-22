@@ -57,6 +57,49 @@ pub struct IndexReport {
     pub unchanged_skipped: usize,
 }
 
+/// Spawn the vault re-index loop for the production daemon.
+pub fn spawn_vault_index_tick(
+    pg: PgPool,
+    interval_secs: u64,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/venkat".to_string());
+                    let vault_path = PathBuf::from(home).join("projects").join("Yarli_KnowledgeBase");
+                    if !vault_path.exists() {
+                        continue;
+                    }
+
+                    let config = VaultConfig {
+                        vault_path,
+                        brain_subfolder: String::new(),
+                    };
+                    match index_vault(&pg, &config).await {
+                        Ok(report) => {
+                            tracing::info!(
+                                nodes_upserted = report.nodes_upserted,
+                                skipped = report.unchanged_skipped,
+                                "vault re-index tick complete"
+                            );
+                        }
+                        Err(err) => tracing::warn!(error = %err, "vault re-index tick failed"),
+                    }
+                }
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        break;
+                    }
+                }
+            }
+        }
+    })
+}
+
 /// Parse YAML frontmatter from a markdown file.
 /// Returns (frontmatter as JSON Value, body without frontmatter).
 pub fn parse_frontmatter(content: &str) -> (serde_json::Value, String) {
