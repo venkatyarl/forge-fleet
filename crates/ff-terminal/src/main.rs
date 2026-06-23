@@ -239,6 +239,12 @@ enum Command {
         /// checkpoint. Prevents a wedged backend from hanging forever.
         #[arg(long)]
         timeout: Option<u64>,
+        /// Skip the per-edit `cargo check --workspace` auto-verify in the agent
+        /// loop (`--backend local` only). Use when dispatching ONE piece of a
+        /// larger refactor that won't compile until every piece lands, so the
+        /// loop doesn't thrash on errors it can't fix yet.
+        #[arg(long = "no-verify")]
+        no_verify: bool,
     },
     /// Ask a local coder model for a unified diff, apply it, and retry on build errors.
     Codegen {
@@ -4034,7 +4040,15 @@ async fn main() -> Result<()> {
             backend,
             backend_args,
             timeout,
+            no_verify,
         }) => {
+            if no_verify {
+                // Force-disable the agent loop's per-edit cargo check for this
+                // process (read by `auto_verify_rust_enabled`). SAFETY: set
+                // before any agent loop / async task spawns, so no other thread
+                // is reading the environment concurrently.
+                unsafe { std::env::set_var("FF_AGENT_NO_VERIFY", "1") };
+            }
             let run_timeout = timeout.map(std::time::Duration::from_secs);
             // Layer-2 backend: spawn a vendor CLI directly (claude /
             // codex / gemini / kimi / grok) instead of the local agent
