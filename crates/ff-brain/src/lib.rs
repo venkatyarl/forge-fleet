@@ -50,7 +50,6 @@ pub use community_summary::{
 pub use context::{BrainMessage, ContextBundle, ResolvedNode, select_context};
 pub use cortex::ingest_decisions;
 pub use cortex::ingest_pm;
-pub use cortex::mirror;
 pub use cortex::{
     CommunityExplanation, CommunityMember, CortexStats, FileOutline, OutlineEntry, SymbolHit,
     SymbolRef, SymbolSource, TestHit, call_path, callees, callers, explain_community, find_symbols,
