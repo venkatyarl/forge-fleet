@@ -9,7 +9,7 @@ use ff_api::config::ApiConfig;
 use ff_api::registry::{BackendEndpoint, BackendRegistry};
 use ff_control::{BootstrapOptions, ControlPlane};
 use ff_core::config::{self, ConfigHandle, DatabaseMode, FleetConfig, spawn_watcher};
-use ff_db::{DbPool, DbPoolConfig, OperationalStore, RuntimeRegistryStore, run_migrations};
+use ff_db::{OperationalStore, RuntimeRegistryStore};
 use ff_discovery::health::HealthStatus;
 use ff_discovery::{
     NodeRegistry, NodeScanner, ScanTarget, ScannerConfig, build_scan_targets, scan_subnet,
@@ -158,48 +158,33 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
     // database URL produced two pools × 15 daemons = 30 baseline conns just
     // for the two stores, and that's before fleet_resolver / get_fleet_pool
     // / per-call sqlx::query helpers piled on.
-    let shared_pg_pool: Option<std::sync::Arc<sqlx::PgPool>> = match config.database.mode {
-        DatabaseMode::EmbeddedSqlite => None,
-        DatabaseMode::PostgresRuntime | DatabaseMode::PostgresFull => {
-            let url = config.database.url.trim();
-            if url.is_empty() {
-                None
-            } else {
-                // create_pool_with_dsn_failover is fail-safe to the static DSN
-                // when config.database.dsn_failover == false (the default), so
-                // the connect behaviour here is unchanged unless an operator has
-                // opted into HA Phase 3 DSN-of-record failover.
-                let pool = ff_core::db::create_pool_with_dsn_failover(&config.database)
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "failed to open shared Postgres pool ({})",
-                            redact_database_url(url)
-                        )
-                    })?;
-                Some(std::sync::Arc::new(pool))
-            }
-        }
-    };
-
-    // ─── Operational persistence backend (SQLite or Postgres) ──────────────
-    let (operational_store, sqlite_pool, sqlite_path) =
-        initialize_operational_store(&config, &config_path, shared_pg_pool.clone()).await?;
-
-    // ─── Runtime registry persistence backend ────────────────────────────────
-    let runtime_registry =
-        initialize_runtime_registry(&config, sqlite_pool.clone(), shared_pg_pool.clone()).await?;
-    log_database_mode_summary(
-        &config,
-        sqlite_path.as_deref(),
-        &operational_store,
-        &runtime_registry,
+    let url = config.database.url.trim();
+    if url.is_empty() {
+        anyhow::bail!(
+            "database.mode={} requires non-empty [database].url",
+            config.database.mode.as_str()
+        );
+    }
+    let shared_pg_pool: std::sync::Arc<sqlx::PgPool> = std::sync::Arc::new(
+        ff_core::db::create_pool_with_dsn_failover(&config.database)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to open shared Postgres pool ({})",
+                    redact_database_url(url)
+                )
+            })?,
     );
 
+    // ─── Operational persistence backend (Postgres) ─────────────────────────
+    let operational_store = initialize_operational_store(&config, shared_pg_pool.clone()).await?;
+
+    // ─── Runtime registry persistence backend ────────────────────────────────
+    let runtime_registry = initialize_runtime_registry(&config, shared_pg_pool.clone()).await?;
+    log_database_mode_summary(&config, &operational_store, &runtime_registry);
+
     // ─── Postgres fleet config seed (fleet.toml → Postgres, first boot only) ──
-    if config.database.mode != DatabaseMode::EmbeddedSqlite
-        && let Some(pg_pool) = operational_store.pg_pool()
-    {
+    if let Some(pg_pool) = operational_store.pg_pool() {
         ff_db::run_postgres_migrations(pg_pool)
             .await
             .context("postgres fleet-config migrations failed")?;
@@ -1858,150 +1843,43 @@ fn enforce_database_mode_preflight(config: &FleetConfig) -> Result<()> {
     anyhow::bail!(message)
 }
 
-fn resolve_embedded_db_path(config: &FleetConfig, config_path: &Path) -> Result<PathBuf> {
-    if let Some(raw) = config
-        .database
-        .sqlite_path
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        let candidate = PathBuf::from(raw);
-        if candidate.is_absolute() {
-            return Ok(candidate);
-        }
-
-        let Some(parent) = config_path.parent() else {
-            anyhow::bail!("unable to resolve config parent directory for sqlite path");
-        };
-        return Ok(parent.join(candidate));
-    }
-
-    let Some(parent) = config_path.parent() else {
-        anyhow::bail!("unable to resolve config parent directory for sqlite path");
-    };
-
-    Ok(parent.join("forgefleet.db"))
-}
-
 async fn initialize_operational_store(
     config: &FleetConfig,
-    config_path: &Path,
-    shared_pg_pool: Option<std::sync::Arc<sqlx::PgPool>>,
-) -> Result<(OperationalStore, Option<DbPool>, Option<PathBuf>)> {
-    match config.database.mode {
-        DatabaseMode::EmbeddedSqlite => {
-            let db_path = resolve_embedded_db_path(config, config_path)?;
-            let pool = DbPool::open(DbPoolConfig::with_path(&db_path)).with_context(|| {
-                format!("failed to open embedded sqlite at {}", db_path.display())
-            })?;
-
-            let conn = pool
-                .open_raw_connection()
-                .context("failed to open sqlite migration connection")?;
-            let applied = run_migrations(&conn).context("database migration failed")?;
-            info!(path = %db_path.display(), applied, "embedded sqlite ready");
-
-            Ok((
-                OperationalStore::sqlite(pool.clone()),
-                Some(pool),
-                Some(db_path),
-            ))
-        }
-        DatabaseMode::PostgresRuntime | DatabaseMode::PostgresFull => {
-            let database_url = config.database.url.trim();
-            if database_url.is_empty() {
-                anyhow::bail!(
-                    "database.mode={} requires non-empty [database].url",
-                    config.database.mode.as_str()
-                );
-            }
-
-            let store = match shared_pg_pool {
-                Some(pool) => OperationalStore::postgres_with_pool(pool).await,
-                None => {
-                    OperationalStore::postgres(database_url, config.database.max_connections).await
-                }
-            }
-            .with_context(|| {
-                format!(
-                    "failed to initialize Postgres operational store ({})",
-                    redact_database_url(database_url)
-                )
-            })?;
-
-            Ok((store, None, None))
-        }
-    }
+    shared_pg_pool: std::sync::Arc<sqlx::PgPool>,
+) -> Result<OperationalStore> {
+    let database_url = config.database.url.trim();
+    OperationalStore::postgres_with_pool(shared_pg_pool)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to initialize Postgres operational store ({})",
+                redact_database_url(database_url)
+            )
+        })
 }
 
 async fn initialize_runtime_registry(
     config: &FleetConfig,
-    sqlite_pool: Option<DbPool>,
-    shared_pg_pool: Option<std::sync::Arc<sqlx::PgPool>>,
+    shared_pg_pool: std::sync::Arc<sqlx::PgPool>,
 ) -> Result<RuntimeRegistryStore> {
-    match config.database.mode {
-        DatabaseMode::EmbeddedSqlite => {
-            let Some(pool) = sqlite_pool else {
-                anyhow::bail!(
-                    "database.mode=embedded_sqlite requires initialized embedded sqlite pool"
-                );
-            };
-            Ok(RuntimeRegistryStore::sqlite(pool))
-        }
-        DatabaseMode::PostgresRuntime | DatabaseMode::PostgresFull => {
-            let database_url = config.database.url.trim();
-            if database_url.is_empty() {
-                anyhow::bail!(
-                    "database.mode={} requires non-empty [database].url",
-                    config.database.mode.as_str()
-                );
-            }
-
-            match shared_pg_pool {
-                Some(pool) => RuntimeRegistryStore::postgres_with_pool(pool).await,
-                None => {
-                    RuntimeRegistryStore::postgres(database_url, config.database.max_connections)
-                        .await
-                }
-            }
-            .with_context(|| {
-                format!(
-                    "failed to initialize Postgres runtime registry ({})",
-                    redact_database_url(database_url)
-                )
-            })
-        }
-    }
+    let database_url = config.database.url.trim();
+    RuntimeRegistryStore::postgres_with_pool(shared_pg_pool)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to initialize Postgres runtime registry ({})",
+                redact_database_url(database_url)
+            )
+        })
 }
 
 fn log_database_mode_summary(
     config: &FleetConfig,
-    sqlite_path: Option<&Path>,
     operational_store: &OperationalStore,
     runtime_registry: &RuntimeRegistryStore,
 ) {
     match config.database.mode {
-        DatabaseMode::EmbeddedSqlite => {
-            let path_display = sqlite_path
-                .map(|path| path.display().to_string())
-                .unwrap_or_else(|| "<unknown>".to_string());
-            info!(
-                mode = "embedded_sqlite",
-                sqlite_path = %path_display,
-                operational_store = operational_store.backend_label(),
-                runtime_registry = runtime_registry.backend_label(),
-                "database mode active"
-            );
-        }
         DatabaseMode::PostgresRuntime => {
-            if let Some(path) = sqlite_path {
-                warn!(
-                    sqlite_path = %path.display(),
-                    "sqlite path still configured but ignored in postgres_runtime mode"
-                );
-            }
-
             info!(
                 mode = "postgres_runtime",
                 postgres_url = %redact_database_url(&config.database.url),
