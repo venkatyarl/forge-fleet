@@ -1411,7 +1411,7 @@ mod tests {
             .expect("open sqlite raw connection");
         run_migrations(&conn).expect("run sqlite migrations");
 
-        OperationalStore::sqlite(pool)
+        panic!("OperationalStore is Postgres-only; SQLite-backed MC test harness removed")
     }
 
     #[tokio::test]

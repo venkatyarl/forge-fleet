@@ -1132,7 +1132,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let handle = tokio::spawn(run(
             EmbeddedAgentConfig::heartbeat_only("taylor".into()),
-            OperationalStore::sqlite(pool.clone()),
+            panic!("OperationalStore is Postgres-only; SQLite-backed agent test harness removed"),
             shutdown_rx,
         ));
 
@@ -1167,7 +1167,7 @@ mod tests {
 
         let handle = tokio::spawn(run(
             cfg,
-            OperationalStore::sqlite(pool.clone()),
+            panic!("OperationalStore is Postgres-only; SQLite-backed agent test harness removed"),
             shutdown_rx,
         ));
 
@@ -1256,7 +1256,7 @@ mod tests {
 
         let handle = tokio::spawn(run(
             cfg,
-            OperationalStore::sqlite(pool.clone()),
+            panic!("OperationalStore is Postgres-only; SQLite-backed agent test harness removed"),
             shutdown_rx,
         ));
 

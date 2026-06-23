@@ -18,8 +18,8 @@ use ff_api::quality_tracker::{Outcome, QualityTracker, QualityTrackerConfig};
 use ff_api::registry::{BackendEndpoint, BackendRegistry};
 use ff_api::router::{TierRouter, TierRouterConfig, TierTimeouts};
 use ff_api::types::{ChatCompletionRequest, ChatMessage};
-use ff_core::config::{self, DatabaseMode, FleetConfig};
-use ff_db::{DbPool, DbPoolConfig, ModelDeploymentRow, OperationalStore, run_migrations};
+use ff_core::config::{self, FleetConfig};
+use ff_db::{ModelDeploymentRow, OperationalStore};
 use ff_discovery::health::{HealthMonitor, HealthStatus, HealthTarget};
 use ff_discovery::ports::known_llm_ports;
 use ff_discovery::scanner::{
@@ -3879,122 +3879,26 @@ async fn persist_quality_snapshot(tracker: &Arc<QualityTracker>) {
     }
 }
 
-fn sqlite_candidates() -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-
-    if let Ok(path) = std::env::var("FORGEFLEET_DB_PATH") {
-        candidates.push(PathBuf::from(path));
-    }
-
-    if let Ok(home) = std::env::var("HOME") {
-        candidates.push(
-            PathBuf::from(home)
-                .join(".forgefleet")
-                .join("forgefleet.db"),
-        );
-    }
-
-    candidates.push(PathBuf::from("forgefleet.db"));
-    candidates
-}
-
-fn resolve_embedded_sqlite_path(
-    config: &FleetConfig,
-    config_path: &Path,
-) -> Result<PathBuf, String> {
-    if let Some(raw) = config
-        .database
-        .sqlite_path
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        let candidate = PathBuf::from(raw);
-        if candidate.is_absolute() {
-            return Ok(candidate);
-        }
-
-        let parent = config_path.parent().ok_or_else(|| {
-            "unable to resolve config parent directory for sqlite path".to_string()
-        })?;
-        return Ok(parent.join(candidate));
-    }
-
-    let parent = config_path
-        .parent()
-        .ok_or_else(|| "unable to resolve config parent directory for sqlite path".to_string())?;
-    Ok(parent.join("forgefleet.db"))
-}
-
-fn open_embedded_sqlite_store(db_path: &Path) -> Result<OperationalStore, String> {
-    if let Some(parent) = db_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("failed to create sqlite parent '{}': {e}", parent.display()))?;
-    }
-
-    let pool = DbPool::open(DbPoolConfig::with_path(db_path))
-        .map_err(|e| format!("failed to open sqlite db '{}': {e}", db_path.display()))?;
-
-    let conn = pool
-        .open_raw_connection()
-        .map_err(|e| format!("failed opening sqlite raw connection: {e}"))?;
-    run_migrations(&conn).map_err(|e| format!("sqlite migration failed: {e}"))?;
-
-    Ok(OperationalStore::sqlite(pool))
-}
-
-fn open_legacy_sqlite_store() -> Result<OperationalStore, String> {
-    let mut errors = Vec::new();
-
-    for path in sqlite_candidates() {
-        match open_embedded_sqlite_store(&path) {
-            Ok(store) => return Ok(store),
-            Err(err) => {
-                errors.push(format!("{} ({err})", path.display()));
-            }
-        }
-    }
-
-    Err(format!(
-        "unable to initialize sqlite operational store from fallback candidates: {}",
-        errors.join("; ")
-    ))
-}
-
 async fn open_operational_store() -> Result<OperationalStore, String> {
-    // Test override: if FORGEFLEET_DB_PATH is set, use it directly as SQLite.
-    if let Ok(db_path) = std::env::var("FORGEFLEET_DB_PATH") {
-        return open_embedded_sqlite_store(std::path::Path::new(&db_path));
-    }
-
     match load_config_auto() {
-        Ok((config, config_path)) => match config.database.mode {
-            DatabaseMode::EmbeddedSqlite => {
-                let sqlite_path = resolve_embedded_sqlite_path(&config, &config_path)?;
-                open_embedded_sqlite_store(&sqlite_path)
+        Ok((config, _config_path)) => {
+            let database_url = config.database.url.trim();
+            if database_url.is_empty() {
+                return Err(format!(
+                    "database.mode={} requires non-empty [database].url",
+                    config.database.mode.as_str()
+                ));
             }
-            DatabaseMode::PostgresRuntime | DatabaseMode::PostgresFull => {
-                let database_url = config.database.url.trim();
-                if database_url.is_empty() {
-                    return Err(format!(
-                        "database.mode={} requires non-empty [database].url",
-                        config.database.mode.as_str()
-                    ));
-                }
 
-                OperationalStore::postgres(database_url, config.database.max_connections)
-                    .await
-                    .map_err(|e| {
-                        format!(
-                            "failed to initialize Postgres operational store for MCP handlers: {e}"
-                        )
-                    })
-            }
-        },
-        Err(err) => {
-            warn!(error = %err, "failed to load fleet config; falling back to sqlite candidates for MCP persistence");
-            open_legacy_sqlite_store()
+            OperationalStore::postgres(database_url, config.database.max_connections)
+                .await
+                .map_err(|e| {
+                    format!("failed to initialize Postgres operational store for MCP handlers: {e}")
+                })
         }
+        Err(err) => Err(format!(
+            "failed to load fleet config for Postgres operational store: {err}"
+        )),
     }
 }
 

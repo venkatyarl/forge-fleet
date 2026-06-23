@@ -1077,11 +1077,8 @@ fn default_require_shared_secret() -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum DatabaseMode {
-    /// Full embedded SQLite runtime (default).
+    /// Runtime/operational persistence in Postgres.
     #[default]
-    EmbeddedSqlite,
-    /// Transitional mode: runtime registry + enrollment events in Postgres,
-    /// while legacy tables remain in embedded SQLite.
     #[serde(alias = "postgres")]
     PostgresRuntime,
     /// Target end-state mode: all runtime persistence should be Postgres.
@@ -1095,7 +1092,6 @@ pub enum DatabaseMode {
 impl DatabaseMode {
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::EmbeddedSqlite => "embedded_sqlite",
             Self::PostgresRuntime => "postgres_runtime",
             Self::PostgresFull => "postgres_full",
         }
@@ -1353,8 +1349,7 @@ fn default_ctx_size() -> u32 {
 /// - `FORGEFLEET_API_PORT` → fleet.api_port
 /// - `FORGEFLEET_HEARTBEAT_INTERVAL` → fleet.heartbeat_interval_secs
 /// - `FORGEFLEET_HEARTBEAT_TIMEOUT` → fleet.heartbeat_timeout_secs
-/// - `FORGEFLEET_DATABASE_MODE` → database.mode (`embedded_sqlite` | `postgres_runtime` | `postgres_full`)
-/// - `FORGEFLEET_DATABASE_SQLITE_PATH` → database.sqlite_path
+/// - `FORGEFLEET_DATABASE_MODE` → database.mode (`postgres_runtime` | `postgres_full`)
 /// - `FORGEFLEET_DATABASE_URL` → database.url
 /// - `FORGEFLEET_DATABASE_MAX_CONNECTIONS` → database.max_connections
 /// - `FORGEFLEET_DATABASE_CUTOVER_EVIDENCE` → database.cutover_evidence
@@ -1390,9 +1385,6 @@ pub fn apply_env_overrides(config: &mut FleetConfig) {
     if let Ok(v) = std::env::var("FORGEFLEET_DATABASE_MODE") {
         let normalized = v.trim().to_ascii_lowercase();
         match normalized.as_str() {
-            "embedded_sqlite" | "sqlite" => {
-                config.database.mode = DatabaseMode::EmbeddedSqlite;
-            }
             "postgres_runtime" | "postgres" => {
                 config.database.mode = DatabaseMode::PostgresRuntime;
             }
@@ -1403,11 +1395,6 @@ pub fn apply_env_overrides(config: &mut FleetConfig) {
                 warn!(value = %v, "invalid FORGEFLEET_DATABASE_MODE; keeping configured mode");
             }
         }
-    }
-    if let Ok(v) = std::env::var("FORGEFLEET_DATABASE_SQLITE_PATH")
-        && !v.trim().is_empty()
-    {
-        config.database.sqlite_path = Some(v.trim().to_string());
     }
     if let Ok(v) = std::env::var("FORGEFLEET_DATABASE_URL") {
         info!("env override: database URL");
@@ -1646,15 +1633,7 @@ impl ConfigHandle {
                         "postgres_full" | "full_postgres" | "full-postgres" => {
                             DatabaseMode::PostgresFull
                         }
-                        _ => DatabaseMode::EmbeddedSqlite,
-                    };
-                }
-                "database.sqlite_path" => {
-                    let value = entry.value().trim();
-                    config.database.sqlite_path = if value.is_empty() {
-                        None
-                    } else {
-                        Some(value.to_string())
+                        _ => config.database.mode.clone(),
                     };
                 }
                 "database.url" => config.database.url = entry.value().clone(),
@@ -2064,7 +2043,7 @@ notes = "Setup started."
         assert_eq!(config.fleet.api_port, 51000);
         assert_eq!(config.leader.preferred, "taylor");
         assert_eq!(config.database.max_connections, 10);
-        assert_eq!(config.database.mode, DatabaseMode::EmbeddedSqlite);
+        assert_eq!(config.database.mode, DatabaseMode::PostgresRuntime);
         assert!(config.loops.evolution.enabled);
         assert!(config.loops.self_heal.enabled);
         assert!(config.nodes.is_empty());

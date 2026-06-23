@@ -1,4 +1,4 @@
-//! Operational persistence abstraction (SQLite or Postgres).
+//! Operational persistence abstraction (Postgres).
 //!
 //! Unlike `RuntimeRegistryStore` (runtime heartbeat/enrollment tables only),
 //! this store covers the broader operational tables used by live gateway/agent
@@ -12,24 +12,17 @@ use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 use tracing::info;
 
 use crate::{
-    DbPool,
     error::DbError,
-    queries::{self, AuditLogRow, AutonomyEventRow, TaskRow, WorkerRow},
+    queries::{AuditLogRow, AutonomyEventRow, TaskRow, WorkerRow},
 };
 
 #[derive(Debug, Clone)]
 pub enum OperationalStore {
-    /// Persist operational tables in embedded SQLite.
-    Sqlite(DbPool),
     /// Persist operational tables in Postgres.
     Postgres(Arc<PgPool>),
 }
 
 impl OperationalStore {
-    pub fn sqlite(pool: DbPool) -> Self {
-        Self::Sqlite(pool)
-    }
-
     pub async fn postgres(database_url: &str, max_connections: u32) -> Result<Self, DbError> {
         let pool = PgPoolOptions::new()
             .max_connections(max_connections.max(1))
@@ -55,37 +48,19 @@ impl OperationalStore {
 
     pub fn backend_label(&self) -> &'static str {
         match self {
-            Self::Sqlite(_) => "embedded_sqlite",
             Self::Postgres(_) => "postgres",
-        }
-    }
-
-    pub fn sqlite_pool(&self) -> Option<&DbPool> {
-        match self {
-            Self::Sqlite(pool) => Some(pool),
-            Self::Postgres(_) => None,
         }
     }
 
     /// Get a reference to the Postgres pool, if this store is Postgres-backed.
     pub fn pg_pool(&self) -> Option<&PgPool> {
         match self {
-            Self::Sqlite(_) => None,
             Self::Postgres(pool) => Some(pool.as_ref()),
         }
     }
 
     pub async fn health_probe(&self) -> Result<(bool, u64), DbError> {
         match self {
-            Self::Sqlite(pool) => {
-                pool.with_conn(|conn| {
-                    let health: i64 = conn.query_row("SELECT 1", [], |row| row.get(0))?;
-                    let kv_count: i64 =
-                        conn.query_row("SELECT COUNT(*) FROM config_kv", [], |row| row.get(0))?;
-                    Ok((health == 1, kv_count.max(0) as u64))
-                })
-                .await
-            }
             Self::Postgres(pool) => {
                 let health: i64 = sqlx::query_scalar("SELECT 1")
                     .fetch_one(pool.as_ref())
@@ -100,11 +75,6 @@ impl OperationalStore {
 
     pub async fn upsert_node(&self, node: &WorkerRow) -> Result<(), DbError> {
         match self {
-            Self::Sqlite(pool) => {
-                let node = node.clone();
-                pool.with_conn(move |conn| queries::upsert_node(conn, &node))
-                    .await
-            }
             Self::Postgres(pool) => {
                 sqlx::query(
                     r#"
@@ -155,7 +125,6 @@ impl OperationalStore {
 
     pub async fn list_nodes(&self) -> Result<Vec<WorkerRow>, DbError> {
         match self {
-            Self::Sqlite(pool) => pool.with_conn(queries::list_nodes).await,
             Self::Postgres(pool) => {
                 let rows = sqlx::query(
                     r#"
@@ -186,11 +155,6 @@ impl OperationalStore {
 
     pub async fn insert_task(&self, task: &TaskRow) -> Result<(), DbError> {
         match self {
-            Self::Sqlite(pool) => {
-                let task = task.clone();
-                pool.with_conn(move |conn| queries::insert_task(conn, &task))
-                    .await
-            }
             Self::Postgres(pool) => {
                 sqlx::query(
                     r#"
@@ -227,11 +191,6 @@ impl OperationalStore {
 
     pub async fn get_task(&self, task_id: &str) -> Result<Option<TaskRow>, DbError> {
         match self {
-            Self::Sqlite(pool) => {
-                let task_id = task_id.to_string();
-                pool.with_conn(move |conn| queries::get_task(conn, &task_id))
-                    .await
-            }
             Self::Postgres(pool) => {
                 let row = sqlx::query(
                     r#"
@@ -260,11 +219,6 @@ impl OperationalStore {
 
     pub async fn list_tasks_by_status(&self, status: &str) -> Result<Vec<TaskRow>, DbError> {
         match self {
-            Self::Sqlite(pool) => {
-                let status = status.to_string();
-                pool.with_conn(move |conn| queries::list_tasks_by_status(conn, &status))
-                    .await
-            }
             Self::Postgres(pool) => {
                 let rows = sqlx::query(
                     r#"
@@ -295,11 +249,6 @@ impl OperationalStore {
 
     pub async fn claim_next_task(&self, worker_name: &str) -> Result<Option<TaskRow>, DbError> {
         match self {
-            Self::Sqlite(pool) => {
-                let node = worker_name.to_string();
-                pool.with_conn_mut(move |conn| queries::claim_next_task(conn, &node))
-                    .await
-            }
             Self::Postgres(pool) => {
                 let now = now_iso();
                 let row = sqlx::query(
@@ -346,12 +295,6 @@ impl OperationalStore {
 
     pub async fn set_task_status(&self, task_id: &str, status: &str) -> Result<bool, DbError> {
         match self {
-            Self::Sqlite(pool) => {
-                let task_id = task_id.to_string();
-                let status = status.to_string();
-                pool.with_conn(move |conn| queries::set_task_status(conn, &task_id, &status))
-                    .await
-            }
             Self::Postgres(pool) => {
                 let normalized = status.trim().to_ascii_lowercase();
                 let now = now_iso();
@@ -407,14 +350,6 @@ impl OperationalStore {
         duration_ms: i64,
     ) -> Result<(), DbError> {
         match self {
-            Self::Sqlite(pool) => {
-                let task_id = task_id.to_string();
-                let output = output.to_string();
-                pool.with_conn(move |conn| {
-                    queries::record_task_result(conn, &task_id, success, &output, duration_ms)
-                })
-                .await
-            }
             Self::Postgres(pool) => {
                 let now = now_iso();
                 sqlx::query(
@@ -447,14 +382,6 @@ impl OperationalStore {
         lease_secs: i64,
     ) -> Result<bool, DbError> {
         match self {
-            Self::Sqlite(pool) => {
-                let task_id = task_id.to_string();
-                let owner_node = owner_node.to_string();
-                pool.with_conn(move |conn| {
-                    queries::ownership_claim(conn, &task_id, &owner_node, lease_secs)
-                })
-                .await
-            }
             Self::Postgres(pool) => {
                 let now = Utc::now();
                 let now_iso = now.to_rfc3339_opts(SecondsFormat::Millis, true);
@@ -502,12 +429,6 @@ impl OperationalStore {
         owner_node: &str,
     ) -> Result<bool, DbError> {
         match self {
-            Self::Sqlite(pool) => {
-                let task_id = task_id.to_string();
-                let owner_node = owner_node.to_string();
-                pool.with_conn(move |conn| queries::ownership_release(conn, &task_id, &owner_node))
-                    .await
-            }
             Self::Postgres(pool) => {
                 let now_iso = now_iso();
                 let changed = sqlx::query(
@@ -543,25 +464,6 @@ impl OperationalStore {
         worker_name: Option<&str>,
     ) -> Result<i64, DbError> {
         match self {
-            Self::Sqlite(pool) => {
-                let event_type = event_type.to_string();
-                let actor = actor.to_string();
-                let target = target.map(ToString::to_string);
-                let details_json = details_json.to_string();
-                let worker_name = worker_name.map(ToString::to_string);
-
-                pool.with_conn(move |conn| {
-                    queries::audit_log(
-                        conn,
-                        &event_type,
-                        &actor,
-                        target.as_deref(),
-                        &details_json,
-                        worker_name.as_deref(),
-                    )
-                })
-                .await
-            }
             Self::Postgres(pool) => {
                 let row = sqlx::query(
                     r#"
@@ -593,10 +495,6 @@ impl OperationalStore {
 
     pub async fn recent_audit_log(&self, limit: u32) -> Result<Vec<AuditLogRow>, DbError> {
         match self {
-            Self::Sqlite(pool) => {
-                pool.with_conn(move |conn| queries::recent_audit_log(conn, limit))
-                    .await
-            }
             Self::Postgres(pool) => {
                 let clamped = limit.clamp(1, 500) as i64;
                 let rows = sqlx::query(
@@ -631,22 +529,6 @@ impl OperationalStore {
         reason: &str,
     ) -> Result<i64, DbError> {
         match self {
-            Self::Sqlite(pool) => {
-                let event_type = event_type.to_string();
-                let action_type = action_type.to_string();
-                let decision = decision.to_string();
-                let reason = reason.to_string();
-                pool.with_conn(move |conn| {
-                    queries::insert_autonomy_event(
-                        conn,
-                        &event_type,
-                        &action_type,
-                        &decision,
-                        &reason,
-                    )
-                })
-                .await
-            }
             Self::Postgres(pool) => {
                 let row = sqlx::query(
                     r#"
@@ -678,10 +560,6 @@ impl OperationalStore {
         limit: u32,
     ) -> Result<Vec<AutonomyEventRow>, DbError> {
         match self {
-            Self::Sqlite(pool) => {
-                pool.with_conn(move |conn| queries::list_recent_autonomy_events(conn, limit))
-                    .await
-            }
             Self::Postgres(pool) => {
                 let clamped = limit.clamp(1, 500) as i64;
                 let rows = sqlx::query(
@@ -711,25 +589,6 @@ impl OperationalStore {
         size_bytes: Option<u64>,
     ) -> Result<i64, DbError> {
         match self {
-            Self::Sqlite(pool) => {
-                let chat_id = chat_id.to_string();
-                let message_id = message_id.to_string();
-                let media_kind = media_kind.to_string();
-                let local_path = local_path.to_string();
-                let mime_type = mime_type.map(ToString::to_string);
-                pool.with_conn(move |conn| {
-                    queries::insert_telegram_media_ingest(
-                        conn,
-                        &chat_id,
-                        &message_id,
-                        &media_kind,
-                        &local_path,
-                        mime_type.as_deref(),
-                        size_bytes,
-                    )
-                })
-                .await
-            }
             Self::Postgres(pool) => {
                 let row = sqlx::query(
                     r#"
@@ -762,12 +621,6 @@ impl OperationalStore {
 
     pub async fn config_set(&self, key: &str, value: &str) -> Result<(), DbError> {
         match self {
-            Self::Sqlite(pool) => {
-                let key = key.to_string();
-                let value = value.to_string();
-                pool.with_conn(move |conn| queries::config_set(conn, &key, &value))
-                    .await
-            }
             Self::Postgres(pool) => {
                 let now = now_iso();
                 sqlx::query(
@@ -791,11 +644,6 @@ impl OperationalStore {
 
     pub async fn config_get(&self, key: &str) -> Result<Option<String>, DbError> {
         match self {
-            Self::Sqlite(pool) => {
-                let key = key.to_string();
-                pool.with_conn(move |conn| queries::config_get(conn, &key))
-                    .await
-            }
             Self::Postgres(pool) => {
                 let value =
                     sqlx::query_scalar::<_, String>("SELECT value FROM config_kv WHERE key = $1")
@@ -809,17 +657,6 @@ impl OperationalStore {
 
     pub async fn config_delete(&self, key: &str) -> Result<bool, DbError> {
         match self {
-            Self::Sqlite(pool) => {
-                let key = key.to_string();
-                pool.with_conn(move |conn| {
-                    let changed = conn.execute(
-                        "DELETE FROM config_kv WHERE key = ?1",
-                        rusqlite::params![key],
-                    )?;
-                    Ok(changed > 0)
-                })
-                .await
-            }
             Self::Postgres(pool) => {
                 let changed = sqlx::query("DELETE FROM config_kv WHERE key = $1")
                     .bind(key)
@@ -840,23 +677,6 @@ impl OperationalStore {
         let like_pattern = format!("{}%", prefix);
 
         match self {
-            Self::Sqlite(pool) => {
-                pool.with_conn(move |conn| {
-                    let mut stmt = conn.prepare(
-                        "SELECT key, value FROM config_kv WHERE key LIKE ?1 ORDER BY key ASC LIMIT ?2",
-                    )?;
-                    let rows = stmt.query_map(rusqlite::params![like_pattern, clamped], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                    })?;
-
-                    let mut collected = Vec::new();
-                    for row in rows {
-                        collected.push(row?);
-                    }
-                    Ok(collected)
-                })
-                .await
-            }
             Self::Postgres(pool) => {
                 let rows = sqlx::query(
                     "SELECT key, value FROM config_kv WHERE key LIKE $1 ORDER BY key ASC LIMIT $2",
@@ -879,9 +699,7 @@ impl OperationalStore {
     }
 
     async fn ensure_postgres_schema(&self) -> Result<(), DbError> {
-        let Self::Postgres(pool) = self else {
-            return Ok(());
-        };
+        let Self::Postgres(pool) = self;
 
         // Core fleet metadata
         sqlx::query(

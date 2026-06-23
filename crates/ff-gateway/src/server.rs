@@ -3976,7 +3976,9 @@ mod fleet_visibility_tests {
         .expect("migrations should apply");
 
         let mut state = GatewayState::new(MessageRouter::default());
-        state.operational_store = Some(OperationalStore::sqlite(pool.clone()));
+        state.operational_store = Some(panic!(
+            "OperationalStore is Postgres-only; SQLite-backed gateway test harness removed"
+        ));
         state.runtime_registry = Some(RuntimeRegistryStore::sqlite(pool.clone()));
 
         let mut cfg = FleetConfig::default();
@@ -4021,7 +4023,9 @@ mod fleet_visibility_tests {
         .expect("migrations should apply");
 
         let mut state = GatewayState::new(MessageRouter::default());
-        state.operational_store = Some(OperationalStore::sqlite(pool.clone()));
+        state.operational_store = Some(panic!(
+            "OperationalStore is Postgres-only; SQLite-backed gateway test harness removed"
+        ));
         state.runtime_registry = Some(RuntimeRegistryStore::sqlite(pool.clone()));
 
         let mut cfg = FleetConfig::default();
@@ -4091,7 +4095,9 @@ mod fleet_visibility_tests {
         .expect("migrations should apply");
 
         let mut state = GatewayState::new(MessageRouter::default());
-        state.operational_store = Some(OperationalStore::sqlite(pool.clone()));
+        state.operational_store = Some(panic!(
+            "OperationalStore is Postgres-only; SQLite-backed gateway test harness removed"
+        ));
         state.runtime_registry = Some(RuntimeRegistryStore::sqlite(pool.clone()));
         let state = Arc::new(state);
 
@@ -4172,7 +4178,9 @@ mod fleet_visibility_tests {
         .expect("seed runtime heartbeat row");
 
         let mut state = GatewayState::new(MessageRouter::default());
-        state.operational_store = Some(OperationalStore::sqlite(pool.clone()));
+        state.operational_store = Some(panic!(
+            "OperationalStore is Postgres-only; SQLite-backed gateway test harness removed"
+        ));
         state.runtime_registry = Some(RuntimeRegistryStore::sqlite(pool.clone()));
 
         let payload = build_fleet_status_payload(&state)
@@ -4424,7 +4432,6 @@ async fn settings_runtime(State(state): State<Arc<GatewayState>>) -> Json<Value>
                 }),
                 json!({
                     "mode": cfg.database.mode.as_str(),
-                    "sqlite_path": cfg.database.sqlite_path.clone(),
                     "url_present": !cfg.database.url.trim().is_empty(),
                     "url_scheme": url_scheme(&cfg.database.url),
                     "host": cfg.database.host.clone(),
@@ -4507,29 +4514,13 @@ async fn settings_runtime(State(state): State<Arc<GatewayState>>) -> Json<Value>
 
         match ping {
             Ok((ping_ok, kv_count)) => {
-                if let Some(pool) = store.sqlite_pool() {
-                    let path = pool.path().to_string_lossy().to_string();
-                    let exists = std::path::Path::new(&path).exists();
-                    json!({
-                        "active_mode": backend,
-                        "status": if ping_ok { "ready" } else { "degraded" },
-                        "sqlite": {
-                            "path": path,
-                            "file_exists": exists,
-                            "wal_mode": pool.config().wal_mode,
-                            "max_connections": pool.config().max_connections,
-                            "config_kv_entries": kv_count,
-                        }
-                    })
-                } else {
-                    json!({
-                        "active_mode": backend,
-                        "status": if ping_ok { "ready" } else { "degraded" },
-                        "postgres": {
-                            "config_kv_entries": kv_count,
-                        }
-                    })
-                }
+                json!({
+                    "active_mode": backend,
+                    "status": if ping_ok { "ready" } else { "degraded" },
+                    "postgres": {
+                        "config_kv_entries": kv_count,
+                    }
+                })
             }
             Err(err) => json!({
                 "active_mode": backend,
