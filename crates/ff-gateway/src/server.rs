@@ -31,7 +31,6 @@ use ff_api::registry::BackendRegistry;
 use ff_api::router::{ModelRouter, TierRouter, TierRouterConfig, TierTimeouts};
 use ff_api::token_ledger::{CostTracker, FleetCostSummary, ModelCostStats, TokenUsageRecord};
 use ff_api::types::ChatCompletionRequest;
-use ff_db::sync::LeaderSync;
 use ff_db::{OperationalStore, RuntimeRegistryStore, queries};
 use ff_discovery::health::HealthStatus;
 use ff_discovery::{FleetComputer, NodeRegistry};
@@ -117,8 +116,6 @@ pub struct GatewayState {
     pub http_client: reqwest::Client,
     /// Discovery registry for fleet node status.
     pub discovery_registry: Option<Arc<NodeRegistry>>,
-    /// Leader sync coordinator for replication endpoints.
-    pub leader_sync: Option<Arc<LeaderSync>>,
     /// Operational persistence store for metadata endpoints.
     pub operational_store: Option<OperationalStore>,
     /// Runtime registry persistence backend (SQLite/Postgres).
@@ -179,7 +176,6 @@ impl GatewayState {
                 .build()
                 .expect("build reqwest client"),
             discovery_registry: None,
-            leader_sync: None,
             operational_store: None,
             runtime_registry: None,
             update_state: Arc::new(tokio::sync::RwLock::new(UpdateRolloutState::default())),
@@ -748,10 +744,6 @@ pub fn build_router(state: Arc<GatewayState>) -> Router {
         )
         .route("/v1/internal/delegate", post(internal_delegate))
         .route("/v1/async/{ticket}", get(async_poll))
-        // ─── Replication routes ──────────────────────────────────────
-        .route("/api/fleet/replicate/snapshot", post(replicate_snapshot))
-        .route("/api/fleet/replicate/sequence", get(replicate_sequence))
-        .route("/api/fleet/replicate/pull", post(replicate_pull))
         // ─── Distributed tracing routes ──────────────────────────────
         .route("/api/traces/recent", get(traces_recent))
         // ─── Agent session routes ───────────────────────────────────
@@ -2408,11 +2400,6 @@ async fn build_fleet_status_payload(
         .map(|registry| registry.list_nodes())
         .unwrap_or_default();
 
-    let leader_sequence = state
-        .leader_sync
-        .as_ref()
-        .map(|sync| sync.current_sequence());
-
     let fleet_config = if let Some(cfg_lock) = &state.fleet_config {
         Some(cfg_lock.read().await.clone())
     } else {
@@ -2440,7 +2427,7 @@ async fn build_fleet_status_payload(
         leader_hint,
         fleet_config.as_ref(),
         db_snapshot.as_ref(),
-        leader_sequence,
+        None,
     ))
 }
 
@@ -6163,118 +6150,6 @@ async fn update_abort(State(state): State<Arc<GatewayState>>) -> Json<Value> {
     rollout.stage = Some("aborted".to_string());
     rollout.completed_at = Some(Utc::now().to_rfc3339());
     Json(json!({"status": "ok", "message": "rollout aborted"}))
-}
-
-// ─── Replication ─────────────────────────────────────────────────────────────
-
-/// POST /api/fleet/replicate/snapshot — leader creates and serves a full DB snapshot.
-async fn replicate_snapshot(
-    State(state): State<Arc<GatewayState>>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let Some(leader_sync) = &state.leader_sync else {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(
-                json!({"error": {"message": "replication not configured (this node is not a leader)", "type": "not_leader"}}),
-            ),
-        ));
-    };
-
-    match leader_sync.create_fresh_snapshot().await {
-        Ok(meta) => Ok(Json(json!({
-            "status": "ok",
-            "snapshot": meta,
-        }))),
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(
-                json!({"error": {"message": format!("snapshot creation failed: {e}"), "type": "snapshot_error"}}),
-            ),
-        )),
-    }
-}
-
-/// GET /api/fleet/replicate/sequence — returns current WAL sequence number.
-async fn replicate_sequence(
-    State(state): State<Arc<GatewayState>>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let Some(leader_sync) = &state.leader_sync else {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(
-                json!({"error": {"message": "replication not configured (this node is not a leader)", "type": "not_leader"}}),
-            ),
-        ));
-    };
-
-    let sequence = leader_sync.current_sequence();
-    Ok(Json(json!({
-        "sequence": sequence,
-    })))
-}
-
-/// POST /api/fleet/replicate/pull — follower requests changes since sequence N.
-///
-/// Request body: `{ "since_sequence": 5 }`
-///
-/// Response:
-/// - If up to date: `{ "status": "up_to_date", "sequence": N }`
-/// - If behind: binary snapshot with `X-Snapshot-Meta` header containing JSON metadata.
-#[derive(Debug, Deserialize)]
-struct PullRequest {
-    since_sequence: u64,
-}
-
-async fn replicate_pull(
-    State(state): State<Arc<GatewayState>>,
-    Json(payload): Json<PullRequest>,
-) -> Result<Response<Body>, (StatusCode, Json<Value>)> {
-    let Some(leader_sync) = &state.leader_sync else {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(
-                json!({"error": {"message": "replication not configured (this node is not a leader)", "type": "not_leader"}}),
-            ),
-        ));
-    };
-
-    let result = leader_sync.handle_pull(payload.since_sequence).await.map_err(|e| (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({"error": {"message": format!("pull failed: {e}"), "type": "pull_error"}})),
-    ))?;
-
-    match result {
-        None => {
-            // Follower is up to date.
-            let body = serde_json::to_string(&json!({
-                "status": "up_to_date",
-                "sequence": leader_sync.current_sequence(),
-            }))
-            .unwrap();
-
-            Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(body))
-                .unwrap())
-        }
-        Some((meta, path)) => {
-            // Read the snapshot file and serve it as binary.
-            let bytes = tokio::fs::read(&path).await.map_err(|e| (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": {"message": format!("read snapshot file: {e}"), "type": "io_error"}})),
-            ))?;
-
-            let meta_json = serde_json::to_string(&meta).unwrap_or_default();
-
-            Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "application/octet-stream")
-                .header("X-Snapshot-Meta", meta_json)
-                .body(Body::from(bytes))
-                .unwrap())
-        }
-    }
 }
 
 // ─── Dashboard ───────────────────────────────────────────────────────────────

@@ -8,11 +8,7 @@
 //! - **queries** — Typed SQLite helpers for common CRUD operations
 //! - **runtime_registry** — SQLite/Postgres abstraction for runtime node + enrollment tables
 //! - **operational_store** — SQLite/Postgres abstraction for live operational tables
-//! - **replication** — Leader→follower WAL-based sync via SQLite backup API
-//! - **backup** — Periodic backup to file and restore
-//! - **sync** — High-level replication coordinator (leader/follower sync loops, backup scheduler)
 
-pub mod backup;
 pub mod connection;
 pub mod dsn_of_record;
 pub mod leader_state;
@@ -20,10 +16,8 @@ pub mod migrations;
 pub mod operational_store;
 pub mod pm;
 pub mod queries;
-pub mod replication;
 pub mod runtime_registry;
 pub mod schema;
-pub mod sync;
 
 pub use leader_state::*;
 
@@ -250,10 +244,6 @@ pub use queries::{
 };
 pub use runtime_registry::RuntimeRegistryStore;
 pub use sqlx::PgPool;
-pub use sync::{
-    BackupScheduler, FollowerSync, LeaderSync, ReplicationBackupHelperAvailability, SyncConfig,
-    SyncRole,
-};
 
 /// Convenience re-export of our error type.
 pub use crate::error::DbError;
