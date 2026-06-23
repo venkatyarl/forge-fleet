@@ -1,15 +1,13 @@
 //! `ff-db` — ForgeFleet persistence adapters.
 //!
-//! Embedded SQLite + Postgres persistence adapters for ForgeFleet.
+//! Postgres persistence adapters for ForgeFleet.
 //!
-//! - **connection** — SQLite connection pool with WAL mode, pragma tuning
-//! - **migrations** — Forward-only SQLite schema versioning with embedded SQL
-//! - **schema** — SQLite table definitions (nodes, models, tasks, memories, etc.)
-//! - **queries** — Typed SQLite helpers for common CRUD operations
-//! - **runtime_registry** — SQLite/Postgres abstraction for runtime node + enrollment tables
-//! - **operational_store** — SQLite/Postgres abstraction for live operational tables
+//! - **migrations** — Forward-only Postgres schema versioning with embedded SQL
+//! - **schema** — Postgres table definitions
+//! - **queries** — Typed Postgres helpers for common CRUD operations
+//! - **runtime_registry** — Postgres runtime node + enrollment tables
+//! - **operational_store** — Postgres operational tables
 
-pub mod connection;
 pub mod dsn_of_record;
 pub mod leader_state;
 pub mod migrations;
@@ -21,8 +19,7 @@ pub mod schema;
 
 pub use leader_state::*;
 
-pub use connection::{DbPool, DbPoolConfig};
-pub use migrations::{run_migrations, run_postgres_migrations};
+pub use migrations::run_postgres_migrations;
 pub use operational_store::OperationalStore;
 pub use queries::{
     AgentReadinessRow,
@@ -252,9 +249,6 @@ pub mod error {
     /// Database-specific error type for ff-db.
     #[derive(Debug, thiserror::Error)]
     pub enum DbError {
-        #[error("SQLite error: {0}")]
-        Sqlite(#[from] rusqlite::Error),
-
         #[error("migration error: {0}")]
         Migration(String),
 

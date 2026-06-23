@@ -4,13 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "ForgeFleet embedded SQLite database — connection pool, migrations, replication, backup"
+description = "ForgeFleet Postgres database adapters, migrations, replication, backup"
 
 [dependencies]
 ff-core = { path = "../ff-core" }
-
-# SQLite — bundled so we compile libsqlite3 from source (zero system deps)
-rusqlite = { version = "0.32", features = ["bundled", "backup"] }
 
 # Async runtime
 tokio = { workspace = true, features = ["sync", "time", "fs", "rt"] }

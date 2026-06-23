@@ -98,8 +98,8 @@ impl AppState {
     ///
     /// # Example
     /// ```ignore
-    /// let pool = ff_db::DbPool::open(config)?;
-    /// let state = state.with_db(pool);
+    /// let store = ff_db::OperationalStore::postgres(database_url, 5).await?;
+    /// let state = state.with_db(store);
     /// ```
     pub fn with_db<T: Send + Sync + 'static>(mut self, pool: T) -> Self {
         self.db_pool = Some(Arc::new(pool));

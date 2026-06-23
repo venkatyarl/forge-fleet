@@ -210,8 +210,8 @@ struct FileParse {
     /// pattern) to the real symbol instead of fabricating a `code:extern`.
     glob_imports: Vec<String>,
     /// `pub use` re-exports: (facade_qn, real_target_qn). A facade crate root
-    /// (`pub use crate::migrations::run_migrations;` in `ff_db`'s lib.rs) makes
-    /// `ff_db::run_migrations` an alias for `ff_db::migrations::run_migrations`.
+    /// (`pub use crate::migrations::run_postgres_migrations;` in `ff_db`'s lib.rs) makes
+    /// `ff_db::run_postgres_migrations` an alias for `ff_db::migrations::run_postgres_migrations`.
     /// Calls through the facade path otherwise resolve to a `code:extern`. Both
     /// halves are stored absolute; the corpus-wide map (built in pass 1) drives a
     /// redirect-only pass at resolve time. Rust only.
@@ -1453,8 +1453,8 @@ async fn extract_files(
             }
 
             // Facade redirect (levers #3/#4/#6): a call through a `pub use`
-            // re-export path — named (`ff_db::run_migrations` for
-            // `ff_db::migrations::run_migrations`) or glob (`ff_db::pg_get_current_leader`
+            // re-export path — named (`ff_db::run_postgres_migrations` for
+            // `ff_db::migrations::run_postgres_migrations`) or glob (`ff_db::pg_get_current_leader`
             // re-exported by `pub use leader_state::*;`) — or one the resolver
             // caller-prefixed onto a crate-rooted path
             // (`ff_gateway::brain_api::ff_db::pg_get_brain_user`) lands on a
@@ -5966,16 +5966,16 @@ fn resolve_external_head_call(
 /// call resolved to a `code:extern`:
 ///
 /// - #3 `pub use` re-exports — a facade crate (`ff_db`) re-exports a submodule
-///   item, so `ff_db::run_migrations` is an alias for the real
-///   `ff_db::migrations::run_migrations`; the call lands on the facade path.
+///   item, so `ff_db::run_postgres_migrations` is an alias for the real
+///   `ff_db::migrations::run_postgres_migrations`; the call lands on the facade path.
 /// - #4 crate-root caller-prefixing — `resolve_call` can't tell a crate-rooted
 ///   path (`ff_db::pg_get_brain_user`) from a same-module submodule, so it
 ///   fabricates `<caller_module>::ff_db::pg_get_brain_user`.
 ///
 /// Combine both: re-anchor at a known crate root (#4), then chase the re-export
 /// map to the real symbol (#3). Also handles a type-facade method receiver
-/// (`ff_db::DbPool::open` → real type `ff_db::connection::DbPool` → flattened
-/// method `ff_db::connection::open`). Redirect-only — every branch returns a name
+/// (`ff_db::OperationalStore::postgres` → real type `ff_db::operational_store::OperationalStore` → flattened
+/// method `ff_db::operational_store::postgres`). Redirect-only — every branch returns a name
 /// that is already a known internal fn, so it never fabricates an edge.
 fn resolve_facade_call(
     resolved: &str,
@@ -7215,7 +7215,11 @@ diff --git a/src/b.rs b/src/b.rs
         // `migrations` IS a real child module of ff_db → the relative path was
         // correct; do NOT strip it (would mis-name the extern / lose context).
         assert_eq!(
-            resolve_external_head_call("ff_db::migrations::run_migrations", "ff_db::boot", &mods,),
+            resolve_external_head_call(
+                "ff_db::migrations::run_postgres_migrations",
+                "ff_db::boot",
+                &mods,
+            ),
             None
         );
         // Uppercase head (`Type::method`) is owned by the std-prelude-type /
@@ -7842,7 +7846,10 @@ diff --git a/src/b.rs b/src/b.rs
             Some("ff_db::pg_get_brain_user".to_string())
         );
         // head is already a crate root (position 0) -> nothing to strip.
-        assert_eq!(anchor_at_crate_root("ff_db::run_migrations", &roots), None);
+        assert_eq!(
+            anchor_at_crate_root("ff_db::run_postgres_migrations", &roots),
+            None
+        );
         // no crate root anywhere -> None.
         assert_eq!(anchor_at_crate_root("some::ext::thing", &roots), None);
     }
@@ -7885,47 +7892,52 @@ diff --git a/src/b.rs b/src/b.rs
     fn chase_reexport_follows_chain_to_internal() {
         let map: HashMap<String, String> = [
             (
-                "ff_db::run_migrations".to_string(),
+                "ff_db::run_postgres_migrations".to_string(),
                 "ff_db::a::run".to_string(),
             ),
             (
                 "ff_db::a::run".to_string(),
-                "ff_db::migrations::run_migrations".to_string(),
+                "ff_db::migrations::run_postgres_migrations".to_string(),
             ),
         ]
         .into();
-        let fns: HashSet<String> = ["ff_db::migrations::run_migrations".to_string()].into();
+        let fns: HashSet<String> =
+            ["ff_db::migrations::run_postgres_migrations".to_string()].into();
         assert_eq!(
-            chase_reexport("ff_db::run_migrations", &map, &fns),
-            Some("ff_db::migrations::run_migrations".to_string())
+            chase_reexport("ff_db::run_postgres_migrations", &map, &fns),
+            Some("ff_db::migrations::run_postgres_migrations".to_string())
         );
         // a facade that never lands internal -> None.
         let empty: HashSet<String> = HashSet::new();
-        assert_eq!(chase_reexport("ff_db::run_migrations", &map, &empty), None);
+        assert_eq!(
+            chase_reexport("ff_db::run_postgres_migrations", &map, &empty),
+            None
+        );
     }
 
     #[test]
     fn facade_redirect_resolves_function_reexport() {
-        // ff_db re-exports `run_migrations` at the crate root; the real fn lives in
-        // ff_db::migrations. Doctor hit: `ff_db::run_migrations` fan-in 14.
+        // ff_db re-exports `run_postgres_migrations` at the crate root; the real fn lives in
+        // ff_db::migrations. Doctor hit: `ff_db::run_postgres_migrations` fan-in 14.
         let reexports: HashMap<String, String> = [(
-            "ff_db::run_migrations".to_string(),
-            "ff_db::migrations::run_migrations".to_string(),
+            "ff_db::run_postgres_migrations".to_string(),
+            "ff_db::migrations::run_postgres_migrations".to_string(),
         )]
         .into();
         let roots: HashSet<String> = ["ff_db".to_string()].into();
-        let fns: HashSet<String> = ["ff_db::migrations::run_migrations".to_string()].into();
+        let fns: HashSet<String> =
+            ["ff_db::migrations::run_postgres_migrations".to_string()].into();
         let types: HashSet<String> = HashSet::new();
         assert_eq!(
             resolve_facade_call(
-                "ff_db::run_migrations",
+                "ff_db::run_postgres_migrations",
                 &reexports,
                 &HashMap::new(),
                 &roots,
                 &fns,
                 &types
             ),
-            Some("ff_db::migrations::run_migrations".to_string())
+            Some("ff_db::migrations::run_postgres_migrations".to_string())
         );
     }
 
@@ -8017,27 +8029,28 @@ diff --git a/src/b.rs b/src/b.rs
 
     #[test]
     fn facade_redirect_resolves_type_facade_method() {
-        // Doctor hit: `ff_db::DbPool::open` fan-in 14. The TYPE is re-exported
-        // (`ff_db::DbPool` -> `ff_db::connection::DbPool`); the method is indexed
-        // flattened at the type's real module (`ff_db::connection::open`).
+        // Doctor hit: `ff_db::OperationalStore::postgres` fan-in 14. The TYPE is re-exported
+        // (`ff_db::OperationalStore` -> `ff_db::operational_store::OperationalStore`); the method is indexed
+        // flattened at the type's real module (`ff_db::operational_store::postgres`).
         let reexports: HashMap<String, String> = [(
-            "ff_db::DbPool".to_string(),
-            "ff_db::connection::DbPool".to_string(),
+            "ff_db::OperationalStore".to_string(),
+            "ff_db::operational_store::OperationalStore".to_string(),
         )]
         .into();
         let roots: HashSet<String> = ["ff_db".to_string()].into();
-        let fns: HashSet<String> = ["ff_db::connection::open".to_string()].into();
-        let types: HashSet<String> = ["ff_db::connection::DbPool".to_string()].into();
+        let fns: HashSet<String> = ["ff_db::operational_store::postgres".to_string()].into();
+        let types: HashSet<String> =
+            ["ff_db::operational_store::OperationalStore".to_string()].into();
         assert_eq!(
             resolve_facade_call(
-                "ff_db::DbPool::open",
+                "ff_db::OperationalStore::postgres",
                 &reexports,
                 &HashMap::new(),
                 &roots,
                 &fns,
                 &types
             ),
-            Some("ff_db::connection::open".to_string())
+            Some("ff_db::operational_store::postgres".to_string())
         );
     }
 
@@ -8065,8 +8078,8 @@ diff --git a/src/b.rs b/src/b.rs
     fn abs_reexport_target_resolves_relative_forms() {
         // bare submodule path is relative to the re-exporting module.
         assert_eq!(
-            abs_reexport_target("connection::DbPool", "ff_db", "ff_db"),
-            "ff_db::connection::DbPool"
+            abs_reexport_target("operational_store::OperationalStore", "ff_db", "ff_db"),
+            "ff_db::operational_store::OperationalStore"
         );
         // crate-rooted path (norm_crate already rewrote `crate::`) is absolute.
         assert_eq!(
@@ -8092,16 +8105,16 @@ diff --git a/src/b.rs b/src/b.rs
         // genuine re-export is recorded with an absolute target.
         record_reexport(
             Some("ff_db"),
-            "run_migrations",
-            "migrations::run_migrations",
+            "run_postgres_migrations",
+            "migrations::run_postgres_migrations",
             "ff_db",
             &mut fp,
         );
         assert_eq!(
             fp.reexports,
             vec![(
-                "ff_db::run_migrations".to_string(),
-                "ff_db::migrations::run_migrations".to_string()
+                "ff_db::run_postgres_migrations".to_string(),
+                "ff_db::migrations::run_postgres_migrations".to_string()
             )]
         );
     }
@@ -8221,15 +8234,14 @@ diff --git a/src/b.rs b/src/b.rs
     fn parse_records_pub_use_reexport() {
         // A facade crate root: `pub use` makes the submodule item visible at the
         // crate root (recorded as a re-export); a private `use` does not.
-        let src = "pub use crate::migrations::run_migrations;\n\
+        let src = "pub use crate::migrations::run_postgres_migrations;\n\
                    use crate::other::helper;\n\
                    pub fn a() {}\n";
         let fp = parse_rust_file("/x/crates/ff_db/src/lib.rs", src).unwrap();
         assert!(
-            fp.reexports
-                .iter()
-                .any(|(facade, target)| facade.ends_with("::run_migrations")
-                    && target.ends_with("::migrations::run_migrations")),
+            fp.reexports.iter().any(|(facade, target)| facade
+                .ends_with("::run_postgres_migrations")
+                && target.ends_with("::migrations::run_postgres_migrations")),
             "pub use not recorded: {:?}",
             fp.reexports
         );
