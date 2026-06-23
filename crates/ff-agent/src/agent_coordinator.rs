@@ -555,6 +555,13 @@ pub async fn seed_slot_zero_for_all(pool: &PgPool) -> Result<u32, CoordError> {
 /// Find or create a transient "dispatch" work_item for ad-hoc prompts.
 /// Returns the work_item id. Creates a sentinel project
 /// `"ff-agent-dispatch"` on first use.
+///
+/// Created terminal (`status='done'`): this is a provenance *container* for a
+/// run/output that has already completed, not pipeline work. It is NOT
+/// lease-managed (only `kind='task'` items go through the scheduler), so leaving
+/// it `in_progress` made the lease-less orphan reaper churn through it and
+/// `ff pm doctor` flag it as orphaned — a false signal. The chat path separately
+/// marks its container `done` afterward, so this is idempotent there.
 pub async fn create_transient_work_item(
     pool: &PgPool,
     prompt: &str,
@@ -572,7 +579,7 @@ pub async fn create_transient_work_item(
     let title = truncate(prompt, 120);
     let row: (Uuid,) = sqlx::query_as(
         "INSERT INTO work_items (project_id, kind, title, description, status, priority, created_by) \
-         VALUES ('ff-agent-dispatch', 'dispatch', $1, $2, 'in_progress', 'normal', $3) \
+         VALUES ('ff-agent-dispatch', 'dispatch', $1, $2, 'done', 'normal', $3) \
          RETURNING id",
     )
     .bind(&title)

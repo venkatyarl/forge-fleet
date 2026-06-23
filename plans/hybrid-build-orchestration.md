@@ -175,3 +175,53 @@ Verified against current code; items above were stale:
 - **GAP-C** — swarm/fanout fair-share cap + partial-failure reporting (unverified).
 - **Validation owed:** a real end-to-end ff→commit-back dogfood (small forge-fleet
   change) to confirm D0+D1+D2 compose into a clean PR.
+
+## Conflicts found + resolved (2026-06-22 audit)
+
+Auditing the shipped items surfaced two real conflicts:
+
+### Conflict 1 — D0 provenance vs the orphan reaper (#526) — FIXED
+`create_transient_work_item` inserted dispatch provenance containers as
+`status='in_progress'` with no lease; the #526 orphan reaper (and `ff pm doctor`)
+treats `in_progress` + no-lease as orphaned and cancelled them — the 27 reaped
+rows were largely these. Harmless to commit-back (it reads `work_outputs` by
+`agent_session_id`, not work_item status) but churny + dishonest.
+**Fix:** (a) the container is now created terminal `status='done'` — it records a
+*completed* run; (b) the reaper + count + doctor are scoped to `kind='task'`, the
+only lease-managed kind (`pg_ready_work_items` filters `kind='task'`), so they no
+longer judge `dispatch`/`audit`/`epic` rows as orphaned.
+
+### Conflict 2 — D2 hard-reset vs the shared dispatch workspace — DESIGN (GAP-D-iso)
+D2's clean-sync `reset --hard` is only safe on a workspace exclusive to the run,
+but `run_cwd` defaults to the single shared `~/.forgefleet/sub-agent-0/forge-fleet`
+(slot 0 hardcoded), NOT the per-slot `sub-agent-{N}` the plan's collision-safety
+assumes. `dispatch-each` (1/member) is safe; `fanout`-to-same-member or two
+concurrent `ff agent` callers on one member race, and the hard reset makes that
+race destructive. (Verified NOT a conflict with the deploy: the auto-upgrade
+builds from `source_tree_path = ~/projects/forge-fleet`, a different dir.)
+Comment downgraded to flag the limitation; proper fix below.
+
+## Better way (research) — GAP-D-iso: per-run `git worktree` isolation
+
+The shared-slot-checkout model (one `sub-agent-N/forge-fleet` reused across runs,
+reset between them) is the root of both D2's race and the D2/D3 clean-base
+juggling. A cleaner architecture: **each dispatched build runs in its own throwaway
+git worktree.**
+
+- At run start (worker side): `git -C <canonical-repo> worktree add --detach
+  <runs-dir>/<task-id> origin/main` — a fresh, isolated checkout at fresh main,
+  sharing the object store (cheap: no full clone, seconds + little disk).
+- The LLM edits there; D0 already records the real `working_dir` into
+  `work_outputs.metadata`, so `commit-back` lifts from exactly that path.
+- `commit-back` branches from the worktree HEAD (== fresh main) → GAP-D3 moot.
+- On completion: `git worktree remove --force <runs-dir>/<task-id>` (or a reaper
+  tick prunes stale ones, mirroring the existing worktree reaper).
+
+Benefits: true per-run isolation (N concurrent runs on one member never collide),
+deterministic fresh base for free (subsumes D2's reset + D3's branch-from-main),
+no shared-state contamination, and natural cleanup. Cost: worktree lifecycle
+management in the worker + commit-back, and a prune path. This is the same pattern
+the `.claude/worktrees/` + `work_item_worktrees` table already use for the
+scheduler flow — extend it to the `ff run`/dispatch flow. **Sequencing:** design +
+the owed dogfood first (small forge-fleet change end-to-end), then wire; retire the
+`clean_sync_prefix` shim once worktrees land.
