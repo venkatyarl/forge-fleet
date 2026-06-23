@@ -104,12 +104,8 @@ pub mod ingest_people;
 pub mod ingest_pm;
 #[path = "cortex/maps_to.rs"]
 pub mod maps_to;
-#[path = "cortex/mirror.rs"]
-pub mod mirror;
 #[path = "cortex/extractors/observ.rs"]
 pub mod observ;
-#[path = "cortex/offline.rs"]
-pub mod offline;
 #[path = "cortex/extractors/owners.rs"]
 pub mod owners;
 #[path = "cortex/extractors/product.rs"]

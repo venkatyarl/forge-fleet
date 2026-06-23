@@ -6,7 +6,7 @@
 use crate::{CYAN, GREEN, RESET, YELLOW};
 use anyhow::{Result, anyhow};
 use clap::Subcommand;
-use ff_brain::{corpus, cortex, ingest_decisions, ingest_pm, mirror};
+use ff_brain::{corpus, cortex, ingest_decisions, ingest_pm};
 use sqlx::PgPool;
 use std::path::{Path, PathBuf};
 
@@ -471,20 +471,6 @@ pub enum TopCortexCommand {
         #[arg(long, value_enum, default_value = "table")]
         format: crate::CortexFormat,
     },
-    /// Export one corpus's published Cortex graph to a local SQLite snapshot.
-    Export {
-        corpus: String,
-        /// Output SQLite file (default: ~/.forgefleet/cortex-cache/<corpus>.db).
-        #[arg(long)]
-        out: Option<PathBuf>,
-    },
-    /// Import a Cortex SQLite snapshot back into Postgres.
-    Import {
-        file: PathBuf,
-        /// Override the corpus/project slug while restoring nodes.
-        #[arg(long)]
-        corpus: Option<String>,
-    },
     /// Ingest PM work_items as Cortex nodes and tracked_by edges to code/data nodes.
     IngestPm,
     /// Link vault notes/docs to the code and source files they describe.
@@ -744,50 +730,7 @@ async fn print_corpora(pool: &PgPool, target: Option<String>, format: &str) -> R
 }
 
 pub async fn handle_top_cortex(args: TopCortexArgs) -> Result<()> {
-    match args.command {
-        TopCortexCommand::Callers {
-            symbol,
-            corpus,
-            min_confidence,
-            format,
-        } => {
-            let corpus = corpus.unwrap_or_else(cwd_slug);
-            return run_callers_with_fallback(&corpus, &symbol, min_confidence, format.as_str())
-                .await;
-        }
-        TopCortexCommand::Callees {
-            symbol,
-            corpus,
-            min_confidence,
-            format,
-        } => {
-            let corpus = corpus.unwrap_or_else(cwd_slug);
-            return run_callees_with_fallback(&corpus, &symbol, min_confidence, format.as_str())
-                .await;
-        }
-        TopCortexCommand::Find {
-            query,
-            corpus,
-            semantic,
-            limit,
-            kind,
-            format,
-        } => {
-            let corpus = corpus.unwrap_or_else(cwd_slug);
-            return run_find_with_fallback(
-                &corpus,
-                &query,
-                semantic,
-                limit,
-                kind.as_deref(),
-                format.as_str(),
-            )
-            .await;
-        }
-        command => {
-            return handle_top_cortex_online(TopCortexArgs { command }).await;
-        }
-    }
+    handle_top_cortex_online(args).await
 }
 
 async fn handle_top_cortex_online(args: TopCortexArgs) -> Result<()> {
@@ -799,11 +742,6 @@ async fn handle_top_cortex_online(args: TopCortexArgs) -> Result<()> {
         .map_err(|e| anyhow!("run_postgres_migrations: {e}"))?;
 
     match args.command {
-        TopCortexCommand::Callers { .. }
-        | TopCortexCommand::Callees { .. }
-        | TopCortexCommand::Find { .. } => {
-            unreachable!("offline-capable cortex query handled before online dispatch")
-        }
         TopCortexCommand::Index {
             path,
             slug,
@@ -889,6 +827,54 @@ async fn handle_top_cortex_online(args: TopCortexArgs) -> Result<()> {
         }
         TopCortexCommand::Prune { slug, yes } => {
             run_prune(&pool, slug, yes).await?;
+        }
+        TopCortexCommand::Callers {
+            symbol,
+            corpus,
+            min_confidence,
+            format,
+        } => {
+            let corpus = corpus.unwrap_or_else(cwd_slug);
+            let rows = cortex::callers(&pool, &corpus, &symbol, min_confidence).await?;
+            crate::cortex_cmd::print_symbols(
+                &rows,
+                format.as_str(),
+                &format!("callers of {symbol}"),
+            );
+        }
+        TopCortexCommand::Callees {
+            symbol,
+            corpus,
+            min_confidence,
+            format,
+        } => {
+            let corpus = corpus.unwrap_or_else(cwd_slug);
+            let rows = cortex::callees(&pool, &corpus, &symbol, min_confidence).await?;
+            crate::cortex_cmd::print_symbols(
+                &rows,
+                format.as_str(),
+                &format!("callees of {symbol}"),
+            );
+        }
+        TopCortexCommand::Find {
+            query,
+            corpus,
+            semantic,
+            limit,
+            kind,
+            format,
+        } => {
+            let corpus = corpus.unwrap_or_else(cwd_slug);
+            let hits = if semantic {
+                cortex::find_symbols_semantic(&pool, &corpus, &query, limit, kind.as_deref())
+                    .await?
+            } else {
+                cortex::find_symbols(&pool, &corpus, &query, limit, kind.as_deref()).await?
+            };
+            print_hits(&hits, format.as_str(), &query, &corpus);
+            if hits.is_empty() {
+                std::process::exit(1);
+            }
         }
         TopCortexCommand::Show {
             symbol,
@@ -1226,21 +1212,6 @@ async fn handle_top_cortex_online(args: TopCortexArgs) -> Result<()> {
                 std::process::exit(1);
             }
         }
-        TopCortexCommand::Export { corpus, out } => {
-            let path = mirror::export(&pool, &corpus, out).await?;
-            let (nodes, edges) = mirror::counts(&path)?;
-            println!(
-                "{GREEN}wrote{RESET} {} ({nodes} node(s), {edges} edge(s))",
-                path.display()
-            );
-        }
-        TopCortexCommand::Import { file, corpus } => {
-            let (nodes, edges) = mirror::import(&pool, &file, corpus.as_deref()).await?;
-            println!(
-                "{GREEN}restored{RESET} {nodes} node(s), {edges} edge(s) from {}",
-                file.display()
-            );
-        }
         TopCortexCommand::IngestPm => {
             let (nodes, edges) = ingest_pm::ingest_pm(&pool).await?;
             println!(
@@ -1253,188 +1224,6 @@ async fn handle_top_cortex_online(args: TopCortexArgs) -> Result<()> {
         }
     }
     Ok(())
-}
-
-async fn run_callers_with_fallback(
-    corpus: &str,
-    symbol: &str,
-    min_confidence: f32,
-    format: &str,
-) -> Result<()> {
-    let pool = match online_pool().await {
-        Ok(pool) => pool,
-        Err(err) => {
-            return fallback_callers(err, corpus, symbol, min_confidence, format).await;
-        }
-    };
-    match cortex::callers(&pool, corpus, symbol, min_confidence).await {
-        Ok(rows) => {
-            crate::cortex_cmd::print_symbols(&rows, format, &format!("callers of {symbol}"));
-            Ok(())
-        }
-        Err(err) if is_pg_connection_error(&err) => {
-            fallback_callers(err, corpus, symbol, min_confidence, format).await
-        }
-        Err(err) => Err(err),
-    }
-}
-
-async fn run_callees_with_fallback(
-    corpus: &str,
-    symbol: &str,
-    min_confidence: f32,
-    format: &str,
-) -> Result<()> {
-    let pool = match online_pool().await {
-        Ok(pool) => pool,
-        Err(err) => {
-            return fallback_callees(err, corpus, symbol, min_confidence, format).await;
-        }
-    };
-    match cortex::callees(&pool, corpus, symbol, min_confidence).await {
-        Ok(rows) => {
-            crate::cortex_cmd::print_symbols(&rows, format, &format!("callees of {symbol}"));
-            Ok(())
-        }
-        Err(err) if is_pg_connection_error(&err) => {
-            fallback_callees(err, corpus, symbol, min_confidence, format).await
-        }
-        Err(err) => Err(err),
-    }
-}
-
-async fn run_find_with_fallback(
-    corpus: &str,
-    query: &str,
-    semantic: bool,
-    limit: i64,
-    kind: Option<&str>,
-    format: &str,
-) -> Result<()> {
-    let pool = match online_pool().await {
-        Ok(pool) => pool,
-        Err(err) => {
-            if semantic {
-                return Err(anyhow!(
-                    "connect Postgres: {err}; offline cortex-cache fallback does not support --semantic"
-                ));
-            }
-            return fallback_find(err, corpus, query, limit, kind, format).await;
-        }
-    };
-    let result = if semantic {
-        cortex::find_symbols_semantic(&pool, corpus, query, limit, kind).await
-    } else {
-        cortex::find_symbols(&pool, corpus, query, limit, kind).await
-    };
-    match result {
-        Ok(hits) => {
-            print_hits(&hits, format, query, corpus);
-            if hits.is_empty() {
-                std::process::exit(1);
-            }
-            Ok(())
-        }
-        Err(err) if !semantic && is_pg_connection_error(&err) => {
-            fallback_find(err, corpus, query, limit, kind, format).await
-        }
-        Err(err) => Err(err),
-    }
-}
-
-async fn fallback_callers(
-    pg_error: anyhow::Error,
-    corpus: &str,
-    symbol: &str,
-    min_confidence: f32,
-    format: &str,
-) -> Result<()> {
-    let Some(conn) = mirror::open_fallback(corpus).await else {
-        return Err(no_fallback_error(pg_error, corpus));
-    };
-    println!("(offline: using local cortex-cache snapshot)");
-    let rows = cortex::offline::callers(&conn, corpus, symbol, min_confidence)?;
-    crate::cortex_cmd::print_symbols(&rows, format, &format!("callers of {symbol}"));
-    Ok(())
-}
-
-async fn fallback_callees(
-    pg_error: anyhow::Error,
-    corpus: &str,
-    symbol: &str,
-    min_confidence: f32,
-    format: &str,
-) -> Result<()> {
-    let Some(conn) = mirror::open_fallback(corpus).await else {
-        return Err(no_fallback_error(pg_error, corpus));
-    };
-    println!("(offline: using local cortex-cache snapshot)");
-    let rows = cortex::offline::callees(&conn, corpus, symbol, min_confidence)?;
-    crate::cortex_cmd::print_symbols(&rows, format, &format!("callees of {symbol}"));
-    Ok(())
-}
-
-async fn fallback_find(
-    pg_error: anyhow::Error,
-    corpus: &str,
-    query: &str,
-    limit: i64,
-    kind: Option<&str>,
-    format: &str,
-) -> Result<()> {
-    let Some(conn) = mirror::open_fallback(corpus).await else {
-        return Err(no_fallback_error(pg_error, corpus));
-    };
-    println!("(offline: using local cortex-cache snapshot)");
-    let hits = cortex::offline::find_symbols(&conn, corpus, query, limit, kind)?;
-    print_hits(&hits, format, query, corpus);
-    if hits.is_empty() {
-        std::process::exit(1);
-    }
-    Ok(())
-}
-
-async fn online_pool() -> Result<PgPool> {
-    let pool = ff_agent::fleet_info::get_fleet_pool()
-        .await
-        .map_err(|e| anyhow!("connect Postgres: {e}"))?;
-    ff_db::run_postgres_migrations(&pool)
-        .await
-        .map_err(|e| anyhow!("run_postgres_migrations: {e}"))?;
-    Ok(pool)
-}
-
-fn no_fallback_error(pg_error: anyhow::Error, corpus: &str) -> anyhow::Error {
-    anyhow!(
-        "{pg_error}; no local cortex-cache snapshot found for corpus '{corpus}' at {}",
-        mirror::cache_path(corpus).display()
-    )
-}
-
-fn is_pg_connection_error(err: &anyhow::Error) -> bool {
-    for cause in err.chain() {
-        if let Some(sqlx_err) = cause.downcast_ref::<sqlx::Error>() {
-            if matches!(
-                sqlx_err,
-                sqlx::Error::Io(_)
-                    | sqlx::Error::Tls(_)
-                    | sqlx::Error::PoolTimedOut
-                    | sqlx::Error::PoolClosed
-            ) {
-                return true;
-            }
-        }
-        let text = cause.to_string().to_lowercase();
-        if text.contains("connection refused")
-            || text.contains("could not connect")
-            || text.contains("error communicating with database")
-            || text.contains("pool timed out")
-            || text.contains("connection closed")
-        {
-            return true;
-        }
-    }
-    false
 }
 
 fn print_api_handlers(rows: &[cortex::api::ApiHandlerSummary], format: &str) {
