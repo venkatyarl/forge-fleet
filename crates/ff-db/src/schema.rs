@@ -9120,3 +9120,13 @@ CREATE INDEX IF NOT EXISTS idx_bve_type_src       ON brain_vault_edges (edge_typ
 CREATE INDEX IF NOT EXISTS idx_bvn_generation     ON brain_vault_nodes (project, generation);
 CREATE INDEX IF NOT EXISTS idx_bve_generation     ON brain_vault_edges (generation);
 "#;
+
+pub const SCHEMA_V143_PROJECT_GIT_POLICY: &str = r#"
+-- Per-project git policy for multi-project build orchestration.
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS integration_strategy TEXT NOT NULL DEFAULT 'feature_pr';
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS branch_prefix        TEXT NOT NULL DEFAULT 'feat';
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS git_remote           TEXT NOT NULL DEFAULT 'origin';
+
+-- HireFlow integrates onto dev, not main.
+UPDATE projects SET default_branch = 'dev' WHERE id = 'hireflow360' AND default_branch = 'main';
+"#;

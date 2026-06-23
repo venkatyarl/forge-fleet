@@ -693,6 +693,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "cortex_universal_foundation",
         sql: schema::SCHEMA_V142_CORTEX_FOUNDATION,
     },
+    PgMigration {
+        version: 143,
+        name: "project_git_policy",
+        sql: schema::SCHEMA_V143_PROJECT_GIT_POLICY,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
