@@ -807,7 +807,7 @@ async fn schema_version(pool: &sqlx::PgPool) -> String {
 ///   2. POST `/v1/chat/completions` with a JARVIS system prompt + the user
 ///      query, `chat_template_kwargs.enable_thinking=false`, a 60s timeout.
 ///   3. Strip any `<think>…</think>` and return the assistant content.
-/// No warm endpoint → an in-character "no model to think with" line.
+///    No warm endpoint → an in-character "no model to think with" line.
 async fn dispatch_to_fleet(client: &reqwest::Client, pool: &sqlx::PgPool, query: &str) -> String {
     let started = std::time::Instant::now();
     // `kind = None` → any warm tool-capable model (this is a chat question, not

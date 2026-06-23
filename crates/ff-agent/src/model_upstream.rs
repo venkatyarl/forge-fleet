@@ -120,7 +120,7 @@ impl ModelUpstreamChecker {
                 continue;
             }
 
-            match fetch_hf_latest_sha(&http, &upstream_id, hf_token.as_deref()).await {
+            match fetch_hf_latest_sha(http, &upstream_id, hf_token.as_deref()).await {
                 Ok(new_rev) => {
                     let changed = match &old_rev {
                         Some(cur) => cur != &new_rev,

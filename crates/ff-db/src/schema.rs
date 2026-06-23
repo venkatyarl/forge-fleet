@@ -9069,7 +9069,7 @@ ON CONFLICT (project_id, github_url) DO NOTHING;
 "#;
 
 /// V142 — Cortex universal-graph FOUNDATION (P0). The graph (`brain_vault_nodes`
-/// + `brain_vault_edges`) is one domain-agnostic knowledge graph: code is one
+/// and `brain_vault_edges`) is one domain-agnostic knowledge graph: code is one
 /// domain (`code:*`, `db:*`, `http:*`, …) alongside non-code (`doc:*`,
 /// `project:*`, `person:*`, `decision:*`, …). Two councils converged on this
 /// being the ONE thing to land + deploy fleet-wide BEFORE fanning out the

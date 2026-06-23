@@ -512,10 +512,10 @@ fn collect_image_files(root: &Path) -> Vec<PathBuf> {
                     continue;
                 }
                 // Skip oversized images.
-                if let Ok(md) = entry.metadata() {
-                    if md.len() > MAX_IMAGE_BYTES {
-                        continue;
-                    }
+                if let Ok(md) = entry.metadata()
+                    && md.len() > MAX_IMAGE_BYTES
+                {
+                    continue;
                 }
                 out.push(path);
             }

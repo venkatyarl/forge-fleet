@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
-static SHARED_HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| reqwest::Client::new());
+static SHARED_HTTP: LazyLock<reqwest::Client> = LazyLock::new(reqwest::Client::new);
 
 use chrono::Utc;
 use ff_api::adaptive_router::AdaptiveRouter;

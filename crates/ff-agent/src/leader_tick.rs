@@ -851,14 +851,12 @@ impl LeaderTick {
         let home = std::env::var("HOME").unwrap_or_default();
         let marker = format!("{home}/.forgefleet/interaction-errors.last");
         const INTERVAL_SECS: u64 = 30 * 60;
-        if let Ok(meta) = std::fs::metadata(&marker) {
-            if let Ok(modified) = meta.modified() {
-                if let Ok(elapsed) = modified.elapsed() {
-                    if elapsed.as_secs() < INTERVAL_SECS {
-                        return Ok(()); // ran recently; skip this tick
-                    }
-                }
-            }
+        if let Ok(meta) = std::fs::metadata(&marker)
+            && let Ok(modified) = meta.modified()
+            && let Ok(elapsed) = modified.elapsed()
+            && elapsed.as_secs() < INTERVAL_SECS
+        {
+            return Ok(()); // ran recently; skip this tick
         }
 
         // ── Aggregate recent interaction errors by signature ────────────────

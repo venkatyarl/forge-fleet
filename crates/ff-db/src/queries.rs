@@ -1950,8 +1950,8 @@ pub async fn pg_disable_safety_gate(
 ///   - missing row                                  → `default_when_missing`
 ///   - value is not the disabled sentinel `false`   → the value as-is
 ///   - value `false` + `expires_at` in the past     → restore `previous_value`
-///       (or `restore_when_expired` if none), best-effort writing it back so the
-///       restore is durable and not recomputed on every read
+///     (or `restore_when_expired` if none), best-effort writing it back so the
+///     restore is durable and not recomputed on every read
 ///   - value `false`, no/future `expires_at`        → `false` (still disabled)
 ///
 /// This is the string-typed sibling of [`pg_read_safety_gate`]; mode gates call
@@ -6458,7 +6458,7 @@ pub struct CortexResolutionStats {
     pub internal: i64,
     pub external: i64,
     /// Subset of `internal` resolved by the primary resolver (edge confidence
-    /// >= 1.0) — the EXTRACTED tier (roadmap #5). The call explicitly named a
+    /// at least 1.0) — the EXTRACTED tier (roadmap #5). The call explicitly named a
     /// real internal symbol; highest-trust edges.
     pub extracted: i64,
     /// Subset of `internal` resolved only via a heuristic redirect (confidence

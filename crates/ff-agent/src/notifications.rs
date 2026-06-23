@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 pub(crate) static SHARED_HTTP: std::sync::LazyLock<reqwest::Client> =
-    std::sync::LazyLock::new(|| reqwest::Client::new());
+    std::sync::LazyLock::new(reqwest::Client::new);
 
 /// Notification event types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

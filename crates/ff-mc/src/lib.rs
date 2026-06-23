@@ -7,34 +7,26 @@
 //! - **Board** — computed Kanban board view (not persisted)
 //! - **Dashboard** — aggregate stats across all items/sprints/epics
 //! - **Auto-link** — keyword-based related item suggestions
-//! - **API** — Axum REST endpoints for all of the above
+//! - **Operational API** — Axum REST endpoints backed by `ff_db::OperationalStore`
 //! - **Legal/Compliance** — legal entities, obligations, and filing deadlines
 //!
 //! ## Storage
 //!
-//! Mission Control supports two runtime storage paths:
-//! - Local SQLite via `McDb` (`rusqlite`) for embedded mode.
-//! - `ff_db::OperationalStore` (SQLite/Postgres) for Postgres runtime/full cutover paths.
-//!
-//! SQLite databases are created/migrated automatically on first access.
+//! Mission Control uses `ff_db::OperationalStore` for Postgres runtime paths.
 //!
 //! ## Usage
 //!
 //! ```rust,no_run
-//! use ff_mc::db::McDb;
-//! use ff_mc::api::mc_router;
+//! use ff_mc::operational_api::operational_router;
 //!
-//! let db = McDb::open("mission-control.db").unwrap();
-//! let router = mc_router(db);
+//! let router = operational_router(store);
 //! // Mount `router` into your axum application
 //! ```
 
-pub mod api;
 pub mod auto_link;
 pub mod board;
 pub mod counsel;
 pub mod dashboard;
-pub mod db;
 pub mod dependency;
 pub mod epic;
 pub mod error;
@@ -48,5 +40,4 @@ pub mod task_group;
 pub mod work_item;
 
 // Re-export key types at crate root for convenience.
-pub use db::McDb;
 pub use error::{McError, McResult};

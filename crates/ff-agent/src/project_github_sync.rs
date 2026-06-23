@@ -115,7 +115,7 @@ impl GitHubSync {
             };
 
             // ─── 1. main commit ────────────────────────────────────────────
-            match fetch_branch_commit(&http, &owner, &repo, &default_branch, token.as_deref()).await
+            match fetch_branch_commit(http, &owner, &repo, &default_branch, token.as_deref()).await
             {
                 Ok(Some(info)) => {
                     if let Err(e) = write_main_commit(&self.pg, &project_id, &info).await {
@@ -142,7 +142,7 @@ impl GitHubSync {
             }
 
             // ─── 2. branches ───────────────────────────────────────────────
-            match fetch_branches(&http, &owner, &repo, token.as_deref()).await {
+            match fetch_branches(http, &owner, &repo, token.as_deref()).await {
                 Ok(branches) => {
                     for br in branches {
                         if let Err(e) = upsert_branch(&self.pg, &project_id, &br).await {
@@ -160,7 +160,7 @@ impl GitHubSync {
             }
 
             // ─── 3. PR metadata on branches ────────────────────────────────
-            match fetch_pulls(&http, &owner, &repo, token.as_deref()).await {
+            match fetch_pulls(http, &owner, &repo, token.as_deref()).await {
                 Ok(pulls) => {
                     for pr in pulls {
                         match attach_pr(&self.pg, &project_id, &pr).await {

@@ -255,10 +255,10 @@ impl Drop for McpClientManager {
         // SIGKILL via the non-blocking `start_kill` — the actual reap happens
         // when the OS notices the parent exiting, which is good enough here.
         for (name, conn) in self.connections.drain() {
-            if let McpTransport::Stdio { mut child, .. } = conn.transport {
-                if let Err(e) = child.start_kill() {
-                    tracing::debug!(server = %name, error = %e, "MCP child kill on drop failed");
-                }
+            if let McpTransport::Stdio { mut child, .. } = conn.transport
+                && let Err(e) = child.start_kill()
+            {
+                tracing::debug!(server = %name, error = %e, "MCP child kill on drop failed");
             }
         }
     }

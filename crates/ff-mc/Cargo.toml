@@ -23,4 +23,3 @@ dashmap.workspace = true
 axum.workspace = true
 
 # Direct deps
-rusqlite = { version = "0.32", features = ["bundled"] }

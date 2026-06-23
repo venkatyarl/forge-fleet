@@ -51,9 +51,6 @@ pub enum McError {
     #[error("invalid compliance sensitivity: {value}")]
     InvalidComplianceSensitivity { value: String },
 
-    #[error("database error: {0}")]
-    Database(#[from] rusqlite::Error),
-
     #[error("{0}")]
     Other(#[from] anyhow::Error),
 }

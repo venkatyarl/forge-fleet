@@ -274,15 +274,16 @@ fn classify_dir(path: &Path, catalog: &[ff_db::ModelCatalogRow]) -> Option<Disco
         // (HF-format dir served by mlx_lm.server) to show up as runtime=vllm
         // — which then blocked `ff model delete` with a false "active
         // deployment" check (deployment was on a different runtime).
-        let runtime =
-            if lower.ends_with("-mlx") || lower.ends_with("-4bit") || lower.contains("mlx") {
-                "mlx"
-            } else if std::env::consts::OS == "macos" {
-                "mlx"
-            } else {
-                "vllm"
-            }
-            .to_string();
+        let runtime = if lower.ends_with("-mlx")
+            || lower.ends_with("-4bit")
+            || lower.contains("mlx")
+            || std::env::consts::OS == "macos"
+        {
+            "mlx"
+        } else {
+            "vllm"
+        }
+        .to_string();
         let quant = extract_hf_quant(&lower);
         let total_size: u64 = safetensor_paths
             .iter()

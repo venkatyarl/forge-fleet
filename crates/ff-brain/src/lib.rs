@@ -1,3 +1,13 @@
+#![allow(
+    dead_code,
+    private_interfaces,
+    clippy::collapsible_if,
+    clippy::doc_lazy_continuation,
+    clippy::doc_overindented_list_items,
+    clippy::nonminimal_bool,
+    clippy::too_many_arguments
+)]
+
 //! ForgeFleet Virtual Brain — knowledge graph, context selection, chat, and fact extraction.
 //!
 //! This crate provides the core intelligence layer for ForgeFleet's Virtual Brain system:

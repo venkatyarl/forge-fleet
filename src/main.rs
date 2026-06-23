@@ -361,12 +361,6 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
 
     // 6) gateway — pass shared state
     info!("starting subsystem: gateway");
-    let mc_db_path = match config.database.mode {
-        DatabaseMode::EmbeddedSqlite => config_path
-            .parent()
-            .map(|p| p.join("mission-control.db").to_string_lossy().to_string()),
-        DatabaseMode::PostgresRuntime | DatabaseMode::PostgresFull => None,
-    };
     subsystem_tasks.push(start_gateway_subsystem(
         config.clone(),
         config_path.to_string_lossy().to_string(),
@@ -374,7 +368,6 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         registry.clone(),
         operational_store.clone(),
         runtime_registry.clone(),
-        mc_db_path,
     ));
 
     // 6.4) Tool registry auto-prune — removes stale fleet_tools rows every 60s.
@@ -2493,7 +2486,6 @@ fn start_gateway_subsystem(
     discovery_registry: Arc<ff_discovery::NodeRegistry>,
     operational_store: OperationalStore,
     runtime_registry: RuntimeRegistryStore,
-    mc_db_path: Option<String>,
 ) -> JoinHandle<()> {
     let gateway_config = GatewayConfig {
         bind_addr: format!("0.0.0.0:{}", config.fleet.api_port.saturating_add(2)), // Web UI on api_port + 2 (51002)
@@ -2501,7 +2493,6 @@ fn start_gateway_subsystem(
         config_path: Some(config_path),
         backend_registry: Some(backend_registry),
         discovery_registry: Some(discovery_registry),
-        mc_db_path,
         operational_store: Some(operational_store),
         runtime_registry: Some(runtime_registry),
         ..GatewayConfig::default()
