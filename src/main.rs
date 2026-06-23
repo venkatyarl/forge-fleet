@@ -9,10 +9,7 @@ use ff_api::config::ApiConfig;
 use ff_api::registry::{BackendEndpoint, BackendRegistry};
 use ff_control::{BootstrapOptions, ControlPlane};
 use ff_core::config::{self, ConfigHandle, DatabaseMode, FleetConfig, spawn_watcher};
-use ff_db::{
-    DbPool, DbPoolConfig, OperationalStore, ReplicationBackupHelperAvailability,
-    RuntimeRegistryStore, run_migrations,
-};
+use ff_db::{DbPool, DbPoolConfig, OperationalStore, RuntimeRegistryStore, run_migrations};
 use ff_discovery::health::HealthStatus;
 use ff_discovery::{
     NodeRegistry, NodeScanner, ScanTarget, ScannerConfig, build_scan_targets, scan_subnet,
@@ -1810,18 +1807,10 @@ fn load_or_default_config(path: &Path) -> Result<FleetConfig> {
     Ok(cfg)
 }
 
-fn postgres_full_sqlite_blockers(config: &FleetConfig) -> Vec<String> {
-    let mut blockers = Vec::new();
-
-    let helper_availability =
-        ReplicationBackupHelperAvailability::for_database_mode(&config.database.mode);
-    if helper_availability.is_enabled() {
-        blockers.push(
-            "ff-db replication/backup helpers are scoped to embedded_sqlite mode only".to_string(),
-        );
-    }
-
-    blockers
+fn postgres_full_sqlite_blockers(_config: &FleetConfig) -> Vec<String> {
+    // The ff-db SQLite replication/backup helpers were removed (Postgres HA now
+    // covers replication), so there are no SQLite-helper blockers to report.
+    Vec::new()
 }
 
 fn enforce_database_mode_preflight(config: &FleetConfig) -> Result<()> {
@@ -1992,9 +1981,6 @@ fn log_database_mode_summary(
     operational_store: &OperationalStore,
     runtime_registry: &RuntimeRegistryStore,
 ) {
-    let replication_backup_helpers =
-        ReplicationBackupHelperAvailability::for_database_mode(&config.database.mode);
-
     match config.database.mode {
         DatabaseMode::EmbeddedSqlite => {
             let path_display = sqlite_path
@@ -2005,7 +1991,6 @@ fn log_database_mode_summary(
                 sqlite_path = %path_display,
                 operational_store = operational_store.backend_label(),
                 runtime_registry = runtime_registry.backend_label(),
-                replication_backup_helpers = replication_backup_helpers.summary(),
                 "database mode active"
             );
         }
@@ -2022,7 +2007,6 @@ fn log_database_mode_summary(
                 postgres_url = %redact_database_url(&config.database.url),
                 operational_store = operational_store.backend_label(),
                 runtime_registry = runtime_registry.backend_label(),
-                replication_backup_helpers = replication_backup_helpers.summary(),
                 "database mode active: Postgres-backed operational/runtime persistence"
             );
         }
@@ -2033,7 +2017,6 @@ fn log_database_mode_summary(
                 operational_store = operational_store.backend_label(),
                 runtime_registry = runtime_registry.backend_label(),
                 cutover_evidence = %config.database.cutover_evidence_ref().unwrap_or("<missing>"),
-                replication_backup_helpers = replication_backup_helpers.summary(),
                 "database mode active: full-postgres operational persistence achieved"
             );
         }
