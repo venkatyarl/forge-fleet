@@ -1149,6 +1149,9 @@ enum AgentCommand {
         /// the global `--cwd`.)
         #[arg(long = "run-cwd")]
         run_cwd: Option<String>,
+        /// Project id whose git policy controls remote/base sync.
+        #[arg(long)]
+        project: Option<String>,
         /// Per-run wall-clock budget in seconds for each dispatched build task.
         /// Raises BOTH 600s caps that otherwise kill a multi-minute codex/kimi
         /// run at ~10min: the dispatched `ff run --timeout` (CLI subprocess) and
@@ -1166,6 +1169,9 @@ enum AgentCommand {
         /// Working dir for the dispatched `ff run` (see `fanout --run-cwd`).
         #[arg(long = "run-cwd")]
         run_cwd: Option<String>,
+        /// Project id whose git policy controls remote/base sync.
+        #[arg(long)]
+        project: Option<String>,
         /// Per-run wall-clock budget in seconds (see `fanout --timeout`).
         #[arg(long, default_value_t = 1800)]
         timeout: u64,
@@ -1174,14 +1180,14 @@ enum AgentCommand {
     /// Idempotent — existing rows are left alone.
     Seed,
     /// Lift fleet-LLM-produced code from a worker's sub-agent workspace back
-    /// to Taylor's canonical repo via a feature branch + (optional) PR on
-    /// origin/main.
+    /// to Taylor's canonical repo via the default feature branch + optional PR
+    /// behavior, or via a project's git policy when `--project` is supplied.
     ///
     /// Looks up the agent session by ID in `work_outputs` (match on
     /// `agent_session_id`) to find the worker name + modified files. SSHes
     /// into the worker and runs `git checkout -b <branch>`, `git add` on the
-    /// recorded files, `git commit`, then optionally `git push` and
-    /// `gh pr create --base main`. See issue #118.
+    /// recorded files, `git commit`, then optionally `git push` and `gh pr create`.
+    /// See issue #118.
     CommitBack {
         /// The ff-agent session id (UUID) that produced the code. The session
         /// must have a matching row in `work_outputs.agent_session_id`.
@@ -1189,10 +1195,13 @@ enum AgentCommand {
         /// Also run `git push -u origin <branch>` after committing locally.
         #[arg(long, default_value_t = false)]
         push: bool,
-        /// After pushing, open a PR via `gh pr create --base main`.
-        /// Implies `--push`.
+        /// After pushing, open a PR via `gh pr create`. Implies `--push`.
+        /// Ignored when `--project` supplies an integration strategy.
         #[arg(long, default_value_t = false)]
         pr: bool,
+        /// Project id whose git policy controls integration behavior.
+        #[arg(long)]
+        project: Option<String>,
     },
 }
 

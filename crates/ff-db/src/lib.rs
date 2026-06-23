@@ -59,6 +59,7 @@ pub use queries::{
     ModelLibraryRow,
     // Orchestrator P3 — adaptive serving-mix autoscaler
     PlacementCandidate,
+    ProjectGitPolicy,
     ReadyWorkItem,
     ReapableWorktree,
     ReprofileCandidate,
@@ -127,6 +128,7 @@ pub use queries::{
     pg_get_catalog,
     pg_get_deferred,
     pg_get_node,
+    pg_get_project_git_policy,
     pg_get_secret,
     pg_get_setting,
     pg_get_shared_volume,
