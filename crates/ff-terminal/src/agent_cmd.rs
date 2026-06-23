@@ -4,13 +4,20 @@ use anyhow::Result;
 
 use crate::{CYAN, GREEN, RESET, YELLOW, resolve_pulse_redis_url};
 
-/// GAP-D2: best-effort clean-sync of a dispatch slot workspace to a fresh
-/// `origin/main` before the dispatched run edits it. Makes the build base
-/// deterministic so concurrent callers on the same slot never cross-contaminate
-/// and `commit-back` diffs against fresh main (the slot is claimed exclusively,
-/// so a hard reset is safe). Guarded — skips a non-git `cwd` — and non-fatal: a
-/// repo that doesn't track `origin/main` simply runs on its existing state. No
-/// `git stash` (per the no-stash rule); reset + clean only.
+/// GAP-D2: best-effort clean-sync of a dispatch workspace to a fresh
+/// `origin/main` before the dispatched run edits it, so the build base is
+/// deterministic and `commit-back` diffs against fresh main. Guarded — skips a
+/// non-git `cwd` — and non-fatal: a repo that doesn't track `origin/main` simply
+/// runs on its existing state. No `git stash` (per the no-stash rule); reset +
+/// clean only.
+///
+/// ⚠️ KNOWN LIMITATION (not yet true per-run isolation): `run_cwd` defaults to
+/// the single shared `~/.forgefleet/sub-agent-0/forge-fleet`, NOT a per-slot
+/// `sub-agent-{N}`. `dispatch-each` (one task per member) is safe, but two
+/// concurrent dispatches landing on the SAME member share that dir, and this
+/// hard reset would clobber the other's in-flight edits. The proper fix is a
+/// per-run `git worktree` (see plans/hybrid-build-orchestration.md, GAP-D-iso),
+/// which gives true isolation + a fresh base and subsumes this prefix.
 fn clean_sync_prefix(cwd: &str) -> String {
     format!(
         "{{ git -C {cwd} rev-parse --git-dir >/dev/null 2>&1 && \

@@ -8525,11 +8525,17 @@ pub async fn pg_reap_stale_work_item_leases(pool: &PgPool, stale_secs: i64) -> R
 /// lease-based reaper [`pg_reap_stale_work_item_leases`] can't see them; they
 /// sit `in_progress` forever. `min_age_secs` guards against a just-assigned
 /// item whose lease row is created a moment after the status flips.
+///
+/// Scoped to `kind='task'` — the ONLY kind the scheduler/lease flow manages
+/// (`pg_ready_work_items` filters `kind='task'`). Non-task kinds (`dispatch`
+/// provenance containers, `audit`/`epic`/`port` backlog) are never leased by
+/// design, so judging them "orphaned" would churn legitimate rows.
 pub async fn pg_count_orphaned_work_items(pool: &PgPool, min_age_secs: i64) -> Result<i64> {
     let n = sqlx::query_scalar(
         "SELECT COUNT(*)
            FROM work_items w
           WHERE w.status = 'in_progress'
+            AND w.kind = 'task'
             AND w.created_at < NOW() - make_interval(secs => $1)
             AND NOT EXISTS (
                 SELECT 1 FROM work_item_leases l
@@ -8548,6 +8554,10 @@ pub async fn pg_count_orphaned_work_items(pool: &PgPool, min_age_secs: i64) -> R
 /// separate sweep. `cancelled` (not `ready`) is correct: a never-leased
 /// in_progress row is an abandoned/botched dispatch, and re-queueing it would
 /// re-dispatch junk forever.
+///
+/// Scoped to `kind='task'` (the lease-managed kind) — see
+/// [`pg_count_orphaned_work_items`]. Without this scope it also cancelled
+/// `kind='dispatch'` provenance containers, which are not pipeline work.
 pub async fn pg_reap_orphaned_work_items(pool: &PgPool, min_age_secs: i64) -> Result<u64> {
     let res = sqlx::query(
         "UPDATE work_items
@@ -8555,6 +8565,7 @@ pub async fn pg_reap_orphaned_work_items(pool: &PgPool, min_age_secs: i64) -> Re
                 completed_at = NOW(),
                 last_error = 'auto-reaped: in_progress with no active lease'
           WHERE status = 'in_progress'
+            AND kind = 'task'
             AND created_at < NOW() - make_interval(secs => $1)
             AND NOT EXISTS (
                 SELECT 1 FROM work_item_leases l
