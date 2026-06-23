@@ -108,6 +108,17 @@ pub struct TelegramMediaIngestRow {
     pub created_at: String,
 }
 
+/// Per-project git integration policy.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct ProjectGitPolicy {
+    pub id: String,
+    pub repo_url: Option<String>,
+    pub default_branch: String,
+    pub integration_strategy: String,
+    pub branch_prefix: String,
+    pub git_remote: String,
+}
+
 /// Runtime heartbeat payload row used to upsert live fleet node state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FleetNodeRuntimeHeartbeatRow {
@@ -432,6 +443,21 @@ pub async fn pg_get_node(pool: &PgPool, name: &str) -> Result<Option<FleetNodeRo
         computer_ram_gb: r.get("computer_ram_gb"),
         computer_cpu_cores: r.get("computer_cpu_cores"),
     }))
+}
+
+pub async fn pg_get_project_git_policy(
+    pool: &PgPool,
+    project_id: &str,
+) -> Result<Option<ProjectGitPolicy>> {
+    sqlx::query_as::<_, ProjectGitPolicy>(
+        "SELECT id, repo_url, default_branch, integration_strategy, branch_prefix, git_remote \
+         FROM projects \
+         WHERE id = $1",
+    )
+    .bind(project_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(Into::into)
 }
 
 /// Upsert a fleet node in Postgres.

@@ -5,9 +5,9 @@ use anyhow::Result;
 use crate::{CYAN, GREEN, RESET, YELLOW, resolve_pulse_redis_url};
 
 /// GAP-D2: best-effort clean-sync of a dispatch workspace to a fresh
-/// `origin/main` before the dispatched run edits it, so the build base is
+/// `<remote>/<base_branch>` before the dispatched run edits it, so the build base is
 /// deterministic and `commit-back` diffs against fresh main. Guarded — skips a
-/// non-git `cwd` — and non-fatal: a repo that doesn't track `origin/main` simply
+/// non-git `cwd` — and non-fatal: a repo that doesn't track the remote ref simply
 /// runs on its existing state. No `git stash` (per the no-stash rule); reset +
 /// clean only.
 ///
@@ -18,13 +18,69 @@ use crate::{CYAN, GREEN, RESET, YELLOW, resolve_pulse_redis_url};
 /// hard reset would clobber the other's in-flight edits. The proper fix is a
 /// per-run `git worktree` (see plans/hybrid-build-orchestration.md, GAP-D-iso),
 /// which gives true isolation + a fresh base and subsumes this prefix.
-fn clean_sync_prefix(cwd: &str) -> String {
+fn clean_sync_prefix(cwd: &str, remote: &str, base_branch: &str) -> String {
+    let remote_ref = format!("{remote}/{base_branch}");
     format!(
         "{{ git -C {cwd} rev-parse --git-dir >/dev/null 2>&1 && \
-            git -C {cwd} fetch origin --quiet && \
-            git -C {cwd} reset --hard origin/main --quiet && \
-            git -C {cwd} clean -fd >/dev/null 2>&1; }} ; "
+            git -C {cwd} fetch {remote_q} --quiet && \
+            git -C {cwd} reset --hard {remote_ref_q} --quiet && \
+            git -C {cwd} clean -fd >/dev/null 2>&1; }} ; ",
+        remote_q = shell_quote(remote),
+        remote_ref_q = shell_quote(&remote_ref),
     )
+}
+
+#[derive(Debug, Clone)]
+struct AgentGitPolicy {
+    base_branch: String,
+    integration_strategy: String,
+    branch_prefix: String,
+    git_remote: String,
+}
+
+async fn resolve_agent_git_policy(
+    pool: &sqlx::PgPool,
+    project: Option<&str>,
+) -> Result<AgentGitPolicy> {
+    let Some(project_id) = project else {
+        return Ok(AgentGitPolicy {
+            base_branch: "main".to_string(),
+            integration_strategy: "feature_pr".to_string(),
+            branch_prefix: "fleet".to_string(),
+            git_remote: "origin".to_string(),
+        });
+    };
+
+    let policy = ff_db::pg_get_project_git_policy(pool, project_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("project '{project_id}' not found"))?;
+
+    let integration_strategy = policy.integration_strategy.trim().to_string();
+    match integration_strategy.as_str() {
+        "direct" | "feature_pr" | "feature_push" => {}
+        other => {
+            return Err(anyhow::anyhow!(
+                "project '{}' has unsupported integration_strategy '{}'",
+                policy.id,
+                other
+            ));
+        }
+    }
+
+    Ok(AgentGitPolicy {
+        base_branch: non_empty_or(policy.default_branch.trim(), "main"),
+        integration_strategy,
+        branch_prefix: non_empty_or(policy.branch_prefix.trim().trim_matches('/'), "fleet"),
+        git_remote: non_empty_or(policy.git_remote.trim(), "origin"),
+    })
+}
+
+fn non_empty_or(value: &str, default: &str) -> String {
+    if value.is_empty() {
+        default.to_string()
+    } else {
+        value.to_string()
+    }
 }
 
 pub async fn handle_agent_fanout(
@@ -34,6 +90,7 @@ pub async fn handle_agent_fanout(
     fanout: u32,
     cwd: Option<String>,
     timeout: u64,
+    project: Option<String>,
 ) -> Result<()> {
     use ff_agent::cli_executor::backend_by_name;
     let cfg = backend_by_name(&backend).ok_or_else(|| {
@@ -82,6 +139,7 @@ pub async fn handle_agent_fanout(
     let run_cwd = cwd
         .clone()
         .unwrap_or_else(|| "~/.forgefleet/sub-agent-0/forge-fleet".to_string());
+    let git_policy = resolve_agent_git_policy(pool, project.as_deref()).await?;
     // Pass --timeout to the dispatched run (bounds the CLI subprocess) AND give
     // the fleet task a matching max_duration_secs (worker cap) with a small
     // buffer, so a multi-minute codex/kimi build isn't killed at the 600s
@@ -91,7 +149,7 @@ pub async fn handle_agent_fanout(
         "{prefix}ff run --backend {} --cwd {} --timeout {timeout} '{shell_safe_prompt}'",
         cfg.name,
         run_cwd,
-        prefix = clean_sync_prefix(&run_cwd),
+        prefix = clean_sync_prefix(&run_cwd, &git_policy.git_remote, &git_policy.base_branch),
     );
     let task_max_secs = timeout + 120;
     for i in 0..fanout {
@@ -127,6 +185,7 @@ pub async fn handle_agent_dispatch_each(
     backend: String,
     cwd: Option<String>,
     timeout: u64,
+    project: Option<String>,
 ) -> Result<()> {
     use ff_agent::cli_executor::backend_by_name;
     let cfg = backend_by_name(&backend).ok_or_else(|| {
@@ -182,13 +241,14 @@ pub async fn handle_agent_dispatch_each(
     let run_cwd = cwd
         .clone()
         .unwrap_or_else(|| "~/.forgefleet/sub-agent-0/forge-fleet".to_string());
+    let git_policy = resolve_agent_git_policy(pool, project.as_deref()).await?;
     // See handle_agent_fanout: --timeout bounds the CLI, task max_duration_secs
     // bounds the worker; both raised above the 600s default for build runs.
     let cmd = format!(
         "{prefix}ff run --backend {} --cwd {} --timeout {timeout} '{shell_safe_prompt}'",
         cfg.name,
         run_cwd,
-        prefix = clean_sync_prefix(&run_cwd),
+        prefix = clean_sync_prefix(&run_cwd, &git_policy.git_remote, &git_policy.base_branch),
     );
     let task_max_secs = timeout + 120;
     for (_id, name) in &members {
@@ -215,10 +275,11 @@ pub async fn handle_agent_dispatch_each(
     Ok(())
 }
 
-// ─── #118: ff agent commit-back — fleet-LLM work → PR on origin/main ────────
+// ─── #118: ff agent commit-back — fleet-LLM work → git integration ─────────
 //
 // Lifts code produced by a fleet LLM in a sub-agent workspace back to Taylor's
-// canonical repo via a feature branch + (optional) PR against origin/main.
+// canonical repo via a feature branch + (optional) PR, or a project-policy
+// direct push.
 //
 // Flow:
 //   1. Look up `work_outputs` WHERE agent_session_id = <session>. Pick the
@@ -235,8 +296,11 @@ pub async fn handle_agent_commit_back(
     session_id: &str,
     push: bool,
     pr: bool,
+    project: Option<String>,
 ) -> Result<()> {
     use tokio::process::Command;
+    let project_supplied = project.is_some();
+    let git_policy = resolve_agent_git_policy(pool, project.as_deref()).await?;
 
     // 1. Look up the latest work_output for this session.
     let row: Option<(
@@ -317,7 +381,7 @@ pub async fn handle_agent_commit_back(
             }
         });
 
-    // 3. Build branch name: fleet/<worker>/<yyyymmdd-HHMMSS>-<slug>-<wi8>.
+    // 3. Build branch name: <branch_prefix>/<worker>/<yyyymmdd-HHMMSS>-<slug>-<wi8>.
     //    The work_item_id suffix (GAP-B) guarantees uniqueness even when two
     //    commit-backs land in the same second on the same worker with the same
     //    title — otherwise `git checkout -b` collides under concurrent dispatch.
@@ -326,10 +390,16 @@ pub async fn handle_agent_commit_back(
     let title_slug = slugify_for_branch(title.as_deref().unwrap_or("agent-session"));
     let wi_short = work_item_id.simple().to_string();
     let branch_name = format!(
-        "fleet/{}/{stamp}-{title_slug}-{}",
+        "{}/{}/{stamp}-{title_slug}-{}",
+        git_policy.branch_prefix,
         worker,
         &wi_short[..8.min(wi_short.len())]
     );
+    let output_branch_name = if project_supplied && git_policy.integration_strategy == "direct" {
+        git_policy.base_branch.clone()
+    } else {
+        branch_name.clone()
+    };
 
     let commit_msg = format!(
         "{}\n\nProduced by ff agent on {worker} in session {session_id}.\n\n\
@@ -341,7 +411,15 @@ pub async fn handle_agent_commit_back(
     eprintln!("  session:   {session_id}");
     eprintln!("  worker:    {worker} ({ssh_user}@{primary_ip})");
     eprintln!("  workspace: {workspace}");
-    eprintln!("  branch:    {branch_name}");
+    if let Some(project_id) = project.as_deref() {
+        eprintln!("  project:   {project_id}");
+        eprintln!("  policy:    {}", git_policy.integration_strategy);
+        eprintln!(
+            "  base:      {}/{}",
+            git_policy.git_remote, git_policy.base_branch
+        );
+    }
+    eprintln!("  branch:    {output_branch_name}");
     eprintln!("  files:     {} modified", modified_files.len());
     for f in &modified_files {
         eprintln!("             {f}");
@@ -359,11 +437,26 @@ pub async fn handle_agent_commit_back(
     let mut script = String::new();
     script.push_str(&format!("cd {workspace} && "));
     script.push_str("_ff_orig=$(git symbolic-ref --quiet --short HEAD || git rev-parse HEAD) && ");
-    script.push_str(&format!(
-        "git fetch origin main >/dev/null 2>&1 || true && \
-         git checkout -b {shell_branch} 2>&1 && ",
-        shell_branch = shell_quote(&branch_name)
-    ));
+    if project_supplied && git_policy.integration_strategy == "direct" {
+        script.push_str(&format!(
+            "git fetch {remote} {base} >/dev/null 2>&1 || true && \
+             {{ git checkout {base} 2>&1 || git checkout -B {base} {remote_ref} 2>&1; }} && ",
+            remote = shell_quote(&git_policy.git_remote),
+            base = shell_quote(&git_policy.base_branch),
+            remote_ref = shell_quote(&format!(
+                "{}/{}",
+                git_policy.git_remote, git_policy.base_branch
+            )),
+        ));
+    } else {
+        script.push_str(&format!(
+            "git fetch {remote} {base} >/dev/null 2>&1 || true && \
+             git checkout -b {shell_branch} 2>&1 && ",
+            remote = shell_quote(&git_policy.git_remote),
+            base = shell_quote(&git_policy.base_branch),
+            shell_branch = shell_quote(&branch_name)
+        ));
+    }
     for f in &modified_files {
         script.push_str(&format!("git add -- {} && ", shell_quote(f)));
     }
@@ -406,12 +499,28 @@ pub async fn handle_agent_commit_back(
     eprintln!("{GREEN}✓ committed{RESET}");
 
     // 4. Optional push.
-    let should_push = push || pr;
+    let should_push = if project_supplied {
+        matches!(
+            git_policy.integration_strategy.as_str(),
+            "direct" | "feature_pr" | "feature_push"
+        )
+    } else {
+        push || pr
+    };
     if should_push {
-        let push_cmd = format!(
-            "cd {workspace} && git push -u origin {br}",
-            br = shell_quote(&branch_name)
-        );
+        let push_cmd = if project_supplied && git_policy.integration_strategy == "direct" {
+            format!(
+                "cd {workspace} && git push {remote} {base}:{base}",
+                remote = shell_quote(&git_policy.git_remote),
+                base = shell_quote(&git_policy.base_branch),
+            )
+        } else {
+            format!(
+                "cd {workspace} && git push -u {remote} {br}",
+                remote = shell_quote(&git_policy.git_remote),
+                br = shell_quote(&branch_name)
+            )
+        };
         let out = Command::new("ssh")
             .args([
                 "-o",
@@ -432,12 +541,27 @@ pub async fn handle_agent_commit_back(
                 String::from_utf8_lossy(&out.stderr).trim()
             ));
         }
-        eprintln!("{GREEN}✓ pushed{RESET} origin/{branch_name}");
+        if project_supplied && git_policy.integration_strategy == "direct" {
+            eprintln!(
+                "{GREEN}✓ pushed{RESET} {}/{}",
+                git_policy.git_remote, git_policy.base_branch
+            );
+        } else {
+            eprintln!(
+                "{GREEN}✓ pushed{RESET} {}/{}",
+                git_policy.git_remote, branch_name
+            );
+        }
     }
 
     // 5. Optional PR via gh on the worker.
     let mut pr_url: Option<String> = None;
-    if pr {
+    let should_open_pr = if project_supplied {
+        git_policy.integration_strategy == "feature_pr"
+    } else {
+        pr
+    };
+    if should_open_pr {
         // Confirm gh auth before attempting.
         let auth_check = Command::new("ssh")
             .args([
@@ -476,8 +600,9 @@ pub async fn handle_agent_commit_back(
         let pr_title = title.as_deref().unwrap_or("ff agent commit-back");
 
         let gh_cmd = format!(
-            "cd {workspace} && gh pr create --base main --head {br} \
+            "cd {workspace} && gh pr create --base {base} --head {br} \
              --title {title_q} --body {body_q}",
+            base = shell_quote(&git_policy.base_branch),
             br = shell_quote(&branch_name),
             title_q = shell_quote(pr_title),
             body_q = shell_quote(&body),
@@ -518,7 +643,7 @@ pub async fn handle_agent_commit_back(
          WHERE id = $1",
     )
     .bind(work_item_id)
-    .bind(&branch_name)
+    .bind(&output_branch_name)
     .bind(pr_url.as_deref())
     .execute(pool)
     .await;
@@ -528,7 +653,7 @@ pub async fn handle_agent_commit_back(
         "session_id": session_id,
         "work_item_id": work_item_id,
         "worker": worker,
-        "branch": branch_name,
+        "branch": output_branch_name,
         "pr_url": pr_url,
         "files": modified_files,
         "ts": now.to_rfc3339(),
@@ -544,7 +669,7 @@ pub async fn handle_agent_commit_back(
     if let Some(url) = pr_url {
         println!("{url}");
     } else {
-        println!("{branch_name}");
+        println!("{output_branch_name}");
     }
     Ok(())
 }
@@ -688,21 +813,26 @@ pub async fn handle_agent(cmd: crate::AgentCommand) -> Result<()> {
             }
             Ok(())
         }
-        crate::AgentCommand::CommitBack { session, push, pr } => {
-            handle_agent_commit_back(&pool, &session, push, pr).await
-        }
+        crate::AgentCommand::CommitBack {
+            session,
+            push,
+            pr,
+            project,
+        } => handle_agent_commit_back(&pool, &session, push, pr, project).await,
         crate::AgentCommand::Fanout {
             prompt,
             backend,
             fanout,
             run_cwd,
             timeout,
-        } => handle_agent_fanout(&pool, prompt, backend, fanout, run_cwd, timeout).await,
+            project,
+        } => handle_agent_fanout(&pool, prompt, backend, fanout, run_cwd, timeout, project).await,
         crate::AgentCommand::DispatchEach {
             prompt,
             backend,
             run_cwd,
             timeout,
-        } => handle_agent_dispatch_each(&pool, prompt, backend, run_cwd, timeout).await,
+            project,
+        } => handle_agent_dispatch_each(&pool, prompt, backend, run_cwd, timeout, project).await,
     }
 }
