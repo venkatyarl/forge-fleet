@@ -225,12 +225,12 @@ impl AlertEngine {
             AlertRule::high_error_rate(0.1),
         ]);
         if tokio::runtime::Handle::try_current().is_ok() {
-            let _ = Self::spawn_history_pruner(
+            std::mem::drop(Self::spawn_history_pruner(
                 engine.history_handle(),
                 std::time::Duration::from_secs(300),
                 chrono::Duration::days(7),
                 10_000,
-            );
+            ));
         }
         engine
     }

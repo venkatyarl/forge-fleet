@@ -318,7 +318,7 @@ async fn summarize_block(pool: &PgPool, block: &str, content: &str) -> Result<St
          recorded failure — drop only transient narration. Output ONLY the \
          compacted text, no preamble.\n\n---\n{content}"
     );
-    let target_tokens = ((content.len() / 4).max(128)).min(2048) as u32;
+    let target_tokens = (content.len() / 4).clamp(128, 2048) as u32;
     crate::research::openai_single_completion(&endpoint, &model, &prompt, target_tokens, &client)
         .await
         .context("summarizer completion")

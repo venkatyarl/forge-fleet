@@ -226,6 +226,7 @@ pub async fn get_by_name_source(
 /// re-inserting. If the same (name, source) exists at a DIFFERENT
 /// version, both rows are kept — the older one stays as history. The
 /// most-recent installed_at wins for materialize.
+#[allow(clippy::too_many_arguments)]
 pub async fn upsert_skill(
     pool: &PgPool,
     name: &str,
@@ -367,12 +368,12 @@ pub fn materialize_one(skill: &SkillRow) -> Result<PathBuf> {
         std::fs::create_dir_all(parent)?;
     }
 
-    if path.exists() {
-        if let Ok(existing) = std::fs::read_to_string(&path) {
-            let existing_body = strip_frontmatter(&existing);
-            if sha256_hex(existing_body) == skill.body_sha256 {
-                return Ok(path);
-            }
+    if path.exists()
+        && let Ok(existing) = std::fs::read_to_string(&path)
+    {
+        let existing_body = strip_frontmatter(&existing);
+        if sha256_hex(existing_body) == skill.body_sha256 {
+            return Ok(path);
         }
     }
 
@@ -510,7 +511,7 @@ fn render_skill_md(s: &SkillRow) -> String {
 }
 
 fn strip_frontmatter(s: &str) -> &str {
-    let trimmed = s.trim_start_matches(|c: char| c == '\u{feff}');
+    let trimmed = s.trim_start_matches('\u{feff}');
     if let Some(rest) = trimmed.strip_prefix("---\n")
         && let Some(end) = rest.find("\n---\n")
     {

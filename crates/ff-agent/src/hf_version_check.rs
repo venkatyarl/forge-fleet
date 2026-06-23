@@ -67,7 +67,7 @@ pub async fn check_catalog_updates(
                 continue;
             }
 
-            let info = match fetch_repo_info(&client, hf_repo, token).await {
+            let info = match fetch_repo_info(client, hf_repo, token).await {
                 Ok(i) => i,
                 Err(e) => {
                     tracing::debug!("HF info fetch {hf_repo}: {e}");

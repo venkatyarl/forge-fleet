@@ -66,7 +66,7 @@ pub async fn evaluate_work_item_dispatch(pg: &PgPool, worker_name: &str) -> Resu
                     error = %e,
                     "work_item_dispatch: dispatch failed"
                 );
-                if let Err(cleanup) = mark_failed_and_release(&pg, &item, &e.to_string()).await {
+                if let Err(cleanup) = mark_failed_and_release(pg, &item, &e.to_string()).await {
                     warn!(
                         work_item_id = %item.work_item_id,
                         error = %cleanup,
@@ -116,10 +116,10 @@ pub fn spawn_work_item_dispatch(
 /// Expand a leading `~` to $HOME (computers.source_tree_path is stored as
 /// `~/projects/forge-fleet` etc.). Leaves absolute paths untouched.
 fn expand_tilde(p: &str) -> String {
-    if let Some(rest) = p.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest).to_string_lossy().to_string();
-        }
+    if let Some(rest) = p.strip_prefix("~/")
+        && let Some(home) = dirs::home_dir()
+    {
+        return home.join(rest).to_string_lossy().to_string();
     }
     p.to_string()
 }

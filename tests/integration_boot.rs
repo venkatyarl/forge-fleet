@@ -1,7 +1,7 @@
 //! Integration test — verify ForgeFleet boot, health, and core API endpoints.
 //!
 //! This test starts the gateway subsystem (which serves /health, /api/config,
-//! /v1/models, and /api/mc/board) on a random port, verifies each endpoint,
+//! /v1/models) on a random port, verifies each endpoint,
 //! and shuts down cleanly.
 //!
 //! A temporary directory is used for the SQLite database, so tests never
@@ -67,13 +67,9 @@ async fn test_boot_health_and_api() {
     let bind_addr = format!("127.0.0.1:{port}");
     let base_url = format!("http://{bind_addr}");
 
-    // Create MC database in temp dir too
-    let mc_db_path = tmp.path().join("test-mc.db").to_string_lossy().to_string();
-
     let gateway_config = ff_gateway::server::GatewayConfig {
         bind_addr: bind_addr.clone(),
         fleet_config: Some(config.clone()),
-        mc_db_path: Some(mc_db_path),
         ..Default::default()
     };
 
@@ -140,19 +136,9 @@ async fn test_boot_health_and_api() {
         );
     }
 
-    // ── 4) GET /api/mc/board → board JSON ───────────────────────────────────
-    let resp = client
-        .get(format!("{base_url}/api/mc/board"))
-        .send()
-        .await
-        .expect("board request");
-    // Board should return 200 with valid JSON (might be empty board)
-    assert_eq!(resp.status(), 200, "/api/mc/board should return 200");
-    let body: serde_json::Value = resp.json().await.expect("board json");
-    assert!(
-        body.is_object() || body.is_array(),
-        "/api/mc/board should return valid JSON"
-    );
+    // (Mission-control /api/mc/* now requires a Postgres operational_store —
+    // the SQLite fallback was removed — so it is not mounted in this lightweight
+    // no-DB boot test and is exercised by the ff-mc Postgres tests instead.)
 
     // ── Cleanup ──────────────────────────────────────────────────────────────
     server_handle.abort();

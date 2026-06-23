@@ -125,7 +125,7 @@ impl ModelScout {
         };
 
         for task in tasks {
-            match fetch_hf_models_for_task(&http, &task, hf_token.as_deref()).await {
+            match fetch_hf_models_for_task(http, &task, hf_token.as_deref()).await {
                 Ok(models) => {
                     report.discovered += models.len();
                     for m in models {

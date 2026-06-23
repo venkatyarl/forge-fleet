@@ -195,7 +195,7 @@ fn strip_code_fence(s: &str) -> &str {
 
 /// Resolve the tool name from any of the recognized name keys, unwrapping an
 /// OpenAI `{"function":{…}}` / `{"type":"function","function":{…}}` wrapper.
-fn unwrap_function<'a>(parsed: &'a serde_json::Value) -> &'a serde_json::Value {
+fn unwrap_function(parsed: &serde_json::Value) -> &serde_json::Value {
     parsed
         .get("function")
         .filter(|f| f.is_object())
@@ -242,21 +242,21 @@ fn extract_embedded_tool_calls(text: &str) -> Vec<ToolCall> {
     let mut i = 0;
     let bytes = text.as_bytes();
     while i < bytes.len() {
-        if bytes[i] == b'{' {
-            if let Some(end) = match_brace(text, i) {
-                let slice = &text[i..=end];
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(slice) {
-                    let obj = unwrap_function(&v);
-                    if find_name(obj).is_some()
-                        && find_args(obj).is_some()
-                        && let Some(call) = try_parse_single_tool_call(&v, calls.len())
-                    {
-                        calls.push(call);
-                    }
+        if bytes[i] == b'{'
+            && let Some(end) = match_brace(text, i)
+        {
+            let slice = &text[i..=end];
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(slice) {
+                let obj = unwrap_function(&v);
+                if find_name(obj).is_some()
+                    && find_args(obj).is_some()
+                    && let Some(call) = try_parse_single_tool_call(&v, calls.len())
+                {
+                    calls.push(call);
                 }
-                i = end + 1;
-                continue;
             }
+            i = end + 1;
+            continue;
         }
         i += 1;
     }

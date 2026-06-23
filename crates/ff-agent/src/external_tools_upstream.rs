@@ -114,7 +114,7 @@ impl ExternalToolsUpstreamChecker {
                 .to_string();
 
             let query_result =
-                query_upstream(&http, &method, &version_source, github_token.as_deref()).await;
+                query_upstream(http, &method, &version_source, github_token.as_deref()).await;
 
             match query_result {
                 UpstreamResult::Version(new_version) => {

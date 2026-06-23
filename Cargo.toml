@@ -96,10 +96,6 @@ description = "ForgeFleet daemon — unified AI operating system"
 name = "forgefleetd"
 path = "src/main.rs"
 
-[[bin]]
-name = "migrate_from_postgres"
-path = "tools/migrate_from_postgres.rs"
-
 [dependencies]
 ff-core = { path = "crates/ff-core" }
 ff-db = { path = "crates/ff-db" }

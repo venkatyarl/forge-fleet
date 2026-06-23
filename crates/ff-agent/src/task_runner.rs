@@ -1726,10 +1726,10 @@ pub async fn compose_fleet_upgrade_wave_filtered(
         // Stage scoping: when a filter is set, only the named members are
         // composed into this wave (the rest of the stage list is held back for
         // a later tick to compose).
-        if let Some(allow) = filter_lower.as_ref() {
-            if !allow.contains(&plan.computer_name.to_ascii_lowercase()) {
-                continue;
-            }
+        if let Some(allow) = filter_lower.as_ref()
+            && !allow.contains(&plan.computer_name.to_ascii_lowercase())
+        {
+            continue;
         }
         let row: Option<(uuid::Uuid, String, String, i32, String)> = sqlx::query_as(
             "SELECT id, ssh_user, primary_ip, ssh_port, COALESCE(os_family, 'unknown') \

@@ -10,6 +10,8 @@ use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+type LivenessProbeRow = (Option<f32>, Option<String>, Option<DateTime<Utc>>);
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum TaskLiveness {
     Alive,
@@ -23,7 +25,7 @@ pub async fn evaluate_task(
     task_id: Uuid,
     max_idle_secs: i64,
 ) -> Result<TaskLiveness, sqlx::Error> {
-    let row: Option<(Option<f32>, Option<String>, Option<DateTime<Utc>>)> = sqlx::query_as(
+    let row: Option<LivenessProbeRow> = sqlx::query_as(
         "SELECT cpu_pct, pid_state, probed_at FROM task_liveness_probes WHERE task_id = $1 ORDER BY probed_at DESC LIMIT 1"
     ).bind(task_id).fetch_optional(pool).await?;
     let Some((cpu_pct, pid_state, probed_at)) = row else {

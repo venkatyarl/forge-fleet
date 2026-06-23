@@ -67,11 +67,6 @@ pub struct GatewayConfig {
     pub discovery_registry: Option<Arc<NodeRegistry>>,
     /// Path to fleet.toml config file (for config save/reload).
     pub config_path: Option<String>,
-    /// Optional legacy Mission Control SQLite database path.
-    ///
-    /// When absent (or when `operational_store` is Postgres-backed), gateway mounts
-    /// the OperationalStore-backed Mission Control API routes instead.
-    pub mc_db_path: Option<String>,
     /// Operational persistence store (SQLite or Postgres) for tasks/config/audit/etc.
     pub operational_store: Option<OperationalStore>,
     /// Runtime registry store (SQLite or Postgres transitional backend).
@@ -88,7 +83,6 @@ impl Default for GatewayConfig {
             backend_registry: None,
             discovery_registry: None,
             config_path: None,
-            mc_db_path: None,
             operational_store: None,
             runtime_registry: None,
         }
@@ -469,7 +463,7 @@ impl GatewayServer {
     }
 
     pub fn app(&self) -> Router {
-        build_router(self.state.clone(), self.config.mc_db_path.as_deref())
+        build_router(self.state.clone())
     }
 
     pub async fn run(mut self) -> anyhow::Result<()> {
@@ -544,7 +538,7 @@ pub async fn run(config: GatewayConfig) -> anyhow::Result<()> {
 
 // ─── Router ──────────────────────────────────────────────────────────────────
 
-pub fn build_router(state: Arc<GatewayState>, mc_db_path: Option<&str>) -> Router {
+pub fn build_router(state: Arc<GatewayState>) -> Router {
     let mut app = Router::new()
         // Core gateway routes
         .route("/health", get(health))
@@ -838,36 +832,12 @@ pub fn build_router(state: Arc<GatewayState>, mc_db_path: Option<&str>) -> Route
 
     // Mount Mission Control API routes.
     //
-    // Priority:
-    // 1) OperationalStore-backed router when a Postgres backend is active
-    //    (or when no sqlite MC DB path was provided).
-    // 2) Legacy sqlite mission-control router when an explicit mc_db_path exists.
-    let mut mounted_mc_routes = false;
-
-    if let Some(store) = state.operational_store.clone()
-        && (matches!(store, OperationalStore::Postgres(_)) || mc_db_path.is_none())
-    {
+    if let Some(store) = state.operational_store.clone() {
         let mc_routes = ff_mc::operational_api::mc_router_operational(store);
         app = app.merge(mc_routes.with_state(()));
-        mounted_mc_routes = true;
         info!("mission control API mounted at /api/mc/* (operational store backend)");
-    }
-
-    if !mounted_mc_routes {
-        if let Some(db_path) = mc_db_path {
-            match ff_mc::McDb::open(db_path) {
-                Ok(mc_db) => {
-                    let mc_routes = ff_mc::api::mc_router(mc_db);
-                    app = app.merge(mc_routes.with_state(()));
-                    info!("mission control API mounted at /api/mc/* (sqlite backend)");
-                }
-                Err(err) => {
-                    warn!(error = %err, "failed to open mission control DB; MC routes not mounted");
-                }
-            }
-        } else {
-            warn!("mission control API not mounted: no sqlite path or operational store available");
-        }
+    } else {
+        warn!("mission control API not mounted: no operational store available");
     }
 
     // Initialize Prometheus metrics (idempotent).

@@ -167,18 +167,17 @@ pub async fn fetch_web_context(
     max_results: usize,
 ) -> Option<String> {
     // Primary (when configured): self-hosted SearXNG metasearch on the fleet.
-    if let Some(base) = searxng_base.map(str::trim).filter(|b| !b.is_empty()) {
-        if let Ok(results) = fetch_searxng_results(client, base, query, max_results).await {
-            if !results.is_empty() {
-                return Some(format_results(&results));
-            }
-        }
+    if let Some(base) = searxng_base.map(str::trim).filter(|b| !b.is_empty())
+        && let Ok(results) = fetch_searxng_results(client, base, query, max_results).await
+        && !results.is_empty()
+    {
+        return Some(format_results(&results));
     }
     // Secondary: general-web results via DuckDuckGo.
-    if let Ok(results) = fetch_search_results(client, query, max_results).await {
-        if !results.is_empty() {
-            return Some(format_results(&results));
-        }
+    if let Ok(results) = fetch_search_results(client, query, max_results).await
+        && !results.is_empty()
+    {
+        return Some(format_results(&results));
     }
     // Fallback: Wikipedia (no API key, not IP-blocked). Narrower coverage than a
     // general web search, but real sources beat hallucinated ones.

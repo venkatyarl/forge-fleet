@@ -64,11 +64,11 @@ pub async fn analyze(
         let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
         let data_uri = format!("data:{};base64,{}", item.mime, b64);
 
-        let analysis = match call_llm(&client, llm_endpoint, model_id, &data_uri, PROMPT).await {
+        let analysis = match call_llm(client, llm_endpoint, model_id, &data_uri, PROMPT).await {
             Ok(a) => a,
             Err(e) => {
                 tracing::warn!(error = %e, "initial vision call failed, retrying with stricter prompt");
-                match call_llm(&client, llm_endpoint, model_id, &data_uri, STRICT_PROMPT).await {
+                match call_llm(client, llm_endpoint, model_id, &data_uri, STRICT_PROMPT).await {
                     Ok(a) => a,
                     Err(e2) => {
                         tracing::warn!(error = %e2, "stricter vision call also failed; degrading");

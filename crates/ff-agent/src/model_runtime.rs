@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 
 static SHARED_HTTP: std::sync::LazyLock<reqwest::Client> =
-    std::sync::LazyLock::new(|| reqwest::Client::new());
+    std::sync::LazyLock::new(reqwest::Client::new);
 
 /// Options for [`load_model`].
 #[derive(Debug, Clone)]
@@ -208,13 +208,12 @@ pub async fn load_model(pool: &sqlx::PgPool, opts: LoadOptions) -> Result<LoadRe
     if let Some(node) = ff_db::pg_get_node(pool, &worker_name)
         .await
         .map_err(|e| format!("pg_get_node({worker_name}): {e}"))?
+        && let Err(reason) = check_runtime_placement(&node, &lib.runtime)
     {
-        if let Err(reason) = check_runtime_placement(&node, &lib.runtime) {
-            return Err(format!(
-                "placement rejected: cannot load {} ({}) on {}: {reason}",
-                lib.catalog_id, lib.runtime, worker_name
-            ));
-        }
+        return Err(format!(
+            "placement rejected: cannot load {} ({}) on {}: {reason}",
+            lib.catalog_id, lib.runtime, worker_name
+        ));
     }
 
     let port = opts.port;
@@ -531,7 +530,7 @@ pub async fn load_model(pool: &sqlx::PgPool, opts: LoadOptions) -> Result<LoadRe
         runtime_label,
         port,
         std::time::Duration::from_secs(90),
-        &*SHARED_HTTP,
+        &SHARED_HTTP,
     )
     .await;
 
@@ -969,7 +968,7 @@ pub async fn health_check_deployment(
         &dep.runtime,
         dep.port as u16,
         std::time::Duration::from_secs(3),
-        &*SHARED_HTTP,
+        &SHARED_HTTP,
     )
     .await;
     let status_new = if ok { "healthy" } else { "unhealthy" };
@@ -1099,7 +1098,7 @@ async fn wait_for_health(
 
 /// Public re-export of [`probe_health`] for other modules (e.g. reconciler).
 pub async fn probe_health_public(runtime: &str, port: u16, timeout: std::time::Duration) -> bool {
-    probe_health(runtime, port, timeout, &*SHARED_HTTP).await
+    probe_health(runtime, port, timeout, &SHARED_HTTP).await
 }
 
 async fn probe_health(

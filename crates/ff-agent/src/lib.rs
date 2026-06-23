@@ -1,3 +1,5 @@
+#![allow(clippy::doc_lazy_continuation, clippy::doc_overindented_list_items)]
+
 pub mod agent_coordinator;
 pub mod agent_hint;
 pub mod agent_loop;

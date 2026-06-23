@@ -240,10 +240,10 @@ pub async fn try_route_to_cloud(
         .unwrap_or(false);
 
     let res = match provider.request_format.as_str() {
-        "openai_chat" => call_openai_chat(&client, &provider, &api_key, body, streaming).await,
-        "anthropic_messages" => call_anthropic_messages(&client, &provider, &api_key, body).await,
+        "openai_chat" => call_openai_chat(client, &provider, &api_key, body, streaming).await,
+        "anthropic_messages" => call_anthropic_messages(client, &provider, &api_key, body).await,
         "google_generate_content" => {
-            call_google_generate_content(&client, &provider, &api_key, model_id, body).await
+            call_google_generate_content(client, &provider, &api_key, model_id, body).await
         }
         other => {
             return Some(Err(error_response(
