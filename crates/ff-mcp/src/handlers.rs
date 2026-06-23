@@ -4316,6 +4316,10 @@ mod tests {
         restore_test_db_env(&db_path, prev_db_path);
     }
 
+    // Requires a live Postgres: project_profile_upsert/policy_resolve now route
+    // through the Postgres-only OperationalStore (the embedded-SQLite path was
+    // removed), so this is a DB integration test, not a `--lib` unit test.
+    #[ignore = "requires Postgres (OperationalStore is Postgres-only)"]
     #[tokio::test(flavor = "current_thread")]
     async fn project_profile_round_trip_and_policy_resolve() {
         let _guard = env_lock().lock().unwrap();
