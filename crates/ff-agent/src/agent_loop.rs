@@ -1923,7 +1923,18 @@ pub(crate) async fn cargo_check_workspace(
 
 /// Resolve the `agent_auto_verify_rust` fleet secret. Default `true`.
 /// Any value starting with `0`, `f`/`F`, or `n`/`N` disables auto-verify.
+///
+/// A per-process `FF_AGENT_NO_VERIFY=1` env var (set by `ff run --no-verify`)
+/// force-disables it regardless of the secret — for dispatching a piece of a
+/// larger refactor that won't compile until every piece lands, so the loop
+/// doesn't thrash on cargo errors it can't fix yet.
 pub(crate) async fn auto_verify_rust_enabled() -> bool {
+    if matches!(
+        std::env::var("FF_AGENT_NO_VERIFY").ok().as_deref(),
+        Some("1") | Some("true")
+    ) {
+        return false;
+    }
     match crate::fleet_info::fetch_secret("agent_auto_verify_rust").await {
         None => true,
         Some(v) => {
