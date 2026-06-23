@@ -67,13 +67,9 @@ async fn test_boot_health_and_api() {
     let bind_addr = format!("127.0.0.1:{port}");
     let base_url = format!("http://{bind_addr}");
 
-    // Create MC database in temp dir too
-    let mc_db_path = tmp.path().join("test-mc.db").to_string_lossy().to_string();
-
     let gateway_config = ff_gateway::server::GatewayConfig {
         bind_addr: bind_addr.clone(),
         fleet_config: Some(config.clone()),
-        mc_db_path: Some(mc_db_path),
         ..Default::default()
     };
 
