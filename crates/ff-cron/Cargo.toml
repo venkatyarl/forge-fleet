@@ -19,7 +19,6 @@ tracing.workspace = true
 chrono.workspace = true
 uuid.workspace = true
 dashmap.workspace = true
-rusqlite = { version = "0.32", features = ["bundled"] }
 sqlx.workspace = true
 
 [dev-dependencies]
