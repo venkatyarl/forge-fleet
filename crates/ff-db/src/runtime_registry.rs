@@ -1,8 +1,6 @@
 //! Runtime registry persistence abstraction.
 //!
-//! Phase 37A transitional model:
-//! - Keep full embedded SQLite support.
-//! - Allow runtime registry + enrollment event tables to be primary on Postgres.
+//! Postgres-only runtime registry and enrollment event persistence.
 //!
 //! This module intentionally scopes Postgres writes to operational runtime tables:
 //! `fleet_worker_runtime` and `fleet_enrollment_events`.
@@ -13,23 +11,16 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 use tracing::info;
 
-use crate::{DbPool, error::DbError, queries};
+use crate::{error::DbError, queries};
 
 /// Persistence backend for runtime registry/enrollment tables.
 #[derive(Debug, Clone)]
 pub enum RuntimeRegistryStore {
-    /// Persist runtime registry rows into embedded SQLite.
-    Sqlite(DbPool),
     /// Persist runtime registry rows into Postgres.
     Postgres(Arc<PgPool>),
 }
 
 impl RuntimeRegistryStore {
-    /// Build runtime registry store backed by SQLite.
-    pub fn sqlite(pool: DbPool) -> Self {
-        Self::Sqlite(pool)
-    }
-
     /// Build runtime registry store backed by Postgres and ensure schema exists.
     pub async fn postgres(database_url: &str, max_connections: u32) -> Result<Self, DbError> {
         let pool = PgPoolOptions::new()
@@ -54,7 +45,6 @@ impl RuntimeRegistryStore {
     /// Human-readable backend label for logs and diagnostics.
     pub fn backend_label(&self) -> &'static str {
         match self {
-            Self::Sqlite(_) => "embedded_sqlite",
             Self::Postgres(_) => "postgres_runtime",
         }
     }
@@ -65,19 +55,6 @@ impl RuntimeRegistryStore {
         heartbeat: &queries::FleetNodeRuntimeHeartbeatRow,
     ) -> Result<queries::FleetNodeRuntimeRow, DbError> {
         match self {
-            Self::Sqlite(pool) => {
-                let heartbeat = heartbeat.clone();
-                let node_id = heartbeat.node_id.clone();
-                let row = pool
-                    .with_conn(move |conn| {
-                        queries::upsert_fleet_worker_runtime(conn, &heartbeat)?;
-                        let rows = queries::list_fleet_worker_runtime(conn)?;
-                        Ok(rows.into_iter().find(|row| row.node_id == node_id))
-                    })
-                    .await?;
-
-                row.ok_or_else(|| DbError::NotFound("runtime node readback failed".to_string()))
-            }
             Self::Postgres(pool) => {
                 let now = Utc::now();
                 let heartbeat_at = parse_rfc3339_to_utc(&heartbeat.last_heartbeat)?;
@@ -148,21 +125,6 @@ impl RuntimeRegistryStore {
         event: &queries::FleetEnrollmentEventInsert,
     ) -> Result<queries::FleetNodeRuntimeRow, DbError> {
         match self {
-            Self::Sqlite(pool) => {
-                let heartbeat = heartbeat.clone();
-                let event = event.clone();
-                let node_id = heartbeat.node_id.clone();
-                let row = pool
-                    .with_conn(move |conn| {
-                        queries::upsert_fleet_worker_runtime(conn, &heartbeat)?;
-                        queries::insert_fleet_enrollment_event(conn, &event)?;
-                        let rows = queries::list_fleet_worker_runtime(conn)?;
-                        Ok(rows.into_iter().find(|row| row.node_id == node_id))
-                    })
-                    .await?;
-
-                row.ok_or_else(|| DbError::NotFound("runtime node readback failed".to_string()))
-            }
             Self::Postgres(pool) => {
                 let mut tx = pool.begin().await?;
                 let now = Utc::now();
@@ -292,11 +254,6 @@ impl RuntimeRegistryStore {
         event: &queries::FleetEnrollmentEventInsert,
     ) -> Result<i64, DbError> {
         match self {
-            Self::Sqlite(pool) => {
-                let event = event.clone();
-                pool.with_conn(move |conn| queries::insert_fleet_enrollment_event(conn, &event))
-                    .await
-            }
             Self::Postgres(pool) => {
                 let row = sqlx::query(
                     r#"
@@ -336,7 +293,6 @@ impl RuntimeRegistryStore {
     /// List runtime nodes.
     pub async fn list_runtime_nodes(&self) -> Result<Vec<queries::FleetNodeRuntimeRow>, DbError> {
         match self {
-            Self::Sqlite(pool) => pool.with_conn(queries::list_fleet_worker_runtime).await,
             Self::Postgres(pool) => {
                 let rows = sqlx::query(
                     r#"
@@ -373,10 +329,6 @@ impl RuntimeRegistryStore {
         limit: usize,
     ) -> Result<Vec<queries::FleetEnrollmentEventRow>, DbError> {
         match self {
-            Self::Sqlite(pool) => {
-                pool.with_conn(move |conn| queries::list_fleet_enrollment_events(conn, limit))
-                    .await
-            }
             Self::Postgres(pool) => {
                 let clamped = (limit as i64).clamp(1, 500);
                 let rows = sqlx::query(
@@ -412,17 +364,6 @@ impl RuntimeRegistryStore {
         node_id: &str,
     ) -> Result<queries::FleetNodeRuntimeRow, DbError> {
         match self {
-            Self::Sqlite(pool) => {
-                let node_id = node_id.to_string();
-                let row = pool
-                    .with_conn(move |conn| {
-                        let rows = queries::list_fleet_worker_runtime(conn)?;
-                        Ok(rows.into_iter().find(|row| row.node_id == node_id))
-                    })
-                    .await?;
-
-                row.ok_or_else(|| DbError::NotFound("runtime node readback failed".to_string()))
-            }
             Self::Postgres(pool) => {
                 let row = sqlx::query(
                     r#"
@@ -457,9 +398,7 @@ impl RuntimeRegistryStore {
     }
 
     async fn ensure_postgres_schema(&self) -> Result<(), DbError> {
-        let Self::Postgres(pool) = self else {
-            return Ok(());
-        };
+        let Self::Postgres(pool) = self;
 
         sqlx::query(
             r#"
