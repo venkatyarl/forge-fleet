@@ -3992,7 +3992,7 @@ fn deploy_playbook(os_family: &str, source_tree_path: &str) -> String {
                     nohup \"$HOME/.local/bin/forgefleetd\" --worker-name $(hostname -s) start \
                     </dev/null >/tmp/forgefleetd.log 2>&1 & disown ); \
              sleep 4; ~/.local/bin/ff model resume-from-build 2>/dev/null || true; \
-             RN=$(pgrep -xc forgefleetd 2>/dev/null || echo 0); \
+             RN=$(pgrep -x forgefleetd 2>/dev/null | wc -l | tr -d ' '); \
              echo \"RESTART_VERIFY count=$RN (macos: launchd-managed)\""
         ),
         // linux + linux-dgx share the same restart idiom; only -j differs
@@ -4015,7 +4015,7 @@ fn deploy_playbook(os_family: &str, source_tree_path: &str) -> String {
                || ( nohup \"$HOME/.local/bin/forgefleetd\" --worker-name $(hostname -s) start \
                     </dev/null >/tmp/forgefleetd.log 2>&1 & disown ); \
              sleep 4; ~/.local/bin/ff model resume-from-build 2>/dev/null || true; \
-             RP=$(pgrep -x forgefleetd | head -1); RN=$(pgrep -xc forgefleetd 2>/dev/null || echo 0); \
+             RP=$(pgrep -x forgefleetd | head -1); RN=$(pgrep -x forgefleetd 2>/dev/null | wc -l | tr -d ' '); \
              RE=$(readlink /proc/$RP/exe 2>/dev/null); \
              echo \"RESTART_VERIFY count=$RN exe=$RE\"; \
              case \"$RE\" in *'(deleted)'*) echo 'RESTART_STALE: running deleted inode' >&2; exit 7;; esac; \
@@ -4050,7 +4050,9 @@ fn leader_refresh_playbook(os_family: &str, source_tree_path: &str) -> String {
              USER_ID=$(stat -f %u \"$HOME\" 2>/dev/null || id -u); \
              launchctl kickstart -k \"gui/${{USER_ID}}/com.forgefleet.forgefleetd\" 2>/dev/null \
                || launchctl kickstart -k \"user/${{USER_ID}}/com.forgefleet.forgefleetd\" 2>/dev/null; \
-             sleep 4; RN=$(pgrep -xc forgefleetd 2>/dev/null || echo 0); \
+             RN=0; for _i in $(seq 1 30); do \
+               RN=$(pgrep -x forgefleetd 2>/dev/null | wc -l | tr -d ' '); \
+               [ \"$RN\" -ge 1 ] && break; sleep 1; done; \
              echo \"LEADER_REFRESH count=$RN\"; [ \"$RN\" -ge 1 ]"
         ),
         _ => format!(
@@ -4062,7 +4064,9 @@ fn leader_refresh_playbook(os_family: &str, source_tree_path: &str) -> String {
                || ( for p in $(pgrep -x forgefleetd); do kill -TERM \"$p\" 2>/dev/null; done; sleep 2; \
                     nohup \"$HOME/.local/bin/forgefleetd\" --worker-name $(hostname -s) start \
                     </dev/null >/tmp/forgefleetd.log 2>&1 & disown ); \
-             sleep 4; RN=$(pgrep -xc forgefleetd 2>/dev/null || echo 0); \
+             RN=0; for _i in $(seq 1 30); do \
+               RN=$(pgrep -x forgefleetd 2>/dev/null | wc -l | tr -d ' '); \
+               [ \"$RN\" -ge 1 ] && break; sleep 1; done; \
              echo \"LEADER_REFRESH count=$RN\"; [ \"$RN\" -ge 1 ]"
         ),
     }
