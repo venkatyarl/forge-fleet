@@ -2777,6 +2777,102 @@ pub async fn find_symbols_all_corpora(
     Ok(projects.into_iter().zip(hits).collect())
 }
 
+/// Static code-health signals derived purely from the Cortex graph (no LLM).
+/// Returned by [`cortex_alerts`].
+#[derive(Debug, Clone)]
+pub struct CortexAlerts {
+    /// Refactor-risk hotspots: most-depended-on functions `(qualified_name,
+    /// fan_in)`, fan-in desc. Changing these ripples widely.
+    pub god_symbols: Vec<(String, i64)>,
+    /// Mutually-importing pairs `(a, b)` — the worst import cycles. Empty = none.
+    pub circular_imports: Vec<(String, String)>,
+    /// Total count of functions with NO in-graph call edges (no callers and no
+    /// callees), plus a capped sample. LOW-CONFIDENCE: a heuristic call graph
+    /// can't see macro/attribute/framework invocation (serde `default=`, derive,
+    /// route handlers), so many of these are actually used — review, don't delete.
+    pub isolated_total: i64,
+    pub isolated_sample: Vec<String>,
+}
+
+/// Compute [`CortexAlerts`] for a corpus from the live graph. `limit` caps each
+/// list. Only the current generation's live (`valid_until IS NULL`) code nodes.
+pub async fn cortex_alerts(pool: &PgPool, corpus_slug: &str, limit: i64) -> Result<CortexAlerts> {
+    let limit = limit.clamp(1, 200);
+
+    // Generation/liveness filter shared by all three queries.
+    let gen_filter = "COALESCE(n.generation, 0) IN (0, COALESCE((SELECT current_generation \
+               FROM cortex_generations WHERE project = n.project), 0))";
+
+    let god_rows = sqlx::query(&format!(
+        "SELECT n.title,
+                (SELECT count(*) FROM brain_vault_edges e
+                  WHERE e.edge_type = 'calls' AND e.dst_id = n.id) AS fan_in
+           FROM brain_vault_nodes n
+          WHERE n.project = $1 AND n.node_type = 'code:function'
+            AND n.valid_until IS NULL AND {gen_filter}
+          ORDER BY fan_in DESC, n.title COLLATE \"C\"
+          LIMIT $2"
+    ))
+    .bind(corpus_slug)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    let god_symbols = god_rows
+        .into_iter()
+        .map(|r| (r.get::<String, _>("title"), r.get::<i64, _>("fan_in")))
+        .filter(|(_, f)| *f > 0)
+        .collect();
+
+    // Mutual imports: src<dst dedupes the symmetric pair.
+    let cyc_rows = sqlx::query(
+        r#"SELECT s.title AS a, d.title AS b
+             FROM brain_vault_edges ea
+             JOIN brain_vault_edges eb ON ea.src_id = eb.dst_id AND ea.dst_id = eb.src_id
+             JOIN brain_vault_nodes s ON s.id = ea.src_id
+             JOIN brain_vault_nodes d ON d.id = ea.dst_id
+            WHERE ea.edge_type = 'imports' AND eb.edge_type = 'imports'
+              AND ea.src_id < ea.dst_id
+              AND s.project = $1 AND d.project = $1
+            ORDER BY s.title COLLATE "C"
+            LIMIT $2"#,
+    )
+    .bind(corpus_slug)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    let circular_imports = cyc_rows
+        .into_iter()
+        .map(|r| (r.get::<String, _>("a"), r.get::<String, _>("b")))
+        .collect();
+
+    let iso_filter = format!(
+        "n.project = $1 AND n.node_type = 'code:function' AND n.valid_until IS NULL AND {gen_filter} \
+         AND n.title NOT ILIKE '%test%' AND n.title NOT ILIKE '%::main' \
+         AND NOT EXISTS (SELECT 1 FROM brain_vault_edges e WHERE e.edge_type='calls' AND e.dst_id=n.id) \
+         AND NOT EXISTS (SELECT 1 FROM brain_vault_edges e WHERE e.edge_type='calls' AND e.src_id=n.id)"
+    );
+    let isolated_total: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM brain_vault_nodes n WHERE {iso_filter}"
+    ))
+    .bind(corpus_slug)
+    .fetch_one(pool)
+    .await?;
+    let isolated_sample: Vec<String> = sqlx::query_scalar(&format!(
+        "SELECT n.title FROM brain_vault_nodes n WHERE {iso_filter} ORDER BY n.title COLLATE \"C\" LIMIT $2"
+    ))
+    .bind(corpus_slug)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(CortexAlerts {
+        god_symbols,
+        circular_imports,
+        isolated_total,
+        isolated_sample,
+    })
+}
+
 /// Resolve each hit's owning file by walking `contains` edges UP to the ancestor
 /// `content:file` node (file -> impl/mod -> symbol can nest, so a recursive walk,
 /// not a single hop). Fills `SymbolHit::file` in place. Shared by the substring

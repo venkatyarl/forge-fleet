@@ -26,7 +26,7 @@ Source: kimi analysis + online SOTA research (2026-06-17). Full transcript: `/tm
 10. **Runtime test-coverage edges** — augment static `tests_for` with coverage-weighted `test_touches_code` for trustworthy change-risk.
 
 ### P2 — future
-11. Agentic graph traversal (MCTS/ReAct, RANGER/LocAgent). 12. Broader languages (Go/C/C++/C#/Ruby/Swift/Kotlin/…). 13. Build/config graph (`Cargo.toml`/`package.json` → `depends_on`/`builds_into`). 14. NL→Cypher/SQL query generation. 15. Token-budget subgraph selection (PageRank/learned relevance). 16. Static dead-code / god-symbol / circular-import alerts.
+11. Agentic graph traversal (MCTS/ReAct, RANGER/LocAgent). 12. Broader languages (Go/C/C++/C#/Ruby/Swift/Kotlin/…). 13. Build/config graph (`Cargo.toml`/`package.json` → `depends_on`/`builds_into`). 14. NL→Cypher/SQL query generation. 15. Token-budget subgraph selection (PageRank/learned relevance). 16. Static dead-code / god-symbol / circular-import alerts. ✅ `ff cortex alerts` (`cortex_alerts`): god symbols (fan-in hotspots) + mutual import cycles reliably; isolated-functions count is shipped but heuristic/caveated (macro/attribute/framework calls are invisible to a tree-sitter call graph, so "dead code" is unreliable — labeled review-not-delete).
 
 ## Suggested sequencing
 1. Ship `cortex_context` (P0.1) — immediate agent productivity win **and** the hook to make cortex auto-consulted in the loop.
