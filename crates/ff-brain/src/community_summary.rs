@@ -73,6 +73,9 @@ const TIMEOUT_SECS: u64 = 120;
 /// Members listed in the prompt (enough to characterize the cluster, bounded so
 /// a giant community doesn't blow the context window).
 const MAX_PROMPT_MEMBERS: i64 = 40;
+
+/// Max child summaries fed into a coarse community's map-reduce prompt.
+const MAX_HIERARCHY_CHILDREN: i64 = 30;
 /// How many sample summaries to surface in the stats for human inspection.
 const MAX_SAMPLES: usize = 5;
 
@@ -155,9 +158,10 @@ pub async fn summarize_communities<F: Fn(usize, usize)>(
         model: model.clone(),
         samples: Vec::new(),
     };
-    if eligible == 0 {
-        return Ok(stats);
-    }
+    // NB: do NOT early-return on `eligible == 0` — even when every level-0
+    // community is already summarized, the coarse (level>0) hierarchy pass below
+    // may still have work (a new super-community, or children that only just got
+    // summaries). The level-0 loop simply no-ops on empty `rows`.
 
     let url = format!("{endpoint}/v1/chat/completions");
 
@@ -208,7 +212,110 @@ pub async fn summarize_communities<F: Fn(usize, usize)>(
         progress(i + 1, eligible);
     }
 
+    // GraphRAG slice 2b: fold the hierarchy upward. Now that the finest (level 0)
+    // communities are summarized, summarize each coarser level from its already-
+    // summarized CHILDREN (map-reduce), ascending level by level. Best-effort —
+    // a failure here never fails the level-0 run.
+    summarize_levels_above_zero(pool, &client, &url, &model, opts, &mut stats).await;
+
     Ok(stats)
+}
+
+/// Summarize the coarse (level > 0) hierarchy communities via map-reduce: each
+/// community's summary is synthesized from its CHILDREN's summaries (rows whose
+/// `parent_member_hash` points at it), not from raw code. Processes levels
+/// ASCENDING so a level's children are always summarized first. Children come
+/// from the level-0 pass (above) or a prior iteration of this loop. Mutates
+/// `stats`; best-effort (logs + continues on any per-community error).
+async fn summarize_levels_above_zero(
+    pool: &PgPool,
+    client: &reqwest::Client,
+    url: &str,
+    model: &str,
+    opts: &SummarizeOpts,
+    stats: &mut CommunitySummaryStats,
+) {
+    let max_level: i32 =
+        sqlx::query_scalar("SELECT COALESCE(MAX(level), 0) FROM brain_code_communities")
+            .fetch_one(pool)
+            .await
+            .unwrap_or(0);
+
+    for lvl in 1..=max_level {
+        let rows: Vec<(i32, String, i32, String)> = match sqlx::query_as(
+            "SELECT c.id, c.member_hash, c.member_count, COALESCE(g.title, '')
+             FROM brain_code_communities c
+             LEFT JOIN brain_vault_nodes g ON g.id = c.god_node_id
+             WHERE c.level = $1
+               AND c.member_count >= $2
+               AND ($3 OR c.summary IS NULL)
+             ORDER BY c.member_count DESC
+             LIMIT $4",
+        )
+        .bind(lvl)
+        .bind(opts.min_members as i32)
+        .bind(opts.all)
+        .bind(opts.max as i64)
+        .fetch_all(pool)
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(level = lvl, error = %e, "select level>0 communities");
+                continue;
+            }
+        };
+
+        for (id, member_hash, member_count, anchor) in rows {
+            // Children = communities pointing at this one, that already have a
+            // summary (finer levels summarized first).
+            let children: Vec<(String, String)> = sqlx::query_as(
+                "SELECT COALESCE(g.title, LEFT(c.member_hash, 12)), c.summary
+                 FROM brain_code_communities c
+                 LEFT JOIN brain_vault_nodes g ON g.id = c.god_node_id
+                 WHERE c.parent_member_hash = $1 AND c.summary IS NOT NULL
+                 ORDER BY c.member_count DESC
+                 LIMIT $2",
+            )
+            .bind(&member_hash)
+            .bind(MAX_HIERARCHY_CHILDREN)
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
+
+            if children.is_empty() {
+                continue; // no summarized children yet — a finer level must run first
+            }
+            stats.attempted += 1;
+
+            let prompt = build_hierarchy_summary_prompt(&anchor, member_count, &children);
+            match call_summary_llm(client, url, model, &prompt).await {
+                Ok(raw) => {
+                    let summary = clean_summary(&raw);
+                    if summary.is_empty() {
+                        stats.empty += 1;
+                    } else if let Err(e) = store_summary(pool, id, &summary, model).await {
+                        tracing::warn!(community = id, error = %e, "store hierarchy summary");
+                        stats.failed += 1;
+                    } else {
+                        stats.summarized += 1;
+                        if stats.samples.len() < MAX_SAMPLES {
+                            stats.samples.push(CommunitySummarySample {
+                                community_id: id,
+                                god_title: anchor.clone(),
+                                member_count,
+                                summary,
+                            });
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(community = id, error = %e, "hierarchy summarize LLM call");
+                    stats.failed += 1;
+                }
+            }
+        }
+    }
 }
 
 /// Persist a summary on the registry row (stamps model + time).
@@ -374,6 +481,48 @@ Anchor symbol (most-connected member): {god_title}\n\
 Anchor location: {god_path}\n\
 Total members in cluster: {member_count}\n\
 Representative members:\n\
+{listing}\n\
+Summary:"
+    )
+}
+
+/// Build the MAP-REDUCE prompt for one coarse (level > 0) community: synthesize a
+/// subsystem summary from its children's summaries rather than raw code. `anchor`
+/// is the community's god-node title (may be empty); `children` are
+/// `(child_anchor, child_summary)` pairs. Pure (unit-tested).
+pub fn build_hierarchy_summary_prompt(
+    anchor: &str,
+    member_count: i32,
+    children: &[(String, String)],
+) -> String {
+    let mut listing = String::new();
+    for (i, (child_anchor, child_summary)) in children.iter().enumerate() {
+        let s = child_summary.trim();
+        if s.is_empty() {
+            continue;
+        }
+        let a = child_anchor.trim();
+        if a.is_empty() {
+            listing.push_str(&format!("{}. {s}\n", i + 1));
+        } else {
+            listing.push_str(&format!("{}. [{a}] {s}\n", i + 1));
+        }
+    }
+    let anchor_line = if anchor.trim().is_empty() {
+        String::new()
+    } else {
+        format!("Anchor symbol (most-connected member): {anchor}\n")
+    };
+    format!(
+        "You are documenting a SUBSYSTEM of a single codebase — a higher-level group \
+that bundles several smaller code clusters found by community detection. Below are the \
+summaries of its sub-components. Write a concise 1-3 sentence summary of what this \
+subsystem is RESPONSIBLE FOR as a whole — the shared responsibility that unifies its \
+parts. Synthesize a theme; do NOT just concatenate the sub-summaries. No preamble, no \
+markdown, no \"Summary:\" prefix — output only the summary sentences.\n\n\
+{anchor_line}\
+Total symbols spanned: {member_count}\n\
+Sub-component summaries:\n\
 {listing}\n\
 Summary:"
     )
@@ -682,6 +831,41 @@ mod tests {
         // a blank-title member produces no bullet line
         assert!(!p.contains("- ["));
         assert!(!p.contains("-  ["));
+    }
+
+    #[test]
+    fn hierarchy_prompt_folds_children_and_anchor() {
+        let children = vec![
+            (
+                "ff_db::queries".to_string(),
+                "Database query helpers.".to_string(),
+            ),
+            (String::new(), "HTTP routing layer.".to_string()),
+        ];
+        let p = build_hierarchy_summary_prompt("gateway", 120, &children);
+        assert!(p.contains("SUBSYSTEM"), "frames it as a subsystem");
+        assert!(p.contains("gateway"), "includes the anchor");
+        assert!(p.contains("[ff_db::queries] Database query helpers."));
+        assert!(
+            p.contains("HTTP routing layer."),
+            "anchorless child still listed"
+        );
+        assert!(p.contains("120"), "includes the span count");
+    }
+
+    #[test]
+    fn hierarchy_prompt_skips_blank_child_summaries_and_anchor() {
+        let children = vec![
+            ("a".to_string(), "   ".to_string()), // blank summary → skipped
+            ("b".to_string(), "Real work.".to_string()),
+        ];
+        let p = build_hierarchy_summary_prompt("", 5, &children);
+        assert!(p.contains("Real work."));
+        assert!(!p.contains("[a]"), "blank-summary child produces no line");
+        assert!(
+            !p.contains("Anchor symbol"),
+            "empty anchor → no anchor line"
+        );
     }
 
     #[test]
