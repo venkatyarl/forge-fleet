@@ -2649,13 +2649,19 @@ fn build_fleet_worker_view(
         .or_else(|| config_hint.and_then(|hint| hint.role.clone()))
         .unwrap_or_else(|| "unknown".to_string());
 
-    let is_leader = if let Some(leader) = leader_hint {
-        node.config_name.as_deref() == Some(leader)
-            || node.hostname.as_deref() == Some(leader)
-            || display_name == leader
-    } else {
-        role == "leader" || role == "gateway"
-    };
+    // A node is the leader if its live DB role says so, OR if it matches the
+    // authoritative leader_hint by any of its names. The role check is the
+    // robust path: leader_hint is the member_name from fleet_leader_state
+    // (e.g. "taylor") and a registry-discovered node may carry no config_name/
+    // hostname to match it against — but its db_node.role (now sourced from the
+    // live fleet_workers table) does resolve to "leader".
+    let is_leader = role == "leader"
+        || role == "gateway"
+        || leader_hint.is_some_and(|leader| {
+            node.config_name.as_deref() == Some(leader)
+                || node.hostname.as_deref() == Some(leader)
+                || display_name == leader
+        });
 
     let leader_state = if is_leader {
         "leader".to_string()
