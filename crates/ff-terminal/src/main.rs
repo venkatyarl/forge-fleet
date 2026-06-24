@@ -67,6 +67,7 @@ mod memory_cmd;
 mod metrics_cmd;
 mod model_cmd;
 mod model_serve_cmd;
+mod notify_cmd;
 mod offload_cmd;
 mod onboard_cmd;
 mod openclaw_cmd;
@@ -652,6 +653,11 @@ enum Command {
     Alert {
         #[command(subcommand)]
         command: AlertCommand,
+    },
+    /// Send fleet notifications (Telegram) through the shared notify path.
+    Notify {
+        #[command(subcommand)]
+        command: notify_cmd::NotifyCommand,
     },
     /// Metrics history (downsampled Pulse beats, 90-day retention).
     Metrics {
@@ -3906,6 +3912,9 @@ async fn main() -> Result<()> {
             return project_cmd::handle_project(command.clone()).await;
         }
         Some(Command::Alert { command }) => return alert_cmd::handle_alert(command.clone()).await,
+        Some(Command::Notify { command }) => {
+            return notify_cmd::handle_notify(command.clone()).await;
+        }
         Some(Command::Metrics { command }) => {
             return metrics_cmd::handle_metrics(command.clone()).await;
         }
@@ -4884,6 +4893,7 @@ async fn main() -> Result<()> {
             }
         }
         Some(Command::Alert { command }) => alert_cmd::handle_alert(command).await,
+        Some(Command::Notify { command }) => notify_cmd::handle_notify(command).await,
         Some(Command::Metrics { command }) => metrics_cmd::handle_metrics(command).await,
         Some(Command::Logs {
             computer,
