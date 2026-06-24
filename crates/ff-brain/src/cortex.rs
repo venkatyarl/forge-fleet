@@ -704,6 +704,30 @@ async fn finish_cortex_generation<T>(
     let lock_key = format!("cortex:{corpus_slug}");
     match result {
         Ok(value) => {
+            // Carry every still-live node forward to the new generation BEFORE the
+            // swap. The read path (find_symbols, callers/callees/impact, …) filters
+            // `generation IN (0, current_generation)`, so a node is only visible at
+            // the current generation. An INCREMENTAL reindex writes just the changed
+            // symbols at the new generation and leaves unchanged ones at whatever
+            // generation they were last written — which, once current_generation
+            // advances, falls BELOW it and vanishes from every query (the forge-fleet
+            // corpus had 12k live symbols stranded at gen 72 while current_generation
+            // had crept to 115, so `ff cortex find/explain` returned nothing).
+            // Promoting all live (`valid_until IS NULL`) nodes to the new generation
+            // keeps the whole live graph visible and self-heals any prior scatter.
+            // Superseded/deleted nodes carry `valid_until` and are correctly skipped.
+            sqlx::query(
+                r#"UPDATE brain_vault_nodes
+                      SET generation = $2
+                    WHERE project = $1
+                      AND valid_until IS NULL
+                      AND COALESCE(generation, 0) <> $2"#,
+            )
+            .bind(corpus_slug)
+            .bind(lock.generation)
+            .execute(&mut *lock.conn)
+            .await?;
+
             sqlx::query(
                 r#"UPDATE cortex_generations
                       SET current_generation = $2,
