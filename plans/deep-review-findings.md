@@ -136,7 +136,24 @@ root cause as the `fleet_worker_runtime`-empty follow-up below — tracked there
 fixed here. So #4's HA core is closed; the dashboard leader rendering rides on the
 runtime-table follow-up.
 
-### NEW finding (surfaced by #4 dogfood) — `fleet_worker_runtime` is empty live
+### ✅ RESOLVED (PR #545) — gateway DB snapshot read TWO dead pre-rename tables
+Chasing the #4 dashboard caveat uncovered the real, bigger root cause. The
+gateway's per-node `role`/`status` (`db_node`) does NOT come from
+`fleet_worker_runtime` — it comes from `OperationalStore::list_nodes()`, which read
+the legacy **`nodes`** base table. Both `nodes` AND `fleet_worker_runtime` are
+pre-rename / pre-Pulse-v2 relics that nothing populates anymore (**0 rows each**
+live; the live state is materialized into `computers` + `fleet_workers`). So the
+gateway's entire DB fleet snapshot was blind → every node `role="unknown"`, no
+leader, running on registry/config only. **Fix (#545):** repointed `list_nodes()`
+at `computers ⋈ fleet_workers` (15 live rows, taylor=leader) and made
+`build_fleet_worker_view`'s `is_leader` honor the live DB role (not only a
+`leader_hint` name-match). This closes the #4 dashboard-rendering follow-up too.
+**Still open:** `list_runtime_nodes` (`fleet_worker_runtime`) — the OTHER dead-table
+reader; lower impact now that `db_node` is sourced correctly, but its
+`db_snapshot.runtime_nodes` consumers (server.rs ~2489) still get empty. Repoint or
+retire similarly. Original detail below.
+
+### `fleet_worker_runtime` is empty live (original note)
 `fleet_worker_runtime` (the table `RuntimeRegistryStore::list_runtime_nodes` reads,
 which becomes the gateway's `db_snapshot.runtime_nodes`) has **0 rows** on the live
 fleet. So *every* consumer of `db_snapshot.runtime_nodes` in the fleet-status
