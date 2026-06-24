@@ -703,6 +703,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "code_community_levels",
         sql: schema::SCHEMA_V144_CODE_COMMUNITY_LEVELS,
     },
+    PgMigration {
+        version: 145,
+        name: "code_community_parent",
+        sql: schema::SCHEMA_V145_CODE_COMMUNITY_PARENT,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.

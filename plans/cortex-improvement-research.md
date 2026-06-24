@@ -50,8 +50,13 @@ Source: kimi analysis + online SOTA research (2026-06-17). Full transcript: `/tm
     stores every level's communities (each distinct grouping once, at its finest
     level). Summarizer scoped to `level = 0` (it resolves members via the level-0
     `code_community_id`, so coarse rows wait for slice 2).
-  - ⏳ slice 2: per-level map-reduce summaries (level N+1 summary from its level-N
-    children's summaries).
+  - ✅ slice 2a (this PR): parent links — `community_parents` (pure, unit-tested)
+    finds each community's immediate strictly-larger enclosing community; V145 adds
+    `parent_member_hash` (indexed) to `brain_code_communities`; detection stores it.
+    The hierarchy is now a navigable tree (children of P = rows WHERE
+    parent_member_hash = P.member_hash).
+  - ⏳ slice 2b: per-level map-reduce summaries (level N summary from its children's
+    summaries, ascending) — uses the parent links from 2a.
   - ⏳ slice 3: wire the hierarchy into `cortex_explain` so "explain this
     subsystem" traverses levels.
 - 🔨 **P0.2 hybrid retrieval** — vector (`find_symbols_semantic`) + graph-neighborhood

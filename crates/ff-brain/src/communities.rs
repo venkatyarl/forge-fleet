@@ -383,6 +383,61 @@ pub fn cluster_calls_graph_levels(
     levels
 }
 
+/// Given a multi-level community labeling (`levels[L][i]` = node `i`'s community
+/// at level `L`, as returned by [`cluster_calls_graph_levels`]), compute each
+/// multi-member community's PARENT in the hierarchy: the first STRICTLY-larger
+/// enclosing community at a higher level (the immediate super-community in the
+/// tree of distinct groupings). Returns a map `(level, label) -> parent` where
+/// `parent` is `Some((level', label'))` or `None` for top-level communities.
+///
+/// Because coarsening is monotonic, all members of a community share the same
+/// label at every higher level, so any representative member resolves the
+/// parent. Singletons are omitted (they aren't stored). Pure; unit-tested.
+pub fn community_parents(levels: &[Vec<usize>]) -> HashMap<(usize, usize), Option<(usize, usize)>> {
+    let mut out: HashMap<(usize, usize), Option<(usize, usize)>> = HashMap::new();
+    if levels.is_empty() {
+        return out;
+    }
+    let n = levels[0].len();
+
+    // Per-level community sizes (label -> member count).
+    let sizes: Vec<HashMap<usize, usize>> = levels
+        .iter()
+        .map(|labels| {
+            let mut s: HashMap<usize, usize> = HashMap::new();
+            for &l in labels {
+                *s.entry(l).or_insert(0) += 1;
+            }
+            s
+        })
+        .collect();
+
+    for (lvl, labels) in levels.iter().enumerate() {
+        let mut seen: HashSet<usize> = HashSet::new();
+        for (i, &c) in labels.iter().enumerate().take(n) {
+            if !seen.insert(c) {
+                continue; // already handled this community via its first member
+            }
+            let size_c = sizes[lvl][&c];
+            if size_c < 2 {
+                continue; // singletons aren't stored
+            }
+            // Walk up: first higher level where this member's enclosing community
+            // is strictly larger is the immediate parent.
+            let mut parent: Option<(usize, usize)> = None;
+            for (l2, sizes_l2) in sizes.iter().enumerate().skip(lvl + 1) {
+                let pc = levels[l2][i];
+                if sizes_l2[&pc] > size_c {
+                    parent = Some((l2, pc));
+                    break;
+                }
+            }
+            out.insert((lvl, c), parent);
+        }
+    }
+    out
+}
+
 /// Run cortex code-community detection: label propagation over the `calls`
 /// subgraph among non-extern `code:*` nodes. Writes each node's
 /// `code_community_id` and reconciles the `brain_code_communities` registry
@@ -492,22 +547,40 @@ pub async fn detect_code_communities(pool: &PgPool) -> Result<CommunitySummary, 
     // means a community that never merges stays at level 0 and only genuinely
     // coarser super-communities get a higher level. Stable member_hash so
     // summaries survive across runs.
-    let mut hashes: Vec<String> = Vec::new();
-    let mut god_ids: Vec<uuid::Uuid> = Vec::new();
-    let mut counts: Vec<i32> = Vec::new();
-    let mut row_levels: Vec<i32> = Vec::new();
-    let mut seen_hashes: HashSet<String> = HashSet::new();
-    for (lvl, labels) in levels.iter().enumerate() {
+    // Group nodes by (level, label) once, and hash every multi-member group so
+    // both a community's own hash AND its parent's hash come from one map.
+    let mut level_groups: Vec<HashMap<usize, Vec<usize>>> = Vec::with_capacity(levels.len());
+    for labels in &levels {
         let mut by_label: HashMap<usize, Vec<usize>> = HashMap::new();
         for (i, &l) in labels.iter().enumerate() {
             by_label.entry(l).or_default().push(i);
         }
-        for idxs in by_label.values() {
+        level_groups.push(by_label);
+    }
+    let mut group_hash: HashMap<(usize, usize), String> = HashMap::new();
+    for (lvl, groups) in level_groups.iter().enumerate() {
+        for (&label, idxs) in groups {
             if idxs.len() < 2 {
                 continue;
             }
-            let member_paths: Vec<String> = idxs.iter().map(|&i| node_rows[i].1.clone()).collect();
-            let hash = community_member_hash(&member_paths);
+            let paths: Vec<String> = idxs.iter().map(|&i| node_rows[i].1.clone()).collect();
+            group_hash.insert((lvl, label), community_member_hash(&paths));
+        }
+    }
+    let parents = community_parents(&levels);
+
+    let mut hashes: Vec<String> = Vec::new();
+    let mut god_ids: Vec<uuid::Uuid> = Vec::new();
+    let mut counts: Vec<i32> = Vec::new();
+    let mut row_levels: Vec<i32> = Vec::new();
+    let mut parent_hashes: Vec<Option<String>> = Vec::new();
+    let mut seen_hashes: HashSet<String> = HashSet::new();
+    for (lvl, groups) in level_groups.iter().enumerate() {
+        for (&label, idxs) in groups {
+            if idxs.len() < 2 {
+                continue;
+            }
+            let hash = group_hash[&(lvl, label)].clone();
             if !seen_hashes.insert(hash.clone()) {
                 continue; // identical grouping already recorded at a finer level
             }
@@ -521,10 +594,17 @@ pub async fn detect_code_communities(pool: &PgPool) -> Result<CommunitySummary, 
                         .then_with(|| node_rows[b].1.cmp(&node_rows[a].1))
                 })
                 .expect("multi-member community has at least one member");
+            // Parent = the immediate strictly-larger enclosing community (a tree
+            // edge up the hierarchy), keyed by its member_hash. NULL = top.
+            let parent_hash = parents
+                .get(&(lvl, label))
+                .and_then(|p| p.as_ref())
+                .and_then(|(l2, pc)| group_hash.get(&(*l2, *pc)).cloned());
             hashes.push(hash);
             god_ids.push(node_rows[god].0);
             counts.push(idxs.len() as i32);
             row_levels.push(lvl as i32);
+            parent_hashes.push(parent_hash);
         }
     }
 
@@ -544,18 +624,21 @@ pub async fn detect_code_communities(pool: &PgPool) -> Result<CommunitySummary, 
     .map_err(|e| format!("DB error pruning stale code communities: {e}"))?;
 
     sqlx::query(
-        "INSERT INTO brain_code_communities (member_hash, god_node_id, member_count, level, updated_at)
-         SELECT h, g, c, l, NOW()
-         FROM UNNEST($1::text[], $2::uuid[], $3::int[], $4::int[]) AS t(h, g, c, l)
+        "INSERT INTO brain_code_communities
+             (member_hash, god_node_id, member_count, level, parent_member_hash, updated_at)
+         SELECT h, g, c, l, p, NOW()
+         FROM UNNEST($1::text[], $2::uuid[], $3::int[], $4::int[], $5::text[]) AS t(h, g, c, l, p)
          ON CONFLICT (member_hash, level) DO UPDATE
-           SET member_count = EXCLUDED.member_count,
-               god_node_id  = EXCLUDED.god_node_id,
-               updated_at   = NOW()",
+           SET member_count       = EXCLUDED.member_count,
+               god_node_id        = EXCLUDED.god_node_id,
+               parent_member_hash = EXCLUDED.parent_member_hash,
+               updated_at         = NOW()",
     )
     .bind(&hashes)
     .bind(&god_ids)
     .bind(&counts)
     .bind(&row_levels)
+    .bind(&parent_hashes)
     .execute(pool)
     .await
     .map_err(|e| format!("DB error upserting code communities: {e}"))?;
@@ -569,7 +652,31 @@ pub async fn detect_code_communities(pool: &PgPool) -> Result<CommunitySummary, 
 
 #[cfg(test)]
 mod tests {
-    use super::{cluster_calls_graph, cluster_calls_graph_levels, community_member_hash};
+    use super::{
+        cluster_calls_graph, cluster_calls_graph_levels, community_member_hash, community_parents,
+    };
+
+    #[test]
+    fn community_parents_walks_to_first_strictly_larger() {
+        // 3 pairs at level 0; pairs {0,1} and {2,3} merge at level 1; everything
+        // merges at level 2.
+        let levels = vec![
+            vec![0, 0, 1, 1, 2, 2], // L0: three 2-member communities
+            vec![0, 0, 0, 0, 1, 1], // L1: {0,1,2,3} (size 4) and {4,5} (size 2)
+            vec![0, 0, 0, 0, 0, 0], // L2: everything (size 6)
+        ];
+        let p = community_parents(&levels);
+        // Finest pairs: {0,1} and {2,3} enclose into the size-4 L1 community.
+        assert_eq!(p[&(0, 0)], Some((1, 0)));
+        assert_eq!(p[&(0, 1)], Some((1, 0)));
+        // {4,5} stays size 2 at L1 (not strictly larger), so its parent is L2.
+        assert_eq!(p[&(0, 2)], Some((2, 0)));
+        // The L1 size-4 community and the L1 size-2 community both roll up to L2.
+        assert_eq!(p[&(1, 0)], Some((2, 0)));
+        assert_eq!(p[&(1, 1)], Some((2, 0)));
+        // The top community has no parent.
+        assert_eq!(p[&(2, 0)], None);
+    }
 
     /// True if `a` and `b` induce the SAME partition (group nodes identically),
     /// ignoring the actual label values.
