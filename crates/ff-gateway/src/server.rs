@@ -2408,19 +2408,24 @@ async fn build_fleet_status_payload(
 
     let db_snapshot = load_db_fleet_snapshot(state).await;
 
-    let leader_hint = state
-        .discovery_registry
-        .as_ref()
-        .and_then(|registry| registry.current_leader())
-        .or_else(|| {
-            db_snapshot.as_ref().and_then(|snapshot| {
-                snapshot
-                    .runtime_nodes
-                    .iter()
-                    .find(|node| node.role.eq_ignore_ascii_case("leader"))
-                    .map(|node| node.hostname.clone())
-            })
-        });
+    // leader_hint reads the authoritative LeaderTick state directly from
+    // Postgres `fleet_leader_state` — the same source the `/api/fleet/leader`
+    // GET and `/.well-known/forgefleet` use. Deep-review #4: the old
+    // discovery/TOML election that populated this via
+    // discovery_registry.current_leader() ran concurrently with LeaderTick and
+    // could leak a stale winner here, so it was removed. The DB runtime-snapshot
+    // role=="leader" path can't surface it either (fleet_worker_runtime is empty
+    // in practice — it would always yield None). One source of truth now.
+    let leader_hint = match state.operational_store.as_ref().and_then(|os| os.pg_pool()) {
+        Some(pool) => sqlx::query_scalar::<_, String>(
+            "SELECT member_name FROM fleet_leader_state WHERE singleton_key = 'current'",
+        )
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten(),
+        None => None,
+    };
 
     Ok(assemble_fleet_status_payload(
         nodes,

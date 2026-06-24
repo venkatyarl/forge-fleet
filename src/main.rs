@@ -307,15 +307,14 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         config.discovery.subnet_scan_enabled,
     ));
 
-    // 2) leader election — periodic election using discovery data
-    info!("starting subsystem: leader election");
-    let election_config = Arc::new(config.clone());
-    subsystem_tasks.push(start_leader_election_subsystem(
-        election_config,
-        worker_name.clone(),
-        registry.clone(),
-        shutdown_rx.clone(),
-    ));
+    // 2) leader election — REMOVED 2026-06-24 (deep-review #4). The
+    // discovery/TOML election engine (start_leader_election_subsystem) ran
+    // concurrently with the authoritative LeaderTick (Postgres
+    // fleet_leader_state) and could disagree with it — leaking a stale winner
+    // into the gateway's leader_hint. Its only effects were a redundant
+    // heartbeat bump (LeaderTick already heartbeats) and that stale hint
+    // (which already falls back to the authoritative DB snapshot). LeaderTick
+    // is now the single source of truth for leadership fleet-wide.
 
     // 3) api proxy — build shared backend registry from config + Postgres
     info!("starting subsystem: api proxy");
@@ -2170,146 +2169,6 @@ fn start_discovery_subsystem(
                 changed = shutdown_rx.changed() => {
                     if changed.is_err() || *shutdown_rx.borrow() {
                         info!("discovery subsystem stopping");
-                        break;
-                    }
-                }
-            }
-        }
-    })
-}
-
-// ─── Leader election subsystem ───────────────────────────────────────────────
-
-/// Announces this node as leader to all known fleet nodes via HTTP POST.
-async fn announce_leader_to_fleet(
-    leader_name: &str,
-    config: &FleetConfig,
-    registry: &NodeRegistry,
-    client: &reqwest::Client,
-) {
-    let payload = serde_json::json!({
-        "leader": leader_name,
-        "announced_at": chrono::Utc::now().to_rfc3339(),
-    });
-
-    // Announce to all config-sourced nodes (except ourselves).
-    for (worker_name, node_cfg) in &config.nodes {
-        if worker_name == leader_name {
-            continue;
-        }
-
-        let port = node_cfg.port.unwrap_or(config.fleet.api_port);
-        let url = format!("http://{}:{}/api/fleet/leader", node_cfg.ip, port);
-
-        match client.post(&url).json(&payload).send().await {
-            Ok(resp) if resp.status().is_success() => {
-                info!(
-                    target_node = %worker_name,
-                    "leader announcement accepted"
-                );
-            }
-            Ok(resp) => {
-                warn!(
-                    target_node = %worker_name,
-                    status = resp.status().as_u16(),
-                    "leader announcement rejected"
-                );
-            }
-            Err(err) => {
-                warn!(
-                    target_node = %worker_name,
-                    error = %err,
-                    "leader announcement failed (node may be offline)"
-                );
-            }
-        }
-    }
-
-    // Record the leader in the registry.
-    registry.set_leader(leader_name.to_string());
-}
-
-fn start_leader_election_subsystem(
-    config: Arc<FleetConfig>,
-    _node_name: String,
-    registry: Arc<NodeRegistry>,
-    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        use ff_core::leader::{check_failover, elect_leader};
-
-        let election_interval = Duration::from_secs(config.leader.election_interval_secs.max(5));
-        let mut ticker = tokio::time::interval(election_interval);
-        let mut current_leader: Option<String> = None;
-        let mut initial_election_done = false;
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(3))
-            .build()
-            .unwrap_or_default();
-
-        loop {
-            tokio::select! {
-                _ = ticker.tick() => {
-                    // Build health tuples from registry.
-                    let health = registry.node_health_for_election();
-
-                    if health.is_empty() {
-                        // No configured nodes in registry — skip election.
-                        continue;
-                    }
-
-                    if !initial_election_done {
-                        // Run a full initial election.
-                        let result = elect_leader(&config, &health);
-                        if let Some(ref elected) = result.elected {
-                            info!(
-                                leader = %elected,
-                                reason = %result.reason,
-                                "initial leader election completed"
-                            );
-                            current_leader = Some(elected.clone());
-                            announce_leader_to_fleet(elected, &config, &registry, &client).await;
-                        } else {
-                            warn!(
-                                reason = %result.reason,
-                                "initial election: no leader could be elected"
-                            );
-                        }
-                        initial_election_done = true;
-                        continue;
-                    }
-
-                    // Periodic election check — failover or preferred-return.
-                    if let Some(ref leader) = current_leader {
-                        if let Some(result) = check_failover(leader, &config, &health)
-                            && let Some(ref new_leader) = result.elected
-                                && new_leader != leader {
-                                    info!(
-                                        old_leader = %leader,
-                                        new_leader = %new_leader,
-                                        reason = %result.reason,
-                                        "leader change detected"
-                                    );
-                                    current_leader = Some(new_leader.clone());
-                                    announce_leader_to_fleet(new_leader, &config, &registry, &client).await;
-                                }
-                    } else {
-                        // No current leader — try to elect one.
-                        let result = elect_leader(&config, &health);
-                        if let Some(ref elected) = result.elected {
-                            info!(
-                                leader = %elected,
-                                reason = %result.reason,
-                                "leader elected (was none)"
-                            );
-                            current_leader = Some(elected.clone());
-                            announce_leader_to_fleet(elected, &config, &registry, &client).await;
-                        }
-                    }
-                }
-                changed = shutdown_rx.changed() => {
-                    if changed.is_err() || *shutdown_rx.borrow() {
-                        info!("leader election subsystem stopping");
                         break;
                     }
                 }
