@@ -210,36 +210,70 @@ async fn run_swarm(
 
     let results = wait_for_children(&pool, &child_ids, timeout_secs).await?;
 
+    let total = results.len();
     let done = results.iter().filter(|r| r.status == "completed").count();
-    let failed = results.iter().filter(|r| r.status == "failed").count();
+    let failed_results: Vec<&ChildResult> =
+        results.iter().filter(|r| r.status != "completed").collect();
+    let failed = failed_results.len();
     eprintln!("aggregator: {done} completed, {failed} failed");
 
-    let raw = results
+    // GAP-C: synthesize ONLY from the completed sub-tasks — a failed/timed-out
+    // sub-task's partial output is noise to the synthesizer. Failures are
+    // reported separately so a partial swarm is visible + retryable, never
+    // silently merged into the result.
+    let completed_raw = results
         .iter()
+        .filter(|r| r.status == "completed")
         .enumerate()
         .map(|(i, r)| {
             format!(
-                "## sub-task {}: {}\n\nstatus: {}\n\n{}\n",
+                "## sub-task {}: {}\n\n{}\n",
                 i + 1,
                 truncate(&r.summary, 120),
-                r.status,
                 r.result_preview.as_deref().unwrap_or("(no output)")
             )
         })
         .collect::<Vec<_>>()
         .join("\n---\n\n");
 
-    let final_text = if no_synthesize {
-        format!("# Swarm raw results\n\nGoal: {goal}\n\n---\n\n{raw}")
+    let failures_section = if failed_results.is_empty() {
+        String::new()
     } else {
-        eprintln!("aggregator: synthesizing final result…");
-        match synthesize(goal, &raw, llm, model).await {
+        let list = failed_results
+            .iter()
+            .map(|r| {
+                format!(
+                    "- **{}** ({}): {}",
+                    truncate(&r.summary, 100),
+                    r.status,
+                    r.result_preview
+                        .as_deref()
+                        .map(|p| truncate(p, 160))
+                        .unwrap_or_else(|| "(no output)".to_string())
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("\n\n## ⚠ {failed}/{total} sub-task(s) failed (retryable)\n\n{list}\n")
+    };
+
+    let final_text = if no_synthesize {
+        format!(
+            "# Swarm raw results\n\nGoal: {goal}\n\n{done}/{total} completed.{failures_section}\n\n---\n\n{completed_raw}"
+        )
+    } else if done == 0 {
+        format!("# Swarm: all {total} sub-task(s) failed\n\nGoal: {goal}{failures_section}")
+    } else {
+        eprintln!("aggregator: synthesizing from {done} completed sub-task(s)…");
+        match synthesize(goal, &completed_raw, llm, model).await {
             Ok(s) => format!(
-                "# Swarm synthesis\n\nGoal: {goal}\n\n{s}\n\n## Raw sub-task results\n\n{raw}"
+                "# Swarm synthesis ({done}/{total} completed)\n\nGoal: {goal}\n\n{s}{failures_section}\n\n## Completed sub-task results\n\n{completed_raw}"
             ),
             Err(e) => {
                 eprintln!("warn: synthesis failed ({e}); falling back to raw");
-                format!("# Swarm raw results (synthesis failed)\n\nGoal: {goal}\n\n---\n\n{raw}")
+                format!(
+                    "# Swarm raw results (synthesis failed)\n\nGoal: {goal}{failures_section}\n\n---\n\n{completed_raw}"
+                )
             }
         }
     };
