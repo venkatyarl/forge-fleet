@@ -2873,6 +2873,155 @@ pub async fn cortex_alerts(pool: &PgPool, corpus_slug: &str, limit: i64) -> Resu
     })
 }
 
+/// A small graph slice for visualization export ([`export_neighborhood`]).
+#[derive(Debug, Clone, Default)]
+pub struct GraphExport {
+    /// `(id, label, kind)` — id is the node UUID (stable), label the qualified
+    /// name, kind the `code:*` type without the prefix.
+    pub nodes: Vec<(String, String, String)>,
+    /// `(source_id, target_id, edge_type)` directed edges among the nodes.
+    pub edges: Vec<(String, String, String)>,
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+/// Serialize a [`GraphExport`] to GraphML (the interchange format yEd / Gephi /
+/// Cytoscape read). Pure; unit-tested.
+pub fn graph_to_graphml(g: &GraphExport) -> String {
+    let mut o = String::with_capacity(256 + g.nodes.len() * 96 + g.edges.len() * 80);
+    o.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+    o.push_str("<graphml xmlns=\"http://graphml.graphdrawing.org/xmlns\">\n");
+    o.push_str("  <key id=\"label\" for=\"node\" attr.name=\"label\" attr.type=\"string\"/>\n");
+    o.push_str("  <key id=\"kind\" for=\"node\" attr.name=\"kind\" attr.type=\"string\"/>\n");
+    o.push_str("  <key id=\"etype\" for=\"edge\" attr.name=\"type\" attr.type=\"string\"/>\n");
+    o.push_str("  <graph edgedefault=\"directed\">\n");
+    for (id, label, kind) in &g.nodes {
+        o.push_str(&format!(
+            "    <node id=\"{}\"><data key=\"label\">{}</data><data key=\"kind\">{}</data></node>\n",
+            xml_escape(id),
+            xml_escape(label),
+            xml_escape(kind)
+        ));
+    }
+    for (src, dst, etype) in &g.edges {
+        o.push_str(&format!(
+            "    <edge source=\"{}\" target=\"{}\"><data key=\"etype\">{}</data></edge>\n",
+            xml_escape(src),
+            xml_escape(dst),
+            xml_escape(etype)
+        ));
+    }
+    o.push_str("  </graph>\n</graphml>\n");
+    o
+}
+
+/// Serialize a [`GraphExport`] to Graphviz DOT (render with `dot -Tsvg`). Pure;
+/// unit-tested. Labels (not ids) are shown; ids key the edges.
+pub fn graph_to_dot(g: &GraphExport) -> String {
+    let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+    let mut o = String::from("digraph cortex {\n  rankdir=LR;\n  node [shape=box, fontsize=10];\n");
+    for (id, label, _kind) in &g.nodes {
+        o.push_str(&format!("  \"{}\" [label=\"{}\"];\n", esc(id), esc(label)));
+    }
+    for (src, dst, _etype) in &g.edges {
+        o.push_str(&format!("  \"{}\" -> \"{}\";\n", esc(src), esc(dst)));
+    }
+    o.push_str("}\n");
+    o
+}
+
+/// Export the call-graph neighborhood of a symbol (callers + callees within
+/// `depth` hops, capped at `max_nodes` nearest by hop distance) as a
+/// [`GraphExport`] for visualization. Resolves `symbol` like the other
+/// `find_symbols` callers. `None` when nothing matches.
+pub async fn export_neighborhood(
+    pool: &PgPool,
+    corpus_slug: &str,
+    symbol: &str,
+    depth: i64,
+    max_nodes: i64,
+) -> Result<Option<GraphExport>> {
+    let hits = find_symbols(pool, corpus_slug, symbol, 50, None).await?;
+    if hits.is_empty() {
+        return Ok(None);
+    }
+    let root = hits[pick_show_match(&hits, symbol)].id;
+    let depth = depth.clamp(0, 5);
+    let max_nodes = max_nodes.clamp(1, 2000);
+
+    // BFS over the undirected `calls` graph (so both callers and callees are
+    // included), keeping each node's MIN hop distance, then take the closest
+    // `max_nodes`.
+    let ids: Vec<Uuid> = sqlx::query_scalar(
+        r#"
+        WITH RECURSIVE nbr(id, d) AS (
+            SELECT $1::uuid, 0
+            UNION
+            SELECT CASE WHEN e.src_id = n.id THEN e.dst_id ELSE e.src_id END, n.d + 1
+              FROM nbr n
+              JOIN brain_vault_edges e
+                ON (e.src_id = n.id OR e.dst_id = n.id) AND e.edge_type = 'calls'
+             WHERE n.d < $2
+        )
+        SELECT id FROM (SELECT id, min(d) AS d FROM nbr GROUP BY id) q
+         ORDER BY d, id
+         LIMIT $3"#,
+    )
+    .bind(root)
+    .bind(depth)
+    .bind(max_nodes)
+    .fetch_all(pool)
+    .await?;
+    if ids.is_empty() {
+        return Ok(None);
+    }
+
+    let node_rows =
+        sqlx::query("SELECT id, title, node_type FROM brain_vault_nodes WHERE id = ANY($1)")
+            .bind(&ids)
+            .fetch_all(pool)
+            .await?;
+    let nodes = node_rows
+        .into_iter()
+        .map(|r| {
+            let nt: String = r.get("node_type");
+            let kind = nt.strip_prefix("code:").unwrap_or(&nt).to_string();
+            (
+                r.get::<Uuid, _>("id").to_string(),
+                r.get::<String, _>("title"),
+                kind,
+            )
+        })
+        .collect();
+
+    // Edges among the selected nodes only (so the export is self-contained).
+    let edge_rows = sqlx::query(
+        "SELECT src_id, dst_id, edge_type FROM brain_vault_edges
+          WHERE edge_type = 'calls' AND src_id = ANY($1) AND dst_id = ANY($1)",
+    )
+    .bind(&ids)
+    .fetch_all(pool)
+    .await?;
+    let edges = edge_rows
+        .into_iter()
+        .map(|r| {
+            (
+                r.get::<Uuid, _>("src_id").to_string(),
+                r.get::<Uuid, _>("dst_id").to_string(),
+                r.get::<String, _>("edge_type"),
+            )
+        })
+        .collect();
+
+    Ok(Some(GraphExport { nodes, edges }))
+}
+
 /// Resolve each hit's owning file by walking `contains` edges UP to the ancestor
 /// `content:file` node (file -> impl/mod -> symbol can nest, so a recursive walk,
 /// not a single hop). Fills `SymbolHit::file` in place. Shared by the substring
@@ -6702,6 +6851,48 @@ fn read_package_name(cargo_toml: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_export() -> GraphExport {
+        GraphExport {
+            nodes: vec![
+                ("id1".into(), "foo<T> & bar".into(), "function".into()),
+                ("id2".into(), "baz".into(), "struct".into()),
+            ],
+            edges: vec![("id1".into(), "id2".into(), "calls".into())],
+        }
+    }
+
+    #[test]
+    fn graphml_is_well_formed_and_escapes() {
+        let xml = graph_to_graphml(&sample_export());
+        assert!(xml.starts_with("<?xml version=\"1.0\""));
+        assert!(xml.contains("<graphml xmlns=\"http://graphml.graphdrawing.org/xmlns\">"));
+        assert!(xml.trim_end().ends_with("</graphml>"));
+        // Special chars in the label are XML-escaped, not raw.
+        assert!(xml.contains("foo&lt;T&gt; &amp; bar"));
+        assert!(!xml.contains("foo<T> & bar"));
+        // One node element per node, one edge element per edge.
+        assert_eq!(xml.matches("<node ").count(), 2);
+        assert_eq!(xml.matches("<edge ").count(), 1);
+        assert!(xml.contains("source=\"id1\" target=\"id2\""));
+    }
+
+    #[test]
+    fn dot_quotes_and_escapes() {
+        let dot = graph_to_dot(&sample_export());
+        assert!(dot.starts_with("digraph cortex {"));
+        assert!(dot.trim_end().ends_with("}"));
+        assert!(dot.contains("\"id1\" -> \"id2\";"));
+        // The label is shown (not the id) and quotes/backslashes are escaped.
+        assert!(dot.contains("[label=\"foo<T> & bar\"]"));
+    }
+
+    #[test]
+    fn empty_export_serializes_cleanly() {
+        let g = GraphExport::default();
+        assert!(graph_to_graphml(&g).contains("<graph edgedefault=\"directed\">"));
+        assert!(graph_to_dot(&g).contains("digraph cortex {"));
+    }
 
     #[test]
     fn no_symbol_error_names_selector_and_corpus() {
