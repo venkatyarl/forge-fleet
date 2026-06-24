@@ -55,8 +55,15 @@ Source: kimi analysis + online SOTA research (2026-06-17). Full transcript: `/tm
     `parent_member_hash` (indexed) to `brain_code_communities`; detection stores it.
     The hierarchy is now a navigable tree (children of P = rows WHERE
     parent_member_hash = P.member_hash).
-  - ⏳ slice 2b: per-level map-reduce summaries (level N summary from its children's
-    summaries, ascending) — uses the parent links from 2a.
+  - ✅ slice 2b (this PR): per-level map-reduce summaries. After the level-0 pass,
+    `summarize_levels_above_zero` processes levels ASCENDING (1,2,…): each level-N
+    community's summary is synthesized from its CHILDREN's summaries (rows whose
+    parent_member_hash points at it) via `build_hierarchy_summary_prompt` (pure,
+    unit-tested) — map-reduce, not raw code. Removed the `eligible==0` early-return
+    so the hierarchy pass runs even when level 0 is fully summarized. No migration
+    (reuses summary*/parent/level columns).
+  - ⏳ slice 3: wire the hierarchy into `cortex_explain` so "explain this subsystem"
+    traverses levels top-down.
   - ⏳ slice 3: wire the hierarchy into `cortex_explain` so "explain this
     subsystem" traverses levels.
 - 🔨 **P0.2 hybrid retrieval** — vector (`find_symbols_semantic`) + graph-neighborhood
