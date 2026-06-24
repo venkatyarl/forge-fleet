@@ -1,0 +1,12 @@
+# Pin the Rust toolchain so local dev == CI == fleet builds.
+#
+# CI's quality gates run on 1.88.0 (.github/workflows/rust-quality-gates.yml
+# uses dtolnay/rust-toolchain@1.88.0). Without this pin a developer's default
+# toolchain (e.g. 1.93) formats and lints DIFFERENTLY — rustfmt 1.93 leaves
+# `mod` ordering / long lines that rustfmt 1.88 rewrites, and clippy 1.93 fires
+# lints 1.88 doesn't — so a locally-clean change fails CI fmt/clippy. Pinning
+# here makes `cargo build / fmt / clippy / test` use 1.88 everywhere (rustup
+# auto-installs it on first use), killing that skew at the source.
+[toolchain]
+channel = "1.88.0"
+components = ["clippy", "rustfmt"]
