@@ -290,39 +290,6 @@ impl RuntimeRegistryStore {
         }
     }
 
-    /// List runtime nodes.
-    pub async fn list_runtime_nodes(&self) -> Result<Vec<queries::FleetNodeRuntimeRow>, DbError> {
-        match self {
-            Self::Postgres(pool) => {
-                let rows = sqlx::query(
-                    r#"
-                    SELECT
-                        node_id,
-                        hostname,
-                        ips_json,
-                        role,
-                        reported_status,
-                        last_heartbeat,
-                        resources_json,
-                        services_json,
-                        models_json,
-                        capabilities_json,
-                        stale_degraded_after_secs,
-                        stale_offline_after_secs,
-                        updated_at
-                    FROM fleet_worker_runtime
-                    ORDER BY hostname, node_id
-                    LIMIT 100
-                    "#,
-                )
-                .fetch_all(pool.as_ref())
-                .await?;
-
-                rows.into_iter().map(map_postgres_runtime_row).collect()
-            }
-        }
-    }
-
     /// List enrollment events.
     pub async fn list_enrollment_events(
         &self,
