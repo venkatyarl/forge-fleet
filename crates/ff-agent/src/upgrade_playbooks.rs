@@ -84,6 +84,16 @@ fn playbook_exact(tool: &str, os_family: &str) -> Option<String> {
             "sudo apt-get update && sudo apt-get install --only-upgrade -y 1password-cli".into(),
         ),
         ("op", "macos") => Some("brew upgrade --cask 1password-cli".into()),
+        // Claude Code is a NATIVE install (~/.local/share/claude/versions/<v>
+        // with a ~/.local/bin/claude symlink it manages itself) — NOT npm/brew,
+        // so the canonical upgrade is its own self-updater `claude update`
+        // ("check for updates and install if available", which fetches the
+        // latest native build and repoints the symlink). Identical on every OS.
+        // Without this arm every `tool=claude` upgrade task failed
+        // "no playbook for tool=claude" (108+ deferred-task failures/24h). The
+        // PATH export makes the symlink resolvable under the daemon's non-login
+        // /bin/sh.
+        ("claude", _) => Some("export PATH=\"$HOME/.local/bin:$PATH\"; claude update".into()),
         // openclaw ships via npm on this fleet (npm-global on macOS, Linux,
         // and DGX alike — never brew/apt despite the binary living under a
         // package-manager bin dir). Homebrew's npm prefix (/opt/homebrew) is
@@ -238,6 +248,18 @@ mod tests {
     fn macos_sub_family_falls_back() {
         let p = playbook_for("forgefleetd_git", "macos-15").unwrap();
         assert!(p.contains("launchctl kickstart"));
+    }
+
+    #[test]
+    fn claude_resolves_to_self_updater_on_every_os() {
+        // The native Claude Code install self-updates via `claude update`; the
+        // wildcard arm must resolve across linux/macos sub-families (was the
+        // "no playbook for tool=claude" failure source).
+        for fam in ["linux-ubuntu", "linux", "macos", "macos-15", "linux-dgx"] {
+            let p = playbook_for("claude", fam)
+                .unwrap_or_else(|| panic!("no claude playbook for {fam}"));
+            assert!(p.contains("claude update"), "fam={fam}");
+        }
     }
 
     #[test]
