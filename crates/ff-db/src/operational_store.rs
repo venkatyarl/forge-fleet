@@ -126,22 +126,33 @@ impl OperationalStore {
     pub async fn list_nodes(&self) -> Result<Vec<WorkerRow>, DbError> {
         match self {
             Self::Postgres(pool) => {
+                // Source the live fleet from `computers ⋈ fleet_workers` — the
+                // tables the Pulse-v2 materializer keeps current. The legacy
+                // `nodes` base table this used to read is a pre-rename / pre-pulse
+                // relic that nothing populates anymore (0 rows in practice), which
+                // left the gateway's whole DB fleet snapshot blind: every node's
+                // role/status came back empty, so the dashboard showed every node
+                // as role="unknown" with no leader. `port` has no column in the
+                // live schema and no live consumer, so it is defaulted to 0;
+                // `models_json` is sourced separately by the status payload, so it
+                // is left empty here. Column aliases match `map_postgres_node_row`.
                 let rows = sqlx::query(
                     r#"
                     SELECT
-                        id,
-                        name,
-                        host,
-                        port,
-                        role,
-                        election_priority,
-                        status,
-                        hardware_json,
-                        models_json,
-                        last_heartbeat,
-                        registered_at
-                    FROM nodes
-                    ORDER BY election_priority, name
+                        c.id::text                        AS id,
+                        c.name                            AS name,
+                        c.primary_ip::text                AS host,
+                        0::bigint                         AS port,
+                        fw.role                           AS role,
+                        fw.election_priority::bigint      AS election_priority,
+                        c.status                          AS status,
+                        COALESCE(fw.hardware::text, '{}') AS hardware_json,
+                        '[]'                              AS models_json,
+                        c.last_seen_at::text              AS last_heartbeat,
+                        c.enrolled_at::text               AS registered_at
+                    FROM computers c
+                    JOIN fleet_workers fw ON fw.name = c.name
+                    ORDER BY fw.election_priority, c.name
                     LIMIT 100
                     "#,
                 )
