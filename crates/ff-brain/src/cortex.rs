@@ -2848,6 +2848,105 @@ pub async fn find_symbols_semantic(
     Ok(hits)
 }
 
+fn symbol_ref_to_hit(symbol: SymbolRef) -> SymbolHit {
+    SymbolHit {
+        id: symbol.id,
+        qualified_name: symbol.qualified_name,
+        node_type: symbol.node_type,
+        file: symbol.file,
+        start_line: symbol.start_line,
+        fan_in: 0,
+        score: None,
+    }
+}
+
+fn cortex_search_document(hit: &SymbolHit) -> String {
+    let location = match (&hit.file, hit.start_line) {
+        (Some(file), Some(line)) => format!("{file}:{line}"),
+        (Some(file), None) => file.clone(),
+        (None, Some(line)) => format!("line {line}"),
+        (None, None) => "unknown location".to_string(),
+    };
+    format!(
+        "{}\n{}\n{}\nfan_in: {}\nvector_score: {}",
+        hit.qualified_name,
+        hit.node_type,
+        location,
+        hit.fan_in,
+        hit.score
+            .map(|s| format!("{s:.4}"))
+            .unwrap_or_else(|| "n/a".to_string())
+    )
+}
+
+/// Hybrid code search: semantic vector search + graph-neighborhood expansion +
+/// cross-encoder reranking.
+///
+/// First-stage semantic search finds intent-matched symbols. One-hop direct
+/// callers/callees add nearby graph context that pure vector search can miss.
+/// A fleet reranker then scores the final candidate documents; if no reranker is
+/// healthy, the first-stage order is returned so the tool remains usable.
+pub async fn cortex_search(
+    pool: &PgPool,
+    corpus_slug: &str,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<SymbolHit>> {
+    let limit = limit.clamp(1, 50);
+    let vector_hits = find_symbols_semantic(pool, corpus_slug, query, 30, None).await?;
+    let mut candidates = Vec::with_capacity(50);
+    let mut seen = HashSet::new();
+
+    for hit in vector_hits {
+        if seen.insert(hit.id) {
+            candidates.push(hit.clone());
+        }
+        if candidates.len() >= 50 {
+            break;
+        }
+
+        let mut neighbors = Vec::new();
+        if let Ok(mut rows) = callers(pool, corpus_slug, &hit.qualified_name, 0.0).await {
+            rows.truncate(3);
+            neighbors.extend(rows);
+        }
+        if let Ok(mut rows) = callees(pool, corpus_slug, &hit.qualified_name, 0.0).await {
+            rows.truncate(3);
+            neighbors.extend(rows);
+        }
+        for neighbor in neighbors {
+            if candidates.len() >= 50 {
+                break;
+            }
+            if seen.insert(neighbor.id) {
+                candidates.push(symbol_ref_to_hit(neighbor));
+            }
+        }
+    }
+
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let docs: Vec<String> = candidates.iter().map(cortex_search_document).collect();
+    match crate::embeddings::fleet_rerank(pool, query, &docs, limit).await {
+        Ok(ranked) => Ok(ranked
+            .into_iter()
+            .filter_map(|(idx, score)| {
+                candidates.get(idx).cloned().map(|mut hit| {
+                    hit.score = Some(score);
+                    hit
+                })
+            })
+            .collect()),
+        Err(e) => {
+            tracing::warn!("cortex_search rerank failed; falling back to vector order: {e}");
+            candidates.truncate(limit);
+            Ok(candidates)
+        }
+    }
+}
+
 // ─── Symbol source retrieval (`ff cortex show`) ──────────────────────────────
 //
 // Collapse the agent's two-step "find a symbol → open its file and read the

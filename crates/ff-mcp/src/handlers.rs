@@ -2773,6 +2773,7 @@ pub async fn dispatch(method: &str, params: Option<Value>) -> HandlerResult {
         // Cortex code graph
         "cortex_corpora" => crate::cortex_tools::cortex_corpora(params).await,
         "cortex_find" => crate::cortex_tools::cortex_find(params).await,
+        "cortex_search" => crate::cortex_tools::cortex_search(params).await,
         "cortex_show" => crate::cortex_tools::cortex_show(params).await,
         "cortex_context" => crate::cortex_tools::cortex_context(params).await,
         "cortex_explain" => crate::cortex_tools::cortex_explain(params).await,

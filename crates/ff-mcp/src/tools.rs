@@ -111,6 +111,7 @@ impl ToolRegistry {
         // ── Cortex code-graph tools ─────────────────────────────────────
         self.register(Self::cortex_corpora());
         self.register(Self::cortex_find());
+        self.register(Self::cortex_search());
         self.register(Self::cortex_show());
         self.register(Self::cortex_context());
         self.register(Self::cortex_explain());
@@ -888,6 +889,32 @@ impl ToolRegistry {
         }
     }
 
+    fn cortex_search() -> ToolDefinition {
+        ToolDefinition {
+            name: "cortex_search".to_string(),
+            description: "Hybrid code search: semantic vector search + graph-neighborhood expansion + cross-encoder rerank → the most relevant symbols for an intent. Use when you do not know the symbol name.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Natural-language intent, e.g. 'where model endpoints are routed'"
+                    },
+                    "corpus": {
+                        "type": "string",
+                        "description": "Indexed repo slug (optional; defaults to the current working directory name)"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max hits to return (1-50, default 8)",
+                        "default": 8
+                    }
+                },
+                "required": ["query"]
+            }),
+        }
+    }
+
     fn cortex_show() -> ToolDefinition {
         ToolDefinition {
             name: "cortex_show".to_string(),
@@ -1615,6 +1642,7 @@ mod tests {
             // Cortex code graph
             "cortex_corpora",
             "cortex_find",
+            "cortex_search",
             "cortex_show",
             "cortex_context",
             "cortex_explain",
