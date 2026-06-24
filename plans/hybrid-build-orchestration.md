@@ -146,7 +146,7 @@ rushing a half-fix into a data/build-critical path unattended.
 2. Service `ff-feature-requests.md` as HireFlow files failures (standing #1).
 3. **GAP-D1-3 code-writing flow** — design + dogfood-validate, then wire (workspace
    targeting + clean-sync + commit-back-from-main).
-4. GAP-C fair-share cap + partial-failure reporting in swarm/fanout.
+4. ✅ GAP-C fair-share cap (#542) + partial-failure reporting (#541) in swarm/fanout — DONE.
 5. GAP-B commit-back branch uniqueness suffix.
 
 ## Status re-audit (2026-06-22) — most of GAP-D already shipped
@@ -172,7 +172,11 @@ Verified against current code; items above were stale:
   dispatched runs; only wrong for a commit-back over a manually-staled workspace.
   Lower priority post-D2; fix = branch from the fetched `origin/main` preserving
   the recorded edits (careful git sequence + a dogfood).
-- **GAP-C** — swarm/fanout fair-share cap + partial-failure reporting (unverified).
+- ✅ **GAP-C** — DONE. Partial-failure reporting in `ff swarm` (#541: synthesize from
+  successes only + list failed sub-tasks retryably). Per-caller fair-share cap (#542:
+  one `parent_task_id` may not hold > `FF_FAIR_SHARE_MAX_RUNNING`=6 `running` tasks
+  fleet-wide *while another caller has pending work* — work-conserving, upgrade-wave
+  exempt, top-level uncapped; append-only conjunct in `task_runner.rs` claim query).
 - **Validation owed:** a real end-to-end ff→commit-back dogfood (small forge-fleet
   change) to confirm D0+D1+D2 compose into a clean PR.
 
