@@ -53,6 +53,26 @@ const MAX_HANDOFFS: i32 = 3;
 /// jobs (e.g. model downloads).
 const MAX_TASK_DURATION: Duration = Duration::from_secs(10 * 60);
 
+/// GAP-C fair-share cap: the max number of `running` tasks a single caller
+/// (one `parent_task_id` — a swarm/fanout/build invocation) may hold
+/// fleet-wide *while another caller has pending work waiting*. Keeps one
+/// large swarm from monopolizing every worker slot and starving a second
+/// caller. The cap is work-conserving: with no contention a caller still
+/// uses the whole fleet (see the claim query's `NOT EXISTS (other caller)`
+/// branch). Default 6; override via `FF_FAIR_SHARE_MAX_RUNNING`.
+const DEFAULT_FAIR_SHARE_MAX_RUNNING: i64 = 6;
+
+/// Resolve the fair-share cap, honoring the `FF_FAIR_SHARE_MAX_RUNNING`
+/// env override (must be a positive integer; anything else falls back to
+/// the default).
+fn fair_share_max_running() -> i64 {
+    std::env::var("FF_FAIR_SHARE_MAX_RUNNING")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_FAIR_SHARE_MAX_RUNNING)
+}
+
 /// Read a port-shaped row from `fleet_secrets`. Panics loudly if the
 /// row is missing — better than silently falling back to a hardcoded
 /// default and drifting away from operational truth. Operators can
@@ -387,6 +407,36 @@ impl TaskRunner {
                                @> to_jsonb(ARRAY[b.claimed_by_computer_id])
                     )
                   )
+                  -- GAP-C per-caller fair-share cap: one caller (a single
+                  -- parent_task_id — a swarm/fanout/build invocation) may not
+                  -- hold more than $3 'running' tasks fleet-wide WHILE a
+                  -- *different* caller has pending work waiting. This stops one
+                  -- large swarm from grabbing every worker slot and starving a
+                  -- second caller. Work-conserving: the cap only bites under
+                  -- contention — with no other caller waiting, the last
+                  -- disjunct (`NOT EXISTS other caller`) is true and the caller
+                  -- uses the full fleet. Top-level tasks (parent_task_id IS
+                  -- NULL) are uncapped — they ARE the work. The system upgrade
+                  -- wave is exempt (it intentionally targets every host and has
+                  -- its own two-phase concurrency control). Soft limit: a tiny
+                  -- count race across concurrent claimers may exceed $3 by 1,
+                  -- which is fine for a fairness cap. Append-only conjunct.
+                  AND (
+                    t.parent_task_id IS NULL
+                    OR t.summary LIKE 'fleet-upgrade-wave/%'
+                    OR (
+                      SELECT COUNT(*) FROM fleet_tasks rs
+                       WHERE rs.parent_task_id = t.parent_task_id
+                         AND rs.status = 'running'
+                    ) < $3
+                    OR NOT EXISTS (
+                      SELECT 1 FROM fleet_tasks other
+                       WHERE other.status = 'pending'
+                         AND other.task_type IN ('shell', 'decomposed')
+                         AND COALESCE(other.parent_task_id, other.id)
+                             != COALESCE(t.parent_task_id, t.id)
+                    )
+                  )
                 -- V74 selfish routing: fleet_first deprioritizes local tasks;
                 -- local_first/balanced prioritizes local tasks.
                 ORDER BY
@@ -409,6 +459,7 @@ impl TaskRunner {
         )
         .bind(self.my_computer_id)
         .bind(&cap_array)
+        .bind(fair_share_max_running())
         .fetch_optional(&self.pg)
         .await?;
 
@@ -2256,6 +2307,45 @@ mod wave_playbook_tests {
         let resume_at = body.find("resume-from-build").expect("has resume");
         assert!(rc_at < resume_at, "rc must be captured before resume runs");
         assert!(body.trim_end().ends_with("exit $__build_rc"));
+    }
+
+    #[test]
+    fn fair_share_cap_defaults_and_env_override() {
+        // Serialized via a single test so the process-global env var doesn't
+        // race a sibling test. Default when unset / invalid / non-positive.
+        // SAFETY: single-threaded test; no other thread reads the env here.
+        unsafe {
+            std::env::remove_var("FF_FAIR_SHARE_MAX_RUNNING");
+            assert_eq!(
+                super::fair_share_max_running(),
+                super::DEFAULT_FAIR_SHARE_MAX_RUNNING
+            );
+
+            std::env::set_var("FF_FAIR_SHARE_MAX_RUNNING", "3");
+            assert_eq!(super::fair_share_max_running(), 3);
+
+            // Whitespace tolerated.
+            std::env::set_var("FF_FAIR_SHARE_MAX_RUNNING", "  10 ");
+            assert_eq!(super::fair_share_max_running(), 10);
+
+            // Non-positive / garbage → default (a 0 cap would deadlock the queue).
+            std::env::set_var("FF_FAIR_SHARE_MAX_RUNNING", "0");
+            assert_eq!(
+                super::fair_share_max_running(),
+                super::DEFAULT_FAIR_SHARE_MAX_RUNNING
+            );
+            std::env::set_var("FF_FAIR_SHARE_MAX_RUNNING", "-4");
+            assert_eq!(
+                super::fair_share_max_running(),
+                super::DEFAULT_FAIR_SHARE_MAX_RUNNING
+            );
+            std::env::set_var("FF_FAIR_SHARE_MAX_RUNNING", "lots");
+            assert_eq!(
+                super::fair_share_max_running(),
+                super::DEFAULT_FAIR_SHARE_MAX_RUNNING
+            );
+            std::env::remove_var("FF_FAIR_SHARE_MAX_RUNNING");
+        }
     }
 
     #[test]
