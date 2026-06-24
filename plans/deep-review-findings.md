@@ -122,11 +122,19 @@ is the single authority. Verified the discovery engine was pure redundancy: its
 `announce` POSTs hit `post_leader`, which only bumps `heartbeat_at` on the EXISTING
 `fleet_leader_state` row (can't install a leader; redundant with LeaderTick's own
 heartbeat), and `registry.current_leader()` had exactly ONE consumer (the gateway
-`leader_hint`). **Dogfood bonus fix:** that `leader_hint` was already `None` live —
-its fallback (`registry → db_snapshot.role=='leader'`) couldn't resolve because
+`leader_hint`). **Dogfood bonus:** that `leader_hint` was already `None` live — its
+fallback (`registry → db_snapshot.role=='leader'`) couldn't resolve because
 `fleet_worker_runtime` is empty in practice. Repointed `leader_hint` to read
-`fleet_leader_state` directly (same source as the `/api/fleet/leader` GET) → now
-returns the real leader (`taylor`). Closed the finding AND a latent display bug.
+`fleet_leader_state` directly (same source as the `/api/fleet/leader` GET) — it now
+resolves to the real leader (`taylor`, proven runtime-resolvable: the identical
+`operational_store.pg_pool()` path serves `/api/fleet/leader`→taylor). **Caveat —
+the dashboard `is_leader` flag still doesn't light up** because the DOWNSTREAM
+`build_fleet_worker_view` match (`node.config_name|hostname|display_name == leader`)
+can't match taylor: its registry `FleetComputer` has `config_name=None`,
+`hostname=None` (not a config-sourced node), and the DB-runtime role is empty. Same
+root cause as the `fleet_worker_runtime`-empty follow-up below — tracked there, not
+fixed here. So #4's HA core is closed; the dashboard leader rendering rides on the
+runtime-table follow-up.
 
 ### NEW finding (surfaced by #4 dogfood) — `fleet_worker_runtime` is empty live
 `fleet_worker_runtime` (the table `RuntimeRegistryStore::list_runtime_nodes` reads,
@@ -137,7 +145,14 @@ populates it anymore (superseded by pulse/heartbeat_v2?) or its writer isn't
 running. **Next:** trace who is supposed to write `fleet_worker_runtime`; if it's
 dead, repoint the remaining `db_snapshot.runtime_nodes` consumers at the live
 source (pulse beats / `computers`+`fleet_workers`) or retire the table. Medium —
-affects the accuracy of the whole fleet-status/dashboard payload.
+affects the accuracy of the whole fleet-status/dashboard payload. **Also gates the
+dashboard leader rendering:** `build_fleet_worker_view` derives a node's `role`
+from `db_node.role` (empty → "unknown") and matches `leader_hint` against
+`config_name|hostname|display_name`. For nodes whose registry `FleetComputer` lacks
+config_name/hostname (e.g. taylor, discovered not config-seeded), neither resolves,
+so `is_leader` stays false even though `leader_hint`=taylor is correct. Fix here =
+correlate the node to its DB/runtime identity (match `leader_hint` against the
+resolved DB name too, and source `role` from the live table).
 
 ### Finding #15 (dead code) — `ff-mesh` CONFIRMED 100% orphaned
 `cargo tree -i -p ff-mesh` → **zero reverse-dependencies**; no `src/` or other
