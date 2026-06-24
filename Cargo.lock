@@ -1535,24 +1535,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ff-mesh"
-version = "2026.4.7"
-dependencies = [
- "anyhow",
- "axum",
- "chrono",
- "dashmap",
- "ff-core",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
 name = "ff-observability"
 version = "2026.4.7"
 dependencies = [

@@ -6,7 +6,9 @@ members = [
     "crates/ff-discovery",
     "crates/ff-agent",
     # "crates/ff-cli", # superseded by ff-terminal unified binary
-    "crates/ff-mesh",
+    # "crates/ff-mesh", # removed 2026-06-24 — orphaned dead code (zero reverse-deps);
+    #                     a parallel never-wired leader/scheduler impl. Production uses
+    #                     ff_agent::leader_tick (Postgres fleet_leader_state) + task_runner.
     "crates/ff-runtime",
     "crates/ff-ssh",
     "crates/ff-orchestrator",
