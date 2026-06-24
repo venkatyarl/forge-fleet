@@ -52,13 +52,15 @@ pub use cortex::ingest_decisions;
 pub use cortex::ingest_pm;
 pub use cortex::{
     CommunityExplanation, CommunityMember, CortexStats, FileOutline, OutlineEntry, SymbolHit,
-    SymbolRef, SymbolSource, TestHit, call_path, callees, callers, explain_community, find_symbols,
-    find_symbols_semantic, impact, index, outline_file, show_symbol, tests_for,
+    SymbolRef, SymbolSource, TestHit, call_path, callees, callers, cortex_search,
+    explain_community, find_symbols, find_symbols_semantic, impact, index, outline_file,
+    show_symbol, tests_for,
 };
 pub use cortex_embed::{EmbedStats, embed_cortex_nodes, spawn_embed_refresh_loop};
 pub use cortex_reindex::{reindex_self_corpus, spawn_reindex_loop};
 pub use embeddings::{
-    EmbeddingClient, fleet_embedding_client, generate_embedding, generate_embedding_with_pool,
+    EmbeddingClient, fleet_embedding_client, fleet_rerank, generate_embedding,
+    generate_embedding_with_pool,
 };
 pub use facts::{contains_signal_phrases, extract_candidates};
 pub use procedural_memory::{consolidate, spawn_consolidation_loop};

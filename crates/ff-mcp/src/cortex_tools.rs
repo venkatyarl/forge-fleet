@@ -185,6 +185,37 @@ pub async fn cortex_find(params: Option<Value>) -> HandlerResult {
     }))
 }
 
+/// Hybrid code search for natural-language intent: semantic vector search,
+/// graph-neighborhood expansion, then cross-encoder rerank.
+pub async fn cortex_search(params: Option<Value>) -> HandlerResult {
+    let corpus_slug = corpus_or_cwd_slug(&params)?;
+    let query = params
+        .as_ref()
+        .and_then(|p| p.get("query"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required parameter: query".to_string())?
+        .to_string();
+    let limit = capped_usize_param(&params, "limit", 8, 50);
+    let pool = get_pool().await?;
+    let hits = ff_brain::cortex_search(&pool, &corpus_slug, &query, limit)
+        .await
+        .map_err(|e| format!("cortex_search: {e}"))?;
+    Ok(json!({
+        "corpus": corpus_slug,
+        "query": query,
+        "count": hits.len(),
+        "hits": hits.iter().map(|h| json!({
+            "qualified_name": h.qualified_name,
+            "node_type": h.node_type,
+            "file": h.file,
+            "start_line": h.start_line,
+            "fan_in": h.fan_in,
+            "score": h.score,
+            "id": h.id.to_string(),
+        })).collect::<Vec<_>>(),
+    }))
+}
+
 /// Show a code symbol's source — resolve a name to its file + line span and
 /// return just that symbol's definition. The Cortex-native `get_review_context`:
 /// one call instead of cortex_find → read the file → slice the span.

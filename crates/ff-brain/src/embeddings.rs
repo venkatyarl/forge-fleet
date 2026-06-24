@@ -6,7 +6,25 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-use sqlx::{PgPool, Row};
+use sqlx::PgPool;
+
+async fn pick_fleet_workload_endpoint(pool: &PgPool, workload: &str) -> Option<(String, String)> {
+    let filter = ff_db::RouteFilter {
+        workload: Some(workload.to_string()),
+        limit: 1,
+        ..Default::default()
+    };
+    let route = ff_db::pg_route_deployments(pool, &filter)
+        .await
+        .ok()?
+        .into_iter()
+        .next()?;
+    let model = route
+        .catalog_id
+        .or(route.catalog_name)
+        .unwrap_or_else(|| workload.to_string());
+    Some((route.endpoint, model))
+}
 
 /// Resolution order for picking an embedding endpoint:
 ///
@@ -20,39 +38,7 @@ use sqlx::{PgPool, Row};
 /// on the fleet. Before this resolver existed, the brain was searching
 /// against random hash vectors whenever the env vars weren't set.
 async fn pick_fleet_embedding_endpoint(pool: &PgPool) -> Option<(String, String)> {
-    // Join deployments → catalog → workers; prefer healthy rows; cheapest tier
-    // first so a 568M bge-m3 wins over an 8B qwen3-embedding if both run.
-    //
-    // computers.primary_ip is the source of truth for the worker's LAN IP
-    // (fleet_workers no longer carries an ip column post-V83). We LEFT JOIN
-    // computers as a fallback for pre-V83 deployments still keyed by name.
-    let row = sqlx::query(
-        r#"
-        SELECT d.port,
-               COALESCE(c.primary_ip, w.name) AS host_or_name,
-               cat.id AS catalog_id,
-               cat.tier AS tier
-        FROM fleet_model_deployments d
-        JOIN fleet_model_catalog cat ON cat.id = d.catalog_id
-        LEFT JOIN fleet_workers w     ON w.name = d.worker_name
-        LEFT JOIN computers c         ON LOWER(c.name) = LOWER(d.worker_name)
-        WHERE d.health_status = 'healthy'
-          AND (cat.preferred_workloads @> '["embedding"]'::jsonb
-            OR cat.preferred_workloads @> '["embeddings"]'::jsonb)
-        ORDER BY cat.tier ASC, d.last_health_at DESC NULLS LAST
-        LIMIT 1
-        "#,
-    )
-    .fetch_optional(pool)
-    .await
-    .ok()
-    .flatten()?;
-
-    let port: i32 = row.try_get("port").ok()?;
-    let host: String = row.try_get("host_or_name").ok()?;
-    let catalog_id: String = row.try_get("catalog_id").ok()?;
-    let endpoint = format!("http://{host}:{port}");
-    Some((endpoint, catalog_id))
+    pick_fleet_workload_endpoint(pool, "embedding").await
 }
 
 /// Discover a live fleet embedding endpoint and return a ready
@@ -71,6 +57,83 @@ pub async fn fleet_embedding_client(pool: &PgPool) -> Option<EmbeddingClient> {
     }
     let (endpoint, model) = pick_fleet_embedding_endpoint(pool).await?;
     Some(EmbeddingClient::new(&endpoint, &model))
+}
+
+async fn pick_fleet_rerank_endpoint(pool: &PgPool) -> Option<String> {
+    if let Ok(endpoint) = std::env::var("FF_RERANK_ENDPOINT") {
+        return Some(endpoint);
+    }
+    let (endpoint, _) = pick_fleet_workload_endpoint(pool, "reranking").await?;
+    Some(endpoint)
+}
+
+/// Rerank `documents` against `query` using a fleet reranker deployment.
+///
+/// The reranker serves llama.cpp's OpenAI-style `/v1/rerank` endpoint
+/// (`llama-server --reranking`). Returns original document indexes plus
+/// relevance scores, sorted descending and capped to `top_n`. If no healthy
+/// reranking endpoint can be routed, this returns `Err` so callers can preserve
+/// their cheaper first-stage order.
+pub async fn fleet_rerank(
+    pool: &PgPool,
+    query: &str,
+    documents: &[String],
+    top_n: usize,
+) -> Result<Vec<(usize, f32)>, String> {
+    if documents.is_empty() || top_n == 0 {
+        return Ok(Vec::new());
+    }
+    let endpoint = pick_fleet_rerank_endpoint(pool)
+        .await
+        .ok_or_else(|| "no healthy fleet reranking endpoint".to_string())?;
+    let resp = EMBEDDING_HTTP_CLIENT
+        .post(format!("{endpoint}/v1/rerank"))
+        .json(&serde_json::json!({
+            "query": query,
+            "documents": documents,
+            "top_n": top_n,
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("rerank request failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("rerank server returned {status}: {body}"));
+    }
+
+    let payload: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("rerank response parse failed: {e}"))?;
+    let results = payload
+        .get("results")
+        .or_else(|| payload.get("data"))
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "rerank response missing results array".to_string())?;
+
+    let mut out = Vec::with_capacity(results.len());
+    for item in results {
+        let index = item
+            .get("index")
+            .or_else(|| item.get("document_index"))
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| "rerank result missing index".to_string())? as usize;
+        if index >= documents.len() {
+            return Err(format!("rerank result index {index} out of bounds"));
+        }
+        let score = item
+            .get("relevance_score")
+            .or_else(|| item.get("score"))
+            .and_then(|v| v.as_f64())
+            .ok_or_else(|| "rerank result missing relevance_score".to_string())?
+            as f32;
+        out.push((index, score));
+    }
+    out.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    out.truncate(top_n.min(documents.len()));
+    Ok(out)
 }
 
 /// Generate an embedding for `text`, using only env vars / hash fallback.

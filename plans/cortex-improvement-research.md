@@ -35,9 +35,16 @@ Source: kimi analysis + online SOTA research (2026-06-17). Full transcript: `/tm
 4. SCIP/LSP (P1.5) — close the precision gap.
 5. Visualization + cross-repo (P1.7–8) — usability + scaling.
 
-## Build status
-- ✅ **P0.1 `cortex_context`** — BUILT (one MCP call: definition + callers/callees + impact
-  + community summary + snippet; composes the existing cortex_* tools). The agent loop's
-  default Cortex call.
+## Build status (audited 2026-06-24)
+- ✅ **P0.1 `cortex_context`** — BUILT (#539): one MCP call = definition + callers/callees +
+  impact + community summary + snippet. The agent loop's default Cortex call.
+- ✅ **P0.4 data-flow / type / trait edges** — ALREADY BUILT by the universal-graph work:
+  `reads`/`writes` (dataflow), `has_field` (types), `implements`/`extends` (trait relationships)
+  are all live in the graph. Only intra-function control-flow (`branches_to`/`loops_over`) is
+  unbuilt — low value, skipped.
+- ~ **P0.3 GraphRAG** — communities + per-community summaries exist (single-level Louvain);
+  hierarchical/multi-level is the remaining part.
+- 🔨 **P0.2 hybrid retrieval** — vector (`find_symbols_semantic`) + graph-neighborhood
+  expansion + bge-reranker rescoring, combined into one `cortex_search`.
 - (OPS.1 — auto-refresh the Cortex SQLite mirror — removed: the mirror was deleted in #531;
   Cortex is Postgres-only now.)
