@@ -420,6 +420,14 @@ pub async fn cortex_explain(params: Option<Value>) -> HandlerResult {
                 "node_type": m.node_type,
                 "fan_in": m.fan_in,
             })).collect::<Vec<_>>(),
+            // GraphRAG subsystem hierarchy above this community (immediate parent
+            // first): "what larger subsystem is this part of, at each scope?".
+            "subsystem_chain": e.subsystem_chain.iter().map(|s| json!({
+                "level": s.level,
+                "member_count": s.member_count,
+                "summary": s.summary,
+                "god_symbol": s.god_symbol,
+            })).collect::<Vec<_>>(),
         })),
     }
 }

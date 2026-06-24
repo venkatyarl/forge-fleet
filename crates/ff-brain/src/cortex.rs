@@ -3147,6 +3147,21 @@ pub struct CommunityMember {
     pub fan_in: i64,
 }
 
+/// One ancestor in the GraphRAG community hierarchy above a symbol's finest
+/// community — a progressively-larger SUBSYSTEM (level 1, 2, …) with its own
+/// map-reduce summary. Used by [`CommunityExplanation::subsystem_chain`].
+#[derive(Debug, Clone)]
+pub struct CommunitySubsystem {
+    /// Hierarchy level (1 = the immediate parent subsystem, larger = coarser).
+    pub level: i32,
+    /// Total code symbols this subsystem spans.
+    pub member_count: i64,
+    /// The subsystem's map-reduce summary (`None` until it's been summarized).
+    pub summary: Option<String>,
+    /// The subsystem's representative ("god") symbol, if any.
+    pub god_symbol: Option<String>,
+}
+
 /// The community a symbol belongs to + its stored summary, from
 /// [`explain_community`].
 #[derive(Debug, Clone)]
@@ -3170,6 +3185,12 @@ pub struct CommunityExplanation {
     /// Highest-fan-in members in this corpus (the cluster's call-graph surface),
     /// capped by `member_limit`.
     pub members: Vec<CommunityMember>,
+    /// The GraphRAG subsystem hierarchy ABOVE this community: walking
+    /// `parent_member_hash` up the tree, each progressively-larger subsystem with
+    /// its own summary (immediate parent first). Empty when the community is
+    /// top-level or the hierarchy hasn't been built. Answers "what larger
+    /// subsystem is this part of, and what does that subsystem do?".
+    pub subsystem_chain: Vec<CommunitySubsystem>,
 }
 
 /// Resolve `query` to a code symbol, then return the community it belongs to plus
@@ -3211,6 +3232,7 @@ pub async fn explain_community(
             summary_model: None,
             god_symbol: None,
             members: Vec::new(),
+            subsystem_chain: Vec::new(),
         }));
     };
 
@@ -3218,7 +3240,7 @@ pub async fn explain_community(
     // code_community_id). Detection is global, so we match on code_community_id,
     // not corpus.
     let reg = sqlx::query(
-        r#"SELECT bc.summary, bc.summary_model, bc.member_count, gn.title AS god_title
+        r#"SELECT bc.member_hash, bc.summary, bc.summary_model, bc.member_count, gn.title AS god_title
              FROM brain_code_communities bc
              JOIN brain_vault_nodes gn ON gn.id = bc.god_node_id
             WHERE gn.code_community_id = $1 AND gn.valid_until IS NULL
@@ -3228,14 +3250,55 @@ pub async fn explain_community(
     .fetch_optional(pool)
     .await?;
 
-    let (summary, summary_model, reg_member_count, god_symbol) = match reg {
+    let (member_hash, summary, summary_model, reg_member_count, god_symbol) = match reg {
         Some(r) => (
+            Some(r.get::<String, _>("member_hash")),
             r.get::<Option<String>, _>("summary"),
             r.get::<Option<String>, _>("summary_model"),
             r.get::<i32, _>("member_count") as i64,
             Some(r.get::<String, _>("god_title")),
         ),
-        None => (None, None, 0i64, None),
+        None => (None, None, None, 0i64, None),
+    };
+
+    // GraphRAG subsystem hierarchy: walk parent_member_hash up the tree from this
+    // (finest) community, collecting each progressively-larger subsystem + its
+    // map-reduce summary (immediate parent first).
+    let subsystem_chain: Vec<CommunitySubsystem> = if let Some(ref mh) = member_hash {
+        let rows = sqlx::query(
+            r#"
+            WITH RECURSIVE chain AS (
+                SELECT member_hash, parent_member_hash, summary, member_count, level,
+                       god_node_id, 0 AS depth
+                  FROM brain_code_communities
+                 WHERE member_hash = $1
+                UNION ALL
+                SELECT p.member_hash, p.parent_member_hash, p.summary, p.member_count,
+                       p.level, p.god_node_id, c.depth + 1
+                  FROM brain_code_communities p
+                  JOIN chain c ON p.member_hash = c.parent_member_hash
+                 WHERE c.depth < 16
+            )
+            SELECT c.level, c.member_count, c.summary,
+                   (SELECT gn.title FROM brain_vault_nodes gn WHERE gn.id = c.god_node_id) AS god_title
+              FROM chain c
+             WHERE c.depth > 0
+             ORDER BY c.level"#,
+        )
+        .bind(mh)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+        rows.into_iter()
+            .map(|r| CommunitySubsystem {
+                level: r.get::<i32, _>("level"),
+                member_count: r.get::<i32, _>("member_count") as i64,
+                summary: r.get::<Option<String>, _>("summary"),
+                god_symbol: r.get::<Option<String>, _>("god_title"),
+            })
+            .collect()
+    } else {
+        Vec::new()
     };
 
     // Top members of this community within the queried corpus, by call-graph
@@ -3286,6 +3349,7 @@ pub async fn explain_community(
         summary_model,
         god_symbol,
         members,
+        subsystem_chain,
     }))
 }
 
