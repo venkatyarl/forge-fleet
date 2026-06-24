@@ -116,13 +116,28 @@ Two leader engines genuinely run **concurrently in production `forgefleetd`**:
 
 They never reconcile and can disagree (TOML-health winner X vs Postgres+pulse
 winner Y) → gateway reports X as `leader_hint` while Y is the real actuating
-leader. **Fix (next iteration, HA-critical, own PR):** make `LeaderTick` the
-single authority — either (a) delete `start_leader_election_subsystem` and drive
-`registry.set_leader` from the `fleet_leader_state` value on every transition, or
-(b) subordinate the discovery loop to read `fleet_leader_state` instead of running
-its own `elect_leader`. Prefer (a): one election engine, registry hint can never
-contradict the actuating leader. Validate no other consumer depends on the HTTP
-`announce_leader_to_fleet` path for correctness (it appears display-only).
+leader. **✅ DONE (PR #544, 2026-06-24):** chose (a) — deleted
+`start_leader_election_subsystem` + `announce_leader_to_fleet` entirely; LeaderTick
+is the single authority. Verified the discovery engine was pure redundancy: its
+`announce` POSTs hit `post_leader`, which only bumps `heartbeat_at` on the EXISTING
+`fleet_leader_state` row (can't install a leader; redundant with LeaderTick's own
+heartbeat), and `registry.current_leader()` had exactly ONE consumer (the gateway
+`leader_hint`). **Dogfood bonus fix:** that `leader_hint` was already `None` live —
+its fallback (`registry → db_snapshot.role=='leader'`) couldn't resolve because
+`fleet_worker_runtime` is empty in practice. Repointed `leader_hint` to read
+`fleet_leader_state` directly (same source as the `/api/fleet/leader` GET) → now
+returns the real leader (`taylor`). Closed the finding AND a latent display bug.
+
+### NEW finding (surfaced by #4 dogfood) — `fleet_worker_runtime` is empty live
+`fleet_worker_runtime` (the table `RuntimeRegistryStore::list_runtime_nodes` reads,
+which becomes the gateway's `db_snapshot.runtime_nodes`) has **0 rows** on the live
+fleet. So *every* consumer of `db_snapshot.runtime_nodes` in the fleet-status
+payload silently degrades to empty — not just `leader_hint`. Either nothing
+populates it anymore (superseded by pulse/heartbeat_v2?) or its writer isn't
+running. **Next:** trace who is supposed to write `fleet_worker_runtime`; if it's
+dead, repoint the remaining `db_snapshot.runtime_nodes` consumers at the live
+source (pulse beats / `computers`+`fleet_workers`) or retire the table. Medium —
+affects the accuracy of the whole fleet-status/dashboard payload.
 
 ### Finding #15 (dead code) — `ff-mesh` CONFIRMED 100% orphaned
 `cargo tree -i -p ff-mesh` → **zero reverse-dependencies**; no `src/` or other
