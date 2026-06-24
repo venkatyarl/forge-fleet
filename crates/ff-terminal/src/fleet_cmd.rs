@@ -4456,10 +4456,19 @@ async fn handle_fleet_deploy(
     let total = results.len();
 
     // Leader self-refresh (closes the recurring leader-drift): --all excludes the
-    // leader, so its own daemon lagged source after every deploy. When the fleet
-    // converged, refresh THIS host's forgefleetd too — if it's the leader and its
-    // tree is clean @ HEAD. Best-effort; never fails the deploy.
-    let leader_refresh: Option<(bool, String)> = if all && total > 0 && converged == total {
+    // leader, so its own daemon lagged source after every deploy. Refresh THIS
+    // host's forgefleetd too — if it's the leader and its tree is clean @ HEAD.
+    // Best-effort; never fails the deploy.
+    //
+    // Gate on `converged > 0`, NOT `converged == total`: a single benign SHA
+    // spread (e.g. a doc-only commit pushed mid-deploy, so hosts split across two
+    // SHAs that both contain the code) made `converged == total` false and skipped
+    // the leader EVERY time → the leader silently ran stale binaries. `converged
+    // > 0` means at least one host built AND is running the new code, proving the
+    // build is good (so we won't rebuild the leader onto a broken tree); the
+    // refresh's own clean-tree-@-origin/main-HEAD guard is what guarantees the
+    // leader rebuilds the deployed state and never a dirty dev tree.
+    let leader_refresh: Option<(bool, String)> = if all && converged > 0 {
         refresh_local_leader_if_self(pool).await
     } else {
         None
