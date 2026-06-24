@@ -120,6 +120,10 @@ pub enum TopCortexCommand {
         query: String,
         #[arg(long)]
         corpus: Option<String>,
+        /// Search EVERY indexed corpus at once (monorepo / multi-repo nav), tagging
+        /// each hit with its repo. Ignores --corpus and --semantic.
+        #[arg(long)]
+        all_corpora: bool,
         /// Rank by embedding similarity (bge-m3) instead of name substring — finds
         /// symbols by INTENT when you don't know the name. Requires `ff cortex embed`
         /// to have run and a live fleet embedding endpoint.
@@ -859,11 +863,21 @@ async fn handle_top_cortex_online(args: TopCortexArgs) -> Result<()> {
         TopCortexCommand::Find {
             query,
             corpus,
+            all_corpora,
             semantic,
             limit,
             kind,
             format,
         } => {
+            if all_corpora {
+                let hits =
+                    cortex::find_symbols_all_corpora(&pool, &query, limit, kind.as_deref()).await?;
+                print_cross_corpus_hits(&hits, format.as_str(), &query);
+                if hits.is_empty() {
+                    std::process::exit(1);
+                }
+                return Ok(());
+            }
             let corpus = corpus.unwrap_or_else(cwd_slug);
             let hits = if semantic {
                 cortex::find_symbols_semantic(&pool, &corpus, &query, limit, kind.as_deref())
@@ -1594,6 +1608,59 @@ async fn run_doctor(pool: &PgPool, corpus: &str, limit: i64, format: &str) -> Re
 /// Render `ff cortex find` hits. `table` (default) shows kind/fan-in/location/
 /// symbol; `json` emits the full records (for agents/tooling); `names` lists
 /// just the qualified names (pipe straight into callers/callees/impact).
+/// Render cross-corpus find hits (`ff cortex find --all-corpora`), each tagged
+/// with its repo. Mirrors [`print_hits`]'s table/json/names formats.
+fn print_cross_corpus_hits(hits: &[(String, cortex::SymbolHit)], format: &str, query: &str) {
+    match format {
+        "json" => {
+            let v: Vec<_> = hits
+                .iter()
+                .map(|(corpus, h)| {
+                    serde_json::json!({
+                        "corpus": corpus,
+                        "id": h.id,
+                        "qualified_name": h.qualified_name,
+                        "node_type": h.node_type,
+                        "file": h.file,
+                        "start_line": h.start_line,
+                        "fan_in": h.fan_in,
+                    })
+                })
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+        }
+        "names" => {
+            for (corpus, h) in hits {
+                println!("{corpus}\t{}", h.qualified_name);
+            }
+        }
+        _ => {
+            println!(
+                "{CYAN}\u{25b6} cortex find '{query}' across all corpora \u{2014} {} hit(s):{RESET}",
+                hits.len()
+            );
+            if hits.is_empty() {
+                println!(
+                    "  (none \u{2014} try a shorter fragment, or `ff cortex index` if a repo is unindexed)"
+                );
+                return;
+            }
+            for (corpus, h) in hits {
+                let kind = h.node_type.strip_prefix("code:").unwrap_or(&h.node_type);
+                let loc = match (&h.file, h.start_line) {
+                    (Some(f), Some(l)) => format!("{f}:{l}"),
+                    (Some(f), None) => f.clone(),
+                    _ => "-".to_string(),
+                };
+                println!(
+                    "  {GREEN}{corpus:<18}{RESET}  {kind:<9}  fanin={:<3}  {}  ({loc})",
+                    h.fan_in, h.qualified_name
+                );
+            }
+        }
+    }
+}
+
 fn print_hits(hits: &[cortex::SymbolHit], format: &str, query: &str, corpus: &str) {
     match format {
         "json" => {
