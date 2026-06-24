@@ -4,30 +4,66 @@ use anyhow::Result;
 
 use crate::{CYAN, GREEN, RESET, YELLOW, resolve_pulse_redis_url};
 
-/// GAP-D2: best-effort clean-sync of a dispatch workspace to a fresh
-/// `<remote>/<base_branch>` before the dispatched run edits it, so the build base is
-/// deterministic and `commit-back` diffs against fresh main. Guarded — skips a
-/// non-git `cwd` — and non-fatal: a repo that doesn't track the remote ref simply
-/// runs on its existing state. No `git stash` (per the no-stash rule); reset +
-/// clean only.
-///
-/// ⚠️ KNOWN LIMITATION (not yet true per-run isolation): `run_cwd` defaults to
-/// the single shared `~/.forgefleet/sub-agent-0/forge-fleet`, NOT a per-slot
-/// `sub-agent-{N}`. `dispatch-each` (one task per member) is safe, but two
-/// concurrent dispatches landing on the SAME member share that dir, and this
-/// hard reset would clobber the other's in-flight edits. The proper fix is a
-/// per-run `git worktree` (see plans/hybrid-build-orchestration.md, GAP-D-iso),
-/// which gives true isolation + a fresh base and subsumes this prefix.
-fn clean_sync_prefix(cwd: &str, remote: &str, base_branch: &str) -> String {
+/// GAP-D-iso: treat `run_cwd` as the canonical repo, then run each dispatched
+/// agent in a fresh throwaway worktree. The worktree intentionally persists
+/// after the run so commit-back can lift changes from the recorded working_dir.
+fn isolated_worktree_run_command(
+    run_cwd: &str,
+    remote: &str,
+    base_branch: &str,
+    backend: &str,
+    timeout: u64,
+    shell_safe_prompt: &str,
+) -> String {
     let remote_ref = format!("{remote}/{base_branch}");
     format!(
-        "{{ git -C {cwd} rev-parse --git-dir >/dev/null 2>&1 && \
-            git -C {cwd} fetch {remote_q} --quiet && \
-            git -C {cwd} reset --hard {remote_ref_q} --quiet && \
-            git -C {cwd} clean -fd >/dev/null 2>&1; }} ; ",
+        "CANON={canon_q}; RUNS=\"$HOME/.forgefleet/runs\"; mkdir -p \"$RUNS\"; \
+         WT=\"$RUNS/run-$(date +%s%N)-$$\"; \
+         if git -C \"$CANON\" rev-parse --git-dir >/dev/null 2>&1; then \
+         git -C \"$CANON\" fetch {remote_q} --quiet 2>/dev/null || true; \
+         git -C \"$CANON\" worktree add --detach --force \"$WT\" {remote_ref_q} >/dev/null 2>&1 || \
+         git -C \"$CANON\" worktree add --detach --force \"$WT\" >/dev/null 2>&1 || WT=\"$CANON\"; \
+         else WT=\"$CANON\"; fi; \
+         ff run --backend {backend} --cwd \"$WT\" --timeout {timeout} '{shell_safe_prompt}'",
+        canon_q = shell_quote(run_cwd),
         remote_q = shell_quote(remote),
         remote_ref_q = shell_quote(&remote_ref),
     )
+}
+
+pub fn prune_stale_run_worktrees(max_age_hours: u64) {
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let runs_dir = std::path::PathBuf::from(home).join(".forgefleet/runs");
+    let Ok(entries) = std::fs::read_dir(&runs_dir) else {
+        return;
+    };
+    let max_age = std::time::Duration::from_secs(max_age_hours.saturating_mul(60 * 60));
+    let now = std::time::SystemTime::now();
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("run-") || !path.is_dir() {
+            continue;
+        }
+
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        let Ok(age) = now.duration_since(modified) else {
+            continue;
+        };
+        if age > max_age {
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -145,11 +181,13 @@ pub async fn handle_agent_fanout(
     // buffer, so a multi-minute codex/kimi build isn't killed at the 600s
     // default by EITHER cap. The CLI --timeout fires first (checkpoint), the
     // worker is the backstop.
-    let cmd = format!(
-        "{prefix}ff run --backend {} --cwd {} --timeout {timeout} '{shell_safe_prompt}'",
+    let cmd = isolated_worktree_run_command(
+        &run_cwd,
+        &git_policy.git_remote,
+        &git_policy.base_branch,
         cfg.name,
-        run_cwd,
-        prefix = clean_sync_prefix(&run_cwd, &git_policy.git_remote, &git_policy.base_branch),
+        timeout,
+        &shell_safe_prompt,
     );
     let task_max_secs = timeout + 120;
     for i in 0..fanout {
@@ -244,11 +282,13 @@ pub async fn handle_agent_dispatch_each(
     let git_policy = resolve_agent_git_policy(pool, project.as_deref()).await?;
     // See handle_agent_fanout: --timeout bounds the CLI, task max_duration_secs
     // bounds the worker; both raised above the 600s default for build runs.
-    let cmd = format!(
-        "{prefix}ff run --backend {} --cwd {} --timeout {timeout} '{shell_safe_prompt}'",
+    let cmd = isolated_worktree_run_command(
+        &run_cwd,
+        &git_policy.git_remote,
+        &git_policy.base_branch,
         cfg.name,
-        run_cwd,
-        prefix = clean_sync_prefix(&run_cwd, &git_policy.git_remote, &git_policy.base_branch),
+        timeout,
+        &shell_safe_prompt,
     );
     let task_max_secs = timeout + 120;
     for (_id, name) in &members {
@@ -299,6 +339,8 @@ pub async fn handle_agent_commit_back(
     project: Option<String>,
 ) -> Result<()> {
     use tokio::process::Command;
+    prune_stale_run_worktrees(24);
+
     let project_supplied = project.is_some();
     let git_policy = resolve_agent_git_policy(pool, project.as_deref()).await?;
 
