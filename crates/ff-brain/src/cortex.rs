@@ -2722,6 +2722,61 @@ pub async fn find_symbols(
     Ok(hits)
 }
 
+/// Cross-corpus variant of [`find_symbols`]: search EVERY indexed corpus at once
+/// and tag each hit with its project slug. The monorepo / multi-repo navigation
+/// entrypoint — "where does `foo` live across all my repos?". Same liveness +
+/// generation rules (per-project `current_generation`, so a corpus with stranded
+/// generations is handled identically) and the same fan-in ranking, then grouped
+/// by project for a stable read. Returns `(project_slug, hit)` pairs.
+pub async fn find_symbols_all_corpora(
+    pool: &PgPool,
+    query: &str,
+    limit: i64,
+    kind: Option<&str>,
+) -> Result<Vec<(String, SymbolHit)>> {
+    let pattern = format!("%{}%", escape_like(query));
+    let limit = limit.clamp(1, 500);
+    let kind_types = resolve_kind_filter(kind)?;
+    let rows = sqlx::query(
+        r#"SELECT n.id, n.project, n.title, n.node_type, n.start_line,
+                  (SELECT count(*) FROM brain_vault_edges e
+                    WHERE e.edge_type = 'calls' AND e.dst_id = n.id) AS fan_in
+             FROM brain_vault_nodes n
+            WHERE n.node_type LIKE 'code:%'
+              AND n.title ILIKE $1 ESCAPE '\'
+              AND ($3::text[] IS NULL OR n.node_type = ANY($3))
+              AND COALESCE(n.generation, 0) IN (
+                  0,
+                  COALESCE((SELECT current_generation
+                              FROM cortex_generations
+                             WHERE project = n.project), 0)
+              )
+            ORDER BY fan_in DESC, n.project, n.title COLLATE "C"
+            LIMIT $2"#,
+    )
+    .bind(&pattern)
+    .bind(limit)
+    .bind(kind_types.as_deref())
+    .fetch_all(pool)
+    .await?;
+
+    let projects: Vec<String> = rows.iter().map(|r| r.get::<String, _>("project")).collect();
+    let mut hits: Vec<SymbolHit> = rows
+        .into_iter()
+        .map(|r| SymbolHit {
+            id: r.get("id"),
+            qualified_name: r.get("title"),
+            node_type: r.get("node_type"),
+            file: None,
+            start_line: r.get("start_line"),
+            fan_in: r.get("fan_in"),
+            score: None,
+        })
+        .collect();
+    resolve_hit_files(pool, &mut hits).await?;
+    Ok(projects.into_iter().zip(hits).collect())
+}
+
 /// Resolve each hit's owning file by walking `contains` edges UP to the ancestor
 /// `content:file` node (file -> impl/mod -> symbol can nest, so a recursive walk,
 /// not a single hop). Fills `SymbolHit::file` in place. Shared by the substring

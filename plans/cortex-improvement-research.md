@@ -20,7 +20,7 @@ Source: kimi analysis + online SOTA research (2026-06-17). Full transcript: `/tm
 ### P1 — strong additions
 5. **SCIP ingestion or LSP bridge** — compiler-accurate symbol IDs where tree-sitter heuristics fall short (Serena/agent-lsp pattern).
 6. **Line/statement-level graph** — fine-grained def/ref nodes (RepoGraph improves SWE-bench) with ego-subgraph retrieval for bug localization.
-7. **Cross-repo merged corpus view** — unified namespace across corpora (monorepo/workspace nav; multi-computer relevance).
+7. **Cross-repo merged corpus view** — unified namespace across corpora (monorepo/workspace nav; multi-computer relevance). ✅ PARTIAL: `ff cortex find --all-corpora <q>` (`find_symbols_all_corpora`) searches EVERY indexed corpus at once, fan-in-ranked, each hit tagged with its repo. Cross-repo *relationship* traversal (calls spanning repos) is the remaining piece.
 8. **Visualization layer** — interactive HTML/SVG/GraphML + Obsidian export (graphify-style).
 9. **Framework-aware routing edges** — URL/HTTP-method → handler (Axum/Actix/Express/FastAPI/…).
 10. **Runtime test-coverage edges** — augment static `tests_for` with coverage-weighted `test_touches_code` for trustworthy change-risk.
