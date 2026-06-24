@@ -5,7 +5,16 @@
 
 use crate::{CYAN, GREEN, RESET, YELLOW};
 use anyhow::{Result, anyhow};
-use clap::Subcommand;
+use clap::{Subcommand, ValueEnum};
+
+/// Output format for `ff cortex export`.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum GraphExportFormat {
+    /// GraphML (yEd / Gephi / Cytoscape).
+    Graphml,
+    /// Graphviz DOT (`dot -Tsvg`).
+    Dot,
+}
 use ff_brain::{corpus, cortex, ingest_decisions, ingest_pm};
 use sqlx::PgPool;
 use std::path::{Path, PathBuf};
@@ -401,6 +410,24 @@ pub enum TopCortexCommand {
         limit: i64,
         #[arg(long, value_enum, default_value = "table")]
         format: crate::CortexFormat,
+    },
+    /// Export a symbol's call-graph neighborhood (callers + callees within
+    /// --depth) as GraphML or DOT for visualization (yEd / Gephi / Cytoscape, or
+    /// `dot -Tsvg`). The graph-viz capability for eyeballing a subsystem's shape.
+    Export {
+        /// Symbol to center the neighborhood on (qualified or leaf, like cortex show).
+        symbol: String,
+        #[arg(long)]
+        corpus: Option<String>,
+        /// Hop radius over the call graph (both callers and callees). 1-5.
+        #[arg(long, default_value_t = 2)]
+        depth: i64,
+        /// Cap nodes (closest by hop distance kept). 1-2000.
+        #[arg(long, default_value_t = 200)]
+        max_nodes: i64,
+        /// Output format.
+        #[arg(long, value_enum, default_value = "graphml")]
+        format: GraphExportFormat,
     },
     /// Change-aware, risk-scored review map of the current diff: which changed
     /// symbols have the widest blast radius (fan-in / transitive callers), so a
@@ -1229,6 +1256,35 @@ async fn handle_top_cortex_online(args: TopCortexArgs) -> Result<()> {
         } => {
             let corpus = corpus.unwrap_or_else(cwd_slug);
             run_alerts(&pool, &corpus, limit, format.as_str()).await?;
+        }
+        TopCortexCommand::Export {
+            symbol,
+            corpus,
+            depth,
+            max_nodes,
+            format,
+        } => {
+            let corpus = corpus.unwrap_or_else(cwd_slug);
+            match ff_brain::export_neighborhood(&pool, &corpus, &symbol, depth, max_nodes).await? {
+                Some(g) => {
+                    let out = match format {
+                        GraphExportFormat::Graphml => ff_brain::graph_to_graphml(&g),
+                        GraphExportFormat::Dot => ff_brain::graph_to_dot(&g),
+                    };
+                    print!("{out}");
+                    eprintln!(
+                        "{CYAN}\u{25b6}{RESET} exported {} node(s), {} edge(s) around '{symbol}' (depth {depth})",
+                        g.nodes.len(),
+                        g.edges.len()
+                    );
+                }
+                None => {
+                    eprintln!(
+                        "{YELLOW}no symbol matching '{symbol}' in corpus '{corpus}'{RESET} — try `ff cortex find {symbol}`"
+                    );
+                    std::process::exit(1);
+                }
+            }
         }
         TopCortexCommand::Explain {
             symbol,
