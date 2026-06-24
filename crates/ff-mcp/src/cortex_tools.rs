@@ -8,8 +8,8 @@
 //! `ff cortex index`; these tools only query it.
 
 use ff_brain::{
-    call_path, callees, callers, corpus, cortex, find_symbols, find_symbols_semantic, impact,
-    tests_for,
+    call_path, callees, callers, corpus, cortex, find_symbols, find_symbols_all_corpora,
+    find_symbols_semantic, impact, tests_for,
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -211,6 +211,45 @@ pub async fn cortex_search(params: Option<Value>) -> HandlerResult {
             "start_line": h.start_line,
             "fan_in": h.fan_in,
             "score": h.score,
+            "id": h.id.to_string(),
+        })).collect::<Vec<_>>(),
+    }))
+}
+
+/// Cross-repo symbol search: find a name across EVERY indexed corpus at once
+/// (monorepo / multi-repo navigation), each hit tagged with its repo. The
+/// multi-corpus counterpart of `cortex_find` — answers "where does `foo` live
+/// across all my repos?" without first picking a corpus.
+pub async fn cortex_cross_repo_find(params: Option<Value>) -> HandlerResult {
+    let query = params
+        .as_ref()
+        .and_then(|p| p.get("query"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "missing required parameter: query".to_string())?
+        .to_string();
+    let limit = params
+        .as_ref()
+        .and_then(|p| p.get("limit"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(20);
+    let kind = params
+        .as_ref()
+        .and_then(|p| p.get("kind"))
+        .and_then(|v| v.as_str());
+    let pool = get_pool().await?;
+    let hits = find_symbols_all_corpora(&pool, &query, limit, kind)
+        .await
+        .map_err(|e| format!("cross_repo_find: {e}"))?;
+    Ok(json!({
+        "query": query,
+        "count": hits.len(),
+        "hits": hits.iter().map(|(corpus, h)| json!({
+            "corpus": corpus,
+            "qualified_name": h.qualified_name,
+            "node_type": h.node_type,
+            "file": h.file,
+            "start_line": h.start_line,
+            "fan_in": h.fan_in,
             "id": h.id.to_string(),
         })).collect::<Vec<_>>(),
     }))

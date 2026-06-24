@@ -111,6 +111,7 @@ impl ToolRegistry {
         // ── Cortex code-graph tools ─────────────────────────────────────
         self.register(Self::cortex_corpora());
         self.register(Self::cortex_find());
+        self.register(Self::cortex_cross_repo_find());
         self.register(Self::cortex_search());
         self.register(Self::cortex_show());
         self.register(Self::cortex_context());
@@ -889,6 +890,32 @@ impl ToolRegistry {
         }
     }
 
+    fn cortex_cross_repo_find() -> ToolDefinition {
+        ToolDefinition {
+            name: "cortex_cross_repo_find".to_string(),
+            description: "Cortex code graph: find code symbols across EVERY indexed repo at once (monorepo / multi-repo navigation), each hit tagged with its corpus + file:line, ranked by fan-in. The multi-corpus counterpart of cortex_find — answers 'where does `foo` live across all my repos?' without first picking a corpus (use cortex_corpora to see them).".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Name fragment (case-insensitive substring), e.g. 'ApiException' or 'load_model'"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max hits across all repos (1-500, default 20)",
+                        "default": 20
+                    },
+                    "kind": {
+                        "type": "string",
+                        "description": "Narrow to one node-type class: function, struct, enum, trait, impl, mod, class, interface, or 'type'. Default: all code symbols."
+                    }
+                },
+                "required": ["query"]
+            }),
+        }
+    }
+
     fn cortex_search() -> ToolDefinition {
         ToolDefinition {
             name: "cortex_search".to_string(),
@@ -1642,6 +1669,7 @@ mod tests {
             // Cortex code graph
             "cortex_corpora",
             "cortex_find",
+            "cortex_cross_repo_find",
             "cortex_search",
             "cortex_show",
             "cortex_context",

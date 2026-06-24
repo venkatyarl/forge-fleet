@@ -53,8 +53,8 @@ pub use cortex::ingest_pm;
 pub use cortex::{
     CommunityExplanation, CommunityMember, CortexStats, FileOutline, OutlineEntry, SymbolHit,
     SymbolRef, SymbolSource, TestHit, call_path, callees, callers, cortex_search,
-    explain_community, find_symbols, find_symbols_semantic, impact, index, outline_file,
-    show_symbol, tests_for,
+    explain_community, find_symbols, find_symbols_all_corpora, find_symbols_semantic, impact,
+    index, outline_file, show_symbol, tests_for,
 };
 pub use cortex_embed::{EmbedStats, embed_cortex_nodes, spawn_embed_refresh_loop};
 pub use cortex_reindex::{reindex_self_corpus, spawn_reindex_loop};
