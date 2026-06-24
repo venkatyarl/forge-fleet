@@ -1506,25 +1506,9 @@ struct NodeWorkloadAggregate {
 }
 
 #[derive(Debug, Clone, Default)]
-struct RuntimeNodeSnapshot {
-    node_id: String,
-    hostname: String,
-    ips: Vec<String>,
-    role: String,
-    status: String,
-    last_heartbeat: String,
-    heartbeat_age_secs: i64,
-    resources: Value,
-    services: Value,
-    models: Vec<String>,
-    capabilities: Value,
-}
-
-#[derive(Debug, Clone, Default)]
 struct DbFleetSnapshot {
     nodes_by_name: HashMap<String, DbNodeSnapshot>,
     nodes_by_host: HashMap<String, DbNodeSnapshot>,
-    runtime_nodes: Vec<RuntimeNodeSnapshot>,
     workloads: HashMap<String, NodeWorkloadAggregate>,
     replication_sequence: Option<u64>,
 }
@@ -1939,16 +1923,6 @@ fn normalize_object(value: Value) -> Value {
 
 fn normalize_array(value: Value) -> Value {
     if value.is_array() { value } else { json!([]) }
-}
-
-fn heartbeat_freshness_bucket(age_seconds: Option<i64>) -> String {
-    match age_seconds {
-        Some(age) if age < 60 => "fresh".to_string(),
-        Some(age) if age < 180 => "warming".to_string(),
-        Some(age) if age < 600 => "stale".to_string(),
-        Some(_) => "expired".to_string(),
-        None => "unknown".to_string(),
-    }
 }
 
 /// POST /api/fleet/enroll — trust-gated runtime node enrollment.
@@ -2490,45 +2464,6 @@ fn assemble_fleet_status_payload(
         node_views.push(view);
     }
 
-    if let Some(snapshot) = db_snapshot {
-        for runtime in &snapshot.runtime_nodes {
-            let hostname_key = runtime.hostname.clone();
-            let runtime_ip = runtime
-                .ips
-                .iter()
-                .find(|ip| !ip.trim().is_empty())
-                .cloned()
-                .unwrap_or_else(|| "unknown".to_string());
-
-            let already_present = seen_config_names
-                .iter()
-                .any(|name| name.eq_ignore_ascii_case(&runtime.hostname))
-                || seen_ips.contains(&runtime_ip);
-
-            if already_present {
-                continue;
-            }
-
-            let workload = snapshot
-                .workloads
-                .get(&runtime.hostname)
-                .or_else(|| snapshot.workloads.get(&runtime_ip));
-
-            node_views.push(build_runtime_node_view(
-                runtime,
-                leader_hint.as_deref(),
-                workload,
-                leader_sequence,
-                snapshot.replication_sequence,
-            ));
-
-            seen_config_names.insert(hostname_key);
-            if runtime_ip != "unknown" {
-                seen_ips.insert(runtime_ip);
-            }
-        }
-    }
-
     // Preserve static fleet.toml seeds that are not represented in runtime registry.
     // Runtime entries always win if both sources refer to the same node.
     if let Some(config) = fleet_config {
@@ -2875,222 +2810,6 @@ fn build_seed_node_view(
             checked_at: None,
             active_tasks: None,
         },
-    }
-}
-
-fn build_runtime_node_view(
-    runtime: &RuntimeNodeSnapshot,
-    leader_hint: Option<&str>,
-    workload: Option<&NodeWorkloadAggregate>,
-    leader_sequence: Option<u64>,
-    local_replication_sequence: Option<u64>,
-) -> FleetNodeView {
-    let first_ip = runtime
-        .ips
-        .iter()
-        .find(|ip| !ip.trim().is_empty())
-        .cloned()
-        .unwrap_or_else(|| "unknown".to_string());
-
-    let role = role_to_string_runtime(&runtime.role);
-    let is_leader = if let Some(leader) = leader_hint {
-        runtime.hostname.eq_ignore_ascii_case(leader)
-            || runtime.ips.iter().any(|ip| ip.eq_ignore_ascii_case(leader))
-    } else {
-        role == "leader" || role == "gateway"
-    };
-
-    let leader_state = if is_leader {
-        "leader".to_string()
-    } else if leader_hint.is_some() {
-        "follower".to_string()
-    } else {
-        "unknown".to_string()
-    };
-
-    let status = match runtime.status.trim().to_ascii_lowercase().as_str() {
-        "online" | "degraded" | "offline" => runtime.status.trim().to_ascii_lowercase(),
-        _ => "unknown".to_string(),
-    };
-
-    let health = match status.as_str() {
-        "online" => "healthy".to_string(),
-        "degraded" => "degraded".to_string(),
-        "offline" => "offline".to_string(),
-        _ => "unknown".to_string(),
-    };
-
-    let mut heartbeat = heartbeat_view(runtime.last_heartbeat.clone(), "db.runtime_heartbeat");
-    if heartbeat.age_seconds.is_none() && runtime.heartbeat_age_secs >= 0 {
-        heartbeat.age_seconds = Some(runtime.heartbeat_age_secs);
-        heartbeat.freshness = heartbeat_freshness_bucket(heartbeat.age_seconds);
-    }
-
-    let models_loaded = runtime.models.clone();
-    let models_loaded_state = if models_loaded.is_empty() {
-        "unreported".to_string()
-    } else {
-        "reported".to_string()
-    };
-
-    let open_ports = runtime
-        .resources
-        .pointer("/open_ports")
-        .and_then(Value::as_array)
-        .map(|ports| {
-            ports
-                .iter()
-                .filter_map(Value::as_u64)
-                .filter(|port| *port <= u16::MAX as u64)
-                .map(|port| port as u16)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-
-    let cpu = extract_json_string(
-        &runtime.resources,
-        &["/cpu", "/resources/cpu", "/hardware/cpu"],
-    )
-    .unwrap_or_else(|| "unknown".to_string());
-    let ram = extract_json_string(
-        &runtime.resources,
-        &["/ram", "/memory", "/resources/ram", "/hardware/memory"],
-    )
-    .unwrap_or_else(|| "unknown".to_string());
-    let gpu = extract_json_string(
-        &runtime.resources,
-        &["/gpu", "/resources/gpu", "/hardware/gpu"],
-    )
-    .unwrap_or_else(|| "unknown".to_string());
-
-    let cpu_cores = runtime
-        .resources
-        .pointer("/cpu_cores")
-        .and_then(Value::as_u64)
-        .map(|value| value as u32);
-    let memory_gib = runtime
-        .resources
-        .pointer("/memory_gib")
-        .and_then(Value::as_u64);
-
-    let service_version = extract_json_string(
-        &runtime.resources,
-        &[
-            "/service_version",
-            "/serviceVersion",
-            "/service/version",
-            "/build/version",
-            "/version",
-        ],
-    )
-    .unwrap_or_else(|| "unreported".to_string());
-
-    let replication_detail = extract_json_string(
-        &runtime.capabilities,
-        &[
-            "/replication_state",
-            "/replication/state",
-            "/replication/health",
-        ],
-    )
-    .unwrap_or_else(|| "runtime heartbeat telemetry".to_string());
-
-    let replication_mode = if is_leader {
-        "leader".to_string()
-    } else if leader_hint.is_some() {
-        "follower".to_string()
-    } else {
-        "unknown".to_string()
-    };
-
-    let replication_state = FleetReplicationView {
-        mode: replication_mode,
-        sequence: if is_leader {
-            leader_sequence.or(local_replication_sequence)
-        } else {
-            local_replication_sequence
-        },
-        health: health.clone(),
-        detail: replication_detail,
-    };
-
-    let current_workload = build_workload_view(workload, true);
-
-    let model_rows = models_loaded
-        .iter()
-        .map(|id| FleetNodeModelView {
-            id: id.clone(),
-            name: id.clone(),
-            node: Some(runtime.hostname.clone()),
-            status: if status == "online" {
-                "healthy".to_string()
-            } else {
-                status.clone()
-            },
-        })
-        .collect::<Vec<_>>();
-
-    let mut runtime_provenance = vec!["db.fleet_worker_runtime".to_string()];
-    if runtime
-        .services
-        .as_array()
-        .is_some_and(|services| !services.is_empty())
-    {
-        runtime_provenance.push("heartbeat.services".to_string());
-    }
-
-    FleetNodeView {
-        id: runtime.node_id.clone(),
-        name: runtime.hostname.clone(),
-        hostname: Some(runtime.hostname.clone()),
-        ip: first_ip,
-        open_ports: open_ports.clone(),
-        status,
-        health,
-        role,
-        leader_state,
-        is_leader,
-        cpu: cpu.clone(),
-        ram: ram.clone(),
-        cpu_cores,
-        memory_gib,
-        gpu: gpu.clone(),
-        models_loaded,
-        models_loaded_state,
-        source_kind: "runtime/db".to_string(),
-        seeded_from_config: false,
-        runtime_enrolled: true,
-        runtime_provenance,
-        last_heartbeat: heartbeat.value,
-        heartbeat_source: heartbeat.source,
-        heartbeat_freshness: heartbeat.freshness,
-        heartbeat_age_seconds: heartbeat.age_seconds,
-        service_version,
-        replication_state,
-        current_workload: current_workload.clone(),
-        hardware: FleetNodeHardwareView {
-            discovered_at: runtime.last_heartbeat.clone(),
-            last_seen: runtime.last_heartbeat.clone(),
-            open_ports,
-            cpu,
-            ram,
-            gpu,
-        },
-        models: model_rows,
-        metrics: FleetNodeMetricsView {
-            latency_ms: None,
-            tcp_ok: None,
-            http_ok: None,
-            checked_at: Some(runtime.last_heartbeat.clone()),
-            active_tasks: current_workload.active_tasks,
-        },
-    }
-}
-
-fn role_to_string_runtime(raw: &str) -> String {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "leader" | "worker" | "gateway" | "builder" => raw.trim().to_ascii_lowercase(),
-        _ => "worker".to_string(),
     }
 }
 
@@ -3595,44 +3314,6 @@ async fn load_db_fleet_snapshot(state: &GatewayState) -> Option<DbFleetSnapshot>
             Err(err) => {
                 warn!(error = %err, "failed to load fleet metadata from operational store");
             }
-        }
-    }
-
-    let runtime_result = if let Some(runtime_registry) = &state.runtime_registry {
-        runtime_registry.list_runtime_nodes().await
-    } else {
-        Ok(Vec::new())
-    };
-
-    match runtime_result {
-        Ok(runtime_rows) => {
-            snapshot.runtime_nodes = runtime_rows
-                .into_iter()
-                .map(|row| RuntimeNodeSnapshot {
-                    node_id: row.node_id,
-                    hostname: row.hostname,
-                    ips: serde_json::from_str::<Vec<String>>(&row.ips_json).unwrap_or_default(),
-                    role: row.role,
-                    status: row.derived_status,
-                    last_heartbeat: row.last_heartbeat,
-                    heartbeat_age_secs: row.heartbeat_age_secs,
-                    resources: serde_json::from_str::<Value>(&row.resources_json)
-                        .unwrap_or_else(|_| json!({})),
-                    services: serde_json::from_str::<Value>(&row.services_json)
-                        .unwrap_or_else(|_| json!([])),
-                    models: serde_json::from_str::<Vec<String>>(&row.models_json)
-                        .unwrap_or_default(),
-                    capabilities: serde_json::from_str::<Value>(&row.capabilities_json)
-                        .unwrap_or_else(|_| json!({})),
-                })
-                .collect();
-
-            if !snapshot.runtime_nodes.is_empty() {
-                has_any_data = true;
-            }
-        }
-        Err(err) => {
-            warn!(error = %err, "failed to load runtime registry snapshot");
         }
     }
 
