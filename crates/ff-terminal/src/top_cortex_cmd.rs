@@ -389,6 +389,19 @@ pub enum TopCortexCommand {
         #[arg(long, value_enum, default_value = "table")]
         format: crate::CortexFormat,
     },
+    /// Static code-health signals from the graph (no LLM): refactor-risk hotspots
+    /// (god symbols by fan-in), mutual import cycles, and low-confidence isolated
+    /// functions (no in-graph call edges — heuristic, review-not-delete).
+    Alerts {
+        /// Override the corpus slug (default: derived from the cwd).
+        #[arg(long)]
+        corpus: Option<String>,
+        /// Cap each list at this many entries.
+        #[arg(long, default_value_t = 15)]
+        limit: i64,
+        #[arg(long, value_enum, default_value = "table")]
+        format: crate::CortexFormat,
+    },
     /// Change-aware, risk-scored review map of the current diff: which changed
     /// symbols have the widest blast radius (fan-in / transitive callers), so a
     /// reviewer knows where to look first. Reads `git diff` for the changed
@@ -1209,6 +1222,14 @@ async fn handle_top_cortex_online(args: TopCortexArgs) -> Result<()> {
             let corpus = corpus.unwrap_or_else(cwd_slug);
             run_doctor(&pool, &corpus, limit, format.as_str()).await?;
         }
+        TopCortexCommand::Alerts {
+            corpus,
+            limit,
+            format,
+        } => {
+            let corpus = corpus.unwrap_or_else(cwd_slug);
+            run_alerts(&pool, &corpus, limit, format.as_str()).await?;
+        }
         TopCortexCommand::Explain {
             symbol,
             corpus,
@@ -1503,6 +1524,54 @@ fn print_explanation(
 
 /// `ff cortex doctor` — print the call-graph resolution rate plus the ranked
 /// suspicious-extern list. Read-only.
+/// `ff cortex alerts` — graph-derived static code-health signals (no LLM).
+async fn run_alerts(pool: &PgPool, corpus: &str, limit: i64, format: &str) -> Result<()> {
+    let a = ff_brain::cortex_alerts(pool, corpus, limit).await?;
+    if format == "json" {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "corpus": corpus,
+                "god_symbols": a.god_symbols.iter()
+                    .map(|(t, f)| serde_json::json!({"symbol": t, "fan_in": f}))
+                    .collect::<Vec<_>>(),
+                "circular_imports": a.circular_imports.iter()
+                    .map(|(x, y)| serde_json::json!({"a": x, "b": y}))
+                    .collect::<Vec<_>>(),
+                "isolated_total": a.isolated_total,
+                "isolated_sample": a.isolated_sample,
+            }))
+            .unwrap_or_default()
+        );
+        return Ok(());
+    }
+    println!("{CYAN}\u{25b6} cortex alerts \u{2014} '{corpus}' (graph-derived, no LLM){RESET}");
+    println!("{CYAN}god symbols{RESET} (refactor-risk hotspots; most-depended-on functions):");
+    if a.god_symbols.is_empty() {
+        println!("  (none)");
+    }
+    for (t, f) in &a.god_symbols {
+        println!("  {f:>5}  {t}");
+    }
+    println!("{CYAN}circular imports{RESET} (mutually-importing pairs):");
+    if a.circular_imports.is_empty() {
+        println!("  {GREEN}none \u{2713}{RESET}");
+    }
+    for (x, y) in &a.circular_imports {
+        println!("  {x}  \u{2194}  {y}");
+    }
+    println!(
+        "{CYAN}isolated functions{RESET}: {} with no in-graph call edges \u{2014} {YELLOW}heuristic{RESET}: \
+macro/attribute/framework calls (serde `default=`, derives, route handlers) are invisible to the \
+graph, so MANY of these are actually used. Review, don't delete.",
+        a.isolated_total
+    );
+    for t in &a.isolated_sample {
+        println!("  {t}");
+    }
+    Ok(())
+}
+
 async fn run_doctor(pool: &PgPool, corpus: &str, limit: i64, format: &str) -> Result<()> {
     let stats = ff_db::pg_cortex_resolution_stats(pool, corpus).await?;
     let report = ff_db::pg_cortex_suspicious_externs(pool, corpus, limit).await?;
