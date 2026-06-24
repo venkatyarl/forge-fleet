@@ -131,7 +131,7 @@ crate (`election::ElectionManager`, `leader::LeaderDaemon`, `scheduler`,
 `work_queue`, `worker`, `resource_pool`) is an abandoned parallel implementation —
 compiled on every workspace build, pollutes leadership greps/Cortex, and is a
 latent re-wire hazard (someone could spawn `LeaderDaemon` and create a real
-split-brain). **Fix (next iteration, low-risk own PR):** drop `crates/ff-mesh`
-from workspace members + delete the crate; confirm `cargo check --workspace` +
-`--workspace --lib` stay green. Distinct from #4 — this is dead code, #4 is two
-*live* engines.
+split-brain). **✅ DONE (PR #543, 2026-06-24):** dropped `crates/ff-mesh` from
+workspace members + deleted the crate (7 files); `cargo check --workspace`,
+CI-exact clippy, and `cargo test --workspace --lib` all green; deployed
+fleet-wide. Distinct from #4 — this was dead code, #4 is two *live* engines.
