@@ -53,7 +53,9 @@ pub async fn handle_notify(cmd: NotifyCommand) -> Result<()> {
             if configured {
                 println!("notification sent");
             } else {
-                println!("notification skipped — Telegram not configured (set openclaw.telegram_bot_token / openclaw.telegram_chat_id)");
+                println!(
+                    "notification skipped — Telegram not configured (set openclaw.telegram_bot_token / openclaw.telegram_chat_id)"
+                );
             }
             Ok(())
         }
