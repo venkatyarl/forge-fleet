@@ -95,3 +95,43 @@ Ordered. **★ = unblocks downstream items.**
 15. Consolidate think-strip / signal-extraction / context-retrieval / SKILL parsing+walking / NodeMetrics+FleetSnapshot duplicates; delete dead code (`ff-memory`, `ff-mesh`, `agent_procedures` consumer-less loop, `self_cmd.rs`, `classify_workload`, `select_context` wire-in via #9); gate `fleet_scan(full)`; fix MCP per-call pools; unify HF token key; extract shared brew upstream fetcher. (S each.)
 
 **Sequencing summary:** #1 unblocks the conflict cluster → #6+#7 are the foundation that #8 (model-swap) and #9–#11 (cortex/memory/CLI-orchestration) all depend on → #12–#14 (web/MC/TUI) are parallelizable once #6/#7 land → #15 is continuous low-risk cleanup.
+---
+
+## Research refinement — 2026-06-24 (loop iteration)
+
+Re-scoped two findings against current code (the table's line cites predate the
+SQLite-removal refactor and have drifted):
+
+### Finding #4 (leader-election) — CONFIRMED live, precise current scope
+Two leader engines genuinely run **concurrently in production `forgefleetd`**:
+- **`LeaderTick`** (`ff_agent::leader_tick`) — claims the Postgres
+  `fleet_leader_state` singleton every 15s. **Authoritative**: every actuating
+  tick (defer-worker, scheduler, auto-upgrade, wave-reaper, revive_scan) gates on
+  it.
+- **`start_leader_election_subsystem`** (`src/main.rs:2232`) — a *second* loop
+  using `ff_core::leader::{elect_leader, check_failover}` over
+  `registry.node_health_for_election()` (discovery/TOML health). It HTTP-announces
+  a winner (`announce_leader_to_fleet`) and calls `registry.set_leader`
+  (`src/main.rs:2229`), which feeds the gateway's `leader_hint`.
+
+They never reconcile and can disagree (TOML-health winner X vs Postgres+pulse
+winner Y) → gateway reports X as `leader_hint` while Y is the real actuating
+leader. **Fix (next iteration, HA-critical, own PR):** make `LeaderTick` the
+single authority — either (a) delete `start_leader_election_subsystem` and drive
+`registry.set_leader` from the `fleet_leader_state` value on every transition, or
+(b) subordinate the discovery loop to read `fleet_leader_state` instead of running
+its own `elect_leader`. Prefer (a): one election engine, registry hint can never
+contradict the actuating leader. Validate no other consumer depends on the HTTP
+`announce_leader_to_fleet` path for correctness (it appears display-only).
+
+### Finding #15 (dead code) — `ff-mesh` CONFIRMED 100% orphaned
+`cargo tree -i -p ff-mesh` → **zero reverse-dependencies**; no `src/` or other
+crate's `Cargo.toml` references it (only the workspace-members list). The whole
+crate (`election::ElectionManager`, `leader::LeaderDaemon`, `scheduler`,
+`work_queue`, `worker`, `resource_pool`) is an abandoned parallel implementation —
+compiled on every workspace build, pollutes leadership greps/Cortex, and is a
+latent re-wire hazard (someone could spawn `LeaderDaemon` and create a real
+split-brain). **Fix (next iteration, low-risk own PR):** drop `crates/ff-mesh`
+from workspace members + delete the crate; confirm `cargo check --workspace` +
+`--workspace --lib` stay green. Distinct from #4 — this is dead code, #4 is two
+*live* engines.
