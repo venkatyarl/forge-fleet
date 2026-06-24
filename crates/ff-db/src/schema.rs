@@ -8528,6 +8528,7 @@ CREATE TABLE IF NOT EXISTS brain_code_communities (
     god_node_id        UUID REFERENCES brain_vault_nodes(id) ON DELETE SET NULL,
     member_count       INT NOT NULL DEFAULT 0,
     level              INT NOT NULL DEFAULT 0,
+    parent_member_hash TEXT,
     summary            TEXT,
     summary_model      TEXT,
     summary_updated_at TIMESTAMPTZ,
@@ -8535,6 +8536,8 @@ CREATE TABLE IF NOT EXISTS brain_code_communities (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_brain_code_communities_member_hash_level
     ON brain_code_communities (member_hash, level);
+CREATE INDEX IF NOT EXISTS idx_brain_code_communities_parent
+    ON brain_code_communities (parent_member_hash);
 "#;
 
 /// V128: per-file `pub use` re-export ledger so an incremental Cortex reindex can
@@ -9142,4 +9145,15 @@ ALTER TABLE brain_code_communities ADD COLUMN IF NOT EXISTS level INT NOT NULL D
 DROP INDEX IF EXISTS idx_brain_code_communities_member_hash;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_brain_code_communities_member_hash_level
     ON brain_code_communities (member_hash, level);
+"#;
+
+pub const SCHEMA_V145_CODE_COMMUNITY_PARENT: &str = r#"
+-- Hierarchical GraphRAG: each community records its PARENT (the immediate
+-- strictly-larger enclosing community up the level hierarchy) by member_hash,
+-- making brain_code_communities a navigable tree. NULL = top-level community.
+-- Indexed for child lookups (a parent's children = rows WHERE parent_member_hash
+-- = the parent's member_hash), which the level>0 map-reduce summary pass uses.
+ALTER TABLE brain_code_communities ADD COLUMN IF NOT EXISTS parent_member_hash TEXT;
+CREATE INDEX IF NOT EXISTS idx_brain_code_communities_parent
+    ON brain_code_communities (parent_member_hash);
 "#;
