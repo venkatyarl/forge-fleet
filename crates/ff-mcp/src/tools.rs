@@ -112,6 +112,7 @@ impl ToolRegistry {
         self.register(Self::cortex_corpora());
         self.register(Self::cortex_find());
         self.register(Self::cortex_show());
+        self.register(Self::cortex_context());
         self.register(Self::cortex_explain());
         self.register(Self::cortex_outline());
         self.register(Self::cortex_callers());
@@ -922,6 +923,42 @@ impl ToolRegistry {
         }
     }
 
+    fn cortex_context() -> ToolDefinition {
+        ToolDefinition {
+            name: "cortex_context".to_string(),
+            description: "Cortex code graph: one call for a code symbol's definition + callers + callees + impact + community summary. This is the agent loop's default Cortex call when orienting on a symbol, replacing cortex_find → cortex_show → cortex_callers/callees/impact/explain. Resolves like cortex_show (exact qualified → exact leaf by fan-in → top fan-in hit), caps direct relationships, and returns the community's stored natural-language summary instead of every member.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "symbol": {
+                        "type": "string",
+                        "description": "Code symbol — bare leaf ('load_model') or qualified ('ff_agent::model_runtime::load_model'), case-insensitive"
+                    },
+                    "corpus": {
+                        "type": "string",
+                        "description": "Indexed repo slug (see cortex_corpora), e.g. 'forge-fleet'. Optional; defaults to the current working directory's basename."
+                    },
+                    "include_snippet": {
+                        "type": "boolean",
+                        "description": "Include the symbol definition source using cortex_show's source extraction logic. Default true.",
+                        "default": true
+                    },
+                    "max_callers": {
+                        "type": "integer",
+                        "description": "Max direct callers to return (1-100, default 10).",
+                        "default": 10
+                    },
+                    "max_callees": {
+                        "type": "integer",
+                        "description": "Max direct callees to return (1-100, default 10).",
+                        "default": 10
+                    }
+                },
+                "required": ["symbol"]
+            }),
+        }
+    }
+
     fn cortex_explain() -> ToolDefinition {
         ToolDefinition {
             name: "cortex_explain".to_string(),
@@ -1579,6 +1616,7 @@ mod tests {
             "cortex_corpora",
             "cortex_find",
             "cortex_show",
+            "cortex_context",
             "cortex_explain",
             "cortex_outline",
             "cortex_callers",

@@ -43,6 +43,50 @@ fn corpus_and_symbol(params: &Option<Value>) -> Result<(String, String), String>
     Ok((corpus.to_string(), symbol.to_string()))
 }
 
+/// Optional `corpus` for tools that can sensibly default to the cwd slug.
+fn corpus_or_cwd_slug(params: &Option<Value>) -> Result<String, String> {
+    if let Some(corpus) = params
+        .as_ref()
+        .and_then(|p| p.get("corpus"))
+        .and_then(|v| v.as_str())
+    {
+        return Ok(corpus.to_string());
+    }
+
+    std::env::current_dir()
+        .map_err(|e| format!("default corpus from cwd: {e}"))?
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| "missing corpus and could not derive default from cwd".to_string())
+}
+
+fn symbol_param(params: &Option<Value>) -> Result<String, String> {
+    params
+        .as_ref()
+        .and_then(|p| p.get("symbol"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| "missing required parameter: symbol".to_string())
+}
+
+fn bool_param(params: &Option<Value>, name: &str, default: bool) -> bool {
+    params
+        .as_ref()
+        .and_then(|p| p.get(name))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(default)
+}
+
+fn capped_usize_param(params: &Option<Value>, name: &str, default: usize, max: usize) -> usize {
+    params
+        .as_ref()
+        .and_then(|p| p.get(name))
+        .and_then(|v| v.as_u64())
+        .map(|n| (n as usize).clamp(1, max))
+        .unwrap_or(default)
+}
+
 /// Shape a `Vec<SymbolRef>` into the JSON result list.
 fn symbols_json(symbols: &[ff_brain::SymbolRef]) -> Vec<Value> {
     symbols
@@ -57,6 +101,10 @@ fn symbols_json(symbols: &[ff_brain::SymbolRef]) -> Vec<Value> {
             })
         })
         .collect()
+}
+
+fn capped_symbols_json(symbols: &[ff_brain::SymbolRef], limit: usize) -> Vec<Value> {
+    symbols_json(&symbols[..symbols.len().min(limit)])
 }
 
 /// List the indexed Cortex corpora (repos) so an agent can discover valid slugs.
@@ -198,6 +246,91 @@ pub async fn cortex_show(params: Option<Value>) -> HandlerResult {
             "other_matches": s.other_matches,
         })),
     }
+}
+
+/// One Cortex call for the standard agent orientation loop: resolve a symbol,
+/// return its definition source, direct callers/callees, blast-radius count, and
+/// the symbol's community summary. This composes the existing Cortex query
+/// helpers so the graph semantics stay centralized in `ff_brain::cortex`.
+pub async fn cortex_context(params: Option<Value>) -> HandlerResult {
+    let corpus_slug = corpus_or_cwd_slug(&params)?;
+    let symbol = symbol_param(&params)?;
+    let include_snippet = bool_param(&params, "include_snippet", true);
+    let max_callers = capped_usize_param(&params, "max_callers", 10, 100);
+    let max_callees = capped_usize_param(&params, "max_callees", 10, 100);
+    let min_confidence = min_confidence_param(&params);
+    let impact_depth = 5;
+
+    let pool = get_pool().await?;
+    let shown = ff_brain::show_symbol(&pool, &corpus_slug, &symbol, None, 200, 0)
+        .await
+        .map_err(|e| format!("context/show: {e}"))?;
+    let Some(s) = shown else {
+        return Ok(json!({
+            "corpus": corpus_slug,
+            "symbol": symbol,
+            "found": false,
+        }));
+    };
+
+    let resolved_symbol = s.qualified_name.clone();
+    let caller_rows = callers(&pool, &corpus_slug, &resolved_symbol, min_confidence)
+        .await
+        .map_err(|e| format!("context/callers: {e}"))?;
+    let callee_rows = callees(&pool, &corpus_slug, &resolved_symbol, min_confidence)
+        .await
+        .map_err(|e| format!("context/callees: {e}"))?;
+    let impacted = impact(
+        &pool,
+        &corpus_slug,
+        &resolved_symbol,
+        impact_depth,
+        min_confidence,
+    )
+    .await
+    .map_err(|e| format!("context/impact: {e}"))?;
+    let community = ff_brain::explain_community(&pool, &corpus_slug, &resolved_symbol, None, 1)
+        .await
+        .map_err(|e| format!("context/community: {e}"))?;
+
+    let snippet = if include_snippet {
+        Some(json!({
+            "display_start": s.display_start,
+            "source": s.source,
+            "truncated": s.truncated,
+        }))
+    } else {
+        None
+    };
+
+    Ok(json!({
+        "corpus": corpus_slug,
+        "symbol": symbol,
+        "found": true,
+        "resolved": {
+            "name": resolved_symbol,
+            "path": format!("code://{}/{}", corpus_slug, s.qualified_name),
+            "kind": s.node_type,
+            "file": s.file,
+            "span": {
+                "start_line": s.start_line,
+                "end_line": s.end_line,
+            },
+        },
+        "snippet": snippet,
+        "callers": capped_symbols_json(&caller_rows, max_callers),
+        "callees": capped_symbols_json(&callee_rows, max_callees),
+        "impact": {
+            "count": impacted.len(),
+            "max_depth": impact_depth,
+            "min_confidence": min_confidence,
+        },
+        "community": community.map(|c| json!({
+            "id": c.community_id,
+            "summary": c.summary,
+        })),
+        "disambiguation": s.other_matches,
+    }))
 }
 
 /// Explain the subsystem a symbol belongs to — resolve it to its code-graph
